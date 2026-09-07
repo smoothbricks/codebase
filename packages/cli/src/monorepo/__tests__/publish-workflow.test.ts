@@ -993,3 +993,121 @@ it('runs macOS platform legs on smoo.github.macosRunsOn; default stays macos-lat
     jobs: { 'macos-platform': { 'runs-on': 'macos-latest' } },
   });
 });
+
+const CARGO_GIT_CREDENTIALS = {
+  gitOrigins: [{ origin: 'https://git.example.net', tokenEnv: 'SOURCE_READ_TOKEN' }],
+};
+
+it('installs the Cargo credential helper in every job that fetches crates', () => {
+  const rendered = renderPublishWorkflowYaml({
+    repoName: '@smoothbricks/codebase',
+    platformTargetGlobs: PLATFORM_TARGET_GLOBS,
+    cargoCredentials: CARGO_GIT_CREDENTIALS,
+  });
+  const linuxCandidate = rendered.slice(
+    rendered.indexOf('  linux-release-candidate:'),
+    rendered.indexOf('  macos-platform:'),
+  );
+  const macosPlatform = rendered.slice(rendered.indexOf('  macos-platform:'), rendered.indexOf('  publish-on-linux:'));
+  const finalJob = rendered.slice(rendered.indexOf('  publish-on-linux:'));
+
+  // The helper is per-job process configuration: a job that builds without it
+  // fetches the private dependency anonymously and fails. The macOS leg builds
+  // the Apple natives and the final job still repairs pending releases.
+  for (const job of [linuxCandidate, macosPlatform, finalJob]) {
+    expect(job).toContain('- name: 🔑 Prepare Cargo git credentials');
+    expect(job.indexOf('🔑 Prepare Cargo git credentials')).toBeLessThan(job.indexOf('🧱 Setup Nix/devenv'));
+  }
+  expect(Bun.YAML.parse(rendered)).toMatchObject({
+    jobs: {
+      'linux-release-candidate': { env: { SOURCE_READ_TOKEN: '${{ secrets.SOURCE_READ_TOKEN }}' } },
+      'macos-platform': { env: { SOURCE_READ_TOKEN: '${{ secrets.SOURCE_READ_TOKEN }}' } },
+      'publish-on-linux': { env: { SOURCE_READ_TOKEN: '${{ secrets.SOURCE_READ_TOKEN }}' } },
+    },
+  });
+  // The token stays a shell expansion of job env: never a URL, never argv.
+  expect(rendered).not.toMatch(/https:\/\/[^\s'"]*SOURCE_READ_TOKEN/);
+
+  const withoutCredentials = renderPublishWorkflowYaml({
+    repoName: '@smoothbricks/codebase',
+    platformTargetGlobs: PLATFORM_TARGET_GLOBS,
+  });
+  expect(withoutCredentials).not.toContain('🔑 Prepare Cargo git credentials');
+  expect(withoutCredentials).not.toContain('CARGO_NET_GIT_FETCH_WITH_CLI');
+  expect(withoutCredentials).not.toContain('SOURCE_READ_TOKEN');
+});
+
+it('keeps job-local step anchors contiguous once Cargo credentials add a setup step', () => {
+  const singleJob = renderPublishWorkflowYaml({
+    repoName: '@smoothbricks/codebase',
+    cargoCredentials: CARGO_GIT_CREDENTIALS,
+  });
+  const platform = renderPublishWorkflowYaml({
+    deploy: true,
+    repoName: '@smoothbricks/codebase',
+    platformTargetGlobs: PLATFORM_TARGET_GLOBS,
+    cargoCredentials: CARGO_GIT_CREDENTIALS,
+  });
+  const linuxCandidate = platform.slice(
+    platform.indexOf('  linux-release-candidate:'),
+    platform.indexOf('  macos-platform:'),
+  );
+  const macosPlatform = platform.slice(platform.indexOf('  macos-platform:'), platform.indexOf('  publish-on-linux:'));
+  const finalJob = platform.slice(platform.indexOf('  publish-on-linux:'));
+
+  // Each job gains exactly one step over the credential-free counts, and the
+  // hand-numbered platform renderers must renumber with it.
+  expect(stepAnchorNumbers(singleJob)).toEqual(Array.from({ length: 17 }, (_, index) => index + 1));
+  expect(stepAnchorNumbers(linuxCandidate)).toEqual(Array.from({ length: 20 }, (_, index) => index + 1));
+  expect(stepAnchorNumbers(macosPlatform)).toEqual(Array.from({ length: 11 }, (_, index) => index + 1));
+  expect(stepAnchorNumbers(finalJob)).toEqual(Array.from({ length: 15 }, (_, index) => index + 1));
+  expect(macosPlatform).toContain('# Step 3\n      - name: 🔑 Prepare Cargo git credentials');
+  expect(finalJob).toContain('# Step 3\n      - name: 🔑 Prepare Cargo git credentials');
+});
+
+it('wires registry-only Cargo credentials as job env without a git credential step', () => {
+  const rendered = renderPublishWorkflowYaml({
+    repoName: '@smoothbricks/codebase',
+    platformTargetGlobs: PLATFORM_TARGET_GLOBS,
+    cargoCredentials: { registryTokenEnvs: ['CARGO_REGISTRIES_PRIVATE_TOKEN', 'CARGO_REGISTRIES_FORGE_TOKEN'] },
+  });
+  const macosPlatform = rendered.slice(rendered.indexOf('  macos-platform:'), rendered.indexOf('  publish-on-linux:'));
+
+  const registryEnv = {
+    CARGO_REGISTRIES_PRIVATE_TOKEN: '${{ secrets.CARGO_REGISTRIES_PRIVATE_TOKEN }}',
+    CARGO_REGISTRIES_FORGE_TOKEN: '${{ secrets.CARGO_REGISTRIES_FORGE_TOKEN }}',
+  };
+  expect(Bun.YAML.parse(rendered)).toMatchObject({
+    jobs: {
+      'linux-release-candidate': { env: registryEnv },
+      'macos-platform': { env: registryEnv },
+      'publish-on-linux': { env: registryEnv },
+    },
+  });
+  // Cargo's own credential provider reads the registry token; no git helper is
+  // installed and no step count moves.
+  expect(rendered).not.toContain('🔑 Prepare Cargo git credentials');
+  expect(stepAnchorNumbers(macosPlatform)).toEqual(Array.from({ length: 10 }, (_, index) => index + 1));
+});
+
+it('refuses malformed Cargo credential declarations at render time', () => {
+  expect(() => renderPublishWorkflowYaml({ cargoCredentials: {} })).toThrow('empty configuration');
+  expect(() =>
+    renderPublishWorkflowYaml({
+      cargoCredentials: { gitOrigins: [{ origin: 'https://git.example.net/codebase', tokenEnv: 'SOURCE_READ_TOKEN' }] },
+    }),
+  ).toThrow('credential-free https origin without a path');
+  expect(() =>
+    renderPublishWorkflowYaml({
+      cargoCredentials: { gitOrigins: [{ origin: 'https://x:y@git.example.net', tokenEnv: 'SOURCE_READ_TOKEN' }] },
+    }),
+  ).toThrow('credential-free https origin');
+  expect(() =>
+    renderPublishWorkflowYaml({
+      cargoCredentials: { gitOrigins: [{ origin: 'https://git.example.net', tokenEnv: 'source_read_token' }] },
+    }),
+  ).toThrow('upper-case secret env name');
+  expect(() => renderPublishWorkflowYaml({ cargoCredentials: { registryTokenEnvs: ['cargo_token'] } })).toThrow(
+    'upper-case secret env names',
+  );
+});
