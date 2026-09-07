@@ -70,6 +70,9 @@ export function checkWorkspaceConfig(nxJson: Record<string, unknown>): NxPolicyI
   // Build target default
   validateBuildTargetDefault(nxJson, 'nx.json', issues);
 
+  // Test target default: dependsOn is inferred per project (cargo-test vs ^build/build)
+  validateTestTargetDefault(nxJson, 'nx.json', issues);
+
   // Clean target default
   validateCleanTargetDefault(nxJson, 'nx.json', issues);
 
@@ -105,6 +108,7 @@ export function checkWorkspaceConfig(nxJson: Record<string, unknown>): NxPolicyI
 export function applyWorkspaceConfig(nxJson: Record<string, unknown>): boolean {
   let changed = removeDisallowedTargetDefaults(nxJson);
   changed = applyBuildTargetDefault(nxJson) || changed;
+  changed = applyTestTargetDefault(nxJson) || changed;
   changed = applyCleanTargetDefault(nxJson) || changed;
   changed = applyNamedInputDefaults(nxJson) || changed;
   const currentPlugins = Array.isArray(nxJson.plugins) ? nxJson.plugins : [];
@@ -284,6 +288,30 @@ function applyBuildTargetDefault(nxJson: Record<string, unknown>): boolean {
     }
   }
   return changed;
+}
+
+function validateTestTargetDefault(nxJson: Record<string, unknown>, nxJsonPath: string, issues: NxPolicyIssue[]): void {
+  const targetDefaults = recordProperty(nxJson, 'targetDefaults');
+  const test = targetDefaults ? recordProperty(targetDefaults, 'test') : null;
+  // Same clobber as targetDefaults.build.dependsOn: Nx replaces an inferred
+  // list rather than merging, so a workspace-wide [^build, build] unwires
+  // cargo-test from every Rust test aggregate. Cache stays allowed.
+  if (test !== null && 'dependsOn' in test) {
+    issues.push({
+      path: nxJsonPath,
+      message: 'targetDefaults.test.dependsOn must not be set; @smoothbricks/nx-plugin infers the test aggregate',
+    });
+  }
+}
+
+function applyTestTargetDefault(nxJson: Record<string, unknown>): boolean {
+  const targetDefaults = recordProperty(nxJson, 'targetDefaults');
+  const test = targetDefaults ? recordProperty(targetDefaults, 'test') : null;
+  if (test === null || !('dependsOn' in test)) {
+    return false;
+  }
+  delete test.dependsOn;
+  return true;
 }
 
 function applyCleanTargetDefault(nxJson: Record<string, unknown>): boolean {

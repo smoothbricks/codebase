@@ -189,6 +189,18 @@ describe('pure core: checkWorkspaceConfig', () => {
     expect(issues.some((i) => i.message.includes('targetDefaults.build.dependsOn must not be set'))).toBe(true);
   });
 
+  it('rejects a test dependsOn default that would clobber inferred cargo-test', () => {
+    const issues = checkWorkspaceConfig({
+      plugins: validPlugins(),
+      targetDefaults: {
+        ...validTargetDefaults(),
+        test: { cache: true, dependsOn: ['^build', 'build'] },
+      },
+      namedInputs: validNamedInputs(),
+    });
+    expect(issues.some((i) => i.message.includes('targetDefaults.test.dependsOn must not be set'))).toBe(true);
+  });
+
   it('detects missing sharedGlobals', () => {
     const issues = checkWorkspaceConfig({
       plugins: validPlugins(),
@@ -232,6 +244,19 @@ describe('pure core: applyWorkspaceConfig', () => {
     expect(applyWorkspaceConfig(nxJson)).toBe(true);
     const build = expectRecord(expectRecord(nxJson.targetDefaults).build);
     expect(build).toEqual({ cache: true });
+  });
+
+  it('strips a test dependsOn default so inferred cargo-test survives', () => {
+    const nxJson = {
+      ...validNxJson(),
+      targetDefaults: {
+        ...validTargetDefaults(),
+        test: { cache: true, dependsOn: ['^build', 'build'] },
+      },
+    };
+    expect(applyWorkspaceConfig(nxJson)).toBe(true);
+    const test = expectRecord(expectRecord(nxJson.targetDefaults).test);
+    expect(test).toEqual({ cache: true });
   });
 
   it('fixes missing plugins', () => {
