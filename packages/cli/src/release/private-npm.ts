@@ -116,11 +116,13 @@ export function resolvePrivateNpmRegistry(root: string): RegistryResult {
     );
   }
   const pathname = url.pathname.endsWith('/') ? url.pathname : `${url.pathname}/`;
-  const readTokenEnv = config.readTokenEnv ?? config.publishTokenEnv;
+  const inferred = resolvePrivateNpmWorkflowConfig(root);
+  const publishTokenEnv = config.publishTokenEnv ?? inferred?.publishTokenEnv;
+  const readTokenEnv = config.readTokenEnv ?? inferred?.readTokenEnv ?? publishTokenEnv;
   if (!readTokenEnv) {
     return configError(
       'MissingConfiguration',
-      'smoo.privateNpm must name a token environment variable (readTokenEnv or publishTokenEnv).',
+      'Private npm authentication must reference a token environment variable in .npmrc or smoo.privateNpm.',
     );
   }
   return {
@@ -130,7 +132,7 @@ export function resolvePrivateNpmRegistry(root: string): RegistryResult {
       registry: `https://${url.host}${pathname}`,
       authKey: `//${url.host}${pathname}:_authToken`,
       readTokenEnv,
-      publishTokenEnv: config.publishTokenEnv,
+      publishTokenEnv,
     },
   };
 }
@@ -240,7 +242,7 @@ export function resolvePrivateNpmWorkflowConfig(root: string): PackagePrivateNpm
   }
   const npmrcEnv = npmrcAuthTokenEnv(root, declared.scope);
   const readTokenEnv = consumes ? (declared.readTokenEnv ?? npmrcEnv) : undefined;
-  const publishTokenEnv = publishes ? (declared.publishTokenEnv ?? (consumes ? undefined : npmrcEnv)) : undefined;
+  const publishTokenEnv = publishes ? (declared.publishTokenEnv ?? npmrcEnv) : undefined;
   if (!readTokenEnv && !publishTokenEnv) {
     return undefined;
   }

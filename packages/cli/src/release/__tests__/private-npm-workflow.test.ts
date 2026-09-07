@@ -2,7 +2,7 @@ import { describe, expect, it } from 'bun:test';
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { resolvePrivateNpmWorkflowConfig } from '../private-npm.js';
+import { requirePrivateNpmRegistry, resolvePrivateNpmWorkflowConfig } from '../private-npm.js';
 
 const SCOPE = '@priv.test';
 const READ_ENV = 'PRIV_NPM_READ_TOKEN';
@@ -31,13 +31,14 @@ describe('private npm workflow token selection', () => {
       {
         privatePackage: `${SCOPE}/sdk`,
         npmrcAuthEnv: PUBLISH_ENV,
-        declared: { scope: SCOPE, publishTokenEnv: PUBLISH_ENV },
+        declared: { scope: SCOPE },
       },
       (root) => {
         expect(resolvePrivateNpmWorkflowConfig(root)).toEqual({
           scope: SCOPE,
           publishTokenEnv: PUBLISH_ENV,
         });
+        expect(requirePrivateNpmRegistry(root).publishTokenEnv).toBe(PUBLISH_ENV);
       },
     );
   });
@@ -54,6 +55,28 @@ describe('private npm workflow token selection', () => {
           scope: SCOPE,
           readTokenEnv: READ_ENV,
         });
+        expect(requirePrivateNpmRegistry(root).readTokenEnv).toBe(READ_ENV);
+      },
+    );
+  });
+
+  it('uses the npmrc credential for both operations when a scope-only repo consumes and publishes', async () => {
+    await withRepo(
+      {
+        privatePackage: `${SCOPE}/sdk`,
+        rootDeps: { [`${SCOPE}/other`]: '1.0.0' },
+        npmrcAuthEnv: READ_ENV,
+        declared: { scope: SCOPE },
+      },
+      (root) => {
+        expect(resolvePrivateNpmWorkflowConfig(root)).toEqual({
+          scope: SCOPE,
+          readTokenEnv: READ_ENV,
+          publishTokenEnv: READ_ENV,
+        });
+        const registry = requirePrivateNpmRegistry(root);
+        expect(registry.readTokenEnv).toBe(READ_ENV);
+        expect(registry.publishTokenEnv).toBe(READ_ENV);
       },
     );
   });
