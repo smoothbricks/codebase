@@ -975,3 +975,17 @@ it('linux publish jobs use smoo.github.runsOn; macOS stays macos-latest', () => 
       fromJSON('["nixos-latest-x64","self-hosted"]') || 'ubuntu-latest' }}`,
   );
 });
+
+it('runs macOS platform legs on smoo.github.macosRunsOn; default stays macos-latest', () => {
+  const configured = renderPublishWorkflowYaml({
+    repoName: '@smoothbricks/codebase',
+    platformTargetGlobs: PLATFORM_TARGET_GLOBS,
+    macosRunsOn: ['macos-arm64', 'self-hosted'],
+  });
+  expect(configured).toContain(`  macos-platform:\n    runs-on: ['macos-arm64', 'self-hosted']`);
+  const fallback = renderPublishWorkflowYaml({
+    repoName: '@smoothbricks/codebase',
+    platformTargetGlobs: PLATFORM_TARGET_GLOBS,
+  });
+  expect(fallback).toContain('  macos-platform:\n    runs-on: macos-latest');
+});

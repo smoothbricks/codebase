@@ -145,6 +145,8 @@ export interface ManagedFileContext {
   productionDeployProvider?: 'cloudflare';
   ciPushBranches: string[];
   ciRunsOn: string | string[];
+  /** macOS platform job runs-on labels from the root smoo config; default macos-latest. */
+  macosRunsOn: string | string[];
   nodeModulesCacheKey: string;
   repoName: string;
   platformTargetGlobs: string[];
@@ -369,6 +371,7 @@ function getManagedContent(file: ManagedFile, context: ManagedFileContext): stri
         platformTargetGlobs: context.platformTargetGlobs,
         macosPlatformArchitectures: context.macosPlatformArchitectures,
         runsOn: context.ciRunsOn,
+        macosRunsOn: context.macosRunsOn,
         privateNpm: context.privateNpm,
         sourceCheckouts: context.sourceCheckouts,
       });
@@ -390,8 +393,8 @@ function getManagedContent(file: ManagedFile, context: ManagedFileContext): stri
 async function getManagedFileContext(root: string): Promise<ManagedFileContext> {
   const packageJson = readPackageJson(join(root, 'package.json'));
   const repoName = packageJson?.name ?? 'monorepo';
-  const ciPushBranches = getCiPushBranches(packageJson?.json);
   const ciRunsOn = getCiRunsOn(packageJson?.json);
+  const macosRunsOn = getMacosRunsOn(packageJson?.json);
   const sourceCheckouts = packageJson?.json?.smoo?.github?.sourceCheckouts;
   // In-process Nx API → daemon socket (no second Node/`nx` CLI process).
   const nxProjects = await loadNxProjects(root);
@@ -417,6 +420,7 @@ async function getManagedFileContext(root: string): Promise<ManagedFileContext> 
     productionDeployProvider: productionDeploy.provider,
     ciPushBranches,
     ciRunsOn,
+    macosRunsOn,
     nodeModulesCacheKey,
     repoName,
     platformTargetGlobs,
@@ -514,6 +518,18 @@ function getCiRunsOn(packageJson: PackageJson | null | undefined): string | stri
   }
   const labels = configured.filter((label) => label.length > 0);
   return labels.length > 0 ? labels : 'ubuntu-latest';
+}
+
+function getMacosRunsOn(packageJson: PackageJson | null | undefined): string | string[] {
+  const configured = packageJson?.smoo?.github?.macosRunsOn;
+  if (configured === undefined) {
+    return 'macos-latest';
+  }
+  if (typeof configured === 'string') {
+    return configured.length > 0 ? configured : 'macos-latest';
+  }
+  const labels = configured.filter((label) => label.length > 0);
+  return labels.length > 0 ? labels : 'macos-latest';
 }
 
 function getCiPushBranches(packageJson: PackageJson | null | undefined): string[] {
