@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import { getStaticTOMLValue, parseTOML } from 'toml-eslint-parser';
 import typia from 'typia';
 import { cloneEnvBlock } from './prepare-env.js';
+import { derivedStagingName, replaceExactToken, replaceHostnameLabel } from './stage-labels.js';
 
 export type DeploymentStage = 'staging' | 'production' | `pr${number}`;
 
@@ -167,20 +168,13 @@ export function planPullRequestResources(
         `Staging KV binding ${binding} references namespace ${id}, which is absent from the account listing.`,
       );
     }
-    const title = replaceExactToken(stagingNamespace.title, 'staging', stage);
-    if (title === stagingNamespace.title) {
-      throw new Error(`Staging KV namespace title ${stagingNamespace.title} has no exact staging segment.`);
-    }
+    const title = derivedStagingName(stagingNamespace.title, stage, 'Staging KV namespace title');
     return { binding, stagingId: id, stagingTitle: stagingNamespace.title, title };
   });
   const r2Buckets = readRows(staging.r2_buckets).map((row) => {
     const binding = requiredString(row, 'binding', 'R2 binding');
     const stagingBucket = requiredString(row, 'bucket_name', `R2 binding ${binding}`);
-    const bucketName = replaceExactToken(stagingBucket, 'staging', stage);
-    if (bucketName === stagingBucket) {
-      throw new Error(`Staging R2 bucket ${stagingBucket} has no exact staging segment.`);
-    }
-    return { binding, bucketName };
+    return { binding, bucketName: derivedStagingName(stagingBucket, stage, 'Staging R2 bucket') };
   });
   const routes = readRows(staging.routes).map((row) => ({
     pattern: replaceHostnameLabel(requiredString(row, 'pattern', 'route'), stage),
@@ -311,15 +305,6 @@ export function rateLimitNamespaceId(
   const digest = createHash('sha256').update(`${accountId}:${workerBaseName}:${token}:${bindingName}`).digest();
   const value = digest.readUInt32BE(0) & 0x7fff_ffff;
   return String(value === 0 ? 1 : value);
-}
-
-function replaceHostnameLabel(value: string, stage: `pr${number}`): string {
-  return value.replace(/(^|[.@/])staging(?=\.)/g, `$1${stage}`);
-}
-
-function replaceExactToken(value: string, from: string, to: string): string {
-  const escaped = from.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  return value.replace(new RegExp(`(^|[-.])${escaped}(?=$|[-.])`, 'g'), `$1${to}`);
 }
 
 function readKvBindings(value: unknown): KvBinding[] {

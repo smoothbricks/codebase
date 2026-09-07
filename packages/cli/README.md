@@ -537,6 +537,30 @@ The release flow is designed to be rerun after partial failure. Nx owns local ve
 durable completion state from the remote branch, release tags, npm registry versions, and GitHub Releases. Repeated
 Publish runs converge without self-spawning another workflow run.
 
+## Wrangler Commands
+
+### `smoo wrangler deploy-stage --stage <stage> [--config <path>]`
+
+Without `--config`, deploys `./wrangler.toml` with `--env <stage>`; a `prN` stage is derived from `[env.staging]`.
+
+With `--config <path>` the target is a build-generated, env-block-free `wrangler.json` (what the Cloudflare Vite and
+Astro adapters emit). `staging` and `production` deploy it as-is, with no `--env` flag. A `prN` stage treats it as the
+staging template and derives a copy beside it: worker name (`<base>-prN` from a `-staging` name), routes and vars by
+hostname label (hosts without a `staging` label are pinned to staging and dropped; a template whose routes are all
+pinned is refused, since the stage would deploy unrouted), KV namespaces created by title, R2 buckets, D1 databases
+created by name with their migrations applied, `services` bindings and rate limits. Cleanup (`cleanup-pr`) removes every
+resource carrying the `prN` segment, D1 included.
+
+- `--config` deploys ignore `CLOUDFLARE_ENV`. There is no `--env` flag for a flat config, so wrangler would otherwise
+  fall back to that variable and rename the worker after it.
+- The secrets manifest (`.dev.vars.example`) and the temporary secrets file come from the working directory, not from
+  beside the `--config` file.
+- Migrations run only for the D1 bindings that declare a `migrations_dir`.
+- For a `prN` stage, an R2 bucket or D1 database whose name has no exact `staging` segment is refused, before any
+  Cloudflare resource is created: reusing the name verbatim would share staging's data with the pull request.
+- A non-wildcard route gets no DNS record from this command; the stage's wildcard record must already exist.
+- Intended for CI. An interactive run blocks on wrangler's migration confirmation prompt.
+
 ## Why This Shape
 
 The important design goal is one source of truth per convention:

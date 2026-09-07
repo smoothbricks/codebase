@@ -99,7 +99,8 @@ export function printCommandOutput(stdout: string, stderr: string): void {
   }
 }
 
-function mergeEnv(env: Record<string, string>): Record<string, string> {
+/** This process's environment with `env` overlaid: the one overlay every child the CLI spawns is given. */
+export function mergeEnv(env: Record<string, string>): Record<string, string> {
   const merged: Record<string, string> = {};
   for (const [key, value] of Object.entries(process.env)) {
     if (value !== undefined) {
