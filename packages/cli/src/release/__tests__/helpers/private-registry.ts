@@ -168,12 +168,16 @@ async function startFixtureRegistry(options: { root: string; owner: string }): P
   const requests: FixtureRegistryRequest[] = [];
   const packDir = join(options.root, `pack-${options.owner || 'public'}`);
   await mkdir(packDir, { recursive: true });
+  // `origin` is only known once the ephemeral server binds, but the handler
+  // needs it for packument base URLs. A mutable binding plus an explicit
+  // fetch signature keeps the initializer from inferring through itself.
+  let originRef = '';
   let failure: number | null = null;
 
   const server = Bun.serve({
     hostname: '127.0.0.1',
     port: 0,
-    fetch(request) {
+    fetch(request: Request): Response {
       const url = new URL(request.url);
       const path = decodeURIComponent(url.pathname);
       requests.push({
@@ -205,11 +209,12 @@ async function startFixtureRegistry(options: { root: string; owner: string }): P
       if (!pkg) {
         return registryError(404, `${rest} is not published to the fixture registry`);
       }
-      return Response.json(packument(pkg, `${origin}${base}`));
+      return Response.json(packument(pkg, `${originRef}${base}`));
     },
   });
 
-  const origin = `http://127.0.0.1:${server.port}`;
+  const origin = originRef || `http://127.0.0.1:${server.port}`;
+  originRef = origin;
   const registryUrl = new URL(`${origin}${base}`);
 
   return {
