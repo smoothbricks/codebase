@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from 'bun:test';
 import { existsSync, readFileSync, statSync } from 'node:fs';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type {
@@ -13,7 +13,15 @@ import type {
   WorkerRoute,
   WorkerScript,
 } from './cloudflare.js';
-import { cleanupPullRequest, deployStage, type ProcessResult, type ProcessRunner } from './deploy-stage.js';
+import {
+  childEnvironment,
+  cleanupPullRequest,
+  deployStage,
+  type ProcessResult,
+  type ProcessRunner,
+  type ProcessRunOptions,
+  writeTemporaryConfigForTest,
+} from './deploy-stage.js';
 import type { LiveKvNamespace } from './stage.js';
 
 const HASH = '16577780061662788004';
@@ -43,19 +51,21 @@ afterEach(async () => {
 });
 
 class FakeRunner implements ProcessRunner {
-  readonly calls: string[][] = [];
+  readonly calls: { command: string; args: string[]; cwd: string; env: NodeJS.ProcessEnv }[] = [];
   configPathSeen: string | undefined;
   secretsPathSeen: string | undefined;
   secretsMode: number | undefined;
   secretsJson: string | undefined;
+  /** Runs before the fake reports success, so a test can read a temporary file the command was handed. */
+  onCall: ((args: string[], cwd: string) => Promise<void>) | undefined;
 
   constructor(
-    private readonly versions: unknown,
-    private readonly deployment: unknown,
+    private readonly versions: unknown = [],
+    private readonly deployment: unknown = {},
   ) {}
 
-  async run(_command: string, args: string[]): Promise<ProcessResult> {
-    this.calls.push(args);
+  async run(command: string, args: string[], options: ProcessRunOptions): Promise<ProcessResult> {
+    this.calls.push({ command, args, cwd: options.cwd, env: childEnvironment(options) });
     if (args[0] === 'versions' && args[1] === 'list') {
       return success(this.versions);
     }
@@ -74,6 +84,7 @@ class FakeRunner implements ProcessRunner {
       this.secretsMode = statSync(secretsPath).mode & 0o777;
       this.secretsJson = readFileSync(secretsPath, 'utf8');
     }
+    await this.onCall?.(args, options.cwd);
     return success({});
   }
 }
@@ -95,7 +106,7 @@ class FakeCloudflare implements CloudflareClient {
   }
   async createKvNamespace(title: string): Promise<LiveKvNamespace> {
     this.mutations.push(`create-kv:${title}`);
-    const namespace = { id: `id-${title}`, title };
+    const namespace = { id: `kv-${title}`, title };
     this.namespaces.push(namespace);
     return namespace;
   }
@@ -175,10 +186,10 @@ describe('deploy-stage remote version fallback', () => {
       versions: [{ version_id: 'version-1', percentage: 100 }],
     });
 
-    const result = await deployStage(root, 'pr123', dependencies(runner, new FakeCloudflare()));
+    const result = await deployStage(root, { stage: 'pr123' }, dependencies(runner, new FakeCloudflare()));
 
     expect(result.action).toBe('remote-cache-hit');
-    expect(runner.calls.map((args) => args.slice(0, 2))).toEqual([
+    expect(runner.calls.map((call) => call.args.slice(0, 2))).toEqual([
       ['versions', 'list'],
       ['deployments', 'status'],
     ]);
@@ -190,10 +201,10 @@ describe('deploy-stage remote version fallback', () => {
       versions: [{ version_id: 'version-2', percentage: 100 }],
     });
 
-    const result = await deployStage(root, 'pr123', dependencies(runner, new FakeCloudflare()));
+    const result = await deployStage(root, { stage: 'pr123' }, dependencies(runner, new FakeCloudflare()));
 
     expect(result.action).toBe('activated');
-    expect(runner.calls.at(-1)?.slice(0, 3)).toEqual(['versions', 'deploy', '--version-tag']);
+    expect(runner.calls.at(-1)?.args.slice(0, 3)).toEqual(['versions', 'deploy', '--version-tag']);
     expect(runner.configPathSeen).toBeDefined();
     expect(existsSync(requiredTestValue(runner.configPathSeen, 'config path'))).toBe(false);
   });
@@ -203,22 +214,26 @@ describe('deploy-stage remote version fallback', () => {
     await writeFile(join(root, '.dev.vars.example'), 'FIXTURE_SECRET=""\nFIXTURE_TOKEN=""\n');
     const runner = new FakeRunner([], { versions: [{ version_id: 'version-2', percentage: 100 }] });
 
-    const result = await deployStage(root, 'pr123', {
-      ...dependencies(runner, new FakeCloudflare()),
-      processEnv: {
-        CLOUDFLARE_ACCOUNT_ID: 'account-1',
-        CLOUDFLARE_API_TOKEN: 'token',
-        NX_TASK_HASH: HASH,
-        NX_TASK_TARGET_PROJECT: 'fixture',
-        FIXTURE_SECRET: 'shared-secret',
-        FIXTURE_TOKEN: 'encryption-secret',
+    const result = await deployStage(
+      root,
+      { stage: 'pr123' },
+      {
+        ...dependencies(runner, new FakeCloudflare()),
+        processEnv: {
+          CLOUDFLARE_ACCOUNT_ID: 'account-1',
+          CLOUDFLARE_API_TOKEN: 'token',
+          NX_TASK_HASH: HASH,
+          NX_TASK_TARGET_PROJECT: 'fixture',
+          FIXTURE_SECRET: 'shared-secret',
+          FIXTURE_TOKEN: 'encryption-secret',
+        },
       },
-    });
+    );
 
     expect(result.action).toBe('deployed');
-    expect(runner.calls.at(-1)?.[0]).toBe('deploy');
-    expect(runner.calls.at(-1)).toContain('--tag');
-    expect(runner.calls.at(-1)).toContain(`nx-${HASH}`);
+    expect(runner.calls.at(-1)?.args[0]).toBe('deploy');
+    expect(runner.calls.at(-1)?.args).toContain('--tag');
+    expect(runner.calls.at(-1)?.args).toContain(`nx-${HASH}`);
     expect(runner.secretsMode).toBe(0o600);
     expect(JSON.parse(requiredTestValue(runner.secretsJson, 'secrets JSON'))).toEqual({
       FIXTURE_SECRET: 'shared-secret',
@@ -234,15 +249,19 @@ describe('deploy-stage remote version fallback', () => {
     const runner = new FakeRunner([], {});
     const cloudflare = new FakeCloudflare();
 
-    const result = await deployStage(root, 'staging', {
-      runner,
-      cloudflare,
-      processEnv: {
-        CLOUDFLARE_ACCOUNT_ID: 'account-1',
-        CLOUDFLARE_API_TOKEN: 'token',
-        FIXTURE_SECRET: 'shared-secret',
+    const result = await deployStage(
+      root,
+      { stage: 'staging' },
+      {
+        runner,
+        cloudflare,
+        processEnv: {
+          CLOUDFLARE_ACCOUNT_ID: 'account-1',
+          CLOUDFLARE_API_TOKEN: 'token',
+          FIXTURE_SECRET: 'shared-secret',
+        },
       },
-    });
+    );
 
     expect(result.action).toBe('deployed');
     expect(JSON.parse(requiredTestValue(runner.secretsJson, 'secrets JSON'))).toEqual({
@@ -258,15 +277,19 @@ describe('deploy-stage remote version fallback', () => {
     cloudflare.scripts = [];
 
     await expect(
-      deployStage(root, 'pr123', {
-        ...dependencies(new FakeRunner([], {}), cloudflare),
-        processEnv: {
-          CLOUDFLARE_ACCOUNT_ID: 'account-1',
-          CLOUDFLARE_API_TOKEN: 'token',
-          NX_TASK_HASH: HASH,
-          NX_TASK_TARGET_PROJECT: 'fixture',
+      deployStage(
+        root,
+        { stage: 'pr123' },
+        {
+          ...dependencies(new FakeRunner([], {}), cloudflare),
+          processEnv: {
+            CLOUDFLARE_ACCOUNT_ID: 'account-1',
+            CLOUDFLARE_API_TOKEN: 'token',
+            NX_TASK_HASH: HASH,
+            NX_TASK_TARGET_PROJECT: 'fixture',
+          },
         },
-      }),
+      ),
     ).rejects.toThrow(/FIXTURE_SECRET/);
     expect(cloudflare.mutations).toEqual([]);
   });
@@ -282,7 +305,7 @@ describe('deploy-stage remote version fallback', () => {
       throw new Error('record already exists');
     };
 
-    const result = await deployStage(root, 'pr123', dependencies(new FakeRunner([], {}), cloudflare));
+    const result = await deployStage(root, { stage: 'pr123' }, dependencies(new FakeRunner([], {}), cloudflare));
 
     expect(result.action).toBe('deployed');
     expect(createAttempts).toBe(1);
@@ -359,6 +382,300 @@ describe('cleanup-pr exact stage matching', () => {
     expect(result.deleted.d1Databases).toBe(1);
   });
 });
+
+// What the Cloudflare Astro adapter writes under the build output: one flat
+// document, already resolved for staging, with its paths relative to itself.
+const FLAT_FIXTURE = JSON.stringify(
+  {
+    name: 'fixture-website-preview-staging',
+    main: 'entry.mjs',
+    targetEnvironment: 'staging',
+    assets: { binding: 'ASSETS', directory: '../client' },
+    routes: [
+      { pattern: 'next.example.com', custom_domain: true },
+      { pattern: 'site.staging.example.test/*', zone_name: 'example.test' },
+    ],
+    vars: { EXAMPLE_SAAS_ENDPOINT: 'https://app.staging.example.test' },
+    kv_namespaces: [{ binding: 'SESSION', id: 'kv-staging' }],
+    d1_databases: [
+      {
+        binding: 'DB',
+        database_name: 'fixture-website-staging-db',
+        database_id: 'd1-staging',
+        migrations_dir: '../../migrations',
+      },
+    ],
+    services: [{ binding: 'BACKEND', service: 'fixture-backend-staging' }],
+  },
+  null,
+  2,
+);
+
+// A production build output: it carries its own name, with no -staging suffix to derive from.
+const FLAT_PRODUCTION_FIXTURE = JSON.stringify(
+  {
+    name: 'fixture-website',
+    main: 'entry.mjs',
+    assets: { binding: 'ASSETS', directory: '../client' },
+    routes: [{ pattern: 'www.example.test/*', zone_name: 'example.test' }],
+    d1_databases: [
+      {
+        binding: 'DB',
+        database_name: 'fixture-website-db',
+        database_id: 'd1-production',
+        migrations_dir: '../../migrations',
+      },
+    ],
+  },
+  null,
+  2,
+);
+
+async function flatFixtureRoot(fixture = FLAT_FIXTURE): Promise<{ root: string; configPath: string }> {
+  const root = await mkdtemp(join(tmpdir(), 'smoo-wrangler-flat-'));
+  roots.push(root);
+  const serverDir = join(root, '.out', 'server');
+  await mkdir(serverDir, { recursive: true });
+  const configPath = join(serverDir, 'wrangler.json');
+  await writeFile(configPath, fixture);
+  return { root, configPath };
+}
+
+describe('deployStage with a flat JSON config', () => {
+  it('deploys staging as-is without an --env flag and applies D1 migrations', async () => {
+    const { root, configPath } = await flatFixtureRoot();
+    const runner = new FakeRunner();
+    const cloudflare = new FakeCloudflare();
+    cloudflare.namespaces = [{ id: 'kv-staging', title: 'fixture-SESSION-staging' }];
+    cloudflare.d1Databases = [{ uuid: 'd1-staging', name: 'fixture-website-staging-db' }];
+    cloudflare.zones = [{ id: 'zone-1', name: 'example.test' }];
+
+    // The build that produced the config runs with CLOUDFLARE_ENV set, so the deploy process inherits it.
+    const result = await withProcessEnv({ CLOUDFLARE_ENV: 'staging', CLOUDFLARE_ACCOUNT_ID: 'account-1' }, () =>
+      deployStage(root, { stage: 'staging', config: configPath }, dependencies(runner, cloudflare)),
+    );
+
+    expect(result).toEqual({
+      stage: 'staging',
+      workerName: 'fixture-website-preview-staging',
+      action: 'deployed',
+      versionTag: `nx-${HASH}`,
+    });
+    const migrate = runner.calls.find((call) => call.args[0] === 'd1');
+    expect(migrate?.args).toEqual(['d1', 'migrations', 'apply', 'DB', '--remote', '--config', configPath]);
+    const deploy = runner.calls.find((call) => call.args[0] === 'deploy');
+    expect(deploy?.args).toEqual(['deploy', '--config', configPath, '--tag', `nx-${HASH}`]);
+    // Without --env, wrangler would fall back to CLOUDFLARE_ENV and rename the worker after it; the
+    // rest of the inherited environment, the account id included, still reaches wrangler.
+    for (const call of runner.calls) {
+      expect(call.env.CLOUDFLARE_ENV).toBeUndefined();
+      expect(call.env.CLOUDFLARE_ACCOUNT_ID).toBe('account-1');
+      expect(call.env.PATH).toBe(process.env.PATH);
+    }
+  });
+
+  it('leaves a D1 binding without a migrations directory unmigrated', async () => {
+    const { root, configPath } = await flatFixtureRoot(
+      JSON.stringify({
+        ...JSON.parse(FLAT_FIXTURE),
+        d1_databases: [{ binding: 'DB', database_name: 'fixture-website-staging-db', database_id: 'd1-staging' }],
+      }),
+    );
+    const runner = new FakeRunner();
+    const cloudflare = new FakeCloudflare();
+    cloudflare.namespaces = [{ id: 'kv-staging', title: 'fixture-SESSION-staging' }];
+    cloudflare.d1Databases = [{ uuid: 'd1-staging', name: 'fixture-website-staging-db' }];
+    cloudflare.zones = [{ id: 'zone-1', name: 'example.test' }];
+
+    const result = await deployStage(root, { stage: 'staging', config: configPath }, dependencies(runner, cloudflare));
+
+    expect(result.action).toBe('deployed');
+    expect(runner.calls.map((call) => call.args[0])).not.toContain('d1');
+  });
+
+  it('derives a pull-request stage beside the original, creating KV and D1 and rewriting the service', async () => {
+    const { root, configPath } = await flatFixtureRoot();
+    const runner = new FakeRunner();
+    const cloudflare = new FakeCloudflare();
+    cloudflare.namespaces = [{ id: 'kv-staging', title: 'fixture-SESSION-staging' }];
+    cloudflare.d1Databases = [{ uuid: 'd1-staging', name: 'fixture-website-staging-db' }];
+    cloudflare.zones = [{ id: 'zone-1', name: 'example.test' }];
+    let derivedConfig: Record<string, unknown> | undefined;
+    runner.onCall = async (args) => {
+      if (args[0] !== 'deploy') return;
+      const index = args.indexOf('--config');
+      derivedConfig = JSON.parse(await readFile(args[index + 1] ?? '', 'utf8'));
+    };
+
+    const result = await deployStage(root, { stage: 'pr7', config: configPath }, dependencies(runner, cloudflare));
+
+    expect(result.workerName).toBe('fixture-website-preview-pr7');
+    expect(cloudflare.mutations).toContain('create-kv:fixture-SESSION-pr7');
+    expect(cloudflare.mutations).toContain('create-d1:fixture-website-pr7-db');
+    expect(derivedConfig).toMatchObject({
+      name: 'fixture-website-preview-pr7',
+      routes: [{ pattern: 'site.pr7.example.test/*', zone_name: 'example.test' }],
+      vars: { EXAMPLE_SAAS_ENDPOINT: 'https://app.pr7.example.test' },
+      kv_namespaces: [{ binding: 'SESSION', id: 'kv-fixture-SESSION-pr7' }],
+      d1_databases: [
+        { binding: 'DB', database_name: 'fixture-website-pr7-db', database_id: 'd1-fixture-website-pr7-db' },
+      ],
+      services: [{ binding: 'BACKEND', service: 'fixture-backend-pr7' }],
+    });
+    const deploy = runner.calls.find((call) => call.args[0] === 'deploy');
+    expect(deploy?.args).not.toContain('--env');
+    expect(deploy?.args[2]?.startsWith(join(root, '.out', 'server', '.wrangler.smoo-'))).toBe(true);
+    // The migrations must run against the derived config, not the staging template beside it.
+    const migrate = runner.calls.find((call) => call.args[0] === 'd1');
+    expect(migrate?.args.slice(0, 5)).toEqual(['d1', 'migrations', 'apply', 'DB', '--remote']);
+    expect(migrate?.args.at(-1)).toBe(deploy?.args[2]);
+    // The derived file is removed afterwards.
+    const leftovers = (await readdir(join(root, '.out', 'server'))).filter((name) =>
+      name.startsWith('.wrangler.smoo-'),
+    );
+    expect(leftovers).toEqual([]);
+  });
+
+  it('deploys a production config as-is, with no derivation and no --env flag', async () => {
+    const { root, configPath } = await flatFixtureRoot(FLAT_PRODUCTION_FIXTURE);
+    const runner = new FakeRunner();
+    const cloudflare = new FakeCloudflare();
+    cloudflare.zones = [{ id: 'zone-1', name: 'example.test' }];
+
+    const result = await deployStage(
+      root,
+      { stage: 'production', config: configPath },
+      dependencies(runner, cloudflare),
+    );
+
+    expect(result).toEqual({
+      stage: 'production',
+      workerName: 'fixture-website',
+      action: 'deployed',
+      versionTag: `nx-${HASH}`,
+    });
+    const migrate = runner.calls.find((call) => call.args[0] === 'd1');
+    expect(migrate?.args).toEqual(['d1', 'migrations', 'apply', 'DB', '--remote', '--config', configPath]);
+    const deploy = runner.calls.find((call) => call.args[0] === 'deploy');
+    expect(deploy?.args).toEqual(['deploy', '--config', configPath, '--tag', `nx-${HASH}`]);
+    const leftovers = (await readdir(join(root, '.out', 'server'))).filter((name) =>
+      name.startsWith('.wrangler.smoo-'),
+    );
+    expect(leftovers).toEqual([]);
+  });
+
+  it('skips the D1 migrations when the tagged build is already the live deployment', async () => {
+    const { root, configPath } = await flatFixtureRoot();
+    const runner = new FakeRunner([{ id: 'version-1', annotations: { 'workers/tag': `nx-${HASH}` } }], {
+      versions: [{ version_id: 'version-1', percentage: 100 }],
+    });
+    const cloudflare = new FakeCloudflare();
+    cloudflare.namespaces = [{ id: 'kv-staging', title: 'fixture-SESSION-staging' }];
+    cloudflare.d1Databases = [{ uuid: 'd1-staging', name: 'fixture-website-staging-db' }];
+    cloudflare.zones = [{ id: 'zone-1', name: 'example.test' }];
+    cloudflare.scripts = [{ id: 'fixture-website-preview-staging' }];
+    cloudflare.domains = [{ id: 'domain-1', hostname: 'next.example.com', service: 'fixture-website-preview-staging' }];
+
+    const result = await deployStage(root, { stage: 'staging', config: configPath }, dependencies(runner, cloudflare));
+
+    expect(result.action).toBe('remote-cache-hit');
+    expect(runner.calls.map((call) => call.args.slice(0, 2))).toEqual([
+      ['versions', 'list'],
+      ['deployments', 'status'],
+    ]);
+  });
+
+  it('refuses an all-pinned template before mutating Cloudflare', async () => {
+    const { root, configPath } = await flatFixtureRoot(
+      JSON.stringify({
+        ...JSON.parse(FLAT_FIXTURE),
+        routes: [{ pattern: 'next.example.com', custom_domain: true }],
+      }),
+    );
+    const cloudflare = new FakeCloudflare();
+    cloudflare.namespaces = [{ id: 'kv-staging', title: 'fixture-SESSION-staging' }];
+
+    await expect(
+      deployStage(root, { stage: 'pr7', config: configPath }, dependencies(new FakeRunner(), cloudflare)),
+    ).rejects.toThrow(/pinned/);
+    expect(cloudflare.mutations).toEqual([]);
+  });
+
+  it('refuses an R2 bucket the stage would share with staging, before mutating Cloudflare', async () => {
+    const { root, configPath } = await flatFixtureRoot(
+      JSON.stringify({
+        ...JSON.parse(FLAT_FIXTURE),
+        r2_buckets: [{ binding: 'MEDIA', bucket_name: 'shared-media' }],
+      }),
+    );
+    const cloudflare = new FakeCloudflare();
+    cloudflare.namespaces = [{ id: 'kv-staging', title: 'fixture-SESSION-staging' }];
+
+    await expect(
+      deployStage(root, { stage: 'pr7', config: configPath }, dependencies(new FakeRunner(), cloudflare)),
+    ).rejects.toThrow(/no exact staging segment/);
+    expect(cloudflare.mutations).toEqual([]);
+  });
+
+  it('rejects a first flat PR Worker with missing manifest secrets before mutating Cloudflare', async () => {
+    const { root, configPath } = await flatFixtureRoot();
+    // The manifest is read from the working directory, not from beside the --config file.
+    await writeFile(join(root, '.dev.vars.example'), 'FIXTURE_SECRET=""\n');
+    const cloudflare = new FakeCloudflare();
+    cloudflare.namespaces = [{ id: 'kv-staging', title: 'fixture-SESSION-staging' }];
+    cloudflare.scripts = [];
+
+    await expect(
+      deployStage(root, { stage: 'pr7', config: configPath }, dependencies(new FakeRunner(), cloudflare)),
+    ).rejects.toThrow(/requires process environment values/);
+    expect(cloudflare.mutations).toEqual([]);
+  });
+
+  it('refuses a config with env blocks', async () => {
+    const { root, configPath } = await flatFixtureRoot();
+    await writeFile(configPath, JSON.stringify({ name: 'x-staging', env: { staging: {} } }));
+
+    await expect(
+      deployStage(root, { stage: 'staging', config: configPath }, dependencies(new FakeRunner(), new FakeCloudflare())),
+    ).rejects.toThrow(/env blocks/);
+  });
+
+  it('names the config file when it is not JSON', async () => {
+    const { root, configPath } = await flatFixtureRoot('{');
+
+    await expect(
+      deployStage(root, { stage: 'staging', config: configPath }, dependencies(new FakeRunner(), new FakeCloudflare())),
+    ).rejects.toThrow(`${configPath} is not valid JSON: `);
+  });
+});
+
+describe('writeTemporaryConfig', () => {
+  it('removes the file it created when the write itself fails', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'smoo-wrangler-write-'));
+    roots.push(root);
+    const path = join(root, '.wrangler.smoo-blocked.json');
+    // A path that exists but cannot be written to: the write fails with the file already on disk.
+    await writeFile(path, 'stale', { mode: 0o400 });
+
+    await expect(writeTemporaryConfigForTest(path, '{}\n')).rejects.toThrow();
+
+    expect(await readdir(root)).toEqual([]);
+  });
+});
+
+/** Runs `action` with the variables set on this process, restoring the previous values afterwards. */
+async function withProcessEnv<T>(variables: Record<string, string>, action: () => Promise<T>): Promise<T> {
+  const previous = Object.fromEntries(Object.keys(variables).map((name) => [name, process.env[name]]));
+  Object.assign(process.env, variables);
+  try {
+    return await action();
+  } finally {
+    for (const [name, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+  }
+}
 
 async function fixtureRoot(toml = FIXTURE): Promise<string> {
   const root = await mkdtemp(join(tmpdir(), 'smoo-wrangler-test-'));

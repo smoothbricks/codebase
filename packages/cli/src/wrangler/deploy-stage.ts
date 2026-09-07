@@ -1,10 +1,18 @@
 import { randomUUID } from 'node:crypto';
 import { existsSync, readFileSync } from 'node:fs';
 import { readFile, rm, writeFile } from 'node:fs/promises';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import typia from 'typia';
-import { printCommandOutput } from '../lib/run.js';
-import { type CloudflareClient, CloudflareRestClient } from './cloudflare.js';
+import { parseJsonFileText } from '../lib/json.js';
+import { mergeEnv, printCommandOutput } from '../lib/run.js';
+import { type CloudflareClient, CloudflareRestClient, type D1DatabaseRecord } from './cloudflare.js';
+import {
+  deriveFlatPullRequestConfig,
+  type FlatWranglerConfig,
+  parseFlatWranglerConfig,
+  planFlatPullRequestResources,
+  planFlatStageResources,
+} from './flat-config.js';
 import { parseDevVarsExample } from './prepare-env.js';
 import {
   type ConfiguredStageResourcePlan,
@@ -12,6 +20,7 @@ import {
   derivePullRequestWranglerConfig,
   hasExactStageSegment,
   isPullRequestStage,
+  type LiveKvNamespace,
   parseDeploymentStage,
   planConfiguredStageResources,
   planPullRequestResources,
@@ -25,19 +34,30 @@ export interface ProcessResult {
   stderr: string;
 }
 
+export interface ProcessRunOptions {
+  cwd: string;
+  /** Overlaid on this process's environment, as `lib/run.ts` merges it; the child inherits everything else. */
+  env?: Record<string, string>;
+  /** Withheld from the child after the overlay: an overlay alone cannot unset a variable this process inherited. */
+  unsetEnv?: string[];
+}
+
 export interface ProcessRunner {
-  run(command: string, args: string[], options: { cwd: string; env?: Record<string, string> }): Promise<ProcessResult>;
+  run(command: string, args: string[], options: ProcessRunOptions): Promise<ProcessResult>;
+}
+
+/** The child environment `options` describe; every runner, test doubles included, spawns with exactly this. */
+export function childEnvironment(options: ProcessRunOptions): NodeJS.ProcessEnv {
+  const env = mergeEnv(options.env ?? {});
+  for (const name of options.unsetEnv ?? []) delete env[name];
+  return env;
 }
 
 export class BunProcessRunner implements ProcessRunner {
-  async run(
-    command: string,
-    args: string[],
-    options: { cwd: string; env?: Record<string, string> },
-  ): Promise<ProcessResult> {
+  async run(command: string, args: string[], options: ProcessRunOptions): Promise<ProcessResult> {
     const child = Bun.spawn([command, ...args], {
       cwd: options.cwd,
-      env: { ...process.env, ...options.env },
+      env: childEnvironment(options),
       stdin: 'inherit',
       stdout: 'pipe',
       stderr: 'pipe',
@@ -66,12 +86,19 @@ export interface DeployStageResult {
 
 const isUnknownRecord = typia.createIs<Record<string, unknown>>();
 
+export interface DeployStageOptions {
+  /** `staging`, `production`, or `prN`. */
+  stage: string;
+  /** A build-generated flat wrangler.json to deploy instead of `./wrangler.toml` (see `prepareFlatConfig`). */
+  config?: string;
+}
+
 export async function deployStage(
   cwd: string,
-  stageValue: string,
+  options: DeployStageOptions,
   dependencies: WranglerCommandDependencies = {},
 ): Promise<DeployStageResult> {
-  const stage = parseDeploymentStage(stageValue);
+  const stage = parseDeploymentStage(options.stage);
   const processEnv = dependencies.processEnv ?? process.env;
   const accountId = processEnv.CLOUDFLARE_ACCOUNT_ID;
   const apiToken = processEnv.CLOUDFLARE_API_TOKEN;
@@ -80,8 +107,6 @@ export async function deployStage(
     dependencies.cloudflare ??
     new CloudflareRestClient(accountId, requiredEnvironmentValue(apiToken, 'CLOUDFLARE_API_TOKEN'));
   const runner = dependencies.runner ?? new BunProcessRunner();
-  const committedConfigPath = join(cwd, 'wrangler.toml');
-  const committedToml = await readFile(committedConfigPath, 'utf8');
   const secretNames = readSecretNames(cwd);
   const secretValues: Record<string, string> = {};
   for (const name of secretNames) {
@@ -89,102 +114,73 @@ export async function deployStage(
     if (value) secretValues[name] = value;
   }
   const missingSecrets = secretNames.filter((name) => !processEnv[name]);
-  let configPath = committedConfigPath;
   let temporaryConfigPath: string | undefined;
   let temporarySecretsPath: string | undefined;
   try {
-    if (isPullRequestStage(stage)) {
-      const staging = planConfiguredStageResources(committedToml, 'staging');
-      if (!staging.workerName.endsWith('-staging')) {
-        throw new Error('[env.staging].name must end with the exact suffix -staging.');
-      }
-      const workerName = stageResourceName(staging.workerName.slice(0, -'-staging'.length), stage);
-      const firstDeployment = !(await cloudflare.listWorkerScripts()).some((script) => script.id === workerName);
-      if (firstDeployment && missingSecrets.length > 0) {
-        throw new Error(
-          `First deployment of ${workerName} requires process environment values for: ${missingSecrets.join(', ')}.`,
-        );
-      }
-      const liveNamespaces = await cloudflare.listKvNamespaces();
-      const plan = planPullRequestResources(committedToml, stage, liveNamespaces);
-      const derivedIds = new Map<string, string>();
-      const byTitle = new Map(liveNamespaces.map((namespace) => [namespace.title, namespace]));
-      for (const namespace of plan.kvNamespaces) {
-        let live = byTitle.get(namespace.title);
-        if (!live) {
-          try {
-            live = await cloudflare.createKvNamespace(namespace.title);
-          } catch (error) {
-            live = (await cloudflare.listKvNamespaces()).find((candidate) => candidate.title === namespace.title);
-            if (!live) throw error;
-          }
-          byTitle.set(live.title, live);
-        }
-        derivedIds.set(namespace.stagingId, live.id);
-      }
-      const derivedToml = derivePullRequestWranglerConfig(committedToml, {
-        stage: stage,
-        accountId,
-        kvNamespaceIds: derivedIds,
-      });
-      temporaryConfigPath = join(cwd, `.wrangler.smoo-${process.pid}-${randomUUID()}.toml`);
-      await writeFile(temporaryConfigPath, derivedToml, { mode: 0o600 });
-      configPath = temporaryConfigPath;
-    }
-
-    const toml = configPath === committedConfigPath ? committedToml : await readFile(configPath, 'utf8');
-    const plan = planConfiguredStageResources(toml, stage);
-    const workerExists = await reconcileStageResources(plan, cloudflare);
+    const prepared = options.config
+      ? await prepareFlatConfig(options.config, stage, accountId, missingSecrets, cloudflare)
+      : await prepareTomlConfig(cwd, stage, accountId, missingSecrets, cloudflare);
+    temporaryConfigPath = prepared.temporaryConfigPath;
+    const workerExists = await reconcileStageResources(prepared.plan, cloudflare);
     const versionTag = nxTaskVersionTag(processEnv);
-    const commandContext = { cwd, configPath, stage, workerName: plan.workerName };
+    const envArgs = prepared.envFlag ? ['--env', prepared.envFlag] : [];
+    // Without `--env`, wrangler falls back to `CLOUDFLARE_ENV` and, for a config with no env blocks,
+    // renames the worker `<name>-<CLOUDFLARE_ENV>`. The build that produced the flat config is the
+    // caller that sets the variable, so the deploy would silently succeed under a name neither
+    // `reconcileStageResources` nor `versions list` looks at.
+    const run: ProcessRunOptions = prepared.envFlag ? { cwd } : { cwd, unsetEnv: ['CLOUDFLARE_ENV'] };
+    const workerName = prepared.plan.workerName;
 
+    // The tagged-version lookup runs before the migrations: a cache hit means this exact build is
+    // already live, so its migrations ran with it and re-applying them would touch the remote
+    // database for nothing. The activation and upload paths below still migrate first.
+    let taggedVersionId: string | null = null;
     if (versionTag && workerExists) {
-      const versions = await wranglerJson(runner, ['versions', 'list', '--name', plan.workerName, '--json'], cwd);
-      const deployments = await wranglerJson(
-        runner,
-        ['deployments', 'status', '--name', plan.workerName, '--json'],
-        cwd,
-      );
-      const versionId = findVersionIdByTag(versions, versionTag);
-      if (versionId && isFullCurrentDeployment(deployments, versionId)) {
-        return { stage, workerName: plan.workerName, action: 'remote-cache-hit', versionTag };
-      }
-      if (versionId) {
-        await wrangler(
-          runner,
-          [
-            'versions',
-            'deploy',
-            '--version-tag',
-            versionTag,
-            '--name',
-            plan.workerName,
-            '--config',
-            configPath,
-            '--env',
-            stage,
-            '--yes',
-          ],
-          cwd,
-        );
-        return { stage, workerName: plan.workerName, action: 'activated', versionTag };
+      const versions = await wranglerJson(runner, ['versions', 'list', '--name', workerName, '--json'], run);
+      const deployments = await wranglerJson(runner, ['deployments', 'status', '--name', workerName, '--json'], run);
+      taggedVersionId = findVersionIdByTag(versions, versionTag);
+      if (taggedVersionId && isFullCurrentDeployment(deployments, taggedVersionId)) {
+        return { stage, workerName, action: 'remote-cache-hit', versionTag };
       }
     }
 
-    const deployArgs = ['deploy', '--config', commandContext.configPath, '--env', commandContext.stage];
+    for (const binding of prepared.d1MigrationBindings) {
+      await wrangler(
+        runner,
+        ['d1', 'migrations', 'apply', binding, '--remote', '--config', prepared.deployConfigPath],
+        run,
+      );
+    }
+
+    if (versionTag && taggedVersionId) {
+      await wrangler(
+        runner,
+        [
+          'versions',
+          'deploy',
+          '--version-tag',
+          versionTag,
+          '--name',
+          workerName,
+          '--config',
+          prepared.deployConfigPath,
+          ...envArgs,
+          '--yes',
+        ],
+        run,
+      );
+      return { stage, workerName, action: 'activated', versionTag };
+    }
+
+    const deployArgs = ['deploy', '--config', prepared.deployConfigPath, ...envArgs];
     if (versionTag) deployArgs.push('--tag', versionTag);
     if (Object.keys(secretValues).length > 0) {
       temporarySecretsPath = join(cwd, `.wrangler-secrets.smoo-${process.pid}-${randomUUID()}.json`);
       await writeFile(temporarySecretsPath, `${JSON.stringify(secretValues)}\n`, { mode: 0o600 });
       deployArgs.push('--secrets-file', temporarySecretsPath);
     }
-    await wrangler(runner, deployArgs, cwd);
-    return {
-      stage,
-      workerName: commandContext.workerName,
-      action: 'deployed',
-      ...(versionTag ? { versionTag } : {}),
-    };
+    await wrangler(runner, deployArgs, run);
+    return { stage, workerName, action: 'deployed', ...(versionTag ? { versionTag } : {}) };
   } finally {
     if (temporaryConfigPath) {
       await rm(temporaryConfigPath, { force: true });
@@ -194,6 +190,169 @@ export async function deployStage(
     }
   }
 }
+
+interface PreparedConfig {
+  deployConfigPath: string;
+  temporaryConfigPath?: string;
+  plan: ConfiguredStageResourcePlan;
+  /** D1 bindings whose migrations run before the deploy (flat configs only; TOML deploys keep migrations out of scope). */
+  d1MigrationBindings: string[];
+  /** `--env <stage>` for TOML configs with env blocks; a flat config is already resolved, so no flag. */
+  envFlag?: DeploymentStage;
+}
+
+async function prepareTomlConfig(
+  cwd: string,
+  stage: DeploymentStage,
+  accountId: string,
+  missingSecrets: string[],
+  cloudflare: CloudflareClient,
+): Promise<PreparedConfig> {
+  const committedConfigPath = join(cwd, 'wrangler.toml');
+  const committedToml = await readFile(committedConfigPath, 'utf8');
+  if (!isPullRequestStage(stage)) {
+    return {
+      deployConfigPath: committedConfigPath,
+      plan: planConfiguredStageResources(committedToml, stage),
+      d1MigrationBindings: [],
+      envFlag: stage,
+    };
+  }
+  const staging = planConfiguredStageResources(committedToml, 'staging');
+  if (!staging.workerName.endsWith('-staging')) {
+    throw new Error('[env.staging].name must end with the exact suffix -staging.');
+  }
+  const workerName = stageResourceName(staging.workerName.slice(0, -'-staging'.length), stage);
+  await refuseFirstDeploymentWithoutSecrets(cloudflare, workerName, missingSecrets);
+  const liveNamespaces = await cloudflare.listKvNamespaces();
+  const plan = planPullRequestResources(committedToml, stage, liveNamespaces);
+  const derivedIds = await ensureKvNamespaces(plan.kvNamespaces, liveNamespaces, cloudflare);
+  const derivedToml = derivePullRequestWranglerConfig(committedToml, { stage, accountId, kvNamespaceIds: derivedIds });
+  const temporaryConfigPath = join(cwd, `.wrangler.smoo-${process.pid}-${randomUUID()}.toml`);
+  await writeTemporaryConfig(temporaryConfigPath, derivedToml);
+  return {
+    deployConfigPath: temporaryConfigPath,
+    temporaryConfigPath,
+    plan: planConfiguredStageResources(derivedToml, stage),
+    d1MigrationBindings: [],
+    envFlag: stage,
+  };
+}
+
+async function prepareFlatConfig(
+  configPath: string,
+  stage: DeploymentStage,
+  accountId: string,
+  missingSecrets: string[],
+  cloudflare: CloudflareClient,
+): Promise<PreparedConfig> {
+  const flat = parseJsonFileText(configPath, await readFile(configPath, 'utf8'), parseFlatWranglerConfig);
+  if (!isPullRequestStage(stage)) {
+    return {
+      deployConfigPath: configPath,
+      plan: planFlatStageResources(flat, stage),
+      d1MigrationBindings: migrationBindings(flat),
+    };
+  }
+  const liveNamespaces = await cloudflare.listKvNamespaces();
+  const prPlan = planFlatPullRequestResources(flat, stage, liveNamespaces);
+  await refuseFirstDeploymentWithoutSecrets(cloudflare, prPlan.workerName, missingSecrets);
+  const kvNamespaceIds = await ensureKvNamespaces(prPlan.kvNamespaces, liveNamespaces, cloudflare);
+  const d1DatabaseIds = await ensureD1Databases(prPlan.d1Databases, await cloudflare.listD1Databases(), cloudflare);
+  const derived = deriveFlatPullRequestConfig(flat, { stage, accountId, kvNamespaceIds, d1DatabaseIds });
+  // Beside the original: its main/assets/migrations paths are relative to the file.
+  const temporaryConfigPath = join(dirname(configPath), `.wrangler.smoo-${process.pid}-${randomUUID()}.json`);
+  await writeTemporaryConfig(temporaryConfigPath, `${JSON.stringify(derived, null, 2)}\n`);
+  return {
+    deployConfigPath: temporaryConfigPath,
+    temporaryConfigPath,
+    plan: planFlatStageResources(derived, stage),
+    d1MigrationBindings: migrationBindings(derived),
+  };
+}
+
+/**
+ * Writes a derived Wrangler config the deploy will delete afterwards. The caller only learns the
+ * path from a successful return, so a write that fails midway (the file created, the content not
+ * written) would leave it behind: remove it here before the failure propagates.
+ */
+async function writeTemporaryConfig(path: string, content: string): Promise<void> {
+  try {
+    await writeFile(path, content, { mode: 0o600 });
+  } catch (error) {
+    await rm(path, { force: true });
+    throw error;
+  }
+}
+export const writeTemporaryConfigForTest = writeTemporaryConfig;
+
+function migrationBindings(config: FlatWranglerConfig): string[] {
+  return (config.d1_databases ?? [])
+    .filter((database) => typeof database.migrations_dir === 'string')
+    .map((database) => database.binding);
+}
+
+async function refuseFirstDeploymentWithoutSecrets(
+  cloudflare: CloudflareClient,
+  workerName: string,
+  missingSecrets: string[],
+): Promise<void> {
+  const firstDeployment = !(await cloudflare.listWorkerScripts()).some((script) => script.id === workerName);
+  if (firstDeployment && missingSecrets.length > 0) {
+    throw new Error(
+      `First deployment of ${workerName} requires process environment values for: ${missingSecrets.join(', ')}.`,
+    );
+  }
+}
+
+/** Creates every planned namespace that is not live yet, mapping staging ids to the stage's own ids. */
+async function ensureKvNamespaces(
+  planned: { stagingId: string; title: string }[],
+  liveNamespaces: LiveKvNamespace[],
+  cloudflare: CloudflareClient,
+): Promise<Map<string, string>> {
+  const derivedIds = new Map<string, string>();
+  const byTitle = new Map(liveNamespaces.map((namespace) => [namespace.title, namespace]));
+  for (const namespace of planned) {
+    let live = byTitle.get(namespace.title);
+    if (!live) {
+      try {
+        live = await cloudflare.createKvNamespace(namespace.title);
+      } catch (error) {
+        live = (await cloudflare.listKvNamespaces()).find((candidate) => candidate.title === namespace.title);
+        if (!live) throw error;
+      }
+      byTitle.set(live.title, live);
+    }
+    derivedIds.set(namespace.stagingId, live.id);
+  }
+  return derivedIds;
+}
+
+/** Creates every planned database that is not live yet, mapping staging ids to the stage's own ids. */
+async function ensureD1Databases(
+  planned: { stagingId: string; name: string }[],
+  liveDatabases: D1DatabaseRecord[],
+  cloudflare: CloudflareClient,
+): Promise<Map<string, string>> {
+  const derivedIds = new Map<string, string>();
+  const byName = new Map(liveDatabases.map((database) => [database.name, database]));
+  for (const database of planned) {
+    let live = byName.get(database.name);
+    if (!live) {
+      try {
+        live = await cloudflare.createD1Database(database.name);
+      } catch (error) {
+        live = (await cloudflare.listD1Databases()).find((candidate) => candidate.name === database.name);
+        if (!live) throw error;
+      }
+      byName.set(live.name, live);
+    }
+    derivedIds.set(database.stagingId, live.uuid);
+  }
+  return derivedIds;
+}
+
 export interface CleanupResult {
   stage: `pr${number}`;
   deleted: {
@@ -425,8 +584,8 @@ export function isFullCurrentDeployment(value: unknown, versionId: string): bool
   return Object.values(value).some((entry) => isFullCurrentDeployment(entry, versionId));
 }
 
-async function wranglerJson(runner: ProcessRunner, args: string[], cwd: string): Promise<unknown> {
-  const result = await wrangler(runner, args, cwd);
+async function wranglerJson(runner: ProcessRunner, args: string[], run: ProcessRunOptions): Promise<unknown> {
+  const result = await wrangler(runner, args, run);
   try {
     return JSON.parse(result.stdout);
   } catch {
@@ -434,8 +593,8 @@ async function wranglerJson(runner: ProcessRunner, args: string[], cwd: string):
   }
 }
 
-async function wrangler(runner: ProcessRunner, args: string[], cwd: string): Promise<ProcessResult> {
-  const result = await runner.run('wrangler', args, { cwd });
+async function wrangler(runner: ProcessRunner, args: string[], run: ProcessRunOptions): Promise<ProcessResult> {
+  const result = await runner.run('wrangler', args, run);
   if (result.exitCode !== 0) {
     printCommandOutput(result.stdout, result.stderr);
     throw new Error(`wrangler ${args.join(' ')} failed with exit code ${result.exitCode}`);

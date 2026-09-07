@@ -1,5 +1,5 @@
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
-import typia from 'typia';
+import typia, { type IValidation } from 'typia';
 
 /** String-keyed dependency / script / engine maps. */
 export type StringMap = Record<string, string>;
@@ -196,6 +196,24 @@ export const parseNxJsonText = typia.json.createIsParse<NxJson>();
 
 /** Parse a JSON string array. Invalid JSON throws; non-arrays return null. */
 export const parseStringArrayText = typia.json.createIsParse<string[]>();
+
+/** typia's failures as `path: expected type` items, the `$input` root stripped so paths read as the document's own. */
+export function formatValidationErrors(errors: IValidation.IError[]): string {
+  return errors.map((error) => `${error.path.replace(/^\$input\.?/, '')}: expected ${error.expected}`).join(', ');
+}
+
+/**
+ * A file's text through a typia JSON parser. Text that is not JSON at all makes the parser throw a bare
+ * SyntaxError that names no file; the rethrow names the one the text came from.
+ */
+export function parseJsonFileText<T>(path: string, text: string, parse: (text: string) => T): T {
+  try {
+    return parse(text);
+  } catch (error) {
+    if (error instanceof SyntaxError) throw new Error(`${path} is not valid JSON: ${error.message}`);
+    throw error;
+  }
+}
 
 const isPackageJsonValue = typia.createIs<PackageJson>();
 

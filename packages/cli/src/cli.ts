@@ -1,3 +1,4 @@
+import { resolve } from 'node:path';
 import { Command, CommanderError } from 'commander';
 import { variants } from './generate/index.js';
 import { dispatchCiWorkflow, ensureCiPullRequest } from './github-ci/api.js';
@@ -510,8 +511,12 @@ function buildProgram(): Command {
   wrangler
     .command('deploy-stage')
     .requiredOption('--stage <stage>', 'staging, production, or prN')
-    .action(async (options: { stage: string }) => {
-      await deployStage(process.cwd(), options.stage);
+    .option('--config <path>', 'deploy a build-generated flat wrangler.json instead of ./wrangler.toml')
+    .action(async (options: { stage: string; config?: string }) => {
+      await deployStage(process.cwd(), {
+        stage: options.stage,
+        ...(options.config ? { config: resolve(options.config) } : {}),
+      });
     });
   wrangler
     .command('cleanup-pr')
