@@ -17,9 +17,9 @@ describe('prunePublishedExports', () => {
       },
     };
 
-    const { manifest, pruned } = prunePublishedExports(pkg);
+    const { manifest, adjustments } = prunePublishedExports(pkg);
 
-    expect(pruned).toEqual(['exports[.][development]', 'exports[./policy][development]']);
+    expect(adjustments).toEqual(['exports[.][development]', 'exports[./policy][development]']);
     expect(manifest.exports).toEqual({
       './package.json': './package.json',
       '.': { types: './dist/index.d.ts', default: './loader.js' },
@@ -42,9 +42,9 @@ describe('prunePublishedExports', () => {
       },
     };
 
-    const { manifest, pruned } = prunePublishedExports(pkg);
+    const { manifest, adjustments } = prunePublishedExports(pkg);
 
-    expect(pruned).toEqual(['exports[.][development]', 'exports[.][bun]']);
+    expect(adjustments).toEqual(['exports[.][development]', 'exports[.][bun]']);
     expect(manifest.exports).toEqual({ '.': { types: './dist/index.d.ts', default: './dist/index.js' } });
   });
 
@@ -54,7 +54,7 @@ describe('prunePublishedExports', () => {
       exports: { '.': { types: './src/index.ts', default: './dist/index.js' } },
     };
 
-    expect(prunePublishedExports(pkg)).toEqual({ manifest: pkg, pruned: [] });
+    expect(prunePublishedExports(pkg)).toEqual({ manifest: pkg, adjustments: [] });
   });
 
   test('leaves a deliberately source-only package untouched', () => {
@@ -73,7 +73,7 @@ describe('prunePublishedExports', () => {
       },
     };
 
-    expect(prunePublishedExports(pkg)).toEqual({ manifest: pkg, pruned: [] });
+    expect(prunePublishedExports(pkg)).toEqual({ manifest: pkg, adjustments: [] });
   });
 
   test('keeps a source-only subpath while pruning its built siblings', () => {
@@ -85,9 +85,9 @@ describe('prunePublishedExports', () => {
       },
     };
 
-    const { manifest, pruned } = prunePublishedExports(pkg);
+    const { manifest, adjustments } = prunePublishedExports(pkg);
 
-    expect(pruned).toEqual(['exports[.][development]']);
+    expect(adjustments).toEqual(['exports[.][development]']);
     expect(manifest.exports).toEqual({
       '.': { default: './dist/index.js' },
       './dev-only': { development: './src/dev.ts' },
@@ -100,18 +100,58 @@ describe('prunePublishedExports', () => {
       exports: { development: './src/index.ts', default: './dist/index.js' },
     };
 
-    const { manifest, pruned } = prunePublishedExports(pkg);
+    const { manifest, adjustments } = prunePublishedExports(pkg);
 
-    expect(pruned).toEqual(['exports[development]']);
+    expect(adjustments).toEqual(['exports[development]']);
     expect(manifest.exports).toEqual({ default: './dist/index.js' });
   });
 
   test('is a no-op for manifests without TypeScript-source exports', () => {
     const pkg: PackageJson = { name: 'demo', exports: { '.': { default: './dist/index.js' } } };
-    expect(prunePublishedExports(pkg)).toEqual({ manifest: pkg, pruned: [] });
+    expect(prunePublishedExports(pkg)).toEqual({ manifest: pkg, adjustments: [] });
 
     const noExports: PackageJson = { name: 'demo' };
-    expect(prunePublishedExports(noExports)).toEqual({ manifest: noExports, pruned: [] });
+    expect(prunePublishedExports(noExports)).toEqual({ manifest: noExports, adjustments: [] });
+  });
+  test('moves the types condition to the front of published condition maps', () => {
+    // publint EXPORT_TYPES_SHOULD_BE_FIRST: conditions are order-sensitive and
+    // TypeScript must resolve `types` before a runtime condition in an earlier
+    // key position wins. The workspace orders `bun`/`development` first so the
+    // repo loads live source; the published manifest must not.
+    const pkg: PackageJson = {
+      name: 'demo',
+      exports: {
+        './package.json': './package.json',
+        '.': { import: './dist/index.js', types: './dist/index.d.ts', default: './dist/index.js' },
+        './sub': { node: './dist/sub.js', types: './dist/sub.d.ts' },
+      },
+    };
+
+    const { manifest, adjustments } = prunePublishedExports(pkg);
+
+    expect(adjustments).toEqual([
+      'exports[.]: types condition moved first',
+      'exports[./sub]: types condition moved first',
+    ]);
+    // Key order is the observable behavior, so assert it explicitly.
+    expect(Object.keys((manifest.exports as Record<string, unknown>)['.'] as object)).toEqual([
+      'types',
+      'import',
+      'default',
+    ]);
+    expect(Object.keys((manifest.exports as Record<string, unknown>)['./sub'] as object)).toEqual(['types', 'node']);
+  });
+
+  test('reorder alone is an applied adjustment, not a no-op', () => {
+    const pkg: PackageJson = {
+      name: 'demo',
+      exports: { '.': { bun: './dist/index.js', types: './dist/index.d.ts', default: './dist/index.js' } },
+    };
+
+    const { manifest, adjustments } = prunePublishedExports(pkg);
+
+    expect(adjustments).toEqual(['exports[.]: types condition moved first']);
+    expect(Object.keys(manifest.exports?.['.'] as object)).toEqual(['types', 'bun', 'default']);
   });
 });
 
@@ -131,7 +171,7 @@ describe('withPublishManifest', () => {
     return dir;
   }
 
-  test('packs against the pruned manifest and restores the original bytes', async () => {
+  test('packs against the adjusted manifest and restores the original bytes', async () => {
     const dir = tempPackageDir(manifestWithSourceExports);
     try {
       const seen = await withPublishManifest(dir, async () => readFileSync(join(dir, 'package.json'), 'utf8'));
@@ -196,6 +236,25 @@ describe('withPublishManifest', () => {
         ),
       ).rejects.toThrow('pack failed');
       expect(readFileSync(join(dir, 'package.json'), 'utf8')).toBe(plain);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+  test('writes the reordered manifest for pack when only condition order changes', async () => {
+    const original = `${JSON.stringify(
+      {
+        name: 'demo',
+        exports: { '.': { import: './dist/index.js', types: './dist/index.d.ts', default: './dist/index.js' } },
+      },
+      null,
+      2,
+    )}\n`;
+    const dir = tempPackageDir(original);
+    try {
+      const seen = await withPublishManifest(dir, async () => readFileSync(join(dir, 'package.json'), 'utf8'));
+      const seenPkg = JSON.parse(seen) as PackageJson;
+      expect(Object.keys(seenPkg.exports?.['.'] as object)[0]).toBe('types');
+      expect(readFileSync(join(dir, 'package.json'), 'utf8')).toBe(original);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
