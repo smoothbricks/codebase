@@ -74,6 +74,8 @@
         "inputs": [
           "{projectRoot}/crates/**/*.rs",
           "{projectRoot}/crates/**/Cargo.toml",
+          "{workspaceRoot}/packages/bitmosaic/crates/**/*.rs",
+          "{workspaceRoot}/packages/bitmosaic/crates/**/Cargo.toml",
           "{workspaceRoot}/Cargo.toml",
           "{workspaceRoot}/Cargo.lock",
           "{workspaceRoot}/.cargo/config.toml",

@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
   "packages/columine/crates/*",
+  "packages/bitmosaic/crates/*",
   "packages/cowshed/crates/*",
   "packages/lmao/crates/*",
 ]
@@ -19,22 +20,11 @@ columine-vm = { path = "packages/columine/crates/columine-vm" }
 cowshed-core = { path = "packages/cowshed/crates/cowshed-core" }
 lmao-core = { path = "packages/lmao/crates/lmao-core" }
 lmao-arena = { path = "packages/lmao/crates/lmao-arena" }
-# Crates from the minigraf fork (https://github.com/axe-scale/minigraf):
-# axroar, the ladder-selected compressed bitmap whose AXR1 string is the
-# BITMAP slot codec and the event processor's ordinal seen-set carrier, and
-# ptmcart-core, whose `art::ArtMap` is the event processor's byte-keyed
-# seen-set. Absolute paths, deliberately, until the crates are published:
-# cargo identifies a path package by the path as spelled, and a workspace
-# that compiles this one together with other minigraf crates (through a
-# symlink beside its own checkout) only gets ONE copy of each crate when
-# every manifest spells the identical absolute path — a relative path
-# resolved through that symlink would name a second package of the same
-# name and split the types. A git dependency needs the fork pushed at the
-# rev these crates compile against; when it is, the dependency becomes
-# `git = "https://github.com/axe-scale/minigraf.git", rev = "…"` and a
-# consuming workspace unifies it with its own checkout through `[patch]`.
-axroar = { path = "/Users/danny/Dev/_fork/minigraf/axroar" }
-ptmcart-core = { path = "/Users/danny/Dev/_fork/minigraf/ptmcart-core" }
+# bitmosaic is this repository's public compressed bitmap package: the
+# ladder-selected container bitmap whose native image is the BITMAP slot
+# codec. It is a plain in-repo workspace member, so the dependency is a
+# normal relative path.
+bitmosaic = { path = "packages/bitmosaic/crates/bitmosaic" }
 arrow-array = { version = "56", default-features = false }
 arrow-buffer = { version = "56", default-features = false }
 arrow-ipc = { version = "56", default-features = false }
