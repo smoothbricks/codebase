@@ -38,6 +38,8 @@ export interface PackageSmooGithub {
    * step entirely.
    */
   sourceCheckouts?: PackageSourceCheckoutConfig[];
+  /** Declared Cargo private-dependency credentials; absent means no private Cargo fetch. */
+  cargoCredentials?: PackageCargoCredentialsConfig;
 }
 
 /** One declared sibling source checkout for managed CI. */
@@ -50,6 +52,31 @@ export interface PackageSourceCheckoutConfig {
   ref?: string;
   /** Secret name holding the source-read credential; required for private sources. */
   tokenEnv?: string;
+}
+
+/**
+ * Declared opt-in for Cargo fetching private dependencies in managed CI. The
+ * generator wires the named secrets into the job environment and, for private
+ * git origins, installs a host-gated credential helper through `GIT_CONFIG_*`
+ * process environment: the token is read at helper-call time, never embedded
+ * in a URL, argv, or any stored git/cargo configuration, and an empty
+ * `credential.helper` reset keeps an ambient credential store from capturing
+ * it. Registry tokens are plain `CARGO_REGISTRIES_<NAME>_TOKEN` mappings read
+ * by Cargo's own credential provider.
+ */
+export interface PackageCargoCredentialsConfig {
+  /** Private git origins Cargo fetches dependencies from. */
+  gitOrigins?: PackageCargoGitOrigin[];
+  /** Credential env names Cargo's `cargo:token` provider reads for private registries. */
+  registryTokenEnvs?: string[];
+}
+
+/** One private git origin with the secret that reads it. */
+export interface PackageCargoGitOrigin {
+  /** Credential-free https origin, e.g. `https://git.example.net`. */
+  origin: string;
+  /** Secret name holding the source-read credential for this origin. */
+  tokenEnv: string;
 }
 
 /**

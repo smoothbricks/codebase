@@ -164,6 +164,90 @@ describe('CI workflow definition', () => {
     ).toThrow('secret env name');
   });
 
+  it('installs the cargo git credential helper and job tokens before setup and renumbers following steps', () => {
+    const definition = options({
+      cargoCredentials: {
+        gitOrigins: [{ origin: 'https://git.example.net', tokenEnv: 'CARGO_GIT_TOKEN' }],
+        registryTokenEnvs: ['CARGO_REGISTRIES_EXAMPLE_TOKEN'],
+      },
+    });
+    const steps = defineCiWorkflow(definition);
+
+    expect(steps.slice(0, 4).map((step) => [step.kind, step.number])).toEqual([
+      [CiWorkflowStepKind.Checkout, 2],
+      [CiWorkflowStepKind.CargoCredentials, 3],
+      [CiWorkflowStepKind.SetupDevenv, 4],
+      [CiWorkflowStepKind.SetNxShas, 5],
+    ]);
+    const rendered = renderCiWorkflowYaml(definition);
+    expect(rendered).toContain('- name: 🔑 Prepare Cargo git credentials');
+    // Registry tokens ride the job env inside the env block, not a step.
+    expect(rendered).toContain('    env:\n      NIX_STORE_NAR:');
+    expect(rendered).toContain('      CARGO_REGISTRIES_EXAMPLE_TOKEN: ${{ secrets.CARGO_REGISTRIES_EXAMPLE_TOKEN }}');
+    expect(rendered).toContain('      CARGO_GIT_TOKEN: ${{ secrets.CARGO_GIT_TOKEN }}');
+    // The helper is written to the runner temp dir and referenced through the
+    // per-process GIT_CONFIG_* environment: no token in any URL or argv.
+    expect(rendered).toContain('helper="$RUNNER_TEMP/cargo-git-credential.sh"');
+    expect(rendered).toContain('CARGO_NET_GIT_FETCH_WITH_CLI=true');
+    expect(rendered).toContain('GIT_CONFIG_COUNT=2');
+    expect(rendered).toContain('GIT_CONFIG_KEY_0=credential.helper');
+    expect(rendered).toContain('GIT_CONFIG_VALUE_0=');
+    expect(rendered).toContain('GIT_CONFIG_KEY_1=credential.helper');
+    expect(rendered).toContain('GIT_CONFIG_VALUE_1=$helper');
+    expect(rendered).toContain('case "$host" in');
+    expect(rendered).toContain('git.example.net)');
+    expect(rendered).toContain('printf \'username=x-access-token\\npassword=%s\\n\' "$CARGO_GIT_TOKEN" ;;');
+    expect(rendered).not.toMatch(/https:\/\/[^ ]*CARGO_GIT_TOKEN/);
+    expect(rendered).not.toContain('extraheader');
+  });
+
+  it('maps registry tokens without emitting a credential step when no git origins are declared', () => {
+    const rendered = renderCiWorkflowYaml(
+      options({ cargoCredentials: { registryTokenEnvs: ['CARGO_REGISTRIES_EXAMPLE_TOKEN'] } }),
+    );
+
+    expect(rendered).not.toContain('Prepare Cargo git credentials');
+    expect(rendered).not.toContain('CARGO_NET_GIT_FETCH_WITH_CLI');
+    expect(rendered).toContain('      CARGO_REGISTRIES_EXAMPLE_TOKEN: ${{ secrets.CARGO_REGISTRIES_EXAMPLE_TOKEN }}');
+  });
+
+  it('does not mention cargo credentials when the root did not opt in', () => {
+    const rendered = renderCiWorkflowYaml(options());
+
+    expect(rendered).not.toContain('Prepare Cargo git credentials');
+    expect(rendered).not.toContain('CARGO_NET_GIT_FETCH_WITH_CLI');
+    expect(rendered).not.toContain('credential.helper');
+  });
+
+  it('refuses malformed cargo credential declarations at render time', () => {
+    expect(() => renderCiWorkflowYaml(options({ cargoCredentials: {} }))).toThrow(
+      'at least one gitOrigins or registryTokenEnvs',
+    );
+    expect(() => renderCiWorkflowYaml(options({ cargoCredentials: { registryTokenEnvs: ['bad-name'] } }))).toThrow(
+      'upper-case secret env names',
+    );
+    expect(() =>
+      renderCiWorkflowYaml(
+        options({ cargoCredentials: { gitOrigins: [{ origin: 'http://git.example.net', tokenEnv: 'T' }] } }),
+      ),
+    ).toThrow('credential-free https origin');
+    expect(() =>
+      renderCiWorkflowYaml(
+        options({ cargoCredentials: { gitOrigins: [{ origin: 'https://token@git.example.net', tokenEnv: 'T' }] } }),
+      ),
+    ).toThrow('credential-free https origin');
+    expect(() =>
+      renderCiWorkflowYaml(
+        options({ cargoCredentials: { gitOrigins: [{ origin: 'https://git.example.net/repo', tokenEnv: 'T' }] } }),
+      ),
+    ).toThrow('without a path');
+    expect(() =>
+      renderCiWorkflowYaml(
+        options({ cargoCredentials: { gitOrigins: [{ origin: 'https://git.example.net', tokenEnv: 'bad' }] } }),
+      ),
+    ).toThrow('upper-case secret env name');
+  });
+
   it('renders deployment E2E as a dependent job with an independent stage input', () => {
     const rendered = renderCiWorkflowYaml(options({ deploy: true, e2eDeployment: true, runsOn: [...nixosRunsOn] }));
 
