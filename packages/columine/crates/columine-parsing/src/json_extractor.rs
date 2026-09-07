@@ -35,23 +35,8 @@ pub mod diagnostic_stage {
     /// Compact CPB1 validation. Distinct from [`COLUMN`] so a compact
     /// `BAD_HEADER` (detail 1) cannot be read as `INVALID_JSON`.
     pub const COMPACT: u8 = 6;
-    /// Semantic payload validation before extraction/deduplication.
+    /// Semantic payload validation before extraction.
     pub const VALIDATION: u8 = 7;
-    /// The seen-set refused an id; the detail is a [`dedup_detail`].
-    pub const DEDUP: u8 = 8;
-}
-
-/// Seen-set refusal details, namespaced by [`diagnostic_stage::DEDUP`].
-pub mod dedup_detail {
-    /// The id is longer than the 64-byte (SHA-512 width) bound.
-    pub const ID_TOO_LONG: u8 = 1;
-    /// The set holds the ceiling the host declared per open.
-    pub const CEILING_REACHED: u8 = 2;
-    /// The signal type declares an ordinal id namespace and the id is not
-    /// the canonical decimal of a u32.
-    pub const NOT_AN_ORDINAL: u8 = 3;
-    /// No in-flight batch has the named id on that log.
-    pub const BATCH_UNKNOWN: u8 = 4;
 }
 
 /// Diagnostic detail bytes (`ExtractionDiagnostic.Detail` — order is ABI,

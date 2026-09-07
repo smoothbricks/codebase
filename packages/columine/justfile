@@ -33,9 +33,9 @@ wasm:
     @cp ../../target/wasm32-unknown-unknown/wasm-release/columine_wasm.opt.wasm dist/columine.wasm
     @ls -la dist/columine.wasm
 
-# event_processor.wasm — the columine EP artifact (EpWiring::columine():
-# base path, no dedup, msgpack growth both formats, no per-field
-# diagnostics; six exports, caller-provided buffers).
+# event_processor.wasm — the columine EP artifact (ParseOptions{base_path:
+# true, msgpack_growth: true, diagnostics: false}; six exports,
+# caller-provided buffers).
 wasm-ep:
     RUSTFLAGS="-Zunstable-options -Cpanic=immediate-abort" \
     cargo build -p columine-ep-wasm --target wasm32-unknown-unknown --profile wasm-release \
