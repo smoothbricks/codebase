@@ -218,20 +218,13 @@ export async function cargoPackageTestInputs({
     if (!isRecord(crateParsed)) {
       continue;
     }
-    for (const tableName of ['dependencies', 'dev-dependencies', 'build-dependencies'] as const) {
-      const table = crateParsed[tableName];
-      if (!isRecord(table)) {
-        continue;
-      }
-      for (const [depName, spec] of Object.entries(table)) {
-        const pathDep = pathDependencyDir(dir, depName, spec, workspacePathDeps);
-        if (pathDep === null) {
-          continue;
-        }
-        if (pathDep.external) {
-          external.set(depName, pathDep.dir);
-        } else {
-          pending.push(pathDep.dir);
+    enqueuePathDependencies(crateParsed, dir, workspacePathDeps, pending, external);
+    // Every target variant can contribute a path dependency to a test binary.
+    // Hash them conservatively rather than evaluating Cargo's cfg language.
+    if (isRecord(crateParsed.target)) {
+      for (const target of Object.values(crateParsed.target)) {
+        if (isRecord(target)) {
+          enqueuePathDependencies(target, dir, workspacePathDeps, pending, external);
         }
       }
     }
@@ -256,6 +249,32 @@ export async function cargoPackageTestInputs({
     inputs.push(EXTERNAL_RUST_CRATES_INPUT);
   }
   return inputs;
+}
+
+function enqueuePathDependencies(
+  scope: Record<string, unknown>,
+  memberDir: string,
+  workspacePathDeps: Map<string, string>,
+  pending: string[],
+  external: Map<string, string>,
+): void {
+  for (const tableName of ['dependencies', 'dev-dependencies', 'build-dependencies'] as const) {
+    const table = scope[tableName];
+    if (!isRecord(table)) {
+      continue;
+    }
+    for (const [depName, spec] of Object.entries(table)) {
+      const pathDep = pathDependencyDir(memberDir, depName, spec, workspacePathDeps);
+      if (pathDep === null) {
+        continue;
+      }
+      if (pathDep.external) {
+        external.set(depName, pathDep.dir);
+      } else {
+        pending.push(pathDep.dir);
+      }
+    }
+  }
 }
 
 async function workspacePathDependencies(absoluteProjectRoot: string): Promise<Map<string, string>> {
@@ -303,7 +322,11 @@ function pathDependencyDir(
     }
     raw = workspacePath;
   } else if (typeof spec.path === 'string') {
-    raw = posix.join(memberDir.split('\\').join('/'), spec.path.split('\\').join('/'));
+    const localPath = spec.path.split('\\').join('/');
+    if (isAbsolute(localPath) || posix.isAbsolute(localPath)) {
+      return { dir: localPath, external: true };
+    }
+    raw = posix.join(memberDir.split('\\').join('/'), localPath);
   } else {
     return null;
   }
