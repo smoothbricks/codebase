@@ -41,6 +41,12 @@
       "import": "./dist/monorepo/git-config.js",
       "default": "./dist/monorepo/git-config.js"
     },
+    "./release/pack": {
+      "types": "./dist/release/pack.d.ts",
+      "development": "./src/release/pack.ts",
+      "import": "./dist/release/pack.js",
+      "default": "./dist/release/pack.js"
+    },
     "./wrangler/prepare-env": {
       "types": "./dist/wrangler/prepare-env.d.ts",
       "bun": "./src/wrangler/prepare-env.ts",

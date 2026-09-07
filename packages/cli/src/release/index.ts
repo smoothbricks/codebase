@@ -20,10 +20,44 @@ import {
   parsePackageJsonText,
 } from '../lib/json.js';
 import { decode, run, runInteractiveStatus, runResult, runText } from '../lib/run.js';
-import { listReleasePackages, readPackageJson, repositoryInfo } from '../lib/workspace.js';
-import { syncBunLockfileVersions } from '../monorepo/lockfile.js';
-import { readPackedPackageJson, validatePackedWorkspaceDependencies } from '../monorepo/packed-manifest.js';
-import { withPublishManifest } from '../monorepo/publish-manifest.js';
+import {
+  getWorkspacePackages,
+  listPublicReleasePackages,
+  listReleasePackages,
+  readPackageJson,
+  repositoryInfo,
+} from '../lib/workspace.js';
+
+export {
+  assertPackedArtifact,
+  type ReleasePackManifest,
+  type ReleasePackOptions,
+  type ReleasePackPackageEntry,
+  releasePack,
+  resolvePackClosure,
+} from './pack.js';
+export {
+  assertPrivatePackage,
+  checkPrivatePackage,
+  isPrivatePackage,
+  type NpmStatusOptions,
+  npmPackageExists as npmPackageExistsOnRegistry,
+  npmPublishedVersionExists as npmPublishedVersionExistsOnRegistry,
+  type PrivateNpmRegistry,
+  type PrivateNpmRegistryConfigError,
+  type PrivateNpmRegistryConfigErrorKind,
+  type PublishDestination,
+  privateNpmPublishArgs,
+  privateNpmUserconfigContent,
+  publishPrivateWithDiagnostics,
+  type Result as PrivateNpmResult,
+  requirePrivateNpmRegistry,
+  resolvePrivateNpmRegistry,
+  selectPublishDestination,
+  selectRegistryForPackage,
+  withPrivateNpmUserconfig,
+} from './private-npm.js';
+
 import { readProjectTargets } from '../nx/index.js';
 import {
   type BootstrapNpmPackagesOptions,
@@ -66,6 +100,18 @@ import {
   runReleaseTag,
   runReleaseVersion,
 } from './orchestration.js';
+import { packReleaseTarball } from './pack.js';
+import {
+  assertPrivatePackage,
+  npmPackageExists as npmPackageExistsOnRegistry,
+  npmPublishedVersionExists as npmPublishedVersionExistsOnRegistry,
+  type PrivateNpmRegistry,
+  privateNpmPublishArgs,
+  publishPrivateWithDiagnostics,
+  selectPublishDestination,
+  selectRegistryForPackage,
+  withPrivateNpmUserconfig,
+} from './private-npm.js';
 import { type RetagUnpublishedTagUpdate, retagUnpublished } from './retag-unpublished.js';
 
 export interface ReleaseVersionOptions {
@@ -312,14 +358,14 @@ export async function releaseTrustPublisher(root: string, options: ReleaseTrustP
     {
       repository,
       workflow,
-      listReleasePackages: () => listReleasePackages(root),
+      listReleasePackages: () => listPublicReleasePackages(root),
       packageExists: (name) => npmPackageExists(root, name),
       bootstrapNpmPackages: (bootstrapOptions) =>
         bootstrapNpmPackages(
           {
-            listReleasePackages: () => listReleasePackages(root),
+            listReleasePackages: () => listPublicReleasePackages(root),
             packageExists: (name) => npmPackageExists(root, name),
-            packageVersionExists: (name, version) => npmPublishedVersionExists(root, name, version),
+            packageVersionExists: (name, version) => npmVersionExists(root, name, version),
             login: () => runNpm(root, ['login', '--auth-type=web']),
             publishPlaceholder: (pkg, env) => publishPlaceholderPackage(root, pkg, env),
             promptOtp: (packageName) => promptForNpmOtp(packageName),
@@ -528,9 +574,9 @@ export async function releaseBootstrapNpmPackages(
 ): Promise<void> {
   await bootstrapNpmPackages(
     {
-      listReleasePackages: () => listReleasePackages(root),
+      listReleasePackages: () => listPublicReleasePackages(root),
       packageExists: (name) => npmPackageExists(root, name),
-      packageVersionExists: (name, version) => npmPublishedVersionExists(root, name, version),
+      packageVersionExists: (name, version) => npmVersionExists(root, name, version),
       login: () => runNpm(root, ['login', '--auth-type=web']),
       publishPlaceholder: (pkg, env) => publishPlaceholderPackage(root, pkg, env),
       promptOtp: (packageName) => promptForNpmOtp(packageName),
@@ -600,22 +646,14 @@ async function listUnpublishedPackages(root: string, packages: ReleasePackage[])
 }
 
 async function publishPackedPackage(root: string, pkg: ReleasePackage, tag: string, dryRun: boolean): Promise<void> {
-  const tempDir = await mkdtemp(join(tmpdir(), 'smoo-publish-'));
-  const tarball = join(tempDir, `${safeTarballPrefix(pkg.name)}-${pkg.version}.tgz`);
-  // bun pm pack resolves workspace:* from bun.lock. Day-to-day lock keeps -next
-  // (install/CI). For publish, temporarily rewrite unpublished -next entries to
-  // the last stable tag so the tarball embeds installable versions, then restore.
-  syncBunLockfileVersions(root, { mode: 'publish', log: true });
+  const destination = selectPublishDestination(root, pkg);
+  if (destination.kind === 'private') {
+    assertPrivatePackage(pkg, destination.registry);
+    await publishPrivatePackedPackage(root, pkg, tag, dryRun, destination.registry);
+    return;
+  }
+  const { tarball, cleanup } = await packReleaseTarball(root, pkg);
   try {
-    console.log(`${pkg.name}@${pkg.version}: packing with bun pm pack`);
-    // Published exports must not point at workspace TypeScript source; the
-    // wrapper prunes those entries around the pack.
-    await withPublishManifest(
-      join(root, pkg.path),
-      () => run('bun', ['pm', 'pack', '--filename', tarball, '--ignore-scripts', '--quiet'], join(root, pkg.path)),
-      { log: true },
-    );
-    await assertPackedWorkspaceDependencies(root, tarball, pkg);
     // npm CLI owns authentication here: trusted publishing OIDC when configured.
     // Bun still produces the tarball so workspace:* dependencies are resolved the
     // same way smoo validates packed packages before release.
@@ -643,8 +681,57 @@ async function publishPackedPackage(root: string, pkg: ReleasePackage, tag: stri
       },
     );
   } finally {
-    syncBunLockfileVersions(root, { mode: 'install', log: true });
-    await rm(tempDir, { recursive: true, force: true });
+    await cleanup();
+  }
+}
+
+/**
+ * Private publish: the resolved literal registry travels in the tarball's
+ * publishConfig through the temporary publish-manifest transform (workspace
+ * bytes restored afterwards); auth rides a mode0600 userconfig holding only
+ * `${TOKEN_ENV}` references. Restricted access, explicit --registry, no npmjs
+ * provenance or trusted-publisher repair. Direct publication without declared
+ * configuration is refused by selectRegistryForPackage before any pack.
+ */
+async function publishPrivatePackedPackage(
+  root: string,
+  pkg: ReleasePackage,
+  tag: string,
+  dryRun: boolean,
+  registry: PrivateNpmRegistry,
+): Promise<void> {
+  const { tarball, cleanup } = await packReleaseTarball(root, pkg, { publishConfigRegistry: registry.registry });
+  try {
+    const args = privateNpmPublishArgs(tarball, tag, registry);
+    if (dryRun) {
+      args.push('--dry-run');
+    }
+    await withPrivateNpmUserconfig(registry, 'publish', async (userconfig) => {
+      await publishPrivateWithDiagnostics(
+        pkg,
+        {
+          publish: () => runNpm(root, args, { NPM_CONFIG_USERCONFIG: userconfig }),
+          versionExists: () =>
+            withPrivateNpmUserconfig(registry, 'read', (readConfig) =>
+              npmPublishedVersionExistsOnRegistry(root, pkg.name, pkg.version, {
+                registry: registry.registry,
+                userconfig: readConfig,
+              }),
+            ),
+          log: (message) => console.log(message),
+          error: (message) => console.error(message),
+          appendSummary: async (markdown) => {
+            const summaryPath = process.env.GITHUB_STEP_SUMMARY;
+            if (summaryPath) {
+              await appendFile(summaryPath, `${markdown}\n\n`);
+            }
+          },
+        },
+        registry,
+      );
+    });
+  } finally {
+    await cleanup();
   }
 }
 
@@ -681,18 +768,6 @@ async function publishPlaceholderPackage(
     await runNpm(root, ['publish', tempDir, '--access', 'public', '--tag', NPM_BOOTSTRAP_DIST_TAG], env);
   } finally {
     await rm(tempDir, { recursive: true, force: true });
-  }
-}
-
-function safeTarballPrefix(name: string): string {
-  return name.replace(/^@/, '').replace(/[^a-zA-Z0-9._-]+/g, '-');
-}
-
-async function assertPackedWorkspaceDependencies(root: string, tarball: string, pkg: ReleasePackage): Promise<void> {
-  const manifest = await readPackedPackageJson(root, tarball, pkg.name);
-  const failures = validatePackedWorkspaceDependencies(root, pkg, manifest, { mode: 'publish' });
-  if (failures.length > 0) {
-    throw new Error(failures.join('\n'));
   }
 }
 
@@ -1583,27 +1658,45 @@ async function assertRemoteTagExists(root: string, tag: string): Promise<void> {
   }
 }
 
+/**
+ * Consolidated registry status: private-scoped names resolve to the declared
+ * Forgejo destination (read token, path-scoped userconfig) and never touch
+ * npmjs; everything else takes the public failure-aware path where only a
+ * genuine not-found means absent. A private name without its URL/token
+ * configuration throws before any network request, as does a workspace
+ * package carrying the npm:private tag when no private registry resolves for
+ * it — status must never fall back to npmjs for a private-tagged package,
+ * even when no scope configuration exists.
+ */
 async function npmVersionExists(root: string, name: string, version: string): Promise<boolean> {
-  const result = await $`bun pm view ${`${name}@${version}`} version`.cwd(root).quiet().nothrow();
-  return result.exitCode === 0 && decode(result.stdout).trim() === version;
+  const registry = selectRegistryForPackage(root, name);
+  if (!registry) {
+    assertPublicStatusAllowed(root, name);
+    return npmPublishedVersionExistsOnRegistry(root, name, version);
+  }
+  return withPrivateNpmUserconfig(registry, 'read', (userconfig) =>
+    npmPublishedVersionExistsOnRegistry(root, name, version, { registry: registry.registry, userconfig }),
+  );
 }
 
 async function npmPackageExists(root: string, name: string): Promise<boolean> {
-  const result = await $`bun pm view ${name} name`.cwd(root).quiet().nothrow();
-  return result.exitCode === 0;
+  const registry = selectRegistryForPackage(root, name);
+  if (!registry) {
+    assertPublicStatusAllowed(root, name);
+    return npmPackageExistsOnRegistry(root, name);
+  }
+  return withPrivateNpmUserconfig(registry, 'read', (userconfig) =>
+    npmPackageExistsOnRegistry(root, name, { registry: registry.registry, userconfig }),
+  );
 }
 
-async function npmPublishedVersionExists(root: string, name: string, version: string): Promise<boolean> {
-  const spec = `${name}@${version}`;
-  const args = ['view', spec, 'version', '--json'];
-  const result = await runResult('npm', args, root);
-  if (result.exitCode === 0) {
-    return true;
+function assertPublicStatusAllowed(root: string, name: string): void {
+  const pkg = getWorkspacePackages(root).find((candidate) => candidate.name === name);
+  if (pkg?.tags.includes('npm:private')) {
+    throw new Error(
+      `${name}: refusing to query the public registry for an npm:private package without a resolved private registry destination.`,
+    );
   }
-  if (/\bE404\b|404 Not Found/i.test(`${result.stdout}\n${result.stderr}`)) {
-    return false;
-  }
-  throw new Error(npmCommandFailedMessage(args, result.exitCode, result.stdout, result.stderr));
 }
 
 async function assertCleanGitTree(root: string): Promise<void> {
