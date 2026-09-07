@@ -9,6 +9,7 @@ import { parseStringArrayText } from '../lib/json.js';
 import { decode, printCommandOutput, run, runResult, runStatus, runText } from '../lib/run.js';
 import { type ProjectTargets, readProjectTargets } from '../nx/index.js';
 import { type DeploymentStage, isPullRequestStage, parseDeploymentStage, pullRequestStage } from '../wrangler/stage.js';
+import { ciApiContext, ciApiRequest } from './api.js';
 import type { NxTargetRun } from './outputs.js';
 
 export interface GithubActionsEventPayload {
@@ -716,6 +717,15 @@ export async function publishGithubDeployment(
   const repository = processEnvironment.GITHUB_REPOSITORY;
   const sha = processEnvironment.GITHUB_SHA;
   if (!repository || !sha) throw new Error('GITHUB_REPOSITORY and GITHUB_SHA are required to publish a deployment.');
+  if (ciApiContext(processEnvironment).forgejo) {
+    await ciApiRequest(`/statuses/${sha}`, 'POST', {
+      state: 'success',
+      context: `deployment/${environment}`,
+      description: `Deployed ${environment}`,
+      target_url: url,
+    }, processEnvironment);
+    return;
+  }
   const createBody = JSON.stringify({
     ref: sha,
     environment,
@@ -797,24 +807,12 @@ async function postGithubStatus(name: string, state: string, description: string
     return;
   }
   const targetUrl = await getGithubStepUrl(step);
-  const args = [
-    'api',
-    '--method',
-    'POST',
-    '-H',
-    'Accept: application/vnd.github+json',
-    `/repos/${repository}/statuses/${sha}`,
-    '-f',
-    `state=${state}`,
-    '-f',
-    `context=${name}`,
-    '-f',
-    `description=${description}`,
-  ];
-  if (targetUrl) {
-    args.push('-f', `target_url=${targetUrl}`);
-  }
-  await run('gh', args, process.cwd());
+  await ciApiRequest(`/statuses/${sha}`, 'POST', {
+    state,
+    context: name,
+    description,
+    ...(targetUrl ? { target_url: targetUrl } : {}),
+  });
 }
 
 async function getGithubStepUrl(step: string): Promise<string | null> {
@@ -824,17 +822,19 @@ async function getGithubStepUrl(step: string): Promise<string | null> {
   if (!repository || !runId || !job) {
     return null;
   }
+  const { forgejo, htmlBase } = ciApiContext();
+  if (forgejo) return `${htmlBase}/${repository}/actions/runs/${runId}`;
   const result =
     await $`gh api -H ${'Accept: application/vnd.github+json'} ${`/repos/${repository}/actions/runs/${runId}/jobs`} --jq ${`.jobs[] | select(.name == "${job}") | .id`}`
       .quiet()
       .nothrow();
   const jobId = decode(result.stdout).trim();
   if (!jobId) {
-    return `https://github.com/${repository}/actions/runs/${runId}`;
+    return `${htmlBase}/${repository}/actions/runs/${runId}`;
   }
   return step
-    ? `https://github.com/${repository}/actions/runs/${runId}/job/${jobId}#step:${step}:1`
-    : `https://github.com/${repository}/actions/runs/${runId}/job/${jobId}`;
+    ? `${htmlBase}/${repository}/actions/runs/${runId}/job/${jobId}#step:${step}:1`
+    : `${htmlBase}/${repository}/actions/runs/${runId}/job/${jobId}`;
 }
 
 export function githubCommitStatusesWritable(

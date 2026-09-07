@@ -1,5 +1,6 @@
 import { Command, CommanderError } from 'commander';
 import { variants } from './generate/index.js';
+import { dispatchCiWorkflow, ensureCiPullRequest } from './github-ci/api.js';
 import { cliPackageVersion } from './lib/cli-package.js';
 import { decode, findRepoRoot, printCommandOutput } from './lib/run.js';
 import { ensureChromium } from './playwright/index.js';
@@ -389,6 +390,20 @@ function buildProgram(): Command {
     });
 
   const githubCi = program.command('github-ci').description('GitHub Actions helpers');
+  githubCi
+    .command('dispatch-workflow')
+    .requiredOption('--workflow <workflow>')
+    .requiredOption('--ref <ref>')
+    .action(async (options: { workflow: string; ref: string }) => {
+      await dispatchCiWorkflow(options.workflow, options.ref);
+    });
+  githubCi
+    .command('ensure-pull-request')
+    .requiredOption('--head <branch>')
+    .requiredOption('--base <branch>')
+    .requiredOption('--title <title>')
+    .requiredOption('--body <body>')
+    .action(ensureCiPullRequest);
   githubCi.command('cleanup-cache').action(async () => {
     const { cleanupGithubCiCache } = await import('./github-ci/index.js');
     await cleanupGithubCiCache(await findRepoRoot());
