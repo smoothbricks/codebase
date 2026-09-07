@@ -249,6 +249,33 @@ describe('auto release candidate filtering', () => {
       expect(queriedRefs).not.toContain('refs/tags/@scope/cli@0.2.0');
     });
   });
+
+  it('selects a private-scoped package by the same path-change rule as public packages', async () => {
+    const widget: ReleasePackageInfo = {
+      name: '@priv.test/widget',
+      projectName: 'widget',
+      path: 'packages/widget',
+      version: '0.1.0',
+    };
+    await withFixtureRepo(async (root) => {
+      await writePackage(root, widget.name, widget.path, widget.version);
+      await writePackage(root, a.name, a.path, a.version);
+      await git(root, ['add', '.']);
+      await git(root, ['commit', '-m', 'initial packages']);
+      await tag(root, 'widget@0.1.0', '2025-01-01T00:00:00Z');
+      await tag(root, 'a@1.0.0', '2025-01-01T00:00:01Z');
+
+      await mkdir(join(root, widget.path, 'src'), { recursive: true });
+      await writeFile(join(root, widget.path, 'src/index.ts'), 'export const changed = true;\n');
+      await git(root, ['add', join(widget.path, 'src/index.ts')]);
+      await git(root, ['commit', '-m', 'feat(widget): package local']);
+
+      // Release candidacy is registry-class agnostic: both npm:public and
+      // npm:private packages version through the same selection. Only the
+      // npmjs bootstrap/trust-publisher flows stay public-only.
+      await expect(autoReleaseCandidatePackages(gitCandidateShell(root), [widget, a])).resolves.toEqual([widget]);
+    });
+  });
 });
 
 function gitCandidateShell(

@@ -46,11 +46,52 @@ export const workspaceDependencyFields = [
 
 export type WorkspaceDependencyField = (typeof workspaceDependencyFields)[number];
 
+export const publishableNpmTags = ['npm:public', 'npm:private'] as const;
+
+export type PublishableNpmTag = (typeof publishableNpmTags)[number];
+
+/**
+ * Publishable packages are non-private with exactly one publishable tag.
+ * private:true still means NEVER publish, not "publish privately"; both tags
+ * together are rejected by tag validation.
+ */
+export function isPublishablePackage(pkg: Pick<PackageInfo, 'private' | 'tags'>): boolean {
+  if (pkg.private) {
+    return false;
+  }
+  return pkg.tags.includes('npm:public') !== pkg.tags.includes('npm:private');
+}
+
+export function listPrivatePackages(root: string): PackageInfo[] {
+  return getWorkspacePackages(root).filter((pkg) => isPublishablePackage(pkg) && pkg.tags.includes('npm:private'));
+}
+
 export function listPublicPackages(root: string): PackageInfo[] {
-  return getWorkspacePackages(root).filter((pkg) => !pkg.private && pkg.tags.includes('npm:public'));
+  return getWorkspacePackages(root).filter((pkg) => isPublishablePackage(pkg) && pkg.tags.includes('npm:public'));
+}
+
+/** Every package releasable through any registry: npm:public plus npm:private. */
+export function listPublishablePackages(root: string): PackageInfo[] {
+  return getWorkspacePackages(root).filter(isPublishablePackage);
 }
 
 export function listReleasePackages(
+  root: string,
+  rootPackage = readPackageJson(join(root, 'package.json')),
+): PackageInfo[] {
+  const rootRepository = rootPackage ? repositoryInfo(rootPackage.json) : null;
+  if (!rootRepository) {
+    return [];
+  }
+  return listPublishablePackages(root).filter((pkg) => isOwnedPackage(rootRepository, pkg));
+}
+
+/**
+ * Owned npm:public packages only. npmjs bootstrap and trusted-publisher setup
+ * are public-registry operations; private packages must never flow through
+ * them.
+ */
+export function listPublicReleasePackages(
   root: string,
   rootPackage = readPackageJson(join(root, 'package.json')),
 ): PackageInfo[] {

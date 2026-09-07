@@ -319,15 +319,22 @@ export function validatePublicTags(root: string): number {
   let failures = 0;
   for (const pkg of getWorkspacePackages(root)) {
     const hasPublicTag = pkg.tags.includes('npm:public');
-    if (pkg.private && hasPublicTag) {
-      console.error(`${pkg.path}: private package must not have nx tag npm:public`);
+    const hasPrivateTag = pkg.tags.includes('npm:private');
+    if (pkg.private && (hasPublicTag || hasPrivateTag)) {
+      console.error(
+        `${pkg.path}: private package must not have a publishable nx tag (private:true means never publish, not publish privately)`,
+      );
+      failures++;
+    }
+    if (hasPublicTag && hasPrivateTag) {
+      console.error(`${pkg.path}: package must not have both nx tags npm:public and npm:private`);
       failures++;
     }
   }
   if (failures > 0) {
     return failures;
   }
-  console.log('npm:public tags are valid.');
+  console.log('Publishable npm tags are valid.');
   return 0;
 }
 
