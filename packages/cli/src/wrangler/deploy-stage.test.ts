@@ -26,8 +26,8 @@ ENVIRONMENT = "staging"
 
 const ROUTED_FIXTURE = `${FIXTURE}
 [[env.staging.routes]]
-pattern = "*.staging.conloca.com/*"
-zone_name = "conloca.com"
+pattern = "*.staging.example.test/*"
+zone_name = "example.test"
 `;
 
 const roots: string[] = [];
@@ -260,7 +260,7 @@ describe('deploy-stage remote version fallback', () => {
   it('recovers when a parallel deployment creates the wildcard DNS record first', async () => {
     const root = await fixtureRoot(ROUTED_FIXTURE);
     const cloudflare = new FakeCloudflare();
-    cloudflare.zones = [{ id: 'zone', name: 'conloca.com' }];
+    cloudflare.zones = [{ id: 'zone', name: 'example.test' }];
     let createAttempts = 0;
     cloudflare.createDnsRecord = async (zoneId, name, content) => {
       createAttempts += 1;
@@ -272,7 +272,7 @@ describe('deploy-stage remote version fallback', () => {
 
     expect(result.action).toBe('deployed');
     expect(createAttempts).toBe(1);
-    expect(cloudflare.records.zone?.map((record) => record.name)).toEqual(['*.pr123.conloca.com']);
+    expect(cloudflare.records.zone?.map((record) => record.name)).toEqual(['*.pr123.example.test']);
   });
 });
 
@@ -292,25 +292,25 @@ describe('cleanup-pr exact stage matching', () => {
   it('deletes only exact hyphen/dot-delimited pr123 resources and is idempotent for missing resources', async () => {
     const cloudflare = new FakeCloudflare();
     cloudflare.domains = [
-      { id: 'domain-123', hostname: 'app.pr123.conloca.com' },
-      { id: 'domain-1234', hostname: 'app.pr1234.conloca.com' },
+      { id: 'domain-123', hostname: 'app.pr123.example.test' },
+      { id: 'domain-1234', hostname: 'app.pr1234.example.test' },
     ];
-    cloudflare.zones = [{ id: 'zone', name: 'conloca.com' }];
+    cloudflare.zones = [{ id: 'zone', name: 'example.test' }];
     cloudflare.routes.zone = [
-      { id: 'route-123', pattern: '*.pr123.conloca.com/*' },
-      { id: 'route-1234', pattern: '*.pr1234.conloca.com/*' },
+      { id: 'route-123', pattern: '*.pr123.example.test/*' },
+      { id: 'route-1234', pattern: '*.pr1234.example.test/*' },
     ];
     cloudflare.records.zone = [
-      { id: 'dns-123', name: '*.pr123.conloca.com', type: 'CNAME', content: 'pr123.conloca.com' },
-      { id: 'dns-staging', name: '*.staging.conloca.com', type: 'CNAME', content: 'staging.conloca.com' },
+      { id: 'dns-123', name: '*.pr123.example.test', type: 'CNAME', content: 'pr123.example.test' },
+      { id: 'dns-staging', name: '*.staging.example.test', type: 'CNAME', content: 'staging.example.test' },
     ];
-    cloudflare.scripts = [{ id: 'conloca-app-pr123' }, { id: 'conloca-app-pr1234' }, { id: 'conloca-app-staging' }];
+    cloudflare.scripts = [{ id: 'app-pr123' }, { id: 'app-pr1234' }, { id: 'app-staging' }];
     cloudflare.namespaces = [
       { id: 'kv-123', title: 'org-profiles-pr123' },
       { id: 'kv-1234', title: 'org-profiles-pr1234' },
     ];
-    cloudflare.buckets = [{ name: 'conloca-media-pr123' }, { name: 'conloca-media-pr1234' }];
-    cloudflare.objects['conloca-media-pr123'] = ['one', 'nested/two'];
+    cloudflare.buckets = [{ name: 'app-media-pr123' }, { name: 'app-media-pr1234' }];
+    cloudflare.objects['app-media-pr123'] = ['one', 'nested/two'];
 
     const result = await cleanupPullRequest('/unused', 123, { cloudflare });
 
@@ -323,7 +323,7 @@ describe('cleanup-pr exact stage matching', () => {
       r2Objects: 2,
       dnsRecords: 1,
     });
-    expect(cloudflare.mutations.join('\n')).toContain('delete-worker:conloca-app-pr123');
+    expect(cloudflare.mutations.join('\n')).toContain('delete-worker:app-pr123');
     expect(cloudflare.mutations.join('\n')).not.toContain('pr1234');
     expect(cloudflare.mutations.join('\n')).not.toContain('staging');
   });
