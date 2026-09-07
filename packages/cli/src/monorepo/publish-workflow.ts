@@ -170,7 +170,7 @@ export function definePublishWorkflow(options: PublishWorkflowDefinitionOptions 
   }
   const setupSteps: PublishWorkflowStepInput[] = [
     { kind: PublishWorkflowStepKind.Checkout, name: '📥 Checkout' },
-    ...(options.cargoCredentials?.gitOrigins?.length
+    ...(options.cargoCredentials !== undefined
       ? [{ kind: PublishWorkflowStepKind.CargoCredentials, name: CARGO_CREDENTIALS_STEP_NAME }]
       : []),
     ...(options.sourceCheckouts?.length
@@ -253,7 +253,7 @@ export function definePublishWorkflow(options: PublishWorkflowDefinitionOptions 
 function defineDeployOnlyWorkflowSteps(options: PublishWorkflowDefinitionOptions): PublishWorkflowStep[] {
   return numberWorkflowSteps([
     { kind: PublishWorkflowStepKind.Checkout, name: '📥 Checkout' },
-    ...(options.cargoCredentials?.gitOrigins?.length
+    ...(options.cargoCredentials !== undefined
       ? [{ kind: PublishWorkflowStepKind.CargoCredentials, name: CARGO_CREDENTIALS_STEP_NAME }]
       : []),
     ...(options.sourceCheckouts?.length
@@ -684,7 +684,7 @@ function siblingSourceCheckoutStepLines(options: PublishWorkflowDefinitionOption
   );
 }
 
-const CARGO_CREDENTIALS_STEP_NAME = '🔑 Prepare Cargo git credentials';
+const CARGO_CREDENTIALS_STEP_NAME = 'Prepare Cargo credentials';
 
 /**
  * One credential-helper install per job, because the helper is process
@@ -694,7 +694,7 @@ const CARGO_CREDENTIALS_STEP_NAME = '🔑 Prepare Cargo git credentials';
  */
 function cargoCredentialsStepLines(options: PublishWorkflowDefinitionOptions): string[] {
   const config = options.cargoCredentials;
-  if (!config?.gitOrigins?.length) {
+  if (config === undefined) {
     return [];
   }
   return cargoCredentialStepLines(

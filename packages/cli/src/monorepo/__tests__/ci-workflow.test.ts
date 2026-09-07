@@ -1,11 +1,15 @@
 /* biome-ignore-all lint/suspicious/noTemplateCurlyInString: Assertions cover literal GitHub Actions expressions. */
 
 import { describe, expect, it } from 'bun:test';
+import { spawnSync } from 'node:child_process';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   type CiWorkflowDefinitionOptions,
   CiWorkflowStepKind,
+  cargoCredentialStepLines,
   defineCiWorkflow,
   renderCiWorkflowYaml,
 } from '../ci-workflow.js';
@@ -164,62 +168,75 @@ describe('CI workflow definition', () => {
     ).toThrow('secret env name');
   });
 
-  it('installs the cargo git credential helper and job tokens before setup and renumbers following steps', () => {
-    const definition = options({
-      cargoCredentials: {
-        gitOrigins: [{ origin: 'https://git.example.net', tokenEnv: 'CARGO_GIT_TOKEN' }],
-        registryTokenEnvs: ['CARGO_REGISTRIES_EXAMPLE_TOKEN'],
-      },
-    });
-    const steps = defineCiWorkflow(definition);
-
-    expect(steps.slice(0, 4).map((step) => [step.kind, step.number])).toEqual([
-      [CiWorkflowStepKind.Checkout, 2],
-      [CiWorkflowStepKind.CargoCredentials, 3],
-      [CiWorkflowStepKind.SetupDevenv, 4],
-      [CiWorkflowStepKind.SetNxShas, 5],
-    ]);
-    const rendered = renderCiWorkflowYaml(definition);
-    expect(rendered).toContain('- name: 🔑 Prepare Cargo git credentials');
-    // Registry tokens ride the job env inside the env block, not a step.
-    expect(rendered).toContain('    env:\n      NIX_STORE_NAR:');
-    expect(rendered).toContain('      CARGO_REGISTRIES_EXAMPLE_TOKEN: ${{ secrets.CARGO_REGISTRIES_EXAMPLE_TOKEN }}');
-    expect(rendered).toContain('      CARGO_GIT_TOKEN: ${{ secrets.CARGO_GIT_TOKEN }}');
-    // The helper is written to the runner temp dir and referenced through the
-    // per-process GIT_CONFIG_* environment: no token in any URL or argv.
-    expect(rendered).toContain('helper="$RUNNER_TEMP/cargo-git-credential.sh"');
-    expect(rendered).toContain('CARGO_NET_GIT_FETCH_WITH_CLI=true');
-    expect(rendered).toContain('GIT_CONFIG_COUNT=2');
-    expect(rendered).toContain('GIT_CONFIG_KEY_0=credential.helper');
-    expect(rendered).toContain('GIT_CONFIG_VALUE_0=');
-    expect(rendered).toContain('GIT_CONFIG_KEY_1=credential.helper');
-    expect(rendered).toContain('GIT_CONFIG_VALUE_1=$helper');
-    expect(rendered).toContain('case "$host" in');
-    expect(rendered).toContain('git.example.net)');
-    expect(rendered).toContain('printf \'username=x-access-token\\npassword=%s\\n\' "$CARGO_GIT_TOKEN" ;;');
-    expect(rendered).not.toMatch(/https:\/\/[^ ]*CARGO_GIT_TOKEN/);
-    expect(rendered).not.toContain('extraheader');
+  it('restricts Cargo credential answers to HTTPS origins and get operations without persisting secrets', () => {
+    const directory = mkdtempSync(join(tmpdir(), 'cargo-credentials-'));
+    try {
+      const githubEnv = join(directory, 'env');
+      writeFileSync(githubEnv, '');
+      const lines = cargoCredentialStepLines(
+        { kind: CiWorkflowStepKind.CargoCredentials, name: 'Credentials', number: 3 },
+        { gitOrigins: [{ origin: 'https://[::1]:8443', tokenEnv: 'SOURCE_READ_TOKEN' }] },
+      );
+      const script = lines.slice(lines.indexOf('        run: |') + 1).map((line) => line.slice(10)).join('\n');
+      const environment = { ...process.env, RUNNER_TEMP: directory, GITHUB_ENV: githubEnv, SOURCE_READ_TOKEN: 'fixture-secret' };
+      const prepared = spawnSync('sh', ['-eu', '-c', script], { env: environment, encoding: 'utf8' });
+      expect(prepared.status).toBe(0);
+      expect(prepared.stdout + prepared.stderr + readFileSync(githubEnv, 'utf8')).not.toContain('fixture-secret');
+      const helper = join(directory, 'cargo-git-credential.sh');
+      expect(readFileSync(helper, 'utf8')).not.toContain('fixture-secret');
+      for (const { operation, protocol, host, expected } of [
+        { operation: 'get', protocol: 'https', host: '[::1]:8443', expected: 'username=x-access-token\npassword=fixture-secret\n' },
+        { operation: 'get', protocol: 'http', host: '[::1]:8443', expected: '' },
+        { operation: 'get', protocol: 'https', host: '[::1]:8444', expected: '' },
+        { operation: 'get', protocol: 'https', host: 'other.example.net', expected: '' },
+        { operation: 'store', protocol: 'https', host: '[::1]:8443', expected: '' },
+        { operation: 'erase', protocol: 'https', host: '[::1]:8443', expected: '' },
+      ]) {
+        const result = spawnSync('sh', [helper, operation], {
+          env: environment, encoding: 'utf8', input: `protocol=${protocol}\nhost=${host}\npath=owner/repository.git\n\n`,
+        });
+        expect(result.status).toBe(0);
+        expect(result.stdout).toBe(expected);
+        expect(result.stderr).toBe('');
+      }
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
   });
 
-  it('maps registry tokens without emitting a credential step when no git origins are declared', () => {
-    const rendered = renderCiWorkflowYaml(
-      options({ cargoCredentials: { registryTokenEnvs: ['CARGO_REGISTRIES_EXAMPLE_TOKEN'] } }),
+  it('refuses missing registry secrets before setup and skips private Cargo jobs for fork PRs', () => {
+    const definition = options({ cargoCredentials: { registryTokenEnvs: ['CARGO_REGISTRIES_EXAMPLE_TOKEN'] } });
+    const steps = defineCiWorkflow(definition);
+    expect(steps.findIndex((step) => step.kind === CiWorkflowStepKind.CargoCredentials)).toBeLessThan(
+      steps.findIndex((step) => step.kind === CiWorkflowStepKind.SetupDevenv),
     );
-
-    expect(rendered).not.toContain('Prepare Cargo git credentials');
-    expect(rendered).not.toContain('CARGO_NET_GIT_FETCH_WITH_CLI');
-    expect(rendered).toContain('      CARGO_REGISTRIES_EXAMPLE_TOKEN: ${{ secrets.CARGO_REGISTRIES_EXAMPLE_TOKEN }}');
+    expect(Bun.YAML.parse(renderCiWorkflowYaml(definition))).toMatchObject({ jobs: { main: {
+      if: "${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}",
+    } } });
+    const lines = cargoCredentialStepLines(
+      { kind: CiWorkflowStepKind.CargoCredentials, name: 'Credentials', number: 3 }, definition.cargoCredentials ?? {},
+    );
+    const script = lines.slice(lines.indexOf('        run: |') + 1).map((line) => line.slice(10)).join('\n');
+    const missing = spawnSync('sh', ['-eu', '-c', script], { env: { CARGO_REGISTRIES_EXAMPLE_TOKEN: '' }, encoding: 'utf8' });
+    expect(missing.status).not.toBe(0);
+    expect(missing.stderr).toContain('CARGO_REGISTRIES_EXAMPLE_TOKEN');
+    const present = spawnSync('sh', ['-eu', '-c', script], { env: { CARGO_REGISTRIES_EXAMPLE_TOKEN: 'fixture-secret' }, encoding: 'utf8' });
+    expect(present.status).toBe(0);
+    expect(present.stdout + present.stderr).toBe('');
   });
 
   it('does not mention cargo credentials when the root did not opt in', () => {
     const rendered = renderCiWorkflowYaml(options());
-
-    expect(rendered).not.toContain('Prepare Cargo git credentials');
+    expect(rendered).not.toContain('Prepare Cargo credentials');
     expect(rendered).not.toContain('CARGO_NET_GIT_FETCH_WITH_CLI');
     expect(rendered).not.toContain('credential.helper');
   });
 
   it('refuses malformed cargo credential declarations at render time', () => {
+    expect(() => renderCiWorkflowYaml(options({ cargoCredentials: { gitOrigins: [
+      { origin: 'https://git.example.net', tokenEnv: 'FIRST_TOKEN' },
+      { origin: 'https://git.example.net:443', tokenEnv: 'SECOND_TOKEN' },
+    ] } }))).toThrow('one token per origin');
     expect(() => renderCiWorkflowYaml(options({ cargoCredentials: {} }))).toThrow(
       'at least one gitOrigins or registryTokenEnvs',
     );
