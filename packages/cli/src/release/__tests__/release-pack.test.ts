@@ -1,7 +1,8 @@
 import { describe, expect, it } from 'bun:test';
 import { createHash } from 'node:crypto';
+import { existsSync } from 'node:fs';
 import { mkdir, readdir, readFile, writeFile } from 'node:fs/promises';
-import { isAbsolute, join } from 'node:path';
+import { ensureNx, ensureNxTargets, readJsonObject, writeJsonObject } from '../../lib/json.js';
 import {
   listPublicPackages,
   listPublishablePackages,
@@ -300,6 +301,46 @@ describe('release pack tarball production', () => {
         alphaExports: { '.': { development: './src/index.ts', default: './dist/index.js' } },
       },
     );
+  });
+});
+
+describe('release-check gate', () => {
+  const checkCommand = 'test -f dist/native-ok && touch dist/check-ran';
+
+  async function declareReleaseCheck(root: string): Promise<void> {
+    const manifestPath = join(root, 'packages/alpha/package.json');
+    const manifest = readJsonObject(manifestPath);
+    if (!manifest) {
+      throw new Error(`fixture manifest is not a package.json: ${manifestPath}`);
+    }
+    ensureNxTargets(ensureNx(manifest))['release-check'] = {
+      executor: 'nx:run-commands',
+      options: { command: checkCommand, cwd: 'packages/alpha' },
+    };
+    writeJsonObject(manifestPath, manifest);
+  }
+
+  it('refuses to pack when the declared release-check gate fails', async () => {
+    await withPackWorkspace(async (root) => {
+      await declareReleaseCheck(root);
+      await expect(packReleaseTarball(root, packagedProject(root, 'alpha'))).rejects.toThrow(
+        /release-check gate refused/,
+      );
+      expect(existsSync(join(root, 'packages/alpha/dist/check-ran'))).toBe(false);
+    });
+  });
+
+  it('packs only after the declared release-check gate passes', async () => {
+    await withPackWorkspace(async (root) => {
+      await declareReleaseCheck(root);
+      await writeFile(join(root, 'packages/alpha/dist/native-ok'), 'ok\n');
+      const packed = await packReleaseTarball(root, packagedProject(root, 'alpha'));
+      try {
+        expect(existsSync(join(root, 'packages/alpha/dist/check-ran'))).toBe(true);
+      } finally {
+        await packed.cleanup();
+      }
+    });
   });
 });
 
