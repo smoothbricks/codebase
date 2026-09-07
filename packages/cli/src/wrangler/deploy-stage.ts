@@ -204,6 +204,7 @@ export interface CleanupResult {
     r2Buckets: number;
     r2Objects: number;
     dnsRecords: number;
+    d1Databases: number;
   };
 }
 
@@ -229,6 +230,7 @@ export async function cleanupPullRequest(
     r2Buckets: 0,
     r2Objects: 0,
     dnsRecords: 0,
+    d1Databases: 0,
   };
 
   for (const domain of await cloudflare.listWorkerDomains()) {
@@ -268,6 +270,11 @@ export async function cleanupPullRequest(
     }
     await cloudflare.deleteR2Bucket(bucket.name);
     deleted.r2Buckets += 1;
+  }
+  for (const database of await cloudflare.listD1Databases()) {
+    if (!hasExactStageSegment(database.name, stage)) continue;
+    await cloudflare.deleteD1Database(database.uuid);
+    deleted.d1Databases += 1;
   }
   return { stage, deleted };
 }

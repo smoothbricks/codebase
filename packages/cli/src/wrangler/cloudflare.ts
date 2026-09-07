@@ -34,6 +34,11 @@ export interface DnsRecord {
   proxied?: boolean;
 }
 
+export interface D1DatabaseRecord {
+  uuid: string;
+  name: string;
+}
+
 export interface CloudflareClient {
   listKvNamespaces(): Promise<LiveKvNamespace[]>;
   createKvNamespace(title: string): Promise<LiveKvNamespace>;
@@ -55,6 +60,9 @@ export interface CloudflareClient {
   listDnsRecords(zoneId: string): Promise<DnsRecord[]>;
   createDnsRecord(zoneId: string, name: string, content: string): Promise<void>;
   deleteDnsRecord(zoneId: string, recordId: string): Promise<void>;
+  listD1Databases(): Promise<D1DatabaseRecord[]>;
+  createD1Database(name: string): Promise<D1DatabaseRecord>;
+  deleteD1Database(uuid: string): Promise<void>;
 }
 
 interface CloudflareEnvelope {
@@ -82,6 +90,8 @@ const isWorkerDomains = typia.createIs<WorkerDomain[]>();
 const isCloudflareZones = typia.createIs<CloudflareZone[]>();
 const isWorkerRoutes = typia.createIs<WorkerRoute[]>();
 const isDnsRecords = typia.createIs<DnsRecord[]>();
+const isD1Databases = typia.createIs<D1DatabaseRecord[]>();
+const isCreatedD1Database = typia.createIs<D1DatabaseRecord>();
 const isR2Objects = typia.createIs<Array<{ key: string }>>();
 const isR2BucketPage = typia.createIs<{ buckets: R2Bucket[] }>();
 const isR2ObjectPage = typia.createIs<{ objects: Array<{ key: string }> }>();
@@ -242,6 +252,25 @@ export class CloudflareRestClient implements CloudflareClient {
     await this.result(`/zones/${encodeURIComponent(zoneId)}/dns_records/${encodeURIComponent(recordId)}`, {
       method: 'DELETE',
     });
+  }
+
+  listD1Databases(): Promise<D1DatabaseRecord[]> {
+    return this.listPageItems(`${this.accountPath}/d1/database`, isD1Databases);
+  }
+
+  async createD1Database(name: string): Promise<D1DatabaseRecord> {
+    const result = await this.result(`${this.accountPath}/d1/database`, {
+      method: 'POST',
+      body: JSON.stringify({ name }),
+    });
+    if (!isCreatedD1Database(result)) {
+      throw new Error(`Cloudflare returned an invalid D1 database after creating ${name}.`);
+    }
+    return result;
+  }
+
+  async deleteD1Database(uuid: string): Promise<void> {
+    await this.result(`${this.accountPath}/d1/database/${encodeURIComponent(uuid)}`, { method: 'DELETE' });
   }
 
   private async listPageItems<T>(path: string, isItems: (value: unknown) => value is T[]): Promise<T[]> {

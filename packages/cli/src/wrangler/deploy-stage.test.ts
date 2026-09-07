@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import type {
   CloudflareClient,
   CloudflareZone,
+  D1DatabaseRecord,
   DnsRecord,
   R2Bucket,
   WorkerDomain,
@@ -86,6 +87,7 @@ class FakeCloudflare implements CloudflareClient {
   routes: Record<string, WorkerRoute[]> = {};
   records: Record<string, DnsRecord[]> = {};
   objects: Record<string, string[]> = {};
+  d1Databases: D1DatabaseRecord[] = [];
   mutations: string[] = [];
 
   async listKvNamespaces(): Promise<LiveKvNamespace[]> {
@@ -151,6 +153,18 @@ class FakeCloudflare implements CloudflareClient {
   }
   async deleteDnsRecord(zoneId: string, recordId: string): Promise<void> {
     this.mutations.push(`delete-dns:${zoneId}:${recordId}`);
+  }
+  async listD1Databases(): Promise<D1DatabaseRecord[]> {
+    return this.d1Databases;
+  }
+  async createD1Database(name: string): Promise<D1DatabaseRecord> {
+    const record = { uuid: `d1-${name}`, name };
+    this.d1Databases.push(record);
+    this.mutations.push(`create-d1:${name}`);
+    return record;
+  }
+  async deleteD1Database(uuid: string): Promise<void> {
+    this.mutations.push(`delete-d1:${uuid}`);
   }
 }
 
@@ -322,10 +336,27 @@ describe('cleanup-pr exact stage matching', () => {
       r2Buckets: 1,
       r2Objects: 2,
       dnsRecords: 1,
+      d1Databases: 0,
     });
     expect(cloudflare.mutations.join('\n')).toContain('delete-worker:app-pr123');
     expect(cloudflare.mutations.join('\n')).not.toContain('pr1234');
     expect(cloudflare.mutations.join('\n')).not.toContain('staging');
+  });
+
+  it('deletes D1 databases carrying the stage segment and reports them', async () => {
+    const cloudflare = new FakeCloudflare();
+    cloudflare.d1Databases = [
+      { uuid: 'd1-keep', name: 'site-staging-db' },
+      { uuid: 'd1-gone', name: 'site-pr7-db' },
+      { uuid: 'd1-other', name: 'site-pr70-db' },
+    ];
+
+    const result = await cleanupPullRequest('/unused', 7, { cloudflare });
+
+    expect(cloudflare.mutations).toContain('delete-d1:d1-gone');
+    expect(cloudflare.mutations).not.toContain('delete-d1:d1-keep');
+    expect(cloudflare.mutations).not.toContain('delete-d1:d1-other');
+    expect(result.deleted.d1Databases).toBe(1);
   });
 });
 

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'bun:test';
-import { CloudflareApiError, CloudflareRestClient } from './cloudflare.js';
+import { CloudflareApiError, CloudflareRestClient, type D1DatabaseRecord } from './cloudflare.js';
 
 type CloudflareFetcher = NonNullable<ConstructorParameters<typeof CloudflareRestClient>[2]>;
 
@@ -104,5 +104,46 @@ describe('CloudflareRestClient responses without an envelope', () => {
   it('still rejects a non-envelope object on a successful status', async () => {
     const client = new CloudflareRestClient('account-1', 'token', rawFetcher('{"unexpected":true}', 200));
     await expect(client.deleteWorkerDomain('domain-1')).rejects.toThrow(/malformed response/);
+  });
+});
+
+describe('CloudflareRestClient D1', () => {
+  it('lists databases from the paginated envelope', async () => {
+    const client = new CloudflareRestClient(
+      'account-1',
+      'token',
+      jsonFetcher({
+        success: true,
+        result: [{ uuid: 'db-1', name: 'site-staging-db', version: 'production' }],
+        result_info: { count: 1, page: 1, per_page: 1000, total_count: 1 },
+      }),
+    );
+    // Hoisted: TypeScript's excess-property check rejects the extra field in an inline
+    // literal, and typia's createIs keeps it at runtime.
+    const expected: D1DatabaseRecord & { version: string } = {
+      uuid: 'db-1',
+      name: 'site-staging-db',
+      version: 'production',
+    };
+    await expect(client.listD1Databases()).resolves.toEqual([expected]);
+  });
+
+  it('creates a database and returns its record', async () => {
+    const client = new CloudflareRestClient(
+      'account-1',
+      'token',
+      jsonFetcher({ success: true, result: { uuid: 'db-2', name: 'site-pr7-db' } }),
+    );
+    await expect(client.createD1Database('site-pr7-db')).resolves.toEqual({ uuid: 'db-2', name: 'site-pr7-db' });
+  });
+
+  it('deletes a database by uuid', async () => {
+    const calls: string[] = [];
+    const client = new CloudflareRestClient('account-1', 'token', async (input, init) => {
+      calls.push(`${init?.method ?? 'GET'} ${input}`);
+      return new Response(JSON.stringify({ success: true, result: null }), { status: 200 });
+    });
+    await client.deleteD1Database('db-2');
+    expect(calls).toEqual(['DELETE https://api.cloudflare.com/client/v4/accounts/account-1/d1/database/db-2']);
   });
 });
