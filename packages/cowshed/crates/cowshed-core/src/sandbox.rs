@@ -406,6 +406,14 @@ pub fn seatbelt_profile(
         &mut profile,
         "(allow mach-priv-task-port (target same-sandbox))",
     );
+    // Filesystem watchers need this service port or they silently receive no
+    // events. FSEvents still filters notifications through the file-read
+    // policy: the real watcher regression covers an allowed update and a
+    // denied descendant. No other Mach service or filesystem access is added.
+    push_line(
+        &mut profile,
+        "(allow mach-lookup (global-name \"com.apple.FSEvents\"))",
+    );
 
     for socket in &sockets {
         push_line(
