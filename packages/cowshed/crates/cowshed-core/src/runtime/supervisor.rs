@@ -1113,6 +1113,10 @@ async fn sandboxed_command(
     let runtime_link = sandbox_runtime_link(sandbox);
 
     let mut command = tokio::process::Command::new(&plan.program);
+    // Local services already have a bounded direct-connect capability. Sending
+    // them through the external gateway incorrectly requires an egress grant.
+    // The sandbox still rejects loopback ports outside this workspace's block.
+    let loopback_no_proxy = "localhost,127.0.0.1,::1";
     command
         .env_clear()
         .args(&plan.args)
@@ -1154,7 +1158,9 @@ async fn sandboxed_command(
         .env("HTTP_PROXY", &gateway_http)
         .env("HTTPS_PROXY", &gateway_http)
         .env("http_proxy", &gateway_http)
-        .env("https_proxy", &gateway_http);
+        .env("https_proxy", &gateway_http)
+        .env("NO_PROXY", loopback_no_proxy)
+        .env("no_proxy", loopback_no_proxy);
     for key in ["LANG", "LC_ALL", "LC_CTYPE", "TERM", "COLORTERM"] {
         if let Some(value) = std::env::var_os(key) {
             command.env(key, value);
