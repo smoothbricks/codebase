@@ -1015,8 +1015,7 @@ it('installs the Cargo credential helper in every job that fetches crates', () =
   // fetches the private dependency anonymously and fails. The macOS leg builds
   // the Apple natives and the final job still repairs pending releases.
   for (const job of [linuxCandidate, macosPlatform, finalJob]) {
-    expect(job).toContain('- name: 🔑 Prepare Cargo git credentials');
-    expect(job.indexOf('🔑 Prepare Cargo git credentials')).toBeLessThan(job.indexOf('🧱 Setup Nix/devenv'));
+    expect(job.indexOf('Prepare Cargo credentials')).toBeLessThan(job.indexOf('🧱 Setup Nix/devenv'));
   }
   expect(Bun.YAML.parse(rendered)).toMatchObject({
     jobs: {
@@ -1032,7 +1031,7 @@ it('installs the Cargo credential helper in every job that fetches crates', () =
     repoName: '@smoothbricks/codebase',
     platformTargetGlobs: PLATFORM_TARGET_GLOBS,
   });
-  expect(withoutCredentials).not.toContain('🔑 Prepare Cargo git credentials');
+  expect(withoutCredentials).not.toContain('Prepare Cargo credentials');
   expect(withoutCredentials).not.toContain('CARGO_NET_GIT_FETCH_WITH_CLI');
   expect(withoutCredentials).not.toContain('SOURCE_READ_TOKEN');
 });
@@ -1061,20 +1060,18 @@ it('keeps job-local step anchors contiguous once Cargo credentials add a setup s
   expect(stepAnchorNumbers(linuxCandidate)).toEqual(Array.from({ length: 20 }, (_, index) => index + 1));
   expect(stepAnchorNumbers(macosPlatform)).toEqual(Array.from({ length: 11 }, (_, index) => index + 1));
   expect(stepAnchorNumbers(finalJob)).toEqual(Array.from({ length: 15 }, (_, index) => index + 1));
-  expect(macosPlatform).toContain('# Step 3\n      - name: 🔑 Prepare Cargo git credentials');
-  expect(finalJob).toContain('# Step 3\n      - name: 🔑 Prepare Cargo git credentials');
 });
 
-it('wires registry-only Cargo credentials as job env without a git credential step', () => {
+it('preflights registry-only Cargo credentials in every fetching job without installing a git helper', () => {
   const rendered = renderPublishWorkflowYaml({
     repoName: '@smoothbricks/codebase',
     platformTargetGlobs: PLATFORM_TARGET_GLOBS,
-    cargoCredentials: { registryTokenEnvs: ['CARGO_REGISTRIES_PRIVATE_TOKEN', 'CARGO_REGISTRIES_FORGE_TOKEN'] },
+    cargoCredentials: { registryTokenEnvs: ['CARGO_REGISTRIES_EXAMPLE_TOKEN', 'CARGO_REGISTRIES_FORGE_TOKEN'] },
   });
   const macosPlatform = rendered.slice(rendered.indexOf('  macos-platform:'), rendered.indexOf('  publish-on-linux:'));
 
   const registryEnv = {
-    CARGO_REGISTRIES_PRIVATE_TOKEN: '${{ secrets.CARGO_REGISTRIES_PRIVATE_TOKEN }}',
+    CARGO_REGISTRIES_EXAMPLE_TOKEN: '${{ secrets.CARGO_REGISTRIES_EXAMPLE_TOKEN }}',
     CARGO_REGISTRIES_FORGE_TOKEN: '${{ secrets.CARGO_REGISTRIES_FORGE_TOKEN }}',
   };
   expect(Bun.YAML.parse(rendered)).toMatchObject({
@@ -1084,10 +1081,8 @@ it('wires registry-only Cargo credentials as job env without a git credential st
       'publish-on-linux': { env: registryEnv },
     },
   });
-  // Cargo's own credential provider reads the registry token; no git helper is
-  // installed and no step count moves.
-  expect(rendered).not.toContain('🔑 Prepare Cargo git credentials');
-  expect(stepAnchorNumbers(macosPlatform)).toEqual(Array.from({ length: 10 }, (_, index) => index + 1));
+  expect(rendered).not.toContain('CARGO_NET_GIT_FETCH_WITH_CLI');
+  expect(stepAnchorNumbers(macosPlatform)).toEqual(Array.from({ length: 11 }, (_, index) => index + 1));
 });
 
 it('refuses malformed Cargo credential declarations at render time', () => {
