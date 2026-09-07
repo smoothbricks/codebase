@@ -1,5 +1,6 @@
+import { readFileSync } from 'node:fs';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { runResult } from '../lib/run.js';
 import { type PackageInfo, readPackageJson } from '../lib/workspace.js';
@@ -35,9 +36,14 @@ function configError(kind: PrivateNpmRegistryConfigErrorKind, message: string): 
 }
 
 /**
- * Resolve the Forgejo npm destination declared by the root smoo config.
- * Reads the typed root configuration plus its named URL environment variable.
- * Makes no network requests; diagnostics name variables, never tokens.
+ * Resolve the Forgejo npm destination for the root's declared private scope.
+ * The URL is the scoped `@scope:registry` entry in the committed .npmrc
+ * (project file first, then the user's) — npm's own source of truth, never a
+ * required environment variable. Validation (HTTPS, credential-free,
+ * /api/packages/<owner>/npm/ owner path) runs here, and this only runs when
+ * an actual registry operation needs a destination: shell entry never
+ * requires private configuration. Diagnostics name the file, scope, or
+ * missing credential variable — never a token value.
  *
  * ScopeMismatch is not produced here (a bare root carries no package scope to
  * compare); per-package scope/registry-conflict checks live in
@@ -58,29 +64,29 @@ export function resolvePrivateNpmRegistry(root: string): RegistryResult {
       `smoo.privateNpm.scope must be a scope such as @priv.test, got ${JSON.stringify(config.scope)}.`,
     );
   }
-  const rawUrl = process.env[config.registryEnv] ?? '';
+  const rawUrl = npmrcScopeRegistry(root, config.scope);
   if (!rawUrl) {
     return configError(
       'MissingRegistry',
-      `Private npm registry URL is not configured: environment variable ${config.registryEnv} is unset or empty. Refusing private operation.`,
+      `Private npm registry URL is not configured: no ${config.scope}:registry entry in ${join(root, '.npmrc')} (or the user .npmrc). Refusing private operation.`,
     );
   }
   let url: URL;
   try {
     url = new URL(rawUrl);
   } catch {
-    return configError('InvalidRegistry', `Environment variable ${config.registryEnv} is not a valid URL.`);
+    return configError('InvalidRegistry', `The ${config.scope}:registry entry in .npmrc is not a valid URL.`);
   }
   if (url.protocol !== 'https:') {
     return configError(
       'InvalidRegistry',
-      `Environment variable ${config.registryEnv} must be an HTTPS URL ending in /api/packages/<owner>/npm/.`,
+      `The ${config.scope}:registry entry in .npmrc must be an HTTPS URL ending in /api/packages/<owner>/npm/.`,
     );
   }
   if (url.username || url.password || url.search || url.hash) {
     return configError(
       'InvalidRegistry',
-      `Environment variable ${config.registryEnv} must be a credential-free URL with no query or fragment.`,
+      `The ${config.scope}:registry entry in .npmrc must be a credential-free URL with no query or fragment; tokens belong in //host/path/:_authToken lines referencing an environment variable.`,
     );
   }
   // Forgejo npm endpoints are scoped under /api/packages/<owner>/npm/, with an
@@ -90,7 +96,7 @@ export function resolvePrivateNpmRegistry(root: string): RegistryResult {
   if (url.pathname.includes('//')) {
     return configError(
       'InvalidRegistry',
-      `Environment variable ${config.registryEnv} must not contain duplicate slashes.`,
+      `The ${config.scope}:registry entry in .npmrc must not contain duplicate slashes.`,
     );
   }
   const segments = url.pathname.split('/').filter((segment) => segment.length > 0);
@@ -98,7 +104,7 @@ export function resolvePrivateNpmRegistry(root: string): RegistryResult {
   if (segments.length < 4 || tail[0] !== 'api' || tail[1] !== 'packages' || !tail[2] || tail[3] !== 'npm') {
     return configError(
       'InvalidRegistry',
-      `Environment variable ${config.registryEnv} must end in /api/packages/<owner>/npm/ (Forgejo npm owner path).`,
+      `The ${config.scope}:registry entry in .npmrc must end in /api/packages/<owner>/npm/ (Forgejo npm owner path).`,
     );
   }
   const pathname = url.pathname.endsWith('/') ? url.pathname : `${url.pathname}/`;
@@ -112,6 +118,38 @@ export function resolvePrivateNpmRegistry(root: string): RegistryResult {
       publishTokenEnv: config.publishTokenEnv,
     },
   };
+}
+
+/**
+ * npm .npmrc semantics, narrowed to the one key this decision needs: the
+ * scoped registry URL. Project .npmrc wins over the user's; comments and
+ * blank lines are skipped; values are used verbatim (an unexpanded ${VAR}
+ * placeholder simply fails URL validation at operation time).
+ */
+function npmrcScopeRegistry(root: string, scope: string): string | null {
+  const candidates = [join(root, '.npmrc'), join(homedir(), '.npmrc')];
+  for (const path of candidates) {
+    let text: string;
+    try {
+      text = readFileSync(path, 'utf8');
+    } catch {
+      continue;
+    }
+    for (const line of text.split(/\r?\n/)) {
+      const trimmed = line.trim();
+      if (trimmed.length === 0 || trimmed.startsWith('#') || trimmed.startsWith(';')) {
+        continue;
+      }
+      const separator = trimmed.indexOf('=');
+      if (separator <= 0) {
+        continue;
+      }
+      if (trimmed.slice(0, separator).trim() === `${scope}:registry`) {
+        return trimmed.slice(separator + 1).trim();
+      }
+    }
+  }
+  return null;
 }
 
 /** Throwing variant for publish/status paths: refuses with zero network I/O. */

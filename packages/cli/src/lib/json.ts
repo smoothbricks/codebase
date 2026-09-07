@@ -30,16 +30,16 @@ export interface PackageSmooGithub {
 }
 
 /**
- * Declared opt-in for private npm distribution. Fields are environment
- * variable NAMES plus the package scope — never endpoint URLs or credentials.
- * A scope without this config is public; the consumer side omits
- * publishTokenEnv because it never publishes.
+ * Declared opt-in for private npm distribution. The registry URL itself is
+ * the scoped `@scope:registry` entry in the committed .npmrc — never a
+ * required environment variable and never a shell-entry check. Token env
+ * names stay declared so credentials remain environment values referenced
+ * from .npmrc; the consumer side omits publishTokenEnv because it never
+ * publishes.
  */
 export interface PackagePrivateNpmConfig {
   scope: string;
-  /** Environment variable holding the credential-free HTTPS registry URL. */
-  registryEnv: string;
-  /** Environment variable holding the package-read token. */
+  /** Environment variable holding the package-read token, referenced from .npmrc. */
   readTokenEnv: string;
   /** Environment variable holding the separate publisher token; publishers only. */
   publishTokenEnv?: string;

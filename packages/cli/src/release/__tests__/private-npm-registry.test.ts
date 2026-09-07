@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'bun:test';
-import { readFile, writeFile } from 'node:fs/promises';
+import { writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { releaseBootstrapNpmPackages } from '../index.js';
 import { withPackWorkspace } from './helpers/pack-workspace.js';
@@ -7,7 +7,6 @@ import {
   FIXTURE_OWNER,
   FIXTURE_READ_TOKEN,
   FIXTURE_READ_TOKEN_ENV,
-  FIXTURE_REGISTRY_ENV,
   FIXTURE_SCOPE,
   type PrivateNpmFixture,
   withPrivateNpmFixture,
@@ -28,13 +27,13 @@ const OWNER_PATH_PREFIX = `/api/packages/${FIXTURE_OWNER}/npm/`;
  * here instead of in a private-install outage.
  */
 describe('private npm scope routing through bun install', () => {
-  it('expands the declared registry and read-token variables into owner-path requests', async () => {
+  it('routes the scoped .npmrc registry and its token env reference into owner-path requests', async () => {
     await withPrivateNpmFixture(async (fixture) => {
       await seedPackages(fixture);
       const consumer = await fixture.createConsumer({
         dependencies: { [PRIVATE_PACKAGE]: PRIVATE_VERSION },
-        registry: '$FIXTURE_PUBLIC_REGISTRY',
-        scopes: { [FIXTURE_SCOPE]: { url: `$${FIXTURE_REGISTRY_ENV}`, token: `$${FIXTURE_READ_TOKEN_ENV}` } },
+        registry: '${FIXTURE_PUBLIC_REGISTRY}',
+        scopes: { [FIXTURE_SCOPE]: { url: fixture.privateRegistry.registry, token: `\${${FIXTURE_READ_TOKEN_ENV}}` } },
       });
 
       const result = await consumer.install(fixtureEnv(fixture));
@@ -58,8 +57,8 @@ describe('private npm scope routing through bun install', () => {
       await seedPackages(fixture);
       const consumer = await fixture.createConsumer({
         dependencies: { [PRIVATE_PACKAGE]: PRIVATE_VERSION, [PUBLIC_PACKAGE]: PUBLIC_VERSION },
-        registry: '$FIXTURE_PUBLIC_REGISTRY',
-        scopes: { [FIXTURE_SCOPE]: { url: `$${FIXTURE_REGISTRY_ENV}`, token: `$${FIXTURE_READ_TOKEN_ENV}` } },
+        registry: '${FIXTURE_PUBLIC_REGISTRY}',
+        scopes: { [FIXTURE_SCOPE]: { url: fixture.privateRegistry.registry, token: `\${${FIXTURE_READ_TOKEN_ENV}}` } },
       });
 
       const result = await consumer.install(fixtureEnv(fixture));
@@ -73,24 +72,23 @@ describe('private npm scope routing through bun install', () => {
       expect(fixture.privateRegistry.requestsFor(PUBLIC_PACKAGE)).toEqual([]);
     });
   });
-
-  it('refuses the install when the registry variable is unset instead of falling back to the public registry', async () => {
+  it('refuses the install when the scope has no .npmrc registry entry', async () => {
     await withPrivateNpmFixture(async (fixture) => {
       await seedPackages(fixture);
       const consumer = await fixture.createConsumer({
         dependencies: { [PRIVATE_PACKAGE]: PRIVATE_VERSION },
-        registry: '$FIXTURE_PUBLIC_REGISTRY',
-        scopes: { [FIXTURE_SCOPE]: { url: `$${FIXTURE_REGISTRY_ENV}`, token: `$${FIXTURE_READ_TOKEN_ENV}` } },
+        registry: '${FIXTURE_PUBLIC_REGISTRY}',
       });
 
-      const { [FIXTURE_REGISTRY_ENV]: _registry, ...envWithoutRegistry } = fixtureEnv(fixture);
-      const result = await consumer.install(envWithoutRegistry);
+      const result = await consumer.install(fixtureEnv(fixture));
 
+      // npm semantics: an unconfigured scope resolves against the default
+      // registry, which is a loopback stand-in that 404s the private name.
+      // The operation fails, nothing installs, and the private registry —
+      // the only origin holding the credential — sees no request.
       expect(result.exitCode).not.toBe(0);
       expect(await consumer.installedVersion(PRIVATE_PACKAGE)).toBeNull();
-      // No request at all: an unresolved endpoint must not become a public lookup.
       expect(fixture.privateRegistry.requests).toEqual([]);
-      expect(fixture.publicRegistry.requestsFor(FIXTURE_SCOPE)).toEqual([]);
     });
   });
 
@@ -99,8 +97,8 @@ describe('private npm scope routing through bun install', () => {
       await seedPackages(fixture);
       const consumer = await fixture.createConsumer({
         dependencies: { [PRIVATE_PACKAGE]: PRIVATE_VERSION },
-        registry: '$FIXTURE_PUBLIC_REGISTRY',
-        scopes: { [FIXTURE_SCOPE]: { url: `$${FIXTURE_REGISTRY_ENV}`, token: `$${FIXTURE_READ_TOKEN_ENV}` } },
+        registry: '${FIXTURE_PUBLIC_REGISTRY}',
+        scopes: { [FIXTURE_SCOPE]: { url: fixture.privateRegistry.registry, token: `\${${FIXTURE_READ_TOKEN_ENV}}` } },
       });
       fixture.privateRegistry.failWith(401);
 
@@ -125,8 +123,8 @@ describe('private npm scope routing through bun install', () => {
       await seedPackages(fixture);
       const consumer = await fixture.createConsumer({
         dependencies: { [PRIVATE_PACKAGE]: PRIVATE_VERSION },
-        registry: '$FIXTURE_PUBLIC_REGISTRY',
-        scopes: { [FIXTURE_SCOPE]: { url: `$${FIXTURE_REGISTRY_ENV}`, token: `$${FIXTURE_READ_TOKEN_ENV}` } },
+        registry: '${FIXTURE_PUBLIC_REGISTRY}',
+        scopes: { [FIXTURE_SCOPE]: { url: fixture.privateRegistry.registry, token: `\${${FIXTURE_READ_TOKEN_ENV}}` } },
       });
 
       expect((await consumer.install(fixtureEnv(fixture))).exitCode).toBe(0);
@@ -137,41 +135,6 @@ describe('private npm scope routing through bun install', () => {
       expect(await consumer.findSecretLeaks(fixture.privateRegistry.registry)).not.toEqual([]);
     });
   });
-
-  /**
-   * Runs the bunfig a repository actually commits, with only the environment
-   * values redirected at the loopback registry. Skipped unless a path is
-   * supplied, because the config lives in the consuming repository rather than here:
-   *
-   *   SMOO_PRIVATE_NPM_BUNFIG=/path/to/consumer/bunfig.toml \
-   *     bun test src/release/__tests__/private-npm-registry.test.ts
-   */
-  it.skipIf(!process.env.SMOO_PRIVATE_NPM_BUNFIG)(
-    'routes the committed repository bunfig scope through the declared variables',
-    async () => {
-      const bunfigPath = process.env.SMOO_PRIVATE_NPM_BUNFIG ?? '';
-      const bunfig = await readFile(bunfigPath, 'utf8');
-      expect(bunfig).toContain(FIXTURE_SCOPE);
-      await withPrivateNpmFixture(async (fixture) => {
-        await seedPackages(fixture);
-        const consumer = await fixture.createConsumer({
-          dependencies: { [PRIVATE_PACKAGE]: PRIVATE_VERSION },
-          bunfig,
-        });
-
-        const result = await consumer.install(fixtureEnv(fixture));
-
-        expect(result.exitCode).toBe(0);
-        expect(await consumer.installedVersion(PRIVATE_PACKAGE)).toBe(PRIVATE_VERSION);
-        expect(
-          fixture.privateRegistry.requests.map((request) => request.path.startsWith(OWNER_PATH_PREFIX)),
-        ).not.toContain(false);
-        expect(new Set(fixture.privateRegistry.requests.map((request) => request.authorization))).toEqual(
-          new Set([`Bearer ${FIXTURE_READ_TOKEN}`]),
-        );
-      });
-    },
-  );
 });
 
 /**
@@ -217,7 +180,6 @@ async function seedPackages(fixture: PrivateNpmFixture): Promise<void> {
 
 function fixtureEnv(fixture: PrivateNpmFixture): Record<string, string> {
   return {
-    [FIXTURE_REGISTRY_ENV]: fixture.privateRegistry.registry,
     [FIXTURE_READ_TOKEN_ENV]: FIXTURE_READ_TOKEN,
     // A default registry that is also loopback makes any accidental public
     // fallback observable instead of silently contacting npmjs.

@@ -7,9 +7,9 @@ import { join, relative } from 'node:path';
  * Publication-free proof harness for private-scope npm routing.
  *
  * Every guarantee this fixture exercises is an operational one that a mocked
- * HTTP client cannot show: whether the pinned Bun expands `$VAR` inside
- * `[install.scopes]`, whether the owner path survives into the request line,
- * whether a credential is attached to an origin that must never see it, and
+ * HTTP client cannot show: whether the pinned Bun resolves the scoped
+ * `.npmrc` registry and expands `${VAR}` credential references, whether a
+ * credential is attached to an origin that must never see it, and
  * which registry failures are genuinely "absent" versus "blocked". So the
  * fixture serves a real loopback registry over real HTTP, packs real tarballs
  * with the pinned Bun, and runs the real `bun install` / `npm view` clients
@@ -21,8 +21,7 @@ import { join, relative } from 'node:path';
 export const FIXTURE_SCOPE = '@priv.test';
 /** Forgejo serves each owner's npm registry under its own path prefix. */
 export const FIXTURE_OWNER = 'priv-owner';
-/** Environment variable names are the declared configuration; values stay fixture-local. */
-export const FIXTURE_REGISTRY_ENV = 'PRIV_NPM_REGISTRY';
+/** Credential variable names are the declared configuration; values stay fixture-local. */
 export const FIXTURE_READ_TOKEN_ENV = 'PRIV_NPM_READ_TOKEN';
 export const FIXTURE_PUBLISH_TOKEN_ENV = 'PRIV_NPM_PUBLISH_TOKEN';
 export const FIXTURE_READ_TOKEN = 'fixture-read-token-3f9c1a';
@@ -79,16 +78,17 @@ export interface FixtureNpmRegistry {
   stop(): void;
 }
 
-export interface FixtureConsumerBunfigScope {
-  /** Written verbatim, so `"$PRIV_NPM_REGISTRY"` reaches Bun unexpanded. */
+export interface FixtureConsumerNpmrcScope {
+  /** Written verbatim into the scoped `:registry` line; the URL is not a secret. */
   url: string;
+  /** Token line value, written verbatim — pass `${ENV_NAME}` to keep the secret in the environment. */
   token?: string;
 }
 
 export interface FixtureConsumerOptions {
   dependencies: Record<string, string>;
-  scopes?: Record<string, FixtureConsumerBunfigScope>;
-  /** `[install] registry`, written verbatim. */
+  scopes?: Record<string, FixtureConsumerNpmrcScope>;
+  /** Default `registry=` line, written verbatim into .npmrc. */
   registry?: string;
   /** Complete bunfig.toml text; overrides `scopes`/`registry` for replaying a real repo config. */
   bunfig?: string;
@@ -333,7 +333,8 @@ async function createFixtureConsumer(root: string, options: FixtureConsumerOptio
       2,
     )}\n`,
   );
-  await writeFile(join(root, 'bunfig.toml'), options.bunfig ?? bunfigText(options));
+  await writeFile(join(root, 'bunfig.toml'), options.bunfig ?? bunfigText());
+  await writeFile(join(root, '.npmrc'), npmrcText(options));
 
   return {
     root,
@@ -376,20 +377,22 @@ async function createFixtureConsumer(root: string, options: FixtureConsumerOptio
   };
 }
 
-function bunfigText(options: FixtureConsumerOptions): string {
-  const lines = ['[install]', 'linker = "isolated"'];
+function bunfigText(): string {
+  // Only what .npmrc cannot express: Bun's isolated linker. Registry and
+  // credential routing live in .npmrc, npm's own source of truth.
+  return '[install]\nlinker = "isolated"\n';
+}
+
+function npmrcText(options: FixtureConsumerOptions): string {
+  const lines: string[] = [];
   if (options.registry !== undefined) {
-    lines.push(`registry = ${JSON.stringify(options.registry)}`);
+    lines.push(`registry=${options.registry}`);
   }
-  const scopes = Object.entries(options.scopes ?? {});
-  if (scopes.length > 0) {
-    lines.push('', '[install.scopes]');
-    for (const [scope, entry] of scopes) {
-      const fields = [`url = ${JSON.stringify(entry.url)}`];
-      if (entry.token !== undefined) {
-        fields.push(`token = ${JSON.stringify(entry.token)}`);
-      }
-      lines.push(`${JSON.stringify(scope)} = { ${fields.join(', ')} }`);
+  for (const [scope, entry] of Object.entries(options.scopes ?? {})) {
+    lines.push(`${scope}:registry=${entry.url}`);
+    if (entry.token !== undefined) {
+      const url = new URL(entry.url);
+      lines.push(`//${url.host}${url.pathname}:_authToken=${entry.token}`);
     }
   }
   return `${lines.join('\n')}\n`;

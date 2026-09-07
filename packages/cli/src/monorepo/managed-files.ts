@@ -377,15 +377,6 @@ function getManagedContent(file: ManagedFile, context: ManagedFileContext): stri
   const sourcePath = join(packageRoot, sourceRoot, file.source);
   const content = readFileSync(sourcePath, 'utf8');
   if (file.kind === 'raw') {
-    if (file.source === 'tooling/direnv/setup-environment.ts' && context.privateNpm) {
-      return content.replace(
-        'const requiredInstallEnvironment: readonly string[] = [];',
-        `const requiredInstallEnvironment: readonly string[] = ${JSON.stringify([
-          context.privateNpm.registryEnv,
-          context.privateNpm.readTokenEnv,
-        ])};`,
-      );
-    }
     return content;
   }
   return renderTemplate(context, content);
@@ -404,17 +395,12 @@ async function getManagedFileContext(root: string): Promise<ManagedFileContext> 
   const platformTargetGlobs = platformTargetGlobsForTest(targetNames);
   const privateNpm = packageJson?.json.smoo?.privateNpm;
   // Cache registry identity plus the lockfile, never token values: a scope
-  // URL change (repo variable) must invalidate the dependency cache, and the
-  // cache key must stay free of secrets.
-  const nodeModulesCacheKey = privateNpm
-    ? `$${`{{ vars.${privateNpm.registryEnv} }}`}-$${
-        existsSync(join(root, 'bun.lock'))
-          ? "{{ hashFiles('bun.lock', 'package.json', 'packages/*/package.json') }}"
-          : "{{ hashFiles('bun.lockb', 'package.json', 'packages/*/package.json') }}"
-      }`
-    : existsSync(join(root, 'bun.lock'))
-      ? `$${"{{ hashFiles('bun.lock', 'package.json', 'packages/*/package.json') }}"}`
-      : `$${"{{ hashFiles('bun.lockb', 'package.json', 'packages/*/package.json') }}"}`;
+  // URL change in the committed .npmrc must invalidate the dependency cache,
+  // and the cache key must stay free of secrets. Shell entry never requires
+  // registry configuration; only actual registry operations resolve one.
+  const nodeModulesCacheKey = existsSync(join(root, 'bun.lock'))
+    ? `$${"{{ hashFiles('.npmrc', 'bun.lock', 'package.json', 'packages/*/package.json') }}"}`
+    : `$${"{{ hashFiles('.npmrc', 'bun.lockb', 'package.json', 'packages/*/package.json') }}"}`;
   return {
     hasReleasePackages: listReleasePackages(root, packageJson).length > 0,
     hasStagingDeployTargets: stagingDeploy.exists,
