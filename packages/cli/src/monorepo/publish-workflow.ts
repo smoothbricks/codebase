@@ -413,7 +413,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       NIX_STORE_NAR: ${githubExpression('github.workspace')}/nix-store.nar
-      GH_TOKEN: ${githubExpression('github.token')}
+      GH_TOKEN: ${githubExpression('github.token')}${privateNpmInstallJobEnv(options)}
     steps:
 `;
 }
@@ -503,6 +503,7 @@ function yamlLinesForStep(step: PublishWorkflowStep, options: PublishWorkflowDef
     case PublishWorkflowStepKind.RepairPendingReleases:
       return [
         `      - name: ${step.name}`,
+        ...privateNpmPublisherStepEnv(options),
         `        run: smoo release repair-pending --dry-run "${githubExpression('inputs.dry_run')}"`,
       ];
     case PublishWorkflowStepKind.VersionRelease:
@@ -554,21 +555,14 @@ function yamlLinesForStep(step: PublishWorkflowStep, options: PublishWorkflowDef
     case PublishWorkflowStepKind.PublishRelease:
       return [
         `      - name: ${step.name}`,
+        ...privateNpmPublisherStepEnv(options),
         ...(options.privateNpm
-          ? [
-              '        env:',
-              `          ${options.privateNpm.registryEnv}: ${githubExpression(`vars.${options.privateNpm.registryEnv}`)}`,
-              `          ${options.privateNpm.readTokenEnv}: ${githubExpression(`secrets.${options.privateNpm.readTokenEnv}`)}`,
-              ...(options.privateNpm.publishTokenEnv
-                ? [
-                    `          ${options.privateNpm.publishTokenEnv}: ${githubExpression(`secrets.${options.privateNpm.publishTokenEnv}`)}`,
-                  ]
-                : []),
-            ]
-          : []),
-        '        # smoo packs with Bun, then publishes tarballs with npm. Existing',
-        '        # packages must already exist on npm and use trusted publishing/OIDC.',
-        '        # Missing package names are bootstrapped locally before trust setup.',
+          ? ['        # Private publication uses the declared registry and step-scoped publisher credential.']
+          : [
+              '        # smoo packs with Bun, then publishes tarballs with npm. Existing',
+              '        # packages must already exist on npm and use trusted publishing/OIDC.',
+              '        # Missing package names are bootstrapped locally before trust setup.',
+            ]),
         `        run: smoo release publish --bump "${githubExpression('inputs.bump')}" --dry-run "${githubExpression('inputs.dry_run')}"`,
       ];
     case PublishWorkflowStepKind.DeployProduction:
@@ -710,7 +704,7 @@ ${renderRunsOnLine(options.runsOn)}
       release-sha: ${githubExpression('steps.release-state.outputs.sha')}
     env:
       NIX_STORE_NAR: ${githubExpression('github.workspace')}/nix-store.nar
-      GH_TOKEN: ${githubExpression('github.token')}
+      GH_TOKEN: ${githubExpression('github.token')}${privateNpmInstallJobEnv(options)}
     steps:
 ${renderLinuxReleaseCandidateSteps(steps, options)}
 
@@ -721,7 +715,7 @@ ${renderMacosJobHeaderLines(options)}
       id-token: none
     env:
       NIX_STORE_NAR: ${githubExpression('github.workspace')}/nix-store.nar
-      GH_TOKEN: ${githubExpression('github.token')}
+      GH_TOKEN: ${githubExpression('github.token')}${privateNpmInstallJobEnv(options)}
     steps:
 ${renderMacosPlatformSteps(options)}
 
@@ -734,7 +728,7 @@ ${renderMacosPlatformSteps(options)}
     env:
       NIX_STORE_NAR: ${githubExpression('github.workspace')}/nix-store.nar
       TTSC_TSGO_BINARY: ${githubExpression('github.workspace')}/node_modules/@typescript/native/bin/tsc
-      GH_TOKEN: ${githubExpression('github.token')}
+      GH_TOKEN: ${githubExpression('github.token')}${privateNpmInstallJobEnv(options)}
     steps:
 ${renderFinalLinuxPublishSteps(options)}
 `;
@@ -1110,23 +1104,11 @@ function renderFinalLinuxPublishSteps(options: PublishWorkflowDefinitionOptions)
     '',
     `      # Step ${stepNumber++}`,
     `      - name: 📦 Publish release (${githubExpression(mode)})`,
+    ...privateNpmPublisherStepEnv(options),
+    '        # Pack verified outputs; --prebuilt refuses missing artifacts rather than rebuilding.',
     ...(options.privateNpm
-      ? [
-          '        env:',
-          `          ${options.privateNpm.registryEnv}: ${githubExpression(`vars.${options.privateNpm.registryEnv}`)}`,
-          `          ${options.privateNpm.readTokenEnv}: ${githubExpression(`secrets.${options.privateNpm.readTokenEnv}`)}`,
-          ...(options.privateNpm.publishTokenEnv
-            ? [
-                `          ${options.privateNpm.publishTokenEnv}: ${githubExpression(`secrets.${options.privateNpm.publishTokenEnv}`)}`,
-              ]
-            : []),
-        ]
-      : []),
-    '        # smoo packs the verified outputs applied above with Bun, then publishes',
-    '        # tarballs with npm. --prebuilt refuses missing outputs instead of',
-    '        # rebuilding unverified bytes. Existing packages must already exist on',
-    '        # npm and use trusted publishing/OIDC; missing package names are',
-    '        # bootstrapped locally before trust setup.',
+      ? ['        # Private publication uses the declared registry and step-scoped publisher credential.']
+      : ['        # Public npm packages use trusted publishing/OIDC after local bootstrap.']),
     '        run:',
     '          smoo release publish --prebuilt',
     `          "${githubExpression('runner.temp')}/publish-artifacts/publish-release-outputs-${githubExpression(
@@ -1243,4 +1225,20 @@ function hasLinuxPlatformTargets(options: PublishWorkflowDefinitionOptions): boo
 
 function githubExpression(expression: string): string {
   return ['$', '{{ ', expression, ' }}'].join('');
+}
+
+function privateNpmInstallJobEnv(options: PublishWorkflowDefinitionOptions): string {
+  const config = options.privateNpm;
+  if (!config) return '';
+  return [
+    '',
+    `      ${config.registryEnv}: ${githubExpression(`vars.${config.registryEnv}`)}`,
+    `      ${config.readTokenEnv}: ${githubExpression(`secrets.${config.readTokenEnv}`)}`,
+  ].join('\n');
+}
+
+/** Both repair and publish can write packages; neither exposes the credential to setup/build. */
+function privateNpmPublisherStepEnv(options: PublishWorkflowDefinitionOptions): string[] {
+  const name = options.privateNpm?.publishTokenEnv;
+  return name ? ['        env:', `          ${name}: ${githubExpression(`secrets.${name}`)}`] : [];
 }

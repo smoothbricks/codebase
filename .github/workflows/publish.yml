@@ -391,11 +391,8 @@ jobs:
 
       # Step 12
       - name: 📦 Publish release (${{ needs.linux-release-candidate.outputs.mode }})
-        # smoo packs the verified outputs applied above with Bun, then publishes
-        # tarballs with npm. --prebuilt refuses missing outputs instead of
-        # rebuilding unverified bytes. Existing packages must already exist on
-        # npm and use trusted publishing/OIDC; missing package names are
-        # bootstrapped locally before trust setup.
+        # Pack verified outputs; --prebuilt refuses missing artifacts rather than rebuilding.
+        # Public npm packages use trusted publishing/OIDC after local bootstrap.
         run:
           smoo release publish --prebuilt "${{ runner.temp }}/publish-artifacts/publish-release-outputs-${{
           github.run_id }}" "${{ runner.temp }}/publish-artifacts/publish-linux-outputs-${{ github.run_id }}" "${{

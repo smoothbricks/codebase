@@ -149,4 +149,36 @@ describe('CI workflow definition', () => {
     expect(rendered).toContain('uses: ./.github/actions/setup-devenv');
     expect(rendered).not.toContain('github-actions-bootstrap.sh');
   });
+
+  it('gives trusted jobs the private registry read env before setup and skips fork PRs', () => {
+    const rendered = renderCiWorkflowYaml(
+      options({
+        privateNpm: {
+          scope: '@priv.test',
+          registryEnv: 'PRIV_NPM_REGISTRY',
+          readTokenEnv: 'PRIV_NPM_READ_TOKEN',
+          publishTokenEnv: 'PRIV_NPM_PUBLISH_TOKEN',
+        },
+      }),
+    );
+
+    expect(rendered).toContain(
+      "if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}",
+    );
+    expect(rendered).toContain('PRIV_NPM_REGISTRY: ${{ vars.PRIV_NPM_REGISTRY }}');
+    expect(rendered).toContain('PRIV_NPM_READ_TOKEN: ${{ secrets.PRIV_NPM_READ_TOKEN }}');
+    // Publisher credential is a publish-job secret; CI install must not see it.
+    expect(rendered).not.toContain('PRIV_NPM_PUBLISH_TOKEN');
+    expect(rendered.indexOf('PRIV_NPM_READ_TOKEN: ${{ secrets.PRIV_NPM_READ_TOKEN }}')).toBeLessThan(
+      rendered.indexOf('uses: ./.github/actions/setup-devenv'),
+    );
+  });
+
+  it('does not mention private registry credentials when the root did not opt in', () => {
+    const rendered = renderCiWorkflowYaml(options());
+
+    expect(rendered).not.toContain('PRIV_NPM_REGISTRY');
+    expect(rendered).not.toContain('PRIV_NPM_READ_TOKEN');
+    expect(rendered).not.toContain('PRIV_NPM_PUBLISH_TOKEN');
+  });
 });
