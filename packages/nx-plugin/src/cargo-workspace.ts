@@ -218,13 +218,13 @@ export async function cargoPackageTestInputs({
     if (!isRecord(crateParsed)) {
       continue;
     }
-    enqueuePathDependencies(crateParsed, dir, workspacePathDeps, pending, external);
+    enqueuePathDependencies(crateParsed, dir, workspacePathDeps, pending, external, absoluteProjectRoot);
     // Every target variant can contribute a path dependency to a test binary.
     // Hash them conservatively rather than evaluating Cargo's cfg language.
     if (isRecord(crateParsed.target)) {
       for (const target of Object.values(crateParsed.target)) {
         if (isRecord(target)) {
-          enqueuePathDependencies(target, dir, workspacePathDeps, pending, external);
+          enqueuePathDependencies(target, dir, workspacePathDeps, pending, external, absoluteProjectRoot);
         }
       }
     }
@@ -242,8 +242,8 @@ export async function cargoPackageTestInputs({
         .join(', ');
       throw new Error(
         `${memberDir}/Cargo.toml depends on crates outside the Nx workspace (${listed}) that no fileset can hash; ` +
-          `declare namedInputs.${EXTERNAL_RUST_CRATES_INPUT} in ${join(workspaceRoot, 'nx.json')} as a runtime input ` +
-          'that hashes every *.rs and Cargo.toml under those trees, and the per-crate cargo test targets will list it',
+          `declare namedInputs.${EXTERNAL_RUST_CRATES_INPUT} in ${join(workspaceRoot, 'nx.json')} as ` +
+          '[{"runtime":"smoo-nx-cargo-hash"}]; Cargo derives the transitive path inputs without a manual source-root list',
       );
     }
     inputs.push(EXTERNAL_RUST_CRATES_INPUT);
@@ -257,6 +257,7 @@ function enqueuePathDependencies(
   workspacePathDeps: Map<string, string>,
   pending: string[],
   external: Map<string, string>,
+  absoluteProjectRoot: string,
 ): void {
   for (const tableName of ['dependencies', 'dev-dependencies', 'build-dependencies'] as const) {
     const table = scope[tableName];
@@ -264,7 +265,7 @@ function enqueuePathDependencies(
       continue;
     }
     for (const [depName, spec] of Object.entries(table)) {
-      const pathDep = pathDependencyDir(memberDir, depName, spec, workspacePathDeps);
+      const pathDep = pathDependencyDir(memberDir, depName, spec, workspacePathDeps, absoluteProjectRoot);
       if (pathDep === null) {
         continue;
       }
@@ -294,14 +295,15 @@ async function workspacePathDependencies(absoluteProjectRoot: string): Promise<M
 interface PathDependencyDir {
   /** Cargo-workspace-relative directory, or the raw path when external. */
   dir: string;
-  /** Resolves above the cargo workspace root or to an absolute path. */
+  /** Resolves outside the Cargo workspace root, regardless of spelling. */
   external: boolean;
 }
 
 /**
  * Where a path dependency lives relative to the cargo workspace root. A
  * `workspace = true` dependency is already root-relative; a crate-local
- * `path` is relative to the member. Anything that escapes the root is
+ * `path` is relative to the member. Absolute paths within the workspace are
+ * normalized to the same local closure; anything that escapes the root is
  * reported as external rather than dropped, so the caller can demand the
  * runtime input that covers it.
  */
@@ -310,6 +312,7 @@ function pathDependencyDir(
   depName: string,
   spec: unknown,
   workspacePathDeps: Map<string, string>,
+  absoluteProjectRoot: string,
 ): PathDependencyDir | null {
   if (!isRecord(spec)) {
     return null;
@@ -323,15 +326,19 @@ function pathDependencyDir(
     raw = workspacePath;
   } else if (typeof spec.path === 'string') {
     const localPath = spec.path.split('\\').join('/');
-    if (isAbsolute(localPath) || posix.isAbsolute(localPath)) {
-      return { dir: localPath, external: true };
-    }
-    raw = posix.join(memberDir.split('\\').join('/'), localPath);
+    raw =
+      isAbsolute(localPath) || posix.isAbsolute(localPath)
+        ? localPath
+        : posix.join(memberDir.split('\\').join('/'), localPath);
   } else {
     return null;
   }
   if (isAbsolute(raw) || posix.isAbsolute(raw)) {
-    return { dir: raw, external: true };
+    const local = relative(absoluteProjectRoot, raw).split(sep).join(posix.sep);
+    if (local === '..' || local.startsWith('../') || isAbsolute(local)) {
+      return { dir: raw, external: true };
+    }
+    raw = local || '.';
   }
   const resolved = normalize(raw).split(sep).join(posix.sep);
   if (resolved === '..' || resolved.startsWith('../')) {

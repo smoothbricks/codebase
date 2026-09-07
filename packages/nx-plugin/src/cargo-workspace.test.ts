@@ -253,6 +253,28 @@ describe('Cargo workspace layouts', () => {
     }
   });
 
+  it('keeps absolute in-workspace dependencies in the ordinary source closure', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'nx-plugin-cargo-absolute-local-'));
+    try {
+      await write(root, 'Cargo.toml', '[workspace]\nmembers=["crates/app"]\n');
+      await write(root, 'crates/base/Cargo.toml', '[package]\nname="base"\n');
+      await write(
+        root,
+        'crates/app/Cargo.toml',
+        `[package]\nname="app"\n[dependencies]\nbase={path=${JSON.stringify(join(root, 'crates/base'))}}\n`,
+      );
+      const inputs = await cargoPackageTestInputs({
+        workspaceRoot: root,
+        absoluteProjectRoot: root,
+        memberDir: 'crates/app',
+      });
+      expect(inputs).toContain('{projectRoot}/crates/base/**/*.rs');
+      expect(inputs).not.toContain('externalRustCrates');
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it('reports member patterns it cannot expand instead of silently omitting crates', async () => {
     const root = await mkdtemp(join(tmpdir(), 'nx-plugin-cargo-invalid-glob-'));
     try {

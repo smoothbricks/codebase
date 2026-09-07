@@ -29,6 +29,32 @@ The plugin supports both Cargo placements without moving crate sources:
   `packages/*/crates/*`); unsupported patterns and member patterns that match no directory fail graph construction
   instead of silently omitting crates.
 
+### External Rust sources
+
+For a repository-root Cargo workspace, declare the shared input once:
+
+```json
+{
+  "namedInputs": {
+    "externalRustCrates": [{ "runtime": "smoo-nx-cargo-hash" }]
+  }
+}
+```
+
+For a package-root Cargo workspace, pass its manifest relative to the Nx root:
+`smoo-nx-cargo-hash packages/example/Cargo.toml`. A shared input covering several Cargo workspaces includes one runtime
+entry per manifest.
+
+The command queries `cargo metadata --locked --offline` and hashes the resolved external path packages, including
+transitive dependencies, Rust sources, target source files, governing Cargo manifests, and Cargo configuration. It also
+covers path packages under `node_modules`, which Nx's normal file map ignores. Adding or moving a dependency does not
+require maintaining a second list of source roots. The command refuses missing dependencies or an unavailable locked
+dependency cache instead of emitting a partial digest.
+
+Git and registry dependencies are identified by `Cargo.lock`; uncommitted changes in a Git repository are not changes to
+a pinned Git dependency. Local `path` dependencies stay live and their source edits change the digest. Build-script data
+and environment inputs outside the Rust/Cargo inputs above still require explicit Nx inputs.
+
 ## Nx Target Naming
 
 Target names are `{tool}-{output}` names. Use names like `tsc-js`, `tsdown-js`, and `cargo-wasm`; `build` and `lint` are

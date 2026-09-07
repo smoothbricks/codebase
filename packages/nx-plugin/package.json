@@ -63,7 +63,8 @@
     }
   },
   "bin": {
-    "smoo-nx-exec": "./dist/bin/smoo-nx-exec.js"
+    "smoo-nx-exec": "./dist/bin/smoo-nx-exec.js",
+    "smoo-nx-cargo-hash": "./dist/bin/smoo-nx-cargo-hash.js"
   },
   "generators": "./generators.json",
   "executors": "./executors.json",
@@ -111,6 +112,11 @@
     "@nx/js": "latest",
     "nx": "latest",
     "smol-toml": "^1.6.1",
-    "tslib": "^2.8.1"
+    "tslib": "^2.8.1",
+    "typia": "14.0.2"
+  },
+  "devDependencies": {
+    "@smoothbricks/lmao": "workspace:*",
+    "@smoothbricks/validation": "workspace:*"
   }
 }
