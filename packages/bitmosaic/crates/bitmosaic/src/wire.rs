@@ -3292,6 +3292,12 @@ impl<'a> Bitmosaic64ViewRange<'a> {
         range
     }
 
+    /// The complete set view, unchanged as this cursor advances.
+    #[inline]
+    pub const fn view(&self) -> &Bitmosaic64View<'a> {
+        &self.view
+    }
+
     /// Members not yet consumed, the head included. As with
     /// [`BitmosaicViewRange::remaining`], `view.len() - remaining()` is the
     /// head's zero-based ordinal.
