@@ -8,11 +8,11 @@ import {
   stageResourceName,
 } from './stage.js';
 
-const APP_FIXTURE = `name = "conloca-app"
+const APP_FIXTURE = `name = "app"
 compatibility_date = "2026-05-06"
 
 [env.staging]
-name = "conloca-app-staging"
+name = "app-staging"
 workers_dev = false
 
 [env.staging.assets]
@@ -20,32 +20,32 @@ directory = "./dist"
 not_found_handling = "single-page-application"
 
 [[env.staging.routes]]
-pattern = "*.staging.conloca.com/*"
-zone_name = "conloca.com"
+pattern = "*.staging.example.test/*"
+zone_name = "example.test"
 
 [[env.staging.routes]]
-pattern = "staging.conloca.com"
+pattern = "staging.example.test"
 custom_domain = true
 `;
 
-const BACKEND_FIXTURE = `name = "conloca-app-backend"
+const BACKEND_FIXTURE = `name = "app-backend"
 main = "dist/worker.js"
 
 [[migrations]]
 tag = "v1"
-new_sqlite_classes = ["ConlocaAuthKeysDO", "SaasGitDO"]
+new_sqlite_classes = ["AuthKeysDO", "SaasGitDO"]
 
 [env.staging]
-name = "conloca-app-backend-staging"
+name = "app-backend-staging"
 workers_dev = false
 
 [[env.staging.routes]]
-pattern = "*.staging.conloca.com/auth/*"
-zone_name = "conloca.com"
+pattern = "*.staging.example.test/auth/*"
+zone_name = "example.test"
 
 [[env.staging.durable_objects.bindings]]
 name = "AUTH_KEYS"
-class_name = "ConlocaAuthKeysDO"
+class_name = "AuthKeysDO"
 
 [[env.staging.kv_namespaces]]
 binding = "ALIAS_INDEX"
@@ -61,7 +61,7 @@ id = "kv-mail-staging-id"
 
 [[env.staging.send_email]]
 name = "EMAIL"
-allowed_sender_addresses = ["login@mail.staging.conloca.com"]
+allowed_sender_addresses = ["login@mail.staging.example.test"]
 
 [[env.staging.ratelimits]]
 name = "MAGIC_LINK_EMAIL_RATE_LIMIT"
@@ -75,26 +75,26 @@ simple = { limit = 20, period = 60 }
 
 [[env.staging.r2_buckets]]
 binding = "MEDIA"
-bucket_name = "conloca-media-staging"
+bucket_name = "app-media-staging"
 
 [env.staging.vars]
 ENVIRONMENT = "staging"
-TLD_DOMAIN = "staging.conloca.com"
-AUTH_TLD_DOMAIN = "staging.conloca.com"
-GITHUB_WEBHOOK_INGRESS_URL = "https://staging.conloca.com/webhooks/github"
+TLD_DOMAIN = "staging.example.test"
+AUTH_TLD_DOMAIN = "staging.example.test"
+GITHUB_WEBHOOK_INGRESS_URL = "https://staging.example.test/webhooks/github"
 GITHUB_APP_ID = "4077531"
-GITHUB_APP_SLUG = "conloca-staging"
+GITHUB_APP_SLUG = "app-staging"
 GITHUB_CLIENT_ID = "Iv23liD6EDsBZ8kJGU3f"
 AUTH_KEYS_INSTANCE_NAME = "staging-20260716-2"
-MAIL_CAPTURE_RECIPIENTS = "login-test@staging.conloca.com,invite-test@staging.conloca.com"
-EMAIL_FROM_ADDRESS = "login@mail.staging.conloca.com"
-INVITATION_REDEEM_ORIGIN = "https://app.staging.conloca.com"
+MAIL_CAPTURE_RECIPIENTS = "login-test@staging.example.test,invite-test@staging.example.test"
+EMAIL_FROM_ADDRESS = "login@mail.staging.example.test"
+INVITATION_REDEEM_ORIGIN = "https://app.staging.example.test"
 `;
 
 const LIVE_NAMESPACES = [
   { id: 'kv-alias-staging-id', title: 'alias-index-staging' },
   { id: 'kv-org-staging-id', title: 'org-profiles-staging' },
-  { id: 'kv-mail-staging-id', title: 'conloca-mail-capture-staging' },
+  { id: 'kv-mail-staging-id', title: 'mail-capture-staging' },
 ];
 
 const DERIVED_IDS = new Map([
@@ -109,10 +109,10 @@ describe('Wrangler deployment stage convention', () => {
     expect(() => pullRequestStage(0)).toThrow(/1 through 999999999/);
     expect(() => pullRequestStage(1.5)).toThrow(/integer/);
     expect(() => pullRequestStage(1_000_000_000)).toThrow(/1 through 999999999/);
-    expect(stageDomain('pr123', 'conloca.com')).toBe('pr123.conloca.com');
-    expect(stageDomain('production', 'conloca.com')).toBe('conloca.com');
-    expect(stageResourceName('conloca-app', 'staging')).toBe('conloca-app-staging');
-    expect(stageResourceName('conloca-app', 'production')).toBe('conloca-app');
+    expect(stageDomain('pr123', 'example.test')).toBe('pr123.example.test');
+    expect(stageDomain('production', 'example.test')).toBe('example.test');
+    expect(stageResourceName('app', 'staging')).toBe('app-staging');
+    expect(stageResourceName('app', 'production')).toBe('app');
   });
 
   it('derives the app staging block without changing inherited/static semantics', () => {
@@ -122,9 +122,9 @@ describe('Wrangler deployment stage convention', () => {
       kvNamespaceIds: new Map<string, string>(),
     });
 
-    expect(derived).toContain('[env.pr123]\nname = "conloca-app-pr123"');
-    expect(derived).toContain('pattern = "*.pr123.conloca.com/*"');
-    expect(derived).toContain('pattern = "pr123.conloca.com"');
+    expect(derived).toContain('[env.pr123]\nname = "app-pr123"');
+    expect(derived).toContain('pattern = "*.pr123.example.test/*"');
+    expect(derived).toContain('pattern = "pr123.example.test"');
     expect(derived).toContain('[env.pr123.assets]\ndirectory = "./dist"');
     expect(derived).toContain('compatibility_date = "2026-05-06"');
     expect(derived).not.toContain('pr456');
@@ -132,21 +132,21 @@ describe('Wrangler deployment stage convention', () => {
 
   it('derives backend resources from staging while preserving provider and DO identities', () => {
     const plan = planPullRequestResources(BACKEND_FIXTURE, 'pr123', LIVE_NAMESPACES);
-    expect(plan.workerName).toBe('conloca-app-backend-pr123');
+    expect(plan.workerName).toBe('app-backend-pr123');
     expect(plan.kvNamespaces.map(({ title }) => title)).toEqual([
       'alias-index-pr123',
       'org-profiles-pr123',
-      'conloca-mail-capture-pr123',
+      'mail-capture-pr123',
     ]);
-    expect(plan.r2Buckets).toEqual([{ binding: 'MEDIA', bucketName: 'conloca-media-pr123' }]);
+    expect(plan.r2Buckets).toEqual([{ binding: 'MEDIA', bucketName: 'app-media-pr123' }]);
 
     const derived = derivePullRequestWranglerConfig(BACKEND_FIXTURE, {
       stage: 'pr123',
       accountId: 'account-1',
       kvNamespaceIds: DERIVED_IDS,
     });
-    const emailId = rateLimitNamespaceId('account-1', 'conloca-app-backend', 'pr123', 'MAGIC_LINK_EMAIL_RATE_LIMIT');
-    const sourceId = rateLimitNamespaceId('account-1', 'conloca-app-backend', 'pr123', 'MAGIC_LINK_SOURCE_RATE_LIMIT');
+    const emailId = rateLimitNamespaceId('account-1', 'app-backend', 'pr123', 'MAGIC_LINK_EMAIL_RATE_LIMIT');
+    const sourceId = rateLimitNamespaceId('account-1', 'app-backend', 'pr123', 'MAGIC_LINK_SOURCE_RATE_LIMIT');
 
     expect(Number(emailId)).toBeGreaterThan(0);
     expect(Number(emailId)).toBeLessThanOrEqual(0x7fff_ffff);
@@ -156,18 +156,20 @@ describe('Wrangler deployment stage convention', () => {
     expect(derived).toContain('id = "kv-alias-pr123-id"');
     expect(derived).toContain('id = "kv-org-pr123-id"');
     expect(derived).toContain('id = "kv-mail-pr123-id"');
-    expect(derived).toContain('bucket_name = "conloca-media-pr123"');
+    expect(derived).toContain('bucket_name = "app-media-pr123"');
     expect(derived).toContain('ENVIRONMENT = "pr123"');
-    expect(derived).toContain('TLD_DOMAIN = "pr123.conloca.com"');
+    expect(derived).toContain('TLD_DOMAIN = "pr123.example.test"');
     expect(derived).toContain('AUTH_KEYS_INSTANCE_NAME = "pr123-20260716-2"');
-    expect(derived).toContain('allowed_sender_addresses = ["login@mail.pr123.conloca.com"]');
-    expect(derived).toContain('MAIL_CAPTURE_RECIPIENTS = "login-test@pr123.conloca.com,invite-test@pr123.conloca.com"');
-    expect(derived).toContain('INVITATION_REDEEM_ORIGIN = "https://app.pr123.conloca.com"');
+    expect(derived).toContain('allowed_sender_addresses = ["login@mail.pr123.example.test"]');
+    expect(derived).toContain(
+      'MAIL_CAPTURE_RECIPIENTS = "login-test@pr123.example.test,invite-test@pr123.example.test"',
+    );
+    expect(derived).toContain('INVITATION_REDEEM_ORIGIN = "https://app.pr123.example.test"');
     expect(derived).toContain('GITHUB_APP_ID = "4077531"');
-    expect(derived).toContain('GITHUB_APP_SLUG = "conloca-staging"');
+    expect(derived).toContain('GITHUB_APP_SLUG = "app-staging"');
     expect(derived).toContain('GITHUB_CLIENT_ID = "Iv23liD6EDsBZ8kJGU3f"');
-    expect(derived).toContain('class_name = "ConlocaAuthKeysDO"');
-    expect(derived).toContain('new_sqlite_classes = ["ConlocaAuthKeysDO", "SaasGitDO"]');
+    expect(derived).toContain('class_name = "AuthKeysDO"');
+    expect(derived).toContain('new_sqlite_classes = ["AuthKeysDO", "SaasGitDO"]');
     expect(derived).not.toContain('pr456');
   });
 });
