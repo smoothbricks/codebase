@@ -3,6 +3,7 @@ import { chmodSync, createReadStream, type Dirent, type Stats } from 'node:fs';
 import { copyFile, lstat, mkdir, readdir, readFile, writeFile } from 'node:fs/promises';
 import { isAbsolute, relative, resolve, sep } from 'node:path';
 import typia from 'typia';
+import { listPublishablePackages, type PackageInfo } from '../lib/workspace.js';
 import { type ProjectTargets, readProjectTargets } from '../nx/index.js';
 
 export interface CollectedOutputFile {
@@ -16,8 +17,10 @@ export interface CollectedOutputFile {
 }
 
 export interface CollectedOutputsManifest {
-  version: 2;
+  version: 3;
   sourceSha: string;
+  /** Independently versioned platform jobs must agree on the full npm closure. */
+  packageVersions: Record<string, string>;
   files: CollectedOutputFile[];
 }
 
@@ -61,8 +64,9 @@ export async function collectNxOutputs(
   }
 
   const manifest: CollectedOutputsManifest = {
-    version: 2,
+    version: 3,
     sourceSha,
+    packageVersions: Object.fromEntries(listPublishablePackages(root).map((pkg) => [pkg.name, pkg.version])),
     files: pending.map(({ source: _source, ...file }) => file),
   };
   const manifestPath = resolve(destination, 'manifest.json');
@@ -144,6 +148,7 @@ export async function applyCollectedOutputs(
   assertGitSha(expectedSourceSha, 'Expected source SHA');
   const resolvedProjects = projects ?? (await readProjectTargets(root));
   const projectsByName = new Map(resolvedProjects.map((project) => [project.project, project]));
+  const packages = listPublishablePackages(root);
 
   const overlays: Array<{ source: string; destination: string; mode: number }> = [];
   const claimedPaths = new Set<string>();
@@ -154,6 +159,7 @@ export async function applyCollectedOutputs(
         `Source SHA mismatch in ${manifestPath}: expected ${expectedSourceSha}, received ${manifest.sourceSha}.`,
       );
     }
+    assertCollectedPackageVersions(packages, manifest, manifestPath);
 
     const workspace = resolve(directory, 'workspace');
     const declaredPaths = new Set<string>();
@@ -255,8 +261,10 @@ export async function assertCollectedOutputsApplied(
   }
   const requestedProjects = new Set(projectNames);
   const foundProjects = new Set<string>();
+  const packages = listPublishablePackages(root);
   for (const directory of directories) {
     const { manifest, manifestPath } = await readCollectedOutputsManifest(directory);
+    assertCollectedPackageVersions(packages, manifest, manifestPath);
     for (const file of manifest.files) {
       if (!requestedProjects.has(file.project)) {
         continue;
@@ -288,6 +296,23 @@ export async function assertCollectedOutputsApplied(
     if (!foundProjects.has(project)) {
       throw new Error(`Collected outputs contain no verified files for Nx project ${project}.`);
     }
+  }
+}
+
+function assertCollectedPackageVersions(
+  packages: readonly PackageInfo[],
+  manifest: CollectedOutputsManifest,
+  manifestPath: string,
+): void {
+  for (const pkg of packages) {
+    if (manifest.packageVersions[pkg.name] !== pkg.version) {
+      throw new Error(
+        `Package version mismatch in ${manifestPath} for ${pkg.name}: expected ${pkg.version}, received ${manifest.packageVersions[pkg.name] ?? 'missing'}.`,
+      );
+    }
+  }
+  if (Object.keys(manifest.packageVersions).length !== packages.length) {
+    throw new Error(`Publishable package set mismatch in ${manifestPath}.`);
   }
 }
 
