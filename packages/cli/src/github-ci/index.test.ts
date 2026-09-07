@@ -211,8 +211,9 @@ describe('collected Nx outputs', () => {
 
       const sourceSha = await readGitHeadSha(root);
       expect(JSON.parse(await readFile(join(artifact, 'manifest.json'), 'utf8'))).toEqual({
-        version: 2,
+        version: 3,
         sourceSha,
+        packageVersions: {},
         files: [],
       });
     });
@@ -237,8 +238,9 @@ describe('collected Nx outputs', () => {
       });
 
       expect(JSON.parse(await readFile(join(artifact, 'manifest.json'), 'utf8'))).toEqual({
-        version: 2,
+        version: 3,
         sourceSha: dispatchSha,
+        packageVersions: {},
         files: [],
       });
     });
@@ -264,7 +266,7 @@ describe('collected Nx outputs', () => {
     await withOutputFixture(async ({ root, artifact }) => {
       const manifest = await collectNxOutputs(root, artifact, [], SOURCE_SHA);
 
-      expect(manifest).toEqual({ version: 2, sourceSha: SOURCE_SHA, files: [] });
+      expect(manifest).toEqual({ version: 3, sourceSha: SOURCE_SHA, packageVersions: {}, files: [] });
       await rm(join(artifact, 'workspace'), { recursive: true });
       await expect(applyCollectedOutputs(root, [artifact], SOURCE_SHA, [])).resolves.toBeUndefined();
     });
@@ -291,6 +293,50 @@ describe('collected Nx outputs', () => {
       await expect(assertCollectedOutputsApplied(root, [artifact], ['app'])).rejects.toThrow(
         'Applied output file is missing: packages/app/dist/index.js',
       );
+    });
+  });
+
+  it('refuses independently bumped platform versions before applying or packing their bytes', async () => {
+    await withOutputFixture(async ({ root, artifact, outputProject }) => {
+      const packagePath = join(root, 'packages/app/package.json');
+      const manifest = {
+        name: '@fixture/app',
+        version: '1.0.0',
+        nx: { name: 'app', tags: ['npm:private'] },
+      };
+      await writeFile(packagePath, JSON.stringify(manifest));
+      const outputPath = join(root, 'packages/app/dist/native.bin');
+      await writeFile(outputPath, 'platform bytes');
+      await collectNxOutputs(root, artifact, [{ target: 'build-macos', projects: [outputProject] }], SOURCE_SHA);
+
+      await writeFile(packagePath, JSON.stringify({ ...manifest, version: '1.0.1' }));
+      await writeFile(outputPath, 'publisher bytes');
+      await expect(applyCollectedOutputs(root, [artifact], SOURCE_SHA, [outputProject])).rejects.toThrow(
+        /Package version mismatch/,
+      );
+      expect(await readFile(outputPath, 'utf8')).toBe('publisher bytes');
+      await writeFile(outputPath, 'platform bytes');
+      await expect(assertCollectedOutputsApplied(root, [artifact], ['app'])).rejects.toThrow(
+        /Package version mismatch/,
+      );
+
+      await writeFile(packagePath, JSON.stringify(manifest));
+      await applyCollectedOutputs(root, [artifact], SOURCE_SHA, [outputProject]);
+      await expect(assertCollectedOutputsApplied(root, [artifact], ['app'])).resolves.toBeUndefined();
+    });
+  });
+
+  it('refuses a missing platform leg before changing publisher outputs', async () => {
+    await withOutputFixture(async ({ root, artifact, outputProject, temp }) => {
+      const outputPath = join(root, 'packages/app/dist/native.bin');
+      await writeFile(outputPath, 'platform bytes');
+      await collectNxOutputs(root, artifact, [{ target: 'build-macos', projects: [outputProject] }], SOURCE_SHA);
+      await writeFile(outputPath, 'publisher bytes');
+
+      await expect(
+        applyCollectedOutputs(root, [artifact, join(temp, 'missing-leg')], SOURCE_SHA, [outputProject]),
+      ).rejects.toThrow();
+      expect(await readFile(outputPath, 'utf8')).toBe('publisher bytes');
     });
   });
 
@@ -442,7 +488,7 @@ describe('collected Nx outputs', () => {
         SOURCE_SHA,
       );
       expect(manifest).toMatchObject({
-        version: 2,
+        version: 3,
         sourceSha: SOURCE_SHA,
         files: [
           {
