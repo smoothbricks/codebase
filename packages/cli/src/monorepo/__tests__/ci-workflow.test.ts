@@ -175,6 +175,21 @@ describe('CI workflow definition', () => {
     );
   });
 
+  it('does not inject a read token or skip fork PRs when only a publish token is declared', () => {
+    const rendered = renderCiWorkflowYaml(
+      options({
+        privateNpm: {
+          scope: '@priv.test',
+          publishTokenEnv: 'PRIV_NPM_PUBLISH_TOKEN',
+        },
+      }),
+    );
+
+    expect(rendered).not.toContain('PRIV_NPM_READ_TOKEN');
+    expect(rendered).not.toContain('PRIV_NPM_PUBLISH_TOKEN');
+    expect(rendered).not.toContain('github.event.pull_request.head.repo.full_name');
+  });
+
   it('does not mention private registry credentials when the root did not opt in', () => {
     const rendered = renderCiWorkflowYaml(options());
 

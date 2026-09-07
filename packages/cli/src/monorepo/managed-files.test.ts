@@ -469,7 +469,7 @@ describe('publish workflow rendering by repo shape', () => {
 
     expect(rendered).toContain('PRIV_NPM_READ_TOKEN: ${{ secrets.PRIV_NPM_READ_TOKEN }}');
     expect(rendered).not.toContain('PRIV_NPM_REGISTRY');
-    expect(rendered).not.toContain('      PRIV_NPM_PUBLISH_TOKEN:');
+    expect(rendered).not.toMatch(/^ {6}PRIV_NPM_PUBLISH_TOKEN:/m);
     expect(rendered).toContain('          PRIV_NPM_PUBLISH_TOKEN: ${{ secrets.PRIV_NPM_PUBLISH_TOKEN }}');
   });
 });

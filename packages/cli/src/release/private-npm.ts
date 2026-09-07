@@ -2,8 +2,16 @@ import { readFileSync } from 'node:fs';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
+import type { PackageJson, PackagePrivateNpmConfig } from '../lib/json.js';
 import { runResult } from '../lib/run.js';
-import { type PackageInfo, readPackageJson } from '../lib/workspace.js';
+import {
+  getWorkspacePackageManifests,
+  listPrivatePackages,
+  type PackageInfo,
+  readPackageJson,
+  readPackageJsonObject,
+  workspaceDependencyFields,
+} from '../lib/workspace.js';
 
 /** Minimal typed-result convention for private-registry resolution. */
 export type Result<T, E> = { ok: true; value: T } | { ok: false; error: E };
@@ -61,7 +69,7 @@ export function resolvePrivateNpmRegistry(root: string): RegistryResult {
   if (!config.scope.startsWith('@')) {
     return configError(
       'InvalidRegistry',
-      `smoo.privateNpm.scope must be a scope such as @priv.test, got ${JSON.stringify(config.scope)}.`,
+      `smoo.privateNpm.scope must be a scope such as @scope, got ${JSON.stringify(config.scope)}.`,
     );
   }
   const rawUrl = npmrcScopeRegistry(root, config.scope);
@@ -108,25 +116,51 @@ export function resolvePrivateNpmRegistry(root: string): RegistryResult {
     );
   }
   const pathname = url.pathname.endsWith('/') ? url.pathname : `${url.pathname}/`;
+  const readTokenEnv = config.readTokenEnv ?? config.publishTokenEnv;
+  if (!readTokenEnv) {
+    return configError(
+      'MissingConfiguration',
+      'smoo.privateNpm must name a token environment variable (readTokenEnv or publishTokenEnv).',
+    );
+  }
   return {
     ok: true,
     value: {
       scope: config.scope,
       registry: `https://${url.host}${pathname}`,
       authKey: `//${url.host}${pathname}:_authToken`,
-      readTokenEnv: config.readTokenEnv,
+      readTokenEnv,
       publishTokenEnv: config.publishTokenEnv,
     },
   };
 }
 
-/**
- * npm .npmrc semantics, narrowed to the one key this decision needs: the
- * scoped registry URL. Project .npmrc wins over the user's; comments and
- * blank lines are skipped; values are used verbatim (an unexpanded ${VAR}
- * placeholder simply fails URL validation at operation time).
- */
 function npmrcScopeRegistry(root: string, scope: string): string | null {
+  return npmrcValue(root, `${scope}:registry`);
+}
+
+const NPMRC_TOKEN_ENV = /^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$/;
+
+function npmrcAuthTokenEnv(root: string, scope: string): string | undefined {
+  const registry = npmrcScopeRegistry(root, scope);
+  if (!registry) {
+    return undefined;
+  }
+  let url: URL;
+  try {
+    url = new URL(registry);
+  } catch {
+    return undefined;
+  }
+  const pathname = url.pathname.endsWith('/') ? url.pathname : `${url.pathname}/`;
+  const value = npmrcValue(root, `//${url.host}${pathname}:_authToken`);
+  if (!value) {
+    return undefined;
+  }
+  return NPMRC_TOKEN_ENV.exec(value)?.[1];
+}
+
+function npmrcValue(root: string, key: string): string | null {
   const candidates = [join(root, '.npmrc'), join(homedir(), '.npmrc')];
   for (const path of candidates) {
     let text: string;
@@ -144,12 +178,77 @@ function npmrcScopeRegistry(root: string, scope: string): string | null {
       if (separator <= 0) {
         continue;
       }
-      if (trimmed.slice(0, separator).trim() === `${scope}:registry`) {
+      if (trimmed.slice(0, separator).trim() === key) {
         return trimmed.slice(separator + 1).trim();
       }
     }
   }
   return null;
+}
+
+function nameInPrivateScope(name: string, scope: string): boolean {
+  return name === scope || name.startsWith(`${scope}/`);
+}
+
+function workspaceConsumesPrivateScope(root: string, scope: string): boolean {
+  const rootJson = readPackageJsonObject(join(root, 'package.json'));
+  const manifests: PackageJson[] = [
+    ...(rootJson ? [rootJson] : []),
+    ...getWorkspacePackageManifests(root).map((pkg) => pkg.json),
+  ];
+  for (const json of manifests) {
+    for (const field of workspaceDependencyFields) {
+      const deps = json[field];
+      if (!deps) {
+        continue;
+      }
+      for (const [name, spec] of Object.entries(deps)) {
+        if (
+          nameInPrivateScope(name, scope) &&
+          !spec.startsWith('workspace:') &&
+          !spec.startsWith('link:') &&
+          !spec.startsWith('file:')
+        ) {
+          return true;
+        }
+      }
+    }
+  }
+  return false;
+}
+
+function workspacePublishesPrivateScope(root: string, scope: string): boolean {
+  return listPrivatePackages(root).some((pkg) => nameInPrivateScope(pkg.name, scope));
+}
+
+/**
+ * Tokens the managed CI/publish workflows should expose. Derived from the
+ * declared scope plus the workspace graph and `.npmrc` `${VAR}` auth line —
+ * never from a hardcoded namespace. A consumer that does not publish the
+ * scope does not receive a publish token; a producer that never installs the
+ * scope from the registry does not receive a read token.
+ */
+export function resolvePrivateNpmWorkflowConfig(root: string): PackagePrivateNpmConfig | undefined {
+  const declared = readPackageJsonObject(join(root, 'package.json'))?.smoo?.privateNpm;
+  if (!declared) {
+    return undefined;
+  }
+  const consumes = workspaceConsumesPrivateScope(root, declared.scope);
+  const publishes = workspacePublishesPrivateScope(root, declared.scope);
+  if (!consumes && !publishes) {
+    return undefined;
+  }
+  const npmrcEnv = npmrcAuthTokenEnv(root, declared.scope);
+  const readTokenEnv = consumes ? (declared.readTokenEnv ?? npmrcEnv) : undefined;
+  const publishTokenEnv = publishes ? (declared.publishTokenEnv ?? (consumes ? undefined : npmrcEnv)) : undefined;
+  if (!readTokenEnv && !publishTokenEnv) {
+    return undefined;
+  }
+  return {
+    scope: declared.scope,
+    ...(readTokenEnv ? { readTokenEnv } : {}),
+    ...(publishTokenEnv ? { publishTokenEnv } : {}),
+  };
 }
 
 /** Throwing variant for publish/status paths: refuses with zero network I/O. */

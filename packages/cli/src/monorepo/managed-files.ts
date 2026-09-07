@@ -5,6 +5,7 @@ import { MACOS_PLATFORM_TARGET_GLOBS, PLATFORM_TARGET_GLOBS } from '@smoothbrick
 import type { NxTargetConfig, PackageJson, PackagePrivateNpmConfig } from '../lib/json.js';
 import { listReleasePackages, readPackageJson } from '../lib/workspace.js';
 import { loadNxProjects, type NxProjects, targetNamesFromProjects } from '../nx/index.js';
+import { resolvePrivateNpmWorkflowConfig } from '../release/private-npm.js';
 import { renderCiWorkflowYaml } from './ci-workflow.js';
 import { renderPrPreviewCleanupWorkflowYaml } from './pr-preview-cleanup-workflow.js';
 import { renderPublishWorkflowYaml } from './publish-workflow.js';
@@ -393,7 +394,7 @@ async function getManagedFileContext(root: string): Promise<ManagedFileContext> 
   const productionDeploy = deployTargetInfoFromProjects(nxProjects, 'production');
   const targetNames = targetNamesFromProjects(nxProjects);
   const platformTargetGlobs = platformTargetGlobsForTest(targetNames);
-  const privateNpm = packageJson?.json.smoo?.privateNpm;
+  const privateNpm = resolvePrivateNpmWorkflowConfig(root);
   // Cache registry identity plus the lockfile, never token values: a scope
   // URL change in the committed .npmrc must invalidate the dependency cache,
   // and the cache key must stay free of secrets. Shell entry never requires
