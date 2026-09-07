@@ -660,6 +660,11 @@ async function publishPackedPackage(root: string, pkg: ReleasePackage, tag: stri
     await publishPrivatePackedPackage(root, pkg, tag, dryRun, destination.registry);
     return;
   }
+  // Public trusted publishing requires the package's publisher binding to
+  // exist first. Token-authenticated private registries create it on publish.
+  if (!dryRun && !(await npmPackageExists(root, pkg.name))) {
+    throw new Error(missingNpmPackagePublishGuidance(pkg));
+  }
   const { tarball, cleanup } = await packReleaseTarball(root, pkg);
   try {
     // npm CLI owns authentication here: trusted publishing OIDC when configured.
@@ -1122,13 +1127,7 @@ function releaseCompletionShell(root: string, prebuiltOutputs?: string[]): Relea
         packages,
         prebuilt,
       ),
-    publishPackage: async (pkg, distTag, dryRun) => {
-      const packageExists = dryRun ? true : await npmPackageExists(root, pkg.name);
-      if (!packageExists) {
-        throw new Error(missingNpmPackagePublishGuidance(pkg));
-      }
-      await publishPackedPackage(root, pkg, distTag, dryRun);
-    },
+    publishPackage: (pkg, distTag, dryRun) => publishPackedPackage(root, pkg, distTag, dryRun),
     listGithubMissingPackages: (packages) => listMissingGithubReleasePackages(root, packages),
     createGithubRelease: (pkg, dryRun) => createGithubRelease(root, pkg, dryRun),
   };
@@ -1161,22 +1160,23 @@ function releaseTargetCheckoutShell(root: string) {
  * architecture means a pending release's binaries arrive as several collected
  * trees; each owns the targets its selector named, so the paths are disjoint
  * and `apply-outputs` can verify them together. A leg that built nothing for a
- * given pending sha contributes no directory, which is not an error.
+ * pending sha still contributes an empty manifest; a missing leg is an error.
  */
 function releaseRepairShell(root: string, platformOutputs: readonly string[]): ReleaseRepairShell<ReleasePackage> {
   return {
     ...releaseCompletionShell(root),
     ...releaseTargetCheckoutShell(root),
-    prepareRepairTarget: async (target) => {
-      if (target.npmPackages.length === 0) {
-        return;
-      }
-      const outputs = platformOutputs.map((base) => join(base, target.sha)).filter((output) => existsSync(output));
+    buildReleaseCandidate: async (packages) => {
+      // Build first: a package build may replace its entire output directory.
+      // Foreign artifacts must be the final overlay before the pack gate.
+      await buildReleaseCandidate(root, packages);
+      const sourceSha = await gitHead(root);
+      const outputs = platformOutputs.map((base) => join(base, sourceSha));
       if (outputs.length === 0) {
         return;
       }
       console.log(`Repair pending releases: applying cross-platform outputs from ${outputs.join(', ')}.`);
-      await githubCiApplyOutputs(root, outputs, target.sha);
+      await githubCiApplyOutputs(root, outputs, sourceSha);
     },
   };
 }
