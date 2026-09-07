@@ -103,13 +103,27 @@ describe('CI workflow definition', () => {
     expect(rendered).toContain('github.event.pull_request.head.repo.full_name == github.repository');
     expect(rendered.match(/SOURCE_READ_TOKEN: \$\{\{ secrets\.SOURCE_READ_TOKEN \}\}/g)).toHaveLength(1);
     expect(rendered).toContain(
-      'git clone --filter=blob:none https://x-access-token:${SOURCE_READ_TOKEN}@git.example.net/codebase/smoothbricks.git "$root/../smoothbricks"',
+      'git clone --filter=blob:none https://git.example.net/codebase/smoothbricks.git "$root/../smoothbricks"',
     );
     expect(rendered).toContain('git -C "$root/../smoothbricks" checkout --detach abc123');
     expect(rendered).toContain(
-      'git clone --filter=blob:none https://x-access-token:${SOURCE_READ_TOKEN}@git.example.net/codebase/minigraf.git "$root/../_fork/minigraf"',
+      'git clone --filter=blob:none https://git.example.net/codebase/minigraf.git "$root/../_fork/minigraf"',
     );
     expect(rendered).toContain('git -C "$root/../_fork/minigraf" checkout --detach def456');
+    // Credential hygiene: no token in any URL or argv; authorization is
+    // per-command env config whose key is scoped to the exact origin, so
+    // nothing leaks to other hosts or into the sibling's .git/config.
+    expect(rendered).not.toContain('x-access-token:${SOURCE_READ_TOKEN}@');
+    expect(rendered).not.toMatch(/https:\/\/[^ ]*SOURCE_READ_TOKEN/);
+    expect(rendered).toContain("key='http.https://git.example.net/.extraheader'");
+    expect(rendered).toContain(
+      'val="AUTHORIZATION: basic $(printf \'x-access-token:%s\' "$SOURCE_READ_TOKEN" | base64 | tr -d \'\\n\')"',
+    );
+    const configPrefixes = rendered.match(/GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0="\$key" GIT_CONFIG_VALUE_0="\$val" \\/g);
+    expect(configPrefixes).toHaveLength(4);
+    expect(rendered).toContain(
+      'GIT_CONFIG_VALUE_0="$val" \\\n          git -C "$root/../smoothbricks" checkout --detach abc123',
+    );
     expect(rendered).toContain('# Step 4. Composite action internals');
   });
 
@@ -124,6 +138,7 @@ describe('CI workflow definition', () => {
       'git clone --filter=blob:none https://git.example.net/codebase/public.git "$root/../public"',
     );
     expect(rendered).not.toMatch(/^\s+[A-Z][A-Z0-9_]+: \$\{\{ secrets\./m);
+    expect(rendered).not.toContain('GIT_CONFIG');
   });
 
   it('refuses malformed source checkout declarations at render time', () => {
@@ -135,6 +150,11 @@ describe('CI workflow definition', () => {
     expect(() =>
       renderCiWorkflowYaml(options({ sourceCheckouts: [{ path: '../x', repository: 'git@example.net:x.git' }] })),
     ).toThrow('https repository URL');
+    expect(() =>
+      renderCiWorkflowYaml(
+        options({ sourceCheckouts: [{ path: '../x', repository: 'https://token@git.example.net/x.git' }] }),
+      ),
+    ).toThrow('credential-free');
     expect(() =>
       renderCiWorkflowYaml(
         options({

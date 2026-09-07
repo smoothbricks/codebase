@@ -322,8 +322,11 @@ function yamlLinesForStep(step: CiWorkflowStep, options: CiWorkflowDefinitionOpt
  * One clone command per declared sibling source, pinned to its configured
  * ref. The step's `if` keeps fork PRs — which receive no secrets — from
  * touching source-read credentials, and their builds would lack the private
- * siblings anyway. Token values only ever enter git through the job env; the
- * emitted YAML references the secret name, never a value.
+ * siblings anyway. The clone URL stays clean: authorization rides per git
+ * command through `GIT_CONFIG_*` environment config whose
+ * `http.<origin>.extraheader` key names the exact origin, so the token never
+ * reaches argv, a file, the sibling's stored `.git/config`, or any other
+ * host. The token itself is only ever a shell expansion of the step env.
  */
 export function sourceCheckoutsStepLines(
   step: CiWorkflowStep,
@@ -343,12 +346,18 @@ export function sourceCheckoutsStepLines(
   lines.push('          root="$GITHUB_WORKSPACE"');
   for (const checkout of checkouts.map(normalizeSourceCheckout)) {
     const destination = `"$root/${checkout.path}"`;
-    const url =
+    const auth =
       checkout.tokenEnv === undefined
-        ? checkout.repository
-        : `https://x-access-token:\${${checkout.tokenEnv}}@${checkout.repository.slice('https://'.length)}`;
-    lines.push(`          git clone --filter=blob:none ${url} ${destination}`);
+        ? []
+        : [
+            `          key='http.${new URL(checkout.repository).origin}/.extraheader'`,
+            `          val="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$${checkout.tokenEnv}" | base64 | tr -d '\\n')"`,
+            '          GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0="$key" GIT_CONFIG_VALUE_0="$val" \\',
+          ];
+    lines.push(...auth);
+    lines.push(`          git clone --filter=blob:none ${checkout.repository} ${destination}`);
     if (checkout.ref !== undefined) {
+      lines.push(...auth);
       lines.push(`          git -C ${destination} checkout --detach ${checkout.ref}`);
     }
   }
@@ -362,9 +371,22 @@ export function normalizeSourceCheckout(config: PackageSourceCheckoutConfig): Pa
       `smoo.github.sourceCheckouts entry needs a path relative to the workspace root, got ${JSON.stringify(config.path)}`,
     );
   }
-  if (config.repository === undefined || !config.repository.startsWith('https://')) {
+  let url: URL | null = null;
+  try {
+    url = config.repository === undefined ? null : new URL(config.repository);
+  } catch {
+    url = null;
+  }
+  if (
+    url === null ||
+    url.protocol !== 'https:' ||
+    url.username !== '' ||
+    url.password !== '' ||
+    url.search !== '' ||
+    url.hash !== ''
+  ) {
     throw new Error(
-      `smoo.github.sourceCheckouts entry needs an https repository URL, got ${JSON.stringify(config.repository)}`,
+      `smoo.github.sourceCheckouts entry needs a credential-free https repository URL, got ${JSON.stringify(config.repository)}`,
     );
   }
   if (config.tokenEnv !== undefined && !/^[A-Z_][A-Z0-9_]*$/.test(config.tokenEnv)) {
