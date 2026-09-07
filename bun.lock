@@ -44,6 +44,10 @@
         "@smoothbricks/validation": "workspace:*",
       },
     },
+    "packages/bitmosaic": {
+      "name": "@smoothbricks/bitmosaic",
+      "version": "0.0.0",
+    },
     "packages/cli": {
       "name": "@smoothbricks/cli",
       "version": "0.11.4-next.0",
@@ -1706,6 +1710,8 @@
     "@sinonjs/fake-timers": ["@sinonjs/fake-timers@15.4.0", "", { "dependencies": { "@sinonjs/commons": "^3.0.1" } }, "sha512-DsG+8/LscQIQg68J6Ef3dv10u6nVyetYn923s3/sus5eaGfTo1of5WMZSLf0UJc9KDuKPilPH0UDJCjvNbDNCA=="],
 
     "@smoothbricks/arrow-builder": ["@smoothbricks/arrow-builder@workspace:packages/arrow-builder"],
+
+    "@smoothbricks/bitmosaic": ["@smoothbricks/bitmosaic@workspace:packages/bitmosaic"],
 
     "@smoothbricks/cli": ["@smoothbricks/cli@workspace:packages/cli"],
 
