@@ -1227,7 +1227,7 @@ function releaseRetagShell(root: string, remote: string) {
           }),
         },
       );
-      if (!response.ok) {
+      if (response.status < 200 || response.status >= 300) {
         const body = await response.text();
         throw new Error(
           `Unable to dispatch source publish workflow ${workflow} (HTTP ${response.status}).${
