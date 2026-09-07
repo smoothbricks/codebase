@@ -5,6 +5,7 @@ import { basename, isAbsolute, join, posix, resolve } from 'node:path';
 import { publint } from 'publint';
 import { formatMessage } from 'publint/utils';
 import typia from 'typia';
+import { githubCiNxRunMany } from '../github-ci/index.js';
 import type { PackageExports } from '../lib/json.js';
 import { run, runResult } from '../lib/run.js';
 import {
@@ -20,6 +21,7 @@ import {
 import { syncBunLockfileVersions } from '../monorepo/lockfile.js';
 import { readPackedPackageJson, validatePackedWorkspaceDependencies } from '../monorepo/packed-manifest.js';
 import { withPublishManifest } from '../monorepo/publish-manifest.js';
+import { readProjectTargets } from '../nx/index.js';
 
 const parseReleasePackManifestText = typia.json.createIsParse<ReleasePackManifest>();
 /** Runtime dependency fields expanded when computing the artifact closure. */
@@ -82,6 +84,7 @@ export async function packReleaseTarball(
   // installable versions, then restore the exact original bytes.
   try {
     syncBunLockfileVersions(root, { mode: 'publish', log: true });
+    await runReleaseCheckGate(root, pkg);
     console.log(`${pkg.name}@${pkg.version}: packing with bun pm pack`);
     await withPublishManifest(
       join(root, pkg.path),
@@ -103,6 +106,28 @@ export async function packReleaseTarball(
     throw error;
   } finally {
     await restoreBunLockfile(lockSnapshot);
+  }
+}
+/**
+ * Per-package release gate: when the project declares an Nx `release-check`
+ * target, run it after prebuilt outputs merge and before the tarball exists.
+ * The target itself owns what it asserts and must declare dependsOn[] so the
+ * gate verifies artifacts without rebuilding them. Undeclared packages pack
+ * exactly as before.
+ */
+async function runReleaseCheckGate(root: string, pkg: PackageInfo): Promise<void> {
+  const projects = await readProjectTargets(root);
+  const declaresGate = projects.some(
+    (project) => project.project === pkg.projectName && project.targets.includes('release-check'),
+  );
+  if (!declaresGate) {
+    return;
+  }
+  console.log(`${pkg.name}@${pkg.version}: running Nx release-check gate`);
+  try {
+    await githubCiNxRunMany(root, { targets: 'release-check', projects: pkg.projectName });
+  } catch (error) {
+    throw new Error(`${pkg.name}@${pkg.version}: release-check gate refused the release`, { cause: error });
   }
 }
 
