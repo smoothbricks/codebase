@@ -466,6 +466,7 @@ function buildProgram(): Command {
     .option('--name <name>')
     .option('--step <step>')
     .option('--verify', 'run build, lint, and test before deploy')
+    .option('--select-tag <tag>', 'deploy only projects carrying this nx tag')
     .action(
       async (options: {
         stage?: string;
@@ -473,6 +474,7 @@ function buildProgram(): Command {
         name?: string;
         step?: string;
         verify?: boolean;
+        selectTag?: string;
       }) => {
         const { githubCiNxDeploy } = await import('./github-ci/index.js');
         await githubCiNxDeploy(await findRepoRoot(), options);

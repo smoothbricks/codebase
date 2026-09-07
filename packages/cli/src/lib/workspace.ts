@@ -224,7 +224,12 @@ function getWorkspacePatternsFromPackageJson(pkg: PackageJson): string[] {
 
 export function readPackageJson(path: string): PackageInfo | null {
   const parsed = readPackageJsonObject(path);
-  if (!parsed?.name || !parsed.version) {
+  return parsed ? packageInfo(path, parsed) : null;
+}
+
+/** The workspace view of an already-parsed manifest; null without the name and version a package needs. */
+export function packageInfo(path: string, parsed: PackageJson): PackageInfo | null {
+  if (!parsed.name || !parsed.version) {
     return null;
   }
   return {

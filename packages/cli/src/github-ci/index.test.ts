@@ -14,6 +14,7 @@ import {
   nxRunManyArgs,
   nxRunManyBatchArgs,
   nxSmartArgs,
+  previewUrlsForStage,
   publishGithubDeployment,
   readGitHeadSha,
   resolveDeploymentStage,
@@ -824,13 +825,21 @@ describe('event-aware stage deployment', () => {
           repository: { full_name: 'owner/repo' },
           pull_request: { number: 123, head: { repo: { full_name: 'owner/repo' } } },
         },
+        'private',
       ),
     ).toBe('pr123');
     expect(
-      resolveDeploymentStage(undefined, { GITHUB_EVENT_NAME: 'push', GITHUB_REF_NAME: 'private' }, undefined),
+      resolveDeploymentStage(
+        undefined,
+        { GITHUB_EVENT_NAME: 'push', GITHUB_REF_NAME: 'private' },
+        undefined,
+        'private',
+      ),
     ).toBe('staging');
-    expect(resolveDeploymentStage(undefined, { GITHUB_EVENT_NAME: 'release' }, undefined)).toBe('production');
-    expect(resolveDeploymentStage('production', {}, undefined)).toBe('production');
+    expect(resolveDeploymentStage(undefined, { GITHUB_EVENT_NAME: 'release' }, undefined, 'private')).toBe(
+      'production',
+    );
+    expect(resolveDeploymentStage('production', {}, undefined, 'private')).toBe('production');
     expect(() =>
       resolveDeploymentStage(
         undefined,
@@ -840,6 +849,7 @@ describe('event-aware stage deployment', () => {
           repository: { full_name: 'owner/repo' },
           pull_request: { number: 123, head: { repo: { full_name: 'fork/repo' } } },
         },
+        'private',
       ),
     ).toThrow(/same-repository/);
   });
@@ -863,22 +873,29 @@ describe('event-aware stage deployment', () => {
         tags: ['permanent-deploy-target'],
         targets: { deploy: { options: { command: 'wrangler deploy --config wrangler.toml' } } },
       },
-      website: {
+      'fixture-website': {
+        tags: ['stage-deploy-target'],
         targets: { deploy: { options: { command: 'bun scripts/deploy-website.ts' } } },
       },
     };
     const candidates = Object.keys(definitions);
     const loadProject = async (project: string) => definitions[project];
 
-    await expect(selectStageDeployProjects(candidates, 'staging', loadProject)).resolves.toEqual([
-      'app',
-      'app-backend',
-      'e2e-mail-capture',
+    await expect(selectStageDeployProjects(candidates, 'staging', undefined, loadProject)).resolves.toEqual([
+      'fixture-app',
+      'fixture-app-backend',
+      'fixture-e2e-mail-capture',
+      'fixture-website',
     ]);
-    await expect(selectStageDeployProjects(candidates, 'pr123', loadProject)).resolves.toEqual(['app', 'app-backend']);
-    await expect(selectStageDeployProjects(candidates, 'production', loadProject)).resolves.toEqual([
-      'app',
-      'app-backend',
+    await expect(selectStageDeployProjects(candidates, 'pr123', undefined, loadProject)).resolves.toEqual([
+      'fixture-app',
+      'fixture-app-backend',
+      'fixture-website',
+    ]);
+    await expect(selectStageDeployProjects(candidates, 'production', undefined, loadProject)).resolves.toEqual([
+      'fixture-app',
+      'fixture-app-backend',
+      'fixture-website',
     ]);
   });
 
@@ -944,7 +961,7 @@ describe('event-aware stage deployment', () => {
 
   it('deploys app/backend, publishes PR metadata, and emits the resolved stage', async () => {
     const nxCalls: string[][] = [];
-    const listCalls: Array<[string, string, string]> = [];
+    const listCalls: Array<[string, string, string, string | undefined]> = [];
     const summaries: string[] = [];
     const deployments: Array<[string, string]> = [];
     const outputs: string[] = [];
@@ -959,15 +976,16 @@ describe('event-aware stage deployment', () => {
           GITHUB_OUTPUT: '/output',
           SMOO_PREVIEW_ZONE: 'example.test',
         },
+        github: { previewUrls: ['https://app.{stage}.example.test', 'https://site.{stage}.example.test'] },
         setStatus: async () => {},
         eventPayload: {
           action: 'opened',
           repository: { full_name: 'owner/repo' },
           pull_request: { number: 123, head: { repo: { full_name: 'owner/repo' } } },
         },
-        listProjects: async (_root, target, mode, stage) => {
-          listCalls.push([target, mode, stage]);
-          return ['app', 'app-backend'];
+        listProjects: async (_root, target, mode, stage, selectTag) => {
+          listCalls.push([target, mode, stage, selectTag]);
+          return ['fixture-app', 'fixture-app-backend'];
         },
         runNx: async (args) => {
           nxCalls.push(args);
@@ -985,13 +1003,16 @@ describe('event-aware stage deployment', () => {
       },
     );
 
-    expect(listCalls).toEqual([['deploy', 'run-many', 'pr123']]);
+    expect(listCalls).toEqual([['deploy', 'run-many', 'pr123', undefined]]);
     expect(nxCalls).toHaveLength(1);
     expect(nxCalls[0]).toContain('--projects=app,app-backend');
     expect(nxCalls[0]).toContain('--exclude=tag:permanent-deploy-target,tag:staging-deploy-target');
     expect(nxCalls[0]).toContain('--stage=pr123');
     expect(nxCalls[0]).not.toContain('e2e-deployment');
-    expect(summaries).toEqual(['## pr123 deployment\n\n[View deployment](https://app.pr123.example.test)\n']);
+    // Every configured surface is listed; the first one is what GitHub links from the PR.
+    expect(summaries).toEqual([
+      '## pr123 deployment\n\n- [https://app.pr123.example.test](https://app.pr123.example.test)\n- [https://site.pr123.example.test](https://site.pr123.example.test)\n',
+    ]);
     expect(deployments).toEqual([['pr123', 'https://app.pr123.example.test']]);
     expect(outputs).toEqual(['stage=pr123\n']);
   });
@@ -1061,5 +1082,121 @@ describe('event-aware stage deployment', () => {
       ),
     ).rejects.toThrow('output unavailable');
     expect(outputStatuses).toEqual(['pending', 'failure']);
+  });
+
+  it('passes --select-tag through to the project selection of the production deploy', async () => {
+    const listCalls: Array<[string, string, string, string | undefined]> = [];
+    const nxCalls: string[][] = [];
+
+    await githubCiNxDeploy(
+      '/repo',
+      { stage: 'production', selectTag: 'production-push-deploy-target' },
+      {
+        processEnv: {},
+        setStatus: async () => {},
+        listProjects: async (_root, target, mode, stage, selectTag) => {
+          listCalls.push([target, mode, stage, selectTag]);
+          return ['fixture-website'];
+        },
+        runNx: async (args) => {
+          nxCalls.push(args);
+          return 0;
+        },
+      },
+    );
+
+    expect(listCalls).toEqual([['deploy', 'run-many', 'production', 'production-push-deploy-target']]);
+    expect(nxCalls).toHaveLength(1);
+    expect(nxCalls[0]).toContain('--projects=fixture-website');
+    expect(nxCalls[0]).toContain('--stage=production');
+  });
+
+  it('refuses a bad preview template before deploying, so the commit status is never left pending', async () => {
+    const statuses: string[] = [];
+    let listed = 0;
+    let deployed = 0;
+
+    await expect(
+      githubCiNxDeploy(
+        '/repo',
+        { mode: 'run-many' },
+        {
+          processEnv: { GITHUB_EVENT_NAME: 'pull_request' },
+          github: { previewUrls: ['https://app.staging.example.com'] },
+          eventPayload: {
+            action: 'opened',
+            repository: { full_name: 'owner/repo' },
+            pull_request: { number: 7, head: { repo: { full_name: 'owner/repo' } } },
+          },
+          setStatus: async (status) => {
+            statuses.push(status);
+          },
+          listProjects: async () => {
+            listed += 1;
+            return ['app'];
+          },
+          runNx: async () => {
+            deployed += 1;
+            return 0;
+          },
+        },
+      ),
+    ).rejects.toThrow('preview URL template "https://app.staging.example.com" must contain {stage}');
+    expect(statuses).toEqual([]);
+    expect(listed).toBe(0);
+    expect(deployed).toBe(0);
+  });
+});
+
+describe('resolveDeploymentStage with a configured push branch', () => {
+  it('maps a push to the configured branch to staging', () => {
+    expect(
+      resolveDeploymentStage(undefined, { GITHUB_EVENT_NAME: 'push', GITHUB_REF_NAME: 'trunk' }, undefined, 'trunk'),
+    ).toBe('staging');
+  });
+
+  it('does not map a push to another branch', () => {
+    expect(() =>
+      resolveDeploymentStage(undefined, { GITHUB_EVENT_NAME: 'push', GITHUB_REF_NAME: 'private' }, undefined, 'trunk'),
+    ).toThrow(/Cannot resolve/);
+  });
+});
+
+describe('selectStageDeployProjects with a required tag', () => {
+  const definitions: Record<string, unknown> = {
+    'fixture-app': { targets: { deploy: { options: { command: 'smoo wrangler deploy-stage --stage {args.stage}' } } } },
+    'fixture-website': {
+      tags: ['stage-deploy-target', 'production-push-deploy-target'],
+      targets: { deploy: { command: 'bun ../../tooling/deploy-website.ts --stage={args.stage}' } },
+    },
+  };
+  const loadProject = async (project: string) => definitions[project];
+
+  it('keeps only projects carrying the tag, on top of the stage-derived rule', async () => {
+    await expect(
+      selectStageDeployProjects(Object.keys(definitions), 'production', 'production-push-deploy-target', loadProject),
+    ).resolves.toEqual(['fixture-website']);
+  });
+
+  it('selects the website on every stage once it is stage-derived', async () => {
+    await expect(selectStageDeployProjects(Object.keys(definitions), 'pr12', undefined, loadProject)).resolves.toEqual([
+      'fixture-app',
+      'fixture-website',
+    ]);
+  });
+});
+
+describe('previewUrlsForStage', () => {
+  it('fills the stage into each template and defaults to the app host', () => {
+    expect(previewUrlsForStage(['https://app.{stage}.example.com', 'https://site.{stage}.example.com'], 'pr9')).toEqual(
+      ['https://app.pr9.example.com', 'https://site.pr9.example.com'],
+    );
+    expect(previewUrlsForStage(undefined, 'pr9')).toEqual(['https://app.pr9.example.test']);
+  });
+
+  it('refuses a template without {stage}, which would publish one URL for every pull request', () => {
+    expect(() => previewUrlsForStage(['https://app.staging.example.com'], 'pr9')).toThrow(
+      'preview URL template "https://app.staging.example.com" must contain {stage}',
+    );
   });
 });

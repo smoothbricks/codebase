@@ -1,10 +1,13 @@
 /* biome-ignore-all lint/suspicious/noTemplateCurlyInString: GitHub Actions expressions are emitted literally. */
 
+import { PRODUCTION_PUSH_DEPLOY_TAG } from '../lib/deploy-tags.js';
 import type {
+  NonEmptyArray,
   PackageCargoCredentialsConfig,
   PackageCargoGitOrigin,
   PackagePrivateNpmConfig,
   PackageSmooGithub,
+  PackageSmooGithubEnvironments,
   PackageSourceCheckoutConfig,
 } from '../lib/json.js';
 import { renderRunsOnLine } from './github-runs-on.js';
@@ -40,7 +43,8 @@ export interface CiWorkflowDefinitionOptions {
   browserTests: boolean;
   e2eDeployment: boolean;
   deployProvider?: 'cloudflare';
-  pushBranches: string[];
+  /** The first entry is the branch whose pushes deploy the staging stage. */
+  pushBranches: NonEmptyArray<string>;
   /** Default ubuntu-latest when omitted. */
   runsOn?: string | string[];
   /**
@@ -63,6 +67,14 @@ export interface CiWorkflowDefinitionOptions {
    * before SetupDevenv. Absent means no private Cargo fetch.
    */
   cargoCredentials?: PackageCargoCredentialsConfig;
+  /** GitHub Environments: staging for the validate/e2e jobs, production for the production-on-push job. */
+  environments?: PackageSmooGithubEnvironments;
+  /** Extra deploy-step secrets, env var name → repository secret name. */
+  deploySecrets?: Record<string, string>;
+  /** Secrets for the e2e-deployment step, env var name → repository secret name. */
+  e2eSecrets?: Record<string, string>;
+  /** Emit the production-on-push job (some project carries PRODUCTION_PUSH_DEPLOY_TAG). */
+  productionOnPush?: boolean;
 }
 
 type CiWorkflowStepInput = Omit<CiWorkflowStep, 'number'>;
@@ -103,7 +115,12 @@ export function defineCiWorkflow(options: CiWorkflowDefinitionOptions): CiWorkfl
 
 export function renderCiWorkflowYaml(options: CiWorkflowDefinitionOptions): string {
   const steps = defineCiWorkflow(options);
-  return `${renderCiWorkflowHeader(options)}${renderCiWorkflowSteps(steps, options)}${renderE2eDeploymentJob(options)}`;
+  return [
+    renderCiWorkflowHeader(options),
+    renderCiWorkflowSteps(steps, options),
+    renderE2eDeploymentJob(options),
+    renderProductionDeployJob(options),
+  ].join('');
 }
 
 function renderCiWorkflowHeader(options: CiWorkflowDefinitionOptions): string {
@@ -140,7 +157,7 @@ ${
     if: \${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
 `
     : ''
-}${
+}${environmentLine(options.deploy ? options.environments?.staging : undefined)}${
   options.e2eDeployment
     ? `    outputs:
       deployment-stage: ${githubExpression('steps.deploy.outputs.stage')}
@@ -304,7 +321,7 @@ function yamlLinesForStep(step: CiWorkflowStep, options: CiWorkflowDefinitionOpt
         "            (github.event_name == 'pull_request' &&",
         '              contains(fromJSON(\'["opened","reopened","synchronize"]\'), github.event.action) &&',
         '              github.event.pull_request.head.repo.full_name == github.repository) ||',
-        "            (github.event_name == 'push' && github.ref == 'refs/heads/private')",
+        `            (github.event_name == 'push' && github.ref == 'refs/heads/${stagingPushBranch(options)}')`,
         '          }}',
         ...deployEnvLines(options),
         `        run: smoo github-ci nx-deploy --mode run-many --name "Deploy Stage" --step ${step.number}`,
@@ -591,15 +608,36 @@ export const SAME_REPO_GATE_FOLDED = [
   '          }}',
 ];
 
+/** The first push branch is the one whose pushes deploy the staging stage. */
+function stagingPushBranch(options: CiWorkflowDefinitionOptions): string {
+  return options.pushBranches[0];
+}
+
+function environmentLine(name: string | undefined): string {
+  return name ? `    environment: ${name}\n` : '';
+}
+
 function deployEnvLines(options: CiWorkflowDefinitionOptions): string[] {
-  if (options.deployProvider !== 'cloudflare') {
-    return [];
-  }
+  const cloudflare: Record<string, string> =
+    options.deployProvider === 'cloudflare'
+      ? { CLOUDFLARE_API_TOKEN: 'CLOUDFLARE_API_TOKEN', CLOUDFLARE_ACCOUNT_ID: 'CLOUDFLARE_ACCOUNT_ID' }
+      : {};
+  return secretEnvLines({ ...cloudflare, ...options.deploySecrets });
+}
+
+/** A step-level `env:` block mapping env var names to repository secrets; nothing when there are none. */
+function secretEnvLines(secrets: Record<string, string>): string[] {
+  const entries = Object.entries(secrets);
+  if (entries.length === 0) return [];
   return [
     '        env:',
-    '          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}',
-    '          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}',
+    ...entries.map(([name, secret]) => `          ${name}: ${githubExpression(`secrets.${secret}`)}`),
   ];
+}
+
+/** Optional lines as a newline-terminated block, or nothing, so templates never gain a blank line. */
+function renderOptionalLines(lines: string[]): string {
+  return lines.length > 0 ? `${lines.join('\n')}\n` : '';
 }
 
 function nxSmartStep(step: CiWorkflowStep, target: string, name: string): string[] {
@@ -614,19 +652,8 @@ function renderYamlList(values: string[], spaces: number): string {
   return values.map((value) => `${indent}- ${value}`).join('\n');
 }
 
-function renderE2eDeploymentJob(options: CiWorkflowDefinitionOptions): string {
-  if (!options.e2eDeployment) return '';
-  return `
-  e2e-deployment:
-    name: E2E Tests (Deployed Stage)
-    needs: main
-${renderRunsOnLine(options.runsOn)}
-    timeout-minutes: 15
-    if: \${{ needs.main.result == 'success' && needs.main.outputs.deployment-stage != '' }}
-    env:
-      GH_TOKEN: \${{ github.token }}
-${privateNpmReadTokenJobEnv(options)}    steps:
-      # Step 1: GitHub adds "Set up job" automatically
+/** Steps 1–3 of every job after Validate: checkout and devenv setup, so the step anchors match across jobs. */
+const FOLLOW_UP_JOB_SETUP_STEPS = `      # Step 1: GitHub adds "Set up job" automatically
       # Step 2
       - name: 📥 Checkout
         uses: actions/checkout@v6.0.2
@@ -638,13 +665,10 @@ ${privateNpmReadTokenJobEnv(options)}    steps:
       - name: 🧱 Setup Nix/devenv
         id: setup
         uses: ./.github/actions/setup-devenv
+`;
 
-      # Step 4
-      - name: E2E Tests (Deployed Stage)
-        # prettier-ignore
-        run: smoo github-ci nx-smart --target e2e-deployment --mode run-many --stage "\${{ needs.main.outputs.deployment-stage }}" --stream-output --name "E2E Tests (Deployed Stage)" --step 4
-
-      # Step 5
+/** The last step of every job after Validate; bakes "# Step 5", so those jobs have exactly one middle step (4). */
+const FOLLOW_UP_JOB_CLEANUP_STEP = `      # Step 5
       - name: 🧹 Cleanup and cache Nix/devenv
         if: always()
         uses: ./.github/actions/save-nix-devenv
@@ -652,6 +676,55 @@ ${privateNpmReadTokenJobEnv(options)}    steps:
           nix-cache-hit: \${{ steps.setup.outputs.nix-cache-hit }}
           devenv-cache-hit: \${{ steps.setup.outputs.devenv-cache-hit }}
 `;
+
+function renderE2eDeploymentJob(options: CiWorkflowDefinitionOptions): string {
+  if (!options.e2eDeployment) return '';
+  return `
+  e2e-deployment:
+    name: E2E Tests (Deployed Stage)
+    needs: main
+${renderRunsOnLine(options.runsOn)}
+    timeout-minutes: 15
+${environmentLine(options.environments?.staging)}    if: \${{ needs.main.result == 'success' && needs.main.outputs.deployment-stage != '' }}
+    env:
+      GH_TOKEN: \${{ github.token }}
+${privateNpmReadTokenJobEnv(options)}    steps:
+${FOLLOW_UP_JOB_SETUP_STEPS}
+      # Step 4
+      - name: E2E Tests (Deployed Stage)
+${renderOptionalLines(secretEnvLines(options.e2eSecrets ?? {}))}        # prettier-ignore
+        run: smoo github-ci nx-smart --target e2e-deployment --mode run-many --stage "\${{ needs.main.outputs.deployment-stage }}" --stream-output --name "E2E Tests (Deployed Stage)" --step 4
+
+${FOLLOW_UP_JOB_CLEANUP_STEP}`;
+}
+
+/**
+ * Deploys the tagged projects to production on a push to the staging push branch, once Validate and the e2e job
+ * succeed. `!cancelled()` lets the job evaluate its own gate when the e2e job was skipped rather than inheriting a skip.
+ * A `'skipped'` e2e result is allowed so a repo without e2e-deployment projects still deploys production.
+ */
+function renderProductionDeployJob(options: CiWorkflowDefinitionOptions): string {
+  if (!options.deploy || !options.productionOnPush) return '';
+  const needs = options.e2eDeployment ? '[main, e2e-deployment]' : '[main]';
+  const e2eGate = options.e2eDeployment
+    ? " && (needs.e2e-deployment.result == 'success' || needs.e2e-deployment.result == 'skipped')"
+    : '';
+  return `
+  deploy-production:
+    name: Deploy Production
+    needs: ${needs}
+${renderRunsOnLine(options.runsOn)}
+    timeout-minutes: 30
+    if: \${{ !cancelled() && github.event_name == 'push' && github.ref == 'refs/heads/${stagingPushBranch(options)}' && needs.main.result == 'success'${e2eGate} }}
+${environmentLine(options.environments?.production)}    env:
+      GH_TOKEN: \${{ github.token }}
+${privateNpmReadTokenJobEnv(options)}    steps:
+${FOLLOW_UP_JOB_SETUP_STEPS}
+      # Step 4
+      - name: 🚀 Deploy Production
+${renderOptionalLines(deployEnvLines(options))}        run: smoo github-ci nx-deploy --stage production --mode run-many --select-tag ${PRODUCTION_PUSH_DEPLOY_TAG} --name "Deploy Production" --step 4
+
+${FOLLOW_UP_JOB_CLEANUP_STEP}`;
 }
 
 export function artifactStepLines(

@@ -7,6 +7,7 @@ import { LINUX_PLATFORM_TARGET_GLOBS, PLATFORM_TARGET_GLOBS } from '@smoothbrick
 import fc from 'fast-check';
 import { type NxProjects, targetNamesFromProjects } from '../nx/index.js';
 import {
+  anyProjectHasTagForTest,
   DEVENV_MODULE_IMPORT,
   deployTargetInfoFromProjects,
   extractInlineLocalBlocksForTest,
@@ -19,7 +20,7 @@ import {
   managedFileTargetsForTest,
   platformTargetGlobsForTest,
   reinsertInlineLocalBlocksForTest,
-  renderManagedPublishWorkflowForTest,
+  renderManagedWorkflowForTest,
   splitLocalSectionForTest,
   validateDevenvModuleImport,
 } from './managed-files.js';
@@ -292,6 +293,25 @@ describe('nx graph project helpers', () => {
     expect(deployTargetInfoFromProjects(projects, 'staging')).toEqual({ exists: true, provider: 'cloudflare' });
     expect(deployTargetInfoFromProjects(projects, 'production')).toEqual({ exists: true, provider: 'cloudflare' });
   });
+
+  it('treats a stage-deploy-target tag as a deploy target for every stage, like the deploy-stage command', () => {
+    const projects: NxProjects = {
+      site: {
+        tags: ['stage-deploy-target'],
+        targets: { deploy: { command: 'wrangler deploy --config dist/wrangler.json' } },
+      },
+    };
+
+    expect(deployTargetInfoFromProjects(projects, 'staging')).toEqual({ exists: true, provider: 'cloudflare' });
+    expect(deployTargetInfoFromProjects(projects, 'production')).toEqual({ exists: true, provider: 'cloudflare' });
+  });
+
+  it('finds a tag carried by any project in the graph', () => {
+    const tagged: NxProjects = { ...sampleProjects, site: { tags: ['production-push-deploy-target'] } };
+
+    expect(anyProjectHasTagForTest(tagged, 'production-push-deploy-target')).toBe(true);
+    expect(anyProjectHasTagForTest(sampleProjects, 'production-push-deploy-target')).toBe(false);
+  });
 });
 
 describe('managed raw files', () => {
@@ -421,25 +441,29 @@ describe('managed cache actions', () => {
   });
 });
 
+const context = (overrides: Partial<ManagedFileContext>): ManagedFileContext => ({
+  hasReleasePackages: true,
+  hasStagingDeployTargets: false,
+  hasProductionDeployTargets: false,
+  hasProductionPushDeployTargets: false,
+  hasBrowserTestTargets: false,
+  hasE2eDeploymentTargets: false,
+  ciPushBranches: ['main'],
+  ciRunsOn: 'ubuntu-latest',
+  ciDeploySecrets: {},
+  ciE2eSecrets: {},
+  nodeModulesCacheKey: 'key',
+  repoName: '@scope/repo',
+  platformTargetGlobs: [],
+  macosPlatformArchitectures: [],
+  ...overrides,
+});
+
 describe('publish workflow rendering by repo shape', () => {
-  const context = (overrides: Partial<ManagedFileContext>): ManagedFileContext => ({
-    hasReleasePackages: true,
-    hasStagingDeployTargets: false,
-    hasProductionDeployTargets: false,
-    hasBrowserTestTargets: false,
-    hasE2eDeploymentTargets: false,
-    ciPushBranches: ['main'],
-    ciRunsOn: 'ubuntu-latest',
-    macosRunsOn: 'macos-latest',
-    nodeModulesCacheKey: 'key',
-    repoName: '@scope/repo',
-    platformTargetGlobs: [],
-    macosPlatformArchitectures: [],
-    ...overrides,
-  });
 
   it('drops the release half for a repo that deploys production but owns no packages', () => {
-    const rendered = renderManagedPublishWorkflowForTest(
+    const rendered = renderManagedWorkflowForTest(
+      'publish-workflow',
       context({ hasReleasePackages: false, hasProductionDeployTargets: true }),
     );
 
@@ -449,7 +473,8 @@ describe('publish workflow rendering by repo shape', () => {
   });
 
   it('keeps the release pipeline for a repo that owns packages', () => {
-    const rendered = renderManagedPublishWorkflowForTest(
+    const rendered = renderManagedWorkflowForTest(
+      'publish-workflow',
       context({ hasReleasePackages: true, hasProductionDeployTargets: true }),
     );
 
@@ -472,5 +497,54 @@ describe('publish workflow rendering by repo shape', () => {
     expect(rendered).not.toContain('PRIV_NPM_REGISTRY');
     expect(rendered).not.toMatch(/^ {6}PRIV_NPM_PUBLISH_TOKEN:/m);
     expect(rendered).toContain('          PRIV_NPM_PUBLISH_TOKEN: ${{ secrets.PRIV_NPM_PUBLISH_TOKEN }}');
+  });
+});
+
+describe('CI workflow rendering by repo shape', () => {
+  const deploying = context({
+    hasStagingDeployTargets: true,
+    stagingDeployProvider: 'cloudflare',
+    hasE2eDeploymentTargets: true,
+  });
+
+  it('adds the production-on-push job only when a project carries the tag', () => {
+    expect(
+      renderManagedWorkflowForTest('ci-workflow', { ...deploying, hasProductionPushDeployTargets: true }),
+    ).toContain('  deploy-production:');
+    expect(renderManagedWorkflowForTest('ci-workflow', deploying)).not.toContain('deploy-production');
+  });
+
+  it('renders the production job for a repo whose only stage project is tag-based', () => {
+    const projects: NxProjects = {
+      site: {
+        tags: ['stage-deploy-target', 'production-push-deploy-target'],
+        targets: { deploy: { command: 'wrangler deploy --config dist/wrangler.json' } },
+      },
+    };
+    const stagingDeploy = deployTargetInfoFromProjects(projects, 'staging');
+    const rendered = renderManagedWorkflowForTest(
+      'ci-workflow',
+      context({
+        hasStagingDeployTargets: stagingDeploy.exists,
+        stagingDeployProvider: stagingDeploy.provider,
+        hasProductionPushDeployTargets: anyProjectHasTagForTest(projects, 'production-push-deploy-target'),
+      }),
+    );
+
+    expect(rendered).toContain('- name: 🚀 Deploy Stage');
+    expect(rendered).toContain('  deploy-production:');
+  });
+
+  it('threads environments and secrets from the context into the workflow', () => {
+    const rendered = renderManagedWorkflowForTest('ci-workflow', {
+      ...deploying,
+      ciEnvironments: { staging: 'staging' },
+      ciDeploySecrets: { E2E_CONTROL_TOKEN: 'E2E_CONTROL_TOKEN' },
+      ciE2eSecrets: { GIT_CRYPT_KEY_B64: 'GIT_CRYPT_KEY_B64' },
+    });
+
+    expect(rendered).toContain('    environment: staging\n');
+    expect(rendered).toContain('E2E_CONTROL_TOKEN: ${{ secrets.E2E_CONTROL_TOKEN }}');
+    expect(rendered).toContain('GIT_CRYPT_KEY_B64: ${{ secrets.GIT_CRYPT_KEY_B64 }}');
   });
 });

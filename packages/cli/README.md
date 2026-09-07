@@ -395,6 +395,32 @@ The bootstrap script is intentionally small. It only handles work required befor
 - Install `devenv`.
 - Build the devenv shell and add repo-local tooling to `GITHUB_PATH`.
 
+### Deploy configuration (`package.json` → `smoo.github`)
+
+- `pushBranches`: the first entry is the branch whose pushes deploy the staging stage (default `main`).
+- `environments.staging` / `environments.production`: GitHub Environments put on the validate + e2e jobs and on the
+  production-on-push job respectively. The staging Environment goes on Validate for every run of a deploying repo,
+  pull requests included, so a staging Environment with required reviewers would gate every pull request's Validate.
+- `deploySecrets`: extra secrets for deploy steps, as a map of env var name → repository secret name, rendered
+  `NAME: ${{ secrets.SECRET }}` (GitHub forbids `GITHUB_`-prefixed secret names, so the two may differ). The keys
+  `CLOUDFLARE_API_TOKEN` / `CLOUDFLARE_ACCOUNT_ID` replace the default Cloudflare mapping.
+- `e2eSecrets`: the same map shape for the e2e-deployment step only.
+- `previewUrls`: URL templates for pull-request stages (`{stage}` is replaced, and required); the first one becomes
+  the GitHub deployment URL, all are listed in the step summary. Default: `https://app.{stage}.example.test`.
+
+A wrong value type anywhere in `smoo.github` fails `smoo monorepo update` and `smoo github-ci nx-deploy` with the
+offending path, rather than silently falling back to the defaults.
+
+Deploy selection is driven by Nx tags: `stage-deploy-target` (deployed on every stage; implied by a
+`smoo wrangler deploy-stage` command), `staging-deploy-target` (staging only), `permanent-deploy-target` (excluded from
+every stage deploy; deployed outside the stage flow) and `production-push-deploy-target` (the generated production job).
+
+Tag a project `production-push-deploy-target` to have it deployed to production by a generated `deploy-production`
+job that runs after Validate and the e2e job succeed on a push to the staging push branch
+(`smoo github-ci nx-deploy --stage production --select-tag production-push-deploy-target`). The project must also be
+stage-derived — carry `stage-deploy-target` or deploy through `smoo wrangler deploy-stage` — otherwise `--select-tag`
+finds nothing and the job logs `No run-many deploy projects; skipping production.`
+
 ## Releases
 
 Release commands wrap [Nx Release][nx-release] but keep SmoothBricks policy in one place.
@@ -559,7 +585,8 @@ resource carrying the `prN` segment, D1 included.
 - For a `prN` stage, an R2 bucket or D1 database whose name has no exact `staging` segment is refused, before any
   Cloudflare resource is created: reusing the name verbatim would share staging's data with the pull request.
 - A non-wildcard route gets no DNS record from this command; the stage's wildcard record must already exist.
-- Intended for CI. An interactive run blocks on wrangler's migration confirmation prompt.
+- D1 migrations are auto-confirmed: the command captures wrangler's output, so wrangler sees a non-interactive
+  session and answers its own "apply migrations?" prompt with yes. Point it only at a stage you mean to migrate.
 
 ## Why This Shape
 
