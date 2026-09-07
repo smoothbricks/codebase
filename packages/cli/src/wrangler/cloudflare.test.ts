@@ -11,6 +11,10 @@ function jsonFetcher(body: unknown, status = 200): CloudflareFetcher {
     });
 }
 
+function rawFetcher(body: string | null, status = 200): CloudflareFetcher {
+  return async () => new Response(body, { status, headers: { 'Content-Type': 'application/json' } });
+}
+
 describe('CloudflareRestClient', () => {
   it('accepts nullable diagnostics in successful API envelopes', async () => {
     const client = new CloudflareRestClient(
@@ -72,5 +76,33 @@ describe('CloudflareRestClient', () => {
         codes: [10000],
       });
     }
+  });
+});
+
+describe('CloudflareRestClient responses without an envelope', () => {
+  it('treats an empty 2xx body as success on a delete', async () => {
+    // Workers custom-domain delete answers a successful call without the usual envelope.
+    const client = new CloudflareRestClient('account-1', 'token', rawFetcher(null, 200));
+    await expect(client.deleteWorkerDomain('domain-1')).resolves.toBeUndefined();
+  });
+
+  it('treats a bare null 2xx body as success on a delete', async () => {
+    const client = new CloudflareRestClient('account-1', 'token', rawFetcher('null', 200));
+    await expect(client.deleteWorkerDomain('domain-1')).resolves.toBeUndefined();
+  });
+
+  it('still rejects a non-envelope body on a failed request', async () => {
+    const client = new CloudflareRestClient('account-1', 'token', rawFetcher('{"unexpected":true}', 500));
+    await expect(client.deleteWorkerDomain('domain-1')).rejects.toThrow(/malformed response/);
+  });
+
+  it('still rejects an unparseable body', async () => {
+    const client = new CloudflareRestClient('account-1', 'token', rawFetcher('<html>', 200));
+    await expect(client.deleteWorkerDomain('domain-1')).rejects.toThrow(/malformed response/);
+  });
+
+  it('still rejects a non-envelope object on a successful status', async () => {
+    const client = new CloudflareRestClient('account-1', 'token', rawFetcher('{"unexpected":true}', 200));
+    await expect(client.deleteWorkerDomain('domain-1')).rejects.toThrow(/malformed response/);
   });
 });

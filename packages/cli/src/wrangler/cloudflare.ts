@@ -70,7 +70,11 @@ interface CloudflareEnvelope {
   };
 }
 
-const isCloudflareEnvelope = typia.createIs<CloudflareEnvelope>();
+const parseCloudflareEnvelope = typia.json.createIsParse<CloudflareEnvelope>();
+/** A body with nothing to read: empty, or the bare `null` some endpoints answer with. */
+const EMPTY_BODY = /^\s*(?:null)?\s*$/;
+/** What a 2xx without an envelope means; one shared value, never allocated per response. */
+const EMPTY_SUCCESS: CloudflareEnvelope = Object.freeze({ success: true });
 const isKvNamespaces = typia.createIs<LiveKvNamespace[]>();
 const isR2Buckets = typia.createIs<R2Bucket[]>();
 const isWorkerScripts = typia.createIs<WorkerScript[]>();
@@ -270,8 +274,19 @@ export class CloudflareRestClient implements CloudflareClient {
         ...init.headers,
       },
     });
-    const body: unknown = await response.json();
-    if (!isCloudflareEnvelope(body)) {
+    const text = await response.text();
+    // A few mutation endpoints (Workers custom-domain delete among them) answer a successful
+    // call with no envelope at all: an empty body or a bare null. On a 2xx that carries
+    // nothing to read, the call succeeded.
+    if (response.ok && EMPTY_BODY.test(text)) return EMPTY_SUCCESS;
+    let body: CloudflareEnvelope | null;
+    try {
+      body = parseCloudflareEnvelope(text);
+    } catch {
+      // Not JSON at all; the same failure as JSON of the wrong shape.
+      body = null;
+    }
+    if (!body) {
       throw new CloudflareApiError(`Cloudflare returned a malformed response for ${path}.`, response.status, []);
     }
     if (!response.ok || !body.success) {
