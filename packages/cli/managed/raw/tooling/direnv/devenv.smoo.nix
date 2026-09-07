@@ -244,6 +244,9 @@
     #    -index-store-path); bun/node native addons find compilers through
     #    node-gyp. CC/CXX are what xcodebuild reads, which is why they go rather
     #    than being pointed somewhere else.
+    # Nx's fallback includes HOME or TMPDIR, either of which can exceed the
+    # Unix socket limit in a checkout. Reuse devenv's short runtime directory,
+    # while preserving an explicit directory supplied by Cowshed or the caller.
     (lib.mkBefore ''
       cd "$DEVENV_ROOT/../.."
       export PATH="$("$PWD/tooling/direnv/repo-path")"
@@ -261,6 +264,8 @@
       export GOFLAGS="''${GOFLAGS:--trimpath}"
       unset GOROOT
       bun "$DEVENV_ROOT/setup-environment.ts" || exit $?
+      export NX_SOCKET_DIR="''${NX_SOCKET_DIR:-$DEVENV_RUNTIME/nx}"
+      mkdir -p "$NX_SOCKET_DIR"
       ${lib.optionalString pkgs.stdenv.isDarwin "unset CC CXX"}
     '')
     # Epilogue: the wrapper runs devenv from tooling/direnv, so return the shell
