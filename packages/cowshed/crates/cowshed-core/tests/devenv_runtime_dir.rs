@@ -259,6 +259,96 @@ server.listen(path, () => {
     std::fs::remove_dir_all(root).expect("remove test workspace");
 }
 
+#[tokio::test]
+async fn proxy_aware_client_reaches_an_allocated_loopback_service() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let root = scratch("loopback-http");
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("local HTTP listener");
+    let port = listener.local_addr().expect("listener address").port();
+    let sandbox = workspace(&root, port.checked_sub(15).expect("ephemeral port"));
+    let origin = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.expect("local HTTP connection");
+        let mut request = [0u8; 1024];
+        let mut used = 0;
+        while !request[..used].ends_with(b"\r\n\r\n") {
+            assert!(used < request.len(), "request exceeds fixture bound");
+            let received = socket.read(&mut request[used..]).await.expect("request");
+            assert_ne!(received, 0, "request closed before complete headers");
+            used += received;
+        }
+        assert!(request[..used].starts_with(b"GET /local "));
+        socket
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 15\r\n\r\nworkspace-local")
+            .await
+            .expect("local response");
+    });
+    let (exit, stdout, stderr) = run_in_sandbox(
+        &sandbox,
+        &sandbox.workspace_mount,
+        vec![
+            "/usr/bin/curl".into(),
+            "--fail".into(),
+            "--silent".into(),
+            "--show-error".into(),
+            "--max-time".into(),
+            "3".into(),
+            format!("http://127.0.0.1:{port}/local").into(),
+        ],
+    )
+    .await;
+    origin.abort();
+    let served = origin.await;
+    assert_eq!(
+        exit,
+        ExitStatus::Exited { code: 0 },
+        "allocated loopback HTTP failed: {}",
+        String::from_utf8_lossy(&stderr)
+    );
+    served.expect("local service handled the request");
+    assert_eq!(stdout, b"workspace-local");
+    std::fs::remove_dir_all(root).expect("remove test workspace");
+}
+
+#[tokio::test]
+async fn proxy_bypass_does_not_admit_unallocated_loopback_ports() {
+    let root = scratch("loopback-denial");
+    let listener =
+        std::net::TcpListener::bind(("127.0.0.1", 0)).expect("unallocated HTTP listener");
+    listener
+        .set_nonblocking(true)
+        .expect("nonblocking listener");
+    let port = listener.local_addr().expect("listener address").port();
+    let base = if (40_000..40_016).contains(&port) {
+        41_000
+    } else {
+        40_000
+    };
+    let sandbox = workspace(&root, base);
+    let (exit, _, _) = run_in_sandbox(
+        &sandbox,
+        &sandbox.workspace_mount,
+        vec![
+            "/usr/bin/curl".into(),
+            "--fail".into(),
+            "--silent".into(),
+            "--show-error".into(),
+            "--max-time".into(),
+            "3".into(),
+            format!("http://127.0.0.1:{port}/forbidden").into(),
+        ],
+    )
+    .await;
+    assert_ne!(exit, ExitStatus::Exited { code: 0 });
+    assert!(
+        matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+        "the sandbox admitted an unallocated loopback connection"
+    );
+    std::fs::remove_dir_all(root).expect("remove test workspace");
+}
+
 fn spawn_request(sandbox: &SandboxConfig, cwd: &Path, argv: Vec<OsString>) -> ProcessSpawnRequest {
     ProcessSpawnRequest {
         authority: WorkspaceAuthoritySnapshot {
