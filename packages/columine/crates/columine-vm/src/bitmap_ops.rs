@@ -834,27 +834,23 @@ pub fn set_algebra(
     // capacity, so the copy is bounded by the image the view parsed: the
     // scratch result is a native image, not a padded region.
     match (left_view, right_view) {
-        (None, None) => return ErrorCode::Ok,
-        (None, Some(r)) => {
-            return match op {
-                BitmapAlgebraOp::And | BitmapAlgebraOp::AndNot => ErrorCode::Ok,
-                BitmapAlgebraOp::Or | BitmapAlgebraOp::Xor => {
-                    env.algebra_result
-                        .extend_from_slice(&right[..r.serialized_len()]);
-                    ErrorCode::Ok
-                }
-            };
-        }
-        (Some(l), None) => {
-            return match op {
-                BitmapAlgebraOp::And => ErrorCode::Ok,
-                BitmapAlgebraOp::Or | BitmapAlgebraOp::AndNot | BitmapAlgebraOp::Xor => {
-                    env.algebra_result
-                        .extend_from_slice(&left[..l.serialized_len()]);
-                    ErrorCode::Ok
-                }
-            };
-        }
+        (None, None) => ErrorCode::Ok,
+        (None, Some(r)) => match op {
+            BitmapAlgebraOp::And | BitmapAlgebraOp::AndNot => ErrorCode::Ok,
+            BitmapAlgebraOp::Or | BitmapAlgebraOp::Xor => {
+                env.algebra_result
+                    .extend_from_slice(&right[..r.serialized_len()]);
+                ErrorCode::Ok
+            }
+        },
+        (Some(l), None) => match op {
+            BitmapAlgebraOp::And => ErrorCode::Ok,
+            BitmapAlgebraOp::Or | BitmapAlgebraOp::AndNot | BitmapAlgebraOp::Xor => {
+                env.algebra_result
+                    .extend_from_slice(&left[..l.serialized_len()]);
+                ErrorCode::Ok
+            }
+        },
         (Some(l), Some(r)) => {
             let result = match op {
                 BitmapAlgebraOp::And => {
