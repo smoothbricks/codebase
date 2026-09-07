@@ -167,4 +167,37 @@ describe('withPublishManifest', () => {
       rmSync(dir, { recursive: true, force: true });
     }
   });
+
+  test('writes the resolved registry literal for pack and restores the workspace bytes', async () => {
+    const plain = `${JSON.stringify({ name: '@priv.test/demo', version: '0.0.1', exports: { '.': './dist/index.js' } }, null, 2)}\n`;
+    const dir = tempPackageDir(plain);
+    try {
+      const seen = await withPublishManifest(dir, async () => readFileSync(join(dir, 'package.json'), 'utf8'), {
+        publishConfigRegistry: 'https://forgejo.example.test/api/packages/priv-owner/npm/',
+      });
+      expect(seen).toContain('"registry": "https://forgejo.example.test/api/packages/priv-owner/npm/"');
+      expect(readFileSync(join(dir, 'package.json'), 'utf8')).toBe(plain);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('restores the original manifest when packing with a registry literal throws', async () => {
+    const plain = `${JSON.stringify({ name: '@priv.test/demo', version: '0.0.1', exports: { '.': './dist/index.js' } }, null, 2)}\n`;
+    const dir = tempPackageDir(plain);
+    try {
+      await expect(
+        withPublishManifest(
+          dir,
+          async () => {
+            throw new Error('pack failed');
+          },
+          { publishConfigRegistry: 'https://forgejo.example.test/api/packages/priv-owner/npm/' },
+        ),
+      ).rejects.toThrow('pack failed');
+      expect(readFileSync(join(dir, 'package.json'), 'utf8')).toBe(plain);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });

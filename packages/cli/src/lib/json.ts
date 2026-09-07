@@ -64,6 +64,7 @@ export interface PackageJson {
   private?: boolean;
   license?: string;
   types?: string;
+  typings?: string;
   packageManager?: string;
   files?: string[];
   bin?: string | StringMap;

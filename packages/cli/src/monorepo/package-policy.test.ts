@@ -11,8 +11,8 @@ import {
 
 const TIMEOUT_FLAG = `--timeout=${BOUNDED_TEST_PER_TEST_TIMEOUT_MS}`;
 
+import { listPublicPackages, listPublishablePackages } from '../lib/workspace.js';
 import { validateCommitMessage } from './commit-msg.js';
-
 import {
   applyFixableMonorepoDefaults,
   applyNxPluginDefaults,
@@ -22,6 +22,7 @@ import {
   validateNoStaleTestOutput,
   validateNxProjectNames,
   validateNxReleaseConfig,
+  validatePublicTags,
   validateRootPackagePolicy,
   validateTestFileLocations,
   validateWorkspaceDependencies,
@@ -277,6 +278,67 @@ describe('stale test output policy', () => {
       expect(validateNoStaleTestOutput(root)).toBe(1);
       expect(errors.join('\n')).toContain('packages/app/dist-test');
       expect(errors.join('\n')).toContain('rm -rf packages/app/dist-test');
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('publishable npm tag policy', () => {
+  afterEach(() => {
+    console.error = originalConsoleError;
+  });
+
+  it('accepts one publishable tag per public package and selects both classes for release', async () => {
+    const root = await createWorkspace({
+      rootName: '@smoothbricks/codebase',
+      packages: [
+        { dir: 'cli', name: '@smoothbricks/cli', nx: { tags: ['npm:public'] } },
+        { dir: 'agent', name: '@smoothbricks/agent', nx: { tags: ['npm:private'] } },
+        { dir: 'tool', name: '@smoothbricks/tool' },
+      ],
+    });
+    try {
+      expect(validatePublicTags(root)).toBe(0);
+      expect(
+        listPublishablePackages(root)
+          .map((pkg) => pkg.name)
+          .sort(),
+      ).toEqual(['@smoothbricks/agent', '@smoothbricks/cli']);
+      expect(listPublicPackages(root).map((pkg) => pkg.name)).toEqual(['@smoothbricks/cli']);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects both publishable tags on one package', async () => {
+    const root = await createWorkspace({
+      rootName: '@smoothbricks/codebase',
+      packages: [{ dir: 'cli', name: '@smoothbricks/cli', nx: { tags: ['npm:public', 'npm:private'] } }],
+    });
+    try {
+      const errors = captureConsoleErrors();
+      expect(validatePublicTags(root)).toBe(1);
+      expect(errors.join('\n')).toContain('both nx tags npm:public and npm:private');
+      expect(listPublishablePackages(root)).toEqual([]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects private:true packages carrying either publishable tag', async () => {
+    const root = await createWorkspace({
+      rootName: '@smoothbricks/codebase',
+      packages: [
+        { dir: 'quiet', name: '@smoothbricks/quiet', private: true, nx: { tags: ['npm:private'] } },
+        { dir: 'loud', name: '@smoothbricks/loud', private: true, nx: { tags: ['npm:public'] } },
+      ],
+    });
+    try {
+      const errors = captureConsoleErrors();
+      expect(validatePublicTags(root)).toBe(2);
+      expect(errors.join('\n')).toContain('private:true means never publish');
+      expect(listPublishablePackages(root)).toEqual([]);
     } finally {
       await rm(root, { recursive: true, force: true });
     }

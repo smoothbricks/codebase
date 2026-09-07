@@ -104,11 +104,16 @@ export function prunePublishedExports(pkg: PackageJson): { manifest: PackageJson
  * rewrite-around-pack pattern syncBunLockfileVersions uses for bun.lock.
  * A manifest transform (rather than a bun feature) because `bun pm pack`
  * offers no publish-time manifest hook.
+ *
+ * When `publishConfigRegistry` is set (private user-run release path), the
+ * resolved literal registry is written into the packed publishConfig and the
+ * workspace bytes are restored afterwards. Only a resolved literal is ever
+ * written here, never an environment placeholder.
  */
 export async function withPublishManifest<T>(
   packageDir: string,
   fn: () => Promise<T>,
-  options: { log?: boolean } = {},
+  options: { log?: boolean; publishConfigRegistry?: string } = {},
 ): Promise<T> {
   const manifestPath = join(packageDir, 'package.json');
   const originalText = readFileSync(manifestPath, 'utf8');
@@ -118,11 +123,20 @@ export async function withPublishManifest<T>(
     return fn();
   }
   const { manifest, pruned } = prunePublishedExports(parsed);
-  if (pruned.length === 0) {
+  if (options.publishConfigRegistry) {
+    manifest.publishConfig = { ...(manifest.publishConfig ?? {}), registry: options.publishConfigRegistry };
+  }
+  const registryChanged = options.publishConfigRegistry !== undefined;
+  if (pruned.length === 0 && !registryChanged) {
     return fn();
   }
   if (options.log) {
-    console.log(`${manifest.name}: pruning TypeScript-source export entries for pack: ${pruned.join(', ')}`);
+    if (pruned.length > 0) {
+      console.log(`${manifest.name}: pruning TypeScript-source export entries for pack: ${pruned.join(', ')}`);
+    }
+    if (registryChanged) {
+      console.log(`${manifest.name}: setting publishConfig.registry for pack`);
+    }
   }
   writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
   try {
