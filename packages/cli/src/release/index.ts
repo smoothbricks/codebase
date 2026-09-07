@@ -1403,11 +1403,17 @@ async function createGithubRelease(root: string, pkg: ReleasePackage, dryRun: bo
       );
     }
   } else {
-    const release = JSON.parse(lookupBody) as { id?: unknown };
-    if (typeof release.id !== 'number' || !Number.isSafeInteger(release.id)) {
+    let release: unknown;
+    try {
+      release = JSON.parse(lookupBody);
+    } catch {
+      throw new Error(`Unable to inspect source release ${currentTag}: response was not valid JSON.`);
+    }
+    const releaseId = release && typeof release === 'object' && 'id' in release ? release.id : undefined;
+    if (typeof releaseId !== 'number' || !Number.isSafeInteger(releaseId)) {
       throw new Error(`Unable to inspect source release ${currentTag}: response did not contain a valid release id.`);
     }
-    const response = await fetch(forgejoApiUrl(source, `/releases/${release.id}`), {
+    const response = await fetch(forgejoApiUrl(source, `/releases/${releaseId}`), {
       method: 'PATCH',
       headers: forgejoAuthHeaders(token),
       body: JSON.stringify({
