@@ -2,6 +2,7 @@ import { describe, expect, it } from 'bun:test';
 import { createHash } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { mkdir, readdir, readFile, writeFile } from 'node:fs/promises';
+import { isAbsolute, join } from 'node:path';
 import { ensureNx, ensureNxTargets, readJsonObject, writeJsonObject } from '../../lib/json.js';
 import {
   listPublicPackages,
