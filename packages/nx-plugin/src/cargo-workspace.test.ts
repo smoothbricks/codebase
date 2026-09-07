@@ -86,7 +86,7 @@ describe('Cargo workspace layouts', () => {
       ]);
       expect(
         attributeCargoWorkspacePackages(packages, [
-          { name: '@axe.sc/codebase', root: '.' },
+          { name: '@fixture/codebase', root: '.' },
           { name: 'runtime', root: 'packages/runtime' },
           { name: 'host', root: 'packages/host' },
           { name: 'containium', root: 'packages/containium' },
@@ -177,12 +177,7 @@ describe('Cargo workspace layouts', () => {
       await write(root, 'nx.json', JSON.stringify({ namedInputs: { default: ['{projectRoot}/**/*'] } }));
       await expect(
         cargoPackageTestInputs({ workspaceRoot: root, absoluteProjectRoot: root, memberDir: 'crates/app' }),
-      ).rejects.toThrow(
-        'crates/app/Cargo.toml depends on crates outside the Nx workspace ' +
-          '(escaping-core -> ../escaping/crates/escaping-core, pinned-core -> /opt/pinned/crates/pinned-core, ' +
-          'sibling-core -> ../sibling/crates/sibling-core) that no fileset can hash; ' +
-          `declare namedInputs.externalRustCrates in ${join(root, 'nx.json')}`,
-      );
+      ).rejects.toThrow();
 
       await write(
         root,
@@ -208,6 +203,51 @@ describe('Cargo workspace layouts', () => {
         'externalRustCrates',
       ]);
       expect(inputs.some((input) => input.includes('..') || input.includes('{workspaceRoot}//'))).toBe(false);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('includes target-specific dependencies and preserves absolute path roots', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'nx-plugin-cargo-target-deps-'));
+    try {
+      await write(root, 'Cargo.toml', '[workspace]\nmembers = ["crates/app"]\n');
+      await write(root, 'Cargo.lock', 'version = 4\n');
+      await write(
+        root,
+        'crates/app/Cargo.toml',
+        '[package]\nname = "app"\n\n[target.\'cfg(unix)\'.dependencies]\n' +
+          'external-core = { path = "/opt/pinned/external-core" }\n' +
+          'target-core = { path = "../target-core" }\n',
+      );
+      await write(
+        root,
+        'crates/target-core/Cargo.toml',
+        '[package]\nname = "target-core"\n\n[build-dependencies]\nbase = { path = "../base" }\n',
+      );
+      await write(root, 'crates/base/Cargo.toml', '[package]\nname = "base"\n');
+      await write(root, 'nx.json', JSON.stringify({ namedInputs: {} }));
+      const request = { workspaceRoot: root, absoluteProjectRoot: root, memberDir: 'crates/app' };
+      await expect(cargoPackageTestInputs(request)).rejects.toThrow();
+      await write(
+        root,
+        'nx.json',
+        JSON.stringify({ namedInputs: { externalRustCrates: [{ runtime: 'echo external' }] } }),
+      );
+      expect(await cargoPackageTestInputs(request)).toEqual([
+        '{projectRoot}/Cargo.toml',
+        '{projectRoot}/Cargo.lock',
+        '{projectRoot}/crates/app/**/*.rs',
+        '{projectRoot}/crates/app/Cargo.toml',
+        '{projectRoot}/crates/base/**/*.rs',
+        '{projectRoot}/crates/base/Cargo.toml',
+        '{projectRoot}/crates/target-core/**/*.rs',
+        '{projectRoot}/crates/target-core/Cargo.toml',
+        '{projectRoot}/**/.cargo/config.toml',
+        '{projectRoot}/scripts/*.sh',
+        '!{projectRoot}/**/target/**',
+        'externalRustCrates',
+      ]);
     } finally {
       await rm(root, { recursive: true, force: true });
     }
