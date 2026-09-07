@@ -10,7 +10,7 @@ repository.workspace = true
 path = "src/lib.rs"
 
 [dependencies]
-axroar = { workspace = true }
+bitmosaic = { workspace = true }
 columine-types = { workspace = true }
 
 [dev-dependencies]
