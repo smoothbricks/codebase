@@ -107,7 +107,7 @@ jobs:
 ${renderRunsOnLine(options.runsOn)}
     timeout-minutes: 45
 ${
-  options.privateNpm
+  options.privateNpm?.readTokenEnv
     ? `    # Fork PRs receive no secrets; a private-registry install cannot run there.
     if: \${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
 `

@@ -420,7 +420,7 @@ describe('publish workflow definition', () => {
     expect(rendered).not.toContain('PRIV_NPM_REGISTRY');
     expect(rendered).not.toContain('vars.PRIV_NPM_REGISTRY');
     // Job env is six spaces; a publisher token there would leak into setup/build.
-    expect(rendered).not.toContain('      PRIV_NPM_PUBLISH_TOKEN:');
+    expect(rendered).not.toMatch(/^ {6}PRIV_NPM_PUBLISH_TOKEN:/m);
     expect(rendered).toContain('          PRIV_NPM_PUBLISH_TOKEN: ${{ secrets.PRIV_NPM_PUBLISH_TOKEN }}');
 
     const setupAt = rendered.indexOf('- name: 🧱 Setup Nix/devenv');
@@ -438,6 +438,20 @@ describe('publish workflow definition', () => {
     expect(rendered.slice(publishAt)).toContain('PRIV_NPM_PUBLISH_TOKEN');
     expect(rendered).not.toContain('NODE_AUTH_TOKEN');
     expect(rendered).not.toContain('secrets.NPM_TOKEN');
+  });
+
+  it('does not wire a publish token when the repo only consumes the private scope', () => {
+    const rendered = renderPublishWorkflowYaml({
+      repoName: '@example/app',
+      privateNpm: {
+        scope: '@priv.test',
+        readTokenEnv: 'PRIV_NPM_READ_TOKEN',
+      },
+    });
+
+    expect(rendered).toContain('PRIV_NPM_READ_TOKEN: ${{ secrets.PRIV_NPM_READ_TOKEN }}');
+    expect(rendered).not.toContain('PRIV_NPM_PUBLISH_TOKEN');
+    expect(rendered).not.toContain('          PRIV_NPM_PUBLISH_TOKEN:');
   });
 
   it('omits production deploy controls when no production deploy target exists', () => {
@@ -461,7 +475,7 @@ describe('publish workflow definition', () => {
   });
 
   it('renders a deploy-only workflow for repos that deploy but own no release packages', () => {
-    const rendered = renderPublishWorkflowYaml({ deploy: true, release: false, repoName: '@conloca/private' });
+    const rendered = renderPublishWorkflowYaml({ deploy: true, release: false, repoName: '@example/app' });
 
     // The deploy must not wait on a release that can never happen here.
     expect(rendered).toContain('- name: 🚀 Deploy production');
