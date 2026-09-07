@@ -1,23 +1,24 @@
-//! The BITMAP slot: an AXR1 string (the `axroar` canonical bitmap) patched
-//! where it lies, read through a zero-copy view.
+//! The BITMAP slot: a native bitmosaic image patched where it lies, read
+//! through a zero-copy view.
 //!
 //! # Slot layout
 //!
-//! `[serialized_len: u32][reserved: u32 = 0][payload: bitmap_payload_capacity bytes]`
+//! `[image: bitmap_payload_capacity bytes]` — the self-delimited native u32
+//! image directly, with no length word and no fixed headroom. The empty set
+//! is the four-byte empty image; a non-empty set occupies the first
+//! `serialized_len` bytes as the forest root of the set, and every payload
+//! byte past the image is zero. Together those make the slot image a pure
+//! function of the set: byte-equal, whatever the history, to a fresh
+//! `Bitmosaic::write_forest_into_slice` of the same members (the forest is
+//! the mutable root — `bitmosaic::patch` keeps the root arm, and a forest
+//! patch touches only the chunks a batch names).
 //!
-//! Slot data offsets are 8-aligned, so the 8-byte header keeps the payload
-//! on the 8-byte boundary axroar's word kernels take their fast path on.
-//! `serialized_len == 0` is the empty set and its only form; a non-empty set
-//! occupies the first `serialized_len` payload bytes as the FOREST root of
-//! the set, and every payload byte past the string is zero. Together those
-//! make the slot image a pure function of the set: byte-equal, whatever the
-//! history, to a fresh `Axroar::write_forest_into_slice` of the same members
-//! (the forest is the mutable root — `axroar::patch` keeps the root arm, and
-//! a forest patch touches only the chunks a batch names).
+//! Slot data offsets stay 8-aligned from the state layout, and every reader
+//! uses byte access, so no alignment padding lives inside the image.
 //!
 //! # Mutation
 //!
-//! Every write is one `axroar::patch_witnessed` over the payload: the batch
+//! Every write is one `bitmosaic::patch_witnessed` over the image: the batch
 //! is sorted and deduplicated into VM-owned buffers, the patch re-ladders
 //! only the touched chunks and reports per value which adds were new and
 //! which removes were held — the bit the edit overwrote, so the undo
@@ -31,70 +32,74 @@
 //! # Reads
 //!
 //! Membership, cardinality, rank/select, iteration and intersection open an
-//! `AxroarView` over the slot bytes (or over caller-supplied bytes for the
+//! `BitmosaicView` over the slot bytes (or over caller-supplied bytes for the
 //! decision-side `*_serialized` queries) and answer from the string; no read
-//! materialises the set.
-use crate::bytes;
 use crate::hooks::{MutationRecord, VmHooks};
 use crate::meta::SlotMetaView;
-use axroar::{
-    AndNotRange, AndRange, Axroar, AxroarView, BatchOutcome, OrRange, PatchError, PatchReport,
-    PatchScratch, Range, XorRange, patch_witnessed,
+use bitmosaic::{
+    AndNotRange, AndRange, BatchOutcome, Bitmosaic, BitmosaicView, IMAGE_ID_LEN, KeyWidth, OrRange,
+    PatchError, PatchReport, PatchScratch, Range, XorRange, image_header, patch_witnessed,
 };
-use columine_types::types::{
-    BITMAP_BASE_BYTES, BITMAP_BYTES_PER_CAPACITY, BITMAP_SERIALIZED_LEN_BYTES, ChangeFlag,
-    EMPTY_KEY, ErrorCode, TOMBSTONE,
-};
+use columine_types::{BITMAP_BYTES_PER_CAPACITY, ChangeFlag, EMPTY_KEY, ErrorCode, TOMBSTONE};
 
 /// Canonical payload-capacity formula used by allocation, grow-copy, and
-/// readers. Keeping one formula prevents those paths from disagreeing.
+/// readers. Keeping one formula prevents those paths from disagreeing: four
+/// bytes per element of slot capacity plus the image identifier, so even a
+/// zero-capacity slot fits the four-byte empty image.
 pub const fn bitmap_payload_capacity(slot_capacity: u32) -> u32 {
-    slot_capacity * BITMAP_BYTES_PER_CAPACITY + BITMAP_BASE_BYTES
+    slot_capacity * BITMAP_BYTES_PER_CAPACITY + IMAGE_ID_LEN as u32
 }
-
 /// Bitmap storage view carrying offsets into the state buffer rather than
 /// references into it.
 #[derive(Clone, Copy, Debug)]
 pub struct BitmapStorage {
-    /// Offset of the `serialized_len: u32` field (== the slot data offset).
+    /// Offset of the native image (== the slot data offset: the image sits
+    /// directly, with no length word).
     pub data_offset: u32,
     pub payload_capacity: u32,
 }
 
 impl BitmapStorage {
     pub fn payload_offset(&self) -> u32 {
-        self.data_offset + BITMAP_SERIALIZED_LEN_BYTES
+        self.data_offset
     }
 
-    pub fn serialized_len(&self, state: &[u8]) -> u32 {
-        bytes::read_u32(state, self.data_offset)
-    }
-
-    pub fn set_serialized_len(&self, state: &mut [u8], len: u32) {
-        bytes::write_u32(state, self.data_offset, len);
-    }
-
-    /// The AXR1 string, or `None` when the set is empty or the length field
-    /// is outside the payload.
-    pub fn serialized_data<'a>(&self, state: &'a [u8]) -> Option<&'a [u8]> {
-        let len = self.serialized_len(state);
-        if len == 0 || len > self.payload_capacity {
-            return None;
+    /// The image's self-delimited length: the header is parsed over exactly
+    /// the capacity-sized region, so a width mismatch or an extent the slot
+    /// does not hold is `InvalidState`, never a slice.
+    pub fn serialized_len(&self, state: &[u8]) -> Result<u32, ErrorCode> {
+        let start = self.data_offset as usize;
+        let capacity = self.payload_capacity as usize;
+        let region = state
+            .get(start..start.checked_add(capacity).ok_or(ErrorCode::InvalidState)?)
+            .ok_or(ErrorCode::InvalidState)?;
+        let header = image_header(region).ok_or(ErrorCode::InvalidState)?;
+        if header.width != KeyWidth::U32 {
+            return Err(ErrorCode::InvalidState);
         }
-        let start = self.payload_offset() as usize;
-        Some(&state[start..start + len as usize])
+        u32::try_from(header.encoded_len).map_err(|_| ErrorCode::InvalidState)
     }
 
-    /// The slot's set as a zero-copy view. `Ok(None)` is the empty set;
-    /// `Err` a length field or string the payload does not hold.
-    pub fn view<'a>(&self, state: &'a [u8]) -> Result<Option<AxroarView<'a>>, ErrorCode> {
-        if self.serialized_len(state) == 0 {
+    /// The native image bytes, or `Err` when no width-checked image of a
+    /// fitting extent starts at the slot offset. The empty set is the
+    /// four-byte empty image, not an absent slice.
+    pub fn serialized_data<'a>(&self, state: &'a [u8]) -> Result<&'a [u8], ErrorCode> {
+        let len = self.serialized_len(state)? as usize;
+        let start = self.data_offset as usize;
+        state.get(start..start + len).ok_or(ErrorCode::InvalidState)
+    }
+
+    /// The slot's set as a zero-copy view. `Ok(None)` is the empty set,
+    /// admitted from the empty header in constant work without walking a
+    /// body; `Err` an image the payload does not hold.
+    pub fn view<'a>(&self, state: &'a [u8]) -> Result<Option<BitmosaicView<'a>>, ErrorCode> {
+        let data = self.serialized_data(state)?;
+        if data.len() == IMAGE_ID_LEN {
             return Ok(None);
         }
-        match self.serialized_data(state).and_then(AxroarView::open) {
-            Some(view) => Ok(Some(view)),
-            None => Err(ErrorCode::InvalidState),
-        }
+        BitmosaicView::open(data)
+            .map(Some)
+            .ok_or(ErrorCode::InvalidState)
     }
 }
 
@@ -131,9 +136,6 @@ pub struct BitmapEnv {
     removes_held: Vec<u64>,
     algebra_result: Vec<u8>,
     pending_mutations: Vec<PendingBitmapMutation>,
-    /// The forest string of the empty set: what a `serialized_len == 0` slot
-    /// is seeded with so a patch has a string to edit.
-    empty_forest: Vec<u8>,
 }
 
 impl Default for BitmapEnv {
@@ -148,7 +150,6 @@ impl Default for BitmapEnv {
             removes_held: Vec::new(),
             algebra_result: Vec::new(),
             pending_mutations: Vec::new(),
-            empty_forest: Axroar::from_sorted(core::iter::empty()).to_forest_bytes(),
         }
     }
 }
@@ -245,11 +246,14 @@ fn commit_bitmap_mutations(
     ErrorCode::Ok
 }
 
-/// Patch the slot's string in place: the set becomes `(old ∪ adds) \ removes`.
-/// `adds` and `removes` are strictly ascending. On success the length field
-/// and the zero tail are maintained, and `env.add_was_new(i)` /
-/// `env.remove_was_held(i)` answer per value what the patch found; a
-/// refusal leaves the slot exactly as it was and `env.last_error` names why.
+/// Patch the slot's image in place: the set becomes `(old ∪ adds) \ removes`.
+/// `adds` and `removes` are strictly ascending. The slot already holds a
+/// valid image — initialization and empty-result emission provide one — so
+/// the patch runs directly with no seed copy and no separate length write:
+/// framing is rewritten by the patch itself. On success only the stale tail
+/// is cleared, and `env.add_was_new(i)` / `env.remove_was_held(i)` answer
+/// per value what the patch found; a refusal leaves the slot exactly as it
+/// was and `env.last_error` names why.
 pub fn bitmap_patch(
     env: &mut BitmapEnv,
     state: &mut [u8],
@@ -257,51 +261,36 @@ pub fn bitmap_patch(
     adds: &[u32],
     removes: &[u32],
 ) -> Result<PatchReport, ErrorCode> {
-    let old_len = storage.serialized_len(state) as usize;
+    let old_len = match storage.serialized_len(state) {
+        Ok(len) => len as usize,
+        Err(_) => {
+            env.last_error = 102;
+            return Err(ErrorCode::InvalidState);
+        }
+    };
     let capacity = storage.payload_capacity as usize;
-    if old_len > capacity {
-        env.last_error = 102;
-        return Err(ErrorCode::InvalidState);
-    }
     let payload = storage.payload_offset() as usize;
     let slot = &mut state[payload..payload + capacity];
-    let seed = env.empty_forest.len();
-    if old_len == 0 {
-        // The empty set has no string; seed one so the patch has a string
-        // to edit. A refusal below zeroes the seed back out.
-        slot[..seed].copy_from_slice(&env.empty_forest);
-    }
     env.adds_new.resize(adds.len().div_ceil(64), 0);
     env.removes_held.resize(removes.len().div_ceil(64), 0);
     let mut outcome = BatchOutcome::new(&mut env.adds_new, &mut env.removes_held);
     match patch_witnessed(slot, adds, removes, &mut env.scratch, &mut outcome) {
         Ok(report) => {
-            let new_len = if report.len == 0 {
-                0
-            } else {
-                report.serialized_len
-            };
-            // Every payload byte past the string is zero, so the image is a
-            // function of the set alone: clear whatever the old string (or
-            // the seed) occupied beyond the new one.
-            let stale_end = old_len.max(seed).max(report.serialized_len);
-            if new_len < stale_end {
-                slot[new_len..stale_end].fill(0);
+            // Every payload byte past the image is zero, so the image is a
+            // function of the set alone: clear whatever the old image
+            // occupied beyond the new one. A zero-member result already
+            // emits the four-byte empty image, so no separate empty path.
+            let new_len = report.serialized_len;
+            if new_len < old_len {
+                slot[new_len..old_len].fill(0);
             }
-            storage.set_serialized_len(state, new_len as u32);
             Ok(report)
         }
         Err(PatchError::Capacity { .. }) => {
-            if old_len == 0 {
-                slot[..seed].fill(0);
-            }
             env.last_error = 60;
             Err(ErrorCode::CapacityExceeded)
         }
         Err(PatchError::Malformed) => {
-            if old_len == 0 {
-                slot[..seed].fill(0);
-            }
             env.last_error = 102;
             Err(ErrorCode::InvalidState)
         }
@@ -313,7 +302,8 @@ pub fn bitmap_patch(
 
 /// Select the element at `rank` in ascending order.
 pub fn bitmap_select(state: &[u8], storage: BitmapStorage, rank: u32) -> Option<u32> {
-    let view = AxroarView::open(storage.serialized_data(state)?)?;
+    let data = storage.serialized_data(state).ok()?;
+    let view = BitmosaicView::open(data)?;
     view.select(u64::from(rank))
 }
 
@@ -595,7 +585,16 @@ pub fn batch_bitmap_algebra(
     let original_size = target_meta.size(state);
 
     let source_data: Option<&[u8]> = match source {
-        BitmapSource::Slot(storage) => storage.serialized_data(state),
+        // A slot operand the reader cannot parse is a corrupt state, not an
+        // empty set: reading it as empty would let AND silently clear the
+        // target.
+        BitmapSource::Slot(storage) => match storage.serialized_data(state) {
+            Ok(data) => Some(data),
+            Err(code) => {
+                env.last_error = 80;
+                return code;
+            }
+        },
         BitmapSource::Scratch => {
             (!env.algebra_result.is_empty()).then_some(&env.algebra_result[..])
         }
@@ -603,7 +602,7 @@ pub fn batch_bitmap_algebra(
     };
     let source_view = match source_data {
         None => None,
-        Some(data) => match AxroarView::open(data) {
+        Some(data) => match BitmosaicView::open(data) {
             Some(view) => Some(view),
             None => {
                 env.last_error = 80;
@@ -682,10 +681,12 @@ pub fn batch_bitmap_algebra(
     ErrorCode::Ok
 }
 
-/// Replace the slot's set with `input`, an AXR1 string that crossed a trust
-/// boundary: it is verified in full, its cardinality checked against the
-/// slot's element capacity, and a sealed Elias-Fano root is re-encoded as
-/// the forest the slot keeps. Zero bytes are the empty set.
+/// Replace the slot's set with `input`, a native u32 image that crossed a
+/// trust boundary: it is verified in full, its width checked, its
+/// cardinality checked against the slot's element capacity, and a sealed
+/// Elias-Fano root is re-encoded as the forest the slot keeps. The canonical
+/// empty image is the empty set; zero-length bytes are no native encoding
+/// and are refused.
 pub fn bitmap_import(
     env: &mut BitmapEnv,
     state: &mut [u8],
@@ -695,19 +696,21 @@ pub fn bitmap_import(
     let storage = get_bitmap_storage(meta);
     let payload = storage.payload_offset() as usize;
     let capacity = storage.payload_capacity as usize;
-    let Some(view) = (if input.is_empty() {
-        None
-    } else {
-        AxroarView::open_verified(input)
-    }) else {
-        if !input.is_empty() {
-            env.last_error = 102;
-            return ErrorCode::InvalidState;
-        }
-        storage.set_serialized_len(state, 0);
-        state[payload..payload + capacity].fill(0);
-        meta.set_size(state, 0);
-        return ErrorCode::Ok;
+    let Some(header) = image_header(input) else {
+        env.last_error = 102;
+        return ErrorCode::InvalidState;
+    };
+    if header.width != KeyWidth::U32 {
+        env.last_error = 102;
+        return ErrorCode::InvalidState;
+    }
+    // The header delimits the image: trailing bytes in the caller's buffer
+    // are not part of it and must not reach the slot, whose tail is zero by
+    // contract.
+    let image = &input[..header.encoded_len];
+    let Some(view) = BitmosaicView::open_verified(image) else {
+        env.last_error = 102;
+        return ErrorCode::InvalidState;
     };
     let Ok(card) = u32::try_from(view.len()) else {
         return ErrorCode::CapacityExceeded;
@@ -715,12 +718,9 @@ pub fn bitmap_import(
     if card > meta.capacity {
         return ErrorCode::CapacityExceeded;
     }
-    if card == 0 {
-        return bitmap_import(env, state, meta, &[]);
-    }
     let slot = &mut state[payload..payload + capacity];
     let written = if view.is_elias_fano() {
-        match Axroar::from_sorted(view.range()).write_forest_into_slice(slot) {
+        match Bitmosaic::from_sorted(view.range()).write_forest_into_slice(slot) {
             Ok(written) => written,
             Err(_) => {
                 env.last_error = 60;
@@ -728,15 +728,14 @@ pub fn bitmap_import(
             }
         }
     } else {
-        if input.len() > capacity {
+        if image.len() > capacity {
             env.last_error = 60;
             return ErrorCode::CapacityExceeded;
         }
-        slot[..input.len()].copy_from_slice(input);
-        input.len()
+        slot[..image.len()].copy_from_slice(image);
+        image.len()
     };
     slot[written..].fill(0);
-    storage.set_serialized_len(state, written as u32);
     meta.set_size(state, card);
     ErrorCode::Ok
 }
@@ -748,27 +747,25 @@ pub fn bitmap_import(
 /// Test whether a serialized bitmap contains `value`. Invalid or empty
 /// payloads return false.
 pub fn contains_serialized(data: &[u8], value: u32) -> bool {
-    AxroarView::open(data).is_some_and(|view| view.contains(value))
+    BitmosaicView::open(data).is_some_and(|view| view.contains(value))
 }
 
 /// Return serialized bitmap cardinality, saturating at `u32::MAX`.
 pub fn cardinality_serialized(data: &[u8]) -> u32 {
-    AxroarView::open(data).map_or(0, |view| u32::try_from(view.len()).unwrap_or(u32::MAX))
+    BitmosaicView::open(data).map_or(0, |view| u32::try_from(view.len()).unwrap_or(u32::MAX))
 }
 
-/// Verify a serialized bitmap in full and return its cardinality. A `None`
-/// result distinguishes malformed bytes from an empty bitmap.
+/// Verify a serialized native image in full and return its cardinality. A
+/// `None` result distinguishes malformed bytes from an empty bitmap: only
+/// the canonical empty image verifies to zero, zero-length bytes verify to
+/// nothing.
 pub fn cardinality_validated(data: &[u8]) -> Option<u32> {
-    if data.is_empty() {
-        return Some(0);
-    }
-    let view = AxroarView::open_verified(data)?;
+    let view = BitmosaicView::open_verified(data)?;
     u32::try_from(view.len()).ok()
 }
-
 /// Extract ascending values into `out`, capped at its length; return the count.
 pub fn extract_serialized(data: &[u8], out: &mut [u32]) -> u32 {
-    let Some(view) = AxroarView::open(data) else {
+    let Some(view) = BitmosaicView::open(data) else {
         return 0;
     };
     let mut count = 0usize;
@@ -782,7 +779,7 @@ pub fn extract_serialized(data: &[u8], out: &mut [u32]) -> u32 {
 /// Test whether two serialized bitmaps intersect: the leapfrog merge stops
 /// at the first common member.
 pub fn intersects_serialized(left: &[u8], right: &[u8]) -> bool {
-    match (AxroarView::open(left), AxroarView::open(right)) {
+    match (BitmosaicView::open(left), BitmosaicView::open(right)) {
         (Some(l), Some(r)) => !AndRange::leapfrog(l.range(), r.range()).empty(),
         _ => false,
     }
@@ -790,7 +787,7 @@ pub fn intersects_serialized(left: &[u8], right: &[u8]) -> bool {
 
 /// Count the intersection of two serialized bitmaps, saturating at `u32::MAX`.
 pub fn intersect_count_serialized(left: &[u8], right: &[u8]) -> u32 {
-    match (AxroarView::open(left), AxroarView::open(right)) {
+    match (BitmosaicView::open(left), BitmosaicView::open(right)) {
         (Some(l), Some(r)) => u32::try_from(l.and_len(&r)).unwrap_or(u32::MAX),
         _ => 0,
     }
@@ -798,7 +795,9 @@ pub fn intersect_count_serialized(left: &[u8], right: &[u8]) -> u32 {
 
 /// Apply set algebra and store the result in `env.algebra_result`, the
 /// VM-owned buffer exported by the wasm layer. Zero bytes are the empty
-/// result.
+/// scratch result. Either side accepts the decision-side empty literal
+/// (zero bytes) or any valid native image, whose empty form reads as the
+/// empty set; a nonempty side that opens as nothing is malformed.
 pub fn set_algebra(
     env: &mut BitmapEnv,
     op: BitmapAlgebraOp,
@@ -807,52 +806,77 @@ pub fn set_algebra(
 ) -> ErrorCode {
     env.algebra_result.clear();
 
-    // Empty-set identities — copy the survivor directly.
-    if left.is_empty() && right.is_empty() {
-        return ErrorCode::Ok;
-    }
-    if left.is_empty() {
-        return match op {
-            BitmapAlgebraOp::And | BitmapAlgebraOp::AndNot => ErrorCode::Ok,
-            BitmapAlgebraOp::Or | BitmapAlgebraOp::Xor => {
-                env.algebra_result.extend_from_slice(right);
-                ErrorCode::Ok
+    let left_view = if left.is_empty() {
+        None
+    } else {
+        match BitmosaicView::open(left) {
+            Some(view) => (!view.is_empty()).then_some(view),
+            None => {
+                env.last_error = 71;
+                return ErrorCode::InvalidState;
             }
-        };
-    }
-    if right.is_empty() {
-        return match op {
-            BitmapAlgebraOp::And => ErrorCode::Ok,
-            BitmapAlgebraOp::Or | BitmapAlgebraOp::AndNot | BitmapAlgebraOp::Xor => {
-                env.algebra_result.extend_from_slice(left);
-                ErrorCode::Ok
+        }
+    };
+    let right_view = if right.is_empty() {
+        None
+    } else {
+        match BitmosaicView::open(right) {
+            Some(view) => (!view.is_empty()).then_some(view),
+            None => {
+                env.last_error = 72;
+                return ErrorCode::InvalidState;
             }
-        };
-    }
+        }
+    };
 
-    let Some(l) = AxroarView::open(left) else {
-        env.last_error = 71;
-        return ErrorCode::InvalidState;
-    };
-    let Some(r) = AxroarView::open(right) else {
-        env.last_error = 72;
-        return ErrorCode::InvalidState;
-    };
-    let result = match op {
-        BitmapAlgebraOp::And => Axroar::from_sorted(AndRange::leapfrog(l.range(), r.range())),
-        BitmapAlgebraOp::Or => Axroar::from_sorted(OrRange::new(l.range(), r.range())),
-        BitmapAlgebraOp::AndNot => Axroar::from_sorted(AndNotRange::new(l.range(), r.range())),
-        BitmapAlgebraOp::Xor => Axroar::from_sorted(XorRange::new(l.range(), r.range())),
-    };
-    if result.is_empty() {
-        return ErrorCode::Ok;
+    // Empty-set identities — copy the survivor's image directly. A decision-
+    // side operand is often a whole slot region, image followed by unused
+    // capacity, so the copy is bounded by the image the view parsed: the
+    // scratch result is a native image, not a padded region.
+    match (left_view, right_view) {
+        (None, None) => return ErrorCode::Ok,
+        (None, Some(r)) => {
+            return match op {
+                BitmapAlgebraOp::And | BitmapAlgebraOp::AndNot => ErrorCode::Ok,
+                BitmapAlgebraOp::Or | BitmapAlgebraOp::Xor => {
+                    env.algebra_result
+                        .extend_from_slice(&right[..r.serialized_len()]);
+                    ErrorCode::Ok
+                }
+            };
+        }
+        (Some(l), None) => {
+            return match op {
+                BitmapAlgebraOp::And => ErrorCode::Ok,
+                BitmapAlgebraOp::Or | BitmapAlgebraOp::AndNot | BitmapAlgebraOp::Xor => {
+                    env.algebra_result
+                        .extend_from_slice(&left[..l.serialized_len()]);
+                    ErrorCode::Ok
+                }
+            };
+        }
+        (Some(l), Some(r)) => {
+            let result = match op {
+                BitmapAlgebraOp::And => {
+                    Bitmosaic::from_sorted(AndRange::leapfrog(l.range(), r.range()))
+                }
+                BitmapAlgebraOp::Or => Bitmosaic::from_sorted(OrRange::new(l.range(), r.range())),
+                BitmapAlgebraOp::AndNot => {
+                    Bitmosaic::from_sorted(AndNotRange::new(l.range(), r.range()))
+                }
+                BitmapAlgebraOp::Xor => Bitmosaic::from_sorted(XorRange::new(l.range(), r.range())),
+            };
+            if result.is_empty() {
+                return ErrorCode::Ok;
+            }
+            env.algebra_result.resize(result.forest_len(), 0);
+            if result
+                .write_forest_into_slice(&mut env.algebra_result)
+                .is_err()
+            {
+                columine_types::die!("forest_len sized the buffer the forest writer refused");
+            }
+            ErrorCode::Ok
+        }
     }
-    env.algebra_result.resize(result.forest_len(), 0);
-    if result
-        .write_forest_into_slice(&mut env.algebra_result)
-        .is_err()
-    {
-        columine_types::die!("forest_len sized the buffer the forest writer refused");
-    }
-    ErrorCode::Ok
 }

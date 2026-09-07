@@ -22,6 +22,7 @@
 
 use crate::meta::SlotMetaView;
 use crate::{aggregates, bitmap_ops, bytes, hash_table, nested, slot_growth};
+use bitmosaic::{EMPTY_U32_IMAGE, KeyWidth, image_header};
 pub use columine_types::DEFAULT_ACCEPTED_PROGRAM_MAGICS;
 use columine_types::types::{
     AggType, CONDITION_TREE_STATE_BYTES, DERIVED_FACT_EMPTY_IDENTITY, EMPTY_KEY, ErrorCode,
@@ -793,11 +794,15 @@ pub fn init_state(
                     hash_table::init_external_keys(state, primary_data_offset, capacity);
                 }
                 SlotType::Bitmap => {
-                    bytes::zero(
-                        state,
-                        primary_data_offset,
-                        slot_growth::slot_data_size(slot_type, capacity, false, agg_type_byte),
-                    );
+                    // The slot holds the native image directly: zero the
+                    // region, then admit the canonical empty image. An
+                    // all-zero slot is no native encoding.
+                    let size =
+                        slot_growth::slot_data_size(slot_type, capacity, false, agg_type_byte);
+                    bytes::zero(state, primary_data_offset, size);
+                    state[primary_data_offset as usize
+                        ..primary_data_offset as usize + EMPTY_U32_IMAGE.len()]
+                        .copy_from_slice(&EMPTY_U32_IMAGE);
                 }
                 SlotType::Aggregate => {
                     aggregates::init_agg_slot(state, primary_data_offset, agg_type_byte);
@@ -1359,14 +1364,29 @@ pub fn grow_state(
                 }
                 SlotType::Bitmap => {
                     // Recompute storage bounds from the canonical bitmap
-                    // capacity formula before copying the payload.
-                    let old_storage_size = columine_types::types::BITMAP_SERIALIZED_LEN_BYTES
-                        + bitmap_ops::bitmap_payload_capacity(old_cap);
-                    let new_storage_size = columine_types::types::BITMAP_SERIALIZED_LEN_BYTES
-                        + bitmap_ops::bitmap_payload_capacity(new_cap);
+                    // capacity formula before copying the image.
+                    let old_storage_size = bitmap_ops::bitmap_payload_capacity(old_cap);
+                    let new_storage_size = bitmap_ops::bitmap_payload_capacity(new_cap);
                     debug_assert_eq!(new_storage_size, new_primary_size);
                     bytes::zero(new_state, new_offset, new_storage_size);
-                    let copy_len = old_storage_size.min(new_storage_size);
+                    // Copy exactly the u32 image the old header delimits. An
+                    // old slot that holds no such image is a corrupt state,
+                    // not an empty set: refuse, so the caller keeps the state
+                    // it has and reports the failure, instead of publishing a
+                    // grown slot whose region is no native encoding. Refusing
+                    // here is safe because `old_state` is never written — only
+                    // the destination buffer, which the caller discards.
+                    let old_start = old_offset as usize;
+                    let header = old_state
+                        .get(old_start..old_start + old_storage_size as usize)
+                        .and_then(image_header)
+                        .filter(|header| header.width == KeyWidth::U32)
+                        .ok_or(ErrorCode::InvalidState)?;
+                    let copy_len =
+                        u32::try_from(header.encoded_len).map_err(|_| ErrorCode::InvalidState)?;
+                    if copy_len > new_storage_size {
+                        return Err(ErrorCode::InvalidState);
+                    }
                     bytes::copy(new_state, new_offset, old_state, old_offset, copy_len);
                 }
                 SlotType::StructMap | SlotType::StructMap2 => {

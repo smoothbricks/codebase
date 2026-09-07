@@ -4982,7 +4982,7 @@ pub fn vm_set_contains(state: &[u8], slot_offset: u32, capacity: u32, elem: u32)
         let storage = get_bitmap_storage(&meta);
         return storage
             .serialized_data(state)
-            .is_some_and(|data| bitmap_ops::contains_serialized(data, elem));
+            .is_ok_and(|data| bitmap_ops::contains_serialized(data, elem));
     }
 
     hash_table::find_key(state, slot_offset, capacity, elem).is_some()

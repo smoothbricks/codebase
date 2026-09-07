@@ -30,10 +30,7 @@ pub fn slot_data_size(
         // Canonical bitmap sizing is shared by allocation, grow copy, and
         // readers. Keeping `alloc == copy == reader capacity` prevents a
         // growth copy from overrunning its allocation.
-        SlotType::Bitmap => {
-            columine_types::types::BITMAP_SERIALIZED_LEN_BYTES
-                + crate::bitmap_ops::bitmap_payload_capacity(capacity)
-        }
+        SlotType::Bitmap => crate::bitmap_ops::bitmap_payload_capacity(capacity),
         SlotType::StructMap | SlotType::StructMap2 | SlotType::OrderedList | SlotType::Nested => 0,
         SlotType::Array => capacity * 4 + capacity * 8,
     }
@@ -318,14 +315,15 @@ mod tests {
     /// `bitmap_ops::bitmap_payload_capacity`.
     #[test]
     fn bitmap_alloc_copy_reader_capacity_are_one_formula() {
-        use columine_types::types::BITMAP_SERIALIZED_LEN_BYTES;
         for cap in [0u32, 1, 16, 31, 32, 255, 256, 257, 512, 4096] {
             let reader_capacity = crate::bitmap_ops::bitmap_payload_capacity(cap);
             let alloc = slot_data_size(SlotType::Bitmap, cap, false, 0);
-            // alloc == serialized_len u32 + full reader-visible payload
-            assert_eq!(alloc, BITMAP_SERIALIZED_LEN_BYTES + reader_capacity);
-            // canonical formula shape: cap*4 + 256
-            assert_eq!(reader_capacity, cap * 4 + 256);
+            // The allocation is the reader-visible image region itself: no
+            // length word beside it.
+            assert_eq!(alloc, reader_capacity);
+            // Canonical formula shape: cap*4 plus the image identifier, so
+            // even a zero-capacity slot fits the four-byte empty image.
+            assert_eq!(reader_capacity, cap * 4 + bitmosaic::IMAGE_ID_LEN as u32);
         }
     }
 }
