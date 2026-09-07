@@ -35,9 +35,10 @@ export interface CiWorkflowDefinitionOptions {
   /** Default ubuntu-latest when omitted. */
   runsOn?: string | string[];
   /**
-   * Declared private-npm opt-in. Exposes the registry variable and the read
-   * token to the installing job before SetupDevenv and skips fork PRs, which
-   * never receive secrets. Publish tokens never belong here.
+   * Declared private-npm opt-in. Exposes the read token to the installing job
+   * before SetupDevenv so `.npmrc` `${TOKEN}` expansion can run, and skips
+   * fork PRs, which never receive secrets. The registry URL lives in `.npmrc`,
+   * not job env. Publish tokens never belong here.
    */
   privateNpm?: PackagePrivateNpmConfig;
 }
@@ -120,18 +121,21 @@ ${
 }    env:
       NIX_STORE_NAR: ${githubExpression('github.workspace')}/nix-store.nar
       GH_TOKEN: ${githubExpression('github.token')}
-${
-  options.privateNpm
-    ? `      ${options.privateNpm.registryEnv}: ${githubExpression(`vars.${options.privateNpm.registryEnv}`)}
-      ${options.privateNpm.readTokenEnv}: ${githubExpression(`secrets.${options.privateNpm.readTokenEnv}`)}
-`
-    : ''
-}    steps:
+${privateNpmReadTokenJobEnv(options)}    steps:
 `;
 }
 
 function githubExpression(expression: string): string {
   return `$${`{{ ${expression} }}`}`;
+}
+
+/** Job env for `.npmrc` token expansion. Registry URL is not a GitHub variable. */
+function privateNpmReadTokenJobEnv(options: CiWorkflowDefinitionOptions): string {
+  const tokenEnv = options.privateNpm?.readTokenEnv;
+  if (!tokenEnv) {
+    return '';
+  }
+  return `      ${tokenEnv}: ${githubExpression(`secrets.${tokenEnv}`)}\n`;
 }
 
 function renderCiWorkflowSteps(steps: CiWorkflowStep[], options: CiWorkflowDefinitionOptions): string {
@@ -336,13 +340,7 @@ ${renderRunsOnLine(options.runsOn)}
     if: \${{ needs.main.result == 'success' && needs.main.outputs.deployment-stage != '' }}
     env:
       GH_TOKEN: \${{ github.token }}
-${
-  options.privateNpm
-    ? `      ${options.privateNpm.registryEnv}: \${{ vars.${options.privateNpm.registryEnv} }}
-      ${options.privateNpm.readTokenEnv}: \${{ secrets.${options.privateNpm.readTokenEnv} }}
-`
-    : ''
-}    steps:
+${privateNpmReadTokenJobEnv(options)}    steps:
       # Step 1: GitHub adds "Set up job" automatically
       # Step 2
       - name: 📥 Checkout

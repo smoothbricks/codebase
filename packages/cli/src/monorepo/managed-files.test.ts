@@ -456,20 +456,19 @@ describe('publish workflow rendering by repo shape', () => {
     expect(rendered).toContain("steps.version.outputs.mode != 'none'");
   });
 
-  it('threads declared privateNpm into the publish workflow as job-level read env', () => {
+  it('threads declared privateNpm into the publish workflow as job-level read token', () => {
     const rendered = renderManagedPublishWorkflowForTest(
       context({
         privateNpm: {
           scope: '@priv.test',
-          registryEnv: 'PRIV_NPM_REGISTRY',
           readTokenEnv: 'PRIV_NPM_READ_TOKEN',
           publishTokenEnv: 'PRIV_NPM_PUBLISH_TOKEN',
         },
       }),
     );
 
-    expect(rendered).toContain('PRIV_NPM_REGISTRY: ${{ vars.PRIV_NPM_REGISTRY }}');
     expect(rendered).toContain('PRIV_NPM_READ_TOKEN: ${{ secrets.PRIV_NPM_READ_TOKEN }}');
+    expect(rendered).not.toContain('PRIV_NPM_REGISTRY');
     expect(rendered).not.toContain('      PRIV_NPM_PUBLISH_TOKEN:');
     expect(rendered).toContain('          PRIV_NPM_PUBLISH_TOKEN: ${{ secrets.PRIV_NPM_PUBLISH_TOKEN }}');
   });

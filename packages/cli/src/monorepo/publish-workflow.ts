@@ -89,8 +89,9 @@ export interface PublishWorkflowDefinitionOptions {
   runsOn?: WorkflowRunsOn;
   /**
    * Declared private-npm opt-in. The publish step is the only place receiving
-   * the publish token; the registry URL and read token ride along for status
-   * queries. No env is emitted without this configuration.
+   * the publish token; the read token rides along for `.npmrc` `${TOKEN}`
+   * expansion. The registry URL is not a job env. No env is emitted without
+   * this configuration.
    */
   privateNpm?: PackagePrivateNpmConfig;
 }
@@ -1228,13 +1229,11 @@ function githubExpression(expression: string): string {
 }
 
 function privateNpmInstallJobEnv(options: PublishWorkflowDefinitionOptions): string {
-  const config = options.privateNpm;
-  if (!config) return '';
-  return [
-    '',
-    `      ${config.registryEnv}: ${githubExpression(`vars.${config.registryEnv}`)}`,
-    `      ${config.readTokenEnv}: ${githubExpression(`secrets.${config.readTokenEnv}`)}`,
-  ].join('\n');
+  const tokenEnv = options.privateNpm?.readTokenEnv;
+  if (!tokenEnv) {
+    return '';
+  }
+  return ['', `      ${tokenEnv}: ${githubExpression(`secrets.${tokenEnv}`)}`].join('\n');
 }
 
 /** Both repair and publish can write packages; neither exposes the credential to setup/build. */
