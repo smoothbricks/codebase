@@ -113,6 +113,14 @@ import {
   withPrivateNpmUserconfig,
 } from './private-npm.js';
 import { type RetagUnpublishedTagUpdate, retagUnpublished } from './retag-unpublished.js';
+import {
+  forgejoApiUrl,
+  forgejoAuthHeaders,
+  forgejoReleaseLookupExists,
+  resolveSourceReleaseToken,
+  resolveSourceRepository,
+  sourceReleaseUrl,
+} from './source-release.js';
 
 export interface ReleaseVersionOptions {
   bump: string;
@@ -1201,8 +1209,33 @@ function releaseRetagShell(root: string, remote: string) {
     remoteTagObject: (tag: string) => remoteReleaseTagObject(root, remote, tag),
     createOrMoveTag: (tag: string, ref: string) => run('git', ['tag', '-fa', tag, '-m', tag, ref], root),
     pushTags: (updates: RetagUnpublishedTagUpdate<ReleasePackage>[]) => pushRetaggedReleaseTags(root, remote, updates),
-    dispatchPublishWorkflow: (workflow: string, branch: string) =>
-      run('gh', ['workflow', 'run', workflow, '--ref', branch, '-f', 'bump=auto', '-f', 'dry_run=false'], root),
+    dispatchPublishWorkflow: async (workflow: string, branch: string) => {
+      const source = resolveSourceRepository(root);
+      if (source.kind === 'github') {
+        await run('gh', ['workflow', 'run', workflow, '--ref', branch, '-f', 'bump=auto', '-f', 'dry_run=false'], root);
+        return;
+      }
+      const token = requireSourceReleaseToken(root);
+      const response = await fetch(
+        forgejoApiUrl(source, `/actions/workflows/${encodeURIComponent(workflow)}/dispatches`),
+        {
+          method: 'POST',
+          headers: forgejoAuthHeaders(token),
+          body: JSON.stringify({
+            ref: branch,
+            inputs: { bump: 'auto', dry_run: 'false' },
+          }),
+        },
+      );
+      if (!response.ok) {
+        const body = await response.text();
+        throw new Error(
+          `Unable to dispatch source publish workflow ${workflow} (HTTP ${response.status}).${
+            body.trim() ? `\n${body.trim().slice(0, 500)}` : ''
+          }`,
+        );
+      }
+    },
     log: (message: string) => console.log(message),
   };
 }
@@ -1309,9 +1342,31 @@ async function listMissingGithubReleasePackages(root: string, packages: ReleaseP
 }
 
 async function createGithubRelease(root: string, pkg: ReleasePackage, dryRun: boolean): Promise<string | null> {
+  const source = resolveSourceRepository(root);
+  if (source.kind === 'github') {
+    const currentTag = releaseTag(pkg);
+    console.log(`${pkg.name}@${pkg.version}: rendering GitHub Release notes for ${currentTag}.`);
+    console.log(`GitHub release auth: ${envPresence('GH_TOKEN')}, ${envPresence('GITHUB_TOKEN')}.`);
+    if (!dryRun) {
+      await assertRemoteTagExists(root, currentTag);
+    }
+    const previousTag = await previousReleaseTag(root, pkg, currentTag);
+    if (dryRun) {
+      await renderNxProjectChangelogContents({ root, pkg, previousTag, dryRun });
+      return null;
+    }
+    const contents = await renderNxProjectChangelogContents({ root, pkg, previousTag, dryRun });
+    await createOrUpdateGithubRelease(pkg, contents, {
+      githubReleaseExists: (tag) => githubReleaseExists(root, tag),
+      runGhRelease: (args) => run('gh', args, root),
+      log: (message) => console.log(message),
+    });
+    return githubReleaseUrl(root, currentTag);
+  }
+
   const currentTag = releaseTag(pkg);
-  console.log(`${pkg.name}@${pkg.version}: rendering GitHub Release notes for ${currentTag}.`);
-  console.log(`GitHub release auth: ${envPresence('GH_TOKEN')}, ${envPresence('GITHUB_TOKEN')}.`);
+  console.log(`${pkg.name}@${pkg.version}: rendering Forgejo Release notes for ${currentTag}.`);
+  console.log(`Forgejo release auth: ${sourceReleaseAuthLine(root)}.`);
   if (!dryRun) {
     await assertRemoteTagExists(root, currentTag);
   }
@@ -1321,12 +1376,77 @@ async function createGithubRelease(root: string, pkg: ReleasePackage, dryRun: bo
     return null;
   }
   const contents = await renderNxProjectChangelogContents({ root, pkg, previousTag, dryRun });
-  await createOrUpdateGithubRelease(pkg, contents, {
-    githubReleaseExists: (tag) => githubReleaseExists(root, tag),
-    runGhRelease: (args) => run('gh', args, root),
-    log: (message) => console.log(message),
+  const token = requireSourceReleaseToken(root);
+  const releasePath = `/releases/tags/${encodeURIComponent(currentTag)}`;
+  const lookup = await fetch(forgejoApiUrl(source, releasePath), {
+    headers: forgejoAuthHeaders(token),
   });
-  return githubReleaseUrl(root, currentTag);
+  const lookupBody = await lookup.text();
+  const releaseExists = forgejoReleaseLookupExists(lookup.status, lookupBody, currentTag);
+  if (!releaseExists) {
+    const response = await fetch(forgejoApiUrl(source, '/releases'), {
+      method: 'POST',
+      headers: forgejoAuthHeaders(token),
+      body: JSON.stringify({
+        tag_name: currentTag,
+        name: currentTag,
+        body: contents,
+        prerelease: pkg.version.includes('-'),
+      }),
+    });
+    if (response.status !== 201) {
+      const body = await response.text();
+      throw new Error(
+        `Unable to create source release ${currentTag} (HTTP ${response.status}).${
+          body.trim() ? `\n${body.trim().slice(0, 500)}` : ''
+        }`,
+      );
+    }
+  } else {
+    const release = JSON.parse(lookupBody) as { id?: unknown };
+    if (typeof release.id !== 'number' || !Number.isSafeInteger(release.id)) {
+      throw new Error(`Unable to inspect source release ${currentTag}: response did not contain a valid release id.`);
+    }
+    const response = await fetch(forgejoApiUrl(source, `/releases/${release.id}`), {
+      method: 'PATCH',
+      headers: forgejoAuthHeaders(token),
+      body: JSON.stringify({
+        name: currentTag,
+        body: contents,
+        prerelease: pkg.version.includes('-'),
+      }),
+    });
+    if (response.status !== 200) {
+      const body = await response.text();
+      throw new Error(
+        `Unable to update source release ${currentTag} (HTTP ${response.status}).${
+          body.trim() ? `\n${body.trim().slice(0, 500)}` : ''
+        }`,
+      );
+    }
+  }
+  return sourceReleaseUrl(source, currentTag);
+}
+
+function sourceReleaseAuthEnvNames(root: string): string[] {
+  const declared = readPackageJson(join(root, 'package.json'))?.json.smoo?.privateNpm?.publishTokenEnv;
+  return [...new Set(['GH_TOKEN', 'GITHUB_TOKEN', ...(declared ? [declared] : [])])];
+}
+
+function sourceReleaseAuthLine(root: string): string {
+  return sourceReleaseAuthEnvNames(root)
+    .map((name) => envPresence(name))
+    .join(', ');
+}
+
+function requireSourceReleaseToken(root: string): string {
+  const token = resolveSourceReleaseToken(root);
+  if (token) {
+    return token;
+  }
+  throw new Error(
+    `Source release authentication is missing; set one of ${sourceReleaseAuthEnvNames(root).join(', ')}.`,
+  );
 }
 
 function envPresence(name: string): string {
@@ -1633,12 +1753,21 @@ async function pushRetaggedReleaseTags(
 }
 
 async function githubReleaseExists(root: string, tag: string): Promise<boolean> {
-  const result = await $`gh release view ${tag} --json tagName`.cwd(root).quiet().nothrow();
-  return githubReleaseLookupExists(tag, result.exitCode, decode(result.stdout), decode(result.stderr));
+  const source = resolveSourceRepository(root);
+  if (source.kind === 'github') {
+    const result = await $`gh release view ${tag} --json tagName`.cwd(root).quiet().nothrow();
+    return githubReleaseLookupExists(tag, result.exitCode, decode(result.stdout), decode(result.stderr));
+  }
+  const token = requireSourceReleaseToken(root);
+  const response = await fetch(forgejoApiUrl(source, `/releases/tags/${encodeURIComponent(tag)}`), {
+    headers: forgejoAuthHeaders(token),
+  });
+  const body = await response.text();
+  return forgejoReleaseLookupExists(response.status, body, tag);
 }
 
 function githubReleaseUrl(root: string, tag: string): string {
-  return `https://github.com/${githubRepositoryFromRootPackage(root)}/releases/tag/${encodeURIComponent(tag)}`;
+  return sourceReleaseUrl(resolveSourceRepository(root), tag);
 }
 
 async function anyGithubReleaseExists(root: string, tags: string[]): Promise<boolean> {

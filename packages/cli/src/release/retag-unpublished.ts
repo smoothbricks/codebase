@@ -73,7 +73,7 @@ export async function retagUnpublished<Package extends Omit<ReleasePackageInfo, 
       throw new Error(`Cannot retag ${tag}: ${match.pkg.name}@${match.version} already exists on npm.`);
     }
     if (await shell.githubReleaseExists(tag)) {
-      throw new Error(`Cannot retag ${tag}: GitHub Release ${tag} already exists.`);
+      throw new Error(`Cannot retag ${tag}: source release ${tag} already exists.`);
     }
 
     updates.push({
