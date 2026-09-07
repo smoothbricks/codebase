@@ -377,6 +377,15 @@ function getManagedContent(file: ManagedFile, context: ManagedFileContext): stri
   const sourcePath = join(packageRoot, sourceRoot, file.source);
   const content = readFileSync(sourcePath, 'utf8');
   if (file.kind === 'raw') {
+    if (file.source === 'tooling/direnv/setup-environment.ts' && context.privateNpm) {
+      return content.replace(
+        'const requiredInstallEnvironment: readonly string[] = [];',
+        `const requiredInstallEnvironment: readonly string[] = ${JSON.stringify([
+          context.privateNpm.registryEnv,
+          context.privateNpm.readTokenEnv,
+        ])};`,
+      );
+    }
     return content;
   }
   return renderTemplate(context, content);

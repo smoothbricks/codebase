@@ -406,6 +406,40 @@ describe('publish workflow definition', () => {
     expect(rendered).toContain('packages must already exist on npm and use trusted publishing/OIDC');
   });
 
+  it('puts private registry read credentials on every job and the publisher token only on write steps', () => {
+    const rendered = renderPublishWorkflowYaml({
+      repoName: '@priv.test/runtime',
+      privateNpm: {
+        scope: '@priv.test',
+        registryEnv: 'PRIV_NPM_REGISTRY',
+        readTokenEnv: 'PRIV_NPM_READ_TOKEN',
+        publishTokenEnv: 'PRIV_NPM_PUBLISH_TOKEN',
+      },
+    });
+
+    expect(rendered).toContain('PRIV_NPM_REGISTRY: ${{ vars.PRIV_NPM_REGISTRY }}');
+    expect(rendered).toContain('PRIV_NPM_READ_TOKEN: ${{ secrets.PRIV_NPM_READ_TOKEN }}');
+    // Job env is six spaces; a publisher token there would leak into setup/build.
+    expect(rendered).not.toContain('      PRIV_NPM_PUBLISH_TOKEN:');
+    expect(rendered).toContain('          PRIV_NPM_PUBLISH_TOKEN: ${{ secrets.PRIV_NPM_PUBLISH_TOKEN }}');
+
+    const setupAt = rendered.indexOf('- name: 🧱 Setup Nix/devenv');
+    const repairAt = rendered.indexOf('- name: 🧯 Repair pending releases');
+    const publishAt = rendered.indexOf('- name: 📦 Publish release');
+    expect(setupAt).toBeGreaterThan(-1);
+    expect(repairAt).toBeGreaterThan(setupAt);
+    expect(publishAt).toBeGreaterThan(repairAt);
+
+    const beforeSetup = rendered.slice(0, setupAt);
+    expect(beforeSetup).toContain('PRIV_NPM_READ_TOKEN: ${{ secrets.PRIV_NPM_READ_TOKEN }}');
+    expect(beforeSetup).not.toContain('PRIV_NPM_PUBLISH_TOKEN');
+
+    expect(rendered.slice(repairAt, publishAt)).toContain('PRIV_NPM_PUBLISH_TOKEN');
+    expect(rendered.slice(publishAt)).toContain('PRIV_NPM_PUBLISH_TOKEN');
+    expect(rendered).not.toContain('NODE_AUTH_TOKEN');
+    expect(rendered).not.toContain('secrets.NPM_TOKEN');
+  });
+
   it('omits production deploy controls when no production deploy target exists', () => {
     const rendered = renderPublishWorkflowYaml({ repoName: '@smoothbricks/codebase' });
 
