@@ -1,0 +1,46 @@
+[package]
+name = "bitmosaic"
+version = "0.1.0"
+edition = "2024"
+description = "Ladder-selected compressed bitmap: cone/stride/array/summary-steered-word containers with fused bitwise ops, rank/select, and closed-form stride intersection"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/smoothbricks/codebase"
+publish = ["crates-io"]
+
+[dependencies]
+
+[features]
+# Skew-arm instrument: the balanced-arm force switch and the position
+# counters the A/B harness reads. Absent from a shipped build — a counter
+# compiled into a kernel is a cost on the very path it claims to witness,
+# and the arm switch would put a load and a branch in front of a chooser
+# that is otherwise pure arithmetic on cardinalities already in register.
+bench-internals = []
+# Opt OUT of the wasm32 SIMD128 hand kernel (`words_and_count`). It is
+# enabled per function with `#[target_feature(enable = "simd128")]`, so the
+# module stays scalar and only the kernel vectorises; simd128 has been
+# universal in shipping wasm engines since 2021, so the default is on. Set
+# this only when targeting an engine that predates the SIMD proposal — the
+# module would otherwise fail validation there. Same contract as ptmcart's
+# feature of the same name, which forwards here.
+wasm-scalar-portable = []
+
+[dev-dependencies]
+criterion = { version = "0.5", default-features = false }
+roaring = "0.10"
+
+[[bench]]
+name = "ops"
+harness = false
+
+[[bench]]
+name = "patch"
+harness = false
+
+[[example]]
+name = "g261_skew_census"
+required-features = ["bench-internals"]
+
+[[example]]
+name = "g378_words_refuter"
+required-features = ["bench-internals"]
