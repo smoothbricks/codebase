@@ -325,7 +325,10 @@ function yamlLinesForStep(step: CiWorkflowStep, options: CiWorkflowDefinitionOpt
  * siblings anyway. Token values only ever enter git through the job env; the
  * emitted YAML references the secret name, never a value.
  */
-function sourceCheckoutsStepLines(step: CiWorkflowStep, checkouts: readonly PackageSourceCheckoutConfig[]): string[] {
+export function sourceCheckoutsStepLines(
+  step: CiWorkflowStep,
+  checkouts: readonly PackageSourceCheckoutConfig[],
+): string[] {
   const lines = [`      - name: ${step.name}`, ...SAME_REPO_GATE_FOLDED];
   const tokenEnvs = [
     ...new Set(checkouts.map((checkout) => checkout.tokenEnv).filter((env): env is string => env !== undefined)),
@@ -353,7 +356,7 @@ function sourceCheckoutsStepLines(step: CiWorkflowStep, checkouts: readonly Pack
 }
 
 /** Mechanism errors surface at managed-file render time, never inside CI. */
-function normalizeSourceCheckout(config: PackageSourceCheckoutConfig): PackageSourceCheckoutConfig {
+export function normalizeSourceCheckout(config: PackageSourceCheckoutConfig): PackageSourceCheckoutConfig {
   if (config.path === undefined || config.path === '' || config.path.startsWith('/')) {
     throw new Error(
       `smoo.github.sourceCheckouts entry needs a path relative to the workspace root, got ${JSON.stringify(config.path)}`,
@@ -377,7 +380,7 @@ function normalizeSourceCheckout(config: PackageSourceCheckoutConfig): PackageSo
  * print width, so the generator emits the folded form itself to keep the
  * checked-in managed output byte-identical across regeneration and hooks.
  */
-const SAME_REPO_GATE_FOLDED = [
+export const SAME_REPO_GATE_FOLDED = [
   '        if:',
   "          ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository",
   '          }}',
