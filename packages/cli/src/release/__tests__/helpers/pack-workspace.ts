@@ -63,6 +63,8 @@ export async function withPackWorkspace(
       version: '0.1.0',
       dependencies: { '@priv.test/beta': 'workspace:*', ...(options.alphaDependencies ?? {}) },
       tags: ['npm:private'],
+      ...(options.alphaScripts ? { scripts: options.alphaScripts } : {}),
+      ...(options.alphaFiles ? { buildFiles: options.alphaFiles } : {}),
       ...(options.alphaTypes ? { types: options.alphaTypes } : {}),
       ...(options.alphaExports ? { exports: options.alphaExports } : {}),
     });
@@ -153,11 +155,23 @@ export interface PackWorkspacePackage {
   /** Written verbatim into the package manifest. */
   types?: string;
   exports?: Record<string, unknown>;
+  buildFiles?: Record<string, string>;
 }
 
 export async function writePackWorkspacePackage(root: string, pkg: PackWorkspacePackage): Promise<void> {
   await mkdir(join(root, pkg.path, 'dist'), { recursive: true });
   await writeFile(join(root, pkg.path, 'dist', 'index.js'), `export const name = ${JSON.stringify(pkg.name)};\n`);
+  await writeFile(
+    join(root, pkg.path, 'build-fixture.mjs'),
+    `import { mkdirSync, writeFileSync } from 'node:fs';
+import { dirname } from 'node:path';
+const files = ${JSON.stringify({ 'dist/index.js': 'export const built = true;\n', ...pkg.buildFiles })};
+for (const [path, content] of Object.entries(files)) {
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(path, content);
+}
+`,
+  );
   await writeFile(
     join(root, pkg.path, 'package.json'),
     manifestText({
@@ -178,7 +192,7 @@ export async function writePackWorkspacePackage(root: string, pkg: PackWorkspace
         targets: {
           build: {
             executor: 'nx:run-commands',
-            options: { command: "mkdir -p dist && echo 'export const built = true;' > dist/index.js", cwd: pkg.path },
+            options: { command: 'node build-fixture.mjs', cwd: pkg.path },
           },
         },
       },
@@ -191,7 +205,7 @@ function manifestText(value: object): string {
 }
 
 async function writeLockfile(root: string): Promise<void> {
-  const result = await Bun.$`${bunBinary()} install --lockfile-only`
+  const result = await Bun.$`${bunBinary()} install --lockfile-only --ignore-scripts`
     .cwd(root)
     .env({
       PATH: process.env.PATH ?? '',
