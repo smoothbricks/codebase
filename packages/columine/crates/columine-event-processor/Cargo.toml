@@ -1,6 +1,6 @@
 [package]
 name = "columine-event-processor"
-description = "Unified event processor: parse, columns, deduplication, and Arrow IPC"
+description = "Public event-processor parse plane: semantic validation, JSON/MessagePack extraction, DynamicColumns, and Arrow IPC"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -11,15 +11,8 @@ repository.workspace = true
 columine-arrow = { path = "../columine-arrow" }
 columine-parsing = { path = "../columine-parsing" }
 columine-types = { path = "../columine-types" }
-axroar = { workspace = true }
-ptmcart-core = { workspace = true }
 
 [dev-dependencies]
-proptest = { workspace = true }
 arrow-array = { workspace = true }
 arrow-ipc = { workspace = true }
 arrow-schema = { workspace = true }
-
-[[bench]]
-name = "dedup_cells"
-harness = false

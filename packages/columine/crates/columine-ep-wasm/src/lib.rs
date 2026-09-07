@@ -18,7 +18,7 @@
 
 use columine_arrow::schema::DynamicSchemaConfig;
 use columine_event_processor::{
-    CollisionPolicy, CompactValidationError, CreateFailure, EpWiring, EventProcessor, InputFormat,
+    CompactValidationError, CreateFailure, EventProcessor, InputFormat, ParseOptions,
     RESULT_HEADER_SIZE, ResultCode, ResultDiagnostic, write_compact_result_header,
 };
 
@@ -83,12 +83,13 @@ fn new_instance(
     capacity: u32,
     schema_config: DynamicSchemaConfig,
 ) -> Result<Box<EpInstance>, CreateFailure> {
-    // Columine has no deduplication, so the policy argument is unused on this
-    // path; `Latest` satisfies the shared core signature.
     let ep = EventProcessor::new(
-        EpWiring::columine(),
+        ParseOptions {
+            base_path: true,
+            msgpack_growth: true,
+            diagnostics: false,
+        },
         capacity,
-        CollisionPolicy::Latest,
         schema_config,
     )?;
     Ok(Box::new(EpInstance { ep }))

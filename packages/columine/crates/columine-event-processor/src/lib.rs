@@ -1,31 +1,32 @@
-//! Unified event processor: parse → columns → (dedup) → Arrow IPC.
+//! Public event-processor parse plane: parse → columns → Arrow IPC.
 //!
-//! [`EpWiring`] parameterizes the two published artifact configurations:
+//! The crate owns schema/config retention, semantic validation, JSON and
+//! MessagePack extraction (with the base four-column scanner path for
+//! four-field schemas and workspace growth), DynamicColumns, and the Arrow
+//! IPC encoding — everything schema-shaped and format-generic.
 //!
-//! - **Consumer configuration**: dynamic-only extraction, exact deduplication
-//!   against the seen-set ([`dedup`]), diagnostic bytes in the result
-//!   header, JSON fallback-workspace growth, and no MessagePack workspace
-//!   growth.
-//! - **Columine configuration**: no deduplication, a base four-column path for
-//!   four-field schemas, and workspace growth for both JSON and MessagePack.
+//! Per-log event admission lives in a private consumer crate: the seen-sets,
+//! destination logs, id namespaces, judge/commit/
+//! abandon window, and redelivery horizon. That crate composes this parse
+//! plane through the borrowed [`ValidatedInput`]/[`ParsedBatch`] API — the
+//! precheck completes once, the extracted columns are judged in place, and
+//! the encoded batch is emitted once — without a second parse, cloned
+//! columns, or intermediate IPC.
 //!
-//! The `ep_*` wasm exports are thin bindings around this library core.
+//! The `ep_*` wasm exports of `columine-ep-wasm` are thin bindings around
+//! this library core.
 
 pub mod compact;
-pub mod dedup;
 
 pub use compact::{
     COMPACT_ABI_VERSION, COMPACT_BATCH_MAGIC, COMPACT_DESCRIPTOR_SIZE, COMPACT_DIAGNOSTIC_STAGE,
     COMPACT_HEADER_SIZE, CompactBatchView, CompactValidationError, compact_detail,
 };
-pub use dedup::{
-    AdmissionRefusal, CollisionPolicy, EventKey, IdNamespace, Judgment, MAX_ID_BYTES, SeenSet,
-};
 
 use columine_arrow::{
-    DynamicColumns, DynamicSchemaConfig, IpcError, MAX_EVENTS_PER_BATCH, MAX_VALUE_BYTES,
-    MIN_ARROW_OUTPUT_CAPACITY, MetadataLimits, MetadataStorage, required_arrow_ipc_len,
-    write_arrow_ipc_from_borrowed_columns, write_arrow_ipc_from_dynamic_columns,
+    DynamicColumns, DynamicSchemaConfig, IpcError, MAX_VALUE_BYTES, MIN_ARROW_OUTPUT_CAPACITY,
+    MetadataLimits, MetadataStorage, required_arrow_ipc_len, write_arrow_ipc_from_borrowed_columns,
+    write_arrow_ipc_from_dynamic_columns,
 };
 use columine_parsing::{
     ExtractionConfig, json_extractor, json_scanner, msgpack_extractor, msgpack_scanner,
@@ -35,9 +36,7 @@ use columine_parsing::{
     },
 };
 
-/// Module version: 3 is the consumer artifact (two-phase exact dedup), 1
-/// this crate's npm artifact.
-pub const CONSUMER_VERSION: u32 = 3;
+/// This crate's npm artifact version.
 pub const COLUMINE_VERSION: u32 = 1;
 
 /// Input format for `create_log_entry` (u8 values are ABI).
@@ -64,12 +63,6 @@ pub enum ResultCode {
     InvalidFormat = 5,
     InvalidInput = 6,
     SchemaMismatch = 7,
-    /// The seen-set refused an id: the diagnostic bytes name the cause
-    /// ([`diagnostic_stage::DEDUP`]) and the set is untouched.
-    AdmissionRefused = 8,
-    /// No in-flight batch has the named id on that log: it was committed or
-    /// abandoned already, or never judged.
-    UnknownBatch = 9,
 }
 
 /// Event capacity every wasm `ep_create_*` handle is built with.
@@ -191,45 +184,31 @@ pub struct ResultDiagnostic {
 
 /// Diagnostic byte vocabularies and `NO_FIELD` live with the extractor that
 /// populates them, keeping one source of truth for the ABI order.
-pub use columine_parsing::json_extractor::{
-    NO_FIELD, dedup_detail, diagnostic_detail, diagnostic_stage,
-};
+pub use columine_parsing::json_extractor::{NO_FIELD, diagnostic_detail, diagnostic_stage};
 
-/// Parse-path wiring that distinguishes the two published artifact
-/// configurations.
+/// How the parse plane is wired (`ParseOptions`). Every published
+/// configuration is one of these values; per-log admission composes the
+/// plane with `base_path: false` and diagnostics on, while columine's own
+/// artifact keeps the base scanner path, MessagePack workspace growth, and
+/// plain headers.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct EpWiring {
-    /// Exact dedup by event id against the seen-set (the consumer artifact
-    /// wires it; columine does not).
-    pub dedup: bool,
-    /// Base 4-column scanner path for `field_count == 4` schemas
-    /// (columine keeps it; the consumer artifact omits it).
+pub struct ParseOptions {
+    /// Base 4-column scanner path for `field_count == 4` schemas whose
+    /// schema IS the base event log.
     pub base_path: bool,
-    /// Grow the msgpack workspace and retry on overflow (columine yes,
-    /// consumer artifact no — its msgpack path errors without retry).
+    /// Grow the msgpack workspace and retry on overflow.
     pub msgpack_growth: bool,
-    /// Write diagnostic bytes into the result header (consumer artifact yes).
+    /// Write diagnostic bytes into the result header's reserved bytes.
     pub diagnostics: bool,
 }
 
-impl EpWiring {
-    pub fn consumer_variant() -> Self {
-        Self {
-            dedup: true,
-            base_path: false,
-            msgpack_growth: false,
-            diagnostics: true,
-        }
-    }
-
-    pub fn columine() -> Self {
-        Self {
-            dedup: false,
-            base_path: true,
-            msgpack_growth: true,
-            diagnostics: false,
-        }
-    }
+/// Why `validate` or `parse` refused an input. `code` is the header/status
+/// value; `diagnostic` is the per-field extraction or semantic-validation
+/// diagnostic for the header's reserved bytes, when the failure has one.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProcessError {
+    pub code: ResultCode,
+    pub diagnostic: Option<ResultDiagnostic>,
 }
 
 const INITIAL_WORK_BUFFER_SIZE: usize = 64 * 1024;
@@ -257,33 +236,18 @@ pub struct PayloadValidationDiagnostic {
     pub observed: String,
 }
 
-/// The unified event processor core.
+/// The public event-processor parse plane.
 pub struct EventProcessor {
-    pub wiring: EpWiring,
-    pub schema_config: DynamicSchemaConfig,
+    options: ParseOptions,
+    schema_config: DynamicSchemaConfig,
     extraction_config: Option<ExtractionConfig>,
     semantic_schemas: Option<SemanticSchemaSet>,
     last_validation_diagnostic: Option<PayloadValidationDiagnostic>,
     dynamic_columns: DynamicColumns,
-    /// True when the schema IS the base event log and this wiring keeps the
+    /// True when the schema IS the base event log and the options keep the
     /// scanner path, so the four-column scanners can write by index.
     use_base_scanners: bool,
     record_batch_metadata: MetadataStorage,
-    /// One seen-set per destination log, opened by the log's own key. The
-    /// processor is shared by every agent of a type, so the set that answers
-    /// "was this id admitted to THIS log" cannot be the processor's: it is
-    /// the log's, and a batch staged for one log never blocks another.
-    logs: Vec<Option<SeenSet>>,
-    free_logs: Vec<u32>,
-    log_by_key: ptmcart_core::art::ArtMap<Box<[u8]>, u32>,
-    policy: CollisionPolicy,
-    column_capacity: u32,
-    /// Signal types whose ids live in the ordinal namespace, sorted, so a
-    /// row's namespace is one binary search over the type column.
-    ordinal_id_types: Vec<Box<[u8]>>,
-    /// Rows the discard policy keeps, one bit per row of the column plane;
-    /// sized once with the columns so a batch allocates nothing to filter.
-    keep_mask: Vec<u8>,
     /// Reusable MessagePack workspace for declared Binary values and
     /// internal batches.
     work_buffer: Vec<u8>,
@@ -294,12 +258,12 @@ pub struct EventProcessor {
 impl EventProcessor {
     /// Init with schema + field names (the primary path; names enable JSON
     /// key matching). `column_capacity` sizes the batch columns; the wasm
-    /// exports build every handle at [`WASM_EVENT_CAPACITY`]. `policy` is
-    /// what every seen-set opened on this processor does with a duplicate.
+    /// exports build every handle at [`WASM_EVENT_CAPACITY`]. `options`
+    /// selects the base scanner path, MessagePack workspace growth, and
+    /// header diagnostics.
     pub fn new(
-        wiring: EpWiring,
+        options: ParseOptions,
         column_capacity: u32,
-        policy: CollisionPolicy,
         schema_config: DynamicSchemaConfig,
     ) -> Result<Self, EpInitError> {
         let semantic_schemas = schema_config
@@ -334,21 +298,14 @@ impl EventProcessor {
         };
 
         Ok(Self {
-            use_base_scanners: wiring.base_path && schema_config.is_base_event_log,
+            use_base_scanners: options.base_path && schema_config.is_base_event_log,
             dynamic_columns: DynamicColumns::new(&schema_config.field_metadata, column_capacity),
             record_batch_metadata,
-            logs: Vec::new(),
-            free_logs: Vec::new(),
-            log_by_key: ptmcart_core::art::ArtMap::new(),
-            policy,
-            column_capacity: column_capacity.min(MAX_EVENTS_PER_BATCH),
-            ordinal_id_types: Vec::new(),
-            keep_mask: vec![0; (column_capacity.min(MAX_EVENTS_PER_BATCH) as usize).div_ceil(8)],
             extraction_config,
             semantic_schemas,
             last_validation_diagnostic: None,
             schema_config,
-            wiring,
+            options,
             work_buffer: vec![0; INITIAL_WORK_BUFFER_SIZE],
             fallback_work_buffer: vec![0; INITIAL_FALLBACK_WORK_BUFFER_SIZE],
         })
@@ -376,55 +333,63 @@ impl EventProcessor {
         Ok(())
     }
 
-    /// Open (or find) the seen-set of the destination log named by `key`,
-    /// with `ceiling` as the most ids it may hold; the slot it answers is
-    /// what every dedup call names. A key already open keeps its set and its
-    /// ceiling. `Err` when this wiring has no dedup.
-    pub fn open_log(&mut self, key: &[u8], ceiling: u32) -> Result<u32, ResultCode> {
-        if !self.wiring.dedup || key.is_empty() {
-            return Err(ResultCode::InvalidInput);
+    /// The retained schema configuration.
+    pub fn schema_config(&self) -> &DynamicSchemaConfig {
+        &self.schema_config
+    }
+
+    /// Run the semantic precheck on `input` and, on success, hand back the
+    /// proof that it completed: a [`ValidatedInput`] that can be extracted
+    /// exactly once. The processor retains its one column plane; nothing is
+    /// cloned or re-validated downstream.
+    ///
+    /// [`ProcessError`] on a semantic refusal carries the header's
+    /// diagnostic bytes; the structured path/message form is available
+    /// through [`EventProcessor::payload_validation_diagnostic`].
+    pub fn validate<'a>(
+        &'a mut self,
+        input: &'a [u8],
+        format: InputFormat,
+    ) -> Result<ValidatedInput<'a>, ProcessError> {
+        self.last_validation_diagnostic = None;
+        if let Some((event_index, event_type, violation)) = self.validate_input(input, format) {
+            self.last_validation_diagnostic = Some(PayloadValidationDiagnostic {
+                stage: diagnostic_stage::VALIDATION,
+                detail: diagnostic_detail::PAYLOAD_VIOLATION,
+                event_index: u32::try_from(event_index).unwrap_or(u32::MAX),
+                signal_type: event_type,
+                path: violation.path,
+                expected: violation.expected,
+                observed: violation.observed,
+            });
+            return Err(ProcessError {
+                code: ResultCode::ParseError,
+                diagnostic: Some(ResultDiagnostic {
+                    stage: diagnostic_stage::VALIDATION,
+                    detail: diagnostic_detail::PAYLOAD_VIOLATION,
+                    ..ResultDiagnostic::default()
+                }),
+            });
         }
-        if let Some(slot) = self.log_by_key.get(key) {
-            return Ok(*slot);
-        }
-        let set = SeenSet::new(self.policy, ceiling, self.column_capacity);
-        let slot = match self.free_logs.pop() {
-            Some(slot) => {
-                self.logs[slot as usize] = Some(set);
-                slot
-            }
-            None => {
-                let slot = u32::try_from(self.logs.len()).map_err(|_| ResultCode::OutOfMemory)?;
-                self.logs.push(Some(set));
-                slot
-            }
-        };
-        self.log_by_key.insert(Box::from(key), slot);
-        Ok(slot)
+        Ok(ValidatedInput {
+            processor: self,
+            input,
+            format,
+        })
     }
 
-    /// Close the seen-set opened for `key`, releasing what it holds.
-    /// `InvalidInput` when no such log is open.
-    pub fn close_log(&mut self, key: &[u8]) -> ResultCode {
-        let Some(slot) = self.log_by_key.remove(key) else {
-            return ResultCode::InvalidInput;
-        };
-        self.logs[slot as usize] = None;
-        self.free_logs.push(slot);
-        ResultCode::Ok
+    /// The convenience composition: semantic validation, then extraction
+    /// into the retained column plane.
+    pub fn parse<'a>(
+        &'a mut self,
+        input: &'a [u8],
+        format: InputFormat,
+    ) -> Result<ParsedBatch<'a>, ProcessError> {
+        self.validate(input, format)?.parse()
     }
 
-    /// The seen-set at `slot`, if open.
-    pub fn log(&self, slot: u32) -> Option<&SeenSet> {
-        self.logs.get(slot as usize).and_then(Option::as_ref)
-    }
-
-    fn log_mut(&mut self, slot: u32) -> Option<&mut SeenSet> {
-        self.logs.get_mut(slot as usize).and_then(Option::as_mut)
-    }
-
-    /// Process one input batch into `output` with no seen-set — validation
-    /// and encoding only, the admission boundary's call:
+    /// Process one input batch into `output` with no seen-set — validation,
+    /// extraction and encoding only, the admission boundary's call:
     /// `[ResultHeader 32B][Arrow IPC stream]`. Returns the header's code.
     pub fn create_log_entry(
         &mut self,
@@ -432,66 +397,104 @@ impl EventProcessor {
         format: InputFormat,
         output: &mut [u8],
     ) -> ResultCode {
-        self.create_log_entry_for(None, input, format, output)
-    }
-
-    /// Process one input batch destined for the log at `log` (a slot from
-    /// [`EventProcessor::open_log`]; `None` judges nothing): the batch is
-    /// judged against that log's seen-set and staged there under the batch
-    /// id the result header carries at [`BATCH_ID_OFFSET`], until
-    /// [`EventProcessor::commit_batch`] or [`EventProcessor::abandon_batch`]
-    /// names that id. Batches for one log may be in flight together.
-    pub fn create_log_entry_for(
-        &mut self,
-        log: Option<u32>,
-        input: &[u8],
-        format: InputFormat,
-        output: &mut [u8],
-    ) -> ResultCode {
         if output.len() < RESULT_HEADER_SIZE {
             return ResultCode::OutOfMemory;
         }
-        self.last_validation_diagnostic = None;
-        let arrow_offset = RESULT_HEADER_SIZE as u32;
-        if let Some((event_index, event_type, violation)) = self.validate_input(input, format) {
-            self.last_validation_diagnostic = Some(PayloadValidationDiagnostic {
-                stage: diagnostic_stage::VALIDATION,
-                detail: diagnostic_detail::PAYLOAD_VIOLATION,
-                event_index: event_index as u32,
-                signal_type: event_type,
-                path: violation.path,
-                expected: violation.expected,
-                observed: violation.observed,
-            });
-            if self.wiring.diagnostics {
-                write_result_header_with_diagnostic(
-                    output,
-                    ResultCode::ParseError,
-                    &ResultDiagnostic {
-                        stage: diagnostic_stage::VALIDATION,
-                        detail: diagnostic_detail::PAYLOAD_VIOLATION,
-                        ..ResultDiagnostic::default()
-                    },
-                );
-            } else {
-                write_result_header(output, ResultCode::ParseError, 0, 0, 0, 0);
+        match self.parse(input, format) {
+            Ok(batch) => batch.encode(output),
+            Err(error) => {
+                match error.diagnostic {
+                    Some(diagnostic) if self.options.diagnostics => {
+                        write_result_header_with_diagnostic(output, error.code as u32, &diagnostic);
+                    }
+                    _ => write_result_header(output, error.code as u32, 0, 0, 0),
+                }
+                error.code
             }
-            return ResultCode::ParseError;
         }
-
-        // The scanners write the four base event-log columns by index, so the
-        // schema must BE that event log — not merely have four fields.
-        if self.use_base_scanners {
-            return self.create_log_entry_base(input, format, output, arrow_offset);
-        }
-        if let Some(slot) = log
-            && self.log(slot).is_none()
-        {
-            write_result_header(output, ResultCode::InvalidInput, 0, 0, 0, 0);
-            return ResultCode::InvalidInput;
-        }
-        self.create_log_entry_dynamic(log, input, format, output, arrow_offset)
     }
+}
+
+/// Proof that the semantic precheck on one input completed. Consumed by
+/// [`ValidatedInput::parse`], which extracts into the processor's retained
+/// column plane exactly once.
+pub struct ValidatedInput<'a> {
+    processor: &'a mut EventProcessor,
+    input: &'a [u8],
+    format: InputFormat,
+}
+
+impl<'a> ValidatedInput<'a> {
+    /// Extract the validated input into the retained column plane. The
+    /// scanners write the four base event-log columns by index when the
+    /// options keep the base path and the schema IS that event log.
+    pub fn parse(self) -> Result<ParsedBatch<'a>, ProcessError> {
+        let ValidatedInput {
+            processor,
+            input,
+            format,
+        } = self;
+        if processor.use_base_scanners {
+            return processor.parse_base(input, format);
+        }
+        processor.parse_dynamic(input, format)
+    }
+}
+
+/// The parsed batch: borrowed views of the processor's one column plane,
+/// schema configuration and mutable Arrow IPC metadata. Consuming
+/// [`ParsedBatch::encode`] releases those borrows.
+pub struct ParsedBatch<'a> {
+    columns: &'a mut DynamicColumns,
+    schema_config: &'a DynamicSchemaConfig,
+    record_batch_metadata: &'a mut MetadataStorage,
+}
+
+impl ParsedBatch<'_> {
+    /// The extracted columns, for direct admission judgment (the per-log
+    /// owner filters rows through its own keep mask before encoding).
+    pub fn columns_mut(&mut self) -> &mut DynamicColumns {
+        self.columns
+    }
+
+    /// Rows currently in the columns.
+    pub fn row_count(&self) -> u32 {
+        self.columns.count
+    }
+
+    /// Encode the columns into `[ResultHeader][Arrow IPC]`, writing a
+    /// success header with zeroed bytes 16..32. `Err` means the encoded
+    /// batch did not fit — nothing reached the caller.
+    pub fn encode(self, output: &mut [u8]) -> ResultCode {
+        let rows = self.columns.count;
+        match write_arrow_ipc_from_dynamic_columns(
+            self.columns,
+            self.schema_config,
+            &mut output[RESULT_HEADER_SIZE..],
+            self.record_batch_metadata,
+        ) {
+            Ok(len) => {
+                let written = u32::try_from(len)
+                    .unwrap_or_else(|_| columine_types::die!("dynamic IPC length exceeds u32"));
+                write_result_header(
+                    output,
+                    ResultCode::Ok as u32,
+                    RESULT_HEADER_SIZE as u32,
+                    written,
+                    rows,
+                );
+                ResultCode::Ok
+            }
+            Err(
+                IpcError::BufferTooSmall { .. } | IpcError::InvalidColumn | IpcError::SizeOverflow,
+            ) => {
+                write_result_header(output, ResultCode::EncodeError as u32, 0, 0, 0);
+                ResultCode::EncodeError
+            }
+        }
+    }
+}
+impl EventProcessor {
     fn validate_input(
         &self,
         input: &[u8],
@@ -579,11 +582,10 @@ impl EventProcessor {
                     .unwrap_or_else(|_| columine_types::die!("compact IPC length exceeds u32"));
                 write_result_header(
                     output,
-                    ResultCode::Ok,
+                    ResultCode::Ok as u32,
                     RESULT_HEADER_SIZE as u32,
                     written,
                     view.row_count(),
-                    0,
                 );
                 ResultCode::Ok
             }
@@ -604,82 +606,71 @@ impl EventProcessor {
         }
     }
 
-    /// BASE PATH (columine npm variant): the base event-log scanners, which
-    /// write the four `BASE_EVENT_LOG_FIELDS` columns by index. Selected only
-    /// when the schema IS that event log, and it shares the one column store
-    /// and the one IPC writer with the extraction path.
-    fn create_log_entry_base(
+    /// BASE PATH: the base event-log scanners, which write the four
+    /// `BASE_EVENT_LOG_FIELDS` columns by index. Selected only when the
+    /// options keep the base path and the schema IS that event log, and it
+    /// shares the one column store and the one IPC writer with the
+    /// extraction path.
+    fn parse_base(
         &mut self,
         input: &[u8],
         format: InputFormat,
-        output: &mut [u8],
-        arrow_offset: u32,
-    ) -> ResultCode {
+    ) -> Result<ParsedBatch<'_>, ProcessError> {
         let cols = &mut self.dynamic_columns;
         cols.reset();
 
         let parse_result = match format {
             InputFormat::Json => {
-                json_scanner::parse_json_events(input, cols).map_err(|_| ResultCode::ParseError)
+                json_scanner::parse_json_events(input, cols).map_err(|_| ProcessError {
+                    code: ResultCode::ParseError,
+                    diagnostic: None,
+                })
             }
-            InputFormat::Msgpack => msgpack_scanner::parse_msgpack_events(input, cols)
-                .map_err(|_| ResultCode::ParseError),
+            InputFormat::Msgpack => {
+                msgpack_scanner::parse_msgpack_events(input, cols).map_err(|_| ProcessError {
+                    code: ResultCode::ParseError,
+                    diagnostic: None,
+                })
+            }
             InputFormat::MsgpackStream => msgpack_scanner::parse_msgpack_stream(input, cols)
-                .map_err(|_| ResultCode::ParseError),
+                .map_err(|_| ProcessError {
+                    code: ResultCode::ParseError,
+                    diagnostic: None,
+                }),
             // Arrow passthrough is unsupported on the base path.
-            InputFormat::ArrowPassthrough => Err(ResultCode::InvalidFormat),
+            InputFormat::ArrowPassthrough => Err(ProcessError {
+                code: ResultCode::InvalidFormat,
+                diagnostic: None,
+            }),
         };
-        if parse_result.is_err() {
-            write_result_header(output, ResultCode::ParseError, 0, 0, 0, 0);
-            return ResultCode::ParseError;
-        }
+        parse_result?;
 
         // No dedup in columine — all events are processed.
-        let processed = self.dynamic_columns.count;
-        match write_arrow_ipc_from_dynamic_columns(
-            &self.dynamic_columns,
-            &self.schema_config,
-            &mut output[arrow_offset as usize..],
-            &mut self.record_batch_metadata,
-        ) {
-            Ok(len) => {
-                write_result_header(
-                    output,
-                    ResultCode::Ok,
-                    arrow_offset,
-                    len as u32,
-                    processed,
-                    0,
-                );
-                ResultCode::Ok
-            }
-            Err(
-                IpcError::BufferTooSmall { .. } | IpcError::InvalidColumn | IpcError::SizeOverflow,
-            ) => {
-                write_result_header(output, ResultCode::EncodeError, 0, 0, 0, 0);
-                ResultCode::EncodeError
-            }
-        }
+        Ok(ParsedBatch {
+            columns: &mut self.dynamic_columns,
+            schema_config: &self.schema_config,
+            record_batch_metadata: &mut self.record_batch_metadata,
+        })
     }
 
-    /// EXTRACTION PATH: extractors into `DynamicColumns`, optional dedup,
-    /// dynamic writer.
-    fn create_log_entry_dynamic(
+    /// EXTRACTION PATH: extractors into `DynamicColumns`.
+    fn parse_dynamic(
         &mut self,
-        log: Option<u32>,
         input: &[u8],
         format: InputFormat,
-        output: &mut [u8],
-        arrow_offset: u32,
-    ) -> ResultCode {
+    ) -> Result<ParsedBatch<'_>, ProcessError> {
         if format == InputFormat::ArrowPassthrough {
-            write_result_header(output, ResultCode::InvalidFormat, 0, 0, 0, 0);
-            return ResultCode::InvalidFormat;
+            return Err(ProcessError {
+                code: ResultCode::InvalidFormat,
+                diagnostic: None,
+            });
         }
         let Some(config) = self.extraction_config.take() else {
             // No field names: JSON keys cannot be matched to columns.
-            write_result_header(output, ResultCode::ParseError, 0, 0, 0, 0);
-            return ResultCode::ParseError;
+            return Err(ProcessError {
+                code: ResultCode::ParseError,
+                diagnostic: None,
+            });
         };
 
         let mut extraction_diagnostic = json_extractor::ExtractionDiagnostic::default();
@@ -692,103 +683,55 @@ impl EventProcessor {
                 json_extractor::ExtractionError::OutOfMemory => ResultCode::OutOfMemory,
                 _ => ResultCode::ParseError,
             };
-            if self.wiring.diagnostics {
-                // JSON carries a per-field diagnostic; MessagePack derives
-                // stage/detail from its error at this level.
-                let diagnostic = if format == InputFormat::Json {
-                    ResultDiagnostic {
-                        stage: extraction_diagnostic.stage,
-                        detail: extraction_diagnostic.detail,
-                        expected_type: extraction_diagnostic.expected_type,
-                        actual_type: extraction_diagnostic.actual_type,
-                        field_index: extraction_diagnostic.field_index,
-                        row_index: extraction_diagnostic.row_index,
-                    }
-                } else {
-                    // A batch past the column plane is a size refusal, not
-                    // malformed input: it names itself, and `row_index`
-                    // carries the plane's capacity — the batch size a
-                    // caller can retry with — as the JSON path's does.
-                    let (detail, row_index) = match err {
-                        json_extractor::ExtractionError::OutOfMemory => {
-                            (diagnostic_detail::OUT_OF_MEMORY, 0)
-                        }
-                        json_extractor::ExtractionError::BufferOverflow => {
-                            (diagnostic_detail::BUFFER_OVERFLOW, 0)
-                        }
-                        json_extractor::ExtractionError::TooManyEvents => (
-                            diagnostic_detail::TOO_MANY_EVENTS,
-                            u16::try_from(self.dynamic_columns.capacity).unwrap_or(u16::MAX),
-                        ),
-                        _ => (diagnostic_detail::INVALID_JSON, 0),
-                    };
-                    ResultDiagnostic {
-                        stage: diagnostic_stage::MSGPACK,
-                        detail,
-                        expected_type: 0,
-                        actual_type: 0,
-                        field_index: NO_FIELD,
-                        row_index,
-                    }
-                };
-                write_result_header_with_diagnostic(output, code, &diagnostic);
+            // JSON carries a per-field diagnostic; MessagePack derives
+            // stage/detail from its error at this level.
+            let diagnostic = if format == InputFormat::Json {
+                ResultDiagnostic {
+                    stage: extraction_diagnostic.stage,
+                    detail: extraction_diagnostic.detail,
+                    expected_type: extraction_diagnostic.expected_type,
+                    actual_type: extraction_diagnostic.actual_type,
+                    field_index: extraction_diagnostic.field_index,
+                    row_index: extraction_diagnostic.row_index,
+                }
             } else {
-                write_result_header(output, code, 0, 0, 0, 0);
-            }
-            return code;
+                // A batch past the column plane is a size refusal, not
+                // malformed input: it names itself, and `row_index`
+                // carries the plane's capacity — the batch size a
+                // caller can retry with — as the JSON path's does.
+                let (detail, row_index) = match err {
+                    json_extractor::ExtractionError::OutOfMemory => {
+                        (diagnostic_detail::OUT_OF_MEMORY, 0)
+                    }
+                    json_extractor::ExtractionError::BufferOverflow => {
+                        (diagnostic_detail::BUFFER_OVERFLOW, 0)
+                    }
+                    json_extractor::ExtractionError::TooManyEvents => (
+                        diagnostic_detail::TOO_MANY_EVENTS,
+                        u16::try_from(self.dynamic_columns.capacity).unwrap_or(u16::MAX),
+                    ),
+                    _ => (diagnostic_detail::INVALID_JSON, 0),
+                };
+                ResultDiagnostic {
+                    stage: diagnostic_stage::MSGPACK,
+                    detail,
+                    expected_type: 0,
+                    actual_type: 0,
+                    field_index: NO_FIELD,
+                    row_index,
+                }
+            };
+            return Err(ProcessError {
+                code,
+                diagnostic: Some(diagnostic),
+            });
         }
 
-        // Dedup: judge event ids from column 0 (type from column 1) against
-        // the destination log's seen-set; discarded rows leave the batch.
-        let seen = log.and_then(|slot| self.logs.get_mut(slot as usize).and_then(Option::as_mut));
-        let (batch, processed, duplicates) = match judge_batch(
-            seen,
-            &self.ordinal_id_types,
-            &mut self.dynamic_columns,
-            &mut self.keep_mask,
-        ) {
-            Ok(counts) => counts,
-            Err(diagnostic) => {
-                let code = ResultCode::AdmissionRefused;
-                if self.wiring.diagnostics {
-                    write_result_header_with_diagnostic(output, code, &diagnostic);
-                } else {
-                    write_result_header(output, code, 0, 0, 0, 0);
-                }
-                return code;
-            }
-        };
-
-        match write_arrow_ipc_from_dynamic_columns(
-            &self.dynamic_columns,
-            &self.schema_config,
-            &mut output[arrow_offset as usize..],
-            &mut self.record_batch_metadata,
-        ) {
-            Ok(len) => {
-                write_result_header(
-                    output,
-                    ResultCode::Ok,
-                    arrow_offset,
-                    len as u32,
-                    processed,
-                    duplicates,
-                );
-                write_batch_id(output, batch);
-                ResultCode::Ok
-            }
-            Err(
-                IpcError::BufferTooSmall { .. } | IpcError::InvalidColumn | IpcError::SizeOverflow,
-            ) => {
-                // The batch stays staged for nothing: the caller never
-                // learns its id, so it is retracted here.
-                if let Some(seen) = log.and_then(|slot| self.log_mut(slot)) {
-                    let _ = seen.abandon(batch);
-                }
-                write_result_header(output, ResultCode::EncodeError, 0, 0, 0, 0);
-                ResultCode::EncodeError
-            }
-        }
+        Ok(ParsedBatch {
+            columns: &mut self.dynamic_columns,
+            schema_config: &self.schema_config,
+            record_batch_metadata: &mut self.record_batch_metadata,
+        })
     }
 
     /// Extraction with workspace growth-and-retry
@@ -835,7 +778,7 @@ impl EventProcessor {
                     let workspace_overflow = !fallback
                         || (diagnostic.stage == diagnostic_stage::MSGPACK
                             && diagnostic.detail == diagnostic_detail::BUFFER_OVERFLOW);
-                    let may_grow = workspace_overflow && (fallback || self.wiring.msgpack_growth);
+                    let may_grow = workspace_overflow && (fallback || self.options.msgpack_growth);
                     if !may_grow || self.grow_work_buffer(fallback).is_err() {
                         return Err(json_extractor::ExtractionError::BufferOverflow);
                     }
@@ -844,268 +787,24 @@ impl EventProcessor {
             }
         }
     }
-
-    /// Bytes a checkpoint of the log's seen-set takes right now; 0 when no
-    /// such log is open.
-    pub fn checkpoint_len(&self, log: u32) -> usize {
-        self.log(log).map_or(0, SeenSet::checkpoint_len)
-    }
-
-    /// Checkpoint the log's seen-set into `output`; 0 = error (no such log
-    /// or buffer too small), matching `ep_checkpoint`'s sentinel.
-    pub fn checkpoint(&self, log: u32, output: &mut [u8]) -> usize {
-        let Some(seen) = self.log(log) else {
-            return 0;
-        };
-        seen.checkpoint(output).unwrap_or(0)
-    }
-
-    /// Restore the log's seen-set from checkpoint bytes (`ep_restore`). The
-    /// set keeps the ceiling it was opened with; a checkpoint that does not
-    /// fit under it is refused with the set untouched.
-    pub fn restore(&mut self, log: u32, input: &[u8]) -> ResultCode {
-        let Some(seen) = self.log_mut(log) else {
-            return ResultCode::InvalidInput;
-        };
-        match seen.restore(input) {
-            Ok(()) => ResultCode::Ok,
-            Err(dedup::checkpoint::DeserializeError::ExceedsCeiling) => {
-                ResultCode::AdmissionRefused
-            }
-            Err(_) => ResultCode::ParseError,
-        }
-    }
-
-    /// Packed dedup stats of the log's seen-set (`ep_get_stats`):
-    /// `total_events as u32 | duplicates as u32 << 32` (u32 truncation is ABI).
-    pub fn stats(&self, log: u32) -> u64 {
-        let Some(seen) = self.log(log) else {
-            return 0;
-        };
-        let total = seen.total_events as u32;
-        let dupes = seen.duplicates_detected as u32;
-        u64::from(total) | (u64::from(dupes) << 32)
-    }
-
-    /// Bind the log's in-flight `batch` to the tx the log assigned it.
-    /// `InvalidInput` when no such log is open, `UnknownBatch` when the log
-    /// has no such batch in flight.
-    pub fn commit_batch(&mut self, log: u32, batch: u32, tx: u64) -> ResultCode {
-        let Some(seen) = self.log_mut(log) else {
-            return ResultCode::InvalidInput;
-        };
-        match seen.commit(batch, tx) {
-            Ok(()) => ResultCode::Ok,
-            Err(_) => ResultCode::UnknownBatch,
-        }
-    }
-
-    /// Retract the log's in-flight `batch`: the append did not happen.
-    pub fn abandon_batch(&mut self, log: u32, batch: u32) -> ResultCode {
-        let Some(seen) = self.log_mut(log) else {
-            return ResultCode::InvalidInput;
-        };
-        match seen.abandon(batch) {
-            Ok(()) => ResultCode::Ok,
-            Err(_) => ResultCode::UnknownBatch,
-        }
-    }
-
-    /// Evict every admission of the log below the redelivery horizon; the
-    /// count that left the set, 0 when no such log is open.
-    pub fn cut_below(&mut self, log: u32, horizon: u64) -> u32 {
-        self.log_mut(log).map_or(0, |seen| seen.cut_below(horizon))
-    }
-
-    /// The tx that admitted `id` to the log: the byproduct read of the
-    /// seen-set.
-    pub fn admitted_tx(&self, log: u32, id: &[u8], namespace: IdNamespace) -> AdmittedTx {
-        let Some(seen) = self.log(log) else {
-            return AdmittedTx::Absent;
-        };
-        match namespace {
-            IdNamespace::Bytes => seen
-                .admitted_tx(id)
-                .map_or(AdmittedTx::Absent, AdmittedTx::At),
-            IdNamespace::Ordinal if seen.contains_ordinal(id) => AdmittedTx::Member,
-            IdNamespace::Ordinal => AdmittedTx::Absent,
-        }
-    }
-
-    /// Declare the signal types whose ids live in the ordinal namespace:
-    /// NUL-separated names, declared once per processor before any log is
-    /// opened.
-    pub fn declare_ordinal_id_types(&mut self, names: &[u8]) -> ResultCode {
-        if !self.wiring.dedup
-            || !self.ordinal_id_types.is_empty()
-            || !self.logs.is_empty()
-            || names.is_empty()
-        {
-            return ResultCode::InvalidInput;
-        }
-        let mut types: Vec<Box<[u8]>> = names
-            .split(|byte| *byte == 0)
-            .filter(|name| !name.is_empty())
-            .map(Box::from)
-            .collect();
-        if types.is_empty() {
-            return ResultCode::InvalidInput;
-        }
-        types.sort_unstable();
-        types.dedup();
-        self.ordinal_id_types = types;
-        ResultCode::Ok
-    }
-
-    /// Judge the rows of a column plane that is not this processor's own —
-    /// a transport lane that shreds its own frames — against the same
-    /// seen-set, the same declared namespaces, and the same keep mask, so no
-    /// two ingest paths can disagree about what a duplicate is.
-    pub fn judge_rows(
-        &mut self,
-        log: Option<u32>,
-        columns: &mut DynamicColumns,
-    ) -> Result<(u32, u32, u32), ResultDiagnostic> {
-        let seen = log.and_then(|slot| self.logs.get_mut(slot as usize).and_then(Option::as_mut));
-        judge_batch(seen, &self.ordinal_id_types, columns, &mut self.keep_mask)
-    }
-
-    /// The namespace a row's type column selects.
-    pub fn id_namespace_of(&self, signal_type: &[u8]) -> IdNamespace {
-        id_namespace_of(&self.ordinal_id_types, signal_type)
-    }
-
-    /// The declared ordinal-namespace signal types, sorted.
-    pub fn ordinal_id_types(&self) -> &[Box<[u8]>] {
-        &self.ordinal_id_types
-    }
 }
-
-/// Answer of [`EventProcessor::admitted_tx`].
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum AdmittedTx {
-    /// Not in the set (or staged, which is not admitted).
-    Absent,
-    /// Admitted by the entry at this tx.
-    At(u64),
-    /// A member of the ordinal carrier, which keeps membership only.
-    Member,
-}
-
-fn id_namespace_of(ordinal_id_types: &[Box<[u8]>], signal_type: &[u8]) -> IdNamespace {
-    if ordinal_id_types.is_empty() {
-        return IdNamespace::Bytes;
-    }
-    match ordinal_id_types.binary_search_by(|name| name.as_ref().cmp(signal_type)) {
-        Ok(_) => IdNamespace::Ordinal,
-        Err(_) => IdNamespace::Bytes,
-    }
-}
-
-/// Judge every row of `columns` against the seen-set as one new batch:
-/// `(batch, processed, duplicates)` on success, with discarded rows
-/// compacted out of the batch and the batch staged under `batch`; on
-/// refusal the diagnostic names the row and the cause, and the set is as it
-/// was before the batch. `None` seen-set means no dedup is wired, and the
-/// batch id is 0.
-pub fn judge_batch(
-    seen: Option<&mut SeenSet>,
-    ordinal_id_types: &[Box<[u8]>],
-    columns: &mut DynamicColumns,
-    keep_mask: &mut [u8],
-) -> Result<(u32, u32, u32), ResultDiagnostic> {
-    let Some(seen) = seen else {
-        return Ok((0, columns.count, 0));
-    };
-    let batch = seen.next_batch();
-    let discard = seen.policy() == CollisionPolicy::Discard;
-    let mut processed = 0u32;
-    let mut duplicates = 0u32;
-    keep_mask.fill(0);
-    for row in 0..columns.count {
-        let event_id = columns.columns[0]
-            .read_variable(row)
-            .unwrap_or_else(|| columine_types::die!("id column is not variable-width"));
-        let namespace = if ordinal_id_types.is_empty() {
-            IdNamespace::Bytes
-        } else {
-            let signal_type = columns.columns[1]
-                .read_variable(row)
-                .unwrap_or_else(|| columine_types::die!("type column is not variable-width"));
-            id_namespace_of(ordinal_id_types, signal_type)
-        };
-        match seen.should_process(batch, event_id, namespace) {
-            Ok(true) => {
-                processed += 1;
-                keep_mask[row as usize / 8] |= 1u8 << (row % 8);
-            }
-            Ok(false) => duplicates += 1,
-            Err(refusal) => {
-                // The batch is open only once a row was judged; a refusal
-                // on its first row has nothing to retract.
-                let _ = seen.abandon(batch);
-                return Err(refusal_diagnostic(refusal, row));
-            }
-        }
-    }
-    if discard && duplicates > 0 {
-        columns.retain_rows(keep_mask);
-    }
-    Ok((batch, processed, duplicates))
-}
-
-/// Offset of the batch id in a successful result header: the four bytes the
-/// diagnostic lane occupies on failure, unused on success until now.
-pub const BATCH_ID_OFFSET: usize = 20;
-
-/// Record the batch id a successful judged entry was staged under.
-pub fn write_batch_id(output: &mut [u8], batch: u32) {
-    output[BATCH_ID_OFFSET..BATCH_ID_OFFSET + 4].copy_from_slice(&batch.to_le_bytes());
-}
-
-/// The batch id a successful judged entry was staged under (0 when no log
-/// was named).
-pub fn read_batch_id(output: &[u8]) -> u32 {
-    u32::from_le_bytes([
-        output[BATCH_ID_OFFSET],
-        output[BATCH_ID_OFFSET + 1],
-        output[BATCH_ID_OFFSET + 2],
-        output[BATCH_ID_OFFSET + 3],
-    ])
-}
-
-fn refusal_diagnostic(refusal: AdmissionRefusal, row: u32) -> ResultDiagnostic {
-    let detail = match refusal {
-        AdmissionRefusal::IdTooLong { .. } => dedup_detail::ID_TOO_LONG,
-        AdmissionRefusal::CeilingReached { .. } => dedup_detail::CEILING_REACHED,
-        AdmissionRefusal::NotAnOrdinal => dedup_detail::NOT_AN_ORDINAL,
-        AdmissionRefusal::UnknownBatch { .. } => dedup_detail::BATCH_UNKNOWN,
-    };
-    ResultDiagnostic {
-        stage: diagnostic_stage::DEDUP,
-        detail,
-        expected_type: 0,
-        actual_type: 0,
-        field_index: 0,
-        row_index: u16::try_from(row).unwrap_or(u16::MAX),
-    }
-}
-
-/// Write the 32-byte result header (`writeResultHeader`).
+/// Write the 32-byte result header (`writeResultHeader`). The code is a raw
+/// u32: this is the byte primitive every header writer casts into, so a
+/// status vocabulary extension (admission codes 8 and 9) composes on
+/// the same bytes. The success posture is the zeroed tail: bytes 16..32
+/// carry nothing — the admission layer decorates them itself.
 pub fn write_result_header(
     output: &mut [u8],
-    code: ResultCode,
+    code: u32,
     arrow_offset: u32,
     arrow_len: u32,
-    events_processed: u32,
-    duplicates_filtered: u32,
+    rows: u32,
 ) {
-    output[0..4].copy_from_slice(&(code as u32).to_le_bytes());
+    output[0..4].copy_from_slice(&code.to_le_bytes());
     output[4..8].copy_from_slice(&arrow_offset.to_le_bytes());
     output[8..12].copy_from_slice(&arrow_len.to_le_bytes());
-    output[12..16].copy_from_slice(&events_processed.to_le_bytes());
-    output[16..20].copy_from_slice(&duplicates_filtered.to_le_bytes());
-    output[20..32].fill(0);
+    output[12..16].copy_from_slice(&rows.to_le_bytes());
+    output[16..32].fill(0);
 }
 
 fn write_diagnostic_bytes(output: &mut [u8], diagnostic: &ResultDiagnostic) {
@@ -1128,7 +827,7 @@ pub fn write_compact_result_header(
     rows: u32,
     diagnostic: &ResultDiagnostic,
 ) {
-    write_result_header(output, code, arrow_offset, arrow_len, rows, 0);
+    write_result_header(output, code as u32, arrow_offset, arrow_len, rows);
     write_diagnostic_bytes(output, diagnostic);
 }
 
@@ -1144,13 +843,14 @@ fn compact_encode_diagnostic() -> ResultDiagnostic {
 }
 
 /// Write the header with the diagnostic packed into the reserved bytes
-/// (`writeResultHeaderWithDiagnostic`, consumer artifact).
+/// (`writeResultHeaderWithDiagnostic`).
 pub fn write_result_header_with_diagnostic(
     output: &mut [u8],
-    code: ResultCode,
+    code: u32,
     diagnostic: &ResultDiagnostic,
 ) {
-    write_result_header(output, code, 0, 0, 0, 0);
+    output[0..4].copy_from_slice(&code.to_le_bytes());
+    output[4..20].fill(0);
     write_diagnostic_bytes(output, diagnostic);
 }
 
@@ -1168,6 +868,26 @@ mod tests {
     use columine_arrow::{ArrowType, SignalSchemaField};
     use std::io::Cursor;
 
+    /// columine's own artifact wiring: base scanner path, MessagePack
+    /// workspace growth, plain headers.
+    fn columine_options() -> ParseOptions {
+        ParseOptions {
+            base_path: true,
+            msgpack_growth: true,
+            diagnostics: false,
+        }
+    }
+
+    /// The admission composition's wiring: extraction-only, no growth
+    /// retry, diagnostics in the header.
+    fn admission_options() -> ParseOptions {
+        ParseOptions {
+            base_path: false,
+            msgpack_growth: false,
+            diagnostics: true,
+        }
+    }
+
     fn base_fields() -> Vec<SignalSchemaField> {
         vec![
             SignalSchemaField::new(ArrowType::Utf8, false),
@@ -1183,10 +903,9 @@ mod tests {
 
     #[test]
     fn compact_null_rows_ignore_parse_column_capacity_and_round_trip() {
-        let fields = [SignalSchemaField::new(ArrowType::Null, true)];
-        let schema = schema_with_names(&fields, b"null\0");
-        let mut processor =
-            EventProcessor::new(EpWiring::columine(), 1, CollisionPolicy::Latest, schema).unwrap();
+        let schema =
+            schema_with_names(&[SignalSchemaField::new(ArrowType::Null, true)], b"value\0");
+        let mut processor = EventProcessor::new(columine_options(), 1, schema).unwrap();
 
         let mut request = vec![0u8; COMPACT_HEADER_SIZE + COMPACT_DESCRIPTOR_SIZE];
         request[0..4].copy_from_slice(&COMPACT_BATCH_MAGIC.to_le_bytes());
@@ -1218,17 +937,10 @@ mod tests {
         assert!(reader.next().is_none());
     }
 
-    // test "ep_create_log_entry with schema" (consumer variant)
     #[test]
-    fn create_log_entry_consumer_variant_json() {
+    fn create_log_entry_json() {
         let schema = schema_with_names(&base_fields(), b"id\0type\0timestamp\0value\0");
-        let mut ep = EventProcessor::new(
-            EpWiring::consumer_variant(),
-            100,
-            CollisionPolicy::Latest,
-            schema,
-        )
-        .unwrap();
+        let mut ep = EventProcessor::new(admission_options(), 100, schema).unwrap();
         let input = br#"[{"id":"test","type":"click","timestamp":1705315800000000}]"#;
         let mut output = vec![0u8; 64 * 1024];
         assert_eq!(
@@ -1243,14 +955,11 @@ mod tests {
         assert_eq!(dupes, 0);
     }
 
-    // test "ep_create_log_entry with schema" (columine base-path variant)
     #[test]
-    fn create_log_entry_columine_base_path() {
+    fn create_log_entry_base_path() {
         let schema = schema_with_names(&base_fields(), b"id\0type\0timestamp\0value\0");
         assert!(schema.is_base_event_log);
-        let mut ep =
-            EventProcessor::new(EpWiring::columine(), 100, CollisionPolicy::Latest, schema)
-                .unwrap();
+        let mut ep = EventProcessor::new(columine_options(), 100, schema).unwrap();
         assert!(ep.use_base_scanners);
         let input =
             br#"[{"id":"a-1","type":"click","timestamp":100,"value":{"x":1}},{"id":"a-2","type":"view","timestamp":200}]"#;
@@ -1264,9 +973,6 @@ mod tests {
         assert!(arrow_len > 0);
         assert_eq!(processed, 2);
         assert_eq!(dupes, 0);
-        // No dedup wired: a log cannot be opened, and no slot answers.
-        assert_eq!(ep.open_log(b"log", 10), Err(ResultCode::InvalidInput));
-        assert_eq!(ep.stats(0), 0);
     }
 
     /// Base and extraction paths emit byte-identical IPC for the same
@@ -1282,9 +988,8 @@ mod tests {
         let dyn_input = br#"[{"id":"a-1","type":"click","timestamp":100000}]"#;
 
         let mut base_ep = EventProcessor::new(
-            EpWiring::columine(),
+            columine_options(),
             10,
-            CollisionPolicy::Latest,
             schema_with_names(&base_fields(), names),
         )
         .unwrap();
@@ -1295,9 +1000,8 @@ mod tests {
         );
 
         let mut dyn_ep = EventProcessor::new(
-            EpWiring::consumer_variant(),
+            admission_options(),
             10,
-            CollisionPolicy::Latest,
             schema_with_names(&base_fields(), names),
         )
         .unwrap();
@@ -1311,22 +1015,16 @@ mod tests {
         let (_, dyn_off, dyn_len, ..) = read_result_header(&dyn_out);
         assert_eq!(base_len, dyn_len);
         assert_eq!(
-            base_out[base_off as usize..(base_off + base_len) as usize],
-            dyn_out[dyn_off as usize..(dyn_off + dyn_len) as usize]
+            &base_out[base_off as usize..(base_off + base_len) as usize],
+            &dyn_out[dyn_off as usize..(dyn_off + dyn_len) as usize],
+            "base and extraction paths emit byte-identical IPC"
         );
     }
 
-    // test "parse and extraction errors map to explicit result codes"
     #[test]
     fn error_result_codes() {
         let schema = schema_with_names(&base_fields(), b"id\0type\0timestamp\0value\0");
-        let mut ep = EventProcessor::new(
-            EpWiring::consumer_variant(),
-            10,
-            CollisionPolicy::Latest,
-            schema,
-        )
-        .unwrap();
+        let mut ep = EventProcessor::new(admission_options(), 10, schema).unwrap();
         let mut output = vec![0u8; 64 * 1024];
         assert_eq!(
             ep.create_log_entry(b"not json", InputFormat::Json, &mut output),
@@ -1334,7 +1032,7 @@ mod tests {
         );
         let (code, ..) = read_result_header(&output);
         assert_eq!(code, ResultCode::ParseError as u32);
-        // Diagnostic bytes occupy the reserved region for consumer wiring.
+        // Diagnostic bytes occupy the reserved region when diagnostics are on.
         assert_eq!(output[20], DIAGNOSTIC_ABI_VERSION);
         assert_eq!(output[21], diagnostic_stage::JSON);
 
@@ -1344,247 +1042,17 @@ mod tests {
         );
     }
 
-    /// The consumer wiring judges a batch against the destination log's own
-    /// seen-set — a batch staged for one log never blocks another — drops
-    /// discarded duplicates from the batch, counts them in the header, and
-    /// the committed set survives a checkpoint/restore round trip into a
-    /// log opened with its own ceiling.
-    #[test]
-    fn dedup_and_checkpoint_through_ep() {
-        let schema = schema_with_names(&base_fields(), b"id\0type\0timestamp\0value\0");
-        let mut ep = EventProcessor::new(
-            EpWiring::consumer_variant(),
-            100,
-            CollisionPolicy::Discard,
-            schema,
-        )
-        .unwrap();
-        let input = br#"[{"id":"dup","type":"a","timestamp":1},{"id":"dup","type":"a","timestamp":2},{"id":"uniq","type":"a","timestamp":3}]"#;
-        let mut output = vec![0u8; 64 * 1024];
-        // With no log named, the batch is validated and encoded, nothing
-        // judged: the admission boundary's call.
-        assert_eq!(
-            ep.create_log_entry(input, InputFormat::Json, &mut output),
-            ResultCode::Ok
-        );
-        let header = read_result_header(&output);
-        assert_eq!((header.3, header.4), (3, 0));
-        let log = ep.open_log(b"log-a", 100).unwrap();
-        assert_eq!(ep.open_log(b"log-a", 5).unwrap(), log, "a key opens once");
-        let other = ep.open_log(b"log-b", 100).unwrap();
-        assert_ne!(log, other);
-        assert_eq!(
-            ep.create_log_entry_for(Some(log), input, InputFormat::Json, &mut output),
-            ResultCode::Ok
-        );
-        let (_, arrow_offset, arrow_len, processed, dupes) = read_result_header(&output);
-        assert_eq!(processed, 2);
-        assert_eq!(dupes, 1);
-        // The discarded row is not in the batch: only two ids reach the body.
-        let body = &output[arrow_offset as usize..(arrow_offset + arrow_len) as usize];
-        assert_eq!(body.windows(3).filter(|w| *w == b"dup").count(), 1);
-        assert!(body.windows(4).any(|w| w == b"uniq"));
-        let first = read_batch_id(&output);
-        assert_ne!(first, 0, "a judged entry names its batch");
-        // Stats and the checkpoint see only committed batches.
-        assert_eq!(ep.stats(log), 0);
-        assert_eq!(ep.checkpoint_len(log), dedup::checkpoint::HEADER_SIZE);
-        // A second writer's batch on the same log is in flight beside the
-        // first: it sees the staged ids as duplicates and gets its own id.
-        assert_eq!(
-            ep.create_log_entry_for(Some(log), input, InputFormat::Json, &mut output),
-            ResultCode::Ok,
-        );
-        let second = read_batch_id(&output);
-        assert!(second != 0 && second != first);
-        assert_eq!(
-            read_result_header(&output).4,
-            3,
-            "every id is staged by the first batch"
-        );
-        assert_eq!(ep.abandon_batch(log, second), ResultCode::Ok);
-        assert_eq!(ep.abandon_batch(log, second), ResultCode::UnknownBatch);
-        // Another log's batch is its own.
-        assert_eq!(
-            ep.create_log_entry_for(Some(other), input, InputFormat::Json, &mut output),
-            ResultCode::Ok
-        );
-        let others = read_batch_id(&output);
-        assert_eq!(ep.abandon_batch(other, others), ResultCode::Ok);
-        assert_eq!(ep.commit_batch(log, first, 7), ResultCode::Ok);
-        assert_eq!(ep.commit_batch(log, first, 7), ResultCode::UnknownBatch);
-        assert_eq!(ep.stats(log), 3 | (1 << 32));
-        assert_eq!(
-            ep.admitted_tx(log, b"dup", IdNamespace::Bytes),
-            AdmittedTx::At(7)
-        );
-        assert_eq!(
-            ep.admitted_tx(other, b"dup", IdNamespace::Bytes),
-            AdmittedTx::Absent
-        );
-        assert_eq!(
-            ep.admitted_tx(log, b"nope", IdNamespace::Bytes),
-            AdmittedTx::Absent
-        );
-
-        let mut checkpoint_buf = vec![0u8; 8192];
-        let size = ep.checkpoint(log, &mut checkpoint_buf);
-        assert_eq!(size, ep.checkpoint_len(log));
-
-        let schema2 = schema_with_names(&base_fields(), b"id\0type\0timestamp\0value\0");
-        let mut restored = EventProcessor::new(
-            EpWiring::consumer_variant(),
-            100,
-            CollisionPolicy::Discard,
-            schema2,
-        )
-        .unwrap();
-        let rlog = restored.open_log(b"log-a", 100).unwrap();
-        assert_eq!(
-            restored.restore(rlog, &checkpoint_buf[..size]),
-            ResultCode::Ok
-        );
-        // The restored set still knows both ids, at the tx that admitted them.
-        assert_eq!(
-            restored.admitted_tx(rlog, b"dup", IdNamespace::Bytes),
-            AdmittedTx::At(7)
-        );
-        assert_eq!(
-            restored.admitted_tx(rlog, b"uniq", IdNamespace::Bytes),
-            AdmittedTx::At(7)
-        );
-        assert_eq!(restored.stats(rlog), 3 | (1 << 32));
-        // Cutting below the horizon evicts them; the ids are new again.
-        assert_eq!(restored.cut_below(rlog, 8), 2);
-        assert_eq!(
-            restored.admitted_tx(rlog, b"dup", IdNamespace::Bytes),
-            AdmittedTx::Absent
-        );
-        // Closing the log frees its slot for the next key.
-        assert_eq!(restored.close_log(b"log-a"), ResultCode::Ok);
-        assert_eq!(restored.close_log(b"log-a"), ResultCode::InvalidInput);
-        assert_eq!(restored.open_log(b"log-c", 100).unwrap(), rlog);
-
-        // A ceiling the checkpoint does not fit under refuses the restore.
-        let schema3 = schema_with_names(&base_fields(), b"id\0type\0timestamp\0value\0");
-        let mut tight = EventProcessor::new(
-            EpWiring::consumer_variant(),
-            100,
-            CollisionPolicy::Discard,
-            schema3,
-        )
-        .unwrap();
-        let tlog = tight.open_log(b"log-a", 1).unwrap();
-        assert_eq!(
-            tight.restore(tlog, &checkpoint_buf[..size]),
-            ResultCode::AdmissionRefused
-        );
-    }
-
-    /// An id past the 64-byte bound refuses the whole batch with the row
-    /// and cause in the diagnostic bytes, and the set is untouched.
-    #[test]
-    fn admission_refusal_names_the_row_and_leaves_the_set_untouched() {
-        let schema = schema_with_names(&base_fields(), b"id\0type\0timestamp\0value\0");
-        let mut ep = EventProcessor::new(
-            EpWiring::consumer_variant(),
-            100,
-            CollisionPolicy::Discard,
-            schema,
-        )
-        .unwrap();
-        let long = "x".repeat(MAX_ID_BYTES + 1);
-        let input = format!(
-            r#"[{{"id":"fine","type":"a","timestamp":1}},{{"id":"{long}","type":"a","timestamp":2}}]"#
-        );
-        let mut output = vec![0u8; 64 * 1024];
-        let log = ep.open_log(b"log", 100).unwrap();
-        assert_eq!(
-            ep.create_log_entry_for(Some(log), input.as_bytes(), InputFormat::Json, &mut output),
-            ResultCode::AdmissionRefused
-        );
-        assert_eq!(output[21], diagnostic_stage::DEDUP);
-        assert_eq!(output[22], dedup_detail::ID_TOO_LONG);
-        assert_eq!(u16::from_le_bytes([output[28], output[29]]), 1);
-        let seen = ep.log(log).unwrap();
-        assert!(seen.is_empty());
-        assert_eq!(seen.open_batches(), 0);
-        // A slot that was never opened is refused by name, not judged.
-        assert_eq!(
-            ep.create_log_entry_for(Some(99), input.as_bytes(), InputFormat::Json, &mut output),
-            ResultCode::InvalidInput
-        );
-
-        // The ceiling refuses at admission, the same way.
-        let small = ep.open_log(b"small", 1).unwrap();
-        let two = br#"[{"id":"a","type":"a","timestamp":1},{"id":"b","type":"a","timestamp":2}]"#;
-        assert_eq!(
-            ep.create_log_entry_for(Some(small), two, InputFormat::Json, &mut output),
-            ResultCode::AdmissionRefused
-        );
-        assert_eq!(output[22], dedup_detail::CEILING_REACHED);
-        assert!(ep.log(small).unwrap().is_empty());
-    }
-
-    /// A signal type declared in the ordinal namespace judges its ids as
-    /// ordinals; every other type keeps the byte namespace.
-    #[test]
-    fn ordinal_namespace_is_selected_by_the_type_column() {
-        let schema = schema_with_names(&base_fields(), b"id\0type\0timestamp\0value\0");
-        let mut ep = EventProcessor::new(
-            EpWiring::consumer_variant(),
-            100,
-            CollisionPolicy::Discard,
-            schema,
-        )
-        .unwrap();
-        assert_eq!(ep.declare_ordinal_id_types(b"tick\0"), ResultCode::Ok);
-        assert_eq!(
-            ep.declare_ordinal_id_types(b"tock\0"),
-            ResultCode::InvalidInput,
-            "declared once per processor"
-        );
-        let log = ep.open_log(b"log", 100).unwrap();
-        let input = br#"[{"id":"7","type":"tick","timestamp":1},{"id":"7","type":"other","timestamp":2},{"id":"7","type":"tick","timestamp":3}]"#;
-        let mut output = vec![0u8; 64 * 1024];
-        assert_eq!(
-            ep.create_log_entry_for(Some(log), input, InputFormat::Json, &mut output),
-            ResultCode::Ok
-        );
-        let (_, _, _, processed, dupes) = read_result_header(&output);
-        assert_eq!((processed, dupes), (2, 1));
-        assert_eq!(
-            ep.commit_batch(log, read_batch_id(&output), 1),
-            ResultCode::Ok
-        );
-        assert_eq!(
-            ep.admitted_tx(log, b"7", IdNamespace::Ordinal),
-            AdmittedTx::Member
-        );
-        assert_eq!(
-            ep.admitted_tx(log, b"7", IdNamespace::Bytes),
-            AdmittedTx::At(1)
-        );
-
-        let bad = br#"[{"id":"07","type":"tick","timestamp":1}]"#;
-        assert_eq!(
-            ep.create_log_entry_for(Some(log), bad, InputFormat::Json, &mut output),
-            ResultCode::AdmissionRefused
-        );
-        assert_eq!(output[22], dedup_detail::NOT_AN_ORDINAL);
-    }
-
     /// Result header layout pinned byte-for-byte (ResultHeader is 32 bytes;
     /// ResultDiagnostic 12 bytes at the reserved offset).
     #[test]
     fn result_header_layout_pinned() {
         let mut out = [0u8; RESULT_HEADER_SIZE];
-        write_result_header(&mut out, ResultCode::EncodeError, 32, 77, 5, 2);
+        write_result_header(&mut out, ResultCode::EncodeError as u32, 32, 77, 5);
         assert_eq!(u32::from_le_bytes(out[0..4].try_into().unwrap()), 3);
         assert_eq!(u32::from_le_bytes(out[4..8].try_into().unwrap()), 32);
         assert_eq!(u32::from_le_bytes(out[8..12].try_into().unwrap()), 77);
         assert_eq!(u32::from_le_bytes(out[12..16].try_into().unwrap()), 5);
-        assert_eq!(u32::from_le_bytes(out[16..20].try_into().unwrap()), 2);
+        assert_eq!(&out[16..32], &[0u8; 16], "success zeroes the whole tail");
         assert_eq!(&out[20..32], &[0u8; 12]);
 
         let diagnostic = ResultDiagnostic {
@@ -1595,7 +1063,7 @@ mod tests {
             field_index: 7,
             row_index: 9,
         };
-        write_result_header_with_diagnostic(&mut out, ResultCode::OutOfMemory, &diagnostic);
+        write_result_header_with_diagnostic(&mut out, ResultCode::OutOfMemory as u32, &diagnostic);
         // Diagnostic detail byte 4 is buffer_overflow in the ABI order decoded
         // by the TypeScript diagnostic vocabulary.
         assert_eq!(
@@ -1605,10 +1073,10 @@ mod tests {
         );
     }
 
-    /// msgpack workspace growth: columine wiring retries and succeeds where
-    /// consumer wiring surfaces the overflow — the drift axis pinned.
+    /// msgpack workspace growth: columine's options retry and succeed where
+    /// the admission options surface the overflow — the drift axis pinned.
     #[test]
-    fn msgpack_growth_is_wiring_dependent() {
+    fn msgpack_growth_is_options_dependent() {
         // The undeclared carrier schema forces the msgpack workspace into use with
         // an undeclared field large enough to overflow the initial 64K...
         // growing 64K deliberately is slow; instead shrink the buffers to
@@ -1621,16 +1089,9 @@ mod tests {
         let schema = schema_with_names(&fields, field_names.as_bytes());
         assert!(!schema.is_base_event_log);
 
-        let mut consumer_ep = EventProcessor::new(
-            EpWiring::consumer_variant(),
-            10,
-            CollisionPolicy::Latest,
-            schema.clone(),
-        )
-        .unwrap();
+        let mut consumer_ep = EventProcessor::new(admission_options(), 10, schema.clone()).unwrap();
         consumer_ep.work_buffer = vec![0; 8];
-        let mut col_ep =
-            EventProcessor::new(EpWiring::columine(), 10, CollisionPolicy::Latest, schema).unwrap();
+        let mut col_ep = EventProcessor::new(columine_options(), 10, schema).unwrap();
         col_ep.work_buffer = vec![0; 8];
 
         // Msgpack map {id:"x", big:"yyyyyyyyyyyyyyyy"} — undeclared `big`
@@ -1649,12 +1110,12 @@ mod tests {
         assert_eq!(
             consumer_ep.create_log_entry(&input, InputFormat::MsgpackStream, &mut output),
             ResultCode::ParseError,
-            "consumer wiring: no msgpack growth, overflow surfaces"
+            "admission options: no msgpack growth, overflow surfaces"
         );
         assert_eq!(
             col_ep.create_log_entry(&input, InputFormat::MsgpackStream, &mut output),
             ResultCode::Ok,
-            "columine wiring: workspace grows and the batch succeeds"
+            "columine options: workspace grows and the batch succeeds"
         );
     }
 
@@ -1670,13 +1131,7 @@ mod tests {
         let field_names = format!("id\0{}\0", columine_parsing::UNDECLARED_COLUMN_NAME);
         let schema = schema_with_names(&fields, field_names.as_bytes());
         const CAPACITY: u32 = 2;
-        let mut ep = EventProcessor::new(
-            EpWiring::consumer_variant(),
-            CAPACITY,
-            CollisionPolicy::Latest,
-            schema,
-        )
-        .unwrap();
+        let mut ep = EventProcessor::new(admission_options(), CAPACITY, schema).unwrap();
 
         // Three maps {id:"<n>"} back to back: one past the plane.
         let mut input = Vec::new();
@@ -1715,7 +1170,7 @@ mod tests {
     }
 
     #[test]
-    fn semantic_validation_refuses_before_extraction_or_dedup() {
+    fn semantic_validation_refuses_before_extraction() {
         let base = DynamicSchemaConfig::from_physical_fields_with_names(
             &[
                 SignalSchemaField::new(ArrowType::Utf8, false),
@@ -1732,13 +1187,7 @@ mod tests {
             ),
             ..base
         };
-        let mut ep = EventProcessor::new(
-            EpWiring::consumer_variant(),
-            8,
-            CollisionPolicy::Latest,
-            schema,
-        )
-        .unwrap();
+        let mut ep = EventProcessor::new(admission_options(), 8, schema).unwrap();
         let input = br#"[{"id":"greeting:42","type":"hi","timestamp":1,"value":{"greeting":42}}]"#;
         let mut output = vec![0xa5; 4096];
         assert_eq!(
