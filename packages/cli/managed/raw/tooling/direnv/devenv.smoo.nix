@@ -107,6 +107,7 @@
   # loudly at `ToolNotFound` and a host lint can never be mistaken for a cross one.
   profiles.linux-cross.module = let
     crossCC = pkgs.pkgsCross.gnu64.stdenv.cc;
+    crossLibc = lib.getDev crossCC.libc;
     tool = name: "${crossCC}/bin/${crossCC.targetPrefix}${name}";
   in {
     packages = [crossCC];
@@ -115,6 +116,8 @@
       CXX_x86_64_unknown_linux_gnu = tool "c++";
       AR_x86_64_unknown_linux_gnu = tool "ar";
       CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER = tool "cc";
+      # bindgen runs host libclang, which cannot infer the cross compiler's headers.
+      BINDGEN_EXTRA_CLANG_ARGS_x86_64_unknown_linux_gnu = "--target=x86_64-unknown-linux-gnu -isystem ${crossLibc}/include -isystem ${pkgs.pkgsCross.gnu64.linuxHeaders}/include";
     };
   };
 
