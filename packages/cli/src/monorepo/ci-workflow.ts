@@ -1,12 +1,18 @@
 /* biome-ignore-all lint/suspicious/noTemplateCurlyInString: GitHub Actions expressions are emitted literally. */
 
-import type { PackagePrivateNpmConfig, PackageSourceCheckoutConfig } from '../lib/json.js';
+import type {
+  PackageCargoCredentialsConfig,
+  PackageCargoGitOrigin,
+  PackagePrivateNpmConfig,
+  PackageSourceCheckoutConfig,
+} from '../lib/json.js';
 import { renderRunsOnLine } from './github-runs-on.js';
 
 export enum CiWorkflowStepKind {
   Checkout = 'checkout',
   SourceCheckouts = 'source-checkouts',
   SetupDevenv = 'setup-devenv',
+  CargoCredentials = 'cargo-credentials',
   SetNxShas = 'set-nx-shas',
   RestoreNxCache = 'restore-nx-cache',
   Build = 'build',
@@ -48,12 +54,22 @@ export interface CiWorkflowDefinitionOptions {
    * resolve exactly as in the developer workspace. Absent means none.
    */
   sourceCheckouts?: PackageSourceCheckoutConfig[];
+  /**
+   * Declared Cargo private-dependency credentials
+   * (package.json `smoo.github.cargoCredentials`). Registry tokens ride the
+   * job env; private git origins get a host-gated credential helper installed
+   * before SetupDevenv. Absent means no private Cargo fetch.
+   */
+  cargoCredentials?: PackageCargoCredentialsConfig;
 }
 
 type CiWorkflowStepInput = Omit<CiWorkflowStep, 'number'>;
 
 export function defineCiWorkflow(options: CiWorkflowDefinitionOptions): CiWorkflowStep[] {
   const steps: CiWorkflowStepInput[] = [{ kind: CiWorkflowStepKind.Checkout, name: '📥 Checkout' }];
+  if (options.cargoCredentials?.gitOrigins?.length) {
+    steps.push({ kind: CiWorkflowStepKind.CargoCredentials, name: '🔑 Prepare Cargo git credentials' });
+  }
   if (options.sourceCheckouts?.length) {
     steps.push({ kind: CiWorkflowStepKind.SourceCheckouts, name: '📦 Check out sibling sources' });
   }
@@ -131,7 +147,7 @@ ${
 }    env:
       NIX_STORE_NAR: ${githubExpression('github.workspace')}/nix-store.nar
       GH_TOKEN: ${githubExpression('github.token')}
-${privateNpmReadTokenJobEnv(options)}    steps:
+${cargoCredentialJobEnvLines(options.cargoCredentials)}${privateNpmReadTokenJobEnv(options)}    steps:
 `;
 }
 
@@ -173,6 +189,19 @@ function commentLinesForStep(step: CiWorkflowStep): string[] {
   if (step.kind === CiWorkflowStepKind.Checkout) {
     return ['      # Step 1: GitHub adds "Set up job" automatically', '      # Step 2'];
   }
+  if (step.kind === CiWorkflowStepKind.CargoCredentials) {
+    return [
+      `      # Step ${step.number}`,
+      '      # Installs a host-gated git credential helper for private Cargo git',
+      '      # dependencies through GITHUB_ENV: CARGO_NET_GIT_FETCH_WITH_CLI makes',
+      '      # cargo shell out to git, whose per-process GIT_CONFIG_* environment',
+      '      # names the helper. The helper reads the token from the environment',
+      '      # when git calls it, answers only for the declared origins, and an',
+      '      # empty credential.helper reset keeps an ambient credential store',
+      '      # (osxkeychain, store) from persisting the token after a fetch. The',
+      '      # token never reaches a URL, argv, or stored git/cargo configuration.',
+    ];
+  }
   if (step.kind === CiWorkflowStepKind.SetupDevenv) {
     return [
       `      # Step ${step.number}. Composite action internals do not affect top-level job step`,
@@ -211,6 +240,8 @@ function yamlLinesForStep(step: CiWorkflowStep, options: CiWorkflowDefinitionOpt
       ];
     case CiWorkflowStepKind.SourceCheckouts:
       return sourceCheckoutsStepLines(step, options.sourceCheckouts ?? []);
+    case CiWorkflowStepKind.CargoCredentials:
+      return cargoCredentialStepLines(step, normalizeCargoCredentials(options.cargoCredentials ?? {}));
     case CiWorkflowStepKind.SetupDevenv:
       // One step everywhere. setup-devenv detects host-nix (GARM) vs ephemeral
       // and skips GH install/cache steps internally — same for ci/publish/managed.
@@ -395,6 +426,143 @@ export function normalizeSourceCheckout(config: PackageSourceCheckoutConfig): Pa
     );
   }
   return config;
+}
+
+/**
+ * Job env lines carrying the declared Cargo credential secrets. Both registry
+ * tokens and git-origin tokens ride the job env so the credential helper is
+ * still in scope when cargo spawns git much later in the build. Fork PRs
+ * receive empty values and skip the helper step, so nothing answers for a
+ * private origin there.
+ */
+export function cargoCredentialJobEnvLines(config: PackageCargoCredentialsConfig | undefined): string {
+  if (config === undefined) {
+    return '';
+  }
+  const tokenEnvs = distinctCargoTokenEnvs(normalizeCargoCredentials(config));
+  if (tokenEnvs.length === 0) {
+    return '';
+  }
+  return tokenEnvs.map((env) => `      ${env}: ${githubExpression(`secrets.${env}`)}\n`).join('');
+}
+
+/**
+ * The credential-transport step. It writes a host-gated helper script into
+ * `$RUNNER_TEMP` and points the per-process `GIT_CONFIG_*` environment at it
+ * through GITHUB_ENV, plus `CARGO_NET_GIT_FETCH_WITH_CLI` so cargo shells out
+ * to git and the environment config applies. The helper reads the token from
+ * the environment at call time and answers only for the declared origins.
+ * Mechanism errors surface at managed-file render time, never inside CI.
+ */
+export function cargoCredentialStepLines(step: CiWorkflowStep, config: PackageCargoCredentialsConfig): string[] {
+  const normalized = normalizeCargoCredentials(config);
+  const origins = normalized.gitOrigins ?? [];
+  if (origins.length === 0) {
+    throw new Error('smoo.github.cargoCredentials needs at least one gitOrigins entry for the credential step');
+  }
+  const tokenEnvs = distinctCargoTokenEnvs(normalized);
+  const lines = [`      - name: ${step.name}`, ...SAME_REPO_GATE_FOLDED];
+  lines.push('        env:');
+  for (const env of tokenEnvs) {
+    lines.push(`          ${env}: ${githubExpression(`secrets.${env}`)}`);
+  }
+  lines.push('        run: |');
+  lines.push('          helper="$RUNNER_TEMP/cargo-git-credential.sh"');
+  lines.push('          cat > "$helper" <<\'SMOO_CARGO_HELPER_EOF\'');
+  lines.push('          #!/bin/sh');
+  lines.push('          # Host-gated credential answers for private Cargo git dependencies. The');
+  lines.push('          # token is read from the environment when git calls this helper; it is');
+  lines.push('          # never stored, echoed, or attached to any other origin.');
+  lines.push('          protocol=');
+  lines.push('          host=');
+  lines.push('          while IFS= read -r line && [ -n "$line" ]; do');
+  lines.push('            case "$line" in');
+  lines.push('              protocol=*) protocol=${line#protocol=} ;;');
+  lines.push('              host=*) host=${line#host=} ;;');
+  lines.push('            esac');
+  lines.push('          done');
+  lines.push('          [ "$protocol" = https ] || exit 0');
+  lines.push('          case "$host" in');
+  for (const origin of origins.map(normalizeCargoGitOrigin)) {
+    lines.push(
+      `            ${new URL(origin.origin).host})`,
+      `              printf 'username=x-access-token\\npassword=%s\\n' "$${origin.tokenEnv}" ;;`,
+    );
+  }
+  lines.push('            *) exit 0 ;;');
+  lines.push('          esac');
+  lines.push('          SMOO_CARGO_HELPER_EOF');
+  lines.push('          chmod 700 "$helper"');
+  lines.push('          {');
+  lines.push('            echo "CARGO_NET_GIT_FETCH_WITH_CLI=true"');
+  lines.push('            echo "GIT_CONFIG_COUNT=2"');
+  lines.push('            # An empty value clears any ambient credential helper (osxkeychain,');
+  lines.push('            # store) so a successful fetch cannot persist the token anywhere.');
+  lines.push('            echo "GIT_CONFIG_KEY_0=credential.helper"');
+  lines.push('            echo "GIT_CONFIG_VALUE_0="');
+  lines.push('            echo "GIT_CONFIG_KEY_1=credential.helper"');
+  lines.push('            echo "GIT_CONFIG_VALUE_1=$helper"');
+  lines.push('          } >> "$GITHUB_ENV"');
+  return lines;
+}
+
+function distinctCargoTokenEnvs(config: PackageCargoCredentialsConfig): string[] {
+  const seen = new Set<string>();
+  for (const env of config.registryTokenEnvs ?? []) {
+    seen.add(env);
+  }
+  for (const origin of config.gitOrigins ?? []) {
+    seen.add(origin.tokenEnv);
+  }
+  return [...seen];
+}
+
+/** Mechanism errors surface at managed-file render time, never inside CI. */
+export function normalizeCargoCredentials(config: PackageCargoCredentialsConfig): PackageCargoCredentialsConfig {
+  for (const env of config.registryTokenEnvs ?? []) {
+    if (!/^[A-Z_][A-Z0-9_]*$/.test(env)) {
+      throw new Error(
+        `smoo.github.cargoCredentials needs upper-case secret env names for registryTokenEnvs, got ${JSON.stringify(env)}`,
+      );
+    }
+  }
+  for (const origin of config.gitOrigins ?? []) {
+    normalizeCargoGitOrigin(origin);
+  }
+  if ((config.registryTokenEnvs?.length ?? 0) === 0 && (config.gitOrigins?.length ?? 0) === 0) {
+    throw new Error(
+      'smoo.github.cargoCredentials needs at least one gitOrigins or registryTokenEnvs entry, got an empty configuration',
+    );
+  }
+  return config;
+}
+
+function normalizeCargoGitOrigin(origin: PackageCargoGitOrigin): PackageCargoGitOrigin {
+  let url: URL | null = null;
+  try {
+    url = origin.origin === undefined ? null : new URL(origin.origin);
+  } catch {
+    url = null;
+  }
+  if (
+    url === null ||
+    url.protocol !== 'https:' ||
+    url.pathname !== '/' ||
+    url.username !== '' ||
+    url.password !== '' ||
+    url.search !== '' ||
+    url.hash !== ''
+  ) {
+    throw new Error(
+      `smoo.github.cargoCredentials gitOrigins entry needs a credential-free https origin without a path, got ${JSON.stringify(origin.origin)}`,
+    );
+  }
+  if (!/^[A-Z_][A-Z0-9_]*$/.test(origin.tokenEnv)) {
+    throw new Error(
+      `smoo.github.cargoCredentials gitOrigins entry needs an upper-case secret env name, got ${JSON.stringify(origin.tokenEnv)}`,
+    );
+  }
+  return origin;
 }
 
 /**

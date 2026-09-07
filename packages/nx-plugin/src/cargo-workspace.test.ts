@@ -208,6 +208,52 @@ describe('Cargo workspace layouts', () => {
     }
   });
 
+  it('hashes git and registry dependencies through Cargo.lock instead of demanding external source inputs', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'nx-plugin-cargo-git-deps-'));
+    try {
+      await write(
+        root,
+        'Cargo.toml',
+        [
+          '[workspace]',
+          'members = ["crates/app"]',
+          '',
+          '[workspace.dependencies]',
+          'engine-core = { git = "https://git.example.net/org/engine.git", rev = "abc123" }',
+          '',
+        ].join('\n'),
+      );
+      await write(root, 'Cargo.lock', 'version = 4\n');
+      await write(
+        root,
+        'crates/app/Cargo.toml',
+        ['[package]', 'name = "app"', '', '[dependencies]', 'engine-core = { workspace = true }', ''].join('\n'),
+      );
+      await write(root, 'nx.json', JSON.stringify({ namedInputs: { default: ['{projectRoot}/**/*'] } }));
+
+      // Cargo owns git resolution; the locked rev in Cargo.lock is the input.
+      // No externalRustCrates named input is required, and nothing hashes a
+      // workstation tree.
+      const inputs = await cargoPackageTestInputs({
+        workspaceRoot: root,
+        absoluteProjectRoot: root,
+        memberDir: 'crates/app',
+        inputRoot: '{workspaceRoot}',
+      });
+      expect(inputs).toEqual([
+        '{workspaceRoot}/Cargo.toml',
+        '{workspaceRoot}/Cargo.lock',
+        '{workspaceRoot}/crates/app/**/*.rs',
+        '{workspaceRoot}/crates/app/Cargo.toml',
+        '{workspaceRoot}/**/.cargo/config.toml',
+        '{workspaceRoot}/scripts/*.sh',
+        '!{workspaceRoot}/**/target/**',
+      ]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it('includes target-specific dependencies and preserves absolute path roots', async () => {
     const root = await mkdtemp(join(tmpdir(), 'nx-plugin-cargo-target-deps-'));
     try {

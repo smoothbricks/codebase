@@ -2,7 +2,13 @@ import { appendFileSync, existsSync, lstatSync, mkdirSync, readFileSync, writeFi
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { MACOS_PLATFORM_TARGET_GLOBS, PLATFORM_TARGET_GLOBS } from '@smoothbricks/nx-plugin/workspace-config-policy';
-import type { NxTargetConfig, PackageJson, PackagePrivateNpmConfig, PackageSourceCheckoutConfig } from '../lib/json.js';
+import type {
+  NxTargetConfig,
+  PackageCargoCredentialsConfig,
+  PackageJson,
+  PackagePrivateNpmConfig,
+  PackageSourceCheckoutConfig,
+} from '../lib/json.js';
 import { listReleasePackages, readPackageJson } from '../lib/workspace.js';
 import { loadNxProjects, type NxProjects, targetNamesFromProjects } from '../nx/index.js';
 import { resolvePrivateNpmWorkflowConfig } from '../release/private-npm.js';
@@ -155,6 +161,8 @@ export interface ManagedFileContext {
   privateNpm?: PackagePrivateNpmConfig;
   /** Declared sibling source checkouts from the root smoo config; absent means none. */
   sourceCheckouts?: PackageSourceCheckoutConfig[];
+  /** Declared Cargo private-dependency credentials from the root smoo config; absent means none. */
+  cargoCredentials?: PackageCargoCredentialsConfig;
 }
 
 interface DeployTargetInfo {
@@ -358,6 +366,7 @@ function getManagedContent(file: ManagedFile, context: ManagedFileContext): stri
         runsOn: context.ciRunsOn,
         privateNpm: context.privateNpm,
         sourceCheckouts: context.sourceCheckouts,
+        cargoCredentials: context.cargoCredentials,
       });
     }
     if (file.source === 'publish-workflow') {
@@ -374,6 +383,7 @@ function getManagedContent(file: ManagedFile, context: ManagedFileContext): stri
         macosRunsOn: context.macosRunsOn,
         privateNpm: context.privateNpm,
         sourceCheckouts: context.sourceCheckouts,
+        cargoCredentials: context.cargoCredentials,
       });
     }
     if (file.source === 'pr-preview-cleanup-workflow') {
@@ -393,9 +403,11 @@ function getManagedContent(file: ManagedFile, context: ManagedFileContext): stri
 async function getManagedFileContext(root: string): Promise<ManagedFileContext> {
   const packageJson = readPackageJson(join(root, 'package.json'));
   const repoName = packageJson?.name ?? 'monorepo';
+  const ciPushBranches = getCiPushBranches(packageJson?.json);
   const ciRunsOn = getCiRunsOn(packageJson?.json);
   const macosRunsOn = getMacosRunsOn(packageJson?.json);
   const sourceCheckouts = packageJson?.json?.smoo?.github?.sourceCheckouts;
+  const cargoCredentials = packageJson?.json?.smoo?.github?.cargoCredentials;
   // In-process Nx API → daemon socket (no second Node/`nx` CLI process).
   const nxProjects = await loadNxProjects(root);
   const stagingDeploy = deployTargetInfoFromProjects(nxProjects, 'staging');
@@ -425,6 +437,7 @@ async function getManagedFileContext(root: string): Promise<ManagedFileContext> 
     repoName,
     platformTargetGlobs,
     sourceCheckouts,
+    cargoCredentials,
     macosPlatformArchitectures: macosPlatformArchitecturesForTest(targetNames),
     privateNpm,
   };
