@@ -2,15 +2,21 @@ import { appendFileSync, existsSync, lstatSync, mkdirSync, readFileSync, writeFi
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { MACOS_PLATFORM_TARGET_GLOBS, PLATFORM_TARGET_GLOBS } from '@smoothbricks/nx-plugin/workspace-config-policy';
-import type {
-  NxTargetConfig,
-  PackageCargoCredentialsConfig,
-  PackageJson,
-  PackagePrivateNpmConfig,
-  PackageSmooGithub,
-  PackageSourceCheckoutConfig,
+import { isStageDerivedDeploy, PRODUCTION_PUSH_DEPLOY_TAG } from '../lib/deploy-tags.js';
+import {
+  ciPushBranches,
+  type NonEmptyArray,
+  type NxProjectJson,
+  type NxTargetConfig,
+  type PackageCargoCredentialsConfig,
+  type PackageJson,
+  type PackagePrivateNpmConfig,
+  type PackageSmooGithub,
+  type PackageSmooGithubEnvironments,
+  type PackageSourceCheckoutConfig,
+  readValidatedPackageJson,
 } from '../lib/json.js';
-import { listReleasePackages, readPackageJson } from '../lib/workspace.js';
+import { listReleasePackages, packageInfo } from '../lib/workspace.js';
 import { loadNxProjects, type NxProjects, targetNamesFromProjects } from '../nx/index.js';
 import { resolvePrivateNpmWorkflowConfig } from '../release/private-npm.js';
 import { privateNpmReadTokenJobEnv, renderCiWorkflowYaml } from './ci-workflow.js';
@@ -149,14 +155,18 @@ export interface ManagedFileContext {
   hasProductionDeployTargets: boolean;
   hasBrowserTestTargets: boolean;
   hasE2eDeploymentTargets: boolean;
+  hasProductionPushDeployTargets: boolean;
   stagingDeployProvider?: 'cloudflare';
   productionDeployProvider?: 'cloudflare';
-  ciPushBranches: string[];
+  ciPushBranches: NonEmptyArray<string>;
   ciRunsOn: string | string[];
   /** macOS platform job runs-on labels from the root smoo config; default macos-latest. */
   macosRunsOn: string | string[];
   platformProducer?: PackageSmooGithub['platformProducer'];
   actionsProvider?: PackageSmooGithub['actionsProvider'];
+  ciEnvironments?: PackageSmooGithubEnvironments;
+  ciDeploySecrets: Record<string, string>;
+  ciE2eSecrets: Record<string, string>;
   nodeModulesCacheKey: string;
   repoName: string;
   platformTargetGlobs: string[];
@@ -349,11 +359,14 @@ function applyManagedFile(
   return { target: file.target, action: 'created' };
 }
 
-/** Renders publish.yml through the real managed-file descriptor, so the context wiring is covered. */
-export function renderManagedPublishWorkflowForTest(context: ManagedFileContext): string {
-  const file = managedFiles.find(({ kind, source }) => kind === 'generated' && source === 'publish-workflow');
+/** Renders a generated workflow through its real managed-file descriptor, so the context wiring is covered. */
+export function renderManagedWorkflowForTest(
+  source: 'ci-workflow' | 'publish-workflow',
+  context: ManagedFileContext,
+): string {
+  const file = managedFiles.find((candidate) => candidate.kind === 'generated' && candidate.source === source);
   if (!file) {
-    throw new Error('publish-workflow is no longer a managed file');
+    throw new Error(`${source} is no longer a managed file`);
   }
   return getManagedContent(file, context);
 }
@@ -364,6 +377,8 @@ function getManagedContent(file: ManagedFile, context: ManagedFileContext): stri
       return renderCiWorkflowYaml({
         actionsProvider: context.actionsProvider,
         deploy: context.hasStagingDeployTargets,
+        // The production job's Cloudflare env pair keys off this too: it can only select stage-derived projects,
+        // whose provider is computed identically for staging and production.
         deployProvider: context.stagingDeployProvider,
         browserTests: context.hasBrowserTestTargets,
         e2eDeployment: context.hasStagingDeployTargets && context.hasE2eDeploymentTargets,
@@ -372,6 +387,10 @@ function getManagedContent(file: ManagedFile, context: ManagedFileContext): stri
         privateNpm: context.privateNpm,
         sourceCheckouts: context.sourceCheckouts,
         cargoCredentials: context.cargoCredentials,
+        environments: context.ciEnvironments,
+        deploySecrets: context.ciDeploySecrets,
+        e2eSecrets: context.ciE2eSecrets,
+        productionOnPush: context.hasProductionPushDeployTargets,
       });
     }
     if (file.source === 'publish-workflow') {
@@ -408,13 +427,14 @@ function getManagedContent(file: ManagedFile, context: ManagedFileContext): stri
 }
 
 async function getManagedFileContext(root: string): Promise<ManagedFileContext> {
-  const packageJson = readPackageJson(join(root, 'package.json'));
+  const manifestPath = join(root, 'package.json');
+  const manifest = readValidatedPackageJson(manifestPath);
+  const packageJson = manifest && packageInfo(manifestPath, manifest);
   const repoName = packageJson?.name ?? 'monorepo';
-  const ciPushBranches = getCiPushBranches(packageJson?.json);
-  const ciRunsOn = getCiRunsOn(packageJson?.json);
-  const macosRunsOn = getMacosRunsOn(packageJson?.json);
-  const sourceCheckouts = packageJson?.json?.smoo?.github?.sourceCheckouts;
-  const cargoCredentials = packageJson?.json?.smoo?.github?.cargoCredentials;
+  const github = manifest?.smoo?.github;
+  const macosRunsOn = getMacosRunsOn(manifest);
+  const sourceCheckouts = github?.sourceCheckouts;
+  const cargoCredentials = github?.cargoCredentials;
   // In-process Nx API → daemon socket (no second Node/`nx` CLI process).
   const nxProjects = await loadNxProjects(root);
   const stagingDeploy = deployTargetInfoFromProjects(nxProjects, 'staging');
@@ -435,13 +455,17 @@ async function getManagedFileContext(root: string): Promise<ManagedFileContext> 
     hasProductionDeployTargets: productionDeploy.exists,
     hasBrowserTestTargets: hasExactTargetForTest(targetNames, 'test-browser'),
     hasE2eDeploymentTargets: hasExactTargetForTest(targetNames, 'e2e-deployment'),
+    hasProductionPushDeployTargets: anyProjectHasTagForTest(nxProjects, PRODUCTION_PUSH_DEPLOY_TAG),
     stagingDeployProvider: stagingDeploy.provider,
     productionDeployProvider: productionDeploy.provider,
-    ciPushBranches,
-    ciRunsOn,
+    ciPushBranches: ciPushBranches(github),
+    ciRunsOn: getCiRunsOn(github),
     macosRunsOn,
-    platformProducer: packageJson?.json?.smoo?.github?.platformProducer,
-    actionsProvider: packageJson?.json?.smoo?.github?.actionsProvider,
+    platformProducer: github?.platformProducer,
+    actionsProvider: github?.actionsProvider,
+    ciEnvironments: github?.environments,
+    ciDeploySecrets: github?.deploySecrets ?? {},
+    ciE2eSecrets: github?.e2eSecrets ?? {},
     nodeModulesCacheKey,
     repoName,
     platformTargetGlobs,
@@ -494,7 +518,7 @@ export function deployTargetInfoFromProjects(projects: NxProjects, configuration
   let exists = false;
   let provider: DeployTargetInfo['provider'];
   for (const project of Object.values(projects)) {
-    const info = deployTargetInfoFromTargets(project.targets ?? {}, configuration);
+    const info = deployTargetInfoFromProject(project, configuration);
     if (!info.exists) {
       continue;
     }
@@ -504,23 +528,31 @@ export function deployTargetInfoFromProjects(projects: NxProjects, configuration
   return { exists, provider };
 }
 
-function deployTargetInfoFromTargets(targets: Record<string, NxTargetConfig>, configuration: string): DeployTargetInfo {
-  const deploy = targets.deploy;
+/** Test seam: whether any project in the graph carries the Nx tag. */
+export function anyProjectHasTagForTest(projects: NxProjects, tag: string): boolean {
+  return Object.values(projects).some((project) => project.tags?.includes(tag));
+}
+
+function deployTargetInfoFromProject(project: NxProjectJson, configuration: string): DeployTargetInfo {
+  const deploy = project.targets?.deploy;
   if (!deploy) {
     return { exists: false };
   }
   const baseCommandValue = deploy.options?.command ?? deploy.command;
   const baseCommand = typeof baseCommandValue === 'string' ? baseCommandValue : '';
-  if (baseCommand.includes('smoo wrangler deploy-stage')) {
-    return { exists: true, provider: 'cloudflare' };
+  if (isStageDerivedDeploy(project.tags, baseCommand)) {
+    return { exists: true, provider: deployProvider(baseCommand) };
   }
   const config = deploy.configurations?.[configuration];
   if (!config) {
     return { exists: false };
   }
   const commandValue = config.command ?? config.options?.command ?? baseCommand;
-  const command = typeof commandValue === 'string' ? commandValue : '';
-  return { exists: true, provider: command.includes('wrangler ') ? 'cloudflare' : undefined };
+  return { exists: true, provider: deployProvider(typeof commandValue === 'string' ? commandValue : '') };
+}
+
+function deployProvider(command: string): DeployTargetInfo['provider'] {
+  return command.includes('wrangler ') ? 'cloudflare' : undefined;
 }
 
 function renderTemplate(context: ManagedFileContext, template: string): string {
@@ -535,8 +567,8 @@ function renderTemplate(context: ManagedFileContext, template: string): string {
     .replaceAll('{{NODE_MODULES_CACHE_KEY}}', context.nodeModulesCacheKey);
 }
 
-function getCiRunsOn(packageJson: PackageJson | null | undefined): string | string[] {
-  const configured = packageJson?.smoo?.github?.runsOn;
+function getCiRunsOn(github: PackageSmooGithub | undefined): string | string[] {
+  const configured = github?.runsOn;
   if (configured === undefined) {
     return 'ubuntu-latest';
   }
@@ -557,16 +589,6 @@ function getMacosRunsOn(packageJson: PackageJson | null | undefined): string | s
   }
   const labels = configured.filter((label) => label.length > 0);
   return labels.length > 0 ? labels : 'macos-latest';
-}
-
-function getCiPushBranches(packageJson: PackageJson | null | undefined): string[] {
-  const configured = readCiPushBranches(packageJson);
-  return configured.length > 0 ? configured : ['main'];
-}
-
-function readCiPushBranches(packageJson: PackageJson | null | undefined): string[] {
-  const branches = packageJson?.smoo?.github?.pushBranches ?? [];
-  return branches.filter((branch) => branch.length > 0);
 }
 
 function renderYamlFlowList(values: string[]): string {

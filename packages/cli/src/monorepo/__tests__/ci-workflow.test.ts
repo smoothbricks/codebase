@@ -62,7 +62,7 @@ describe('CI workflow definition', () => {
     expect(rendered).toContain('group: ${{ github.workflow }}-${{ github.ref }}');
     expect(rendered).toContain('cancel-in-progress: true');
     expect(rendered).toContain('github.event.pull_request.head.repo.full_name == github.repository');
-    expect(rendered).toContain("github.ref == 'refs/heads/private'");
+    expect(rendered).toContain("github.ref == 'refs/heads/main'");
     expect(rendered).toContain("# Step 13\n      # Nx's database cache needs artifact files");
   });
 
@@ -407,5 +407,82 @@ describe('CI workflow definition', () => {
     expect(rendered).not.toContain('PRIV_NPM_REGISTRY');
     expect(rendered).not.toContain('PRIV_NPM_READ_TOKEN');
     expect(rendered).not.toContain('PRIV_NPM_PUBLISH_TOKEN');
+  });
+});
+
+describe('renderCiWorkflowYaml with deploy configuration', () => {
+  const rendered = renderCiWorkflowYaml(
+    options({
+      deploy: true,
+      deployProvider: 'cloudflare',
+      e2eDeployment: true,
+      pushBranches: ['private'],
+      environments: { staging: 'staging', production: 'production' },
+      deploySecrets: { E2E_CONTROL_TOKEN: 'E2E_CONTROL_TOKEN', GITHUB_CLIENT_SECRET: 'EXAMPLE_GITHUB_CLIENT_SECRET' },
+      e2eSecrets: { GIT_CRYPT_KEY_B64: 'GIT_CRYPT_KEY_B64' },
+      productionOnPush: true,
+    }),
+  );
+
+  it('puts the staging environment on the validate and e2e jobs', () => {
+    expect(rendered).toContain('  main:\n    name: Validate\n');
+    expect((rendered.match(/ {4}environment: staging\n/g) ?? []).length).toBe(2);
+  });
+
+  it('exposes extra deploy secrets on the deploy steps under their env names', () => {
+    expect(rendered).toContain('          E2E_CONTROL_TOKEN: ${{ secrets.E2E_CONTROL_TOKEN }}');
+    expect(rendered).toContain('          GITHUB_CLIENT_SECRET: ${{ secrets.EXAMPLE_GITHUB_CLIENT_SECRET }}');
+  });
+
+  it('exposes e2e secrets only on the e2e step', () => {
+    const e2eJob = rendered.slice(rendered.indexOf('  e2e-deployment:'), rendered.indexOf('  deploy-production:'));
+    expect(e2eJob).toContain('          GIT_CRYPT_KEY_B64: ${{ secrets.GIT_CRYPT_KEY_B64 }}');
+    expect(e2eJob).not.toContain('EXAMPLE_GITHUB_CLIENT_SECRET');
+    const mainJob = rendered.slice(0, rendered.indexOf('  e2e-deployment:'));
+    expect(mainJob).not.toContain('GIT_CRYPT_KEY_B64');
+  });
+
+  it('uses the configured push branch for the staging deploy condition', () => {
+    expect(rendered).toContain("(github.event_name == 'push' && github.ref == 'refs/heads/private')");
+  });
+
+  it('adds a production-on-push job gated on validate and the e2e job', () => {
+    expect(rendered).toContain(
+      '  deploy-production:\n    name: Deploy Production\n    needs: [main, e2e-deployment]\n',
+    );
+    expect(rendered).toContain('    environment: production\n');
+    expect(rendered).toContain(
+      "    if: ${{ !cancelled() && github.event_name == 'push' && github.ref == 'refs/heads/private' && needs.main.result == 'success' && (needs.e2e-deployment.result == 'success' || needs.e2e-deployment.result == 'skipped') }}",
+    );
+    expect(rendered).toContain(
+      'run: smoo github-ci nx-deploy --stage production --mode run-many --select-tag production-push-deploy-target --name "Deploy Production" --step 4',
+    );
+  });
+
+  it('gates production on validate alone when there is no e2e job', () => {
+    const withoutE2e = renderCiWorkflowYaml(
+      options({ deploy: true, deployProvider: 'cloudflare', pushBranches: ['private'], productionOnPush: true }),
+    );
+    const productionJob = withoutE2e.slice(withoutE2e.indexOf('  deploy-production:'));
+
+    expect(productionJob).toContain('    needs: [main]\n');
+    expect(productionJob).toContain(
+      "    if: ${{ !cancelled() && github.event_name == 'push' && github.ref == 'refs/heads/private' && needs.main.result == 'success' }}",
+    );
+    expect(productionJob).not.toContain('needs.e2e-deployment');
+  });
+
+  it('keeps a protected staging environment off CI runs that do not deploy', () => {
+    const validateOnly = renderCiWorkflowYaml(options({ environments: { staging: 'staging' } }));
+
+    expect(validateOnly).not.toContain('environment:');
+  });
+
+  it('omits the production job, environments and secret blocks when not configured', () => {
+    const plain = renderCiWorkflowYaml(options({ deploy: true, deployProvider: 'cloudflare', e2eDeployment: true }));
+    expect(plain).not.toContain('deploy-production');
+    expect(plain).not.toContain('environment:');
+    expect(plain).not.toContain('GIT_CRYPT_KEY_B64');
+    expect(plain).toContain("github.ref == 'refs/heads/main'");
   });
 });

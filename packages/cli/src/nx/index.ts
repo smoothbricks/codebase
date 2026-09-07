@@ -4,6 +4,7 @@ import { join } from 'node:path';
 // Nx package exports are CLI-oriented; this is the module the CLI uses for graph + daemon IPC.
 import { createProjectGraphAsync } from 'nx/src/project-graph/project-graph.js';
 import { workspaceRoot as primaryWorkspaceRoot } from 'nx/src/utils/workspace-root.js';
+import typia from 'typia';
 import type { NxDependsOn, NxProjectJson, NxTargetConfig, NxTargetOptions } from '../lib/json.js';
 import { printCommandOutput, run, runResult } from '../lib/run.js';
 
@@ -210,6 +211,9 @@ export async function cleanCache(root: string): Promise<void> {
 
 export type NxProjects = Readonly<Record<string, NxProjectJson>>;
 
+/** Parse the foreign graph script's output. Invalid JSON throws; wrong shape returns null. */
+const parseNxProjects = typia.json.createIsParse<NxProjects>();
+
 /**
  * Load the resolved project graph through Nx's API. The current workspace uses the
  * daemon in-process; foreign roots use an isolated process because Nx snapshots its
@@ -264,8 +268,8 @@ async function loadForeignNxProjects(root: string): Promise<NxProjects> {
       `Failed to load Nx project graph for ${root}: ${process.execPath} --eval <foreign graph script> failed with exit code ${result.exitCode}`,
     );
   }
-  const parsed: unknown = JSON.parse(result.stdout);
-  if (!isNxProjects(parsed)) {
+  const parsed = parseNxProjects(result.stdout);
+  if (!parsed) {
     throw new Error(`Nx returned an invalid project graph for ${root}`);
   }
   return parsed;
@@ -281,21 +285,6 @@ function nxProjectsFromNodes(nodes: Readonly<Record<string, { data: NxProjectJso
     };
   }
   return projects;
-}
-
-function isNxProjects(value: unknown): value is NxProjects {
-  if (!isRecord(value)) return false;
-  return Object.values(value).every(
-    (project) =>
-      isRecord(project) &&
-      (project.name === undefined || typeof project.name === 'string') &&
-      (project.root === undefined || typeof project.root === 'string') &&
-      (project.targets === undefined || (isRecord(project.targets) && Object.values(project.targets).every(isRecord))),
-  );
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 
 export function targetNamesFromProjects(projects: NxProjects): string[] {

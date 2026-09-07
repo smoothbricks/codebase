@@ -1,8 +1,16 @@
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
 import typia, { type IValidation } from 'typia';
 
 /** String-keyed dependency / script / engine maps. */
 export type StringMap = Record<string, string>;
+
+/** An array statically known to hold at least one item. */
+export type NonEmptyArray<T> = [T, ...T[]];
+
+export function isNonEmpty<T>(items: T[]): items is NonEmptyArray<T> {
+  return items.length > 0;
+}
 
 export interface PackageRepository {
   type?: string;
@@ -23,12 +31,26 @@ export interface PackagePublishConfig {
   registry?: string;
 }
 
+export interface PackageSmooGithubEnvironments {
+  /** GitHub Environment for the staging deploy and e2e jobs. */
+  staging?: string;
+  /** GitHub Environment for the production-on-push deploy job. */
+  production?: string;
+}
+
 export interface PackageSmooGithub {
   /** Action repository provider selected while generating workflows. Default: GitHub. */
   actionsProvider?: 'github' | 'forgejo';
   pushBranches?: string[];
   /** GitHub Actions runs-on for managed CI (string or label list). Default: ubuntu-latest. */
   runsOn?: string | string[];
+  environments?: PackageSmooGithubEnvironments;
+  /** Extra deploy secrets, mapped from environment variable names to repository secret names. */
+  deploySecrets?: Record<string, string>;
+  /** Secrets exposed only to the e2e-deployment step. */
+  e2eSecrets?: Record<string, string>;
+  /** Pull-request preview URL templates; `{stage}` is replaced with the stage name. */
+  previewUrls?: string[];
   /** macOS platform job runs-on labels (string or label list). Default: macos-latest. */
   macosRunsOn?: string | string[];
   /** Opt in to building foreign platform artifacts on Linux without native-host runtime tests. */
@@ -178,6 +200,7 @@ export interface NxTargetConfig {
 export interface NxProjectJson {
   name?: string;
   root?: string;
+  tags?: string[];
   targets?: Record<string, NxTargetConfig>;
 }
 
@@ -214,6 +237,8 @@ export function parseJsonFileText<T>(path: string, text: string, parse: (text: s
     throw error;
   }
 }
+
+const validatePackageJsonText = typia.json.createValidateParse<PackageJson>();
 
 const isPackageJsonValue = typia.createIs<PackageJson>();
 
@@ -253,6 +278,33 @@ export function readJson(path: string): unknown {
 
 export function isPackageJson(value: unknown): value is PackageJson {
   return isPackageJsonValue(value);
+}
+
+/**
+ * package.json validated as a whole, every wrong value named by its path; null when the file is absent. The
+ * is-parser behind `readJsonObject` answers a wrong value with null for the whole manifest instead, which for the
+ * `smoo.github` block would mean silently falling back to the defaults (branch `main`, no environments or secrets).
+ */
+export function readValidatedPackageJson(path: string): PackageJson | null {
+  if (!existsSync(path)) {
+    return null;
+  }
+  const result = parseJsonFileText(path, readFileSync(path, 'utf8'), validatePackageJsonText);
+  if (result.success) {
+    return result.data;
+  }
+  throw new Error(`package.json is invalid: ${formatValidationErrors(result.errors)}`);
+}
+
+/** The root manifest's `smoo.github` block (see `readValidatedPackageJson`); nothing without a manifest or a block. */
+export function readSmooGithub(root: string): PackageSmooGithub | undefined {
+  return readValidatedPackageJson(join(root, 'package.json'))?.smoo?.github;
+}
+
+/** The branches whose pushes drive the managed CI; the first one maps to the staging stage. */
+export function ciPushBranches(github: PackageSmooGithub | undefined): NonEmptyArray<string> {
+  const configured = (github?.pushBranches ?? []).filter((branch) => branch.length > 0);
+  return isNonEmpty(configured) ? configured : ['main'];
 }
 
 /** Ensure package.json.scripts exists. */

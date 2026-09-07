@@ -5,7 +5,15 @@ import { dirname, join } from 'node:path';
 import { PLATFORM_TARGET_GLOBS } from '@smoothbricks/nx-plugin/workspace-config-policy';
 import { $ } from 'bun';
 import typia from 'typia';
-import { parseStringArrayText } from '../lib/json.js';
+import { isStageDerivedDeploy, PERMANENT_DEPLOY_TAG, STAGING_DEPLOY_TAG } from '../lib/deploy-tags.js';
+import {
+  ciPushBranches,
+  isNonEmpty,
+  type NonEmptyArray,
+  type PackageSmooGithub,
+  parseStringArrayText,
+  readSmooGithub,
+} from '../lib/json.js';
 import { decode, printCommandOutput, run, runResult, runStatus, runText } from '../lib/run.js';
 import { type ProjectTargets, readProjectTargets } from '../nx/index.js';
 import { type DeploymentStage, isPullRequestStage, parseDeploymentStage, pullRequestStage } from '../wrangler/stage.js';
@@ -447,6 +455,7 @@ export interface GithubCiNxDeployOptions {
   name?: string;
   step?: string;
   verify?: boolean;
+  selectTag?: string;
 }
 
 export interface GithubCiNxDeployDependencies {
@@ -455,6 +464,7 @@ export interface GithubCiNxDeployDependencies {
     target: string,
     mode: 'affected' | 'run-many',
     stage: DeploymentStage,
+    selectTag?: string,
   ) => Promise<string[]>;
   runNx?: (args: string[], root: string) => Promise<number>;
   appendSummary?: (summaryPath: string, content: string) => Promise<void>;
@@ -463,6 +473,8 @@ export interface GithubCiNxDeployDependencies {
   setStatus?: (state: 'pending' | 'success' | 'failure') => Promise<void>;
   processEnv?: NodeJS.ProcessEnv;
   eventPayload?: GithubActionsEventPayload;
+  /** The root manifest's `smoo.github` block; read from `root` when absent. */
+  github?: PackageSmooGithub;
 }
 
 export async function githubCiNxDeploy(
@@ -472,7 +484,13 @@ export async function githubCiNxDeploy(
 ): Promise<void> {
   const processEnv = dependencies.processEnv ?? process.env;
   const eventPayload = dependencies.eventPayload ?? readGithubActionsEvent(processEnv);
-  const stage = resolveDeploymentStage(options.stage, processEnv, eventPayload);
+  const github = dependencies.github ?? readSmooGithub(root);
+  const [stagingPushBranch] = ciPushBranches(github);
+  const stage = resolveDeploymentStage(options.stage, processEnv, eventPayload, stagingPushBranch);
+  // Resolved before anything runs: a bad template must fail here, not after the deploy with the status left pending.
+  const preview = isPullRequestStage(stage)
+    ? { stage, urls: previewUrlsForStage(github?.previewUrls, stage) }
+    : undefined;
   const name = options.name ?? 'Deploy Stage';
   const step = options.step ?? '';
   const setStatus =
@@ -483,7 +501,7 @@ export async function githubCiNxDeploy(
   const mode = resolveNxSmartMode(options.mode ?? 'run-many');
   const listProjects = dependencies.listProjects ?? listNxProjectsWithTarget;
   const runNx = dependencies.runNx ?? ((args: string[], commandRoot: string) => runStatus('nx', args, commandRoot));
-  const projects = await listProjects(root, 'deploy', mode, stage);
+  const projects = await listProjects(root, 'deploy', mode, stage, options.selectTag);
   if (projects.length === 0) {
     console.log(`No ${mode} deploy projects; skipping ${stage}.`);
     await setStatus('success');
@@ -511,27 +529,20 @@ export async function githubCiNxDeploy(
     }
   }
 
-  if (isPullRequestStage(stage)) {
-    const zone = processEnv.SMOO_PREVIEW_ZONE;
-    if (!zone) {
-      throw new Error('SMOO_PREVIEW_ZONE is not set; refusing to invent a preview hostname.');
-    }
-    const url = `https://app.${stage}.${zone}`;
+  if (preview) {
     const summaryPath = processEnv.GITHUB_STEP_SUMMARY;
     if (summaryPath) {
       const appendSummary = dependencies.appendSummary ?? appendFile;
       await appendSummary(
         summaryPath,
-        `## ${stage} deployment
-
-[View deployment](${url})
-`,
+        `## ${stage} deployment\n\n${preview.urls.map((url) => `- [${url}](${url})`).join('\n')}\n`,
       );
     }
     const publishDeployment =
       dependencies.publishDeployment ??
       ((token: `pr${number}`, deploymentUrl: string) => publishGithubDeployment(token, deploymentUrl, processEnv));
-    await publishDeployment(stage, url);
+    // GitHub shows one environment URL per deployment, so the first template is the PR's entry point.
+    await publishDeployment(preview.stage, preview.urls[0]);
   }
 
   const outputPath = processEnv.GITHUB_OUTPUT;
@@ -591,6 +602,7 @@ export function resolveDeploymentStage(
   explicit: string | undefined,
   environment: NodeJS.ProcessEnv,
   event: GithubActionsEventPayload | undefined,
+  stagingPushBranch: string,
 ): DeploymentStage {
   if (explicit !== undefined) return parseDeploymentStage(explicit);
   if (environment.GITHUB_EVENT_NAME === 'pull_request') {
@@ -606,7 +618,7 @@ export function resolveDeploymentStage(
     if (number === undefined) throw new Error('GitHub pull_request event is missing its PR number.');
     return pullRequestStage(number);
   }
-  if (environment.GITHUB_EVENT_NAME === 'push' && environment.GITHUB_REF_NAME === 'private') {
+  if (environment.GITHUB_EVENT_NAME === 'push' && environment.GITHUB_REF_NAME === stagingPushBranch) {
     return 'staging';
   }
   if (environment.GITHUB_EVENT_NAME === 'release') {
@@ -626,9 +638,23 @@ function readGithubActionsEvent(environment: NodeJS.ProcessEnv): GithubActionsEv
 }
 
 function deployExclusions(stage: DeploymentStage): string {
-  const tags = ['tag:permanent-deploy-target'];
-  if (stage !== 'staging') tags.push('tag:staging-deploy-target');
+  const tags = [`tag:${PERMANENT_DEPLOY_TAG}`];
+  if (stage !== 'staging') tags.push(`tag:${STAGING_DEPLOY_TAG}`);
   return tags.join(',');
+}
+
+const DEFAULT_PREVIEW_URL_TEMPLATES: NonEmptyArray<string> = ['https://app.{stage}.example.test'];
+
+/** Preview URLs for a pull-request stage from the configured templates; `{stage}` is the only placeholder. */
+export function previewUrlsForStage(templates: string[] | undefined, stage: `pr${number}`): NonEmptyArray<string> {
+  const [first, ...rest] = templates && isNonEmpty(templates) ? templates : DEFAULT_PREVIEW_URL_TEMPLATES;
+  return [previewUrlFromTemplate(first, stage), ...rest.map((template) => previewUrlFromTemplate(template, stage))];
+}
+
+/** A template without `{stage}` would publish one URL for every pull request, so it is refused. */
+function previewUrlFromTemplate(template: string, stage: string): string {
+  if (!template.includes('{stage}')) throw new Error(`preview URL template "${template}" must contain {stage}`);
+  return template.replaceAll('{stage}', stage);
 }
 
 async function listNxProjectsWithTarget(
@@ -636,6 +662,7 @@ async function listNxProjectsWithTarget(
   target: string,
   mode: 'affected' | 'run-many',
   stage: DeploymentStage,
+  selectTag?: string,
 ): Promise<string[]> {
   const listArgs = ['show', 'projects'];
   if (mode === 'affected') listArgs.push('--affected');
@@ -646,7 +673,7 @@ async function listNxProjectsWithTarget(
     left.localeCompare(right),
   );
   if (target !== 'deploy') return candidates;
-  return selectStageDeployProjects(candidates, stage, async (project) => {
+  return selectStageDeployProjects(candidates, stage, selectTag, async (project) => {
     const parsed = parseNxProjectDeployTarget(await runText('nx', ['show', 'project', project, '--json'], root));
     if (!parsed) throw new Error(`nx show project ${project} returned invalid JSON.`);
     return parsed;
@@ -656,6 +683,7 @@ async function listNxProjectsWithTarget(
 export async function selectStageDeployProjects(
   candidates: string[],
   stage: DeploymentStage,
+  requireTag: string | undefined,
   loadProject: (project: string) => Promise<unknown>,
 ): Promise<string[]> {
   const selected: string[] = [];
@@ -667,10 +695,10 @@ export async function selectStageDeployProjects(
     const tags = Array.isArray(definition.tags)
       ? definition.tags.filter((tag): tag is string => typeof tag === 'string')
       : [];
-    const isStageDerived =
-      tags.includes('stage-deploy-target') ||
-      (typeof commandValue === 'string' && commandValue.includes('smoo wrangler deploy-stage'));
-    const isStagingOnly = tags.includes('staging-deploy-target');
+    const isStageDerived = isStageDerivedDeploy(tags, typeof commandValue === 'string' ? commandValue : undefined);
+    const isStagingOnly = tags.includes(STAGING_DEPLOY_TAG);
+    // A required tag narrows the stage rules; it never selects a project they exclude.
+    if (requireTag && !tags.includes(requireTag)) continue;
     if (isStageDerived || (stage === 'staging' && isStagingOnly)) {
       selected.push(project);
     }
