@@ -8,6 +8,7 @@ import { makeModuleSynchronized } from 'make-synchronized';
 import type * as PrettierModule from 'prettier';
 import type { Options as PrettierOptions } from 'prettier';
 import { isSmoothBricksCodebasePackageName } from '../lib/cli-package.js';
+import type { PackagePrivateNpmConfig } from '../lib/json.js';
 import { renderRunsOnLine, type WorkflowRunsOn } from './github-runs-on.js';
 
 const PUBLISH_WORKFLOW_FORMAT_OPTIONS = Object.freeze({
@@ -86,6 +87,12 @@ export interface PublishWorkflowDefinitionOptions {
   macosPlatformArchitectures?: readonly string[];
   /** Linux jobs only. Default ubuntu-latest. Same smoo.github.runsOn as CI. */
   runsOn?: WorkflowRunsOn;
+  /**
+   * Declared private-npm opt-in. The publish step is the only place receiving
+   * the publish token; the registry URL and read token ride along for status
+   * queries. No env is emitted without this configuration.
+   */
+  privateNpm?: PackagePrivateNpmConfig;
 }
 
 export interface PublishWorkflowInputs {
@@ -547,6 +554,18 @@ function yamlLinesForStep(step: PublishWorkflowStep, options: PublishWorkflowDef
     case PublishWorkflowStepKind.PublishRelease:
       return [
         `      - name: ${step.name}`,
+        ...(options.privateNpm
+          ? [
+              '        env:',
+              `          ${options.privateNpm.registryEnv}: ${githubExpression(`vars.${options.privateNpm.registryEnv}`)}`,
+              `          ${options.privateNpm.readTokenEnv}: ${githubExpression(`secrets.${options.privateNpm.readTokenEnv}`)}`,
+              ...(options.privateNpm.publishTokenEnv
+                ? [
+                    `          ${options.privateNpm.publishTokenEnv}: ${githubExpression(`secrets.${options.privateNpm.publishTokenEnv}`)}`,
+                  ]
+                : []),
+            ]
+          : []),
         '        # smoo packs with Bun, then publishes tarballs with npm. Existing',
         '        # packages must already exist on npm and use trusted publishing/OIDC.',
         '        # Missing package names are bootstrapped locally before trust setup.',
@@ -1091,6 +1110,18 @@ function renderFinalLinuxPublishSteps(options: PublishWorkflowDefinitionOptions)
     '',
     `      # Step ${stepNumber++}`,
     `      - name: 📦 Publish release (${githubExpression(mode)})`,
+    ...(options.privateNpm
+      ? [
+          '        env:',
+          `          ${options.privateNpm.registryEnv}: ${githubExpression(`vars.${options.privateNpm.registryEnv}`)}`,
+          `          ${options.privateNpm.readTokenEnv}: ${githubExpression(`secrets.${options.privateNpm.readTokenEnv}`)}`,
+          ...(options.privateNpm.publishTokenEnv
+            ? [
+                `          ${options.privateNpm.publishTokenEnv}: ${githubExpression(`secrets.${options.privateNpm.publishTokenEnv}`)}`,
+              ]
+            : []),
+        ]
+      : []),
     '        # smoo packs the verified outputs applied above with Bun, then publishes',
     '        # tarballs with npm. --prebuilt refuses missing outputs instead of',
     '        # rebuilding unverified bytes. Existing packages must already exist on',

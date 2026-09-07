@@ -19,6 +19,8 @@ export interface PackageNxConfig {
 
 export interface PackagePublishConfig {
   access?: string;
+  /** Real registry URL for publication metadata. Resolved configuration only — never an environment placeholder in a packed package.json. */
+  registry?: string;
 }
 
 export interface PackageSmooGithub {
@@ -27,8 +29,25 @@ export interface PackageSmooGithub {
   runsOn?: string | string[];
 }
 
+/**
+ * Declared opt-in for private npm distribution. Fields are environment
+ * variable NAMES plus the package scope — never endpoint URLs or credentials.
+ * A scope without this config is public; the consumer side omits
+ * publishTokenEnv because it never publishes.
+ */
+export interface PackagePrivateNpmConfig {
+  scope: string;
+  /** Environment variable holding the credential-free HTTPS registry URL. */
+  registryEnv: string;
+  /** Environment variable holding the package-read token. */
+  readTokenEnv: string;
+  /** Environment variable holding the separate publisher token; publishers only. */
+  publishTokenEnv?: string;
+}
+
 export interface PackageSmooConfig {
   github?: PackageSmooGithub;
+  privateNpm?: PackagePrivateNpmConfig;
 }
 
 export interface PackageWorkspacesObject {

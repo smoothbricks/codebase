@@ -1,5 +1,6 @@
 /* biome-ignore-all lint/suspicious/noTemplateCurlyInString: GitHub Actions expressions are emitted literally. */
 
+import type { PackagePrivateNpmConfig } from '../lib/json.js';
 import { renderRunsOnLine } from './github-runs-on.js';
 
 export enum CiWorkflowStepKind {
@@ -33,6 +34,12 @@ export interface CiWorkflowDefinitionOptions {
   pushBranches: string[];
   /** Default ubuntu-latest when omitted. */
   runsOn?: string | string[];
+  /**
+   * Declared private-npm opt-in. Exposes the registry variable and the read
+   * token to the installing job before SetupDevenv and skips fork PRs, which
+   * never receive secrets. Publish tokens never belong here.
+   */
+  privateNpm?: PackagePrivateNpmConfig;
 }
 
 type CiWorkflowStepInput = Omit<CiWorkflowStep, 'number'>;
@@ -99,6 +106,12 @@ jobs:
 ${renderRunsOnLine(options.runsOn)}
     timeout-minutes: 45
 ${
+  options.privateNpm
+    ? `    # Fork PRs receive no secrets; a private-registry install cannot run there.
+    if: \${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+`
+    : ''
+}${
   options.e2eDeployment
     ? `    outputs:
       deployment-stage: ${githubExpression('steps.deploy.outputs.stage')}
@@ -107,7 +120,13 @@ ${
 }    env:
       NIX_STORE_NAR: ${githubExpression('github.workspace')}/nix-store.nar
       GH_TOKEN: ${githubExpression('github.token')}
-    steps:
+${
+  options.privateNpm
+    ? `      ${options.privateNpm.registryEnv}: ${githubExpression(`vars.${options.privateNpm.registryEnv}`)}
+      ${options.privateNpm.readTokenEnv}: ${githubExpression(`secrets.${options.privateNpm.readTokenEnv}`)}
+`
+    : ''
+}    steps:
 `;
 }
 
@@ -317,7 +336,13 @@ ${renderRunsOnLine(options.runsOn)}
     if: \${{ needs.main.result == 'success' && needs.main.outputs.deployment-stage != '' }}
     env:
       GH_TOKEN: \${{ github.token }}
-    steps:
+${
+  options.privateNpm
+    ? `      ${options.privateNpm.registryEnv}: \${{ vars.${options.privateNpm.registryEnv} }}
+      ${options.privateNpm.readTokenEnv}: \${{ secrets.${options.privateNpm.readTokenEnv} }}
+`
+    : ''
+}    steps:
       # Step 1: GitHub adds "Set up job" automatically
       # Step 2
       - name: 📥 Checkout

@@ -2,7 +2,7 @@ import { appendFileSync, existsSync, lstatSync, mkdirSync, readFileSync, writeFi
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { MACOS_PLATFORM_TARGET_GLOBS, PLATFORM_TARGET_GLOBS } from '@smoothbricks/nx-plugin/workspace-config-policy';
-import type { NxTargetConfig, PackageJson } from '../lib/json.js';
+import type { NxTargetConfig, PackageJson, PackagePrivateNpmConfig } from '../lib/json.js';
 import { listReleasePackages, readPackageJson } from '../lib/workspace.js';
 import { loadNxProjects, type NxProjects, targetNamesFromProjects } from '../nx/index.js';
 import { renderCiWorkflowYaml } from './ci-workflow.js';
@@ -148,6 +148,8 @@ export interface ManagedFileContext {
   repoName: string;
   platformTargetGlobs: string[];
   macosPlatformArchitectures: string[];
+  /** Declared private-npm opt-in from the root smoo config; absent means fully public. */
+  privateNpm?: PackagePrivateNpmConfig;
 }
 
 interface DeployTargetInfo {
@@ -349,6 +351,7 @@ function getManagedContent(file: ManagedFile, context: ManagedFileContext): stri
         e2eDeployment: context.hasStagingDeployTargets && context.hasE2eDeploymentTargets,
         pushBranches: context.ciPushBranches,
         runsOn: context.ciRunsOn,
+        privateNpm: context.privateNpm,
       });
     }
     if (file.source === 'publish-workflow') {
@@ -362,6 +365,7 @@ function getManagedContent(file: ManagedFile, context: ManagedFileContext): stri
         platformTargetGlobs: context.platformTargetGlobs,
         macosPlatformArchitectures: context.macosPlatformArchitectures,
         runsOn: context.ciRunsOn,
+        privateNpm: context.privateNpm,
       });
     }
     if (file.source === 'pr-preview-cleanup-workflow') {
@@ -389,9 +393,19 @@ async function getManagedFileContext(root: string): Promise<ManagedFileContext> 
   const productionDeploy = deployTargetInfoFromProjects(nxProjects, 'production');
   const targetNames = targetNamesFromProjects(nxProjects);
   const platformTargetGlobs = platformTargetGlobsForTest(targetNames);
-  const nodeModulesCacheKey = existsSync(join(root, 'bun.lock'))
-    ? `$${"{{ hashFiles('bun.lock', 'package.json', 'packages/*/package.json') }}"}`
-    : `$${"{{ hashFiles('bun.lockb', 'package.json', 'packages/*/package.json') }}"}`;
+  const privateNpm = packageJson?.json.smoo?.privateNpm;
+  // Cache registry identity plus the lockfile, never token values: a scope
+  // URL change (repo variable) must invalidate the dependency cache, and the
+  // cache key must stay free of secrets.
+  const nodeModulesCacheKey = privateNpm
+    ? `$${`{{ vars.${privateNpm.registryEnv} }}`}-$${
+        existsSync(join(root, 'bun.lock'))
+          ? "{{ hashFiles('bun.lock', 'package.json', 'packages/*/package.json') }}"
+          : "{{ hashFiles('bun.lockb', 'package.json', 'packages/*/package.json') }}"
+      }`
+    : existsSync(join(root, 'bun.lock'))
+      ? `$${"{{ hashFiles('bun.lock', 'package.json', 'packages/*/package.json') }}"}`
+      : `$${"{{ hashFiles('bun.lockb', 'package.json', 'packages/*/package.json') }}"}`;
   return {
     hasReleasePackages: listReleasePackages(root, packageJson).length > 0,
     hasStagingDeployTargets: stagingDeploy.exists,
@@ -406,6 +420,7 @@ async function getManagedFileContext(root: string): Promise<ManagedFileContext> 
     repoName,
     platformTargetGlobs,
     macosPlatformArchitectures: macosPlatformArchitecturesForTest(targetNames),
+    privateNpm,
   };
 }
 
