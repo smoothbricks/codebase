@@ -371,13 +371,13 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
   it('attributes one repository-root Cargo workspace across package projects', async () => {
     const workspace = await createWorkspace();
     try {
-      await workspace.write('package.json', '{"name":"@axe.sc/codebase"}\n');
-      await workspace.write('packages/runtime/package.json', '{"name":"@axe.sc/runtime","nx":{"name":"runtime"}}\n');
-      await workspace.write('packages/wasm/package.json', '{"name":"@axe.sc/wasm","nx":{"name":"wasm"}}\n');
+      await workspace.write('package.json', '{"name":"@fixture/codebase"}\n');
+      await workspace.write('packages/runtime/package.json', '{"name":"@fixture/runtime","nx":{"name":"runtime"}}\n');
+      await workspace.write('packages/wasm/package.json', '{"name":"@fixture/wasm","nx":{"name":"wasm"}}\n');
       await workspace.write(
         'packages/native/package.json',
         JSON.stringify({
-          name: '@axe.sc/native',
+          name: '@fixture/native',
           nx: { name: 'native' },
           napi: {
             binaryName: 'native',
@@ -427,7 +427,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       const runtime = projects.get('packages/runtime')?.targets ?? {};
       const wasm = projects.get('packages/wasm')?.targets ?? {};
       const native = projects.get('packages/native')?.targets ?? {};
-      const rootProject = '@axe.sc/codebase';
+      const rootProject = '@fixture/codebase';
       const rootFetch = { projects: [rootProject], target: 'cargo-fetch' };
       const rootCompile = { projects: [rootProject], target: 'cargo-test-compile' };
 
@@ -995,7 +995,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
 
       const targets = await inferProjectTargets(workspace, 'packages/custom/package.json');
       expect(targets['cargo-wasm']).toBeUndefined();
-      expect(targets.test).toBeUndefined();
+      expect(targets.test).toEqual({ dependsOn: ['^build', 'build'] });
       expect(targets['cargo-test']).toBeDefined();
 
       // A member crate's own Cargo.toml (no [workspace]) infers nothing.
@@ -1003,6 +1003,33 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       await workspace.write('packages/member/Cargo.toml', '[package]\nname = "member"\n');
       const memberTargets = await inferProjectTargets(workspace, 'packages/member/package.json');
       expect(memberTargets).toEqual({});
+    } finally {
+      await workspace.cleanup();
+    }
+  });
+
+  it('gives a declared TypeScript test the ^build/build dependsOn base targetDefaults must not supply', async () => {
+    const workspace = await createWorkspace();
+    try {
+      await workspace.write(
+        'packages/money/package.json',
+        JSON.stringify({
+          name: 'money',
+          nx: {
+            targets: {
+              test: {
+                executor: '@smoothbricks/nx-plugin:bounded-exec',
+                options: { command: 'bun test', cwd: '{projectRoot}' },
+              },
+            },
+          },
+        }),
+      );
+      await workspace.write('packages/money/tsconfig.lib.json', '{}\n');
+
+      const targets = await inferProjectTargets(workspace, 'packages/money/package.json');
+      expect(targets.test).toEqual({ dependsOn: ['^build', 'build'] });
+      expect(targets['cargo-test']).toBeUndefined();
     } finally {
       await workspace.cleanup();
     }

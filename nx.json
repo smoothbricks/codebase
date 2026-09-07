@@ -50,7 +50,6 @@
       "outputs": []
     },
     "test": {
-      "dependsOn": ["^build", "build"],
       "cache": true
     },
     "lint": {

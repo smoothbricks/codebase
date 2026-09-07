@@ -632,10 +632,12 @@ async function createProjectTargets(
   // Additive intent already has a spelling (`"..."` above), so a plugin-local
   // additive key would be a second convention beside a working one.
   //
-  // The output families (`cargo-wasm`, `napi-*`) and the `test` aggregate stay
-  // all-or-nothing, because for those the package decides whether the target
-  // EXISTS — a packaging decision for output families, the bounded-test policy's
-  // rewrite for `test` — so there is no inferred base to partially override.
+  // The output families (`cargo-wasm`, `napi-*`) stay all-or-nothing: the
+  // package decides whether that target EXISTS. The `test` aggregate is inferred
+  // for cargo workspaces that do not declare it. A declared `test` gets only a
+  // dependsOn base of `^build`/`build` so TypeScript packages that omit dependsOn
+  // keep those edges now that targetDefaults.test.dependsOn is forbidden — it
+  // replaced inferred cargo-test rather than merging.
   const ownsCargoWorkspaceTargets = isCargoWorkspace || isRepoRootWorkspaceRoot;
   if (ownsCargoWorkspaceTargets) {
     const cargoWorkspaceRoot = isRepoRootWorkspaceRoot ? '.' : projectRoot;
@@ -755,6 +757,12 @@ async function createProjectTargets(
         dependsOn: [CARGO_TEST_TARGET],
       };
     }
+  }
+
+  if ('test' in declaredTargets && targets.test === undefined) {
+    targets.test = {
+      dependsOn: ['^build', 'build'],
+    };
   }
 
   // Every `cargoFrozen` command needs a registry cache holding the whole locked
