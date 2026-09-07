@@ -555,6 +555,11 @@ function resolveNxSmartMode(mode: NxSmartMode): 'affected' | 'run-many' {
   if (mode === 'affected' || mode === 'run-many') {
     return mode;
   }
+  // No successful-workflow baseline is resolved on Forgejo. A previous commit
+  // is not equivalent: it can omit changes from an earlier failed CI run.
+  if ((process.env.FORGEJO_REPOSITORY || process.env.GITHUB_REPOSITORY) && ciApiContext().forgejo) {
+    return 'run-many';
+  }
   const defaultBranch = eventDefaultBranch() ?? 'main';
   if (process.env.GITHUB_EVENT_NAME === 'push') {
     return process.env.GITHUB_REF_NAME === defaultBranch ? 'run-many' : 'affected';
