@@ -27,6 +27,8 @@ export interface PackageSmooGithub {
   pushBranches?: string[];
   /** GitHub Actions runs-on for managed CI (string or label list). Default: ubuntu-latest. */
   runsOn?: string | string[];
+  /** macOS platform job runs-on labels (string or label list). Default: macos-latest. */
+  macosRunsOn?: string | string[];
   /**
    * Sibling source checkouts a repo path-depends on (Cargo path
    * dependencies, nix path inputs). The CI workflow clones each entry beside

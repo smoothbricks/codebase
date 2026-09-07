@@ -89,6 +89,8 @@ export interface PublishWorkflowDefinitionOptions {
   macosPlatformArchitectures?: readonly string[];
   /** Linux jobs only. Default ubuntu-latest. Same smoo.github.runsOn as CI. */
   runsOn?: WorkflowRunsOn;
+  /** macOS platform job runs-on labels. Default macos-latest. Same smoo.github.macosRunsOn as CI. */
+  macosRunsOn?: WorkflowRunsOn;
   /**
    * Declared private-npm opt-in. The publish step is the only place receiving
    * the publish token; the read token rides along for `.npmrc` `${TOKEN}`
@@ -1224,7 +1226,9 @@ function macosTestArchitecture(architectures: readonly string[]): string | undef
 
 function renderMacosJobHeaderLines(options: PublishWorkflowDefinitionOptions): string {
   const architectures = macosPlatformArchitectures(options);
-  const lines = ['    runs-on: macos-latest'];
+  const lines = [
+    options.macosRunsOn === undefined ? '    runs-on: macos-latest' : renderRunsOnLine(options.macosRunsOn),
+  ];
   if (architectures.length >= 2) {
     lines.push(
       '    strategy:',
