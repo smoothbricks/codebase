@@ -9,43 +9,43 @@ import type { PackageExports, PackageJson } from '../lib/json.js';
 import { parsePackageJsonText } from '../lib/json.js';
 import { printCommandOutput, runResult } from '../lib/run.js';
 import type { PackageInfo } from '../lib/workspace.js';
-import { listPublicPackages } from '../lib/workspace.js';
+import { listPublishablePackages } from '../lib/workspace.js';
 import { readPackedPackageJson, validatePackedWorkspaceDependencies } from './packed-manifest.js';
 import { withPublishManifest } from './publish-manifest.js';
 
-export async function validatePackedPublicPackages(root: string): Promise<number> {
+export async function validatePackedPublishablePackages(root: string): Promise<number> {
   return (
-    (await validatePackedPublicPackagePublint(root)) +
-    (await validatePackedPublicPackageManifest(root)) +
-    (await validatePackedPublicPackageTypes(root))
+    (await validatePackedPublishablePackagePublint(root)) +
+    (await validatePackedPublishablePackageManifest(root)) +
+    (await validatePackedPublishablePackageTypes(root))
   );
 }
 
-export async function validatePackedPublicPackagePublint(root: string): Promise<number> {
+export async function validatePackedPublishablePackagePublint(root: string): Promise<number> {
   let failures = 0;
-  for (const pkg of listPublicPackages(root)) {
-    failures += await validatePackedPublicPackageTool(root, pkg, validatePublint);
+  for (const pkg of listPublishablePackages(root)) {
+    failures += await validatePackedPublishablePackageTool(root, pkg, validatePublint);
   }
   return failures;
 }
 
-export async function validatePackedPublicPackageManifest(root: string): Promise<number> {
+export async function validatePackedPublishablePackageManifest(root: string): Promise<number> {
   let failures = 0;
-  for (const pkg of listPublicPackages(root)) {
-    failures += await validatePackedPublicPackageTool(root, pkg, validatePackedManifest);
+  for (const pkg of listPublishablePackages(root)) {
+    failures += await validatePackedPublishablePackageTool(root, pkg, validatePackedManifest);
   }
   return failures;
 }
 
-export async function validatePackedPublicPackageTypes(root: string): Promise<number> {
+export async function validatePackedPublishablePackageTypes(root: string): Promise<number> {
   let failures = 0;
-  for (const pkg of listPublicPackages(root)) {
-    failures += await validatePackedPublicPackageTool(root, pkg, validateAttw);
+  for (const pkg of listPublishablePackages(root)) {
+    failures += await validatePackedPublishablePackageTool(root, pkg, validateAttw);
   }
   return failures;
 }
 
-async function validatePackedPublicPackageTool(
+async function validatePackedPublishablePackageTool(
   root: string,
   pkg: PackageInfo,
   validate: (root: string, pkg: PackageInfo, packed: { path: string; arrayBuffer: ArrayBuffer }) => Promise<number>,

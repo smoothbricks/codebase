@@ -23,9 +23,9 @@ import {
   validateWorkspaceDependencies,
 } from '../package-policy.js';
 import {
-  validatePackedPublicPackageManifest,
-  validatePackedPublicPackagePublint,
-  validatePackedPublicPackageTypes,
+  validatePackedPublishablePackageManifest,
+  validatePackedPublishablePackagePublint,
+  validatePackedPublishablePackageTypes,
 } from '../packed-package.js';
 import { syncRootRuntimeVersions, validateRootRuntimeVersions } from '../runtime.js';
 import { applyToolConfigDefaults, validateToolConfig } from '../tool-validation.js';
@@ -161,19 +161,19 @@ const packs: MonorepoPack[] = [
   {
     name: 'packed-package-publint',
     validatePostBuild(ctx) {
-      return validatePackedPublicPackagePublint(ctx.root);
+      return validatePackedPublishablePackagePublint(ctx.root);
     },
   },
   {
     name: 'packed-package-manifest',
     validatePostBuild(ctx) {
-      return validatePackedPublicPackageManifest(ctx.root);
+      return validatePackedPublishablePackageManifest(ctx.root);
     },
   },
   {
     name: 'packed-package-types',
     validatePostBuild(ctx) {
-      return validatePackedPublicPackageTypes(ctx.root);
+      return validatePackedPublishablePackageTypes(ctx.root);
     },
   },
   {
