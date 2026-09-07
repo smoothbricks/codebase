@@ -9,6 +9,7 @@ import {
   PLATFORM_TARGET_GLOBS,
 } from '@smoothbricks/nx-plugin/workspace-config-policy';
 import { format } from 'prettier';
+import { CiWorkflowStepKind, sourceCheckoutsStepLines } from '../ci-workflow.js';
 import {
   definePublishWorkflow,
   type PublishWorkflowBump,
@@ -21,6 +22,20 @@ import {
 } from '../publish-workflow.js';
 
 const nixosRunsOn = ['nixos-latest-x64', 'self-hosted'] as const;
+const siblingSourceCheckouts = [
+  {
+    path: '../smoothbricks',
+    repository: 'https://git.example.net/codebase/smoothbricks.git',
+    ref: 'abc123',
+    tokenEnv: 'SOURCE_READ_TOKEN',
+  },
+  {
+    path: '../_fork/minigraf',
+    repository: 'https://git.example.net/codebase/minigraf.git',
+    ref: 'def456',
+    tokenEnv: 'SOURCE_READ_TOKEN',
+  },
+] as const;
 
 /**
  * What `smoo monorepo` derives from this repository's own Nx graph: macOS and
@@ -923,6 +938,54 @@ function packageNameFromTag(tag: string): string {
   }
   return tag.slice(0, versionSeparator);
 }
+
+it('uses the CI sibling checkout helper in every publish builder shape', () => {
+  const expected = sourceCheckoutsStepLines(
+    { kind: CiWorkflowStepKind.SourceCheckouts, name: '📦 Check out sibling sources', number: 0 },
+    siblingSourceCheckouts,
+  ).join('\n');
+  const singleJob = renderPublishWorkflowYaml({ sourceCheckouts: [...siblingSourceCheckouts] });
+  const linuxOnly = renderPublishWorkflowYaml({
+    platformTargetGlobs: LINUX_PLATFORM_TARGET_GLOBS,
+    sourceCheckouts: [...siblingSourceCheckouts],
+  });
+  const platform = renderPublishWorkflowYaml({
+    platformTargetGlobs: PLATFORM_TARGET_GLOBS,
+    sourceCheckouts: [...siblingSourceCheckouts],
+  });
+
+  expect(singleJob).toContain(expected);
+  expect(linuxOnly).toContain(expected);
+  expect(platform.split(expected).length - 1).toBe(3);
+});
+
+it('omits sibling checkout steps when no sources are declared', () => {
+  const absent = renderPublishWorkflowYaml();
+  const empty = renderPublishWorkflowYaml({ sourceCheckouts: [] });
+
+  expect(empty).toBe(absent);
+  expect(absent).not.toContain('📦 Check out sibling sources');
+});
+
+it('refuses malformed sibling checkout declarations at render time', () => {
+  expect(() =>
+    renderPublishWorkflowYaml({
+      sourceCheckouts: [{ path: '/absolute', repository: 'https://git.example.net/source.git' }],
+    }),
+  ).toThrow('path relative to the workspace root');
+  expect(() =>
+    renderPublishWorkflowYaml({
+      sourceCheckouts: [{ path: '../source', repository: 'git@example.net:source.git' }],
+    }),
+  ).toThrow('https repository URL');
+  expect(() =>
+    renderPublishWorkflowYaml({
+      sourceCheckouts: [
+        { path: '../source', repository: 'https://git.example.net/source.git', tokenEnv: 'source_read_token' },
+      ],
+    }),
+  ).toThrow('secret env name');
+});
 
 it('linux publish jobs use smoo.github.runsOn; macOS stays macos-latest', () => {
   const rendered = renderPublishWorkflowYaml({

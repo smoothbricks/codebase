@@ -8,7 +8,8 @@ import { makeModuleSynchronized } from 'make-synchronized';
 import type * as PrettierModule from 'prettier';
 import type { Options as PrettierOptions } from 'prettier';
 import { isSmoothBricksCodebasePackageName } from '../lib/cli-package.js';
-import type { PackagePrivateNpmConfig } from '../lib/json.js';
+import type { PackagePrivateNpmConfig, PackageSourceCheckoutConfig } from '../lib/json.js';
+import { CiWorkflowStepKind, sourceCheckoutsStepLines } from './ci-workflow.js';
 import { renderRunsOnLine, type WorkflowRunsOn } from './github-runs-on.js';
 
 const PUBLISH_WORKFLOW_FORMAT_OPTIONS = Object.freeze({
@@ -39,6 +40,7 @@ export type PublishWorkflowDeployStage = 'none' | 'production';
 
 export enum PublishWorkflowStepKind {
   Checkout = 'checkout',
+  SourceCheckouts = 'source-checkouts',
   SetupDevenv = 'setup-devenv',
   ConfigureReleaseAuthor = 'configure-release-author',
   BuildNxVersionActions = 'build-nx-version-actions',
@@ -94,6 +96,8 @@ export interface PublishWorkflowDefinitionOptions {
    * this configuration.
    */
   privateNpm?: PackagePrivateNpmConfig;
+  /** Declared sibling source checkouts cloned before SetupDevenv. */
+  sourceCheckouts?: PackageSourceCheckoutConfig[];
 }
 
 export interface PublishWorkflowInputs {
@@ -144,10 +148,13 @@ type PublishWorkflowStepInput = Omit<PublishWorkflowStep, 'number'>;
 export function definePublishWorkflow(options: PublishWorkflowDefinitionOptions = {}): PublishWorkflowDefinition {
   const versionMode = githubExpression('steps.version.outputs.mode');
   if (options.release === false) {
-    return { steps: defineDeployOnlyWorkflowSteps() };
+    return { steps: defineDeployOnlyWorkflowSteps(options) };
   }
   const setupSteps: PublishWorkflowStepInput[] = [
     { kind: PublishWorkflowStepKind.Checkout, name: '📥 Checkout' },
+    ...(options.sourceCheckouts?.length
+      ? [{ kind: PublishWorkflowStepKind.SourceCheckouts, name: '📦 Check out sibling sources' }]
+      : []),
     { kind: PublishWorkflowStepKind.SetupDevenv, name: '🧱 Setup Nix/devenv', id: 'setup' },
     { kind: PublishWorkflowStepKind.ConfigureReleaseAuthor, name: '🤖 Configure release author' },
   ];
@@ -222,9 +229,12 @@ export function definePublishWorkflow(options: PublishWorkflowDefinitionOptions 
  * Repos that deploy but own no release packages. Build, lint and test are not
  * dropped safety: `nx-deploy --verify` runs all three before it deploys.
  */
-function defineDeployOnlyWorkflowSteps(): PublishWorkflowStep[] {
+function defineDeployOnlyWorkflowSteps(options: PublishWorkflowDefinitionOptions): PublishWorkflowStep[] {
   return numberWorkflowSteps([
     { kind: PublishWorkflowStepKind.Checkout, name: '📥 Checkout' },
+    ...(options.sourceCheckouts?.length
+      ? [{ kind: PublishWorkflowStepKind.SourceCheckouts, name: '📦 Check out sibling sources' }]
+      : []),
     { kind: PublishWorkflowStepKind.SetupDevenv, name: '🧱 Setup Nix/devenv', id: 'setup' },
     {
       kind: PublishWorkflowStepKind.DeployProduction,
@@ -260,6 +270,9 @@ export async function runPublishWorkflow(
       switch (step.kind) {
         case PublishWorkflowStepKind.Checkout:
           await context.callbacks.checkout();
+          break;
+        case PublishWorkflowStepKind.SourceCheckouts:
+          // The generated job runs this setup shell; runtime simulation has no callback.
           break;
         case PublishWorkflowStepKind.SetupDevenv:
           setupOutputs = await context.callbacks.setupDevenv();
@@ -460,7 +473,7 @@ function commentLinesForStep(step: PublishWorkflowStep): string[] {
   }
   if (step.kind === PublishWorkflowStepKind.SetupDevenv) {
     return [
-      '      # Step 3. Composite action internals do not affect top-level job step',
+      `      # Step ${step.number}. Composite action internals do not affect top-level job step`,
       '      # anchors; update these comments if top-level steps move.',
     ];
   }
@@ -477,6 +490,8 @@ function yamlLinesForStep(step: PublishWorkflowStep, options: PublishWorkflowDef
         '          filter: blob:none',
         '          fetch-depth: 0',
       ];
+    case PublishWorkflowStepKind.SourceCheckouts:
+      return siblingSourceCheckoutStepLines(options);
     case PublishWorkflowStepKind.SetupDevenv:
       return [`      - name: ${step.name}`, '        id: setup', '        uses: ./.github/actions/setup-devenv'];
     case PublishWorkflowStepKind.ConfigureReleaseAuthor:
@@ -629,6 +644,17 @@ function deployEnvLines(options: PublishWorkflowDefinitionOptions): string[] {
 function conditionalRunStep(step: PublishWorkflowStep, run: string): string[] {
   const condition = "steps.version.outputs.mode != 'none'";
   return [`      - name: ${step.name}`, `        if: ${condition}`, `        run: ${run}`];
+}
+
+function siblingSourceCheckoutStepLines(options: PublishWorkflowDefinitionOptions): string[] {
+  const checkouts = options.sourceCheckouts;
+  if (!checkouts?.length) {
+    return [];
+  }
+  return sourceCheckoutsStepLines(
+    { kind: CiWorkflowStepKind.SourceCheckouts, name: '📦 Check out sibling sources', number: 0 },
+    checkouts,
+  );
 }
 
 function renderSingleJobPublishWorkflowSteps(
@@ -873,7 +899,7 @@ function renderLinuxReleaseCandidateSteps(
 }
 
 function renderMacosPlatformSteps(options: PublishWorkflowDefinitionOptions): string {
-  let stepNumber = 4;
+  let stepNumber = 3;
   const lines = [
     '      # --- Setup --------------------------------------------------------------',
     '',
@@ -885,13 +911,19 @@ function renderMacosPlatformSteps(options: PublishWorkflowDefinitionOptions): st
     `          ref: ${githubExpression('github.sha')}`,
     '          filter: blob:none',
     '          fetch-depth: 0',
+  ];
+  const siblingSourceCheckouts = siblingSourceCheckoutStepLines(options);
+  if (siblingSourceCheckouts.length > 0) {
+    lines.push('', `      # Step ${stepNumber++}`, ...siblingSourceCheckouts);
+  }
+  lines.push(
     '',
-    '      # Step 3. Composite action internals do not affect top-level job step',
+    `      # Step ${stepNumber++}. Composite action internals do not affect top-level job step`,
     '      # anchors; update these comments if top-level steps move.',
     '      - name: 🧱 Setup Nix/devenv',
     '        id: setup',
     '        uses: ./.github/actions/setup-devenv',
-  ];
+  );
   if (isSmoothBricksCodebasePackageName(options.repoName)) {
     lines.push(
       '',
@@ -1001,6 +1033,12 @@ function renderFinalLinuxPublishSteps(options: PublishWorkflowDefinitionOptions)
     `          ref: ${githubExpression('github.sha')}`,
     '          filter: blob:none',
     '          fetch-depth: 0',
+  ];
+  const siblingSourceCheckouts = siblingSourceCheckoutStepLines(options);
+  if (siblingSourceCheckouts.length > 0) {
+    lines.push('', `      # Step ${stepNumber++}`, ...siblingSourceCheckouts);
+  }
+  lines.push(
     '',
     `      # Step ${stepNumber++}`,
     '      - name: 🧱 Setup Nix/devenv',
@@ -1023,7 +1061,7 @@ function renderFinalLinuxPublishSteps(options: PublishWorkflowDefinitionOptions)
     '        run:',
     '          git config user.name "github-actions[bot]" && git config user.email',
     '          "41898282+github-actions[bot]@users.noreply.github.com"',
-  ];
+  );
   if (isSmoothBricksCodebasePackageName(options.repoName)) {
     lines.push(
       '',

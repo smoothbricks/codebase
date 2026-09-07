@@ -370,6 +370,7 @@ function getManagedContent(file: ManagedFile, context: ManagedFileContext): stri
         macosPlatformArchitectures: context.macosPlatformArchitectures,
         runsOn: context.ciRunsOn,
         privateNpm: context.privateNpm,
+        sourceCheckouts: context.sourceCheckouts,
       });
     }
     if (file.source === 'pr-preview-cleanup-workflow') {
