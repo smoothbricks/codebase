@@ -83,20 +83,18 @@ pub const TOMBSTONE: u32 = u32::MAX - 1;
 /// so both sentinels are outside the valid domain and cannot alias a fact.
 pub const DERIVED_FACT_EMPTY_IDENTITY: u64 = u64::MAX;
 pub const DERIVED_FACT_TOMBSTONE_IDENTITY: u64 = u64::MAX - 1;
-/// BITMAP slot header: `serialized_len: u32` plus four reserved zero bytes.
-/// Slot data offsets are 8-aligned, so the 8-byte header keeps the AXR1
-/// payload on the 8-byte boundary axroar's word kernels take their fast
-/// path on.
-pub const BITMAP_SERIALIZED_LEN_BYTES: u32 = 8;
-/// Payload bytes reserved per element of slot capacity. AXR1 costs at most
-/// 2 bytes per member inside a chunk plus a 10-byte directory record and an
-/// 8-byte payload footprint per occupied chunk; a set scattered one member
-/// per chunk exceeds this and takes the slot-growth retry, which is the
-/// contract for every shape the closed form does not cover.
+/// Payload bytes reserved per element of slot capacity. A native bitmosaic
+/// image costs roughly 2 bytes per member inside a chunk plus directory and
+/// container records; a set scattered one member per chunk exceeds this and
+/// takes the slot-growth retry, which is the contract for every shape the
+/// closed form does not cover. This is the per-element price only:
+/// `bitmap_ops::bitmap_payload_capacity` adds the four-byte image identifier
+/// on top (`capacity * 4 + 4`), so even a zero-capacity slot holds the empty
+/// image. Declared capacities normalize to `next_power_of_2(requested * 2)`,
+/// which floors at 16, so the smallest declarable bitmap slot holds 16
+/// elements and its whole data region is 68 bytes. The slot holds the image
+/// directly, with no separate length word or fixed headroom.
 pub const BITMAP_BYTES_PER_CAPACITY: u32 = 4;
-/// Fixed payload headroom: the 32-byte AXR1 header and the first chunks'
-/// directory records.
-pub const BITMAP_BASE_BYTES: u32 = 256;
 
 pub struct StateHeaderOffset;
 
