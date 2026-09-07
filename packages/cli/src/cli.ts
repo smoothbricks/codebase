@@ -259,6 +259,15 @@ function buildProgram(): Command {
       });
     });
   release
+    .command('pack')
+    .description('Pack publishable artifacts and write a manifest without publishing or touching Git')
+    .requiredOption('--projects <projects>', 'comma-separated Nx project names')
+    .requiredOption('--output <path>', 'empty output directory for tarballs and the manifest')
+    .action(async (options: { projects: string; output: string }) => {
+      const { releasePack } = await import('./release/index.js');
+      await releasePack(await findRepoRoot(), options);
+    });
+  release
     .command('retag-unpublished')
     .description('Move unpublished owned release tags to a later commit without bumping versions')
     .argument('<tag...>', 'owned release tags to move, for example @scope/pkg@1.2.3')

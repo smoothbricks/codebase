@@ -6,6 +6,7 @@ import {
   npmPublishAuthFailureMessage,
   publishWithAuthDiagnostics,
 } from '../npm-auth.js';
+import { privateNpmPublishArgs, publishPrivateWithDiagnostics } from '../private-npm.js';
 
 const pkg: Pick<ReleasePackageInfo, 'name' | 'version'> = { name: '@scope/pkg', version: '1.2.3' };
 
@@ -81,6 +82,59 @@ describe('npm publish auth diagnostics', () => {
     expect(shell.errors).toEqual([]);
     expect(shell.summaries).toEqual([]);
     expect(shell.logs).toEqual(['@scope/pkg@1.2.3: publish result already visible on npm; continuing.']);
+  });
+});
+
+describe('private npm publish diagnostics', () => {
+  const registry = {
+    scope: '@priv.test',
+    registry: 'https://forgejo.example.test/api/packages/priv-owner/npm/',
+    authKey: '//forgejo.example.test/api/packages/priv-owner/npm/:_authToken',
+    readTokenEnv: 'PRIV_NPM_READ_TOKEN',
+    publishTokenEnv: 'PRIV_NPM_PUBLISH_TOKEN',
+  };
+
+  it('refuses with token env names and registry, never npmjs trusted-publisher repair', async () => {
+    const shell = new RecordingPublishShell({ publishFails: true });
+
+    await expect(publishPrivateWithDiagnostics(pkg, shell, registry)).rejects.toThrow(
+      '@scope/pkg@1.2.3: private npm publish failed',
+    );
+
+    expect(shell.errors).toHaveLength(1);
+    expect(shell.errors[0]).toContain('PRIV_NPM_READ_TOKEN');
+    expect(shell.errors[0]).toContain('PRIV_NPM_PUBLISH_TOKEN');
+    expect(shell.errors[0]).toContain('https://forgejo.example.test/api/packages/priv-owner/npm/');
+    expect(shell.errors[0]).not.toContain('trust-publisher');
+    expect(shell.errors[0]).not.toContain('provenance');
+    expect(shell.summaries).toHaveLength(1);
+    expect(shell.summaries[0]).toContain('## Private npm publish failed');
+    expect(shell.logs).toEqual([]);
+  });
+
+  it('continues without auth warning when the version appears on the private registry after failure', async () => {
+    const shell = new RecordingPublishShell({ publishFails: true, versionVisibleAfterFailure: true });
+
+    await publishPrivateWithDiagnostics(pkg, shell, registry);
+
+    expect(shell.errors).toEqual([]);
+    expect(shell.summaries).toEqual([]);
+    expect(shell.logs).toEqual([
+      '@scope/pkg@1.2.3: publish result already visible on the private registry; continuing.',
+    ]);
+  });
+
+  it('builds restricted publish args against the resolved registry without provenance', () => {
+    expect(privateNpmPublishArgs('/tmp/demo.tgz', 'latest', registry)).toEqual([
+      'publish',
+      '/tmp/demo.tgz',
+      '--access',
+      'restricted',
+      '--tag',
+      'latest',
+      '--registry',
+      'https://forgejo.example.test/api/packages/priv-owner/npm/',
+    ]);
   });
 });
 
