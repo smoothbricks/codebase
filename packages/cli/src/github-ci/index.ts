@@ -511,7 +511,11 @@ export async function githubCiNxDeploy(
   }
 
   if (isPullRequestStage(stage)) {
-    const url = `https://app.${stage}.conloca.com`;
+    const zone = processEnv.SMOO_PREVIEW_ZONE;
+    if (!zone) {
+      throw new Error('SMOO_PREVIEW_ZONE is not set; refusing to invent a preview hostname.');
+    }
+    const url = `https://app.${stage}.${zone}`;
     const summaryPath = processEnv.GITHUB_STEP_SUMMARY;
     if (summaryPath) {
       const appendSummary = dependencies.appendSummary ?? appendFile;
