@@ -1,10 +1,11 @@
 /* biome-ignore-all lint/suspicious/noTemplateCurlyInString: GitHub Actions expressions are emitted literally. */
 
-import type { PackagePrivateNpmConfig } from '../lib/json.js';
+import type { PackagePrivateNpmConfig, PackageSourceCheckoutConfig } from '../lib/json.js';
 import { renderRunsOnLine } from './github-runs-on.js';
 
 export enum CiWorkflowStepKind {
   Checkout = 'checkout',
+  SourceCheckouts = 'source-checkouts',
   SetupDevenv = 'setup-devenv',
   SetNxShas = 'set-nx-shas',
   RestoreNxCache = 'restore-nx-cache',
@@ -41,18 +42,27 @@ export interface CiWorkflowDefinitionOptions {
    * not job env. Publish tokens never belong here.
    */
   privateNpm?: PackagePrivateNpmConfig;
+  /**
+   * Declared sibling source checkouts (package.json `smoo.github.sourceCheckouts`).
+   * Cloned beside the main checkout before SetupDevenv so path dependencies
+   * resolve exactly as in the developer workspace. Absent means none.
+   */
+  sourceCheckouts?: PackageSourceCheckoutConfig[];
 }
 
 type CiWorkflowStepInput = Omit<CiWorkflowStep, 'number'>;
 
 export function defineCiWorkflow(options: CiWorkflowDefinitionOptions): CiWorkflowStep[] {
-  const steps: CiWorkflowStepInput[] = [
-    { kind: CiWorkflowStepKind.Checkout, name: '📥 Checkout' },
+  const steps: CiWorkflowStepInput[] = [{ kind: CiWorkflowStepKind.Checkout, name: '📥 Checkout' }];
+  if (options.sourceCheckouts?.length) {
+    steps.push({ kind: CiWorkflowStepKind.SourceCheckouts, name: '📦 Check out sibling sources' });
+  }
+  steps.push(
     { kind: CiWorkflowStepKind.SetupDevenv, name: '🧱 Setup Nix/devenv' },
     { kind: CiWorkflowStepKind.SetNxShas, name: '🧭 Set Nx SHAs' },
     { kind: CiWorkflowStepKind.RestoreNxCache, name: '🧠 Restore Nx cache' },
     { kind: CiWorkflowStepKind.Build, name: '🔨 Build' },
-  ];
+  );
   if (options.deploy) {
     steps.push({ kind: CiWorkflowStepKind.Deploy, name: '🚀 Deploy Stage' });
   }
@@ -165,7 +175,7 @@ function commentLinesForStep(step: CiWorkflowStep): string[] {
   }
   if (step.kind === CiWorkflowStepKind.SetupDevenv) {
     return [
-      '      # Step 3. Composite action internals do not affect top-level job step',
+      `      # Step ${step.number}. Composite action internals do not affect top-level job step`,
       '      # anchors; update the nx-smart --step values below if top-level steps move.',
     ];
   }
@@ -199,6 +209,8 @@ function yamlLinesForStep(step: CiWorkflowStep, options: CiWorkflowDefinitionOpt
         '          filter: blob:none',
         '          fetch-depth: 0',
       ];
+    case CiWorkflowStepKind.SourceCheckouts:
+      return sourceCheckoutsStepLines(step, options.sourceCheckouts ?? []);
     case CiWorkflowStepKind.SetupDevenv:
       // One step everywhere. setup-devenv detects host-nix (GARM) vs ephemeral
       // and skips GH install/cache steps internally — same for ci/publish/managed.
@@ -305,6 +317,71 @@ function yamlLinesForStep(step: CiWorkflowStep, options: CiWorkflowDefinitionOpt
       ];
   }
 }
+
+/**
+ * One clone command per declared sibling source, pinned to its configured
+ * ref. The step's `if` keeps fork PRs — which receive no secrets — from
+ * touching source-read credentials, and their builds would lack the private
+ * siblings anyway. Token values only ever enter git through the job env; the
+ * emitted YAML references the secret name, never a value.
+ */
+function sourceCheckoutsStepLines(step: CiWorkflowStep, checkouts: readonly PackageSourceCheckoutConfig[]): string[] {
+  const lines = [`      - name: ${step.name}`, ...SAME_REPO_GATE_FOLDED];
+  const tokenEnvs = [
+    ...new Set(checkouts.map((checkout) => checkout.tokenEnv).filter((env): env is string => env !== undefined)),
+  ];
+  if (tokenEnvs.length > 0) {
+    lines.push('        env:');
+    for (const env of tokenEnvs) {
+      lines.push(`          ${env}: ${githubExpression(`secrets.${env}`)}`);
+    }
+  }
+  lines.push('        run: |');
+  lines.push('          root="$GITHUB_WORKSPACE"');
+  for (const checkout of checkouts.map(normalizeSourceCheckout)) {
+    const destination = `"$root/${checkout.path}"`;
+    const url =
+      checkout.tokenEnv === undefined
+        ? checkout.repository
+        : `https://x-access-token:\${${checkout.tokenEnv}}@${checkout.repository.slice('https://'.length)}`;
+    lines.push(`          git clone --filter=blob:none ${url} ${destination}`);
+    if (checkout.ref !== undefined) {
+      lines.push(`          git -C ${destination} checkout --detach ${checkout.ref}`);
+    }
+  }
+  return lines;
+}
+
+/** Mechanism errors surface at managed-file render time, never inside CI. */
+function normalizeSourceCheckout(config: PackageSourceCheckoutConfig): PackageSourceCheckoutConfig {
+  if (config.path === undefined || config.path === '' || config.path.startsWith('/')) {
+    throw new Error(
+      `smoo.github.sourceCheckouts entry needs a path relative to the workspace root, got ${JSON.stringify(config.path)}`,
+    );
+  }
+  if (config.repository === undefined || !config.repository.startsWith('https://')) {
+    throw new Error(
+      `smoo.github.sourceCheckouts entry needs an https repository URL, got ${JSON.stringify(config.repository)}`,
+    );
+  }
+  if (config.tokenEnv !== undefined && !/^[A-Z_][A-Z0-9_]*$/.test(config.tokenEnv)) {
+    throw new Error(
+      `smoo.github.sourceCheckouts entry needs an upper-case secret env name, got ${JSON.stringify(config.tokenEnv)}`,
+    );
+  }
+  return config;
+}
+
+/**
+ * The same-repo gate as prettier folds it: the raw single line exceeds the
+ * print width, so the generator emits the folded form itself to keep the
+ * checked-in managed output byte-identical across regeneration and hooks.
+ */
+const SAME_REPO_GATE_FOLDED = [
+  '        if:',
+  "          ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository",
+  '          }}',
+];
 
 function deployEnvLines(options: CiWorkflowDefinitionOptions): string[] {
   if (options.deployProvider !== 'cloudflare') {

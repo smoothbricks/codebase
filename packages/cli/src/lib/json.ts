@@ -27,6 +27,27 @@ export interface PackageSmooGithub {
   pushBranches?: string[];
   /** GitHub Actions runs-on for managed CI (string or label list). Default: ubuntu-latest. */
   runsOn?: string | string[];
+  /**
+   * Sibling source checkouts a repo path-depends on (Cargo path
+   * dependencies, nix path inputs). The CI workflow clones each entry beside
+   * the main checkout before any build step runs, so the workspace layout on
+   * CI matches the developer workspace. Private sources need tokenEnv naming
+   * the repo-scoped read secret; fork PRs receive no secrets and skip the
+   * step entirely.
+   */
+  sourceCheckouts?: PackageSourceCheckoutConfig[];
+}
+
+/** One declared sibling source checkout for managed CI. */
+export interface PackageSourceCheckoutConfig {
+  /** Destination relative to the CI workspace root, e.g. `../smoothbricks`. */
+  path: string;
+  /** HTTPS clone URL of the source repository. */
+  repository: string;
+  /** Exact commit or ref to check out; the remote default branch when omitted. */
+  ref?: string;
+  /** Secret name holding the source-read credential; required for private sources. */
+  tokenEnv?: string;
 }
 
 /**
