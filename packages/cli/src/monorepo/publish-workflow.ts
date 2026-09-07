@@ -8,8 +8,17 @@ import { makeModuleSynchronized } from 'make-synchronized';
 import type * as PrettierModule from 'prettier';
 import type { Options as PrettierOptions } from 'prettier';
 import { isSmoothBricksCodebasePackageName } from '../lib/cli-package.js';
-import type { PackagePrivateNpmConfig, PackageSourceCheckoutConfig } from '../lib/json.js';
-import { CiWorkflowStepKind, sourceCheckoutsStepLines } from './ci-workflow.js';
+import type {
+  PackageCargoCredentialsConfig,
+  PackagePrivateNpmConfig,
+  PackageSourceCheckoutConfig,
+} from '../lib/json.js';
+import {
+  CiWorkflowStepKind,
+  cargoCredentialJobEnvLines,
+  cargoCredentialStepLines,
+  sourceCheckoutsStepLines,
+} from './ci-workflow.js';
 import { renderRunsOnLine, type WorkflowRunsOn } from './github-runs-on.js';
 
 const PUBLISH_WORKFLOW_FORMAT_OPTIONS = Object.freeze({
@@ -41,6 +50,7 @@ export type PublishWorkflowDeployStage = 'none' | 'production';
 export enum PublishWorkflowStepKind {
   Checkout = 'checkout',
   SourceCheckouts = 'source-checkouts',
+  CargoCredentials = 'cargo-credentials',
   SetupDevenv = 'setup-devenv',
   ConfigureReleaseAuthor = 'configure-release-author',
   BuildNxVersionActions = 'build-nx-version-actions',
@@ -100,6 +110,12 @@ export interface PublishWorkflowDefinitionOptions {
   privateNpm?: PackagePrivateNpmConfig;
   /** Declared sibling source checkouts cloned before SetupDevenv. */
   sourceCheckouts?: PackageSourceCheckoutConfig[];
+  /**
+   * Declared Cargo private-dependency credentials. Private git origins add a
+   * host-gated credential helper step before SetupDevenv; the named secrets
+   * become job env because every later cargo fetch resolves them.
+   */
+  cargoCredentials?: PackageCargoCredentialsConfig;
 }
 
 export interface PublishWorkflowInputs {
@@ -154,6 +170,9 @@ export function definePublishWorkflow(options: PublishWorkflowDefinitionOptions 
   }
   const setupSteps: PublishWorkflowStepInput[] = [
     { kind: PublishWorkflowStepKind.Checkout, name: '📥 Checkout' },
+    ...(options.cargoCredentials?.gitOrigins?.length
+      ? [{ kind: PublishWorkflowStepKind.CargoCredentials, name: CARGO_CREDENTIALS_STEP_NAME }]
+      : []),
     ...(options.sourceCheckouts?.length
       ? [{ kind: PublishWorkflowStepKind.SourceCheckouts, name: '📦 Check out sibling sources' }]
       : []),
@@ -234,6 +253,9 @@ export function definePublishWorkflow(options: PublishWorkflowDefinitionOptions 
 function defineDeployOnlyWorkflowSteps(options: PublishWorkflowDefinitionOptions): PublishWorkflowStep[] {
   return numberWorkflowSteps([
     { kind: PublishWorkflowStepKind.Checkout, name: '📥 Checkout' },
+    ...(options.cargoCredentials?.gitOrigins?.length
+      ? [{ kind: PublishWorkflowStepKind.CargoCredentials, name: CARGO_CREDENTIALS_STEP_NAME }]
+      : []),
     ...(options.sourceCheckouts?.length
       ? [{ kind: PublishWorkflowStepKind.SourceCheckouts, name: '📦 Check out sibling sources' }]
       : []),
@@ -274,7 +296,8 @@ export async function runPublishWorkflow(
           await context.callbacks.checkout();
           break;
         case PublishWorkflowStepKind.SourceCheckouts:
-          // The generated job runs this setup shell; runtime simulation has no callback.
+        case PublishWorkflowStepKind.CargoCredentials:
+          // The generated job runs these setup shells; runtime simulation has no callback.
           break;
         case PublishWorkflowStepKind.SetupDevenv:
           setupOutputs = await context.callbacks.setupDevenv();
@@ -429,7 +452,7 @@ jobs:
 ${renderRunsOnLine(options.runsOn)}
     env:
       NIX_STORE_NAR: ${githubExpression('github.workspace')}/nix-store.nar
-      GH_TOKEN: ${githubExpression('github.token')}${privateNpmInstallJobEnv(options)}
+      GH_TOKEN: ${githubExpression('github.token')}${cargoCredentialsJobEnv(options)}${privateNpmInstallJobEnv(options)}
     steps:
 `;
 }
@@ -494,6 +517,8 @@ function yamlLinesForStep(step: PublishWorkflowStep, options: PublishWorkflowDef
       ];
     case PublishWorkflowStepKind.SourceCheckouts:
       return siblingSourceCheckoutStepLines(options);
+    case PublishWorkflowStepKind.CargoCredentials:
+      return cargoCredentialsStepLines(options);
     case PublishWorkflowStepKind.SetupDevenv:
       return [`      - name: ${step.name}`, '        id: setup', '        uses: ./.github/actions/setup-devenv'];
     case PublishWorkflowStepKind.ConfigureReleaseAuthor:
@@ -659,6 +684,38 @@ function siblingSourceCheckoutStepLines(options: PublishWorkflowDefinitionOption
   );
 }
 
+const CARGO_CREDENTIALS_STEP_NAME = '🔑 Prepare Cargo git credentials';
+
+/**
+ * One credential-helper install per job, because the helper is process
+ * configuration and every later cargo fetch in that job resolves through it:
+ * the release candidate, both native platform legs, and the final publish job
+ * whose pending-release repair still builds historical versions from source.
+ */
+function cargoCredentialsStepLines(options: PublishWorkflowDefinitionOptions): string[] {
+  const config = options.cargoCredentials;
+  if (!config?.gitOrigins?.length) {
+    return [];
+  }
+  return cargoCredentialStepLines(
+    { kind: CiWorkflowStepKind.CargoCredentials, name: CARGO_CREDENTIALS_STEP_NAME, number: 0 },
+    config,
+  );
+}
+
+/**
+ * Cargo credentials are job env, not step env: the helper reads its token at
+ * call time from whichever later step runs the fetch, and build, lint, test
+ * and platform-output builds all do. Narrowing it to the install step would
+ * leave those fetches unauthenticated. Only `${{ secrets.NAME }}` is ever
+ * rendered — no token value, URL, or argv. Malformed declarations throw here,
+ * on every render path, rather than in CI.
+ */
+function cargoCredentialsJobEnv(options: PublishWorkflowDefinitionOptions): string {
+  const rendered = cargoCredentialJobEnvLines(options.cargoCredentials).trimEnd();
+  return rendered === '' ? '' : `\n${rendered}`;
+}
+
 function renderSingleJobPublishWorkflowSteps(
   steps: PublishWorkflowStep[],
   options: PublishWorkflowDefinitionOptions,
@@ -733,7 +790,7 @@ ${renderRunsOnLine(options.runsOn)}
       release-sha: ${githubExpression('steps.release-state.outputs.sha')}
     env:
       NIX_STORE_NAR: ${githubExpression('github.workspace')}/nix-store.nar
-      GH_TOKEN: ${githubExpression('github.token')}${privateNpmInstallJobEnv(options)}
+      GH_TOKEN: ${githubExpression('github.token')}${cargoCredentialsJobEnv(options)}${privateNpmInstallJobEnv(options)}
     steps:
 ${renderLinuxReleaseCandidateSteps(steps, options)}
 
@@ -744,7 +801,7 @@ ${renderMacosJobHeaderLines(options)}
       id-token: none
     env:
       NIX_STORE_NAR: ${githubExpression('github.workspace')}/nix-store.nar
-      GH_TOKEN: ${githubExpression('github.token')}${privateNpmInstallJobEnv(options)}
+      GH_TOKEN: ${githubExpression('github.token')}${cargoCredentialsJobEnv(options)}${privateNpmInstallJobEnv(options)}
     steps:
 ${renderMacosPlatformSteps(options)}
 
@@ -757,7 +814,7 @@ ${renderRunsOnLine(options.runsOn)}
     env:
       NIX_STORE_NAR: ${githubExpression('github.workspace')}/nix-store.nar
       TTSC_TSGO_BINARY: ${githubExpression('github.workspace')}/node_modules/@typescript/native/bin/tsc
-      GH_TOKEN: ${githubExpression('github.token')}${privateNpmInstallJobEnv(options)}
+      GH_TOKEN: ${githubExpression('github.token')}${cargoCredentialsJobEnv(options)}${privateNpmInstallJobEnv(options)}
     steps:
 ${renderFinalLinuxPublishSteps(options)}
 `;
@@ -914,6 +971,10 @@ function renderMacosPlatformSteps(options: PublishWorkflowDefinitionOptions): st
     '          filter: blob:none',
     '          fetch-depth: 0',
   ];
+  const macosCargoCredentials = cargoCredentialsStepLines(options);
+  if (macosCargoCredentials.length > 0) {
+    lines.push('', `      # Step ${stepNumber++}`, ...macosCargoCredentials);
+  }
   const siblingSourceCheckouts = siblingSourceCheckoutStepLines(options);
   if (siblingSourceCheckouts.length > 0) {
     lines.push('', `      # Step ${stepNumber++}`, ...siblingSourceCheckouts);
@@ -1036,6 +1097,10 @@ function renderFinalLinuxPublishSteps(options: PublishWorkflowDefinitionOptions)
     '          filter: blob:none',
     '          fetch-depth: 0',
   ];
+  const publishCargoCredentials = cargoCredentialsStepLines(options);
+  if (publishCargoCredentials.length > 0) {
+    lines.push('', `      # Step ${stepNumber++}`, ...publishCargoCredentials);
+  }
   const siblingSourceCheckouts = siblingSourceCheckoutStepLines(options);
   if (siblingSourceCheckouts.length > 0) {
     lines.push('', `      # Step ${stepNumber++}`, ...siblingSourceCheckouts);
