@@ -50,6 +50,7 @@ jobs:
       # Step 4
       # Sets the base and head SHAs required for the nx affected commands
       - name: 🧭 Set Nx SHAs
+        if: github.server_url == 'https://github.com' || endsWith(github.api_url, '/api/v3')
         uses: nrwl/nx-set-shas@v5.0.1
         with:
           workflow-id: ci.yml
@@ -83,7 +84,7 @@ jobs:
       # Step 10
       - name: 🔁 Dispatch managed-file drift healing
         if: steps.managed-drift.outputs.drifted != '' && steps.managed-drift.outputs.drifted != '0'
-        run: gh workflow run managed-files.yml --ref "$GITHUB_REF_NAME"
+        run: smoo github-ci dispatch-workflow --workflow managed-files.yml --ref "$GITHUB_REF_NAME"
 
       # Step 11
       # Nx's database cache needs artifact files and .nx/workspace-data DB

@@ -156,7 +156,7 @@ function githubExpression(expression: string): string {
 }
 
 /** Job env for `.npmrc` token expansion. Registry URL is not a GitHub variable. */
-function privateNpmReadTokenJobEnv(options: CiWorkflowDefinitionOptions): string {
+export function privateNpmReadTokenJobEnv(options: Pick<CiWorkflowDefinitionOptions, 'privateNpm'>): string {
   const tokenEnv = options.privateNpm?.readTokenEnv;
   if (!tokenEnv) {
     return '';
@@ -250,6 +250,7 @@ function yamlLinesForStep(step: CiWorkflowStep, options: CiWorkflowDefinitionOpt
     case CiWorkflowStepKind.SetNxShas:
       return [
         `      - name: ${step.name}`,
+        "        if: github.server_url == 'https://github.com' || endsWith(github.api_url, '/api/v3')",
         '        uses: nrwl/nx-set-shas@v5.0.1',
         '        with:',
         '          workflow-id: ci.yml',
@@ -290,7 +291,7 @@ function yamlLinesForStep(step: CiWorkflowStep, options: CiWorkflowDefinitionOpt
       return [
         `      - name: ${step.name}`,
         "        if: steps.managed-drift.outputs.drifted != '' && steps.managed-drift.outputs.drifted != '0'",
-        '        run: gh workflow run managed-files.yml --ref "$GITHUB_REF_NAME"',
+        '        run: smoo github-ci dispatch-workflow --workflow managed-files.yml --ref "$GITHUB_REF_NAME"',
       ];
     case CiWorkflowStepKind.Deploy:
       return [

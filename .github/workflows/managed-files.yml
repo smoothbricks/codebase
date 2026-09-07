@@ -39,7 +39,9 @@ defaults:
 
 jobs:
   update:
-    runs-on: ubuntu-latest
+    runs-on:
+      ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) &&
+      fromJSON('["nixos-latest-x64","self-hosted"]') || 'ubuntu-latest' }}
     timeout-minutes: 30
     steps:
       - name: 📥 Checkout
@@ -76,7 +78,7 @@ jobs:
           git status --porcelain
 
           workflow_changes="$(git status --porcelain -- .github/workflows || true)"
-          if [ -n "$workflow_changes" ] && [ "${MANAGED_FILES_TOKEN_CONFIGURED}" != "true" ]; then
+          if [ -n "$workflow_changes" ] && [ "${GITHUB_SERVER_URL}" = "https://github.com" ] && [ "${MANAGED_FILES_TOKEN_CONFIGURED}" != "true" ]; then
             {
               echo "::error title=MANAGED_FILES_TOKEN required::Managed update touches .github/workflows/* but repository secret MANAGED_FILES_TOKEN is not set."
               echo ""
@@ -113,15 +115,11 @@ jobs:
             exit 1
           fi
 
-          if ! gh pr view chore/managed-files --json number --jq .number >/dev/null 2>&1; then
-            gh pr create \
-              --head chore/managed-files \
-              --base "${GITHUB_REF_NAME}" \
-              --title "chore: regenerate smoo-managed files" \
-              --body "Automated refresh of smoo-managed files after drift (usually a \`@smoothbricks/cli\` pin bump). One persistent PR; re-runs force-push this branch in place. Review the template changes — do NOT enable auto-merge."
-          else
-            echo "PR already open for chore/managed-files; branch refreshed in place."
-          fi
+          smoo github-ci ensure-pull-request \
+            --head chore/managed-files \
+            --base "${GITHUB_REF_NAME}" \
+            --title "chore: regenerate smoo-managed files" \
+            --body "Automated refresh of smoo-managed files after drift (usually a \`@smoothbricks/cli\` pin bump). One persistent PR; re-runs force-push this branch in place. Review the template changes — do NOT enable auto-merge."
 
       - name: 🧹 Cleanup and cache Nix/devenv
         # success() is default; always() still saves GH Nix cache after a red job.

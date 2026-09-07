@@ -39,9 +39,9 @@ defaults:
 
 jobs:
   update:
-    runs-on: ubuntu-latest
+__SMOO_CI_RUNS_ON__
     timeout-minutes: 30
-    steps:
+__SMOO_PRIVATE_INSTALL_ENV__    steps:
       - name: 📥 Checkout
         uses: actions/checkout@v6.0.2
         with:
