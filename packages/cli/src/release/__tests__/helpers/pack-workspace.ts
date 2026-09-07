@@ -15,6 +15,8 @@ export interface PackWorkspaceOptions {
   /** Overrides alpha's `types` / `exports` manifest fields. */
   alphaTypes?: string;
   alphaExports?: Record<string, unknown>;
+  /** Overrides beta's version (e.g. an unpublished prerelease the publish-mode lock sync rewrites). */
+  betaVersion?: string;
   /** Lightweight git tags created after the fixture commit (e.g. `beta@0.2.0` stable tags). */
   stableTags?: string[];
   /** Adds packages whose tags/private flags are ambiguous under the publish policy. */
@@ -60,6 +62,7 @@ export async function withPackWorkspace(
       path: 'packages/alpha',
       version: '0.1.0',
       dependencies: { '@priv.test/beta': 'workspace:*', ...(options.alphaDependencies ?? {}) },
+      tags: ['npm:private'],
       ...(options.alphaTypes ? { types: options.alphaTypes } : {}),
       ...(options.alphaExports ? { exports: options.alphaExports } : {}),
     });
@@ -145,6 +148,8 @@ export interface PackWorkspacePackage {
   dependencies?: Record<string, string>;
   scripts?: Record<string, string>;
   private?: boolean;
+  /** Defaults to the fixture root's repository; a different URL is not owned by it. */
+  repository?: string;
   /** Written verbatim into the package manifest. */
   types?: string;
   exports?: Record<string, unknown>;
