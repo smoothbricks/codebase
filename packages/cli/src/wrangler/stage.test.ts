@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'bun:test';
 import {
   derivePullRequestWranglerConfig,
+  isPullRequestStage,
   planPullRequestResources,
   pullRequestStage,
   rateLimitNamespaceId,
@@ -113,6 +114,12 @@ describe('Wrangler deployment stage convention', () => {
     expect(stageDomain('production', 'example.test')).toBe('example.test');
     expect(stageResourceName('app', 'staging')).toBe('app-staging');
     expect(stageResourceName('app', 'production')).toBe('app');
+  });
+
+  it('counts only numbered pr stages as pull requests, not production', () => {
+    expect(isPullRequestStage('pr123')).toBe(true);
+    expect(isPullRequestStage('production')).toBe(false);
+    expect(isPullRequestStage('staging')).toBe(false);
   });
 
   it('derives the app staging block without changing inherited/static semantics', () => {

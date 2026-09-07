@@ -26,7 +26,8 @@ export function parseDeploymentStage(value: string): DeploymentStage {
 }
 
 export function isPullRequestStage(stage: DeploymentStage): stage is `pr${number}` {
-  return stage.startsWith('pr');
+  // `production` also starts with `pr`, so the pull-request number is what distinguishes the stage.
+  return /^pr[0-9]/.test(stage);
 }
 
 export function stageDomain(stage: string, zone: string): string {
