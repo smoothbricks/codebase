@@ -12,7 +12,8 @@ import type {
 import { listReleasePackages, readPackageJson } from '../lib/workspace.js';
 import { loadNxProjects, type NxProjects, targetNamesFromProjects } from '../nx/index.js';
 import { resolvePrivateNpmWorkflowConfig } from '../release/private-npm.js';
-import { renderCiWorkflowYaml } from './ci-workflow.js';
+import { privateNpmReadTokenJobEnv, renderCiWorkflowYaml } from './ci-workflow.js';
+import { renderRunsOnLine } from './github-runs-on.js';
 import { renderPrPreviewCleanupWorkflowYaml } from './pr-preview-cleanup-workflow.js';
 import { renderPublishWorkflowYaml } from './publish-workflow.js';
 
@@ -518,6 +519,11 @@ function renderTemplate(context: ManagedFileContext, template: string): string {
   return template
     .replaceAll('{{REPO_NAME}}', context.repoName)
     .replaceAll('__SMOO_CI_PUSH_BRANCHES__', renderYamlFlowList(context.ciPushBranches))
+    .replaceAll('__SMOO_CI_RUNS_ON__', renderRunsOnLine(context.ciRunsOn))
+    .replaceAll(
+      '__SMOO_PRIVATE_INSTALL_ENV__',
+      context.privateNpm ? `    env:\n${privateNpmReadTokenJobEnv(context)}` : '',
+    )
     .replaceAll('{{NODE_MODULES_CACHE_KEY}}', context.nodeModulesCacheKey);
 }
 
