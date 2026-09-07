@@ -982,10 +982,14 @@ it('runs macOS platform legs on smoo.github.macosRunsOn; default stays macos-lat
     platformTargetGlobs: PLATFORM_TARGET_GLOBS,
     macosRunsOn: ['macos-arm64', 'self-hosted'],
   });
-  expect(configured).toContain(`  macos-platform:\n    runs-on: ['macos-arm64', 'self-hosted']`);
+  expect(Bun.YAML.parse(configured)).toMatchObject({
+    jobs: { 'macos-platform': { 'runs-on': ['macos-arm64', 'self-hosted'] } },
+  });
   const fallback = renderPublishWorkflowYaml({
     repoName: '@smoothbricks/codebase',
     platformTargetGlobs: PLATFORM_TARGET_GLOBS,
   });
-  expect(fallback).toContain('  macos-platform:\n    runs-on: macos-latest');
+  expect(Bun.YAML.parse(fallback)).toMatchObject({
+    jobs: { 'macos-platform': { 'runs-on': 'macos-latest' } },
+  });
 });
