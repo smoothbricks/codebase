@@ -1,7 +1,7 @@
 import { afterAll, beforeAll, describe, expect, it } from 'bun:test';
 import { spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
-import { chmod, mkdir, mkdtemp, realpath, rm, symlink, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -280,6 +280,11 @@ describe('smoo-nx-exec', () => {
     // Realpath because macOS puts the temp directory behind a /private
     // symlink, and a process's reported cwd is the resolved one.
     workspace = await realpath(await mkdtemp(join(tmpdir(), 'ensure-built-')));
+    // Cowshed's scratch is ignored by its enclosing Git checkout. This is an
+    // independent Nx workspace: its own Git boundary keeps the daemon's
+    // ignore-aware watcher from dropping all of its source changes.
+    const initialized = Bun.spawnSync(['git', 'init', '--quiet', workspace]);
+    expect(initialized.exitCode).toBe(0);
     await mkdir(join(workspace, 'packages', 'app'), { recursive: true });
     await mkdir(join(workspace, 'packages', 'lib'), { recursive: true });
     // The repository's own node_modules, so the fixture resolves the same Nx
@@ -433,9 +438,9 @@ describe('smoo-nx-exec', () => {
 
   it('runs again when a dependency\u0027s own inputs change', async () => {
     await writeFile(join(workspace, 'packages', 'lib', 'source.txt'), 'lib changed\n');
-    const changed = await runBin(workspace, ['app:build', '--', './report'], { NX_VERBOSE_LOGGING: 'true' });
+    const changed = await runBin(workspace, ['app:build', '--', './report']);
     expect(changed.code).toBe(0);
-    expect(changed.stderr).toContain('lib:build has no cached result');
+    expect(await readFile(join(workspace, 'packages', 'lib', 'dist', 'lib.txt'), 'utf-8')).toBe('lib changed\n');
 
     // And the graph settles back to silence, which is only reachable if the
     // dependent-outputs task was hashed too.
