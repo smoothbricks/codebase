@@ -19,7 +19,6 @@ import {
   FIXTURE_PUBLISH_TOKEN_ENV,
   FIXTURE_READ_TOKEN,
   FIXTURE_READ_TOKEN_ENV,
-  FIXTURE_REGISTRY_ENV,
   FIXTURE_SCOPE,
   type FixtureNpmRegistry,
   type PrivateNpmFixture,
@@ -90,7 +89,7 @@ describe('private npm registry configuration', () => {
     });
   });
 
-  it('names the unset variable without disclosing any credential', async () => {
+  it('names the missing .npmrc entry without disclosing any credential', async () => {
     await withConfiguredRoot({ registry: null }, async (root) => {
       const resolved = resolvePrivateNpmRegistry(root);
 
@@ -99,7 +98,8 @@ describe('private npm registry configuration', () => {
         return;
       }
       expect(resolved.error.kind).toBe('MissingRegistry');
-      expect(resolved.error.message).toContain(FIXTURE_REGISTRY_ENV);
+      expect(resolved.error.message).toContain('.npmrc');
+      expect(resolved.error.message).toContain(FIXTURE_SCOPE);
       expect(resolved.error.message).not.toContain(FIXTURE_READ_TOKEN);
       expect(resolved.error.message).not.toContain(FIXTURE_PUBLISH_TOKEN);
     });
@@ -179,10 +179,10 @@ describe('publish destination selection', () => {
     await withPrivateNpmFixture(async (fixture) => {
       const pkg = { name: `${FIXTURE_SCOPE}/probe`, tags: ['npm:private'] };
 
-      // Declared configuration, endpoint variable unset: the diagnostic must
-      // name the variable an operator has to set.
+      // Declared configuration, no scoped .npmrc entry: the diagnostic must
+      // name the file an operator has to configure.
       await withConfiguredRoot({ registry: null }, async (root) => {
-        expect(() => selectPublishDestination(root, pkg)).toThrow(new RegExp(FIXTURE_REGISTRY_ENV));
+        expect(() => selectPublishDestination(root, pkg)).toThrow(/npmrc/);
       });
 
       // No declared configuration at all: still a refusal, naming the package
@@ -288,7 +288,7 @@ describe('private operations without declared configuration', () => {
 
   it('refuses when the declared endpoint variable is unset', async () => {
     await withConfiguredRoot({ registry: null }, async (root) => {
-      expect(() => requirePrivateNpmRegistry(root)).toThrow(new RegExp(FIXTURE_REGISTRY_ENV));
+      expect(() => requirePrivateNpmRegistry(root)).toThrow(/npmrc/);
     });
   });
 });
@@ -513,7 +513,6 @@ async function withConfiguredRoot(
   fn: (root: string) => Promise<void>,
 ): Promise<void> {
   const root = await mkdtemp(join(tmpdir(), 'smoo-private-npm-config-'));
-  const previousRegistry = process.env[FIXTURE_REGISTRY_ENV];
   const previousRead = process.env[FIXTURE_READ_TOKEN_ENV];
   const previousPublish = process.env[FIXTURE_PUBLISH_TOKEN_ENV];
   try {
@@ -531,7 +530,6 @@ async function withConfiguredRoot(
                 smoo: {
                   privateNpm: {
                     scope: FIXTURE_SCOPE,
-                    registryEnv: FIXTURE_REGISTRY_ENV,
                     readTokenEnv: FIXTURE_READ_TOKEN_ENV,
                     publishTokenEnv: FIXTURE_PUBLISH_TOKEN_ENV,
                   },
@@ -542,10 +540,8 @@ async function withConfiguredRoot(
         2,
       )}\n`,
     );
-    if (options.registry === null) {
-      delete process.env[FIXTURE_REGISTRY_ENV];
-    } else {
-      process.env[FIXTURE_REGISTRY_ENV] = options.registry;
+    if (options.registry !== null) {
+      await writeFile(join(root, '.npmrc'), `${FIXTURE_SCOPE}:registry=${options.registry}\n`);
     }
     // Credentials present throughout: a diagnostic must never echo them even
     // when they are available to echo.
@@ -553,7 +549,6 @@ async function withConfiguredRoot(
     process.env[FIXTURE_PUBLISH_TOKEN_ENV] = FIXTURE_PUBLISH_TOKEN;
     await fn(root);
   } finally {
-    restoreEnv(FIXTURE_REGISTRY_ENV, previousRegistry);
     restoreEnv(FIXTURE_READ_TOKEN_ENV, previousRead);
     restoreEnv(FIXTURE_PUBLISH_TOKEN_ENV, previousPublish);
     await rm(root, { recursive: true, force: true });

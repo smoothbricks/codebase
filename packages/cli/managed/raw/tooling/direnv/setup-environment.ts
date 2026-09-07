@@ -11,8 +11,6 @@ import { $ } from 'bun';
 // back to the git top level rather than resolving "undefined/../.." two levels
 // above the repository and failing with "could not find a package.json".
 const devenvRoot = process.env.DEVENV_ROOT;
-// Filled from the typed root configuration by the managed-file renderer.
-const requiredInstallEnvironment: readonly string[] = [];
 
 class CapturedCommandError extends Error {
   constructor(
@@ -67,12 +65,6 @@ const TYPESCRIPT_API_VERSION = '6.0.3';
 process.chdir(projectRoot);
 
 try {
-  for (const name of requiredInstallEnvironment) {
-    if (!process.env[name]?.trim()) {
-      console.error(`Missing ${name}; configure the private registry install environment before setup.`);
-      process.exit(1);
-    }
-  }
   // Bootstrap only: install deps + wire local git hooks/config.
   // Do not import workspace packages here — this script is what installs them,
   // and package resolution/Typia transforms are not available yet.
