@@ -475,12 +475,10 @@ Versioning:
   `HEAD`; `auto` may no-op when there are no releasable conventional commits.
 - `--dry-run` previews versioning and completion without pushing refs, publishing npm packages, or writing GitHub
   Releases.
-- The `nx-version-actions` hook is a temporary Bun workaround. Bun currently leaves `bun.lock` workspace versions stale
-  after package manifest bumps, and `bun pm pack` rewrites `workspace:*` dependencies using those stale lockfile
-  versions. Keep the hook until supported Bun versions resolve these issues:
-  [oven-sh/bun#18906](https://github.com/oven-sh/bun/issues/18906),
-  [oven-sh/bun#20477](https://github.com/oven-sh/bun/issues/20477), and
-  [oven-sh/bun#20829](https://github.com/oven-sh/bun/issues/20829).
+- The pack path maps unpublished `-next` lock entries to the last stable tag because `bun pm pack` resolves
+  `workspace:*` from `bun.lock`. Supported Buns keep the lockfile fresh on install
+  ([18906](https://github.com/oven-sh/bun/issues/18906), [20477](https://github.com/oven-sh/bun/issues/20477),
+  [20829](https://github.com/oven-sh/bun/issues/20829)), so no staleness repair remains.
 - Package release tags must use the Nx project name and version, for example `nx-plugin@0.0.2`. smoo derives release
   package/version pairs from that tag shape and maps project names back to npm package names before checking npm state.
 - `smoo release retag-unpublished <tag...>` is a break-glass recovery command for the case where Nx already committed a
@@ -606,7 +604,8 @@ The important design goal is one source of truth per convention:
 - Managed files decide what generated CI and hooks should look like.
 - Root package metadata provides defaults only for owned public packages.
 - Actual workspace package names decide which dependency ranges become `workspace:*`.
-- Package manifests decide Bun lockfile workspace versions until Bun stops leaving them stale during releases.
+- Package manifests decide Bun lockfile workspace versions; the pre-publish pack maps unpublished `-next` entries to the
+  last stable tag.
 - [`sherif`] handles broad package hygiene.
 - [`publint`] and [`attw`][are-the-types-wrong] validate real packed artifacts.
 
