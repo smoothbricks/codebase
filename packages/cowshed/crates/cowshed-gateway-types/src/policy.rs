@@ -254,16 +254,34 @@ impl EgressGrant {
         Ok(())
     }
 
-    pub(crate) fn admits(&self, target: &CanonicalTarget, method: &Method, path: &str) -> bool {
-        self.port == target.port
-            && self.host.matches(&target.host)
-            && (method == Method::CONNECT
-                || (self.mode == EgressMode::Intercept
-                    && self.methods.contains(method.as_str())
-                    && self
-                        .path_prefixes
-                        .iter()
-                        .any(|prefix| path.starts_with(prefix))))
+    /// Does this grant admit the request, reading the RAW request path?
+    ///
+    /// The path is not pre-normalized by the caller: prefix matching belongs to
+    /// [`path_matches_prefix`], the one owner of that decision on this boundary, and handing it
+    /// raw bytes is what keeps an encoded slash from helping a prefix match. `Err` is a
+    /// structurally refused path rather than "no grant matched", so the caller can say which of
+    /// the two happened.
+    pub(crate) fn admits(
+        &self,
+        target: &CanonicalTarget,
+        method: &Method,
+        path: &str,
+    ) -> Result<bool, PolicyError> {
+        if self.port != target.port || !self.host.matches(&target.host) {
+            return Ok(false);
+        }
+        if method == Method::CONNECT {
+            return Ok(true);
+        }
+        if self.mode != EgressMode::Intercept || !self.methods.contains(method.as_str()) {
+            return Ok(false);
+        }
+        for prefix in &self.path_prefixes {
+            if path_matches_prefix(path, prefix)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 }
 
@@ -409,13 +427,17 @@ impl WorkspacePolicy {
         method: &Method,
         path: &str,
     ) -> Result<&'a EgressGrant, PolicyDenial> {
-        let normalized = normalize_path(path).map_err(|_| PolicyDenial::InvalidPath)?;
-        self.grants
-            .iter()
-            .find(|grant| grant.admits(target, method, &normalized))
-            .ok_or_else(|| PolicyDenial::NotGranted {
-                hint: format!("cowshed grant <ws> --egress {}", target.authority()),
-            })
+        raw_path_admissible(path).map_err(|_| PolicyDenial::InvalidPath)?;
+        for grant in &self.grants {
+            match grant.admits(target, method, path) {
+                Ok(true) => return Ok(grant),
+                Ok(false) => {}
+                Err(_) => return Err(PolicyDenial::InvalidPath),
+            }
+        }
+        Err(PolicyDenial::NotGranted {
+            hint: format!("cowshed grant <ws> --egress {}", target.authority()),
+        })
     }
 
     pub fn resolve_mirror(&self, path: &str) -> Option<ResolvedMirrorRoute> {
@@ -536,35 +558,92 @@ fn normalize_mirror_suffix(
         let normalized = normalize_path(path_and_query)?;
         return Ok((normalized.clone(), normalized));
     }
-    if !path_and_query.starts_with('/')
-        || path_and_query.len() > 8192
-        || path_and_query.contains(['\\', '\0', '\r', '\n'])
-    {
-        return Err(PolicyError::InvalidPath);
-    }
-    let path = path_and_query
-        .split_once('?')
-        .map_or(path_and_query, |(path, _)| path);
-    let admission_path = decode_percent(path, |value| matches!(value, b'\\' | 0 | b'%'))?;
-    if admission_path.contains("//")
-        || admission_path
-            .split('/')
-            .any(|segment| segment == "." || segment == "..")
-    {
+    let admission_path = decode_encoded_slashes(path_and_query)?;
+    if admission_path.contains("//") {
         return Err(PolicyError::InvalidPath);
     }
     Ok((path_and_query.to_owned(), admission_path))
 }
 
+pub const MAX_PATH_BYTES: usize = 8192;
+
+/// Is this raw request path well-formed, before any prefix is known?
+///
+/// The proxy's front door and [`WorkspacePolicy::authorize`] share this, so a request that
+/// reaches prefix matching has already been proven well-formed once. A path strict
+/// [`normalize_path`] accepts keeps exactly its former meaning; the relaxed reading exists for
+/// the single encoded slash npm puts inside one package segment (`/@scope%2fname`), and it still
+/// refuses malformed or truncated escapes, double encoding (`%25`), backslash, NUL, CR, LF and
+/// decoded `.`/`..` segments.
+pub fn raw_path_admissible(path: &str) -> Result<(), PolicyError> {
+    if normalize_path(path).is_ok() {
+        return Ok(());
+    }
+    decode_encoded_slashes(path).map(|_| ())
+}
+
+/// Does `raw_path` lie under `prefix`?
+///
+/// The one owner of that decision on this boundary: egress grants and scoped credential records
+/// both ask here, so the network admission and the secret's scope cannot drift into two readings
+/// of the same bytes. `prefix` is matched against the RAW bytes, so an encoded slash can never
+/// help satisfy a prefix — only the remainder after a literal match is decoded, and that
+/// remainder must still be free of duplicate slashes and dot segments. Callers forward the
+/// original bytes upstream; nothing here re-encodes a path.
+pub fn path_matches_prefix(raw_path: &str, prefix: &str) -> Result<bool, PolicyError> {
+    if let Ok(strict) = normalize_path(raw_path) {
+        return Ok(strict.starts_with(prefix));
+    }
+    decode_encoded_slashes(raw_path)?;
+    let path = split_query(raw_path);
+    let Some(suffix) = path.strip_prefix(prefix) else {
+        return Ok(false);
+    };
+    let decoded = decode_percent(suffix, encoded_slash_forbidden)?;
+    if decoded.contains("//") || has_dot_segment(&decoded) {
+        return Err(PolicyError::InvalidPath);
+    }
+    Ok(true)
+}
+
+/// Bytes no escape may decode to even in the relaxed reading. `%` is forbidden so a decoded
+/// path can never be decoded a second time downstream into something else.
+const fn encoded_slash_forbidden(value: u8) -> bool {
+    matches!(value, b'\\' | 0 | b'%')
+}
+
+fn split_query(path_and_query: &str) -> &str {
+    path_and_query
+        .split_once('?')
+        .map_or(path_and_query, |(path, _)| path)
+}
+
+fn has_dot_segment(path: &str) -> bool {
+    path.split('/')
+        .any(|segment| segment == "." || segment == "..")
+}
+
+/// The relaxed reading: strict structure, but an escaped `/` decodes instead of refusing.
+fn decode_encoded_slashes(path_and_query: &str) -> Result<String, PolicyError> {
+    if !path_and_query.starts_with('/')
+        || path_and_query.len() > MAX_PATH_BYTES
+        || path_and_query.contains(['\\', '\0', '\r', '\n'])
+    {
+        return Err(PolicyError::InvalidPath);
+    }
+    let decoded = decode_percent(split_query(path_and_query), encoded_slash_forbidden)?;
+    if has_dot_segment(&decoded) {
+        return Err(PolicyError::InvalidPath);
+    }
+    Ok(decoded)
+}
+
 pub fn normalize_path(path: &str) -> Result<String, PolicyError> {
-    if !path.starts_with('/') || path.len() > 8192 || path.contains(['\\', '\0']) {
+    if !path.starts_with('/') || path.len() > MAX_PATH_BYTES || path.contains(['\\', '\0']) {
         return Err(PolicyError::InvalidPath);
     }
     let decoded = decode_percent(path, |value| matches!(value, b'/' | b'\\' | 0 | b'%'))?;
-    if decoded
-        .split('/')
-        .any(|segment| segment == "." || segment == "..")
-    {
+    if has_dot_segment(&decoded) {
         return Err(PolicyError::InvalidPath);
     }
     Ok(decoded)
@@ -647,4 +726,160 @@ pub enum PolicyError {
     InvalidOrigin,
     #[error("mirror local prefixes must be unique")]
     DuplicateMirrorPrefix,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const NPM_PREFIX: &str = "/api/packages/owner/npm/";
+
+    fn matches(raw: &str, prefix: &str) -> Result<bool, PolicyError> {
+        path_matches_prefix(raw, prefix)
+    }
+
+    #[test]
+    fn a_scoped_packument_after_the_prefix_is_admitted_and_forwarded_unchanged() {
+        let raw = "/api/packages/owner/npm/@scope%2fpkg";
+        assert!(matches(raw, NPM_PREFIX).expect("well-formed path"));
+        // Nothing here rewrites the request: the caller forwards the same bytes it was given.
+        assert!(raw.contains("%2f"));
+        assert!(
+            matches(
+                "/api/packages/owner/npm/@scope%2Fpkg/-/pkg-1.0.0.tgz",
+                NPM_PREFIX
+            )
+            .expect("well-formed path")
+        );
+    }
+
+    #[test]
+    fn an_encoded_slash_cannot_help_satisfy_the_prefix() {
+        // Decoded, this reads as if it were inside the admitted namespace; upstream would read a
+        // different resource. The prefix is matched on raw bytes precisely so it cannot pass.
+        assert!(!matches("/api%2fpackages/owner/npm/pkg", NPM_PREFIX).expect("well-formed path"));
+        assert!(!matches("%2fapi/packages/owner/npm/pkg", NPM_PREFIX).is_ok_and(|matched| matched));
+    }
+
+    #[test]
+    fn traversal_and_double_encoding_are_refused_rather_than_matched() {
+        for raw in [
+            "/api/packages/owner/npm/..%2f..%2fother",
+            "/api/packages/owner/npm/@scope%2f..%2f..%2fetc",
+        ] {
+            assert!(
+                matches(raw, NPM_PREFIX).is_err(),
+                "{raw} decodes to a dot segment"
+            );
+        }
+        // `%252f` would decode to `%2f` and invite a second decoding round downstream.
+        assert!(matches("/api/packages/owner/npm/@scope%252fpkg", NPM_PREFIX).is_err());
+        assert!(matches("/api/packages/owner/npm/@scope%2", NPM_PREFIX).is_err());
+        assert!(matches("/api/packages/owner/npm/@scope%zz", NPM_PREFIX).is_err());
+        assert!(matches("/api/packages/owner/npm/a%2f%2fb", NPM_PREFIX).is_err());
+        assert!(matches("/api/packages/owner/npm/a%5cb", NPM_PREFIX).is_err());
+        assert!(matches("/api/packages/owner/npm/a%00b", NPM_PREFIX).is_err());
+        assert!(matches("api/packages/owner/npm/@scope%2fpkg", NPM_PREFIX).is_err());
+    }
+
+    #[test]
+    fn paths_strict_normalization_accepts_keep_their_former_meaning() {
+        // Non-slash escapes still decode before the prefix comparison, as they always did.
+        assert!(matches("/api/packages/owner/npm/%41", NPM_PREFIX).expect("strict path"));
+        assert!(matches("/%61pi/packages/owner/npm/pkg", NPM_PREFIX).expect("strict path"));
+        assert!(!matches("/other/pkg", NPM_PREFIX).expect("strict path"));
+        // A duplicate slash is not new grounds for refusal where strict normalization allowed it.
+        assert!(matches("//api/packages", "/").expect("strict path"));
+        assert!(normalize_path("/a/%2f/b").is_err());
+        assert!(raw_path_admissible("/a/%2f/b").is_ok());
+        assert!(raw_path_admissible("/a/%2e%2e/b").is_err());
+        assert!(raw_path_admissible("/a/../b").is_err());
+    }
+
+    #[test]
+    fn a_query_string_is_not_part_of_the_prefix_decision() {
+        assert!(
+            matches(
+                "/api/packages/owner/npm/@scope%2fpkg?write=true",
+                NPM_PREFIX
+            )
+            .expect("well-formed path")
+        );
+    }
+
+    #[test]
+    fn grant_admission_reads_the_raw_path_and_still_gates_host_method_and_port() {
+        let target = CanonicalTarget::from_authority("registry.test:443", TargetScheme::Https)
+            .expect("fixture target");
+        let grant = EgressGrant::intercept("registry.test", 443)
+            .expect("fixture grant")
+            .allow_path(NPM_PREFIX)
+            .expect("fixture prefix");
+        let scoped = "/api/packages/owner/npm/@scope%2fpkg";
+        assert!(
+            grant
+                .admits(&target, &Method::GET, scoped)
+                .expect("well-formed path")
+        );
+        assert!(
+            !grant
+                .admits(&target, &Method::POST, scoped)
+                .expect("well-formed path")
+        );
+        let other = CanonicalTarget::from_authority("elsewhere.test:443", TargetScheme::Https)
+            .expect("fixture target");
+        assert!(
+            !grant
+                .admits(&other, &Method::GET, scoped)
+                .expect("well-formed path")
+        );
+        let other_port = CanonicalTarget::from_authority("registry.test:8443", TargetScheme::Https)
+            .expect("fixture target");
+        assert!(
+            !grant
+                .admits(&other_port, &Method::GET, scoped)
+                .expect("well-formed path")
+        );
+        assert!(
+            grant
+                .admits(&target, &Method::CONNECT, "/")
+                .expect("well-formed path")
+        );
+    }
+
+    #[test]
+    fn authorize_separates_a_malformed_path_from_an_ungranted_destination() {
+        let policy = WorkspacePolicy {
+            grants: vec![
+                EgressGrant::intercept("registry.test", 443)
+                    .expect("fixture grant")
+                    .allow_path(NPM_PREFIX)
+                    .expect("fixture prefix"),
+            ],
+            mirrors: Vec::new(),
+        };
+        let target = CanonicalTarget::from_authority("registry.test:443", TargetScheme::Https)
+            .expect("fixture target");
+        assert!(
+            policy
+                .authorize(
+                    &target,
+                    &Method::GET,
+                    "/api/packages/owner/npm/@scope%2fpkg"
+                )
+                .is_ok()
+        );
+        assert!(matches!(
+            policy.authorize(&target, &Method::GET, "/api/packages/owner/npm/%2e%2e%2fx"),
+            Err(PolicyDenial::InvalidPath)
+        ));
+        // An egress grant is origin-wide by design (`intercept` admits `/`), so the ungranted
+        // case is another destination; the exact namespace lives in the credential's own scope.
+        let elsewhere = CanonicalTarget::from_authority("elsewhere.test:443", TargetScheme::Https)
+            .expect("fixture target");
+        assert!(matches!(
+            policy.authorize(&elsewhere, &Method::GET, "/api/packages/owner/npm/pkg"),
+            Err(PolicyDenial::NotGranted { .. })
+        ));
+    }
 }

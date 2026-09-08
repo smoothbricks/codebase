@@ -34,7 +34,7 @@ use tokio::{
 use tokio_rustls::TlsAcceptor;
 
 use cowshed_gateway_types::{
-    CanonicalHost, CanonicalTarget, EgressMode, MirrorProtocol, TargetScheme, normalize_path,
+    CanonicalHost, CanonicalTarget, EgressMode, MirrorProtocol, TargetScheme, raw_path_admissible,
 };
 
 use crate::{
@@ -2168,7 +2168,7 @@ fn request_target(
         None
     };
     if local_kind.is_none() {
-        normalize_path(request.uri().path())
+        raw_path_admissible(request.uri().path())
             .map_err(|_| RequestError::bad("request path is ambiguous"))?;
     }
     if let Some(target) = fixed {

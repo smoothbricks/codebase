@@ -14,7 +14,9 @@ use tokio::{
 use tokio_rustls::TlsConnector;
 use zeroize::Zeroizing;
 
-use cowshed_gateway_types::{CanonicalHost, CanonicalTarget, MirrorProtocol, normalize_path};
+use cowshed_gateway_types::{
+    CanonicalHost, CanonicalTarget, MirrorProtocol, normalize_path, path_matches_prefix,
+};
 
 use crate::mirror::MirrorCacheStatus;
 
@@ -273,9 +275,9 @@ impl CredentialRecord {
             && self.protocol == query.protocol
             && self.origin == query.origin
             && self.methods.contains(query.method.as_str())
-            && normalize_path(&query.path).is_ok_and(|path| {
-                self.path_prefixes.iter().any(|prefix| {
-                    normalize_path(prefix).is_ok_and(|allowed| path.starts_with(&allowed))
+            && self.path_prefixes.iter().any(|prefix| {
+                normalize_path(prefix).is_ok_and(|allowed| {
+                    path_matches_prefix(&query.path, &allowed).unwrap_or(false)
                 })
             })
             && !matches!(

@@ -23,7 +23,7 @@ pub mod status;
 pub use policy::{
     CanonicalHost, CanonicalTarget, EgressGrant, EgressMode, HostPattern, MirrorProtocol,
     MirrorRoute, PolicyDenial, PolicyError, ResolvedMirrorRoute, TargetScheme, WorkspacePolicy,
-    decode_percent, mirror_scope_matches, normalize_path,
+    decode_percent, mirror_scope_matches, normalize_path, path_matches_prefix, raw_path_admissible,
 };
 pub use repo_id::{InvalidRepoId, validate_repo_id};
 pub use session::{
