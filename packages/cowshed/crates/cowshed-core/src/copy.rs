@@ -764,8 +764,6 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use proptest::prelude::*;
-
     use super::{
         CopyReport, DIRECTORY_STAGING_MODE, EntryKind, Snapshot, converge, copy_with_budget,
         describe_churn, render_path, snapshot, validate_copy_roots,
@@ -776,10 +774,13 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("clock after epoch")
             .as_nanos();
-        let root = std::env::temp_dir().join(format!(
-            "cowshed-copy-{label}-{}-{suffix}",
-            std::process::id()
-        ));
+        let root = std::env::var_os("XDG_RUNTIME_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir)
+            .join(format!(
+                "cowshed-copy-{label}-{}-{suffix}",
+                std::process::id()
+            ));
         fs::create_dir_all(&root).expect("create fixture root");
         root
     }
@@ -945,7 +946,8 @@ mod tests {
     /// `.git` object stores and package stores are full of hard links. Expanding
     /// them into independent copies inflates the image for nothing.
     #[test]
-    fn preserves_hard_linked_files_as_a_single_inode() {
+    #[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
+    fn host_controller_preserves_hard_linked_files_as_a_single_inode() {
         let (root, source, destination) = copy_roots("hard-links");
         fs::create_dir(source.join("store")).expect("create store");
         fs::write(source.join("store/original"), b"shared bytes\n").expect("write original");
@@ -977,14 +979,12 @@ mod tests {
         let (root, source, destination) = copy_roots("runtime-artifacts");
         fs::create_dir(source.join("run")).expect("create run directory");
         fs::write(source.join("run/kept"), b"content\n").expect("write regular file");
-        // `bind` is the one filesystem call with a hard path-length ceiling:
-        // `sun_path` is 104 bytes, and a fixture root under the temp directory
-        // already spends most of them — the same ceiling that made copying a
-        // socket into the staging mount impossible. So bind under a short
-        // sibling of the fixture, which shares its filesystem, and rename in.
-        // A rename from a fixed `/tmp` would cross devices wherever `TMPDIR`
-        // points somewhere else.
-        let staging = std::env::temp_dir().join(format!("cs{}", std::process::id()));
+        // Bind through the admitted short runtime spelling, then rename on the
+        // same filesystem into the long checkout path the copier must skip.
+        let staging = root
+            .parent()
+            .expect("fixture runtime directory")
+            .join(format!("cs{}", std::process::id()));
         fs::create_dir_all(&staging).expect("create socket staging directory");
         let staged_socket = staging.join("s");
         let _ = fs::remove_file(&staged_socket);
@@ -1256,57 +1256,50 @@ mod tests {
         fs::remove_dir_all(root).expect("remove fixture");
     }
 
-    proptest! {
-        #![proptest_config(ProptestConfig::with_cases(24))]
+    #[test]
+    fn resumed_parallel_copy_keeps_completed_leaves() {
+        let (root, source, destination) = copy_roots("parallel-resume");
+        let mut initial_inodes = Vec::new();
 
-        #[test]
-        fn resumed_parallel_copy_keeps_completed_leaves(file_count in 2_usize..80) {
-            let (root, source, destination) = copy_roots("parallel-resume");
-            let completed = file_count / 2;
-            for index in 0..completed {
-                let subtree = source.join(format!("subtree-{}", index % 8));
-                fs::create_dir_all(&subtree).expect("create initial subtree");
-                fs::write(subtree.join(format!("file-{index}")), index.to_le_bytes())
-                    .expect("write initial file");
-            }
-            run(&source, &destination, 6);
-            let initial_inodes = (0..completed)
-                .map(|index| {
-                    let path = destination
-                        .join(format!("subtree-{}", index % 8))
-                        .join(format!("file-{index}"));
-                    fs::symlink_metadata(path).expect("stat initial copy").ino()
-                })
-                .collect::<Vec<_>>();
-
+        // Grow one real tree instead of rebuilding 24 randomly sized fixtures.
+        // Cross the eight-subtree boundary, retain the old maximum's 39 completed
+        // and 40 missing leaves, then resume once more with no work left.
+        for file_count in [1_usize, 2, 8, 9, 39, 79, 79] {
+            let completed = initial_inodes.len();
             for index in completed..file_count {
                 let subtree = source.join(format!("subtree-{}", index % 8));
                 fs::create_dir_all(&subtree).expect("create resumed subtree");
                 fs::write(subtree.join(format!("file-{index}")), index.to_le_bytes())
                     .expect("write resumed file");
             }
-            run(&source, &destination, 6);
+            let report = run(&source, &destination, 6);
+            assert_eq!(report.passes, 1, "a still source needs one pass");
+            assert_eq!(report.changed_entries, 0);
+            assert_eq!(
+                report.cloned_files + report.copied_files,
+                file_count - completed,
+                "a resumed copy must materialize only missing leaves"
+            );
 
             for index in 0..file_count {
                 let path = destination
                     .join(format!("subtree-{}", index % 8))
                     .join(format!("file-{index}"));
-                prop_assert_eq!(
-                    fs::read(path).expect("read copied file"),
+                assert_eq!(
+                    fs::read(&path).expect("read copied file"),
                     index.to_le_bytes()
                 );
+                let inode = fs::symlink_metadata(&path).expect("stat copied file").ino();
+                if index < completed {
+                    assert_eq!(
+                        inode, initial_inodes[index],
+                        "a resumed copy must not reclone completed leaves"
+                    );
+                } else {
+                    initial_inodes.push(inode);
+                }
             }
-            for (index, inode) in initial_inodes.into_iter().enumerate() {
-                let path = destination
-                    .join(format!("subtree-{}", index % 8))
-                    .join(format!("file-{index}"));
-                prop_assert_eq!(
-                    fs::symlink_metadata(path).expect("restat initial copy").ino(),
-                    inode,
-                    "a resumed copy must not reclone completed leaves"
-                );
-            }
-            fs::remove_dir_all(root).expect("remove fixture");
         }
+        fs::remove_dir_all(root).expect("remove fixture");
     }
 }
