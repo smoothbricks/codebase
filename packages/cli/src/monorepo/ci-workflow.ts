@@ -37,12 +37,24 @@ export interface CiWorkflowStep {
   number: number;
 }
 
-export interface CiWorkflowDefinitionOptions {
+/**
+ * What a deploy step needs to authenticate, as declared configuration. Both
+ * workflow generators deploy production with the same credentials, so the
+ * declaration and its rendering live here once: a repo that declares
+ * `smoo.github.deploySecrets` gets them wherever a managed workflow deploys,
+ * not only on CI's stage deploy.
+ */
+export interface DeployStepSecretConfig {
+  deployProvider?: 'cloudflare';
+  /** Extra deploy-step secrets, env var name → repository secret name. */
+  deploySecrets?: Record<string, string>;
+}
+
+export interface CiWorkflowDefinitionOptions extends DeployStepSecretConfig {
   actionsProvider?: PackageSmooGithub['actionsProvider'];
   deploy: boolean;
   browserTests: boolean;
   e2eDeployment: boolean;
-  deployProvider?: 'cloudflare';
   /** The first entry is the branch whose pushes deploy the staging stage. */
   pushBranches: NonEmptyArray<string>;
   /** Default ubuntu-latest when omitted. */
@@ -69,8 +81,6 @@ export interface CiWorkflowDefinitionOptions {
   cargoCredentials?: PackageCargoCredentialsConfig;
   /** GitHub Environments: staging for the validate/e2e jobs, production for the production-on-push job. */
   environments?: PackageSmooGithubEnvironments;
-  /** Extra deploy-step secrets, env var name → repository secret name. */
-  deploySecrets?: Record<string, string>;
   /** Secrets for the e2e-deployment step, env var name → repository secret name. */
   e2eSecrets?: Record<string, string>;
   /** Emit the production-on-push job (some project carries PRODUCTION_PUSH_DEPLOY_TAG). */
@@ -327,7 +337,7 @@ function yamlLinesForStep(step: CiWorkflowStep, options: CiWorkflowDefinitionOpt
         '              github.event.pull_request.head.repo.full_name == github.repository) ||',
         `            (github.event_name == 'push' && github.ref == ${stagingRefLiteral(options)})`,
         '          }}',
-        ...deployEnvLines(options),
+        ...deployStepSecretEnvLines(options),
         `        run: smoo github-ci nx-deploy --mode run-many --name "Deploy Stage" --step ${step.number}`,
       ];
     case CiWorkflowStepKind.SaveNxCache:
@@ -643,12 +653,23 @@ function environmentLine(name: string | undefined): string {
   return name ? `    environment: ${yamlScalar(name)}\n` : '';
 }
 
-function deployEnvLines(options: CiWorkflowDefinitionOptions): string[] {
+/**
+ * The step-scoped `env:` block for a deploy step. Step scope is the property
+ * being rendered, not an accident of indentation: job env would hand the
+ * deployment credentials to every other step in that job — checkout, setup,
+ * build, and in the publish workflow the pending-release repair and the npm
+ * publish itself.
+ *
+ * An explicit declaration wins over the provider default, so a repo whose
+ * Cloudflare credentials live under different repository secret names says so
+ * once in `deploySecrets` instead of being overridden here.
+ */
+export function deployStepSecretEnvLines(config: DeployStepSecretConfig): string[] {
   const cloudflare: Record<string, string> =
-    options.deployProvider === 'cloudflare'
+    config.deployProvider === 'cloudflare'
       ? { CLOUDFLARE_API_TOKEN: 'CLOUDFLARE_API_TOKEN', CLOUDFLARE_ACCOUNT_ID: 'CLOUDFLARE_ACCOUNT_ID' }
       : {};
-  return secretEnvLines({ ...cloudflare, ...options.deploySecrets });
+  return secretEnvLines({ ...cloudflare, ...config.deploySecrets });
 }
 
 /** A step-level `env:` block mapping env var names to repository secrets; nothing when there are none. */
@@ -770,7 +791,7 @@ ${cargoCredentialJobEnvLines(options.cargoCredentials)}${privateNpmReadTokenJobE
 ${renderCiWorkflowSteps(followUpSetupSteps(options, numbers), options)}
       # Step ${numbers.middle}
       - name: 🚀 Deploy Production
-${renderOptionalLines(deployEnvLines(options))}        run: smoo github-ci nx-deploy --stage production --mode run-many --select-tag ${PRODUCTION_PUSH_DEPLOY_TAG} --name "Deploy Production" --step ${numbers.middle}
+${renderOptionalLines(deployStepSecretEnvLines(options))}        run: smoo github-ci nx-deploy --stage production --mode run-many --select-tag ${PRODUCTION_PUSH_DEPLOY_TAG} --name "Deploy Production" --step ${numbers.middle}
 
 ${renderCiWorkflowSteps(followUpCleanupStep(numbers), options)}`;
 }

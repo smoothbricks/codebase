@@ -19,6 +19,8 @@ import {
   CiWorkflowStepKind,
   cargoCredentialJobEnvLines,
   cargoCredentialStepLines,
+  type DeployStepSecretConfig,
+  deployStepSecretEnvLines,
   sourceCheckoutsStepLines,
 } from './ci-workflow.js';
 import { GITHUB_HOSTED_LINUX_RUNNER, renderRunsOnLine, type WorkflowRunsOn } from './github-runs-on.js';
@@ -83,7 +85,7 @@ export interface PublishWorkflowDefinition {
   steps: PublishWorkflowStep[];
 }
 
-export interface PublishWorkflowDefinitionOptions {
+export interface PublishWorkflowDefinitionOptions extends DeployStepSecretConfig {
   deploy?: boolean;
   /**
    * Whether the repo owns packages this workflow can release. False drops the
@@ -91,7 +93,6 @@ export interface PublishWorkflowDefinitionOptions {
    * production deploy on, and every `smoo release` command throws without one.
    */
   release?: boolean;
-  deployProvider?: 'cloudflare';
   repoName?: string;
   platformTargetGlobs?: readonly string[];
   /**
@@ -655,19 +656,8 @@ function deployProductionStep(step: PublishWorkflowStep, options: PublishWorkflo
   return [
     `      - name: ${step.name}`,
     ...conditionLines,
-    ...deployEnvLines(options),
+    ...deployStepSecretEnvLines(options),
     '        run: smoo github-ci nx-deploy --stage production --mode run-many --verify --name "Deploy Production"',
-  ];
-}
-
-function deployEnvLines(options: PublishWorkflowDefinitionOptions): string[] {
-  if (options.deployProvider !== 'cloudflare') {
-    return [];
-  }
-  return [
-    '        env:',
-    '          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}',
-    '          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}',
   ];
 }
 
@@ -1277,7 +1267,7 @@ function renderFinalLinuxPublishSteps(options: PublishWorkflowDefinitionOptions)
       '        if:',
       "          ${{ needs.linux-release-candidate.outputs.mode != 'none' && inputs.deploy_stage == 'production' &&",
       "          inputs.dry_run != 'true' }}",
-      ...deployEnvLines(options),
+      ...deployStepSecretEnvLines(options),
       '        run: smoo github-ci nx-deploy --stage production --mode run-many --verify --name "Deploy Production"',
     );
   }
