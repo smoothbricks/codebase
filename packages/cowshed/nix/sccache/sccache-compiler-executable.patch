@@ -48,6 +48,14 @@ diff --git a/src/server.rs b/src/server.rs
 diff --git a/src/compiler/rust.rs b/src/compiler/rust.rs
 --- a/src/compiler/rust.rs
 +++ b/src/compiler/rust.rs
+@@ -237,2 +237,6 @@
+ /// Version number for cache key.
+-const CACHE_VERSION: &[u8] = b"6";
++// Before compiler-executable binding, a cached compiler could retain a mutable
++// alias and publish another rustc's output under this compiler's key. The fix
++// must not read those entries. Domain-separate this epoch from upstream versions
++// while retaining normal cache reads, writes, and eviction.
++const CACHE_VERSION: &[u8] = b"6-cowshed-compiler-executable-v1";
 @@ -419,6 +419,10 @@ impl Rust {
      where
          T: CommandCreatorSync,
