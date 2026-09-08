@@ -2443,6 +2443,30 @@ pub struct SkillInstallReport {
     pub installs: Vec<SkillInstall>,
 }
 
+/// One approved gateway-backed registry route, as reported to an operator.
+///
+/// Non-secret by construction: the origin and its scope, which environment variable names the
+/// route was enrolled from and are therefore withheld from every child, and whether a usable
+/// credential is installed. The secret is never read into this shape, not even to be discarded —
+/// `installed` is the whole answer a report needs.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CredentialRoute {
+    pub repo_id: RepoId,
+    pub origin: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub path_prefixes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub withheld_env_names: Vec<String>,
+    pub installed: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CredentialReport {
+    pub routes: Vec<CredentialRoute>,
+}
+
 mod result_body_seal {
     pub trait Sealed {}
 }
@@ -2485,6 +2509,7 @@ result_bodies!(
     MirrorInfo,
     AuditEvent,
     SkillInstallReport,
+    CredentialReport,
     HostSetupReport,
     UninstallReport,
     Vec<WorkspaceInfo>,

@@ -12,7 +12,10 @@ use std::io;
 use cowshed_core::CowshedError;
 use cowshed_gateway::{GATEWAY_GIT_FETCH_HELPER_ARG, run_gateway_git_fetch_helper};
 
-use crate::{args, gateway_service, help, output, runtime, sccache_service, setup_service, skill};
+use crate::{
+    args, credential_service, gateway_service, help, output, runtime, sccache_service,
+    setup_service, skill,
+};
 
 /// Run one CLI invocation. `arguments` excludes argv[0].
 ///
@@ -97,6 +100,17 @@ async fn run_parsed(parsed: args::Cli) -> i32 {
     }
     if let args::Command::Gateway(action) = &parsed.command {
         let outcome = gateway_service::dispatch(*action, parsed.global.json, &mut output).await;
+        return finish(outcome, &mut output, json);
+    }
+    // Enrolment is a host operation with a project subject: it needs the repository identity a
+    // credential record binds to, and nothing else the project bridge provides.
+    if let args::Command::Credential(action) = parsed.command.clone() {
+        let outcome = match runtime::resolve_project_root(&parsed).await {
+            Ok(root) => {
+                credential_service::dispatch(action, &root, parsed.global.json, &mut output).await
+            }
+            Err(error) => Err(error),
+        };
         return finish(outcome, &mut output, json);
     }
     if let args::Command::Sccache(action) = &parsed.command {

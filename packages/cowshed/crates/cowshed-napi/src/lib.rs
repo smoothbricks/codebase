@@ -1017,6 +1017,7 @@ mod parity_tests {
             Command::Land(_) => Some("Coordinator.land"),
             Command::Doctor(_) => Some("Coordinator.doctor"),
             Command::Gateway(_)
+            | Command::Credential(_)
             | Command::Sccache(_)
             | Command::Skill(_)
             | Command::Setup(_)
@@ -1063,6 +1064,7 @@ mod parity_tests {
         (&["land", "parity"], Some("Coordinator.land")),
         (&["doctor"], Some("Coordinator.doctor")),
         (&["gateway", "status"], None),
+        (&["credential", "status"], None),
         (&["sccache", "status"], None),
         (&["skill", "install"], None),
         (&["mount", "main", "--repo-id", "acme/widget"], None),

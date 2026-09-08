@@ -37,6 +37,7 @@ pub static COMMANDS: &[&CommandSpec] = &[
     &LAND,
     &DOCTOR,
     &GATEWAY,
+    &CREDENTIAL,
     &SCCACHE,
     &SKILL,
 ];
@@ -81,6 +82,7 @@ pub enum Command {
     Land(LandArgs),
     Doctor(DoctorArgs),
     Gateway(GatewayCommand),
+    Credential(CredentialCommand),
     Sccache(SccacheCommand),
     Skill(SkillArgs),
     /// `--version` or `-V`: the npm package version.
@@ -118,7 +120,8 @@ impl Command {
             | Self::Gc(_)
             | Self::Push(_)
             | Self::Rebase(_)
-            | Self::Land(_) => ProjectDiscovery::Required,
+            | Self::Land(_)
+            | Self::Credential(_) => ProjectDiscovery::Required,
             Self::List(args) if !args.all => ProjectDiscovery::Optional,
             Self::Doctor(_) => ProjectDiscovery::Optional,
             Self::List(_)
@@ -154,6 +157,30 @@ pub enum GatewayCommand {
     Stop { purge: bool },
     Status,
     Run,
+}
+
+/// Enrolment is per project, because a credential record is bound to one `repo_id`. The
+/// repository is discovered from the checkout like every other project verb, so an operator
+/// never types an identity the store already knows.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CredentialCommand {
+    Add(CredentialAddArgs),
+    Status,
+    Remove { origin: String },
+}
+
+/// The secret is named, never written on the command line: `--secret-env` names a variable in
+/// the operator's own environment, `--secret-command` names a helper to run, `--secret-stdin`
+/// reads a pipe. There is deliberately no flag that takes the credential itself — argv is
+/// visible to every process on the host and lands in shell history.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CredentialAddArgs {
+    pub origin: String,
+    pub path_prefixes: Vec<String>,
+    pub methods: Vec<String>,
+    pub secret_env: Option<String>,
+    pub secret_command: Option<Vec<String>>,
+    pub secret_stdin: bool,
 }
 
 /// `setup` runs in one of two directions and never both, so they are one flag apiece rather than a
@@ -303,6 +330,9 @@ pub struct GrantArgs {
     pub workspace: String,
     pub read: Vec<PathBuf>,
     pub write: Vec<PathBuf>,
+    /// Hosts this workspace may reach through the gateway. Network reach is a separate decision
+    /// from filesystem reach, and separately auditable: the gateway logs every admission.
+    pub egress: Vec<String>,
 }
 
 /// `rm <ws>` — retire one workspace.
@@ -671,7 +701,8 @@ fn cli_command() -> ClapCommand {
         .subcommand(
             leaf("grant")
                 .arg(positional("workspace", 0..=1))
-                .args([path_values("read"), path_values("write")]),
+                .args([path_values("read"), path_values("write")])
+                .arg(append_value("egress")),
         )
         .subcommand(leaf("rm").arg(positional("workspace", 0..=1)).args([
             flag("force"),
@@ -729,6 +760,21 @@ fn cli_command() -> ClapCommand {
                 .subcommand(leaf("stop").arg(flag("purge")))
                 .subcommand(leaf("status"))
                 .subcommand(leaf("run")),
+        )
+        .subcommand(
+            leaf("credential")
+                .subcommand_required(true)
+                .subcommand(leaf("add").args([
+                    value("origin"),
+                    append_value("path-prefix"),
+                    append_value("method"),
+                    value("secret-env"),
+                    value("secret-command"),
+                    flag("secret-stdin"),
+                ]))
+                .subcommand(leaf("ls"))
+                .subcommand(leaf("status"))
+                .subcommand(leaf("rm").arg(value("origin"))),
         )
         .subcommand(
             leaf("sccache")
@@ -844,6 +890,7 @@ fn cli_from_matches(matches: ArgMatches) -> Result<Cli, UsageError> {
         "land" => parse_land(leaf)?,
         "doctor" => parse_doctor(leaf)?,
         "gateway" => parse_gateway(leaf, &global)?,
+        "credential" => parse_credential(leaf)?,
         "sccache" => parse_sccache(leaf, &global)?,
         "skill" => parse_skill(leaf, &global)?,
         other => return Err(unknown_command(other)),
@@ -898,7 +945,9 @@ fn translate_clap(error: clap::Error, args: &[OsString]) -> UsageError {
                 .or_else(|| first_unrecognized(args).map(str::to_owned))
                 .unwrap_or_else(|| "unknown".to_owned());
             match spec {
-                Some(spec) if matches!(spec.name, "gateway" | "sccache" | "skill") => {
+                Some(spec)
+                    if matches!(spec.name, "gateway" | "credential" | "sccache" | "skill") =>
+                {
                     UsageError::new(format!("unknown {} action `{name}`", spec.name), spec)
                 }
                 _ => unknown_command(&name),
@@ -1067,6 +1116,31 @@ fn flagged(matches: &ArgMatches, name: &str) -> bool {
     matches.get_flag(name)
 }
 
+/// A required `--flag <value>` that must be UTF-8. Origins, paths and methods are protocol text,
+/// so a non-UTF-8 spelling is a usage error rather than something to carry as bytes.
+fn required_value(
+    matches: &ArgMatches,
+    name: &str,
+    usage: &'static CommandSpec,
+    missing: &str,
+) -> Result<String, UsageError> {
+    let value = os(matches, name).ok_or_else(|| UsageError::new(missing, usage))?;
+    value
+        .into_string()
+        .map_err(|_| UsageError::new(format!("--{name} must be valid UTF-8"), usage))
+}
+
+fn appended_values(matches: &ArgMatches, name: &str) -> Vec<String> {
+    matches
+        .get_many::<OsString>(name)
+        .map(|values| {
+            values
+                .filter_map(|value| value.to_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn require_workspace(
     matches: &ArgMatches,
     field: &str,
@@ -1152,6 +1226,155 @@ fn parse_gateway(matches: &ArgMatches, global: &GlobalOptions) -> Result<Command
         }
     };
     Ok(Command::Gateway(command))
+}
+
+const CREDENTIAL: CommandSpec = CommandSpec {
+    name: "credential",
+    missing: "credential action is required",
+    args: "<add|ls|status|rm>",
+    trailing: "",
+    summary: "enrol the registry credentials the gateway holds",
+    about: &[
+        "A workspace reaches a private registry through the gateway, which attaches a credential the host holds and strips whatever the client sent. Nothing inside a sandbox ever receives the secret, so this command is how the host comes to hold it: `add` writes one scoped record to the platform credential store, `ls`/`status` report which routes exist and whether their credential is installed, and `rm` forgets one.",
+        "A record is bound to this project's repository, one exact HTTPS origin with its port, the methods an intercept grant admits, and at least one registry path prefix. The origin is host and port only — the registry's namespace path belongs in `--path-prefix`, which is what keeps the credential from being usable for the whole host.",
+        "The secret is named, never typed: `--secret-env` reads a variable from this shell, `--secret-command` runs a helper whose argv comes from the flag, `--secret-stdin` reads a pipe. A non-empty named variable wins and the helper is not run. There is no flag that takes the credential itself, because argv is visible to every process on the host.",
+        "Enrolment records the variable NAME it read, and every job in this project then has that name withheld from its environment: a credential the gateway holds has no reason to also travel into a sandbox. Network reach is still a separate, auditable decision — grant it per workspace with `cowshed grant <workspace> --egress <host>`.",
+    ],
+    options: &[
+        Opt {
+            spelling: "--origin <https://host[:port]>",
+            meaning: "the registry origin, host and port only; the port defaults to 443",
+        },
+        Opt {
+            spelling: "--path-prefix <path>",
+            meaning: "registry namespace the credential is limited to; repeatable, at least one required",
+        },
+        Opt {
+            spelling: "--method <GET|HEAD>",
+            meaning: "methods the credential may be attached to; defaults to GET and HEAD",
+        },
+        Opt {
+            spelling: "--secret-env <NAME>",
+            meaning: "read the credential from this environment variable, and withhold that name from every child",
+        },
+        Opt {
+            spelling: "--secret-command <json-argv>",
+            meaning: "run this argv array to obtain the credential; not run when --secret-env is set and non-empty",
+        },
+        Opt {
+            spelling: "--secret-stdin",
+            meaning: "read the credential from stdin",
+        },
+    ],
+};
+
+/// `GET` and `HEAD` are what an intercept grant admits, so they are the default and the only
+/// methods worth spelling out; anything else is refused by the record's own validation.
+const DEFAULT_CREDENTIAL_METHODS: [&str; 2] = ["GET", "HEAD"];
+
+fn parse_credential(matches: &ArgMatches) -> Result<Command, UsageError> {
+    const USAGE: &CommandSpec = &CREDENTIAL;
+    let (action, child) = matches
+        .subcommand()
+        .ok_or_else(|| UsageError::new(USAGE.missing, USAGE))?;
+    let command = match action {
+        "add" => {
+            let origin = required_value(
+                child,
+                "origin",
+                USAGE,
+                "--origin <https://host> is required",
+            )?;
+            let path_prefixes = appended_values(child, "path-prefix");
+            if path_prefixes.is_empty() {
+                return Err(UsageError::new(
+                    "at least one --path-prefix is required: a credential without a scope would be usable for the whole host",
+                    USAGE,
+                ));
+            }
+            let mut methods = appended_values(child, "method");
+            if methods.is_empty() {
+                methods = DEFAULT_CREDENTIAL_METHODS
+                    .iter()
+                    .map(|method| (*method).to_owned())
+                    .collect();
+            }
+            let secret_env = match os(child, "secret-env") {
+                Some(name) => Some(
+                    name.into_string()
+                        .map_err(|_| UsageError::new("--secret-env must be valid UTF-8", USAGE))?,
+                ),
+                None => None,
+            };
+            let secret_command = match os(child, "secret-command") {
+                Some(text) => {
+                    let text = text.into_string().map_err(|_| {
+                        UsageError::new("--secret-command must be valid UTF-8", USAGE)
+                    })?;
+                    Some(parse_secret_command(&text, USAGE)?)
+                }
+                None => None,
+            };
+            let secret_stdin = flagged(child, "secret-stdin");
+            if secret_stdin && (secret_env.is_some() || secret_command.is_some()) {
+                return Err(UsageError::new(
+                    "--secret-stdin cannot be combined with another credential source",
+                    USAGE,
+                ));
+            }
+            if !secret_stdin && secret_env.is_none() && secret_command.is_none() {
+                return Err(UsageError::new(
+                    "name a credential source: --secret-env <NAME>, --secret-command <json-argv>, or --secret-stdin",
+                    USAGE,
+                ));
+            }
+            CredentialCommand::Add(CredentialAddArgs {
+                origin,
+                path_prefixes,
+                methods,
+                secret_env,
+                secret_command,
+                secret_stdin,
+            })
+        }
+        "ls" | "status" => CredentialCommand::Status,
+        "rm" => CredentialCommand::Remove {
+            origin: required_value(
+                child,
+                "origin",
+                USAGE,
+                "--origin <https://host> is required to name the route to forget",
+            )?,
+        },
+        other => {
+            return Err(UsageError::new(
+                format!("unknown credential action `{other}`"),
+                USAGE,
+            ));
+        }
+    };
+    Ok(Command::Credential(command))
+}
+
+/// The helper is an argv ARRAY, not a shell string: a command line assembled by a shell is a
+/// second language between the operator and the process that reads the secret.
+fn parse_secret_command(
+    text: &str,
+    usage: &'static CommandSpec,
+) -> Result<Vec<String>, UsageError> {
+    let argv: Vec<String> = serde_json::from_str(text).map_err(|error| {
+        UsageError::new(
+            format!("--secret-command must be a JSON array of strings: {error}"),
+            usage,
+        )
+    })?;
+    if argv.is_empty() || argv.iter().any(|word| word.is_empty()) {
+        return Err(UsageError::new(
+            "--secret-command needs a program and no empty arguments",
+            usage,
+        ));
+    }
+    Ok(argv)
 }
 
 const SCCACHE: CommandSpec = CommandSpec {
@@ -1775,7 +1998,7 @@ const GRANT: CommandSpec = CommandSpec {
     missing: "grant requires a workspace",
     args: "<ws>",
     trailing: "",
-    summary: "grant filesystem access",
+    summary: "grant filesystem and network access",
     about: &[
         "Adds read-only or writable host paths to one workspace's sandbox grant snapshot. Paths are normalized, deduplicated, sorted, and recorded outside the workspace image; they apply from the next exec or shell. With no flags, prints the current filesystem grants.",
         "A grant cannot cover the workspace mount, another cowshed mount, controller state, project policy roots, or credential-bearing paths.",
@@ -1789,6 +2012,10 @@ const GRANT: CommandSpec = CommandSpec {
         Opt {
             spelling: "--write <path...>",
             meaning: "allow reads and writes beneath one or more absolute host paths; repeat the flag to add more",
+        },
+        Opt {
+            spelling: "--egress <host>",
+            meaning: "allow this workspace to reach one host through the gateway; repeat the flag to add more",
         },
     ],
 };
@@ -1805,6 +2032,7 @@ fn parse_grant(matches: &ArgMatches) -> Result<Command, UsageError> {
             .get_many::<PathBuf>("write")
             .map(|paths| paths.cloned().collect())
             .unwrap_or_default(),
+        egress: appended_values(matches, "egress"),
     }))
 }
 
@@ -2814,6 +3042,176 @@ mod tests {
         ] {
             assert!(parse_args(argv.clone()).is_err(), "accepted {argv:?}");
         }
+    }
+
+    /// The credential the gateway will hold is named, never typed: there is no flag carrying the
+    /// secret, and a source has to be chosen explicitly.
+    #[test]
+    fn credential_add_requires_a_scope_and_a_named_secret_source() {
+        let cli = parse_args([
+            "credential",
+            "add",
+            "--origin",
+            "https://registry.test",
+            "--path-prefix",
+            "/api/packages/owner/npm/",
+            "--secret-env",
+            "REGISTRY_READ_TOKEN",
+        ])
+        .unwrap();
+        assert_eq!(
+            cli.command,
+            Command::Credential(CredentialCommand::Add(CredentialAddArgs {
+                origin: "https://registry.test".to_owned(),
+                path_prefixes: vec!["/api/packages/owner/npm/".to_owned()],
+                methods: vec!["GET".to_owned(), "HEAD".to_owned()],
+                secret_env: Some("REGISTRY_READ_TOKEN".to_owned()),
+                secret_command: None,
+                secret_stdin: false,
+            }))
+        );
+
+        // A scope is mandatory: a credential admitted for the whole host is not a scope.
+        assert!(
+            parse_args([
+                "credential",
+                "add",
+                "--origin",
+                "https://registry.test",
+                "--secret-env",
+                "TOKEN",
+            ])
+            .is_err()
+        );
+        // So is a source.
+        assert!(
+            parse_args([
+                "credential",
+                "add",
+                "--origin",
+                "https://registry.test",
+                "--path-prefix",
+                "/api/packages/owner/npm/",
+            ])
+            .is_err()
+        );
+        // And there is no flag that takes the secret itself.
+        assert!(
+            parse_args([
+                "credential",
+                "add",
+                "--origin",
+                "https://registry.test",
+                "--path-prefix",
+                "/x/",
+                "--secret",
+                "hunter2",
+            ])
+            .is_err()
+        );
+    }
+
+    /// `--secret-env` and `--secret-command` travel together — the variable wins at resolution
+    /// time and the helper is the fallback — while stdin is exclusive with both.
+    #[test]
+    fn credential_secret_sources_compose_except_stdin() {
+        let cli = parse_args([
+            "credential",
+            "add",
+            "--origin",
+            "https://registry.test:8443",
+            "--path-prefix",
+            "/api/packages/owner/npm/",
+            "--method",
+            "GET",
+            "--secret-env",
+            "REGISTRY_READ_TOKEN",
+            "--secret-command",
+            r#"["credential-helper","read","registry"]"#,
+        ])
+        .unwrap();
+        assert_eq!(
+            cli.command,
+            Command::Credential(CredentialCommand::Add(CredentialAddArgs {
+                origin: "https://registry.test:8443".to_owned(),
+                path_prefixes: vec!["/api/packages/owner/npm/".to_owned()],
+                methods: vec!["GET".to_owned()],
+                secret_env: Some("REGISTRY_READ_TOKEN".to_owned()),
+                secret_command: Some(vec![
+                    "credential-helper".to_owned(),
+                    "read".to_owned(),
+                    "registry".to_owned(),
+                ]),
+                secret_stdin: false,
+            }))
+        );
+
+        for argv in [
+            vec![
+                "credential",
+                "add",
+                "--origin",
+                "https://registry.test",
+                "--path-prefix",
+                "/x/",
+                "--secret-stdin",
+                "--secret-env",
+                "TOKEN",
+            ],
+            // A shell string is a second language between the operator and the helper.
+            vec![
+                "credential",
+                "add",
+                "--origin",
+                "https://registry.test",
+                "--path-prefix",
+                "/x/",
+                "--secret-command",
+                "credential-helper read registry",
+            ],
+            vec![
+                "credential",
+                "add",
+                "--origin",
+                "https://registry.test",
+                "--path-prefix",
+                "/x/",
+                "--secret-command",
+                "[]",
+            ],
+        ] {
+            assert!(parse_args(argv.clone()).is_err(), "accepted {argv:?}");
+        }
+    }
+
+    #[test]
+    fn credential_reports_and_removals_name_their_route() {
+        assert_eq!(
+            parse_args(["credential", "ls"]).unwrap().command,
+            Command::Credential(CredentialCommand::Status)
+        );
+        assert_eq!(
+            parse_args(["credential", "status"]).unwrap().command,
+            Command::Credential(CredentialCommand::Status)
+        );
+        assert_eq!(
+            parse_args(["credential", "rm", "--origin", "https://registry.test"])
+                .unwrap()
+                .command,
+            Command::Credential(CredentialCommand::Remove {
+                origin: "https://registry.test".to_owned()
+            })
+        );
+        assert!(parse_args(["credential", "rm"]).is_err());
+        assert!(parse_args(["credential"]).is_err());
+        assert!(parse_args(["credential", "forget"]).is_err());
+        // Enrolment is per project, so the project selector is honoured like any project verb.
+        let cli = parse_args(["credential", "status", "--project", "/tmp/checkout"]).unwrap();
+        assert_eq!(
+            cli.global.project.as_deref(),
+            Some(std::path::Path::new("/tmp/checkout"))
+        );
+        assert_eq!(cli.command.project_discovery(), ProjectDiscovery::Required);
     }
 
     #[test]

@@ -1,4 +1,5 @@
 pub mod args;
+pub mod credential_service;
 pub mod gateway_service;
 pub mod help;
 pub mod launchd;
