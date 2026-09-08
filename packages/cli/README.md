@@ -412,18 +412,23 @@ The bootstrap script is intentionally small. It only handles work required befor
   (for example, a zone that used to build `https://app.<stage>.<zone>` becomes `["https://app.{stage}.<zone>"]` with the
   zone's real hostname in place of `<zone>`).
 
+Cloudflare deploys and cleanups need `CLOUDFLARE_ACCOUNT_ID` and `CLOUDFLARE_API_TOKEN`. The token needs Workers
+Scripts, Workers KV, R2, and D1 write, plus Zone DNS and Workers Routes write for preview hostnames. A token without D1
+access makes cleanup refuse before it deletes anything rather than half-clean a stage.
+
 A wrong value type anywhere in `smoo.github` fails `smoo monorepo update` and `smoo github-ci nx-deploy` with the
 offending path, rather than silently falling back to the defaults.
-
-Deploy selection is driven by Nx tags: `stage-deploy-target` (deployed on every stage; implied by a
-`smoo wrangler deploy-stage` command), `staging-deploy-target` (staging only), `permanent-deploy-target` (excluded from
-every stage deploy; deployed outside the stage flow) and `production-push-deploy-target` (the generated production job).
 
 Tag a project `production-push-deploy-target` to have it deployed to production by a generated `deploy-production` job
 that runs after Validate and the e2e job succeed on a push to the staging push branch
 (`smoo github-ci nx-deploy --stage production --select-tag production-push-deploy-target`). The project must also be
 stage-derived — carry `stage-deploy-target` or deploy through `smoo wrangler deploy-stage` — otherwise `--select-tag`
 finds nothing and the job logs `No run-many deploy projects; skipping production.`
+
+Pushes to the staging push branch queue behind a running workflow instead of canceling it, so a newer push never cancels
+a production deployment mid-flight. Pull requests and other branches keep canceling superseded runs. The e2e and
+production jobs repeat the Cargo credential and sibling-source preflight before SetupDevenv, so their `--step` anchors
+shift with the configuration instead of staying fixed.
 
 ## Releases
 
