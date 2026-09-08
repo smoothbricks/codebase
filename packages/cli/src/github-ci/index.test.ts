@@ -531,7 +531,7 @@ describe('collected Nx outputs', () => {
     });
   });
 
-  it('rejects manifests from the previous schema version', async () => {
+  it('rejects v1 and v2 collected manifests', async () => {
     await withOutputFixture(async ({ root, artifact, outputProject }) => {
       await writeFile(join(root, 'packages/app/dist/result.bin'), 'native artifact');
       const manifest = await collectNxOutputs(
@@ -540,10 +540,41 @@ describe('collected Nx outputs', () => {
         [{ target: 'build-macos', projects: [outputProject] }],
         SOURCE_SHA,
       );
-      await writeFile(join(artifact, 'manifest.json'), `${JSON.stringify({ ...manifest, version: 1 })}\n`);
 
-      await expect(applyCollectedOutputs(root, [artifact], SOURCE_SHA, [outputProject])).rejects.toThrow(
-        'Invalid collected output manifest',
+      for (const version of [1, 2]) {
+        await writeFile(join(artifact, 'manifest.json'), `${JSON.stringify({ ...manifest, version })}\n`);
+        await expect(applyCollectedOutputs(root, [artifact], SOURCE_SHA, [outputProject])).rejects.toThrow(
+          'Invalid collected output manifest',
+        );
+      }
+    });
+  });
+
+  it('strips leftover native-tree files from declared outputs at apply', async () => {
+    await withOutputFixture(async ({ root, artifact, outputProject }) => {
+      const outputPath = join(root, 'packages/app/dist/result.bin');
+      await writeFile(outputPath, 'native artifact');
+      await collectNxOutputs(root, artifact, [{ target: 'build-macos', projects: [outputProject] }], SOURCE_SHA);
+
+      const leftover = join(root, 'packages/app/dist/stale.bin');
+      await writeFile(leftover, 'host native tree');
+      await applyCollectedOutputs(root, [artifact], SOURCE_SHA, [outputProject]);
+
+      expect(await readFile(outputPath, 'utf8')).toBe('native artifact');
+      await expect(readFile(leftover, 'utf8')).rejects.toThrow();
+      await expect(assertCollectedOutputsApplied(root, [artifact], ['app'])).resolves.toBeUndefined();
+    });
+  });
+
+  it('refuses a leftover native-tree file at the prebuilt pack gate', async () => {
+    await withOutputFixture(async ({ root, artifact, outputProject }) => {
+      await writeFile(join(root, 'packages/app/dist/result.bin'), 'native artifact');
+      await collectNxOutputs(root, artifact, [{ target: 'build-macos', projects: [outputProject] }], SOURCE_SHA);
+      await applyCollectedOutputs(root, [artifact], SOURCE_SHA, [outputProject]);
+
+      await writeFile(join(root, 'packages/app/dist/stale.bin'), 'host native tree');
+      await expect(assertCollectedOutputsApplied(root, [artifact], ['app'])).rejects.toThrow(
+        'Undeclared workspace output file at merge boundary',
       );
     });
   });
