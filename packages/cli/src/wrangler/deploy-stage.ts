@@ -6,26 +6,22 @@ import typia from 'typia';
 import { parseJsonFileText } from '../lib/json.js';
 import { mergeEnv, printCommandOutput } from '../lib/run.js';
 import { type CloudflareClient, CloudflareRestClient, type D1DatabaseRecord } from './cloudflare.js';
-import {
-  deriveFlatPullRequestConfig,
-  type FlatWranglerConfig,
-  parseFlatWranglerConfig,
-  planFlatPullRequestResources,
-  planFlatStageResources,
-} from './flat-config.js';
+import { type FlatWranglerConfig, parseFlatWranglerConfig, planFlatStageResources } from './flat-config.js';
 import { parseDevVarsExample } from './prepare-env.js';
 import {
   type ConfiguredStageResourcePlan,
   type DeploymentStage,
+  derivePullRequestStageConfig,
   derivePullRequestWranglerConfig,
   hasExactStageSegment,
   isPullRequestStage,
   type LiveKvNamespace,
+  type PullRequestResourcePlan,
   parseDeploymentStage,
   planConfiguredStageResources,
+  planPullRequestBindings,
   planPullRequestResources,
   pullRequestStage,
-  stageResourceName,
 } from './stage.js';
 
 export interface ProcessResult {
@@ -218,16 +214,20 @@ async function prepareTomlConfig(
       envFlag: stage,
     };
   }
-  const staging = planConfiguredStageResources(committedToml, 'staging');
-  if (!staging.workerName.endsWith('-staging')) {
-    throw new Error('[env.staging].name must end with the exact suffix -staging.');
-  }
-  const workerName = stageResourceName(staging.workerName.slice(0, -'-staging'.length), stage);
-  await refuseFirstDeploymentWithoutSecrets(cloudflare, workerName, missingSecrets);
   const liveNamespaces = await cloudflare.listKvNamespaces();
   const plan = planPullRequestResources(committedToml, stage, liveNamespaces);
-  const derivedIds = await ensureKvNamespaces(plan.kvNamespaces, liveNamespaces, cloudflare);
-  const derivedToml = derivePullRequestWranglerConfig(committedToml, { stage, accountId, kvNamespaceIds: derivedIds });
+  const { kvNamespaceIds, d1DatabaseIds } = await provisionPullRequestResources(
+    plan,
+    missingSecrets,
+    cloudflare,
+    liveNamespaces,
+  );
+  const derivedToml = derivePullRequestWranglerConfig(committedToml, {
+    stage,
+    accountId,
+    kvNamespaceIds,
+    d1DatabaseIds,
+  });
   const temporaryConfigPath = join(cwd, `.wrangler.smoo-${process.pid}-${randomUUID()}.toml`);
   await writeTemporaryConfig(temporaryConfigPath, derivedToml);
   return {
@@ -255,11 +255,14 @@ async function prepareFlatConfig(
     };
   }
   const liveNamespaces = await cloudflare.listKvNamespaces();
-  const prPlan = planFlatPullRequestResources(flat, stage, liveNamespaces);
-  await refuseFirstDeploymentWithoutSecrets(cloudflare, prPlan.workerName, missingSecrets);
-  const kvNamespaceIds = await ensureKvNamespaces(prPlan.kvNamespaces, liveNamespaces, cloudflare);
-  const d1DatabaseIds = await ensureD1Databases(prPlan.d1Databases, await cloudflare.listD1Databases(), cloudflare);
-  const derived = deriveFlatPullRequestConfig(flat, { stage, accountId, kvNamespaceIds, d1DatabaseIds });
+  const plan = planPullRequestBindings(flat, stage, liveNamespaces);
+  const { kvNamespaceIds, d1DatabaseIds } = await provisionPullRequestResources(
+    plan,
+    missingSecrets,
+    cloudflare,
+    liveNamespaces,
+  );
+  const derived = derivePullRequestStageConfig(flat, { stage, accountId, kvNamespaceIds, d1DatabaseIds });
   // Beside the original: its main/assets/migrations paths are relative to the file.
   const temporaryConfigPath = join(dirname(configPath), `.wrangler.smoo-${process.pid}-${randomUUID()}.json`);
   await writeTemporaryConfig(temporaryConfigPath, `${JSON.stringify(derived, null, 2)}\n`);
@@ -303,6 +306,22 @@ async function refuseFirstDeploymentWithoutSecrets(
       `First deployment of ${workerName} requires process environment values for: ${missingSecrets.join(', ')}.`,
     );
   }
+}
+
+/** Isolation refusals already ran in the plan; this is the first Cloudflare write. */
+async function provisionPullRequestResources(
+  plan: PullRequestResourcePlan,
+  missingSecrets: string[],
+  cloudflare: CloudflareClient,
+  liveNamespaces: LiveKvNamespace[],
+): Promise<{ kvNamespaceIds: Map<string, string>; d1DatabaseIds: Map<string, string> }> {
+  await refuseFirstDeploymentWithoutSecrets(cloudflare, plan.workerName, missingSecrets);
+  const kvNamespaceIds = await ensureKvNamespaces(plan.kvNamespaces, liveNamespaces, cloudflare);
+  const d1DatabaseIds =
+    plan.d1Databases.length === 0
+      ? new Map<string, string>()
+      : await ensureD1Databases(plan.d1Databases, await cloudflare.listD1Databases(), cloudflare);
+  return { kvNamespaceIds, d1DatabaseIds };
 }
 
 /** Creates every planned namespace that is not live yet, mapping staging ids to the stage's own ids. */
@@ -392,45 +411,64 @@ export async function cleanupPullRequest(
     d1Databases: 0,
   };
 
-  for (const domain of await cloudflare.listWorkerDomains()) {
+  // Every listing, D1 included, must succeed before the first delete: a missing D1
+  // permission must not leave workers/KV/R2 already gone.
+  const domains = await cloudflare.listWorkerDomains();
+  const zones = await cloudflare.listZones();
+  const routesByZone = [];
+  const dnsByZone = [];
+  for (const zone of zones) {
+    routesByZone.push({ zone, routes: await cloudflare.listWorkerRoutes(zone.id) });
+    dnsByZone.push({ zone, records: await cloudflare.listDnsRecords(zone.id) });
+  }
+  const scripts = await cloudflare.listWorkerScripts();
+  const namespaces = await cloudflare.listKvNamespaces();
+  const buckets = await cloudflare.listR2Buckets();
+  const objectsByBucket = [];
+  for (const bucket of buckets) {
+    if (!hasExactStageSegment(bucket.name, stage)) continue;
+    objectsByBucket.push({ bucket, keys: await cloudflare.listR2Objects(bucket.name) });
+  }
+  const databases = await cloudflare.listD1Databases();
+
+  for (const domain of domains) {
     if (!hasExactStageSegment(domain.hostname, stage)) continue;
     await cloudflare.deleteWorkerDomain(domain.id);
     deleted.domains += 1;
   }
-
-  for (const zone of await cloudflare.listZones()) {
-    for (const route of await cloudflare.listWorkerRoutes(zone.id)) {
+  for (const { zone, routes } of routesByZone) {
+    for (const route of routes) {
       if (!hasExactStageSegment(route.pattern, stage)) continue;
       await cloudflare.deleteWorkerRoute(zone.id, route.id);
       deleted.routes += 1;
     }
-    for (const record of await cloudflare.listDnsRecords(zone.id)) {
+  }
+  for (const { zone, records } of dnsByZone) {
+    for (const record of records) {
       if (!hasExactStageSegment(record.name, stage)) continue;
       await cloudflare.deleteDnsRecord(zone.id, record.id);
       deleted.dnsRecords += 1;
     }
   }
-
-  for (const script of await cloudflare.listWorkerScripts()) {
+  for (const script of scripts) {
     if (!hasExactStageSegment(script.id, stage)) continue;
     await cloudflare.deleteWorkerScript(script.id);
     deleted.workers += 1;
   }
-  for (const namespace of await cloudflare.listKvNamespaces()) {
+  for (const namespace of namespaces) {
     if (!hasExactStageSegment(namespace.title, stage)) continue;
     await cloudflare.deleteKvNamespace(namespace.id);
     deleted.kvNamespaces += 1;
   }
-  for (const bucket of await cloudflare.listR2Buckets()) {
-    if (!hasExactStageSegment(bucket.name, stage)) continue;
-    for (const key of await cloudflare.listR2Objects(bucket.name)) {
+  for (const { bucket, keys } of objectsByBucket) {
+    for (const key of keys) {
       await cloudflare.deleteR2Object(bucket.name, key);
       deleted.r2Objects += 1;
     }
     await cloudflare.deleteR2Bucket(bucket.name);
     deleted.r2Buckets += 1;
   }
-  for (const database of await cloudflare.listD1Databases()) {
+  for (const database of databases) {
     if (!hasExactStageSegment(database.name, stage)) continue;
     await cloudflare.deleteD1Database(database.uuid);
     deleted.d1Databases += 1;

@@ -381,6 +381,17 @@ describe('cleanup-pr exact stage matching', () => {
     expect(cloudflare.mutations).not.toContain('delete-d1:d1-other');
     expect(result.deleted.d1Databases).toBe(1);
   });
+
+  it('lists D1 before deleting anything so a listing failure cannot partial-clean', async () => {
+    const cloudflare = new FakeCloudflare();
+    cloudflare.scripts = [{ id: 'app-pr7' }];
+    cloudflare.listD1Databases = async () => {
+      throw new Error('D1 listing forbidden');
+    };
+
+    await expect(cleanupPullRequest('/unused', 7, { cloudflare })).rejects.toThrow(/D1 listing forbidden/);
+    expect(cloudflare.mutations).toEqual([]);
+  });
 });
 
 // What the Cloudflare Astro adapter writes under the build output: one flat
@@ -395,7 +406,7 @@ const FLAT_FIXTURE = JSON.stringify(
       { pattern: 'next.example.com', custom_domain: true },
       { pattern: 'site.staging.example.test/*', zone_name: 'example.test' },
     ],
-    vars: { EXAMPLE_SAAS_ENDPOINT: 'https://app.staging.example.test' },
+    vars: { SITE_URL: 'https://app.staging.example.test' },
     kv_namespaces: [{ binding: 'SESSION', id: 'kv-staging' }],
     d1_databases: [
       {
@@ -515,7 +526,7 @@ describe('deployStage with a flat JSON config', () => {
     expect(derivedConfig).toMatchObject({
       name: 'fixture-website-preview-pr7',
       routes: [{ pattern: 'site.pr7.example.test/*', zone_name: 'example.test' }],
-      vars: { EXAMPLE_SAAS_ENDPOINT: 'https://app.pr7.example.test' },
+      vars: { SITE_URL: 'https://app.pr7.example.test' },
       kv_namespaces: [{ binding: 'SESSION', id: 'kv-fixture-SESSION-pr7' }],
       d1_databases: [
         { binding: 'DB', database_name: 'fixture-website-pr7-db', database_id: 'd1-fixture-website-pr7-db' },
@@ -583,6 +594,47 @@ describe('deployStage with a flat JSON config', () => {
       ['versions', 'list'],
       ['deployments', 'status'],
     ]);
+  });
+
+  it('applies D1 migrations before activating a tagged version that is not current', async () => {
+    const { root, configPath } = await flatFixtureRoot();
+    const runner = new FakeRunner([{ id: 'version-1', annotations: { 'workers/tag': `nx-${HASH}` } }], {
+      versions: [{ version_id: 'version-2', percentage: 100 }],
+    });
+    const cloudflare = new FakeCloudflare();
+    cloudflare.namespaces = [{ id: 'kv-staging', title: 'fixture-SESSION-staging' }];
+    cloudflare.d1Databases = [{ uuid: 'd1-staging', name: 'fixture-website-staging-db' }];
+    cloudflare.scripts = [{ id: 'fixture-website-preview-staging' }];
+    cloudflare.domains = [{ id: 'domain-1', hostname: 'next.example.com', service: 'fixture-website-preview-staging' }];
+
+    const result = await deployStage(root, { stage: 'staging', config: configPath }, dependencies(runner, cloudflare));
+
+    expect(result.action).toBe('activated');
+    expect(runner.calls.map((call) => call.args.slice(0, 2))).toEqual([
+      ['versions', 'list'],
+      ['deployments', 'status'],
+      ['d1', 'migrations'],
+      ['versions', 'deploy'],
+    ]);
+  });
+
+  it('removes the derived config when wrangler fails after writing it', async () => {
+    const { root, configPath } = await flatFixtureRoot();
+    const runner = new FakeRunner();
+    runner.onCall = async () => {
+      throw new Error('wrangler exploded');
+    };
+    const cloudflare = new FakeCloudflare();
+    cloudflare.namespaces = [{ id: 'kv-staging', title: 'fixture-SESSION-staging' }];
+    cloudflare.d1Databases = [{ uuid: 'd1-staging', name: 'fixture-website-staging-db' }];
+
+    await expect(
+      deployStage(root, { stage: 'pr7', config: configPath }, dependencies(runner, cloudflare)),
+    ).rejects.toThrow(/wrangler exploded/);
+    const leftovers = (await readdir(join(root, '.out', 'server'))).filter((name) =>
+      name.startsWith('.wrangler.smoo-'),
+    );
+    expect(leftovers).toEqual([]);
   });
 
   it('refuses an all-pinned template before mutating Cloudflare', async () => {

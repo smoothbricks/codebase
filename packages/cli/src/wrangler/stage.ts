@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import { getStaticTOMLValue, parseTOML } from 'toml-eslint-parser';
 import typia from 'typia';
 import { cloneEnvBlock } from './prepare-env.js';
-import { derivedStagingName, replaceExactToken, replaceHostnameLabel } from './stage-labels.js';
+import { derivedStagingName, hasStageLabel, replaceExactToken, replaceHostnameLabel } from './stage-labels.js';
 
 export type DeploymentStage = 'staging' | 'production' | `pr${number}`;
 
@@ -27,8 +27,9 @@ export function parseDeploymentStage(value: string): DeploymentStage {
 }
 
 export function isPullRequestStage(stage: DeploymentStage): stage is `pr${number}` {
-  // `production` also starts with `pr`, so the pull-request number is what distinguishes the stage.
-  return /^pr[0-9]/.test(stage);
+  // After parseDeploymentStage the only values are staging, production, or prN.
+  // `production` starts with `pr`, so a prefix check is not a stage check.
+  return stage !== 'staging' && stage !== 'production';
 }
 
 export function stageDomain(stage: string, zone: string): string {
@@ -61,8 +62,11 @@ interface WranglerEnvironment {
   routes?: unknown;
   kv_namespaces?: unknown;
   r2_buckets?: unknown;
+  d1_databases?: unknown;
+  services?: unknown;
   ratelimits?: unknown;
   vars?: unknown;
+  send_email?: unknown;
   [key: string]: unknown;
 }
 
@@ -74,6 +78,45 @@ export interface R2Binding {
   binding: string;
   bucketName: string;
 }
+
+/** One-stage bindings that a TOML env block and a flat JSON config both present. */
+export interface StageConfigFields {
+  name: string;
+  routes?: StageRoute[];
+  vars?: Record<string, unknown>;
+  kv_namespaces?: KvBinding[];
+  r2_buckets?: { binding: string; bucket_name: string }[];
+  d1_databases?: StageD1Binding[];
+  services?: StageServiceBinding[];
+  ratelimits?: StageRateLimit[];
+  send_email?: Array<{ allowed_sender_addresses?: unknown; [key: string]: unknown }>;
+}
+
+export interface StageRoute {
+  pattern: string;
+  zone_name?: string;
+  custom_domain?: boolean;
+}
+
+export interface StageD1Binding {
+  binding: string;
+  database_name: string;
+  database_id: string;
+  migrations_dir?: string;
+}
+
+export interface StageServiceBinding {
+  binding: string;
+  service: string;
+  environment?: string;
+}
+
+export interface StageRateLimit {
+  name: string;
+  namespace_id: string;
+  simple?: unknown;
+}
+
 const isWranglerRoot = typia.createIs<WranglerRoot>();
 const isWranglerEnvironment = typia.createIs<WranglerEnvironment>();
 const isUnknownRecord = typia.createIs<Record<string, unknown>>();
@@ -91,11 +134,18 @@ export interface PullRequestKvResource {
   title: string;
 }
 
+export interface PullRequestD1Resource {
+  binding: string;
+  stagingId: string;
+  name: string;
+}
+
 export interface PullRequestResourcePlan {
   stage: `pr${number}`;
   workerName: string;
   workerBaseName: string;
   kvNamespaces: PullRequestKvResource[];
+  d1Databases: PullRequestD1Resource[];
   r2Buckets: R2Binding[];
   routes: Array<{ pattern: string; zoneName?: string; customDomain: boolean }>;
 }
@@ -117,15 +167,8 @@ export function planConfiguredStageResources(toml: string, stage: DeploymentStag
     stage,
     workerName,
     kvNamespaces: readKvBindings(block.kv_namespaces),
-    r2Buckets: readRows(block.r2_buckets).map((row) => {
-      const binding = requiredString(row, 'binding', 'R2 binding');
-      return { binding, bucketName: requiredString(row, 'bucket_name', `R2 binding ${binding}`) };
-    }),
-    routes: readRows(block.routes).map((row) => ({
-      pattern: requiredString(row, 'pattern', 'route'),
-      ...(typeof row.zone_name === 'string' ? { zoneName: row.zone_name } : {}),
-      customDomain: row.custom_domain === true,
-    })),
+    r2Buckets: readR2Bindings(block.r2_buckets),
+    routes: readRoutes(block.routes),
   };
 }
 
@@ -145,11 +188,51 @@ function stagingEnvironment(toml: string): WranglerEnvironment {
   return staging;
 }
 
-function stagingWorkerName(staging: WranglerEnvironment): { workerName: string; workerBaseName: string } {
-  if (typeof staging.name !== 'string' || !staging.name.endsWith('-staging')) {
-    throw new Error('[env.staging].name must end with the exact suffix -staging.');
+/** The staging worker name without its required `-staging` suffix. */
+export function stagingWorkerBaseName(name: string): string {
+  if (!name.endsWith('-staging')) {
+    throw new Error(`Worker name ${name} must end with the exact suffix -staging.`);
   }
-  return { workerName: staging.name, workerBaseName: staging.name.slice(0, -'-staging'.length) };
+  return name.slice(0, -'-staging'.length);
+}
+
+function stagingWorkerName(staging: WranglerEnvironment): { workerName: string; workerBaseName: string } {
+  if (typeof staging.name !== 'string' || !staging.name) {
+    throw new Error('[env.staging] must declare a non-empty name.');
+  }
+  return { workerName: staging.name, workerBaseName: stagingWorkerBaseName(staging.name) };
+}
+
+/**
+ * A template whose routes are all pinned (no derivable stage label) cannot serve a
+ * pull-request stage: it would deploy unrouted and Wrangler would expose it on workers.dev.
+ */
+export function assertPullRequestRoutable(name: string, routes: StageRoute[] | undefined): void {
+  const list = routes ?? [];
+  if (list.length === 0 || list.some((route) => hasStageLabel(route.pattern))) return;
+  const patterns = list.map((route) => route.pattern).join(', ');
+  throw new Error(
+    `Every route of ${name} is pinned (no staging label): ${patterns}. A pull-request stage would deploy unrouted and Wrangler would expose it on workers.dev; add a stage-derivable route such as site.staging.<zone>/*.`,
+  );
+}
+
+function stagingStageConfig(toml: string): StageConfigFields {
+  const staging = stagingEnvironment(toml);
+  const { workerName } = stagingWorkerName(staging);
+  return {
+    name: workerName,
+    routes: readStageRoutes(staging.routes),
+    ...(isUnknownRecord(staging.vars) ? { vars: staging.vars } : {}),
+    kv_namespaces: readKvBindings(staging.kv_namespaces),
+    r2_buckets: readRows(staging.r2_buckets).map((row) => {
+      const binding = requiredString(row, 'binding', 'R2 binding');
+      return { binding, bucket_name: requiredString(row, 'bucket_name', `R2 binding ${binding}`) };
+    }),
+    d1_databases: readD1Bindings(staging.d1_databases),
+    services: readServices(staging.services),
+    ratelimits: readRateLimits(staging.ratelimits),
+    send_email: readRows(staging.send_email),
+  };
 }
 
 export function planPullRequestResources(
@@ -157,11 +240,20 @@ export function planPullRequestResources(
   stage: `pr${number}`,
   liveNamespaces: LiveKvNamespace[],
 ): PullRequestResourcePlan {
+  return planPullRequestBindings(stagingStageConfig(toml), stage, liveNamespaces);
+}
+
+/** KV/R2/D1 isolation and route checks for a pull-request stage, shared by TOML and JSON. */
+export function planPullRequestBindings(
+  config: StageConfigFields,
+  stage: `pr${number}`,
+  liveNamespaces: LiveKvNamespace[],
+): PullRequestResourcePlan {
   parseDeploymentStage(stage);
-  const staging = stagingEnvironment(toml);
-  const { workerBaseName } = stagingWorkerName(staging);
+  assertPullRequestRoutable(config.name, config.routes);
+  const workerBaseName = stagingWorkerBaseName(config.name);
   const namespaceById = new Map(liveNamespaces.map((namespace) => [namespace.id, namespace]));
-  const kvNamespaces = readKvBindings(staging.kv_namespaces).map(({ binding, id }) => {
+  const kvNamespaces = (config.kv_namespaces ?? []).map(({ binding, id }) => {
     const stagingNamespace = namespaceById.get(id);
     if (!stagingNamespace) {
       throw new Error(
@@ -171,21 +263,29 @@ export function planPullRequestResources(
     const title = derivedStagingName(stagingNamespace.title, stage, 'Staging KV namespace title');
     return { binding, stagingId: id, stagingTitle: stagingNamespace.title, title };
   });
-  const r2Buckets = readRows(staging.r2_buckets).map((row) => {
-    const binding = requiredString(row, 'binding', 'R2 binding');
-    const stagingBucket = requiredString(row, 'bucket_name', `R2 binding ${binding}`);
-    return { binding, bucketName: derivedStagingName(stagingBucket, stage, 'Staging R2 bucket') };
-  });
-  const routes = readRows(staging.routes).map((row) => ({
-    pattern: replaceHostnameLabel(requiredString(row, 'pattern', 'route'), stage),
-    ...(typeof row.zone_name === 'string' ? { zoneName: row.zone_name } : {}),
-    customDomain: row.custom_domain === true,
+  const d1Databases = (config.d1_databases ?? []).map((database) => ({
+    binding: database.binding,
+    stagingId: database.database_id,
+    name: derivedStagingName(database.database_name, stage, 'Staging D1 database'),
   }));
+  // Planned, not created: the deploy refuses an underivable bucket here, before it mutates the account.
+  const r2Buckets = (config.r2_buckets ?? []).map((bucket) => ({
+    binding: bucket.binding,
+    bucketName: derivedStagingName(bucket.bucket_name, stage, 'Staging R2 bucket'),
+  }));
+  const routes = (config.routes ?? [])
+    .filter((route) => hasStageLabel(route.pattern))
+    .map((route) => ({
+      pattern: replaceHostnameLabel(route.pattern, stage),
+      ...(typeof route.zone_name === 'string' ? { zoneName: route.zone_name } : {}),
+      customDomain: route.custom_domain === true,
+    }));
   return {
     stage,
     workerName: stageResourceName(workerBaseName, stage),
     workerBaseName,
     kvNamespaces,
+    d1Databases,
     r2Buckets,
     routes,
   };
@@ -195,17 +295,168 @@ export interface DerivePullRequestConfigOptions {
   stage: `pr${number}`;
   accountId: string;
   kvNamespaceIds: ReadonlyMap<string, string>;
+  d1DatabaseIds: ReadonlyMap<string, string>;
 }
 
-export function derivePullRequestWranglerConfig(toml: string, options: DerivePullRequestConfigOptions): string {
-  const stage = options.stage;
-  parseDeploymentStage(stage);
+interface DeriveContext {
+  stage: `pr${number}`;
+  accountId: string;
+  workerBaseName: string;
+  kvNamespaceIds: ReadonlyMap<string, string>;
+  d1DatabaseIds: ReadonlyMap<string, string>;
+}
+
+function deriveContext(name: string, options: DerivePullRequestConfigOptions): DeriveContext {
+  parseDeploymentStage(options.stage);
   if (!options.accountId) {
     throw new Error('Cloudflare account id is required to derive rate-limit namespaces.');
   }
-  const staging = stagingEnvironment(toml);
-  const { workerBaseName } = stagingWorkerName(staging);
-  const cloned = cloneEnvBlock(toml, 'staging', stage);
+  return {
+    stage: options.stage,
+    accountId: options.accountId,
+    workerBaseName: stagingWorkerBaseName(name),
+    kvNamespaceIds: options.kvNamespaceIds,
+    d1DatabaseIds: options.d1DatabaseIds,
+  };
+}
+
+/**
+ * The one rewrite policy for a pull-request stage. `section` is the wrangler
+ * array/table name (`routes`, `vars`, …); a missing section is the worker root.
+ * `nearbyName` is the rate-limit binding's `name` when rewriting `namespace_id`.
+ */
+function deriveStageField(
+  section: string | undefined,
+  key: string,
+  current: unknown,
+  ctx: DeriveContext,
+  nearbyName?: string,
+): unknown {
+  if (section === undefined && key === 'name') {
+    return stageResourceName(ctx.workerBaseName, ctx.stage);
+  }
+  if (section === 'routes' && key === 'pattern' && typeof current === 'string') {
+    return replaceHostnameLabel(current, ctx.stage);
+  }
+  if (section === 'vars' && typeof current === 'string') {
+    if (key === 'ENVIRONMENT') return ctx.stage;
+    return replaceHostnameLabel(current, ctx.stage);
+  }
+  if (section === 'send_email' && key === 'allowed_sender_addresses' && Array.isArray(current)) {
+    return current.map((value) => (typeof value === 'string' ? replaceHostnameLabel(value, ctx.stage) : value));
+  }
+  if (section === 'kv_namespaces' && key === 'id' && typeof current === 'string') {
+    const derived = ctx.kvNamespaceIds.get(current);
+    if (!derived) {
+      throw new Error(`No derived KV namespace id was supplied for staging namespace ${current}.`);
+    }
+    return derived;
+  }
+  if (section === 'r2_buckets' && key === 'bucket_name' && typeof current === 'string') {
+    return derivedStagingName(current, ctx.stage, 'Staging R2 bucket');
+  }
+  if (section === 'd1_databases' && key === 'database_name' && typeof current === 'string') {
+    return derivedStagingName(current, ctx.stage, 'Staging D1 database');
+  }
+  if (section === 'd1_databases' && key === 'database_id' && typeof current === 'string') {
+    const derived = ctx.d1DatabaseIds.get(current);
+    if (!derived) {
+      throw new Error(`No derived D1 database id was supplied for staging database ${current}.`);
+    }
+    return derived;
+  }
+  if (section === 'services' && key === 'service' && typeof current === 'string') {
+    // Unlabelled services stay shared; replaceExactToken is a no-op without an exact staging segment.
+    return replaceExactToken(current, 'staging', ctx.stage);
+  }
+  if (section === 'ratelimits' && key === 'namespace_id') {
+    if (!nearbyName) {
+      throw new Error('Rate-limit binding must declare a non-empty name.');
+    }
+    return rateLimitNamespaceId(ctx.accountId, ctx.workerBaseName, ctx.stage, nearbyName);
+  }
+  return current;
+}
+
+/** Staging bindings rewritten for a pull-request stage; keys this module does not model are left to the caller. */
+export function derivePullRequestStageConfig<T extends StageConfigFields>(
+  config: T,
+  options: DerivePullRequestConfigOptions,
+): T {
+  const ctx = deriveContext(config.name, options);
+  const derived: T = { ...config, name: stageResourceName(ctx.workerBaseName, ctx.stage) };
+  if (config.routes) {
+    derived.routes = config.routes
+      .filter((route) => hasStageLabel(route.pattern))
+      .map((route) => ({
+        ...route,
+        pattern: replaceHostnameLabel(route.pattern, ctx.stage),
+      }));
+  }
+  if (config.vars) {
+    derived.vars = Object.fromEntries(
+      Object.entries(config.vars).map(([key, value]) => [key, deriveStageField('vars', key, value, ctx)]),
+    );
+  }
+  if (config.kv_namespaces) {
+    derived.kv_namespaces = config.kv_namespaces.map((namespace) => ({
+      ...namespace,
+      id: requiredDerivedString(deriveStageField('kv_namespaces', 'id', namespace.id, ctx)),
+    }));
+  }
+  if (config.r2_buckets) {
+    derived.r2_buckets = config.r2_buckets.map((bucket) => ({
+      ...bucket,
+      bucket_name: requiredDerivedString(deriveStageField('r2_buckets', 'bucket_name', bucket.bucket_name, ctx)),
+    }));
+  }
+  if (config.d1_databases) {
+    derived.d1_databases = config.d1_databases.map((database) => ({
+      ...database,
+      database_name: requiredDerivedString(
+        deriveStageField('d1_databases', 'database_name', database.database_name, ctx),
+      ),
+      database_id: requiredDerivedString(deriveStageField('d1_databases', 'database_id', database.database_id, ctx)),
+    }));
+  }
+  if (config.services) {
+    derived.services = config.services.map((service) => ({
+      ...service,
+      service: requiredDerivedString(deriveStageField('services', 'service', service.service, ctx)),
+    }));
+  }
+  if (config.ratelimits) {
+    derived.ratelimits = config.ratelimits.map((limit) => ({
+      ...limit,
+      namespace_id: requiredDerivedString(
+        deriveStageField('ratelimits', 'namespace_id', limit.namespace_id, ctx, limit.name),
+      ),
+    }));
+  }
+  if (config.send_email) {
+    derived.send_email = config.send_email.map((row) => ({
+      ...row,
+      allowed_sender_addresses: deriveStageField(
+        'send_email',
+        'allowed_sender_addresses',
+        row.allowed_sender_addresses,
+        ctx,
+      ),
+    }));
+  }
+  return derived;
+}
+
+function requiredDerivedString(value: unknown): string {
+  if (typeof value !== 'string' || !value) {
+    throw new Error('Derived pull-request field must be a non-empty string.');
+  }
+  return value;
+}
+
+export function derivePullRequestWranglerConfig(toml: string, options: DerivePullRequestConfigOptions): string {
+  const ctx = deriveContext(stagingWorkerName(stagingEnvironment(toml)).workerName, options);
+  const cloned = cloneEnvBlock(toml, 'staging', ctx.stage);
   const program = parseTOML(cloned);
   const rootValue: unknown = getStaticTOMLValue(program);
   if (!isWranglerRoot(rootValue)) {
@@ -215,26 +466,26 @@ export function derivePullRequestWranglerConfig(toml: string, options: DerivePul
   const edits: Array<{ start: number; end: number; value: string }> = [];
 
   for (const table of program.body[0].body) {
-    if (table.type !== 'TOMLTable' || table.resolvedKey[0] !== 'env' || table.resolvedKey[1] !== stage) {
+    if (table.type !== 'TOMLTable' || table.resolvedKey[0] !== 'env' || table.resolvedKey[1] !== ctx.stage) {
       continue;
     }
     const tableValue = valueAtPath(root, table.resolvedKey);
     if (!isUnknownRecord(tableValue)) {
       continue;
     }
+    const section = typeof table.resolvedKey[2] === 'string' ? table.resolvedKey[2] : undefined;
+    if (section === 'routes') {
+      const pattern = tableValue.pattern;
+      if (typeof pattern === 'string' && !hasStageLabel(pattern)) {
+        edits.push({ start: table.range[0], end: table.range[1], value: '' });
+        continue;
+      }
+    }
+    const nearbyName = typeof tableValue.name === 'string' ? tableValue.name : undefined;
     for (const keyValue of table.body) {
       const key = cloned.slice(keyValue.key.range[0], keyValue.key.range[1]).trim();
       const current = tableValue[key];
-      const next = deriveFieldValue(
-        table.resolvedKey.slice(2),
-        tableValue,
-        key,
-        current,
-        stage,
-        workerBaseName,
-        options.accountId,
-        options.kvNamespaceIds,
-      );
+      const next = deriveStageField(section, key, current, ctx, nearbyName);
       if (next !== current) {
         edits.push({ start: keyValue.value.range[0], end: keyValue.value.range[1], value: tomlLiteral(next) });
       }
@@ -247,52 +498,6 @@ export function derivePullRequestWranglerConfig(toml: string, options: DerivePul
   }
   parseTOML(derived);
   return derived;
-}
-
-function deriveFieldValue(
-  path: Array<string | number>,
-  table: Record<string, unknown>,
-  key: string,
-  current: unknown,
-  stage: `pr${number}`,
-  workerBaseName: string,
-  accountId: string,
-  kvNamespaceIds: ReadonlyMap<string, string>,
-): unknown {
-  const section = path[0];
-  if (path.length === 0 && key === 'name') {
-    return stageResourceName(workerBaseName, stage);
-  }
-  if (section === 'routes' && key === 'pattern' && typeof current === 'string') {
-    return replaceHostnameLabel(current, stage);
-  }
-  if (section === 'vars' && typeof current === 'string') {
-    if (key === 'ENVIRONMENT') {
-      return stage;
-    }
-    if (key === 'AUTH_KEYS_INSTANCE_NAME') {
-      return replaceExactToken(current, 'staging', stage);
-    }
-    return replaceHostnameLabel(current, stage);
-  }
-  if (section === 'send_email' && key === 'allowed_sender_addresses' && Array.isArray(current)) {
-    return current.map((value) => (typeof value === 'string' ? replaceHostnameLabel(value, stage) : value));
-  }
-  if (section === 'kv_namespaces' && key === 'id' && typeof current === 'string') {
-    const derived = kvNamespaceIds.get(current);
-    if (!derived) {
-      throw new Error(`No derived KV namespace id was supplied for staging namespace ${current}.`);
-    }
-    return derived;
-  }
-  if (section === 'r2_buckets' && key === 'bucket_name' && typeof current === 'string') {
-    return replaceExactToken(current, 'staging', stage);
-  }
-  if (section === 'ratelimits' && key === 'namespace_id') {
-    const bindingName = requiredString(table, 'name', 'Rate-limit binding');
-    return rateLimitNamespaceId(accountId, workerBaseName, stage, bindingName);
-  }
-  return current;
 }
 
 export function rateLimitNamespaceId(
@@ -311,6 +516,63 @@ function readKvBindings(value: unknown): KvBinding[] {
   return readRows(value).map((row) => ({
     binding: requiredString(row, 'binding', 'KV namespace'),
     id: requiredString(row, 'id', 'KV namespace'),
+  }));
+}
+
+function readR2Bindings(value: unknown): R2Binding[] {
+  return readRows(value).map((row) => {
+    const binding = requiredString(row, 'binding', 'R2 binding');
+    return { binding, bucketName: requiredString(row, 'bucket_name', `R2 binding ${binding}`) };
+  });
+}
+
+function readD1Bindings(value: unknown): StageD1Binding[] {
+  return readRows(value).map((row) => {
+    const binding = requiredString(row, 'binding', 'D1 database');
+    const database: StageD1Binding = {
+      binding,
+      database_name: requiredString(row, 'database_name', `D1 binding ${binding}`),
+      database_id: requiredString(row, 'database_id', `D1 binding ${binding}`),
+    };
+    return typeof row.migrations_dir === 'string' ? { ...database, migrations_dir: row.migrations_dir } : database;
+  });
+}
+
+function readServices(value: unknown): StageServiceBinding[] {
+  return readRows(value).map((row) => {
+    const binding = requiredString(row, 'binding', 'Service binding');
+    const service: StageServiceBinding = {
+      binding,
+      service: requiredString(row, 'service', `Service binding ${binding}`),
+    };
+    return typeof row.environment === 'string' ? { ...service, environment: row.environment } : service;
+  });
+}
+
+function readRateLimits(value: unknown): StageRateLimit[] {
+  return readRows(value).map((row) => {
+    const name = requiredString(row, 'name', 'Rate-limit binding');
+    const limit: StageRateLimit = {
+      name,
+      namespace_id: requiredString(row, 'namespace_id', `Rate-limit binding ${name}`),
+    };
+    return row.simple === undefined ? limit : { ...limit, simple: row.simple };
+  });
+}
+
+function readStageRoutes(value: unknown): StageRoute[] {
+  return readRows(value).map((row) => ({
+    pattern: requiredString(row, 'pattern', 'route'),
+    ...(typeof row.zone_name === 'string' ? { zone_name: row.zone_name } : {}),
+    ...(row.custom_domain === true ? { custom_domain: true } : {}),
+  }));
+}
+
+function readRoutes(value: unknown): Array<{ pattern: string; zoneName?: string; customDomain: boolean }> {
+  return readRows(value).map((row) => ({
+    pattern: requiredString(row, 'pattern', 'route'),
+    ...(typeof row.zone_name === 'string' ? { zoneName: row.zone_name } : {}),
+    customDomain: row.custom_domain === true,
   }));
 }
 
