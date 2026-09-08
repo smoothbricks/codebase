@@ -26,6 +26,7 @@ in {
       coreutils # Provides fmt for commit message wrapping
       git # Git hooks and repository inspection
       gh # GitHub Actions and release inspection
+      direnv # Cowshed .envrc activation; hosted CI has no ambient direnv
       # Bun.sh for javascript dependencies
       bun
       # The toolchain itself comes from ./devenv.smoo.nix (one nightly for every
