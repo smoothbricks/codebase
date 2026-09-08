@@ -1,8 +1,8 @@
 import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
-import { isAbsolute, join, normalize, posix, relative, sep } from 'node:path';
+import { dirname, isAbsolute, join, normalize, posix, relative, resolve, sep } from 'node:path';
 import { readNxJson } from 'nx/src/config/nx-json.js';
-import { parse as parseToml } from 'smol-toml';
+import { parse as parseToml, type TomlTable } from 'smol-toml';
 
 export interface CargoWorkspacePackage {
   name: string;
@@ -30,7 +30,7 @@ export function listCargoWorkspacePackages(absoluteProjectRoot: string): CargoWo
     return [];
   }
   const parsed: unknown = parseToml(readFileSync(workspaceTomlPath, 'utf-8'));
-  if (!isRecord(parsed) || !isRecord(parsed.workspace) || !Array.isArray(parsed.workspace.members)) {
+  if (!isRecord(parsed) || !isRecord(parsed.workspace)) {
     return [];
   }
   const excludedDirs = new Set<string>();
@@ -44,7 +44,9 @@ export function listCargoWorkspacePackages(absoluteProjectRoot: string): CargoWo
     }
   }
   const packageDirs = new Set<string>();
-  for (const member of parsed.workspace.members) {
+  if (isRecord(parsed.package)) packageDirs.add('.');
+  const members = Array.isArray(parsed.workspace.members) ? parsed.workspace.members : [];
+  for (const member of members) {
     if (typeof member !== 'string' || member.length === 0) {
       continue;
     }
@@ -55,12 +57,14 @@ export function listCargoWorkspacePackages(absoluteProjectRoot: string): CargoWo
     }
   }
   const packages: CargoWorkspacePackage[] = [];
+  const workspacePathDeps = workspacePathDependencies(parsed, absoluteProjectRoot);
+  const external = new Map<string, string>();
   for (const memberDir of packageDirs) {
     const crateTomlPath = join(absoluteProjectRoot, memberDir, 'Cargo.toml');
     if (!existsSync(crateTomlPath)) {
       continue;
     }
-    const crateParsed: unknown = parseToml(readFileSync(crateTomlPath, 'utf-8'));
+    const crateParsed: unknown = memberDir === '.' ? parsed : parseToml(readFileSync(crateTomlPath, 'utf-8'));
     if (!isRecord(crateParsed) || !isRecord(crateParsed.package) || typeof crateParsed.package.name !== 'string') {
       continue;
     }
@@ -69,6 +73,36 @@ export function listCargoWorkspacePackages(absoluteProjectRoot: string): CargoWo
       dir: memberDir,
       testShards: readTestShards(crateParsed.package, crateTomlPath),
     });
+    // Cargo automatically includes in-workspace path dependencies as members,
+    // except explicitly excluded packages.
+    const dependencies: string[] = [];
+    enqueuePathDependencies(
+      crateParsed,
+      memberDir,
+      workspacePathDeps,
+      dependencies,
+      external,
+      absoluteProjectRoot,
+      absoluteProjectRoot,
+    );
+    if (isRecord(crateParsed.target)) {
+      for (const target of Object.values(crateParsed.target)) {
+        if (isRecord(target)) {
+          enqueuePathDependencies(
+            target,
+            memberDir,
+            workspacePathDeps,
+            dependencies,
+            external,
+            absoluteProjectRoot,
+            absoluteProjectRoot,
+          );
+        }
+      }
+    }
+    for (const dependency of dependencies) {
+      if (!isExcludedCargoMember(dependency, excludedDirs)) packageDirs.add(dependency);
+    }
   }
   packages.sort((left, right) => left.name.localeCompare(right.name));
   return packages;
@@ -91,6 +125,7 @@ function isExcludedCargoMember(memberDir: string, excludedDirs: ReadonlySet<stri
  */
 function expandCargoMemberDirs(absoluteProjectRoot: string, member: string, requireGlobMatch = true): string[] {
   const normalized = member.split('\\').join('/').replace(/\/+$/, '');
+  if (normalized === '.') return ['.'];
   const segments = normalized.split('/');
   if (
     normalized.length === 0 ||
@@ -195,7 +230,16 @@ export async function cargoPackageTestInputs({
   memberDir,
   inputRoot = '{projectRoot}',
 }: CargoPackageTestInputsOptions): Promise<string[]> {
-  const workspacePathDeps = await workspacePathDependencies(absoluteProjectRoot);
+  const manifests = new Map<string, TomlTable>();
+  const loadManifest = async (path: string): Promise<TomlTable> => {
+    const normalized = resolve(path);
+    const cached = manifests.get(normalized);
+    if (cached !== undefined) return cached;
+    const parsed = parseToml(await readFile(normalized, 'utf-8'));
+    manifests.set(normalized, parsed);
+    return parsed;
+  };
+  const rootManifest = await loadManifest(join(absoluteProjectRoot, 'Cargo.toml'));
   // The closure over in-tree path dependencies, not the direct edge set: a
   // test binary links every crate beneath it, and the chained cargo-test
   // targets order runs without contributing to each other's hash, so a
@@ -203,7 +247,33 @@ export async function cargoPackageTestInputs({
   // nothing in the target that links it.
   const dirs = new Set<string>();
   const external = new Map<string, string>();
-  const pending = [memberDir.split('\\').join('/')];
+  const pending = [normalize(memberDir).split(sep).join('/')];
+  const declaredSources = new Set<string>();
+  // Workspace patches/replacements can substitute local code for locked sources.
+  if (isRecord(rootManifest.patch)) {
+    for (const replacements of Object.values(rootManifest.patch)) {
+      enqueuePathDependencies(
+        { dependencies: replacements },
+        '.',
+        new Map(),
+        pending,
+        external,
+        absoluteProjectRoot,
+        workspaceRoot,
+      );
+    }
+  }
+  if (isRecord(rootManifest.replace)) {
+    enqueuePathDependencies(
+      { dependencies: rootManifest.replace },
+      '.',
+      new Map(),
+      pending,
+      external,
+      absoluteProjectRoot,
+      workspaceRoot,
+    );
+  }
   while (pending.length > 0) {
     const dir = pending.pop();
     if (dir === undefined || dirs.has(dir)) {
@@ -214,26 +284,137 @@ export async function cargoPackageTestInputs({
     if (!existsSync(crateTomlPath)) {
       continue;
     }
-    const crateParsed: unknown = parseToml(await readFile(crateTomlPath, 'utf-8'));
+    const crateParsed = await loadManifest(crateTomlPath);
     if (!isRecord(crateParsed)) {
       continue;
     }
-    enqueuePathDependencies(crateParsed, dir, workspacePathDeps, pending, external, absoluteProjectRoot);
-    // Every target variant can contribute a path dependency to a test binary.
-    // Hash them conservatively rather than evaluating Cargo's cfg language.
+    let owner = resolve(absoluteProjectRoot, dir);
+    if (isRecord(crateParsed.package) && typeof crateParsed.package.workspace === 'string') {
+      owner = resolve(owner, crateParsed.package.workspace);
+      if (isOutsideRoot(relative(workspaceRoot, owner))) {
+        external.set(`${dir} workspace`, owner);
+      }
+    }
+    let workspacePathDeps = new Map<string, string>();
+    while (!isOutsideRoot(relative(workspaceRoot, owner))) {
+      const manifestPath = join(owner, 'Cargo.toml');
+      if (existsSync(manifestPath)) {
+        const manifest = await loadManifest(manifestPath);
+        if (isRecord(manifest.workspace)) {
+          workspacePathDeps = workspacePathDependencies(manifest, owner);
+          declaredSources.add(manifestPath);
+          break;
+        }
+      }
+      const parent = dirname(owner);
+      if (parent === owner) break;
+      owner = parent;
+    }
+    enqueuePathDependencies(crateParsed, dir, workspacePathDeps, pending, external, absoluteProjectRoot, workspaceRoot);
+    // All cfg variants can affect a compiled target; do not evaluate Cargo cfg here.
     if (isRecord(crateParsed.target)) {
       for (const target of Object.values(crateParsed.target)) {
         if (isRecord(target)) {
-          enqueuePathDependencies(target, dir, workspacePathDeps, pending, external, absoluteProjectRoot);
+          enqueuePathDependencies(
+            target,
+            dir,
+            workspacePathDeps,
+            pending,
+            external,
+            absoluteProjectRoot,
+            workspaceRoot,
+          );
+        }
+      }
+    }
+    if (isRecord(crateParsed.package) && typeof crateParsed.package.build === 'string') {
+      declaredSources.add(resolve(absoluteProjectRoot, dir, crateParsed.package.build));
+    }
+    for (const targetName of ['lib', 'bin', 'example', 'test', 'bench']) {
+      const targets = crateParsed[targetName];
+      for (const target of Array.isArray(targets) ? targets : [targets]) {
+        if (isRecord(target) && typeof target.path === 'string') {
+          declaredSources.add(resolve(absoluteProjectRoot, dir, target.path));
         }
       }
     }
   }
-  const inputs: string[] = [`${inputRoot}/Cargo.toml`, `${inputRoot}/Cargo.lock`];
+  const inputPath = (absolutePath: string): string => {
+    const cargoRelative = relative(absoluteProjectRoot, absolutePath).split(sep).join('/');
+    return isOutsideRoot(cargoRelative)
+      ? posix.join('{workspaceRoot}', relative(workspaceRoot, absolutePath).split(sep).join('/'))
+      : posix.join(inputRoot, cargoRelative);
+  };
+  const inputs = new Set<string>([`${inputRoot}/Cargo.toml`, `${inputRoot}/Cargo.lock`]);
+  const exclusions = new Set<string>();
   for (const dir of [...dirs].sort()) {
-    inputs.push(`${inputRoot}/${dir}/**/*.rs`, `${inputRoot}/${dir}/Cargo.toml`);
+    const absoluteDir = resolve(absoluteProjectRoot, dir);
+    // Cargo packages can compile include_bytes!, headers, schemas and build.rs,
+    // not only Rust sources. Nested packages are separate source owners.
+    inputs.add(`${inputPath(absoluteDir)}/**/*`);
+    const scan = [absoluteDir];
+    while (scan.length > 0) {
+      const current = scan.pop();
+      if (current === undefined || !existsSync(current)) continue;
+      for (const entry of readdirSync(current, { withFileTypes: true })) {
+        if (!entry.isDirectory()) continue;
+        const child = join(current, entry.name);
+        if (['target', '.git', 'node_modules', '.nx'].includes(entry.name)) {
+        } else if (existsSync(join(child, 'Cargo.toml'))) {
+          const childDir = relative(absoluteProjectRoot, child).split(sep).join('/');
+          if (!dirs.has(childDir)) exclusions.add(`!${inputPath(child)}/**`);
+        } else {
+          scan.push(child);
+        }
+      }
+    }
   }
-  inputs.push(`${inputRoot}/**/.cargo/config.toml`, `${inputRoot}/scripts/*.sh`, `!${inputRoot}/**/target/**`);
+  for (const source of [...declaredSources].sort()) {
+    const sourceRelative = relative(workspaceRoot, source);
+    if (isOutsideRoot(sourceRelative)) {
+      external.set(source, source);
+    } else {
+      inputs.add(inputPath(source));
+    }
+  }
+  // Cargo/rustup search from the command's working directory upwards. Do not
+  // hash unrelated descendant configuration or generated Cargo target caches.
+  for (let current = resolve(absoluteProjectRoot); ; current = dirname(current)) {
+    for (const config of [
+      '.cargo/config',
+      '.cargo/config.toml',
+      'rust-toolchain',
+      'rust-toolchain.toml',
+      'rustfmt.toml',
+      '.rustfmt.toml',
+      'clippy.toml',
+      '.clippy.toml',
+    ]) {
+      inputs.add(inputPath(join(current, config)));
+      if (config === '.cargo/config' || config === '.cargo/config.toml') {
+        const configPath = join(current, config);
+        if (existsSync(configPath)) {
+          const cargoConfig = await loadManifest(configPath);
+          if (isRecord(cargoConfig.build) && typeof cargoConfig.build['target-dir'] === 'string') {
+            const targetDir = resolve(current, cargoConfig.build['target-dir']);
+            if (!isOutsideRoot(relative(workspaceRoot, targetDir))) {
+              exclusions.add(`!${inputPath(targetDir)}/**`);
+            }
+          }
+        }
+      }
+    }
+    if (current === resolve(workspaceRoot) || dirname(current) === current) break;
+  }
+  inputs.add(`${inputRoot}/.config/nextest.toml`);
+  for (const generated of ['.git', 'node_modules', '.nx']) {
+    inputs.add(`!{workspaceRoot}/**/${generated}/**`);
+  }
+  inputs.add(`!${inputRoot}/**/target/**`);
+  inputs.add('!{workspaceRoot}/**/target/**');
+  for (const exclusion of [...exclusions].sort()) inputs.add(exclusion);
+  // Arbitrary build-script reads outside package trees, custom output trees,
+  // and ambient tools/environment require explicit target or named inputs.
   if (external.size > 0) {
     if (readNxJson(workspaceRoot).namedInputs?.[EXTERNAL_RUST_CRATES_INPUT] === undefined) {
       const listed = [...external]
@@ -241,14 +422,14 @@ export async function cargoPackageTestInputs({
         .map(([name, dir]) => `${name} -> ${dir}`)
         .join(', ');
       throw new Error(
-        `${memberDir}/Cargo.toml depends on crates outside the Nx workspace (${listed}) that no fileset can hash; ` +
-          `declare namedInputs.${EXTERNAL_RUST_CRATES_INPUT} in ${join(workspaceRoot, 'nx.json')} as ` +
-          '[{"runtime":"smoo-nx-cargo-hash"}]; Cargo derives the transitive path inputs without a manual source-root list',
+        `${memberDir}/Cargo.toml references inputs outside the Nx workspace (${listed}) that no fileset can hash; ` +
+          `declare namedInputs.${EXTERNAL_RUST_CRATES_INPUT} in ${join(workspaceRoot, 'nx.json')} ` +
+          'with runtime inputs that hash those external sources and configuration',
       );
     }
-    inputs.push(EXTERNAL_RUST_CRATES_INPUT);
+    inputs.add(EXTERNAL_RUST_CRATES_INPUT);
   }
-  return inputs;
+  return [...inputs];
 }
 
 function enqueuePathDependencies(
@@ -258,6 +439,7 @@ function enqueuePathDependencies(
   pending: string[],
   external: Map<string, string>,
   absoluteProjectRoot: string,
+  workspaceRoot: string,
 ): void {
   for (const tableName of ['dependencies', 'dev-dependencies', 'build-dependencies'] as const) {
     const table = scope[tableName];
@@ -265,7 +447,14 @@ function enqueuePathDependencies(
       continue;
     }
     for (const [depName, spec] of Object.entries(table)) {
-      const pathDep = pathDependencyDir(memberDir, depName, spec, workspacePathDeps, absoluteProjectRoot);
+      const pathDep = pathDependencyDir(
+        memberDir,
+        depName,
+        spec,
+        workspacePathDeps,
+        absoluteProjectRoot,
+        workspaceRoot,
+      );
       if (pathDep === null) {
         continue;
       }
@@ -278,15 +467,15 @@ function enqueuePathDependencies(
   }
 }
 
-async function workspacePathDependencies(absoluteProjectRoot: string): Promise<Map<string, string>> {
-  const parsed: unknown = parseToml(await readFile(join(absoluteProjectRoot, 'Cargo.toml'), 'utf-8'));
+function workspacePathDependencies(parsed: unknown, root: string): Map<string, string> {
   const deps = new Map<string, string>();
   if (!isRecord(parsed) || !isRecord(parsed.workspace) || !isRecord(parsed.workspace.dependencies)) {
     return deps;
   }
   for (const [name, spec] of Object.entries(parsed.workspace.dependencies)) {
     if (isRecord(spec) && typeof spec.path === 'string') {
-      deps.set(name, spec.path.split('\\').join('/'));
+      const path = spec.path.split('\\').join('/');
+      deps.set(name, resolve(root, path));
     }
   }
   return deps;
@@ -295,17 +484,15 @@ async function workspacePathDependencies(absoluteProjectRoot: string): Promise<M
 interface PathDependencyDir {
   /** Cargo-workspace-relative directory, or the raw path when external. */
   dir: string;
-  /** Resolves outside the Cargo workspace root, regardless of spelling. */
+  /** Resolves outside the Nx workspace root, regardless of spelling. */
   external: boolean;
 }
 
 /**
- * Where a path dependency lives relative to the cargo workspace root. A
- * `workspace = true` dependency is already root-relative; a crate-local
- * `path` is relative to the member. Absolute paths within the workspace are
- * normalized to the same local closure; anything that escapes the root is
- * reported as external rather than dropped, so the caller can demand the
- * runtime input that covers it.
+ * Resolve inherited dependencies from their owning workspace and local paths
+ * from their member directory. Paths inside Nx remain in the ordinary source
+ * closure even when they escape the Cargo workspace; paths outside Nx require
+ * an explicit runtime named input.
  */
 function pathDependencyDir(
   memberDir: string,
@@ -313,6 +500,7 @@ function pathDependencyDir(
   spec: unknown,
   workspacePathDeps: Map<string, string>,
   absoluteProjectRoot: string,
+  workspaceRoot: string,
 ): PathDependencyDir | null {
   if (!isRecord(spec)) {
     return null;
@@ -333,18 +521,13 @@ function pathDependencyDir(
   } else {
     return null;
   }
-  if (isAbsolute(raw) || posix.isAbsolute(raw)) {
-    const local = relative(absoluteProjectRoot, raw).split(sep).join(posix.sep);
-    if (local === '..' || local.startsWith('../') || isAbsolute(local)) {
-      return { dir: raw, external: true };
-    }
-    raw = local || '.';
-  }
-  const resolved = normalize(raw).split(sep).join(posix.sep);
-  if (resolved === '..' || resolved.startsWith('../')) {
-    return { dir: resolved, external: true };
-  }
-  return { dir: resolved, external: false };
+  const absolute = resolve(absoluteProjectRoot, raw);
+  const local = relative(absoluteProjectRoot, absolute).split(sep).join(posix.sep) || '.';
+  return { dir: local, external: isOutsideRoot(relative(workspaceRoot, absolute)) };
+}
+
+function isOutsideRoot(path: string): boolean {
+  return path === '..' || path.startsWith(`..${sep}`) || isAbsolute(path);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -363,8 +546,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
  *
  * It is declared rather than inferred because the only honest input is how long
  * the suite takes, which target inference cannot measure. Defaulting to 1 keeps
- * small crates on a single target: cowshed-cli's 226 tests run in 6.5s, so
- * sharding them would buy nothing and pay a per-target cargo freshness check.
+ * small crates on a single target without paying another Cargo freshness check.
  */
 function readTestShards(cratePackage: Record<string, unknown>, crateTomlPath: string): number {
   const metadata = isRecord(cratePackage.metadata) ? cratePackage.metadata : null;
@@ -399,7 +581,7 @@ export const CARGO_TEST_EXCEPTIONS_SUFFIX = 'exceptions';
 
 /**
  * A crate on one target keeps the bare name; a split crate suffixes the piece,
- * so `cargo-test-cowshed-core-shard2` still reads as "cowshed-core's tests".
+ * so `cargo-test-example-core-shard2` still reads as "example-core's tests".
  */
 export function cargoTestPackageTargetName(packageName: string, piece?: string): string {
   const base = `cargo-test-${packageName}`;
@@ -424,24 +606,10 @@ export function packageNameFromCargoTestTarget(targetName: string): string | nul
 /**
  * The tests nextest.toml singles out with an override, as one filterset.
  *
- * An override is the config author saying "this class does not behave like the
- * rest of the suite", and both classes declared today break a shard, each in a
- * different way:
- *
- *   - a `test-group` is scoped to a single nextest RUN, so letting the hash
- *     scatter its members across shards silently dissolves it. The real-APFS
- *     group exists because those tests contend on Disk Arbitration
- *     machine-wide, where an unscoped `diskutil apfs list -plist` measured 0.7s
- *     idle against 14.4s while another process is attaching.
- *   - a raised `slow-timeout` marks a test whose cost is not the suite's cost.
- *     `lesser_capabilities_fail_to_compile_...` rustc's a fixture that
- *     `cargo test --no-run` cannot pre-build, so it costs 25.6s on a cold
- *     target directory against 1.8s warm. Every CI runner is cold, and left in
- *     a shard that spike lands on whichever 250-odd tests share it.
- *
- * One target for all of them rather than one each: they sit in different groups
- * so they run concurrently, making the combined wall the max of the classes
- * rather than their sum.
+ * Overrides can encode constraints that must survive sharding: a test group
+ * limits concurrency within one nextest run, while a raised slow timeout can
+ * identify expensive tests that should not delay an otherwise bounded shard.
+ * Keep the configured exceptions in one run so group limits remain effective.
  *
  * Deriving this from the config that declares the classes, rather than
  * restating their filters, means adding an override there is the whole change —

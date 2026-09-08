@@ -294,6 +294,8 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         'cargo-fetch',
         'cargo-lint',
         'cargo-lint-cross',
+        'cargo-lint-ferris-core',
+        'cargo-lint-ferris-wasm',
         'cargo-sweep',
         'cargo-test',
         'cargo-test-compile',
@@ -319,11 +321,19 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       // Every frozen cargo command carries the edge, not just the head of the
       // serialization chain: offline cargo fails at resolution, so each one
       // needs the locked graph downloaded whether or not the chain runs first.
-      for (const name of ['cargo-test-compile', 'cargo-lint', CARGO_CROSS_LINT_TARGET, 'mutation', 'bench']) {
+      for (const name of [
+        'cargo-test-compile',
+        'cargo-lint-ferris-core',
+        CARGO_CROSS_LINT_TARGET,
+        'mutation',
+        'bench',
+      ]) {
         expect(targets[name]?.dependsOn).toContain('cargo-fetch');
       }
       expect(targets['cargo-sweep']?.dependsOn).toBeUndefined();
       expect(targets['cargo-test-compile']?.executor).toBe('nx:run-commands');
+      expect(targets['cargo-test-compile']?.cache).toBe(false);
+      expect(targets['cargo-test-compile']?.outputs).toEqual([]);
       expect(targets['cargo-test-compile']?.options).toMatchObject({
         command: 'cargo --frozen test --workspace --no-run',
         cwd: 'packages/ferris',
@@ -339,18 +349,24 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       expect(targets['cargo-test-ferris-core']?.options?.command).toMatch(
         /^cargo --frozen nextest run --workspace -E 'package\(ferris-core\)' --no-tests=pass --user-config-file none --config-file /,
       );
-      expect(targets['cargo-test-ferris-core']?.inputs).toEqual([
-        '{projectRoot}/Cargo.toml',
-        '{projectRoot}/Cargo.lock',
-        '{projectRoot}/crates/ferris-core/**/*.rs',
-        '{projectRoot}/crates/ferris-core/Cargo.toml',
-        '{projectRoot}/**/.cargo/config.toml',
-        '{projectRoot}/scripts/*.sh',
-        '!{projectRoot}/**/target/**',
-      ]);
-      expect(targets['cargo-lint']?.options).toMatchObject({
-        commands: ['cargo fmt --all --check', CARGO_LINT_CLIPPY_COMMAND],
+      expect(targets['cargo-test-ferris-core']?.inputs).toEqual(
+        expect.arrayContaining([
+          '{projectRoot}/Cargo.toml',
+          '{projectRoot}/Cargo.lock',
+          '{projectRoot}/crates/ferris-core/**/*',
+        ]),
+      );
+      expect(targets['cargo-test-ferris-core']?.inputs).not.toContain('{projectRoot}/crates/ferris-wasm/**/*');
+      expect(targets['cargo-lint']?.dependsOn).toEqual(['cargo-lint-ferris-core', 'cargo-lint-ferris-wasm']);
+      expect(targets['cargo-lint-ferris-core']?.options).toMatchObject({
+        cwd: 'packages/ferris',
+        commands: [
+          'cargo fmt -p ferris-core --check',
+          'cargo --frozen clippy -p ferris-core --all-targets --target-dir target/cargo-lint-ferris-core -- -D warnings',
+        ],
       });
+      expect(targets['cargo-lint-ferris-core']?.cache).toBe(true);
+      expect(targets['cargo-lint-ferris-core']?.outputs).toEqual([]);
       expect(targets.lint?.dependsOn).toEqual(['cargo-lint']);
       expect(targets[CARGO_CROSS_LINT_TARGET]?.options).toMatchObject({
         command: CARGO_CROSS_LINT_COMMAND,
@@ -445,7 +461,11 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         command: 'cargo --frozen test --workspace --no-run',
         cwd: '.',
       });
-      expect(root['cargo-lint']?.options).toMatchObject({ cwd: '.' });
+      expect(root['cargo-lint']?.dependsOn).toEqual([
+        { projects: ['native'], target: 'cargo-lint-native-napi' },
+        { projects: ['runtime'], target: 'cargo-lint-runtime-core' },
+        { projects: ['wasm'], target: 'cargo-lint-runtime-wasm' },
+      ]);
       expect(root['cargo-test']?.dependsOn).toHaveLength(5);
 
       expect(runtime['cargo-test-runtime-core-shard1']?.dependsOn).toEqual([
@@ -470,7 +490,10 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         'cargo-test-runtime-core-shard2',
         'cargo-test-runtime-core-exceptions',
       ]);
-      expect(runtime['cargo-lint']).toBeUndefined();
+      expect(runtime['cargo-lint']?.dependsOn).toEqual(['cargo-lint-runtime-core']);
+      expect(runtime.lint?.dependsOn).toEqual(['cargo-lint']);
+      expect(runtime['cargo-lint-runtime-core']?.dependsOn).toEqual([rootFetch]);
+      expect(runtime['cargo-lint-runtime-core']?.options?.cwd).toBe('.');
       expect(runtime.clean).toBeUndefined();
 
       expect(wasm['cargo-test-runtime-wasm']?.dependsOn).toEqual([
@@ -504,6 +527,128 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       await workspace.cleanup();
     }
   });
+
+  it('keeps root packages, nested workspaces and multiple owned crates in their own lint graph', async () => {
+    const workspace = await createWorkspace();
+    const declared: Record<string, TargetConfiguration> = {
+      'cargo-lint-alpha-core': { dependsOn: ['...', 'prepare-check'] },
+      'cargo-lint': { dependsOn: ['cargo-lint-alpha-core'] },
+      lint: { dependsOn: ['cargo-lint', 'custom-check'] },
+    };
+    try {
+      await workspace.write('package.json', '{"name":"outer-root"}\n');
+      await workspace.write(
+        'Cargo.toml',
+        '[workspace]\nmembers = ["packages/group/crates/*"]\nexclude = ["nested"]\n\n[package]\nname = "host-core"\n',
+      );
+      await workspace.write(
+        'packages/group/package.json',
+        JSON.stringify({ name: 'group', nx: { targets: declared } }),
+      );
+      await workspace.write('packages/group/tsconfig.lib.json', '{}\n');
+      await workspace.write('packages/group/crates/alpha/Cargo.toml', '[package]\nname = "alpha-core"\n');
+      await workspace.write('packages/group/crates/beta/Cargo.toml', '[package]\nname = "beta-wasm"\n');
+      await workspace.write('nested/package.json', '{"name":"inner-root"}\n');
+      await workspace.write(
+        'nested/Cargo.toml',
+        '[workspace]\nmembers = ["modules/leaf"]\n\n[package]\nname = "inner-host"\n',
+      );
+      await workspace.write('nested/modules/leaf/package.json', '{"name":"inner-leaf-project"}\n');
+      await workspace.write('nested/modules/leaf/Cargo.toml', '[package]\nname = "inner-leaf"\n');
+      const inferred = await inferTargets(
+        ['package.json', 'packages/group/package.json', 'nested/package.json', 'nested/modules/leaf/package.json'],
+        undefined,
+        workspace.context,
+      );
+      const projects = new Map(inferred.flatMap(([, result]) => Object.entries(result.projects ?? {})));
+      const outer = projects.get('.')?.targets ?? {};
+      const group = projects.get('packages/group')?.targets ?? {};
+      const inner = projects.get('nested')?.targets ?? {};
+      const leaf = projects.get('nested/modules/leaf')?.targets ?? {};
+      expect(outer['cargo-lint']?.dependsOn).toEqual([
+        { projects: ['group'], target: 'cargo-lint-alpha-core' },
+        { projects: ['group'], target: 'cargo-lint-beta-wasm' },
+        'cargo-lint-host-core',
+      ]);
+      expect(group['cargo-lint']?.dependsOn).toEqual(['cargo-lint-alpha-core', 'cargo-lint-beta-wasm']);
+      expect(group.build?.dependsOn).toEqual([
+        '^build',
+        { projects: ['outer-root'], target: 'cargo-test-compile' },
+        'tsc-js',
+      ]);
+      expect(outer['cargo-lint-host-core']?.options?.commands).toEqual([
+        'cargo fmt -p host-core --check',
+        'cargo --frozen clippy -p host-core --all-targets --target-dir target/cargo-lint-host-core -- -D warnings',
+      ]);
+      expect(inner['cargo-lint']?.dependsOn).toEqual([
+        'cargo-lint-inner-host',
+        { projects: ['inner-leaf-project'], target: 'cargo-lint-inner-leaf' },
+      ]);
+      expect(leaf['cargo-lint-inner-leaf']?.options).toMatchObject({
+        cwd: 'nested',
+        commands: [
+          'cargo fmt -p inner-leaf --check',
+          'cargo --frozen clippy -p inner-leaf --all-targets --target-dir target/cargo-lint-inner-leaf -- -D warnings',
+        ],
+      });
+      expect(leaf['cargo-lint-inner-leaf']?.dependsOn).toEqual([{ projects: ['inner-root'], target: 'cargo-fetch' }]);
+      expect(leaf['cargo-lint-inner-leaf']?.inputs).toContain('{workspaceRoot}/nested/modules/leaf/**/*');
+      expect(leaf['cargo-lint-inner-leaf']?.inputs).not.toContain('{workspaceRoot}/packages/group/crates/alpha/**/*');
+      expect(leaf['cargo-test-inner-leaf']?.options?.cwd).toBe('nested');
+      expect(inner['cargo-test-compile']?.options?.cwd).toBe('nested');
+      expect(leaf['cargo-test-inner-leaf']?.configurations?.production?.command).toContain('--workspace --release');
+      expect(resolveDeclaredOverInferred(group, declared, 'cargo-lint-alpha-core')).toMatchObject({
+        executor: 'nx:run-commands',
+        cache: true,
+        outputs: [],
+        dependsOn: [{ projects: ['outer-root'], target: 'cargo-fetch' }, 'prepare-check'],
+      });
+      expect(resolveDeclaredOverInferred(group, declared, 'cargo-lint')?.dependsOn).toEqual(['cargo-lint-alpha-core']);
+      expect(resolveDeclaredOverInferred(group, declared, 'lint')?.dependsOn).toEqual(['cargo-lint', 'custom-check']);
+    } finally {
+      await workspace.cleanup();
+    }
+  });
+
+  it('invalidates cached lint verdicts for Cargo target, profile and global configuration changes', async () => {
+    const workspace = await createWorkspace();
+    try {
+      await workspace.write('package.json', '{"name":"cache-fixture"}\n');
+      await workspace.write('Cargo.toml', '[workspace]\nmembers = ["crate"]\n');
+      await workspace.write('crate/Cargo.toml', '[package]\nname = "cache-crate"\n');
+      await workspace.write('cargo-home/config.toml', '[build]\njobs = 1\n');
+      const targets = await inferProjectTargets(workspace, 'package.json');
+      const runtimeCommands = (targets['cargo-lint-cache-crate']?.inputs ?? []).flatMap((input) =>
+        typeof input !== 'string' && 'runtime' in input ? [input.runtime] : [],
+      );
+      const capture = async (extraEnv: Record<string, string>) =>
+        Promise.all(
+          runtimeCommands.map(async (command) => {
+            const child = Bun.spawn(['sh', '-c', command], {
+              cwd: workspace.context.workspaceRoot,
+              env: { ...process.env, CARGO_HOME: join(workspace.context.workspaceRoot, 'cargo-home'), ...extraEnv },
+              stdout: 'pipe',
+              stderr: 'pipe',
+            });
+            const [exitCode, stdout, stderr] = await Promise.all([
+              child.exited,
+              new Response(child.stdout).text(),
+              new Response(child.stderr).text(),
+            ]);
+            expect({ exitCode, stderr }).toMatchObject({ exitCode: 0 });
+            return stdout;
+          }),
+        );
+      const baseline = await capture({});
+      expect(await capture({ CARGO_BUILD_TARGET: 'wasm32-unknown-unknown' })).not.toEqual(baseline);
+      expect(await capture({ CARGO_PROFILE_DEV_OPT_LEVEL: '2' })).not.toEqual(baseline);
+      expect(await capture({ UNRELATED_FIXTURE_VARIABLE: 'changed' })).toEqual(baseline);
+      await workspace.write('cargo-home/config.toml', '[build]\njobs = 2\n');
+      expect(await capture({})).not.toEqual(baseline);
+    } finally {
+      await workspace.cleanup();
+    }
+  }, 30_000);
 
   it('scopes each per-crate cargo-test command to exactly one package', async () => {
     const workspace = await createWorkspace();
@@ -566,16 +711,12 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         executor: 'nx:run-commands',
         cache: true,
         dependsOn: ['cargo-fetch', '^build'],
-        inputs: [
+        inputs: expect.arrayContaining([
           '{projectRoot}/**/*.rs',
           '{projectRoot}/**/Cargo.toml',
-          '{projectRoot}/**/Cargo.lock',
-          '{projectRoot}/**/.cargo/config.toml',
-          '{projectRoot}/scripts/*.sh',
-          '!{projectRoot}/**/target/**',
           '{projectRoot}/package.json',
           '{workspaceRoot}/bun.lock',
-        ],
+        ]),
         outputs: ['{projectRoot}/generated/wasm'],
         options: {
           commands: [
@@ -1228,6 +1369,8 @@ function cargoPackageSelection(command: string): {
   return {
     workspaceBuild: tokens.includes('--workspace'),
     packageFlags,
-    filtered: [...command.matchAll(/\bpackage\(([^)]+)\)/g)].map((match) => match[1] as string),
+    filtered: [...command.matchAll(/\bpackage\(([^)]+)\)/g)].flatMap((match) =>
+      match[1] === undefined ? [] : [match[1]],
+    ),
   };
 }

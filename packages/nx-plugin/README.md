@@ -16,18 +16,43 @@ with `tsconfig.lib.json` receives transformer-aware `tsc-js` and native `typeche
 
 ## Cargo Workspace Layouts
 
-The plugin supports both Cargo placements without moving crate sources:
+The plugin discovers Cargo workspaces beside Nx project manifests at any depth:
 
-- **Package-rooted:** `packages/example/package.json` sits beside `packages/example/Cargo.toml`. The package owns the
-  whole Cargo target set, and commands keep `cwd: packages/example`.
-- **Repository-rooted:** the repository `package.json` sits beside the one root `Cargo.toml`, whose members may live
-  below several `packages/*` projects. The root Nx project owns the single `cargo-fetch`, `cargo-test-compile`,
-  `cargo-lint`, mutation, bench, and sweep targets. Each crate's `cargo-test-<crate>` target and declared Wasm/N-API
-  output targets belong to the deepest Nx project directory containing that crate. All Cargo commands run from the
-  repository root, select the crate with `-p <crate>`, and share the root `target/`; cross-project dependencies keep the
-  runners in one serialization chain. Member and exclude patterns may use `*` and `?` in any path segment (for example,
-  `packages/*/crates/*`); unsupported patterns and member patterns that match no directory fail graph construction
-  instead of silently omitting crates.
+- **Workspace owner:** the project beside a workspace `Cargo.toml` owns one `cargo-fetch`, `cargo-test-compile`,
+  cross-check, mutation, bench, and sweep target. Its `cargo-lint` and `cargo-test` aggregates reach all workspace
+  crates, including a root `[package]`.
+- **Crate owner:** the deepest Nx project directory containing a crate owns `cargo-lint-<crate>` and
+  `cargo-test-<crate>` targets. Its `cargo-lint` and `lint` aggregates reach only its own crates; lint never depends on
+  the workspace test suite. Projects can own multiple crates. A nested independent workspace has its own prerequisites
+  and does not inherit those of an outer workspace.
+- **Commands:** validation runs from the governing Cargo workspace directory. Formatting uses
+  `cargo fmt -p <crate> --check`; Clippy uses
+  `cargo --frozen clippy -p <crate> --all-targets --target-dir target/cargo-lint-<crate> -- -D warnings`. The package
+  selector narrows both tools, and each Clippy target has a separate build directory.
+- **Overrides:** normal Nx merging applies. Explicit `nx.targets` fields replace inferred fields, while omitted fields
+  retain their inferred base. Use `"dependsOn": ["...", "extra"]` to preserve inferred prerequisites when adding an
+  edge; replacing the array makes its author responsible for fetching before frozen Cargo commands.
+
+Member and exclude patterns may use `*` and `?` in any path segment (for example, `packages/*/crates/*`). Unsupported
+patterns and member patterns that match no directory fail graph construction instead of silently omitting crates.
+
+### Cargo cache boundaries
+
+`cargo-fetch` is uncached because the registry lives outside Nx outputs. `cargo-test-compile` is also uncached: it warms
+Cargo's shared mutable build directory before the bounded runner, even if that directory was deleted after an earlier
+successful run. Cargo's own incremental cache avoids recompiling unchanged code. Nx never restores or collects shared
+Cargo build directories; lint and test **results**, and dedicated Wasm/N-API **outputs**, remain cacheable.
+
+Validation inputs include the crate's files, local dependency closure, governing manifests and configuration, toolchain
+versions, Cargo/Rust/native-build environment, target/profile overrides, and global Cargo configuration. Workspace test
+runners additionally hash all workspace member manifests because those affect unified features, and the nextest
+executable/configuration. Production test configurations use release compilation and release runners together. Keep
+explicit inputs for arbitrary build-script reads or custom environment variables that Cargo metadata cannot name.
+
+Cargo keeps the caller's `CARGO_HOME`. Moving configuration into an isolated home can change relative paths or lose
+source replacement, credentials, and toolchain settings; forwarding it with `--config` changes precedence. Registry
+access may consequently serialize on Cargo's package-cache lock, while separate Clippy target directories still avoid
+contention with the test build directory.
 
 ### External Rust sources
 
@@ -72,15 +97,15 @@ Concrete targets come from concrete files:
 - `test:watch` is inferred when the package already defines an explicit Bun or Vitest `test` command. The plugin derives
   the corresponding watch command and makes it depend on `typecheck-tests`.
 - A workspace-root `Cargo.toml` provides `cargo-test`, `test`, `cargo-lint`, `mutation`, and `bench`.
-  `cargo-test-compile` is one workspace `cargo test --no-run`. Each member crate gets a cached `cargo-test-<package>`
-  run (30s per-test timeout like `bun test --timeout=30000`) whose inputs are that crate and its path deps, so unchanged
-  crates are skipped. Package-rooted workspaces use `cargo nextest run --workspace -E 'package(<crate>)'`;
-  repository-rooted workspaces additionally use `-p <crate>` to bind the runner to the project that owns the crate.
-  Per-crate runners accept an empty nextest selection because a valid workspace member may have no tests and a hash
-  partition may legitimately be empty. Those runs are chained across project boundaries so two cargos never share
-  `target/`; `napi-debug` sits on that chain after compile. Clippy uses `--target-dir target/cargo-lint` so lint can
-  overlap tests. A crate declaring `[package.metadata.smoothbricks.wasm-bindgen]` also receives the cacheable
-  `cargo-wasm` output target in its owning project.
+  `cargo-test-compile` warms one workspace `cargo test --no-run`. Each member crate gets a cached `cargo-test-<package>`
+  run (30s per-test timeout like `bun test --timeout=30000`) whose inputs include that crate and its path dependencies.
+  Package-rooted workspaces use `cargo nextest run --workspace -E 'package(<crate>)'`; repository-rooted workspaces
+  additionally use `-p <crate>` to bind the runner to the project that owns the crate. Per-crate runners accept an empty
+  nextest selection because a valid workspace member may have no tests and a hash partition may legitimately be empty.
+  Those runs are chained across project boundaries to serialize their Cargo writers; `napi-debug` sits on that chain
+  after compile. Clippy uses a separate per-crate target directory so lint can overlap tests. A crate declaring
+  `[package.metadata.smoothbricks.wasm-bindgen]` also receives the cacheable `cargo-wasm` output target in its owning
+  project.
 - A crate whose suite outgrows one bounded window declares `[package.metadata.smoothbricks.test] shards = N`, and gets
   `cargo-test-<package>-shard1..N`, each running `--partition hash:i/N` with the full bound. nextest assigns a test to a
   shard by hashing its name, so the shards stay an exact partition of the crate as tests and test binaries are added,

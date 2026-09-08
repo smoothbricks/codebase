@@ -92,7 +92,12 @@ function hostPlatformTargetNames(targetNames: Iterable<string>, hostPlatform: Na
  */
 function buildOutputTargetNames(targetNames: Iterable<string>): string[] {
   return [...new Set(targetNames)]
-    .filter((name) => BUILD_OUTPUT_TARGET_PATTERN.test(name) && !name.startsWith(`${CARGO_TEST_TARGET}-`))
+    .filter(
+      (name) =>
+        BUILD_OUTPUT_TARGET_PATTERN.test(name) &&
+        !name.startsWith(`${CARGO_TEST_TARGET}-`) &&
+        !name.startsWith('cargo-lint-'),
+    )
     .sort();
 }
 
@@ -127,6 +132,14 @@ const REPO_ROOT_CARGO_OUTPUT_INPUTS = [
   '{projectRoot}/package.json',
   '{workspaceRoot}/bun.lock',
 ];
+const CARGO_ENVIRONMENT_INPUT = {
+  runtime: `bun -e 'const fs = require("node:fs"); const path = require("node:path"); const home = process.env.CARGO_HOME || path.join(require("node:os").homedir(), ".cargo"); console.log(JSON.stringify({env: Object.entries(process.env).filter(([name]) => /^(?:CARGO_|RUST|NEXTEST_|CLIPPY_|CC(?:_|$)|CXX(?:_|$)|AR(?:_|$)|CFLAGS|CXXFLAGS|CPPFLAGS|LDFLAGS|PKG_CONFIG|TARGET_|HOST_)/.test(name)).sort(([a], [b]) => a.localeCompare(b)), config: ["config", "config.toml"].map(name => { const file = path.join(home, name); return fs.existsSync(file) ? fs.readFileSync(file, "utf8") : null; })}));'`,
+};
+
+function cargoRuntimeInput(projectRoot: string, command: string): { runtime: string } {
+  const quotedRoot = `'${projectRoot.replaceAll("'", "'\"'\"'")}'`;
+  return { runtime: `cd ${quotedRoot} && ${command}` };
+}
 const NAPI_INPUTS = CARGO_OUTPUT_INPUTS;
 
 interface NapiTargetConvention extends NapiPlatform {
@@ -219,9 +232,9 @@ function createCargoWasmTarget(
  * Compilation is excluded from the bounded test window: a cold Cargo
  * workspace can take many minutes to compile while still making progress,
  * which is not a property of the tests. `cargo test --no-run` pays that cost
- * in its own unbounded, cacheable target; the bounded runner then re-invokes
- * cargo against a warm target directory, where only the suites' own runtime
- * counts against the standard bound.
+ * in its own unbounded target. Cargo reuses incremental compilation locally;
+ * Nx cannot cache this warming action without restoring shared mutable state.
+ * The bounded runner then uses the warm directory for the suites' own runtime.
  *
  * Cargo flocks one `target/` per invocation. Nx must not run two cargo
  * writers on that directory at once — that is a mutex, not a deadlock, and
@@ -233,8 +246,9 @@ function createCargoWasmTarget(
 function createCargoTestCompileTarget(projectRoot: string): TargetConfiguration {
   return {
     executor: 'nx:run-commands',
-    cache: true,
+    cache: false,
     inputs: CARGO_INPUTS,
+    outputs: [],
     options: {
       command: cargoFrozen('test --workspace --no-run'),
       cwd: projectRoot,
@@ -265,106 +279,18 @@ function createCargoTestTarget(projectRoot: string): TargetConfiguration {
 
 const PLUGIN_NEXTEST_CONFIG = fileURLToPath(new URL('../nextest.toml', import.meta.url));
 
-/**
- * One bounded target per crate; a crate that declares `smoothbricks.test.shards`
- * gets one per shard plus one for the tests nextest.toml singles out.
- *
- * `--workspace -E 'package(X)'` rather than `--package X`. A filterset selects
- * what RUNS; `--package` also re-resolves FEATURES for that crate alone, which
- * fingerprints differently from the `cargo test --workspace --no-run` that
- * `cargo-test-compile` already paid for, so cargo rebuilds the divergent half
- * inside the bounded window. Measured on a hosted 3-core macOS runner that
- * rebuild was 57.9s of a 120s budget — the tests were killed with 264 still to
- * run while nothing was wrong with them. The two forms select the same tests;
- * only the filterset reuses the compile target's artifacts.
- *
- * nextest.toml singles some tests out with an override, and each such class
- * breaks a shard in its own way — a `test-group` is scoped to one nextest RUN
- * so the hash would dissolve it, and a raised `slow-timeout` marks a test whose
- * cost is not the suite's. Those are lifted OUT of the hash into one target and
- * the shards run the exact complement, so which tests a shard holds stops
- * depending on how the hash happened to fall.
- *
- * The two filtersets are exact complements, so their union is the crate whatever
- * either one matches. Every piece uses `--no-tests=pass`: a valid workspace
- * member may expose no nextest tests, a small suite can leave a declared hash
- * shard empty, and platform-specific exceptions may not exist on this host.
- * Manifest discovery proves the package exists and generates the selector from
- * its Cargo name, so accepting an empty run cannot hide a misspelled package.
- *
- * The trade is explicit: a generated target cannot distinguish an intentionally
- * test-less crate from one whose entire suite stopped matching, so both pass.
- * Detecting that regression requires a separate coverage policy rather than
- * making valid empty crates and shards fail execution.
- *
- * Pieces chain rather than fan out, like the crates do: cargo flocks one
- * `target/`, and chaining keeps even the pinned group from overlapping the
- * shards on a machine-wide resource.
- */
-async function addPerPackageCargoTestTargets(
-  targets: Record<string, TargetConfiguration>,
-  projectRoot: string,
-  workspaceRoot: string,
-  absoluteProjectRoot: string,
-): Promise<string[]> {
-  const packages = listCargoWorkspacePackages(absoluteProjectRoot);
-  if (packages.length === 0) {
-    return [];
-  }
-  const configFile = nextestConfigRelPath(workspaceRoot, projectRoot, PLUGIN_NEXTEST_CONFIG);
-  const exceptional = exceptionalTestFilter(PLUGIN_NEXTEST_CONFIG);
-  const packageTargetNames: string[] = [];
-  let previous = CARGO_TEST_COMPILE_TARGET;
-  for (const pkg of packages) {
-    const inputs = await cargoPackageTestInputs({ workspaceRoot, absoluteProjectRoot, memberDir: pkg.dir });
-    const sharded = pkg.testShards > 1;
-    const pin = sharded && exceptional !== null ? exceptional : null;
-    const addTarget = (piece: string | undefined, selector: string, extra: string) => {
-      const targetName = cargoTestPackageTargetName(pkg.name, piece);
-      packageTargetNames.push(targetName);
-      targets[targetName] = {
-        executor: '@smoothbricks/nx-plugin:bounded-exec',
-        cache: true,
-        inputs,
-        dependsOn: [previous],
-        options: {
-          command: cargoFrozen(
-            `nextest run --workspace -E '${selector}'${extra} --no-tests=pass --user-config-file none --config-file ${configFile}`,
-          ),
-          cwd: projectRoot,
-          timeoutMs: BOUNDED_TEST_TIMEOUT_MS,
-          killAfterMs: BOUNDED_TEST_KILL_AFTER_MS,
-        },
-      };
-      previous = targetName;
-    };
-    const shardable = pin === null ? `package(${pkg.name})` : `package(${pkg.name}) and not (${pin})`;
-    for (let index = 1; index <= pkg.testShards; index += 1) {
-      // nextest hashes the test name, so a shard holds the same tests whatever
-      // else the filterset selects and whatever tests are added later.
-      addTarget(
-        sharded ? `shard${index}` : undefined,
-        shardable,
-        sharded ? ` --partition hash:${index}/${pkg.testShards}` : '',
-      );
-    }
-    if (pin !== null) {
-      addTarget(CARGO_TEST_EXCEPTIONS_SUFFIX, `package(${pkg.name}) and (${pin})`, '');
-    }
-  }
-  return packageTargetNames;
-}
-
 type CreateNodesHandler = CreateNodesV2[1];
 
 function createNodesHandler(hostPlatform: NapiPlatform | null): CreateNodesHandler {
   return async (projectConfigurationFiles, _options, context) => {
     const results: CreateNodesResultV2 = [];
     const errors: Array<[file: string | null, error: Error]> = [];
-    const repoRootCargoWorkspace = await resolveRepoRootCargoWorkspace(
-      projectConfigurationFiles,
-      context.workspaceRoot,
-    );
+    let cargoWorkspaces: CargoWorkspace[];
+    try {
+      cargoWorkspaces = await resolveCargoWorkspaces(projectConfigurationFiles, context.workspaceRoot);
+    } catch (error) {
+      throw new AggregateCreateNodesError([[null, error instanceof Error ? error : new Error(String(error))]], results);
+    }
 
     await Promise.all(
       projectConfigurationFiles.map(async (packageJsonPath) => {
@@ -381,7 +307,7 @@ function createNodesHandler(hostPlatform: NapiPlatform | null): CreateNodesHandl
           }
           results.push([
             packageJsonPath,
-            await createProjectTargets(packageJsonPath, context.workspaceRoot, hostPlatform, repoRootCargoWorkspace),
+            await createProjectTargets(packageJsonPath, context.workspaceRoot, hostPlatform, cargoWorkspaces),
           ]);
         } catch (error) {
           errors.push([packageJsonPath, error instanceof Error ? error : new Error(String(error))]);
@@ -459,7 +385,7 @@ async function createProjectTargets(
   packageJsonPath: string,
   workspaceRoot: string,
   hostPlatform: NapiPlatform | null,
-  repoRootCargoWorkspace: RepoRootCargoWorkspace | null,
+  cargoWorkspaces: readonly CargoWorkspace[],
 ) {
   const projectRoot = dirname(packageJsonPath);
   const absoluteProjectRoot = join(workspaceRoot, projectRoot);
@@ -475,12 +401,14 @@ async function createProjectTargets(
   const cargoTomlPath = join(absoluteProjectRoot, 'Cargo.toml');
   const isCargoWorkspace =
     existsSync(cargoTomlPath) && CARGO_WORKSPACE_PATTERN.test(await readFile(cargoTomlPath, 'utf-8'));
-  const repoRootPackagePlans =
-    repoRootCargoWorkspace?.packages.filter((plan) => plan.package.projectRoot === projectRoot) ?? [];
-  const isRepoRootWorkspaceRoot = repoRootCargoWorkspace !== null && projectRoot === '.';
-  const isRepoRootCargoProject = isRepoRootWorkspaceRoot || repoRootPackagePlans.length > 0;
-  const repoRootPackages = repoRootPackagePlans.map((plan) => plan.package);
-  const isRepoRootedCargoProject = isRepoRootCargoProject && (!isCargoWorkspace || isRepoRootWorkspaceRoot);
+  const cargoWorkspace =
+    cargoWorkspaces.find((workspace) => workspace.projectRoot === projectRoot) ??
+    cargoWorkspaces.find((workspace) => workspace.packages.some((plan) => plan.package.projectRoot === projectRoot));
+  const cargoPackagePlans = cargoWorkspace?.packages.filter((plan) => plan.package.projectRoot === projectRoot) ?? [];
+  const isCargoWorkspaceRoot = cargoWorkspace?.projectRoot === projectRoot;
+  const isCargoProject = cargoWorkspace !== undefined;
+  const repoRootPackages = cargoWorkspace?.projectRoot === '.' ? cargoPackagePlans.map((plan) => plan.package) : [];
+  const isRepoRootedCargoProject = cargoWorkspace?.projectRoot === '.';
   const napiConfig = resolveNapiConfig(
     packageJson,
     packageJsonPath,
@@ -590,8 +518,8 @@ async function createProjectTargets(
     }
   }
 
-  // Member crates get their targets from the workspace-root package.json,
-  // never per-crate — one Nx project per Cargo workspace.
+  // Cargo members belong to the deepest containing Nx project. Workspace-wide
+  // prerequisites belong once to the project beside the workspace manifest.
   //
   // Every cargo tool target below is inferred unconditionally, INCLUDING when
   // the package already declares that key in `nx.targets`. Nx merges a
@@ -638,38 +566,52 @@ async function createProjectTargets(
   // dependsOn base of `^build`/`build` so TypeScript packages that omit dependsOn
   // keep those edges now that targetDefaults.test.dependsOn is forbidden — it
   // replaced inferred cargo-test rather than merging.
-  const ownsCargoWorkspaceTargets = isCargoWorkspace || isRepoRootWorkspaceRoot;
-  if (ownsCargoWorkspaceTargets) {
-    const cargoWorkspaceRoot = isRepoRootWorkspaceRoot ? '.' : projectRoot;
+  const ownsCargoWorkspaceTargets = isCargoWorkspaceRoot;
+  if (ownsCargoWorkspaceTargets && cargoWorkspace) {
+    const cargoWorkspaceRoot = cargoWorkspace.projectRoot;
     targets[CARGO_TEST_COMPILE_TARGET] = createCargoTestCompileTarget(cargoWorkspaceRoot);
-    const packageTargetNames = isRepoRootWorkspaceRoot
-      ? await addRepoRootCargoTestTargets(targets, projectName, projectRoot, workspaceRoot, repoRootCargoWorkspace)
-      : await addPerPackageCargoTestTargets(targets, projectRoot, workspaceRoot, absoluteProjectRoot);
-    const aggregateDependencies = isRepoRootWorkspaceRoot
-      ? repoRootCargoWorkspace.packages.flatMap((plan) =>
-          plan.pieces.map((piece) =>
-            cargoTargetDependency(projectName, {
-              projectName: plan.package.projectName,
-              targetName: piece.targetName,
-            }),
-          ),
-        )
-      : packageTargetNames;
+    const workspaceInputs = [
+      ...new Set(
+        (
+          await Promise.all(
+            cargoWorkspace.packages.map((plan) =>
+              cargoPackageTestInputs({
+                workspaceRoot,
+                absoluteProjectRoot: join(workspaceRoot, cargoWorkspaceRoot),
+                memberDir: plan.package.dir,
+              }),
+            ),
+          )
+        ).flat(),
+      ),
+    ];
+    targets[CARGO_TEST_COMPILE_TARGET].inputs = workspaceInputs.length > 0 ? workspaceInputs : CARGO_INPUTS;
+    const aggregateDependencies = cargoWorkspace.packages.flatMap((plan) =>
+      plan.pieces.map((piece) =>
+        cargoTargetDependency(projectName, {
+          projectName: plan.package.projectName,
+          targetName: piece.targetName,
+        }),
+      ),
+    );
     targets[CARGO_TEST_TARGET] =
       aggregateDependencies.length > 0
-        ? { executor: 'nx:noop', cache: true, dependsOn: aggregateDependencies }
+        ? { executor: 'nx:noop', cache: true, outputs: [], dependsOn: aggregateDependencies }
         : createCargoTestTarget(cargoWorkspaceRoot);
-    targets['cargo-lint'] = {
-      executor: 'nx:run-commands',
-      cache: true,
-      inputs: CARGO_INPUTS,
-      options: {
-        commands: ['cargo fmt --all --check', CARGO_LINT_CLIPPY_COMMAND],
-        cwd: cargoWorkspaceRoot,
-        parallel: false,
-      },
-    };
-    validationTargets.push('cargo-lint');
+    if (cargoWorkspace.packages.length === 0) {
+      targets['cargo-lint'] = {
+        executor: 'nx:run-commands',
+        cache: true,
+        inputs: CARGO_INPUTS,
+        outputs: [],
+        options: {
+          commands: ['cargo fmt --all --check', CARGO_LINT_CLIPPY_COMMAND],
+          cwd: cargoWorkspaceRoot,
+          parallel: false,
+        },
+      };
+      validationTargets.push('cargo-lint');
+    }
     // The Linux arm of `cargo-lint`, as its own target. Rationale for the name,
     // the command and the absent cross test leg lives in ./cross-check-policy.ts.
     //
@@ -700,7 +642,8 @@ async function createProjectTargets(
     targets[CARGO_CROSS_LINT_TARGET] = {
       executor: 'nx:run-commands',
       cache: true,
-      inputs: CARGO_INPUTS,
+      inputs: workspaceInputs.length > 0 ? workspaceInputs : CARGO_INPUTS,
+      outputs: [],
       options: {
         command: CARGO_CROSS_LINT_COMMAND,
         cwd: cargoWorkspaceRoot,
@@ -737,25 +680,75 @@ async function createProjectTargets(
     };
   }
 
-  if (!isCargoWorkspace && !isRepoRootWorkspaceRoot && repoRootPackagePlans.length > 0 && repoRootCargoWorkspace) {
-    const packageTargetNames = await addRepoRootCargoTestTargets(
+  if (cargoWorkspace) {
+    const packageTargetNames = await addCargoTestTargets(
       targets,
       projectName,
       projectRoot,
       workspaceRoot,
-      repoRootCargoWorkspace,
+      cargoWorkspace,
     );
-    targets[CARGO_TEST_TARGET] = {
-      executor: 'nx:noop',
-      cache: true,
-      dependsOn: packageTargetNames,
-    };
+    if (!isCargoWorkspaceRoot) {
+      targets[CARGO_TEST_TARGET] = {
+        executor: 'nx:noop',
+        cache: true,
+        outputs: [],
+        dependsOn: packageTargetNames,
+      };
+    }
+    for (const plan of cargoPackagePlans) {
+      const name = plan.package.name;
+      targets[`cargo-lint-${name}`] = {
+        executor: 'nx:run-commands',
+        cache: true,
+        inputs: await cargoPackageTestInputs({
+          workspaceRoot,
+          absoluteProjectRoot: join(workspaceRoot, cargoWorkspace.projectRoot),
+          memberDir: plan.package.dir,
+          inputRoot:
+            projectRoot === cargoWorkspace.projectRoot
+              ? '{projectRoot}'
+              : posix.join('{workspaceRoot}', cargoWorkspace.projectRoot),
+        }),
+        outputs: [],
+        options: {
+          commands: [
+            `cargo fmt -p ${name} --check`,
+            cargoFrozen(`clippy -p ${name} --all-targets --target-dir target/cargo-lint-${name} -- -D warnings`),
+          ],
+          cwd: cargoWorkspace.projectRoot,
+          parallel: false,
+        },
+      };
+    }
+    const lintPlans = isCargoWorkspaceRoot ? cargoWorkspace.packages : cargoPackagePlans;
+    if (lintPlans.length > 0) {
+      targets['cargo-lint'] = {
+        executor: 'nx:noop',
+        cache: true,
+        outputs: [],
+        dependsOn: lintPlans.map((plan) =>
+          cargoTargetDependency(projectName, {
+            projectName: plan.package.projectName,
+            targetName: `cargo-lint-${plan.package.name}`,
+          }),
+        ),
+      };
+      validationTargets.push('cargo-lint');
+    }
     if (!targets.test && !('test' in declaredTargets) && typeof packageJson.scripts?.test !== 'string') {
       targets.test = {
         executor: 'nx:noop',
         cache: true,
         dependsOn: [CARGO_TEST_TARGET],
       };
+    }
+    for (const name of [CARGO_TEST_TARGET, 'test']) {
+      const target = targets[name];
+      if (target?.executor === 'nx:noop') {
+        target.outputs = [];
+        target.configurations = { production: {} };
+      }
     }
   }
 
@@ -808,7 +801,7 @@ async function createProjectTargets(
               ? CARGO_FETCH_COMMAND
               : `${CARGO_FETCH_COMMAND} --manifest-path ${manifestPath}`,
           ),
-        cwd: isRepoRootWorkspaceRoot ? '.' : projectRoot,
+        cwd: projectRoot,
         // Two fetches into one CARGO_HOME contend on its package-cache flock;
         // serializing here spends the wait in Nx instead of inside cargo.
         parallel: false,
@@ -828,9 +821,9 @@ async function createProjectTargets(
         target.dependsOn = [CARGO_FETCH_TARGET, ...(target.dependsOn ?? [])];
       }
     }
-  } else if (isRepoRootedCargoProject && repoRootCargoWorkspace) {
+  } else if (cargoWorkspace) {
     const rootFetch = cargoTargetDependency(projectName, {
-      projectName: repoRootCargoWorkspace.rootProjectName,
+      projectName: cargoWorkspace.rootProjectName,
       targetName: CARGO_FETCH_TARGET,
     });
     for (const target of Object.values(targets)) {
@@ -846,14 +839,39 @@ async function createProjectTargets(
     }
   }
 
+  // Cache verdicts and dedicated artifacts, never Cargo's shared mutable build
+  // directories. Resolve tool versions from the command's actual directory.
+  for (const [name, target] of Object.entries(targets)) {
+    const command: unknown = target.options?.command;
+    const commands: unknown = target.options?.commands;
+    const text = [
+      typeof command === 'string' ? command : '',
+      ...(Array.isArray(commands) ? commands.filter((entry) => typeof entry === 'string') : []),
+    ].join('\n');
+    if (!text.includes(CARGO_FROZEN_PREFIX)) continue;
+    target.outputs ??= [];
+    if (!target.cache) continue;
+    const cwd: unknown = target.options?.cwd;
+    const versions = name.startsWith('cargo-lint')
+      ? ' && cargo clippy -V' + (name === CARGO_CROSS_LINT_TARGET ? '' : ' && cargo fmt --version')
+      : text.includes('nextest run')
+        ? ' && cargo nextest --version'
+        : '';
+    target.inputs = [
+      ...(target.inputs ?? CARGO_INPUTS),
+      cargoRuntimeInput(typeof cwd === 'string' ? cwd : projectRoot, CARGO_ENVIRONMENT_INPUT.runtime),
+      cargoRuntimeInput(typeof cwd === 'string' ? cwd : projectRoot, `rustc -vV && cargo -V${versions}`),
+    ];
+  }
+
   // Cargo flocks the workspace's default target/. Keep every writer out of the
   // bounded test window by placing N-API debug builds on the same serialized
   // chain as the root compile and per-crate runners.
   const cargoTestCompileDependency: CargoTargetDependency | null = targets[CARGO_TEST_COMPILE_TARGET]
     ? CARGO_TEST_COMPILE_TARGET
-    : isRepoRootCargoProject && repoRootCargoWorkspace
+    : isCargoProject && cargoWorkspace
       ? cargoTargetDependency(projectName, {
-          projectName: repoRootCargoWorkspace.rootProjectName,
+          projectName: cargoWorkspace.rootProjectName,
           targetName: CARGO_TEST_COMPILE_TARGET,
         })
       : null;
@@ -864,8 +882,8 @@ async function createProjectTargets(
       napiDebug.dependsOn = [...dependsOn, cargoTestCompileDependency];
     }
   }
-  if (napiDebug && isRepoRootedCargoProject) {
-    const firstCargoTest = repoRootPackagePlans.flatMap((plan) => plan.pieces)[0];
+  if (napiDebug && cargoWorkspace) {
+    const firstCargoTest = cargoPackagePlans.flatMap((plan) => plan.pieces)[0];
     const firstTarget = firstCargoTest ? targets[firstCargoTest.targetName] : undefined;
     if (firstCargoTest && firstTarget) {
       const previous = cargoTargetDependency(projectName, firstCargoTest.previous);
@@ -953,10 +971,8 @@ async function createProjectTargets(
       dependsOn: [
         ...new Set([
           '^build',
-          // Compiling the test executables is build work: it is unbounded and
-          // cacheable, while every RUNNER is a bounded-exec target reached only
-          // through the `test` aggregate. That split is what keeps a cold cargo
-          // workspace's compile time out of the bounded test window.
+          // Compiling the test executables is unbounded preparation. Cargo
+          // reuses its incremental state; Nx never restores that shared state.
           ...(cargoTestCompileDependency ? [cargoTestCompileDependency] : []),
           ...buildOutputTargetNames([...Object.keys(declaredTargets), ...Object.keys(targets)]),
           ...cargoWriterNames,
@@ -1419,45 +1435,41 @@ function classifyPackageLocalBuildOutputs(packageJson: PackageJson): { ordinary:
   };
 }
 
-interface RepoRootCargoTargetRef {
+interface CargoTargetRef {
   projectName: string;
   targetName: string;
 }
 
-interface RepoRootCargoTestPiece {
+interface CargoTestPiece {
   extra: string;
-  previous: RepoRootCargoTargetRef;
+  previous: CargoTargetRef;
   selector: string;
   targetName: string;
 }
 
-interface RepoRootCargoPackagePlan {
+interface CargoPackagePlan {
   package: AttributedCargoWorkspacePackage;
-  pieces: RepoRootCargoTestPiece[];
+  pieces: CargoTestPiece[];
 }
 
-interface RepoRootCargoWorkspace {
-  packages: RepoRootCargoPackagePlan[];
+interface CargoWorkspace {
+  packages: CargoPackagePlan[];
   rootProjectName: string;
+  projectRoot: string;
 }
 
 type CargoTargetDependency = NonNullable<TargetConfiguration['dependsOn']>[number];
 
-function cargoTargetDependency(currentProjectName: string, target: RepoRootCargoTargetRef): CargoTargetDependency {
+function cargoTargetDependency(currentProjectName: string, target: CargoTargetRef): CargoTargetDependency {
   return target.projectName === currentProjectName
     ? target.targetName
     : { projects: [target.projectName], target: target.targetName };
 }
 
-async function resolveRepoRootCargoWorkspace(
+async function resolveCargoWorkspaces(
   packageJsonPaths: readonly string[],
   workspaceRoot: string,
-): Promise<RepoRootCargoWorkspace | null> {
-  const cargoTomlPath = join(workspaceRoot, 'Cargo.toml');
-  if (!existsSync(cargoTomlPath) || !CARGO_WORKSPACE_PATTERN.test(await readFile(cargoTomlPath, 'utf-8'))) {
-    return null;
-  }
-
+): Promise<CargoWorkspace[]> {
   const projects: Array<{ name: string; root: string }> = [];
   for (const packageJsonPath of packageJsonPaths) {
     if (isManagedPackageJsonSource(packageJsonPath) || isBuildOutputPackageJson(packageJsonPath)) {
@@ -1473,47 +1485,94 @@ async function resolveRepoRootCargoWorkspace(
       // createProjectTargets records the path-specific parse failure below.
     }
   }
-  const rootProject = projects.find((project) => project.root === '.');
-  if (!rootProject) {
-    return null;
-  }
-
-  const attributed = attributeCargoWorkspacePackages(listCargoWorkspacePackages(workspaceRoot), projects);
-  const packages: RepoRootCargoPackagePlan[] = [];
-  let previous: RepoRootCargoTargetRef = {
-    projectName: rootProject.name,
-    targetName: CARGO_TEST_COMPILE_TARGET,
-  };
-  const exceptional = exceptionalTestFilter(PLUGIN_NEXTEST_CONFIG);
-  for (const pkg of attributed) {
-    const pieces: RepoRootCargoTestPiece[] = [];
-    const sharded = pkg.testShards > 1;
-    const pin = sharded && exceptional !== null ? exceptional : null;
-    const shardable = pin === null ? `package(${pkg.name})` : `package(${pkg.name}) and not (${pin})`;
-    for (let index = 1; index <= pkg.testShards; index += 1) {
-      const targetName = cargoTestPackageTargetName(pkg.name, sharded ? `shard${index}` : undefined);
-      pieces.push({
-        extra: sharded ? ` --partition hash:${index}/${pkg.testShards}` : '',
-        previous,
-        selector: shardable,
-        targetName,
-      });
-      previous = { projectName: pkg.projectName, targetName };
+  const workspaces: CargoWorkspace[] = [];
+  for (const rootProject of projects) {
+    const absoluteRoot = join(workspaceRoot, rootProject.root);
+    const manifest = join(absoluteRoot, 'Cargo.toml');
+    if (!existsSync(manifest) || !CARGO_WORKSPACE_PATTERN.test(await readFile(manifest, 'utf-8'))) {
+      continue;
     }
-    if (pin !== null) {
-      const targetName = cargoTestPackageTargetName(pkg.name, CARGO_TEST_EXCEPTIONS_SUFFIX);
-      pieces.push({
-        extra: '',
-        previous,
-        selector: `package(${pkg.name}) and (${pin})`,
-        targetName,
-      });
-      previous = { projectName: pkg.projectName, targetName };
+    const attributed = attributeCargoWorkspacePackages(
+      listCargoWorkspacePackages(absoluteRoot).map((pkg) => ({
+        ...pkg,
+        dir: posix.join(rootProject.root, pkg.dir),
+      })),
+      projects,
+    ).map((pkg) => ({ ...pkg, dir: posix.relative(rootProject.root, pkg.dir) || '.' }));
+    const packages: CargoPackagePlan[] = [];
+    let previous: CargoTargetRef = {
+      projectName: rootProject.name,
+      targetName: CARGO_TEST_COMPILE_TARGET,
+    };
+    const exceptional = exceptionalTestFilter(PLUGIN_NEXTEST_CONFIG);
+    for (const pkg of attributed) {
+      const pieces: CargoTestPiece[] = [];
+      const sharded = pkg.testShards > 1;
+      const pin = sharded && exceptional !== null ? exceptional : null;
+      const shardable = pin === null ? `package(${pkg.name})` : `package(${pkg.name}) and not (${pin})`;
+      for (let index = 1; index <= pkg.testShards; index += 1) {
+        const targetName = cargoTestPackageTargetName(pkg.name, sharded ? `shard${index}` : undefined);
+        pieces.push({
+          extra: sharded ? ` --partition hash:${index}/${pkg.testShards}` : '',
+          previous,
+          selector: shardable,
+          targetName,
+        });
+        previous = { projectName: pkg.projectName, targetName };
+      }
+      if (pin !== null) {
+        const targetName = cargoTestPackageTargetName(pkg.name, CARGO_TEST_EXCEPTIONS_SUFFIX);
+        pieces.push({
+          extra: '',
+          previous,
+          selector: `package(${pkg.name}) and (${pin})`,
+          targetName,
+        });
+        previous = { projectName: pkg.projectName, targetName };
+      }
+      packages.push({ package: pkg, pieces });
     }
-    packages.push({ package: pkg, pieces });
+    workspaces.push({ packages, rootProjectName: rootProject.name, projectRoot: rootProject.root });
   }
-  return { packages, rootProjectName: rootProject.name };
+  return workspaces;
 }
+
+/**
+ * One bounded target per crate; a crate that declares `smoothbricks.test.shards`
+ * gets one per shard plus one for the tests nextest.toml singles out.
+ *
+ * `--workspace -E 'package(X)'` rather than `--package X`. A filterset selects
+ * what RUNS; `--package` also re-resolves FEATURES for that crate alone, which
+ * fingerprints differently from the `cargo test --workspace --no-run` that
+ * `cargo-test-compile` already paid for, so cargo rebuilds the divergent half
+ * inside the bounded window. Measured on a hosted 3-core macOS runner that
+ * rebuild was 57.9s of a 120s budget — the tests were killed with 264 still to
+ * run while nothing was wrong with them. The two forms select the same tests;
+ * only the filterset reuses the compile target's artifacts.
+ *
+ * nextest.toml singles some tests out with an override, and each such class
+ * breaks a shard in its own way — a `test-group` is scoped to one nextest RUN
+ * so the hash would dissolve it, and a raised `slow-timeout` marks a test whose
+ * cost is not the suite's. Those are lifted OUT of the hash into one target and
+ * the shards run the exact complement, so which tests a shard holds stops
+ * depending on how the hash happened to fall.
+ *
+ * The two filtersets are exact complements, so their union is the crate whatever
+ * either one matches. Every piece uses `--no-tests=pass`: a valid workspace
+ * member may expose no nextest tests, a small suite can leave a declared hash
+ * shard empty, and platform-specific exceptions may not exist on this host.
+ * Manifest discovery proves the package exists and generates the selector from
+ * its Cargo name, so accepting an empty run cannot hide a misspelled package.
+ *
+ * The trade is explicit: a generated target cannot distinguish an intentionally
+ * test-less crate from one whose entire suite stopped matching, so both pass.
+ * Detecting that regression requires a separate coverage policy rather than
+ * making valid empty crates and shards fail execution.
+ *
+ * Pieces chain rather than fan out, like the crates do: cargo flocks one
+ * `target/`, and chaining keeps even the pinned group from overlapping the
+ * shards on a machine-wide resource.
+ */
 
 /**
  * Root mode keeps `--workspace` and adds `-p` only to make the owning crate
@@ -1523,25 +1582,38 @@ async function resolveRepoRootCargoWorkspace(
  * Never drop `--workspace`: `-p X` alone re-resolves features for one package
  * and defeats the compile target's shared artifacts.
  */
-async function addRepoRootCargoTestTargets(
+async function addCargoTestTargets(
   targets: Record<string, TargetConfiguration>,
   currentProjectName: string,
   projectRoot: string,
   workspaceRoot: string,
-  workspace: RepoRootCargoWorkspace,
+  workspace: CargoWorkspace,
 ): Promise<string[]> {
   const targetNames: string[] = [];
-  const configFile = nextestConfigRelPath(workspaceRoot, '.', PLUGIN_NEXTEST_CONFIG);
+  const configFile = nextestConfigRelPath(workspaceRoot, workspace.projectRoot, PLUGIN_NEXTEST_CONFIG);
   for (const plan of workspace.packages) {
     if (plan.package.projectRoot !== projectRoot) {
       continue;
     }
-    const inputs = await cargoPackageTestInputs({
-      workspaceRoot,
-      absoluteProjectRoot: workspaceRoot,
-      memberDir: plan.package.dir,
-      inputRoot: '{workspaceRoot}',
-    });
+    const inputRoot =
+      projectRoot === workspace.projectRoot ? '{projectRoot}' : posix.join('{workspaceRoot}', workspace.projectRoot);
+    // A workspace nextest build unifies features across every selected member.
+    // A sibling manifest can therefore change this crate's tests without being
+    // a path dependency. Track those manifests, not unrelated sibling sources.
+    const inputs: NonNullable<TargetConfiguration['inputs']> = [
+      ...new Set([
+        ...(await cargoPackageTestInputs({
+          workspaceRoot,
+          absoluteProjectRoot: join(workspaceRoot, workspace.projectRoot),
+          memberDir: plan.package.dir,
+          inputRoot,
+        })),
+        ...workspace.packages.map((member) => posix.join(inputRoot, member.package.dir, 'Cargo.toml')),
+      ]),
+      {
+        runtime: `bun -e 'console.log(new Bun.CryptoHasher("sha256").update(require("node:fs").readFileSync(process.argv[1])).digest("hex"))' '${PLUGIN_NEXTEST_CONFIG.replaceAll("'", "'\"'\"'")}'`,
+      },
+    ];
     for (const piece of plan.pieces) {
       targetNames.push(piece.targetName);
       targets[piece.targetName] = {
@@ -1551,11 +1623,18 @@ async function addRepoRootCargoTestTargets(
         dependsOn: [cargoTargetDependency(currentProjectName, piece.previous)],
         options: {
           command: cargoFrozen(
-            `nextest run --workspace -p ${plan.package.name} -E '${piece.selector}'${piece.extra} --no-tests=pass --user-config-file none --config-file ${configFile}`,
+            `nextest run --workspace${workspace.projectRoot === '.' ? ` -p ${plan.package.name}` : ''} -E '${piece.selector}'${piece.extra} --no-tests=pass --user-config-file none --config-file ${configFile}`,
           ),
-          cwd: '.',
+          cwd: workspace.projectRoot,
           timeoutMs: BOUNDED_TEST_TIMEOUT_MS,
           killAfterMs: BOUNDED_TEST_KILL_AFTER_MS,
+        },
+        configurations: {
+          production: {
+            command: cargoFrozen(
+              `nextest run --workspace${workspace.projectRoot === '.' ? ` -p ${plan.package.name}` : ''} --release -E '${piece.selector}'${piece.extra} --no-tests=pass --user-config-file none --config-file ${configFile}`,
+            ),
+          },
         },
       };
     }
