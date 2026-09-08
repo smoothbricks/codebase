@@ -17,12 +17,15 @@ export interface SyncBunLockfileVersionsOptions {
   mode?: 'install' | 'publish';
 }
 
-// Temporary Bun workaround. Delete once supported Bun versions stop leaving
-// workspace package versions stale in bun.lock after manifest bumps, and stop
-// resolving `workspace:*` from the lockfile during `bun pm pack`:
-// - https://github.com/oven-sh/bun/issues/18906
-// - https://github.com/oven-sh/bun/issues/20477
-// - https://github.com/oven-sh/bun/issues/20829
+// Pre-publish pack support: `bun pm pack` resolves `workspace:*` versions
+// from bun.lock, so packing a tree whose manifests carry unpublished
+// prereleases (post-release "prepare next") would embed uninstallable
+// -next dependency versions. Publish mode temporarily rewrites those lock
+// entries to the last stable tag — restored byte-exactly afterwards — so the
+// tarball embeds installable versions. (Supported Buns now keep lock entries
+// fresh on install — oven-sh/bun#18906, #20477, #20829 — so unlike the earlier
+// form of this workaround, nothing here repairs staleness; it serves only
+// the -next mapping.)
 //
 // Two modes, because one lockfile serves two jobs:
 //
