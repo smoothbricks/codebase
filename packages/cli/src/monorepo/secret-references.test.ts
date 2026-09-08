@@ -60,6 +60,31 @@ interface BootstrapOutcome {
   readonly error?: string;
 }
 
+/** Narrows a harness JSON envelope with `in` checks instead of assertions: unknown shapes fail the test. Field-level expectations below do the precise checking. */
+function isBootstrapOutcome(value: unknown): value is BootstrapOutcome {
+  if (typeof value !== 'object' || value === null) return false;
+  if ('resolved' in value && (typeof value.resolved !== 'object' || value.resolved === null)) return false;
+  if ('error' in value && typeof value.error !== 'string') return false;
+  return true;
+}
+function mustOutcome(stdout: string): BootstrapOutcome {
+  const value: unknown = JSON.parse(stdout);
+  if (!isBootstrapOutcome(value)) throw new Error(`bootstrap harness returned a malformed envelope: ${stdout}`);
+  return value;
+}
+
+function mustNames(stdout: string): string[] {
+  const value: unknown = JSON.parse(stdout);
+  if (typeof value !== 'object' || value === null || !('names' in value)) {
+    throw new Error(`bootstrap harness returned a malformed envelope: ${stdout}`);
+  }
+  const names: unknown = value.names;
+  if (!Array.isArray(names) || !names.every((entry: unknown): entry is string => typeof entry === 'string')) {
+    throw new Error(`bootstrap harness returned malformed names: ${stdout}`);
+  }
+  return names;
+}
+
 /**
  * Runs one script against the raw module in a plain Bun child. The child env
  * carries only PATH/HOME so parent suite state (CI, workspace tokens) cannot
@@ -95,7 +120,7 @@ async function resolveInBootstrap(options: {
   );
   expect(stderr).toBe('');
   expect(exitCode).toBe(0);
-  return JSON.parse(stdout) as BootstrapOutcome;
+  return mustOutcome(stdout);
 }
 
 /** Builds a fixture repository whose package.json and .npmrc are the resolver's real inputs. */
@@ -122,7 +147,7 @@ describe('smoo.secrets shape validation', () => {
   const parse = async (packageJson: unknown): Promise<BootstrapOutcome> => {
     const { stdout, exitCode } = await runInBootstrap(PARSE_SCRIPT, JSON.stringify(packageJson));
     expect(exitCode).toBe(0);
-    return JSON.parse(stdout) as BootstrapOutcome;
+    return mustOutcome(stdout);
   };
 
   it('returns an empty map when nothing is declared', async () => {
@@ -161,7 +186,7 @@ describe('registryAuthEnvNames', () => {
   const names = async (npmrc: string | null): Promise<string[]> => {
     const { stdout, exitCode } = await runInBootstrap(NPMRC_SCRIPT, JSON.stringify(npmrc));
     expect(exitCode).toBe(0);
-    return (JSON.parse(stdout) as { names: string[] }).names;
+    return mustNames(stdout);
   };
 
   it('collects ${VAR} references from .npmrc text', async () => {
