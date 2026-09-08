@@ -78,7 +78,7 @@ fn run_patch_split_bridge_spill_and_empty_preserve_witnesses() {
 #[test]
 fn short_ef_low_planes_patch_without_guard_padding() {
     let mut scratch = PatchScratch::new();
-    for n in [7u32, 15, 31, 63, 64] {
+    for n in [65u32, 64, 63, 31, 15, 7] {
         let stride = u32::MAX / (n + 1);
         let values: Vec<_> = (0..n).map(|i| 1 + i * stride + i % 3).collect();
         let owned = Bitmosaic::from_sorted(values.iter().copied());
@@ -105,6 +105,44 @@ fn short_ef_low_planes_patch_without_guard_padding() {
                 .range()
                 .collect::<Vec<_>>(),
             oracle.into_iter().collect::<Vec<_>>()
+        );
+    }
+}
+
+#[test]
+fn ef_zero_sample_boundaries_survive_a_shrinking_last_bucket() {
+    let mut scratch = PatchScratch::new();
+    let mut rng = Rng(0xEF_0064);
+    for zeros in [65u32, 64, 63] {
+        // Forty members with 24 low bits, then a gap before the last two
+        // buckets. Zero 0 follows one member; zero 64, when present, follows
+        // all forty. These are canonical sample positions, not encoder output.
+        let values: Vec<_> = (0..38)
+            .chain([zeros - 2, zeros - 1])
+            .map(|bucket| bucket << 24)
+            .collect();
+        let mut oracle: BTreeSet<_> = values.iter().copied().collect();
+        let mut slot = Bitmosaic::from_sorted(values.iter().copied()).to_bytes();
+        assert!(BitmosaicView::open_verified(&slot).unwrap().is_elias_fano());
+        let samples: &[u8] = if zeros == 65 {
+            &[1, 0, 0, 0, 104, 0, 0, 0]
+        } else {
+            &[1, 0, 0, 0]
+        };
+        assert_eq!(&slot[slot.len() - samples.len()..], samples);
+        slot.resize(slot.len() + 1024, 0xa5);
+        let last = values[39];
+        oracle.remove(&last);
+        let report = patch(&mut slot, &[], &[last], &mut scratch).unwrap();
+        assert_eq!((report.added, report.removed, report.len), (0, 1, 39));
+        let canonical = Bitmosaic::from_sorted(oracle.iter().copied()).to_bytes();
+        assert_eq!(&slot[..report.serialized_len], canonical);
+        check_reads(
+            "zero sample boundary",
+            zeros as usize,
+            &slot[..report.serialized_len],
+            &oracle,
+            &mut rng,
         );
     }
 }
@@ -514,8 +552,8 @@ fn a_single_member_moves_a_chunk_across_every_arm_boundary() {
         .expect("fits");
     let mut roll = Rng(7);
     let edits: [(&str, u32); 8] = [
-        ("array to words", 4_096 * 16 + 5),
-        ("words back to array", 4_096 * 16 + 5),
+        ("array to words", 5),
+        ("words back to array", 5),
         ("stride to words", 65_536 + 40_000),
         ("words back to stride", 65_536 + 40_000),
         ("stride keeps stride at its end", 131_072),
