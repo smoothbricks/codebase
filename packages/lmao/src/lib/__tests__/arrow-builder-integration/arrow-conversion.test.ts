@@ -508,7 +508,7 @@ describe('Arrow Table Conversion', () => {
 
       // Convert with statsToLog - now requires CapacityStatsEntry[] with both SpanBufferClass and metadata
       const statsToLog: CapacityStatsEntry[] = [{ bufferClass: SpanBufferClass, metadata }];
-      const table = convertSpanTreeToArrowTable(buffer, undefined, statsToLog);
+      const table = convertSpanTreeToArrowTable(buffer, statsToLog);
 
       // Should have span entries (2) + buffer metric entries (4) = 6 rows total
       expect(table.numRows).toBe(6);
@@ -552,7 +552,7 @@ describe('Arrow Table Conversion', () => {
 
       // Convert with statsToLog - now requires CapacityStatsEntry[] with both SpanBufferClass and metadata
       const statsToLog: CapacityStatsEntry[] = [{ bufferClass: SpanBufferClass, metadata }];
-      const table = convertSpanTreeToArrowTable(buffer, undefined, statsToLog);
+      const table = convertSpanTreeToArrowTable(buffer, statsToLog);
 
       // Should have only buffer metric entries (4 rows)
       expect(table.numRows).toBe(4);
@@ -635,7 +635,6 @@ describe('Arrow Table Conversion', () => {
         'package_file',
         'git_sha',
         'message',
-        'uint64_value',
         'value',
         'label',
       ]);

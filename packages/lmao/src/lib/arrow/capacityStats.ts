@@ -1,7 +1,6 @@
 import {
   bool,
   type Column,
-  dictionary,
   float64,
   type IntType,
   int8,
@@ -12,13 +11,12 @@ import {
   uint8,
   uint32,
   uint64,
-  utf8,
 } from '@uwdata/flechette';
 import { SYSTEM_SCHEMA_FIELD_NAMES } from '../schema/systemSchema.js';
 import { getSchemaType } from '../schema/typeGuards.js';
 import type { SpanBufferConstructor } from '../spanBuffer.js';
 import type { OpMetadata } from '../types.js';
-import { getArrowIndexTypeOr, makeArrowColumn } from './flechette.js';
+import { createUtf8DictionaryType, getArrowIndexTypeOr, makeArrowColumn } from './flechette.js';
 import { getArrowFieldName } from './utils.js';
 
 export interface CapacityStatsEntry {
@@ -136,22 +134,30 @@ export function createCapacityStatsTable(
 
   const cols: [string, Column<unknown>][] = [];
 
+  // One dictionary type/value-type pair per column: Flechette resolves IPC
+  // dictionary ids by instance identity of the value type.
   append(
     cols,
     'timestamp',
     makeArrowColumn({ type: timestamp(TimeUnit.NANOSECOND), length: totalRows, nullCount: 0, values: timestamps }),
   );
 
+  const traceIdDict = createUtf8DictionaryType(indexTypeForCount(traceIdStrings.length), false, 0);
+  const entryTypeDict = createUtf8DictionaryType(int8(), false, 1);
+  const packageNameDict = createUtf8DictionaryType(indexTypeForCount(packageNameStrings.length), false, 2);
+  const packageFileDict = createUtf8DictionaryType(indexTypeForCount(packageFileStrings.length), false, 3);
+  const gitShaDict = createUtf8DictionaryType(indexTypeForCount(gitShaStrings.length), false, 4);
+  const messageDict = createUtf8DictionaryType(indexTypeForCount(messageStrings.length), false, 5);
   append(
     cols,
     'trace_id',
     makeArrowColumn({
-      type: dictionary(utf8(), indexTypeForCount(traceIdStrings.length), false, 0),
+      type: traceIdDict.type,
       length: totalRows,
       nullCount: 0,
       values: traceIds,
       dictionary: makeArrowColumn({
-        type: utf8(),
+        type: traceIdDict.valueType,
         length: traceIdStrings.length,
         nullCount: 0,
         values: traceIdUtf8.data,
@@ -189,12 +195,12 @@ export function createCapacityStatsTable(
     cols,
     'entry_type',
     makeArrowColumn({
-      type: dictionary(utf8(), int8(), false, 1),
+      type: entryTypeDict.type,
       length: totalRows,
       nullCount: 0,
       values: entryTypes,
       dictionary: makeArrowColumn({
-        type: utf8(),
+        type: entryTypeDict.valueType,
         length: entryTypeStrings.length,
         nullCount: 0,
         values: entryTypeUtf8.data,
@@ -207,12 +213,12 @@ export function createCapacityStatsTable(
     cols,
     'package_name',
     makeArrowColumn({
-      type: dictionary(utf8(), indexTypeForCount(packageNameStrings.length), false, 2),
+      type: packageNameDict.type,
       length: totalRows,
       nullCount: 0,
       values: packageNames,
       dictionary: makeArrowColumn({
-        type: utf8(),
+        type: packageNameDict.valueType,
         length: packageNameStrings.length,
         nullCount: 0,
         values: packageNameUtf8.data,
@@ -224,12 +230,12 @@ export function createCapacityStatsTable(
     cols,
     'package_file',
     makeArrowColumn({
-      type: dictionary(utf8(), indexTypeForCount(packageFileStrings.length), false, 3),
+      type: packageFileDict.type,
       length: totalRows,
       nullCount: 0,
       values: packageFiles,
       dictionary: makeArrowColumn({
-        type: utf8(),
+        type: packageFileDict.valueType,
         length: packageFileStrings.length,
         nullCount: 0,
         values: packageFileUtf8.data,
@@ -241,12 +247,12 @@ export function createCapacityStatsTable(
     cols,
     'git_sha',
     makeArrowColumn({
-      type: dictionary(utf8(), indexTypeForCount(gitShaStrings.length), false, 4),
+      type: gitShaDict.type,
       length: totalRows,
       nullCount: 0,
       values: gitShas,
       dictionary: makeArrowColumn({
-        type: utf8(),
+        type: gitShaDict.valueType,
         length: gitShaStrings.length,
         nullCount: 0,
         values: gitShaUtf8.data,
@@ -258,12 +264,12 @@ export function createCapacityStatsTable(
     cols,
     'message',
     makeArrowColumn({
-      type: dictionary(utf8(), indexTypeForCount(messageStrings.length), false, 5),
+      type: messageDict.type,
       length: totalRows,
       nullCount: 0,
       values: messages,
       dictionary: makeArrowColumn({
-        type: utf8(),
+        type: messageDict.valueType,
         length: messageStrings.length,
         nullCount: 0,
         values: messageUtf8.data,
@@ -316,18 +322,18 @@ export function createCapacityStatsTable(
     if (lmaoType === 'enum') {
       idxType = getArrowIndexTypeOr(fieldSchema, uint8());
     }
-    const dictType = dictionary(utf8(), idxType);
+    const columnDict = createUtf8DictionaryType(idxType);
     append(
       cols,
       arrowFieldName,
       makeArrowColumn({
-        type: dictType,
+        type: columnDict.type,
         length: totalRows,
         nullCount: totalRows,
         values: new Uint8Array(totalRows),
         validity: new Uint8Array(Math.ceil(totalRows / 8)),
         dictionary: makeArrowColumn({
-          type: utf8(),
+          type: columnDict.valueType,
           length: 1,
           nullCount: 0,
           values: new Uint8Array(0),

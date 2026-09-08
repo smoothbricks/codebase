@@ -56,6 +56,37 @@ enveloping them would only add an allocation and a microtask while hiding the re
 Inline-function overloads always passed through verbatim; Op invocations now match them. Consumers that do not know the
 op is sync must still `await` — awaiting a plain Result is a no-op wrapper.
 
+### Result Ownership
+
+An `Ok` or `Err` returned by a span callback must be bound to that executing span's context. `ctx.ok(value)` and
+`ctx.err(error)` capture the existing context object as their writer state. The runtime compares that captured reference
+with the executing context before successful/error completion and before applying a transient result's retry policy.
+Root, synchronous child, asynchronous child, and transformer-generated span dispatch enforce the same rule.
+
+Returning an unbound result or one from a parent, sibling, completed child, or earlier invocation is a programmer error:
+the invocation throws/rejects with a `TypeError`, records `span-exception`, and still runs its end hook. This does not
+turn an ownership failure into an operational `Err`. Root inline callbacks retain their existing arbitrary-value return
+contract; when the returned value is an `Ok`/`Err`, ownership is checked regardless of its static annotation.
+
+```typescript
+const child = await ctx.span('lookup', lookupOp, key);
+if (!child.success) return ctx.err(child.error);
+return ctx.ok(child.value);
+```
+
+TypeScript preserves the value/error/schema types and sync/async return kind; it does **not** prove per-invocation
+identity. A generic phantom scope is not a fresh runtime identity, and a public generic constructor cannot prove who
+created a result. No ownership generic or cast bridge is required at call sites. `map`/`mapErr` retain the source
+context; successful `flatMap` returns its callback's result with that result's context.
+
+This is a completion-ownership invariant, not a linear lifetime or security boundary. Reusing a same-context result
+within that span (including its retry loop) is allowed. It does not revoke captured contexts, freeze payloads, or roll
+back fluent writes already made to the creating span. Low-level
+`new Ok(value, writerState)`/`new Err(error, writerState)` are bound to the supplied state; omitting that state creates
+a value result that cannot complete a traced invocation. The raw `writeSpanEnd(buffer, result)` storage helper does not
+execute callbacks or establish ownership; the execution envelopes perform that check while they still have the executing
+context.
+
 ## Context Hierarchy <a id="smoo/lmao!n/context-flow-hierarchy"></a>
 
 ```

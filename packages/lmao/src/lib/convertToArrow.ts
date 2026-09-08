@@ -9,6 +9,7 @@
  */
 
 import {
+  type ColumnEntry,
   clearBitRange,
   compareStrings,
   countNulls,
@@ -37,15 +38,17 @@ import {
   uint16,
   uint32,
   uint64,
-  utf8,
+  type utf8,
 } from '@uwdata/flechette';
 import { type CapacityStatsEntry, createCapacityStatsTable } from './arrow/capacityStats.js';
 import { buildSortedCategoryDictionary, buildTextDictionary } from './arrow/dictionaries.js';
 import {
+  createUtf8DictionaryType,
   type DictionaryColumnData,
   type GenericColumnData,
   makeArrowColumn,
   type Utf8ColumnData,
+  type Utf8DictionaryType,
 } from './arrow/flechette.js';
 import { type ArrowLease, createArrowLease } from './arrow/lease.js';
 import {
@@ -59,10 +62,15 @@ import {
 } from './arrow/utils.js';
 import {
   appendVocabularyDictionarySuffix,
+  ENTRY_TYPE_VALUE_TYPE,
   getVocabularyDictionaryPrefix,
   PREBUILT_ENTRY_TYPE_DICTIONARY,
 } from './arrow/vocabularyDictionary.js';
-import { type EnumLookupDescriptor, resolveEnumLookupDescriptor } from './enumMetadata.js';
+import {
+  type EnumLookupDescriptor,
+  resolveEnumLookupDescriptor,
+  type SchemaEnumLookupDescriptor,
+} from './enumMetadata.js';
 import type { RemapDescriptor } from './logBinding.js';
 import { resolveEntryType } from './resolveMessage.js';
 import {
@@ -87,12 +95,6 @@ type BuiltArrowColumn = { column: Column<unknown>; nullCount: number };
 type BuiltMetadataColumns = { fields: string[]; vectors: Column<unknown>[] };
 type BuiltMessageColumn = { column: Column<unknown>; entryTypeIndices?: Int8Array };
 type RemapsByBuffer = WeakMap<AnySpanBuffer, RemapDescriptor>;
-
-export type SystemColumnBuilder = (
-  buffer: AnySpanBuffer,
-  buffers: AnySpanBuffer[],
-  totalRows: number,
-) => BuiltMetadataColumns;
 
 const EMPTY_VALIDITY = new Uint8Array(0);
 const BINARY_TYPE = binary();
@@ -178,18 +180,80 @@ function buildTable(fields: string[], vectors: Column<unknown>[]): Table {
   return tableFromColumns(columns);
 }
 
+function nullValuesLike(sourceValues: unknown, length: number): ArrayBufferView {
+  if (sourceValues instanceof BigUint64Array) return new BigUint64Array(length);
+  if (sourceValues instanceof BigInt64Array) return new BigInt64Array(length);
+  if (sourceValues instanceof Float64Array) return new Float64Array(length);
+  if (sourceValues instanceof Float32Array) return new Float32Array(length);
+  if (sourceValues instanceof Uint32Array) return new Uint32Array(length);
+  if (sourceValues instanceof Uint16Array) return new Uint16Array(length);
+  if (sourceValues instanceof Uint8Array) return new Uint8Array(length);
+  if (sourceValues instanceof Int32Array) return new Int32Array(length);
+  if (sourceValues instanceof Int16Array) return new Int16Array(length);
+  if (sourceValues instanceof Int8Array) return new Int8Array(length);
+  throw new Error('Cannot synthesize a null Arrow batch for this column type');
+}
+
+function nullColumnLike(template: Column<unknown>, length: number): Column<unknown> {
+  if (length === 0) return new Column([]);
+  const source = template.data[0];
+  if (!source) {
+    throw new Error('Cannot synthesize a null Arrow batch from an empty column');
+  }
+  const sourceValues = source.values;
+  const packed =
+    sourceValues instanceof Uint8Array &&
+    sourceValues.length !== source.length &&
+    sourceValues.length === Math.ceil(source.length / 8);
+  const batch = new (batchType(template.type))({
+    type: template.type,
+    length,
+    nullCount: length,
+    validity: new Uint8Array(Math.ceil(length / 8)),
+    values: nullValuesLike(sourceValues, packed ? Math.ceil(length / 8) : length),
+  });
+  const dictionary = Reflect.get(source, 'dictionary');
+  const setDictionary = Reflect.get(batch, 'setDictionary');
+  if (dictionary instanceof Column && typeof setDictionary === 'function') {
+    Reflect.apply(setDictionary, batch, [dictionary]);
+  }
+  return new Column([batch]);
+}
+
 function appendTables(base: Table, extra: Table): Table {
+  const names: string[] = [];
+  const seen = new Set<string>();
+  for (const name of base.names) {
+    names.push(name);
+    seen.add(name);
+  }
+  for (const name of extra.names) {
+    if (!seen.has(name)) names.push(name);
+  }
   const columns: Record<string, Column<unknown>> = {};
-  for (let i = 0; i < base.numCols; i++) {
-    const name = base.names[i];
-    const left = base.getChildAt(i);
+  for (const name of names) {
+    const left = base.getChild(name);
     const right = extra.getChild(name);
-    if (!left || !right) {
+    if (left && right) {
+      columns[name] = new Column([...left.data, ...right.data]);
+    } else if (left) {
+      columns[name] = new Column([...left.data, ...nullColumnLike(left, extra.numRows).data]);
+    } else if (right) {
+      columns[name] = new Column([...nullColumnLike(right, base.numRows).data, ...right.data]);
+    } else {
       throw new Error(`Cannot append tables: missing column '${name}'`);
     }
-    columns[name] = new Column([...left.data, ...right.data]);
   }
   return tableFromColumns(columns);
+}
+
+function populatedSystemSchemaFields(buffers: AnySpanBuffer[], schema: LogSchema): readonly ColumnEntry[] {
+  return schema._columns.filter(
+    ([fieldName]) =>
+      fieldName !== 'message' &&
+      SYSTEM_SCHEMA_FIELD_NAMES.has(fieldName) &&
+      buffers.some((buffer) => buffer.getColumnIfAllocated(fieldName) !== undefined),
+  );
 }
 
 function resolveColumnName(buffer: AnySpanBuffer, outputName: string, remaps: RemapsByBuffer): string {
@@ -398,7 +462,7 @@ function buildMessageColumn(
     const encoded = globalUtf8Cache.encodeMany(suffixValues);
     const suffix = buildColumn(
       buildData({
-        type: utf8(),
+        type: prefix.valueType,
         offset: 0,
         length: suffixValues.length,
         nullCount: 0,
@@ -413,7 +477,9 @@ function buildMessageColumn(
     column: buildColumn(
       buildData({
         type:
-          dictionaryId === undefined ? dictionary(utf8(), uint32()) : dictionary(utf8(), uint32(), false, dictionaryId),
+          dictionaryId === undefined
+            ? dictionary(prefix.valueType, uint32())
+            : dictionary(prefix.valueType, uint32(), false, dictionaryId),
         offset: 0,
         length: totalRows,
         nullCount,
@@ -572,7 +638,7 @@ function buildEntryTypeColumn(
   classifiedEntryTypes?: Int8Array,
 ): void {
   const entryTypeDictionary = PREBUILT_ENTRY_TYPE_DICTIONARY;
-  const type = dictType ?? dictionary(utf8(), int8());
+  const type = dictType ?? dictionary(ENTRY_TYPE_VALUE_TYPE, int8());
   fields.push('entry_type');
   if (canBorrowEntryTypeChunks(buffers, borrowChunks)) {
     const chunks = buffers.map((buffer) => {
@@ -625,7 +691,7 @@ function buildPerBufferDictColumn(
   totalRows: number,
   fieldName: string,
   metadataGetter: (m: OpMetadata) => string,
-  dictType: ReturnType<typeof dictionary>,
+  dict: Utf8DictionaryType,
   dictValues: string[],
   dictMap: Map<string, number>,
   dictUtf8Offsets: Int32Array,
@@ -651,14 +717,14 @@ function buildPerBufferDictColumn(
   vectors.push(
     buildColumn(
       buildData({
-        type: dictType,
+        type: dict.type,
         offset: 0,
         length: totalRows,
         nullCount: 0,
         data: indices,
         dictionary: buildColumn(
           buildData({
-            type: utf8(),
+            type: dict.valueType,
             offset: 0,
             length: dictValues.length,
             nullCount: 0,
@@ -772,18 +838,14 @@ function buildBinaryColumnFromBuffers(
  * Dictionaries are built from the data in this batch only and are not shared
  * with other batches, even when combined into a Table.
  */
-export function convertToTable(
-  buffer: AnySpanBuffer,
-  systemColumnBuilder?: SystemColumnBuilder,
-  borrowChunks = false,
-): Table {
+export function convertToTable(buffer: AnySpanBuffer, borrowChunks = false): Table {
   const buffers: AnySpanBuffer[] = [];
   let currentBuffer: AnySpanBuffer | undefined = buffer;
   while (currentBuffer) {
     buffers.push(currentBuffer);
     currentBuffer = currentBuffer._overflow;
   }
-  return convertBuffersToTable(buffers, systemColumnBuilder, borrowChunks);
+  return convertBuffersToTable(buffers, borrowChunks);
 }
 
 /**
@@ -793,11 +855,7 @@ export function convertToTable(
  * Dictionaries are built from the data in this batch only and are not shared
  * with other batches, even when combined into a Table.
  */
-function convertBuffersToTable(
-  buffers: AnySpanBuffer[],
-  systemColumnBuilder?: SystemColumnBuilder,
-  borrowChunks = false,
-): Table {
+function convertBuffersToTable(buffers: AnySpanBuffer[], borrowChunks = false): Table {
   if (buffers.length === 0) return tableFromColumns({});
 
   const totalRows = buffers.reduce((sum, buf) => sum + buf._writeIndex, 0);
@@ -811,34 +869,58 @@ function convertBuffersToTable(
   const fields: string[] = [];
   const vectors: Column<unknown>[] = [];
 
-  if (systemColumnBuilder) {
-    const systemColumns = systemColumnBuilder(buffers[0], buffers, totalRows);
-    fields.push(...systemColumns.fields);
-    vectors.push(...systemColumns.vectors);
-  } else {
-    const borrowEntryTypes = canBorrowEntryTypeChunks(buffers, borrowChunks);
-    const messageResult = buildMessageColumn(buffers, totalRows, undefined, !borrowEntryTypes);
-    // Build metadata columns - returns both fields and vectors with matching types.
-    const metadataResult = buildMetadataColumnsWithFields(
-      buffers,
-      totalRows,
-      borrowChunks,
-      messageResult.entryTypeIndices,
-    );
-    fields.push(...metadataResult.fields);
-    vectors.push(...metadataResult.vectors);
+  const borrowEntryTypes = canBorrowEntryTypeChunks(buffers, borrowChunks);
+  const messageResult = buildMessageColumn(buffers, totalRows, undefined, !borrowEntryTypes);
+  // Build metadata columns - returns both fields and vectors with matching types.
+  const metadataResult = buildMetadataColumnsWithFields(
+    buffers,
+    totalRows,
+    borrowChunks,
+    messageResult.entryTypeIndices,
+  );
+  fields.push(...metadataResult.fields);
+  vectors.push(...metadataResult.vectors);
 
-    // Static vocabulary values form an immutable prefix. Only raw messages
-    // missing from that prefix are interned into a first-seen suffix.
-    fields.push('message');
-    vectors.push(messageResult.column);
-  }
+  // Static vocabulary values form an immutable prefix. Only raw messages
+  // missing from that prefix are interned into a first-seen suffix.
+  fields.push('message');
+  vectors.push(messageResult.column);
 
-  // Build user attribute vectors
-  // Skip system schema fields - they are handled separately as system columns
-  // (message is handled above, line/error_code/exception_stack/ff_value/uint64_value below)
+  // Build user attribute vectors from the merged schema's user fields.
   const userSchemaFields = schema._columns.filter(([fieldName]) => !SYSTEM_SCHEMA_FIELD_NAMES.has(fieldName));
-  for (const [fieldName, fieldSchema] of userSchemaFields) {
+  appendSchemaFieldColumns(buffers, totalRows, userSchemaFields, fields, vectors, enumLookup, borrowChunks);
+
+  // Populated system attribute columns, derived from the same maintained schema
+  // definitions (SSoT) — never a hand-maintained field list. `message` is
+  // emitted above; unpopulated lazy lanes stay absent instead of materializing
+  // empty columns.
+  appendSchemaFieldColumns(
+    buffers,
+    totalRows,
+    populatedSystemSchemaFields(buffers, schema),
+    fields,
+    vectors,
+    enumLookup,
+    borrowChunks,
+  );
+
+  return buildTable(fields, vectors);
+}
+
+/**
+ * Append Arrow columns for schema fields shared by user and system schema
+ * entries: enum, category, text, number, bigUint64, boolean, and binary.
+ */
+function appendSchemaFieldColumns(
+  buffers: AnySpanBuffer[],
+  totalRows: number,
+  schemaFields: readonly ColumnEntry[],
+  fields: string[],
+  vectors: Column<unknown>[],
+  enumLookup: SchemaEnumLookupDescriptor,
+  borrowChunks: boolean,
+): void {
+  for (const [fieldName, fieldSchema] of schemaFields) {
     const lmaoType = getSchemaType(fieldSchema);
     const arrowFieldName = getArrowFieldName(fieldName);
     const columnName = fieldName; // User columns have no prefix
@@ -884,12 +966,13 @@ function convertBuffersToTable(
 
       const { nullBitmap, nullCount } = concatenateNullBitmaps(buffers, columnName);
 
-      // CRITICAL: Create ONE Dictionary type instance for field and batch data
-      const enumDictType = dictionary(utf8(), arrowIndexType);
+      // One dictionary type/value-type pair per column: Flechette resolves
+      // IPC dictionary ids by instance identity of the value type.
+      const enumDict = createUtf8DictionaryType(arrowIndexType);
       fields.push(arrowFieldName);
 
       const enumDictData = buildData({
-        type: utf8(),
+        type: enumDict.valueType,
         offset: 0,
         length: enumValues.length,
         nullCount: 0,
@@ -898,7 +981,7 @@ function convertBuffersToTable(
       });
 
       const enumData = buildData({
-        type: enumDictType,
+        type: enumDict.type,
         offset: 0,
         length: totalRows,
         nullCount,
@@ -919,14 +1002,15 @@ function convertBuffersToTable(
         nullCount,
       } = buildSortedCategoryDictionary(buffers, columnName, maskTransform);
 
-      // CRITICAL: Create ONE Dictionary type instance for field and batch data
-      const categoryDictType = dictionary(utf8(), arrowIndexType);
+      // One dictionary type/value-type pair per column: Flechette resolves
+      // IPC dictionary ids by instance identity of the value type.
+      const categoryDict = createUtf8DictionaryType(arrowIndexType);
       fields.push(arrowFieldName);
 
       const { data: categoryUtf8Data, offsets: categoryUtf8Offsets } = globalUtf8Cache.encodeMany(dictValues);
 
       const categoryDictData = buildData({
-        type: utf8(),
+        type: categoryDict.valueType,
         offset: 0,
         length: dictValues.length,
         nullCount: 0,
@@ -935,7 +1019,7 @@ function convertBuffersToTable(
       });
 
       const categoryData = buildData({
-        type: categoryDictType,
+        type: categoryDict.type,
         offset: 0,
         length: totalRows,
         nullCount,
@@ -952,14 +1036,15 @@ function convertBuffersToTable(
       if (result) {
         const { dictionary: dictValues, indices, arrowIndexType, nullBitmap, nullCount } = result;
 
-        // CRITICAL: Create ONE Dictionary type instance for field and batch data
-        const textDictType = dictionary(utf8(), arrowIndexType);
+        // One dictionary type/value-type pair per column: Flechette resolves
+        // IPC dictionary ids by instance identity of the value type.
+        const textDict = createUtf8DictionaryType(arrowIndexType);
         fields.push(arrowFieldName);
 
         const { data: textUtf8Data, offsets: textUtf8Offsets } = globalUtf8Cache.encodeMany(dictValues);
 
         const textDictData = buildData({
-          type: utf8(),
+          type: textDict.valueType,
           offset: 0,
           length: dictValues.length,
           nullCount: 0,
@@ -968,7 +1053,7 @@ function convertBuffersToTable(
         });
 
         const textData = buildData({
-          type: textDictType,
+          type: textDict.type,
           offset: 0,
           length: totalRows,
           nullCount,
@@ -1056,6 +1141,30 @@ function convertBuffersToTable(
       });
 
       vectors.push(buildColumn(boolData));
+    } else if (lmaoType === 'bigUint64') {
+      fields.push(arrowFieldName);
+      const allValues = new BigUint64Array(totalRows);
+      let offset = 0;
+      for (const buf of buffers) {
+        const column = buf.getColumnIfAllocated(columnName);
+        if (column instanceof BigUint64Array) {
+          allValues.set(column.subarray(0, buf._writeIndex), offset);
+        }
+        offset += buf._writeIndex;
+      }
+      const { nullBitmap, nullCount } = concatenateNullBitmaps(buffers, columnName);
+      vectors.push(
+        buildColumn(
+          buildData({
+            type: uint64(),
+            offset: 0,
+            length: totalRows,
+            nullCount,
+            data: allValues,
+            nullBitmap,
+          }),
+        ),
+      );
     } else if (lmaoType === 'binary') {
       // Binary columns: raw Uint8Array or encoder-wrapped values (e.g. msgpack)
       const { column } = buildBinaryColumnFromBuffers(buffers, columnName, totalRows, fieldSchema);
@@ -1063,8 +1172,6 @@ function convertBuffersToTable(
       vectors.push(column);
     }
   }
-
-  return buildTable(fields, vectors);
 }
 
 /**
@@ -1107,19 +1214,19 @@ function buildMetadataColumnsWithFields(
     traceIdIndices.fill(traceIdIndex, rowOffset, rowOffset + buf._writeIndex);
     rowOffset += buf._writeIndex;
   }
-  const traceIdDictType = dictionary(utf8(), traceIdArrowIndexType);
+  const traceIdDict = createUtf8DictionaryType(traceIdArrowIndexType);
   fields.push('trace_id');
   vectors.push(
     buildColumn(
       buildData({
-        type: traceIdDictType,
+        type: traceIdDict.type,
         offset: 0,
         length: totalRows,
         nullCount: 0,
         data: traceIdIndices,
         dictionary: buildColumn(
           buildData({
-            type: utf8(),
+            type: traceIdDict.valueType,
             offset: 0,
             length: traceIdArray.length,
             nullCount: 0,
@@ -1151,14 +1258,14 @@ function buildMetadataColumnsWithFields(
     const dictValues = Array.from(valueSet);
     const dictMap = new Map(dictValues.map((v, i) => [v, i]));
     const arrowIndexType = indexTypeForCount(dictValues.length);
-    const dictType = dictionary(utf8(), arrowIndexType);
+    const dict = createUtf8DictionaryType(arrowIndexType);
 
     buildPerBufferDictColumn(
       buffers,
       totalRows,
       fieldName,
       metadataGetter,
-      dictType,
+      dict,
       dictValues,
       dictMap,
       calculateUtf8Offsets(dictValues),
@@ -1219,20 +1326,14 @@ function createLeasedConversion(
 /**
  * Convert SpanBuffer (and its overflow chain) to Arrow Table
  */
-export function convertToArrowTable<_T extends LogSchema = LogSchema>(
-  buffer: AnySpanBuffer,
-  systemColumnBuilder?: SystemColumnBuilder,
-): Table {
-  const batch = convertToTable(buffer, systemColumnBuilder);
+export function convertToArrowTable<_T extends LogSchema = LogSchema>(buffer: AnySpanBuffer): Table {
+  const batch = convertToTable(buffer);
   if (batch.numRows === 0) return tableFromColumns({});
   return batch;
 }
 
 /** Borrow JS physical Arrow chunks until the returned lease is released. */
-export function convertToLeasedArrowTable(
-  buffer: AnySpanBuffer,
-  systemColumnBuilder?: SystemColumnBuilder,
-): ArrowLease {
+export function convertToLeasedArrowTable(buffer: AnySpanBuffer): ArrowLease {
   const buffers: AnySpanBuffer[] = [];
   let segment: AnySpanBuffer | undefined = buffer;
   while (segment) {
@@ -1240,7 +1341,7 @@ export function convertToLeasedArrowTable(
     segment = segment._overflow;
   }
   return createLeasedConversion(buffer, buffers, (borrowChunks) => {
-    const table = convertToTable(buffer, systemColumnBuilder, borrowChunks);
+    const table = convertToTable(buffer, borrowChunks);
     return table.numRows === 0 ? tableFromColumns({}) : table;
   });
 }
@@ -1258,7 +1359,6 @@ export function convertToLeasedArrowTable(
  */
 export function convertSpanTreeToArrowTable(
   rootBuffer: AnySpanBuffer,
-  _systemColumnBuilder?: SystemColumnBuilder,
   modulesToLogStats?: CapacityStatsEntry[],
   periodStartNs?: bigint,
   borrowChunks = false,
@@ -1510,7 +1610,6 @@ export function convertSpanTreeToArrowTable(
 /** Convert a logical trace tree while pinning every borrowed physical chunk. */
 export function convertSpanTreeToLeasedArrowTable(
   rootBuffer: AnySpanBuffer,
-  systemColumnBuilder?: SystemColumnBuilder,
   modulesToLogStats?: CapacityStatsEntry[],
   periodStartNs?: bigint,
 ): ArrowLease {
@@ -1519,7 +1618,7 @@ export function convertSpanTreeToLeasedArrowTable(
     if (buffer._writeIndex > 0) buffers.push(buffer);
   });
   return createLeasedConversion(rootBuffer, buffers, (borrowChunks) =>
-    convertSpanTreeToArrowTable(rootBuffer, systemColumnBuilder, modulesToLogStats, periodStartNs, borrowChunks),
+    convertSpanTreeToArrowTable(rootBuffer, modulesToLogStats, periodStartNs, borrowChunks),
   );
 }
 
@@ -1553,11 +1652,11 @@ function convertBuffersWithSharedDicts(
   const messageResult = buildMessageColumn(buffers, totalRows, 5, !borrowEntryTypes);
 
   // Dictionary types with explicit IDs for IPC serialization
-  const traceIdType = dictionary(utf8(), traceIdDict.arrowIndexType, false, 0);
-  const entryTypeDictType = dictionary(utf8(), int8(), false, 1);
-  const packageType = dictionary(utf8(), packageDict.arrowIndexType, false, 2);
-  const packagePathType = dictionary(utf8(), packagePathDict.arrowIndexType, false, 3);
-  const gitShaType = dictionary(utf8(), gitShaDict.arrowIndexType, false, 4);
+  const traceIdType = createUtf8DictionaryType(traceIdDict.arrowIndexType, false, 0);
+  const entryTypeDictType = dictionary(ENTRY_TYPE_VALUE_TYPE, int8(), false, 1);
+  const packageType = createUtf8DictionaryType(packageDict.arrowIndexType, false, 2);
+  const packagePathType = createUtf8DictionaryType(packagePathDict.arrowIndexType, false, 3);
+  const gitShaType = createUtf8DictionaryType(gitShaDict.arrowIndexType, false, 4);
 
   // Column order: timestamp, trace_id, thread_id, span_id, parent_thread_id, parent_span_id,
   //               entry_type, package_name, package_file, git_sha
@@ -1577,14 +1676,14 @@ function convertBuffersWithSharedDicts(
   vectors.push(
     buildColumn(
       buildData({
-        type: traceIdType,
+        type: traceIdType.type,
         offset: 0,
         length: totalRows,
         nullCount: 0,
         data: traceIdIndices,
         dictionary: buildColumn(
           buildData({
-            type: utf8(),
+            type: traceIdType.valueType,
             offset: 0,
             length: traceIdDict.indexMap.size,
             nullCount: 0,
@@ -1614,18 +1713,18 @@ function convertBuffersWithSharedDicts(
   // Per specs/lmao/01c_context_flow_and_op_wrappers.md:
   // - Row 0 (span-start): uses callsiteModule for gitSha/packageName/packagePath
   // - Rows 1+ (logs, span-end): uses task._module
-  for (const [fieldName, metadataGetter, dictType, dict] of [
+  for (const [fieldName, metadataGetter, dictPair, dict] of [
     ['package_name', (m: OpMetadata) => m.package_name, packageType, packageDict],
     ['package_file', (m: OpMetadata) => m.package_file, packagePathType, packagePathDict],
     ['git_sha', (m: OpMetadata) => m.git_sha, gitShaType, gitShaDict],
-  ] as [string, (m: OpMetadata) => string, ReturnType<typeof dictionary>, FinalizedDictionary][]) {
+  ] as [string, (m: OpMetadata) => string, Utf8DictionaryType, FinalizedDictionary][]) {
     const dictValues = Array.from(dict.indexMap.keys());
     buildPerBufferDictColumn(
       buffers,
       totalRows,
       fieldName,
       metadataGetter,
-      dictType,
+      dictPair,
       dictValues,
       dict.indexMap,
       dict.offsets,
@@ -1643,24 +1742,8 @@ function convertBuffersWithSharedDicts(
   vectors.push(messageResult.column);
   fields.push('message');
 
-  // System attribute column: uint64_value (for buffer metrics - op durations, counts, etc.)
-  // For span data, this is all null - only buffer metrics use it
-  const uint64ValueNullBitmap = new Uint8Array(Math.ceil(totalRows / 8));
-  // All zeros = all null (Arrow null bitmap: 1 = valid, 0 = null)
-  vectors.push(
-    buildColumn(
-      buildData({
-        type: uint64(),
-        offset: 0,
-        length: totalRows,
-        nullCount: totalRows,
-        data: new BigUint64Array(totalRows),
-        nullBitmap: uint64ValueNullBitmap,
-      }),
-    ),
-  );
-  fields.push('uint64_value');
-
+  // User attributes first, then populated system lanes from the same SSoT as
+  // convertBuffersToTable. Unpopulated lazy lanes stay absent.
   for (const [fieldName, fieldSchema] of schemaFields) {
     const lmaoType = getSchemaType(fieldSchema);
     const columnName = fieldName; // User columns have no prefix
@@ -1718,11 +1801,12 @@ function convertBuffersWithSharedDicts(
         }
         rowOffset += buf._writeIndex;
       }
+      const columnDict = createUtf8DictionaryType(dict.arrowIndexType);
 
       vectors.push(
         buildColumn(
           buildData({
-            type: dictionary(utf8(), dict.arrowIndexType),
+            type: columnDict.type,
             offset: 0,
             length: totalRows,
             nullCount,
@@ -1730,7 +1814,7 @@ function convertBuffersWithSharedDicts(
             nullBitmap: nullCount > 0 ? nullBitmap : undefined,
             dictionary: buildColumn(
               buildData({
-                type: utf8(),
+                type: columnDict.valueType,
                 offset: 0,
                 length: dict.indexMap.size,
                 nullCount: 0,
@@ -1793,11 +1877,12 @@ function convertBuffersWithSharedDicts(
         }
         rowOffset += buf._writeIndex;
       }
+      const columnDict = createUtf8DictionaryType(dict.arrowIndexType);
 
       vectors.push(
         buildColumn(
           buildData({
-            type: dictionary(utf8(), dict.arrowIndexType),
+            type: columnDict.type,
             offset: 0,
             length: totalRows,
             nullCount,
@@ -1805,7 +1890,7 @@ function convertBuffersWithSharedDicts(
             nullBitmap: nullCount > 0 ? nullBitmap : undefined,
             dictionary: buildColumn(
               buildData({
-                type: utf8(),
+                type: columnDict.valueType,
                 offset: 0,
                 length: dict.indexMap.size,
                 nullCount: 0,
@@ -2063,8 +2148,9 @@ function convertBuffersWithSharedDicts(
         rowOffset += buf._writeIndex;
       }
 
+      const enumDict = createUtf8DictionaryType(arrowIndexType);
       const enumDictData = buildData({
-        type: utf8(),
+        type: enumDict.valueType,
         offset: 0,
         length: enumValues.length,
         nullCount: 0,
@@ -2075,7 +2161,7 @@ function convertBuffersWithSharedDicts(
       vectors.push(
         buildColumn(
           buildData({
-            type: dictionary(utf8(), arrowIndexType),
+            type: enumDict.type,
             offset: 0,
             length: totalRows,
             nullCount,
@@ -2094,6 +2180,17 @@ function convertBuffersWithSharedDicts(
       vectors.push(column);
     }
   }
+
+  const schema: LogSchema = buffers[0]._logSchema;
+  appendSchemaFieldColumns(
+    buffers,
+    totalRows,
+    populatedSystemSchemaFields(buffers, schema),
+    fields,
+    vectors,
+    resolveEnumLookupDescriptor(schema),
+    borrowChunks,
+  );
 
   return buildTable(fields, vectors);
 }

@@ -312,7 +312,8 @@ describe('Child Span Lifecycle', () => {
         return childCtx.ok('child success');
       });
 
-      return childResult;
+      if (!childResult.success) return ctx.err(childResult.error);
+      return ctx.ok(childResult.value);
     });
 
     expect(result.success).toBe(true);
@@ -387,7 +388,8 @@ describe('Child Span Lifecycle', () => {
         return childCtx.ok('child-done');
       });
 
-      return childResult;
+      if (!childResult.success) return ctx.err(childResult.error);
+      return ctx.ok(childResult.value);
     });
 
     expect(result.success).toBe(true);

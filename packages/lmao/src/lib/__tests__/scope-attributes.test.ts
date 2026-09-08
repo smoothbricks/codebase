@@ -201,7 +201,8 @@ describe('Span Scope Attributes', () => {
           return childCtx.ok('child-done');
         });
 
-        return childResult;
+        if (!childResult.success) return ctx.err(childResult.error);
+        return ctx.ok(childResult.value);
       });
 
       const { trace } = new TestTracer(ctx, { ...createTestTracerOptions() });

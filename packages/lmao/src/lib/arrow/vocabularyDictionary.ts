@@ -1,7 +1,7 @@
 import { Column, utf8 } from '@uwdata/flechette';
 import { ENTRY_TYPE_NAMES } from '../schema/systemSchema.js';
 import type { VocabularyGeneration } from '../vocabularyRegistry.js';
-import { makeArrowColumn } from './flechette.js';
+import { makeArrowColumn, type Utf8Type } from './flechette.js';
 
 const ENTRY_TYPE_UTF8 = new TextEncoder().encode(ENTRY_TYPE_NAMES.join(''));
 const ENTRY_TYPE_OFFSETS = new Int32Array(ENTRY_TYPE_NAMES.length + 1);
@@ -11,9 +11,14 @@ for (let index = 0, offset = 0; index < ENTRY_TYPE_NAMES.length; index++) {
   ENTRY_TYPE_OFFSETS[index + 1] = offset;
 }
 
-function makeUtf8Dictionary(length: number, offsets: Int32Array, values: Uint8Array): Column<unknown> {
+function makeUtf8Dictionary(
+  valueType: Utf8Type,
+  length: number,
+  offsets: Int32Array,
+  values: Uint8Array,
+): Column<unknown> {
   return makeArrowColumn({
-    type: utf8(),
+    type: valueType,
     length,
     nullCount: 0,
     offsets,
@@ -25,8 +30,18 @@ const EMPTY_DICTIONARY_BYTES = new Uint8Array(0);
 const EMPTY_DICTIONARY_OFFSETS = new Int32Array([0, 0]);
 const decoder = new TextDecoder('utf-8', { fatal: true });
 
+/**
+ * Value-type instances backing the prebuilt entry-type and per-generation
+ * message dictionary columns. Flechette resolves IPC dictionary ids by
+ * instance identity, so conversion sites must pair columns with these exact
+ * instances; one instance per column keeps their ids distinct.
+ */
+export const ENTRY_TYPE_VALUE_TYPE = utf8();
+const MESSAGE_PREFIX_VALUE_TYPE = utf8();
+
 export interface VocabularyDictionaryPrefix {
   readonly column: Column<unknown>;
+  readonly valueType: Utf8Type;
   readonly length: number;
   readonly valueToDenseIndex: ReadonlyMap<string, number>;
 }
@@ -44,9 +59,10 @@ export function getVocabularyDictionaryPrefix(generation: VocabularyGeneration):
 
   if (generation.ids.length === 0) {
     const emptyPrefix = Object.freeze({
-      column: makeUtf8Dictionary(1, EMPTY_DICTIONARY_OFFSETS, EMPTY_DICTIONARY_BYTES),
+      column: makeUtf8Dictionary(MESSAGE_PREFIX_VALUE_TYPE, 1, EMPTY_DICTIONARY_OFFSETS, EMPTY_DICTIONARY_BYTES),
+      valueType: MESSAGE_PREFIX_VALUE_TYPE,
       length: 1,
-      valueToDenseIndex: new Map<string, number>([['', 0]]),
+      valueToDenseIndex: new Map(Object.entries({ '': 0 })),
     });
     emptyPrefix.column.cache();
     vocabularyDictionaries.set(generation, emptyPrefix);
@@ -80,7 +96,8 @@ export function getVocabularyDictionaryPrefix(generation: VocabularyGeneration):
   }
 
   const prefix = Object.freeze({
-    column: makeUtf8Dictionary(count, offsets, values),
+    column: makeUtf8Dictionary(MESSAGE_PREFIX_VALUE_TYPE, count, offsets, values),
+    valueType: MESSAGE_PREFIX_VALUE_TYPE,
     length: count,
     valueToDenseIndex,
   });
@@ -117,6 +134,7 @@ export function appendVocabularyDictionarySuffix(
 }
 
 export const PREBUILT_ENTRY_TYPE_DICTIONARY = makeUtf8Dictionary(
+  ENTRY_TYPE_VALUE_TYPE,
   ENTRY_TYPE_NAMES.length,
   ENTRY_TYPE_OFFSETS,
   ENTRY_TYPE_UTF8,
