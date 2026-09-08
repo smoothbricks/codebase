@@ -79,16 +79,32 @@ try {
   // Do not import workspace packages here — this script is what installs them,
   // and package resolution/Typia transforms are not available yet.
   if (process.env.CI) {
-    try {
-      await runSetupCommand('bun install --frozen-lockfile', $`bun install --frozen-lockfile`, { quiet: false });
-    } catch (error) {
-      console.error('! Failed to install dependencies with frozen lockfile');
-      replayCapturedOutput(error);
+    // Concurrent devenv activations share one node_modules, so the CI
+    // installs race exactly like local ones (EEXIST link failures under
+    // parallel shells). Serialize them under the same setup lock. Nothing
+    // that exits the process may run inside the callback: process.exit
+    // skips the finally that releases the lock and strands it, so failures
+    // are captured inside and reported outside.
+    let frozenError: unknown;
+    let fallbackError: unknown;
+    await withSetupLock(async () => {
       try {
-        await runSetupCommand('bun install', $`bun install`, { quiet: false });
-      } catch (fallbackError) {
-        reportSetupFailure(fallbackError);
+        await runSetupCommand('bun install --frozen-lockfile', $`bun install --frozen-lockfile`, { quiet: false });
+      } catch (error) {
+        frozenError = error;
+        console.error('! Failed to install dependencies with frozen lockfile');
+        replayCapturedOutput(error);
+        try {
+          await runSetupCommand('bun install', $`bun install`, { quiet: false });
+        } catch (fallback) {
+          fallbackError = fallback;
+        }
       }
+    });
+    if (fallbackError !== undefined) {
+      reportSetupFailure(fallbackError);
+    }
+    if (frozenError !== undefined) {
       console.error('git diff after install:');
       try {
         await runSetupCommand('git diff', $`git diff`, { quiet: false });
