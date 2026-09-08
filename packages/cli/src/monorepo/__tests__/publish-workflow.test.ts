@@ -1008,28 +1008,88 @@ it('refuses malformed sibling checkout declarations at render time', () => {
   ).toThrow('secret env name');
 });
 
-it('linux publish jobs use smoo.github.runsOn; macOS stays macos-latest', () => {
+it('builds on smoo.github.runsOn but publishes from the GitHub-hosted runner', () => {
   const rendered = renderPublishWorkflowYaml({
     repoName: '@smoothbricks/codebase',
     platformTargetGlobs: PLATFORM_TARGET_GLOBS,
     runsOn: [...nixosRunsOn],
   });
-  expect(rendered).toContain(
-    `runs-on:
+  const selfHostedRunner = `runs-on:
       \${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) &&
-      fromJSON('["nixos-latest-x64","self-hosted"]') || 'ubuntu-latest' }}`,
-  );
+      fromJSON('["nixos-latest-x64","self-hosted"]') || 'ubuntu-latest' }}`;
+
+  expect(rendered).toContain(`  linux-release-candidate:\n    ${selfHostedRunner}`);
   expect(rendered).toContain('  macos-platform:\n    runs-on: macos-latest');
-  // Both Linux jobs use the configured self-hosted labels.
-  expect(rendered.split('fromJSON(\'["nixos-latest-x64","self-hosted"]\')').length - 1).toBe(2);
-  expect(rendered).not.toContain('  linux-release-candidate:\n    runs-on: ubuntu-latest');
-  const publishOnLinux = rendered.slice(rendered.indexOf('  publish-on-linux:'));
-  expect(publishOnLinux).not.toContain('runs-on: ubuntu-latest');
+  // npmjs signs provenance with the job's OIDC token and then rejects the
+  // upload (422) unless the runner is GitHub-hosted, so only the build lane
+  // may keep the configured labels.
+  expect(rendered.split('fromJSON(\'["nixos-latest-x64","self-hosted"]\')').length - 1).toBe(1);
   expect(rendered).toContain(
-    `  publish-on-linux:\n    needs: [linux-release-candidate, macos-platform]\n    runs-on:
-      \${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) &&
-      fromJSON('["nixos-latest-x64","self-hosted"]') || 'ubuntu-latest' }}`,
+    '  publish-on-linux:\n    needs: [linux-release-candidate, macos-platform]\n    runs-on: ubuntu-latest',
   );
+  // The runner moved; the OIDC permission that mints provenance did not.
+  expect(rendered.slice(rendered.indexOf('  publish-on-linux:'))).toContain('id-token: write');
+});
+
+it('publishes single-job workflows from the GitHub-hosted runner, private scopes included', () => {
+  for (const platformTargetGlobs of [undefined, LINUX_PLATFORM_TARGET_GLOBS]) {
+    const rendered = renderPublishWorkflowYaml({
+      repoName: '@smoothbricks/codebase',
+      platformTargetGlobs,
+      runsOn: [...nixosRunsOn],
+    });
+
+    // Build and publish share this job, so the whole job follows the publisher.
+    expect(rendered).toContain('  publish:\n    runs-on: ubuntu-latest');
+    expect(rendered).not.toContain('nixos-latest-x64');
+    expect(rendered).toContain('- name: 📦 Publish release');
+  }
+
+  const privateScope = renderPublishWorkflowYaml({
+    repoName: '@priv.test/runtime',
+    runsOn: [...nixosRunsOn],
+    privateNpm: {
+      scope: '@priv.test',
+      readTokenEnv: 'PRIV_NPM_READ_TOKEN',
+      publishTokenEnv: 'PRIV_NPM_PUBLISH_TOKEN',
+    },
+  });
+
+  expect(privateScope).toContain('  publish:\n    runs-on: ubuntu-latest');
+  expect(privateScope).toContain('      PRIV_NPM_READ_TOKEN: ${{ secrets.PRIV_NPM_READ_TOKEN }}');
+  expect(privateScope).toContain('          PRIV_NPM_PUBLISH_TOKEN: ${{ secrets.PRIV_NPM_PUBLISH_TOKEN }}');
+});
+
+it('keeps every job on the configured runner when the workflow is not GitHub Actions', () => {
+  const rendered = renderPublishWorkflowYaml({
+    repoName: '@example/runtime',
+    platformTargetGlobs: PLATFORM_TARGET_GLOBS,
+    runsOn: ['linux-x64', 'self-hosted'],
+    actionsProvider: 'forgejo',
+  });
+
+  // `ubuntu-latest` names no runner on a Forgejo instance, and there is no
+  // GitHub OIDC there to mint npmjs provenance from.
+  expect(Bun.YAML.parse(rendered)).toMatchObject({
+    jobs: {
+      'linux-release-candidate': { 'runs-on': ['linux-x64', 'self-hosted'] },
+      'publish-on-linux': { 'runs-on': ['linux-x64', 'self-hosted'] },
+    },
+  });
+  expect(rendered).not.toContain('runs-on: ubuntu-latest');
+});
+
+it('leaves the deploy-only job on the configured runner', () => {
+  const rendered = renderPublishWorkflowYaml({
+    deploy: true,
+    release: false,
+    repoName: '@example/app',
+    runsOn: ['linux-x64', 'self-hosted'],
+  });
+
+  // Nothing here reaches a registry, so the publisher rule does not apply.
+  expect(Bun.YAML.parse(rendered)).toMatchObject({ jobs: { publish: { 'runs-on': ['linux-x64', 'self-hosted'] } } });
+  expect(rendered).not.toContain('smoo release');
 });
 
 it('runs macOS platform legs on smoo.github.macosRunsOn; default stays macos-latest', () => {
