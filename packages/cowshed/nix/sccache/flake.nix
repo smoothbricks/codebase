@@ -1,6 +1,6 @@
-# The patched sccache, as a standalone flake. This directory — flake.nix, flake.lock, and the two
-# .patch files beside them — is self-contained: it references nothing outside itself, so it builds
-# from a bare copy with no repository, no cowshed, and no npm package around it.
+# The patched sccache, as a standalone flake. This directory — flake.nix, flake.lock,
+# patches and regression source — is self-contained: it references nothing outside
+# itself, so it builds from a bare copy with no repository, cowshed, or npm package.
 #
 # On a machine without cowshed (a NixOS build server is the case this exists for):
 #
@@ -80,6 +80,10 @@
         #    normalized. Present in the build iff `nm` finds `hash_normalized`.
         # 2. singleflight: concurrent misses of one cache key wait for the first compile to publish
         #    instead of running N rustcs. Present in the build iff `nm` finds `inflight_join`.
+        # 3. compiler-executable: bind concrete compilers to the same stable,
+        #    basename-preserving path used by the server's compiler-info cache.
+        #    Rustup discovery retains the original path; retired workspace aliases
+        #    cannot poison subsequent requests from another workspace.
         #
         # This directory is the only copy of these patches. `smoo monorepo check` asserts that this
         # list and the `.patch` files beside it name each other exactly, so neither an orphaned file
@@ -87,16 +91,15 @@
         patches = [
           ./sccache-rust-basedir-cwd.patch
           ./sccache-singleflight.patch
+          ./sccache-compiler-executable.patch
         ];
 
         sccache = pkgs.sccache.overrideAttrs (finalAttrs: previousAttrs: {
           inherit patches;
           version = "${previousAttrs.version}-${suffix}";
-          # The rename is the point, not an accident: `src` deliberately stays nixpkgs' 0.17.0
-          # tarball and the suffix names the patch set applied on top of it. Without this, every
-          # evaluation — including the one `cowshed setup --sccache` runs — prints a 12-line
-          # "override both version and src" warning at the operator.
-          __intentionallyOverridingVersion = true;
+          # Upstream's fetcher interpolates finalAttrs.version. Keep its original
+          # source explicitly: the suffix names our patch set, not an upstream tag.
+          src = pkgs.sccache.src;
 
           # Cargo default features are `all` (S3/GCS/redis/dist-client/…). Cowshed needs the local
           # disk cache and the UDS daemon and nothing else, so the cloud backends — and the openssl
@@ -117,11 +120,44 @@
             + ''
               substituteInPlace Cargo.toml \
                 --replace-fail 'version = "${previousAttrs.version}"' 'version = "${finalAttrs.version}"'
+              cp ${./compiler-executable.rs} tests/compiler_executable.rs
             '';
         });
       in {
         inherit sccache;
         default = sccache;
+      }
+    );
+
+    # Reuse the package's pinned source, patches and vendored Cargo dependencies.
+    # Only the real-compiler integration target runs; upstream's unrelated daemon
+    # and distributed tests remain outside this check.
+    checks = forSystems (
+      system: let
+        pkgs = nixpkgs.legacyPackages.${system};
+        sccache = self.packages.${system}.sccache;
+      in {
+        compiler-executable = sccache.overrideAttrs (previousAttrs: {
+          doCheck = true;
+          nativeCheckInputs =
+            (previousAttrs.nativeCheckInputs or [])
+            ++ [
+              pkgs.rustc
+              pkgs.clang
+              pkgs.rustup
+            ];
+          cargoTestFlags = ["--test" "compiler_executable"];
+          checkFlags = ["--ignored" "--test-threads=1"];
+          preCheck =
+            (previousAttrs.preCheck or "")
+            + ''
+              export XDG_RUNTIME_DIR="$TMPDIR"
+              export PATH="${pkgs.lib.makeBinPath [pkgs.rustc pkgs.cargo pkgs.clang pkgs.rustup]}:$PATH"
+              export RUSTUP_AUTO_INSTALL=0
+              export SCCACHE_TEST_BINARY="${sccache}/bin/sccache"
+              export SCCACHE_TEST_CLANG="${pkgs.clang.cc}/bin/clang"
+            '';
+        });
       }
     );
 
