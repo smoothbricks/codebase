@@ -13,8 +13,12 @@ permissions:
   statuses: write
 
 concurrency:
+  # One in-flight run per ref. Pushes to the staging push branch queue behind a
+  # running workflow instead of canceling it, so a newer push never cancels a
+  # production deployment mid-flight. Pull requests and other branches keep
+  # canceling superseded runs.
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 defaults:
   run:

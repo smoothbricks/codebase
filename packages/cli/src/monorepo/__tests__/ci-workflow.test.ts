@@ -60,7 +60,7 @@ describe('CI workflow definition', () => {
     expect(rendered).toContain('smoo github-ci nx-deploy --mode run-many --name "Deploy Stage" --step 7');
     expect(rendered).toContain('smoo github-ci nx-smart --target test-browser --name "Browser Tests" --step 10');
     expect(rendered).toContain('group: ${{ github.workflow }}-${{ github.ref }}');
-    expect(rendered).toContain('cancel-in-progress: true');
+    expect(rendered).toContain("cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}");
     expect(rendered).toContain('github.event.pull_request.head.repo.full_name == github.repository');
     expect(rendered).toContain("github.ref == 'refs/heads/main'");
     expect(rendered).toContain("# Step 13\n      # Nx's database cache needs artifact files");
@@ -484,5 +484,54 @@ describe('renderCiWorkflowYaml with deploy configuration', () => {
     expect(plain).not.toContain('environment:');
     expect(plain).not.toContain('GIT_CRYPT_KEY_B64');
     expect(plain).toContain("github.ref == 'refs/heads/main'");
+  });
+
+  it('serializes pushes to the staging push branch instead of canceling a running deploy', () => {
+    expect(rendered).toContain("cancel-in-progress: ${{ github.ref != 'refs/heads/trunk' }}");
+    expect(rendered).not.toContain('cancel-in-progress: true');
+  });
+
+  it('runs cargo and sibling-source preflight in both follow-up jobs before setup, with shifting anchors', () => {
+    const configured = options({
+      deploy: true,
+      deployProvider: 'cloudflare',
+      e2eDeployment: true,
+      pushBranches: ['trunk'],
+      productionOnPush: true,
+      cargoCredentials: { registryTokenEnvs: ['CARGO_REGISTRIES_EXAMPLE_TOKEN'] },
+      sourceCheckouts: [{ path: '../sibling', repository: 'https://git.example.net/sibling.git' }],
+    });
+    const full = renderCiWorkflowYaml(configured);
+    const e2eJob = full.slice(full.indexOf('  e2e-deployment:'), full.indexOf('  deploy-production:'));
+    const productionJob = full.slice(full.indexOf('  deploy-production:'));
+
+    for (const job of [e2eJob, productionJob]) {
+      expect(job).toContain('CARGO_REGISTRIES_EXAMPLE_TOKEN: ${{ secrets.CARGO_REGISTRIES_EXAMPLE_TOKEN }}');
+      const cargoAt = job.indexOf('- name: Prepare Cargo credentials');
+      const sourcesAt = job.indexOf('- name: 📦 Check out sibling sources');
+      const setupAt = job.indexOf('- name: 🧱 Setup Nix/devenv');
+      expect(cargoAt).toBeGreaterThanOrEqual(0);
+      expect(sourcesAt).toBeGreaterThan(cargoAt);
+      expect(setupAt).toBeGreaterThan(sourcesAt);
+      // Checkout 2, cargo 3, sources 4, setup 5: the middle step and its anchor move to 6.
+      expect(job).toContain('# Step 6');
+      expect(job).toContain('--step 6');
+      expect(job).not.toContain('--step 4');
+      expect(job).toContain('# Step 7');
+    }
+    expect(e2eJob).toContain(
+      'run: smoo github-ci nx-smart --target e2e-deployment --mode run-many --stage "${{ needs.main.outputs.deployment-stage }}" --stream-output --name "E2E Tests (Deployed Stage)" --step 6',
+    );
+    expect(productionJob).toContain(
+      'run: smoo github-ci nx-deploy --stage production --mode run-many --select-tag production-push-deploy-target --name "Deploy Production" --step 6',
+    );
+  });
+
+  it('keeps the base follow-up anchors when no preflight is configured', () => {
+    const e2eJob = rendered.slice(rendered.indexOf('  e2e-deployment:'), rendered.indexOf('  deploy-production:'));
+    expect(e2eJob).toContain('--step 4');
+    expect(e2eJob).not.toContain('Prepare Cargo credentials');
+    expect(e2eJob).not.toContain('Check out sibling sources');
+    expect(e2eJob).not.toContain('CARGO_REGISTRIES_EXAMPLE_TOKEN');
   });
 });
