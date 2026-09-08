@@ -1166,7 +1166,15 @@ async fn sandboxed_command(
             command.env(key, value);
         }
     }
-    if let Some(directory) = developer_directory() {
+    // Mirror, never invent: a workspace shell must see the same toolchain
+    // selection as the host shell that adopted it. xcrun and xcode-select
+    // resolve the system default inside the sandbox on their own (measured),
+    // so an injected Xcode DEVELOPER_DIR adds nothing when the host has none —
+    // and it makes CMake resolve Xcode's SDK for a Nix clang whose sysroot is
+    // the Nix apple-sdk, which fails on the first header (`uint8_t` unknown in
+    // sys/resource.h) while the identical build passes in the host shell.
+    // The developer directory still joins PATH above so its tools are found.
+    if let Some(directory) = std::env::var_os("DEVELOPER_DIR") {
         command.env("DEVELOPER_DIR", directory);
     }
     Ok(command)
