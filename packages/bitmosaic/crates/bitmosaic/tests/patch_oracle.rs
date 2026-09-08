@@ -381,7 +381,7 @@ fn check_reads(name: &str, step: usize, bytes: &[u8], oracle: &BTreeSet<u32>, rn
         );
         assert_eq!(
             view.rank(probe) as usize,
-            oracle.range(..probe).count(),
+            members.partition_point(|value| *value < probe),
             "{name}/{step}: rank({probe})"
         );
     }
