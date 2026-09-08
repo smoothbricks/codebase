@@ -322,20 +322,13 @@ function yamlLinesForStep(step: CiWorkflowStep, options: CiWorkflowDefinitionOpt
         '          key: ${{ runner.os }}-${{ runner.arch }}-nx-db-v1-${{ github.sha }}',
       ];
     case CiWorkflowStepKind.UploadTraceDbs:
-      return [
-        `      - name: ${step.name}`,
-        '        # success() is the default; always() keeps traces after a red build/test.',
-        '        if: always()',
-        '        uses: actions/upload-artifact@v7.0.1',
-        '        with:',
-        '          name: trace-results-${{ github.run_id }}',
-        // The trailing wildcard collects the WAL sidecars too: a killed worker leaves its last commits there, and
-        // those are exactly the traces worth downloading.
-        '          path: packages/*/.cache/trace-results.db*',
-        '          if-no-files-found: ignore',
-        '          retention-days: 14',
-        '          include-hidden-files: true',
-      ];
+      return artifactStepLines(step.name, 'upload', [
+        'name: trace-results-${{ github.run_id }}',
+        'path: packages/*/.cache/trace-results.db*',
+        'if-no-files-found: ignore',
+        'retention-days: 14',
+        'include-hidden-files: true',
+      ], 'always()');
     case CiWorkflowStepKind.SaveNixDevenv:
       return [
         `      - name: ${step.name}`,
@@ -651,4 +644,23 @@ ${privateNpmReadTokenJobEnv(options)}    steps:
           nix-cache-hit: \${{ steps.setup.outputs.nix-cache-hit }}
           devenv-cache-hit: \${{ steps.setup.outputs.devenv-cache-hit }}
 `;
+}
+
+export function artifactStepLines(name: string, kind: 'upload' | 'download', inputs: readonly string[], condition = 'success()'): string[] {
+  const github = "github.server_url == 'https://github.com' || endsWith(github.api_url, '/api/v3')";
+  // Forgejo 15 implements the v4 artifact protocol. Upstream clients reject
+  // non-GitHub hosts as GHES; these pinned Forgejo forks remove that host gate.
+  const providers = [
+    { condition: `(${github})`, action: kind === 'upload' ? 'actions/upload-artifact@v7.0.1' : 'actions/download-artifact@v8.0.1', suffix: '' },
+    { condition: `!(${github})`, action: kind === 'upload'
+      ? 'https://code.forgejo.org/forgejo/upload-artifact@cb8afe72b42edc798abfb8fcb556cf660d894245'
+      : 'https://code.forgejo.org/forgejo/download-artifact@769f970437aa3291b13f35dc23fc87967d7fb19f', suffix: ' (Forgejo)' },
+  ];
+  return providers.flatMap((provider) => [
+    `      - name: ${name}${provider.suffix}`,
+    `        if: (${condition}) && ${provider.condition}`,
+    `        uses: ${provider.action}`,
+    '        with:',
+    ...inputs.map((input) => `          ${input}`),
+  ]);
 }

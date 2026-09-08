@@ -15,6 +15,7 @@ import type {
 } from '../lib/json.js';
 import {
   CiWorkflowStepKind,
+  artifactStepLines,
   cargoCredentialJobEnvLines,
   cargoCredentialStepLines,
   sourceCheckoutsStepLines,
@@ -577,20 +578,13 @@ function yamlLinesForStep(step: PublishWorkflowStep, options: PublishWorkflowDef
         `smoo github-ci nx-run-many --targets test --projects "${githubExpression('steps.version.outputs.projects')}"`,
       );
     case PublishWorkflowStepKind.UploadTraceDbs:
-      return [
-        `      - name: ${step.name}`,
-        '        # Default is success(); failure() uploads traces only when the job already failed.',
-        '        if: failure()',
-        '        uses: actions/upload-artifact@v7.0.1',
-        '        with:',
-        `          name: trace-results-${githubExpression('github.run_id')}`,
-        // The trailing wildcard collects the WAL sidecars too: a killed worker leaves its last commits there, and
-        // those are exactly the traces worth downloading.
-        '          path: packages/*/.cache/trace-results.db*',
-        '          if-no-files-found: ignore',
-        '          retention-days: 14',
-        '          include-hidden-files: true',
-      ];
+      return artifactStepLines(step.name, 'upload', [
+        `name: trace-results-${githubExpression('github.run_id')}`,
+        'path: packages/*/.cache/trace-results.db*',
+        'if-no-files-found: ignore',
+        'retention-days: 14',
+        'include-hidden-files: true',
+      ], 'failure()');
     case PublishWorkflowStepKind.ValidateMonorepoConfig:
       return conditionalRunStep(step, 'smoo monorepo validate');
     case PublishWorkflowStepKind.TagRelease:
@@ -907,38 +901,33 @@ function renderLinuxReleaseCandidateSteps(
     `          "${githubExpression('runner.temp')}/publish-release-state/release-head"`,
     '',
     `      # Step ${stepNumber++}`,
-    '      - name: 📤 Upload validated release state',
-    '        uses: actions/upload-artifact@v7.0.1',
-    '        with:',
-    `          name: publish-release-state-${githubExpression('github.run_id')}`,
-    `          path: ${githubExpression('runner.temp')}/publish-release-state`,
-    '          if-no-files-found: error',
-    '          retention-days: 1',
+    ...artifactStepLines('📤 Upload validated release state', 'upload', [
+      `name: publish-release-state-${githubExpression('github.run_id')}`,
+      `path: ${githubExpression('runner.temp')}/publish-release-state`,
+      'if-no-files-found: error',
+      'retention-days: 1',
+    ]),
     '',
     `      # Step ${stepNumber++}`,
-    '      - name: 📤 Upload validated build outputs',
-    "        if: steps.version.outputs.mode != 'none'",
-    '        uses: actions/upload-artifact@v7.0.1',
-    '        with:',
-    `          name: publish-release-outputs-${githubExpression('github.run_id')}`,
-    `          path: ${githubExpression('runner.temp')}/release-build-outputs`,
-    '          if-no-files-found: error',
-    '          retention-days: 1',
-    '          include-hidden-files: true',
+    ...artifactStepLines('📤 Upload validated build outputs', 'upload', [
+      `name: publish-release-outputs-${githubExpression('github.run_id')}`,
+      `path: ${githubExpression('runner.temp')}/release-build-outputs`,
+      'if-no-files-found: error',
+      'retention-days: 1',
+      'include-hidden-files: true',
+    ], "steps.version.outputs.mode != 'none'"),
   );
   if (hasLinuxPlatformTargets(options)) {
     lines.push(
       '',
       `      # Step ${stepNumber++}`,
-      '      - name: 📤 Upload supplemental Linux outputs',
-      "        if: steps.version.outputs.mode != 'none'",
-      '        uses: actions/upload-artifact@v7.0.1',
-      '        with:',
-      `          name: publish-linux-outputs-${githubExpression('github.run_id')}`,
-      `          path: ${githubExpression('runner.temp')}/linux-platform-outputs`,
-      '          if-no-files-found: error',
-      '          retention-days: 1',
-      '          include-hidden-files: true',
+      ...artifactStepLines('📤 Upload supplemental Linux outputs', 'upload', [
+        `name: publish-linux-outputs-${githubExpression('github.run_id')}`,
+        `path: ${githubExpression('runner.temp')}/linux-platform-outputs`,
+        'if-no-files-found: error',
+        'retention-days: 1',
+        'include-hidden-files: true',
+      ], "steps.version.outputs.mode != 'none'"),
     );
   }
   lines.push(
@@ -1055,18 +1044,17 @@ function renderMacosPlatformSteps(options: PublishWorkflowDefinitionOptions): st
     `          "${githubExpression('steps.platform-outputs.outputs.projects')}"`,
     '',
     `      # Step ${stepNumber++}`,
-    `      - name: 📤 Upload macOS platform outputs${legLabel}`,
-    '        uses: actions/upload-artifact@v7.0.1',
-    '        with:',
-    `          name: ${
-      isMatrix
-        ? `publish-macos-${githubExpression('matrix.arch')}-outputs-${githubExpression('github.run_id')}`
-        : `publish-macos-outputs-${githubExpression('github.run_id')}`
-    }`,
-    `          path: ${githubExpression('runner.temp')}/macos-platform-outputs`,
-    '          if-no-files-found: error',
-    '          retention-days: 1',
-    '          include-hidden-files: true',
+    ...artifactStepLines(`📤 Upload macOS platform outputs${legLabel}`, 'upload', [
+      `name: ${
+        isMatrix
+          ? `publish-macos-${githubExpression('matrix.arch')}-outputs-${githubExpression('github.run_id')}`
+          : `publish-macos-outputs-${githubExpression('github.run_id')}`
+      }`,
+      `path: ${githubExpression('runner.temp')}/macos-platform-outputs`,
+      'if-no-files-found: error',
+      'retention-days: 1',
+      'include-hidden-files: true',
+    ]),
     '',
     '      # --- Cleanup ------------------------------------------------------------',
     '',
@@ -1116,12 +1104,11 @@ function renderFinalLinuxPublishSteps(options: PublishWorkflowDefinitionOptions)
     '        uses: ./.github/actions/setup-devenv',
     '',
     `      # Step ${stepNumber++}`,
-    '      - name: 📥 Download candidate artifacts',
-    '        uses: actions/download-artifact@v8.0.1',
-    '        with:',
-    `          pattern: publish-*-${githubExpression('github.run_id')}`,
-    `          path: ${githubExpression('runner.temp')}/publish-artifacts`,
-    '          merge-multiple: false',
+    ...artifactStepLines('📥 Download candidate artifacts', 'download', [
+      `pattern: publish-*-${githubExpression('github.run_id')}`,
+      `path: ${githubExpression('runner.temp')}/publish-artifacts`,
+      'merge-multiple: false',
+    ]),
     '',
     `      # Step ${stepNumber++}`,
     '      - name: 🤖 Configure release author',
@@ -1162,13 +1149,23 @@ function renderFinalLinuxPublishSteps(options: PublishWorkflowDefinitionOptions)
     '',
     `      # Step ${stepNumber++}`,
     '      - name: ♻️ Restore validated release state',
-    '        run:',
-    `          git fetch "${githubExpression(
-      'runner.temp',
-    )}/publish-artifacts/publish-release-state-${githubExpression('github.run_id')}/release-state.bundle" HEAD --tags && git reset`,
-    `          --hard "$(cat "${githubExpression(
-      'runner.temp',
-    )}/publish-artifacts/publish-release-state-${githubExpression('github.run_id')}/release-head")"`,
+    '        env:',
+    `          EXPECTED_RELEASE_SHA: ${githubExpression('needs.linux-release-candidate.outputs.release-sha')}`,
+    '        run: |',
+    '          set -euo pipefail',
+    `          state="${githubExpression('runner.temp')}/publish-artifacts/publish-release-state-${githubExpression('github.run_id')}"`,
+    '          actual="$(cat "$state/release-head")"',
+    '          if [ -z "$EXPECTED_RELEASE_SHA" ] || [ "$actual" != "$EXPECTED_RELEASE_SHA" ]; then',
+    '            echo "Release state does not match the validated candidate SHA." >&2',
+    '            exit 1',
+    '          fi',
+    '          git bundle verify "$state/release-state.bundle"',
+    '          git fetch "$state/release-state.bundle" HEAD --tags',
+    '          if [ "$(git rev-parse FETCH_HEAD)" != "$EXPECTED_RELEASE_SHA" ]; then',
+    '            echo "Release bundle HEAD does not match the validated candidate SHA." >&2',
+    '            exit 1',
+    '          fi',
+    '          git reset --hard "$EXPECTED_RELEASE_SHA"',
   );
   lines.push(
     '',
