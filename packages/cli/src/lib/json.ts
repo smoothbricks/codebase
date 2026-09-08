@@ -29,6 +29,14 @@ export interface PackageSmooGithub {
   runsOn?: string | string[];
   /** macOS platform job runs-on labels (string or label list). Default: macos-latest. */
   macosRunsOn?: string | string[];
+  /** Opt in to building foreign platform artifacts on Linux without native-host runtime tests. */
+  platformProducer?: {
+    kind: 'linux-cross';
+    /** Required shell preflight, run from the repository root before toolchain setup or builds. */
+    preflight: string;
+    /** Toolchain environment on the Linux foreign-platform producer, such as an SDK path. */
+    env?: StringMap;
+  };
   /**
    * Sibling source checkouts a repo path-depends on (Cargo path
    * dependencies, nix path inputs). The CI workflow clones each entry beside
