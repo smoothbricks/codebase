@@ -798,12 +798,21 @@ fn record_installed_source(executable: &HostStableExecutable, source: &Path) {
 /// is a first install and has nothing to roll back to.
 pub fn retain_previous_executable(executable: &HostStableExecutable) -> Result<Option<PathBuf>> {
     let retained = retained_path(executable);
-    if fs::symlink_metadata(executable.path()).is_err() {
+    if inspect_existing(executable.path())?.is_none() {
         return Ok(None);
     }
     // A leftover from an earlier interrupted run is stale by definition: the live binary is the
     // authority, and linking onto an existing name fails.
-    let _ = fs::remove_file(&retained);
+    match fs::remove_file(&retained) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(CowshedError::internal(format!(
+                "could not remove stale retained executable {}: {error}",
+                retained.display()
+            )));
+        }
+    }
     fs::hard_link(executable.path(), &retained).map_err(|error| {
         CowshedError::internal(format!(
             "could not retain {} as {}: {error}",
