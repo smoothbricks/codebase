@@ -4,8 +4,14 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { $ } from 'bun';
 
-export async function run(command: string, args: string[], cwd: string, env?: Record<string, string>): Promise<void> {
-  const status = await runStatus(command, args, cwd, false, env);
+export async function run(
+  command: string,
+  args: string[],
+  cwd: string,
+  env?: Record<string, string>,
+  unsetEnv?: readonly string[],
+): Promise<void> {
+  const status = await runStatus(command, args, cwd, false, env, unsetEnv);
   if (status !== 0) {
     throw new Error(`${command} ${args.join(' ')} failed with exit code ${status}`);
   }
@@ -17,11 +23,12 @@ export async function runStatus(
   cwd: string,
   quiet = false,
   env?: Record<string, string>,
+  unsetEnv?: readonly string[],
 ): Promise<number> {
   const invocation = resolveCommandInvocation(cwd, command, args);
   let shell = $`${invocation.command} ${invocation.args}`.cwd(cwd).nothrow();
-  if (env) {
-    shell = shell.env(mergeEnv(env));
+  if (env || unsetEnv) {
+    shell = shell.env(mergeEnv(env, unsetEnv));
   }
   const result = quiet ? await shell.quiet() : await shell;
   return result.exitCode;
@@ -32,12 +39,13 @@ export async function runInteractiveStatus(
   args: string[],
   cwd: string,
   env?: Record<string, string>,
+  unsetEnv?: readonly string[],
 ): Promise<number> {
   const invocation = resolveCommandInvocation(cwd, command, args);
   return new Promise((resolve, reject) => {
     const child = spawn(invocation.command, invocation.args, {
       cwd,
-      env: env ? mergeEnv(env) : process.env,
+      env: mergeEnv(env, unsetEnv),
       stdio: 'inherit',
     });
     child.on('error', reject);
@@ -56,11 +64,12 @@ export async function runResult(
   args: string[],
   cwd: string,
   env?: Record<string, string>,
+  unsetEnv?: readonly string[],
 ): Promise<{ exitCode: number; stdout: string; stderr: string }> {
   const invocation = resolveCommandInvocation(cwd, command, args);
   let shell = $`${invocation.command} ${invocation.args}`.cwd(cwd).nothrow().quiet();
-  if (env) {
-    shell = shell.env(mergeEnv(env));
+  if (env || unsetEnv) {
+    shell = shell.env(mergeEnv(env, unsetEnv));
   }
   const result = await shell;
   return {
@@ -81,8 +90,9 @@ export async function runText(
   args: string[],
   cwd: string,
   env?: Record<string, string>,
+  unsetEnv?: readonly string[],
 ): Promise<string> {
-  const result = await runResult(command, args, cwd, env);
+  const result = await runResult(command, args, cwd, env, unsetEnv);
   if (result.exitCode !== 0) {
     printCommandOutput(result.stdout, result.stderr);
     throw new Error(`${command} ${args.join(' ')} failed with exit code ${result.exitCode}`);
@@ -99,15 +109,27 @@ export function printCommandOutput(stdout: string, stderr: string): void {
   }
 }
 
-/** This process's environment with `env` overlaid: the one overlay every child the CLI spawns is given. */
-export function mergeEnv(env: Record<string, string>): Record<string, string> {
+/**
+ * This process's environment with `env` overlaid and `unsetEnv` withheld: the one overlay every child the CLI
+ * spawns is given. An overlay alone cannot unset a variable this process inherited, so withheld names are
+ * deleted after the overlay. The result is a fresh object; `process.env` is never mutated.
+ */
+export function mergeEnv(env?: Record<string, string>, unsetEnv?: readonly string[]): Record<string, string> {
   const merged: Record<string, string> = {};
   for (const [key, value] of Object.entries(process.env)) {
     if (value !== undefined) {
       merged[key] = value;
     }
   }
-  return { ...merged, ...env };
+  if (env) {
+    Object.assign(merged, env);
+  }
+  if (unsetEnv) {
+    for (const name of unsetEnv) {
+      delete merged[name];
+    }
+  }
+  return merged;
 }
 
 function resolveCommandInvocation(root: string, command: string, args: string[]): { command: string; args: string[] } {
