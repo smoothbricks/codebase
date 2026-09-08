@@ -135,9 +135,11 @@ describe('private npm publish diagnostics', () => {
       (error: unknown) => error,
     );
 
-    expect(failure).toBeInstanceOf(Error);
-    expect((failure as Error).message).toContain('private npm publish failed; refusing');
-    expect((failure as Error).cause).toBe(shell.publishFailure);
+    if (!(failure instanceof Error)) {
+      throw new Error('Expected publication to fail with an Error');
+    }
+    expect(failure.message).toContain('private npm publish failed; refusing');
+    expect(failure.cause).toBe(shell.publishFailure);
     expect(shell.errors).toHaveLength(1);
     expect(shell.errors[0]).toContain('publication state is unknown');
     expect(shell.errors[0]).toContain('503 Service Unavailable');
