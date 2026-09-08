@@ -234,6 +234,31 @@ describe('CloudflareRestClient page-numbered listings', () => {
     ]);
   });
 
+  it('refuses an empty page while total_pages still promises more', async () => {
+    // A torn listing, not an ending: returning page one alone would read as the whole zone.
+    const record = { id: 'dns-1', name: 'pr7.example.test', type: 'CNAME', content: 'worker.example.test' };
+    const { fetcher, calls } = pageFetcher([
+      { success: true, result: [record], result_info: { page: 1, total_pages: 3 } },
+      { success: true, result: [], result_info: { page: 2, total_pages: 3 } },
+    ]);
+    const client = new CloudflareRestClient('account-1', 'token', fetcher);
+
+    await expect(client.listDnsRecords('zone-1')).rejects.toThrow(
+      /page 2 .* with no rows while reporting more to come/,
+    );
+    expect(calls).toHaveLength(2);
+  });
+
+  it('refuses an empty page while total_count still promises more', async () => {
+    const { fetcher } = pageFetcher([
+      { success: true, result: [{ id: 'kv-1', title: 'site-pr7-cache' }], result_info: { total_count: 3 } },
+      { success: true, result: [], result_info: { total_count: 3 } },
+    ]);
+    const client = new CloudflareRestClient('account-1', 'token', fetcher);
+
+    await expect(client.listKvNamespaces()).rejects.toThrow(/no rows while reporting more to come/);
+  });
+
   it('requests zones at the page size that endpoint accepts', async () => {
     // `GET /zones` rejects per_page above 50, so the shared 1000 would fail the whole listing.
     const { fetcher, calls } = pageFetcher([{ success: true, result: [{ id: 'zone-1', name: 'example.test' }] }]);
@@ -315,6 +340,19 @@ describe('CloudflareRestClient cursor listings', () => {
       `GET ${V4}/accounts/account-1/r2/buckets/site-pr7-uploads/objects?per_page=1000`,
       `GET ${V4}/accounts/account-1/r2/buckets/site-pr7-uploads/objects?per_page=1000&cursor=cursor-2`,
     ]);
+  });
+
+  it('keeps following a truncated object page that came back empty', async () => {
+    // A filtered object page can hold no keys and still precede more, so `is_truncated` decides —
+    // stopping on the empty page would hide every remaining key in the bucket.
+    const { fetcher, calls } = pageFetcher([
+      { success: true, result: { objects: [] }, result_info: { cursor: 'cursor-2', is_truncated: true } },
+      { success: true, result: { objects: [{ key: 'b/2.json' }] }, result_info: { is_truncated: false } },
+    ]);
+    const client = new CloudflareRestClient('account-1', 'token', fetcher);
+
+    await expect(client.listR2Objects('site-pr7-uploads')).resolves.toEqual(['b/2.json']);
+    expect(calls).toHaveLength(2);
   });
 });
 
