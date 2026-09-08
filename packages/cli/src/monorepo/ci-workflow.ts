@@ -624,7 +624,7 @@ function stagingPushBranch(options: CiWorkflowDefinitionOptions): string {
  * names the platform itself accepts.
  */
 function yamlScalar(value: string): string {
-  if (/^[A-Za-z0-9_][A-Za-z0-9_./-]*$/.test(value)) {
+  if (/^[A-Za-z0-9_][A-Za-z0-9_./-]*$/.test(value) && Bun.YAML.parse(value) === value) {
     return value;
   }
   return JSON.stringify(value);

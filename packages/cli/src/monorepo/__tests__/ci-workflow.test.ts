@@ -512,6 +512,26 @@ describe('renderCiWorkflowYaml with deploy configuration', () => {
     expect(quoted).toContain('environment: production');
   });
 
+  it('preserves scalar-looking branch and environment names as strings', () => {
+    const workflow = renderCiWorkflowYaml(
+      options({
+        deploy: true,
+        e2eDeployment: true,
+        productionOnPush: true,
+        pushBranches: ['123', 'null', 'false'],
+        environments: { staging: 'true', production: '123' },
+      }),
+    );
+    expect(Bun.YAML.parse(workflow)).toMatchObject({
+      on: { push: { branches: ['123', 'null', 'false'] } },
+      jobs: {
+        main: { environment: 'true' },
+        'e2e-deployment': { environment: 'true' },
+        'deploy-production': { environment: '123' },
+      },
+    });
+  });
+
   it('runs cargo and sibling-source preflight in both follow-up jobs before setup, with shifting anchors', () => {
     const configured = options({
       deploy: true,
