@@ -307,55 +307,45 @@ describe('publish workflow definition', () => {
     );
   });
 
-  it('selects one artifact transport per provider and retains hidden outputs only for eligible steps', () => {
-    const workflow = typia.assert<{
-      jobs: Record<
-        string,
-        {
-          steps: Array<{
-            uses?: string;
-            if?: string;
-            with?: { name?: string; 'include-hidden-files'?: boolean };
-          }>;
-        }
-      >;
-    }>(Bun.YAML.parse(renderPublishWorkflowYaml({ platformTargetGlobs: PLATFORM_TARGET_GLOBS })));
-    const uploads = Object.values(workflow.jobs)
-      .flatMap((job) => job.steps)
-      .filter((step) => step.uses?.includes('upload-artifact'));
-    for (const github of [
-      { server_url: 'https://github.com', api_url: 'https://api.github.com' },
-      { server_url: 'https://forge.example.test', api_url: 'https://forge.example.test/api/v1' },
-    ]) {
+  it('emits only the selected provider action references before evaluating artifact step eligibility', () => {
+    const providers: Array<PublishWorkflowDefinitionOptions['actionsProvider']> = [undefined, 'github', 'forgejo'];
+    for (const actionsProvider of providers) {
+      const workflow = typia.assert<{
+        jobs: Record<string, { steps: Array<{
+          uses?: string;
+          if?: string;
+          with?: { name?: string; 'include-hidden-files'?: boolean };
+        }> }>;
+      }>(Bun.YAML.parse(renderPublishWorkflowYaml({ platformTargetGlobs: PLATFORM_TARGET_GLOBS, actionsProvider })));
+      const artifacts = Object.values(workflow.jobs).flatMap((job) => job.steps)
+        .filter((step) => step.uses?.includes('-artifact'));
+      // Runners resolve actions before evaluating if: even an ineligible
+      // foreign action reference would prevent the whole workflow from starting.
+      for (const step of artifacts) {
+        expect(step.uses?.startsWith('https://code.forgejo.org/')).toBe(actionsProvider === 'forgejo');
+        expect(step.uses?.startsWith('actions/')).toBe(actionsProvider !== 'forgejo');
+      }
+      const uploads = artifacts.filter((step) => step.uses?.includes('upload-artifact'));
       for (const succeeded of [true, false]) {
         const selected = uploads.filter((step) => {
-          if (!step.if) throw new Error('Artifact transport requires an explicit provider condition.');
-          // These generated conditions use the shared JS/Actions boolean subset.
-          // Execute the rendered predicate, not a parallel copy of its policy.
+          if (!step.if) throw new Error('Artifact transport requires an explicit execution condition.');
           // Actions implicitly adds success() when no status function is present.
           if (!/\b(success|failure|always|cancelled)\(/.test(step.if) && !succeeded) return false;
-          const matches = new Function('github', 'steps', 'success', 'failure', 'endsWith', `return ${step.if};`);
-          return Boolean(
-            matches(
-              github,
-              { version: { outputs: { mode: 'release' } } },
-              () => succeeded,
-              () => !succeeded,
-              (value: string, suffix: string) => value.endsWith(suffix),
-            ),
-          );
+          const matches = new Function('steps', 'success', 'failure', `return ${step.if};`);
+          return Boolean(matches(
+            { version: { outputs: { mode: 'release' } } },
+            () => succeeded,
+            () => !succeeded,
+          ));
         });
-        const expectedNames = succeeded
-          ? [
-              'publish-release-state-${{ github.run_id }}',
-              'publish-release-outputs-${{ github.run_id }}',
-              'publish-linux-outputs-${{ github.run_id }}',
-              'publish-macos-outputs-${{ github.run_id }}',
-            ]
-          : ['trace-results-${{ github.run_id }}'];
+        const expectedNames = succeeded ? [
+          'publish-release-state-${{ github.run_id }}',
+          'publish-release-outputs-${{ github.run_id }}',
+          'publish-linux-outputs-${{ github.run_id }}',
+          'publish-macos-outputs-${{ github.run_id }}',
+        ] : ['trace-results-${{ github.run_id }}'];
         expect(selected.map((step) => step.with?.name).sort()).toEqual(expectedNames.sort());
         for (const step of selected) {
-          expect(step.uses?.startsWith('https://code.forgejo.org/')).toBe(github.api_url.endsWith('/api/v1'));
           if (step.with?.name !== 'publish-release-state-${{ github.run_id }}') {
             expect(step.with?.['include-hidden-files']).toBe(true);
           }

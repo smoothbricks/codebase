@@ -104,6 +104,7 @@ export interface PublishWorkflowDefinitionOptions {
   /** macOS platform job runs-on labels. Default macos-latest. Same smoo.github.macosRunsOn as CI. */
   macosRunsOn?: WorkflowRunsOn;
   platformProducer?: PackageSmooGithub['platformProducer'];
+  actionsProvider?: PackageSmooGithub['actionsProvider'];
   /**
    * Declared private-npm opt-in. The publish step is the only place receiving
    * the publish token; the read token rides along for `.npmrc` `${TOKEN}`
@@ -580,18 +581,16 @@ function yamlLinesForStep(step: PublishWorkflowStep, options: PublishWorkflowDef
         `smoo github-ci nx-run-many --targets test --projects "${githubExpression('steps.version.outputs.projects')}"`,
       );
     case PublishWorkflowStepKind.UploadTraceDbs:
-      return artifactStepLines(
-        step.name,
-        'upload',
-        [
-          `name: trace-results-${githubExpression('github.run_id')}`,
-          'path: packages/*/.cache/trace-results.db*',
-          'if-no-files-found: ignore',
-          'retention-days: 14',
-          'include-hidden-files: true',
-        ],
-        'failure()',
-      );
+      return artifactStepLines(options.actionsProvider, step.name,
+      'upload',
+      [
+        `name: trace-results-${githubExpression('github.run_id')}`,
+        'path: packages/*/.cache/trace-results.db*',
+        'if-no-files-found: ignore',
+        'retention-days: 14',
+        'include-hidden-files: true',
+      ],
+      'failure()',);
     case PublishWorkflowStepKind.ValidateMonorepoConfig:
       return conditionalRunStep(step, 'smoo monorepo validate');
     case PublishWorkflowStepKind.TagRelease:
@@ -909,7 +908,7 @@ function renderLinuxReleaseCandidateSteps(
     `          "${githubExpression('runner.temp')}/publish-release-state/release-head"`,
     '',
     `      # Step ${stepNumber++}`,
-    ...artifactStepLines('📤 Upload validated release state', 'upload', [
+    ...artifactStepLines(options.actionsProvider, '📤 Upload validated release state', 'upload', [
       `name: publish-release-state-${githubExpression('github.run_id')}`,
       `path: ${githubExpression('runner.temp')}/publish-release-state`,
       'if-no-files-found: error',
@@ -917,35 +916,31 @@ function renderLinuxReleaseCandidateSteps(
     ]),
     '',
     `      # Step ${stepNumber++}`,
-    ...artifactStepLines(
-      '📤 Upload validated build outputs',
-      'upload',
-      [
-        `name: publish-release-outputs-${githubExpression('github.run_id')}`,
-        `path: ${githubExpression('runner.temp')}/release-build-outputs`,
-        'if-no-files-found: error',
-        'retention-days: 1',
-        'include-hidden-files: true',
-      ],
-      "steps.version.outputs.mode != 'none'",
-    ),
+    ...artifactStepLines(options.actionsProvider, '📤 Upload validated build outputs',
+    'upload',
+    [
+      `name: publish-release-outputs-${githubExpression('github.run_id')}`,
+      `path: ${githubExpression('runner.temp')}/release-build-outputs`,
+      'if-no-files-found: error',
+      'retention-days: 1',
+      'include-hidden-files: true',
+    ],
+    "steps.version.outputs.mode != 'none'",),
   );
   if (hasLinuxPlatformTargets(options)) {
     lines.push(
       '',
       `      # Step ${stepNumber++}`,
-      ...artifactStepLines(
-        '📤 Upload supplemental Linux outputs',
-        'upload',
-        [
-          `name: publish-linux-outputs-${githubExpression('github.run_id')}`,
-          `path: ${githubExpression('runner.temp')}/linux-platform-outputs`,
-          'if-no-files-found: error',
-          'retention-days: 1',
-          'include-hidden-files: true',
-        ],
-        "steps.version.outputs.mode != 'none'",
-      ),
+      ...artifactStepLines(options.actionsProvider, '📤 Upload supplemental Linux outputs',
+      'upload',
+      [
+        `name: publish-linux-outputs-${githubExpression('github.run_id')}`,
+        `path: ${githubExpression('runner.temp')}/linux-platform-outputs`,
+        'if-no-files-found: error',
+        'retention-days: 1',
+        'include-hidden-files: true',
+      ],
+      "steps.version.outputs.mode != 'none'",),
     );
   }
   lines.push(
@@ -1082,7 +1077,7 @@ function renderMacosPlatformSteps(options: PublishWorkflowDefinitionOptions): st
   lines.push(
     '',
     `      # Step ${stepNumber++}`,
-    ...artifactStepLines(`📤 Upload macOS platform outputs${legLabel}`, 'upload', [
+    ...artifactStepLines(options.actionsProvider, `📤 Upload macOS platform outputs${legLabel}`, 'upload', [
       `name: ${
         isMatrix
           ? `publish-macos-${githubExpression('matrix.arch')}-outputs-${githubExpression('github.run_id')}`
@@ -1142,7 +1137,7 @@ function renderFinalLinuxPublishSteps(options: PublishWorkflowDefinitionOptions)
     '        uses: ./.github/actions/setup-devenv',
     '',
     `      # Step ${stepNumber++}`,
-    ...artifactStepLines('📥 Download candidate artifacts', 'download', [
+    ...artifactStepLines(options.actionsProvider, '📥 Download candidate artifacts', 'download', [
       `pattern: publish-*-${githubExpression('github.run_id')}`,
       `path: ${githubExpression('runner.temp')}/publish-artifacts`,
       'merge-multiple: false',

@@ -156,6 +156,7 @@ export interface ManagedFileContext {
   /** macOS platform job runs-on labels from the root smoo config; default macos-latest. */
   macosRunsOn: string | string[];
   platformProducer?: PackageSmooGithub['platformProducer'];
+  actionsProvider?: PackageSmooGithub['actionsProvider'];
   nodeModulesCacheKey: string;
   repoName: string;
   platformTargetGlobs: string[];
@@ -361,6 +362,7 @@ function getManagedContent(file: ManagedFile, context: ManagedFileContext): stri
   if (file.kind === 'generated') {
     if (file.source === 'ci-workflow') {
       return renderCiWorkflowYaml({
+        actionsProvider: context.actionsProvider,
         deploy: context.hasStagingDeployTargets,
         deployProvider: context.stagingDeployProvider,
         browserTests: context.hasBrowserTestTargets,
@@ -385,6 +387,7 @@ function getManagedContent(file: ManagedFile, context: ManagedFileContext): stri
         runsOn: context.ciRunsOn,
         macosRunsOn: context.macosRunsOn,
         platformProducer: context.platformProducer,
+        actionsProvider: context.actionsProvider,
         privateNpm: context.privateNpm,
         sourceCheckouts: context.sourceCheckouts,
         cargoCredentials: context.cargoCredentials,
@@ -438,6 +441,7 @@ async function getManagedFileContext(root: string): Promise<ManagedFileContext> 
     ciRunsOn,
     macosRunsOn,
     platformProducer: packageJson?.json?.smoo?.github?.platformProducer,
+    actionsProvider: packageJson?.json?.smoo?.github?.actionsProvider,
     nodeModulesCacheKey,
     repoName,
     platformTargetGlobs,
