@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { chmodSync, createReadStream, type Dirent, type Stats } from 'node:fs';
-import { copyFile, lstat, mkdir, readdir, readFile, writeFile } from 'node:fs/promises';
-import { isAbsolute, relative, resolve, sep } from 'node:path';
+import { copyFile, lstat, mkdir, readdir, readFile, unlink, writeFile } from 'node:fs/promises';
+import { dirname, isAbsolute, relative, resolve, sep } from 'node:path';
 import typia from 'typia';
 import { listPublishablePackages, type PackageInfo } from '../lib/workspace.js';
 import { type ProjectTargets, readProjectTargets } from '../nx/index.js';
@@ -60,6 +60,12 @@ export async function collectNxOutputs(
       await copyFile(file.source, staged);
     } catch (error) {
       throw new Error(`Unable to stage output ${file.path} at ${staged}: ${describeError(error)}`, { cause: error });
+    }
+    const stagedHash = await checksumFile(staged, 'Unable to checksum staged output');
+    if (stagedHash !== file.sha256) {
+      throw new Error(
+        `SHA-256 mismatch for staged output ${file.path}: expected ${file.sha256}, received ${stagedHash}.`,
+      );
     }
   }
 
@@ -152,6 +158,8 @@ export async function applyCollectedOutputs(
 
   const overlays: Array<{ source: string; destination: string; mode: number }> = [];
   const claimedPaths = new Set<string>();
+  const appliedOutputs: Array<{ project: ProjectTargets; output: string }> = [];
+  const appliedOutputKeys = new Set<string>();
   for (const directory of directories) {
     const { manifest, manifestPath } = await readCollectedOutputsManifest(directory);
     if (manifest.sourceSha !== expectedSourceSha) {
@@ -194,6 +202,11 @@ export async function applyCollectedOutputs(
       }
       declaredPaths.add(path);
       claimedPaths.add(path);
+      const appliedKey = `${file.project}\0${file.output}`;
+      if (!appliedOutputKeys.has(appliedKey)) {
+        appliedOutputKeys.add(appliedKey);
+        appliedOutputs.push({ project, output: file.output });
+      }
 
       const source = resolveWorkspacePath(workspace, path, 'staged output file');
       let stat: Stats;
@@ -249,6 +262,23 @@ export async function applyCollectedOutputs(
       );
     }
   }
+
+  for (const { project, output } of appliedOutputs) {
+    const resolved = resolveDeclaredOutput(output, project);
+    for (const path of await filesMatchingOutput(root, resolved)) {
+      if (claimedPaths.has(path)) {
+        continue;
+      }
+      const extra = resolveWorkspacePath(root, path, 'workspace output file');
+      try {
+        await unlink(extra);
+      } catch (error) {
+        throw new Error(`Unable to remove undeclared workspace output ${path}: ${describeError(error)}`, {
+          cause: error,
+        });
+      }
+    }
+  }
 }
 
 export async function assertCollectedOutputsApplied(
@@ -261,16 +291,20 @@ export async function assertCollectedOutputsApplied(
   }
   const requestedProjects = new Set(projectNames);
   const foundProjects = new Set<string>();
+  const claimedPaths = new Set<string>();
+  const verifiedParents = new Set<string>();
   const packages = listPublishablePackages(root);
   for (const directory of directories) {
     const { manifest, manifestPath } = await readCollectedOutputsManifest(directory);
     assertCollectedPackageVersions(packages, manifest, manifestPath);
     for (const file of manifest.files) {
+      const path = validateWorkspaceRelativePath(file.path, 'manifest file path');
+      claimedPaths.add(path);
       if (!requestedProjects.has(file.project)) {
         continue;
       }
       foundProjects.add(file.project);
-      const path = validateWorkspaceRelativePath(file.path, 'manifest file path');
+      verifiedParents.add(dirname(path));
       const destination = resolveWorkspacePath(root, path, 'workspace output file');
       let stat: Stats;
       try {
@@ -295,6 +329,17 @@ export async function assertCollectedOutputsApplied(
   for (const project of requestedProjects) {
     if (!foundProjects.has(project)) {
       throw new Error(`Collected outputs contain no verified files for Nx project ${project}.`);
+    }
+  }
+  for (const parent of verifiedParents) {
+    if (!parent || parent === '.') {
+      continue;
+    }
+    for (const file of await listRegularFiles(resolveWorkspacePath(root, parent, 'workspace output directory'))) {
+      const path = workspaceRelativePath(root, file, 'workspace output file');
+      if (!claimedPaths.has(path)) {
+        throw new Error(`Undeclared workspace output file at merge boundary: ${path}`);
+      }
     }
   }
 }
