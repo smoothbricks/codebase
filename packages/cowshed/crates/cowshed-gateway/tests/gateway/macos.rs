@@ -143,6 +143,36 @@ impl CredentialProvider for FixedCredential {
         }))
     }
 }
+
+/// A registry credential scoped to one namespace path, the shape `cowshed credential add` writes.
+///
+/// It answers for its origin whatever the request path is, exactly as the platform store does:
+/// the store is keyed by origin, and whether the path is in scope is the record's own business
+/// through `validate_for`. That is what makes the refusal cases below meaningful.
+struct ScopedRegistryCredential {
+    repo_id: String,
+    origin: String,
+    path_prefix: String,
+    value: String,
+}
+
+#[async_trait]
+impl CredentialProvider for ScopedRegistryCredential {
+    async fn lookup(
+        &self,
+        _query: &CredentialQuery,
+    ) -> Result<Option<CredentialRecord>, CredentialError> {
+        Ok(Some(CredentialRecord {
+            repo_id: self.repo_id.clone(),
+            protocol: CredentialProtocol::Generic,
+            origin: self.origin.clone(),
+            methods: BTreeSet::from(["GET".to_owned(), "HEAD".to_owned()]),
+            path_prefixes: vec![self.path_prefix.clone()],
+            header_name: HeaderName::from_static("authorization"),
+            header_value: Zeroizing::new(self.value.clone()),
+        }))
+    }
+}
 struct ChannelAudit(mpsc::Sender<AuditEvent>);
 
 #[async_trait]
@@ -1164,6 +1194,139 @@ async fn intercept_injects_only_gateway_headers_and_validates_sni() {
     assert!(!lowercase.contains("sandbox=cookie"));
     assert!(!lowercase.contains("proxy-authorization"));
     assert!(lowercase.contains("traceparent: 00-"));
+    gateway.drain().await.expect("drain gateway");
+}
+
+/// The private-registry case end to end: bun's own URL shape reaches the registry with the
+/// host-held credential attached, and the workspace never sees the secret.
+#[tokio::test]
+async fn a_scoped_packument_carries_the_held_credential_and_forwards_its_bytes_unchanged() {
+    let (upstream_port, mut captured, _upstream) = http_fixture(1, None).await;
+    let endpoint = free_endpoint();
+    let gateway = gateway(
+        test_config(),
+        Arc::new(ScopedRegistryCredential {
+            repo_id: "owner/repo-registry".to_owned(),
+            origin: format!("http://registry.test:{upstream_port}"),
+            path_prefix: "/api/packages/owner/npm/".to_owned(),
+            value: "Bearer host-held-registry-token".to_owned(),
+        }),
+        Arc::new(LocalConnector {
+            health: UpstreamHealth::Healthy,
+            observed: None,
+        }),
+        Arc::new(DiscardAudit),
+    )
+    .await;
+    let (session, token, _ca) = session(
+        "registry",
+        "owner/repo-registry",
+        WorkspaceEndpoint::Tcp(endpoint),
+        9,
+        1,
+        WorkspacePolicy {
+            grants: vec![grant("registry.test", upstream_port)],
+            mirrors: Vec::new(),
+        },
+    );
+    gateway
+        .handle()
+        .install(session)
+        .await
+        .expect("install session");
+
+    // Exactly what bun 1.4 sends for a scoped packument: one encoded slash inside the package
+    // segment, after the registry's own namespace path.
+    let scoped = "/api/packages/owner/npm/@scope%2fpkg";
+    let response = proxy_request(
+        endpoint,
+        absolute_request("registry.test", upstream_port, &token, scoped),
+    )
+    .await;
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+
+    let forwarded = captured.recv().await.expect("captured upstream request");
+    assert!(
+        forwarded.starts_with(&format!("GET {scoped} HTTP/1.1")),
+        "upstream must see the client's own bytes, encoded slash included: {forwarded}"
+    );
+    assert!(
+        forwarded
+            .to_ascii_lowercase()
+            .contains("authorization: bearer host-held-registry-token\r\n"),
+        "{forwarded}"
+    );
+    gateway.drain().await.expect("drain gateway");
+}
+
+/// The refusals that make the admission above safe. Each one must end the request rather than
+/// forward it without the credential: the upstream fixture accepts nothing here.
+#[tokio::test]
+async fn a_request_outside_the_credential_scope_is_refused_and_carries_no_credential() {
+    let (upstream_port, mut captured, _upstream) = http_fixture(0, None).await;
+    let endpoint = free_endpoint();
+    let gateway = gateway(
+        test_config(),
+        Arc::new(ScopedRegistryCredential {
+            repo_id: "owner/repo-scope".to_owned(),
+            origin: format!("http://scope.test:{upstream_port}"),
+            path_prefix: "/api/packages/owner/npm/".to_owned(),
+            value: "Bearer host-held-registry-token".to_owned(),
+        }),
+        Arc::new(LocalConnector {
+            health: UpstreamHealth::Healthy,
+            observed: None,
+        }),
+        Arc::new(DiscardAudit),
+    )
+    .await;
+    let (session, token, _ca) = session(
+        "scope",
+        "owner/repo-scope",
+        WorkspaceEndpoint::Tcp(endpoint),
+        10,
+        1,
+        WorkspacePolicy {
+            grants: vec![grant("scope.test", upstream_port)],
+            mirrors: Vec::new(),
+        },
+    );
+    gateway
+        .handle()
+        .install(session)
+        .await
+        .expect("install session");
+
+    // An encoded slash that would read as the admitted namespace once decoded. Upstream would
+    // read a different resource, so the prefix is matched on raw bytes and this is out of scope.
+    let disguised = "/api%2fpackages/owner/npm/pkg";
+    let response = proxy_request(
+        endpoint,
+        absolute_request("scope.test", upstream_port, &token, disguised),
+    )
+    .await;
+    assert!(response.starts_with("HTTP/1.1 502"), "{response}");
+
+    // A neighbouring namespace on the same origin, plus traversal out of the admitted one.
+    for refused in [
+        "/api/packages/other/npm/pkg",
+        "/api/packages/owner/npm/%2e%2e%2f%2e%2e%2fadmin",
+    ] {
+        let response = proxy_request(
+            endpoint,
+            absolute_request("scope.test", upstream_port, &token, refused),
+        )
+        .await;
+        assert!(
+            response.starts_with("HTTP/1.1 4") || response.starts_with("HTTP/1.1 5"),
+            "{refused} must be refused: {response}"
+        );
+    }
+
+    assert!(
+        captured.try_recv().is_err(),
+        "a refused request must never reach the registry"
+    );
     gateway.drain().await.expect("drain gateway");
 }
 
