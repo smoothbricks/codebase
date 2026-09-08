@@ -73,6 +73,8 @@ export function checkWorkspaceConfig(nxJson: Record<string, unknown>): NxPolicyI
   // Test target default: dependsOn is inferred per project (cargo-test vs ^build/build)
   validateTestTargetDefault(nxJson, 'nx.json', issues);
 
+  validateLintTargetDefault(nxJson, 'nx.json', issues);
+
   // Clean target default
   validateCleanTargetDefault(nxJson, 'nx.json', issues);
 
@@ -109,6 +111,7 @@ export function applyWorkspaceConfig(nxJson: Record<string, unknown>): boolean {
   let changed = removeDisallowedTargetDefaults(nxJson);
   changed = applyBuildTargetDefault(nxJson) || changed;
   changed = applyTestTargetDefault(nxJson) || changed;
+  changed = applyLintTargetDefault(nxJson) || changed;
   changed = applyCleanTargetDefault(nxJson) || changed;
   changed = applyNamedInputDefaults(nxJson) || changed;
   const currentPlugins = Array.isArray(nxJson.plugins) ? nxJson.plugins : [];
@@ -312,6 +315,35 @@ function applyTestTargetDefault(nxJson: Record<string, unknown>): boolean {
   }
   delete test.dependsOn;
   return true;
+}
+
+const inferredLintProperties = ['executor', 'options', 'dependsOn', 'outputs', 'inputs'] as const;
+
+function validateLintTargetDefault(nxJson: Record<string, unknown>, nxJsonPath: string, issues: NxPolicyIssue[]): void {
+  const defaults = recordProperty(nxJson, 'targetDefaults');
+  const lint = defaults ? recordProperty(defaults, 'lint') : null;
+  for (const property of inferredLintProperties) {
+    if (lint !== null && property in lint) {
+      issues.push({
+        path: nxJsonPath,
+        message: `targetDefaults.lint.${property} must not be set; @smoothbricks/nx-plugin infers lint from project sources`,
+      });
+    }
+  }
+}
+
+function applyLintTargetDefault(nxJson: Record<string, unknown>): boolean {
+  const defaults = recordProperty(nxJson, 'targetDefaults');
+  const lint = defaults ? recordProperty(defaults, 'lint') : null;
+  if (lint === null) return false;
+  let changed = false;
+  for (const property of inferredLintProperties) {
+    if (property in lint) {
+      delete lint[property];
+      changed = true;
+    }
+  }
+  return changed;
 }
 
 function applyCleanTargetDefault(nxJson: Record<string, unknown>): boolean {
