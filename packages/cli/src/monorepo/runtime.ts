@@ -99,6 +99,18 @@ export function validateRuntimePins(packageJson: PackageJson, runtime: RuntimeVe
     );
     failures++;
   }
+  // manifest only on Bun new enough to keep the lockfile fresh (the stale
+  // guard this replaced failed on 1.4.2). Older Buns silently embed stale
+  // versions, so they fail here with upgrade guidance instead of shipping
+  // bad tarballs.
+  const minimumBunVersion = '1.4.2';
+  const pathBun = parseVersionLenient(runtime.bun);
+  if (!pathBun || compareVersions(pathBun, minimumBunVersion) < 0) {
+    console.error(
+      `PATH bun is ${runtime.bun} but smoo requires bun >= ${minimumBunVersion} for workspace pack resolution; upgrade the shell bun, ${repair}`,
+    );
+    failures++;
+  }
   const typesNode = packageJson.devDependencies?.['@types/node'] ?? null;
   const typesNodeParts = typesNode ? /^\^(\d+)\.(\d+)\.(\d+)$/.exec(typesNode) : null;
   if (!typesNodeParts || typesNodeParts[1] !== nodeMajor) {
@@ -195,6 +207,12 @@ function versionMajor(version: string): string | null {
 function parseVersion(version: string): [number, number, number] | null {
   const match = /^(\d+)\.(\d+)\.(\d+)$/.exec(version);
   return match ? [Number(match[1]), Number(match[2]), Number(match[3])] : null;
+}
+
+/** Leading numeric triple of a runtime version, tolerating suffixes like `-canary`. */
+function parseVersionLenient(version: string): string | null {
+  const match = /^(\d+)\.(\d+)\.(\d+)/.exec(version);
+  return match ? `${match[1]}.${match[2]}.${match[3]}` : null;
 }
 
 function runtimeCommand(root: string, name: 'bun' | 'node'): string {
