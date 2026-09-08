@@ -569,17 +569,11 @@ pub const MAX_PATH_BYTES: usize = 8192;
 
 /// Is this raw request path well-formed, before any prefix is known?
 ///
-/// The proxy's front door and [`WorkspacePolicy::authorize`] share this, so a request that
-/// reaches prefix matching has already been proven well-formed once. A path strict
-/// [`normalize_path`] accepts keeps exactly its former meaning; the relaxed reading exists for
-/// the single encoded slash npm puts inside one package segment (`/@scope%2fname`), and it still
-/// refuses malformed or truncated escapes, double encoding (`%25`), backslash, NUL, CR, LF and
-/// decoded `.`/`..` segments.
+/// The proxy's front door asks this, and it is the same question [`path_matches_prefix`] answers
+/// against the root prefix every intercept grant already carries — so there is one reading of a
+/// path here, not a front-door reading and a policy reading that could disagree.
 pub fn raw_path_admissible(path: &str) -> Result<(), PolicyError> {
-    if normalize_path(path).is_ok() {
-        return Ok(());
-    }
-    decode_encoded_slashes(path).map(|_| ())
+    path_matches_prefix(path, "/").map(|_| ())
 }
 
 /// Does `raw_path` lie under `prefix`?
@@ -791,7 +785,11 @@ mod tests {
         // A duplicate slash is not new grounds for refusal where strict normalization allowed it.
         assert!(matches("//api/packages", "/").expect("strict path"));
         assert!(normalize_path("/a/%2f/b").is_err());
-        assert!(raw_path_admissible("/a/%2f/b").is_ok());
+        // An escape that decodes to an empty segment stays refused: `/a/%2f/b` reads as `/a//b`,
+        // which is two paths, not one. Only a slash INSIDE a segment (npm's `@scope%2fname`) is
+        // what the relaxed reading exists for.
+        assert!(raw_path_admissible("/a/%2f/b").is_err());
+        assert!(raw_path_admissible("/api/packages/o/npm/@scope%2fname").is_ok());
         assert!(raw_path_admissible("/a/%2e%2e/b").is_err());
         assert!(raw_path_admissible("/a/../b").is_err());
     }
