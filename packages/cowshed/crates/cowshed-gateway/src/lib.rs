@@ -53,6 +53,10 @@ pub use mirror::{
 pub use platform::KeychainCredentialProvider;
 #[cfg(target_os = "linux")]
 pub use platform::SystemdCredentialProvider;
+pub use platform::{
+    CredentialPresence, ScopedCredential, remove_scoped_credential, scoped_credential_presence,
+    store_scoped_credential, validate_scope,
+};
 pub use repo_mirror::{
     GATEWAY_GIT_FETCH_HELPER_ARG, GitFetchHelperError, MirrorInfo, RepoFetchOutcome, RepoFetchPlan,
     RepoMirrorError, RepoMirrorRequest, RepoTransport, run_gateway_git_fetch_helper,
