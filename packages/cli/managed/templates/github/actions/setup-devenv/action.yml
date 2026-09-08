@@ -1,8 +1,8 @@
 name: Setup Nix/devenv
 description: >
   Build the SmoothBricks devenv shell after checkout. Restores the small devenv/direnv actions/cache segment on every
-  runner (eval SQLite + shell scripts). On GARM/NixOS (NIX_REMOTE=daemon + /var/cache/ci) skips Nix install and the
-  large store NAR (host store). On ubuntu/macOS installs Nix and restores the NAR/profile cache.
+  runner (eval SQLite + shell scripts). On host-nix runners (NIX_REMOTE=daemon + /var/cache/ci) skips Nix install and
+  the large store NAR (host store). On ephemeral runners installs Nix and restores the NAR/profile cache.
 
 outputs:
   nix-cache-hit:
@@ -12,7 +12,7 @@ outputs:
     description: Whether the devenv/direnv cache restored from the exact primary key.
     value: ${{ steps.devenv-cache.outputs.cache-hit || 'false' }}
   host-runner:
-    description: Whether this job is on a host-nix runner (GARM) with shared store/caches.
+    description: Whether this job is on a host-nix runner with shared store/caches.
     value: ${{ steps.runner-kind.outputs.host }}
 
 runs:
@@ -37,40 +37,53 @@ runs:
 
     # Nx names its cache metadata DB after the machine identity
     # (.nx/workspace-data/<machine-id>-v3.db) and refuses artifacts written by a
-    # different machine. Each runner instance is a fresh clone that generates its
-    # own id on first boot, so a restored DB is never the file Nx opens: measured,
-    # every artifact came back unrecognized and the transfer was wasted. GitHub's
-    # hosted images ship one baked id, which is why the same wiring works there.
+    # different machine. Each Linux runner instance is a fresh clone that
+    # generates its own id on first boot, so a restored DB is never the file Nx
+    # opens: measured, every artifact came back unrecognized and the transfer
+    # was wasted. GitHub's hosted images ship one baked id, which is why the
+    # same wiring works there.
     #
-    # Pin the id, then keep the cache on the shared mutable bind instead of
-    # shipping it through the Actions cache. One host is then one cache with one
-    # identity, which is the only arrangement Nx trusts. Artifacts AND metadata
-    # must move together: the DB alone is where "Nx recognizes this" lives.
+    # Pin the id on Linux, then keep the cache on the shared mutable bind
+    # instead of shipping it through the Actions cache. One host is then one
+    # cache with one identity, which is the only arrangement Nx trusts.
+    # Artifacts AND metadata must move together: the DB alone is where "Nx
+    # recognizes this" lives. Darwin has a stable native identity and no
+    # /etc/machine-id, so it skips the pin (and the sudo) entirely — the
+    # Linux-only gate below is on runner.os, not on host detection, because
+    # Darwin host jobs take the same host branch.
     #
-    # /etc/machine-id is a plain writable file here, not a mount point. The
-    # durable home for this is the runner image; doing it per job keeps the fix
-    # in one managed place until then.
-    - name: 🧠 Pin the machine id and locate the Nx cache
-      if: steps.runner-kind.outputs.host == 'true'
+    # /etc/machine-id is a plain writable file on the Linux hosts, not a mount
+    # point. The durable home for this is the runner image; doing it per job
+    # keeps the fix in one managed place until then.
+    - name: 🧠 Pin the machine id (Linux hosts only)
+      if: steps.runner-kind.outputs.host == 'true' && runner.os == 'Linux'
       shell: bash
       env:
         # Any valid 32-char lowercase hex; only its stability across instances
         # matters. Shared fleet-wide on purpose — see the cache trust model in
         # the CI workflow's save step.
         FLEET_MACHINE_ID: 5cbb1f9a4d2e4f0f8b6a3c7d9e150246
+      run: |
+        printf '%s\n' "$FLEET_MACHINE_ID" | sudo tee /etc/machine-id >/dev/null
+        echo "machine id : $(cat /etc/machine-id)"
+
+    # Nx cache location on the shared bind: common to every host runner.
+    # Scoped per workflow, and it has to be. workspace-data is not a cache:
+    # it holds project-graph.json, file-map.json and nx_files for ONE
+    # checkout. It cannot be split from the artifacts either -- Nx rejects
+    # cache artifacts it has no DB row for ("Unrecognized Cache Artifacts"),
+    # and that DB lives in workspace-data. Since CI and Publish sit in
+    # different concurrency groups they run simultaneously on one host, so a
+    # repository-wide tree let one workflow rewrite the other's graph state
+    # mid-read; that is what failed a release with a bare non-zero
+    # `nx show project`. Per lane they stay warm and never overlap.
+    - name: 📂 Locate the Nx cache on the shared bind
+      if: steps.runner-kind.outputs.host == 'true'
+      shell: bash
+      env:
         NX_CACHE_REPO: ${{ github.repository }}
         NX_CACHE_LANE: ${{ github.workflow }}
       run: |
-        printf '%s\n' "$FLEET_MACHINE_ID" | sudo tee /etc/machine-id >/dev/null
-        # Scoped per workflow, and it has to be. workspace-data is not a cache:
-        # it holds project-graph.json, file-map.json and nx_files for ONE
-        # checkout. It cannot be split from the artifacts either -- Nx rejects
-        # cache artifacts it has no DB row for ("Unrecognized Cache Artifacts"),
-        # and that DB lives in workspace-data. Since CI and Publish sit in
-        # different concurrency groups they run simultaneously on one host, so a
-        # repository-wide tree let one workflow rewrite the other's graph state
-        # mid-read; that is what failed a release with a bare non-zero
-        # `nx show project`. Per lane they stay warm and never overlap.
         lane=$(printf '%s' "$NX_CACHE_LANE" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9._-' '-')
         NX_CACHE_ROOT="/var/cache/ci/nx/$NX_CACHE_REPO/${lane:-default}"
         mkdir -p "$NX_CACHE_ROOT/cache" "$NX_CACHE_ROOT/workspace-data"
@@ -82,7 +95,6 @@ runs:
           # silent miss, but deleting the DB orphans every artifact.
           echo "NX_MAX_CACHE_SIZE=20GB"
         } >> "$GITHUB_ENV"
-        echo "machine id : $(cat /etc/machine-id)"
         echo "nx cache   : $NX_CACHE_ROOT"
 
     # Devenv segment (own key): tooling/direnv/.devenv + .direnv — includes
