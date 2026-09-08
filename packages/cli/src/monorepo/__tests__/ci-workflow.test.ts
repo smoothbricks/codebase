@@ -416,7 +416,7 @@ describe('renderCiWorkflowYaml with deploy configuration', () => {
       deploy: true,
       deployProvider: 'cloudflare',
       e2eDeployment: true,
-      pushBranches: ['private'],
+      pushBranches: ['trunk'],
       environments: { staging: 'staging', production: 'production' },
       deploySecrets: { E2E_CONTROL_TOKEN: 'E2E_CONTROL_TOKEN', GITHUB_CLIENT_SECRET: 'EXAMPLE_GITHUB_CLIENT_SECRET' },
       e2eSecrets: { GIT_CRYPT_KEY_B64: 'GIT_CRYPT_KEY_B64' },
@@ -443,7 +443,7 @@ describe('renderCiWorkflowYaml with deploy configuration', () => {
   });
 
   it('uses the configured push branch for the staging deploy condition', () => {
-    expect(rendered).toContain("(github.event_name == 'push' && github.ref == 'refs/heads/private')");
+    expect(rendered).toContain("(github.event_name == 'push' && github.ref == 'refs/heads/trunk')");
   });
 
   it('adds a production-on-push job gated on validate and the e2e job', () => {
@@ -452,7 +452,7 @@ describe('renderCiWorkflowYaml with deploy configuration', () => {
     );
     expect(rendered).toContain('    environment: production\n');
     expect(rendered).toContain(
-      "    if: ${{ !cancelled() && github.event_name == 'push' && github.ref == 'refs/heads/private' && needs.main.result == 'success' && (needs.e2e-deployment.result == 'success' || needs.e2e-deployment.result == 'skipped') }}",
+      "    if: ${{ !cancelled() && github.event_name == 'push' && github.ref == 'refs/heads/trunk' && needs.main.result == 'success' && (needs.e2e-deployment.result == 'success' || needs.e2e-deployment.result == 'skipped') }}",
     );
     expect(rendered).toContain(
       'run: smoo github-ci nx-deploy --stage production --mode run-many --select-tag production-push-deploy-target --name "Deploy Production" --step 4',
@@ -461,13 +461,13 @@ describe('renderCiWorkflowYaml with deploy configuration', () => {
 
   it('gates production on validate alone when there is no e2e job', () => {
     const withoutE2e = renderCiWorkflowYaml(
-      options({ deploy: true, deployProvider: 'cloudflare', pushBranches: ['private'], productionOnPush: true }),
+      options({ deploy: true, deployProvider: 'cloudflare', pushBranches: ['trunk'], productionOnPush: true }),
     );
     const productionJob = withoutE2e.slice(withoutE2e.indexOf('  deploy-production:'));
 
     expect(productionJob).toContain('    needs: [main]\n');
     expect(productionJob).toContain(
-      "    if: ${{ !cancelled() && github.event_name == 'push' && github.ref == 'refs/heads/private' && needs.main.result == 'success' }}",
+      "    if: ${{ !cancelled() && github.event_name == 'push' && github.ref == 'refs/heads/trunk' && needs.main.result == 'success' }}",
     );
     expect(productionJob).not.toContain('needs.e2e-deployment');
   });

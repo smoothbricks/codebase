@@ -450,6 +450,7 @@ const context = (overrides: Partial<ManagedFileContext>): ManagedFileContext => 
   hasE2eDeploymentTargets: false,
   ciPushBranches: ['main'],
   ciRunsOn: 'ubuntu-latest',
+  macosRunsOn: 'macos-latest',
   ciDeploySecrets: {},
   ciE2eSecrets: {},
   nodeModulesCacheKey: 'key',
@@ -460,7 +461,6 @@ const context = (overrides: Partial<ManagedFileContext>): ManagedFileContext => 
 });
 
 describe('publish workflow rendering by repo shape', () => {
-
   it('drops the release half for a repo that deploys production but owns no packages', () => {
     const rendered = renderManagedWorkflowForTest(
       'publish-workflow',
@@ -483,7 +483,8 @@ describe('publish workflow rendering by repo shape', () => {
   });
 
   it('threads declared privateNpm into the publish workflow as job-level read token', () => {
-    const rendered = renderManagedPublishWorkflowForTest(
+    const rendered = renderManagedWorkflowForTest(
+      'publish-workflow',
       context({
         privateNpm: {
           scope: '@priv.test',
