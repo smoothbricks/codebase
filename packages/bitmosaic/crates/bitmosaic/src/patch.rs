@@ -588,11 +588,11 @@ fn kind_of(arm: Arm) -> u32 {
 fn finish(scratch: &mut PatchScratch, card: u32) -> Fresh {
     let n = card as usize;
     let plane = &*scratch.plane;
-    let (_, _, first, _) = word_window(plane);
     let arm = if n <= ARRAY_MAX {
         extract(plane, &mut scratch.members);
         choose_arm(&scratch.members, true)
     } else {
+        let (_, _, first, _) = word_window(plane);
         dense_arm(plane, usize::from(first), n)
     };
     if matches!(arm, Arm::Runs { .. }) {
@@ -603,20 +603,14 @@ fn finish(scratch: &mut PatchScratch, card: u32) -> Fresh {
 
 /// Ladder `scratch.members` (ascending, `1..=ARRAY_MAX` of them) and emit
 /// the chosen payload: the member form of [`finish`], for a chunk merged
-/// as a sequence rather than staged on the plane. The ladder is the same
-/// call, so the bytes are the plane path's; the one arm that needs the
-/// plane — `Words`, offered to every ladder — builds it from the members
-/// and takes the plane path, which re-derives the same verdict.
+/// as a sequence rather than staged on the plane. Array costs at most
+/// `2 * ARRAY_MAX` bytes, less than Words, so omitting the unbacked Words
+/// candidate preserves the plane path's verdict and bytes.
 fn finish_members(scratch: &mut PatchScratch, card: u32) -> Fresh {
     debug_assert_eq!(scratch.members.len(), card as usize);
-    let arm = choose_arm(&scratch.members, true);
-    if matches!(arm, Arm::Words) {
-        scratch.plane.fill(0);
-        for i in 0..scratch.members.len() {
-            set_bit(&mut scratch.plane, scratch.members[i]);
-        }
-        return finish(scratch, card);
-    }
+    debug_assert!((1..=ARRAY_MAX).contains(&scratch.members.len()));
+    debug_assert!(scratch.members.windows(2).all(|pair| pair[0] < pair[1]));
+    let arm = choose_arm(&scratch.members, false);
     if matches!(arm, Arm::Runs { .. }) {
         prepare_runs(scratch, card);
     }
@@ -770,13 +764,15 @@ fn merge_interval_events<W: Witness>(
 fn emit_arm(scratch: &mut PatchScratch, arm: Arm, card: u32) -> Fresh {
     let n = card as usize;
     let plane = &*scratch.plane;
-    let (lo, hi, _, _) = word_window(plane);
     let len = match arm {
         Arm::Runs { count } => runs_payload_len(count),
         Arm::Stride { .. } => 4,
         Arm::Cone { .. } => 11 + n,
         Arm::Array => 2 * n,
-        Arm::Words => words_payload_len(hi - lo),
+        Arm::Words => {
+            let (lo, hi, _, _) = word_window(plane);
+            words_payload_len(hi - lo)
+        }
     };
     let at = scratch.staged.len();
     scratch.staged.resize(at + len, 0);
@@ -2420,27 +2416,18 @@ fn splice_ef(
     let new_zeros = (u64::from(new_span) >> b) + 1;
 
     // Output regions. The high plane goes straight into the build at its
-    // final offset; the low plane and the samples are staged, because
-    // their offsets depend on the cardinality the pass is about to count.
+    // final offset; only the low plane is staged because its final offset
+    // depends on the cardinality the pass is about to count.
     let n_max = n + adds.len() as u64;
     let high_words_max = (new_zeros + n_max).div_ceil(64) as usize;
-    let ones_samples_bytes = (n_max.div_ceil(u64::from(SAMPLE_STRIDE)) as usize + 1) * 4;
-    let zero_samples_bytes = (new_zeros
-        .max(layout.zeros)
-        .div_ceil(u64::from(SAMPLE_STRIDE)) as usize
-        + 1)
-        * 4;
     let low_bytes_max = ((n_max * u64::from(b)).div_ceil(8) as usize).div_ceil(8) * 8 + 16;
     // Grow-only buffers: every byte the result reads is written below, so
     // nothing is zeroed here.
     let build = &mut scratch.build;
     grow(build, high_words_max * 8 + 8);
     let staged = &mut scratch.staged;
-    grow(
-        staged,
-        ones_samples_bytes + zero_samples_bytes + low_bytes_max,
-    );
-    let low_out = &mut staged[ones_samples_bytes + zero_samples_bytes..];
+    grow(staged, low_bytes_max);
+    let low_out = &mut staged[..];
 
     let src = ef.bytes;
     let low_src = &src[layout.low_at()..];
@@ -2583,7 +2570,7 @@ fn splice_ef(
     let payload_at = ef_total - new_layout.payload_bytes();
     build.copy_within(0..new_layout.high_words * 8, payload_at);
     let payload = &mut build[payload_at..ef_total];
-    let low_out = &scratch.staged[ones_samples_bytes + zero_samples_bytes..];
+    let low_out = &scratch.staged;
     let low_at = new_layout.low_at();
     payload[low_at..low_at + new_layout.low_bytes]
         .copy_from_slice(&low_out[..new_layout.low_bytes]);

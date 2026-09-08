@@ -132,14 +132,12 @@ pub(crate) fn encode_into(
         let word = read_u64_at(high, at) | 1u64 << (p % 64);
         high[at..at + 8].copy_from_slice(&word.to_le_bytes());
 
-        // Zeros in [next_zero, h) all sit at bit `z + k`, so their sample
-        // positions are known without ever scanning the high plane back.
+        // Sampled zeros below h sit at bit `z + k`; next_zero advances
+        // only to the next sample, without visiting unsampled buckets.
         while next_zero < h {
-            if next_zero.is_multiple_of(stride) {
-                let at = (next_zero / stride) as usize * 4;
-                zero_s[at..at + 4].copy_from_slice(&((next_zero + k) as u32).to_le_bytes());
-            }
-            next_zero += 1;
+            let at = (next_zero / stride) as usize * 4;
+            zero_s[at..at + 4].copy_from_slice(&((next_zero + k) as u32).to_le_bytes());
+            next_zero += stride;
         }
 
         if k != 0 && k.is_multiple_of(stride) {
@@ -160,11 +158,9 @@ pub(crate) fn encode_into(
     }
     // Buckets past the last value: one final run of zeros, all at `z + n`.
     while next_zero < layout.zeros {
-        if next_zero.is_multiple_of(stride) {
-            let at = (next_zero / stride) as usize * 4;
-            zero_s[at..at + 4].copy_from_slice(&((next_zero + count) as u32).to_le_bytes());
-        }
-        next_zero += 1;
+        let at = (next_zero / stride) as usize * 4;
+        zero_s[at..at + 4].copy_from_slice(&((next_zero + count) as u32).to_le_bytes());
+        next_zero += stride;
     }
 }
 
