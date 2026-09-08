@@ -91,7 +91,11 @@ function mustNames(stdout: string): string[] {
  * tests execute Bun itself instead of host utilities. Real spawn path,
  * portable binary.
  */
-const emit = (text: string): string[] => [process.execPath, '-e', `process.stdout.write(${JSON.stringify(text)})`];
+const emit = (text: string): readonly [string, ...string[]] => [
+  process.execPath,
+  '-e',
+  `process.stdout.write(${JSON.stringify(text)})`,
+];
 /**
  * Runs one script against the raw module in a plain Bun child. The child env
  * carries only PATH/HOME so parent suite state (CI, workspace tokens) cannot
