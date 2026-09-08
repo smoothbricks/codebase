@@ -12,6 +12,23 @@ export function isNonEmpty<T>(items: T[]): items is NonEmptyArray<T> {
   return items.length > 0;
 }
 
+/** A git branch usable as a workflow push trigger; an empty string would render a trigger that matches nothing. */
+export type BranchName = string & typia.tags.MinLength<1>;
+
+/**
+ * A repository secret referenced from a workflow `env:` block. GitHub forbids creating secrets whose name
+ * starts with GITHUB_, so such a reference could only ever resolve to an empty value.
+ */
+export type RepositorySecretName = string &
+  typia.tags.MinLength<1> &
+  typia.tags.Pattern<'^(?![Gg][Ii][Tt][Hh][Uu][Bb]_)'>;
+
+/** Environment variable names mapped to repository secret names. */
+export type SecretEnvMap = Record<string, RepositorySecretName>;
+
+/** A pull-request preview URL template; `{stage}` is replaced with the stage name at deploy time. */
+export type PreviewUrlTemplate = string & typia.tags.Pattern<'.*\\{stage\\}.*'>;
+
 export interface PackageRepository {
   type?: string;
   url?: string;
@@ -41,16 +58,15 @@ export interface PackageSmooGithubEnvironments {
 export interface PackageSmooGithub {
   /** Action repository provider selected while generating workflows. Default: GitHub. */
   actionsProvider?: 'github' | 'forgejo';
-  pushBranches?: string[];
+  pushBranches?: NonEmptyArray<BranchName>;
   /** GitHub Actions runs-on for managed CI (string or label list). Default: ubuntu-latest. */
   runsOn?: string | string[];
   environments?: PackageSmooGithubEnvironments;
-  /** Extra deploy secrets, mapped from environment variable names to repository secret names. */
-  deploySecrets?: Record<string, string>;
+  deploySecrets?: SecretEnvMap;
   /** Secrets exposed only to the e2e-deployment step. */
-  e2eSecrets?: Record<string, string>;
+  e2eSecrets?: SecretEnvMap;
   /** Pull-request preview URL templates; `{stage}` is replaced with the stage name. */
-  previewUrls?: string[];
+  previewUrls?: PreviewUrlTemplate[];
   /** macOS platform job runs-on labels (string or label list). Default: macos-latest. */
   macosRunsOn?: string | string[];
   /** Opt in to building foreign platform artifacts on Linux without native-host runtime tests. */
@@ -303,8 +319,7 @@ export function readSmooGithub(root: string): PackageSmooGithub | undefined {
 
 /** The branches whose pushes drive the managed CI; the first one maps to the staging stage. */
 export function ciPushBranches(github: PackageSmooGithub | undefined): NonEmptyArray<string> {
-  const configured = (github?.pushBranches ?? []).filter((branch) => branch.length > 0);
-  return isNonEmpty(configured) ? configured : ['main'];
+  return github?.pushBranches ?? ['main'];
 }
 
 /** Ensure package.json.scripts exists. */
