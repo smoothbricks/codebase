@@ -84,12 +84,19 @@ export interface SourceReleaseCredential {
  * `repo`, in resolution order.
  *
  * The ambient forge credentials (GH_TOKEN, GITHUB_TOKEN) count only when the
- * ambient forge *is* the source forge. Forgejo Actions exports GITHUB_TOKEN
- * and GITHUB_SERVER_URL exactly as GitHub Actions does, and a developer shell
- * normally holds a GitHub PAT in GH_TOKEN, so an ungated ambient token sends
- * one forge's credential to another forge's host: an unexplainable 401 in the
- * good case, credential disclosure in the bad one. GITHUB_SERVER_URL names
- * the forge that issued the ambient token.
+ * ambient forge *is* the forge hosting the source repository. Forgejo Actions
+ * exports GITHUB_TOKEN and GITHUB_SERVER_URL exactly as GitHub Actions does,
+ * and a developer shell normally holds a GitHub PAT in GH_TOKEN, so an
+ * ungated ambient token sends one forge's credential to another forge's host:
+ * an unexplainable 401 in the good case, credential disclosure in the bad one.
+ *
+ * Identity cannot be decided on the server URL alone. A runner reaches its own
+ * instance through whatever address its network gives it -- the observed
+ * Forgejo GARM runner checks out `http://10.89.0.1:3000/<owner>/<repo>` while
+ * the repository's public URL is `https://<public-host>/<owner>/<repo>` -- so
+ * requiring the public host would refuse the instance's own token and break
+ * the version/tag/status steps that run before any publisher secret exists.
+ * See ambientForgeIsSource for the accepted evidence.
  *
  * The declared private-npm publisher variable comes last, and only for a
  * source forge that also hosts the declared registry: it is that host's
@@ -101,7 +108,7 @@ export function sourceReleaseTokenEnvNames(
   env: Record<string, string | undefined> = process.env,
 ): string[] {
   const sourceHost = repo.kind === 'github' ? 'github.com' : new URL(repo.htmlBase).host;
-  const names = ambientForgeIsSource(sourceHost, env) ? ['GH_TOKEN', 'GITHUB_TOKEN'] : [];
+  const names = ambientForgeIsSource(repo, sourceHost, env) ? ['GH_TOKEN', 'GITHUB_TOKEN'] : [];
   const declared = readPackageJsonObject(join(root, 'package.json'))?.smoo?.privateNpm?.publishTokenEnv;
   if (declared && !names.includes(declared) && declaredRegistryHostsSource(sourceHost, root)) {
     names.push(declared);
@@ -127,19 +134,50 @@ export function resolveSourceReleaseToken(
   return null;
 }
 
-function ambientForgeIsSource(sourceHost: string, env: Record<string, string | undefined>): boolean {
+const GITHUB_HOST = /^(?:www\.)?github\.com$/i;
+
+/**
+ * Whether the ambient CI credential belongs to the forge that hosts the source
+ * repository. Accepted evidence, narrowest first:
+ *
+ * - `GITHUB_SERVER_URL` host equals the source host: same forge, said plainly.
+ * - The ambient forge is not GitHub and `GITHUB_REPOSITORY` names exactly the
+ *   repository being called. A Forgejo instance mints GITHUB_TOKEN for one
+ *   repository and hands the runner an internal address for itself, so the
+ *   repository identity is the only stable link back to the public URL. The
+ *   worst case this admits is a foreign self-hosted instance running a
+ *   same-named repository and leaking its OWN token to us, where we reject it;
+ *   it never spends a credential of ours on a stranger's host.
+ * - No `GITHUB_SERVER_URL` at all, for a github.com source only: an operator
+ *   shell's GH_TOKEN is conventionally GitHub's (gh CLI), and that same
+ *   convention is why it must never reach another forge.
+ *
+ * A GitHub-issued ambient token is never accepted for a non-GitHub source,
+ * repository name match or not: a mirror of the same owner/repo on GitHub is
+ * exactly how a GitHub credential would otherwise be posted to a third party.
+ */
+function ambientForgeIsSource(
+  repo: SourceRepository,
+  sourceHost: string,
+  env: Record<string, string | undefined>,
+): boolean {
   const serverUrl = env.GITHUB_SERVER_URL;
   if (!serverUrl) {
-    // No CI forge identity in the environment: ambient GitHub credentials are
-    // conventionally GitHub's own (gh CLI, developer PATs), so they
-    // authenticate a github.com source and nothing else.
     return sourceHost === 'github.com';
   }
+  let serverHost: string;
   try {
-    return new URL(serverUrl).host === sourceHost;
+    serverHost = new URL(serverUrl).host;
   } catch {
     return false;
   }
+  if (serverHost === sourceHost) {
+    return true;
+  }
+  if (repo.kind === 'github' || GITHUB_HOST.test(serverHost)) {
+    return false;
+  }
+  return env.GITHUB_REPOSITORY?.toLowerCase() === `${repo.owner}/${repo.repo}`.toLowerCase();
 }
 
 function declaredRegistryHostsSource(sourceHost: string, root: string): boolean {

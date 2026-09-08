@@ -174,6 +174,60 @@ describe('source release token resolution', () => {
     });
   });
 
+  it('accepts the instance token when the runner reaches its own forge through an internal address', async () => {
+    await withRoot(manifest, (root) => {
+      const repo = parseSourceRepository(FORGEJO_REPO.url);
+
+      // Observed on the Forgejo GARM runner: the job checks out
+      // http://10.89.0.1:3000/<owner>/<repo> and GITHUB_SERVER_URL is that
+      // container-network address, while the repository's public URL is the
+      // https host. Refusing this token would break the version/tag/status
+      // steps, which run before any publisher secret exists.
+      expect(
+        resolveSourceReleaseToken(repo, root, {
+          GITHUB_SERVER_URL: 'http://10.89.0.1:3000',
+          GITHUB_REPOSITORY: 'fixture-owner/fixture-repo',
+          GITHUB_TOKEN: 'instance-issued-token',
+        }),
+      ).toEqual({ envName: 'GITHUB_TOKEN', token: 'instance-issued-token' });
+
+      // Same instance address, a different repository: that token was minted
+      // for something else.
+      expect(
+        resolveSourceReleaseToken(repo, root, {
+          GITHUB_SERVER_URL: 'http://10.89.0.1:3000',
+          GITHUB_REPOSITORY: 'other-owner/other-repo',
+          GITHUB_TOKEN: 'instance-issued-token',
+        }),
+      ).toBeNull();
+
+      // No repository context to link the alias back to the source at all.
+      expect(
+        resolveSourceReleaseToken(repo, root, {
+          GITHUB_SERVER_URL: 'http://10.89.0.1:3000',
+          GITHUB_TOKEN: 'instance-issued-token',
+        }),
+      ).toBeNull();
+    });
+  });
+
+  it('refuses a GitHub-issued token for a Forgejo source even when the repository name matches', async () => {
+    await withRoot(manifest, (root) => {
+      const repo = parseSourceRepository(FORGEJO_REPO.url);
+
+      // A same-named GitHub mirror is exactly how a GitHub credential would
+      // otherwise be posted to a third-party forge, so repository identity
+      // must not override the public-forge exclusion.
+      expect(
+        resolveSourceReleaseToken(repo, root, {
+          GITHUB_SERVER_URL: 'https://github.com',
+          GITHUB_REPOSITORY: 'fixture-owner/fixture-repo',
+          GITHUB_TOKEN: 'github-issued-token',
+        }),
+      ).toBeNull();
+    });
+  });
+
   it('never sends another forge ambient token to the source forge', async () => {
     await withRoot(
       manifest,
