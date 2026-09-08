@@ -19,6 +19,12 @@
   "references": [
     {
       "path": "./tsconfig.lib.json"
+    },
+    {
+      "path": "../lmao/tsconfig.lib.json"
+    },
+    {
+      "path": "../validation/tsconfig.lib.json"
     }
   ]
 }
