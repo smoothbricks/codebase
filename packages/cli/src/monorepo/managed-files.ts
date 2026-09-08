@@ -414,6 +414,7 @@ function getManagedContent(file: ManagedFile, context: ManagedFileContext): stri
         privateNpm: context.privateNpm,
         sourceCheckouts: context.sourceCheckouts,
         cargoCredentials: context.cargoCredentials,
+        deploySecrets: context.ciDeploySecrets,
       });
     }
     if (file.source === 'pr-preview-cleanup-workflow') {

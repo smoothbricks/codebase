@@ -1222,3 +1222,77 @@ it('refuses malformed Cargo credential declarations at render time', () => {
     'upper-case secret env names',
   );
 });
+
+/**
+ * Deploy credentials are declared once, in `smoo.github.deploySecrets`, and
+ * every managed workflow that deploys renders them the same way. This workflow
+ * used to render the Cloudflare pair alone, so a repository whose production
+ * deploy needs any other credential got a deploy that could not authenticate —
+ * and got it silently, since nothing in the generated YAML mentioned the
+ * declaration it dropped.
+ *
+ * Scope is the other half of the contract, and it is why these assertions read
+ * the parsed workflow rather than the text: the job that deploys is also the job
+ * that repairs pending releases and publishes to npm. Step `env` hands the
+ * credentials to the deploy and to nothing else; job `env` would hand them to
+ * checkout, setup, repair, and the publish itself.
+ */
+it('renders declared deploy secrets on the production deploy step of every deploying shape', () => {
+  const deploySecrets = { BILLING_API_TOKEN: 'BILLING_API_TOKEN', STRIPE_SECRET_KEY: 'SMOO_STRIPE_SECRET_KEY' };
+  const declared = {
+    BILLING_API_TOKEN: '${{ secrets.BILLING_API_TOKEN }}',
+    STRIPE_SECRET_KEY: '${{ secrets.SMOO_STRIPE_SECRET_KEY }}',
+  };
+  const cloudflare = {
+    CLOUDFLARE_API_TOKEN: '${{ secrets.CLOUDFLARE_API_TOKEN }}',
+    CLOUDFLARE_ACCOUNT_ID: '${{ secrets.CLOUDFLARE_ACCOUNT_ID }}',
+  };
+  const shapes: Array<[string, PublishWorkflowDefinitionOptions, Record<string, string>]> = [
+    // Release plus deploy in one job.
+    [
+      'single-job',
+      { deploy: true, deployProvider: 'cloudflare', repoName: '@example/app', deploySecrets },
+      { ...cloudflare, ...declared },
+    ],
+    // Native platform producers, deploy in the final publishing job.
+    [
+      'platform',
+      {
+        deploy: true,
+        deployProvider: 'cloudflare',
+        repoName: '@smoothbricks/codebase',
+        platformTargetGlobs: PLATFORM_TARGET_GLOBS,
+        deploySecrets,
+      },
+      { ...cloudflare, ...declared },
+    ],
+    // Deploys but owns no release packages.
+    [
+      'deploy-only',
+      { deploy: true, release: false, deployProvider: 'cloudflare', repoName: '@example/app', deploySecrets },
+      { ...cloudflare, ...declared },
+    ],
+    // No provider default to fall back on: the declaration is the whole env.
+    ['provider-free', { deploy: true, repoName: '@example/app', deploySecrets }, declared],
+  ];
+
+  for (const [shape, options, expected] of shapes) {
+    const workflow = typia.assert<{
+      jobs: Record<
+        string,
+        { env?: Record<string, string>; steps: Array<{ name?: string; env?: Record<string, string> }> }
+      >;
+    }>(Bun.YAML.parse(renderPublishWorkflowYaml(options)));
+    const steps = Object.values(workflow.jobs).flatMap((job) => job.steps);
+    const deploySteps = steps.filter((step) => step.name?.includes('Deploy production'));
+
+    expect(`${shape}: ${deploySteps.length}`).toBe(`${shape}: 1`);
+    expect({ shape, env: deploySteps[0]?.env }).toEqual({ shape, env: expected });
+
+    const elsewhere = [
+      ...Object.values(workflow.jobs).map((job) => job.env ?? {}),
+      ...steps.filter((step) => step !== deploySteps[0]).map((step) => step.env ?? {}),
+    ].flatMap((env) => Object.keys(env).filter((name) => name in deploySecrets));
+    expect({ shape, elsewhere }).toEqual({ shape, elsewhere: [] });
+  }
+});
