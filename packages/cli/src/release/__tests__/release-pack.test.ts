@@ -195,12 +195,13 @@ describe('release pack artifacts', () => {
   it('ships a declared Wasm export that is present in the files allowlist', async () => {
     await withPackWorkspace(
       async (root) => {
-        const output = join(root, 'artifacts');
-        await releasePack(root, { projects: 'alpha', output });
-        const manifest = await readManifest(output);
-        const tarball = join(output, manifest.packages[0]?.tarball ?? '');
-        const extraction = await Bun.$`tar -xzOf ${tarball} package/dist/reducer.wasm`.nothrow().quiet();
-        expect(extraction.exitCode).toBe(0);
+        const packed = await packReleaseTarball(root, packagedProject(root, 'alpha'));
+        try {
+          const extraction = await Bun.$`tar -xzOf ${packed.tarball} package/dist/reducer.wasm`.quiet();
+          expect(extraction.stdout.toString()).toBe('wasm-bytes');
+        } finally {
+          await packed.cleanup();
+        }
       },
       {
         alphaExports: { '.': './dist/index.js', './reducer.wasm': './dist/reducer.wasm' },
