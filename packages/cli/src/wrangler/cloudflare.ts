@@ -65,24 +65,35 @@ export interface CloudflareClient {
   deleteD1Database(uuid: string): Promise<void>;
 }
 
+/**
+ * The end-of-listing signals a `result_info` can carry. Cloudflare also echoes `page`, `per_page`
+ * and `count`, which no caller here needs: page-numbered endpoints are bounded by `total_pages`
+ * where they send it and by `total_count` where they do not, and R2 paginates by cursor instead.
+ */
+interface CloudflareResultInfo {
+  total_count?: number;
+  total_pages?: number;
+  cursor?: string;
+  is_truncated?: boolean;
+}
+
 interface CloudflareEnvelope {
   success: boolean;
   result?: unknown;
   errors?: Array<{ code?: number; message?: string }> | null;
   messages?: Array<{ code?: number; message?: string }> | null;
-  result_info?: {
-    page?: number;
-    total_pages?: number;
-    cursor?: string;
-    is_truncated?: boolean;
-  };
+  result_info?: CloudflareResultInfo;
 }
 
 const parseCloudflareEnvelope = typia.json.createIsParse<CloudflareEnvelope>();
 /** A body with nothing to read: empty, or the bare `null` some endpoints answer with. */
 const EMPTY_BODY = /^\s*(?:null)?\s*$/;
-/** What a 2xx without an envelope means; one shared value, never allocated per response. */
-const EMPTY_SUCCESS: CloudflareEnvelope = Object.freeze({ success: true });
+/** Cloudflare rejects a larger page outright; KV, R2, DNS and D1 all document 1000 as legal. */
+const PAGE_SIZE = 1000;
+/** `GET /zones` caps `per_page` at 50, so the shared page size would be a 400. */
+const ZONE_PAGE_SIZE = 50;
+/** A listing that never reports its end is a broken listing; refuse rather than page forever. */
+const MAX_LIST_PAGES = 1000;
 const isKvNamespaces = typia.createIs<LiveKvNamespace[]>();
 const isR2Buckets = typia.createIs<R2Bucket[]>();
 const isWorkerScripts = typia.createIs<WorkerScript[]>();
@@ -96,6 +107,26 @@ const isR2Objects = typia.createIs<Array<{ key: string }>>();
 const isR2BucketPage = typia.createIs<{ buckets: R2Bucket[] }>();
 const isR2ObjectPage = typia.createIs<{ objects: Array<{ key: string }> }>();
 const isCreatedKvNamespace = typia.createIs<LiveKvNamespace>();
+
+/**
+ * Whether a page-numbered listing continues past `page`. `total_pages` is authoritative where
+ * Cloudflare sends it (DNS records, Workers domains); KV namespaces and D1 databases report only
+ * `total_count`, and R2-style endpoints report neither — so fall back to that count and then to a
+ * short page, which only the final page can be. Trusting a missing `total_pages` as "one page"
+ * silently truncates every account past its first page.
+ */
+function hasPageAfter(
+  page: number,
+  rows: number,
+  collected: number,
+  perPage: number,
+  info: CloudflareResultInfo | undefined,
+): boolean {
+  if (rows === 0) return false;
+  if (info?.total_pages !== undefined) return page < info.total_pages;
+  if (info?.total_count !== undefined && collected < info.total_count) return true;
+  return rows === perPage;
+}
 
 export class CloudflareApiError extends Error {
   constructor(
@@ -124,11 +155,11 @@ export class CloudflareRestClient implements CloudflareClient {
   }
 
   listKvNamespaces(): Promise<LiveKvNamespace[]> {
-    return this.listPageItems(`${this.accountPath}/storage/kv/namespaces`, isKvNamespaces);
+    return this.listPages(`${this.accountPath}/storage/kv/namespaces`, isKvNamespaces, PAGE_SIZE);
   }
 
   async createKvNamespace(title: string): Promise<LiveKvNamespace> {
-    const result = await this.result(`${this.accountPath}/storage/kv/namespaces`, {
+    const { result } = await this.request(`${this.accountPath}/storage/kv/namespaces`, {
       method: 'POST',
       body: JSON.stringify({ title }),
     });
@@ -138,128 +169,110 @@ export class CloudflareRestClient implements CloudflareClient {
     return result;
   }
 
-  async deleteKvNamespace(id: string): Promise<void> {
-    await this.result(`${this.accountPath}/storage/kv/namespaces/${encodeURIComponent(id)}`, { method: 'DELETE' });
+  deleteKvNamespace(id: string): Promise<void> {
+    return this.mutate(`${this.accountPath}/storage/kv/namespaces/${encodeURIComponent(id)}`, { method: 'DELETE' });
   }
 
-  async listR2Buckets(): Promise<R2Bucket[]> {
-    const buckets: R2Bucket[] = [];
-    let page = 1;
-    for (;;) {
-      const envelope = await this.request(`${this.accountPath}/r2/buckets?per_page=1000&page=${page}`);
-      let rows: R2Bucket[];
-      if (isR2Buckets(envelope.result)) rows = envelope.result;
-      else if (isR2BucketPage(envelope.result)) rows = envelope.result.buckets;
-      else throw new Error('Cloudflare returned an invalid R2 bucket listing.');
-      buckets.push(...rows);
-      const totalPages = envelope.result_info?.total_pages ?? page;
-      if (page >= totalPages) break;
-      page += 1;
-    }
-    return buckets;
+  listR2Buckets(): Promise<R2Bucket[]> {
+    // R2 paginates by cursor: a `page` parameter is ignored, so page numbers would re-read the
+    // first 1000 buckets forever or stop there. Either a bare array or a `buckets` page arrives.
+    return this.listCursor(`${this.accountPath}/r2/buckets`, (result) =>
+      isR2Buckets(result) ? result : isR2BucketPage(result) ? result.buckets : undefined,
+    );
   }
 
-  async createR2Bucket(name: string): Promise<void> {
-    await this.result(`${this.accountPath}/r2/buckets`, { method: 'POST', body: JSON.stringify({ name }) });
+  createR2Bucket(name: string): Promise<void> {
+    return this.mutate(`${this.accountPath}/r2/buckets`, { method: 'POST', body: JSON.stringify({ name }) });
   }
 
   async listR2Objects(bucket: string): Promise<string[]> {
-    const keys: string[] = [];
-    let cursor: string | undefined;
-    do {
-      const query = new URLSearchParams({ per_page: '1000' });
-      if (cursor) query.set('cursor', cursor);
-      const envelope = await this.request(
-        `${this.accountPath}/r2/buckets/${encodeURIComponent(bucket)}/objects?${query.toString()}`,
-      );
-      let rows: Array<{ key: string }>;
-      if (isR2Objects(envelope.result)) rows = envelope.result;
-      else if (isR2ObjectPage(envelope.result)) rows = envelope.result.objects;
-      else throw new Error(`Cloudflare returned an invalid object listing for R2 bucket ${bucket}.`);
-      keys.push(...rows.map((row) => row.key));
-      cursor = envelope.result_info?.is_truncated === true ? envelope.result_info.cursor : undefined;
-    } while (cursor);
-    return keys;
+    const objects = await this.listCursor(
+      `${this.accountPath}/r2/buckets/${encodeURIComponent(bucket)}/objects`,
+      (result) => (isR2Objects(result) ? result : isR2ObjectPage(result) ? result.objects : undefined),
+    );
+    return objects.map((object) => object.key);
   }
 
-  async deleteR2Object(bucket: string, key: string): Promise<void> {
+  deleteR2Object(bucket: string, key: string): Promise<void> {
     const objectPath = key.split('/').map(encodeURIComponent).join('/');
-    await this.result(`${this.accountPath}/r2/buckets/${encodeURIComponent(bucket)}/objects/${objectPath}`, {
+    return this.mutate(`${this.accountPath}/r2/buckets/${encodeURIComponent(bucket)}/objects/${objectPath}`, {
       method: 'DELETE',
     });
   }
 
-  async deleteR2Bucket(name: string): Promise<void> {
-    await this.result(`${this.accountPath}/r2/buckets/${encodeURIComponent(name)}`, { method: 'DELETE' });
+  deleteR2Bucket(name: string): Promise<void> {
+    return this.mutate(`${this.accountPath}/r2/buckets/${encodeURIComponent(name)}`, { method: 'DELETE' });
   }
 
   listWorkerScripts(): Promise<WorkerScript[]> {
-    return this.listPageItems(`${this.accountPath}/workers/scripts`, isWorkerScripts);
+    // `workers/scripts` takes no pagination parameters: the account's scripts arrive in one answer.
+    return this.listOnce(`${this.accountPath}/workers/scripts`, isWorkerScripts);
   }
 
-  async deleteWorkerScript(name: string): Promise<void> {
-    await this.result(`${this.accountPath}/workers/scripts/${encodeURIComponent(name)}`, { method: 'DELETE' });
+  deleteWorkerScript(name: string): Promise<void> {
+    return this.mutate(`${this.accountPath}/workers/scripts/${encodeURIComponent(name)}`, { method: 'DELETE' });
   }
 
   listWorkerDomains(): Promise<WorkerDomain[]> {
-    return this.listPageItems(`${this.accountPath}/workers/domains`, isWorkerDomains);
+    return this.listPages(`${this.accountPath}/workers/domains`, isWorkerDomains, PAGE_SIZE);
   }
 
-  async createWorkerDomain(hostname: string, workerName: string, zoneId: string): Promise<void> {
-    await this.result(`${this.accountPath}/workers/domains`, {
+  createWorkerDomain(hostname: string, workerName: string, zoneId: string): Promise<void> {
+    return this.mutate(`${this.accountPath}/workers/domains`, {
       method: 'PUT',
       body: JSON.stringify({ hostname, service: workerName, zone_id: zoneId }),
     });
   }
 
-  async deleteWorkerDomain(id: string): Promise<void> {
-    await this.result(`${this.accountPath}/workers/domains/${encodeURIComponent(id)}`, { method: 'DELETE' });
+  deleteWorkerDomain(id: string): Promise<void> {
+    return this.mutate(`${this.accountPath}/workers/domains/${encodeURIComponent(id)}`, { method: 'DELETE' });
   }
 
   listZones(): Promise<CloudflareZone[]> {
-    return this.listPageItems('/zones', isCloudflareZones);
+    return this.listPages('/zones', isCloudflareZones, ZONE_PAGE_SIZE);
   }
 
   listWorkerRoutes(zoneId: string): Promise<WorkerRoute[]> {
-    return this.listPageItems(`/zones/${encodeURIComponent(zoneId)}/workers/routes`, isWorkerRoutes);
+    // A zone's route table is unpaginated as well.
+    return this.listOnce(`/zones/${encodeURIComponent(zoneId)}/workers/routes`, isWorkerRoutes);
   }
 
-  async createWorkerRoute(zoneId: string, pattern: string, workerName: string): Promise<void> {
-    await this.result(`/zones/${encodeURIComponent(zoneId)}/workers/routes`, {
+  createWorkerRoute(zoneId: string, pattern: string, workerName: string): Promise<void> {
+    return this.mutate(`/zones/${encodeURIComponent(zoneId)}/workers/routes`, {
       method: 'POST',
       body: JSON.stringify({ pattern, script: workerName }),
     });
   }
 
-  async deleteWorkerRoute(zoneId: string, routeId: string): Promise<void> {
-    await this.result(`/zones/${encodeURIComponent(zoneId)}/workers/routes/${encodeURIComponent(routeId)}`, {
+  deleteWorkerRoute(zoneId: string, routeId: string): Promise<void> {
+    return this.mutate(`/zones/${encodeURIComponent(zoneId)}/workers/routes/${encodeURIComponent(routeId)}`, {
       method: 'DELETE',
     });
   }
 
   listDnsRecords(zoneId: string): Promise<DnsRecord[]> {
-    return this.listPageItems(`/zones/${encodeURIComponent(zoneId)}/dns_records`, isDnsRecords);
+    return this.listPages(`/zones/${encodeURIComponent(zoneId)}/dns_records`, isDnsRecords, PAGE_SIZE);
   }
 
-  async createDnsRecord(zoneId: string, name: string, content: string): Promise<void> {
-    await this.result(`/zones/${encodeURIComponent(zoneId)}/dns_records`, {
+  createDnsRecord(zoneId: string, name: string, content: string): Promise<void> {
+    return this.mutate(`/zones/${encodeURIComponent(zoneId)}/dns_records`, {
       method: 'POST',
       body: JSON.stringify({ type: 'CNAME', name, content, proxied: true }),
     });
   }
 
-  async deleteDnsRecord(zoneId: string, recordId: string): Promise<void> {
-    await this.result(`/zones/${encodeURIComponent(zoneId)}/dns_records/${encodeURIComponent(recordId)}`, {
+  deleteDnsRecord(zoneId: string, recordId: string): Promise<void> {
+    return this.mutate(`/zones/${encodeURIComponent(zoneId)}/dns_records/${encodeURIComponent(recordId)}`, {
       method: 'DELETE',
     });
   }
 
   listD1Databases(): Promise<D1DatabaseRecord[]> {
-    return this.listPageItems(`${this.accountPath}/d1/database`, isD1Databases);
+    return this.listPages(`${this.accountPath}/d1/database`, isD1Databases, PAGE_SIZE);
   }
 
   async createD1Database(name: string): Promise<D1DatabaseRecord> {
-    const result = await this.result(`${this.accountPath}/d1/database`, {
+    const { result } = await this.request(`${this.accountPath}/d1/database`, {
       method: 'POST',
       body: JSON.stringify({ name }),
     });
@@ -269,32 +282,80 @@ export class CloudflareRestClient implements CloudflareClient {
     return result;
   }
 
-  async deleteD1Database(uuid: string): Promise<void> {
-    await this.result(`${this.accountPath}/d1/database/${encodeURIComponent(uuid)}`, { method: 'DELETE' });
+  deleteD1Database(uuid: string): Promise<void> {
+    return this.mutate(`${this.accountPath}/d1/database/${encodeURIComponent(uuid)}`, { method: 'DELETE' });
   }
 
-  private async listPageItems<T>(path: string, isItems: (value: unknown) => value is T[]): Promise<T[]> {
+  /** An endpoint that answers its whole collection at once. */
+  private async listOnce<T>(path: string, isItems: (value: unknown) => value is T[]): Promise<T[]> {
+    const envelope = await this.request(path);
+    if (!isItems(envelope.result)) {
+      throw new Error(`Cloudflare returned an invalid listing for ${path}.`);
+    }
+    return envelope.result;
+  }
+
+  private async listPages<T>(path: string, isItems: (value: unknown) => value is T[], perPage: number): Promise<T[]> {
     const items: T[] = [];
-    let page = 1;
-    for (;;) {
-      const separator = path.includes('?') ? '&' : '?';
-      const envelope = await this.request(`${path}${separator}per_page=1000&page=${page}`);
+    for (let page = 1; page <= MAX_LIST_PAGES; page += 1) {
+      const envelope = await this.request(`${path}?per_page=${perPage}&page=${page}`);
       if (!isItems(envelope.result)) {
         throw new Error(`Cloudflare returned an invalid paginated result for ${path}.`);
       }
-      items.push(...envelope.result);
-      const totalPages = envelope.result_info?.total_pages ?? page;
-      if (page >= totalPages) break;
-      page += 1;
+      const rows = envelope.result;
+      items.push(...rows);
+      if (!hasPageAfter(page, rows.length, items.length, perPage, envelope.result_info)) return items;
     }
-    return items;
+    throw new Error(`Cloudflare paged ${path} past ${MAX_LIST_PAGES} pages without reporting an end.`);
   }
 
-  private async result(path: string, init?: RequestInit): Promise<unknown> {
-    return (await this.request(path, init)).result;
+  private async listCursor<T>(path: string, readRows: (result: unknown) => T[] | undefined): Promise<T[]> {
+    const items: T[] = [];
+    let cursor: string | undefined;
+    for (let page = 1; page <= MAX_LIST_PAGES; page += 1) {
+      const query = new URLSearchParams({ per_page: String(PAGE_SIZE) });
+      if (cursor !== undefined) query.set('cursor', cursor);
+      const envelope = await this.request(`${path}?${query.toString()}`);
+      const rows = readRows(envelope.result);
+      if (!rows) {
+        throw new Error(`Cloudflare returned an invalid listing for ${path}.`);
+      }
+      items.push(...rows);
+      const info = envelope.result_info;
+      const next = info?.cursor;
+      // `is_truncated` is authoritative where the endpoint sends it (objects); where it does not
+      // (buckets) only the last page can be short.
+      const truncated = info?.is_truncated ?? rows.length === PAGE_SIZE;
+      if (rows.length === 0 || next === undefined || next === '' || !truncated) return items;
+      if (next === cursor) {
+        throw new Error(`Cloudflare repeated one pagination cursor for ${path}, so the listing never ends.`);
+      }
+      cursor = next;
+    }
+    throw new Error(`Cloudflare paged ${path} past ${MAX_LIST_PAGES} pages without reporting an end.`);
   }
 
-  private async request(path: string, init: RequestInit = {}): Promise<CloudflareEnvelope> {
+  /** A read: the payload *is* the envelope, so a 2xx carrying nothing is a failed read. */
+  private async request(path: string, init?: RequestInit): Promise<CloudflareEnvelope> {
+    const { response, text } = await this.send(path, init);
+    if (response.ok && EMPTY_BODY.test(text)) {
+      throw new CloudflareApiError(`Cloudflare returned an empty response body for ${path}.`, response.status, []);
+    }
+    return readEnvelope(path, response.status, response.ok, text);
+  }
+
+  /**
+   * A mutation with nothing to read back. A few endpoints (Workers custom-domain delete among them)
+   * answer a successful call with no envelope at all: an empty body or a bare null. On a 2xx that
+   * carries nothing to read, the call succeeded.
+   */
+  private async mutate(path: string, init: RequestInit): Promise<void> {
+    const { response, text } = await this.send(path, init);
+    if (response.ok && EMPTY_BODY.test(text)) return;
+    readEnvelope(path, response.status, response.ok, text);
+  }
+
+  private async send(path: string, init: RequestInit = {}): Promise<{ response: Response; text: string }> {
     const response = await this.fetcher(`https://api.cloudflare.com/client/v4${path}`, {
       ...init,
       headers: {
@@ -303,34 +364,34 @@ export class CloudflareRestClient implements CloudflareClient {
         ...init.headers,
       },
     });
-    const text = await response.text();
-    // A few mutation endpoints (Workers custom-domain delete among them) answer a successful
-    // call with no envelope at all: an empty body or a bare null. On a 2xx that carries
-    // nothing to read, the call succeeded.
-    if (response.ok && EMPTY_BODY.test(text)) return EMPTY_SUCCESS;
-    let body: CloudflareEnvelope | null;
-    try {
-      body = parseCloudflareEnvelope(text);
-    } catch {
-      // Not JSON at all; the same failure as JSON of the wrong shape.
-      body = null;
-    }
-    if (!body) {
-      throw new CloudflareApiError(`Cloudflare returned a malformed response for ${path}.`, response.status, []);
-    }
-    if (!response.ok || !body.success) {
-      const errors = body.errors ?? [];
-      const message =
-        errors
-          .map((error) => error.message)
-          .filter(Boolean)
-          .join('; ') || `HTTP ${response.status}`;
-      throw new CloudflareApiError(
-        `Cloudflare API ${path} failed: ${message}`,
-        response.status,
-        errors.flatMap((error) => error.code ?? []),
-      );
-    }
-    return body;
+    return { response, text: await response.text() };
   }
+}
+
+/** The envelope, or a failure named by endpoint and Cloudflare's own codes — never by credential. */
+function readEnvelope(path: string, status: number, ok: boolean, text: string): CloudflareEnvelope {
+  let body: CloudflareEnvelope | null;
+  try {
+    body = parseCloudflareEnvelope(text);
+  } catch {
+    // Not JSON at all; the same failure as JSON of the wrong shape.
+    body = null;
+  }
+  if (!body) {
+    throw new CloudflareApiError(`Cloudflare returned a malformed response for ${path}.`, status, []);
+  }
+  if (!ok || !body.success) {
+    const errors = body.errors ?? [];
+    const message =
+      errors
+        .map((error) => error.message)
+        .filter(Boolean)
+        .join('; ') || `HTTP ${status}`;
+    throw new CloudflareApiError(
+      `Cloudflare API ${path} failed: ${message}`,
+      status,
+      errors.flatMap((error) => error.code ?? []),
+    );
+  }
+  return body;
 }
