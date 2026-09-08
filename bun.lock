@@ -50,7 +50,7 @@
     },
     "packages/cli": {
       "name": "@smoothbricks/cli",
-      "version": "0.11.5-next.0",
+      "version": "0.11.5",
       "bin": {
         "smoo": "./bin/smoo",
       },
@@ -84,7 +84,7 @@
     },
     "packages/cowshed": {
       "name": "@smoothbricks/cowshed",
-      "version": "0.1.14-next.0",
+      "version": "0.1.14",
       "bin": {
         "cowshed": "./dist/ts/cli.js",
       },
