@@ -24,6 +24,8 @@ export interface PackagePublishConfig {
 }
 
 export interface PackageSmooGithub {
+  /** Action repository provider selected while generating workflows. Default: GitHub. */
+  actionsProvider?: 'github' | 'forgejo';
   pushBranches?: string[];
   /** GitHub Actions runs-on for managed CI (string or label list). Default: ubuntu-latest. */
   runsOn?: string | string[];
