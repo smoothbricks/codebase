@@ -239,8 +239,10 @@ describe('source release endpoint selection', () => {
     await withRoot(manifest, (root) => {
       const repo = parseSourceRepository(FORGEJO_REPO.url);
 
-      // GH_TOKEN in an operator shell is conventionally a GitHub PAT.
-      expect(sourceReleaseTokenEnvNames(repo, root, null, { GH_TOKEN: 'developer-github-pat' })).toEqual([]);
+      // Candidate names do not depend on which variables happen to be set:
+      // outside CI no ambient variable is a candidate at all, so an operator
+      // shell's GitHub PAT can never authenticate this forge.
+      expect(sourceReleaseTokenEnvNames(repo, root, null)).toEqual([]);
       expect(
         resolveSourceReleaseEndpoint(repo, root, null, {
           GH_TOKEN: 'developer-github-pat',
@@ -272,7 +274,7 @@ describe('source release endpoint selection', () => {
       (root) => {
         const repo = parseSourceRepository(FORGEJO_REPO.url);
 
-        expect(sourceReleaseTokenEnvNames(repo, root, null, {})).toEqual([]);
+        expect(sourceReleaseTokenEnvNames(repo, root, null)).toEqual([]);
         expect(
           resolveSourceReleaseEndpoint(repo, root, null, { DECLARED_PUBLISH_TOKEN: 'other-forge-token' }),
         ).toBeNull();
