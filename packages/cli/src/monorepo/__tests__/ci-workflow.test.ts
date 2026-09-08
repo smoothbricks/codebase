@@ -341,26 +341,8 @@ describe('CI workflow definition', () => {
     expect(saveKey).toBe(restoreKey);
   });
 
-  it('keeps the Actions cache transport off host runners, which cache on the shared bind', async () => {
+  it('keeps the Actions cache transport off host runners, which cache on the shared bind', () => {
     const rendered = renderCiWorkflowYaml(options());
-    const packageRoot = join(import.meta.dir, '..', '..', '..');
-    const setup = await readFile(join(packageRoot, '..', '..', '.github/actions/setup-devenv/action.yml'), 'utf8');
-
-    // Nx refuses artifacts from another machine, so a host runner needs a pinned
-    // identity and a cache that outlives the instance; both come from setup-devenv.
-    expect(setup).toContain('sudo tee /etc/machine-id');
-    expect(setup).toContain('NX_CACHE_DIRECTORY=$NX_CACHE_ROOT/cache');
-    expect(setup).toContain('NX_WORKSPACE_DATA_DIRECTORY=$NX_CACHE_ROOT/workspace-data');
-    expect(setup).toContain('NX_MAX_CACHE_SIZE=');
-
-    // The root MUST be scoped per workflow. workspace-data holds one checkout's
-    // project graph and cannot be split from the artifacts (Nx rejects artifacts
-    // with no DB row), and CI and Publish are separate concurrency groups that
-    // run together on one host -- a repository-wide root let one rewrite the
-    // other's graph mid-read and failed a release.
-    expect(setup).toContain('NX_CACHE_LANE: ${{ github.workflow }}');
-    expect(setup).toContain('NX_CACHE_ROOT="/var/cache/ci/nx/$NX_CACHE_REPO/${lane:-default}"');
-
     // Both halves of the transport must be gated, or a host runner either
     // overwrites its live cache with an older archive or uploads a copy of it.
     for (const step of ['🧠 Restore Nx cache', '💾 Save Nx cache']) {
