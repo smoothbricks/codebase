@@ -206,12 +206,24 @@
           "cwd": "packages/cowshed"
         }
       },
+      "wire-warmup": {
+        "executor": "@smoothbricks/nx-plugin:bounded-exec",
+        "cache": false,
+        "options": {
+          "comment": "Build prerequisite for wire-test, not a test: the first load of each project through the compiler preload compiles the typia native plugin, which takes minutes on a cold Go cache and would blow wire-test's 120s bound. The 600s budget here is a build budget, not a test timeout increase: it bounds the compilation while staying inside the workflow's overall bound, and fails loudly instead of hanging release. cache:false is load-bearing — the ttsc plugin cache lives outside Nx outputs, so a cached skip on a fresh runner would run the test cold and hang it again. Uses the same compiler preload specifier as bunfig.toml; the trace preload is absent on purpose (its setup calls afterAll(), which throws outside `bun test`) and adds no plugin key (measured: harness import alone builds the full runtime key set).",
+          "command": "bun --preload @smoothbricks/lmao/bun/preload scripts/warm-ttsc-plugins.mjs",
+          "cwd": "packages/cowshed",
+          "timeoutMs": 600000,
+          "killAfterMs": 10000
+        }
+      },
       "wire-test": {
         "executor": "@smoothbricks/nx-plugin:bounded-exec",
         "cache": true,
         "dependsOn": [
           "typecheck-tests",
-          "wire-fixtures"
+          "wire-fixtures",
+          "wire-warmup"
         ],
         "options": {
           "comment": "Runs from source under the typia transform because the validators under test are the point. Depends on wire-fixtures (the corpus is a generated output, current by construction) and not on cargo-test: the Rust half proves the same corpus through include_str!, and cowshed:test already joins both legs; a cargo-test edge here only meant an unrelated Rust failure deleted this target from the run.",
