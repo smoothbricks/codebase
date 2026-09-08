@@ -2,6 +2,12 @@
 
 export type WorkflowRunsOn = string | string[] | undefined;
 
+/**
+ * The GitHub-hosted Linux runner. Also the fork-PR fallback of every gated
+ * self-hosted label, and the only runner class npmjs accepts provenance from.
+ */
+export const GITHUB_HOSTED_LINUX_RUNNER = 'ubuntu-latest';
+
 export function isNixosRunner(runsOn: WorkflowRunsOn): boolean {
   const labels = runsOn === undefined ? [] : typeof runsOn === 'string' ? [runsOn] : runsOn;
   return labels.some((label) => label === 'nixos' || label.startsWith('nixos-'));

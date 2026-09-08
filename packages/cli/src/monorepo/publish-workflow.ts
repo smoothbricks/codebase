@@ -21,7 +21,7 @@ import {
   cargoCredentialStepLines,
   sourceCheckoutsStepLines,
 } from './ci-workflow.js';
-import { renderRunsOnLine, type WorkflowRunsOn } from './github-runs-on.js';
+import { GITHUB_HOSTED_LINUX_RUNNER, renderRunsOnLine, type WorkflowRunsOn } from './github-runs-on.js';
 
 const PUBLISH_WORKFLOW_FORMAT_OPTIONS = Object.freeze({
   parser: 'yaml',
@@ -453,7 +453,7 @@ defaults:
 
 jobs:
   publish:
-${renderRunsOnLine(options.runsOn)}
+${options.release === false ? renderRunsOnLine(options.runsOn) : publishJobRunsOnLine(options)}
     env:
       NIX_STORE_NAR: ${githubExpression('github.workspace')}/nix-store.nar
       GH_TOKEN: ${githubExpression('github.token')}${cargoCredentialsJobEnv(options)}${privateNpmInstallJobEnv(options)}
@@ -813,7 +813,7 @@ ${renderMacosPlatformSteps(options)}
 
   publish-on-linux:
     needs: [linux-release-candidate, ${options.platformProducer?.kind === 'linux-cross' ? 'cross-platform' : 'macos-platform'}]
-${renderRunsOnLine(options.runsOn)}
+${publishJobRunsOnLine(options)}
     permissions:
       contents: write
       id-token: write
@@ -1368,6 +1368,30 @@ function macosPlatformArtifactNames(options: PublishWorkflowDefinitionOptions): 
 
 function hasLinuxPlatformTargets(options: PublishWorkflowDefinitionOptions): boolean {
   return LINUX_PLATFORM_TARGET_GLOBS.some((glob) => options.platformTargetGlobs?.includes(glob) === true);
+}
+
+/**
+ * Runner for the job that tags and publishes, on GitHub Actions always the
+ * GitHub-hosted one.
+ *
+ * npmjs mints provenance from the job's OIDC token and then rejects the upload
+ * with `422 Unsupported GitHub Actions runner environment "self-hosted", only
+ * github-hosted supported for provenance`: the tarball is signed, the registry
+ * refuses it, and the release is left tagged but unpublished. Publishing from
+ * a GitHub-hosted runner is the fix; dropping `--provenance` is not.
+ *
+ * A `forgejo` actions provider keeps the configured labels: that workflow does
+ * not run on GitHub Actions, so `ubuntu-latest` names no runner there and
+ * there is no GitHub OIDC to mint provenance from in the first place.
+ * Private-registry publishing is unaffected either way — its static publisher
+ * token works from any runner, and its packages ride the same job.
+ *
+ * Build lanes keep `smoo.github.runsOn`: only the publishing job moves. Where
+ * build and publish share one job (no macOS platform fan-out) that whole job
+ * follows the publisher, because that job is the one npmjs sees.
+ */
+function publishJobRunsOnLine(options: PublishWorkflowDefinitionOptions): string {
+  return renderRunsOnLine(options.actionsProvider === 'forgejo' ? options.runsOn : GITHUB_HOSTED_LINUX_RUNNER);
 }
 
 function githubExpression(expression: string): string {
