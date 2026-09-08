@@ -121,6 +121,43 @@
     };
   };
 
+  # linux-cross is the only profile here, and the shape of the publish job is
+  # why. A lean publish shell was measured and rejected, so the next reader does
+  # not have to measure it again.
+  #
+  # The ceiling first: dropping rustc, Go, binaryen, the cargo helpers, python
+  # and the clang/lldb tools leaves 2.21 GiB of a 5.41 GiB default closure
+  # (`nix path-info -S` over the devenv profile, aarch64-darwin), and modules
+  # only ADD — so collecting that saving means moving the toolchain OUT of base
+  # and making every developer shell and every other CI job pass `-P`. A
+  # forgotten flag then yields a shell that is quietly missing a compiler, which
+  # is the same false green the paragraph above exists to prevent.
+  #
+  # Repair is what makes it unfixable rather than merely awkward. `smoo release
+  # repair-pending` builds the historical release commits npm is missing, and it
+  # gets their toolchain by running a plain `devenv shell` AT that checkout
+  # (packages/cli/src/lib/devenv.ts). No flag is passed and none can be: devenv
+  # throws for a profile the checked-out commit does not define — `Profile 'x'
+  # not found. Available profiles: ...` — which is every release commit older
+  # than the split. Leave the flag off and a post-split commit hands repair a
+  # base without rustc; add it and every pre-split commit fails to evaluate.
+  # Either way the break surfaces months later, in the one command whose whole
+  # job is to recover a release that already went wrong.
+  #
+  # The publish job's OWN environment is not just publishing either: `smoo
+  # release publish --prebuilt` runs each project's Nx `release-check` gate over
+  # the merged artifacts, which is where a native or wasm artifact is validated
+  # before it is packed. A lean publish shell removes those tools silently, from
+  # the one step that exists to refuse a bad artifact.
+  #
+  # And it would not even pay: the Actions nix segment is keyed on
+  # os+arch+hash(devenv.yaml, devenv.nix, devenv.lock) and is blind to the
+  # profile, so a restore ships the whole NAR regardless, while the save exports
+  # the closure that job realized. A lean publish job that won that immutable
+  # key would hand the CI workflow a NAR with no toolchain in it. On any run
+  # where repair has work the saving is zero anyway, because repair realizes the
+  # historical default shell inside the same job.
+
   # One Go for every repository, same reasoning as the Rust toolchain: a compiler
   # is part of a cache key, so two of them mean two caches.
   #
