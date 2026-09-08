@@ -550,19 +550,32 @@ describe('collected Nx outputs', () => {
     });
   });
 
-  it('strips leftover native-tree files from declared outputs at apply', async () => {
-    await withOutputFixture(async ({ root, artifact, outputProject }) => {
-      const outputPath = join(root, 'packages/app/dist/result.bin');
-      await writeFile(outputPath, 'native artifact');
-      await collectNxOutputs(root, artifact, [{ target: 'build-macos', projects: [outputProject] }], SOURCE_SHA);
+  it('preserves an earlier platform tree when a later overlay uses a broader glob', async () => {
+    await withOutputFixture(async ({ root, artifact, outputProject, temp }) => {
+      outputProject.targets = ['build', 'build-macos'];
+      outputProject.targetOutputs = new Map([
+        ['build', ['{projectRoot}/dist']],
+        ['build-macos', ['{projectRoot}/dist/native/darwin-arm64']],
+      ]);
 
-      const leftover = join(root, 'packages/app/dist/stale.bin');
-      await writeFile(leftover, 'host native tree');
+      const darwinDir = join(root, 'packages/app/dist/native/darwin-arm64');
+      await mkdir(darwinDir, { recursive: true });
+      const darwinFile = join(darwinDir, 'app.node');
+      await writeFile(darwinFile, 'darwin native');
+      const macosArtifact = join(temp, 'artifact-macos');
+      await collectNxOutputs(root, macosArtifact, [{ target: 'build-macos', projects: [outputProject] }], SOURCE_SHA);
+
+      await rm(join(root, 'packages/app/dist/native'), { recursive: true, force: true });
+      await mkdir(join(root, 'packages/app/dist/ts'), { recursive: true });
+      await writeFile(join(root, 'packages/app/dist/ts/index.js'), 'javascript');
+      await collectNxOutputs(root, artifact, [{ target: 'build', projects: [outputProject] }], SOURCE_SHA);
+
+      await applyCollectedOutputs(root, [macosArtifact], SOURCE_SHA, [outputProject]);
       await applyCollectedOutputs(root, [artifact], SOURCE_SHA, [outputProject]);
 
-      expect(await readFile(outputPath, 'utf8')).toBe('native artifact');
-      await expect(readFile(leftover, 'utf8')).rejects.toThrow();
-      await expect(assertCollectedOutputsApplied(root, [artifact], ['app'])).resolves.toBeUndefined();
+      expect(await readFile(darwinFile, 'utf8')).toBe('darwin native');
+      expect(await readFile(join(root, 'packages/app/dist/ts/index.js'), 'utf8')).toBe('javascript');
+      await expect(assertCollectedOutputsApplied(root, [artifact, macosArtifact], ['app'])).resolves.toBeUndefined();
     });
   });
 
