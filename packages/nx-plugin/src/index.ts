@@ -999,7 +999,34 @@ async function createProjectTargets(
   }
 
   if (validationTargets.length > 0) {
+    const rustOnlyLint =
+      isCargoProject &&
+      !hasLibTsconfig &&
+      !hasTestTsconfig &&
+      !('lint' in declaredTargets) &&
+      typeof packageJson.scripts?.lint !== 'string';
+    if (rustOnlyLint) {
+      targets['biome-lint'] = {
+        executor: 'nx:run-commands',
+        cache: true,
+        inputs: [
+          'default',
+          '{workspaceRoot}/biome.json',
+          '{workspaceRoot}/package.json',
+          '{workspaceRoot}/bun.lock',
+        ],
+        outputs: [],
+        options: {
+          command: 'biome check --files-ignore-unknown=true {projectRoot}',
+          cwd: '{workspaceRoot}',
+        },
+      };
+      validationTargets.push('biome-lint');
+    }
     targets.lint = {
+      // An explicit aggregate executor prevents JavaScript-oriented lint
+      // targetDefaults from replacing this Rust-only validation graph.
+      ...(rustOnlyLint ? { executor: 'nx:noop' } : {}),
       cache: true,
       dependsOn: validationTargets,
     };
