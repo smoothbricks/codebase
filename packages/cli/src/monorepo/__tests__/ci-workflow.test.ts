@@ -490,6 +490,27 @@ describe('renderCiWorkflowYaml with deploy configuration', () => {
     expect(rendered).toContain("cancel-in-progress: ${{ github.ref != 'refs/heads/trunk' }}");
     expect(rendered).not.toContain('cancel-in-progress: true');
   });
+  it('quotes YAML-significant names instead of rejecting valid ones', () => {
+    const quoted = renderCiWorkflowYaml(
+      options({
+        deploy: true,
+        deployProvider: 'cloudflare',
+        e2eDeployment: true,
+        pushBranches: ["o'brien", 'trunk'],
+        environments: { staging: 'review env', production: 'production' },
+        productionOnPush: true,
+      }),
+    );
+
+    // Expression literal: the branch quote doubles; the YAML list quotes the item.
+    expect(quoted).toContain("github.ref == 'refs/heads/o''brien'");
+    expect(quoted).toContain("github.ref != 'refs/heads/o''brien'");
+    expect(quoted).toContain('- "o\'brien"');
+    expect(quoted).toContain('- trunk');
+    // Significant environment names quote; plain ones stay bare.
+    expect(quoted).toContain('environment: "review env"');
+    expect(quoted).toContain('environment: production');
+  });
 
   it('runs cargo and sibling-source preflight in both follow-up jobs before setup, with shifting anchors', () => {
     const configured = options({

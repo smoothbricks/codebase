@@ -129,7 +129,7 @@ function renderCiWorkflowHeader(options: CiWorkflowDefinitionOptions): string {
 on:
   push:
     branches:
-${renderYamlList(options.pushBranches, 6)}
+${renderYamlList(options.pushBranches.map(yamlScalar), 6)}
   pull_request:
 
 permissions:
@@ -144,7 +144,7 @@ concurrency:
   # production deployment mid-flight. Pull requests and other branches keep
   # canceling superseded runs.
   group: \${{ github.workflow }}-\${{ github.ref }}
-  cancel-in-progress: \${{ github.ref != 'refs/heads/${stagingPushBranch(options)}' }}
+  cancel-in-progress: \${{ github.ref != ${stagingRefLiteral(options)} }}
 
 defaults:
   run:
@@ -325,7 +325,7 @@ function yamlLinesForStep(step: CiWorkflowStep, options: CiWorkflowDefinitionOpt
         "            (github.event_name == 'pull_request' &&",
         '              contains(fromJSON(\'["opened","reopened","synchronize"]\'), github.event.action) &&',
         '              github.event.pull_request.head.repo.full_name == github.repository) ||',
-        `            (github.event_name == 'push' && github.ref == 'refs/heads/${stagingPushBranch(options)}')`,
+        `            (github.event_name == 'push' && github.ref == ${stagingRefLiteral(options)})`,
         '          }}',
         ...deployEnvLines(options),
         `        run: smoo github-ci nx-deploy --mode run-many --name "Deploy Stage" --step ${step.number}`,
@@ -617,8 +617,30 @@ function stagingPushBranch(options: CiWorkflowDefinitionOptions): string {
   return options.pushBranches[0];
 }
 
+/**
+ * A YAML scalar for operator-configured names. Plain-safe names stay bare so
+ * generated output stays readable; anything YAML-significant is double-quoted
+ * (JSON string syntax is valid YAML for these values) rather than rejecting
+ * names the platform itself accepts.
+ */
+function yamlScalar(value: string): string {
+  if (/^[A-Za-z0-9_][A-Za-z0-9_./-]*$/.test(value)) {
+    return value;
+  }
+  return JSON.stringify(value);
+}
+
+/**
+ * A `refs/heads/<branch>` GitHub expression literal. Single quotes double
+ * inside expression literals; the branch itself is never restricted here
+ * because git permits quotes in ref names.
+ */
+function stagingRefLiteral(options: CiWorkflowDefinitionOptions): string {
+  return `'refs/heads/${stagingPushBranch(options).replaceAll("'", "''")}'`;
+}
+
 function environmentLine(name: string | undefined): string {
-  return name ? `    environment: ${name}\n` : '';
+  return name ? `    environment: ${yamlScalar(name)}\n` : '';
 }
 
 function deployEnvLines(options: CiWorkflowDefinitionOptions): string[] {
@@ -741,7 +763,7 @@ function renderProductionDeployJob(options: CiWorkflowDefinitionOptions): string
     needs: ${needs}
 ${renderRunsOnLine(options.runsOn)}
     timeout-minutes: 30
-    if: \${{ !cancelled() && github.event_name == 'push' && github.ref == 'refs/heads/${stagingPushBranch(options)}' && needs.main.result == 'success'${e2eGate} }}
+    if: \${{ !cancelled() && github.event_name == 'push' && github.ref == ${stagingRefLiteral(options)} && needs.main.result == 'success'${e2eGate} }}
 ${environmentLine(options.environments?.production)}    env:
       GH_TOKEN: \${{ github.token }}
 ${cargoCredentialJobEnvLines(options.cargoCredentials)}${privateNpmReadTokenJobEnv(options)}    steps:
