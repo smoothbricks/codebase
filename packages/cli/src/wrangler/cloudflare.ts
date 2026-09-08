@@ -347,7 +347,7 @@ export class CloudflareRestClient implements CloudflareClient {
     if (response.ok && EMPTY_BODY.test(text)) {
       throw new CloudflareApiError(`Cloudflare returned an empty response body for ${path}.`, response.status, []);
     }
-    return readEnvelope(path, response.status, response.ok, text);
+    return readEnvelope(path, response, text);
   }
 
   /**
@@ -358,7 +358,7 @@ export class CloudflareRestClient implements CloudflareClient {
   private async mutate(path: string, init: RequestInit): Promise<void> {
     const { response, text } = await this.send(path, init);
     if (response.ok && EMPTY_BODY.test(text)) return;
-    readEnvelope(path, response.status, response.ok, text);
+    readEnvelope(path, response, text);
   }
 
   private async send(path: string, init: RequestInit = {}): Promise<{ response: Response; text: string }> {
@@ -375,7 +375,7 @@ export class CloudflareRestClient implements CloudflareClient {
 }
 
 /** The envelope, or a failure named by endpoint and Cloudflare's own codes — never by credential. */
-function readEnvelope(path: string, status: number, ok: boolean, text: string): CloudflareEnvelope {
+function readEnvelope(path: string, response: Response, text: string): CloudflareEnvelope {
   let body: CloudflareEnvelope | null;
   try {
     body = parseCloudflareEnvelope(text);
@@ -384,18 +384,18 @@ function readEnvelope(path: string, status: number, ok: boolean, text: string): 
     body = null;
   }
   if (!body) {
-    throw new CloudflareApiError(`Cloudflare returned a malformed response for ${path}.`, status, []);
+    throw new CloudflareApiError(`Cloudflare returned a malformed response for ${path}.`, response.status, []);
   }
-  if (!ok || !body.success) {
+  if (!response.ok || !body.success) {
     const errors = body.errors ?? [];
     const message =
       errors
         .map((error) => error.message)
         .filter(Boolean)
-        .join('; ') || `HTTP ${status}`;
+        .join('; ') || `HTTP ${response.status}`;
     throw new CloudflareApiError(
       `Cloudflare API ${path} failed: ${message}`,
-      status,
+      response.status,
       errors.flatMap((error) => error.code ?? []),
     );
   }
