@@ -28,7 +28,7 @@ use crate::metadata::{WorkspaceIncarnation, WorkspaceName};
 use crate::repository::{OwnedRepoIds, RepoId};
 use crate::sandbox::{SandboxConfig, SandboxProfileRole, seatbelt_profile};
 use crate::storage::audit::AuditSinkError;
-use crate::workspace_environment::{GO_ENV, PORT_BASE_ENV, WORKSPACE_TOKEN_ENV};
+use crate::workspace_environment::{GO_ENV, NODE_CA_ENV, PORT_BASE_ENV, WORKSPACE_TOKEN_ENV};
 use cowshed_gateway_types::WorkspaceToken;
 
 use crate::storage::job_artifact::{
@@ -67,6 +67,12 @@ pub struct WorkspaceSupervisorConfig {
     pub term_grace: Duration,
     pub actor_capacity: usize,
     pub event_capacity: usize,
+    /// Environment variable names every spawn withholds from the child.
+    ///
+    /// Resolved host-side from the approved credential routes for this project: when the gateway
+    /// holds a registry credential for an origin, an ambient copy of the same token in the
+    /// operator's shell has no business reaching a sandbox. Empty unless a route was enrolled.
+    pub credential_env_names: BTreeSet<String>,
 }
 
 impl WorkspaceSupervisorConfig {
@@ -134,6 +140,7 @@ impl Default for WorkspaceSupervisorConfig {
             term_grace: Duration::from_secs(2),
             actor_capacity: DEFAULT_ACTOR_CAPACITY,
             event_capacity: DEFAULT_EVENT_CAPACITY,
+            credential_env_names: BTreeSet::new(),
         }
     }
 }
@@ -1223,6 +1230,34 @@ async fn sandboxed_command(
     if let Some(directory) = std::env::var_os("DEVELOPER_DIR") {
         command.env("DEVELOPER_DIR", directory);
     }
+    // Every intercepted HTTPS origin is presented with a leaf this workspace's CA signed, so a
+    // client that does not trust that CA cannot reach the registry at all — measured on the
+    // pinned Bun as `UNABLE_TO_VERIFY_LEAF_SIGNATURE downloading package manifest`. The
+    // certificate is the public half and already travels in the image; only the anchor wiring
+    // was missing.
+    //
+    // NODE_EXTAA_CA_CERTS is additive and belongs to Node and Bun alone, so it can be set
+    // without touching SSL_CERT_FILE — which nix and devenv own for the whole toolchain, and
+    // which is not ours to redirect. Nothing here relaxes verification: the anchor is added, no
+    // check is disabled.
+    //
+    // A caller that set the variable itself keeps it. Node reads exactly one file, so there is
+    // no honest merge; silently replacing an operator's anchor would change what a build was
+    // compiled against without saying so, and the alternative — refusing to spawn — is worse
+    // for a variable that may be entirely unrelated. It is announced instead.
+    if !env.contains_key(NODE_CA_ENV) {
+        let anchor = sandbox
+            .workspace_mount
+            .join(crate::workspace_credentials::CA_CERTIFICATE_PATH);
+        if tokio::fs::try_exists(&anchor).await.unwrap_or(false) {
+            command.env(NODE_CA_ENV, &anchor);
+        }
+    } else {
+        eprintln!(
+            "cowshed: {NODE_CA_ENV} was supplied by the caller; the workspace gateway CA is not \
+             being added, so an intercepted HTTPS origin may fail to verify"
+        );
+    }
     Ok(command)
 }
 
@@ -1805,6 +1840,7 @@ impl WorkspaceSupervisor {
             workspace_root: config.workspace_root,
             default_cwd: config.default_cwd,
             sandbox: config.sandbox,
+            credential_env_names: config.credential_env_names,
             term_grace: config.term_grace,
             next_job_id,
             next_session_id: 1,
@@ -2010,6 +2046,8 @@ struct SupervisorActor {
     workspace_root: PathBuf,
     default_cwd: Option<WorkspacePath>,
     sandbox: SandboxConfig,
+    /// Names withheld from every child; see [`WorkspaceSupervisorConfig::credential_env_names`].
+    credential_env_names: BTreeSet<String>,
     term_grace: Duration,
     next_job_id: JobId,
     next_session_id: u64,
@@ -2382,7 +2420,7 @@ impl SupervisorActor {
         }
         let info_argv = argv.clone();
         let argv_os = request_argv_to_os(argv);
-        let (cwd, merged_env, session_identity) = match session.as_ref() {
+        let (cwd, mut merged_env, session_identity) = match session.as_ref() {
             Some(token) => {
                 let state = self
                     .sessions
@@ -2392,6 +2430,11 @@ impl SupervisorActor {
                     state.cwd = Some(cwd);
                 }
                 state.env.extend(env);
+                // A session is long-lived, so the withheld names must not accumulate in it
+                // either: what the session remembers is what a later exec would forward.
+                state
+                    .env
+                    .retain(|name, _| !self.credential_env_names.contains(name));
                 (state.cwd.clone(), state.env.clone(), Some(state.identity))
             }
             None => (
@@ -2400,6 +2443,10 @@ impl SupervisorActor {
                 None,
             ),
         };
+        // The gateway holds the credential for these origins. An ambient copy of the same token
+        // in the caller's environment would hand the workspace the very bytes the host kept out
+        // of it, so it is dropped here — at the one place every job's environment is settled.
+        merged_env.retain(|name, _| !self.credential_env_names.contains(name));
         let job_id = self.next_job_id;
         let expected_next = match job_id
             .get()
@@ -3967,6 +4014,7 @@ mod lifecycle_commitment_tests {
             term_grace: defaults.term_grace,
             actor_capacity: defaults.actor_capacity,
             event_capacity: defaults.event_capacity,
+            credential_env_names: defaults.credential_env_names,
         };
         // `list()`/`info()` answer from the actor's resident job set, which is this supervisor's
         // own lifetime and deliberately not the durable history: the artifact store holds every

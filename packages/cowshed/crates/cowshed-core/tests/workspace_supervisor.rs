@@ -372,6 +372,7 @@ fn config() -> WorkspaceSupervisorConfig {
         term_grace: Duration::from_millis(10),
         actor_capacity: 8,
         event_capacity: 8,
+        credential_env_names: std::collections::BTreeSet::new(),
     }
 }
 
@@ -908,6 +909,51 @@ async fn named_session_preserves_cwd_env_and_background_membership() {
             .background_jobs
             .is_empty()
     );
+}
+
+/// A gateway-held registry credential is pointless if the workspace also gets the bytes.
+///
+/// The withheld names come from host state, so this is the one place a caller's ambient token
+/// can be dropped for every job — including the second exec in a long-lived named session,
+/// which is why the session's own remembered environment is checked too.
+#[tokio::test]
+async fn a_registered_credential_env_name_never_reaches_a_child() {
+    let mut h = harness_with_config(
+        WorkspaceSupervisorConfig {
+            credential_env_names: std::collections::BTreeSet::from([
+                "REGISTRY_READ_TOKEN".to_owned()
+            ]),
+            ..config()
+        },
+        1,
+        1024,
+        false,
+        false,
+    );
+    let session = open_named(&h.handle, "dev").await;
+    let mut first = request(StdinSource::Empty);
+    first
+        .env
+        .insert("REGISTRY_READ_TOKEN".into(), "ambient-secret".into());
+    first.env.insert("MODE".into(), "watch".into());
+    let job = h
+        .handle
+        .exec_background(Some(&session), first)
+        .await
+        .unwrap();
+    let spawned = h.spawned.recv().await.unwrap();
+    assert!(
+        !spawned.request.env.contains_key("REGISTRY_READ_TOKEN"),
+        "the child must not receive a token the gateway holds"
+    );
+    assert_eq!(spawned.request.env["MODE"], "watch");
+    let snapshot = h.handle.session_snapshot(&session).await.unwrap();
+    assert!(
+        !snapshot.env.contains_key("REGISTRY_READ_TOKEN"),
+        "the session must not remember it for the next exec either"
+    );
+    complete(&spawned, b"", b"", ExitStatus::Exited { code: 0 }).await;
+    h.handle.wait(job).await.unwrap();
 }
 
 #[tokio::test]
