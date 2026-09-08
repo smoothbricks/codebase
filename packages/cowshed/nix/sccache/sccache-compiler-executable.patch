@@ -1,0 +1,72 @@
+diff --git a/src/util.rs b/src/util.rs
+--- a/src/util.rs
++++ b/src/util.rs
+@@ -34,6 +34,23 @@ use std::time::{self, SystemTime};
+ 
+ use crate::errors::*;
+ 
++/// Share same-basename compiler aliases without retaining their transient paths.
++/// A different basename can select a different multicall mode (clang++ or a
++/// rustup proxy), so it must remain both the invocation path and cache identity.
++/// Apply this after compiler/proxy detection, which needs the original location.
++pub fn canonicalize_compiler_executable(executable: PathBuf) -> PathBuf {
++    match executable.canonicalize() {
++        Ok(path)
++            if matches!(path.file_name(), Some(name) if executable.file_name() == Some(name)) =>
++        {
++            path
++        }
++        // Preserve the existing compiler lookup policy. The subsequent metadata,
++        // hashing or process operation reports an unavailable executable.
++        _ => executable,
++    }
++}
++
+ /// The url safe engine for base64.
+ pub const BASE64_URL_SAFE_ENGINE: base64::engine::GeneralPurpose =
+     base64::engine::general_purpose::URL_SAFE_NO_PAD;
+diff --git a/src/server.rs b/src/server.rs
+--- a/src/server.rs
++++ b/src/server.rs
+@@ -1260,11 +1260,8 @@
+-        // canonicalize the path to follow symlinks
+-        // don't canonicalize if the file name differs so it works with clang's multicall
+-        let resolved_compiler_path = match resolved_compiler_path.canonicalize() {
+-            Ok(path) if matches!(path.file_name(), Some(name) if resolved_compiler_path.file_name() == Some(name)) => {
+-                path
+-            }
+-            _ => resolved_compiler_path,
+-        };
++        // Cache identity and the executable retained by the concrete compiler
++        // must follow the same alias policy. Detection still uses the original
++        // request path below so Rustup can discover its adjacent proxy.
++        let resolved_compiler_path =
++            util::canonicalize_compiler_executable(resolved_compiler_path);
+ 
+         let dist_info = match me1.dist_client.get_client().await {
+             Ok(Some(ref client)) => {
+diff --git a/src/compiler/rust.rs b/src/compiler/rust.rs
+--- a/src/compiler/rust.rs
++++ b/src/compiler/rust.rs
+@@ -419,6 +419,10 @@ impl Rust {
+     where
+         T: CommandCreatorSync,
+     {
++        // Proxy discovery is complete. Retain the same stable executable that
++        // keys the server cache, not the first workspace alias to populate it.
++        let executable = crate::util::canonicalize_compiler_executable(executable);
++
+         // Taken from Cargo
+         let host = rustc_verbose_version
+             .lines()
+diff --git a/src/compiler/c.rs b/src/compiler/c.rs
+--- a/src/compiler/c.rs
++++ b/src/compiler/c.rs
+@@ -235,6 +235,7 @@ where
+         executable: PathBuf,
+         pool: &tokio::runtime::Handle,
+     ) -> Result<CCompiler<I>> {
++        let executable = crate::util::canonicalize_compiler_executable(executable);
+         let digest = Digest::file(executable.clone(), pool).await?;
+ 
+         Ok(CCompiler {
