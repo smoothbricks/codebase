@@ -343,6 +343,21 @@ describe('private npm userconfig', () => {
     });
   });
 
+  it('refuses to render a publish userconfig when no publish token env is declared', () => {
+    const readOnly: PrivateNpmRegistry = {
+      scope: FIXTURE_SCOPE,
+      registry: DECLARED_REGISTRY,
+      authKey: `//forge.example.test/api/packages/${FIXTURE_OWNER}/npm/:_authToken`,
+      readTokenEnv: FIXTURE_READ_TOKEN_ENV,
+    };
+
+    // Rendering and materializing must agree: a publish userconfig carrying
+    // the read credential would 401 mid-publication, or spend a read-only
+    // credential on a write.
+    expect(() => privateNpmUserconfigContent(readOnly, { mode: 'publish' })).toThrow(/publish token/);
+    expect(privateNpmUserconfigContent(readOnly, { mode: 'read' })).toContain(`\${${FIXTURE_READ_TOKEN_ENV}}`);
+  });
+
   it('exposes the userconfig only for the operation, owner-readable, and removes it after', async () => {
     await withPrivateNpmFixture(async (fixture) => {
       const resolved = loopbackRegistry(fixture.privateRegistry);

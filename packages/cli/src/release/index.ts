@@ -119,6 +119,9 @@ import {
   forgejoReleaseLookupExists,
   resolveSourceReleaseToken,
   resolveSourceRepository,
+  type SourceReleaseCredential,
+  type SourceRepository,
+  sourceReleaseTokenEnvNames,
   sourceReleaseUrl,
 } from './source-release.js';
 
@@ -724,13 +727,16 @@ async function publishPrivatePackedPackage(
         pkg,
         {
           publish: () => runNpm(root, args, { NPM_CONFIG_USERCONFIG: userconfig }),
+          // The open publish userconfig already authenticates this registry,
+          // so the failure probe reuses it. Opening a second read-mode
+          // userconfig here demanded a read credential the publishing job need
+          // not carry, and it failed *inside* the publish failure path, hiding
+          // the publish diagnostic behind a missing-credential error.
           versionExists: () =>
-            withPrivateNpmUserconfig(registry, 'read', (readConfig) =>
-              npmPublishedVersionExistsOnRegistry(root, pkg.name, pkg.version, {
-                registry: registry.registry,
-                userconfig: readConfig,
-              }),
-            ),
+            npmPublishedVersionExistsOnRegistry(root, pkg.name, pkg.version, {
+              registry: registry.registry,
+              userconfig,
+            }),
           log: (message) => console.log(message),
           error: (message) => console.error(message),
           appendSummary: async (markdown) => {
@@ -1215,7 +1221,7 @@ function releaseRetagShell(root: string, remote: string) {
         await run('gh', ['workflow', 'run', workflow, '--ref', branch, '-f', 'bump=auto', '-f', 'dry_run=false'], root);
         return;
       }
-      const token = requireSourceReleaseToken(root);
+      const { token } = requireSourceReleaseToken(source, root);
       const response = await fetch(
         forgejoApiUrl(source, `/actions/workflows/${encodeURIComponent(workflow)}/dispatches`),
         {
@@ -1366,7 +1372,7 @@ async function createGithubRelease(root: string, pkg: ReleasePackage, dryRun: bo
 
   const currentTag = releaseTag(pkg);
   console.log(`${pkg.name}@${pkg.version}: rendering Forgejo Release notes for ${currentTag}.`);
-  console.log(`Forgejo release auth: ${sourceReleaseAuthLine(root)}.`);
+  console.log(`Forgejo release auth: ${sourceReleaseAuthLine(source, root)}.`);
   if (!dryRun) {
     await assertRemoteTagExists(root, currentTag);
   }
@@ -1376,7 +1382,9 @@ async function createGithubRelease(root: string, pkg: ReleasePackage, dryRun: bo
     return null;
   }
   const contents = await renderNxProjectChangelogContents({ root, pkg, previousTag, dryRun });
-  const token = requireSourceReleaseToken(root);
+  const credential = requireSourceReleaseToken(source, root);
+  console.log(`Forgejo release auth: using ${credential.envName}.`);
+  const token = credential.token;
   const releasePath = `/releases/tags/${encodeURIComponent(currentTag)}`;
   const lookup = await fetch(forgejoApiUrl(source, releasePath), {
     headers: forgejoAuthHeaders(token),
@@ -1434,24 +1442,30 @@ async function createGithubRelease(root: string, pkg: ReleasePackage, dryRun: bo
   return sourceReleaseUrl(source, currentTag);
 }
 
-function sourceReleaseAuthEnvNames(root: string): string[] {
-  const declared = readPackageJson(join(root, 'package.json'))?.json.smoo?.privateNpm?.publishTokenEnv;
-  return [...new Set(['GH_TOKEN', 'GITHUB_TOKEN', ...(declared ? [declared] : [])])];
-}
-
-function sourceReleaseAuthLine(root: string): string {
-  return sourceReleaseAuthEnvNames(root)
-    .map((name) => envPresence(name))
-    .join(', ');
-}
-
-function requireSourceReleaseToken(root: string): string {
-  const token = resolveSourceReleaseToken(root);
-  if (token) {
-    return token;
+/**
+ * One owner of the candidate order: source-release.ts decides which variables
+ * may authenticate this forge. A second copy here drifted into advertising
+ * GitHub variables for a Forgejo source, which is how a foreign forge token
+ * reached a Forgejo API call.
+ */
+function sourceReleaseAuthLine(repo: SourceRepository, root: string): string {
+  const names = sourceReleaseTokenEnvNames(repo, root);
+  if (names.length === 0) {
+    return 'no credential variable is configured for this source forge';
   }
+  return names.map((name) => envPresence(name)).join(', ');
+}
+
+function requireSourceReleaseToken(repo: SourceRepository, root: string): SourceReleaseCredential {
+  const credential = resolveSourceReleaseToken(repo, root);
+  if (credential) {
+    return credential;
+  }
+  const names = sourceReleaseTokenEnvNames(repo, root);
   throw new Error(
-    `Source release authentication is missing; set one of ${sourceReleaseAuthEnvNames(root).join(', ')}.`,
+    names.length === 0
+      ? 'Source release authentication is missing: no credential variable is configured for this source forge. Declare the publisher token env for the forge that hosts it, or run where that forge issues GITHUB_TOKEN.'
+      : `Source release authentication is missing; set one of ${names.join(', ')}.`,
   );
 }
 
@@ -1764,7 +1778,7 @@ async function githubReleaseExists(root: string, tag: string): Promise<boolean> 
     const result = await $`gh release view ${tag} --json tagName`.cwd(root).quiet().nothrow();
     return githubReleaseLookupExists(tag, result.exitCode, decode(result.stdout), decode(result.stderr));
   }
-  const token = requireSourceReleaseToken(root);
+  const { token } = requireSourceReleaseToken(source, root);
   const response = await fetch(forgejoApiUrl(source, `/releases/tags/${encodeURIComponent(tag)}`), {
     headers: forgejoAuthHeaders(token),
   });

@@ -2,7 +2,11 @@ import { describe, expect, it } from 'bun:test';
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { requirePrivateNpmRegistry, resolvePrivateNpmWorkflowConfig } from '../private-npm.js';
+import {
+  privateNpmTokenEnvForMode,
+  requirePrivateNpmRegistry,
+  resolvePrivateNpmWorkflowConfig,
+} from '../private-npm.js';
 
 const SCOPE = '@priv.test';
 const READ_ENV = 'PRIV_NPM_READ_TOKEN';
@@ -103,6 +107,33 @@ describe('private npm workflow token selection', () => {
     await withRepo({ declared: null, npmrcAuthEnv: READ_ENV }, (root) => {
       expect(resolvePrivateNpmWorkflowConfig(root)).toBeUndefined();
     });
+  });
+
+  it('resolves the npmrc read credential for a declared scope the workspace has not wired up yet', async () => {
+    await withRepo({ declared: { scope: SCOPE }, npmrcAuthEnv: READ_ENV }, (root) => {
+      // Nothing consumes or publishes the scope yet, so managed CI hands out
+      // no secrets...
+      expect(resolvePrivateNpmWorkflowConfig(root)).toBeUndefined();
+      // ...but an explicit npm operation still has a declared destination and
+      // the credential its own .npmrc names. Whether CI should expose a token
+      // is not the same question as which token authenticates this call.
+      const registry = requirePrivateNpmRegistry(root);
+      expect(registry.readTokenEnv).toBe(READ_ENV);
+      expect(registry.publishTokenEnv).toBeUndefined();
+    });
+  });
+
+  it('never infers a publish credential for a workspace that does not publish the scope', async () => {
+    await withRepo(
+      { declared: { scope: SCOPE }, rootDeps: { [`${SCOPE}/sdk`]: '1.0.0' }, npmrcAuthEnv: READ_ENV },
+      (root) => {
+        const registry = requirePrivateNpmRegistry(root);
+
+        expect(registry.readTokenEnv).toBe(READ_ENV);
+        expect(registry.publishTokenEnv).toBeUndefined();
+        expect(() => privateNpmTokenEnvForMode(registry, 'publish')).toThrow(/publish token/);
+      },
+    );
   });
 });
 

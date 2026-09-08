@@ -124,6 +124,28 @@ describe('private npm publish diagnostics', () => {
     ]);
   });
 
+  it('keeps the publish diagnostic when the follow-up status query also fails', async () => {
+    const shell = new RecordingPublishShell({ publishFails: true, statusFails: '503 Service Unavailable' });
+
+    // The probe is failure-aware and throws on 401/403/5xx. If that throw
+    // escaped, the run would report a status problem for a failed publish and
+    // write no operator summary at all.
+    const failure = await publishPrivateWithDiagnostics(pkg, shell, registry).then(
+      () => null,
+      (error: unknown) => error,
+    );
+
+    expect(failure).toBeInstanceOf(Error);
+    expect((failure as Error).message).toContain('private npm publish failed; refusing');
+    expect((failure as Error).cause).toBe(shell.publishFailure);
+    expect(shell.errors).toHaveLength(1);
+    expect(shell.errors[0]).toContain('publication state is unknown');
+    expect(shell.errors[0]).toContain('503 Service Unavailable');
+    expect(shell.summaries).toHaveLength(1);
+    expect(shell.summaries[0]).toContain('## Private npm publish failed');
+    expect(shell.logs).toEqual([]);
+  });
+
   it('builds restricted publish args against the resolved registry without provenance', () => {
     expect(privateNpmPublishArgs('/tmp/demo.tgz', 'latest', registry)).toEqual([
       'publish',
@@ -142,21 +164,27 @@ class RecordingPublishShell implements NpmPublishDiagnosticShell {
   readonly logs: string[] = [];
   readonly errors: string[] = [];
   readonly summaries: string[] = [];
+  readonly publishFailure = new Error('ENEEDAUTH');
   private readonly publishFails: boolean;
   private readonly versionVisibleAfterFailure: boolean;
+  private readonly statusFails: string | undefined;
 
-  constructor(options: { publishFails: boolean; versionVisibleAfterFailure?: boolean }) {
+  constructor(options: { publishFails: boolean; versionVisibleAfterFailure?: boolean; statusFails?: string }) {
     this.publishFails = options.publishFails;
     this.versionVisibleAfterFailure = options.versionVisibleAfterFailure === true;
+    this.statusFails = options.statusFails;
   }
 
   async publish(): Promise<void> {
     if (this.publishFails) {
-      throw new Error('ENEEDAUTH');
+      throw this.publishFailure;
     }
   }
 
   async versionExists(): Promise<boolean> {
+    if (this.statusFails !== undefined) {
+      throw new Error(this.statusFails);
+    }
     return this.versionVisibleAfterFailure;
   }
 
