@@ -194,6 +194,7 @@ export class CloudflareRestClient implements CloudflareClient {
   }
 
   deleteR2Object(bucket: string, key: string): Promise<void> {
+    // The endpoint requires literal slashes in an object key and percent-encoding everywhere else.
     const objectPath = key.split('/').map(encodeURIComponent).join('/');
     return this.mutate(`${this.accountPath}/r2/buckets/${encodeURIComponent(bucket)}/objects/${objectPath}`, {
       method: 'DELETE',
