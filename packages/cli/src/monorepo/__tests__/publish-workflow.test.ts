@@ -9,6 +9,7 @@ import {
   PLATFORM_TARGET_GLOBS,
 } from '@smoothbricks/nx-plugin/workspace-config-policy';
 import { format } from 'prettier';
+import typia from 'typia';
 import {
   definePublishWorkflow,
   type PublishWorkflowBump,
@@ -289,10 +290,8 @@ describe('publish workflow definition', () => {
     expect(native).toContain('name: publish-release-state-${{ github.run_id }}');
     expect(native).toContain('name: publish-release-outputs-${{ github.run_id }}');
     expect(native).toContain('name: publish-linux-outputs-${{ github.run_id }}');
-    expect(native.match(/include-hidden-files: true/g)).toHaveLength(4);
     expect(native).toContain('name: publish-macos-outputs-${{ github.run_id }}');
     expect(native).toContain('git bundle create');
-    expect(native).toContain('git fetch "${{ runner.temp }}/publish-artifacts/publish-release-state-');
     expect(finalJob).toContain(
       'smoo github-ci apply-outputs --source-sha "${{ needs.linux-release-candidate.outputs.release-sha }}"',
     );
@@ -306,6 +305,53 @@ describe('publish workflow definition', () => {
       'smoo github-ci apply-outputs --source-sha "${{ github.sha }}" ' +
         '"${{ runner.temp }}/publish-artifacts/publish-macos-outputs-${{ github.run_id }}/current"',
     );
+  });
+
+  it('selects one artifact transport per provider and retains hidden outputs only for eligible steps', () => {
+    const workflow = typia.assert<{
+      jobs: Record<string, { steps: Array<{
+        uses?: string;
+        if?: string;
+        with?: { name?: string; 'include-hidden-files'?: boolean };
+      }> }>;
+    }>(Bun.YAML.parse(renderPublishWorkflowYaml({ platformTargetGlobs: PLATFORM_TARGET_GLOBS })));
+    const uploads = Object.values(workflow.jobs).flatMap((job) => job.steps)
+      .filter((step) => step.uses?.includes('upload-artifact'));
+    for (const github of [
+      { server_url: 'https://github.com', api_url: 'https://api.github.com' },
+      { server_url: 'https://forge.example.test', api_url: 'https://forge.example.test/api/v1' },
+    ]) {
+      for (const succeeded of [true, false]) {
+        const selected = uploads.filter((step) => {
+          if (!step.if) throw new Error('Artifact transport requires an explicit provider condition.');
+          // These generated conditions use the shared JS/Actions boolean subset.
+          // Execute the rendered predicate, not a parallel copy of its policy.
+          // Actions implicitly adds success() when no status function is present.
+          if (!/\b(success|failure|always|cancelled)\(/.test(step.if) && !succeeded) return false;
+          const matches = new Function('github', 'steps', 'success', 'failure', 'endsWith', `return ${step.if};`);
+          return Boolean(matches(
+            github,
+            { version: { outputs: { mode: 'release' } } },
+            () => succeeded,
+            () => !succeeded,
+            (value: string, suffix: string) => value.endsWith(suffix),
+          ));
+        });
+        const expectedNames = succeeded ? [
+          'publish-release-state-${{ github.run_id }}',
+          'publish-release-outputs-${{ github.run_id }}',
+          'publish-linux-outputs-${{ github.run_id }}',
+          'publish-macos-outputs-${{ github.run_id }}',
+        ] : ['trace-results-${{ github.run_id }}'];
+        expect(selected.map((step) => step.with?.name).sort()).toEqual(expectedNames.sort());
+        for (const step of selected) {
+          expect(step.uses?.startsWith('https://code.forgejo.org/')).toBe(github.api_url.endsWith('/api/v1'));
+          if (step.with?.name !== 'publish-release-state-${{ github.run_id }}') {
+            expect(step.with?.['include-hidden-files']).toBe(true);
+          }
+        }
+      }
+    }
   });
 
   it('fans the macOS producer out over one runner per architecture', () => {
