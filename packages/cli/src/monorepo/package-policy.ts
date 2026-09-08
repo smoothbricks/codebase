@@ -653,32 +653,89 @@ function validateCiSkipTags(root: string, options: PackageTargetPolicyOptions): 
 }
 
 /**
- * Every Cargo workspace must carry the Linux cross-lint target. The plugin
- * infers it, so an absence means the target was declared away, the plugin is
- * stale, or the project is no longer recognised as a Cargo workspace — and in all
- * three cases a Rust project silently stops being checked against the platform CI
- * actually validates on. That silence is the whole defect class this target
- * exists to end, so it is reported rather than repaired: which of the three
- * causes applies changes the correct fix, and guessing would hide the reason.
+ * Every Cargo workspace must carry the Linux cross-lint target — once, at the
+ * project beside its manifest. The plugin infers it there because
+ * `cargo clippy --workspace` already lints every member, so member crates
+ * carry only the per-crate `cargo-lint-*` targets feeding the `cargo-lint`
+ * aggregate, never their own cross target: re-linting the same workspace once
+ * per child would only recompile it.
  *
- * Keyed off `cargo-lint`, the sibling target inferred from the same `[workspace]`
- * Cargo.toml, so this check needs no second opinion about what a Rust project is.
+ * An absence therefore means different things by ownership, and the fix
+ * differs too: a workspace root missing its own cross target lost the check
+ * for the whole workspace (declared away, stale plugin, or no longer
+ * recognised as a workspace), while a member whose covering workspace lost it
+ * is uncovered from above. Both are reported rather than repaired: guessing
+ * would hide which cause applies. A member covered by its owner's cross
+ * target passes — demanding a local one could never pass, since inference
+ * never creates it.
+ *
+ * Keyed off `cargo-lint`, the sibling target inferred from the same
+ * `[workspace]` Cargo.toml, so this check needs no second opinion about what
+ * a Rust project is. The `[workspace]` discriminator is the same one target
+ * inference uses.
  */
 function validateCargoCrossLintTargets(root: string, options: PackageTargetPolicyOptions): number {
+  const resolvedByProject = options.resolvedTargetsByProject;
+  // Owner project per repo-relative directory, repository root included: the
+  // project beside a Cargo workspace manifest owns that workspace's checks.
+  const projectByDir = new Map<string, string>();
+  for (const record of listPackageJsonRecords(root)) {
+    if (!projectByDir.has(record.path)) {
+      projectByDir.set(record.path, record.projectName);
+    }
+  }
   let failures = 0;
   for (const pkg of getWorkspacePackages(root)) {
-    const resolved = options.resolvedTargetsByProject?.get(pkg.projectName);
+    const resolved = resolvedByProject?.get(pkg.projectName);
     const resolvedTargets = resolved && 'targets' in resolved ? resolved.targets : resolved;
     if (!resolvedTargets?.has('cargo-lint') || resolvedTargets.has(CARGO_CROSS_LINT_TARGET)) {
       continue;
     }
+    const ownerDir = nearestCargoWorkspaceDir(root, pkg.path);
+    const owner = ownerDir === null ? undefined : projectByDir.get(ownerDir);
+    const ownerResolved = owner === undefined ? undefined : resolvedByProject?.get(owner);
+    const ownerTargets = ownerResolved && 'targets' in ownerResolved ? ownerResolved.targets : ownerResolved;
+    if (ownerDir !== null && ownerDir !== pkg.path && ownerTargets?.has(CARGO_CROSS_LINT_TARGET)) {
+      continue;
+    }
     console.error(
-      `${pkg.path}: Cargo workspace has cargo-lint but no ${CARGO_CROSS_LINT_TARGET}, so its Linux arm is never compiled. ` +
-        `Remove any local ${CARGO_CROSS_LINT_TARGET} override, or rebuild @smoothbricks/nx-plugin if it is stale.`,
+      ownerDir !== null && ownerDir !== pkg.path
+        ? `${pkg.path}: no ${CARGO_CROSS_LINT_TARGET} covers this Cargo member: its workspace at ` +
+            `${ownerDir === '.' ? 'the repository root' : ownerDir} carries none, so its Linux arm is never compiled. ` +
+            `Restore the workspace owner's ${CARGO_CROSS_LINT_TARGET} instead of adding one here: inference owns the workspace check once at its root.`
+        : `${pkg.path}: Cargo workspace has cargo-lint but no ${CARGO_CROSS_LINT_TARGET}, so its Linux arm is never compiled. ` +
+            `Remove any local ${CARGO_CROSS_LINT_TARGET} override, or rebuild @smoothbricks/nx-plugin if it is stale.`,
     );
     failures++;
   }
   return failures;
+}
+
+const CARGO_WORKSPACE_PATTERN = /^\s*\[workspace\]/m;
+
+/**
+ * Nearest ancestor of `packageDir` — itself first, repository root last —
+ * owning a Cargo workspace manifest. Null when no Cargo workspace covers the
+ * package at all.
+ */
+function nearestCargoWorkspaceDir(root: string, packageDir: string): string | null {
+  let dir = packageDir;
+  for (;;) {
+    let text: string;
+    try {
+      text = readFileSync(join(root, dir, 'Cargo.toml'), 'utf-8');
+    } catch {
+      text = '';
+    }
+    if (CARGO_WORKSPACE_PATTERN.test(text)) {
+      return dir;
+    }
+    if (dir === '.') {
+      return null;
+    }
+    const parent = dirname(dir);
+    dir = parent === '' ? '.' : parent;
+  }
 }
 
 // ---------------------------------------------------------------------------

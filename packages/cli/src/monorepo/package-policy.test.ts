@@ -1217,6 +1217,7 @@ describe('workspace package script policy', () => {
     const root = await createWorkspace({
       rootName: '@fixture/root',
       packages: [{ dir: 'ferris', name: '@fixture/ferris', nx: { name: 'ferris', targets: {} } }],
+      files: { 'packages/ferris/Cargo.toml': '[workspace]\n' },
     });
     try {
       const resolvedTargetsByProject = new Map([['ferris', new Set(['cargo-lint', 'cargo-lint-cross', 'test'])]]);
@@ -1234,12 +1235,101 @@ describe('workspace package script policy', () => {
     const root = await createWorkspace({
       rootName: '@fixture/root',
       packages: [{ dir: 'ferris', name: '@fixture/ferris', nx: { name: 'ferris', targets: {} } }],
+      files: { 'packages/ferris/Cargo.toml': '[workspace]\n' },
     });
     const errors = captureConsoleErrors();
     try {
       const resolvedTargetsByProject = new Map([['ferris', new Set(['cargo-lint', 'test'])]]);
       expect(validateWorkspaceDependencies(root, { resolvedTargetsByProject })).toBe(1);
       expect(errors.some((error) => error.includes('its Linux arm is never compiled'))).toBe(true);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('accepts member crates covered by the root workspace cross check', async () => {
+    // Inference owns cargo-lint-cross once at the Cargo workspace root because
+    // `cargo clippy --workspace` already lints every member. A member wrapper
+    // carries cargo-lint but never its own cross target, so owner coverage
+    // must pass.
+    const root = await createWorkspace({
+      rootName: '@fixture/root',
+      packages: [{ dir: 'ferris', name: '@fixture/ferris', nx: { name: 'ferris', targets: {} } }],
+      files: { 'Cargo.toml': '[workspace]\nmembers = ["packages/ferris/crates/*"]\n' },
+    });
+    try {
+      const resolvedTargetsByProject = new Map([
+        ['@fixture/root', new Set(['cargo-lint', 'cargo-lint-cross'])],
+        ['ferris', new Set(['cargo-lint'])],
+      ]);
+      expect(validateWorkspaceDependencies(root, { resolvedTargetsByProject })).toBe(0);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects member crates when the covering workspace loses its cross target', async () => {
+    // The companion to the coverage acceptance above: the member passes
+    // because the owner carries the check, so losing it at the owner must
+    // fail the member rather than silently uncover it.
+    const root = await createWorkspace({
+      rootName: '@fixture/root',
+      packages: [{ dir: 'ferris', name: '@fixture/ferris', nx: { name: 'ferris', targets: {} } }],
+      files: { 'Cargo.toml': '[workspace]\nmembers = ["packages/ferris/crates/*"]\n' },
+    });
+    const errors = captureConsoleErrors();
+    try {
+      const resolvedTargetsByProject = new Map([
+        ['@fixture/root', new Set(['cargo-lint'])],
+        ['ferris', new Set(['cargo-lint'])],
+      ]);
+      expect(validateWorkspaceDependencies(root, { resolvedTargetsByProject })).toBe(1);
+      expect(errors.some((error) => error.includes('packages/ferris'))).toBe(true);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects a nested workspace without its own cross target while the root is covered', async () => {
+    // A nested independent workspace is its own coverage owner: the root
+    // check passing must not excuse it. This is what stops the owner lookup
+    // from degrading into skipping every child while some cross exists.
+    const root = await createWorkspace({
+      rootName: '@fixture/root',
+      packages: [{ dir: 'nested', name: '@fixture/nested', nx: { name: 'nested', targets: {} } }],
+      files: {
+        'Cargo.toml': '[workspace]\nmembers = ["packages/nested/crates/*"]\n',
+        'packages/nested/Cargo.toml': '[workspace]\n',
+      },
+    });
+    const errors = captureConsoleErrors();
+    try {
+      const resolvedTargetsByProject = new Map([
+        ['@fixture/root', new Set(['cargo-lint', 'cargo-lint-cross'])],
+        ['nested', new Set(['cargo-lint'])],
+      ]);
+      expect(validateWorkspaceDependencies(root, { resolvedTargetsByProject })).toBe(1);
+      expect(errors.some((error) => error.includes('packages/nested'))).toBe(true);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('accepts a nested workspace carrying its own cross target', async () => {
+    const root = await createWorkspace({
+      rootName: '@fixture/root',
+      packages: [{ dir: 'nested', name: '@fixture/nested', nx: { name: 'nested', targets: {} } }],
+      files: {
+        'Cargo.toml': '[workspace]\nmembers = ["packages/nested/crates/*"]\n',
+        'packages/nested/Cargo.toml': '[workspace]\n',
+      },
+    });
+    try {
+      const resolvedTargetsByProject = new Map([
+        ['@fixture/root', new Set(['cargo-lint', 'cargo-lint-cross'])],
+        ['nested', new Set(['cargo-lint', 'cargo-lint-cross'])],
+      ]);
+      expect(validateWorkspaceDependencies(root, { resolvedTargetsByProject })).toBe(0);
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -1272,6 +1362,7 @@ async function createWorkspace(input: {
     scripts?: Record<string, string>;
     nx?: Record<string, unknown>;
   }>;
+  files?: Record<string, string>;
 }): Promise<string> {
   const root = await mkdtemp(join(tmpdir(), 'smoo-package-policy-'));
   await writeJson(join(root, 'package.json'), {
@@ -1289,6 +1380,11 @@ async function createWorkspace(input: {
       ...(pkg.scripts ? { scripts: pkg.scripts } : {}),
       ...(pkg.nx ? { nx: pkg.nx } : {}),
     });
+  }
+  for (const [relativePath, content] of Object.entries(input.files ?? {})) {
+    const absolutePath = join(root, relativePath);
+    await mkdir(dirname(absolutePath), { recursive: true });
+    await writeFile(absolutePath, content);
   }
   return root;
 }
