@@ -1,4 +1,4 @@
-import { batchType, bool, Column, type DataType, type dictionary, type IntType, type utf8 } from '@uwdata/flechette';
+import { batchType, bool, Column, type DataType, dictionary, type IntType, utf8 } from '@uwdata/flechette';
 
 const EMPTY_VALIDITY = new Uint8Array(0);
 const BOOL_TYPE_ID = bool().typeId;
@@ -8,6 +8,23 @@ export type ArrowIndexArrayConstructor = Uint8ArrayConstructor | Uint16ArrayCons
 export type BoolType = ReturnType<typeof bool>;
 export type DictionaryType = ReturnType<typeof dictionary>;
 export type Utf8Type = ReturnType<typeof utf8>;
+
+/**
+ * A dictionary type paired with the exact value-type instance backing its
+ * dictionary column. Flechette resolves IPC dictionary ids by instance
+ * identity of the value type, so a field's dictionary type and the inner
+ * dictionary column MUST share one instance or IPC encoding throws.
+ */
+export interface Utf8DictionaryType {
+  readonly type: DictionaryType;
+  readonly valueType: Utf8Type;
+}
+
+/** Create a fresh utf8 dictionary type/value-type pair for one column. */
+export function createUtf8DictionaryType(indexType: IntType, ordered = false, id = -1): Utf8DictionaryType {
+  const valueType = utf8();
+  return { valueType, type: dictionary(valueType, indexType, ordered, id) };
+}
 
 type ColumnDataBase<TType, TValues = unknown> = {
   type: TType;

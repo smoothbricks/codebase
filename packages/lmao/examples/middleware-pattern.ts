@@ -145,23 +145,29 @@ async function main(): Promise<void> {
   const baseReq = { userId: 'admin-123', userAgent: 'Mozilla/5.0', ipAddress: '192.168.1.100' };
 
   console.log('🌐 POST /api/users');
-  const created = await trace('POST /api/users', (ctx) => {
+  const created = await trace('POST /api/users', async (ctx) => {
     ctx.setScope(requestScope({ ...baseReq, requestId: 'req-001', endpoint: '/api/users', httpMethod: 'POST' }));
-    return ctx.span('create-user', createUser, { email: 'newuser@example.com', name: 'New User' });
+    const r = await ctx.span('create-user', createUser, { email: 'newuser@example.com', name: 'New User' });
+    if (!r.success) return ctx.err(r.error);
+    return ctx.ok(r.value);
   });
   console.log(created.success ? `✅ created ${created.value.id}` : `❌ ${created.error.code}`);
 
   console.log('\n🌐 GET /api/users/123');
-  const fetched = await trace('GET /api/users/123', (ctx) => {
+  const fetched = await trace('GET /api/users/123', async (ctx) => {
     ctx.setScope(requestScope({ ...baseReq, requestId: 'req-002', endpoint: '/api/users/123', httpMethod: 'GET' }));
-    return ctx.span('get-user', getUser, 'user-123');
+    const r = await ctx.span('get-user', getUser, 'user-123');
+    if (!r.success) return ctx.err(r.error);
+    return ctx.ok(r.value);
   });
   console.log(fetched.success ? `✅ fetched ${fetched.value.id}` : `❌ ${fetched.error.code}`);
 
   console.log('\n🌐 PUT /api/users/123');
-  const updated = await trace('PUT /api/users/123', (ctx) => {
+  const updated = await trace('PUT /api/users/123', async (ctx) => {
     ctx.setScope(requestScope({ ...baseReq, requestId: 'req-003', endpoint: '/api/users/123', httpMethod: 'PUT' }));
-    return ctx.span('update-user', updateUser, 'user-123', { name: 'Updated Name' });
+    const r = await ctx.span('update-user', updateUser, 'user-123', { name: 'Updated Name' });
+    if (!r.success) return ctx.err(r.error);
+    return ctx.ok(r.value);
   });
   console.log(updated.success ? `✅ updated ${updated.value.id}` : `❌ ${updated.error.code}`);
 }

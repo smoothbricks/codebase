@@ -122,81 +122,36 @@ This design ensures every span has valid duration data, even when exceptions byp
 
 ### Fluent Result Integration <a id="smoo/lmao!n/lmao-entry-fluent-result-integration"></a>
 
-`ctx.ok()` and `ctx.err()` return **buffer-agnostic** fluent builders. Tags are captured as closures and applied by
-`span()`/`trace()` when the function returns:
+`ctx.ok()` and `ctx.err()` return fluent result objects bound to their creating span context. The context already owns
+the immutable span-root buffer and the mutable append buffer; the result captures that context reference once.
 
 ```typescript
-// FluentOk - tags captured, applied at span-end
 return ctx.ok(value).with({ cached: true }).message('Success');
-
-// FluentErr - tags captured, applied at span-end
-return ctx.err('NOT_FOUND', { id }).with({ searched: true }).message('Not found');
+return ctx.err(NOT_FOUND({ id })).with({ searched: true }).message('Not found');
 ```
 
-#### Deferred Tag Application
+#### Fixed-Row Attribute Writes
 
-**Key Design**: `FluentOk` and `FluentErr` do NOT hold buffer references. This ensures type safety - tags are always
-applied to the correct buffer, preventing accidental writes to wrong buffers if a result is captured.
-
-Each chained method (`.with()`, `.message()`, `.line()`) captures the write operation as a closure:
-
-```typescript
-class FluentOk<V, T extends LogSchema> implements Ok<V> {
-  readonly value: V;
-  applyTags?: (buffer: SpanBuffer<T>) => void; // Closure chain
-
-  constructor(value: V) {
-    this.value = value;
-    // No buffer reference - buffer-agnostic!
-  }
-
-  get success(): true {
-    return true;
-  } // Derived from class identity
-
-  message(text: string): this {
-    const prev = this.applyTags;
-    this.applyTags = (buffer) => {
-      if (prev) prev(buffer);
-      buffer.message(1, text);
-    };
-    return this;
-  }
-
-  // Similar pattern for .with() and .line()
-}
-```
+The span-start operation reserves row 1 for completion. `.with()`, `.message()`, and `.line()` write directly to that
+row through the lazily materialized result writer. They do not allocate deferred closure chains or retarget attributes
+to whichever span later receives the result. Overflow advances the context's append buffer, not the span-root buffer
+used by fixed-row writers.
 
 #### Span-End Write Sequence
 
-When `span()` or `trace()` receives the result, it writes to row 1:
+The execution envelope first checks that the result's captured writer state is the exact executing context. Only then
+does `writeSpanEnd` write `span-ok` or `span-err`, its timestamp, and any structured error code. A mismatch throws a
+programmer `TypeError` and the envelope records `span-exception` with the failure details. Retry dispatch performs the
+same check before applying a transient error's policy, so a foreign result never retries the receiving span.
 
-```typescript
-function writeSpanEnd(buffer: SpanBuffer, result: Result): void {
-  // 1. Write entry_type based on result type
-  if (result instanceof FluentOk) {
-    buffer.entry_type[1] = ENTRY_TYPE_SPAN_OK;
-  } else if (result instanceof FluentErr) {
-    buffer.entry_type[1] = ENTRY_TYPE_SPAN_ERR;
-    buffer.error_code(1, result.error.code);  // Write error code
-  }
+Completed child results remain inspectable. To propagate their outcome, return the receiving context's own
+`ctx.ok(child.value)` or `ctx.err(child.error)`. TypeScript checks result payload/schema types, not the identity of
+individual callback invocations. See [Result Ownership](./01c_context_flow_and_op_wrappers.md#result-ownership) for the
+runtime guarantee and its lifetime limits.
 
-  // 2. Write timestamp
-  buffer.timestamp[1] = getTimestampNanos(...);
-
-  // 3. Apply deferred tags
-  if (result.applyTags) {
-    result.applyTags(buffer);
-  }
-}
-```
-
-This enables:
-
-1. **Type safety**: Result objects have no buffer reference - can't write to wrong buffer
-2. **Attribute chaining**: `.with()` captures attributes to apply at span-end
-3. **Custom messages**: `.message()` overwrites the default span name in row 1
-4. **Source tracking**: `.line()` sets source line number
+Attribute writes happen before completion checking; the check does not undo prior writes, revoke captured contexts, or
+make result payloads immutable. Low-level result constructors can take an explicit writer state; unbound results cannot
+complete a traced callback.
 
 #### Message Column Semantics
 

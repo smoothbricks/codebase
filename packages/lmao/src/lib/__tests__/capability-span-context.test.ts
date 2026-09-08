@@ -21,6 +21,7 @@ import { S } from '../schema/builder.js';
 import { defineFeatureFlags } from '../schema/defineFeatureFlags.js';
 import { defineLogSchema } from '../schema/defineLogSchema.js';
 import { InMemoryFlagEvaluator, type SpanContextWithoutFf } from '../schema/evaluator.js';
+import type { SpanContextClass } from '../spanContext.js';
 import { TestTracer } from '../tracers/TestTracer.js';
 import { iterateSpanChildren } from '../traceTopology.js';
 import { createTestTracerOptions } from './test-helpers.js';
@@ -140,15 +141,20 @@ function constructorOf(value: object): (...args: never[]) => unknown {
 
 async function captureRoot(runtimeHint: number, name: string): Promise<CapturedContext> {
   let captured: CapturedContext | undefined;
+  let ContextClass: SpanContextClass<Context> | undefined;
   const op = context.defineOp(
     name,
     (ctx) => {
+      // Some masks deliberately omit ctx.ok/err. Bind the low-level result to
+      // the actual executing context instead of returning an unowned result.
+      if (!ContextClass || !(ctx instanceof ContextClass)) throw new TypeError('Unexpected context constructor');
       captured = ctx;
-      return new Ok(name);
+      return new Ok(name, ctx);
     },
     undefined,
     { runtimeHint },
   );
+  ContextClass = op.callsitePlan.SpanContextClass;
   const tracer = new TestTracer(context, createTestTracerOptions());
   await tracer.trace(name, { requestId: `${name}-request` }, op);
   return requireCaptured(captured, name);

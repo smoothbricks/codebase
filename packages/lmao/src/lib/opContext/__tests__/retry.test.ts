@@ -65,8 +65,9 @@ const PLAIN_ERROR = Code<{ detail: string }>('PLAIN_ERROR');
 const CHILD_FAILED = Code<Record<string, never>>('CHILD_FAILED');
 
 describe('LMAO Op Retry', () => {
-  // Helper to test retry behavior via child span
-  // Retry logic is in span execution (ctx.span()), not tracer.trace()
+  // Helper to test retry behavior via child span.
+  // Retry logic is in span execution (ctx.span()), not tracer.trace().
+  // Propagate the child result through the root's own context.
   const executeWithRetry = async <TValue, TError>(
     tracer: TestTracer<typeof testOpContext>,
     spanName: string,
@@ -74,10 +75,11 @@ describe('LMAO Op Retry', () => {
   ): Promise<Result<TValue, TError>> => {
     return tracer.trace('root', async (ctx) => {
       // Use ctx.span() to trigger span execution with retry logic
-      return ctx.span(spanName, opFn);
+      const r = await ctx.span(spanName, opFn);
+      if (!r.success) return ctx.err(r.error);
+      return ctx.ok(r.value);
     });
   };
-
   describe('TransientError triggers retry', () => {
     it('should retry on TransientError and succeed on second attempt', async () => {
       let attempts = 0;
@@ -407,20 +409,24 @@ describe('LMAO Op Retry', () => {
 
       // Execute blocked - should return immediately
       const blockedResult = await tracer.trace('blocked-trace', async (ctx) => {
-        return ctx.span('blocked-span', async (spanCtx) => {
+        const blocked = await ctx.span('blocked-span', async (spanCtx) => {
           blockedAttempts++;
           return spanCtx.err(Blocked.service('dependency'));
         });
+        if (!blocked.success) return ctx.err(blocked.error);
+        return ctx.ok(blocked.value);
       });
       expect(blockedAttempts).toBe(1);
       expect(blockedResult.success).toBe(false);
 
       // Execute transient - should retry
       const transientResult = await tracer.trace('transient-trace', async (ctx) => {
-        return ctx.span('transient-span', async (spanCtx) => {
+        const transient = await ctx.span('transient-span', async (spanCtx) => {
           transientAttempts++;
           return spanCtx.err(SERVICE_UNAVAILABLE({ status: 503 }));
         });
+        if (!transient.success) return ctx.err(transient.error);
+        return ctx.ok(transient.value);
       });
 
       expect(transientAttempts).toBe(3); // maxAttempts: 3
@@ -462,13 +468,15 @@ describe('LMAO Op Retry', () => {
       const tracer = new TestTracer(testOpContext, createTestTracerOptions());
 
       const result = await tracer.trace('root', async (ctx) => {
-        return ctx.span('retryObservability', async (spanCtx) => {
+        const observed = await ctx.span('retryObservability', async (spanCtx) => {
           attempts++;
           if (attempts < 3) {
             return spanCtx.err(RETRY_OBSERVABILITY({ status: 503 }));
           }
           return spanCtx.ok({ success: true });
         });
+        if (!observed.success) return ctx.err(observed.error);
+        return ctx.ok(observed.value);
       });
 
       expect(result.success).toBe(true);
@@ -520,9 +528,11 @@ describe('LMAO Op Retry', () => {
       const tracer = new TestTracer(testOpContext, createTestTracerOptions());
 
       await tracer.trace('root', async (ctx) => {
-        return ctx.span('noRetry', async (spanCtx) => {
+        const completed = await ctx.span('noRetry', async (spanCtx) => {
           return spanCtx.ok({ success: true });
         });
+        if (!completed.success) return ctx.err(completed.error);
+        return ctx.ok(completed.value);
       });
 
       expect(tracer.rootBuffers.length).toBe(1);
@@ -548,9 +558,11 @@ describe('LMAO Op Retry', () => {
       const tracer = new TestTracer(testOpContext, createTestTracerOptions());
 
       const result = await tracer.trace('root', async (ctx) => {
-        return ctx.span('exhaustedRetries', async (spanCtx) => {
+        const exhausted = await ctx.span('exhaustedRetries', async (spanCtx) => {
           return spanCtx.err(SERVICE_UNAVAILABLE({ status: 503 }));
         });
+        if (!exhausted.success) return ctx.err(exhausted.error);
+        return ctx.ok(exhausted.value);
       });
 
       expect(result.success).toBe(false);
@@ -578,13 +590,15 @@ describe('LMAO Op Retry', () => {
       const tracer = new TestTracer(testOpContext, createTestTracerOptions());
 
       await tracer.trace('root', async (ctx) => {
-        return ctx.span('retryErrorCode', async (spanCtx) => {
+        const coded = await ctx.span('retryErrorCode', async (spanCtx) => {
           attempts++;
           if (attempts < 2) {
             return spanCtx.err(SERVICE_UNAVAILABLE({ status: 503 }));
           }
           return spanCtx.ok({ success: true });
         });
+        if (!coded.success) return ctx.err(coded.error);
+        return ctx.ok(coded.value);
       });
 
       const rootBuffer = tracer.rootBuffers[0];
@@ -652,7 +666,7 @@ describe('LMAO Op Retry', () => {
       const tracer = new TestTracer(testOpContext, createTestTracerOptions());
 
       const result = await tracer.trace('root', async (ctx) => {
-        return ctx.span('tagPreservation', async (spanCtx) => {
+        const tagged = await ctx.span('tagPreservation', async (spanCtx) => {
           attempts++;
           // Write tag on first attempt
           if (attempts === 1) {
@@ -663,6 +677,8 @@ describe('LMAO Op Retry', () => {
           }
           return spanCtx.ok({ success: true });
         });
+        if (!tagged.success) return ctx.err(tagged.error);
+        return ctx.ok(tagged.value);
       });
 
       expect(result.success).toBe(true);
@@ -685,7 +701,7 @@ describe('LMAO Op Retry', () => {
       const tracer = new TestTracer(testOpContext, createTestTracerOptions());
 
       const result = await tracer.trace('root', async (rootCtx) => {
-        return rootCtx.span('parent', async (parentCtx) => {
+        const parent = await rootCtx.span('parent', async (parentCtx) => {
           const childResult = await parentCtx.span('childWithRetry', async (childCtx) => {
             childAttempts++;
             if (childAttempts < 2) {
@@ -700,6 +716,8 @@ describe('LMAO Op Retry', () => {
 
           return parentCtx.ok({ parent: true, childResult: childResult.value });
         });
+        if (!parent.success) return rootCtx.err(parent.error);
+        return rootCtx.ok(parent.value);
       });
 
       expect(result.success).toBe(true);
@@ -721,13 +739,15 @@ describe('LMAO Op Retry', () => {
       const tracer = new TestTracer(testOpContext, createTestTracerOptions());
 
       const result = await tracer.trace('root', async (ctx) => {
-        return ctx.span('multiRetries', async (spanCtx) => {
+        const retried = await ctx.span('multiRetries', async (spanCtx) => {
           attempts++;
           if (attempts < 5) {
             return spanCtx.err(multiRetryError());
           }
           return spanCtx.ok({ success: true });
         });
+        if (!retried.success) return ctx.err(retried.error);
+        return ctx.ok(retried.value);
       });
 
       expect(result.success).toBe(true);
@@ -760,7 +780,9 @@ describe('LMAO Op Retry', () => {
 
       const result = await tracer.trace('root', async (ctx) => {
         // Using Op via ctx.span triggers the retry logic
-        return ctx.span('op-span', retryOp);
+        const completed = await ctx.span('op-span', retryOp);
+        if (!completed.success) return ctx.err(completed.error);
+        return ctx.ok(completed.value);
       });
 
       expect(attempts).toBe(2);

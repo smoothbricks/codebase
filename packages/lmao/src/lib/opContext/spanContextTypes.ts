@@ -174,6 +174,10 @@ export type SpanFn<Ctx extends OpContext> = {
    *
    * Per spec 01o lines 51-53: Monomorphic span_fn for transformer-injected line numbers.
    *
+   * Return this child context's own `ok()`/`err()` result. The runtime rejects
+   * foreign and standalone results; TypeScript does not distinguish individual
+   * invocations. Propagate child values explicitly through the receiving ctx.
+   *
    * @param line - Source code line number (injected by transformer at compile time)
    * @param name - Child span name
    * @param fn - Async function to execute in child span (receives SpanContext<Ctx>)
@@ -211,6 +215,8 @@ export type SpanFn<Ctx extends OpContext> = {
    *
    * Per spec 01o lines 55-71: Polymorphic span dispatcher for fallback when transformer didn't inject line number.
    *
+   * The runtime requires the result to belong to this child context.
+   *
    * @param name - Child span name
    * @param fn - Async function to execute in child span (receives SpanContext<Ctx>)
    * @returns Promise resolving to Result<S, E>
@@ -239,6 +245,8 @@ export type SpanFn<Ctx extends OpContext> = {
  *   childCtx.tag.step('validation');
  *   return childCtx.ok({ valid: true });
  * });
+ *
+ * The runtime requires the result to belong to this child context.
  */
 export type SpanSyncFn<Ctx extends OpContext> = {
   <R extends AnyResult | Promise<AnyResult>>(

@@ -22,7 +22,7 @@
  * const callPaymentApi = defineOp('callPaymentApi', async (ctx, amount: number) => {
  *   const health = await checkHealth('payment-api');
  *   if (!health.available) {
- *     return new Err(Blocked.service('payment-api'));
+ *     return ctx.err(Blocked.service('payment-api'));
  *   }
  *   const result = await ctx.deps.http.post('/pay', { amount });
  *   return ctx.ok(result);

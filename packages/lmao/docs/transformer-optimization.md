@@ -136,10 +136,12 @@ specializing; failure selects full capabilities and adaptive capacity.
 When called explicitly by internal code, `spanAuto0`–`spanAuto8` invoke the Op once on the initial path. Only a genuine
 non-retryable `Ok`/`Err` terminal result is written and returned synchronously. Every other value—including a custom
 thenable—is handed to the async helper and assimilated once; a synchronous retryable error also takes that path. The
-helper awaits the first value, applies the existing retry policy, re-invokes only for actual retry attempts, records the
-retry/terminal rows, and ends the span exactly once. Throws and rejected thenables use the existing exception path.
-Because automatic lowering is disabled, this internal `Result | Promise<Result>` behavior cannot alter the public
-Promise API's microtask scheduling. No performance magnitude is asserted here.
+helper awaits the first value and reuses a synchronous first error's ownership/retry classification when the resolved
+object is still that same result. Promise-resolved and subsequent results are checked normally. It applies the existing
+retry policy, re-invokes only for actual retry attempts, records retry/terminal rows, and ends the span exactly once.
+Throws and rejected thenables use the existing exception path. Because automatic lowering is disabled, this internal
+`Result | Promise<Result>` behavior cannot alter the public Promise API's microtask scheduling. No performance magnitude
+is asserted here.
 
 ## Shipped clean cutover: registered structured vocabulary
 

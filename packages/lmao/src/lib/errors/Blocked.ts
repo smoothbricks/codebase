@@ -19,8 +19,9 @@
  * const fetchData = defineOp('fetchData', async (ctx, service: string) => {
  *   const health = await checkHealth(service);
  *   if (!health.available) {
- *     // Return Err with Blocked - can chain .with() for tags
- *     return new Err(Blocked.service(service)).with({ service });
+ *     // Return Err with Blocked - can chain .with() for tags.
+ *     // NOTE span ownership: build the error value, stamp it via ctx.err.
+ *     return ctx.err(Blocked.service(service)).with({ service });
  *   }
  *   ctx.tag.service(service);
  *   return ctx.ok(await doFetch(service));
@@ -30,8 +31,8 @@
  * const callApi = defineOp('callApi', async (ctx, url: string) => {
  *   const response = await fetch(url);
  *   if (response.status === 503) {
- *     const retryAfterSec = parseInt(response.headers.get('Retry-After') ?? '5');
- *     return new Err(Blocked.service('payment-api', {
+ *     const retryAfterSec = parseInt(response.headers.get('Retry-After') ?? '5', 10);
+ *     return ctx.err(Blocked.service('payment-api', {
  *       maxAttempts: 5,
  *       nextRetry: (attempt) => {
  *         if (attempt === 1) return retryAfterSec * 1000;

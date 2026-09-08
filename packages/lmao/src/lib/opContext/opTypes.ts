@@ -31,8 +31,10 @@ export { Op, type OpCompileMetadata, type OpMetadata } from '../op.js';
 // =============================================================================
 
 /**
- * Op function signature - what the user provides to defineOp.
- * MUST return Result<S, E> or Promise<Result<S, E>>.
+ * Op function signature - what the user provides to defineOp/defineOps.
+ *
+ * Result types carry value/error/schema information, not invocation identity.
+ * The runtime rejects a result whose creating context is not the completing span.
  *
  * @template Ctx - Bundled OpContext (logSchema, flags, deps, userCtx)
  * @template Args - Function arguments (after ctx)

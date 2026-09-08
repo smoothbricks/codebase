@@ -30,7 +30,6 @@ const ARROW_METADATA_FIELDS = [
   'package_file',
   'git_sha',
   'message',
-  'uint64_value',
 ] as const;
 
 function extractRows(table: Table, columns: readonly string[]): Array<Record<string, unknown>> {
@@ -46,7 +45,7 @@ function extractRows(table: Table, columns: readonly string[]): Array<Record<str
 }
 
 function expectArrowSchema(table: Table, userFields: readonly string[]): void {
-  expect(table.schema.fields.map((field) => field.name)).toEqual([...ARROW_METADATA_FIELDS, ...userFields]);
+  expect(table.schema.fields.map((field) => field.name)).toEqual([...ARROW_METADATA_FIELDS, ...userFields, 'line']);
 }
 
 describe('Library remap descriptor integration', () => {

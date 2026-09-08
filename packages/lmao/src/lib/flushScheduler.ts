@@ -386,7 +386,7 @@ export class FlushScheduler {
 
     for (const buffer of buffersToFlush) {
       try {
-        const lease = convertSpanTreeToLeasedArrowTable(buffer, undefined, modulesToLogStatsForConversion);
+        const lease = convertSpanTreeToLeasedArrowTable(buffer, modulesToLogStatsForConversion);
         if (lease.table.numRows > 0) {
           leases.push(lease);
           tables.push(lease.table);

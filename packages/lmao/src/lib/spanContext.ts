@@ -36,7 +36,7 @@ import { TransientError } from './errors/Transient.js';
 import type { Op } from './op.js';
 import type { OpContext, OpMetadata, SpanContext, SpanFn, SpanLogger, SpanSyncFn } from './opContext/types.js';
 import type { CallsitePlan, PhysicalLayoutPlan } from './physicalLayoutPlan.js';
-import { Err, hasErrorCode, Ok, type Result } from './result.js';
+import { Err, hasErrorCode, Ok, type Result, SPAN_COMPLETION_OWNER_ERROR } from './result.js';
 import {
   RUNTIME_HINT_DEPS,
   RUNTIME_HINT_FF,
@@ -189,7 +189,17 @@ function isSynchronousResult<S, E>(value: Result<S, E> | PromiseLike<Result<S, E
   return value instanceof Ok || value instanceof Err;
 }
 
-function getRetryableError<S, E>(result: Result<S, E>, attempt: number): TransientError<string, unknown> | undefined {
+function getRetryableError<S, E>(
+  result: Result<S, E>,
+  attempt: number,
+  owner: object,
+): TransientError<string, unknown> | undefined {
+  if (!(result instanceof Ok) && !(result instanceof Err)) {
+    // Broken traced call graph: the callback fulfilled with a non-Result.
+    throw new TypeError(SPAN_COMPLETION_OWNER_ERROR);
+  }
+  // Validate before retry policy: a foreign transient error must never retry this span.
+  result._assertOwner(owner);
   if (!(result instanceof Err) || !(result.error instanceof TransientError)) return undefined;
   return attempt < result.error.policy.maxAttempts ? result.error : undefined;
 }
@@ -321,10 +331,10 @@ async function executeWithRetry0<Ctx extends OpContext, S, E>(
   while (true) {
     attempt++;
     const result = await fn(ctx);
-    if (!(result instanceof Err) || !(result.error instanceof TransientError)) return result;
-    if (attempt >= result.error.policy.maxAttempts) return result;
-    const delay = calculateDelay(result.error.policy, attempt);
-    writeRetryEntry(buffer, attempt, result.error, delay);
+    const retryError = getRetryableError(result, attempt, ctx);
+    if (!retryError) return result;
+    const delay = calculateDelay(retryError.policy, attempt);
+    writeRetryEntry(buffer, attempt, retryError, delay);
     await sleep(delay);
   }
 }
@@ -339,10 +349,10 @@ async function executeWithRetry1<Ctx extends OpContext, S, E, A1>(
   while (true) {
     attempt++;
     const result = await fn(ctx, a1);
-    if (!(result instanceof Err) || !(result.error instanceof TransientError)) return result;
-    if (attempt >= result.error.policy.maxAttempts) return result;
-    const delay = calculateDelay(result.error.policy, attempt);
-    writeRetryEntry(buffer, attempt, result.error, delay);
+    const retryError = getRetryableError(result, attempt, ctx);
+    if (!retryError) return result;
+    const delay = calculateDelay(retryError.policy, attempt);
+    writeRetryEntry(buffer, attempt, retryError, delay);
     await sleep(delay);
   }
 }
@@ -358,10 +368,10 @@ async function executeWithRetry2<Ctx extends OpContext, S, E, A1, A2>(
   while (true) {
     attempt++;
     const result = await fn(ctx, a1, a2);
-    if (!(result instanceof Err) || !(result.error instanceof TransientError)) return result;
-    if (attempt >= result.error.policy.maxAttempts) return result;
-    const delay = calculateDelay(result.error.policy, attempt);
-    writeRetryEntry(buffer, attempt, result.error, delay);
+    const retryError = getRetryableError(result, attempt, ctx);
+    if (!retryError) return result;
+    const delay = calculateDelay(retryError.policy, attempt);
+    writeRetryEntry(buffer, attempt, retryError, delay);
     await sleep(delay);
   }
 }
@@ -378,10 +388,10 @@ async function executeWithRetry3<Ctx extends OpContext, S, E, A1, A2, A3>(
   while (true) {
     attempt++;
     const result = await fn(ctx, a1, a2, a3);
-    if (!(result instanceof Err) || !(result.error instanceof TransientError)) return result;
-    if (attempt >= result.error.policy.maxAttempts) return result;
-    const delay = calculateDelay(result.error.policy, attempt);
-    writeRetryEntry(buffer, attempt, result.error, delay);
+    const retryError = getRetryableError(result, attempt, ctx);
+    if (!retryError) return result;
+    const delay = calculateDelay(retryError.policy, attempt);
+    writeRetryEntry(buffer, attempt, retryError, delay);
     await sleep(delay);
   }
 }
@@ -399,10 +409,10 @@ async function executeWithRetry4<Ctx extends OpContext, S, E, A1, A2, A3, A4>(
   while (true) {
     attempt++;
     const result = await fn(ctx, a1, a2, a3, a4);
-    if (!(result instanceof Err) || !(result.error instanceof TransientError)) return result;
-    if (attempt >= result.error.policy.maxAttempts) return result;
-    const delay = calculateDelay(result.error.policy, attempt);
-    writeRetryEntry(buffer, attempt, result.error, delay);
+    const retryError = getRetryableError(result, attempt, ctx);
+    if (!retryError) return result;
+    const delay = calculateDelay(retryError.policy, attempt);
+    writeRetryEntry(buffer, attempt, retryError, delay);
     await sleep(delay);
   }
 }
@@ -421,10 +431,10 @@ async function executeWithRetry5<Ctx extends OpContext, S, E, A1, A2, A3, A4, A5
   while (true) {
     attempt++;
     const result = await fn(ctx, a1, a2, a3, a4, a5);
-    if (!(result instanceof Err) || !(result.error instanceof TransientError)) return result;
-    if (attempt >= result.error.policy.maxAttempts) return result;
-    const delay = calculateDelay(result.error.policy, attempt);
-    writeRetryEntry(buffer, attempt, result.error, delay);
+    const retryError = getRetryableError(result, attempt, ctx);
+    if (!retryError) return result;
+    const delay = calculateDelay(retryError.policy, attempt);
+    writeRetryEntry(buffer, attempt, retryError, delay);
     await sleep(delay);
   }
 }
@@ -444,10 +454,10 @@ async function executeWithRetry6<Ctx extends OpContext, S, E, A1, A2, A3, A4, A5
   while (true) {
     attempt++;
     const result = await fn(ctx, a1, a2, a3, a4, a5, a6);
-    if (!(result instanceof Err) || !(result.error instanceof TransientError)) return result;
-    if (attempt >= result.error.policy.maxAttempts) return result;
-    const delay = calculateDelay(result.error.policy, attempt);
-    writeRetryEntry(buffer, attempt, result.error, delay);
+    const retryError = getRetryableError(result, attempt, ctx);
+    if (!retryError) return result;
+    const delay = calculateDelay(retryError.policy, attempt);
+    writeRetryEntry(buffer, attempt, retryError, delay);
     await sleep(delay);
   }
 }
@@ -477,10 +487,10 @@ async function executeWithRetry7<Ctx extends OpContext, S, E, A1, A2, A3, A4, A5
   while (true) {
     attempt++;
     const result = await fn(ctx, a1, a2, a3, a4, a5, a6, a7);
-    if (!(result instanceof Err) || !(result.error instanceof TransientError)) return result;
-    if (attempt >= result.error.policy.maxAttempts) return result;
-    const delay = calculateDelay(result.error.policy, attempt);
-    writeRetryEntry(buffer, attempt, result.error, delay);
+    const retryError = getRetryableError(result, attempt, ctx);
+    if (!retryError) return result;
+    const delay = calculateDelay(retryError.policy, attempt);
+    writeRetryEntry(buffer, attempt, retryError, delay);
     await sleep(delay);
   }
 }
@@ -512,10 +522,10 @@ async function executeWithRetry8<Ctx extends OpContext, S, E, A1, A2, A3, A4, A5
   while (true) {
     attempt++;
     const result = await fn(ctx, a1, a2, a3, a4, a5, a6, a7, a8);
-    if (!(result instanceof Err) || !(result.error instanceof TransientError)) return result;
-    if (attempt >= result.error.policy.maxAttempts) return result;
-    const delay = calculateDelay(result.error.policy, attempt);
-    writeRetryEntry(buffer, attempt, result.error, delay);
+    const retryError = getRetryableError(result, attempt, ctx);
+    if (!retryError) return result;
+    const delay = calculateDelay(retryError.policy, attempt);
+    writeRetryEntry(buffer, attempt, retryError, delay);
     await sleep(delay);
   }
 }
@@ -1228,9 +1238,11 @@ export function createSpanContextClass<Ctx extends OpContext>(
       let isAsync = false;
       try {
         const result = op.fn(ctx);
-        if (!isSynchronousResult(result) || getRetryableError(result, 1) !== undefined) {
+        const isSync = isSynchronousResult(result);
+        const retryError = isSync ? getRetryableError(result, 1, ctx) : undefined;
+        if (!isSync || retryError !== undefined) {
           isAsync = true;
-          return this._spanAutoAsync0(ctx, buffer, op, result);
+          return this._spanAutoAsync0(ctx, buffer, op, result, retryError);
         }
         writeSpanEnd(buffer, result);
         return result;
@@ -1249,18 +1261,21 @@ export function createSpanContextClass<Ctx extends OpContext>(
       buffer: SpanBuffer<Ctx['logSchema']>,
       op: Op<Ctx, [], S, E>,
       first: Result<S, E> | PromiseLike<Result<S, E>>,
+      firstRetryError: TransientError<string, unknown> | undefined,
     ): Promise<Result<S, E>> {
       try {
         let attempt = 1;
         let result = await first;
-        while (true) {
-          const retryError = getRetryableError(result, attempt);
-          if (!retryError) break;
+        // Reuse the first proof only if await did not assimilate a different result.
+        let retryError =
+          result === first && firstRetryError !== undefined ? firstRetryError : getRetryableError(result, attempt, ctx);
+        while (retryError !== undefined) {
           const delay = calculateDelay(retryError.policy, attempt);
           writeRetryEntry(buffer, attempt, retryError, delay);
           await sleep(delay);
           attempt++;
           result = await op.fn(ctx);
+          retryError = getRetryableError(result, attempt, ctx);
         }
         writeSpanEnd(buffer, result);
         return result;
@@ -1284,9 +1299,11 @@ export function createSpanContextClass<Ctx extends OpContext>(
       let isAsync = false;
       try {
         const result = op.fn(ctx, a1);
-        if (!isSynchronousResult(result) || getRetryableError(result, 1) !== undefined) {
+        const isSync = isSynchronousResult(result);
+        const retryError = isSync ? getRetryableError(result, 1, ctx) : undefined;
+        if (!isSync || retryError !== undefined) {
           isAsync = true;
-          return this._spanAutoAsync1(ctx, buffer, op, result, a1);
+          return this._spanAutoAsync1(ctx, buffer, op, result, retryError, a1);
         }
         writeSpanEnd(buffer, result);
         return result;
@@ -1305,19 +1322,21 @@ export function createSpanContextClass<Ctx extends OpContext>(
       buffer: SpanBuffer<Ctx['logSchema']>,
       op: Op<Ctx, [A1], S, E>,
       first: Result<S, E> | PromiseLike<Result<S, E>>,
+      firstRetryError: TransientError<string, unknown> | undefined,
       a1: A1,
     ): Promise<Result<S, E>> {
       try {
         let attempt = 1;
         let result = await first;
-        while (true) {
-          const retryError = getRetryableError(result, attempt);
-          if (!retryError) break;
+        let retryError =
+          result === first && firstRetryError !== undefined ? firstRetryError : getRetryableError(result, attempt, ctx);
+        while (retryError !== undefined) {
           const delay = calculateDelay(retryError.policy, attempt);
           writeRetryEntry(buffer, attempt, retryError, delay);
           await sleep(delay);
           attempt++;
           result = await op.fn(ctx, a1);
+          retryError = getRetryableError(result, attempt, ctx);
         }
         writeSpanEnd(buffer, result);
         return result;
@@ -1342,9 +1361,11 @@ export function createSpanContextClass<Ctx extends OpContext>(
       let isAsync = false;
       try {
         const result = op.fn(ctx, a1, a2);
-        if (!isSynchronousResult(result) || getRetryableError(result, 1) !== undefined) {
+        const isSync = isSynchronousResult(result);
+        const retryError = isSync ? getRetryableError(result, 1, ctx) : undefined;
+        if (!isSync || retryError !== undefined) {
           isAsync = true;
-          return this._spanAutoAsync2(ctx, buffer, op, result, a1, a2);
+          return this._spanAutoAsync2(ctx, buffer, op, result, retryError, a1, a2);
         }
         writeSpanEnd(buffer, result);
         return result;
@@ -1363,20 +1384,22 @@ export function createSpanContextClass<Ctx extends OpContext>(
       buffer: SpanBuffer<Ctx['logSchema']>,
       op: Op<Ctx, [A1, A2], S, E>,
       first: Result<S, E> | PromiseLike<Result<S, E>>,
+      firstRetryError: TransientError<string, unknown> | undefined,
       a1: A1,
       a2: A2,
     ): Promise<Result<S, E>> {
       try {
         let attempt = 1;
         let result = await first;
-        while (true) {
-          const retryError = getRetryableError(result, attempt);
-          if (!retryError) break;
+        let retryError =
+          result === first && firstRetryError !== undefined ? firstRetryError : getRetryableError(result, attempt, ctx);
+        while (retryError !== undefined) {
           const delay = calculateDelay(retryError.policy, attempt);
           writeRetryEntry(buffer, attempt, retryError, delay);
           await sleep(delay);
           attempt++;
           result = await op.fn(ctx, a1, a2);
+          retryError = getRetryableError(result, attempt, ctx);
         }
         writeSpanEnd(buffer, result);
         return result;
@@ -1402,9 +1425,11 @@ export function createSpanContextClass<Ctx extends OpContext>(
       let isAsync = false;
       try {
         const result = op.fn(ctx, a1, a2, a3);
-        if (!isSynchronousResult(result) || getRetryableError(result, 1) !== undefined) {
+        const isSync = isSynchronousResult(result);
+        const retryError = isSync ? getRetryableError(result, 1, ctx) : undefined;
+        if (!isSync || retryError !== undefined) {
           isAsync = true;
-          return this._spanAutoAsync3(ctx, buffer, op, result, a1, a2, a3);
+          return this._spanAutoAsync3(ctx, buffer, op, result, retryError, a1, a2, a3);
         }
         writeSpanEnd(buffer, result);
         return result;
@@ -1423,6 +1448,7 @@ export function createSpanContextClass<Ctx extends OpContext>(
       buffer: SpanBuffer<Ctx['logSchema']>,
       op: Op<Ctx, [A1, A2, A3], S, E>,
       first: Result<S, E> | PromiseLike<Result<S, E>>,
+      firstRetryError: TransientError<string, unknown> | undefined,
       a1: A1,
       a2: A2,
       a3: A3,
@@ -1430,14 +1456,15 @@ export function createSpanContextClass<Ctx extends OpContext>(
       try {
         let attempt = 1;
         let result = await first;
-        while (true) {
-          const retryError = getRetryableError(result, attempt);
-          if (!retryError) break;
+        let retryError =
+          result === first && firstRetryError !== undefined ? firstRetryError : getRetryableError(result, attempt, ctx);
+        while (retryError !== undefined) {
           const delay = calculateDelay(retryError.policy, attempt);
           writeRetryEntry(buffer, attempt, retryError, delay);
           await sleep(delay);
           attempt++;
           result = await op.fn(ctx, a1, a2, a3);
+          retryError = getRetryableError(result, attempt, ctx);
         }
         writeSpanEnd(buffer, result);
         return result;
@@ -1464,9 +1491,11 @@ export function createSpanContextClass<Ctx extends OpContext>(
       let isAsync = false;
       try {
         const result = op.fn(ctx, a1, a2, a3, a4);
-        if (!isSynchronousResult(result) || getRetryableError(result, 1) !== undefined) {
+        const isSync = isSynchronousResult(result);
+        const retryError = isSync ? getRetryableError(result, 1, ctx) : undefined;
+        if (!isSync || retryError !== undefined) {
           isAsync = true;
-          return this._spanAutoAsync4(ctx, buffer, op, result, a1, a2, a3, a4);
+          return this._spanAutoAsync4(ctx, buffer, op, result, retryError, a1, a2, a3, a4);
         }
         writeSpanEnd(buffer, result);
         return result;
@@ -1485,6 +1514,7 @@ export function createSpanContextClass<Ctx extends OpContext>(
       buffer: SpanBuffer<Ctx['logSchema']>,
       op: Op<Ctx, [A1, A2, A3, A4], S, E>,
       first: Result<S, E> | PromiseLike<Result<S, E>>,
+      firstRetryError: TransientError<string, unknown> | undefined,
       a1: A1,
       a2: A2,
       a3: A3,
@@ -1493,14 +1523,15 @@ export function createSpanContextClass<Ctx extends OpContext>(
       try {
         let attempt = 1;
         let result = await first;
-        while (true) {
-          const retryError = getRetryableError(result, attempt);
-          if (!retryError) break;
+        let retryError =
+          result === first && firstRetryError !== undefined ? firstRetryError : getRetryableError(result, attempt, ctx);
+        while (retryError !== undefined) {
           const delay = calculateDelay(retryError.policy, attempt);
           writeRetryEntry(buffer, attempt, retryError, delay);
           await sleep(delay);
           attempt++;
           result = await op.fn(ctx, a1, a2, a3, a4);
+          retryError = getRetryableError(result, attempt, ctx);
         }
         writeSpanEnd(buffer, result);
         return result;
@@ -1528,9 +1559,11 @@ export function createSpanContextClass<Ctx extends OpContext>(
       let isAsync = false;
       try {
         const result = op.fn(ctx, a1, a2, a3, a4, a5);
-        if (!isSynchronousResult(result) || getRetryableError(result, 1) !== undefined) {
+        const isSync = isSynchronousResult(result);
+        const retryError = isSync ? getRetryableError(result, 1, ctx) : undefined;
+        if (!isSync || retryError !== undefined) {
           isAsync = true;
-          return this._spanAutoAsync5(ctx, buffer, op, result, a1, a2, a3, a4, a5);
+          return this._spanAutoAsync5(ctx, buffer, op, result, retryError, a1, a2, a3, a4, a5);
         }
         writeSpanEnd(buffer, result);
         return result;
@@ -1549,6 +1582,7 @@ export function createSpanContextClass<Ctx extends OpContext>(
       buffer: SpanBuffer<Ctx['logSchema']>,
       op: Op<Ctx, [A1, A2, A3, A4, A5], S, E>,
       first: Result<S, E> | PromiseLike<Result<S, E>>,
+      firstRetryError: TransientError<string, unknown> | undefined,
       a1: A1,
       a2: A2,
       a3: A3,
@@ -1558,14 +1592,15 @@ export function createSpanContextClass<Ctx extends OpContext>(
       try {
         let attempt = 1;
         let result = await first;
-        while (true) {
-          const retryError = getRetryableError(result, attempt);
-          if (!retryError) break;
+        let retryError =
+          result === first && firstRetryError !== undefined ? firstRetryError : getRetryableError(result, attempt, ctx);
+        while (retryError !== undefined) {
           const delay = calculateDelay(retryError.policy, attempt);
           writeRetryEntry(buffer, attempt, retryError, delay);
           await sleep(delay);
           attempt++;
           result = await op.fn(ctx, a1, a2, a3, a4, a5);
+          retryError = getRetryableError(result, attempt, ctx);
         }
         writeSpanEnd(buffer, result);
         return result;
@@ -1594,9 +1629,11 @@ export function createSpanContextClass<Ctx extends OpContext>(
       let isAsync = false;
       try {
         const result = op.fn(ctx, a1, a2, a3, a4, a5, a6);
-        if (!isSynchronousResult(result) || getRetryableError(result, 1) !== undefined) {
+        const isSync = isSynchronousResult(result);
+        const retryError = isSync ? getRetryableError(result, 1, ctx) : undefined;
+        if (!isSync || retryError !== undefined) {
           isAsync = true;
-          return this._spanAutoAsync6(ctx, buffer, op, result, a1, a2, a3, a4, a5, a6);
+          return this._spanAutoAsync6(ctx, buffer, op, result, retryError, a1, a2, a3, a4, a5, a6);
         }
         writeSpanEnd(buffer, result);
         return result;
@@ -1615,6 +1652,7 @@ export function createSpanContextClass<Ctx extends OpContext>(
       buffer: SpanBuffer<Ctx['logSchema']>,
       op: Op<Ctx, [A1, A2, A3, A4, A5, A6], S, E>,
       first: Result<S, E> | PromiseLike<Result<S, E>>,
+      firstRetryError: TransientError<string, unknown> | undefined,
       a1: A1,
       a2: A2,
       a3: A3,
@@ -1625,14 +1663,15 @@ export function createSpanContextClass<Ctx extends OpContext>(
       try {
         let attempt = 1;
         let result = await first;
-        while (true) {
-          const retryError = getRetryableError(result, attempt);
-          if (!retryError) break;
+        let retryError =
+          result === first && firstRetryError !== undefined ? firstRetryError : getRetryableError(result, attempt, ctx);
+        while (retryError !== undefined) {
           const delay = calculateDelay(retryError.policy, attempt);
           writeRetryEntry(buffer, attempt, retryError, delay);
           await sleep(delay);
           attempt++;
           result = await op.fn(ctx, a1, a2, a3, a4, a5, a6);
+          retryError = getRetryableError(result, attempt, ctx);
         }
         writeSpanEnd(buffer, result);
         return result;
@@ -1662,9 +1701,11 @@ export function createSpanContextClass<Ctx extends OpContext>(
       let isAsync = false;
       try {
         const result = op.fn(ctx, a1, a2, a3, a4, a5, a6, a7);
-        if (!isSynchronousResult(result) || getRetryableError(result, 1) !== undefined) {
+        const isSync = isSynchronousResult(result);
+        const retryError = isSync ? getRetryableError(result, 1, ctx) : undefined;
+        if (!isSync || retryError !== undefined) {
           isAsync = true;
-          return this._spanAutoAsync7(ctx, buffer, op, result, a1, a2, a3, a4, a5, a6, a7);
+          return this._spanAutoAsync7(ctx, buffer, op, result, retryError, a1, a2, a3, a4, a5, a6, a7);
         }
         writeSpanEnd(buffer, result);
         return result;
@@ -1683,6 +1724,7 @@ export function createSpanContextClass<Ctx extends OpContext>(
       buffer: SpanBuffer<Ctx['logSchema']>,
       op: Op<Ctx, [A1, A2, A3, A4, A5, A6, A7], S, E>,
       first: Result<S, E> | PromiseLike<Result<S, E>>,
+      firstRetryError: TransientError<string, unknown> | undefined,
       a1: A1,
       a2: A2,
       a3: A3,
@@ -1694,14 +1736,15 @@ export function createSpanContextClass<Ctx extends OpContext>(
       try {
         let attempt = 1;
         let result = await first;
-        while (true) {
-          const retryError = getRetryableError(result, attempt);
-          if (!retryError) break;
+        let retryError =
+          result === first && firstRetryError !== undefined ? firstRetryError : getRetryableError(result, attempt, ctx);
+        while (retryError !== undefined) {
           const delay = calculateDelay(retryError.policy, attempt);
           writeRetryEntry(buffer, attempt, retryError, delay);
           await sleep(delay);
           attempt++;
           result = await op.fn(ctx, a1, a2, a3, a4, a5, a6, a7);
+          retryError = getRetryableError(result, attempt, ctx);
         }
         writeSpanEnd(buffer, result);
         return result;
@@ -1732,9 +1775,11 @@ export function createSpanContextClass<Ctx extends OpContext>(
       let isAsync = false;
       try {
         const result = op.fn(ctx, a1, a2, a3, a4, a5, a6, a7, a8);
-        if (!isSynchronousResult(result) || getRetryableError(result, 1) !== undefined) {
+        const isSync = isSynchronousResult(result);
+        const retryError = isSync ? getRetryableError(result, 1, ctx) : undefined;
+        if (!isSync || retryError !== undefined) {
           isAsync = true;
-          return this._spanAutoAsync8(ctx, buffer, op, result, a1, a2, a3, a4, a5, a6, a7, a8);
+          return this._spanAutoAsync8(ctx, buffer, op, result, retryError, a1, a2, a3, a4, a5, a6, a7, a8);
         }
         writeSpanEnd(buffer, result);
         return result;
@@ -1753,6 +1798,7 @@ export function createSpanContextClass<Ctx extends OpContext>(
       buffer: SpanBuffer<Ctx['logSchema']>,
       op: Op<Ctx, [A1, A2, A3, A4, A5, A6, A7, A8], S, E>,
       first: Result<S, E> | PromiseLike<Result<S, E>>,
+      firstRetryError: TransientError<string, unknown> | undefined,
       a1: A1,
       a2: A2,
       a3: A3,
@@ -1765,14 +1811,15 @@ export function createSpanContextClass<Ctx extends OpContext>(
       try {
         let attempt = 1;
         let result = await first;
-        while (true) {
-          const retryError = getRetryableError(result, attempt);
-          if (!retryError) break;
+        let retryError =
+          result === first && firstRetryError !== undefined ? firstRetryError : getRetryableError(result, attempt, ctx);
+        while (retryError !== undefined) {
           const delay = calculateDelay(retryError.policy, attempt);
           writeRetryEntry(buffer, attempt, retryError, delay);
           await sleep(delay);
           attempt++;
           result = await op.fn(ctx, a1, a2, a3, a4, a5, a6, a7, a8);
+          retryError = getRetryableError(result, attempt, ctx);
         }
         writeSpanEnd(buffer, result);
         return result;
@@ -1804,8 +1851,9 @@ export function createSpanContextClass<Ctx extends OpContext>(
       try {
         const result = fn(ctx);
         if (!isSynchronousResult(result)) {
-          throw new TypeError('spanSync operation returned a Promise');
+          throw new TypeError(SPAN_COMPLETION_OWNER_ERROR);
         }
+        result._assertOwner(ctx);
         writeSpanEnd(buffer, result);
         return result;
       } catch (error) {

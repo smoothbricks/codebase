@@ -381,11 +381,15 @@ export interface OpContextFactory<
    *     return ctx.ok(user);
    *   },
    *
-   *   // Call sibling op via this.opName
+   *   // Call sibling op via this.opName. Child results are completed values:
+   *   // inspect them, then propagate explicitly via the current ctx. Returning
+   *   // a child result directly is rejected by runtime ownership checking.
    *   async createAndFetch(ctx, data: UserData) {
    *     const created = await ctx.span('create', this.createUser, data);
-   *     if (!created.success) return created;
-   *     return ctx.span('fetch', this.fetchUser, created.value.id);
+   *     if (!created.success) return ctx.err(created.error);
+   *     const fetched = await ctx.span('fetch', this.fetchUser, created.value.id);
+   *     if (!fetched.success) return ctx.err(fetched.error);
+   *     return ctx.ok(fetched.value);
    *   },
    * });
    *

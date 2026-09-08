@@ -70,9 +70,9 @@ import {
   type PhysicalLayoutPlan,
   sealCallsitePlan,
 } from './physicalLayoutPlan.js';
-import { type AnyResult, Err, Ok, type Result } from './result.js';
+import { type AnyResult, Err, Ok, type Result, SPAN_COMPLETION_OWNER_ERROR } from './result.js';
 import { createFeatureFlagEvaluator, type FlagEvaluator, InMemoryFlagEvaluator } from './schema/evaluator.js';
-import { ENTRY_TYPE_SPAN_EXCEPTION, ENTRY_TYPE_SPAN_OK } from './schema/systemSchema.js';
+import { ENTRY_TYPE_SPAN_OK } from './schema/systemSchema.js';
 import { EMPTY_SCOPE, getSpanBufferClass } from './spanBuffer.js';
 import {
   createSpanContextClass,
@@ -773,15 +773,14 @@ export abstract class Tracer<B extends OpContextBinding = OpContextBinding>
    * Execute function with context and handle span-ok/span-err/span-exception writes
    * Promise-agnostic: returns sync for sync fn, Promise for async fn
    *
-   * Writes span-end entry (entry_type, timestamp, error_code) and applies deferred tags
-   * when the function returns an Ok/Err result.
+   * Checks the creating context before writing span-end entry type, timestamp,
+   * and error code. Fluent result tags already target the reserved row 1.
    */
   private _executeResultWithContext<S, E>(
     ctx: SpanContextInstance<OpContextOf<B>>,
     fn: (ctx: SpanContext<OpContextOf<B>>) => Result<S, E> | Promise<Result<S, E>>,
   ): Result<S, E> | Promise<Result<S, E>> {
     const buffer = ctx._spanBuffer;
-    const writeSpanEndEntry = buffer._appenders.writeSpanEnd;
 
     this.onTraceStart(buffer);
 
@@ -794,39 +793,35 @@ export abstract class Tracer<B extends OpContextBinding = OpContextBinding>
         return result
           .then(
             (resolved) => {
-              writeSpanEnd(buffer, resolved);
-              return resolved;
+              try {
+                if (!(resolved instanceof Ok) && !(resolved instanceof Err)) {
+                  throw new TypeError(SPAN_COMPLETION_OWNER_ERROR);
+                }
+                resolved._assertOwner(ctx);
+                writeSpanEnd(buffer, resolved);
+                return resolved;
+              } catch (error) {
+                // A rejection handler on the same then cannot catch completion failures.
+                ctx._spanException(buffer, error);
+                throw error;
+              }
             },
             (error: unknown) => {
-              writeSpanEndEntry(buffer, ENTRY_TYPE_SPAN_EXCEPTION);
-
-              const errorMessage = error instanceof Error ? error.message : String(error);
-              const errorStack = error instanceof Error ? error.stack : undefined;
-
-              buffer.message(1, errorMessage);
-              if (errorStack) {
-                buffer.exception_stack(1, errorStack);
-              }
-
+              ctx._spanException(buffer, error);
               throw error;
             },
           )
           .finally(() => this.onTraceEnd(buffer));
       }
 
+      if (!(result instanceof Ok) && !(result instanceof Err)) {
+        throw new TypeError(SPAN_COMPLETION_OWNER_ERROR);
+      }
+      result._assertOwner(ctx);
       writeSpanEnd(buffer, result);
       return result;
     } catch (error) {
-      writeSpanEndEntry(buffer, ENTRY_TYPE_SPAN_EXCEPTION);
-
-      const errorMessage = error instanceof Error ? error.message : String(error);
-      const errorStack = error instanceof Error ? error.stack : undefined;
-
-      buffer.message(1, errorMessage);
-      if (errorStack) {
-        buffer.exception_stack(1, errorStack);
-      }
-
+      ctx._spanException(buffer, error);
       throw error;
     } finally {
       if (!isAsync) {
@@ -854,24 +849,21 @@ export abstract class Tracer<B extends OpContextBinding = OpContextBinding>
         return result
           .then(
             (resolved) => {
-              if (resolved instanceof Ok || resolved instanceof Err) {
-                writeSpanEnd(buffer, resolved);
-              } else {
-                writeSpanEndEntry(buffer, ENTRY_TYPE_SPAN_OK);
+              try {
+                if (resolved instanceof Ok || resolved instanceof Err) {
+                  resolved._assertOwner(ctx);
+                  writeSpanEnd(buffer, resolved);
+                } else {
+                  writeSpanEndEntry(buffer, ENTRY_TYPE_SPAN_OK);
+                }
+                return resolved;
+              } catch (error) {
+                ctx._spanException(buffer, error);
+                throw error;
               }
-              return resolved;
             },
             (error: unknown) => {
-              writeSpanEndEntry(buffer, ENTRY_TYPE_SPAN_EXCEPTION);
-
-              const errorMessage = error instanceof Error ? error.message : String(error);
-              const errorStack = error instanceof Error ? error.stack : undefined;
-
-              buffer.message(1, errorMessage);
-              if (errorStack) {
-                buffer.exception_stack(1, errorStack);
-              }
-
+              ctx._spanException(buffer, error);
               throw error;
             },
           )
@@ -880,6 +872,7 @@ export abstract class Tracer<B extends OpContextBinding = OpContextBinding>
 
       // Sync path - write span-end
       if (result instanceof Ok || result instanceof Err) {
+        result._assertOwner(ctx);
         writeSpanEnd(buffer, result);
       } else {
         writeSpanEndEntry(buffer, ENTRY_TYPE_SPAN_OK);
@@ -887,18 +880,7 @@ export abstract class Tracer<B extends OpContextBinding = OpContextBinding>
 
       return result;
     } catch (error) {
-      // Sync exception path
-      writeSpanEndEntry(buffer, ENTRY_TYPE_SPAN_EXCEPTION);
-
-      // Write exception details
-      const errorMessage = error instanceof Error ? error.message : String(error);
-      const errorStack = error instanceof Error ? error.stack : undefined;
-
-      buffer.message(1, errorMessage);
-      if (errorStack) {
-        buffer.exception_stack(1, errorStack);
-      }
-
+      ctx._spanException(buffer, error);
       throw error;
     } finally {
       // Only call for sync path - async uses .finally() on promise

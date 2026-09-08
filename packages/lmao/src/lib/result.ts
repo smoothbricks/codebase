@@ -89,35 +89,41 @@ function createCodeErrorValue<Code extends string, Fields extends object>(
   return Object.assign(Object.create(prototype), fields);
 }
 
+/**
+ * Deliberate failure for returning a completion that the executing span did not
+ * create: a standalone or foreign Ok/Err. Shared by every ownership envelope so
+ * the message cannot drift between runtime paths.
+ */
+export const SPAN_COMPLETION_OWNER_ERROR = 'Span callback must return its own ctx.ok() or ctx.err() result';
+
 // =============================================================================
 // OK CLASS
 // =============================================================================
 
 //#region smoo/lmao!n/lmao-entry-fluentok
 /**
- * Success result with fluent tag application.
+ * Success result with fluent writes to the creating span's reserved row 1.
  *
- * Created by `ctx.ok(value)`. Tags are captured as closures and applied when
- * span()/trace() completes, ensuring writes go to the correct buffer.
- *
- * @typeParam V - The type of the success value
- * @typeParam T - The log schema for buffer tag application
- *
- * @example
- * ```typescript
- * return ctx.ok(user);
- * return ctx.ok(user).with({ userId: user.id }).message('Created');
- * ```
+ * Ownership is runtime identity of the captured writer state, not a TypeScript
+ * per-invocation brand. Value/schema inference stays ordinary; a foreign or
+ * standalone result cannot complete a span. This is not a linear-use contract.
  */
 export class Ok<V, T extends LogSchema = LogSchema> {
   readonly value: V;
-
   private readonly _state: WriterState | undefined;
   private declare _writer: BoundResultWriter<T, V, never> | undefined;
 
   constructor(value: V, state?: WriterState) {
     this.value = value;
     this._state = state;
+  }
+
+  /** @internal A completion belongs to the exact context that created it. */
+  _assertOwner(owner: object): void {
+    if (this._state !== owner) {
+      // Invariant: forwarding a foreign completion is a broken traced call graph.
+      throw new TypeError(SPAN_COMPLETION_OWNER_ERROR);
+    }
   }
 
   private _resultWriter(): BoundResultWriter<T, V, never> | undefined {
@@ -158,7 +164,7 @@ export class Ok<V, T extends LogSchema = LogSchema> {
     return undefined;
   }
 
-  /** Transform the success value. */
+  /** Transform the success value. Ownership follows the original result. */
   map<U>(fn: (value: V) => U): Ok<U, T> {
     return new Ok<U, T>(fn(this.value), this._state);
   }
@@ -168,7 +174,11 @@ export class Ok<V, T extends LogSchema = LogSchema> {
     return this;
   }
 
-  /** Transform the success value, potentially returning an error. */
+  /**
+   * Transform the success value, potentially returning an error.
+   * Ownership follows the callback's result: chaining a same-span
+   * `ctx.ok()` stays returnable; a foreign result stays rejected.
+   */
   flatMap<U, F>(fn: (value: V) => Result<U, F, T>): Result<U, F, T> {
     return fn(this.value);
   }
@@ -190,7 +200,7 @@ export class Ok<V, T extends LogSchema = LogSchema> {
 
   /**
    * Set multiple attributes on the span-end entry (row 1).
-   * Deferred - applied when span()/trace() completes.
+   * Writes immediately to the creating span's reserved completion row.
    *
    * @example ctx.ok(result).with({ userId: 'u1', operation: 'CREATE' })
    */
@@ -237,33 +247,25 @@ export class Ok<V, T extends LogSchema = LogSchema> {
 
 //#region smoo/lmao!n/lmao-entry-fluenterr
 /**
- * Error result with fluent tag application.
- *
- * Created by `ctx.err(error)`. The error is stored directly (flat structure).
- * Supports fluent `.with()`, `.message()`, `.line()` for deferred tag application.
- *
- * @typeParam E - The type of the error
- * @typeParam T - The log schema for buffer tag application
- *
- * @example
- * ```typescript
- * const NOT_FOUND = defineCodeError('NOT_FOUND')<{ userId: string }>();
- * return ctx.err(NOT_FOUND({ userId }));
- * return ctx.err(NOT_FOUND({ userId })).message('User not found');
- *
- * // Tagged errors work too
- * return ctx.err(Blocked.service('payment-api'));
- * ```
+ * Error result with fluent writes to the creating span's reserved row 1.
+ * The captured writer state is its runtime owner, just as for Ok.
  */
 export class Err<E, T extends LogSchema = LogSchema> {
   readonly error: E;
-
   private readonly _state: WriterState | undefined;
   private declare _writer: BoundResultWriter<T, never, E> | undefined;
 
   constructor(error: E, state?: WriterState) {
     this.error = error;
     this._state = state;
+  }
+
+  /** @internal A completion belongs to the exact context that created it. */
+  _assertOwner(owner: object): void {
+    if (this._state !== owner) {
+      // Invariant: forwarding a foreign completion is a broken traced call graph.
+      throw new TypeError(SPAN_COMPLETION_OWNER_ERROR);
+    }
   }
 
   private _resultWriter(): BoundResultWriter<T, never, E> | undefined {
@@ -334,7 +336,7 @@ export class Err<E, T extends LogSchema = LogSchema> {
     return this;
   }
 
-  /** Transform the error. */
+  /** Transform the error. Ownership follows the original result. */
   mapErr<F>(fn: (error: E) => F): Err<F, T> {
     return new Err<F, T>(fn(this.error), this._state);
   }
@@ -361,7 +363,7 @@ export class Err<E, T extends LogSchema = LogSchema> {
 
   /**
    * Set multiple attributes on the span-end entry (row 1).
-   * Deferred - applied when span()/trace() completes.
+   * Writes immediately to the creating span's reserved completion row.
    *
    * @example ctx.err(error).with({ user_id: 'u1' })
    */
@@ -406,7 +408,7 @@ export class Err<E, T extends LogSchema = LogSchema> {
 // RESULT TYPE
 // =============================================================================
 
-/** Union type for Result - either Ok or Err. */
+/** Union type for Result. Invocation ownership is checked at runtime. */
 export type Result<V, E, T extends LogSchema = LogSchema> = Ok<V, T> | Err<E, T>;
 
 /**
@@ -508,12 +510,7 @@ export function defineCodeError<Code extends string>(code: Code) {
  * Used by writeSpanEnd to extract error_code for logging.
  */
 export function hasErrorCode(error: unknown): error is { code: string } {
-  return (
-    error !== null &&
-    typeof error === 'object' &&
-    'code' in error &&
-    typeof (error as { code: unknown }).code === 'string'
-  );
+  return error !== null && typeof error === 'object' && 'code' in error && typeof error.code === 'string';
 }
 
 // =============================================================================

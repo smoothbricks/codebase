@@ -68,7 +68,9 @@ interface OrderData {
 // Validation op — demonstrates a flag-guarded nested span and scope override.
 const validateOrder = defineOp('validate-order', async (ctx, orderData: OrderData) => {
   if (ctx.ff.advancedValidation?.value) {
-    return ctx.span('advanced-validation', async (childCtx) => {
+    // Child results belong to the child: inspect, then propagate through this
+    // context. Returning the child result directly fails runtime ownership.
+    const advanced = await ctx.span('advanced-validation', async (childCtx) => {
       // Child inherits parent scope (userId, requestId, ...) and can add/override its own.
       childCtx.setScope({ operation: 'UPDATE_ORDER', sqlQuery: 'SELECT * FROM products WHERE id IN (...)' });
       childCtx.log.info('Running advanced validation');
@@ -77,6 +79,8 @@ const validateOrder = defineOp('validate-order', async (ctx, orderData: OrderDat
       }
       return childCtx.ok({ validated: true });
     });
+    if (!advanced.success) return ctx.err(advanced.error);
+    return ctx.ok(advanced.value);
   }
 
   ctx.log.info('Running basic validation');
