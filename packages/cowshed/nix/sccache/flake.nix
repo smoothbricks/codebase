@@ -84,6 +84,8 @@
         #    basename-preserving path used by the server's compiler-info cache.
         #    Rustup discovery retains the original path; retired workspace aliases
         #    cannot poison subsequent requests from another workspace.
+        #    Its Rust key epoch rejects entries poisoned by an older daemon
+        #    executing a repointed alias under another compiler's identity.
         #
         # This directory is the only copy of these patches. `smoo monorepo check` asserts that this
         # list and the `.patch` files beside it name each other exactly, so neither an orphaned file
