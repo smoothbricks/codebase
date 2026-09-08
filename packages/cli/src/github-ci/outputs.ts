@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { chmodSync, createReadStream, type Dirent, type Stats } from 'node:fs';
-import { copyFile, lstat, mkdir, readdir, readFile, unlink, writeFile } from 'node:fs/promises';
+import { copyFile, lstat, mkdir, readdir, readFile, writeFile } from 'node:fs/promises';
 import { dirname, isAbsolute, relative, resolve, sep } from 'node:path';
 import typia from 'typia';
 import { listPublishablePackages, type PackageInfo } from '../lib/workspace.js';
@@ -158,8 +158,6 @@ export async function applyCollectedOutputs(
 
   const overlays: Array<{ source: string; destination: string; mode: number }> = [];
   const claimedPaths = new Set<string>();
-  const appliedOutputs: Array<{ project: ProjectTargets; output: string }> = [];
-  const appliedOutputKeys = new Set<string>();
   for (const directory of directories) {
     const { manifest, manifestPath } = await readCollectedOutputsManifest(directory);
     if (manifest.sourceSha !== expectedSourceSha) {
@@ -202,11 +200,6 @@ export async function applyCollectedOutputs(
       }
       declaredPaths.add(path);
       claimedPaths.add(path);
-      const appliedKey = `${file.project}\0${file.output}`;
-      if (!appliedOutputKeys.has(appliedKey)) {
-        appliedOutputKeys.add(appliedKey);
-        appliedOutputs.push({ project, output: file.output });
-      }
 
       const source = resolveWorkspacePath(workspace, path, 'staged output file');
       let stat: Stats;
@@ -260,23 +253,6 @@ export async function applyCollectedOutputs(
         `Unable to apply staged output ${overlay.destination} at ${destination}: ${describeError(error)}`,
         { cause: error },
       );
-    }
-  }
-
-  for (const { project, output } of appliedOutputs) {
-    const resolved = resolveDeclaredOutput(output, project);
-    for (const path of await filesMatchingOutput(root, resolved)) {
-      if (claimedPaths.has(path)) {
-        continue;
-      }
-      const extra = resolveWorkspacePath(root, path, 'workspace output file');
-      try {
-        await unlink(extra);
-      } catch (error) {
-        throw new Error(`Unable to remove undeclared workspace output ${path}: ${describeError(error)}`, {
-          cause: error,
-        });
-      }
     }
   }
 }
