@@ -13,6 +13,46 @@ process.chdir(projectRoot);
 
 await rebuildNxPluginIfStale();
 
+await syncRuntimePinsIfDrifted();
+
+/** Shell entry tracks runtime pins: cheap local `--version` probes, sync on drift, best-effort (offline failure warns, validate is the gate, CI never rewrites). */
+async function syncRuntimePinsIfDrifted(): Promise<void> {
+  if (process.env.CI) {
+    return;
+  }
+  const manifest = await Bun.file(path.join(projectRoot, 'package.json'))
+    .json()
+    .catch(() => null);
+  const pinnedBun = typeof manifest?.packageManager === 'string' ? manifest.packageManager : null;
+  const pinnedNode = typeof manifest?.engines?.node === 'string' ? manifest.engines.node : null;
+  const [bun, node] = await Promise.all([
+    $`bun --version`
+      .cwd(projectRoot)
+      .quiet(true)
+      .nothrow()
+      .then((r) => (r.exitCode === 0 ? r.text().trim() : null)),
+    $`node --version`
+      .cwd(projectRoot)
+      .quiet(true)
+      .nothrow()
+      .then((r) => (r.exitCode === 0 ? r.text().trim().replace(/^v/, '') : null)),
+  ]);
+  const nodeMajor = node?.split('.', 1)[0];
+  if (
+    (pinnedBun === null || pinnedBun === `bun@${bun}`) &&
+    (pinnedNode === null || nodeMajor === undefined || pinnedNode === `>=${nodeMajor}.0.0`)
+  ) {
+    return;
+  }
+  try {
+    await runQuietly('smoo', ['monorepo', 'init', '--runtime-only'], projectRoot);
+  } catch (error) {
+    console.error(
+      `! Runtime pin sync failed (${error instanceof Error ? error.message : String(error)}); shell continues with pinned versions. Run \`smoo monorepo init --runtime-only\` once online.`,
+    );
+  }
+}
+
 async function rebuildNxPluginIfStale(): Promise<void> {
   const buildMarker = path.join(projectRoot, 'packages/nx-plugin/dist/tsconfig.lib.tsbuildinfo');
   const markerStat = await stat(buildMarker).catch(() => null);
