@@ -1009,12 +1009,7 @@ async function createProjectTargets(
       targets['biome-lint'] = {
         executor: 'nx:run-commands',
         cache: true,
-        inputs: [
-          'default',
-          '{workspaceRoot}/biome.json',
-          '{workspaceRoot}/package.json',
-          '{workspaceRoot}/bun.lock',
-        ],
+        inputs: ['default', '{workspaceRoot}/biome.json', '{workspaceRoot}/package.json', '{workspaceRoot}/bun.lock'],
         outputs: [],
         options: {
           command: 'biome check --files-ignore-unknown=true {projectRoot}',

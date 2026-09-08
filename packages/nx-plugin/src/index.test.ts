@@ -6,8 +6,8 @@ import { fileURLToPath } from 'node:url';
 
 import type { CreateNodesContextV2, CreateNodesV2, TargetConfiguration } from 'nx/src/devkit-exports.js';
 import { AggregateCreateNodesError } from 'nx/src/project-graph/error-types.js';
-import { mergeTargetConfigurations } from 'nx/src/project-graph/utils/project-configuration-utils.js';
 import { createTargetDefaultsResults } from 'nx/src/project-graph/utils/project-configuration/target-defaults.js';
+import { mergeTargetConfigurations } from 'nx/src/project-graph/utils/project-configuration-utils.js';
 import { BOUNDED_TEST_TIMEOUT_MS } from './bounded-test-policy.js';
 import { exceptionalTestFilter } from './cargo-workspace.js';
 import { CARGO_CROSS_LINT_COMMAND, CARGO_CROSS_LINT_TARGET, CARGO_LINT_CLIPPY_COMMAND } from './cross-check-policy.js';
@@ -407,7 +407,10 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       expect(rust['biome-lint']?.options?.command).toBe('biome check --files-ignore-unknown=true {projectRoot}');
 
       const custom = { executor: 'nx:run-commands', options: { command: 'custom-linter package.json' } };
-      await workspace.write(`${root}/package.json`, JSON.stringify({ name: 'ferris', nx: { targets: { lint: custom } } }));
+      await workspace.write(
+        `${root}/package.json`,
+        JSON.stringify({ name: 'ferris', nx: { targets: { lint: custom } } }),
+      );
       const declared = await inferProjectTargets(workspace, `${root}/package.json`);
       expect(resolveLint(declared, custom).options?.command).toBe(custom.options.command);
       expect(declared['biome-lint']).toBeUndefined();
