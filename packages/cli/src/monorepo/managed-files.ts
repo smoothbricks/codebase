@@ -8,6 +8,7 @@ import type {
   PackageJson,
   PackagePrivateNpmConfig,
   PackageSourceCheckoutConfig,
+  PackageSmooGithub,
 } from '../lib/json.js';
 import { listReleasePackages, readPackageJson } from '../lib/workspace.js';
 import { loadNxProjects, type NxProjects, targetNamesFromProjects } from '../nx/index.js';
@@ -154,6 +155,7 @@ export interface ManagedFileContext {
   ciRunsOn: string | string[];
   /** macOS platform job runs-on labels from the root smoo config; default macos-latest. */
   macosRunsOn: string | string[];
+  platformProducer?: PackageSmooGithub['platformProducer'];
   nodeModulesCacheKey: string;
   repoName: string;
   platformTargetGlobs: string[];
@@ -382,6 +384,7 @@ function getManagedContent(file: ManagedFile, context: ManagedFileContext): stri
         macosPlatformArchitectures: context.macosPlatformArchitectures,
         runsOn: context.ciRunsOn,
         macosRunsOn: context.macosRunsOn,
+        platformProducer: context.platformProducer,
         privateNpm: context.privateNpm,
         sourceCheckouts: context.sourceCheckouts,
         cargoCredentials: context.cargoCredentials,
@@ -434,6 +437,7 @@ async function getManagedFileContext(root: string): Promise<ManagedFileContext> 
     ciPushBranches,
     ciRunsOn,
     macosRunsOn,
+    platformProducer: packageJson?.json?.smoo?.github?.platformProducer,
     nodeModulesCacheKey,
     repoName,
     platformTargetGlobs,

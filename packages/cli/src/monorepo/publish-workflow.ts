@@ -12,6 +12,7 @@ import type {
   PackageCargoCredentialsConfig,
   PackagePrivateNpmConfig,
   PackageSourceCheckoutConfig,
+  PackageSmooGithub,
 } from '../lib/json.js';
 import {
   artifactStepLines,
@@ -102,6 +103,7 @@ export interface PublishWorkflowDefinitionOptions {
   runsOn?: WorkflowRunsOn;
   /** macOS platform job runs-on labels. Default macos-latest. Same smoo.github.macosRunsOn as CI. */
   macosRunsOn?: WorkflowRunsOn;
+  platformProducer?: PackageSmooGithub['platformProducer'];
   /**
    * Declared private-npm opt-in. The publish step is the only place receiving
    * the publish token; the read token rides along for `.npmrc` `${TOKEN}`
@@ -793,7 +795,7 @@ ${renderRunsOnLine(options.runsOn)}
     steps:
 ${renderLinuxReleaseCandidateSteps(steps, options)}
 
-  macos-platform:
+  ${options.platformProducer?.kind === 'linux-cross' ? 'cross-platform' : 'macos-platform'}:
 ${renderMacosJobHeaderLines(options)}
     permissions:
       contents: read
@@ -801,11 +803,12 @@ ${renderMacosJobHeaderLines(options)}
     env:
       NIX_STORE_NAR: ${githubExpression('github.workspace')}/nix-store.nar
       GH_TOKEN: ${githubExpression('github.token')}${cargoCredentialsJobEnv(options)}${privateNpmInstallJobEnv(options)}
+${Object.entries(options.platformProducer?.env ?? {}).map(([name, value]) => `      ${name}: ${JSON.stringify(value)}`).join('\n')}
     steps:
 ${renderMacosPlatformSteps(options)}
 
   publish-on-linux:
-    needs: [linux-release-candidate, macos-platform]
+    needs: [linux-release-candidate, ${options.platformProducer?.kind === 'linux-cross' ? 'cross-platform' : 'macos-platform'}]
 ${renderRunsOnLine(options.runsOn)}
     permissions:
       contents: write
@@ -975,6 +978,20 @@ function renderMacosPlatformSteps(options: PublishWorkflowDefinitionOptions): st
     '          filter: blob:none',
     '          fetch-depth: 0',
   ];
+  if (options.platformProducer) {
+    if (!options.platformProducer.preflight.trim()) {
+      throw new Error('Linux cross-platform production requires a nonempty toolchain preflight command.');
+    }
+    lines.push(
+      '',
+      `      # Step ${stepNumber++}`,
+      '      - name: Check cross-platform toolchain prerequisites',
+      '        working-directory: .',
+      '        run: |',
+      '          set -euo pipefail',
+      ...options.platformProducer.preflight.split('\n').map((line) => `          ${line}`),
+    );
+  }
   const macosCargoCredentials = cargoCredentialsStepLines(options);
   if (macosCargoCredentials.length > 0) {
     lines.push('', `      # Step ${stepNumber++}`, ...macosCargoCredentials);
@@ -1042,10 +1059,13 @@ function renderMacosPlatformSteps(options: PublishWorkflowDefinitionOptions): st
       'inputs.bump',
     )}" --ref "${githubExpression('github.sha')}" --targets "${macosPlatformTargetSelector(options)}" --output`,
     `          "${githubExpression('runner.temp')}/macos-platform-outputs" --github-output "$GITHUB_OUTPUT"`,
-    '',
-    `      # Step ${stepNumber++}`,
-    '      - name: 🧪 Unit test selected macOS and iOS packages',
   );
+  if (options.platformProducer?.kind !== 'linux-cross') {
+    lines.push(
+      '',
+      `      # Step ${stepNumber++}`,
+      '      - name: 🧪 Unit test selected macOS and iOS packages',
+    );
   if (isMatrix) {
     lines.push(
       '        # Only the runner-native leg can execute what it built; the foreign',
@@ -1057,6 +1077,9 @@ function renderMacosPlatformSteps(options: PublishWorkflowDefinitionOptions): st
     '        run:',
     '          smoo github-ci nx-run-many --targets test --projects',
     `          "${githubExpression('steps.platform-outputs.outputs.projects')}"`,
+    );
+  }
+  lines.push(
     '',
     `      # Step ${stepNumber++}`,
     ...artifactStepLines(`📤 Upload macOS platform outputs${legLabel}`, 'upload', [
@@ -1294,6 +1317,7 @@ function macosPlatformFamilies(options: PublishWorkflowDefinitionOptions): strin
  * parallel for real.
  */
 function macosPlatformArchitectures(options: PublishWorkflowDefinitionOptions): string[] {
+  if (options.platformProducer?.kind === 'linux-cross') return [];
   return hasMacosPlatformTargets(options) ? [...(options.macosPlatformArchitectures ?? [])] : [];
 }
 
@@ -1302,6 +1326,7 @@ function macosTestArchitecture(architectures: readonly string[]): string | undef
 }
 
 function renderMacosJobHeaderLines(options: PublishWorkflowDefinitionOptions): string {
+  if (options.platformProducer?.kind === 'linux-cross') return renderRunsOnLine(options.runsOn);
   const architectures = macosPlatformArchitectures(options);
   const lines = [
     options.macosRunsOn === undefined ? '    runs-on: macos-latest' : renderRunsOnLine(options.macosRunsOn),
