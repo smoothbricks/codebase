@@ -110,17 +110,8 @@ jobs:
 
       # Step 12
       - name: 📎 Upload trace DBs
-        if: (always()) && (github.server_url == 'https://github.com' || endsWith(github.api_url, '/api/v3'))
+        if: always()
         uses: actions/upload-artifact@v7.0.1
-        with:
-          name: trace-results-${{ github.run_id }}
-          path: packages/*/.cache/trace-results.db*
-          if-no-files-found: ignore
-          retention-days: 14
-          include-hidden-files: true
-      - name: 📎 Upload trace DBs (Forgejo)
-        if: (always()) && !(github.server_url == 'https://github.com' || endsWith(github.api_url, '/api/v3'))
-        uses: https://code.forgejo.org/forgejo/upload-artifact@cb8afe72b42edc798abfb8fcb556cf660d894245
         with:
           name: trace-results-${{ github.run_id }}
           path: packages/*/.cache/trace-results.db*

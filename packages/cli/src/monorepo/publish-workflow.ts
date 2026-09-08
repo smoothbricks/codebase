@@ -11,8 +11,8 @@ import { isSmoothBricksCodebasePackageName } from '../lib/cli-package.js';
 import type {
   PackageCargoCredentialsConfig,
   PackagePrivateNpmConfig,
-  PackageSourceCheckoutConfig,
   PackageSmooGithub,
+  PackageSourceCheckoutConfig,
 } from '../lib/json.js';
 import {
   artifactStepLines,
@@ -581,16 +581,19 @@ function yamlLinesForStep(step: PublishWorkflowStep, options: PublishWorkflowDef
         `smoo github-ci nx-run-many --targets test --projects "${githubExpression('steps.version.outputs.projects')}"`,
       );
     case PublishWorkflowStepKind.UploadTraceDbs:
-      return artifactStepLines(options.actionsProvider, step.name,
-      'upload',
-      [
-        `name: trace-results-${githubExpression('github.run_id')}`,
-        'path: packages/*/.cache/trace-results.db*',
-        'if-no-files-found: ignore',
-        'retention-days: 14',
-        'include-hidden-files: true',
-      ],
-      'failure()',);
+      return artifactStepLines(
+        options.actionsProvider,
+        step.name,
+        'upload',
+        [
+          `name: trace-results-${githubExpression('github.run_id')}`,
+          'path: packages/*/.cache/trace-results.db*',
+          'if-no-files-found: ignore',
+          'retention-days: 14',
+          'include-hidden-files: true',
+        ],
+        'failure()',
+      );
     case PublishWorkflowStepKind.ValidateMonorepoConfig:
       return conditionalRunStep(step, 'smoo monorepo validate');
     case PublishWorkflowStepKind.TagRelease:
@@ -802,7 +805,9 @@ ${renderMacosJobHeaderLines(options)}
     env:
       NIX_STORE_NAR: ${githubExpression('github.workspace')}/nix-store.nar
       GH_TOKEN: ${githubExpression('github.token')}${cargoCredentialsJobEnv(options)}${privateNpmInstallJobEnv(options)}
-${Object.entries(options.platformProducer?.env ?? {}).map(([name, value]) => `      ${name}: ${JSON.stringify(value)}`).join('\n')}
+${Object.entries(options.platformProducer?.env ?? {})
+  .map(([name, value]) => `      ${name}: ${JSON.stringify(value)}`)
+  .join('\n')}
     steps:
 ${renderMacosPlatformSteps(options)}
 
@@ -916,31 +921,37 @@ function renderLinuxReleaseCandidateSteps(
     ]),
     '',
     `      # Step ${stepNumber++}`,
-    ...artifactStepLines(options.actionsProvider, '📤 Upload validated build outputs',
-    'upload',
-    [
-      `name: publish-release-outputs-${githubExpression('github.run_id')}`,
-      `path: ${githubExpression('runner.temp')}/release-build-outputs`,
-      'if-no-files-found: error',
-      'retention-days: 1',
-      'include-hidden-files: true',
-    ],
-    "steps.version.outputs.mode != 'none'",),
+    ...artifactStepLines(
+      options.actionsProvider,
+      '📤 Upload validated build outputs',
+      'upload',
+      [
+        `name: publish-release-outputs-${githubExpression('github.run_id')}`,
+        `path: ${githubExpression('runner.temp')}/release-build-outputs`,
+        'if-no-files-found: error',
+        'retention-days: 1',
+        'include-hidden-files: true',
+      ],
+      "steps.version.outputs.mode != 'none'",
+    ),
   );
   if (hasLinuxPlatformTargets(options)) {
     lines.push(
       '',
       `      # Step ${stepNumber++}`,
-      ...artifactStepLines(options.actionsProvider, '📤 Upload supplemental Linux outputs',
-      'upload',
-      [
-        `name: publish-linux-outputs-${githubExpression('github.run_id')}`,
-        `path: ${githubExpression('runner.temp')}/linux-platform-outputs`,
-        'if-no-files-found: error',
-        'retention-days: 1',
-        'include-hidden-files: true',
-      ],
-      "steps.version.outputs.mode != 'none'",),
+      ...artifactStepLines(
+        options.actionsProvider,
+        '📤 Upload supplemental Linux outputs',
+        'upload',
+        [
+          `name: publish-linux-outputs-${githubExpression('github.run_id')}`,
+          `path: ${githubExpression('runner.temp')}/linux-platform-outputs`,
+          'if-no-files-found: error',
+          'retention-days: 1',
+          'include-hidden-files: true',
+        ],
+        "steps.version.outputs.mode != 'none'",
+      ),
     );
   }
   lines.push(
@@ -1056,22 +1067,18 @@ function renderMacosPlatformSteps(options: PublishWorkflowDefinitionOptions): st
     `          "${githubExpression('runner.temp')}/macos-platform-outputs" --github-output "$GITHUB_OUTPUT"`,
   );
   if (options.platformProducer?.kind !== 'linux-cross') {
+    lines.push('', `      # Step ${stepNumber++}`, '      - name: 🧪 Unit test selected macOS and iOS packages');
+    if (isMatrix) {
+      lines.push(
+        '        # Only the runner-native leg can execute what it built; the foreign',
+        '        # architecture ships as an artifact without running here.',
+      );
+    }
     lines.push(
-      '',
-      `      # Step ${stepNumber++}`,
-      '      - name: 🧪 Unit test selected macOS and iOS packages',
-    );
-  if (isMatrix) {
-    lines.push(
-      '        # Only the runner-native leg can execute what it built; the foreign',
-      '        # architecture ships as an artifact without running here.',
-    );
-  }
-  lines.push(
-    `        if: ${testCondition}`,
-    '        run:',
-    '          smoo github-ci nx-run-many --targets test --projects',
-    `          "${githubExpression('steps.platform-outputs.outputs.projects')}"`,
+      `        if: ${testCondition}`,
+      '        run:',
+      '          smoo github-ci nx-run-many --targets test --projects',
+      `          "${githubExpression('steps.platform-outputs.outputs.projects')}"`,
     );
   }
   lines.push(

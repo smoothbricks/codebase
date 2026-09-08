@@ -4,8 +4,8 @@ import type {
   PackageCargoCredentialsConfig,
   PackageCargoGitOrigin,
   PackagePrivateNpmConfig,
-  PackageSourceCheckoutConfig,
   PackageSmooGithub,
+  PackageSourceCheckoutConfig,
 } from '../lib/json.js';
 import { renderRunsOnLine } from './github-runs-on.js';
 
@@ -324,16 +324,19 @@ function yamlLinesForStep(step: CiWorkflowStep, options: CiWorkflowDefinitionOpt
         '          key: ${{ runner.os }}-${{ runner.arch }}-nx-db-v1-${{ github.sha }}',
       ];
     case CiWorkflowStepKind.UploadTraceDbs:
-      return artifactStepLines(options.actionsProvider, step.name,
-      'upload',
-      [
-        'name: trace-results-${{ github.run_id }}',
-        'path: packages/*/.cache/trace-results.db*',
-        'if-no-files-found: ignore',
-        'retention-days: 14',
-        'include-hidden-files: true',
-      ],
-      'always()',);
+      return artifactStepLines(
+        options.actionsProvider,
+        step.name,
+        'upload',
+        [
+          'name: trace-results-${{ github.run_id }}',
+          'path: packages/*/.cache/trace-results.db*',
+          'if-no-files-found: ignore',
+          'retention-days: 14',
+          'include-hidden-files: true',
+        ],
+        'always()',
+      );
     case CiWorkflowStepKind.SaveNixDevenv:
       return [
         `      - name: ${step.name}`,
@@ -661,13 +664,14 @@ export function artifactStepLines(
   // GitHub resolves every action before evaluating step conditions, so a
   // Forgejo absolute action URL must never appear in a GitHub workflow.
   // Forgejo 15 supports v4 artifacts; its pinned clients remove the GHES gate.
-  const action = provider === 'forgejo'
-    ? kind === 'upload'
-      ? 'https://code.forgejo.org/forgejo/upload-artifact@cb8afe72b42edc798abfb8fcb556cf660d894245'
-      : 'https://code.forgejo.org/forgejo/download-artifact@769f970437aa3291b13f35dc23fc87967d7fb19f'
-    : kind === 'upload'
-      ? 'actions/upload-artifact@v7.0.1'
-      : 'actions/download-artifact@v8.0.1';
+  const action =
+    provider === 'forgejo'
+      ? kind === 'upload'
+        ? 'https://code.forgejo.org/forgejo/upload-artifact@cb8afe72b42edc798abfb8fcb556cf660d894245'
+        : 'https://code.forgejo.org/forgejo/download-artifact@769f970437aa3291b13f35dc23fc87967d7fb19f'
+      : kind === 'upload'
+        ? 'actions/upload-artifact@v7.0.1'
+        : 'actions/download-artifact@v8.0.1';
   return [
     `      - name: ${name}`,
     `        if: ${condition}`,
