@@ -14,6 +14,15 @@ with `tsconfig.lib.json` receives transformer-aware `tsc-js` and native `typeche
 - Cargo workspace targets from a neighboring workspace-root `Cargo.toml`
 - aggregate `build` and `lint` targets
 
+Lint commands are inferred per project. A workspace Biome configuration enables the project-wide Biome check; an ESLint
+flat configuration enables ESLint only for existing JavaScript/TypeScript files under that project's `src`. Rust-only
+source trees therefore keep their Cargo validation and manifest checks without invoking ESLint on nonexistent JavaScript
+inputs. Adding JavaScript or TypeScript sources adds their lint coverage automatically.
+
+Keep `targetDefaults.lint` limited to shared cache policy. Smoo's workspace policy removes static lint executors,
+commands, dependencies, inputs and outputs because they override source-aware inference for every project. Project-local
+`nx.targets.lint` declarations retain normal Nx override precedence.
+
 ## Cargo Workspace Layouts
 
 The plugin discovers Cargo workspaces beside Nx project manifests at any depth:

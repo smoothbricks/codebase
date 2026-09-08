@@ -46,6 +46,47 @@ const TYPESCRIPT_TOOLCHAIN_INPUTS = [
   '{workspaceRoot}/tsconfig.base.json',
 ];
 
+const BIOME_CONFIG_FILES = ['biome.json', 'biome.jsonc'];
+const ESLINT_CONFIG_FILES = [
+  'eslint.config.js',
+  'eslint.config.mjs',
+  'eslint.config.cjs',
+  'eslint.config.ts',
+  'eslint.config.mts',
+  'eslint.config.cts',
+];
+
+async function javaScriptSourceFiles(directory: string): Promise<string[]> {
+  if (!existsSync(directory)) return [];
+  const files: string[] = [];
+  for (const entry of await readdir(directory, { withFileTypes: true })) {
+    if (entry.isDirectory()) {
+      if (entry.name !== 'node_modules' && entry.name !== 'target' && entry.name !== 'dist') {
+        files.push(...(await javaScriptSourceFiles(join(directory, entry.name))));
+      }
+    } else if (entry.isFile() && /\.[cm]?[jt]sx?$/.test(entry.name)) {
+      files.push(join(directory, entry.name));
+    }
+  }
+  return files.sort();
+}
+
+async function projectLintCommands(projectRoot: string, workspaceRoot: string): Promise<string[]> {
+  const commands: string[] = [];
+  const absoluteProjectRoot = join(workspaceRoot, projectRoot);
+  const quote = (path: string) => `'${path.replaceAll("'", "'\"'\"'")}'`;
+  if (BIOME_CONFIG_FILES.some((name) => existsSync(join(workspaceRoot, name)))) {
+    commands.push(`biome check --files-ignore-unknown=true ${quote(projectRoot)}`);
+  }
+  if (ESLINT_CONFIG_FILES.some((name) => existsSync(join(workspaceRoot, name)))) {
+    const sourceFiles = await javaScriptSourceFiles(join(absoluteProjectRoot, 'src'));
+    if (sourceFiles.length > 0) {
+      commands.push(`eslint ${sourceFiles.map((file) => quote(relative(workspaceRoot, file))).join(' ')}`);
+    }
+  }
+  return commands;
+}
+
 type NapiArchitecture = 'arm64' | 'x64';
 type NapiTargetFamily = 'linux' | 'macos';
 
@@ -998,32 +1039,27 @@ async function createProjectTargets(
     }
   }
 
-  if (validationTargets.length > 0) {
-    const rustOnlyLint =
-      isCargoProject &&
-      !hasLibTsconfig &&
-      !hasTestTsconfig &&
-      !('lint' in declaredTargets) &&
-      typeof packageJson.scripts?.lint !== 'string';
-    if (rustOnlyLint) {
-      targets['biome-lint'] = {
-        executor: 'nx:run-commands',
-        cache: true,
-        inputs: ['default', '{workspaceRoot}/biome.json', '{workspaceRoot}/package.json', '{workspaceRoot}/bun.lock'],
-        outputs: [],
-        options: {
-          command: 'biome check --files-ignore-unknown=true {projectRoot}',
-          cwd: '{workspaceRoot}',
-        },
-      };
-      validationTargets.push('biome-lint');
-    }
+  const lintCommands = await projectLintCommands(projectRoot, workspaceRoot);
+  if (validationTargets.length > 0 || lintCommands.length > 0) {
     targets.lint = {
-      // An explicit aggregate executor prevents JavaScript-oriented lint
-      // targetDefaults from replacing this Rust-only validation graph.
-      ...(rustOnlyLint ? { executor: 'nx:noop' } : {}),
+      executor: lintCommands.length > 0 ? 'nx:run-commands' : 'nx:noop',
       cache: true,
       dependsOn: validationTargets,
+      outputs: [],
+      inputs: [
+        'default',
+        ...TYPESCRIPT_TOOLCHAIN_INPUTS,
+        ...[...BIOME_CONFIG_FILES, ...ESLINT_CONFIG_FILES].flatMap((name) => [
+          `{workspaceRoot}/${name}`,
+          `{projectRoot}/${name}`,
+        ]),
+        '{workspaceRoot}/tooling/checks/**/*',
+      ],
+      ...(lintCommands.length > 0
+        ? {
+            options: { commands: lintCommands, cwd: '.', parallel: false },
+          }
+        : {}),
     };
   }
 

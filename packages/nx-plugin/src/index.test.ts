@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'bun:test';
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -12,10 +12,87 @@ import { BOUNDED_TEST_TIMEOUT_MS } from './bounded-test-policy.js';
 import { exceptionalTestFilter } from './cargo-workspace.js';
 import { CARGO_CROSS_LINT_COMMAND, CARGO_CROSS_LINT_TARGET, CARGO_LINT_CLIPPY_COMMAND } from './cross-check-policy.js';
 import { createNodesV2, createNodesV2ForPlatform } from './index.js';
+import { applyWorkspaceConfig } from './workspace-config-policy.js';
 
 const [, inferTargets] = createNodesV2;
 
 describe('@smoothbricks/nx-plugin inferred targets', () => {
+  it('runs Rust-only lint without ESLint and checks JavaScript when sources appear', async () => {
+    const workspace = await createWorkspace();
+    const root = workspace.context.workspaceRoot;
+    const repositoryRoot = fileURLToPath(new URL('../../../', import.meta.url));
+    try {
+      await symlink(join(repositoryRoot, 'node_modules'), join(root, 'node_modules'), 'dir');
+      await workspace.write('package.json', '{"name":"lint-workspace","private":true,"workspaces":["packages/*"]}\n');
+      await workspace.write(
+        'nx.json',
+        JSON.stringify({
+          plugins: [fileURLToPath(new URL('../dist/index.js', import.meta.url))],
+          namedInputs: { default: ['{projectRoot}/**/*'] },
+          targetDefaults: { lint: { cache: true } },
+        }),
+      );
+      await workspace.write(
+        'biome.json',
+        '{"formatter":{"enabled":false},"linter":{"rules":{"suspicious":{"noDebugger":"off"}}}}\n',
+      );
+      await workspace.write(
+        'eslint.config.mjs',
+        'export default [{ files: ["**/*.{js,ts}"], rules: { "no-debugger": "error" } }];\n',
+      );
+      await workspace.write('Cargo.toml', '[workspace]\nmembers = ["packages/rust"]\nresolver = "2"\n');
+      await workspace.write('Cargo.lock', 'version = 4\n\n[[package]]\nname = "lint-crate"\nversion = "0.1.0"\n');
+      await workspace.write('packages/rust/package.json', '{"name":"rust-fixture"}\n');
+      await workspace.write(
+        'packages/rust/Cargo.toml',
+        '[package]\nname = "lint-crate"\nversion = "0.1.0"\nedition = "2021"\n',
+      );
+      await workspace.write('packages/rust/src/lib.rs', 'pub fn answer() -> u32 {\n    42\n}\n');
+      const runLint = async () => {
+        const child = Bun.spawn(['bun', join(repositoryRoot, 'node_modules/.bin/nx'), 'run', 'rust-fixture:lint'], {
+          cwd: root,
+          env: {
+            ...process.env,
+            PATH: `${join(repositoryRoot, 'node_modules/.bin')}:${process.env.PATH ?? ''}`,
+            NX_DAEMON: 'false',
+            NX_ISOLATE_PLUGINS: 'false',
+            NX_WORKSPACE_DATA_DIRECTORY: join(root, '.nx/workspace-data'),
+            NX_CACHE_DIRECTORY: join(root, '.nx/cache'),
+            RUSTC_WRAPPER: '',
+            RUSTC_WORKSPACE_WRAPPER: '',
+          },
+          stdout: 'pipe',
+          stderr: 'pipe',
+        });
+        const [exitCode, stdout, stderr] = await Promise.all([
+          child.exited,
+          new Response(child.stdout).text(),
+          new Response(child.stderr).text(),
+        ]);
+        return { exitCode, output: stdout + stderr };
+      };
+      const rustOnly = await runLint();
+      expect(rustOnly).toMatchObject({ exitCode: 0 });
+      expect(rustOnly.output).toContain('cargo-lint-lint-crate');
+      await workspace.write('packages/rust/src/check.js', 'debugger;\n');
+      const withJavaScript = await runLint();
+      expect(withJavaScript.exitCode).not.toBe(0);
+      expect(withJavaScript.output).toContain('no-debugger');
+      await workspace.write(
+        'packages/rust/package.json',
+        JSON.stringify({
+          name: 'rust-fixture',
+          nx: { targets: { lint: { executor: 'nx:run-commands', options: { command: 'printf explicit-lint' } } } },
+        }),
+      );
+      const overridden = await runLint();
+      expect(overridden).toMatchObject({ exitCode: 0 });
+      expect(overridden.output).toContain('explicit-lint');
+    } finally {
+      await workspace.cleanup();
+    }
+  }, 120_000);
+
   it('names standalone package projects from package metadata', async () => {
     const workspace = await createWorkspace();
     try {
@@ -176,7 +253,6 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         cwd: 'packages/example',
       });
 
-      expect(targets.lint?.executor).toBeUndefined();
       expect(targets.lint?.cache).toBe(true);
       expect(targets.lint?.dependsOn).toEqual(['typecheck-tests']);
     } finally {
@@ -354,7 +430,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       });
       expect(targets['cargo-lint-ferris-core']?.cache).toBe(true);
       expect(targets['cargo-lint-ferris-core']?.outputs).toEqual([]);
-      expect(targets.lint?.dependsOn).toEqual(['cargo-lint', 'biome-lint']);
+      expect(targets.lint?.dependsOn).toEqual(['cargo-lint']);
       expect(targets[CARGO_CROSS_LINT_TARGET]?.options).toMatchObject({
         command: CARGO_CROSS_LINT_COMMAND,
         cwd: 'packages/ferris',
@@ -371,7 +447,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
     }
   });
 
-  it('keeps Rust-only lint free of inherited JavaScript commands without replacing mixed or custom lint', async () => {
+  it('keeps Rust-only lint source-aware after migrating defaults without replacing mixed or custom lint', async () => {
     const workspace = await createWorkspace();
     const root = 'packages/ferris';
     const defaults = {
@@ -382,6 +458,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         },
       },
     };
+    applyWorkspaceConfig(defaults);
     const resolveLint = (targets: Record<string, TargetConfiguration>, declared: TargetConfiguration = {}) => {
       let lint = targets.lint ?? {};
       const synthesized = createTargetDefaultsResults(
@@ -396,15 +473,16 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       return mergeTargetConfigurations(declared, lint);
     };
     try {
+      await workspace.write('biome.json', '{}\n');
+      await workspace.write('eslint.config.mjs', 'export default [{ files: ["**/*.ts"] }];\n');
       await workspace.write(`${root}/package.json`, '{"name":"ferris"}\n');
       await workspace.write(`${root}/Cargo.toml`, '[workspace]\nmembers = ["crates/core"]\n');
       await workspace.write(`${root}/crates/core/Cargo.toml`, '[package]\nname = "ferris-core"\n');
       const rust = await inferProjectTargets(workspace, `${root}/package.json`);
       const rustLint = resolveLint(rust);
-      expect(rustLint.executor).toBe('nx:noop');
-      expect(rustLint.dependsOn).toEqual(['cargo-lint', 'biome-lint']);
-      expect(rustLint.options).toBeUndefined();
-      expect(rust['biome-lint']?.options?.command).toBe('biome check --files-ignore-unknown=true {projectRoot}');
+      expect(rustLint.executor).toBe('nx:run-commands');
+      expect(rustLint.dependsOn).toEqual(['cargo-lint']);
+      expect(rustLint.options?.commands).toEqual([`biome check --files-ignore-unknown=true '${root}'`]);
 
       const custom = { executor: 'nx:run-commands', options: { command: 'custom-linter package.json' } };
       await workspace.write(
@@ -413,13 +491,15 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       );
       const declared = await inferProjectTargets(workspace, `${root}/package.json`);
       expect(resolveLint(declared, custom).options?.command).toBe(custom.options.command);
-      expect(declared['biome-lint']).toBeUndefined();
 
       await workspace.write(`${root}/package.json`, '{"name":"ferris"}\n');
       await workspace.write(`${root}/tsconfig.lib.json`, '{"compilerOptions":{"outDir":"dist"}}\n');
+      await workspace.write(`${root}/src/index.ts`, 'export const value = 1;\n');
       const mixed = await inferProjectTargets(workspace, `${root}/package.json`);
-      expect(resolveLint(mixed).options?.commands).toEqual(defaults.targetDefaults.lint.options.commands);
-      expect(mixed['biome-lint']).toBeUndefined();
+      expect(resolveLint(mixed).options?.commands).toEqual([
+        `biome check --files-ignore-unknown=true '${root}'`,
+        `eslint '${root}/src/index.ts'`,
+      ]);
     } finally {
       await workspace.cleanup();
     }

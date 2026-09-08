@@ -215,6 +215,29 @@ describe('pure core: checkWorkspaceConfig', () => {
 });
 
 describe('pure core: applyWorkspaceConfig', () => {
+  it('removes workspace-wide lint commands while preserving shared cache policy', () => {
+    const nxJson = {
+      ...validNxJson(),
+      targetDefaults: {
+        ...validTargetDefaults(),
+        lint: {
+          cache: true,
+          executor: 'nx:run-commands',
+          dependsOn: ['typecheck-tests', 'cargo-lint'],
+          inputs: ['default'],
+          outputs: ['dist'],
+          options: { command: 'eslint packages/*/src' },
+        },
+      },
+    };
+    expect(checkWorkspaceConfig(nxJson).some((issue) => issue.message.includes('targetDefaults.lint.'))).toBe(true);
+    expect(applyWorkspaceConfig(nxJson)).toBe(true);
+    expect(nxJson.targetDefaults.lint).toMatchObject({ cache: true });
+    expect(Object.keys(nxJson.targetDefaults.lint)).toEqual(['cache']);
+    expect(checkWorkspaceConfig(nxJson)).toEqual([]);
+    expect(applyWorkspaceConfig(nxJson)).toBe(false);
+  });
+
   it('returns false for already-valid config', () => {
     const nxJson = validNxJson();
     expect(applyWorkspaceConfig(nxJson)).toBe(false);
