@@ -1106,10 +1106,13 @@ impl GitRepository {
     /// `--path-format=absolute` is load-bearing: the bare form answers relative to the repository
     /// root, and this path is handed to a *different* repository as an alternate object store,
     /// where a relative path resolves against the wrong directory.
+    /// An empty `--show-prefix` proves this is the repository root in the same lookup;
+    /// otherwise a missing checkout could silently resolve an enclosing repository.
     pub async fn object_directory(&self) -> Result<PathBuf> {
         let output = self
             .run([
                 "rev-parse",
+                "--show-prefix",
                 "--path-format=absolute",
                 "--git-path",
                 "objects",
@@ -1118,7 +1121,13 @@ impl GitRepository {
         if !output.status.success() {
             return Err(git_internal("locate the git object store", &output));
         }
-        parse_one_path(&output.stdout, "git object store")
+        let root_output = output.stdout.strip_prefix(b"\n").ok_or_else(|| {
+            CowshedError::integrity(
+                format!("{} is not a git repository root", self.root.display()),
+                "restore the expected repository at this path, then retry",
+            )
+        })?;
+        parse_one_path(root_output, "git object store")
     }
 
     /// How many commits `head` has that `revision` does not.
