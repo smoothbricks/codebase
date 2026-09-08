@@ -31,10 +31,10 @@ describe('runtimeTypesRangeForPublishedVersions', () => {
 });
 
 describe('validateRuntimePins', () => {
-  const runtime = { node: '24.16.0', bun: '1.3.14' };
+  const runtime = { node: '24.16.0', bun: '1.4.2' };
   const aligned = () => ({
     engines: { node: '>=24.0.0' },
-    packageManager: 'bun@1.3.14',
+    packageManager: 'bun@1.4.2',
     devDependencies: { '@types/node': '^24.13.0' },
   });
 
@@ -71,5 +71,21 @@ describe('validateRuntimePins', () => {
     const pkg: PackageJson = aligned();
     pkg.devDependencies = {};
     expect(validateRuntimePins(pkg, runtime)).toBe(1);
+  });
+
+  test('refuses a PATH bun below the pack-resolution floor even when pins align', () => {
+    for (const bun of ['1.4.0', '1.3.14']) {
+      const pkg = aligned();
+      pkg.packageManager = `bun@${bun}`;
+      expect(validateRuntimePins(pkg, { node: '24.16.0', bun })).toBe(1);
+    }
+  });
+
+  test('accepts a PATH bun at or above the pack-resolution floor', () => {
+    for (const bun of ['1.4.2', '1.5.0']) {
+      const pkg = aligned();
+      pkg.packageManager = `bun@${bun}`;
+      expect(validateRuntimePins(pkg, { node: '24.16.0', bun })).toBe(0);
+    }
   });
 });
