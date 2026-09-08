@@ -1,5 +1,6 @@
 import { join } from 'node:path';
 import { readPackageJson, readPackageJsonObject, repositoryInfo } from '../lib/workspace.js';
+import { resolvePrivateNpmRegistry } from './private-npm.js';
 
 export type SourceRepository =
   | { kind: 'github'; owner: string; repo: string }
@@ -71,12 +72,79 @@ export function sourceReleaseUrl(repo: SourceRepository, tag: string): string {
   return `${repo.htmlBase}/${repo.owner}/${repo.repo}/releases/tag/${encodedTag}`;
 }
 
-export function resolveSourceReleaseToken(
+/** Which environment variable supplied a source-release token, plus its value. */
+export interface SourceReleaseCredential {
+  /** Variable name: safe to log. The token is not. */
+  envName: string;
+  token: string;
+}
+
+/**
+ * Environment variables that may authenticate source-release API calls for
+ * `repo`, in resolution order.
+ *
+ * The ambient forge credentials (GH_TOKEN, GITHUB_TOKEN) count only when the
+ * ambient forge *is* the source forge. Forgejo Actions exports GITHUB_TOKEN
+ * and GITHUB_SERVER_URL exactly as GitHub Actions does, and a developer shell
+ * normally holds a GitHub PAT in GH_TOKEN, so an ungated ambient token sends
+ * one forge's credential to another forge's host: an unexplainable 401 in the
+ * good case, credential disclosure in the bad one. GITHUB_SERVER_URL names
+ * the forge that issued the ambient token.
+ *
+ * The declared private-npm publisher variable comes last, and only for a
+ * source forge that also hosts the declared registry: it is that host's
+ * credential, not a general-purpose one.
+ */
+export function sourceReleaseTokenEnvNames(
+  repo: SourceRepository,
   root: string,
   env: Record<string, string | undefined> = process.env,
-): string | null {
+): string[] {
+  const sourceHost = repo.kind === 'github' ? 'github.com' : new URL(repo.htmlBase).host;
+  const names = ambientForgeIsSource(sourceHost, env) ? ['GH_TOKEN', 'GITHUB_TOKEN'] : [];
   const declared = readPackageJsonObject(join(root, 'package.json'))?.smoo?.privateNpm?.publishTokenEnv;
-  return env.GH_TOKEN || env.GITHUB_TOKEN || (declared ? env[declared] : undefined) || null;
+  if (declared && !names.includes(declared) && declaredRegistryHostsSource(sourceHost, root)) {
+    names.push(declared);
+  }
+  return names;
+}
+
+/**
+ * First configured credential for `repo`, naming the variable it came from so
+ * a release log can say which credential authenticated without printing it.
+ */
+export function resolveSourceReleaseToken(
+  repo: SourceRepository,
+  root: string,
+  env: Record<string, string | undefined> = process.env,
+): SourceReleaseCredential | null {
+  for (const envName of sourceReleaseTokenEnvNames(repo, root, env)) {
+    const token = env[envName];
+    if (token) {
+      return { envName, token };
+    }
+  }
+  return null;
+}
+
+function ambientForgeIsSource(sourceHost: string, env: Record<string, string | undefined>): boolean {
+  const serverUrl = env.GITHUB_SERVER_URL;
+  if (!serverUrl) {
+    // No CI forge identity in the environment: ambient GitHub credentials are
+    // conventionally GitHub's own (gh CLI, developer PATs), so they
+    // authenticate a github.com source and nothing else.
+    return sourceHost === 'github.com';
+  }
+  try {
+    return new URL(serverUrl).host === sourceHost;
+  } catch {
+    return false;
+  }
+}
+
+function declaredRegistryHostsSource(sourceHost: string, root: string): boolean {
+  const resolved = resolvePrivateNpmRegistry(root);
+  return resolved.ok && new URL(resolved.value.registry).host === sourceHost;
 }
 
 export function forgejoReleaseLookupExists(status: number, body: string, tag: string): boolean {

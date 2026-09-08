@@ -116,9 +116,19 @@ export function resolvePrivateNpmRegistry(root: string): RegistryResult {
     );
   }
   const pathname = url.pathname.endsWith('/') ? url.pathname : `${url.pathname}/`;
-  const inferred = resolvePrivateNpmWorkflowConfig(root);
-  const publishTokenEnv = config.publishTokenEnv ?? inferred?.publishTokenEnv;
-  const readTokenEnv = config.readTokenEnv ?? inferred?.readTokenEnv ?? publishTokenEnv;
+  // Token env names come from the explicit declaration first, then the
+  // committed .npmrc `${VAR}` auth line. A publish credential is never
+  // *inferred* for a workspace that does not publish the scope: a consumer
+  // must refuse publication rather than reach for its read credential.
+  // Reading with a declared publisher credential is the producer's normal
+  // case, so the read name may fall back to it. Only the publish inference
+  // consults the workspace graph, so ordinary status resolution costs no
+  // manifest scan.
+  const npmrcTokenEnv = NPMRC_TOKEN_ENV.exec(npmrcValue(root, `//${url.host}${pathname}:_authToken`) ?? '')?.[1];
+  const publishTokenEnv =
+    config.publishTokenEnv ??
+    (npmrcTokenEnv && workspacePublishesPrivateScope(root, config.scope) ? npmrcTokenEnv : undefined);
+  const readTokenEnv = config.readTokenEnv ?? npmrcTokenEnv ?? publishTokenEnv;
   if (!readTokenEnv) {
     return configError(
       'MissingConfiguration',
@@ -155,11 +165,7 @@ function npmrcAuthTokenEnv(root: string, scope: string): string | undefined {
     return undefined;
   }
   const pathname = url.pathname.endsWith('/') ? url.pathname : `${url.pathname}/`;
-  const value = npmrcValue(root, `//${url.host}${pathname}:_authToken`);
-  if (!value) {
-    return undefined;
-  }
-  return NPMRC_TOKEN_ENV.exec(value)?.[1];
+  return NPMRC_TOKEN_ENV.exec(npmrcValue(root, `//${url.host}${pathname}:_authToken`) ?? '')?.[1];
 }
 
 function npmrcValue(root: string, key: string): string | null {
@@ -357,8 +363,10 @@ export function privateNpmUserconfigContent(
   resolved: PrivateNpmRegistry,
   options: { mode: 'read' | 'publish' },
 ): string {
-  const tokenEnv =
-    options.mode === 'publish' ? (resolved.publishTokenEnv ?? resolved.readTokenEnv) : resolved.readTokenEnv;
+  // One owner of mode -> credential: a publish userconfig authenticated with
+  // the read credential would either 401 mid-publication or spend a read-only
+  // credential on a write, so the mode resolver refuses instead of falling back.
+  const tokenEnv = privateNpmTokenEnvForMode(resolved, options.mode);
   return `${resolved.scope}:registry=${resolved.registry}\n${resolved.authKey}=\${${tokenEnv}}\n`;
 }
 
@@ -486,14 +494,34 @@ export async function publishPrivateWithDiagnostics(
     await shell.publish();
   } catch (error) {
     const packageVersion = `${pkg.name}@${pkg.version}`;
-    if (await shell.versionExists()) {
+    // The status probe is failure-aware, so it throws on 401/403/5xx. Letting
+    // that throw escape from here would replace the publish diagnostic with a
+    // status diagnostic and skip the operator summary entirely: the run would
+    // report "cannot read the registry" for what is actually a failed publish.
+    // Classify instead -- visible / absent / unknown -- and only a visible
+    // version continues.
+    let visible: boolean;
+    let statusFailure: unknown;
+    try {
+      visible = await shell.versionExists();
+    } catch (probeError) {
+      visible = false;
+      statusFailure = probeError;
+    }
+    if (visible) {
       shell.log(`${packageVersion}: publish result already visible on the private registry; continuing.`);
       return;
     }
+    const statusDetail =
+      statusFailure === undefined
+        ? ''
+        : ` The follow-up status query also failed, so publication state is unknown: ${
+            statusFailure instanceof Error ? statusFailure.message : String(statusFailure)
+          }`;
     const message =
       `${packageVersion}: private npm publish failed. ` +
       `Verify ${registry.readTokenEnv} (status) and ${registry.publishTokenEnv ?? registry.readTokenEnv} (publish) ` +
-      `are set and the Forgejo namespace/package ACLs grant access to ${registry.registry}.`;
+      `are set and the Forgejo namespace/package ACLs grant access to ${registry.registry}.${statusDetail}`;
     shell.error(message);
     await shell.appendSummary(`## Private npm publish failed\n\nPackage: \`${packageVersion}\`\n\n${message}\n`);
     throw new Error(`${packageVersion}: private npm publish failed; refusing instead of treating it as unpublished.`, {
