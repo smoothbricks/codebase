@@ -450,7 +450,8 @@ fn a_debug_build_is_never_installed_as_the_supervised_binary() {
 /// makes that possible: it keeps the old inode alive through the atomic rename that replaces the
 /// path, so the restore reads the exact bytes launchd was running rather than a re-copy.
 #[test]
-fn a_failed_activation_restores_the_binary_it_replaced() {
+#[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
+fn host_controller_a_failed_activation_restores_the_binary_it_replaced() {
     let home = scratch_home("rollback");
     let executable =
         HostStableExecutable::new(&home, COWSHED_BINARY_NAME).expect("host-stable path");
@@ -489,17 +490,21 @@ fn a_failed_activation_restores_the_binary_it_replaced() {
         original
     );
 
-    let sentence = restore_previous_executable(&executable, &retained);
-    assert!(
-        sentence.contains("as it was found"),
-        "the rollback has to say the host is unchanged; got {sentence}"
-    );
+    restore_previous_executable(&executable, &retained);
     assert_eq!(
         fs::read(executable.path()).expect("restored bytes"),
         b"the supervised release build\n"
     );
-    assert!(
-        fs::symlink_metadata(&retained).is_err(),
+    assert_eq!(
+        fs::symlink_metadata(executable.path())
+            .expect("restored")
+            .ino(),
+        original,
+        "rollback restores the original inode, not a copy"
+    );
+    assert_eq!(
+        fs::symlink_metadata(&retained).unwrap_err().kind(),
+        io::ErrorKind::NotFound,
         "the retained link is consumed by the restore"
     );
 
@@ -509,4 +514,21 @@ fn a_failed_activation_restores_the_binary_it_replaced() {
     assert!(sentence.contains("could NOT be restored"), "got {sentence}");
 
     let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
+fn retention_inspection_failure_is_not_an_empty_host() {
+    let home = scratch_home("retention-inspection-error");
+    let executable =
+        HostStableExecutable::new(&home, COWSHED_BINARY_NAME).expect("host-stable path");
+    let library = home.join("Library");
+    fs::write(&library, b"not a directory").expect("blocked ancestor");
+
+    assert_eq!(
+        fs::symlink_metadata(executable.path()).unwrap_err().kind(),
+        io::ErrorKind::NotADirectory
+    );
+    retain_previous_executable(&executable).expect_err("inspection failure must abort retention");
+    assert_eq!(fs::read(&library).unwrap(), b"not a directory");
+    fs::remove_dir_all(&home).unwrap();
 }
