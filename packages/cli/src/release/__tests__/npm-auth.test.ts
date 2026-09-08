@@ -2,9 +2,12 @@ import { describe, expect, it } from 'bun:test';
 import type { ReleasePackageInfo } from '../core.js';
 import {
   type NpmPublishDiagnosticShell,
+  npmProvenanceRunnerRefusalMarkdown,
+  npmProvenanceRunnerRefusalMessage,
   npmPublishAuthFailureMarkdown,
   npmPublishAuthFailureMessage,
   publishWithAuthDiagnostics,
+  selfHostedGithubProvenanceRefusal,
 } from '../npm-auth.js';
 import { privateNpmPublishArgs, publishPrivateWithDiagnostics } from '../private-npm.js';
 
@@ -82,6 +85,111 @@ describe('npm publish auth diagnostics', () => {
     expect(shell.errors).toEqual([]);
     expect(shell.summaries).toEqual([]);
     expect(shell.logs).toEqual(['@scope/pkg@1.2.3: publish result already visible on npm; continuing.']);
+  });
+
+  it('names runner policy and does not publish when GitHub Actions provenance is self-hosted', async () => {
+    const shell = new RecordingPublishShell({ publishFails: false });
+    const npmArgs = ['publish', 'pkg.tgz', '--access', 'public', '--tag', 'latest', '--provenance'];
+    const env = { GITHUB_ACTIONS: 'true', RUNNER_ENVIRONMENT: 'self-hosted' };
+
+    expect(selfHostedGithubProvenanceRefusal(npmArgs, env)).toBe(true);
+    expect(npmProvenanceRunnerRefusalMessage(pkg)).toContain('RUNNER_ENVIRONMENT=self-hosted');
+    expect(npmProvenanceRunnerRefusalMessage(pkg)).toContain('github-hosted');
+    expect(npmProvenanceRunnerRefusalMessage(pkg)).toContain('Do not run smoo release trust-publisher');
+    expect(npmProvenanceRunnerRefusalMessage(pkg)).not.toContain('Run locally: smoo release trust-publisher');
+    expect(npmProvenanceRunnerRefusalMessage(pkg)).not.toContain('smoo expected npm trusted publishing');
+    expect(npmProvenanceRunnerRefusalMarkdown(pkg)).toContain('## npm provenance requires a GitHub-hosted runner');
+    expect(npmProvenanceRunnerRefusalMarkdown(pkg)).toContain('Do not run `smoo release trust-publisher`');
+    expect(npmProvenanceRunnerRefusalMarkdown(pkg)).not.toContain('Run locally: `smoo release trust-publisher`');
+
+    await expect(
+      publishWithAuthDiagnostics(pkg, shell, {
+        tokenPresent: true,
+        repository: 'smoothbricks/codebase',
+        npmArgs,
+        env,
+      }),
+    ).rejects.toThrow('npm provenance is refused on self-hosted GitHub Actions runners');
+
+    expect(shell.publishCalls).toBe(0);
+    expect(shell.errors).toHaveLength(1);
+    expect(shell.errors[0]).toContain('RUNNER_ENVIRONMENT=self-hosted');
+    expect(shell.errors[0]).toContain('github-hosted');
+    expect(shell.errors[0]).toContain('Do not run smoo release trust-publisher');
+    expect(shell.errors[0]).not.toContain('Run locally: smoo release trust-publisher');
+    expect(shell.errors[0]).not.toContain('smoo expected npm trusted publishing');
+    expect(shell.summaries).toHaveLength(1);
+    expect(shell.summaries[0]).toContain('runner policy');
+    expect(shell.summaries[0]).toContain('Do not run `smoo release trust-publisher`');
+    expect(shell.summaries[0]).not.toContain('Run locally: `smoo release trust-publisher`');
+    expect(shell.logs).toEqual([]);
+  });
+
+  it('publishes public provenance on a github-hosted GitHub Actions runner', async () => {
+    const shell = new RecordingPublishShell({ publishFails: false });
+    const npmArgs = ['publish', 'pkg.tgz', '--access', 'public', '--tag', 'latest', '--provenance'];
+
+    await publishWithAuthDiagnostics(pkg, shell, {
+      tokenPresent: false,
+      npmArgs,
+      env: { GITHUB_ACTIONS: 'true', RUNNER_ENVIRONMENT: 'github-hosted' },
+    });
+
+    expect(
+      selfHostedGithubProvenanceRefusal(npmArgs, { GITHUB_ACTIONS: 'true', RUNNER_ENVIRONMENT: 'github-hosted' }),
+    ).toBe(false);
+    expect(shell.publishCalls).toBe(1);
+    expect(shell.errors).toEqual([]);
+    expect(shell.summaries).toEqual([]);
+  });
+
+  it('leaves local public provenance alone when GitHub Actions is unset', async () => {
+    const shell = new RecordingPublishShell({ publishFails: false });
+    const npmArgs = ['publish', 'pkg.tgz', '--access', 'public', '--tag', 'latest', '--provenance'];
+
+    await publishWithAuthDiagnostics(pkg, shell, {
+      tokenPresent: true,
+      npmArgs,
+      env: { RUNNER_ENVIRONMENT: 'self-hosted' },
+    });
+
+    expect(selfHostedGithubProvenanceRefusal(npmArgs, { RUNNER_ENVIRONMENT: 'self-hosted' })).toBe(false);
+    expect(shell.publishCalls).toBe(1);
+    expect(shell.errors).toEqual([]);
+  });
+
+  it('does not treat a self-hosted GitHub Actions publish without provenance as runner policy', async () => {
+    const shell = new RecordingPublishShell({ publishFails: false });
+    const npmArgs = ['publish', 'pkg.tgz', '--access', 'restricted', '--tag', 'latest'];
+
+    await publishWithAuthDiagnostics(pkg, shell, {
+      tokenPresent: false,
+      npmArgs,
+      env: { GITHUB_ACTIONS: 'true', RUNNER_ENVIRONMENT: 'self-hosted' },
+    });
+
+    expect(
+      selfHostedGithubProvenanceRefusal(npmArgs, { GITHUB_ACTIONS: 'true', RUNNER_ENVIRONMENT: 'self-hosted' }),
+    ).toBe(false);
+    expect(shell.publishCalls).toBe(1);
+    expect(shell.errors).toEqual([]);
+  });
+
+  it('still reports trusted-publishing guidance when github-hosted provenance auth fails', async () => {
+    const shell = new RecordingPublishShell({ publishFails: true });
+
+    await expect(
+      publishWithAuthDiagnostics(pkg, shell, {
+        tokenPresent: true,
+        repository: 'smoothbricks/codebase',
+        npmArgs: ['publish', 'pkg.tgz', '--access', 'public', '--tag', 'latest', '--provenance'],
+        env: { GITHUB_ACTIONS: 'true', RUNNER_ENVIRONMENT: 'github-hosted' },
+      }),
+    ).rejects.toThrow('@scope/pkg@1.2.3: npm publish authentication failed');
+
+    expect(shell.publishCalls).toBe(1);
+    expect(shell.errors[0]).toContain('smoo release trust-publisher');
+    expect(shell.errors[0]).not.toContain('RUNNER_ENVIRONMENT=self-hosted');
   });
 });
 
@@ -167,6 +275,7 @@ class RecordingPublishShell implements NpmPublishDiagnosticShell {
   readonly errors: string[] = [];
   readonly summaries: string[] = [];
   readonly publishFailure = new Error('ENEEDAUTH');
+  publishCalls = 0;
   private readonly publishFails: boolean;
   private readonly versionVisibleAfterFailure: boolean;
   private readonly statusFails: string | undefined;
@@ -178,6 +287,7 @@ class RecordingPublishShell implements NpmPublishDiagnosticShell {
   }
 
   async publish(): Promise<void> {
+    this.publishCalls += 1;
     if (this.publishFails) {
       throw this.publishFailure;
     }

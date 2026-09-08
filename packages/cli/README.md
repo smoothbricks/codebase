@@ -502,6 +502,10 @@ Publishing:
   stable versions). Bun pack resolves internal `workspace:*` dependency ranges to real versions in the tarball manifest;
   smoo fails before publish if a packed manifest still contains `workspace:` or if an internal dependency does not match
   the current workspace package version.
+- npmjs accepts `--provenance` only from GitHub-hosted runners (`RUNNER_ENVIRONMENT=github-hosted`). On GitHub Actions,
+  smoo refuses a public provenance publish when `RUNNER_ENVIRONMENT=self-hosted` before calling npm, so the failure
+  names runner policy instead of trusted-publishing credentials. Private Forgejo publication does not use provenance.
+  Local public publishes (no `GITHUB_ACTIONS`) are unchanged.
 - [npm CLI][npm] owns publish authentication. Packages use [trusted publishing][npm-trusted-publishing] with [GitHub
   Actions OIDC][github-actions-oidc] from the workflow's `id-token: write` permission. Package names must exist on npm
   before CI publish runs; use `smoo release trust-publisher --bootstrap` locally to publish `0.0.0-bootstrap.0` under
