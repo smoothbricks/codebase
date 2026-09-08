@@ -3537,6 +3537,19 @@ impl NativeProjectRuntimeHost {
             term_grace: std::time::Duration::from_secs(2),
             actor_capacity: ROUTER_CAPACITY,
             event_capacity: ROUTER_CAPACITY,
+            // Host state, read at supervisor start: which environment variable names this
+            // project's approved gateway credentials came from, so no child receives an ambient
+            // copy of a token the gateway already holds.
+            credential_env_names: crate::storage::host_config::HostConfig::load_for_store(
+                &self.descriptor.store_root,
+            )
+            .map_err(|error| {
+                CowshedError::integrity(
+                    format!("host configuration is unreadable: {error}"),
+                    "cowshed doctor --json",
+                )
+            })?
+            .credential_env_names(self.descriptor.repo_id.as_str()),
         };
         let handle =
             super::supervisor::WorkspaceSupervisor::start(config, self.commitments.clone())?;

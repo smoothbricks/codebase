@@ -10,6 +10,9 @@ pub const WORKSPACE_ENVIRONMENT_PATH: &str = ".cowshed/env";
 pub const WORKSPACE_TOKEN_ENV: &str = "COWSHED_WORKSPACE_TOKEN";
 pub const PORT_BASE_ENV: &str = "COWSHED_PORT_BASE";
 pub const GO_ENV: &str = "GOENV";
+/// Node's and Bun's additive TLS trust anchor. The workspace CA is wired here and nowhere else:
+/// `SSL_CERT_FILE` belongs to nix and devenv, which supply the toolchain's own bundle.
+pub const NODE_CA_ENV: &str = "NODE_EXTRA_CA_CERTS";
 const GO_ENV_RELATIVE_PATH: &str = ".cowshed/cache/go/env";
 
 #[derive(Debug, Error)]

@@ -23,11 +23,58 @@ pub(crate) const RETIRED_MOUNT_DIRECTORY: &str = "mnt";
 /// literal there could not follow a change made here.
 pub(crate) const DEFAULT_MOUNT_RELATIVE: &str = ".cowshed/mnt";
 
+/// One approved gateway-backed registry route, as host state rather than workspace state.
+///
+/// The secret itself lives in the platform credential store; this is the non-secret half the
+/// store cannot answer: which routes exist at all (a keychain item is found by its exact
+/// account, never enumerated), and the NAME of the host environment variable the operator
+/// enrolled from. That name is what lets a spawn withhold an ambient copy of the same token
+/// from a sandbox — a gateway-held credential is pointless if the workspace also gets the bytes.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CredentialRoute {
+    pub repo_id: String,
+    pub origin: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub secret_env_names: Vec<String>,
+}
+
+impl CredentialRoute {
+    fn validate(&self) -> Result<(), HostConfigError> {
+        if self.repo_id.is_empty() || self.origin.is_empty() {
+            return Err(HostConfigError::InvalidCredentialRoute {
+                reason: "a credential route needs both a repository id and an origin",
+            });
+        }
+        for name in &self.secret_env_names {
+            if !is_environment_name(name) {
+                return Err(HostConfigError::InvalidCredentialRoute {
+                    reason: "a registered secret source must be an environment variable name",
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A POSIX-shaped environment variable name. Anything else could not name a variable to withhold.
+fn is_environment_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with(|first: char| first.is_ascii_digit())
+        && name
+            .chars()
+            .all(|character| character == '_' || character.is_ascii_alphanumeric())
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct HostConfig {
     version: u32,
     mount_root: PathBuf,
+    /// Approved gateway-backed registry routes. Absent in a configuration that has none, so a
+    /// host that never enrolled one keeps writing exactly the bytes it wrote before.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    credential_routes: Vec<CredentialRoute>,
 }
 
 impl HostConfig {
@@ -37,11 +84,67 @@ impl HostConfig {
         Ok(Self {
             version: HOST_CONFIG_VERSION,
             mount_root,
+            credential_routes: Vec::new(),
         })
     }
 
     pub fn mount_root(&self) -> &Path {
         &self.mount_root
+    }
+
+    pub fn credential_routes(&self) -> &[CredentialRoute] {
+        &self.credential_routes
+    }
+
+    /// Environment variable names this project's approved routes were enrolled from.
+    ///
+    /// A spawn withholds exactly these from the child: the gateway holds the credential, so an
+    /// ambient copy in the operator's shell has no reason to travel into a sandbox.
+    pub fn credential_env_names(&self, repo_id: &str) -> BTreeSet<String> {
+        self.credential_routes
+            .iter()
+            .filter(|route| route.repo_id == repo_id)
+            .flat_map(|route| route.secret_env_names.iter().cloned())
+            .collect()
+    }
+
+    /// Record one route, replacing any earlier record of the same repository and origin.
+    ///
+    /// Enrolling again is rotation, which is the common case; refusing it would only leave an
+    /// operator to delete and re-add, with no credential in between.
+    pub fn upsert_credential_route(
+        &mut self,
+        route: CredentialRoute,
+    ) -> Result<(), HostConfigError> {
+        route.validate()?;
+        self.credential_routes
+            .retain(|held| held.repo_id != route.repo_id || held.origin != route.origin);
+        self.credential_routes.push(route);
+        self.credential_routes.sort();
+        Ok(())
+    }
+
+    /// Forget one route. `false` means it was not recorded, which is already the asked state.
+    pub fn remove_credential_route(&mut self, repo_id: &str, origin: &str) -> bool {
+        let before = self.credential_routes.len();
+        self.credential_routes
+            .retain(|held| held.repo_id != repo_id || held.origin != origin);
+        before != self.credential_routes.len()
+    }
+
+    /// Publish the configuration atomically at mode 0600, the way the mount root is published.
+    pub fn save(&self, store_root: &Path) -> Result<(), HostConfigError> {
+        validate_absolute_path(store_root)?;
+        for route in &self.credential_routes {
+            route.validate()?;
+        }
+        let mut bytes =
+            serde_json::to_vec_pretty(self).map_err(|source| HostConfigError::InvalidConfig {
+                path: store_root.join(HOST_CONFIG_FILE),
+                message: source.to_string(),
+            })?;
+        bytes.push(b'\n');
+        write_private_atomic(&store_root.join(HOST_CONFIG_FILE), &bytes)
     }
 
     /// Load the store-owned host configuration, using the documented per-user default when the
@@ -91,6 +194,9 @@ impl HostConfig {
             });
         }
         validate_absolute_path(&config.mount_root)?;
+        for route in &config.credential_routes {
+            route.validate()?;
+        }
         Ok(config)
     }
 }
@@ -386,6 +492,8 @@ pub enum HostConfigError {
     InvalidMode { path: PathBuf, mode: u32 },
     #[error("invalid host configuration {path}: {message}")]
     InvalidConfig { path: PathBuf, message: String },
+    #[error("invalid gateway credential route: {reason}")]
+    InvalidCredentialRoute { reason: &'static str },
     #[error("workspace mount root cannot change while attached: {workspaces:?}")]
     WorkspacesAttached { workspaces: Vec<AttachedWorkspace> },
     #[error("could not scan retired workspace layout at {path}: {message}")]
@@ -435,6 +543,94 @@ mod tests {
         paths.project_root
     }
 
+    fn route(repo_id: &str, origin: &str, names: &[&str]) -> CredentialRoute {
+        CredentialRoute {
+            repo_id: repo_id.to_owned(),
+            origin: origin.to_owned(),
+            secret_env_names: names.iter().map(|name| (*name).to_owned()).collect(),
+        }
+    }
+
+    #[test]
+    fn credential_routes_persist_and_answer_per_project() {
+        let store = temp_directory("routes");
+        let mut config = HostConfig::new("/Users/tester/.cowshed/mnt").expect("config");
+        config
+            .upsert_credential_route(route(
+                "owner/repo",
+                "https://registry.test:443",
+                &["REGISTRY_READ_TOKEN"],
+            ))
+            .expect("route");
+        config
+            .upsert_credential_route(route("other/repo", "https://registry.test:443", &["OTHER"]))
+            .expect("route");
+        // Enrolling the same origin again is rotation, not a second route.
+        config
+            .upsert_credential_route(route(
+                "owner/repo",
+                "https://registry.test:443",
+                &["ROTATED_TOKEN"],
+            ))
+            .expect("route");
+        config.save(&store).expect("save");
+
+        let loaded = HostConfig::load(&store, Path::new("/Users/tester")).expect("load");
+        assert_eq!(loaded.credential_routes().len(), 2);
+        assert_eq!(
+            loaded.credential_env_names("owner/repo"),
+            BTreeSet::from(["ROTATED_TOKEN".to_owned()])
+        );
+        assert!(loaded.credential_env_names("absent/repo").is_empty());
+        assert_eq!(loaded.mount_root(), Path::new("/Users/tester/.cowshed/mnt"));
+
+        let mut without = loaded.clone();
+        assert!(without.remove_credential_route("owner/repo", "https://registry.test:443"));
+        assert!(!without.remove_credential_route("owner/repo", "https://registry.test:443"));
+        without.save(&store).expect("save");
+        assert!(
+            HostConfig::load(&store, Path::new("/Users/tester"))
+                .expect("load")
+                .credential_env_names("owner/repo")
+                .is_empty()
+        );
+        fs::remove_dir_all(&store).expect("cleanup");
+    }
+
+    #[test]
+    fn a_host_with_no_routes_writes_no_route_key_at_all() {
+        let store = temp_directory("no-routes");
+        HostConfig::new("/Users/tester/.cowshed/mnt")
+            .expect("config")
+            .save(&store)
+            .expect("save");
+        let written = fs::read_to_string(store.join(HOST_CONFIG_FILE)).expect("written");
+        assert!(!written.contains("credentialRoutes"), "{written}");
+        fs::remove_dir_all(&store).expect("cleanup");
+    }
+
+    #[test]
+    fn a_route_that_could_not_name_a_variable_to_withhold_is_refused() {
+        let mut config = HostConfig::new("/Users/tester/.cowshed/mnt").expect("config");
+        for names in [vec!["lower case"], vec!["1TOKEN"], vec![""]] {
+            assert!(
+                config
+                    .upsert_credential_route(route(
+                        "owner/repo",
+                        "https://registry.test:443",
+                        &names
+                    ))
+                    .is_err(),
+                "{names:?} must be refused"
+            );
+        }
+        assert!(
+            config
+                .upsert_credential_route(route("", "https://registry.test:443", &[]))
+                .is_err()
+        );
+        assert!(config.credential_routes().is_empty());
+    }
     #[test]
     fn absent_config_uses_default_mount_root() {
         let root = temp_directory("default");
