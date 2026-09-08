@@ -21,7 +21,7 @@ import {
 import { syncBunLockfileVersions } from '../monorepo/lockfile.js';
 import { readPackedPackageJson, validatePackedWorkspaceDependencies } from '../monorepo/packed-manifest.js';
 import { withPublishManifest } from '../monorepo/publish-manifest.js';
-import { readProjectTargets } from '../nx/index.js';
+import { loadNxProjects } from '../nx/index.js';
 
 const parseReleasePackManifestText = typia.json.createIsParse<ReleasePackManifest>();
 /** Runtime dependency fields expanded when computing the artifact closure. */
@@ -111,17 +111,36 @@ export async function packReleaseTarball(
 /**
  * Per-package release gate: when the project declares an Nx `release-check`
  * target, run it after prebuilt outputs merge and before the tarball exists.
- * The target itself owns what it asserts and must declare dependsOn[] so the
- * gate verifies artifacts without rebuilding them. Undeclared packages pack
- * exactly as before.
+ * The target itself owns what it asserts; this owner enforces the two
+ * properties that make the assertion mean anything, reading the *resolved*
+ * graph configuration so `targetDefaults` cannot smuggle either one back in:
+ *
+ * - Empty `dependsOn`: the gate runs in the publishing job, where the only
+ *   complete artifact tree is the union of this job's build and the foreign
+ *   platform outputs applied over it. A dependency would rebuild and replace
+ *   that tree, so the gate would verify (or wipe) something other than what
+ *   gets packed.
+ * - `cache: false`: a cached gate is replayed, not run. Its inputs cannot
+ *   describe artifacts merged in from another job, so a cache hit would
+ *   silently skip verification of the very bytes being published.
+ *
+ * Undeclared packages pack exactly as before.
  */
 async function runReleaseCheckGate(root: string, pkg: PackageInfo): Promise<void> {
-  const projects = await readProjectTargets(root);
-  const declaresGate = projects.some(
-    (project) => project.project === pkg.projectName && project.targets.includes('release-check'),
-  );
-  if (!declaresGate) {
+  const gate = (await loadNxProjects(root))[pkg.projectName]?.targets?.['release-check'];
+  if (!gate) {
     return;
+  }
+  const dependsOn = gate.dependsOn ?? [];
+  if (dependsOn.length > 0) {
+    throw new Error(
+      `${pkg.projectName}: the release-check target must declare an empty dependsOn so the gate cannot rebuild merged prebuilt outputs; it resolves to ${JSON.stringify(dependsOn)}.`,
+    );
+  }
+  if (gate.cache !== false) {
+    throw new Error(
+      `${pkg.projectName}: the release-check target must declare cache: false so the gate cannot be replayed from cache instead of verifying the packed artifacts.`,
+    );
   }
   console.log(`${pkg.name}@${pkg.version}: running Nx release-check gate`);
   try {
@@ -370,26 +389,48 @@ function runtimeDependencyNames(pkg: PackageInfo): string[] {
   return [...names];
 }
 
-/** Re-hash every tarball against the manifest; throws on any mismatch. */
+/**
+ * Verify an artifact directory against its manifest, in the order a consumer
+ * needs: shape, then the name/tarball binding, then bytes. Path shape is
+ * checked before any read so a hostile entry cannot name a file outside the
+ * directory, duplicate names are refused because the manifest is the
+ * name/version map a consumer pins against, and an unbound file is refused
+ * because `release pack` writes into an empty directory -- anything else in
+ * there is a mixed or tampered release.
+ */
 export async function verifyReleasePackManifest(outputDir: string): Promise<ReleasePackManifest> {
   const manifestPath = join(outputDir, 'manifest.json');
   const manifest = parseReleasePackManifestText(await readFile(manifestPath, 'utf8'));
   if (!manifest) {
     throw new Error(`${manifestPath}: invalid release pack manifest (expected schemaVersion 1 with typed entries).`);
   }
+  const boundNames = new Set<string>();
+  const boundTarballs = new Set<string>();
   for (const entry of manifest.packages) {
-    const tarballPath = join(outputDir, entry.tarball);
-    if (entry.tarball.includes('..') || isAbsolute(entry.tarball)) {
-      throw new Error(`${entry.name}: tarball path must be relative to the output directory.`);
+    if (entry.tarball !== basename(entry.tarball) || isAbsolute(entry.tarball) || entry.tarball.includes('..')) {
+      throw new Error(`${entry.name}: tarball path must be a bare file name relative to the output directory.`);
     }
+    if (boundNames.has(entry.name)) {
+      throw new Error(`${entry.name}: appears twice in the manifest; one entry must bind one package name.`);
+    }
+    if (boundTarballs.has(entry.tarball)) {
+      throw new Error(`${entry.name}: tarball ${entry.tarball} is claimed by more than one manifest entry.`);
+    }
+    boundNames.add(entry.name);
+    boundTarballs.add(entry.tarball);
+  }
+  const unbound = (await readdir(outputDir)).filter((file) => file !== 'manifest.json' && !boundTarballs.has(file));
+  if (unbound.length > 0) {
+    throw new Error(
+      `${outputDir}: holds ${unbound.sort().join(', ')}, which the manifest does not bind; a release artifact directory holds exactly its manifest and the tarballs it names.`,
+    );
+  }
+  for (const entry of manifest.packages) {
     const digest = createHash('sha256')
-      .update(await readFile(tarballPath))
+      .update(await readFile(join(outputDir, entry.tarball)))
       .digest('hex');
     if (digest !== entry.sha256) {
       throw new Error(`${entry.name}: SHA-256 mismatch for ${entry.tarball} (manifest corrupt or tarball replaced).`);
-    }
-    if (basename(entry.tarball) !== entry.tarball) {
-      throw new Error(`${entry.name}: tarball path must be a bare file name relative to the output directory.`);
     }
   }
   return manifest;
