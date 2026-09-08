@@ -41,14 +41,6 @@ export const CARGO_CROSS_LINT_TARGET = 'cargo-lint-cross';
 const CARGO_CROSS_LINT_GUARD = `[ -n "\${CC_x86_64_unknown_linux_gnu:-}" ] || [ "$(uname -s)" = Linux ] || { echo 'cargo-lint-cross needs the linux-cross C toolchain; run: bun run check:linux' >&2; exit 2; }`;
 
 /**
- * Point this cargo at a project-local home so parallel Nx cargos do not
- * exclusive-lock `~/.cargo/.package-cache`. Downloaded crates stay shared.
- */
-export function withProjectCargoHome(homeRel: string, command: string): string {
-  return `host_cargo_home="\${CARGO_HOME:-$HOME/.cargo}"; mkdir -p ${homeRel}; if [ -d "$host_cargo_home/registry" ]; then ln -sfn "$host_cargo_home/registry" ${homeRel}/registry; fi; if [ -d "$host_cargo_home/git" ]; then ln -sfn "$host_cargo_home/git" ${homeRel}/git; fi; CARGO_HOME="$PWD/${homeRel}" ${command}`;
-}
-
-/**
  * The prefix `cargoFrozen` writes. Exported so target inference can recognize
  * the commands whose precondition `CARGO_FETCH_TARGET` supplies without
  * re-spelling the flag; a second copy would silently stop matching.
@@ -119,22 +111,18 @@ export const CARGO_FETCH_COMMAND = 'cargo fetch --locked';
  * `cargo fmt` is absent on purpose: formatting is target-independent and already
  * covered by `cargo-lint`, so repeating it here would only cost time.
  *
- * `CARGO_HOME` is per-project (`$PWD/target/cargo-lint-cross-home`). Cargo's
- * package-cache flock lives in CARGO_HOME; three workspaces otherwise serialize
- * on `~/.cargo/.package-cache` even with distinct `--target-dir`. Registry and
- * git are linked to the host home so crates are not re-fetched. `--frozen`
- * keeps that shared registry read-only: lockfile and cache are inputs.
+ * Keep the caller's CARGO_HOME: it owns registry sources, credentials and global
+ * Cargo configuration, including paths relative to that configuration. Relocating
+ * or replaying it through --config changes path resolution or precedence.
+ * Cargo may serialize registry access on its package-cache lock; these checks
+ * are unbounded, and correctness takes priority over overlapping that access.
  */
-export const CARGO_CROSS_LINT_COMMAND = `${CARGO_CROSS_LINT_GUARD}; ${withProjectCargoHome(
-  'target/cargo-lint-cross-home',
-  cargoFrozen(
-    `clippy --workspace --all-targets --target ${CARGO_LINUX_TRIPLE} --target-dir target/cargo-lint-cross -- -D warnings`,
-  ),
+export const CARGO_CROSS_LINT_COMMAND = `${CARGO_CROSS_LINT_GUARD}; ${cargoFrozen(
+  `clippy --workspace --all-targets --target ${CARGO_LINUX_TRIPLE} --target-dir target/cargo-lint-cross -- -D warnings`,
 )}`;
 
-export const CARGO_LINT_CLIPPY_COMMAND = withProjectCargoHome(
-  'target/cargo-lint-home',
-  cargoFrozen('clippy --workspace --all-targets --target-dir target/cargo-lint -- -D warnings'),
+export const CARGO_LINT_CLIPPY_COMMAND = cargoFrozen(
+  'clippy --workspace --all-targets --target-dir target/cargo-lint -- -D warnings',
 );
 
 /** Root `package.json` script name, in the repo's `verb:qualifier` style. */

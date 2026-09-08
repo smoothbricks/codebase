@@ -1,4 +1,7 @@
 import { describe, expect, it } from 'bun:test';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 import {
   CARGO_CROSS_LINT_COMMAND,
@@ -9,7 +12,6 @@ import {
   CROSS_CHECK_SCRIPT_NAME,
   cargoFrozen,
   DEVENV_CROSS_PROFILE,
-  withProjectCargoHome,
 } from './cross-check-policy.js';
 import { BUILD_OUTPUT_DEPENDENCIES, PLATFORM_TARGET_GLOBS } from './workspace-config-policy.js';
 
@@ -74,12 +76,40 @@ describe('Linux cross-check policy', () => {
     expect(CARGO_CROSS_LINT_COMMAND).toContain('--target ');
   });
 
-  it('gives each project its own CARGO_HOME so parallel clippy does not flock ~/.cargo', () => {
-    expect(CARGO_CROSS_LINT_COMMAND).toContain('CARGO_HOME="$PWD/target/cargo-lint-cross-home"');
-    expect(CARGO_CROSS_LINT_COMMAND).toContain('ln -sfn "$host_cargo_home/registry"');
-    expect(CARGO_LINT_CLIPPY_COMMAND).toContain('CARGO_HOME="$PWD/target/cargo-lint-home"');
-    expect(withProjectCargoHome('target/h', 'cargo clippy')).toContain('CARGO_HOME="$PWD/target/h" cargo clippy');
-  });
+  it('preserves Cargo home configuration and its relative paths while linting', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'cargo-lint-config-'));
+    const home = join(root, 'home');
+    const project = join(root, 'project');
+    try {
+      await mkdir(home);
+      await mkdir(join(project, 'src'), { recursive: true });
+      await writeFile(join(home, 'config.toml'), '[env]\nCONFIG_DATA = { value = "data.txt", relative = true }\n');
+      await writeFile(join(root, 'data.txt'), 'configuration-relative data\n');
+      await writeFile(
+        join(project, 'Cargo.toml'),
+        '[package]\nname = "config-fixture"\nversion = "0.1.0"\nedition = "2021"\n[workspace]\n',
+      );
+      await writeFile(
+        join(project, 'Cargo.lock'),
+        'version = 4\n\n[[package]]\nname = "config-fixture"\nversion = "0.1.0"\n',
+      );
+      await writeFile(join(project, 'src/lib.rs'), 'pub const DATA: &str = include_str!(env!("CONFIG_DATA"));\n');
+      const child = Bun.spawn(['sh', '-c', CARGO_LINT_CLIPPY_COMMAND], {
+        cwd: project,
+        env: { ...process.env, CARGO_HOME: home, RUSTC_WRAPPER: '', RUSTC_WORKSPACE_WRAPPER: '' },
+        stdout: 'pipe',
+        stderr: 'pipe',
+      });
+      const [exitCode, stdout, stderr] = await Promise.all([
+        child.exited,
+        new Response(child.stdout).text(),
+        new Response(child.stderr).text(),
+      ]);
+      expect({ exitCode, output: stdout + stderr }).toMatchObject({ exitCode: 0 });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  }, 30_000);
 
   it('pins clippy to the committed lockfile and local cache', () => {
     expect(cargoFrozen('clippy --workspace')).toBe('cargo --frozen clippy --workspace');
