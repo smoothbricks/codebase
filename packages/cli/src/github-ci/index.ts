@@ -487,26 +487,28 @@ export async function githubCiNxDeploy(
   const github = dependencies.github ?? readSmooGithub(root);
   const [stagingPushBranch] = ciPushBranches(github);
   const stage = resolveDeploymentStage(options.stage, processEnv, eventPayload, stagingPushBranch);
-  // Resolved before anything runs: a bad template must fail here, not after the deploy with the status left pending.
-  const preview = isPullRequestStage(stage)
-    ? { stage, urls: previewUrlsForStage(github?.previewUrls, stage) }
-    : undefined;
   const name = options.name ?? 'Deploy Stage';
   const step = options.step ?? '';
   const setStatus =
     dependencies.setStatus ??
     ((state: 'pending' | 'success' | 'failure') =>
       state === 'pending' ? createGithubStatus(name, step) : updateGithubStatus(name, state, step));
-  await setStatus('pending');
   const mode = resolveNxSmartMode(options.mode ?? 'run-many');
   const listProjects = dependencies.listProjects ?? listNxProjectsWithTarget;
   const runNx = dependencies.runNx ?? ((args: string[], commandRoot: string) => runStatus('nx', args, commandRoot));
   const projects = await listProjects(root, 'deploy', mode, stage, options.selectTag);
   if (projects.length === 0) {
     console.log(`No ${mode} deploy projects; skipping ${stage}.`);
+    await setStatus('pending');
     await setStatus('success');
     return;
   }
+  // Resolved only for a non-empty pull-request selection, before any status mutation or deploy: a missing or bad
+  // template must fail here, not after the deploy with the status left pending.
+  const preview = isPullRequestStage(stage)
+    ? { stage, urls: previewUrlsForStage(github?.previewUrls, stage) }
+    : undefined;
+  await setStatus('pending');
 
   const projectList = projects.join(',');
   const targets = options.verify === true ? ['build', 'lint', 'test', 'deploy'] : ['deploy'];
@@ -643,11 +645,15 @@ function deployExclusions(stage: DeploymentStage): string {
   return tags.join(',');
 }
 
-const DEFAULT_PREVIEW_URL_TEMPLATES: NonEmptyArray<string> = ['https://app.{stage}.example.test'];
-
 /** Preview URLs for a pull-request stage from the configured templates; `{stage}` is the only placeholder. */
 export function previewUrlsForStage(templates: string[] | undefined, stage: `pr${number}`): NonEmptyArray<string> {
-  const [first, ...rest] = templates && isNonEmpty(templates) ? templates : DEFAULT_PREVIEW_URL_TEMPLATES;
+  if (!templates || !isNonEmpty(templates)) {
+    throw new Error(
+      'smoo.github.previewUrls is not configured; refusing to invent a preview hostname. ' +
+        'SMOO_PREVIEW_ZONE is no longer read: set previewUrls to one or more URL templates containing {stage}.',
+    );
+  }
+  const [first, ...rest] = templates;
   return [previewUrlFromTemplate(first, stage), ...rest.map((template) => previewUrlFromTemplate(template, stage))];
 }
 
