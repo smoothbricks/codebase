@@ -284,6 +284,17 @@ describe('CloudflareRestClient cursor listings', () => {
     await expect(client.listR2Buckets()).rejects.toThrow(/repeated one pagination cursor/);
   });
 
+  it('refuses a listing that claims truncation without a cursor', async () => {
+    // More objects exist and nothing says where to resume: a partial key list would delete the
+    // bucket's visible objects and then fail on the bucket itself.
+    const { fetcher } = pageFetcher([
+      { success: true, result: { objects: [{ key: 'a/1.json' }] }, result_info: { is_truncated: true } },
+    ]);
+    const client = new CloudflareRestClient('account-1', 'token', fetcher);
+
+    await expect(client.listR2Objects('site-pr7-uploads')).rejects.toThrow(/truncated without a cursor/);
+  });
+
   it('trusts is_truncated on a short object page and stops when it clears', async () => {
     const { fetcher, calls } = pageFetcher([
       {

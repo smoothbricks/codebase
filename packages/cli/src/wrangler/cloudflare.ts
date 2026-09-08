@@ -326,7 +326,12 @@ export class CloudflareRestClient implements CloudflareClient {
       // `is_truncated` is authoritative where the endpoint sends it (objects); where it does not
       // (buckets) only the last page can be short.
       const truncated = info?.is_truncated ?? rows.length === PAGE_SIZE;
-      if (rows.length === 0 || next === undefined || next === '' || !truncated) return items;
+      if (info?.is_truncated === true && !next) {
+        // The listing says more exists and gives nothing to continue with: report the hole rather
+        // than hand back a silently partial listing.
+        throw new Error(`Cloudflare reported ${path} as truncated without a cursor to continue.`);
+      }
+      if (rows.length === 0 || !next || !truncated) return items;
       if (next === cursor) {
         throw new Error(`Cloudflare repeated one pagination cursor for ${path}, so the listing never ends.`);
       }
