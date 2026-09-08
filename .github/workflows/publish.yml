@@ -128,9 +128,17 @@ jobs:
 
       # Step 13
       - name: 📎 Upload trace DBs
-        # Default is success(); failure() uploads traces only when the job already failed.
-        if: failure()
+        if: (failure()) && (github.server_url == 'https://github.com' || endsWith(github.api_url, '/api/v3'))
         uses: actions/upload-artifact@v7.0.1
+        with:
+          name: trace-results-${{ github.run_id }}
+          path: packages/*/.cache/trace-results.db*
+          if-no-files-found: ignore
+          retention-days: 14
+          include-hidden-files: true
+      - name: 📎 Upload trace DBs (Forgejo)
+        if: (failure()) && !(github.server_url == 'https://github.com' || endsWith(github.api_url, '/api/v3'))
+        uses: https://code.forgejo.org/forgejo/upload-artifact@cb8afe72b42edc798abfb8fcb556cf660d894245
         with:
           name: trace-results-${{ github.run_id }}
           path: packages/*/.cache/trace-results.db*
@@ -154,7 +162,16 @@ jobs:
 
       # Step 16
       - name: 📤 Upload validated release state
+        if: (success()) && (github.server_url == 'https://github.com' || endsWith(github.api_url, '/api/v3'))
         uses: actions/upload-artifact@v7.0.1
+        with:
+          name: publish-release-state-${{ github.run_id }}
+          path: ${{ runner.temp }}/publish-release-state
+          if-no-files-found: error
+          retention-days: 1
+      - name: 📤 Upload validated release state (Forgejo)
+        if: (success()) && !(github.server_url == 'https://github.com' || endsWith(github.api_url, '/api/v3'))
+        uses: https://code.forgejo.org/forgejo/upload-artifact@cb8afe72b42edc798abfb8fcb556cf660d894245
         with:
           name: publish-release-state-${{ github.run_id }}
           path: ${{ runner.temp }}/publish-release-state
@@ -163,8 +180,21 @@ jobs:
 
       # Step 17
       - name: 📤 Upload validated build outputs
-        if: steps.version.outputs.mode != 'none'
+        if:
+          (steps.version.outputs.mode != 'none') && (github.server_url == 'https://github.com' ||
+          endsWith(github.api_url, '/api/v3'))
         uses: actions/upload-artifact@v7.0.1
+        with:
+          name: publish-release-outputs-${{ github.run_id }}
+          path: ${{ runner.temp }}/release-build-outputs
+          if-no-files-found: error
+          retention-days: 1
+          include-hidden-files: true
+      - name: 📤 Upload validated build outputs (Forgejo)
+        if:
+          (steps.version.outputs.mode != 'none') && !(github.server_url == 'https://github.com' ||
+          endsWith(github.api_url, '/api/v3'))
+        uses: https://code.forgejo.org/forgejo/upload-artifact@cb8afe72b42edc798abfb8fcb556cf660d894245
         with:
           name: publish-release-outputs-${{ github.run_id }}
           path: ${{ runner.temp }}/release-build-outputs
@@ -174,8 +204,21 @@ jobs:
 
       # Step 18
       - name: 📤 Upload supplemental Linux outputs
-        if: steps.version.outputs.mode != 'none'
+        if:
+          (steps.version.outputs.mode != 'none') && (github.server_url == 'https://github.com' ||
+          endsWith(github.api_url, '/api/v3'))
         uses: actions/upload-artifact@v7.0.1
+        with:
+          name: publish-linux-outputs-${{ github.run_id }}
+          path: ${{ runner.temp }}/linux-platform-outputs
+          if-no-files-found: error
+          retention-days: 1
+          include-hidden-files: true
+      - name: 📤 Upload supplemental Linux outputs (Forgejo)
+        if:
+          (steps.version.outputs.mode != 'none') && !(github.server_url == 'https://github.com' ||
+          endsWith(github.api_url, '/api/v3'))
+        uses: https://code.forgejo.org/forgejo/upload-artifact@cb8afe72b42edc798abfb8fcb556cf660d894245
         with:
           name: publish-linux-outputs-${{ github.run_id }}
           path: ${{ runner.temp }}/linux-platform-outputs
@@ -269,7 +312,17 @@ jobs:
 
       # Step 9
       - name: 📤 Upload macOS platform outputs (${{ matrix.arch }})
+        if: (success()) && (github.server_url == 'https://github.com' || endsWith(github.api_url, '/api/v3'))
         uses: actions/upload-artifact@v7.0.1
+        with:
+          name: publish-macos-${{ matrix.arch }}-outputs-${{ github.run_id }}
+          path: ${{ runner.temp }}/macos-platform-outputs
+          if-no-files-found: error
+          retention-days: 1
+          include-hidden-files: true
+      - name: 📤 Upload macOS platform outputs (${{ matrix.arch }}) (Forgejo)
+        if: (success()) && !(github.server_url == 'https://github.com' || endsWith(github.api_url, '/api/v3'))
+        uses: https://code.forgejo.org/forgejo/upload-artifact@cb8afe72b42edc798abfb8fcb556cf660d894245
         with:
           name: publish-macos-${{ matrix.arch }}-outputs-${{ github.run_id }}
           path: ${{ runner.temp }}/macos-platform-outputs
@@ -322,7 +375,15 @@ jobs:
 
       # Step 4
       - name: 📥 Download candidate artifacts
+        if: (success()) && (github.server_url == 'https://github.com' || endsWith(github.api_url, '/api/v3'))
         uses: actions/download-artifact@v8.0.1
+        with:
+          pattern: publish-*-${{ github.run_id }}
+          path: ${{ runner.temp }}/publish-artifacts
+          merge-multiple: false
+      - name: 📥 Download candidate artifacts (Forgejo)
+        if: (success()) && !(github.server_url == 'https://github.com' || endsWith(github.api_url, '/api/v3'))
+        uses: https://code.forgejo.org/forgejo/download-artifact@769f970437aa3291b13f35dc23fc87967d7fb19f
         with:
           pattern: publish-*-${{ github.run_id }}
           path: ${{ runner.temp }}/publish-artifacts
@@ -360,10 +421,23 @@ jobs:
 
       # Step 8
       - name: ♻️ Restore validated release state
-        run:
-          git fetch "${{ runner.temp }}/publish-artifacts/publish-release-state-${{ github.run_id
-          }}/release-state.bundle" HEAD --tags && git reset --hard "$(cat "${{ runner.temp
-          }}/publish-artifacts/publish-release-state-${{ github.run_id }}/release-head")"
+        env:
+          EXPECTED_RELEASE_SHA: ${{ needs.linux-release-candidate.outputs.release-sha }}
+        run: |
+          set -euo pipefail
+          state="${{ runner.temp }}/publish-artifacts/publish-release-state-${{ github.run_id }}"
+          actual="$(cat "$state/release-head")"
+          if [ -z "$EXPECTED_RELEASE_SHA" ] || [ "$actual" != "$EXPECTED_RELEASE_SHA" ]; then
+            echo "Release state does not match the validated candidate SHA." >&2
+            exit 1
+          fi
+          git bundle verify "$state/release-state.bundle"
+          git fetch "$state/release-state.bundle" HEAD --tags
+          if [ "$(git rev-parse FETCH_HEAD)" != "$EXPECTED_RELEASE_SHA" ]; then
+            echo "Release bundle HEAD does not match the validated candidate SHA." >&2
+            exit 1
+          fi
+          git reset --hard "$EXPECTED_RELEASE_SHA"
 
       # --- Validation ---------------------------------------------------------
 

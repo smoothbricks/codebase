@@ -309,13 +309,19 @@ describe('publish workflow definition', () => {
 
   it('selects one artifact transport per provider and retains hidden outputs only for eligible steps', () => {
     const workflow = typia.assert<{
-      jobs: Record<string, { steps: Array<{
-        uses?: string;
-        if?: string;
-        with?: { name?: string; 'include-hidden-files'?: boolean };
-      }> }>;
+      jobs: Record<
+        string,
+        {
+          steps: Array<{
+            uses?: string;
+            if?: string;
+            with?: { name?: string; 'include-hidden-files'?: boolean };
+          }>;
+        }
+      >;
     }>(Bun.YAML.parse(renderPublishWorkflowYaml({ platformTargetGlobs: PLATFORM_TARGET_GLOBS })));
-    const uploads = Object.values(workflow.jobs).flatMap((job) => job.steps)
+    const uploads = Object.values(workflow.jobs)
+      .flatMap((job) => job.steps)
       .filter((step) => step.uses?.includes('upload-artifact'));
     for (const github of [
       { server_url: 'https://github.com', api_url: 'https://api.github.com' },
@@ -329,20 +335,24 @@ describe('publish workflow definition', () => {
           // Actions implicitly adds success() when no status function is present.
           if (!/\b(success|failure|always|cancelled)\(/.test(step.if) && !succeeded) return false;
           const matches = new Function('github', 'steps', 'success', 'failure', 'endsWith', `return ${step.if};`);
-          return Boolean(matches(
-            github,
-            { version: { outputs: { mode: 'release' } } },
-            () => succeeded,
-            () => !succeeded,
-            (value: string, suffix: string) => value.endsWith(suffix),
-          ));
+          return Boolean(
+            matches(
+              github,
+              { version: { outputs: { mode: 'release' } } },
+              () => succeeded,
+              () => !succeeded,
+              (value: string, suffix: string) => value.endsWith(suffix),
+            ),
+          );
         });
-        const expectedNames = succeeded ? [
-          'publish-release-state-${{ github.run_id }}',
-          'publish-release-outputs-${{ github.run_id }}',
-          'publish-linux-outputs-${{ github.run_id }}',
-          'publish-macos-outputs-${{ github.run_id }}',
-        ] : ['trace-results-${{ github.run_id }}'];
+        const expectedNames = succeeded
+          ? [
+              'publish-release-state-${{ github.run_id }}',
+              'publish-release-outputs-${{ github.run_id }}',
+              'publish-linux-outputs-${{ github.run_id }}',
+              'publish-macos-outputs-${{ github.run_id }}',
+            ]
+          : ['trace-results-${{ github.run_id }}'];
         expect(selected.map((step) => step.with?.name).sort()).toEqual(expectedNames.sort());
         for (const step of selected) {
           expect(step.uses?.startsWith('https://code.forgejo.org/')).toBe(github.api_url.endsWith('/api/v1'));
