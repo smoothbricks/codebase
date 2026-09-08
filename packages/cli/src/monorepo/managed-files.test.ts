@@ -499,6 +499,21 @@ describe('publish workflow rendering by repo shape', () => {
     expect(rendered).not.toMatch(/^ {6}PRIV_NPM_PUBLISH_TOKEN:/m);
     expect(rendered).toContain('          PRIV_NPM_PUBLISH_TOKEN: ${{ secrets.PRIV_NPM_PUBLISH_TOKEN }}');
   });
+
+  it('threads production deploy secrets into the publish deploy step', () => {
+    const rendered = renderManagedWorkflowForTest(
+      'publish-workflow',
+      context({
+        hasProductionDeployTargets: true,
+        productionDeployProvider: 'cloudflare',
+        hasReleasePackages: true,
+        ciDeploySecrets: { BILLING_API_TOKEN: 'SMOO_BILLING_API_TOKEN' },
+      }),
+    );
+
+    expect(rendered).toContain('          BILLING_API_TOKEN: ${{ secrets.SMOO_BILLING_API_TOKEN }}');
+    expect(rendered).not.toMatch(/^ {6}BILLING_API_TOKEN:/m);
+  });
 });
 
 describe('CI workflow rendering by repo shape', () => {
