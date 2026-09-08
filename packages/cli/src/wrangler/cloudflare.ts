@@ -108,24 +108,36 @@ const isR2BucketPage = typia.createIs<{ buckets: R2Bucket[] }>();
 const isR2ObjectPage = typia.createIs<{ objects: Array<{ key: string }> }>();
 const isCreatedKvNamespace = typia.createIs<LiveKvNamespace>();
 
+/** What one page's `result_info` says about the rest of a page-numbered listing. */
+type PageVerdict = 'more' | 'done' | 'contradiction';
+
 /**
- * Whether a page-numbered listing continues past `page`. `total_pages` is authoritative where
- * Cloudflare sends it (DNS records, Workers domains); KV namespaces and D1 databases report only
- * `total_count`, and R2-style endpoints report neither — so fall back to that count and then to a
- * short page, which only the final page can be. Trusting a missing `total_pages` as "one page"
- * silently truncates every account past its first page.
+ * Where the listing stands after `page`. `total_pages` is authoritative where Cloudflare sends it
+ * (DNS records, Workers domains); KV namespaces and D1 databases report only `total_count`, and
+ * R2-style endpoints report neither — so fall back to that count and then to a short page, which
+ * only the final page can be. Trusting a missing `total_pages` as "one page" silently truncated
+ * every account past its first page.
+ *
+ * A page with no rows at all while the metadata still promises more is a contradiction, not an
+ * ending: the listing was torn, by a concurrent change or by the API itself. Say so instead of
+ * returning the rows read so far, which a caller planning deletions would read as the whole truth.
  */
-function hasPageAfter(
+function pageVerdict(
   page: number,
   rows: number,
   collected: number,
   perPage: number,
   info: CloudflareResultInfo | undefined,
-): boolean {
-  if (rows === 0) return false;
-  if (info?.total_pages !== undefined) return page < info.total_pages;
-  if (info?.total_count !== undefined && collected < info.total_count) return true;
-  return rows === perPage;
+): PageVerdict {
+  if (info?.total_pages !== undefined) {
+    if (page >= info.total_pages) return 'done';
+    return rows === 0 ? 'contradiction' : 'more';
+  }
+  if (info?.total_count !== undefined && collected < info.total_count) {
+    return rows === 0 ? 'contradiction' : 'more';
+  }
+  if (rows === 0) return 'done';
+  return rows === perPage ? 'more' : 'done';
 }
 
 export class CloudflareApiError extends Error {
@@ -305,7 +317,11 @@ export class CloudflareRestClient implements CloudflareClient {
       }
       const rows = envelope.result;
       items.push(...rows);
-      if (!hasPageAfter(page, rows.length, items.length, perPage, envelope.result_info)) return items;
+      const verdict = pageVerdict(page, rows.length, items.length, perPage, envelope.result_info);
+      if (verdict === 'contradiction') {
+        throw new Error(`Cloudflare answered page ${page} of ${path} with no rows while reporting more to come.`);
+      }
+      if (verdict === 'done') return items;
     }
     throw new Error(`Cloudflare paged ${path} past ${MAX_LIST_PAGES} pages without reporting an end.`);
   }
@@ -324,15 +340,16 @@ export class CloudflareRestClient implements CloudflareClient {
       items.push(...rows);
       const info = envelope.result_info;
       const next = info?.cursor;
-      // `is_truncated` is authoritative where the endpoint sends it (objects); where it does not
-      // (buckets) only the last page can be short.
-      const truncated = info?.is_truncated ?? rows.length === PAGE_SIZE;
       if (info?.is_truncated === true && !next) {
         // The listing says more exists and gives nothing to continue with: report the hole rather
         // than hand back a silently partial listing.
         throw new Error(`Cloudflare reported ${path} as truncated without a cursor to continue.`);
       }
-      if (rows.length === 0 || !next || !truncated) return items;
+      // `is_truncated` is authoritative both ways where the endpoint sends it (objects), and an
+      // empty page there still precedes more keys. Where it does not (buckets), only the last page
+      // can be short.
+      const more = info?.is_truncated ?? (rows.length === PAGE_SIZE && next !== undefined);
+      if (!more || !next) return items;
       if (next === cursor) {
         throw new Error(`Cloudflare repeated one pagination cursor for ${path}, so the listing never ends.`);
       }
