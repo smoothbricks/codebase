@@ -669,37 +669,46 @@ async function publishPackedPackage(root: string, pkg: ReleasePackage, tag: stri
   if (!dryRun && !(await npmPackageExists(root, pkg.name))) {
     throw new Error(missingNpmPackagePublishGuidance(pkg));
   }
-  const { tarball, cleanup } = await packReleaseTarball(root, pkg);
-  try {
-    // npm CLI owns authentication here: trusted publishing OIDC when configured.
-    // Bun still produces the tarball so workspace:* dependencies are resolved the
-    // same way smoo validates packed packages before release.
-    const args = ['publish', tarball, '--access', 'public', '--tag', tag, '--provenance'];
-    if (dryRun) {
-      args.push('--dry-run');
-    }
-    await publishWithAuthDiagnostics(
-      pkg,
-      {
-        publish: () => runNpmPublish(root, args),
-        versionExists: () => npmVersionExists(root, pkg.name, pkg.version),
-        log: (message) => console.log(message),
-        error: (message) => console.error(message),
-        appendSummary: async (markdown) => {
-          const summaryPath = process.env.GITHUB_STEP_SUMMARY;
-          if (summaryPath) {
-            await appendFile(summaryPath, `${markdown}\n\n`);
-          }
-        },
-      },
-      {
-        tokenPresent: npmAuthTokenPresent(),
-        repository: githubRepositoryFromRootPackage(root),
-      },
-    );
-  } finally {
-    await cleanup();
+  // npm CLI owns authentication here: trusted publishing OIDC when configured.
+  // Bun still produces the tarball so workspace:* dependencies are resolved the
+  // same way smoo validates packed packages before release. Preflight the
+  // provenance argv against RUNNER_ENVIRONMENT before packing or contacting npm:
+  // npmjs accepts --provenance only from github-hosted GitHub Actions runners.
+  const args = ['publish', '--access', 'public', '--tag', tag, '--provenance'];
+  if (dryRun) {
+    args.push('--dry-run');
   }
+  await publishWithAuthDiagnostics(
+    pkg,
+    {
+      publish: async () => {
+        const { tarball, cleanup } = await packReleaseTarball(root, pkg);
+        try {
+          await runNpmPublish(root, ['publish', tarball, ...args.slice(1)]);
+        } finally {
+          await cleanup();
+        }
+      },
+      versionExists: () => npmVersionExists(root, pkg.name, pkg.version),
+      log: (message) => console.log(message),
+      error: (message) => console.error(message),
+      appendSummary: async (markdown) => {
+        const summaryPath = process.env.GITHUB_STEP_SUMMARY;
+        if (summaryPath) {
+          await appendFile(summaryPath, `${markdown}\n\n`);
+        }
+      },
+    },
+    {
+      tokenPresent: npmAuthTokenPresent(),
+      repository: githubRepositoryFromRootPackage(root),
+      npmArgs: args,
+      env: {
+        GITHUB_ACTIONS: process.env.GITHUB_ACTIONS,
+        RUNNER_ENVIRONMENT: process.env.RUNNER_ENVIRONMENT,
+      },
+    },
+  );
 }
 
 /**
