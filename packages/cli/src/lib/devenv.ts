@@ -21,7 +21,8 @@ async function loadDevenvEnv(root: string): Promise<EnvSnapshot> {
   const tempDir = await mkdtemp(join(tmpdir(), 'smoo-devenv-env-'));
   const envPath = join(tempDir, 'env');
   try {
-    const result = await $`devenv shell -- bash -lc ${'env -0 > "$1"'} bash ${envPath}`
+    // A login shell reloads host profiles and can replace the selected Nix toolchain in PATH.
+    const result = await $`devenv shell -- bash -c ${'env -0 > "$1"'} bash ${envPath}`
       .cwd(join(root, 'tooling', 'direnv'))
       .quiet()
       .nothrow();
