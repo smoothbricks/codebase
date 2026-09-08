@@ -86,6 +86,13 @@ function mustNames(stdout: string): string[] {
 }
 
 /**
+ * Provider commands must run on macOS and NixOS alike, whose /bin and
+ * /usr/bin layouts differ (NixOS has neither echo nor printf there), so the
+ * tests execute Bun itself instead of host utilities. Real spawn path,
+ * portable binary.
+ */
+const emit = (text: string): string[] => [process.execPath, '-e', `process.stdout.write(${JSON.stringify(text)})`];
+/**
  * Runs one script against the raw module in a plain Bun child. The child env
  * carries only PATH/HOME so parent suite state (CI, workspace tokens) cannot
  * leak into the routing flags; every decision input travels through the
@@ -213,43 +220,37 @@ describe('resolveSecretEnvironment', () => {
   });
 
   it('an empty environment value does not win; the provider supplies the value', async () => {
-    await withFixture(
-      { secrets: { SMOO_TOKEN: { command: ['/bin/echo', '-n', 'tok-from-provider'] } } },
-      async (root) => {
-        expect(await resolveInBootstrap({ root, env: { SMOO_TOKEN: '' } })).toEqual({
-          resolved: { SMOO_TOKEN: 'tok-from-provider' },
-        });
-      },
-    );
+    await withFixture({ secrets: { SMOO_TOKEN: { command: emit('tok-from-provider') } } }, async (root) => {
+      expect(await resolveInBootstrap({ root, env: { SMOO_TOKEN: '' } })).toEqual({
+        resolved: { SMOO_TOKEN: 'tok-from-provider' },
+      });
+    });
   });
 
   it('trims one terminal newline, LF or CRLF, preserving interior content', async () => {
-    await withFixture({ secrets: { SMOO_TOKEN: { command: ['/bin/echo', 'tok-from-provider'] } } }, async (root) => {
+    await withFixture({ secrets: { SMOO_TOKEN: { command: emit('tok-from-provider\n') } } }, async (root) => {
       expect(await resolveInBootstrap({ root, env: {} })).toEqual({ resolved: { SMOO_TOKEN: 'tok-from-provider' } });
     });
-    await withFixture({ secrets: { SMOO_TOKEN: { command: ['/usr/bin/printf', 'tok\r\nmid\r\n'] } } }, async (root) => {
+    await withFixture({ secrets: { SMOO_TOKEN: { command: emit('tok\r\nmid\r\n') } } }, async (root) => {
       expect(await resolveInBootstrap({ root, env: {} })).toEqual({ resolved: { SMOO_TOKEN: 'tok\r\nmid' } });
     });
   });
 
   it('missing variables in CI refuse with injected-secret guidance and run nothing', async () => {
-    await withFixture(
-      { secrets: { SMOO_MISSING: { command: ['/bin/echo', '-n', 'NEVER-RAN-VALUE'] } } },
-      async (root) => {
-        const outcome = await resolveInBootstrap({ root, env: { CI: 'true' } });
-        expect(outcome.error).toContain('SMOO_MISSING');
-        expect(outcome.error).toContain('inject');
-        expect(outcome.error).not.toContain('NEVER-RAN-VALUE');
-      },
-    );
+    await withFixture({ secrets: { SMOO_MISSING: { command: emit('NEVER-RAN-VALUE') } } }, async (root) => {
+      const outcome = await resolveInBootstrap({ root, env: { CI: 'true' } });
+      expect(outcome.error).toContain('SMOO_MISSING');
+      expect(outcome.error).toContain('inject');
+      expect(outcome.error).not.toContain('NEVER-RAN-VALUE');
+    });
   });
 
   it('a present variable is not reported while another refuses in CI', async () => {
     await withFixture(
       {
         secrets: {
-          SMOO_MISSING: { command: ['/bin/echo', '-n', 'x'] },
-          SMOO_PRESENT: { command: ['/bin/echo', '-n', 'x'] },
+          SMOO_MISSING: { command: emit('x') },
+          SMOO_PRESENT: { command: emit('x') },
         },
       },
       async (root) => {
@@ -264,7 +265,7 @@ describe('resolveSecretEnvironment', () => {
     await withFixture(
       {
         npmrc: '//npm.example.net/:_authToken=${SMOO_NPM_TOKEN}\n',
-        secrets: { SMOO_NPM_TOKEN: { command: ['/bin/echo', '-n', 'LOCAL-RESOLVED-VALUE'] } },
+        secrets: { SMOO_NPM_TOKEN: { command: emit('LOCAL-RESOLVED-VALUE') } },
       },
       async (root) => {
         const outcome = await resolveInBootstrap({ root, env: { COWSHED_WORKSPACE_TOKEN: 'gateway-session' } });
@@ -279,7 +280,7 @@ describe('resolveSecretEnvironment', () => {
     await withFixture(
       {
         npmrc: '//npm.example.net/:_authToken=${SMOO_UNDECLARED}\n',
-        secrets: { SMOO_GENERIC: { command: ['/bin/echo', '-n', 'generic-tok'] } },
+        secrets: { SMOO_GENERIC: { command: emit('generic-tok') } },
       },
       async (root) => {
         expect(await resolveInBootstrap({ root, env: { COWSHED_WORKSPACE_TOKEN: 'gateway-session' } })).toEqual({
@@ -291,7 +292,13 @@ describe('resolveSecretEnvironment', () => {
 
   it('provider failures name the variable, the exit code, and nothing secret-shaped', async () => {
     await withFixture(
-      { secrets: { SMOO_TOKEN: { command: ['/bin/sh', '-c', 'echo token=sk-live-stderr >&2; exit 3'] } } },
+      {
+        secrets: {
+          SMOO_TOKEN: {
+            command: [process.execPath, '-e', 'process.stderr.write("token=sk-live-stderr\\n");process.exit(3)'],
+          },
+        },
+      },
       async (root) => {
         const outcome = await resolveInBootstrap({ root, env: {} });
         expect(outcome.error).toContain('SMOO_TOKEN');
@@ -303,7 +310,7 @@ describe('resolveSecretEnvironment', () => {
   });
 
   it('an empty provider output refuses instead of assigning an empty secret', async () => {
-    await withFixture({ secrets: { SMOO_TOKEN: { command: ['/bin/echo', '-n', ''] } } }, async (root) => {
+    await withFixture({ secrets: { SMOO_TOKEN: { command: emit('') } } }, async (root) => {
       const outcome = await resolveInBootstrap({ root, env: {} });
       expect(outcome.error).toContain('SMOO_TOKEN');
       expect(outcome.error).toContain('no output');
