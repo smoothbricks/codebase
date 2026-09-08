@@ -7,7 +7,6 @@ import {
   ciPushBranches,
   type NonEmptyArray,
   type NxProjectJson,
-  type NxTargetConfig,
   type PackageCargoCredentialsConfig,
   type PackageJson,
   type PackagePrivateNpmConfig,

@@ -44,9 +44,7 @@ export interface ProcessRunner {
 
 /** The child environment `options` describe; every runner, test doubles included, spawns with exactly this. */
 export function childEnvironment(options: ProcessRunOptions): NodeJS.ProcessEnv {
-  const env = mergeEnv(options.env ?? {});
-  for (const name of options.unsetEnv ?? []) delete env[name];
-  return env;
+  return mergeEnv(options.env, options.unsetEnv);
 }
 
 export class BunProcessRunner implements ProcessRunner {
