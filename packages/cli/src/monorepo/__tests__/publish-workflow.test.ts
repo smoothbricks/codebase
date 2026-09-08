@@ -311,13 +311,19 @@ describe('publish workflow definition', () => {
     const providers: Array<PublishWorkflowDefinitionOptions['actionsProvider']> = [undefined, 'github', 'forgejo'];
     for (const actionsProvider of providers) {
       const workflow = typia.assert<{
-        jobs: Record<string, { steps: Array<{
-          uses?: string;
-          if?: string;
-          with?: { name?: string; 'include-hidden-files'?: boolean };
-        }> }>;
+        jobs: Record<
+          string,
+          {
+            steps: Array<{
+              uses?: string;
+              if?: string;
+              with?: { name?: string; 'include-hidden-files'?: boolean };
+            }>;
+          }
+        >;
       }>(Bun.YAML.parse(renderPublishWorkflowYaml({ platformTargetGlobs: PLATFORM_TARGET_GLOBS, actionsProvider })));
-      const artifacts = Object.values(workflow.jobs).flatMap((job) => job.steps)
+      const artifacts = Object.values(workflow.jobs)
+        .flatMap((job) => job.steps)
         .filter((step) => step.uses?.includes('-artifact'));
       // Runners resolve actions before evaluating if: even an ineligible
       // foreign action reference would prevent the whole workflow from starting.
@@ -332,18 +338,22 @@ describe('publish workflow definition', () => {
           // Actions implicitly adds success() when no status function is present.
           if (!/\b(success|failure|always|cancelled)\(/.test(step.if) && !succeeded) return false;
           const matches = new Function('steps', 'success', 'failure', `return ${step.if};`);
-          return Boolean(matches(
-            { version: { outputs: { mode: 'release' } } },
-            () => succeeded,
-            () => !succeeded,
-          ));
+          return Boolean(
+            matches(
+              { version: { outputs: { mode: 'release' } } },
+              () => succeeded,
+              () => !succeeded,
+            ),
+          );
         });
-        const expectedNames = succeeded ? [
-          'publish-release-state-${{ github.run_id }}',
-          'publish-release-outputs-${{ github.run_id }}',
-          'publish-linux-outputs-${{ github.run_id }}',
-          'publish-macos-outputs-${{ github.run_id }}',
-        ] : ['trace-results-${{ github.run_id }}'];
+        const expectedNames = succeeded
+          ? [
+              'publish-release-state-${{ github.run_id }}',
+              'publish-release-outputs-${{ github.run_id }}',
+              'publish-linux-outputs-${{ github.run_id }}',
+              'publish-macos-outputs-${{ github.run_id }}',
+            ]
+          : ['trace-results-${{ github.run_id }}'];
         expect(selected.map((step) => step.with?.name).sort()).toEqual(expectedNames.sort());
         for (const step of selected) {
           if (step.with?.name !== 'publish-release-state-${{ github.run_id }}') {

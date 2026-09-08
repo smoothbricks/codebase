@@ -7,8 +7,8 @@ import type {
   PackageCargoCredentialsConfig,
   PackageJson,
   PackagePrivateNpmConfig,
-  PackageSourceCheckoutConfig,
   PackageSmooGithub,
+  PackageSourceCheckoutConfig,
 } from '../lib/json.js';
 import { listReleasePackages, readPackageJson } from '../lib/workspace.js';
 import { loadNxProjects, type NxProjects, targetNamesFromProjects } from '../nx/index.js';
