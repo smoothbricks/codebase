@@ -894,7 +894,7 @@ async function createProjectTargets(
     if (!target.cache) continue;
     const cwd: unknown = target.options?.cwd;
     const versions = name.startsWith('cargo-lint')
-      ? ' && cargo clippy -V' + (name === CARGO_CROSS_LINT_TARGET ? '' : ' && cargo fmt --version')
+      ? ` && cargo clippy -V${name === CARGO_CROSS_LINT_TARGET ? '' : ' && cargo fmt --version'}`
       : text.includes('nextest run')
         ? ' && cargo nextest --version'
         : '';
