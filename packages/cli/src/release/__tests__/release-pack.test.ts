@@ -244,6 +244,90 @@ describe('release pack artifacts', () => {
       await expect(verifyReleasePackManifest(output)).rejects.toThrow(/beta/);
     });
   });
+
+  it('refuses an artifact directory holding a tarball the manifest does not bind', async () => {
+    await withPackWorkspace(async (root) => {
+      const output = join(root, 'artifacts');
+      await releasePack(root, { projects: 'beta', output });
+
+      // `release pack` writes into an empty directory, so an extra tarball is a
+      // mixed or tampered release, not an artifact this manifest describes.
+      await writeFile(join(output, 'priv.test-beta-9.9.9.tgz'), 'unbound artifact');
+
+      await expect(verifyReleasePackManifest(output)).rejects.toThrow(/priv\.test-beta-9\.9\.9\.tgz/);
+    });
+  });
+
+  it('refuses a manifest that binds one package name twice or escapes the directory', async () => {
+    await withPackWorkspace(async (root) => {
+      const output = join(root, 'artifacts');
+      await releasePack(root, { projects: 'beta', output });
+      const manifest = await readManifest(output);
+      const entry = manifest.packages[0];
+      if (!entry) {
+        throw new Error('pack produced no manifest entries');
+      }
+
+      // The manifest is the name/version map a consumer pins against: two
+      // entries for one name make the pinned version ambiguous.
+      await writeFile(
+        join(output, 'manifest.json'),
+        `${JSON.stringify({ schemaVersion: 1, packages: [entry, { ...entry, version: '9.9.9' }] }, null, 2)}\n`,
+      );
+      await expect(verifyReleasePackManifest(output)).rejects.toThrow(/appears twice/);
+
+      // A path is validated before it is opened, so no read can escape the
+      // artifact directory.
+      await writeFile(
+        join(output, 'manifest.json'),
+        `${JSON.stringify({ schemaVersion: 1, packages: [{ ...entry, tarball: `../${entry.tarball}` }] }, null, 2)}\n`,
+      );
+      await expect(verifyReleasePackManifest(output)).rejects.toThrow(/bare file name/);
+    });
+  });
+});
+
+/**
+ * The private publish path carries the destination inside the tarball: the
+ * resolved literal registry goes into publishConfig for the pack and the
+ * workspace bytes come back afterwards. An unresolved placeholder shipping in
+ * a published package.json would send every consumer's install to a
+ * nonexistent host, so it must fail before bytes leave.
+ */
+describe('private publish manifest transform', () => {
+  const registry = 'https://forge.example.test/api/packages/priv-owner/npm/';
+
+  it('packs the resolved literal registry and restores the workspace manifest', async () => {
+    await withPackWorkspace(async (root) => {
+      const manifestPath = join(root, 'packages/beta/package.json');
+      const before = await readFile(manifestPath, 'utf8');
+
+      const packed = await packReleaseTarball(root, packagedProject(root, 'beta'), {
+        publishConfigRegistry: registry,
+      });
+      try {
+        const manifest = await packedManifestJson(packed.tarball);
+        expect(manifest).toContain(`"registry": "${registry}"`);
+        expect(manifest).not.toContain('${');
+      } finally {
+        await packed.cleanup();
+      }
+
+      expect(await readFile(manifestPath, 'utf8')).toBe(before);
+    });
+  });
+
+  it('refuses a packed artifact whose registry is still an environment placeholder', async () => {
+    await withPackWorkspace(async (root) => {
+      const pkg = packagedProject(root, 'beta');
+      const packed = await packReleaseTarball(root, pkg, { publishConfigRegistry: '${PRIV_NPM_REGISTRY}' });
+      try {
+        await expect(assertPackedArtifact(root, packed.tarball, pkg)).rejects.toThrow(/environment placeholder/);
+      } finally {
+        await packed.cleanup();
+      }
+    });
+  });
 });
 
 describe('release pack tarball production', () => {
@@ -308,7 +392,7 @@ describe('release pack tarball production', () => {
 describe('release-check gate', () => {
   const checkCommand = 'test -f dist/native-ok && touch dist/check-ran';
 
-  async function declareReleaseCheck(root: string): Promise<void> {
+  async function declareReleaseCheck(root: string, overrides: Record<string, unknown> = {}): Promise<void> {
     const manifestPath = join(root, 'packages/alpha/package.json');
     const manifest = readJsonObject(manifestPath);
     if (!manifest) {
@@ -316,7 +400,13 @@ describe('release-check gate', () => {
     }
     ensureNxTargets(ensureNx(manifest))['release-check'] = {
       executor: 'nx:run-commands',
+      // The gate runs in the publishing job over the union of this job's build
+      // and the applied foreign-platform outputs: it must not rebuild that
+      // tree, and a cache replay would verify nothing.
+      dependsOn: [],
+      cache: false,
       options: { command: checkCommand, cwd: 'packages/alpha' },
+      ...overrides,
     };
     writeJsonObject(manifestPath, manifest);
   }
@@ -341,6 +431,29 @@ describe('release-check gate', () => {
       } finally {
         await packed.cleanup();
       }
+    });
+  });
+
+  it('refuses a release-check that can rebuild the merged artifact tree', async () => {
+    await withPackWorkspace(async (root) => {
+      await declareReleaseCheck(root, { dependsOn: ['build'] });
+      await writeFile(join(root, 'packages/alpha/dist/native-ok'), 'ok\n');
+
+      await expect(packReleaseTarball(root, packagedProject(root, 'alpha'))).rejects.toThrow(/empty dependsOn/);
+
+      // The gate never ran, so nothing rebuilt over the applied outputs.
+      expect(existsSync(join(root, 'packages/alpha/dist/check-ran'))).toBe(false);
+    });
+  });
+
+  it('refuses a release-check that a cache hit could replay instead of running', async () => {
+    await withPackWorkspace(async (root) => {
+      await declareReleaseCheck(root, { cache: true });
+      await writeFile(join(root, 'packages/alpha/dist/native-ok'), 'ok\n');
+
+      await expect(packReleaseTarball(root, packagedProject(root, 'alpha'))).rejects.toThrow(/cache: false/);
+
+      expect(existsSync(join(root, 'packages/alpha/dist/check-ran'))).toBe(false);
     });
   });
 });
