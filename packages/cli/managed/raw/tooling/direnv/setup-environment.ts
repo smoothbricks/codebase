@@ -4,6 +4,7 @@ import { mkdir, rmdir, stat } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import path from 'node:path';
 import { $ } from 'bun';
+import { resolveSecretEnvironment } from './secret-references.ts';
 
 // DEVENV_ROOT is set by the devenv shell, which is how this script normally
 // runs. CI jobs that install dependencies without building that shell (the
@@ -65,6 +66,15 @@ const TYPESCRIPT_API_VERSION = '6.0.3';
 process.chdir(projectRoot);
 
 try {
+  // Provider-declared secrets (smoo.secrets) resolve before any install. The
+  // values land in THIS process environment only — bun install, the prepare
+  // scripts it runs, and every later child of this script inherit them (for
+  // example .npmrc `${VAR}` auth); the direnv shell itself does not, which is
+  // the point: this script must never act as a global shell export.
+  for (const [name, value] of Object.entries(await resolveSecretEnvironment({ root: projectRoot }))) {
+    process.env[name] = value;
+  }
+
   // Bootstrap only: install deps + wire local git hooks/config.
   // Do not import workspace packages here — this script is what installs them,
   // and package resolution/Typia transforms are not available yet.

@@ -215,6 +215,11 @@ const managedFiles: ManagedFile[] = [
   },
   {
     kind: 'raw',
+    source: 'tooling/direnv/secret-references.ts',
+    target: 'tooling/direnv/secret-references.ts',
+  },
+  {
+    kind: 'raw',
     source: 'tooling/direnv/devenv.smoo.nix',
     target: 'tooling/direnv/devenv.smoo.nix',
   },

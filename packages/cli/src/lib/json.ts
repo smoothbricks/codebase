@@ -144,9 +144,17 @@ export interface PackagePrivateNpmConfig {
   publishTokenEnv?: string;
 }
 
+/** Local bootstrap fallback; existing environment values always take precedence. */
+export interface PackageSecretCommand {
+  /** Executed directly, without a shell; stdout supplies the secret value. */
+  command: NonEmptyArray<string>;
+}
+
 export interface PackageSmooConfig {
   github?: PackageSmooGithub;
   privateNpm?: PackagePrivateNpmConfig;
+  /** Provider-neutral local secret commands. CI supplies these variables externally. */
+  secrets?: Record<string, PackageSecretCommand>;
 }
 
 export interface PackageWorkspacesObject {
