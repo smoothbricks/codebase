@@ -14,8 +14,8 @@ import type {
   PackageSourceCheckoutConfig,
 } from '../lib/json.js';
 import {
-  CiWorkflowStepKind,
   artifactStepLines,
+  CiWorkflowStepKind,
   cargoCredentialJobEnvLines,
   cargoCredentialStepLines,
   sourceCheckoutsStepLines,
@@ -578,13 +578,18 @@ function yamlLinesForStep(step: PublishWorkflowStep, options: PublishWorkflowDef
         `smoo github-ci nx-run-many --targets test --projects "${githubExpression('steps.version.outputs.projects')}"`,
       );
     case PublishWorkflowStepKind.UploadTraceDbs:
-      return artifactStepLines(step.name, 'upload', [
-        `name: trace-results-${githubExpression('github.run_id')}`,
-        'path: packages/*/.cache/trace-results.db*',
-        'if-no-files-found: ignore',
-        'retention-days: 14',
-        'include-hidden-files: true',
-      ], 'failure()');
+      return artifactStepLines(
+        step.name,
+        'upload',
+        [
+          `name: trace-results-${githubExpression('github.run_id')}`,
+          'path: packages/*/.cache/trace-results.db*',
+          'if-no-files-found: ignore',
+          'retention-days: 14',
+          'include-hidden-files: true',
+        ],
+        'failure()',
+      );
     case PublishWorkflowStepKind.ValidateMonorepoConfig:
       return conditionalRunStep(step, 'smoo monorepo validate');
     case PublishWorkflowStepKind.TagRelease:
@@ -909,25 +914,35 @@ function renderLinuxReleaseCandidateSteps(
     ]),
     '',
     `      # Step ${stepNumber++}`,
-    ...artifactStepLines('📤 Upload validated build outputs', 'upload', [
-      `name: publish-release-outputs-${githubExpression('github.run_id')}`,
-      `path: ${githubExpression('runner.temp')}/release-build-outputs`,
-      'if-no-files-found: error',
-      'retention-days: 1',
-      'include-hidden-files: true',
-    ], "steps.version.outputs.mode != 'none'"),
+    ...artifactStepLines(
+      '📤 Upload validated build outputs',
+      'upload',
+      [
+        `name: publish-release-outputs-${githubExpression('github.run_id')}`,
+        `path: ${githubExpression('runner.temp')}/release-build-outputs`,
+        'if-no-files-found: error',
+        'retention-days: 1',
+        'include-hidden-files: true',
+      ],
+      "steps.version.outputs.mode != 'none'",
+    ),
   );
   if (hasLinuxPlatformTargets(options)) {
     lines.push(
       '',
       `      # Step ${stepNumber++}`,
-      ...artifactStepLines('📤 Upload supplemental Linux outputs', 'upload', [
-        `name: publish-linux-outputs-${githubExpression('github.run_id')}`,
-        `path: ${githubExpression('runner.temp')}/linux-platform-outputs`,
-        'if-no-files-found: error',
-        'retention-days: 1',
-        'include-hidden-files: true',
-      ], "steps.version.outputs.mode != 'none'"),
+      ...artifactStepLines(
+        '📤 Upload supplemental Linux outputs',
+        'upload',
+        [
+          `name: publish-linux-outputs-${githubExpression('github.run_id')}`,
+          `path: ${githubExpression('runner.temp')}/linux-platform-outputs`,
+          'if-no-files-found: error',
+          'retention-days: 1',
+          'include-hidden-files: true',
+        ],
+        "steps.version.outputs.mode != 'none'",
+      ),
     );
   }
   lines.push(

@@ -177,15 +177,28 @@ describe('CI workflow definition', () => {
         { kind: CiWorkflowStepKind.CargoCredentials, name: 'Credentials', number: 3 },
         { gitOrigins: [{ origin: 'https://[::1]:8443', tokenEnv: 'SOURCE_READ_TOKEN' }] },
       );
-      const script = lines.slice(lines.indexOf('        run: |') + 1).map((line) => line.slice(10)).join('\n');
-      const environment = { ...process.env, RUNNER_TEMP: directory, GITHUB_ENV: githubEnv, SOURCE_READ_TOKEN: 'fixture-secret' };
+      const script = lines
+        .slice(lines.indexOf('        run: |') + 1)
+        .map((line) => line.slice(10))
+        .join('\n');
+      const environment = {
+        ...process.env,
+        RUNNER_TEMP: directory,
+        GITHUB_ENV: githubEnv,
+        SOURCE_READ_TOKEN: 'fixture-secret',
+      };
       const prepared = spawnSync('sh', ['-eu', '-c', script], { env: environment, encoding: 'utf8' });
       expect(prepared.status).toBe(0);
       expect(prepared.stdout + prepared.stderr + readFileSync(githubEnv, 'utf8')).not.toContain('fixture-secret');
       const helper = join(directory, 'cargo-git-credential.sh');
       expect(readFileSync(helper, 'utf8')).not.toContain('fixture-secret');
       for (const { operation, protocol, host, expected } of [
-        { operation: 'get', protocol: 'https', host: '[::1]:8443', expected: 'username=x-access-token\npassword=fixture-secret\n' },
+        {
+          operation: 'get',
+          protocol: 'https',
+          host: '[::1]:8443',
+          expected: 'username=x-access-token\npassword=fixture-secret\n',
+        },
         { operation: 'get', protocol: 'http', host: '[::1]:8443', expected: '' },
         { operation: 'get', protocol: 'https', host: '[::1]:8444', expected: '' },
         { operation: 'get', protocol: 'https', host: 'other.example.net', expected: '' },
@@ -193,7 +206,9 @@ describe('CI workflow definition', () => {
         { operation: 'erase', protocol: 'https', host: '[::1]:8443', expected: '' },
       ]) {
         const result = spawnSync('sh', [helper, operation], {
-          env: environment, encoding: 'utf8', input: `protocol=${protocol}\nhost=${host}\npath=owner/repository.git\n\n`,
+          env: environment,
+          encoding: 'utf8',
+          input: `protocol=${protocol}\nhost=${host}\npath=owner/repository.git\n\n`,
         });
         expect(result.status).toBe(0);
         expect(result.stdout).toBe(expected);
@@ -210,17 +225,31 @@ describe('CI workflow definition', () => {
     expect(steps.findIndex((step) => step.kind === CiWorkflowStepKind.CargoCredentials)).toBeLessThan(
       steps.findIndex((step) => step.kind === CiWorkflowStepKind.SetupDevenv),
     );
-    expect(Bun.YAML.parse(renderCiWorkflowYaml(definition))).toMatchObject({ jobs: { main: {
-      if: "${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}",
-    } } });
+    expect(Bun.YAML.parse(renderCiWorkflowYaml(definition))).toMatchObject({
+      jobs: {
+        main: {
+          if: "${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}",
+        },
+      },
+    });
     const lines = cargoCredentialStepLines(
-      { kind: CiWorkflowStepKind.CargoCredentials, name: 'Credentials', number: 3 }, definition.cargoCredentials ?? {},
+      { kind: CiWorkflowStepKind.CargoCredentials, name: 'Credentials', number: 3 },
+      definition.cargoCredentials ?? {},
     );
-    const script = lines.slice(lines.indexOf('        run: |') + 1).map((line) => line.slice(10)).join('\n');
-    const missing = spawnSync('sh', ['-eu', '-c', script], { env: { CARGO_REGISTRIES_EXAMPLE_TOKEN: '' }, encoding: 'utf8' });
+    const script = lines
+      .slice(lines.indexOf('        run: |') + 1)
+      .map((line) => line.slice(10))
+      .join('\n');
+    const missing = spawnSync('sh', ['-eu', '-c', script], {
+      env: { CARGO_REGISTRIES_EXAMPLE_TOKEN: '' },
+      encoding: 'utf8',
+    });
     expect(missing.status).not.toBe(0);
     expect(missing.stderr).toContain('CARGO_REGISTRIES_EXAMPLE_TOKEN');
-    const present = spawnSync('sh', ['-eu', '-c', script], { env: { CARGO_REGISTRIES_EXAMPLE_TOKEN: 'fixture-secret' }, encoding: 'utf8' });
+    const present = spawnSync('sh', ['-eu', '-c', script], {
+      env: { CARGO_REGISTRIES_EXAMPLE_TOKEN: 'fixture-secret' },
+      encoding: 'utf8',
+    });
     expect(present.status).toBe(0);
     expect(present.stdout + present.stderr).toBe('');
   });
@@ -233,10 +262,18 @@ describe('CI workflow definition', () => {
   });
 
   it('refuses malformed cargo credential declarations at render time', () => {
-    expect(() => renderCiWorkflowYaml(options({ cargoCredentials: { gitOrigins: [
-      { origin: 'https://git.example.net', tokenEnv: 'FIRST_TOKEN' },
-      { origin: 'https://git.example.net:443', tokenEnv: 'SECOND_TOKEN' },
-    ] } }))).toThrow('one token per origin');
+    expect(() =>
+      renderCiWorkflowYaml(
+        options({
+          cargoCredentials: {
+            gitOrigins: [
+              { origin: 'https://git.example.net', tokenEnv: 'FIRST_TOKEN' },
+              { origin: 'https://git.example.net:443', tokenEnv: 'SECOND_TOKEN' },
+            ],
+          },
+        }),
+      ),
+    ).toThrow('one token per origin');
     expect(() => renderCiWorkflowYaml(options({ cargoCredentials: {} }))).toThrow(
       'at least one gitOrigins or registryTokenEnvs',
     );

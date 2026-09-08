@@ -430,6 +430,7 @@ describe('publish workflow rendering by repo shape', () => {
     hasE2eDeploymentTargets: false,
     ciPushBranches: ['main'],
     ciRunsOn: 'ubuntu-latest',
+    macosRunsOn: 'macos-latest',
     nodeModulesCacheKey: 'key',
     repoName: '@scope/repo',
     platformTargetGlobs: [],

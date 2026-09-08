@@ -723,12 +723,17 @@ export async function publishGithubDeployment(
   const sha = processEnvironment.GITHUB_SHA;
   if (!repository || !sha) throw new Error('GITHUB_REPOSITORY and GITHUB_SHA are required to publish a deployment.');
   if (ciApiContext(processEnvironment).forgejo) {
-    await ciApiRequest(`/statuses/${sha}`, 'POST', {
-      state: 'success',
-      context: `deployment/${environment}`,
-      description: `Deployed ${environment}`,
-      target_url: url,
-    }, processEnvironment);
+    await ciApiRequest(
+      `/statuses/${sha}`,
+      'POST',
+      {
+        state: 'success',
+        context: `deployment/${environment}`,
+        description: `Deployed ${environment}`,
+        target_url: url,
+      },
+      processEnvironment,
+    );
     return;
   }
   const createBody = JSON.stringify({

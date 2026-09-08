@@ -1,9 +1,17 @@
 import { describe, expect, test } from 'bun:test';
+import assert from 'node:assert/strict';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import type { PackageJson } from '../lib/json.js';
+import { isPackageJson, type PackageJson } from '../lib/json.js';
 import { prunePublishedExports, withPublishManifest } from './publish-manifest.js';
+
+function conditionKeys(exports: PackageJson['exports'], subpath: string): string[] {
+  assert(exports && typeof exports === 'object');
+  const conditions = exports[subpath];
+  assert(conditions && typeof conditions === 'object');
+  return Object.keys(conditions);
+}
 
 describe('prunePublishedExports', () => {
   test('drops conditions pointing at TypeScript source and keeps built entries', () => {
@@ -134,12 +142,8 @@ describe('prunePublishedExports', () => {
       'exports[./sub]: types condition moved first',
     ]);
     // Key order is the observable behavior, so assert it explicitly.
-    expect(Object.keys((manifest.exports as Record<string, unknown>)['.'] as object)).toEqual([
-      'types',
-      'import',
-      'default',
-    ]);
-    expect(Object.keys((manifest.exports as Record<string, unknown>)['./sub'] as object)).toEqual(['types', 'node']);
+    expect(conditionKeys(manifest.exports, '.')).toEqual(['types', 'import', 'default']);
+    expect(conditionKeys(manifest.exports, './sub')).toEqual(['types', 'node']);
   });
 
   test('reorder alone is an applied adjustment, not a no-op', () => {
@@ -151,7 +155,7 @@ describe('prunePublishedExports', () => {
     const { manifest, adjustments } = prunePublishedExports(pkg);
 
     expect(adjustments).toEqual(['exports[.]: types condition moved first']);
-    expect(Object.keys(manifest.exports?.['.'] as object)).toEqual(['types', 'bun', 'default']);
+    expect(conditionKeys(manifest.exports, '.')).toEqual(['types', 'bun', 'default']);
   });
 });
 
@@ -252,8 +256,9 @@ describe('withPublishManifest', () => {
     const dir = tempPackageDir(original);
     try {
       const seen = await withPublishManifest(dir, async () => readFileSync(join(dir, 'package.json'), 'utf8'));
-      const seenPkg = JSON.parse(seen) as PackageJson;
-      expect(Object.keys(seenPkg.exports?.['.'] as object)[0]).toBe('types');
+      const seenPkg: unknown = JSON.parse(seen);
+      assert(isPackageJson(seenPkg));
+      expect(conditionKeys(seenPkg.exports, '.')[0]).toBe('types');
       expect(readFileSync(join(dir, 'package.json'), 'utf8')).toBe(original);
     } finally {
       rmSync(dir, { recursive: true, force: true });

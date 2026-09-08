@@ -257,7 +257,7 @@ export async function assertPackedArtifact(root: string, tarball: string, pkg: P
     }
   }
   const registry = manifest.publishConfig?.registry;
-  if (registry && registry.includes('$')) {
+  if (registry?.includes('$')) {
     failures.push(
       `${pkg.path}: packed publishConfig.registry must be a real registry URL, never an environment placeholder.`,
     );
