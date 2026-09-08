@@ -72,112 +72,114 @@ export function sourceReleaseUrl(repo: SourceRepository, tag: string): string {
   return `${repo.htmlBase}/${repo.owner}/${repo.repo}/releases/tag/${encodedTag}`;
 }
 
-/** Which environment variable supplied a source-release token, plus its value. */
-export interface SourceReleaseCredential {
-  /** Variable name: safe to log. The token is not. */
+/**
+ * The CI forge's own identity, exactly as `github-ci/api.ts::ciApiContext`
+ * resolves it: that function owns server/API/repository resolution and already
+ * refuses an API URL outside the CI server's origin. Passed in as data so this
+ * module stays free of the import cycle api.ts -> source-release.ts.
+ */
+export interface CiForgeContext {
+  forgejo: boolean;
+  /** API base inside the CI server's own origin; on a runner this is often an internal address. */
+  apiBase: string;
+  /** `owner/repo` the ambient credential was issued for. */
+  repository: string;
+}
+
+/** Where source-release API calls go, plus the credential for that one origin. */
+export interface SourceReleaseEndpoint {
+  /** `<apiBase>/repos/<owner>/<repo>`; release paths append to this. */
+  repositoryApi: string;
+  /** Variable that supplied the token: safe to log. The token is not. */
   envName: string;
   token: string;
 }
 
 /**
- * Environment variables that may authenticate source-release API calls for
- * `repo`, in resolution order.
- *
- * The ambient forge credentials (GH_TOKEN, GITHUB_TOKEN) count only when the
- * ambient forge *is* the forge hosting the source repository. Forgejo Actions
- * exports GITHUB_TOKEN and GITHUB_SERVER_URL exactly as GitHub Actions does,
- * and a developer shell normally holds a GitHub PAT in GH_TOKEN, so an
- * ungated ambient token sends one forge's credential to another forge's host:
- * an unexplainable 401 in the good case, credential disclosure in the bad one.
- *
- * Identity cannot be decided on the server URL alone. A runner reaches its own
- * instance through whatever address its network gives it -- the observed
- * Forgejo GARM runner checks out `http://10.89.0.1:3000/<owner>/<repo>` while
- * the repository's public URL is `https://<public-host>/<owner>/<repo>` -- so
- * requiring the public host would refuse the instance's own token and break
- * the version/tag/status steps that run before any publisher secret exists.
- * See ambientForgeIsSource for the accepted evidence.
- *
- * The declared private-npm publisher variable comes last, and only for a
- * source forge that also hosts the declared registry: it is that host's
- * credential, not a general-purpose one.
+ * Ambient credential names, in the order `github-ci/api.ts::ciApiRequest`
+ * consumes them. They are only ever paired with an endpoint taken from the
+ * same CI context, so the credential cannot leave the origin that issued it.
  */
-export function sourceReleaseTokenEnvNames(
+const CI_TOKEN_ENVS = ['FORGEJO_TOKEN', 'GH_TOKEN', 'GITHUB_TOKEN'] as const;
+
+/**
+ * Every credential that may authenticate a source release, each already paired
+ * with the one endpoint it is allowed to reach, in resolution order. The
+ * pairing is the security property: a credential is never offered an origin
+ * other than the one that issued it.
+ *
+ * - In CI for this very repository, the ambient credential is used against the
+ *   CI server's own API base. A runner reaches its instance through whatever
+ *   address its network gives it -- the observed Forgejo GARM runner checks out
+ *   `http://10.89.0.1:3000/<owner>/<repo>` while the repository's public URL is
+ *   the https host -- and no environment signal proves those are one host. So
+ *   the ambient token is never sent to the public URL on the strength of a
+ *   guess: it goes back to the origin that minted it, for the repository it
+ *   was minted for. A foreign instance serving a same-named repository can
+ *   therefore only ever be handed its own credential, never ours.
+ * - The declared private-npm publisher variable is that forge's own
+ *   credential, so it pairs with the canonical public API and only when the
+ *   declared registry lives on the source host. It remains available in CI
+ *   too: a runner whose forge issued no token still releases, through the
+ *   public host it was declared for.
+ */
+function sourceReleaseCandidates(
   repo: SourceRepository,
   root: string,
-  env: Record<string, string | undefined> = process.env,
-): string[] {
-  const sourceHost = repo.kind === 'github' ? 'github.com' : new URL(repo.htmlBase).host;
-  const names = ambientForgeIsSource(repo, sourceHost, env) ? ['GH_TOKEN', 'GITHUB_TOKEN'] : [];
-  const declared = readPackageJsonObject(join(root, 'package.json'))?.smoo?.privateNpm?.publishTokenEnv;
-  if (declared && !names.includes(declared) && declaredRegistryHostsSource(sourceHost, root)) {
-    names.push(declared);
+  ci: CiForgeContext | null,
+): Array<{ envName: string; repositoryApi: string }> {
+  const candidates: Array<{ envName: string; repositoryApi: string }> = [];
+  if (ciHostsSource(repo, ci)) {
+    const repositoryApi = `${ci.apiBase}/repos/${ci.repository}`;
+    for (const envName of CI_TOKEN_ENVS) {
+      candidates.push({ envName, repositoryApi });
+    }
   }
-  return names;
+  const declared = readPackageJsonObject(join(root, 'package.json'))?.smoo?.privateNpm?.publishTokenEnv;
+  if (repo.kind === 'forgejo' && declared && declaredRegistryHostsSource(new URL(repo.htmlBase).host, root)) {
+    candidates.push({ envName: declared, repositoryApi: forgejoApiUrl(repo, '') });
+  }
+  return candidates;
+}
+
+/** Candidate variable names in resolution order; for diagnostics, never values. */
+export function sourceReleaseTokenEnvNames(repo: SourceRepository, root: string, ci: CiForgeContext | null): string[] {
+  return sourceReleaseCandidates(repo, root, ci).map((candidate) => candidate.envName);
 }
 
 /**
- * First configured credential for `repo`, naming the variable it came from so
- * a release log can say which credential authenticated without printing it.
+ * The endpoint and credential for source-release API calls, or null when
+ * nothing is configured. Release links stay canonical and public regardless of
+ * which endpoint served the call: see sourceReleaseUrl.
  */
-export function resolveSourceReleaseToken(
+export function resolveSourceReleaseEndpoint(
   repo: SourceRepository,
   root: string,
+  ci: CiForgeContext | null,
   env: Record<string, string | undefined> = process.env,
-): SourceReleaseCredential | null {
-  for (const envName of sourceReleaseTokenEnvNames(repo, root, env)) {
+): SourceReleaseEndpoint | null {
+  for (const { envName, repositoryApi } of sourceReleaseCandidates(repo, root, ci)) {
     const token = env[envName];
     if (token) {
-      return { envName, token };
+      return { repositoryApi, envName, token };
     }
   }
   return null;
 }
 
-const GITHUB_HOST = /^(?:www\.)?github\.com$/i;
-
 /**
- * Whether the ambient CI credential belongs to the forge that hosts the source
- * repository. Accepted evidence, narrowest first:
- *
- * - `GITHUB_SERVER_URL` host equals the source host: same forge, said plainly.
- * - The ambient forge is not GitHub and `GITHUB_REPOSITORY` names exactly the
- *   repository being called. A Forgejo instance mints GITHUB_TOKEN for one
- *   repository and hands the runner an internal address for itself, so the
- *   repository identity is the only stable link back to the public URL. The
- *   worst case this admits is a foreign self-hosted instance running a
- *   same-named repository and leaking its OWN token to us, where we reject it;
- *   it never spends a credential of ours on a stranger's host.
- * - No `GITHUB_SERVER_URL` at all, for a github.com source only: an operator
- *   shell's GH_TOKEN is conventionally GitHub's (gh CLI), and that same
- *   convention is why it must never reach another forge.
- *
- * A GitHub-issued ambient token is never accepted for a non-GitHub source,
- * repository name match or not: a mirror of the same owner/repo on GitHub is
- * exactly how a GitHub credential would otherwise be posted to a third party.
+ * Whether the CI context is this repository's own forge: same forge family as
+ * the configured source and the same `owner/repo`. The repository match is
+ * what makes the ambient credential the right one to use; the addressing
+ * guarantee comes from taking the API base from this same context, never from
+ * comparing an internal address to a public host.
  */
-function ambientForgeIsSource(
-  repo: SourceRepository,
-  sourceHost: string,
-  env: Record<string, string | undefined>,
-): boolean {
-  const serverUrl = env.GITHUB_SERVER_URL;
-  if (!serverUrl) {
-    return sourceHost === 'github.com';
-  }
-  let serverHost: string;
-  try {
-    serverHost = new URL(serverUrl).host;
-  } catch {
-    return false;
-  }
-  if (serverHost === sourceHost) {
-    return true;
-  }
-  if (repo.kind === 'github' || GITHUB_HOST.test(serverHost)) {
-    return false;
-  }
-  return env.GITHUB_REPOSITORY?.toLowerCase() === `${repo.owner}/${repo.repo}`.toLowerCase();
+function ciHostsSource(repo: SourceRepository, ci: CiForgeContext | null): ci is CiForgeContext {
+  return (
+    ci !== null &&
+    ci.forgejo === (repo.kind === 'forgejo') &&
+    ci.repository.toLowerCase() === `${repo.owner}/${repo.repo}`.toLowerCase()
+  );
 }
 
 function declaredRegistryHostsSource(sourceHost: string, root: string): boolean {

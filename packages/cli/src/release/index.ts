@@ -58,6 +58,7 @@ export {
   withPrivateNpmUserconfig,
 } from './private-npm.js';
 
+import { ciApiContext } from '../github-ci/api.js';
 import { readProjectTargets } from '../nx/index.js';
 import {
   type BootstrapNpmPackagesOptions,
@@ -114,12 +115,12 @@ import {
 } from './private-npm.js';
 import { type RetagUnpublishedTagUpdate, retagUnpublished } from './retag-unpublished.js';
 import {
-  forgejoApiUrl,
+  type CiForgeContext,
   forgejoAuthHeaders,
   forgejoReleaseLookupExists,
-  resolveSourceReleaseToken,
+  resolveSourceReleaseEndpoint,
   resolveSourceRepository,
-  type SourceReleaseCredential,
+  type SourceReleaseEndpoint,
   type SourceRepository,
   sourceReleaseTokenEnvNames,
   sourceReleaseUrl,
@@ -1221,12 +1222,12 @@ function releaseRetagShell(root: string, remote: string) {
         await run('gh', ['workflow', 'run', workflow, '--ref', branch, '-f', 'bump=auto', '-f', 'dry_run=false'], root);
         return;
       }
-      const { token } = requireSourceReleaseToken(source, root);
+      const endpoint = requireSourceReleaseEndpoint(source, root);
       const response = await fetch(
-        forgejoApiUrl(source, `/actions/workflows/${encodeURIComponent(workflow)}/dispatches`),
+        `${endpoint.repositoryApi}/actions/workflows/${encodeURIComponent(workflow)}/dispatches`,
         {
           method: 'POST',
-          headers: forgejoAuthHeaders(token),
+          headers: forgejoAuthHeaders(endpoint.token),
           body: JSON.stringify({
             ref: branch,
             inputs: { bump: 'auto', dry_run: 'false' },
@@ -1382,19 +1383,18 @@ async function createGithubRelease(root: string, pkg: ReleasePackage, dryRun: bo
     return null;
   }
   const contents = await renderNxProjectChangelogContents({ root, pkg, previousTag, dryRun });
-  const credential = requireSourceReleaseToken(source, root);
-  console.log(`Forgejo release auth: using ${credential.envName}.`);
-  const token = credential.token;
+  const endpoint = requireSourceReleaseEndpoint(source, root);
+  console.log(`Forgejo release auth: using ${endpoint.envName} against ${new URL(endpoint.repositoryApi).origin}.`);
   const releasePath = `/releases/tags/${encodeURIComponent(currentTag)}`;
-  const lookup = await fetch(forgejoApiUrl(source, releasePath), {
-    headers: forgejoAuthHeaders(token),
+  const lookup = await fetch(`${endpoint.repositoryApi}${releasePath}`, {
+    headers: forgejoAuthHeaders(endpoint.token),
   });
   const lookupBody = await lookup.text();
   const releaseExists = forgejoReleaseLookupExists(lookup.status, lookupBody, currentTag);
   if (!releaseExists) {
-    const response = await fetch(forgejoApiUrl(source, '/releases'), {
+    const response = await fetch(`${endpoint.repositoryApi}/releases`, {
       method: 'POST',
-      headers: forgejoAuthHeaders(token),
+      headers: forgejoAuthHeaders(endpoint.token),
       body: JSON.stringify({
         tag_name: currentTag,
         name: currentTag,
@@ -1421,9 +1421,9 @@ async function createGithubRelease(root: string, pkg: ReleasePackage, dryRun: bo
     if (typeof releaseId !== 'number' || !Number.isSafeInteger(releaseId)) {
       throw new Error(`Unable to inspect source release ${currentTag}: response did not contain a valid release id.`);
     }
-    const response = await fetch(forgejoApiUrl(source, `/releases/${releaseId}`), {
+    const response = await fetch(`${endpoint.repositoryApi}/releases/${releaseId}`, {
       method: 'PATCH',
-      headers: forgejoAuthHeaders(token),
+      headers: forgejoAuthHeaders(endpoint.token),
       body: JSON.stringify({
         name: currentTag,
         body: contents,
@@ -1443,28 +1443,52 @@ async function createGithubRelease(root: string, pkg: ReleasePackage, dryRun: bo
 }
 
 /**
+ * The CI forge's own identity, resolved by its existing owner. ciApiContext
+ * refuses a server/API pair that crosses origins and requires a repository, so
+ * a throw here means there is no usable CI identity: an operator shell (no
+ * repository variable) or a misconfigured runner. Both fall back to the
+ * declared-publisher route, which refuses by name rather than sending an
+ * ambient credential anywhere; a runner that looked like CI and still failed
+ * to resolve says so, because silence there is a 3am mystery.
+ */
+function ciForgeContext(): CiForgeContext | null {
+  try {
+    const { forgejo, apiBase, repository } = ciApiContext();
+    return { forgejo, apiBase, repository };
+  } catch (error) {
+    if (process.env.GITHUB_SERVER_URL || process.env.GITHUB_REPOSITORY || process.env.FORGEJO_SERVER_URL) {
+      console.log(
+        `Source release: no usable CI forge identity (${error instanceof Error ? error.message : String(error)}).`,
+      );
+    }
+    return null;
+  }
+}
+
+/**
  * One owner of the candidate order: source-release.ts decides which variables
- * may authenticate this forge. A second copy here drifted into advertising
+ * may authenticate which endpoint. A second copy here drifted into advertising
  * GitHub variables for a Forgejo source, which is how a foreign forge token
  * reached a Forgejo API call.
  */
 function sourceReleaseAuthLine(repo: SourceRepository, root: string): string {
-  const names = sourceReleaseTokenEnvNames(repo, root);
+  const names = sourceReleaseTokenEnvNames(repo, root, ciForgeContext());
   if (names.length === 0) {
     return 'no credential variable is configured for this source forge';
   }
   return names.map((name) => envPresence(name)).join(', ');
 }
 
-function requireSourceReleaseToken(repo: SourceRepository, root: string): SourceReleaseCredential {
-  const credential = resolveSourceReleaseToken(repo, root);
-  if (credential) {
-    return credential;
+function requireSourceReleaseEndpoint(repo: SourceRepository, root: string): SourceReleaseEndpoint {
+  const ci = ciForgeContext();
+  const endpoint = resolveSourceReleaseEndpoint(repo, root, ci);
+  if (endpoint) {
+    return endpoint;
   }
-  const names = sourceReleaseTokenEnvNames(repo, root);
+  const names = sourceReleaseTokenEnvNames(repo, root, ci);
   throw new Error(
     names.length === 0
-      ? 'Source release authentication is missing: no credential variable is configured for this source forge. Declare the publisher token env for the forge that hosts it, or run where that forge issues GITHUB_TOKEN.'
+      ? 'Source release authentication is missing: no credential is configured for this source forge. Run in CI for this repository, so its own credential authenticates its own API, or declare the publisher token env for the forge that hosts the source.'
       : `Source release authentication is missing; set one of ${names.join(', ')}.`,
   );
 }
@@ -1778,9 +1802,9 @@ async function githubReleaseExists(root: string, tag: string): Promise<boolean> 
     const result = await $`gh release view ${tag} --json tagName`.cwd(root).quiet().nothrow();
     return githubReleaseLookupExists(tag, result.exitCode, decode(result.stdout), decode(result.stderr));
   }
-  const { token } = requireSourceReleaseToken(source, root);
-  const response = await fetch(forgejoApiUrl(source, `/releases/tags/${encodeURIComponent(tag)}`), {
-    headers: forgejoAuthHeaders(token),
+  const endpoint = requireSourceReleaseEndpoint(source, root);
+  const response = await fetch(`${endpoint.repositoryApi}/releases/tags/${encodeURIComponent(tag)}`, {
+    headers: forgejoAuthHeaders(endpoint.token),
   });
   const body = await response.text();
   return forgejoReleaseLookupExists(response.status, body, tag);

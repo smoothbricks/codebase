@@ -7,7 +7,7 @@ import {
   forgejoAuthHeaders,
   forgejoReleaseLookupExists,
   parseSourceRepository,
-  resolveSourceReleaseToken,
+  resolveSourceReleaseEndpoint,
   resolveSourceRepository,
   sourceReleaseTokenEnvNames,
   sourceReleaseUrl,
@@ -116,14 +116,18 @@ describe('source release URLs and Forgejo protocol helpers', () => {
 });
 
 /**
- * A source-release token is a forge credential. Forgejo Actions exports
- * GITHUB_TOKEN/GITHUB_SERVER_URL exactly as GitHub Actions does and developer
- * shells hold GitHub PATs, so "is this token even for this host" is the whole
- * question: an ambient token from another forge produces an unexplainable 401
- * and discloses the credential to a third party.
+ * A source-release token is a forge credential, and the only sound rule is
+ * that it goes back to the origin that issued it. A runner reaches its own
+ * instance through whatever address its network gives it (observed: the
+ * Forgejo GARM runner checks out http://10.89.0.1:3000/<owner>/<repo> while
+ * the repository's public URL is the https host), so no environment signal
+ * proves an internal alias and a public host are the same forge. The endpoint
+ * is therefore taken from the same CI context as the credential, never chosen
+ * by comparing hosts.
  */
-describe('source release token resolution', () => {
+describe('source release endpoint selection', () => {
   const FORGEJO_REPO = { type: 'git', url: 'https://forge.example.test/fixture-owner/fixture-repo.git' };
+  const PUBLIC_REPOSITORY_API = 'https://forge.example.test/api/v1/repos/fixture-owner/fixture-repo';
   const SAME_FORGE_NPMRC =
     '@fixture.test:registry=https://forge.example.test/api/packages/fixture-owner/npm/\n' +
     '//forge.example.test/api/packages/fixture-owner/npm/:_authToken=${DECLARED_PUBLISH_TOKEN}\n';
@@ -136,146 +140,155 @@ describe('source release token resolution', () => {
     repository: FORGEJO_REPO,
     smoo: { privateNpm: { scope: '@fixture.test', publishTokenEnv: 'DECLARED_PUBLISH_TOKEN' } },
   };
+  /** What ciApiContext reports on the observed GARM runner: its own internal address. */
+  const aliasCi = {
+    forgejo: true,
+    apiBase: 'http://10.89.0.1:3000/api/v1',
+    repository: 'fixture-owner/fixture-repo',
+  };
 
-  it('uses GH_TOKEN, then GITHUB_TOKEN, then the declared publisher token env for a GitHub source', async () => {
-    await withRoot({ ...manifest, repository: { type: 'git', url: 'github:owner/repo' } }, (root) => {
-      const github = parseSourceRepository('github:owner/repo');
-      const env = {
-        GITHUB_SERVER_URL: 'https://github.com',
-        GH_TOKEN: 'fixture-gh-token',
-        GITHUB_TOKEN: 'fixture-github-token',
-        DECLARED_PUBLISH_TOKEN: 'fixture-declared-token',
-      };
+  it('sends the instance credential back to the instance that issued it, not to the public host', async () => {
+    await withRoot(manifest, (root) => {
+      const repo = parseSourceRepository(FORGEJO_REPO.url);
 
-      expect(resolveSourceReleaseToken(github, root, env)).toEqual({
-        envName: 'GH_TOKEN',
-        token: 'fixture-gh-token',
+      const endpoint = resolveSourceReleaseEndpoint(repo, root, aliasCi, {
+        FORGEJO_TOKEN: undefined,
+        GITHUB_TOKEN: 'instance-issued-token',
       });
-      expect(resolveSourceReleaseToken(github, root, { ...env, GH_TOKEN: undefined })).toEqual({
+
+      expect(endpoint).toEqual({
+        repositoryApi: 'http://10.89.0.1:3000/api/v1/repos/fixture-owner/fixture-repo',
         envName: 'GITHUB_TOKEN',
-        token: 'fixture-github-token',
+        token: 'instance-issued-token',
       });
-      // The declared publisher variable belongs to the Forgejo registry host,
-      // not to github.com, so it is not a candidate for a GitHub source.
-      expect(resolveSourceReleaseToken(github, root, { DECLARED_PUBLISH_TOKEN: 'fixture-declared-token' })).toBeNull();
+      // The public host never receives the ambient credential.
+      expect(endpoint?.repositoryApi).not.toContain('forge.example.test');
+      expect(sourceReleaseTokenEnvNames(repo, root, aliasCi)).toEqual(['FORGEJO_TOKEN', 'GH_TOKEN', 'GITHUB_TOKEN']);
     });
   });
 
-  it('accepts the ambient CI token when the ambient forge is the source forge', async () => {
+  it('prefers FORGEJO_TOKEN over the GitHub-named aliases, as the CI API path does', async () => {
     await withRoot(manifest, (root) => {
       const repo = parseSourceRepository(FORGEJO_REPO.url);
 
       expect(
-        resolveSourceReleaseToken(repo, root, {
-          GITHUB_SERVER_URL: 'https://forge.example.test',
-          GITHUB_TOKEN: 'fixture-forgejo-actions-token',
-        }),
-      ).toEqual({ envName: 'GITHUB_TOKEN', token: 'fixture-forgejo-actions-token' });
+        resolveSourceReleaseEndpoint(repo, root, aliasCi, {
+          FORGEJO_TOKEN: 'forgejo-token',
+          GH_TOKEN: 'gh-token',
+          GITHUB_TOKEN: 'github-token',
+        })?.envName,
+      ).toBe('FORGEJO_TOKEN');
     });
   });
 
-  it('accepts the instance token when the runner reaches its own forge through an internal address', async () => {
+  it('refuses to spend an ambient credential on the source host when CI is for another repository', async () => {
     await withRoot(manifest, (root) => {
       const repo = parseSourceRepository(FORGEJO_REPO.url);
+      const foreignCi = { ...aliasCi, repository: 'other-owner/other-repo' };
 
-      // Observed on the Forgejo GARM runner: the job checks out
-      // http://10.89.0.1:3000/<owner>/<repo> and GITHUB_SERVER_URL is that
-      // container-network address, while the repository's public URL is the
-      // https host. Refusing this token would break the version/tag/status
-      // steps, which run before any publisher secret exists.
+      // A same-named repository on a foreign instance cannot redirect our
+      // credential, and a foreign instance's credential is not offered to our
+      // source host either: no ambient variable is even a candidate.
+      expect(sourceReleaseTokenEnvNames(repo, root, foreignCi)).toEqual([]);
       expect(
-        resolveSourceReleaseToken(repo, root, {
-          GITHUB_SERVER_URL: 'http://10.89.0.1:3000',
-          GITHUB_REPOSITORY: 'fixture-owner/fixture-repo',
-          GITHUB_TOKEN: 'instance-issued-token',
-        }),
-      ).toEqual({ envName: 'GITHUB_TOKEN', token: 'instance-issued-token' });
-
-      // Same instance address, a different repository: that token was minted
-      // for something else.
-      expect(
-        resolveSourceReleaseToken(repo, root, {
-          GITHUB_SERVER_URL: 'http://10.89.0.1:3000',
-          GITHUB_REPOSITORY: 'other-owner/other-repo',
-          GITHUB_TOKEN: 'instance-issued-token',
-        }),
-      ).toBeNull();
-
-      // No repository context to link the alias back to the source at all.
-      expect(
-        resolveSourceReleaseToken(repo, root, {
-          GITHUB_SERVER_URL: 'http://10.89.0.1:3000',
-          GITHUB_TOKEN: 'instance-issued-token',
-        }),
+        resolveSourceReleaseEndpoint(repo, root, foreignCi, { GITHUB_TOKEN: 'foreign-instance-token' }),
       ).toBeNull();
     });
   });
 
-  it('refuses a GitHub-issued token for a Forgejo source even when the repository name matches', async () => {
-    await withRoot(manifest, (root) => {
-      const repo = parseSourceRepository(FORGEJO_REPO.url);
-
-      // A same-named GitHub mirror is exactly how a GitHub credential would
-      // otherwise be posted to a third-party forge, so repository identity
-      // must not override the public-forge exclusion.
-      expect(
-        resolveSourceReleaseToken(repo, root, {
-          GITHUB_SERVER_URL: 'https://github.com',
-          GITHUB_REPOSITORY: 'fixture-owner/fixture-repo',
-          GITHUB_TOKEN: 'github-issued-token',
-        }),
-      ).toBeNull();
-    });
-  });
-
-  it('never sends another forge ambient token to the source forge', async () => {
+  it('falls back to the declared publisher credential in CI, against the host it was declared for', async () => {
     await withRoot(
       manifest,
       (root) => {
         const repo = parseSourceRepository(FORGEJO_REPO.url);
 
-        // Running on GitHub Actions against a Forgejo source.
-        expect(
-          resolveSourceReleaseToken(repo, root, {
-            GITHUB_SERVER_URL: 'https://github.com',
-            GH_TOKEN: 'github-issued-token',
-            GITHUB_TOKEN: 'github-issued-token',
-          }),
-        ).toBeNull();
-        // A developer shell: GH_TOKEN there is a GitHub PAT, not a Forgejo token.
-        expect(resolveSourceReleaseToken(repo, root, { GH_TOKEN: 'developer-github-pat' })).toBeNull();
-        expect(sourceReleaseTokenEnvNames(repo, root, { GH_TOKEN: 'developer-github-pat' })).not.toContain('GH_TOKEN');
+        // A runner whose forge issued no token still releases; the declared
+        // credential belongs to the public host, so it goes there and never to
+        // the runner's internal address.
+        expect(resolveSourceReleaseEndpoint(repo, root, aliasCi, { DECLARED_PUBLISH_TOKEN: 'declared-token' })).toEqual(
+          {
+            repositoryApi: PUBLIC_REPOSITORY_API,
+            envName: 'DECLARED_PUBLISH_TOKEN',
+            token: 'declared-token',
+          },
+        );
+        expect(sourceReleaseTokenEnvNames(repo, root, aliasCi)).toEqual([
+          'FORGEJO_TOKEN',
+          'GH_TOKEN',
+          'GITHUB_TOKEN',
+          'DECLARED_PUBLISH_TOKEN',
+        ]);
       },
       SAME_FORGE_NPMRC,
     );
   });
 
-  it('uses the declared publisher token when it belongs to the source forge', async () => {
+  it('refuses an ambient credential from a different forge family', async () => {
+    await withRoot(manifest, (root) => {
+      const repo = parseSourceRepository(FORGEJO_REPO.url);
+      const githubCi = { forgejo: false, apiBase: 'https://api.github.com', repository: 'fixture-owner/fixture-repo' };
+
+      // GitHub Actions running against a Forgejo source: the repository name
+      // matches a mirror, which is exactly how a GitHub credential would
+      // otherwise be posted to a third-party forge.
+      expect(resolveSourceReleaseEndpoint(repo, root, githubCi, { GITHUB_TOKEN: 'github-issued-token' })).toBeNull();
+    });
+  });
+
+  it('offers no ambient credential outside CI, whatever the shell holds', async () => {
+    await withRoot(manifest, (root) => {
+      const repo = parseSourceRepository(FORGEJO_REPO.url);
+
+      // GH_TOKEN in an operator shell is conventionally a GitHub PAT.
+      expect(sourceReleaseTokenEnvNames(repo, root, null, { GH_TOKEN: 'developer-github-pat' })).toEqual([]);
+      expect(
+        resolveSourceReleaseEndpoint(repo, root, null, {
+          GH_TOKEN: 'developer-github-pat',
+          GITHUB_TOKEN: 'developer-github-pat',
+        }),
+      ).toBeNull();
+    });
+  });
+
+  it('uses the declared publisher credential against the public host when it belongs to that forge', async () => {
     await withRoot(
       manifest,
       (root) => {
         const repo = parseSourceRepository(FORGEJO_REPO.url);
 
-        expect(resolveSourceReleaseToken(repo, root, { DECLARED_PUBLISH_TOKEN: 'fixture-declared-token' })).toEqual({
+        expect(resolveSourceReleaseEndpoint(repo, root, null, { DECLARED_PUBLISH_TOKEN: 'declared-token' })).toEqual({
+          repositoryApi: PUBLIC_REPOSITORY_API,
           envName: 'DECLARED_PUBLISH_TOKEN',
-          token: 'fixture-declared-token',
+          token: 'declared-token',
         });
       },
       SAME_FORGE_NPMRC,
     );
   });
 
-  it('refuses a declared publisher token issued by a different host than the source forge', async () => {
+  it('refuses a declared publisher credential issued by a different host than the source forge', async () => {
     await withRoot(
       manifest,
       (root) => {
         const repo = parseSourceRepository(FORGEJO_REPO.url);
 
-        expect(sourceReleaseTokenEnvNames(repo, root, {})).toEqual([]);
-        expect(resolveSourceReleaseToken(repo, root, { DECLARED_PUBLISH_TOKEN: 'other-forge-token' })).toBeNull();
+        expect(sourceReleaseTokenEnvNames(repo, root, null, {})).toEqual([]);
+        expect(
+          resolveSourceReleaseEndpoint(repo, root, null, { DECLARED_PUBLISH_TOKEN: 'other-forge-token' }),
+        ).toBeNull();
       },
       OTHER_FORGE_NPMRC,
     );
+  });
+
+  it('has no endpoint for a GitHub source, which releases through the gh CLI', async () => {
+    await withRoot({ ...manifest, repository: { type: 'git', url: 'github:owner/repo' } }, (root) => {
+      const github = parseSourceRepository('github:owner/repo');
+
+      expect(
+        resolveSourceReleaseEndpoint(github, root, null, { GH_TOKEN: 'gh', DECLARED_PUBLISH_TOKEN: 'declared' }),
+      ).toBeNull();
+    });
   });
 });
 
