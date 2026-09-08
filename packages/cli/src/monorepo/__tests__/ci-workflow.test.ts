@@ -219,6 +219,51 @@ describe('CI workflow definition', () => {
     }
   });
 
+  it('mirrors the runner proxy into git config so Cargo git fetches take the same route', () => {
+    const directory = mkdtempSync(join(tmpdir(), 'cargo-gitcfg-'));
+    try {
+      const scriptOf = (): string => {
+        const lines = cargoCredentialStepLines(
+          { kind: CiWorkflowStepKind.CargoCredentials, name: 'Credentials', number: 3 },
+          { gitOrigins: [{ origin: 'https://git.example.net', tokenEnv: 'SOURCE_READ_TOKEN' }] },
+        );
+        return lines
+          .slice(lines.indexOf('        run: |') + 1)
+          .map((line) => line.slice(10))
+          .join('\n');
+      };
+      const script = scriptOf();
+      const baseEnv = {
+        PATH: process.env.PATH ?? '/usr/bin:/bin',
+        RUNNER_TEMP: directory,
+        SOURCE_READ_TOKEN: 'fixture-secret',
+      };
+      const runScript = (env: Record<string, string>, tag: string): { status: number | null; githubEnv: string } => {
+        const githubEnv = join(directory, `env-${tag}`);
+        writeFileSync(githubEnv, '');
+        const result = spawnSync('sh', ['-eu', '-c', script], {
+          env: { ...baseEnv, GITHUB_ENV: githubEnv, ...env },
+          encoding: 'utf8',
+        });
+        return { status: result.status, githubEnv: readFileSync(githubEnv, 'utf8') };
+      };
+      // Proxied runner: both schemes land in git config after the helper entries.
+      const proxied = runScript({ HTTPS_PROXY: 'http://proxy.example.net:8080' }, 'proxied');
+      expect(proxied.status).toBe(0);
+      expect(proxied.githubEnv).toContain('GIT_CONFIG_KEY_2=https.proxy');
+      expect(proxied.githubEnv).toContain('GIT_CONFIG_VALUE_2=http://proxy.example.net:8080');
+      expect(proxied.githubEnv).toContain('GIT_CONFIG_KEY_3=http.proxy');
+      expect(proxied.githubEnv).toContain('GIT_CONFIG_COUNT=4');
+      // Direct network: no proxy entries, count covers only the helper.
+      const direct = runScript({}, 'direct');
+      expect(direct.status).toBe(0);
+      expect(direct.githubEnv).toContain('GIT_CONFIG_COUNT=2');
+      expect(direct.githubEnv).not.toContain('proxy');
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
   it('refuses missing registry secrets before setup and skips private Cargo jobs for fork PRs', () => {
     const definition = options({ cargoCredentials: { registryTokenEnvs: ['CARGO_REGISTRIES_EXAMPLE_TOKEN'] } });
     const steps = defineCiWorkflow(definition);

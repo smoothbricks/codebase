@@ -483,8 +483,11 @@ export function cargoCredentialJobEnvLines(config: PackageCargoCredentialsConfig
  * The credential-transport step preflights every declared token, then writes a
  * host-gated helper script into `$RUNNER_TEMP` for git origins and points the
  * per-process `GIT_CONFIG_*` environment at it through GITHUB_ENV, plus
- * `CARGO_NET_GIT_FETCH_WITH_CLI` so Cargo shells out to git.
- * The helper reads the environment at call time and answers only for declared origins.
+ * `CARGO_NET_GIT_FETCH_WITH_CLI` so Cargo shells out to git. Runners whose
+ * egress requires a proxy export it as `HTTP(S)_PROXY`, which cargo honors
+ * natively but git never reads, so the step mirrors it into git config or
+ * Cargo git fetches bypass the proxy and fail to connect. The helper reads
+ * the environment at call time and answers only for declared origins.
  * Mechanism errors surface at managed-file render time, never inside CI.
  */
 export function cargoCredentialStepLines(step: CiWorkflowStep, config: PackageCargoCredentialsConfig): string[] {
@@ -536,13 +539,30 @@ export function cargoCredentialStepLines(step: CiWorkflowStep, config: PackageCa
   lines.push('          chmod 700 "$helper"');
   lines.push('          {');
   lines.push('            echo "CARGO_NET_GIT_FETCH_WITH_CLI=true"');
-  lines.push('            echo "GIT_CONFIG_COUNT=2"');
   lines.push('            # An empty value clears any ambient credential helper (osxkeychain,');
   lines.push('            # store) so a successful fetch cannot persist the token anywhere.');
   lines.push('            echo "GIT_CONFIG_KEY_0=credential.helper"');
   lines.push('            echo "GIT_CONFIG_VALUE_0="');
   lines.push('            echo "GIT_CONFIG_KEY_1=credential.helper"');
   lines.push('            echo "GIT_CONFIG_VALUE_1=$helper"');
+  lines.push('            # Cargo honors proxy env natively; git does not read it. Mirror the');
+  lines.push('            # runner proxy into git config so Cargo git fetches take the same');
+  lines.push('            # route instead of failing to connect. Absent on direct networks,');
+  lines.push('            # so this block is a no-op there.');
+  lines.push('            idx=2');
+  lines.push('            https_proxy_value="${HTTPS_PROXY:-${https_proxy:-}}"');
+  lines.push('            http_proxy_value="${HTTP_PROXY:-${http_proxy:-${https_proxy_value:-}}}"');
+  lines.push('            if [ -n "$https_proxy_value" ]; then');
+  lines.push('              echo "GIT_CONFIG_KEY_${idx}=https.proxy"');
+  lines.push('              echo "GIT_CONFIG_VALUE_${idx}=${https_proxy_value}"');
+  lines.push('              idx=$((idx + 1))');
+  lines.push('            fi');
+  lines.push('            if [ -n "$http_proxy_value" ]; then');
+  lines.push('              echo "GIT_CONFIG_KEY_${idx}=http.proxy"');
+  lines.push('              echo "GIT_CONFIG_VALUE_${idx}=${http_proxy_value}"');
+  lines.push('              idx=$((idx + 1))');
+  lines.push('            fi');
+  lines.push('            echo "GIT_CONFIG_COUNT=${idx}"');
   lines.push('          } >> "$GITHUB_ENV"');
   return lines;
 }
