@@ -17,6 +17,8 @@ cowshed-gateway = { path = "../cowshed-gateway" }
 clap.workspace = true
 
 libc = "0.2"
+url = "2"
+zeroize = "1"
 sha2 = "0.10"
 serde.workspace = true
 serde_json.workspace = true

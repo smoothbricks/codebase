@@ -27,6 +27,7 @@ use cowshed_core::metadata::{
     DetachedWorkspaceMetadata, ImageCapacity, ImageFormat, SlotId, WorkspaceIncarnation,
     WorkspaceName, WorkspaceRole,
 };
+use cowshed_core::metadata::{EgressMode, EgressRule};
 use cowshed_core::repository::RepoId;
 use cowshed_core::runtime::ProjectRuntime;
 use cowshed_core::storage::apfs::native::MacOsApfsExecutionHost;
@@ -169,6 +170,7 @@ fn runtime_open_mode(command: &Command) -> RuntimeOpenMode {
         | Command::Mount(_)
         | Command::Setup(_)
         | Command::Gateway(_)
+        | Command::Credential(_)
         | Command::Sccache(_)
         | Command::Skill(_)
         | Command::Version
@@ -957,9 +959,22 @@ where
             }
         }
         Command::Grant(args) => {
-            let changed = !args.read.is_empty() || !args.write.is_empty();
+            let changed =
+                !args.read.is_empty() || !args.write.is_empty() || !args.egress.is_empty();
             let requested: Vec<PathBuf> =
                 args.read.iter().chain(args.write.iter()).cloned().collect();
+            // A host is admitted for the ports an intercept grant defaults to; the mode and the
+            // per-port narrowing belong to trusted policy, not to a flag on this verb.
+            let egress: Vec<EgressRule> = args
+                .egress
+                .iter()
+                .map(|host| EgressRule {
+                    host: host.clone(),
+                    ports: Vec::new(),
+                    mode: EgressMode::default(),
+                    impersonate: None,
+                })
+                .collect();
             let grants = if changed {
                 service
                     .grant(
@@ -967,6 +982,7 @@ where
                         GrantDelta {
                             read: args.read,
                             write: args.write,
+                            egress,
                             ..GrantDelta::default()
                         },
                     )
@@ -1277,6 +1293,9 @@ where
         }
         Command::Gateway(_) => Err(CowshedError::internal(
             "gateway commands must be dispatched by the host service entrypoint",
+        )),
+        Command::Credential(_) => Err(CowshedError::internal(
+            "credential commands must be dispatched by the host service entrypoint",
         )),
         Command::Setup(_) => Err(CowshedError::internal(
             "setup must be dispatched by the host service entrypoint",
