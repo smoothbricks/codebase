@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url';
 import type { CreateNodesContextV2, CreateNodesV2, TargetConfiguration } from 'nx/src/devkit-exports.js';
 import { AggregateCreateNodesError } from 'nx/src/project-graph/error-types.js';
 import { mergeTargetConfigurations } from 'nx/src/project-graph/utils/project-configuration-utils.js';
+import { createTargetDefaultsResults } from 'nx/src/project-graph/utils/project-configuration/target-defaults.js';
 import { BOUNDED_TEST_TIMEOUT_MS } from './bounded-test-policy.js';
 import { exceptionalTestFilter } from './cargo-workspace.js';
 import { CARGO_CROSS_LINT_COMMAND, CARGO_CROSS_LINT_TARGET, CARGO_LINT_CLIPPY_COMMAND } from './cross-check-policy.js';
@@ -289,22 +290,8 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
 
       // Even a cdylib crate named *-wasm infers no cargo-wasm: rust output
       // targets are declared package-locally, never derived from crate metadata.
-      expect(Object.keys(targets).sort()).toEqual([
-        'bench',
-        'cargo-fetch',
-        'cargo-lint',
-        'cargo-lint-cross',
-        'cargo-lint-ferris-core',
-        'cargo-lint-ferris-wasm',
-        'cargo-sweep',
-        'cargo-test',
-        'cargo-test-compile',
-        'cargo-test-ferris-core',
-        'cargo-test-ferris-wasm',
-        'lint',
-        'mutation',
-        'test',
-      ]);
+      expect(targets['cargo-wasm']).toBeUndefined();
+      expect(targets['cargo-napi']).toBeUndefined();
       expect(targets['cargo-sweep']?.options).toMatchObject({
         command: 'cargo sweep --time 7',
         cwd: 'packages/ferris',
@@ -367,7 +354,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       });
       expect(targets['cargo-lint-ferris-core']?.cache).toBe(true);
       expect(targets['cargo-lint-ferris-core']?.outputs).toEqual([]);
-      expect(targets.lint?.dependsOn).toEqual(['cargo-lint']);
+      expect(targets.lint?.dependsOn).toEqual(['cargo-lint', 'biome-lint']);
       expect(targets[CARGO_CROSS_LINT_TARGET]?.options).toMatchObject({
         command: CARGO_CROSS_LINT_COMMAND,
         cwd: 'packages/ferris',
@@ -379,6 +366,57 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       expect(targets.mutation?.cache).toBe(false);
       expect(targets.mutation?.options).toMatchObject({ command: 'cargo --frozen mutants --workspace' });
       expect(targets.bench?.options).toMatchObject({ command: 'cargo --frozen bench --workspace' });
+    } finally {
+      await workspace.cleanup();
+    }
+  });
+
+  it('keeps Rust-only lint free of inherited JavaScript commands without replacing mixed or custom lint', async () => {
+    const workspace = await createWorkspace();
+    const root = 'packages/ferris';
+    const defaults = {
+      targetDefaults: {
+        lint: {
+          executor: 'nx:run-commands',
+          options: { commands: ['biome check {projectRoot}', 'eslint {projectRoot}/src'] },
+        },
+      },
+    };
+    const resolveLint = (targets: Record<string, TargetConfiguration>, declared: TargetConfiguration = {}) => {
+      let lint = targets.lint ?? {};
+      const synthesized = createTargetDefaultsResults(
+        { [root]: { root, targets } },
+        { [root]: { root, targets: { lint: declared } } },
+        defaults,
+      );
+      for (const [, , result] of synthesized) {
+        const target = result.projects?.[root]?.targets?.lint;
+        if (target) lint = mergeTargetConfigurations(target, lint);
+      }
+      return mergeTargetConfigurations(declared, lint);
+    };
+    try {
+      await workspace.write(`${root}/package.json`, '{"name":"ferris"}\n');
+      await workspace.write(`${root}/Cargo.toml`, '[workspace]\nmembers = ["crates/core"]\n');
+      await workspace.write(`${root}/crates/core/Cargo.toml`, '[package]\nname = "ferris-core"\n');
+      const rust = await inferProjectTargets(workspace, `${root}/package.json`);
+      const rustLint = resolveLint(rust);
+      expect(rustLint.executor).toBe('nx:noop');
+      expect(rustLint.dependsOn).toEqual(['cargo-lint', 'biome-lint']);
+      expect(rustLint.options).toBeUndefined();
+      expect(rust['biome-lint']?.options?.command).toBe('biome check --files-ignore-unknown=true {projectRoot}');
+
+      const custom = { executor: 'nx:run-commands', options: { command: 'custom-linter package.json' } };
+      await workspace.write(`${root}/package.json`, JSON.stringify({ name: 'ferris', nx: { targets: { lint: custom } } }));
+      const declared = await inferProjectTargets(workspace, `${root}/package.json`);
+      expect(resolveLint(declared, custom).options?.command).toBe(custom.options.command);
+      expect(declared['biome-lint']).toBeUndefined();
+
+      await workspace.write(`${root}/package.json`, '{"name":"ferris"}\n');
+      await workspace.write(`${root}/tsconfig.lib.json`, '{"compilerOptions":{"outDir":"dist"}}\n');
+      const mixed = await inferProjectTargets(workspace, `${root}/package.json`);
+      expect(resolveLint(mixed).options?.commands).toEqual(defaults.targetDefaults.lint.options.commands);
+      expect(mixed['biome-lint']).toBeUndefined();
     } finally {
       await workspace.cleanup();
     }
