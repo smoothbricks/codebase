@@ -150,28 +150,24 @@ async function streamBytes(stream: ReadableStream<Uint8Array>): Promise<Uint8Arr
 }
 
 export async function runFixtureNx(root: string, args: string[]): Promise<void> {
-  // A fixture is a throwaway one-project workspace, so its Nx state MUST live
-  // inside it. Host CI runners export NX_CACHE_DIRECTORY and
-  // NX_WORKSPACE_DATA_DIRECTORY to a shared per-lane tree, and inheriting those
-  // absolute paths made this fixture overwrite the REAL workspace's project
-  // graph mid-run: a concurrent `nx run-many -t test` then failed with
-  // "Could not find project <name>" for projects the fixture had never heard of,
-  // and Nx aborted the whole run. Reproduced locally by exporting those two
-  // variables and running this file: the outer directory ends up holding this
-  // fixture's 612-byte file-map, byte-identical to the runner's.
+  // Nested Nx must own both its workspace root and its graph/cache paths.
+  // Inheriting the outer task's locations can select or overwrite another workspace.
   const result = await $`nx ${args}`
     .cwd(root)
     .env({
       ...definedProcessEnv(),
       NX_DAEMON: 'false',
+      NX_WORKSPACE_ROOT_PATH: root,
       NX_CACHE_DIRECTORY: join(root, '.nx', 'cache'),
       NX_WORKSPACE_DATA_DIRECTORY: join(root, '.nx', 'workspace-data'),
     })
     .quiet()
     .nothrow();
   if (result.exitCode !== 0) {
-    printCommandOutput(decode(result.stdout), decode(result.stderr));
-    throw new Error(`nx ${args.join(' ')} failed with exit code ${result.exitCode}`);
+    const stdout = decode(result.stdout);
+    const stderr = decode(result.stderr);
+    printCommandOutput(stdout, stderr);
+    throw new Error(`nx ${args.join(' ')} failed with exit code ${result.exitCode}\n${stdout}\n${stderr}`);
   }
 }
 

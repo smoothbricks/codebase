@@ -131,6 +131,12 @@ describe('release planning with fixture git repositories', () => {
       const shared = await mkdtemp(join(tmpdir(), 'nx-shared-'));
       const sharedData = join(shared, 'workspace-data');
       const sharedCache = join(shared, 'cache');
+      const inherited = {
+        NX_WORKSPACE_ROOT_PATH: process.env.NX_WORKSPACE_ROOT_PATH,
+        NX_WORKSPACE_DATA_DIRECTORY: process.env.NX_WORKSPACE_DATA_DIRECTORY,
+        NX_CACHE_DIRECTORY: process.env.NX_CACHE_DIRECTORY,
+      };
+      process.env.NX_WORKSPACE_ROOT_PATH = shared;
       await mkdir(sharedData, { recursive: true });
       await mkdir(sharedCache, { recursive: true });
       process.env.NX_WORKSPACE_DATA_DIRECTORY = sharedData;
@@ -145,8 +151,10 @@ describe('release planning with fixture git repositories', () => {
         expect(await readdir(sharedCache)).toEqual([]);
         expect(await readdir(join(root, '.nx'))).toContain('workspace-data');
       } finally {
-        delete process.env.NX_WORKSPACE_DATA_DIRECTORY;
-        delete process.env.NX_CACHE_DIRECTORY;
+        for (const [key, value] of Object.entries(inherited)) {
+          if (value === undefined) delete process.env[key];
+          else process.env[key] = value;
+        }
         await rm(shared, { recursive: true, force: true });
       }
     });
