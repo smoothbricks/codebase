@@ -139,8 +139,12 @@ permissions:
 ${options.deploy ? '  deployments: write\n' : ''}  statuses: write
 
 concurrency:
+  # One in-flight run per ref. Pushes to the staging push branch queue behind a
+  # running workflow instead of canceling it, so a newer push never cancels a
+  # production deployment mid-flight. Pull requests and other branches keep
+  # canceling superseded runs.
   group: \${{ github.workflow }}-\${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: \${{ github.ref != 'refs/heads/${stagingPushBranch(options)}' }}
 
 defaults:
   run:
@@ -651,34 +655,55 @@ function renderYamlList(values: string[], spaces: number): string {
   const indent = ' '.repeat(spaces);
   return values.map((value) => `${indent}- ${value}`).join('\n');
 }
+/**
+ * Top-level step numbers for the jobs after Validate. Checkout is always 2 (1
+ * is GitHub's automatic "Set up job"); every preflight the main job runs also
+ * runs here before SetupDevenv, so the middle and cleanup anchors shift with
+ * the configuration instead of baking a fixed step number.
+ */
+interface FollowUpStepNumbers {
+  cargo: number | undefined;
+  sources: number | undefined;
+  setup: number;
+  middle: number;
+  cleanup: number;
+}
 
-/** Steps 1–3 of every job after Validate: checkout and devenv setup, so the step anchors match across jobs. */
-const FOLLOW_UP_JOB_SETUP_STEPS = `      # Step 1: GitHub adds "Set up job" automatically
-      # Step 2
-      - name: 📥 Checkout
-        uses: actions/checkout@v6.0.2
-        with:
-          filter: blob:none
-          fetch-depth: 0
+function followUpStepNumbers(options: CiWorkflowDefinitionOptions): FollowUpStepNumbers {
+  let number = 3;
+  const cargo = options.cargoCredentials !== undefined ? number++ : undefined;
+  const sources = options.sourceCheckouts?.length ? number++ : undefined;
+  const setup = number++;
+  const middle = number++;
+  const cleanup = number++;
+  return { cargo, sources, setup, middle, cleanup };
+}
 
-      # Step 3. Composite action internals do not affect top-level job step anchors.
-      - name: 🧱 Setup Nix/devenv
-        id: setup
-        uses: ./.github/actions/setup-devenv
-`;
+/** Checkout plus every preflight the main job runs, numbered so later anchors track the configuration. */
+function followUpSetupSteps(options: CiWorkflowDefinitionOptions, numbers: FollowUpStepNumbers): CiWorkflowStep[] {
+  const steps: CiWorkflowStep[] = [{ kind: CiWorkflowStepKind.Checkout, name: '📥 Checkout', number: 2 }];
+  if (numbers.cargo !== undefined && options.cargoCredentials !== undefined) {
+    steps.push({ kind: CiWorkflowStepKind.CargoCredentials, name: 'Prepare Cargo credentials', number: numbers.cargo });
+  }
+  if (numbers.sources !== undefined) {
+    steps.push({
+      kind: CiWorkflowStepKind.SourceCheckouts,
+      name: '📦 Check out sibling sources',
+      number: numbers.sources,
+    });
+  }
+  steps.push({ kind: CiWorkflowStepKind.SetupDevenv, name: '🧱 Setup Nix/devenv', number: numbers.setup });
+  return steps;
+}
 
-/** The last step of every job after Validate; bakes "# Step 5", so those jobs have exactly one middle step (4). */
-const FOLLOW_UP_JOB_CLEANUP_STEP = `      # Step 5
-      - name: 🧹 Cleanup and cache Nix/devenv
-        if: always()
-        uses: ./.github/actions/save-nix-devenv
-        with:
-          nix-cache-hit: \${{ steps.setup.outputs.nix-cache-hit }}
-          devenv-cache-hit: \${{ steps.setup.outputs.devenv-cache-hit }}
-`;
+/** The final cache-save step, at its configured anchor. */
+function followUpCleanupStep(numbers: FollowUpStepNumbers): CiWorkflowStep[] {
+  return [{ kind: CiWorkflowStepKind.SaveNixDevenv, name: '🧹 Cleanup and cache Nix/devenv', number: numbers.cleanup }];
+}
 
 function renderE2eDeploymentJob(options: CiWorkflowDefinitionOptions): string {
   if (!options.e2eDeployment) return '';
+  const numbers = followUpStepNumbers(options);
   return `
   e2e-deployment:
     name: E2E Tests (Deployed Stage)
@@ -688,14 +713,14 @@ ${renderRunsOnLine(options.runsOn)}
 ${environmentLine(options.environments?.staging)}    if: \${{ needs.main.result == 'success' && needs.main.outputs.deployment-stage != '' }}
     env:
       GH_TOKEN: \${{ github.token }}
-${privateNpmReadTokenJobEnv(options)}    steps:
-${FOLLOW_UP_JOB_SETUP_STEPS}
-      # Step 4
+${cargoCredentialJobEnvLines(options.cargoCredentials)}${privateNpmReadTokenJobEnv(options)}    steps:
+${renderCiWorkflowSteps(followUpSetupSteps(options, numbers), options)}
+      # Step ${numbers.middle}
       - name: E2E Tests (Deployed Stage)
 ${renderOptionalLines(secretEnvLines(options.e2eSecrets ?? {}))}        # prettier-ignore
-        run: smoo github-ci nx-smart --target e2e-deployment --mode run-many --stage "\${{ needs.main.outputs.deployment-stage }}" --stream-output --name "E2E Tests (Deployed Stage)" --step 4
+        run: smoo github-ci nx-smart --target e2e-deployment --mode run-many --stage "\${{ needs.main.outputs.deployment-stage }}" --stream-output --name "E2E Tests (Deployed Stage)" --step ${numbers.middle}
 
-${FOLLOW_UP_JOB_CLEANUP_STEP}`;
+${renderCiWorkflowSteps(followUpCleanupStep(numbers), options)}`;
 }
 
 /**
@@ -709,6 +734,7 @@ function renderProductionDeployJob(options: CiWorkflowDefinitionOptions): string
   const e2eGate = options.e2eDeployment
     ? " && (needs.e2e-deployment.result == 'success' || needs.e2e-deployment.result == 'skipped')"
     : '';
+  const numbers = followUpStepNumbers(options);
   return `
   deploy-production:
     name: Deploy Production
@@ -718,13 +744,13 @@ ${renderRunsOnLine(options.runsOn)}
     if: \${{ !cancelled() && github.event_name == 'push' && github.ref == 'refs/heads/${stagingPushBranch(options)}' && needs.main.result == 'success'${e2eGate} }}
 ${environmentLine(options.environments?.production)}    env:
       GH_TOKEN: \${{ github.token }}
-${privateNpmReadTokenJobEnv(options)}    steps:
-${FOLLOW_UP_JOB_SETUP_STEPS}
-      # Step 4
+${cargoCredentialJobEnvLines(options.cargoCredentials)}${privateNpmReadTokenJobEnv(options)}    steps:
+${renderCiWorkflowSteps(followUpSetupSteps(options, numbers), options)}
+      # Step ${numbers.middle}
       - name: 🚀 Deploy Production
-${renderOptionalLines(deployEnvLines(options))}        run: smoo github-ci nx-deploy --stage production --mode run-many --select-tag ${PRODUCTION_PUSH_DEPLOY_TAG} --name "Deploy Production" --step 4
+${renderOptionalLines(deployEnvLines(options))}        run: smoo github-ci nx-deploy --stage production --mode run-many --select-tag ${PRODUCTION_PUSH_DEPLOY_TAG} --name "Deploy Production" --step ${numbers.middle}
 
-${FOLLOW_UP_JOB_CLEANUP_STEP}`;
+${renderCiWorkflowSteps(followUpCleanupStep(numbers), options)}`;
 }
 
 export function artifactStepLines(
