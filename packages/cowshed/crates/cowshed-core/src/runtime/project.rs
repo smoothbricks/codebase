@@ -1456,6 +1456,51 @@ fn claim_port_block(staging: &Path, base: u16) -> std::io::Result<Option<PathBuf
 }
 
 #[cfg(target_os = "macos")]
+async fn reserve_port_grants(
+    inventory: &crate::gateway_inventory::NativeGatewayInventory,
+    reservation_root: &Path,
+    mut used: std::collections::BTreeSet<u16>,
+) -> Result<PortGrantReservation> {
+    for base in (crate::metadata::MACOS_PORT_BLOCK_MIN
+        ..=crate::metadata::MACOS_PORT_BLOCK_LAST_BASE)
+        .step_by(usize::from(crate::metadata::PORT_BLOCK_SIZE))
+    {
+        if used.contains(&base) {
+            continue;
+        }
+        let grants = GrantSet::closed_baseline(Some(
+            crate::metadata::PortBlock::new(base, crate::metadata::PORT_BLOCK_SIZE)
+                .map_err(native_integrity_error)?,
+        ))
+        .map_err(native_integrity_error)?;
+        let Some(marker) = claim_port_block(reservation_root, base).map_err(|error| {
+            CowshedError::internal(format!(
+                "claim macOS port block {base} at {}: {error}",
+                reservation_root.display()
+            ))
+        })?
+        else {
+            continue;
+        };
+        let reservation = PortGrantReservation { grants, marker };
+        // A creator can publish and release this marker after our initial inventory read.
+        // Owning it excludes another claimant while we re-read publication; retaining the
+        // guard across this await also releases the marker on error or cancellation.
+        used = inventory
+            .all_reserved_port_bases()
+            .await
+            .map_err(native_integrity_error)?;
+        if !used.contains(&base) {
+            return Ok(reservation);
+        }
+    }
+    Err(CowshedError::conflict(
+        "no macOS workspace port block remains",
+        "remove an unused workspace",
+    ))
+}
+
+#[cfg(target_os = "macos")]
 fn remove_terminal_storage_tree(path: &Path) -> Result<()> {
     let metadata = match std::fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
@@ -3364,37 +3409,12 @@ impl NativeProjectRuntimeHost {
         let storage =
             crate::storage::bootstrap::ValidatedHostStorage::new(self.home.clone(), roots);
         let reservation_root = storage.store().join(".staging");
-        let used = crate::gateway_inventory::NativeGatewayInventory::new(storage)
+        let inventory = crate::gateway_inventory::NativeGatewayInventory::new(storage);
+        let used = inventory
             .all_reserved_port_bases()
             .await
             .map_err(native_integrity_error)?;
-        for base in (crate::metadata::MACOS_PORT_BLOCK_MIN
-            ..=crate::metadata::MACOS_PORT_BLOCK_LAST_BASE)
-            .step_by(usize::from(crate::metadata::PORT_BLOCK_SIZE))
-        {
-            if used.contains(&base) {
-                continue;
-            }
-            let Some(marker) = claim_port_block(&reservation_root, base).map_err(|error| {
-                CowshedError::internal(format!(
-                    "claim macOS port block {base} at {}: {error}",
-                    reservation_root.display()
-                ))
-            })?
-            else {
-                continue;
-            };
-            let grants = GrantSet::closed_baseline(Some(
-                crate::metadata::PortBlock::new(base, crate::metadata::PORT_BLOCK_SIZE)
-                    .map_err(native_integrity_error)?,
-            ))
-            .map_err(native_integrity_error)?;
-            return Ok(PortGrantReservation { grants, marker });
-        }
-        Err(CowshedError::conflict(
-            "no macOS workspace port block remains",
-            "remove an unused workspace",
-        ))
+        reserve_port_grants(&inventory, &reservation_root, used).await
     }
 
     async fn snapshot_named(&self, name: &WorkspaceName) -> Result<WorkspaceSnapshot> {
@@ -11305,7 +11325,16 @@ mod binding_tests {
 
 #[cfg(all(test, target_os = "macos"))]
 mod port_reservation_tests {
-    use super::claim_port_block;
+    use super::{claim_port_block, reserve_port_grants};
+    use crate::gateway_inventory::NativeGatewayInventory;
+    use crate::metadata::{
+        CheckoutLayout, DetachedWorkspaceMetadata, ImageFormat, MACOS_PORT_BLOCK_MIN,
+        PORT_BLOCK_SIZE, Platform, PublicationState, SIDECAR_VERSION, WorkspaceIncarnation,
+        WorkspaceName,
+    };
+    use crate::repository::{BoundIdentity, RepoId, RepositoryBinding};
+    use crate::storage::StorageLayout;
+    use crate::storage::bootstrap::{CanonicalRoots, ValidatedHostStorage};
     use std::os::unix::fs::symlink;
 
     fn root(label: &str) -> std::path::PathBuf {
@@ -11317,6 +11346,114 @@ mod port_reservation_tests {
             "cowshed-port-reservation-{label}-{}-{nonce}",
             std::process::id()
         ))
+    }
+
+    fn inventory(root: &std::path::Path) -> (NativeGatewayInventory, StorageLayout) {
+        let roots = CanonicalRoots::for_test(root.join("store"), root.join("caches"));
+        std::fs::create_dir_all(roots.store()).expect("store");
+        std::fs::create_dir_all(roots.caches()).expect("caches");
+        let repo = RepoId::parse("acme/widget").expect("repo");
+        let layout = StorageLayout::new(roots.store(), &repo).expect("layout");
+        std::fs::create_dir_all(&layout.project().project_root).expect("project");
+        let binding = RepositoryBinding::new(vec![BoundIdentity {
+            repo_id: repo,
+            remote_name: None,
+            remote_url: None,
+            primary: true,
+        }])
+        .expect("binding");
+        crate::metadata::write_json(&layout.project().repository_binding, &binding)
+            .expect("publish binding");
+        layout
+            .record_checkout_layout(CheckoutLayout::Symlink)
+            .expect("checkout layout");
+        let storage = ValidatedHostStorage::new(root.join("home"), roots);
+        (NativeGatewayInventory::new(storage), layout)
+    }
+
+    #[tokio::test]
+    async fn publication_after_snapshot_and_before_claim_cannot_reuse_a_port_block() {
+        let root = root("publication");
+        let (inventory, layout) = inventory(&root);
+        let staging = root.join("store/.staging");
+        let stale = inventory.all_reserved_port_bases().await.expect("snapshot");
+        assert!(stale.is_empty());
+
+        // Pause the second allocator at its snapshot boundary. The first completes the
+        // real claim -> canonical image/metadata publication -> reservation release handoff.
+        let first = reserve_port_grants(&inventory, &staging, stale.clone())
+            .await
+            .expect("first allocation");
+        let first_base = first.grants.port_block.expect("first block").base();
+        assert_eq!(first_base, MACOS_PORT_BLOCK_MIN);
+        let image = layout.main_image(ImageFormat::Sparse).expect("main image");
+        std::fs::write(image.image(), b"detached image fixture").expect("image");
+        DetachedWorkspaceMetadata {
+            version: SIDECAR_VERSION,
+            repo_id: RepoId::parse("acme/widget").expect("repo"),
+            workspace: WorkspaceName::main(),
+            workspace_incarnation: WorkspaceIncarnation::new("0198f2c0b7e34dc795f17b238b331c80")
+                .expect("incarnation"),
+            image_format: ImageFormat::Sparse,
+            platform: Platform::Macos,
+            publication_state: PublicationState::Active,
+            updated_at: "2026-07-14T00:00:00Z".to_owned(),
+            grants: first.grants.clone(),
+            info_snapshot: None,
+        }
+        .write_for_image(image.image())
+        .expect("publish allocation");
+        drop(first);
+        assert_eq!(
+            inventory
+                .all_reserved_port_bases()
+                .await
+                .expect("publication"),
+            std::collections::BTreeSet::from([first_base])
+        );
+
+        // The marker is gone, so live-claim exclusion alone cannot protect this stale read.
+        let second = reserve_port_grants(&inventory, &staging, stale)
+            .await
+            .expect("allocation after publication");
+        let second_base = second.grants.port_block.expect("second block").base();
+        assert_eq!(second_base, first_base + PORT_BLOCK_SIZE);
+        assert!(
+            claim_port_block(&staging, second_base)
+                .expect("competing claim")
+                .is_none()
+        );
+        let rejected = claim_port_block(&staging, first_base)
+            .expect("rejected candidate cleanup")
+            .expect("conflicting marker was released");
+        std::fs::remove_file(rejected).expect("release probe");
+        drop(second);
+        let released = claim_port_block(&staging, second_base)
+            .expect("claim after owner release")
+            .expect("successful owner releases marker");
+        std::fs::remove_file(released).expect("release probe");
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[tokio::test]
+    async fn inventory_error_after_claim_releases_the_port_reservation() {
+        let root = root("inventory-error");
+        let (inventory, layout) = inventory(&root);
+        let staging = root.join("store/.staging");
+        let stale = inventory.all_reserved_port_bases().await.expect("snapshot");
+        std::fs::write(&layout.project().repository_binding, b"{broken")
+            .expect("corrupt publication");
+
+        let error = match reserve_port_grants(&inventory, &staging, stale).await {
+            Ok(_) => panic!("invalid current inventory must refuse allocation"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code.as_str(), "integrity");
+        let marker = claim_port_block(&staging, MACOS_PORT_BLOCK_MIN)
+            .expect("claim after inventory error")
+            .expect("failed allocation must release its marker");
+        std::fs::remove_file(marker).expect("release probe");
+        std::fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[test]
