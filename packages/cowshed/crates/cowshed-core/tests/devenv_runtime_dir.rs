@@ -215,7 +215,7 @@ fn install_real_tool(sandbox: &SandboxConfig, name: &str) {
     let installed = std::env::split_paths(&std::env::var_os("PATH").expect("host PATH"))
         .map(|directory| directory.join(name))
         .find(|candidate| candidate.is_file())
-        .expect("required runtime tool is installed on PATH");
+        .unwrap_or_else(|| panic!("required runtime tool `{name}` is not on PATH"));
     let installed = std::fs::canonicalize(installed).expect("resolve runtime tool");
     std::os::unix::fs::symlink(
         installed,
