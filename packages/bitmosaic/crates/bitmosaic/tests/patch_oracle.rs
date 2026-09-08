@@ -450,20 +450,6 @@ fn history(shape: &Shape, steps: usize, seed: u64, scratch: &mut PatchScratch) {
         let adds = sorted_unique(adds);
         let removes = sorted_unique(removes);
 
-        let expected_added = adds.iter().filter(|v| !oracle.contains(v)).count() as u32;
-        let after_adds: BTreeSet<u32> = oracle
-            .union(&adds.iter().copied().collect())
-            .copied()
-            .collect();
-        let expected_removed = removes.iter().filter(|v| after_adds.contains(v)).count() as u32;
-        let before_adds = oracle.clone();
-        for v in &adds {
-            oracle.insert(*v);
-        }
-        for v in &removes {
-            oracle.remove(v);
-        }
-
         // Every other step the patch is witnessed, so the per-value answer
         // is checked on every path the plain patch takes.
         let mut adds_new = vec![0u64; adds.len().div_ceil(64)];
@@ -475,14 +461,14 @@ fn history(shape: &Shape, steps: usize, seed: u64, scratch: &mut PatchScratch) {
             for (i, v) in adds.iter().enumerate() {
                 assert_eq!(
                     outcome.add_was_new(i),
-                    !before_adds.contains(v),
+                    !oracle.contains(v),
                     "{name}/{step}: add {v} witnessed"
                 );
             }
             for (i, v) in removes.iter().enumerate() {
                 assert_eq!(
                     outcome.remove_was_held(i),
-                    after_adds.contains(v),
+                    oracle.contains(v) || adds.binary_search(v).is_ok(),
                     "{name}/{step}: remove {v} witnessed"
                 );
             }
@@ -491,6 +477,8 @@ fn history(shape: &Shape, steps: usize, seed: u64, scratch: &mut PatchScratch) {
             patch(&mut slot, &adds, &removes, scratch)
                 .unwrap_or_else(|e| panic!("{name}/{step}: {e}"))
         };
+        let expected_added = adds.iter().filter(|v| oracle.insert(**v)).count() as u32;
+        let expected_removed = removes.iter().filter(|v| oracle.remove(v)).count() as u32;
         assert_eq!(report.added, expected_added, "{name}/{step}: added");
         assert_eq!(report.removed, expected_removed, "{name}/{step}: removed");
         assert_eq!(report.len, oracle.len() as u64, "{name}/{step}: len");
