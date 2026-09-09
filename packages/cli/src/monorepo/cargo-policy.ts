@@ -1,4 +1,5 @@
-import { type Dirent, existsSync, readdirSync, readFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { type Dirent, existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import typia from 'typia';
 import { parsePackageJsonText } from '../lib/json.js';
@@ -21,6 +22,11 @@ interface CargoManifest {
     workspace?: string | boolean;
   };
   profile?: Record<string, CargoProfile>;
+  // Only the KEYS matter here: a workspace-hack is wired in by name, and every
+  // dependency spelling — string, table, inherited — carries the same key.
+  dependencies?: Record<string, unknown>;
+  'dev-dependencies'?: Record<string, unknown>;
+  'build-dependencies'?: Record<string, unknown>;
 }
 
 interface CargoConfigTarget {
@@ -42,6 +48,22 @@ interface CargoConfig {
   };
   target?: Record<string, CargoConfigTarget>;
   env?: Record<string, string | CargoConfigEnvObject>;
+  resolver?: {
+    'feature-unification'?: string;
+  };
+  unstable?: {
+    'feature-unification'?: boolean;
+  };
+}
+
+interface RustToolchainFile {
+  toolchain?: {
+    channel?: string;
+  };
+}
+
+interface HakariConfig {
+  'hakari-package'?: string;
 }
 
 interface LoadedManifest {
@@ -62,6 +84,45 @@ interface EffectiveProfile {
 
 const validateCargoManifest = typia.createValidate<CargoManifest>();
 const validateCargoConfig = typia.createValidate<CargoConfig>();
+const validateRustToolchainFile = typia.createValidate<RustToolchainFile>();
+const validateHakariConfig = typia.createValidate<HakariConfig>();
+
+/**
+ * The one command this policy shells out to, behind a seam. `cargo hakari
+ * verify` is the only authority on whether a generated workspace-hack still
+ * unifies what the workspace resolves today; nothing in these files can answer
+ * that. Tests supply their own so the policy stays runnable without the binary.
+ */
+export interface CargoHakariShell {
+  run(directory: string, args: readonly string[]): { code: number; output: string; missing: boolean };
+}
+
+const defaultHakariShell: CargoHakariShell = {
+  run(directory, args) {
+    const result = spawnSync('cargo', ['hakari', ...args], { cwd: directory, encoding: 'utf8' });
+    const output = `${result.stdout ?? ''}${result.stderr ?? ''}`.trim();
+    // cargo itself exists; a missing subcommand is cargo's own error, not ENOENT.
+    const missing =
+      (result.error as NodeJS.ErrnoException | undefined)?.code === 'ENOENT' || output.includes('no such command');
+    return { code: result.status ?? 1, output, missing };
+  },
+};
+
+/** Cargo's nightly-only workspace feature unification, and the config that turns it on. */
+const RESOLVER_UNIFICATION_BLOCK = [
+  '# One feature resolution for the whole workspace. Without it every per-crate',
+  '# cargo invocation resolves features for its own selection, so one shared',
+  '# dependency is compiled once per selection and no warm target directory is',
+  '# reused across crates. Requires the nightly channel the managed devenv',
+  '# module pins; on a stable toolchain a cargo-hakari workspace-hack does the',
+  '# same job. Both keys are needed: cargo ignores [resolver] without the',
+  '# [unstable] opt-in.',
+  '[unstable]',
+  'feature-unification = true',
+  '',
+  '[resolver]',
+  'feature-unification = "workspace"',
+].join('\n');
 
 const SKIPPED_DIRECTORY_NAMES = new Set([
   'node_modules',
@@ -254,6 +315,188 @@ function hasAncestorWorkspace(manifest: LoadedManifest, workspaceRoots: LoadedMa
         return path !== '' && path !== '..' && !path.startsWith(`..${sep}`) && !isAbsolute(path);
       })(),
   );
+}
+
+/**
+ * The channel that will actually compile this repository.
+ *
+ * The managed devenv module wins when it exists: devenv resolves the toolchain
+ * through rust-overlay and ignores `rust-toolchain.toml` unless
+ * `languages.rust.toolchainFile` names it, so a rust-toolchain file beside that
+ * module is decoration. Without the module, rustup's file is the answer. With
+ * neither, stable is the safe verdict: it is the channel on which the nightly
+ * resolver keys silently do nothing.
+ */
+function isNightlyToolchain(repositoryRoot: string, workspaceDirectory: string): boolean {
+  const devenvModule = join(repositoryRoot, 'tooling/direnv/devenv.smoo.nix');
+  if (existsSync(devenvModule)) {
+    const text = readFileSync(devenvModule, 'utf8');
+    const rustIndex = text.indexOf('languages.rust');
+    const channel = rustIndex === -1 ? null : /channel\s*=\s*"([^"]+)"/.exec(text.slice(rustIndex))?.[1];
+    return channel?.startsWith('nightly') === true;
+  }
+  for (const directory of [workspaceDirectory, repositoryRoot]) {
+    const path = join(directory, 'rust-toolchain.toml');
+    if (!existsSync(path)) {
+      continue;
+    }
+    try {
+      const validation = validateRustToolchainFile(Bun.TOML.parse(readFileSync(path, 'utf8')));
+      return validation.success && validation.data.toolchain?.channel?.startsWith('nightly') === true;
+    } catch {
+      return false;
+    }
+  }
+  return false;
+}
+
+/**
+ * Cargo merges `.cargo/config.toml` from the invocation directory upward, with
+ * the deepest file winning. Only the configs at or above the workspace root can
+ * govern a command run there, so the effective value is the deepest of those.
+ */
+function effectiveConfigValue<T>(
+  configs: LoadedConfig[],
+  workspaceDirectory: string,
+  read: (config: CargoConfig) => T | undefined,
+): T | undefined {
+  let deepest: { directory: string; value: T } | null = null;
+  for (const loaded of configs) {
+    const directory = dirname(dirname(loaded.path));
+    if (!pathWithin(directory, workspaceDirectory)) {
+      continue;
+    }
+    const value = read(loaded.config);
+    if (value === undefined) {
+      continue;
+    }
+    if (deepest === null || directory.length > deepest.directory.length) {
+      deepest = { directory, value };
+    }
+  }
+  return deepest?.value;
+}
+
+function workspaceCrates(root: LoadedManifest, manifests: LoadedManifest[]): LoadedManifest[] {
+  const members = manifests.filter((manifest) => workspaceContains(root, manifest));
+  return root.manifest.package === undefined ? members : [root, ...members];
+}
+
+const FEATURE_UNIFICATION_FIX = 'Run: smoo monorepo update';
+
+/**
+ * A workspace of two or more crates must resolve features ONCE for all of them.
+ *
+ * Without that, every per-crate cargo invocation resolves features for its own
+ * selection, and one shared dependency is compiled once per selection: the same
+ * `nx run cargo-test-<crate>` that should reuse a warm target directory rebuilds
+ * its half of the graph instead. Cargo's own mechanism is nightly-only, so a
+ * stable toolchain reaches the identical result through a cargo-hakari
+ * workspace-hack — a generated crate that depends on the union of features, which
+ * every member then depends on.
+ *
+ * One crate needs neither: there is only one selection to unify.
+ */
+function featureUnificationPolicy(
+  repositoryRoot: string,
+  workspaceRoots: LoadedManifest[],
+  manifests: LoadedManifest[],
+  configs: LoadedConfig[],
+  shell: CargoHakariShell,
+): number {
+  let failures = 0;
+  for (const root of workspaceRoots) {
+    const crates = workspaceCrates(root, manifests);
+    if (crates.length < 2) {
+      continue;
+    }
+    const nightly = isNightlyToolchain(repositoryRoot, root.directory);
+    const resolver = effectiveConfigValue(
+      configs,
+      root.directory,
+      (config) => config.resolver?.['feature-unification'],
+    );
+    const unstable = effectiveConfigValue(
+      configs,
+      root.directory,
+      (config) => config.unstable?.['feature-unification'],
+    );
+    if (nightly && resolver === 'workspace') {
+      if (unstable !== true) {
+        failures += report(
+          join(root.directory, '.cargo/config.toml'),
+          'sets [resolver] feature-unification = "workspace" without [unstable] feature-unification = true, ' +
+            `so cargo ignores it and every crate still resolves features on its own. ${FEATURE_UNIFICATION_FIX}`,
+        );
+      }
+      continue;
+    }
+    if (existsSync(join(root.directory, '.config/hakari.toml'))) {
+      failures += hakariWorkspaceHackPolicy(root, crates, shell);
+      continue;
+    }
+    failures += report(
+      root.path,
+      `workspace of ${crates.length} crates has no workspace-wide feature unification: ` +
+        (nightly
+          ? 'add [unstable] feature-unification = true and [resolver] feature-unification = "workspace" to .cargo/config.toml'
+          : 'the [resolver] feature-unification key needs the nightly channel, so this stable toolchain needs a ' +
+            'cargo-hakari workspace-hack (.config/hakari.toml)') +
+        `. Every per-crate cargo invocation otherwise recompiles the shared graph for its own feature selection. ${FEATURE_UNIFICATION_FIX}`,
+    );
+  }
+  return failures;
+}
+
+function hakariWorkspaceHackPolicy(root: LoadedManifest, crates: LoadedManifest[], shell: CargoHakariShell): number {
+  const configPath = join(root.directory, '.config/hakari.toml');
+  let hackName: string | undefined;
+  try {
+    const validation = validateHakariConfig(Bun.TOML.parse(readFileSync(configPath, 'utf8')));
+    hackName = validation.success ? validation.data['hakari-package'] : undefined;
+  } catch {
+    hackName = undefined;
+  }
+  if (hackName === undefined || hackName.length === 0) {
+    return report(configPath, `must declare hakari-package = "<crate>". ${FEATURE_UNIFICATION_FIX}`);
+  }
+  const hack = crates.find((crate) => crate.manifest.package?.name === hackName);
+  if (hack === undefined) {
+    return report(
+      configPath,
+      `names hakari-package "${hackName}", which is not a member of this workspace. ${FEATURE_UNIFICATION_FIX}`,
+    );
+  }
+  const unwired = crates
+    .filter((crate) => crate !== hack)
+    .filter(
+      (crate) =>
+        ![crate.manifest.dependencies, crate.manifest['dev-dependencies'], crate.manifest['build-dependencies']].some(
+          (table) => table !== undefined && hackName in table,
+        ),
+    )
+    .map((crate) => crate.manifest.package?.name ?? crate.path);
+  if (unwired.length > 0) {
+    return report(
+      root.path,
+      `these crates do not depend on the "${hackName}" workspace-hack, so their features are still resolved ` +
+        `separately: ${unwired.join(', ')}. ${FEATURE_UNIFICATION_FIX}`,
+    );
+  }
+  const verify = shell.run(root.directory, ['verify']);
+  if (verify.missing) {
+    return report(
+      configPath,
+      'needs cargo-hakari, which is not installed; the managed devenv module provides it — reload the shell (direnv reload).',
+    );
+  }
+  if (verify.code !== 0) {
+    return report(
+      root.path,
+      `cargo hakari verify rejected the workspace-hack: ${verify.output || 'no output'}. ${FEATURE_UNIFICATION_FIX}`,
+    );
+  }
+  return 0;
 }
 
 function isWorkspaceMember(manifest: LoadedManifest, workspaceRoots: LoadedManifest[]): boolean {
@@ -563,7 +806,12 @@ function reportManifestDirectoryAdvisories(repositoryRoot: string, ignoredDirect
   }
 }
 
-export function validateCargoCachePolicy(root: string): number {
+export interface CargoPolicyOptions {
+  /** Injected in tests; production shells out to the real `cargo hakari`. */
+  shell?: CargoHakariShell;
+}
+
+export function validateCargoCachePolicy(root: string, options: CargoPolicyOptions = {}): number {
   const repositoryRoot = resolve(root);
   const discoveredManifestPaths = discoverFiles(repositoryRoot, (name) => name === 'Cargo.toml');
   const ignoredDirectories = discoverIgnoredSubtrees(discoveredManifestPaths);
@@ -606,10 +854,101 @@ export function validateCargoCachePolicy(root: string): number {
 
   const workspaceRoots = manifests.filter((loaded) => loaded.manifest.workspace !== undefined);
   failures += reportManifestPolicy(manifests, workspaceRoots);
+  failures += featureUnificationPolicy(
+    repositoryRoot,
+    workspaceRoots,
+    manifests,
+    configs,
+    options.shell ?? defaultHakariShell,
+  );
   failures += cargoIncrementalPolicy(repositoryRoot, configs, packageJsonPaths, justfilePaths, ignoredDirectories);
   for (const config of configs) {
     failures += configPolicy(config, repositoryRoot);
   }
   reportManifestDirectoryAdvisories(repositoryRoot, ignoredDirectories);
   return failures;
+}
+
+/**
+ * The fix `smoo monorepo update` applies for the policy above: write the
+ * nightly resolver configuration, or generate and wire the workspace-hack a
+ * stable toolchain needs. Both are idempotent — the second run of either does
+ * nothing — because update runs on every repository, not only broken ones.
+ */
+export function applyCargoFeatureUnification(root: string, options: CargoPolicyOptions = {}): void {
+  const repositoryRoot = resolve(root);
+  const shell = options.shell ?? defaultHakariShell;
+  const discoveredManifestPaths = discoverFiles(repositoryRoot, (name) => name === 'Cargo.toml');
+  const manifestPaths = filterIgnoredPaths(discoveredManifestPaths, discoverIgnoredSubtrees(discoveredManifestPaths));
+  const manifests: LoadedManifest[] = [];
+  for (const path of manifestPaths) {
+    const manifest = loadManifest(path);
+    if (manifest !== null) {
+      manifests.push({ path, directory: dirname(path), manifest });
+    }
+  }
+  for (const root of manifests.filter((loaded) => loaded.manifest.workspace !== undefined)) {
+    if (workspaceCrates(root, manifests).length < 2) {
+      continue;
+    }
+    if (isNightlyToolchain(repositoryRoot, root.directory)) {
+      writeResolverUnification(root.directory);
+      continue;
+    }
+    const hakariConfig = join(root.directory, '.config/hakari.toml');
+    const relativeRoot = relative(repositoryRoot, root.directory) || '.';
+    if (!existsSync(hakariConfig)) {
+      console.log(`generating     cargo workspace-hack in ${relativeRoot} (cargo hakari init workspace-hack)`);
+      runHakari(shell, root.directory, ['init', 'workspace-hack']);
+    }
+    console.log(`unifying       cargo features in ${relativeRoot} (cargo hakari generate, manage-deps)`);
+    runHakari(shell, root.directory, ['generate']);
+    runHakari(shell, root.directory, ['manage-deps', '--yes']);
+  }
+}
+
+function runHakari(shell: CargoHakariShell, directory: string, args: readonly string[]): void {
+  const result = shell.run(directory, args);
+  if (result.missing) {
+    console.error(
+      `cargo hakari is not installed, so the workspace-hack in ${directory} was not updated; the managed devenv module provides it — reload the shell (direnv reload).`,
+    );
+    return;
+  }
+  if (result.code !== 0) {
+    console.error(`cargo hakari ${args.join(' ')} failed in ${directory}: ${result.output || 'no output'}`);
+  }
+}
+
+/**
+ * Append the two keys, never rewrite the file. A `.cargo/config.toml` carries
+ * linkers, env and target settings whose ORDER and comments are load-bearing;
+ * re-emitting parsed TOML would lose both. If either table already exists with
+ * some other content, appending a second one is invalid TOML — so that case is
+ * reported for a human instead of being guessed at.
+ */
+function writeResolverUnification(workspaceDirectory: string): void {
+  const path = join(workspaceDirectory, '.cargo/config.toml');
+  const existing = existsSync(path) ? readFileSync(path, 'utf8') : null;
+  if (existing === null) {
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, `${RESOLVER_UNIFICATION_BLOCK}\n`);
+    console.log(`writing        ${path}`);
+    return;
+  }
+  const parsed = loadConfig(path);
+  if (parsed === null) {
+    return;
+  }
+  if (parsed.resolver?.['feature-unification'] === 'workspace' && parsed.unstable?.['feature-unification'] === true) {
+    return;
+  }
+  if (parsed.resolver !== undefined || parsed.unstable !== undefined) {
+    console.error(
+      `${path}: already declares [resolver] or [unstable]; add feature-unification to the existing tables by hand:\n${RESOLVER_UNIFICATION_BLOCK}`,
+    );
+    return;
+  }
+  writeFileSync(path, `${existing.replace(/\n*$/, '\n')}\n${RESOLVER_UNIFICATION_BLOCK}\n`);
+  console.log(`updating       ${path}`);
 }

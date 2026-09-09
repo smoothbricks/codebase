@@ -2,6 +2,7 @@ import { chmodSync, existsSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { printCommandOutput, runResult, runStatus } from '../../lib/run.js';
 import { type ProjectTargets, readProjectTargets } from '../../nx/index.js';
+import { applyCargoFeatureUnification, validateCargoCachePolicy } from '../cargo-policy.js';
 import { validateGoToolchainAgreement } from '../go-toolchain.js';
 import { syncBunLockfileVersions, validateBunLockfileVersions } from '../lockfile.js';
 import { validateDevenvModuleImport, warnOnManagedFileDrift } from '../managed-files.js';
@@ -118,6 +119,18 @@ const packs: MonorepoPack[] = [
     name: 'devenv',
     validatePreBuild(ctx) {
       return validateDevenvModuleImport(ctx.root);
+    },
+  },
+  {
+    // Cargo's build-cache and feature-unification conventions. `--fix` writes
+    // the workspace feature unification a multi-crate workspace needs; the rest
+    // of the policy is a verdict a human has to act on.
+    name: 'cargo',
+    fixPreBuild(ctx) {
+      applyCargoFeatureUnification(ctx.root);
+    },
+    validatePreBuild(ctx) {
+      return validateCargoCachePolicy(ctx.root);
     },
   },
   {
