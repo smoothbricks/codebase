@@ -704,7 +704,30 @@ export function exceptionalTestFilter(nextestConfigPath: string): string | null 
   return unique.length === 0 ? null : unique.map((filter) => `(${filter})`).join(' or ');
 }
 
-export function nextestConfigRelPath(workspaceRoot: string, projectRoot: string, configAbs: string): string {
+/**
+ * The plugin's own nextest settings, as a config layer BENEATH the repository's.
+ *
+ * `--config-file` replaces `<workspace>/.config/nextest.toml` outright, which
+ * made every plugin default unoverridable and — now that per-crate runs execute
+ * from an archive — left a repository no way to declare `archive.include` for a
+ * cdylib or fixture its tests need. `--tool-config-file` is nextest's mechanism
+ * for exactly this: "lower than --config-file in priority but above the default
+ * config shipped with nextest". Measured: with only this layer a 1s
+ * slow-timeout terminates a 3s test; adding `.config/nextest.toml` with 10s
+ * lets the same test pass.
+ *
+ * The path must be absolute, and an absolute path written into the command text
+ * would differ per checkout and split one Nx cache entry per machine. `$PWD`
+ * resolves at exec time — both the archive (`nx:run-commands`) and the runners
+ * (`bounded-exec`, which spawns with `shell: true`) go through a shell — so the
+ * command text stays identical everywhere. Quoted, because a workspace path may
+ * contain spaces.
+ */
+export function nextestToolConfigArg(workspaceRoot: string, projectRoot: string, configAbs: string): string {
   const rel = relative(join(workspaceRoot, projectRoot), configAbs);
-  return rel.length === 0 ? configAbs : rel.split(sep).join('/');
+  const path = rel.length === 0 ? configAbs : rel.split(sep).join('/');
+  return `--tool-config-file "smoo:$PWD/${path}"`;
 }
+
+/** The repository's own nextest config, which now layers over the plugin's. */
+export const NEXTEST_REPO_CONFIG_PATH = '.config/nextest.toml';

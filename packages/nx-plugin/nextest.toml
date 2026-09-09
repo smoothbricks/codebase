@@ -34,8 +34,14 @@ slow-timeout = { period = "180s", terminate-after = 1 }
 # test joins the group by being named for what it touches. A bare `real_*` filter
 # would be wrong here — unrelated `real_*` tests exist in columine-arrow,
 # cowshed-cli and cowshed-gateway that touch no disk image at all.
+#
+# The `@tool:smoo:` prefix is not decoration: this file is passed as
+# `--tool-config-file smoo:...` so a repository's own `.config/nextest.toml`
+# can override it, and nextest REFUSES a tool config whose groups are not
+# namespaced ("test groups must start with '@tool:<tool-name>:'") precisely so
+# a tool cannot collide with a repository's group of the same name.
 [test-groups]
-real-apfs = { max-threads = 1 }
+"@tool:smoo:real-apfs" = { max-threads = 1 }
 
 # The full-lifecycle real-APFS tests cannot meet the default deadline, and
 # `specs/cowshed/08_testing.md` already contains the arithmetic that proves it.
@@ -72,8 +78,8 @@ real-apfs = { max-threads = 1 }
 [[profile.default.overrides]]
 filter = 'test(/real_apfs_.*_substrate_lifecycle/)'
 slow-timeout = { period = "60s", terminate-after = 1 }
-test-group = 'real-apfs'
+test-group = '@tool:smoo:real-apfs'
 
 [[profile.default.overrides]]
 filter = 'test(/real_apfs_/)'
-test-group = 'real-apfs'
+test-group = '@tool:smoo:real-apfs'

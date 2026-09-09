@@ -27,7 +27,8 @@ import {
   createCargoInputsCache,
   exceptionalTestFilter,
   listCargoWorkspacePackages,
-  nextestConfigRelPath,
+  NEXTEST_REPO_CONFIG_PATH,
+  nextestToolConfigArg,
 } from './cargo-workspace.js';
 import {
   CARGO_CROSS_LINT_COMMAND,
@@ -337,10 +338,10 @@ function createCargoTestCompileTarget(projectRoot: string): TargetConfiguration 
  * not a mutable build tree Nx would have to restore. `--workspace` matches the
  * clippy selection exactly, so both gates unify features the same way.
  */
-function createCargoTestArchiveTarget(projectRoot: string, configFile: string): TargetConfiguration {
+function createCargoTestArchiveTarget(projectRoot: string, toolConfig: string): TargetConfiguration {
   const archiveCommand = (profile: string): string =>
     cargoFrozen(
-      `nextest archive --workspace${profile} --archive-file ${CARGO_TEST_ARCHIVE_FILE} --user-config-file none --config-file ${configFile}`,
+      `nextest archive --workspace${profile} --archive-file ${CARGO_TEST_ARCHIVE_FILE} --user-config-file none ${toolConfig}`,
     );
   return {
     executor: 'nx:run-commands',
@@ -690,9 +691,14 @@ async function createProjectTargets(
     targets[CARGO_TEST_COMPILE_TARGET].inputs = workspaceInputs.length > 0 ? workspaceInputs : CARGO_INPUTS;
     targets[CARGO_TEST_ARCHIVE_TARGET] = createCargoTestArchiveTarget(
       cargoWorkspaceRoot,
-      nextestConfigRelPath(workspaceRoot, cargoWorkspaceRoot, PLUGIN_NEXTEST_CONFIG),
+      nextestToolConfigArg(workspaceRoot, cargoWorkspaceRoot, PLUGIN_NEXTEST_CONFIG),
     );
-    targets[CARGO_TEST_ARCHIVE_TARGET].inputs = workspaceInputs.length > 0 ? workspaceInputs : CARGO_INPUTS;
+    // `archive.include` lives in the repository's nextest config, so that file
+    // decides what the archive CONTAINS, not merely how a run behaves.
+    targets[CARGO_TEST_ARCHIVE_TARGET].inputs = [
+      ...(workspaceInputs.length > 0 ? workspaceInputs : CARGO_INPUTS),
+      `{projectRoot}/${NEXTEST_REPO_CONFIG_PATH}`,
+    ];
     const aggregateDependencies = cargoWorkspace.packages.flatMap((plan) =>
       plan.pieces.map((piece) =>
         cargoTargetDependency(projectName, {
@@ -1713,7 +1719,7 @@ async function addCargoTestTargets(
   workspace: CargoWorkspace,
 ): Promise<string[]> {
   const targetNames: string[] = [];
-  const configFile = nextestConfigRelPath(workspaceRoot, workspace.projectRoot, PLUGIN_NEXTEST_CONFIG);
+  const toolConfig = nextestToolConfigArg(workspaceRoot, workspace.projectRoot, PLUGIN_NEXTEST_CONFIG);
   for (const plan of workspace.packages) {
     if (plan.package.projectRoot !== projectRoot) {
       continue;
@@ -1723,6 +1729,10 @@ async function addCargoTestTargets(
     // A workspace nextest build unifies features across every selected member.
     // A sibling manifest can therefore change this crate's tests without being
     // a path dependency. Track those manifests, not unrelated sibling sources.
+    //
+    // The repository's own nextest config layers OVER the plugin's tool config,
+    // so it decides timeouts, groups and archive contents: a cached verdict that
+    // ignored it would survive the change that invalidates it.
     const inputs: NonNullable<TargetConfiguration['inputs']> = [
       ...new Set([
         ...(await cargoPackageTestInputs({
@@ -1733,6 +1743,7 @@ async function addCargoTestTargets(
           cache: workspace.inputsCache,
         })),
         ...workspace.packages.map((member) => posix.join(inputRoot, member.package.dir, 'Cargo.toml')),
+        posix.join(inputRoot, NEXTEST_REPO_CONFIG_PATH),
       ]),
       {
         runtime: `bun -e 'console.log(new Bun.CryptoHasher("sha256").update(require("node:fs").readFileSync(process.argv[1])).digest("hex"))' '${PLUGIN_NEXTEST_CONFIG.replaceAll("'", "'\"'\"'")}'`,
@@ -1751,7 +1762,7 @@ async function addCargoTestTargets(
         dependsOn: [archive],
         options: {
           command: cargoFrozen(
-            `nextest run --archive-file ${CARGO_TEST_ARCHIVE_FILE} --workspace-remap . -E '${piece.selector}'${piece.extra} --no-tests=pass --user-config-file none --config-file ${configFile}`,
+            `nextest run --archive-file ${CARGO_TEST_ARCHIVE_FILE} --workspace-remap . -E '${piece.selector}'${piece.extra} --no-tests=pass --user-config-file none ${toolConfig}`,
           ),
           cwd: workspace.projectRoot,
           timeoutMs: BOUNDED_TEST_TIMEOUT_MS,

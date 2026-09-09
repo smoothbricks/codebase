@@ -414,9 +414,15 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       // nextest does not create the archive's parent directory and fails the
       // whole build if it is missing (measured: "error writing to archive").
       expect(targets['cargo-test-archive']?.options?.commands?.[0]).toBe('mkdir -p target/nextest');
+      // `--tool-config-file`, never `--config-file`: the plugin's settings must
+      // sit UNDER the repository's `.config/nextest.toml`, which is the only
+      // place an `archive.include` for a cdylib or fixture can be declared.
+      // `$PWD` because tool config paths must be absolute and an absolute path
+      // in the command text would split one cache entry per checkout.
       expect(String(targets['cargo-test-archive']?.options?.commands?.[1])).toMatch(
-        /^cargo --frozen nextest archive --workspace --archive-file target\/nextest\/archive\.tar\.zst --user-config-file none --config-file /,
+        /^cargo --frozen nextest archive --workspace --archive-file target\/nextest\/archive\.tar\.zst --user-config-file none --tool-config-file "smoo:\$PWD\/.*nextest\.toml"$/,
       );
+      expect(targets['cargo-test-archive']?.inputs).toContain('{projectRoot}/.config/nextest.toml');
       expect(String(targets['cargo-test-archive']?.configurations?.production?.commands?.[1])).toContain(
         'nextest archive --workspace --release --archive-file',
       );
@@ -428,8 +434,9 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       // `--workspace` is not merely redundant here, nextest rejects it with
       // `--archive-file`.
       expect(targets['cargo-test-ferris-core']?.options?.command).toMatch(
-        /^cargo --frozen nextest run --archive-file target\/nextest\/archive\.tar\.zst --workspace-remap \. -E 'package\(ferris-core\)' --no-tests=pass --user-config-file none --config-file /,
+        /^cargo --frozen nextest run --archive-file target\/nextest\/archive\.tar\.zst --workspace-remap \. -E 'package\(ferris-core\)' --no-tests=pass --user-config-file none --tool-config-file "smoo:\$PWD\/.*nextest\.toml"$/,
       );
+      expect(targets['cargo-test-ferris-core']?.inputs).toContain('{projectRoot}/.config/nextest.toml');
       expect(targets['cargo-test-ferris-core']?.configurations?.production).toEqual({});
       expect(targets['cargo-test-ferris-core']?.inputs).toEqual(
         expect.arrayContaining([
@@ -1139,7 +1146,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         'napi-debug',
       ]);
       expect(targets['cargo-test-cowshed-napi']?.options?.command).toMatch(
-        /^cargo --frozen nextest run --archive-file target\/nextest\/archive\.tar\.zst --workspace-remap \. -E 'package\(cowshed-napi\)' --no-tests=pass --user-config-file none --config-file /,
+        /^cargo --frozen nextest run --archive-file target\/nextest\/archive\.tar\.zst --workspace-remap \. -E 'package\(cowshed-napi\)' --no-tests=pass --user-config-file none --tool-config-file "smoo:\$PWD\/.*nextest\.toml"$/,
       );
       expect(targets['napi-test']).toMatchObject({
         executor: '@smoothbricks/nx-plugin:bounded-exec',
