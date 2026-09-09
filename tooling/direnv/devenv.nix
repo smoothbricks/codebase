@@ -108,6 +108,13 @@ in {
     # plus pytz, python-dateutil, tzdata and six — for an import nothing makes.
     # numpy stays: pyarrow propagates it.
     package = pkgs.python314.withPackages (ps: [ps.pyarrow]);
+    # A language server is editor tooling, and nothing in this repository is
+    # written in Python, so devenv's default pyright is 291.7 MB of pure tax on
+    # every macOS CI store restore. It also drags nodejs 24 in alongside the
+    # nodejs 26 this shell pins on purpose — a second Node major on one PATH is
+    # exactly the ambiguity that fleet-wide pin exists to prevent. An editor
+    # that wants pyright can install its own; a release runner cannot.
+    lsp.enable = false;
   };
 
   # We're not using Devenv's pre-commit-hooks, because this repo's pre-commit hook
