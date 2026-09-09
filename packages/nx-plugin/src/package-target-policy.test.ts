@@ -720,6 +720,22 @@ describe('checkPackageTargetPolicyTree', () => {
     expect(issues.filter((i) => i.message.includes('test files require'))).toEqual([]);
   });
 
+  it('does not read test files out of build output or dot-directories', () => {
+    addProject(tree, 'lib', 'packages/lib');
+    writeJsonFile(tree, 'packages/lib/package.json', {
+      name: '@scope/lib',
+      nx: { name: 'lib' },
+    });
+    // Stale emit, cargo's tree and a runtime cache all carry test-shaped files; none is a
+    // source the package must wire a test target for.
+    tree.write('packages/lib/dist-test/example.test.js', 'export {};\n');
+    tree.write('packages/lib/target/debug/build/example.test.ts', 'export {};\n');
+    tree.write('packages/lib/.runtime/cache-pin/test/example.test.ts', 'export {};\n');
+
+    const issues = checkPackageTargetPolicyTree(tree);
+    expect(issues.filter((i) => i.message.includes('test files require'))).toEqual([]);
+  });
+
   it('accepts wildcard aggregate build dependencies', () => {
     addProject(tree, 'lib', 'packages/lib');
     writeJsonFile(tree, 'packages/lib/package.json', {
