@@ -57,6 +57,35 @@ describe('publish workflow definition', () => {
     ).resolves.toBe(rendered);
   });
 
+  it('gives every publish job the declared remote cache, in bytes Prettier keeps', async () => {
+    const remoteCache = {
+      server: 'https://nx-cache.example.net',
+      internalServer: 'http://10.89.0.1:8765',
+      tokenSecret: 'NX_REMOTE_CACHE_TOKEN',
+    };
+    const cacheEnv = {
+      NX_SELF_HOSTED_REMOTE_CACHE_SERVER: 'http://10.89.0.1:8765',
+      NX_SELF_HOSTED_REMOTE_CACHE_ACCESS_TOKEN: '${{ secrets.NX_REMOTE_CACHE_TOKEN }}',
+    };
+    const platform = renderPublishWorkflowYaml({ ...codebaseWorkflowOptions, remoteCache });
+    const single = renderPublishWorkflowYaml({ repoName: '@smoothbricks/codebase', remoteCache });
+
+    expect(Bun.YAML.parse(platform)).toMatchObject({
+      jobs: {
+        'linux-release-candidate': { env: cacheEnv },
+        'macos-platform': { env: cacheEnv },
+        'publish-on-linux': { env: cacheEnv },
+      },
+    });
+    expect(Bun.YAML.parse(single)).toMatchObject({ jobs: { publish: { env: cacheEnv } } });
+    expect(renderPublishWorkflowYaml(codebaseWorkflowOptions)).not.toContain('NX_SELF_HOSTED');
+    // A workflow the repository Prettier config would rewrite drifts on the
+    // first commit hook, so the cache lines must already be its output.
+    await expect(
+      format(platform, { parser: 'yaml', printWidth: 120, proseWrap: 'always', singleQuote: true }),
+    ).resolves.toBe(platform);
+  });
+
   it('passes the projects selector to the version and platform-output steps', async () => {
     const rendered = renderPublishWorkflowYaml(codebaseWorkflowOptions);
 

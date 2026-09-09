@@ -136,14 +136,18 @@ async function resolveInBootstrap(options: {
 
 /** Builds a fixture repository whose package.json and .npmrc are the resolver's real inputs. */
 async function withFixture(
-  options: { secrets: Record<string, SecretSpec>; npmrc?: string },
+  options: { secrets: Record<string, SecretSpec>; npmrc?: string; remoteCache?: unknown },
   run: (root: string) => Promise<void>,
 ): Promise<void> {
   const root = await mkdtemp(join(tmpdir(), 'smoo-secret-references-'));
   try {
     await writeFile(
       join(root, 'package.json'),
-      JSON.stringify({ name: 'fixture', version: '0.0.0', smoo: { secrets: options.secrets } }),
+      JSON.stringify({
+        name: 'fixture',
+        version: '0.0.0',
+        smoo: { secrets: options.secrets, remoteCache: options.remoteCache },
+      }),
     );
     if (options.npmrc !== undefined) {
       await writeFile(join(root, '.npmrc'), options.npmrc);
@@ -358,6 +362,136 @@ describe('resolveSecretEnvironment', () => {
       expect(outcome.error).toContain('package.json');
     } finally {
       await rm(root, { recursive: true, force: true });
+    }
+  });
+});
+
+/**
+ * The remote cache half is exercised the way the managed shell runs it — the
+ * raw script as a program, its stdout `eval`-ed — because that round trip is
+ * the contract: shell text on stdout, guidance on stderr, and a status that
+ * never keeps a shell from opening.
+ */
+describe('remote cache shell export', () => {
+  const SERVER = 'https://nx-cache.example.net';
+
+  async function exportFor(root: string, env: Record<string, string>): Promise<{ stdout: string; stderr: string }> {
+    const proc = Bun.spawn({
+      cmd: ['bun', RAW_RESOLVER, root],
+      env: { PATH: process.env['PATH'], HOME: process.env['HOME'], ...env },
+      stdin: 'ignore',
+      stdout: 'pipe',
+      stderr: 'pipe',
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+      proc.exited,
+    ]);
+    // A cache is an optimization: nothing it does may fail shell entry.
+    expect(exitCode).toBe(0);
+    return { stdout, stderr };
+  }
+
+  /** The value a shell ends up with after eval-ing the script's output. */
+  async function evaluated(root: string, env: Record<string, string>, name: string): Promise<string> {
+    const { stdout } = await exportFor(root, env);
+    const shell = Bun.spawnSync({
+      cmd: ['sh', '-c', `${stdout}printf %s "\${${name}:-}"`],
+      env: { PATH: process.env['PATH'] ?? '/usr/bin:/bin' },
+    });
+    expect(shell.exitCode).toBe(0);
+    return shell.stdout.toString();
+  }
+
+  it('exports the pair from an ambient token and nothing from an absent declaration', async () => {
+    await withFixture(
+      { secrets: {}, remoteCache: { server: SERVER, tokenSecret: 'NX_REMOTE_CACHE_TOKEN' } },
+      async (root) => {
+        expect((await exportFor(root, { NX_REMOTE_CACHE_TOKEN: 'ambient-token' })).stdout).toBe(
+          `export NX_SELF_HOSTED_REMOTE_CACHE_SERVER='${SERVER}'\nexport NX_SELF_HOSTED_REMOTE_CACHE_ACCESS_TOKEN='ambient-token'\n`,
+        );
+      },
+    );
+    await withFixture({ secrets: {} }, async (root) => {
+      expect(await exportFor(root, { NX_REMOTE_CACHE_TOKEN: 'ambient-token' })).toEqual({ stdout: '', stderr: '' });
+    });
+  });
+
+  it('exports nothing and names the variable when the token has no value', async () => {
+    await withFixture(
+      { secrets: {}, remoteCache: { server: SERVER, tokenSecret: 'NX_REMOTE_CACHE_TOKEN' } },
+      async (root) => {
+        const { stdout, stderr } = await exportFor(root, {});
+        // Half a pair is worse than none: Nx enables its cache on the server
+        // alone and then fails every task on 401.
+        expect(stdout).toBe('');
+        expect(stderr).toContain('NX_REMOTE_CACHE_TOKEN');
+        expect(stderr).toContain(SERVER);
+      },
+    );
+  });
+
+  it('leaves a server the environment already carries alone', async () => {
+    await withFixture(
+      { secrets: {}, remoteCache: { server: SERVER, tokenSecret: 'NX_REMOTE_CACHE_TOKEN' } },
+      async (root) => {
+        // A CI job env names the address its own runners reach; the public
+        // origin must not replace it.
+        expect(
+          await exportFor(root, {
+            NX_SELF_HOSTED_REMOTE_CACHE_SERVER: 'http://10.89.0.1:8765',
+            NX_REMOTE_CACHE_TOKEN: 'ambient-token',
+          }),
+        ).toEqual({ stdout: '', stderr: '' });
+      },
+    );
+  });
+
+  it('resolves a provider-declared token, and only that one secret', async () => {
+    await withFixture(
+      {
+        secrets: {
+          NX_REMOTE_CACHE_TOKEN: { command: emit('provider-token') },
+          SMOO_OTHER: { command: ['definitely-not-a-real-smoo-binary-xyz'] },
+        },
+        remoteCache: { server: SERVER, tokenSecret: 'NX_REMOTE_CACHE_TOKEN' },
+      },
+      async (root) => {
+        // The unrunnable sibling proves no other declared secret is resolved
+        // here, and that none of them reaches the shell.
+        const { stdout } = await exportFor(root, {});
+        expect(stdout).toContain("export NX_SELF_HOSTED_REMOTE_CACHE_ACCESS_TOKEN='provider-token'");
+        expect(stdout).not.toContain('SMOO_OTHER');
+      },
+    );
+  });
+
+  it('survives eval with a token full of shell metacharacters', async () => {
+    const hostile = `it's $(touch /tmp/smoo-cache-pwned) \`x\` "q" \\`;
+    await withFixture(
+      { secrets: {}, remoteCache: { server: SERVER, tokenSecret: 'NX_REMOTE_CACHE_TOKEN' } },
+      async (root) => {
+        expect(
+          await evaluated(root, { NX_REMOTE_CACHE_TOKEN: hostile }, 'NX_SELF_HOSTED_REMOTE_CACHE_ACCESS_TOKEN'),
+        ).toBe(hostile);
+      },
+    );
+  });
+
+  it('refuses a declaration Nx could not use, naming the field', async () => {
+    for (const remoteCache of [
+      { server: `${SERVER}/`, tokenSecret: 'NX_REMOTE_CACHE_TOKEN' },
+      { server: '', tokenSecret: 'NX_REMOTE_CACHE_TOKEN' },
+      { server: SERVER, tokenSecret: 'has-dash' },
+      { server: SERVER },
+      'https://nx-cache.example.net',
+    ]) {
+      await withFixture({ secrets: {}, remoteCache }, async (root) => {
+        const { stdout, stderr } = await exportFor(root, { NX_REMOTE_CACHE_TOKEN: 'ambient-token' });
+        expect(stdout).toBe('');
+        expect(stderr).toContain('smoo.remoteCache');
+      });
     }
   });
 });

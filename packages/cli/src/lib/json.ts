@@ -153,6 +153,43 @@ export interface PackagePrivateNpmConfig {
   publishTokenEnv?: string;
 }
 
+/**
+ * Declared self-hosted Nx remote cache (`smoo.remoteCache`). Nx enables its
+ * HTTP cache on a nonempty NX_SELF_HOSTED_REMOTE_CACHE_SERVER and reads the
+ * credential from NX_SELF_HOSTED_REMOTE_CACHE_ACCESS_TOKEN; this declaration
+ * is what puts that pair in a managed CI job's environment and in a developer
+ * shell (tooling/direnv/secret-references.ts). Absent means every workspace
+ * keeps its own local cache and nothing is shared.
+ *
+ * The pair is emitted whole or not at all, because Nx accepts only 200 or 404
+ * from a cache server: a server without a working credential fails every task
+ * with 401 rather than missing quietly.
+ */
+export interface PackageRemoteCacheConfig {
+  /**
+   * Origin every runner and developer machine can reach, e.g.
+   * `https://nx-cache.example.net`. Credential-free, no path, and no trailing
+   * slash — Nx appends `/v1/cache/<hash>`, so a trailing slash requests
+   * `//v1/cache/<hash>`, which is a different route and answers 404 forever.
+   */
+  server: string;
+  /**
+   * Origin an internal runner reaches instead of `server`, e.g.
+   * `http://10.89.0.1:8765` across a container bridge. Same declaration as a
+   * git origin's `internalMirror`: declaring it says this repository's managed
+   * runners are inside that network, so managed CI uses it and shells outside
+   * keep `server`. Omitted means CI uses `server` too.
+   */
+  internalServer?: string;
+  /**
+   * Repository secret holding the cache token, and the same variable name a
+   * developer shell resolves locally (an ambient value or a `smoo.secrets`
+   * entry). A read-only token here keeps an untrusted context reading the
+   * cache without being able to publish into it.
+   */
+  tokenSecret: RepositorySecretName;
+}
+
 /** Local bootstrap fallback; existing environment values always take precedence. */
 export interface PackageSecretCommand {
   /** Executed directly, without a shell; stdout supplies the secret value. */
@@ -162,6 +199,8 @@ export interface PackageSecretCommand {
 export interface PackageSmooConfig {
   github?: PackageSmooGithub;
   privateNpm?: PackagePrivateNpmConfig;
+  /** Declared self-hosted Nx remote cache; absent means local caching only. */
+  remoteCache?: PackageRemoteCacheConfig;
   /** Provider-neutral local secret commands. CI supplies these variables externally. */
   secrets?: Record<string, PackageSecretCommand>;
 }
