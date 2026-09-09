@@ -73,6 +73,24 @@ in {
   # https://github.com/cachix/devenv/issues/1674
   apple.sdk = null;
 
+  # devenv's languages.rust switches on languages.c to expose `cc`, and that
+  # module then adds an editor language server and a debugger by default. No C
+  # is written here, so ccls serves nothing; and lldb is redundant on the one
+  # platform devenv defaults to it, because this shell already defers to the
+  # Xcode command line tools for the SDK and the compiler (see the SDKROOT and
+  # DEVELOPER_DIR drops in devenv.smoo.nix) and those ship lldb too.
+  #
+  # 35.5 MB off every shell and every macOS CI store restore — ccls 1.6 MB plus
+  # lldb and its tails 33.9 MB. clang-tools is the larger 149.2 MB share and
+  # stays: languages.c adds it unconditionally, so shedding it means disabling
+  # languages.c outright, which takes `cc` off PATH where rustc and cc-rs
+  # resolve it. That is a linker change, not a cache change, and does not belong
+  # in a commit about closure size.
+  languages.c = {
+    lsp.enable = false;
+    debugger = null;
+  };
+
   # The managed module supplies fleet-wide WASM and Linux targets. Add only the
   # native release targets the current runner can actually build, so a laptop
   # does not fetch Linux std it never links.
