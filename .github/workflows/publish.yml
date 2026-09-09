@@ -43,6 +43,7 @@ jobs:
       projects: ${{ steps.plan.outputs.projects }}
       repairs: ${{ steps.plan.outputs.repairs }}
     env:
+      TTSC_TSGO_BINARY: ${{ github.workspace }}/node_modules/@typescript/native/bin/tsc
       GH_TOKEN: ${{ github.token }}
     steps:
       - name: 📥 Checkout dispatch commit
