@@ -47,9 +47,12 @@ smoo release retag-unpublished <tag...> [--to <ref>] [--push] [--dispatch] [--re
 smoo release bootstrap-npm-packages [--dry-run] [--skip-login] [--package <name...>]
 smoo release trust-publisher [--bootstrap] [--dry-run] [--skip-login] [--package <name...>]
 
-smoo github-ci cleanup-cache
-smoo github-ci nx-smart --target <target> --name <check-name> --step <number>
-smoo github-ci nx-run-many --targets <targets> [--projects <projects>]
+smoo github-ci nx-smart --target <target> [--name <check-name>] [--step <number>] [--mode <auto|affected|run-many>] [--stage <stage>]
+smoo github-ci nx-run-many --targets <targets> [--projects <projects>] [--collect-outputs <directory>]
+smoo github-ci nx-deploy [--stage <stage>] [--mode <auto|affected|run-many>] [--select-tag <tag>] [--verify]
+smoo github-ci apply-outputs <directories...> --source-sha <sha>
+smoo github-ci dispatch-workflow --workflow <workflow> --ref <ref>
+smoo github-ci ensure-pull-request --head <branch> --base <branch> --title <title> --body <body>
 ```
 
 ## Initialization
@@ -373,26 +376,26 @@ must stay synchronized with those comments. Composite action internals do not ch
 
 Managed CI setup is split across local composite actions:
 
-- `setup-devenv` installs [Nix], restores the Nix cache segment, imports the store NAR, restores `.devenv`/`.direnv`
-  only after an exact Nix cache hit, enables [Cachix], installs [devenv], restores `node_modules`, and builds the shell.
-- `save-nix-devenv` runs under `always()`, calls `smoo github-ci cleanup-cache`, and explicitly saves cache segments
-  only when cleanup reports `cache-ready=true`.
-- `cache-nix-devenv` is the shared restore/save primitive for the separate `nix` and `devenv` cache segments.
+- `setup-devenv` detects the runner kind first. An ephemeral runner installs a single-user [Nix], restores `/nix` itself
+  from the Actions cache — store paths and the Nix database, as files, so nothing is imported — enables [Cachix],
+  installs [devenv] at `devenv.lock`'s rev, restores `node_modules` and the ttsc plugins, and builds the shell. A
+  host-nix runner (`NIX_REMOTE=daemon` with `/var/cache/ci`) skips the install and every store cache: it already has the
+  store and keeps its caches on the shared bind.
+- `save-nix-devenv` runs under `always()` and saves the `.devenv`/`.direnv` eval-cache segment when setup missed it and
+  the shell produced `nix-eval-cache.db`. The store cache saves itself in `setup-devenv`'s post phase, which collects
+  garbage down to the live closure before uploading.
+- `cache-nix-devenv` is the shared restore/save primitive for the `.devenv`/`.direnv` segment.
 
-The cache split is intentional. The Nix segment contains the profile, Nix state, and exported store NAR. It is large and
-keyed by the expensive shell closure inputs. The `.devenv`/`.direnv` segment is small, but it contains absolute
-`/nix/store` pointers, so restoring it without the exact matching Nix store can leave metadata pointing at missing store
-paths.
-
-`smoo github-ci cleanup-cache` prepares the Nix segment for saving. It verifies and repairs the store, scans `.devenv`,
-`.direnv`, and `~/.nix-profile` for embedded `/nix/store/...` references, protects the live paths with temporary GC
-roots, runs garbage collection, and exports the resulting closure to `NIX_STORE_NAR`. The command writes
-`cache-ready=true` or `cache-ready=false` to `GITHUB_OUTPUT` so the save action can avoid uploading incomplete caches.
+The cache split is intentional. The store segment is large and keyed by the expensive shell closure inputs
+(`devenv.yaml`, `devenv.nix`, `devenv.lock`), and it carries store content only — never the Nix profiles, which exist to
+be gcroots: restoring a previous run's copies over a freshly installed Nix de-roots the running Nix binary, and the post
+phase then collects it. The `.devenv`/`.direnv` segment is small, but it holds absolute `/nix/store` pointers, so it
+restores on every ephemeral runner and devenv checks that the shell's derivation and output still exist on an eval-cache
+hit, re-evaluating when garbage collection removed them.
 
 The bootstrap script is intentionally small. It only handles work required before `smoo` can run in GitHub Actions:
 
-- Restore Nix store cache state, clearing `.devenv` and `.direnv` if the matching NAR is missing or fails to import.
-- Install `devenv`.
+- Install `devenv`, held to `devenv.lock`'s rev on an ephemeral runner.
 - Build the devenv shell and add repo-local tooling to `GITHUB_PATH`.
 
 ### Deploy configuration (`package.json` → `smoo.github`)
