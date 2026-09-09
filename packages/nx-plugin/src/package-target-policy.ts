@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { getProjects, readJson, type Tree, updateJson } from 'nx/src/devkit-exports.js';
 
 import { boundedTestScriptAlias } from './bounded-test-policy.js';
+import { isNonSourceDirectory } from './source-directories.js';
 import {
   BUILD_OUTPUT_DEPENDENCIES,
   LINUX_PLATFORM_TARGET_GLOBS,
@@ -594,7 +595,7 @@ function directoryContainsTestFiles(path: string): boolean {
     return false;
   }
   for (const entry of readdirSync(path, { withFileTypes: true })) {
-    if (entry.name === 'node_modules' || entry.name === 'dist' || entry.name === 'coverage' || entry.name === '.git') {
+    if (isNonSourceDirectory(entry.name)) {
       continue;
     }
     const entryPath = join(path, entry.name);
@@ -956,7 +957,7 @@ function directoryContainsTestFilesTree(tree: Tree, path: string): boolean {
     return false;
   }
   for (const entry of tree.children(path)) {
-    if (entry === 'node_modules' || entry === 'dist' || entry === 'coverage' || entry === '.git') {
+    if (isNonSourceDirectory(entry)) {
       continue;
     }
     const entryPath = `${path}/${entry}`;

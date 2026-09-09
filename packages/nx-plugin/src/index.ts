@@ -34,6 +34,7 @@ import {
   CARGO_LINT_CLIPPY_COMMAND,
   cargoFrozen,
 } from './cross-check-policy.js';
+import { isNonSourceDirectory } from './source-directories.js';
 import { PLATFORM_TARGET_GLOBS } from './workspace-config-policy.js';
 
 export { CARGO_TEST_COMPILE_TARGET };
@@ -61,7 +62,7 @@ async function javaScriptSourceFiles(directory: string): Promise<string[]> {
   const files: string[] = [];
   for (const entry of await readdir(directory, { withFileTypes: true })) {
     if (entry.isDirectory()) {
-      if (entry.name !== 'node_modules' && entry.name !== 'target' && entry.name !== 'dist') {
+      if (!isNonSourceDirectory(entry.name)) {
         files.push(...(await javaScriptSourceFiles(join(directory, entry.name))));
       }
     } else if (entry.isFile() && /\.[cm]?[jt]sx?$/.test(entry.name)) {
