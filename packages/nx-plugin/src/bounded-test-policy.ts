@@ -207,9 +207,12 @@ export function checkWorkspaceCargoTestReachabilityPolicy(
 
 /**
  * True when `target`, or something in its dependency closure, invokes cargo in a
- * mode that executes tests. `cargo-test-compile` is deliberately excluded: it is
- * `cargo test --no-run`, so it proves the binaries build and nothing about them
- * running.
+ * mode that executes tests. The two workspace-wide preparation targets are
+ * deliberately excluded: `cargo-test-compile` is `cargo test --no-run` and
+ * `cargo-test-archive` is `cargo nextest archive`. Both prove the binaries
+ * build and nothing about them running, and both say "test"/"nextest" in their
+ * command — a closure holding only these is the silent green this check exists
+ * to catch.
  */
 function resolvedTargetRunsTests(project: ResolvedProjectTargets, target: string): boolean {
   const visiting = new Set<string>();
@@ -219,7 +222,11 @@ function resolvedTargetRunsTests(project: ResolvedProjectTargets, target: string
     }
     visiting.add(targetName);
     const command = commandOf(project, targetName);
-    const runs = command !== undefined && /\btest\b|\bnextest\b/.test(command) && !command.includes('--no-run');
+    const runs =
+      command !== undefined &&
+      /\btest\b|\bnextest\b/.test(command) &&
+      !command.includes('--no-run') &&
+      !command.includes('nextest archive');
     const reached =
       runs ||
       (project.targetDependencies?.get(targetName) ?? []).some((dependency) =>

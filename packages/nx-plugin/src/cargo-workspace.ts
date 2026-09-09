@@ -613,6 +613,23 @@ export const CARGO_TEST_TARGET = 'cargo-test';
 export const CARGO_TEST_COMPILE_TARGET = 'cargo-test-compile';
 
 /**
+ * The one workspace-wide `cargo nextest archive` every per-crate runner
+ * executes from. Named here beside the other cargo target names so the policy
+ * that checks a workspace's test graph and the inference that builds it read
+ * the same string.
+ */
+export const CARGO_TEST_ARCHIVE_TARGET = 'cargo-test-archive';
+
+/**
+ * Where that archive lands, relative to the cargo workspace root — the cwd both
+ * the archive command and every runner already use. `cargo nextest archive`
+ * does NOT create this parent directory and fails the whole build when it is
+ * missing ("error writing to archive ... No such file or directory"), so the
+ * target mkdir's it first.
+ */
+export const CARGO_TEST_ARCHIVE_FILE = 'target/nextest/archive.tar.zst';
+
+/**
  * Tests that nextest.toml singles out are pinned to this suffix instead of
  * being sharded. Only a sharded crate has one: an unsharded crate runs its
  * whole suite in a single nextest process, which is all the pin restores.
@@ -632,9 +649,17 @@ export function cargoTestPackageTargetName(packageName: string, piece?: string):
  * Inverse of `cargoTestPackageTargetName`, used by the reachability policy to
  * check that the per-crate targets cover every workspace member. Pieces of one
  * crate collapse back to that crate, so a split crate counts as covered once.
+ *
+ * The two workspace-wide `cargo-test-*` targets are not crates: reading them as
+ * one would invent members named "compile" and "archive" and report every real
+ * crate's coverage against a set that can never match.
  */
 export function packageNameFromCargoTestTarget(targetName: string): string | null {
-  if (!targetName.startsWith('cargo-test-') || targetName === CARGO_TEST_COMPILE_TARGET) {
+  if (
+    !targetName.startsWith('cargo-test-') ||
+    targetName === CARGO_TEST_COMPILE_TARGET ||
+    targetName === CARGO_TEST_ARCHIVE_TARGET
+  ) {
     return null;
   }
   const name = targetName

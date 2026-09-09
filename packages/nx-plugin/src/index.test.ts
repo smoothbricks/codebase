@@ -384,7 +384,14 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       // Every frozen cargo command carries the edge, not just the head of the
       // serialization chain: offline cargo fails at resolution, so each one
       // needs the locked graph downloaded whether or not the chain runs first.
-      for (const name of ['cargo-test-compile', 'cargo-lint', CARGO_CROSS_LINT_TARGET, 'mutation', 'bench']) {
+      for (const name of [
+        'cargo-test-compile',
+        'cargo-test-archive',
+        'cargo-lint',
+        CARGO_CROSS_LINT_TARGET,
+        'mutation',
+        'bench',
+      ]) {
         expect(targets[name]?.dependsOn).toContain('cargo-fetch');
       }
       expect(targets['cargo-sweep']?.dependsOn).toBeUndefined();
@@ -397,15 +404,33 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       });
       expect(targets['cargo-test']?.executor).toBe('nx:noop');
       expect(targets['cargo-test']?.dependsOn).toEqual(['cargo-test-ferris-core', 'cargo-test-ferris-wasm']);
-      expect(targets['cargo-test-ferris-core']?.dependsOn).toEqual(['cargo-fetch', 'cargo-test-compile']);
-      expect(targets['cargo-test-ferris-wasm']?.dependsOn).toEqual(['cargo-fetch', 'cargo-test-ferris-core']);
-      // `--workspace -E 'package(...)'`, never `--package`: the filterset picks
-      // the same tests without re-resolving features, so the run reuses what
-      // cargo-test-compile built instead of rebuilding inside the bound. A
-      // workspace member with no tests is still a successful per-crate target.
-      expect(targets['cargo-test-ferris-core']?.options?.command).toMatch(
-        /^cargo --frozen nextest run --workspace -E 'package\(ferris-core\)' --no-tests=pass --user-config-file none --config-file /,
+      // One workspace compile, packed once. Every per-crate runner reads that
+      // archive, so the runners fan out instead of chaining: none of them
+      // builds, re-resolves features, or writes cargo's flocked `target/`.
+      expect(targets['cargo-test-archive']?.executor).toBe('nx:run-commands');
+      expect(targets['cargo-test-archive']?.cache).toBe(true);
+      expect(targets['cargo-test-archive']?.outputs).toEqual(['{projectRoot}/target/nextest/archive.tar.zst']);
+      expect(targets['cargo-test-archive']?.options).toMatchObject({ cwd: 'packages/ferris', parallel: false });
+      // nextest does not create the archive's parent directory and fails the
+      // whole build if it is missing (measured: "error writing to archive").
+      expect(targets['cargo-test-archive']?.options?.commands?.[0]).toBe('mkdir -p target/nextest');
+      expect(String(targets['cargo-test-archive']?.options?.commands?.[1])).toMatch(
+        /^cargo --frozen nextest archive --workspace --archive-file target\/nextest\/archive\.tar\.zst --user-config-file none --config-file /,
       );
+      expect(String(targets['cargo-test-archive']?.configurations?.production?.commands?.[1])).toContain(
+        'nextest archive --workspace --release --archive-file',
+      );
+      expect(targets['cargo-test-ferris-core']?.dependsOn).toEqual(['cargo-fetch', 'cargo-test-archive']);
+      expect(targets['cargo-test-ferris-wasm']?.dependsOn).toEqual(['cargo-fetch', 'cargo-test-archive']);
+      // The runner executes the archive's binaries and remaps the workspace
+      // root: without `--workspace-remap`, a restored archive hands tests the
+      // PRODUCING tree's absolute CARGO_MANIFEST_DIR (measured on a moved tree).
+      // `--workspace` is not merely redundant here, nextest rejects it with
+      // `--archive-file`.
+      expect(targets['cargo-test-ferris-core']?.options?.command).toMatch(
+        /^cargo --frozen nextest run --archive-file target\/nextest\/archive\.tar\.zst --workspace-remap \. -E 'package\(ferris-core\)' --no-tests=pass --user-config-file none --config-file /,
+      );
+      expect(targets['cargo-test-ferris-core']?.configurations?.production).toEqual({});
       expect(targets['cargo-test-ferris-core']?.inputs).toEqual(
         expect.arrayContaining([
           '{projectRoot}/Cargo.toml',
@@ -440,6 +465,32 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       expect(targets.mutation?.cache).toBe(false);
       expect(targets.mutation?.options).toMatchObject({ command: 'cargo --frozen mutants --workspace' });
       expect(targets.bench?.options).toMatchObject({ command: 'cargo --frozen bench --workspace' });
+    } finally {
+      await workspace.cleanup();
+    }
+  });
+
+  it('cleans every cargo directory its own commands write, including the ones caching refuses', async () => {
+    const workspace = await createWorkspace();
+    try {
+      await workspace.write('packages/ferris/package.json', '{"name":"ferris"}\n');
+      await workspace.write('packages/ferris/Cargo.toml', '[workspace]\nmembers = ["crates/ferris-core"]\n');
+      await workspace.write('packages/ferris/crates/ferris-core/Cargo.toml', '[package]\nname = "ferris-core"\n');
+
+      const targets = await inferProjectTargets(workspace, 'packages/ferris/package.json');
+
+      // A clippy target dir is not an Nx output — restoring an 11 GiB build
+      // tree from a cache is worse than rebuilding it — so `clean` cannot find
+      // these through `outputs`. They are read back off the commands that
+      // write them, which is why a new `--target-dir` cannot be forgotten here.
+      expect(targets.clean?.executor).toBe('@smoothbricks/nx-plugin:clean-outputs');
+      expect(targets.clean?.cache).toBe(false);
+      expect(targets.clean?.options?.outputs).toEqual([
+        '{projectRoot}/dist',
+        '{workspaceRoot}/packages/ferris/target/cargo-lint',
+        '{workspaceRoot}/packages/ferris/target/cargo-lint-cross',
+        '{workspaceRoot}/packages/ferris/target/nextest',
+      ]);
     } finally {
       await workspace.cleanup();
     }
@@ -565,6 +616,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       const rootProject = '@fixture/codebase';
       const rootFetch = { projects: [rootProject], target: 'cargo-fetch' };
       const rootCompile = { projects: [rootProject], target: 'cargo-test-compile' };
+      const rootArchive = { projects: [rootProject], target: 'cargo-test-archive' };
 
       expect(
         [...projects]
@@ -587,21 +639,15 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       expect(root['cargo-lint']?.dependsOn).toContain('cargo-fetch');
       expect(root['cargo-test']?.dependsOn).toHaveLength(5);
 
-      expect(runtime['cargo-test-runtime-core-shard1']?.dependsOn).toEqual([
-        rootFetch,
-        { projects: ['native'], target: 'cargo-test-native-napi' },
-      ]);
-      expect(runtime['cargo-test-runtime-core-shard2']?.dependsOn).toEqual([
-        rootFetch,
-        'cargo-test-runtime-core-shard1',
-      ]);
-      expect(runtime['cargo-test-runtime-core-exceptions']?.dependsOn).toEqual([
-        rootFetch,
-        'cargo-test-runtime-core-shard2',
-      ]);
+      // Root mode: every piece of every project hangs off the one root archive,
+      // in any order. The crate is selected by filterset alone — `-p` would
+      // re-resolve features, and there is nothing left to build anyway.
+      expect(runtime['cargo-test-runtime-core-shard1']?.dependsOn).toEqual([rootFetch, rootArchive]);
+      expect(runtime['cargo-test-runtime-core-shard2']?.dependsOn).toEqual([rootFetch, rootArchive]);
+      expect(runtime['cargo-test-runtime-core-exceptions']?.dependsOn).toEqual([rootFetch, rootArchive]);
       expect(runtime['cargo-test-runtime-core-shard1']?.options).toMatchObject({ cwd: '.' });
       expect(runtime['cargo-test-runtime-core-shard1']?.options?.command).toContain(
-        'nextest run --workspace -p runtime-core',
+        "nextest run --archive-file target/nextest/archive.tar.zst --workspace-remap . -E 'package(runtime-core)",
       );
       expect(native['cargo-test-native-napi']?.options?.command).toContain('--no-tests=pass');
       expect(runtime['cargo-test']?.dependsOn).toEqual([
@@ -615,10 +661,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       expect(runtime['cargo-lint-runtime-core']).toBeUndefined();
       expect(runtime.clean).toBeUndefined();
 
-      expect(wasm['cargo-test-runtime-wasm']?.dependsOn).toEqual([
-        rootFetch,
-        { projects: ['runtime'], target: 'cargo-test-runtime-core-exceptions' },
-      ]);
+      expect(wasm['cargo-test-runtime-wasm']?.dependsOn).toEqual([rootFetch, rootArchive]);
       expect(wasm['cargo-wasm']?.options).toMatchObject({ cwd: '.' });
       expect(wasm['cargo-wasm']?.options?.commands).toContain(
         'cargo --frozen build --release --target wasm32-unknown-unknown --target-dir target/cargo-wasm -p runtime-wasm',
@@ -628,7 +671,9 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       expect(wasm.build?.dependsOn).toContainEqual(rootCompile);
       expect(wasm.clean?.executor).toBe('@smoothbricks/nx-plugin:clean-outputs');
 
-      expect(native['cargo-test-native-napi']?.dependsOn).toEqual([rootFetch, 'napi-debug']);
+      // The crate whose project also builds the debug cdylib keeps that edge:
+      // its tests load the artifact `napi-debug` writes into `target/debug`.
+      expect(native['cargo-test-native-napi']?.dependsOn).toEqual([rootFetch, rootArchive, 'napi-debug']);
       expect(native['napi-debug']?.dependsOn).toContainEqual(rootCompile);
       expect(native['napi-debug']?.options).toMatchObject({
         cwd: '.',
@@ -712,7 +757,14 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       expect(leaf['cargo-lint-inner-leaf']).toBeUndefined();
       expect(leaf['cargo-test-inner-leaf']?.options?.cwd).toBe('nested');
       expect(inner['cargo-test-compile']?.options?.cwd).toBe('nested');
-      expect(leaf['cargo-test-inner-leaf']?.configurations?.production?.command).toContain('--workspace --release');
+      expect(leaf['cargo-test-inner-leaf']?.dependsOn).toEqual([
+        { projects: ['inner-root'], target: 'cargo-fetch' },
+        { projects: ['inner-root'], target: 'cargo-test-archive' },
+      ]);
+      // The profile lives in the archive, so the runner's production
+      // configuration has nothing left to say.
+      expect(leaf['cargo-test-inner-leaf']?.configurations?.production).toEqual({});
+      expect(inner['cargo-test-archive']?.options?.cwd).toBe('nested');
       expect(resolveDeclaredOverInferred(group, declared, 'cargo-lint')).toMatchObject({
         executor: 'nx:noop',
         cache: true,
@@ -778,20 +830,20 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
 
       const targets = await inferProjectTargets(workspace, 'packages/ferris/package.json');
 
-      // Scoped by filterset over a workspace build: one crate runs, and the
-      // build stays the one cargo-test-compile already paid for.
+      // Scoped by filterset over one archived workspace build: exactly one
+      // crate runs, and no `-p` re-resolves its features.
       expect(cargoPackageSelection(String(targets['cargo-test-ferris-core']?.options?.command ?? ''))).toEqual({
-        workspaceBuild: true,
+        archiveRun: true,
         packageFlags: [],
         filtered: ['ferris-core'],
       });
       expect(cargoPackageSelection(String(targets['cargo-test-ferris-wasm']?.options?.command ?? ''))).toEqual({
-        workspaceBuild: true,
+        archiveRun: true,
         packageFlags: [],
         filtered: ['ferris-wasm'],
       });
-      expect(targets['cargo-test-ferris-core']?.dependsOn).toEqual(['cargo-fetch', 'cargo-test-compile']);
-      expect(targets['cargo-test-ferris-wasm']?.dependsOn).toEqual(['cargo-fetch', 'cargo-test-ferris-core']);
+      expect(targets['cargo-test-ferris-core']?.dependsOn).toEqual(['cargo-fetch', 'cargo-test-archive']);
+      expect(targets['cargo-test-ferris-wasm']?.dependsOn).toEqual(['cargo-fetch', 'cargo-test-archive']);
       expect(targets['cargo-test']?.dependsOn).toEqual(['cargo-test-ferris-core', 'cargo-test-ferris-wasm']);
     } finally {
       await workspace.cleanup();
@@ -1077,12 +1129,17 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         },
       });
       expect(targets['cargo-test']?.dependsOn).toEqual(['cargo-test-cowshed-napi']);
-      // cargo-fetch survives the napi-debug re-route: the per-crate runner is
-      // itself a frozen cargo command, so its precondition is its own edge and
-      // not something it inherits from cargo-test-compile's position.
-      expect(targets['cargo-test-cowshed-napi']?.dependsOn).toEqual(['cargo-fetch', 'napi-debug']);
+      // cargo-fetch survives the napi-debug edge: the per-crate runner is itself
+      // a frozen cargo command, so its precondition is its own edge. It reads
+      // the workspace archive and still waits for the debug cdylib its own
+      // project builds, because its tests load that artifact from `target/`.
+      expect(targets['cargo-test-cowshed-napi']?.dependsOn).toEqual([
+        'cargo-fetch',
+        'cargo-test-archive',
+        'napi-debug',
+      ]);
       expect(targets['cargo-test-cowshed-napi']?.options?.command).toMatch(
-        /^cargo --frozen nextest run --workspace -E 'package\(cowshed-napi\)' --no-tests=pass --user-config-file none --config-file /,
+        /^cargo --frozen nextest run --archive-file target\/nextest\/archive\.tar\.zst --workspace-remap \. -E 'package\(cowshed-napi\)' --no-tests=pass --user-config-file none --config-file /,
       );
       expect(targets['napi-test']).toMatchObject({
         executor: '@smoothbricks/nx-plugin:bounded-exec',
@@ -1161,7 +1218,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       // An unsharded crate keeps the bare name and takes no --partition, so
       // declaring nothing is exactly the old single-target behaviour.
       expect(targets['cargo-test-small']?.options?.command).toMatch(
-        /nextest run --workspace -E 'package\(small\)' --no-tests=pass --user-config-file none/,
+        /nextest run --archive-file target\/nextest\/archive\.tar\.zst --workspace-remap \. -E 'package\(small\)' --no-tests=pass --user-config-file none/,
       );
       // The shards partition the crate MINUS the classes nextest.toml singles
       // out, i of N. Those are lifted out because a test-group only holds
@@ -1174,22 +1231,22 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       }
       for (const index of [1, 2, 3]) {
         expect(targets[`cargo-test-big-shard${index}`]?.options?.command).toContain(
-          `--workspace -E 'package(big) and not (${exceptional})' --partition hash:${index}/3 --no-tests=pass`,
+          `-E 'package(big) and not (${exceptional})' --partition hash:${index}/3 --no-tests=pass`,
         );
         expect(targets[`cargo-test-big-shard${index}`]?.options?.timeoutMs).toBe(BOUNDED_TEST_TIMEOUT_MS);
       }
       // Exact complement of the shards' filterset, so the union is the crate.
       expect(targets['cargo-test-big-exceptions']?.options?.command).toContain(
-        `--workspace -E 'package(big) and (${exceptional})' --no-tests=pass`,
+        `-E 'package(big) and (${exceptional})' --no-tests=pass`,
       );
       expect(targets['cargo-test-big-exceptions']?.options?.command).not.toContain('--partition');
       expect(targets['cargo-test-big-exceptions']?.options?.timeoutMs).toBe(BOUNDED_TEST_TIMEOUT_MS);
       // An unsharded crate needs no pin: its whole suite is already one run.
       expect(targets['cargo-test-small-exceptions']).toBeUndefined();
       expect(targets['cargo-test-big']).toBeUndefined();
-      // Every piece reaches the aggregate, and they chain rather than fan out:
-      // cargo flocks one target/, and chaining also stops the pinned group
-      // contending with a shard over a machine-wide resource.
+      // Every piece reaches the aggregate, and they all hang off the one
+      // archive: a run extracts binaries to its own temp directory and writes
+      // nothing to cargo's flocked target/, so nothing is left to serialize.
       expect(targets['cargo-test']?.dependsOn).toEqual([
         'cargo-test-big-shard1',
         'cargo-test-big-shard2',
@@ -1197,11 +1254,15 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         'cargo-test-big-exceptions',
         'cargo-test-small',
       ]);
-      expect(targets['cargo-test-big-shard1']?.dependsOn).toEqual(['cargo-fetch', 'cargo-test-compile']);
-      expect(targets['cargo-test-big-shard2']?.dependsOn).toEqual(['cargo-fetch', 'cargo-test-big-shard1']);
-      expect(targets['cargo-test-big-shard3']?.dependsOn).toEqual(['cargo-fetch', 'cargo-test-big-shard2']);
-      expect(targets['cargo-test-big-exceptions']?.dependsOn).toEqual(['cargo-fetch', 'cargo-test-big-shard3']);
-      expect(targets['cargo-test-small']?.dependsOn).toEqual(['cargo-fetch', 'cargo-test-big-exceptions']);
+      for (const name of [
+        'cargo-test-big-shard1',
+        'cargo-test-big-shard2',
+        'cargo-test-big-shard3',
+        'cargo-test-big-exceptions',
+        'cargo-test-small',
+      ]) {
+        expect(targets[name]?.dependsOn).toEqual(['cargo-fetch', 'cargo-test-archive']);
+      }
       // Pieces of one crate share its inputs: they are one suite, split only to
       // fit the bound, so any change to the crate invalidates all of them.
       expect(targets['cargo-test-big-shard2']?.inputs).toEqual(targets['cargo-test-big-shard1']?.inputs);
@@ -1458,16 +1519,17 @@ function resolveDeclaredOverInferred(
  * How a cargo test command is scoped to one crate, split into the three facts
  * that can independently go wrong.
  *
- * `--workspace` must be present: it makes the build fingerprint-identical to
- * `cargo-test-compile`'s, so the bounded run reuses those artifacts. Narrowing
- * must come from the nextest filterset, which selects what RUNS without
- * changing what is BUILT. `--package` narrows too, but it re-resolves that
- * crate's features, diverges from the workspace build, and rebuilds inside the
- * bounded window — 57.9s of a 120s budget on a hosted 3-core macOS runner — so
- * its presence is a regression even though it selects the same tests.
+ * `--archive-file` must be present: the runner executes binaries one workspace
+ * `cargo nextest archive --workspace` already built, so a per-crate run cannot
+ * compile anything. Narrowing comes from the nextest filterset, which selects
+ * what RUNS. `--package` narrows too, but it re-resolves that crate's features,
+ * which is a build — 57.9s of a 120s bounded budget on a hosted 3-core macOS
+ * runner when the runners still built — so its presence is a regression even
+ * though it selects the same tests. nextest rejects it outright beside
+ * `--archive-file`, and this assertion says so before cargo does.
  */
 function cargoPackageSelection(command: string): {
-  workspaceBuild: boolean;
+  archiveRun: boolean;
   packageFlags: string[];
   filtered: string[];
 } {
@@ -1482,7 +1544,7 @@ function cargoPackageSelection(command: string): {
     }
   }
   return {
-    workspaceBuild: tokens.includes('--workspace'),
+    archiveRun: tokens.includes('--archive-file'),
     packageFlags,
     filtered: [...command.matchAll(/\bpackage\(([^)]+)\)/g)].flatMap((match) =>
       match[1] === undefined ? [] : [match[1]],

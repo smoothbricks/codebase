@@ -16,6 +16,8 @@ import { BOUNDED_TEST_KILL_AFTER_MS, BOUNDED_TEST_TIMEOUT_MS } from './bounded-t
 import {
   type AttributedCargoWorkspacePackage,
   attributeCargoWorkspacePackages,
+  CARGO_TEST_ARCHIVE_FILE,
+  CARGO_TEST_ARCHIVE_TARGET,
   CARGO_TEST_COMPILE_TARGET,
   CARGO_TEST_EXCEPTIONS_SUFFIX,
   CARGO_TEST_TARGET,
@@ -179,6 +181,21 @@ function cargoRuntimeInput(projectRoot: string, command: string): { runtime: str
   const quotedRoot = `'${projectRoot.replaceAll("'", "'\"'\"'")}'`;
   return { runtime: `cd ${quotedRoot} && ${command}` };
 }
+
+/**
+ * Everything a target actually runs, as one string. `nx:run-commands` accepts
+ * either spelling and inference asks four questions of the text — does it run
+ * frozen cargo, which tool's version keys its cache, which target directories
+ * does it write — so the two shapes collapse here once rather than at each ask.
+ */
+function targetCommandText(target: TargetConfiguration): string {
+  const command: unknown = target.options?.command;
+  const commands: unknown = target.options?.commands;
+  return [
+    typeof command === 'string' ? command : '',
+    ...(Array.isArray(commands) ? commands.filter((entry) => typeof entry === 'string') : []),
+  ].join('\n');
+}
 const NAPI_INPUTS = CARGO_OUTPUT_INPUTS;
 
 interface NapiTargetConvention extends NapiPlatform {
@@ -273,14 +290,20 @@ function createCargoWasmTarget(
  * which is not a property of the tests. `cargo test --no-run` pays that cost
  * in its own unbounded target. Cargo reuses incremental compilation locally;
  * Nx cannot cache this warming action without restoring shared mutable state.
- * The bounded runner then uses the warm directory for the suites' own runtime.
  *
  * Cargo flocks one `target/` per invocation. Nx must not run two cargo
  * writers on that directory at once — that is a mutex, not a deadlock, and
  * the second process sits in "Blocking waiting for file lock" until a
  * timeout. Inference serializes writers that share the default target dir
- * (`napi-debug` after compile, `cargo-test` after `napi-debug`). Clippy uses
- * its own `--target-dir` so lint can overlap tests.
+ * (`napi-debug` after compile).
+ *
+ * Clippy writes ONE shared `--target-dir target/cargo-lint` rather than a
+ * directory per crate. Per-crate dirs were never about overlap: clippy of a
+ * crate is a check build of its whole closure, so 49 crates meant 49 closure
+ * rebuilds and 11 GiB of target directories on one repository, and no
+ * per-crate cache hit ever repaid that. Sharing the directory costs nothing:
+ * cargo's own lock serializes the invocations that use it and each dependency
+ * artifact is then compiled once for all of them.
  */
 function createCargoTestCompileTarget(projectRoot: string): TargetConfiguration {
   return {
@@ -294,6 +317,45 @@ function createCargoTestCompileTarget(projectRoot: string): TargetConfiguration 
     },
     configurations: {
       production: { command: cargoFrozen('test --workspace --release --no-run') },
+    },
+  };
+}
+
+/**
+ * The workspace's test binaries, compiled once and packed into one file the
+ * per-crate runners execute from.
+ *
+ * This is the only cargo BUILD in the test graph. Before it, every per-crate
+ * target ran `nextest run --workspace -E 'package(X)'`, which is a workspace
+ * build with a filter: 32 such tasks on one repository each re-entered cargo,
+ * re-resolved features and chained behind one another so the flocked `target/`
+ * had a single writer. Reading from an archive removes the build from the run
+ * entirely — the runner extracts binaries into its own temporary directory and
+ * touches no shared state — which is what lets the runners fan out.
+ *
+ * Cached, unlike `cargo-test-compile`, because it produces a VALUE: one file,
+ * not a mutable build tree Nx would have to restore. `--workspace` matches the
+ * clippy selection exactly, so both gates unify features the same way.
+ */
+function createCargoTestArchiveTarget(projectRoot: string, configFile: string): TargetConfiguration {
+  const archiveCommand = (profile: string): string =>
+    cargoFrozen(
+      `nextest archive --workspace${profile} --archive-file ${CARGO_TEST_ARCHIVE_FILE} --user-config-file none --config-file ${configFile}`,
+    );
+  return {
+    executor: 'nx:run-commands',
+    cache: true,
+    inputs: CARGO_INPUTS,
+    outputs: [`{projectRoot}/${CARGO_TEST_ARCHIVE_FILE}`],
+    options: {
+      commands: [`mkdir -p ${posix.dirname(CARGO_TEST_ARCHIVE_FILE)}`, archiveCommand('')],
+      cwd: projectRoot,
+      parallel: false,
+    },
+    configurations: {
+      production: {
+        commands: [`mkdir -p ${posix.dirname(CARGO_TEST_ARCHIVE_FILE)}`, archiveCommand(' --release')],
+      },
     },
   };
 }
@@ -626,6 +688,11 @@ async function createProjectTargets(
       ),
     ];
     targets[CARGO_TEST_COMPILE_TARGET].inputs = workspaceInputs.length > 0 ? workspaceInputs : CARGO_INPUTS;
+    targets[CARGO_TEST_ARCHIVE_TARGET] = createCargoTestArchiveTarget(
+      cargoWorkspaceRoot,
+      nextestConfigRelPath(workspaceRoot, cargoWorkspaceRoot, PLUGIN_NEXTEST_CONFIG),
+    );
+    targets[CARGO_TEST_ARCHIVE_TARGET].inputs = workspaceInputs.length > 0 ? workspaceInputs : CARGO_INPUTS;
     const aggregateDependencies = cargoWorkspace.packages.flatMap((plan) =>
       plan.pieces.map((piece) =>
         cargoTargetDependency(projectName, {
@@ -831,12 +898,7 @@ async function createProjectTargets(
       if (name === CARGO_FETCH_TARGET) {
         continue;
       }
-      const command: unknown = target.options?.command;
-      const commands: unknown = target.options?.commands;
-      const text = [
-        typeof command === 'string' ? command : '',
-        ...(Array.isArray(commands) ? commands.filter((entry) => typeof entry === 'string') : []),
-      ].join('\n');
+      const text = targetCommandText(target);
       if (text.includes(CARGO_FROZEN_PREFIX)) {
         target.dependsOn = [CARGO_FETCH_TARGET, ...(target.dependsOn ?? [])];
       }
@@ -847,12 +909,7 @@ async function createProjectTargets(
       targetName: CARGO_FETCH_TARGET,
     });
     for (const target of Object.values(targets)) {
-      const command: unknown = target.options?.command;
-      const commands: unknown = target.options?.commands;
-      const text = [
-        typeof command === 'string' ? command : '',
-        ...(Array.isArray(commands) ? commands.filter((entry) => typeof entry === 'string') : []),
-      ].join('\n');
+      const text = targetCommandText(target);
       if (text.includes(CARGO_FROZEN_PREFIX)) {
         target.dependsOn = [rootFetch, ...(target.dependsOn ?? [])];
       }
@@ -862,31 +919,32 @@ async function createProjectTargets(
   // Cache verdicts and dedicated artifacts, never Cargo's shared mutable build
   // directories. Resolve tool versions from the command's actual directory.
   for (const [name, target] of Object.entries(targets)) {
-    const command: unknown = target.options?.command;
-    const commands: unknown = target.options?.commands;
-    const text = [
-      typeof command === 'string' ? command : '',
-      ...(Array.isArray(commands) ? commands.filter((entry) => typeof entry === 'string') : []),
-    ].join('\n');
+    const text = targetCommandText(target);
     if (!text.includes(CARGO_FROZEN_PREFIX)) continue;
     target.outputs ??= [];
     if (!target.cache) continue;
     const cwd: unknown = target.options?.cwd;
     const versions = name.startsWith('cargo-lint')
       ? ` && cargo clippy -V${name === CARGO_CROSS_LINT_TARGET ? '' : ' && cargo fmt --version'}`
-      : text.includes('nextest run')
+      : text.includes('nextest ')
         ? ' && cargo nextest --version'
         : '';
+    // The archive is the one cached artifact whose CONTENT depends on where it
+    // was produced: nextest bakes the workspace's absolute path into it, and
+    // `env!("CARGO_BIN_EXE_*")` bakes absolute binary paths into the tests
+    // themselves. Restoring one tree's archive into another tree's path is a
+    // silent wrong answer, so the path is part of the key: a second checkout
+    // builds its own archive, and CI — whose path is stable — still shares.
+    const identity = name === CARGO_TEST_ARCHIVE_TARGET ? 'pwd && ' : '';
     target.inputs = [
       ...(target.inputs ?? CARGO_INPUTS),
       cargoRuntimeInput(typeof cwd === 'string' ? cwd : projectRoot, CARGO_ENVIRONMENT_INPUT.runtime),
-      cargoRuntimeInput(typeof cwd === 'string' ? cwd : projectRoot, `rustc -vV && cargo -V${versions}`),
+      cargoRuntimeInput(typeof cwd === 'string' ? cwd : projectRoot, `${identity}rustc -vV && cargo -V${versions}`),
     ];
   }
 
   // Cargo flocks the workspace's default target/. Keep every writer out of the
-  // bounded test window by placing N-API debug builds on the same serialized
-  // chain as the root compile and per-crate runners.
+  // bounded test window by placing N-API debug builds behind the root compile.
   const cargoTestCompileDependency: CargoTargetDependency | null = targets[CARGO_TEST_COMPILE_TARGET]
     ? CARGO_TEST_COMPILE_TARGET
     : isCargoProject && cargoWorkspace
@@ -903,17 +961,18 @@ async function createProjectTargets(
     }
   }
   if (napiDebug && cargoWorkspace) {
-    const firstCargoTest = cargoPackagePlans.flatMap((plan) => plan.pieces)[0];
-    const firstTarget = firstCargoTest ? targets[firstCargoTest.targetName] : undefined;
-    if (firstCargoTest && firstTarget) {
-      const previous = cargoTargetDependency(projectName, firstCargoTest.previous);
-      const debugDependencies = napiDebug.dependsOn ?? [];
-      if (!hasCargoTargetDependency(debugDependencies, previous)) {
-        napiDebug.dependsOn = [...debugDependencies, previous];
+    // A crate whose project also builds the debug cdylib runs its tests after
+    // that build: the tests dlopen what `napi-debug` writes into `target/debug`,
+    // and an archived test binary still loads it from this tree. The old serial
+    // chain gave the same guarantee by accident, to whichever crate happened to
+    // be first; this states it for exactly the crates that own the artifact.
+    for (const plan of cargoPackagePlans) {
+      for (const piece of plan.pieces) {
+        const target = targets[piece.targetName];
+        if (target && !hasCargoTargetDependency(target.dependsOn ?? [], 'napi-debug')) {
+          target.dependsOn = [...(target.dependsOn ?? []), 'napi-debug'];
+        }
       }
-      firstTarget.dependsOn = (firstTarget.dependsOn ?? []).map((dependency) =>
-        hasCargoTargetDependency([dependency], previous) ? 'napi-debug' : dependency,
-      );
     }
   } else if (napiDebug) {
     for (const [name, target] of Object.entries(targets)) {
@@ -1000,10 +1059,42 @@ async function createProjectTargets(
       ],
     };
   }
-  if (hasAnyBuildOutputTarget) {
+  // Every cargo build directory this project's own commands write. `clean`
+  // cannot learn them from `outputs`: a clippy or nextest target dir is a
+  // multi-GB build tree that must never enter the Nx cache (`target/cargo-lint`
+  // alone was 11 GiB when each of 49 crates had its own), so the targets
+  // deliberately declare `outputs: []`. Reading `--target-dir` back off the
+  // commands means the list cannot drift from what actually gets written, and a
+  // directory is named relative to the command's own cwd, not the project root.
+  const cargoBuildDirs = [
+    ...new Set(
+      Object.entries(targets).flatMap(([name, target]) => {
+        const cwd: unknown = target.options?.cwd;
+        const base = typeof cwd === 'string' ? cwd : projectRoot;
+        const dirs = [...targetCommandText(target).matchAll(/--target-dir\s+(\S+)/g)].flatMap((match) =>
+          match[1] === undefined ? [] : [match[1]],
+        );
+        if (name === CARGO_TEST_ARCHIVE_TARGET) {
+          dirs.push(posix.dirname(CARGO_TEST_ARCHIVE_FILE));
+        }
+        return dirs.map((dir) => `{workspaceRoot}/${posix.normalize(posix.join(base, dir))}`);
+      }),
+    ),
+  ].sort();
+  if (hasAnyBuildOutputTarget || cargoBuildDirs.length > 0) {
+    const declaredBuild = declaredTargets.build;
+    const declaredBuildOutputs =
+      isRecord(declaredBuild) && Array.isArray(declaredBuild.outputs)
+        ? declaredBuild.outputs.filter((output): output is string => typeof output === 'string')
+        : null;
     targets.clean = {
       executor: '@smoothbricks/nx-plugin:clean-outputs',
       cache: false,
+      // Naming any output REPLACES the executor's default, so the build outputs
+      // it would have used are restated here rather than lost.
+      ...(cargoBuildDirs.length > 0
+        ? { options: { outputs: [...(declaredBuildOutputs ?? ['{projectRoot}/dist']), ...cargoBuildDirs] } }
+        : {}),
     };
   }
 
@@ -1479,7 +1570,6 @@ interface CargoTargetRef {
 
 interface CargoTestPiece {
   extra: string;
-  previous: CargoTargetRef;
   selector: string;
   targetName: string;
 }
@@ -1539,10 +1629,6 @@ async function resolveCargoWorkspaces(
       projects,
     ).map((pkg) => ({ ...pkg, dir: posix.relative(rootProject.root, pkg.dir) || '.' }));
     const packages: CargoPackagePlan[] = [];
-    let previous: CargoTargetRef = {
-      projectName: rootProject.name,
-      targetName: CARGO_TEST_COMPILE_TARGET,
-    };
     const exceptional = exceptionalTestFilter(PLUGIN_NEXTEST_CONFIG);
     for (const pkg of attributed) {
       const pieces: CargoTestPiece[] = [];
@@ -1553,21 +1639,17 @@ async function resolveCargoWorkspaces(
         const targetName = cargoTestPackageTargetName(pkg.name, sharded ? `shard${index}` : undefined);
         pieces.push({
           extra: sharded ? ` --partition hash:${index}/${pkg.testShards}` : '',
-          previous,
           selector: shardable,
           targetName,
         });
-        previous = { projectName: pkg.projectName, targetName };
       }
       if (pin !== null) {
         const targetName = cargoTestPackageTargetName(pkg.name, CARGO_TEST_EXCEPTIONS_SUFFIX);
         pieces.push({
           extra: '',
-          previous,
           selector: `package(${pkg.name}) and (${pin})`,
           targetName,
         });
-        previous = { projectName: pkg.projectName, targetName };
       }
       packages.push({ package: pkg, pieces });
     }
@@ -1585,14 +1667,25 @@ async function resolveCargoWorkspaces(
  * One bounded target per crate; a crate that declares `smoothbricks.test.shards`
  * gets one per shard plus one for the tests nextest.toml singles out.
  *
- * `--workspace -E 'package(X)'` rather than `--package X`. A filterset selects
- * what RUNS; `--package` also re-resolves FEATURES for that crate alone, which
- * fingerprints differently from the `cargo test --workspace --no-run` that
- * `cargo-test-compile` already paid for, so cargo rebuilds the divergent half
- * inside the bounded window. Measured on a hosted 3-core macOS runner that
- * rebuild was 57.9s of a 120s budget — the tests were killed with 264 still to
- * run while nothing was wrong with them. The two forms select the same tests;
- * only the filterset reuses the compile target's artifacts.
+ * Every piece EXECUTES, it never builds: `--archive-file` runs the binaries
+ * `cargo-test-archive` compiled once for the whole workspace, extracted into
+ * the runner's own temporary directory. That is what removed the two costs the
+ * old shape could not avoid. `nextest run --workspace -E 'package(X)'` re-entered
+ * cargo once per crate, and the `-p X` form re-resolved that crate's features so
+ * cargo rebuilt the divergent half inside the bounded window — measured at 57.9s
+ * of a 120s budget on a hosted 3-core macOS runner, killing the run with 264
+ * tests still to go. Neither form is reachable from an archive: nextest rejects
+ * `--workspace` and `-p` beside `--archive-file`, so the filterset is the only
+ * selector left, and it selects the same tests it always did.
+ *
+ * `--workspace-remap .` is not cosmetic. An archive records the ABSOLUTE paths
+ * of the tree that produced it; without the remap, a restored archive hands
+ * every test the producing tree's `CARGO_MANIFEST_DIR` — measured on a moved
+ * tree, tests then read another checkout's fixtures, or a path that no longer
+ * exists. With it, the runner's own cargo workspace root wins. (`env!` bakes
+ * paths at COMPILE time and no remap can move them: a test that spawns
+ * `env!("CARGO_BIN_EXE_x")` still needs the producing tree, which is why the
+ * archive's cache key includes that path.)
  *
  * nextest.toml singles some tests out with an override, and each such class
  * breaks a shard in its own way — a `test-group` is scoped to one nextest RUN
@@ -1613,18 +1706,9 @@ async function resolveCargoWorkspaces(
  * Detecting that regression requires a separate coverage policy rather than
  * making valid empty crates and shards fail execution.
  *
- * Pieces chain rather than fan out, like the crates do: cargo flocks one
- * `target/`, and chaining keeps even the pinned group from overlapping the
- * shards on a machine-wide resource.
- */
-
-/**
- * Root mode keeps `--workspace` and adds `-p` only to make the owning crate
- * explicit in the command Nx attributes to its project. Cargo treats
- * `--workspace -p X` as the full workspace selection, so `-p` is inert for
- * feature resolution; the nextest filterset is what narrows the tests that run.
- * Never drop `--workspace`: `-p X` alone re-resolves features for one package
- * and defeats the compile target's shared artifacts.
+ * Pieces fan out rather than chain. The chain existed because every runner was
+ * a cargo writer on one flocked `target/`; an archive run writes nothing there,
+ * so the only serialization left is the one the machine's own scheduler does.
  */
 async function addCargoTestTargets(
   targets: Record<string, TargetConfiguration>,
@@ -1659,28 +1743,30 @@ async function addCargoTestTargets(
         runtime: `bun -e 'console.log(new Bun.CryptoHasher("sha256").update(require("node:fs").readFileSync(process.argv[1])).digest("hex"))' '${PLUGIN_NEXTEST_CONFIG.replaceAll("'", "'\"'\"'")}'`,
       },
     ];
+    const archive = cargoTargetDependency(currentProjectName, {
+      projectName: workspace.rootProjectName,
+      targetName: CARGO_TEST_ARCHIVE_TARGET,
+    });
     for (const piece of plan.pieces) {
       targetNames.push(piece.targetName);
       targets[piece.targetName] = {
         executor: '@smoothbricks/nx-plugin:bounded-exec',
         cache: true,
         inputs,
-        dependsOn: [cargoTargetDependency(currentProjectName, piece.previous)],
+        dependsOn: [archive],
         options: {
           command: cargoFrozen(
-            `nextest run --workspace${workspace.projectRoot === '.' ? ` -p ${plan.package.name}` : ''} -E '${piece.selector}'${piece.extra} --no-tests=pass --user-config-file none --config-file ${configFile}`,
+            `nextest run --archive-file ${CARGO_TEST_ARCHIVE_FILE} --workspace-remap . -E '${piece.selector}'${piece.extra} --no-tests=pass --user-config-file none --config-file ${configFile}`,
           ),
           cwd: workspace.projectRoot,
           timeoutMs: BOUNDED_TEST_TIMEOUT_MS,
           killAfterMs: BOUNDED_TEST_KILL_AFTER_MS,
         },
-        configurations: {
-          production: {
-            command: cargoFrozen(
-              `nextest run --workspace${workspace.projectRoot === '.' ? ` -p ${plan.package.name}` : ''} --release -E '${piece.selector}'${piece.extra} --no-tests=pass --user-config-file none --config-file ${configFile}`,
-            ),
-          },
-        },
+        // The archive already holds the profile it was built with, and nextest
+        // rejects `--release` beside `--archive-file`. Nx propagates the
+        // configuration to this target's dependencies, so `:production` builds
+        // the release archive and this command runs exactly what it finds.
+        configurations: { production: {} },
       };
     }
   }
