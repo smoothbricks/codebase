@@ -70,23 +70,26 @@ devenv_matches_lock() {
 }
 
 install_devenv() {
-  # Host runners get devenv from their image and own their own Nix profile, so a
-  # repository must not rewrite it: SMOO_HOST_RUNNER comes from setup-devenv's
-  # runner-kind detection, and on those hosts whatever is on PATH is correct by
-  # definition. Everywhere else the devenv in play came out of a cache THIS
-  # workflow wrote, so it is ours to hold to the lock.
+  local rev flake found=""
+  # Host runners own their Nix profile, and that profile roots a /nix/store the
+  # whole fleet shares, so an image-provided devenv is authoritative here
+  # whatever commit it is — and a wrong one is never REPLACED, because
+  # `nix profile remove --all` on a host would take the fleet's other roots with
+  # it. When the image ships none, install the locked rev: that is what these
+  # runners have always done, they just did it from a floating branch.
+  # SMOO_HOST_RUNNER comes from setup-devenv's runner-kind detection.
   if [ "${SMOO_HOST_RUNNER:-false}" = true ]; then
     if command -v devenv >/dev/null 2>&1; then
       echo "using host devenv: $(command -v devenv) ($(devenv version))"
     else
-      echo "install-devenv: host runner has no devenv on PATH" >&2
-      return 1
+      flake="${DEVENV_FLAKE:-github:cachix/devenv/$(devenv_locked_rev)}"
+      echo "host runner has no devenv; nix profile add ${flake}"
+      nix profile add --accept-flake-config "$flake"
     fi
     devenv_path_and_caches
     return 0
   fi
 
-  local rev flake found=""
   rev="$(devenv_locked_rev)"
   # The store cache carries content only, never the Nix profiles, so the normal
   # ephemeral case is that nothing is installed yet and this profile-adds the
