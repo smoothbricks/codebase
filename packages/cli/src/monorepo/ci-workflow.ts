@@ -6,6 +6,7 @@ import type {
   PackageCargoCredentialsConfig,
   PackageCargoGitOrigin,
   PackagePrivateNpmConfig,
+  PackageRemoteCacheConfig,
   PackageSmooGithub,
   PackageSmooGithubEnvironments,
   PackageSourceCheckoutConfig,
@@ -79,6 +80,12 @@ export interface CiWorkflowDefinitionOptions extends DeployStepSecretConfig {
    * before SetupDevenv. Absent means no private Cargo fetch.
    */
   cargoCredentials?: PackageCargoCredentialsConfig;
+  /**
+   * Declared self-hosted Nx remote cache (package.json `smoo.remoteCache`).
+   * Every job that runs Nx carries the server and the access token, so one
+   * cache serves the whole fleet. Absent means each runner caches locally.
+   */
+  remoteCache?: PackageRemoteCacheConfig;
   /** GitHub Environments: staging for the validate/e2e jobs, production for the production-on-push job. */
   environments?: PackageSmooGithubEnvironments;
   /** Secrets for the e2e-deployment step, env var name → repository secret name. */
@@ -166,8 +173,9 @@ jobs:
 ${renderRunsOnLine(options.runsOn)}
     timeout-minutes: 45
 ${
-  options.privateNpm?.readTokenEnv || options.cargoCredentials !== undefined
-    ? `    # Fork PRs receive no secrets; private dependency installs cannot run there.
+  options.privateNpm?.readTokenEnv || options.cargoCredentials !== undefined || options.remoteCache !== undefined
+    ? `    # Fork PRs receive no secrets, so neither a private dependency install nor an
+    # authenticated remote cache read can run there.
     if: \${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
 `
     : ''
@@ -179,7 +187,7 @@ ${
     : ''
 }    env:
       GH_TOKEN: ${githubExpression('github.token')}
-${cargoCredentialJobEnvLines(options.cargoCredentials)}${privateNpmReadTokenJobEnv(options)}    steps:
+${remoteCacheJobEnvLines(options.remoteCache)}${cargoCredentialJobEnvLines(options.cargoCredentials)}${privateNpmReadTokenJobEnv(options)}    steps:
 `;
 }
 
@@ -457,6 +465,78 @@ export function normalizeSourceCheckout(config: PackageSourceCheckoutConfig): Pa
     );
   }
   return config;
+}
+
+/**
+ * Job env lines carrying the declared Nx remote cache. The pair rides the job
+ * env rather than a step because every Nx invocation in the job — build, lint,
+ * tests, deploy — reads it, and Nx enables the cache on a nonempty server
+ * alone: an empty or absent token would make it authenticate with nothing and
+ * fail every task on 401, which is why the job carries the same fork-PR gate
+ * as a private dependency install (see `renderCiWorkflowHeader`).
+ *
+ * A declared `internalServer` is the address managed runners use, exactly as a
+ * git origin's `internalMirror` is: both say this repository's runners sit
+ * inside that network, and shells outside it keep the public origin.
+ * Mechanism errors surface at managed-file render time, never inside CI.
+ */
+export function remoteCacheJobEnvLines(config: PackageRemoteCacheConfig | undefined): string {
+  if (config === undefined) {
+    return '';
+  }
+  const normalized = normalizeRemoteCache(config);
+  return [
+    `      NX_SELF_HOSTED_REMOTE_CACHE_SERVER: ${normalized.internalServer ?? normalized.server}\n`,
+    `      NX_SELF_HOSTED_REMOTE_CACHE_ACCESS_TOKEN: ${githubExpression(`secrets.${normalized.tokenSecret}`)}\n`,
+  ].join('');
+}
+
+/** Mechanism errors surface at managed-file render time, never inside CI. */
+export function normalizeRemoteCache(config: PackageRemoteCacheConfig): PackageRemoteCacheConfig {
+  assertCacheOrigin('server', config.server);
+  if (config.internalServer !== undefined) {
+    assertCacheOrigin('internalServer', config.internalServer);
+    if (config.internalServer === config.server) {
+      throw new Error(
+        `smoo.remoteCache internalServer repeats server ${config.server}; drop internalServer or point it at the address internal runners reach`,
+      );
+    }
+  }
+  if (!/^[A-Z_][A-Z0-9_]*$/.test(config.tokenSecret)) {
+    throw new Error(
+      `smoo.remoteCache needs an upper-case secret name for tokenSecret, got ${JSON.stringify(config.tokenSecret)}`,
+    );
+  }
+  return config;
+}
+
+/**
+ * A cache origin is exactly `scheme://host[:port]`. Nx appends
+ * `/v1/cache/<hash>` to it, so a trailing slash silently requests a doubled
+ * slash the server routes nowhere, and a path or credential would be dropped
+ * or leaked rather than honored.
+ */
+function assertCacheOrigin(field: 'server' | 'internalServer', value: string): void {
+  let url: URL | null = null;
+  try {
+    url = new URL(value);
+  } catch {
+    url = null;
+  }
+  if (
+    url === null ||
+    (url.protocol !== 'https:' && url.protocol !== 'http:') ||
+    url.pathname !== '/' ||
+    value.endsWith('/') ||
+    url.username !== '' ||
+    url.password !== '' ||
+    url.search !== '' ||
+    url.hash !== ''
+  ) {
+    throw new Error(
+      `smoo.remoteCache ${field} needs a credential-free http(s) origin with no path and no trailing slash, got ${JSON.stringify(value)}`,
+    );
+  }
 }
 
 /**
@@ -828,7 +908,7 @@ ${renderRunsOnLine(options.runsOn)}
 ${environmentLine(options.environments?.staging)}    if: \${{ needs.main.result == 'success' && needs.main.outputs.deployment-stage != '' }}
     env:
       GH_TOKEN: \${{ github.token }}
-${cargoCredentialJobEnvLines(options.cargoCredentials)}${privateNpmReadTokenJobEnv(options)}    steps:
+${remoteCacheJobEnvLines(options.remoteCache)}${cargoCredentialJobEnvLines(options.cargoCredentials)}${privateNpmReadTokenJobEnv(options)}    steps:
 ${renderCiWorkflowSteps(followUpSetupSteps(options, numbers), options)}
       # Step ${numbers.middle}
       - name: E2E Tests (Deployed Stage)
@@ -859,7 +939,7 @@ ${renderRunsOnLine(options.runsOn)}
     if: \${{ !cancelled() && github.event_name == 'push' && github.ref == ${stagingRefLiteral(options)} && needs.main.result == 'success'${e2eGate} }}
 ${environmentLine(options.environments?.production)}    env:
       GH_TOKEN: \${{ github.token }}
-${cargoCredentialJobEnvLines(options.cargoCredentials)}${privateNpmReadTokenJobEnv(options)}    steps:
+${remoteCacheJobEnvLines(options.remoteCache)}${cargoCredentialJobEnvLines(options.cargoCredentials)}${privateNpmReadTokenJobEnv(options)}    steps:
 ${renderCiWorkflowSteps(followUpSetupSteps(options, numbers), options)}
       # Step ${numbers.middle}
       - name: 🚀 Deploy Production

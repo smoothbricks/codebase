@@ -10,6 +10,7 @@ import {
   type PackageCargoCredentialsConfig,
   type PackageJson,
   type PackagePrivateNpmConfig,
+  type PackageRemoteCacheConfig,
   type PackageSmooGithub,
   type PackageSmooGithubEnvironments,
   type PackageSourceCheckoutConfig,
@@ -176,6 +177,8 @@ export interface ManagedFileContext {
   sourceCheckouts?: PackageSourceCheckoutConfig[];
   /** Declared Cargo private-dependency credentials from the root smoo config; absent means none. */
   cargoCredentials?: PackageCargoCredentialsConfig;
+  /** Declared self-hosted Nx remote cache from the root smoo config; absent means local caching only. */
+  remoteCache?: PackageRemoteCacheConfig;
 }
 
 interface DeployTargetInfo {
@@ -391,6 +394,7 @@ function getManagedContent(file: ManagedFile, context: ManagedFileContext): stri
         privateNpm: context.privateNpm,
         sourceCheckouts: context.sourceCheckouts,
         cargoCredentials: context.cargoCredentials,
+        remoteCache: context.remoteCache,
         environments: context.ciEnvironments,
         deploySecrets: context.ciDeploySecrets,
         e2eSecrets: context.ciE2eSecrets,
@@ -414,6 +418,7 @@ function getManagedContent(file: ManagedFile, context: ManagedFileContext): stri
         privateNpm: context.privateNpm,
         sourceCheckouts: context.sourceCheckouts,
         cargoCredentials: context.cargoCredentials,
+        remoteCache: context.remoteCache,
         deploySecrets: context.ciDeploySecrets,
       });
     }
@@ -476,6 +481,7 @@ async function getManagedFileContext(root: string): Promise<ManagedFileContext> 
     platformTargetGlobs,
     sourceCheckouts,
     cargoCredentials,
+    remoteCache: manifest?.smoo?.remoteCache,
     macosPlatformArchitectures: macosPlatformArchitecturesForTest(targetNames),
     privateNpm,
   };

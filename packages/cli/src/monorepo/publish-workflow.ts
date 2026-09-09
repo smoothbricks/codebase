@@ -11,6 +11,7 @@ import { isSmoothBricksCodebasePackageName } from '../lib/cli-package.js';
 import type {
   PackageCargoCredentialsConfig,
   PackagePrivateNpmConfig,
+  PackageRemoteCacheConfig,
   PackageSmooGithub,
   PackageSourceCheckoutConfig,
 } from '../lib/json.js';
@@ -21,6 +22,7 @@ import {
   cargoCredentialStepLines,
   type DeployStepSecretConfig,
   deployStepSecretEnvLines,
+  remoteCacheJobEnvLines,
   sourceCheckoutsStepLines,
 } from './ci-workflow.js';
 import { GITHUB_HOSTED_LINUX_RUNNER, renderRunsOnLine, type WorkflowRunsOn } from './github-runs-on.js';
@@ -125,6 +127,13 @@ export interface PublishWorkflowDefinitionOptions extends DeployStepSecretConfig
    * become job env because every later cargo fetch resolves them.
    */
   cargoCredentials?: PackageCargoCredentialsConfig;
+  /**
+   * Declared self-hosted Nx remote cache. Every job here runs Nx targets —
+   * the release-candidate build, the platform build, the publish gate — so
+   * each carries the server and access token and reuses what CI already
+   * built for the same hashes.
+   */
+  remoteCache?: PackageRemoteCacheConfig;
 }
 
 export interface PublishWorkflowInputs {
@@ -466,7 +475,7 @@ jobs:
   publish:
 ${options.release === false ? renderRunsOnLine(options.runsOn) : publishJobRunsOnLine(options)}
     env:
-      GH_TOKEN: ${githubExpression('github.token')}${cargoCredentialsJobEnv(options)}${privateNpmInstallJobEnv(options)}
+      GH_TOKEN: ${githubExpression('github.token')}${remoteCacheJobEnv(options)}${cargoCredentialsJobEnv(options)}${privateNpmInstallJobEnv(options)}
     steps:
 `;
 }
@@ -717,6 +726,17 @@ function cargoCredentialsJobEnv(options: PublishWorkflowDefinitionOptions): stri
   return rendered === '' ? '' : `\n${rendered}`;
 }
 
+/**
+ * The remote cache is job env for the same reason: every Nx target in the job
+ * reads it, and a release build that missed the cache would rebuild what CI
+ * already built for the identical hashes. Only `${{ secrets.NAME }}` is
+ * rendered for the token. Malformed declarations throw here, not in CI.
+ */
+function remoteCacheJobEnv(options: PublishWorkflowDefinitionOptions): string {
+  const rendered = remoteCacheJobEnvLines(options.remoteCache).trimEnd();
+  return rendered === '' ? '' : `\n${rendered}`;
+}
+
 function renderSingleJobPublishWorkflowSteps(
   steps: PublishWorkflowStep[],
   options: PublishWorkflowDefinitionOptions,
@@ -796,7 +816,7 @@ ${renderRunsOnLine(options.runsOn)}
       mode: ${githubExpression('steps.version.outputs.mode')}
       release-sha: ${githubExpression('steps.release-state.outputs.sha')}
     env:
-      GH_TOKEN: ${githubExpression('github.token')}${cargoCredentialsJobEnv(options)}${privateNpmInstallJobEnv(options)}
+      GH_TOKEN: ${githubExpression('github.token')}${remoteCacheJobEnv(options)}${cargoCredentialsJobEnv(options)}${privateNpmInstallJobEnv(options)}
     steps:
 ${renderLinuxReleaseCandidateSteps(steps, options)}
 
@@ -806,7 +826,7 @@ ${renderMacosJobHeaderLines(options)}
       contents: read
       id-token: none
     env:
-      GH_TOKEN: ${githubExpression('github.token')}${cargoCredentialsJobEnv(options)}${privateNpmInstallJobEnv(options)}
+      GH_TOKEN: ${githubExpression('github.token')}${remoteCacheJobEnv(options)}${cargoCredentialsJobEnv(options)}${privateNpmInstallJobEnv(options)}
 ${Object.entries(options.platformProducer?.env ?? {})
   .map(([name, value]) => `      ${name}: ${JSON.stringify(value)}`)
   .join('\n')}
@@ -821,7 +841,7 @@ ${publishJobRunsOnLine(options)}
       id-token: write
     env:
       TTSC_TSGO_BINARY: ${githubExpression('github.workspace')}/node_modules/@typescript/native/bin/tsc
-      GH_TOKEN: ${githubExpression('github.token')}${cargoCredentialsJobEnv(options)}${privateNpmInstallJobEnv(options)}
+      GH_TOKEN: ${githubExpression('github.token')}${remoteCacheJobEnv(options)}${cargoCredentialsJobEnv(options)}${privateNpmInstallJobEnv(options)}
     steps:
 ${renderFinalLinuxPublishSteps(options)}
 `;

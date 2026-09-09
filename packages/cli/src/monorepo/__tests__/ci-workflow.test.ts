@@ -333,6 +333,79 @@ describe('CI workflow definition', () => {
     }
   });
 
+  it('gives every Nx job the declared remote cache at the address its runners reach', () => {
+    const definition = options({
+      deploy: true,
+      e2eDeployment: true,
+      productionOnPush: true,
+      remoteCache: {
+        server: 'https://nx-cache.example.net',
+        internalServer: 'http://10.89.0.1:8765',
+        tokenSecret: 'NX_REMOTE_CACHE_TOKEN',
+      },
+    });
+    const rendered = renderCiWorkflowYaml(definition);
+    const cacheEnv = {
+      NX_SELF_HOSTED_REMOTE_CACHE_SERVER: 'http://10.89.0.1:8765',
+      NX_SELF_HOSTED_REMOTE_CACHE_ACCESS_TOKEN: '${{ secrets.NX_REMOTE_CACHE_TOKEN }}',
+    };
+
+    expect(Bun.YAML.parse(rendered)).toMatchObject({
+      jobs: {
+        main: {
+          env: cacheEnv,
+          // A fork PR receives no secrets, and Nx fails every task a cache
+          // server refuses, so the job cannot run there at all.
+          if: "${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}",
+        },
+        'e2e-deployment': { env: cacheEnv },
+        'deploy-production': { env: cacheEnv },
+      },
+    });
+    // The public origin belongs to shells outside the runner network; a job
+    // that took it would leave the internal address unused.
+    expect(rendered).not.toContain('https://nx-cache.example.net');
+  });
+
+  it('takes the public server without an internal runner, and emits nothing without the declaration', () => {
+    const publicOnly = renderCiWorkflowYaml(
+      options({ remoteCache: { server: 'https://nx-cache.example.net', tokenSecret: 'NX_REMOTE_CACHE_TOKEN' } }),
+    );
+
+    expect(Bun.YAML.parse(publicOnly)).toMatchObject({
+      jobs: { main: { env: { NX_SELF_HOSTED_REMOTE_CACHE_SERVER: 'https://nx-cache.example.net' } } },
+    });
+    expect(renderCiWorkflowYaml(options())).not.toContain('NX_SELF_HOSTED');
+    // Without a cache token the job needs no secrets, so fork PRs still run.
+    expect(renderCiWorkflowYaml(options())).not.toContain('head.repo.full_name');
+  });
+
+  it('refuses a remote cache declaration Nx could not use, at render time', () => {
+    for (const server of [
+      'https://nx-cache.example.net/',
+      'https://nx-cache.example.net/cache',
+      'https://token@nx-cache.example.net',
+      'ftp://nx-cache.example.net',
+      'nx-cache.example.net:8765',
+    ]) {
+      expect(() =>
+        renderCiWorkflowYaml(options({ remoteCache: { server, tokenSecret: 'NX_REMOTE_CACHE_TOKEN' } })),
+      ).toThrow('smoo.remoteCache server');
+    }
+    const server = 'https://nx-cache.example.net';
+    expect(() =>
+      renderCiWorkflowYaml(
+        options({ remoteCache: { server, internalServer: 'http://10.89.0.1:8765/', tokenSecret: 'TOKEN' } }),
+      ),
+    ).toThrow('smoo.remoteCache internalServer');
+    expect(() =>
+      renderCiWorkflowYaml(options({ remoteCache: { server, internalServer: server, tokenSecret: 'TOKEN' } })),
+    ).toThrow('repeats server');
+    expect(() =>
+      renderCiWorkflowYaml(options({ remoteCache: { server, tokenSecret: 'nx_remote_cache_token' } })),
+    ).toThrow('tokenSecret');
+  });
+
   it('refuses missing registry secrets before setup and skips private Cargo jobs for fork PRs', () => {
     const definition = options({ cargoCredentials: { registryTokenEnvs: ['CARGO_REGISTRIES_EXAMPLE_TOKEN'] } });
     const steps = defineCiWorkflow(definition);

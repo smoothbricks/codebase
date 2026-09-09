@@ -430,6 +430,43 @@ a production deployment mid-flight. Pull requests and other branches keep cancel
 production jobs repeat the Cargo credential and sibling-source preflight before SetupDevenv, so their `--step` anchors
 shift with the configuration instead of staying fixed.
 
+### Remote cache configuration (`package.json` → `smoo.remoteCache`)
+
+One Nx self-hosted remote cache shared by every runner and every developer shell:
+
+```json
+{
+  "smoo": {
+    "remoteCache": {
+      "server": "https://nx-cache.example.net",
+      "internalServer": "http://10.89.0.1:8765",
+      "tokenSecret": "NX_REMOTE_CACHE_TOKEN"
+    }
+  }
+}
+```
+
+- `server`: the origin every developer machine reaches. Credential-free, no path, and no trailing slash — Nx appends
+  `/v1/cache/<hash>`, so a trailing slash asks for a doubled-slash route that answers 404 forever. Such a declaration is
+  refused at render time rather than trimmed, because managed CI and the developer shell read the same field.
+- `internalServer`: the origin managed runners reach instead, such as a container-bridge address. Same declaration as a
+  git origin's `internalMirror` — it says this repository's runners sit inside that network — so every generated job
+  takes it while shells outside keep `server`. Omitted means CI uses `server` too.
+- `tokenSecret`: the repository secret holding the cache token, and the variable name a developer shell resolves locally
+  (an ambient value, or a `smoo.secrets` entry). A read-only token is the honest choice for an untrusted context: it
+  reads the cache and cannot publish into it.
+
+Both generated workflows put `NX_SELF_HOSTED_REMOTE_CACHE_SERVER` and `NX_SELF_HOSTED_REMOTE_CACHE_ACCESS_TOKEN` in
+every job env that runs Nx. The pair is emitted whole or not at all: Nx enables its cache on a nonempty server alone and
+accepts only 200 or 404 from it, so a server it cannot authenticate to fails every task on 401 instead of missing
+quietly. That is also why a declared cache puts the same-repository gate on Validate that a private dependency install
+does — a fork pull request receives no secrets, and a job with half the pair would fail everything.
+
+Developer shells get the pair from the managed `tooling/direnv/secret-references.ts`, which the managed devenv
+`enterShell` runs and `eval`s: it prints the two exports when the declared token has a value, prints nothing when it has
+none (with the reason on stderr), and never replaces a server the environment already carries, so a CI job keeps the
+internal address its own runners reach.
+
 ## Releases
 
 Release commands wrap [Nx Release][nx-release] but keep SmoothBricks policy in one place.

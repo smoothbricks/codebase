@@ -1,12 +1,14 @@
 /**
- * Provider-neutral local secret resolution for smoo-managed repositories.
+ * Provider-neutral local secret resolution for smoo-managed repositories, and
+ * the developer-shell half of the declared Nx remote cache.
  *
- * Reads the root package.json `smoo.secrets` map — the bootstrap twin of
- * `PackageSecretCommand` and `PackageSmooConfig.secrets` in
- * packages/cli/src/lib/json.ts. This file is a managed raw script: it runs
- * from `tooling/direnv/setup-environment.ts` BEFORE `bun install`, when no
- * workspace package and no Typia transform exist yet, so the map is
- * hand-validated here against the exact shape json.ts declares. Keep the two
+ * Reads the root package.json `smoo.secrets` map and `smoo.remoteCache` block
+ * — the bootstrap twins of `PackageSecretCommand`, `PackageSmooConfig.secrets`
+ * and `PackageRemoteCacheConfig` in packages/cli/src/lib/json.ts. This file is
+ * a managed raw script: it runs from `tooling/direnv/setup-environment.ts`
+ * BEFORE `bun install`, and from the managed devenv `enterShell` before that,
+ * when no workspace package and no Typia transform exist yet, so both shapes
+ * are hand-validated here against exactly what json.ts declares. Keep them
  * aligned; smoo's Typia validation fails the manifest at generation time for
  * anything this file would reject at runtime.
  *
@@ -26,6 +28,17 @@
  * Failures aggregate so a single direnv reload surfaces every problem.
  * Error text names variables and exit codes only: secret values, provider
  * stdout/stderr, and command arguments are never echoed.
+ *
+ * Run as a program (`bun secret-references.ts [root]`), the script prints the
+ * remote cache's `export` lines for the shell to `eval` and nothing else: Nx
+ * runs in the developer's shell, not in the setup child, and the export is
+ * limited to those two variables so `smoo.secrets` stays process-local. It
+ * prints nothing when the repository declares no cache, when the shell already
+ * carries a server (a CI job env is never overwritten), or when the declared
+ * token has no value — Nx accepts only 200 or 404 from a cache server, so a
+ * server it cannot authenticate to fails every task instead of missing. Why
+ * the cache is off is said on stderr; the exit status stays 0, because a
+ * missing cache credential must never keep a shell from opening.
  */
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -69,7 +82,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
-function isNonemptyEnvValue(value: string | undefined): boolean {
+function isNonemptyEnvValue(value: string | undefined): value is string {
   return value !== undefined && value.length > 0;
 }
 
@@ -114,6 +127,53 @@ function parseSecretSpec(name: string, spec: unknown): SecretSpec {
   }
   const [first, ...rest] = raw;
   return { command: [first, ...rest] };
+}
+
+/** The two variables Nx reads for its self-hosted HTTP cache. */
+const REMOTE_CACHE_SERVER = 'NX_SELF_HOSTED_REMOTE_CACHE_SERVER';
+const REMOTE_CACHE_ACCESS_TOKEN = 'NX_SELF_HOSTED_REMOTE_CACHE_ACCESS_TOKEN';
+
+/**
+ * The declared remote cache as a local shell needs it. `internalServer` is
+ * deliberately absent: it is the address a managed runner reaches inside its
+ * own network, and a shell that loads this file is by definition outside it,
+ * so a developer machine always takes the public `server`.
+ */
+export interface RemoteCacheSpec {
+  readonly server: string;
+  /** Variable holding the cache token: an ambient value, or a `smoo.secrets` entry resolved here. */
+  readonly tokenSecret: string;
+}
+
+/**
+ * Validates the `smoo.remoteCache` block out of an already-parsed
+ * package.json. Absent `smoo` or `smoo.remoteCache` is no cache; a malformed
+ * declaration throws naming the field.
+ */
+export function parseSmooRemoteCache(packageJson: unknown): RemoteCacheSpec | null {
+  if (!isRecord(packageJson)) return null;
+  const smoo = packageJson['smoo'];
+  if (!isRecord(smoo)) return null;
+  const remoteCache = smoo['remoteCache'];
+  if (remoteCache === undefined) return null;
+  if (!isRecord(remoteCache)) {
+    throw new Error('smoo.remoteCache must be an object with { server, tokenSecret }');
+  }
+  const server = remoteCache['server'];
+  const tokenSecret = remoteCache['tokenSecret'];
+  // A trailing slash is refused rather than trimmed: Nx appends
+  // `/v1/cache/<hash>`, so the doubled slash is a route that answers 404
+  // forever, and silently repairing the manifest here would leave managed CI
+  // — which reads the same field — disagreeing with this shell.
+  if (typeof server !== 'string' || server.length === 0 || server.endsWith('/')) {
+    throw new Error(
+      'smoo.remoteCache.server must be an origin with no trailing slash, e.g. https://nx-cache.example.net',
+    );
+  }
+  if (typeof tokenSecret !== 'string' || !ENV_NAME.test(tokenSecret)) {
+    throw new Error('smoo.remoteCache.tokenSecret must name the environment variable holding the cache token');
+  }
+  return { server, tokenSecret };
 }
 
 /** Every `${VAR}` referenced from `.npmrc` text; an absent file contributes nothing. */
@@ -253,6 +313,86 @@ export async function resolveSecretEnvironment(
   });
 }
 
+/**
+ * What the shell should do about the declared remote cache. Each case is a
+ * value, not an exception: three of the four are ordinary, and only one is
+ * worth saying out loud.
+ */
+export type RemoteCacheOutcome =
+  | { readonly kind: 'undeclared' }
+  | { readonly kind: 'inherited' }
+  | { readonly kind: 'unavailable'; readonly reason: string }
+  | { readonly kind: 'exported'; readonly env: Readonly<Record<string, string>> };
+
+/**
+ * The remote cache variables this shell should export, or why it exports none.
+ * An inherited server always wins, so a CI job env — which carries the address
+ * its own runners reach — is never overwritten by the public one. The token is
+ * taken from the environment when it is there, and otherwise from the one
+ * `smoo.secrets` entry that declares it — resolving that single variable, so
+ * no other declared secret ever reaches the shell. A repository that declares
+ * the cache token as a provider secret therefore pays that one command twice
+ * per shell entry, once here and once in the setup child's own aggregate
+ * resolution; an ambient token pays nothing.
+ */
+export async function resolveRemoteCacheOutcome(options: SecretResolutionOptions): Promise<RemoteCacheOutcome> {
+  const env = options.env ?? process.env;
+  const packageJson = readPackageJson(options.root);
+  const spec = parseSmooRemoteCache(packageJson);
+  if (spec === null) {
+    return { kind: 'undeclared' };
+  }
+  if (isNonemptyEnvValue(env[REMOTE_CACHE_SERVER])) {
+    return { kind: 'inherited' };
+  }
+  const ambient = env[spec.tokenSecret];
+  if (isNonemptyEnvValue(ambient)) {
+    return {
+      kind: 'exported',
+      env: { [REMOTE_CACHE_SERVER]: spec.server, [REMOTE_CACHE_ACCESS_TOKEN]: ambient },
+    };
+  }
+  const declared = parseSmooSecrets(packageJson)[spec.tokenSecret];
+  if (declared === undefined) {
+    return {
+      kind: 'unavailable',
+      reason: `${spec.tokenSecret} is unset and no smoo.secrets entry declares it, so ${spec.server} would be asked for cache entries with no credential`,
+    };
+  }
+  let resolved: Readonly<Record<string, string>>;
+  try {
+    resolved = await resolveSecrets({
+      secrets: { [spec.tokenSecret]: declared },
+      // A cache token is not registry routing, so the cowshed `.npmrc`
+      // exclusion cannot apply to it.
+      registryIntentEnvs: new Set(),
+      env,
+      runCommand: options.runCommand,
+    });
+  } catch (error) {
+    return { kind: 'unavailable', reason: error instanceof Error ? error.message : String(error) };
+  }
+  const value = resolved[spec.tokenSecret];
+  if (value === undefined) {
+    return { kind: 'unavailable', reason: `${spec.tokenSecret} resolved to no value` };
+  }
+  return {
+    kind: 'exported',
+    env: { [REMOTE_CACHE_SERVER]: spec.server, [REMOTE_CACHE_ACCESS_TOKEN]: value },
+  };
+}
+
+/**
+ * POSIX `export` lines for a shell to `eval`. Single quotes are the only
+ * quoting a value cannot escape from, so each value is single-quoted with its
+ * own quotes spliced out — a token is opaque bytes, never assumed shell-safe.
+ */
+export function shellExportLines(env: Readonly<Record<string, string>>): string {
+  return Object.entries(env)
+    .map(([name, value]) => `export ${name}='${value.replaceAll("'", "'\\''")}'\n`)
+    .join('');
+}
+
 function readPackageJson(root: string): unknown {
   const packageJsonPath = join(root, 'package.json');
   let text: string;
@@ -278,4 +418,22 @@ function readNpmrcText(root: string): string | null {
   const npmrcPath = join(root, '.npmrc');
   if (!existsSync(npmrcPath)) return null;
   return readFileSync(npmrcPath, 'utf8');
+}
+
+// Program mode, run by the managed devenv shell as
+// `eval "$(bun "$DEVENV_ROOT/secret-references.ts" "$PWD")"`. stdout is
+// therefore shell text and carries nothing else; everything a human should
+// read goes to stderr, and the status stays 0 so a shell always opens.
+if (import.meta.main) {
+  const root = Bun.argv[2] ?? process.cwd();
+  try {
+    const outcome = await resolveRemoteCacheOutcome({ root });
+    if (outcome.kind === 'exported') {
+      process.stdout.write(shellExportLines(outcome.env));
+    } else if (outcome.kind === 'unavailable') {
+      console.error(`smoo: Nx remote cache off — ${outcome.reason}`);
+    }
+  } catch (error) {
+    console.error(`smoo: Nx remote cache off — ${error instanceof Error ? error.message : String(error)}`);
+  }
 }
