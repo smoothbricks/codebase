@@ -812,6 +812,10 @@ ${renderMacosJobHeaderLines(options)}
       platform_work: ${githubExpression('steps.plan.outputs.platform_work')}
     env:
       NIX_STORE_NAR: ${githubExpression('github.workspace')}/nix-store.nar
+      # The same root devenv derives, so the Bun-only prologue and the shell
+      # share the restored plugin binaries (and never write under node_modules).
+      TTSC_CACHE_DIR: ${githubExpression('github.workspace')}/.cache/ttsc
+      TTSC_TSGO_BINARY: ${githubExpression('github.workspace')}/node_modules/@typescript/native/bin/tsc
       GH_TOKEN: ${githubExpression('github.token')}${cargoCredentialsJobEnv(options)}${privateNpmInstallJobEnv(options)}
 ${Object.entries(options.platformProducer?.env ?? {})
   .map(([name, value]) => `      ${name}: ${JSON.stringify(value)}`)
@@ -1001,6 +1005,17 @@ function renderMacosPlatformSteps(options: PublishWorkflowDefinitionOptions): st
     '      # platform targets, and the pending releases only it can repair -- is',
     '      # git, the Nx graph, npm and GitHub metadata. Bun runs smoo and Nx',
     '      # directly, so the ten-minute Nix setup below is spent only on a run.',
+    '      # The dependency segments restore here, once: bun install is then a',
+    '      # lockfile check and ttsc finds its compiled plugins instead of building',
+    '      # them with Go; setup-devenv is told not to restore them again.',
+    '',
+    `      # Step ${stepNumber++}`,
+    '      - name: 📦 Restore node_modules',
+    '        uses: ./.github/actions/cache-node-modules',
+    '',
+    `      # Step ${stepNumber++}`,
+    '      - name: 🧊 Restore ttsc plugins',
+    '        uses: ./.github/actions/cache-ttsc-plugins',
     '',
     `      # Step ${stepNumber++}`,
     '      - name: 🥟 Setup Bun',
@@ -1011,6 +1026,7 @@ function renderMacosPlatformSteps(options: PublishWorkflowDefinitionOptions): st
     `      # Step ${stepNumber++}`,
     '      - name: 📦 Install workspace dependencies',
     '        # repo-path exposes smoo: the source shim here, node_modules/.bin elsewhere.',
+    '        working-directory: .',
     '        run: |',
     '          bun install --frozen-lockfile',
     '          tooling/direnv/repo-path --github-path',
@@ -1038,6 +1054,8 @@ function renderMacosPlatformSteps(options: PublishWorkflowDefinitionOptions): st
     `      # Step ${stepNumber++}`,
     '      - name: 🗺️ Plan platform outputs',
     '        id: plan',
+    '        env:',
+    "          NX_VERBOSE_LOGGING: 'true'",
     '        run:',
     `          smoo release build-platform-outputs --plan --bump "${githubExpression('inputs.bump')}" --projects "${githubExpression('inputs.projects')}"`,
     `          --ref "${githubExpression('github.sha')}" --targets "${macosPlatformFamilySelector(options)}" --github-output "$GITHUB_OUTPUT"`,
@@ -1076,6 +1094,8 @@ function renderMacosPlatformSteps(options: PublishWorkflowDefinitionOptions): st
     '        id: setup',
     `        if: ${planned}`,
     '        uses: ./.github/actions/setup-devenv',
+    '        with:',
+    "          dependencies-restored: 'true'",
   );
   lines.push(
     '',
