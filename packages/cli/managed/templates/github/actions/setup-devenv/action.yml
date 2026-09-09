@@ -143,9 +143,17 @@ runs:
       with:
         name: devenv
 
+    # A host runner's devenv belongs to its image, so install-devenv accepts
+    # whatever is on PATH there. On an ephemeral runner the devenv came out of a
+    # cache this workflow wrote, so it is held to devenv.lock's rev: the store
+    # cache restores ~/.nix-profile wholesale and a prefix match hands the job
+    # the CLI of whichever run last populated the key, which outlived a lock bump
+    # until the check existed.
     - name: 🧰 Install devenv
       shell: bash
       working-directory: tooling/direnv
+      env:
+        SMOO_HOST_RUNNER: ${{ steps.runner-kind.outputs.host }}
       run: ./github-actions-bootstrap.sh install-devenv
 
     # node_modules + ttsc plugin binaries: GH Actions cache on ephemeral runners.
