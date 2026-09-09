@@ -55,6 +55,57 @@ export async function autoReleaseCandidatePackages<Package extends ReleasePackag
   return candidates;
 }
 
+export type ReleaseProjectSelection = { mode: 'changed' } | { mode: 'named'; projects: string[] } | { mode: 'all' };
+
+/**
+ * Parse the release project selector. Blank selects the package-local changed
+ * set (the auto filter), whatever the bump mode is. `all` is the deliberate
+ * whole-fleet opt-in. Anything else is a comma-separated Nx project list that
+ * releases exactly those projects without change detection.
+ */
+export function parseReleaseProjectSelection(
+  raw: string | undefined,
+  knownProjects: string[],
+): ReleaseProjectSelection {
+  const value = (raw ?? '').trim();
+  if (value === '') {
+    return { mode: 'changed' };
+  }
+  if (value === 'all') {
+    return { mode: 'all' };
+  }
+  const projects = value
+    .split(',')
+    .map((project) => project.trim())
+    .filter(Boolean);
+  const unknown = projects.filter((project) => !knownProjects.includes(project));
+  if (unknown.length > 0) {
+    throw new Error(
+      `Unknown release project(s): ${unknown.join(', ')}. Owned release projects: ${knownProjects.join(', ')}.`,
+    );
+  }
+  return { mode: 'named', projects };
+}
+
+/**
+ * The bump specifier never widens the release set: an explicit patch/minor/
+ * major/prerelease only forces the version step for whatever this selection
+ * picks. Named projects and `all` bypass change detection on purpose.
+ */
+export async function releaseCandidatePackages<Package extends ReleasePackageInfo>(
+  shell: AutoReleaseCandidateShell,
+  packages: Package[],
+  selection: ReleaseProjectSelection,
+): Promise<Package[]> {
+  if (selection.mode === 'all') {
+    return packages;
+  }
+  if (selection.mode === 'named') {
+    return packages.filter((pkg) => selection.projects.includes(pkg.projectName));
+  }
+  return autoReleaseCandidatePackages(shell, packages);
+}
+
 async function isAutoReleaseCandidate<Package extends ReleasePackageInfo>(
   shell: AutoReleaseCandidateShell,
   pkg: Package,

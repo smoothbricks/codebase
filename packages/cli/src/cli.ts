@@ -213,25 +213,43 @@ function buildProgram(): Command {
     .command('build-platform-outputs')
     .description('Build selected current and pending-release platform outputs')
     .requiredOption('--bump <bump>', 'auto, patch, minor, major, or prerelease')
+    .option(
+      '--projects <projects>',
+      'comma-separated Nx projects to release, or all for every owned release package; blank releases package-local changes',
+    )
     .requiredOption('--targets <targets>', 'comma-separated Nx platform target names or globs')
     .requiredOption('--output <path>', 'output directory for current and repair artifacts')
     .option('--ref <ref>', 'fixed release graph ref to inspect')
     .option('--github-output <path>', 'append selected current platform projects to a GitHub Actions output file')
-    .action(async (options: { bump: string; githubOutput?: string; output: string; ref?: string; targets: string }) => {
-      // The source self-hosting shim has no Typia transform; release commands import transformed output validators.
-      const { releaseCollectPlatformOutputs } = await import('./release/index.js');
-      await releaseCollectPlatformOutputs(await findRepoRoot(), options);
-    });
+    .action(
+      async (options: {
+        bump: string;
+        projects?: string;
+        githubOutput?: string;
+        output: string;
+        ref?: string;
+        targets: string;
+      }) => {
+        // The source self-hosting shim has no Typia transform; release commands import transformed output validators.
+        const { releaseCollectPlatformOutputs } = await import('./release/index.js');
+        await releaseCollectPlatformOutputs(await findRepoRoot(), options);
+      },
+    );
   release
     .command('version')
     .description('Bump release package versions and create the release commit; writes no tags')
     .option('--bump <bump>', 'auto, patch, minor, major, or prerelease', 'auto')
+    .option(
+      '--projects <projects>',
+      'comma-separated Nx projects to release, or all for every owned release package; blank releases package-local changes',
+    )
     .option('--dry-run [dryRun]', 'preview the bump without writing versions or a release commit')
     .option('--github-output <path>', 'append mode=<mode> and projects=<nx-projects> to a GitHub Actions output file')
-    .action(async (options: { bump: string; dryRun?: string | boolean; githubOutput?: string }) => {
+    .action(async (options: { bump: string; projects?: string; dryRun?: string | boolean; githubOutput?: string }) => {
       const { releaseVersion } = await import('./release/index.js');
       await releaseVersion(await findRepoRoot(), {
         bump: options.bump,
+        projects: options.projects,
         dryRun: booleanOption(options.dryRun),
         githubOutput: options.githubOutput,
       });

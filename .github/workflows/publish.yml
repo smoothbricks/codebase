@@ -10,6 +10,12 @@ on:
           latest.
         options: [auto, patch, minor, major, prerelease]
         default: auto
+      projects:
+        type: string
+        description:
+          Comma-separated Nx projects to release, or all for every owned release package. Blank releases package-local
+          changes since the last release, whatever the bump mode is.
+        default: ''
       dry_run:
         type: boolean
         description: Run release commands without writing versions, tags, publishes, or GitHub Releases.
@@ -82,8 +88,8 @@ jobs:
       - name: 🔢 Version release
         id: version
         run:
-          smoo release version --bump "${{ inputs.bump }}" --dry-run "${{ inputs.dry_run }}" --github-output
-          "$GITHUB_OUTPUT"
+          smoo release version --bump "${{ inputs.bump }}" --projects "${{ inputs.projects }}" --dry-run "${{
+          inputs.dry_run }}" --github-output "$GITHUB_OUTPUT"
 
       # Step 7
       - name: 🔒 Capture candidate release SHA
@@ -251,15 +257,16 @@ jobs:
       - name: 🔢 Version release
         id: version
         run:
-          smoo release version --bump "${{ inputs.bump }}" --dry-run "${{ inputs.dry_run }}" --github-output
-          "$GITHUB_OUTPUT"
+          smoo release version --bump "${{ inputs.bump }}" --projects "${{ inputs.projects }}" --dry-run "${{
+          inputs.dry_run }}" --github-output "$GITHUB_OUTPUT"
 
       # Step 7
       - name: 🍎 Build selected macOS and iOS release outputs (${{ matrix.arch }})
         id: platform-outputs
         run:
-          smoo release build-platform-outputs --bump "${{ inputs.bump }}" --ref "${{ github.sha }}" --targets "*-${{
-          matrix.arch }}-macos" --output "${{ runner.temp }}/macos-platform-outputs" --github-output "$GITHUB_OUTPUT"
+          smoo release build-platform-outputs --bump "${{ inputs.bump }}" --projects "${{ inputs.projects }}" --ref "${{
+          github.sha }}" --targets "*-${{ matrix.arch }}-macos" --output "${{ runner.temp }}/macos-platform-outputs"
+          --github-output "$GITHUB_OUTPUT"
 
       # Step 8
       - name: 🧪 Unit test selected macOS and iOS packages

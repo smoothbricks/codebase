@@ -200,6 +200,16 @@ describe('release orchestration', () => {
     expect(shell.cleanChecks).toBe(0);
   });
 
+  it('no-ops an explicit bump when the changed-set selection is empty', async () => {
+    const shell = new RecordingVersionShell({ releasePackagesAtHead: [[]], releaseVersionPackages: [] });
+
+    const result = await runReleaseVersion(shell, { bump: 'patch', dryRun: false });
+
+    expect(result).toEqual({ mode: 'none', packages: [], status: 'no-release-needed' });
+    expect(shell.nxRuns).toEqual([]);
+    expect(shell.cleanChecks).toBe(0);
+  });
+
   it('runs auto Nx versioning only for selected package-local candidates', async () => {
     const shell = new RecordingVersionShell({
       releasePackagesAtHead: [[], [stable]],

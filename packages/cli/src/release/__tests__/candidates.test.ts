@@ -4,7 +4,12 @@ import { join } from 'node:path';
 import { $ } from 'bun';
 import type { PackageJson } from '../../lib/json.js';
 import { parsePackageJsonText } from '../../lib/json.js';
-import { type AutoReleaseCandidateShell, autoReleaseCandidatePackages } from '../candidates.js';
+import {
+  type AutoReleaseCandidateShell,
+  autoReleaseCandidatePackages,
+  parseReleaseProjectSelection,
+  releaseCandidatePackages,
+} from '../candidates.js';
 import type { ReleasePackageInfo } from '../core.js';
 import { git, tag, withFixtureRepo, writePackage } from './helpers/fixture-repo.js';
 
@@ -274,6 +279,72 @@ describe('auto release candidate filtering', () => {
       // npm:private packages version through the same selection. Only the
       // npmjs bootstrap/trust-publisher flows stay public-only.
       await expect(autoReleaseCandidatePackages(gitCandidateShell(root), [widget, a])).resolves.toEqual([widget]);
+    });
+  });
+});
+
+describe('release project selection', () => {
+  it('parses blank, all, and explicit project selections', () => {
+    expect(parseReleaseProjectSelection(undefined, [a.projectName, b.projectName])).toEqual({ mode: 'changed' });
+    expect(parseReleaseProjectSelection('', [a.projectName, b.projectName])).toEqual({ mode: 'changed' });
+    expect(parseReleaseProjectSelection('  ', [a.projectName, b.projectName])).toEqual({ mode: 'changed' });
+    expect(parseReleaseProjectSelection('all', [a.projectName, b.projectName])).toEqual({ mode: 'all' });
+    expect(parseReleaseProjectSelection('a, b', [a.projectName, b.projectName])).toEqual({
+      mode: 'named',
+      projects: ['a', 'b'],
+    });
+    expect(() => parseReleaseProjectSelection('a, ghost', [a.projectName, b.projectName])).toThrow(
+      'Unknown release project(s): ghost. Owned release projects: a, b.',
+    );
+  });
+
+  it('scopes a selection to the changed set like the auto filter, whatever the bump mode is', async () => {
+    await withFixtureRepo(async (root) => {
+      await writePackage(root, a.name, a.path, a.version);
+      await writePackage(root, b.name, b.path, b.version);
+      await git(root, ['add', '.']);
+      await git(root, ['commit', '-m', 'initial packages']);
+      await tag(root, 'a@1.0.0', '2025-01-01T00:00:00Z');
+      await tag(root, 'b@1.0.0', '2025-01-01T00:00:01Z');
+
+      await mkdir(join(root, a.path, 'src'), { recursive: true });
+      await writeFile(join(root, a.path, 'src/index.ts'), 'export const changed = true;\n');
+      await git(root, ['add', join(a.path, 'src/index.ts')]);
+      await git(root, ['commit', '-m', 'feat(a): package local']);
+
+      // An explicit bump keeps its force meaning for the specifier only: the
+      // unchanged package has no changed dependents, so it stays skipped.
+      await expect(releaseCandidatePackages(gitCandidateShell(root), [a, b], { mode: 'changed' })).resolves.toEqual([
+        a,
+      ]);
+    });
+  });
+
+  it('releases the named projects without change detection', async () => {
+    await withFixtureRepo(async (root) => {
+      await writePackage(root, a.name, a.path, a.version);
+      await writePackage(root, b.name, b.path, b.version);
+      await git(root, ['add', '.']);
+      await git(root, ['commit', '-m', 'initial packages']);
+      await tag(root, 'a@1.0.0', '2025-01-01T00:00:00Z');
+      await tag(root, 'b@1.0.0', '2025-01-01T00:00:01Z');
+
+      await expect(
+        releaseCandidatePackages(gitCandidateShell(root), [a, b], { mode: 'named', projects: ['b'] }),
+      ).resolves.toEqual([b]);
+    });
+  });
+
+  it('releases the whole fleet only when the selection is all', async () => {
+    await withFixtureRepo(async (root) => {
+      await writePackage(root, a.name, a.path, a.version);
+      await writePackage(root, b.name, b.path, b.version);
+      await git(root, ['add', '.']);
+      await git(root, ['commit', '-m', 'initial packages']);
+      await tag(root, 'a@1.0.0', '2025-01-01T00:00:00Z');
+      await tag(root, 'b@1.0.0', '2025-01-01T00:00:01Z');
+
+      await expect(releaseCandidatePackages(gitCandidateShell(root), [a, b], { mode: 'all' })).resolves.toEqual([a, b]);
     });
   });
 });

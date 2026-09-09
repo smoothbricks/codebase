@@ -41,7 +41,7 @@ smoo monorepo setup-test-tracing (--all | --projects <projects>) [--dry-run]
 
 smoo release npm-status
 smoo release repair-pending [--dry-run]
-smoo release version --bump <auto|patch|minor|major|prerelease> [--dry-run] [--github-output <path>]
+smoo release version --bump <auto|patch|minor|major|prerelease> [--projects <projects|all>] [--dry-run] [--github-output <path>]
 smoo release publish --bump <auto|patch|minor|major|prerelease> [--dry-run]
 smoo release retag-unpublished <tag...> [--to <ref>] [--push] [--dispatch] [--remote <remote>] [--branch <branch>] [--dry-run]
 smoo release bootstrap-npm-packages [--dry-run] [--skip-login] [--package <name...>]
@@ -442,8 +442,10 @@ Versioning:
   only when its package root has git history and its current version is stable. Root-only changes, workflow edits,
   lockfile-only churn, untagged next-prerelease preparation commits, and other workspace-global changes may still affect
   Nx tasks, but they do not make unrelated package artifacts releasable.
-- `--bump patch|minor|major|prerelease` forces the release specifier for the full owned release package set. Forced
-  bumps intentionally bypass the package-local auto filter.
+- `--bump patch|minor|major|prerelease` forces the release specifier only; it never widens the release set. Package
+  selection comes from `--projects`: blank selects the package-local changed set (the same filter `--bump auto` uses),
+  whatever the bump mode is. `--projects <a,b,...>` releases exactly those owned Nx projects without change detection,
+  and `--projects all` is the deliberate whole-fleet opt-in that versions every owned release package.
 - Release packages are discovered from `npm:public` packages whose `repository.url` exactly matches the root package.
 - [Nx Release][nx-release] config must use `currentVersionResolver: "git-tag"` with
   `fallbackCurrentVersionResolver: "disk"`. Conventional-commit versioning requires git tags as the primary source,
@@ -470,9 +472,10 @@ Versioning:
   `smoo release publish` will publish. `projects` is a comma-separated Nx project-name list, not an npm package-name
   list. The validation and publish step names include the selected mode so the [GitHub Actions] run shows whether it is
   creating a new release or recording a no-op.
-- Explicit bumps are mandatory when `HEAD` is not already a release target: after pending releases are repaired,
-  `bump=patch|minor|major|prerelease` must make Nx create a new release commit. smoo fails if Nx returns without moving
-  `HEAD`; `auto` may no-op when there are no releasable conventional commits.
+- An explicit bump with a non-empty selection is mandatory progress when `HEAD` is not already a release target: after
+  pending releases are repaired, `bump=patch|minor|major|prerelease` must make Nx create a new release commit, and smoo
+  fails if Nx returns without moving `HEAD`. Every bump mode may no-op with `mode=none` when the selection is empty: no
+  package-local changes for blank `--projects`, or no owned release packages at all for `--projects all`.
 - `--dry-run` previews versioning and completion without pushing refs, publishing npm packages, or writing GitHub
   Releases.
 - The pack path maps unpublished `-next` lock entries to the last stable tag because `bun pm pack` resolves

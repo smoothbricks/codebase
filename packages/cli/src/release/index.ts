@@ -67,7 +67,12 @@ import {
   NPM_BOOTSTRAP_VERSION,
 } from './bootstrap-npm-packages.js';
 import { resolveBuildInputPatterns } from './build-inputs.js';
-import { autoReleaseCandidatePackages } from './candidates.js';
+import {
+  type AutoReleaseCandidateShell,
+  parseReleaseProjectSelection,
+  type ReleaseProjectSelection,
+  releaseCandidatePackages,
+} from './candidates.js';
 import {
   type ReleaseTagRecord as CoreReleaseTagRecord,
   type ReleaseTarget as CoreReleaseTarget,
@@ -128,6 +133,8 @@ import {
 
 export interface ReleaseVersionOptions {
   bump: string;
+  /** Blank selects the changed set; `all` releases every owned package; a list releases those projects. */
+  projects?: string;
   dryRun?: boolean;
   githubOutput?: string;
 }
@@ -151,6 +158,8 @@ export interface ReleaseRepairPendingOptions {
 
 export interface ReleasePlatformOutputsOptions {
   bump: string;
+  /** Same selector as `release version`. */
+  projects?: string;
   githubOutput?: string;
   output: string;
   ref?: string;
@@ -185,10 +194,15 @@ export interface ReleaseRetagUnpublishedOptions {
 export async function releaseVersion(root: string, options: ReleaseVersionOptions): Promise<void> {
   const bump = releaseBumpArg(options.bump);
   const packages = releasePackages(root);
+  const selection = parseReleaseProjectSelection(
+    options.projects,
+    packages.map((pkg) => pkg.projectName),
+  );
   const result = await runReleaseVersion(
     {
       releasePackagesAtHead: () => releasePackagesAtHead(root, packages),
-      releaseVersionPackages: (releaseBump) => releaseVersionPackages(root, packages, releaseBump),
+      releaseVersionPackages: async () =>
+        releaseCandidatePackages(await releaseCandidateShell(root), packages, selection),
       gitHead: () => gitHead(root),
       runNxReleaseVersion: (releasePackages, releaseBump, dryRun) =>
         runNxReleaseVersion(root, releasePackageProjects(releasePackages), releaseBump, dryRun),
@@ -321,10 +335,13 @@ export async function releaseCollectPlatformOutputs(
   const releaseRef = await fetchReleaseRepairRef(root, PLATFORM_OUTPUTS_LABEL, options.ref);
   const packages = releasePackages(root);
   const packagesAtHead = await releasePackagesAtHead(root, packages);
+  const bump = releaseBumpArg(options.bump);
+  const selection = parseReleaseProjectSelection(
+    options.projects,
+    packages.map((pkg) => pkg.projectName),
+  );
   const currentPackages =
-    packagesAtHead.length > 0
-      ? packagesAtHead
-      : await releasePlatformPackages(root, packages, releaseBumpArg(options.bump));
+    packagesAtHead.length > 0 ? packagesAtHead : await releasePlatformPackages(root, packages, bump, selection);
   console.log(
     currentPackages.length === 0
       ? `${PLATFORM_OUTPUTS_LABEL}: no current release packages selected.`
@@ -812,35 +829,25 @@ function releasePackageProjects(packages: ReleasePackage[]): string {
   return packages.map((pkg) => pkg.projectName).join(',');
 }
 
-async function releaseVersionPackages(
-  root: string,
-  packages: ReleasePackage[],
-  bump: string,
-): Promise<ReleasePackage[]> {
-  if (bump !== 'auto') {
-    return packages;
-  }
-  return autoReleaseCandidatePackages(
-    {
-      gitRefExists: (ref) => gitRefExists(root, ref),
-      latestStableReleaseRef: (projectName) => latestStableReleaseRef(root, projectName),
-      packageChangedFilesSince: (ref, packagePath) => packageChangedFilesSince(root, ref, packagePath),
-      packageJsonAtRef: (ref, packagePath) => packageJsonAtRef(root, ref, packagePath),
-      currentPackageJson: (packagePath) => currentPackageJson(root, packagePath),
-      packageBuildInputPatterns: (projectName, packagePath) =>
-        packageBuildInputPatterns(root, projectName, packagePath),
-      packageHasHistory: (packagePath) => packageHasHistory(root, packagePath),
-    },
-    packages,
-  );
+async function releaseCandidateShell(root: string): Promise<AutoReleaseCandidateShell> {
+  return {
+    gitRefExists: (ref) => gitRefExists(root, ref),
+    latestStableReleaseRef: (projectName) => latestStableReleaseRef(root, projectName),
+    packageChangedFilesSince: (ref, packagePath) => packageChangedFilesSince(root, ref, packagePath),
+    packageJsonAtRef: (ref, packagePath) => packageJsonAtRef(root, ref, packagePath),
+    currentPackageJson: (packagePath) => currentPackageJson(root, packagePath),
+    packageBuildInputPatterns: (projectName, packagePath) => packageBuildInputPatterns(root, projectName, packagePath),
+    packageHasHistory: (packagePath) => packageHasHistory(root, packagePath),
+  };
 }
 
 async function releasePlatformPackages(
   root: string,
   packages: ReleasePackage[],
   bump: string,
+  selection: ReleaseProjectSelection,
 ): Promise<ReleasePackage[]> {
-  const candidates = await releaseVersionPackages(root, packages, bump);
+  const candidates = await releaseCandidatePackages(await releaseCandidateShell(root), packages, selection);
   if (candidates.length === 0) {
     return [];
   }

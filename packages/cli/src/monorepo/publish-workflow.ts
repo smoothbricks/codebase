@@ -29,6 +29,10 @@ const PUBLISH_WORKFLOW_FORMAT_OPTIONS = Object.freeze({
   parser: 'yaml',
   printWidth: 120,
   proseWrap: 'always',
+  // Mirrors .prettierrc: git-format-staged reformats the committed workflow
+  // with the repo config on every commit, so the render must agree or the
+  // first empty-string scalar (default: '') drifts on quote style alone.
+  singleQuote: true,
 } satisfies PrettierOptions);
 
 // @prettier/sync is unusable here: its module body eagerly instantiates a
@@ -420,7 +424,13 @@ function renderPublishWorkflowHeader(options: PublishWorkflowDefinitionOptions):
           Use auto for conventional commits, or force a semver bump. Prerelease publishes to next; all others publish to
           latest.
         options: [auto, patch, minor, major, prerelease]
-        default: auto`;
+        default: auto
+      projects:
+        type: string
+        description:
+          Comma-separated Nx projects to release, or all for every owned release package. Blank releases package-local
+          changes since the last release, whatever the bump mode is.
+        default: ''`;
   const deployInput =
     options.deploy === true
       ? `
@@ -559,7 +569,7 @@ function yamlLinesForStep(step: PublishWorkflowStep, options: PublishWorkflowDef
         `      - name: ${step.name}`,
         '        id: version',
         '        run:',
-        `          smoo release version --bump "${githubExpression('inputs.bump')}" --dry-run "${githubExpression('inputs.dry_run')}" --github-output`,
+        `          smoo release version --bump "${githubExpression('inputs.bump')}" --projects "${githubExpression('inputs.projects')}" --dry-run "${githubExpression('inputs.dry_run')}" --github-output`,
         '          "$GITHUB_OUTPUT"',
       ];
     case PublishWorkflowStepKind.CheckManagedMonorepoFiles:
@@ -756,6 +766,12 @@ on:
           latest.
         options: [auto, patch, minor, major, prerelease]
         default: auto
+      projects:
+        type: string
+        description:
+          Comma-separated Nx projects to release, or all for every owned release package. Blank releases package-local
+          changes since the last release, whatever the bump mode is.
+        default: ''
       dry_run:
         type: boolean
         description: Run release commands without writing versions, tags, publishes, or GitHub Releases.
@@ -1034,7 +1050,7 @@ function renderMacosPlatformSteps(options: PublishWorkflowDefinitionOptions): st
     '      - name: 🔢 Version release',
     '        id: version',
     '        run:',
-    `          smoo release version --bump "${githubExpression('inputs.bump')}" --dry-run "${githubExpression('inputs.dry_run')}" --github-output`,
+    `          smoo release version --bump "${githubExpression('inputs.bump')}" --projects "${githubExpression('inputs.projects')}" --dry-run "${githubExpression('inputs.dry_run')}" --github-output`,
     '          "$GITHUB_OUTPUT"',
   );
   const architectures = macosPlatformArchitectures(options);
@@ -1053,7 +1069,7 @@ function renderMacosPlatformSteps(options: PublishWorkflowDefinitionOptions): st
     '        run:',
     `          smoo release build-platform-outputs --bump "${githubExpression(
       'inputs.bump',
-    )}" --ref "${githubExpression('github.sha')}" --targets "${macosPlatformTargetSelector(options)}" --output`,
+    )}" --projects "${githubExpression('inputs.projects')}" --ref "${githubExpression('github.sha')}" --targets "${macosPlatformTargetSelector(options)}" --output`,
     `          "${githubExpression('runner.temp')}/macos-platform-outputs" --github-output "$GITHUB_OUTPUT"`,
   );
   if (options.platformProducer?.kind !== 'linux-cross') {
