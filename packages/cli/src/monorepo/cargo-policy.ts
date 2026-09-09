@@ -479,8 +479,8 @@ function hakariWorkspaceHackPolicy(root: LoadedManifest, crates: LoadedManifest[
   if (unwired.length > 0) {
     return report(
       root.path,
-      `these crates do not depend on the "${hackName}" workspace-hack, so their features are still resolved ` +
-        `separately: ${unwired.join(', ')}. ${FEATURE_UNIFICATION_FIX}`,
+      `these crates do not depend on "${hackName}", so cargo-hakari cannot unify their features: ` +
+        `${unwired.join(', ')}. ${FEATURE_UNIFICATION_FIX}`,
     );
   }
   const verify = shell.run(root.directory, ['verify']);
