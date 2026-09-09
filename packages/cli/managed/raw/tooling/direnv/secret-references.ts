@@ -197,47 +197,64 @@ type SecretOutcome =
   | { readonly name: string; readonly kind: 'resolved'; readonly value: string }
   | { readonly name: string; readonly kind: 'failed'; readonly guidance: string };
 
+/**
+ * One variable's routing, the four rules in the header applied in order. It is
+ * a value rather than a throw so each caller presents a failure in its own
+ * terms: an install refuses, the remote cache turns itself off.
+ */
+async function routeSecret(
+  name: string,
+  spec: SecretSpec,
+  context: {
+    readonly env: Readonly<Record<string, string | undefined>>;
+    readonly registryIntentEnvs: ReadonlySet<string>;
+    readonly run: SecretCommandRunner;
+  },
+): Promise<SecretOutcome> {
+  const { env } = context;
+  if (isNonemptyEnvValue(env[name])) {
+    return { name, kind: 'env-wins' };
+  }
+  if (isNonemptyEnvValue(env['CI'])) {
+    return {
+      name,
+      kind: 'failed',
+      guidance:
+        'CI does not run secret provider commands — inject this variable into the job environment from the CI secret store',
+    };
+  }
+  if (isNonemptyEnvValue(env['COWSHED_WORKSPACE_TOKEN']) && context.registryIntentEnvs.has(name)) {
+    return {
+      name,
+      kind: 'failed',
+      guidance:
+        'referenced from .npmrc and absent in this cowshed workspace — enroll registry credentials through the cowshed gateway; gateway-managed workspaces never resolve .npmrc registry variables via local provider commands',
+    };
+  }
+  try {
+    const value = (await context.run(spec.command)).replace(/\r?\n$/, '');
+    if (value.length === 0) {
+      return {
+        name,
+        kind: 'failed',
+        guidance:
+          'provider command produced no output — run it locally to see why (its arguments and output are never logged here)',
+      };
+    }
+    return { name, kind: 'resolved', value };
+  } catch (error) {
+    return { name, kind: 'failed', guidance: describeCommandFailure(error) };
+  }
+}
+
 export async function resolveSecrets(request: SecretResolutionRequest): Promise<Readonly<Record<string, string>>> {
-  const run = request.runCommand ?? runSecretCommand;
-  const env = request.env;
-  const ci = isNonemptyEnvValue(env['CI']);
-  const cowshed = isNonemptyEnvValue(env['COWSHED_WORKSPACE_TOKEN']);
+  const context = {
+    env: request.env,
+    registryIntentEnvs: request.registryIntentEnvs,
+    run: request.runCommand ?? runSecretCommand,
+  };
   const outcomes = await Promise.all(
-    Object.entries(request.secrets).map(async ([name, spec]): Promise<SecretOutcome> => {
-      if (isNonemptyEnvValue(env[name])) {
-        return { name, kind: 'env-wins' };
-      }
-      if (ci) {
-        return {
-          name,
-          kind: 'failed',
-          guidance:
-            'CI does not run secret provider commands — inject this variable into the job environment from the CI secret store',
-        };
-      }
-      if (cowshed && request.registryIntentEnvs.has(name)) {
-        return {
-          name,
-          kind: 'failed',
-          guidance:
-            'referenced from .npmrc and absent in this cowshed workspace — enroll registry credentials through the cowshed gateway; gateway-managed workspaces never resolve .npmrc registry variables via local provider commands',
-        };
-      }
-      try {
-        const value = (await run(spec.command)).replace(/\r?\n$/, '');
-        if (value.length === 0) {
-          return {
-            name,
-            kind: 'failed',
-            guidance:
-              'provider command produced no output — run it locally to see why (its arguments and output are never logged here)',
-          };
-        }
-        return { name, kind: 'resolved', value };
-      } catch (error) {
-        return { name, kind: 'failed', guidance: describeCommandFailure(error) };
-      }
-    }),
+    Object.entries(request.secrets).map(async ([name, spec]) => routeSecret(name, spec, context)),
   );
   const failures = outcomes.filter(
     (outcome): outcome is Extract<SecretOutcome, { kind: 'failed' }> => outcome.kind === 'failed',
@@ -382,27 +399,26 @@ export async function resolveRemoteCacheOutcome(options: SecretResolutionOptions
       reason: `${spec.tokenSecret} is unset and no smoo.secrets entry declares it, so ${spec.server} would be asked for cache entries with no credential`,
     };
   }
-  let resolved: Readonly<Record<string, string>>;
-  try {
-    resolved = await resolveSecrets({
-      secrets: { [spec.tokenSecret]: declared },
-      // A cache token is not registry routing, so the cowshed `.npmrc`
-      // exclusion cannot apply to it.
-      registryIntentEnvs: new Set(),
-      env,
-      runCommand: options.runCommand,
-    });
-  } catch (error) {
-    return { kind: 'unavailable', reason: error instanceof Error ? error.message : String(error) };
+  // A cache token is not registry routing, so the cowshed `.npmrc` exclusion
+  // cannot apply to it; every other rule in the header does.
+  const outcome = await routeSecret(spec.tokenSecret, declared, {
+    env,
+    registryIntentEnvs: new Set(),
+    run: options.runCommand ?? runSecretCommand,
+  });
+  switch (outcome.kind) {
+    case 'resolved':
+      return {
+        kind: 'exported',
+        env: { [REMOTE_CACHE_SERVER]: spec.server, [REMOTE_CACHE_ACCESS_TOKEN]: outcome.value },
+      };
+    case 'failed':
+      return { kind: 'unavailable', reason: `${spec.tokenSecret}: ${outcome.guidance}` };
+    case 'env-wins':
+      // Only reachable if an ambient value appeared between the check above
+      // and this call; the export happens on the next shell entry.
+      return { kind: 'unavailable', reason: `${spec.tokenSecret} was set after it was read` };
   }
-  const value = resolved[spec.tokenSecret];
-  if (value === undefined) {
-    return { kind: 'unavailable', reason: `${spec.tokenSecret} resolved to no value` };
-  }
-  return {
-    kind: 'exported',
-    env: { [REMOTE_CACHE_SERVER]: spec.server, [REMOTE_CACHE_ACCESS_TOKEN]: value },
-  };
 }
 
 /**

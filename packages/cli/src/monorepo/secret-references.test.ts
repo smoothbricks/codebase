@@ -454,6 +454,23 @@ describe('remote cache shell export', () => {
     );
   });
 
+  it('reports a broken provider as a lost cache, never as a failed install', async () => {
+    await withFixture(
+      {
+        secrets: { NX_REMOTE_CACHE_TOKEN: { command: ['definitely-not-a-real-smoo-binary-xyz'] } },
+        remoteCache: { server: SERVER, tokenSecret: 'NX_REMOTE_CACHE_TOKEN' },
+      },
+      async (root) => {
+        const { stdout, stderr } = await exportFor(root, {});
+        expect(stdout).toBe('');
+        expect(stderr).toContain('NX_REMOTE_CACHE_TOKEN');
+        expect(stderr).toContain('remote cache off');
+        // Nothing here stopped an install, and the message may not say it did.
+        expect(stderr).not.toContain('dependencies were not installed');
+      },
+    );
+  });
+
   it('leaves a server the environment already carries alone', async () => {
     await withFixture(
       { secrets: {}, remoteCache: { server: SERVER, tokenSecret: 'NX_REMOTE_CACHE_TOKEN' } },
