@@ -31,20 +31,16 @@ add_repo_paths() {
 # `--accept-flake-config` makes it worse than untidy: it pre-trusts the
 # substituters declared by a commit nobody looked at.
 #
-# Resolved lazily, on the install path only: a runner that already has devenv
-# never needs the rev, and that is the one branch which pays for a `nix eval`.
-devenv_flake() {
-  if [ -n "${DEVENV_FLAKE:-}" ]; then
-    printf '%s' "$DEVENV_FLAKE"
-    return 0
-  fi
+# Resolved lazily, on the paths that need it, because a host runner never does
+# and that is the one branch which must not pay for a `nix eval`.
+devenv_locked_rev() {
   local lock="$repo_root/tooling/direnv/devenv.lock" rev
   # nix, not jq: jq arrives with the shell this script is about to build, while
   # nix is guaranteed by the install step before it. fromJSON also beats
   # hand-rolled parsing of a file whose key order is not ours to assume.
   # Absolute-path readFile needs --impure; nix's own error is left on stderr
-  # rather than swallowed, because an unresolvable pin is the failure this
-  # function exists to prevent.
+  # rather than swallowed, because an unresolvable pin is the failure these
+  # functions exist to prevent.
   rev="$(nix eval --raw --impure --expr \
     "(builtins.fromJSON (builtins.readFile \"$lock\")).nodes.devenv.locked.rev")" || rev=""
   if [ -z "$rev" ]; then
@@ -52,26 +48,77 @@ devenv_flake() {
     echo "                set DEVENV_FLAKE to install a devenv explicitly" >&2
     return 1
   fi
-  printf 'github:cachix/devenv/%s' "$rev"
+  printf '%s' "$rev"
+}
+
+# Whether a devenv binary is the commit the lock names. `devenv version` prints
+# "devenv <semver>+<short rev> (<system>)", so the abbreviated commit is right
+# there and a prefix test against the full rev is the entire comparison — no
+# assumption about how many characters devenv chooses to abbreviate to. A build
+# with no "+<rev>" at all cannot prefix a 40-char hex rev, so it reads as a
+# mismatch, which is the safe direction.
+devenv_matches_lock() {
+  local bin="$1" rev="$2" printed
+  printed="$("$bin" version 2>/dev/null)" || return 1
+  printed="${printed#*+}"
+  printed="${printed%% *}"
+  [ -n "$printed" ] || return 1
+  case "$rev" in
+    "$printed"*) return 0 ;;
+  esac
+  return 1
 }
 
 install_devenv() {
-  # Shared host /nix/store is the package cache. Image may already provide
-  # devenv; otherwise profile-add the flake rev devenv.lock names (links store
-  # paths; re-fetch only when missing).
-  # The restored profile is not on PATH yet; look where the store cache put
-  # it before evaluating the devenv flake again.
-  local restored="$HOME/.nix-profile/bin/devenv"
+  # Host runners get devenv from their image and own their own Nix profile, so a
+  # repository must not rewrite it: SMOO_HOST_RUNNER comes from setup-devenv's
+  # runner-kind detection, and on those hosts whatever is on PATH is correct by
+  # definition. Everywhere else the devenv in play came out of a cache THIS
+  # workflow wrote, so it is ours to hold to the lock.
+  if [ "${SMOO_HOST_RUNNER:-false}" = true ]; then
+    if command -v devenv >/dev/null 2>&1; then
+      echo "using host devenv: $(command -v devenv) ($(devenv version))"
+    else
+      echo "install-devenv: host runner has no devenv on PATH" >&2
+      return 1
+    fi
+    devenv_path_and_caches
+    return 0
+  fi
+
+  local rev flake found=""
+  rev="$(devenv_locked_rev)"
+  # nix-quick-install puts ~/.nix-profile/bin on PATH, so a restored profile is
+  # usually already resolvable; check the literal path too for the case where it
+  # is not yet.
   if command -v devenv >/dev/null 2>&1; then
-    echo "using existing devenv: $(command -v devenv) ($(devenv version))"
-  elif [ -x "$restored" ]; then
-    echo "using restored devenv: $restored ($("$restored" version))"
+    found="$(command -v devenv)"
+  elif [ -x "$HOME/.nix-profile/bin/devenv" ]; then
+    found="$HOME/.nix-profile/bin/devenv"
+  fi
+
+  if [ -n "$found" ] && devenv_matches_lock "$found" "$rev"; then
+    echo "using locked devenv: $found ($("$found" version))"
   else
-    local flake
-    flake="$(devenv_flake)"
+    flake="${DEVENV_FLAKE:-github:cachix/devenv/$rev}"
+    if [ -n "$found" ]; then
+      # The store cache restores ~/.nix-profile wholesale, so a key rotation
+      # hands this job the devenv of whichever run last populated the prefix —
+      # which is how the CLI silently outlived a lock bump before this check
+      # existed. Replacing it needs the old entry gone first: `nix profile add`
+      # would otherwise refuse on a bin/devenv collision at equal priority.
+      # --all is exact rather than blunt, because devenv is the only thing this
+      # script ever profile-adds, so a wrong devenv means a wrong profile.
+      echo "replacing devenv $("$found" version 2>/dev/null) — lock names ${rev:0:7}"
+      nix profile remove --all
+    fi
     echo "nix profile add ${flake}"
     nix profile add --accept-flake-config "$flake"
   fi
+  devenv_path_and_caches
+}
+
+devenv_path_and_caches() {
   if [ -d "$HOME/.nix-profile/bin" ]; then
     echo "$HOME/.nix-profile/bin" >> "${GITHUB_PATH:-/dev/null}"
   fi

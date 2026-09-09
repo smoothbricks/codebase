@@ -140,7 +140,7 @@ interface InstallRun {
   nixCalls: string;
 }
 
-function runInstallDevenv(lock: string, options: { devenvOnPath?: boolean } = {}): InstallRun {
+function runInstallDevenv(lock: string, options: { devenvVersion?: string; hostRunner?: boolean } = {}): InstallRun {
   const dir = mkdtempSync(join(tmpdir(), 'gab-install-'));
   try {
     const direnv = join(dir, 'root', 'tooling', 'direnv');
@@ -154,20 +154,22 @@ function runInstallDevenv(lock: string, options: { devenvOnPath?: boolean } = {}
     const stub = join(bin, 'nix');
     writeFileSync(stub, NIX_STUB);
     chmodSync(stub, 0o755);
-    if (options.devenvOnPath) {
+    if (options.devenvVersion !== undefined) {
+      // Shaped like the real thing: `devenv <semver>+<short rev> (<system>)`.
       const devenv = join(bin, 'devenv');
-      writeFileSync(devenv, '#!/usr/bin/env bash\necho 9.9.9-from-path\n');
+      writeFileSync(devenv, `#!/usr/bin/env bash\necho "${options.devenvVersion}"\n`);
       chmodSync(devenv, 0o755);
     }
     const r = spawnSync('bash', [join(direnv, 'github-actions-bootstrap.sh'), 'install-devenv'], {
       encoding: 'utf8',
-      // A bare PATH on purpose: an ambient devenv would select the
-      // already-installed branch and the pin would never be exercised.
+      // A bare PATH on purpose: an ambient devenv would decide these cases
+      // instead of the stub.
       env: {
         PATH: `${bin}:${dirname(REAL_NIX)}:/usr/bin:/bin`,
         HOME: join(dir, 'home'),
         NIX_CALLS: nixCalls,
         REAL_NIX,
+        ...(options.hostRunner ? { SMOO_HOST_RUNNER: 'true' } : {}),
       },
     });
     return {
@@ -181,10 +183,12 @@ function runInstallDevenv(lock: string, options: { devenvOnPath?: boolean } = {}
   }
 }
 
+const REV = 'f'.repeat(40);
+
 const LOCK_WITH_REV = JSON.stringify({
   nodes: {
     devenv: {
-      locked: { dir: 'src/modules', owner: 'cachix', repo: 'devenv', rev: 'f'.repeat(40), type: 'github' },
+      locked: { dir: 'src/modules', owner: 'cachix', repo: 'devenv', rev: REV, type: 'github' },
       original: { dir: 'src/modules', owner: 'cachix', repo: 'devenv', type: 'github' },
     },
   },
@@ -202,10 +206,10 @@ describe('github-actions-bootstrap install-devenv', () => {
     // The rev comes out of the lock, so the CLI is the commit whose modules the
     // shell is locked to. An unpinned `github:cachix/devenv` would install
     // whatever HEAD is on the day a cold runner misses the store cache.
-    expect(run.nixCalls).toContain(`nix profile add --accept-flake-config github:cachix/devenv/${'f'.repeat(40)}`);
+    expect(run.nixCalls).toContain(`nix profile add --accept-flake-config github:cachix/devenv/${REV}`);
     expect(run.nixCalls).not.toContain('github:cachix/devenv\n');
     // Announced, so a run's log names the version it installed.
-    expect(run.stdout).toContain(`github:cachix/devenv/${'f'.repeat(40)}`);
+    expect(run.stdout).toContain(`github:cachix/devenv/${REV}`);
   });
 
   it('refuses to install anything when the lock names no devenv rev', () => {
@@ -216,10 +220,49 @@ describe('github-actions-bootstrap install-devenv', () => {
     expect(run.nixCalls).not.toContain('profile add');
   });
 
-  it('keeps an already-installed devenv and never evaluates the flake', () => {
-    const run = runInstallDevenv(LOCK_WITH_REV, { devenvOnPath: true });
+  it('keeps a restored devenv built from the locked commit', () => {
+    const run = runInstallDevenv(LOCK_WITH_REV, { devenvVersion: 'devenv 2.3.1+fffffff (aarch64-darwin)' });
     expect(run.status).toBe(0);
-    expect(run.stdout).toContain('using existing devenv');
+    expect(run.stdout).toContain('using locked devenv');
+    // The warm path must cost nothing: no eval of the flake, no profile writes.
     expect(run.nixCalls).toBe('');
+  });
+
+  it('replaces a restored devenv that is a different commit than the lock', () => {
+    // The real drift: the store cache restores ~/.nix-profile wholesale, so a
+    // rotated key hands the job the CLI of whichever run last populated the
+    // prefix. Observed in run 34369909403 as devenv 2.3.1+2a399e9 against a
+    // lock naming 190959a.
+    const run = runInstallDevenv(LOCK_WITH_REV, { devenvVersion: 'devenv 2.3.1+2a399e9 (aarch64-darwin)' });
+    if (run.status !== 0) {
+      printCommandOutput(run.stdout, run.stderr);
+    }
+    expect(run.status).toBe(0);
+    // Removal first: `nix profile add` collides on bin/devenv at equal priority.
+    const removeAt = run.nixCalls.indexOf('profile remove --all');
+    const addAt = run.nixCalls.indexOf(`profile add --accept-flake-config github:cachix/devenv/${REV}`);
+    expect(removeAt).toBeGreaterThanOrEqual(0);
+    expect(addAt).toBeGreaterThan(removeAt);
+    // Said out loud, with both commits, so a log explains the replacement.
+    expect(run.stdout).toContain('replacing devenv');
+    expect(run.stdout).toContain('2a399e9');
+  });
+
+  it('leaves a host runner its own devenv, whatever commit it is', () => {
+    // Host runners own their Nix profile; a repository rewriting it would take
+    // the whole fleet's shared store with it.
+    const run = runInstallDevenv(LOCK_WITH_REV, {
+      devenvVersion: 'devenv 2.3.1+2a399e9 (x86_64-linux)',
+      hostRunner: true,
+    });
+    expect(run.status).toBe(0);
+    expect(run.stdout).toContain('using host devenv');
+    expect(run.nixCalls).toBe('');
+  });
+
+  it('fails loudly when a host runner has no devenv at all', () => {
+    const run = runInstallDevenv(LOCK_WITH_REV, { hostRunner: true });
+    expect(run.status).not.toBe(0);
+    expect(run.stderr).toContain('host runner has no devenv on PATH');
   });
 });
