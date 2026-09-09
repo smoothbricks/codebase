@@ -33,7 +33,47 @@ defaults:
     working-directory: tooling/direnv
 
 jobs:
+  platform-plan:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: none
+    outputs:
+      platform-work: ${{ steps.plan.outputs.platform-work }}
+      projects: ${{ steps.plan.outputs.projects }}
+      repairs: ${{ steps.plan.outputs.repairs }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: 📥 Checkout dispatch commit
+        uses: actions/checkout@v6.0.2
+        with:
+          ref: ${{ github.sha }}
+          filter: blob:none
+          fetch-depth: 0
+      - name: 🥟 Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version-file: package.json
+      - name: 📦 Install workspace dependencies
+        working-directory: .
+        # repo-path exposes smoo: the source shim here, node_modules/.bin elsewhere.
+        run: |
+          bun install --frozen-lockfile
+          tooling/direnv/repo-path --github-path
+      - name: 🏗️ Build smoo Nx version actions
+        # The plan previews Nx Release versioning, which loads
+        # @smoothbricks/nx-plugin/version-actions from dist; ttsc runs on Bun.
+        working-directory: packages/nx-plugin
+        run: bunx ttsc -p tsconfig.lib.json --emit
+      - name: 🗺️ Plan platform outputs
+        id: plan
+        run:
+          smoo release build-platform-outputs --plan --bump "${{ inputs.bump }}" --projects "${{ inputs.projects }}"
+          --ref "${{ github.sha }}" --targets "*-macos" --github-output "$GITHUB_OUTPUT"
+
   linux-release-candidate:
+    needs: [platform-plan]
     runs-on:
       ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) &&
       fromJSON('["nixos-latest-x64","self-hosted"]') || 'ubuntu-latest' }}
@@ -201,6 +241,10 @@ jobs:
           devenv-cache-hit: ${{ steps.setup.outputs.devenv-cache-hit }}
 
   macos-platform:
+    # Ten minutes of toolchain setup only when the plan found a run for this
+    # platform; the plan job decided that without a toolchain.
+    needs: [platform-plan]
+    if: ${{ needs.platform-plan.outputs.platform-work == 'true' }}
     runs-on: macos-latest
     strategy:
       # One architecture per runner: a leg that fails still leaves the other
@@ -298,7 +342,11 @@ jobs:
           devenv-cache-hit: ${{ steps.setup.outputs.devenv-cache-hit }}
 
   publish-on-linux:
-    needs: [linux-release-candidate, macos-platform]
+    needs: [platform-plan, linux-release-candidate, macos-platform]
+    # A platform leg the plan skipped is not a failure; a leg that ran must have passed.
+    if:
+      ${{ !cancelled() && needs.linux-release-candidate.result == 'success' && (needs.macos-platform.result == 'success'
+      || needs.macos-platform.result == 'skipped') }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -397,35 +445,49 @@ jobs:
           }}/publish-artifacts/publish-linux-outputs-${{ github.run_id }}"
 
       # Step 10
+      - name: 🧾 Select prebuilt platform outputs
+        # A platform leg the plan skipped left no artifact, and that is the
+        # expected shape; a leg the plan asked for must have delivered one.
+        id: platform-outputs
+        run: |
+          set -euo pipefail
+          dirs=""
+          for dir in "${{ runner.temp }}/publish-artifacts/publish-macos-arm64-outputs-${{ github.run_id }}/current" "${{ runner.temp }}/publish-artifacts/publish-macos-x64-outputs-${{ github.run_id }}/current"; do
+            if [ -d "$dir" ]; then
+              # runner.temp carries no spaces; the publish step splits this on them.
+              dirs="$dirs $dir"
+            elif [ "${{ needs.platform-plan.outputs.platform-work }}" = "true" ]; then
+              echo "Platform outputs the plan asked for are missing: $dir" >&2
+              exit 1
+            fi
+          done
+          echo "dirs=$dirs" >> "$GITHUB_OUTPUT"
+
+      # Step 11
       - name: 🍎 Apply verified macOS outputs
-        if: needs.linux-release-candidate.outputs.mode != 'none'
-        run:
-          smoo github-ci apply-outputs --source-sha "${{ github.sha }}" "${{ runner.temp
-          }}/publish-artifacts/publish-macos-arm64-outputs-${{ github.run_id }}/current" "${{ runner.temp
-          }}/publish-artifacts/publish-macos-x64-outputs-${{ github.run_id }}/current"
+        if: needs.linux-release-candidate.outputs.mode != 'none' && steps.platform-outputs.outputs.dirs != ''
+        run: smoo github-ci apply-outputs --source-sha "${{ github.sha }}" ${{ steps.platform-outputs.outputs.dirs }}
 
       # --- Release ------------------------------------------------------------
 
-      # Step 11
+      # Step 12
       - name: 🏷️ Tag release
         # Ordered before the publish below so an interrupted release stays
         # detectable by the repair step at the top of this job on a later run.
         run: smoo release tag --dry-run "${{ inputs.dry_run }}"
 
-      # Step 12
+      # Step 13
       - name: 📦 Publish release (${{ needs.linux-release-candidate.outputs.mode }})
         # Pack verified outputs; --prebuilt refuses missing artifacts rather than rebuilding.
         # Public npm packages use trusted publishing/OIDC after local bootstrap.
         run:
           smoo release publish --prebuilt "${{ runner.temp }}/publish-artifacts/publish-release-outputs-${{
-          github.run_id }}" "${{ runner.temp }}/publish-artifacts/publish-linux-outputs-${{ github.run_id }}" "${{
-          runner.temp }}/publish-artifacts/publish-macos-arm64-outputs-${{ github.run_id }}/current" "${{ runner.temp
-          }}/publish-artifacts/publish-macos-x64-outputs-${{ github.run_id }}/current" --bump "${{ inputs.bump }}"
-          --dry-run "${{ inputs.dry_run }}"
+          github.run_id }}" "${{ runner.temp }}/publish-artifacts/publish-linux-outputs-${{ github.run_id }}" ${{
+          steps.platform-outputs.outputs.dirs }} --bump "${{ inputs.bump }}" --dry-run "${{ inputs.dry_run }}"
 
       # --- Cleanup ------------------------------------------------------------
 
-      # Step 13
+      # Step 14
       - name: 🧹 Cleanup and cache Nix/devenv
         if: always()
         uses: ./.github/actions/save-nix-devenv

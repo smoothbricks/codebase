@@ -119,7 +119,7 @@ describe('publish workflow definition', () => {
     expect(stepAnchorNumbers(singleJob)).toEqual(Array.from({ length: 16 }, (_, index) => index + 1));
     expect(stepAnchorNumbers(linuxCandidate)).toEqual(Array.from({ length: 19 }, (_, index) => index + 1));
     expect(stepAnchorNumbers(macosPlatform)).toEqual(Array.from({ length: 10 }, (_, index) => index + 1));
-    expect(stepAnchorNumbers(finalJob)).toEqual(Array.from({ length: 14 }, (_, index) => index + 1));
+    expect(stepAnchorNumbers(finalJob)).toEqual(Array.from({ length: 15 }, (_, index) => index + 1));
     expect(singleJob).toContain('# Step 14\n      - name: 🏷️ Tag release');
     expect(singleJob).toContain('# Step 15\n      - name: 📦 Publish release (${{ steps.version.outputs.mode }})');
     expect(singleJob).toContain('# Step 16\n      - name: 🧹 Cleanup and cache Nix/devenv');
@@ -137,13 +137,14 @@ describe('publish workflow definition', () => {
     expect(finalJob).toContain('# Step 7\n      - name: 🧯 Repair pending releases');
     expect(finalJob).toContain('# Step 8\n      - name: ♻️ Restore validated release state');
     expect(finalJob).toContain('# Step 9\n      - name: 📦 Apply verified Linux outputs');
-    expect(finalJob).toContain('# Step 10\n      - name: 🍎 Apply verified macOS outputs');
-    expect(finalJob).toContain('# Step 11\n      - name: 🏷️ Tag release');
+    expect(finalJob).toContain('# Step 10\n      - name: 🧾 Select prebuilt platform outputs');
+    expect(finalJob).toContain('# Step 11\n      - name: 🍎 Apply verified macOS outputs');
+    expect(finalJob).toContain('# Step 12\n      - name: 🏷️ Tag release');
     expect(finalJob).toContain(
-      '# Step 12\n      - name: 📦 Publish release (${{ needs.linux-release-candidate.outputs.mode }})',
+      '# Step 13\n      - name: 📦 Publish release (${{ needs.linux-release-candidate.outputs.mode }})',
     );
-    expect(finalJob).toContain('# Step 13\n      - name: 🚀 Deploy production');
-    expect(finalJob).toContain('# Step 14\n      - name: 🧹 Cleanup and cache Nix/devenv');
+    expect(finalJob).toContain('# Step 14\n      - name: 🚀 Deploy production');
+    expect(finalJob).toContain('# Step 15\n      - name: 🧹 Cleanup and cache Nix/devenv');
     expect(finalJob).toContain('uses: ./.github/actions/setup-devenv');
     expect(finalJob).toContain('uses: ./.github/actions/save-nix-devenv');
     expect(finalJob).not.toContain('🥟 Install Bun');
@@ -258,11 +259,19 @@ describe('publish workflow definition', () => {
       `smoo github-ci nx-run-many --targets "${LINUX_PLATFORM_TARGET_GLOBS.join(',')}" --projects`,
     );
     expect(native).toContain('  linux-release-candidate:');
-    expect(native).toContain('  macos-platform:\n    runs-on: macos-latest');
+    expect(native).toContain(
+      "  macos-platform:\n    # Ten minutes of toolchain setup only when the plan found a run for this\n    # platform; the plan job decided that without a toolchain.\n    needs: [platform-plan]\n    if: ${{ needs.platform-plan.outputs.platform-work == 'true' }}\n    runs-on: macos-latest",
+    );
     expect(native).toContain('  publish-on-linux:');
-    expect(native).toContain('  publish-on-linux:\n    needs: [linux-release-candidate, macos-platform]');
-    expect(linuxCandidate).not.toContain('needs:');
-    expect(macosPlatform).not.toContain('needs:');
+    expect(native).toContain(
+      '  publish-on-linux:\n    needs: [platform-plan, linux-release-candidate, macos-platform]',
+    );
+    // Both producers wait only on the toolchain-free plan, never on each other.
+    expect(linuxCandidate).toContain('needs: [platform-plan]');
+    expect(linuxCandidate).not.toContain('needs: [platform-plan, ');
+    expect(macosPlatform).toContain('needs: [platform-plan]');
+    expect(native).toContain('  platform-plan:\n    runs-on: ubuntu-latest');
+    expect(native).toContain('smoo release build-platform-outputs --plan');
     expect(linuxCandidate).not.toContain('smoo release repair-pending');
     expect(linuxCandidate).toContain('smoo release version');
     expect(linuxCandidate).toContain('smoo github-ci nx-run-many --targets build --projects');
@@ -314,9 +323,12 @@ describe('publish workflow definition', () => {
         '"${{ runner.temp }}/publish-artifacts/publish-release-outputs-${{ github.run_id }}" ' +
         '"${{ runner.temp }}/publish-artifacts/publish-linux-outputs-${{ github.run_id }}"',
     );
-    expect(foldedRunCommand(finalJob, '🍎 Apply verified macOS outputs')).toBe(
-      'smoo github-ci apply-outputs --source-sha "${{ github.sha }}" ' +
-        '"${{ runner.temp }}/publish-artifacts/publish-macos-outputs-${{ github.run_id }}/current"',
+    // The selection step owns the artifact list: a leg the plan skipped is absent, not fatal.
+    expect(finalJob).toContain(
+      'for dir in "${{ runner.temp }}/publish-artifacts/publish-macos-outputs-${{ github.run_id }}/current"; do',
+    );
+    expect(finalJob).toContain(
+      'run: smoo github-ci apply-outputs --source-sha "${{ github.sha }}" ${{ steps.platform-outputs.outputs.dirs }}',
     );
   });
 
@@ -400,10 +412,12 @@ describe('publish workflow definition', () => {
     expect(macosPlatform).toContain("if: matrix.arch == 'arm64' && steps.platform-outputs.outputs.projects != ''");
     expect(macosPlatform).toContain('name: publish-macos-${{ matrix.arch }}-outputs-${{ github.run_id }}');
     expect(macosPlatform).not.toContain('name: publish-macos-outputs-');
-    expect(foldedRunCommand(finalJob, '🍎 Apply verified macOS outputs')).toBe(
-      'smoo github-ci apply-outputs --source-sha "${{ github.sha }}" ' +
-        '"${{ runner.temp }}/publish-artifacts/publish-macos-arm64-outputs-${{ github.run_id }}/current" ' +
-        '"${{ runner.temp }}/publish-artifacts/publish-macos-x64-outputs-${{ github.run_id }}/current"',
+    expect(finalJob).toContain(
+      'for dir in "${{ runner.temp }}/publish-artifacts/publish-macos-arm64-outputs-${{ github.run_id }}/current" ' +
+        '"${{ runner.temp }}/publish-artifacts/publish-macos-x64-outputs-${{ github.run_id }}/current"; do',
+    );
+    expect(finalJob).toContain(
+      'run: smoo github-ci apply-outputs --source-sha "${{ github.sha }}" ${{ steps.platform-outputs.outputs.dirs }}',
     );
     expect(foldedRunCommand(finalJob, '🧯 Repair pending releases')).toBe(
       'smoo release repair-pending --ref "${{ github.sha }}" --platform-outputs ' +
@@ -461,7 +475,9 @@ describe('publish workflow definition', () => {
     expect(publishCommand).toContain('smoo release publish --prebuilt');
     expect(publishCommand).toContain('/publish-release-outputs-${{ github.run_id }}"');
     expect(publishCommand).toContain('/publish-linux-outputs-${{ github.run_id }}"');
-    expect(publishCommand).toContain('/publish-macos-outputs-${{ github.run_id }}/current"');
+    // Platform artifacts arrive through the selection step, which tolerates a leg the plan skipped.
+    expect(publishCommand).toContain('${{ steps.platform-outputs.outputs.dirs }}');
+    expect(finalJob).toContain('/publish-macos-outputs-${{ github.run_id }}/current"');
     expect(publishCommand).toContain('--bump "${{ inputs.bump }}" --dry-run "${{ inputs.dry_run }}"');
     expect(finalJob).toContain('CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}');
     expect(finalJob).toContain('CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}');
@@ -1031,15 +1047,18 @@ it('builds on smoo.github.runsOn but publishes from the GitHub-hosted runner', (
       \${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) &&
       fromJSON('["nixos-latest-x64","self-hosted"]') || 'ubuntu-latest' }}`;
 
-  expect(rendered).toContain(`  linux-release-candidate:\n    ${selfHostedRunner}`);
-  expect(rendered).toContain('  macos-platform:\n    runs-on: macos-latest');
+  expect(rendered).toContain(`  linux-release-candidate:\n    needs: [platform-plan]\n    ${selfHostedRunner}`);
+  expect(rendered).toContain(
+    "  macos-platform:\n    # Ten minutes of toolchain setup only when the plan found a run for this\n    # platform; the plan job decided that without a toolchain.\n    needs: [platform-plan]\n    if: ${{ needs.platform-plan.outputs.platform-work == 'true' }}\n    runs-on: macos-latest",
+  );
   // npmjs signs provenance with the job's OIDC token and then rejects the
   // upload (422) unless the runner is GitHub-hosted, so only the build lane
   // may keep the configured labels.
   expect(rendered.split('fromJSON(\'["nixos-latest-x64","self-hosted"]\')').length - 1).toBe(1);
   expect(rendered).toContain(
-    '  publish-on-linux:\n    needs: [linux-release-candidate, macos-platform]\n    runs-on: ubuntu-latest',
+    '  publish-on-linux:\n    needs: [platform-plan, linux-release-candidate, macos-platform]',
   );
+  expect(rendered.slice(rendered.indexOf('  publish-on-linux:'))).toContain('runs-on: ubuntu-latest');
   // The runner moved; the OIDC permission that mints provenance did not.
   expect(rendered.slice(rendered.indexOf('  publish-on-linux:'))).toContain('id-token: write');
 });
@@ -1188,7 +1207,7 @@ it('keeps job-local step anchors contiguous once Cargo credentials add a setup s
   expect(stepAnchorNumbers(singleJob)).toEqual(Array.from({ length: 17 }, (_, index) => index + 1));
   expect(stepAnchorNumbers(linuxCandidate)).toEqual(Array.from({ length: 20 }, (_, index) => index + 1));
   expect(stepAnchorNumbers(macosPlatform)).toEqual(Array.from({ length: 11 }, (_, index) => index + 1));
-  expect(stepAnchorNumbers(finalJob)).toEqual(Array.from({ length: 15 }, (_, index) => index + 1));
+  expect(stepAnchorNumbers(finalJob)).toEqual(Array.from({ length: 16 }, (_, index) => index + 1));
 });
 
 it('preflights registry-only Cargo credentials in every fetching job without installing a git helper', () => {
