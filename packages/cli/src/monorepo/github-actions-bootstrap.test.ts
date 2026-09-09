@@ -260,9 +260,17 @@ describe('github-actions-bootstrap install-devenv', () => {
     expect(run.nixCalls).toBe('');
   });
 
-  it('fails loudly when a host runner has no devenv at all', () => {
+  it('installs the locked rev on a host runner whose image ships no devenv', () => {
+    // What these runners have always done — they just did it from a floating
+    // branch. Refusing instead was a regression: it failed
+    // linux-release-candidate in run 34373420924.
     const run = runInstallDevenv(LOCK_WITH_REV, { hostRunner: true });
-    expect(run.status).not.toBe(0);
-    expect(run.stderr).toContain('host runner has no devenv on PATH');
+    if (run.status !== 0) {
+      printCommandOutput(run.stdout, run.stderr);
+    }
+    expect(run.status).toBe(0);
+    expect(run.nixCalls).toContain(`nix profile add --accept-flake-config github:cachix/devenv/${REV}`);
+    // Never on a host: the profile roots a store the whole fleet shares.
+    expect(run.nixCalls).not.toContain('profile remove');
   });
 });
