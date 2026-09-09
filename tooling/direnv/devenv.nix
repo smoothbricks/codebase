@@ -100,7 +100,14 @@ in {
   # - languages.python sets up shell hooks that ensure argv[0] contains the full path
   languages.python = {
     enable = true;
-    package = pkgs.python314.withPackages (ps: [ps.pyarrow ps.pandas]);
+    # pyarrow only. The oracles import `pyarrow.ipc` and nothing else — grep the
+    # whole repository and there is not one `import pandas`, nor a single .py
+    # file: python here exists to be spawned by two Rust tests
+    # (columine-arrow/tests/pyarrow_oracle.rs, lmao-arrow/tests/convert.rs).
+    # pandas dragged 102.7 MB into every shell and every mac CI restore — itself
+    # plus pytz, python-dateutil, tzdata and six — for an import nothing makes.
+    # numpy stays: pyarrow propagates it.
+    package = pkgs.python314.withPackages (ps: [ps.pyarrow]);
   };
 
   # We're not using Devenv's pre-commit-hooks, because this repo's pre-commit hook
