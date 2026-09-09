@@ -136,12 +136,7 @@ function hostPlatformTargetNames(targetNames: Iterable<string>, hostPlatform: Na
  */
 function buildOutputTargetNames(targetNames: Iterable<string>): string[] {
   return [...new Set(targetNames)]
-    .filter(
-      (name) =>
-        BUILD_OUTPUT_TARGET_PATTERN.test(name) &&
-        !name.startsWith(`${CARGO_TEST_TARGET}-`) &&
-        !name.startsWith('cargo-lint-'),
-    )
+    .filter((name) => BUILD_OUTPUT_TARGET_PATTERN.test(name) && !name.startsWith(`${CARGO_TEST_TARGET}-`))
     .sort();
 }
 
@@ -643,20 +638,24 @@ async function createProjectTargets(
       aggregateDependencies.length > 0
         ? { executor: 'nx:noop', cache: true, outputs: [], dependsOn: aggregateDependencies }
         : createCargoTestTarget(cargoWorkspaceRoot);
-    if (cargoWorkspace.packages.length === 0) {
-      targets['cargo-lint'] = {
-        executor: 'nx:run-commands',
-        cache: true,
-        inputs: CARGO_INPUTS,
-        outputs: [],
-        options: {
-          commands: ['cargo fmt --all --check', CARGO_LINT_CLIPPY_COMMAND],
-          cwd: cargoWorkspaceRoot,
-          parallel: false,
-        },
-      };
-      validationTargets.push('cargo-lint');
-    }
+    // One clippy over the whole workspace, in one target dir. Clippy of a crate
+    // is a check build of its closure; a target dir per crate compiled every
+    // shared dependency once per crate (49 closures, 11 GiB on one repository)
+    // and no per-crate cache hit ever repaid that. The workspace inputs are
+    // exactly the union of every crate's, so the verdict caches on the same
+    // key set the compile does. Non-root packages depend on this target.
+    targets['cargo-lint'] = {
+      executor: 'nx:run-commands',
+      cache: true,
+      inputs: workspaceInputs.length > 0 ? workspaceInputs : CARGO_INPUTS,
+      outputs: [],
+      options: {
+        commands: ['cargo fmt --all --check', CARGO_LINT_CLIPPY_COMMAND],
+        cwd: cargoWorkspaceRoot,
+        parallel: false,
+      },
+    };
+    validationTargets.push('cargo-lint');
     // The Linux arm of `cargo-lint`, as its own target. Rationale for the name,
     // the command and the absent cross test leg lives in ./cross-check-policy.ts.
     //
@@ -741,44 +740,19 @@ async function createProjectTargets(
         dependsOn: packageTargetNames,
       };
     }
-    for (const plan of cargoPackagePlans) {
-      const name = plan.package.name;
-      targets[`cargo-lint-${name}`] = {
-        executor: 'nx:run-commands',
-        cache: true,
-        inputs: await cargoPackageTestInputs({
-          workspaceRoot,
-          absoluteProjectRoot: join(workspaceRoot, cargoWorkspace.projectRoot),
-          memberDir: plan.package.dir,
-          cache: cargoWorkspace.inputsCache,
-          inputRoot:
-            projectRoot === cargoWorkspace.projectRoot
-              ? '{projectRoot}'
-              : posix.join('{workspaceRoot}', cargoWorkspace.projectRoot),
-        }),
-        outputs: [],
-        options: {
-          commands: [
-            `cargo fmt -p ${name} --check`,
-            cargoFrozen(`clippy -p ${name} --all-targets --target-dir target/cargo-lint-${name} -- -D warnings`),
-          ],
-          cwd: cargoWorkspace.projectRoot,
-          parallel: false,
-        },
-      };
-    }
-    const lintPlans = isCargoWorkspaceRoot ? cargoWorkspace.packages : cargoPackagePlans;
-    if (lintPlans.length > 0) {
+    if (!isCargoWorkspaceRoot && cargoPackagePlans.length > 0) {
+      // The workspace root runs clippy for every member; a package owning
+      // crates validates through that one verdict.
       targets['cargo-lint'] = {
         executor: 'nx:noop',
         cache: true,
         outputs: [],
-        dependsOn: lintPlans.map((plan) =>
+        dependsOn: [
           cargoTargetDependency(projectName, {
-            projectName: plan.package.projectName,
-            targetName: `cargo-lint-${plan.package.name}`,
+            projectName: cargoWorkspace.rootProjectName,
+            targetName: 'cargo-lint',
           }),
-        ),
+        ],
       };
       validationTargets.push('cargo-lint');
     }
