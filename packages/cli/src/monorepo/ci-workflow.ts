@@ -486,8 +486,11 @@ export function cargoCredentialJobEnvLines(config: PackageCargoCredentialsConfig
  * `CARGO_NET_GIT_FETCH_WITH_CLI` so Cargo shells out to git. Runners whose
  * egress requires a proxy export it as `HTTP(S)_PROXY`, which cargo honors
  * natively but git never reads, so the step mirrors it into git config or
- * Cargo git fetches bypass the proxy and fail to connect. The helper reads
- * the environment at call time and answers only for declared origins.
+ * Cargo git fetches bypass the proxy and fail to connect. Origins with an
+ * `internalMirror` are rewritten to the mirror with `url.<mirror>.insteadOf`
+ * and the helper answers the same credential for the mirror's host, since git
+ * passes helpers the rewritten URL. The helper reads the environment at call
+ * time and answers only for declared origins.
  * Mechanism errors surface at managed-file render time, never inside CI.
  */
 export function cargoCredentialStepLines(step: CiWorkflowStep, config: PackageCargoCredentialsConfig): string[] {
@@ -523,15 +526,26 @@ export function cargoCredentialStepLines(step: CiWorkflowStep, config: PackageCa
   lines.push('              host=*) host=${line#host=} ;;');
   lines.push('            esac');
   lines.push('          done');
-  lines.push('          [ "$protocol" = https ] || exit 0');
-  lines.push('          case "$host" in');
+  lines.push('          key="${protocol}|${host}"');
+  lines.push('          case "$key" in');
   for (const origin of origins) {
     const url = new URL(origin.origin);
     const host = url.host.replaceAll("'", "'\\''");
     lines.push(
-      `            '${host}'${url.port === '' ? `|'${host}:443'` : ''})`,
+      `            'https|${host}'${url.port === '' ? `|'https|${host}:443'` : ''})`,
       `              printf 'username=x-access-token\\npassword=%s\\n' "$${origin.tokenEnv}" ;;`,
     );
+    if (origin.internalMirror !== undefined) {
+      // Git passes helpers the rewritten URL, so the mirror answers with the
+      // same credential under its own scheme.
+      const mirror = new URL(origin.internalMirror);
+      const scheme = mirror.protocol === 'http:' ? 'http' : 'https';
+      const mirrorHost = mirror.host.replaceAll("'", "'\\''");
+      lines.push(
+        `            '${scheme}|${mirrorHost}'${mirror.port === '' ? `|'${scheme}|${mirror.hostname}:${scheme === 'http' ? '80' : '443'}'` : ''})`,
+        `              printf 'username=x-access-token\\npassword=%s\\n' "$${origin.tokenEnv}" ;;`,
+      );
+    }
   }
   lines.push('            *) exit 0 ;;');
   lines.push('          esac');
@@ -562,6 +576,20 @@ export function cargoCredentialStepLines(step: CiWorkflowStep, config: PackageCa
   lines.push('              echo "GIT_CONFIG_VALUE_${idx}=${http_proxy_value}"');
   lines.push('              idx=$((idx + 1))');
   lines.push('            fi');
+  lines.push('            # Internal mirrors rewrite the declared origin prefix so runners');
+  lines.push('            # that cannot reach the public URL fetch over guest networking.');
+  for (const origin of origins) {
+    if (origin.internalMirror === undefined) {
+      continue;
+    }
+    const originUrl = new URL(origin.origin);
+    const mirrorUrl = new URL(origin.internalMirror);
+    const originBase = `${originUrl.protocol}//${originUrl.host}/`.replaceAll("'", "'\\''");
+    const mirrorBase = `${mirrorUrl.protocol}//${mirrorUrl.host}/`.replaceAll("'", "'\\''");
+    lines.push('            echo "GIT_CONFIG_KEY_${idx}=url.' + mirrorBase + '.insteadOf"');
+    lines.push('            echo "GIT_CONFIG_VALUE_${idx}=' + originBase + '"');
+    lines.push('            idx=$((idx + 1))');
+  }
   lines.push('            echo "GIT_CONFIG_COUNT=${idx}"');
   lines.push('          } >> "$GITHUB_ENV"');
   return lines;
@@ -627,6 +655,32 @@ function normalizeCargoGitOrigin(origin: PackageCargoGitOrigin): PackageCargoGit
     throw new Error(
       `smoo.github.cargoCredentials gitOrigins entry needs an upper-case secret env name, got ${JSON.stringify(origin.tokenEnv)}`,
     );
+  }
+  if (origin.internalMirror !== undefined) {
+    let mirror: URL | null = null;
+    try {
+      mirror = new URL(origin.internalMirror);
+    } catch {
+      mirror = null;
+    }
+    if (
+      mirror === null ||
+      (mirror.protocol !== 'https:' && mirror.protocol !== 'http:') ||
+      mirror.pathname !== '/' ||
+      mirror.username !== '' ||
+      mirror.password !== '' ||
+      mirror.search !== '' ||
+      mirror.hash !== ''
+    ) {
+      throw new Error(
+        `smoo.github.cargoCredentials gitOrigins entry needs a credential-free http(s) internalMirror origin without a path, got ${JSON.stringify(origin.internalMirror)}`,
+      );
+    }
+    if (mirror.host === url.host && mirror.protocol === url.protocol) {
+      throw new Error(
+        `smoo.github.cargoCredentials gitOrigins entry rewrites ${origin.origin} to itself; drop internalMirror or point it at the internal mirror`,
+      );
+    }
   }
   return origin;
 }

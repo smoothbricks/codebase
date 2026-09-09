@@ -125,6 +125,15 @@ export interface PackageCargoGitOrigin {
   origin: string;
   /** Secret name holding the source-read credential for this origin. */
   tokenEnv: string;
+  /**
+   * Internal mirror of the origin, e.g. `http://10.89.0.1:3000` for a runner
+   * that reaches its own forge over guest networking instead of the public
+   * URL. Managed CI rewrites the origin prefix to the mirror with
+   * `url.<mirror>.insteadOf` and answers the same credential for the
+   * mirror's host (git passes helpers the rewritten URL). Omitted means the
+   * origin is fetched as declared.
+   */
+  internalMirror?: string;
 }
 
 /**
