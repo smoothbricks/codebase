@@ -1,8 +1,9 @@
 import { describe, expect, it, spyOn } from 'bun:test';
+import { readFileSync } from 'node:fs';
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { validateCargoCachePolicy } from './cargo-policy.js';
+import { applyCargoFeatureUnification, type CargoHakariShell, validateCargoCachePolicy } from './cargo-policy.js';
 
 async function withFixture<T>(files: Record<string, string>, callback: (root: string) => T): Promise<T> {
   const root = await mkdtemp(join(tmpdir(), 'smoo-cargo-policy-'));
@@ -18,16 +19,45 @@ async function withFixture<T>(files: Record<string, string>, callback: (root: st
   }
 }
 
-async function check(files: Record<string, string>): Promise<{ failures: number; messages: string[] }> {
+async function check(
+  files: Record<string, string>,
+  shell?: CargoHakariShell,
+): Promise<{ failures: number; messages: string[] }> {
   return withFixture(files, (root) => {
     const captured = captureErrors();
     try {
-      return { failures: validateCargoCachePolicy(root), messages: captured.messages };
+      return { failures: validateCargoCachePolicy(root, { shell }), messages: captured.messages };
     } finally {
       captured.restore();
     }
   });
 }
+
+/** Records what update would run, and answers `verify` however the test needs. */
+function recordingHakari(
+  verify: { code: number; output?: string; missing?: boolean } = { code: 0 },
+): CargoHakariShell & {
+  calls: string[][];
+} {
+  const calls: string[][] = [];
+  return {
+    calls,
+    run(_directory, args) {
+      calls.push([...args]);
+      return args[0] === 'verify'
+        ? { code: verify.code, output: verify.output ?? '', missing: verify.missing ?? false }
+        : { code: 0, output: '', missing: false };
+    },
+  };
+}
+
+const NIGHTLY_DEVENV = 'languages.rust = {\n  channel = "nightly";\n};\n';
+const UNIFIED_CONFIG = '[unstable]\nfeature-unification = true\n\n[resolver]\nfeature-unification = "workspace"\n';
+const TWO_CRATE_WORKSPACE = {
+  'Cargo.toml': '[workspace]\nmembers = ["crates/*"]\n\n[profile.test]\nincremental = false\ndebug = 0\n',
+  'crates/alpha/Cargo.toml': '[package]\nname = "alpha"\n',
+  'crates/beta/Cargo.toml': '[package]\nname = "beta"\n',
+};
 
 function captureErrors(): { messages: string[]; restore: () => void } {
   const messages: string[] = [];
@@ -184,5 +214,178 @@ describe('Cargo cache policy', () => {
     });
     expect(result.failures).toBe(0);
     expect(result.messages).toEqual([]);
+  });
+});
+
+describe('Cargo workspace feature unification', () => {
+  it('leaves a single-crate workspace alone', async () => {
+    // Nothing to unify: `feature-unification = "workspace"` and a workspace-hack
+    // both exist to stop ONE dependency being built twice with different
+    // features for two members, which needs two members.
+    const result = await check({
+      'Cargo.toml': '[workspace]\nmembers = ["crates/only"]\n\n[profile.test]\nincremental = false\ndebug = 0\n',
+      'crates/only/Cargo.toml': '[package]\nname = "only"\n',
+      'tooling/direnv/devenv.smoo.nix': NIGHTLY_DEVENV,
+    });
+    expect(result.failures).toBe(0);
+  });
+
+  it('requires a mechanism once a workspace holds more than one crate', async () => {
+    const result = await check({ ...TWO_CRATE_WORKSPACE, 'tooling/direnv/devenv.smoo.nix': NIGHTLY_DEVENV });
+    expect(result.failures).toBe(1);
+    expect(result.messages[0]).toContain('feature-unification');
+    expect(result.messages[0]).toContain('smoo monorepo update');
+  });
+
+  it('accepts the nightly resolver configuration and rejects it without the unstable flag', async () => {
+    const configured = await check({
+      ...TWO_CRATE_WORKSPACE,
+      'tooling/direnv/devenv.smoo.nix': NIGHTLY_DEVENV,
+      '.cargo/config.toml': UNIFIED_CONFIG,
+    });
+    expect(configured.failures).toBe(0);
+
+    // Cargo silently ignores [resolver] feature-unification without the
+    // unstable opt-in, so the half-configured repository believes it is unified
+    // while every crate still re-resolves features.
+    const inert = await check({
+      ...TWO_CRATE_WORKSPACE,
+      'tooling/direnv/devenv.smoo.nix': NIGHTLY_DEVENV,
+      '.cargo/config.toml': '[resolver]\nfeature-unification = "workspace"\n',
+    });
+    expect(inert.failures).toBe(1);
+    expect(inert.messages[0]).toContain('[unstable] feature-unification = true');
+  });
+
+  it('reads the channel from the managed devenv module, not from a decorative rust-toolchain file', async () => {
+    // devenv resolves the toolchain through rust-overlay and ignores
+    // rust-toolchain.toml unless languages.rust.toolchainFile names it, so the
+    // module's channel is the compiler that actually runs these commands.
+    const result = await check({
+      ...TWO_CRATE_WORKSPACE,
+      'tooling/direnv/devenv.smoo.nix': NIGHTLY_DEVENV,
+      'rust-toolchain.toml': '[toolchain]\nchannel = "stable"\n',
+      '.cargo/config.toml': UNIFIED_CONFIG,
+    });
+    expect(result.failures).toBe(0);
+  });
+
+  it('refuses the nightly-only resolver key on a stable toolchain', async () => {
+    const result = await check({
+      ...TWO_CRATE_WORKSPACE,
+      'rust-toolchain.toml': '[toolchain]\nchannel = "stable"\n',
+      '.cargo/config.toml': UNIFIED_CONFIG,
+    });
+    expect(result.failures).toBe(1);
+    expect(result.messages[0]).toContain('cargo-hakari');
+    expect(result.messages[0]).toContain('stable');
+  });
+
+  it('accepts a hakari-managed workspace-hack on a stable toolchain', async () => {
+    const hakari = recordingHakari();
+    const result = await check(
+      {
+        'Cargo.toml':
+          '[workspace]\nmembers = ["crates/*", "workspace-hack"]\n\n[profile.test]\nincremental = false\ndebug = 0\n',
+        'crates/alpha/Cargo.toml':
+          '[package]\nname = "alpha"\n\n[dependencies]\nworkspace-hack = { path = "../../workspace-hack" }\n',
+        'crates/beta/Cargo.toml':
+          '[package]\nname = "beta"\n\n[dependencies]\nworkspace-hack = { path = "../../workspace-hack" }\n',
+        'workspace-hack/Cargo.toml': '[package]\nname = "workspace-hack"\n',
+        '.config/hakari.toml': 'hakari-package = "workspace-hack"\nresolver = "2"\n',
+        'rust-toolchain.toml': '[toolchain]\nchannel = "stable"\n',
+      },
+      hakari,
+    );
+    expect(result.failures).toBe(0);
+    expect(hakari.calls).toEqual([['verify']]);
+  });
+
+  it('flags a crate that does not depend on the workspace-hack', async () => {
+    const result = await check(
+      {
+        'Cargo.toml':
+          '[workspace]\nmembers = ["crates/*", "workspace-hack"]\n\n[profile.test]\nincremental = false\ndebug = 0\n',
+        'crates/alpha/Cargo.toml':
+          '[package]\nname = "alpha"\n\n[dependencies]\nworkspace-hack = { path = "../../workspace-hack" }\n',
+        'crates/beta/Cargo.toml': '[package]\nname = "beta"\n',
+        'workspace-hack/Cargo.toml': '[package]\nname = "workspace-hack"\n',
+        '.config/hakari.toml': 'hakari-package = "workspace-hack"\n',
+        'rust-toolchain.toml': '[toolchain]\nchannel = "stable"\n',
+      },
+      recordingHakari(),
+    );
+    expect(result.failures).toBe(1);
+    expect(result.messages[0]).toContain('beta');
+    expect(result.messages[0]).toContain('smoo monorepo update');
+  });
+
+  it('surfaces a stale workspace-hack that cargo hakari verify rejects', async () => {
+    const result = await check(
+      {
+        'Cargo.toml':
+          '[workspace]\nmembers = ["crates/*", "workspace-hack"]\n\n[profile.test]\nincremental = false\ndebug = 0\n',
+        'crates/alpha/Cargo.toml':
+          '[package]\nname = "alpha"\n\n[dependencies]\nworkspace-hack = { path = "../../workspace-hack" }\n',
+        'crates/beta/Cargo.toml':
+          '[package]\nname = "beta"\n\n[dependencies]\nworkspace-hack = { path = "../../workspace-hack" }\n',
+        'workspace-hack/Cargo.toml': '[package]\nname = "workspace-hack"\n',
+        '.config/hakari.toml': 'hakari-package = "workspace-hack"\n',
+        'rust-toolchain.toml': '[toolchain]\nchannel = "stable"\n',
+      },
+      recordingHakari({ code: 1, output: 'workspace-hack is not up-to-date' }),
+    );
+    expect(result.failures).toBe(1);
+    expect(result.messages[0]).toContain('cargo hakari verify');
+    expect(result.messages[0]).toContain('workspace-hack is not up-to-date');
+  });
+});
+
+describe('Cargo feature unification update', () => {
+  it('writes the nightly resolver configuration once', async () => {
+    await withFixture({ ...TWO_CRATE_WORKSPACE, 'tooling/direnv/devenv.smoo.nix': NIGHTLY_DEVENV }, (root) => {
+      const configPath = join(root, '.cargo/config.toml');
+      const hakari = recordingHakari();
+      applyCargoFeatureUnification(root, { shell: hakari });
+      const written = readFileSync(configPath, 'utf8');
+      expect(written).toContain('[unstable]\nfeature-unification = true');
+      expect(written).toContain('[resolver]\nfeature-unification = "workspace"');
+      expect(hakari.calls).toEqual([]);
+
+      applyCargoFeatureUnification(root, { shell: hakari });
+      expect(readFileSync(configPath, 'utf8')).toBe(written);
+      const captured = captureErrors();
+      try {
+        expect(validateCargoCachePolicy(root, { shell: hakari })).toBe(0);
+      } finally {
+        captured.restore();
+      }
+    });
+  });
+
+  it('generates and wires a workspace-hack on a stable toolchain', async () => {
+    await withFixture(
+      { ...TWO_CRATE_WORKSPACE, 'rust-toolchain.toml': '[toolchain]\nchannel = "1.89.0"\n' },
+      (root) => {
+        const hakari = recordingHakari();
+        applyCargoFeatureUnification(root, { shell: hakari });
+        expect(hakari.calls).toEqual([['init', 'workspace-hack'], ['generate'], ['manage-deps', '--yes']]);
+      },
+    );
+  });
+
+  it('skips hakari init when the workspace already declares one', async () => {
+    await withFixture(
+      {
+        ...TWO_CRATE_WORKSPACE,
+        'rust-toolchain.toml': '[toolchain]\nchannel = "1.89.0"\n',
+        '.config/hakari.toml': 'hakari-package = "workspace-hack"\n',
+      },
+      (root) => {
+        const hakari = recordingHakari();
+        applyCargoFeatureUnification(root, { shell: hakari });
+        expect(hakari.calls).toEqual([['generate'], ['manage-deps', '--yes']]);
+      },
+    );
   });
 });

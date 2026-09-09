@@ -221,6 +221,38 @@ describe('monorepo validation pack phases', () => {
     }
   });
 
+  it('validates and fixes cargo workspace feature unification through its own pack', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'smoo-validate-cargo-'));
+    try {
+      await mkdir(join(root, 'crates/alpha'), { recursive: true });
+      await mkdir(join(root, 'crates/beta'), { recursive: true });
+      await mkdir(join(root, 'tooling/direnv'), { recursive: true });
+      await writeFile(
+        join(root, 'Cargo.toml'),
+        '[workspace]\nmembers = ["crates/*"]\n\n[profile.test]\nincremental = false\ndebug = 0\n',
+      );
+      await writeFile(join(root, 'crates/alpha/Cargo.toml'), '[package]\nname = "alpha"\n');
+      await writeFile(join(root, 'crates/beta/Cargo.toml'), '[package]\nname = "beta"\n');
+      await writeFile(join(root, 'tooling/direnv/devenv.smoo.nix'), 'languages.rust = {\n  channel = "nightly";\n};\n');
+      const cargoPack = packsForTest.find((pack) => pack.name === 'cargo');
+      if (!cargoPack) {
+        throw new Error('cargo validation pack not found');
+      }
+      const runBuild = () => 0;
+
+      // A policy nothing calls is not a policy: validate must reach it.
+      expect(
+        await runValidatePacks({ root, syncRuntime: false }, { failFast: true }, { packs: [cargoPack], runBuild }),
+      ).toEqual({ failures: 1, failedChecks: 1 });
+
+      expect(
+        await runValidatePacks({ root, syncRuntime: false }, { fix: true }, { packs: [cargoPack], runBuild }),
+      ).toEqual({ failures: 0, failedChecks: 0 });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it('propagates parsed target dependencies through the production adapter', () => {
     const targetDependencies = new Map([
       ['build', ['compile-linux']],

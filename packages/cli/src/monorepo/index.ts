@@ -2,7 +2,7 @@ import { appendFileSync, readFileSync, writeFileSync } from 'node:fs';
 import { printCommandOutput, run, runResult } from '../lib/run.js';
 import { escapeRegex, getWorkspacePackages, getWorkspacePatterns, listReleasePackages } from '../lib/workspace.js';
 import { readProjectTargets } from '../nx/index.js';
-import { validateCargoCachePolicy } from './cargo-policy.js';
+import { applyCargoFeatureUnification, validateCargoCachePolicy } from './cargo-policy.js';
 import {
   formatCommitMessage,
   stagedDeletedPublicPackages,
@@ -112,6 +112,10 @@ export async function updateManagedFiles(root: string): Promise<void> {
   // Tool dependency policy (typescript API 6, @typescript/native for ttsc, nx, …)
   // lives next to managed templates — update must install them, not only rewrite files.
   await applyToolConfigDefaults(root);
+  // Rust's half of the same job: a multi-crate Cargo workspace must resolve
+  // features once for every member, or each per-crate cargo invocation
+  // recompiles the shared graph for its own selection.
+  applyCargoFeatureUnification(root);
   syncBunLockfileVersions(root, { mode: 'install' });
   console.log('installing     workspace dependencies (bun install)');
   await run('bun', ['install', '--no-summary'], root);

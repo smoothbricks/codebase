@@ -221,6 +221,12 @@
     # variants per crate and 26 GB of junk before this existed), and a sweep
     # prunes them without touching the warm current-fingerprint surface.
     pkgs.cargo-sweep
+    # The stable-toolchain arm of smoo's workspace feature-unification policy:
+    # `cargo hakari` generates and wires the workspace-hack crate that unifies
+    # features when `[resolver] feature-unification` — nightly-only, and what
+    # the channel above selects — is unavailable. `smoo monorepo validate` runs
+    # `cargo hakari verify` for a workspace that took that route.
+    pkgs.cargo-hakari
   ];
 
   enterShell = lib.mkMerge [
