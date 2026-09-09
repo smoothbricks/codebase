@@ -221,7 +221,7 @@ function buildProgram(): Command {
     .option('--output <path>', 'output directory for current and repair artifacts')
     .option(
       '--plan',
-      'decide whether the selected targets have any current or repair work, without building; writes platform-work, projects and repairs to --github-output',
+      'decide whether the selected targets have any current or repair work, without building; writes platform_work, projects and repairs to --github-output',
     )
     .option('--ref <ref>', 'fixed release graph ref to inspect')
     .option('--github-output <path>', 'append selected current platform projects to a GitHub Actions output file')

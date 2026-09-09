@@ -397,7 +397,7 @@ const PLATFORM_PLAN_LABEL = 'release platform plan';
  * release packages whose projects carry a matching platform target) plus the
  * pending releases only that runner can repair. Everything here is git, the
  * Nx graph, npm and GitHub metadata, so a plan job needs no toolchain — a
- * workflow gates its platform runners on `platform-work` and spends ten
+ * workflow gates its platform runners on `platform_work` and spends ten
  * minutes of Nix setup only when a run exists for them.
  */
 export async function releasePlanPlatformOutputs(root: string, options: ReleasePlatformPlanOptions): Promise<void> {
@@ -430,7 +430,7 @@ export async function releasePlanPlatformOutputs(root: string, options: ReleaseP
   if (options.githubOutput) {
     await appendFile(
       options.githubOutput,
-      `platform-work=${work ? 'true' : 'false'}\nprojects=${projects.join(',')}\nrepairs=${repairs.length}\n`,
+      `platform_work=${work ? 'true' : 'false'}\nprojects=${projects.join(',')}\nrepairs=${repairs.length}\n`,
     );
   }
 }
