@@ -178,7 +178,6 @@ ${
 `
     : ''
 }    env:
-      NIX_STORE_NAR: ${githubExpression('github.workspace')}/nix-store.nar
       GH_TOKEN: ${githubExpression('github.token')}
 ${cargoCredentialJobEnvLines(options.cargoCredentials)}${privateNpmReadTokenJobEnv(options)}    steps:
 `;
@@ -376,7 +375,6 @@ function yamlLinesForStep(step: CiWorkflowStep, options: CiWorkflowDefinitionOpt
         '        if: always()',
         '        uses: ./.github/actions/save-nix-devenv',
         '        with:',
-        '          nix-cache-hit: ${{ steps.setup.outputs.nix-cache-hit }}',
         '          devenv-cache-hit: ${{ steps.setup.outputs.devenv-cache-hit }}',
       ];
   }

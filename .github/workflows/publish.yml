@@ -44,7 +44,6 @@ jobs:
       mode: ${{ steps.version.outputs.mode }}
       release-sha: ${{ steps.release-state.outputs.sha }}
     env:
-      NIX_STORE_NAR: ${{ github.workspace }}/nix-store.nar
       GH_TOKEN: ${{ github.token }}
     steps:
       # --- Setup --------------------------------------------------------------
@@ -197,7 +196,6 @@ jobs:
         if: always()
         uses: ./.github/actions/save-nix-devenv
         with:
-          nix-cache-hit: ${{ steps.setup.outputs.nix-cache-hit }}
           devenv-cache-hit: ${{ steps.setup.outputs.devenv-cache-hit }}
 
   macos-platform:
@@ -211,14 +209,7 @@ jobs:
     permissions:
       contents: read
       id-token: none
-    outputs:
-      platform_work: ${{ steps.plan.outputs.platform_work }}
     env:
-      NIX_STORE_NAR: ${{ github.workspace }}/nix-store.nar
-      # The same root devenv derives, so the Bun-only prologue and the shell
-      # share the restored plugin binaries (and never write under node_modules).
-      TTSC_CACHE_DIR: ${{ github.workspace }}/.cache/ttsc
-      TTSC_TSGO_BINARY: ${{ github.workspace }}/node_modules/@typescript/native/bin/tsc
       GH_TOKEN: ${{ github.token }}
 
     steps:
@@ -233,46 +224,17 @@ jobs:
           filter: blob:none
           fetch-depth: 0
 
-      # --- Plan (Bun only) ---------------------------------------------------
-      # Whether this runner has anything to build -- the release selection, its
-      # platform targets, and the pending releases only it can repair -- is
-      # git, the Nx graph, npm and GitHub metadata. Bun runs smoo and Nx
-      # directly, so the ten-minute Nix setup below is spent only on a run.
-      # The dependency segments restore here, once: bun install is then a
-      # lockfile check and ttsc finds its compiled plugins instead of building
-      # them with Go; setup-devenv is told not to restore them again.
-
-      # Step 3
-      - name: 📦 Restore node_modules
-        uses: ./.github/actions/cache-node-modules
+      # Step 3. Composite action internals do not affect top-level job step
+      # anchors; update these comments if top-level steps move.
+      - name: 🧱 Setup Nix/devenv
+        id: setup
+        uses: ./.github/actions/setup-devenv
 
       # Step 4
-      - name: 🧊 Restore ttsc plugins
-        uses: ./.github/actions/cache-ttsc-plugins
-        with:
-          scope: bun
-
-      # Step 5
-      - name: 🥟 Setup Bun
-        uses: oven-sh/setup-bun@v2
-        with:
-          bun-version-file: package.json
-
-      # Step 6
-      - name: 📦 Install workspace dependencies
-        # repo-path exposes smoo: the source shim here, node_modules/.bin elsewhere.
-        working-directory: .
-        run: |
-          bun install --frozen-lockfile
-          tooling/direnv/repo-path --github-path
-          # nx must run on Node: its js plugin needs the full TypeScript API.
-          echo "node: $(command -v node) $(node -e 'console.log(process.version, process.versions.bun ?? "")')"
-
-      # Step 7
       - name: 🏗️ Build smoo Nx version actions
         # Nx Release loads @smoothbricks/nx-plugin/version-actions through the
-        # export map in its own node process, and both the plan preview and
-        # versioning run it, so the hook must exist in dist first. Downstream
+        # export map in its own node process, and versioning runs before the
+        # build phase, so the hook must exist in dist first. Downstream
         # consumers install the published package and skip this bootstrap.
         #
         # `nx` cannot do it: the project graph loads this very plugin, so
@@ -280,62 +242,39 @@ jobs:
         # ttsc needs only the package tsconfig -- same bootstrap the devenv
         # shell runs (tooling/direnv/enter-shell.ts).
         working-directory: packages/nx-plugin
-        run: bunx ttsc -p tsconfig.lib.json --emit
+        run: ttsc -p tsconfig.lib.json --emit
 
-      # Step 8
-      - name: 🗺️ Plan platform outputs
-        id: plan
-        env:
-          NX_VERBOSE_LOGGING: 'true'
-        run:
-          smoo release build-platform-outputs --plan --bump "${{ inputs.bump }}" --projects "${{ inputs.projects }}"
-          --ref "${{ github.sha }}" --targets "*-macos" --github-output "$GITHUB_OUTPUT"
-
-      # --- Setup (only with work) --------------------------------------------
-
-      # Step 9. Composite action internals do not affect top-level job step
-      # anchors; update these comments if top-level steps move.
-      - name: 🧱 Setup Nix/devenv
-        id: setup
-        if: steps.plan.outputs.platform_work == 'true'
-        uses: ./.github/actions/setup-devenv
-        with:
-          dependencies-restored: 'true'
-
-      # Step 10
+      # Step 5
       - name: 🤖 Configure release author
-        if: steps.plan.outputs.platform_work == 'true'
         run:
           git config user.name "github-actions[bot]" && git config user.email
           "41898282+github-actions[bot]@users.noreply.github.com"
 
-      # Step 11
+      # Step 6
       - name: 🔢 Version release
         id: version
-        if: steps.plan.outputs.platform_work == 'true'
         run:
           smoo release version --bump "${{ inputs.bump }}" --projects "${{ inputs.projects }}" --dry-run "${{
           inputs.dry_run }}" --github-output "$GITHUB_OUTPUT"
 
-      # Step 12
+      # Step 7
       - name: 🍎 Build selected macOS and iOS release outputs (${{ matrix.arch }})
         id: platform-outputs
-        if: steps.plan.outputs.platform_work == 'true'
         run:
           smoo release build-platform-outputs --bump "${{ inputs.bump }}" --projects "${{ inputs.projects }}" --ref "${{
           github.sha }}" --targets "*-${{ matrix.arch }}-macos" --output "${{ runner.temp }}/macos-platform-outputs"
           --github-output "$GITHUB_OUTPUT"
 
-      # Step 13
+      # Step 8
       - name: 🧪 Unit test selected macOS and iOS packages
         # Only the runner-native leg can execute what it built; the foreign
         # architecture ships as an artifact without running here.
         if: matrix.arch == 'arm64' && steps.platform-outputs.outputs.projects != ''
         run: smoo github-ci nx-run-many --targets test --projects "${{ steps.platform-outputs.outputs.projects }}"
 
-      # Step 14
+      # Step 9
       - name: 📤 Upload macOS platform outputs (${{ matrix.arch }})
-        if: steps.plan.outputs.platform_work == 'true'
+        if: success()
         uses: actions/upload-artifact@v7.0.1
         with:
           name: publish-macos-${{ matrix.arch }}-outputs-${{ github.run_id }}
@@ -346,14 +285,12 @@ jobs:
 
       # --- Cleanup ------------------------------------------------------------
 
-      # Step 15
+      # Step 10
       - name: 🧹 Cleanup and cache Nix/devenv
-        # always() still saves GH Nix cache after a red job; a runner the plan
-        # kept toolchain-free has no cache to save.
-        if: always() && steps.plan.outputs.platform_work == 'true'
+        # success() is default; always() still saves GH Nix cache after a red job.
+        if: always()
         uses: ./.github/actions/save-nix-devenv
         with:
-          nix-cache-hit: ${{ steps.setup.outputs.nix-cache-hit }}
           devenv-cache-hit: ${{ steps.setup.outputs.devenv-cache-hit }}
 
   publish-on-linux:
@@ -363,7 +300,6 @@ jobs:
       contents: write
       id-token: write
     env:
-      NIX_STORE_NAR: ${{ github.workspace }}/nix-store.nar
       TTSC_TSGO_BINARY: ${{ github.workspace }}/node_modules/@typescript/native/bin/tsc
       GH_TOKEN: ${{ github.token }}
     steps:
@@ -456,52 +392,37 @@ jobs:
           }}/publish-artifacts/publish-linux-outputs-${{ github.run_id }}"
 
       # Step 10
-      - name: 🧾 Select prebuilt platform outputs
-        # A platform leg the plan skipped left no artifact, and that is the
-        # expected shape; a leg the plan asked for must have delivered one.
-        id: platform-outputs
-        run: |
-          set -euo pipefail
-          dirs=""
-          for dir in "${{ runner.temp }}/publish-artifacts/publish-macos-arm64-outputs-${{ github.run_id }}/current" "${{ runner.temp }}/publish-artifacts/publish-macos-x64-outputs-${{ github.run_id }}/current"; do
-            if [ -d "$dir" ]; then
-              # runner.temp carries no spaces; the publish step splits this on them.
-              dirs="$dirs $dir"
-            elif [ "${{ needs.macos-platform.outputs.platform_work }}" = "true" ]; then
-              echo "Platform outputs the plan asked for are missing: $dir" >&2
-              exit 1
-            fi
-          done
-          echo "dirs=$dirs" >> "$GITHUB_OUTPUT"
-
-      # Step 11
       - name: 🍎 Apply verified macOS outputs
-        if: needs.linux-release-candidate.outputs.mode != 'none' && steps.platform-outputs.outputs.dirs != ''
-        run: smoo github-ci apply-outputs --source-sha "${{ github.sha }}" ${{ steps.platform-outputs.outputs.dirs }}
+        if: needs.linux-release-candidate.outputs.mode != 'none'
+        run:
+          smoo github-ci apply-outputs --source-sha "${{ github.sha }}" "${{ runner.temp
+          }}/publish-artifacts/publish-macos-arm64-outputs-${{ github.run_id }}/current" "${{ runner.temp
+          }}/publish-artifacts/publish-macos-x64-outputs-${{ github.run_id }}/current"
 
       # --- Release ------------------------------------------------------------
 
-      # Step 12
+      # Step 11
       - name: 🏷️ Tag release
         # Ordered before the publish below so an interrupted release stays
         # detectable by the repair step at the top of this job on a later run.
         run: smoo release tag --dry-run "${{ inputs.dry_run }}"
 
-      # Step 13
+      # Step 12
       - name: 📦 Publish release (${{ needs.linux-release-candidate.outputs.mode }})
         # Pack verified outputs; --prebuilt refuses missing artifacts rather than rebuilding.
         # Public npm packages use trusted publishing/OIDC after local bootstrap.
         run:
           smoo release publish --prebuilt "${{ runner.temp }}/publish-artifacts/publish-release-outputs-${{
-          github.run_id }}" "${{ runner.temp }}/publish-artifacts/publish-linux-outputs-${{ github.run_id }}" ${{
-          steps.platform-outputs.outputs.dirs }} --bump "${{ inputs.bump }}" --dry-run "${{ inputs.dry_run }}"
+          github.run_id }}" "${{ runner.temp }}/publish-artifacts/publish-linux-outputs-${{ github.run_id }}" "${{
+          runner.temp }}/publish-artifacts/publish-macos-arm64-outputs-${{ github.run_id }}/current" "${{ runner.temp
+          }}/publish-artifacts/publish-macos-x64-outputs-${{ github.run_id }}/current" --bump "${{ inputs.bump }}"
+          --dry-run "${{ inputs.dry_run }}"
 
       # --- Cleanup ------------------------------------------------------------
 
-      # Step 14
+      # Step 13
       - name: 🧹 Cleanup and cache Nix/devenv
         if: always()
         uses: ./.github/actions/save-nix-devenv
         with:
-          nix-cache-hit: ${{ steps.setup.outputs.nix-cache-hit }}
           devenv-cache-hit: ${{ steps.setup.outputs.devenv-cache-hit }}

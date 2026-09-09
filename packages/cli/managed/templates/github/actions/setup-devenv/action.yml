@@ -2,26 +2,16 @@ name: Setup Nix/devenv
 description: >
   Build the SmoothBricks devenv shell after checkout. Restores the small devenv/direnv actions/cache segment on every
   runner (eval SQLite + shell scripts). On host-nix runners (NIX_REMOTE=daemon + /var/cache/ci) skips Nix install and
-  the large store NAR (host store). On ephemeral runners installs Nix and restores the NAR/profile cache.
+  the store cache (host store). On ephemeral runners installs a single-user Nix and restores /nix itself from the
+  actions cache: store paths and the Nix database come back as files, so no NAR is imported and no daemon is needed.
 
 outputs:
-  nix-cache-hit:
-    description: Whether the Nix profile/store cache restored from the exact primary key.
-    value: ${{ steps.nix-cache.outputs.cache-hit || 'false' }}
   devenv-cache-hit:
     description: Whether the devenv/direnv cache restored from the exact primary key.
     value: ${{ steps.devenv-cache.outputs.cache-hit || 'false' }}
   host-runner:
     description: Whether this job is on a host-nix runner with shared store/caches.
     value: ${{ steps.runner-kind.outputs.host }}
-
-inputs:
-  dependencies-restored:
-    description: >
-      Set to 'true' by a job that already restored the node_modules and ttsc plugin cache segments (for example ahead of
-      a Bun-only prologue); this action then neither restores nor saves them again.
-    required: false
-    default: 'false'
 
 runs:
   using: composite
@@ -106,33 +96,46 @@ runs:
         echo "nx cache   : $NX_CACHE_ROOT"
 
     # Devenv segment (own key): tooling/direnv/.devenv + .direnv — includes
-    # nix-eval-cache.db. Independent of the nix NAR; restore on host and ephemeral
-    # whether or not the store cache hit. Missing store paths are fine: devenv
-    # verifies shell drv/out exist on eval-cache hit and invalidates + re-evals
-    # / realizes when GC removed them. Packages still come from host store, NAR,
-    # or Cachix — this blob only skips evaluation.
+    # nix-eval-cache.db. Independent of the store cache; restore on host and
+    # ephemeral whether or not the store cache hit. Missing store paths are fine:
+    # devenv verifies shell drv/out exist on eval-cache hit and invalidates +
+    # re-evals / realizes when GC removed them. Packages still come from host
+    # store, the store cache, or Cachix — this blob only skips evaluation.
     - name: 🧊 Cache devenv and direnv
       id: devenv-cache
       uses: ./.github/actions/cache-nix-devenv
-      with:
-        segment: devenv
 
+    # Single-user Nix unpacked into /nix in seconds: no installer volume, no
+    # daemon, no sudo. keep-outputs/keep-derivations make the garbage collection
+    # before a cache save keep the shell's derivations, so a restored eval cache
+    # still finds them.
     - name: ❄️ Install Nix
       if: steps.runner-kind.outputs.host != 'true'
-      uses: DeterminateSystems/determinate-nix-action@v3
+      uses: nixbuild/nix-quick-install-action@v35
+      with:
+        nix_conf: |
+          keep-outputs = true
+          keep-derivations = true
+          keep-env-derivations = true
 
-    - name: 🧊 Cache Nix profiles and store NAR
+    # The store itself, restored as files: /nix/store plus the Nix database,
+    # merged into the fresh install. Profiles live outside /nix/var in
+    # single-user mode and ride along. The post phase collects garbage down
+    # to the live closure and saves when the primary key missed.
+    - name: 🧊 Cache Nix store
       id: nix-cache
       if: steps.runner-kind.outputs.host != 'true'
-      uses: ./.github/actions/cache-nix-devenv
+      uses: nix-community/cache-nix-action@v7
       with:
-        segment: nix
-
-    - name: ♻️ Restore Nix store from NAR
-      if: steps.runner-kind.outputs.host != 'true'
-      shell: bash
-      working-directory: tooling/direnv
-      run: ./github-actions-bootstrap.sh restore-store
+        paths: |
+          /nix
+          ~/.nix-profile
+          ~/.local/state/nix/profiles
+          ~/.cache/nix
+        # prettier-ignore
+        primary-key: ${{ runner.os }}-${{ runner.arch }}-nix-v4-${{ hashFiles('tooling/direnv/devenv.yaml', 'tooling/direnv/devenv.nix', 'tooling/direnv/devenv.lock') }}
+        restore-prefixes-first-match: ${{ runner.os }}-${{ runner.arch }}-nix-v4-
+        gc-max-store-size: 1G
 
     - name: ⚡ Enable Cachix
       if: steps.runner-kind.outputs.host != 'true'
@@ -148,11 +151,11 @@ runs:
     # node_modules + ttsc plugin binaries: GH Actions cache on ephemeral runners.
     # Host runners keep those under the /var/cache/ci bind (bun / ttsc env).
     - name: 📦 Cache node_modules
-      if: steps.runner-kind.outputs.host != 'true' && inputs.dependencies-restored != 'true'
+      if: steps.runner-kind.outputs.host != 'true'
       uses: ./.github/actions/cache-node-modules
 
     - name: 🧊 Cache ttsc plugins
-      if: steps.runner-kind.outputs.host != 'true' && inputs.dependencies-restored != 'true'
+      if: steps.runner-kind.outputs.host != 'true'
       uses: ./.github/actions/cache-ttsc-plugins
 
     - name: 🐚 Build devenv shell

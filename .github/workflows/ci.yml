@@ -32,7 +32,6 @@ jobs:
       fromJSON('["nixos-latest-x64","self-hosted"]') || 'ubuntu-latest' }}
     timeout-minutes: 45
     env:
-      NIX_STORE_NAR: ${{ github.workspace }}/nix-store.nar
       GH_TOKEN: ${{ github.token }}
     steps:
       # Step 1: GitHub adds "Set up job" automatically
@@ -132,5 +131,4 @@ jobs:
         if: always()
         uses: ./.github/actions/save-nix-devenv
         with:
-          nix-cache-hit: ${{ steps.setup.outputs.nix-cache-hit }}
           devenv-cache-hit: ${{ steps.setup.outputs.devenv-cache-hit }}

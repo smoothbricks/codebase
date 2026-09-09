@@ -218,11 +218,7 @@ function buildProgram(): Command {
       'comma-separated Nx projects to release, or all for every owned release package; blank releases package-local changes',
     )
     .requiredOption('--targets <targets>', 'comma-separated Nx platform target names or globs')
-    .option('--output <path>', 'output directory for current and repair artifacts')
-    .option(
-      '--plan',
-      'decide whether the selected targets have any current or repair work, without building; writes platform_work, projects and repairs to --github-output',
-    )
+    .requiredOption('--output <path>', 'output directory for current and repair artifacts')
     .option('--ref <ref>', 'fixed release graph ref to inspect')
     .option('--github-output <path>', 'append selected current platform projects to a GitHub Actions output file')
     .action(
@@ -230,22 +226,13 @@ function buildProgram(): Command {
         bump: string;
         projects?: string;
         githubOutput?: string;
-        output?: string;
-        plan?: boolean;
+        output: string;
         ref?: string;
         targets: string;
       }) => {
         // The source self-hosting shim has no Typia transform; release commands import transformed output validators.
-        if (options.plan) {
-          const { releasePlanPlatformOutputs } = await import('./release/index.js');
-          await releasePlanPlatformOutputs(await findRepoRoot(), options);
-          return;
-        }
-        if (options.output === undefined) {
-          throw new Error('release build-platform-outputs: --output is required unless --plan is given');
-        }
         const { releaseCollectPlatformOutputs } = await import('./release/index.js');
-        await releaseCollectPlatformOutputs(await findRepoRoot(), { ...options, output: options.output });
+        await releaseCollectPlatformOutputs(await findRepoRoot(), options);
       },
     );
   release
@@ -436,10 +423,6 @@ function buildProgram(): Command {
     .requiredOption('--title <title>')
     .requiredOption('--body <body>')
     .action(ensureCiPullRequest);
-  githubCi.command('cleanup-cache').action(async () => {
-    const { cleanupGithubCiCache } = await import('./github-ci/index.js');
-    await cleanupGithubCiCache(await findRepoRoot());
-  });
   githubCi
     .command('nx-smart')
     .requiredOption('--target <target>')

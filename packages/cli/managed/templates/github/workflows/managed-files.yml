@@ -124,5 +124,4 @@ __SMOO_PRIVATE_INSTALL_ENV__    steps:
         if: always()
         uses: ./.github/actions/save-nix-devenv
         with:
-          nix-cache-hit: ${{ steps.setup.outputs.nix-cache-hit }}
           devenv-cache-hit: ${{ steps.setup.outputs.devenv-cache-hit }}
