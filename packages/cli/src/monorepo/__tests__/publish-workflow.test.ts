@@ -52,8 +52,21 @@ describe('publish workflow definition', () => {
         parser: 'yaml',
         printWidth: 120,
         proseWrap: 'always',
+        singleQuote: true,
       }),
     ).resolves.toBe(rendered);
+  });
+
+  it('passes the projects selector to the version and platform-output steps', async () => {
+    const rendered = renderPublishWorkflowYaml(codebaseWorkflowOptions);
+
+    expect(foldedRunCommand(rendered, '🔢 Version release')).toBe(
+      'smoo release version --bump "${{ inputs.bump }}" --projects "${{ inputs.projects }}" --dry-run "${{ inputs.dry_run }}" --github-output "$GITHUB_OUTPUT"',
+    );
+    expect(foldedRunCommand(rendered, '🍎 Build selected macOS and iOS release outputs')).toContain(
+      '--projects "${{ inputs.projects }}"',
+    );
+    expect(rendered).toContain("default: ''");
   });
 
   it('preserves the single Ubuntu job and renders no artifact transfer when no Apple targets exist', () => {
@@ -263,7 +276,7 @@ describe('publish workflow definition', () => {
       macosPlatform.indexOf('- name: 🍎 Build selected macOS and iOS release outputs'),
     );
     expect(foldedRunCommand(macosPlatform, '🍎 Build selected macOS and iOS release outputs')).toBe(
-      `smoo release build-platform-outputs --bump "\${{ inputs.bump }}" --ref "\${{ github.sha }}" --targets "${MACOS_PLATFORM_TARGET_GLOBS.join(
+      `smoo release build-platform-outputs --bump "\${{ inputs.bump }}" --projects "\${{ inputs.projects }}" --ref "\${{ github.sha }}" --targets "${MACOS_PLATFORM_TARGET_GLOBS.join(
         ',',
       )}" --output "\${{ runner.temp }}/macos-platform-outputs" --github-output "$GITHUB_OUTPUT"`,
     );
@@ -379,7 +392,7 @@ describe('publish workflow definition', () => {
     expect(macosPlatform).toContain('      fail-fast: false');
     expect(macosPlatform).toContain('        arch: [arm64, x64]');
     expect(foldedRunCommand(macosPlatform, '🍎 Build selected macOS and iOS release outputs')).toBe(
-      'smoo release build-platform-outputs --bump "${{ inputs.bump }}" --ref "${{ github.sha }}" ' +
+      'smoo release build-platform-outputs --bump "${{ inputs.bump }}" --projects "${{ inputs.projects }}" --ref "${{ github.sha }}" ' +
         '--targets "*-${{ matrix.arch }}-macos,*-${{ matrix.arch }}-ios" ' +
         '--output "${{ runner.temp }}/macos-platform-outputs" --github-output "$GITHUB_OUTPUT"',
     );
