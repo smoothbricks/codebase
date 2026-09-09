@@ -99,9 +99,9 @@ function isNonemptyEnvValue(value: string | undefined): value is string {
  */
 export function parseSmooSecrets(packageJson: unknown): Readonly<Record<string, SecretSpec>> {
   if (!isRecord(packageJson)) return {};
-  const smoo = packageJson['smoo'];
+  const smoo = packageJson.smoo;
   if (!isRecord(smoo)) return {};
-  const secrets = smoo['secrets'];
+  const secrets = smoo.secrets;
   if (secrets === undefined) return {};
   if (!isRecord(secrets)) {
     throw new Error('smoo.secrets must map environment variable names to { command: [string, ...] }');
@@ -122,7 +122,7 @@ function parseSecretSpec(name: string, spec: unknown): SecretSpec {
   if (!isRecord(spec)) {
     throw new Error(`smoo.secrets.${name}: each entry must be an object with a command array`);
   }
-  const raw = spec['command'];
+  const raw = spec.command;
   if (!Array.isArray(raw) || raw.length === 0) {
     throw new Error(`smoo.secrets.${name}.command: must be an array of at least one string`);
   }
@@ -158,15 +158,15 @@ export interface RemoteCacheSpec {
  */
 export function parseSmooRemoteCache(packageJson: unknown): RemoteCacheSpec | null {
   if (!isRecord(packageJson)) return null;
-  const smoo = packageJson['smoo'];
+  const smoo = packageJson.smoo;
   if (!isRecord(smoo)) return null;
-  const remoteCache = smoo['remoteCache'];
+  const remoteCache = smoo.remoteCache;
   if (remoteCache === undefined) return null;
   if (!isRecord(remoteCache)) {
     throw new Error('smoo.remoteCache must be an object with { server, tokenSecret }');
   }
-  const server = remoteCache['server'];
-  const tokenSecret = remoteCache['tokenSecret'];
+  const server = remoteCache.server;
+  const tokenSecret = remoteCache.tokenSecret;
   // A trailing slash is refused rather than trimmed: Nx appends
   // `/v1/cache/<hash>`, so the doubled slash is a route that answers 404
   // forever, and silently repairing the manifest here would leave managed CI
@@ -215,7 +215,7 @@ async function routeSecret(
   if (isNonemptyEnvValue(env[name])) {
     return { name, kind: 'env-wins' };
   }
-  if (isNonemptyEnvValue(env['CI'])) {
+  if (isNonemptyEnvValue(env.CI)) {
     return {
       name,
       kind: 'failed',
@@ -223,7 +223,7 @@ async function routeSecret(
         'CI does not run secret provider commands — inject this variable into the job environment from the CI secret store',
     };
   }
-  if (isNonemptyEnvValue(env['COWSHED_WORKSPACE_TOKEN']) && context.registryIntentEnvs.has(name)) {
+  if (isNonemptyEnvValue(env.COWSHED_WORKSPACE_TOKEN) && context.registryIntentEnvs.has(name)) {
     return {
       name,
       kind: 'failed',
