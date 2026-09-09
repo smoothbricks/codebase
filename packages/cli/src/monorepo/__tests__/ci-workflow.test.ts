@@ -264,6 +264,75 @@ describe('CI workflow definition', () => {
     }
   });
 
+  it('rewrites a mirrored origin with insteadOf and answers the mirror host', () => {
+    const directory = mkdtempSync(join(tmpdir(), 'cargo-mirror-'));
+    try {
+      const lines = cargoCredentialStepLines(
+        { kind: CiWorkflowStepKind.CargoCredentials, name: 'Credentials', number: 3 },
+        {
+          gitOrigins: [
+            {
+              origin: 'https://git.example.net',
+              tokenEnv: 'SOURCE_READ_TOKEN',
+              internalMirror: 'http://10.89.0.1:3000',
+            },
+          ],
+        },
+      );
+      const script = lines
+        .slice(lines.indexOf('        run: |') + 1)
+        .map((line) => line.slice(10))
+        .join('\n');
+      const githubEnv = join(directory, 'env');
+      writeFileSync(githubEnv, '');
+      const environment = {
+        PATH: process.env.PATH ?? '/usr/bin:/bin',
+        RUNNER_TEMP: directory,
+        GITHUB_ENV: githubEnv,
+        SOURCE_READ_TOKEN: 'fixture-secret',
+      };
+      const prepared = spawnSync('sh', ['-eu', '-c', script], { env: environment, encoding: 'utf8' });
+      expect(prepared.status).toBe(0);
+      const written = readFileSync(githubEnv, 'utf8');
+      expect(written).toContain('GIT_CONFIG_KEY_2=url.http://10.89.0.1:3000/.insteadOf');
+      expect(written).toContain('GIT_CONFIG_VALUE_2=https://git.example.net/');
+      expect(written).toContain('GIT_CONFIG_COUNT=3');
+      const helper = join(directory, 'cargo-git-credential.sh');
+      const ask = (protocol: string, host: string): string => {
+        const result = spawnSync('sh', [helper, 'get'], {
+          env: environment,
+          encoding: 'utf8',
+          input: `protocol=${protocol}\nhost=${host}\n\n`,
+        });
+        expect(result.status).toBe(0);
+        return result.stdout;
+      };
+      // Declared origin and its rewritten mirror both answer; anything else stays silent.
+      expect(ask('https', 'git.example.net')).toBe('username=x-access-token\npassword=fixture-secret\n');
+      expect(ask('http', '10.89.0.1:3000')).toBe('username=x-access-token\npassword=fixture-secret\n');
+      expect(ask('http', 'git.example.net')).toBe('');
+      expect(ask('https', 'other.example.net')).toBe('');
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it('refuses malformed internal mirrors at render time', () => {
+    for (const internalMirror of [
+      'http://git.example.net/private/repo.git',
+      'https://token@git.example.net',
+      'ftp://git.example.net',
+      'https://git.example.net',
+    ]) {
+      expect(() =>
+        cargoCredentialStepLines(
+          { kind: CiWorkflowStepKind.CargoCredentials, name: 'Credentials', number: 3 },
+          { gitOrigins: [{ origin: 'https://git.example.net', tokenEnv: 'SOURCE_READ_TOKEN', internalMirror }] },
+        ),
+      ).toThrow('internalMirror');
+    }
+  });
+
   it('refuses missing registry secrets before setup and skips private Cargo jobs for fork PRs', () => {
     const definition = options({ cargoCredentials: { registryTokenEnvs: ['CARGO_REGISTRIES_EXAMPLE_TOKEN'] } });
     const steps = defineCiWorkflow(definition);
