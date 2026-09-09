@@ -260,16 +260,19 @@ describe('github-actions-bootstrap install-devenv', () => {
     expect(run.nixCalls).toBe('');
   });
 
-  it('installs the locked rev on a host runner whose image ships no devenv', () => {
-    // What these runners have always done — they just did it from a floating
-    // branch. Refusing instead was a regression: it failed
-    // linux-release-candidate in run 34373420924.
+  it('installs from the floating branch on a host runner with no devenv', () => {
+    // The one place drift is accepted deliberately. A host installs into a
+    // long-lived profile that roots the fleet's shared store, and holding it
+    // back to an older CLI than the fleet was running segfaulted the Rust
+    // linker in run 34374650577. Refusing to install at all was also wrong —
+    // that failed linux-release-candidate in run 34373420924.
     const run = runInstallDevenv(LOCK_WITH_REV, { hostRunner: true });
     if (run.status !== 0) {
       printCommandOutput(run.stdout, run.stderr);
     }
     expect(run.status).toBe(0);
-    expect(run.nixCalls).toContain(`nix profile add --accept-flake-config github:cachix/devenv/${REV}`);
+    expect(run.nixCalls).toContain('nix profile add --accept-flake-config github:cachix/devenv\n');
+    expect(run.nixCalls).not.toContain(REV);
     // Never on a host: the profile roots a store the whole fleet shares.
     expect(run.nixCalls).not.toContain('profile remove');
   });

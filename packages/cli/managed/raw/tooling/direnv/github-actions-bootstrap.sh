@@ -75,14 +75,24 @@ install_devenv() {
   # whole fleet shares, so an image-provided devenv is authoritative here
   # whatever commit it is — and a wrong one is never REPLACED, because
   # `nix profile remove --all` on a host would take the fleet's other roots with
-  # it. When the image ships none, install the locked rev: that is what these
-  # runners have always done, they just did it from a floating branch.
-  # SMOO_HOST_RUNNER comes from setup-devenv's runner-kind detection.
+  # it. SMOO_HOST_RUNNER comes from setup-devenv's runner-kind detection.
+  #
+  # With none present these runners install from the FLOATING branch, not the
+  # locked rev, which is the one place this script deliberately accepts drift.
+  # The pin exists to make the ephemeral runners' cached devenv reproducible;
+  # a host installs into a long-lived shared profile whose blast radius is the
+  # whole fleet, and pinning it down to an older CLI than the fleet had been
+  # running broke it: run 34374650577 segfaulted the Rust linker
+  # (devenv-rust-linker, clang exit 139) building cowshed-cli tests, where run
+  # 34371205556 on the same commit range was green with floating 2a399e9.
+  # 190959a is TWO COMMITS OLDER than what these hosts had been getting, so the
+  # pin was moving them backwards. A host's toolchain moves when its image or
+  # the lock moves, not when a repository decides to hold it back.
   if [ "${SMOO_HOST_RUNNER:-false}" = true ]; then
     if command -v devenv >/dev/null 2>&1; then
       echo "using host devenv: $(command -v devenv) ($(devenv version))"
     else
-      flake="${DEVENV_FLAKE:-github:cachix/devenv/$(devenv_locked_rev)}"
+      flake="${DEVENV_FLAKE:-github:cachix/devenv}"
       echo "host runner has no devenv; nix profile add ${flake}"
       nix profile add --accept-flake-config "$flake"
     fi
