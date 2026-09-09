@@ -33,48 +33,7 @@ defaults:
     working-directory: tooling/direnv
 
 jobs:
-  platform-plan:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      id-token: none
-    outputs:
-      platform-work: ${{ steps.plan.outputs.platform-work }}
-      projects: ${{ steps.plan.outputs.projects }}
-      repairs: ${{ steps.plan.outputs.repairs }}
-    env:
-      TTSC_TSGO_BINARY: ${{ github.workspace }}/node_modules/@typescript/native/bin/tsc
-      GH_TOKEN: ${{ github.token }}
-    steps:
-      - name: 📥 Checkout dispatch commit
-        uses: actions/checkout@v6.0.2
-        with:
-          ref: ${{ github.sha }}
-          filter: blob:none
-          fetch-depth: 0
-      - name: 🥟 Setup Bun
-        uses: oven-sh/setup-bun@v2
-        with:
-          bun-version-file: package.json
-      - name: 📦 Install workspace dependencies
-        working-directory: .
-        # repo-path exposes smoo: the source shim here, node_modules/.bin elsewhere.
-        run: |
-          bun install --frozen-lockfile
-          tooling/direnv/repo-path --github-path
-      - name: 🏗️ Build smoo Nx version actions
-        # The plan previews Nx Release versioning, which loads
-        # @smoothbricks/nx-plugin/version-actions from dist; ttsc runs on Bun.
-        working-directory: packages/nx-plugin
-        run: bunx ttsc -p tsconfig.lib.json --emit
-      - name: 🗺️ Plan platform outputs
-        id: plan
-        run:
-          smoo release build-platform-outputs --plan --bump "${{ inputs.bump }}" --projects "${{ inputs.projects }}"
-          --ref "${{ github.sha }}" --targets "*-macos" --github-output "$GITHUB_OUTPUT"
-
   linux-release-candidate:
-    needs: [platform-plan]
     runs-on:
       ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) &&
       fromJSON('["nixos-latest-x64","self-hosted"]') || 'ubuntu-latest' }}
@@ -242,10 +201,6 @@ jobs:
           devenv-cache-hit: ${{ steps.setup.outputs.devenv-cache-hit }}
 
   macos-platform:
-    # Ten minutes of toolchain setup only when the plan found a run for this
-    # platform; the plan job decided that without a toolchain.
-    needs: [platform-plan]
-    if: ${{ needs.platform-plan.outputs.platform-work == 'true' }}
     runs-on: macos-latest
     strategy:
       # One architecture per runner: a leg that fails still leaves the other
@@ -256,6 +211,8 @@ jobs:
     permissions:
       contents: read
       id-token: none
+    outputs:
+      platform_work: ${{ steps.plan.outputs.platform_work }}
     env:
       NIX_STORE_NAR: ${{ github.workspace }}/nix-store.nar
       GH_TOKEN: ${{ github.token }}
@@ -272,17 +229,30 @@ jobs:
           filter: blob:none
           fetch-depth: 0
 
-      # Step 3. Composite action internals do not affect top-level job step
-      # anchors; update these comments if top-level steps move.
-      - name: 🧱 Setup Nix/devenv
-        id: setup
-        uses: ./.github/actions/setup-devenv
+      # --- Plan (Bun only) ---------------------------------------------------
+      # Whether this runner has anything to build -- the release selection, its
+      # platform targets, and the pending releases only it can repair -- is
+      # git, the Nx graph, npm and GitHub metadata. Bun runs smoo and Nx
+      # directly, so the ten-minute Nix setup below is spent only on a run.
+
+      # Step 3
+      - name: 🥟 Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version-file: package.json
 
       # Step 4
+      - name: 📦 Install workspace dependencies
+        # repo-path exposes smoo: the source shim here, node_modules/.bin elsewhere.
+        run: |
+          bun install --frozen-lockfile
+          tooling/direnv/repo-path --github-path
+
+      # Step 5
       - name: 🏗️ Build smoo Nx version actions
         # Nx Release loads @smoothbricks/nx-plugin/version-actions through the
-        # export map in its own node process, and versioning runs before the
-        # build phase, so the hook must exist in dist first. Downstream
+        # export map in its own node process, and both the plan preview and
+        # versioning run it, so the hook must exist in dist first. Downstream
         # consumers install the published package and skip this bootstrap.
         #
         # `nx` cannot do it: the project graph loads this very plugin, so
@@ -290,39 +260,58 @@ jobs:
         # ttsc needs only the package tsconfig -- same bootstrap the devenv
         # shell runs (tooling/direnv/enter-shell.ts).
         working-directory: packages/nx-plugin
-        run: ttsc -p tsconfig.lib.json --emit
+        run: bunx ttsc -p tsconfig.lib.json --emit
 
-      # Step 5
+      # Step 6
+      - name: 🗺️ Plan platform outputs
+        id: plan
+        run:
+          smoo release build-platform-outputs --plan --bump "${{ inputs.bump }}" --projects "${{ inputs.projects }}"
+          --ref "${{ github.sha }}" --targets "*-macos" --github-output "$GITHUB_OUTPUT"
+
+      # --- Setup (only with work) --------------------------------------------
+
+      # Step 7. Composite action internals do not affect top-level job step
+      # anchors; update these comments if top-level steps move.
+      - name: 🧱 Setup Nix/devenv
+        id: setup
+        if: steps.plan.outputs.platform_work == 'true'
+        uses: ./.github/actions/setup-devenv
+
+      # Step 8
       - name: 🤖 Configure release author
+        if: steps.plan.outputs.platform_work == 'true'
         run:
           git config user.name "github-actions[bot]" && git config user.email
           "41898282+github-actions[bot]@users.noreply.github.com"
 
-      # Step 6
+      # Step 9
       - name: 🔢 Version release
         id: version
+        if: steps.plan.outputs.platform_work == 'true'
         run:
           smoo release version --bump "${{ inputs.bump }}" --projects "${{ inputs.projects }}" --dry-run "${{
           inputs.dry_run }}" --github-output "$GITHUB_OUTPUT"
 
-      # Step 7
+      # Step 10
       - name: 🍎 Build selected macOS and iOS release outputs (${{ matrix.arch }})
         id: platform-outputs
+        if: steps.plan.outputs.platform_work == 'true'
         run:
           smoo release build-platform-outputs --bump "${{ inputs.bump }}" --projects "${{ inputs.projects }}" --ref "${{
           github.sha }}" --targets "*-${{ matrix.arch }}-macos" --output "${{ runner.temp }}/macos-platform-outputs"
           --github-output "$GITHUB_OUTPUT"
 
-      # Step 8
+      # Step 11
       - name: 🧪 Unit test selected macOS and iOS packages
         # Only the runner-native leg can execute what it built; the foreign
         # architecture ships as an artifact without running here.
         if: matrix.arch == 'arm64' && steps.platform-outputs.outputs.projects != ''
         run: smoo github-ci nx-run-many --targets test --projects "${{ steps.platform-outputs.outputs.projects }}"
 
-      # Step 9
+      # Step 12
       - name: 📤 Upload macOS platform outputs (${{ matrix.arch }})
-        if: success()
+        if: steps.plan.outputs.platform_work == 'true'
         uses: actions/upload-artifact@v7.0.1
         with:
           name: publish-macos-${{ matrix.arch }}-outputs-${{ github.run_id }}
@@ -333,21 +322,18 @@ jobs:
 
       # --- Cleanup ------------------------------------------------------------
 
-      # Step 10
+      # Step 13
       - name: 🧹 Cleanup and cache Nix/devenv
-        # success() is default; always() still saves GH Nix cache after a red job.
-        if: always()
+        # always() still saves GH Nix cache after a red job; a runner the plan
+        # kept toolchain-free has no cache to save.
+        if: always() && steps.plan.outputs.platform_work == 'true'
         uses: ./.github/actions/save-nix-devenv
         with:
           nix-cache-hit: ${{ steps.setup.outputs.nix-cache-hit }}
           devenv-cache-hit: ${{ steps.setup.outputs.devenv-cache-hit }}
 
   publish-on-linux:
-    needs: [platform-plan, linux-release-candidate, macos-platform]
-    # A platform leg the plan skipped is not a failure; a leg that ran must have passed.
-    if:
-      ${{ !cancelled() && needs.linux-release-candidate.result == 'success' && (needs.macos-platform.result == 'success'
-      || needs.macos-platform.result == 'skipped') }}
+    needs: [linux-release-candidate, macos-platform]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -457,7 +443,7 @@ jobs:
             if [ -d "$dir" ]; then
               # runner.temp carries no spaces; the publish step splits this on them.
               dirs="$dirs $dir"
-            elif [ "${{ needs.platform-plan.outputs.platform-work }}" = "true" ]; then
+            elif [ "${{ needs.macos-platform.outputs.platform_work }}" = "true" ]; then
               echo "Platform outputs the plan asked for are missing: $dir" >&2
               exit 1
             fi

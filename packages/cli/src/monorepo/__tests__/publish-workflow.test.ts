@@ -118,7 +118,7 @@ describe('publish workflow definition', () => {
 
     expect(stepAnchorNumbers(singleJob)).toEqual(Array.from({ length: 16 }, (_, index) => index + 1));
     expect(stepAnchorNumbers(linuxCandidate)).toEqual(Array.from({ length: 19 }, (_, index) => index + 1));
-    expect(stepAnchorNumbers(macosPlatform)).toEqual(Array.from({ length: 10 }, (_, index) => index + 1));
+    expect(stepAnchorNumbers(macosPlatform)).toEqual(Array.from({ length: 13 }, (_, index) => index + 1));
     expect(stepAnchorNumbers(finalJob)).toEqual(Array.from({ length: 15 }, (_, index) => index + 1));
     expect(singleJob).toContain('# Step 14\n      - name: 🏷️ Tag release');
     expect(singleJob).toContain('# Step 15\n      - name: 📦 Publish release (${{ steps.version.outputs.mode }})');
@@ -128,9 +128,10 @@ describe('publish workflow definition', () => {
       '# Step 8\n      - name: ✅ Check managed monorepo files (${{ steps.version.outputs.mode }})',
     );
     expect(linuxCandidate).toContain('# Step 19\n      - name: 🧹 Cleanup and cache Nix/devenv');
-    expect(macosPlatform).toContain('# Step 6\n      - name: 🔢 Version release');
-    expect(macosPlatform).toContain('# Step 7\n      - name: 🍎 Build selected macOS and iOS release outputs');
-    expect(macosPlatform).toContain('# Step 10\n      - name: 🧹 Cleanup and cache Nix/devenv');
+    expect(macosPlatform).toContain('# Step 6\n      - name: 🗺️ Plan platform outputs');
+    expect(macosPlatform).toContain('# Step 9\n      - name: 🔢 Version release');
+    expect(macosPlatform).toContain('# Step 10\n      - name: 🍎 Build selected macOS and iOS release outputs');
+    expect(macosPlatform).toContain('# Step 13\n      - name: 🧹 Cleanup and cache Nix/devenv');
     expect(finalJob).toContain('# Step 3\n      - name: 🧱 Setup Nix/devenv');
     expect(finalJob).toContain('# Step 4\n      - name: 📥 Download candidate artifacts');
     expect(finalJob).toContain('# Step 6\n      - name: 🏗️ Build smoo Nx version actions');
@@ -170,7 +171,7 @@ describe('publish workflow definition', () => {
     // versions must materialize that one package first -- never the whole CLI
     // dependency chain, which is what this step used to build.
     for (const job of [...candidates, finalJob]) {
-      expect(job).toContain('        run: ttsc -p tsconfig.lib.json --emit');
+      expect(job).toContain(' ttsc -p tsconfig.lib.json --emit');
       expect(job).not.toContain('run: nx build');
     }
     for (const candidate of candidates) {
@@ -259,19 +260,23 @@ describe('publish workflow definition', () => {
       `smoo github-ci nx-run-many --targets "${LINUX_PLATFORM_TARGET_GLOBS.join(',')}" --projects`,
     );
     expect(native).toContain('  linux-release-candidate:');
-    expect(native).toContain(
-      "  macos-platform:\n    # Ten minutes of toolchain setup only when the plan found a run for this\n    # platform; the plan job decided that without a toolchain.\n    needs: [platform-plan]\n    if: ${{ needs.platform-plan.outputs.platform-work == 'true' }}\n    runs-on: macos-latest",
-    );
+    expect(native).toContain('  macos-platform:\n    runs-on: macos-latest');
     expect(native).toContain('  publish-on-linux:');
-    expect(native).toContain(
-      '  publish-on-linux:\n    needs: [platform-plan, linux-release-candidate, macos-platform]',
+    expect(native).toContain('  publish-on-linux:\n    needs: [linux-release-candidate, macos-platform]');
+    expect(linuxCandidate).not.toContain('needs:');
+    expect(macosPlatform).not.toContain('needs:');
+    // The mac runner decides on Bun alone whether it has work; every toolchain
+    // step after the plan is gated on its answer, and the job reports it.
+    expect(macosPlatform).toContain('smoo release build-platform-outputs --plan');
+    expect(macosPlatform).toContain('      platform_work: ${{ steps.plan.outputs.platform_work }}');
+    expect(macosPlatform.indexOf('- name: 🗺️ Plan platform outputs')).toBeLessThan(
+      macosPlatform.indexOf('- name: 🧱 Setup Nix/devenv'),
     );
-    // Both producers wait only on the toolchain-free plan, never on each other.
-    expect(linuxCandidate).toContain('needs: [platform-plan]');
-    expect(linuxCandidate).not.toContain('needs: [platform-plan, ');
-    expect(macosPlatform).toContain('needs: [platform-plan]');
-    expect(native).toContain('  platform-plan:\n    runs-on: ubuntu-latest');
-    expect(native).toContain('smoo release build-platform-outputs --plan');
+    expect(macosPlatform).toContain(
+      "- name: 🧱 Setup Nix/devenv\n        id: setup\n        if: steps.plan.outputs.platform_work == 'true'",
+    );
+    expect(macosPlatform).toContain("if: always() && steps.plan.outputs.platform_work == 'true'");
+    expect(macosPlatform).not.toContain('smoo release repair-pending');
     expect(linuxCandidate).not.toContain('smoo release repair-pending');
     expect(linuxCandidate).toContain('smoo release version');
     expect(linuxCandidate).toContain('smoo github-ci nx-run-many --targets build --projects');
@@ -365,7 +370,7 @@ describe('publish workflow definition', () => {
           const matches = new Function('steps', 'success', 'failure', `return ${step.if};`);
           return Boolean(
             matches(
-              { version: { outputs: { mode: 'release' } } },
+              { version: { outputs: { mode: 'release' } }, plan: { outputs: { platform_work: 'true' } } },
               () => succeeded,
               () => !succeeded,
             ),
@@ -1047,17 +1052,13 @@ it('builds on smoo.github.runsOn but publishes from the GitHub-hosted runner', (
       \${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) &&
       fromJSON('["nixos-latest-x64","self-hosted"]') || 'ubuntu-latest' }}`;
 
-  expect(rendered).toContain(`  linux-release-candidate:\n    needs: [platform-plan]\n    ${selfHostedRunner}`);
-  expect(rendered).toContain(
-    "  macos-platform:\n    # Ten minutes of toolchain setup only when the plan found a run for this\n    # platform; the plan job decided that without a toolchain.\n    needs: [platform-plan]\n    if: ${{ needs.platform-plan.outputs.platform-work == 'true' }}\n    runs-on: macos-latest",
-  );
+  expect(rendered).toContain(`  linux-release-candidate:\n    ${selfHostedRunner}`);
+  expect(rendered).toContain('  macos-platform:\n    runs-on: macos-latest');
   // npmjs signs provenance with the job's OIDC token and then rejects the
   // upload (422) unless the runner is GitHub-hosted, so only the build lane
   // may keep the configured labels.
   expect(rendered.split('fromJSON(\'["nixos-latest-x64","self-hosted"]\')').length - 1).toBe(1);
-  expect(rendered).toContain(
-    '  publish-on-linux:\n    needs: [platform-plan, linux-release-candidate, macos-platform]',
-  );
+  expect(rendered).toContain('  publish-on-linux:\n    needs: [linux-release-candidate, macos-platform]');
   expect(rendered.slice(rendered.indexOf('  publish-on-linux:'))).toContain('runs-on: ubuntu-latest');
   // The runner moved; the OIDC permission that mints provenance did not.
   expect(rendered.slice(rendered.indexOf('  publish-on-linux:'))).toContain('id-token: write');
@@ -1206,7 +1207,7 @@ it('keeps job-local step anchors contiguous once Cargo credentials add a setup s
   // hand-numbered platform renderers must renumber with it.
   expect(stepAnchorNumbers(singleJob)).toEqual(Array.from({ length: 17 }, (_, index) => index + 1));
   expect(stepAnchorNumbers(linuxCandidate)).toEqual(Array.from({ length: 20 }, (_, index) => index + 1));
-  expect(stepAnchorNumbers(macosPlatform)).toEqual(Array.from({ length: 11 }, (_, index) => index + 1));
+  expect(stepAnchorNumbers(macosPlatform)).toEqual(Array.from({ length: 14 }, (_, index) => index + 1));
   expect(stepAnchorNumbers(finalJob)).toEqual(Array.from({ length: 16 }, (_, index) => index + 1));
 });
 
@@ -1230,7 +1231,7 @@ it('preflights registry-only Cargo credentials in every fetching job without ins
     },
   });
   expect(rendered).not.toContain('CARGO_NET_GIT_FETCH_WITH_CLI');
-  expect(stepAnchorNumbers(macosPlatform)).toEqual(Array.from({ length: 11 }, (_, index) => index + 1));
+  expect(stepAnchorNumbers(macosPlatform)).toEqual(Array.from({ length: 14 }, (_, index) => index + 1));
 });
 
 it('refuses malformed Cargo credential declarations at render time', () => {
