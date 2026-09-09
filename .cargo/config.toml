@@ -8,3 +8,16 @@ linker = "packages/cowshed/scripts/macos-linker.sh"
 
 [target.x86_64-apple-darwin]
 linker = "packages/cowshed/scripts/macos-linker.sh"
+
+# One feature resolution for the whole workspace. Without it every per-crate
+# cargo invocation resolves features for its own selection, so one shared
+# dependency is compiled once per selection and no warm target directory is
+# reused across crates. Requires the nightly channel the managed devenv
+# module pins; on a stable toolchain a cargo-hakari workspace-hack does the
+# same job. Both keys are needed: cargo ignores [resolver] without the
+# [unstable] opt-in.
+[unstable]
+feature-unification = true
+
+[resolver]
+feature-unification = "workspace"
