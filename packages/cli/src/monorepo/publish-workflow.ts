@@ -1016,6 +1016,8 @@ function renderMacosPlatformSteps(options: PublishWorkflowDefinitionOptions): st
     `      # Step ${stepNumber++}`,
     '      - name: 🧊 Restore ttsc plugins',
     '        uses: ./.github/actions/cache-ttsc-plugins',
+    '        with:',
+    '          scope: bun',
     '',
     `      # Step ${stepNumber++}`,
     '      - name: 🥟 Setup Bun',
@@ -1030,6 +1032,8 @@ function renderMacosPlatformSteps(options: PublishWorkflowDefinitionOptions): st
     '        run: |',
     '          bun install --frozen-lockfile',
     '          tooling/direnv/repo-path --github-path',
+    '          # nx must run on Node: its js plugin needs the full TypeScript API.',
+    '          echo "node: $(command -v node) $(node -e \'console.log(process.version, process.versions.bun ?? "")\')"',
   ];
   if (isSmoothBricksCodebasePackageName(options.repoName)) {
     lines.push(
