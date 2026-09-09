@@ -253,6 +253,28 @@ describe('resolveSecretEnvironment', () => {
     });
   });
 
+  it('an unreachable cache-token provider does not block the install, while other secrets still refuse', async () => {
+    await withFixture(
+      {
+        secrets: {
+          NX_REMOTE_CACHE_TOKEN: { command: ['definitely-not-a-real-smoo-binary-xyz'] },
+          SMOO_TOKEN: { command: emit('tok-from-provider') },
+        },
+        remoteCache: { server: 'https://nx-cache.example.net', tokenSecret: 'NX_REMOTE_CACHE_TOKEN' },
+      },
+      async (root) => {
+        // A cache is an optimization: its provider being down installs
+        // dependencies anyway. Every other declared secret keeps its refusal.
+        expect(await resolveInBootstrap({ root, env: {} })).toEqual({
+          resolved: { SMOO_TOKEN: 'tok-from-provider' },
+        });
+        const withoutCacheDeclaration = await resolveInBootstrap({ root, env: { CI: 'true' } });
+        expect(withoutCacheDeclaration.error).toContain('SMOO_TOKEN');
+        expect(withoutCacheDeclaration.error).not.toContain('NX_REMOTE_CACHE_TOKEN');
+      },
+    );
+  });
+
   it('a present variable is not reported while another refuses in CI', async () => {
     await withFixture(
       {

@@ -29,6 +29,12 @@
  * Error text names variables and exit codes only: secret values, provider
  * stdout/stderr, and command arguments are never echoed.
  *
+ * One declared variable is exempt from blocking an install: the one
+ * `smoo.remoteCache.tokenSecret` names. A remote cache is an optimization, so
+ * an unreachable secret provider must not keep dependencies from installing or
+ * a shell from opening; that variable is resolved by the cache export below,
+ * where failure costs a stderr line.
+ *
  * Run as a program (`bun secret-references.ts [root]`), the script prints the
  * remote cache's `export` lines for the shell to `eval` and nothing else: Nx
  * runs in the developer's shell, not in the setup child, and the export is
@@ -302,11 +308,28 @@ const runSecretCommand: SecretCommandRunner = async (argv) => {
   return stdout;
 };
 
+/**
+ * The declared secrets an install needs, resolved before it runs. The cache
+ * token is deliberately not among them: a remote cache is an optimization, so
+ * its credential is resolved by the shell's cache export — where an
+ * unreachable secret provider costs a stderr line — while every secret an
+ * install actually depends on still refuses loudly here. Which variable that
+ * is comes from `smoo.remoteCache.tokenSecret` rather than a second flag, so
+ * the two declarations cannot disagree.
+ */
 export async function resolveSecretEnvironment(
   options: SecretResolutionOptions,
 ): Promise<Readonly<Record<string, string>>> {
+  const packageJson = readPackageJson(options.root);
+  const cacheToken = parseSmooRemoteCache(packageJson)?.tokenSecret;
+  const required: Record<string, SecretSpec> = {};
+  for (const [name, spec] of Object.entries(parseSmooSecrets(packageJson))) {
+    if (name !== cacheToken) {
+      required[name] = spec;
+    }
+  }
   return resolveSecrets({
-    secrets: parseSmooSecrets(readPackageJson(options.root)),
+    secrets: required,
     registryIntentEnvs: registryAuthEnvNames(readNpmrcText(options.root)),
     env: options.env ?? process.env,
     runCommand: options.runCommand,

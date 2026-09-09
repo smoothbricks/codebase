@@ -467,6 +467,11 @@ Developer shells get the pair from the managed `tooling/direnv/secret-references
 none (with the reason on stderr), and never replaces a server the environment already carries, so a CI job keeps the
 internal address its own runners reach.
 
+`tokenSecret` may name a `smoo.secrets` entry, and then it is the one declared secret that never blocks an install: a
+cache is an optimization, so an unreachable secret provider costs a stderr line where every other declared secret would
+refuse the install outright. `op read` being unavailable in a sandboxed workspace therefore loses the cache, not the
+shell.
+
 ## Releases
 
 Release commands wrap [Nx Release][nx-release] but keep SmoothBricks policy in one place.
