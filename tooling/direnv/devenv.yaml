@@ -25,9 +25,21 @@ inputs:
     flake: true
     overlays:
       - default
+  # Its own nixpkgs is the single largest duplication in the shell closure. This
+  # is a Python script, and on Darwin nixpkgs' python3 retains the whole SDK
+  # chain (apple-sdk -> cctools-libtool -> llvm-lib -> clang-lib), so a second
+  # nixpkgs revision meant a SECOND copy of all of it: apple-sdk-14.4 362.9 MB,
+  # llvm-21.1.8-lib 398.6 MB, clang-21.1.8-lib 301.5 MB, python3 3.13 115.1 MB
+  # and their cctools/ld64/xcbuild/libiconv tails. `nix why-depends` traces every
+  # one of those to this input alone. Following the fleet nixpkgs collapses them
+  # onto the copies rustc and stdenv-darwin already require, at no cost: this
+  # flake pins no nixpkgs-specific behaviour, it packages one script.
   git-format-staged:
     url: github:smoothbricks/git-format-staged
     flake: true
+    inputs:
+      nixpkgs:
+        follows: nixpkgs
   rust-overlay:
     url: github:oxalica/rust-overlay
     flake: true
