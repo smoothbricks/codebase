@@ -1,13 +1,9 @@
 name: Save Nix/devenv caches
 description: >
-  Save cache segments after the job. Nix store NAR stays ephemeral-only (host uses shared /nix/store). Devenv/direnv
-  eval-cache segment saves on every runner when setup missed and build-shell produced nix-eval-cache.db.
+  Save the devenv/direnv eval-cache segment after the job, on every runner where setup missed and build-shell produced
+  nix-eval-cache.db. The Nix store cache saves itself in setup-devenv's post phase (ephemeral runners only).
 
 inputs:
-  nix-cache-hit:
-    description: Exact-hit output from setup-devenv's Nix cache restore.
-    required: false
-    default: 'false'
   devenv-cache-hit:
     description: Exact-hit output from setup-devenv's devenv cache restore.
     required: false
@@ -16,47 +12,6 @@ inputs:
 runs:
   using: composite
   steps:
-    - name: 🔎 Runner kind
-      id: runner-kind
-      shell: bash
-      run: |
-        if [ "${NIX_REMOTE:-}" = daemon ] && [ -d /var/cache/ci ]; then
-          echo "host=true" >> "$GITHUB_OUTPUT"
-        else
-          echo "host=false" >> "$GITHUB_OUTPUT"
-        fi
-
-    - name: 🧹 Prepare Nix/devenv cache save
-      id: cleanup-cache
-      if: steps.runner-kind.outputs.host != 'true'
-      shell: bash
-      working-directory: tooling/direnv
-      env:
-        NIX_CACHE_HIT: ${{ inputs.nix-cache-hit }}
-      # An exact Nix cache hit is immutable and cannot be overwritten by
-      # actions/cache. Avoid rebuilding its ~2 GB NAR just to discard it.
-      # build-shell normally adds repo paths to GITHUB_PATH, but cleanup must
-      # still run after a cache miss when build-shell fails before that happens.
-      run: |
-        if [[ "$NIX_CACHE_HIT" == 'true' ]]; then
-          echo 'cache-ready=true' >> "$GITHUB_OUTPUT"
-          exit 0
-        fi
-        export PATH="$(../../tooling/direnv/repo-path)"
-        smoo github-ci cleanup-cache
-
-    - name: 🧊 Save Nix profiles and store NAR
-      if:
-        ${{ steps.runner-kind.outputs.host != 'true' && steps.cleanup-cache.outputs.cache-ready == 'true' &&
-        inputs.nix-cache-hit != 'true' }}
-      uses: ./.github/actions/cache-nix-devenv
-      with:
-        segment: nix
-        mode: save
-
-    # Devenv segment is independent of nix NAR readiness and host vs ephemeral.
-    # Skip when setup never finished (no eval DB) so if: always() cannot poison
-    # the next restore with an empty/partial key.
     - name: 🔎 Devenv save ready
       id: devenv-save
       if: inputs.devenv-cache-hit != 'true'
@@ -74,5 +29,4 @@ runs:
       if: ${{ inputs.devenv-cache-hit != 'true' && steps.devenv-save.outputs.ready == 'true' }}
       uses: ./.github/actions/cache-nix-devenv
       with:
-        segment: devenv
         mode: save

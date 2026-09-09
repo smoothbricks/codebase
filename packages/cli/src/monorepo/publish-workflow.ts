@@ -466,7 +466,6 @@ jobs:
   publish:
 ${options.release === false ? renderRunsOnLine(options.runsOn) : publishJobRunsOnLine(options)}
     env:
-      NIX_STORE_NAR: ${githubExpression('github.workspace')}/nix-store.nar
       GH_TOKEN: ${githubExpression('github.token')}${cargoCredentialsJobEnv(options)}${privateNpmInstallJobEnv(options)}
     steps:
 `;
@@ -631,7 +630,6 @@ function yamlLinesForStep(step: PublishWorkflowStep, options: PublishWorkflowDef
         '        if: always()',
         '        uses: ./.github/actions/save-nix-devenv',
         '        with:',
-        `          nix-cache-hit: ${githubExpression('steps.setup.outputs.nix-cache-hit')}`,
         `          devenv-cache-hit: ${githubExpression('steps.setup.outputs.devenv-cache-hit')}`,
       ];
   }
@@ -798,24 +796,16 @@ ${renderRunsOnLine(options.runsOn)}
       mode: ${githubExpression('steps.version.outputs.mode')}
       release-sha: ${githubExpression('steps.release-state.outputs.sha')}
     env:
-      NIX_STORE_NAR: ${githubExpression('github.workspace')}/nix-store.nar
       GH_TOKEN: ${githubExpression('github.token')}${cargoCredentialsJobEnv(options)}${privateNpmInstallJobEnv(options)}
     steps:
 ${renderLinuxReleaseCandidateSteps(steps, options)}
 
-  ${platformJobName(options)}:
+  ${options.platformProducer?.kind === 'linux-cross' ? 'cross-platform' : 'macos-platform'}:
 ${renderMacosJobHeaderLines(options)}
     permissions:
       contents: read
       id-token: none
-    outputs:
-      platform_work: ${githubExpression('steps.plan.outputs.platform_work')}
     env:
-      NIX_STORE_NAR: ${githubExpression('github.workspace')}/nix-store.nar
-      # The same root devenv derives, so the Bun-only prologue and the shell
-      # share the restored plugin binaries (and never write under node_modules).
-      TTSC_CACHE_DIR: ${githubExpression('github.workspace')}/.cache/ttsc
-      TTSC_TSGO_BINARY: ${githubExpression('github.workspace')}/node_modules/@typescript/native/bin/tsc
       GH_TOKEN: ${githubExpression('github.token')}${cargoCredentialsJobEnv(options)}${privateNpmInstallJobEnv(options)}
 ${Object.entries(options.platformProducer?.env ?? {})
   .map(([name, value]) => `      ${name}: ${JSON.stringify(value)}`)
@@ -824,22 +814,17 @@ ${Object.entries(options.platformProducer?.env ?? {})
 ${renderMacosPlatformSteps(options)}
 
   publish-on-linux:
-    needs: [linux-release-candidate, ${platformJobName(options)}]
+    needs: [linux-release-candidate, ${options.platformProducer?.kind === 'linux-cross' ? 'cross-platform' : 'macos-platform'}]
 ${publishJobRunsOnLine(options)}
     permissions:
       contents: write
       id-token: write
     env:
-      NIX_STORE_NAR: ${githubExpression('github.workspace')}/nix-store.nar
       TTSC_TSGO_BINARY: ${githubExpression('github.workspace')}/node_modules/@typescript/native/bin/tsc
       GH_TOKEN: ${githubExpression('github.token')}${cargoCredentialsJobEnv(options)}${privateNpmInstallJobEnv(options)}
     steps:
 ${renderFinalLinuxPublishSteps(options)}
 `;
-}
-
-function platformJobName(options: PublishWorkflowDefinitionOptions): string {
-  return options.platformProducer?.kind === 'linux-cross' ? 'cross-platform' : 'macos-platform';
 }
 
 function renderLinuxReleaseCandidateSteps(
@@ -980,7 +965,6 @@ function renderLinuxReleaseCandidateSteps(
     '        if: always()',
     '        uses: ./.github/actions/save-nix-devenv',
     '        with:',
-    `          nix-cache-hit: ${githubExpression('steps.setup.outputs.nix-cache-hit')}`,
     `          devenv-cache-hit: ${githubExpression('steps.setup.outputs.devenv-cache-hit')}`,
   );
   return lines.join('\n').trimEnd();
@@ -999,74 +983,7 @@ function renderMacosPlatformSteps(options: PublishWorkflowDefinitionOptions): st
     `          ref: ${githubExpression('github.sha')}`,
     '          filter: blob:none',
     '          fetch-depth: 0',
-    '',
-    '      # --- Plan (Bun only) ---------------------------------------------------',
-    '      # Whether this runner has anything to build -- the release selection, its',
-    '      # platform targets, and the pending releases only it can repair -- is',
-    '      # git, the Nx graph, npm and GitHub metadata. Bun runs smoo and Nx',
-    '      # directly, so the ten-minute Nix setup below is spent only on a run.',
-    '      # The dependency segments restore here, once: bun install is then a',
-    '      # lockfile check and ttsc finds its compiled plugins instead of building',
-    '      # them with Go; setup-devenv is told not to restore them again.',
-    '',
-    `      # Step ${stepNumber++}`,
-    '      - name: 📦 Restore node_modules',
-    '        uses: ./.github/actions/cache-node-modules',
-    '',
-    `      # Step ${stepNumber++}`,
-    '      - name: 🧊 Restore ttsc plugins',
-    '        uses: ./.github/actions/cache-ttsc-plugins',
-    '        with:',
-    '          scope: bun',
-    '',
-    `      # Step ${stepNumber++}`,
-    '      - name: 🥟 Setup Bun',
-    '        uses: oven-sh/setup-bun@v2',
-    '        with:',
-    '          bun-version-file: package.json',
-    '',
-    `      # Step ${stepNumber++}`,
-    '      - name: 📦 Install workspace dependencies',
-    '        # repo-path exposes smoo: the source shim here, node_modules/.bin elsewhere.',
-    '        working-directory: .',
-    '        run: |',
-    '          bun install --frozen-lockfile',
-    '          tooling/direnv/repo-path --github-path',
-    '          # nx must run on Node: its js plugin needs the full TypeScript API.',
-    '          echo "node: $(command -v node) $(node -e \'console.log(process.version, process.versions.bun ?? "")\')"',
   ];
-  if (isSmoothBricksCodebasePackageName(options.repoName)) {
-    lines.push(
-      '',
-      `      # Step ${stepNumber++}`,
-      '      - name: 🏗️ Build smoo Nx version actions',
-      '        # Nx Release loads @smoothbricks/nx-plugin/version-actions through the',
-      '        # export map in its own node process, and both the plan preview and',
-      '        # versioning run it, so the hook must exist in dist first. Downstream',
-      '        # consumers install the published package and skip this bootstrap.',
-      '        #',
-      '        # `nx` cannot do it: the project graph loads this very plugin, so',
-      '        # `nx build nx-plugin` deadlocks on the executor it is building.',
-      '        # ttsc needs only the package tsconfig -- same bootstrap the devenv',
-      '        # shell runs (tooling/direnv/enter-shell.ts).',
-      '        working-directory: packages/nx-plugin',
-      '        run: bunx ttsc -p tsconfig.lib.json --emit',
-    );
-  }
-  lines.push(
-    '',
-    `      # Step ${stepNumber++}`,
-    '      - name: 🗺️ Plan platform outputs',
-    '        id: plan',
-    '        env:',
-    "          NX_VERBOSE_LOGGING: 'true'",
-    '        run:',
-    `          smoo release build-platform-outputs --plan --bump "${githubExpression('inputs.bump')}" --projects "${githubExpression('inputs.projects')}"`,
-    `          --ref "${githubExpression('github.sha')}" --targets "${macosPlatformFamilySelector(options)}" --github-output "$GITHUB_OUTPUT"`,
-    '',
-    '      # --- Setup (only with work) --------------------------------------------',
-  );
-  const planned = "steps.plan.outputs.platform_work == 'true'";
   if (options.platformProducer) {
     if (!options.platformProducer.preflight.trim()) {
       throw new Error('Linux cross-platform production requires a nonempty toolchain preflight command.');
@@ -1075,18 +992,17 @@ function renderMacosPlatformSteps(options: PublishWorkflowDefinitionOptions): st
       '',
       `      # Step ${stepNumber++}`,
       '      - name: Check cross-platform toolchain prerequisites',
-      `        if: ${planned}`,
       '        working-directory: .',
       '        run: |',
       '          set -euo pipefail',
       ...options.platformProducer.preflight.split('\n').map((line) => `          ${line}`),
     );
   }
-  const macosCargoCredentials = plannedStepLines(cargoCredentialsStepLines(options), planned);
+  const macosCargoCredentials = cargoCredentialsStepLines(options);
   if (macosCargoCredentials.length > 0) {
     lines.push('', `      # Step ${stepNumber++}`, ...macosCargoCredentials);
   }
-  const siblingSourceCheckouts = plannedStepLines(siblingSourceCheckoutStepLines(options), planned);
+  const siblingSourceCheckouts = siblingSourceCheckoutStepLines(options);
   if (siblingSourceCheckouts.length > 0) {
     lines.push('', `      # Step ${stepNumber++}`, ...siblingSourceCheckouts);
   }
@@ -1096,16 +1012,30 @@ function renderMacosPlatformSteps(options: PublishWorkflowDefinitionOptions): st
     '      # anchors; update these comments if top-level steps move.',
     '      - name: 🧱 Setup Nix/devenv',
     '        id: setup',
-    `        if: ${planned}`,
     '        uses: ./.github/actions/setup-devenv',
-    '        with:',
-    "          dependencies-restored: 'true'",
   );
+  if (isSmoothBricksCodebasePackageName(options.repoName)) {
+    lines.push(
+      '',
+      `      # Step ${stepNumber++}`,
+      '      - name: 🏗️ Build smoo Nx version actions',
+      '        # Nx Release loads @smoothbricks/nx-plugin/version-actions through the',
+      '        # export map in its own node process, and versioning runs before the',
+      '        # build phase, so the hook must exist in dist first. Downstream',
+      '        # consumers install the published package and skip this bootstrap.',
+      '        #',
+      '        # `nx` cannot do it: the project graph loads this very plugin, so',
+      '        # `nx build nx-plugin` deadlocks on the executor it is building.',
+      '        # ttsc needs only the package tsconfig -- same bootstrap the devenv',
+      '        # shell runs (tooling/direnv/enter-shell.ts).',
+      '        working-directory: packages/nx-plugin',
+      '        run: ttsc -p tsconfig.lib.json --emit',
+    );
+  }
   lines.push(
     '',
     `      # Step ${stepNumber++}`,
     '      - name: 🤖 Configure release author',
-    `        if: ${planned}`,
     '        run:',
     '          git config user.name "github-actions[bot]" && git config user.email',
     '          "41898282+github-actions[bot]@users.noreply.github.com"',
@@ -1113,7 +1043,6 @@ function renderMacosPlatformSteps(options: PublishWorkflowDefinitionOptions): st
     `      # Step ${stepNumber++}`,
     '      - name: 🔢 Version release',
     '        id: version',
-    `        if: ${planned}`,
     '        run:',
     `          smoo release version --bump "${githubExpression('inputs.bump')}" --projects "${githubExpression('inputs.projects')}" --dry-run "${githubExpression('inputs.dry_run')}" --github-output`,
     '          "$GITHUB_OUTPUT"',
@@ -1131,7 +1060,6 @@ function renderMacosPlatformSteps(options: PublishWorkflowDefinitionOptions): st
     `      # Step ${stepNumber++}`,
     `      - name: 🍎 Build selected macOS and iOS release outputs${legLabel}`,
     '        id: platform-outputs',
-    `        if: ${planned}`,
     '        run:',
     `          smoo release build-platform-outputs --bump "${githubExpression(
       'inputs.bump',
@@ -1156,44 +1084,29 @@ function renderMacosPlatformSteps(options: PublishWorkflowDefinitionOptions): st
   lines.push(
     '',
     `      # Step ${stepNumber++}`,
-    ...artifactStepLines(
-      options.actionsProvider,
-      `📤 Upload macOS platform outputs${legLabel}`,
-      'upload',
-      [
-        `name: ${
-          isMatrix
-            ? `publish-macos-${githubExpression('matrix.arch')}-outputs-${githubExpression('github.run_id')}`
-            : `publish-macos-outputs-${githubExpression('github.run_id')}`
-        }`,
-        `path: ${githubExpression('runner.temp')}/macos-platform-outputs`,
-        'if-no-files-found: error',
-        'retention-days: 1',
-        'include-hidden-files: true',
-      ],
-      planned,
-    ),
+    ...artifactStepLines(options.actionsProvider, `📤 Upload macOS platform outputs${legLabel}`, 'upload', [
+      `name: ${
+        isMatrix
+          ? `publish-macos-${githubExpression('matrix.arch')}-outputs-${githubExpression('github.run_id')}`
+          : `publish-macos-outputs-${githubExpression('github.run_id')}`
+      }`,
+      `path: ${githubExpression('runner.temp')}/macos-platform-outputs`,
+      'if-no-files-found: error',
+      'retention-days: 1',
+      'include-hidden-files: true',
+    ]),
     '',
     '      # --- Cleanup ------------------------------------------------------------',
     '',
     `      # Step ${stepNumber}`,
     '      - name: 🧹 Cleanup and cache Nix/devenv',
-    '        # always() still saves GH Nix cache after a red job; a runner the plan',
-    '        # kept toolchain-free has no cache to save.',
-    `        if: always() && ${planned}`,
+    '        # success() is default; always() still saves GH Nix cache after a red job.',
+    '        if: always()',
     '        uses: ./.github/actions/save-nix-devenv',
     '        with:',
-    `          nix-cache-hit: ${githubExpression('steps.setup.outputs.nix-cache-hit')}`,
     `          devenv-cache-hit: ${githubExpression('steps.setup.outputs.devenv-cache-hit')}`,
   );
   return lines.join('\n').trimEnd();
-}
-
-/** Gate a rendered step on the plan: its `if:` follows the `- name:` line. */
-function plannedStepLines(lines: readonly string[], planned: string): string[] {
-  const name = lines.findIndex((line) => line.startsWith('      - name: '));
-  if (name < 0) return [...lines];
-  return [...lines.slice(0, name + 1), `        if: ${planned}`, ...lines.slice(name + 1)];
 }
 
 function renderFinalLinuxPublishSteps(options: PublishWorkflowDefinitionOptions): string {
@@ -1318,34 +1231,13 @@ function renderFinalLinuxPublishSteps(options: PublishWorkflowDefinitionOptions)
   lines.push(
     '',
     `      # Step ${stepNumber++}`,
-    '      - name: 🧾 Select prebuilt platform outputs',
-    '        # A platform leg the plan skipped left no artifact, and that is the',
-    '        # expected shape; a leg the plan asked for must have delivered one.',
-    '        id: platform-outputs',
-    '        run: |',
-    '          set -euo pipefail',
-    '          dirs=""',
-    `          for dir in ${macosPlatformArtifactNames(options)
-      .map((name) => `"${githubExpression('runner.temp')}/publish-artifacts/${name}/current"`)
-      .join(' ')}; do`,
-    '            if [ -d "$dir" ]; then',
-    '              # runner.temp carries no spaces; the publish step splits this on them.',
-    '              dirs="$dirs $dir"',
-    `            elif [ "${githubExpression(`needs.${platformJobName(options)}.outputs.platform_work`)}" = "true" ]; then`,
-    '              echo "Platform outputs the plan asked for are missing: $dir" >&2',
-    '              exit 1',
-    '            fi',
-    '          done',
-    '          echo "dirs=$dirs" >> "$GITHUB_OUTPUT"',
-  );
-  lines.push(
-    '',
-    `      # Step ${stepNumber++}`,
     '      - name: 🍎 Apply verified macOS outputs',
-    `        if: ${mode} != 'none' && steps.platform-outputs.outputs.dirs != ''`,
-    `        run: smoo github-ci apply-outputs --source-sha "${githubExpression('github.sha')}" ${githubExpression(
-      'steps.platform-outputs.outputs.dirs',
-    )}`,
+    `        if: ${mode} != 'none'`,
+    '        run:',
+    `          smoo github-ci apply-outputs --source-sha "${githubExpression('github.sha')}"`,
+    ...macosPlatformArtifactNames(options).map(
+      (name) => `          "${githubExpression('runner.temp')}/publish-artifacts/${name}/current"`,
+    ),
     '',
     '      # --- Release ------------------------------------------------------------',
     '',
@@ -1371,7 +1263,9 @@ function renderFinalLinuxPublishSteps(options: PublishWorkflowDefinitionOptions)
           )}"`,
         ]
       : []),
-    `          ${githubExpression('steps.platform-outputs.outputs.dirs')}`,
+    ...macosPlatformArtifactNames(options).map(
+      (name) => `          "${githubExpression('runner.temp')}/publish-artifacts/${name}/current"`,
+    ),
     `          --bump "${githubExpression('inputs.bump')}" --dry-run "${githubExpression('inputs.dry_run')}"`,
   );
   if (options.deploy === true) {
@@ -1395,7 +1289,6 @@ function renderFinalLinuxPublishSteps(options: PublishWorkflowDefinitionOptions)
     '        if: always()',
     '        uses: ./.github/actions/save-nix-devenv',
     '        with:',
-    `          nix-cache-hit: ${githubExpression('steps.setup.outputs.nix-cache-hit')}`,
     `          devenv-cache-hit: ${githubExpression('steps.setup.outputs.devenv-cache-hit')}`,
   );
   return lines.join('\n').trimEnd();
@@ -1449,12 +1342,6 @@ function renderMacosJobHeaderLines(options: PublishWorkflowDefinitionOptions): s
     );
   }
   return lines.join('\n');
-}
-
-/** Every macOS family this workflow produces, architecture-agnostic: what the plan job asks about. */
-function macosPlatformFamilySelector(options: PublishWorkflowDefinitionOptions): string {
-  const families = macosPlatformFamilies(options);
-  return (families.length > 0 ? families : [...MACOS_PLATFORM_TARGET_GLOBS]).join(',');
 }
 
 /** Per-leg target selector, or every macOS family when there is no matrix. */

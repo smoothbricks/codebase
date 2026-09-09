@@ -31,7 +31,8 @@ const REPO_ROOT = join(import.meta.dir, '..', '..', '..', '..');
 const ARCHITECTURE_SCOPED_PREFIX = '${{ runner.os }}-${{ runner.arch }}-';
 const NODE_MODULES_CACHE_KEY = "${{ hashFiles('.npmrc', 'bun.lock', 'package.json', 'packages/*/package.json') }}";
 const CACHE_ACTIONS = [
-  { name: 'cache-nix-devenv', osKeyLines: 6 },
+  { name: 'setup-devenv', osKeyLines: 2 },
+  { name: 'cache-nix-devenv', osKeyLines: 3 },
   { name: 'cache-node-modules', osKeyLines: 2 },
   { name: 'cache-ttsc-plugins', osKeyLines: 2 },
   { name: 'cache-nx', osKeyLines: 2 },

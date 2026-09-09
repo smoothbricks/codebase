@@ -1,8 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-NIX_STORE_NAR="${NIX_STORE_NAR:-/tmp/nix-store.nar}"
-nix_store_cmd="/nix/var/nix/profiles/default/bin/nix-store"
 DEVENV_FLAKE="${DEVENV_FLAKE:-github:cachix/devenv}"
 # Resolve from this script's location, not the caller's cwd. GitHub Actions
 # runs this from tooling/direnv today, but direct cwd-changing helpers are easy
@@ -16,38 +14,21 @@ repo_root="$(cd "$script_dir/../.." && pwd)"
 # fingerprints as the pre-shell baseline.
 ttsc_cache_dir_default="${TTSC_CACHE_DIR:-$repo_root/.cache/ttsc}"
 
-clear_devenv_cache_state() {
-  rm -rf "$repo_root/tooling/direnv/.devenv" "$repo_root/tooling/direnv/.direnv"
-}
-
 add_repo_paths() {
   "$repo_root/tooling/direnv/repo-path" --github-path
-}
-
-restore_nix_store() {
-  if [ -s "$NIX_STORE_NAR" ]; then
-    if ! sudo "$nix_store_cmd" --import --quiet < "$NIX_STORE_NAR"; then
-      # .devenv/.direnv contain absolute /nix/store references. If importing the
-      # matching store closure fails, clearing them prevents incoherent restores.
-      clear_devenv_cache_state
-      exit 1
-    fi
-    # The restored NAR is only the import source. Cleanup exports a fresh NAR for
-    # the next cache save, so remove this workspace scratch file before release
-    # steps run git cleanliness checks.
-    rm -f "$NIX_STORE_NAR"
-  else
-    echo "No NAR file found; clearing devenv cache state"
-    clear_devenv_cache_state
-  fi
 }
 
 install_devenv() {
   # Shared host /nix/store is the package cache. Image may already provide
   # devenv from github:cachix/devenv; otherwise profile-add the same flake
   # (links store paths; re-fetch only when missing).
+  # The restored profile is not on PATH yet; look where the store cache put
+  # it before evaluating the devenv flake again.
+  local restored="$HOME/.nix-profile/bin/devenv"
   if command -v devenv >/dev/null 2>&1; then
     echo "using existing devenv: $(command -v devenv) ($(devenv version))"
+  elif [ -x "$restored" ]; then
+    echo "using restored devenv: $restored ($("$restored" version))"
   else
     echo "nix profile add ${DEVENV_FLAKE}"
     nix profile add --accept-flake-config "$DEVENV_FLAKE"
@@ -61,7 +42,8 @@ install_devenv() {
 }
 
 build_devenv_shell() {
-  devenv shell --verbose -- date
+  # One evaluation: the shell that captures the environment is the shell
+  # build. A separate `devenv shell -- date` evaluated everything twice.
   persist_devenv_environment
   # Add repo-local tools only after the shell exists; cleanup steps use an
   # explicit PATH because failures before this point must still refresh caches.
@@ -124,11 +106,10 @@ persist_devenv_environment() {
 }
 
 case "${1:-}" in
-  restore-store) restore_nix_store ;;
   install-devenv) install_devenv ;;
   build-shell) build_devenv_shell ;;
   *)
-    echo "Usage: $0 {restore-store|install-devenv|build-shell}" >&2
+    echo "Usage: $0 {install-devenv|build-shell}" >&2
     exit 1
     ;;
 esac

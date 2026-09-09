@@ -1,7 +1,6 @@
 import { spawn } from 'node:child_process';
-import { existsSync, readFileSync } from 'node:fs';
-import { appendFile, mkdtemp, realpath, rename, rm } from 'node:fs/promises';
-import { dirname, join } from 'node:path';
+import { readFileSync } from 'node:fs';
+import { appendFile } from 'node:fs/promises';
 import { PLATFORM_TARGET_GLOBS } from '@smoothbricks/nx-plugin/workspace-config-policy';
 import { $ } from 'bun';
 import typia from 'typia';
@@ -14,7 +13,7 @@ import {
   parseStringArrayText,
   readSmooGithub,
 } from '../lib/json.js';
-import { decode, printCommandOutput, run, runResult, runStatus, runText } from '../lib/run.js';
+import { decode, printCommandOutput, run, runStatus, runText } from '../lib/run.js';
 import { type ProjectTargets, readProjectTargets } from '../nx/index.js';
 import { type DeploymentStage, isPullRequestStage, parseDeploymentStage, pullRequestStage } from '../wrangler/stage.js';
 import { ciApiContext, ciApiRequest } from './api.js';
@@ -57,128 +56,6 @@ type NxSmartMode = 'auto' | 'affected' | 'run-many';
 
 /** Nx workers = host cores (CI runners sized for full machine use). */
 const NX_PARALLEL = '100%';
-
-export async function cleanupGithubCiCache(root: string): Promise<void> {
-  const githubOutput = process.env.GITHUB_OUTPUT;
-  const markCacheReady = async (ready: boolean): Promise<void> => {
-    if (githubOutput) {
-      await appendFile(githubOutput, `cache-ready=${ready ? 'true' : 'false'}\n`);
-    }
-  };
-
-  const nar = process.env.NIX_STORE_NAR;
-  if (!nar) {
-    console.warn('NIX_STORE_NAR is not set; skipping Nix cache save.');
-    await markCacheReady(false);
-    return;
-  }
-  const nixStore = '/nix/var/nix/profiles/default/bin/nix-store';
-  const devenvProfile = `${root}/tooling/direnv/.devenv/profile`;
-  if (!existsSync(devenvProfile)) {
-    console.warn(`${devenvProfile} is missing; skipping Nix cache save.`);
-    await markCacheReady(false);
-    return;
-  }
-  const verifyArgs = ['--verify', '--check-contents', '--repair'];
-  const verifyResult = await runResult(nixStore, verifyArgs, root);
-  if (verifyResult.exitCode !== 0) {
-    printCommandOutput(verifyResult.stdout, verifyResult.stderr);
-    console.error(
-      `${nixStore} ${verifyArgs.join(' ')} failed with exit code ${verifyResult.exitCode}; continuing cache save.`,
-    );
-  }
-  await exportNixStoreCache(root, nar, nixStore, devenvProfile);
-  await markCacheReady(true);
-}
-
-async function exportNixStoreCache(root: string, nar: string, nixStore: string, devenvProfile: string): Promise<void> {
-  const gcRootDir = '/nix/var/nix/gcroots/smoothbricks-cache-roots';
-  const tmpDir = await mkdtemp(join(dirname(nar), '.smoo-nix-cache-'));
-  const tmpNar = join(tmpDir, 'nix-store.nar');
-  const roots = new Set<string>();
-
-  try {
-    await run('rm', ['-f', nar], root);
-    await run('sudo', ['rm', '-rf', gcRootDir], root);
-    await run('sudo', ['mkdir', '-p', gcRootDir], root);
-
-    // The Nix cache must include every live store path referenced by the
-    // restored shell state, not just the devenv profile. .direnv stores paths to
-    // derivations like devenv-shell.drv; omitting those makes a cache hit restore
-    // metadata that points at missing store paths.
-    await addRoot(roots, devenvProfile);
-    const home = process.env.HOME;
-    if (home) {
-      const nixProfile = join(home, '.nix-profile');
-      await addRoot(roots, nixProfile);
-      await addReferencesFrom(roots, nixProfile, root);
-    }
-    await addReferencesFrom(roots, join(root, 'tooling/direnv/.devenv'), root);
-    await addReferencesFrom(roots, join(root, 'tooling/direnv/.direnv'), root);
-
-    const rootLinks: string[] = [];
-    let index = 0;
-    for (const target of roots) {
-      const link = `${gcRootDir}/root-${index}`;
-      await run('sudo', ['ln', '-s', target, link], root);
-      rootLinks.push(link);
-      index += 1;
-    }
-
-    if (rootLinks.length === 0) {
-      throw new Error('No live Nix store roots found; skipping Nix cache save.');
-    }
-
-    await run('nix-collect-garbage', ['--quiet'], root);
-    const closureOutput = await runText('sudo', [nixStore, '-qR', ...rootLinks], root);
-    const closure = closureOutput
-      .split('\n')
-      .map((line) => line.trim())
-      .filter(Boolean);
-    if (closure.length === 0) {
-      throw new Error('No Nix store closure paths found; skipping Nix cache save.');
-    }
-
-    // NAR is binary; keep the export on disk instead of decoding it into text.
-    // `.nothrow()` lets us print stderr before naming the failed command and exit code.
-    const exportResult = await $`sudo ${nixStore} --export --quiet ${closure} > ${tmpNar}`.cwd(root).nothrow();
-    if (exportResult.exitCode !== 0) {
-      printCommandOutput('', decode(exportResult.stderr));
-      throw new Error(
-        `sudo ${nixStore} --export --quiet ${closure.join(' ')} failed with exit code ${exportResult.exitCode}`,
-      );
-    }
-    await run('test', ['-s', tmpNar], root);
-    await rename(tmpNar, nar);
-  } finally {
-    await run('sudo', ['rm', '-rf', gcRootDir], root);
-    await rm(tmpDir, { recursive: true, force: true });
-  }
-}
-
-async function addRoot(roots: Set<string>, candidate: string): Promise<void> {
-  if (!existsSync(candidate)) {
-    return;
-  }
-  const target = await realpath(candidate);
-  if (existsSync(target)) {
-    roots.add(target);
-  }
-}
-
-async function addReferencesFrom(roots: Set<string>, path: string, cwd: string): Promise<void> {
-  if (!existsSync(path)) {
-    return;
-  }
-  const storePathPattern = '/nix/store/[a-z0-9]{32}-[A-Za-z0-9+._?=-]+';
-  const result = await $`grep -rahoE ${storePathPattern} ${path}`.cwd(cwd).quiet().nothrow();
-  for (const line of decode(result.stdout).split('\n')) {
-    const candidate = line.trim();
-    if (candidate && existsSync(candidate)) {
-      roots.add(candidate);
-    }
-  }
-}
 
 export function nxSmartArgs(
   target: string,
