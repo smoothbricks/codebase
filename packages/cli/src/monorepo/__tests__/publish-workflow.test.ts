@@ -118,7 +118,7 @@ describe('publish workflow definition', () => {
 
     expect(stepAnchorNumbers(singleJob)).toEqual(Array.from({ length: 16 }, (_, index) => index + 1));
     expect(stepAnchorNumbers(linuxCandidate)).toEqual(Array.from({ length: 19 }, (_, index) => index + 1));
-    expect(stepAnchorNumbers(macosPlatform)).toEqual(Array.from({ length: 13 }, (_, index) => index + 1));
+    expect(stepAnchorNumbers(macosPlatform)).toEqual(Array.from({ length: 15 }, (_, index) => index + 1));
     expect(stepAnchorNumbers(finalJob)).toEqual(Array.from({ length: 15 }, (_, index) => index + 1));
     expect(singleJob).toContain('# Step 14\n      - name: 🏷️ Tag release');
     expect(singleJob).toContain('# Step 15\n      - name: 📦 Publish release (${{ steps.version.outputs.mode }})');
@@ -128,10 +128,11 @@ describe('publish workflow definition', () => {
       '# Step 8\n      - name: ✅ Check managed monorepo files (${{ steps.version.outputs.mode }})',
     );
     expect(linuxCandidate).toContain('# Step 19\n      - name: 🧹 Cleanup and cache Nix/devenv');
-    expect(macosPlatform).toContain('# Step 6\n      - name: 🗺️ Plan platform outputs');
-    expect(macosPlatform).toContain('# Step 9\n      - name: 🔢 Version release');
-    expect(macosPlatform).toContain('# Step 10\n      - name: 🍎 Build selected macOS and iOS release outputs');
-    expect(macosPlatform).toContain('# Step 13\n      - name: 🧹 Cleanup and cache Nix/devenv');
+    expect(macosPlatform).toContain('# Step 3\n      - name: 📦 Restore node_modules');
+    expect(macosPlatform).toContain('# Step 8\n      - name: 🗺️ Plan platform outputs');
+    expect(macosPlatform).toContain('# Step 11\n      - name: 🔢 Version release');
+    expect(macosPlatform).toContain('# Step 12\n      - name: 🍎 Build selected macOS and iOS release outputs');
+    expect(macosPlatform).toContain('# Step 15\n      - name: 🧹 Cleanup and cache Nix/devenv');
     expect(finalJob).toContain('# Step 3\n      - name: 🧱 Setup Nix/devenv');
     expect(finalJob).toContain('# Step 4\n      - name: 📥 Download candidate artifacts');
     expect(finalJob).toContain('# Step 6\n      - name: 🏗️ Build smoo Nx version actions');
@@ -273,7 +274,10 @@ describe('publish workflow definition', () => {
       macosPlatform.indexOf('- name: 🧱 Setup Nix/devenv'),
     );
     expect(macosPlatform).toContain(
-      "- name: 🧱 Setup Nix/devenv\n        id: setup\n        if: steps.plan.outputs.platform_work == 'true'",
+      "- name: 🧱 Setup Nix/devenv\n        id: setup\n        if: steps.plan.outputs.platform_work == 'true'\n        uses: ./.github/actions/setup-devenv\n        with:\n          dependencies-restored: 'true'",
+    );
+    expect(macosPlatform.indexOf('uses: ./.github/actions/cache-node-modules')).toBeLessThan(
+      macosPlatform.indexOf('run: |\n          bun install --frozen-lockfile'),
     );
     expect(macosPlatform).toContain("if: always() && steps.plan.outputs.platform_work == 'true'");
     expect(macosPlatform).not.toContain('smoo release repair-pending');
@@ -1207,7 +1211,7 @@ it('keeps job-local step anchors contiguous once Cargo credentials add a setup s
   // hand-numbered platform renderers must renumber with it.
   expect(stepAnchorNumbers(singleJob)).toEqual(Array.from({ length: 17 }, (_, index) => index + 1));
   expect(stepAnchorNumbers(linuxCandidate)).toEqual(Array.from({ length: 20 }, (_, index) => index + 1));
-  expect(stepAnchorNumbers(macosPlatform)).toEqual(Array.from({ length: 14 }, (_, index) => index + 1));
+  expect(stepAnchorNumbers(macosPlatform)).toEqual(Array.from({ length: 16 }, (_, index) => index + 1));
   expect(stepAnchorNumbers(finalJob)).toEqual(Array.from({ length: 16 }, (_, index) => index + 1));
 });
 
@@ -1231,7 +1235,7 @@ it('preflights registry-only Cargo credentials in every fetching job without ins
     },
   });
   expect(rendered).not.toContain('CARGO_NET_GIT_FETCH_WITH_CLI');
-  expect(stepAnchorNumbers(macosPlatform)).toEqual(Array.from({ length: 14 }, (_, index) => index + 1));
+  expect(stepAnchorNumbers(macosPlatform)).toEqual(Array.from({ length: 16 }, (_, index) => index + 1));
 });
 
 it('refuses malformed Cargo credential declarations at render time', () => {
