@@ -222,21 +222,49 @@ export interface CargoPackageTestInputsOptions {
   absoluteProjectRoot: string;
   memberDir: string;
   inputRoot?: string;
+  /** Shared across every call of one graph computation; see {@link createCargoInputsCache}. */
+  cache?: CargoInputsCache;
 }
 
-export async function cargoPackageTestInputs({
-  workspaceRoot,
-  absoluteProjectRoot,
-  memberDir,
-  inputRoot = '{projectRoot}',
-}: CargoPackageTestInputsOptions): Promise<string[]> {
-  const manifests = new Map<string, TomlTable>();
-  const loadManifest = async (path: string): Promise<TomlTable> => {
+/**
+ * Memo for one project-graph computation. Every crate's compile, lint and
+ * test targets derive the same closure, and every crate re-reads the same
+ * manifests and re-walks the same trees for nested `Cargo.toml` files; with
+ * three targets over ~45 crates that was ~135 derivations and the dominant
+ * cost of loading the graph. The cache lives exactly as long as one
+ * `createNodes` call — Nx recomputes the graph when a manifest changes, so
+ * nothing here can go stale across runs.
+ */
+export interface CargoInputsCache {
+  readonly manifests: Map<string, Promise<TomlTable>>;
+  readonly nestedCrateDirs: Map<string, string[]>;
+  readonly results: Map<string, Promise<string[]>>;
+}
+
+export function createCargoInputsCache(): CargoInputsCache {
+  return { manifests: new Map(), nestedCrateDirs: new Map(), results: new Map() };
+}
+
+export function cargoPackageTestInputs(options: CargoPackageTestInputsOptions): Promise<string[]> {
+  const cache = options.cache ?? createCargoInputsCache();
+  const key = `${options.absoluteProjectRoot}\0${options.memberDir}\0${options.inputRoot ?? '{projectRoot}'}`;
+  const cached = cache.results.get(key);
+  if (cached !== undefined) return cached;
+  const derived = deriveCargoPackageTestInputs(options, cache);
+  cache.results.set(key, derived);
+  return derived;
+}
+
+async function deriveCargoPackageTestInputs(
+  { workspaceRoot, absoluteProjectRoot, memberDir, inputRoot = '{projectRoot}' }: CargoPackageTestInputsOptions,
+  cache: CargoInputsCache,
+): Promise<string[]> {
+  const loadManifest = (path: string): Promise<TomlTable> => {
     const normalized = resolve(path);
-    const cached = manifests.get(normalized);
+    const cached = cache.manifests.get(normalized);
     if (cached !== undefined) return cached;
-    const parsed = parseToml(await readFile(normalized, 'utf-8'));
-    manifests.set(normalized, parsed);
+    const parsed = readFile(normalized, 'utf-8').then(parseToml);
+    cache.manifests.set(normalized, parsed);
     return parsed;
   };
   const rootManifest = await loadManifest(join(absoluteProjectRoot, 'Cargo.toml'));
@@ -352,21 +380,9 @@ export async function cargoPackageTestInputs({
     // Cargo packages can compile include_bytes!, headers, schemas and build.rs,
     // not only Rust sources. Nested packages are separate source owners.
     inputs.add(`${inputPath(absoluteDir)}/**/*`);
-    const scan = [absoluteDir];
-    while (scan.length > 0) {
-      const current = scan.pop();
-      if (current === undefined || !existsSync(current)) continue;
-      for (const entry of readdirSync(current, { withFileTypes: true })) {
-        if (!entry.isDirectory()) continue;
-        const child = join(current, entry.name);
-        if (['target', '.git', 'node_modules', '.nx'].includes(entry.name)) {
-        } else if (existsSync(join(child, 'Cargo.toml'))) {
-          const childDir = relative(absoluteProjectRoot, child).split(sep).join('/');
-          if (!dirs.has(childDir)) exclusions.add(`!${inputPath(child)}/**`);
-        } else {
-          scan.push(child);
-        }
-      }
+    for (const child of nestedCrateDirs(absoluteDir, cache)) {
+      const childDir = relative(absoluteProjectRoot, child).split(sep).join('/');
+      if (!dirs.has(childDir)) exclusions.add(`!${inputPath(child)}/**`);
     }
   }
   for (const source of [...declaredSources].sort()) {
@@ -430,6 +446,30 @@ export async function cargoPackageTestInputs({
     inputs.add(EXTERNAL_RUST_CRATES_INPUT);
   }
   return [...inputs];
+}
+
+/** Every directory beneath `root` that holds its own `Cargo.toml`, the walk stopping at each. */
+function nestedCrateDirs(root: string, cache: CargoInputsCache): string[] {
+  const cached = cache.nestedCrateDirs.get(root);
+  if (cached !== undefined) return cached;
+  const found: string[] = [];
+  const scan = [root];
+  while (scan.length > 0) {
+    const current = scan.pop();
+    if (current === undefined || !existsSync(current)) continue;
+    for (const entry of readdirSync(current, { withFileTypes: true })) {
+      if (!entry.isDirectory()) continue;
+      const child = join(current, entry.name);
+      if (['target', '.git', 'node_modules', '.nx'].includes(entry.name)) {
+      } else if (existsSync(join(child, 'Cargo.toml'))) {
+        found.push(child);
+      } else {
+        scan.push(child);
+      }
+    }
+  }
+  cache.nestedCrateDirs.set(root, found);
+  return found;
 }
 
 function enqueuePathDependencies(

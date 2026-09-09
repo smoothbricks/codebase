@@ -19,8 +19,10 @@ import {
   CARGO_TEST_COMPILE_TARGET,
   CARGO_TEST_EXCEPTIONS_SUFFIX,
   CARGO_TEST_TARGET,
+  type CargoInputsCache,
   cargoPackageTestInputs,
   cargoTestPackageTargetName,
+  createCargoInputsCache,
   exceptionalTestFilter,
   listCargoWorkspacePackages,
   nextestConfigRelPath,
@@ -621,6 +623,7 @@ async function createProjectTargets(
                 workspaceRoot,
                 absoluteProjectRoot: join(workspaceRoot, cargoWorkspaceRoot),
                 memberDir: plan.package.dir,
+                cache: cargoWorkspace.inputsCache,
               }),
             ),
           )
@@ -747,6 +750,7 @@ async function createProjectTargets(
           workspaceRoot,
           absoluteProjectRoot: join(workspaceRoot, cargoWorkspace.projectRoot),
           memberDir: plan.package.dir,
+          cache: cargoWorkspace.inputsCache,
           inputRoot:
             projectRoot === cargoWorkspace.projectRoot
               ? '{projectRoot}'
@@ -1515,6 +1519,8 @@ interface CargoWorkspace {
   packages: CargoPackagePlan[];
   rootProjectName: string;
   projectRoot: string;
+  /** One derivation memo for the whole graph computation (see cargoPackageTestInputs). */
+  inputsCache: CargoInputsCache;
 }
 
 type CargoTargetDependency = NonNullable<TargetConfiguration['dependsOn']>[number];
@@ -1591,7 +1597,12 @@ async function resolveCargoWorkspaces(
       }
       packages.push({ package: pkg, pieces });
     }
-    workspaces.push({ packages, rootProjectName: rootProject.name, projectRoot: rootProject.root });
+    workspaces.push({
+      packages,
+      rootProjectName: rootProject.name,
+      projectRoot: rootProject.root,
+      inputsCache: createCargoInputsCache(),
+    });
   }
   return workspaces;
 }
@@ -1666,6 +1677,7 @@ async function addCargoTestTargets(
           absoluteProjectRoot: join(workspaceRoot, workspace.projectRoot),
           memberDir: plan.package.dir,
           inputRoot,
+          cache: workspace.inputsCache,
         })),
         ...workspace.packages.map((member) => posix.join(inputRoot, member.package.dir, 'Cargo.toml')),
       ]),
