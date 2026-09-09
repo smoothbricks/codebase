@@ -134,6 +134,19 @@ export interface PackageCargoGitOrigin {
    * origin is fetched as declared.
    */
   internalMirror?: string;
+  /**
+   * SSH spellings of the same forge that managed CI rewrites onto
+   * `internalMirror` as well, e.g. `ssh://forgejo@forge.example.net:2223/`
+   * as Cargo and uv pin a git dependency. A runner holds the read token the
+   * mirror accepts and no SSH key at all, so every spelling a lockfile can
+   * carry needs its own rewrite: git matches `insteadOf` values as literal
+   * URL prefixes and infers no spelling from another — not the SSH host from
+   * the HTTPS one, and not the userless form from the one carrying a user.
+   * Each entry is a credential-free `ssh://` origin without a path; the SSH
+   * user is part of the spelling and stays in it. Requires
+   * `internalMirror`, since the entry is a rewrite source and nothing else.
+   */
+  sshOrigins?: string[];
 }
 
 /**

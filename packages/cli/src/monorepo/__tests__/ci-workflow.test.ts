@@ -6,6 +6,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import type { PackageCargoGitOrigin } from '../../lib/json.js';
 import {
   type CiWorkflowDefinitionOptions,
   CiWorkflowStepKind,
@@ -315,6 +316,115 @@ describe('CI workflow definition', () => {
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }
+  });
+
+  it('rewrites every declared SSH spelling of a mirrored forge onto the same mirror', () => {
+    const directory = mkdtempSync(join(tmpdir(), 'cargo-ssh-'));
+    try {
+      const lines = cargoCredentialStepLines(
+        { kind: CiWorkflowStepKind.CargoCredentials, name: 'Credentials', number: 3 },
+        {
+          gitOrigins: [
+            {
+              origin: 'https://git.example.net',
+              tokenEnv: 'SOURCE_READ_TOKEN',
+              internalMirror: 'http://10.89.0.1:3000',
+              // Both spellings a lockfile can carry: git matches insteadOf
+              // prefixes textually and infers neither from the other.
+              sshOrigins: ['ssh://forgejo@forge.example.net:2223/', 'ssh://forge.example.net:2223'],
+            },
+          ],
+        },
+      );
+      const script = lines
+        .slice(lines.indexOf('        run: |') + 1)
+        .map((line) => line.slice(10))
+        .join('\n');
+      const githubEnv = join(directory, 'env');
+      writeFileSync(githubEnv, '');
+      const environment = {
+        PATH: process.env.PATH ?? '/usr/bin:/bin',
+        RUNNER_TEMP: directory,
+        GITHUB_ENV: githubEnv,
+        SOURCE_READ_TOKEN: 'fixture-secret',
+      };
+      const prepared = spawnSync('sh', ['-eu', '-c', script], { env: environment, encoding: 'utf8' });
+      expect(prepared.status).toBe(0);
+      const written = readFileSync(githubEnv, 'utf8');
+      // One insteadOf pair per spelling, all pointing at the one mirror, and a
+      // missing trailing slash is normalized: `ssh://host:2223` would rewrite
+      // `ssh://host:2223-other/` too.
+      expect(written).toContain('GIT_CONFIG_KEY_2=url.http://10.89.0.1:3000/.insteadOf');
+      expect(written).toContain('GIT_CONFIG_VALUE_2=https://git.example.net/');
+      expect(written).toContain('GIT_CONFIG_KEY_3=url.http://10.89.0.1:3000/.insteadOf');
+      expect(written).toContain('GIT_CONFIG_VALUE_3=ssh://forgejo@forge.example.net:2223/');
+      expect(written).toContain('GIT_CONFIG_KEY_4=url.http://10.89.0.1:3000/.insteadOf');
+      expect(written).toContain('GIT_CONFIG_VALUE_4=ssh://forge.example.net:2223/');
+      expect(written).toContain('GIT_CONFIG_COUNT=5');
+      const helper = join(directory, 'cargo-git-credential.sh');
+      const ask = (protocol: string, host: string): string => {
+        const result = spawnSync('sh', [helper, 'get'], {
+          env: environment,
+          encoding: 'utf8',
+          input: `protocol=${protocol}\nhost=${host}\n\n`,
+        });
+        expect(result.status).toBe(0);
+        return result.stdout;
+      };
+      // The rewrite happens before transport, so git only ever asks for the
+      // mirror. The SSH spelling stays credential-free: an SSH origin the
+      // runner cannot reach must fail loudly, not collect a token.
+      expect(ask('http', '10.89.0.1:3000')).toBe('username=x-access-token\npassword=fixture-secret\n');
+      expect(ask('ssh', 'forge.example.net:2223')).toBe('');
+      expect(ask('ssh', 'forgejo@forge.example.net:2223')).toBe('');
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it('refuses SSH spellings no mirror rewrites, and spellings git cannot match as a prefix', () => {
+    const origin = { origin: 'https://git.example.net', tokenEnv: 'SOURCE_READ_TOKEN' };
+    const render = (entry: PackageCargoGitOrigin): string[] =>
+      cargoCredentialStepLines(
+        { kind: CiWorkflowStepKind.CargoCredentials, name: 'Credentials', number: 3 },
+        { gitOrigins: [entry] },
+      );
+
+    // An sshOrigins entry only means anything as a rewrite target.
+    expect(() => render({ ...origin, sshOrigins: ['ssh://forge.example.net:2223/'] })).toThrow('internalMirror');
+    const mirrored = { ...origin, internalMirror: 'http://10.89.0.1:3000' };
+    for (const sshOrigins of [
+      [],
+      // scp syntax is not a URL prefix git can rewrite from a Cargo pin.
+      ['forgejo@forge.example.net:axe/minigraf.git'],
+      // A path would rewrite one repository, not the forge.
+      ['ssh://forge.example.net:2223/axe/minigraf.git'],
+      // A password in a declared origin is a secret in package.json.
+      ['ssh://forgejo:hunter2@forge.example.net:2223/'],
+      ['https://git.example.net/'],
+      // Two identical spellings make the same key ambiguous.
+      ['ssh://forge.example.net:2223/', 'ssh://forge.example.net:2223'],
+    ]) {
+      expect(() => render({ ...mirrored, sshOrigins })).toThrow('sshOrigins');
+    }
+    // One spelling, two mirrors: git keeps whichever identical key it read
+    // last, so the declaration is refused instead of resolved.
+    expect(() =>
+      cargoCredentialStepLines(
+        { kind: CiWorkflowStepKind.CargoCredentials, name: 'Credentials', number: 3 },
+        {
+          gitOrigins: [
+            { ...mirrored, sshOrigins: ['ssh://forge.example.net:2223/'] },
+            {
+              origin: 'https://git.other.net',
+              tokenEnv: 'OTHER_READ_TOKEN',
+              internalMirror: 'http://10.89.0.2:3000',
+              sshOrigins: ['ssh://forge.example.net:2223/'],
+            },
+          ],
+        },
+      ),
+    ).toThrow('sshOrigins');
   });
 
   it('refuses malformed internal mirrors at render time', () => {
