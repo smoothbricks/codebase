@@ -73,7 +73,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       };
       const rustOnly = await runLint();
       expect(rustOnly).toMatchObject({ exitCode: 0 });
-      expect(rustOnly.output).toContain('cargo-lint-lint-crate');
+      expect(rustOnly.output).toContain('cargo-lint');
       await workspace.write('packages/rust/src/check.js', 'debugger;\n');
       const withJavaScript = await runLint();
       expect(withJavaScript.exitCode).not.toBe(0);
@@ -384,13 +384,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       // Every frozen cargo command carries the edge, not just the head of the
       // serialization chain: offline cargo fails at resolution, so each one
       // needs the locked graph downloaded whether or not the chain runs first.
-      for (const name of [
-        'cargo-test-compile',
-        'cargo-lint-ferris-core',
-        CARGO_CROSS_LINT_TARGET,
-        'mutation',
-        'bench',
-      ]) {
+      for (const name of ['cargo-test-compile', 'cargo-lint', CARGO_CROSS_LINT_TARGET, 'mutation', 'bench']) {
         expect(targets[name]?.dependsOn).toContain('cargo-fetch');
       }
       expect(targets['cargo-sweep']?.dependsOn).toBeUndefined();
@@ -420,16 +414,20 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         ]),
       );
       expect(targets['cargo-test-ferris-core']?.inputs).not.toContain('{projectRoot}/crates/ferris-wasm/**/*');
-      expect(targets['cargo-lint']?.dependsOn).toEqual(['cargo-lint-ferris-core', 'cargo-lint-ferris-wasm']);
-      expect(targets['cargo-lint-ferris-core']?.options).toMatchObject({
+      // One clippy for the workspace in one target dir: a per-crate closure
+      // compiled every shared dependency once per crate.
+      expect(targets['cargo-lint']?.options).toMatchObject({
         cwd: 'packages/ferris',
         commands: [
-          'cargo fmt -p ferris-core --check',
-          'cargo --frozen clippy -p ferris-core --all-targets --target-dir target/cargo-lint-ferris-core -- -D warnings',
+          'cargo fmt --all --check',
+          'cargo --frozen clippy --workspace --all-targets --target-dir target/cargo-lint -- -D warnings',
         ],
       });
-      expect(targets['cargo-lint-ferris-core']?.cache).toBe(true);
-      expect(targets['cargo-lint-ferris-core']?.outputs).toEqual([]);
+      expect(targets['cargo-lint']?.cache).toBe(true);
+      expect(targets['cargo-lint']?.outputs).toEqual([]);
+      expect(targets['cargo-lint']?.inputs).toEqual(
+        expect.arrayContaining(['{projectRoot}/crates/ferris-core/**/*', '{projectRoot}/crates/ferris-wasm/**/*']),
+      );
       expect(targets.lint?.dependsOn).toEqual(['cargo-lint']);
       expect(targets[CARGO_CROSS_LINT_TARGET]?.options).toMatchObject({
         command: CARGO_CROSS_LINT_COMMAND,
@@ -582,11 +580,11 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         command: 'cargo --frozen test --workspace --no-run',
         cwd: '.',
       });
-      expect(root['cargo-lint']?.dependsOn).toEqual([
-        { projects: ['native'], target: 'cargo-lint-native-napi' },
-        { projects: ['runtime'], target: 'cargo-lint-runtime-core' },
-        { projects: ['wasm'], target: 'cargo-lint-runtime-wasm' },
+      expect(root['cargo-lint']?.options?.commands).toEqual([
+        'cargo fmt --all --check',
+        'cargo --frozen clippy --workspace --all-targets --target-dir target/cargo-lint -- -D warnings',
       ]);
+      expect(root['cargo-lint']?.dependsOn).toContain('cargo-fetch');
       expect(root['cargo-test']?.dependsOn).toHaveLength(5);
 
       expect(runtime['cargo-test-runtime-core-shard1']?.dependsOn).toEqual([
@@ -611,10 +609,10 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         'cargo-test-runtime-core-shard2',
         'cargo-test-runtime-core-exceptions',
       ]);
-      expect(runtime['cargo-lint']?.dependsOn).toEqual(['cargo-lint-runtime-core']);
+      // A package owning crates validates through the root's one clippy verdict.
+      expect(runtime['cargo-lint']?.dependsOn).toEqual([{ projects: [rootProject], target: 'cargo-lint' }]);
       expect(runtime.lint?.dependsOn).toEqual(['cargo-lint']);
-      expect(runtime['cargo-lint-runtime-core']?.dependsOn).toEqual([rootFetch]);
-      expect(runtime['cargo-lint-runtime-core']?.options?.cwd).toBe('.');
+      expect(runtime['cargo-lint-runtime-core']).toBeUndefined();
       expect(runtime.clean).toBeUndefined();
 
       expect(wasm['cargo-test-runtime-wasm']?.dependsOn).toEqual([
@@ -652,8 +650,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
   it('keeps root packages, nested workspaces and multiple owned crates in their own lint graph', async () => {
     const workspace = await createWorkspace();
     const declared: Record<string, TargetConfiguration> = {
-      'cargo-lint-alpha-core': { dependsOn: ['...', 'prepare-check'] },
-      'cargo-lint': { dependsOn: ['cargo-lint-alpha-core'] },
+      'cargo-lint': { dependsOn: ['...', 'prepare-check'] },
       lint: { dependsOn: ['cargo-lint', 'custom-check'] },
     };
     try {
@@ -686,45 +683,42 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       const group = projects.get('packages/group')?.targets ?? {};
       const inner = projects.get('nested')?.targets ?? {};
       const leaf = projects.get('nested/modules/leaf')?.targets ?? {};
-      expect(outer['cargo-lint']?.dependsOn).toEqual([
-        { projects: ['group'], target: 'cargo-lint-alpha-core' },
-        { projects: ['group'], target: 'cargo-lint-beta-wasm' },
-        'cargo-lint-host-core',
-      ]);
-      expect(group['cargo-lint']?.dependsOn).toEqual(['cargo-lint-alpha-core', 'cargo-lint-beta-wasm']);
+      // Each cargo workspace root runs one clippy over all its members; the
+      // packages owning crates validate through that verdict.
+      expect(outer['cargo-lint']?.options).toMatchObject({
+        cwd: '.',
+        commands: [
+          'cargo fmt --all --check',
+          'cargo --frozen clippy --workspace --all-targets --target-dir target/cargo-lint -- -D warnings',
+        ],
+      });
+      expect(outer['cargo-lint']?.inputs).toEqual(
+        expect.arrayContaining([
+          '{projectRoot}/packages/group/crates/alpha/**/*',
+          '{projectRoot}/packages/group/crates/beta/**/*',
+        ]),
+      );
+      expect(group['cargo-lint']?.dependsOn).toEqual([{ projects: ['outer-root'], target: 'cargo-lint' }]);
       expect(group.build?.dependsOn).toEqual([
         '^build',
         { projects: ['outer-root'], target: 'cargo-test-compile' },
         'tsc-js',
       ]);
-      expect(outer['cargo-lint-host-core']?.options?.commands).toEqual([
-        'cargo fmt -p host-core --check',
-        'cargo --frozen clippy -p host-core --all-targets --target-dir target/cargo-lint-host-core -- -D warnings',
-      ]);
-      expect(inner['cargo-lint']?.dependsOn).toEqual([
-        'cargo-lint-inner-host',
-        { projects: ['inner-leaf-project'], target: 'cargo-lint-inner-leaf' },
-      ]);
-      expect(leaf['cargo-lint-inner-leaf']?.options).toMatchObject({
-        cwd: 'nested',
-        commands: [
-          'cargo fmt -p inner-leaf --check',
-          'cargo --frozen clippy -p inner-leaf --all-targets --target-dir target/cargo-lint-inner-leaf -- -D warnings',
-        ],
-      });
-      expect(leaf['cargo-lint-inner-leaf']?.dependsOn).toEqual([{ projects: ['inner-root'], target: 'cargo-fetch' }]);
-      expect(leaf['cargo-lint-inner-leaf']?.inputs).toContain('{workspaceRoot}/nested/modules/leaf/**/*');
-      expect(leaf['cargo-lint-inner-leaf']?.inputs).not.toContain('{workspaceRoot}/packages/group/crates/alpha/**/*');
+      expect(outer['cargo-lint-host-core']).toBeUndefined();
+      expect(inner['cargo-lint']?.options).toMatchObject({ cwd: 'nested' });
+      expect(inner['cargo-lint']?.inputs).toContain('{projectRoot}/**/*');
+      expect(inner['cargo-lint']?.inputs).not.toContain('{workspaceRoot}/packages/group/crates/alpha/**/*');
+      expect(leaf['cargo-lint']?.dependsOn).toEqual([{ projects: ['inner-root'], target: 'cargo-lint' }]);
+      expect(leaf['cargo-lint-inner-leaf']).toBeUndefined();
       expect(leaf['cargo-test-inner-leaf']?.options?.cwd).toBe('nested');
       expect(inner['cargo-test-compile']?.options?.cwd).toBe('nested');
       expect(leaf['cargo-test-inner-leaf']?.configurations?.production?.command).toContain('--workspace --release');
-      expect(resolveDeclaredOverInferred(group, declared, 'cargo-lint-alpha-core')).toMatchObject({
-        executor: 'nx:run-commands',
+      expect(resolveDeclaredOverInferred(group, declared, 'cargo-lint')).toMatchObject({
+        executor: 'nx:noop',
         cache: true,
         outputs: [],
-        dependsOn: [{ projects: ['outer-root'], target: 'cargo-fetch' }, 'prepare-check'],
+        dependsOn: [{ projects: ['outer-root'], target: 'cargo-lint' }, 'prepare-check'],
       });
-      expect(resolveDeclaredOverInferred(group, declared, 'cargo-lint')?.dependsOn).toEqual(['cargo-lint-alpha-core']);
       expect(resolveDeclaredOverInferred(group, declared, 'lint')?.dependsOn).toEqual(['cargo-lint', 'custom-check']);
     } finally {
       await workspace.cleanup();
@@ -739,7 +733,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       await workspace.write('crate/Cargo.toml', '[package]\nname = "cache-crate"\n');
       await workspace.write('cargo-home/config.toml', '[build]\njobs = 1\n');
       const targets = await inferProjectTargets(workspace, 'package.json');
-      const runtimeCommands = (targets['cargo-lint-cache-crate']?.inputs ?? []).flatMap((input) =>
+      const runtimeCommands = (targets['cargo-lint']?.inputs ?? []).flatMap((input) =>
         typeof input !== 'string' && 'runtime' in input ? [input.runtime] : [],
       );
       const capture = async (extraEnv: Record<string, string>) =>
