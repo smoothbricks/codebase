@@ -929,17 +929,10 @@ async function createProjectTargets(
       : text.includes('nextest ')
         ? ' && cargo nextest --version'
         : '';
-    // The archive is the one cached artifact whose CONTENT depends on where it
-    // was produced: nextest bakes the workspace's absolute path into it, and
-    // `env!("CARGO_BIN_EXE_*")` bakes absolute binary paths into the tests
-    // themselves. Restoring one tree's archive into another tree's path is a
-    // silent wrong answer, so the path is part of the key: a second checkout
-    // builds its own archive, and CI — whose path is stable — still shares.
-    const identity = name === CARGO_TEST_ARCHIVE_TARGET ? 'pwd && ' : '';
     target.inputs = [
       ...(target.inputs ?? CARGO_INPUTS),
       cargoRuntimeInput(typeof cwd === 'string' ? cwd : projectRoot, CARGO_ENVIRONMENT_INPUT.runtime),
-      cargoRuntimeInput(typeof cwd === 'string' ? cwd : projectRoot, `${identity}rustc -vV && cargo -V${versions}`),
+      cargoRuntimeInput(typeof cwd === 'string' ? cwd : projectRoot, `rustc -vV && cargo -V${versions}`),
     ];
   }
 
@@ -1682,10 +1675,12 @@ async function resolveCargoWorkspaces(
  * of the tree that produced it; without the remap, a restored archive hands
  * every test the producing tree's `CARGO_MANIFEST_DIR` — measured on a moved
  * tree, tests then read another checkout's fixtures, or a path that no longer
- * exists. With it, the runner's own cargo workspace root wins. (`env!` bakes
- * paths at COMPILE time and no remap can move them: a test that spawns
- * `env!("CARGO_BIN_EXE_x")` still needs the producing tree, which is why the
- * archive's cache key includes that path.)
+ * exists. With it, the runner's own cargo workspace root wins, so the archive
+ * is relocatable and one cache entry serves every checkout of the same commit.
+ * nextest also re-points `CARGO_BIN_EXE_<name>`/`NEXTEST_BIN_EXE_<name>` at the
+ * extracted binaries at RUNTIME (measured), but `env!` reads them at COMPILE
+ * time: a test that spawns `env!("CARGO_BIN_EXE_x")` holds the producing tree's
+ * path and must read the runtime variable instead to survive relocation.
  *
  * nextest.toml singles some tests out with an override, and each such class
  * breaks a shard in its own way — a `test-group` is scoped to one nextest RUN

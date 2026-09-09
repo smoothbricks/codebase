@@ -115,11 +115,13 @@ Concrete targets come from concrete files:
   therefore execute rather than build: they extract binaries into their own temporary directory, write nothing to
   cargo's flocked `target/`, and fan out instead of chaining. `--workspace-remap` is required — an archive records the
   producing tree's absolute paths, and without it a restored archive hands tests another checkout's
-  `CARGO_MANIFEST_DIR`. For the same reason the archive's cache key includes its workspace path. Per-crate runners
-  accept an empty nextest selection because a valid workspace member may have no tests and a hash partition may
-  legitimately be empty. `napi-debug` stays behind `cargo-test-compile`, and a crate in the project that builds the
-  debug cdylib runs after it. A crate declaring `[package.metadata.smoothbricks.wasm-bindgen]` also receives the
-  cacheable `cargo-wasm` output target in its owning project.
+  `CARGO_MANIFEST_DIR`. With it the archive is relocatable, so one cache entry serves every checkout of the same commit;
+  nextest re-points `CARGO_BIN_EXE_<name>`/`NEXTEST_BIN_EXE_<name>` at the extracted binaries at runtime, but a test
+  that reads them through the compile-time `env!` macro keeps the producing tree's path. Per-crate runners accept an
+  empty nextest selection because a valid workspace member may have no tests and a hash partition may legitimately be
+  empty. `napi-debug` stays behind `cargo-test-compile`, and a crate in the project that builds the debug cdylib runs
+  after it. A crate declaring `[package.metadata.smoothbricks.wasm-bindgen]` also receives the cacheable `cargo-wasm`
+  output target in its owning project.
 - A crate whose suite outgrows one bounded window declares `[package.metadata.smoothbricks.test] shards = N`, and gets
   `cargo-test-<package>-shard1..N`, each running `--partition hash:i/N` with the full bound. nextest assigns a test to a
   shard by hashing its name, so the shards stay an exact partition of the crate as tests and test binaries are added,
