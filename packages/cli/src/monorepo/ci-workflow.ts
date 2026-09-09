@@ -568,7 +568,10 @@ export function cargoCredentialJobEnvLines(config: PackageCargoCredentialsConfig
  * `internalMirror` are rewritten to the mirror with `url.<mirror>.insteadOf`
  * and the helper answers the same credential for the mirror's host, since git
  * passes helpers the rewritten URL. The helper reads the environment at call
- * time and answers only for declared origins.
+ * time and answers only for declared origins. Declared `sshOrigins` rewrite
+ * onto the same mirror and stay credential-free: the rewrite happens before
+ * transport, so git only ever asks for the mirror, and an SSH pin the runner
+ * has no key for fails loudly instead of collecting a token.
  * Mechanism errors surface at managed-file render time, never inside CI.
  */
 export function cargoCredentialStepLines(step: CiWorkflowStep, config: PackageCargoCredentialsConfig): string[] {
@@ -656,21 +659,50 @@ export function cargoCredentialStepLines(step: CiWorkflowStep, config: PackageCa
   lines.push('            fi');
   lines.push('            # Internal mirrors rewrite the declared origin prefix so runners');
   lines.push('            # that cannot reach the public URL fetch over guest networking.');
+  if (origins.some((origin) => origin.sshOrigins !== undefined)) {
+    lines.push('            # The same forge over SSH, as Cargo and uv pin it: git matches');
+    lines.push('            # insteadOf values as literal URL prefixes, so every declared');
+    lines.push('            # spelling rewrites onto the mirror on its own line.');
+  }
   for (const origin of origins) {
     if (origin.internalMirror === undefined) {
       continue;
     }
-    const originUrl = new URL(origin.origin);
     const mirrorUrl = new URL(origin.internalMirror);
-    const originBase = `${originUrl.protocol}//${originUrl.host}/`.replaceAll("'", "'\\''");
     const mirrorBase = `${mirrorUrl.protocol}//${mirrorUrl.host}/`.replaceAll("'", "'\\''");
-    lines.push('            echo "GIT_CONFIG_KEY_${idx}=url.' + mirrorBase + '.insteadOf"');
-    lines.push('            echo "GIT_CONFIG_VALUE_${idx}=' + originBase + '"');
-    lines.push('            idx=$((idx + 1))');
+    for (const prefix of mirrorRewritePrefixes(origin)) {
+      lines.push('            echo "GIT_CONFIG_KEY_${idx}=url.' + mirrorBase + '.insteadOf"');
+      lines.push('            echo "GIT_CONFIG_VALUE_${idx}=' + prefix.replaceAll("'", "'\\''") + '"');
+      lines.push('            idx=$((idx + 1))');
+    }
   }
   lines.push('            echo "GIT_CONFIG_COUNT=${idx}"');
   lines.push('          } >> "$GITHUB_ENV"');
   return lines;
+}
+
+/**
+ * Every URL prefix a mirrored origin rewrites from: the declared https origin
+ * first, then each declared SSH spelling of the same forge. One `insteadOf`
+ * value per prefix, because git matches them as literal prefixes and derives
+ * no spelling from another. Rendering runs after `normalizeCargoCredentials`,
+ * which parsed and refused every malformed entry.
+ */
+function mirrorRewritePrefixes(origin: PackageCargoGitOrigin): string[] {
+  const originUrl = new URL(origin.origin);
+  return [
+    `${originUrl.protocol}//${originUrl.host}/`,
+    ...(origin.sshOrigins ?? []).map((spelling) => sshRewritePrefix(new URL(spelling))),
+  ];
+}
+
+/**
+ * The SSH spelling as a rewritable prefix: userinfo is part of the spelling
+ * git matches, and the trailing slash keeps `ssh://host:2223` from also
+ * rewriting `ssh://host:22230/`.
+ */
+function sshRewritePrefix(spelling: URL): string {
+  return `ssh://${spelling.username === '' ? '' : `${spelling.username}@`}${spelling.host}/`;
 }
 
 function distinctCargoTokenEnvs(config: PackageCargoCredentialsConfig): string[] {
@@ -694,12 +726,24 @@ export function normalizeCargoCredentials(config: PackageCargoCredentialsConfig)
     }
   }
   const hosts = new Set<string>();
+  const sshPrefixes = new Set<string>();
   for (const origin of config.gitOrigins ?? []) {
     const host = new URL(normalizeCargoGitOrigin(origin).origin).host;
     if (hosts.has(host)) {
       throw new Error(`smoo.github.cargoCredentials repeats git origin host ${host}; declare one token per origin`);
     }
     hosts.add(host);
+    for (const spelling of origin.sshOrigins ?? []) {
+      // One spelling, one rewrite, whole config: a repeat renders two
+      // identical insteadOf keys and git silently keeps the last one read.
+      const prefix = sshRewritePrefix(assertSshOrigin(spelling));
+      if (sshPrefixes.has(prefix)) {
+        throw new Error(
+          `smoo.github.cargoCredentials repeats the sshOrigins spelling ${prefix}; declare each spelling once, on the origin whose mirror rewrites it`,
+        );
+      }
+      sshPrefixes.add(prefix);
+    }
   }
   if ((config.registryTokenEnvs?.length ?? 0) === 0 && (config.gitOrigins?.length ?? 0) === 0) {
     throw new Error(
@@ -760,7 +804,52 @@ function normalizeCargoGitOrigin(origin: PackageCargoGitOrigin): PackageCargoGit
       );
     }
   }
+  if (origin.sshOrigins !== undefined) {
+    if (origin.internalMirror === undefined) {
+      throw new Error(
+        `smoo.github.cargoCredentials gitOrigins entry declares sshOrigins for ${origin.origin} without an internalMirror to rewrite them onto; an SSH spelling is a rewrite source and nothing else`,
+      );
+    }
+    if (origin.sshOrigins.length === 0) {
+      throw new Error(
+        `smoo.github.cargoCredentials gitOrigins entry for ${origin.origin} declares an empty sshOrigins list; name every SSH spelling a lockfile can carry, or omit the field`,
+      );
+    }
+    for (const spelling of origin.sshOrigins) {
+      assertSshOrigin(spelling);
+    }
+  }
   return origin;
+}
+
+/**
+ * One declared SSH spelling, parsed. Credential-free and path-free: a
+ * password here would be a secret committed in package.json, and a path
+ * would rewrite a single repository instead of the forge. scp syntax
+ * (`git@host:org/repo.git`) is no URL, so git cannot rewrite it from a Cargo
+ * or uv pin at all; the `ssh://` spelling is the one to declare.
+ */
+function assertSshOrigin(spelling: string): URL {
+  let ssh: URL | null = null;
+  try {
+    ssh = new URL(spelling);
+  } catch {
+    ssh = null;
+  }
+  if (
+    ssh === null ||
+    ssh.protocol !== 'ssh:' ||
+    ssh.host === '' ||
+    (ssh.pathname !== '' && ssh.pathname !== '/') ||
+    ssh.password !== '' ||
+    ssh.search !== '' ||
+    ssh.hash !== ''
+  ) {
+    throw new Error(
+      `smoo.github.cargoCredentials gitOrigins entry needs credential-free ssh:// sshOrigins without a path, got ${JSON.stringify(spelling)}`,
+    );
+  }
+  return ssh;
 }
 
 /**

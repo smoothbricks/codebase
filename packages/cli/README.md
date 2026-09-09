@@ -430,6 +430,45 @@ a production deployment mid-flight. Pull requests and other branches keep cancel
 production jobs repeat the Cargo credential and sibling-source preflight before SetupDevenv, so their `--step` anchors
 shift with the configuration instead of staying fixed.
 
+### Private dependency configuration (`package.json` → `smoo.github.cargoCredentials`)
+
+The private git origins Cargo fetches from, and the secret that reads each one:
+
+```json
+{
+  "smoo": {
+    "github": {
+      "cargoCredentials": {
+        "gitOrigins": [
+          {
+            "origin": "https://git.example.net",
+            "tokenEnv": "SOURCE_READ_TOKEN",
+            "internalMirror": "http://10.89.0.1:3000",
+            "sshOrigins": ["ssh://forgejo@forge.example.net:2223/", "ssh://forge.example.net:2223/"]
+          }
+        ],
+        "registryTokenEnvs": ["CARGO_REGISTRIES_EXAMPLE_TOKEN"]
+      }
+    }
+  }
+}
+```
+
+- `origin`: the credential-free https origin, and `tokenEnv` the repository secret that reads it. The generated
+  credential helper answers for that host alone, reading the token from the environment when git calls it.
+- `internalMirror`: the address managed runners reach the same forge at, such as a container-bridge address. Managed CI
+  rewrites the origin prefix onto it with `url.<mirror>.insteadOf` and answers the same credential for the mirror's
+  host, because git hands helpers the rewritten URL.
+- `sshOrigins`: the SSH spellings of that same forge, as a lockfile pins them (`Cargo.toml` git dependencies, uv
+  sources). Each one gets its own `insteadOf` line onto the mirror. git matches `insteadOf` values as literal URL
+  prefixes and derives no spelling from another, so a forge pinned as `ssh://forgejo@host:2223/` and as
+  `ssh://host:2223/` needs both declared; a runner holding only the mirror's read token and no SSH key would otherwise
+  fetch nothing. The declarations stay credential-free — the rewrite happens before transport, so an SSH pin nobody
+  rewrote fails loudly instead of collecting a token — and each requires `internalMirror`, since an SSH spelling is a
+  rewrite source and nothing else.
+- `registryTokenEnvs`: `CARGO_REGISTRIES_<NAME>_TOKEN` secrets Cargo's own credential provider reads for private
+  registries.
+
 ### Remote cache configuration (`package.json` → `smoo.remoteCache`)
 
 One Nx self-hosted remote cache shared by every runner and every developer shell:
