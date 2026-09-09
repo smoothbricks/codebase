@@ -88,9 +88,11 @@ install_devenv() {
 
   local rev flake found=""
   rev="$(devenv_locked_rev)"
-  # nix-quick-install puts ~/.nix-profile/bin on PATH, so a restored profile is
-  # usually already resolvable; check the literal path too for the case where it
-  # is not yet.
+  # The store cache carries content only, never the Nix profiles, so the normal
+  # ephemeral case is that nothing is installed yet and this profile-adds the
+  # locked rev against an already-warm /nix — an evaluation and a link, not a
+  # download. Anything that does turn up on PATH is still checked rather than
+  # trusted, because "a devenv exists" was never the question.
   if command -v devenv >/dev/null 2>&1; then
     found="$(command -v devenv)"
   elif [ -x "$HOME/.nix-profile/bin/devenv" ]; then
@@ -102,13 +104,10 @@ install_devenv() {
   else
     flake="${DEVENV_FLAKE:-github:cachix/devenv/$rev}"
     if [ -n "$found" ]; then
-      # The store cache restores ~/.nix-profile wholesale, so a key rotation
-      # hands this job the devenv of whichever run last populated the prefix —
-      # which is how the CLI silently outlived a lock bump before this check
-      # existed. Replacing it needs the old entry gone first: `nix profile add`
-      # would otherwise refuse on a bin/devenv collision at equal priority.
-      # --all is exact rather than blunt, because devenv is the only thing this
-      # script ever profile-adds, so a wrong devenv means a wrong profile.
+      # Replacing needs the old entry gone first: `nix profile add` would
+      # otherwise refuse on a bin/devenv collision at equal priority. --all is
+      # exact rather than blunt, because devenv is the only thing this script
+      # ever profile-adds, so a wrong devenv means a wrong profile.
       echo "replacing devenv $("$found" version 2>/dev/null) — lock names ${rev:0:7}"
       nix profile remove --all
     fi
