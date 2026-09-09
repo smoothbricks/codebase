@@ -28,16 +28,17 @@ commands, dependencies, inputs and outputs because they override source-aware in
 The plugin discovers Cargo workspaces beside Nx project manifests at any depth:
 
 - **Workspace owner:** the project beside a workspace `Cargo.toml` owns one `cargo-fetch`, `cargo-test-compile`,
-  cross-check, mutation, bench, and sweep target. Its `cargo-lint` and `cargo-test` aggregates reach all workspace
-  crates, including a root `[package]`.
-- **Crate owner:** the deepest Nx project directory containing a crate owns `cargo-lint-<crate>` and
-  `cargo-test-<crate>` targets. Its `cargo-lint` and `lint` aggregates reach only its own crates; lint never depends on
-  the workspace test suite. Projects can own multiple crates. A nested independent workspace has its own prerequisites
-  and does not inherit those of an outer workspace.
-- **Commands:** validation runs from the governing Cargo workspace directory. Formatting uses
-  `cargo fmt -p <crate> --check`; Clippy uses
-  `cargo --frozen clippy -p <crate> --all-targets --target-dir target/cargo-lint-<crate> -- -D warnings`. The package
-  selector narrows both tools, and each Clippy target has a separate build directory.
+  `cargo-test-archive`, `cargo-lint`, cross-check, mutation, bench, and sweep target. Its `cargo-lint` and `cargo-test`
+  aggregates reach all workspace crates, including a root `[package]`.
+- **Crate owner:** the deepest Nx project directory containing a crate owns `cargo-test-<crate>` targets. Its
+  `cargo-lint` delegates to the workspace owner's one verdict, and `lint` never depends on the workspace test suite.
+  Projects can own multiple crates. A nested independent workspace has its own prerequisites and does not inherit those
+  of an outer workspace.
+- **Commands:** validation runs from the governing Cargo workspace directory. One `cargo fmt --all --check` and one
+  `cargo --frozen clippy --workspace --all-targets --target-dir target/cargo-lint -- -D warnings` cover every member.
+  Clippy of a crate is a check build of its whole closure, so a target directory per crate rebuilt every shared
+  dependency once per crate — 49 closures and 11 GiB on one repository — and no per-crate cache hit repaid it. Cargo's
+  own lock serializes the invocations that share the directory.
 - **Overrides:** normal Nx merging applies. Explicit `nx.targets` fields replace inferred fields, while omitted fields
   retain their inferred base. Use `"dependsOn": ["...", "extra"]` to preserve inferred prerequisites when adding an
   edge; replacing the array makes its author responsible for fetching before frozen Cargo commands.
@@ -60,8 +61,8 @@ explicit inputs for arbitrary build-script reads or custom environment variables
 
 Cargo keeps the caller's `CARGO_HOME`. Moving configuration into an isolated home can change relative paths or lose
 source replacement, credentials, and toolchain settings; forwarding it with `--config` changes precedence. Registry
-access may consequently serialize on Cargo's package-cache lock, while separate Clippy target directories still avoid
-contention with the test build directory.
+access may consequently serialize on Cargo's package-cache lock. Clippy's dedicated target directory keeps its check
+artifacts out of the test build directory without splitting one directory per crate.
 
 ### External Rust sources
 
@@ -106,15 +107,19 @@ Concrete targets come from concrete files:
 - `test:watch` is inferred when the package already defines an explicit Bun or Vitest `test` command. The plugin derives
   the corresponding watch command and makes it depend on `typecheck-tests`.
 - A workspace-root `Cargo.toml` provides `cargo-test`, `test`, `cargo-lint`, `mutation`, and `bench`.
-  `cargo-test-compile` warms one workspace `cargo test --no-run`. Each member crate gets a cached `cargo-test-<package>`
-  run (30s per-test timeout like `bun test --timeout=30000`) whose inputs include that crate and its path dependencies.
-  Package-rooted workspaces use `cargo nextest run --workspace -E 'package(<crate>)'`; repository-rooted workspaces
-  additionally use `-p <crate>` to bind the runner to the project that owns the crate. Per-crate runners accept an empty
-  nextest selection because a valid workspace member may have no tests and a hash partition may legitimately be empty.
-  Those runs are chained across project boundaries to serialize their Cargo writers; `napi-debug` sits on that chain
-  after compile. Clippy uses a separate per-crate target directory so lint can overlap tests. A crate declaring
-  `[package.metadata.smoothbricks.wasm-bindgen]` also receives the cacheable `cargo-wasm` output target in its owning
-  project.
+  `cargo-test-compile` warms one workspace `cargo test --no-run`. `cargo-test-archive` runs one
+  `cargo --frozen nextest archive --workspace` into `target/nextest/archive.tar.zst` and is the only cached cargo BUILD:
+  it produces a file rather than a mutable build tree. Each member crate gets a cached `cargo-test-<package>` run (30s
+  per-test timeout like `bun test --timeout=30000`) whose inputs include that crate and its path dependencies, and whose
+  command is `cargo --frozen nextest run --archive-file <archive> --workspace-remap . -E 'package(<crate>)'`. Runners
+  therefore execute rather than build: they extract binaries into their own temporary directory, write nothing to
+  cargo's flocked `target/`, and fan out instead of chaining. `--workspace-remap` is required — an archive records the
+  producing tree's absolute paths, and without it a restored archive hands tests another checkout's
+  `CARGO_MANIFEST_DIR`. For the same reason the archive's cache key includes its workspace path. Per-crate runners
+  accept an empty nextest selection because a valid workspace member may have no tests and a hash partition may
+  legitimately be empty. `napi-debug` stays behind `cargo-test-compile`, and a crate in the project that builds the
+  debug cdylib runs after it. A crate declaring `[package.metadata.smoothbricks.wasm-bindgen]` also receives the
+  cacheable `cargo-wasm` output target in its owning project.
 - A crate whose suite outgrows one bounded window declares `[package.metadata.smoothbricks.test] shards = N`, and gets
   `cargo-test-<package>-shard1..N`, each running `--partition hash:i/N` with the full bound. nextest assigns a test to a
   shard by hashing its name, so the shards stay an exact partition of the crate as tests and test binaries are added,

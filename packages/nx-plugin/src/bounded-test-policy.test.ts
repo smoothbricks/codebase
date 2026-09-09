@@ -512,6 +512,73 @@ describe('cargo-test reachability policy', () => {
     }
   });
 
+  it('treats the workspace nextest archive as a build, never as a runner or a crate', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'cargo-reach-archive-'));
+    try {
+      await writeJson(join(root, 'package.json'), { name: '@scope/root', private: true, workspaces: ['packages/*'] });
+      await writeJson(join(root, 'packages/rusty/package.json'), { name: 'rusty', nx: { name: 'rusty' } });
+      await mkdir(join(root, 'packages/rusty/crates/core'), { recursive: true });
+      await writeFile(join(root, 'packages/rusty/Cargo.toml'), '[workspace]\nmembers = ["crates/core"]\n');
+      await writeFile(join(root, 'packages/rusty/crates/core/Cargo.toml'), '[package]\nname = "rusty-core"\n');
+
+      // `cargo nextest archive` compiles test binaries and packs them. It is
+      // the same silent green as `--no-run`: the word "nextest" appears, no
+      // test runs. And `cargo-test-archive` is not a crate called "archive".
+      const archiveOptions = new Map<string, Record<string, unknown>>([
+        [
+          'cargo-test-archive',
+          { command: 'cargo --frozen nextest archive --workspace --archive-file target/nextest/archive.tar.zst' },
+        ],
+      ]);
+      const archiveOnly: ResolvedProjectTargets = {
+        root: 'packages/rusty',
+        targets: new Set(['test', 'cargo-test', 'cargo-test-archive']),
+        targetDependencies: new Map([
+          ['test', ['cargo-test']],
+          ['cargo-test', ['cargo-test-archive']],
+        ]),
+        targetExecutors: new Map([
+          ['test', 'nx:noop'],
+          ['cargo-test', 'nx:noop'],
+          ['cargo-test-archive', 'nx:run-commands'],
+        ]),
+        targetOptions: archiveOptions,
+      };
+      const issues = checkWorkspaceCargoTestReachabilityPolicy(root, {
+        resolvedTargetsByProject: new Map([['rusty', archiveOnly]]),
+      });
+      expect(issues).toHaveLength(1);
+      expect(issues[0]?.message).toContain('RUNS tests');
+
+      const withRunner: ResolvedProjectTargets = {
+        ...archiveOnly,
+        targets: new Set([...archiveOnly.targets, 'cargo-test-rusty-core']),
+        targetDependencies: new Map([
+          ['test', ['cargo-test']],
+          ['cargo-test', ['cargo-test-rusty-core']],
+          ['cargo-test-rusty-core', ['cargo-test-archive']],
+        ]),
+        targetOptions: new Map([
+          ...archiveOptions,
+          [
+            'cargo-test-rusty-core',
+            {
+              command:
+                "cargo --frozen nextest run --archive-file target/nextest/archive.tar.zst --workspace-remap . -E 'package(rusty-core)'",
+            },
+          ],
+        ]),
+      };
+      expect(
+        checkWorkspaceCargoTestReachabilityPolicy(root, {
+          resolvedTargetsByProject: new Map([['rusty', withRunner]]),
+        }),
+      ).toEqual([]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it('ignores projects with no cargo-test target', async () => {
     const root = await mkdtemp(join(tmpdir(), 'cargo-reach-ts-'));
     try {
