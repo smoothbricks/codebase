@@ -1,7 +1,7 @@
 name: Save Nix/devenv caches
 description: >
-  Save the devenv/direnv eval-cache segment after the job, on every runner where setup missed and build-shell produced
-  nix-eval-cache.db. The Nix store cache saves itself in setup-devenv's post phase (ephemeral runners only).
+  Save the devenv/direnv eval-cache segment after the job, on every ephemeral runner where setup missed and build-shell
+  produced nix-eval-cache.db. The Nix store cache saves itself in setup-devenv's post phase (ephemeral runners only).
 
 inputs:
   devenv-cache-hit:
