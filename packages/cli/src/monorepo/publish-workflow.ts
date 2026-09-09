@@ -867,6 +867,7 @@ function renderPlatformPlanJob(options: PublishWorkflowDefinitionOptions): strin
     `      projects: ${githubExpression('steps.plan.outputs.projects')}`,
     `      repairs: ${githubExpression('steps.plan.outputs.repairs')}`,
     '    env:',
+    `      TTSC_TSGO_BINARY: ${githubExpression('github.workspace')}/node_modules/@typescript/native/bin/tsc`,
     `      GH_TOKEN: ${githubExpression('github.token')}${privateNpmInstallJobEnv(options)}`,
     '    steps:',
     '      - name: 📥 Checkout dispatch commit',
