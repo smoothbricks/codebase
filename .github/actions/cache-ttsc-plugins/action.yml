@@ -4,6 +4,15 @@ description: >
   and skip the multi-minute `go build` when the cache key matches. The Go object cache (go-build/) is NOT cached — it is
   multi-GB and only helps when the plugin key misses.
 
+inputs:
+  scope:
+    description: >
+      Build environment the binaries were compiled in. ttsc keys a plugin on its Go build environment, so binaries from
+      the devenv shell and from a Bun-only prologue never share a key; each environment keeps its own segment. The key
+      carries no repository source: a CLI or plugin change compiles against the cached binary in seconds.
+    required: false
+    default: devenv
+
 runs:
   using: composite
   steps:
@@ -14,6 +23,6 @@ runs:
         # workspace; devenv sets TTSC_CACHE_DIR to <repo>/.cache/ttsc.
         path: .cache/ttsc/plugins
         # prettier-ignore
-        key: ${{ runner.os }}-${{ runner.arch }}-ttsc-plugins-v1-${{ hashFiles('bun.lock', 'package.json', 'patches/ttsc@*.patch', 'tooling/direnv/devenv.lock') }}
+        key: ${{ runner.os }}-${{ runner.arch }}-ttsc-plugins-${{ inputs.scope }}-v1-${{ hashFiles('bun.lock', 'package.json', 'patches/ttsc@*.patch', 'tooling/direnv/devenv.lock') }}
         restore-keys: |
-          ${{ runner.os }}-${{ runner.arch }}-ttsc-plugins-v1-
+          ${{ runner.os }}-${{ runner.arch }}-ttsc-plugins-${{ inputs.scope }}-v1-

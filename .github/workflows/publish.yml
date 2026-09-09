@@ -249,6 +249,8 @@ jobs:
       # Step 4
       - name: 🧊 Restore ttsc plugins
         uses: ./.github/actions/cache-ttsc-plugins
+        with:
+          scope: bun
 
       # Step 5
       - name: 🥟 Setup Bun
@@ -263,6 +265,8 @@ jobs:
         run: |
           bun install --frozen-lockfile
           tooling/direnv/repo-path --github-path
+          # nx must run on Node: its js plugin needs the full TypeScript API.
+          echo "node: $(command -v node) $(node -e 'console.log(process.version, process.versions.bun ?? "")')"
 
       # Step 7
       - name: 🏗️ Build smoo Nx version actions
