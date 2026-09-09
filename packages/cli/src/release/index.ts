@@ -7,7 +7,7 @@ import { Writable } from 'node:stream';
 import { setTimeout as delay } from 'node:timers/promises';
 import { $ } from 'bun';
 import typia from 'typia';
-import { githubCiApplyOutputs, githubCiNxRunMany } from '../github-ci/index.js';
+import { expandNxTargetRuns, githubCiApplyOutputs, githubCiNxRunMany } from '../github-ci/index.js';
 import { assertCollectedOutputsApplied } from '../github-ci/outputs.js';
 import { assertNoConflictMarkers } from '../lib/conflict-markers.js';
 import { withDevenvEnv } from '../lib/devenv.js';
@@ -162,6 +162,15 @@ export interface ReleasePlatformOutputsOptions {
   projects?: string;
   githubOutput?: string;
   output: string;
+  ref?: string;
+  targets: string;
+}
+
+export interface ReleasePlatformPlanOptions {
+  bump: string;
+  /** Same selector as `release version`. */
+  projects?: string;
+  githubOutput?: string;
   ref?: string;
   targets: string;
 }
@@ -377,6 +386,52 @@ export async function releaseCollectPlatformOutputs(
       ...new Set(currentRuns.runs.flatMap((run) => run.projects.map((project) => project.project))),
     ].sort((left, right) => left.localeCompare(right));
     await appendFile(options.githubOutput, `projects=${projects.join(',')}\n`);
+  }
+}
+
+const PLATFORM_PLAN_LABEL = 'release platform plan';
+
+/**
+ * Whether a platform runner has anything to build for this release, decided
+ * without building: the same selection `build-platform-outputs` runs (current
+ * release packages whose projects carry a matching platform target) plus the
+ * pending releases only that runner can repair. Everything here is git, the
+ * Nx graph, npm and GitHub metadata, so a plan job needs no toolchain — a
+ * workflow gates its platform runners on `platform-work` and spends ten
+ * minutes of Nix setup only when a run exists for them.
+ */
+export async function releasePlanPlatformOutputs(root: string, options: ReleasePlatformPlanOptions): Promise<void> {
+  const releaseRef = await fetchReleaseRepairRef(root, PLATFORM_PLAN_LABEL, options.ref);
+  const packages = releasePackages(root);
+  const packagesAtHead = await releasePackagesAtHead(root, packages);
+  const bump = releaseBumpArg(options.bump);
+  const selection = parseReleaseProjectSelection(
+    options.projects,
+    packages.map((pkg) => pkg.projectName),
+  );
+  const currentPackages =
+    packagesAtHead.length > 0 ? packagesAtHead : await releasePlatformPackages(root, packages, bump, selection);
+  const expanded = expandNxTargetRuns(await readProjectTargets(root), {
+    targets: options.targets,
+    projects: releasePackageProjects(currentPackages),
+    allowEmptyProjects: true,
+  });
+  const projects = [...new Set(expanded.runs.flatMap((run) => run.projects.map((project) => project.project)))].sort(
+    (left, right) => left.localeCompare(right),
+  );
+  const repairs = await listPendingReleaseTargets(root, releaseRef, PLATFORM_PLAN_LABEL);
+  logPendingReleaseTargets(repairs, PLATFORM_PLAN_LABEL);
+  const work = projects.length > 0 || repairs.length > 0;
+  console.log(
+    work
+      ? `${PLATFORM_PLAN_LABEL}: ${options.targets} has work — current ${projects.length === 0 ? 'none' : projects.join(', ')}; repairs ${repairs.length}.`
+      : `${PLATFORM_PLAN_LABEL}: ${options.targets} has nothing to build; platform runners can be skipped.`,
+  );
+  if (options.githubOutput) {
+    await appendFile(
+      options.githubOutput,
+      `platform-work=${work ? 'true' : 'false'}\nprojects=${projects.join(',')}\nrepairs=${repairs.length}\n`,
+    );
   }
 }
 

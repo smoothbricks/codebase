@@ -789,7 +789,10 @@ defaults:
     working-directory: tooling/direnv
 
 jobs:
+${renderPlatformPlanJob(options)}
+
   linux-release-candidate:
+    needs: [platform-plan]
 ${renderRunsOnLine(options.runsOn)}
     permissions:
       contents: write
@@ -803,7 +806,11 @@ ${renderRunsOnLine(options.runsOn)}
     steps:
 ${renderLinuxReleaseCandidateSteps(steps, options)}
 
-  ${options.platformProducer?.kind === 'linux-cross' ? 'cross-platform' : 'macos-platform'}:
+  ${platformJobName(options)}:
+    # Ten minutes of toolchain setup only when the plan found a run for this
+    # platform; the plan job decided that without a toolchain.
+    needs: [platform-plan]
+    if: ${githubExpression("needs.platform-plan.outputs.platform-work == 'true'")}
 ${renderMacosJobHeaderLines(options)}
     permissions:
       contents: read
@@ -818,7 +825,11 @@ ${Object.entries(options.platformProducer?.env ?? {})
 ${renderMacosPlatformSteps(options)}
 
   publish-on-linux:
-    needs: [linux-release-candidate, ${options.platformProducer?.kind === 'linux-cross' ? 'cross-platform' : 'macos-platform'}]
+    needs: [platform-plan, linux-release-candidate, ${platformJobName(options)}]
+    # A platform leg the plan skipped is not a failure; a leg that ran must have passed.
+    if:
+      \${{ !cancelled() && needs.linux-release-candidate.result == 'success' && (needs.${platformJobName(options)}.result == 'success'
+      || needs.${platformJobName(options)}.result == 'skipped') }}
 ${publishJobRunsOnLine(options)}
     permissions:
       contents: write
@@ -830,6 +841,68 @@ ${publishJobRunsOnLine(options)}
     steps:
 ${renderFinalLinuxPublishSteps(options)}
 `;
+}
+
+function platformJobName(options: PublishWorkflowDefinitionOptions): string {
+  return options.platformProducer?.kind === 'linux-cross' ? 'cross-platform' : 'macos-platform';
+}
+
+/**
+ * Decide, without a toolchain, whether the platform runners have anything to
+ * build: the release selection, which selected projects carry platform
+ * targets, and the pending releases only they can repair are git, the Nx
+ * graph, npm and GitHub metadata. Bun runs smoo and Nx directly; the ten-minute
+ * Nix setup is then spent only on a platform leg with a run.
+ */
+function renderPlatformPlanJob(options: PublishWorkflowDefinitionOptions): string {
+  const selector = macosPlatformFamilySelector(options);
+  const lines = [
+    '  platform-plan:',
+    publishJobRunsOnLine(options),
+    '    permissions:',
+    '      contents: read',
+    '      id-token: none',
+    '    outputs:',
+    `      platform-work: ${githubExpression('steps.plan.outputs.platform-work')}`,
+    `      projects: ${githubExpression('steps.plan.outputs.projects')}`,
+    `      repairs: ${githubExpression('steps.plan.outputs.repairs')}`,
+    '    env:',
+    `      GH_TOKEN: ${githubExpression('github.token')}${privateNpmInstallJobEnv(options)}`,
+    '    steps:',
+    '      - name: 📥 Checkout dispatch commit',
+    '        uses: actions/checkout@v6.0.2',
+    '        with:',
+    `          ref: ${githubExpression('github.sha')}`,
+    '          filter: blob:none',
+    '          fetch-depth: 0',
+    '      - name: 🥟 Setup Bun',
+    '        uses: oven-sh/setup-bun@v2',
+    '        with:',
+    '          bun-version-file: package.json',
+    '      - name: 📦 Install workspace dependencies',
+    '        working-directory: .',
+    '        # repo-path exposes smoo: the source shim here, node_modules/.bin elsewhere.',
+    '        run: |',
+    '          bun install --frozen-lockfile',
+    '          tooling/direnv/repo-path --github-path',
+  ];
+  if (isSmoothBricksCodebasePackageName(options.repoName)) {
+    lines.push(
+      '      - name: 🏗️ Build smoo Nx version actions',
+      '        # The plan previews Nx Release versioning, which loads',
+      '        # @smoothbricks/nx-plugin/version-actions from dist; ttsc runs on Bun.',
+      '        working-directory: packages/nx-plugin',
+      '        run: bunx ttsc -p tsconfig.lib.json --emit',
+    );
+  }
+  lines.push(
+    '      - name: 🗺️ Plan platform outputs',
+    '        id: plan',
+    '        run:',
+    `          smoo release build-platform-outputs --plan --bump "${githubExpression('inputs.bump')}" --projects "${githubExpression('inputs.projects')}"`,
+    `          --ref "${githubExpression('github.sha')}" --targets "${selector}" --github-output "$GITHUB_OUTPUT"`,
+  );
+  return lines.join('\n');
 }
 
 function renderLinuxReleaseCandidateSteps(
@@ -1238,13 +1311,34 @@ function renderFinalLinuxPublishSteps(options: PublishWorkflowDefinitionOptions)
   lines.push(
     '',
     `      # Step ${stepNumber++}`,
+    '      - name: 🧾 Select prebuilt platform outputs',
+    '        # A platform leg the plan skipped left no artifact, and that is the',
+    '        # expected shape; a leg the plan asked for must have delivered one.',
+    '        id: platform-outputs',
+    '        run: |',
+    '          set -euo pipefail',
+    '          dirs=""',
+    `          for dir in ${macosPlatformArtifactNames(options)
+      .map((name) => `"${githubExpression('runner.temp')}/publish-artifacts/${name}/current"`)
+      .join(' ')}; do`,
+    '            if [ -d "$dir" ]; then',
+    '              # runner.temp carries no spaces; the publish step splits this on them.',
+    '              dirs="$dirs $dir"',
+    `            elif [ "${githubExpression('needs.platform-plan.outputs.platform-work')}" = "true" ]; then`,
+    '              echo "Platform outputs the plan asked for are missing: $dir" >&2',
+    '              exit 1',
+    '            fi',
+    '          done',
+    '          echo "dirs=$dirs" >> "$GITHUB_OUTPUT"',
+  );
+  lines.push(
+    '',
+    `      # Step ${stepNumber++}`,
     '      - name: 🍎 Apply verified macOS outputs',
-    `        if: ${mode} != 'none'`,
-    '        run:',
-    `          smoo github-ci apply-outputs --source-sha "${githubExpression('github.sha')}"`,
-    ...macosPlatformArtifactNames(options).map(
-      (name) => `          "${githubExpression('runner.temp')}/publish-artifacts/${name}/current"`,
-    ),
+    `        if: ${mode} != 'none' && steps.platform-outputs.outputs.dirs != ''`,
+    `        run: smoo github-ci apply-outputs --source-sha "${githubExpression('github.sha')}" ${githubExpression(
+      'steps.platform-outputs.outputs.dirs',
+    )}`,
     '',
     '      # --- Release ------------------------------------------------------------',
     '',
@@ -1270,9 +1364,7 @@ function renderFinalLinuxPublishSteps(options: PublishWorkflowDefinitionOptions)
           )}"`,
         ]
       : []),
-    ...macosPlatformArtifactNames(options).map(
-      (name) => `          "${githubExpression('runner.temp')}/publish-artifacts/${name}/current"`,
-    ),
+    `          ${githubExpression('steps.platform-outputs.outputs.dirs')}`,
     `          --bump "${githubExpression('inputs.bump')}" --dry-run "${githubExpression('inputs.dry_run')}"`,
   );
   if (options.deploy === true) {
@@ -1350,6 +1442,12 @@ function renderMacosJobHeaderLines(options: PublishWorkflowDefinitionOptions): s
     );
   }
   return lines.join('\n');
+}
+
+/** Every macOS family this workflow produces, architecture-agnostic: what the plan job asks about. */
+function macosPlatformFamilySelector(options: PublishWorkflowDefinitionOptions): string {
+  const families = macosPlatformFamilies(options);
+  return (families.length > 0 ? families : [...MACOS_PLATFORM_TARGET_GLOBS]).join(',');
 }
 
 /** Per-leg target selector, or every macOS family when there is no matrix. */
