@@ -119,9 +119,29 @@ runs:
           keep-env-derivations = true
 
     # The store itself, restored as files: /nix/store plus the Nix database,
-    # merged into the fresh install. Profiles live outside /nix/var in
-    # single-user mode and ride along. The post phase collects garbage down
-    # to the live closure and saves when the primary key missed.
+    # merged into the fresh install. The post phase collects garbage down to the
+    # live closure and saves when the primary key missed.
+    #
+    # CONTENT ONLY — never the Nix profiles. `~/.nix-profile` and
+    # ~/.local/state/nix/profiles are mutable places whose whole job is to be
+    # gcroots, and restoring a previous run's copies over a freshly installed
+    # single-user Nix de-roots the Nix binary that is currently running. The post
+    # phase then garbage-collects it and cache-nix-action's own `nix --version`
+    # probe fails, at which point it skips the upload and still reports the step
+    # as a success — so the store cache silently stops being written and every
+    # later run pays a cold shell. Measured exactly that way: run 34371205556
+    # logged `nix (Nix) 2.34.7`, freed 2.7 GiB, then `nix: command not found`,
+    # and no `Cache saved` line for this key ever appeared.
+    #
+    # It only surfaced now because it needs a restore-prefix fallback rather than
+    # a cold store or an exact hit: a matching key restores profiles consistent
+    # with the store, while the diet rotated the key and pulled the previous
+    # store's profiles onto a different Nix.
+    #
+    # Dropping them costs nothing and buys determinism. devenv's closure still
+    # arrives inside /nix, so install-devenv's `nix profile add` of the locked
+    # rev is a link rather than a download, and the devenv in play is the one
+    # devenv.lock names instead of whichever run last populated the prefix.
     - name: 🧊 Cache Nix store
       id: nix-cache
       if: steps.runner-kind.outputs.host != 'true'
@@ -129,12 +149,10 @@ runs:
       with:
         paths: |
           /nix
-          ~/.nix-profile
-          ~/.local/state/nix/profiles
           ~/.cache/nix
         # prettier-ignore
-        primary-key: ${{ runner.os }}-${{ runner.arch }}-nix-v4-${{ hashFiles('tooling/direnv/devenv.yaml', 'tooling/direnv/devenv.nix', 'tooling/direnv/devenv.lock') }}
-        restore-prefixes-first-match: ${{ runner.os }}-${{ runner.arch }}-nix-v4-
+        primary-key: ${{ runner.os }}-${{ runner.arch }}-nix-v5-${{ hashFiles('tooling/direnv/devenv.yaml', 'tooling/direnv/devenv.nix', 'tooling/direnv/devenv.lock') }}
+        restore-prefixes-first-match: ${{ runner.os }}-${{ runner.arch }}-nix-v5-
         gc-max-store-size: 1G
 
     - name: ⚡ Enable Cachix
