@@ -120,3 +120,106 @@ describe('github-actions-bootstrap build-shell environment persistence', () => {
     expect(run.githubPath).toContain('tooling/direnv/.devenv/profile/bin');
   });
 });
+
+// install-devenv resolves the devenv CLI from devenv.lock, so its harness needs
+// a repo_root that actually holds tooling/direnv/devenv.lock — the raw template
+// directory does not. Copy the script into a temp tree instead, stub away
+// `nix profile add`, and delegate `nix eval` to the real nix so the lock-reading
+// expression itself is under test rather than mocked.
+const REAL_NIX = spawnSync('sh', ['-c', 'command -v nix'], { encoding: 'utf8' }).stdout.trim();
+
+const NIX_STUB = `#!/usr/bin/env bash
+if [ "$1" = eval ]; then exec "$REAL_NIX" "$@"; fi
+printf '%s\\n' "nix $*" >> "$NIX_CALLS"
+`;
+
+interface InstallRun {
+  status: number | null;
+  stdout: string;
+  stderr: string;
+  nixCalls: string;
+}
+
+function runInstallDevenv(lock: string, options: { devenvOnPath?: boolean } = {}): InstallRun {
+  const dir = mkdtempSync(join(tmpdir(), 'gab-install-'));
+  try {
+    const direnv = join(dir, 'root', 'tooling', 'direnv');
+    const bin = join(dir, 'bin');
+    mkdirSync(direnv, { recursive: true });
+    mkdirSync(bin);
+    writeFileSync(join(direnv, 'github-actions-bootstrap.sh'), readFileSync(script, 'utf8'));
+    writeFileSync(join(direnv, 'devenv.lock'), lock);
+    const nixCalls = join(dir, 'nix-calls');
+    writeFileSync(nixCalls, '');
+    const stub = join(bin, 'nix');
+    writeFileSync(stub, NIX_STUB);
+    chmodSync(stub, 0o755);
+    if (options.devenvOnPath) {
+      const devenv = join(bin, 'devenv');
+      writeFileSync(devenv, '#!/usr/bin/env bash\necho 9.9.9-from-path\n');
+      chmodSync(devenv, 0o755);
+    }
+    const r = spawnSync('bash', [join(direnv, 'github-actions-bootstrap.sh'), 'install-devenv'], {
+      encoding: 'utf8',
+      // A bare PATH on purpose: an ambient devenv would select the
+      // already-installed branch and the pin would never be exercised.
+      env: {
+        PATH: `${bin}:${dirname(REAL_NIX)}:/usr/bin:/bin`,
+        HOME: join(dir, 'home'),
+        NIX_CALLS: nixCalls,
+        REAL_NIX,
+      },
+    });
+    return {
+      status: r.status,
+      stdout: r.stdout ?? '',
+      stderr: r.stderr ?? '',
+      nixCalls: readFileSync(nixCalls, 'utf8'),
+    };
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+const LOCK_WITH_REV = JSON.stringify({
+  nodes: {
+    devenv: {
+      locked: { dir: 'src/modules', owner: 'cachix', repo: 'devenv', rev: 'f'.repeat(40), type: 'github' },
+      original: { dir: 'src/modules', owner: 'cachix', repo: 'devenv', type: 'github' },
+    },
+  },
+  root: 'root',
+  version: 7,
+});
+
+describe('github-actions-bootstrap install-devenv', () => {
+  it('installs the devenv rev devenv.lock names, never a floating branch', () => {
+    const run = runInstallDevenv(LOCK_WITH_REV);
+    if (run.status !== 0) {
+      printCommandOutput(run.stdout, run.stderr);
+    }
+    expect(run.status).toBe(0);
+    // The rev comes out of the lock, so the CLI is the commit whose modules the
+    // shell is locked to. An unpinned `github:cachix/devenv` would install
+    // whatever HEAD is on the day a cold runner misses the store cache.
+    expect(run.nixCalls).toContain(`nix profile add --accept-flake-config github:cachix/devenv/${'f'.repeat(40)}`);
+    expect(run.nixCalls).not.toContain('github:cachix/devenv\n');
+    // Announced, so a run's log names the version it installed.
+    expect(run.stdout).toContain(`github:cachix/devenv/${'f'.repeat(40)}`);
+  });
+
+  it('refuses to install anything when the lock names no devenv rev', () => {
+    const run = runInstallDevenv(JSON.stringify({ nodes: {}, root: 'root', version: 7 }));
+    expect(run.status).not.toBe(0);
+    expect(run.stderr).toContain('cannot resolve .nodes.devenv.locked.rev');
+    // Silently falling back to an unpinned flake is the failure being prevented.
+    expect(run.nixCalls).not.toContain('profile add');
+  });
+
+  it('keeps an already-installed devenv and never evaluates the flake', () => {
+    const run = runInstallDevenv(LOCK_WITH_REV, { devenvOnPath: true });
+    expect(run.status).toBe(0);
+    expect(run.stdout).toContain('using existing devenv');
+    expect(run.nixCalls).toBe('');
+  });
+});

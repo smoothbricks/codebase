@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-DEVENV_FLAKE="${DEVENV_FLAKE:-github:cachix/devenv}"
 # Resolve from this script's location, not the caller's cwd. GitHub Actions
 # runs this from tooling/direnv today, but direct cwd-changing helpers are easy
 # to misuse and break on repeated calls.
@@ -18,10 +17,48 @@ add_repo_paths() {
   "$repo_root/tooling/direnv/repo-path" --github-path
 }
 
+# The CLI that evaluates the shell must be the commit whose modules the shell is
+# locked to. devenv writes its own source rev into devenv.lock's `devenv` node,
+# so the lock already names one coherent pair (CLI 2.3.1+190959a evaluating the
+# 190959a modules) and nothing here restates it. Note `original` carries no rev:
+# that node is HEAD-at-lock-time rather than a release tag, so this pin buys
+# coherence, not blessing.
+#
+# An unpinned `github:cachix/devenv` instead installs whatever HEAD is on the day
+# a cold runner misses the store cache — a version that moves with no commit
+# behind it, so it cannot be reviewed or bisected, and a CLI newer than the
+# locked modules breaks eval-cache or flag compatibility with no diff to blame.
+# `--accept-flake-config` makes it worse than untidy: it pre-trusts the
+# substituters declared by a commit nobody looked at.
+#
+# Resolved lazily, on the install path only: a runner that already has devenv
+# never needs the rev, and that is the one branch which pays for a `nix eval`.
+devenv_flake() {
+  if [ -n "${DEVENV_FLAKE:-}" ]; then
+    printf '%s' "$DEVENV_FLAKE"
+    return 0
+  fi
+  local lock="$repo_root/tooling/direnv/devenv.lock" rev
+  # nix, not jq: jq arrives with the shell this script is about to build, while
+  # nix is guaranteed by the install step before it. fromJSON also beats
+  # hand-rolled parsing of a file whose key order is not ours to assume.
+  # Absolute-path readFile needs --impure; nix's own error is left on stderr
+  # rather than swallowed, because an unresolvable pin is the failure this
+  # function exists to prevent.
+  rev="$(nix eval --raw --impure --expr \
+    "(builtins.fromJSON (builtins.readFile \"$lock\")).nodes.devenv.locked.rev")" || rev=""
+  if [ -z "$rev" ]; then
+    echo "install-devenv: cannot resolve .nodes.devenv.locked.rev from $lock" >&2
+    echo "                set DEVENV_FLAKE to install a devenv explicitly" >&2
+    return 1
+  fi
+  printf 'github:cachix/devenv/%s' "$rev"
+}
+
 install_devenv() {
   # Shared host /nix/store is the package cache. Image may already provide
-  # devenv from github:cachix/devenv; otherwise profile-add the same flake
-  # (links store paths; re-fetch only when missing).
+  # devenv; otherwise profile-add the flake rev devenv.lock names (links store
+  # paths; re-fetch only when missing).
   # The restored profile is not on PATH yet; look where the store cache put
   # it before evaluating the devenv flake again.
   local restored="$HOME/.nix-profile/bin/devenv"
@@ -30,8 +67,10 @@ install_devenv() {
   elif [ -x "$restored" ]; then
     echo "using restored devenv: $restored ($("$restored" version))"
   else
-    echo "nix profile add ${DEVENV_FLAKE}"
-    nix profile add --accept-flake-config "$DEVENV_FLAKE"
+    local flake
+    flake="$(devenv_flake)"
+    echo "nix profile add ${flake}"
+    nix profile add --accept-flake-config "$flake"
   fi
   if [ -d "$HOME/.nix-profile/bin" ]; then
     echo "$HOME/.nix-profile/bin" >> "${GITHUB_PATH:-/dev/null}"
