@@ -8,7 +8,7 @@ description: >
 outputs:
   devenv-cache-hit:
     description: Whether the devenv/direnv cache restored from the exact primary key.
-    value: ${{ steps.devenv-cache.outputs.cache-hit || 'false' }}
+    value: ${{ steps.runner-kind.outputs.host == 'true' || steps.devenv-cache.outputs.cache-hit || 'false' }}
   host-runner:
     description: Whether this job is on a host-nix runner with shared store/caches.
     value: ${{ steps.runner-kind.outputs.host }}
@@ -95,14 +95,38 @@ runs:
         } >> "$GITHUB_ENV"
         echo "nx cache   : $NX_CACHE_ROOT"
 
+    # Host runners keep devenv's state on the shared bind, next to the Nx cache:
+    # .devenv (eval SQLite, gc roots, profile) and .direnv survive the job, so
+    # the next job on this host evaluates nothing and downloads nothing. The
+    # Actions cache segment below is the ephemeral runners' substitute for this.
+    # Scoped per job as well as lane: two jobs of one run are parallel, and one
+    # eval-cache.db has one writer.
+    - name: 📂 Locate devenv state on the shared bind
+      if: steps.runner-kind.outputs.host == 'true'
+      shell: bash
+      working-directory: tooling/direnv
+      env:
+        DEVENV_STATE_REPO: ${{ github.repository }}
+        DEVENV_STATE_LANE: ${{ github.workflow }}
+        DEVENV_STATE_JOB: ${{ github.job }}
+      run: |
+        lane=$(printf '%s' "$DEVENV_STATE_LANE" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9._-' '-')
+        root="/var/cache/ci/devenv/$DEVENV_STATE_REPO/${lane:-default}/$DEVENV_STATE_JOB"
+        mkdir -p "$root/.devenv" "$root/.direnv"
+        rm -rf .devenv .direnv
+        ln -s "$root/.devenv" .devenv
+        ln -s "$root/.direnv" .direnv
+        echo "devenv state: $root"
+
     # Devenv segment (own key): tooling/direnv/.devenv + .direnv — includes
-    # nix-eval-cache.db. Independent of the store cache; restore on host and
-    # ephemeral whether or not the store cache hit. Missing store paths are fine:
+    # nix-eval-cache.db. Independent of the store cache; restored on ephemeral
+    # runners whether or not the store cache hit. Missing store paths are fine:
     # devenv verifies shell drv/out exist on eval-cache hit and invalidates +
     # re-evals / realizes when GC removed them. Packages still come from host
     # store, the store cache, or Cachix — this blob only skips evaluation.
     - name: 🧊 Cache devenv and direnv
       id: devenv-cache
+      if: steps.runner-kind.outputs.host != 'true'
       uses: ./.github/actions/cache-nix-devenv
 
     # Single-user Nix unpacked into /nix in seconds: no installer volume, no
