@@ -518,6 +518,42 @@ describe('typecheck test policy (Tree)', () => {
 // ---------------------------------------------------------------------------
 
 describe('typecheck test policy', () => {
+  it('reads a documented tsconfig.test.json instead of treating it as absent', async () => {
+    // tsconfig files are JSONC: TypeScript permits comments. A plain
+    // JSON.parse failed, the reader answered "absent", and the policy
+    // regenerated the file — deleting a declared `lib`, an `exclude`, extra
+    // `include` globs and every comment explaining them. That is how AxE's
+    // Bun-only test program lost es2023 and `toSorted` became a type error.
+    const root = await mkdtemp(join(tmpdir(), 'smoo-typecheck-test-jsonc-'));
+    try {
+      await writeJsonFs(join(root, 'package.json'), { workspaces: ['packages/*'] });
+      await writeJsonFs(join(root, 'packages/app/package.json'), {
+        name: '@scope/app',
+        scripts: { test: 'bun test' },
+      });
+      await mkdir(join(root, 'packages/app'), { recursive: true });
+      const documented = [
+        '{',
+        '  "extends": "../../tsconfig.base.json",',
+        '  // WHY es2023: this program is Bun-only and JSC has change-array-by-copy.',
+        '  "compilerOptions": { "lib": ["es2023"], "types": ["bun"], "noEmit": true, "composite": false,',
+        '    "declaration": false, "declarationMap": false, "emitDeclarationOnly": false },',
+        '  "include": ["src/**/*.test.ts", "src/**/*.spec.ts", "src/**/__tests__/**/*.ts",',
+        '    "src/**/__tests__/**/*.tsx", "src/test-suite-tracer.ts", "tests/**/*.ts"],',
+        '  "exclude": ["src/lib/ts-plugin.ts"]',
+        '}',
+        '',
+      ].join('\n');
+      await writeFile(join(root, 'packages/app/tsconfig.test.json'), documented);
+
+      // Nothing the policy wants is missing, so it must not rewrite the file.
+      expect(applyTypecheckTestPolicy(root)).toBe(false);
+      expect(await readFile(join(root, 'packages/app/tsconfig.test.json'), 'utf8')).toBe(documented);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it('creates tsconfig.test.json for bun test package', async () => {
     const root = await mkdtemp(join(tmpdir(), 'smoo-typecheck-test-policy-'));
     try {

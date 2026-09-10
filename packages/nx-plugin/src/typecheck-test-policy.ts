@@ -459,6 +459,16 @@ export function applyTypecheckTestPolicy(root: string): boolean {
       }) || fileChanged;
 
     if (fileChanged) {
+      // A documented tsconfig cannot survive JSON.stringify, so the policy says
+      // what it wants instead of quietly deleting the reasoning. The check
+      // half (checkTypecheckTestPolicy) reports the same drift, so CI still
+      // fails until a human applies it.
+      if (existsSync(tsconfigTestPath) && hasJsonComments(readFileSync(tsconfigTestPath, 'utf8'))) {
+        console.error(
+          `refused        ${packagePath}/tsconfig.test.json carries comments a rewrite would delete; apply the policy by hand`,
+        );
+        continue;
+      }
       writeJsonObjectFs(tsconfigTestPath, tsconfigTest);
       changed = true;
     }
@@ -688,16 +698,80 @@ function collectTsconfigTestReferencePaths(
   return paths;
 }
 
+/**
+ * Read a tsconfig or package.json. tsconfig files are JSONC — TypeScript
+ * permits comments and trailing commas — so a plain `JSON.parse` fails on a
+ * documented one. Returning null there meant "file absent", and the caller
+ * regenerated it from scratch: a `lib` the test program declared, an
+ * `exclude`, an extra `include` glob and every comment explaining them
+ * disappeared on the next `smoo monorepo update`. Comments are stripped for
+ * parsing only; a caller that intends to write back must decide what to do
+ * about them (see writeJsonObjectFs's caller).
+ */
 function readJsonObject(path: string): Record<string, unknown> | null {
   if (!existsSync(path)) {
     return null;
   }
+  const text = readFileSync(path, 'utf8');
   try {
-    const parsed: unknown = JSON.parse(readFileSync(path, 'utf8'));
+    const parsed: unknown = JSON.parse(stripJsonComments(text));
     return isRecord(parsed) ? parsed : null;
-  } catch {
-    return null;
+  } catch (error) {
+    // A file that exists but cannot be parsed is a configuration error, not an
+    // invitation to overwrite it.
+    throw new Error(`${path} is not valid JSON/JSONC: ${error instanceof Error ? error.message : String(error)}`);
   }
+}
+
+/** Whether the file carries comments a rewrite would destroy. */
+function hasJsonComments(text: string): boolean {
+  return stripJsonComments(text) !== text;
+}
+
+/**
+ * Remove `//` and block comments outside string literals, and trailing commas.
+ * Small on purpose: the alternative is a JSONC dependency in a plugin whose
+ * only JSONC inputs are tsconfig files.
+ */
+function stripJsonComments(text: string): string {
+  let output = '';
+  let inString = false;
+  let escaped = false;
+  let index = 0;
+  while (index < text.length) {
+    const char = text[index];
+    if (inString) {
+      output += char;
+      if (escaped) {
+        escaped = false;
+      } else if (char === '\\') {
+        escaped = true;
+      } else if (char === '"') {
+        inString = false;
+      }
+      index += 1;
+      continue;
+    }
+    if (char === '"') {
+      inString = true;
+      output += char;
+      index += 1;
+      continue;
+    }
+    if (char === '/' && text[index + 1] === '/') {
+      while (index < text.length && text[index] !== '\n') index += 1;
+      continue;
+    }
+    if (char === '/' && text[index + 1] === '*') {
+      index += 2;
+      while (index < text.length && !(text[index] === '*' && text[index + 1] === '/')) index += 1;
+      index += 2;
+      continue;
+    }
+    output += char;
+    index += 1;
+  }
+  return output.replace(/,(\s*[}\]])/g, '$1');
 }
 
 function writeJsonObjectFs(path: string, value: Record<string, unknown>): void {
