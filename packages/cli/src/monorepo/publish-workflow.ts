@@ -614,7 +614,14 @@ function yamlLinesForStep(step: PublishWorkflowStep, options: PublishWorkflowDef
         'failure()',
       );
     case PublishWorkflowStepKind.ValidateMonorepoConfig:
-      return conditionalRunStep(step, 'smoo monorepo validate');
+      // Scoped to the release's candidates: the build phase and the packed-package
+      // checks cover what ships. Unscoped, validate compiled every project - on a
+      // release touching no Rust that was 3m30 of the cowshed CLI on the critical
+      // path, for a binary the release did not contain.
+      return conditionalRunStep(
+        step,
+        `smoo monorepo validate --projects "${githubExpression('steps.version.outputs.projects')}"`,
+      );
     case PublishWorkflowStepKind.TagRelease:
       return tagReleaseStepLines(step.name);
     case PublishWorkflowStepKind.PublishRelease:

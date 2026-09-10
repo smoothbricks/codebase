@@ -89,15 +89,24 @@ function buildProgram(): Command {
     .option('--fail-fast', 'stop after the first failing validation pack')
     .option('--only-if-new-workspace-package', 'skip validation unless a new workspace package manifest is staged')
     .option('--verbose', 'print validation progress and successful checks')
+    .option(
+      '--projects <names>',
+      'comma-separated Nx project names to build and pack-validate (a release selection); default: every project',
+    )
     .action(
       async (options: {
         fix?: boolean;
         failFast?: boolean;
         onlyIfNewWorkspacePackage?: boolean;
         verbose?: boolean;
+        projects?: string;
       }) => {
         const { validateMonorepo } = await import('./monorepo/index.js');
-        await validateMonorepo(await findRepoRoot(), options);
+        const projects = options.projects
+          ?.split(',')
+          .map((name) => name.trim())
+          .filter((name) => name.length > 0);
+        await validateMonorepo(await findRepoRoot(), { ...options, projects });
       },
     );
   monorepo.command('update').action(async () => {

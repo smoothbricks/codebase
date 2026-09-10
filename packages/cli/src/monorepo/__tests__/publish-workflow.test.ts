@@ -38,6 +38,9 @@ const codebaseWorkflowOptions: PublishWorkflowDefinitionOptions = {
 describe('publish workflow definition', () => {
   it('renders the checked-in local publish workflow copy', async () => {
     const rendered = renderPublishWorkflowYaml(codebaseWorkflowOptions);
+    // validate builds and pack-checks the release's candidates, not every project:
+    // unscoped it compiled binaries the release did not contain.
+    expect(rendered).toContain('smoo monorepo validate --projects "${{ steps.version.outputs.projects }}"');
     const packageRoot = join(import.meta.dir, '..', '..', '..');
     await expect(readFile(join(packageRoot, '..', '..', '.github/workflows/publish.yml'), 'utf8')).resolves.toBe(
       rendered,
