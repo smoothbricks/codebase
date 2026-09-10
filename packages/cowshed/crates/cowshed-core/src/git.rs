@@ -2,7 +2,7 @@ use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Output;
 
@@ -97,6 +97,38 @@ pub struct CowshedUpstream {
 /// root. Inside the image, so it is on the workspace's own volume and gone before the mount is
 /// published; under `.cowshed/` because that subtree is already cowshed's and not the repository's.
 const WORKTREE_STAGING: &str = ".cowshed/worktree-staging";
+
+/// Private identity-only global Git config for one workspace, never shared .git state.
+pub const WORKSPACE_GIT_IDENTITY_CONFIG_PATH: &str = ".cowshed/git-identity.inc";
+
+/// The workspace's private identity config, when the controller has published one.
+///
+/// A sandboxed child loads exactly this file as `GIT_CONFIG_GLOBAL`, so the answer is what
+/// decides whether `git commit` in a workspace has an author at all. A workspace minted before
+/// identity capture existed simply has none and keeps the empty device.
+///
+/// Anything at that path which is not a regular file is refused by name instead of loaded. The
+/// controller publishes one regular 0600 file there and the child's profile denies writing it,
+/// so a symlink or device at that name is tampering, and pointing Git's global configuration at
+/// it would be the one place the workspace boundary leaks.
+pub fn workspace_git_identity_config(mount: &Path) -> Result<Option<PathBuf>> {
+    let path = mount.join(WORKSPACE_GIT_IDENTITY_CONFIG_PATH);
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.file_type().is_file() => Ok(Some(path)),
+        Ok(_) => Err(CowshedError::integrity(
+            format!(
+                "workspace Git identity config is not a regular file: {}",
+                path.display()
+            ),
+            format!("remove {WORKSPACE_GIT_IDENTITY_CONFIG_PATH} in the workspace, then reattach"),
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(CowshedError::internal(format!(
+            "inspect workspace Git identity config at {}: {error}",
+            path.display()
+        ))),
+    }
+}
 
 const WORKSPACE_ENVIRONMENT_MARKER: &[u8] = b"# cowshed: workspace environment";
 const LOCAL_ENVIRONMENT_LOADER: &[u8] = b"source_env_if_exists \"$local_override\"";
@@ -385,6 +417,159 @@ impl GitRepository {
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// Snapshot only effective Git identity from the source checkout into a private global config.
+    ///
+    /// Git resolves includes and repository/worktree overrides in the source context. A fork uses
+    /// its source's inherited global identity instead of the controller's global config. The
+    /// destination later loads this as GIT_CONFIG_GLOBAL, below its own repository-local config;
+    /// nothing is written to either repository's .git, including a linked worktree's shared config.
+    pub async fn inherit_identity_from(&self, source_root: &Path) -> Result<()> {
+        let root = self.root.clone();
+        let source_root = source_root.to_owned();
+        tokio::task::spawn_blocking(move || {
+            let io_error = |operation: &str, path: &Path, error: std::io::Error| {
+                CowshedError::internal(format!("{operation} at {}: {error}", path.display()))
+            };
+            let source_root = fs::canonicalize(&source_root)
+                .map_err(|error| io_error("resolve Git identity source", &source_root, error))?;
+            let inherited = source_root.join(WORKSPACE_GIT_IDENTITY_CONFIG_PATH);
+            let inherited = match fs::symlink_metadata(&inherited) {
+                Ok(_) => Some(fs::canonicalize(&inherited).map_err(|error| {
+                    io_error("resolve source Git identity config", &inherited, error)
+                })?),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => {
+                    return Err(io_error(
+                        "inspect source Git identity config",
+                        &inherited,
+                        error,
+                    ));
+                }
+            };
+            let mut identity = Vec::with_capacity(6);
+            for key in [
+                "user.name",
+                "user.email",
+                "author.name",
+                "author.email",
+                "committer.name",
+                "committer.email",
+            ] {
+                let mut command = git_command_at(&source_root);
+                command.args(["config", "--includes", "--null", "--get", key]);
+                if let Some(inherited) = &inherited {
+                    command.env("GIT_CONFIG_GLOBAL", inherited);
+                }
+                let output = command.output().map_err(|error| git_spawn_error(&error))?;
+                if output.status.code() == Some(1) {
+                    continue; // git-config's documented absent-key status, not an empty value.
+                }
+                if !output.status.success() {
+                    return Err(git_internal(
+                        &format!("read source Git identity {key}"),
+                        &output,
+                    ));
+                }
+                let mut value = output.stdout;
+                if value.pop() != Some(0) || value.contains(&0) {
+                    return Err(CowshedError::internal(format!(
+                        "invalid NUL-delimited source Git identity value for {key}"
+                    )));
+                }
+                identity.push((key, OsString::from_vec(value)));
+            }
+
+            let root = fs::canonicalize(&root)
+                .map_err(|error| io_error("resolve Git identity destination", &root, error))?;
+            let path = root.join(WORKSPACE_GIT_IDENTITY_CONFIG_PATH);
+            let directory = path.parent().expect("identity config has a parent");
+            match fs::symlink_metadata(directory) {
+                Ok(metadata) if metadata.file_type().is_dir() => {}
+                Ok(_) => {
+                    return Err(CowshedError::integrity(
+                        format!(
+                            "Git identity directory is not a real directory: {}",
+                            directory.display()
+                        ),
+                        "replace the workspace's .cowshed symlink or non-directory, then retry",
+                    ));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    fs::DirBuilder::new()
+                        .mode(0o700)
+                        .create(directory)
+                        .map_err(|error| {
+                            io_error("create Git identity directory", directory, error)
+                        })?;
+                    crate::fsio::sync_directory(&root)
+                        .map_err(|error| io_error("sync Git identity parent", &root, error))?;
+                }
+                Err(error) => {
+                    return Err(io_error("inspect Git identity directory", directory, error));
+                }
+            }
+
+            // A newly created private directory cannot contain inherited links or Git lockfiles.
+            // Let Git quote values, then use the maintained private-file publisher for the final
+            // rename; replacing a copied final-component symlink never writes through its target.
+            let staging = directory.join(crate::fsio::temp_name(
+                OsStr::new("git-identity.inc"),
+                uuid::Uuid::new_v4().simple(),
+            ));
+            fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&staging)
+                .map_err(|error| {
+                    io_error("create Git identity staging directory", &staging, error)
+                })?;
+            let result = (|| -> Result<()> {
+                let draft = staging.join("config");
+                OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(&draft)
+                    .map_err(|error| io_error("create Git identity draft", &draft, error))?;
+                for (key, value) in identity {
+                    let output = git_command_at(&source_root)
+                        .args([
+                            OsStr::new("config"),
+                            OsStr::new("--file"),
+                            draft.as_os_str(),
+                            OsStr::new(key),
+                            value.as_os_str(),
+                        ])
+                        .output()
+                        .map_err(|error| git_spawn_error(&error))?;
+                    if !output.status.success() {
+                        return Err(git_internal("encode inherited Git identity", &output));
+                    }
+                }
+                let bytes = fs::read(&draft)
+                    .map_err(|error| io_error("read Git identity draft", &draft, error))?;
+                crate::metadata::write_atomic_bytes(&path, &bytes).map_err(|error| {
+                    CowshedError::internal(format!(
+                        "publish Git identity at {}: {error}",
+                        path.display()
+                    ))
+                })
+            })();
+            let cleanup = fs::remove_dir_all(&staging).map_err(|error| {
+                io_error("remove Git identity staging directory", &staging, error)
+            });
+            match (result, cleanup) {
+                (Ok(()), result) | (result, Ok(())) => result,
+                (Err(error), Err(cleanup)) => {
+                    Err(CowshedError::internal(format!("{error}; {cleanup}")))
+                }
+            }
+        })
+        .await
+        .map_err(|error| {
+            CowshedError::internal(format!("inherit Git identity task failed: {error}"))
+        })?
     }
 
     /// Return the first in-progress repository operation, if any.
