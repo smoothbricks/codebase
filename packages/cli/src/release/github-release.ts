@@ -36,10 +36,7 @@ export interface GithubReleaseWriteShell {
 
 export async function renderNxProjectChangelogContents(input: RenderNxProjectChangelogInput): Promise<string> {
   return withNxWorkspaceRoot(input.root, async () => {
-    const { createAPI } = await importWorkspaceNx<typeof import('nx/src/command-line/release/changelog.js')>(
-      input.root,
-      'src/command-line/release/changelog.js',
-    );
+    const { createAPI } = await importWorkspaceNx(input.root, 'src/command-line/release/changelog.js');
     const result = await createAPI(
       nxRenderOnlyReleaseConfig,
       false,
@@ -139,16 +136,25 @@ function isPrereleaseVersion(version: string): boolean {
  * workspace resolves from that workspace's root, exactly as `nx` on its PATH
  * would.
  */
-export async function importWorkspaceNx<T>(root: string, subpath: string): Promise<T> {
+interface WorkspaceNxModules {
+  'src/utils/workspace-root.js': typeof import('nx/src/utils/workspace-root.js');
+  'src/command-line/release/version.js': typeof import('nx/src/command-line/release/version.js');
+  'src/command-line/release/changelog.js': typeof import('nx/src/command-line/release/changelog.js');
+}
+
+export async function importWorkspaceNx<Subpath extends keyof WorkspaceNxModules>(
+  root: string,
+  subpath: Subpath,
+): Promise<WorkspaceNxModules[Subpath]> {
   const resolved = createRequire(join(root, 'package.json')).resolve(`nx/${subpath}`);
-  return (await import(pathToFileURL(resolved).href)) as T;
+  // A dynamic specifier types as `any`; the map above is the declared shape of
+  // the module the workspace's Nx serves at that subpath.
+  const module: WorkspaceNxModules[Subpath] = await import(pathToFileURL(resolved).href);
+  return module;
 }
 
 export async function withNxWorkspaceRoot<T>(root: string, run: () => Promise<T>): Promise<T> {
-  const workspaceRootModule = await importWorkspaceNx<typeof import('nx/src/utils/workspace-root.js')>(
-    root,
-    'src/utils/workspace-root.js',
-  );
+  const workspaceRootModule = await importWorkspaceNx(root, 'src/utils/workspace-root.js');
   const previousWorkspaceRoot = workspaceRootModule.workspaceRoot;
   const previousEnvWorkspaceRoot = process.env.NX_WORKSPACE_ROOT_PATH;
   const previousCwd = process.cwd();

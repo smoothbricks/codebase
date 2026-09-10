@@ -882,13 +882,8 @@ async function runNxReleaseVersion(
 
 async function runNxReleaseVersionPreview(root: string, projects: string, bump: string): Promise<ReleasePackage[]> {
   return withNxWorkspaceRoot(root, async () => {
-    const { createAPI } = await importWorkspaceNx<typeof import('nx/src/command-line/release/version.js')>(
-      root,
-      'src/command-line/release/version.js',
-    );
-    const { createAPI: createChangelogAPI } = await importWorkspaceNx<
-      typeof import('nx/src/command-line/release/changelog.js')
-    >(root, 'src/command-line/release/changelog.js');
+    const { createAPI } = await importWorkspaceNx(root, 'src/command-line/release/version.js');
+    const { createAPI: createChangelogAPI } = await importWorkspaceNx(root, 'src/command-line/release/changelog.js');
     const projectNames = projects.split(',').filter(Boolean);
     const result = await createAPI(
       {},
