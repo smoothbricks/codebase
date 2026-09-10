@@ -1558,6 +1558,86 @@ fn struct_scatter_array_destination_is_invalid_program() {
     );
 }
 
+/// A route table larger than the decode arrays refuses at the boundary —
+/// the same admission contract for both scatter forms (92 §4: reject at
+/// sizing, never overflow later).
+#[test]
+fn struct_scatter_over_capacity_route_table_is_invalid_program() {
+    const T: u32 = 2113;
+    let prog = build_struct_map_scatter_program(T);
+    let mut state = init(&prog);
+    let mut vm = Vm::default();
+
+    // The declared count must be validated against MAX_SCATTER_ROUTES, not
+    // left to index past the decode arrays; the table itself is junk rows of
+    // route 0 so only the count check can refuse.
+    let mut scatter = vec![0x3eu8, 2, 3, 4, 33];
+    let route = [0u8, 0, 0, 5];
+    for _ in 0..33 {
+        scatter.extend_from_slice(&route);
+    }
+    let mut flat_map = vec![0xE1, 1, 0xFF];
+    flat_map.extend((scatter.len() as u16).to_le_bytes());
+    flat_map.extend(scatter);
+    let mut reduce = vec![0xE0, 0, 1];
+    reduce.extend(T.to_le_bytes());
+    reduce.extend((flat_map.len() as u16).to_le_bytes());
+    reduce.extend(&flat_map);
+    let mut full_init = Vec::new();
+    full_init.extend(slot_struct_map(0, 6, 4, &[4, 4, 2]));
+    full_init.extend(slot_def(1, 1, 4, 0));
+    full_init.extend(slot_def(2, 1, 4, 0));
+    let full = program(3, 8, &full_init, &reduce);
+    let element = [ScatterElement {
+        route: 0,
+        op_retract: 0,
+        key: 600,
+        v_str: 7001,
+        v_num: 0.0,
+        v_set: 0,
+    }];
+    assert_eq!(
+        ErrorCode::InvalidProgram as u32,
+        run_struct_scatter(&mut vm, &mut state, &full, T, &element)
+    );
+}
+
+/// The probe scatter carries the same route-table admission bound (the
+/// pre-existing class this const closes for both forms).
+#[test]
+fn probe_scatter_over_capacity_route_table_is_invalid_program() {
+    // Rebuild the 0x2f parity program with 33 declared routes.
+    let mut probe_init = Vec::new();
+    probe_init.extend(slot_struct_map(0, 6, 4, &[0, 0, 0, 4, 2, 4]));
+    probe_init.extend(slot_struct_map(1, 6, 4, &[4, 4, 2]));
+    probe_init.extend(slot_def(2, 1, 4, 0));
+    probe_init.extend(slot_def(3, 1, 4, 0));
+    let mut scatter = vec![0x2fu8, 0, 2, 0, 0, 1, 33];
+    let route = [0u8, 1, 0, 2, 3];
+    for _ in 0..33 {
+        scatter.extend_from_slice(&route);
+    }
+    let mut flat_map = vec![0xE1, 1, 0xFF];
+    flat_map.extend((scatter.len() as u16).to_le_bytes());
+    flat_map.extend(scatter);
+    let mut reduce = vec![0xE0, 0, 1];
+    reduce.extend(2100u32.to_le_bytes());
+    reduce.extend((flat_map.len() as u16).to_le_bytes());
+    reduce.extend(&flat_map);
+    let prog = program(4, 3, &probe_init, &reduce);
+    let mut state = init(&prog);
+    let mut vm = Vm::default();
+    let cols: Vec<&[u8]> = vec![
+        u32s_as_bytes(&[2100u32]),
+        u32s_as_bytes(&[0u32, 1]),
+        u32s_as_bytes(&[10u32]),
+    ];
+    assert_eq!(
+        ErrorCode::InvalidProgram as u32,
+        vm.execute_batch(&mut state, &prog, &cols, 1)
+    );
+}
+
 /// Sentinel destination keys are never written (the same guard the keyed
 /// struct-map upserts carry).
 #[test]

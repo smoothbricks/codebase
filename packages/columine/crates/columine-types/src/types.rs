@@ -78,6 +78,12 @@ impl ProgramHeader {
 
 pub const EMPTY_KEY: u32 = u32::MAX;
 pub const TOMBSTONE: u32 = u32::MAX - 1;
+/// Route-table capacity of the struct-map scatters (`0x2f`, `0x3e`). The VM
+/// decodes each route table into fixed 32-entry arrays, so a program declaring
+/// more routes than this refuses `INVALID_PROGRAM` at decode instead of
+/// indexing past the decode arrays at execution. A program emitter enforces the
+/// same bound from this number; both sides name it once.
+pub const MAX_SCATTER_ROUTES: usize = 32;
 /// Empty and tombstone markers for the collision-free derived-fact identity
 /// lane. Valid identities only use the low 48 bits (`fact_idx:u16`, `key:u32`),
 /// so both sentinels are outside the valid domain and cannot alias a fact.
