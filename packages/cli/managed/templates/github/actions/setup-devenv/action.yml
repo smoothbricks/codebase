@@ -101,10 +101,17 @@ runs:
     # Actions cache segment below is the ephemeral runners' substitute for this.
     # Scoped per job as well as lane: two jobs of one run are parallel, and one
     # eval-cache.db has one writer.
+    #
+    # The eval cache keys on canonical absolute paths, and act's host executor
+    # checks out under <cache>/<random 8 chars>/hostexecutor - a new path every
+    # job by design (act/runner/run_context.go: MustRandName), so a restored
+    # cache could never match. The workspace is therefore bind-mounted at a
+    # stable path (a symlink would not do: Nix canonicalises) and devenv is
+    # evaluated from there; every later step still runs in the checkout, which
+    # is the same tree. DEVENV_WORKDIR names the path the devenv steps use.
     - name: 📂 Locate devenv state on the shared bind
       if: steps.runner-kind.outputs.host == 'true'
       shell: bash
-      working-directory: tooling/direnv
       env:
         DEVENV_STATE_REPO: ${{ github.repository }}
         DEVENV_STATE_LANE: ${{ github.workflow }}
@@ -112,11 +119,18 @@ runs:
       run: |
         lane=$(printf '%s' "$DEVENV_STATE_LANE" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9._-' '-')
         root="/var/cache/ci/devenv/$DEVENV_STATE_REPO/${lane:-default}/$DEVENV_STATE_JOB"
-        mkdir -p "$root/.devenv" "$root/.direnv"
-        rm -rf .devenv .direnv
-        ln -s "$root/.devenv" .devenv
-        ln -s "$root/.direnv" .direnv
-        echo "devenv state: $root"
+        mkdir -p "$root/.devenv" "$root/.direnv" "$root/workspace"
+        sudo mount --bind "$GITHUB_WORKSPACE" "$root/workspace"
+        rm -rf tooling/direnv/.devenv tooling/direnv/.direnv
+        ln -s "$root/.devenv" tooling/direnv/.devenv
+        ln -s "$root/.direnv" tooling/direnv/.direnv
+        echo "DEVENV_WORKDIR=$root/workspace" >> "$GITHUB_ENV"
+        echo "devenv state: $root (workspace bind-mounted at $root/workspace)"
+
+    - name: 📂 Devenv runs in the checkout
+      if: steps.runner-kind.outputs.host != 'true'
+      shell: bash
+      run: echo "DEVENV_WORKDIR=$GITHUB_WORKSPACE" >> "$GITHUB_ENV"
 
     # Devenv segment (own key): tooling/direnv/.devenv + .direnv — includes
     # nix-eval-cache.db. Independent of the store cache; restored on ephemeral
@@ -193,7 +207,7 @@ runs:
     # until the check existed.
     - name: 🧰 Install devenv
       shell: bash
-      working-directory: tooling/direnv
+      working-directory: ${{ env.DEVENV_WORKDIR }}/tooling/direnv
       env:
         SMOO_HOST_RUNNER: ${{ steps.runner-kind.outputs.host }}
       run: ./github-actions-bootstrap.sh install-devenv
@@ -210,5 +224,5 @@ runs:
 
     - name: 🐚 Build devenv shell
       shell: bash
-      working-directory: tooling/direnv
+      working-directory: ${{ env.DEVENV_WORKDIR }}/tooling/direnv
       run: ./github-actions-bootstrap.sh build-shell
