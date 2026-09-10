@@ -428,12 +428,48 @@ that runs after Validate and the e2e job succeed on a push to the staging push b
 stage-derived — carry `stage-deploy-target` or deploy through `smoo wrangler deploy-stage` — otherwise `--select-tag`
 finds nothing and the job logs `No run-many deploy projects; skipping production.`
 
-Tag a project `late-deploy-target` when its deploy calls into what the rest of its stage deploys — a site that signs in
-to its stage's backend, for example. `smoo github-ci nx-deploy` then deploys it in a second `nx run-many`, started only
-after every other selected project deployed successfully. The tag orders; it never selects: the project must still
-qualify through the stage rules, and a run with no late projects, or only late ones, keeps a single round. There are
-only two rounds: several late projects deploy together in the second one, so a late project cannot wait for another late
-project.
+#### Ordering one deploy after another
+
+When a project's deploy calls into what another project deploys — a site that signs in to its stage's backend — say so
+with an ordinary Nx edge on the deploying project:
+
+```json
+{ "nx": { "targets": { "deploy": { "dependsOn": ["...", "app-backend:deploy"] } } } }
+```
+
+Nx then orders it, at any depth: `site:deploy` after `app-backend:deploy` after `db:deploy` all resolve inside the one
+`nx run-many` that `smoo github-ci nx-deploy` already issues, and `nx deploy site --stage=…` run by hand gets the same
+order. Keep the leading `"..."`: it expands the `deploy-build` edge the plugin infers (below), which a bare list would
+drop.
+
+What makes the edge safe is that a deploy is never cached and always cheap when there is nothing to do:
+
+- `@smoothbricks/nx-plugin` gives every declared `deploy` target `cache: false`. An Nx cache hit on a deploy means "we
+  once uploaded this hash", which a rollback silently falsifies — the workspace is unchanged, so the hash is unchanged,
+  so a cached deploy would report success while the previous version keeps serving.
+- `smoo wrangler deploy-stage` reads live state first. If the version tagged with this task's hash is already the one
+  serving 100% of traffic, it returns `remote-cache-hit` after two API calls: no upload, no migration, no traffic shift.
+- The expensive, purely file-derived half belongs in a sibling `deploy-build` target (build the artifact, register it,
+  refresh what the build needs). The plugin gives that one `cache: true` and makes `deploy` depend on it, so a redundant
+  deploy costs two API calls rather than a rebuild.
+- A deploy does not finish when Cloudflare accepts the traffic shift; it finishes when the new version is the one being
+  served. `deploy-stage` polls `wrangler deployments status` until the tag it activated is live, and fails with what it
+  expected and what it saw if that never happens. Pass `--version-endpoint <url>` to also require an endpoint served by
+  the worker — whose trimmed response body is the running version tag — to answer with it. Without that wait, an edge
+  onto a deploy orders nothing: the step returns while the edge still serves the old code.
+
+**The policy caveat, plainly.** A cross-project edge is part of the graph, not of the selection: a run that selects only
+the dependent project will still evaluate the dependency's `deploy`. When the dependency is already at that hash, that
+evaluation is a no-op — two API calls. But it is not inert: if the dependency is intentionally behind (its production
+deploy is being held back, say), a run that selects only the dependent project **will advance the dependency to the hash
+the current workspace produces**. If you need a project to be deployable without touching what it depends on, do not add
+the edge; sequence those two deploys as separate CI jobs instead.
+
+`smoo wrangler deployed-version --stage <stage>` prints the tag serving all traffic for the project's worker on that
+stage, so an operator can check the same fact the deploy checks. It caches its answer briefly under Nx's workspace data
+directory; that cache is a convenience for repeated queries only. Nothing that decides whether to deploy reads it, and
+it refuses — rather than answering `unknown` — without credentials, on an API error, or while traffic is split between
+two versions.
 
 Pushes to the staging push branch queue behind a running workflow instead of canceling it, so a newer push never cancels
 a production deployment mid-flight. Pull requests and other branches keep canceling superseded runs. The e2e and
