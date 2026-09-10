@@ -108,6 +108,12 @@ from an unsandboxed host-controller shell: its exception lane also exercises rea
 DiskManagement. Run the explicit `host-controller-test` target separately. Both are mandatory proofs; an ignored
 controller fixture in the ordinary chain is never evidence that its behavior passed.
 
+The ordinary core lane also covers port allocation's publication handoff. A deterministic regression snapshots native
+inventory, lets another allocator reserve a block, publishes its workspace metadata, and releases its reservation before
+the stale allocator resumes. The stale allocator must claim then re-read current inventory under its reservation guard,
+reject the now published block, and choose another. Inventory errors must release the newly claimed marker; successful
+reservations remain held until their owner's publication finishes.
+
 ## Property tests (proptest, pure, all platforms)
 
 Invariants the table-driven unit cases only sample. Each is a pure function over generated inputs:
