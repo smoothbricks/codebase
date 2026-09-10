@@ -4,7 +4,7 @@ import { mkdir, rmdir, stat } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import path from 'node:path';
 import { $ } from 'bun';
-import { resolveSecretEnvironment } from './secret-references.ts';
+import { maskSecretValues, resolveSecretEnvironment } from './secret-references.ts';
 
 // DEVENV_ROOT is set by the devenv shell, which is how this script normally
 // runs. CI jobs that install dependencies without building that shell (the
@@ -23,6 +23,14 @@ class CapturedCommandError extends Error {
     super(`${command} failed with exit code ${exitCode}`);
   }
 }
+
+// Every value resolved out of smoo.secrets below. The install inherits them,
+// so whatever a failing child echoed is redacted before its captured output
+// is replayed. Declared above the first replay site (resolveProjectRoot's own
+// failure) because module consts are not hoisted: a reference from there to a
+// const declared further down would report a temporal-dead-zone error instead
+// of the failure it was called to report.
+const resolvedSecretValues: string[] = [];
 
 async function resolveProjectRoot(): Promise<string> {
   if (devenvRoot) {
@@ -73,6 +81,7 @@ try {
   // the point: this script must never act as a global shell export.
   for (const [name, value] of Object.entries(await resolveSecretEnvironment({ root: projectRoot }))) {
     process.env[name] = value;
+    resolvedSecretValues.push(value);
   }
 
   // Bootstrap only: install deps + wire local git hooks/config.
@@ -389,10 +398,15 @@ function replayCapturedOutput(error: unknown): void {
   if (!(error instanceof CapturedCommandError)) {
     return;
   }
-  if (error.stdout.length > 0) {
-    process.stdout.write(error.stdout);
+  // The install ran with every resolved secret in its environment, so its
+  // output is redacted before replay. Masking is same-length, which keeps the
+  // failure this replay exists to show intact.
+  const stdout = maskSecretValues(error.stdout, resolvedSecretValues);
+  const stderr = maskSecretValues(error.stderr, resolvedSecretValues);
+  if (stdout.length > 0) {
+    process.stdout.write(stdout);
   }
-  if (error.stderr.length > 0) {
-    process.stderr.write(error.stderr);
+  if (stderr.length > 0) {
+    process.stderr.write(stderr);
   }
 }

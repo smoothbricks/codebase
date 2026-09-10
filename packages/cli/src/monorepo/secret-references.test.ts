@@ -387,3 +387,71 @@ describe('resolveSecretEnvironment', () => {
     }
   });
 });
+
+/**
+ * Redaction is a byte operation on output the caller already captured, so the
+ * harness carries both directions as base64: a text-only round trip would
+ * hide exactly the invalid-UTF-8 bytes a failing install can emit.
+ */
+const MASK_SCRIPT = `
+const resolver = await import(Bun.argv[1]);
+const { output, values } = JSON.parse(Bun.argv[2]);
+const captured = Buffer.from(output, 'base64');
+const masked = resolver.maskSecretValues(captured, values);
+process.stdout.write(JSON.stringify({
+  masked: Buffer.from(masked).toString('base64'),
+  captured: captured.toString('base64'),
+}));
+`;
+
+describe('maskSecretValues', () => {
+  const mask = async (output: Uint8Array, values: readonly string[]): Promise<{ masked: Buffer; captured: Buffer }> => {
+    const { stdout, stderr, exitCode } = await runInBootstrap(
+      MASK_SCRIPT,
+      JSON.stringify({ output: Buffer.from(output).toString('base64'), values }),
+    );
+    expect(stderr).toBe('');
+    expect(exitCode).toBe(0);
+    const value: unknown = JSON.parse(stdout);
+    if (
+      typeof value !== 'object' ||
+      value === null ||
+      !('masked' in value) ||
+      typeof value.masked !== 'string' ||
+      !('captured' in value) ||
+      typeof value.captured !== 'string'
+    ) {
+      throw new Error(`bootstrap harness returned a malformed envelope: ${stdout}`);
+    }
+    return { masked: Buffer.from(value.masked, 'base64'), captured: Buffer.from(value.captured, 'base64') };
+  };
+
+  it('replaces every occurrence and leaves the surrounding failure legible', async () => {
+    const output = Buffer.from('error: 401 for https://x:hunter2@registry/pkg\nretrying with hunter2\n');
+    const { masked, captured } = await mask(output, ['hunter2']);
+    expect(masked.toString()).toBe('error: 401 for https://x:*******@registry/pkg\nretrying with *******\n');
+    expect(masked.length).toBe(output.length);
+    // The caller keeps its captured bytes: redaction returns a copy, and a
+    // node Buffer's `slice` would have handed back a view of these.
+    expect(captured.toString()).toBe(output.toString());
+  });
+
+  it('redacts each declared value even when one is a prefix of another', async () => {
+    expect((await mask(Buffer.from('AB ABCD AB'), ['ABCD', 'AB'])).masked.toString()).toBe('** **** **');
+  });
+
+  it('survives a false start on the first byte', async () => {
+    expect((await mask(Buffer.from('aab aaab'), ['aab'])).masked.toString()).toBe('*** a***');
+  });
+
+  it('masks whole bytes and carries invalid UTF-8 through untouched', async () => {
+    const output = Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from('kå'), Buffer.from([0x00])]);
+    const { masked } = await mask(output, ['kå']);
+    expect([...masked]).toEqual([0xff, 0xfe, 0x2a, 0x2a, 0x2a, 0x00]);
+  });
+
+  it('leaves output alone when nothing is declared or a value is empty', async () => {
+    expect((await mask(Buffer.from('nothing to hide'), [])).masked.toString()).toBe('nothing to hide');
+    expect((await mask(Buffer.from('nothing to hide'), [''])).masked.toString()).toBe('nothing to hide');
+  });
+});
