@@ -4,7 +4,7 @@ import { appendFile } from 'node:fs/promises';
 import { PLATFORM_TARGET_GLOBS } from '@smoothbricks/nx-plugin/workspace-config-policy';
 import { $ } from 'bun';
 import typia from 'typia';
-import { isStageDerivedDeploy, PERMANENT_DEPLOY_TAG, STAGING_DEPLOY_TAG } from '../lib/deploy-tags.js';
+import { isStageDerivedDeploy, LATE_DEPLOY_TAG, PERMANENT_DEPLOY_TAG, STAGING_DEPLOY_TAG } from '../lib/deploy-tags.js';
 import {
   ciPushBranches,
   isNonEmpty,
@@ -335,6 +335,12 @@ export interface GithubCiNxDeployOptions {
   selectTag?: string;
 }
 
+/** A project `nx-deploy` will deploy, and whether it waits for the rest of the selection (LATE_DEPLOY_TAG). */
+export interface DeployProject {
+  name: string;
+  late: boolean;
+}
+
 export interface GithubCiNxDeployDependencies {
   listProjects?: (
     root: string,
@@ -342,7 +348,7 @@ export interface GithubCiNxDeployDependencies {
     mode: 'affected' | 'run-many',
     stage: DeploymentStage,
     selectTag?: string,
-  ) => Promise<string[]>;
+  ) => Promise<DeployProject[]>;
   runNx?: (args: string[], root: string) => Promise<number>;
   appendSummary?: (summaryPath: string, content: string) => Promise<void>;
   appendOutput?: (outputPath: string, content: string) => Promise<void>;
@@ -387,24 +393,28 @@ export async function githubCiNxDeploy(
     : undefined;
   await setStatus('pending');
 
-  const projectList = projects.join(',');
   const targets = options.verify === true ? ['build', 'lint', 'test', 'deploy'] : ['deploy'];
+  const names = projects.map((project) => project.name);
   for (const target of targets) {
-    const nxArgs = [
-      'run-many',
-      '-t',
-      target,
-      `--projects=${projectList}`,
-      `--exclude=${deployExclusions(stage)}`,
-      `--parallel=${NX_PARALLEL}`,
-    ];
-    if (target === 'deploy') {
-      nxArgs.push(`--stage=${stage}`);
-    }
-    const status = await runNx(nxArgs, root);
-    if (status !== 0) {
-      await setStatus('failure');
-      throw new Error(`nx ${nxArgs.join(' ')} failed with exit code ${status}`);
+    // Build, lint and test run over the whole selection at once; only the deploy waits for its late round.
+    const rounds = target === 'deploy' ? deployRounds(projects) : [names];
+    for (const round of rounds) {
+      const nxArgs = [
+        'run-many',
+        '-t',
+        target,
+        `--projects=${round.join(',')}`,
+        `--exclude=${deployExclusions(stage)}`,
+        `--parallel=${NX_PARALLEL}`,
+      ];
+      if (target === 'deploy') {
+        nxArgs.push(`--stage=${stage}`);
+      }
+      const status = await runNx(nxArgs, root);
+      if (status !== 0) {
+        await setStatus('failure');
+        throw new Error(`nx ${nxArgs.join(' ')} failed with exit code ${status}`);
+      }
     }
   }
 
@@ -546,7 +556,7 @@ async function listNxProjectsWithTarget(
   mode: 'affected' | 'run-many',
   stage: DeploymentStage,
   selectTag?: string,
-): Promise<string[]> {
+): Promise<DeployProject[]> {
   const listArgs = ['show', 'projects'];
   if (mode === 'affected') listArgs.push('--affected');
   listArgs.push('--withTarget', target);
@@ -555,7 +565,7 @@ async function listNxProjectsWithTarget(
   const candidates = nxProjectList(await runText('nx', listArgs, root)).sort((left, right) =>
     left.localeCompare(right),
   );
-  if (target !== 'deploy') return candidates;
+  if (target !== 'deploy') return candidates.map((name) => ({ name, late: false }));
   return selectStageDeployProjects(candidates, stage, selectTag, async (project) => {
     const parsed = parseNxProjectDeployTarget(await runText('nx', ['show', 'project', project, '--json'], root));
     if (!parsed) throw new Error(`nx show project ${project} returned invalid JSON.`);
@@ -568,8 +578,8 @@ export async function selectStageDeployProjects(
   stage: DeploymentStage,
   requireTag: string | undefined,
   loadProject: (project: string) => Promise<unknown>,
-): Promise<string[]> {
-  const selected: string[] = [];
+): Promise<DeployProject[]> {
+  const selected: DeployProject[] = [];
   for (const project of candidates) {
     const definition = await loadProject(project);
     if (!isNxProjectDeployTarget(definition)) continue;
@@ -583,10 +593,20 @@ export async function selectStageDeployProjects(
     // A required tag narrows the stage rules; it never selects a project they exclude.
     if (requireTag && !tags.includes(requireTag)) continue;
     if (isStageDerived || (stage === 'staging' && isStagingOnly)) {
-      selected.push(project);
+      selected.push({ name: project, late: tags.includes(LATE_DEPLOY_TAG) });
     }
   }
   return selected;
+}
+
+/** The deploy's `nx run-many` rounds: everything else first, then the late projects; an empty round is dropped. */
+export function deployRounds(projects: DeployProject[]): string[][] {
+  const early: string[] = [];
+  const late: string[] = [];
+  for (const project of projects) {
+    (project.late ? late : early).push(project.name);
+  }
+  return [early, late].filter((round) => round.length > 0);
 }
 
 export interface GithubApiProcessResult {
