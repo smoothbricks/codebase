@@ -23,6 +23,7 @@ pub mod secrets;
 pub mod storage;
 pub mod workspace_credentials;
 pub mod workspace_environment;
+pub mod workspace_git_fetch;
 
 pub use error::{CowshedError, ErrorCode, Result};
 pub use gateway_inventory::{

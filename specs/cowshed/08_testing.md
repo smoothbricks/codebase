@@ -99,6 +99,11 @@ denial. It pins `TMPDIR` to a unique disposable directory under the exact owned 
 afterward. Fixtures use only disposable local data: no launchd calls, installed host-service changes, or checkout source
 mutation.
 
+Git discovery fixtures exercise the restricted discovery profile, including denied includes, alternate object stores,
+and worktree metadata grants. The probe executes Git through the system-selected developer directory, not the
+`/usr/bin/git` launcher: the launcher requires xcrun host-cache writes even for read-only operations. Publication
+fixtures provide the existing `.cowshed` directory that workspace creation owns.
+
 No outer sandbox installation or permission change is required for this target: the authority boundary is unchanged.
 Updating the checkout's sandbox source cannot change an already-running outer supervisor; separately testing a changed
 runtime policy requires the controller to install the intended release and start a fresh supervisor. Never broaden
