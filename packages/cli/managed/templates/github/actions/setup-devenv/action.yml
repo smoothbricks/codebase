@@ -200,8 +200,8 @@ runs:
           /nix
           ~/.cache/nix
         # prettier-ignore
-        primary-key: ${{ runner.os }}-${{ runner.arch }}-nix-v5-${{ hashFiles('tooling/direnv/devenv.yaml', 'tooling/direnv/devenv.nix', 'tooling/direnv/devenv.lock') }}
-        restore-prefixes-first-match: ${{ runner.os }}-${{ runner.arch }}-nix-v5-
+        primary-key: ${{ runner.os }}-${{ runner.arch }}-nix-v6-${{ hashFiles('tooling/direnv/devenv.yaml', 'tooling/direnv/devenv.nix', 'tooling/direnv/devenv.lock') }}
+        restore-prefixes-first-match: ${{ runner.os }}-${{ runner.arch }}-nix-v6-
         gc-max-store-size: 1G
 
     - name: ⚡ Enable Cachix
@@ -236,4 +236,6 @@ runs:
     - name: 🐚 Build devenv shell
       shell: bash
       working-directory: ${{ env.DEVENV_WORKDIR }}/tooling/direnv
+      env:
+        SMOO_HOST_RUNNER: ${{ steps.runner-kind.outputs.host }}
       run: ./github-actions-bootstrap.sh build-shell
