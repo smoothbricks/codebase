@@ -223,6 +223,12 @@ const managedFiles: ManagedFile[] = [
   },
   {
     kind: 'raw',
+    source: 'tooling/direnv/toolchain-stamp.ts',
+    target: 'tooling/direnv/toolchain-stamp.ts',
+    executable: true,
+  },
+  {
+    kind: 'raw',
     source: 'tooling/direnv/devenv.smoo.nix',
     target: 'tooling/direnv/devenv.smoo.nix',
   },

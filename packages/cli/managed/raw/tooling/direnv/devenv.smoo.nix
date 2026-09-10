@@ -372,9 +372,11 @@
         esac
       ''}
     '')
-    # Epilogue: the wrapper runs devenv from tooling/direnv, so return the shell
-    # to wherever the caller invoked it. Last, after every project step.
+    # Epilogue, after every project step (a project's own enterShell may resolve
+    # SDKROOT/compilers; the toolchain identity must see the final values). The
+    # stamp logic lives in toolchain-stamp.ts; see its header for why.
     (lib.mkAfter ''
+      bun "$DEVENV_ROOT/toolchain-stamp.ts" || exit $?
       if [ -n "$DEVENV_SHELL_PWD" ]; then
         cd "$DEVENV_SHELL_PWD"
       fi
