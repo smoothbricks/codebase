@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'bun:test';
-import { mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -1475,6 +1475,117 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       await workspace.cleanup();
     }
   });
+
+  it('never caches a declared deploy, and puts its build half in front of it', async () => {
+    const workspace = await createWorkspace();
+    const declared = {
+      deploy: { executor: 'nx:run-commands', options: { command: 'smoo wrangler deploy-stage --stage={args.stage}' } },
+      'deploy-build': { executor: 'nx:run-commands', options: { command: 'bun tooling/build-site.ts' } },
+    };
+    try {
+      await workspace.write('packages/site/package.json', JSON.stringify({ name: 'site', nx: { targets: declared } }));
+      const targets = await inferProjectTargets(workspace, 'packages/site/package.json');
+
+      const deploy = resolveDeclaredOverInferred(targets, declared, 'deploy');
+      // A cache hit on deploy would mean "we once uploaded this hash", which a rollback falsifies
+      // silently; the step has to run and read live state instead.
+      expect(deploy?.cache).toBe(false);
+      expect(deploy?.dependsOn).toEqual(['deploy-build']);
+      expect(resolveDeclaredOverInferred(targets, declared, 'deploy-build')?.cache).toBe(true);
+    } finally {
+      await workspace.cleanup();
+    }
+  });
+
+  it('infers nothing for a project that declares no deploy', async () => {
+    const workspace = await createWorkspace();
+    try {
+      await workspace.write('packages/lib/package.json', '{"name":"plain-lib"}\n');
+      const targets = await inferProjectTargets(workspace, 'packages/lib/package.json');
+
+      expect(Object.keys(targets)).not.toContain('deploy');
+      expect(Object.keys(targets)).not.toContain('deploy-build');
+    } finally {
+      await workspace.cleanup();
+    }
+  });
+
+  it('orders a three-project deploy chain through one run-many', async () => {
+    const workspace = await createWorkspace();
+    const root = workspace.context.workspaceRoot;
+    const repositoryRoot = fileURLToPath(new URL('../../../', import.meta.url));
+    try {
+      await symlink(join(repositoryRoot, 'node_modules'), join(root, 'node_modules'), 'dir');
+      await workspace.write('package.json', '{"name":"chain-workspace","private":true,"workspaces":["packages/*"]}\n');
+      await workspace.write(
+        'nx.json',
+        JSON.stringify({
+          plugins: [fileURLToPath(new URL('../dist/index.js', import.meta.url))],
+          namedInputs: { default: ['{projectRoot}/**/*'] },
+        }),
+      );
+      // c is deepest: a's deploy calls into b's, b's calls into c's. Only the edges are declared;
+      // nothing here says "round one" or "round two", and no project knows the chain's depth.
+      const chain: Record<string, string[]> = { a: ['b:deploy'], b: ['c:deploy'], c: [] };
+      for (const [name, dependsOn] of Object.entries(chain)) {
+        await workspace.write(
+          `packages/${name}/package.json`,
+          JSON.stringify({
+            name,
+            nx: {
+              targets: {
+                deploy: {
+                  executor: 'nx:run-commands',
+                  ...(dependsOn.length > 0 ? { dependsOn: ['...', ...dependsOn] } : {}),
+                  // A real deploy command consumes the stage through `{args.stage}`; this fixture
+                  // records the order and nothing else, so it declines the forwarded flags.
+                  options: {
+                    command: `printf '%s\\n' ${name} >> ${join(root, 'deploy-order.txt')}`,
+                    forwardAllArgs: false,
+                  },
+                },
+              },
+            },
+          }),
+        );
+      }
+      const child = Bun.spawn(
+        [
+          'bun',
+          join(repositoryRoot, 'node_modules/.bin/nx'),
+          'run-many',
+          '-t',
+          'deploy',
+          '--projects=a,b,c',
+          '--parallel=3',
+          '--stage=staging',
+        ],
+        {
+          cwd: root,
+          env: {
+            ...process.env,
+            PATH: `${join(repositoryRoot, 'node_modules/.bin')}:${process.env.PATH ?? ''}`,
+            NX_DAEMON: 'false',
+            NX_ISOLATE_PLUGINS: 'false',
+            NX_WORKSPACE_DATA_DIRECTORY: join(root, '.nx/workspace-data'),
+            NX_CACHE_DIRECTORY: join(root, '.nx/cache'),
+          },
+          stdout: 'pipe',
+          stderr: 'pipe',
+        },
+      );
+      const [exitCode, stdout, stderr] = await Promise.all([
+        child.exited,
+        new Response(child.stdout).text(),
+        new Response(child.stderr).text(),
+      ]);
+      expect({ exitCode, output: stdout + stderr }).toMatchObject({ exitCode: 0 });
+      const order = (await readFile(join(root, 'deploy-order.txt'), 'utf8')).trim().split('\n');
+      expect(order).toEqual(['c', 'b', 'a']);
+    } finally {
+      await workspace.cleanup();
+    }
+  }, 120_000);
   //#endregion
 });
 
