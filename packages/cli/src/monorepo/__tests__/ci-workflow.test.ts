@@ -7,6 +7,7 @@ import { readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { format } from 'prettier';
+import typia from 'typia';
 import type { PackageCargoGitOrigin } from '../../lib/json.js';
 import {
   type CiWorkflowDefinitionOptions,
@@ -923,9 +924,9 @@ describe('renderCiWorkflowYaml with cross-built test archives', () => {
 
   it('builds and uploads each archive in Validate, then executes it in a job that needs Validate', () => {
     const rendered = renderCiWorkflowYaml(declared);
-    const workflow = Bun.YAML.parse(rendered) as {
+    const workflow = typia.assert<{
       jobs: Record<string, { needs?: string; 'runs-on'?: unknown; 'timeout-minutes'?: number; steps: unknown[] }>;
-    };
+    }>(Bun.YAML.parse(rendered));
     const validate = workflow.jobs.main;
     const execute = workflow.jobs['macos-cross-tests'];
 
