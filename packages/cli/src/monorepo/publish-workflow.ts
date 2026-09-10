@@ -49,6 +49,7 @@ const synchronizedPrettier = makeModuleSynchronized<typeof PrettierModule>(impor
 
 export type PublishWorkflowBump = 'auto' | 'patch' | 'minor' | 'major' | 'prerelease';
 export type PublishWorkflowCondition =
+  | 'plan-mode-not-none'
   | 'version-mode-not-none'
   | 'deploy-production'
   | 'deploy-production-standalone'
@@ -65,6 +66,7 @@ export enum PublishWorkflowStepKind {
   ConfigureReleaseAuthor = 'configure-release-author',
   BuildNxVersionActions = 'build-nx-version-actions',
   RepairPendingReleases = 'repair-pending-releases',
+  PlanRelease = 'plan-release',
   VersionRelease = 'version-release',
   CheckManagedMonorepoFiles = 'check-managed-monorepo-files',
   Build = 'build',
@@ -159,6 +161,12 @@ export interface PublishWorkflowCallbacks {
   buildNxVersionActions(): Promise<void>;
   repairPendingReleases(input: { dryRun: boolean }): Promise<void>;
   versionRelease(input: { bump: PublishWorkflowBump; dryRun: boolean }): Promise<PublishWorkflowVersionOutputs>;
+  /**
+   * The selection the bump WILL make, computed without writing anything, so the
+   * gates that run before the version commit know what to run over. Defaults to
+   * a dry-run `versionRelease` when a caller supplies none.
+   */
+  planRelease?(input: { bump: PublishWorkflowBump }): Promise<PublishWorkflowVersionOutputs>;
   checkManagedMonorepoFiles(): Promise<void>;
   nxRunMany(input: { target: PublishWorkflowNxTarget; projects: string[] }): Promise<void>;
   uploadTraceDbs(): Promise<void>;
@@ -183,6 +191,9 @@ type PublishWorkflowStepInput = Omit<PublishWorkflowStep, 'number'>;
 
 export function definePublishWorkflow(options: PublishWorkflowDefinitionOptions = {}): PublishWorkflowDefinition {
   const versionMode = githubExpression('steps.version.outputs.mode');
+  // Steps that run before the bump must label themselves from the plan: the
+  // version step's outputs do not exist yet, so the interpolation renders empty.
+  const planMode = githubExpression('steps.plan.outputs.mode');
   if (options.release === false) {
     return { steps: defineDeployOnlyWorkflowSteps(options) };
   }
@@ -224,29 +235,36 @@ export function definePublishWorkflow(options: PublishWorkflowDefinitionOptions 
         kind: PublishWorkflowStepKind.RepairPendingReleases,
         name: '🧯 Repair pending releases',
       },
-      { kind: PublishWorkflowStepKind.VersionRelease, name: '🔢 Version release', id: 'version' },
+      // Plan first, gate second, bump third. Lint and test hash the source, so
+      // running them BEFORE the version commit means their task hashes match
+      // the ones ci already computed for the same source — the publish reuses
+      // that cache instead of re-running 189 tasks. Build stays after the bump
+      // on purpose: an artifact built from pre-bump sources would ship the
+      // previous version string.
+      { kind: PublishWorkflowStepKind.PlanRelease, name: '🧭 Plan release', id: 'plan' },
       {
         kind: PublishWorkflowStepKind.CheckManagedMonorepoFiles,
-        name: `✅ Check managed monorepo files (${versionMode})`,
-        condition: 'version-mode-not-none',
+        name: `✅ Check managed monorepo files (${planMode})`,
+        condition: 'plan-mode-not-none',
       },
+      {
+        kind: PublishWorkflowStepKind.Lint,
+        name: `🔍 Lint (${planMode})`,
+        condition: 'plan-mode-not-none',
+        nxTarget: 'lint',
+      },
+      {
+        kind: PublishWorkflowStepKind.UnitTests,
+        name: `🧪 Unit Tests (${planMode})`,
+        condition: 'plan-mode-not-none',
+        nxTarget: 'test',
+      },
+      { kind: PublishWorkflowStepKind.VersionRelease, name: '🔢 Version release', id: 'version' },
       {
         kind: PublishWorkflowStepKind.Build,
         name: `🔨 Build (${versionMode})`,
         condition: 'version-mode-not-none',
         nxTarget: 'build',
-      },
-      {
-        kind: PublishWorkflowStepKind.Lint,
-        name: `🔍 Lint (${versionMode})`,
-        condition: 'version-mode-not-none',
-        nxTarget: 'lint',
-      },
-      {
-        kind: PublishWorkflowStepKind.UnitTests,
-        name: `🧪 Unit Tests (${versionMode})`,
-        condition: 'version-mode-not-none',
-        nxTarget: 'test',
       },
       { kind: PublishWorkflowStepKind.UploadTraceDbs, name: '📎 Upload trace DBs', condition: 'failure' },
       {
@@ -302,10 +320,11 @@ export async function runPublishWorkflow(
 ): Promise<PublishWorkflowRunResult> {
   let setupOutputs: PublishWorkflowSetupOutputs = { nixCacheHit: '', devenvCacheHit: '' };
   let version: PublishWorkflowVersionOutputs = { mode: 'none', projects: [] };
+  let plan: PublishWorkflowVersionOutputs = { mode: 'none', projects: [] };
   let failed = false;
   let failure: unknown;
   for (const step of workflow.steps) {
-    if (!shouldRunStep(step, version, failed, context.inputs)) {
+    if (!shouldRunStep(step, version, failed, context.inputs, plan)) {
       continue;
     }
     try {
@@ -331,6 +350,11 @@ export async function runPublishWorkflow(
             dryRun: context.inputs.dryRun,
           });
           break;
+        case PublishWorkflowStepKind.PlanRelease:
+          plan = context.callbacks.planRelease
+            ? await context.callbacks.planRelease({ bump: context.inputs.bump })
+            : await context.callbacks.versionRelease({ bump: context.inputs.bump, dryRun: true });
+          break;
         case PublishWorkflowStepKind.VersionRelease:
           version = await context.callbacks.versionRelease(context.inputs);
           break;
@@ -343,7 +367,12 @@ export async function runPublishWorkflow(
           if (!step.nxTarget) {
             throw new Error(`Workflow step ${step.kind} is missing an Nx target.`);
           }
-          await context.callbacks.nxRunMany({ target: step.nxTarget, projects: version.projects });
+          // Lint and test run before the bump exists, so they select from the
+          // plan; build runs after it and selects from the written version.
+          await context.callbacks.nxRunMany({
+            target: step.nxTarget,
+            projects: step.kind === PublishWorkflowStepKind.Build ? version.projects : plan.projects,
+          });
           break;
         case PublishWorkflowStepKind.UploadTraceDbs:
           await context.callbacks.uploadTraceDbs();
@@ -383,7 +412,11 @@ function shouldRunStep(
   version: PublishWorkflowVersionOutputs,
   failed: boolean,
   inputs: PublishWorkflowInputs,
+  plan: PublishWorkflowVersionOutputs = version,
 ): boolean {
+  if (step.condition === 'plan-mode-not-none') {
+    return plan.mode !== 'none';
+  }
   if (step.condition === 'version-mode-not-none') {
     return version.mode !== 'none';
   }
@@ -581,6 +614,16 @@ function yamlLinesForStep(step: PublishWorkflowStep, options: PublishWorkflowDef
         ...privateNpmPublisherStepEnv(options),
         `        run: smoo release repair-pending --dry-run "${githubExpression('inputs.dry_run')}"`,
       ];
+    case PublishWorkflowStepKind.PlanRelease:
+      // The same selection the bump will make, computed without writing: the
+      // gates need `mode` and `projects` before any version commit exists.
+      return [
+        `      - name: ${step.name}`,
+        '        id: plan',
+        '        run:',
+        `          smoo release version --bump "${githubExpression('inputs.bump')}" --projects "${githubExpression('inputs.projects')}" --dry-run "true" --github-output`,
+        '          "$GITHUB_OUTPUT"',
+      ];
     case PublishWorkflowStepKind.VersionRelease:
       return [
         `      - name: ${step.name}`,
@@ -601,12 +644,12 @@ function yamlLinesForStep(step: PublishWorkflowStep, options: PublishWorkflowDef
     case PublishWorkflowStepKind.Lint:
       return conditionalRunStep(
         step,
-        `smoo github-ci nx-run-many --targets lint --projects "${githubExpression('steps.version.outputs.projects')}"`,
+        `smoo github-ci nx-run-many --targets lint --projects "${githubExpression('steps.plan.outputs.projects')}"`,
       );
     case PublishWorkflowStepKind.UnitTests:
       return conditionalRunStep(
         step,
-        `smoo github-ci nx-run-many --targets test --projects "${githubExpression('steps.version.outputs.projects')}"`,
+        `smoo github-ci nx-run-many --targets test --projects "${githubExpression('steps.plan.outputs.projects')}"`,
       );
     case PublishWorkflowStepKind.UploadTraceDbs:
       return artifactStepLines(
@@ -695,8 +738,11 @@ function deployProductionStep(step: PublishWorkflowStep, options: PublishWorkflo
 }
 
 function conditionalRunStep(step: PublishWorkflowStep, run: string): string[] {
-  const condition = "steps.version.outputs.mode != 'none'";
-  return [`      - name: ${step.name}`, `        if: ${condition}`, `        run: ${run}`];
+  // A step gated on the plan must read the PLAN's mode: it runs before the
+  // version step exists, and `steps.version.outputs.mode` is empty there, which
+  // silently skips the gate rather than running it.
+  const source = step.condition === 'plan-mode-not-none' ? 'plan' : 'version';
+  return [`      - name: ${step.name}`, `        if: steps.${source}.outputs.mode != 'none'`, `        run: ${run}`];
 }
 
 function siblingSourceCheckoutStepLines(options: PublishWorkflowDefinitionOptions): string[] {

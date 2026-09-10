@@ -202,18 +202,18 @@ describe('publish workflow definition', () => {
     );
     const finalJob = platform.slice(platform.indexOf('  publish-on-linux:'));
 
-    expect(stepAnchorNumbers(singleJob)).toEqual(Array.from({ length: 16 }, (_, index) => index + 1));
-    expect(stepAnchorNumbers(linuxCandidate)).toEqual(Array.from({ length: 19 }, (_, index) => index + 1));
+    expect(stepAnchorNumbers(singleJob)).toEqual(Array.from({ length: 17 }, (_, index) => index + 1));
+    expect(stepAnchorNumbers(linuxCandidate)).toEqual(Array.from({ length: 20 }, (_, index) => index + 1));
     expect(stepAnchorNumbers(macosPlatform)).toEqual(Array.from({ length: 10 }, (_, index) => index + 1));
     expect(stepAnchorNumbers(finalJob)).toEqual(Array.from({ length: 14 }, (_, index) => index + 1));
-    expect(singleJob).toContain('# Step 14\n      - name: 🏷️ Tag release');
-    expect(singleJob).toContain('# Step 15\n      - name: 📦 Publish release (${{ steps.version.outputs.mode }})');
-    expect(singleJob).toContain('# Step 16\n      - name: 🧹 Cleanup and cache Nix/devenv');
-    expect(linuxCandidate).toContain('# Step 7\n      - name: 🔒 Capture candidate release SHA');
+    expect(singleJob).toContain('# Step 15\n      - name: 🏷️ Tag release');
+    expect(singleJob).toContain('# Step 16\n      - name: 📦 Publish release (${{ steps.version.outputs.mode }})');
+    expect(singleJob).toContain('# Step 17\n      - name: 🧹 Cleanup and cache Nix/devenv');
+    expect(linuxCandidate).toContain('# Step 11\n      - name: 🔒 Capture candidate release SHA');
     expect(linuxCandidate).toContain(
-      '# Step 8\n      - name: ✅ Check managed monorepo files (${{ steps.version.outputs.mode }})',
+      '# Step 7\n      - name: ✅ Check managed monorepo files (${{ steps.plan.outputs.mode }})',
     );
-    expect(linuxCandidate).toContain('# Step 19\n      - name: 🧹 Cleanup and cache Nix/devenv');
+    expect(linuxCandidate).toContain('# Step 20\n      - name: 🧹 Cleanup and cache Nix/devenv');
     expect(macosPlatform).toContain('# Step 6\n      - name: 🔢 Version release');
     expect(macosPlatform).toContain('# Step 7\n      - name: 🍎 Build selected macOS and iOS release outputs');
     expect(macosPlatform).toContain('# Step 10\n      - name: 🧹 Cleanup and cache Nix/devenv');
@@ -311,14 +311,22 @@ describe('publish workflow definition', () => {
     expect(singleJob.match(/- name: 🏷️ Tag release/g)).toHaveLength(1);
     expect(singleJob).toContain('        run: smoo release tag --dry-run "${{ inputs.dry_run }}"');
     expect(singleJob.indexOf('- name: 🧯 Repair pending releases')).toBeLessThan(
-      singleJob.indexOf('- name: 🔢 Version release'),
+      singleJob.indexOf('- name: 🧭 Plan release'),
     );
+    // Lint and test hash the source, so they run BEFORE the version commit and
+    // reuse the task hashes ci already computed. Build stays after it: an
+    // artifact built from pre-bump sources would carry the previous version.
+    expect(singleJob.indexOf('- name: 🧭 Plan release')).toBeLessThan(singleJob.indexOf('- name: 🔍 Lint'));
+    expect(singleJob.indexOf('- name: 🧪 Unit Tests')).toBeLessThan(singleJob.indexOf('- name: 🔢 Version release'));
     expect(singleJob.indexOf('- name: 🔢 Version release')).toBeLessThan(singleJob.indexOf('- name: 🔨 Build'));
-    expect(singleJob.indexOf('- name: 🧪 Unit Tests')).toBeLessThan(singleJob.indexOf('- name: 🏷️ Tag release'));
+    expect(singleJob.indexOf('- name: 🔨 Build')).toBeLessThan(singleJob.indexOf('- name: 🏷️ Tag release'));
+    // The gates select from the plan, not from a version step that has not run.
+    expect(singleJob).toContain('--targets lint --projects "${{ steps.plan.outputs.projects }}"');
+    expect(singleJob).toContain("if: steps.plan.outputs.mode != 'none'");
     expect(singleJob.indexOf('- name: 🏷️ Tag release')).toBeLessThan(singleJob.indexOf('- name: 📦 Publish release'));
     // The Release section starts at tagging now, not at publishing.
     expect(singleJob).toContain(
-      '# --- Release ------------------------------------------------------------\n\n      # Step 14\n      - name: 🏷️ Tag release',
+      '# --- Release ------------------------------------------------------------\n\n      # Step 15\n      - name: 🏷️ Tag release',
     );
   });
 
@@ -919,6 +927,8 @@ class WorkflowScenarioState {
     tests: [],
     validates: 0,
   };
+  planned = false;
+  gatesBeforeVersion: { lints: string[]; tests: string[] } = { lints: [], tests: [] };
 
   constructor(private readonly config: WorkflowScenarioConfig) {
     for (const gap of [...config.repairs, ...config.current]) {
@@ -960,8 +970,16 @@ class WorkflowScenarioState {
           this.repaired.add(gap.tag);
         }
       },
+      planRelease: async ({ bump }) => {
+        // The plan runs before anything is written, and the gates that follow
+        // it must therefore have seen no version commit yet.
+        this.planned = true;
+        expect(bump).toBe(this.config.bump);
+        return this.config.version;
+      },
       versionRelease: async ({ bump, dryRun }) => {
         this.versionObservedNxVersionActions = this.nxVersionActions;
+        this.gatesBeforeVersion = { lints: [...this.validationState.lints], tests: [...this.validationState.tests] };
         expect(bump).toBe(this.config.bump);
         expect(dryRun).toBe(this.config.dryRun);
         return this.config.version;
@@ -1271,8 +1289,8 @@ it('keeps job-local step anchors contiguous once Cargo credentials add a setup s
 
   // Each job gains exactly one step over the credential-free counts, and the
   // hand-numbered platform renderers must renumber with it.
-  expect(stepAnchorNumbers(singleJob)).toEqual(Array.from({ length: 17 }, (_, index) => index + 1));
-  expect(stepAnchorNumbers(linuxCandidate)).toEqual(Array.from({ length: 20 }, (_, index) => index + 1));
+  expect(stepAnchorNumbers(singleJob)).toEqual(Array.from({ length: 18 }, (_, index) => index + 1));
+  expect(stepAnchorNumbers(linuxCandidate)).toEqual(Array.from({ length: 21 }, (_, index) => index + 1));
   expect(stepAnchorNumbers(macosPlatform)).toEqual(Array.from({ length: 11 }, (_, index) => index + 1));
   expect(stepAnchorNumbers(finalJob)).toEqual(Array.from({ length: 15 }, (_, index) => index + 1));
 });

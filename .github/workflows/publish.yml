@@ -84,16 +84,11 @@ jobs:
         run: ttsc -p tsconfig.lib.json --emit
 
       # Step 6
-      - name: 🔢 Version release
-        id: version
+      - name: 🧭 Plan release
+        id: plan
         run:
-          smoo release version --bump "${{ inputs.bump }}" --projects "${{ inputs.projects }}" --dry-run "${{
-          inputs.dry_run }}" --github-output "$GITHUB_OUTPUT"
-
-      # Step 7
-      - name: 🔒 Capture candidate release SHA
-        id: release-state
-        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          smoo release version --bump "${{ inputs.bump }}" --projects "${{ inputs.projects }}" --dry-run "true"
+          --github-output "$GITHUB_OUTPUT"
 
       # --- Validation ---------------------------------------------------------
 
@@ -102,36 +97,48 @@ jobs:
       # never relies on task outputs restored from CI cache. version runs before
       # validation so the commit completed below is the commit that was checked.
 
-      # Step 8
-      - name: ✅ Check managed monorepo files (${{ steps.version.outputs.mode }})
-        if: steps.version.outputs.mode != 'none'
+      # Step 7
+      - name: ✅ Check managed monorepo files (${{ steps.plan.outputs.mode }})
+        if: steps.plan.outputs.mode != 'none'
         run: smoo monorepo check --warn
 
+      # Step 8
+      - name: 🔍 Lint (${{ steps.plan.outputs.mode }})
+        if: steps.plan.outputs.mode != 'none'
+        run: smoo github-ci nx-run-many --targets lint --projects "${{ steps.plan.outputs.projects }}"
+
       # Step 9
+      - name: 🧪 Unit Tests (${{ steps.plan.outputs.mode }})
+        if: steps.plan.outputs.mode != 'none'
+        run: smoo github-ci nx-run-many --targets test --projects "${{ steps.plan.outputs.projects }}"
+
+      # Step 10
+      - name: 🔢 Version release
+        id: version
+        run:
+          smoo release version --bump "${{ inputs.bump }}" --projects "${{ inputs.projects }}" --dry-run "${{
+          inputs.dry_run }}" --github-output "$GITHUB_OUTPUT"
+
+      # Step 11
+      - name: 🔒 Capture candidate release SHA
+        id: release-state
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      # Step 12
       - name: 🔨 Build (${{ steps.version.outputs.mode }})
         if: steps.version.outputs.mode != 'none'
         run:
           smoo github-ci nx-run-many --targets build --projects "${{ steps.version.outputs.projects }}"
           --collect-outputs "${{ runner.temp }}/release-build-outputs"
 
-      # Step 10
+      # Step 13
       - name: 🐧 Build supplemental Linux targets
         if: steps.version.outputs.mode != 'none'
         run:
           smoo github-ci nx-run-many --targets "*-linux" --projects "${{ steps.version.outputs.projects }}"
           --collect-outputs "${{ runner.temp }}/linux-platform-outputs"
 
-      # Step 11
-      - name: 🔍 Lint (${{ steps.version.outputs.mode }})
-        if: steps.version.outputs.mode != 'none'
-        run: smoo github-ci nx-run-many --targets lint --projects "${{ steps.version.outputs.projects }}"
-
-      # Step 12
-      - name: 🧪 Unit Tests (${{ steps.version.outputs.mode }})
-        if: steps.version.outputs.mode != 'none'
-        run: smoo github-ci nx-run-many --targets test --projects "${{ steps.version.outputs.projects }}"
-
-      # Step 13
+      # Step 14
       - name: 📎 Upload trace DBs
         if: failure()
         uses: actions/upload-artifact@v7.0.1
@@ -142,21 +149,21 @@ jobs:
           retention-days: 14
           include-hidden-files: true
 
-      # Step 14
+      # Step 15
       - name: ✅ Validate monorepo config (${{ steps.version.outputs.mode }})
         if: steps.version.outputs.mode != 'none'
         run: smoo monorepo validate --projects "${{ steps.version.outputs.projects }}"
 
       # --- Candidate transfer --------------------------------------------------
 
-      # Step 15
+      # Step 16
       - name: 📦 Bundle validated release state
         run:
           mkdir -p "${{ runner.temp }}/publish-release-state" && git bundle create "${{ runner.temp
           }}/publish-release-state/release-state.bundle" HEAD --tags && git rev-parse HEAD > "${{ runner.temp
           }}/publish-release-state/release-head"
 
-      # Step 16
+      # Step 17
       - name: 📤 Upload validated release state
         if: success()
         uses: actions/upload-artifact@v7.0.1
@@ -166,7 +173,7 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
-      # Step 17
+      # Step 18
       - name: 📤 Upload validated build outputs
         if: steps.version.outputs.mode != 'none'
         uses: actions/upload-artifact@v7.0.1
@@ -177,7 +184,7 @@ jobs:
           retention-days: 1
           include-hidden-files: true
 
-      # Step 18
+      # Step 19
       - name: 📤 Upload supplemental Linux outputs
         if: steps.version.outputs.mode != 'none'
         uses: actions/upload-artifact@v7.0.1
@@ -190,7 +197,7 @@ jobs:
 
       # --- Cleanup ------------------------------------------------------------
 
-      # Step 19
+      # Step 20
       - name: 🧹 Cleanup and cache Nix/devenv
         # success() is default; always() still saves GH Nix cache after a red job.
         if: always()
