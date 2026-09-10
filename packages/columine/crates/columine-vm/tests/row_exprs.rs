@@ -9,6 +9,7 @@ use columine_vm::row_exprs::{
     BatchView, Binding, ROW_EXPRESSIONS_MAGIC, RowColumns, RowExpression, bind_row_columns,
 };
 use columine_vm::state_init::{DEFAULT_ACCEPTED_PROGRAM_MAGICS, calculate_state_size, init_state};
+use columine_vm::struct_map::StructMapSlot;
 use columine_vm::vm::{Vm, col_u32_exact, u32s_as_bytes, vm_map_get};
 
 const OK: u32 = ErrorCode::Ok as u32;
@@ -854,4 +855,248 @@ fn a_live_entry_bound_after_a_bound_entry_on_reused_storage_reads_its_own_column
         "column 4 is the live entry: 150 beats an absent value"
     );
     assert_eq!(both.competes.evaluated, 1);
+}
+
+// =============================================================================
+// A guarded scatter's guard column is a plain read of the batch
+// =============================================================================
+
+/// Columns of the guarded-scatter program below: 0 type, 1 route, 2 op,
+/// 3 key, 4 value, 5 guard (the derived one).
+const GUARD_ROUTE_COL: u8 = 1;
+const GUARD_OP_COL: u8 = 2;
+const GUARD_KEY_COL: u8 = 3;
+const GUARD_VAL_COL: u8 = 4;
+const GUARD_COL: u8 = 5;
+
+/// `FOR_EACH(type == ORDER_TYPE) { BATCH_STRUCT_MAP_SCATTER_GUARDED }` over
+/// one struct-map slot `[value:UINT32, guard:UINT32]`, guarded on field 1
+/// by column 5, with a single kind-0 route writing field 0 from column 4.
+fn guarded_scatter_program(trailer: &[u8]) -> Vec<u8> {
+    // SLOT_STRUCT_MAP(0x18) slot 0, STRUCTMAP, cap 8, two UINT32 fields.
+    let init = [0x18u8, 0, 6, 8, 0, 2, 0, 0, 0];
+    #[rustfmt::skip]
+    let body = [
+        0x3fu8, GUARD_ROUTE_COL, GUARD_OP_COL, GUARD_KEY_COL, 0, 1,
+        GUARD_COL, 1,
+        1,
+        0, 0, 0, GUARD_VAL_COL,
+    ];
+    let mut reduce = vec![0xE0u8, TYPE_COL, 1];
+    reduce.extend(ORDER_TYPE.to_le_bytes());
+    reduce.extend((body.len() as u16).to_le_bytes());
+    reduce.extend(body);
+    reduce.push(0); // HALT
+    let mut prog = vec![0u8; 32];
+    prog.extend(PROGRAM_MAGIC.to_le_bytes());
+    prog.extend([1, 0, 1, 6, 0, 0]);
+    prog.extend((init.len() as u16).to_le_bytes());
+    prog.extend((reduce.len() as u16).to_le_bytes());
+    prog.extend(init);
+    prog.extend(&reduce);
+    prog.extend_from_slice(trailer);
+    prog
+}
+
+/// Expression `[src_col]`: the row's cell of `src_col`, copied. `binding`
+/// decides whether the derived column is computed up front or deferred, so
+/// one evaluator drives both halves of the guard-column contract.
+struct Copy {
+    binding: Binding,
+}
+
+impl RowExpression for Copy {
+    fn admit(&mut self, expr: &[u8], batch: &BatchView<'_>) -> Result<Binding, ErrorCode> {
+        if expr.len() != 1 || usize::from(expr[0]) >= batch.num_cols() {
+            return Err(ErrorCode::InvalidProgram);
+        }
+        col_u32_exact(batch.column(expr[0]), batch.batch_len)
+            .map(|_| self.binding)
+            .ok_or(ErrorCode::ColumnUnderrun)
+    }
+
+    fn eval(&mut self, expr: &[u8], batch: &BatchView<'_>, row: u32) -> Result<u32, ErrorCode> {
+        let cells =
+            col_u32_exact(batch.column(expr[0]), batch.batch_len).expect("admit proved coverage");
+        Ok(cells[row as usize])
+    }
+}
+
+/// The guarded row's `value` field, or `None` when the row is absent.
+fn guarded_value(state: &[u8], key: u32) -> Option<u32> {
+    let smap = StructMapSlot::bind(state, 0);
+    let pos = smap.find(state, key)?;
+    Some(columine_vm::bytes::read_u32(state, smap.row_off(pos) + 1))
+}
+
+/// A derived guard column that binds up front survives planning and is what
+/// the guard actually orders by: the second row here carries a lower guard
+/// than the first and must not overwrite it.
+#[test]
+fn a_bound_derived_guard_column_plans_and_orders_the_scatter() {
+    let prog = guarded_scatter_program(&table(
+        TYPE_COL,
+        &[entry(GUARD_COL, &[ORDER_TYPE], &[GUARD_VAL_COL])],
+    ));
+    let mut state = init(&prog);
+    // The derived guard copies the value column, so row 0 guards at 80 and
+    // row 1 at 30 — descending, for one key.
+    let types = [ORDER_TYPE, ORDER_TYPE];
+    let routes = [0u32, 0];
+    let ops = [0u32, 0];
+    let keys = [1u32, 1];
+    let vals = [80u32, 30];
+    let mut cols: Vec<&[u8]> = vec![
+        u32s_as_bytes(&types),
+        u32s_as_bytes(&routes),
+        u32s_as_bytes(&ops),
+        u32s_as_bytes(&keys),
+        u32s_as_bytes(&vals),
+        &[],
+    ];
+    let mut rows = RowColumns::new();
+    let mut eval = Copy {
+        binding: Binding::Bound,
+    };
+    let mut vm = Vm::new(DEFAULT_ACCEPTED_PROGRAM_MAGICS);
+    {
+        let mut live =
+            bind_row_columns(&prog, &state, &mut cols, 2, &mut eval, &mut rows).expect("bind");
+        assert!(live.is_empty());
+        assert_eq!(
+            vm.execute_batch_live(&mut state, &prog, &cols, 2, &mut live),
+            OK
+        );
+    }
+    assert_eq!(
+        guarded_value(&state, 1),
+        Some(80),
+        "the lower-guarded row does not overwrite the higher one"
+    );
+}
+
+/// A derived guard column deferred to the reduce section carries zeros in
+/// the batch, and the guarded scatter reads its guard straight out of those
+/// bytes. Registering the guard column as a plain read is what turns that
+/// into a refusal instead of a guard that silently orders every element
+/// against zero.
+#[test]
+fn a_live_derived_guard_column_is_refused_before_any_element_runs() {
+    let prog = guarded_scatter_program(&table(
+        TYPE_COL,
+        &[entry(GUARD_COL, &[ORDER_TYPE], &[GUARD_VAL_COL])],
+    ));
+    let state = init(&prog);
+    let types = [ORDER_TYPE];
+    let routes = [0u32];
+    let ops = [0u32];
+    let keys = [1u32];
+    let vals = [80u32];
+    let mut cols: Vec<&[u8]> = vec![
+        u32s_as_bytes(&types),
+        u32s_as_bytes(&routes),
+        u32s_as_bytes(&ops),
+        u32s_as_bytes(&keys),
+        u32s_as_bytes(&vals),
+        &[],
+    ];
+    let mut rows = RowColumns::new();
+    let mut eval = Copy {
+        binding: Binding::Live,
+    };
+    assert_eq!(
+        bind_row_columns(&prog, &state, &mut cols, 1, &mut eval, &mut rows)
+            .err()
+            .map(|e| e as u32),
+        Some(ErrorCode::InvalidProgram as u32),
+        "a guard read through a live column would see placeholder zeros"
+    );
+}
+
+/// Columns 6 (set element) and 7 (live predicate) extend the guarded
+/// program below with a second body opcode.
+const GUARD_ELEM_COL: u8 = 6;
+const GUARD_PRED_COL: u8 = 7;
+
+/// The same guarded scatter with a `BATCH_SET_INSERT_IF` beside it, whose
+/// predicate is a LIVE derived column. A live entry is what makes the bind
+/// walk the reduce section's column uses at all, so this is the program
+/// that needs `column_uses` to know the opcode: without an arm for `0x3f`
+/// the walk refuses the whole program and a legitimate live predicate
+/// stops working. The guard columns here are plain host columns.
+fn guarded_scatter_with_live_predicate_program(trailer: &[u8]) -> Vec<u8> {
+    // Struct map slot 0 [value:UINT32, guard:UINT32]; HASHSET slot 1.
+    let init = [0x18u8, 0, 6, 8, 0, 2, 0, 0, 0x10, 1, 1, 8, 0, 0];
+    #[rustfmt::skip]
+    let mut body = vec![
+        0x3fu8, GUARD_ROUTE_COL, GUARD_OP_COL, GUARD_KEY_COL, 0, 1,
+        GUARD_COL, 1,
+        1,
+        0, 0, 0, GUARD_VAL_COL,
+    ];
+    body.extend_from_slice(&[0x33, 1, GUARD_ELEM_COL, GUARD_PRED_COL]);
+    let mut reduce = vec![0xE0u8, TYPE_COL, 1];
+    reduce.extend(ORDER_TYPE.to_le_bytes());
+    reduce.extend((body.len() as u16).to_le_bytes());
+    reduce.extend(&body);
+    reduce.push(0); // HALT
+    let mut prog = vec![0u8; 32];
+    prog.extend(PROGRAM_MAGIC.to_le_bytes());
+    prog.extend([1, 0, 2, 8, 0, 0]);
+    prog.extend((init.len() as u16).to_le_bytes());
+    prog.extend((reduce.len() as u16).to_le_bytes());
+    prog.extend(init);
+    prog.extend(&reduce);
+    prog.extend_from_slice(trailer);
+    prog
+}
+
+/// A live element predicate beside a guarded scatter binds and runs: the
+/// column-use walk must know `0x3f`, and must classify its guard column as
+/// a plain read without mistaking the predicate for one.
+#[test]
+fn a_live_element_predicate_binds_beside_a_guarded_scatter() {
+    let prog = guarded_scatter_with_live_predicate_program(&table(
+        TYPE_COL,
+        &[entry(GUARD_PRED_COL, &[ORDER_TYPE], &[GUARD_VAL_COL])],
+    ));
+    let mut state = init(&prog);
+    let types = [ORDER_TYPE, ORDER_TYPE];
+    let routes = [0u32, 0];
+    let ops = [0u32, 0];
+    let keys = [1u32, 1];
+    let vals = [80u32, 30];
+    let guards = [80u32, 30];
+    let elems = [900u32, 901];
+    let mut cols: Vec<&[u8]> = vec![
+        u32s_as_bytes(&types),
+        u32s_as_bytes(&routes),
+        u32s_as_bytes(&ops),
+        u32s_as_bytes(&keys),
+        u32s_as_bytes(&vals),
+        u32s_as_bytes(&guards),
+        u32s_as_bytes(&elems),
+        &[],
+    ];
+    let mut rows = RowColumns::new();
+    let mut eval = Copy {
+        binding: Binding::Live,
+    };
+    let mut vm = Vm::new(DEFAULT_ACCEPTED_PROGRAM_MAGICS);
+    {
+        let mut live = bind_row_columns(&prog, &state, &mut cols, 2, &mut eval, &mut rows)
+            .expect("a guarded scatter must not refuse an unrelated live predicate");
+        assert!(!live.is_empty());
+        assert_eq!(
+            vm.execute_batch_live(&mut state, &prog, &cols, 2, &mut live),
+            OK
+        );
+    }
+    assert_eq!(
+        guarded_value(&state, 1),
+        Some(80),
+        "the guard still orders the two rows"
+    );
+    let meta = SlotMetaView::read(&state, 1);
+    assert_eq!(meta.size(&state), 2, "both live predicates were non-zero");
 }

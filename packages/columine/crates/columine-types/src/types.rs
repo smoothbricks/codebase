@@ -78,12 +78,17 @@ impl ProgramHeader {
 
 pub const EMPTY_KEY: u32 = u32::MAX;
 pub const TOMBSTONE: u32 = u32::MAX - 1;
-/// Route-table capacity of the struct-map scatters (`0x2f`, `0x3e`). The VM
-/// decodes each route table into fixed 32-entry arrays, so a program declaring
-/// more routes than this refuses `INVALID_PROGRAM` at decode instead of
-/// indexing past the decode arrays at execution. A program emitter enforces the
-/// same bound from this number; both sides name it once.
+/// Route-table capacity of the struct-map scatters (`0x2f`, `0x3e`, `0x3f`).
+/// The VM decodes each route table into fixed 32-entry arrays, so a program
+/// declaring more routes than this refuses `INVALID_PROGRAM` at decode instead
+/// of indexing past the decode arrays at execution. A program emitter enforces
+/// the same bound from this number; both sides name it once.
 pub const MAX_SCATTER_ROUTES: usize = 32;
+/// Guard-tuple width of the guarded struct-map scatter (`0x3f`). The VM
+/// compares guards out of a fixed `[u64; 4]`, so a program declaring a wider
+/// tuple refuses `INVALID_PROGRAM` at decode. A tuple of zero components
+/// refuses too: an unguarded scatter is `0x3e`, not a degenerate `0x3f`.
+pub const MAX_GUARD_COMPONENTS: usize = 4;
 /// Empty and tombstone markers for the collision-free derived-fact identity
 /// lane. Valid identities only use the low 48 bits (`fact_idx:u16`, `key:u32`),
 /// so both sentinels are outside the valid domain and cannot alias a fact.
@@ -497,9 +502,90 @@ pub enum Opcode {
     /// assert/retract semantics (retract clears iff the stored field equals
     /// the column cell; never clearBitset) are byte-identical to
     /// BatchStructMapProbeScatter minus the probe.
+    ///
+    /// Two write arms and no aggregator: kind 0 is a card-one struct field
+    /// (assert overwrites, retract clears iff the stored cell still equals
+    /// the retracted one) and kind 1 is a set membership (insert / remove).
+    /// The whole family is therefore last-write-wins in STREAM order — an
+    /// element that arrives later overwrites one that arrived earlier, no
+    /// matter what the elements say about their own order. A destination
+    /// that must keep the winner by a value the element CARRIES rather than
+    /// by arrival order takes [`Self::BatchStructMapScatterGuarded`], which
+    /// puts a guard in front of these same two arms.
     /// route_col:u8, op_col:u8, key_col:u8, num_routes:u8,
     /// \[kind:u8, dest_slot:u8, dest_field_idx:u8, v_col:u8\] × num_routes
     BatchStructMapScatter = 0x3e,
+    /// Guarded route-column dispatch, probe-free (body opcode, per FLAT_MAP
+    /// element). Routing, kinds, and the assert/retract semantics are
+    /// [`Self::BatchStructMapScatter`]'s, unchanged. What is added is a
+    /// GUARD: every element carries a guard tuple naming the transaction it
+    /// belongs to, and the guarded row remembers the guard of the
+    /// transaction that last wrote it.
+    ///
+    /// The guarded row is `guard_slot[key_col]`, one row per element,
+    /// resolved once. `num_guards` `(guard_col, guard_field_idx)` pairs name
+    /// the tuple: `guard_col` is where the element carries the component (a
+    /// batch column, read at the FLAT_MAP child index like every other
+    /// operand here) and `guard_field_idx` is the field of the guarded row
+    /// that stores it. Components compare in declared order, most
+    /// significant first, each through the destination field's declared type
+    /// mapped to an order-preserving u64.
+    ///
+    /// The rule is: SKIP IFF THE ELEMENT'S GUARD IS STRICTLY LESS THAN THE
+    /// STORED GUARD. A skip is total — it gates every route of the group,
+    /// kind-1 set arms included — so a transaction that arrives late cannot
+    /// win some columns of a row and lose others. A guarded row that is
+    /// absent, or whose guard fields are not all set, has made no claim and
+    /// every element passes it.
+    ///
+    /// EQUAL PROCEEDS, and that is load-bearing, not a tolerance. One
+    /// transaction is many elements sharing one guard: under a
+    /// strictly-greater rule its first element would advance the stored
+    /// guard and its remaining elements would compare equal and be skipped,
+    /// leaving a row with one column of the transaction and the rest
+    /// missing — a row no transaction ever asserted. The PRECONDITION that
+    /// falls out is the emitter's to discharge: two DISTINCT transactions
+    /// must never produce equal guard tuples. Where they can tie, their
+    /// elements interleave into one row exactly as they would with no guard
+    /// at all; the VM cannot detect this and does not try. An emitter whose
+    /// ordering components can tie declares an extra component that is
+    /// unique per transaction and the tuple becomes a total order again.
+    ///
+    /// Determinism, stated for what it actually covers: a card-one
+    /// destination FIELD ends at the same value whichever order two
+    /// DISTINCT transactions arrive in — the tuple totally orders them, so
+    /// the lower one never overwrites the higher one from either side. A
+    /// kind-1 set is card-many and accumulates, so what it holds depends on
+    /// which transactions were accepted at all, not only on the highest;
+    /// the guarantee there is ATOMICITY, not convergence — a transaction
+    /// that loses the guard contributes nothing through any route, instead
+    /// of contributing its set members while losing its columns.
+    ///
+    /// Replay of an already-applied transaction is a no-op by construction
+    /// rather than by exclusion: its guard is equal, so it proceeds into
+    /// the write path, where the identical-assert check and
+    /// retract-iff-current turn each write into a no-op, and the stamp
+    /// itself is skipped because the row already remembers exactly this
+    /// guard. Proceeding is what makes replay SAFE — a rule that excluded
+    /// equal guards would also exclude the transaction's own remaining
+    /// elements.
+    ///
+    /// A retract is guarded like an assert, so a stale retract cannot delete
+    /// a fresher row. It differs in one respect: a passing assert upserts
+    /// the guarded row, a passing retract stamps the guard only on a row
+    /// that already exists. A retract of an absent row is already a no-op,
+    /// and creating a row to remember it would grow the map from keys
+    /// nothing ever asserted.
+    ///
+    /// Every kind-0 route's `dest_slot` MUST equal `guard_slot`: the guarded
+    /// row IS the destination row, and a kind-0 route naming another slot is
+    /// `INVALID_PROGRAM` rather than a silently unguarded write. kind-1
+    /// routes name their own set slot; those writes are gated by the guard
+    /// but the set carries no guard of its own.
+    /// route_col:u8, op_col:u8, key_col:u8, guard_slot:u8, num_guards:u8,
+    /// \[guard_col:u8, guard_field_idx:u8\] × num_guards, num_routes:u8,
+    /// \[kind:u8, dest_slot:u8, dest_field_idx:u8, v_col:u8\] × num_routes
+    BatchStructMapScatterGuarded = 0x3f,
     /// slot:u8, elem_col:u8
     BatchSetInsert = 0x30,
     /// slot:u8, elem_col:u8
@@ -638,6 +724,7 @@ impl Opcode {
             0x3c => Self::BatchBitmapAndNotScratch,
             0x3d => Self::BatchBitmapXorScratch,
             0x3e => Self::BatchStructMapScatter,
+            0x3f => Self::BatchStructMapScatterGuarded,
             0x40 => Self::BatchAggSum,
             0x41 => Self::BatchAggCount,
             0x42 => Self::BatchAggMin,

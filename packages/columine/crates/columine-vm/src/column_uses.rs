@@ -139,6 +139,30 @@ fn walk(
                     visit(ops[4 + ri * 4 + 3], ColumnUse::Read);
                 }
             }
+            Opcode::BatchStructMapScatterGuarded => {
+                // ops[0]=route_col, ops[1]=op_col, ops[2]=key_col,
+                // ops[3]=guard_slot, ops[4]=num_guards, then
+                // [guard_col, guard_field] × num_guards, num_routes, then
+                // [kind, dest_slot, dest_field, v_col] × num_routes.
+                //
+                // A guard column is READ and never written, and it is read
+                // by the dispatch straight out of the batch's bytes. Leave
+                // it out and a derived guard column deferred to the reduce
+                // section binds as live, where the batch carries zeros for
+                // it — the guard would then order every element against
+                // zero and silently let stale transactions through. Naming
+                // it here is what turns that into a refusal.
+                read(visit, &ops[0..3]);
+                let num_guards = usize::from(ops[4]);
+                for gi in 0..num_guards {
+                    visit(ops[5 + gi * 2], ColumnUse::Read);
+                }
+                let routes_at = 5 + num_guards * 2;
+                let num_routes = usize::from(ops[routes_at]);
+                for ri in 0..num_routes {
+                    visit(ops[routes_at + 1 + ri * 4 + 3], ColumnUse::Read);
+                }
+            }
             Opcode::BatchSetInsert
             | Opcode::BatchSetRemove
             | Opcode::BatchBitmapAdd

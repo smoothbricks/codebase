@@ -25,17 +25,19 @@ use crate::meta::{SlotMetaView, slot_meta_base};
 use crate::nested;
 use crate::row_exprs::LiveColumns;
 use crate::state_init::{self, ARENA_HEADER_SIZE, EVICTION_ENTRY_SIZE, NEEDS_GROWTH_SLOT};
-use crate::struct_map::{StructMap2Slot, StructMapSlot, scalar_cell_encoded};
+use crate::struct_map::{
+    StructMap2Slot, StructMapSlot, scalar_cell_encoded, scalar_cell_order_key, scalar_order_key,
+};
 use crate::undo_log::{
     self, FLAT_UNDO_ENTRY_SIZE, FlatUndoEntry, FlatUndoOp, SMF_BIT_SET, SMF_ROW_ABSENT,
     SMR_ROW_ABSENT,
 };
 use columine_types::DEFAULT_ACCEPTED_PROGRAM_MAGICS;
 use columine_types::types::{
-    AggType, ChangeFlag, DERIVED_FACT_TOMBSTONE_IDENTITY, EMPTY_KEY, ErrorCode, MAX_SCATTER_ROUTES,
-    Opcode, PROGRAM_HASH_PREFIX, PROGRAM_HEADER_SIZE, ProgramHeader, SLOT_META_SIZE,
-    STATE_HEADER_SIZE, STATE_MAGIC, SlotMetaOffset, SlotType, StateHeaderOffset, StructFieldType,
-    TOMBSTONE, align8, struct_field_size,
+    AggType, ChangeFlag, DERIVED_FACT_TOMBSTONE_IDENTITY, EMPTY_KEY, ErrorCode,
+    MAX_GUARD_COMPONENTS, MAX_SCATTER_ROUTES, Opcode, PROGRAM_HASH_PREFIX, PROGRAM_HEADER_SIZE,
+    ProgramHeader, SLOT_META_SIZE, STATE_HEADER_SIZE, STATE_MAGIC, SlotMetaOffset, SlotType,
+    StateHeaderOffset, StructFieldType, TOMBSTONE, align8, struct_field_size,
 };
 use core::sync::atomic::Ordering;
 
@@ -1558,6 +1560,166 @@ fn nested_journal_ranges(state: &[u8], meta: &SlotMetaView) -> [(u32, u32); 2] {
         (meta.offset, slot_data_len),
     ]
 }
+// =============================================================================
+// Guarded-scatter guards
+// =============================================================================
+
+/// The guard of a `BATCH_STRUCT_MAP_SCATTER_GUARDED` instruction: which
+/// batch columns carry the element's guard components and which fields of
+/// the guarded row remember them. Decoded once per element from the body,
+/// like the route table beside it, and held in fixed arrays so an element
+/// costs no allocation.
+///
+/// A guard is compared as `[u64; _]`, most significant component first,
+/// through [`scalar_order_key`] — one image for the element's cell and the
+/// stored field, so the two sides cannot drift into different orders.
+#[derive(Clone, Copy)]
+struct GuardTuple {
+    cols: [u8; MAX_GUARD_COMPONENTS],
+    fields: [u8; MAX_GUARD_COMPONENTS],
+    len: usize,
+}
+
+/// A guard as compared: only the leading `len` lanes are meaningful, and
+/// both sides zero the rest, so a slice compare over `len` is the order.
+type GuardKey = [u64; MAX_GUARD_COMPONENTS];
+
+impl GuardTuple {
+    /// Read `len` `(guard_col, guard_field_idx)` pairs starting at `at`.
+    /// `None` for a width the compare array cannot hold, and for a width of
+    /// zero: an unguarded scatter is `0x3e`, not a degenerate `0x3f`.
+    fn decode(body: &[u8], at: usize, len: usize) -> Option<Self> {
+        if len == 0 || len > MAX_GUARD_COMPONENTS {
+            return None;
+        }
+        let mut tuple = Self {
+            cols: [0; MAX_GUARD_COMPONENTS],
+            fields: [0; MAX_GUARD_COMPONENTS],
+            len,
+        };
+        for gi in 0..len {
+            tuple.cols[gi] = body[at + gi * 2];
+            tuple.fields[gi] = body[at + gi * 2 + 1];
+        }
+        Some(tuple)
+    }
+
+    /// The element's guard, imaged through the guarded row's own field
+    /// types. `None` when a component names an array field, which has no
+    /// column-cell form to order.
+    fn incoming(
+        &self,
+        state: &[u8],
+        smap: &StructMapSlot,
+        cols: &[&[u8]],
+        element_idx: u32,
+    ) -> Option<GuardKey> {
+        let mut key = [0u64; MAX_GUARD_COMPONENTS];
+        for gi in 0..self.len {
+            let ft = smap.field_type(state, self.fields[gi]);
+            key[gi] =
+                scalar_cell_order_key(ft, col_at(cols, usize::from(self.cols[gi])), element_idx)?;
+        }
+        Some(key)
+    }
+
+    /// The guard `row` remembers, or `None` when it remembers none — a row
+    /// missing any component has claimed nothing and loses to every
+    /// element, which is also what an absent row does.
+    fn stored(&self, state: &[u8], smap: &StructMapSlot, row: u32) -> Option<GuardKey> {
+        let mut key = [0u64; MAX_GUARD_COMPONENTS];
+        for gi in 0..self.len {
+            let fi = self.fields[gi];
+            if !StructMapSlot::is_field_set(state, row, fi) {
+                return None;
+            }
+            let ft = smap.field_type(state, fi);
+            let off = (row + smap.field_offset(state, fi)) as usize;
+            let size = struct_field_size(ft) as usize;
+            key[gi] = scalar_order_key(ft, &state[off..off + size])?;
+        }
+        Some(key)
+    }
+
+    /// Whether `incoming` loses to what the row remembers. Strictly less
+    /// loses; EQUAL WINS, because one transaction is many elements sharing
+    /// one guard and all of them have to land.
+    fn loses(&self, incoming: &GuardKey, stored: Option<GuardKey>) -> bool {
+        stored.is_some_and(|s| incoming[..self.len] < s[..self.len])
+    }
+
+    /// Whether the row already remembers exactly this guard, so the stamp
+    /// would rewrite identical bytes and journal them.
+    fn already_stamped(&self, incoming: &GuardKey, stored: Option<GuardKey>) -> bool {
+        stored.is_some_and(|s| s[..self.len] == incoming[..self.len])
+    }
+
+    /// Write the element's guard into row `pos`, journaled field by field.
+    /// `row_created` marks the row this stamp brought into existence: its
+    /// first entry then carries the row-absent undo that rollback removes
+    /// the whole row by, so exactly one journal entry claims the creation.
+    #[allow(clippy::too_many_arguments)]
+    fn stamp(
+        &self,
+        undo: &mut UndoState,
+        delta_mode: bool,
+        state: &mut [u8],
+        smap: &StructMapSlot,
+        slot: u8,
+        key: u32,
+        pos: u32,
+        cols: &[&[u8]],
+        element_idx: u32,
+        row_created: bool,
+    ) -> ErrorCode {
+        let row = smap.row_off(pos);
+        for gi in 0..self.len {
+            let fi = self.fields[gi];
+            let ft = smap.field_type(state, fi);
+            let Some((cell, cell_size)) =
+                scalar_cell_encoded(ft, col_at(cols, usize::from(self.cols[gi])), element_idx)
+            else {
+                return ErrorCode::InvalidProgram;
+            };
+            let f_off = row + smap.field_offset(state, fi);
+            let prior_bit = StructMapSlot::is_field_set(state, row, fi);
+            if undo.enabled {
+                let undo_flags = if row_created && gi == 0 {
+                    SMF_ROW_ABSENT
+                } else if prior_bit {
+                    SMF_BIT_SET
+                } else {
+                    0
+                };
+                let prior_aux = if prior_bit {
+                    pack_field_bytes(&state[f_off as usize..(f_off + cell_size) as usize])
+                } else {
+                    0
+                };
+                let smf = |pad2: u8, aux: u64| FlatUndoEntry {
+                    op: FlatUndoOp::StructMapField,
+                    slot,
+                    pad1: fi,
+                    pad2,
+                    key,
+                    prev_value: 0,
+                    aux,
+                };
+                append_mutation_state(
+                    undo,
+                    delta_mode,
+                    state,
+                    smf(undo_flags, prior_aux),
+                    smf(SMF_BIT_SET, pack_field_bytes(&cell[..cell_size as usize])),
+                );
+            }
+            StructMapSlot::set_field_bit(state, row, fi);
+            state[f_off as usize..(f_off + cell_size) as usize]
+                .copy_from_slice(&cell[..cell_size as usize]);
+        }
+        ErrorCode::Ok
+    }
+}
 
 // =============================================================================
 // Single-element struct-map operations
@@ -2587,6 +2749,20 @@ pub(crate) fn body_op_len(code: &[u8], pc: usize) -> Option<usize> {
             5usize.checked_add(num_routes.checked_mul(4)?)?
         }
         //#endregion struct-map scatter-element length
+        //#region reduce-typed-state.scatter-element-guarded-len
+        // The guard pairs sit between the fixed prefix and `num_routes`, so
+        // the route count is found through the guard count, never at a fixed
+        // offset. A width the compare array cannot hold is refused at
+        // execution, not here: this answers only how long the instruction is.
+        Opcode::BatchStructMapScatterGuarded => {
+            let num_guards = usize::from(*code.get(pc.checked_add(5)?)?);
+            let routes_at = 6usize.checked_add(num_guards.checked_mul(2)?)?;
+            let num_routes = usize::from(*code.get(pc.checked_add(routes_at)?)?);
+            routes_at
+                .checked_add(1)?
+                .checked_add(num_routes.checked_mul(4)?)?
+        }
+        //#endregion struct-map guarded scatter-element length
         Opcode::BatchSetInsert
         | Opcode::BatchSetRemove
         | Opcode::BatchBitmapAdd
@@ -4689,6 +4865,265 @@ impl Vm {
                     }
                 }
                 //#endregion reduce-typed-state.scatter-element-exec
+
+                //#region reduce-typed-state.scatter-element-guarded-exec
+                // STRUCT_MAP_SCATTER_GUARDED (0x3f) — 0x3e's routing and
+                // write arms behind a per-row transaction guard. The
+                // semantics are stated once, on the opcode's declaration;
+                // what is here is how they run in one pass.
+                //
+                // Order of work per element, and why: resolve the guarded
+                // row ONCE off the key, compare, and only then act. The
+                // stamp precedes the route action because the kind-0 arm
+                // can `continue` on an identical assert, and a guard left
+                // behind the transaction that just won would let a
+                // transaction between the two write over it afterwards.
+                Opcode::BatchStructMapScatterGuarded => {
+                    let (route_col, op_col, key_col, guard_slot, num_guards) = (
+                        body[bpc + 1],
+                        body[bpc + 2],
+                        body[bpc + 3],
+                        body[bpc + 4],
+                        body[bpc + 5] as usize,
+                    );
+                    let Some(guard) = GuardTuple::decode(body, bpc + 6, num_guards) else {
+                        return INVALID_PROGRAM;
+                    };
+                    bpc += 6 + num_guards * 2;
+
+                    let num_routes = body[bpc] as usize;
+                    if num_routes > MAX_SCATTER_ROUTES {
+                        return INVALID_PROGRAM;
+                    }
+                    bpc += 1;
+
+                    let mut route_kinds = [0u8; MAX_SCATTER_ROUTES];
+                    let mut route_dest_slots = [0u8; MAX_SCATTER_ROUTES];
+                    let mut route_dest_fields = [0u8; MAX_SCATTER_ROUTES];
+                    let mut route_v_cols = [0u8; MAX_SCATTER_ROUTES];
+                    for ri in 0..num_routes {
+                        route_kinds[ri] = body[bpc];
+                        route_dest_slots[ri] = body[bpc + 1];
+                        route_dest_fields[ri] = body[bpc + 2];
+                        route_v_cols[ri] = body[bpc + 3];
+                        bpc += 4;
+                        // The guarded row IS the destination row. A kind-0
+                        // route pointing elsewhere would be a card-one write
+                        // gated by a guard no row of its own slot keeps —
+                        // refused by name rather than left silently
+                        // unguarded.
+                        if route_kinds[ri] == 0 && route_dest_slots[ri] != guard_slot {
+                            return INVALID_PROGRAM;
+                        }
+                    }
+
+                    let key = cell_u32(cols, key_col, child_idx);
+                    if key == EMPTY_KEY || key == TOMBSTONE {
+                        continue;
+                    }
+                    let route_ord = cell_u32(cols, route_col, child_idx);
+                    if route_ord == 0xFFFF_FFFF || route_ord as usize >= num_routes {
+                        continue; // SKIP / out-of-range → SKIP
+                    }
+                    let is_retract = cell_u32(cols, op_col, child_idx) != 0;
+                    let ri = route_ord as usize;
+                    let route_kind = route_kinds[ri];
+                    let dest_slot = route_dest_slots[ri];
+                    let dest_field_idx = route_dest_fields[ri];
+                    let v_col = route_v_cols[ri];
+
+                    let guarded = StructMapSlot::bind(state, guard_slot);
+                    let Some(incoming) = guard.incoming(state, &guarded, cols, child_idx) else {
+                        return INVALID_PROGRAM;
+                    };
+                    // One key lookup for the guard read, the stamp and the
+                    // kind-0 write: the guarded row is the destination row.
+                    let mut guard_pos = guarded.find(state, key);
+                    let stored = guard_pos
+                        .and_then(|pos| guard.stored(state, &guarded, guarded.row_off(pos)));
+                    if guard.loses(&incoming, stored) {
+                        continue; // an older transaction writes nothing, by any route
+                    }
+
+                    if !guard.already_stamped(&incoming, stored) {
+                        let row_created = guard_pos.is_none();
+                        // A retract of an absent row is already a no-op.
+                        // Creating a row to remember it would grow the map
+                        // from keys nothing ever asserted.
+                        if row_created && !is_retract {
+                            let Some(up) = guarded.upsert(state, key) else {
+                                NEEDS_GROWTH_SLOT.store(guard_slot, Ordering::Relaxed);
+                                return NEEDS_GROWTH;
+                            };
+                            guard_pos = Some(up.pos);
+                        }
+                        if let Some(pos) = guard_pos {
+                            let stamped = guard.stamp(
+                                &mut self.undo,
+                                delta_mode,
+                                state,
+                                &guarded,
+                                guard_slot,
+                                key,
+                                pos,
+                                cols,
+                                child_idx,
+                                row_created,
+                            );
+                            if stamped != ErrorCode::Ok {
+                                return stamped as u32;
+                            }
+                            let meta_base = slot_meta_base(guard_slot);
+                            state[(meta_base + SlotMetaOffset::CHANGE_FLAGS) as usize] |=
+                                if row_created {
+                                    ChangeFlag::INSERTED
+                                } else {
+                                    ChangeFlag::UPDATED
+                                };
+                        }
+                    }
+
+                    match route_kind {
+                        // kind 0: card-one struct field on the guarded row.
+                        0 => {
+                            let dst_ft = guarded.field_type(state, dest_field_idx);
+                            let Some((cell, cell_size)) = scalar_cell_encoded(
+                                dst_ft,
+                                col_at(cols, v_col as usize),
+                                child_idx,
+                            ) else {
+                                // Array destinations have no column-cell
+                                // value form; refuse by name instead of
+                                // comparing field bytes against garbage.
+                                return INVALID_PROGRAM;
+                            };
+                            // The stamp resolved this row: it created it for
+                            // an assert, and left a retract of an absent row
+                            // with nothing to clear.
+                            let Some(pos) = guard_pos else {
+                                continue;
+                            };
+                            let row = guarded.row_off(pos);
+                            let dst_off = row + guarded.field_offset(state, dest_field_idx);
+                            let prior_bit = StructMapSlot::is_field_set(state, row, dest_field_idx);
+                            let value_matches = prior_bit
+                                && state[dst_off as usize..(dst_off + cell_size) as usize]
+                                    == cell[..cell_size as usize];
+
+                            if !is_retract {
+                                if value_matches {
+                                    continue;
+                                }
+                                if self.undo.enabled {
+                                    let prior_aux = if prior_bit {
+                                        pack_field_bytes(
+                                            &state
+                                                [dst_off as usize..(dst_off + cell_size) as usize],
+                                        )
+                                    } else {
+                                        0
+                                    };
+                                    let smf = |pad2: u8, aux: u64| FlatUndoEntry {
+                                        op: FlatUndoOp::StructMapField,
+                                        slot: dest_slot,
+                                        pad1: dest_field_idx,
+                                        pad2,
+                                        key,
+                                        prev_value: 0,
+                                        aux,
+                                    };
+                                    // The row's creation is journaled by the
+                                    // stamp, which owns the only row-absent
+                                    // entry; this entry restores one field.
+                                    append_mutation_state(
+                                        &mut self.undo,
+                                        delta_mode,
+                                        state,
+                                        smf(if prior_bit { SMF_BIT_SET } else { 0 }, prior_aux),
+                                        smf(
+                                            SMF_BIT_SET,
+                                            pack_field_bytes(&cell[..cell_size as usize]),
+                                        ),
+                                    );
+                                }
+                                guarded.write_scalar_field(
+                                    state,
+                                    pos,
+                                    dest_field_idx,
+                                    cols,
+                                    v_col,
+                                    child_idx,
+                                );
+                                let meta_base = slot_meta_base(dest_slot);
+                                state[(meta_base + SlotMetaOffset::CHANGE_FLAGS) as usize] |=
+                                    if prior_bit {
+                                        ChangeFlag::UPDATED
+                                    } else {
+                                        ChangeFlag::INSERTED
+                                    };
+                            } else if value_matches {
+                                // Retract is a no-op unless the stored value
+                                // still matches v.
+                                if self.undo.enabled {
+                                    let prior_aux = pack_field_bytes(
+                                        &state[dst_off as usize..(dst_off + cell_size) as usize],
+                                    );
+                                    let smf = |pad2: u8, aux: u64| FlatUndoEntry {
+                                        op: FlatUndoOp::StructMapField,
+                                        slot: dest_slot,
+                                        pad1: dest_field_idx,
+                                        pad2,
+                                        key,
+                                        prev_value: 0,
+                                        aux,
+                                    };
+                                    append_mutation_state(
+                                        &mut self.undo,
+                                        delta_mode,
+                                        state,
+                                        smf(SMF_BIT_SET, prior_aux),
+                                        smf(0, 0),
+                                    );
+                                }
+                                StructMapSlot::clear_scalar_field(state, row, dest_field_idx);
+                                bytes::zero(state, dst_off, cell_size);
+                                let meta_base = slot_meta_base(dest_slot);
+                                state[(meta_base + SlotMetaOffset::CHANGE_FLAGS) as usize] |=
+                                    ChangeFlag::REMOVED;
+                            }
+                        }
+                        // kind 1: card-many set — the element carries the
+                        // precomputed interned composite in its column. The
+                        // set keeps no guard of its own; the guarded row's
+                        // guard gates this write too, which is what makes a
+                        // stale transaction lose the whole group.
+                        1 => {
+                            let meta = SlotMetaView::read(state, dest_slot);
+                            let v = cell_u32(cols, v_col, child_idx);
+                            if is_retract {
+                                self.set_remove(delta_mode, state, &meta, dest_slot, &[v]);
+                            } else {
+                                let set_result = self.set_insert(
+                                    delta_mode,
+                                    state,
+                                    &meta,
+                                    dest_slot,
+                                    &[v],
+                                    meta.has_ttl().then_some(&[0.0][..]),
+                                );
+                                // Any failure requests growth so the caller
+                                // can retry.
+                                if set_result != ErrorCode::Ok {
+                                    NEEDS_GROWTH_SLOT.store(dest_slot, Ordering::Relaxed);
+                                    return NEEDS_GROWTH;
+                                }
+                            }
+                        }
+                        // kind 2: deferred to Phase 2 — never emitted.
+                        _ => return INVALID_PROGRAM,
+                    }
+                }
+                //#endregion reduce-typed-state.scatter-element-guarded-exec
 
                 // LIST_APPEND (0x84)
                 Opcode::ListAppend => {

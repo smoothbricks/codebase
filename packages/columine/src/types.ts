@@ -296,10 +296,37 @@ export enum Opcode {
   // by the producer before the batch was built), so they are read directly
   // and no intermediate row is ever staged in a slot. Kind arms, the identical-assert
   // no-op, and the retract-iff-current rule are byte-identical to 0x2f minus
-  // the probe. Variable-length operands:
+  // the probe.
+  // Two write arms and no aggregator: kind 0 is a card-one struct field
+  // (assert overwrites; retract clears iff the stored cell still equals the
+  // retracted one) and kind 1 is a set membership (insert/remove). The family
+  // is therefore last-write-wins in STREAM order. A destination that must keep
+  // the winner by a value the element CARRIES takes 0x3f, which puts a guard in
+  // front of these same two arms. Variable-length operands:
   //   route_col:u8, op_col:u8, key_col:u8, num_routes:u8,
   //   [kind:u8, dest_slot:u8, dest_field_idx:u8, v_col:u8] × num_routes
   BATCH_STRUCT_MAP_SCATTER = 0x3e,
+
+  // Guarded route-column dispatch, probe-free. Routing, kinds and the
+  // assert/retract semantics are 0x3e's, unchanged. Added: every element
+  // carries a guard tuple naming the transaction it belongs to, and the
+  // guarded row guard_slot[key_col] remembers the guard of the transaction
+  // that last wrote it. Components compare in declared order, most significant
+  // first, each through the destination field's declared type.
+  // SKIP IFF THE ELEMENT'S GUARD IS STRICTLY LESS THAN THE STORED GUARD, and
+  // the skip is total — it gates every route of the group, kind-1 included, so
+  // a late transaction cannot win some columns of a row and lose others.
+  // EQUAL PROCEEDS: one transaction is many elements sharing one guard and all
+  // of them have to land, which also makes replay a no-op through the
+  // identical-assert check rather than through exclusion. The emitter's
+  // precondition is that two DISTINCT transactions never produce equal tuples;
+  // where they can tie, it declares an extra component that is unique per
+  // transaction. Every kind-0 route's dest_slot MUST equal guard_slot.
+  // Variable-length operands:
+  //   route_col:u8, op_col:u8, key_col:u8, guard_slot:u8, num_guards:u8,
+  //   [guard_col:u8, guard_field_idx:u8] × num_guards, num_routes:u8,
+  //   [kind:u8, dest_slot:u8, dest_field_idx:u8, v_col:u8] × num_routes
+  BATCH_STRUCT_MAP_SCATTER_GUARDED = 0x3f,
   //#endregion reduce-typed-state.scatter-element-op
 
   // Batch HashSet ops

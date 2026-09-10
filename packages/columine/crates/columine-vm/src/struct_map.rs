@@ -86,6 +86,62 @@ pub(crate) fn scalar_cell_encoded(
     }
 }
 
+/// The order-preserving `u64` image of one scalar cell, in the exact stored
+/// form [`write_scalar_cell`] writes and [`scalar_cell_encoded`] returns.
+///
+/// WHY an image and not a per-type comparison: the guarded scatter (`0x3f`)
+/// compares a tuple of guard components lexicographically, once per element,
+/// on the hot path. Mapping each component into one unsigned space collapses
+/// the whole comparison to `[u64; N] < [u64; N]` — one code path, no per-type
+/// branch inside the compare, and the same image for the element's cell and
+/// the stored field because both arrive here as the same bytes.
+///
+/// The mapping is monotone in each type's own order: unsigned lanes pass
+/// through, `Int64` flips the sign bit so negatives sort below positives, and
+/// `Float64` takes the standard total order (negatives inverted, positives
+/// sign-set) so every bit pattern including NaN lands somewhere definite
+/// rather than comparing false against itself.
+///
+/// `None` for array field types, for the same reason
+/// [`scalar_cell_encoded`] refuses them: an array field has no column-cell
+/// form, so a guard naming one is refused by name instead of ordering
+/// garbage.
+pub(crate) fn scalar_order_key(ft: StructFieldType, cell: &[u8]) -> Option<u64> {
+    match ft {
+        StructFieldType::UInt32 | StructFieldType::String => {
+            Some(u64::from(bytes::read_u32(cell, 0)))
+        }
+        StructFieldType::Bool => Some(u64::from(cell[0] != 0)),
+        StructFieldType::Int64 => Some(bytes::read_u64(cell, 0) ^ (1u64 << 63)),
+        StructFieldType::Float64 => {
+            let bits = bytes::read_u64(cell, 0);
+            Some(if bits >> 63 == 0 {
+                bits | (1u64 << 63)
+            } else {
+                !bits
+            })
+        }
+        StructFieldType::ArrayU32
+        | StructFieldType::ArrayI64
+        | StructFieldType::ArrayF64
+        | StructFieldType::ArrayString
+        | StructFieldType::ArrayBool => None,
+    }
+}
+
+/// One column cell as an order key: encoded exactly as it would be stored,
+/// then imaged. The pairing lives here rather than at the call site so the
+/// element side of a guard comparison cannot encode through one path and
+/// order through another.
+pub(crate) fn scalar_cell_order_key(
+    ft: StructFieldType,
+    col: &[u8],
+    element_idx: u32,
+) -> Option<u64> {
+    let (cell, size) = scalar_cell_encoded(ft, col, element_idx)?;
+    scalar_order_key(ft, &cell[..size as usize])
+}
+
 /// Bound struct-map view carrying offsets into the state buffer.
 /// No pointers into state are formed.
 #[derive(Clone, Copy, Debug)]

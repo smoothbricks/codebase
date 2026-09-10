@@ -12,7 +12,8 @@ use columine_vm::state_init::{
 };
 use columine_vm::struct_map::StructMapSlot;
 use columine_vm::vm::{
-    Vm, f64s_as_bytes, u32s_as_bytes, vm_map_get, vm_set_contains, vm_struct_map_get_row_ptr,
+    Vm, f64s_as_bytes, i64s_as_bytes, u32s_as_bytes, vm_map_get, vm_set_contains,
+    vm_struct_map_get_row_ptr,
 };
 
 const OK: u32 = ErrorCode::Ok as u32;
@@ -1600,6 +1601,532 @@ fn struct_scatter_over_capacity_route_table_is_invalid_program() {
         ErrorCode::InvalidProgram as u32,
         run_struct_scatter(&mut vm, &mut state, &full, T, &element)
     );
+}
+
+// =============================================================================
+// STRUCT_MAP_SCATTER_GUARDED 0x3f — 0x3e's dispatch behind a per-row guard
+// =============================================================================
+
+/// One resolved element of a `BATCH_STRUCT_MAP_SCATTER_GUARDED` batch.
+/// Columns: 0=type(FOR_EACH filter), 1=offsets(FLAT_MAP child), 2=route(u32),
+/// 3=op(u32), 4=key(u32), 5=v_str(interned u32), 6=v_set(interned composite
+/// u32), 7=guard at_ns(i64), 8=guard ordinal(i64).
+struct GuardedElement {
+    route: u32,
+    op_retract: u32,
+    key: u32,
+    v_str: u32,
+    v_set: u32,
+    at_ns: i64,
+    ordinal: i64,
+}
+
+/// Row layout of the guarded `checks` slot: bitset(1) then verdict(4),
+/// detail(4), at_ns(8), ordinal(8).
+const VERDICT_AT: u32 = 1;
+const DETAIL_AT: u32 = 5;
+const AT_NS_AT: u32 = 9;
+const ORDINAL_AT: u32 = 17;
+
+/// FOR_EACH { FLAT_MAP { 0x3f } } over slot 0 = `checks`, a guarded struct
+/// map \[verdict:STR, detail:STR, at_ns:I64, ordinal:I64\], and slot 1 =
+/// `tags`, a HASHSET. The guard is (at_ns, ordinal) carried in columns 7
+/// and 8 and remembered in fields 2 and 3 of the guarded row.
+fn build_guarded_scatter_program(type_id: u32) -> Vec<u8> {
+    let mut init = Vec::new();
+    init.extend(slot_struct_map(0, 6, 8, &[4, 4, 1, 1]));
+    init.extend(slot_def(1, 1, 8, 0));
+    let mut reduce = vec![0xE0, 0, 1];
+    reduce.extend(type_id.to_le_bytes());
+    let flat_map = guarded_flat_map(&guarded_scatter_body());
+    reduce.extend((flat_map.len() as u16).to_le_bytes());
+    reduce.extend(&flat_map);
+    program(2, 9, &init, &reduce)
+}
+
+/// The 0x3f body the suite routes through: guard_slot=0, two guard pairs,
+/// three routes — two kind-0 columns of the guarded row and one kind-1 set.
+fn guarded_scatter_body() -> Vec<u8> {
+    #[rustfmt::skip]
+    let body: [u8; 23] = [
+        0x3f, 2, 3, 4, 0, 2,
+        7, 2,       // guard 0: column 7 -> field 2 (at_ns), most significant
+        8, 3,       // guard 1: column 8 -> field 3 (ordinal)
+        3,          // num_routes
+        0, 0, 0, 5, // route 0: kind0 -> checks.verdict, v=v_str
+        0, 0, 1, 5, // route 1: kind0 -> checks.detail,  v=v_str
+        1, 1, 0, 6, // route 2: kind1 -> tags,           v=v_set
+    ];
+    body.to_vec()
+}
+
+fn guarded_flat_map(body: &[u8]) -> Vec<u8> {
+    let mut flat_map = vec![0xE1, 1, 0xFF];
+    flat_map.extend((body.len() as u16).to_le_bytes());
+    flat_map.extend_from_slice(body);
+    flat_map
+}
+
+fn run_guarded_scatter(
+    vm: &mut Vm,
+    state: &mut [u8],
+    prog: &[u8],
+    type_id: u32,
+    elements: &[GuardedElement],
+) -> u32 {
+    let types: Vec<u32> = vec![type_id; elements.len()];
+    let routes: Vec<u32> = elements.iter().map(|e| e.route).collect();
+    let ops: Vec<u32> = elements.iter().map(|e| e.op_retract).collect();
+    let keys: Vec<u32> = elements.iter().map(|e| e.key).collect();
+    let v_strs: Vec<u32> = elements.iter().map(|e| e.v_str).collect();
+    let v_sets: Vec<u32> = elements.iter().map(|e| e.v_set).collect();
+    let at_ns: Vec<i64> = elements.iter().map(|e| e.at_ns).collect();
+    let ordinals: Vec<i64> = elements.iter().map(|e| e.ordinal).collect();
+    let n = elements.len() as u32;
+    let offsets = [0u32, n];
+    let cols: Vec<&[u8]> = vec![
+        u32s_as_bytes(&types),
+        u32s_as_bytes(&offsets),
+        u32s_as_bytes(&routes),
+        u32s_as_bytes(&ops),
+        u32s_as_bytes(&keys),
+        u32s_as_bytes(&v_strs),
+        u32s_as_bytes(&v_sets),
+        i64s_as_bytes(&at_ns),
+        i64s_as_bytes(&ordinals),
+    ];
+    vm.execute_batch(state, prog, &cols, 1)
+}
+
+/// The three elements of one transaction against key `key`: verdict,
+/// detail, and one set member, all carrying the same guard.
+fn guarded_transaction(
+    key: u32,
+    verdict: u32,
+    detail: u32,
+    tag: u32,
+    at_ns: i64,
+    ordinal: i64,
+) -> [GuardedElement; 3] {
+    [
+        GuardedElement {
+            route: 0,
+            op_retract: 0,
+            key,
+            v_str: verdict,
+            v_set: 0,
+            at_ns,
+            ordinal,
+        },
+        GuardedElement {
+            route: 1,
+            op_retract: 0,
+            key,
+            v_str: detail,
+            v_set: 0,
+            at_ns,
+            ordinal,
+        },
+        GuardedElement {
+            route: 2,
+            op_retract: 0,
+            key,
+            v_str: 0,
+            v_set: tag,
+            at_ns,
+            ordinal,
+        },
+    ]
+}
+
+fn read_i64(state: &[u8], off: u32) -> i64 {
+    bytes::read_u64(state, off) as i64
+}
+
+fn tag_present(state: &[u8], tag: u32) -> bool {
+    vm_set_contains(state, slot_offset(state, 1), slot_cap(state, 1), tag)
+}
+
+/// The row-granularity rule: an element whose guard is strictly below the
+/// row's writes through NO route of its group. The kind-1 arm is the one
+/// that a per-route guard would leak — a set has no row to carry a guard,
+/// so only the group gate can stop it.
+#[test]
+fn guarded_scatter_stale_transaction_writes_through_no_route_including_the_set() {
+    const T: u32 = 3101;
+    let prog = build_guarded_scatter_program(T);
+    let mut state = init(&prog);
+    let mut vm = Vm::default();
+
+    let fresh = guarded_transaction(500, 7002, 7012, 8002, 2000, 20);
+    assert_eq!(
+        OK,
+        run_guarded_scatter(&mut vm, &mut state, &prog, T, &fresh)
+    );
+
+    // Same row, an earlier transaction arriving late.
+    let stale = guarded_transaction(500, 7001, 7011, 8001, 1000, 10);
+    assert_eq!(
+        OK,
+        run_guarded_scatter(&mut vm, &mut state, &prog, T, &stale)
+    );
+
+    let row = struct_map_row(&state, 0, 500);
+    assert_ne!(0xFFFF_FFFF, row);
+    assert_eq!(7002, bytes::read_u32(&state, row + VERDICT_AT));
+    assert_eq!(7012, bytes::read_u32(&state, row + DETAIL_AT));
+    assert_eq!(2000, read_i64(&state, row + AT_NS_AT));
+    assert_eq!(20, read_i64(&state, row + ORDINAL_AT));
+    assert!(tag_present(&state, 8002));
+    assert!(
+        !tag_present(&state, 8001),
+        "the stale transaction's set member is gated by the same row guard"
+    );
+    assert_eq!(1, slot_size(&state, 1));
+}
+
+/// Equal guards PROCEED, which is what lets one transaction's elements all
+/// land: the first stamps the row and the rest compare equal. A
+/// strictly-greater rule would leave the row holding only its first column.
+/// The same test pins the order-independence a total guard order buys for a
+/// card-one field, and the honest limit of it for a card-many set.
+#[test]
+fn guarded_scatter_equal_guard_completes_the_row_and_order_does_not_change_it() {
+    const T: u32 = 3102;
+    let prog = build_guarded_scatter_program(T);
+    let mut vm = Vm::default();
+
+    let older = guarded_transaction(500, 7001, 7011, 8001, 1000, 10);
+    let newer = guarded_transaction(500, 7002, 7012, 8002, 2000, 20);
+
+    let mut forward = init(&prog);
+    assert_eq!(
+        OK,
+        run_guarded_scatter(&mut vm, &mut forward, &prog, T, &older)
+    );
+    // Every column of the older transaction landed: three elements, one
+    // guard, none of them skipped.
+    let row = struct_map_row(&forward, 0, 500);
+    assert_eq!(7001, bytes::read_u32(&forward, row + VERDICT_AT));
+    assert_eq!(7011, bytes::read_u32(&forward, row + DETAIL_AT));
+    assert!(tag_present(&forward, 8001));
+    assert_eq!(
+        OK,
+        run_guarded_scatter(&mut vm, &mut forward, &prog, T, &newer)
+    );
+
+    let mut reverse = init(&prog);
+    assert_eq!(
+        OK,
+        run_guarded_scatter(&mut vm, &mut reverse, &prog, T, &newer)
+    );
+    assert_eq!(
+        OK,
+        run_guarded_scatter(&mut vm, &mut reverse, &prog, T, &older)
+    );
+
+    let f_row = struct_map_row(&forward, 0, 500);
+    let r_row = struct_map_row(&reverse, 0, 500);
+    for (name, at) in [("verdict", VERDICT_AT), ("detail", DETAIL_AT)] {
+        assert_eq!(
+            bytes::read_u32(&forward, f_row + at),
+            bytes::read_u32(&reverse, r_row + at),
+            "card-one {name} does not depend on which order the two transactions arrived in"
+        );
+    }
+    assert_eq!(7002, bytes::read_u32(&forward, f_row + VERDICT_AT));
+    assert_eq!(2000, read_i64(&forward, f_row + AT_NS_AT));
+    assert_eq!(2000, read_i64(&reverse, r_row + AT_NS_AT));
+
+    // A set accumulates, so it converges to what was ACCEPTED, not to the
+    // highest transaction: the older one contributed when it arrived first
+    // and contributed nothing at all when it arrived last. All-or-nothing
+    // per transaction is the guarantee; convergence is not.
+    assert!(tag_present(&forward, 8001) && tag_present(&forward, 8002));
+    assert!(tag_present(&reverse, 8002) && !tag_present(&reverse, 8001));
+}
+
+/// A retract is guarded too. The stale retract here names the value the row
+/// actually holds, so retract-iff-current would fire and clear it without
+/// the guard in front.
+#[test]
+fn guarded_scatter_stale_retract_does_not_delete_a_fresher_row() {
+    const T: u32 = 3103;
+    let prog = build_guarded_scatter_program(T);
+    let mut state = init(&prog);
+    let mut vm = Vm::default();
+
+    let fresh = guarded_transaction(500, 7002, 7012, 8002, 2000, 20);
+    assert_eq!(
+        OK,
+        run_guarded_scatter(&mut vm, &mut state, &prog, T, &fresh)
+    );
+
+    let stale_retract = [
+        GuardedElement {
+            route: 0,
+            op_retract: 1,
+            key: 500,
+            v_str: 7002, // matches what is stored: an unguarded retract clears
+            v_set: 0,
+            at_ns: 1000,
+            ordinal: 10,
+        },
+        GuardedElement {
+            route: 2,
+            op_retract: 1,
+            key: 500,
+            v_str: 0,
+            v_set: 8002, // present in the set: an unguarded remove drops it
+            at_ns: 1000,
+            ordinal: 10,
+        },
+    ];
+    assert_eq!(
+        OK,
+        run_guarded_scatter(&mut vm, &mut state, &prog, T, &stale_retract)
+    );
+
+    let row = struct_map_row(&state, 0, 500);
+    assert!(bit_set(&state, row, 0));
+    assert_eq!(7002, bytes::read_u32(&state, row + VERDICT_AT));
+    assert!(tag_present(&state, 8002));
+
+    // The same retract at the row's own guard is not stale, and clears.
+    let current_retract = [GuardedElement {
+        route: 0,
+        op_retract: 1,
+        key: 500,
+        v_str: 7002,
+        v_set: 0,
+        at_ns: 2000,
+        ordinal: 20,
+    }];
+    assert_eq!(
+        OK,
+        run_guarded_scatter(&mut vm, &mut state, &prog, T, &current_retract)
+    );
+    assert!(!bit_set(&state, row, 0));
+}
+
+/// The one asymmetry between a passing assert and a passing retract: an
+/// assert upserts the guarded row, a retract stamps only a row that
+/// already exists. A retract of an absent row has nothing to clear, and a
+/// map that grew a row per retracted unknown key would be unbounded in the
+/// keys nothing ever asserted.
+#[test]
+fn guarded_scatter_a_retract_of_an_absent_row_creates_nothing() {
+    const T: u32 = 3108;
+    let prog = build_guarded_scatter_program(T);
+    let mut state = init(&prog);
+    let mut vm = Vm::default();
+
+    let retracts: Vec<GuardedElement> = (0..4)
+        .map(|i| GuardedElement {
+            route: 0,
+            op_retract: 1,
+            key: 900 + i,
+            v_str: 7002,
+            v_set: 0,
+            at_ns: 1000,
+            ordinal: 10,
+        })
+        .collect();
+    assert_eq!(
+        OK,
+        run_guarded_scatter(&mut vm, &mut state, &prog, T, &retracts)
+    );
+    assert_eq!(
+        0,
+        slot_size(&state, 0),
+        "four retracts of keys nothing asserted leave the map empty"
+    );
+}
+
+/// The stamp writes guard fields, so it journals them, and exactly one of
+/// its entries claims the row it created — otherwise a rolled-back
+/// transaction would leave a row of guard columns behind, and the next
+/// element to arrive would lose to a transaction that never happened.
+#[test]
+fn guarded_scatter_rolling_back_a_transaction_removes_the_row_it_stamped() {
+    const T: u32 = 3109;
+    let prog = build_guarded_scatter_program(T);
+    let mut state = init(&prog);
+    let mut vm = Vm::default();
+
+    let first = guarded_transaction(500, 7001, 7011, 8001, 1000, 10);
+    assert_eq!(
+        OK,
+        run_guarded_scatter(&mut vm, &mut state, &prog, T, &first)
+    );
+
+    vm.undo_enable(&state);
+    let cp = vm.undo_checkpoint();
+    let second = guarded_transaction(501, 7002, 7012, 8002, 2000, 20);
+    assert_eq!(
+        OK,
+        run_guarded_scatter(&mut vm, &mut state, &prog, T, &second)
+    );
+    assert_eq!(2, slot_size(&state, 0));
+
+    vm.undo_rollback(&mut state, cp);
+    vm.undo_commit();
+    assert_eq!(
+        0xFFFF_FFFF,
+        struct_map_row(&state, 0, 501),
+        "the rolled-back transaction leaves no guard-only row behind"
+    );
+    assert_eq!(1, slot_size(&state, 0));
+
+    // And the row it did not touch still remembers its own guard, so a
+    // transaction older than the first still loses.
+    let row = struct_map_row(&state, 0, 500);
+    assert_eq!(1000, read_i64(&state, row + AT_NS_AT));
+    let older = guarded_transaction(500, 7009, 7019, 8009, 500, 5);
+    assert_eq!(
+        OK,
+        run_guarded_scatter(&mut vm, &mut state, &prog, T, &older)
+    );
+    assert_eq!(7001, bytes::read_u32(&state, row + VERDICT_AT));
+
+    // The stamped guard is also restored, not just the row: re-running the
+    // rolled-back transaction against key 501 must succeed from scratch.
+    assert_eq!(
+        OK,
+        run_guarded_scatter(&mut vm, &mut state, &prog, T, &second)
+    );
+    let restored = struct_map_row(&state, 0, 501);
+    assert_ne!(0xFFFF_FFFF, restored);
+    assert_eq!(7002, bytes::read_u32(&state, restored + VERDICT_AT));
+    assert_eq!(2000, read_i64(&state, restored + AT_NS_AT));
+}
+
+/// Replay is a no-op by construction: the guard is equal, so the elements
+/// PROCEED into the write path, where the identical-assert check and
+/// retract-iff-current make each write nothing. Byte equality of the whole
+/// state is the claim — a stamp that rewrote the guard, or a set arm that
+/// re-inserted, would show up here.
+#[test]
+fn guarded_scatter_replaying_an_identical_transaction_changes_no_state() {
+    const T: u32 = 3104;
+    let prog = build_guarded_scatter_program(T);
+    let mut state = init(&prog);
+    let mut vm = Vm::default();
+
+    let tx = guarded_transaction(500, 7002, 7012, 8002, 2000, 20);
+    assert_eq!(OK, run_guarded_scatter(&mut vm, &mut state, &prog, T, &tx));
+    clear_slot_change_flags(&mut state, 0);
+    clear_slot_change_flags(&mut state, 1);
+    let applied = state.clone();
+
+    assert_eq!(OK, run_guarded_scatter(&mut vm, &mut state, &prog, T, &tx));
+    assert_eq!(
+        applied, state,
+        "an identical transaction replayed leaves every byte of state alone"
+    );
+}
+
+/// The stamp precedes the route action, and the ordering is observable. A
+/// transaction that re-asserts the value already stored takes the kind-0
+/// identical-assert `continue`; if the guard were stamped after the write
+/// it would never be stamped at all, and a transaction BETWEEN the two
+/// would then still be able to overwrite the row.
+#[test]
+fn guarded_scatter_an_identical_assert_still_advances_the_row_guard() {
+    const T: u32 = 3107;
+    let prog = build_guarded_scatter_program(T);
+    let mut state = init(&prog);
+    let mut vm = Vm::default();
+
+    let first = guarded_transaction(500, 7002, 7012, 8002, 1000, 10);
+    assert_eq!(
+        OK,
+        run_guarded_scatter(&mut vm, &mut state, &prog, T, &first)
+    );
+    // The stamp comes first, so the row exists by the time the kind-0 arm
+    // looks for it: on a row the stamp had not yet created, every kind-0
+    // route would find nothing and the transaction would leave a row of
+    // guard columns and no values.
+    let row = struct_map_row(&state, 0, 500);
+    assert_ne!(0xFFFF_FFFF, row);
+    assert_eq!(7002, bytes::read_u32(&state, row + VERDICT_AT));
+    assert_eq!(7012, bytes::read_u32(&state, row + DETAIL_AT));
+    assert_eq!(1000, read_i64(&state, row + AT_NS_AT));
+
+    // A later transaction re-asserting exactly what is stored: every route
+    // writes nothing, and the row's guard must still move to 3000.
+    let identical = guarded_transaction(500, 7002, 7012, 8002, 3000, 30);
+    assert_eq!(
+        OK,
+        run_guarded_scatter(&mut vm, &mut state, &prog, T, &identical)
+    );
+    assert_eq!(3000, read_i64(&state, row + AT_NS_AT));
+
+    // Between the two, and therefore stale against the row as it now
+    // stands: it must not write.
+    let between = guarded_transaction(500, 7009, 7019, 8009, 2000, 20);
+    assert_eq!(
+        OK,
+        run_guarded_scatter(&mut vm, &mut state, &prog, T, &between)
+    );
+    assert_eq!(7002, bytes::read_u32(&state, row + VERDICT_AT));
+    assert!(!tag_present(&state, 8009));
+}
+
+/// A kind-0 route pointing at a slot other than the guarded one would be a
+/// card-one write gated by a guard no row of its own slot keeps. Refused by
+/// name rather than left silently unguarded.
+#[test]
+fn guarded_scatter_kind0_route_outside_the_guarded_slot_is_invalid_program() {
+    const T: u32 = 3105;
+    let mut body = guarded_scatter_body();
+    body[12] = 1; // route 0's dest_slot: the set slot, not the guarded map
+    let refused = guarded_program_with_body(&body, T);
+    let mut state = init(&refused);
+    let mut vm = Vm::default();
+    let tx = guarded_transaction(500, 7002, 7012, 8002, 2000, 20);
+    assert_eq!(
+        ErrorCode::InvalidProgram as u32,
+        run_guarded_scatter(&mut vm, &mut state, &refused, T, &tx)
+    );
+}
+
+/// A guard tuple the compare array cannot hold, and a guard tuple of zero
+/// components, both refuse: an unguarded scatter is 0x3e, and a wider tuple
+/// would index past the decode array (92 §4 — reject at sizing).
+#[test]
+fn guarded_scatter_guard_width_outside_the_decode_array_is_invalid_program() {
+    const T: u32 = 3106;
+    let tx = guarded_transaction(500, 7002, 7012, 8002, 2000, 20);
+
+    for pairs in [0usize, 5] {
+        let mut body = vec![0x3fu8, 2, 3, 4, 0, pairs as u8];
+        for _ in 0..pairs {
+            body.extend_from_slice(&[7, 2]);
+        }
+        body.push(1);
+        body.extend_from_slice(&[0, 0, 0, 5]);
+        let refused = guarded_program_with_body(&body, T);
+        let mut state = init(&refused);
+        let mut vm = Vm::default();
+        assert_eq!(
+            ErrorCode::InvalidProgram as u32,
+            run_guarded_scatter(&mut vm, &mut state, &refused, T, &tx),
+            "a guard tuple of {pairs} components must refuse"
+        );
+    }
+}
+
+fn guarded_program_with_body(body: &[u8], type_id: u32) -> Vec<u8> {
+    let mut init_code = Vec::new();
+    init_code.extend(slot_struct_map(0, 6, 8, &[4, 4, 1, 1]));
+    init_code.extend(slot_def(1, 1, 8, 0));
+    let mut reduce = vec![0xE0, 0, 1];
+    reduce.extend(type_id.to_le_bytes());
+    let flat_map = guarded_flat_map(body);
+    reduce.extend((flat_map.len() as u16).to_le_bytes());
+    reduce.extend(&flat_map);
+    program(2, 9, &init_code, &reduce)
 }
 
 /// The probe scatter carries the same route-table admission bound (the
