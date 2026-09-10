@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from 'bun:test';
-import { existsSync, readFileSync, statSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, statSync } from 'node:fs';
 import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -22,6 +22,12 @@ import {
   type ProcessRunOptions,
   writeTemporaryConfigForTest,
 } from './deploy-stage.js';
+import {
+  type FetchLike,
+  findVersionIdByTag,
+  LIVE_VERSION_CACHE_TTL_MS,
+  readCachedLiveVersion,
+} from './live-version.js';
 import type { LiveKvNamespace } from './stage.js';
 
 const HASH = '16577780061662788004';
@@ -58,11 +64,41 @@ class FakeRunner implements ProcessRunner {
   secretsJson: string | undefined;
   /** Runs before the fake reports success, so a test can read a temporary file the command was handed. */
   onCall: ((args: string[], cwd: string) => Promise<void>) | undefined;
+  /**
+   * How many `deployments status` reads still answer with the OLD version after a traffic shift.
+   * This is the whole point of the fake: Cloudflare accepts the shift before it serves it.
+   */
+  propagationPolls = 0;
+
+  private pendingVersionId: string | null = null;
 
   constructor(
-    private readonly versions: unknown = [],
-    private readonly deployment: unknown = {},
+    private versions: unknown = [],
+    private deployment: unknown = {},
   ) {}
+
+  /** The versions payload as a growable list, so an upload can add the version it just created. */
+  private versionList(): unknown[] {
+    const list: unknown[] = Array.isArray(this.versions) ? this.versions : [this.versions];
+    this.versions = list;
+    return list;
+  }
+
+  private shiftTrafficTo(versionId: string): void {
+    this.pendingVersionId = versionId;
+  }
+
+  private readDeployment(): unknown {
+    if (this.pendingVersionId !== null) {
+      if (this.propagationPolls > 0) {
+        this.propagationPolls -= 1;
+      } else {
+        this.deployment = { versions: [{ version_id: this.pendingVersionId, percentage: 100 }] };
+        this.pendingVersionId = null;
+      }
+    }
+    return this.deployment;
+  }
 
   async run(command: string, args: string[], options: ProcessRunOptions): Promise<ProcessResult> {
     this.calls.push({ command, args, cwd: options.cwd, env: childEnvironment(options) });
@@ -70,7 +106,7 @@ class FakeRunner implements ProcessRunner {
       return success(this.versions);
     }
     if (args[0] === 'deployments' && args[1] === 'status') {
-      return success(this.deployment);
+      return success(this.readDeployment());
     }
     const configIndex = args.indexOf('--config');
     if (configIndex >= 0) {
@@ -83,6 +119,21 @@ class FakeRunner implements ProcessRunner {
       const secretsPath = requiredTestValue(this.secretsPathSeen, 'secrets path');
       this.secretsMode = statSync(secretsPath).mode & 0o777;
       this.secretsJson = readFileSync(secretsPath, 'utf8');
+    }
+    if (args[0] === 'versions' && args[1] === 'deploy') {
+      // Resolved with the same reader the deploy uses, so the fake cannot agree with a lookup
+      // production would miss.
+      const tag = args[args.indexOf('--version-tag') + 1];
+      const existing = tag ? findVersionIdByTag(this.versions, tag) : null;
+      if (existing) this.shiftTrafficTo(existing);
+    }
+    if (args[0] === 'deploy') {
+      const tagIndex = args.indexOf('--tag');
+      if (tagIndex >= 0) {
+        const versionId = `uploaded-${args[tagIndex + 1]}`;
+        this.versionList().push({ id: versionId, annotations: { 'workers/tag': args[tagIndex + 1] } });
+        this.shiftTrafficTo(versionId);
+      }
     }
     await this.onCall?.(args, options.cwd);
     return success({});
@@ -179,8 +230,8 @@ class FakeCloudflare implements CloudflareClient {
   }
 }
 
-describe('deploy-stage remote version fallback', () => {
-  it('returns a remote cache hit for the active tagged 100% version', async () => {
+describe('deploy-stage against live state', () => {
+  it('uploads nothing and shifts no traffic when the live version already is the task hash', async () => {
     const root = await fixtureRoot();
     const runner = new FakeRunner([{ id: 'version-1', annotations: { 'workers/tag': `nx-${HASH}` } }], {
       versions: [{ version_id: 'version-1', percentage: 100 }],
@@ -189,14 +240,17 @@ describe('deploy-stage remote version fallback', () => {
     const result = await deployStage(root, { stage: 'pr123' }, dependencies(runner, new FakeCloudflare()));
 
     expect(result.action).toBe('remote-cache-hit');
+    // Two reads and nothing else. This is what makes a redundant deploy — the one a cross-project
+    // `dependsOn` edge adds — provably free instead of assumed free.
     expect(runner.calls.map((call) => call.args.slice(0, 2))).toEqual([
       ['versions', 'list'],
       ['deployments', 'status'],
     ]);
   });
 
-  it('activates an existing tagged version that is not current', async () => {
+  it('redeploys after a rollback, when the live version is no longer the task hash', async () => {
     const root = await fixtureRoot();
+    // The build for this hash is still uploaded; someone rolled traffic back to the older version.
     const runner = new FakeRunner([{ id: 'version-1', annotations: { 'workers/tag': `nx-${HASH}` } }], {
       versions: [{ version_id: 'version-2', percentage: 100 }],
     });
@@ -204,9 +258,106 @@ describe('deploy-stage remote version fallback', () => {
     const result = await deployStage(root, { stage: 'pr123' }, dependencies(runner, new FakeCloudflare()));
 
     expect(result.action).toBe('activated');
-    expect(runner.calls.at(-1)?.args.slice(0, 3)).toEqual(['versions', 'deploy', '--version-tag']);
-    expect(runner.configPathSeen).toBeDefined();
+    const shiftIndex = runner.calls.findIndex((call) => call.args[0] === 'versions' && call.args[1] === 'deploy');
+    expect(runner.calls[shiftIndex]?.args.slice(0, 4)).toEqual(['versions', 'deploy', '--version-tag', `nx-${HASH}`]);
+    // And the step does not return until it has read live state again after that shift.
+    expect(runner.calls.slice(shiftIndex + 1).some((call) => call.args[0] === 'deployments')).toBe(true);
     expect(existsSync(requiredTestValue(runner.configPathSeen, 'config path'))).toBe(false);
+  });
+
+  it('waits out propagation before reporting the deploy done', async () => {
+    const root = await fixtureRoot();
+    const runner = new FakeRunner([{ id: 'version-1', annotations: { 'workers/tag': `nx-${HASH}` } }], {
+      versions: [{ version_id: 'version-2', percentage: 100 }],
+    });
+    runner.propagationPolls = 3;
+
+    const result = await deployStage(root, { stage: 'pr123' }, dependencies(runner, new FakeCloudflare()));
+
+    expect(result.action).toBe('activated');
+    const statusReads = runner.calls.filter((call) => call.args[0] === 'deployments').length;
+    expect(statusReads).toBe(5);
+  });
+
+  it('fails with what it expected and what it saw when the version never becomes live', async () => {
+    const root = await fixtureRoot();
+    const runner = new FakeRunner([{ id: 'version-1', annotations: { 'workers/tag': `nx-${HASH}` } }], {
+      versions: [{ version_id: 'version-2', percentage: 100 }],
+    });
+    runner.propagationPolls = Number.POSITIVE_INFINITY;
+
+    await expect(deployStage(root, { stage: 'pr123' }, dependencies(runner, new FakeCloudflare()))).rejects.toThrow(
+      `fixture-worker-pr123: deployed version nx-${HASH} was not serving traffic after 10s; live is an untagged version (version-2)`,
+    );
+  });
+
+  it('leaves the cache holding the tag it made live, so the next query needs no API call', async () => {
+    const root = await fixtureRoot();
+    const cacheDirectory = await mkdtemp(join(tmpdir(), 'smoo-live-version-'));
+    roots.push(cacheDirectory);
+    const runner = new FakeRunner([{ id: 'version-1', annotations: { 'workers/tag': `nx-${HASH}` } }], {
+      versions: [{ version_id: 'version-2', percentage: 100 }],
+    });
+
+    await deployStage(
+      root,
+      { stage: 'pr123' },
+      { ...dependencies(runner, new FakeCloudflare()), liveVersionCacheDirectory: cacheDirectory },
+    );
+
+    const cached = await readCachedLiveVersion(
+      cacheDirectory,
+      { accountId: 'account-1', workerName: 'fixture-worker-pr123', stage: 'pr123' },
+      LIVE_VERSION_CACHE_TTL_MS,
+    );
+    expect(cached).toMatchObject({ versionTag: `nx-${HASH}`, versionId: 'version-1' });
+  });
+
+  it('is not done until a declared version endpoint answers with the new tag', async () => {
+    const root = await fixtureRoot();
+    const runner = new FakeRunner([{ id: 'version-1', annotations: { 'workers/tag': `nx-${HASH}` } }], {
+      versions: [{ version_id: 'version-2', percentage: 100 }],
+    });
+    const bodies = [`nx-${'0'.repeat(20)}`, `nx-${'0'.repeat(20)}`, `nx-${HASH}`];
+    const requested: string[] = [];
+    const stubFetch: FetchLike = async (input) => {
+      requested.push(String(input));
+      return new Response(bodies.shift() ?? `nx-${HASH}`);
+    };
+
+    const result = await deployStage(
+      root,
+      { stage: 'pr123', versionEndpoint: 'https://fixture.example.test/__version' },
+      {
+        ...dependencies(runner, new FakeCloudflare()),
+        wait: { ...fakeWait(), fetch: stubFetch },
+      },
+    );
+
+    expect(result.action).toBe('activated');
+    expect(requested).toEqual([
+      'https://fixture.example.test/__version',
+      'https://fixture.example.test/__version',
+      'https://fixture.example.test/__version',
+    ]);
+  });
+
+  it('fails naming the endpoint answer when the edge never reports the new tag', async () => {
+    const root = await fixtureRoot();
+    const runner = new FakeRunner([{ id: 'version-1', annotations: { 'workers/tag': `nx-${HASH}` } }], {
+      versions: [{ version_id: 'version-2', percentage: 100 }],
+    });
+    const stubFetch: FetchLike = async () => new Response('nx-previous');
+
+    await expect(
+      deployStage(
+        root,
+        { stage: 'pr123', versionEndpoint: 'https://fixture.example.test/__version' },
+        { ...dependencies(runner, new FakeCloudflare()), wait: { ...fakeWait(), fetch: stubFetch } },
+      ),
+    ).rejects.toThrow(
+      `fixture-worker-pr123: https://fixture.example.test/__version did not report version nx-${HASH} after 10s; it reported nx-previous`,
+    );
   });
 
   it('uploads a missing tag with a temporary config and secure secrets file, then removes both', async () => {
@@ -231,9 +382,12 @@ describe('deploy-stage remote version fallback', () => {
     );
 
     expect(result.action).toBe('deployed');
-    expect(runner.calls.at(-1)?.args[0]).toBe('deploy');
-    expect(runner.calls.at(-1)?.args).toContain('--tag');
-    expect(runner.calls.at(-1)?.args).toContain(`nx-${HASH}`);
+    const upload = requiredTestValue(
+      runner.calls.find((call) => call.args[0] === 'deploy'),
+      'upload call',
+    );
+    expect(upload.args).toContain('--tag');
+    expect(upload.args).toContain(`nx-${HASH}`);
     expect(runner.secretsMode).toBe(0o600);
     expect(JSON.parse(requiredTestValue(runner.secretsJson, 'secrets JSON'))).toEqual({
       FIXTURE_SECRET: 'shared-secret',
@@ -615,6 +769,10 @@ describe('deployStage with a flat JSON config', () => {
       ['deployments', 'status'],
       ['d1', 'migrations'],
       ['versions', 'deploy'],
+      // The traffic shift is not the end of the deploy: the step re-reads live state and only
+      // returns once the tag it activated is the one being served.
+      ['deployments', 'status'],
+      ['versions', 'list'],
     ]);
   });
 
@@ -736,10 +894,30 @@ async function fixtureRoot(toml = FIXTURE): Promise<string> {
   return root;
 }
 
+/**
+ * A wait whose clock only advances when the code under test sleeps: real bounds, no real seconds,
+ * and a deterministic poll count a test can assert on.
+ */
+function fakeWait(): { budgetMs: number; intervalMs: number; now: () => number; sleep: (ms: number) => Promise<void> } {
+  let clock = 0;
+  return {
+    budgetMs: 10_000,
+    intervalMs: 1_000,
+    now: () => clock,
+    sleep: async (ms: number) => {
+      clock += ms;
+    },
+  };
+}
+
 function dependencies(runner: ProcessRunner, cloudflare: CloudflareClient) {
+  const cacheDirectory = mkdtempSync(join(tmpdir(), 'smoo-live-version-'));
+  roots.push(cacheDirectory);
   return {
     runner,
     cloudflare,
+    wait: fakeWait(),
+    liveVersionCacheDirectory: cacheDirectory,
     processEnv: {
       CLOUDFLARE_ACCOUNT_ID: 'account-1',
       CLOUDFLARE_API_TOKEN: 'token',
