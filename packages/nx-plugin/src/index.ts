@@ -179,8 +179,14 @@ const REPO_ROOT_CARGO_OUTPUT_INPUTS = [
   '{workspaceRoot}/scripts/*.sh',
   '!{workspaceRoot}/**/target/**',
 ];
+// The environment half of a cargo task's identity. Beyond cargo/rustc's own
+// variables, every build script that compiles C/C++ reads the Apple SDK
+// (SDKROOT, DEVELOPER_DIR, the deployment targets), bindgen reads its libclang
+// and extra clang args, cmake-rs forwards CMAKE_*, and zig-based cross links
+// read ZIG*. An output linked against one sysroot must never hash equal to
+// the same sources linked against another.
 const CARGO_ENVIRONMENT_INPUT = {
-  runtime: `bun -e 'const fs = require("node:fs"); const path = require("node:path"); const home = process.env.CARGO_HOME || path.join(require("node:os").homedir(), ".cargo"); console.log(JSON.stringify({env: Object.entries(process.env).filter(([name]) => /^(?:CARGO_|RUST|NEXTEST_|CLIPPY_|CC(?:_|$)|CXX(?:_|$)|AR(?:_|$)|CFLAGS|CXXFLAGS|CPPFLAGS|LDFLAGS|PKG_CONFIG|TARGET_|HOST_)/.test(name)).sort(([a], [b]) => a.localeCompare(b)), config: ["config", "config.toml"].map(name => { const file = path.join(home, name); return fs.existsSync(file) ? fs.readFileSync(file, "utf8") : null; })}));'`,
+  runtime: `bun -e 'const fs = require("node:fs"); const path = require("node:path"); const home = process.env.CARGO_HOME || path.join(require("node:os").homedir(), ".cargo"); console.log(JSON.stringify({env: Object.entries(process.env).filter(([name]) => /^(?:CARGO_|RUST|NEXTEST_|CLIPPY_|CC(?:_|$)|CXX(?:_|$)|AR(?:_|$)|CFLAGS|CXXFLAGS|CPPFLAGS|LDFLAGS|PKG_CONFIG|TARGET_|HOST_|SDKROOT$|DEVELOPER_DIR$|MACOSX_DEPLOYMENT_TARGET$|IPHONEOS_DEPLOYMENT_TARGET$|LIBCLANG_PATH$|BINDGEN_EXTRA_CLANG_ARGS|CMAKE_|ZIG)/.test(name)).sort(([a], [b]) => a.localeCompare(b)), config: ["config", "config.toml"].map(name => { const file = path.join(home, name); return fs.existsSync(file) ? fs.readFileSync(file, "utf8") : null; })}));'`,
 };
 
 function cargoRuntimeInput(projectRoot: string, command: string): { runtime: string } {
