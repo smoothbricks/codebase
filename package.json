@@ -94,9 +94,9 @@
         ]
       },
       "cargo-lint-cross": {
+        "//": "No lmaoGitRevision, deliberately: it is `git rev-parse HEAD`, so including it made EVERY commit invalidate this gate. The pre-push probe then missed on every push no matter what changed, which is unusable — you would have to rerun `bun run check:linux` after your last commit, every time. Clippy emits no artifact and its verdict does not depend on the revision string; the crates that bake a revision do so in targets that still hash it.",
         "inputs": [
-          "rustWorkspace",
-          "lmaoGitRevision"
+          "rustWorkspace"
         ]
       },
       "cargo-test-compile": {
