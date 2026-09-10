@@ -7,6 +7,7 @@ import { decode, findRepoRoot, printCommandOutput } from './lib/run.js';
 import { ensureChromium } from './playwright/index.js';
 import { resolvePrConflicts } from './pr/index.js';
 import { cleanupPullRequest, deployStage } from './wrangler/deploy-stage.js';
+import { deployedVersion } from './wrangler/deployed-version.js';
 import { scaffold } from './wrangler/scaffold.js';
 
 export async function runCli(argv = process.argv.slice(2)): Promise<void> {
@@ -537,11 +538,29 @@ function buildProgram(): Command {
     .command('deploy-stage')
     .requiredOption('--stage <stage>', 'staging, production, or prN')
     .option('--config <path>', 'deploy a build-generated flat wrangler.json instead of ./wrangler.toml')
-    .action(async (options: { stage: string; config?: string }) => {
+    .option('--version-endpoint <url>', 'URL served by this worker whose trimmed body is the running version tag')
+    .action(async (options: { stage: string; config?: string; versionEndpoint?: string }) => {
       await deployStage(process.cwd(), {
         stage: options.stage,
         ...(options.config ? { config: resolve(options.config) } : {}),
+        ...(options.versionEndpoint ? { versionEndpoint: options.versionEndpoint } : {}),
       });
+    });
+  wrangler
+    .command('deployed-version')
+    .description('Print the version tag serving all traffic for this project\u2019s worker on a stage')
+    .requiredOption('--stage <stage>', 'staging, production, or prN')
+    .option('--config <path>', 'resolve the worker name from a build-generated flat wrangler.json')
+    .option('--refresh', 'ask Cloudflare even when a fresh cached answer exists')
+    .action(async (options: { stage: string; config?: string; refresh?: boolean }) => {
+      const report = await deployedVersion(process.cwd(), {
+        stage: options.stage,
+        ...(options.config ? { config: resolve(options.config) } : {}),
+        ...(options.refresh ? { refresh: true } : {}),
+      });
+      // The tag alone on stdout: this is read by humans and by `$(...)`, and a version deployed
+      // outside Nx genuinely has no tag, which `untagged` says without pretending to be one.
+      console.log(report.versionTag ?? 'untagged');
     });
   wrangler
     .command('cleanup-pr')
