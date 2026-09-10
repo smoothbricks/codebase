@@ -86,17 +86,37 @@ describe('private npm workflow token selection', () => {
   });
 
   it('ignores workspace and link specs so a producer install does not look like a registry consume', async () => {
+    // Without a declared read token, the .npmrc credential is a publish
+    // credential and must never be promoted into the read role by inference.
     await withRepo(
       {
         privatePackage: `${SCOPE}/sdk`,
         rootDeps: { [`${SCOPE}/sdk`]: 'workspace:*' },
         extraDeps: { [`${SCOPE}/other`]: 'link:@priv.test/other' },
         npmrcAuthEnv: PUBLISH_ENV,
+        declared: { scope: SCOPE, publishTokenEnv: PUBLISH_ENV },
+      },
+      (root) => {
+        expect(resolvePrivateNpmWorkflowConfig(root)).toEqual({
+          scope: SCOPE,
+          publishTokenEnv: PUBLISH_ENV,
+        });
+      },
+    );
+  });
+
+  it('renders a declared read token for a producer, whose later releases read the previous tag state', async () => {
+    await withRepo(
+      {
+        privatePackage: `${SCOPE}/sdk`,
+        rootDeps: { [`${SCOPE}/sdk`]: 'workspace:*' },
+        npmrcAuthEnv: PUBLISH_ENV,
         declared: { scope: SCOPE, readTokenEnv: READ_ENV, publishTokenEnv: PUBLISH_ENV },
       },
       (root) => {
         expect(resolvePrivateNpmWorkflowConfig(root)).toEqual({
           scope: SCOPE,
+          readTokenEnv: READ_ENV,
           publishTokenEnv: PUBLISH_ENV,
         });
       },

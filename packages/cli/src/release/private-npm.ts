@@ -247,7 +247,12 @@ export function resolvePrivateNpmWorkflowConfig(root: string): PackagePrivateNpm
     return undefined;
   }
   const npmrcEnv = npmrcAuthTokenEnv(root, declared.scope);
-  const readTokenEnv = consumes ? (declared.readTokenEnv ?? npmrcEnv) : undefined;
+  // A publishing workspace reads the registry too: every release after the
+  // first checks the previous tag's durable state, and that check runs in the
+  // producer jobs that never see the publish credential. A declared read token
+  // therefore always renders; only the .npmrc fallback stays consumer-only, so
+  // a publish token is never promoted into a read role by inference.
+  const readTokenEnv = declared.readTokenEnv ?? (consumes ? npmrcEnv : undefined);
   const publishTokenEnv = publishes ? (declared.publishTokenEnv ?? npmrcEnv) : undefined;
   if (!readTokenEnv && !publishTokenEnv) {
     return undefined;
