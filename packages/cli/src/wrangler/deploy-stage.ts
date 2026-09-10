@@ -2,11 +2,20 @@ import { randomUUID } from 'node:crypto';
 import { existsSync, readFileSync } from 'node:fs';
 import { readFile, rm, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
-import typia from 'typia';
 import { parseJsonFileText } from '../lib/json.js';
 import { mergeEnv, printCommandOutput } from '../lib/run.js';
 import { type CloudflareClient, CloudflareRestClient, type D1DatabaseRecord } from './cloudflare.js';
 import { type FlatWranglerConfig, parseFlatWranglerConfig, planFlatStageResources } from './flat-config.js';
+import {
+  awaitLiveVersion,
+  awaitVersionEndpoint,
+  currentDeploymentVersionId,
+  findVersionIdByTag,
+  type LiveVersionProbe,
+  liveVersionCacheDirectory,
+  type VersionEndpointWaitOptions,
+  writeCachedLiveVersion,
+} from './live-version.js';
 import { parseDevVarsExample } from './prepare-env.js';
 import {
   type ConfiguredStageResourcePlan,
@@ -69,6 +78,10 @@ export interface WranglerCommandDependencies {
   runner?: ProcessRunner;
   cloudflare?: CloudflareClient;
   processEnv?: NodeJS.ProcessEnv;
+  /** Bounds and clock for the post-deploy wait; tests drive it without sleeping. */
+  wait?: VersionEndpointWaitOptions;
+  /** Where a successful deploy records the tag it made live, for `smoo wrangler deployed-version`. */
+  liveVersionCacheDirectory?: string;
 }
 
 export interface DeployStageResult {
@@ -78,13 +91,17 @@ export interface DeployStageResult {
   versionTag?: string;
 }
 
-const isUnknownRecord = typia.createIs<Record<string, unknown>>();
-
 export interface DeployStageOptions {
   /** `staging`, `production`, or `prN`. */
   stage: string;
   /** A build-generated flat wrangler.json to deploy instead of `./wrangler.toml` (see `prepareFlatConfig`). */
   config?: string;
+  /**
+   * A URL, served by this worker, whose trimmed body is the running version tag. When given, the
+   * deploy is not done until that URL answers with the tag it just made live — the control plane
+   * accepting a traffic shift is not the edge serving it.
+   */
+  versionEndpoint?: string;
 }
 
 export async function deployStage(
@@ -124,16 +141,24 @@ export async function deployStage(
     // `reconcileStageResources` nor `versions list` looks at.
     const run: ProcessRunOptions = prepared.envFlag ? { cwd } : { cwd, unsetEnv: ['CLOUDFLARE_ENV'] };
     const workerName = prepared.plan.workerName;
+    const probe: LiveVersionProbe = {
+      deployments: () => wranglerJson(runner, ['deployments', 'status', '--name', workerName, '--json'], run),
+      versions: () => wranglerJson(runner, ['versions', 'list', '--name', workerName, '--json'], run),
+    };
 
     // The tagged-version lookup runs before the migrations: a cache hit means this exact build is
     // already live, so its migrations ran with it and re-applying them would touch the remote
     // database for nothing. The activation and upload paths below still migrate first.
+    //
+    // This reads Cloudflare every time and never the local cache. A cache hit here would mean
+    // "we believe this hash is live" — exactly the belief a rollback falsifies — and believing it
+    // would skip the deploy that repairs the rollback. Reading live state is what makes a
+    // redundant deploy a proven no-op instead of an assumed one, which is in turn what makes a
+    // cross-project `dependsOn: ["<other>:deploy"]` edge cheap enough to be the ordering mechanism.
     let taggedVersionId: string | null = null;
     if (versionTag && workerExists) {
-      const versions = await wranglerJson(runner, ['versions', 'list', '--name', workerName, '--json'], run);
-      const deployments = await wranglerJson(runner, ['deployments', 'status', '--name', workerName, '--json'], run);
-      taggedVersionId = findVersionIdByTag(versions, versionTag);
-      if (taggedVersionId && isFullCurrentDeployment(deployments, taggedVersionId)) {
+      taggedVersionId = findVersionIdByTag(await probe.versions(), versionTag);
+      if (taggedVersionId && currentDeploymentVersionId(await probe.deployments()) === taggedVersionId) {
         return { stage, workerName, action: 'remote-cache-hit', versionTag };
       }
     }
@@ -163,6 +188,7 @@ export async function deployStage(
         ],
         run,
       );
+      await confirmVersionIsLive(probe, versionTag, { stage, workerName, accountId }, options, dependencies, cwd);
       return { stage, workerName, action: 'activated', versionTag };
     }
 
@@ -174,6 +200,9 @@ export async function deployStage(
       deployArgs.push('--secrets-file', temporarySecretsPath);
     }
     await wrangler(runner, deployArgs, run);
+    if (versionTag) {
+      await confirmVersionIsLive(probe, versionTag, { stage, workerName, accountId }, options, dependencies, cwd);
+    }
     return { stage, workerName, action: 'deployed', ...(versionTag ? { versionTag } : {}) };
   } finally {
     if (temporaryConfigPath) {
@@ -578,49 +607,47 @@ export function nxTaskVersionTag(environment: NodeJS.ProcessEnv): string | undef
   throw new Error('NX_TASK_HASH must be canonical decimal digits or at least 32 hexadecimal characters.');
 }
 
-export function findVersionIdByTag(value: unknown, tag: string): string | null {
-  if (Array.isArray(value)) {
-    for (const entry of value) {
-      const found = findVersionIdByTag(entry, tag);
-      if (found) return found;
-    }
-    return null;
-  }
-  if (!isUnknownRecord(value)) return null;
-  const annotations = isUnknownRecord(value.annotations) ? value.annotations : undefined;
-  const metadata = isUnknownRecord(value.metadata) ? value.metadata : undefined;
-  const annotationTag = annotations?.['workers/tag'];
-  const candidateTag =
-    typeof annotationTag === 'string' ? annotationTag : typeof value.tag === 'string' ? value.tag : metadata?.tag;
-  if (candidateTag === tag) {
-    if (typeof value.id === 'string') return value.id;
-    if (typeof value.version_id === 'string') return value.version_id;
-  }
-  for (const nested of Object.values(value)) {
-    const found = findVersionIdByTag(nested, tag);
-    if (found) return found;
-  }
-  return null;
+/** What a freshly activated version has to be true of, and where the fact gets recorded. */
+interface DeployedVersionIdentity {
+  stage: DeploymentStage;
+  workerName: string;
+  accountId: string;
 }
 
-export function isFullCurrentDeployment(value: unknown, versionId: string): boolean {
-  if (Array.isArray(value)) return value.some((entry) => isFullCurrentDeployment(entry, versionId));
-  if (!isUnknownRecord(value)) return false;
-  if (Array.isArray(value.versions)) {
-    return (
-      value.versions.length === 1 &&
-      value.versions.some(
-        (version) =>
-          isUnknownRecord(version) &&
-          (version.version_id === versionId || version.id === versionId) &&
-          Number(version.percentage) === 100,
-      )
-    );
+/**
+ * Turns "Cloudflare accepted the traffic shift" into "the new version answers".
+ *
+ * Without this the deploy step goes green while the edge still serves the previous version — the
+ * measured gap was about 20 s — so anything ordered after this deploy could call into code that
+ * has not shipped yet. The wait is what a `dependsOn: ["<other>:deploy"]` edge actually buys; an
+ * edge onto a step that returns early orders nothing.
+ */
+async function confirmVersionIsLive(
+  probe: LiveVersionProbe,
+  versionTag: string,
+  identity: DeployedVersionIdentity,
+  options: DeployStageOptions,
+  dependencies: WranglerCommandDependencies,
+  cwd: string,
+): Promise<void> {
+  const wait = dependencies.wait ?? {};
+  const live = await awaitLiveVersion(probe, versionTag, wait);
+  if (!live.ok) throw new Error(`${identity.workerName}: ${live.error.message}`);
+  if (options.versionEndpoint) {
+    const answered = await awaitVersionEndpoint(options.versionEndpoint, versionTag, wait);
+    if (!answered.ok) throw new Error(`${identity.workerName}: ${answered.error.message}`);
   }
-  return Object.values(value).some((entry) => isFullCurrentDeployment(entry, versionId));
+  const processEnv = dependencies.processEnv ?? process.env;
+  const directory = dependencies.liveVersionCacheDirectory ?? liveVersionCacheDirectory(cwd, processEnv);
+  await writeCachedLiveVersion(
+    directory,
+    { accountId: identity.accountId, workerName: identity.workerName, stage: identity.stage },
+    { versionTag, versionId: live.value.versionId, fetchedAt: Date.now() },
+  );
 }
 
-async function wranglerJson(runner: ProcessRunner, args: string[], run: ProcessRunOptions): Promise<unknown> {
+/** One wrangler invocation whose stdout must be JSON; shared by the deploy and the read-only query. */
+export async function wranglerJson(runner: ProcessRunner, args: string[], run: ProcessRunOptions): Promise<unknown> {
   const result = await wrangler(runner, args, run);
   try {
     return JSON.parse(result.stdout);
