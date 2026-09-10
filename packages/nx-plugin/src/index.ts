@@ -1302,7 +1302,10 @@ function inferTypescriptOutputs(tsconfigPath: string, packageJsonPath: string): 
   const compilerOptions = isRecord(tsconfig) && isRecord(tsconfig.compilerOptions) ? tsconfig.compilerOptions : null;
   const outDir = compilerOptions?.outDir;
   if (typeof outDir !== 'string' || outDir.length === 0) {
-    return ['{projectRoot}/dist/**/*.{js,cjs,mjs,jsx,d.ts,d.cts,d.mts}{,.map}', '{projectRoot}/dist/**/*.tsbuildinfo'];
+    // No .tsbuildinfo here: the emit executor overlays incremental: false, so
+    // tsc-js never writes one and a declared-but-absent output fails the
+    // release-candidate output inspection.
+    return ['{projectRoot}/dist/**/*.{js,cjs,mjs,jsx,d.ts,d.cts,d.mts}{,.map}'];
   }
 
   const normalized = posix.normalize(outDir.replaceAll('\\', '/'));
