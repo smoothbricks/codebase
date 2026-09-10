@@ -688,17 +688,26 @@ async function createProjectTargets(
         ).flat(),
       ),
     ];
-    targets[CARGO_TEST_COMPILE_TARGET].inputs = workspaceInputs.length > 0 ? workspaceInputs : CARGO_INPUTS;
+    // Generated crate sources (wire codecs, vocabularies, fixtures) are
+    // gitignored and invisible to nx's file hasher; they reach these targets
+    // as the outputs of the targets a repository adds to `dependsOn`. Hashing
+    // those outputs here means a repository never has to restate `inputs` to
+    // add them - and a restated `inputs` REPLACES this union with the root
+    // project's `default`, which owns no crate file, so the archive then
+    // cache-hits against edited crates while every per-crate test reruns on
+    // the stale binary. That verdict is wrong, not merely slow.
+    const workspaceCargoInputs: TargetConfiguration['inputs'] = [
+      ...(workspaceInputs.length > 0 ? workspaceInputs : CARGO_INPUTS),
+      { dependentTasksOutputFiles: '**/*', transitive: false },
+    ];
+    targets[CARGO_TEST_COMPILE_TARGET].inputs = workspaceCargoInputs;
     targets[CARGO_TEST_ARCHIVE_TARGET] = createCargoTestArchiveTarget(
       cargoWorkspaceRoot,
       nextestToolConfigArg(workspaceRoot, cargoWorkspaceRoot, PLUGIN_NEXTEST_CONFIG),
     );
     // `archive.include` lives in the repository's nextest config, so that file
     // decides what the archive CONTAINS, not merely how a run behaves.
-    targets[CARGO_TEST_ARCHIVE_TARGET].inputs = [
-      ...(workspaceInputs.length > 0 ? workspaceInputs : CARGO_INPUTS),
-      `{projectRoot}/${NEXTEST_REPO_CONFIG_PATH}`,
-    ];
+    targets[CARGO_TEST_ARCHIVE_TARGET].inputs = [...workspaceCargoInputs, `{projectRoot}/${NEXTEST_REPO_CONFIG_PATH}`];
     const aggregateDependencies = cargoWorkspace.packages.flatMap((plan) =>
       plan.pieces.map((piece) =>
         cargoTargetDependency(projectName, {
@@ -720,7 +729,7 @@ async function createProjectTargets(
     targets['cargo-lint'] = {
       executor: 'nx:run-commands',
       cache: true,
-      inputs: workspaceInputs.length > 0 ? workspaceInputs : CARGO_INPUTS,
+      inputs: workspaceCargoInputs,
       outputs: [],
       options: {
         commands: ['cargo fmt --all --check', CARGO_LINT_CLIPPY_COMMAND],
@@ -759,7 +768,7 @@ async function createProjectTargets(
     targets[CARGO_CROSS_LINT_TARGET] = {
       executor: 'nx:run-commands',
       cache: true,
-      inputs: workspaceInputs.length > 0 ? workspaceInputs : CARGO_INPUTS,
+      inputs: workspaceCargoInputs,
       outputs: [],
       options: {
         command: CARGO_CROSS_LINT_COMMAND,
