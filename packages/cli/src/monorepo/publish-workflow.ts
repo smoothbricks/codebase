@@ -404,8 +404,17 @@ export function renderPublishWorkflowYaml(options: PublishWorkflowDefinitionOpti
   if (options.release === false) {
     const steps = definePublishWorkflow(options).steps;
     workflow = `${renderPublishWorkflowHeader(options)}${renderPublishWorkflowSteps(steps, options)}`;
-  } else if (hasMacosPlatformTargets(options)) {
+  } else if (hasMacosPlatformTargets(options) && !skipsPublishHandoff(options)) {
     workflow = renderPlatformPublishWorkflowYaml(options);
+  } else if (hasMacosPlatformTargets(options)) {
+    // A linux-cross producer runs the Apple targets on the publisher's own
+    // runner. Splitting jobs then buys nothing and costs a real transfer: the
+    // outputs get tarred, uploaded, downloaded into a second checkout, and two
+    // more devenv setups pay for themselves twice. One job, no artifacts.
+    workflow = `${renderPublishWorkflowHeader(options)}${renderSingleJobPublishWorkflowSteps(
+      definePublishWorkflow(options).steps,
+      options,
+    )}`;
   } else if (hasLinuxPlatformTargets(options)) {
     workflow = `${renderPublishWorkflowHeader(options)}${renderSingleJobPublishWorkflowSteps(
       definePublishWorkflow(options).steps,
@@ -475,7 +484,7 @@ jobs:
   publish:
 ${options.release === false ? renderRunsOnLine(options.runsOn) : publishJobRunsOnLine(options)}
     env:
-      GH_TOKEN: ${githubExpression('github.token')}${remoteCacheJobEnv(options)}${cargoCredentialsJobEnv(options)}${privateNpmInstallJobEnv(options)}
+      GH_TOKEN: ${githubExpression('github.token')}${remoteCacheJobEnv(options)}${cargoCredentialsJobEnv(options)}${privateNpmInstallJobEnv(options)}${platformProducerJobEnv(options)}
     steps:
 `;
 }
@@ -749,11 +758,25 @@ function renderSingleJobPublishWorkflowSteps(
   options: PublishWorkflowDefinitionOptions,
 ): string {
   const lines: string[] = [];
+  const producer = options.platformProducer;
+  const crossOnThisRunner = skipsPublishHandoff(options) && hasMacosPlatformTargets(options);
   for (const step of steps) {
     lines.push(...sectionLinesBefore(step));
     lines.push(...commentLinesForStep(step));
     lines.push(...yamlLinesForStep(step, options));
     lines.push('');
+    if (crossOnThisRunner && producer && step.kind === PublishWorkflowStepKind.Checkout) {
+      // Before any toolchain setup or build, exactly as the dedicated producer
+      // job ordered it: the SDK has to be on disk before devenv resolves it.
+      lines.push(
+        '      - name: Check cross-platform toolchain prerequisites',
+        '        working-directory: .',
+        '        run: |',
+        '          set -euo pipefail',
+        ...producer.preflight.split('\n').map((line) => `          ${line}`),
+        '',
+      );
+    }
     if (step.kind === PublishWorkflowStepKind.Build) {
       lines.push(
         '      - name: 🐧 Build supplemental Linux targets',
@@ -763,6 +786,16 @@ function renderSingleJobPublishWorkflowSteps(
         )}"`,
         '',
       );
+      if (crossOnThisRunner) {
+        lines.push(
+          '      - name: 🍎 Build selected macOS and iOS release outputs',
+          "        if: steps.version.outputs.mode != 'none'",
+          `        run: smoo github-ci nx-run-many --targets "${macosPlatformFamilies(options).join(',')}" --projects "${githubExpression(
+            'steps.version.outputs.projects',
+          )}"`,
+          '',
+        );
+      }
     }
   }
   return `${lines.join('\n').trimEnd()}\n`;
@@ -1421,6 +1454,41 @@ function publishJobRunsOnLine(options: PublishWorkflowDefinitionOptions): string
 
 function githubExpression(expression: string): string {
   return ['$', '{{ ', expression, ' }}'].join('');
+}
+
+/**
+ * Whether the separate publishing job can be dropped, so the release runs as
+ * one job that builds every artifact and publishes them.
+ *
+ * The hand-off exists for ONE reason: npmjs mints provenance from the
+ * publishing job's OIDC token and refuses a self-hosted runner for it, so a
+ * release with public packages must publish from the GitHub-hosted runner and
+ * therefore has to receive its self-hosted artifacts through an artifact.
+ * A release that publishes only to the declared private registry has no such
+ * constraint; when its Apple targets are cross-built on the same runner (or it
+ * has none), one job holds everything.
+ */
+function skipsPublishHandoff(options: PublishWorkflowDefinitionOptions): boolean {
+  if (options.actionsProvider !== 'forgejo' || options.privateNpm === undefined) {
+    return false;
+  }
+  return !hasMacosPlatformTargets(options) || options.platformProducer?.kind === 'linux-cross';
+}
+
+/**
+ * Toolchain environment for a foreign-platform producer, rendered onto whichever
+ * job runs its builds. In the flattened single-job shape that is the publish job
+ * itself, so the SDK path and cross flags have to reach it the same way the
+ * dedicated producer job received them.
+ */
+function platformProducerJobEnv(options: PublishWorkflowDefinitionOptions): string {
+  const producer = options.platformProducer;
+  if (!producer || !skipsPublishHandoff(options)) {
+    return '';
+  }
+  return Object.entries(producer.env ?? {})
+    .map(([name, value]) => `\n      ${name}: ${JSON.stringify(value)}`)
+    .join('');
 }
 
 function privateNpmInstallJobEnv(options: PublishWorkflowDefinitionOptions): string {

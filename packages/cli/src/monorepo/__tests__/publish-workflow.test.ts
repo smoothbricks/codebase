@@ -101,6 +101,60 @@ describe('publish workflow definition', () => {
     expect(rendered).toContain("default: ''");
   });
 
+  it('a private forge release with cross-built Apple targets publishes from one job', () => {
+    const rendered = renderPublishWorkflowYaml({
+      repoName: 'axe.sc/axe',
+      actionsProvider: 'forgejo',
+      runsOn: ['nixos-latest-x64', 'self-hosted'],
+      platformTargetGlobs: ['*-macos', '*-linux'],
+      macosPlatformArchitectures: ['arm64'],
+      platformProducer: { kind: 'linux-cross', preflight: 'sh scripts/prepare-macos-sdk.sh', env: { AXE_CROSS: '1' } },
+      privateNpm: { scope: '@axe.sc', readTokenEnv: 'READ_ENV', publishTokenEnv: 'PUBLISH_ENV' },
+    });
+
+    // One job: no producer job to hand outputs over from, so no transfer at all.
+    const jobsYaml = rendered.slice(rendered.indexOf('jobs:\n') + 'jobs:\n'.length);
+    expect(jobsYaml.match(/^ {2}[a-z][a-z0-9-]*:$/gm)).toEqual(['  publish:']);
+    // The hand-off steps specifically; the failure-only trace-DB upload stays.
+    expect(rendered).not.toContain('Upload validated release state');
+    expect(rendered).not.toContain('Upload validated build outputs');
+    expect(rendered).not.toContain('Upload macOS platform outputs');
+    expect(rendered).not.toContain('Download candidate artifacts');
+    expect(rendered).not.toContain('git bundle');
+    // It still builds the Apple targets, with the producer's toolchain env and
+    // its preflight ahead of setup.
+    expect(rendered).toContain('--targets "*-macos"');
+    expect(rendered).toMatch(/^ {6}AXE_CROSS: ['"]1['"]$/m);
+    expect(rendered).toContain('Check cross-platform toolchain prerequisites');
+    expect(rendered.indexOf('Check cross-platform toolchain prerequisites')).toBeLessThan(
+      rendered.indexOf('Setup Nix/devenv'),
+    );
+  });
+
+  it('keeps the publishing hand-off when provenance needs the hosted runner', () => {
+    const publicWithMac = renderPublishWorkflowYaml({
+      repoName: '@smoothbricks/codebase',
+      platformTargetGlobs: ['*-macos', '*-linux'],
+      macosPlatformArchitectures: ['arm64'],
+      platformProducer: { kind: 'linux-cross', preflight: 'sh prepare.sh' },
+    });
+    const forgePublicWithMac = renderPublishWorkflowYaml({
+      repoName: '@smoothbricks/codebase',
+      actionsProvider: 'forgejo',
+      runsOn: ['nixos-latest-x64', 'self-hosted'],
+      platformTargetGlobs: ['*-macos', '*-linux'],
+      macosPlatformArchitectures: ['arm64'],
+      platformProducer: { kind: 'linux-cross', preflight: 'sh prepare.sh' },
+    });
+
+    // No private registry declared: packages go to npmjs, which mints
+    // provenance from the publishing job and refuses a self-hosted runner.
+    for (const rendered of [publicWithMac, forgePublicWithMac]) {
+      expect(rendered).toContain('publish-on-linux:');
+      expect(rendered).toContain('Download candidate artifacts');
+    }
+  });
+
   it('preserves the single Ubuntu job and renders no artifact transfer when no Apple targets exist', () => {
     const current = renderPublishWorkflowYaml({ repoName: '@smoothbricks/codebase' });
     const explicitlyEmpty = renderPublishWorkflowYaml({
