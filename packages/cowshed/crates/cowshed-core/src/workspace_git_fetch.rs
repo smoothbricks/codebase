@@ -716,7 +716,8 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn excessive_probe_output_is_refused_and_the_process_is_reaped() {
-        for script in ["exec /usr/bin/yes", "exec /usr/bin/yes >&2"] {
+        // `yes` through the shell's PATH: NixOS runners have no /usr/bin/yes.
+        for script in ["exec yes", "exec yes >&2"] {
             let mut child = tokio::process::Command::new("/bin/sh")
                 .args(["-c", script])
                 .stdin(std::process::Stdio::null())
