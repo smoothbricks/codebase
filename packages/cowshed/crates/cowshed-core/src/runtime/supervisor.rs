@@ -1236,7 +1236,7 @@ async fn sandboxed_command(
     // certificate is the public half and already travels in the image; only the anchor wiring
     // was missing.
     //
-    // NODE_EXTAA_CA_CERTS is additive and belongs to Node and Bun alone, so it can be set
+    // NODE_EXTRA_CA_CERTS is additive and belongs to Node and Bun alone, so it can be set
     // without touching SSL_CERT_FILE — which nix and devenv own for the whole toolchain, and
     // which is not ours to redirect. Nothing here relaxes verification: the anchor is added, no
     // check is disabled.
