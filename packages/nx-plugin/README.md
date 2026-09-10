@@ -13,6 +13,14 @@ with `tsconfig.lib.json` receives transformer-aware `tsc-js` and native `typeche
 - `test:watch` from explicit `test` commands for Bun and Vitest packages
 - Cargo workspace targets from a neighboring workspace-root `Cargo.toml`
 - aggregate `build` and `lint` targets
+- an uncached `deploy` for a project with a wrangler manifest, running `smoo wrangler deploy-stage --stage {args.stage}`
+
+The deploy is one target that takes whichever stage it is given, never a configuration per stage: pull-request stages
+are `prN` for unbounded N, so `nx run <project>:deploy --stage=pr42` has to work for a stage no enumeration could list.
+It is never cached, because a cache hit would mean "we once uploaded this hash", which a rollback falsifies silently.
+Declaring `deploy` locally overrides only the properties it names, so a project adds cross-project ordering with
+`"dependsOn": ["...", "backend:deploy"]` and keeps the inferred command; a project that declares `deploy-build` gets
+that edge instead of `build`, and the plugin caches that half without inventing its command.
 
 Lint commands are inferred per project. A workspace Biome configuration enables the project-wide Biome check; an ESLint
 flat configuration enables ESLint only for existing JavaScript/TypeScript files under that project's `src`. Rust-only
@@ -100,15 +108,15 @@ them by field instead: a `json` input with `excludeFields` for `package.json#ver
 this costs no process. Everything else still counts: a dependency range, an export map, and the lockfile's resolution
 table.
 
-Crate manifests are the one kind Nx cannot hash by field, because TOML has no such input. The plugin hashes them
-itself, in the process that builds the graph and is already reading them: a single forward scan over the bytes feeds
-the hasher every run it keeps, dropping `[package].version` and the `[workspace.package].version` members inherit and
-nothing else — a `version` naming a *different* crate under a dependency table stays in the digest, and anything a
-line-oriented scan cannot read (a multi-line string, an unterminated value) is hashed verbatim rather than guessed at.
-The digest then travels as a literal input path that matches no file: Nx hashes a project's `namedInputs` definitions
-into that project's configuration hash, which is part of every task in the project and of every task depending on it,
-so the value reaches the hash with no process at all. Earlier revisions spawned a command per crate project per graph
-computation; that spawn is gone.
+Crate manifests are the one kind Nx cannot hash by field, because TOML has no such input. The plugin hashes them itself,
+in the process that builds the graph and is already reading them: a single forward scan over the bytes feeds the hasher
+every run it keeps, dropping `[package].version` and the `[workspace.package].version` members inherit and nothing else
+— a `version` naming a _different_ crate under a dependency table stays in the digest, and anything a line-oriented scan
+cannot read (a multi-line string, an unterminated value) is hashed verbatim rather than guessed at. The digest then
+travels as a literal input path that matches no file: Nx hashes a project's `namedInputs` definitions into that
+project's configuration hash, which is part of every task in the project and of every task depending on it, so the value
+reaches the hash with no process at all. Earlier revisions spawned a command per crate project per graph computation;
+that spawn is gone.
 
 Targets that produce a shipped artifact keep hashing the raw manifests. A crate embeds its version at compile time
 through `env!("CARGO_PKG_VERSION")`, so a version-insensitive `build`, `pack`, `tsc-js` or cargo hash would let a
@@ -127,9 +135,9 @@ plugin does not infer a definition to resolve:
 
 Without it the dependency half stays `^production`. On an Nx older than 23.2, which rejects a `json` input rather than
 ignoring it, the targets keep today's inputs entirely; the same is true of crate manifests when the command is not
-installed. Every fallback costs cache hits and never trades away invalidation, because Nx runs a `runtime` input
-without reporting a failing one — a fileset that excluded a manifest with no digest replacing it would serve stale
-results silently.
+installed. Every fallback costs cache hits and never trades away invalidation, because Nx runs a `runtime` input without
+reporting a failing one — a fileset that excluded a manifest with no digest replacing it would serve stale results
+silently.
 
 ## Nx Target Naming
 
