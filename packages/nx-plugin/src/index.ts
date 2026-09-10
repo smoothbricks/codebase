@@ -44,6 +44,11 @@ import { PLATFORM_TARGET_GLOBS } from './workspace-config-policy.js';
 
 export { CARGO_TEST_COMPILE_TARGET };
 
+/** Makes a version live and proves it answers; never cached. */
+export const DEPLOY_TARGET = 'deploy';
+/** The purely file-derived half a deploy needs built first; cached. */
+export const DEPLOY_BUILD_TARGET = 'deploy-build';
+
 const BUILD_OUTPUT_TARGET_PATTERN = /-(?:js|web|html|css|android|native|napi|bun|wasm)$/;
 const TYPESCRIPT_TOOLCHAIN_INPUTS = [
   '{workspaceRoot}/package.json',
@@ -1062,6 +1067,42 @@ async function createProjectTargets(
     if (!hasCargoTargetDependency(dependsOn, cargoTestCompileDependency)) {
       cargoNapi.dependsOn = [...dependsOn, cargoTestCompileDependency];
     }
+  }
+
+  // A deploy is never cached; the build half beside it always is.
+  //
+  // Nx's cache answers "did this exact input set already produce an output". A deploy's real
+  // question is "is this exact version live", and the two agree only until someone rolls back.
+  // After a rollback the workspace is unchanged, so the hash is unchanged, so a cached `deploy`
+  // reports success while the previous version keeps serving. No input tuning repairs that: a
+  // `runtime` input cannot even learn WHICH STAGE is being deployed. Nx hashes runtime inputs with
+  // the env from `getTaskSpecificEnv`, which deliberately excludes the task coordinates; input
+  // strings interpolate only `{workspaceRoot}`/`{projectRoot}`, never `{args.*}`; and overrides
+  // are not forwarded to `dependsOn` dependencies, so an auxiliary task cannot carry the stage
+  // either. (An executor's custom hasher is the single Nx API that does see `task.overrides`, if
+  // hash-level participation is ever genuinely wanted.)
+  //
+  // So the target is split along the line the question actually falls on. `deploy-build` is purely
+  // file-derived — build the artifact and whatever the build registers — and caches honestly.
+  // `deploy` reads live state every run and no-ops when live already equals the desired tag, which
+  // costs two Cloudflare calls and makes a redundant deploy provably free rather than assumed
+  // free. That is what lets ordering be an ordinary `dependsOn: ["<other>:deploy"]` edge at any
+  // depth, and it is why such an edge must point at `deploy` and not at `deploy-build`: a
+  // dependent has to re-check liveness, not inherit someone else's cache hit.
+  //
+  // Both are bases for a package-local declaration to land on, per the merge rules above: a
+  // declaration naming `cache`, `inputs` or `dependsOn` REPLACES what is set here, so a project
+  // adding a cross-project edge writes `"dependsOn": ["...", "backend:deploy"]` to keep the
+  // `deploy-build` edge this adds.
+  if (DEPLOY_BUILD_TARGET in declaredTargets) {
+    targets[DEPLOY_BUILD_TARGET] = { cache: true };
+  }
+  if (DEPLOY_TARGET in declaredTargets) {
+    targets[DEPLOY_TARGET] = {
+      cache: false,
+      outputs: [],
+      ...(DEPLOY_BUILD_TARGET in declaredTargets ? { dependsOn: [DEPLOY_BUILD_TARGET] } : {}),
+    };
   }
 
   // No `outputs`, deliberately: this aggregate runs no command, so every file
