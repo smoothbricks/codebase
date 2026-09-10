@@ -4555,6 +4555,11 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
             // soon as the checkout moves, and only the canonical mount is maintained by
             // `cowshed mv`.
             let main_mount = self.workspace_mount_path(&main_name())?;
+            // The tree the image came from is also where this workspace's Git identity comes
+            // from: main under a plain `new`, the sibling under `--from`. Only that context
+            // resolves the operator's `includeIf gitdir:` rules, and a fork of a workspace that
+            // already inherited one no longer needs the operator's global file at all.
+            let source_mount = self.workspace_mount_path(&source_name)?;
             let start = options.revision.as_ref().map(revision_target);
             let destination = workspace.clone();
             let receipt = self
@@ -4574,7 +4579,7 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                                 stage.resuming,
                             )
                             .await?;
-                        repository.ensure_workspace_environment_wiring().await
+                        repository.ensure_workspace_environment_wiring().await?;
                     } else {
                         repository.ensure_workspace_environment_wiring().await?;
                         repository
@@ -4584,9 +4589,12 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                                 start.as_deref(),
                                 stage.resuming,
                             )
-                            .await
-                            .map(|_| ())
+                            .await?;
                     }
+                    // A sandboxed child reads this file as its whole global Git configuration.
+                    // Capturing at mint is what makes `git commit` in a fresh workspace author
+                    // as the operator instead of failing for want of an identity.
+                    repository.inherit_identity_from(&source_mount).await
                 })
                 .await
                 .map_err(native_staged_error)?;

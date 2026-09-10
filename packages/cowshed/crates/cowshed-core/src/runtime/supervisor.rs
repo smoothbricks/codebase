@@ -1121,6 +1121,10 @@ async fn sandboxed_command(
     // files. The Git directory probe runs under the narrower GitDiscovery child profile.
     // Refresh each spawn so revoked grants and relocated checkouts cannot leave stale routes.
     let git_fetch_config = crate::workspace_git_fetch::refresh_git_fetch_config(sandbox).await?;
+    // Identity is the workspace's own published file or nothing at all. A workspace minted
+    // before capture existed keeps the empty device and fails an authorless commit loudly,
+    // rather than silently borrowing whatever the controller's user happens to be.
+    let git_identity = crate::git::workspace_git_identity_config(&sandbox.workspace_mount)?;
     let path = bootstrap_path(sandbox, devenv_dir)?;
     let port_base = sandbox.port_block.base().to_string();
     let encoded_token = workspace_token.encode();
@@ -1143,7 +1147,10 @@ async fn sandboxed_command(
         .env("XDG_CACHE_HOME", &private_cache)
         .env("XDG_DATA_HOME", &private_data)
         .env("DIRENV_CONFIG", private_config.join("direnv"))
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env(
+            "GIT_CONFIG_GLOBAL",
+            git_identity.as_deref().unwrap_or(Path::new("/dev/null")),
+        )
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_ATTR_NOSYSTEM", "1")
         .env("TMPDIR", &sandbox.exec_temp_dir)
@@ -1179,10 +1186,11 @@ async fn sandboxed_command(
     // Cargo only honors url.insteadOf through the Git CLI, so every child
     // fetches through it; uv shells out to Git and follows the same include
     // with no extra wiring. The include points at the managed file
-    // regenerated above, layered over the isolated GLOBAL=/dev/null — no
-    // user or system configuration is read or modified. With no mapping the
-    // count is pinned to zero so caller-supplied GIT_CONFIG_KEY_* entries
-    // cannot smuggle configuration in.
+    // regenerated above, layered over the isolated GLOBAL set just above —
+    // the workspace's own identity file or the empty device, never the
+    // user's or the system's configuration. With no mapping the count is
+    // pinned to zero so caller-supplied GIT_CONFIG_KEY_* entries cannot
+    // smuggle configuration in.
     command.env(
         crate::workspace_git_fetch::CARGO_NET_GIT_FETCH_WITH_CLI_ENV,
         crate::workspace_git_fetch::CARGO_NET_GIT_FETCH_WITH_CLI_VALUE,

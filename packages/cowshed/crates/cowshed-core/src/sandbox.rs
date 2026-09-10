@@ -620,6 +620,7 @@ pub fn seatbelt_profile(
         crate::workspace_credentials::WORKSPACE_TOKEN_PATH,
         crate::workspace_environment::WORKSPACE_ENVIRONMENT_PATH,
         crate::workspace_git_fetch::WORKSPACE_GIT_FETCH_CONFIG_PATH,
+        crate::git::WORKSPACE_GIT_IDENTITY_CONFIG_PATH,
     ] {
         push_literal_rule(
             &mut profile,
