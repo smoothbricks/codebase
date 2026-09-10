@@ -32,10 +32,10 @@ use crate::undo_log::{
 };
 use columine_types::DEFAULT_ACCEPTED_PROGRAM_MAGICS;
 use columine_types::types::{
-    AggType, ChangeFlag, DERIVED_FACT_TOMBSTONE_IDENTITY, EMPTY_KEY, ErrorCode, Opcode,
-    PROGRAM_HASH_PREFIX, PROGRAM_HEADER_SIZE, ProgramHeader, SLOT_META_SIZE, STATE_HEADER_SIZE,
-    STATE_MAGIC, SlotMetaOffset, SlotType, StateHeaderOffset, StructFieldType, TOMBSTONE, align8,
-    struct_field_size,
+    AggType, ChangeFlag, DERIVED_FACT_TOMBSTONE_IDENTITY, EMPTY_KEY, ErrorCode, MAX_SCATTER_ROUTES,
+    Opcode, PROGRAM_HASH_PREFIX, PROGRAM_HEADER_SIZE, ProgramHeader, SLOT_META_SIZE,
+    STATE_HEADER_SIZE, STATE_MAGIC, SlotMetaOffset, SlotType, StateHeaderOffset, StructFieldType,
+    TOMBSTONE, align8, struct_field_size,
 };
 use core::sync::atomic::Ordering;
 
@@ -4309,6 +4309,9 @@ impl Vm {
                         body[bpc + 5],
                         body[bpc + 6] as usize,
                     );
+                    if num_routes > MAX_SCATTER_ROUTES {
+                        return INVALID_PROGRAM;
+                    }
                     bpc += 7;
 
                     let mut route_kinds = [0u8; 32];
@@ -4502,6 +4505,9 @@ impl Vm {
                         body[bpc + 3],
                         body[bpc + 4] as usize,
                     );
+                    if num_routes > MAX_SCATTER_ROUTES {
+                        return INVALID_PROGRAM;
+                    }
                     bpc += 5;
 
                     let mut route_kinds = [0u8; 32];
