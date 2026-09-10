@@ -156,12 +156,21 @@ permissions:
 ${options.deploy ? '  deployments: write\n' : ''}  statuses: write
 
 concurrency:
-  # One in-flight run per ref. Pushes to the staging push branch queue behind a
-  # running workflow instead of canceling it, so a newer push never cancels a
-  # production deployment mid-flight. Pull requests and other branches keep
-  # canceling superseded runs.
+${
+  options.deploy
+    ? `  # One in-flight run per ref. Pushes to the staging push branch queue behind a
+  # running workflow instead of canceling it, so a newer push never cancels the
+  # deploy job mid-flight. Pull requests and other branches keep canceling
+  # superseded runs.
   group: \${{ github.workflow }}-\${{ github.ref }}
-  cancel-in-progress: \${{ github.ref != ${stagingRefLiteral(options)} }}
+  cancel-in-progress: \${{ github.ref != ${stagingRefLiteral(options)} }}`
+    : `  # This workflow validates and never deploys, so there is no in-flight
+  # deployment for a newer push to protect: every ref cancels its superseded
+  # runs. Queuing them instead serializes the staging branch, and a burst of
+  # pushes then reports the newest commit one full run per queued push late.
+  group: \${{ github.workflow }}-\${{ github.ref }}
+  cancel-in-progress: true`
+}
 
 defaults:
   run:

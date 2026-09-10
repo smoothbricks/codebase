@@ -787,6 +787,13 @@ describe('renderCiWorkflowYaml with deploy configuration', () => {
     }
   });
 
+  it('cancels superseded pushes when the workflow has no deploy job to protect', () => {
+    const validateOnly = renderCiWorkflowYaml(options());
+
+    expect(validateOnly).toContain('cancel-in-progress: true');
+    expect(validateOnly).not.toContain("cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}");
+  });
+
   it('keeps a protected staging environment off CI runs that do not deploy', () => {
     const validateOnly = renderCiWorkflowYaml(options({ environments: { staging: 'staging' } }));
 
