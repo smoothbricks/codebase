@@ -74,20 +74,11 @@ const TYPESCRIPT_API_VERSION = '6.0.3';
 process.chdir(projectRoot);
 
 try {
-  // Provider-declared secrets (smoo.secrets) resolve before any install. The
-  // values land in THIS process environment only — bun install, the prepare
-  // scripts it runs, and every later child of this script inherit them (for
-  // example .npmrc `${VAR}` auth); the direnv shell itself does not, which is
-  // the point: this script must never act as a global shell export.
-  for (const [name, value] of Object.entries(await resolveSecretEnvironment({ root: projectRoot }))) {
-    process.env[name] = value;
-    resolvedSecretValues.push(value);
-  }
-
   // Bootstrap only: install deps + wire local git hooks/config.
   // Do not import workspace packages here — this script is what installs them,
   // and package resolution/Typia transforms are not available yet.
   if (process.env.CI) {
+    await resolveSecrets();
     // Concurrent devenv activations share one node_modules, so the CI
     // installs race exactly like local ones (EEXIST link failures under
     // parallel shells). Serialize them under the same setup lock. Nothing
@@ -127,9 +118,10 @@ try {
       process.exit(1);
     }
   } else {
-    // A local install failure (an unpublished private package, a missing
-    // registry credential, a lockfile that needs `devenv update`) must not take
-    // the shell down with it: direnv drops the whole environment on a non-zero
+    // A local secret-resolution or install failure (a provider that is not
+    // signed in, an unpublished private package, a missing registry
+    // credential, a lockfile that needs `devenv update`) must not take the
+    // shell down with it: direnv drops the whole environment on a non-zero
     // exit, and then bun, nx, op and every other tool needed to repair the
     // install are gone too. Report it, finish what does not depend on the
     // install, and load the shell. CI above stays strict.
@@ -147,7 +139,26 @@ try {
   reportSetupFailure(error);
 }
 
+/**
+ * Provider-declared secrets (smoo.secrets) resolve before any install. The
+ * values land in THIS process environment only — bun install, the prepare
+ * scripts it runs, and every later child of this script inherit them (for
+ * example .npmrc `${VAR}` auth); the direnv shell itself does not, which is
+ * the point: this script must never act as a global shell export.
+ */
+async function resolveSecrets(): Promise<void> {
+  for (const [name, value] of Object.entries(await resolveSecretEnvironment({ root: projectRoot }))) {
+    process.env[name] = value;
+    resolvedSecretValues.push(value);
+  }
+}
+
 async function installLocalDependencies(): Promise<unknown> {
+  try {
+    await resolveSecrets();
+  } catch (error) {
+    return error;
+  }
   // bun install runs the root prepare script. Multiple concurrent direnv
   // activations can otherwise race while mutating the same files under
   // node_modules. Nothing that exits the process may run inside the callback
