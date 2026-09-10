@@ -7,6 +7,27 @@ use std::process::Command;
 
 const REVISION_ENV: &str = "LMAO_GIT_REVISION";
 
+/// Git's repository-local variables (`git rev-parse --local-env-vars` as of git 2.55), which
+/// git exports to hooks. A build started from a hook would otherwise let them override the
+/// `cwd`-based repository discovery these git calls rely on; githooks(5) says to clear them.
+const GIT_REPOSITORY_ENV: &[&str] = &[
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_CONFIG",
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_CONFIG_COUNT",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_IMPLICIT_WORK_TREE",
+    "GIT_GRAFT_FILE",
+    "GIT_INDEX_FILE",
+    "GIT_NO_REPLACE_OBJECTS",
+    "GIT_REPLACE_REF_BASE",
+    "GIT_PREFIX",
+    "GIT_SHALLOW_FILE",
+    "GIT_COMMON_DIR",
+];
+
 fn main() {
     let manifest_dir =
         PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
@@ -342,11 +363,12 @@ fn relative_utf8<'a>(path: &'a Path, base: &Path) -> Option<&'a str> {
 }
 
 fn git_output(cwd: &Path, args: &[&str]) -> Option<String> {
-    let output = Command::new("git")
-        .current_dir(cwd)
-        .args(args)
-        .output()
-        .ok()?;
+    let mut command = Command::new("git");
+    command.current_dir(cwd).args(args);
+    for variable in GIT_REPOSITORY_ENV {
+        command.env_remove(variable);
+    }
+    let output = command.output().ok()?;
     if !output.status.success() {
         return None;
     }
