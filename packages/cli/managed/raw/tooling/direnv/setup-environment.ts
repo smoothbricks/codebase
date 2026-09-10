@@ -127,24 +127,40 @@ try {
       process.exit(1);
     }
   } else {
-    await installLocalDependencies();
+    // A local install failure (an unpublished private package, a missing
+    // registry credential, a lockfile that needs `devenv update`) must not take
+    // the shell down with it: direnv drops the whole environment on a non-zero
+    // exit, and then bun, nx, op and every other tool needed to repair the
+    // install are gone too. Report it, finish what does not depend on the
+    // install, and load the shell. CI above stays strict.
+    const installError = await installLocalDependencies();
+    if (installError === undefined) {
+      // Pin unscoped typescript → API 6 for root and Bun's shared .bun hoist (Nx).
+      ensureTypeScriptApiPackage(projectRoot);
+    }
+    await applyWorkspaceGitConfig(projectRoot);
+    if (installError !== undefined) {
+      reportDegradedSetup(installError);
+    }
   }
-
-  // Pin unscoped typescript → API 6 for root and Bun's shared .bun hoist (Nx).
-  ensureTypeScriptApiPackage(projectRoot);
-
-  await applyWorkspaceGitConfig(projectRoot);
 } catch (error) {
   reportSetupFailure(error);
 }
 
-async function installLocalDependencies(): Promise<void> {
+async function installLocalDependencies(): Promise<unknown> {
   // bun install runs the root prepare script. Multiple concurrent direnv
   // activations can otherwise race while mutating the same files under
-  // node_modules.
+  // node_modules. Nothing that exits the process may run inside the callback
+  // (see the CI branch), so the failure is returned, not thrown.
+  let installError: unknown;
   await withSetupLock(async () => {
-    await runSetupCommand('bun install --no-summary', $`bun install --no-summary`);
+    try {
+      await runSetupCommand('bun install --no-summary', $`bun install --no-summary`);
+    } catch (error) {
+      installError = error;
+    }
   });
+  return installError;
 }
 
 function ensureTypeScriptApiPackage(root: string): void {
@@ -383,15 +399,29 @@ function isFileExistsError(error: unknown): boolean {
 }
 
 function reportSetupFailure(error: unknown): never {
+  describeFailure('ERROR', error);
+  process.exit(1);
+}
+
+function reportDegradedSetup(error: unknown): void {
+  describeFailure('WARNING', error);
+  console.error(
+    'The shell is loaded WITHOUT installed dependencies so the tools to repair this stay available.\n' +
+      'Fix the cause above (missing registry credential, unpublished package, stale lockfile → `devenv update`),\n' +
+      'then run `bun install` or `direnv reload`.',
+  );
+  console.error('---');
+}
+
+function describeFailure(level: 'ERROR' | 'WARNING', error: unknown): void {
   if (error instanceof CapturedCommandError) {
-    console.error(`--- ERROR: setup-environment.ts failed while running: ${error.command}`);
+    console.error(`--- ${level}: setup-environment.ts failed while running: ${error.command}`);
     console.error(`exit code: ${error.exitCode}`);
   } else {
-    console.error(`--- ERROR: setup-environment.ts failed: ${error}`);
+    console.error(`--- ${level}: setup-environment.ts failed: ${error}`);
   }
   replayCapturedOutput(error);
   console.error('\n---');
-  process.exit(1);
 }
 
 function replayCapturedOutput(error: unknown): void {
