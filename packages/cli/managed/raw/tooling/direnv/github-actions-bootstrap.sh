@@ -145,7 +145,10 @@ build_devenv_shell() {
   # One evaluation: the shell that captures the environment is the shell
   # build. A separate `devenv shell -- date` evaluated everything twice.
   persist_devenv_environment
-  if [ "${SMOO_HOST_RUNNER:-false}" != true ]; then
+  # Only the ephemeral-runner path of setup-devenv opts in: the scan walks the
+  # whole store, which on a developer host or a host runner is large and not
+  # ours to root.
+  if [ "${SMOO_ROOT_BUILD_INPUTS:-false}" = true ]; then
     root_build_inputs "$since"
   fi
   # Add repo-local tools only after the shell exists; cleanup steps use an
