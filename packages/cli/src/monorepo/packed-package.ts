@@ -21,25 +21,40 @@ export async function validatePackedPublishablePackages(root: string): Promise<n
   );
 }
 
-export async function validatePackedPublishablePackagePublint(root: string): Promise<number> {
+/** The publishable packages, narrowed to `projects` (Nx names) when given. */
+function selectedPublishablePackages(root: string, projects?: readonly string[]): PackageInfo[] {
+  const all = listPublishablePackages(root);
+  return projects?.length ? all.filter((pkg) => projects.includes(pkg.projectName)) : all;
+}
+
+export async function validatePackedPublishablePackagePublint(
+  root: string,
+  projects?: readonly string[],
+): Promise<number> {
   let failures = 0;
-  for (const pkg of listPublishablePackages(root)) {
+  for (const pkg of selectedPublishablePackages(root, projects)) {
     failures += await validatePackedPublishablePackageTool(root, pkg, validatePublint);
   }
   return failures;
 }
 
-export async function validatePackedPublishablePackageManifest(root: string): Promise<number> {
+export async function validatePackedPublishablePackageManifest(
+  root: string,
+  projects?: readonly string[],
+): Promise<number> {
   let failures = 0;
-  for (const pkg of listPublishablePackages(root)) {
+  for (const pkg of selectedPublishablePackages(root, projects)) {
     failures += await validatePackedPublishablePackageTool(root, pkg, validatePackedManifest);
   }
   return failures;
 }
 
-export async function validatePackedPublishablePackageTypes(root: string): Promise<number> {
+export async function validatePackedPublishablePackageTypes(
+  root: string,
+  projects?: readonly string[],
+): Promise<number> {
   let failures = 0;
-  for (const pkg of listPublishablePackages(root)) {
+  for (const pkg of selectedPublishablePackages(root, projects)) {
     failures += await validatePackedPublishablePackageTool(root, pkg, validateAttw);
   }
   return failures;

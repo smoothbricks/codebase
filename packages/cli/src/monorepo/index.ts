@@ -47,6 +47,8 @@ export interface ValidateOptions {
   onlyIfNewWorkspacePackage?: boolean;
   fix?: boolean;
   verbose?: boolean;
+  /** Nx project names to build and pack-validate; see MonorepoContext.projects. */
+  projects?: readonly string[];
 }
 
 export interface ValidateCommitMessageOptions {
@@ -85,7 +87,10 @@ export async function validateMonorepo(root: string, options: ValidateOptions = 
   if (options.onlyIfNewWorkspacePackage && !(await hasNewWorkspacePackage(root))) {
     return;
   }
-  const result = await runValidatePacks({ root, syncRuntime: false, verbose: options.verbose === true }, options);
+  const result = await runValidatePacks(
+    { root, syncRuntime: false, verbose: options.verbose === true, projects: options.projects },
+    options,
+  );
   if (result.failures > 0) {
     const checkNoun = result.failedChecks === 1 ? 'check' : 'checks';
     const problemNoun = result.failures === 1 ? 'problem' : 'problems';

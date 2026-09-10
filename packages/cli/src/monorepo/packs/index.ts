@@ -36,6 +36,14 @@ export interface MonorepoContext {
   root: string;
   syncRuntime: boolean;
   verbose?: boolean;
+  /**
+   * Nx project names the validation is about, when a caller knows: the
+   * release's candidates. The build phase and the packed-package packs scope
+   * to them; manifest-level packs still see the whole repository, because a
+   * package's hygiene does not depend on which packages ship today. Absent,
+   * everything is validated and everything is built.
+   */
+  projects?: readonly string[];
 }
 
 export interface ValidatePackOptions {
@@ -174,19 +182,19 @@ const packs: MonorepoPack[] = [
   {
     name: 'packed-package-publint',
     validatePostBuild(ctx) {
-      return validatePackedPublishablePackagePublint(ctx.root);
+      return validatePackedPublishablePackagePublint(ctx.root, ctx.projects);
     },
   },
   {
     name: 'packed-package-manifest',
     validatePostBuild(ctx) {
-      return validatePackedPublishablePackageManifest(ctx.root);
+      return validatePackedPublishablePackageManifest(ctx.root, ctx.projects);
     },
   },
   {
     name: 'packed-package-types',
     validatePostBuild(ctx) {
-      return validatePackedPublishablePackageTypes(ctx.root);
+      return validatePackedPublishablePackageTypes(ctx.root, ctx.projects);
     },
   },
   {
@@ -369,9 +377,10 @@ async function runBuild(ctx: MonorepoContext, options: ValidatePackOptions = {})
   if (options.verbose) {
     printCheckHeading('build', true);
   }
+  const args = ['run-many', '-t', 'build', ...(ctx.projects?.length ? ['-p', ctx.projects.join(',')] : [])];
   const result = options.verbose
-    ? { exitCode: await runStatus('nx', ['run-many', '-t', 'build'], ctx.root, false), stdout: '', stderr: '' }
-    : await runResult('nx', ['run-many', '-t', 'build'], ctx.root);
+    ? { exitCode: await runStatus('nx', args, ctx.root, false), stdout: '', stderr: '' }
+    : await runResult('nx', args, ctx.root);
   const status = result.exitCode;
   if (status !== 0) {
     if (!options.verbose) {
