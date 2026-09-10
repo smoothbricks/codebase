@@ -131,7 +131,70 @@ export const CROSS_CHECK_SCRIPT_NAME = 'check:linux';
 /**
  * The developer entry point: one command on macOS that reports what CI's Linux
  * job would. `tooling/devenv` is the managed wrapper, so this resolves the
- * repository's devenv config from any repo in the fleet without naming its path,
- * and `--quiet` keeps the output to Nx's own.
+ * repository's devenv config from any repo in the fleet without naming its path.
+ *
+ * Deliberately NOT `--quiet`. The pre-push gate is a probe: it consults the Nx
+ * cache and refuses a push that has no hit, never entering a profile or starting
+ * a compile of its own. That makes this script the only place the gate ever
+ * runs, and a human watching it needs devenv's progress too — the cross profile
+ * is a 0.4 GiB closure and the clippy behind it is unbounded, so a silent
+ * terminal is indistinguishable from a hang. Suppressing that output only paid
+ * while a hook ran this for you and nobody read it.
  */
-export const CROSS_CHECK_SCRIPT_COMMAND = `tooling/devenv --quiet -P ${DEVENV_CROSS_PROFILE} shell -- nx run-many -t ${CARGO_CROSS_LINT_TARGET}`;
+export const CROSS_CHECK_SCRIPT_COMMAND = `tooling/devenv -P ${DEVENV_CROSS_PROFILE} shell -- nx run-many -t ${CARGO_CROSS_LINT_TARGET}`;
+
+/**
+ * A cross-built test archive and the target that EXECUTES it, per foreign
+ * target triple the cargo workspace declares in
+ * `[workspace.metadata.smoothbricks.test] cross-targets`.
+ *
+ * TWO names because the halves run on two machines. `cargo-lint-cross` above
+ * type-checks foreign code and states outright that a cross TEST target could
+ * only build a harness it must then refuse to launch — that is still true of
+ * one machine. It stops being true across two: the triple's archive is built
+ * where the cross toolchain is, shipped, and executed where those binaries are
+ * native, which is the only arrangement in which a cross compile is proved by
+ * running rather than by linking.
+ *
+ * `cargo-cross-test-` and not `cargo-test-`: `packageNameFromCargoTestTarget`
+ * reads everything under that prefix as a crate, so a triple there would invent
+ * a workspace member named `aarch64-apple-darwin` and make the per-crate
+ * coverage policy unsatisfiable. The `-cross` qualifier is the same neutral one
+ * `CARGO_CROSS_LINT_TARGET` carries, and for the same reason: it stays outside
+ * every platform-suffix and build-output family, so no aggregate sweeps a
+ * foreign archive into `build`.
+ *
+ * These names live here rather than beside the Cargo.toml reader because the
+ * workflow generator renders jobs from them: the CLI already imports this
+ * module, and a second spelling of the convention on that side would drift
+ * silently the first time either half changed.
+ */
+export function cargoCrossTestArchiveTargetName(triple: string): string {
+  return `cargo-cross-test-archive-${triple}`;
+}
+
+/** The bounded runner that executes one triple's archive. */
+export function cargoCrossTestTargetName(triple: string): string {
+  return `cargo-cross-test-${triple}`;
+}
+
+/**
+ * One archive file per triple, beside the host-native
+ * `CARGO_TEST_ARCHIVE_FILE`, relative to the cargo workspace root. Distinct
+ * paths are what let both exist: each is a declared Nx output, so a single path
+ * for two triples would let a restored cache serve one machine's binaries under
+ * the other's name.
+ */
+export function cargoCrossTestArchiveFile(triple: string): string {
+  return `target/nextest/archive-${triple}.tar.zst`;
+}
+
+const CARGO_CROSS_TEST_ARCHIVE_PREFIX = cargoCrossTestArchiveTargetName('');
+
+/** Inverse of `cargoCrossTestArchiveTargetName`; null for every other target. */
+export function cargoCrossTestTripleFromArchiveTarget(targetName: string): string | null {
+  return targetName.startsWith(CARGO_CROSS_TEST_ARCHIVE_PREFIX) &&
+    targetName.length > CARGO_CROSS_TEST_ARCHIVE_PREFIX.length
+    ? targetName.slice(CARGO_CROSS_TEST_ARCHIVE_PREFIX.length)
+    : null;
+}

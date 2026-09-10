@@ -126,7 +126,10 @@ describe('Linux cross-check policy', () => {
     // ...and runs Nx rather than cargo directly, so caching and project
     // discovery stay Nx's job.
     expect(CROSS_CHECK_SCRIPT_COMMAND).toContain(`nx run-many -t ${CARGO_CROSS_LINT_TARGET}`);
-    expect(CROSS_CHECK_SCRIPT_COMMAND).toContain('--quiet');
+    // The probe-only pre-push gate never runs this, so a human does — and
+    // devenv's own progress has to reach them, or a 0.4 GiB closure and an
+    // unbounded clippy are indistinguishable from a hang.
+    expect(CROSS_CHECK_SCRIPT_COMMAND).not.toContain('--quiet');
   });
 
   it('uses the verb:qualifier root script convention', () => {
