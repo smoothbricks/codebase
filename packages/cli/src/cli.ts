@@ -6,6 +6,7 @@ import { cliPackageVersion } from './lib/cli-package.js';
 import { decode, findRepoRoot, printCommandOutput } from './lib/run.js';
 import { ensureChromium } from './playwright/index.js';
 import { resolvePrConflicts } from './pr/index.js';
+import { secretsSet, secretsStatus, secretsSync } from './secrets/commands.js';
 import { cleanupPullRequest, deployStage } from './wrangler/deploy-stage.js';
 import { deployedVersion } from './wrangler/deployed-version.js';
 import { scaffold } from './wrangler/scaffold.js';
@@ -524,6 +525,31 @@ function buildProgram(): Command {
     .description('Ensure Chromium is available for browser tests')
     .action(async () => {
       await ensureChromium();
+    });
+
+  const secrets = program
+    .command('secrets')
+    .description('Reconcile declared secrets: what Workers need, what workflows pass, what the repository holds');
+  secrets
+    .command('status')
+    .description('Show every declared secret and refuse when a workflow passes one the repository lacks')
+    .option('--repo <owner/name>', 'repository to read secrets from; defaults to the current checkout')
+    .action(async (options: { repo?: string }) => {
+      process.exitCode = secretsStatus(await findRepoRoot(), options);
+    });
+  secrets
+    .command('set <name>')
+    .description('Set one repository secret from a pasted value; the value is read without echo and never logged')
+    .option('--repo <owner/name>', 'repository to set the secret on')
+    .action(async (name: string, options: { repo?: string }) => {
+      process.exitCode = await secretsSet(name, options);
+    });
+  secrets
+    .command('sync')
+    .description('Push every secret smoo.secrets can fetch locally to the repository')
+    .option('--repo <owner/name>', 'repository to set the secrets on')
+    .action(async (options: { repo?: string }) => {
+      process.exitCode = await secretsSync(await findRepoRoot(), options);
     });
 
   const wrangler = program.command('wrangler').description('Cloudflare wrangler project helpers');
