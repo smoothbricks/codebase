@@ -199,6 +199,33 @@ describe('applyTypecheckTestDefaults', () => {
     expect(references).toContainEqual({ path: './tsconfig.lib.json' });
   });
 
+  it('fills compiler options the test program left out and keeps the ones it declared', () => {
+    // A Bun-only test program declaring es2023 says something the library cannot
+    // know: its runtime has change-array-by-copy while the library's output ships
+    // to node, workerd and browsers. Overwriting it made `toSorted` a type error
+    // in a suite that calls it, and every `smoo monorepo update` reintroduced it.
+    const declared: Record<string, unknown> = {
+      compilerOptions: { lib: ['es2023'], types: ['bun'], noEmit: true },
+    };
+    applyTypecheckTestDefaults(declared, {
+      testRunners: new Set(['bun'] as const),
+      referencePaths: [],
+      libCompilerOptions: { lib: ['es2022'], module: 'preserve' },
+    });
+
+    const declaredOptions = expectRecord(declared.compilerOptions);
+    expect(declaredOptions.lib).toEqual(['es2023']);
+    expect(declaredOptions.module).toBe('preserve');
+
+    const silent: Record<string, unknown> = { compilerOptions: {} };
+    applyTypecheckTestDefaults(silent, {
+      testRunners: new Set(['bun'] as const),
+      referencePaths: [],
+      libCompilerOptions: { lib: ['es2022'] },
+    });
+    expect(expectRecord(silent.compilerOptions).lib).toEqual(['es2022']);
+  });
+
   it('uses custom extends from lib tsconfig', () => {
     const tsconfigTest: Record<string, unknown> = {};
     applyTypecheckTestDefaults(tsconfigTest, {

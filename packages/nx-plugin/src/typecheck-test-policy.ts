@@ -1,6 +1,5 @@
 import { existsSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join, relative } from 'node:path';
-import { isDeepStrictEqual } from 'node:util';
 import type { Tree } from 'nx/src/devkit-exports.js';
 import { getProjects, readJson, readProjectConfiguration, updateJson, writeJson } from 'nx/src/devkit-exports.js';
 
@@ -167,13 +166,15 @@ export function applyTypecheckTestDefaults(
 
   const compilerOptions = getOrCreateRecord(tsconfigTest, 'compilerOptions');
 
-  // Copy relevant compiler options from lib tsconfig
+  // Fill from the lib tsconfig only what the test program has NOT declared. A
+  // test program that names its own `lib` is stating a fact the lib program
+  // cannot know: it runs on one runtime (Bun's JSC understands
+  // change-array-by-copy) while the library's output has to run on the shipping
+  // floor. Overwriting it turned `toSorted` into a type error in a suite that
+  // calls it every day, and it came back on every `smoo monorepo update`.
   if (options.libCompilerOptions) {
     for (const key of ['baseUrl', 'module', 'moduleResolution', 'jsx', 'lib']) {
-      if (
-        Object.hasOwn(options.libCompilerOptions, key) &&
-        !isDeepStrictEqual(compilerOptions[key], options.libCompilerOptions[key])
-      ) {
+      if (Object.hasOwn(options.libCompilerOptions, key) && !Object.hasOwn(compilerOptions, key)) {
         compilerOptions[key] = options.libCompilerOptions[key];
         changed = true;
       }
