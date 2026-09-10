@@ -1331,8 +1331,12 @@ async fn stdin_sources_are_exclusive_exact_and_streams_apply_backpressure() {
     let mut streamed = FakeService::default();
     let cli = parse_args(["exec", "raven", "--stdin", "--", "cat"]).unwrap();
     let mut output = Output::new(Vec::new(), Vec::new(), false);
-    let (mut writer, reader) = tokio::io::duplex(1);
-    let payload = vec![0x5a; 256 * 1024];
+    // Backpressure is the writer blocking until the dispatcher drains: any
+    // pipe smaller than the payload proves it. A 1-byte pipe under 256 KiB
+    // was 262 144 wake-ups on a current-thread runtime, which a slow hosted
+    // macOS runner could not finish inside the 30s deadline.
+    let (mut writer, reader) = tokio::io::duplex(64);
+    let payload = vec![0x5a; 64 * 1024];
     let expected = payload.clone();
     let producer = tokio::spawn(async move {
         tokio::io::AsyncWriteExt::write_all(&mut writer, &payload)
