@@ -15,6 +15,7 @@ import {
   checkReleaseConfigTree,
   SMOO_NX_RELEASE_TAG_PATTERN,
   SMOO_NX_VERSION_ACTIONS,
+  SMOO_NX_VERSION_ACTIONS_WORKSPACE_PATH,
 } from './release-config-policy.js';
 
 // ---------------------------------------------------------------------------
@@ -100,7 +101,9 @@ describe('pure core: checkReleaseConfig', () => {
     expect(messages).toContainEqual('release.version.specifierSource must be conventional-commits');
     expect(messages).toContainEqual('release.version.currentVersionResolver must be git-tag');
     expect(messages).toContainEqual('release.version.fallbackCurrentVersionResolver must be disk');
-    expect(messages).toContainEqual(`release.version.versionActions must be ${SMOO_NX_VERSION_ACTIONS}`);
+    expect(messages).toContainEqual(
+      `release.version.versionActions must be ${SMOO_NX_VERSION_ACTIONS} or ${SMOO_NX_VERSION_ACTIONS_WORKSPACE_PATH}`,
+    );
     expect(messages).toContainEqual(
       'release.version.preVersionCommand must not be defined; smoo builds npm-missing packages before publish',
     );
@@ -109,6 +112,20 @@ describe('pure core: checkReleaseConfig', () => {
     expect(messages).toContainEqual('release.changelog.workspaceChangelog must be false');
     expect(messages).toContainEqual('release.changelog.projectChangelogs.createRelease must be false');
     expect(messages).toContainEqual('release.changelog.projectChangelogs.file must be false');
+  });
+
+  it('accepts the workspace path to the same version-actions module and leaves it alone', () => {
+    // Under bun's global virtual store Nx resolves versionActions only as
+    // workspaceRoot + path; the path is the plugin's own export target.
+    expect(SMOO_NX_VERSION_ACTIONS_WORKSPACE_PATH).toBe(
+      'node_modules/@smoothbricks/nx-plugin/dist/version-actions.cjs',
+    );
+    const nxJson = validReleaseNxJson();
+    const version = expectRecord(expectRecord(nxJson.release).version);
+    version.versionActions = SMOO_NX_VERSION_ACTIONS_WORKSPACE_PATH;
+    expect(checkReleaseConfig(nxJson)).toEqual([]);
+    expect(applyReleaseConfig(nxJson)).toBe(false);
+    expect(version.versionActions).toBe(SMOO_NX_VERSION_ACTIONS_WORKSPACE_PATH);
   });
 });
 

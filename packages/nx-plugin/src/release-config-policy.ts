@@ -1,12 +1,39 @@
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import type { Tree } from 'nx/src/devkit-exports.js';
 import { readJson, updateJson } from 'nx/src/devkit-exports.js';
 
 import type { NxPolicyIssue } from './workspace-config-policy.js';
 
 export const SMOO_NX_VERSION_ACTIONS = '@smoothbricks/nx-plugin/version-actions';
+/**
+ * The same module as a workspace path. Nx resolves `versionActions` with
+ * `require.resolve` from its own location and falls back to workspaceRoot +
+ * path; under bun's global virtual store Nx lives outside the workspace, so
+ * only the path form resolves there. Derived from this package's own
+ * `./version-actions` export, never retyped.
+ */
+export const SMOO_NX_VERSION_ACTIONS_WORKSPACE_PATH = versionActionsWorkspacePath();
 export const SMOO_NX_RELEASE_TAG_PATTERN = '{projectName}@{version}';
+
+function versionActionsWorkspacePath(): string {
+  // src/ and dist/ both sit one level below the package root.
+  const packageJson = readJsonObject(join(dirname(fileURLToPath(import.meta.url)), '..', 'package.json'));
+  const name = packageJson && stringProperty(packageJson, 'name');
+  const exports = packageJson && recordProperty(packageJson, 'exports');
+  const entry = exports && recordProperty(exports, './version-actions');
+  const target = entry && stringProperty(entry, 'require');
+  if (!name || !target) {
+    // invariant throw: this package's own manifest is malformed
+    throw new Error('@smoothbricks/nx-plugin: package.json lacks the ./version-actions require export');
+  }
+  return `node_modules/${name}/${target.replace(/^\.\//, '')}`;
+}
+
+function isVersionActions(value: string | null): boolean {
+  return value === SMOO_NX_VERSION_ACTIONS || value === SMOO_NX_VERSION_ACTIONS_WORKSPACE_PATH;
+}
 
 /**
  * Check release config policy on an in-memory nx.json object.
@@ -37,10 +64,10 @@ export function checkReleaseConfig(nxJson: Record<string, unknown>): NxPolicyIss
   if (version && stringProperty(version, 'fallbackCurrentVersionResolver') !== 'disk') {
     issues.push({ path: 'nx.json', message: 'release.version.fallbackCurrentVersionResolver must be disk' });
   }
-  if (version && stringProperty(version, 'versionActions') !== SMOO_NX_VERSION_ACTIONS) {
+  if (version && !isVersionActions(stringProperty(version, 'versionActions'))) {
     issues.push({
       path: 'nx.json',
-      message: `release.version.versionActions must be ${SMOO_NX_VERSION_ACTIONS}`,
+      message: `release.version.versionActions must be ${SMOO_NX_VERSION_ACTIONS} or ${SMOO_NX_VERSION_ACTIONS_WORKSPACE_PATH}`,
     });
   }
   if (version && stringProperty(version, 'preVersionCommand')) {
@@ -114,7 +141,9 @@ export function applyReleaseConfig(nxJson: Record<string, unknown>): boolean {
   changed = setStringProperty(version, 'specifierSource', 'conventional-commits') || changed;
   changed = setStringProperty(version, 'currentVersionResolver', 'git-tag') || changed;
   changed = setStringProperty(version, 'fallbackCurrentVersionResolver', 'disk') || changed;
-  changed = setStringProperty(version, 'versionActions', SMOO_NX_VERSION_ACTIONS) || changed;
+  if (!isVersionActions(stringProperty(version, 'versionActions'))) {
+    changed = setStringProperty(version, 'versionActions', SMOO_NX_VERSION_ACTIONS) || changed;
+  }
 
   if ('preVersionCommand' in version) {
     delete version.preVersionCommand;
