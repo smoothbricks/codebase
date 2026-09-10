@@ -1025,6 +1025,7 @@ function renderProductionDeployJob(options: CiWorkflowDefinitionOptions): string
     needs: ${needs}
 ${renderRunsOnLine(options.runsOn)}
     timeout-minutes: 30
+    # prettier-ignore
     if: \${{ !cancelled() && github.event_name == 'push' && github.ref == ${stagingRefLiteral(options)} && needs.main.result == 'success'${e2eGate} }}
 ${environmentLine(options.environments?.production)}    env:
       GH_TOKEN: \${{ github.token }}
@@ -1032,7 +1033,8 @@ ${remoteCacheJobEnvLines(options.remoteCache)}${cargoCredentialJobEnvLines(optio
 ${renderCiWorkflowSteps(followUpSetupSteps(options, numbers), options)}
       # Step ${numbers.middle}
       - name: 🚀 Deploy Production
-${renderOptionalLines(deployStepSecretEnvLines(options))}        run: smoo github-ci nx-deploy --stage production --mode run-many --select-tag ${PRODUCTION_PUSH_DEPLOY_TAG} --name "Deploy Production" --step ${numbers.middle}
+${renderOptionalLines(deployStepSecretEnvLines(options))}        # prettier-ignore
+        run: smoo github-ci nx-deploy --stage production --mode run-many --select-tag ${PRODUCTION_PUSH_DEPLOY_TAG} --name "Deploy Production" --step ${numbers.middle}
 
 ${renderCiWorkflowSteps(followUpCleanupStep(numbers), options)}`;
 }

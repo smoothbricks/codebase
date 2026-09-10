@@ -6,6 +6,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { format } from 'prettier';
 import type { PackageCargoGitOrigin } from '../../lib/json.js';
 import {
   type CiWorkflowDefinitionOptions,
@@ -767,6 +768,23 @@ describe('renderCiWorkflowYaml with deploy configuration', () => {
       "    if: ${{ !cancelled() && github.event_name == 'push' && github.ref == 'refs/heads/trunk' && needs.main.result == 'success' }}",
     );
     expect(productionJob).not.toContain('needs.e2e-deployment');
+  });
+
+  it('renders a production job the repository Prettier config keeps byte for byte', async () => {
+    const withoutE2e = renderCiWorkflowYaml(
+      options({ deploy: true, deployProvider: 'cloudflare', pushBranches: ['trunk'], productionOnPush: true }),
+    );
+    for (const workflow of [rendered, withoutE2e]) {
+      const productionJob = workflow.slice(workflow.indexOf('  deploy-production:'));
+      expect(productionJob).toContain('    # prettier-ignore\n    if: ${{ !cancelled() ');
+      expect(productionJob).toContain(
+        '        # prettier-ignore\n        run: smoo github-ci nx-deploy --stage production ',
+      );
+      // A consuming repo's commit hook formats staged YAML with Prettier; a rewrapped line reads as drift forever.
+      await expect(
+        format(workflow, { parser: 'yaml', printWidth: 120, proseWrap: 'always', singleQuote: true }),
+      ).resolves.toBe(workflow);
+    }
   });
 
   it('keeps a protected staging environment off CI runs that do not deploy', () => {
