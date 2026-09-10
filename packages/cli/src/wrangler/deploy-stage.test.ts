@@ -3,15 +3,16 @@ import { existsSync, mkdtempSync, readFileSync, statSync } from 'node:fs';
 import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import type {
-  CloudflareClient,
-  CloudflareZone,
-  D1DatabaseRecord,
-  DnsRecord,
-  R2Bucket,
-  WorkerDomain,
-  WorkerRoute,
-  WorkerScript,
+import {
+  CloudflareApiError,
+  type CloudflareClient,
+  type CloudflareZone,
+  type D1DatabaseRecord,
+  type DnsRecord,
+  type R2Bucket,
+  type WorkerDomain,
+  type WorkerRoute,
+  type WorkerScript,
 } from './cloudflare.js';
 import {
   childEnvironment,
@@ -144,6 +145,10 @@ class FakeCloudflare implements CloudflareClient {
   namespaces: LiveKvNamespace[] = [];
   buckets: R2Bucket[] = [];
   scripts: WorkerScript[] = [{ id: 'fixture-worker-pr123' }];
+  /** Secret names each Worker already holds, by Worker name. */
+  secrets: Record<string, string[]> = {};
+  /** Every Worker whose secrets were queried, in order, so a test can prove one was never asked. */
+  secretQueries: string[] = [];
   domains: WorkerDomain[] = [];
   zones: CloudflareZone[] = [];
   routes: Record<string, WorkerRoute[]> = {};
@@ -182,6 +187,20 @@ class FakeCloudflare implements CloudflareClient {
   }
   async listWorkerScripts(): Promise<WorkerScript[]> {
     return this.scripts;
+  }
+  async listWorkerSecrets(workerName: string): Promise<string[]> {
+    this.secretQueries.push(workerName);
+    // Cloudflare answers 404 for a Worker that is not there. Wrangler used to hand that back as an
+    // empty list; it no longer does, and code that reads the failure as "no secrets" inverts the
+    // one check a first deployment depends on.
+    if (!this.scripts.some((script) => script.id === workerName)) {
+      throw new CloudflareApiError(
+        `Cloudflare API /workers/scripts/${workerName}/secrets failed: not found`,
+        404,
+        [10007],
+      );
+    }
+    return this.secrets[workerName] ?? [];
   }
   async deleteWorkerScript(name: string): Promise<void> {
     this.mutations.push(`delete-worker:${name}`);
@@ -397,11 +416,13 @@ describe('deploy-stage against live state', () => {
     expect(existsSync(requiredTestValue(runner.secretsPathSeen, 'secrets path'))).toBe(false);
   });
 
-  it('passes only present manifest values for fixed stages and preserves absent remote secrets', async () => {
+  it('sends only the values it has and leaves a secret the Worker already holds untouched', async () => {
     const root = await fixtureRoot();
     await writeFile(join(root, '.dev.vars.example'), 'FIXTURE_SECRET=""\nFIXTURE_TOKEN=""\n');
     const runner = new FakeRunner([], {});
     const cloudflare = new FakeCloudflare();
+    cloudflare.scripts = [{ id: 'fixture-worker-staging' }];
+    cloudflare.secrets['fixture-worker-staging'] = ['FIXTURE_TOKEN'];
 
     const result = await deployStage(
       root,
@@ -417,6 +438,8 @@ describe('deploy-stage against live state', () => {
       },
     );
 
+    // `--secrets-file` applies additively, so naming only what this shell has leaves FIXTURE_TOKEN
+    // exactly as the Worker holds it. That silence is only safe because the gate proved it is held.
     expect(result.action).toBe('deployed');
     expect(JSON.parse(requiredTestValue(runner.secretsJson, 'secrets JSON'))).toEqual({
       FIXTURE_SECRET: 'shared-secret',
@@ -464,6 +487,217 @@ describe('deploy-stage against live state', () => {
     expect(result.action).toBe('deployed');
     expect(createAttempts).toBe(1);
     expect(cloudflare.records.zone?.map((record) => record.name)).toEqual(['*.pr123.example.test']);
+  });
+});
+
+/**
+ * `smoo.wrangler.secretStages` answers two questions from one declaration, and both are load
+ * bearing: which secrets a stage must have before it may deploy, and which secrets it is allowed
+ * to receive at all. The second direction is the security-relevant one — a capability CI exports
+ * for preview stages must not ride a production deploy just because the variable is set.
+ */
+describe('stage-scoped deployment secrets', () => {
+  const STAGED_FIXTURE = `${FIXTURE}
+[env.production]
+name = "fixture-worker-production"
+workers_dev = false
+
+[env.production.vars]
+ENVIRONMENT = "production"
+`;
+
+  async function scopedRoot(secrets: string[], secretStages?: Record<string, string[]>): Promise<string> {
+    const root = await fixtureRoot(STAGED_FIXTURE);
+    await writeFile(join(root, '.dev.vars.example'), secrets.map((name) => `${name}=""\n`).join(''));
+    if (secretStages) {
+      await writeFile(
+        join(root, 'package.json'),
+        `${JSON.stringify({ name: '@acme/api', smoo: { wrangler: { secretStages } } }, null, 2)}\n`,
+      );
+    }
+    return root;
+  }
+
+  function environment(values: Record<string, string> = {}): NodeJS.ProcessEnv {
+    return { CLOUDFLARE_ACCOUNT_ID: 'account-1', CLOUDFLARE_API_TOKEN: 'token', ...values };
+  }
+
+  it('refuses a first deploy whose stage-required secret is exported nowhere, naming every one', async () => {
+    const root = await scopedRoot(['SESSION_SECRET', 'OAUTH_STATE_KEY'], {
+      OAUTH_STATE_KEY: ['staging', 'production'],
+    });
+    const runner = new FakeRunner([], {});
+    const cloudflare = new FakeCloudflare();
+
+    await expect(
+      deployStage(root, { stage: 'production' }, { runner, cloudflare, processEnv: environment() }),
+    ).rejects.toThrow(
+      /Refusing to deploy fixture-worker-production to production[\s\S]*SESSION_SECRET[\s\S]*OAUTH_STATE_KEY/,
+    );
+    expect(cloudflare.mutations).toEqual([]);
+    expect(runner.calls).toEqual([]);
+  });
+
+  it('treats a Worker that is not there as holding nothing, never as needing nothing', async () => {
+    const root = await scopedRoot(['OAUTH_STATE_KEY']);
+    const cloudflare = new FakeCloudflare();
+
+    // The double answers 404 for an absent Worker, exactly as Cloudflare does. Reading that error
+    // as "no secrets" would let this deploy through; asking at all would surface the 404 instead
+    // of the refusal. Neither happens: the script listing already said the Worker holds nothing.
+    await expect(
+      deployStage(
+        root,
+        { stage: 'production' },
+        { runner: new FakeRunner([], {}), cloudflare, processEnv: environment() },
+      ),
+    ).rejects.toThrow(/Refusing to deploy fixture-worker-production to production[\s\S]*OAUTH_STATE_KEY/);
+    expect(cloudflare.secretQueries).toEqual([]);
+    expect(cloudflare.mutations).toEqual([]);
+  });
+
+  it('requires an unscoped secret of every stage, including a pull-request stage', async () => {
+    const root = await scopedRoot(['SESSION_SECRET'], { OTHER_SECRET: ['staging'] });
+    await writeFile(join(root, '.dev.vars.example'), 'SESSION_SECRET=""\nOTHER_SECRET=""\n');
+    const cloudflare = new FakeCloudflare();
+
+    await expect(
+      deployStage(root, { stage: 'pr77' }, dependencies(new FakeRunner([], {}), cloudflare)),
+    ).rejects.toThrow(/fixture-worker-pr77[\s\S]*SESSION_SECRET — unscoped, so every stage requires it/);
+    expect(cloudflare.mutations).toEqual([]);
+  });
+
+  it('does not require a preview-scoped secret of production', async () => {
+    const root = await scopedRoot(['E2E_CONTROL_TOKEN'], { E2E_CONTROL_TOKEN: ['staging', 'preview'] });
+    const runner = new FakeRunner([], {});
+    const cloudflare = new FakeCloudflare();
+
+    const result = await deployStage(root, { stage: 'production' }, { runner, cloudflare, processEnv: environment() });
+
+    expect(result).toMatchObject({ action: 'deployed', workerName: 'fixture-worker-production' });
+    expect(runner.secretsPathSeen).toBeUndefined();
+  });
+
+  it('withholds a preview-scoped secret from production even when the deploying shell exports it', async () => {
+    const root = await scopedRoot(['API_TOKEN', 'E2E_CONTROL_TOKEN'], { E2E_CONTROL_TOKEN: ['staging', 'preview'] });
+    const runner = new FakeRunner([], {});
+    const cloudflare = new FakeCloudflare();
+
+    const result = await deployStage(
+      root,
+      { stage: 'production' },
+      {
+        runner,
+        cloudflare,
+        processEnv: environment({ API_TOKEN: 'api-value', E2E_CONTROL_TOKEN: 'teardown-value' }),
+      },
+    );
+
+    expect(result.action).toBe('deployed');
+    expect(JSON.parse(requiredTestValue(runner.secretsJson, 'secrets JSON'))).toEqual({ API_TOKEN: 'api-value' });
+  });
+
+  it('sends a preview-scoped secret to the stages it is scoped to', async () => {
+    const scopes = { E2E_CONTROL_TOKEN: ['staging', 'preview'] };
+    const values = { API_TOKEN: 'api-value', E2E_CONTROL_TOKEN: 'teardown-value' };
+
+    for (const stage of ['staging', 'pr77'] as const) {
+      const root = await scopedRoot(['API_TOKEN', 'E2E_CONTROL_TOKEN'], scopes);
+      const runner = new FakeRunner([], {});
+
+      await deployStage(root, { stage }, { runner, cloudflare: new FakeCloudflare(), processEnv: environment(values) });
+
+      expect(JSON.parse(requiredTestValue(runner.secretsJson, `secrets JSON for ${stage}`))).toEqual(values);
+    }
+  });
+
+  it('treats an empty scope as no stage at all, not as every stage', async () => {
+    const root = await scopedRoot(['API_TOKEN', 'LOCAL_ONLY_KEY'], { LOCAL_ONLY_KEY: [] });
+    const runner = new FakeRunner([], {});
+
+    // `[]` and "absent from the map" are opposite declarations. A check written as
+    // `!scope?.length` would collapse them and ship a local-development value to every stage.
+    const result = await deployStage(
+      root,
+      { stage: 'production' },
+      {
+        runner,
+        cloudflare: new FakeCloudflare(),
+        processEnv: environment({ API_TOKEN: 'api-value', LOCAL_ONLY_KEY: 'laptop-value' }),
+      },
+    );
+
+    expect(result.action).toBe('deployed');
+    expect(JSON.parse(requiredTestValue(runner.secretsJson, 'secrets JSON'))).toEqual({ API_TOKEN: 'api-value' });
+  });
+
+  it('refuses when the Worker holds a secret this stage is scoped out of, since a deploy cannot remove it', async () => {
+    const root = await scopedRoot(['E2E_CONTROL_TOKEN'], { E2E_CONTROL_TOKEN: ['staging', 'preview'] });
+    const cloudflare = new FakeCloudflare();
+    cloudflare.scripts = [{ id: 'fixture-worker-production' }];
+    cloudflare.secrets['fixture-worker-production'] = ['E2E_CONTROL_TOKEN'];
+
+    await expect(
+      deployStage(
+        root,
+        { stage: 'production' },
+        { runner: new FakeRunner([], {}), cloudflare, processEnv: environment() },
+      ),
+    ).rejects.toThrow(/keeps out of production[\s\S]*E2E_CONTROL_TOKEN — scoped to staging, preview/);
+    expect(cloudflare.mutations).toEqual([]);
+  });
+
+  it('refuses a scope written against a name no secret has, rather than scoping nothing', async () => {
+    const root = await scopedRoot(['E2E_CONTROL_TOKEN'], { E2E_CONTROL_TOEKN: ['staging'] });
+
+    await expect(
+      deployStage(
+        root,
+        { stage: 'production' },
+        { runner: new FakeRunner([], {}), cloudflare: new FakeCloudflare(), processEnv: environment() },
+      ),
+    ).rejects.toThrow(/secretStages scopes E2E_CONTROL_TOEKN, which .dev.vars.example does not declare/);
+  });
+
+  it('names a malformed scope declaration by its path in the manifest', async () => {
+    const root = await scopedRoot(['E2E_CONTROL_TOKEN'], { E2E_CONTROL_TOKEN: ['pr7'] });
+
+    await expect(
+      deployStage(
+        root,
+        { stage: 'production' },
+        { runner: new FakeRunner([], {}), cloudflare: new FakeCloudflare(), processEnv: environment() },
+      ),
+    ).rejects.toThrow(
+      /package\.json declares an invalid smoo\.wrangler block: smoo\.wrangler\.secretStages\.E2E_CONTROL_TOKEN\[0\]/,
+    );
+  });
+
+  it('keeps every secret value out of the refusal and off every command line', async () => {
+    const root = await scopedRoot(['API_TOKEN', 'SESSION_SECRET']);
+    const runner = new FakeRunner([], {});
+    const cloudflare = new FakeCloudflare();
+
+    const refused = await deployStage(
+      root,
+      { stage: 'production' },
+      { runner, cloudflare, processEnv: environment({ API_TOKEN: 'api-value' }) },
+    ).catch((error: unknown) => (error instanceof Error ? error.message : String(error)));
+
+    expect(refused).toContain('SESSION_SECRET');
+    expect(refused).not.toContain('api-value');
+
+    // And the same on the path that does deploy: values reach wrangler through a 0600 file only.
+    cloudflare.scripts = [{ id: 'fixture-worker-production' }];
+    cloudflare.secrets['fixture-worker-production'] = ['SESSION_SECRET'];
+    await deployStage(
+      root,
+      { stage: 'production' },
+      { runner, cloudflare, processEnv: environment({ API_TOKEN: 'api-value' }) },
+    );
+
+    expect(runner.calls.flatMap((call) => call.args).join('\u0000')).not.toContain('api-value');
+    expect(JSON.parse(requiredTestValue(runner.secretsJson, 'secrets JSON'))).toEqual({ API_TOKEN: 'api-value' });
   });
 });
 
@@ -837,7 +1071,7 @@ describe('deployStage with a flat JSON config', () => {
 
     await expect(
       deployStage(root, { stage: 'pr7', config: configPath }, dependencies(new FakeRunner(), cloudflare)),
-    ).rejects.toThrow(/requires process environment values/);
+    ).rejects.toThrow(/Refusing to deploy fixture-website-preview-pr7 to pr7[\s\S]*FIXTURE_SECRET/);
     expect(cloudflare.mutations).toEqual([]);
   });
 

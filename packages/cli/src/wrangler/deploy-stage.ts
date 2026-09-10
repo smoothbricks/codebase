@@ -1,5 +1,4 @@
 import { randomUUID } from 'node:crypto';
-import { existsSync, readFileSync } from 'node:fs';
 import { readFile, rm, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { parseJsonFileText } from '../lib/json.js';
@@ -16,7 +15,6 @@ import {
   type VersionEndpointWaitOptions,
   writeCachedLiveVersion,
 } from './live-version.js';
-import { parseDevVarsExample } from './prepare-env.js';
 import {
   type ConfiguredStageResourcePlan,
   type DeploymentStage,
@@ -32,6 +30,13 @@ import {
   planPullRequestResources,
   pullRequestStage,
 } from './stage.js';
+import {
+  planStageSecrets,
+  readDeclaredSecretNames,
+  readSecretStageMap,
+  type StageSecretPlan,
+  stageSecretRefusal,
+} from './stage-secrets.js';
 
 export interface ProcessResult {
   exitCode: number;
@@ -118,20 +123,25 @@ export async function deployStage(
     dependencies.cloudflare ??
     new CloudflareRestClient(accountId, requiredEnvironmentValue(apiToken, 'CLOUDFLARE_API_TOKEN'));
   const runner = dependencies.runner ?? new BunProcessRunner();
-  const secretNames = readSecretNames(cwd);
+  const secretPlan = planStageSecrets(readDeclaredSecretNames(cwd), stage, readSecretStageMap(cwd));
+  // Only the stage's own secrets, and only the ones a value exists for. A secret scoped to other
+  // stages is dropped here even when this shell exports it: that is the whole permission rule.
   const secretValues: Record<string, string> = {};
-  for (const name of secretNames) {
+  for (const name of secretPlan.required) {
     const value = processEnv[name];
     if (value) secretValues[name] = value;
   }
-  const missingSecrets = secretNames.filter((name) => !processEnv[name]);
+  const gate = stageSecretGate(secretPlan, new Set(Object.keys(secretValues)), cloudflare);
   let temporaryConfigPath: string | undefined;
   let temporarySecretsPath: string | undefined;
   try {
     const prepared = options.config
-      ? await prepareFlatConfig(options.config, stage, accountId, missingSecrets, cloudflare)
-      : await prepareTomlConfig(cwd, stage, accountId, missingSecrets, cloudflare);
+      ? await prepareFlatConfig(options.config, stage, accountId, gate, cloudflare)
+      : await prepareTomlConfig(cwd, stage, accountId, gate, cloudflare);
     temporaryConfigPath = prepared.temporaryConfigPath;
+    // The pull-request path already ran this before provisioning; the gate answers once per Worker.
+    // Everything below here writes to Cloudflare.
+    await gate(prepared.plan.workerName);
     const workerExists = await reconcileStageResources(prepared.plan, cloudflare);
     const versionTag = nxTaskVersionTag(processEnv);
     const envArgs = prepared.envFlag ? ['--env', prepared.envFlag] : [];
@@ -228,7 +238,7 @@ async function prepareTomlConfig(
   cwd: string,
   stage: DeploymentStage,
   accountId: string,
-  missingSecrets: string[],
+  gate: SecretGate,
   cloudflare: CloudflareClient,
 ): Promise<PreparedConfig> {
   const committedConfigPath = join(cwd, 'wrangler.toml');
@@ -243,12 +253,7 @@ async function prepareTomlConfig(
   }
   const liveNamespaces = await cloudflare.listKvNamespaces();
   const plan = planPullRequestResources(committedToml, stage, liveNamespaces);
-  const { kvNamespaceIds, d1DatabaseIds } = await provisionPullRequestResources(
-    plan,
-    missingSecrets,
-    cloudflare,
-    liveNamespaces,
-  );
+  const { kvNamespaceIds, d1DatabaseIds } = await provisionPullRequestResources(plan, gate, cloudflare, liveNamespaces);
   const derivedToml = derivePullRequestWranglerConfig(committedToml, {
     stage,
     accountId,
@@ -270,7 +275,7 @@ async function prepareFlatConfig(
   configPath: string,
   stage: DeploymentStage,
   accountId: string,
-  missingSecrets: string[],
+  gate: SecretGate,
   cloudflare: CloudflareClient,
 ): Promise<PreparedConfig> {
   const flat = parseJsonFileText(configPath, await readFile(configPath, 'utf8'), parseFlatWranglerConfig);
@@ -283,12 +288,7 @@ async function prepareFlatConfig(
   }
   const liveNamespaces = await cloudflare.listKvNamespaces();
   const plan = planPullRequestBindings(flat, stage, liveNamespaces);
-  const { kvNamespaceIds, d1DatabaseIds } = await provisionPullRequestResources(
-    plan,
-    missingSecrets,
-    cloudflare,
-    liveNamespaces,
-  );
+  const { kvNamespaceIds, d1DatabaseIds } = await provisionPullRequestResources(plan, gate, cloudflare, liveNamespaces);
   const derived = derivePullRequestStageConfig(flat, { stage, accountId, kvNamespaceIds, d1DatabaseIds });
   // Beside the original: its main/assets/migrations paths are relative to the file.
   const temporaryConfigPath = join(dirname(configPath), `.wrangler.smoo-${process.pid}-${randomUUID()}.json`);
@@ -322,27 +322,58 @@ function migrationBindings(config: FlatWranglerConfig): string[] {
     .map((database) => database.binding);
 }
 
-async function refuseFirstDeploymentWithoutSecrets(
+/**
+ * Asks, of one Worker, whether this stage may deploy at all. Called at each path's last read
+ * before its first write, so a refusal costs nothing: the pull-request path provisions KV and D1
+ * inside config preparation, and every path reconciles buckets, routes and DNS after it. A
+ * refusal arriving later would strand resources created for a deploy that was never allowed.
+ */
+type SecretGate = (workerName: string) => Promise<void>;
+
+/**
+ * One answer per Worker, reused by both call sites so the read costs one round trip.
+ *
+ * What the Worker holds comes from the account's script listing first. A Worker absent from it
+ * holds nothing — exactly the first-deployment case — and Cloudflare answers 404 rather than an
+ * empty list when asked for a missing Worker's secrets. Reading that failure as "then nothing is
+ * needed" would disarm the check at the one moment it matters most, so it is never asked.
+ */
+function stageSecretGate(
+  plan: StageSecretPlan,
+  exported: ReadonlySet<string>,
   cloudflare: CloudflareClient,
-  workerName: string,
-  missingSecrets: string[],
-): Promise<void> {
-  const firstDeployment = !(await cloudflare.listWorkerScripts()).some((script) => script.id === workerName);
-  if (firstDeployment && missingSecrets.length > 0) {
-    throw new Error(
-      `First deployment of ${workerName} requires process environment values for: ${missingSecrets.join(', ')}.`,
-    );
-  }
+): SecretGate {
+  const answered = new Map<string, Promise<void>>();
+  return (workerName) => {
+    let pending = answered.get(workerName);
+    if (!pending) {
+      pending = assertStageSecrets(plan, exported, cloudflare, workerName);
+      answered.set(workerName, pending);
+    }
+    return pending;
+  };
 }
 
-/** Isolation refusals already ran in the plan; this is the first Cloudflare write. */
+async function assertStageSecrets(
+  plan: StageSecretPlan,
+  exported: ReadonlySet<string>,
+  cloudflare: CloudflareClient,
+  workerName: string,
+): Promise<void> {
+  const live = (await cloudflare.listWorkerScripts()).some((script) => script.id === workerName);
+  const held = new Set(live ? await cloudflare.listWorkerSecrets(workerName) : []);
+  const refusal = stageSecretRefusal(plan, exported, held, workerName);
+  if (refusal) throw new Error(refusal);
+}
+
+/** Isolation refusals already ran in the plan; the gate below is the last one before the first write. */
 async function provisionPullRequestResources(
   plan: PullRequestResourcePlan,
-  missingSecrets: string[],
+  gate: SecretGate,
   cloudflare: CloudflareClient,
   liveNamespaces: LiveKvNamespace[],
 ): Promise<{ kvNamespaceIds: Map<string, string>; d1DatabaseIds: Map<string, string> }> {
-  await refuseFirstDeploymentWithoutSecrets(cloudflare, plan.workerName, missingSecrets);
+  await gate(plan.workerName);
   const kvNamespaceIds = await ensureKvNamespaces(plan.kvNamespaces, liveNamespaces, cloudflare);
   const d1DatabaseIds =
     plan.d1Databases.length === 0
@@ -668,9 +699,4 @@ async function wrangler(runner: ProcessRunner, args: string[], run: ProcessRunOp
 function requiredEnvironmentValue(value: string | undefined, name: string): string {
   if (!value) throw new Error(`${name} is required.`);
   return value;
-}
-
-function readSecretNames(cwd: string): string[] {
-  const path = join(cwd, '.dev.vars.example');
-  return existsSync(path) ? parseDevVarsExample(readFileSync(path, 'utf8')) : [];
 }

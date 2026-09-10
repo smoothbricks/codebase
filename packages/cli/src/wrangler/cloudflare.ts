@@ -9,6 +9,11 @@ export interface WorkerScript {
   id: string;
 }
 
+/** One secret bound to a Worker. Cloudflare answers names and types only; a value is never readable. */
+export interface WorkerSecret {
+  name: string;
+}
+
 export interface WorkerRoute {
   id: string;
   pattern: string;
@@ -49,6 +54,8 @@ export interface CloudflareClient {
   deleteR2Object(bucket: string, key: string): Promise<void>;
   deleteR2Bucket(name: string): Promise<void>;
   listWorkerScripts(): Promise<WorkerScript[]>;
+  /** Names only; the Worker's stored values are write-only from outside. */
+  listWorkerSecrets(workerName: string): Promise<string[]>;
   deleteWorkerScript(name: string): Promise<void>;
   listWorkerDomains(): Promise<WorkerDomain[]>;
   createWorkerDomain(hostname: string, workerName: string, zoneId: string): Promise<void>;
@@ -97,6 +104,7 @@ const MAX_LIST_PAGES = 1000;
 const isKvNamespaces = typia.createIs<LiveKvNamespace[]>();
 const isR2Buckets = typia.createIs<R2Bucket[]>();
 const isWorkerScripts = typia.createIs<WorkerScript[]>();
+const isWorkerSecrets = typia.createIs<WorkerSecret[]>();
 const isWorkerDomains = typia.createIs<WorkerDomain[]>();
 const isCloudflareZones = typia.createIs<CloudflareZone[]>();
 const isWorkerRoutes = typia.createIs<WorkerRoute[]>();
@@ -220,6 +228,16 @@ export class CloudflareRestClient implements CloudflareClient {
   listWorkerScripts(): Promise<WorkerScript[]> {
     // `workers/scripts` takes no pagination parameters: the account's scripts arrive in one answer.
     return this.listOnce(`${this.accountPath}/workers/scripts`, isWorkerScripts);
+  }
+
+  async listWorkerSecrets(workerName: string): Promise<string[]> {
+    // Unpaginated, like the script listing itself. A Worker that does not exist answers 404 rather
+    // than an empty list, so the caller must establish that the Worker is there before asking.
+    const secrets = await this.listOnce(
+      `${this.accountPath}/workers/scripts/${encodeURIComponent(workerName)}/secrets`,
+      isWorkerSecrets,
+    );
+    return secrets.map((secret) => secret.name);
   }
 
   deleteWorkerScript(name: string): Promise<void> {
