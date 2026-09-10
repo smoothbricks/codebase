@@ -30,6 +30,11 @@ pub(crate) const DEFAULT_MOUNT_RELATIVE: &str = ".cowshed/mnt";
 /// account, never enumerated), and the NAME of the host environment variable the operator
 /// enrolled from. That name is what lets a spawn withhold an ambient copy of the same token
 /// from a sandbox — a gateway-held credential is pointless if the workspace also gets the bytes.
+///
+/// Unlike [`HostConfig`] itself, a route is strict: a key this build does not know could be a
+/// constraint on where the credential may be used, and honouring the half it understands is
+/// worse than refusing. Anything added here therefore has to answer the same question the file
+/// already answered — what an older binary does when it meets it.
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CredentialRoute {
@@ -66,8 +71,15 @@ fn is_environment_name(name: &str) -> bool {
             .all(|character| character == '_' || character.is_ascii_alphanumeric())
 }
 
+/// Host state every cowshed binary on the machine reads, so unknown keys are TOLERATED.
+///
+/// This file outlives any one build: a workspace image, a daemon, and the CLI on `PATH` can all
+/// be different versions of cowshed at once. A reader that refuses a field a newer writer added
+/// turns one enrolment into every other binary on the host failing to run at all — which is a
+/// far worse failure than ignoring a key it has no use for. `version` is what a genuinely
+/// incompatible layout would bump; additive keys are not that.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct HostConfig {
     version: u32,
     mount_root: PathBuf,
@@ -138,12 +150,14 @@ impl HostConfig {
         for route in &self.credential_routes {
             route.validate()?;
         }
-        let mut bytes =
+        // `write_private_atomic` terminates the file itself; appending here as well wrote a
+        // second newline, so a host that enrolled nothing no longer matched the bytes the
+        // mount-root writer had produced.
+        let bytes =
             serde_json::to_vec_pretty(self).map_err(|source| HostConfigError::InvalidConfig {
                 path: store_root.join(HOST_CONFIG_FILE),
                 message: source.to_string(),
             })?;
-        bytes.push(b'\n');
         write_private_atomic(&store_root.join(HOST_CONFIG_FILE), &bytes)
     }
 
@@ -597,15 +611,55 @@ mod tests {
         fs::remove_dir_all(&store).expect("cleanup");
     }
 
+    /// A host that never enrolled a credential must not be able to tell that this file gained
+    /// the ability to hold one — byte for byte, because the two writers publish the same file.
     #[test]
-    fn a_host_with_no_routes_writes_no_route_key_at_all() {
-        let store = temp_directory("no-routes");
-        HostConfig::new("/Users/tester/.cowshed/mnt")
+    fn a_host_with_no_routes_writes_exactly_what_the_mount_root_writer_writes() {
+        let root = temp_directory("no-routes");
+        let saved_store = root.join("saved");
+        let planned_store = root.join("planned");
+        fs::create_dir_all(&saved_store).expect("saved store");
+        fs::create_dir_all(&planned_store).expect("planned store");
+        let mount_root = root.join("workspaces");
+
+        HostConfig::new(&mount_root)
             .expect("config")
-            .save(&store)
+            .save(&saved_store)
             .expect("save");
-        let written = fs::read_to_string(store.join(HOST_CONFIG_FILE)).expect("written");
-        assert!(!written.contains("credentialRoutes"), "{written}");
+        let plan =
+            plan_mount_root_change(&planned_store, &mount_root, []).expect("mount root plan");
+        execute_mount_root_change(&plan).expect("mount root change");
+
+        let saved = fs::read(saved_store.join(HOST_CONFIG_FILE)).expect("saved bytes");
+        let planned = fs::read(planned_store.join(HOST_CONFIG_FILE)).expect("planned bytes");
+        assert_eq!(
+            String::from_utf8_lossy(&saved),
+            String::from_utf8_lossy(&planned)
+        );
+        assert!(!String::from_utf8_lossy(&saved).contains("credentialRoutes"));
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    /// One machine runs several cowshed builds at once — a workspace image, the daemon, and the
+    /// CLI on `PATH`. A reader that refuses a key a newer writer added makes one enrolment brick
+    /// every other binary on the host, which is exactly what a shared state file must not do.
+    #[test]
+    fn a_key_this_build_does_not_know_is_ignored_rather_than_fatal() {
+        let store = temp_directory("forward-compatible");
+        fs::write(
+            store.join(HOST_CONFIG_FILE),
+            br#"{"version":1,"mountRoot":"/Users/tester/.cowshed/mnt","somethingNewer":{"a":1}}"#,
+        )
+        .expect("write");
+        #[cfg(unix)]
+        fs::set_permissions(
+            store.join(HOST_CONFIG_FILE),
+            std::os::unix::fs::PermissionsExt::from_mode(0o600),
+        )
+        .expect("mode");
+
+        let config = HostConfig::load(&store, Path::new("/Users/tester")).expect("load");
+        assert_eq!(config.mount_root(), Path::new("/Users/tester/.cowshed/mnt"));
         fs::remove_dir_all(&store).expect("cleanup");
     }
 
