@@ -1,6 +1,8 @@
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import type { ChangelogOptions } from 'nx/src/command-line/release/command-object.js';
 import type { NxReleaseConfiguration } from 'nx/src/config/nx-json.js';
 import { type ReleasePackageInfo, releaseTag } from './core.js';
@@ -34,7 +36,10 @@ export interface GithubReleaseWriteShell {
 
 export async function renderNxProjectChangelogContents(input: RenderNxProjectChangelogInput): Promise<string> {
   return withNxWorkspaceRoot(input.root, async () => {
-    const { createAPI } = await import('nx/src/command-line/release/changelog.js');
+    const { createAPI } = await importWorkspaceNx<typeof import('nx/src/command-line/release/changelog.js')>(
+      input.root,
+      'src/command-line/release/changelog.js',
+    );
     const result = await createAPI(
       nxRenderOnlyReleaseConfig,
       false,
@@ -124,8 +129,26 @@ function isPrereleaseVersion(version: string): boolean {
   return version.includes('-');
 }
 
+/**
+ * A module of the WORKSPACE's Nx, not of smoo's own dependency. smoo installs
+ * with its own `nx` in the global virtual store, where the workspace's
+ * node_modules is invisible: that Nx cannot resolve the workspace's
+ * `versionActions` plugin (`Unable to resolve the "versionActions"
+ * implementation ... "@smoothbricks/nx-plugin/version-actions"`), and it is
+ * a second Nx version driving one release. Every in-process Nx call for a
+ * workspace resolves from that workspace's root, exactly as `nx` on its PATH
+ * would.
+ */
+export async function importWorkspaceNx<T>(root: string, subpath: string): Promise<T> {
+  const resolved = createRequire(join(root, 'package.json')).resolve(`nx/${subpath}`);
+  return (await import(pathToFileURL(resolved).href)) as T;
+}
+
 export async function withNxWorkspaceRoot<T>(root: string, run: () => Promise<T>): Promise<T> {
-  const workspaceRootModule = await import('nx/src/utils/workspace-root.js');
+  const workspaceRootModule = await importWorkspaceNx<typeof import('nx/src/utils/workspace-root.js')>(
+    root,
+    'src/utils/workspace-root.js',
+  );
   const previousWorkspaceRoot = workspaceRootModule.workspaceRoot;
   const previousEnvWorkspaceRoot = process.env.NX_WORKSPACE_ROOT_PATH;
   const previousCwd = process.cwd();
