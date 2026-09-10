@@ -1338,12 +1338,12 @@ mod tests {
     #[test]
     fn the_daemon_socket_is_admitted_only_by_resolving_to_a_real_socket() {
         let sequence = NEXT_SANDBOX_DIR.fetch_add(1, Ordering::Relaxed);
-        let root = fs::canonicalize(std::env::temp_dir())
-            .unwrap()
-            .join(format!(
-                "cowshed-socket-test-{}-{sequence}",
-                std::process::id()
-            ));
+        // Bind through the admitted short runtime spelling; canonicalizing it first
+        // expands a cowshed mount beyond sockaddr_un's path limit.
+        let root = std::env::var_os("XDG_RUNTIME_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir)
+            .join(format!("cs-s-{}-{sequence}", std::process::id()));
         fs::create_dir_all(&root).unwrap();
 
         // A path that is not a socket is not admitted by being named, and neither is a missing one.
@@ -1356,12 +1356,15 @@ mod tests {
         // Seatbelt's `path-literal` matches against.
         let listener = root.join("real.socket");
         let _server = std::os::unix::net::UnixListener::bind(&listener).unwrap();
+        let listener = fs::canonicalize(listener).unwrap();
         let link = root.join("link-to-socket");
         std::os::unix::fs::symlink(&listener, &link).unwrap();
         assert_eq!(nix_daemon_socket_at(&link), Some(listener.clone()));
 
-        // The admitted path reaches the profile with its ancestors traversable, or connecting fails
-        // on path resolution before the outbound rule is consulted.
+        // The admitted path reaches the profile with its ancestors traversable, or connecting
+        // fails on path resolution before the outbound rule is consulted. The profile names the
+        // resolved socket, so its directory is the resolved parent, not the runtime alias.
+        let resolved_directory = listener.parent().expect("resolved socket directory");
         let mut config = config(RunSandboxMode::ReadWrite);
         config.allowed_unix_sockets = vec![listener.clone()];
         let profile = seatbelt_profile(&config, SandboxProfileRole::ExecutedChild).unwrap();
@@ -1372,7 +1375,7 @@ mod tests {
         assert!(
             profile.contains(&format!(
                 "(allow file-read* (literal \"{}\"))",
-                root.display()
+                resolved_directory.display()
             )),
             "the socket's own directory must be traversable"
         );
@@ -1382,7 +1385,8 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn seatbelt_enforces_supervisor_and_child_artifact_authority() {
+    #[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
+    fn host_controller_seatbelt_enforces_supervisor_and_child_artifact_authority() {
         let sequence = NEXT_SANDBOX_DIR.fetch_add(1, Ordering::Relaxed);
         let root_alias = std::env::temp_dir().join(format!(
             "cowshed-sandbox-test-{}-{sequence}",
