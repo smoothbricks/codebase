@@ -237,5 +237,5 @@ runs:
       shell: bash
       working-directory: ${{ env.DEVENV_WORKDIR }}/tooling/direnv
       env:
-        SMOO_HOST_RUNNER: ${{ steps.runner-kind.outputs.host }}
+        SMOO_ROOT_BUILD_INPUTS: ${{ steps.runner-kind.outputs.host != 'true' }}
       run: ./github-actions-bootstrap.sh build-shell
