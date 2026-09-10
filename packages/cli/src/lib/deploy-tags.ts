@@ -14,6 +14,12 @@ export const PERMANENT_DEPLOY_TAG = 'permanent-deploy-target';
 export const PRODUCTION_PUSH_DEPLOY_TAG = 'production-push-deploy-target';
 
 /**
+ * Deployed after every other project the same run selected: its deploy calls into what they deploy (a site that
+ * signs in to its stage's backend). It orders; it never selects.
+ */
+export const LATE_DEPLOY_TAG = 'late-deploy-target';
+
+/**
  * Whether a deploy target is stage-derived (the tag, or the `smoo wrangler deploy-stage` command) rather than a set of
  * per-stage configurations; CI selection and workflow generation must agree on this.
  */

@@ -428,6 +428,13 @@ that runs after Validate and the e2e job succeed on a push to the staging push b
 stage-derived — carry `stage-deploy-target` or deploy through `smoo wrangler deploy-stage` — otherwise `--select-tag`
 finds nothing and the job logs `No run-many deploy projects; skipping production.`
 
+Tag a project `late-deploy-target` when its deploy calls into what the rest of its stage deploys — a site that signs in
+to its stage's backend, for example. `smoo github-ci nx-deploy` then deploys it in a second `nx run-many`, started only
+after every other selected project deployed successfully. The tag orders; it never selects: the project must still
+qualify through the stage rules, and a run with no late projects, or only late ones, keeps a single round. There are
+only two rounds: several late projects deploy together in the second one, so a late project cannot wait for another late
+project.
+
 Pushes to the staging push branch queue behind a running workflow instead of canceling it, so a newer push never cancels
 a production deployment mid-flight. Pull requests and other branches keep canceling superseded runs. The e2e and
 production jobs repeat the Cargo credential and sibling-source preflight before SetupDevenv, so their `--step` anchors

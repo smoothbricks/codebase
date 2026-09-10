@@ -6,6 +6,7 @@ import { $ } from 'bun';
 import { decode } from '../lib/run.js';
 import type { ProjectTargets } from '../nx/index.js';
 import {
+  deployRounds,
   expandNxTargetDependencyRuns,
   expandNxTargetRuns,
   githubCiNxDeploy,
@@ -27,6 +28,9 @@ import {
   collectNxOutputs,
   resolveDeclaredOutput,
 } from './outputs.js';
+
+/** Selected deploy projects that wait for nothing, as `listProjects` reports them. */
+const early = (...names: string[]) => names.map((name) => ({ name, late: false }));
 
 const SOURCE_SHA = 'a'.repeat(40);
 const OTHER_SHA = 'b'.repeat(40);
@@ -874,22 +878,15 @@ describe('event-aware stage deployment', () => {
     const candidates = Object.keys(definitions);
     const loadProject = async (project: string) => definitions[project];
 
-    await expect(selectStageDeployProjects(candidates, 'staging', undefined, loadProject)).resolves.toEqual([
-      'app',
-      'app-backend',
-      'e2e-mail-capture',
-      'website',
-    ]);
-    await expect(selectStageDeployProjects(candidates, 'pr123', undefined, loadProject)).resolves.toEqual([
-      'app',
-      'app-backend',
-      'website',
-    ]);
-    await expect(selectStageDeployProjects(candidates, 'production', undefined, loadProject)).resolves.toEqual([
-      'app',
-      'app-backend',
-      'website',
-    ]);
+    await expect(selectStageDeployProjects(candidates, 'staging', undefined, loadProject)).resolves.toEqual(
+      early('app', 'app-backend', 'e2e-mail-capture', 'website'),
+    );
+    await expect(selectStageDeployProjects(candidates, 'pr123', undefined, loadProject)).resolves.toEqual(
+      early('app', 'app-backend', 'website'),
+    );
+    await expect(selectStageDeployProjects(candidates, 'production', undefined, loadProject)).resolves.toEqual(
+      early('app', 'app-backend', 'website'),
+    );
   });
 
   it('publishes GitHub deployment JSON through a real stdin process seam', async () => {
@@ -977,7 +974,7 @@ describe('event-aware stage deployment', () => {
         },
         listProjects: async (_root, target, mode, stage, selectTag) => {
           listCalls.push([target, mode, stage, selectTag]);
-          return ['app', 'app-backend'];
+          return early('app', 'app-backend');
         },
         runNx: async (args) => {
           nxCalls.push(args);
@@ -1041,7 +1038,7 @@ describe('event-aware stage deployment', () => {
         { stage: 'staging' },
         {
           processEnv: { GITHUB_OUTPUT: '/output' },
-          listProjects: async () => ['app'],
+          listProjects: async () => early('app'),
           runNx: async () => 1,
           appendOutput: async (_path, content) => {
             deploymentOutputs.push(content);
@@ -1062,7 +1059,7 @@ describe('event-aware stage deployment', () => {
         { stage: 'staging' },
         {
           processEnv: { GITHUB_OUTPUT: '/output' },
-          listProjects: async () => ['app'],
+          listProjects: async () => early('app'),
           runNx: async () => 0,
           appendOutput: async () => {
             throw new Error('output unavailable');
@@ -1088,7 +1085,7 @@ describe('event-aware stage deployment', () => {
         setStatus: async () => {},
         listProjects: async (_root, target, mode, stage, selectTag) => {
           listCalls.push([target, mode, stage, selectTag]);
-          return ['website'];
+          return early('website');
         },
         runNx: async (args) => {
           nxCalls.push(args);
@@ -1125,7 +1122,7 @@ describe('event-aware stage deployment', () => {
           },
           listProjects: async () => {
             listed += 1;
-            return ['app'];
+            return early('app');
           },
           runNx: async () => {
             deployed += 1;
@@ -1158,7 +1155,7 @@ describe('event-aware stage deployment', () => {
           setStatus: async (status) => {
             statuses.push(status);
           },
-          listProjects: async () => ['app'],
+          listProjects: async () => early('app'),
           runNx: async () => {
             deployed += 1;
             return 0;
@@ -1193,6 +1190,133 @@ describe('event-aware stage deployment', () => {
 
     expect(statuses).toEqual(['pending', 'success']);
   });
+
+  it('deploys the late projects only after the rest of the stage deployed', async () => {
+    const nxCalls: string[][] = [];
+    await githubCiNxDeploy(
+      '/repo',
+      { stage: 'staging' },
+      {
+        processEnv: {},
+        setStatus: async () => {},
+        listProjects: async () => [
+          { name: 'app-backend', late: false },
+          { name: 'website', late: true },
+        ],
+        runNx: async (args) => {
+          nxCalls.push(args);
+          return 0;
+        },
+      },
+    );
+    expect(nxCalls.map((args) => args.find((arg) => arg.startsWith('--projects=')))).toEqual([
+      '--projects=app-backend',
+      '--projects=website',
+    ]);
+    expect(nxCalls.every((args) => args.includes('--stage=staging'))).toBe(true);
+  });
+
+  it('does not start the late round after the first round failed', async () => {
+    const nxCalls: string[][] = [];
+    const statuses: string[] = [];
+    await expect(
+      githubCiNxDeploy(
+        '/repo',
+        { stage: 'staging' },
+        {
+          processEnv: {},
+          setStatus: async (status) => {
+            statuses.push(status);
+          },
+          listProjects: async () => [
+            { name: 'app-backend', late: false },
+            { name: 'website', late: true },
+          ],
+          runNx: async (args) => {
+            nxCalls.push(args);
+            return 1;
+          },
+        },
+      ),
+    ).rejects.toThrow(/--projects=app-backend .*failed with exit code 1/);
+    expect(nxCalls).toHaveLength(1);
+    expect(statuses).toEqual(['pending', 'failure']);
+  });
+
+  it('publishes nothing when the late round fails after the first round deployed', async () => {
+    const nxCalls: string[][] = [];
+    const statuses: string[] = [];
+    const summaries: string[] = [];
+    const deployments: Array<[string, string]> = [];
+    const outputs: string[] = [];
+    await expect(
+      githubCiNxDeploy(
+        '/repo',
+        { mode: 'run-many' },
+        {
+          processEnv: { GITHUB_EVENT_NAME: 'pull_request', GITHUB_OUTPUT: '/output', GITHUB_STEP_SUMMARY: '/summary' },
+          github: { previewUrls: ['https://app.{stage}.example.com'] },
+          eventPayload: {
+            action: 'opened',
+            repository: { full_name: 'owner/repo' },
+            pull_request: { number: 12, head: { repo: { full_name: 'owner/repo' } } },
+          },
+          setStatus: async (status) => {
+            statuses.push(status);
+          },
+          listProjects: async () => [
+            { name: 'app-backend', late: false },
+            { name: 'website', late: true },
+          ],
+          runNx: async (args) => {
+            nxCalls.push(args);
+            return nxCalls.length === 1 ? 0 : 1;
+          },
+          appendSummary: async (_path, content) => {
+            summaries.push(content);
+          },
+          appendOutput: async (_path, content) => {
+            outputs.push(content);
+          },
+          publishDeployment: async (stage, url) => {
+            deployments.push([stage, url]);
+          },
+        },
+      ),
+    ).rejects.toThrow(/--projects=website .*failed with exit code 1/);
+    expect(nxCalls).toHaveLength(2);
+    expect(statuses).toEqual(['pending', 'failure']);
+    expect(outputs).toEqual([]);
+    expect(summaries).toEqual([]);
+    expect(deployments).toEqual([]);
+  });
+
+  it('verifies the whole selection at once and splits only the deploy', async () => {
+    const nxCalls: string[][] = [];
+    await githubCiNxDeploy(
+      '/repo',
+      { stage: 'production', verify: true },
+      {
+        processEnv: {},
+        setStatus: async () => {},
+        listProjects: async () => [
+          { name: 'app-backend', late: false },
+          { name: 'website', late: true },
+        ],
+        runNx: async (args) => {
+          nxCalls.push(args);
+          return 0;
+        },
+      },
+    );
+    expect(nxCalls.map((args) => `${args[2]} ${args[3]}`)).toEqual([
+      'build --projects=app-backend,website',
+      'lint --projects=app-backend,website',
+      'test --projects=app-backend,website',
+      'deploy --projects=app-backend',
+      'deploy --projects=website',
+    ]);
+  });
 });
 
 describe('resolveDeploymentStage with a configured push branch', () => {
@@ -1222,14 +1346,52 @@ describe('selectStageDeployProjects with a required tag', () => {
   it('keeps only projects carrying the tag, on top of the stage-derived rule', async () => {
     await expect(
       selectStageDeployProjects(Object.keys(definitions), 'production', 'production-push-deploy-target', loadProject),
-    ).resolves.toEqual(['website']);
+    ).resolves.toEqual(early('website'));
   });
 
   it('selects the website on every stage once it is stage-derived', async () => {
+    await expect(selectStageDeployProjects(Object.keys(definitions), 'pr12', undefined, loadProject)).resolves.toEqual(
+      early('app', 'website'),
+    );
+  });
+});
+
+describe('late deploy projects', () => {
+  const definitions: Record<string, unknown> = {
+    'app-backend': {
+      tags: ['stage-deploy-target'],
+      targets: { deploy: { command: 'bun scripts/deploy-backend.ts --stage={args.stage}' } },
+    },
+    website: {
+      tags: ['stage-deploy-target', 'late-deploy-target'],
+      targets: { deploy: { command: 'bun scripts/deploy-website.ts --stage={args.stage}' } },
+    },
+    docs: {
+      tags: ['late-deploy-target'],
+      targets: { deploy: { options: { command: 'wrangler deploy --config wrangler.toml' } } },
+    },
+  };
+  const loadProject = async (project: string) => definitions[project];
+
+  it('marks a selected project late and selects none the stage rules exclude', async () => {
     await expect(selectStageDeployProjects(Object.keys(definitions), 'pr12', undefined, loadProject)).resolves.toEqual([
-      'app',
-      'website',
+      { name: 'app-backend', late: false },
+      { name: 'website', late: true },
     ]);
+  });
+
+  it('deploys the late projects in a second round', () => {
+    expect(
+      deployRounds([
+        { name: 'website', late: true },
+        { name: 'app-backend', late: false },
+      ]),
+    ).toEqual([['app-backend'], ['website']]);
+  });
+
+  it('keeps a single round when nothing, or everything, is late', () => {
+    expect(deployRounds(early('app', 'app-backend'))).toEqual([['app', 'app-backend']]);
+    expect(deployRounds([{ name: 'website', late: true }])).toEqual([['website']]);
   });
 });
 
