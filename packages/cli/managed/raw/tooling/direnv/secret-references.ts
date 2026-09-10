@@ -26,6 +26,9 @@
  * Failures aggregate so a single direnv reload surfaces every problem.
  * Error text names variables and exit codes only: secret values, provider
  * stdout/stderr, and command arguments are never echoed.
+ * A resolved value still reaches the environment of the install its caller
+ * runs next, so `maskSecretValues` redacts those values out of any captured
+ * child output that caller replays.
  *
  * The variable `smoo.remoteCache.tokenSecret` names is never resolved here,
  * nor anywhere at shell entry. A remote cache is an optimization, and shell
@@ -310,6 +313,69 @@ const runSecretCommand: SecretCommandRunner = async (argv) => {
   }
   return stdout;
 };
+
+/** '*', the byte a redacted secret leaves behind. */
+const MASK_BYTE = 0x2a;
+
+/**
+ * A copy of captured child output with every resolved secret value replaced
+ * by the same number of `*` bytes.
+ *
+ * setup-environment.ts puts the values this file resolves into the
+ * environment of the install it then runs, and replays that child's captured
+ * stdout/stderr verbatim when it fails. Whatever the child echoes — a prepare
+ * script printing its environment, a registry URL carrying an inline
+ * credential — would otherwise walk straight past the suppression the rest of
+ * this file maintains. Redaction is byte-exact and same-length, so the
+ * failure being reported stays legible and every offset in it still lines up.
+ * Output with nothing to redact is returned as it came in, so the path that
+ * has no secrets to hide copies nothing.
+ */
+export function maskSecretValues(output: Uint8Array, values: Iterable<string>): Uint8Array {
+  const encoder = new TextEncoder();
+  let masked: Uint8Array | undefined;
+  for (const value of values) {
+    const needle = encoder.encode(value);
+    if (needle.length === 0 || needle.length > output.length) {
+      continue;
+    }
+    for (let from = 0; from + needle.length <= output.length; ) {
+      const at = indexOfBytes(masked ?? output, needle, from);
+      if (at < 0) {
+        break;
+      }
+      // `new Uint8Array`, not `.slice()`: a captured child's output arrives as
+      // a node Buffer, whose `slice` is `subarray` — a view. Masking through
+      // one would rewrite the caller's own captured bytes.
+      masked ??= new Uint8Array(output);
+      masked.fill(MASK_BYTE, at, at + needle.length);
+      from = at + needle.length;
+    }
+  }
+  return masked ?? output;
+}
+
+/** First occurrence of `needle` in `haystack` at or after `from`, or -1. */
+function indexOfBytes(haystack: Uint8Array, needle: Uint8Array, from: number): number {
+  const first = needle[0];
+  if (first === undefined) {
+    return -1;
+  }
+  const last = haystack.length - needle.length;
+  for (let at = haystack.indexOf(first, from); at >= 0 && at <= last; at = haystack.indexOf(first, at + 1)) {
+    let matches = true;
+    for (let offset = 1; offset < needle.length; offset += 1) {
+      if (haystack[at + offset] !== needle[offset]) {
+        matches = false;
+        break;
+      }
+    }
+    if (matches) {
+      return at;
+    }
+  }
+  return -1;
+}
 
 /**
  * The declared secrets an install needs, resolved before it runs. The cache
