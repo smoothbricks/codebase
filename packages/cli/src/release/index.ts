@@ -89,6 +89,7 @@ import {
 } from './core.js';
 import {
   createOrUpdateGithubRelease,
+  DEPENDENCY_ONLY_RELEASE_NOTES,
   githubReleaseLookupExists,
   importWorkspaceNx,
   renderNxProjectChangelogContents,
@@ -1596,10 +1597,9 @@ async function writeReleasePreviewSummary(
       lines.push(`  - \`${pkg.name}\`: \`${currentByName.get(pkg.name)?.version ?? 'unknown'}\` -> \`${pkg.version}\``);
     }
     for (const pkg of previewPackages) {
-      const contents = releasePreviewChangelogs.get(pkg.projectName);
-      if (!contents) {
-        throw new Error(`Nx did not generate a project changelog for ${pkg.projectName}.`);
-      }
+      // A dependency-only bump has no commits of its own, so Nx generates no
+      // changelog for it. The preview says so rather than refusing to render.
+      const contents = releasePreviewChangelogs.get(pkg.projectName) ?? DEPENDENCY_ONLY_RELEASE_NOTES;
       lines.push('', `### ${pkg.name} ${pkg.version}`, '', contents.trim());
     }
   }

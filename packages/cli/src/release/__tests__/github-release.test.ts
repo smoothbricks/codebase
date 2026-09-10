@@ -3,6 +3,7 @@ import { readFile } from 'node:fs/promises';
 import type { ReleasePackageInfo } from '../core.js';
 import {
   createOrUpdateGithubRelease,
+  DEPENDENCY_ONLY_RELEASE_NOTES,
   type GithubReleaseWriteShell,
   githubReleaseLookupExists,
   nxProjectChangelogArgs,
@@ -63,10 +64,13 @@ describe('GitHub release helpers', () => {
     ).toBe('generated release notes');
   });
 
-  it('fails when Nx omits the requested project changelog', () => {
-    expect(() => projectChangelogContents({ projectChangelogs: {} }, 'pkg')).toThrow(
-      'Nx did not generate a project changelog for pkg.',
-    );
+  it('renders a dependency-only body when Nx generates no project changelog', () => {
+    // Nx bumps a project "because a dependency was bumped", and such a version
+    // carries no commits of its own — so no changelog is the correct output
+    // rather than a failure. Refusing here aborted a publish AFTER the new
+    // versions had been written to every manifest, leaving the release half
+    // done: one dependency-only package took down the whole run.
+    expect(projectChangelogContents({ projectChangelogs: {} }, 'pkg')).toBe(DEPENDENCY_ONLY_RELEASE_NOTES);
   });
 
   it('distinguishes missing releases from transient GitHub lookup failures', () => {

@@ -80,12 +80,20 @@ export function nxProjectChangelogArgs(pkg: ReleasePackageInfo, previousTag: str
   return previousTag ? { ...base, from: previousTag } : { ...base, firstRelease: true };
 }
 
+/**
+ * The release body for a version that carries no commits of its own.
+ *
+ * Nx bumps a project when a dependency it depends on was bumped, and reports
+ * that reason itself ("because a dependency was bumped"). Such a version has no
+ * commits touching the project, so Nx generates no changelog for it — which is
+ * correct, not a failure. Treating the absence as fatal made one dependency-only
+ * package abort a whole publish after the versions had already been written.
+ */
+export const DEPENDENCY_ONLY_RELEASE_NOTES =
+  '_No changelog entries for this package: this version was released because one of its dependencies was bumped._';
+
 export function projectChangelogContents(result: ProjectChangelogLookupResult, projectName: string): string {
-  const changelog = result.projectChangelogs?.[projectName];
-  if (!changelog) {
-    throw new Error(`Nx did not generate a project changelog for ${projectName}.`);
-  }
-  return changelog.contents;
+  return result.projectChangelogs?.[projectName]?.contents ?? DEPENDENCY_ONLY_RELEASE_NOTES;
 }
 
 export function githubReleaseLookupExists(tag: string, exitCode: number, stdout: string, stderr: string): boolean {
