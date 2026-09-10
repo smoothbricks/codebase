@@ -467,6 +467,36 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
     }
   });
 
+  it('keeps a test runner out of the aggregate build however its name ends', async () => {
+    const workspace = await createWorkspace();
+    try {
+      await workspace.write(
+        'packages/suites/package.json',
+        JSON.stringify({
+          name: 'suites',
+          nx: {
+            targets: {
+              // A runner reading as "tool=test, output=bun". Suffix alone would
+              // sweep it into `build`, which is a serialized test suite behind
+              // every consumer's build.
+              'test-bun': { executor: 'nx:run-commands' },
+              'test:watch': { executor: 'nx:run-commands' },
+              // A real emitter in the same family, to prove the exclusion is
+              // the test-runner class and not the family itself.
+              'bundle-bun': { executor: 'nx:run-commands' },
+            },
+          },
+        }),
+      );
+
+      const targets = await inferProjectTargets(workspace, 'packages/suites/package.json');
+
+      expect(targets.build?.dependsOn).toEqual(['^build', 'bundle-bun']);
+    } finally {
+      await workspace.cleanup();
+    }
+  });
+
   it('keeps platform-only output families out of the ordinary aggregate build', async () => {
     const workspace = await createWorkspace();
     try {

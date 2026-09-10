@@ -199,18 +199,38 @@ function hostPlatformTargetNames(targetNames: Iterable<string>, hostPlatform: Na
 /**
  * The reserved suffixes name targets that EMIT an artifact, and the `build`
  * aggregate is a list of those. Handing Nx the raw `*-<family>` globs let it
- * match on suffix alone, and one namespace collides by construction: a
- * per-crate cargo test runner is named `cargo-test-<crate>`, so any crate whose
- * name ends in an output family — `*-napi`, `*-wasm`, `*-native`, `*-js` — put
- * its RUNNER in the aggregate. The runners are one serialized chain, so a
- * single such crate made `build` pull an entire cargo test suite. Expanding the
- * families here instead of delegating to Nx's matcher keeps the plugin's own
- * `cargo-test-` namespace out of the aggregate however a crate is named.
+ * match on suffix alone, and a test runner collides by construction whenever
+ * its name ends in a family: `*-js`, `*-web`, `*-html`, `*-css`, `*-android`,
+ * `*-native`, `*-napi`, `*-bun`, `*-wasm`.
+ *
+ * Two spellings of the same collision. A per-crate cargo test runner is
+ * `cargo-test-<crate>`, so any crate whose name ends in a family put its RUNNER
+ * in the aggregate; the runners are one serialized chain, so a single such
+ * crate made `build` pull an entire cargo test suite. A bun suite named
+ * `test-bun` is the collision without the prefix — a runner reading as
+ * "tool=test, output=bun", swept into `build` by suffix alone. That one forced
+ * a consumer to hand-declare `build` purely to replace the inferred list.
+ *
+ * So the rule is the CLASS, not one namespace: a target that RUNS tests is
+ * never a build output, however it is spelled. Expanding the families here
+ * rather than delegating to Nx's matcher is what makes that expressible.
  */
 function buildOutputTargetNames(targetNames: Iterable<string>): string[] {
   return [...new Set(targetNames)]
-    .filter((name) => BUILD_OUTPUT_TARGET_PATTERN.test(name) && !name.startsWith(`${CARGO_TEST_TARGET}-`))
+    .filter((name) => BUILD_OUTPUT_TARGET_PATTERN.test(name) && !isTestRunnerTargetName(name))
     .sort();
+}
+
+/**
+ * A target whose job is to RUN tests. `test`, anything under `test-`/`test:`,
+ * and the plugin's own `cargo-test-<crate>` namespace. Deliberately name-based:
+ * the aggregate is assembled from declared AND inferred target names, and a
+ * declaration carries no marker saying "this executes rather than emits".
+ */
+function isTestRunnerTargetName(name: string): boolean {
+  return (
+    name === 'test' || name.startsWith('test-') || name.startsWith('test:') || name.startsWith(`${CARGO_TEST_TARGET}-`)
+  );
 }
 
 //#region smoo!n/rust-output-target-inference
