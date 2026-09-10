@@ -140,12 +140,47 @@ devenv_path_and_caches() {
 }
 
 build_devenv_shell() {
+  local since
+  since="$(date +%s)"
   # One evaluation: the shell that captures the environment is the shell
   # build. A separate `devenv shell -- date` evaluated everything twice.
   persist_devenv_environment
+  if [ "${SMOO_HOST_RUNNER:-false}" != true ]; then
+    root_build_inputs "$since"
+  fi
   # Add repo-local tools only after the shell exists; cleanup steps use an
   # explicit PATH because failures before this point must still refresh caches.
   add_repo_paths
+}
+
+# The store cache's post phase collects garbage down to the live roots before
+# it saves, and the shell's own root (.devenv/gc/shell) covers only the build
+# closure. What evaluation fetched and built - flake input sources, the
+# import-from-derivation outputs devenv-nixpkgs-patched and cabal2nix-* - has
+# no root, so it was collected on the miss run and every hit run rebuilt it
+# (measured at ~80s of a 150s setup on hosted macOS, run 34427309827). devenv
+# records no store paths in its eval cache, so the exact set is the paths this
+# build registered: root them under .devenv/gc, which the devenv cache carries
+# and /nix/var/nix/gcroots/auto (inside the store cache) points at.
+root_build_inputs() {
+  local since="$1" gcdir="$PWD/.devenv/gc/build-inputs" paths
+  rm -rf "$gcdir"
+  mkdir -p "$gcdir"
+  # `nix path-info --all --json` is an object keyed by path on Nix >= 2.19 and
+  # an array of {path} objects before that.
+  paths="$(nix path-info --all --json 2>/dev/null | jq -r --argjson since "$since" '
+    (if type == "array" then map({key: .path, value: .}) | from_entries else . end)
+    | to_entries[] | select(.value.registrationTime >= $since) | select(.key | endswith(".drv") | not) | .key')"
+  if [ -z "$paths" ]; then
+    echo "no store paths registered since $since; nothing to root"
+    return 0
+  fi
+  # Store paths are installables; --out-link names the first link and numbers
+  # the rest, each an indirect gc root. Derivations are excluded: keep-derivations
+  # retains the ones whose outputs are rooted, and realising a .drv would build it.
+  # shellcheck disable=SC2086
+  nix build --out-link "$gcdir/path" $paths
+  echo "rooted $(printf '%s\n' "$paths" | wc -l | tr -d ' ') store paths registered during the shell build under $gcdir"
 }
 
 # Workflow steps run their commands directly — never through `devenv shell` —
