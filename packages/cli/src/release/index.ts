@@ -59,6 +59,7 @@ export {
   withPrivateNpmUserconfig,
 } from './private-npm.js';
 
+import { PLATFORM_TARGET_GLOBS } from '@smoothbricks/nx-plugin/workspace-config-policy';
 import { ciApiContext } from '../github-ci/api.js';
 import { readProjectTargets } from '../nx/index.js';
 import {
@@ -1206,6 +1207,17 @@ function releaseRepairShell(root: string, platformOutputs: readonly string[]): R
       const sourceSha = await gitHead(root);
       const outputs = platformOutputs.map((base) => join(base, sourceSha));
       if (outputs.length === 0) {
+        // No producer job handed outputs over, so this runner is the producer:
+        // build the platform legs at the checked-out ref. `build` alone gives a
+        // package only the legs its own graph depends on — the host one and
+        // whatever it declares — and the release gate demands the whole declared
+        // native closure, so a foreign leg it never asked for was simply absent.
+        console.log('Repair pending releases: building cross-platform outputs on this runner.');
+        await githubCiNxRunMany(root, {
+          targets: PLATFORM_TARGET_GLOBS.join(','),
+          projects: releasePackageProjects(packages),
+          allowEmptyProjects: true,
+        });
         return;
       }
       console.log(`Repair pending releases: applying cross-platform outputs from ${outputs.join(', ')}.`);
