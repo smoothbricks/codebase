@@ -280,9 +280,9 @@ export enum Opcode {
 
   //#region reduce-typed-state.scatter-op
   // Fused probe+dispatch (body opcode, runs per FLAT_MAP element). Probes a slot
-  // and scatters the resolved datom DIRECTLY into a destination typed slot routed
+  // and scatters the resolved row DIRECTLY into a destination typed slot routed
   // by a compiler-emitted route-ordinal column — one copy, no intermediate.
-  // route/op/out_key/v all come from the PROBED row (resolved datom); only key_col
+  // route/op/out_key/v all come from the PROBED row; only key_col
   // is an input column. v_src_field_idx is PER ROUTE so heterogeneously-typed values
   // (interned STRING beside FLOAT64 boost/order) each read their own typed probe field.
   // Variable-length operands:
@@ -291,10 +291,10 @@ export enum Opcode {
   //   [kind:u8, dest_slot:u8, dest_field_idx:u8, out_key_col:u8, v_src_field_idx:u8] × num_routes
   BATCH_STRUCT_MAP_PROBE_SCATTER = 0x2f,
 
-  // Attribute-routed datom dispatch, probe-free. The resolved datom IS the
-  // FLAT_MAP element — commits arrive A-partitioned, alpha-memory-shaped —
-  // so route/op/destination-key/value read from element columns and no datom
-  // row is ever materialized in reducer state. Kind arms, the identical-assert
+  // Route-column dispatch, probe-free. The FLAT_MAP element already
+  // carries the resolved route/op/destination-key/value as columns (resolved
+  // by the producer before the batch was built), so they are read directly
+  // and no intermediate row is ever staged in a slot. Kind arms, the identical-assert
   // no-op, and the retract-iff-current rule are byte-identical to 0x2f minus
   // the probe. Variable-length operands:
   //   route_col:u8, op_col:u8, key_col:u8, num_routes:u8,

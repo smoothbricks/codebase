@@ -4489,10 +4489,10 @@ impl Vm {
 
                 //#region reduce-typed-state.scatter-element-exec
                 // STRUCT_MAP_SCATTER (0x3e) — probe-free attribute-routed
-                // dispatch. The resolved datom IS the FLAT_MAP element (02i §9:
-                // commits arrive A-partitioned, alpha-memory-shaped), so
-                // route/op/destination-key/value read from element columns and
-                // no datom row is ever materialized in reducer state. Kind
+                // dispatch. The FLAT_MAP element already carries the resolved
+                // route/op/destination-key/value as columns (the producer
+                // resolved them before building the batch), so they are read
+                // directly and no intermediate row is staged in a slot. Kind
                 // arms, the identical-assert no-op, and the retract-iff-current
                 // rule are byte-identical to 0x2f minus the probe.
                 Opcode::BatchStructMapScatter => {

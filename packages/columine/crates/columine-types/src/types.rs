@@ -483,11 +483,11 @@ pub enum Opcode {
     /// probe_slot:u8, key_col:u8, miss_mode:u8(0=skip,1=null), route_col:u8, op_col:u8,
     /// num_routes:u8, \[kind:u8, dest_slot:u8, dest_field_idx:u8, out_key_col:u8, v_src_field_idx:u8\] × num_routes
     BatchStructMapProbeScatter = 0x2f,
-    /// Attribute-routed datom dispatch, probe-free (body opcode, per FLAT_MAP
-    /// element). The resolved datom IS the element — 02i §9: commits arrive
-    /// A-partitioned, alpha-memory-shaped — so route/op/destination-key/value
-    /// read from element columns directly and no datom row is ever
-    /// materialized into reducer state. Kind-0/kind-1 arms and the
+    /// Route-column dispatch, probe-free (body opcode, per FLAT_MAP
+    /// element). The element already carries the resolved route, op, key and
+    /// value as columns — the producer resolved them before the batch was
+    /// built — so the dispatch reads them directly and no intermediate row is
+    /// ever staged in a slot. Kind-0/kind-1 arms and the
     /// assert/retract semantics (retract clears iff the stored field equals
     /// the column cell; never clearBitset) are byte-identical to
     /// BatchStructMapProbeScatter minus the probe.
