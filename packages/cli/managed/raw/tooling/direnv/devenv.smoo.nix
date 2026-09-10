@@ -274,16 +274,16 @@
     # 5. The shared setup-environment.ts bootstraps repository dependencies; a
     #    failure aborts shell entry instead of yielding a half-working shell.
     #    Repo-owned enterShell bodies merge after this prologue.
-    # 6. The declared Nx remote cache (`smoo.remoteCache`), if the repository
-    #    has one. secret-references.ts prints the two variables Nx reads — the
-    #    server and the access token — and prints nothing at all unless the
-    #    declared token has a value, because Nx accepts only 200 or 404 from a
-    #    cache server: an unauthenticated one fails every task on 401 instead
-    #    of missing quietly. It is eval-ed into THIS shell because that is
-    #    where Nx runs; the export covers those two variables only, so the rule
-    #    that keeps `smoo.secrets` inside the setup child still holds. An
-    #    inherited server wins, so a CI job env is never overwritten, and a
-    #    missing token costs a stderr line rather than shell entry.
+    # 6. The declared Nx remote cache (`smoo.remoteCache`) is NOT resolved
+    #    here. Shell entry happens on every direnv reload and every
+    #    `devenv shell -- <command>`, and a provider command that runs then is a
+    #    credential prompt on every one of them (1Password authorises per
+    #    requesting process lineage, and this one is new each time). Nx reads
+    #    NX_SELF_HOSTED_REMOTE_CACHE_SERVER and _ACCESS_TOKEN from the
+    #    environment when it runs: CI injects them into the job, a developer
+    #    exports the token once in the terminal that wants the cache (for
+    #    example `op signin`, then the declared command), and every nested
+    #    shell inherits it. Absent, Nx runs with the local cache only.
     # 7. GOROOT is unset rather than set. With devenv's Go pinned to the patch
     #    release ttsc vendors, a GOROOT crossing cannot misfire on version at all,
     #    so this is belt-and-braces rather than the fix — it keeps the isolation
@@ -354,7 +354,6 @@
       export GOFLAGS="''${GOFLAGS:--trimpath}"
       unset GOROOT
       bun "$DEVENV_ROOT/setup-environment.ts" || exit $?
-      eval "$(bun "$DEVENV_ROOT/secret-references.ts" "$PWD")"
       export NX_SOCKET_DIR="$DEVENV_RUNTIME/nx"
       mkdir -p "$NX_SOCKET_DIR"
       ${lib.optionalString pkgs.stdenv.isDarwin ''
