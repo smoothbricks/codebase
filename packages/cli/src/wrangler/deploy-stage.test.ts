@@ -582,19 +582,32 @@ ENVIRONMENT = "production"
     const root = await scopedRoot(['API_TOKEN', 'E2E_CONTROL_TOKEN'], { E2E_CONTROL_TOKEN: ['staging', 'preview'] });
     const runner = new FakeRunner([], {});
     const cloudflare = new FakeCloudflare();
+    // The real environment, because that is what a child process inherits and what the shell of a
+    // laptop deploy actually looks like when CI has exported a preview capability.
+    process.env.E2E_CONTROL_TOKEN = 'teardown-value';
 
-    const result = await deployStage(
-      root,
-      { stage: 'production' },
-      {
-        runner,
-        cloudflare,
-        processEnv: environment({ API_TOKEN: 'api-value', E2E_CONTROL_TOKEN: 'teardown-value' }),
-      },
-    );
+    try {
+      const result = await deployStage(
+        root,
+        { stage: 'production' },
+        {
+          runner,
+          cloudflare,
+          processEnv: environment({ API_TOKEN: 'api-value', E2E_CONTROL_TOKEN: 'teardown-value' }),
+        },
+      );
 
-    expect(result.action).toBe('deployed');
-    expect(JSON.parse(requiredTestValue(runner.secretsJson, 'secrets JSON'))).toEqual({ API_TOKEN: 'api-value' });
+      expect(result.action).toBe('deployed');
+      expect(JSON.parse(requiredTestValue(runner.secretsJson, 'secrets JSON'))).toEqual({ API_TOKEN: 'api-value' });
+      // Not in the payload, and not readable by the deploy either: the capability is absent from
+      // this stage at the process boundary, not merely left out of a file.
+      for (const call of runner.calls) {
+        expect(call.env.E2E_CONTROL_TOKEN).toBeUndefined();
+      }
+      expect(runner.calls.length).toBeGreaterThan(0);
+    } finally {
+      delete process.env.E2E_CONTROL_TOKEN;
+    }
   });
 
   it('sends a preview-scoped secret to the stages it is scoped to', async () => {

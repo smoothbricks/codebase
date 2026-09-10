@@ -149,7 +149,13 @@ export async function deployStage(
     // renames the worker `<name>-<CLOUDFLARE_ENV>`. The build that produced the flat config is the
     // caller that sets the variable, so the deploy would silently succeed under a name neither
     // `reconcileStageResources` nor `versions list` looks at.
-    const run: ProcessRunOptions = prepared.envFlag ? { cwd } : { cwd, unsetEnv: ['CLOUDFLARE_ENV'] };
+    //
+    // A secret this stage is scoped out of goes with it. Leaving it out of the secrets payload is
+    // what stops it being installed; withholding it from the child as well means the deploy cannot
+    // read it at all, so "this stage never sees that capability" holds at the process boundary and
+    // not merely in the file we happen to write.
+    const unsetEnv = [...(prepared.envFlag ? [] : ['CLOUDFLARE_ENV']), ...secretPlan.withheld];
+    const run: ProcessRunOptions = unsetEnv.length > 0 ? { cwd, unsetEnv } : { cwd };
     const workerName = prepared.plan.workerName;
     const probe: LiveVersionProbe = {
       deployments: () => wranglerJson(runner, ['deployments', 'status', '--name', workerName, '--json'], run),
