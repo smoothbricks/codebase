@@ -163,7 +163,14 @@ const CARGO_INPUTS = [
   '{projectRoot}/scripts/*.sh',
   '!{projectRoot}/**/target/**',
 ];
-const CARGO_OUTPUT_INPUTS = [...CARGO_INPUTS, '{projectRoot}/package.json', '{workspaceRoot}/bun.lock'];
+// A Cargo output is a function of Rust sources and the toolchain, not of the
+// npm package that ships it. `{projectRoot}/package.json` and the lockfile
+// used to be inputs here, and a release bumps exactly those two (the version
+// step runs before the build), so every publish recompiled every native
+// binary on every platform for a change to a version string. What the N-API
+// build really reads is the package's `napi` block (binary name, targets) and
+// the `@napi-rs/cli` it runs; those are hashed as such by napiInputs().
+const CARGO_OUTPUT_INPUTS = CARGO_INPUTS;
 const REPO_ROOT_CARGO_OUTPUT_INPUTS = [
   '{workspaceRoot}/**/*.rs',
   '{workspaceRoot}/**/Cargo.toml',
@@ -171,8 +178,6 @@ const REPO_ROOT_CARGO_OUTPUT_INPUTS = [
   '{workspaceRoot}/**/.cargo/config.toml',
   '{workspaceRoot}/scripts/*.sh',
   '!{workspaceRoot}/**/target/**',
-  '{projectRoot}/package.json',
-  '{workspaceRoot}/bun.lock',
 ];
 const CARGO_ENVIRONMENT_INPUT = {
   runtime: `bun -e 'const fs = require("node:fs"); const path = require("node:path"); const home = process.env.CARGO_HOME || path.join(require("node:os").homedir(), ".cargo"); console.log(JSON.stringify({env: Object.entries(process.env).filter(([name]) => /^(?:CARGO_|RUST|NEXTEST_|CLIPPY_|CC(?:_|$)|CXX(?:_|$)|AR(?:_|$)|CFLAGS|CXXFLAGS|CPPFLAGS|LDFLAGS|PKG_CONFIG|TARGET_|HOST_)/.test(name)).sort(([a], [b]) => a.localeCompare(b)), config: ["config", "config.toml"].map(name => { const file = path.join(home, name); return fs.existsSync(file) ? fs.readFileSync(file, "utf8") : null; })}));'`,
@@ -197,7 +202,22 @@ function targetCommandText(target: TargetConfiguration): string {
     ...(Array.isArray(commands) ? commands.filter((entry) => typeof entry === 'string') : []),
   ].join('\n');
 }
-const NAPI_INPUTS = CARGO_OUTPUT_INPUTS;
+/**
+ * The N-API build's inputs beyond the Cargo sources: the package's `napi`
+ * block, which names the binary and the targets, and the napi CLI's resolved
+ * version from the lockfile. Neither the package version nor any other
+ * lockfile entry is part of the artifact.
+ */
+function napiInputs(projectRoot: string, repoRooted: boolean): TargetConfiguration['inputs'] {
+  // Runtime inputs execute from the workspace root, so the manifest is named
+  // by its path from there whichever way the Cargo invocation is rooted.
+  const packageJson = `./${posix.join(projectRoot, 'package.json')}`;
+  return [
+    ...(repoRooted ? REPO_ROOT_CARGO_OUTPUT_INPUTS : CARGO_OUTPUT_INPUTS),
+    { runtime: `bun -e 'console.log(JSON.stringify(require(${JSON.stringify(packageJson)}).napi ?? null))'` },
+    { externalDependencies: ['@napi-rs/cli'] },
+  ];
+}
 
 interface NapiTargetConvention extends NapiPlatform {
   outputName: string;
@@ -1350,7 +1370,7 @@ function createNapiTargets(
   // that stale local artifacts can mask for months.
   const packageJsonPath = repoRooted ? posix.join(projectRoot, 'package.json') : 'package.json';
   const commonCommand = `--manifest-path ${config.manifestPath} --package ${config.cargoPackage} --package-json-path ${packageJsonPath}`;
-  const cargoInputs = repoRooted ? REPO_ROOT_CARGO_OUTPUT_INPUTS : NAPI_INPUTS;
+  const cargoInputs = napiInputs(projectRoot, repoRooted);
   const cargoCwd = repoRooted ? '.' : projectRoot;
   // A repository-root Cargo invocation runs outside the owning npm package, so
   // Nx's root-only PATH cannot resolve that package's napi CLI.
