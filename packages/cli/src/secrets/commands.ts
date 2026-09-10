@@ -222,10 +222,14 @@ export function secretsStatus(root: string, options: { repo?: string; env?: stri
       );
     }
   }
-  const needed = secretsNeedingValues(rows);
+  // A value an environment holds is not a value to duplicate at repository
+  // scope: offering it invites two sources of truth for one credential, and
+  // the table above already shows where it lives. Only a name no scope holds
+  // is a name to set here.
+  const needed = secretsNeedingValues(rows).filter((row) => !row.onRepository && row.heldByEnvironment.length === 0);
   if (needed.length > 0) {
     console.log('');
-    console.log(`${needed.length} secret(s) have no value at repository scope on ${repo}:`);
+    console.log(`${needed.length} secret(s) have no value in any scope on ${repo}:`);
     for (const row of needed) console.log(`  ${row.repositorySecret}${describeNeed(row)}`);
     console.log('');
     console.log(`set them all, one prompt each:  smoo secrets set -R ${repo}`);
