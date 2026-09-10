@@ -344,7 +344,6 @@ export interface DeployProject {
 export interface GithubCiNxDeployDependencies {
   listProjects?: (
     root: string,
-    target: string,
     mode: 'affected' | 'run-many',
     stage: DeploymentStage,
     selectTag?: string,
@@ -377,9 +376,9 @@ export async function githubCiNxDeploy(
     ((state: 'pending' | 'success' | 'failure') =>
       state === 'pending' ? createGithubStatus(name, step) : updateGithubStatus(name, state, step));
   const mode = resolveNxSmartMode(options.mode ?? 'run-many');
-  const listProjects = dependencies.listProjects ?? listNxProjectsWithTarget;
+  const listProjects = dependencies.listProjects ?? listNxDeployProjects;
   const runNx = dependencies.runNx ?? ((args: string[], commandRoot: string) => runStatus('nx', args, commandRoot));
-  const projects = await listProjects(root, 'deploy', mode, stage, options.selectTag);
+  const projects = await listProjects(root, mode, stage, options.selectTag);
   if (projects.length === 0) {
     console.log(`No ${mode} deploy projects; skipping ${stage}.`);
     await setStatus('pending');
@@ -550,22 +549,18 @@ function previewUrlFromTemplate(template: string, stage: string): string {
   return template.replaceAll('{stage}', stage);
 }
 
-async function listNxProjectsWithTarget(
+async function listNxDeployProjects(
   root: string,
-  target: string,
   mode: 'affected' | 'run-many',
   stage: DeploymentStage,
   selectTag?: string,
 ): Promise<DeployProject[]> {
   const listArgs = ['show', 'projects'];
   if (mode === 'affected') listArgs.push('--affected');
-  listArgs.push('--withTarget', target);
-  if (target === 'deploy') listArgs.push(`--exclude=${deployExclusions(stage)}`);
-  listArgs.push('--json');
+  listArgs.push('--withTarget', 'deploy', `--exclude=${deployExclusions(stage)}`, '--json');
   const candidates = nxProjectList(await runText('nx', listArgs, root)).sort((left, right) =>
     left.localeCompare(right),
   );
-  if (target !== 'deploy') return candidates.map((name) => ({ name, late: false }));
   return selectStageDeployProjects(candidates, stage, selectTag, async (project) => {
     const parsed = parseNxProjectDeployTarget(await runText('nx', ['show', 'project', project, '--json'], root));
     if (!parsed) throw new Error(`nx show project ${project} returned invalid JSON.`);

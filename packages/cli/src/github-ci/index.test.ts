@@ -951,7 +951,7 @@ describe('event-aware stage deployment', () => {
 
   it('deploys app/backend, publishes PR metadata, and emits the resolved stage', async () => {
     const nxCalls: string[][] = [];
-    const listCalls: Array<[string, string, string, string | undefined]> = [];
+    const listCalls: Array<[string, string, string | undefined]> = [];
     const summaries: string[] = [];
     const deployments: Array<[string, string]> = [];
     const outputs: string[] = [];
@@ -972,8 +972,8 @@ describe('event-aware stage deployment', () => {
           repository: { full_name: 'owner/repo' },
           pull_request: { number: 123, head: { repo: { full_name: 'owner/repo' } } },
         },
-        listProjects: async (_root, target, mode, stage, selectTag) => {
-          listCalls.push([target, mode, stage, selectTag]);
+        listProjects: async (_root, mode, stage, selectTag) => {
+          listCalls.push([mode, stage, selectTag]);
           return early('app', 'app-backend');
         },
         runNx: async (args) => {
@@ -992,7 +992,7 @@ describe('event-aware stage deployment', () => {
       },
     );
 
-    expect(listCalls).toEqual([['deploy', 'run-many', 'pr123', undefined]]);
+    expect(listCalls).toEqual([['run-many', 'pr123', undefined]]);
     expect(nxCalls).toHaveLength(1);
     expect(nxCalls[0]).toContain('--projects=app,app-backend');
     expect(nxCalls[0]).toContain('--exclude=tag:permanent-deploy-target,tag:staging-deploy-target');
@@ -1074,7 +1074,7 @@ describe('event-aware stage deployment', () => {
   });
 
   it('passes --select-tag through to the project selection of the production deploy', async () => {
-    const listCalls: Array<[string, string, string, string | undefined]> = [];
+    const listCalls: Array<[string, string, string | undefined]> = [];
     const nxCalls: string[][] = [];
 
     await githubCiNxDeploy(
@@ -1083,8 +1083,8 @@ describe('event-aware stage deployment', () => {
       {
         processEnv: {},
         setStatus: async () => {},
-        listProjects: async (_root, target, mode, stage, selectTag) => {
-          listCalls.push([target, mode, stage, selectTag]);
+        listProjects: async (_root, mode, stage, selectTag) => {
+          listCalls.push([mode, stage, selectTag]);
           return early('website');
         },
         runNx: async (args) => {
@@ -1094,7 +1094,7 @@ describe('event-aware stage deployment', () => {
       },
     );
 
-    expect(listCalls).toEqual([['deploy', 'run-many', 'production', 'production-push-deploy-target']]);
+    expect(listCalls).toEqual([['run-many', 'production', 'production-push-deploy-target']]);
     expect(nxCalls).toHaveLength(1);
     expect(nxCalls[0]).toContain('--projects=website');
     expect(nxCalls[0]).toContain('--stage=production');
