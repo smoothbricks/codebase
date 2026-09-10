@@ -395,6 +395,16 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         expect(targets[name]?.dependsOn).toContain('cargo-fetch');
       }
       expect(targets['cargo-sweep']?.dependsOn).toBeUndefined();
+      // The archive and the compile it stands for hash every crate's sources
+      // AND the outputs of the targets they depend on: generated crate inputs
+      // are gitignored, so a repository that had to restate `inputs` to add
+      // them replaced the crate union with the root's `default` and shipped a
+      // stale archive to every per-crate test.
+      for (const name of ['cargo-test-compile', 'cargo-test-archive', 'cargo-lint', CARGO_CROSS_LINT_TARGET]) {
+        const inputs = targets[name]?.inputs ?? [];
+        expect(inputs).toContainEqual({ dependentTasksOutputFiles: '**/*', transitive: false });
+        expect(inputs).toContain('{projectRoot}/crates/ferris-core/**/*');
+      }
       expect(targets['cargo-test-compile']?.executor).toBe('nx:run-commands');
       expect(targets['cargo-test-compile']?.cache).toBe(false);
       expect(targets['cargo-test-compile']?.outputs).toEqual([]);
