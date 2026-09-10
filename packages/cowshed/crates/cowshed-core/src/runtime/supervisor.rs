@@ -4169,11 +4169,13 @@ mod sandbox_environment_tests {
         let root = scratch("git-environment-injection");
         let injected = [("GIT_CONFIG_PARAMETERS", "'cowshed.injected=unsafe'")];
         let run = |environment: BTreeMap<String, String>| {
-            std::process::Command::new("/usr/bin/git")
+            // env_clear drops the ambient GIT_* variables; PATH passes through so
+            // git resolves on NixOS runners too, where there is no /usr/bin/git.
+            std::process::Command::new("git")
                 .args(["config", "--get", "cowshed.injected"])
                 .current_dir(&root)
                 .env_clear()
-                .env("PATH", "/usr/bin:/bin")
+                .env("PATH", std::env::var_os("PATH").unwrap_or_default())
                 .env("GIT_CONFIG_GLOBAL", "/dev/null")
                 .env("GIT_CONFIG_NOSYSTEM", "1")
                 .envs(environment)
