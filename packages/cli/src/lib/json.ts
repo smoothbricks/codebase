@@ -78,6 +78,15 @@ export interface PackageSmooGithub {
     env?: StringMap;
   };
   /**
+   * Platform target families the RELEASE workflow must not produce, as target
+   * globs (`*-macos`, `*-ios`, `*-linux`). A repository whose Nx graph carries
+   * a family it does not release from `publish.yml` — because another workflow
+   * owns it, or because the leg is not production yet — names it here, and the
+   * publish workflow renders without that job instead of carrying a leg whose
+   * failure blocks every release.
+   */
+  releasePlatformFamiliesExcluded?: string[];
+  /**
    * Sibling source checkouts a repo path-depends on (Cargo path
    * dependencies, nix path inputs). The CI workflow clones each entry beside
    * the main checkout before any build step runs, so the workspace layout on

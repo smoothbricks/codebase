@@ -20,10 +20,12 @@ import {
   managedFileTargetsForTest,
   platformTargetGlobsForTest,
   reinsertInlineLocalBlocksForTest,
+  releasePlatformTargetGlobsFor,
   renderManagedWorkflowForTest,
   splitLocalSectionForTest,
   validateDevenvModuleImport,
 } from './managed-files.js';
+import { renderPublishWorkflowYaml } from './publish-workflow.js';
 
 const MANAGED = '# managed content\npath merge=driver\n';
 
@@ -457,6 +459,7 @@ const context = (overrides: Partial<ManagedFileContext>): ManagedFileContext => 
   nodeModulesCacheKey: 'key',
   repoName: '@scope/repo',
   platformTargetGlobs: [],
+  releasePlatformTargetGlobs: [],
   macosPlatformArchitectures: [],
   ...overrides,
 });
@@ -563,5 +566,28 @@ describe('CI workflow rendering by repo shape', () => {
     expect(rendered).toContain('    environment: staging\n');
     expect(rendered).toContain('E2E_CONTROL_TOKEN: ${{ secrets.E2E_CONTROL_TOKEN }}');
     expect(rendered).toContain('GIT_CRYPT_KEY_B64: ${{ secrets.GIT_CRYPT_KEY_B64 }}');
+  });
+});
+
+describe('release platform families', () => {
+  it('an excluded family is not produced by the release workflow, and the rest still are', () => {
+    expect(releasePlatformTargetGlobsFor(['*-macos', '*-ios', '*-linux'], ['*-macos', '*-ios'])).toEqual(['*-linux']);
+    expect(releasePlatformTargetGlobsFor(PLATFORM_TARGET_GLOBS, undefined)).toEqual([...PLATFORM_TARGET_GLOBS]);
+  });
+
+  it('excluding every Apple family renders the single-job Linux publish shape', () => {
+    const globs = releasePlatformTargetGlobsFor(['*-macos', '*-linux'], ['*-macos']);
+    const rendered = renderPublishWorkflowYaml({
+      repoName: 'axe.sc/axe',
+      platformTargetGlobs: globs,
+      macosPlatformArchitectures: [],
+      runsOn: ['nixos-latest-x64', 'self-hosted'],
+      actionsProvider: 'forgejo',
+    });
+    expect(rendered).not.toContain('cross-platform:');
+    expect(rendered).not.toContain('macos-platform:');
+    expect(rendered).not.toContain('SDKROOT');
+    expect(rendered).not.toContain('--targets "*-macos"');
+    expect(rendered).toContain('  publish:');
   });
 });

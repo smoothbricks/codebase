@@ -170,6 +170,8 @@ export interface ManagedFileContext {
   nodeModulesCacheKey: string;
   repoName: string;
   platformTargetGlobs: string[];
+  /** Platform families the release workflow produces; excluded families are absent. */
+  releasePlatformTargetGlobs: string[];
   macosPlatformArchitectures: string[];
   /** Declared private-npm opt-in from the root smoo config; absent means fully public. */
   privateNpm?: PackagePrivateNpmConfig;
@@ -415,7 +417,7 @@ function getManagedContent(file: ManagedFile, context: ManagedFileContext): stri
         release: context.hasReleasePackages,
         deployProvider: context.productionDeployProvider,
         repoName: context.repoName,
-        platformTargetGlobs: context.platformTargetGlobs,
+        platformTargetGlobs: context.releasePlatformTargetGlobs,
         macosPlatformArchitectures: context.macosPlatformArchitectures,
         runsOn: context.ciRunsOn,
         macosRunsOn: context.macosRunsOn,
@@ -457,6 +459,14 @@ async function getManagedFileContext(root: string): Promise<ManagedFileContext> 
   const productionDeploy = deployTargetInfoFromProjects(nxProjects, 'production');
   const targetNames = targetNamesFromProjects(nxProjects);
   const platformTargetGlobs = platformTargetGlobsForTest(targetNames);
+  // The release workflow produces every platform family the graph carries
+  // EXCEPT the ones the repository excludes. An excluded family renders no job
+  // at all rather than a job whose failure blocks every release; the workflow
+  // that does own it says so itself.
+  const releasePlatformTargetGlobs = releasePlatformTargetGlobsFor(
+    platformTargetGlobs,
+    github?.releasePlatformFamiliesExcluded,
+  );
   const privateNpm = resolvePrivateNpmWorkflowConfig(root);
   // Cache registry identity plus the lockfile, never token values: a scope
   // URL change in the committed .npmrc must invalidate the dependency cache,
@@ -485,16 +495,34 @@ async function getManagedFileContext(root: string): Promise<ManagedFileContext> 
     nodeModulesCacheKey,
     repoName,
     platformTargetGlobs,
+    releasePlatformTargetGlobs,
     sourceCheckouts,
     cargoCredentials,
     remoteCache: manifest?.smoo?.remoteCache,
-    macosPlatformArchitectures: macosPlatformArchitecturesForTest(targetNames),
+    macosPlatformArchitectures: MACOS_PLATFORM_TARGET_GLOBS.some((glob) => releasePlatformTargetGlobs.includes(glob))
+      ? macosPlatformArchitecturesForTest(targetNames)
+      : [],
     privateNpm,
   };
 }
 
 export function hasExactTargetForTest(targetNames: Iterable<string>, target: string): boolean {
   return [...targetNames].includes(target);
+}
+
+/**
+ * The platform families the release workflow produces: the graph's families
+ * minus the ones the repository excludes. Excluding a family the graph does not
+ * have is not an error — a repository states what it does not release, and the
+ * statement stays true when the target is added later.
+ */
+export function releasePlatformTargetGlobsFor(
+  platformTargetGlobs: readonly string[],
+  excluded: readonly string[] | undefined,
+): string[] {
+  if (!excluded || excluded.length === 0) return [...platformTargetGlobs];
+  const drop = new Set(excluded);
+  return platformTargetGlobs.filter((glob) => !drop.has(glob));
 }
 
 export function platformTargetGlobsForTest(targetNames: Iterable<string>): string[] {
