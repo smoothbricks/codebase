@@ -993,7 +993,7 @@ where
             if json {
                 output.success(grants.clone()).map_err(output_error)?;
             } else if !changed {
-                emit_filesystem_grants(output, &grants)?;
+                emit_grants(output, &grants)?;
             }
             if changed {
                 // A grant is recorded under its resolved spelling. Saying so when that differs
@@ -1015,14 +1015,15 @@ where
                 }
                 output
                     .guidance(&format!(
-                        "grants for {} now: {} read, {} write",
+                        "grants for {} now: {} read, {} write, {} egress",
                         args.workspace,
                         grants.read.len(),
-                        grants.write.len()
+                        grants.write.len(),
+                        grants.egress.len()
                     ))
                     .map_err(output_error)?;
                 output
-                    .guidance("filesystem grants apply from the next exec or shell")
+                    .guidance("grants apply from the next exec or shell")
                     .map_err(output_error)?;
                 output
                     .hint(&format!(
@@ -1617,10 +1618,14 @@ fn emit_mount<W: Write, E: Write>(
     }
 }
 
-fn emit_filesystem_grants<W: Write, E: Write>(
-    output: &mut Output<W, E>,
-    grants: &GrantSet,
-) -> Result<()> {
+/// Every grant this workspace holds, one per line: what it may read, write, and reach.
+///
+/// Network reach is listed beside filesystem reach because it is a grant like any other — a
+/// host an operator admitted and can be asked to justify. Leaving it out of the listing was how
+/// `cowshed grant <ws>` could answer "nothing here" for a workspace that could reach a
+/// registry. The ports are the effective ones, so the line says what is admitted rather than
+/// what happened to be typed.
+fn emit_grants<W: Write, E: Write>(output: &mut Output<W, E>, grants: &GrantSet) -> Result<()> {
     for (kind, paths) in [
         (b"read".as_slice(), &grants.read),
         (b"write".as_slice(), &grants.write),
@@ -1633,6 +1638,21 @@ fn emit_filesystem_grants<W: Write, E: Write>(
                 .map_err(output_error)?;
             output.bare(b"\n").map_err(output_error)?;
         }
+    }
+    for rule in &grants.egress {
+        let ports = rule
+            .effective_ports()
+            .iter()
+            .map(u16::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        let mode = match rule.mode {
+            EgressMode::Intercept => "intercept",
+            EgressMode::Opaque => "opaque",
+        };
+        output
+            .bare_line(format!("egress\t{}\t{ports}\t{mode}", rule.host).as_bytes())
+            .map_err(output_error)?;
     }
     Ok(())
 }

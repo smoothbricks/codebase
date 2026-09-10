@@ -263,10 +263,10 @@ async fn lookup_keychain(account: String) -> Result<Option<CredentialRecord>, Cr
     .map_err(|error| CredentialError::Unavailable(format!("Keychain task failed: {error}")))?
 }
 
-/// Whether an enrolled binding is present, without reading the secret back out.
+/// Whether a binding was there, without reading the secret back out.
 ///
-/// `status` needs to say "a credential is installed for this origin" and nothing more. Handing
-/// the secret to a reporting path just so it can be discarded is how secrets end up in output.
+/// What `rm` answers: an absent binding is already the requested state, and saying which of the
+/// two happened is the whole difference between "removed" and "was not enrolled".
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CredentialPresence {
     Installed,
@@ -330,19 +330,23 @@ pub async fn remove_scoped_credential(
     .map_err(|error| CredentialError::Unavailable(format!("Keychain task failed: {error}")))?
 }
 
-/// Is a usable binding installed for this origin? The secret is never returned.
+/// The scope of the installed binding for this origin, or `None` when nothing is enrolled.
+///
+/// `status` reports what an operator enrolled, and the path prefixes are that answer: they are
+/// the non-secret half of the record, and the half that decides which requests the credential
+/// can ever ride. The decoded record's secret is dropped — and zeroed — right here rather than
+/// travelling into a reporting path.
 #[cfg(target_os = "macos")]
-pub async fn scoped_credential_presence(
+pub async fn scoped_credential_scope(
     repo_id: &str,
     protocol: CredentialProtocol,
     origin: &str,
-) -> Result<CredentialPresence, CredentialError> {
+) -> Result<Option<Vec<String>>, CredentialError> {
     validate_origin(origin)?;
     let account = account_key(repo_id, protocol, origin);
-    Ok(match lookup_keychain(account).await? {
-        Some(_) => CredentialPresence::Installed,
-        None => CredentialPresence::Absent,
-    })
+    Ok(lookup_keychain(account)
+        .await?
+        .map(|record| record.path_prefixes))
 }
 
 /// Enrolment is not available where the store is read-only by construction.
@@ -367,11 +371,11 @@ pub async fn remove_scoped_credential(
 }
 
 #[cfg(not(target_os = "macos"))]
-pub async fn scoped_credential_presence(
+pub async fn scoped_credential_scope(
     _repo_id: &str,
     _protocol: CredentialProtocol,
     origin: &str,
-) -> Result<CredentialPresence, CredentialError> {
+) -> Result<Option<Vec<String>>, CredentialError> {
     validate_origin(origin)?;
     Err(CredentialError::Unavailable(READ_ONLY_STORE.to_owned()))
 }

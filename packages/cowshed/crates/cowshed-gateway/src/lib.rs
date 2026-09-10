@@ -54,7 +54,7 @@ pub use platform::KeychainCredentialProvider;
 #[cfg(target_os = "linux")]
 pub use platform::SystemdCredentialProvider;
 pub use platform::{
-    CredentialPresence, ScopedCredential, remove_scoped_credential, scoped_credential_presence,
+    CredentialPresence, ScopedCredential, remove_scoped_credential, scoped_credential_scope,
     store_scoped_credential, validate_scope,
 };
 pub use repo_mirror::{

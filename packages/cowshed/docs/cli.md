@@ -626,16 +626,16 @@ walkthrough, Expo included, is [ios.md](ios.md).
 
 ## Sandbox grants
 
-### `cowshed grant <name> [--read <path...>] [--write <path...>]`
+### `cowshed grant <name> [--read <path...>] [--write <path...>] [--egress <host>]`
 
 Workspaces start **closed**: write access to their own volume, `/private/cowshed/caches`, and temp; read access to the
-toolchains and system; egress to the localhost gateway only. Widen filesystem access per workspace:
+toolchains and system; egress to the localhost gateway only. Widen filesystem and network access per workspace:
 
 ```
 $ cowshed grant raven --read <project-root>/reference-corpus
 $ cowshed grant raven --write <project-root>/shared-assets
-cowshed: grants for raven now: 1 read, 1 write
-cowshed: filesystem grants apply from the next exec or shell
+cowshed: grants for raven now: 1 read, 1 write, 0 egress
+cowshed: grants apply from the next exec or shell
 next: cowshed exec raven -- <retry your command>
 ```
 
@@ -650,12 +650,18 @@ next: cowshed exec raven -- <retry your command>
   its target is granted — grant the target, and the workspace reaches it through the link.
 - Filesystem grants take effect at the next `exec`/`shell`: Seatbelt profiles are fixed at process launch, and every
   launch carries the current persisted grant snapshot.
+- `--egress <host>` is repeatable and admits one host through the gateway, intercepted, on the default ports (443 and
+  80). Network reach is a separate decision from filesystem reach and a separately auditable one: the gateway logs every
+  admission (`cowshed audit`). Holding a credential for a registry does not grant reach to it, and granting reach does
+  not hand the workspace a credential — see [`cowshed credential`](#cowshed-credential-addlsstatusrm).
+- Egress grants apply immediately: the gateway reads the current policy per request, with no re-exec.
 - `cowshed grant <name>` with no flags prints the current grant set (TSV; `--json` for the envelope):
 
 ```
 $ cowshed grant raven
 read	<project-root>/reference-corpus
 write	<project-root>/shared-assets
+egress	registry.internal.example	443,80	intercept
 ```
 
 ## Authority boundaries
@@ -790,6 +796,47 @@ none, restores every authoritative attached workspace session, and drains on SIG
 `attach`, and `doctor` commands reconcile the current project's attached sessions before admission; lifecycle commands
 reconcile again before reporting success. If the service is absent they fail with exit 5 and the exact
 `launchctl kickstart -k gui/<uid>/dev.cowshed.gateway` next hint.
+
+### `cowshed credential add|ls|status|rm`
+
+A workspace reaches a private registry through the gateway, which attaches a credential **the host holds** and strips
+whatever the client sent; nothing inside a sandbox ever receives the secret. This verb is how the host comes to hold
+one. It is per project — a record is bound to the discovered `repo_id` — and it is host-side: a workspace manifest
+cannot ask for a credential.
+
+```
+$ export REGISTRY_READ_TOKEN=<token>
+$ cowshed credential add --origin https://registry.internal.example \
+    --path-prefix /api/packages/acme/npm/ --secret-env REGISTRY_READ_TOKEN
+cowshed: enrolled https://registry.internal.example:443 for acme/site with scope /api/packages/acme/npm/
+cowshed: REGISTRY_READ_TOKEN is now withheld from every child of this project
+next: cowshed grant <workspace> --egress registry.internal.example
+https://registry.internal.example:443  credential installed
+cowshed: scope: /api/packages/acme/npm/
+cowshed: withheld from every child: REGISTRY_READ_TOKEN
+```
+
+- The secret is **named, never typed**: `--secret-env <NAME>` reads a variable from this shell,
+  `--secret-command '["op","read","op://vault/item/field"]'` runs a helper directly with no shell, `--secret-stdin`
+  reads a pipe. A non-empty named variable wins and the helper is not run. There is deliberately no flag carrying the
+  credential itself — argv is visible to every process on the host and lands in shell history.
+- `--origin` is host and port only (the port defaults to 443, and is always explicit in the stored record). The
+  registry's namespace belongs in `--path-prefix`, which is repeatable and **required**: a credential admitted for a
+  whole host is not a scope, and a bare `/` is refused. `--method` defaults to `GET` and `HEAD`, which is what an
+  intercept grant admits.
+- Enrolment records the environment variable NAME it read in host state, and every job in the project then has that name
+  withheld from its environment — including the second `exec` in a long-lived named session. A credential the gateway
+  holds has no business also riding into the sandbox.
+- `ls`/`status` report each route, the scope it was enrolled with, the names withheld, and whether a usable credential
+  is installed. They never print the secret, and never a digest of it. A record that no longer decodes, or whose scope
+  could never match a request, reports as missing rather than silently never attaching.
+- Enrolling the same origin again is rotation, and is the supported path: the record is replaced with no window in which
+  the credential is absent. `rm --origin <origin>` forgets one.
+- Network reach stays separate: `cowshed grant <ws> --egress <host>` is what lets a workspace reach the registry at all,
+  and it is audited on its own.
+- On Linux the store is read-only by construction — the service manager supplies records through
+  `$CREDENTIALS_DIRECTORY` — so `add`/`rm`/`status` say that, with the mechanism named, instead of reporting a success
+  that wrote nothing.
 
 ### `cowshed sccache start [--capacity <size>]` / `stop` / `status`
 
