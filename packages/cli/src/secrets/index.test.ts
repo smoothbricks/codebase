@@ -1,6 +1,16 @@
 import { describe, expect, it } from 'bun:test';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { repositorySecretMapping } from '../lib/secret-names.js';
-import { reconcileSecrets, unsatisfiedSecrets, unwiredSecrets } from './index.js';
+import {
+  environmentsMissing,
+  reconcileSecrets,
+  type SecretRow,
+  unsatisfiedSecrets,
+  unwiredSecrets,
+  workflowEnvironments,
+} from './index.js';
 
 const sources = {
   workerSecrets: {
@@ -53,6 +63,7 @@ describe('secret reconciliation', () => {
       suppliedByWorkflow: false,
       fetchableLocally: false,
       onRepository: true,
+      heldByEnvironment: [],
     });
   });
 
@@ -85,8 +96,114 @@ describe('secret reconciliation', () => {
         suppliedByWorkflow: true,
         fetchableLocally: false,
         onRepository: true,
+        heldByEnvironment: [],
       },
     ]);
     expect(unsatisfiedSecrets(rows)).toEqual([]);
+  });
+});
+
+describe('environment-scoped values', () => {
+  // Two jobs bind an environment each: what `secrets.X` resolves to in them is
+  // the environment's value, and only then the repository's.
+  const bound = ['preview', 'production'];
+  const rowFor = (rows: readonly SecretRow[], name: string): SecretRow => {
+    const row = rows.find((candidate) => candidate.name === name);
+    if (!row) throw new Error(`no row for ${name}`);
+    return row;
+  };
+
+  it('does not call a name missing when every environment a job binds holds it', () => {
+    // The false refusal this fixes: the values are set, in the scope the job
+    // actually reads, and reading repository scope alone reported them absent.
+    const rows = reconcileSecrets({
+      ...sources,
+      environmentSecrets: {
+        preview: ['STRIPE_PUBLISHABLE_KEY', 'STRIPE_SECRET_KEY'],
+        production: ['STRIPE_PUBLISHABLE_KEY', 'STRIPE_SECRET_KEY'],
+      },
+    });
+
+    expect(unsatisfiedSecrets(rows, bound)).toEqual([]);
+    expect(rowFor(rows, 'STRIPE_SECRET_KEY').heldByEnvironment).toEqual(['preview', 'production']);
+    expect(rowFor(rows, 'STRIPE_SECRET_KEY').onRepository).toBe(false);
+  });
+
+  it('lets a repository value satisfy every bound environment, because a job falls back to it', () => {
+    const rows = reconcileSecrets({
+      ...sources,
+      repositorySecrets: [...sources.repositorySecrets, 'STRIPE_PUBLISHABLE_KEY', 'STRIPE_SECRET_KEY'],
+    });
+
+    expect(unsatisfiedSecrets(rows, bound)).toEqual([]);
+    expect(environmentsMissing(rowFor(rows, 'STRIPE_SECRET_KEY'), bound)).toEqual([]);
+  });
+
+  it('names exactly the scopes that lack a value, so each gets its own command', () => {
+    const rows = reconcileSecrets({ ...sources, environmentSecrets: { preview: ['STRIPE_SECRET_KEY'] } });
+
+    expect(unsatisfiedSecrets(rows, bound).map((row) => row.name)).toEqual([
+      'STRIPE_PUBLISHABLE_KEY',
+      'STRIPE_SECRET_KEY',
+    ]);
+    expect(environmentsMissing(rowFor(rows, 'STRIPE_SECRET_KEY'), bound)).toEqual(['production']);
+    expect(environmentsMissing(rowFor(rows, 'STRIPE_PUBLISHABLE_KEY'), bound)).toEqual(['preview', 'production']);
+  });
+
+  it('shows a value only an environment holds, even when nothing declares the name', () => {
+    const rows = reconcileSecrets({ ...sources, environmentSecrets: { production: ['RETIRED_TOKEN'] } });
+
+    expect(rowFor(rows, 'RETIRED_TOKEN').heldByEnvironment).toEqual(['production']);
+    expect(rowFor(rows, 'RETIRED_TOKEN').onRepository).toBe(false);
+  });
+});
+
+describe('workflow environment bindings', () => {
+  it('reads the scopes a workflow binds, and nothing that only looks like one', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'smoo-secrets-environments-'));
+    try {
+      await mkdir(join(root, '.github', 'workflows'), { recursive: true });
+      await writeFile(
+        join(root, '.github', 'workflows', 'ci.yml'),
+        `name: CI
+on: push
+jobs:
+  main:
+    name: Validate
+    runs-on: ubuntu-latest
+    environment: staging
+    steps:
+      - name: Build
+        run: echo build
+  review:
+    runs-on: ubuntu-latest
+    environment: "review env"
+    steps:
+      - name: Deploy
+        run: echo deploy
+  preview:
+    runs-on: ubuntu-latest
+    environment: \${{ github.event.inputs.stage }}
+    steps:
+      - name: Deploy
+        run: echo deploy
+  production:
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+      url: \${{ steps.deploy.outputs.url }}
+    steps:
+      - name: Deploy
+        run: echo deploy
+`,
+      );
+
+      // The workflow's own name, each job's, and each step's are not scopes: a
+      // secret cannot be set in "Validate", and offering it would be a command
+      // that fails. The computed one names no fixed scope either.
+      expect(workflowEnvironments(root)).toEqual(['production', 'review env', 'staging']);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
 });

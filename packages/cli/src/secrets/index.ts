@@ -20,7 +20,7 @@
  */
 
 import { spawnSync } from 'node:child_process';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { repositoryOwnerFromUrl, repositorySecretMapping } from '../lib/secret-names.js';
 import { readPackageJsonObject, repositoryInfo } from '../lib/workspace.js';
@@ -39,6 +39,13 @@ export interface SecretRow {
   fetchableLocally: boolean;
   /** True when the repository holds a secret of this name. */
   onRepository: boolean;
+  /**
+   * GitHub Environments holding their own value for this name. A job bound to
+   * an environment reads that value in preference to the repository's, which
+   * is how one name carries test credentials on a preview stage and live ones
+   * in production.
+   */
+  heldByEnvironment: string[];
 }
 
 export interface SecretSources {
@@ -52,6 +59,8 @@ export interface SecretSources {
   localCommands: readonly string[];
   /** Repository secret names GitHub currently holds. */
   repositorySecrets: readonly string[];
+  /** Environment name -> secret names that environment holds. */
+  environmentSecrets?: Readonly<Record<string, readonly string[]>>;
 }
 
 /**
@@ -68,8 +77,14 @@ export function reconcileSecrets(sources: SecretSources): SecretRow[] {
   const carriesKnownEnvName = new Set(
     names.size > 0 ? [...names].map((name) => sources.secretNames[name] ?? name) : [],
   );
-  for (const secret of sources.repositorySecrets) {
+  // A value only an environment holds is still a value: leaving it out of the
+  // rows is how an operator ends up hunting for a secret that is already set.
+  const addUndeclared = (secret: string): void => {
     if (!carriesKnownEnvName.has(secret)) names.add(secret);
+  };
+  for (const secret of sources.repositorySecrets) addUndeclared(secret);
+  for (const held of Object.values(sources.environmentSecrets ?? {})) {
+    for (const secret of held) addUndeclared(secret);
   }
   return [...names]
     .sort((left, right) => left.localeCompare(right))
@@ -83,6 +98,10 @@ export function reconcileSecrets(sources: SecretSources): SecretRow[] {
       suppliedByWorkflow: sources.workflowSecrets.includes(name),
       fetchableLocally: sources.localCommands.includes(name),
       onRepository: sources.repositorySecrets.includes(sources.secretNames[name] ?? name),
+      heldByEnvironment: Object.entries(sources.environmentSecrets ?? {})
+        .filter(([, held]) => held.includes(sources.secretNames[name] ?? name))
+        .map(([environment]) => environment)
+        .sort((left, right) => left.localeCompare(right)),
     }));
 }
 
@@ -92,8 +111,22 @@ export function reconcileSecrets(sources: SecretSources): SecretRow[] {
  * separately from "declared but not wired into any workflow", because the
  * remedies differ — set a secret, versus declare it in `smoo.github`.
  */
-export function unsatisfiedSecrets(rows: readonly SecretRow[]): SecretRow[] {
-  return rows.filter((row) => row.suppliedByWorkflow && !row.onRepository);
+export function unsatisfiedSecrets(rows: readonly SecretRow[], boundEnvironments: readonly string[] = []): SecretRow[] {
+  return rows.filter((row) => {
+    if (!row.suppliedByWorkflow) return false;
+    if (row.onRepository) return false;
+    // With no environment bound, the repository is the only scope a job reads.
+    // With environments bound, each one can carry the value instead - so the
+    // name is satisfied only when every bound environment holds it.
+    if (boundEnvironments.length === 0) return true;
+    return !boundEnvironments.every((environment) => row.heldByEnvironment.includes(environment));
+  });
+}
+
+/** Bound environments that lack their own value and cannot fall back to the repository. */
+export function environmentsMissing(row: SecretRow, boundEnvironments: readonly string[]): string[] {
+  if (row.onRepository) return [];
+  return boundEnvironments.filter((environment) => !row.heldByEnvironment.includes(environment));
 }
 
 /** Worker-declared names no managed workflow passes: a CI deploy will run without them. */
@@ -120,6 +153,77 @@ export function workflowSecretNames(root: string): string[] {
   if (smoo?.privateNpm?.readTokenEnv) names.add(smoo.privateNpm.readTokenEnv);
   if (smoo?.privateNpm?.publishTokenEnv) names.add(smoo.privateNpm.publishTokenEnv);
   return [...names].sort((left, right) => left.localeCompare(right));
+}
+
+/**
+ * GitHub Environments the rendered workflows bind, read from the workflow
+ * files rather than from config: a binding may be hand-authored inside a
+ * `smoo-local` block, and the file is what GitHub executes either way. A job
+ * bound to an environment resolves `secrets.X` from that environment first and
+ * from the repository second, so these names are the scopes a value can live
+ * in. Expressions are skipped - a computed environment names no fixed scope.
+ */
+export function workflowEnvironments(root: string): string[] {
+  const directory = join(root, '.github', 'workflows');
+  if (!existsSync(directory)) return [];
+  const environments = new Set<string>();
+  for (const entry of readdirSync(directory)) {
+    if (!entry.endsWith('.yml') && !entry.endsWith('.yaml')) continue;
+    for (const bound of environmentBindings(readFileSync(join(directory, entry), 'utf8'))) {
+      environments.add(bound);
+    }
+  }
+  return [...environments].sort((left, right) => left.localeCompare(right));
+}
+
+/**
+ * The environments one workflow file binds, in both spellings GitHub accepts:
+ * `environment: staging`, and the block form whose `name:` sits under it when
+ * the job also records a deployment URL. Only a `name:` indented inside an
+ * `environment:` block is a binding - a workflow's, a job's and a step's are
+ * not, and reading those as environments would send an operator to set
+ * secrets in scopes that do not exist.
+ */
+function environmentBindings(text: string): string[] {
+  const lines = text.split('\n');
+  const bound: string[] = [];
+  for (let index = 0; index < lines.length; index += 1) {
+    const binding = /^(\s*)environment:(.*)$/.exec(lines[index] ?? '');
+    if (!binding) continue;
+    const indent = (binding[1] ?? '').length;
+    const value = binding[2] ?? '';
+    // Nothing but a comment after the colon is the block form; anything else
+    // is the value itself.
+    if (!/^\s*(?:#.*)?$/.test(value)) {
+      const name = literalEnvironmentName(value);
+      if (name !== null) bound.push(name);
+      continue;
+    }
+    for (let next = index + 1; next < lines.length; next += 1) {
+      const line = lines[next] ?? '';
+      const content = line.trimStart();
+      if (content.length === 0 || content.startsWith('#')) continue;
+      if (line.length - content.length <= indent) break;
+      const named = /^name:(.*)$/.exec(content);
+      if (!named) continue;
+      const name = literalEnvironmentName(named[1] ?? '');
+      if (name !== null) bound.push(name);
+      break;
+    }
+  }
+  return bound;
+}
+
+/**
+ * The fixed name a YAML value denotes, or null when it denotes no fixed scope:
+ * an expression is computed per run, and a flow mapping or a list is not a
+ * name. Names may contain spaces, which is why the renderer quotes them.
+ */
+function literalEnvironmentName(value: string): string | null {
+  const scalar = value.replace(/\s+#.*$/, '').trim();
+  if (scalar.length === 0 || scalar.includes('${{')) return null;
+  const unquoted = /^(['"])(.*)\1$/.exec(scalar)?.[2] ?? scalar;
+  return /^[A-Za-z0-9._-][A-Za-z0-9._ -]*$/.test(unquoted) ? unquoted : null;
 }
 
 /**

@@ -532,23 +532,46 @@ function buildProgram(): Command {
     .description('Reconcile declared secrets: what Workers need, what workflows pass, what the repository holds');
   secrets
     .command('status')
-    .description('Show every declared secret and refuse when a workflow passes one the repository lacks')
-    .option('--repo <owner/name>', 'repository to read secrets from; defaults to the current checkout')
-    .action(async (options: { repo?: string }) => {
+    .description(
+      'Show every declared secret with the scopes holding it, and refuse when a workflow passes one none has',
+    )
+    .option(
+      '-R, --repo <owner/name|remote>',
+      "repository or remote name; defaults to the current branch's upstream remote",
+    )
+    .option(
+      '--env <environment>',
+      "also read this GitHub Environment; its value takes precedence over the repository's for a job bound to it",
+    )
+    .action(async (options: { repo?: string; env?: string }) => {
       process.exitCode = secretsStatus(await findRepoRoot(), options);
     });
   secrets
-    .command('set <name>')
-    .description('Set one repository secret from a pasted value; the value is read without echo and never logged')
-    .option('--repo <owner/name>', 'repository to set the secret on')
-    .action(async (name: string, options: { repo?: string }) => {
-      process.exitCode = await secretsSet(name, options);
+    .command('set [name]')
+    .description('Set secrets from pasted values; with no name, prompts for every secret the target scope still lacks')
+    .option(
+      '-R, --repo <owner/name|remote>',
+      "repository or remote name; defaults to the current branch's upstream remote",
+    )
+    .option(
+      '--env <environment>',
+      "write into this GitHub Environment; its value takes precedence over the repository's for a job bound to it",
+    )
+    .action(async (name: string | undefined, options: { repo?: string; env?: string }) => {
+      process.exitCode = await secretsSet(await findRepoRoot(), name, options);
     });
   secrets
     .command('sync')
     .description('Push every secret smoo.secrets can fetch locally to the repository')
-    .option('--repo <owner/name>', 'repository to set the secrets on')
-    .action(async (options: { repo?: string }) => {
+    .option(
+      '-R, --repo <owner/name|remote>',
+      "repository or remote name; defaults to the current branch's upstream remote",
+    )
+    .option(
+      '--env <environment>',
+      "write into this GitHub Environment; its value takes precedence over the repository's for a job bound to it",
+    )
+    .action(async (options: { repo?: string; env?: string }) => {
       process.exitCode = await secretsSync(await findRepoRoot(), options);
     });
 
