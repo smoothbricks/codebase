@@ -351,12 +351,18 @@ wraps prose body paragraphs through `fmt -w 72` while preserving fenced code blo
 bullets, trailers, URLs, and comment lines.
 
 The generated pre-push hook runs only on macOS. Linux `nx lint` already compiles the Linux `cfg(target_os)` arm; Darwin
-does not. The hook is a probe: it runs `nx run-many -t cargo-lint-cross` and nothing else. Nx caches that target on the
-Cargo inputs, so a hit is a prior real Linux clippy and the push proceeds. A miss refuses the push and names
-`bun run check:linux` — the hook never enters linux-cross and never starts a compile, so what it costs is one Nx graph
-construction rather than an unbounded clippy. `bun run check:linux` is `tooling/devenv -P linux-cross shell --` around
-that same Nx target; it is the only place the gate actually runs, so it is deliberately not quiet. `git push
---no-verify` skips the hook.
+does not. The hook is a probe: it runs `env -u CC_x86_64_unknown_linux_gnu nx run-many -t cargo-lint-cross` and nothing
+else. Nx caches that target on the Cargo inputs, so a hit is a prior real Linux clippy and the push proceeds. A miss
+refuses the push and names `bun run check:linux` — the hook never enters linux-cross and never starts a compile, so what
+it costs is one Nx graph construction rather than an unbounded clippy. `bun run check:linux` is
+`tooling/devenv -P linux-cross shell --` around that same Nx target; it is the only place the gate actually runs, so it
+is deliberately not quiet. `git push --no-verify` skips the hook.
+
+The toolchain variable is unset for the probe on purpose. The target's own command reads it to decide whether the cross
+toolchain is present, so a push made from inside an already-entered linux-cross shell would otherwise fall through into
+a real multi-minute compile — the thing the probe exists to avoid. It is not a declared input of the target, so
+unsetting it cannot change the task hash: a warm entry still hits. Measured both ways, including with the variable set
+to a nonexistent compiler.
 
 Conventional commit scopes should use Nx project names. For packages in the same npm scope as the root package, smoo
 requires `package.json` `nx.name` to be the unscoped package name, such as `cli` for `@smoothbricks/cli`, so subjects
@@ -720,6 +726,16 @@ resource carrying the `prN` segment, D1 included.
   fall back to that variable and rename the worker after it.
 - The secrets manifest (`.dev.vars.example`) and the temporary secrets file come from the working directory, not from
   beside the `--config` file.
+- Secrets are gated per stage. `smoo.wrangler.secretStages` in the project's `package.json` maps a declared secret name
+  to the stages that require it, and the mapping cuts both ways: a listed stage REFUSES to deploy when that secret has
+  no value in the environment and none on the Worker, and an unlisted stage never RECEIVES it even when the deploying
+  shell exports one. `preview` matches any `prN`. A name absent from the map is required by every stage.
+- The refusal happens before any Cloudflare mutation and names every missing secret at once, so a first deploy reports
+  the whole list instead of one name per attempt. Values never appear in a message or in argv.
+- Both directions are load-bearing, and neither is a lint. `--secrets-file` applies additively — wrangler deletes
+  nothing it is not told about — so a secret introduced after a stage's first deploy would otherwise never arrive and
+  the Worker would keep serving without it, silently. And a token scoped to preview stages, exported by a shell that
+  also deploys production, would otherwise install a test-only capability into production.
 - Migrations run only for the D1 bindings that declare a `migrations_dir`.
 - For a `prN` stage, an R2 bucket or D1 database whose name has no exact `staging` segment is refused, before any
   Cloudflare resource is created: reusing the name verbatim would share staging's data with the pull request.
