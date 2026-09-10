@@ -417,10 +417,30 @@ export async function withPrivateNpmUserconfig<T>(
 export interface NpmStatusOptions {
   registry?: string;
   userconfig?: string;
+  /** Path-scoped auth key and token env, so the credential can ride env config. */
+  credential?: { authKey: string; tokenEnv: string };
 }
 
-function npmStatusEnv(userconfig: string | undefined): Record<string, string> | undefined {
-  return userconfig ? { NPM_CONFIG_USERCONFIG: userconfig } : undefined;
+/**
+ * npm config precedence is cli > env > project `.npmrc` > userconfig. A
+ * repository that commits its own `//host/path:_authToken=${SOME_ENV}` line
+ * therefore OVERRIDES the userconfig this module writes, and when that env is
+ * unset npm sends the unexpanded value: the registry answers 401 on reads with
+ * a perfectly good read credential, naming nothing. So the credential also
+ * rides as env config, which the project file cannot outrank, and the token
+ * value stays out of every file on disk.
+ */
+function npmStatusEnv(
+  userconfig: string | undefined,
+  credential?: { authKey: string; tokenEnv: string },
+): Record<string, string> | undefined {
+  if (!userconfig) return undefined;
+  const env: Record<string, string> = { NPM_CONFIG_USERCONFIG: userconfig };
+  const token = credential ? process.env[credential.tokenEnv] : undefined;
+  if (credential && token) {
+    env[`npm_config_${credential.authKey}`] = token;
+  }
+  return env;
 }
 
 function npmCommandFailedMessage(npmArgs: string[], exitCode: number, stdout = '', stderr = ''): string {
@@ -444,7 +464,7 @@ export async function npmPublishedVersionExists(
   if (options.registry) {
     args.push('--registry', options.registry);
   }
-  const result = await runResult('npm', args, root, npmStatusEnv(options.userconfig));
+  const result = await runResult('npm', args, root, npmStatusEnv(options.userconfig, options.credential));
   if (result.exitCode === 0) {
     return true;
   }
@@ -460,7 +480,7 @@ export async function npmPackageExists(root: string, name: string, options: NpmS
   if (options.registry) {
     args.push('--registry', options.registry);
   }
-  const result = await runResult('npm', args, root, npmStatusEnv(options.userconfig));
+  const result = await runResult('npm', args, root, npmStatusEnv(options.userconfig, options.credential));
   if (result.exitCode === 0) {
     return true;
   }

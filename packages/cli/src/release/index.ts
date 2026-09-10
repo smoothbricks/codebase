@@ -48,6 +48,7 @@ export {
   type PrivateNpmRegistryConfigErrorKind,
   type PublishDestination,
   privateNpmPublishArgs,
+  privateNpmTokenEnvForMode,
   privateNpmUserconfigContent,
   publishPrivateWithDiagnostics,
   type Result as PrivateNpmResult,
@@ -114,6 +115,7 @@ import {
   npmPublishedVersionExists as npmPublishedVersionExistsOnRegistry,
   type PrivateNpmRegistry,
   privateNpmPublishArgs,
+  privateNpmTokenEnvForMode,
   publishPrivateWithDiagnostics,
   selectPublishDestination,
   selectRegistryForPackage,
@@ -754,7 +756,13 @@ async function publishPrivatePackedPackage(
       await publishPrivateWithDiagnostics(
         pkg,
         {
-          publish: () => runNpm(root, args, { NPM_CONFIG_USERCONFIG: userconfig }),
+          publish: () =>
+            runNpm(root, args, {
+              NPM_CONFIG_USERCONFIG: userconfig,
+              // Env config outranks a committed project `.npmrc` auth line; see
+              // npmStatusEnv in private-npm.ts for why that matters here.
+              [`npm_config_${registry.authKey}`]: process.env[privateNpmTokenEnvForMode(registry, 'publish')] ?? '',
+            }),
           // The open publish userconfig already authenticates this registry,
           // so the failure probe reuses it. Opening a second read-mode
           // userconfig here demanded a read credential the publishing job need
@@ -764,6 +772,7 @@ async function publishPrivatePackedPackage(
             npmPublishedVersionExistsOnRegistry(root, pkg.name, pkg.version, {
               registry: registry.registry,
               userconfig,
+              credential: { authKey: registry.authKey, tokenEnv: privateNpmTokenEnvForMode(registry, 'publish') },
             }),
           log: (message) => console.log(message),
           error: (message) => console.error(message),
@@ -1865,7 +1874,11 @@ async function npmVersionExists(root: string, name: string, version: string): Pr
     return npmPublishedVersionExistsOnRegistry(root, name, version);
   }
   return withPrivateNpmUserconfig(registry, 'read', (userconfig) =>
-    npmPublishedVersionExistsOnRegistry(root, name, version, { registry: registry.registry, userconfig }),
+    npmPublishedVersionExistsOnRegistry(root, name, version, {
+      registry: registry.registry,
+      userconfig,
+      credential: { authKey: registry.authKey, tokenEnv: privateNpmTokenEnvForMode(registry, 'read') },
+    }),
   );
 }
 

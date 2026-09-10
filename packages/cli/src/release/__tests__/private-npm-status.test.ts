@@ -433,6 +433,43 @@ describe('private npm published-version status', () => {
     });
   });
 
+  it('reads through a repository .npmrc whose own auth line names an unset env', async () => {
+    // The shape that cost a day: AxE commits
+    // `//host/path:_authToken=${AXE_NPM_PUBLISH_TOKEN}` at the workspace root.
+    // npm ranks that project file ABOVE the userconfig this CLI writes, so with
+    // the publish env unset it sent the unexpanded value and the registry
+    // answered 401 — with a perfectly good read credential in hand.
+    await withStatusFixture(async ({ fixture, root, userconfig }) => {
+      await fixture.privateRegistry.publishPackage({ name: PRIVATE_PACKAGE, version: PRIVATE_VERSION });
+      const resolved = loopbackRegistry(fixture.privateRegistry);
+      await writeFile(
+        join(root, '.npmrc'),
+        `${resolved.scope}:registry=${resolved.registry}\n${resolved.authKey}=\${NOT_SET_ANYWHERE}\n`,
+      );
+
+      // Control: with the userconfig alone the project file wins, so the token
+      // npm sends is the unexpanded reference — the registry sees no usable
+      // credential. Asserted on the wire, because a fixture that answers
+      // anonymous reads would let the server's verdict hide it.
+      await npmPublishedVersionExists(root, PRIVATE_PACKAGE, PRIVATE_VERSION, {
+        registry: fixture.privateRegistry.registry,
+        userconfig,
+      });
+      const overridden = fixture.privateRegistry.requestsFor('probe').at(-1);
+      expect(overridden?.authorization ?? '').not.toContain(FIXTURE_READ_TOKEN);
+
+      await expect(
+        npmPublishedVersionExists(root, PRIVATE_PACKAGE, PRIVATE_VERSION, {
+          registry: fixture.privateRegistry.registry,
+          userconfig,
+          credential: { authKey: resolved.authKey, tokenEnv: FIXTURE_READ_TOKEN_ENV },
+        }),
+      ).resolves.toBe(true);
+      const authenticated = fixture.privateRegistry.requestsFor('probe').at(-1);
+      expect(authenticated?.authorization ?? '').toContain(FIXTURE_READ_TOKEN);
+    });
+  });
+
   it('reports a genuine not-found as absent', async () => {
     await withStatusFixture(async ({ fixture, root, userconfig }) => {
       fixture.privateRegistry.failWith(404);
