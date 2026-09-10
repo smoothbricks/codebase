@@ -206,7 +206,7 @@ describe('registryAuthEnvNames', () => {
 
   it('collects ${VAR} references from .npmrc text', async () => {
     expect(
-      await names('@axe.sc:registry=https://npm.example.net\n//npm.example.net/:_authToken=${SMOO_READ_TOKEN}\n'),
+      await names('@acme:registry=https://npm.example.net\n//npm.example.net/:_authToken=${SMOO_READ_TOKEN}\n'),
     ).toEqual(['SMOO_READ_TOKEN']);
   });
 

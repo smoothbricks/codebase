@@ -522,8 +522,8 @@ describe('typecheck test policy', () => {
     // tsconfig files are JSONC: TypeScript permits comments. A plain
     // JSON.parse failed, the reader answered "absent", and the policy
     // regenerated the file — deleting a declared `lib`, an `exclude`, extra
-    // `include` globs and every comment explaining them. That is how AxE's
-    // Bun-only test program lost es2023 and `toSorted` became a type error.
+    // `include` globs and every comment explaining them. That is how a
+    // Bun-only test program loses es2023 and `toSorted` becomes a type error.
     const root = await mkdtemp(join(tmpdir(), 'smoo-typecheck-test-jsonc-'));
     try {
       await writeJsonFs(join(root, 'package.json'), { workspaces: ['packages/*'] });

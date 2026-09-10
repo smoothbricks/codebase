@@ -434,8 +434,8 @@ describe('private npm published-version status', () => {
   });
 
   it('reads through a repository .npmrc whose own auth line names an unset env', async () => {
-    // The shape that cost a day: AxE commits
-    // `//host/path:_authToken=${AXE_NPM_PUBLISH_TOKEN}` at the workspace root.
+    // The shape that cost a day: a repository commits
+    // `//host/path:_authToken=${NPM_PUBLISH_TOKEN}` at the workspace root.
     // npm ranks that project file ABOVE the userconfig this CLI writes, so with
     // the publish env unset it sent the unexpanded value and the registry
     // answered 401 — with a perfectly good read credential in hand.

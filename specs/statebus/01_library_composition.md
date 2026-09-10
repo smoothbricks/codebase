@@ -75,7 +75,7 @@ or search by library name.
 ## Application definition <a id="smoo/statebus!n/composition-application"></a>
 
 ```ts
-export const conlocaBus = defineBus(
+export const appBus = defineBus(
   [
     appLibrary,
     authLibrary,
@@ -98,14 +98,14 @@ export const conlocaBus = defineBus(
 The definition exposes:
 
 ```ts
-conlocaBus.createRuntime(runtimeConfig);
-conlocaBus.Provider;
-conlocaBus.useBus;
-conlocaBus.useBusEvents;
-conlocaBus.reduceSnapshot;
-conlocaBus.serialize;
-conlocaBus.replay;
-conlocaBus.schemaFingerprint;
+appBus.createRuntime(runtimeConfig);
+appBus.Provider;
+appBus.useBus;
+appBus.useBusEvents;
+appBus.reduceSnapshot;
+appBus.serialize;
+appBus.replay;
+appBus.schemaFingerprint;
 ```
 
 `defineBus` performs no external I/O and creates no process-global runtime.
@@ -113,7 +113,7 @@ conlocaBus.schemaFingerprint;
 ## Runtime creation <a id="smoo/statebus!n/composition-runtime"></a>
 
 ```ts
-const runtime = conlocaBus.createRuntime({
+const runtime = appBus.createRuntime({
   scheduler: microtaskScheduler,
   tracer: appTracer,
   flagEvaluator,
@@ -145,7 +145,7 @@ Tests, stories, browser roots, and embedded instances create independent runtime
 
 ```tsx
 function MembersScreen({ orgId }: Props) {
-  const { state, events } = conlocaBus.useBus();
+  const { state, events } = appBus.useBus();
   const model = state.members.screen.use({ orgId });
 
   return (
@@ -165,7 +165,7 @@ functions publish to the runtime selected by the nearest Provider.
 Event-only code may narrow capabilities:
 
 ```ts
-const { inviteSubmitted } = conlocaBus.useBusEvents(membersLibrary.events);
+const { inviteSubmitted } = appBus.useBusEvents(membersLibrary.events);
 ```
 
 The public event facade includes only events declared publishable to the caller. Lifecycle/result events remain

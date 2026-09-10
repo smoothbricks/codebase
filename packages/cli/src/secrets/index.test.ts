@@ -20,10 +20,10 @@ const sources = {
 
 describe('secret reconciliation', () => {
   it('names the secret a workflow passes and the repository does not hold', () => {
-    // Conloca's pr80 stage refused with `publishable_key_mismatch` because
-    // ci.yml passed secrets.STRIPE_PUBLISHABLE_KEY and the repository had no
-    // such secret: the empty value reached Stripe's validator, which talked
-    // about the key instead of the missing declaration.
+    // A preview stage refuses with `publishable_key_mismatch` when `ci.yml`
+    // passes `secrets.STRIPE_PUBLISHABLE_KEY` and the repository holds no such
+    // secret: the empty value reaches the payment library's validator, which
+    // talks about the key instead of the missing declaration.
     const unsatisfied = unsatisfiedSecrets(reconcileSecrets(sources)).map((row) => row.name);
 
     expect(unsatisfied).toEqual(['STRIPE_PUBLISHABLE_KEY', 'STRIPE_SECRET_KEY']);
@@ -67,20 +67,20 @@ describe('secret reconciliation', () => {
 
   it('reads a reserved env name from its owner-prefixed secret, with no declaration', () => {
     // GitHub rejects `gh secret set GITHUB_*`, so the value cannot live under
-    // its own name. Conloca had written CONLOCA_GITHUB_CLIENT_SECRET by hand in
-    // its workflow; the convention derives exactly that from the repo owner.
+    // its own name. Operators write the owner-prefixed name by hand in the
+    // workflow; the convention derives exactly that from the repository owner.
     const rows = reconcileSecrets({
       workerSecrets: { 'targets/backend': ['GITHUB_CLIENT_SECRET'] },
       workflowSecrets: ['GITHUB_CLIENT_SECRET'],
-      secretNames: repositorySecretMapping(['GITHUB_CLIENT_SECRET'], 'conloca'),
+      secretNames: repositorySecretMapping(['GITHUB_CLIENT_SECRET'], 'acme'),
       localCommands: [],
-      repositorySecrets: ['CONLOCA_GITHUB_CLIENT_SECRET'],
+      repositorySecrets: ['ACME_GITHUB_CLIENT_SECRET'],
     });
 
     expect(rows).toEqual([
       {
         name: 'GITHUB_CLIENT_SECRET',
-        repositorySecret: 'CONLOCA_GITHUB_CLIENT_SECRET',
+        repositorySecret: 'ACME_GITHUB_CLIENT_SECRET',
         declaredByWorkers: ['targets/backend'],
         suppliedByWorkflow: true,
         fetchableLocally: false,

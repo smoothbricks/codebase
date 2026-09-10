@@ -13,10 +13,10 @@
  * Nothing joined them, so a Worker could declare a secret no workflow supplies
  * and no repository holds. That fails at deploy time, on a stage, with a
  * fail-closed message about the value rather than about the missing
- * declaration — which is exactly how Conloca's `pr80` stage refused: its
- * billing Worker declares STRIPE_PUBLISHABLE_KEY, ci.yml passes
- * `secrets.STRIPE_PUBLISHABLE_KEY`, and the repository had no such secret, so
- * the empty value arrived as `publishable_key_mismatch`.
+ * declaration — the shape that costs an afternoon: a Worker declares
+ * `STRIPE_PUBLISHABLE_KEY`, `ci.yml` passes `secrets.STRIPE_PUBLISHABLE_KEY`,
+ * the repository holds no such secret, and the empty value surfaces as the
+ * payment library's own `publishable_key_mismatch` refusal.
  */
 
 import { spawnSync } from 'node:child_process';
@@ -62,7 +62,7 @@ export function reconcileSecrets(sources: SecretSources): SecretRow[] {
   const declaredByAnyWorker: string[] = Object.values(sources.workerSecrets).flatMap((names) => [...names]);
   const names = new Set<string>([...declaredByAnyWorker, ...sources.workflowSecrets, ...sources.localCommands]);
   // A repository secret that already carries a known env name is that name's
-  // row, not a row of its own: listing CONLOCA_GITHUB_CLIENT_SECRET beside
+  // row, not a row of its own: listing ACME_GITHUB_CLIENT_SECRET beside
   // GITHUB_CLIENT_SECRET would report one value as two secrets, one of them
   // permanently "declared by nothing".
   const carriesKnownEnvName = new Set(

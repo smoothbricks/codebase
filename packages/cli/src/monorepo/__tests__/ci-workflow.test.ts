@@ -397,9 +397,9 @@ describe('CI workflow definition', () => {
     for (const sshOrigins of [
       [],
       // scp syntax is not a URL prefix git can rewrite from a Cargo pin.
-      ['forgejo@forge.example.net:axe/minigraf.git'],
+      ['forgejo@forge.example.net:acme/widgets.git'],
       // A path would rewrite one repository, not the forge.
-      ['ssh://forge.example.net:2223/axe/minigraf.git'],
+      ['ssh://forge.example.net:2223/acme/widgets.git'],
       // A password in a declared origin is a secret in package.json.
       ['ssh://forgejo:hunter2@forge.example.net:2223/'],
       ['https://git.example.net/'],

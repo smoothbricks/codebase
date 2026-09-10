@@ -6,9 +6,9 @@
  * GitHub refuses to create a secret whose name starts with `GITHUB_` (hence
  * `RepositorySecretName`'s pattern), which is why a Worker's
  * `GITHUB_CLIENT_SECRET` cannot be stored under its own name. Prefixing with
- * the repository owner is what Conloca already did by hand
- * (`CONLOCA_GITHUB_CLIENT_SECRET`); making it the convention means nothing has
- * to declare it.
+ * the repository owner is the workaround operators already reach for by hand
+ * (`ACME_GITHUB_CLIENT_SECRET` for `acme/app`); making it the convention means
+ * nothing has to declare it.
  */
 
 /** Names GitHub reserves: it rejects `gh secret set GITHUB_*` outright. */
@@ -57,8 +57,8 @@ export function repositorySecretMapping(
 }
 
 /**
- * Repository owner from a repository URL — `conloca` from
- * `https://github.com/conloca/private.git`, and the same for an ssh or forge
+ * Repository owner from a repository URL — `acme` from
+ * `https://github.com/acme/app.git`, and the same for an ssh or forge
  * URL. The owner is derived rather than configured so a fork or a rename
  * carries its own prefix instead of inheriting one.
  */

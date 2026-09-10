@@ -578,7 +578,7 @@ describe('release platform families', () => {
   it('excluding every Apple family renders the single-job Linux publish shape', () => {
     const globs = releasePlatformTargetGlobsFor(['*-macos', '*-linux'], ['*-macos']);
     const rendered = renderPublishWorkflowYaml({
-      repoName: 'axe.sc/axe',
+      repoName: 'acme/app',
       platformTargetGlobs: globs,
       macosPlatformArchitectures: [],
       runsOn: ['nixos-latest-x64', 'self-hosted'],

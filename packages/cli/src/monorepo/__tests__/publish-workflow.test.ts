@@ -103,13 +103,13 @@ describe('publish workflow definition', () => {
 
   it('a private forge release with cross-built Apple targets publishes from one job', () => {
     const rendered = renderPublishWorkflowYaml({
-      repoName: 'axe.sc/axe',
+      repoName: 'acme/app',
       actionsProvider: 'forgejo',
       runsOn: ['nixos-latest-x64', 'self-hosted'],
       platformTargetGlobs: ['*-macos', '*-linux'],
       macosPlatformArchitectures: ['arm64'],
       platformProducer: { kind: 'linux-cross', preflight: 'sh scripts/prepare-macos-sdk.sh', env: { AXE_CROSS: '1' } },
-      privateNpm: { scope: '@axe.sc', readTokenEnv: 'READ_ENV', publishTokenEnv: 'PUBLISH_ENV' },
+      privateNpm: { scope: '@acme', readTokenEnv: 'READ_ENV', publishTokenEnv: 'PUBLISH_ENV' },
     });
 
     // One job: no producer job to hand outputs over from, so no transfer at all.

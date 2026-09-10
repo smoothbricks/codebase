@@ -331,7 +331,7 @@ export const ENTRY_TYPE_BUFFER_SPANS = 23;
 export const ENTRY_TYPE_BUFFER_CAPACITY = 24;
 
 // =============================================================================
-// AxE engine state transitions
+// Consumer engine state transitions
 // =============================================================================
 
 /**
@@ -384,7 +384,7 @@ export const ENTRY_TYPE_NAMES = [
   'buffer-writes', // 22
   'buffer-spans', // 23
   'buffer-capacity', // 24
-  // AxE engine state transitions. Tail-appended: every number above is written
+  // Consumer engine state transitions. Tail-appended: every number above is written
   // into persisted trace rows and generated into Rust `EntryType` discriminants
   // BY INDEX, so inserting mid-table would silently renumber history.
   //
