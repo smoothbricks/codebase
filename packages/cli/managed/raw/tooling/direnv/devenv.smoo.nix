@@ -322,7 +322,12 @@
     #    swaps the SDK a build was compiled against.
     # Nx's fallback includes HOME or TMPDIR, either of which can exceed the
     # Unix socket limit in a checkout. Reuse devenv's short runtime directory,
-    # while preserving an explicit directory supplied by Cowshed or the caller.
+    # which is keyed on this checkout's devenv root and so is one per
+    # workspace. Unconditionally: an inherited value is another workspace's
+    # shell (a shed entered from the host, a second repository from the first,
+    # a subprocess of either), and one socket dir for two workspaces makes the
+    # daemon refuse whichever came second ("received a message from a
+    # different workspace"). Nobody supplies this deliberately.
     (lib.mkBefore ''
       cd "$DEVENV_ROOT/../.."
       export PATH="$("$PWD/tooling/direnv/repo-path")"
@@ -350,7 +355,7 @@
       unset GOROOT
       bun "$DEVENV_ROOT/setup-environment.ts" || exit $?
       eval "$(bun "$DEVENV_ROOT/secret-references.ts" "$PWD")"
-      export NX_SOCKET_DIR="''${NX_SOCKET_DIR:-$DEVENV_RUNTIME/nx}"
+      export NX_SOCKET_DIR="$DEVENV_RUNTIME/nx"
       mkdir -p "$NX_SOCKET_DIR"
       ${lib.optionalString pkgs.stdenv.isDarwin ''
         unset CC CXX
