@@ -42,6 +42,7 @@ direnv users need nothing extra.
 | Locate                  | `cowshed path <ws>`                                                  | Print the live mount path.                                      |
 | Run a command           | `cowshed exec <ws> -- <cmd>`                                         | Execute argv inside the workspace sandbox.                      |
 | Grant host paths        | `cowshed grant <ws> --read <path...> [--write <path...>]`            | Widen filesystem access from the next exec; omit flags to list. |
+| Grant network reach     | `cowshed grant <ws> --egress <host>`                                 | Admit one host through the gateway; separately audited.         |
 | List this project       | `cowshed ls`                                                         | Show its workspaces.                                            |
 | List every project      | `cowshed ls --all`                                                   | Show workspaces store-wide.                                     |
 | Inspect host            | `cowshed doctor`                                                     | Check host and workspace invariants without mutation.           |

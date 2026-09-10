@@ -1130,15 +1130,27 @@ fn required_value(
         .map_err(|_| UsageError::new(format!("--{name} must be valid UTF-8"), usage))
 }
 
-fn appended_values(matches: &ArgMatches, name: &str) -> Vec<String> {
-    matches
-        .get_many::<OsString>(name)
-        .map(|values| {
-            values
-                .filter_map(|value| value.to_str().map(str::to_owned))
-                .collect()
+/// Every occurrence of a repeatable `--flag <value>`, in the order they were typed.
+///
+/// A value that is not UTF-8 is refused rather than skipped: origins, prefixes and methods are
+/// protocol text, and dropping one silently would enrol a narrower scope than the operator
+/// wrote — or grant one host fewer than they asked for — while reporting success.
+fn appended_values(
+    matches: &ArgMatches,
+    name: &str,
+    usage: &'static CommandSpec,
+) -> Result<Vec<String>, UsageError> {
+    let Some(values) = matches.get_many::<OsString>(name) else {
+        return Ok(Vec::new());
+    };
+    values
+        .map(|value| {
+            value
+                .to_str()
+                .map(str::to_owned)
+                .ok_or_else(|| UsageError::new(format!("--{name} must be valid UTF-8"), usage))
         })
-        .unwrap_or_default()
+        .collect()
 }
 
 fn require_workspace(
@@ -1235,7 +1247,7 @@ const CREDENTIAL: CommandSpec = CommandSpec {
     trailing: "",
     summary: "enrol the registry credentials the gateway holds",
     about: &[
-        "A workspace reaches a private registry through the gateway, which attaches a credential the host holds and strips whatever the client sent. Nothing inside a sandbox ever receives the secret, so this command is how the host comes to hold it: `add` writes one scoped record to the platform credential store, `ls`/`status` report which routes exist and whether their credential is installed, and `rm` forgets one.",
+        "A workspace reaches a private registry through the gateway, which attaches a credential the host holds and strips whatever the client sent. Nothing inside a sandbox ever receives the secret, so this command is how the host comes to hold it: `add` writes one scoped record to the platform credential store, `ls`/`status` report which routes exist, the scope each was enrolled with, and whether its credential is installed, and `rm` forgets one.",
         "A record is bound to this project's repository, one exact HTTPS origin with its port, the methods an intercept grant admits, and at least one registry path prefix. The origin is host and port only — the registry's namespace path belongs in `--path-prefix`, which is what keeps the credential from being usable for the whole host.",
         "The secret is named, never typed: `--secret-env` reads a variable from this shell, `--secret-command` runs a helper whose argv comes from the flag, `--secret-stdin` reads a pipe. A non-empty named variable wins and the helper is not run. There is no flag that takes the credential itself, because argv is visible to every process on the host.",
         "Enrolment records the variable NAME it read, and every job in this project then has that name withheld from its environment: a credential the gateway holds has no reason to also travel into a sandbox. Network reach is still a separate, auditable decision — grant it per workspace with `cowshed grant <workspace> --egress <host>`.",
@@ -1285,14 +1297,14 @@ fn parse_credential(matches: &ArgMatches) -> Result<Command, UsageError> {
                 USAGE,
                 "--origin <https://host> is required",
             )?;
-            let path_prefixes = appended_values(child, "path-prefix");
+            let path_prefixes = appended_values(child, "path-prefix", USAGE)?;
             if path_prefixes.is_empty() {
                 return Err(UsageError::new(
                     "at least one --path-prefix is required: a credential without a scope would be usable for the whole host",
                     USAGE,
                 ));
             }
-            let mut methods = appended_values(child, "method");
+            let mut methods = appended_values(child, "method", USAGE)?;
             if methods.is_empty() {
                 methods = DEFAULT_CREDENTIAL_METHODS
                     .iter()
@@ -2032,7 +2044,7 @@ fn parse_grant(matches: &ArgMatches) -> Result<Command, UsageError> {
             .get_many::<PathBuf>("write")
             .map(|paths| paths.cloned().collect())
             .unwrap_or_default(),
-        egress: appended_values(matches, "egress"),
+        egress: appended_values(matches, "egress", USAGE)?,
     }))
 }
 

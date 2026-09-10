@@ -20,7 +20,7 @@ use cowshed_core::storage::host_config::{CredentialRoute, HostConfig};
 use cowshed_core::{CowshedError, Result};
 use cowshed_gateway::{
     CanonicalTarget, CredentialPresence, CredentialProtocol, ScopedCredential,
-    remove_scoped_credential, scoped_credential_presence, store_scoped_credential, validate_scope,
+    remove_scoped_credential, scoped_credential_scope, store_scoped_credential, validate_scope,
 };
 use zeroize::Zeroizing;
 
@@ -149,20 +149,17 @@ async fn report<W: std::io::Write + Send, E: std::io::Write + Send>(
         .iter()
         .filter(|route| route.repo_id == repo_id.as_str())
     {
-        // Presence only: the record is read to prove it decodes and is in scope, and its secret
-        // is dropped without ever entering the report.
-        let installed = matches!(
-            scoped_credential_presence(repo_id.as_str(), PROTOCOL, &route.origin)
-                .await
-                .map_err(scope_error)?,
-            CredentialPresence::Installed
-        );
+        // The record answers with its scope and nothing else: the secret it also carries is
+        // dropped, and zeroed, before this returns.
+        let scope = scoped_credential_scope(repo_id.as_str(), PROTOCOL, &route.origin)
+            .await
+            .map_err(scope_error)?;
         routes.push(CredentialRouteReport {
             repo_id: repo_id.clone(),
             origin: route.origin.clone(),
-            path_prefixes: Vec::new(),
             withheld_env_names: route.secret_env_names.clone(),
-            installed,
+            installed: scope.is_some(),
+            path_prefixes: scope.unwrap_or_default(),
         });
     }
     if json {
@@ -186,6 +183,11 @@ async fn report<W: std::io::Write + Send, E: std::io::Write + Send>(
         output
             .bare_line(format!("{}  {state}", route.origin).as_bytes())
             .map_err(write_error)?;
+        if !route.path_prefixes.is_empty() {
+            output
+                .note(&format!("scope: {}", route.path_prefixes.join(", ")))
+                .map_err(write_error)?;
+        }
         if !route.withheld_env_names.is_empty() {
             output
                 .note(&format!(

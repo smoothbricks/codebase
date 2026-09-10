@@ -119,6 +119,14 @@ CI platform configuration. A valid credential binding includes protocol, exact H
 explicit port), allowed methods, normalized path/package/module prefixes, and project `repo_id` where applicable. A bare
 host-only credential is rejected.
 
+`cowshed credential add|ls|status|rm` is the operator's side of that store, and the only supported way to write one: the
+secret is named (`--secret-env`, `--secret-command`, `--secret-stdin`) rather than typed, travels in a zeroizing buffer,
+and never enters argv, a file, or any diagnostic. Enrolment applies the same validation the gateway applies when reading
+a record, so a binding that could never match is refused while the operator is looking instead of silently never
+attaching. The variable NAME a credential was enrolled from is recorded in host state and withheld from every child of
+that project — a credential the gateway holds has no reason to also reach a sandbox. See
+[cli.md](cli.md#cowshed-credential-addlsstatusrm).
+
 Credential lookup happens only after workspace endpoint and token checks, project admission, CONNECT authority/SNI and
 port agreement, method validation, and path normalization. Client `Authorization`, `Proxy-Authorization`, cookies, and
 protocol token headers are stripped first, so workspace input cannot select or override the credential. Values never

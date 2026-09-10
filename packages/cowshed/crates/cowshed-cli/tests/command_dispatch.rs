@@ -257,6 +257,15 @@ impl CliService for FakeService {
         self.grants.write.extend(delta.write);
         self.grants.write.sort();
         self.grants.write.dedup();
+        // One rule per host, latest spelling wins: the same shape the real grant store keeps,
+        // so what this fake returns is what the CLI would have to render.
+        for rule in delta.egress {
+            self.grants.egress.retain(|held| held.host != rule.host);
+            self.grants.egress.push(rule);
+        }
+        self.grants
+            .egress
+            .sort_by(|left, right| left.host.cmp(&right.host));
         self.grants.revision += 1;
         Ok(self.grants.clone())
     }
@@ -460,8 +469,8 @@ async fn grant_persists_sorted_paths_that_the_next_exec_observes() {
     assert!(stdout.is_empty());
     assert_eq!(
         stderr,
-        b"cowshed: grants for raven now: 2 read, 1 write\n\
-          cowshed: filesystem grants apply from the next exec or shell\n\
+        b"cowshed: grants for raven now: 2 read, 1 write, 0 egress\n\
+          cowshed: grants apply from the next exec or shell\n\
           next: cowshed exec raven -- <retry your command>\n"
     );
 
@@ -471,6 +480,25 @@ async fn grant_persists_sorted_paths_that_the_next_exec_observes() {
         b"read\t/tmp/probe\nread\t/tmp/z\nwrite\t/tmp/output\n"
     );
     assert!(stderr.is_empty());
+
+    // Network reach is a grant like any other, so it is listed and counted. A workspace that
+    // can reach a registry must not answer "nothing granted here".
+    let (_, _, stderr) = run(
+        &mut service,
+        ["grant", "raven", "--egress", "registry.test"],
+    )
+    .await;
+    assert_eq!(
+        stderr,
+        b"cowshed: grants for raven now: 2 read, 1 write, 1 egress\n\
+          cowshed: grants apply from the next exec or shell\n\
+          next: cowshed exec raven -- <retry your command>\n"
+    );
+    let (_, stdout, _) = run(&mut service, ["grant", "raven"]).await;
+    assert_eq!(
+        stdout,
+        b"read\t/tmp/probe\nread\t/tmp/z\nwrite\t/tmp/output\negress\tregistry.test\t443,80\tintercept\n"
+    );
 
     let (_, stdout, stderr) = run(&mut service, ["grant", "raven", "--json"]).await;
     assert!(stderr.is_empty());
