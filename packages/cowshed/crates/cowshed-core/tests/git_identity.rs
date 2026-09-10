@@ -384,9 +384,19 @@ async fn absent_source_identity_is_not_invented_for_a_destination_commit() {
             global: &identity,
         },
     );
+    // Without `user.useConfigOnly` git invents `<user>@<hostname>` wherever the
+    // passwd gecos and a resolvable hostname allow it (hosted macOS runners), so
+    // the refusal would depend on the host, not on the captured identity.
     let output = git_output(
         &dest,
-        ["commit", "-q", "-m", "should not invent identity"],
+        [
+            "-c",
+            "user.useConfigOnly=true",
+            "commit",
+            "-q",
+            "-m",
+            "should not invent identity",
+        ],
         IsolatedGit {
             home: &dest_home,
             global: &identity,
@@ -401,7 +411,8 @@ async fn absent_source_identity_is_not_invented_for_a_destination_commit() {
         stderr.contains("tell me who you are")
             || stderr.contains("empty ident")
             || stderr.contains("user.email")
-            || stderr.contains("can't guess"),
+            || stderr.contains("can't guess")
+            || stderr.contains("auto-detection is disabled"),
         "git must refuse for missing identity, not another reason: {stderr}"
     );
     assert_eq!(
