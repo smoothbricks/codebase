@@ -1033,6 +1033,7 @@ pub(super) fn build_environment(
         .iter()
         .map(|(name, value)| (name.as_str(), value.as_str()))
         .filter(|(name, _)| !BUILD_POLICY.iter().any(|(owned, _)| owned == name))
+        .filter(|(name, _)| crate::workspace_git_fetch::caller_git_environment_allowed(name))
         .chain(BUILD_POLICY)
 }
 
@@ -1052,6 +1053,16 @@ async fn sandboxed_command(
     env: &BTreeMap<String, String>,
 ) -> Result<tokio::process::Command> {
     let private_root = sandbox.workspace_mount.join(".cowshed");
+    // This directory contains controller-published credentials and Git policy. Reject an
+    // inherited symlink before any host-side preparation writes through it.
+    crate::storage::verify_no_symlinks(&sandbox.workspace_mount, &private_root).map_err(
+        |error| {
+            CowshedError::integrity(
+                format!("unsafe workspace metadata directory: {error}"),
+                "repair the workspace metadata directory and reattach",
+            )
+        },
+    )?;
     let private_home = private_root.join("home");
     let private_config = private_root.join("config");
     let private_cache = private_root.join("cache");
@@ -1106,6 +1117,10 @@ async fn sandboxed_command(
     link_cargo_registry(&private_home, &sandbox.home).await?;
     link_nix_cache(&private_cache).await?;
     link_runtime_dir(sandbox, &private_runtime).await?;
+    // Host-side preparation: adopted bindings are controller metadata, not child-readable
+    // files. The Git directory probe runs under the narrower GitDiscovery child profile.
+    // Refresh each spawn so revoked grants and relocated checkouts cannot leave stale routes.
+    let git_fetch_config = crate::workspace_git_fetch::refresh_git_fetch_config(sandbox).await?;
     let path = bootstrap_path(sandbox, devenv_dir)?;
     let port_base = sandbox.port_block.base().to_string();
     let encoded_token = workspace_token.encode();
@@ -1161,6 +1176,29 @@ async fn sandboxed_command(
         .env("https_proxy", &gateway_http)
         .env("NO_PROXY", loopback_no_proxy)
         .env("no_proxy", loopback_no_proxy);
+    // Cargo only honors url.insteadOf through the Git CLI, so every child
+    // fetches through it; uv shells out to Git and follows the same include
+    // with no extra wiring. The include points at the managed file
+    // regenerated above, layered over the isolated GLOBAL=/dev/null — no
+    // user or system configuration is read or modified. With no mapping the
+    // count is pinned to zero so caller-supplied GIT_CONFIG_KEY_* entries
+    // cannot smuggle configuration in.
+    command.env(
+        crate::workspace_git_fetch::CARGO_NET_GIT_FETCH_WITH_CLI_ENV,
+        crate::workspace_git_fetch::CARGO_NET_GIT_FETCH_WITH_CLI_VALUE,
+    );
+    match &git_fetch_config {
+        Some(path) => {
+            for (key, value) in crate::workspace_git_fetch::git_fetch_include_env(path) {
+                command.env(key, value);
+            }
+        }
+        None => {
+            command.env("GIT_CONFIG_COUNT", "0");
+            command.env_remove("GIT_CONFIG_KEY_0");
+            command.env_remove("GIT_CONFIG_VALUE_0");
+        }
+    }
     for key in ["LANG", "LC_ALL", "LC_CTYPE", "TERM", "COLORTERM"] {
         if let Some(value) = std::env::var_os(key) {
             command.env(key, value);
@@ -4064,6 +4102,39 @@ mod sandbox_environment_tests {
                 ("SCCACHE_BASEDIR_CWD".to_owned(), "1".to_owned()),
             ])
         );
+    }
+
+    #[test]
+    fn caller_config_parameters_cannot_bypass_the_managed_git_include() {
+        let root = scratch("git-environment-injection");
+        let injected = [("GIT_CONFIG_PARAMETERS", "'cowshed.injected=unsafe'")];
+        let run = |environment: BTreeMap<String, String>| {
+            std::process::Command::new("/usr/bin/git")
+                .args(["config", "--get", "cowshed.injected"])
+                .current_dir(&root)
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .envs(environment)
+                .output()
+                .expect("git config")
+        };
+        let control = run(injected
+            .iter()
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect());
+        assert!(
+            control.status.success(),
+            "negative control must inject a real Git setting"
+        );
+        let protected = run(built(&injected));
+        assert_eq!(
+            protected.status.code(),
+            Some(1),
+            "caller injection must not reach Git"
+        );
+        std::fs::remove_dir_all(root).expect("cleanup");
     }
 
     /// The gateway decodes the token to exactly 32 bytes before it authenticates a CONNECT, so

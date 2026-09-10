@@ -34,7 +34,7 @@ use crate::workspace_credentials::{
     GatewayWorkspaceCredentials, WorkspaceCredentialError, read_gateway_workspace_credentials,
 };
 
-const MAX_BINDING_BYTES: u64 = 1024 * 1024;
+pub(crate) const MAX_BINDING_BYTES: u64 = 1024 * 1024;
 const UNRESOLVED_CHECKOUT_PATH: &str = ".unresolved-main-mount";
 
 /// Complete controller-authoritative input for installing one gateway workspace session.
@@ -1267,21 +1267,28 @@ fn binding_path_exists(path: &Path) -> Result<bool, GatewayInventoryError> {
     }
 }
 
-fn read_typed_json_nofollow<T: serde::de::DeserializeOwned>(
+pub(crate) fn read_typed_json_nofollow<T: serde::de::DeserializeOwned>(
     path: &Path,
     maximum: u64,
 ) -> Result<T, String> {
+    let bytes = read_bytes_nofollow(path, maximum)?;
+    serde_json::from_slice(&bytes).map_err(|error| error.to_string())
+}
+
+/// Bounded private-file admission shared by typed controller metadata and generated Git policy.
+pub(crate) fn read_bytes_nofollow(path: &Path, maximum: u64) -> Result<Vec<u8>, String> {
     let mut options = OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
-        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        // Regular files ignore O_NONBLOCK; a substituted FIFO must not block before fstat.
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
     }
     let file = options.open(path).map_err(|error| error.to_string())?;
     let metadata = file.metadata().map_err(|error| error.to_string())?;
     if !metadata.file_type().is_file() || metadata.len() > maximum {
-        return Err("typed JSON file is not regular or exceeds its size bound".to_owned());
+        return Err("private file is not regular or exceeds its size bound".to_owned());
     }
     #[cfg(unix)]
     {
@@ -1289,7 +1296,7 @@ fn read_typed_json_nofollow<T: serde::de::DeserializeOwned>(
         if metadata.uid() != crate::gateway_sessions::effective_uid()
             || metadata.permissions().mode() & 0o077 != 0
         {
-            return Err("typed JSON file is not controller-owned mode 0600".to_owned());
+            return Err("private file is not controller-owned mode 0600".to_owned());
         }
     }
     let capacity = usize::try_from(metadata.len()).map_err(|error| error.to_string())?;
@@ -1298,12 +1305,12 @@ fn read_typed_json_nofollow<T: serde::de::DeserializeOwned>(
         .read_to_end(&mut bytes)
         .map_err(|error| error.to_string())?;
     if bytes.len() as u64 > maximum {
-        return Err("typed JSON file exceeds its size bound".to_owned());
+        return Err("private file exceeds its size bound".to_owned());
     }
-    serde_json::from_slice(&bytes).map_err(|error| error.to_string())
+    Ok(bytes)
 }
 
-fn authoritative_checkout_path(
+pub(crate) fn authoritative_checkout_path(
     layout: &StorageLayout,
     repo: &RepoId,
 ) -> Result<Option<PathBuf>, GatewayInventoryError> {

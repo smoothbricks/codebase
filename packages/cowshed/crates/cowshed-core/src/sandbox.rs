@@ -39,6 +39,9 @@ pub enum RunSandboxMode {
 pub enum SandboxProfileRole {
     TrustedSupervisor,
     ExecutedChild,
+    /// Controller-invoked Git directory discovery needs only system roots and explicit
+    /// readable trees, not the child toolchain's ambient file-read-data permission.
+    GitDiscovery,
 }
 
 /// The canonical entry point to a multi-user Nix installation's daemon socket.
@@ -365,7 +368,12 @@ pub fn seatbelt_profile(
     // Hard-link creation is a separate SBPL operation from file-write*.
     // Keep aliases unavailable to both authority tiers.
     push_line(&mut profile, "(deny file-link)");
-    push_line(&mut profile, "(allow file-read-data (subpath \"/\"))");
+    if role != SandboxProfileRole::GitDiscovery {
+        push_line(&mut profile, "(allow file-read-data (subpath \"/\"))");
+    } else {
+        // Git's isolated global configuration is the empty device, not user HOME.
+        push_literal_rule(&mut profile, "allow file-read*", Path::new("/dev/null"))?;
+    }
     // Directory metadata is distinct from file-read-data in Seatbelt. Toolchain
     // launchers (notably /usr/bin/git -> xcrun) must traverse their immutable
     // system roots without gaining metadata access to the user's home.
@@ -611,6 +619,7 @@ pub fn seatbelt_profile(
         crate::workspace_credentials::CA_CERTIFICATE_PATH,
         crate::workspace_credentials::WORKSPACE_TOKEN_PATH,
         crate::workspace_environment::WORKSPACE_ENVIRONMENT_PATH,
+        crate::workspace_git_fetch::WORKSPACE_GIT_FETCH_CONFIG_PATH,
     ] {
         push_literal_rule(
             &mut profile,
@@ -625,7 +634,7 @@ pub fn seatbelt_profile(
             // carve-back, including when the repository itself is read-only.
             push_exact_and_subpath_rule(&mut profile, "allow file-write*", &job_artifacts)?;
         }
-        SandboxProfileRole::ExecutedChild => {
+        SandboxProfileRole::ExecutedChild | SandboxProfileRole::GitDiscovery => {
             // These terminal rules are emitted after every configurable or broad
             // allow. Denying create/unlink at the metadata directory itself
             // prevents replacing or renaming that ancestor without blocking
@@ -1404,6 +1413,10 @@ mod tests {
         fs::create_dir_all(&config.home).unwrap();
         fs::create_dir_all(&config.exec_temp_dir).unwrap();
         fs::create_dir_all(&protected).unwrap();
+        let git_config = crate::workspace_git_fetch::git_fetch_config_path(&config.workspace_mount);
+        fs::write(&git_config, b"controller mapping\n").unwrap();
+        let git_alias = config.workspace_mount.join("git-config-alias");
+        std::os::unix::fs::symlink(&git_config, &git_alias).unwrap();
 
         let supervisor = seatbelt_profile(&config, SandboxProfileRole::TrustedSupervisor).unwrap();
         let child = seatbelt_profile(&config, SandboxProfileRole::ExecutedChild).unwrap();
@@ -1436,6 +1449,31 @@ mod tests {
             .stderr(Stdio::null())
             .status()
             .unwrap();
+
+        for path in [&git_config, &git_alias] {
+            let write = std::process::Command::new("/usr/bin/sandbox-exec")
+                .args(["-p", &child, "--", "/usr/bin/tee"])
+                .arg(path)
+                .stdin(Stdio::null())
+                .output()
+                .unwrap();
+            assert!(
+                !write.status.success(),
+                "child must not truncate {}",
+                path.display()
+            );
+        }
+        let replace_parent = std::process::Command::new("/usr/bin/sandbox-exec")
+            .args(["-p", &child, "--", "/bin/mv"])
+            .arg(config.workspace_mount.join(".cowshed"))
+            .arg(config.workspace_mount.join("moved-metadata"))
+            .output()
+            .unwrap();
+        assert!(
+            !replace_parent.status.success(),
+            "child must not replace the protected mapping's ancestor"
+        );
+        assert_eq!(fs::read(&git_config).unwrap(), b"controller mapping\n");
 
         fs::remove_dir_all(&root).unwrap();
         assert!(supervisor_write.success());
