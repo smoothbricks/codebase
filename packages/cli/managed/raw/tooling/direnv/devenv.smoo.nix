@@ -354,7 +354,15 @@
       export GOFLAGS="''${GOFLAGS:--trimpath}"
       unset GOROOT
       bun "$DEVENV_ROOT/setup-environment.ts" || exit $?
-      export NX_SOCKET_DIR="$DEVENV_RUNTIME/nx"
+      # One socket dir per Nx workspace. DEVENV_RUNTIME is keyed to the devenv
+      # ROOT, so every workspace sharing one devenv - a sibling repository, a
+      # copy-on-write clone, a scratch workspace created inside this shell -
+      # would land on one socket. The first daemon to claim it then refuses
+      # every message from the others ("received a message from a different
+      # workspace"), which reads as a hung Nx in a workspace that did nothing
+      # wrong. Nx's own diagnostic names this exact cause.
+      nx_workspace_root="$(cd "$DEVENV_ROOT/../.." >/dev/null 2>&1 && pwd || printf '%s' "$PWD")"
+      export NX_SOCKET_DIR="$DEVENV_RUNTIME/nx-$(printf '%s' "$nx_workspace_root" | cksum | cut -d' ' -f1)"
       mkdir -p "$NX_SOCKET_DIR"
       ${lib.optionalString pkgs.stdenv.isDarwin ''
         unset CC CXX
