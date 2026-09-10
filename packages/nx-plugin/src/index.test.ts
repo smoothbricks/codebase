@@ -692,6 +692,16 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       // its tests load the artifact `napi-debug` writes into `target/debug`.
       expect(native['cargo-test-native-napi']?.dependsOn).toEqual([rootFetch, rootArchive, 'napi-debug']);
       expect(native['napi-debug']?.dependsOn).toContainEqual(rootCompile);
+      // The addon depends on the package's napi block and the napi CLI's version,
+      // never on the package version or the whole lockfile: a release bumps both
+      // before it builds, and that must not recompile the native code.
+      const napiInputs = native['napi-debug']?.inputs ?? [];
+      expect(napiInputs).toContainEqual({ externalDependencies: ['@napi-rs/cli'] });
+      expect(
+        napiInputs.some((input) => typeof input === 'object' && 'runtime' in input && input.runtime.includes('.napi')),
+      ).toBe(true);
+      expect(napiInputs).not.toContain('{workspaceRoot}/bun.lock');
+      expect(napiInputs.some((input) => typeof input === 'string' && input.endsWith('/package.json'))).toBe(false);
       expect(native['napi-debug']?.options).toMatchObject({
         cwd: '.',
         command:
@@ -891,16 +901,15 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
 
       const targets = await inferProjectTargets(workspace, 'packages/git-do/package.json');
 
+      // A release bumps package.json and the lockfile before it builds; neither
+      // is part of a wasm artifact, so neither may be an input.
+      expect(targets['cargo-wasm']?.inputs).not.toContain('{projectRoot}/package.json');
+      expect(targets['cargo-wasm']?.inputs).not.toContain('{workspaceRoot}/bun.lock');
       expect(targets['cargo-wasm']).toMatchObject({
         executor: 'nx:run-commands',
         cache: true,
         dependsOn: ['cargo-fetch', '^build'],
-        inputs: expect.arrayContaining([
-          '{projectRoot}/**/*.rs',
-          '{projectRoot}/**/Cargo.toml',
-          '{projectRoot}/package.json',
-          '{workspaceRoot}/bun.lock',
-        ]),
+        inputs: expect.arrayContaining(['{projectRoot}/**/*.rs', '{projectRoot}/**/Cargo.toml']),
         outputs: ['{projectRoot}/generated/wasm'],
         options: {
           commands: [
