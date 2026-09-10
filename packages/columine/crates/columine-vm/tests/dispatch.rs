@@ -794,7 +794,7 @@ fn run_scatter_one(vm: &mut Vm, state: &mut [u8], prog: &[u8], type_id: u32, key
 }
 
 #[test]
-fn probe_scatter_apply_datom_parity_across_kinds_and_skip() {
+fn probe_scatter_apply_parity_across_kinds_and_skip() {
     const T: u32 = 2002;
     const SKIP: u32 = 0xFFFF_FFFF;
     let prog = build_probe_scatter_program(T);
@@ -1020,7 +1020,7 @@ fn probe_scatter_kind0_retract_clear_then_rollback_restores_value_and_bit() {
 // STRUCT_MAP_SCATTER 0x3e — probe-free attribute-routed dispatch ()
 // =============================================================================
 
-/// One resolved datom element of a `BATCH_STRUCT_MAP_SCATTER` batch.
+/// One resolved element of a `BATCH_STRUCT_MAP_SCATTER` batch.
 /// Columns: 0=type(FOR_EACH filter), 1=offsets(FLAT_MAP child), 2=route(u32),
 /// 3=op(u32), 4=key(u32), 5=v_str(interned u32), 6=v_num(f64),
 /// 7=v_set(interned composite u32).
@@ -1095,9 +1095,9 @@ fn run_struct_scatter(
 }
 
 /// The 0x2f parity fixture replayed through the probe-free opcode: same
-/// datoms, same final slots, no staged row materialized anywhere.
+/// elements, same final slots, no staged row materialized anywhere.
 #[test]
-fn struct_scatter_apply_datom_parity_across_kinds_and_skip() {
+fn struct_scatter_apply_parity_across_kinds_and_skip() {
     const T: u32 = 2102;
     let prog = build_struct_map_scatter_program(T);
     let mut state = init(&prog);
