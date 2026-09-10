@@ -326,6 +326,15 @@
     (lib.mkBefore ''
       cd "$DEVENV_ROOT/../.."
       export PATH="$("$PWD/tooling/direnv/repo-path")"
+      # devenv enters the shell with TMPDIR unset (not empty) on every platform.
+      # Tools then fall back to /tmp, which on Darwin is not the per-user
+      # temporary directory the OS hands out, and a test that asserts the
+      # parent carries TMPDIR (so its env_clear check means something) fails in
+      # the shell and passes outside it. Ask the OS; an explicit value wins.
+      if [ -z "''${TMPDIR:-}" ]; then
+        TMPDIR="$(getconf DARWIN_USER_TEMP_DIR 2>/dev/null || true)"
+        export TMPDIR="''${TMPDIR:-/tmp}"
+      fi
       export TTSC_TSGO_BINARY="$PWD/node_modules/@typescript/native/bin/tsc"
       if [ -d "$HOME/.cowshed/caches" ]; then
         export TTSC_CACHE_DIR="''${TTSC_CACHE_DIR:-$HOME/.cowshed/caches/ttsc}"
