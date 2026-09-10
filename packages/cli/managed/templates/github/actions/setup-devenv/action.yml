@@ -109,6 +109,11 @@ runs:
     # stable path (a symlink would not do: Nix canonicalises) and devenv is
     # evaluated from there; every later step still runs in the checkout, which
     # is the same tree. DEVENV_WORKDIR names the path the devenv steps use.
+    # The mount target is the instance's own /work, not the shared bind: only
+    # the path's spelling must be stable, and a bind onto the idmapped cache
+    # dataset failed inside the job (move_mount: ENOENT) where a container-fs
+    # target does not. If the mount is refused the job goes on from the
+    # checkout and pays the evaluation: this is an optimisation, never a gate.
     - name: 📂 Locate devenv state on the shared bind
       if: steps.runner-kind.outputs.host == 'true'
       shell: bash
@@ -119,13 +124,19 @@ runs:
       run: |
         lane=$(printf '%s' "$DEVENV_STATE_LANE" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9._-' '-')
         root="/var/cache/ci/devenv/$DEVENV_STATE_REPO/${lane:-default}/$DEVENV_STATE_JOB"
-        mkdir -p "$root/.devenv" "$root/.direnv" "$root/workspace"
-        sudo mount --bind "$GITHUB_WORKSPACE" "$root/workspace"
+        mkdir -p "$root/.devenv" "$root/.direnv"
         rm -rf tooling/direnv/.devenv tooling/direnv/.direnv
         ln -s "$root/.devenv" tooling/direnv/.devenv
         ln -s "$root/.direnv" tooling/direnv/.direnv
-        echo "DEVENV_WORKDIR=$root/workspace" >> "$GITHUB_ENV"
-        echo "devenv state: $root (workspace bind-mounted at $root/workspace)"
+        stable="/work/$DEVENV_STATE_REPO/${lane:-default}/$DEVENV_STATE_JOB"
+        if mkdir -p "$stable" && sudo mount --bind "$GITHUB_WORKSPACE" "$stable"; then
+          echo "DEVENV_WORKDIR=$stable" >> "$GITHUB_ENV"
+          echo "devenv state: $root (workspace bind-mounted at $stable)"
+        else
+          echo "DEVENV_WORKDIR=$GITHUB_WORKSPACE" >> "$GITHUB_ENV"
+          echo "::warning::stable devenv path unavailable (bind mount refused); evaluating from the checkout"
+          echo "devenv state: $root (workspace at $GITHUB_WORKSPACE)"
+        fi
 
     - name: 📂 Devenv runs in the checkout
       if: steps.runner-kind.outputs.host != 'true'
