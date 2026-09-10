@@ -94,11 +94,19 @@ and environment inputs outside the Rust/Cargo inputs above still require explici
 
 A release rewrites `version` in every package manifest it publishes and in the lockfile entries mirroring them. Those
 files are inputs of `lint`, `typecheck` and `typecheck-tests`, so a publish run misses the cache for the whole gate set
-over a change that alters no code. Those three targets therefore hash the manifests through `smoo-nx-manifest-hash`,
-which removes only a manifest's own version — `package.json#version`, `[package].version`,
-`[workspace.package].version`, and each lockfile member's `version` — and leave the raw files out of their filesets.
-Everything else still counts: a dependency range, an export map, a `version` naming a *different* crate under a
-dependency table, and a manifest the command cannot parse (hashed raw rather than dropped).
+over a change that alters no code. Those three targets therefore leave the raw manifests out of their filesets and hash
+them by field instead: a `json` input with `excludeFields` for `package.json#version`, and one dropping the lockfile's
+`workspaces` section, which is only the mirror of each member's own manifest. Nx hashes both in its native hasher, so
+this costs no process. Everything else still counts: a dependency range, an export map, and the lockfile's resolution
+table.
+
+Crate manifests are the one kind Nx cannot hash by field, because TOML has no such input. They go through
+`smoo-nx-manifest-hash`, which removes `[package].version` and `[workspace.package].version` and nothing else — a
+`version` naming a *different* crate under a dependency table stays in the digest, and a manifest the command cannot
+parse is hashed raw rather than dropped. A `runtime` input is a process spawn per project per graph computation, and Nx
+re-runs an identical command string two to three times rather than memoizing it (measured: 30–39 spawns and +18% wall
+time on a fully-cached run when every project declared one), so the plugin declares it only for projects that actually
+carry a `Cargo.toml`.
 
 Targets that produce a shipped artifact keep hashing the raw manifests. A crate embeds its version at compile time
 through `env!("CARGO_PKG_VERSION")`, so a version-insensitive `build`, `pack`, `tsc-js` or cargo hash would let a
@@ -115,10 +123,11 @@ plugin does not infer a definition to resolve:
 }
 ```
 
-Without it the dependency half stays `^production`; without the command installed the targets keep today's inputs
-entirely. Both fallbacks cost cache hits and never trade away invalidation, because Nx runs a `runtime` input without
-reporting a failing one — a fileset that excluded the manifests with no digest replacing them would serve stale results
-silently.
+Without it the dependency half stays `^production`. On an Nx older than 23.2, which rejects a `json` input rather than
+ignoring it, the targets keep today's inputs entirely; the same is true of crate manifests when the command is not
+installed. Every fallback costs cache hits and never trades away invalidation, because Nx runs a `runtime` input
+without reporting a failing one — a fileset that excluded a manifest with no digest replacing it would serve stale
+results silently.
 
 ## Nx Target Naming
 

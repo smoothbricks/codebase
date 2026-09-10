@@ -192,6 +192,8 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         '{workspaceRoot}/patches/**/*',
         '{workspaceRoot}/tsconfig.base.json',
       ];
+      // An emit is a shipped artifact: it hashes the raw manifests, so a
+      // version bump reruns it rather than restoring a stale one.
       expect(targets['tsc-js']?.inputs).toEqual([
         'production',
         '^production',
@@ -203,10 +205,16 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         command: 'tsc -p tsconfig.lib.json --noEmit',
         cwd: 'packages/example',
       });
+      const checkToolchainInputs = [
+        '{workspaceRoot}/patches/**/*',
+        '{workspaceRoot}/tsconfig.base.json',
+        { json: '{workspaceRoot}/package.json', excludeFields: ['version'] },
+        { json: '{workspaceRoot}/bun.lock', excludeFields: ['workspaces'] },
+      ];
       expect(targets.typecheck?.inputs).toEqual([
-        'production',
+        'versionlessProduction',
         '^production',
-        ...toolchainInputs,
+        ...checkToolchainInputs,
         '{projectRoot}/tsconfig.lib.json',
       ]);
       expect(targets.build?.executor).toBe('nx:noop');
@@ -229,9 +237,9 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         cwd: 'packages/example',
       });
       expect(targets['typecheck-tests']?.inputs).toEqual([
-        'default',
+        'versionlessDefault',
         '^production',
-        ...toolchainInputs,
+        ...checkToolchainInputs,
         '{projectRoot}/tsconfig.test.json',
       ]);
 
@@ -269,18 +277,28 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         namedInputs: { versionlessProduction: ['production'] },
       });
       const targets = project?.targets ?? {};
-      const projectDigest = { runtime: `node node_modules/${MANIFEST_HASH_BIN_PATH} 'packages/example'` };
-      const workspaceDigest = { runtime: `node node_modules/${MANIFEST_HASH_BIN_PATH} --workspace` };
-      const checkToolchain = ['{workspaceRoot}/patches/**/*', '{workspaceRoot}/tsconfig.base.json', workspaceDigest];
+      const checkToolchain = [
+        '{workspaceRoot}/patches/**/*',
+        '{workspaceRoot}/tsconfig.base.json',
+        // Hashed by Nx itself: a `json` input costs no process, unlike the
+        // `runtime` command the crate manifests still need.
+        { json: '{workspaceRoot}/package.json', excludeFields: ['version'] },
+        { json: '{workspaceRoot}/bun.lock', excludeFields: ['workspaces'] },
+      ];
 
+      // No crate manifest in this project, so no hash command is declared at
+      // all — the cost stays proportional to the crates it covers.
       expect(project?.namedInputs).toEqual({
         versionlessProduction: [
           'production',
           '!{projectRoot}/package.json',
-          '!{projectRoot}/**/Cargo.toml',
-          projectDigest,
+          { json: '{projectRoot}/package.json', excludeFields: ['version'] },
         ],
-        versionlessDefault: ['default', '!{projectRoot}/package.json', '!{projectRoot}/**/Cargo.toml', projectDigest],
+        versionlessDefault: [
+          'default',
+          '!{projectRoot}/package.json',
+          { json: '{projectRoot}/package.json', excludeFields: ['version'] },
+        ],
       });
       expect(targets.typecheck?.inputs).toEqual([
         'versionlessProduction',
@@ -329,6 +347,30 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
     }
   });
 
+  it('hashes crate manifests through a command, only where crates exist', async () => {
+    const workspace = await createWorkspace();
+    try {
+      await workspace.write('packages/rust/package.json', '{"name":"rust-example"}\n');
+      await workspace.write('packages/rust/tsconfig.lib.json', '{}\n');
+      await workspace.write('packages/rust/Cargo.toml', '[package]\nname = "rust-example"\nversion = "0.1.0"\n');
+      await workspace.write(`node_modules/${MANIFEST_HASH_BIN_PATH}`, '#!/usr/bin/env node\n');
+
+      const project = await inferProjectWithNxJson(workspace, 'packages/rust/package.json', {});
+
+      // TOML has no `json` input, so this is the one manifest kind that costs a
+      // spawn — and `bun`, not `node`, for a third of the startup.
+      expect(project?.namedInputs?.versionlessProduction).toEqual([
+        'production',
+        '!{projectRoot}/package.json',
+        { json: '{projectRoot}/package.json', excludeFields: ['version'] },
+        '!{projectRoot}/**/Cargo.toml',
+        { runtime: `bun node_modules/${MANIFEST_HASH_BIN_PATH} 'packages/rust'` },
+      ]);
+    } finally {
+      await workspace.cleanup();
+    }
+  });
+
   it('keeps the dependency half raw until the workspace defines the named input', async () => {
     const workspace = await createWorkspace();
     try {
@@ -347,7 +389,8 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         '^production',
         '{workspaceRoot}/patches/**/*',
         '{workspaceRoot}/tsconfig.base.json',
-        { runtime: `node node_modules/${MANIFEST_HASH_BIN_PATH} --workspace` },
+        { json: '{workspaceRoot}/package.json', excludeFields: ['version'] },
+        { json: '{workspaceRoot}/bun.lock', excludeFields: ['workspaces'] },
         '{projectRoot}/tsconfig.lib.json',
       ]);
     } finally {
