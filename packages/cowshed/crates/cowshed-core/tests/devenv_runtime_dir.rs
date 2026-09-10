@@ -1,6 +1,8 @@
 //! Real shell activation through SystemSpawnSink and the executed-child Seatbelt profile.
 //! Minimal .envrc fixtures exercise exports, executable lookup, private authority, and the
 //! runtime/temp directories without Nix evaluation or a stand-in development environment.
+//! Kernel-profile probes run in the host-controller lane: an enclosing workspace
+//! sandbox cannot grant the fixture supervisor its independently declared authority.
 
 #![cfg(target_os = "macos")]
 
@@ -95,7 +97,8 @@ fn workspace(root: &Path, port_base: u16) -> SandboxConfig {
 }
 
 #[tokio::test]
-async fn shell_activation_owns_a_runtime_directory_the_profile_lets_it_write() {
+#[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
+async fn host_controller_shell_activation_owns_a_runtime_directory_the_profile_lets_it_write() {
     let root = scratch("devenv-runtime");
     let sandbox = workspace(&root, 40_960);
     install_real_tool(&sandbox, "direnv");
@@ -225,7 +228,8 @@ fn install_real_tool(sandbox: &SandboxConfig, name: &str) {
 }
 
 #[tokio::test]
-async fn nx_runtime_directory_supports_real_unix_socket_roundtrips() {
+#[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
+async fn host_controller_nx_runtime_directory_supports_real_unix_socket_roundtrips() {
     let root = scratch("nx-socket");
     let sandbox = workspace(&root, 41_056);
     install_real_tool(&sandbox, "node");
@@ -260,7 +264,8 @@ server.listen(path, () => {
 }
 
 #[tokio::test]
-async fn proxy_aware_client_reaches_an_allocated_loopback_service() {
+#[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
+async fn host_controller_proxy_aware_client_reaches_an_allocated_loopback_service() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let root = scratch("loopback-http");
@@ -313,7 +318,8 @@ async fn proxy_aware_client_reaches_an_allocated_loopback_service() {
 }
 
 #[tokio::test]
-async fn proxy_bypass_does_not_admit_unallocated_loopback_ports() {
+#[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
+async fn host_controller_proxy_bypass_does_not_admit_unallocated_loopback_ports() {
     let root = scratch("loopback-denial");
     let listener =
         std::net::TcpListener::bind(("127.0.0.1", 0)).expect("unallocated HTTP listener");
@@ -411,7 +417,8 @@ async fn run_in_sandbox(
 }
 
 #[tokio::test]
-async fn shell_activation_preserves_environment_path_cwd_argv_and_private_home() {
+#[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
+async fn host_controller_shell_activation_preserves_environment_path_cwd_argv_and_private_home() {
     let root = scratch("shell-activation");
     let sandbox = workspace(&root, 40_976);
     install_real_tool(&sandbox, "direnv");
@@ -503,7 +510,8 @@ fi
 }
 
 #[tokio::test]
-async fn shell_activation_failure_prevents_command_execution() {
+#[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
+async fn host_controller_shell_activation_failure_prevents_command_execution() {
     let root = scratch("shell-activation-failure");
     let sandbox = workspace(&root, 40_992);
     install_real_tool(&sandbox, "direnv");
@@ -541,7 +549,8 @@ async fn shell_activation_failure_prevents_command_execution() {
 }
 
 #[tokio::test]
-async fn shell_activation_selects_nearest_workspace_envrc() {
+#[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
+async fn host_controller_shell_activation_selects_nearest_workspace_envrc() {
     let root = scratch("shell-activation-nearest");
     let sandbox = workspace(&root, 41_008);
     install_real_tool(&sandbox, "direnv");
@@ -584,7 +593,9 @@ async fn shell_activation_selects_nearest_workspace_envrc() {
 }
 
 #[tokio::test]
-async fn shell_activation_does_not_authorize_or_load_an_envrc_outside_the_workspace() {
+#[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
+async fn host_controller_shell_activation_does_not_authorize_or_load_an_envrc_outside_the_workspace()
+ {
     let root = scratch("shell-activation-boundary");
     let sandbox = workspace(&root, 41_024);
     install_real_tool(&sandbox, "direnv");
@@ -661,7 +672,8 @@ async fn configured_missing_devenv_fails_before_command_execution() {
 }
 
 #[tokio::test]
-async fn native_file_watching_observes_allowed_updates_without_private_paths() {
+#[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
+async fn host_controller_native_file_watching_observes_allowed_updates_without_private_paths() {
     let root = scratch("native-file-watching");
     let mut sandbox = workspace(&root, 41_072);
     install_real_tool(&sandbox, "node");

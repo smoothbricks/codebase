@@ -256,6 +256,25 @@
           "verify-packaging"
         ]
       },
+      "host-controller-test": {
+        "executor": "@smoothbricks/nx-plugin:bounded-exec",
+        "cache": false,
+        "dependsOn": [
+          {
+            "target": "cargo-test-compile",
+            "projects": [
+              "@smoothbricks/codebase"
+            ]
+          }
+        ],
+        "options": {
+          "comment": "Run from an unsandboxed host-controller shell, never cowshed exec: controller fixtures require file-link, deliberately denied to every workspace supervisor and child. This mandatory target runs only ignored host_controller_ tests across core and CLI, without relaxing that boundary or mutating installed host services.",
+          "command": "bun packages/cowshed/scripts/host-controller-test.ts",
+          "cwd": ".",
+          "timeoutMs": 120000,
+          "killAfterMs": 10000
+        }
+      },
       "integration-apfs": {
         "executor": "nx:run-commands",
         "cache": false,

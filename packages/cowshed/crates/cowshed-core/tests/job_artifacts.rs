@@ -552,16 +552,68 @@ fn redirect_sealing_uses_owned_descriptor_and_reads_only_independent_artifact() 
         let source_metadata = fs::metadata(root.path().join(source.as_path())).unwrap();
         let protected_metadata = fs::metadata(root.path().join(".cowshed/job/1/out")).unwrap();
         assert_ne!(source_metadata.ino(), protected_metadata.ino());
-        fs::hard_link(
-            root.path().join(".cowshed/job/1/out"),
-            root.path().join("workspace-alias"),
-        )
-        .unwrap();
-        assert!(matches!(
-            read_stream(root.path(), &sealed.record.stdout).unwrap_err(),
-            ArtifactError::Integrity { .. }
-        ));
     }
+}
+
+#[cfg(unix)]
+#[test]
+#[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
+fn host_controller_redirect_artifact_rejects_planted_hardlink_alias() {
+    use std::os::fd::AsRawFd;
+
+    let root = TempRoot::new("redirect-hardlink");
+    let source = WorkspacePath::new("build/live.log").unwrap();
+    fs::create_dir_all(root.path().join("build")).unwrap();
+    let descriptor = OpenOptions::new()
+        .create_new(true)
+        .read(true)
+        .write(true)
+        .open(root.path().join(source.as_path()))
+        .unwrap();
+    let redirect_fd = descriptor.as_raw_fd();
+    assert_eq!(
+        unsafe { libc::fcntl(redirect_fd, libc::F_SETFD, 0) },
+        0,
+        "clear the standard library's default close-on-exec flag"
+    );
+    let mut store = store(
+        root.path(),
+        ArtifactConfig {
+            inline_cap_bytes: 2,
+            supervisor_buffer_budget_bytes: 2,
+            combined_output_quota_bytes: 100,
+            ..ArtifactConfig::default()
+        },
+    );
+    let token = begin(
+        &mut store,
+        1,
+        OutputTargets {
+            stdout: StreamTarget::Redirect {
+                source: source.clone(),
+                descriptor,
+            },
+            stderr: StreamTarget::Captured,
+        },
+    );
+    store
+        .append(&token, StreamKind::Stdout, b"protected")
+        .unwrap();
+    let sealed = store.finish(token, JobState::Exited).unwrap();
+    assert_eq!(
+        read_stream(root.path(), &sealed.record.stdout).unwrap(),
+        b"protected"
+    );
+    fs::hard_link(
+        root.path().join(".cowshed/job/1/out"),
+        root.path().join("workspace-alias"),
+    )
+    .unwrap();
+    let error = read_stream(root.path(), &sealed.record.stdout).unwrap_err();
+    assert!(matches!(
+        error,
+        ArtifactError::Integrity { message, .. } if message.contains("hardlink aliases")
+    ));
 }
 
 #[test]
@@ -978,7 +1030,6 @@ fn verified_file_rejects_each_metadata_length_and_hash_violation() {
     #[derive(Clone, Copy, Debug)]
     enum Mutation {
         WritableMode,
-        Hardlink,
         Truncated,
         Extended,
         SameLengthHash,
@@ -988,7 +1039,6 @@ fn verified_file_rejects_each_metadata_length_and_hash_violation() {
 
     for mutation in [
         Mutation::WritableMode,
-        Mutation::Hardlink,
         Mutation::Truncated,
         Mutation::Extended,
         Mutation::SameLengthHash,
@@ -1024,9 +1074,6 @@ fn verified_file_rejects_each_metadata_length_and_hash_violation() {
         match mutation {
             Mutation::WritableMode => {
                 fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
-            }
-            Mutation::Hardlink => {
-                fs::hard_link(&path, root.path().join("protected-alias")).unwrap();
             }
             Mutation::Truncated => {
                 fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
@@ -1078,10 +1125,6 @@ fn verified_file_rejects_each_metadata_length_and_hash_violation() {
                 ),
                 "{mutation:?}: {error:?}"
             ),
-            Mutation::Hardlink => assert!(matches!(
-                error,
-                ArtifactError::Integrity { message, .. } if message.contains("hardlink aliases")
-            )),
             Mutation::Truncated | Mutation::Extended => assert!(matches!(
                 error,
                 ArtifactError::Integrity { message, .. } if message.contains("length differs")
@@ -1108,6 +1151,43 @@ fn verified_file_rejects_each_metadata_length_and_hash_violation() {
             fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
         }
     }
+}
+
+#[cfg(unix)]
+#[test]
+#[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
+fn host_controller_verified_file_rejects_planted_hardlink_aliases() {
+    use std::os::unix::fs::MetadataExt;
+
+    let root = TempRoot::new("verified-file-Hardlink");
+    let mut store = store(
+        root.path(),
+        ArtifactConfig {
+            inline_cap_bytes: 1,
+            ..ArtifactConfig::default()
+        },
+    );
+    let expected = b"sealed-authority";
+    let token = begin(&mut store, 1, OutputTargets::default());
+    store.append(&token, StreamKind::Stdout, expected).unwrap();
+    let sealed = store.finish(token, JobState::Exited).unwrap();
+    let path = root.path().join(".cowshed/job/1/out");
+
+    let metadata = fs::metadata(&path).unwrap();
+    assert_eq!(metadata.permissions().mode() & 0o777, 0o400);
+    assert_eq!(metadata.nlink(), 1);
+    assert_eq!(metadata.len(), expected.len() as u64);
+    assert_eq!(
+        read_stream(root.path(), &sealed.record.stdout).unwrap(),
+        expected
+    );
+
+    fs::hard_link(&path, root.path().join("protected-alias")).unwrap();
+    let error = read_stream(root.path(), &sealed.record.stdout).unwrap_err();
+    assert!(matches!(
+        error,
+        ArtifactError::Integrity { message, .. } if message.contains("hardlink aliases")
+    ));
 }
 
 #[test]

@@ -631,7 +631,9 @@ fn canonical_publication_moves_complete_image_and_sidecar_together() {
 }
 
 #[test]
-fn restore_swap_keeps_old_metadata_until_verified_publication_and_rolls_back_generations() {
+#[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
+fn host_controller_restore_swap_keeps_old_metadata_until_verified_publication_and_rolls_back_generations()
+ {
     let fixture = Fixture::new("restore-swap");
     let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
     let canonical = layout.main_image(ImageFormat::Sparse).expect("canonical");
@@ -3233,7 +3235,8 @@ fn recovery_never_publishes_metadata_without_its_staged_image() {
 }
 
 #[test]
-fn recovery_rolls_forward_published_metadata_before_undo_rename() {
+#[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
+fn host_controller_recovery_rolls_forward_published_metadata_before_undo_rename() {
     let fixture = Fixture::new("published-before-undo");
     let (host, canonical, staged, undo, replacement) =
         interrupted_restore_image_publication(&fixture, RestoreFailpoint::AfterImageSwap);
@@ -3266,7 +3269,8 @@ fn recovery_rolls_forward_published_metadata_before_undo_rename() {
 }
 
 #[test]
-fn restore_recovery_rejects_published_new_image_with_old_ca_key() {
+#[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
+fn host_controller_restore_recovery_rejects_published_new_image_with_old_ca_key() {
     let fixture = Fixture::new("published-new-image-old-ca");
     let (host, canonical, staged, undo, replacement) =
         interrupted_restore_image_publication(&fixture, RestoreFailpoint::AfterRestoreImageSwap);
@@ -3291,7 +3295,8 @@ fn restore_recovery_rejects_published_new_image_with_old_ca_key() {
 }
 
 #[test]
-fn recovery_rolls_back_when_published_metadata_is_missing() {
+#[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
+fn host_controller_recovery_rolls_back_when_published_metadata_is_missing() {
     let fixture = Fixture::new("published-metadata-missing");
     let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
     let canonical = layout.main_image(ImageFormat::Sparse).expect("canonical");
@@ -3361,7 +3366,8 @@ fn recovery_rolls_back_when_published_metadata_is_missing() {
     );
 }
 #[test]
-fn recovery_accepts_an_already_rolled_back_canonical_layout() {
+#[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
+fn host_controller_recovery_accepts_an_already_rolled_back_canonical_layout() {
     let fixture = Fixture::new("already-rolled-back");
     let (host, canonical, staged, _, _) =
         interrupted_restore_image_publication(&fixture, RestoreFailpoint::AfterImageSwap);
@@ -3383,7 +3389,8 @@ fn recovery_accepts_an_already_rolled_back_canonical_layout() {
 }
 
 #[test]
-fn recovery_restores_missing_prepublication_canonical_metadata() {
+#[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
+fn host_controller_recovery_restores_missing_prepublication_canonical_metadata() {
     let fixture = Fixture::new("missing-canonical-metadata");
     let (host, canonical, staged, undo, _) =
         interrupted_restore_image_publication(&fixture, RestoreFailpoint::AfterUndoRename);
@@ -3409,7 +3416,8 @@ fn recovery_restores_missing_prepublication_canonical_metadata() {
 }
 
 #[test]
-fn restored_publication_preserves_authoritative_workspace_topology() {
+#[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
+fn host_controller_restored_publication_preserves_authoritative_workspace_topology() {
     let fixture = Fixture::new("authoritative-restored-publication");
     let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
     let canonical = layout.main_image(ImageFormat::Sparse).expect("canonical");
@@ -3469,7 +3477,8 @@ fn restored_publication_preserves_authoritative_workspace_topology() {
 }
 
 #[test]
-fn stateless_restore_recovery_converges_each_publication_boundary() {
+#[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
+fn host_controller_stateless_restore_recovery_converges_each_publication_boundary() {
     for failpoint in [
         RestoreFailpoint::AfterUndoSidecar,
         RestoreFailpoint::AfterRestoreImageSwap,
@@ -3642,7 +3651,8 @@ fn stateless_restore_recovery_converges_each_publication_boundary() {
 }
 
 #[test]
-fn restore_recovery_selects_current_undo_generation_among_older_history() {
+#[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
+fn host_controller_restore_recovery_selects_current_undo_generation_among_older_history() {
     let fixture = Fixture::new("restore-current-undo-generation");
     let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
     let canonical = layout.main_image(ImageFormat::Sparse).expect("canonical");

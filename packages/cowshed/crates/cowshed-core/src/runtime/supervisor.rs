@@ -3585,9 +3585,10 @@ mod workspace_toolchain_tests {
     /// The end of the mechanism, exercised for real: a workspace whose `devenv` evaluation
     /// materialized a store profile gets that profile's tools on `PATH`, ahead of the inherited
     /// roots, and can actually execute them inside its own Seatbelt sandbox.
-    #[cfg_attr(not(target_os = "macos"), ignore)]
+    #[cfg(target_os = "macos")]
     #[test]
-    fn an_evaluated_workspace_profile_leads_path_and_runs_inside_the_sandbox() {
+    #[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
+    fn host_controller_an_evaluated_workspace_profile_leads_path_and_runs_inside_the_sandbox() {
         // A store-resolved profile root, standing in for a devenv-generated one without pinning
         // a generated store path. The daemon profile is the obvious candidate but is absent on a
         // single-user Nix install, so any store `bin` already on PATH serves equally: it is the

@@ -3560,7 +3560,9 @@ mod tests {
     }
 
     #[test]
-    fn boot_mount_service_install_uses_fixed_root_owned_artifacts_and_system_launchd() {
+    #[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
+    fn host_controller_boot_mount_service_install_uses_fixed_root_owned_artifacts_and_system_launchd()
+     {
         let (commands, received) = mpsc::channel();
         let host = MountServiceInstallHost { commands };
         let files = desired_mount_service(&mount_service_pins()).unwrap();
@@ -6061,10 +6063,12 @@ UUID=CACHES /private/cowshed/caches apfs rw # cowshed created volume labelled co
     /// later validation.
     #[test]
     fn cowshed_runtime_residue_is_reclaimable_but_foreign_data_masks() {
-        // A bound unix socket path must fit SUN_LEN (104 bytes on macOS); the
-        // default temp_dir's /var/folders/... prefix does not, so this fixture
-        // lives under /tmp.
-        let root = PathBuf::from(format!("/tmp/cowshed-residue-{}", Uuid::new_v4().simple()));
+        // Socket fixtures need the admitted short runtime spelling under cowshed;
+        // outside a workspace, /tmp keeps the name below macOS's SUN_LEN.
+        let root = std::env::var_os("XDG_RUNTIME_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/tmp"))
+            .join(format!("cowshed-residue-{}", Uuid::new_v4().simple()));
         fs::create_dir(&root).unwrap();
 
         // Daemon socket, workspace mountpoint scaffolding, compile cache, telemetry stub.

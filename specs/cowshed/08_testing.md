@@ -86,6 +86,28 @@ No mounts, no root, no network — pure functions with table-driven cases:
   transitions once to `output-limit`; tests pin TERM→grace→KILL→drain→seal→terminal-audit-record ordering and
   distinguish timeout/signal/exit.
 
+## Host-controller authority
+
+Run `nx run cowshed:host-controller-test` from the owned checkout in an unsandboxed host-controller shell. This single
+uncached target selects `test(/host_controller_/)` across `cowshed-core` and `cowshed-cli` with `--run-ignored only`,
+without a second list of fixture names. Controller-owned filesystem and kernel-profile fixtures carry that prefix and an
+explicit ignore reason naming this target. Ordinary sandboxed nextest runs report them ignored: an enclosing
+executed-child profile cannot grant an inner supervisor independent authority. Pure policy tests and pre-spawn refusal
+tests remain in the ordinary lane. The host runner probes actual hard-link authority before running and refuses with the
+same actionable command if an enclosing sandbox denies it; neither a write grant nor a nested profile can undo that
+denial. It pins `TMPDIR` to a unique disposable directory under the exact owned checkout's `.cowshed/tmp` and removes it
+afterward. Fixtures use only disposable local data: no launchd calls, installed host-service changes, or checkout source
+mutation.
+
+No outer sandbox installation or permission change is required for this target: the authority boundary is unchanged.
+Updating the checkout's sandbox source cannot change an already-running outer supervisor; separately testing a changed
+runtime policy requires the controller to install the intended release and start a fresh supervisor. Never broaden
+`file-link` to make this proof run. The ordinary CLI/core shards run inside the workspace sandbox. After
+`nx run @smoothbricks/codebase:cargo-lint`, run the complete `nx run cowshed:cargo-test-cowshed-core-exceptions` chain
+from an unsandboxed host-controller shell: its exception lane also exercises real APFS image attachment through
+DiskManagement. Run the explicit `host-controller-test` target separately. Both are mandatory proofs; an ignored
+controller fixture in the ordinary chain is never evidence that its behavior passed.
+
 ## Property tests (proptest, pure, all platforms)
 
 Invariants the table-driven unit cases only sample. Each is a pure function over generated inputs:
