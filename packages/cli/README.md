@@ -355,8 +355,8 @@ does not. The hook is a probe: it runs `nx run-many -t cargo-lint-cross` and not
 Cargo inputs, so a hit is a prior real Linux clippy and the push proceeds. A miss refuses the push and names
 `bun run check:linux` — the hook never enters linux-cross and never starts a compile, so what it costs is one Nx graph
 construction rather than an unbounded clippy. `bun run check:linux` is `tooling/devenv -P linux-cross shell --` around
-that same Nx target; it is the only place the gate actually runs, so it is deliberately not quiet.
-`git push --no-verify` skips the hook.
+that same Nx target; it is the only place the gate actually runs, so it is deliberately not quiet. `git push
+--no-verify` skips the hook.
 
 Conventional commit scopes should use Nx project names. For packages in the same npm scope as the root package, smoo
 requires `package.json` `nx.name` to be the unscoped package name, such as `cli` for `@smoothbricks/cli`, so subjects

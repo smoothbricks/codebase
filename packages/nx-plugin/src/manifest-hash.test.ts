@@ -1,10 +1,10 @@
 import { describe, expect, it } from 'bun:test';
+import { createHash } from 'node:crypto';
 import { mkdir, mkdtemp, rename, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { parse as parseToml } from 'smol-toml';
 
-import { hashVersionlessCrateManifests, stripCargoTomlVersion } from './manifest-hash.js';
+import { hashVersionlessCrateManifests, updateVersionlessCrateManifest } from './manifest-hash.js';
 
 const CRATE_MANIFEST = `[package]
 name = "acme-core"
@@ -16,18 +16,109 @@ serde = { version = "1.0.200", features = ["derive"] }
 acme-sibling = { path = "../sibling", version = "1.2.3" }
 `;
 
-const WORKSPACE_CRATE_MANIFEST = `[workspace]
-members = ["crates/*"]
+/**
+ * The line a form writes the crate's own version on, and the manifest it sits
+ * in. Dropping it must leave the digest exactly where hashing the manifest
+ * with it leaves it: that is what "the release cannot move this digest" means.
+ */
+const OWN_VERSION_FORMS: Record<string, [manifest: string, line: string]> = {
+  plain: ['[package]\nname = "acme-core"\n@\nedition = "2024"\n', 'version = "1.2.3"'],
+  padded: ['[package]\nname = "acme-core"\n@\nedition = "2024"\n', '  version\t=   "1.2.3"   '],
+  commented: ['[package]\nname = "acme-core"\n@\nedition = "2024"\n', 'version = "1.2.3" # bumped by the release'],
+  inherited: ['[package]\nname = "acme-core"\n@\nedition = "2024"\n', 'version.workspace = true'],
+  'inherited, spaced': ['[package]\nname = "acme-core"\n@\n', 'version . workspace = true'],
+  'quoted key': ['[package]\nname = "acme-core"\n@\n', '"version" = "1.2.3"'],
+  'literal-quoted key': ['[package]\nname = "acme-core"\n@\n', "'version' = '1.2.3'"],
+  'literal-quoted value': ['[package]\nname = "acme-core"\n@\n', "version = '1.2.3'"],
+  'padded header': ['[ package ]\nname = "acme-core"\n@\n', 'version = "1.2.3"'],
+  'commented header': ['[package] # the crate itself\nname = "acme-core"\n@\n', 'version = "1.2.3"'],
+  'quoted header': ['["package"]\nname = "acme-core"\n@\n', 'version = "1.2.3"'],
+  'workspace package': [
+    '[workspace]\nmembers = ["crates/*"]\n\n[workspace.package]\n@\nedition = "2024"\n',
+    'version = "0.0.1"',
+  ],
+  'workspace package, spaced header': ['[workspace . package]\n@\nedition = "2024"\n', 'version = "0.0.1"'],
+  'after a multi-line array': [
+    '[package]\nname = "acme-core"\nkeywords = [\n  "build",\n  "cache",\n]\n@\n',
+    'version = "1.2.3"',
+  ],
+  crlf: ['[package]\r\nname = "acme-core"\r\n@\r\nedition = "2024"\r\n', 'version = "1.2.3"'],
+};
 
-[workspace.package]
-version = "0.0.1"
-edition = "2024"
+/**
+ * A `version` that names a DIFFERENT crate. Dropping one of these lines must
+ * move the digest, or a dependency change serves a stale result.
+ */
+const FOREIGN_VERSION_FORMS: Record<string, [manifest: string, line: string]> = {
+  'dependency table': [
+    '[package]\nname = "acme-core"\nversion = "1.2.3"\n\n[dependencies.serde]\n@\n',
+    'version = "1.0.200"',
+  ],
+  'dev-dependency table': ['[package]\nname = "acme-core"\n\n[dev-dependencies.insta]\n@\n', 'version = "1.39"'],
+  'build-dependency table': ['[package]\nname = "acme-core"\n\n[build-dependencies.cc]\n@\n', 'version = "1.0"'],
+  'workspace dependency table': ['[workspace]\n\n[workspace.dependencies.serde]\n@\n', 'version = "1.0.200"'],
+  'target cfg dependency table': [
+    '[package]\nname = "acme-core"\n\n[target.\'cfg(unix)\'.dependencies.libc]\n@\n',
+    'version = "0.2.155"',
+  ],
+  'inline table': ['[package]\nname = "acme-core"\n\n[dependencies]\n@\n', 'serde = { version = "1.0.200" }'],
+  'package metadata table': ['[package]\nname = "acme-core"\n\n[package.metadata.acme]\n@\n', 'version = "7"'],
+};
 
-[workspace.dependencies]
-serde = { version = "1.0.200" }
-`;
+function digest(manifest: string): string {
+  const hash = createHash('sha256');
+  updateVersionlessCrateManifest(hash, Buffer.from(manifest));
+  return hash.digest('hex');
+}
+
+/**
+ * Whether each form's version line contributes nothing at all to the digest:
+ * the manifest carrying it hashes to what the manifest without it hashes to.
+ */
+function elided(forms: Record<string, [manifest: string, line: string]>): Record<string, boolean> {
+  const result: Record<string, boolean> = {};
+  for (const [name, [manifest, line]] of Object.entries(forms)) {
+    result[name] = digest(manifest.replace('@', line)) === digest(manifest.replace(/@\r?\n/, ''));
+  }
+  return result;
+}
 
 describe('versionless crate manifest hashing', () => {
+  it('drops the version a crate declares for itself, in every form a manifest writes it', () => {
+    expect(elided(OWN_VERSION_FORMS)).toEqual(Object.fromEntries(Object.keys(OWN_VERSION_FORMS).map((n) => [n, true])));
+  });
+
+  it('keeps every version that names a different crate', () => {
+    expect(elided(FOREIGN_VERSION_FORMS)).toEqual(
+      Object.fromEntries(Object.keys(FOREIGN_VERSION_FORMS).map((n) => [n, false])),
+    );
+  });
+
+  it("separates the tables it left, so a later version is not read as the crate's own", () => {
+    const own = '[package]\nname = "acme-core"\nversion = "1.2.3"\n';
+    // The same bytes under a dependency table must not collapse onto the same
+    // digest as the crate's own version: the scanner has to know which table
+    // it is standing in, not just which line it is looking at.
+    expect(digest(`${own}\n[dependencies.serde]\nversion = "1.0.200"\n`)).not.toBe(
+      digest(`${own}\n[dependencies.serde]\nversion = "1.0.201"\n`),
+    );
+  });
+
+  it('hashes verbatim from the first construct a line scan cannot read', () => {
+    // A multi-line string can spell out a `[package]` header and a version
+    // line, and no line scan can tell that text from the document. Everything
+    // after one is hashed as written, so the release moves this digest — a
+    // miss, never a wrong hit.
+    const withNote = (version: string) =>
+      `[package]\nname = "acme-core"\ndescription = """\n[package]\nversion = "0.0.0"\n"""\nversion = "${version}"\n`;
+    expect(digest(withNote('1.2.3'))).not.toBe(digest(withNote('2.0.0')));
+
+    // A version the scanner reached BEFORE the string is still dropped.
+    const beforeNote = (version: string) =>
+      `[package]\nname = "acme-core"\nversion = "${version}"\ndescription = """\nany text\n"""\n`;
+    expect(digest(beforeNote('1.2.3'))).toBe(digest(beforeNote('2.0.0')));
+  });
+
   it('ignores the version a crate declares for itself and nothing else', async () => {
     await withProject(async (project) => {
       const baseline = await hashVersionlessCrateManifests(project.root, project.workspaceRoot);
@@ -41,25 +132,6 @@ describe('versionless crate manifest hashing', () => {
     });
   });
 
-  it('keeps every version that names a different crate', () => {
-    expect(parseToml(stripCargoTomlVersion(CRATE_MANIFEST))).toEqual({
-      package: { name: 'acme-core', edition: '2024' },
-      dependencies: {
-        serde: { version: '1.0.200', features: ['derive'] },
-        // A sibling pinned by path AND version keeps that version: the digest
-        // describes a dependency that really did change on release.
-        'acme-sibling': { path: '../sibling', version: '1.2.3' },
-      },
-    });
-    expect(parseToml(stripCargoTomlVersion(WORKSPACE_CRATE_MANIFEST))).toEqual({
-      workspace: {
-        members: ['crates/*'],
-        package: { edition: '2024' },
-        dependencies: { serde: { version: '1.0.200' } },
-      },
-    });
-  });
-
   it('reports a moved crate manifest', async () => {
     await withProject(async (project) => {
       const baseline = await hashVersionlessCrateManifests(project.root, project.workspaceRoot);
@@ -69,7 +141,7 @@ describe('versionless crate manifest hashing', () => {
     });
   });
 
-  it('hashes a manifest it cannot parse instead of dropping it', async () => {
+  it('hashes a manifest it cannot read instead of dropping it', async () => {
     await withProject(async (project) => {
       await project.write('crates/core/Cargo.toml', 'this is not toml [[[');
       const broken = await hashVersionlessCrateManifests(project.root, project.workspaceRoot);

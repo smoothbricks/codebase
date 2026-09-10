@@ -100,13 +100,15 @@ them by field instead: a `json` input with `excludeFields` for `package.json#ver
 this costs no process. Everything else still counts: a dependency range, an export map, and the lockfile's resolution
 table.
 
-Crate manifests are the one kind Nx cannot hash by field, because TOML has no such input. They go through
-`smoo-nx-manifest-hash`, which removes `[package].version` and `[workspace.package].version` and nothing else — a
-`version` naming a *different* crate under a dependency table stays in the digest, and a manifest the command cannot
-parse is hashed raw rather than dropped. A `runtime` input is a process spawn per project per graph computation, and Nx
-re-runs an identical command string two to three times rather than memoizing it (measured: 30–39 spawns and +18% wall
-time on a fully-cached run when every project declared one), so the plugin declares it only for projects that actually
-carry a `Cargo.toml`.
+Crate manifests are the one kind Nx cannot hash by field, because TOML has no such input. The plugin hashes them
+itself, in the process that builds the graph and is already reading them: a single forward scan over the bytes feeds
+the hasher every run it keeps, dropping `[package].version` and the `[workspace.package].version` members inherit and
+nothing else — a `version` naming a *different* crate under a dependency table stays in the digest, and anything a
+line-oriented scan cannot read (a multi-line string, an unterminated value) is hashed verbatim rather than guessed at.
+The digest then travels as a literal input path that matches no file: Nx hashes a project's `namedInputs` definitions
+into that project's configuration hash, which is part of every task in the project and of every task depending on it,
+so the value reaches the hash with no process at all. Earlier revisions spawned a command per crate project per graph
+computation; that spawn is gone.
 
 Targets that produce a shipped artifact keep hashing the raw manifests. A crate embeds its version at compile time
 through `env!("CARGO_PKG_VERSION")`, so a version-insensitive `build`, `pack`, `tsc-js` or cargo hash would let a

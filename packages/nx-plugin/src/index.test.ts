@@ -9,7 +9,7 @@ import { AggregateCreateNodesError } from 'nx/src/project-graph/error-types.js';
 import { createTargetDefaultsResults } from 'nx/src/project-graph/utils/project-configuration/target-defaults.js';
 import { mergeTargetConfigurations } from 'nx/src/project-graph/utils/project-configuration-utils.js';
 import { BOUNDED_TEST_TIMEOUT_MS } from './bounded-test-policy.js';
-import { exceptionalTestFilter } from './cargo-workspace.js';
+import { exceptionalTestFilter, packageNameFromCargoTestTarget } from './cargo-workspace.js';
 import { CARGO_CROSS_LINT_COMMAND, CARGO_CROSS_LINT_TARGET, CARGO_LINT_CLIPPY_COMMAND } from './cross-check-policy.js';
 import { createNodesV2, createNodesV2ForPlatform } from './index.js';
 import { applyWorkspaceConfig } from './workspace-config-policy.js';
@@ -271,7 +271,6 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       await workspace.write('packages/example/package.json', '{"name":"example"}\n');
       await workspace.write('packages/example/tsconfig.lib.json', '{}\n');
       await workspace.write('packages/example/tsconfig.test.json', '{}\n');
-      await workspace.write(`node_modules/${MANIFEST_HASH_BIN_PATH}`, '#!/usr/bin/env node\n');
 
       const project = await inferProjectWithNxJson(workspace, 'packages/example/package.json', {
         namedInputs: { versionlessProduction: ['production'] },
@@ -280,14 +279,14 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       const checkToolchain = [
         '{workspaceRoot}/patches/**/*',
         '{workspaceRoot}/tsconfig.base.json',
-        // Hashed by Nx itself: a `json` input costs no process, unlike the
-        // `runtime` command the crate manifests still need.
+        // Hashed by Nx itself: a `json` input costs no process, and neither
+        // does the crate digest that replaces the manifests below.
         { json: '{workspaceRoot}/package.json', excludeFields: ['version'] },
         { json: '{workspaceRoot}/bun.lock', excludeFields: ['workspaces'] },
       ];
 
-      // No crate manifest in this project, so no hash command is declared at
-      // all — the cost stays proportional to the crates it covers.
+      // No crate manifest in this project, so no crate digest is declared at
+      // all — nothing is hashed that nothing reads.
       expect(project?.namedInputs).toEqual({
         versionlessProduction: [
           'production',
@@ -347,25 +346,39 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
     }
   });
 
-  it('hashes crate manifests through a command, only where crates exist', async () => {
+  it('hashes crate manifests into a digest, only where crates exist', async () => {
     const workspace = await createWorkspace();
     try {
+      const manifest = (version: string) =>
+        `[package]\nname = "rust-example"\nversion = "${version}"\n\n[dependencies]\nserde = { version = "1.0.200" }\n`;
       await workspace.write('packages/rust/package.json', '{"name":"rust-example"}\n');
       await workspace.write('packages/rust/tsconfig.lib.json', '{}\n');
-      await workspace.write('packages/rust/Cargo.toml', '[package]\nname = "rust-example"\nversion = "0.1.0"\n');
-      await workspace.write(`node_modules/${MANIFEST_HASH_BIN_PATH}`, '#!/usr/bin/env node\n');
+      await workspace.write('packages/rust/Cargo.toml', manifest('0.1.0'));
+      const production = async () =>
+        (await inferProjectWithNxJson(workspace, 'packages/rust/package.json', {}))?.namedInputs?.versionlessProduction;
 
-      const project = await inferProjectWithNxJson(workspace, 'packages/rust/package.json', {});
+      const baseline = await production();
 
-      // TOML has no `json` input, so this is the one manifest kind that costs a
-      // spawn — and `bun`, not `node`, for a third of the startup.
-      expect(project?.namedInputs?.versionlessProduction).toEqual([
+      // TOML has no `json` input, so this is the one manifest kind the plugin
+      // hashes itself. There is no command behind it: the value IS the input,
+      // and Nx hashes it through the project configuration.
+      expect(baseline).toEqual([
         'production',
         '!{projectRoot}/package.json',
         { json: '{projectRoot}/package.json', excludeFields: ['version'] },
         '!{projectRoot}/**/Cargo.toml',
-        { runtime: `bun node_modules/${MANIFEST_HASH_BIN_PATH} 'packages/rust'` },
+        expect.stringMatching(/^\{projectRoot\}\/\.versionless-crate-manifests\/[0-9a-f]{64}$/),
       ]);
+
+      // What the digest exists for: the release moves the crate's own version
+      // and nothing else, so the input a check hashes must not move with it.
+      await workspace.write('packages/rust/Cargo.toml', manifest('9.9.9'));
+      expect(await production()).toEqual(baseline);
+
+      // And a dependency really changing must still reach the hash, or the
+      // exclusion above would be hiding it.
+      await workspace.write('packages/rust/Cargo.toml', manifest('0.1.0').replace('1.0.200', '1.0.201'));
+      expect(await production()).not.toEqual(baseline);
     } finally {
       await workspace.cleanup();
     }
@@ -376,7 +389,6 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
     try {
       await workspace.write('packages/example/package.json', '{"name":"example"}\n');
       await workspace.write('packages/example/tsconfig.lib.json', '{}\n');
-      await workspace.write(`node_modules/${MANIFEST_HASH_BIN_PATH}`, '#!/usr/bin/env node\n');
 
       // `{ input, dependencies: true }` resolves the name in each dependency's
       // own context and Nx throws when one has no definition for it. A
@@ -1727,6 +1739,91 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       await workspace.cleanup();
     }
   }, 120_000);
+
+  it('archives a declared foreign triple beside the host archive, and runs it without building', async () => {
+    const workspace = await createWorkspace();
+    try {
+      await workspace.write('packages/ferris/package.json', '{"name":"ferris"}\n');
+      await workspace.write(
+        'packages/ferris/Cargo.toml',
+        '[workspace]\nmembers = ["crates/ferris-core"]\n\n' +
+          '[workspace.metadata.smoothbricks.test]\n' +
+          'cross-targets = [{ target = "aarch64-apple-darwin", cargo = "scripts/cargo-for-nextest.sh" }]\n',
+      );
+      await workspace.write('packages/ferris/crates/ferris-core/Cargo.toml', '[package]\nname = "ferris-core"\n');
+      await workspace.write('packages/ferris/scripts/cargo-for-nextest.sh', '#!/bin/sh\nexec cargo "$@"\n');
+
+      const targets = await inferProjectTargets(workspace, 'packages/ferris/package.json');
+      const archive = targets['cargo-cross-test-archive-aarch64-apple-darwin'];
+      const run = targets['cargo-cross-test-aarch64-apple-darwin'];
+
+      // A distinct archive file, declared as this target's output: the host
+      // archive must survive a cross build and each must be cached as itself.
+      expect(archive?.outputs).toEqual(['{projectRoot}/target/nextest/archive-aarch64-apple-darwin.tar.zst']);
+      expect(targets['cargo-test-archive']?.outputs).toEqual(['{projectRoot}/target/nextest/archive.tar.zst']);
+      expect(archive?.cache).toBe(true);
+      // Everything the host archive hashes, plus the declared driver: the
+      // script that decides how the foreign link happens is an input of the
+      // bytes it produces.
+      for (const input of targets['cargo-test-archive']?.inputs ?? []) {
+        expect(archive?.inputs).toContainEqual(input);
+      }
+      expect(archive?.inputs).toContain('{projectRoot}/scripts/cargo-for-nextest.sh');
+      expect(archive?.options?.env).toEqual({ CARGO: 'scripts/cargo-for-nextest.sh' });
+      // The runner needs no driver: it never invokes cargo at all.
+      expect(run?.options?.env).toBeUndefined();
+      expect(archive?.options?.commands?.[0]).toBe('mkdir -p target/nextest');
+      // `cargo-nextest`, not `cargo nextest`: cargo overwrites CARGO for its
+      // subcommands, and CARGO is the only seam a cross cargo driver has.
+      expect(String(archive?.options?.commands?.[1])).toMatch(
+        /^cargo-nextest nextest archive --workspace --target aarch64-apple-darwin --frozen --archive-file target\/nextest\/archive-aarch64-apple-darwin\.tar\.zst --user-config-file none --tool-config-file "smoo:\$PWD\/.*nextest\.toml"$/,
+      );
+      expect(String(archive?.configurations?.production?.commands?.[1])).toContain(
+        'nextest archive --workspace --release --target aarch64-apple-darwin',
+      );
+      // The archive BUILDS, so it needs the locked registry graph; the runner
+      // never touches cargo, so it needs nothing and depends on nothing.
+      expect(archive?.dependsOn).toEqual(['cargo-fetch']);
+      expect(run?.dependsOn).toEqual([]);
+      expect(String(run?.options?.command)).toMatch(
+        /^cargo-nextest nextest run --archive-file target\/nextest\/archive-aarch64-apple-darwin\.tar\.zst --workspace-remap \. --no-tests=pass --user-config-file none --tool-config-file "smoo:\$PWD\/.*nextest\.toml"$/,
+      );
+      expect(run?.executor).toBe('@smoothbricks/nx-plugin:bounded-exec');
+      // Not a crate: the per-crate coverage policy reads `cargo-test-<name>`,
+      // so a triple must not land in that namespace, and neither target may
+      // join the test aggregate a host machine runs.
+      expect(packageNameFromCargoTestTarget('cargo-cross-test-archive-aarch64-apple-darwin')).toBeNull();
+      expect(packageNameFromCargoTestTarget('cargo-cross-test-aarch64-apple-darwin')).toBeNull();
+      expect(targets['cargo-test']?.dependsOn).toEqual(['cargo-test-ferris-core']);
+      expect(targets.build?.dependsOn ?? []).not.toContain('cargo-cross-test-archive-aarch64-apple-darwin');
+    } finally {
+      await workspace.cleanup();
+    }
+  });
+
+  it('refuses a cross-targets declaration that cannot name a target or a file', async () => {
+    const workspace = await createWorkspace();
+    try {
+      await workspace.write('packages/ferris/package.json', '{"name":"ferris"}\n');
+      await workspace.write(
+        'packages/ferris/Cargo.toml',
+        '[workspace]\nmembers = ["crates/ferris-core"]\n\n' +
+          '[workspace.metadata.smoothbricks.test]\ncross-targets = ["aarch64 apple darwin; rm -rf /"]\n',
+      );
+      await workspace.write('packages/ferris/crates/ferris-core/Cargo.toml', '[package]\nname = "ferris-core"\n');
+
+      const failure = await inferProjectTargets(workspace, 'packages/ferris/package.json').then(
+        () => undefined,
+        (error: unknown) => error,
+      );
+      if (!(failure instanceof AggregateCreateNodesError)) {
+        throw new Error(`expected AggregateCreateNodesError, got ${String(failure)}`);
+      }
+      expect(failure.errors[0]?.[1]?.message).toMatch(/cross-targets entries must be target triples like/);
+    } finally {
+      await workspace.cleanup();
+    }
+  });
   //#endregion
 });
 
@@ -1764,13 +1861,6 @@ async function inferProject(
   const result = await infer([packageJsonPath], undefined, workspace.context);
   return result[0]?.[1].projects?.[dirname(packageJsonPath)];
 }
-
-/**
- * The manifest hash bin as the workspace path the plugin emits, spelled out
- * here rather than imported: a test that derived it the same way the plugin
- * does would agree with a wrong answer.
- */
-const MANIFEST_HASH_BIN_PATH = '@smoothbricks/nx-plugin/dist/bin/smoo-nx-manifest-hash.js';
 
 /**
  * Inference against a chosen nx.json. The versionless manifest inputs reach as

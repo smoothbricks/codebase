@@ -64,8 +64,7 @@
   },
   "bin": {
     "smoo-nx-exec": "./dist/bin/smoo-nx-exec.js",
-    "smoo-nx-cargo-hash": "./dist/bin/smoo-nx-cargo-hash.js",
-    "smoo-nx-manifest-hash": "./dist/bin/smoo-nx-manifest-hash.js"
+    "smoo-nx-cargo-hash": "./dist/bin/smoo-nx-cargo-hash.js"
   },
   "generators": "./generators.json",
   "executors": "./executors.json",

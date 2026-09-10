@@ -23,11 +23,13 @@ import {
   CARGO_TEST_COMPILE_TARGET,
   CARGO_TEST_EXCEPTIONS_SUFFIX,
   CARGO_TEST_TARGET,
+  type CargoCrossTestTarget,
   type CargoInputsCache,
   cargoPackageTestInputs,
   cargoTestPackageTargetName,
   createCargoInputsCache,
   exceptionalTestFilter,
+  listCargoCrossTestTargets,
   listCargoWorkspacePackages,
   NEXTEST_REPO_CONFIG_PATH,
   nextestToolConfigArg,
@@ -39,8 +41,12 @@ import {
   CARGO_FETCH_TARGET,
   CARGO_FROZEN_PREFIX,
   CARGO_LINT_CLIPPY_COMMAND,
+  cargoCrossTestArchiveFile,
+  cargoCrossTestArchiveTargetName,
+  cargoCrossTestTargetName,
   cargoFrozen,
 } from './cross-check-policy.js';
+import { hashVersionlessCrateManifests } from './manifest-hash.js';
 import { isNonSourceDirectory } from './source-directories.js';
 import { PLATFORM_TARGET_GLOBS } from './workspace-config-policy.js';
 
@@ -93,19 +99,26 @@ const VERSIONLESS_PACKAGE_INPUTS = [
 /**
  * Crate manifests, for the projects that have any.
  *
- * TOML has no `json` input, so this is the one case that needs a command —
- * measured at 30-39 spawns per fully-cached run when every project declared
- * one, because Nx re-runs an identical command string 2-3 times rather than
- * memoizing it, for +18% wall time on a run that computed nothing. Declaring
- * it only where a `Cargo.toml` exists keeps that cost proportional to the
- * crates it covers.
+ * TOML has no `json` input, so this is the one manifest kind the plugin
+ * hashes itself — in this process, over bytes it is already reading, during
+ * the graph construction that needs the answer.
+ *
+ * The digest reaches the hash as a literal, with no command behind it. Nx
+ * hashes a project's `namedInputs` DEFINITIONS into that project's
+ * configuration hash, and that hash is part of every task in the project and
+ * of every task that depends on the project — which is exactly the reach the
+ * transitive half needs. So the digest is written as an input path that
+ * matches no file and is only ever read as a string. It is a positive
+ * pattern, never an exclusion: a pattern that matched something unexpected
+ * could then only ADD to the hash, never quietly remove a real manifest from
+ * it.
  */
 const VERSIONLESS_CRATE_EXCLUSION = '!{projectRoot}/**/Cargo.toml';
+const VERSIONLESS_CRATE_DIGEST_PREFIX = '{projectRoot}/.versionless-crate-manifests/';
 
 /** Plugin-owned named inputs: a project's `production`/`default` with the manifest versions ignored. */
 const VERSIONLESS_PRODUCTION_INPUT = 'versionlessProduction';
 const VERSIONLESS_DEFAULT_INPUT = 'versionlessDefault';
-const MANIFEST_HASH_BIN = 'smoo-nx-manifest-hash';
 /** `json` inputs with `excludeFields` are Nx 23.2; an older hasher rejects the entry outright. */
 const JSON_INPUT_MINIMUM_NX = [23, 2] as const;
 
@@ -444,6 +457,106 @@ function createCargoTestArchiveTarget(projectRoot: string, toolConfig: string): 
   };
 }
 
+/**
+ * One foreign triple's test archive, and the target that EXECUTES it.
+ *
+ * A target-triple VARIANT of `cargo-test-archive`, not a second mechanism: same
+ * `nextest archive --workspace`, same tool config layering, same
+ * `--workspace-remap .` on the run — only `--target <triple>` and a distinct
+ * archive file are added, because both archives coexist as declared Nx outputs
+ * and one path for two triples would let a restored cache serve the wrong
+ * machine's binaries.
+ *
+ * `cargo-nextest` where every other cargo target spells `cargo --frozen`, and
+ * that is measured, not stylistic: cargo overwrites `CARGO` with its own path
+ * for every subcommand it launches, so `cargo nextest` erases the cross cargo
+ * driver a repository exports through `CARGO` — the only seam nextest has for
+ * one. Invoking `cargo-nextest` directly leaves that driver intact, and
+ * `--frozen` moves onto nextest, which forwards it to both inner cargo calls
+ * (measured: `metadata … --frozen` and `test --no-run … --frozen`).
+ *
+ * The archive target therefore states `CARGO_FETCH_TARGET` and the toolchain
+ * runtime inputs itself: both are otherwise attached by matching the
+ * `cargo --frozen` prefix in a command, and this command does not carry it.
+ *
+ * The RUNNER declares no dependency on the archive and is not cached. That is
+ * the whole point of splitting the pair: it runs on a machine where the triple
+ * is native and the archive arrived as a file, so a dependency edge would ask
+ * that machine to cross-build what it was sent, and a cache verdict would be
+ * keyed on sources whose binaries it did not build. It is also the one cargo
+ * target that needs no cargo: `nextest run --archive-file` extracts prebuilt
+ * binaries and never invokes cargo (measured, zero invocations).
+ */
+function createCargoCrossTestTargets(
+  projectRoot: string,
+  toolConfig: string,
+  crossTarget: CargoCrossTestTarget,
+  archiveInputs: NonNullable<TargetConfiguration['inputs']>,
+): Record<string, TargetConfiguration> {
+  const { target: triple, cargo } = crossTarget;
+  const archiveFile = cargoCrossTestArchiveFile(triple);
+  const archiveCommand = (profile: string): string =>
+    `cargo-nextest nextest archive --workspace${profile} --target ${triple} --frozen ` +
+    `--archive-file ${archiveFile} --user-config-file none ${toolConfig}`;
+  return {
+    [cargoCrossTestArchiveTargetName(triple)]: {
+      executor: 'nx:run-commands',
+      cache: true,
+      // The two runtime inputs every cached cargo target carries, plus the
+      // declared driver's own bytes. They are attached elsewhere by matching
+      // the `cargo --frozen` prefix in a command, which this one does not
+      // spell — and they matter MORE here than anywhere else: the cross
+      // environment (SDKROOT, CC_<triple>, ZIG*, and CARGO itself) is what
+      // decides whether these bytes are Mach-O at all, so an archive linked
+      // against one sysroot must never hash equal to the same sources linked
+      // against another.
+      inputs: [
+        ...archiveInputs,
+        ...(cargo === undefined ? [] : [`{projectRoot}/${cargo}`]),
+        cargoRuntimeInput(projectRoot, CARGO_ENVIRONMENT_INPUT.runtime),
+        cargoRuntimeInput(projectRoot, 'rustc -vV && cargo -V && cargo nextest --version'),
+      ],
+      outputs: [`{projectRoot}/${archiveFile}`],
+      dependsOn: [CARGO_FETCH_TARGET],
+      options: {
+        commands: [`mkdir -p ${posix.dirname(archiveFile)}`, archiveCommand('')],
+        cwd: projectRoot,
+        parallel: false,
+        // `CARGO` is cargo's own driver variable and the only seam nextest
+        // offers: it shells out to `$CARGO metadata` and
+        // `$CARGO test --no-run --target <triple>`, so the declared script
+        // decides how the foreign link happens without the generated command
+        // knowing anything about zig, an SDK, or a sysroot. Target-scoped, so
+        // it applies to this archive and to nothing else cargo runs.
+        ...(cargo === undefined ? {} : { env: { CARGO: cargo } }),
+      },
+      configurations: {
+        production: {
+          commands: [`mkdir -p ${posix.dirname(archiveFile)}`, archiveCommand(' --release')],
+        },
+      },
+    },
+    [cargoCrossTestTargetName(triple)]: {
+      executor: '@smoothbricks/nx-plugin:bounded-exec',
+      cache: false,
+      inputs: [],
+      outputs: [],
+      dependsOn: [],
+      options: {
+        command:
+          `cargo-nextest nextest run --archive-file ${archiveFile} --workspace-remap . ` +
+          `--no-tests=pass --user-config-file none ${toolConfig}`,
+        cwd: projectRoot,
+        timeoutMs: BOUNDED_TEST_TIMEOUT_MS,
+        killAfterMs: BOUNDED_TEST_KILL_AFTER_MS,
+      },
+      // The archive already holds the profile it was built with, and nextest
+      // rejects `--release` beside `--archive-file`.
+      configurations: { production: {} },
+    },
+  };
+}
+
 function createCargoTestTarget(projectRoot: string): TargetConfiguration {
   return {
     executor: '@smoothbricks/nx-plugin:bounded-exec',
@@ -473,18 +586,12 @@ const PLUGIN_NEXTEST_CONFIG = fileURLToPath(new URL('../nextest.toml', import.me
  * published, so an older consumer gets today's inputs instead of a broken
  * hash.
  *
- * `crateCommand` is a workspace path, not a bare specifier: Nx runs a
- * `runtime` input from the workspace root, and under bun's global virtual
- * store the published package is reachable there and nowhere else. It is
- * derived from this package's own `bin` map rather than retyped, so a renamed
- * bin cannot leave a command behind that resolves to nothing. `null` there
- * means crate manifests keep being hashed raw: with no digest to replace it,
- * excluding a manifest from a fileset would stop a real dependency change
- * from invalidating anything, and Nx reports neither a missing command nor a
- * failing one.
+ * The crate half asks nothing of the workspace at all. The digest is computed
+ * right here, in the process that is already reading those manifests, and
+ * rides into the project's named inputs as a literal — so there is no command
+ * to install and nothing to look for before the treatment is safe to declare.
  */
 interface VersionlessManifestPolicy {
-  crateCommand: string | null;
   /**
    * Whether a dependency's manifests can be hashed versionlessly too.
    *
@@ -500,21 +607,33 @@ interface VersionlessManifestPolicy {
 
 function versionlessManifestPolicy(context: CreateNodesContextV2): VersionlessManifestPolicy | null {
   if (!supportsJsonInputs()) return null;
-  const manifest = readJsonFile<{ name?: unknown; bin?: unknown }>(
-    fileURLToPath(new URL('../package.json', import.meta.url)),
-  );
-  const entry = isRecord(manifest.bin) ? manifest.bin[MANIFEST_HASH_BIN] : undefined;
-  if (typeof manifest.name !== 'string' || typeof entry !== 'string') {
-    // invariant throw: this package's own manifest is malformed
-    throw new Error(`@smoothbricks/nx-plugin: package.json lacks the ${MANIFEST_HASH_BIN} bin`);
+  return { transitive: context.nxJsonConfiguration.namedInputs?.[VERSIONLESS_PRODUCTION_INPUT] !== undefined };
+}
+
+/**
+ * The crate manifests' exclusion and the digest that stands in for them, or
+ * nothing at all when this process cannot read them.
+ *
+ * Fail-closed, and the only direction that is safe: excluding the manifests
+ * with no digest replacing them would stop a real dependency change from
+ * invalidating anything, and neither Nx nor this plugin would say a word.
+ * Handing back the empty list leaves the raw manifests in the fileset — one
+ * cache miss per release, which is what the workspace has today.
+ */
+async function versionlessCrateInputs(projectRoot: string, workspaceRoot: string): Promise<string[]> {
+  try {
+    const digest = await hashVersionlessCrateManifests(projectRoot, workspaceRoot);
+    return [VERSIONLESS_CRATE_EXCLUSION, `${VERSIONLESS_CRATE_DIGEST_PREFIX}${digest}`];
+  } catch (error) {
+    // Out loud: a silent degrade here reads as "the release stopped costing a
+    // rebuild", which is the same thing a wrong hash reads as.
+    process.stderr.write(
+      `@smoothbricks/nx-plugin: hashing the crate manifests under ${projectRoot} failed (${
+        error instanceof Error ? error.message : String(error)
+      }); hashing them raw instead, so a release invalidates this project's checks.\n`,
+    );
+    return [];
   }
-  const binPath = `node_modules/${manifest.name}/${entry.replace(/^\.\//, '')}`;
-  return {
-    // bun over node: the same digest for a third of the startup, and this
-    // plugin's other runtime inputs already assume bun.
-    crateCommand: existsSync(join(context.workspaceRoot, binPath)) ? `bun ${binPath}` : null,
-    transitive: context.nxJsonConfiguration.namedInputs?.[VERSIONLESS_PRODUCTION_INPUT] !== undefined,
-  };
 }
 
 /**
@@ -672,17 +791,12 @@ async function createProjectTargets(
   const isRepoRootedCargoProject = cargoWorkspace?.projectRoot === '.';
   // What a check that only READS the manifests hashes instead of their raw
   // bytes. Each piece degrades to today's input on its own: an Nx without
-  // `json` inputs gets no treatment at all; an uninstalled hash command
-  // leaves the crate manifests raw; no workspace-wide named input leaves the
+  // `json` inputs gets no treatment at all; crate manifests this process
+  // cannot read stay raw; no workspace-wide named input leaves the
   // transitive half `^production`.
   const hasCrateManifests = isCargoProject || existsSync(cargoTomlPath);
   const crateInputs =
-    versionless?.crateCommand != null && hasCrateManifests
-      ? [
-          VERSIONLESS_CRATE_EXCLUSION,
-          { runtime: `${versionless.crateCommand} '${projectRoot.replaceAll("'", "'\"'\"'")}'` },
-        ]
-      : [];
+    versionless !== null && hasCrateManifests ? await versionlessCrateInputs(projectRoot, workspaceRoot) : [];
   const versionlessProjectInputs = versionless === null ? [] : [...VERSIONLESS_PACKAGE_INPUTS, ...crateInputs];
   const checkInputs = versionless === null ? TYPESCRIPT_TOOLCHAIN_INPUTS : VERSIONLESS_TOOLCHAIN_INPUTS;
   const selfProduction = versionless === null ? 'production' : VERSIONLESS_PRODUCTION_INPUT;
@@ -888,6 +1002,21 @@ async function createProjectTargets(
     // `archive.include` lives in the repository's nextest config, so that file
     // decides what the archive CONTAINS, not merely how a run behaves.
     targets[CARGO_TEST_ARCHIVE_TARGET].inputs = [...workspaceCargoInputs, `{projectRoot}/${NEXTEST_REPO_CONFIG_PATH}`];
+    // One archive per declared foreign triple, from the same inputs and the
+    // same repository nextest config: an archive is the workspace's test
+    // binaries whichever machine they are for, so a change that invalidates
+    // the host archive must invalidate every cross one.
+    for (const crossTarget of listCargoCrossTestTargets(join(workspaceRoot, cargoWorkspaceRoot))) {
+      Object.assign(
+        targets,
+        createCargoCrossTestTargets(
+          cargoWorkspaceRoot,
+          nextestToolConfigArg(workspaceRoot, cargoWorkspaceRoot, PLUGIN_NEXTEST_CONFIG),
+          crossTarget,
+          [...workspaceCargoInputs, `{projectRoot}/${NEXTEST_REPO_CONFIG_PATH}`],
+        ),
+      );
+    }
     const aggregateDependencies = cargoWorkspace.packages.flatMap((plan) =>
       plan.pieces.map((piece) =>
         cargoTargetDependency(projectName, {
