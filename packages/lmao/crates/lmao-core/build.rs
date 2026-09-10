@@ -407,13 +407,22 @@ fn write_source_git(entries: &BTreeMap<String, String>, revision: Option<&str>) 
         "cargo:rustc-env=LMAO_GIT_REVISION={}",
         revision.unwrap_or_default()
     );
-    let mut generated = String::from(
-        "#[doc(hidden)]\n#[inline(always)]\npub fn source_git_sha(file: &str) -> Option<&'static str> {\n    match file {\n",
-    );
-    for (file, sha) in entries {
-        writeln!(generated, "        {file:?} => Some({sha:?}),")
-            .expect("writing to String cannot fail");
+    let mut generated = String::from("#[doc(hidden)]\n#[inline(always)]\n");
+    if entries.is_empty() {
+        // No map when git had no answer: a lone `_ => None` arm fails clippy's
+        // `match_single_binding` under `-D warnings`.
+        generated.push_str(
+            "pub fn source_git_sha(_file: &str) -> Option<&'static str> {\n    None\n}\n",
+        );
+    } else {
+        generated.push_str(
+            "pub fn source_git_sha(file: &str) -> Option<&'static str> {\n    match file {\n",
+        );
+        for (file, sha) in entries {
+            writeln!(generated, "        {file:?} => Some({sha:?}),")
+                .expect("writing to String cannot fail");
+        }
+        generated.push_str("        _ => None,\n    }\n}\n");
     }
-    generated.push_str("        _ => None,\n    }\n}\n");
     write_generated("source_git.rs", generated);
 }
