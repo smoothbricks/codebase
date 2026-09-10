@@ -129,6 +129,16 @@ fn walk(
                 visit(ops[5 + num_fields * 2], ColumnUse::Read);
             }
             Opcode::BatchStructMapProbeScatter => visit(ops[1], ColumnUse::Read),
+            Opcode::BatchStructMapScatter => {
+                // ops[0]=route_col, ops[1]=op_col, ops[2]=key_col,
+                // ops[3]=num_routes, then [kind, dest_slot, dest_field, v_col]
+                // × num_routes — the route table's v columns are reads too.
+                read(visit, &ops[0..3]);
+                let num_routes = usize::from(ops[3]);
+                for ri in 0..num_routes {
+                    visit(ops[4 + ri * 4 + 3], ColumnUse::Read);
+                }
+            }
             Opcode::BatchSetInsert
             | Opcode::BatchSetRemove
             | Opcode::BatchBitmapAdd

@@ -290,7 +290,17 @@ export enum Opcode {
   //   num_routes:u8,
   //   [kind:u8, dest_slot:u8, dest_field_idx:u8, out_key_col:u8, v_src_field_idx:u8] × num_routes
   BATCH_STRUCT_MAP_PROBE_SCATTER = 0x2f,
-  //#endregion reduce-typed-state.scatter-op
+
+  // Attribute-routed datom dispatch, probe-free. The resolved datom IS the
+  // FLAT_MAP element — commits arrive A-partitioned, alpha-memory-shaped —
+  // so route/op/destination-key/value read from element columns and no datom
+  // row is ever materialized in reducer state. Kind arms, the identical-assert
+  // no-op, and the retract-iff-current rule are byte-identical to 0x2f minus
+  // the probe. Variable-length operands:
+  //   route_col:u8, op_col:u8, key_col:u8, num_routes:u8,
+  //   [kind:u8, dest_slot:u8, dest_field_idx:u8, v_col:u8] × num_routes
+  BATCH_STRUCT_MAP_SCATTER = 0x3e,
+  //#endregion reduce-typed-state.scatter-element-op
 
   // Batch HashSet ops
   BATCH_SET_INSERT = 0x30,

@@ -483,6 +483,17 @@ pub enum Opcode {
     /// probe_slot:u8, key_col:u8, miss_mode:u8(0=skip,1=null), route_col:u8, op_col:u8,
     /// num_routes:u8, \[kind:u8, dest_slot:u8, dest_field_idx:u8, out_key_col:u8, v_src_field_idx:u8\] × num_routes
     BatchStructMapProbeScatter = 0x2f,
+    /// Attribute-routed datom dispatch, probe-free (body opcode, per FLAT_MAP
+    /// element). The resolved datom IS the element — 02i §9: commits arrive
+    /// A-partitioned, alpha-memory-shaped — so route/op/destination-key/value
+    /// read from element columns directly and no datom row is ever
+    /// materialized into reducer state. Kind-0/kind-1 arms and the
+    /// assert/retract semantics (retract clears iff the stored field equals
+    /// the column cell; never clearBitset) are byte-identical to
+    /// BatchStructMapProbeScatter minus the probe.
+    /// route_col:u8, op_col:u8, key_col:u8, num_routes:u8,
+    /// \[kind:u8, dest_slot:u8, dest_field_idx:u8, v_col:u8\] × num_routes
+    BatchStructMapScatter = 0x3e,
     /// slot:u8, elem_col:u8
     BatchSetInsert = 0x30,
     /// slot:u8, elem_col:u8
@@ -620,6 +631,7 @@ impl Opcode {
             0x3b => Self::BatchBitmapOrScratch,
             0x3c => Self::BatchBitmapAndNotScratch,
             0x3d => Self::BatchBitmapXorScratch,
+            0x3e => Self::BatchStructMapScatter,
             0x40 => Self::BatchAggSum,
             0x41 => Self::BatchAggCount,
             0x42 => Self::BatchAggMin,

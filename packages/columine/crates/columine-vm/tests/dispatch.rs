@@ -1017,6 +1017,573 @@ fn probe_scatter_kind0_retract_clear_then_rollback_restores_value_and_bit() {
 }
 
 // =============================================================================
+// STRUCT_MAP_SCATTER 0x3e — probe-free attribute-routed dispatch ()
+// =============================================================================
+
+/// One resolved datom element of a `BATCH_STRUCT_MAP_SCATTER` batch.
+/// Columns: 0=type(FOR_EACH filter), 1=offsets(FLAT_MAP child), 2=route(u32),
+/// 3=op(u32), 4=key(u32), 5=v_str(interned u32), 6=v_num(f64),
+/// 7=v_set(interned composite u32).
+struct ScatterElement {
+    route: u32,
+    op_retract: u32,
+    key: u32,
+    v_str: u32,
+    v_num: f64,
+    v_set: u32,
+}
+
+const SKIP_ROUTE: u32 = 0xFFFF_FFFF;
+
+/// FOR_EACH { FLAT_MAP { 0x3e } } over slots 0=nodes, 1=nodeDeps, 2=nodeTouch.
+/// Route table mirrors the 0x2f suite's five routes minus the probe.
+fn build_struct_map_scatter_program(type_id: u32) -> Vec<u8> {
+    let mut init = Vec::new();
+    // Slot 0: nodes [title:STR, status:STR, boost:F64]
+    init.extend(slot_struct_map(0, 6, 4, &[4, 4, 2]));
+    // Slots 1, 2: HASHSET nodeDeps / nodeTouch
+    init.extend(slot_def(1, 1, 4, 0));
+    init.extend(slot_def(2, 1, 4, 0));
+
+    // 0x3e body: route_col=2, op_col=3, key_col=4, 5 routes.
+    #[rustfmt::skip]
+    let scatter: [u8; 25] = [
+        0x3e, 2, 3, 4, 5,
+        0, 0, 0, 5, // route 0: kind0 -> nodes.title, v=v_str
+        0, 0, 1, 5, // route 1: kind0 -> nodes.status, v=v_str
+        1, 1, 0, 7, // route 2: kind1 -> nodeDeps, v=v_set
+        1, 2, 0, 7, // route 3: kind1 -> nodeTouch, v=v_set
+        0, 0, 2, 6, // route 4: kind0 -> nodes.boost, v=v_num
+    ];
+    let mut flat_map = vec![0xE1, 1, 0xFF];
+    flat_map.extend((scatter.len() as u16).to_le_bytes());
+    flat_map.extend(scatter);
+    let mut reduce = vec![0xE0, 0, 1];
+    reduce.extend(type_id.to_le_bytes());
+    reduce.extend((flat_map.len() as u16).to_le_bytes());
+    reduce.extend(&flat_map);
+    program(3, 8, &init, &reduce)
+}
+
+fn run_struct_scatter(
+    vm: &mut Vm,
+    state: &mut [u8],
+    prog: &[u8],
+    type_id: u32,
+    elements: &[ScatterElement],
+) -> u32 {
+    let types: Vec<u32> = vec![type_id; elements.len()];
+    let routes: Vec<u32> = elements.iter().map(|e| e.route).collect();
+    let ops: Vec<u32> = elements.iter().map(|e| e.op_retract).collect();
+    let keys: Vec<u32> = elements.iter().map(|e| e.key).collect();
+    let v_strs: Vec<u32> = elements.iter().map(|e| e.v_str).collect();
+    let v_nums: Vec<f64> = elements.iter().map(|e| e.v_num).collect();
+    let v_sets: Vec<u32> = elements.iter().map(|e| e.v_set).collect();
+    let n = elements.len() as u32;
+    let offsets = [0u32, n];
+    let cols: Vec<&[u8]> = vec![
+        u32s_as_bytes(&types),
+        u32s_as_bytes(&offsets),
+        u32s_as_bytes(&routes),
+        u32s_as_bytes(&ops),
+        u32s_as_bytes(&keys),
+        u32s_as_bytes(&v_strs),
+        f64s_as_bytes(&v_nums),
+        u32s_as_bytes(&v_sets),
+    ];
+    vm.execute_batch(state, prog, &cols, 1)
+}
+
+/// The 0x2f parity fixture replayed through the probe-free opcode: same
+/// datoms, same final slots, no staged row materialized anywhere.
+#[test]
+fn struct_scatter_apply_datom_parity_across_kinds_and_skip() {
+    const T: u32 = 2102;
+    let prog = build_struct_map_scatter_program(T);
+    let mut state = init(&prog);
+    let mut vm = Vm::default();
+
+    let elements = [
+        ScatterElement {
+            route: 0,
+            op_retract: 0,
+            key: 500,
+            v_str: 7001,
+            v_num: 0.0,
+            v_set: 0,
+        },
+        ScatterElement {
+            route: 1,
+            op_retract: 0,
+            key: 500,
+            v_str: 7002,
+            v_num: 0.0,
+            v_set: 0,
+        },
+        ScatterElement {
+            route: 2,
+            op_retract: 0,
+            key: 0,
+            v_str: 7003,
+            v_num: 0.0,
+            v_set: 8003,
+        },
+        ScatterElement {
+            route: 3,
+            op_retract: 0,
+            key: 0,
+            v_str: 7004,
+            v_num: 0.0,
+            v_set: 8004,
+        },
+        ScatterElement {
+            route: 0,
+            op_retract: 1,
+            key: 500,
+            v_str: 7001,
+            v_num: 0.0,
+            v_set: 0,
+        },
+        ScatterElement {
+            route: 1,
+            op_retract: 1,
+            key: 500,
+            v_str: 9999,
+            v_num: 0.0,
+            v_set: 0,
+        },
+        ScatterElement {
+            route: 4,
+            op_retract: 0,
+            key: 500,
+            v_str: 0,
+            v_num: 2.5,
+            v_set: 0,
+        },
+        ScatterElement {
+            route: SKIP_ROUTE,
+            op_retract: 0,
+            key: 0,
+            v_str: 0,
+            v_num: 0.0,
+            v_set: 0,
+        },
+        ScatterElement {
+            route: 3,
+            op_retract: 1,
+            key: 0,
+            v_str: 7004,
+            v_num: 0.0,
+            v_set: 8004,
+        },
+    ];
+    assert_eq!(
+        OK,
+        run_struct_scatter(&mut vm, &mut state, &prog, T, &elements)
+    );
+
+    // nodes (slot 0): row 500 — bitset(1) + title(4) + status(4) + boost(8).
+    let row_500 = struct_map_row(&state, 0, 500);
+    assert_ne!(0xFFFF_FFFF, row_500);
+    assert!(!bit_set(&state, row_500, 0)); // title retracted (MATCH)
+    assert_eq!(0, bytes::read_u32(&state, row_500 + 1));
+    assert!(bit_set(&state, row_500, 1)); // status survives NON-MATCH retract
+    assert_eq!(7002, bytes::read_u32(&state, row_500 + 5));
+    assert!(bit_set(&state, row_500, 2)); // boost via typed v_num
+    assert_eq!(2.5, f64::from_bits(bytes::read_u64(&state, row_500 + 9)));
+
+    // nodeDeps (slot 1): {(e,7003)=8003} deduped -> size 1.
+    assert_eq!(1, slot_size(&state, 1));
+    let (d_off, d_cap) = (slot_offset(&state, 1), slot_cap(&state, 1));
+    assert!(vm_set_contains(&state, d_off, d_cap, 8003));
+
+    // nodeTouch (slot 2): asserted then retracted -> empty.
+    assert_eq!(0, slot_size(&state, 2));
+    let (t_off, t_cap) = (slot_offset(&state, 2), slot_cap(&state, 2));
+    assert!(!vm_set_contains(&state, t_off, t_cap, 8004));
+}
+
+#[test]
+fn struct_scatter_kind0_insert_sets_effective_flag_without_delta_mode() {
+    const T: u32 = 2106;
+    let prog = build_struct_map_scatter_program(T);
+    let mut state = init(&prog);
+    let mut vm = Vm::default();
+
+    let assert_title = [ScatterElement {
+        route: 0,
+        op_retract: 0,
+        key: 600,
+        v_str: 7001,
+        v_num: 0.0,
+        v_set: 0,
+    }];
+    vm.undo_enable(&state);
+    let cp = vm.undo_checkpoint();
+
+    assert_eq!(
+        OK,
+        run_struct_scatter(&mut vm, &mut state, &prog, T, &assert_title)
+    );
+    assert_eq!(ChangeFlag::INSERTED, slot_change_flags(&state, 0));
+    assert!(vm.undo_checkpoint() > cp);
+    let row = struct_map_row(&state, 0, 600);
+    assert_ne!(0xFFFF_FFFF, row);
+    assert!(bit_set(&state, row, 0));
+    assert_eq!(7001, bytes::read_u32(&state, row + 1));
+}
+
+#[test]
+fn struct_scatter_kind0_differing_assert_sets_updated_without_delta_mode() {
+    const T: u32 = 2107;
+    let prog = build_struct_map_scatter_program(T);
+    let mut state = init(&prog);
+    let mut vm = Vm::default();
+
+    let first = [ScatterElement {
+        route: 0,
+        op_retract: 0,
+        key: 600,
+        v_str: 7001,
+        v_num: 0.0,
+        v_set: 0,
+    }];
+    let second = [ScatterElement {
+        route: 0,
+        op_retract: 0,
+        key: 600,
+        v_str: 7002,
+        v_num: 0.0,
+        v_set: 0,
+    }];
+    assert_eq!(
+        OK,
+        run_struct_scatter(&mut vm, &mut state, &prog, T, &first)
+    );
+    clear_slot_change_flags(&mut state, 0);
+    vm.undo_enable(&state);
+    let cp = vm.undo_checkpoint();
+
+    assert_eq!(
+        OK,
+        run_struct_scatter(&mut vm, &mut state, &prog, T, &second)
+    );
+    assert_eq!(ChangeFlag::UPDATED, slot_change_flags(&state, 0));
+    assert!(vm.undo_checkpoint() > cp);
+    let row = struct_map_row(&state, 0, 600);
+    assert!(bit_set(&state, row, 0));
+    assert_eq!(7002, bytes::read_u32(&state, row + 1));
+}
+
+#[test]
+fn struct_scatter_kind0_identical_assert_is_noop_without_undo_or_flag() {
+    const T: u32 = 2108;
+    let prog = build_struct_map_scatter_program(T);
+    let mut state = init(&prog);
+    let mut vm = Vm::default();
+
+    let element = [ScatterElement {
+        route: 0,
+        op_retract: 0,
+        key: 600,
+        v_str: 7001,
+        v_num: 0.0,
+        v_set: 0,
+    }];
+    assert_eq!(
+        OK,
+        run_struct_scatter(&mut vm, &mut state, &prog, T, &element)
+    );
+    clear_slot_change_flags(&mut state, 0);
+    vm.undo_enable(&state);
+    let cp = vm.undo_checkpoint();
+    let before = state.clone();
+
+    assert_eq!(
+        OK,
+        run_struct_scatter(&mut vm, &mut state, &prog, T, &element)
+    );
+    assert_eq!(0, slot_change_flags(&state, 0));
+    assert_eq!(cp, vm.undo_checkpoint());
+    assert_eq!(before, state);
+}
+
+#[test]
+fn struct_scatter_kind0_retract_only_matching_value_removes() {
+    const T: u32 = 2109;
+    let prog = build_struct_map_scatter_program(T);
+    let mut state = init(&prog);
+    let mut vm = Vm::default();
+
+    let assert_title = [ScatterElement {
+        route: 0,
+        op_retract: 0,
+        key: 600,
+        v_str: 7001,
+        v_num: 0.0,
+        v_set: 0,
+    }];
+    let nonmatch = [ScatterElement {
+        route: 0,
+        op_retract: 1,
+        key: 600,
+        v_str: 9999,
+        v_num: 0.0,
+        v_set: 0,
+    }];
+    let matching = [ScatterElement {
+        route: 0,
+        op_retract: 1,
+        key: 600,
+        v_str: 7001,
+        v_num: 0.0,
+        v_set: 0,
+    }];
+    assert_eq!(
+        OK,
+        run_struct_scatter(&mut vm, &mut state, &prog, T, &assert_title)
+    );
+    clear_slot_change_flags(&mut state, 0);
+    vm.undo_enable(&state);
+    let cp = vm.undo_checkpoint();
+    let before = state.clone();
+
+    assert_eq!(
+        OK,
+        run_struct_scatter(&mut vm, &mut state, &prog, T, &nonmatch)
+    );
+    assert_eq!(0, slot_change_flags(&state, 0));
+    assert_eq!(cp, vm.undo_checkpoint());
+    assert_eq!(before, state);
+
+    assert_eq!(
+        OK,
+        run_struct_scatter(&mut vm, &mut state, &prog, T, &matching)
+    );
+    assert_eq!(ChangeFlag::REMOVED, slot_change_flags(&state, 0));
+    assert!(vm.undo_checkpoint() > cp);
+    let row = struct_map_row(&state, 0, 600);
+    assert!(!bit_set(&state, row, 0));
+    assert_eq!(0, bytes::read_u32(&state, row + 1));
+}
+
+#[test]
+fn struct_scatter_card_many_keeps_two_entities_sharing_a_value_distinct() {
+    const T: u32 = 2105;
+    let prog = build_struct_map_scatter_program(T);
+    let mut state = init(&prog);
+    let mut vm = Vm::default();
+
+    let elements = [
+        ScatterElement {
+            route: 2,
+            op_retract: 0,
+            key: 100,
+            v_str: 7003,
+            v_num: 0.0,
+            v_set: 8101,
+        },
+        ScatterElement {
+            route: 2,
+            op_retract: 0,
+            key: 200,
+            v_str: 7003,
+            v_num: 0.0,
+            v_set: 8102,
+        },
+    ];
+    assert_eq!(
+        OK,
+        run_struct_scatter(&mut vm, &mut state, &prog, T, &elements)
+    );
+
+    assert_eq!(2, slot_size(&state, 1));
+    let (d_off, d_cap) = (slot_offset(&state, 1), slot_cap(&state, 1));
+    assert!(vm_set_contains(&state, d_off, d_cap, 8101));
+    assert!(vm_set_contains(&state, d_off, d_cap, 8102));
+    assert!(!vm_set_contains(&state, d_off, d_cap, 7003));
+}
+
+#[test]
+fn struct_scatter_kind0_assert_then_rollback_restores_absence() {
+    const T: u32 = 2103;
+    let prog = build_struct_map_scatter_program(T);
+    let mut state = init(&prog);
+    let mut vm = Vm::default();
+
+    let assert_title = [ScatterElement {
+        route: 0,
+        op_retract: 0,
+        key: 600,
+        v_str: 7001,
+        v_num: 0.0,
+        v_set: 0,
+    }];
+
+    assert_eq!(0xFFFF_FFFF, struct_map_row(&state, 0, 600));
+
+    vm.undo_enable(&state);
+    let cp = vm.undo_checkpoint();
+    assert_eq!(
+        OK,
+        run_struct_scatter(&mut vm, &mut state, &prog, T, &assert_title)
+    );
+
+    let row_after = struct_map_row(&state, 0, 600);
+    assert_ne!(0xFFFF_FFFF, row_after);
+    assert!(bit_set(&state, row_after, 0));
+    assert_eq!(7001, bytes::read_u32(&state, row_after + 1));
+    assert_eq!(1, slot_size(&state, 0));
+
+    vm.undo_rollback(&mut state, cp);
+    assert_eq!(0xFFFF_FFFF, struct_map_row(&state, 0, 600));
+    assert_eq!(0, slot_size(&state, 0));
+    vm.undo_commit();
+}
+
+#[test]
+fn struct_scatter_kind0_retract_clear_then_rollback_restores_value_and_bit() {
+    const T: u32 = 2104;
+    let prog = build_struct_map_scatter_program(T);
+    let mut state = init(&prog);
+    let mut vm = Vm::default();
+
+    let assert_title = [ScatterElement {
+        route: 0,
+        op_retract: 0,
+        key: 700,
+        v_str: 7001,
+        v_num: 0.0,
+        v_set: 0,
+    }];
+    let retract_title = [ScatterElement {
+        route: 0,
+        op_retract: 1,
+        key: 700,
+        v_str: 7001,
+        v_num: 0.0,
+        v_set: 0,
+    }];
+
+    // Commit the assert WITHOUT undo.
+    assert_eq!(
+        OK,
+        run_struct_scatter(&mut vm, &mut state, &prog, T, &assert_title)
+    );
+    let row = struct_map_row(&state, 0, 700);
+    assert_ne!(0xFFFF_FFFF, row);
+    assert!(bit_set(&state, row, 0));
+    assert_eq!(7001, bytes::read_u32(&state, row + 1));
+
+    vm.undo_enable(&state);
+    let cp = vm.undo_checkpoint();
+    assert_eq!(
+        OK,
+        run_struct_scatter(&mut vm, &mut state, &prog, T, &retract_title)
+    );
+    assert!(!bit_set(&state, row, 0));
+    assert_eq!(0, bytes::read_u32(&state, row + 1));
+
+    vm.undo_rollback(&mut state, cp);
+    assert!(bit_set(&state, row, 0));
+    assert_eq!(7001, bytes::read_u32(&state, row + 1));
+    vm.undo_commit();
+}
+
+/// A route kind outside the implemented set refuses by name — the same
+/// INVALID_PROGRAM contract 0x2f carries for its Phase-2 placeholder.
+#[test]
+fn struct_scatter_unknown_route_kind_is_invalid_program() {
+    const T: u32 = 2110;
+    let prog = build_struct_map_scatter_program(T);
+    let mut state = init(&prog);
+    let mut vm = Vm::default();
+
+    // Kind 2 routes to a real slot but is never emitted; the boundary refuses.
+    let mut patched = prog.clone();
+    let kind_off = prog
+        .windows(25)
+        .position(|w| {
+            w == [
+                0x3e, 2, 3, 4, 5, 0, 0, 0, 5, 0, 0, 1, 5, 1, 1, 0, 7, 1, 2, 0, 7, 0, 0, 2, 6,
+            ]
+        })
+        .expect("0x3e body in program");
+    patched[kind_off + 5 + 4 * 4] = 2; // route 4's kind byte
+    let element = [ScatterElement {
+        route: 4,
+        op_retract: 0,
+        key: 600,
+        v_str: 0,
+        v_num: 1.0,
+        v_set: 0,
+    }];
+    assert_eq!(
+        ErrorCode::InvalidProgram as u32,
+        run_struct_scatter(&mut vm, &mut state, &patched, T, &element)
+    );
+}
+
+/// An array-typed destination field has no column-cell value form; the
+/// boundary refuses by name instead of comparing field bytes against garbage.
+#[test]
+fn struct_scatter_array_destination_is_invalid_program() {
+    const T: u32 = 2111;
+    let mut init_code = Vec::new();
+    // Slot 0: nodes [title:STR, tags:ARRAY_U32]
+    init_code.extend(slot_struct_map(0, 6, 4, &[4, 5]));
+    let scatter: [u8; 9] = [0x3e, 2, 3, 4, 1, 0, 0, 1, 5];
+    let mut flat_map = vec![0xE1, 1, 0xFF];
+    flat_map.extend((scatter.len() as u16).to_le_bytes());
+    flat_map.extend(scatter);
+    let mut reduce = vec![0xE0, 0, 1];
+    reduce.extend(T.to_le_bytes());
+    reduce.extend((flat_map.len() as u16).to_le_bytes());
+    reduce.extend(&flat_map);
+    let prog = program(1, 8, &init_code, &reduce);
+    let mut state = init(&prog);
+    let mut vm = Vm::default();
+
+    let element = [ScatterElement {
+        route: 0,
+        op_retract: 0,
+        key: 600,
+        v_str: 7001,
+        v_num: 0.0,
+        v_set: 0,
+    }];
+    assert_eq!(
+        ErrorCode::InvalidProgram as u32,
+        run_struct_scatter(&mut vm, &mut state, &prog, T, &element)
+    );
+}
+
+/// Sentinel destination keys are never written (the same guard the keyed
+/// struct-map upserts carry).
+#[test]
+fn struct_scatter_sentinel_key_is_skipped() {
+    const T: u32 = 2112;
+    let prog = build_struct_map_scatter_program(T);
+    let mut state = init(&prog);
+    let mut vm = Vm::default();
+
+    let element = [ScatterElement {
+        route: 0,
+        op_retract: 0,
+        key: EMPTY_KEY,
+        v_str: 7001,
+        v_num: 0.0,
+        v_set: 0,
+    }];
+    assert_eq!(
+        OK,
+        run_struct_scatter(&mut vm, &mut state, &prog, T, &element)
+    );
+    assert_eq!(0xFFFF_FFFF, struct_map_row(&state, 0, EMPTY_KEY));
+    assert_eq!(0, slot_size(&state, 0));
+}
+
+// =============================================================================
 // STRUCT_MAP_UPSERT_LAST 0x80 rollback ()
 // =============================================================================
 

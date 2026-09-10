@@ -25,7 +25,7 @@ use crate::meta::{SlotMetaView, slot_meta_base};
 use crate::nested;
 use crate::row_exprs::LiveColumns;
 use crate::state_init::{self, ARENA_HEADER_SIZE, EVICTION_ENTRY_SIZE, NEEDS_GROWTH_SLOT};
-use crate::struct_map::{StructMap2Slot, StructMapSlot};
+use crate::struct_map::{StructMap2Slot, StructMapSlot, scalar_cell_encoded};
 use crate::undo_log::{
     self, FLAT_UNDO_ENTRY_SIZE, FlatUndoEntry, FlatUndoOp, SMF_BIT_SET, SMF_ROW_ABSENT,
     SMR_ROW_ABSENT,
@@ -2581,7 +2581,12 @@ pub(crate) fn body_op_len(code: &[u8], pc: usize) -> Option<usize> {
             let num_routes = usize::from(*code.get(pc.checked_add(6)?)?);
             7usize.checked_add(num_routes.checked_mul(5)?)?
         }
-        //#endregion struct-map scatter length
+        //#region reduce-typed-state.scatter-element-len
+        Opcode::BatchStructMapScatter => {
+            let num_routes = usize::from(*code.get(pc.checked_add(4)?)?);
+            5usize.checked_add(num_routes.checked_mul(4)?)?
+        }
+        //#endregion struct-map scatter-element length
         Opcode::BatchSetInsert
         | Opcode::BatchSetRemove
         | Opcode::BatchBitmapAdd
@@ -4481,6 +4486,203 @@ impl Vm {
                     }
                 }
                 //#endregion reduce-typed-state.scatter-exec
+
+                //#region reduce-typed-state.scatter-element-exec
+                // STRUCT_MAP_SCATTER (0x3e) — probe-free attribute-routed
+                // dispatch. The resolved datom IS the FLAT_MAP element (02i §9:
+                // commits arrive A-partitioned, alpha-memory-shaped), so
+                // route/op/destination-key/value read from element columns and
+                // no datom row is ever materialized in reducer state. Kind
+                // arms, the identical-assert no-op, and the retract-iff-current
+                // rule are byte-identical to 0x2f minus the probe.
+                Opcode::BatchStructMapScatter => {
+                    let (route_col, op_col, key_col, num_routes) = (
+                        body[bpc + 1],
+                        body[bpc + 2],
+                        body[bpc + 3],
+                        body[bpc + 4] as usize,
+                    );
+                    bpc += 5;
+
+                    let mut route_kinds = [0u8; 32];
+                    let mut route_dest_slots = [0u8; 32];
+                    let mut route_dest_fields = [0u8; 32];
+                    let mut route_v_cols = [0u8; 32];
+                    for ri in 0..num_routes {
+                        route_kinds[ri] = body[bpc];
+                        route_dest_slots[ri] = body[bpc + 1];
+                        route_dest_fields[ri] = body[bpc + 2];
+                        route_v_cols[ri] = body[bpc + 3];
+                        bpc += 4;
+                    }
+
+                    let key = cell_u32(cols, key_col, child_idx);
+                    if key == EMPTY_KEY || key == TOMBSTONE {
+                        continue;
+                    }
+                    let route_ord = cell_u32(cols, route_col, child_idx);
+                    if route_ord == 0xFFFF_FFFF || route_ord as usize >= num_routes {
+                        continue; // SKIP / out-of-range → SKIP
+                    }
+                    let is_retract = cell_u32(cols, op_col, child_idx) != 0;
+                    let ri = route_ord as usize;
+                    let route_kind = route_kinds[ri];
+                    let dest_slot = route_dest_slots[ri];
+                    let dest_field_idx = route_dest_fields[ri];
+                    let v_col = route_v_cols[ri];
+
+                    match route_kind {
+                        // kind 0: card-one struct field on the `nodes` map.
+                        0 => {
+                            let out = StructMapSlot::bind(state, dest_slot);
+                            let dst_ft = out.field_type(state, dest_field_idx);
+                            let Some((cell, cell_size)) = scalar_cell_encoded(
+                                dst_ft,
+                                col_at(cols, v_col as usize),
+                                child_idx,
+                            ) else {
+                                // Array destinations have no column-cell value
+                                // form; refuse by name instead of comparing
+                                // field bytes against garbage.
+                                return INVALID_PROGRAM;
+                            };
+
+                            if !is_retract {
+                                let Some(up) = out.upsert(state, key) else {
+                                    NEEDS_GROWTH_SLOT.store(dest_slot, Ordering::Relaxed);
+                                    return NEEDS_GROWTH;
+                                };
+                                let row = out.row_off(up.pos);
+                                let dst_off = row + out.field_offset(state, dest_field_idx);
+
+                                let prior_bit =
+                                    StructMapSlot::is_field_set(state, row, dest_field_idx);
+                                let value_matches = prior_bit
+                                    && state[dst_off as usize..(dst_off + cell_size) as usize]
+                                        == cell[..cell_size as usize];
+                                if value_matches {
+                                    continue;
+                                }
+
+                                if self.undo.enabled {
+                                    let undo_flags = if up.is_new {
+                                        SMF_ROW_ABSENT
+                                    } else if prior_bit {
+                                        SMF_BIT_SET
+                                    } else {
+                                        0
+                                    };
+                                    let prior_aux = if up.is_new || !prior_bit {
+                                        0
+                                    } else {
+                                        pack_field_bytes(
+                                            &state
+                                                [dst_off as usize..(dst_off + cell_size) as usize],
+                                        )
+                                    };
+                                    let smf = |pad2: u8, aux: u64| FlatUndoEntry {
+                                        op: FlatUndoOp::StructMapField,
+                                        slot: dest_slot,
+                                        pad1: dest_field_idx,
+                                        pad2,
+                                        key,
+                                        prev_value: 0,
+                                        aux,
+                                    };
+                                    append_mutation_state(
+                                        &mut self.undo,
+                                        delta_mode,
+                                        state,
+                                        smf(undo_flags, prior_aux),
+                                        smf(
+                                            SMF_BIT_SET,
+                                            pack_field_bytes(&cell[..cell_size as usize]),
+                                        ),
+                                    );
+                                }
+
+                                out.write_scalar_field(
+                                    state,
+                                    up.pos,
+                                    dest_field_idx,
+                                    cols,
+                                    v_col,
+                                    child_idx,
+                                );
+                                let meta_base = slot_meta_base(dest_slot);
+                                state[(meta_base + SlotMetaOffset::CHANGE_FLAGS) as usize] |=
+                                    if prior_bit {
+                                        ChangeFlag::UPDATED
+                                    } else {
+                                        ChangeFlag::INSERTED
+                                    };
+                            } else if let Some(pos) = out.find(state, key) {
+                                let row = out.row_off(pos);
+                                let dst_off = row + out.field_offset(state, dest_field_idx);
+                                // Retract is a no-op unless the stored value matches v.
+                                let stored_matches =
+                                    StructMapSlot::is_field_set(state, row, dest_field_idx)
+                                        && state[dst_off as usize..(dst_off + cell_size) as usize]
+                                            == cell[..cell_size as usize];
+                                if stored_matches {
+                                    if self.undo.enabled {
+                                        let prior_aux = pack_field_bytes(
+                                            &state
+                                                [dst_off as usize..(dst_off + cell_size) as usize],
+                                        );
+                                        let smf = |pad2: u8, aux: u64| FlatUndoEntry {
+                                            op: FlatUndoOp::StructMapField,
+                                            slot: dest_slot,
+                                            pad1: dest_field_idx,
+                                            pad2,
+                                            key,
+                                            prev_value: 0,
+                                            aux,
+                                        };
+                                        append_mutation_state(
+                                            &mut self.undo,
+                                            delta_mode,
+                                            state,
+                                            smf(SMF_BIT_SET, prior_aux),
+                                            smf(0, 0),
+                                        );
+                                    }
+                                    StructMapSlot::clear_scalar_field(state, row, dest_field_idx);
+                                    bytes::zero(state, dst_off, cell_size);
+                                    let meta_base = slot_meta_base(dest_slot);
+                                    state[(meta_base + SlotMetaOffset::CHANGE_FLAGS) as usize] |=
+                                        ChangeFlag::REMOVED;
+                                }
+                            }
+                        }
+                        // kind 1: card-many set — element is the precomputed
+                        // interned composite (e, v) read from its column.
+                        1 => {
+                            let meta = SlotMetaView::read(state, dest_slot);
+                            let v = cell_u32(cols, v_col, child_idx);
+                            if is_retract {
+                                self.set_remove(delta_mode, state, &meta, dest_slot, &[v]);
+                            } else {
+                                let set_result = self.set_insert(
+                                    delta_mode,
+                                    state,
+                                    &meta,
+                                    dest_slot,
+                                    &[v],
+                                    meta.has_ttl().then_some(&[0.0][..]),
+                                );
+                                // Any failure requests growth so the caller can retry.
+                                if set_result != ErrorCode::Ok {
+                                    NEEDS_GROWTH_SLOT.store(dest_slot, Ordering::Relaxed);
+                                    return NEEDS_GROWTH;
+                                }
+                            }
+                        }
+                        // kind 2: deferred to Phase 2 — never emitted.
+                        _ => return INVALID_PROGRAM,
+                    }
+                }
+                //#endregion reduce-typed-state.scatter-element-exec
 
                 // LIST_APPEND (0x84)
                 Opcode::ListAppend => {
