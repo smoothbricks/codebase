@@ -50,6 +50,41 @@ fn write_scalar_cell(
         | StructFieldType::ArrayBool => {}
     }
 }
+/// Encode one column cell exactly as [`write_scalar_cell`] writes it, so the
+/// probe-free scatter (0x3e) can equality-check a stored field against the
+/// incoming cell without writing. Lives beside [`write_scalar_cell`]: the two
+/// encodings are one contract, and a drift between them would silently break
+/// the scatter's retract-iff-current semantics.
+///
+/// `None` for array field types — a 0x3e route destination is a scalar field
+/// by definition (the value source is a column cell, not a same-layout field),
+/// and an array route is refused by name instead of comparing garbage.
+pub(crate) fn scalar_cell_encoded(
+    ft: StructFieldType,
+    col: &[u8],
+    element_idx: u32,
+) -> Option<([u8; 8], u32)> {
+    match ft {
+        StructFieldType::UInt32 | StructFieldType::String => {
+            let mut buf = [0u8; 8];
+            buf[..4].copy_from_slice(&bytes::read_u32(col, element_idx * 4).to_le_bytes());
+            Some((buf, 4))
+        }
+        StructFieldType::Int64 | StructFieldType::Float64 => {
+            Some((bytes::read_u64(col, element_idx * 8).to_le_bytes(), 8))
+        }
+        StructFieldType::Bool => {
+            let mut buf = [0u8; 8];
+            buf[0] = u8::from(bytes::read_u32(col, element_idx * 4) != 0);
+            Some((buf, 1))
+        }
+        StructFieldType::ArrayU32
+        | StructFieldType::ArrayI64
+        | StructFieldType::ArrayF64
+        | StructFieldType::ArrayString
+        | StructFieldType::ArrayBool => None,
+    }
+}
 
 /// Bound struct-map view carrying offsets into the state buffer.
 /// No pointers into state are formed.
