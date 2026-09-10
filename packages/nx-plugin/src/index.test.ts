@@ -1659,28 +1659,101 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
     }
   });
 
-  it('never caches a declared deploy, and puts its build half in front of it', async () => {
+  it('gives a wrangler project a deploy that runs the stage CLI, uncached, behind its build half', async () => {
     const workspace = await createWorkspace();
-    const declared = {
-      deploy: { executor: 'nx:run-commands', options: { command: 'smoo wrangler deploy-stage --stage={args.stage}' } },
-      'deploy-build': { executor: 'nx:run-commands', options: { command: 'bun tooling/build-site.ts' } },
-    };
     try {
-      await workspace.write('packages/site/package.json', JSON.stringify({ name: 'site', nx: { targets: declared } }));
+      await workspace.write('packages/site/package.json', '{"name":"site"}\n');
+      await workspace.write('packages/site/wrangler.toml', 'name = "site"\n');
       const targets = await inferProjectTargets(workspace, 'packages/site/package.json');
 
-      const deploy = resolveDeclaredOverInferred(targets, declared, 'deploy');
+      // One target taking a stage, never a configuration per stage: pull-request stages are
+      // `prN` for unbounded N, so `--configuration` could not name the stage that matters most.
+      expect(targets.deploy?.options).toEqual({
+        command: 'smoo wrangler deploy-stage --stage {args.stage}',
+        cwd: 'packages/site',
+      });
+      // That exact string is load-bearing beyond running: the CLI's `isStageDerivedDeploy`
+      // recognises a stage deploy by it, which is why the plugin emits it instead of asking
+      // every consumer to retype it and drift.
       // A cache hit on deploy would mean "we once uploaded this hash", which a rollback falsifies
       // silently; the step has to run and read live state instead.
-      expect(deploy?.cache).toBe(false);
-      expect(deploy?.dependsOn).toEqual(['deploy-build']);
-      expect(resolveDeclaredOverInferred(targets, declared, 'deploy-build')?.cache).toBe(true);
+      expect(targets.deploy?.cache).toBe(false);
+      expect(targets.deploy?.outputs).toEqual([]);
+      // No build half of any kind here, so no edge is claimed: wrangler bundles its own
+      // TypeScript, so a worker with neither `build` nor `deploy-build` is legitimate.
+      expect(targets.deploy?.dependsOn).toBeUndefined();
     } finally {
       await workspace.cleanup();
     }
   });
 
-  it('infers nothing for a project that declares no deploy', async () => {
+  it('points an inferred deploy at the declared deploy-build, and caches that half', async () => {
+    const workspace = await createWorkspace();
+    const declared = {
+      'deploy-build': { executor: 'nx:run-commands', options: { command: 'bun tooling/build-site.ts' } },
+    };
+    try {
+      await workspace.write('packages/site/package.json', JSON.stringify({ name: 'site', nx: { targets: declared } }));
+      await workspace.write('packages/site/wrangler.toml', 'name = "site"\n');
+      const targets = await inferProjectTargets(workspace, 'packages/site/package.json');
+
+      expect(targets.deploy?.dependsOn).toEqual(['deploy-build']);
+      // Only the project knows what building it means, so the plugin supplies the policy for
+      // that half and nothing else.
+      expect(resolveDeclaredOverInferred(targets, declared, 'deploy-build')?.cache).toBe(true);
+      expect(resolveDeclaredOverInferred(targets, declared, 'deploy-build')?.options).toEqual({
+        command: 'bun tooling/build-site.ts',
+      });
+    } finally {
+      await workspace.cleanup();
+    }
+  });
+
+  it('falls back to the aggregate build when a wrangler project emits one', async () => {
+    const workspace = await createWorkspace();
+    try {
+      await workspace.write('packages/site/package.json', '{"name":"site"}\n');
+      await workspace.write('packages/site/wrangler.toml', 'name = "site"\n');
+      // tsconfig.lib.json is what puts an emitting target, and so the `build` aggregate, on a project.
+      await workspace.write('packages/site/tsconfig.lib.json', '{}\n');
+      const targets = await inferProjectTargets(workspace, 'packages/site/package.json');
+
+      expect(targets.build).toBeDefined();
+      expect(targets.deploy?.dependsOn).toEqual(['build']);
+    } finally {
+      await workspace.cleanup();
+    }
+  });
+
+  it('lets a dependsOn-only declaration add a cross-project edge without restating the command', async () => {
+    const workspace = await createWorkspace();
+    // The whole point of inferring: ordering is expressed in Nx's own vocabulary, and the
+    // consumer never retypes the command, cwd, cache or outputs to get it.
+    const declared: Record<string, TargetConfiguration> = {
+      deploy: { dependsOn: ['...', { projects: ['backend'], target: 'deploy', params: 'forward' }] },
+    };
+    try {
+      await workspace.write('packages/site/package.json', JSON.stringify({ name: 'site', nx: { targets: declared } }));
+      await workspace.write('packages/site/wrangler.toml', 'name = "site"\n');
+      await workspace.write('packages/site/tsconfig.lib.json', '{}\n');
+      const targets = await inferProjectTargets(workspace, 'packages/site/package.json');
+
+      const deploy = resolveDeclaredOverInferred(targets, declared, 'deploy');
+      // `...` expands to the inferred list at its position, so the inferred build edge survives
+      // beside the declared one.
+      expect(deploy?.dependsOn).toEqual(['build', { projects: ['backend'], target: 'deploy', params: 'forward' }]);
+      expect(deploy?.options).toEqual({
+        command: 'smoo wrangler deploy-stage --stage {args.stage}',
+        cwd: 'packages/site',
+      });
+      expect(deploy?.cache).toBe(false);
+      expect(deploy?.outputs).toEqual([]);
+    } finally {
+      await workspace.cleanup();
+    }
+  });
+
+  it('infers no deploy for a project with no wrangler manifest', async () => {
     const workspace = await createWorkspace();
     try {
       await workspace.write('packages/lib/package.json', '{"name":"plain-lib"}\n');
@@ -1693,7 +1766,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
     }
   });
 
-  it('orders a three-project deploy chain through one run-many', async () => {
+  it('orders a three-project chain of INFERRED deploys through one run-many', async () => {
     const workspace = await createWorkspace();
     const root = workspace.context.workspaceRoot;
     const repositoryRoot = fileURLToPath(new URL('../../../', import.meta.url));
@@ -1707,10 +1780,12 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
           namedInputs: { default: ['{projectRoot}/**/*'] },
         }),
       );
-      // c is deepest: a's deploy calls into b's, b's calls into c's. Only the edges are declared;
-      // nothing here says "round one" or "round two", and no project knows the chain's depth.
+      // c is deepest: a's deploy calls into b's, b's calls into c's. No project declares a
+      // deploy target — each only has a wrangler manifest and, where it needs ordering, the
+      // edge. Nothing here says "round one" or "round two", and no project knows the depth.
       const chain: Record<string, string[]> = { a: ['b:deploy'], b: ['c:deploy'], c: [] };
       for (const [name, dependsOn] of Object.entries(chain)) {
+        await workspace.write(`packages/${name}/wrangler.toml`, `name = "${name}"\n`);
         await workspace.write(
           `packages/${name}/package.json`,
           JSON.stringify({
@@ -1718,10 +1793,10 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
             nx: {
               targets: {
                 deploy: {
-                  executor: 'nx:run-commands',
                   ...(dependsOn.length > 0 ? { dependsOn: ['...', ...dependsOn] } : {}),
-                  // A real deploy command consumes the stage through `{args.stage}`; this fixture
-                  // records the order and nothing else, so it declines the forwarded flags.
+                  // The real inferred command deploys to Cloudflare. Only `command` is
+                  // overridden, so this still proves the rest of the inferred target — the
+                  // executor that runs it, and the edges — is what carries the run.
                   options: {
                     command: `printf '%s\\n' ${name} >> ${join(root, 'deploy-order.txt')}`,
                     forwardAllArgs: false,

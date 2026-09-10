@@ -780,6 +780,46 @@ function packageBinOutputs(packageJson: PackageJson, packageJsonPath: string): s
   return [...outputs];
 }
 
+/**
+ * The deployment manifests wrangler itself looks for, in its own precedence
+ * order. Finding one IS the detection: a project that hands Cloudflare a
+ * worker has one of these, and nothing else in a workspace does.
+ *
+ * Deploy POLICY is deliberately NOT read from the manifest. `smoo.wrangler.stages`
+ * belongs to the CLI, which reads it to decide which secrets a stage requires; a
+ * second copy in the graph would disagree the first time a stage was added. And
+ * which stages CI actually runs is the four-way vocabulary in the CLI's
+ * `deploy-tags.ts` — every stage, staging only, excluded, production-on-push —
+ * that a flag here could express exactly one of. So every wrangler project gets
+ * the target, and CI selection keeps excluding by tag.
+ *
+ * A worker deployed by some other mechanism declares its own `options.command`,
+ * which replaces this one; `isStageDerivedDeploy` then correctly stops matching
+ * it, because the `deploy-stage` string went with it.
+ */
+const WRANGLER_CONFIG_FILES = ['wrangler.jsonc', 'wrangler.json', 'wrangler.toml'];
+
+/**
+ * ONE target that deploys whichever stage it is handed, never a configuration
+ * per stage. Pull-request stages are `prN` for unbounded N, so an enumerated
+ * `configurations` map cannot describe the surface that actually exists, and a
+ * project carrying both spellings would have two ways to say one thing.
+ *
+ * No `stage-deploy-target` tag either, deliberately: the CLI's
+ * `isStageDerivedDeploy` recognises a stage deploy by the tag OR by this exact
+ * command string, and the inferred target always carries the command. Adding
+ * the tag would be a second mechanism answering a question the first already
+ * answers, and the two would drift the first time either moved.
+ *
+ * `{args.stage}` rather than `forwardAllArgs`: run-commands'
+ * `interpolateArgsIntoCommand` returns as soon as it sees `{args.` and never
+ * appends forwarded arguments, so `nx run web:deploy --stage=pr42` yields
+ * exactly one `--stage`, for an arbitrary preview stage no map could enumerate.
+ * An omitted stage interpolates to empty and `deploy-stage`'s required
+ * `--stage` refuses it, which is the failure we want at the boundary.
+ */
+const WRANGLER_DEPLOY_COMMAND = 'smoo wrangler deploy-stage --stage {args.stage}';
+
 async function createProjectTargets(
   packageJsonPath: string,
   workspaceRoot: string,
@@ -844,6 +884,7 @@ async function createProjectTargets(
   const hasOrdinaryBuildOutputTarget =
     hasLibTsconfig || napiConfig !== null || cargoWasmConfig !== null || packageLocalBuildOutputs.ordinary;
   const hasAnyBuildOutputTarget = hasOrdinaryBuildOutputTarget || packageLocalBuildOutputs.platform;
+  const isWranglerProject = WRANGLER_CONFIG_FILES.some((file) => existsSync(join(absoluteProjectRoot, file)));
 
   if (hasLibTsconfig) {
     const executableOutputs = packageBinOutputs(packageJson, packageJsonPath);
@@ -1389,17 +1430,38 @@ async function createProjectTargets(
   // dependent has to re-check liveness, not inherit someone else's cache hit.
   //
   // Both are bases for a package-local declaration to land on, per the merge rules above: a
-  // declaration naming `cache`, `inputs` or `dependsOn` REPLACES what is set here, so a project
-  // adding a cross-project edge writes `"dependsOn": ["...", "backend:deploy"]` to keep the
-  // `deploy-build` edge this adds.
+  // declaration naming `cache`, `inputs` or `dependsOn` REPLACES what is set here and inherits
+  // everything it does not name, while Nx's `"..."` token expands to the inferred list at its
+  // position. So a project adding a cross-project edge writes
+  // `"dependsOn": ["...", "backend:deploy"]` and keeps both the edge below and this command —
+  // measured, not assumed, against an inferred base.
+  //
+  // `deploy` is INFERRED for a wrangler project rather than patched onto a hand-written one. The
+  // command is a constant of the convention, not of the project: every consumer wrote the same
+  // `nx:run-commands` wrapper around it, and one that spells it differently silently stops being
+  // a stage deploy to `isStageDerivedDeploy`, which reads that exact string. `deploy-build` stays
+  // declaration-driven in the other direction, because only the project knows what building it
+  // means — the plugin supplies its POLICY (cache honestly) and nothing else.
   if (DEPLOY_BUILD_TARGET in declaredTargets) {
     targets[DEPLOY_BUILD_TARGET] = { cache: true };
   }
-  if (DEPLOY_TARGET in declaredTargets) {
+  if (isWranglerProject) {
+    // Naming only an edge that exists is tidiness, not a guard: Nx tolerates a `dependsOn` on a
+    // target the project lacks — measured, the task just runs alone — and a wrangler worker can
+    // legitimately have no build at all, since wrangler bundles its own TypeScript. Pointing at a
+    // target that is not there would only make `nx graph` claim a prerequisite nothing satisfies.
+    const fileDerivedHalf =
+      DEPLOY_BUILD_TARGET in declaredTargets
+        ? DEPLOY_BUILD_TARGET
+        : hasOrdinaryBuildOutputTarget || 'build' in declaredTargets
+          ? 'build'
+          : null;
     targets[DEPLOY_TARGET] = {
+      executor: 'nx:run-commands',
       cache: false,
       outputs: [],
-      ...(DEPLOY_BUILD_TARGET in declaredTargets ? { dependsOn: [DEPLOY_BUILD_TARGET] } : {}),
+      ...(fileDerivedHalf === null ? {} : { dependsOn: [fileDerivedHalf] }),
+      options: { command: WRANGLER_DEPLOY_COMMAND, cwd: projectRoot },
     };
   }
 
