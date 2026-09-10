@@ -4,6 +4,7 @@ import { dirname, join, posix, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import {
+  type CreateNodesContextV2,
   type CreateNodesResultV2,
   type CreateNodesV2,
   readJsonFile,
@@ -50,12 +51,36 @@ export const DEPLOY_TARGET = 'deploy';
 export const DEPLOY_BUILD_TARGET = 'deploy-build';
 
 const BUILD_OUTPUT_TARGET_PATTERN = /-(?:js|web|html|css|android|native|napi|bun|wasm)$/;
+/** The workspace-wide manifests a release rewrites: the version of every member, and the lockfile mirror of it. */
+const RELEASE_REWRITTEN_WORKSPACE_INPUTS = ['{workspaceRoot}/package.json', '{workspaceRoot}/bun.lock'];
 const TYPESCRIPT_TOOLCHAIN_INPUTS = [
-  '{workspaceRoot}/package.json',
-  '{workspaceRoot}/bun.lock',
+  ...RELEASE_REWRITTEN_WORKSPACE_INPUTS,
   '{workspaceRoot}/patches/**/*',
   '{workspaceRoot}/tsconfig.base.json',
 ];
+/** The same toolchain for targets whose versionless digest covers those two files instead. */
+const VERSIONLESS_TOOLCHAIN_INPUTS = TYPESCRIPT_TOOLCHAIN_INPUTS.filter(
+  (input) => !RELEASE_REWRITTEN_WORKSPACE_INPUTS.includes(input),
+);
+
+/**
+ * A project's filesets minus the manifests a release rewrites. The digest that
+ * replaces them removes the version alone, so a dependency range still
+ * invalidates.
+ *
+ * ONLY targets that read source may exclude these. A target that produces a
+ * shipped artifact keeps hashing the raw manifests: Rust embeds its version at
+ * compile time through `env!("CARGO_PKG_VERSION")`, so a version-insensitive
+ * build hash lets a post-bump `build` hit a pre-bump artifact and ship a
+ * binary that reports the previous version. `tsc-js`, `build`, `pack` and
+ * every cargo target are therefore left alone.
+ */
+const RELEASE_REWRITTEN_PROJECT_INPUTS = ['!{projectRoot}/package.json', '!{projectRoot}/**/Cargo.toml'];
+
+/** Plugin-owned named inputs: a project's `production`/`default` with the manifest versions ignored. */
+const VERSIONLESS_PRODUCTION_INPUT = 'versionlessProduction';
+const VERSIONLESS_DEFAULT_INPUT = 'versionlessDefault';
+const MANIFEST_HASH_BIN = 'smoo-nx-manifest-hash';
 
 const BIOME_CONFIG_FILES = ['biome.json', 'biome.jsonc'];
 const ESLINT_CONFIG_FILES = [
@@ -412,6 +437,52 @@ function createCargoTestTarget(projectRoot: string): TargetConfiguration {
 
 const PLUGIN_NEXTEST_CONFIG = fileURLToPath(new URL('../nextest.toml', import.meta.url));
 
+/**
+ * How far the versionless manifest treatment reaches in this workspace.
+ *
+ * `command` is a workspace path, not a bare specifier: Nx runs a `runtime`
+ * input from the workspace root, and under bun's global virtual store the
+ * published package is reachable there and nowhere else. It is derived from
+ * this package's own `bin` map rather than retyped, so a renamed bin cannot
+ * leave a command behind that resolves to nothing.
+ *
+ * `null` means the treatment is off: with no digest to replace them, excluding
+ * the manifests from a fileset would stop a real dependency change from
+ * invalidating anything, and Nx reports neither a missing command nor a
+ * failing one. Absent bin, today's inputs.
+ */
+interface VersionlessManifestPolicy {
+  command: string;
+  /**
+   * Whether a dependency's manifests can be hashed versionlessly too.
+   *
+   * `{ input, dependencies: true }` resolves the named input in EACH
+   * dependency's own context, and Nx throws when a dependency has no
+   * definition for it. A project this plugin never inferred — a project.json
+   * project with no package.json — has none, so the transitive half is only
+   * safe once nx.json defines the name workspace-wide. That definition is what
+   * a consumer opts in with; without it the dependency half stays `^production`.
+   */
+  transitive: boolean;
+}
+
+function versionlessManifestPolicy(context: CreateNodesContextV2): VersionlessManifestPolicy | null {
+  const manifest = readJsonFile<{ name?: unknown; bin?: unknown }>(
+    fileURLToPath(new URL('../package.json', import.meta.url)),
+  );
+  const entry = isRecord(manifest.bin) ? manifest.bin[MANIFEST_HASH_BIN] : undefined;
+  if (typeof manifest.name !== 'string' || typeof entry !== 'string') {
+    // invariant throw: this package's own manifest is malformed
+    throw new Error(`@smoothbricks/nx-plugin: package.json lacks the ${MANIFEST_HASH_BIN} bin`);
+  }
+  const binPath = `node_modules/${manifest.name}/${entry.replace(/^\.\//, '')}`;
+  if (!existsSync(join(context.workspaceRoot, binPath))) return null;
+  return {
+    command: `node ${binPath}`,
+    transitive: context.nxJsonConfiguration.namedInputs?.[VERSIONLESS_PRODUCTION_INPUT] !== undefined,
+  };
+}
+
 type CreateNodesHandler = CreateNodesV2[1];
 
 function createNodesHandler(hostPlatform: NapiPlatform | null): CreateNodesHandler {
@@ -424,6 +495,7 @@ function createNodesHandler(hostPlatform: NapiPlatform | null): CreateNodesHandl
     } catch (error) {
       throw new AggregateCreateNodesError([[null, error instanceof Error ? error : new Error(String(error))]], results);
     }
+    const versionless = versionlessManifestPolicy(context);
 
     await Promise.all(
       projectConfigurationFiles.map(async (packageJsonPath) => {
@@ -440,7 +512,13 @@ function createNodesHandler(hostPlatform: NapiPlatform | null): CreateNodesHandl
           }
           results.push([
             packageJsonPath,
-            await createProjectTargets(packageJsonPath, context.workspaceRoot, hostPlatform, cargoWorkspaces),
+            await createProjectTargets(
+              packageJsonPath,
+              context.workspaceRoot,
+              hostPlatform,
+              cargoWorkspaces,
+              versionless,
+            ),
           ]);
         } catch (error) {
           errors.push([packageJsonPath, error instanceof Error ? error : new Error(String(error))]);
@@ -519,6 +597,7 @@ async function createProjectTargets(
   workspaceRoot: string,
   hostPlatform: NapiPlatform | null,
   cargoWorkspaces: readonly CargoWorkspace[],
+  versionless: VersionlessManifestPolicy | null,
 ) {
   const projectRoot = dirname(packageJsonPath);
   const absoluteProjectRoot = join(workspaceRoot, projectRoot);
@@ -529,6 +608,20 @@ async function createProjectTargets(
   }
   const targets: Record<string, TargetConfiguration> = {};
   const validationTargets: string[] = [];
+  // What a check that only READS the manifests hashes instead of their raw
+  // bytes. Each piece degrades to today's input on its own: no bin, no
+  // treatment; no workspace-wide named input, no transitive half.
+  const projectManifestDigest =
+    versionless === null ? [] : [{ runtime: `${versionless.command} '${projectRoot.replaceAll("'", "'\"'\"'")}'` }];
+  const workspaceManifestDigest = versionless === null ? [] : [{ runtime: `${versionless.command} --workspace` }];
+  const toolchainInputs = versionless === null ? TYPESCRIPT_TOOLCHAIN_INPUTS : VERSIONLESS_TOOLCHAIN_INPUTS;
+  const checkInputs = [...toolchainInputs, ...workspaceManifestDigest];
+  const selfProduction = versionless === null ? 'production' : VERSIONLESS_PRODUCTION_INPUT;
+  const selfDefault = versionless === null ? 'default' : VERSIONLESS_DEFAULT_INPUT;
+  const dependencyProduction =
+    versionless?.transitive === true
+      ? { input: VERSIONLESS_PRODUCTION_INPUT, dependencies: true as const }
+      : '^production';
   const libTsconfigPath = join(absoluteProjectRoot, 'tsconfig.lib.json');
   const hasLibTsconfig = existsSync(libTsconfigPath);
   const cargoTomlPath = join(absoluteProjectRoot, 'Cargo.toml');
@@ -587,7 +680,7 @@ async function createProjectTargets(
     targets.typecheck = {
       executor: 'nx:run-commands',
       cache: true,
-      inputs: ['production', '^production', ...TYPESCRIPT_TOOLCHAIN_INPUTS, '{projectRoot}/tsconfig.lib.json'],
+      inputs: [selfProduction, dependencyProduction, ...checkInputs, '{projectRoot}/tsconfig.lib.json'],
       outputs: [],
       dependsOn: ['^*-js', ...(cargoWasmConfig ? ['cargo-wasm'] : [])],
       options: {
@@ -602,7 +695,7 @@ async function createProjectTargets(
     targets['typecheck-tests'] = {
       executor: 'nx:run-commands',
       cache: true,
-      inputs: ['default', '^production', ...TYPESCRIPT_TOOLCHAIN_INPUTS, '{projectRoot}/tsconfig.test.json'],
+      inputs: [selfDefault, dependencyProduction, ...checkInputs, '{projectRoot}/tsconfig.test.json'],
       dependsOn: ['typecheck'],
       options: {
         command: 'tsc -p tsconfig.test.json --noEmit',
@@ -1192,8 +1285,8 @@ async function createProjectTargets(
       dependsOn: validationTargets,
       outputs: [],
       inputs: [
-        'default',
-        ...TYPESCRIPT_TOOLCHAIN_INPUTS,
+        selfDefault,
+        ...checkInputs,
         ...[...BIOME_CONFIG_FILES, ...ESLINT_CONFIG_FILES].flatMap((name) => [
           `{workspaceRoot}/${name}`,
           `{projectRoot}/${name}`,
@@ -1210,7 +1303,29 @@ async function createProjectTargets(
 
   return {
     projects: {
-      [projectRoot]: { name: projectName, targets },
+      [projectRoot]: {
+        name: projectName,
+        targets,
+        // Defined per project because a `runtime` command is NOT interpolated:
+        // `{projectRoot}` reaches the shell literally, so the only way a
+        // dependency's own manifests can be hashed through
+        // `{ input, dependencies: true }` is for each project to carry the
+        // command that names its own root. Nx resolves a named input from the
+        // project first and nx.json second, so a workspace-wide definition
+        // still covers projects this plugin never inferred.
+        ...(versionless === null
+          ? {}
+          : {
+              namedInputs: {
+                [VERSIONLESS_PRODUCTION_INPUT]: [
+                  'production',
+                  ...RELEASE_REWRITTEN_PROJECT_INPUTS,
+                  ...projectManifestDigest,
+                ],
+                [VERSIONLESS_DEFAULT_INPUT]: ['default', ...RELEASE_REWRITTEN_PROJECT_INPUTS, ...projectManifestDigest],
+              },
+            }),
+      },
     },
   };
 }

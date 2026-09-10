@@ -257,6 +257,104 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
     }
   });
 
+  it('hashes the manifests without their versions for checks, raw for artifacts', async () => {
+    const workspace = await createWorkspace();
+    try {
+      await workspace.write('packages/example/package.json', '{"name":"example"}\n');
+      await workspace.write('packages/example/tsconfig.lib.json', '{}\n');
+      await workspace.write('packages/example/tsconfig.test.json', '{}\n');
+      await workspace.write(`node_modules/${MANIFEST_HASH_BIN_PATH}`, '#!/usr/bin/env node\n');
+
+      const project = await inferProjectWithNxJson(workspace, 'packages/example/package.json', {
+        namedInputs: { versionlessProduction: ['production'] },
+      });
+      const targets = project?.targets ?? {};
+      const projectDigest = { runtime: `node node_modules/${MANIFEST_HASH_BIN_PATH} 'packages/example'` };
+      const workspaceDigest = { runtime: `node node_modules/${MANIFEST_HASH_BIN_PATH} --workspace` };
+      const checkToolchain = ['{workspaceRoot}/patches/**/*', '{workspaceRoot}/tsconfig.base.json', workspaceDigest];
+
+      expect(project?.namedInputs).toEqual({
+        versionlessProduction: [
+          'production',
+          '!{projectRoot}/package.json',
+          '!{projectRoot}/**/Cargo.toml',
+          projectDigest,
+        ],
+        versionlessDefault: ['default', '!{projectRoot}/package.json', '!{projectRoot}/**/Cargo.toml', projectDigest],
+      });
+      expect(targets.typecheck?.inputs).toEqual([
+        'versionlessProduction',
+        { input: 'versionlessProduction', dependencies: true },
+        ...checkToolchain,
+        '{projectRoot}/tsconfig.lib.json',
+      ]);
+      expect(targets['typecheck-tests']?.inputs).toEqual([
+        'versionlessDefault',
+        { input: 'versionlessProduction', dependencies: true },
+        ...checkToolchain,
+        '{projectRoot}/tsconfig.test.json',
+      ]);
+      expect(targets.lint?.inputs).toEqual([
+        'versionlessDefault',
+        ...checkToolchain,
+        ...[
+          'biome.json',
+          'biome.jsonc',
+          'eslint.config.js',
+          'eslint.config.mjs',
+          'eslint.config.cjs',
+          'eslint.config.ts',
+          'eslint.config.mts',
+          'eslint.config.cts',
+        ].flatMap((name) => [`{workspaceRoot}/${name}`, `{projectRoot}/${name}`]),
+        '{workspaceRoot}/tooling/checks/**/*',
+      ]);
+
+      // The guard this whole treatment lives or dies on. A declaration emit is
+      // a shipped artifact, and a crate compiled beside it embeds its version
+      // through `env!("CARGO_PKG_VERSION")`, so an artifact target that stopped
+      // hashing the raw manifests could hit a pre-bump entry and publish a
+      // binary reporting the previous version.
+      expect(targets['tsc-js']?.inputs).toEqual([
+        'production',
+        '^production',
+        '{workspaceRoot}/package.json',
+        '{workspaceRoot}/bun.lock',
+        '{workspaceRoot}/patches/**/*',
+        '{workspaceRoot}/tsconfig.base.json',
+        '{projectRoot}/tsconfig.lib.json',
+      ]);
+    } finally {
+      await workspace.cleanup();
+    }
+  });
+
+  it('keeps the dependency half raw until the workspace defines the named input', async () => {
+    const workspace = await createWorkspace();
+    try {
+      await workspace.write('packages/example/package.json', '{"name":"example"}\n');
+      await workspace.write('packages/example/tsconfig.lib.json', '{}\n');
+      await workspace.write(`node_modules/${MANIFEST_HASH_BIN_PATH}`, '#!/usr/bin/env node\n');
+
+      // `{ input, dependencies: true }` resolves the name in each dependency's
+      // own context and Nx throws when one has no definition for it. A
+      // project.json project this plugin never inferred has none, so the
+      // transitive half waits for the workspace-wide definition that covers it.
+      const targets = (await inferProjectWithNxJson(workspace, 'packages/example/package.json', {}))?.targets ?? {};
+
+      expect(targets.typecheck?.inputs).toEqual([
+        'versionlessProduction',
+        '^production',
+        '{workspaceRoot}/patches/**/*',
+        '{workspaceRoot}/tsconfig.base.json',
+        { runtime: `node node_modules/${MANIFEST_HASH_BIN_PATH} --workspace` },
+        '{projectRoot}/tsconfig.lib.json',
+      ]);
+    } finally {
+      await workspace.cleanup();
+    }
+  });
+
   it('rebuilds current library declarations before test typechecking after clean', async () => {
     const workspace = await createWorkspace();
     try {
@@ -1621,6 +1719,31 @@ async function inferProject(
 ) {
   const [, infer] = createNodes;
   const result = await infer([packageJsonPath], undefined, workspace.context);
+  return result[0]?.[1].projects?.[dirname(packageJsonPath)];
+}
+
+/**
+ * The manifest hash bin as the workspace path the plugin emits, spelled out
+ * here rather than imported: a test that derived it the same way the plugin
+ * does would agree with a wrong answer.
+ */
+const MANIFEST_HASH_BIN_PATH = '@smoothbricks/nx-plugin/dist/bin/smoo-nx-manifest-hash.js';
+
+/**
+ * Inference against a chosen nx.json. The versionless manifest inputs reach as
+ * far as the workspace's own `namedInputs` allow, so the workspace
+ * configuration is an input to inference and not a constant of the fixture.
+ */
+async function inferProjectWithNxJson(
+  workspace: WorkspaceFixture,
+  packageJsonPath: string,
+  nxJsonConfiguration: CreateNodesContextV2['nxJsonConfiguration'],
+) {
+  const [, infer] = createNodesV2;
+  const result = await infer([packageJsonPath], undefined, {
+    workspaceRoot: workspace.context.workspaceRoot,
+    nxJsonConfiguration,
+  });
   return result[0]?.[1].projects?.[dirname(packageJsonPath)];
 }
 

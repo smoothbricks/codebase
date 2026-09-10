@@ -90,6 +90,36 @@ Git and registry dependencies are identified by `Cargo.lock`; uncommitted change
 a pinned Git dependency. Local `path` dependencies stay live and their source edits change the digest. Build-script data
 and environment inputs outside the Rust/Cargo inputs above still require explicit Nx inputs.
 
+### Manifest versions and validation inputs
+
+A release rewrites `version` in every package manifest it publishes and in the lockfile entries mirroring them. Those
+files are inputs of `lint`, `typecheck` and `typecheck-tests`, so a publish run misses the cache for the whole gate set
+over a change that alters no code. Those three targets therefore hash the manifests through `smoo-nx-manifest-hash`,
+which removes only a manifest's own version — `package.json#version`, `[package].version`,
+`[workspace.package].version`, and each lockfile member's `version` — and leave the raw files out of their filesets.
+Everything else still counts: a dependency range, an export map, a `version` naming a *different* crate under a
+dependency table, and a manifest the command cannot parse (hashed raw rather than dropped).
+
+Targets that produce a shipped artifact keep hashing the raw manifests. A crate embeds its version at compile time
+through `env!("CARGO_PKG_VERSION")`, so a version-insensitive `build`, `pack`, `tsc-js` or cargo hash would let a
+post-bump run hit a pre-bump artifact and publish a binary reporting the previous version.
+
+A dependency's manifests are hashed the same way once the workspace declares the named input, which gives projects this
+plugin does not infer a definition to resolve:
+
+```json
+{
+  "namedInputs": {
+    "versionlessProduction": ["production"]
+  }
+}
+```
+
+Without it the dependency half stays `^production`; without the command installed the targets keep today's inputs
+entirely. Both fallbacks cost cache hits and never trade away invalidation, because Nx runs a `runtime` input without
+reporting a failing one — a fileset that excluded the manifests with no digest replacing them would serve stale results
+silently.
+
 ## Nx Target Naming
 
 Target names are `{tool}-{output}` names. Use names like `tsc-js`, `tsdown-js`, and `cargo-wasm`; `build` and `lint` are
