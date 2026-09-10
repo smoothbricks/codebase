@@ -1659,10 +1659,10 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
     }
   });
 
-  it('gives a wrangler project a deploy that runs the stage CLI, uncached, behind its build half', async () => {
+  it('gives a private wrangler project a deploy that runs the stage CLI, uncached, behind its build half', async () => {
     const workspace = await createWorkspace();
     try {
-      await workspace.write('packages/site/package.json', '{"name":"site"}\n');
+      await workspace.write('packages/site/package.json', '{"name":"site","private":true}\n');
       await workspace.write('packages/site/wrangler.toml', 'name = "site"\n');
       const targets = await inferProjectTargets(workspace, 'packages/site/package.json');
 
@@ -1672,9 +1672,6 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         command: 'smoo wrangler deploy-stage --stage {args.stage}',
         cwd: 'packages/site',
       });
-      // That exact string is load-bearing beyond running: the CLI's `isStageDerivedDeploy`
-      // recognises a stage deploy by it, which is why the plugin emits it instead of asking
-      // every consumer to retype it and drift.
       // A cache hit on deploy would mean "we once uploaded this hash", which a rollback falsifies
       // silently; the step has to run and read live state instead.
       expect(targets.deploy?.cache).toBe(false);
@@ -1687,13 +1684,38 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
     }
   });
 
+  it('infers no deploy for a PUBLISHED package whose wrangler manifest documents a binding', async () => {
+    const workspace = await createWorkspace();
+    try {
+      // The shape that regressed a consumer: a library published to npm that ships a wrangler
+      // manifest so consumers can declare the Durable Object binding it implements. Structurally
+      // identical to a worker's, so only the manifest's own `private` flag tells them apart.
+      await workspace.write(
+        'packages/acme-cloudflare/package.json',
+        '{"name":"@acme/cloudflare","nx":{"tags":["npm:private"]}}\n',
+      );
+      await workspace.write(
+        'packages/acme-cloudflare/wrangler.toml',
+        '# Wrangler configuration for @acme/cloudflare Durable Object\nname = "acme-cloudflare"\nmain = "src/index.ts"\ncompatibility_date = "2025-01-01"\n',
+      );
+      const targets = await inferProjectTargets(workspace, 'packages/acme-cloudflare/package.json');
+
+      expect(Object.keys(targets)).not.toContain('deploy');
+    } finally {
+      await workspace.cleanup();
+    }
+  });
+
   it('points an inferred deploy at the declared deploy-build, and caches that half', async () => {
     const workspace = await createWorkspace();
     const declared = {
       'deploy-build': { executor: 'nx:run-commands', options: { command: 'bun tooling/build-site.ts' } },
     };
     try {
-      await workspace.write('packages/site/package.json', JSON.stringify({ name: 'site', nx: { targets: declared } }));
+      await workspace.write(
+        'packages/site/package.json',
+        JSON.stringify({ name: 'site', private: true, nx: { targets: declared } }),
+      );
       await workspace.write('packages/site/wrangler.toml', 'name = "site"\n');
       const targets = await inferProjectTargets(workspace, 'packages/site/package.json');
 
@@ -1712,7 +1734,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
   it('falls back to the aggregate build when a wrangler project emits one', async () => {
     const workspace = await createWorkspace();
     try {
-      await workspace.write('packages/site/package.json', '{"name":"site"}\n');
+      await workspace.write('packages/site/package.json', '{"name":"site","private":true}\n');
       await workspace.write('packages/site/wrangler.toml', 'name = "site"\n');
       // tsconfig.lib.json is what puts an emitting target, and so the `build` aggregate, on a project.
       await workspace.write('packages/site/tsconfig.lib.json', '{}\n');
@@ -1733,7 +1755,10 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       deploy: { dependsOn: ['...', { projects: ['backend'], target: 'deploy', params: 'forward' }] },
     };
     try {
-      await workspace.write('packages/site/package.json', JSON.stringify({ name: 'site', nx: { targets: declared } }));
+      await workspace.write(
+        'packages/site/package.json',
+        JSON.stringify({ name: 'site', private: true, nx: { targets: declared } }),
+      );
       await workspace.write('packages/site/wrangler.toml', 'name = "site"\n');
       await workspace.write('packages/site/tsconfig.lib.json', '{}\n');
       const targets = await inferProjectTargets(workspace, 'packages/site/package.json');
@@ -1790,6 +1815,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
           `packages/${name}/package.json`,
           JSON.stringify({
             name,
+            private: true,
             nx: {
               targets: {
                 deploy: {

@@ -750,6 +750,8 @@ interface PackageJson {
   bin?: unknown;
   name?: string;
   napi?: Record<string, unknown>;
+  /** npm's own "never published" flag, which is what makes a package a deployable target rather than a library. */
+  private?: boolean;
   scripts?: Record<string, unknown>;
   nx?: {
     name?: string;
@@ -782,20 +784,22 @@ function packageBinOutputs(packageJson: PackageJson, packageJsonPath: string): s
 
 /**
  * The deployment manifests wrangler itself looks for, in its own precedence
- * order. Finding one IS the detection: a project that hands Cloudflare a
- * worker has one of these, and nothing else in a workspace does.
+ * order. Finding one is HALF the detection: a published library ships one to
+ * document a Durable Object binding for its consumers, and that manifest is
+ * structurally indistinguishable from a deployable worker's — same `name`,
+ * `main` and `compatibility_date`. So presence alone cannot mean deployable,
+ * and the other half is `private: true` below.
  *
  * Deploy POLICY is deliberately NOT read from the manifest. `smoo.wrangler.stages`
  * belongs to the CLI, which reads it to decide which secrets a stage requires; a
  * second copy in the graph would disagree the first time a stage was added. And
- * which stages CI actually runs is the four-way vocabulary in the CLI's
+ * which stages CI actually runs is the four-way tag vocabulary in the CLI's
  * `deploy-tags.ts` — every stage, staging only, excluded, production-on-push —
- * that a flag here could express exactly one of. So every wrangler project gets
- * the target, and CI selection keeps excluding by tag.
+ * that a flag here could express exactly one of. So a private wrangler project
+ * gets the target, and the tags alone decide what CI deploys.
  *
  * A worker deployed by some other mechanism declares its own `options.command`,
- * which replaces this one; `isStageDerivedDeploy` then correctly stops matching
- * it, because the `deploy-stage` string went with it.
+ * which replaces this one; the tag is what CI reads either way.
  */
 const WRANGLER_CONFIG_FILES = ['wrangler.jsonc', 'wrangler.json', 'wrangler.toml'];
 
@@ -805,11 +809,10 @@ const WRANGLER_CONFIG_FILES = ['wrangler.jsonc', 'wrangler.json', 'wrangler.toml
  * `configurations` map cannot describe the surface that actually exists, and a
  * project carrying both spellings would have two ways to say one thing.
  *
- * No `stage-deploy-target` tag either, deliberately: the CLI's
- * `isStageDerivedDeploy` recognises a stage deploy by the tag OR by this exact
- * command string, and the inferred target always carries the command. Adding
- * the tag would be a second mechanism answering a question the first already
- * answers, and the two would drift the first time either moved.
+ * No `stage-deploy-target` tag either, deliberately: that tag is the repository's
+ * statement that CI deploys this project on every stage, and only the repository
+ * can make it. A plugin that tagged what it inferred would enrol every private
+ * wrangler project in CI deploys by writing the policy it is supposed to read.
  *
  * `{args.stage}` rather than `forwardAllArgs`: run-commands'
  * `interpolateArgsIntoCommand` returns as soon as it sees `{args.` and never
@@ -884,7 +887,8 @@ async function createProjectTargets(
   const hasOrdinaryBuildOutputTarget =
     hasLibTsconfig || napiConfig !== null || cargoWasmConfig !== null || packageLocalBuildOutputs.ordinary;
   const hasAnyBuildOutputTarget = hasOrdinaryBuildOutputTarget || packageLocalBuildOutputs.platform;
-  const isWranglerProject = WRANGLER_CONFIG_FILES.some((file) => existsSync(join(absoluteProjectRoot, file)));
+  const isDeployableWranglerProject =
+    packageJson.private === true && WRANGLER_CONFIG_FILES.some((file) => existsSync(join(absoluteProjectRoot, file)));
 
   if (hasLibTsconfig) {
     const executableOutputs = packageBinOutputs(packageJson, packageJsonPath);
@@ -1436,16 +1440,19 @@ async function createProjectTargets(
   // `"dependsOn": ["...", "backend:deploy"]` and keeps both the edge below and this command —
   // measured, not assumed, against an inferred base.
   //
-  // `deploy` is INFERRED for a wrangler project rather than patched onto a hand-written one. The
-  // command is a constant of the convention, not of the project: every consumer wrote the same
-  // `nx:run-commands` wrapper around it, and one that spells it differently silently stops being
-  // a stage deploy to `isStageDerivedDeploy`, which reads that exact string. `deploy-build` stays
-  // declaration-driven in the other direction, because only the project knows what building it
-  // means — the plugin supplies its POLICY (cache honestly) and nothing else.
+  // `deploy` is INFERRED for a private wrangler project rather than patched onto a hand-written
+  // one. The command is a constant of the convention, not of the project: every consumer wrote
+  // the same `nx:run-commands` wrapper around it. `private: true` is the second half of the
+  // detection: a PUBLISHED package's wrangler manifest documents a binding for its consumers,
+  // so inferring a deploy from it would put a live `wrangler deploy` of someone's documentation
+  // one `nx run-many -t deploy` away. A published package that really is deployed declares
+  // `deploy` itself. `deploy-build` stays declaration-driven in the other direction, because
+  // only the project knows what building it means — the plugin supplies its POLICY (cache
+  // honestly) and nothing else.
   if (DEPLOY_BUILD_TARGET in declaredTargets) {
     targets[DEPLOY_BUILD_TARGET] = { cache: true };
   }
-  if (isWranglerProject) {
+  if (isDeployableWranglerProject) {
     // Naming only an edge that exists is tidiness, not a guard: Nx tolerates a `dependsOn` on a
     // target the project lacks — measured, the task just runs alone — and a wrangler worker can
     // legitimately have no build at all, since wrangler bundles its own TypeScript. Pointing at a
@@ -1946,6 +1953,7 @@ async function readPackageJson(packageJsonPath: string): Promise<PackageJson> {
     ...('bin' in parsed ? { bin: parsed.bin } : {}),
     ...(typeof parsed.name === 'string' ? { name: parsed.name } : {}),
     ...(isRecord(parsed.napi) ? { napi: parsed.napi } : {}),
+    ...(typeof parsed.private === 'boolean' ? { private: parsed.private } : {}),
     ...(isRecord(parsed.scripts) ? { scripts: parsed.scripts } : {}),
     ...(rawNx
       ? {

@@ -13,7 +13,8 @@ with `tsconfig.lib.json` receives transformer-aware `tsc-js` and native `typeche
 - `test:watch` from explicit `test` commands for Bun and Vitest packages
 - Cargo workspace targets from a neighboring workspace-root `Cargo.toml`
 - aggregate `build` and `lint` targets
-- an uncached `deploy` for a project with a wrangler manifest, running `smoo wrangler deploy-stage --stage {args.stage}`
+- an uncached `deploy` for a PRIVATE project with a wrangler manifest, running
+  `smoo wrangler deploy-stage --stage {args.stage}`
 
 The deploy is one target that takes whichever stage it is given, never a configuration per stage: pull-request stages
 are `prN` for unbounded N, so `nx run <project>:deploy --stage=pr42` has to work for a stage no enumeration could list.
@@ -21,6 +22,12 @@ It is never cached, because a cache hit would mean "we once uploaded this hash",
 Declaring `deploy` locally overrides only the properties it names, so a project adds cross-project ordering with
 `"dependsOn": ["...", "backend:deploy"]` and keeps the inferred command; a project that declares `deploy-build` gets
 that edge instead of `build`, and the plugin caches that half without inventing its command.
+
+`private: true` is half the detection, because a wrangler manifest alone does not mean deployable: a published library
+ships one to document the Durable Object binding it implements, and that manifest carries the same `name`, `main` and
+`compatibility_date` a deployable worker's does. So the inferred target goes to packages npm will never publish, and a
+published package that really is deployed declares `deploy` itself. Whether CI deploys any of them is a separate
+question, answered only by the deploy tags the CLI reads (`stage-deploy-target` and its three siblings).
 
 Lint commands are inferred per project. A workspace Biome configuration enables the project-wide Biome check; an ESLint
 flat configuration enables ESLint only for existing JavaScript/TypeScript files under that project's `src`. Rust-only
