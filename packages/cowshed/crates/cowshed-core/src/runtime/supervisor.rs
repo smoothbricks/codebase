@@ -3527,11 +3527,15 @@ fn retiring_error() -> CowshedError {
 #[cfg(test)]
 mod workspace_toolchain_tests {
     use super::*;
+    #[cfg(target_os = "macos")]
     use crate::sandbox::{
         RunSandboxMode, SandboxConfig, SandboxGrants, SandboxProfileRole, nix_daemon_socket,
         seatbelt_profile,
     };
 
+    // Only the macOS host-controller test below builds a sandbox; on the Linux
+    // cross lint the helper would be dead code.
+    #[cfg(target_os = "macos")]
     fn sandbox_at(mount: &Path) -> SandboxConfig {
         SandboxConfig {
             home: mount.parent().expect("root").join("home"),
