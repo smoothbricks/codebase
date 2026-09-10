@@ -34,6 +34,7 @@ import {
   describe as _describe,
   expect as _expect,
   it as _it,
+  type TestOptions,
 } from 'vitest';
 import { JsBufferStrategy } from '../JsBufferStrategy.js';
 import type { SpanContext } from '../opContext/spanContextTypes.js';
@@ -104,16 +105,22 @@ function vitestHarnessDebug(message: string, data?: unknown): void {
 
 type TestBody = () => unknown | Promise<unknown>;
 type SpanCtx<B extends OpContextBinding> = SpanContext<OpContextOf<B>>;
+/**
+ * vitest's trailing registration slot: a bare timeout in milliseconds, or the full options
+ * object (`timeout`, `retry`, `repeats`, …). Every wrapper below forwards this verbatim —
+ * swallowing it silently demotes `it(name, fn, 300_000)` to the ambient `testTimeout`.
+ */
+type VitestTestOptions = number | TestOptions;
 type VitestDescribeCallback = () => void;
-type VitestDescribeBranch = (name: string, fn: VitestDescribeCallback) => unknown;
+type VitestDescribeBranch = (name: string, fn: VitestDescribeCallback, options?: VitestTestOptions) => unknown;
 type VitestPublicTestCallback = () => void | Promise<void>;
-type VitestPublicTestBranch = (name: string, fn: VitestPublicTestCallback) => unknown;
-type VitestModuleIt = ((name: string, fn: TestBody) => unknown) & {
-  skip: (name: string, fn: VitestPublicTestCallback) => unknown;
-  only: (name: string, fn: VitestPublicTestCallback) => unknown;
-  todo: (name: string, fn: VitestPublicTestCallback) => unknown;
+type VitestPublicTestBranch = (name: string, fn: VitestPublicTestCallback, options?: VitestTestOptions) => unknown;
+type VitestModuleIt = ((name: string, fn: TestBody, options?: VitestTestOptions) => unknown) & {
+  skip: VitestPublicTestBranch;
+  only: VitestPublicTestBranch;
+  todo: VitestPublicTestBranch;
   each: VitestEach;
-  skipIf: (condition: boolean) => (name: string, fn: VitestPublicTestCallback) => unknown;
+  skipIf: (condition: boolean) => VitestPublicTestBranch;
 };
 type VitestEach = (...args: unknown[]) => unknown;
 
@@ -341,8 +348,8 @@ export type VitestTestTracer<B extends OpContextBinding> = {
   useTestSpan(): SpanCtx<B>;
   getTracer(): Tracer<B>;
   createVitestMock<T extends VitestModuleShape>(vitestModule: T): T;
-  describe(name: string, fn: () => void): unknown;
-  it(name: string, fn: () => void | Promise<void>): void;
+  describe: VitestDescribeBranch;
+  it: VitestPublicTestBranch;
 };
 
 export type VitestTestSuiteTracer<B extends OpContextBinding> = {
@@ -356,8 +363,8 @@ type ActiveVitestTestTracer = {
   useTestSpan(): unknown;
   getTracer(): unknown;
   createVitestMock<T extends VitestModuleShape>(vitestModule: T): T;
-  describe(name: string, fn: () => void): unknown;
-  it(name: string, fn: () => void | Promise<void>): void;
+  describe: VitestDescribeBranch;
+  it: VitestPublicTestBranch;
 };
 
 let _activeSuiteTracer: ActiveVitestTestTracer | null = null;
@@ -368,8 +375,8 @@ function createActiveVitestTestTracer<B extends OpContextBinding>(tracer: Vitest
     useTestSpan: () => tracer.useTestSpan(),
     getTracer: () => tracer.getTracer(),
     createVitestMock: (vitestModule) => tracer.createVitestMock(vitestModule),
-    describe: (name, fn) => tracer.describe(name, fn),
-    it: (name, fn) => tracer.it(name, fn),
+    describe: (name, fn, options) => tracer.describe(name, fn, options),
+    it: (name, fn, options) => tracer.it(name, fn, options),
   };
 }
 
@@ -509,15 +516,19 @@ export function makeVitestTestTracer<B extends OpContextBinding>(config: VitestH
     const origDescribe = vitestModule.describe;
     const describeStack: string[] = [];
 
-    function wrappedDescribe(name: string, fn: () => void) {
-      return origDescribe(name, () => {
-        describeStack.push(name);
-        try {
-          fn();
-        } finally {
-          describeStack.pop();
-        }
-      });
+    function wrappedDescribe(name: string, fn: VitestDescribeCallback, options?: VitestTestOptions) {
+      return origDescribe(
+        name,
+        () => {
+          describeStack.push(name);
+          try {
+            fn();
+          } finally {
+            describeStack.pop();
+          }
+        },
+        options,
+      );
     }
 
     Object.assign(wrappedDescribe, {
@@ -528,21 +539,24 @@ export function makeVitestTestTracer<B extends OpContextBinding>(config: VitestH
       skipIf: origDescribe.skipIf.bind(origDescribe),
     });
 
-    function wrappedIt(name: string, fn: TestBody) {
+    function wrappedIt(name: string, fn: TestBody, options?: VitestTestOptions) {
       const describePath = describeStack.length > 0 ? describeStack.join(' > ') : null;
-      return origIt(name, () =>
-        currentRootCtx.span(name, async (ctx) => {
-          writeDescribeTag(ctx.tag, describePath);
-          try {
-            await spanStore.run(ctx, fn);
-            return ctx.ok(undefined);
-          } catch (error) {
-            if (isExpectError(error)) {
-              return ctx.err(error);
+      return origIt(
+        name,
+        () =>
+          currentRootCtx.span(name, async (ctx) => {
+            writeDescribeTag(ctx.tag, describePath);
+            try {
+              await spanStore.run(ctx, fn);
+              return ctx.ok(undefined);
+            } catch (error) {
+              if (isExpectError(error)) {
+                return ctx.err(error);
+              }
+              throw error;
             }
-            throw error;
-          }
-        }),
+          }),
+        options,
       );
     }
 
@@ -562,34 +576,42 @@ export function makeVitestTestTracer<B extends OpContextBinding>(config: VitestH
     };
   }
 
-  function describe(name: string, fn: () => void) {
-    return _describe(name, () => {
-      standaloneDescribeStack.push(name);
-      try {
-        fn();
-      } finally {
-        standaloneDescribeStack.pop();
-      }
-    });
+  function describe(name: string, fn: VitestDescribeCallback, options?: VitestTestOptions) {
+    return _describe(
+      name,
+      () => {
+        standaloneDescribeStack.push(name);
+        try {
+          fn();
+        } finally {
+          standaloneDescribeStack.pop();
+        }
+      },
+      options,
+    );
   }
 
-  function it(name: string, fn: () => void | Promise<void>): void {
+  function it(name: string, fn: VitestPublicTestCallback, options?: VitestTestOptions): void {
     const describePath = standaloneDescribeStack.length > 0 ? standaloneDescribeStack.join(' > ') : null;
-    _it(name, () => {
-      const currentRootCtx = getRootCtx();
-      return currentRootCtx.span(name, async (ctx) => {
-        writeDescribeTag(ctx.tag, describePath);
-        try {
-          await spanStore.run(ctx, fn);
-          return ctx.ok(undefined);
-        } catch (error) {
-          if (isExpectError(error)) {
-            return ctx.err(error);
+    _it(
+      name,
+      () => {
+        const currentRootCtx = getRootCtx();
+        return currentRootCtx.span(name, async (ctx) => {
+          writeDescribeTag(ctx.tag, describePath);
+          try {
+            await spanStore.run(ctx, fn);
+            return ctx.ok(undefined);
+          } catch (error) {
+            if (isExpectError(error)) {
+              return ctx.err(error);
+            }
+            throw error;
           }
-          throw error;
-        }
-      });
-    });
+        });
+      },
+      options,
+    );
   }
 
   return {
@@ -657,27 +679,30 @@ export function createVitestMock<T extends VitestModuleShape>(vitestModule: T): 
  * Wrapped describe — tracks describe nesting for the standalone export path.
  * describe() callbacks run synchronously (just registering tests).
  */
-const describeBase: VitestDescribeBranch = (name, fn) => {
-  return requireActiveSuiteTracer('Call initTraceTestRun() in setupFiles before tests').describe(name, fn);
+const describeBase: VitestDescribeBranch = (name, fn, options) => {
+  return requireActiveSuiteTracer('Call initTraceTestRun() in setupFiles before tests').describe(name, fn, options);
 };
 
 export const describe: VitestDescribe = Object.assign(describeBase, {
-  skip: (name: string, fn: VitestDescribeCallback) => _describe.skip(name, fn),
-  only: (name: string, fn: VitestDescribeCallback) => _describe.only(name, fn),
-  todo: (name: string, fn: VitestDescribeCallback) => _describe.todo(name, fn),
+  // Untraced branches: hand vitest's own chainables straight back so every registration slot,
+  // per-suite `timeout` included, keeps the signature vitest documents.
+  skip: _describe.skip,
+  only: _describe.only,
+  todo: _describe.todo,
   each: (...args: unknown[]) => Reflect.apply(_describe.each, _describe, args),
   skipIf: (condition: boolean) => (condition ? _describe.skip : describe),
 });
 
 /** Wrapped it — creates a child span of the root trace for the test case */
-const itBase: VitestPublicTestBranch = (name, fn) => {
-  return requireActiveSuiteTracer('Call initTraceTestRun() in setupFiles before tests').it(name, fn);
+const itBase: VitestPublicTestBranch = (name, fn, options) => {
+  return requireActiveSuiteTracer('Call initTraceTestRun() in setupFiles before tests').it(name, fn, options);
 };
 
 export const it: VitestIt = Object.assign(itBase, {
-  skip: (name: string, fn: TestBody) => _it.skip(name, fn),
-  only: (name: string, fn: TestBody) => _it.only(name, fn),
-  todo: (name: string, fn: TestBody) => _it.todo(name, fn),
+  // Untraced branches: see the describe note above.
+  skip: _it.skip,
+  only: _it.only,
+  todo: _it.todo,
   each: (...args: unknown[]) => Reflect.apply(_it.each, _it, args),
   skipIf: (condition: boolean) => (condition ? _it.skip : it),
 });

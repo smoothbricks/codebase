@@ -783,23 +783,28 @@ export function createBunTestMock<TModule extends BunTestModuleShape>(bunTestMod
   assignOnly(wrappedDescribe, origDescribe, origDescribe);
   assignOptionalBoundTestFunction(wrappedDescribe, 'each', origDescribe, origDescribe);
 
-  function wrappedIt(name: string, fn: TestBody) {
+  function wrappedIt(name: string, fn: TestBody, options?: BunTestOptions) {
     // Capture describe path at registration time (synchronous)
     const describePath = describeStack.length > 0 ? describeStack.join(' > ') : null;
-    return origIt(name, () =>
-      rootCtx.span(name, async (ctx) => {
-        writeDescribeTag(ctx.tag, describePath);
-        try {
-          await als.run(ctx, fn);
-          return ctx.ok(undefined); // pass → span-ok
-        } catch (error) {
-          if (isExpectError(error)) {
-            ctx.err(error); // record assertion failure in span
-            throw error; // re-throw so bun:test sees the failure
+    // `options` carries the per-test timeout/retry/repeats. Dropping it silently demotes an
+    // explicit `it(name, fn, 300_000)` to the runner's ambient testTimeout.
+    return origIt(
+      name,
+      () =>
+        rootCtx.span(name, async (ctx) => {
+          writeDescribeTag(ctx.tag, describePath);
+          try {
+            await als.run(ctx, fn);
+            return ctx.ok(undefined); // pass → span-ok
+          } catch (error) {
+            if (isExpectError(error)) {
+              ctx.err(error); // record assertion failure in span
+              throw error; // re-throw so bun:test sees the failure
+            }
+            throw error; // other throw → span-exception
           }
-          throw error; // other throw → span-exception
-        }
-      }),
+        }),
+      options,
     );
   }
   // skipIf/if must return wrappedIt (not origIt) when the test should run,
@@ -944,22 +949,32 @@ assignOptionalBoundTestFunction(describe, 'each', _describe, _describe);
 assignOptionalBoundTestFunction(describe, 'skipIf', _describe, _describe);
 assignOptionalBoundTestFunction(describe, 'if', _describe, _describe);
 
-/** Wrapped it — creates a child span of the root trace for the test case */
-export function it(name: string, fn: () => void | Promise<void>): void {
+/**
+ * Wrapped it — creates a child span of the root trace for the test case.
+ *
+ * `options` is bun's per-test timeout/retry/repeats slot. It is forwarded verbatim: a wrapper
+ * that swallows it demotes `it(name, fn, 300_000)` to the runner's ambient testTimeout, and the
+ * resulting failure blames the test instead of the wrapper.
+ */
+export function it(name: string, fn: () => void | Promise<void>, options?: BunTestOptions): void {
   const describePath = _standaloneDescribeStack.length > 0 ? _standaloneDescribeStack.join(' > ') : null;
-  _it(name, () => {
-    if (!isSpanContext(_rootCtx)) throw new Error('Call initTraceTestRun() in preload before tests');
-    return _rootCtx.span(name, async (ctx: SpanContext<OpContext>) => {
-      writeDescribeTag(ctx.tag, describePath);
-      try {
-        await _als.run(ctx, fn);
-        return ctx.ok(undefined); // pass → span-ok
-      } catch (error) {
-        if (isExpectError(error)) return ctx.err(error); // expect() fail → span-err
-        throw error; // other throw → span-exception
-      }
-    });
-  });
+  _it(
+    name,
+    () => {
+      if (!isSpanContext(_rootCtx)) throw new Error('Call initTraceTestRun() in preload before tests');
+      return _rootCtx.span(name, async (ctx: SpanContext<OpContext>) => {
+        writeDescribeTag(ctx.tag, describePath);
+        try {
+          await _als.run(ctx, fn);
+          return ctx.ok(undefined); // pass → span-ok
+        } catch (error) {
+          if (isExpectError(error)) return ctx.err(error); // expect() fail → span-err
+          throw error; // other throw → span-exception
+        }
+      });
+    },
+    options,
+  );
 }
 
 it.skip = _it.skip;

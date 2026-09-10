@@ -7,8 +7,14 @@ import { type BunTestModuleShape, makeBunTestSuiteTracer, makeTestTracer } from 
 
 type BunTestModuleLike = BunTestModuleShape;
 
-function createImmediateTestFn(): BunTestModuleLike['it'] {
-  const runBase = (_name: string, fn: () => unknown | Promise<unknown>) => fn();
+/** What the harness handed the underlying runner: the label and bun's timeout/options slot. */
+type Registration = { name: string; options: unknown };
+
+function createImmediateTestFn(registrations?: Registration[]): BunTestModuleLike['it'] {
+  const runBase = (name: string, fn: () => unknown | Promise<unknown>, options?: unknown) => {
+    registrations?.push({ name, options });
+    return fn();
+  };
   return Object.assign(runBase, it, {
     only: runBase,
     skipIf: (condition: boolean) => (condition ? it.skip : runBase),
@@ -16,8 +22,11 @@ function createImmediateTestFn(): BunTestModuleLike['it'] {
   });
 }
 
-function createImmediateDescribeFn(): BunTestModuleLike['describe'] {
-  const runBase = (_name: string, fn: () => void) => fn();
+function createImmediateDescribeFn(registrations?: Registration[]): BunTestModuleLike['describe'] {
+  const runBase = (name: string, fn: () => void) => {
+    registrations?.push({ name, options: undefined });
+    return fn();
+  };
   return Object.assign(runBase, describe, {
     only: runBase,
     skipIf: (condition: boolean) => (condition ? describe.skip : runBase),
@@ -25,19 +34,11 @@ function createImmediateDescribeFn(): BunTestModuleLike['describe'] {
   });
 }
 
-function createImmediateIt() {
-  return createImmediateTestFn();
-}
-
-function createImmediateDescribe() {
-  return createImmediateDescribeFn();
-}
-
-function createImmediateBunTestModule(): BunTestModuleLike {
-  const itFn = createImmediateIt();
+function createImmediateBunTestModule(registrations?: Registration[]): BunTestModuleLike {
+  const itFn = createImmediateTestFn(registrations);
   return {
     it: itFn,
-    describe: createImmediateDescribe(),
+    describe: createImmediateDescribeFn(registrations),
     test: itFn,
   };
 }
@@ -104,5 +105,28 @@ describe('bun harness test log schema extension', () => {
     expect(() => tracer.setup()).toThrow(
       "Test harness schema column 'base_field' already exists in the bound log schema",
     );
+  });
+});
+
+// Argument-forwarding assertions, not end-to-end timeout expiry: driving a real expiry would need a
+// test slower than the ambient `--timeout`. The seam asserted here is the exact call the harness
+// makes into bun's runner, which is where a dropped timeout becomes an ignored timeout.
+describe('bun harness per-test options forwarding', () => {
+  it('hands bun the timeout slot it was given', async () => {
+    const tracer = makeTestTracer(baseBinding);
+    tracer.setup();
+
+    const registrations: Registration[] = [];
+    const wrapped = tracer.createBunTestMock(createImmediateBunTestModule(registrations));
+
+    await wrapped.it('bare millisecond timeout', () => undefined, 300_000);
+    await wrapped.test('full options object', () => undefined, { timeout: 250, retry: 2 });
+    await wrapped.it('caller passed nothing', () => undefined);
+
+    expect(registrations).toEqual([
+      { name: 'bare millisecond timeout', options: 300_000 },
+      { name: 'full options object', options: { timeout: 250, retry: 2 } },
+      { name: 'caller passed nothing', options: undefined },
+    ]);
   });
 });
