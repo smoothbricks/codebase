@@ -898,3 +898,163 @@ describe('renderCiWorkflowYaml with deploy configuration', () => {
     expect(e2eJob).not.toContain('CARGO_REGISTRIES_EXAMPLE_TOKEN');
   });
 });
+
+describe('renderCiWorkflowYaml with cross-built test archives', () => {
+  const darwin = {
+    triple: 'aarch64-apple-darwin',
+    path: 'target/nextest/archive-aarch64-apple-darwin.tar.zst',
+  };
+  const declared = options({
+    runsOn: [...nixosRunsOn],
+    macosRunsOn: ['macos-arm64', 'self-hosted'],
+    crossTestArchives: [darwin],
+  });
+
+  it('renders nothing for a repository that declares no cross archives', () => {
+    const bare = renderCiWorkflowYaml(options({ runsOn: [...nixosRunsOn] }));
+
+    // An empty declaration is the same repository as an absent one: no step, no
+    // job, and above all no renumbering of the steps that were already there.
+    expect(renderCiWorkflowYaml(options({ runsOn: [...nixosRunsOn], crossTestArchives: [] }))).toBe(bare);
+    expect(bare).not.toContain('macos-cross-tests');
+    expect(bare).not.toContain('cross-target test archives');
+    expect(bare).not.toContain('cargo-cross-test');
+  });
+
+  it('builds and uploads each archive in Validate, then executes it in a job that needs Validate', () => {
+    const rendered = renderCiWorkflowYaml(declared);
+    const workflow = Bun.YAML.parse(rendered) as {
+      jobs: Record<string, { needs?: string; 'runs-on'?: unknown; 'timeout-minutes'?: number; steps: unknown[] }>;
+    };
+    const validate = workflow.jobs.main;
+    const execute = workflow.jobs['macos-cross-tests'];
+
+    expect(execute?.needs).toBe('main');
+    expect(execute?.['runs-on']).toEqual(['macos-arm64', 'self-hosted']);
+    expect(execute?.['timeout-minutes']).toBe(30);
+    // The Linux job COMPILES the darwin binaries; that is what proves the cross
+    // build works at all.
+    expect(rendered).toContain(
+      'run: smoo github-ci nx-run-many --targets "cargo-cross-test-archive-aarch64-apple-darwin"',
+    );
+    expect(JSON.stringify(validate?.steps)).toContain('cross-test-archives-${{ github.run_id }}');
+    // ...and the macOS job only RUNS them: every step is checkout, the shell,
+    // the download, the archive run, or the cache save. Nothing invokes cargo,
+    // a toolchain install, or an SDK.
+    const executeSteps = execute?.steps ?? [];
+    expect(executeSteps).toContainEqual({
+      name: '🧪 Cross-Target Unit Tests',
+      run: 'smoo github-ci nx-run-many --targets "cargo-cross-test-aarch64-apple-darwin"',
+    });
+    const executeText = JSON.stringify(executeSteps);
+    expect(executeText).toContain('cross-test-archives-${{ github.run_id }}');
+    expect(executeText).toContain('actions/download-artifact');
+    expect(executeText).not.toContain('cargo ');
+    expect(executeText).not.toContain('rustup');
+    expect(executeText).not.toContain('cargo-cross-test-archive');
+    expect(executeText).not.toContain('--target build');
+    expect(executeText).not.toContain('SDK');
+  });
+
+  it('reuses the declared cross producer for the archive step, step-scoped', () => {
+    const rendered = renderCiWorkflowYaml(
+      options({
+        ...declared,
+        platformProducer: {
+          kind: 'linux-cross',
+          preflight: 'sh scripts/prepare-macos-sdk.sh',
+          env: { ACME_CROSS: '1', SDKROOT: '${{ runner.temp }}/apple-sdk/MacOSX.sdk' },
+        },
+      }),
+    );
+    const validate = rendered.slice(0, rendered.indexOf('  macos-cross-tests:'));
+
+    expect(validate).toContain('- name: Check cross-platform toolchain prerequisites');
+    expect(validate).toContain('        working-directory: .\n');
+    expect(validate).toContain('          set -euo pipefail\n          sh scripts/prepare-macos-sdk.sh');
+    // Step-scoped, so Validate's host builds stay host builds: the pair appears
+    // once per cross step and never in the job's own env block.
+    expect(validate.match(/ACME_CROSS: "1"/g)).toHaveLength(2);
+    const jobEnv = validate.slice(validate.indexOf('    env:'), validate.indexOf('    steps:'));
+    expect(jobEnv).not.toContain('ACME_CROSS');
+    expect(jobEnv).not.toContain('SDKROOT');
+    // A declared producer with no preflight is a mechanism error at render time.
+    expect(() =>
+      renderCiWorkflowYaml(options({ ...declared, platformProducer: { kind: 'linux-cross', preflight: '  ' } })),
+    ).toThrow('nonempty toolchain preflight');
+  });
+
+  it('numbers the execute job download before the run and keeps the cleanup anchor after both', () => {
+    const execute = crossTestJob(renderCiWorkflowYaml(declared));
+
+    // Checkout 2, setup-devenv 3, download 4, run 5, cleanup 6.
+    expect(execute).toContain('# Step 4\n      - name: 📥 Download cross-target test archives');
+    expect(execute).toContain('# Step 5\n      - name: 🧪 Cross-Target Unit Tests');
+    expect(execute).toContain('# Step 6');
+    expect(execute).toContain('uses: ./.github/actions/save-nix-devenv');
+  });
+
+  it('builds a non-darwin triple without an execution job it has no runner for', () => {
+    const rendered = renderCiWorkflowYaml(
+      options({
+        crossTestArchives: [
+          { triple: 'x86_64-unknown-linux-musl', path: 'target/nextest/archive-x86_64-unknown-linux-musl.tar.zst' },
+        ],
+      }),
+    );
+
+    expect(rendered).toContain(
+      'run: smoo github-ci nx-run-many --targets "cargo-cross-test-archive-x86_64-unknown-linux-musl"',
+    );
+    expect(rendered).not.toContain('macos-cross-tests');
+  });
+
+  it('downloads a nested cargo workspace archive back to the directory its target writes', () => {
+    const execute = crossTestJob(
+      renderCiWorkflowYaml(
+        options({
+          crossTestArchives: [{ ...darwin, path: `packages/ferris/${darwin.path}` }],
+        }),
+      ),
+    );
+
+    expect(execute).toContain('path: packages/ferris/target/nextest');
+  });
+
+  it('refuses declarations the Nx graph could not have produced, at render time', () => {
+    expect(() =>
+      renderCiWorkflowYaml(options({ crossTestArchives: [{ ...darwin, path: 'target/nextest/archive.tar.zst' }] })),
+    ).toThrow('must be a repository-relative target/nextest/archive-aarch64-apple-darwin.tar.zst');
+    expect(() =>
+      renderCiWorkflowYaml(options({ crossTestArchives: [{ ...darwin, path: `../${darwin.path}` }] })),
+    ).toThrow('must stay inside the repository');
+    expect(() =>
+      renderCiWorkflowYaml(
+        options({ crossTestArchives: [{ triple: 'Bad Triple; rm -rf /', path: 'target/nextest/x.tar.zst' }] }),
+      ),
+    ).toThrow('must be a target triple');
+    // Two cargo workspaces cannot share one artifact: upload-artifact roots it
+    // at the least common ancestor, so the restored paths would be wrong for
+    // both. Refuse here rather than on the runner.
+    expect(() =>
+      renderCiWorkflowYaml(
+        options({
+          crossTestArchives: [
+            darwin,
+            { triple: 'x86_64-apple-darwin', path: `packages/ferris/${cargoArchive('x86_64-apple-darwin')}` },
+          ],
+        }),
+      ),
+    ).toThrow('must share one directory');
+  });
+});
+
+function crossTestJob(rendered: string): string {
+  const start = rendered.indexOf('  macos-cross-tests:');
+  expect(start).toBeGreaterThan(-1);
+  return rendered.slice(start);
+}
+
+function cargoArchive(triple: string): string {
+  return `target/nextest/archive-${triple}.tar.zst`;
+}

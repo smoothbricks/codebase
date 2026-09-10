@@ -1,6 +1,10 @@
 import { appendFileSync, existsSync, lstatSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import {
+  cargoCrossTestArchiveFile,
+  cargoCrossTestTripleFromArchiveTarget,
+} from '@smoothbricks/nx-plugin/cross-check-policy';
 import { MACOS_PLATFORM_TARGET_GLOBS, PLATFORM_TARGET_GLOBS } from '@smoothbricks/nx-plugin/workspace-config-policy';
 import { isStageDerivedDeploy, PRODUCTION_PUSH_DEPLOY_TAG } from '../lib/deploy-tags.js';
 import {
@@ -17,9 +21,15 @@ import {
   readValidatedPackageJson,
 } from '../lib/json.js';
 import { listReleasePackages, packageInfo } from '../lib/workspace.js';
-import { loadNxProjects, type NxProjects, targetNamesFromProjects } from '../nx/index.js';
+import {
+  loadNxProjects,
+  type NxProjects,
+  projectRootFromNxProjectJson,
+  targetNamesFromNxProjectJson,
+  targetNamesFromProjects,
+} from '../nx/index.js';
 import { resolvePrivateNpmWorkflowConfig } from '../release/private-npm.js';
-import { privateNpmReadTokenJobEnv, renderCiWorkflowYaml } from './ci-workflow.js';
+import { type CiCrossTestArchive, privateNpmReadTokenJobEnv, renderCiWorkflowYaml } from './ci-workflow.js';
 import { renderRunsOnLine } from './github-runs-on.js';
 import { renderPrPreviewCleanupWorkflowYaml } from './pr-preview-cleanup-workflow.js';
 import { renderPublishWorkflowYaml } from './publish-workflow.js';
@@ -181,6 +191,12 @@ export interface ManagedFileContext {
   cargoCredentials?: PackageCargoCredentialsConfig;
   /** Declared self-hosted Nx remote cache from the root smoo config; absent means local caching only. */
   remoteCache?: PackageRemoteCacheConfig;
+  /**
+   * Cross-built test archives the graph can produce, one per foreign target
+   * triple the cargo workspace declares. Empty for a repository that declares
+   * none, which renders a CI workflow with no cross steps and no macOS job.
+   */
+  crossTestArchives: CiCrossTestArchive[];
 }
 
 interface DeployTargetInfo {
@@ -407,6 +423,9 @@ function getManagedContent(file: ManagedFile, context: ManagedFileContext): stri
         deploySecrets: context.ciDeploySecrets,
         e2eSecrets: context.ciE2eSecrets,
         productionOnPush: context.hasProductionPushDeployTargets,
+        crossTestArchives: context.crossTestArchives,
+        macosRunsOn: context.macosRunsOn,
+        platformProducer: context.platformProducer,
       });
     }
     if (file.source === 'publish-workflow') {
@@ -503,11 +522,46 @@ async function getManagedFileContext(root: string): Promise<ManagedFileContext> 
       ? macosPlatformArchitecturesForTest(targetNames)
       : [],
     privateNpm,
+    crossTestArchives: crossTestArchivesForTest(nxProjects),
   };
 }
 
 export function hasExactTargetForTest(targetNames: Iterable<string>, target: string): boolean {
   return [...targetNames].includes(target);
+}
+
+/**
+ * Test seam: the cross-built test archives this graph can produce, read back
+ * out of the inferred `cargo-cross-test-archive-<triple>` targets.
+ *
+ * Derived, not configured. The triple is declared exactly once — in the cargo
+ * workspace's own `[workspace.metadata.smoothbricks.test] cross-targets`, where
+ * a Rust target triple belongs — and both halves of the workflow are rendered
+ * from the targets that declaration produced. A second copy in `smoo.github`
+ * could name a triple the graph cannot build, and CI would discover that only
+ * on the runner.
+ *
+ * The path is the target's own output location, so the artifact the Linux job
+ * uploads and the file the macOS job's runner opens are the same string
+ * computed once.
+ */
+export function crossTestArchivesForTest(projects: NxProjects): CiCrossTestArchive[] {
+  const archives: CiCrossTestArchive[] = [];
+  for (const project of Object.values(projects)) {
+    const projectRoot = projectRootFromNxProjectJson(project);
+    for (const targetName of targetNamesFromNxProjectJson(project)) {
+      const triple = cargoCrossTestTripleFromArchiveTarget(targetName);
+      if (triple === null) {
+        continue;
+      }
+      const file = cargoCrossTestArchiveFile(triple);
+      archives.push({
+        triple,
+        path: projectRoot === undefined || projectRoot === '.' ? file : `${projectRoot}/${file}`,
+      });
+    }
+  }
+  return archives.sort((left, right) => left.triple.localeCompare(right.triple));
 }
 
 /**

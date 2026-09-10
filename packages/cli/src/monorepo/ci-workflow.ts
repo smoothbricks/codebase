@@ -1,5 +1,10 @@
 /* biome-ignore-all lint/suspicious/noTemplateCurlyInString: GitHub Actions expressions are emitted literally. */
 
+import {
+  cargoCrossTestArchiveFile,
+  cargoCrossTestArchiveTargetName,
+  cargoCrossTestTargetName,
+} from '@smoothbricks/nx-plugin/cross-check-policy';
 import { PRODUCTION_PUSH_DEPLOY_TAG } from '../lib/deploy-tags.js';
 import type {
   NonEmptyArray,
@@ -24,6 +29,11 @@ export enum CiWorkflowStepKind {
   BrowserTests = 'browser-tests',
   Lint = 'lint',
   UnitTests = 'unit-tests',
+  CrossToolchainPreflight = 'cross-toolchain-preflight',
+  CrossTestArchives = 'cross-test-archives',
+  UploadCrossTestArchives = 'upload-cross-test-archives',
+  DownloadCrossTestArchives = 'download-cross-test-archives',
+  CrossTests = 'cross-tests',
   ManagedFilesCheck = 'managed-files-check',
   ManagedFilesDispatch = 'managed-files-dispatch',
   Deploy = 'deploy',
@@ -49,6 +59,23 @@ export interface DeployStepSecretConfig {
   deployProvider?: 'cloudflare';
   /** Extra deploy-step secrets, env var name → repository secret name. */
   deploySecrets?: Record<string, string>;
+}
+
+/**
+ * One foreign target triple's test archive: what the Linux job cross-builds and
+ * a native runner executes.
+ *
+ * Both fields are DERIVED, never hand-written: the triple comes from the cargo
+ * workspace's `[workspace.metadata.smoothbricks.test] cross-targets`, and the
+ * path is where the inferred `cargo-cross-test-archive-<triple>` target
+ * declares its output. That is why this is not a `smoo.github` key — a triple
+ * repeated in CI config could name an archive the graph cannot build, and the
+ * workflow would only find out on the runner.
+ */
+export interface CiCrossTestArchive {
+  triple: string;
+  /** Repository-relative path of the archive file, from the target's output. */
+  path: string;
 }
 
 export interface CiWorkflowDefinitionOptions extends DeployStepSecretConfig {
@@ -92,6 +119,41 @@ export interface CiWorkflowDefinitionOptions extends DeployStepSecretConfig {
   e2eSecrets?: Record<string, string>;
   /** Emit the production-on-push job (some project carries PRODUCTION_PUSH_DEPLOY_TAG). */
   productionOnPush?: boolean;
+  /**
+   * Cross-built test archives, one per foreign target triple the cargo
+   * workspace declares. The Linux job builds and uploads each one; a second job
+   * downloads the `*-apple-darwin` ones and EXECUTES them on `macosRunsOn`,
+   * which is how a cross compile gets proved by running rather than by linking.
+   *
+   * Empty or absent renders exactly what a repository without cross archives
+   * renders — no step, no job, no numbering shift.
+   */
+  crossTestArchives?: readonly CiCrossTestArchive[];
+  /**
+   * macOS runner labels for the darwin execution job
+   * (`smoo.github.macosRunsOn`, the same labels the publish workflow's macOS
+   * legs use). Default macos-latest.
+   *
+   * A self-hosted label here is one specific machine. That machine being asleep
+   * does not skip the job: it queues, and the run FAILS on the job's
+   * `timeout-minutes`. That is the trade this opt-in buys — a red run when the
+   * Mac is unreachable, in exchange for the darwin binaries being tested by
+   * execution at all. `continue-on-error` would buy the green back by making
+   * the job unable to report anything, which is worse than not having it.
+   */
+  macosRunsOn?: string | string[];
+  /**
+   * Declared Linux cross-platform producer (`smoo.github.platformProducer`):
+   * the toolchain preflight and the environment a foreign-target build needs on
+   * a Linux runner. The publish workflow already renders this declaration for
+   * its cross artifact job, so the cross test archive reuses it rather than
+   * carrying a second copy of one repository's SDK and linker setup.
+   *
+   * Rendered STEP-scoped here, never as job env: this environment turns the
+   * repository's native producers into cross producers, and Validate's other
+   * steps are host builds that must stay host builds.
+   */
+  platformProducer?: PackageSmooGithub['platformProducer'];
 }
 
 type CiWorkflowStepInput = Omit<CiWorkflowStep, 'number'>;
@@ -117,6 +179,18 @@ export function defineCiWorkflow(options: CiWorkflowDefinitionOptions): CiWorkfl
     { kind: CiWorkflowStepKind.Lint, name: '🔍 Lint' },
     { kind: CiWorkflowStepKind.UnitTests, name: '🧪 Unit Tests' },
   );
+  if (options.crossTestArchives?.length) {
+    if (options.platformProducer !== undefined) {
+      steps.push({
+        kind: CiWorkflowStepKind.CrossToolchainPreflight,
+        name: 'Check cross-platform toolchain prerequisites',
+      });
+    }
+    steps.push(
+      { kind: CiWorkflowStepKind.CrossTestArchives, name: '🎯 Build cross-target test archives' },
+      { kind: CiWorkflowStepKind.UploadCrossTestArchives, name: '📤 Upload cross-target test archives' },
+    );
+  }
   if (options.browserTests) {
     steps.push({ kind: CiWorkflowStepKind.BrowserTests, name: '🌐 Browser Tests' });
   }
@@ -135,6 +209,7 @@ export function renderCiWorkflowYaml(options: CiWorkflowDefinitionOptions): stri
   return [
     renderCiWorkflowHeader(options),
     renderCiWorkflowSteps(steps, options),
+    renderCrossTestExecutionJob(options),
     renderE2eDeploymentJob(options),
     renderProductionDeployJob(options),
   ].join('');
@@ -321,6 +396,61 @@ function yamlLinesForStep(step: CiWorkflowStep, options: CiWorkflowDefinitionOpt
       return nxSmartStep(step, 'lint', 'Lint');
     case CiWorkflowStepKind.UnitTests:
       return nxSmartStep(step, 'test', 'Unit Tests');
+    case CiWorkflowStepKind.CrossToolchainPreflight:
+      // The repository's own preflight, the same one the publish workflow's
+      // cross artifact job runs — an SDK to provision, a linker to check.
+      // `working-directory: .` because this workflow's steps default to the
+      // direnv shell directory while a preflight is repository-relative.
+      return [
+        `      - name: ${step.name}`,
+        '        working-directory: .',
+        ...platformProducerStepEnvLines(options),
+        '        run: |',
+        '          set -euo pipefail',
+        ...crossToolchainPreflight(options).map((line) => `          ${line}`),
+      ];
+    case CiWorkflowStepKind.CrossTestArchives:
+      // Cross-COMPILES the workspace's test binaries for each declared foreign
+      // triple and packs them; runs nothing. `nx-run-many` rather than
+      // `nx-smart`, because an affected-graph selection would skip the archive
+      // on a commit that changed nothing Rust — and the sibling job that
+      // executes it has no way to build one.
+      return [
+        `      - name: ${step.name}`,
+        ...platformProducerStepEnvLines(options),
+        `        run: smoo github-ci nx-run-many --targets "${crossArchiveTargetNames(options).join(',')}"`,
+      ];
+    case CiWorkflowStepKind.UploadCrossTestArchives:
+      // retention-days: 1 — the only consumer is the sibling job in this same
+      // run, and these archives are the whole workspace's test binaries.
+      return artifactStepLines(options.actionsProvider, step.name, 'upload', [
+        `name: ${CROSS_TEST_ARCHIVE_ARTIFACT}`,
+        'path: |',
+        ...crossTestArchives(options).map((archive) => `  ${archive.path}`),
+        // error, not ignore: a missing archive means the cross build silently
+        // produced nothing, and the execute job would then have nothing to run
+        // and no reason to say so.
+        'if-no-files-found: error',
+        'retention-days: 1',
+      ]);
+    case CiWorkflowStepKind.DownloadCrossTestArchives:
+      // Restores each archive at the path its own Nx target declares as output,
+      // which is where the runner target reads it from. upload-artifact roots
+      // the artifact at the least common ancestor of what it uploaded, so the
+      // download path is that shared directory.
+      return artifactStepLines(options.actionsProvider, step.name, 'download', [
+        `name: ${CROSS_TEST_ARCHIVE_ARTIFACT}`,
+        `path: ${crossTestArchiveDirectory(options)}`,
+      ]);
+    case CiWorkflowStepKind.CrossTests:
+      // EXECUTES, and that is all it can do: every one of these targets is
+      // `nextest run --archive-file`, which extracts prebuilt binaries into its
+      // own temporary directory. nextest never invokes cargo on this path
+      // (measured), so nothing here can compile even if a toolchain is present.
+      return [
+        `      - name: ${step.name}`,
+        `        run: smoo github-ci nx-run-many --targets "${darwinCrossTestTargetNames(options).join(',')}"`,
+      ];
     case CiWorkflowStepKind.ManagedFilesCheck:
       // The authoritative drift check is nearly free here (devenv is already
       // up). --warn never fails the job and publishes the step output
@@ -953,6 +1083,10 @@ function renderYamlList(values: string[], spaces: number): string {
  * is GitHub's automatic "Set up job"); every preflight the main job runs also
  * runs here before SetupDevenv, so the middle and cleanup anchors shift with
  * the configuration instead of baking a fixed step number.
+ *
+ * `middle` is the FIRST of the job's own steps. A job with more than one — the
+ * cross-test job downloads before it runs — passes how many it has, so the
+ * cleanup anchor stays the number of the step GitHub will actually report.
  */
 interface FollowUpStepNumbers {
   cargo: number | undefined;
@@ -962,12 +1096,13 @@ interface FollowUpStepNumbers {
   cleanup: number;
 }
 
-function followUpStepNumbers(options: CiWorkflowDefinitionOptions): FollowUpStepNumbers {
+function followUpStepNumbers(options: CiWorkflowDefinitionOptions, middleSteps = 1): FollowUpStepNumbers {
   let number = 3;
   const cargo = options.cargoCredentials !== undefined ? number++ : undefined;
   const sources = options.sourceCheckouts?.length ? number++ : undefined;
   const setup = number++;
-  const middle = number++;
+  const middle = number;
+  number += middleSteps;
   const cleanup = number++;
   return { cargo, sources, setup, middle, cleanup };
 }
@@ -992,6 +1127,146 @@ function followUpSetupSteps(options: CiWorkflowDefinitionOptions, numbers: Follo
 /** The final cache-save step, at its configured anchor. */
 function followUpCleanupStep(numbers: FollowUpStepNumbers): CiWorkflowStep[] {
   return [{ kind: CiWorkflowStepKind.SaveNixDevenv, name: '🧹 Cleanup and cache Nix/devenv', number: numbers.cleanup }];
+}
+
+/**
+ * How long the darwin execution job may take, download included. Generous
+ * because the archive is the whole workspace's test binaries, and bounded
+ * because the runner behind `macosRunsOn` may be one person's laptop: an
+ * unreachable runner queues, and this number is when the run says so.
+ */
+const CROSS_TEST_JOB_TIMEOUT_MINUTES = 30;
+
+/** Rust names every Apple-desktop triple this way; iOS and simulator do not. */
+const DARWIN_TRIPLE_SUFFIX = '-apple-darwin';
+
+/** One artifact carrying every triple's archive, scoped to the run that built it. */
+const CROSS_TEST_ARCHIVE_ARTIFACT = `cross-test-archives-${githubExpression('github.run_id')}`;
+
+/**
+ * Executes the cross-built test binaries on a machine where they are native.
+ *
+ * This job COMPILES NOTHING, and cannot: its only Rust input is the archive the
+ * Validate job uploaded, and `nextest run --archive-file` extracts prebuilt
+ * binaries rather than invoking cargo (measured: zero cargo invocations). It
+ * needs the checkout for the workspace `--workspace-remap .` points at and for
+ * Nx to resolve the target, and setup-devenv for `nx` and `cargo-nextest`
+ * themselves — the repository's ordinary shell, not a cross toolchain, no SDK,
+ * no `rustup target add`.
+ *
+ * `needs: main` and a success gate rather than `!cancelled()`: an archive that
+ * was never uploaded cannot be executed, and a job that starts anyway would
+ * fail on a missing artifact and report it as a test failure.
+ *
+ * Only `*-apple-darwin` archives run here, because macOS runner labels are the
+ * only native runner this declaration names. A repository declaring some other
+ * foreign triple still gets its archive BUILT — which proves that triple
+ * compiles — and no execution job, which is the honest rendering of having
+ * nowhere to run it.
+ */
+function renderCrossTestExecutionJob(options: CiWorkflowDefinitionOptions): string {
+  const archives = darwinCrossTestArchives(options);
+  if (archives.length === 0) return '';
+  const numbers = followUpStepNumbers(options, 2);
+  const middleSteps: CiWorkflowStep[] = [
+    {
+      kind: CiWorkflowStepKind.DownloadCrossTestArchives,
+      name: '📥 Download cross-target test archives',
+      number: numbers.middle,
+    },
+    { kind: CiWorkflowStepKind.CrossTests, name: '🧪 Cross-Target Unit Tests', number: numbers.middle + 1 },
+  ];
+  return `
+  macos-cross-tests:
+    name: Unit Tests (${archives.map((archive) => archive.triple).join(', ')})
+    needs: main
+${options.macosRunsOn === undefined ? '    runs-on: macos-latest' : renderRunsOnLine(options.macosRunsOn)}
+    timeout-minutes: ${CROSS_TEST_JOB_TIMEOUT_MINUTES}
+    if: \${{ needs.main.result == 'success' }}
+    env:
+      GH_TOKEN: \${{ github.token }}
+${remoteCacheJobEnvLines(options.remoteCache)}${cargoCredentialJobEnvLines(options.cargoCredentials)}${privateNpmReadTokenJobEnv(options)}    steps:
+${renderCiWorkflowSteps(followUpSetupSteps(options, numbers), options)}
+${renderCiWorkflowSteps(middleSteps, options)}
+${renderCiWorkflowSteps(followUpCleanupStep(numbers), options)}`;
+}
+
+/**
+ * The declared archives, checked against the naming the Nx graph would have
+ * produced. A path that is not `cargoCrossTestArchiveFile(triple)` under some
+ * project root cannot have come from that target, so it is refused here rather
+ * than uploaded as an artifact nothing on the other side can find.
+ */
+function crossTestArchives(options: CiWorkflowDefinitionOptions): CiCrossTestArchive[] {
+  return (options.crossTestArchives ?? []).map((archive) => {
+    const suffix = cargoCrossTestArchiveFile(archive.triple);
+    const path = archive.path.split('\\').join('/');
+    if (!/^[a-z0-9][a-z0-9._-]*$/.test(archive.triple)) {
+      throw new Error(`smoo cross test archive triple must be a target triple, got ${JSON.stringify(archive.triple)}`);
+    }
+    if (path !== suffix && !path.endsWith(`/${suffix}`)) {
+      throw new Error(
+        `smoo cross test archive for ${archive.triple} must be a repository-relative ${suffix}, got ${archive.path}`,
+      );
+    }
+    if (path.startsWith('/') || path.split('/').includes('..')) {
+      throw new Error(`smoo cross test archive path must stay inside the repository, got ${archive.path}`);
+    }
+    return { triple: archive.triple, path };
+  });
+}
+
+function crossArchiveTargetNames(options: CiWorkflowDefinitionOptions): string[] {
+  return crossTestArchives(options).map((archive) => cargoCrossTestArchiveTargetName(archive.triple));
+}
+
+/**
+ * The declared preflight, as lines. A declaration with nothing in it is a
+ * mechanism error, and it surfaces here at render time rather than as a step
+ * whose `run:` block is empty.
+ */
+function crossToolchainPreflight(options: CiWorkflowDefinitionOptions): string[] {
+  const preflight = options.platformProducer?.preflight ?? '';
+  if (preflight.trim().length === 0) {
+    throw new Error('smoo.github.platformProducer requires a nonempty toolchain preflight command.');
+  }
+  return preflight.split('\n');
+}
+
+/** The producer environment, step-scoped, quoted exactly as the publish workflow quotes it. */
+function platformProducerStepEnvLines(options: CiWorkflowDefinitionOptions): string[] {
+  const entries = Object.entries(options.platformProducer?.env ?? {});
+  if (entries.length === 0) return [];
+  return ['        env:', ...entries.map(([name, value]) => `          ${name}: ${JSON.stringify(value)}`)];
+}
+
+function darwinCrossTestArchives(options: CiWorkflowDefinitionOptions): CiCrossTestArchive[] {
+  return crossTestArchives(options).filter((archive) => archive.triple.endsWith(DARWIN_TRIPLE_SUFFIX));
+}
+
+function darwinCrossTestTargetNames(options: CiWorkflowDefinitionOptions): string[] {
+  return darwinCrossTestArchives(options).map((archive) => cargoCrossTestTargetName(archive.triple));
+}
+
+/**
+ * Where the download lands. upload-artifact roots an artifact at the least
+ * common ancestor of the files it uploaded, so every archive in one artifact
+ * has to share a parent directory for the restored layout to be the one the
+ * runner targets read — true for one cargo workspace, false the moment a
+ * second one also declares cross targets, which is refused here instead of
+ * silently restoring the archives one directory too high.
+ */
+function crossTestArchiveDirectory(options: CiWorkflowDefinitionOptions): string {
+  const directories = new Set(
+    darwinCrossTestArchives(options).map((archive) => archive.path.slice(0, archive.path.lastIndexOf('/') + 1) || './'),
+  );
+  if (directories.size > 1) {
+    throw new Error(
+      `smoo cross test archives must share one directory to travel as one artifact, got ${[...directories].join(', ')}`,
+    );
+  }
+  const [directory] = [...directories];
+  return (directory ?? './').replace(/\/$/, '');
 }
 
 function renderE2eDeploymentJob(options: CiWorkflowDefinitionOptions): string {

@@ -630,6 +630,89 @@ export const CARGO_TEST_ARCHIVE_TARGET = 'cargo-test-archive';
 export const CARGO_TEST_ARCHIVE_FILE = 'target/nextest/archive.tar.zst';
 
 /**
+ * One foreign target triple this cargo workspace also archives its tests for.
+ */
+export interface CargoCrossTestTarget {
+  target: string;
+  /**
+   * The repository's own cargo driver for this triple, relative to the cargo
+   * workspace root — a program that accepts cargo's argv and links for the
+   * target. Exported to the archive command as `CARGO`, which is cargo's own
+   * driver variable and the only seam nextest offers: nextest shells out to
+   * `$CARGO metadata` and `$CARGO test --no-run --target <triple>` (measured),
+   * so a repository whose cross link needs zig, an SDK or a sysroot puts that
+   * knowledge in one script instead of in the generated command.
+   *
+   * Absent means the ambient toolchain already links the triple.
+   */
+  cargo?: string;
+}
+
+/**
+ * Foreign target triples this cargo workspace archives tests for, from
+ * `[workspace.metadata.smoothbricks.test] cross-targets`. An entry is either
+ * the triple as a string, or a table adding that triple's cargo driver:
+ *
+ * ```toml
+ * [workspace.metadata.smoothbricks.test]
+ * cross-targets = [{ target = "aarch64-apple-darwin", cargo = "scripts/cargo-for-nextest.sh" }]
+ * ```
+ *
+ * The DECLARATION lives in Cargo.toml rather than in a CI config because a
+ * Rust target triple is a cargo fact: the same list decides which archives the
+ * graph can produce whether or not anything is running CI, and it is read from
+ * the same manifest `shards` comes out of, beside it in the same
+ * `smoothbricks.test` table, with the parser this module already uses.
+ */
+export function listCargoCrossTestTargets(absoluteProjectRoot: string): CargoCrossTestTarget[] {
+  const workspaceTomlPath = join(absoluteProjectRoot, 'Cargo.toml');
+  if (!existsSync(workspaceTomlPath)) {
+    return [];
+  }
+  const parsed: unknown = parseToml(readFileSync(workspaceTomlPath, 'utf-8'));
+  if (!isRecord(parsed) || !isRecord(parsed.workspace)) {
+    return [];
+  }
+  const metadata = isRecord(parsed.workspace.metadata) ? parsed.workspace.metadata : null;
+  const smoothbricks = metadata && isRecord(metadata.smoothbricks) ? metadata.smoothbricks : null;
+  const test = smoothbricks && isRecord(smoothbricks.test) ? smoothbricks.test : null;
+  const declared = test?.['cross-targets'];
+  if (declared === undefined) {
+    return [];
+  }
+  if (!Array.isArray(declared)) {
+    throw new Error(`${workspaceTomlPath}: smoothbricks.test.cross-targets must be an array of target triples`);
+  }
+  const crossTargets: CargoCrossTestTarget[] = [];
+  for (const entry of declared) {
+    const target = typeof entry === 'string' ? entry : isRecord(entry) ? entry.target : undefined;
+    // A triple becomes an Nx target NAME and an archive FILE name, so anything
+    // a shell or Nx would have to quote is refused where it is declared rather
+    // than emitted into a command.
+    if (typeof target !== 'string' || !/^[a-z0-9][a-z0-9._-]*$/.test(target)) {
+      throw new Error(
+        `${workspaceTomlPath}: smoothbricks.test.cross-targets entries must be target triples like ` +
+          `"aarch64-apple-darwin", got ${JSON.stringify(entry)}`,
+      );
+    }
+    const cargo = isRecord(entry) ? entry.cargo : undefined;
+    // The driver is an input of every archive built through it, so it has to be
+    // a path inside this workspace rather than a command line: `{projectRoot}/`
+    // plus this string is what makes editing it invalidate the archive.
+    if (cargo !== undefined && (typeof cargo !== 'string' || cargo.length === 0 || !/^[\w./-]+$/.test(cargo))) {
+      throw new Error(
+        `${workspaceTomlPath}: smoothbricks.test.cross-targets ${target} cargo must be a path inside the ` +
+          `cargo workspace, got ${JSON.stringify(cargo)}`,
+      );
+    }
+    if (!crossTargets.some((existing) => existing.target === target)) {
+      crossTargets.push(cargo === undefined ? { target } : { target, cargo });
+    }
+  }
+  return crossTargets;
+}
+
+/**
  * Tests that nextest.toml singles out are pinned to this suffix instead of
  * being sharded. Only a sharded crate has one: an unsharded crate runs its
  * whole suite in a single nextest process, which is all the pin restores.

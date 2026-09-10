@@ -8,6 +8,7 @@ import fc from 'fast-check';
 import { type NxProjects, targetNamesFromProjects } from '../nx/index.js';
 import {
   anyProjectHasTagForTest,
+  crossTestArchivesForTest,
   DEVENV_MODULE_IMPORT,
   deployTargetInfoFromProjects,
   extractInlineLocalBlocksForTest,
@@ -204,6 +205,31 @@ describe('managed publish platform discovery', () => {
     ).toEqual(['arm64', 'x64']);
     expect(macosPlatformArchitecturesForTest(['simulator-arm64-ios', 'cli-arm64-macos'])).toEqual(['arm64']);
     expect(macosPlatformArchitecturesForTest(['build', 'cli-x64-linux', 'test'])).toEqual([]);
+  });
+
+  it('reads cross-built archives out of the graph, at each project root', () => {
+    expect(
+      crossTestArchivesForTest({
+        '@acme/codebase': {
+          root: '.',
+          targets: { 'cargo-cross-test-archive-aarch64-apple-darwin': {}, 'cargo-test-archive': {}, test: {} },
+        },
+        'acme-embedded': {
+          root: 'packages/embedded',
+          targets: { 'cargo-cross-test-archive-thumbv7em-none-eabihf': {} },
+        },
+        'acme-web': { root: 'packages/web', targets: { build: {}, 'cargo-cross-test-aarch64-apple-darwin': {} } },
+      }),
+    ).toEqual([
+      { triple: 'aarch64-apple-darwin', path: 'target/nextest/archive-aarch64-apple-darwin.tar.zst' },
+      {
+        triple: 'thumbv7em-none-eabihf',
+        path: 'packages/embedded/target/nextest/archive-thumbv7em-none-eabihf.tar.zst',
+      },
+    ]);
+    // A repository with no cross declaration has no such target, so the CI
+    // renderer gets an empty list and renders the workflow it renders today.
+    expect(crossTestArchivesForTest({ '@acme/codebase': { root: '.', targets: { test: {} } } })).toEqual([]);
   });
 });
 
@@ -461,6 +487,7 @@ const context = (overrides: Partial<ManagedFileContext>): ManagedFileContext => 
   platformTargetGlobs: [],
   releasePlatformTargetGlobs: [],
   macosPlatformArchitectures: [],
+  crossTestArchives: [],
   ...overrides,
 });
 
