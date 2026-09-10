@@ -430,11 +430,28 @@ access makes cleanup refuse before it deletes anything rather than half-clean a 
 A wrong value type anywhere in `smoo.github` fails `smoo monorepo update` and `smoo github-ci nx-deploy` with the
 offending path, rather than silently falling back to the defaults.
 
+#### What CI deploys: the deploy tags
+
+A `deploy` target says a project CAN be deployed. Four Nx tags say whether CI does, and they are the only thing that
+says so: the generated workflows and `smoo github-ci nx-deploy` read one rule, so a repository cannot render a deploy
+job that deploys nothing, nor deploy a project no job announced.
+
+- `stage-deploy-target`: deployed on every stage — pull-request previews, staging, and production.
+- `staging-deploy-target`: deployed on staging only, for infrastructure the pull-request stages share.
+- `permanent-deploy-target`: excluded from every stage deploy; deployed outside the stage flow.
+- `production-push-deploy-target`: also deployed by the generated production-on-push job (below).
+
+An untagged `deploy` target is deployable by hand — `nx run <project>:deploy --stage=pr42` — and invisible to CI. A
+repository where no project carries one of these tags gets no deploy step, no `deployments: write` permission, no
+Cloudflare credentials and no `pr-preview-cleanup.yml`, however many wrangler manifests its packages hold: a published
+library ships one to document a Durable Object binding for its consumers, and that manifest looks exactly like a
+deployable worker's.
+
 Tag a project `production-push-deploy-target` to have it deployed to production by a generated `deploy-production` job
 that runs after Validate and the e2e job succeed on a push to the staging push branch
-(`smoo github-ci nx-deploy --stage production --select-tag production-push-deploy-target`). The project must also be
-stage-derived — carry `stage-deploy-target` or deploy through `smoo wrangler deploy-stage` — otherwise `--select-tag`
-finds nothing and the job logs `No run-many deploy projects; skipping production.`
+(`smoo github-ci nx-deploy --stage production --select-tag production-push-deploy-target`). The project must also carry
+`stage-deploy-target`, otherwise `--select-tag` finds nothing and the job logs
+`No run-many deploy projects; skipping production.`
 
 #### Ordering one deploy after another
 
@@ -452,9 +469,9 @@ drop.
 
 What makes the edge safe is that a deploy is never cached and always cheap when there is nothing to do:
 
-- `@smoothbricks/nx-plugin` gives every declared `deploy` target `cache: false`. An Nx cache hit on a deploy means "we
-  once uploaded this hash", which a rollback silently falsifies — the workspace is unchanged, so the hash is unchanged,
-  so a cached deploy would report success while the previous version keeps serving.
+- `@smoothbricks/nx-plugin` gives the `deploy` it infers `cache: false`. An Nx cache hit on a deploy means "we once
+  uploaded this hash", which a rollback silently falsifies — the workspace is unchanged, so the hash is unchanged, so a
+  cached deploy would report success while the previous version keeps serving.
 - `smoo wrangler deploy-stage` reads live state first. If the version tagged with this task's hash is already the one
   serving 100% of traffic, it returns `remote-cache-hit` after two API calls: no upload, no migration, no traffic shift.
 - The expensive, purely file-derived half belongs in a sibling `deploy-build` target (build the artifact, register it,

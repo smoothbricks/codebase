@@ -4,7 +4,7 @@ import { appendFile } from 'node:fs/promises';
 import { PLATFORM_TARGET_GLOBS } from '@smoothbricks/nx-plugin/workspace-config-policy';
 import { $ } from 'bun';
 import typia from 'typia';
-import { isStageDerivedDeploy, PERMANENT_DEPLOY_TAG, STAGING_DEPLOY_TAG } from '../lib/deploy-tags.js';
+import { PERMANENT_DEPLOY_TAG, STAGING_DEPLOY_TAG, stageDeploysProject } from '../lib/deploy-tags.js';
 import {
   ciPushBranches,
   isNonEmpty,
@@ -35,16 +35,14 @@ export interface GithubActionsEventPayload {
   };
 }
 
+/**
+ * What a deploy candidate is READ for: its tags. `nx show projects --withTarget
+ * deploy` already established the target, and the tags decide the rest, so a
+ * project whose `tags` is not a string array fails the parse instead of being
+ * silently untagged.
+ */
 interface NxProjectDeployTarget {
-  tags?: unknown;
-  targets?: {
-    deploy?: {
-      command?: unknown;
-      options?: {
-        command?: unknown;
-      };
-    };
-  };
+  tags?: string[];
 }
 
 const parseGithubActionsEvent = typia.json.createIsParse<GithubActionsEventPayload>();
@@ -570,16 +568,10 @@ export async function selectStageDeployProjects(
   for (const project of candidates) {
     const definition = await loadProject(project);
     if (!isNxProjectDeployTarget(definition)) continue;
-    const deploy = definition.targets?.deploy;
-    const commandValue = deploy?.options?.command ?? deploy?.command;
-    const tags = Array.isArray(definition.tags)
-      ? definition.tags.filter((tag): tag is string => typeof tag === 'string')
-      : [];
-    const isStageDerived = isStageDerivedDeploy(tags, typeof commandValue === 'string' ? commandValue : undefined);
-    const isStagingOnly = tags.includes(STAGING_DEPLOY_TAG);
+    const tags = definition.tags;
     // A required tag narrows the stage rules; it never selects a project they exclude.
-    if (requireTag && !tags.includes(requireTag)) continue;
-    if (isStageDerived || (stage === 'staging' && isStagingOnly)) {
+    if (requireTag && !tags?.includes(requireTag)) continue;
+    if (stageDeploysProject(tags, stage)) {
       selected.push(project);
     }
   }

@@ -847,8 +847,11 @@ describe('event-aware stage deployment', () => {
     ).toThrow(/same-repository/);
   });
 
-  it('selects stage-derived deploy targets plus staging-only infrastructure on staging', async () => {
+  it('selects tagged stage projects plus staging-only infrastructure, and never an untagged one', async () => {
     const definitions: Record<string, unknown> = {
+      // A private wrangler project the plugin gave a deploy target and nobody tagged: deployable
+      // by hand, invisible to CI. Reading the command instead deployed whatever held a wrangler
+      // manifest, including a published library that ships one to document a binding.
       app: {
         targets: {
           deploy: { options: { command: 'smoo wrangler deploy-stage --stage {args.stage}' } },
@@ -875,18 +878,15 @@ describe('event-aware stage deployment', () => {
     const loadProject = async (project: string) => definitions[project];
 
     await expect(selectStageDeployProjects(candidates, 'staging', undefined, loadProject)).resolves.toEqual([
-      'app',
       'app-backend',
       'e2e-mail-capture',
       'website',
     ]);
     await expect(selectStageDeployProjects(candidates, 'pr123', undefined, loadProject)).resolves.toEqual([
-      'app',
       'app-backend',
       'website',
     ]);
     await expect(selectStageDeployProjects(candidates, 'production', undefined, loadProject)).resolves.toEqual([
-      'app',
       'app-backend',
       'website',
     ]);
@@ -1303,15 +1303,14 @@ describe('selectStageDeployProjects with a required tag', () => {
   };
   const loadProject = async (project: string) => definitions[project];
 
-  it('keeps only projects carrying the tag, on top of the stage-derived rule', async () => {
+  it('keeps only projects carrying the tag, on top of the stage rules', async () => {
     await expect(
       selectStageDeployProjects(Object.keys(definitions), 'production', 'production-push-deploy-target', loadProject),
     ).resolves.toEqual(['website']);
   });
 
-  it('selects the website on every stage once it is stage-derived', async () => {
+  it('selects only the tagged project on every stage, required tag or not', async () => {
     await expect(selectStageDeployProjects(Object.keys(definitions), 'pr12', undefined, loadProject)).resolves.toEqual([
-      'app',
       'website',
     ]);
   });

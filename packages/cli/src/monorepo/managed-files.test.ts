@@ -18,6 +18,7 @@ import {
   LOCAL_SECTION_MARKER,
   type ManagedFileContext,
   macosPlatformArchitecturesForTest,
+  managedFileTargetsForContext,
   managedFileTargetsForTest,
   platformTargetGlobsForTest,
   reinsertInlineLocalBlocksForTest,
@@ -263,14 +264,10 @@ describe('nx graph project helpers', () => {
       },
     },
     app: {
+      // What the plugin infers for a private wrangler project, and what a published library
+      // holding a wrangler manifest used to get: a deploy target no tag enrols in CI.
       targets: {
-        deploy: {
-          options: { command: 'echo no' },
-          configurations: {
-            staging: { command: 'wrangler deploy --env staging' },
-            production: { options: { command: 'wrangler deploy --env production' } },
-          },
-        },
+        deploy: { options: { command: 'smoo wrangler deploy-stage --stage {args.stage}' } },
         'package-macos': {},
       },
     },
@@ -296,43 +293,40 @@ describe('nx graph project helpers', () => {
     expect(hasExactTargetForTest(nearMisses, 'e2e-deployment')).toBe(false);
   });
 
-  it('detects deploy configurations and cloudflare provider from graph nodes', () => {
-    expect(deployTargetInfoFromProjects(sampleProjects, 'staging')).toEqual({
-      exists: true,
-      provider: 'cloudflare',
-    });
-    expect(deployTargetInfoFromProjects(sampleProjects, 'production')).toEqual({
-      exists: true,
-      provider: 'cloudflare',
-    });
-    expect(deployTargetInfoFromProjects(sampleProjects, 'preview')).toEqual({ exists: false });
+  it('deploys nothing for a wrangler deploy target no tag names', () => {
+    expect(deployTargetInfoFromProjects(sampleProjects, 'staging')).toEqual({ exists: false });
+    expect(deployTargetInfoFromProjects(sampleProjects, 'production')).toEqual({ exists: false });
   });
 
-  it('recognizes convention-driven deploy-stage targets without per-stage configurations', () => {
-    const projects: NxProjects = {
-      app: {
-        targets: {
-          deploy: {
-            options: { command: 'smoo wrangler deploy-stage --stage {args.stage}' },
-          },
-        },
-      },
-    };
+  it('reads the tags as precedence: permanent excludes, staging narrows, stage generalizes', () => {
+    const deploy = { options: { command: 'smoo wrangler deploy-stage --stage {args.stage}' } };
+    const stageFor = (tags: string[]) => ({
+      staging: deployTargetInfoFromProjects({ site: { tags, targets: { deploy } } }, 'staging').exists,
+      production: deployTargetInfoFromProjects({ site: { tags, targets: { deploy } } }, 'production').exists,
+    });
 
-    expect(deployTargetInfoFromProjects(projects, 'staging')).toEqual({ exists: true, provider: 'cloudflare' });
-    expect(deployTargetInfoFromProjects(projects, 'production')).toEqual({ exists: true, provider: 'cloudflare' });
+    expect(stageFor(['stage-deploy-target'])).toEqual({ staging: true, production: true });
+    expect(stageFor(['staging-deploy-target'])).toEqual({ staging: true, production: false });
+    expect(stageFor(['permanent-deploy-target'])).toEqual({ staging: false, production: false });
+    // Both spellings on one project is a contradiction; the exclusion wins, which is what
+    // `nx show projects --exclude=tag:permanent-deploy-target` does to it in CI too.
+    expect(stageFor(['permanent-deploy-target', 'stage-deploy-target'])).toEqual({
+      staging: false,
+      production: false,
+    });
+    expect(stageFor(['npm:private'])).toEqual({ staging: false, production: false });
   });
 
-  it('treats a stage-deploy-target tag as a deploy target for every stage, like the deploy-stage command', () => {
-    const projects: NxProjects = {
-      site: {
-        tags: ['stage-deploy-target'],
-        targets: { deploy: { command: 'wrangler deploy --config dist/wrangler.json' } },
-      },
+  it('reads the command for the provider only: which credentials the generated job needs', () => {
+    const cloudflare: NxProjects = {
+      site: { tags: ['stage-deploy-target'], targets: { deploy: { command: 'wrangler deploy --config dist/w.json' } } },
+    };
+    const elsewhere: NxProjects = {
+      site: { tags: ['stage-deploy-target'], targets: { deploy: { command: 'bun tooling/deploy-site.ts' } } },
     };
 
-    expect(deployTargetInfoFromProjects(projects, 'staging')).toEqual({ exists: true, provider: 'cloudflare' });
-    expect(deployTargetInfoFromProjects(projects, 'production')).toEqual({ exists: true, provider: 'cloudflare' });
+    expect(deployTargetInfoFromProjects(cloudflare, 'staging')).toEqual({ exists: true, provider: 'cloudflare' });
+    expect(deployTargetInfoFromProjects(elsewhere, 'staging')).toEqual({ exists: true, provider: undefined });
   });
 
   it('finds a tag carried by any project in the graph', () => {
@@ -580,6 +574,44 @@ describe('CI workflow rendering by repo shape', () => {
 
     expect(rendered).toContain('- name: 🚀 Deploy Stage');
     expect(rendered).toContain('  deploy-production:');
+  });
+
+  it('renders no deploy job at all for a repo whose wrangler projects carry no deploy tag', () => {
+    // The regression this exists for: published libraries ship a wrangler manifest to document a
+    // Durable Object binding for their consumers, the plugin inferred a deploy target from each,
+    // and a repository that deploys nothing from CI grew a Deploy Stage step holding Cloudflare
+    // credentials, a deployments permission, and a preview-cleanup workflow.
+    const deploy = { options: { command: 'smoo wrangler deploy-stage --stage {args.stage}' } };
+    const projects: NxProjects = {
+      'acme-cloudflare': { tags: ['npm:private'], targets: { deploy } },
+      'acme-documents': { tags: ['npm:public'], targets: { deploy } },
+      // A private worker, deployed by hand from a developer's shell and never by CI.
+      'acme-service': { targets: { deploy } },
+    };
+    const staging = deployTargetInfoFromProjects(projects, 'staging');
+    const production = deployTargetInfoFromProjects(projects, 'production');
+    const shape = context({
+      hasStagingDeployTargets: staging.exists,
+      stagingDeployProvider: staging.provider,
+      hasProductionDeployTargets: production.exists,
+      productionDeployProvider: production.provider,
+      hasE2eDeploymentTargets: true,
+    });
+    const ci = renderManagedWorkflowForTest('ci-workflow', shape);
+
+    expect(ci).not.toContain('Deploy Stage');
+    expect(ci).not.toContain('deployments: write');
+    expect(ci).not.toContain('CLOUDFLARE_API_TOKEN');
+    expect(ci).not.toContain('e2e-deployment');
+    expect(renderManagedWorkflowForTest('publish-workflow', shape)).not.toContain('Deploy production');
+    expect(managedFileTargetsForContext(shape)).not.toContain('.github/workflows/pr-preview-cleanup.yml');
+  });
+
+  it('adds the preview cleanup workflow only where a cloudflare stage deploy makes preview stages', () => {
+    expect(managedFileTargetsForContext(deploying)).toContain('.github/workflows/pr-preview-cleanup.yml');
+    expect(managedFileTargetsForContext({ ...deploying, stagingDeployProvider: undefined })).not.toContain(
+      '.github/workflows/pr-preview-cleanup.yml',
+    );
   });
 
   it('threads environments and secrets from the context into the workflow', () => {

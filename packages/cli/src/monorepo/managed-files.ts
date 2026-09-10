@@ -6,7 +6,7 @@ import {
   cargoCrossTestTripleFromArchiveTarget,
 } from '@smoothbricks/nx-plugin/cross-check-policy';
 import { MACOS_PLATFORM_TARGET_GLOBS, PLATFORM_TARGET_GLOBS } from '@smoothbricks/nx-plugin/workspace-config-policy';
-import { isStageDerivedDeploy, PRODUCTION_PUSH_DEPLOY_TAG } from '../lib/deploy-tags.js';
+import { PRODUCTION_PUSH_DEPLOY_TAG, stageDeploysProject } from '../lib/deploy-tags.js';
 import {
   ciPushBranches,
   type NonEmptyArray,
@@ -29,6 +29,7 @@ import {
   targetNamesFromProjects,
 } from '../nx/index.js';
 import { resolvePrivateNpmWorkflowConfig } from '../release/private-npm.js';
+import type { DeploymentStage } from '../wrangler/stage.js';
 import { type CiCrossTestArchive, privateNpmReadTokenJobEnv, renderCiWorkflowYaml } from './ci-workflow.js';
 import { renderRunsOnLine } from './github-runs-on.js';
 import { renderPrPreviewCleanupWorkflowYaml } from './pr-preview-cleanup-workflow.js';
@@ -342,6 +343,23 @@ export const managedFileTargetsForTest = managedFiles.map(({ target, executable 
 
 const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 
+/**
+ * Whether a repository of this shape has the file at all. A repository that owns
+ * no packages has nothing to publish, and one the stage flow does not deploy to
+ * Cloudflare has no preview stage to clean up.
+ */
+function managedFileApplies(file: ManagedFile, context: ManagedFileContext): boolean {
+  if (file.releasePackagesOnly === true && !context.hasReleasePackages && !context.hasProductionDeployTargets) {
+    return false;
+  }
+  return file.cloudflareDeployOnly !== true || context.stagingDeployProvider === 'cloudflare';
+}
+
+/** Test seam: the managed targets a repository of this shape gets, in file order. */
+export function managedFileTargetsForContext(context: ManagedFileContext): string[] {
+  return managedFiles.filter((file) => managedFileApplies(file, context)).map((file) => file.target);
+}
+
 export async function applyManagedFiles(root: string, mode: 'update' | 'check' | 'diff'): Promise<FileResult[]> {
   const context = await getManagedFileContext(root);
   return managedFiles.map((file) => applyManagedFile(root, file, mode, context));
@@ -353,10 +371,7 @@ function applyManagedFile(
   mode: 'update' | 'check' | 'diff',
   context: ManagedFileContext,
 ): FileResult {
-  if (file.releasePackagesOnly === true && !context.hasReleasePackages && !context.hasProductionDeployTargets) {
-    return { target: file.target, action: 'skipped' };
-  }
-  if (file.cloudflareDeployOnly === true && context.stagingDeployProvider !== 'cloudflare') {
+  if (!managedFileApplies(file, context)) {
     return { target: file.target, action: 'skipped' };
   }
   const target = resolve(root, file.target);
@@ -612,12 +627,12 @@ export function macosPlatformArchitecturesForTest(targetNames: Iterable<string>)
   return [...architectures].sort((left, right) => left.localeCompare(right));
 }
 
-/** Test seam: deploy configuration presence/provider from graph nodes. */
-export function deployTargetInfoFromProjects(projects: NxProjects, configuration: string): DeployTargetInfo {
+/** Test seam: what the stage flow deploys, and with which provider, from graph nodes. */
+export function deployTargetInfoFromProjects(projects: NxProjects, stage: DeploymentStage): DeployTargetInfo {
   let exists = false;
   let provider: DeployTargetInfo['provider'];
   for (const project of Object.values(projects)) {
-    const info = deployTargetInfoFromProject(project, configuration);
+    const info = deployTargetInfoFromProject(project, stage);
     if (!info.exists) {
       continue;
     }
@@ -632,22 +647,24 @@ export function anyProjectHasTagForTest(projects: NxProjects, tag: string): bool
   return Object.values(projects).some((project) => project.tags?.includes(tag));
 }
 
-function deployTargetInfoFromProject(project: NxProjectJson, configuration: string): DeployTargetInfo {
+/**
+ * A generated deploy job exists for the projects CI would actually deploy, which
+ * is `stageDeploysProject` and nothing else — the same rule `smoo github-ci
+ * nx-deploy` selects by, so the job and its selection cannot disagree. Reading
+ * the target's presence instead would render a deploy job, with cloud
+ * credentials, into a repository whose only wrangler manifests document a
+ * Durable Object binding for a published library's consumers.
+ *
+ * The command is read for the PROVIDER only: which cloud CLI runs says which
+ * credentials the job needs, and says nothing about whether CI runs it.
+ */
+function deployTargetInfoFromProject(project: NxProjectJson, stage: DeploymentStage): DeployTargetInfo {
   const deploy = project.targets?.deploy;
-  if (!deploy) {
+  if (!deploy || !stageDeploysProject(project.tags, stage)) {
     return { exists: false };
   }
-  const baseCommandValue = deploy.options?.command ?? deploy.command;
-  const baseCommand = typeof baseCommandValue === 'string' ? baseCommandValue : '';
-  if (isStageDerivedDeploy(project.tags, baseCommand)) {
-    return { exists: true, provider: deployProvider(baseCommand) };
-  }
-  const config = deploy.configurations?.[configuration];
-  if (!config) {
-    return { exists: false };
-  }
-  const commandValue = config.command ?? config.options?.command ?? baseCommand;
-  return { exists: true, provider: deployProvider(typeof commandValue === 'string' ? commandValue : '') };
+  const command = deploy.options?.command ?? deploy.command;
+  return { exists: true, provider: deployProvider(typeof command === 'string' ? command : '') };
 }
 
 function deployProvider(command: string): DeployTargetInfo['provider'] {
