@@ -10,7 +10,7 @@ permissions:
 jobs:
   source:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v6.0.2
         with:
@@ -18,14 +18,15 @@ jobs:
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: 1.4.2
-      - name: Export tracked source and test runtime
+      - name: Install locked dependencies
+        run: bun install --frozen-lockfile --no-summary
+      - name: Export dependencies for local validation
         run: |
-          mkdir -p "$RUNNER_TEMP/cli-refactor-source"
-          git archive --format=tar HEAD | gzip > "$RUNNER_TEMP/cli-refactor-source/source.tar.gz"
-          cp "$(command -v bun)" "$RUNNER_TEMP/cli-refactor-source/bun"
+          mkdir -p "$RUNNER_TEMP/cli-refactor-runtime"
+          tar -czf "$RUNNER_TEMP/cli-refactor-runtime/dependencies.tar.gz" node_modules $(find packages targets tooling -mindepth 2 -maxdepth 2 -type d -name node_modules)
       - uses: actions/upload-artifact@v7.0.1
         with:
-          name: cli-refactor-source
-          path: ${{ runner.temp }}/cli-refactor-source
+          name: cli-refactor-runtime
+          path: ${{ runner.temp }}/cli-refactor-runtime
           retention-days: 1
           if-no-files-found: error
