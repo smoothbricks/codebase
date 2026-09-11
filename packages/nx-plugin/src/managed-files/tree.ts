@@ -1,4 +1,4 @@
-import type { Tree } from 'nx/src/devkit-exports.js';
+import type { FileChange, Tree } from 'nx/src/devkit-exports.js';
 import {
   extractInlineLocalBlocks,
   ManagedContentConflict,
@@ -44,6 +44,13 @@ export function mergeManagedContent(current: string, desired: string): string {
   return localTail === '' ? rendered : `${rendered}\n${localTail}`;
 }
 
+/** Pending Nx edits override disk facts; updates without a mode retain the disk mode. */
+function stagedExecutable(change: FileChange | undefined, onDisk: boolean | undefined): boolean | undefined {
+  const mode = change?.options?.mode;
+  if (mode === undefined) return change?.type === 'CREATE' ? false : onDisk;
+  return ((typeof mode === 'string' ? Number.parseInt(mode, 8) : mode) & 0o100) !== 0;
+}
+
 /**
  * Stage updates in Nx's virtual filesystem. No disk, process, graph, or network
  * access. The caller decides whether to inspect or flush Tree.listChanges().
@@ -55,6 +62,7 @@ export function stageManagedFiles(
   paths: ReadonlyMap<string, ManagedPathInfo> = new Map(),
 ): FileResult[] {
   const seen = new Set<string>();
+  const pending = new Map(tree.listChanges().map((change) => [change.path, change]));
   const targets = new Set(files.map((file) => file.target));
   return files.map(({ target, content, executable = false }): FileResult => {
     const conflict = (reason: string): FileResult => ({ target, action: 'drifted', reason });
@@ -76,17 +84,19 @@ export function stageManagedFiles(
     if (current === null && tree.exists(target)) return conflict('target cannot be read');
     try {
       const rendered = current === null ? content : mergeManagedContent(current, content);
-      const modeMatches = path?.executable === undefined || path.executable === executable;
+      const currentExecutable = stagedExecutable(pending.get(target), path?.executable);
+      const modeMatches = currentExecutable === undefined || currentExecutable === executable;
       if (path?.symlink) {
         return current === rendered && modeMatches
           ? { target, action: 'ok-symlink' }
           : conflict('symlink content or executable mode differs; update its source explicitly');
       }
       const mode = executable ? 0o755 : 0o644;
-      if (current !== rendered) tree.write(target, rendered, { mode });
-      // Nx write() intentionally drops an equal-content write, including its
-      // options. Permission-only changes therefore use the dedicated Tree API.
-      if (!modeMatches) tree.changePermissions(target, mode);
+      if (current !== rendered) tree.write(target, rendered);
+      // A write reverting a prior generator's edit to the on-disk content can
+      // erase its pending mode too. Stage permissions after every content write,
+      // as well as for permission-only repairs, using Nx's dedicated API.
+      if (current !== rendered || !modeMatches) tree.changePermissions(target, mode);
       return {
         target,
         action: current === null ? 'created' : current !== rendered || !modeMatches ? 'updated' : 'unchanged',
