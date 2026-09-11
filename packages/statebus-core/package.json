@@ -62,6 +62,22 @@
           "timeoutMs": 120000,
           "killAfterMs": 10000
         }
+      },
+      "bench": {
+        "executor": "nx:run-commands",
+        "cache": false,
+        "dependsOn": [
+          "tsc-js"
+        ],
+        "options": {
+          "command": "bun benchmarks/interest.mjs",
+          "cwd": "{projectRoot}"
+        },
+        "configurations": {
+          "v8": {
+            "command": "node --expose-gc benchmarks/interest.mjs"
+          }
+        }
       }
     },
     "tags": [

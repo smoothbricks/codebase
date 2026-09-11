@@ -1,4 +1,5 @@
 import { atom } from '@tldraw/state';
+import { SubscriberCountBatch } from './subscriber-counts.js';
 import type {
   AnyEvent,
   AnyEventReducer,
@@ -114,43 +115,79 @@ export abstract class StateBus implements StateBusReader {
     this.state = Object.freeze(s) as WritableState;
   }
 
-  private eventQueue: AnyEvent[] = [];
-  private dispatchingEventQueue: AnyEvent[] = [];
+  // Keep backing capacity between waves; length = 0 can discard the backing store.
+  // Slots are cleared after dispatch so retaining capacity never retains payloads.
+  private queuedEventCount = 0;
+  private eventQueue = new Array<AnyEvent | undefined>(32).fill(undefined);
+  private dispatchingEventQueue = new Array<AnyEvent | undefined>(32).fill(undefined);
   private listeners: AnyTopicListenerMap = {};
+  private dispatching = false;
+  private readonly interestCounts = new SubscriberCountBatch<StateKeys>();
 
   dispatchEvents() {
-    let substateInterestEvent: undefined | Event<'statebus', 'substateInterest'>;
-    while (this.eventQueue.length > 0) {
+    // A listener may request a flush, but must not interrupt the current wave.
+    if (this.dispatching) return;
+    this.dispatching = true;
+    try {
+      this.dispatchQueuedEvents();
+    } finally {
+      this.dispatching = false;
+      // A failed reducer may have published work before throwing.
+      if (this.queuedEventCount > 0) this.scheduleDispatch();
+    }
+  }
+
+  private dispatchQueuedEvents() {
+    while (this.queuedEventCount > 0) {
       const eventQueue = this.eventQueue;
-      // Set an empty queue in case publish is called while dispatching
-      // Swap eventQueue and dispatchingEventQueue every dispatch to lower GC pressure
+      const eventCount = this.queuedEventCount;
+      this.queuedEventCount = 0;
+      // Reuse queue storage. Publications during this wave enter the other queue.
       this.eventQueue = this.dispatchingEventQueue;
       this.dispatchingEventQueue = eventQueue;
+      try {
+        this.dispatchWave(eventQueue, eventCount);
+      } finally {
+        // Never retain or replay a failed wave when this storage is reused.
+        for (let index = 0; index < eventCount; index += 1) eventQueue[index] = undefined;
+        this.interestCounts.clear();
+      }
+    }
+  }
 
-      // Reduce all events first, to make sure all state is up to date
-      for (const event of eventQueue) {
-        if (!event) continue;
-        this.reduceEvent(this.state, event);
-      }
-
-      // Dispatch events to listeners, that may read updated state
-      for (const event of eventQueue) {
-        if (!event) {
-          continue;
+  private dispatchWave(eventQueue: readonly (AnyEvent | undefined)[], eventCount: number): void {
+    let firstInterestEvent: Event<'statebus', 'substateInterest'> | undefined;
+    let multipleInterests = false;
+    // Reduce the complete wave before any listener observes it.
+    for (let index = 0; index < eventCount; index += 1) {
+      const event = eventQueue[index];
+      if (event) this.reduceEvent(this.state, event);
+    }
+    for (let index = 0; index < eventCount; index += 1) {
+      const event = eventQueue[index];
+      if (!event) continue;
+      if (event.topic === 'statebus' && event.type === 'substateInterest') {
+        if (firstInterestEvent === undefined) {
+          firstInterestEvent = event;
+        } else {
+          if (!multipleInterests) {
+            this.interestCounts.append(firstInterestEvent.payload.subscribers);
+            multipleInterests = true;
+          }
+          this.interestCounts.append(event.payload.subscribers);
         }
-        if (!(event.topic === 'statebus' && event.type === 'substateInterest')) {
-          this.dispatchEvent(event);
-        } else if (event.type === 'substateInterest') {
-          if (substateInterestEvent) Object.assign(substateInterestEvent.payload, event.payload);
-          else substateInterestEvent = event;
-        }
+      } else {
+        this.dispatchEvent(event);
       }
-      // Finally dispatch the merged 'substateInterest' event
-      if (substateInterestEvent) {
-        this.dispatchEvent(substateInterestEvent);
-      }
-      // Clear the dispatching queue
-      eventQueue.length = 0;
+    }
+    if (!firstInterestEvent) return;
+    if (!multipleInterests) {
+      this.dispatchEvent(firstInterestEvent);
+      return;
+    }
+    const subscribers = this.interestCounts.take();
+    if (subscribers) {
+      this.dispatchEvent({ topic: 'statebus', type: 'substateInterest', payload: { subscribers } });
     }
   }
 
@@ -176,8 +213,10 @@ export abstract class StateBus implements StateBusReader {
   protected abstract scheduleDispatch(): void;
 
   publish(event: AnyEvent) {
-    const length = this.eventQueue.push(event);
-    this.scheduleDispatch();
+    const length = ++this.queuedEventCount;
+    this.eventQueue[length - 1] = event;
+    // The active dispatcher already drains every queued successor wave.
+    if (!this.dispatching) this.scheduleDispatch();
     return length;
   }
 
@@ -190,21 +229,21 @@ export abstract class StateBus implements StateBusReader {
     const topicListeners = (this.listeners[topic] ?? {}) as Record<Type, Set<Listener<Topic, Type>> | undefined>;
     this.listeners[topic] = topicListeners as AnyTopicListenerMap[Topic];
 
-    const typeListeners = topicListeners[type];
-    if (!typeListeners) {
-      topicListeners[type] = new Set([listener]);
-    } else {
-      typeListeners.add(listener);
-    }
-    // Return a function to unsubscribe
-    return () => typeListeners?.delete(listener);
+    const typeListeners = topicListeners[type] ?? new Set<Listener<Topic, Type>>();
+    topicListeners[type] = typeListeners;
+    typeListeners.add(listener);
+    // Capture the actual set even when this is the first subscription.
+    return () => {
+      typeListeners.delete(listener);
+    };
   }
 
   substateInterest<SK extends StateKeys>(keys: SK[]): () => void {
     if (keys.length === 0) return () => {};
+    const subscribedKeys = [...keys];
 
     const subscribers: Record<SK, number> = {};
-    for (const key of keys) {
+    for (const key of subscribedKeys) {
       const count = (this.substateInterestCount.get(key) ?? 0) + 1;
       subscribers[key] = count;
       this.substateInterestCount.set(key, count);
@@ -213,10 +252,14 @@ export abstract class StateBus implements StateBusReader {
     // Let data-providers know there is interest in these topics
     this.publish({ topic: 'statebus', type: 'substateInterest', payload: { subscribers } });
 
+    let released = false;
     return () => {
+      if (released) return;
+      released = true;
       const subscribers: Record<SK, number> = {};
-      for (const key of keys) {
+      for (const key of subscribedKeys) {
         const count = (this.substateInterestCount.get(key) ?? 1) - 1;
+        subscribers[key] = count;
         if (count > 0) this.substateInterestCount.set(key, count);
         else this.substateInterestCount.delete(key);
       }

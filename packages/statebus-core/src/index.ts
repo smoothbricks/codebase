@@ -27,6 +27,7 @@ declare module '@smoothbricks/statebus-core' {
 
 export { StateBus } from './api.js';
 export { ManualStateBus } from './manual.js';
+export { MicrotaskStateBus } from './microtask.js';
 export type {
   AnyEvent,
   AnyListener,
