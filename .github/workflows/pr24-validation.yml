@@ -5,38 +5,36 @@ on:
     branches: [assist/pr24-validation]
 
 permissions:
-  contents: write
+  actions: read
+  contents: read
 
 jobs:
-  candidate:
+  diagnostics:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v6.0.2
-        with:
-          persist-credentials: false
-      - name: Prepare validated edits
+      - name: Extract failed tests
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          cp .github/pr24-apply.py "$RUNNER_TEMP/pr24-apply.py"
-          cat .github/pr24-edits-0.bin .github/pr24-edits-1.bin .github/pr24-edits-2.bin | gzip -dc > "$RUNNER_TEMP/pr24-edits.json"
-      - uses: actions/checkout@v6.0.2
+          mkdir -p "$RUNNER_TEMP/diagnostics"
+          gh api /repos/smoothbricks/codebase/actions/jobs/103418927500/logs > "$RUNNER_TEMP/diagnostics/job.log"
+          python3 - <<'PY'
+          import os, pathlib, re
+          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'diagnostics'
+          lines = re.sub(r'\x1b\[[0-9;]*m', '', (root / 'job.log').read_text()).splitlines()
+          selected = set()
+          for i, line in enumerate(lines):
+              if '(fail)' in line or 'NX Run summary:' in line or 'error: expect(' in line or 'failed, ' in line:
+                  selected.update(range(max(0, i-30), min(len(lines), i+8)))
+          output = '\n'.join(f'{i+1}: {lines[i]}' for i in sorted(selected))
+          (root / 'failures.txt').write_text(output + '\n')
+          print(output)
+          PY
+      - uses: actions/upload-artifact@v7.0.1
         with:
-          ref: 07d32f0f58297a161ab6a2e7f9e2ea5804e34399
-          fetch-depth: 0
-      - name: Apply and verify refactor
-        run: |
-          set -euo pipefail
-          python3 "$RUNNER_TEMP/pr24-apply.py" "$RUNNER_TEMP/pr24-edits.json"
-          git diff --check
-          git add -A
-          if git diff --cached --name-only | grep '^.github/pr24-'; then
-            echo 'Transport files must not enter the candidate.' >&2
-            exit 1
-          fi
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git commit -m 'refactor(nx-plugin): generate managed files through Nx Tree' -m 'Move managed assets and rendering into the existing Nx plugin. Use its virtual filesystem for staging and drift checks, retain pure content helpers, and keep filesystem effects in the CLI shell. Add generator idempotence tests and remove the bespoke write planner.'
-          git push origin HEAD:refs/heads/assist/pr24-nx-tree
-          git rev-parse HEAD
-          git show --stat --oneline HEAD
+          name: cli-refactor-diagnostics
+          path: ${{ runner.temp }}/diagnostics
+          retention-days: 1
+          if-no-files-found: error
