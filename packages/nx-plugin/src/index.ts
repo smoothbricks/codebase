@@ -15,6 +15,7 @@ import { AggregateCreateNodesError } from 'nx/src/project-graph/error-types.js';
 import { parse as parseToml } from 'smol-toml';
 
 import { BOUNDED_TEST_KILL_AFTER_MS, BOUNDED_TEST_TIMEOUT_MS } from './bounded-test-policy.js';
+import { CARGO_TOOLCHAIN_NAMED_INPUT, CARGO_TOOLCHAIN_PIN_INPUTS } from './cargo-toolchain-policy.js';
 import {
   type AttributedCargoWorkspacePackage,
   attributeCargoWorkspacePackages,
@@ -269,40 +270,10 @@ const REPO_ROOT_CARGO_OUTPUT_INPUTS = [
   '{workspaceRoot}/scripts/*.sh',
   '!{workspaceRoot}/**/target/**',
 ];
-// The toolchain half of a cargo task's identity: the DECLARED pin, hashed as
-// an ordinary file. devenv resolves this lock into the rustc, cargo, linker,
-// C toolchain and SDK that every cargo command inherits, so a bump here is
-// exactly the event that must invalidate a cached artifact — and it is the
-// only such event the workspace can state portably.
-//
-// This replaces a runtime input that dumped the ambient cargo environment
-// (every CARGO_*/RUST*/CC*/AR*/SDKROOT/LIBCLANG_PATH/CMAKE_*/ZIG* variable,
-// plus the contents of $CARGO_HOME/config{,.toml}). That bought the same
-// invalidation at the price of two defects. Its values are absolute
-// `/nix/store/<hash>-…` paths and per-checkout devenv state directories, so
-// no two machines ever agree and no cargo target can share a cache entry
-// with a peer or with CI — a remote cache for Rust was dead on arrival. And
-// the dump differs between a bare shell and a devenv profile for the SAME
-// sources: `bun run check:linux` runs inside the `linux-cross` profile
-// (AR=x86_64-unknown-linux-gnu-ar, CARGO_TARGET_X86_64_…_LINKER set) and
-// writes an entry the bare pre-push `cargo-lint-cross` probe can never hit.
-// Measured: a green `check:linux` followed by `Cache: 0/1 hit`.
-//
-// A file input has neither defect. The lock's bytes are identical bare and
-// in-profile, and identical on every machine holding this checkout, while
-// the toolchain VERSIONS the dump was really guarding are already covered
-// twice over — by the pin itself and by the `rustc -vV && cargo -V` runtime
-// input alongside it, whose output is byte-identical in both shells
-// (measured). Nothing machine-local survives.
-//
-// Both fleet locations are declared: the pin lives at `tooling/direnv/` in
-// every repository and additionally at the root in one. A fileset that
-// matches nothing contributes nothing — the same property the inert
-// `rust-toolchain*` entries already rely on.
-const CARGO_TOOLCHAIN_PIN_INPUTS: readonly string[] = [
-  '{workspaceRoot}/devenv.lock',
-  '{workspaceRoot}/tooling/direnv/devenv.lock',
-];
+// The toolchain half of a cargo task's identity lives in its own module
+// because `smoo monorepo validate` reads the same two constants to refuse a
+// declaration that drops it. See cargo-toolchain-policy.ts for why it is the
+// declared pin and not the ambient environment.
 
 function cargoRuntimeInput(projectRoot: string, command: string): { runtime: string } {
   const quotedRoot = `'${projectRoot.replaceAll("'", "'\"'\"'")}'`;
@@ -1611,6 +1582,26 @@ async function createProjectTargets(
     };
   }
 
+  // A declared target REPLACES the inferred input list, pin included, so a
+  // repository that hand-writes `inputs` for a cargo target silently loses its
+  // toolchain identity. Name the pin once here so such a declaration can
+  // reference it as `cargoToolchain` instead of restating two paths that could
+  // drift from the plugin; `smoo monorepo validate` refuses a cached cargo
+  // target whose resolved inputs reach neither. Defined only for projects that
+  // HAVE cargo targets: a project's namedInputs definitions are hashed into
+  // its configuration hash, so defining it everywhere would invalidate every
+  // task in the repository to serve projects that can never reference it.
+  const namedInputs: Record<string, NonNullable<TargetConfiguration['inputs']>> = {
+    ...(versionless === null
+      ? {}
+      : {
+          [VERSIONLESS_PRODUCTION_INPUT]: ['production', ...versionlessProjectInputs],
+          [VERSIONLESS_DEFAULT_INPUT]: ['default', ...versionlessProjectInputs],
+        }),
+    ...(Object.keys(targets).some((name) => name.startsWith('cargo-') || name.startsWith('napi-'))
+      ? { [CARGO_TOOLCHAIN_NAMED_INPUT]: [...CARGO_TOOLCHAIN_PIN_INPUTS] }
+      : {}),
+  };
   return {
     projects: {
       [projectRoot]: {
@@ -1624,14 +1615,7 @@ async function createProjectTargets(
         // Nx resolves a named input from the project first and nx.json second,
         // so a workspace-wide definition still covers projects this plugin
         // never inferred.
-        ...(versionless === null
-          ? {}
-          : {
-              namedInputs: {
-                [VERSIONLESS_PRODUCTION_INPUT]: ['production', ...versionlessProjectInputs],
-                [VERSIONLESS_DEFAULT_INPUT]: ['default', ...versionlessProjectInputs],
-              },
-            }),
+        ...(Object.keys(namedInputs).length === 0 ? {} : { namedInputs }),
       },
     },
   };

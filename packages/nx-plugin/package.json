@@ -60,6 +60,12 @@
       "development": "./src/cross-check-policy.ts",
       "import": "./dist/cross-check-policy.js",
       "default": "./dist/cross-check-policy.js"
+    },
+    "./cargo-toolchain-policy": {
+      "types": "./dist/cargo-toolchain-policy.d.ts",
+      "development": "./src/cargo-toolchain-policy.ts",
+      "import": "./dist/cargo-toolchain-policy.js",
+      "default": "./dist/cargo-toolchain-policy.js"
     }
   },
   "bin": {

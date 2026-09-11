@@ -13,8 +13,12 @@ export interface ProjectTargets {
   root?: string;
   targets: string[];
   buildDependsOn?: string[];
+  /** Per-target `cache`, for policies that only govern what Nx can restore. */
+  targetCache?: Map<string, boolean>;
   targetDependencies?: Map<string, string[]>;
   targetExecutors?: Map<string, string>;
+  /** Per-target string inputs; object inputs (`runtime`, `json`, …) are dropped. */
+  targetInputs?: Map<string, string[]>;
   targetOptions?: Map<string, NxTargetOptions>;
   targetOutputs?: Map<string, string[]>;
   targetScripts?: Map<string, string>;
@@ -118,6 +122,20 @@ export function targetOptionsFromNxProjectJson(value: NxProjectJson | null | und
 
 export function targetOutputsFromNxProjectJson(value: NxProjectJson | null | undefined): Map<string, string[]> {
   return targetStringArraysFromNxProjectJson(value, 'outputs');
+}
+
+export function targetInputsFromNxProjectJson(value: NxProjectJson | null | undefined): Map<string, string[]> {
+  return targetStringArraysFromNxProjectJson(value, 'inputs');
+}
+
+export function targetCacheFromNxProjectJson(value: NxProjectJson | null | undefined): Map<string, boolean> {
+  const cache = new Map<string, boolean>();
+  for (const [targetName, target] of Object.entries(value?.targets ?? {})) {
+    if (typeof target.cache === 'boolean') {
+      cache.set(targetName, target.cache);
+    }
+  }
+  return cache;
 }
 
 export function targetScriptsFromNxProjectJson(value: NxProjectJson | null | undefined): Map<string, string> {
@@ -307,7 +325,9 @@ export function projectTargetsFromNxProjects(projects: NxProjects): ProjectTarge
         root: projectRootFromNxProjectJson(metadata),
         targets: targetNamesFromNxProjectJson(metadata),
         buildDependsOn: targetDependencies.get('build'),
+        targetCache: targetCacheFromNxProjectJson(metadata),
         targetDependencies,
+        targetInputs: targetInputsFromNxProjectJson(metadata),
         targetExecutors: targetExecutorsFromNxProjectJson(metadata),
         targetOptions: targetOptionsFromNxProjectJson(metadata),
         targetOutputs: targetOutputsFromNxProjectJson(metadata),

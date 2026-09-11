@@ -3,7 +3,13 @@ import { readFileSync } from 'node:fs';
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { applyCargoFeatureUnification, type CargoHakariShell, validateCargoCachePolicy } from './cargo-policy.js';
+import type { ProjectTargets } from '../nx/index.js';
+import {
+  applyCargoFeatureUnification,
+  type CargoHakariShell,
+  validateCargoCachePolicy,
+  validateCargoToolchainInputs,
+} from './cargo-policy.js';
 
 async function withFixture<T>(files: Record<string, string>, callback: (root: string) => T): Promise<T> {
   const root = await mkdtemp(join(tmpdir(), 'smoo-cargo-policy-'));
@@ -27,6 +33,20 @@ async function check(
     const captured = captureErrors();
     try {
       return { failures: validateCargoCachePolicy(root, { shell }), messages: captured.messages };
+    } finally {
+      captured.restore();
+    }
+  });
+}
+
+async function checkToolchain(
+  files: Record<string, string>,
+  projects: ProjectTargets[],
+): Promise<{ failures: number; messages: string[] }> {
+  return withFixture(files, (root) => {
+    const captured = captureErrors();
+    try {
+      return { failures: validateCargoToolchainInputs(root, projects), messages: captured.messages };
     } finally {
       captured.restore();
     }
@@ -387,5 +407,75 @@ describe('Cargo feature unification update', () => {
         expect(hakari.calls).toEqual([['generate'], ['manage-deps', '--yes']]);
       },
     );
+  });
+});
+
+describe('cargo toolchain identity policy', () => {
+  const cargoLint = (inputs: string[]): ProjectTargets => ({
+    project: 'codebase',
+    root: '.',
+    targets: ['cargo-lint'],
+    targetCache: new Map([['cargo-lint', true]]),
+    targetInputs: new Map([['cargo-lint', inputs]]),
+    targetOptions: new Map([['cargo-lint', { command: 'cargo --frozen clippy --workspace -- -D warnings' }]]),
+  });
+
+  // The failure this policy exists for: a hand-written input list replaces the
+  // inferred one, so the target stops hashing the pin and a toolchain bump
+  // leaves its cached verdict standing.
+  it('refuses a cached cargo target whose declared inputs drop the pin', async () => {
+    const { failures, messages } = await checkToolchain({ 'nx.json': '{}\n' }, [cargoLint(['rustWorkspace'])]);
+    expect(failures).toBe(1);
+    expect(messages).toEqual([
+      'codebase:cargo-lint: cached cargo target hashes no toolchain pin, so a toolchain bump cannot invalidate it. ' +
+        'Add "cargoToolchain" to its inputs, or to the named input it uses.',
+    ]);
+  });
+
+  it('accepts the pin reached directly, through a named input, or by the name inference defines', async () => {
+    const viaNamedInput = JSON.stringify({
+      namedInputs: { rustWorkspace: ['{workspaceRoot}/Cargo.toml', '{workspaceRoot}/tooling/direnv/devenv.lock'] },
+    });
+    expect(await checkToolchain({ 'nx.json': viaNamedInput }, [cargoLint(['rustWorkspace'])])).toMatchObject({
+      failures: 0,
+    });
+    expect(
+      await checkToolchain({ 'nx.json': '{}\n' }, [cargoLint(['{workspaceRoot}/tooling/direnv/devenv.lock'])]),
+    ).toMatchObject({ failures: 0 });
+    expect(await checkToolchain({ 'nx.json': '{}\n' }, [cargoLint(['cargoToolchain'])])).toMatchObject({
+      failures: 0,
+    });
+  });
+
+  // A negated fileset REMOVES a path from the hash. Reading one as the pin
+  // would accept the exact declaration that guarantees the bug.
+  it('does not accept an excluded lock as the pin', async () => {
+    expect(
+      await checkToolchain({ 'nx.json': '{}\n' }, [cargoLint(['!{workspaceRoot}/tooling/direnv/devenv.lock'])]),
+    ).toMatchObject({ failures: 1 });
+  });
+
+  // Only what Nx can restore, and only what runs cargo: an uncached warm-up or
+  // a TypeScript build has no stale artifact for a toolchain bump to strand.
+  it('governs cached cargo targets only', async () => {
+    const uncached: ProjectTargets = {
+      ...cargoLint([]),
+      targetCache: new Map([['cargo-lint', false]]),
+    };
+    const notCargo: ProjectTargets = {
+      ...cargoLint([]),
+      targets: ['tsc-js'],
+      targetCache: new Map([['tsc-js', true]]),
+      targetInputs: new Map([['tsc-js', ['default']]]),
+      targetOptions: new Map([['tsc-js', { command: 'ttsc --build' }]]),
+    };
+    expect(await checkToolchain({ 'nx.json': '{}\n' }, [uncached, notCargo])).toMatchObject({ failures: 0 });
+  });
+
+  // A cyclic named input is a repository mistake, not a reason to hang the
+  // whole validation run before it can report anything at all.
+  it('terminates on a named input that references itself', async () => {
+    const cyclic = JSON.stringify({ namedInputs: { rustWorkspace: ['rustWorkspace'] } });
+    expect(await checkToolchain({ 'nx.json': cyclic }, [cargoLint(['rustWorkspace'])])).toMatchObject({ failures: 1 });
   });
 });

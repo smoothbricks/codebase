@@ -109,7 +109,9 @@ describe('Nx helper output formatting', () => {
         targets: {
           test: {
             executor: '@smoothbricks/nx-plugin:bounded-exec',
+            cache: true,
             dependsOn: ['build'],
+            inputs: ['default', { runtime: 'echo version' }],
             options: { command: 'bun test', timeoutMs: 120_000 },
           },
           build: { outputs: ['{projectRoot}/dist'] },
@@ -125,8 +127,10 @@ describe('Nx helper output formatting', () => {
         root: 'packages/cli',
         targets: ['lint'],
         buildDependsOn: undefined,
+        targetCache: new Map(),
         targetDependencies: new Map(),
         targetExecutors: new Map(),
+        targetInputs: new Map(),
         targetOptions: new Map(),
         targetOutputs: new Map(),
         targetScripts: new Map(),
@@ -136,8 +140,12 @@ describe('Nx helper output formatting', () => {
         root: 'packages/web',
         targets: ['build', 'test'],
         buildDependsOn: undefined,
+        targetCache: new Map([['test', true]]),
         targetDependencies: new Map([['test', ['build']]]),
         targetExecutors: new Map([['test', '@smoothbricks/nx-plugin:bounded-exec']]),
+        // Object inputs carry no fileset a policy can read, so only the
+        // strings survive the projection.
+        targetInputs: new Map([['test', ['default']]]),
         targetOptions: new Map([['test', { command: 'bun test', timeoutMs: 120_000 }]]),
         targetOutputs: new Map([['build', ['{projectRoot}/dist']]]),
         targetScripts: new Map(),

@@ -2,7 +2,11 @@ import { chmodSync, existsSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { printCommandOutput, runResult, runStatus } from '../../lib/run.js';
 import { type ProjectTargets, readProjectTargets } from '../../nx/index.js';
-import { applyCargoFeatureUnification, validateCargoCachePolicy } from '../cargo-policy.js';
+import {
+  applyCargoFeatureUnification,
+  validateCargoCachePolicy,
+  validateCargoToolchainInputs,
+} from '../cargo-policy.js';
 import { validateGoToolchainAgreement } from '../go-toolchain.js';
 import { syncBunLockfileVersions, validateBunLockfileVersions } from '../lockfile.js';
 import { validateDevenvModuleImport, warnOnManagedFileDrift } from '../managed-files.js';
@@ -139,6 +143,11 @@ const packs: MonorepoPack[] = [
     },
     validatePreBuild(ctx) {
       return validateCargoCachePolicy(ctx.root);
+    },
+    // Post-build: the toolchain identity is read off the RESOLVED graph, which
+    // means running the inference plugin, which means its dist has to exist.
+    async validatePostBuild(ctx) {
+      return validateCargoToolchainInputs(ctx.root, await readProjectTargets(ctx.root));
     },
   },
   {

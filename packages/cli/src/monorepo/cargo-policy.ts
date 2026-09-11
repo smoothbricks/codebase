@@ -1,8 +1,10 @@
 import { spawnSync } from 'node:child_process';
 import { type Dirent, existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
+import { CARGO_TOOLCHAIN_NAMED_INPUT, isCargoToolchainInput } from '@smoothbricks/nx-plugin/cargo-toolchain-policy';
 import typia from 'typia';
-import { parsePackageJsonText } from '../lib/json.js';
+import { type NxJson, type NxTargetOptions, parseNxJsonText, parsePackageJsonText } from '../lib/json.js';
+import type { ProjectTargets } from '../nx/index.js';
 
 interface CargoProfile {
   inherits?: string;
@@ -866,6 +868,90 @@ export function validateCargoCachePolicy(root: string, options: CargoPolicyOptio
     failures += configPolicy(config, repositoryRoot);
   }
   reportManifestDirectoryAdvisories(repositoryRoot, ignoredDirectories);
+  return failures;
+}
+
+/** A command that compiles or checks Rust, whichever driver spells it. */
+const RUNS_CARGO = /(?:^|[\s;&|])cargo[\s-]|\bnapi build\b/;
+
+const CARGO_TOOLCHAIN_FIX = `Add "${CARGO_TOOLCHAIN_NAMED_INPUT}" to its inputs, or to the named input it uses`;
+
+function commandsOf(options: NxTargetOptions | undefined): string {
+  const command: unknown = options?.command;
+  const commands: unknown = options?.commands;
+  return [
+    typeof command === 'string' ? command : '',
+    ...(Array.isArray(commands) ? commands.filter((entry) => typeof entry === 'string') : []),
+  ].join('\n');
+}
+
+/**
+ * Every fileset one declared input list reaches, with nx.json's named inputs
+ * expanded. The plugin's own `cargoToolchain` is defined per PROJECT and wins
+ * over nx.json, so naming it counts without an entry here; a repository that
+ * redefines it workspace-wide is expanded and judged on what it resolves to.
+ */
+function resolveInputFilesets(
+  declared: readonly string[],
+  namedInputs: NonNullable<NxJson['namedInputs']>,
+  seen: Set<string> = new Set(),
+): string[] {
+  const filesets: string[] = [];
+  for (const entry of declared) {
+    const name = entry.startsWith('^') ? entry.slice(1) : entry;
+    const definition = namedInputs[name];
+    if (definition === undefined) {
+      filesets.push(entry);
+      continue;
+    }
+    if (seen.has(name)) continue;
+    seen.add(name);
+    const expanded = typeof definition === 'string' ? [definition] : definition;
+    filesets.push(
+      ...resolveInputFilesets(
+        expanded.filter((value): value is string => typeof value === 'string'),
+        namedInputs,
+        seen,
+      ),
+    );
+  }
+  return filesets;
+}
+
+/**
+ * A cached cargo target must hash the toolchain that compiled it.
+ *
+ * Inference attaches the pin to every cargo target it infers, but a repository
+ * that DECLARES `inputs` for one replaces that list wholesale and silently
+ * drops it — the target then survives a toolchain bump with a stale verdict,
+ * and a pre-push cross-compile probe consults a cache entry that cannot
+ * express the change it is probing for. Measured before this policy existed:
+ * a one-byte bump to the declared pin left one repository's `cargo-lint-cross`
+ * hash unchanged.
+ *
+ * This is a generated safety property removed by a local override, which no
+ * amount of care at the override site will catch on its own, so it is checked
+ * against the RESOLVED graph rather than against any one file.
+ */
+export function validateCargoToolchainInputs(root: string, projects: readonly ProjectTargets[]): number {
+  const nxJsonPath = join(resolve(root), 'nx.json');
+  const namedInputs = existsSync(nxJsonPath)
+    ? (parseNxJsonText(readFileSync(nxJsonPath, 'utf8'))?.namedInputs ?? {})
+    : {};
+  let failures = 0;
+  for (const project of projects) {
+    for (const target of [...project.targets].sort()) {
+      if (project.targetCache?.get(target) !== true) continue;
+      if (!RUNS_CARGO.test(commandsOf(project.targetOptions?.get(target)))) continue;
+      const declared = project.targetInputs?.get(target) ?? [];
+      if (declared.includes(CARGO_TOOLCHAIN_NAMED_INPUT)) continue;
+      if (resolveInputFilesets(declared, namedInputs).some(isCargoToolchainInput)) continue;
+      failures += report(
+        `${project.project}:${target}`,
+        `cached cargo target hashes no toolchain pin, so a toolchain bump cannot invalidate it. ${CARGO_TOOLCHAIN_FIX}.`,
+      );
+    }
+  }
   return failures;
 }
 

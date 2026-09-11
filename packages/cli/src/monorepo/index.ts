@@ -2,7 +2,11 @@ import { appendFileSync, readFileSync, writeFileSync } from 'node:fs';
 import { printCommandOutput, run, runResult } from '../lib/run.js';
 import { escapeRegex, getWorkspacePackages, getWorkspacePatterns, listReleasePackages } from '../lib/workspace.js';
 import { readProjectTargets } from '../nx/index.js';
-import { applyCargoFeatureUnification, validateCargoCachePolicy } from './cargo-policy.js';
+import {
+  applyCargoFeatureUnification,
+  validateCargoCachePolicy,
+  validateCargoToolchainInputs,
+} from './cargo-policy.js';
 import {
   formatCommitMessage,
   stagedDeletedPublicPackages,
@@ -133,7 +137,8 @@ export async function checkManagedFiles(root: string, options: { warn?: boolean 
   }
   const results = await applyManagedFiles(root, 'check');
   printResults(results);
-  const resolvedTargets = resolvedTargetsByProject(await readProjectTargets(root));
+  const projectTargets = await readProjectTargets(root);
+  const resolvedTargets = resolvedTargetsByProject(projectTargets);
   const packageFailures =
     validateRootPackagePolicy(root) +
     validateNxProjectNames(root) +
@@ -145,6 +150,7 @@ export async function checkManagedFiles(root: string, options: { warn?: boolean 
     validateWorkspaceDependencies(root, { resolvedTargetsByProject: resolvedTargets }) +
     validateDevenvModuleImport(root) +
     validateCargoCachePolicy(root) +
+    validateCargoToolchainInputs(root, projectTargets) +
     validateSccachePatches(root);
   if (results.some((result) => result.action === 'drifted') || packageFailures > 0) {
     throw new Error('Managed monorepo files or package conventions are out of date. Run: smoo monorepo update');
