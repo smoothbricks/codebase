@@ -1,20 +1,17 @@
 /* biome-ignore-all lint/suspicious/noTemplateCurlyInString: GitHub Actions expressions are emitted literally. */
 
-import {
-  LINUX_PLATFORM_TARGET_GLOBS,
-  MACOS_PLATFORM_TARGET_GLOBS,
-} from '@smoothbricks/nx-plugin/workspace-config-policy';
 import { makeModuleSynchronized } from 'make-synchronized';
 import type * as PrettierModule from 'prettier';
 import type { Options as PrettierOptions } from 'prettier';
-import { isSmoothBricksCodebasePackageName } from '../lib/cli-package.js';
+import { LINUX_PLATFORM_TARGET_GLOBS, MACOS_PLATFORM_TARGET_GLOBS } from '../platform-targets.js';
 import type {
   PackageCargoCredentialsConfig,
   PackagePrivateNpmConfig,
   PackageRemoteCacheConfig,
   PackageSmooGithub,
   PackageSourceCheckoutConfig,
-} from '../lib/json.js';
+} from '../workspace-manifest.js';
+import { isSmoothBricksCodebasePackageName } from '../workspace-package-policy.js';
 import {
   artifactStepLines,
   CiWorkflowStepKind,

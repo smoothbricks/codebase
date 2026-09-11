@@ -14,9 +14,9 @@ import {
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { INLINE_LOCAL_BEGIN, INLINE_LOCAL_END } from './managed-content.js';
+import { INLINE_LOCAL_BEGIN, INLINE_LOCAL_END } from '@smoothbricks/nx-plugin/managed-files/managed-content';
+import type { ManagedFile } from '@smoothbricks/nx-plugin/managed-files/tree';
 import { syncManagedFiles } from './managed-fs.js';
-import type { ManagedFileSpec } from './managed-plan.js';
 
 const directories: string[] = [];
 function temporaryWorkspace(): string {
@@ -24,7 +24,7 @@ function temporaryWorkspace(): string {
   directories.push(directory);
   return directory;
 }
-const spec: ManagedFileSpec = { target: 'config', desired: { content: 'new\n', executable: false } };
+const spec: ManagedFile = { target: 'config', content: 'new\n', executable: false };
 afterEach(() => {
   for (const directory of directories.splice(0)) rmSync(directory, { recursive: true, force: true });
 });
@@ -48,8 +48,8 @@ describe('managed filesystem shell', () => {
 
   it.each([0o644, 0o645])('reports and repairs owner-execute drift (mode %i)', (mode) => {
     const root = temporaryWorkspace();
-    const script = { ...spec, desired: { content: '#!/bin/sh\n', executable: true } };
-    writeFileSync(join(root, spec.target), script.desired.content);
+    const script = { ...spec, content: '#!/bin/sh\n', executable: true };
+    writeFileSync(join(root, spec.target), script.content);
     chmodSync(join(root, spec.target), mode);
     expect(syncManagedFiles(root, [script], 'check')[0]?.action).toBe('drifted');
     syncManagedFiles(root, [script], 'update');
@@ -115,7 +115,7 @@ describe('managed filesystem shell', () => {
   it('leaves a capability-disabled file and its customizations untouched', () => {
     const root = temporaryWorkspace();
     writeFileSync(join(root, 'config'), 'repo customization');
-    expect(syncManagedFiles(root, [{ ...spec, desired: null }], 'update')[0]?.action).toBe('skipped');
+    expect(syncManagedFiles(root, [{ ...spec, content: null }], 'update')[0]?.action).toBe('skipped');
     expect(readFileSync(join(root, 'config'), 'utf8')).toBe('repo customization');
   });
 });

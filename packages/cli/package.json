@@ -76,7 +76,6 @@
     "README.md",
     "bin",
     "dist",
-    "managed",
     "src",
     "!**/*.tsbuildinfo"
   ],
@@ -107,7 +106,7 @@
           "command": "bun test --timeout=30000",
           "cwd": "{projectRoot}",
           "timeoutMs": 120000,
-          "killAfterMs": 1e4
+          "killAfterMs": 10000.0
         }
       }
     },

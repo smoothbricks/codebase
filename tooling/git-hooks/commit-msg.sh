@@ -1,1 +1,1 @@
-../../packages/cli/managed/raw/tooling/git-hooks/commit-msg.sh
+../../packages/nx-plugin/managed/raw/tooling/git-hooks/commit-msg.sh

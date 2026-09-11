@@ -1,7 +1,7 @@
 /* biome-ignore-all lint/suspicious/noTemplateCurlyInString: Assertions verify emitted GitHub Actions expressions literally. */
 import { describe, expect, it } from 'bun:test';
+import { renderPrPreviewCleanupWorkflowYaml } from '@smoothbricks/nx-plugin/managed-files/pr-preview-cleanup-workflow';
 import { managedFileTargetsForTest } from '../managed-files.js';
-import { renderPrPreviewCleanupWorkflowYaml } from '../pr-preview-cleanup-workflow.js';
 
 describe('PR preview cleanup workflow', () => {
   it('renders one close-only same-repository cleanup job from the PR number', () => {

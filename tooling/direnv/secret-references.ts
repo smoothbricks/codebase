@@ -1,1 +1,1 @@
-../../packages/cli/managed/raw/tooling/direnv/secret-references.ts
+../../packages/nx-plugin/managed/raw/tooling/direnv/secret-references.ts

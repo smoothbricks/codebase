@@ -1,1 +1,1 @@
-../../packages/cli/managed/raw/tooling/direnv/github-actions-bootstrap.sh
+../../packages/nx-plugin/managed/raw/tooling/direnv/github-actions-bootstrap.sh

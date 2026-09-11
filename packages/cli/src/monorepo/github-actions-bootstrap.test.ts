@@ -2,16 +2,11 @@ import { describe, expect, it } from 'bun:test';
 import { spawnSync } from 'node:child_process';
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, join, resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { dirname, join } from 'node:path';
+import { managedAssetsRoot } from '@smoothbricks/nx-plugin/managed-assets';
 import { printCommandOutput } from '../lib/run.js';
 
-const script = resolve(
-  dirname(fileURLToPath(import.meta.url)),
-  '..',
-  '..',
-  'managed/raw/tooling/direnv/github-actions-bootstrap.sh',
-);
+const script = join(managedAssetsRoot, 'raw/tooling/direnv/github-actions-bootstrap.sh');
 
 // A stand-in `devenv` that emulates `devenv shell [flags] -- cmd...`: it
 // exports what a real shell's enterShell hooks would (contract vars, a

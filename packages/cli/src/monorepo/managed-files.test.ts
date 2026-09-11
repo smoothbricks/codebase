@@ -3,6 +3,7 @@ import { describe, expect, it } from 'bun:test';
 import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { renderPublishWorkflowYaml } from '@smoothbricks/nx-plugin/managed-files/publish-workflow';
 import { LINUX_PLATFORM_TARGET_GLOBS, PLATFORM_TARGET_GLOBS } from '@smoothbricks/nx-plugin/workspace-config-policy';
 import { type NxProjects, targetNamesFromProjects } from '../nx/index.js';
 import {
@@ -20,7 +21,6 @@ import {
   renderManagedWorkflowForTest,
   validateDevenvModuleImport,
 } from './managed-files.js';
-import { renderPublishWorkflowYaml } from './publish-workflow.js';
 
 const REPO_ROOT = join(import.meta.dir, '..', '..', '..', '..');
 const ARCHITECTURE_SCOPED_PREFIX = '${{ runner.os }}-${{ runner.arch }}-';
@@ -198,7 +198,7 @@ describe('managed raw files', () => {
     expect(managedFileTargetsForTest).toContainEqual({ target: 'tooling/devenv', executable: true });
 
     const [source, generated] = await Promise.all([
-      readFile(join(REPO_ROOT, 'packages', 'cli', 'managed', 'raw', 'tooling', 'devenv'), 'utf8'),
+      readFile(join(REPO_ROOT, 'packages', 'nx-plugin', 'managed', 'raw', 'tooling', 'devenv'), 'utf8'),
       readFile(join(REPO_ROOT, 'tooling', 'devenv'), 'utf8'),
     ]);
 
@@ -212,7 +212,10 @@ describe('managed raw files', () => {
     });
 
     const [source, generated] = await Promise.all([
-      readFile(join(REPO_ROOT, 'packages', 'cli', 'managed', 'raw', 'tooling', 'git-hooks', 'pre-push.sh'), 'utf8'),
+      readFile(
+        join(REPO_ROOT, 'packages', 'nx-plugin', 'managed', 'raw', 'tooling', 'git-hooks', 'pre-push.sh'),
+        'utf8',
+      ),
       readFile(join(REPO_ROOT, 'tooling', 'git-hooks', 'pre-push.sh'), 'utf8'),
     ]);
 
@@ -294,7 +297,17 @@ describe('managed cache actions', () => {
     for (const action of CACHE_ACTIONS) {
       const [template, generated] = await Promise.all([
         readFile(
-          join(REPO_ROOT, 'packages', 'cli', 'managed', 'templates', 'github', 'actions', action.name, 'action.yml'),
+          join(
+            REPO_ROOT,
+            'packages',
+            'nx-plugin',
+            'managed',
+            'templates',
+            'github',
+            'actions',
+            action.name,
+            'action.yml',
+          ),
           'utf8',
         ),
         readFile(join(REPO_ROOT, '.github', 'actions', action.name, 'action.yml'), 'utf8'),
@@ -307,7 +320,7 @@ describe('managed cache actions', () => {
   it('scopes every primary, restore, and save key to the runner OS and architecture', async () => {
     for (const action of CACHE_ACTIONS) {
       for (const actionRoot of [
-        join(REPO_ROOT, 'packages', 'cli', 'managed', 'templates', 'github', 'actions'),
+        join(REPO_ROOT, 'packages', 'nx-plugin', 'managed', 'templates', 'github', 'actions'),
         join(REPO_ROOT, '.github', 'actions'),
       ]) {
         const content = await readFile(join(actionRoot, action.name, 'action.yml'), 'utf8');

@@ -1,7 +1,7 @@
 // The Nx tags that drive stage deploys. CI selection (github-ci), workflow generation (monorepo)
 // and the graph readers must agree on these, so they live here rather than with any one of them.
 
-import type { DeploymentStage } from '../wrangler/stage.js';
+export type DeploymentStage = 'staging' | 'production' | `pr${number}`;
 
 /** Deployed on every stage: one command that deploys whichever stage it is given. */
 const STAGE_DEPLOY_TAG = 'stage-deploy-target';

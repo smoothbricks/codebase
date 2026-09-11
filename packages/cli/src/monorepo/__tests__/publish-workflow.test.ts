@@ -4,13 +4,6 @@ import { describe, expect, it } from 'bun:test';
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import {
-  LINUX_PLATFORM_TARGET_GLOBS,
-  MACOS_PLATFORM_TARGET_GLOBS,
-  PLATFORM_TARGET_GLOBS,
-} from '@smoothbricks/nx-plugin/workspace-config-policy';
-import { format } from 'prettier';
-import typia from 'typia';
-import {
   definePublishWorkflow,
   type PublishWorkflowBump,
   type PublishWorkflowCallbacks,
@@ -19,7 +12,14 @@ import {
   type PublishWorkflowVersionOutputs,
   renderPublishWorkflowYaml,
   runPublishWorkflow,
-} from '../publish-workflow.js';
+} from '@smoothbricks/nx-plugin/managed-files/publish-workflow';
+import {
+  LINUX_PLATFORM_TARGET_GLOBS,
+  MACOS_PLATFORM_TARGET_GLOBS,
+  PLATFORM_TARGET_GLOBS,
+} from '@smoothbricks/nx-plugin/workspace-config-policy';
+import { format } from 'prettier';
+import typia from 'typia';
 
 const nixosRunsOn = ['nixos-latest-x64', 'self-hosted'] as const;
 
