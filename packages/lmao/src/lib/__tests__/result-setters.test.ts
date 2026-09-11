@@ -13,8 +13,8 @@ import {
   createTestOpMetadata,
   createTestSchema,
   createTestSpanContext,
-  createTestTracerOptions,
   createTestTraceRoot,
+  createTestTracerOptions,
 } from './test-helpers.js';
 
 const schema = defineLogSchema({ status: S.number(), phase: S.enum(['start', 'done']) });
@@ -126,7 +126,13 @@ describe('schema-bound result setters', () => {
   });
 
   it('protects payloads, discriminants and promise assimilation with raw low-level schemas', async () => {
-    const raw = createTestSchema({ success: S.boolean(), value: S.text(), map: S.text(), then: S.text() });
+    const raw = createTestSchema({
+      success: S.boolean(),
+      value: S.text(),
+      map: S.text(),
+      // biome-ignore lint/suspicious/noThenProperty: Regression fixture deliberately exercises a raw then field.
+      then: S.text(),
+    });
     const buffer = createSpanBuffer(raw, createTestTraceRoot(), createTestOpMetadata(), 8);
     const state = createTestSpanContext(raw, buffer);
     const { OkClass, ErrClass } = getResultClasses<typeof raw>(getResultWriterClass(raw));
@@ -146,7 +152,9 @@ describe('schema-bound result setters', () => {
   it('preserves sync, async and child-span payload inference through the public API', async () => {
     const context = defineOpContext({ logSchema: schema });
     const sync = context.defineOp('result-setters-sync', (ctx) => ctx.ok(7).status(200).map(String));
-    const asyncOp = context.defineOp('result-setters-async', async (ctx) => ctx.err('failed').status(400).mapErr(String));
+    const asyncOp = context.defineOp('result-setters-async', async (ctx) =>
+      ctx.err('failed').status(400).mapErr(String),
+    );
     const tracer = new TestTracer(context, createTestTracerOptions());
     const syncResult = tracer.trace('sync', sync);
     expect(syncResult.value.toUpperCase()).toBe('7');

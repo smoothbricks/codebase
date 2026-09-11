@@ -31,7 +31,7 @@
  * ```
  */
 
-import type { ResultWriterConstructor, WriterState } from './codegen/fixedPositionWriterGenerator.js';
+import type { ResultWriter, ResultWriterConstructor, WriterState } from './codegen/fixedPositionWriterGenerator.js';
 import type { InferSchema, LogSchema } from './schema/types.js';
 
 // =============================================================================
@@ -63,23 +63,14 @@ type ErrPredicate<E> = (error: E) => boolean;
 type ErrClassMatcher = abstract new (...args: never[]) => unknown;
 type ErrMatcher<E> = TaggedErrorConstructor<TaggedError> | ErrClassMatcher | ErrPredicate<E>;
 
-/**
- * Ok/Err's lazy fallback only consumes these commands, never the writer's fluent
- * return type. Retaining the mapped ResultWriter here would leak its string index
- * signature through a private field and make concrete results invariant in T.
- */
-interface BoundResultWriter<T extends LogSchema> {
-  with(attributes: Partial<InferSchema<T>>): void;
-  message(text: string): void;
-  line(lineNumber: number): void;
-}
+type BoundResultWriter<T extends LogSchema, R, E> = ResultWriter<T, R, E>;
 
-function ensureResultWriter<T extends LogSchema>(
-  writer: BoundResultWriter<T> | undefined,
+function ensureResultWriter<T extends LogSchema, R, E>(
+  writer: BoundResultWriter<T, R, E> | undefined,
   state: WriterState | undefined,
-): BoundResultWriter<T> | undefined {
+): BoundResultWriter<T, R, E> | undefined {
   if (writer || !state) return writer;
-  return new state._physicalLayoutPlan.ResultWriterClass<T>(state);
+  return new state._physicalLayoutPlan.ResultWriterClass<T, R, E>(state);
 }
 
 function isErrPredicate<E>(value: ErrMatcher<E>): value is ErrPredicate<E> {
@@ -122,7 +113,7 @@ export class Ok<V, T extends LogSchema = LogSchema> {
 
   /** protected, not private: getResultClasses() subclasses Ok per schema to install row-1 fluent setters. */
   protected readonly _state: WriterState | undefined;
-  private declare _writer: BoundResultWriter<T> | undefined;
+  private declare _writer: BoundResultWriter<T, V, never> | undefined;
 
   constructor(value: V, state?: WriterState) {
     this.value = value;
@@ -137,8 +128,8 @@ export class Ok<V, T extends LogSchema = LogSchema> {
     }
   }
 
-  private _resultWriter(): BoundResultWriter<T> | undefined {
-    const writer = ensureResultWriter<T>(this._writer, this._state);
+  private _resultWriter(): BoundResultWriter<T, V, never> | undefined {
+    const writer = ensureResultWriter<T, V, never>(this._writer, this._state);
     if (writer) this._writer = writer;
     return writer;
   }
@@ -266,7 +257,7 @@ export class Err<E, T extends LogSchema = LogSchema> {
 
   /** protected, not private: getResultClasses() subclasses Err per schema to install row-1 fluent setters. */
   protected readonly _state: WriterState | undefined;
-  private declare _writer: BoundResultWriter<T> | undefined;
+  private declare _writer: BoundResultWriter<T, never, E> | undefined;
 
   constructor(error: E, state?: WriterState) {
     this.error = error;
@@ -281,8 +272,8 @@ export class Err<E, T extends LogSchema = LogSchema> {
     }
   }
 
-  private _resultWriter(): BoundResultWriter<T> | undefined {
-    const writer = ensureResultWriter<T>(this._writer, this._state);
+  private _resultWriter(): BoundResultWriter<T, never, E> | undefined {
+    const writer = ensureResultWriter<T, never, E>(this._writer, this._state);
     if (writer) this._writer = writer;
     return writer;
   }
@@ -446,6 +437,7 @@ export type AnyResult = Result<any, any, any>;
 
 //#region smoo/lmao!n/lmao-entry-result-row-setters
 /** Result members and JavaScript protocols must never become schema setters. */
+// biome-ignore lint/complexity/noBannedTypes: Enumerate Object protocol keys, not wrapper values.
 type ResultMember = keyof Ok<unknown> | keyof Err<unknown> | keyof Object | 'then' | `_${string}`;
 
 /**
@@ -504,10 +496,7 @@ function isResultClasses<T extends LogSchema>(value: unknown): value is ResultCl
   const ok = Reflect.get(value, 'OkClass');
   const err = Reflect.get(value, 'ErrClass');
   return (
-    typeof ok === 'function' &&
-    ok.prototype instanceof Ok &&
-    typeof err === 'function' &&
-    err.prototype instanceof Err
+    typeof ok === 'function' && ok.prototype instanceof Ok && typeof err === 'function' && err.prototype instanceof Err
   );
 }
 
@@ -532,6 +521,7 @@ export function getResultClasses<T extends LogSchema>(WriterClass: ResultWriterC
     class SchemaOk<V> extends Ok<V, T> {
       protected declare readonly _state: WriterState;
 
+      // biome-ignore lint/complexity/noUselessConstructor: Require state here; the standalone base constructor allows none.
       constructor(value: V, state: WriterState) {
         super(value, state);
       }
@@ -544,6 +534,7 @@ export function getResultClasses<T extends LogSchema>(WriterClass: ResultWriterC
     class SchemaErr<E> extends Err<E, T> {
       protected declare readonly _state: WriterState;
 
+      // biome-ignore lint/complexity/noUselessConstructor: Require state here; the standalone base constructor allows none.
       constructor(error: E, state: WriterState) {
         super(error, state);
       }
@@ -564,10 +555,7 @@ export function getResultClasses<T extends LogSchema>(WriterClass: ResultWriterC
         name === 'value' ||
         name === 'error' ||
         name.startsWith('_') ||
-        ((name in Ok.prototype || name in Err.prototype) &&
-          name !== 'with' &&
-          name !== 'message' &&
-          name !== 'line')
+        ((name in Ok.prototype || name in Err.prototype) && name !== 'with' && name !== 'message' && name !== 'line')
       ) {
         delete descriptors[name];
       }

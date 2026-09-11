@@ -365,44 +365,47 @@ describe('Span Scope Attributes', () => {
     // ctx.ok(v).status(...) / ctx.err(v).status(...) — reproducing the spec's exact
     // example table (01i lines 306-334), which no test exercised before this setter
     // existed (every prior test here uses bare ctx.ok('done')).
-    test.each(['ok', 'err'])('ctx.%s(v).status(...) overrides only row 1, leaving scope defaults intact', async (kind) => {
-      const schema = defineLogSchema({
-        status: S.category(),
-        orderId: S.category(),
-      });
+    test.each(['ok', 'err'])(
+      'ctx.%s(v).status(...) overrides only row 1, leaving scope defaults intact',
+      async (kind) => {
+        const schema = defineLogSchema({
+          status: S.category(),
+          orderId: S.category(),
+        });
 
-      const ctx = defineOpContext({ logSchema: schema });
-      const { defineOp } = ctx;
+        const ctx = defineOpContext({ logSchema: schema });
+        const { defineOp } = ctx;
 
-      const testOp = defineOp('test-op', (ctx) => {
-        ctx.setScope({ status: 'processing', orderId: 'ord-1' });
-        ctx.tag.status('started'); // row 0: tag wins over scope
+        const testOp = defineOp('test-op', (ctx) => {
+          ctx.setScope({ status: 'processing', orderId: 'ord-1' });
+          ctx.tag.status('started'); // row 0: tag wins over scope
 
-        ctx.log.info('Step 1'); // row 2: no direct write, keeps scope value
-        ctx.log.info('Step 2').status('validating'); // row 3: direct write wins
-        ctx.log.info('Step 3'); // row 4: no direct write, keeps scope value
+          ctx.log.info('Step 1'); // row 2: no direct write, keeps scope value
+          ctx.log.info('Step 2').status('validating'); // row 3: direct write wins
+          ctx.log.info('Step 3'); // row 4: no direct write, keeps scope value
 
-        const result = kind === 'ok' ? ctx.ok({ done: true }) : ctx.err({ code: 'FAILED' });
-        expect(result.status('completed')).toBe(result); // row 1: direct write wins
-        return result;
-      });
+          const result = kind === 'ok' ? ctx.ok({ done: true }) : ctx.err({ code: 'FAILED' });
+          expect(result.status('completed')).toBe(result); // row 1: direct write wins
+          return result;
+        });
 
-      const { trace, rootBuffers } = new TestTracer(ctx, { ...createTestTracerOptions() });
-      const result = await trace('test-span', testOp);
-      expect(result.success).toBe(kind === 'ok');
+        const { trace, rootBuffers } = new TestTracer(ctx, { ...createTestTracerOptions() });
+        const result = await trace('test-span', testOp);
+        expect(result.success).toBe(kind === 'ok');
 
-      const table = convertSpanTreeToArrowTable(rootBuffers[0]);
-      expect(getColumnValue(table, 'status', 0)).toBe('started'); // tag wins row 0
-      expect(getColumnValue(table, 'status', 1)).toBe('completed'); // ok() wins row 1
-      expect(getColumnValue(table, 'status', 2)).toBe('processing'); // scope default
-      expect(getColumnValue(table, 'status', 3)).toBe('validating'); // direct write wins
-      expect(getColumnValue(table, 'status', 4)).toBe('processing'); // scope default
+        const table = convertSpanTreeToArrowTable(rootBuffers[0]);
+        expect(getColumnValue(table, 'status', 0)).toBe('started'); // tag wins row 0
+        expect(getColumnValue(table, 'status', 1)).toBe('completed'); // ok() wins row 1
+        expect(getColumnValue(table, 'status', 2)).toBe('processing'); // scope default
+        expect(getColumnValue(table, 'status', 3)).toBe('validating'); // direct write wins
+        expect(getColumnValue(table, 'status', 4)).toBe('processing'); // scope default
 
-      // orderId was only ever set via scope — it should default onto every row,
-      // including the row-1 span-ok that status() wrote to directly.
-      for (let row = 0; row <= 4; row++) {
-        expect(getColumnValue(table, 'orderId', row)).toBe('ord-1');
-      }
-    });
+        // orderId was only ever set via scope — it should default onto every row,
+        // including the row-1 span-ok that status() wrote to directly.
+        for (let row = 0; row <= 4; row++) {
+          expect(getColumnValue(table, 'orderId', row)).toBe('ord-1');
+        }
+      },
+    );
   });
 });

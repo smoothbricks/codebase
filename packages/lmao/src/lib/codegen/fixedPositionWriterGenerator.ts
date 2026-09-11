@@ -75,7 +75,15 @@ export type ResultWriter<T extends LogSchema, R = unknown, E = unknown> = {
   line(lineNumber: number): ResultWriter<T, R, E>;
   uint64_value(value: bigint): ResultWriter<T, R, E>;
 } & {
-  [K in keyof InferSchema<T>]: (value: InferSchema<T>[K]) => ResultWriter<T, R, E>;
+  // WHY exclude the open string index: a wildcard schema cannot promise every
+  // named setter. That signature collides with the writer's own methods and
+  // makes concrete Ok/Err values invariant through their private cached writer.
+  // System methods win over schema fields at runtime; reflect that here too.
+  [K in keyof InferSchema<T> as string extends K
+    ? never
+    : K extends 'with' | 'message' | 'line' | 'uint64_value' | '_resultType' | '_errorType'
+      ? never
+      : K]: (value: InferSchema<T>[K]) => ResultWriter<T, R, E>;
 };
 
 export type TagWriterConstructor<T extends LogSchema> = new (state: WriterState) => TagWriter<T>;

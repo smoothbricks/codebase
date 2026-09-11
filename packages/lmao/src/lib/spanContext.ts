@@ -36,7 +36,15 @@ import { TransientError } from './errors/Transient.js';
 import type { Op } from './op.js';
 import type { OpContext, OpMetadata, SpanContext, SpanFn, SpanLogger, SpanSyncFn } from './opContext/types.js';
 import type { CallsitePlan, PhysicalLayoutPlan } from './physicalLayoutPlan.js';
-import { Err, type ErrResult, hasErrorCode, Ok, type OkResult, type Result, SPAN_COMPLETION_OWNER_ERROR } from './result.js';
+import {
+  Err,
+  type ErrResult,
+  hasErrorCode,
+  Ok,
+  type OkResult,
+  type Result,
+  SPAN_COMPLETION_OWNER_ERROR,
+} from './result.js';
 import {
   RUNTIME_HINT_DEPS,
   RUNTIME_HINT_FF,
