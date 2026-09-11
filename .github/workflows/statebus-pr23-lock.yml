@@ -1,13 +1,14 @@
-# Temporary lockfile generation/validation; removed once generated lock is committed.
+# Temporary lock generation/validation. Only bun.lock is written; removed before review.
 name: StateBus PR23 lock inputs
 on:
   push:
     branches: [feat/statebus-loader-navigation]
     paths: [.github/workflows/statebus-pr23-lock.yml]
 permissions:
-  contents: read
+  contents: write
 jobs:
   lock:
+    if: github.repository == 'smoothbricks/codebase' && github.ref_name == 'feat/statebus-loader-navigation'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -30,6 +31,30 @@ jobs:
           git diff -- bun.lock > "$RUNNER_TEMP/pr23-lock/lock.diff"
           git rev-parse HEAD > "$RUNNER_TEMP/pr23-lock/revision.txt"
           cd "$RUNNER_TEMP/pr23-lock" && sha256sum bun.lock source.tar.gz > SHA256SUMS
+      - name: Commit only the generated lock if branch has not advanced
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 - <<'PY'
+          import base64, json, os, pathlib, subprocess
+          repo = os.environ['GITHUB_REPOSITORY']
+          branch = os.environ['GITHUB_REF_NAME']
+          def get(path):
+              return json.loads(subprocess.check_output(['gh', 'api', path]))
+          head = get(f'repos/{repo}/git/ref/heads/{branch}')['object']['sha']
+          if head != os.environ['GITHUB_SHA']:
+              raise SystemExit('Branch advanced; do not overwrite a newer dependency graph.')
+          if not subprocess.check_output(['git', 'diff', '--', 'bun.lock']):
+              print('Lock is unchanged.')
+          else:
+              source = get(f'repos/{repo}/contents/bun.lock?ref={head}')
+              body = {'message': 'build(statebus): record verified Bun resolution for browser navigation',
+                      'branch': branch, 'sha': source['sha'],
+                      'content': base64.b64encode(pathlib.Path('bun.lock').read_bytes()).decode()}
+              response = subprocess.check_output(['gh', 'api', '--method', 'PUT',
+                  f'repos/{repo}/contents/bun.lock', '--input', '-'], input=json.dumps(body).encode())
+              print('Committed generated lock:', json.loads(response)['commit']['sha'])
+          PY
       - uses: actions/upload-artifact@v7.0.1
         with:
           name: statebus-pr23-lock-inputs
