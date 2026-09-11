@@ -5,36 +5,38 @@ on:
     branches: [assist/pr24-validation]
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
-  source:
+  candidate:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v6.0.2
         with:
           persist-credentials: false
-      - uses: oven-sh/setup-bun@v2
-        with:
-          bun-version: 1.4.2
-      - name: Install locked dependencies
-        run: bun install --frozen-lockfile --no-summary
-      - name: Export shared packages for local validation
+      - name: Prepare validated edits
         run: |
-          mkdir -p "$RUNNER_TEMP/cli-refactor-cache"
-          tar -czf - -C "$HOME" .bun/install/cache/links | split -b 300m - "$RUNNER_TEMP/cli-refactor-cache/cache-"
-      - uses: actions/upload-artifact@v7.0.1
+          set -euo pipefail
+          cp .github/pr24-apply.py "$RUNNER_TEMP/pr24-apply.py"
+          cat .github/pr24-edits-0.bin .github/pr24-edits-1.bin .github/pr24-edits-2.bin | gzip -dc > "$RUNNER_TEMP/pr24-edits.json"
+      - uses: actions/checkout@v6.0.2
         with:
-          name: cli-refactor-cache-first
-          path: ${{ runner.temp }}/cli-refactor-cache/cache-aa
-          retention-days: 1
-          compression-level: 0
-          if-no-files-found: error
-      - uses: actions/upload-artifact@v7.0.1
-        with:
-          name: cli-refactor-cache-second
-          path: ${{ runner.temp }}/cli-refactor-cache/cache-ab
-          retention-days: 1
-          compression-level: 0
-          if-no-files-found: error
+          ref: 07d32f0f58297a161ab6a2e7f9e2ea5804e34399
+          fetch-depth: 0
+      - name: Apply and verify refactor
+        run: |
+          set -euo pipefail
+          python3 "$RUNNER_TEMP/pr24-apply.py" "$RUNNER_TEMP/pr24-edits.json"
+          git diff --check
+          git add -A
+          if git diff --cached --name-only | grep '^.github/pr24-'; then
+            echo 'Transport files must not enter the candidate.' >&2
+            exit 1
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'refactor(nx-plugin): generate managed files through Nx Tree' -m 'Move managed assets and rendering into the existing Nx plugin. Use its virtual filesystem for staging and drift checks, retain pure content helpers, and keep filesystem effects in the CLI shell. Add generator idempotence tests and remove the bespoke write planner.'
+          git push origin HEAD:refs/heads/assist/pr24-nx-tree
+          git rev-parse HEAD
+          git show --stat --oneline HEAD
