@@ -189,6 +189,36 @@ describe('defineLogSchema with Sury', () => {
     }).toThrow(/reserved/i);
   });
 
+  test.each([
+    'success',
+    'value',
+    'error',
+    'map',
+    'mapErr',
+    'flatMap',
+    'match',
+    'isOk',
+    'isErr',
+    'maybeValue',
+    'maybeError',
+    'unwrapOr',
+    'unwrapOrElse',
+    'toJSON',
+    'line',
+    'then',
+    'constructor',
+    'toString',
+    'toLocaleString',
+    'valueOf',
+    'hasOwnProperty',
+    'isPrototypeOf',
+    'propertyIsEnumerable',
+  ])('rejects result member or protocol name %s in definitions and extensions', (name) => {
+    expect(() => defineLogSchema({ [name]: S.text() })).toThrow(/reserved/i);
+    const base = new LogSchema({ requestId: S.category() });
+    expect(() => base.extend({ [name]: S.text() })).toThrow(/reserved/i);
+  });
+
   test('allows non-reserved names', () => {
     expect(() => {
       LogSchema.assertUserFieldNames(['requestId', 'userId']);
@@ -237,14 +267,14 @@ describe('defineLogSchema with Sury', () => {
 
   test('union schemas work', () => {
     const schema = defineLogSchema({
-      value: S.union([S.category(), S.number()]),
+      payload: S.union([S.category(), S.number()]),
     });
 
-    const result1 = schema.validate({ value: 'test' });
-    expect(result1.value).toBe('test');
+    const result1 = schema.validate({ payload: 'test' });
+    expect(result1.payload).toBe('test');
 
-    const result2 = schema.validate({ value: 42 });
-    expect(result2.value).toBe(42);
+    const result2 = schema.validate({ payload: 42 });
+    expect(result2.payload).toBe(42);
   });
 
   test('complex nested schema validation', () => {
@@ -327,16 +357,16 @@ describe('defineLogSchema with Sury', () => {
 
   test('union rejects when no member matches', () => {
     const schema = defineLogSchema({
-      value: S.union([S.category(), S.number()]),
+      payload: S.union([S.category(), S.number()]),
     });
 
     // Valid members
-    expect(schema.validate({ value: 'hello' }).value).toBe('hello');
-    expect(schema.validate({ value: 42 }).value).toBe(42);
+    expect(schema.validate({ payload: 'hello' }).payload).toBe('hello');
+    expect(schema.validate({ payload: 42 }).payload).toBe(42);
 
     // Invalid: boolean is not in the union
     expect(() => {
-      schema.validate({ value: true });
+      schema.validate({ payload: true });
     }).toThrow(/does not match any union member/);
   });
 });

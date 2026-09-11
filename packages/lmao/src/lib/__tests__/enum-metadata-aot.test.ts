@@ -90,9 +90,9 @@ describe('AOT-safe enum metadata', () => {
   it('maps non-string values to zero without coercion or Function compilation', () => {
     const functionConstructorCalls = countFunctionConstructorCalls(() => {
       const schema = defineLogSchema({
-        value: S.enum(['ZERO', '1', '[object Object]', 'Symbol(value)']),
+        outcome: S.enum(['ZERO', '1', '[object Object]', 'Symbol(value)']),
       });
-      const encode = resolveEnumLookupDescriptor(schema).byField.value.encode;
+      const encode = resolveEnumLookupDescriptor(schema).byField.outcome.encode;
       const invalidValues = [1, {}, Symbol('value')];
 
       expect(invalidValues.map((value) => Reflect.apply(encode, undefined, [value]))).toEqual([0, 0, 0]);

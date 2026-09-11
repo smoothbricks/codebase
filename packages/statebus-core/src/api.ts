@@ -1,12 +1,6 @@
 import { atom } from '@tldraw/state';
-import {
-  mergeStateInterests,
-  type StateInterest,
-  type StateInterestChange,
-  StateInterestRegistry,
-  stateInterestKey,
-} from './interest.js';
-import { mergeSubscriberCounts } from './subscriber-counts.js';
+import { type StateInterest, StateInterestBatch, type StateInterestChange, StateInterestRegistry } from './interest.js';
+import { SubscriberCountBatch } from './subscriber-counts.js';
 import type {
   AnyEvent,
   AnyEventReducer,
@@ -96,12 +90,12 @@ export abstract class StateBus implements StateBusReader {
   readonly isolates: Record<string, ReadonlyState> = {};
   readonly reduceEvent: TopLevelReducer;
   readonly state: WritableState;
-  readonly substateInterestCount = new Map<string, number>();
   private readonly exactInterest = new StateInterestRegistry<StateKeys>((changes) => {
     const subscribers: Record<string, number> = {};
     for (const { interest } of changes) subscribers[interest.key] = this.substateInterestCount.get(interest.key) ?? 0;
     this.publish({ topic: 'statebus', type: 'substateInterest', payload: { subscribers, changes } });
   });
+  readonly substateInterestCount: ReadonlyMap<StateKeys, number> = this.exactInterest.propertyCounts;
   private readonly keyedStates = new Map<string, Substates<unknown>>();
   private initialState: InitialState;
 
@@ -132,7 +126,7 @@ export abstract class StateBus implements StateBusReader {
     // Build the state object of Atoms and Substates
     const s = Object.fromEntries(
       Object.entries(this.initialState).map(([key, value]) => {
-        const entry = createStateEntry(key, value, (id) => this.exactInterest.count({ key, id }) > 0);
+        const entry = createStateEntry(key, value, (id) => this.exactInterest.countAt(key, id) > 0);
         if (entry instanceof Substates) this.keyedStates.set(key, entry);
         return [key, entry];
       }),
@@ -140,10 +134,16 @@ export abstract class StateBus implements StateBusReader {
     this.state = Object.freeze(s) as WritableState;
   }
 
-  private eventQueue: AnyEvent[] = [];
-  private dispatchingEventQueue: AnyEvent[] = [];
+  // Keep backing capacity between waves; length = 0 can discard the backing store.
+  // Slots are cleared after dispatch so retaining capacity never retains payloads.
+  private queuedEventCount = 0;
+  private eventQueue = new Array<AnyEvent | undefined>(32).fill(undefined);
+  private dispatchingEventQueue = new Array<AnyEvent | undefined>(32).fill(undefined);
   private listeners: AnyTopicListenerMap = {};
   private dispatching = false;
+  private readonly interestCounts = new SubscriberCountBatch<StateKeys>();
+
+  private readonly interestChanges = new StateInterestBatch<StateKeys>();
 
   dispatchEvents() {
     // A listener may request a flush, but must not interrupt the current wave.
@@ -153,62 +153,73 @@ export abstract class StateBus implements StateBusReader {
       this.dispatchQueuedEvents();
     } finally {
       this.dispatching = false;
+      // A failed reducer may have published work before throwing.
+      if (this.queuedEventCount > 0) this.scheduleDispatch();
     }
   }
 
   private dispatchQueuedEvents() {
-    while (this.eventQueue.length > 0) {
-      let substateInterestEvent: undefined | Event<'statebus', 'substateInterest'>;
+    while (this.queuedEventCount > 0) {
       const eventQueue = this.eventQueue;
-      // Set an empty queue in case publish is called while dispatching
-      // Swap eventQueue and dispatchingEventQueue every dispatch to lower GC pressure
+      const eventCount = this.queuedEventCount;
+      this.queuedEventCount = 0;
+      // Reuse queue storage. Publications during this wave enter the other queue.
       this.eventQueue = this.dispatchingEventQueue;
       this.dispatchingEventQueue = eventQueue;
-
-      // Reduce all events first, to make sure all state is up to date
-      for (const event of eventQueue) {
-        if (!event) continue;
-        this.reduceEvent(this.state, event);
+      try {
+        this.dispatchWave(eventQueue, eventCount);
+      } finally {
+        // Never retain or replay a failed wave when this storage is reused.
+        for (let index = 0; index < eventCount; index += 1) eventQueue[index] = undefined;
+        this.interestCounts.clear();
+        this.interestChanges.clear();
       }
+    }
+  }
 
-      // Dispatch events to listeners, that may read updated state
-      for (const event of eventQueue) {
-        if (!event) {
-          continue;
-        }
-        if (!(event.topic === 'statebus' && event.type === 'substateInterest')) {
-          this.dispatchEvent(event);
-        } else if (event.type === 'substateInterest') {
-          substateInterestEvent = substateInterestEvent
-            ? {
-                topic: 'statebus',
-                type: 'substateInterest',
-                payload: {
-                  subscribers: mergeSubscriberCounts(
-                    substateInterestEvent.payload.subscribers,
-                    event.payload.subscribers,
-                  ),
-                  changes: mergeStateInterests(
-                    substateInterestEvent.payload.changes ?? [],
-                    event.payload.changes ?? [],
-                  ),
-                },
-              }
-            : event;
-        }
-      }
-      // Finally dispatch the merged 'substateInterest' event for this wave only.
-      if (substateInterestEvent) {
-        this.dispatchEvent(substateInterestEvent);
-        // Coalesced StrictMode churn must not evict the signal still used by the remount.
-        for (const { interest, subscribers } of substateInterestEvent.payload.changes ?? []) {
-          if (subscribers === 0 && interest.id !== undefined) {
-            this.keyedStates.get(interest.key)?.releaseRemoved(interest.id);
+  private dispatchWave(eventQueue: readonly (AnyEvent | undefined)[], eventCount: number): void {
+    let firstInterestEvent: Event<'statebus', 'substateInterest'> | undefined;
+    let multipleInterests = false;
+    // Reduce the complete wave before any listener observes it.
+    for (let index = 0; index < eventCount; index += 1) {
+      const event = eventQueue[index];
+      if (event) this.reduceEvent(this.state, event);
+    }
+    for (let index = 0; index < eventCount; index += 1) {
+      const event = eventQueue[index];
+      if (!event) continue;
+      if (event.topic === 'statebus' && event.type === 'substateInterest') {
+        if (firstInterestEvent === undefined) firstInterestEvent = event;
+        else {
+          if (!multipleInterests) {
+            this.interestCounts.append(firstInterestEvent.payload.subscribers);
+            multipleInterests = true;
           }
+          this.interestCounts.append(event.payload.subscribers);
+        }
+        if (event.payload.changes) this.interestChanges.append(event.payload.changes);
+      } else {
+        this.dispatchEvent(event);
+      }
+    }
+    if (!firstInterestEvent) return;
+    const subscribers = multipleInterests ? this.interestCounts.take() : firstInterestEvent.payload.subscribers;
+    const changes = this.interestChanges.take();
+    if (subscribers) {
+      this.dispatchEvent(
+        !multipleInterests &&
+          (changes === firstInterestEvent.payload.changes ||
+            (changes.length === 0 && firstInterestEvent.payload.changes === undefined))
+          ? firstInterestEvent
+          : { topic: 'statebus', type: 'substateInterest', payload: { subscribers, changes } },
+      );
+      // Read live counts: a listener may already have reacquired an address in the next wave.
+      for (let index = 0; index < changes.length; index += 1) {
+        const change = changes[index];
+        if (change.subscribers === 0 && change.interest.id !== undefined) {
+          this.keyedStates.get(change.interest.key)?.releaseRemoved(change.interest.id);
         }
       }
-      // Clear the dispatching queue
-      eventQueue.length = 0;
     }
   }
 
@@ -234,8 +245,10 @@ export abstract class StateBus implements StateBusReader {
   protected abstract scheduleDispatch(): void;
 
   publish(event: AnyEvent) {
-    const length = this.eventQueue.push(event);
-    this.scheduleDispatch();
+    const length = ++this.queuedEventCount;
+    this.eventQueue[length - 1] = event;
+    // The active dispatcher already drains every queued successor wave.
+    if (!this.dispatching) this.scheduleDispatch();
     return length;
   }
 
@@ -262,32 +275,6 @@ export abstract class StateBus implements StateBusReader {
   }
 
   substateInterest<SK extends StateKeys>(keys: readonly (SK | StateInterest<SK>)[]): () => void {
-    if (keys.length === 0) return () => {};
-    const interests = keys.map((key) => {
-      const interest = typeof key === 'string' ? { key } : key;
-      stateInterestKey(interest);
-      return interest;
-    });
-    const subscribedKeys = interests.map((interest) => interest.key);
-
-    for (const key of subscribedKeys) {
-      const count = (this.substateInterestCount.get(key) ?? 0) + 1;
-      this.substateInterestCount.set(key, count);
-    }
-
-    // Property counts summarize demand; exact addresses are authoritative for providers.
-    const releaseExact = this.exactInterest.acquire(interests);
-
-    let released = false;
-    return () => {
-      if (released) return;
-      released = true;
-      for (const key of subscribedKeys) {
-        const count = (this.substateInterestCount.get(key) ?? 1) - 1;
-        if (count > 0) this.substateInterestCount.set(key, count);
-        else this.substateInterestCount.delete(key);
-      }
-      releaseExact();
-    };
+    return this.exactInterest.acquire(keys);
   }
 }

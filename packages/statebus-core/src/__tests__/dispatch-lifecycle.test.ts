@@ -60,13 +60,13 @@ describe('state interest lifecycle', () => {
   it('coalesces independent keys and StrictMode churn into their final counts', () => {
     const bus = createBus();
     const observed: Event<'statebus', 'substateInterest'>['payload'][] = [];
-    bus.subscribe('statebus', 'substateInterest', (event) => observed.push(event.payload));
+    bus.subscribe('statebus', 'substateInterest', (event) => observed.push({ subscribers: event.payload.subscribers }));
     const release = bus.substateInterest(['counter']);
     release();
     bus.substateInterest(['counter']);
     bus.substateInterest(['counter1']);
     bus.dispatchEvents();
-    expect(observed.map((payload) => payload.subscribers)).toEqual([{ counter: 1, counter1: 1 }]);
+    expect(observed).toEqual([{ subscribers: { counter: 1, counter1: 1 } }]);
   });
 
   it('does not mutate the published events while coalescing', () => {
@@ -82,13 +82,13 @@ describe('state interest lifecycle', () => {
       payload: Object.freeze({ subscribers: Object.freeze({ counter1: 2 }) }),
     } as const);
     const observed: Event<'statebus', 'substateInterest'>['payload'][] = [];
-    bus.subscribe('statebus', 'substateInterest', (event) => observed.push(event.payload));
+    bus.subscribe('statebus', 'substateInterest', (event) => observed.push({ subscribers: event.payload.subscribers }));
     bus.publish(first);
     bus.publish(second);
     bus.dispatchEvents();
     expect(first.payload.subscribers).toEqual({ counter: 1 });
     expect(second.payload.subscribers).toEqual({ counter1: 2 });
-    expect(observed.map((payload) => payload.subscribers)).toEqual([{ counter: 1, counter1: 2 }]);
+    expect(observed).toEqual([{ subscribers: { counter: 1, counter1: 2 } }]);
   });
 
   it('does not redispatch an interest event in a subsequent event wave', () => {
@@ -126,4 +126,73 @@ describe('dispatch waves', () => {
     bus.dispatchEvents();
     expect(observed).toEqual([3, 3, 7]);
   });
+});
+
+it('keeps every delivered interest payload intact after later waves', () => {
+  const bus = createBus();
+  const retained: Event<'statebus', 'substateInterest'>['payload'][] = [];
+  bus.subscribe('statebus', 'substateInterest', (event) => {
+    Object.freeze(event.payload.subscribers);
+    retained.push({ subscribers: event.payload.subscribers });
+  });
+  const releaseFirst = bus.substateInterest(['counter']);
+  const releaseSecond = bus.substateInterest(['counter1']);
+  const releaseThird = bus.substateInterest(['counter2']);
+  bus.dispatchEvents();
+  releaseFirst();
+  releaseSecond();
+  releaseThird();
+  bus.dispatchEvents();
+  expect(retained).toEqual([
+    { subscribers: { counter: 1, counter1: 1, counter2: 1 } },
+    { subscribers: { counter: 0, counter1: 0, counter2: 0 } },
+  ]);
+});
+
+it('does not replay a failed reducer wave when the queue storage is reused', () => {
+  const seen: number[] = [];
+  const bus = createBus({
+    count: {
+      increment: (_state, value) => {
+        seen.push(value);
+        if (value === 1) throw new Error('programmer error');
+      },
+    },
+  });
+  bus.publish(increment(1));
+  expect(() => bus.dispatchEvents()).toThrow('programmer error');
+  bus.publish(increment(2));
+  bus.dispatchEvents();
+  bus.publish(increment(3));
+  expect(() => bus.dispatchEvents()).not.toThrow();
+  expect(seen).toEqual([1, 2, 3]);
+});
+
+it('leaves successor work scheduled after a reducer fails', () => {
+  class ObservedBus extends ManualStateBus {
+    scheduled = 0;
+    protected override scheduleDispatch() {
+      this.scheduled += 1;
+    }
+  }
+  const seen: number[] = [];
+  const bus = new ObservedBus({
+    initialState,
+    reducers: {
+      count: {
+        increment: (_state, value) => {
+          seen.push(value);
+          if (value === 1) {
+            bus.publish(increment(2));
+            throw new Error('programmer error');
+          }
+        },
+      },
+    },
+  });
+  bus.publish(increment(1));
+  expect(() => bus.dispatchEvents()).toThrow('programmer error');
+  expect(bus.scheduled).toBe(2);
+  bus.dispatchEvents();
+  expect(seen).toEqual([1, 2]);
 });

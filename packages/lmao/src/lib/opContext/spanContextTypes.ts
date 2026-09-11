@@ -19,7 +19,7 @@
  */
 
 import type { FluentLogEntry as FluentLogEntryFromGenerator } from '../codegen/spanLoggerGenerator.js';
-import type { AnyResult, Err, ExtractError, ExtractSuccess, Ok, Result } from '../result.js';
+import type { AnyResult, ErrResult, ExtractError, ExtractSuccess, OkResult, Result } from '../result.js';
 import type { FeatureFlagEvaluator, InferFeatureFlagsWithContext } from '../schema/evaluator.js';
 import type { LogSchema } from '../schema/LogSchema.js';
 import type { InferSchema } from '../schema/types.js';
@@ -349,7 +349,10 @@ export type SpanContext<Ctx extends OpContext> = {
    * Create a success result with optional attributes.
    *
    * Writes span-ok entry to row 1 (span-end).
-   * Supports fluent chaining with .with() and .message().
+   * Supports schema-field setters and chaining with .with() and .message().
+   *
+   * The schema's field setters are typed on the returned result. Unspecified
+   * schemas do not acquire a string index signature; see OkResult's variance note.
    *
    * @param value - The success value
    * @returns Fluent result builder
@@ -357,13 +360,13 @@ export type SpanContext<Ctx extends OpContext> = {
    * @example
    * return ctx.ok(user).with({ userId: user.id });
    */
-  ok<S>(value: S): Ok<S, Ctx['logSchema']>;
+  ok<S>(value: S): OkResult<S, Ctx['logSchema']>;
 
   /**
    * Create an error result with optional attributes.
    *
    * Writes span-err entry to row 1 (span-end).
-   * Supports fluent chaining with .with() and .message().
+   * Supports schema-field setters and chaining with .with() and .message().
    *
    * @param code - Error code string
    * @param details - Error details
@@ -373,7 +376,7 @@ export type SpanContext<Ctx extends OpContext> = {
    * const NOT_FOUND = defineCodeError('NOT_FOUND')<{ userId: string }>();
    * return ctx.err(NOT_FOUND({ userId })).message('User not found');
    */
-  err<E>(error: E): Err<E, Ctx['logSchema']>;
+  err<E>(error: E): ErrResult<E, Ctx['logSchema']>;
 
   /**
    * Create a child span with its own buffer.

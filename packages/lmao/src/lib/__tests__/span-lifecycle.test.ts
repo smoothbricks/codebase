@@ -618,6 +618,40 @@ describe('Fixed Row Layout', () => {
     expect(capturedBuffer.line_values[1]).toBe(42);
   });
 
+  it('should write ok/err single-field setters directly to row 1, same as tag on row 0', async () => {
+    // Per specs/lmao/01i_span_scope_attributes.md: ctx.ok(v).userId('123') writes row 1
+    // only, mirroring ctx.tag.userId('123') on row 0 — a per-field setter, not .with().
+    let capturedOkBuffer: SpanBuffer<(typeof ctx)['logBinding']['logSchema']> | undefined;
+    let capturedErrBuffer: SpanBuffer<(typeof ctx)['logBinding']['logSchema']> | undefined;
+
+    const { trace } = new TestTracer(ctx, { ...createTestTracerOptions() });
+    await trace('test-ok', async (ctx) => {
+      capturedOkBuffer = ctx.buffer;
+      const okResult = ctx.ok('done');
+      expect(okResult.userId('user-single').operation('CREATE')).toBe(okResult);
+      return okResult;
+    });
+    await trace('test-err', async (ctx) => {
+      capturedErrBuffer = ctx.buffer;
+      const errResult = ctx.err(ERROR_CODE({ detail: 'oops' }));
+      expect(errResult.userId('user-single-err')).toBe(errResult);
+      return errResult;
+    });
+
+    expect(capturedOkBuffer).toBeDefined();
+    expect(capturedErrBuffer).toBeDefined();
+    if (!capturedOkBuffer || !capturedErrBuffer) {
+      throw new Error('captured buffer is undefined');
+    }
+
+    expect(capturedOkBuffer.userId_values[1]).toBe('user-single');
+    expect(capturedOkBuffer.operation_values[1]).toBe(0);
+    // Single-field setters only touch row 1 — row 0 (span-start) stays unset.
+    expect(capturedOkBuffer.userId_values[0]).toBeUndefined();
+
+    expect(capturedErrBuffer.userId_values[1]).toBe('user-single-err');
+  });
+
   it('should write err fluent result attributes directly to row 1', async () => {
     let capturedBuffer: SpanBuffer<(typeof ctx)['logBinding']['logSchema']> | undefined;
 

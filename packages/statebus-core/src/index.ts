@@ -32,8 +32,14 @@ declare module '@smoothbricks/statebus-core' {
 }
 
 export { StateBus } from './api.js';
-export type { StateInterest, StateInterestChange } from './interest.js';
-export { mergeStateInterests, StateInterestRegistry, stateInterestKey } from './interest.js';
+export type { StateInterest, StateInterestChange, StateInterestKey } from './interest.js';
+export {
+  mergeStateInterests,
+  StateInterestBatch,
+  StateInterestMap,
+  StateInterestRegistry,
+  stateInterestKey,
+} from './interest.js';
 export { ManualStateBus } from './manual.js';
 export { MicrotaskStateBus } from './microtask.js';
 export type {

@@ -36,7 +36,15 @@ import { TransientError } from './errors/Transient.js';
 import type { Op } from './op.js';
 import type { OpContext, OpMetadata, SpanContext, SpanFn, SpanLogger, SpanSyncFn } from './opContext/types.js';
 import type { CallsitePlan, PhysicalLayoutPlan } from './physicalLayoutPlan.js';
-import { Err, hasErrorCode, Ok, type Result, SPAN_COMPLETION_OWNER_ERROR } from './result.js';
+import {
+  Err,
+  type ErrResult,
+  hasErrorCode,
+  Ok,
+  type OkResult,
+  type Result,
+  SPAN_COMPLETION_OWNER_ERROR,
+} from './result.js';
 import {
   RUNTIME_HINT_DEPS,
   RUNTIME_HINT_FF,
@@ -828,8 +836,8 @@ export function createSpanContextClass<Ctx extends OpContext>(
     [key: string]: unknown;
 
     declare setScope: (attributes: ScopeUpdate<Ctx['logSchema']> | null) => void;
-    declare ok: <V>(value: V) => Ok<V, Ctx['logSchema']>;
-    declare err: <E>(error: E) => Err<E, Ctx['logSchema']>;
+    declare ok: <V>(value: V) => OkResult<V, Ctx['logSchema']>;
+    declare err: <E>(error: E) => ErrResult<E, Ctx['logSchema']>;
     declare span: SpanFn<Ctx>;
     declare spanSync: SpanSyncFn<Ctx>;
 
@@ -887,8 +895,11 @@ export function createSpanContextClass<Ctx extends OpContext>(
       }
 
       if (hasResult) {
-        this.ok = <V>(value: V): Ok<V, Ctx['logSchema']> => new Ok<V, Ctx['logSchema']>(value, this);
-        this.err = <E>(error: E): Err<E, Ctx['logSchema']> => new Err<E, Ctx['logSchema']>(error, this);
+        // The selected schema-bound classes write directly to this context's row 1.
+        // State is required: it is both the writer target and completion owner.
+        const { OkClass, ErrClass } = callsitePlan;
+        this.ok = <V>(value: V): OkResult<V, Ctx['logSchema']> => new OkClass<V>(value, this);
+        this.err = <E>(error: E): ErrResult<E, Ctx['logSchema']> => new ErrClass<E>(error, this);
       }
       //#endregion smoo/lmao!n/codegen-destructured-context
 

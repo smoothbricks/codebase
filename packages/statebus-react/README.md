@@ -93,3 +93,9 @@ import { ManualStateBus } from '@smoothbricks/statebus-react';
   `import { useBus, useSubstate } from '@smoothbricks/statebus-react'`
 - `declare module '@smoothbricks/statebus'` -> `declare module '@smoothbricks/statebus-core'`
 - `StateBus` is now exported from `@smoothbricks/statebus-react`
+
+## Application command scheduling
+
+`MicrotaskStateBus` is re-exported from core. Use it explicitly when application commands should reduce in a microtask
+rather than wait for an animation frame. It uses the same `StatebusProvider` and typed hooks. The existing `StateBus`
+alias still refers to `AnimationFrameStateBus`; this release does not silently change existing applications' scheduling.

@@ -1,5 +1,13 @@
 import { describe, expect, it } from 'bun:test';
-import { AnimationFrameStateBus, computed, ManualStateBus, StateBus, track, useStateTracking } from '../index.js';
+import {
+  AnimationFrameStateBus,
+  computed,
+  ManualStateBus,
+  MicrotaskStateBus,
+  StateBus,
+  track,
+  useStateTracking,
+} from '../index.js';
 
 declare module '@smoothbricks/statebus-core' {
   export interface States {
@@ -46,4 +54,15 @@ describe('StateBus React exports', () => {
     // Now state should be updated
     expect(bus.state.counter.get()).toBe(5);
   });
+});
+
+it('exports the microtask scheduler without requiring requestAnimationFrame', async () => {
+  const bus = new MicrotaskStateBus({
+    initialState: { counter: 0, testRecords: () => undefined },
+    reducers: { test: { increment: (state, amount) => state.counter.set(amount) } },
+  });
+  bus.publish({ topic: 'test', type: 'increment', payload: 8 });
+  expect(bus.state.counter.get()).toBe(0);
+  await Promise.resolve();
+  expect(bus.state.counter.get()).toBe(8);
 });

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'bun:test';
-import { mergeSubscriberCounts } from '../subscriber-counts.js';
+import { mergeSubscriberCounts, SubscriberCountBatch } from '../subscriber-counts.js';
 
 type Counts = Readonly<Partial<Record<'first' | 'second', number>>>;
 
@@ -45,5 +45,56 @@ describe('subscriber-count coalescing properties', () => {
         }
       }
     }
+  });
+});
+
+// The mutable accumulator owns only unpublished scratch. take() transfers its
+// result to the caller; a later wave must never reuse that published record.
+describe('wave-owned subscriber count accumulation', () => {
+  it('does not allocate a replacement record for an empty or single-payload wave', () => {
+    const batch = new SubscriberCountBatch<'first' | 'second'>();
+    expect(batch.take()).toBeUndefined();
+    const counts = Object.freeze({ first: 1 });
+    batch.append(counts);
+    expect(batch.take()).toBe(counts);
+    expect(batch.take()).toBeUndefined();
+  });
+
+  it('matches the pure reference for every three-payload stream', () => {
+    const batch = new SubscriberCountBatch<'first' | 'second'>();
+    for (const first of values) {
+      for (const second of values) {
+        for (const third of values) {
+          batch.append(Object.freeze(first));
+          batch.append(Object.freeze(second));
+          batch.append(Object.freeze(third));
+          expect(batch.take()).toEqual(mergeSubscriberCounts(mergeSubscriberCounts(first, second), third));
+        }
+      }
+    }
+  });
+
+  it('keeps transferred records unchanged across later waves and resets', () => {
+    const batch = new SubscriberCountBatch<'first' | 'second'>();
+    batch.append({ first: 1 });
+    batch.append({ second: 2 });
+    const retained = Object.freeze(batch.take());
+    batch.append({ first: 0 });
+    batch.append({ second: 0 });
+    expect(batch.take()).toEqual({ first: 0, second: 0 });
+    expect(retained).toEqual({ first: 1, second: 2 });
+    batch.append({ first: 9 });
+    batch.clear();
+    expect(batch.take()).toBeUndefined();
+  });
+
+  it('copies only own keys and treats __proto__ as data, not a prototype mutation', () => {
+    const batch = new SubscriberCountBatch<string>();
+    batch.append({ first: 1 });
+    batch.append({ second: 2 });
+    batch.append({ ['__proto__']: 0, constructor: 3 });
+    const result = batch.take();
+    expect(result).toEqual({ first: 1, second: 2, ['__proto__']: 0, constructor: 3 });
+    expect(Object.getPrototypeOf(result)).toBe(Object.prototype);
   });
 });

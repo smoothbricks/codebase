@@ -382,8 +382,12 @@ export function makeBunTestSuiteTracer<B extends OpContextBinding, TExt extends 
 export function makeBunTestSuiteTracer<B extends OpContextBinding, TExt extends SchemaFields = Record<never, never>>(
   binding: B,
   options?: BunTestSetupOptions<TExt>,
-) {
-  const useTestTracer = createTestTracerInstance(binding, options);
+):
+  | BunTestSuiteTracer<ExtendBindingLogSchema<B, BunTestHarnessBuiltins>>
+  | BunTestSuiteTracer<ExtendBindingLogSchema<B, HarnessSchema<TExt>>> {
+  // Keep the caller's binding and extension through the public typed factory.
+  // Inferring the lower-level factory here widens B to its schema constraint.
+  const useTestTracer = makeTestTracer<B, TExt>(binding, options);
   return {
     useTestTracer,
     useTestSpan: () => useTestTracer.useTestSpan(),

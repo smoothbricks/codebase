@@ -31,7 +31,7 @@
  * ```
  */
 
-import type { ResultWriter, WriterState } from './codegen/fixedPositionWriterGenerator.js';
+import type { ResultWriter, ResultWriterConstructor, WriterState } from './codegen/fixedPositionWriterGenerator.js';
 import type { InferSchema, LogSchema } from './schema/types.js';
 
 // =============================================================================
@@ -110,7 +110,9 @@ export const SPAN_COMPLETION_OWNER_ERROR = 'Span callback must return its own ct
  */
 export class Ok<V, T extends LogSchema = LogSchema> {
   readonly value: V;
-  private readonly _state: WriterState | undefined;
+
+  /** protected, not private: getResultClasses() subclasses Ok per schema to install row-1 fluent setters. */
+  protected readonly _state: WriterState | undefined;
   private declare _writer: BoundResultWriter<T, V, never> | undefined;
 
   constructor(value: V, state?: WriterState) {
@@ -252,7 +254,9 @@ export class Ok<V, T extends LogSchema = LogSchema> {
  */
 export class Err<E, T extends LogSchema = LogSchema> {
   readonly error: E;
-  private readonly _state: WriterState | undefined;
+
+  /** protected, not private: getResultClasses() subclasses Err per schema to install row-1 fluent setters. */
+  protected readonly _state: WriterState | undefined;
   private declare _writer: BoundResultWriter<T, never, E> | undefined;
 
   constructor(error: E, state?: WriterState) {
@@ -426,6 +430,148 @@ export type InferResult<S, E> = Result<S, E, any>;
  */
 // biome-ignore lint/suspicious/noExplicitAny: inference wildcard by design; see doc above.
 export type AnyResult = Result<any, any, any>;
+
+// =============================================================================
+// ROW-1 FLUENT SETTERS (ctx.ok(v).status(200), mirroring ctx.tag on row 0)
+// =============================================================================
+
+//#region smoo/lmao!n/lmao-entry-result-row-setters
+/** Result members and JavaScript protocols must never become schema setters. */
+// biome-ignore lint/complexity/noBannedTypes: Enumerate Object protocol keys, not wrapper values.
+type ResultMember = keyof Ok<unknown> | keyof Err<unknown> | keyof Object | 'then' | `_${string}`;
+
+/**
+ * A schema-bound success result. The base Ok intersection retains result identity
+ * and inference; the additional overloads retain the fluent surface after chaining.
+ *
+ * WHY exclude a broad string key: an unspecified LogSchema is not a promise that
+ * every string is a setter. Such an index signature also collides with Ok's own
+ * members and makes concrete schemas invariant when an Op returns a loose Result.
+ */
+export type OkResult<V, T extends LogSchema = LogSchema> = {
+  with(attributes: Partial<InferSchema<T>>): OkResult<V, T>;
+  message(text: string): OkResult<V, T>;
+  line(lineNumber: number): OkResult<V, T>;
+  uint64_value(value: bigint): OkResult<V, T>;
+  map<U>(fn: (value: V) => U): OkResult<U, T>;
+  mapErr<F>(fn: (error: never) => F): OkResult<V, T>;
+  flatMap<R extends AnyResult>(fn: (value: V) => R): R;
+} & Ok<V, T> & {
+    [K in keyof InferSchema<T> as string extends K ? never : K extends ResultMember ? never : K]: (
+      value: InferSchema<T>[K],
+    ) => OkResult<V, T>;
+  };
+
+/** A schema-bound error result, with the same row-1 fluent contract as OkResult. */
+export type ErrResult<E, T extends LogSchema = LogSchema> = {
+  with(attributes: Partial<InferSchema<T>>): ErrResult<E, T>;
+  message(text: string): ErrResult<E, T>;
+  line(lineNumber: number): ErrResult<E, T>;
+  uint64_value(value: bigint): ErrResult<E, T>;
+  map<U>(fn: (value: never) => U): ErrResult<E, T>;
+  mapErr<F>(fn: (error: E) => F): ErrResult<F, T>;
+  flatMap<U, F>(fn: (value: never) => Result<U, F>): ErrResult<E, T>;
+} & Err<E, T> & {
+    [K in keyof InferSchema<T> as string extends K ? never : K extends ResultMember ? never : K]: (
+      value: InferSchema<T>[K],
+    ) => ErrResult<E, T>;
+  };
+
+/** Payload generics belong to each construction, not to the cached class pair. */
+export type OkClassConstructor<T extends LogSchema> = new <V>(value: V, state: WriterState) => OkResult<V, T>;
+export type ErrClassConstructor<T extends LogSchema> = new <E>(error: E, state: WriterState) => ErrResult<E, T>;
+
+export interface ResultClasses<T extends LogSchema> {
+  readonly OkClass: OkClassConstructor<T>;
+  readonly ErrClass: ErrClassConstructor<T>;
+}
+
+/**
+ * Bridge the dynamically installed schema API to its mapped type. Only class pairs
+ * assembled below enter this cache; prototype checks verify the underlying Result
+ * identity, while the writer constructor supplies the schema-specific methods.
+ */
+function isResultClasses<T extends LogSchema>(value: unknown): value is ResultClasses<T> {
+  if (typeof value !== 'object' || value === null) return false;
+  const ok = Reflect.get(value, 'OkClass');
+  const err = Reflect.get(value, 'ErrClass');
+  return (
+    typeof ok === 'function' && ok.prototype instanceof Ok && typeof err === 'function' && err.prototype instanceof Err
+  );
+}
+
+const resultClassCache = new WeakMap<ResultWriterConstructor, unknown>();
+
+/**
+ * Reuse the plan's already-specialized writer methods, not a second materializer.
+ * The constructor identity includes schema, enum binding, materializer mode, and
+ * message layout. Cache hits return the same pair without another allocation.
+ *
+ * Every installed method uses the same captured _state as Ok/Err and returns its
+ * receiver. Copying descriptors preserves compiled direct writes on JIT runtimes
+ * and the no-eval closure path on workerd, without allocating a ResultWriter.
+ *
+ * State is mandatory for these subclasses. Standalone new Ok/Err values retain
+ * their original no-op fluent behavior; mapped span results retain their owner
+ * and the schema-bound subclass instead of silently losing the fluent surface.
+ */
+export function getResultClasses<T extends LogSchema>(WriterClass: ResultWriterConstructor): ResultClasses<T> {
+  let classes = resultClassCache.get(WriterClass);
+  if (!classes) {
+    class SchemaOk<V> extends Ok<V, T> {
+      protected declare readonly _state: WriterState;
+
+      // biome-ignore lint/complexity/noUselessConstructor: Require state here; the standalone base constructor allows none.
+      constructor(value: V, state: WriterState) {
+        super(value, state);
+      }
+
+      override map<U>(fn: (value: V) => U): SchemaOk<U> {
+        return new SchemaOk(fn(this.value), this._state);
+      }
+    }
+
+    class SchemaErr<E> extends Err<E, T> {
+      protected declare readonly _state: WriterState;
+
+      // biome-ignore lint/complexity/noUselessConstructor: Require state here; the standalone base constructor allows none.
+      constructor(error: E, state: WriterState) {
+        super(error, state);
+      }
+
+      override mapErr<F>(fn: (error: E) => F): SchemaErr<F> {
+        return new SchemaErr(fn(this.error), this._state);
+      }
+    }
+
+    const descriptors = Object.getOwnPropertyDescriptors(WriterClass.prototype);
+    for (const name of Object.keys(descriptors)) {
+      // Raw low-level LogSchemas can contain names rejected by defineLogSchema.
+      // Never overwrite payloads, ownership checks, or JavaScript protocols.
+      // Existing bulk/system methods deliberately replace the lazy writer path.
+      if (
+        name === 'constructor' ||
+        name === 'then' ||
+        name === 'value' ||
+        name === 'error' ||
+        name.startsWith('_') ||
+        ((name in Ok.prototype || name in Err.prototype) && name !== 'with' && name !== 'message' && name !== 'line')
+      ) {
+        delete descriptors[name];
+      }
+    }
+    Object.defineProperties(SchemaOk.prototype, descriptors);
+    Object.defineProperties(SchemaErr.prototype, descriptors);
+    classes = { OkClass: SchemaOk, ErrClass: SchemaErr };
+    resultClassCache.set(WriterClass, classes);
+  }
+
+  if (!isResultClasses<T>(classes)) {
+    throw new TypeError('Invalid schema-bound Ok/Err constructor pair');
+  }
+  return classes;
+}
+//#endregion smoo/lmao!n/lmao-entry-result-row-setters
 
 // =============================================================================
 // CODE ERROR FACTORY
