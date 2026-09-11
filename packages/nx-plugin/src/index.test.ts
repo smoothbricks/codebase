@@ -250,10 +250,10 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         cwd: 'packages/example',
       });
 
-      expect(targets['test:watch']?.executor).toBe('nx:run-commands');
-      expect(targets['test:watch']?.continuous).toBe(true);
-      expect(targets['test:watch']?.dependsOn).toEqual(['typecheck-tests']);
-      expect(targets['test:watch']?.options).toMatchObject({
+      expect(targets['test-watch']?.executor).toBe('nx:run-commands');
+      expect(targets['test-watch']?.continuous).toBe(true);
+      expect(targets['test-watch']?.dependsOn).toEqual(['typecheck-tests']);
+      expect(targets['test-watch']?.options).toMatchObject({
         command: 'bun test --watch --pass-with-no-tests',
         cwd: 'packages/example',
       });
@@ -437,8 +437,8 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
 
       const targets = await inferProjectTargets(workspace, 'packages/example/package.json');
 
-      expect(targets['test:watch']?.continuous).toBe(true);
-      expect(targets['test:watch']?.options).toMatchObject({
+      expect(targets['test-watch']?.continuous).toBe(true);
+      expect(targets['test-watch']?.options).toMatchObject({
         command: 'vitest --coverage',
         cwd: 'packages/example',
       });
@@ -480,7 +480,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
               // sweep it into `build`, which is a serialized test suite behind
               // every consumer's build.
               'test-bun': { executor: 'nx:run-commands' },
-              'test:watch': { executor: 'nx:run-commands' },
+              'test-watch': { executor: 'nx:run-commands' },
               // A real emitter in the same family, to prove the exclusion is
               // the test-runner class and not the family itself.
               'bundle-bun': { executor: 'nx:run-commands' },

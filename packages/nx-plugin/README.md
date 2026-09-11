@@ -10,7 +10,7 @@ with `tsconfig.lib.json` receives transformer-aware `tsc-js` and native `typeche
 `@smoothbricks/nx-plugin` also owns inferred targets Nx does not provide here:
 
 - `typecheck-tests` and `typecheck-tests:watch` from `tsconfig.test.json`
-- `test:watch` from explicit `test` commands for Bun and Vitest packages
+- `test-watch` from explicit `test` commands for Bun and Vitest packages
 - Cargo workspace targets from a neighboring workspace-root `Cargo.toml`
 - aggregate `build` and `lint` targets
 - an uncached `deploy` for a PRIVATE project with a wrangler manifest, running
@@ -171,7 +171,7 @@ Concrete targets come from concrete files:
 - `typecheck-tests` is inferred from `tsconfig.test.json` and runs `tsc -p tsconfig.test.json --noEmit`. It first
   rebuilds the current package's `tsc-js` output (or its non-TypeScript `build`) so self-imports resolve after `clean`.
 - `typecheck-tests:watch` is inferred from `tsconfig.test.json` and runs the same typecheck in watch mode.
-- `test:watch` is inferred when the package already defines an explicit Bun or Vitest `test` command. The plugin derives
+- `test-watch` is inferred when the package already defines an explicit Bun or Vitest `test` command. The plugin derives
   the corresponding watch command and makes it depend on `typecheck-tests`.
 - A workspace-root `Cargo.toml` provides `cargo-test`, `test`, `cargo-lint`, `mutation`, and `bench`.
   `cargo-test-compile` warms one workspace `cargo test --no-run`. `cargo-test-archive` runs one
@@ -257,7 +257,7 @@ target such as `nx run pkg:cargo-wasm`.
 There is no Nx `lint:fix` target; repository formatting is handled by the root `lint:fix` script.
 
 `typecheck-tests` and `typecheck-tests:watch` are inferred only when `tsconfig.test.json` exists. Test typechecking must
-not emit `dist-test`. `test:watch` is continuous and depends on `typecheck-tests` before entering Bun or Vitest watch
+not emit `dist-test`. `test-watch` is continuous and depends on `typecheck-tests` before entering Bun or Vitest watch
 mode. Smoo validation creates/requires this config for test runners that do not typecheck test files by default.
 
 `tsconfig.test.json` is not a TypeScript build-mode project. It should reference library tsconfigs it needs to typecheck

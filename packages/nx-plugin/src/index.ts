@@ -935,7 +935,7 @@ async function createProjectTargets(
     };
     const inferredTestWatchCommand = inferTestWatchCommand(packageJson);
     if (inferredTestWatchCommand) {
-      targets['test:watch'] = {
+      targets['test-watch'] = {
         executor: 'nx:run-commands',
         continuous: true,
         dependsOn: ['typecheck-tests'],
