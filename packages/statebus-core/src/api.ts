@@ -1,5 +1,5 @@
 import { atom } from '@tldraw/state';
-import { mergeSubscriberCounts } from './subscriber-counts.js';
+import { SubscriberCountBatch } from './subscriber-counts.js';
 import type {
   AnyEvent,
   AnyEventReducer,
@@ -119,6 +119,7 @@ export abstract class StateBus implements StateBusReader {
   private dispatchingEventQueue: AnyEvent[] = [];
   private listeners: AnyTopicListenerMap = {};
   private dispatching = false;
+  private readonly interestCounts = new SubscriberCountBatch<StateKeys>();
 
   dispatchEvents() {
     // A listener may request a flush, but must not interrupt the current wave.
@@ -133,47 +134,42 @@ export abstract class StateBus implements StateBusReader {
 
   private dispatchQueuedEvents() {
     while (this.eventQueue.length > 0) {
-      let substateInterestEvent: undefined | Event<'statebus', 'substateInterest'>;
       const eventQueue = this.eventQueue;
-      // Set an empty queue in case publish is called while dispatching
-      // Swap eventQueue and dispatchingEventQueue every dispatch to lower GC pressure
+      // Reuse queue storage. Publications during this wave enter the other queue.
       this.eventQueue = this.dispatchingEventQueue;
       this.dispatchingEventQueue = eventQueue;
+      try {
+        this.dispatchWave(eventQueue);
+      } finally {
+        // Never retain or replay a failed wave when this storage is reused.
+        eventQueue.length = 0;
+        this.interestCounts.clear();
+      }
+    }
+  }
 
-      // Reduce all events first, to make sure all state is up to date
-      for (const event of eventQueue) {
-        if (!event) continue;
-        this.reduceEvent(this.state, event);
+  private dispatchWave(eventQueue: readonly AnyEvent[]): void {
+    let firstInterestEvent: Event<'statebus', 'substateInterest'> | undefined;
+    // Reduce the complete wave before any listener observes it.
+    for (let index = 0; index < eventQueue.length; index += 1) {
+      this.reduceEvent(this.state, eventQueue[index]);
+    }
+    for (let index = 0; index < eventQueue.length; index += 1) {
+      const event = eventQueue[index];
+      if (event.topic === 'statebus' && event.type === 'substateInterest') {
+        firstInterestEvent ??= event;
+        this.interestCounts.append(event.payload.subscribers);
+      } else {
+        this.dispatchEvent(event);
       }
-
-      // Dispatch events to listeners, that may read updated state
-      for (const event of eventQueue) {
-        if (!event) {
-          continue;
-        }
-        if (!(event.topic === 'statebus' && event.type === 'substateInterest')) {
-          this.dispatchEvent(event);
-        } else if (event.type === 'substateInterest') {
-          substateInterestEvent = substateInterestEvent
-            ? {
-                topic: 'statebus',
-                type: 'substateInterest',
-                payload: {
-                  subscribers: mergeSubscriberCounts(
-                    substateInterestEvent.payload.subscribers,
-                    event.payload.subscribers,
-                  ),
-                },
-              }
-            : event;
-        }
-      }
-      // Finally dispatch the merged 'substateInterest' event for this wave only.
-      if (substateInterestEvent) {
-        this.dispatchEvent(substateInterestEvent);
-      }
-      // Clear the dispatching queue
-      eventQueue.length = 0;
+    }
+    const subscribers = this.interestCounts.take();
+    if (firstInterestEvent && subscribers) {
+      this.dispatchEvent(
+        subscribers === firstInterestEvent.payload.subscribers
+          ? firstInterestEvent
+          : { topic: 'statebus', type: 'substateInterest', payload: { subscribers } },
+      );
     }
   }
 
@@ -200,7 +196,8 @@ export abstract class StateBus implements StateBusReader {
 
   publish(event: AnyEvent) {
     const length = this.eventQueue.push(event);
-    this.scheduleDispatch();
+    // The active dispatcher already drains every queued successor wave.
+    if (!this.dispatching) this.scheduleDispatch();
     return length;
   }
 

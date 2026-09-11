@@ -49,3 +49,24 @@ describe('microtask scheduling', () => {
     expect(observed).toEqual([3, 3, 7]);
   });
 });
+
+it('drains listener-published waves without scheduling another empty microtask', async () => {
+  class ObservedBus extends MicrotaskStateBus {
+    flushes = 0;
+    override dispatchEvents() {
+      this.flushes += 1;
+      super.dispatchEvents();
+    }
+  }
+  const bus = new ObservedBus({
+    initialState: { counter: 0, counter1: 0, counter2: 0 },
+    reducers: {},
+  });
+  bus.subscribe('count', 'increment', (event) => {
+    if (event.payload < 4) bus.publish(increment(event.payload + 1));
+  });
+  bus.publish(increment(1));
+  await Promise.resolve();
+  await Promise.resolve();
+  expect(bus.flushes).toBe(1);
+});
