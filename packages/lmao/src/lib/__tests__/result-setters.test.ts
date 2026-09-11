@@ -54,12 +54,13 @@ describe('schema-bound result setters', () => {
       for (const physical of physicals) {
         it(`reuses ${mode} writer methods for ${family}/${physical} without a writer allocation`, () => {
           setMaterializerModeOverride(mode);
-          const runtimeSchema = createTestSchema({ status: S.number(), phase: S.enum(['start', 'done']) });
+          const runtimeSchema = createTestSchema(schema.fields);
           const BufferClass = getSpanBufferClass(runtimeSchema, family, physical);
           const buffer = createSpanBuffer(runtimeSchema, createTestTraceRoot(), createTestOpMetadata(), 8, BufferClass);
           const state = createTestSpanContext(runtimeSchema, buffer);
           const WriterClass = getResultWriterClass(runtimeSchema, family, physical);
-          const classes = getResultClasses<typeof runtimeSchema>(WriterClass);
+          // Bind the declared user schema, not the storage fixture's open-ended system fields.
+          const classes = getResultClasses<typeof schema>(WriterClass);
           expect(getResultClasses(WriterClass)).toBe(classes);
           for (const key of ['status', 'phase', 'with', 'message', 'line', 'uint64_value']) {
             const writerMethod = Object.getOwnPropertyDescriptor(WriterClass.prototype, key);
