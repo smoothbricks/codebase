@@ -1,4 +1,4 @@
-import { appendFileSync, existsSync, lstatSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, readFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
@@ -32,18 +32,15 @@ import { resolvePrivateNpmWorkflowConfig } from '../release/private-npm.js';
 import type { DeploymentStage } from '../wrangler/stage.js';
 import { type CiCrossTestArchive, privateNpmReadTokenJobEnv, renderCiWorkflowYaml } from './ci-workflow.js';
 import { renderRunsOnLine } from './github-runs-on.js';
+import { syncManagedFiles } from './managed-fs.js';
+import type { FileResult } from './managed-plan.js';
 import { renderPrPreviewCleanupWorkflowYaml } from './pr-preview-cleanup-workflow.js';
 import { renderPublishWorkflowYaml } from './publish-workflow.js';
 
-type ManagedKind = 'raw' | 'template' | 'generated';
+export { INLINE_LOCAL_BEGIN, INLINE_LOCAL_END, LOCAL_SECTION_MARKER } from './managed-content.js';
+export type { FileResult } from './managed-plan.js';
 
-/**
- * Repos may append their own content to a managed file below this marker —
- * e.g. extra merge drivers in .gitattributes. Everything from the marker
- * line onward is preserved verbatim across updates and ignored by the
- * drift check; the managed section above it stays byte-exact.
- */
-export const LOCAL_SECTION_MARKER = '# smoo-local: everything below this line is repo-owned and preserved';
+type ManagedKind = 'raw' | 'template' | 'generated';
 
 interface ManagedFile {
   kind: ManagedKind;
@@ -52,112 +49,6 @@ interface ManagedFile {
   executable?: boolean;
   releasePackagesOnly?: boolean;
   cloudflareDeployOnly?: boolean;
-}
-
-/** Split a managed target's content into the managed part and the repo-owned tail. */
-function splitLocalSection(current: string): { managed: string; localTail: string } {
-  const index = current.indexOf(LOCAL_SECTION_MARKER);
-  if (index === -1) return { managed: current, localTail: '' };
-  return { managed: current.slice(0, index), localTail: current.slice(index) };
-}
-
-/** Test seam for the pure splitter. */
-export const splitLocalSectionForTest = splitLocalSection;
-
-/**
- * A repo-owned block INSIDE the managed section — e.g. one extra pattern
- * spliced into a formatter's list, where a trailing marker (LOCAL_SECTION_MARKER)
- * can't express it because it isn't at the end of the file. Wrap it in
- * `# smoo-local-begin` / `# smoo-local-end`; the block is anchored to the line
- * immediately before `# smoo-local-begin`. On update, the block is re-spliced
- * right after that same anchor line in the freshly rendered template — if the
- * anchor no longer appears there (the template reworked that section), the
- * update refuses rather than silently dropping the repo's customization.
- */
-export const INLINE_LOCAL_BEGIN = '# smoo-local-begin';
-export const INLINE_LOCAL_END = '# smoo-local-end';
-
-interface InlineLocalBlock {
-  anchor: string;
-  lines: string;
-  markerIndent?: string;
-}
-
-/** Pull inline local blocks out of a managed section, returning the section
- * with each block (and its markers) removed, plus the extracted blocks in
- * the order they appeared. */
-function extractInlineLocalBlocks(managed: string): { withoutInline: string; blocks: InlineLocalBlock[] } {
-  const lines = managed.split('\n');
-  const kept: string[] = [];
-  const blocks: InlineLocalBlock[] = [];
-  let i = 0;
-  while (i < lines.length) {
-    const line = lines[i];
-    if (line !== undefined && line.trim() === INLINE_LOCAL_BEGIN) {
-      const anchor = kept.at(-1);
-      if (anchor === undefined) {
-        throw new Error(`${INLINE_LOCAL_BEGIN} on line ${i + 1} has no preceding anchor line`);
-      }
-      const blockLines: string[] = [];
-      i += 1;
-      while (i < lines.length && lines[i]?.trim() !== INLINE_LOCAL_END) {
-        blockLines.push(lines[i] as string);
-        i += 1;
-      }
-      if (i >= lines.length) {
-        throw new Error(`${INLINE_LOCAL_BEGIN} anchored on "${anchor}" has no matching ${INLINE_LOCAL_END}`);
-      }
-      const markerIndent = line.slice(0, line.length - line.trimStart().length);
-      blocks.push({
-        anchor,
-        lines: blockLines.join('\n'),
-        ...(markerIndent === '' ? {} : { markerIndent }),
-      });
-      i += 1; // skip the END marker line itself
-      continue;
-    }
-    kept.push(line);
-    i += 1;
-  }
-  return { withoutInline: kept.join('\n'), blocks };
-}
-
-/** Test seam for the pure extractor. */
-export const extractInlineLocalBlocksForTest = extractInlineLocalBlocks;
-
-/** Re-splice extracted inline blocks into freshly rendered managed content,
- * each immediately after its anchor line. A no-op when there are no blocks. */
-function reinsertInlineLocalBlocks(content: string, blocks: InlineLocalBlock[]): string {
-  if (blocks.length === 0) return content;
-  const lines = content.split('\n');
-  for (const block of blocks) {
-    const matches = lines.flatMap((line, index) => (line === block.anchor ? [index] : []));
-    if (matches.length !== 1) {
-      const reason = matches.length === 0 ? 'no line' : `${matches.length} lines`;
-      throw new Error(
-        `${INLINE_LOCAL_BEGIN} block anchored on "${block.anchor}" matches ${reason} in the updated ` +
-          'template — reconcile the repo-owned block manually',
-      );
-    }
-    const index = matches[0] as number;
-    const markerIndent = block.markerIndent ?? '';
-    lines.splice(
-      index + 1,
-      0,
-      `${markerIndent}${INLINE_LOCAL_BEGIN}`,
-      ...block.lines.split('\n'),
-      `${markerIndent}${INLINE_LOCAL_END}`,
-    );
-  }
-  return lines.join('\n');
-}
-
-/** Test seam for the pure re-splicer. */
-export const reinsertInlineLocalBlocksForTest = reinsertInlineLocalBlocks;
-
-export interface FileResult {
-  target: string;
-  action: 'created' | 'updated' | 'unchanged' | 'skipped' | 'skipped-symlink' | 'drifted' | 'ok-symlink';
 }
 
 export interface ManagedFileContext {
@@ -362,47 +253,18 @@ export function managedFileTargetsForContext(context: ManagedFileContext): strin
 
 export async function applyManagedFiles(root: string, mode: 'update' | 'check' | 'diff'): Promise<FileResult[]> {
   const context = await getManagedFileContext(root);
-  return managedFiles.map((file) => applyManagedFile(root, file, mode, context));
-}
-
-function applyManagedFile(
-  root: string,
-  file: ManagedFile,
-  mode: 'update' | 'check' | 'diff',
-  context: ManagedFileContext,
-): FileResult {
-  if (!managedFileApplies(file, context)) {
-    return { target: file.target, action: 'skipped' };
-  }
-  const target = resolve(root, file.target);
-  const content = getManagedContent(file, context);
-  if (existsSync(target)) {
-    const info = lstatSync(target);
-    if (info.isSymbolicLink()) {
-      return { target: file.target, action: mode === 'check' ? 'ok-symlink' : 'skipped-symlink' };
-    }
-    if (!info.isFile()) {
-      throw new Error(`${file.target} exists but is not a regular file or symlink`);
-    }
-    const current = readFileSync(target, 'utf8');
-    const { managed, localTail } = splitLocalSection(current);
-    const { withoutInline, blocks } = extractInlineLocalBlocks(managed);
-    if (withoutInline === content || (localTail !== '' && withoutInline === `${content}\n`)) {
-      return { target: file.target, action: 'unchanged' };
-    }
-    if (mode === 'check' || mode === 'diff') {
-      return { target: file.target, action: 'drifted' };
-    }
-    const rendered = reinsertInlineLocalBlocks(content, blocks);
-    const next = localTail === '' ? rendered : `${rendered}\n${localTail}`;
-    writeManagedFile(target, next, file.executable === true);
-    return { target: file.target, action: 'updated' };
-  }
-  if (mode === 'check' || mode === 'diff') {
-    return { target: file.target, action: 'drifted' };
-  }
-  writeManagedFile(target, content, file.executable === true);
-  return { target: file.target, action: 'created' };
+  // Render every template before any write. A late renderer or ownership
+  // conflict must not leave the checkout half-updated.
+  return syncManagedFiles(
+    root,
+    managedFiles.map((file) => ({
+      target: file.target,
+      desired: managedFileApplies(file, context)
+        ? { content: getManagedContent(file, context), executable: file.executable === true }
+        : null,
+    })),
+    mode,
+  );
 }
 
 /** Renders a generated workflow through its real managed-file descriptor, so the context wiring is covered. */
@@ -711,14 +573,9 @@ function renderYamlFlowList(values: string[]): string {
   return JSON.stringify(values);
 }
 
-function writeManagedFile(path: string, content: string, executable: boolean): void {
-  mkdirSync(dirname(path), { recursive: true });
-  writeFileSync(path, content, { mode: executable ? 0o755 : 0o644 });
-}
-
 export function printResults(results: FileResult[]): void {
   for (const result of results) {
-    console.log(`${result.action.padEnd(15)} ${result.target}`);
+    console.log(`${result.action.padEnd(15)} ${result.target}${result.reason ? ` — ${result.reason}` : ''}`);
   }
 }
 
