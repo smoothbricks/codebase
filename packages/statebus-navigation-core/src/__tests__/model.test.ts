@@ -5,20 +5,27 @@ import {
   initialNavigationState,
   type NavigationEvent,
   type NavigationRequest,
+  navigationRequestId,
   reduceNavigation,
 } from '../model.js';
 
-const request: NavigationRequest<string> = { requestId: 'first', intent: { kind: 'push', to: '/settings/billing' } };
+const request: NavigationRequest<string> = {
+  requestId: navigationRequestId('first'),
+  intent: { kind: 'push', to: '/settings/billing' },
+};
 
 describe('navigation reducer properties', () => {
   it('does not predict a URL from an intent and only admits an unblocked request', () => {
     fc.assert(
       fc.property(fc.string(), fc.string(), (from, to) => {
         const initial = Object.freeze(initialNavigationState<string, string>(from));
-        const target: NavigationRequest<string> = { requestId: 'go', intent: { kind: 'navigate', to } };
+        const target: NavigationRequest<string> = {
+          requestId: navigationRequestId('go'),
+          intent: { kind: 'navigate', to },
+        };
         const next = reduceNavigation(initial, { type: 'navigationRequested', request: target });
         expect(next.location).toBe(from);
-        expect(admittedNavigation(next, 'go')).toEqual(target);
+        expect(admittedNavigation(next, navigationRequestId('go'))).toEqual(target);
         expect(initial).toEqual({ location: from, operation: { kind: 'idle' } });
       }),
       { numRuns: 500 },
@@ -37,8 +44,12 @@ describe('navigation reducer properties', () => {
         expect(blocked.operation.kind).toBe('blocked');
         expect(admittedNavigation(blocked, request.requestId)).toBeUndefined();
         expect(reduceNavigation(blocked, { type: 'navigationRequested', request })).toBe(blocked);
-        expect(reduceNavigation(blocked, { type: 'navigationConfirmed', requestId: other })).toBe(blocked);
-        expect(reduceNavigation(blocked, { type: 'navigationCancelled', requestId: other })).toBe(blocked);
+        expect(reduceNavigation(blocked, { type: 'navigationConfirmed', requestId: navigationRequestId(other) })).toBe(
+          blocked,
+        );
+        expect(reduceNavigation(blocked, { type: 'navigationCancelled', requestId: navigationRequestId(other) })).toBe(
+          blocked,
+        );
         const confirmed = reduceNavigation(blocked, { type: 'navigationConfirmed', requestId: request.requestId });
         expect(admittedNavigation(confirmed, request.requestId)).toEqual(request);
         const cancelled = reduceNavigation(blocked, { type: 'navigationCancelled', requestId: request.requestId });
@@ -56,24 +67,29 @@ describe('navigation reducer properties', () => {
           type: 'navigationRequested',
           request,
         });
-        const latest: NavigationRequest<string> = { requestId: 'latest', intent: { kind: 'replace', to: '/members' } };
+        const latest: NavigationRequest<string> = {
+          requestId: navigationRequestId('latest'),
+          intent: { kind: 'replace', to: '/members' },
+        };
         const pending = reduceNavigation(first, { type: 'navigationRequested', request: latest });
         expect(
           reduceNavigation(pending, {
             type: 'navigationFailed',
-            requestId: 'first',
+            requestId: navigationRequestId('first'),
             error: { code: 'driver-failed', message: 'late' },
           }),
         ).toBe(pending);
-        expect(reduceNavigation(pending, { type: 'navigationDispatched', requestId: 'first' })).toBe(pending);
+        expect(
+          reduceNavigation(pending, { type: 'navigationDispatched', requestId: navigationRequestId('first') }),
+        ).toBe(pending);
         const fact = reduceNavigation(pending, {
           type: 'locationObserved',
           source: 'intent',
-          requestId: 'first',
+          requestId: navigationRequestId('first'),
           location: observed,
         });
         expect(fact.location).toBe(observed);
-        expect(admittedNavigation(fact, 'latest')).toEqual(latest);
+        expect(admittedNavigation(fact, navigationRequestId('latest'))).toEqual(latest);
         const history = reduceNavigation(fact, { type: 'locationObserved', source: 'history', location: '/back' });
         expect(history.location).toBe('/back');
         expect(history.operation.kind).toBe('idle');
@@ -91,16 +107,16 @@ describe('navigation reducer properties', () => {
             case 0:
               return {
                 type: 'navigationRequested',
-                request: { requestId: String(index), intent: { kind: 'push', to: text } },
+                request: { requestId: navigationRequestId(String(index)), intent: { kind: 'push', to: text } },
               };
             case 1:
               return { type: 'navigationGuardChanged', reason: text || undefined };
             case 2:
               return { type: 'locationObserved', source: 'history', location: text };
             case 3:
-              return { type: 'navigationConfirmed', requestId: String(index - 1) };
+              return { type: 'navigationConfirmed', requestId: navigationRequestId(String(index - 1)) };
             default:
-              return { type: 'navigationCancelled', requestId: String(index - 1) };
+              return { type: 'navigationCancelled', requestId: navigationRequestId(String(index - 1)) };
           }
         });
         const expected = events.reduce(reduceNavigation<string, string>, initial);
@@ -114,4 +130,14 @@ describe('navigation reducer properties', () => {
       { numRuns: 500 },
     );
   });
+});
+
+it('preserves identity for unchanged guards and unchanged observations', () => {
+  fc.assert(
+    fc.property(fc.string(), fc.option(fc.string(), { nil: undefined }), (location, guard) => {
+      const state = Object.freeze({ ...initialNavigationState<string, string>(location), guard });
+      expect(reduceNavigation(state, { type: 'navigationGuardChanged', reason: guard })).toBe(state);
+      expect(reduceNavigation(state, { type: 'locationObserved', source: 'history', location })).toBe(state);
+    }),
+  );
 });

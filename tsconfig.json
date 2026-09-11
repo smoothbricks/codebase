@@ -3,59 +3,24 @@
   "compileOnSave": false,
   "files": [],
   "references": [
-    {
-      "path": "./packages/arrow-builder"
-    },
-    {
-      "path": "./packages/lmao"
-    },
-    {
-      "path": "./packages/duration"
-    },
-    {
-      "path": "./packages/columine"
-    },
-    {
-      "path": "./packages/money"
-    },
-    {
-      "path": "./packages/lmao-inspector"
-    },
-    {
-      "path": "./packages/nx-plugin"
-    },
-    {
-      "path": "./packages/time"
-    },
-    {
-      "path": "./packages/validation"
-    },
-    {
-      "path": "./packages/opencode-entangled"
-    },
-    {
-      "path": "./packages/statebus-core"
-    },
-    {
-      "path": "./packages/statebus-react"
-    },
-    {
-      "path": "./packages/cli"
-    },
-    {
-      "path": "./packages/cowshed"
-    },
-    {
-      "path": "./packages/lmao-ttsc"
-    },
-    {
-      "path": "./packages/statebus-data-loader"
-    },
-    {
-      "path": "./packages/statebus-tanstack-query"
-    },
-    {
-      "path": "./packages/statebus-navigation-core"
-    }
+    { "path": "./packages/arrow-builder" },
+    { "path": "./packages/lmao" },
+    { "path": "./packages/duration" },
+    { "path": "./packages/columine" },
+    { "path": "./packages/money" },
+    { "path": "./packages/lmao-inspector" },
+    { "path": "./packages/nx-plugin" },
+    { "path": "./packages/time" },
+    { "path": "./packages/validation" },
+    { "path": "./packages/opencode-entangled" },
+    { "path": "./packages/statebus-core" },
+    { "path": "./packages/statebus-react" },
+    { "path": "./packages/cli" },
+    { "path": "./packages/cowshed" },
+    { "path": "./packages/lmao-ttsc" },
+    { "path": "./packages/statebus-data-loader" },
+    { "path": "./packages/statebus-tanstack-query" },
+    { "path": "./packages/statebus-navigation-core" },
+    { "path": "./packages/statebus-navigation-browser" }
   ]
 }

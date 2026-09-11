@@ -1,0 +1,38 @@
+# Temporary lockfile generation/validation; removed once generated lock is committed.
+name: StateBus PR23 lock inputs
+on:
+  push:
+    branches: [feat/statebus-loader-navigation]
+    paths: [.github/workflows/statebus-pr23-lock.yml]
+permissions:
+  contents: read
+jobs:
+  lock:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6.0.2
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: '1.4.2'
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '26'
+      - name: Generate and verify the actual dependency lock
+        run: |
+          bun install --lockfile-only
+          bun install --frozen-lockfile --ignore-scripts
+          mkdir -p "$RUNNER_TEMP/pr23-lock"
+          cp bun.lock "$RUNNER_TEMP/pr23-lock/bun.lock"
+          git archive HEAD | gzip > "$RUNNER_TEMP/pr23-lock/source.tar.gz"
+          git diff -- bun.lock > "$RUNNER_TEMP/pr23-lock/lock.diff"
+          git rev-parse HEAD > "$RUNNER_TEMP/pr23-lock/revision.txt"
+          cd "$RUNNER_TEMP/pr23-lock" && sha256sum bun.lock source.tar.gz > SHA256SUMS
+      - uses: actions/upload-artifact@v7.0.1
+        with:
+          name: statebus-pr23-lock-inputs
+          path: ${{ runner.temp }}/pr23-lock/*
+          retention-days: 1
+          if-no-files-found: error

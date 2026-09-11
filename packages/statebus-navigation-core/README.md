@@ -17,8 +17,8 @@ a newer pending intent; uncorrelated browser traversal is authoritative.
 
 `reduceNavigation` owns the renderable operation and optional navigation guard. A guarded user intent becomes blocked;
 only matching `navigationConfirmed`/`navigationCancelled` can resolve it. A newer intent supersedes the pending intent.
-Every logical request needs a fresh ID; replaying the current request ID is idempotent. The reducer does not retain an
-unbounded historic deduplication ledger.
+Every logical request needs a fresh branded `NavigationRequestId` (created with `navigationRequestId(value)`); replaying
+the current request ID is idempotent. The reducer does not retain an unbounded historic deduplication ledger.
 
 ## Composition
 
@@ -29,14 +29,16 @@ and converts rejected/thrown driver calls to typed failures. Supersession/dispos
 late acknowledgements. A driver must honour the AbortSignal while doing asynchronous work; completed history side
 effects cannot be undone by aborting a promise.
 
-Browser and Expo implementations are separate adapters, not included in this package. Each should implement `current`,
-`subscribe`, and `execute`, map supported intents to its platform router, and feed actual route changes back as facts.
-Browser-only operations should return `unsupported` on a platform that cannot perform them.
+The concrete browser adapter is the separate `@smoothbricks/statebus-navigation-browser` package. Expo remains a future
+adapter, not an implemented binding. Each adapter implements `current`, `subscribe`, and `execute`, maps supported
+intents to its platform router, and feeds actual route changes back as facts. Browser-only operations should return
+`unsupported` on a platform that cannot perform them.
 
 ## Offline scenarios
 
 `createMemoryNavigation({ entries, index?, equal })` implements deterministic in-memory history for stories and tests.
 Push truncates forward history, replace edits the current entry, and Back/Forward/Go traverse only existing entries.
+Unchanged and out-of-range memory navigation acknowledges the existing location, and aborted requests do not write.
 External navigation is disabled, so a story cannot accidentally open a real authentication or payment URL. Location
 values should be immutable serializable data; the driver never receives the application bus writer.
 
@@ -49,8 +51,8 @@ admission, stale results, guard transitions, arbitrary event streams, and checkp
 A user-intent guard is not a browser `popstate` veto. Browser traversal has already happened when its observation
 arrives; the state must not lie about that location. Native navigation blockers, browser history rollback/entry
 tracking, and `beforeunload` confirmation require a platform-specific policy and smoke tests. They are not claimed by
-this core or the initial browser driver. Third-party router interception must likewise be implemented at that router's
-boundary, not by silently monkey-patching global history.
+this core; the browser package supplies only native unload confirmation, not traversal rollback or veto. Third-party
+router interception must likewise be implemented at that router's boundary, not by silently monkey-patching history.
 
 Run `nx lint statebus-navigation-core` and `nx test statebus-navigation-core`. The normal repository Bun/TypeScript lane
 is retained. Application Help replay codecs, bounded journals and generic StateBus-LMAO execution are separate runtime

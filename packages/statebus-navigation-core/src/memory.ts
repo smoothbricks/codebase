@@ -1,4 +1,5 @@
 import {
+  NAVIGATION_CANCELLED,
   NAVIGATION_DISPATCHED,
   type NavigationDriver,
   type NavigationObservation,
@@ -31,7 +32,8 @@ export function createMemoryNavigation<Location>(options: {
         listeners.delete(listener);
       };
     },
-    execute(request): NavigationOutcome {
+    execute(request, { signal }): NavigationOutcome {
+      if (signal.aborted) return NAVIGATION_CANCELLED;
       const intent = request.intent;
       switch (intent.kind) {
         case 'external':
@@ -47,7 +49,7 @@ export function createMemoryNavigation<Location>(options: {
           entries[index] = intent.to;
           break;
         case 'navigate':
-          if (options.equal(current(), intent.to)) return NAVIGATION_DISPATCHED;
+          if (options.equal(current(), intent.to)) break;
           entries.splice(index + 1, entries.length, intent.to);
           index += 1;
           break;
@@ -62,7 +64,7 @@ export function createMemoryNavigation<Location>(options: {
             };
           }
           const next = index + delta;
-          if (next < 0 || next >= entries.length || next === index) return NAVIGATION_DISPATCHED;
+          if (next < 0 || next >= entries.length || next === index) break;
           index = next;
           break;
         }

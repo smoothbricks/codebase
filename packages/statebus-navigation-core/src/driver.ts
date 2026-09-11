@@ -3,13 +3,14 @@ import {
   type NavigationEvent,
   type NavigationFailure,
   type NavigationRequest,
+  type NavigationRequestId,
   type NavigationState,
 } from './model.js';
 
 export interface NavigationObservation<Location> {
   readonly location: Location;
   readonly source: 'intent' | 'history' | 'external';
-  readonly requestId?: string;
+  readonly requestId?: NavigationRequestId;
 }
 
 export type NavigationOutcome =
@@ -40,45 +41,86 @@ export function connectNavigation<Target, Location>(options: {
   readonly driver: NavigationDriver<Target, Location>;
 }): () => void {
   let disposed = false;
-  let lastStarted: string | undefined;
+  let lastStarted: NavigationRequestId | undefined;
   let activeScope: AbortController | undefined;
   const { channel, driver } = options;
+  // Read before installing listeners so a faulty adapter cannot leave a half-installed connection.
+  const initialLocation = driver.current();
   const stopLocation = driver.subscribe((observation) => {
     if (!disposed) channel.publish({ type: 'locationObserved', ...observation });
   });
-  const stopRequests = channel.subscribe((event) => {
-    if (disposed || (event.type !== 'navigationRequested' && event.type !== 'navigationConfirmed')) return;
-    const id = event.type === 'navigationRequested' ? event.request.requestId : event.requestId;
-    const request = admittedNavigation(channel.read(), id);
-    if (!request || lastStarted === id) return;
-    lastStarted = id;
-    // A driver may be an async router adapter. The catch also consumes rejected navigation promises.
-    activeScope?.abort();
-    activeScope = new AbortController();
-    void execute(request, activeScope.signal);
-  });
-  channel.publish({ type: 'locationObserved', source: 'initial', location: driver.current() });
+  let stopRequests: () => void;
+  try {
+    stopRequests = channel.subscribe((event) => {
+      if (disposed) return;
+      const state = channel.read();
+      const operation = state.operation;
+      if (
+        activeScope &&
+        ((operation.kind !== 'requested' && operation.kind !== 'dispatched') ||
+          operation.request.requestId !== lastStarted)
+      ) {
+        activeScope.abort();
+        activeScope = undefined;
+      }
+      if (event.type !== 'navigationRequested' && event.type !== 'navigationConfirmed') return;
+      const id = event.type === 'navigationRequested' ? event.request.requestId : event.requestId;
+      const request = admittedNavigation(state, id);
+      if (!request || lastStarted === id) return;
+      lastStarted = id;
+      activeScope?.abort();
+      activeScope = new AbortController();
+      execute(request, activeScope.signal);
+    });
+  } catch (cause) {
+    stopLocation();
+    throw cause;
+  }
+  try {
+    channel.publish({ type: 'locationObserved', source: 'initial', location: initialLocation });
+  } catch (cause) {
+    stopRequests();
+    stopLocation();
+    throw cause;
+  }
 
-  async function execute(request: NavigationRequest<Target>, signal: AbortSignal): Promise<void> {
-    let outcome: NavigationOutcome;
+  function execute(request: NavigationRequest<Target>, signal: AbortSignal): void {
+    const finish = (outcome: NavigationOutcome) => {
+      if (disposed || signal.aborted || lastStarted !== request.requestId) return;
+      channel.publish(
+        outcome.kind === 'dispatched'
+          ? { type: 'navigationDispatched', requestId: request.requestId }
+          : { type: 'navigationFailed', requestId: request.requestId, error: outcome.error },
+      );
+    };
+    const failed = () => finish(DRIVER_FAILED);
+    let outcome: NavigationOutcome | Promise<NavigationOutcome>;
     try {
-      outcome = await driver.execute(request, { signal });
+      outcome = driver.execute(request, { signal });
     } catch {
-      outcome = { kind: 'failed', error: { code: 'driver-failed', message: 'The navigation driver failed.' } };
+      failed();
+      return;
     }
-    if (disposed || signal.aborted || lastStarted !== request.requestId) return;
-    channel.publish(
-      outcome.kind === 'dispatched'
-        ? { type: 'navigationDispatched', requestId: request.requestId }
-        : { type: 'navigationFailed', requestId: request.requestId, error: outcome.error },
-    );
+    // Synchronous history implementations need no promise/microtask just to acknowledge a write.
+    if ('kind' in outcome) finish(outcome);
+    else void outcome.then(finish, failed);
   }
 
   return () => {
     if (disposed) return;
     disposed = true;
     activeScope?.abort();
+    activeScope = undefined;
     stopRequests();
     stopLocation();
   };
 }
+
+const DRIVER_FAILED: NavigationOutcome = Object.freeze({
+  kind: 'failed',
+  error: Object.freeze({ code: 'driver-failed', message: 'The navigation driver failed.' }),
+});
+export const NAVIGATION_CANCELLED: NavigationOutcome = Object.freeze({
+  kind: 'failed',
+  error: Object.freeze({ code: 'cancelled', message: 'Navigation was cancelled.' }),
+});

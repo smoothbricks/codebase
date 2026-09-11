@@ -1,0 +1,29 @@
+{
+  "extends": "./tsconfig.lib.json",
+  "compilerOptions": {
+    "composite": false,
+    "declaration": false,
+    "declarationMap": false,
+    "emitDeclarationOnly": false,
+    "noEmit": true,
+    "types": ["bun"],
+    "lib": ["ES2024", "DOM", "DOM.Iterable"],
+    "rootDir": "."
+  },
+  "include": ["src/**/*.test.ts", "src/**/__tests__/**/*.ts", "browser/**/*.ts"],
+  "exclude": [],
+  "references": [
+    {
+      "path": "./tsconfig.lib.json"
+    },
+    {
+      "path": "../statebus-core/tsconfig.lib.json"
+    },
+    {
+      "path": "../statebus-navigation-core/tsconfig.lib.json"
+    },
+    {
+      "path": "../statebus-react/tsconfig.lib.json"
+    }
+  ]
+}

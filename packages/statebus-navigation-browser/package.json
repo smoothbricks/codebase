@@ -1,0 +1,79 @@
+{
+  "name": "@smoothbricks/statebus-navigation-browser",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Explicitly owned browser history and URL-observation adapter for StateBus navigation.",
+  "license": "MIT",
+  "author": "SmoothBricks Contributors",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/smoothbricks/codebase.git",
+    "directory": "packages/statebus-navigation-browser"
+  },
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "development": "./src/index.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "src",
+    "!**/*.tsbuildinfo"
+  ],
+  "dependencies": {
+    "tslib": "^2.8.1",
+    "@smoothbricks/statebus-navigation-core": "workspace:*"
+  },
+  "devDependencies": {
+    "fast-check": "^4.4.0",
+    "@smoothbricks/statebus-core": "workspace:*",
+    "playwright": "^1.62.1",
+    "react": "^19.2.5",
+    "react-dom": "^19.2.5",
+    "@types/react": "^19.2.14",
+    "@types/react-dom": "^19.2.3",
+    "@smoothbricks/statebus-react": "workspace:*"
+  },
+  "nx": {
+    "name": "statebus-navigation-browser",
+    "tags": [
+      "npm:public"
+    ],
+    "targets": {
+      "lint": {},
+      "test": {
+        "executor": "@smoothbricks/nx-plugin:bounded-exec",
+        "options": {
+          "command": "bun test --timeout=30000",
+          "cwd": "{projectRoot}/src",
+          "timeoutMs": 120000,
+          "killAfterMs": 10000
+        }
+      },
+      "test-browser": {
+        "executor": "@smoothbricks/nx-plugin:bounded-exec",
+        "dependsOn": [
+          "build"
+        ],
+        "cache": true,
+        "parallelism": false,
+        "options": {
+          "command": "bun test --timeout=30000 browser",
+          "cwd": "{projectRoot}",
+          "timeoutMs": 180000,
+          "killAfterMs": 10000
+        }
+      }
+    }
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}
