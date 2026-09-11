@@ -1,4 +1,5 @@
 import { atom } from '@tldraw/state';
+import { mergeSubscriberCounts } from './subscriber-counts.js';
 import type {
   AnyEvent,
   AnyEventReducer,
@@ -117,10 +118,22 @@ export abstract class StateBus implements StateBusReader {
   private eventQueue: AnyEvent[] = [];
   private dispatchingEventQueue: AnyEvent[] = [];
   private listeners: AnyTopicListenerMap = {};
+  private dispatching = false;
 
   dispatchEvents() {
-    let substateInterestEvent: undefined | Event<'statebus', 'substateInterest'>;
+    // A listener may request a flush, but must not interrupt the current wave.
+    if (this.dispatching) return;
+    this.dispatching = true;
+    try {
+      this.dispatchQueuedEvents();
+    } finally {
+      this.dispatching = false;
+    }
+  }
+
+  private dispatchQueuedEvents() {
     while (this.eventQueue.length > 0) {
+      let substateInterestEvent: undefined | Event<'statebus', 'substateInterest'>;
       const eventQueue = this.eventQueue;
       // Set an empty queue in case publish is called while dispatching
       // Swap eventQueue and dispatchingEventQueue every dispatch to lower GC pressure
@@ -141,11 +154,21 @@ export abstract class StateBus implements StateBusReader {
         if (!(event.topic === 'statebus' && event.type === 'substateInterest')) {
           this.dispatchEvent(event);
         } else if (event.type === 'substateInterest') {
-          if (substateInterestEvent) Object.assign(substateInterestEvent.payload, event.payload);
-          else substateInterestEvent = event;
+          substateInterestEvent = substateInterestEvent
+            ? {
+                topic: 'statebus',
+                type: 'substateInterest',
+                payload: {
+                  subscribers: mergeSubscriberCounts(
+                    substateInterestEvent.payload.subscribers,
+                    event.payload.subscribers,
+                  ),
+                },
+              }
+            : event;
         }
       }
-      // Finally dispatch the merged 'substateInterest' event
+      // Finally dispatch the merged 'substateInterest' event for this wave only.
       if (substateInterestEvent) {
         this.dispatchEvent(substateInterestEvent);
       }
@@ -190,21 +213,21 @@ export abstract class StateBus implements StateBusReader {
     const topicListeners = (this.listeners[topic] ?? {}) as Record<Type, Set<Listener<Topic, Type>> | undefined>;
     this.listeners[topic] = topicListeners as AnyTopicListenerMap[Topic];
 
-    const typeListeners = topicListeners[type];
-    if (!typeListeners) {
-      topicListeners[type] = new Set([listener]);
-    } else {
-      typeListeners.add(listener);
-    }
-    // Return a function to unsubscribe
-    return () => typeListeners?.delete(listener);
+    const typeListeners = topicListeners[type] ?? new Set<Listener<Topic, Type>>();
+    topicListeners[type] = typeListeners;
+    typeListeners.add(listener);
+    // Capture the actual set even when this is the first subscription.
+    return () => {
+      typeListeners.delete(listener);
+    };
   }
 
   substateInterest<SK extends StateKeys>(keys: SK[]): () => void {
     if (keys.length === 0) return () => {};
+    const subscribedKeys = [...keys];
 
     const subscribers: Record<SK, number> = {};
-    for (const key of keys) {
+    for (const key of subscribedKeys) {
       const count = (this.substateInterestCount.get(key) ?? 0) + 1;
       subscribers[key] = count;
       this.substateInterestCount.set(key, count);
@@ -213,10 +236,14 @@ export abstract class StateBus implements StateBusReader {
     // Let data-providers know there is interest in these topics
     this.publish({ topic: 'statebus', type: 'substateInterest', payload: { subscribers } });
 
+    let released = false;
     return () => {
+      if (released) return;
+      released = true;
       const subscribers: Record<SK, number> = {};
-      for (const key of keys) {
+      for (const key of subscribedKeys) {
         const count = (this.substateInterestCount.get(key) ?? 1) - 1;
+        subscribers[key] = count;
         if (count > 0) this.substateInterestCount.set(key, count);
         else this.substateInterestCount.delete(key);
       }
