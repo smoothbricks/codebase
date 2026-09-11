@@ -6,6 +6,7 @@ import { pathToFileURL } from 'node:url';
 import type { ChangelogOptions } from 'nx/src/command-line/release/command-object.js';
 import type { NxReleaseConfiguration } from 'nx/src/config/nx-json.js';
 import { type ReleasePackageInfo, releaseTag } from './core.js';
+import { type DurableState, isTransportFailure, undetermined } from './durable-state.js';
 
 const nxRenderOnlyReleaseConfig = {
   changelog: {
@@ -96,13 +97,26 @@ export function projectChangelogContents(result: ProjectChangelogLookupResult, p
   return result.projectChangelogs?.[projectName]?.contents ?? DEPENDENCY_ONLY_RELEASE_NOTES;
 }
 
-export function githubReleaseLookupExists(tag: string, exitCode: number, stdout: string, stderr: string): boolean {
+/**
+ * `gh release view` reduced to the three outcomes.
+ *
+ * Same shape as the npm probe and the same reason: a 404 means the release is
+ * genuinely missing and must be created, a dead connection or a 5xx means the
+ * question was never answered, and collapsing the second into "lookup failed"
+ * ended releases over one reset packet. `gh` reports transport trouble in
+ * Go's phrasing, so the classification lives in `isTransportFailure` where
+ * both client families are handled together.
+ */
+export function githubReleaseLookupStatus(tag: string, exitCode: number, stdout: string, stderr: string): DurableState {
   if (exitCode === 0) {
-    return true;
+    return { kind: 'exists' };
   }
   const details = [stderr.trim(), stdout.trim()].filter(Boolean).join('\n');
   if (/\bHTTP 404\b|release not found/i.test(details)) {
-    return false;
+    return { kind: 'absent' };
+  }
+  if (isTransportFailure(details)) {
+    return undetermined(`gh release view ${tag} failed with exit code ${exitCode}${details ? `: ${details}` : ''}`);
   }
   throw new Error(`Unable to inspect GitHub Release ${tag}.${details ? `\n${details}` : ''}`);
 }

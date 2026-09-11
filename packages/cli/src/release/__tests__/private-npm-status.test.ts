@@ -4,6 +4,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   assertPrivatePackage,
+  type NpmStatusShell,
+  npmProcessStatusShell,
   npmPublishedVersionExists,
   type PrivateNpmRegistry,
   privateNpmUserconfigContent,
@@ -486,8 +488,7 @@ describe('private npm published-version status', () => {
   it.each([
     ['unauthorized', 401],
     ['forbidden', 403],
-    ['unavailable', 503],
-  ])('blocks on a %s registry response instead of reporting the version unpublished', async (_case, status) => {
+  ])('blocks on a %s registry verdict instead of reporting the version unpublished', async (_case, status) => {
     await withStatusFixture(async ({ fixture, root, userconfig }) => {
       fixture.privateRegistry.failWith(status);
 
@@ -498,9 +499,33 @@ describe('private npm published-version status', () => {
         }),
       ).rejects.toThrow();
 
-      // One attempt per query: npm retries 5xx by default, and a retry storm
-      // inside a publish gate turns an outage into a hang.
+      // The registry answered; retrying it would only delay the same answer.
       expect(fixture.privateRegistry.requestsFor(PRIVATE_PACKAGE)).toHaveLength(1);
+    });
+  });
+
+  it('retries an unavailable registry over real requests and then refuses the release', async () => {
+    await withStatusFixture(async ({ fixture, root, userconfig }) => {
+      fixture.privateRegistry.failWith(503);
+      // Real npm, real requests, no real waiting: what is under test is the
+      // bound and the refusal, not the length of the backoff.
+      const shell: NpmStatusShell = { ...npmProcessStatusShell(root), sleep: () => Promise.resolve() };
+
+      await expect(
+        npmPublishedVersionExists(
+          root,
+          PRIVATE_PACKAGE,
+          PRIVATE_VERSION,
+          { registry: fixture.privateRegistry.registry, userconfig },
+          shell,
+        ),
+      ).rejects.toThrow('re-dispatching this run is safe');
+
+      // npm's own ladder stays off, so every request here is one deliberate
+      // attempt -- more than one, and bounded.
+      const attempts = fixture.privateRegistry.requestsFor(PRIVATE_PACKAGE).length;
+      expect(attempts).toBeGreaterThan(1);
+      expect(attempts).toBeLessThan(6);
     });
   });
 

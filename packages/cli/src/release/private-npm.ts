@@ -2,6 +2,7 @@ import { readFileSync } from 'node:fs';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { setTimeout as delay } from 'node:timers/promises';
 import type { PackageJson, PackagePrivateNpmConfig } from '../lib/json.js';
 import { runResult } from '../lib/run.js';
 import {
@@ -12,6 +13,13 @@ import {
   readPackageJsonObject,
   workspaceDependencyFields,
 } from '../lib/workspace.js';
+import {
+  type DurableState,
+  isTransportFailure,
+  probeWithTransportRetry,
+  requireDurableState,
+  undetermined,
+} from './durable-state.js';
 
 /** Minimal typed-result convention for private-registry resolution. */
 export type Result<T, E> = { ok: true; value: T } | { ok: false; error: E };
@@ -448,46 +456,128 @@ function npmCommandFailedMessage(npmArgs: string[], exitCode: number, stdout = '
   return `npm ${npmArgs.join(' ')} failed with exit code ${exitCode}${detail ? `: ${detail}` : ''}`;
 }
 
+export interface NpmCommandResult {
+  exitCode: number;
+  stdout: string;
+  stderr: string;
+}
+
 /**
- * Failure-aware registry status: only a genuine not-found result means absent.
- * Unauthorized/forbidden/unavailable (and any other failure) throw instead of
- * reading as unpublished. Passes --fetch-retries=0 so 5xx responses fail fast
- * instead of hanging CI in npm's retry loop. No fallback to another registry.
+ * How a status probe reaches npm and how it waits between attempts. Injected
+ * so the three outcomes are pinned without a registry: the probe's verdict is
+ * a pure function of npm's exit code and output, and this is the seam that
+ * supplies them.
+ */
+export interface NpmStatusShell {
+  /** Runs `npm <args>`; a non-zero exit is reported, never thrown. */
+  run(args: string[], env: Record<string, string> | undefined): Promise<NpmCommandResult>;
+  /** Backoff between transport retries. */
+  sleep(ms: number): Promise<void>;
+}
+
+export function npmProcessStatusShell(root: string): NpmStatusShell {
+  return {
+    run: (args, env) => runResult('npm', args, root, env),
+    sleep: (ms) => delay(ms),
+  };
+}
+
+/** A genuine not-found verdict: the one failure that means "not published". */
+const NPM_NOT_FOUND = /\bE404\b|404 Not Found/i;
+
+function npmViewArgs(target: string, field: string, options: NpmStatusOptions): string[] {
+  // --fetch-retries=0: npm's own retry ladder is off because a 404 is the
+  // common answer on the publish path. Transport retries happen above instead,
+  // where a 404 does not pay for them.
+  const args = ['view', target, field, '--json', '--fetch-retries=0'];
+  if (options.registry) {
+    args.push('--registry', options.registry);
+  }
+  return args;
+}
+
+/**
+ * One `npm view` reduced to the three outcomes. Exit 0 is a verdict, E404 is a
+ * verdict, a dead connection is not -- and the difference between the last two
+ * is the whole point: both used to leave here as "failed", so a reset packet
+ * ended a release that had nothing wrong with it.
+ */
+async function npmViewStatus(args: string[], options: NpmStatusOptions, shell: NpmStatusShell): Promise<DurableState> {
+  return probeWithTransportRetry(async () => {
+    const result = await shell.run(args, npmStatusEnv(options.userconfig, options.credential));
+    if (result.exitCode === 0) {
+      return { kind: 'exists' };
+    }
+    const output = `${result.stdout}\n${result.stderr}`;
+    if (NPM_NOT_FOUND.test(output)) {
+      return { kind: 'absent' };
+    }
+    const failure = npmCommandFailedMessage(args, result.exitCode, result.stdout, result.stderr);
+    if (isTransportFailure(output)) {
+      return undetermined(failure);
+    }
+    // A verdict this probe must not interpret: unauthorized, forbidden,
+    // unparseable. Retrying it is pointless and reading it as absent would
+    // publish over a version the registry refused to describe.
+    throw new Error(failure);
+  }, shell);
+}
+
+/**
+ * Whether the registry holds this exact version: the durable-state probe the
+ * publish and repair paths plan from.
+ */
+export async function npmPublishedVersionStatus(
+  root: string,
+  name: string,
+  version: string,
+  options: NpmStatusOptions = {},
+  shell: NpmStatusShell = npmProcessStatusShell(root),
+): Promise<DurableState> {
+  return npmViewStatus(npmViewArgs(`${name}@${version}`, 'version', options), options, shell);
+}
+
+/** Package-level existence on the same path. */
+export async function npmPackageStatus(
+  root: string,
+  name: string,
+  options: NpmStatusOptions = {},
+  shell: NpmStatusShell = npmProcessStatusShell(root),
+): Promise<DurableState> {
+  return npmViewStatus(npmViewArgs(name, 'name', options), options, shell);
+}
+
+/**
+ * Boolean view for callers that must decide now: absent is false, and an
+ * undetermined probe refuses the release rather than guessing. A caller that
+ * can do something better with a non-answer takes `npmPublishedVersionStatus`
+ * instead.
  */
 export async function npmPublishedVersionExists(
   root: string,
   name: string,
   version: string,
   options: NpmStatusOptions = {},
+  shell: NpmStatusShell = npmProcessStatusShell(root),
 ): Promise<boolean> {
-  const args = ['view', `${name}@${version}`, 'version', '--json', '--fetch-retries=0'];
-  if (options.registry) {
-    args.push('--registry', options.registry);
-  }
-  const result = await runResult('npm', args, root, npmStatusEnv(options.userconfig, options.credential));
-  if (result.exitCode === 0) {
-    return true;
-  }
-  if (/\bE404\b|404 Not Found/i.test(`${result.stdout}\n${result.stderr}`)) {
-    return false;
-  }
-  throw new Error(npmCommandFailedMessage(args, result.exitCode, result.stdout, result.stderr));
+  return requireDurableState(
+    await npmPublishedVersionStatus(root, name, version, options, shell),
+    `${name}@${version}`,
+    'whether this version is published on the npm registry',
+  );
 }
 
-/** Failure-aware package-level existence on the same path (E404-only absent). */
-export async function npmPackageExists(root: string, name: string, options: NpmStatusOptions = {}): Promise<boolean> {
-  const args = ['view', name, 'name', '--json', '--fetch-retries=0'];
-  if (options.registry) {
-    args.push('--registry', options.registry);
-  }
-  const result = await runResult('npm', args, root, npmStatusEnv(options.userconfig, options.credential));
-  if (result.exitCode === 0) {
-    return true;
-  }
-  if (/\bE404\b|404 Not Found/i.test(`${result.stdout}\n${result.stderr}`)) {
-    return false;
-  }
-  throw new Error(npmCommandFailedMessage(args, result.exitCode, result.stdout, result.stderr));
+export async function npmPackageExists(
+  root: string,
+  name: string,
+  options: NpmStatusOptions = {},
+  shell: NpmStatusShell = npmProcessStatusShell(root),
+): Promise<boolean> {
+  return requireDurableState(
+    await npmPackageStatus(root, name, options, shell),
+    name,
+    'whether this package exists on the npm registry',
+  );
 }
 
 export interface PrivateNpmPublishDiagnosticShell {

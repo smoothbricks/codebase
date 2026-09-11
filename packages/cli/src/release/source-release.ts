@@ -1,5 +1,6 @@
 import { join } from 'node:path';
 import { readPackageJson, readPackageJsonObject, repositoryInfo } from '../lib/workspace.js';
+import { type DurableState, undetermined } from './durable-state.js';
 import { resolvePrivateNpmRegistry } from './private-npm.js';
 
 export type SourceRepository =
@@ -187,14 +188,22 @@ function declaredRegistryHostsSource(sourceHost: string, root: string): boolean 
   return resolved.ok && new URL(resolved.value.registry).host === sourceHost;
 }
 
-export function forgejoReleaseLookupExists(status: number, body: string, tag: string): boolean {
+/**
+ * A Forgejo release lookup reduced to the three outcomes. A 5xx is the server
+ * saying it produced no verdict, which is a retryable non-answer rather than a
+ * refusal; 401/403 are verdicts and stay terminal.
+ */
+export function forgejoReleaseLookupStatus(status: number, body: string, tag: string): DurableState {
   if (status === 200) {
-    return true;
+    return { kind: 'exists' };
   }
   if (status === 404) {
-    return false;
+    return { kind: 'absent' };
   }
   const snippet = body.trim().slice(0, 500);
+  if (status >= 500) {
+    return undetermined(`GET release ${tag} answered HTTP ${status}${snippet ? `: ${snippet}` : ''}`);
+  }
   throw new Error(`Unable to inspect source release ${tag} (HTTP ${status}).${snippet ? `\n${snippet}` : ''}`);
 }
 

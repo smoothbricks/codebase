@@ -718,6 +718,14 @@ decide which tags still need work; it does not walk normal commits looking for r
    then publish those packages using the npm dist-tag implied by each package version. If the commit only needs GitHub
    Releases, skip the build. Finally, create the missing GitHub Releases for the grouped tags that need them.
 
+Both state queries have three answers, not two: the version is on npm or it is not, the GitHub Release exists or it does
+not, and the network may answer neither. The clients' own retry ladders stay off (npm gets `--fetch-retries=0`) so a
+genuine not-found costs exactly one request, while a failure that never reached a verdict — connection reset, DNS
+failure, timeout, 5xx — is retried up to three times with bounded backoff. When every attempt dies in transport the run
+refuses, naming the package, the version and the transport error, instead of guessing: read as missing it would
+republish a version that exists, and read as present it would skip one that does not. That refusal is a network
+failure, not a release failure — nothing was published or skipped by the query, so the run is safe to re-dispatch.
+
 Pending release state should be a suffix of the release-target timeline because `repair-pending` runs before every
 publish. Once a complete release target is reached, older targets are assumed complete; an observed gap in repair state
 violates the workflow invariant and should fail loudly instead of silently repairing history out of order.

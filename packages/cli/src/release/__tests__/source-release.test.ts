@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import {
   forgejoApiUrl,
   forgejoAuthHeaders,
-  forgejoReleaseLookupExists,
+  forgejoReleaseLookupStatus,
   parseSourceRepository,
   resolveSourceReleaseEndpoint,
   resolveSourceRepository,
@@ -99,19 +99,25 @@ describe('source release URLs and Forgejo protocol helpers', () => {
   });
 
   it('treats only 200 as found and 404 as absent', () => {
-    expect(forgejoReleaseLookupExists(200, '{"id":1}', 'v1')).toBe(true);
-    expect(forgejoReleaseLookupExists(404, '{"message":"not found"}', 'v1')).toBe(false);
+    expect(forgejoReleaseLookupStatus(200, '{"id":1}', 'v1')).toEqual({ kind: 'exists' });
+    expect(forgejoReleaseLookupStatus(404, '{"message":"not found"}', 'v1')).toEqual({ kind: 'absent' });
   });
 
-  it('throws with status and response details for unauthorized and unavailable responses', () => {
-    expect(() => forgejoReleaseLookupExists(401, '{"message":"unauthorized"}', 'v1')).toThrow(
+  it('throws with status and response details for an unauthorized response', () => {
+    expect(() => forgejoReleaseLookupStatus(401, '{"message":"unauthorized"}', 'v1')).toThrow(
       'Unable to inspect source release v1 (HTTP 401)',
     );
-    expect(() => forgejoReleaseLookupExists(401, '{"message":"unauthorized"}', 'v1')).toThrow('unauthorized');
-    expect(() => forgejoReleaseLookupExists(503, 'service unavailable', 'v1')).toThrow(
-      'Unable to inspect source release v1 (HTTP 503)',
-    );
-    expect(() => forgejoReleaseLookupExists(503, 'service unavailable', 'v1')).toThrow('service unavailable');
+    expect(() => forgejoReleaseLookupStatus(401, '{"message":"unauthorized"}', 'v1')).toThrow('unauthorized');
+  });
+
+  it('reports an unavailable forge as undetermined rather than a verdict', () => {
+    // 503 is the server saying it produced no answer. Read as absent it would
+    // recreate a release that exists; read as a refusal it ends a release the
+    // next attempt would have completed.
+    expect(forgejoReleaseLookupStatus(503, 'service unavailable', 'v1')).toMatchObject({
+      kind: 'undetermined',
+      detail: expect.stringContaining('service unavailable'),
+    });
   });
 });
 

@@ -5,7 +5,7 @@ import {
   createOrUpdateGithubRelease,
   DEPENDENCY_ONLY_RELEASE_NOTES,
   type GithubReleaseWriteShell,
-  githubReleaseLookupExists,
+  githubReleaseLookupStatus,
   nxProjectChangelogArgs,
   projectChangelogContents,
 } from '../github-release.js';
@@ -73,11 +73,24 @@ describe('GitHub release helpers', () => {
     expect(projectChangelogContents({ projectChangelogs: {} }, 'pkg')).toBe(DEPENDENCY_ONLY_RELEASE_NOTES);
   });
 
-  it('distinguishes missing releases from transient GitHub lookup failures', () => {
-    expect(githubReleaseLookupExists('pkg@1.2.3', 0, '{"tagName":"pkg@1.2.3"}', '')).toBe(true);
-    expect(githubReleaseLookupExists('pkg@1.2.3', 1, '', 'HTTP 404: release not found')).toBe(false);
-    expect(() => githubReleaseLookupExists('pkg@1.2.3', 1, '', 'HTTP 503: Service Unavailable')).toThrow(
-      'Unable to inspect GitHub Release pkg@1.2.3.\nHTTP 503: Service Unavailable',
+  it('distinguishes missing releases from unanswered GitHub lookups', () => {
+    expect(githubReleaseLookupStatus('pkg@1.2.3', 0, '{"tagName":"pkg@1.2.3"}', '')).toEqual({ kind: 'exists' });
+    expect(githubReleaseLookupStatus('pkg@1.2.3', 1, '', 'HTTP 404: release not found')).toEqual({ kind: 'absent' });
+    // A 5xx or a dropped connection is not a verdict: the caller retries it
+    // and, if it never resolves, refuses instead of recreating a release that
+    // may well exist.
+    expect(githubReleaseLookupStatus('pkg@1.2.3', 1, '', 'HTTP 503: Service Unavailable')).toMatchObject({
+      kind: 'undetermined',
+      detail: expect.stringContaining('HTTP 503'),
+    });
+    expect(
+      githubReleaseLookupStatus('pkg@1.2.3', 1, '', 'Get "https://api.github.com/repos": read tcp: connection reset'),
+    ).toMatchObject({ kind: 'undetermined' });
+  });
+
+  it('refuses a GitHub lookup the forge answered with a verdict it cannot read', () => {
+    expect(() => githubReleaseLookupStatus('pkg@1.2.3', 1, '', 'HTTP 401: Bad credentials')).toThrow(
+      'Unable to inspect GitHub Release pkg@1.2.3.\nHTTP 401: Bad credentials',
     );
   });
 

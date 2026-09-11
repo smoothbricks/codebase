@@ -88,9 +88,16 @@ import {
   releaseTagAliases,
 } from './core.js';
 import {
+  type DurableState,
+  probeWithTransportRetry,
+  requireDurableState,
+  transportFailureDetail,
+  undetermined,
+} from './durable-state.js';
+import {
   createOrUpdateGithubRelease,
   DEPENDENCY_ONLY_RELEASE_NOTES,
-  githubReleaseLookupExists,
+  githubReleaseLookupStatus,
   importWorkspaceNx,
   renderNxProjectChangelogContents,
   withNxWorkspaceRoot,
@@ -119,6 +126,7 @@ import {
   privateNpmPublishArgs,
   privateNpmTokenEnvForMode,
   publishPrivateWithDiagnostics,
+  type Result,
   selectPublishDestination,
   selectRegistryForPackage,
   withPrivateNpmUserconfig,
@@ -127,7 +135,7 @@ import { type RetagUnpublishedTagUpdate, retagUnpublished } from './retag-unpubl
 import {
   type CiForgeContext,
   forgejoAuthHeaders,
-  forgejoReleaseLookupExists,
+  forgejoReleaseLookupStatus,
   resolveSourceReleaseEndpoint,
   resolveSourceRepository,
   type SourceReleaseEndpoint,
@@ -1424,12 +1432,13 @@ async function createGithubRelease(root: string, pkg: ReleasePackage, dryRun: bo
   const contents = await renderNxProjectChangelogContents({ root, pkg, previousTag, dryRun });
   const endpoint = requireSourceReleaseEndpoint(source, root);
   console.log(`Forgejo release auth: using ${endpoint.envName} against ${new URL(endpoint.repositoryApi).origin}.`);
-  const releasePath = `/releases/tags/${encodeURIComponent(currentTag)}`;
-  const lookup = await fetch(`${endpoint.repositoryApi}${releasePath}`, {
-    headers: forgejoAuthHeaders(endpoint.token),
-  });
-  const lookupBody = await lookup.text();
-  const releaseExists = forgejoReleaseLookupExists(lookup.status, lookupBody, currentTag);
+  // The write below needs this lookup's own body (the release id lives in it),
+  // so this one is not retried here -- it refuses with the network diagnostic
+  // instead. The retrying probe is githubReleaseExists, which is what the
+  // repair and planning paths ask.
+  const lookup = await forgejoReleaseLookup(endpoint, currentTag);
+  const lookupBody = lookup.body;
+  const releaseExists = requireDurableState(lookup.probe, `release ${currentTag}`, SOURCE_RELEASE_QUESTION);
   if (!releaseExists) {
     const response = await fetch(`${endpoint.repositoryApi}/releases`, {
       method: 'POST',
@@ -1834,18 +1843,68 @@ async function pushRetaggedReleaseTags(
   await run('git', ['push', '--atomic', ...leases, remote, ...refspecs], root);
 }
 
+/** What the forge-release probe is asked, phrased for the refusal message. */
+const SOURCE_RELEASE_QUESTION = 'whether the source release already exists';
+
+/**
+ * The other half of the release's durable state, and the same three outcomes
+ * as the npm probe: a missing release must be created, an unreachable forge
+ * must not be guessed at. Both run in `repair-pending`'s state query, so a
+ * reset on either one used to end the run.
+ */
 async function githubReleaseExists(root: string, tag: string): Promise<boolean> {
   const source = resolveSourceRepository(root);
-  if (source.kind === 'github') {
-    const result = await $`gh release view ${tag} --json tagName`.cwd(root).quiet().nothrow();
-    return githubReleaseLookupExists(tag, result.exitCode, decode(result.stdout), decode(result.stderr));
+  const lookup: () => Promise<DurableState> =
+    source.kind === 'github'
+      ? () => ghReleaseLookup(root, tag)
+      : async () => (await forgejoReleaseLookup(requireSourceReleaseEndpoint(source, root), tag)).probe;
+  return requireDurableState(await probeWithTransportRetry(lookup), `release ${tag}`, SOURCE_RELEASE_QUESTION);
+}
+
+async function ghReleaseLookup(root: string, tag: string): Promise<DurableState> {
+  const result = await $`gh release view ${tag} --json tagName`.cwd(root).quiet().nothrow();
+  return githubReleaseLookupStatus(tag, result.exitCode, decode(result.stdout), decode(result.stderr));
+}
+
+interface SourceReleaseLookup {
+  probe: DurableState;
+  /** The response body, which the create/update path reads the release id from; empty when nothing arrived. */
+  body: string;
+}
+
+async function forgejoReleaseLookup(endpoint: SourceReleaseEndpoint, tag: string): Promise<SourceReleaseLookup> {
+  const url = `${endpoint.repositoryApi}/releases/tags/${encodeURIComponent(tag)}`;
+  const fetched = await fetchSourceRelease(url, endpoint.token);
+  if (!fetched.ok) {
+    return { probe: undetermined(`GET ${url} failed: ${fetched.error}`), body: '' };
   }
-  const endpoint = requireSourceReleaseEndpoint(source, root);
-  const response = await fetch(`${endpoint.repositoryApi}/releases/tags/${encodeURIComponent(tag)}`, {
-    headers: forgejoAuthHeaders(endpoint.token),
-  });
-  const body = await response.text();
-  return forgejoReleaseLookupExists(response.status, body, tag);
+  return {
+    probe: forgejoReleaseLookupStatus(fetched.value.status, fetched.value.body, tag),
+    body: fetched.value.body,
+  };
+}
+
+/**
+ * The response, or the transport failure that kept it from arriving. `fetch`
+ * rejects with `TypeError: fetch failed` and buries the reset in `cause`, so
+ * an unclassified rejection reaches the operator as three words that name
+ * neither the forge nor the fact that the run is safe to re-dispatch. A
+ * rejection that is not transport is a bug here and keeps propagating.
+ */
+async function fetchSourceRelease(
+  url: string,
+  token: string,
+): Promise<Result<{ status: number; body: string }, string>> {
+  try {
+    const response = await fetch(url, { headers: forgejoAuthHeaders(token) });
+    return { ok: true, value: { status: response.status, body: await response.text() } };
+  } catch (error) {
+    const detail = transportFailureDetail(error);
+    if (detail === null) {
+      throw error;
+    }
+    return { ok: false, error: detail };
+  }
 }
 
 function githubReleaseUrl(root: string, tag: string): string {
