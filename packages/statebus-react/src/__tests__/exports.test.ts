@@ -22,7 +22,7 @@ describe('StateBus React exports', () => {
 
   it('should export ManualStateBus for testing', () => {
     const bus = new ManualStateBus({
-      initialState: { counter: 0 },
+      initialState: { counter: 0, testRecords: () => undefined },
       reducers: {
         test: {
           increment: (state, payload) => {

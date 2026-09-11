@@ -14,6 +14,24 @@ export function sortedKeyValuePairs(props: Record<string, ViewPrimitiveProp>): [
   return Object.entries(props).sort(([k1], [k2]) => k1.localeCompare(k2));
 }
 
+/** Stable dependency identity, including absent props, null, numeric/string values and changing key sets. */
+export function viewPropsIdentity(props: ViewProps): string {
+  const primitive = (value: ViewPrimitiveProp) => [
+    typeof value,
+    typeof value === 'number' ? (Object.is(value, -0) ? '-0' : String(value)) : value,
+  ];
+  return JSON.stringify(
+    props !== null && typeof props === 'object'
+      ? [
+          'object',
+          Object.keys(props)
+            .sort()
+            .map((key) => [key, primitive(props[key])]),
+        ]
+      : ['primitive', primitive(props)],
+  );
+}
+
 export function computedPropsString(props: ViewProps): string {
   if (props === undefined || props === null) {
     return '';

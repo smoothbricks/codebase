@@ -4,12 +4,19 @@ import type {
   EventTypes,
   StateBus,
   StateByIDKey,
+  StateInterest,
   StateKeys,
   StatePropKey,
   StateValue,
   Topics,
 } from '@smoothbricks/statebus-core';
-import { computed, sortedKeyValuePairs, type ViewFunction, type ViewProps } from '@smoothbricks/statebus-core';
+import {
+  computed,
+  stateInterestKey,
+  type ViewFunction,
+  type ViewProps,
+  viewPropsIdentity,
+} from '@smoothbricks/statebus-core';
 import { isSignal, type Signal } from '@tldraw/state';
 import { useValue } from '@tldraw/state-react';
 import React, { useContext, useEffect, useMemo } from 'react';
@@ -28,28 +35,14 @@ function useBusSignal<T, SK extends StateKeys>(
   bus: StateBus,
   _viewId: string,
   signal: Signal<T, unknown>,
-  latestDataInterest: SK[],
+  latestDataInterest: readonly (SK | StateInterest<SK>)[],
 ): T {
-  /*---
-  // Awaiting answer why `useState` shouldn't work: https://github.com/tldraw/signia/issues/88
-  const [state, setState] = useState(signal.get());
-  
-  useEffect(() => {
-    const decrement = latestDataInterest ? bus.substateInterest(latestDataInterest) : undefined;
-    const unreact = react(viewId, () => setState(signal.get()));
-    return () => {
-      unreact();
-      decrement?.();
-    };
-  }, [bus, ...latestDataInterest]);
-  //---*/
-
   const value = useValue(signal);
-  // biome-ignore lint/correctness/useExhaustiveDependencies: latestDataInterest is used as spread
-  useEffect(
-    () => (latestDataInterest ? bus.substateInterest(latestDataInterest) : undefined),
-    [bus, ...latestDataInterest],
+  const interestIdentity = JSON.stringify(
+    latestDataInterest.map((interest) => stateInterestKey(typeof interest === 'string' ? { key: interest } : interest)),
   );
+  // biome-ignore lint/correctness/useExhaustiveDependencies: canonical identity covers exact key/ID values, not descriptor object identity
+  useEffect(() => bus.substateInterest(latestDataInterest), [bus, interestIdentity]);
 
   return value;
 }
@@ -57,17 +50,15 @@ function useBusSignal<T, SK extends StateKeys>(
 export function computedHook<SK extends StateKeys, Props extends ViewProps, R>(
   viewId: string,
   hook: ViewFunction<SK, Props, R>,
-  latestDataInterest?: SK[],
+  latestDataInterest?: readonly (SK | StateInterest<SK>)[] | ((props: Props) => readonly (SK | StateInterest<SK>)[]),
 ): (props: Props) => R {
   return (props) => {
     const bus = useStateBus();
-    const deps = useMemo(
-      () => (!props || typeof props !== 'object' ? [props, bus] : [bus, ...sortedKeyValuePairs(props)]),
-      [props, bus],
-    );
-    // biome-ignore lint/correctness/useExhaustiveDependencies: dynamic deps array
-    const signal = useMemo(() => computed(bus, viewId, hook, props), deps);
-    return useBusSignal(bus, viewId, signal, latestDataInterest ?? []);
+    const identity = viewPropsIdentity(props);
+    // biome-ignore lint/correctness/useExhaustiveDependencies: identity covers all primitive prop values and key names; equivalent props must retain the computed signal
+    const signal = useMemo(() => computed(bus, viewId, hook, props), [bus, identity]);
+    const interests = typeof latestDataInterest === 'function' ? latestDataInterest(props) : (latestDataInterest ?? []);
+    return useBusSignal(bus, viewId, signal, interests);
   };
 }
 
@@ -89,7 +80,7 @@ export function useSubstate<SK extends StateKeys>(key: SK, id?: string | number)
     signal = sub.get(id) as Signal<StateValue<SK>, unknown>;
   }
 
-  return useBusSignal(bus, key, signal, [key]);
+  return useBusSignal(bus, key, signal, [id === undefined ? { key } : { key, id }]);
 }
 
 type EventTypePublisher<

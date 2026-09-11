@@ -1,9 +1,10 @@
 import { describe, expect, it } from 'bun:test';
 import { MicrotaskStateBus } from '../microtask.js';
+import { initialTestState } from './test-state.js';
 
 function createBus() {
   return new MicrotaskStateBus({
-    initialState: { counter: 0, counter1: 0, counter2: 0 },
+    initialState: initialTestState(),
     reducers: { count: { increment: (state, amount) => state.counter.update((value) => value + amount) } },
   });
 }

@@ -1,8 +1,9 @@
 import { describe, expect, it } from 'bun:test';
 import { ManualStateBus } from '../manual.js';
 import type { Event, StateBusConfig } from '../types.js';
+import { initialTestState } from './test-state.js';
 
-const initialState = { counter: 0, counter1: 0, counter2: 0 };
+const initialState = initialTestState();
 
 function createBus(reducers: StateBusConfig['reducers'] = {}) {
   return new ManualStateBus({ initialState, reducers });
@@ -65,7 +66,7 @@ describe('state interest lifecycle', () => {
     bus.substateInterest(['counter']);
     bus.substateInterest(['counter1']);
     bus.dispatchEvents();
-    expect(observed).toEqual([{ subscribers: { counter: 1, counter1: 1 } }]);
+    expect(observed.map((payload) => payload.subscribers)).toEqual([{ counter: 1, counter1: 1 }]);
   });
 
   it('does not mutate the published events while coalescing', () => {
@@ -87,7 +88,7 @@ describe('state interest lifecycle', () => {
     bus.dispatchEvents();
     expect(first.payload.subscribers).toEqual({ counter: 1 });
     expect(second.payload.subscribers).toEqual({ counter1: 2 });
-    expect(observed).toEqual([{ subscribers: { counter: 1, counter1: 2 } }]);
+    expect(observed.map((payload) => payload.subscribers)).toEqual([{ counter: 1, counter1: 2 }]);
   });
 
   it('does not redispatch an interest event in a subsequent event wave', () => {
