@@ -1120,6 +1120,99 @@ describe('writeTemporaryConfig', () => {
   });
 });
 
+// The same project as FIXTURE/ROUTED_FIXTURE, in the format Cloudflare now recommends. The
+// deploy has to reach the same worker, the same routes and the same derived stage from it.
+const JSONC_FIXTURE = `{
+  // A worker whose stages are derived, written as JSONC.
+  "env": {
+    "staging": {
+      "name": "fixture-worker-staging",
+      "workers_dev": false,
+      "routes": [{ "pattern": "*.staging.example.test/*", "zone_name": "example.test" }],
+      "vars": { "ENVIRONMENT": "staging" },
+    },
+  },
+}
+`;
+
+describe('deployStage with a JSONC source config', () => {
+  it('deploys staging from wrangler.jsonc itself, with --env and no temporary file', async () => {
+    const root = await fixtureRoot(JSONC_FIXTURE, 'wrangler.jsonc');
+    const runner = new FakeRunner();
+    const cloudflare = new FakeCloudflare();
+    cloudflare.scripts = [{ id: 'fixture-worker-staging' }];
+    cloudflare.zones = [{ id: 'zone-1', name: 'example.test' }];
+
+    const result = await deployStage(root, { stage: 'staging' }, dependencies(runner, cloudflare));
+
+    expect(result).toMatchObject({ workerName: 'fixture-worker-staging', action: 'deployed' });
+    const deploy = requiredTestValue(
+      runner.calls.find((call) => call.args[0] === 'deploy'),
+      'deploy call',
+    );
+    expect(deploy.args.slice(0, 5)).toEqual(['deploy', '--config', join(root, 'wrangler.jsonc'), '--env', 'staging']);
+    expect(cloudflare.mutations).toEqual([
+      'create-dns:zone-1:*.staging.example.test:staging.example.test',
+      'create-route:zone-1:*.staging.example.test/*:fixture-worker-staging',
+    ]);
+    expect((await readdir(root)).filter((name) => name.startsWith('.wrangler.smoo-'))).toEqual([]);
+  });
+
+  it('derives a pull-request stage into a temporary JSON config beside the source', async () => {
+    const root = await fixtureRoot(JSONC_FIXTURE, 'wrangler.jsonc');
+    const runner = new FakeRunner();
+    const cloudflare = new FakeCloudflare();
+    cloudflare.zones = [{ id: 'zone-1', name: 'example.test' }];
+    let derivedConfig: Record<string, unknown> | undefined;
+    let derivedPath: string | undefined;
+    runner.onCall = async (args) => {
+      if (args[0] !== 'deploy') return;
+      derivedPath = args[args.indexOf('--config') + 1];
+      derivedConfig = JSON.parse(await readFile(derivedPath ?? '', 'utf8'));
+    };
+
+    const result = await deployStage(root, { stage: 'pr123' }, dependencies(runner, cloudflare));
+
+    expect(result).toMatchObject({ workerName: 'fixture-worker-pr123', action: 'deployed' });
+    // Wrangler picks its parser by extension, so the derived config is JSON whatever the source was.
+    expect(derivedPath?.startsWith(join(root, '.wrangler.smoo-'))).toBe(true);
+    expect(derivedPath?.endsWith('.json')).toBe(true);
+    expect(derivedConfig?.env).toEqual({
+      staging: {
+        name: 'fixture-worker-staging',
+        workers_dev: false,
+        routes: [{ pattern: '*.staging.example.test/*', zone_name: 'example.test' }],
+        vars: { ENVIRONMENT: 'staging' },
+      },
+      pr123: {
+        name: 'fixture-worker-pr123',
+        workers_dev: false,
+        routes: [{ pattern: '*.pr123.example.test/*', zone_name: 'example.test' }],
+        vars: { ENVIRONMENT: 'pr123' },
+      },
+    });
+    const deploy = requiredTestValue(
+      runner.calls.find((call) => call.args[0] === 'deploy'),
+      'deploy call',
+    );
+    expect(deploy.args.slice(3, 5)).toEqual(['--env', 'pr123']);
+    // The committed source is never rewritten, and the derived copy does not outlive the deploy.
+    expect(await readFile(join(root, 'wrangler.jsonc'), 'utf8')).toBe(JSONC_FIXTURE);
+    expect((await readdir(root)).filter((name) => name.startsWith('.wrangler.smoo-'))).toEqual([]);
+  });
+
+  it('refuses a project carrying two source configs before it reads either', async () => {
+    const root = await fixtureRoot(JSONC_FIXTURE, 'wrangler.jsonc');
+    await writeFile(join(root, 'wrangler.toml'), FIXTURE);
+    const cloudflare = new FakeCloudflare();
+
+    await expect(deployStage(root, { stage: 'staging' }, dependencies(new FakeRunner(), cloudflare))).rejects.toThrow(
+      `${root} declares more than one Wrangler configuration: wrangler.jsonc, wrangler.toml.`,
+    );
+    expect(cloudflare.mutations).toEqual([]);
+  });
+});
+
 /** Runs `action` with the variables set on this process, restoring the previous values afterwards. */
 async function withProcessEnv<T>(variables: Record<string, string>, action: () => Promise<T>): Promise<T> {
   const previous = Object.fromEntries(Object.keys(variables).map((name) => [name, process.env[name]]));
@@ -1134,10 +1227,10 @@ async function withProcessEnv<T>(variables: Record<string, string>, action: () =
   }
 }
 
-async function fixtureRoot(toml = FIXTURE): Promise<string> {
+async function fixtureRoot(config = FIXTURE, file = 'wrangler.toml'): Promise<string> {
   const root = await mkdtemp(join(tmpdir(), 'smoo-wrangler-test-'));
   roots.push(root);
-  await writeFile(join(root, 'wrangler.toml'), toml);
+  await writeFile(join(root, file), config);
   return root;
 }
 

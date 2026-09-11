@@ -615,7 +615,7 @@ function buildProgram(): Command {
   wrangler
     .command('deploy-stage')
     .requiredOption('--stage <stage>', 'staging, production, or prN')
-    .option('--config <path>', 'deploy a build-generated flat wrangler.json instead of ./wrangler.toml')
+    .option('--config <path>', "deploy a build-generated flat wrangler.json instead of the project's own config")
     .option('--version-endpoint <url>', 'URL served by this worker whose trimmed body is the running version tag')
     .action(async (options: { stage: string; config?: string; versionEndpoint?: string }) => {
       await deployStage(process.cwd(), {

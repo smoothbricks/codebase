@@ -1,6 +1,11 @@
 import { describe, expect, it } from 'bun:test';
-import { type FlatWranglerConfig, parseFlatWranglerConfig, planFlatStageResources } from './flat-config.js';
-import { type DerivePullRequestConfigOptions, derivePullRequestStageConfig, planPullRequestBindings } from './stage.js';
+import { type FlatWranglerConfig, parseFlatWranglerConfig } from './flat-config.js';
+import {
+  type DerivePullRequestConfigOptions,
+  derivePullRequestStageConfig,
+  planPullRequestBindings,
+  planStageResources,
+} from './stage.js';
 
 // The shape the Cloudflare Vite adapter emits for a site built with
 // CLOUDFLARE_ENV=staging: one flat document, ids already resolved.
@@ -181,9 +186,9 @@ describe('derivePullRequestStageConfig for a flat config', () => {
   });
 });
 
-describe('planFlatStageResources', () => {
+describe('planStageResources', () => {
   it('reads the bindings a reconcile needs from a flat config', () => {
-    const plan = planFlatStageResources(CONFIG, 'staging');
+    const plan = planStageResources(CONFIG, 'staging');
     expect(plan.workerName).toBe('site-preview-staging');
     expect(plan.kvNamespaces).toEqual([{ binding: 'SESSION', id: 'kv-staging' }]);
     expect(plan.r2Buckets).toEqual([{ binding: 'MEDIA', bucketName: 'site-media-staging' }]);

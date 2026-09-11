@@ -4,12 +4,10 @@
 // Cloudflare. It never provisions, never derives a pull-request stage's resources, and never
 // writes anything except its own cache entry.
 
-import { existsSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
-import { join } from 'node:path';
 import { parseJsonFileText } from '../lib/json.js';
 import { BunProcessRunner, type ProcessRunner, type ProcessRunOptions, wranglerJson } from './deploy-stage.js';
-import { parseFlatWranglerConfig, planFlatStageResources } from './flat-config.js';
+import { parseFlatWranglerConfig } from './flat-config.js';
 import {
   LIVE_VERSION_CACHE_TTL_MS,
   type LiveVersionProbe,
@@ -18,11 +16,13 @@ import {
   readLiveVersion,
   writeCachedLiveVersion,
 } from './live-version.js';
+import { readWranglerSourceConfig } from './source-config.js';
 import {
   type DeploymentStage,
   isPullRequestStage,
   parseDeploymentStage,
   planConfiguredStageResources,
+  planStageResources,
   stageResourceName,
   stagingWorkerBaseName,
 } from './stage.js';
@@ -64,16 +64,12 @@ export async function stageWorkerName(cwd: string, stage: DeploymentStage, confi
     const flat = parseJsonFileText(configPath, await readFile(configPath, 'utf8'), parseFlatWranglerConfig);
     return isPullRequestStage(stage)
       ? stageResourceName(stagingWorkerBaseName(flat.name), stage)
-      : planFlatStageResources(flat, stage).workerName;
+      : planStageResources(flat, stage).workerName;
   }
-  const tomlPath = join(cwd, 'wrangler.toml');
-  if (!existsSync(tomlPath)) {
-    throw new Error(`${tomlPath} does not exist; pass --config for a build-generated flat configuration.`);
-  }
-  const toml = await readFile(tomlPath, 'utf8');
+  const { document } = readWranglerSourceConfig(cwd);
   return isPullRequestStage(stage)
-    ? stageResourceName(stagingWorkerBaseName(planConfiguredStageResources(toml, 'staging').workerName), stage)
-    : planConfiguredStageResources(toml, stage).workerName;
+    ? stageResourceName(stagingWorkerBaseName(planConfiguredStageResources(document, 'staging').workerName), stage)
+    : planConfiguredStageResources(document, stage).workerName;
 }
 
 /**

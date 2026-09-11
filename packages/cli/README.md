@@ -782,7 +782,17 @@ Publish runs converge without self-spawning another workflow run.
 
 ### `smoo wrangler deploy-stage --stage <stage> [--config <path>]`
 
-Without `--config`, deploys `./wrangler.toml` with `--env <stage>`; a `prN` stage is derived from `[env.staging]`.
+Without `--config`, deploys the project's own source configuration with `--env <stage>`; a `prN` stage is derived from
+`[env.staging]`. The source configuration is discovered in wrangler's own precedence — `wrangler.jsonc`,
+`wrangler.json`, `wrangler.toml` — and the two JSON spellings are read with the JSONC parser wrangler uses for them, so
+comments and trailing commas are fine. A project carrying more than one of those files is refused by name: wrangler
+would read the first and ignore the rest without saying so, and that is how a repo ends up deploying a config nobody is
+editing.
+
+Both formats parse into one model, so a stage derives identically from either: the same plan, the same resources, the
+same refusals. The committed file is never rewritten. A `prN` stage's derived configuration is written beside it as a
+temporary `.wrangler.smoo-*.json` that the deploy deletes afterwards — JSON whichever format the source was, because
+wrangler selects its parser by extension and a file read once by a machine has no reader for comments.
 
 With `--config <path>` the target is a build-generated, env-block-free `wrangler.json` (what the Cloudflare Vite and
 Astro adapters emit). `staging` and `production` deploy it as-is, with no `--env` flag. A `prN` stage treats it as the

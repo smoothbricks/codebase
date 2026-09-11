@@ -1,7 +1,5 @@
 import { createHash } from 'node:crypto';
-import { getStaticTOMLValue, parseTOML } from 'toml-eslint-parser';
 import typia from 'typia';
-import { cloneEnvBlock } from './prepare-env.js';
 import { derivedStagingName, hasStageLabel, replaceExactToken, replaceHostnameLabel } from './stage-labels.js';
 
 export type DeploymentStage = 'staging' | 'production' | `pr${number}`;
@@ -53,23 +51,25 @@ export function hasExactStageSegment(value: string, stage: `pr${number}`): boole
   return new RegExp(`(?:^|[-.])${escaped}(?=$|[-.])`).test(value);
 }
 
-interface WranglerRoot {
+/**
+ * A whole Wrangler configuration as data — the one model both source formats parse into
+ * (`source-config.ts` owns the parsers). Nothing in this module reads configuration text, which
+ * is what makes a stage derive identically from `wrangler.toml` and from `wrangler.jsonc`.
+ */
+export interface WranglerDocument {
   env?: Record<string, WranglerEnvironment | undefined>;
-}
-
-interface WranglerEnvironment {
-  name?: unknown;
-  routes?: unknown;
-  kv_namespaces?: unknown;
-  r2_buckets?: unknown;
-  d1_databases?: unknown;
-  services?: unknown;
-  ratelimits?: unknown;
-  vars?: unknown;
-  send_email?: unknown;
   [key: string]: unknown;
 }
 
+/**
+ * One `env` block, still unparsed. `StageConfigFields` is the typed statement of what this
+ * module reads out of it; every other key is carried into a derived stage, never interpreted.
+ */
+export interface WranglerEnvironment {
+  [key: string]: unknown;
+}
+
+/** One reconciled binding of the plan: exactly what Cloudflare is asked about, and nothing else. */
 export interface KvBinding {
   binding: string;
   id: string;
@@ -79,23 +79,27 @@ export interface R2Binding {
   bucketName: string;
 }
 
-/** One-stage bindings that a TOML env block and a flat JSON config both present. */
-export interface StageConfigFields {
-  name: string;
-  routes?: StageRoute[];
-  vars?: Record<string, unknown>;
-  kv_namespaces?: KvBinding[];
-  r2_buckets?: { binding: string; bucket_name: string }[];
-  d1_databases?: StageD1Binding[];
-  services?: StageServiceBinding[];
-  ratelimits?: StageRateLimit[];
-  send_email?: Array<{ allowed_sender_addresses?: unknown; [key: string]: unknown }>;
-}
+// Configuration rows, as opposed to plan rows: the fields the derivation proves and rewrites,
+// plus every other key of the row carried verbatim. A route's `zone_id`, a KV binding's
+// `preview_id` and anything Cloudflare adds next survive into the derived config untouched.
 
 export interface StageRoute {
   pattern: string;
   zone_name?: string;
   custom_domain?: boolean;
+  [key: string]: unknown;
+}
+
+export interface StageKvBinding {
+  binding: string;
+  id: string;
+  [key: string]: unknown;
+}
+
+export interface StageR2Binding {
+  binding: string;
+  bucket_name: string;
+  [key: string]: unknown;
 }
 
 export interface StageD1Binding {
@@ -103,24 +107,40 @@ export interface StageD1Binding {
   database_name: string;
   database_id: string;
   migrations_dir?: string;
+  [key: string]: unknown;
 }
 
 export interface StageServiceBinding {
   binding: string;
   service: string;
   environment?: string;
+  [key: string]: unknown;
 }
 
 export interface StageRateLimit {
   name: string;
   namespace_id: string;
-  simple?: unknown;
+  [key: string]: unknown;
 }
 
-const isWranglerRoot = typia.createIs<WranglerRoot>();
+/** One-stage bindings that an env block and a flat JSON config both present. */
+export interface StageConfigFields {
+  name: string;
+  routes?: StageRoute[];
+  vars?: Record<string, unknown>;
+  kv_namespaces?: StageKvBinding[];
+  r2_buckets?: StageR2Binding[];
+  d1_databases?: StageD1Binding[];
+  services?: StageServiceBinding[];
+  ratelimits?: StageRateLimit[];
+  send_email?: Record<string, unknown>[];
+  [key: string]: unknown;
+}
+
 const isWranglerEnvironment = typia.createIs<WranglerEnvironment>();
 const isUnknownRecord = typia.createIs<Record<string, unknown>>();
 const isUnknownRows = typia.createIs<Record<string, unknown>[]>();
+const isRouteRows = typia.createIs<Array<string | Record<string, unknown>>>();
 
 export interface LiveKvNamespace {
   id: string;
@@ -157,35 +177,53 @@ export interface ConfiguredStageResourcePlan {
   routes: Array<{ pattern: string; zoneName?: string; customDomain: boolean }>;
 }
 
-export function planConfiguredStageResources(toml: string, stage: DeploymentStage): ConfiguredStageResourcePlan {
-  const block = parseRoot(toml).env?.[stage];
-  if (!isWranglerEnvironment(block)) {
-    throw new Error(`Wrangler configuration must declare [env.${stage}].`);
-  }
-  const workerName = requiredString(block, 'name', `[env.${stage}]`);
+/** The reconcile plan (`reconcileStageResources`) read off one resolved stage's bindings. */
+export function planStageResources(config: StageConfigFields, stage: DeploymentStage): ConfiguredStageResourcePlan {
   return {
     stage,
-    workerName,
-    kvNamespaces: readKvBindings(block.kv_namespaces),
-    r2Buckets: readR2Bindings(block.r2_buckets),
-    routes: readRoutes(block.routes),
+    workerName: config.name,
+    kvNamespaces: (config.kv_namespaces ?? []).map(({ binding, id }) => ({ binding, id })),
+    r2Buckets: (config.r2_buckets ?? []).map((bucket) => ({ binding: bucket.binding, bucketName: bucket.bucket_name })),
+    routes: (config.routes ?? []).map((route) => ({
+      pattern: route.pattern,
+      ...(typeof route.zone_name === 'string' ? { zoneName: route.zone_name } : {}),
+      customDomain: route.custom_domain === true,
+    })),
   };
 }
 
-function parseRoot(toml: string): WranglerRoot {
-  const value: unknown = getStaticTOMLValue(parseTOML(toml));
-  if (!isWranglerRoot(value)) {
-    throw new Error('Wrangler configuration is not a valid TOML environment document.');
-  }
-  return value;
+export function planConfiguredStageResources(
+  document: WranglerDocument,
+  stage: DeploymentStage,
+): ConfiguredStageResourcePlan {
+  return planStageResources(stageEnvironmentConfig(document, stage), stage);
 }
 
-function stagingEnvironment(toml: string): WranglerEnvironment {
-  const staging = parseRoot(toml).env?.staging;
-  if (!isWranglerEnvironment(staging)) {
-    throw new Error('Wrangler configuration must declare [env.staging].');
+/** The `env.<stage>` block as the stage model, or the refusal that it is not declared. */
+function stageEnvironmentConfig(document: WranglerDocument, stage: DeploymentStage): StageConfigFields {
+  const block = document.env?.[stage];
+  if (!isWranglerEnvironment(block)) {
+    throw new Error(`Wrangler configuration must declare [env.${stage}].`);
   }
-  return staging;
+  return environmentStageConfig(block, `[env.${stage}]`);
+}
+
+/**
+ * One env block as the stage model: every field the derivation reads proven present and typed,
+ * every other key carried verbatim. A field absent from the source stays absent, so the same
+ * worker written as TOML and as JSONC produces the same model down to the key set.
+ */
+function environmentStageConfig(environment: WranglerEnvironment, label: string): StageConfigFields {
+  const config: StageConfigFields = { ...environment, name: requiredString(environment, 'name', label) };
+  if (environment.routes !== undefined) config.routes = readStageRoutes(environment.routes);
+  if (isUnknownRecord(environment.vars)) config.vars = environment.vars;
+  if (environment.kv_namespaces !== undefined) config.kv_namespaces = readKvBindings(environment.kv_namespaces);
+  if (environment.r2_buckets !== undefined) config.r2_buckets = readR2Buckets(environment.r2_buckets);
+  if (environment.d1_databases !== undefined) config.d1_databases = readD1Bindings(environment.d1_databases);
+  if (environment.services !== undefined) config.services = readServices(environment.services);
+  if (environment.ratelimits !== undefined) config.ratelimits = readRateLimits(environment.ratelimits);
+  if (environment.send_email !== undefined) config.send_email = readRows(environment.send_email);
+  return config;
 }
 
 /** The staging worker name without its required `-staging` suffix. */
@@ -194,13 +232,6 @@ export function stagingWorkerBaseName(name: string): string {
     throw new Error(`Worker name ${name} must end with the exact suffix -staging.`);
   }
   return name.slice(0, -'-staging'.length);
-}
-
-function stagingWorkerName(staging: WranglerEnvironment): { workerName: string; workerBaseName: string } {
-  if (typeof staging.name !== 'string' || !staging.name) {
-    throw new Error('[env.staging] must declare a non-empty name.');
-  }
-  return { workerName: staging.name, workerBaseName: stagingWorkerBaseName(staging.name) };
 }
 
 /**
@@ -216,34 +247,15 @@ export function assertPullRequestRoutable(name: string, routes: StageRoute[] | u
   );
 }
 
-function stagingStageConfig(toml: string): StageConfigFields {
-  const staging = stagingEnvironment(toml);
-  const { workerName } = stagingWorkerName(staging);
-  return {
-    name: workerName,
-    routes: readStageRoutes(staging.routes),
-    ...(isUnknownRecord(staging.vars) ? { vars: staging.vars } : {}),
-    kv_namespaces: readKvBindings(staging.kv_namespaces),
-    r2_buckets: readRows(staging.r2_buckets).map((row) => {
-      const binding = requiredString(row, 'binding', 'R2 binding');
-      return { binding, bucket_name: requiredString(row, 'bucket_name', `R2 binding ${binding}`) };
-    }),
-    d1_databases: readD1Bindings(staging.d1_databases),
-    services: readServices(staging.services),
-    ratelimits: readRateLimits(staging.ratelimits),
-    send_email: readRows(staging.send_email),
-  };
-}
-
 export function planPullRequestResources(
-  toml: string,
+  document: WranglerDocument,
   stage: `pr${number}`,
   liveNamespaces: LiveKvNamespace[],
 ): PullRequestResourcePlan {
-  return planPullRequestBindings(stagingStageConfig(toml), stage, liveNamespaces);
+  return planPullRequestBindings(stageEnvironmentConfig(document, 'staging'), stage, liveNamespaces);
 }
 
-/** KV/R2/D1 isolation and route checks for a pull-request stage, shared by TOML and JSON. */
+/** KV/R2/D1 isolation and route checks for a pull-request stage, shared by every source format. */
 export function planPullRequestBindings(
   config: StageConfigFields,
   stage: `pr${number}`,
@@ -454,50 +466,22 @@ function requiredDerivedString(value: unknown): string {
   return value;
 }
 
-export function derivePullRequestWranglerConfig(toml: string, options: DerivePullRequestConfigOptions): string {
-  const ctx = deriveContext(stagingWorkerName(stagingEnvironment(toml)).workerName, options);
-  const cloned = cloneEnvBlock(toml, 'staging', ctx.stage);
-  const program = parseTOML(cloned);
-  const rootValue: unknown = getStaticTOMLValue(program);
-  if (!isWranglerRoot(rootValue)) {
-    throw new Error('Derived Wrangler configuration is not a valid environment document.');
+/**
+ * The whole document with `env.<prN>` added, derived from `env.staging`. Nothing read from disk
+ * is mutated — every level the derivation touches is rebuilt — so the committed source config is
+ * still exactly what the repo wrote once the deploy is done with it.
+ */
+export function derivePullRequestDocument(
+  document: WranglerDocument,
+  options: DerivePullRequestConfigOptions,
+): WranglerDocument {
+  if (document.env?.[options.stage] !== undefined) {
+    throw new Error(
+      `Wrangler configuration already declares [env.${options.stage}]; a pull-request stage is derived from [env.staging] and must not be committed.`,
+    );
   }
-  const root = rootValue;
-  const edits: Array<{ start: number; end: number; value: string }> = [];
-
-  for (const table of program.body[0].body) {
-    if (table.type !== 'TOMLTable' || table.resolvedKey[0] !== 'env' || table.resolvedKey[1] !== ctx.stage) {
-      continue;
-    }
-    const tableValue = valueAtPath(root, table.resolvedKey);
-    if (!isUnknownRecord(tableValue)) {
-      continue;
-    }
-    const section = typeof table.resolvedKey[2] === 'string' ? table.resolvedKey[2] : undefined;
-    if (section === 'routes') {
-      const pattern = tableValue.pattern;
-      if (typeof pattern === 'string' && !hasStageLabel(pattern)) {
-        edits.push({ start: table.range[0], end: table.range[1], value: '' });
-        continue;
-      }
-    }
-    const nearbyName = typeof tableValue.name === 'string' ? tableValue.name : undefined;
-    for (const keyValue of table.body) {
-      const key = cloned.slice(keyValue.key.range[0], keyValue.key.range[1]).trim();
-      const current = tableValue[key];
-      const next = deriveStageField(section, key, current, ctx, nearbyName);
-      if (next !== current) {
-        edits.push({ start: keyValue.value.range[0], end: keyValue.value.range[1], value: tomlLiteral(next) });
-      }
-    }
-  }
-
-  let derived = cloned;
-  for (const edit of edits.sort((left, right) => right.start - left.start)) {
-    derived = derived.slice(0, edit.start) + edit.value + derived.slice(edit.end);
-  }
-  parseTOML(derived);
-  return derived;
+  const derived = derivePullRequestStageConfig(stageEnvironmentConfig(document, 'staging'), options);
+  return { ...document, env: { ...document.env, [options.stage]: derived } };
 }
 
 export function rateLimitNamespaceId(
@@ -512,68 +496,57 @@ export function rateLimitNamespaceId(
   return String(value === 0 ? 1 : value);
 }
 
-function readKvBindings(value: unknown): KvBinding[] {
+/**
+ * Wrangler accepts a route as an object or as a bare pattern string. Both become the object form
+ * here, so one derivation rewrites the hostname label either way — a string route used to be
+ * carried into the pull-request stage verbatim, pointing it at staging's own hostname.
+ */
+function readStageRoutes(value: unknown): StageRoute[] {
+  if (!isRouteRows(value)) return [];
+  return value.map((row) =>
+    typeof row === 'string' ? { pattern: row } : { ...row, pattern: requiredString(row, 'pattern', 'route') },
+  );
+}
+
+function readKvBindings(value: unknown): StageKvBinding[] {
   return readRows(value).map((row) => ({
+    ...row,
     binding: requiredString(row, 'binding', 'KV namespace'),
     id: requiredString(row, 'id', 'KV namespace'),
   }));
 }
 
-function readR2Bindings(value: unknown): R2Binding[] {
+function readR2Buckets(value: unknown): StageR2Binding[] {
   return readRows(value).map((row) => {
     const binding = requiredString(row, 'binding', 'R2 binding');
-    return { binding, bucketName: requiredString(row, 'bucket_name', `R2 binding ${binding}`) };
+    return { ...row, binding, bucket_name: requiredString(row, 'bucket_name', `R2 binding ${binding}`) };
   });
 }
 
 function readD1Bindings(value: unknown): StageD1Binding[] {
   return readRows(value).map((row) => {
     const binding = requiredString(row, 'binding', 'D1 database');
-    const database: StageD1Binding = {
+    return {
+      ...row,
       binding,
       database_name: requiredString(row, 'database_name', `D1 binding ${binding}`),
       database_id: requiredString(row, 'database_id', `D1 binding ${binding}`),
     };
-    return typeof row.migrations_dir === 'string' ? { ...database, migrations_dir: row.migrations_dir } : database;
   });
 }
 
 function readServices(value: unknown): StageServiceBinding[] {
   return readRows(value).map((row) => {
     const binding = requiredString(row, 'binding', 'Service binding');
-    const service: StageServiceBinding = {
-      binding,
-      service: requiredString(row, 'service', `Service binding ${binding}`),
-    };
-    return typeof row.environment === 'string' ? { ...service, environment: row.environment } : service;
+    return { ...row, binding, service: requiredString(row, 'service', `Service binding ${binding}`) };
   });
 }
 
 function readRateLimits(value: unknown): StageRateLimit[] {
   return readRows(value).map((row) => {
     const name = requiredString(row, 'name', 'Rate-limit binding');
-    const limit: StageRateLimit = {
-      name,
-      namespace_id: requiredString(row, 'namespace_id', `Rate-limit binding ${name}`),
-    };
-    return row.simple === undefined ? limit : { ...limit, simple: row.simple };
+    return { ...row, name, namespace_id: requiredString(row, 'namespace_id', `Rate-limit binding ${name}`) };
   });
-}
-
-function readStageRoutes(value: unknown): StageRoute[] {
-  return readRows(value).map((row) => ({
-    pattern: requiredString(row, 'pattern', 'route'),
-    ...(typeof row.zone_name === 'string' ? { zone_name: row.zone_name } : {}),
-    ...(row.custom_domain === true ? { custom_domain: true } : {}),
-  }));
-}
-
-function readRoutes(value: unknown): Array<{ pattern: string; zoneName?: string; customDomain: boolean }> {
-  return readRows(value).map((row) => ({
-    pattern: requiredString(row, 'pattern', 'route'),
-    ...(typeof row.zone_name === 'string' ? { zoneName: row.zone_name } : {}),
-    customDomain: row.custom_domain === true,
-  }));
 }
 
 function readRows(value: unknown): Record<string, unknown>[] {
@@ -586,26 +559,4 @@ function requiredString(row: Record<string, unknown>, key: string, context: stri
     throw new Error(`${context} must declare a non-empty ${key}.`);
   }
   return value;
-}
-
-function valueAtPath(root: unknown, path: Array<string | number>): unknown {
-  let value = root;
-  for (const segment of path) {
-    if (typeof segment === 'number') {
-      if (!Array.isArray(value)) return undefined;
-      value = value[segment];
-    } else {
-      if (!isUnknownRecord(value)) return undefined;
-      value = value[segment];
-    }
-  }
-  return value;
-}
-
-function tomlLiteral(value: unknown): string {
-  if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean' || Array.isArray(value)) {
-    const literal = JSON.stringify(value);
-    if (literal !== undefined) return literal;
-  }
-  throw new Error(`Cannot materialize Wrangler TOML value of type ${typeof value}.`);
 }

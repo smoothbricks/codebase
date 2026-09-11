@@ -22,6 +22,7 @@ import { $ } from 'bun';
 import { type AST, getStaticTOMLValue, parseTOML } from 'toml-eslint-parser';
 import typia from 'typia';
 import { decode, printCommandOutput, runText } from '../lib/run.js';
+import { readWranglerSourceConfig } from './source-config.js';
 
 // ── runtime narrowing (wrangler TOML/JSON is external data — no casts) ───────
 
@@ -280,13 +281,14 @@ export function parseDevVarsExample(text: string): string[] {
 }
 
 /**
- * Read the vars/secrets split for `env` from `<root>/wrangler.toml` (public var
- * keys) + `<root>/.dev.vars.example` (secret names). This is the "what to prompt
- * for" manifest a prepare-env script derives its work from.
+ * Read the vars/secrets split for `env` from the project's own Wrangler configuration (public
+ * var keys) + `<root>/.dev.vars.example` (secret names). This is the "what to prompt for"
+ * manifest a prepare-env script derives its work from. The config may be JSONC, JSON or TOML —
+ * reading it is format-blind; the editors below are the TOML half of the flow.
  */
 export function readManifest(root: string, env: string): Manifest {
-  const toml = readFileSync(join(root, 'wrangler.toml'), 'utf8');
-  const block = envRecord(toml, env);
+  const declared: unknown = readWranglerSourceConfig(root).document.env?.[env];
+  const block = isWranglerEnvBlock(declared) ? declared : null;
   const vars = Object.keys(block?.vars ?? {});
   const kvBindings = (block?.kv_namespaces ?? []).flatMap((row) =>
     typeof row.binding === 'string' ? [row.binding] : [],

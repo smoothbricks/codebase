@@ -4,7 +4,7 @@ import { dirname, join } from 'node:path';
 import { parseJsonFileText } from '../lib/json.js';
 import { mergeEnv, printCommandOutput } from '../lib/run.js';
 import { type CloudflareClient, CloudflareRestClient, type D1DatabaseRecord } from './cloudflare.js';
-import { type FlatWranglerConfig, parseFlatWranglerConfig, planFlatStageResources } from './flat-config.js';
+import { type FlatWranglerConfig, parseFlatWranglerConfig } from './flat-config.js';
 import {
   awaitLiveVersion,
   awaitVersionEndpoint,
@@ -15,11 +15,12 @@ import {
   type VersionEndpointWaitOptions,
   writeCachedLiveVersion,
 } from './live-version.js';
+import { readWranglerSourceConfig } from './source-config.js';
 import {
   type ConfiguredStageResourcePlan,
   type DeploymentStage,
+  derivePullRequestDocument,
   derivePullRequestStageConfig,
-  derivePullRequestWranglerConfig,
   hasExactStageSegment,
   isPullRequestStage,
   type LiveKvNamespace,
@@ -28,6 +29,7 @@ import {
   planConfiguredStageResources,
   planPullRequestBindings,
   planPullRequestResources,
+  planStageResources,
   pullRequestStage,
 } from './stage.js';
 import {
@@ -99,7 +101,7 @@ export interface DeployStageResult {
 export interface DeployStageOptions {
   /** `staging`, `production`, or `prN`. */
   stage: string;
-  /** A build-generated flat wrangler.json to deploy instead of `./wrangler.toml` (see `prepareFlatConfig`). */
+  /** A build-generated flat wrangler.json to deploy instead of the project's own config (see `prepareFlatConfig`). */
   config?: string;
   /**
    * A URL, served by this worker, whose trimmed body is the running version tag. When given, the
@@ -137,7 +139,7 @@ export async function deployStage(
   try {
     const prepared = options.config
       ? await prepareFlatConfig(options.config, stage, accountId, gate, cloudflare)
-      : await prepareTomlConfig(cwd, stage, accountId, gate, cloudflare);
+      : await prepareSourceConfig(cwd, stage, accountId, gate, cloudflare);
     temporaryConfigPath = prepared.temporaryConfigPath;
     // The pull-request path already ran this before provisioning; the gate answers once per Worker.
     // Everything below here writes to Cloudflare.
@@ -234,44 +236,45 @@ interface PreparedConfig {
   deployConfigPath: string;
   temporaryConfigPath?: string;
   plan: ConfiguredStageResourcePlan;
-  /** D1 bindings whose migrations run before the deploy (flat configs only; TOML deploys keep migrations out of scope). */
+  /** D1 bindings whose migrations run before the deploy (flat configs only; source configs keep migrations out of scope). */
   d1MigrationBindings: string[];
-  /** `--env <stage>` for TOML configs with env blocks; a flat config is already resolved, so no flag. */
+  /** `--env <stage>` for a source config with env blocks; a flat config is already resolved, so no flag. */
   envFlag?: DeploymentStage;
 }
 
-async function prepareTomlConfig(
+/**
+ * The project's own `wrangler.jsonc`/`wrangler.json`/`wrangler.toml`, whichever it declares.
+ * Format stops mattering at `readWranglerSourceConfig`: everything below derives from the model.
+ */
+async function prepareSourceConfig(
   cwd: string,
   stage: DeploymentStage,
   accountId: string,
   gate: SecretGate,
   cloudflare: CloudflareClient,
 ): Promise<PreparedConfig> {
-  const committedConfigPath = join(cwd, 'wrangler.toml');
-  const committedToml = await readFile(committedConfigPath, 'utf8');
+  const source = readWranglerSourceConfig(cwd);
   if (!isPullRequestStage(stage)) {
     return {
-      deployConfigPath: committedConfigPath,
-      plan: planConfiguredStageResources(committedToml, stage),
+      deployConfigPath: source.path,
+      plan: planConfiguredStageResources(source.document, stage),
       d1MigrationBindings: [],
       envFlag: stage,
     };
   }
   const liveNamespaces = await cloudflare.listKvNamespaces();
-  const plan = planPullRequestResources(committedToml, stage, liveNamespaces);
+  const plan = planPullRequestResources(source.document, stage, liveNamespaces);
   const { kvNamespaceIds, d1DatabaseIds } = await provisionPullRequestResources(plan, gate, cloudflare, liveNamespaces);
-  const derivedToml = derivePullRequestWranglerConfig(committedToml, {
-    stage,
-    accountId,
-    kvNamespaceIds,
-    d1DatabaseIds,
-  });
-  const temporaryConfigPath = join(cwd, `.wrangler.smoo-${process.pid}-${randomUUID()}.toml`);
-  await writeTemporaryConfig(temporaryConfigPath, derivedToml);
+  const derived = derivePullRequestDocument(source.document, { stage, accountId, kvNamespaceIds, d1DatabaseIds });
+  // JSON whatever the source format was: wrangler picks its parser by extension, and a file
+  // written to be read once and deleted has no reader for the comments a TOML rewrite preserved.
+  // Beside the original, because its main/assets/migrations paths are relative to the file.
+  const temporaryConfigPath = join(dirname(source.path), `.wrangler.smoo-${process.pid}-${randomUUID()}.json`);
+  await writeTemporaryConfig(temporaryConfigPath, `${JSON.stringify(derived, null, 2)}\n`);
   return {
     deployConfigPath: temporaryConfigPath,
     temporaryConfigPath,
-    plan: planConfiguredStageResources(derivedToml, stage),
+    plan: planConfiguredStageResources(derived, stage),
     d1MigrationBindings: [],
     envFlag: stage,
   };
@@ -288,7 +291,7 @@ async function prepareFlatConfig(
   if (!isPullRequestStage(stage)) {
     return {
       deployConfigPath: configPath,
-      plan: planFlatStageResources(flat, stage),
+      plan: planStageResources(flat, stage),
       d1MigrationBindings: migrationBindings(flat),
     };
   }
@@ -302,7 +305,7 @@ async function prepareFlatConfig(
   return {
     deployConfigPath: temporaryConfigPath,
     temporaryConfigPath,
-    plan: planFlatStageResources(derived, stage),
+    plan: planStageResources(derived, stage),
     d1MigrationBindings: migrationBindings(derived),
   };
 }
