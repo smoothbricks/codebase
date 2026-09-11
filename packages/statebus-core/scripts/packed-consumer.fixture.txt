@@ -1,0 +1,135 @@
+import * as core from '@smoothbricks/statebus-core';
+import * as react from '@smoothbricks/statebus-react';
+import {
+  createByteProgressReporter,
+  initialLoadState,
+  type LoaderChannel,
+  type LoaderEvent,
+  type LoadState,
+  loadFingerprint,
+  loadRequestId,
+  reduceByteProgress,
+  reduceLoadState,
+  statebusInterestSource,
+} from '@smoothbricks/statebus-data-loader';
+import { installTanStackQueryLoader } from '@smoothbricks/statebus-tanstack-query';
+import {
+  connectNavigation,
+  createMemoryNavigation,
+  initialNavigationState,
+  type NavigationChannel,
+  type NavigationEvent,
+  type NavigationState,
+  navigationRequestId,
+  reduceNavigation,
+} from '@smoothbricks/statebus-navigation-core';
+import { createBrowserNavigation, planBrowserNavigation } from '@smoothbricks/statebus-navigation-browser';
+import { QueryClient } from '@tanstack/query-core';
+
+function check(value: unknown, message: string): asserts value {
+  if (!value) throw new Error(message);
+}
+type Data = LoadState<number, { code: 'failed' }>;
+type Load = LoaderEvent<number, { code: 'failed' }>;
+type Navigation = NavigationEvent<string, string>;
+declare module '@smoothbricks/statebus-core' {
+  interface States {
+    'packed.data': core.ByID<Data>;
+    'packed.navigation': NavigationState<string, string>;
+  }
+  interface Events {
+    packed: { load: Load; navigation: Navigation };
+  }
+}
+check(core.MicrotaskStateBus === react.MicrotaskStateBus, 'React must use the packed core runtime.');
+check(react.StateBus === react.AnimationFrameStateBus, 'Existing animation-frame alias must remain compatible.');
+check(typeof react.StatebusProvider === 'object', 'React provider export is missing.');
+check(typeof createBrowserNavigation === 'function', 'Browser package must import without a Window.');
+const encoded = core.stateInterestKey({ key: 'packed.data', id: 7 });
+check(encoded !== core.stateInterestKey({ key: 'packed.data', id: '7' }), 'ID types collided.');
+const batch = new core.StateInterestBatch();
+batch.append([{ interest: { key: 'packed.data', id: 7 }, subscribers: 1 }]);
+batch.append([{ interest: { key: 'packed.data', id: 7 }, subscribers: 0 }]);
+check(batch.take()[0]?.subscribers === 0, 'Terminal zero was lost.');
+check(core.sameViewProps({ id: 7 }, { id: 7 }), 'Equal view bindings must be reusable.');
+check(!core.sameViewProps({ id: 7 }, { id: '7' }), 'View identity must not coerce values.');
+
+const bus = new core.ManualStateBus({
+  initialState: {
+    'packed.data': () => initialLoadState<number, { code: 'failed' }>(),
+    'packed.navigation': initialNavigationState<string, string>('/'),
+  },
+  reducers: {
+    packed: {
+      load(state, event) {
+        const id = event.request.interest.id;
+        if (id === undefined) throw new Error('The packed resource must have an ID.');
+        const slot = state['packed.data'].get(id);
+        slot.set(reduceLoadState(slot.get() ?? initialLoadState(), event));
+      },
+      navigation(state, event) {
+        const slot = state['packed.navigation'];
+        slot.set(reduceNavigation(slot.get(), event));
+      },
+    },
+  },
+});
+const loads: LoaderChannel<number, { code: 'failed' }> = {
+  read: (interest) => bus.state['packed.data'].get(interest.id ?? '').get() ?? initialLoadState(),
+  publish: (event) => { bus.publish({ topic: 'packed', type: 'load', payload: event }); },
+  subscribe: (listen) => bus.subscribe('packed', 'load', (event) => listen(event.payload)),
+};
+const query = new QueryClient({ defaultOptions: { queries: { retry: false, gcTime: Infinity } } });
+let executed = 0;
+const stopLoader = installTanStackQueryLoader({
+  channel: loads,
+  queryClient: query,
+  interests: statebusInterestSource(bus),
+  matches: (interest) => interest.key === 'packed.data',
+  requestId: () => loadRequestId('packed-request'),
+  fingerprint: () => loadFingerprint('packed-resource'),
+  now: () => 1,
+  failure: () => ({ code: 'failed' as const }),
+  query: () => ({
+    queryKey: ['packed', 'resource'],
+    execute: async ({ reportBytes }) => {
+      executed += 1;
+      reportBytes('download', 8, 8);
+      return 42;
+    },
+  }),
+});
+const releaseInterest = bus.substateInterest([{ key: 'packed.data', id: 7 }]);
+bus.dispatchEvents();
+await new Promise((resolve) => setTimeout(resolve, 0));
+bus.dispatchEvents();
+const loaded = loads.read({ key: 'packed.data', id: 7 });
+check(loaded.kind === 'ready' && loaded.data.value === 42 && executed === 1, 'Packed QueryClient pipeline failed.');
+releaseInterest();
+bus.dispatchEvents();
+stopLoader();
+query.clear();
+
+const nav: NavigationChannel<string, string> = {
+  read: () => bus.state['packed.navigation'].get(),
+  publish: (event) => { bus.publish({ topic: 'packed', type: 'navigation', payload: event }); },
+  subscribe: (listen) => bus.subscribe('packed', 'navigation', (event) => listen(event.payload)),
+};
+const stopNavigation = connectNavigation({ channel: nav, driver: createMemoryNavigation({ entries: ['/'], equal: Object.is }) });
+nav.publish({ type: 'navigationRequested', request: { requestId: navigationRequestId('packed-nav'), intent: { kind: 'push', to: '/billing' } } });
+bus.dispatchEvents();
+check(nav.read().location === '/billing' && nav.read().operation.kind === 'idle', 'Packed navigation pipeline failed.');
+stopNavigation();
+check(planBrowserNavigation({ kind: 'push', to: '/billing?tab=plans' }, 'https://example.test/').kind === 'write', 'Browser planner export failed.');
+check(planBrowserNavigation({ kind: 'go', delta: 2 ** 32 }, 'https://example.test/').kind === 'failed', 'Unsafe traversal delta admitted.');
+
+const sample = { direction: 'download' as const, transferred: 8, total: 8 };
+const progress = reduceByteProgress({ attempt: 1 }, 1, sample);
+check(reduceByteProgress(progress, 1, sample) === progress, 'Duplicate progress allocated new state.');
+let reported = 0;
+const reporter = createByteProgressReporter({ intervalMs: 100, timer: { after: () => () => {} }, emit: (value) => { reported = value.transferred; } });
+reporter.report(sample);
+reporter.flush();
+reporter.dispose();
+check(reported === 8, 'Reporter export failed.');
+console.log('Six packed packages: declarations, exports, exact interest, QueryClient lifecycle and navigation passed.');

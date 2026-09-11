@@ -1,0 +1,53 @@
+name: StateBus package contracts
+on:
+  pull_request:
+    paths:
+      - 'packages/statebus-*/**'
+      - 'bun.lock'
+      - 'package.json'
+      - 'tsconfig*.json'
+      - '.github/workflows/statebus-packages.yml'
+      - '.github/actions/setup-devenv/**'
+  push:
+    branches: [main]
+    paths:
+      - 'packages/statebus-*/**'
+      - 'bun.lock'
+      - 'package.json'
+      - 'tsconfig*.json'
+      - '.github/workflows/statebus-packages.yml'
+      - '.github/actions/setup-devenv/**'
+permissions:
+  contents: read
+concurrency:
+  group: statebus-packages-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  consumer:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v6.0.2
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-devenv
+      - name: Verify frozen dependencies
+        run: bun install --frozen-lockfile
+      - name: Build and verify actual packed consumers
+        run: nx run statebus-core:verify-packages --output-style=static
+      - name: Record tracked source and revision for reproducible verification
+        if: always()
+        run: |
+          mkdir -p .cache/statebus-packages
+          git archive HEAD | gzip > .cache/statebus-packages/source.tar.gz
+          git rev-parse HEAD > .cache/statebus-packages/revision.txt
+      - uses: actions/upload-artifact@v7.0.1
+        if: always()
+        with:
+          name: statebus-package-contracts
+          path: .cache/statebus-packages/*
+          include-hidden-files: true
+          retention-days: 14
+          if-no-files-found: error
