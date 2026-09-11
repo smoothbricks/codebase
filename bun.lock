@@ -50,7 +50,7 @@
     },
     "packages/cli": {
       "name": "@smoothbricks/cli",
-      "version": "0.11.21",
+      "version": "0.11.22-next.0",
       "bin": {
         "smoo": "./bin/smoo",
       },
@@ -215,7 +215,7 @@
     },
     "packages/nx-plugin": {
       "name": "@smoothbricks/nx-plugin",
-      "version": "0.4.15",
+      "version": "0.4.16-next.0",
       "bin": {
         "smoo-nx-exec": "./dist/bin/smoo-nx-exec.js",
         "smoo-nx-cargo-hash": "./dist/bin/smoo-nx-cargo-hash.js",
