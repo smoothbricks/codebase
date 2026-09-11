@@ -31,6 +31,7 @@ import { repositoryOwnerFromUrl, repositorySecretMapping } from '../lib/secret-n
 import { readPackageJsonObject, repositoryInfo } from '../lib/workspace.js';
 import { parseDevVarsExample } from '../wrangler/prepare-env.js';
 import { readSecretStageMap, type SecretStageMap } from '../wrangler/stage-secrets.js';
+import { type GroupedSecret, readSecretGroups } from './resolver.js';
 
 /** Env names the managed workflows pass into a job, from the declarations that render them. */
 export function workflowSecretNames(root: string): string[] {
@@ -176,10 +177,22 @@ export function workerSecretStages(
   return { ok: true, byWorker };
 }
 
-/** Names `smoo.secrets` declares a fetch command for. */
-export function localSecretCommandNames(root: string): string[] {
-  const manifest = readPackageJsonObject(join(root, 'package.json'));
-  return Object.keys(manifest?.smoo?.secrets ?? {}).sort((left, right) => left.localeCompare(right));
+/**
+ * Every `smoo.secrets` entry with the group that resolves it, sorted by name,
+ * or a refusal naming the declaration that could not be read. The groups come
+ * from ./resolver.ts — the same file shell entry routes with — so a status
+ * table and a `smoo secrets run` cannot disagree about which group resolves
+ * a name.
+ */
+export async function localSecretGroups(
+  root: string,
+): Promise<{ ok: true; secrets: GroupedSecret[] } | { ok: false; reason: string }> {
+  try {
+    const secrets = await readSecretGroups(root);
+    return { ok: true, secrets: secrets.sort((left, right) => left.name.localeCompare(right.name)) };
+  } catch (error) {
+    return { ok: false, reason: error instanceof Error ? error.message : String(error) };
+  }
 }
 
 /**

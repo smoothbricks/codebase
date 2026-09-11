@@ -4,7 +4,13 @@ import { mkdir, rmdir, stat } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import path from 'node:path';
 import { $ } from 'bun';
-import { maskSecretValues, resolveSecretEnvironment } from './secret-references.ts';
+import {
+  type DeferredSecret,
+  dependentGroups,
+  maskSecretValues,
+  resolveSecretEnvironment,
+  SHELL_GROUP,
+} from './secret-references.ts';
 
 // DEVENV_ROOT is set by the devenv shell, which is how this script normally
 // runs. CI jobs that install dependencies without building that shell (the
@@ -31,6 +37,15 @@ class CapturedCommandError extends Error {
 // const declared further down would report a temporal-dead-zone error instead
 // of the failure it was called to report.
 const resolvedSecretValues: string[] = [];
+
+// The declared secrets shell entry deliberately did NOT resolve — see THE
+// RULE in secret-references.ts: shell entry resolves the `shell` group and
+// nothing else. Nonempty only when this repository declares a secret in
+// another group that is absent from this environment. An installed checkout
+// contacts no registry and Nx needs no cache to run, so this stays silent;
+// it is printed by reportDegradedSetup, where an install has already failed
+// and a 401 is one of the things it might have been.
+const deferredSecrets: DeferredSecret[] = [];
 
 async function resolveProjectRoot(): Promise<string> {
   if (devenvRoot) {
@@ -145,12 +160,22 @@ try {
  * scripts it runs, and every later child of this script inherit them (for
  * example .npmrc `${VAR}` auth); the direnv shell itself does not, which is
  * the point: this script must never act as a global shell export.
+ *
+ * `shell` is the group, and it is what keeps a credential only a deliberate
+ * command needs — a registry token, the Nx cache token — from running its
+ * provider command on every direnv reload. Such a variable comes back
+ * deferred instead of resolved, and an install proceeds without it — which
+ * is the normal case, because an installed checkout contacts no registry.
+ * The install that does need one fails, and reportDegradedSetup then names
+ * the variable and the exact command that supplies it.
  */
 async function resolveSecrets(): Promise<void> {
-  for (const [name, value] of Object.entries(await resolveSecretEnvironment({ root: projectRoot }))) {
+  const resolution = await resolveSecretEnvironment({ root: projectRoot, group: SHELL_GROUP });
+  for (const [name, value] of Object.entries(resolution.values)) {
     process.env[name] = value;
     resolvedSecretValues.push(value);
   }
+  deferredSecrets.push(...resolution.deferred);
 }
 
 async function installLocalDependencies(): Promise<unknown> {
@@ -416,12 +441,43 @@ function reportSetupFailure(error: unknown): never {
 
 function reportDegradedSetup(error: unknown): void {
   describeFailure('WARNING', error);
+  reportDeferredSecrets();
   console.error(
     'The shell is loaded WITHOUT installed dependencies so the tools to repair this stay available.\n' +
       'Fix the cause above (missing registry credential, unpublished package, stale lockfile → `devenv update`),\n' +
       'then run `bun install` or `direnv reload`.',
   );
   console.error('---');
+}
+
+/**
+ * The declared secrets this shell entry deliberately did not resolve, named
+ * now that an install has actually failed. Printing them on a healthy shell
+ * entry would be noise on every reload — an installed checkout contacts no
+ * registry and needs none of them — while an install that failed may be
+ * exactly the 401 they explain, and then the useful output is the variable
+ * and the command that supplies it.
+ */
+function reportDeferredSecrets(): void {
+  if (deferredSecrets.length === 0) {
+    return;
+  }
+  console.error('Secrets outside the `shell` group are not resolved at shell entry, by design:');
+  for (const secret of deferredSecrets) {
+    console.error(`- ${secret.name} (${secret.group}): ${secret.guidance}`);
+  }
+  // Only a group the install itself reads can explain this failure, and only
+  // for those is re-running the install the command worth printing. A group
+  // nothing here consumes — the Nx cache token — is listed above and left
+  // alone: it did not cause this and re-running the install with it would
+  // not fix it.
+  for (const group of dependentGroups(SHELL_GROUP)) {
+    if (!deferredSecrets.some((secret) => secret.group === group)) {
+      continue;
+    }
+    console.error(`The install reads group \`${group}\`; supply it to exactly that one command with:`);
+    console.error(`  smoo secrets run ${group} bun install`);
+  }
 }
 
 function describeFailure(level: 'ERROR' | 'WARNING', error: unknown): void {

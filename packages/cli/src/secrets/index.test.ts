@@ -12,7 +12,7 @@ const sources = {
     'targets/mail': ['MAIL_CAPTURE_CONTROL_TOKEN'],
   },
   workflowSecrets: ['MAIL_CAPTURE_CONTROL_TOKEN', 'STRIPE_PUBLISHABLE_KEY', 'STRIPE_SECRET_KEY'],
-  localCommands: ['NPM_READ_TOKEN'],
+  localSecrets: [{ name: 'NPM_READ_TOKEN', group: 'registry', derivedGroup: 'registry' }],
   secretNames: {
     STRIPE_PUBLISHABLE_KEY: 'STRIPE_PUBLISHABLE_KEY',
     STRIPE_SECRET_KEY: 'STRIPE_SECRET_KEY',
@@ -78,7 +78,7 @@ describe('secret reconciliation', () => {
       workerSecrets: { 'targets/backend': ['GITHUB_CLIENT_SECRET'] },
       workflowSecrets: ['GITHUB_CLIENT_SECRET'],
       secretNames: repositorySecretMapping(['GITHUB_CLIENT_SECRET'], 'acme'),
-      localCommands: [],
+      localSecrets: [],
       repositorySecrets: ['ACME_GITHUB_CLIENT_SECRET'],
     });
 

@@ -25,8 +25,15 @@ export interface SecretRow {
   declaredByWorkers: string[];
   /** True when a managed workflow renders `secrets.<name>` into a job. */
   suppliedByWorkflow: boolean;
-  /** True when `smoo.secrets` can fetch it for a developer shell. */
+  /** True when `smoo.secrets` can fetch it for a developer shell; equivalently, `localGroup` is set. */
   fetchableLocally: boolean;
+  /**
+   * How `smoo.secrets` resolves it locally: the group that resolves it, and
+   * the group this repository's own declarations derive. They differ exactly
+   * when the entry overrides the derivation, which is the one thing a reader
+   * must never have to infer. Absent when nothing fetches the name locally.
+   */
+  localGroup?: { resolves: string; derived: string };
   /** True when the repository holds a secret of this name. */
   onRepository: boolean;
   /**
@@ -38,6 +45,18 @@ export interface SecretRow {
   heldByEnvironment: string[];
 }
 
+/**
+ * One `smoo.secrets` entry as the reconciliation needs it: the name, the
+ * group that resolves it, and the group this repository's declarations
+ * derive. ../secrets/resolver.ts produces these from the same file shell
+ * entry routes with.
+ */
+export interface LocalSecret {
+  name: string;
+  group: string;
+  derivedGroup: string;
+}
+
 export interface SecretSources {
   /** Worker label -> env names it declares. */
   workerSecrets: Record<string, readonly string[]>;
@@ -45,8 +64,8 @@ export interface SecretSources {
   workflowSecrets: readonly string[];
   /** Env name -> repository secret, by convention with declared exceptions. */
   secretNames: Readonly<Record<string, string>>;
-  /** Env names `smoo.secrets` can fetch locally. */
-  localCommands: readonly string[];
+  /** Every `smoo.secrets` entry with the group that resolves it. */
+  localSecrets: readonly LocalSecret[];
   /** Repository secret names GitHub currently holds. */
   repositorySecrets: readonly string[];
   /** Environment name -> secret names that environment holds. */
@@ -59,7 +78,8 @@ export interface SecretSources {
  */
 export function reconcileSecrets(sources: SecretSources): SecretRow[] {
   const declaredByAnyWorker: string[] = Object.values(sources.workerSecrets).flatMap((names) => [...names]);
-  const names = new Set<string>([...declaredByAnyWorker, ...sources.workflowSecrets, ...sources.localCommands]);
+  const localSecrets = new Map(sources.localSecrets.map((secret) => [secret.name, secret]));
+  const names = new Set<string>([...declaredByAnyWorker, ...sources.workflowSecrets, ...localSecrets.keys()]);
   // A repository secret that already carries a known env name is that name's
   // row, not a row of its own: listing ACME_GITHUB_CLIENT_SECRET beside
   // GITHUB_CLIENT_SECRET would report one value as two secrets, one of them
@@ -78,21 +98,25 @@ export function reconcileSecrets(sources: SecretSources): SecretRow[] {
   }
   return [...names]
     .sort((left, right) => left.localeCompare(right))
-    .map((name) => ({
-      name,
-      repositorySecret: sources.secretNames[name] ?? name,
-      declaredByWorkers: Object.entries(sources.workerSecrets)
-        .filter(([, declared]) => declared.includes(name))
-        .map(([label]) => label)
-        .sort((left, right) => left.localeCompare(right)),
-      suppliedByWorkflow: sources.workflowSecrets.includes(name),
-      fetchableLocally: sources.localCommands.includes(name),
-      onRepository: sources.repositorySecrets.includes(sources.secretNames[name] ?? name),
-      heldByEnvironment: Object.entries(sources.environmentSecrets ?? {})
-        .filter(([, held]) => held.includes(sources.secretNames[name] ?? name))
-        .map(([environment]) => environment)
-        .sort((left, right) => left.localeCompare(right)),
-    }));
+    .map((name) => {
+      const local = localSecrets.get(name);
+      return {
+        name,
+        repositorySecret: sources.secretNames[name] ?? name,
+        declaredByWorkers: Object.entries(sources.workerSecrets)
+          .filter(([, declared]) => declared.includes(name))
+          .map(([label]) => label)
+          .sort((left, right) => left.localeCompare(right)),
+        suppliedByWorkflow: sources.workflowSecrets.includes(name),
+        fetchableLocally: local !== undefined,
+        ...(local === undefined ? {} : { localGroup: { resolves: local.group, derived: local.derivedGroup } }),
+        onRepository: sources.repositorySecrets.includes(sources.secretNames[name] ?? name),
+        heldByEnvironment: Object.entries(sources.environmentSecrets ?? {})
+          .filter(([, held]) => held.includes(sources.secretNames[name] ?? name))
+          .map(([environment]) => environment)
+          .sort((left, right) => left.localeCompare(right)),
+      };
+    });
 }
 
 /**

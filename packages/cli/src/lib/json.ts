@@ -212,10 +212,32 @@ export interface PackageRemoteCacheConfig {
   tokenSecret: RepositorySecretName;
 }
 
-/** Local bootstrap fallback; existing environment values always take precedence. */
+/**
+ * A `smoo.secrets` group: which operation resolves the credential. One argv
+ * word of `smoo secrets run <group> <command...>`, so whitespace would make
+ * that command unwritable. Only the shape is validated — the values are the
+ * repository's, and a new group must not need a new smoo release.
+ */
+export type SecretGroupName = string & typia.tags.MinLength<1> & typia.tags.Pattern<'^\\S+$'>;
+
+/**
+ * Local bootstrap fallback; existing environment values always take
+ * precedence, and CI injects these variables instead of running commands.
+ *
+ * Shell entry resolves the `shell` group and nothing else; every other group
+ * is resolved by `smoo secrets run <group> <command...>`, the one command
+ * that needs it. The group is DERIVED from what this manifest already
+ * declares — a variable `.npmrc` interpolates as `${VAR}` is `registry`, the
+ * variable `smoo.remoteCache.tokenSecret` names is `nx-cache`, everything
+ * else is `shell` — so `group` below is only for what those declarations
+ * cannot say. The routing lives in tooling/direnv/secret-references.ts,
+ * whose header states the rule and the derivation.
+ */
 export interface PackageSecretCommand {
   /** Executed directly, without a shell; stdout supplies the secret value. */
   command: NonEmptyArray<string>;
+  /** Overrides the derived group; absent derives one from this manifest and `.npmrc`. */
+  group?: SecretGroupName;
 }
 
 export interface PackageSmooConfig {

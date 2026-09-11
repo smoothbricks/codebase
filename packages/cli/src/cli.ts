@@ -7,6 +7,7 @@ import { decode, findRepoRoot, printCommandOutput } from './lib/run.js';
 import { ensureChromium } from './playwright/index.js';
 import { resolvePrConflicts } from './pr/index.js';
 import { secretsSet, secretsStatus, secretsSync } from './secrets/commands.js';
+import { secretsRun } from './secrets/run.js';
 import { cleanupPullRequest, deployStage } from './wrangler/deploy-stage.js';
 import { deployedVersion } from './wrangler/deployed-version.js';
 import { scaffold } from './wrangler/scaffold.js';
@@ -74,6 +75,11 @@ function buildProgram(): Command {
     .description('SmoothBricks monorepo tooling')
     .version(cliPackageVersion, '-v, --version', 'print smoo version')
     .exitOverride()
+    // `smoo secrets run <group> <command...>` hands the rest of argv to a
+    // child verbatim, flags included. Commander only stops parsing after the
+    // first operand when positional options are enabled here, on the parent
+    // of the command that declares `passThroughOptions`.
+    .enablePositionalOptions()
     .showHelpAfterError();
 
   const monorepo = program.command('monorepo').description('Manage SmoothBricks-style monorepos');
@@ -529,7 +535,23 @@ function buildProgram(): Command {
 
   const secrets = program
     .command('secrets')
-    .description('Reconcile declared secrets: what Workers need, what workflows pass, what the repository holds');
+    .description('Reconcile declared secrets: what Workers need, what workflows pass, what the repository holds')
+    .enablePositionalOptions();
+  secrets
+    .command('run [group] [command...]')
+    .description(
+      'Run one command with one group of declared secrets in its environment. Shell entry resolves the ' +
+        '`shell` group only, so a registry credential or the Nx cache token is resolved here, by the command ' +
+        'that needs it, instead of by every direnv reload. The group is required and positional: with none, ' +
+        'this lists the groups this repository declares and the secrets in each',
+    )
+    // Everything after the group reaches the child verbatim, flags included:
+    // `smoo secrets run registry bun add -d @acme/x` must run `bun add -d
+    // @acme/x`, not lose `-d` to this command's own parser.
+    .passThroughOptions()
+    .action(async (group: string | undefined, command: string[]) => {
+      process.exitCode = await secretsRun(await findRepoRoot(), group, command);
+    });
   secrets
     .command('status')
     .description(
@@ -551,7 +573,7 @@ function buildProgram(): Command {
         'unchanged, so a status that refuses still refuses',
     )
     .action(async (options: { repo?: string; env?: string; json?: boolean }) => {
-      process.exitCode = secretsStatus(await findRepoRoot(), options);
+      process.exitCode = await secretsStatus(await findRepoRoot(), options);
     });
   secrets
     .command('set [name]')

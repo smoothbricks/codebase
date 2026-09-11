@@ -274,16 +274,32 @@
     # 5. The shared setup-environment.ts bootstraps repository dependencies; a
     #    failure aborts shell entry instead of yielding a half-working shell.
     #    Repo-owned enterShell bodies merge after this prologue.
-    # 6. The declared Nx remote cache (`smoo.remoteCache`) is NOT resolved
-    #    here. Shell entry happens on every direnv reload and every
+    # 6. Shell entry resolves the `shell` group of `smoo.secrets` and nothing
+    #    else. Shell entry happens on every direnv reload and every
     #    `devenv shell -- <command>`, and a provider command that runs then is a
     #    credential prompt on every one of them (1Password authorises per
-    #    requesting process lineage, and this one is new each time). Nx reads
+    #    requesting process lineage, and this one is new each time). A
+    #    credential only one deliberate command needs belongs to that command:
+    #    `smoo secrets run <group> <command...>`. The full statement, and the
+    #    derivation below, live in tooling/direnv/secret-references.ts.
+    #
+    #    A group is derived from what the repository already declares, so
+    #    nothing restates it:
+    #
+    #    The variable `smoo.remoteCache.tokenSecret` names is group
+    #    `nx-cache`, and shell entry never resolves it. Nx reads
     #    NX_SELF_HOSTED_REMOTE_CACHE_SERVER and _ACCESS_TOKEN from the
     #    environment when it runs: CI injects them into the job, a developer
     #    exports the token once in the terminal that wants the cache (for
     #    example `op signin`, then the declared command), and every nested
     #    shell inherits it. Absent, Nx runs with the local cache only.
+    #
+    #    A variable `.npmrc` interpolates as `${VAR}` is group `registry`,
+    #    deferred rather than resolved, so setup-environment.ts installs
+    #    without it. An installed checkout contacts no registry, which is why
+    #    that costs nothing in the common case; an install that genuinely
+    #    needs one fails naming the variable, and `smoo secrets run registry
+    #    bun install` supplies it for that one command.
     # 7. GOROOT is unset rather than set. With devenv's Go pinned to the patch
     #    release ttsc vendors, a GOROOT crossing cannot misfire on version at all,
     #    so this is belt-and-braces rather than the fix — it keeps the isolation

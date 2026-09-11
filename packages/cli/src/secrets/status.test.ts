@@ -15,7 +15,7 @@ const rows = reconcileSecrets({
     STRIPE_PUBLISHABLE_KEY: 'STRIPE_PUBLISHABLE_KEY',
     E2E_CONTROL_TOKEN: 'E2E_CONTROL_TOKEN',
   },
-  localCommands: [],
+  localSecrets: [],
   repositorySecrets: ['RETIRED_TOKEN'],
   environmentSecrets: { staging: ['STRIPE_SECRET_KEY'] },
 });
@@ -79,7 +79,7 @@ describe('which stages a secret is required by', () => {
         workerSecrets: { 'targets/billing': ['STRIPE_SECRET_KEY'], 'targets/mail': ['STRIPE_SECRET_KEY'] },
         workflowSecrets: [],
         secretNames: { STRIPE_SECRET_KEY: 'STRIPE_SECRET_KEY' },
-        localCommands: [],
+        localSecrets: [],
         repositorySecrets: [],
       }),
     });

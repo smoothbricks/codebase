@@ -19,7 +19,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import { getWorkspacePackages } from '../lib/workspace.js';
 import {
   fetchLocalSecret,
-  localSecretCommandNames,
+  localSecretGroups,
   secretNameMapping,
   workerSecretNames,
   workerSecretStages,
@@ -28,6 +28,7 @@ import {
 } from './index.js';
 import { resolveRepository } from './repository.js';
 import {
+  type LocalSecret,
   projectSecretsStatus,
   reconcileSecrets,
   type SecretRow,
@@ -135,20 +136,24 @@ export async function writeRepositorySecret(
 function collectSources(
   root: string,
   workspaceDirs: readonly string[],
+  localSecrets: readonly LocalSecret[],
   repositorySecrets: readonly string[],
   environmentSecrets: Readonly<Record<string, readonly string[]>> = {},
 ) {
   const workerSecrets = workerSecretNames(root, workspaceDirs);
   const workflowSecrets = workflowSecretNames(root);
-  const localCommands = localSecretCommandNames(root);
   const envNames = [
-    ...new Set([...Object.values(workerSecrets).flatMap((names) => [...names]), ...workflowSecrets, ...localCommands]),
+    ...new Set([
+      ...Object.values(workerSecrets).flatMap((names) => [...names]),
+      ...workflowSecrets,
+      ...localSecrets.map((secret) => secret.name),
+    ]),
   ];
   return {
     workerSecrets,
     workflowSecrets,
     secretNames: secretNameMapping(root, envNames),
-    localCommands,
+    localSecrets,
     repositorySecrets,
     environmentSecrets,
   };
@@ -177,10 +182,10 @@ function describe(row: SecretRow, scopeWidth: number): string {
  * answer either a human or a machine from exactly the same facts: `--json`
  * cannot drift from the table because there is nothing for it to drift from.
  */
-function gatherSecretsStatus(
+async function gatherSecretsStatus(
   root: string,
   options: { repo?: string; env?: string },
-): { ok: true; document: SecretsStatusDocument } | { ok: false; reason: string } {
+): Promise<{ ok: true; document: SecretsStatusDocument } | { ok: false; reason: string }> {
   const resolved = resolveRepository(root, options.repo);
   if (!resolved.ok) return resolved;
   const { repo, source } = resolved.choice;
@@ -208,12 +213,19 @@ function gatherSecretsStatus(
   const workspaceDirs = getWorkspacePackages(root).map((pkg) => pkg.path);
   const stageScopes = workerSecretStages(root, workspaceDirs);
   if (!stageScopes.ok) return stageScopes;
+  // A `smoo.secrets` declaration smoo cannot read is a refusal, not an empty
+  // list: reporting "nothing is fetchable locally" for a manifest that says
+  // otherwise is the confident wrong answer.
+  const localSecrets = await localSecretGroups(root);
+  if (!localSecrets.ok) return localSecrets;
   return {
     ok: true,
     document: projectSecretsStatus({
       repository: { repo, source, secretCount: repositorySecrets.names.length },
       environments,
-      rows: reconcileSecrets(collectSources(root, workspaceDirs, repositorySecrets.names, environmentSecrets)),
+      rows: reconcileSecrets(
+        collectSources(root, workspaceDirs, localSecrets.secrets, repositorySecrets.names, environmentSecrets),
+      ),
       stageScopes: stageScopes.byWorker,
     }),
   };
@@ -228,8 +240,11 @@ function gatherSecretsStatus(
  * `unsatisfied` and still exits 1: a machine-readable status that always
  * succeeded would be a status nobody could gate on.
  */
-export function secretsStatus(root: string, options: { repo?: string; env?: string; json?: boolean }): number {
-  const gathered = gatherSecretsStatus(root, options);
+export async function secretsStatus(
+  root: string,
+  options: { repo?: string; env?: string; json?: boolean },
+): Promise<number> {
+  const gathered = await gatherSecretsStatus(root, options);
   if (!gathered.ok) {
     console.error(gathered.reason);
     return 1;
@@ -264,6 +279,25 @@ export function secretsStatus(root: string, options: { repo?: string; env?: stri
       console.log(
         `note: ${row.name} is declared by ${row.declaredByWorkers.join(', ')} but no managed workflow passes it; ` +
           'declare it in smoo.github.deploySecrets to have CI supply it.',
+      );
+    }
+  }
+  // A declared `group` that disagrees with what this repository's own
+  // declarations derive is the override working — and a silent override is
+  // how the next reader loses an hour wondering why a `.npmrc` credential
+  // resolves at shell entry. It is stated here, where a human is already
+  // looking at every declared secret.
+  const overridden = rows.filter(
+    (row) => row.localGroup !== undefined && row.localGroup.resolves !== row.localGroup.derived,
+  );
+  if (overridden.length > 0) {
+    console.log('');
+    for (const row of overridden) {
+      const local = row.localGroup;
+      if (local === undefined) continue;
+      console.log(
+        `note: ${row.name} declares group \`${local.resolves}\`, overriding the \`${local.derived}\` this ` +
+          `repository's declarations derive; \`smoo secrets run ${local.resolves} <command>\` is what resolves it.`,
       );
     }
   }
@@ -362,7 +396,12 @@ export async function secretsSet(
     environmentSecrets[environment] = inEnvironment.names;
   }
   const workspaceDirs = getWorkspacePackages(root).map((pkg) => pkg.path);
-  const rows = reconcileSecrets(collectSources(root, workspaceDirs, held.names, environmentSecrets));
+  const local = await localSecretGroups(root);
+  if (!local.ok) {
+    console.error(local.reason);
+    return 1;
+  }
+  const rows = reconcileSecrets(collectSources(root, workspaceDirs, local.secrets, held.names, environmentSecrets));
   const needed =
     environment === undefined ? secretsNeedingValues(rows) : secretsMissingInEnvironment(rows, environment);
   const target =
@@ -430,7 +469,15 @@ export async function secretsSync(root: string, options: { repo?: string; env?: 
   }
   const { repo } = resolved.choice;
   const environment = options.env;
-  const names = localSecretCommandNames(root);
+  const local = await localSecretGroups(root);
+  if (!local.ok) {
+    console.error(local.reason);
+    return 1;
+  }
+  // Every group: a repository secret store holds the credential whatever
+  // resolves it locally, and a `smoo secrets run` group is about which
+  // command pays the provider prompt, not about which values CI needs.
+  const names = local.secrets.map((secret) => secret.name);
   if (names.length === 0) {
     console.error('smoo.secrets declares no fetch commands; nothing to sync.');
     return 1;

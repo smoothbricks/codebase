@@ -1,0 +1,28 @@
+{
+  // The managed raw scripts are their own TypeScript project, and must be:
+  // they run as plain Bun source during bootstrap — before any workspace
+  // package, before node_modules, before the Typia transform — so they can
+  // belong to no project that assumes those. This file is what says so.
+  //
+  // It is also load-bearing at runtime. Bun's ttsc loader (see
+  // packages/validation/src/bun/preload.ts) routes each file to the nearest
+  // `tsconfig.lib.json` above it; without this one, a raw script under
+  // managed/ routed to packages/cli/tsconfig.lib.json, whose `include` is
+  // `src/**/*.ts`, and the transform returned no output at all. `smoo secrets
+  // run` imports secret-references.ts from here, and a consuming repo does
+  // the same from inside node_modules, so this file ships with the package.
+  "compilerOptions": {
+    "target": "ESNext",
+    "lib": ["ESNext"],
+    "module": "Preserve",
+    "moduleResolution": "bundler",
+    "allowImportingTsExtensions": true,
+    "verbatimModuleSyntax": true,
+    "noEmit": true,
+    "strict": true,
+    "noUncheckedIndexedAccess": false,
+    "skipLibCheck": true,
+    "types": ["bun"]
+  },
+  "include": ["**/*.ts"]
+}

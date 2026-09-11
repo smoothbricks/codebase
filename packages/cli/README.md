@@ -47,6 +47,11 @@ smoo release retag-unpublished <tag...> [--to <ref>] [--push] [--dispatch] [--re
 smoo release bootstrap-npm-packages [--dry-run] [--skip-login] [--package <name...>]
 smoo release trust-publisher [--bootstrap] [--dry-run] [--skip-login] [--package <name...>]
 
+smoo secrets status [-R <owner/name|remote>] [--env <environment>] [--json]
+smoo secrets set [name] [-R <owner/name|remote>] [--env <environment>]
+smoo secrets sync [-R <owner/name|remote>] [--env <environment>]
+smoo secrets run <group> <command...>
+
 smoo github-ci nx-smart --target <target> [--name <check-name>] [--step <number>] [--mode <auto|affected|run-many>] [--stage <stage>]
 smoo github-ci nx-run-many --targets <targets> [--projects <projects>] [--collect-outputs <directory>]
 smoo github-ci nx-deploy [--stage <stage>] [--mode <auto|affected|run-many>] [--select-tag <tag>] [--verify]
@@ -577,10 +582,58 @@ Developer shells get the pair from the managed `tooling/direnv/secret-references
 none (with the reason on stderr), and never replaces a server the environment already carries, so a CI job keeps the
 internal address its own runners reach.
 
-`tokenSecret` may name a `smoo.secrets` entry, and then it is the one declared secret that never blocks an install: a
-cache is an optimization, so an unreachable secret provider costs a stderr line where every other declared secret would
-refuse the install outright. `op read` being unavailable in a sandboxed workspace therefore loses the cache, not the
-shell.
+`tokenSecret` may name a `smoo.secrets` entry, and then it is in group `nx-cache`: shell entry never resolves it, so an
+unreachable secret provider loses the cache rather than the install. `op read` being unavailable in a sandboxed
+workspace therefore costs the cache, not the shell. See the section below for what a group is.
+
+### Local secret commands and groups (`package.json` → `smoo.secrets`)
+
+```json
+{
+  "smoo": {
+    "secrets": {
+      "SMOO_TOKEN": { "command": ["op", "read", "op://vault/smoo/token"] },
+      "ACME_NPM_TOKEN": { "command": ["op", "read", "op://vault/registry/token"] },
+      "DEPLOY_TOKEN": { "command": ["op", "read", "op://vault/deploy/token"], "group": "deploy" }
+    }
+  }
+}
+```
+
+Each entry names a command whose stdout is the value. An existing nonempty environment value always wins, and CI never
+runs these commands at all: there, every variable comes from the job's secret store.
+
+A group says which operation resolves the credential, and shell entry — every direnv reload, every
+`devenv shell -- <command>` — resolves the `shell` group and nothing else. A provider authorises per requesting process
+lineage, so a command placed at shell entry is a credential prompt on every reload; a credential only one deliberate
+command needs belongs to that command:
+
+```bash
+smoo secrets run registry bun install
+smoo secrets run registry bun add -d @acme/sdk
+smoo secrets run nx-cache nx build app
+```
+
+The group is DERIVED from declarations the repository already carries, so almost nothing declares one:
+
+- `registry` — a variable `.npmrc` interpolates as `${VAR}`. An installed checkout contacts no registry, so shell entry
+  defers it; a request that does contact one is what resolves it.
+- `nx-cache` — the variable `smoo.remoteCache.tokenSecret` names.
+- `shell` — everything else, resolved at shell entry because that is when it is needed.
+
+`group` on an entry overrides the derivation, and any label the command line can name is a group: nothing about
+`registry` or `nx-cache` is privileged in smoo, so a repository may declare `deploy` and run it the same way. An
+override is stated in `smoo secrets status`, because a silent one is how the next reader loses an hour.
+
+`smoo secrets run` with no group refuses and lists the groups this repository declares with the secrets in each. It
+resolves exactly one group — a run for `registry` never triggers the cache token's provider command — and passes the
+values in the child's environment only: never in argv, which `ps` shows to every user on the machine, never in a file,
+and never on stdout. Everything after the group reaches the child verbatim, flags included, and the child's exit status
+is reproduced, including death by signal as 128+signum.
+
+Both contexts that cannot run a provider command refuse by name instead of promising a command that would not work
+there: CI says to inject the variable from the secret store, and a cowshed workspace says to enroll registry credentials
+through the gateway.
 
 ## Releases
 

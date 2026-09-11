@@ -8,7 +8,7 @@ import { parseSecretsStatusDocument, reconcileSecrets } from './status.js';
 const sources = {
   workerSecrets: { 'targets/billing': ['PAYMENTS_PUBLISHABLE_KEY', 'PAYMENTS_SECRET_KEY'] },
   workflowSecrets: ['PAYMENTS_PUBLISHABLE_KEY', 'PAYMENTS_SECRET_KEY'],
-  localCommands: [],
+  localSecrets: [],
   secretNames: {
     PAYMENTS_PUBLISHABLE_KEY: 'PAYMENTS_PUBLISHABLE_KEY',
     PAYMENTS_SECRET_KEY: 'PAYMENTS_SECRET_KEY',
@@ -126,25 +126,25 @@ esac
     await rm(root, { recursive: true, force: true });
   });
 
-  function run(options: { repo?: string; env?: string; json?: boolean }): {
+  async function run(options: { repo?: string; env?: string; json?: boolean }): Promise<{
     code: number;
     out: string[];
     errors: string[];
-  } {
+  }> {
     const out: string[] = [];
     const errors: string[] = [];
     const [log, error] = [console.log, console.error];
     console.log = (...args: unknown[]) => out.push(args.map(String).join(' '));
     console.error = (...args: unknown[]) => errors.push(args.map(String).join(' '));
     try {
-      return { code: secretsStatus(root, options), out, errors };
+      return { code: await secretsStatus(root, options), out, errors };
     } finally {
       [console.log, console.error] = [log, error];
     }
   }
 
-  it('writes one document to stdout and nothing else, and still refuses', () => {
-    const { code, out } = run({ repo: 'acme/app', json: true });
+  it('writes one document to stdout and nothing else, and still refuses', async () => {
+    const { code, out } = await run({ repo: 'acme/app', json: true });
 
     expect(out).toHaveLength(1);
     const validated = parseSecretsStatusDocument(out[0] ?? '');
@@ -169,8 +169,8 @@ esac
     expect(code).toBe(1);
   });
 
-  it('carries the stages `smoo.wrangler.secretStages` declares, per name', () => {
-    const { out } = run({ repo: 'acme/app', json: true });
+  it('carries the stages `smoo.wrangler.secretStages` declares, per name', async () => {
+    const { out } = await run({ repo: 'acme/app', json: true });
     const validated = parseSecretsStatusDocument(out[0] ?? '');
     if (!validated.success) throw new Error('`--json` wrote a document its own validator rejects');
     const stages = Object.fromEntries(validated.data.secrets.map((row) => [row.name, row.requiredByStages]));
@@ -189,8 +189,8 @@ esac
     });
   });
 
-  it('prints the same facts as a table without the flag', () => {
-    const { code, out, errors } = run({ repo: 'acme/app' });
+  it('prints the same facts as a table without the flag', async () => {
+    const { code, out, errors } = await run({ repo: 'acme/app' });
 
     expect(out[0]).toBe('repository acme/app (requested), holding 2 secrets');
     expect(out[1]).toBe('environment staging, holding 1 secrets');
