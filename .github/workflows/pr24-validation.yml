@@ -23,10 +23,18 @@ jobs:
       - name: Export shared packages for local validation
         run: |
           mkdir -p "$RUNNER_TEMP/cli-refactor-cache"
-          tar -czf "$RUNNER_TEMP/cli-refactor-cache/bun-links.tar.gz" -C "$HOME" .bun/install/cache/links
+          tar -czf - -C "$HOME" .bun/install/cache/links | split -b 300m - "$RUNNER_TEMP/cli-refactor-cache/cache-"
       - uses: actions/upload-artifact@v7.0.1
         with:
-          name: cli-refactor-cache
-          path: ${{ runner.temp }}/cli-refactor-cache
+          name: cli-refactor-cache-first
+          path: ${{ runner.temp }}/cli-refactor-cache/cache-aa
           retention-days: 1
+          compression-level: 0
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v7.0.1
+        with:
+          name: cli-refactor-cache-second
+          path: ${{ runner.temp }}/cli-refactor-cache/cache-ab
+          retention-days: 1
+          compression-level: 0
           if-no-files-found: error
