@@ -68,11 +68,22 @@ Cargo's shared mutable build directory before the bounded runner, even if that d
 successful run. Cargo's own incremental cache avoids recompiling unchanged code. Nx never restores or collects shared
 Cargo build directories; lint and test **results**, and dedicated Wasm/N-API **outputs**, remain cacheable.
 
-Validation inputs include the crate's files, local dependency closure, governing manifests and configuration, toolchain
-versions, Cargo/Rust/native-build environment, target/profile overrides, and global Cargo configuration. Workspace test
-runners additionally hash all workspace member manifests because those affect unified features, and the nextest
-executable/configuration. Production test configurations use release compilation and release runners together. Keep
-explicit inputs for arbitrary build-script reads or custom environment variables that Cargo metadata cannot name.
+Validation inputs include the crate's files, local dependency closure, governing manifests and configuration, the
+declared toolchain pin, and the toolchain's own reported versions. The pin is `devenv.lock`, hashed as an ordinary file
+input at both `{workspaceRoot}/devenv.lock` and `{workspaceRoot}/tooling/direnv/devenv.lock` — devenv resolves it into
+the rustc, cargo, linker, C toolchain and SDK every cargo command inherits, so bumping it invalidates every cached cargo
+target. Workspace test runners additionally hash all workspace member manifests because those affect unified features,
+and the nextest executable/configuration. Production test configurations use release compilation and release runners
+together.
+
+Nothing machine-local takes part. The ambient cargo environment and the global `$CARGO_HOME/config.toml` are
+deliberately not hashed: their values carry absolute store paths and per-checkout state directories, which would make
+every cache entry private to the machine that wrote it and make one target hash differently inside a devenv profile than
+outside it — enough to make a pre-push cross-compile probe unsatisfiable. Keep explicit inputs for arbitrary
+build-script reads or custom environment variables that Cargo metadata cannot name.
+
+A target whose inputs a repository DECLARES replaces the inferred list, pin included. Name the two `devenv.lock` entries
+in that declaration, or in the named input it uses, or a toolchain bump will not invalidate it.
 
 Cargo keeps the caller's `CARGO_HOME`. Moving configuration into an isolated home can change relative paths or lose
 source replacement, credentials, and toolchain settings; forwarding it with `--config` changes precedence. Registry
