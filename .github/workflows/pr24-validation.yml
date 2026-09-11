@@ -13,21 +13,21 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - name: Extract failed tests
+      - name: Extract failure diagnostics
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/diagnostics"
-          gh api --allow-escape-sequences /repos/smoothbricks/codebase/actions/jobs/103418927500/logs > "$RUNNER_TEMP/diagnostics/job.log"
+          gh api --allow-escape-sequences /repos/smoothbricks/codebase/actions/jobs/103426206377/logs > "$RUNNER_TEMP/diagnostics/job.log"
           python3 - <<'PY'
           import os, pathlib, re
           root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'diagnostics'
           lines = re.sub(r'\x1b\[[0-9;]*m', '', (root / 'job.log').read_text()).splitlines()
           selected = set()
           for i, line in enumerate(lines):
-              if '(fail)' in line or 'NX Run summary:' in line or 'error: expect(' in line or 'failed, ' in line:
-                  selected.update(range(max(0, i-30), min(len(lines), i+8)))
+              if re.search(r'✗ |❌|error:|Error:|FIXABLE| lint/| formatter|FAILED|Run summary', line):
+                  selected.update(range(max(0, i-8), min(len(lines), i+20)))
           output = '\n'.join(f'{i+1}: {lines[i]}' for i in sorted(selected))
           (root / 'failures.txt').write_text(output + '\n')
           print(output)
