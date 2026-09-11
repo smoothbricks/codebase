@@ -53,6 +53,8 @@ const suiteWithExtension = makeBunTestSuiteTracer(baseBinding, {
   },
 });
 
+const suiteWithoutExtension = makeBunTestSuiteTracer(baseBinding);
+type BaseSpan = ReturnType<typeof suiteWithoutExtension.useTestSpan>;
 type ExtendedSpan = ReturnType<typeof suiteWithExtension.useTestSpan>;
 type HasExtendedTag = ExtendedSpan['tag'] extends { test_metric: (value: number) => unknown } ? true : false;
 type HasExtendedLog =
@@ -60,13 +62,27 @@ type HasExtendedLog =
 const hasExtendedTag: HasExtendedTag = true;
 const hasExtendedLog: HasExtendedLog = true;
 
+function assertHarnessResultInference(base: BaseSpan, extended: ExtendedSpan): void {
+  const baseValue: number = base.ok(1).base_field('base').describe('suite').value;
+  const extendedValue: string = extended.ok(1).test_metric(200).map(String).base_field('result').value;
+  const extendedError: string = extended.err('failed').test_metric(500).error;
+  // @ts-expect-error - a base-only harness must not acquire extension setters
+  base.ok(1).test_metric(200);
+  // @ts-expect-error - extension fields retain their declared value types
+  extended.ok(1).test_metric('200');
+  void baseValue;
+  void extendedValue;
+  void extendedError;
+}
+void assertHarnessResultInference;
+
 describe('bun harness test log schema extension', () => {
   it('includes extension fields in suite span typing', () => {
     expect(hasExtendedTag).toBe(true);
     expect(hasExtendedLog).toBe(true);
   });
 
-  it('writes extension fields through tag and log APIs', async () => {
+  it('writes extension fields through tag, log, and result APIs', async () => {
     const tracer = makeTestTracer(baseBinding, {
       extraTestColumns: {
         test_metric: S.number(),
@@ -85,6 +101,10 @@ describe('bun harness test log schema extension', () => {
       expect(buffer.test_metric_values[0]).toBe(123);
       expect(buffer.test_metric_values[2]).toBe(456);
       expect(buffer.test_note_values[2]).toBe('hello');
+      const result = span.ok('done').test_metric(789).test_note('result');
+      expect(result.value).toBe('done');
+      expect(buffer.test_metric_values[1]).toBe(789);
+      expect(buffer.test_note_values[1]).toBe('result');
     });
   });
 
