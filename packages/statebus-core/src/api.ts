@@ -115,8 +115,11 @@ export abstract class StateBus implements StateBusReader {
     this.state = Object.freeze(s) as WritableState;
   }
 
-  private eventQueue: AnyEvent[] = [];
-  private dispatchingEventQueue: AnyEvent[] = [];
+  // Keep backing capacity between waves; length = 0 can discard the backing store.
+  // Slots are cleared after dispatch so retaining capacity never retains payloads.
+  private queuedEventCount = 0;
+  private eventQueue = new Array<AnyEvent | undefined>(32).fill(undefined);
+  private dispatchingEventQueue = new Array<AnyEvent | undefined>(32).fill(undefined);
   private listeners: AnyTopicListenerMap = {};
   private dispatching = false;
   private readonly interestCounts = new SubscriberCountBatch<StateKeys>();
@@ -133,29 +136,33 @@ export abstract class StateBus implements StateBusReader {
   }
 
   private dispatchQueuedEvents() {
-    while (this.eventQueue.length > 0) {
+    while (this.queuedEventCount > 0) {
       const eventQueue = this.eventQueue;
+      const eventCount = this.queuedEventCount;
+      this.queuedEventCount = 0;
       // Reuse queue storage. Publications during this wave enter the other queue.
       this.eventQueue = this.dispatchingEventQueue;
       this.dispatchingEventQueue = eventQueue;
       try {
-        this.dispatchWave(eventQueue);
+        this.dispatchWave(eventQueue, eventCount);
       } finally {
         // Never retain or replay a failed wave when this storage is reused.
-        eventQueue.length = 0;
+        for (let index = 0; index < eventCount; index += 1) eventQueue[index] = undefined;
         this.interestCounts.clear();
       }
     }
   }
 
-  private dispatchWave(eventQueue: readonly AnyEvent[]): void {
+  private dispatchWave(eventQueue: readonly (AnyEvent | undefined)[], eventCount: number): void {
     let firstInterestEvent: Event<'statebus', 'substateInterest'> | undefined;
     // Reduce the complete wave before any listener observes it.
-    for (let index = 0; index < eventQueue.length; index += 1) {
-      this.reduceEvent(this.state, eventQueue[index]);
-    }
-    for (let index = 0; index < eventQueue.length; index += 1) {
+    for (let index = 0; index < eventCount; index += 1) {
       const event = eventQueue[index];
+      if (event) this.reduceEvent(this.state, event);
+    }
+    for (let index = 0; index < eventCount; index += 1) {
+      const event = eventQueue[index];
+      if (!event) continue;
       if (event.topic === 'statebus' && event.type === 'substateInterest') {
         firstInterestEvent ??= event;
         this.interestCounts.append(event.payload.subscribers);
@@ -195,7 +202,8 @@ export abstract class StateBus implements StateBusReader {
   protected abstract scheduleDispatch(): void;
 
   publish(event: AnyEvent) {
-    const length = this.eventQueue.push(event);
+    const length = ++this.queuedEventCount;
+    this.eventQueue[length - 1] = event;
     // The active dispatcher already drains every queued successor wave.
     if (!this.dispatching) this.scheduleDispatch();
     return length;
