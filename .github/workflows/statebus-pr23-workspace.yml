@@ -1,0 +1,31 @@
+# Temporary tracked-source transport for the PR23 integration; removed before review.
+name: StateBus PR23 workspace
+on:
+  push:
+    branches: [feat/statebus-loader-navigation]
+    paths: [.github/workflows/statebus-pr23-workspace.yml]
+permissions:
+  contents: read
+jobs:
+  source:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Archive tracked head and main sources
+        run: |
+          mkdir -p "$RUNNER_TEMP/pr23-source"
+          git archive HEAD | gzip > "$RUNNER_TEMP/pr23-source/head.tar.gz"
+          git archive origin/main | gzip > "$RUNNER_TEMP/pr23-source/main.tar.gz"
+          git rev-parse HEAD origin/main > "$RUNNER_TEMP/pr23-source/revisions.txt"
+          git diff 9338901a582c11d577c2783bbdc089ec98e4ce73 HEAD -- packages/statebus-core packages/statebus-react packages/statebus-data-loader packages/statebus-tanstack-query packages/statebus-navigation-core tsconfig.json bun.lock > "$RUNNER_TEMP/pr23-source/extension.patch"
+          cd "$RUNNER_TEMP/pr23-source" && sha256sum *.gz extension.patch > SHA256SUMS
+      - uses: actions/upload-artifact@v7.0.1
+        with:
+          name: statebus-pr23-source
+          path: ${{ runner.temp }}/pr23-source/*
+          retention-days: 1
+          if-no-files-found: error
