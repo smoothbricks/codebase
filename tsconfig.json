@@ -47,6 +47,15 @@
     },
     {
       "path": "./packages/lmao-ttsc"
+    },
+    {
+      "path": "./packages/statebus-data-loader"
+    },
+    {
+      "path": "./packages/statebus-tanstack-query"
+    },
+    {
+      "path": "./packages/statebus-navigation-core"
     }
   ]
 }

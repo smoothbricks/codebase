@@ -29,10 +29,9 @@ and converts rejected/thrown driver calls to typed failures. Supersession/dispos
 late acknowledgements. A driver must honour the AbortSignal while doing asynchronous work; completed history side
 effects cannot be undone by aborting a promise.
 
-The browser implementation is `@smoothbricks/statebus-navigation-browser`. The future Expo implementation is **not**
-included. It should implement `current`, `subscribe`, and `execute`, map supported native intents to its router, and
-feed actual route changes back as facts. Browser-only operations should return `unsupported` on a platform that cannot
-perform them.
+Browser and Expo implementations are separate adapters, not included in this package. Each should implement `current`,
+`subscribe`, and `execute`, map supported intents to its platform router, and feed actual route changes back as facts.
+Browser-only operations should return `unsupported` on a platform that cannot perform them.
 
 ## Offline scenarios
 

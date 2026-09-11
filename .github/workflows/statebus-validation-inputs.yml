@@ -1,6 +1,6 @@
-# Temporary validation transport; removed after public test dependencies are retrieved.
-# Explicit package directories only. No credentials, environment, .git or runner-home archive.
-name: StateBus validation inputs
+# Temporary, branch-scoped lockfile regeneration. Removed after the generated lock is reviewed.
+# Only bun.lock may be committed; the non-force push refuses a concurrently advanced branch.
+name: StateBus lockfile generation
 
 on:
   pull_request:
@@ -11,76 +11,31 @@ permissions:
   contents: read
 
 jobs:
-  source:
-    if: github.repository == 'smoothbricks/codebase' && github.event.pull_request.head.ref == 'feat/statebus-loader-navigation'
+  lockfile:
+    if: >-
+      github.repository == 'smoothbricks/codebase' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.head.ref == 'feat/statebus-loader-navigation'
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v6.0.2
         with:
-          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha }}
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: '1.4.2'
-      - uses: actions/setup-node@v6
-        with:
-          node-version: '26'
-      - name: Install the checked-in dependency graph
-        run: bun install --frozen-lockfile
-      - name: Archive explicit validation inputs with bounded artifact sizes
+      - name: Generate the dependency lock using the repository package manager
+        run: bun install --lockfile-only --ignore-scripts
+      - name: Verify frozen dependency resolution
+        run: bun install --lockfile-only --frozen-lockfile --ignore-scripts
+      - name: Commit only the generated lockfile to the requested working branch
         run: |
-          mkdir -p "$RUNNER_TEMP/statebus-inputs/base" "$RUNNER_TEMP/statebus-tools/bin"
-          git archive --format=tar HEAD | gzip > "$RUNNER_TEMP/statebus-inputs/base/source.tar.gz"
-          find . -type d -name node_modules -prune -print0 > "$RUNNER_TEMP/node-module-paths"
-          tar --null -T "$RUNNER_TEMP/node-module-paths" -czf "$RUNNER_TEMP/statebus-inputs/base/node-modules.tar.gz"
-          # Bun globalStore links point outside node_modules: include just those public package directories.
-          tar -C "$HOME/.bun/install/cache" -czf "$RUNNER_TEMP/statebus-inputs/cache-links.tar.gz" links
-          (cd "$RUNNER_TEMP/statebus-inputs" && sha256sum cache-links.tar.gz > base/cache-links.sha256)
-          split -b 250M -d "$RUNNER_TEMP/statebus-inputs/cache-links.tar.gz" "$RUNNER_TEMP/statebus-inputs/cache-"
-          test ! -f "$RUNNER_TEMP/statebus-inputs/cache-06"
-          rm "$RUNNER_TEMP/statebus-inputs/cache-links.tar.gz"
-          cp "$(command -v bun)" "$RUNNER_TEMP/statebus-tools/bin/bun"
-          cp "$(command -v node)" "$RUNNER_TEMP/statebus-tools/bin/node"
-          tar -C "$RUNNER_TEMP/statebus-tools" -czf "$RUNNER_TEMP/statebus-inputs/base/toolchain.tar.gz" bin
-      - uses: actions/upload-artifact@v7.0.1
-        with:
-          name: statebus-loader-validation-base
-          path: ${{ runner.temp }}/statebus-inputs/base/*
-          retention-days: 1
-          if-no-files-found: error
-      - uses: actions/upload-artifact@v7.0.1
-        with:
-          name: statebus-loader-validation-cache-00
-          path: ${{ runner.temp }}/statebus-inputs/cache-00
-          retention-days: 1
-          if-no-files-found: ignore
-      - uses: actions/upload-artifact@v7.0.1
-        with:
-          name: statebus-loader-validation-cache-01
-          path: ${{ runner.temp }}/statebus-inputs/cache-01
-          retention-days: 1
-          if-no-files-found: ignore
-      - uses: actions/upload-artifact@v7.0.1
-        with:
-          name: statebus-loader-validation-cache-02
-          path: ${{ runner.temp }}/statebus-inputs/cache-02
-          retention-days: 1
-          if-no-files-found: ignore
-      - uses: actions/upload-artifact@v7.0.1
-        with:
-          name: statebus-loader-validation-cache-03
-          path: ${{ runner.temp }}/statebus-inputs/cache-03
-          retention-days: 1
-          if-no-files-found: ignore
-      - uses: actions/upload-artifact@v7.0.1
-        with:
-          name: statebus-loader-validation-cache-04
-          path: ${{ runner.temp }}/statebus-inputs/cache-04
-          retention-days: 1
-          if-no-files-found: ignore
-      - uses: actions/upload-artifact@v7.0.1
-        with:
-          name: statebus-loader-validation-cache-05
-          path: ${{ runner.temp }}/statebus-inputs/cache-05
-          retention-days: 1
-          if-no-files-found: ignore
+          test -z "$(git diff --name-only -- . ':!bun.lock')"
+          test -z "$(git ls-files --others --exclude-standard)"
+          if git diff --quiet -- bun.lock; then exit 0; fi
+          git add -- bun.lock
+          git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' commit -m 'chore(deps): generate StateBus adapter workspace lockfile'
+          git push origin HEAD:refs/heads/feat/statebus-loader-navigation
