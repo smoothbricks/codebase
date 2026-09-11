@@ -189,22 +189,14 @@ describe('defineLogSchema with Sury', () => {
     }).toThrow(/reserved/i);
   });
 
-  test('rejects Ok/Err member names', () => {
-    // `success` is the sharp edge: it's a getter on the Ok/Err prototype, so a
-    // same-named field would silently overwrite it with a function - always
-    // truthy, treating every error as a success. Guarded here so that hazard
-    // can never reach defineLogSchema.
-    expect(() => {
-      defineLogSchema({ success: S.boolean() });
-    }).toThrow(/reserved/i);
-
-    expect(() => {
-      defineLogSchema({ value: S.text() });
-    }).toThrow(/reserved/i);
-
-    expect(() => {
-      LogSchema.assertUserFieldNames(['success', 'value', 'map', 'isOk', 'isErr']); // Reserved!
-    }).toThrow(/reserved/i);
+  test.each([
+    'success', 'value', 'error', 'map', 'mapErr', 'flatMap', 'match', 'isOk', 'isErr',
+    'maybeValue', 'maybeError', 'unwrapOr', 'unwrapOrElse', 'toJSON', 'line', 'then', 'constructor',
+    'toString', 'toLocaleString', 'valueOf', 'hasOwnProperty', 'isPrototypeOf', 'propertyIsEnumerable',
+  ])('rejects result member or protocol name %s in definitions and extensions', (name) => {
+    expect(() => defineLogSchema({ [name]: S.text() })).toThrow(/reserved/i);
+    const base = new LogSchema({ requestId: S.category() });
+    expect(() => base.extend({ [name]: S.text() })).toThrow(/reserved/i);
   });
 
   test('allows non-reserved names', () => {
