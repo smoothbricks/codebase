@@ -12,11 +12,12 @@ screen interest -> loadRequested -> application reducer admission
 
 `LoadState<T, Failure>` distinguishes `not-requested`, `loading`, `ready`, `failed`, and `cancelled`. Loading, failure,
 and cancellation retain previous successful data. A success is not confused with an empty or missing result. Every
-request carries an exact `{ key, id? }` interest, request ID, fingerprint, reason, supplied timestamp, and admission
+request carries an exact `{ key, id? }` interest, nominal `LoadRequestId`, nominal `LoadFingerprint`, reason, supplied timestamp, and admission
 policy. `reduceLoadState` writes only the addressed resource; other resource identities and stale outcomes are neutral.
 `admitLoadRequest` exposes duplicate and request-ID/fingerprint conflicts without running an effect. `latest-wins`
 supersedes an earlier request; `drop-duplicate` retains the first equivalent running fingerprint. IDs must be unique for
-logical operations. Retries retain the original ID; a new refresh gets a new ID. These read helpers do not establish
+logical operations. Bind them with `loadRequestId(value)` and `loadFingerprint(value)` at composition/request creation;
+the two types cannot be accidentally interchanged and neither creates a wrapper. Retries retain the original ID; a new refresh gets a new ID. These read helpers do not establish
 server-side mutation idempotency, serialize writes, or implement publication workflows.
 
 The application owns the event topic, state declaration, failure codec, and reducer. `LoaderChannel` binds this contract
@@ -42,9 +43,9 @@ most once per direction per interval, plus an explicit final flush. The interval
 continuous chunk arrival cannot postpone notification forever. Disposal drops pending measurements and cancels timers.
 Idle time does not manufacture progress.
 
-`measureByteStream(source, report, { direction, total? })` forwards an async byte stream while measuring actual
-`Uint8Array.byteLength`. Early iterator return closes the source. Feed these samples into the execution adapter's
-`reportBytes` callback. The transport must itself honour its AbortSignal, including any blocked read.
+`measureByteStream(source, reportBytes, { direction, total? })` forwards an async byte stream while measuring actual
+`Uint8Array.byteLength`. Early iterator return closes the source. Feed the numeric callback `(direction, transferred, total?)` directly into the execution adapter's
+`reportBytes` callback. No per-chunk progress object is constructed by the stream adapter. The transport must itself honour its AbortSignal, including any blocked read.
 
 Only supply `total` when it describes the measured stream. A compressed wire Content-Length may not match decompressed
 response bytes; omit an incomparable or unknown total. The reducer rejects invalid byte counts, preserves monotonicity
@@ -62,3 +63,21 @@ The complete post-reducer StateBus/QueryClient binding is exercised in
 `../statebus-tanstack-query/src/__tests__/fixture.ts` and `loader.test.ts`; these use the production runtime and
 reducer, not mocked hooks. This package is a resource lifecycle primitive, not the separate key-batching DataLoader
 capability specified for future library composition.
+
+
+### Allocation and no-op contract
+
+A reporter retains primitive byte counters, optional totals, and dirty flags for one request attempt. `reportBytes`
+updates these primitives without copying each transport sample. `report(sample)` adapts an already-existing native
+sample through the same path without retaining/copying it. The first dirty sample schedules a timer; later samples
+reuse that timer. Duplicate, invalid, and regressive measurements do not replace the last valid sample or schedule
+redundant notifications. An ended empty stream reports a real zero-byte observation.
+
+Only `flush` constructs owned samples for changed directions, at most two. Published samples remain immutable from the
+reporter's perspective. Both directions are captured before callback execution; reentrant reports are deferred to the
+next flush and disposal during a callback suppresses remaining output. Per-retry construction, timer scheduling,
+async-iterator mechanics, and actual state changes retain separate allocation costs.
+
+`reduceByteProgress` and `reduceLoadState` return their input by identity for repeated/ineffective samples. Changed
+progress uses stable field order. Attempt changes reset both directions, and stale attempt results cannot restore old
+counts. The tests include seeded property streams and retained/reentrant publication contracts.

@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'bun:test';
 import fc from 'fast-check';
+import { type LoadFingerprint, type LoadRequestId, loadFingerprint, loadRequestId } from '../identifiers.js';
 import {
   admitLoadRequest,
   initialLoadState,
@@ -16,8 +17,8 @@ import {
 
 const request: LoadRequest = {
   interest: { key: 'example.documents', id: 'home' },
-  requestId: 'r1',
-  fingerprint: 'home',
+  requestId: loadRequestId('r1'),
+  fingerprint: loadFingerprint('home'),
   reason: 'interest',
   policy: 'latest-wins',
   at: 1,
@@ -35,8 +36,8 @@ describe('data lifecycle properties', () => {
     fc.assert(
       fc.property(identity, identity, fc.integer(), (oldId, newId, value) => {
         fc.pre(oldId !== newId);
-        const old = { ...request, requestId: oldId };
-        const latest = { ...request, requestId: newId };
+        const old = { ...request, requestId: loadRequestId(oldId) };
+        const latest = { ...request, requestId: loadRequestId(newId) };
         const state = Object.freeze(reduceLoadState(loading(old), { type: 'loadRequested', request: latest }));
         const stale: readonly LoaderEvent<number, Failure>[] = [
           { type: 'loadSucceeded', request: old, value, at: 10 },
@@ -54,7 +55,7 @@ describe('data lifecycle properties', () => {
         for (const event of stale) expect(reduceLoadState(state, event)).toBe(state);
         expect(isLoadAccepted(state, latest)).toBe(true);
       }),
-      { numRuns: 500 },
+      { seed: 230923, numRuns: 500 },
     );
   });
 
@@ -63,15 +64,15 @@ describe('data lifecycle properties', () => {
       fc.property(identity, identity, (nextId, nextFingerprint) => {
         fc.pre(nextId !== request.requestId && nextFingerprint !== request.fingerprint);
         const state = Object.freeze(loading());
-        const duplicate: LoadRequest = { ...request, requestId: nextId, policy: 'drop-duplicate' };
+        const duplicate: LoadRequest = { ...request, requestId: loadRequestId(nextId), policy: 'drop-duplicate' };
         expect(admitLoadRequest(state, duplicate)).toBe('duplicate');
         expect(reduceLoadState(state, { type: 'loadRequested', request: duplicate })).toBe(state);
-        const conflicting = { ...request, fingerprint: nextFingerprint };
+        const conflicting = { ...request, fingerprint: loadFingerprint(nextFingerprint) };
         expect(admitLoadRequest(state, conflicting)).toBe('request-id-conflict');
         expect(isLoadAccepted(state, conflicting)).toBe(false);
         expect(reduceLoadState(state, { type: 'loadRequested', request: conflicting })).toBe(state);
       }),
-      { numRuns: 300 },
+      { seed: 230923, numRuns: 300 },
     );
   });
 
@@ -99,7 +100,7 @@ describe('data lifecycle properties', () => {
           ];
           let current = events.reduce(reduceLoadState<number, Failure>, initialLoadState<number, Failure>());
           outcomes.forEach((outcome, index) => {
-            const next = { ...request, requestId: `refresh-${index}`, reason: 'refresh' as const };
+            const next = { ...request, requestId: loadRequestId(`refresh-${index}`), reason: 'refresh' as const };
             const start: LoaderEvent<number, Failure> = { type: 'loadRequested', request: next };
             const result: LoaderEvent<number, Failure> =
               outcome === 'succeeded'
@@ -118,7 +119,7 @@ describe('data lifecycle properties', () => {
           expect(events.reduce(reduceLoadState<number, Failure>, initialLoadState<number, Failure>())).toEqual(current);
         },
       ),
-      { numRuns: 300 },
+      { seed: 230923, numRuns: 300 },
     );
   });
 
@@ -150,7 +151,7 @@ describe('progress properties', () => {
           expect(progress.upload).toBeUndefined();
         }
       }),
-      { numRuns: 500 },
+      { seed: 230923, numRuns: 500 },
     );
   });
 
@@ -168,4 +169,35 @@ describe('progress properties', () => {
       upload: { transferred: 9 },
     });
   });
+});
+
+it('preserves progress and load-state identity for repeated or ineffective byte samples', () => {
+  fc.assert(
+    fc.property(fc.nat({ max: 1000000 }), (bytes) => {
+      const sample = Object.freeze({ direction: 'download' as const, transferred: bytes });
+      const once = Object.freeze(reduceByteProgress({ attempt: 1 }, 1, sample));
+      expect(reduceByteProgress(once, 1, sample)).toBe(once);
+      expect(reduceByteProgress(once, 1, { ...sample, total: -1 })).toBe(once);
+      const event: LoaderEvent<number, Failure> = { type: 'loadProgressed', request, attempt: 1, sample, at: 2 };
+      const state = Object.freeze(reduceLoadState(loading(), event));
+      expect(reduceLoadState(state, event)).toBe(state);
+      expect(reduceLoadState(state, { ...event, at: 99 })).toBe(state);
+    }),
+    { seed: 230923, numRuns: 500 },
+  );
+});
+
+it('keeps logical request IDs nominally distinct from fingerprints and ordinary strings', () => {
+  const id = loadRequestId('request');
+  const fingerprint = loadFingerprint('operation');
+  // @ts-expect-error a fingerprint cannot serve as a logical request identity
+  const wrongId: LoadRequestId = fingerprint;
+  // @ts-expect-error a logical request identity is not the operation fingerprint
+  const wrongFingerprint: LoadFingerprint = id;
+  // @ts-expect-error plain strings must be bound at the composition boundary
+  const unbound: LoadRequestId = 'request';
+  expect(String(wrongId)).toBe('operation');
+  expect(String(wrongFingerprint)).toBe('request');
+  expect(unbound).toBe(id);
+  expect(() => loadRequestId('')).toThrow(RangeError);
 });

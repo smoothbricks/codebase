@@ -1,13 +1,21 @@
-import { type StateInterest, type StateInterestChange, stateInterestKey } from '@smoothbricks/statebus-core';
 import {
-  type ByteSample,
+  type StateInterest,
+  type StateInterestChange,
+  StateInterestMap,
+  stateInterestKey,
+} from '@smoothbricks/statebus-core';
+import {
+  type ByteProgressSink,
   createByteProgressReporter,
   type InterestSource,
   isLoadAccepted,
   type LoaderChannel,
   type LoaderEvent,
+  type LoadFingerprint,
   type LoadRequest,
+  type LoadRequestId,
   type LoadState,
+  loadFingerprint,
   needsLoad,
   sameLoadRequest,
   systemTimer,
@@ -20,7 +28,7 @@ export interface QueryExecutionContext {
   readonly request: LoadRequest;
   readonly attempt: number;
   /** Measurements must come from the actual transport, not a guessed percentage. */
-  reportBytes(sample: ByteSample): void;
+  readonly reportBytes: ByteProgressSink;
 }
 
 export type LoaderQuery<T> = Pick<
@@ -39,9 +47,9 @@ export interface TanStackLoaderOptions<T, Failure> {
   readonly matches: (interest: StateInterest) => boolean;
   readonly query: (request: LoadRequest) => LoaderQuery<T>;
   readonly failure: (cause: unknown) => Failure;
-  readonly requestId: () => string;
+  readonly requestId: () => LoadRequestId;
   readonly now: () => number;
-  readonly fingerprint?: (interest: StateInterest) => string;
+  readonly fingerprint?: (interest: StateInterest) => LoadFingerprint;
   readonly staleAfterMs?: number;
   readonly graceMs?: number;
   readonly progressIntervalMs?: number;
@@ -57,7 +65,7 @@ export interface TanStackLoaderOptions<T, Failure> {
 
 interface QueryJob<T> {
   readonly request: LoadRequest;
-  readonly address: string;
+  readonly address: StateInterest;
   readonly group: QueryGroup<T>;
   closed: boolean;
   stopObservation: () => void;
@@ -83,10 +91,10 @@ export function installTanStackQueryLoader<T, Failure>(options: TanStackLoaderOp
   if (Number.isNaN(staleAfterMs) || staleAfterMs < 0) throw new RangeError('staleAfterMs must be nonnegative.');
   const { channel, queryClient } = options;
   const demand = options.demand ?? needsLoad;
-  const jobs = new Map<string, QueryJob<T>>();
+  const jobs = new StateInterestMap<QueryJob<T>>();
   const groups = new Map<string, QueryGroup<T>>();
-  const counts = new Map<string, number>();
-  const pendingRelease = new Map<string, () => void>();
+  const counts = new StateInterestMap<number>();
+  const pendingRelease = new StateInterestMap<() => void>();
   let disposed = false;
 
   function current(job: QueryJob<T>): boolean {
@@ -98,7 +106,7 @@ export function installTanStackQueryLoader<T, Failure>(options: TanStackLoaderOp
     );
   }
 
-  function clearRelease(address: string): void {
+  function clearRelease(address: StateInterest): void {
     pendingRelease.get(address)?.();
     pendingRelease.delete(address);
   }
@@ -115,7 +123,7 @@ export function installTanStackQueryLoader<T, Failure>(options: TanStackLoaderOp
     if (reason && !disposed) channel.publish({ type: 'loadCancelled', request: job.request, reason });
   }
 
-  function releaseLater(address: string): void {
+  function releaseLater(address: StateInterest): void {
     if (pendingRelease.has(address) || !jobs.has(address)) return;
     pendingRelease.set(
       address,
@@ -132,7 +140,7 @@ export function installTanStackQueryLoader<T, Failure>(options: TanStackLoaderOp
     if (disposed) return;
     for (const { interest, subscribers } of changes) {
       if (!options.matches(interest)) continue;
-      const address = stateInterestKey(interest);
+      const address = interest;
       const previousSubscribers = counts.get(address) ?? 0;
       if (subscribers > 0) counts.set(address, subscribers);
       else counts.delete(address);
@@ -149,7 +157,7 @@ export function installTanStackQueryLoader<T, Failure>(options: TanStackLoaderOp
       const request: LoadRequest = {
         interest,
         requestId: options.requestId(),
-        fingerprint: options.fingerprint?.(interest) ?? address,
+        fingerprint: options.fingerprint?.(interest) ?? loadFingerprint(stateInterestKey(interest)),
         at: now,
         reason: 'interest',
         policy: 'latest-wins',
@@ -165,7 +173,7 @@ export function installTanStackQueryLoader<T, Failure>(options: TanStackLoaderOp
   }
 
   async function start(request: LoadRequest): Promise<void> {
-    const address = stateInterestKey(request.interest);
+    const address = request.interest;
     const previous = jobs.get(address);
     if (previous?.request.requestId === request.requestId) return;
     let job: QueryJob<T> | undefined;
@@ -229,7 +237,7 @@ export function installTanStackQueryLoader<T, Failure>(options: TanStackLoaderOp
           signal.addEventListener('abort', abort, { once: true });
           try {
             if (signal.aborted) throw signal.reason;
-            return await execute({ signal, request, attempt, reportBytes: progress.report });
+            return await execute({ signal, request, attempt, reportBytes: progress.reportBytes });
           } finally {
             // Publish the last measured bytes before success/failure, even when no interval has elapsed.
             if (!signal.aborted) progress.flush();
@@ -254,7 +262,7 @@ export function installTanStackQueryLoader<T, Failure>(options: TanStackLoaderOp
   const stopRequests = channel.subscribe((event) => {
     if (disposed || !options.matches(event.request.interest)) return;
     if (event.type === 'loadCancelled') {
-      const job = jobs.get(stateInterestKey(event.request.interest));
+      const job = jobs.get(event.request.interest);
       const state = channel.read(event.request.interest);
       if (
         job &&

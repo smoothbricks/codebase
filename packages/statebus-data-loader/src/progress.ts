@@ -1,44 +1,92 @@
-import type { ByteSample } from './model.js';
+import { type ByteSample, comparableByteTotal } from './model.js';
 import type { TimerPort } from './ports.js';
 
-/** Throttles actual transport measurements. It never fabricates bytes from query status or elapsed time. */
+export type ByteProgressSink = (direction: ByteSample['direction'], transferred: number, total?: number) => void;
+export interface ByteProgressReporter {
+  /** Adapt an existing transport sample without cloning it. */
+  report(sample: ByteSample): void;
+  /** Numeric producer path: no sample object is constructed for a suppressed chunk. */
+  reportBytes: ByteProgressSink;
+  flush(): void;
+  dispose(): void;
+}
+
+/** Accumulate primitives per attempt; create owned samples only at the notification boundary. */
 export function createByteProgressReporter(options: {
   readonly timer: TimerPort;
   readonly intervalMs: number;
   readonly emit: (sample: ByteSample) => void;
-}): { report(sample: ByteSample): void; flush(): void; dispose(): void } {
+}): ByteProgressReporter {
   if (!Number.isFinite(options.intervalMs) || options.intervalMs <= 0) {
     throw new RangeError('A progress interval must be a finite positive number.');
   }
-  let upload: ByteSample | undefined;
-  let download: ByteSample | undefined;
+  let uploadTransferred = -1;
+  let downloadTransferred = -1;
+  let uploadTotal: number | undefined;
+  let downloadTotal: number | undefined;
+  let uploadDirty = false;
+  let downloadDirty = false;
   let cancelTimer: (() => void) | undefined;
   let disposed = false;
+  let flushing = false;
+
   function flush(): void {
+    if (flushing || disposed) return;
     cancelTimer?.();
     cancelTimer = undefined;
-    if (disposed) return;
-    const pendingUpload = upload;
-    const pendingDownload = download;
-    upload = undefined;
-    download = undefined;
-    if (pendingUpload) options.emit(pendingUpload);
-    if (pendingDownload) options.emit(pendingDownload);
+    // Capture both directions before callbacks: reentrant reports belong to the next flush.
+    const sendUpload = uploadDirty;
+    const sendDownload = downloadDirty;
+    const uploaded = uploadTransferred;
+    const downloaded = downloadTransferred;
+    const uploadSize = uploadTotal;
+    const downloadSize = downloadTotal;
+    uploadDirty = false;
+    downloadDirty = false;
+    flushing = true;
+    try {
+      if (sendUpload) options.emit({ direction: 'upload', transferred: uploaded, total: uploadSize });
+      if (sendDownload && !disposed)
+        options.emit({ direction: 'download', transferred: downloaded, total: downloadSize });
+    } finally {
+      flushing = false;
+    }
   }
+
+  const reportBytes: ByteProgressSink = (direction, transferred, total) => {
+    if (disposed || !Number.isSafeInteger(transferred) || transferred < 0) return;
+    const comparableTotal = comparableByteTotal(transferred, total);
+    if (direction === 'upload') {
+      if (transferred < uploadTransferred || (transferred === uploadTransferred && comparableTotal === uploadTotal))
+        return;
+      uploadTransferred = transferred;
+      uploadTotal = comparableTotal;
+      uploadDirty = true;
+    } else {
+      if (
+        transferred < downloadTransferred ||
+        (transferred === downloadTransferred && comparableTotal === downloadTotal)
+      )
+        return;
+      downloadTransferred = transferred;
+      downloadTotal = comparableTotal;
+      downloadDirty = true;
+    }
+    cancelTimer ??= options.timer.after(options.intervalMs, flush);
+  };
+
   return {
     report(sample) {
-      if (disposed) return;
-      if (sample.direction === 'upload') upload = { ...sample };
-      else download = { ...sample };
-      cancelTimer ??= options.timer.after(options.intervalMs, flush);
+      reportBytes(sample.direction, sample.transferred, sample.total);
     },
+    reportBytes,
     flush,
     dispose() {
       disposed = true;
       cancelTimer?.();
       cancelTimer = undefined;
-      upload = undefined;
-      download = undefined;
+      uploadDirty = false;
+      downloadDirty = false;
     },
   };
 }

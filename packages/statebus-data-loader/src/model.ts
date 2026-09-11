@@ -1,4 +1,5 @@
 import type { StateInterest } from '@smoothbricks/statebus-core';
+import type { LoadFingerprint, LoadRequestId } from './identifiers.js';
 
 export interface Loaded<T> {
   readonly value: T;
@@ -7,8 +8,8 @@ export interface Loaded<T> {
 
 export interface LoadRequest {
   readonly interest: StateInterest;
-  readonly requestId: string;
-  readonly fingerprint: string;
+  readonly requestId: LoadRequestId;
+  readonly fingerprint: LoadFingerprint;
   readonly at: number;
   readonly reason: 'interest' | 'refresh' | 'retry';
   readonly policy: 'drop-duplicate' | 'latest-wins';
@@ -104,21 +105,26 @@ export function isLoadAccepted<T, Failure>(state: LoadState<T, Failure>, request
   return state.kind === 'loading' && sameLoadRequest(state.request, request);
 }
 
+/** Unknown or incomparable totals remain unknown, never a guessed percentage. */
+export function comparableByteTotal(transferred: number, total: number | undefined): number | undefined {
+  return total !== undefined && Number.isSafeInteger(total) && total >= transferred ? total : undefined;
+}
+
 /** Progress is monotone within one attempt/direction; a retry starts a new byte count. */
 export function reduceByteProgress(progress: LoadProgress, attempt: number, sample: ByteSample): LoadProgress {
   if (!Number.isSafeInteger(attempt) || attempt < 1 || attempt < progress.attempt) return progress;
   if (!Number.isSafeInteger(sample.transferred) || sample.transferred < 0) return progress;
-  const base: LoadProgress = attempt === progress.attempt ? progress : { attempt };
-  const previous = base[sample.direction];
+  const sameAttempt = attempt === progress.attempt;
+  const previous = sameAttempt ? progress[sample.direction] : undefined;
   if (previous && sample.transferred < previous.transferred) return progress;
-  const total =
-    sample.total !== undefined && Number.isSafeInteger(sample.total) && sample.total >= sample.transferred
-      ? sample.total
-      : undefined;
+  const total = comparableByteTotal(sample.transferred, sample.total);
+  if (previous && previous.transferred === sample.transferred && previous.total === total) return progress;
+  const bytes: ByteCount = { transferred: sample.transferred, total };
+  // Fixed field order and shape; no transient base object or dynamically shaped spread.
   return {
-    ...base,
-    [sample.direction]:
-      total === undefined ? { transferred: sample.transferred } : { transferred: sample.transferred, total },
+    attempt,
+    upload: sample.direction === 'upload' ? bytes : sameAttempt ? progress.upload : undefined,
+    download: sample.direction === 'download' ? bytes : sameAttempt ? progress.download : undefined,
   };
 }
 

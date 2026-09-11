@@ -10,7 +10,8 @@ Install one `installTanStackQueryLoader` per non-overlapping resource owner at t
 - the runtime-owned `queryClient`, typed `channel`, and exact `interests` source;
 - `matches` for that owner's namespace, and `query(request)` for semantic query identity/options and the boundary
   `execute` operation;
-- total pure `failure` classification, plus boundary `now` and `requestId` functions.
+- total pure `failure` classification, plus boundary `now` and nominal `requestId` functions (`loadRequestId(value)`). An optional fingerprint function returns
+  `LoadFingerprint` via `loadFingerprint(value)`.
 
 For ByID resources, `matches` must also require an ID. Include tenant, repository, branch, locale, and other relevant
 inputs in the query key. Equal keys must mean equivalent execution/data, not merely equal display labels. Binding two
@@ -52,7 +53,8 @@ they must not silently share a cancellable query without an observer. The middle
 `cancelQueries`, clear somebody else's client, or remove cached application data on unmount. The caller owns final
 QueryClient disposal.
 
-Periodic byte samples come only from `execute`'s transport. Retry attempts reset byte counts, preserve logical request
+`reportBytes(direction, transferred, total?)` accepts cumulative numeric samples directly, including from
+`measureByteStream`; there is no per-chunk sample-object allocation in this path. Periodic byte samples come only from `execute`'s transport. Retry attempts reset byte counts, preserve logical request
 identity, and flush final measurements before the terminal result. Multiple consumers of a matching query key receive
 separate correlated result/progress events. Disposal unregisters interest/event listeners, clears grace timers, releases
 owned query observations, and suppresses future publications.
@@ -66,3 +68,9 @@ admission, retries, measured bytes, offline cancellation, grace renewal, late ou
 The package does not migrate application screens by itself. Keep the public CMS reducer independent; compose it into the
 hosted reducer and bind separate resource namespaces at that target. Do not dual-write query-hook state and StateBus or
 use the presence of these adapters as evidence that composition, no-I/O replay, or app screen migration is complete.
+
+
+Runtime job/count/grace lookups use the core's structural interest index, not JSON strings. The default fingerprint
+encodes an address only when creating a new logical request. Renewing/releasing demand for already-bound work needs no
+address serialization. QueryClient query hashing is its own request/cache boundary, not the StateBus read/render path.
+The published request keeps its typed structural address for diagnostics and stale-result checks.

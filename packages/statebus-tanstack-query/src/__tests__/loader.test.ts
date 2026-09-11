@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it } from 'bun:test';
 import type { LoadRequest } from '@smoothbricks/statebus-data-loader';
+import { loadFingerprint, loadRequestId } from '@smoothbricks/statebus-data-loader';
 import { onlineManager, QueryObserver } from '@tanstack/query-core';
 import type { QueryExecutionContext } from '../index.js';
 import { fixture, type Items } from './fixture.js';
@@ -224,17 +225,17 @@ describe('StateBus -> real QueryClient integration', () => {
     await test.tick();
     const base: LoadRequest = {
       interest: { key: 'loaderTest.resources', id: 'home' },
-      requestId: 'manual',
-      fingerprint: 'home-load',
+      requestId: loadRequestId('manual'),
+      fingerprint: loadFingerprint('home-load'),
       at: 0,
       reason: 'refresh',
       policy: 'drop-duplicate',
     };
     test.channel.publish({ type: 'loadRequested', request: base });
-    test.channel.publish({ type: 'loadRequested', request: { ...base, requestId: 'duplicate' } });
+    test.channel.publish({ type: 'loadRequested', request: { ...base, requestId: loadRequestId('duplicate') } });
     await test.tick();
     expect(executions).toBe(1);
-    expect(accepted(test, 'home').requestId).toBe('manual');
+    expect(accepted(test, 'home').requestId).toBe(loadRequestId('manual'));
   });
 
   it('does not cancel an admitted request when the reducer refuses a conflicting cancellation', async () => {
@@ -251,7 +252,7 @@ describe('StateBus -> real QueryClient integration', () => {
     const request = accepted(test, 'home');
     test.channel.publish({
       type: 'loadCancelled',
-      request: { ...request, fingerprint: 'wrong-operation' },
+      request: { ...request, fingerprint: loadFingerprint('wrong-operation') },
       reason: 'cancelled',
     });
     await test.tick();
@@ -278,7 +279,12 @@ describe('StateBus -> real QueryClient integration', () => {
     const previous = accepted(test, 'home');
     test.channel.publish({
       type: 'loadRequested',
-      request: { ...previous, requestId: 'refresh', fingerprint: 'v2', reason: 'refresh' },
+      request: {
+        ...previous,
+        requestId: loadRequestId('refresh'),
+        fingerprint: loadFingerprint('v2'),
+        reason: 'refresh',
+      },
     });
     await test.tick();
     expect(executions.length).toBe(2);
@@ -299,7 +305,7 @@ describe('StateBus -> real QueryClient integration', () => {
       retry: 1,
       execute: async (context) => {
         executions.push(context);
-        context.reportBytes({ direction: 'download', transferred: context.attempt === 1 ? 10 : 3 });
+        context.reportBytes('download', context.attempt === 1 ? 10 : 3);
         if (context.attempt === 1) throw new Error('transient');
         retried.resolve();
         return pending.promise;
@@ -315,7 +321,7 @@ describe('StateBus -> real QueryClient integration', () => {
     await test.tick();
     const state = test.state('home');
     expect(state.kind === 'loading' ? state.progress : undefined).toEqual({ attempt: 2, download: { transferred: 3 } });
-    executions[1]?.reportBytes({ direction: 'download', transferred: 9, total: 9 });
+    executions[1]?.reportBytes('download', 9, 9);
     pending.resolve(['ready']);
     await test.tick();
     const progress = test.events.filter((event) => event.type === 'loadProgressed');
@@ -351,11 +357,42 @@ describe('StateBus -> real QueryClient integration', () => {
     test.dispose();
     test.dispose();
     expect(executions[0]?.signal.aborted).toBe(true);
-    executions[0]?.reportBytes({ direction: 'download', transferred: 100 });
+    executions[0]?.reportBytes('download', 100);
     pending.resolve(['late']);
     test.timer.advance(1000);
     await test.tick();
     expect(test.events.length).toBe(count);
     expect(test.timer.pending).toBe(0);
   });
+});
+
+it('renews and releases an already-bound request without serializing its interest address', async () => {
+  const pending = Promise.withResolvers<Items>();
+  const test = setup({ execute: () => pending.promise });
+  const first = test.interest(7);
+  await test.tick();
+  const request = accepted(test, 7);
+  const original = JSON.stringify;
+  let encodings = 0;
+  JSON.stringify = () => {
+    encodings += 1;
+    throw new Error('Encoding in an already-bound interest path.');
+  };
+  try {
+    const second = test.interest(7);
+    test.bus.dispatchEvents();
+    first();
+    test.bus.dispatchEvents();
+    second();
+    test.bus.dispatchEvents();
+  } finally {
+    JSON.stringify = original;
+  }
+  expect(encodings).toBe(0);
+  expect(accepted(test, 7)).toBe(request);
+  test.timer.advance(250);
+  pending.resolve(['late']);
+  await test.tick();
+  expect(test.state(7).kind).toBe('cancelled');
+  test.dispose();
 });
