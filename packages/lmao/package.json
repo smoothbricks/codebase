@@ -215,7 +215,8 @@
           "{projectRoot}/**/.cargo/config.toml",
           "{projectRoot}/scripts/*.sh",
           "!{projectRoot}/**/target/**",
-          "lmaoGitRevision"
+          "lmaoGitRevision",
+          "cargoToolchain"
         ]
       },
       "cargo-test-lmao-ffi-dylib": {
@@ -230,7 +231,8 @@
           "{projectRoot}/**/.cargo/config.toml",
           "{projectRoot}/scripts/*.sh",
           "!{projectRoot}/**/target/**",
-          "lmaoGitRevision"
+          "lmaoGitRevision",
+          "cargoToolchain"
         ]
       },
       "cargo-test-lmao-query": {
@@ -247,7 +249,8 @@
           "{projectRoot}/**/.cargo/config.toml",
           "{projectRoot}/scripts/*.sh",
           "!{projectRoot}/**/target/**",
-          "lmaoGitRevision"
+          "lmaoGitRevision",
+          "cargoToolchain"
         ]
       },
       "cargo-test-lmao-wasm": {
@@ -264,7 +267,8 @@
           "{projectRoot}/**/.cargo/config.toml",
           "{projectRoot}/scripts/*.sh",
           "!{projectRoot}/**/target/**",
-          "lmaoGitRevision"
+          "lmaoGitRevision",
+          "cargoToolchain"
         ]
       },
       "cargo-test-lmao-core": {
@@ -279,7 +283,8 @@
           "{projectRoot}/**/.cargo/config.toml",
           "{projectRoot}/scripts/*.sh",
           "!{projectRoot}/**/target/**",
-          "lmaoGitRevision"
+          "lmaoGitRevision",
+          "cargoToolchain"
         ]
       },
       "cargo-test-lmao-macros": {
@@ -294,7 +299,8 @@
           "{projectRoot}/**/.cargo/config.toml",
           "{projectRoot}/scripts/*.sh",
           "!{projectRoot}/**/target/**",
-          "lmaoGitRevision"
+          "lmaoGitRevision",
+          "cargoToolchain"
         ]
       },
       "typecheck": {
@@ -356,7 +362,8 @@
           "{workspaceRoot}/Cargo.lock",
           "{workspaceRoot}/.cargo/config.toml",
           "{projectRoot}/.cargo/config.toml",
-          "lmaoGitRevision"
+          "lmaoGitRevision",
+          "cargoToolchain"
         ],
         "outputs": [
           "{workspaceRoot}/target/release/liblmao_ffi_dylib.dylib",
