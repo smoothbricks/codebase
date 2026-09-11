@@ -539,6 +539,33 @@ describe('publish workflow rendering by repo shape', () => {
     expect(rendered).toContain('          BILLING_API_TOKEN: ${{ secrets.SMOO_BILLING_API_TOKEN }}');
     expect(rendered).not.toMatch(/^ {6}BILLING_API_TOKEN:/m);
   });
+
+  it('renders publish.yml byte-identical whether or not the graph declares cross test archives', () => {
+    // A repo shape that HAS macOS publish legs, so the invariance is asserted
+    // where a cross-test step could plausibly have been grafted on.
+    const bare = context({
+      platformTargetGlobs: [...PLATFORM_TARGET_GLOBS],
+      releasePlatformTargetGlobs: [...PLATFORM_TARGET_GLOBS],
+      macosPlatformArchitectures: ['arm64'],
+    });
+    const crossing: ManagedFileContext = {
+      ...bare,
+      crossTestArchives: [
+        { triple: 'aarch64-apple-darwin', path: 'target/nextest/archive-aarch64-apple-darwin.tar.zst' },
+      ],
+    };
+
+    expect(renderManagedWorkflowForTest('publish-workflow', crossing)).toBe(
+      renderManagedWorkflowForTest('publish-workflow', bare),
+    );
+    expect(renderManagedWorkflowForTest('publish-workflow', crossing)).not.toContain('cross-test');
+    // ...and the declaration is not inert: the same pair of contexts does change
+    // ci.yml, which is the file that owns executing those binaries.
+    expect(renderManagedWorkflowForTest('ci-workflow', crossing)).not.toBe(
+      renderManagedWorkflowForTest('ci-workflow', bare),
+    );
+    expect(renderManagedWorkflowForTest('ci-workflow', crossing)).toContain('  macos-cross-tests:');
+  });
 });
 
 describe('CI workflow rendering by repo shape', () => {
