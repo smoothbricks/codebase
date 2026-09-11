@@ -47,6 +47,12 @@
       "import": "./dist/release/pack.js",
       "default": "./dist/release/pack.js"
     },
+    "./secrets": {
+      "types": "./dist/secrets/status.d.ts",
+      "development": "./src/secrets/status.ts",
+      "import": "./dist/secrets/status.js",
+      "default": "./dist/secrets/status.js"
+    },
     "./wrangler/prepare-env": {
       "types": "./dist/wrangler/prepare-env.d.ts",
       "bun": "./src/wrangler/prepare-env.ts",

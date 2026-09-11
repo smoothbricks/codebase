@@ -533,7 +533,9 @@ function buildProgram(): Command {
   secrets
     .command('status')
     .description(
-      'Show every declared secret with the scopes holding it, and refuse when a workflow passes one none has',
+      'Show every declared secret with the scopes holding it. Exits 0 when every secret a managed workflow ' +
+        'passes has a value in a scope the job reads, and 1 when one does not or when the repository, its ' +
+        'secrets or a stage declaration could not be read',
     )
     .option(
       '-R, --repo <owner/name|remote>',
@@ -543,7 +545,12 @@ function buildProgram(): Command {
       '--env <environment>',
       "also read this GitHub Environment; its value takes precedence over the repository's for a job bound to it",
     )
-    .action(async (options: { repo?: string; env?: string }) => {
+    .option(
+      '--json',
+      'write one JSON document to stdout instead of the table, for another tool to read; the exit code is ' +
+        'unchanged, so a status that refuses still refuses',
+    )
+    .action(async (options: { repo?: string; env?: string; json?: boolean }) => {
       process.exitCode = secretsStatus(await findRepoRoot(), options);
     });
   secrets

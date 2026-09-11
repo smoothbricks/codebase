@@ -1,5 +1,5 @@
 /**
- * `smoo secrets` — the operator side of the reconciliation in ./index.ts.
+ * `smoo secrets` — the operator side of the reconciliation in ./status.ts.
  *
  * Values are handed to `gh` over stdin, never through argv (a process list is
  * world-readable) and never printed. Reading one from the terminal disables
@@ -18,19 +18,24 @@
 import { spawn, spawnSync } from 'node:child_process';
 import { getWorkspacePackages } from '../lib/workspace.js';
 import {
-  environmentsMissing,
   fetchLocalSecret,
   localSecretCommandNames,
-  reconcileSecrets,
-  type SecretRow,
   secretNameMapping,
-  unsatisfiedSecrets,
-  unwiredSecrets,
   workerSecretNames,
+  workerSecretStages,
   workflowEnvironments,
   workflowSecretNames,
 } from './index.js';
 import { resolveRepository } from './repository.js';
+import {
+  projectSecretsStatus,
+  reconcileSecrets,
+  type SecretRow,
+  type SecretsStatusDocument,
+  type SecretsStatusEnvironment,
+  stringifySecretsStatusDocument,
+  unwiredSecrets,
+} from './status.js';
 
 /**
  * Every secret this checkout declares that the repository does not hold, in
@@ -129,10 +134,10 @@ export async function writeRepositorySecret(
 
 function collectSources(
   root: string,
+  workspaceDirs: readonly string[],
   repositorySecrets: readonly string[],
   environmentSecrets: Readonly<Record<string, readonly string[]>> = {},
 ) {
-  const workspaceDirs = getWorkspacePackages(root).map((pkg) => pkg.path);
   const workerSecrets = workerSecretNames(root, workspaceDirs);
   const workflowSecrets = workflowSecretNames(root);
   const localCommands = localSecretCommandNames(root);
@@ -167,46 +172,86 @@ function describe(row: SecretRow, scopeWidth: number): string {
 }
 
 /**
- * Print every known secret and the scopes holding it. Exit code 1 when a
- * workflow promises a value no scope a bound job reads can supply — that
- * combination is the one that fails a deploy, and it fails talking about the
- * value rather than the missing secret.
+ * Everything `status` reports, read from git, `gh` and the checkout before a
+ * single line is printed. Gathering ahead of rendering is what lets one run
+ * answer either a human or a machine from exactly the same facts: `--json`
+ * cannot drift from the table because there is nothing for it to drift from.
  */
-export function secretsStatus(root: string, options: { repo?: string; env?: string }): number {
+function gatherSecretsStatus(
+  root: string,
+  options: { repo?: string; env?: string },
+): { ok: true; document: SecretsStatusDocument } | { ok: false; reason: string } {
   const resolved = resolveRepository(root, options.repo);
-  if (!resolved.ok) {
-    console.error(resolved.reason);
-    return 1;
-  }
+  if (!resolved.ok) return resolved;
   const { repo, source } = resolved.choice;
   const repositorySecrets = readRepositorySecrets(repo);
-  if (!repositorySecrets.ok) {
-    console.error(repositorySecrets.reason);
-    return 1;
-  }
+  if (!repositorySecrets.ok) return repositorySecrets;
   // The workflows decide which environments a job reads; an explicitly asked
   // for one is shown too, so an operator can inspect a scope before a workflow
   // binds it.
   const boundEnvironments = workflowEnvironments(root);
   const asked = options.env !== undefined && !boundEnvironments.includes(options.env) ? [options.env] : [];
   const environmentSecrets: Record<string, string[]> = {};
-  const unreadable: { environment: string; reason: string }[] = [];
-  for (const environment of [...boundEnvironments, ...asked]) {
-    const held = readRepositorySecrets(repo, environment);
-    if (held.ok) environmentSecrets[environment] = held.names;
-    else unreadable.push({ environment, reason: held.reason });
+  const environments: SecretsStatusEnvironment[] = [];
+  for (const name of [...boundEnvironments, ...asked]) {
+    const bound = boundEnvironments.includes(name);
+    const held = readRepositorySecrets(repo, name);
+    // An environment that cannot be read is reported, never assumed empty:
+    // guessing produces a refusal about a value that may well be set.
+    if (!held.ok) {
+      environments.push({ name, bound, readable: false, reason: held.reason });
+      continue;
+    }
+    environmentSecrets[name] = held.names;
+    environments.push({ name, bound, readable: true, secretCount: held.names.length });
   }
-  // An environment that cannot be read is reported, never assumed empty:
-  // guessing produces a refusal about a value that may well be set.
-  const readable = boundEnvironments.filter((environment) => environment in environmentSecrets);
-  const rows = reconcileSecrets(collectSources(root, repositorySecrets.names, environmentSecrets));
+  const workspaceDirs = getWorkspacePackages(root).map((pkg) => pkg.path);
+  const stageScopes = workerSecretStages(root, workspaceDirs);
+  if (!stageScopes.ok) return stageScopes;
+  return {
+    ok: true,
+    document: projectSecretsStatus({
+      repository: { repo, source, secretCount: repositorySecrets.names.length },
+      environments,
+      rows: reconcileSecrets(collectSources(root, workspaceDirs, repositorySecrets.names, environmentSecrets)),
+      stageScopes: stageScopes.byWorker,
+    }),
+  };
+}
 
-  console.log(`repository ${repo} (${source}), holding ${repositorySecrets.names.length} secrets`);
-  for (const [environment, names] of Object.entries(environmentSecrets)) {
-    console.log(`environment ${environment}, holding ${names.length} secrets`);
+/**
+ * Print every known secret and the scopes holding it, or - with `json` - the
+ * same facts as one document on stdout and nothing else. Exit code 1 when a
+ * workflow promises a value no scope a bound job reads can supply — that
+ * combination is the one that fails a deploy, and it fails talking about the
+ * value rather than the missing secret. `--json` reports that refusal in
+ * `unsatisfied` and still exits 1: a machine-readable status that always
+ * succeeded would be a status nobody could gate on.
+ */
+export function secretsStatus(root: string, options: { repo?: string; env?: string; json?: boolean }): number {
+  const gathered = gatherSecretsStatus(root, options);
+  if (!gathered.ok) {
+    console.error(gathered.reason);
+    return 1;
   }
-  for (const { environment, reason } of unreadable) {
-    console.log(`environment ${environment} could not be read, so nothing below claims what it holds: ${reason}`);
+  const { document } = gathered;
+  const { repo, source } = document.repository;
+  if (options.json) {
+    console.log(stringifySecretsStatusDocument(document));
+    return document.unsatisfied.length > 0 ? 1 : 0;
+  }
+  const rows = document.secrets;
+
+  console.log(`repository ${repo} (${source}), holding ${document.repository.secretCount} secrets`);
+  for (const environment of document.environments) {
+    if (environment.readable)
+      console.log(`environment ${environment.name}, holding ${environment.secretCount} secrets`);
+  }
+  for (const environment of document.environments) {
+    if (environment.readable) continue;
+    console.log(
+      `environment ${environment.name} could not be read, so nothing below claims what it holds: ${environment.reason}`,
+    );
   }
   const scopeWidth = Math.max('held by'.length, ...rows.map((row) => heldBy(row).length));
   console.log(`${'held by'.padEnd(scopeWidth)}  ${'name'.padEnd(32)}  workflow  local  declared by`);
@@ -236,22 +281,20 @@ export function secretsStatus(root: string, options: { repo?: string; env?: stri
     console.log(`set one:                        smoo secrets set ${needed[0]?.repositorySecret ?? 'NAME'} -R ${repo}`);
   }
 
-  const unsatisfied = unsatisfiedSecrets(rows, readable);
-  if (unsatisfied.length === 0) return 0;
+  if (document.unsatisfied.length === 0) return 0;
   console.log('');
-  for (const row of unsatisfied) {
-    const missing = environmentsMissing(row, readable);
-    const scopes = missing.length > 0 ? missing.join(', ') : 'the repository';
-    console.error(`missing: ${row.name} — a workflow passes secrets.${row.name} and no value exists in ${scopes}.`);
-    if (missing.length === 0) {
-      console.error(`  smoo secrets set ${row.repositorySecret} -R ${repo}`);
+  for (const { name, repositorySecret, missingIn } of document.unsatisfied) {
+    const scopes = missingIn.length > 0 ? missingIn.join(', ') : 'the repository';
+    console.error(`missing: ${name} — a workflow passes secrets.${name} and no value exists in ${scopes}.`);
+    if (missingIn.length === 0) {
+      console.error(`  smoo secrets set ${repositorySecret} -R ${repo}`);
       continue;
     }
-    for (const environment of missing) {
+    for (const environment of missingIn) {
       const named = environment.includes(' ') ? `'${environment}'` : environment;
-      console.error(`  smoo secrets set ${row.repositorySecret} -R ${repo} --env ${named}`);
+      console.error(`  smoo secrets set ${repositorySecret} -R ${repo} --env ${named}`);
     }
-    console.error(`  or one value for every environment:  smoo secrets set ${row.repositorySecret} -R ${repo}`);
+    console.error(`  or one value for every environment:  smoo secrets set ${repositorySecret} -R ${repo}`);
   }
   return 1;
 }
@@ -318,7 +361,8 @@ export async function secretsSet(
     }
     environmentSecrets[environment] = inEnvironment.names;
   }
-  const rows = reconcileSecrets(collectSources(root, held.names, environmentSecrets));
+  const workspaceDirs = getWorkspacePackages(root).map((pkg) => pkg.path);
+  const rows = reconcileSecrets(collectSources(root, workspaceDirs, held.names, environmentSecrets));
   const needed =
     environment === undefined ? secretsNeedingValues(rows) : secretsMissingInEnvironment(rows, environment);
   const target =

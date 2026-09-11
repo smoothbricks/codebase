@@ -3,14 +3,8 @@ import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { repositorySecretMapping } from '../lib/secret-names.js';
-import {
-  environmentsMissing,
-  reconcileSecrets,
-  type SecretRow,
-  unsatisfiedSecrets,
-  unwiredSecrets,
-  workflowEnvironments,
-} from './index.js';
+import { workflowEnvironments } from './index.js';
+import { environmentsMissing, reconcileSecrets, type SecretRow, unsatisfiedSecrets, unwiredSecrets } from './status.js';
 
 const sources = {
   workerSecrets: {

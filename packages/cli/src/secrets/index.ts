@@ -1,9 +1,11 @@
 /**
- * Reconciles the three places a repository's secrets are described, all of
- * which smoo already owns:
+ * Reads the three places a repository's secrets are described, all of which
+ * smoo already owns:
  *
  * 1. **Workers declare names.** `.dev.vars.example` per wrangler project — the
- *    file `wrangler types --env-file` reads and `prepare-env` prompts from.
+ *    file `wrangler types --env-file` reads and `prepare-env` prompts from —
+ *    and `smoo.wrangler.secretStages` beside it says which stages each name
+ *    belongs to.
  * 2. **Workflows declare where values come from.** `smoo.github.deploySecrets`
  *    and `e2eSecrets` map an env name to a repository secret, and the managed
  *    workflows render exactly those into the job environment.
@@ -17,6 +19,9 @@
  * `STRIPE_PUBLISHABLE_KEY`, `ci.yml` passes `secrets.STRIPE_PUBLISHABLE_KEY`,
  * the repository holds no such secret, and the empty value surfaces as the
  * payment library's own `publishable_key_mismatch` refusal.
+ *
+ * The join itself is ./status.ts: pure, and the owner of the document type
+ * these readings are projected into.
  */
 
 import { spawnSync } from 'node:child_process';
@@ -25,114 +30,7 @@ import { join } from 'node:path';
 import { repositoryOwnerFromUrl, repositorySecretMapping } from '../lib/secret-names.js';
 import { readPackageJsonObject, repositoryInfo } from '../lib/workspace.js';
 import { parseDevVarsExample } from '../wrangler/prepare-env.js';
-
-/** Where an env name is described, which repository secret carries it, and whether that exists. */
-export interface SecretRow {
-  name: string;
-  /** The repository secret this env name reads from, by convention or declaration. */
-  repositorySecret: string;
-  /** Wrangler projects whose `.dev.vars.example` declares it. */
-  declaredByWorkers: string[];
-  /** True when a managed workflow renders `secrets.<name>` into a job. */
-  suppliedByWorkflow: boolean;
-  /** True when `smoo.secrets` can fetch it for a developer shell. */
-  fetchableLocally: boolean;
-  /** True when the repository holds a secret of this name. */
-  onRepository: boolean;
-  /**
-   * GitHub Environments holding their own value for this name. A job bound to
-   * an environment reads that value in preference to the repository's, which
-   * is how one name carries test credentials on a preview stage and live ones
-   * in production.
-   */
-  heldByEnvironment: string[];
-}
-
-export interface SecretSources {
-  /** Worker label -> env names it declares. */
-  workerSecrets: Record<string, readonly string[]>;
-  /** Env names a managed workflow passes into a job. */
-  workflowSecrets: readonly string[];
-  /** Env name -> repository secret, by convention with declared exceptions. */
-  secretNames: Readonly<Record<string, string>>;
-  /** Env names `smoo.secrets` can fetch locally. */
-  localCommands: readonly string[];
-  /** Repository secret names GitHub currently holds. */
-  repositorySecrets: readonly string[];
-  /** Environment name -> secret names that environment holds. */
-  environmentSecrets?: Readonly<Record<string, readonly string[]>>;
-}
-
-/**
- * One row per name known to any source, sorted, so a reader sees the whole
- * picture rather than one source's view of it.
- */
-export function reconcileSecrets(sources: SecretSources): SecretRow[] {
-  const declaredByAnyWorker: string[] = Object.values(sources.workerSecrets).flatMap((names) => [...names]);
-  const names = new Set<string>([...declaredByAnyWorker, ...sources.workflowSecrets, ...sources.localCommands]);
-  // A repository secret that already carries a known env name is that name's
-  // row, not a row of its own: listing ACME_GITHUB_CLIENT_SECRET beside
-  // GITHUB_CLIENT_SECRET would report one value as two secrets, one of them
-  // permanently "declared by nothing".
-  const carriesKnownEnvName = new Set(
-    names.size > 0 ? [...names].map((name) => sources.secretNames[name] ?? name) : [],
-  );
-  // A value only an environment holds is still a value: leaving it out of the
-  // rows is how an operator ends up hunting for a secret that is already set.
-  const addUndeclared = (secret: string): void => {
-    if (!carriesKnownEnvName.has(secret)) names.add(secret);
-  };
-  for (const secret of sources.repositorySecrets) addUndeclared(secret);
-  for (const held of Object.values(sources.environmentSecrets ?? {})) {
-    for (const secret of held) addUndeclared(secret);
-  }
-  return [...names]
-    .sort((left, right) => left.localeCompare(right))
-    .map((name) => ({
-      name,
-      repositorySecret: sources.secretNames[name] ?? name,
-      declaredByWorkers: Object.entries(sources.workerSecrets)
-        .filter(([, declared]) => declared.includes(name))
-        .map(([label]) => label)
-        .sort((left, right) => left.localeCompare(right)),
-      suppliedByWorkflow: sources.workflowSecrets.includes(name),
-      fetchableLocally: sources.localCommands.includes(name),
-      onRepository: sources.repositorySecrets.includes(sources.secretNames[name] ?? name),
-      heldByEnvironment: Object.entries(sources.environmentSecrets ?? {})
-        .filter(([, held]) => held.includes(sources.secretNames[name] ?? name))
-        .map(([environment]) => environment)
-        .sort((left, right) => left.localeCompare(right)),
-    }));
-}
-
-/**
- * The rows a CI deploy cannot satisfy: a Worker declares the name, a workflow
- * promises to pass it, and the repository has no value to pass. Reported
- * separately from "declared but not wired into any workflow", because the
- * remedies differ — set a secret, versus declare it in `smoo.github`.
- */
-export function unsatisfiedSecrets(rows: readonly SecretRow[], boundEnvironments: readonly string[] = []): SecretRow[] {
-  return rows.filter((row) => {
-    if (!row.suppliedByWorkflow) return false;
-    if (row.onRepository) return false;
-    // With no environment bound, the repository is the only scope a job reads.
-    // With environments bound, each one can carry the value instead - so the
-    // name is satisfied only when every bound environment holds it.
-    if (boundEnvironments.length === 0) return true;
-    return !boundEnvironments.every((environment) => row.heldByEnvironment.includes(environment));
-  });
-}
-
-/** Bound environments that lack their own value and cannot fall back to the repository. */
-export function environmentsMissing(row: SecretRow, boundEnvironments: readonly string[]): string[] {
-  if (row.onRepository) return [];
-  return boundEnvironments.filter((environment) => !row.heldByEnvironment.includes(environment));
-}
-
-/** Worker-declared names no managed workflow passes: a CI deploy will run without them. */
-export function unwiredSecrets(rows: readonly SecretRow[]): SecretRow[] {
-  return rows.filter((row) => row.declaredByWorkers.length > 0 && !row.suppliedByWorkflow);
-}
+import { readSecretStageMap, type SecretStageMap } from '../wrangler/stage-secrets.js';
 
 /** Env names the managed workflows pass into a job, from the declarations that render them. */
 export function workflowSecretNames(root: string): string[] {
@@ -248,6 +146,34 @@ export function workerSecretNames(root: string, workspaceDirs: readonly string[]
     if (names.length > 0) byWorker[dir] = names;
   }
   return byWorker;
+}
+
+/**
+ * Every wrangler project's `smoo.wrangler.secretStages`, keyed by the project
+ * directory — the same keys `workerSecretNames` uses, so a name's scopes and
+ * its declarations are joined on one label.
+ *
+ * A malformed block is a refusal rather than a throw: it is the same class of
+ * problem as a repository `gh` will not talk to, and `smoo secrets status`
+ * reports those instead of dying with a stack. Silently reading it as "no
+ * scopes" is the one thing this must not do — that is the direction where
+ * every secret quietly reaches every stage.
+ */
+export function workerSecretStages(
+  root: string,
+  workspaceDirs: readonly string[],
+): { ok: true; byWorker: Record<string, SecretStageMap> } | { ok: false; reason: string } {
+  const byWorker: Record<string, SecretStageMap> = {};
+  for (const dir of workspaceDirs) {
+    if (!existsSync(join(root, dir, '.dev.vars.example'))) continue;
+    try {
+      const scopes = readSecretStageMap(join(root, dir));
+      if (Object.keys(scopes).length > 0) byWorker[dir] = scopes;
+    } catch (error) {
+      return { ok: false, reason: error instanceof Error ? error.message : String(error) };
+    }
+  }
+  return { ok: true, byWorker };
 }
 
 /** Names `smoo.secrets` declares a fetch command for. */
