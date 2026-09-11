@@ -1,6 +1,5 @@
-# Temporary validation transport, removed after retrieval. Only tracked source,
-# installed package directories, and public Bun/Node executables are archived.
-# No runner credentials, environment files, .git, or home directories.
+# Temporary validation transport; removed before release. Only tracked source,
+# installed packages, and public toolchain binaries are included, never credentials.
 name: StateBus validation inputs
 
 on:
@@ -15,7 +14,7 @@ jobs:
   source:
     if: github.repository == 'smoothbricks/codebase' && github.event.pull_request.head.ref == 'fix/statebus-dispatch-lifecycle'
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v6.0.2
         with:
@@ -26,9 +25,18 @@ jobs:
       - uses: actions/setup-node@v6
         with:
           node-version: '26'
-      - name: Install the checked-in dependency graph
-        run: bun install --frozen-lockfile
-      - name: Archive explicit validation inputs
+      - name: Materialize the checked-in dependency graph
+        run: |
+          sed -i 's/globalStore = true/globalStore = false/' bunfig.toml
+          bun install --frozen-lockfile --backend copyfile
+      - name: Install isolated validation extras
+        run: |
+          mkdir -p "$RUNNER_TEMP/statebus-extras"
+          printf '%s\n' '{"private":true,"dependencies":{"immer":"10.1.1","dataloader":"2.2.3","@testing-library/react":"16.3.3","@happy-dom/global-registrator":"20.13.2","@tanstack/query-core":"5.102.8","fast-check":"4.9.0"}}' > "$RUNNER_TEMP/statebus-extras/package.json"
+          printf '%s\n' '[install]' 'linker = "isolated"' 'globalStore = false' > "$RUNNER_TEMP/statebus-extras/bunfig.toml"
+          cd "$RUNNER_TEMP/statebus-extras"
+          bun install --backend copyfile
+      - name: Archive portable validation inputs
         run: |
           mkdir -p "$RUNNER_TEMP/statebus-inputs/base" "$RUNNER_TEMP/statebus-tools/bin"
           git archive --format=tar HEAD | gzip > "$RUNNER_TEMP/statebus-inputs/base/source.tar.gz"
@@ -37,48 +45,49 @@ jobs:
           (cd "$RUNNER_TEMP/statebus-inputs" && sha256sum node-modules.tar.gz > base/node-modules.sha256)
           split -b 250M -d "$RUNNER_TEMP/statebus-inputs/node-modules.tar.gz" "$RUNNER_TEMP/statebus-inputs/modules-"
           rm "$RUNNER_TEMP/statebus-inputs/node-modules.tar.gz"
+          tar -C "$RUNNER_TEMP/statebus-extras" -czf "$RUNNER_TEMP/statebus-inputs/base/extras.tar.gz" package.json bun.lock node_modules
           cp "$(command -v bun)" "$RUNNER_TEMP/statebus-tools/bin/bun"
           cp "$(command -v node)" "$RUNNER_TEMP/statebus-tools/bin/node"
           tar -C "$RUNNER_TEMP/statebus-tools" -czf "$RUNNER_TEMP/statebus-inputs/base/toolchain.tar.gz" bin
       - uses: actions/upload-artifact@v7.0.1
         with:
-          name: statebus-validation-base
+          name: statebus-portable-base
           path: ${{ runner.temp }}/statebus-inputs/base/*
           retention-days: 1
           if-no-files-found: error
       - uses: actions/upload-artifact@v7.0.1
         with:
-          name: statebus-validation-modules-00
+          name: statebus-portable-modules-00
           path: ${{ runner.temp }}/statebus-inputs/modules-00
           retention-days: 1
-          if-no-files-found: ignore
+          if-no-files-found: error
       - uses: actions/upload-artifact@v7.0.1
         with:
-          name: statebus-validation-modules-01
+          name: statebus-portable-modules-01
           path: ${{ runner.temp }}/statebus-inputs/modules-01
           retention-days: 1
           if-no-files-found: ignore
       - uses: actions/upload-artifact@v7.0.1
         with:
-          name: statebus-validation-modules-02
+          name: statebus-portable-modules-02
           path: ${{ runner.temp }}/statebus-inputs/modules-02
           retention-days: 1
           if-no-files-found: ignore
       - uses: actions/upload-artifact@v7.0.1
         with:
-          name: statebus-validation-modules-03
+          name: statebus-portable-modules-03
           path: ${{ runner.temp }}/statebus-inputs/modules-03
           retention-days: 1
           if-no-files-found: ignore
       - uses: actions/upload-artifact@v7.0.1
         with:
-          name: statebus-validation-modules-04
+          name: statebus-portable-modules-04
           path: ${{ runner.temp }}/statebus-inputs/modules-04
           retention-days: 1
           if-no-files-found: ignore
       - uses: actions/upload-artifact@v7.0.1
         with:
-          name: statebus-validation-modules-05
+          name: statebus-portable-modules-05
           path: ${{ runner.temp }}/statebus-inputs/modules-05
           retention-days: 1
           if-no-files-found: ignore
