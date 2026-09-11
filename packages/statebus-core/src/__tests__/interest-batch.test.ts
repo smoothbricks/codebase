@@ -146,3 +146,19 @@ describe('single-pass exact-interest accumulation', () => {
     ]);
   });
 });
+
+it('publishes aggregate counts for a reserved property as an own data field', () => {
+  const bus = new ManualStateBus({ initialState: initialTestState(), reducers: {} });
+  const observed: number[] = [];
+  bus.subscribe('statebus', 'substateInterest', (event) => {
+    expect(Object.hasOwn(event.payload.subscribers, '__proto__')).toBe(true);
+    // biome-ignore lint/suspicious/noProto: Deliberately test a legal own data field, not the prototype accessor.
+    observed.push(event.payload.subscribers.__proto__ ?? -1);
+    expect(Object.getPrototypeOf(event.payload.subscribers)).toBe(Object.prototype);
+  });
+  const release = bus.substateInterest(['__proto__']);
+  bus.dispatchEvents();
+  release();
+  bus.dispatchEvents();
+  expect(observed).toEqual([1, 0]);
+});

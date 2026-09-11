@@ -1,9 +1,9 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'bun:test';
 import { type ByID, ManualStateBus } from '@smoothbricks/statebus-core';
 import { Window } from 'happy-dom';
-import { act, createElement, StrictMode } from 'react';
+import { act, createElement, StrictMode, Suspense, startTransition } from 'react';
 import type { Root } from 'react-dom/client';
-import { computedHook, StatebusProvider, useSubstate } from '../react.js';
+import { computedHook, eventPublisher, StatebusProvider, useBus, useSubstate } from '../react.js';
 
 declare module '@smoothbricks/statebus-core' {
   interface States {
@@ -134,4 +134,103 @@ describe('real React subscription lifecycle in a DOM environment', () => {
     expect(container.textContent).toBe('string:b');
     expect(bus.getStateInterests()).toEqual([{ interest: { key: 'testRecords', id: 'b' }, subscribers: 1 }]);
   });
+});
+
+it('keeps equivalent primitive props and event publisher functions stable across renders', async () => {
+  const bus = createBus();
+  const { root, container } = mount();
+  let computations = 0;
+  let interestEvents = 0;
+  bus.subscribe('statebus', 'substateInterest', () => {
+    interestEvents += 1;
+  });
+  const useSummary = computedHook(
+    'summary',
+    (states, props: { id: string; label?: string }) => {
+      computations += 1;
+      return `${props.label}:${states.testRecords.get(props.id).get()}`;
+    },
+    (props) => [{ key: 'testRecords', id: props.id }],
+  );
+  const publishers: ((amount: number) => void)[] = [];
+  const rootPublishers: ((amount: number) => void)[] = [];
+  function Summary({ input }: { input: { id: string; label?: string } }) {
+    const value = useSummary(input);
+    const topic = useBus('test');
+    const all = useBus();
+    publishers.push(topic.increment);
+    rootPublishers.push(all.test.increment);
+    return createElement('span', null, value);
+  }
+  const render = (input: { id: string; label?: string }) =>
+    act(() => root.render(createElement(StatebusProvider, { value: bus }, createElement(Summary, { input }))));
+  await render({ id: 'a', label: 'first' });
+  bus.dispatchEvents();
+  for (let i = 0; i < 12; i += 1) await render({ label: 'first', id: 'a' });
+  bus.dispatchEvents();
+  expect(computations).toBe(1);
+  expect(interestEvents).toBe(1);
+  expect(publishers.every((publish) => publish === publishers[0])).toBe(true);
+  expect(rootPublishers.every((publish) => publish === rootPublishers[0])).toBe(true);
+  const mutable = { id: 'a', label: 'first' };
+  await render(mutable);
+  mutable.label = 'changed';
+  await render(mutable);
+  bus.dispatchEvents();
+  expect(container.textContent).toBe('changed:string:a');
+  expect(interestEvents).toBe(1); // Unrelated view props must not churn demand.
+  await act(() => bus.state.testRecords.get('a').set('updated'));
+  expect(container.textContent).toBe('changed:updated');
+  const direct = eventPublisher(bus, 'test');
+  expect(direct.increment).toBe(direct.increment);
+});
+
+it('does not commit interest or overwrite the current computation from an abandoned suspended render', async () => {
+  const bus = createBus();
+  const { root, container } = mount();
+  const pending = new Promise<void>(() => {});
+  function SuspendedScreen({ id }: { id: string }) {
+    const value = useLabel({ id });
+    if (id === 'suspended') throw pending;
+    return createElement('span', null, value);
+  }
+  const screen = (id: string) =>
+    createElement(
+      StatebusProvider,
+      { value: bus },
+      createElement(Suspense, { fallback: 'waiting' }, createElement(SuspendedScreen, { id })),
+    );
+  await act(() => root.render(screen('visible')));
+  bus.dispatchEvents();
+  await act(() => startTransition(() => root.render(screen('suspended'))));
+  bus.dispatchEvents();
+  expect(container.textContent).toBe('string:visible');
+  expect(bus.getStateInterests()).toEqual([{ interest: { key: 'testRecords', id: 'visible' }, subscribers: 1 }]);
+  await act(() => root.render(screen('visible')));
+  await act(() => bus.state.testRecords.get('visible').set('still-live'));
+  expect(container.textContent).toBe('still-live');
+  bus.dispatchEvents();
+  expect(bus.getStateInterests()).toEqual([{ interest: { key: 'testRecords', id: 'visible' }, subscribers: 1 }]);
+});
+
+it('rebinds publishers to a new runtime rather than emitting to a stale provider', async () => {
+  const first = createBus();
+  const second = createBus();
+  const { root } = mount();
+  let publish: ((amount: number) => void) | undefined;
+  const seen: number[] = [];
+  first.subscribe('test', 'increment', () => seen.push(1));
+  second.subscribe('test', 'increment', () => seen.push(2));
+  function Publisher() {
+    publish = useBus('test').increment;
+    return null;
+  }
+  await act(() => root.render(createElement(StatebusProvider, { value: first }, createElement(Publisher))));
+  const old = publish;
+  await act(() => root.render(createElement(StatebusProvider, { value: second }, createElement(Publisher))));
+  expect(publish).not.toBe(old);
+  publish?.(1);
+  first.dispatchEvents();
+  second.dispatchEvents();
+  expect(seen).toEqual([2]);
 });

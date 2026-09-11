@@ -92,7 +92,17 @@ export abstract class StateBus implements StateBusReader {
   readonly state: WritableState;
   private readonly exactInterest = new StateInterestRegistry<StateKeys>((changes) => {
     const subscribers: Record<string, number> = {};
-    for (const { interest } of changes) subscribers[interest.key] = this.substateInterestCount.get(interest.key) ?? 0;
+    for (const { interest } of changes) {
+      const count = this.substateInterestCount.get(interest.key) ?? 0;
+      if (interest.key === '__proto__') {
+        Object.defineProperty(subscribers, interest.key, {
+          value: count,
+          enumerable: true,
+          writable: true,
+          configurable: true,
+        });
+      } else subscribers[interest.key] = count;
+    }
     this.publish({ topic: 'statebus', type: 'substateInterest', payload: { subscribers, changes } });
   });
   readonly substateInterestCount: ReadonlyMap<StateKeys, number> = this.exactInterest.propertyCounts;

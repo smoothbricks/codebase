@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'bun:test';
-import { computed, ManualStateBus, viewPropsIdentity } from '../index.js';
+import { captureViewProps, computed, ManualStateBus, sameViewProps } from '../index.js';
 import { initialTestState } from './test-state.js';
 
 //*
@@ -83,15 +83,27 @@ describe('computed prop identity properties', () => {
     ];
     for (const left of values)
       for (const right of values) {
-        expect(viewPropsIdentity(left) === viewPropsIdentity(right)).toBe(Object.is(left, right));
-        expect(viewPropsIdentity({ value: left }) === viewPropsIdentity({ value: right })).toBe(Object.is(left, right));
+        expect(sameViewProps(left, right)).toBe(Object.is(left, right));
+        expect(sameViewProps({ value: left }, { value: right })).toBe(Object.is(left, right));
       }
   });
   it('ignores object insertion order but distinguishes changed key sets and delimiter-containing keys', () => {
     for (const value of [undefined, null, '', 'a=b,c=d', 7]) {
-      expect(viewPropsIdentity({ first: value, second: 'x' })).toBe(viewPropsIdentity({ second: 'x', first: value }));
-      expect(viewPropsIdentity({ first: value })).not.toBe(viewPropsIdentity({ first: value, second: undefined }));
-      expect(viewPropsIdentity({ 'a=b,c': value })).not.toBe(viewPropsIdentity({ a: value, 'b,c': undefined }));
+      expect(sameViewProps({ first: value, second: 'x' }, { second: 'x', first: value })).toBe(true);
+      expect(sameViewProps({ first: value }, { first: value, second: undefined })).toBe(false);
+      expect(sameViewProps({ 'a=b,c': value }, { a: value, 'b,c': undefined })).toBe(false);
     }
   });
+});
+
+it('captures caller-owned prop values and keeps reserved keys as data', () => {
+  const props = { ['__proto__']: 7, value: 'before' };
+  const captured = captureViewProps(props);
+  props.value = 'after';
+  expect(captured.value).toBe('before');
+  expect(Object.hasOwn(captured, '__proto__')).toBe(true);
+  expect(sameViewProps(captured, props)).toBe(false);
+  expect(sameViewProps({}, { missing: undefined })).toBe(false);
+  expect(sameViewProps(null, {})).toBe(false);
+  expect(captureViewProps(7)).toBe(7);
 });

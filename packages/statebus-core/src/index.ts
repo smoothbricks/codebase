@@ -72,4 +72,4 @@ export type {
   WritableState,
 } from './types.js';
 export type { ViewFunction, ViewProps } from './view.js';
-export { computed, sortedKeyValuePairs, viewPropsIdentity } from './view.js';
+export { captureViewProps, computed, sameViewProps } from './view.js';

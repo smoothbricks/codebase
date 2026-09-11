@@ -40,9 +40,9 @@ declare module '@smoothbricks/statebus-core' {
 ## React Usage
 
 ```tsx
-import { StateBus, StatebusProvider, useBus, useSubstate } from '@smoothbricks/statebus-react';
+import { MicrotaskStateBus, StatebusProvider, useBus, useSubstate } from '@smoothbricks/statebus-react';
 
-const eventBus = new StateBus({
+export const createCounterRuntime = () => new MicrotaskStateBus({
   initialState: {
     counter: 0,
   },
@@ -70,7 +70,7 @@ function Counter() {
   );
 }
 
-export function App() {
+export function App({ eventBus }: { eventBus: ReturnType<typeof createCounterRuntime> }) {
   return (
     <StatebusProvider value={eventBus}>
       <Counter />
@@ -99,3 +99,26 @@ import { ManualStateBus } from '@smoothbricks/statebus-react';
 `MicrotaskStateBus` is re-exported from core. Use it explicitly when application commands should reduce in a microtask
 rather than wait for an animation frame. It uses the same `StatebusProvider` and typed hooks. The existing `StateBus`
 alias still refers to `AnimationFrameStateBus`; this release does not silently change existing applications' scheduling.
+
+
+## Stable bindings and exact demand
+
+`useSubstate(key, id)` acquires an exact interest lease in its effect. Unchanged primitive addresses reuse the lease and
+signal; they do not create descriptor arrays or JSON identity strings on every render. Runtime/ID changes release the
+old lease and acquire the new one. StrictMode churn and removal/recreation of an interested ByID entry are covered by
+real ReactDOM tests.
+
+`computedHook` accepts primitive props or plain records of primitive props, and optional static interests or a pure
+`props => interests` function. Equivalent props reuse the existing computation without sorting/serialization. Meaningful
+changes capture the new props once. This binding cache uses React-managed render state, not a render-mutated ref:
+concurrent/suspended renders cannot overwrite the committed binding. The cache is internal renderer bookkeeping, not
+application/domain state. Changing unrelated view props does not churn unchanged resource interest.
+
+`useBus(topic)` and `useBus()` memoize their facade per runtime. A topic/event property binds its publisher function on
+first access and returns the same function on subsequent reads. A changed provider gets new publishers; old callbacks
+never silently retarget another runtime. The cache belongs to the facade, not a process-global registry. Event envelopes
+are owned publications, not reusable objects. Do not use this typed facade as an unbounded dynamic-string interner.
+
+Create a runtime at the composition boundary and pass it to `App`; create a fresh runtime per isolated test/story. None
+of these hooks introduces a module-global runtime or a QueryClient provider. The app-bound generic library composer is
+separate work; this package does not claim the full Conloca migration gate is complete.
