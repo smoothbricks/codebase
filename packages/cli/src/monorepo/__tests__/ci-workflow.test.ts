@@ -1008,6 +1008,69 @@ describe('renderCiWorkflowYaml with cross-built test archives', () => {
       'run: smoo github-ci nx-run-many --targets "cargo-cross-test-archive-x86_64-unknown-linux-musl"',
     );
     expect(rendered).not.toContain('macos-cross-tests');
+    // No native runner means no consumer, so the archive does not travel
+    // either: an artifact at 1-day retention that nothing in the run downloads
+    // is waste, and its `if-no-files-found: error` would be a failure with
+    // nobody on the other end to act on it.
+    expect(rendered).not.toContain('📤 Upload cross-target test archives');
+    expect(rendered).not.toContain('cross-test-archives-');
+  });
+
+  it('uploads only what the execution job runs, so the artifact lands where the download reads it', () => {
+    const embedded = {
+      triple: 'thumbv7em-none-eabihf',
+      path: `packages/embedded/${cargoArchive('thumbv7em-none-eabihf')}`,
+    };
+    const rendered = renderCiWorkflowYaml(options({ ...declared, crossTestArchives: [darwin, embedded] }));
+    const workflow = typia.assert<{
+      jobs: Record<
+        string,
+        { needs?: string; steps: Array<{ uses?: string; with?: { name?: string; path?: string } }> }
+      >;
+    }>(Bun.YAML.parse(rendered));
+
+    // Both triples are still BUILT — that a cross compile links is what the
+    // archive step proves, runner or no runner.
+    expect(rendered).toContain(
+      '--targets "cargo-cross-test-archive-aarch64-apple-darwin,cargo-cross-test-archive-thumbv7em-none-eabihf"',
+    );
+    // The execution job depends on the Linux job and consumes exactly the
+    // artifact that job produced: one upload step carries that name.
+    const execute = workflow.jobs['macos-cross-tests'];
+    const download = execute?.steps.find((step) => step.uses?.includes('download-artifact'))?.with;
+    const producing = (workflow.jobs.main?.steps ?? []).filter(
+      (step) => step.uses?.includes('upload-artifact') && step.with?.name === download?.name,
+    );
+    expect(execute?.needs).toBe('main');
+    expect(producing).toHaveLength(1);
+    // Only the darwin archive travels. upload-artifact roots an artifact at the
+    // least common ancestor of the files it uploaded, so adding the embedded
+    // workspace's archive would raise that root to the repository and restore
+    // the darwin archive one directory below where its runner target opens it.
+    expect(producing[0]?.with?.path?.trim()).toBe(darwin.path);
+    expect(download?.path).toBe('target/nextest');
+    expect(rendered).not.toContain(embedded.path);
+  });
+
+  it('transports the archive with the artifact actions of the forge it renders for', () => {
+    for (const actionsProvider of [undefined, 'github', 'forgejo'] as const) {
+      const workflow = typia.assert<{ jobs: Record<string, { steps: Array<{ uses?: string }> }> }>(
+        Bun.YAML.parse(renderCiWorkflowYaml(options({ ...declared, actionsProvider }))),
+      );
+      const artifacts = Object.values(workflow.jobs)
+        .flatMap((job) => job.steps)
+        .filter((step) => step.uses?.includes('-artifact'));
+
+      // A runner resolves every action reference before it evaluates any step
+      // condition, so a single foreign one keeps the workflow from starting at
+      // all — which is why the cross archive uses the same provider seam every
+      // other artifact here does instead of naming `actions/` itself.
+      expect(artifacts.filter((step) => step.uses?.includes('download-artifact'))).toHaveLength(1);
+      for (const step of artifacts) {
+        expect(step.uses?.startsWith('https://code.forgejo.org/')).toBe(actionsProvider === 'forgejo');
+        expect(step.uses?.startsWith('actions/')).toBe(actionsProvider !== 'forgejo');
+      }
+    }
   });
 
   it('downloads a nested cargo workspace archive back to the directory its target writes', () => {

@@ -186,10 +186,15 @@ export function defineCiWorkflow(options: CiWorkflowDefinitionOptions): CiWorkfl
         name: 'Check cross-platform toolchain prerequisites',
       });
     }
-    steps.push(
-      { kind: CiWorkflowStepKind.CrossTestArchives, name: '🎯 Build cross-target test archives' },
-      { kind: CiWorkflowStepKind.UploadCrossTestArchives, name: '📤 Upload cross-target test archives' },
-    );
+    steps.push({ kind: CiWorkflowStepKind.CrossTestArchives, name: '🎯 Build cross-target test archives' });
+    // The artifact has exactly one consumer, the execution job below. A triple
+    // with no native runner here is already proved by the build above, so
+    // uploading its archive would ship a file nothing in the run downloads —
+    // and would move the artifact's root off the directory the download
+    // restores to.
+    if (darwinCrossTestArchives(options).length > 0) {
+      steps.push({ kind: CiWorkflowStepKind.UploadCrossTestArchives, name: '📤 Upload cross-target test archives' });
+    }
   }
   if (options.browserTests) {
     steps.push({ kind: CiWorkflowStepKind.BrowserTests, name: '🌐 Browser Tests' });
@@ -421,12 +426,17 @@ function yamlLinesForStep(step: CiWorkflowStep, options: CiWorkflowDefinitionOpt
         `        run: smoo github-ci nx-run-many --targets "${crossArchiveTargetNames(options).join(',')}"`,
       ];
     case CiWorkflowStepKind.UploadCrossTestArchives:
-      // retention-days: 1 — the only consumer is the sibling job in this same
-      // run, and these archives are the whole workspace's test binaries.
+      // Exactly the archives the sibling job EXECUTES, which is what keeps the
+      // artifact's root where the download expects it: upload-artifact roots an
+      // artifact at the least common ancestor of the files it uploaded, so a
+      // foreign triple's archive under another cargo workspace would raise that
+      // root to the repository and restore every path one directory too deep.
+      // retention-days: 1 — the only consumer is that job in this same run, and
+      // these archives are the whole workspace's test binaries.
       return artifactStepLines(options.actionsProvider, step.name, 'upload', [
         `name: ${CROSS_TEST_ARCHIVE_ARTIFACT}`,
         'path: |',
-        ...crossTestArchives(options).map((archive) => `  ${archive.path}`),
+        ...darwinCrossTestArchives(options).map((archive) => `  ${archive.path}`),
         // error, not ignore: a missing archive means the cross build silently
         // produced nothing, and the execute job would then have nothing to run
         // and no reason to say so.
@@ -1249,12 +1259,14 @@ function darwinCrossTestTargetNames(options: CiWorkflowDefinitionOptions): strin
 }
 
 /**
- * Where the download lands. upload-artifact roots an artifact at the least
- * common ancestor of the files it uploaded, so every archive in one artifact
- * has to share a parent directory for the restored layout to be the one the
- * runner targets read — true for one cargo workspace, false the moment a
- * second one also declares cross targets, which is refused here instead of
- * silently restoring the archives one directory too high.
+ * Where the download lands, and the artifact's root by construction: the upload
+ * step carries exactly these archives, and upload-artifact roots an artifact at
+ * the least common ancestor of the files it uploaded.
+ *
+ * One cargo workspace's triples all share `target/nextest` and travel together.
+ * Two workspaces that each declare a darwin triple do not: their common
+ * ancestor is above the directory the runner targets read from, so the pair is
+ * refused here instead of restoring both archives one directory too high.
  */
 function crossTestArchiveDirectory(options: CiWorkflowDefinitionOptions): string {
   const directories = new Set(
