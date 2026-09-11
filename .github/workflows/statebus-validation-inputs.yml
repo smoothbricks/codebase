@@ -1,5 +1,5 @@
 # Temporary validation transport, removed after retrieval. The artifact contains
-# only tracked source, package directories, and public Bun/Node executables.
+# only tracked source, public package directories, and public Bun/Node executables.
 # No environment files, runner home directories, credentials, or .git data.
 name: StateBus validation inputs
 
@@ -13,7 +13,7 @@ permissions:
 
 jobs:
   source:
-    if: github.repository == 'smoothbricks/codebase' && github.event.pull_request.head.ref == 'fix/statebus-dispatch-lifecycle'
+    if: github.repository == 'smoothbricks/codebase' && github.event.pull_request.head.ref == 'feat/statebus-loader-navigation'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -34,6 +34,8 @@ jobs:
           git archive --format=tar HEAD | gzip > "$RUNNER_TEMP/statebus-inputs/source.tar.gz"
           find . -type d -name node_modules -prune -print0 > "$RUNNER_TEMP/node-module-paths"
           tar --null -T "$RUNNER_TEMP/node-module-paths" -czf "$RUNNER_TEMP/statebus-inputs/node-modules.tar.gz"
+          # Only public package directories, not cache credentials or the runner's home.
+          tar -C "$HOME/.bun/install/cache" -czf "$RUNNER_TEMP/statebus-inputs/cache-links.tar.gz" links
           cp "$(command -v bun)" "$RUNNER_TEMP/statebus-tools/bin/bun"
           cp "$(command -v node)" "$RUNNER_TEMP/statebus-tools/bin/node"
           tar -C "$RUNNER_TEMP/statebus-tools" -czf "$RUNNER_TEMP/statebus-inputs/toolchain.tar.gz" bin
