@@ -166,3 +166,32 @@ it('does not replay a failed reducer wave when the queue storage is reused', () 
   expect(() => bus.dispatchEvents()).not.toThrow();
   expect(seen).toEqual([1, 2, 3]);
 });
+
+it('leaves successor work scheduled after a reducer fails', () => {
+  class ObservedBus extends ManualStateBus {
+    scheduled = 0;
+    protected override scheduleDispatch() {
+      this.scheduled += 1;
+    }
+  }
+  const seen: number[] = [];
+  const bus = new ObservedBus({
+    initialState,
+    reducers: {
+      count: {
+        increment: (_state, value) => {
+          seen.push(value);
+          if (value === 1) {
+            bus.publish(increment(2));
+            throw new Error('programmer error');
+          }
+        },
+      },
+    },
+  });
+  bus.publish(increment(1));
+  expect(() => bus.dispatchEvents()).toThrow('programmer error');
+  expect(bus.scheduled).toBe(2);
+  bus.dispatchEvents();
+  expect(seen).toEqual([1, 2]);
+});

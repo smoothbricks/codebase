@@ -132,6 +132,8 @@ export abstract class StateBus implements StateBusReader {
       this.dispatchQueuedEvents();
     } finally {
       this.dispatching = false;
+      // A failed reducer may have published work before throwing.
+      if (this.queuedEventCount > 0) this.scheduleDispatch();
     }
   }
 
@@ -155,6 +157,7 @@ export abstract class StateBus implements StateBusReader {
 
   private dispatchWave(eventQueue: readonly (AnyEvent | undefined)[], eventCount: number): void {
     let firstInterestEvent: Event<'statebus', 'substateInterest'> | undefined;
+    let multipleInterests = false;
     // Reduce the complete wave before any listener observes it.
     for (let index = 0; index < eventCount; index += 1) {
       const event = eventQueue[index];
@@ -164,19 +167,27 @@ export abstract class StateBus implements StateBusReader {
       const event = eventQueue[index];
       if (!event) continue;
       if (event.topic === 'statebus' && event.type === 'substateInterest') {
-        firstInterestEvent ??= event;
-        this.interestCounts.append(event.payload.subscribers);
+        if (firstInterestEvent === undefined) {
+          firstInterestEvent = event;
+        } else {
+          if (!multipleInterests) {
+            this.interestCounts.append(firstInterestEvent.payload.subscribers);
+            multipleInterests = true;
+          }
+          this.interestCounts.append(event.payload.subscribers);
+        }
       } else {
         this.dispatchEvent(event);
       }
     }
+    if (!firstInterestEvent) return;
+    if (!multipleInterests) {
+      this.dispatchEvent(firstInterestEvent);
+      return;
+    }
     const subscribers = this.interestCounts.take();
-    if (firstInterestEvent && subscribers) {
-      this.dispatchEvent(
-        subscribers === firstInterestEvent.payload.subscribers
-          ? firstInterestEvent
-          : { topic: 'statebus', type: 'substateInterest', payload: { subscribers } },
-      );
+    if (subscribers) {
+      this.dispatchEvent({ topic: 'statebus', type: 'substateInterest', payload: { subscribers } });
     }
   }
 
