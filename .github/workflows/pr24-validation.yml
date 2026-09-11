@@ -5,36 +5,67 @@ on:
     branches: [assist/pr24-validation]
 
 permissions:
-  actions: read
   contents: read
 
 jobs:
-  diagnostics:
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
+  generator-contract:
+    runs-on: [nixos-latest-x64, self-hosted]
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: tooling/direnv
+    env:
+      GH_TOKEN: ${{ github.token }}
     steps:
-      - name: Extract failure diagnostics
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - uses: actions/checkout@v6.0.2
+        with:
+          ref: fc6b982ef8dfdee13d68e617e6c01a2927c963b1
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: ./.github/actions/setup-devenv
+        id: setup
+      - name: Build using the repository toolchain
+        run: nx run-many -t build -p nx-plugin,cli
+      - name: Exercise the native Nx entry points
         run: |
           set -euo pipefail
-          mkdir -p "$RUNNER_TEMP/diagnostics"
-          gh api --allow-escape-sequences /repos/smoothbricks/codebase/actions/jobs/103426206377/logs > "$RUNNER_TEMP/diagnostics/job.log"
+          nx generate @smoothbricks/nx-plugin:managed-files --dry-run --interactive=false
+          nx generate @smoothbricks/nx-plugin:managed-files --interactive=false
+          nx sync
+          nx sync:check
+          git diff --binary > "$RUNNER_TEMP/first-generation.diff"
+          nx generate @smoothbricks/nx-plugin:managed-files --interactive=false
+          nx sync:check
+          git diff --binary > "$RUNNER_TEMP/second-generation.diff"
+          cmp "$RUNNER_TEMP/first-generation.diff" "$RUNNER_TEMP/second-generation.diff"
+      - name: Verify packaged generator assets
+        working-directory: packages/nx-plugin
+        run: |
+          set -euo pipefail
+          bun pm pack --filename "$RUNNER_TEMP/nx-plugin.tgz"
           python3 - <<'PY'
-          import os, pathlib, re
-          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'diagnostics'
-          lines = re.sub(r'\x1b\[[0-9;]*m', '', (root / 'job.log').read_text()).splitlines()
-          selected = set()
-          for i, line in enumerate(lines):
-              if re.search(r'✗ |❌|error:|Error:|FIXABLE| lint/| formatter|FAILED|Run summary', line):
-                  selected.update(range(max(0, i-8), min(len(lines), i+20)))
-          output = '\n'.join(f'{i+1}: {lines[i]}' for i in sorted(selected))
-          (root / 'failures.txt').write_text(output + '\n')
-          print(output)
+          import json, os, pathlib, tarfile
+          with tarfile.open(pathlib.Path(os.environ['RUNNER_TEMP']) / 'nx-plugin.tgz') as archive:
+              members = {member.name for member in archive.getmembers()}
+              for path in ['dist/managed-files/generator.js', 'src/managed-files/schema.json', 'managed/raw/tooling/devenv', 'managed/raw/tooling/direnv/devenv.smoo.nix']:
+                  assert f'package/{path}' in members, path
+              registry = json.load(archive.extractfile('package/generators.json'))
+              declaration = registry['generators']['managed-files']
+              for field in ['factory', 'schema']:
+                  assert 'package/' + declaration[field].removeprefix('./') in members, declaration[field]
+          print('Packaged generator entry point, schema and managed assets verified.')
           PY
-      - uses: actions/upload-artifact@v7.0.1
+      - name: Save validation diagnostics
+        if: always()
+        uses: actions/upload-artifact@v7.0.1
         with:
-          name: cli-refactor-diagnostics
-          path: ${{ runner.temp }}/diagnostics
+          name: native-generator-diagnostics
+          path: |
+            ${{ runner.temp }}/first-generation.diff
+            ${{ runner.temp }}/second-generation.diff
+          if-no-files-found: ignore
           retention-days: 1
-          if-no-files-found: error
+      - uses: ./.github/actions/save-nix-devenv
+        if: always()
+        with:
+          devenv-cache-hit: ${{ steps.setup.outputs.devenv-cache-hit }}
