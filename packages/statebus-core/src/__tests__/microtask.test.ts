@@ -1,0 +1,51 @@
+import { describe, expect, it } from 'bun:test';
+import { MicrotaskStateBus } from '../microtask.js';
+
+function createBus() {
+  return new MicrotaskStateBus({
+    initialState: { counter: 0, counter1: 0, counter2: 0 },
+    reducers: { count: { increment: (state, amount) => state.counter.update((value) => value + amount) } },
+  });
+}
+
+const increment = (payload: number) => ({ topic: 'count', type: 'increment', payload }) as const;
+
+describe('microtask scheduling', () => {
+  it('reduces a complete wave before notifying listeners without waiting for a paint', async () => {
+    const bus = createBus();
+    const observed: number[] = [];
+    bus.subscribe('count', 'increment', () => observed.push(bus.state.counter.get()));
+    bus.publish(increment(1));
+    bus.publish(increment(2));
+    expect(bus.state.counter.get()).toBe(0);
+    await Promise.resolve();
+    expect(observed).toEqual([3, 3]);
+    expect(bus.state.counter.get()).toBe(3);
+  });
+
+  it('does not duplicate delivery after an explicit manual flush', async () => {
+    const bus = createBus();
+    let calls = 0;
+    bus.subscribe('count', 'increment', () => {
+      calls += 1;
+    });
+    bus.publish(increment(1));
+    bus.dispatchEvents();
+    await Promise.resolve();
+    expect(calls).toBe(1);
+    expect(bus.state.counter.get()).toBe(1);
+  });
+
+  it('keeps listener publications in the following wave', async () => {
+    const bus = createBus();
+    const observed: number[] = [];
+    bus.subscribe('count', 'increment', (event) => {
+      observed.push(bus.state.counter.get());
+      if (event.payload === 1) bus.publish(increment(4));
+    });
+    bus.publish(increment(1));
+    bus.publish(increment(2));
+    await Promise.resolve();
+    expect(observed).toEqual([3, 3, 7]);
+  });
+});
