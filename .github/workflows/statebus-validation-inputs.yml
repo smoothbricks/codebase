@@ -1,6 +1,5 @@
-# Temporary validation transport, removed after retrieval. The artifact contains
-# only tracked source, public package directories, and public Bun/Node executables.
-# No environment files, runner home directories, credentials, or .git data.
+# Temporary validation transport; removed after public test dependencies are retrieved.
+# Explicit package directories only. No credentials, environment, .git or runner-home archive.
 name: StateBus validation inputs
 
 on:
@@ -28,20 +27,60 @@ jobs:
           node-version: '26'
       - name: Install the checked-in dependency graph
         run: bun install --frozen-lockfile
-      - name: Archive explicit validation inputs
+      - name: Archive explicit validation inputs with bounded artifact sizes
         run: |
-          mkdir -p "$RUNNER_TEMP/statebus-inputs" "$RUNNER_TEMP/statebus-tools/bin"
-          git archive --format=tar HEAD | gzip > "$RUNNER_TEMP/statebus-inputs/source.tar.gz"
+          mkdir -p "$RUNNER_TEMP/statebus-inputs/base" "$RUNNER_TEMP/statebus-tools/bin"
+          git archive --format=tar HEAD | gzip > "$RUNNER_TEMP/statebus-inputs/base/source.tar.gz"
           find . -type d -name node_modules -prune -print0 > "$RUNNER_TEMP/node-module-paths"
-          tar --null -T "$RUNNER_TEMP/node-module-paths" -czf "$RUNNER_TEMP/statebus-inputs/node-modules.tar.gz"
-          # Only public package directories, not cache credentials or the runner's home.
+          tar --null -T "$RUNNER_TEMP/node-module-paths" -czf "$RUNNER_TEMP/statebus-inputs/base/node-modules.tar.gz"
+          # Bun globalStore links point outside node_modules: include just those public package directories.
           tar -C "$HOME/.bun/install/cache" -czf "$RUNNER_TEMP/statebus-inputs/cache-links.tar.gz" links
+          (cd "$RUNNER_TEMP/statebus-inputs" && sha256sum cache-links.tar.gz > base/cache-links.sha256)
+          split -b 250M -d "$RUNNER_TEMP/statebus-inputs/cache-links.tar.gz" "$RUNNER_TEMP/statebus-inputs/cache-"
+          test ! -f "$RUNNER_TEMP/statebus-inputs/cache-06"
+          rm "$RUNNER_TEMP/statebus-inputs/cache-links.tar.gz"
           cp "$(command -v bun)" "$RUNNER_TEMP/statebus-tools/bin/bun"
           cp "$(command -v node)" "$RUNNER_TEMP/statebus-tools/bin/node"
-          tar -C "$RUNNER_TEMP/statebus-tools" -czf "$RUNNER_TEMP/statebus-inputs/toolchain.tar.gz" bin
+          tar -C "$RUNNER_TEMP/statebus-tools" -czf "$RUNNER_TEMP/statebus-inputs/base/toolchain.tar.gz" bin
       - uses: actions/upload-artifact@v7.0.1
         with:
-          name: statebus-validation-environment
-          path: ${{ runner.temp }}/statebus-inputs/*.tar.gz
+          name: statebus-loader-validation-base
+          path: ${{ runner.temp }}/statebus-inputs/base/*
           retention-days: 1
           if-no-files-found: error
+      - uses: actions/upload-artifact@v7.0.1
+        with:
+          name: statebus-loader-validation-cache-00
+          path: ${{ runner.temp }}/statebus-inputs/cache-00
+          retention-days: 1
+          if-no-files-found: ignore
+      - uses: actions/upload-artifact@v7.0.1
+        with:
+          name: statebus-loader-validation-cache-01
+          path: ${{ runner.temp }}/statebus-inputs/cache-01
+          retention-days: 1
+          if-no-files-found: ignore
+      - uses: actions/upload-artifact@v7.0.1
+        with:
+          name: statebus-loader-validation-cache-02
+          path: ${{ runner.temp }}/statebus-inputs/cache-02
+          retention-days: 1
+          if-no-files-found: ignore
+      - uses: actions/upload-artifact@v7.0.1
+        with:
+          name: statebus-loader-validation-cache-03
+          path: ${{ runner.temp }}/statebus-inputs/cache-03
+          retention-days: 1
+          if-no-files-found: ignore
+      - uses: actions/upload-artifact@v7.0.1
+        with:
+          name: statebus-loader-validation-cache-04
+          path: ${{ runner.temp }}/statebus-inputs/cache-04
+          retention-days: 1
+          if-no-files-found: ignore
+      - uses: actions/upload-artifact@v7.0.1
+        with:
+          name: statebus-loader-validation-cache-05
+          path: ${{ runner.temp }}/statebus-inputs/cache-05
+          retention-days: 1
+          if-no-files-found: ignore
