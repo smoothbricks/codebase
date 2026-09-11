@@ -21,7 +21,7 @@
     "@swc/core": "1.15.43",
     "@swc/helpers": "0.5.23",
     "@types/bun": "1.4.2",
-    "@types/node": "~26.1.1",
+    "@types/node": "^26.5.1",
     "@typescript-eslint/eslint-plugin": "^8.59.1",
     "@typescript-eslint/parser": "^8.59.1",
     "@typescript/native": "npm:typescript@^7.0.2",

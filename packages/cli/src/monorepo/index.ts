@@ -125,6 +125,9 @@ export async function updateManagedFiles(root: string): Promise<void> {
   // features once for every member, or each per-crate cargo invocation
   // recompiles the shared graph for its own selection.
   applyCargoFeatureUnification(root);
+  // packageManager, engines.node and the @types pins are derived from the
+  // resolved toolchain, so update recomputes them.
+  await syncRootRuntimeVersions(root);
   syncBunLockfileVersions(root, { mode: 'install' });
   console.log('installing     workspace dependencies (bun install)');
   await run('bun', ['install', '--no-summary'], root);
