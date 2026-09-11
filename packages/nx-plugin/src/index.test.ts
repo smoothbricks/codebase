@@ -882,6 +882,11 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       ).toBe(true);
       expect(napiInputs).not.toContain('{workspaceRoot}/bun.lock');
       expect(napiInputs.some((input) => typeof input === 'string' && input.endsWith('/package.json'))).toBe(false);
+      // ... and on the toolchain pin, which it must state itself: `napi build`
+      // compiles with the pinned rustc but never spells `cargo --frozen`, so
+      // the sweep that gives every other cargo target its identity skips it.
+      expect(napiInputs).toContain('{workspaceRoot}/devenv.lock');
+      expect(napiInputs).toContain('{workspaceRoot}/tooling/direnv/devenv.lock');
       expect(native['napi-debug']?.options).toMatchObject({
         cwd: '.',
         command:

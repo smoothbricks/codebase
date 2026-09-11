@@ -324,10 +324,17 @@ function targetCommandText(target: TargetConfiguration): string {
   ].join('\n');
 }
 /**
- * The N-API build's inputs beyond the Cargo sources: the package's `napi`
- * block, which names the binary and the targets, and the napi CLI's resolved
- * version from the lockfile. Neither the package version nor any other
- * lockfile entry is part of the artifact.
+ * The N-API build's inputs beyond the Cargo sources: the toolchain pin, the
+ * package's `napi` block, which names the binary and the targets, and the napi
+ * CLI's resolved version from the lockfile. Neither the package version nor
+ * any other lockfile entry is part of the artifact.
+ *
+ * The pin is stated here rather than inherited: `napi build` compiles with the
+ * same rustc and links against the same SDK as any other cargo target, but its
+ * command does not spell `cargo --frozen`, which is how every other cached
+ * cargo target acquires its toolchain identity. Without it a `.node` linked
+ * against one toolchain hashed equal to the same sources linked against the
+ * next one.
  */
 function napiInputs(projectRoot: string, repoRooted: boolean): TargetConfiguration['inputs'] {
   // Runtime inputs execute from the workspace root, so the manifest is named
@@ -335,6 +342,7 @@ function napiInputs(projectRoot: string, repoRooted: boolean): TargetConfigurati
   const packageJson = `./${posix.join(projectRoot, 'package.json')}`;
   return [
     ...(repoRooted ? REPO_ROOT_CARGO_OUTPUT_INPUTS : CARGO_OUTPUT_INPUTS),
+    ...CARGO_TOOLCHAIN_PIN_INPUTS,
     { runtime: `bun -e 'console.log(JSON.stringify(require(${JSON.stringify(packageJson)}).napi ?? null))'` },
     { externalDependencies: ['@napi-rs/cli'] },
   ];
