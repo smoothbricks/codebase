@@ -365,7 +365,7 @@ describe('Span Scope Attributes', () => {
     // ctx.ok(v).status(...) / ctx.err(v).status(...) — reproducing the spec's exact
     // example table (01i lines 306-334), which no test exercised before this setter
     // existed (every prior test here uses bare ctx.ok('done')).
-    test('ctx.ok(v).status(...) overrides scope on row 1 only, log entries keep scope default', async () => {
+    test.each(['ok', 'err'])('ctx.%s(v).status(...) overrides only row 1, leaving scope defaults intact', async (kind) => {
       const schema = defineLogSchema({
         status: S.category(),
         orderId: S.category(),
@@ -382,22 +382,14 @@ describe('Span Scope Attributes', () => {
         ctx.log.info('Step 2').status('validating'); // row 3: direct write wins
         ctx.log.info('Step 3'); // row 4: no direct write, keeps scope value
 
-        // ctx.ok()'s declared return type stays Ok<S,T> (not the wider OkResult<S,T>)
-        // because OkResult's per-field setters make T invariant, which breaks
-        // assignability to OpFn's Result<S,E> — see spanContextTypes.ts's WHY on
-        // SpanContext.ok. The setter exists on the returned object at runtime
-        // regardless; invoke it via Reflect like the internals this suite already
-        // probes (e.g. capability-span-context.test.ts's `_state`/`_writer` checks).
-        const okResult = ctx.ok({ done: true });
-        const statusSetter = Reflect.get(okResult, 'status');
-        if (typeof statusSetter !== 'function') throw new TypeError('ok result missing status setter');
-        Reflect.apply(statusSetter, okResult, ['completed']); // row 1: ok() wins over scope
-        return okResult;
+        const result = kind === 'ok' ? ctx.ok({ done: true }) : ctx.err({ code: 'FAILED' });
+        expect(result.status('completed')).toBe(result); // row 1: direct write wins
+        return result;
       });
 
       const { trace, rootBuffers } = new TestTracer(ctx, { ...createTestTracerOptions() });
       const result = await trace('test-span', testOp);
-      expect(result.success).toBe(true);
+      expect(result.success).toBe(kind === 'ok');
 
       const table = convertSpanTreeToArrowTable(rootBuffers[0]);
       expect(getColumnValue(table, 'status', 0)).toBe('started'); // tag wins row 0

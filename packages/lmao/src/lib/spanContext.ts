@@ -36,7 +36,7 @@ import { TransientError } from './errors/Transient.js';
 import type { Op } from './op.js';
 import type { OpContext, OpMetadata, SpanContext, SpanFn, SpanLogger, SpanSyncFn } from './opContext/types.js';
 import type { CallsitePlan, PhysicalLayoutPlan } from './physicalLayoutPlan.js';
-import { Err, hasErrorCode, Ok, type Result, SPAN_COMPLETION_OWNER_ERROR } from './result.js';
+import { Err, type ErrResult, hasErrorCode, Ok, type OkResult, type Result, SPAN_COMPLETION_OWNER_ERROR } from './result.js';
 import {
   RUNTIME_HINT_DEPS,
   RUNTIME_HINT_FF,
@@ -828,8 +828,8 @@ export function createSpanContextClass<Ctx extends OpContext>(
     [key: string]: unknown;
 
     declare setScope: (attributes: ScopeUpdate<Ctx['logSchema']> | null) => void;
-    declare ok: <V>(value: V) => Ok<V, Ctx['logSchema']>;
-    declare err: <E>(error: E) => Err<E, Ctx['logSchema']>;
+    declare ok: <V>(value: V) => OkResult<V, Ctx['logSchema']>;
+    declare err: <E>(error: E) => ErrResult<E, Ctx['logSchema']>;
     declare span: SpanFn<Ctx>;
     declare spanSync: SpanSyncFn<Ctx>;
 
@@ -887,17 +887,11 @@ export function createSpanContextClass<Ctx extends OpContext>(
       }
 
       if (hasResult) {
-        // OkClass/ErrClass are per-schema subclasses of Ok/Err carrying row-1 fluent
-        // setters (ctx.ok(v).status(200)) — see getResultClasses' WHY in result.ts for
-        // why `state` (always `this` here) is required on these constructors. The
-        // setters aren't reflected in ctx.ok's *declared* return type (Ok<V,T>, not
-        // OkResult<V,T>) — see spanContextTypes.ts's WHY on SpanContext.ok for the
-        // variance conflict that creates with OpFn's Result<S,E> — but the object
-        // returned still carries them at runtime; reach them via `.with({...})` in
-        // typed code, or `.status(200)` directly where the concrete type is known.
+        // The selected schema-bound classes write directly to this context's row 1.
+        // State is required: it is both the writer target and completion owner.
         const { OkClass, ErrClass } = callsitePlan;
-        this.ok = <V>(value: V): Ok<V, Ctx['logSchema']> => new OkClass<V>(value, this);
-        this.err = <E>(error: E): Err<E, Ctx['logSchema']> => new ErrClass<E>(error, this);
+        this.ok = <V>(value: V): OkResult<V, Ctx['logSchema']> => new OkClass<V>(value, this);
+        this.err = <E>(error: E): ErrResult<E, Ctx['logSchema']> => new ErrClass<E>(error, this);
       }
       //#endregion smoo/lmao!n/codegen-destructured-context
 

@@ -199,9 +199,7 @@ function createBasePlan<T extends LogSchema, Ctx extends OpContext<T>>(
     eagerColumns.names,
     enumLookup,
   );
-  // OkClass/ErrClass only vary with messageLayoutFamily + enumLookup (see getResultClasses'
-  // WHY comment) — no eagerColumns/messagePhysicalLayout dependency, unlike ResultWriterClass.
-  const { OkClass, ErrClass } = getResultClasses(schema, messageLayoutFamily, enumLookup);
+  const { OkClass, ErrClass } = getResultClasses<T>(ResultWriterClass);
   const needsTag = (capabilities & RUNTIME_HINT_TAG) !== 0;
   const TagWriterClass = needsTag ? getTagWriterClass(schema, eagerColumns.names, enumLookup) : undefined;
   const newSpanLogger =
