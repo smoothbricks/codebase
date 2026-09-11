@@ -23,6 +23,14 @@ import type { SchemaFields } from './types.js';
  */
 const RESERVED_NAMES = new Set([
   // Technically conflicting - methods on TagWriter/FluentLogEntry/result objects
+  'then', // Prevent Promise/await from treating results as thenables
+  'constructor', // Reserved by JavaScript classes and generated writers
+  'toString', // Object protocol members must not become field setters
+  'toLocaleString',
+  'valueOf',
+  'hasOwnProperty',
+  'isPrototypeOf',
+  'propertyIsEnumerable',
   'with', // Used on TagWriter, FluentLogEntry, Ok, Err
   'message', // Used on Ok, Err
   'line', // Used on Ok, Err, FluentLogEntry (also a system column)
