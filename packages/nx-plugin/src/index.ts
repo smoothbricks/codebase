@@ -269,15 +269,40 @@ const REPO_ROOT_CARGO_OUTPUT_INPUTS = [
   '{workspaceRoot}/scripts/*.sh',
   '!{workspaceRoot}/**/target/**',
 ];
-// The environment half of a cargo task's identity. Beyond cargo/rustc's own
-// variables, every build script that compiles C/C++ reads the Apple SDK
-// (SDKROOT, DEVELOPER_DIR, the deployment targets), bindgen reads its libclang
-// and extra clang args, cmake-rs forwards CMAKE_*, and zig-based cross links
-// read ZIG*. An output linked against one sysroot must never hash equal to
-// the same sources linked against another.
-const CARGO_ENVIRONMENT_INPUT = {
-  runtime: `bun -e 'const fs = require("node:fs"); const path = require("node:path"); const home = process.env.CARGO_HOME || path.join(require("node:os").homedir(), ".cargo"); console.log(JSON.stringify({env: Object.entries(process.env).filter(([name]) => /^(?:CARGO_|RUST|NEXTEST_|CLIPPY_|CC(?:_|$)|CXX(?:_|$)|AR(?:_|$)|CFLAGS|CXXFLAGS|CPPFLAGS|LDFLAGS|PKG_CONFIG|TARGET_|HOST_|SDKROOT$|DEVELOPER_DIR$|MACOSX_DEPLOYMENT_TARGET$|IPHONEOS_DEPLOYMENT_TARGET$|LIBCLANG_PATH$|BINDGEN_EXTRA_CLANG_ARGS|CMAKE_|ZIG)/.test(name)).sort(([a], [b]) => a.localeCompare(b)), config: ["config", "config.toml"].map(name => { const file = path.join(home, name); return fs.existsSync(file) ? fs.readFileSync(file, "utf8") : null; })}));'`,
-};
+// The toolchain half of a cargo task's identity: the DECLARED pin, hashed as
+// an ordinary file. devenv resolves this lock into the rustc, cargo, linker,
+// C toolchain and SDK that every cargo command inherits, so a bump here is
+// exactly the event that must invalidate a cached artifact — and it is the
+// only such event the workspace can state portably.
+//
+// This replaces a runtime input that dumped the ambient cargo environment
+// (every CARGO_*/RUST*/CC*/AR*/SDKROOT/LIBCLANG_PATH/CMAKE_*/ZIG* variable,
+// plus the contents of $CARGO_HOME/config{,.toml}). That bought the same
+// invalidation at the price of two defects. Its values are absolute
+// `/nix/store/<hash>-…` paths and per-checkout devenv state directories, so
+// no two machines ever agree and no cargo target can share a cache entry
+// with a peer or with CI — a remote cache for Rust was dead on arrival. And
+// the dump differs between a bare shell and a devenv profile for the SAME
+// sources: `bun run check:linux` runs inside the `linux-cross` profile
+// (AR=x86_64-unknown-linux-gnu-ar, CARGO_TARGET_X86_64_…_LINKER set) and
+// writes an entry the bare pre-push `cargo-lint-cross` probe can never hit.
+// Measured: a green `check:linux` followed by `Cache: 0/1 hit`.
+//
+// A file input has neither defect. The lock's bytes are identical bare and
+// in-profile, and identical on every machine holding this checkout, while
+// the toolchain VERSIONS the dump was really guarding are already covered
+// twice over — by the pin itself and by the `rustc -vV && cargo -V` runtime
+// input alongside it, whose output is byte-identical in both shells
+// (measured). Nothing machine-local survives.
+//
+// Both fleet locations are declared: the pin lives at `tooling/direnv/` in
+// every repository and additionally at the root in one. A fileset that
+// matches nothing contributes nothing — the same property the inert
+// `rust-toolchain*` entries already rely on.
+const CARGO_TOOLCHAIN_PIN_INPUTS: readonly string[] = [
+  '{workspaceRoot}/devenv.lock',
+  '{workspaceRoot}/tooling/direnv/devenv.lock',
+];
 
 function cargoRuntimeInput(projectRoot: string, command: string): { runtime: string } {
   const quotedRoot = `'${projectRoot.replaceAll("'", "'\"'\"'")}'`;
@@ -496,7 +521,7 @@ function createCargoTestArchiveTarget(projectRoot: string, toolConfig: string): 
  * (measured: `metadata … --frozen` and `test --no-run … --frozen`).
  *
  * The archive target therefore states `CARGO_FETCH_TARGET` and the toolchain
- * runtime inputs itself: both are otherwise attached by matching the
+ * inputs itself: both are otherwise attached by matching the
  * `cargo --frozen` prefix in a command, and this command does not carry it.
  *
  * The RUNNER declares no dependency on the archive and is not cached. That is
@@ -522,18 +547,21 @@ function createCargoCrossTestTargets(
     [cargoCrossTestArchiveTargetName(triple)]: {
       executor: 'nx:run-commands',
       cache: true,
-      // The two runtime inputs every cached cargo target carries, plus the
-      // declared driver's own bytes. They are attached elsewhere by matching
-      // the `cargo --frozen` prefix in a command, which this one does not
-      // spell — and they matter MORE here than anywhere else: the cross
-      // environment (SDKROOT, CC_<triple>, ZIG*, and CARGO itself) is what
-      // decides whether these bytes are Mach-O at all, so an archive linked
-      // against one sysroot must never hash equal to the same sources linked
-      // against another.
+      // The toolchain inputs every cached cargo target carries, plus the
+      // declared driver's own bytes. Those toolchain inputs are attached
+      // elsewhere by matching the `cargo --frozen` prefix in a command,
+      // which this one does not spell — and the pin matters MORE here than
+      // anywhere else: the cross regime this archive links under (the C
+      // toolchain for the triple, its sysroot, and the `CARGO` driver below)
+      // comes out of the same devenv lock, so an archive built under one pin
+      // must never hash equal to the same sources built under another. The
+      // declared driver is hashed by its own bytes; nothing samples the shell
+      // that supplies it, which is why this hash is the same bare and inside
+      // the cross profile.
       inputs: [
         ...archiveInputs,
+        ...CARGO_TOOLCHAIN_PIN_INPUTS,
         ...(cargo === undefined ? [] : [`{projectRoot}/${cargo}`]),
-        cargoRuntimeInput(projectRoot, CARGO_ENVIRONMENT_INPUT.runtime),
         cargoRuntimeInput(projectRoot, 'rustc -vV && cargo -V && cargo nextest --version'),
       ],
       outputs: [`{projectRoot}/${archiveFile}`],
@@ -1320,7 +1348,7 @@ async function createProjectTargets(
         : '';
     target.inputs = [
       ...(target.inputs ?? CARGO_INPUTS),
-      cargoRuntimeInput(typeof cwd === 'string' ? cwd : projectRoot, CARGO_ENVIRONMENT_INPUT.runtime),
+      ...CARGO_TOOLCHAIN_PIN_INPUTS,
       cargoRuntimeInput(typeof cwd === 'string' ? cwd : projectRoot, `rustc -vV && cargo -V${versions}`),
     ];
   }

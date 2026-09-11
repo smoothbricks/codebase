@@ -984,45 +984,74 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
     }
   });
 
-  it('invalidates cached lint verdicts for Cargo target, profile and global configuration changes', async () => {
+  it('keys every cached cargo target on the declared toolchain pin', async () => {
     const workspace = await createWorkspace();
     try {
-      await workspace.write('package.json', '{"name":"cache-fixture"}\n');
-      await workspace.write('Cargo.toml', '[workspace]\nmembers = ["crate"]\n');
-      await workspace.write('crate/Cargo.toml', '[package]\nname = "cache-crate"\n');
-      await workspace.write('cargo-home/config.toml', '[build]\njobs = 1\n');
-      const targets = await inferProjectTargets(workspace, 'package.json');
-      const runtimeCommands = (targets['cargo-lint']?.inputs ?? []).flatMap((input) =>
-        typeof input !== 'string' && 'runtime' in input ? [input.runtime] : [],
-      );
-      const capture = async (extraEnv: Record<string, string>) =>
-        Promise.all(
-          runtimeCommands.map(async (command) => {
-            const child = Bun.spawn(['sh', '-c', command], {
-              cwd: workspace.context.workspaceRoot,
-              env: { ...process.env, CARGO_HOME: join(workspace.context.workspaceRoot, 'cargo-home'), ...extraEnv },
-              stdout: 'pipe',
-              stderr: 'pipe',
-            });
-            const [exitCode, stdout, stderr] = await Promise.all([
-              child.exited,
-              new Response(child.stdout).text(),
-              new Response(child.stderr).text(),
-            ]);
-            expect({ exitCode, stderr }).toMatchObject({ exitCode: 0 });
-            return stdout;
-          }),
+      await writeCargoIdentityFixture(workspace);
+      const targets = await inferProjectTargets(workspace, 'packages/ferris/package.json');
+      const cached = cachedCargoTargets(targets);
+
+      // Named, so a family that stops being cached — or a new one that starts —
+      // shows up here rather than silently leaving the sweep below empty.
+      expect(cached.map(([name]) => name).sort()).toEqual([
+        'cargo-cross-test-archive-aarch64-apple-darwin',
+        'cargo-lint',
+        'cargo-lint-cross',
+        'cargo-test-archive',
+        'cargo-test-ferris-core',
+      ]);
+      // An SDK or toolchain change must invalidate every one of them. The pin
+      // is the only thing in the identity that can see one, and it is declared
+      // at both fleet locations because a fileset matching nothing is free.
+      for (const [name, target] of cached) {
+        const declared = (target.inputs ?? []).filter(
+          (input) => typeof input === 'string' && input.endsWith('devenv.lock'),
         );
-      const baseline = await capture({});
-      expect(await capture({ CARGO_BUILD_TARGET: 'wasm32-unknown-unknown' })).not.toEqual(baseline);
-      expect(await capture({ CARGO_PROFILE_DEV_OPT_LEVEL: '2' })).not.toEqual(baseline);
-      expect(await capture({ UNRELATED_FIXTURE_VARIABLE: 'changed' })).toEqual(baseline);
-      await workspace.write('cargo-home/config.toml', '[build]\njobs = 2\n');
-      expect(await capture({})).not.toEqual(baseline);
+        expect([name, declared]).toEqual([
+          name,
+          ['{workspaceRoot}/devenv.lock', '{workspaceRoot}/tooling/direnv/devenv.lock'],
+        ]);
+      }
     } finally {
       await workspace.cleanup();
     }
-  }, 30_000);
+  });
+
+  // The property that decides whether Rust can ever use a shared cache. A cargo
+  // target's identity used to include a dump of the ambient cargo environment,
+  // whose values are absolute `/nix/store/…` and per-checkout devenv state
+  // paths: no two machines agreed, and the same target hashed differently in a
+  // bare shell and inside a devenv profile, which made the pre-push
+  // cross-compile probe unsatisfiable by construction.
+  //
+  // Runtime inputs are checked by their OUTPUT, not their command text, because
+  // that is what Nx hashes: measured, two workspaces at different absolute
+  // paths whose only difference is the spelling of a runtime command producing
+  // identical stdout hash identically.
+  it('hashes no machine-local value into a cached cargo target', async () => {
+    const workspace = await createWorkspace();
+    try {
+      await writeCargoIdentityFixture(workspace);
+      const targets = await inferProjectTargets(workspace, 'packages/ferris/package.json');
+      const offenders: string[] = [];
+      for (const [name, target] of cachedCargoTargets(targets)) {
+        for (const input of target.inputs ?? []) {
+          if (typeof input === 'string') {
+            if (!WORKSPACE_ANCHORED_INPUT.test(input)) offenders.push(`${name}: fileset ${input}`);
+            continue;
+          }
+          if ('env' in input) offenders.push(`${name}: environment input ${String(input.env)}`);
+          if (!('runtime' in input)) continue;
+          const value = await runtimeInputValue(input.runtime, workspace.context.workspaceRoot);
+          const rooted = PATH_OUTSIDE_WORKSPACE.exec(value);
+          if (rooted) offenders.push(`${name}: runtime input yields ${rooted[0].trim()} — from ${input.runtime}`);
+        }
+      }
+      expect(offenders).toEqual([]);
+    } finally {
+      await workspace.cleanup();
+    }
+  }, 60_000);
 
   it('scopes each per-crate cargo-test command to exactly one package', async () => {
     const workspace = await createWorkspace();
@@ -1981,6 +2010,62 @@ interface WorkspaceFixture {
   context: CreateNodesContextV2;
   write(filePath: string, contents: string): Promise<void>;
   cleanup(): Promise<void>;
+}
+
+/**
+ * A fileset Nx resolves against the workspace, or a named input nx.json
+ * declares. Anything else is a path this machine happens to have.
+ */
+const WORKSPACE_ANCHORED_INPUT = /^!?(?:\{(?:projectRoot|workspaceRoot)\}\/|\^?[A-Za-z][\w-]*$)/;
+
+/** A path rooted outside the workspace, wherever it appears in a hashed value. */
+const PATH_OUTSIDE_WORKSPACE = /(?:^|[^\w.\-~])(\/[\w.-]+\/[\w.-]+)/;
+
+/**
+ * One Cargo workspace producing every cached cargo target family inference can
+ * make: the host archive, a per-crate run, both lint verdicts, and — through
+ * the `cross-targets` declaration — the foreign-triple archive, which states
+ * its own inputs instead of receiving them from the `cargo --frozen` sweep.
+ */
+async function writeCargoIdentityFixture(workspace: WorkspaceFixture): Promise<void> {
+  await workspace.write('packages/ferris/package.json', '{"name":"ferris"}\n');
+  await workspace.write(
+    'packages/ferris/Cargo.toml',
+    '[workspace]\nmembers = ["crates/ferris-core"]\n\n' +
+      '[workspace.metadata.smoothbricks.test]\n' +
+      'cross-targets = [{ target = "aarch64-apple-darwin", cargo = "scripts/cargo-for-nextest.sh" }]\n',
+  );
+  await workspace.write('packages/ferris/crates/ferris-core/Cargo.toml', '[package]\nname = "ferris-core"\n');
+  await workspace.write('packages/ferris/scripts/cargo-for-nextest.sh', '#!/bin/sh\nexec cargo "$@"\n');
+}
+
+/**
+ * The targets a cache verdict can be wrong about: cached, and running cargo.
+ * Derived rather than listed, so a new cargo family joins these assertions the
+ * day it is inferred instead of the day someone remembers to add it.
+ */
+function cachedCargoTargets(targets: Record<string, TargetConfiguration>): [string, TargetConfiguration][] {
+  return Object.entries(targets).filter(([, target]) => {
+    const command: unknown = target.options?.command;
+    const commands: unknown = target.options?.commands;
+    const text = [
+      typeof command === 'string' ? command : '',
+      ...(Array.isArray(commands) ? commands.filter((entry) => typeof entry === 'string') : []),
+    ].join('\n');
+    return target.cache === true && /\bcargo/.test(text);
+  });
+}
+
+/** What Nx actually hashes for a `runtime` input: the command's stdout. */
+async function runtimeInputValue(command: string, cwd: string): Promise<string> {
+  const child = Bun.spawn(['sh', '-c', command], { cwd, stdout: 'pipe', stderr: 'pipe' });
+  const [exitCode, stdout, stderr] = await Promise.all([
+    child.exited,
+    new Response(child.stdout).text(),
+    new Response(child.stderr).text(),
+  ]);
+  expect({ command, exitCode, stderr }).toMatchObject({ command, exitCode: 0 });
+  return stdout;
 }
 
 async function inferProject(
