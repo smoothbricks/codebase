@@ -1,0 +1,31 @@
+name: CLI refactor validation
+
+on:
+  push:
+    branches: [assist/pr24-validation]
+
+permissions:
+  contents: read
+
+jobs:
+  source:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6.0.2
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - name: Export tracked source and test runtime
+        run: |
+          mkdir -p "$RUNNER_TEMP/cli-refactor-source"
+          git archive --format=tar HEAD | gzip > "$RUNNER_TEMP/cli-refactor-source/source.tar.gz"
+          cp "$(command -v bun)" "$RUNNER_TEMP/cli-refactor-source/bun"
+      - uses: actions/upload-artifact@v7.0.1
+        with:
+          name: cli-refactor-source
+          path: ${{ runner.temp }}/cli-refactor-source
+          retention-days: 1
+          if-no-files-found: error
