@@ -131,13 +131,18 @@ describe('actual browser history with StateBus and React StrictMode', () => {
   });
   it('installs a real beforeunload guard only while dirty and removes it on disposal', async () => {
     await page.click('#guard'); // Native dialogs require user activation.
-    const dialog = page.waitForEvent('dialog');
-    await page.evaluate(() => {
-      location.href = '/leave';
+    // A native modal suspends evaluate(). Handle it concurrently, before waiting
+    // for the attempted navigation to return, or the test deadlocks itself.
+    const dismissed = page.waitForEvent('dialog').then(async (prompt) => {
+      expect(prompt.type()).toBe('beforeunload');
+      await prompt.dismiss();
     });
-    const prompt = await dialog;
-    expect(prompt.type()).toBe('beforeunload');
-    await prompt.dismiss();
+    await Promise.all([
+      dismissed,
+      page.evaluate(() => {
+        location.href = '/leave';
+      }),
+    ]);
     expect(new URL(page.url()).pathname).toBe('/');
     const cdp = await context.newCDPSession(page);
     const remote = await cdp.send('Runtime.evaluate', { expression: 'window' });
