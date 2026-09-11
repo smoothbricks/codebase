@@ -108,6 +108,14 @@ Reach for the result's setters — not `ctx.tag` — for anything that isn't kno
 that differs by branch, for example): tagging it up front would record that value even on a path that never reaches
 it. See [Integrate with an HTTP framework](/guides/integrate-with-http-framework/).
 
+The setters are schema-typed and remain available after `.with()`, `.message()`, `.line()`, and result mapping.
+For example, `ctx.ok(42).map(String).status(200)` keeps the same span ownership and row-1 target. Standalone
+`new Ok(...)` and `new Err(...)` do not have schema-specific setters.
+
+Schema field names must not collide with result members such as `success`, `value`, `map`, or `toJSON`.
+`then` and `constructor` are also reserved to protect JavaScript promise and class behavior; rename existing
+fields that use these names before adopting this API.
+
 ## `ctx.buffer`
 
 The span's underlying buffer. Useful in tests for querying the span tree (`querySpan(ctx.buffer)`) and for reading
