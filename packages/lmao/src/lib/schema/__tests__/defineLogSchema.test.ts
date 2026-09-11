@@ -190,9 +190,29 @@ describe('defineLogSchema with Sury', () => {
   });
 
   test.each([
-    'success', 'value', 'error', 'map', 'mapErr', 'flatMap', 'match', 'isOk', 'isErr',
-    'maybeValue', 'maybeError', 'unwrapOr', 'unwrapOrElse', 'toJSON', 'line', 'then', 'constructor',
-    'toString', 'toLocaleString', 'valueOf', 'hasOwnProperty', 'isPrototypeOf', 'propertyIsEnumerable',
+    'success',
+    'value',
+    'error',
+    'map',
+    'mapErr',
+    'flatMap',
+    'match',
+    'isOk',
+    'isErr',
+    'maybeValue',
+    'maybeError',
+    'unwrapOr',
+    'unwrapOrElse',
+    'toJSON',
+    'line',
+    'then',
+    'constructor',
+    'toString',
+    'toLocaleString',
+    'valueOf',
+    'hasOwnProperty',
+    'isPrototypeOf',
+    'propertyIsEnumerable',
   ])('rejects result member or protocol name %s in definitions and extensions', (name) => {
     expect(() => defineLogSchema({ [name]: S.text() })).toThrow(/reserved/i);
     const base = new LogSchema({ requestId: S.category() });
