@@ -1,0 +1,45 @@
+# Temporary validation transport, removed after retrieval. The artifact contains
+# only tracked source, package directories, and public Bun/Node executables.
+# No environment files, runner home directories, credentials, or .git data.
+name: StateBus validation inputs
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/statebus-validation-inputs.yml
+
+permissions:
+  contents: read
+
+jobs:
+  source:
+    if: github.repository == 'smoothbricks/codebase' && github.event.pull_request.head.ref == 'fix/statebus-dispatch-lifecycle'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6.0.2
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: '1.4.2'
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '26'
+      - name: Install the checked-in dependency graph
+        run: bun install --frozen-lockfile
+      - name: Archive explicit validation inputs
+        run: |
+          mkdir -p "$RUNNER_TEMP/statebus-inputs" "$RUNNER_TEMP/statebus-tools/bin"
+          git archive --format=tar HEAD | gzip > "$RUNNER_TEMP/statebus-inputs/source.tar.gz"
+          find . -type d -name node_modules -prune -print0 > "$RUNNER_TEMP/node-module-paths"
+          tar --null -T "$RUNNER_TEMP/node-module-paths" -czf "$RUNNER_TEMP/statebus-inputs/node-modules.tar.gz"
+          cp "$(command -v bun)" "$RUNNER_TEMP/statebus-tools/bin/bun"
+          cp "$(command -v node)" "$RUNNER_TEMP/statebus-tools/bin/node"
+          tar -C "$RUNNER_TEMP/statebus-tools" -czf "$RUNNER_TEMP/statebus-inputs/toolchain.tar.gz" bin
+      - uses: actions/upload-artifact@v7.0.1
+        with:
+          name: statebus-validation-environment
+          path: ${{ runner.temp }}/statebus-inputs/*.tar.gz
+          retention-days: 1
+          if-no-files-found: error
