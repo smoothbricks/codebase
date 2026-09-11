@@ -24,6 +24,8 @@
     "rustWorkspace": [
       "{workspaceRoot}/Cargo.toml",
       "{workspaceRoot}/Cargo.lock",
+      "{workspaceRoot}/devenv.lock",
+      "{workspaceRoot}/tooling/direnv/devenv.lock",
       "{workspaceRoot}/.cargo/config.toml",
       "{workspaceRoot}/packages/columine/crates/**/*.rs",
       "{workspaceRoot}/packages/columine/crates/**/Cargo.toml",
