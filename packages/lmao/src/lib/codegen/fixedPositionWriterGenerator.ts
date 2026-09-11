@@ -219,7 +219,7 @@ interface RuntimeFixedWriter {
   readonly _state: WriterState;
 }
 
-export interface FixedFieldPlan {
+interface FixedFieldPlan {
   readonly fieldName: string;
   readonly encode: ((value: unknown) => number) | undefined;
 }
@@ -235,10 +235,7 @@ function writeFixedField(writer: RuntimeFixedWriter, fieldName: string, position
 }
 
 /** Preserve the generated writer's schema order and enum-binding semantics. */
-export function createFixedFieldPlans(
-  schema: LogSchema,
-  enumLookup: SchemaEnumLookupDescriptor,
-): readonly FixedFieldPlan[] {
+function createFixedFieldPlans(schema: LogSchema, enumLookup: SchemaEnumLookupDescriptor): readonly FixedFieldPlan[] {
   const enumFieldNames = new Set<string>();
   for (const { fieldName } of enumLookup.ordered) enumFieldNames.add(fieldName);
 
@@ -281,11 +278,7 @@ function createFieldSetterDescriptor(plan: FixedFieldPlan, position: number): Pr
 }
 
 /** Install the schema-specific fluent API with class-member-equivalent descriptors. */
-export function installFixedWriterMethods(
-  prototype: object,
-  plans: readonly FixedFieldPlan[],
-  position: number,
-): void {
+function installFixedWriterMethods(prototype: object, plans: readonly FixedFieldPlan[], position: number): void {
   const bulkMethods = {
     with(this: RuntimeFixedWriter, attributes: Readonly<Record<string, unknown>>) {
       for (const plan of plans) {
@@ -436,7 +429,7 @@ function messageLaneOf(buffer: AnySpanBuffer): (string | undefined)[] {
 }
 
 /** Install result-row system setters mirroring createResultWriterExtension without source text. */
-export function installResultSystemMethods(prototype: object, messageLayoutFamily: MessageLayoutFamily): void {
+function installResultSystemMethods(prototype: object, messageLayoutFamily: MessageLayoutFamily): void {
   const methods =
     messageLayoutFamily === 'static-only'
       ? {

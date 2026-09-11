@@ -319,17 +319,12 @@ describe('specialized SpanContext runtime semantics', () => {
       expectThinWriter(logger, ctx);
       expect(Object.is(logger.info(`${label}-log`).marker(`${label}-log-marker`), logger)).toBe(true);
 
-      // OkClass/ErrClass (getResultClasses in result.ts) install row-1 fluent setters —
-      // including with()/message()/line() — directly on the schema-bound subclass
-      // prototype, writing straight through ctx._spanBuffer. That shadows the base
-      // Ok/Err's lazy `_resultWriter()` indirection, so `_writer` never materializes for
-      // a schema-bound result (unlike a state-less `new Ok(value)`, which still lazily
-      // builds one on first `.with()`/`.message()`/`.line()` call). Assert the writes
-      // land on the buffer directly instead of asserting a `_writer` object appears.
+      // Schema-bound results reuse the plan's writer methods without a second
+      // writer allocation. Standalone results without a state remain no-ops.
       const ok = ctx.ok({ label });
       expect(Reflect.get(ok, '_state')).toBe(ctx);
       expect(Object.hasOwn(ok, '_writer')).toBe(false);
-      expect(ok.with({ marker: `${label}-ok` })).toBe(ok);
+      expect(ok.with({ marker: `${label}-bulk` }).marker(`${label}-ok`)).toBe(ok);
       expect(Object.hasOwn(ok, '_writer')).toBe(false);
       expect(ctx.buffer.marker_values[1]).toBe(`${label}-ok`);
       expect(ok.message(`${label} ok`).line(101)).toBe(ok);
@@ -340,7 +335,7 @@ describe('specialized SpanContext runtime semantics', () => {
       const err = ctx.err(TEST_FAILURE({ reason: label }));
       expect(Reflect.get(err, '_state')).toBe(ctx);
       expect(Object.hasOwn(err, '_writer')).toBe(false);
-      expect(err.with({ marker: `${label}-err` })).toBe(err);
+      expect(err.with({ marker: `${label}-bulk` }).marker(`${label}-err`)).toBe(err);
       expect(Object.hasOwn(err, '_writer')).toBe(false);
       expect(ctx.buffer.marker_values[1]).toBe(`${label}-err`);
       expect(err.message(`${label} error`).line(202)).toBe(err);
