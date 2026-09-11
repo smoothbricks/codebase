@@ -3,6 +3,8 @@ import { join } from 'node:path';
 import type { Tree } from 'nx/src/devkit-exports.js';
 import { readJson, updateJson } from 'nx/src/devkit-exports.js';
 
+import { CARGO_TEST_TARGET } from './cargo-workspace.js';
+
 export interface NxPolicyIssue {
   path: string;
   message: string;
@@ -23,6 +25,37 @@ export const BUILD_OUTPUT_DEPENDENCIES = [
 export const MACOS_PLATFORM_TARGET_GLOBS = ['*-macos', '*-ios'] as const;
 export const LINUX_PLATFORM_TARGET_GLOBS = ['*-linux'] as const;
 export const PLATFORM_TARGET_GLOBS = [...MACOS_PLATFORM_TARGET_GLOBS, ...LINUX_PLATFORM_TARGET_GLOBS] as const;
+
+const buildOutputTargetSuffixes = BUILD_OUTPUT_DEPENDENCIES.map((glob) => glob.slice(1));
+
+/**
+ * The glob list above, spelled as a target name: a target whose name ends in a
+ * reserved family suffix EMITS that kind of artifact. Inference collects
+ * exactly these names into the `nx:noop` build aggregate, which makes this the
+ * same rule that decides whether a hand-declared aggregate names an edge
+ * inference could have produced on its own — one definition, two readers, so
+ * the removal policy cannot drift away from what it judges redundant.
+ */
+export function isBuildOutputTargetName(name: string): boolean {
+  return buildOutputTargetSuffixes.some((suffix) => name.endsWith(suffix));
+}
+
+/**
+ * A target whose job is to RUN tests. `test`, anything under `test-`/`test:`,
+ * and the plugin's own `cargo-test-<crate>` namespace. Deliberately name-based:
+ * the aggregate is assembled from declared AND inferred target names, and a
+ * declaration carries no marker saying "this executes rather than emits".
+ *
+ * A runner collides with the families by construction whenever its name ends in
+ * one: a crate named `…-js` puts `cargo-test-<crate>` in the family, and a bun
+ * suite named `test-bun` reads as "tool=test, output=bun". Both would drag a
+ * test suite into `build`, so the rule is the CLASS, not one namespace.
+ */
+export function isTestRunnerTargetName(name: string): boolean {
+  return (
+    name === 'test' || name.startsWith('test-') || name.startsWith('test:') || name.startsWith(`${CARGO_TEST_TARGET}-`)
+  );
+}
 
 const nxJsTypescriptPlugin = '@nx/js/typescript';
 const smoothBricksNxPlugin = '@smoothbricks/nx-plugin';

@@ -7,6 +7,8 @@ import { boundedTestScriptAlias } from './bounded-test-policy.js';
 import { isNonSourceDirectory } from './source-directories.js';
 import {
   BUILD_OUTPUT_DEPENDENCIES,
+  isBuildOutputTargetName,
+  isTestRunnerTargetName,
   LINUX_PLATFORM_TARGET_GLOBS,
   MACOS_PLATFORM_TARGET_GLOBS,
   type NxPolicyIssue,
@@ -18,7 +20,6 @@ export type { NxPolicyIssue };
 export interface ResolvedProjectTargets {
   root?: string;
   targets: ReadonlySet<string>;
-  buildDependsOn?: readonly string[];
   targetDependencies?: ReadonlyMap<string, readonly string[]>;
   targetExecutors?: ReadonlyMap<string, string>;
   targetOptions?: ReadonlyMap<string, Readonly<Record<string, unknown>>>;
@@ -190,15 +191,6 @@ function resolvedProjectTargetNames(
   return isResolvedProjectTargets(resolvedProject) ? resolvedProject.targets : resolvedProject;
 }
 
-function resolvedProjectBuildDependsOn(
-  resolvedProject?: ReadonlySet<string> | ResolvedProjectTargets,
-): readonly string[] | undefined {
-  if (!isResolvedProjectTargets(resolvedProject)) {
-    return undefined;
-  }
-  return resolvedProject.buildDependsOn;
-}
-
 function resolvedProjectTargetExecutor(
   resolvedProject: ReadonlySet<string> | ResolvedProjectTargets | undefined,
   targetName: string,
@@ -286,43 +278,75 @@ function isNoopTarget(target: Record<string, unknown>): boolean {
   return !options || stringProperty(options, 'command') === null;
 }
 
-function targetDependenciesMatchResolvedBuild(
-  target: Record<string, unknown>,
-  resolvedBuildDependsOn: readonly string[],
-): boolean {
-  if (!Array.isArray(target.dependsOn)) {
+/**
+ * Properties the inferred aggregate already sets to exactly these values. A
+ * declaration carrying anything else — `inputs`, `outputs`, `cache: false`, a
+ * `configurations` block — is CHANGING the aggregate, not restating it.
+ */
+const inferredNoopBuildProperties: Record<string, true> = { executor: true, cache: true, dependsOn: true };
+
+/**
+ * Can the build-aggregate inference produce this edge on its own?
+ *
+ * The inferred aggregate is `^build` plus the project's own build-output
+ * targets — `isBuildOutputTargetName`, test runners excluded — and
+ * `BUILD_OUTPUT_DEPENDENCIES` is the glob spelling of that same list. Anything
+ * else is an edge only the declaration carries: a project-local target outside
+ * the families (`build-cli`), or a `project:target` edge to a sibling target
+ * that is not named `build`, which `^build` never visits.
+ */
+function isInferredBuildDependency(dependency: unknown, resolvedTargets: ReadonlySet<string>): boolean {
+  if (typeof dependency !== 'string') {
     return false;
   }
-  const expected = new Set(resolvedBuildDependsOn);
-  if (target.dependsOn.length !== expected.size) {
-    return false;
+  if (dependency === '^build' || isBuildOutputDependencyPattern(dependency)) {
+    return true;
   }
-  return target.dependsOn.every((dependency) => {
-    if (typeof dependency !== 'string') {
-      return false;
-    }
-    return expected.has(dependency);
-  });
+  return isBuildOutputTargetName(dependency) && !isTestRunnerTargetName(dependency) && resolvedTargets.has(dependency);
 }
 
+function isRedundantBuildDeclaration(build: Record<string, unknown>, resolvedTargets: ReadonlySet<string>): boolean {
+  if (!Object.keys(build).every((key) => inferredNoopBuildProperties[key] === true)) {
+    return false;
+  }
+  if ('cache' in build && build.cache !== true) {
+    return false;
+  }
+  // An empty list is a deliberate cut — "this aggregate waits for nothing" —
+  // and restoring the inferred edges by deleting it is a behaviour change.
+  return (
+    Array.isArray(build.dependsOn) &&
+    build.dependsOn.length > 0 &&
+    build.dependsOn.every((dependency) => isInferredBuildDependency(dependency, resolvedTargets))
+  );
+}
+
+/**
+ * A hand-declared `build` is deleted only when inference provably rebuilds it.
+ *
+ * Deliberately NOT decided against the resolved project graph. Nx replaces a
+ * named property of an inferred target with the declared one, so the resolved
+ * `build.dependsOn` IS the declaration: comparing them answered "redundant"
+ * for every noop aggregate anyone ever wrote. AxE's `containium` lost seven
+ * edges that way — four of them targets no inference can reach — and a clean
+ * checkout then built it without its producers. The question this has to
+ * answer is what inference yields WITHOUT the declaration, so the test is
+ * structural: every declared edge must be one the aggregate already collects.
+ */
 function removeRedundantNoopBuildTarget(
   pkg: Record<string, unknown>,
   resolvedProject?: ReadonlySet<string> | ResolvedProjectTargets,
 ): boolean {
   const resolvedTargets = resolvedProjectTargetNames(resolvedProject);
-  const resolvedBuildDependsOn = resolvedProjectBuildDependsOn(resolvedProject);
-  if (!resolvedTargets?.has('build') || !resolvedBuildDependsOn) {
+  // No build-output target in the project, no inferred aggregate to fall back
+  // on: deleting the declaration would leave it with no `build` at all.
+  if (!resolvedTargets?.has('build') || ![...resolvedTargets].some(isBuildOutputTargetName)) {
     return false;
   }
   const nx = recordProperty(pkg, 'nx');
   const targets = nx ? recordProperty(nx, 'targets') : null;
   const build = targets ? recordProperty(targets, 'build') : null;
-  if (
-    !targets ||
-    !build ||
-    !isNoopTarget(build) ||
-    !targetDependenciesMatchResolvedBuild(build, resolvedBuildDependsOn)
-  ) {
+  if (!targets || !build || !isNoopTarget(build) || !isRedundantBuildDeclaration(build, resolvedTargets)) {
     return false;
   }
   delete targets.build;

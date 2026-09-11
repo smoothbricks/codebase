@@ -49,7 +49,7 @@ import {
 } from './cross-check-policy.js';
 import { hashVersionlessCrateManifests } from './manifest-hash.js';
 import { isNonSourceDirectory } from './source-directories.js';
-import { PLATFORM_TARGET_GLOBS } from './workspace-config-policy.js';
+import { isBuildOutputTargetName, isTestRunnerTargetName, PLATFORM_TARGET_GLOBS } from './workspace-config-policy.js';
 
 export { CARGO_TEST_COMPILE_TARGET };
 
@@ -58,7 +58,6 @@ export const DEPLOY_TARGET = 'deploy';
 /** The purely file-derived half a deploy needs built first; cached. */
 export const DEPLOY_BUILD_TARGET = 'deploy-build';
 
-const BUILD_OUTPUT_TARGET_PATTERN = /-(?:js|web|html|css|android|native|napi|bun|wasm)$/;
 /** The workspace-wide manifests a release rewrites: the version of every member, and the lockfile mirror of it. */
 const RELEASE_REWRITTEN_WORKSPACE_INPUTS = ['{workspaceRoot}/package.json', '{workspaceRoot}/bun.lock'];
 const TYPESCRIPT_TOOLCHAIN_INPUTS = [
@@ -204,34 +203,16 @@ function hostPlatformTargetNames(targetNames: Iterable<string>, hostPlatform: Na
  * its name ends in a family: `*-js`, `*-web`, `*-html`, `*-css`, `*-android`,
  * `*-native`, `*-napi`, `*-bun`, `*-wasm`.
  *
- * Two spellings of the same collision. A per-crate cargo test runner is
- * `cargo-test-<crate>`, so any crate whose name ends in a family put its RUNNER
- * in the aggregate; the runners are one serialized chain, so a single such
- * crate made `build` pull an entire cargo test suite. A bun suite named
- * `test-bun` is the collision without the prefix — a runner reading as
- * "tool=test, output=bun", swept into `build` by suffix alone. That one forced
- * a consumer to hand-declare `build` purely to replace the inferred list.
- *
  * So the rule is the CLASS, not one namespace: a target that RUNS tests is
  * never a build output, however it is spelled. Expanding the families here
- * rather than delegating to Nx's matcher is what makes that expressible.
+ * rather than delegating to Nx's matcher is what makes that expressible, and
+ * `package-target-policy` reads the same two predicates to decide whether a
+ * hand-declared aggregate is naming an edge this list already produces.
  */
 function buildOutputTargetNames(targetNames: Iterable<string>): string[] {
   return [...new Set(targetNames)]
-    .filter((name) => BUILD_OUTPUT_TARGET_PATTERN.test(name) && !isTestRunnerTargetName(name))
+    .filter((name) => isBuildOutputTargetName(name) && !isTestRunnerTargetName(name))
     .sort();
-}
-
-/**
- * A target whose job is to RUN tests. `test`, anything under `test-`/`test:`,
- * and the plugin's own `cargo-test-<crate>` namespace. Deliberately name-based:
- * the aggregate is assembled from declared AND inferred target names, and a
- * declaration carries no marker saying "this executes rather than emits".
- */
-function isTestRunnerTargetName(name: string): boolean {
-  return (
-    name === 'test' || name.startsWith('test-') || name.startsWith('test:') || name.startsWith(`${CARGO_TEST_TARGET}-`)
-  );
 }
 
 //#region smoo!n/rust-output-target-inference
@@ -2041,7 +2022,7 @@ function classifyPackageLocalBuildOutputs(packageJson: PackageJson): { ordinary:
   const targets = packageJson.nx?.targets;
   const targetNames = isRecord(targets) ? Object.keys(targets) : [];
   return {
-    ordinary: targetNames.some((targetName) => BUILD_OUTPUT_TARGET_PATTERN.test(targetName)),
+    ordinary: targetNames.some(isBuildOutputTargetName),
     platform: targetNames.some((targetName) =>
       PLATFORM_TARGET_GLOBS.some((glob) => targetName.endsWith(glob.slice(1))),
     ),

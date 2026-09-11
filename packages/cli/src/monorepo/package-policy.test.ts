@@ -532,12 +532,7 @@ describe('workspace package script policy', () => {
     });
     try {
       await writeJson(join(root, 'packages/native/tsconfig.lib.json'), {});
-      const resolvedTargetsByProject = new Map([
-        [
-          'native',
-          { targets: new Set(['build', 'tsc-js', 'tsdown-js']), buildDependsOn: ['^build', 'tsc-js', 'tsdown-js'] },
-        ],
-      ]);
+      const resolvedTargetsByProject = new Map([['native', { targets: new Set(['build', 'tsc-js', 'tsdown-js']) }]]);
 
       applyWorkspaceDependencyDefaults(root, { resolvedTargetsByProject });
 
@@ -574,9 +569,7 @@ describe('workspace package script policy', () => {
       ],
     });
     try {
-      const resolvedTargetsByProject = new Map([
-        ['native', { targets: new Set(['build', 'tsdown-js']), buildDependsOn: ['^build', 'tsdown-js'] }],
-      ]);
+      const resolvedTargetsByProject = new Map([['native', { targets: new Set(['build', 'tsdown-js']) }]]);
 
       applyWorkspaceDependencyDefaults(root, { resolvedTargetsByProject });
 
@@ -596,7 +589,7 @@ describe('workspace package script policy', () => {
     }
   });
 
-  it('removes noop aggregate build targets only when they match resolved Nx plugin output', async () => {
+  it('removes noop aggregate build targets whose dependencies inference already produces', async () => {
     const root = await createWorkspace({
       rootName: '@smoothbricks/codebase',
       packages: [
@@ -613,17 +606,57 @@ describe('workspace package script policy', () => {
       ],
     });
     try {
-      const resolvedTargetsByProject = new Map([
-        [
-          'native',
-          { targets: new Set(['build', 'tsc-js', 'tsdown-js']), buildDependsOn: ['^build', 'tsc-js', 'tsdown-js'] },
-        ],
-      ]);
+      const resolvedTargetsByProject = new Map([['native', { targets: new Set(['build', 'tsc-js', 'tsdown-js']) }]]);
 
       applyWorkspaceDependencyDefaults(root, { resolvedTargetsByProject });
 
       const native = await readJson(join(root, 'packages/native/package.json'));
       expect(native.nx).toEqual({ name: 'native', targets: {} });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  /**
+   * The AxE regression: `containium` declares its build aggregate because
+   * inference cannot reach the producers it needs — its own `build-cli`, and
+   * sibling targets that are not named `build`, so `^build` never visits them,
+   * and are outside the `*-js|*-web|…` output family, so the inferred aggregate
+   * never collects them either. Nx replaces a named property of an inferred
+   * target with the declared one, so the resolved graph echoes the declaration
+   * straight back; comparing a declaration against that echo says "redundant"
+   * about every hand-written aggregate and deletes the only thing that ordered
+   * the build. `tsc-js` is in the list on purpose: one inferable entry beside
+   * two that are not must still keep the whole block.
+   */
+  it('keeps noop build aggregates that name edges inference cannot produce', async () => {
+    const declaredBuild = {
+      executor: 'nx:noop',
+      cache: true,
+      dependsOn: ['build-cli', 'containium-bun:runtime', 'tsc-js'],
+    };
+    const root = await createWorkspace({
+      rootName: '@smoothbricks/codebase',
+      packages: [
+        { dir: 'containium-bun', name: '@axe.sc/containium-bun', nx: { name: 'containium-bun' } },
+        {
+          dir: 'containium',
+          name: '@axe.sc/containium',
+          nx: { name: 'containium', targets: { build: declaredBuild } },
+        },
+      ],
+    });
+    try {
+      const resolvedTargetsByProject = new Map([
+        ['containium-bun', { targets: new Set(['build', 'runtime', 'tsc-js']) }],
+        ['containium', { targets: new Set(['build', 'build-cli', 'tsc-js']) }],
+      ]);
+
+      applyWorkspaceDependencyDefaults(root, { resolvedTargetsByProject });
+
+      const containium = await readJson(join(root, 'packages/containium/package.json'));
+      expect(containium.nx).toEqual({ name: 'containium', targets: { build: declaredBuild } });
+      expect(validateWorkspaceDependencies(root, { resolvedTargetsByProject })).toBe(0);
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -669,9 +702,7 @@ describe('workspace package script policy', () => {
       ],
     });
     try {
-      const resolvedTargetsByProject = new Map([
-        ['native', { targets: new Set(['build', 'tsc-js', 'tsdown-js']), buildDependsOn: buildOutputDependencies }],
-      ]);
+      const resolvedTargetsByProject = new Map([['native', { targets: new Set(['build', 'tsc-js', 'tsdown-js']) }]]);
 
       applyWorkspaceDependencyDefaults(root, { resolvedTargetsByProject });
 

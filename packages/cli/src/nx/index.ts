@@ -12,7 +12,6 @@ export interface ProjectTargets {
   project: string;
   root?: string;
   targets: string[];
-  buildDependsOn?: string[];
   /** Per-target `cache`, for policies that only govern what Nx can restore. */
   targetCache?: Map<string, boolean>;
   targetDependencies?: Map<string, string[]>;
@@ -324,7 +323,6 @@ export function projectTargetsFromNxProjects(projects: NxProjects): ProjectTarge
         project,
         root: projectRootFromNxProjectJson(metadata),
         targets: targetNamesFromNxProjectJson(metadata),
-        buildDependsOn: targetDependencies.get('build'),
         targetCache: targetCacheFromNxProjectJson(metadata),
         targetDependencies,
         targetInputs: targetInputsFromNxProjectJson(metadata),

@@ -175,13 +175,7 @@ describe('package target policy', () => {
       });
 
       const resolvedTargetsByProject = new Map<string, ResolvedProjectTargets>([
-        [
-          'lib',
-          {
-            targets: new Set(['build', 'tsc-js']),
-            buildDependsOn: ['^build', '*-js'],
-          },
-        ],
+        ['lib', { targets: new Set(['build', 'tsc-js']) }],
       ]);
 
       expect(applyPackageTargetPolicy(root, { resolvedTargetsByProject })).toBe(true);
@@ -216,13 +210,7 @@ describe('package target policy', () => {
       });
 
       const resolvedTargetsByProject = new Map<string, ResolvedProjectTargets>([
-        [
-          'lib',
-          {
-            targets: new Set(['build', 'tsc-js']),
-            buildDependsOn: ['^build', '*-js'],
-          },
-        ],
+        ['lib', { targets: new Set(['build', 'tsc-js']) }],
       ]);
 
       expect(applyPackageTargetPolicy(root, { resolvedTargetsByProject })).toBe(false);
@@ -911,13 +899,7 @@ describe('applyPackageTargetPolicyTree', () => {
     });
 
     const resolvedTargetsByProject = new Map<string, ResolvedProjectTargets>([
-      [
-        'lib',
-        {
-          targets: new Set(['build', 'tsc-js']),
-          buildDependsOn: ['^build', '*-js'],
-        },
-      ],
+      ['lib', { targets: new Set(['build', 'tsc-js']) }],
     ]);
 
     expect(applyPackageTargetPolicyTree(tree, { resolvedTargetsByProject })).toBe(true);
@@ -943,13 +925,7 @@ describe('applyPackageTargetPolicyTree', () => {
     });
 
     const resolvedTargetsByProject = new Map<string, ResolvedProjectTargets>([
-      [
-        'lib',
-        {
-          targets: new Set(['build', 'tsc-js']),
-          buildDependsOn: ['^build', '*-js'],
-        },
-      ],
+      ['lib', { targets: new Set(['build', 'tsc-js']) }],
     ]);
 
     expect(applyPackageTargetPolicyTree(tree, { resolvedTargetsByProject })).toBe(false);
