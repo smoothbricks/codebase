@@ -29,6 +29,7 @@ rmSync(join(artifacts, 'validation.json'), { force: true });
 const temporary = mkdtempSync(join(tmpdir(), 'statebus-packaged-consumer-'));
 const external = new Map();
 const dependencies = {};
+const overrides = {};
 const summaries = [];
 const consumers = [];
 try {
@@ -57,6 +58,7 @@ try {
       } else external.set(dep, source);
     }
     dependencies[packed.name] = `file:${archive}`;
+    overrides[packed.name] = dependencies[packed.name];
     summaries.push({
       name: packed.name,
       version: packed.version,
@@ -79,7 +81,9 @@ try {
     mkdirSync(consumer);
     writeFileSync(
       join(consumer, 'package.json'),
-      JSON.stringify({ name: 'statebus-packed-consumer', private: true, type: 'module', dependencies }),
+      // These exact prereleases are not on npm yet. Map transitive requests to the
+      // same unmodified tarballs; the packed semver edges were asserted above.
+      JSON.stringify({ name: 'statebus-packed-consumer', private: true, type: 'module', dependencies, overrides }),
     );
     // Keep every dependency inside this disposable install, including with Bun's
     // isolated linker. No workspace source, global store, or TS paths overrides.
