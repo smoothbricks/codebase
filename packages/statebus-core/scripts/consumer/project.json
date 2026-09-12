@@ -1,0 +1,24 @@
+{
+  "name": "statebus-consumer",
+  "projectType": "application",
+  "targets": {
+    "lint": {
+      "executor": "nx:run-commands",
+      "cache": true,
+      "inputs": ["default", "{workspaceRoot}/biome.json"],
+      "options": {
+        "command": "biome check packages/statebus-core/scripts/consumer",
+        "cwd": "{workspaceRoot}"
+      }
+    },
+    "test": {
+      "executor": "nx:noop",
+      "dependsOn": [
+        {
+          "target": "verify-packages",
+          "projects": ["statebus-core"]
+        }
+      ]
+    }
+  }
+}

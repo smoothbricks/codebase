@@ -279,10 +279,10 @@ temporary external consumer, and retains its resolved lockfile. Consumer overrid
 transitive workspace dependency also uses those same tarballs, not an unpublished registry version.
 Strict declaration checks (including negative branded-ID/capability tests) retain `skipLibCheck: false`.
 Every relevant package resolution must point inside the installed `node_modules/.../dist` directory.
-The composed fixture excludes the legacy ambient fixture.
+The platform and composed consumers have separate checked-in TypeScript configurations.
 
-The executable example lives in `scripts/consumer/{library,codecs,scenario,edge-cases}.fixture.txt`;
-the verifier materializes these as `.ts` files outside the workspace. Its codecs are generated from
+The executable example lives in `scripts/consumer/composed/` as ordinary `.ts` files, with its own
+`tsconfig.json`. The verifier copies the consumer project unchanged outside the workspace. Its codecs are generated from
 the actual public types by the normal ttsc/Typia compiler, not hand-maintained loader schemas. The
 edge cases include a JSON-transported checkpoint/event envelope validated before no-I/O replay.
 Both suites run against built package exports under Node and Bun. They use synthetic inventory resources,
@@ -304,7 +304,7 @@ return, async failure, failed reductions; count-bounded support capture; and equ
 | Composed bindings to the existing loader and QueryClient helpers | Newly implemented |
 | Admitted effects, injected typed LMAO-compatible execution, pure outcomes/decoders, disposal | Newly implemented |
 | Manual/production scheduler equivalence, versioned checkpoints/events/outcomes, bounded replay | Newly implemented |
-| Browser navigation core/driver package | Already present in the underlying branch; not rewritten here |
+| Browser navigation core/driver package | Already supported; unchanged by this integration |
 | Application-specific permissions, fingerprints, stale decisions, failure classes and actual screen wiring | Application-owned; not implemented by this generic example |
 | Expo, collaboration, generic forms and diagnostics/Help UI | Unsupported here; not required for this consumer contract |
 

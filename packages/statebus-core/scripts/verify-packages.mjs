@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { join, sep } from 'node:path';
@@ -96,7 +96,11 @@ try {
   for (const linker of ['isolated', 'hoisted']) {
     const consumer = join(temporary, linker);
     const nodeModules = join(consumer, 'node_modules');
-    mkdirSync(consumer);
+    // Copy only authored source/configuration. Local editor output must not enter the test install.
+    cpSync(new URL('./consumer/', import.meta.url), consumer, {
+      recursive: true,
+      filter: (path) => !['dist', 'node_modules', '.cache'].includes(path.split(sep).at(-1)),
+    });
     writeFileSync(
       join(consumer, 'package.json'),
       // These exact prereleases are not on npm yet. Map transitive requests to the
@@ -116,26 +120,6 @@ try {
       env: runtimeEnv,
       stdio: 'inherit',
     });
-    writeFileSync(
-      join(consumer, 'consumer.ts'),
-      readFileSync(new URL('./packed-consumer.fixture.txt', import.meta.url)),
-    );
-    writeFileSync(
-      join(consumer, 'tsconfig.json'),
-      JSON.stringify({
-        compilerOptions: {
-          strict: true,
-          module: 'NodeNext',
-          moduleResolution: 'NodeNext',
-          target: 'ES2022',
-          lib: ['ES2024', 'DOM'],
-          outDir: 'out',
-          types: [],
-          skipLibCheck: false,
-        },
-        include: ['consumer.ts'],
-      }),
-    );
     const require = createRequire(join(consumer, 'package.json'));
     for (const name of names) {
       const resolved = realpathSync(require.resolve(`@smoothbricks/${name}`));
@@ -147,43 +131,32 @@ try {
       assert.deepEqual(readFileSync(resolved), readFileSync(join(inspected, packed.exports['.'].import)));
       assert.equal(require(`@smoothbricks/${name}/package.json`).version, manifests.get(name).version);
     }
-    execFileSync('node', [join(nodeModules, 'typescript', 'bin', 'tsc'), '-p', join(consumer, 'tsconfig.json')], {
-      cwd: consumer,
-      stdio: 'inherit',
-    });
-    execFileSync('node', [join(consumer, 'out', 'consumer.js')], { cwd: consumer, env: runtimeEnv, stdio: 'inherit' });
-    execFileSync('bun', [join(consumer, 'out', 'consumer.js')], { cwd: consumer, env: runtimeEnv, stdio: 'inherit' });
-    for (const name of ['codecs', 'library', 'scenario', 'edge-cases']) {
-      writeFileSync(
-        join(consumer, `${name}.ts`),
-        readFileSync(new URL(`./consumer/${name}.fixture.txt`, import.meta.url)),
-      );
-    }
-    writeFileSync(
-      join(consumer, 'tsconfig.composed.json'),
-      JSON.stringify({
-        compilerOptions: {
-          strict: true,
-          module: 'NodeNext',
-          moduleResolution: 'NodeNext',
-          target: 'ES2022',
-          lib: ['ES2024', 'DOM'],
-          outDir: 'composed',
-          types: ['node'],
-          skipLibCheck: false,
-        },
-        // Deliberately exclude the legacy fixture and its ambient module augmentation.
-        include: ['codecs.ts', 'library.ts', 'scenario.ts', 'edge-cases.ts'],
-      }),
-    );
     execFileSync(
       'node',
-      [join(nodeModules, 'typescript', 'bin', 'tsc'), '-p', join(consumer, 'tsconfig.composed.json')],
+      [join(nodeModules, 'typescript', 'bin', 'tsc'), '-p', join(consumer, 'platform', 'tsconfig.json')],
+      {
+        cwd: consumer,
+        stdio: 'inherit',
+      },
+    );
+    execFileSync('node', [join(consumer, 'dist', 'platform', 'consumer.js')], {
+      cwd: consumer,
+      env: runtimeEnv,
+      stdio: 'inherit',
+    });
+    execFileSync('bun', [join(consumer, 'dist', 'platform', 'consumer.js')], {
+      cwd: consumer,
+      env: runtimeEnv,
+      stdio: 'inherit',
+    });
+    execFileSync(
+      'node',
+      [join(nodeModules, 'typescript', 'bin', 'tsc'), '-p', join(consumer, 'composed', 'tsconfig.json')],
       { cwd: consumer, stdio: 'inherit' },
     );
     // Generate the example's codecs from its imported public types using the repository's
     // normal compiler. The preceding strict tsc pass still checks all package declarations.
-    execFileSync('ttsc', ['-p', join(consumer, 'tsconfig.composed.json'), '--emit'], {
+    execFileSync('ttsc', ['-p', join(consumer, 'composed', 'tsconfig.json'), '--emit'], {
       cwd: consumer,
       env: runtimeEnv,
       stdio: 'inherit',
@@ -191,7 +164,7 @@ try {
     // Both runners select built StateBus exports and development React for act/StrictMode.
     for (const executable of ['scenario', 'edge-cases'])
       for (const runner of ['node', 'bun'])
-        execFileSync(runner, [join(consumer, 'composed', `${executable}.js`)], {
+        execFileSync(runner, [join(consumer, 'dist', 'composed', `${executable}.js`)], {
           cwd: consumer,
           env: runtimeEnv,
           stdio: 'inherit',
