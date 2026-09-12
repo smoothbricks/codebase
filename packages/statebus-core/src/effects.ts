@@ -343,6 +343,9 @@ export function bindEffect<C, P extends EffectPlan, O, R>(
         }
       } else emit(job, await operations.execute(job.plan, { signal: job.controller.signal }));
     } catch (cause) {
+      // An operation can throw before reaching its first await. Match Promise rejection
+      // timing so failure outcomes never enter the caller's command flush synchronously.
+      await Promise.resolve();
       if (current(job)) {
         try {
           emit(job, operations.failure(cause, job.plan));
