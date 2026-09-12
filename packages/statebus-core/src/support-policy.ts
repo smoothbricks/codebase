@@ -1,4 +1,4 @@
-import { type CaptureValue, captureValue } from './capture.js';
+import { CaptureError, type CaptureValue, captureValue } from './capture.js';
 import type { SupportClassification } from './composition.js';
 
 export type RedactionReason = 'unclassified' | 'secret' | 'excluded' | 'consent';
@@ -22,6 +22,10 @@ const markers = Object.freeze({
 
 export function redactSupport(reason: RedactionReason): RedactedValue {
   return markers[reason];
+}
+/** Internal result identity; never inspect untrusted object fields to recognize a refusal. */
+export function isRedactedSupport(value: unknown): boolean {
+  return value === markers.unclassified || value === markers.secret || value === markers.excluded || value === markers.consent;
 }
 export function publicSupport<T>(project: (value: T) => unknown): SupportPolicy<T> {
   return (value) => ({ kind: 'public', value: project(value) });
@@ -61,9 +65,17 @@ export function projectSupport(
 ): unknown {
   if (classification === 'secret' || classification === 'excluded') return markers[classification];
   if (!policy) return markers.unclassified;
-  const decision = policy(value);
-  if (!decision) return markers.unclassified;
-  if (decision.kind === 'redact') return markers[decision.reason];
-  if ((classification === 'sensitive' || decision.kind === 'consent') && !consent) return markers.consent;
-  return scrub(captureValue(decision.value, maxBytes).value);
+  try {
+    const decision = policy(value);
+    if (!decision) return markers.unclassified;
+    if (decision.kind === 'redact') return markers[decision.reason];
+    if ((classification === 'sensitive' || decision.kind === 'consent') && !consent) return markers.consent;
+    return scrub(captureValue(decision.value, maxBytes).value);
+  } catch (cause) {
+    // Policy/codecs may throw private input in their messages or causes. Never expose
+    // those exceptions through the support-export boundary or return a partial artifact.
+    if (cause instanceof CaptureError && cause.issue.code === 'size-limit')
+      throw new CaptureError({ code: 'size-limit', boundary: 'support projection', limit: maxBytes });
+    throw new CaptureError({ code: 'schema', boundary: 'support projection' });
+  }
 }
