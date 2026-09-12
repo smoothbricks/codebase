@@ -28,3 +28,18 @@ explicitly recorded. See `../benchmarks/EXACT-INTEREST.md` for the measurement b
 
 The CI artifact retains tarballs, consumer lockfiles, result metadata, benchmark samples, and tracked source/revision.
 It contains no dependency caches, credentials, `.git`, environment files, or runner home directories.
+
+## Platform ambient contracts
+
+All six production tsconfigs use `types: []`. Core, data-loader, navigation-core,
+and the TanStack bridge select `ES2022` plus `WebWorker` for standard host APIs
+(`AbortSignal`, timers, microtasks and console), without declaring Node/Bun or
+DOM-only `Window`/`Document` globals. This selects declarations only; it does not
+require a worker runtime. The React and browser adapters explicitly select DOM
+libraries instead. Test-runner types remain confined to test tsconfigs.
+
+The package check asserts the empty production ambient-type allowlist. Both
+isolated and hoisted packed consumers also compile negative contracts for
+`Buffer`, `process`, `Bun`, `require` and `__dirname` with the real transitive
+exports. Reintroducing those globals fails validation rather than silently
+weakening platform neutrality. Declaration checking remains strict.

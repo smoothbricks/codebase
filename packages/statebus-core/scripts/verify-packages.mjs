@@ -36,6 +36,9 @@ try {
   for (const name of names) {
     const manifest = manifests.get(name);
     const source = join(root, 'packages', name);
+    // Browser/isomorphic production programs must not inherit Node/Bun globals.
+    const config = JSON.parse(readFileSync(join(source, 'tsconfig.lib.json'), 'utf8'));
+    assert.deepEqual(config.compilerOptions.types, [], `${name}: platform ambient types must be explicit`);
     const archive = join(artifacts, `${name}.tgz`);
     execFileSync('bun', ['pm', 'pack', '--filename', archive, '--quiet'], { cwd: source, stdio: 'inherit' });
     const target = join(temporary, 'inspected', name);
