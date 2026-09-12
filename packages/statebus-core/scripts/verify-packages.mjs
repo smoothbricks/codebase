@@ -136,8 +136,11 @@ try {
     for (const name of names) {
       const resolved = realpathSync(require.resolve(`@smoothbricks/${name}`));
       assert.ok(resolved.startsWith(`${nodeModules}${sep}`), `Unexpected workspace/source resolution: ${resolved}`);
-      // Check bytes as well as location: a registry/source fallback must not pass.
-      assert.deepEqual(readFileSync(resolved), readFileSync(join(temporary, 'inspected', name, 'dist', 'index.js')));
+      // Check the actual declared entry, including packages with a nested dist layout.
+      // Byte equality still rejects a registry/source fallback.
+      const inspected = join(temporary, 'inspected', name);
+      const packed = JSON.parse(readFileSync(join(inspected, 'package.json'), 'utf8'));
+      assert.deepEqual(readFileSync(resolved), readFileSync(join(inspected, packed.exports['.'].import)));
       assert.equal(require(`@smoothbricks/${name}/package.json`).version, manifests.get(name).version);
     }
     execFileSync('node', [join(nodeModules, 'typescript', 'bin', 'tsc'), '-p', join(consumer, 'tsconfig.json')], {
