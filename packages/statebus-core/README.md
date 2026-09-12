@@ -151,3 +151,9 @@ new address encodings and intermediate collections. Public snapshot ownership is
 `captureViewProps` copies record props only when binding a new computation; the previously exported formatting/JSON
 identity helpers are removed. Computation names are diagnostic labels, not identity keys. This is still the existing
 ambient-schema API, not the separate value-level library composition/replay implementation.
+
+## Value-level composition and external consumers
+
+See [the composed consumer contract](./CONSUMER.md) for independently owned libraries, composition-bound
+React providers, typed effect/loader bindings and deterministic no-I/O replay. The legacy ambient API
+above remains compatible; new reusable libraries do not need module augmentation.

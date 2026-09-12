@@ -291,3 +291,14 @@ export function installTanStackQueryLoader<T, Failure>(options: TanStackLoaderOp
     counts.clear();
   };
 }
+
+/** Runtime-owned binding of the existing QueryClient execution boundary. Replay installs no I/O. */
+export function bindComposedQueryLoader<T, Failure, ID extends string | number>(
+  binding: import('@smoothbricks/statebus-data-loader').ComposedLoaderBinding<T, Failure, ID>,
+  options: Omit<TanStackLoaderOptions<T, Failure>, 'channel' | 'interests' | 'matches'>,
+): () => void {
+  const { runtime, channel, interests, matches } = binding;
+  if (runtime.mode === 'replay') return () => {};
+  if (runtime.disposed) throw new Error('Cannot bind a loader to a disposed runtime.');
+  return runtime.manage(installTanStackQueryLoader({ ...options, channel, interests, matches }));
+}
