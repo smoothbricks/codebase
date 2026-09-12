@@ -1,0 +1,47 @@
+name: StateBus consumer validation inputs
+on:
+  push:
+    branches: [feat/statebus-consumer-composition]
+    paths: [.github/workflows/statebus-consumer-bootstrap.yml]
+permissions:
+  contents: read
+jobs:
+  inputs:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - name: Export tracked source and isolated test dependencies
+        shell: bash
+        run: |
+          mkdir -p /tmp/statebus-inputs/dependencies
+          git archive HEAD | tar -x -C /tmp/statebus-inputs
+          node - <<'NODE'
+          const fs = require('node:fs');
+          const names = ['statebus-core', 'statebus-react', 'statebus-data-loader', 'statebus-tanstack-query', 'lmao'];
+          const dependencies = { typescript: '6.0.3', '@types/node': '^26.5.1', '@types/bun': '1.4.2', '@biomejs/biome': '^2.3.5', 'fast-check': '^4.3.0', 'happy-dom': '^20.0.0', 'react-dom': '^19.0.0', '@types/react-dom': '^19.0.0' };
+          for (const name of names) {
+            const pkg = JSON.parse(fs.readFileSync(`packages/${name}/package.json`, 'utf8'));
+            for (const section of ['dependencies', 'peerDependencies', 'devDependencies']) {
+              for (const [key, value] of Object.entries(pkg[section] || {})) {
+                if (!value.startsWith('workspace:') && !value.startsWith('catalog:')) dependencies[key] = value;
+              }
+            }
+          }
+          fs.writeFileSync('/tmp/statebus-inputs/dependencies/package.json', JSON.stringify({ private: true, dependencies }, null, 2));
+          NODE
+          cd /tmp/statebus-inputs/dependencies
+          bun install
+          cp "$(command -v bun)" ../bun
+          cd /tmp
+          tar -czf statebus-inputs.tar.gz statebus-inputs
+      - uses: actions/upload-artifact@v4
+        with:
+          name: statebus-consumer-inputs
+          path: /tmp/statebus-inputs.tar.gz
+          retention-days: 3
