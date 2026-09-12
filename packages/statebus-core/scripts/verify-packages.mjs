@@ -1,19 +1,10 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import {
-  existsSync,
-  mkdirSync,
-  mkdtempSync,
-  readFileSync,
-  realpathSync,
-  rmSync,
-  symlinkSync,
-  writeFileSync,
-} from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { prunePublishedExports } from '../../cli/src/monorepo/published-exports.ts';
 
@@ -37,6 +28,7 @@ const manifests = new Map(
 );
 const artifacts = join(root, '.cache', 'statebus-packages');
 mkdirSync(artifacts, { recursive: true });
+rmSync(join(artifacts, 'validation.json'), { force: true });
 const consumer = mkdtempSync(join(tmpdir(), 'statebus-packaged-consumer-'));
 const nodeModules = join(consumer, 'node_modules');
 const external = new Map();
@@ -80,22 +72,36 @@ try {
       sha256: createHash('sha256').update(readFileSync(archive)).digest('hex'),
     });
   }
-  // Only third-party dependencies may use the already-verified workspace install.
-  // Every StateBus package and its transitive StateBus imports resolve to extracted tarballs.
+  // Seed exact direct versions from the frozen workspace installation, then let Bun install
+  // the external consumer's real dependency graph. Cache-directory symlinks make declaration
+  // lookup escape the consumer's @types/react; preserveSymlinks/skipLibCheck would mask that.
   for (const dep of ['typescript', '@types/node']) external.set(dep, root);
   for (const dep of ['@types/react', '@types/react-dom', 'react-dom', 'happy-dom'])
     external.set(dep, join(root, 'packages', 'statebus-react'));
+  const dependencies = {};
   for (const [dep, source] of external) {
     const require = createRequire(join(source, 'package.json'));
-    const manifest = require.resolve(`${dep}/package.json`);
-    const target = join(nodeModules, dep);
-    mkdirSync(dirname(target), { recursive: true });
-    symlinkSync(dirname(realpathSync(manifest)), target, 'dir');
+    const manifest = JSON.parse(readFileSync(require.resolve(`${dep}/package.json`), 'utf8'));
+    dependencies[dep] = manifest.version;
   }
-  writeFileSync(
-    join(consumer, 'package.json'),
-    JSON.stringify({ name: 'statebus-packed-consumer', private: true, type: 'module' }),
-  );
+  for (const name of names) dependencies[`@smoothbricks/${name}`] = `file:${join(artifacts, `${name}.tgz`)}`;
+  rmSync(nodeModules, { recursive: true, force: true });
+  const consumerManifest = { name: 'statebus-packed-consumer', private: true, type: 'module', dependencies };
+  writeFileSync(join(consumer, 'package.json'), JSON.stringify(consumerManifest, null, 2));
+  const runtimeEnv = { ...process.env, NODE_ENV: 'test' };
+  execFileSync('bun', ['install', '--ignore-scripts', '--linker=hoisted'], {
+    cwd: consumer,
+    env: runtimeEnv,
+    stdio: 'inherit',
+  });
+  execFileSync('bun', ['install', '--ignore-scripts', '--linker=hoisted', '--frozen-lockfile'], {
+    cwd: consumer,
+    env: runtimeEnv,
+    stdio: 'inherit',
+  });
+  // Retain the actual resolved consumer graph, including transitive versions, as verification evidence.
+  writeFileSync(join(artifacts, 'consumer-package.json'), readFileSync(join(consumer, 'package.json')));
+  writeFileSync(join(artifacts, 'consumer.bun.lock'), readFileSync(join(consumer, 'bun.lock')));
   writeFileSync(join(consumer, 'consumer.ts'), readFileSync(new URL('./packed-consumer.fixture.txt', import.meta.url)));
   writeFileSync(
     join(consumer, 'tsconfig.json'),
@@ -125,9 +131,8 @@ try {
     cwd: consumer,
     stdio: 'inherit',
   });
-  execFileSync('node', [join(consumer, 'out', 'consumer.js')], { cwd: consumer, stdio: 'inherit' });
+  execFileSync('node', [join(consumer, 'out', 'consumer.js')], { cwd: consumer, env: runtimeEnv, stdio: 'inherit' });
   // Published manifests select built exports even when Bun's development condition is active.
-  const runtimeEnv = { ...process.env, NODE_ENV: 'test' };
   execFileSync('bun', [join(consumer, 'out', 'consumer.js')], { cwd: consumer, env: runtimeEnv, stdio: 'inherit' });
   for (const name of ['codecs', 'library', 'scenario']) {
     writeFileSync(
@@ -159,7 +164,11 @@ try {
   );
   // React StrictMode checks need its development build, while StateBus must resolve built JS.
   // Node selects the import condition in either environment; its assertion rejects source paths.
-  execFileSync('node', [join(consumer, 'composed', 'scenario.js')], { cwd: consumer, stdio: 'inherit' });
+  execFileSync('node', [join(consumer, 'composed', 'scenario.js')], {
+    cwd: consumer,
+    env: runtimeEnv,
+    stdio: 'inherit',
+  });
   // React's test build keeps act/StrictMode; every package resolution is independently checked.
   execFileSync('bun', [join(consumer, 'composed', 'scenario.js')], {
     cwd: consumer,
