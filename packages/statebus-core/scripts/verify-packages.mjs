@@ -15,6 +15,7 @@ import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { prunePublishedExports } from '../../cli/src/monorepo/published-exports.ts';
 
 const root = fileURLToPath(new URL('../../..', import.meta.url));
 const names = [
@@ -24,6 +25,9 @@ const names = [
   'statebus-tanstack-query',
   'statebus-navigation-core',
   'statebus-navigation-browser',
+  'lmao',
+  'arrow-builder',
+  'validation',
 ];
 const manifests = new Map(
   names.map((name) => {
@@ -42,7 +46,15 @@ try {
     const manifest = manifests.get(name);
     const source = join(root, 'packages', name);
     const archive = join(artifacts, `${name}.tgz`);
-    execFileSync('bun', ['pm', 'pack', '--filename', archive, '--quiet'], { cwd: source, stdio: 'inherit' });
+    const manifestPath = join(source, 'package.json');
+    const original = readFileSync(manifestPath);
+    // Use the release packer's pure manifest transform, not a second export-map implementation.
+    writeFileSync(manifestPath, `${JSON.stringify(prunePublishedExports(manifest).manifest, null, 2)}\n`);
+    try {
+      execFileSync('bun', ['pm', 'pack', '--filename', archive, '--quiet'], { cwd: source, stdio: 'inherit' });
+    } finally {
+      writeFileSync(manifestPath, original);
+    }
     const target = join(nodeModules, '@smoothbricks', name);
     mkdirSync(target, { recursive: true });
     execFileSync('tar', ['-xzf', archive, '-C', target, '--strip-components=1']);
@@ -54,7 +66,7 @@ try {
     assert.ok(existsSync(join(target, packed.exports['.'].import)));
     assert.ok(!existsSync(join(target, 'node_modules')));
     for (const [dep, version] of Object.entries({ ...packed.dependencies, ...packed.peerDependencies })) {
-      if (dep.startsWith('@smoothbricks/statebus-')) {
+      if (dep.startsWith('@smoothbricks/') && manifests.has(dep.slice('@smoothbricks/'.length))) {
         assert.equal(
           version,
           manifests.get(dep.slice('@smoothbricks/'.length)).version,
@@ -71,7 +83,8 @@ try {
   // Only third-party dependencies may use the already-verified workspace install.
   // Every StateBus package and its transitive StateBus imports resolve to extracted tarballs.
   for (const dep of ['typescript', '@types/node']) external.set(dep, root);
-  for (const dep of ['@types/react', '@types/react-dom']) external.set(dep, join(root, 'packages', 'statebus-react'));
+  for (const dep of ['@types/react', '@types/react-dom', 'react-dom', 'happy-dom'])
+    external.set(dep, join(root, 'packages', 'statebus-react'));
   for (const [dep, source] of external) {
     const require = createRequire(join(source, 'package.json'));
     const manifest = require.resolve(`${dep}/package.json`);
@@ -94,7 +107,7 @@ try {
         target: 'ES2022',
         lib: ['ES2024', 'DOM'],
         outDir: 'out',
-        types: [],
+        types: ['node'],
         skipLibCheck: false,
       },
       include: ['consumer.ts'],
@@ -113,7 +126,46 @@ try {
     stdio: 'inherit',
   });
   execFileSync('node', [join(consumer, 'out', 'consumer.js')], { cwd: consumer, stdio: 'inherit' });
-  execFileSync('bun', [join(consumer, 'out', 'consumer.js')], { cwd: consumer, stdio: 'inherit' });
+  // Published manifests select built exports even when Bun's development condition is active.
+  const runtimeEnv = { ...process.env, NODE_ENV: 'test' };
+  execFileSync('bun', [join(consumer, 'out', 'consumer.js')], { cwd: consumer, env: runtimeEnv, stdio: 'inherit' });
+  for (const name of ['codecs', 'library', 'scenario']) {
+    writeFileSync(
+      join(consumer, `${name}.ts`),
+      readFileSync(new URL(`./consumer/${name}.fixture.txt`, import.meta.url)),
+    );
+  }
+  writeFileSync(
+    join(consumer, 'tsconfig.composed.json'),
+    JSON.stringify({
+      compilerOptions: {
+        strict: true,
+        module: 'NodeNext',
+        moduleResolution: 'NodeNext',
+        target: 'ES2022',
+        lib: ['ES2024', 'DOM'],
+        outDir: 'composed',
+        types: ['node'],
+        skipLibCheck: false,
+      },
+      // Deliberately exclude the legacy fixture and its ambient module augmentation.
+      include: ['codecs.ts', 'library.ts', 'scenario.ts'],
+    }),
+  );
+  execFileSync(
+    'node',
+    [join(nodeModules, 'typescript', 'bin', 'tsc'), '-p', join(consumer, 'tsconfig.composed.json')],
+    { cwd: consumer, stdio: 'inherit' },
+  );
+  // React StrictMode checks need its development build, while StateBus must resolve built JS.
+  // Node selects the import condition in either environment; its assertion rejects source paths.
+  execFileSync('node', [join(consumer, 'composed', 'scenario.js')], { cwd: consumer, stdio: 'inherit' });
+  // React's test build keeps act/StrictMode; every package resolution is independently checked.
+  execFileSync('bun', [join(consumer, 'composed', 'scenario.js')], {
+    cwd: consumer,
+    env: runtimeEnv,
+    stdio: 'inherit',
+  });
   writeFileSync(
     join(artifacts, 'validation.json'),
     `${JSON.stringify(
@@ -122,7 +174,15 @@ try {
         sourceCommit: process.env.GITHUB_SHA ?? process.env.STATEBUS_BENCH_COMMIT ?? 'working-tree',
         versions: process.versions,
         packages: summaries,
-        verified: ['strict declarations', 'Node consumer', 'Bun consumer', 'packed workspace resolutions'],
+        verified: [
+          'strict declarations',
+          'Node consumer',
+          'Bun consumer',
+          'packed workspace resolutions',
+          'non-ambient composition consumer',
+          'LMAO Op/Result binding',
+          'React lifecycle and no-I/O replay',
+        ],
       },
       null,
       2,
