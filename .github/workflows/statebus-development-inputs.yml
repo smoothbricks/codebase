@@ -26,8 +26,8 @@ jobs:
           import { readFileSync, writeFileSync } from 'node:fs';
           import { join } from 'node:path';
           const text = readFileSync('bun.lock', 'utf8');
-          const names = ['@tldraw/state', '@tldraw/state-react', '@tanstack/query-core', 'typescript', 'react', 'react-dom', '@types/react', '@types/react-dom', '@types/node', '@types/bun', 'happy-dom', 'fast-check', '@biomejs/biome', 'tslib'];
-          const dependencies = {};
+          const names = ['@tldraw/state', '@tldraw/state-react', '@tanstack/query-core', 'typescript', 'react', 'react-dom', '@types/react', '@types/react-dom', '@types/node', '@types/bun', 'happy-dom', 'fast-check', '@biomejs/biome', 'tslib', 'typia'];
+          const dependencies = {'@smoothbricks/lmao':'latest'};
           for (const name of names) {
             const line = text.split('\n').find(line => line.trimStart().startsWith(JSON.stringify(name) + ': ['));
             if (!line) throw new Error('Missing locked dependency ' + name);
