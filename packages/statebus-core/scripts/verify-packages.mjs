@@ -85,7 +85,8 @@ try {
   // install a real consumer dependency graph. Symlinking workspace packages into
   // /tmp made their declarations resolve peers from the workspace/global store,
   // bypassing the consumer's @types/react and hiding dependency-closure problems.
-  for (const dep of ['typescript', '@types/node', 'fast-check']) external.set(dep, root);
+  for (const dep of ['typescript', '@types/node']) external.set(dep, root);
+  external.set('fast-check', join(root, 'packages', 'statebus-data-loader'));
   for (const dep of ['@types/react', '@types/react-dom', 'react-dom', 'happy-dom'])
     external.set(dep, join(root, 'packages', 'statebus-react'));
   for (const [dep, source] of external) {
