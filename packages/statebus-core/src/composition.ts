@@ -1,20 +1,26 @@
 import { type Atom, atom, computed, react, type Signal, transaction } from '@tldraw/state';
+import { CaptureError, compareResourceIds } from './capture.js';
+import { type CodecMigration, decodeCodec, supportsCodec } from './codec.js';
 import { DispatchQueue, type DispatchScheduler, microtaskScheduler } from './dispatch.js';
+import type { EffectCodecDescriptor } from './effects.js';
 import { type StateInterest, StateInterestBatch, type StateInterestChange, StateInterestRegistry } from './interest.js';
+import type { SupportPolicy } from './support-policy.js';
 
 export interface ValueCodec<T> {
   readonly schema: string;
   readonly version: number;
+  readonly migrations?: readonly CodecMigration<T>[];
   /** Return an owned representation. Validation and redaction belong at this boundary. */
   encode(value: T): unknown;
   /** Validate untrusted input, including branded identifiers, before returning T. */
   decode(value: unknown): T;
 }
-export type SupportClassification = 'public' | 'sensitive' | 'excluded';
+export type SupportClassification = 'public' | 'sensitive' | 'excluded' | 'secret' | 'unclassified';
 export interface DeclarationOptions<T> {
   readonly codec?: ValueCodec<T>;
   readonly classify?: (value: T) => SupportClassification;
   readonly description?: string;
+  readonly support?: SupportPolicy<T>;
 }
 export interface DeclarationMetadata {
   readonly key: string;
@@ -24,20 +30,29 @@ export interface DeclarationMetadata {
   readonly schema?: string;
   readonly version?: number;
   readonly description?: string;
+  readonly idSchema?: string;
+  readonly idVersion?: number;
 }
 export interface EncodedValue {
   readonly schema: string;
   readonly version: number;
   readonly value: unknown;
   readonly classification: SupportClassification;
+  readonly primitive?: 'number' | 'string';
+}
+export interface EncodedStateEntry {
+  readonly id?: EncodedValue;
+  readonly value: EncodedValue;
 }
 export interface EncodedState {
   readonly key: string;
-  readonly entries: readonly { readonly id?: EncodedValue; readonly value: EncodedValue }[];
+  readonly entries: readonly EncodedStateEntry[];
 }
 export interface EncodedEvent {
   readonly key: string;
   readonly payload: EncodedValue;
+  readonly admitted?: boolean;
+  readonly reactionDepth?: number;
 }
 function encode<T>(options: DeclarationOptions<T>, value: T): EncodedValue {
   const codec = options.codec;
@@ -46,13 +61,26 @@ function encode<T>(options: DeclarationOptions<T>, value: T): EncodedValue {
     schema: codec.schema,
     version: codec.version,
     value: codec.encode(value),
-    classification: options.classify?.(value) ?? 'public',
+    classification: options.classify?.(value) ?? 'unclassified',
   });
 }
-function decode<T>(codec: ValueCodec<T> | undefined, value: EncodedValue): T {
-  if (!codec || codec.schema !== value.schema || codec.version !== value.version)
-    throw new Error('Incompatible codec/schema version.');
-  return codec.decode(value.value);
+function decode<T>(codec: ValueCodec<T> | undefined, value: EncodedValue, metadata?: DeclarationMetadata): T {
+  try {
+    return decodeCodec(codec, value);
+  } catch (cause) {
+    throw new CaptureError(
+      {
+        code: 'schema',
+        boundary: 'declaration decode',
+        owner: metadata?.owner,
+        declaration: metadata?.name,
+        schema: value.schema,
+        fromVersion: value.version,
+        toVersion: codec?.version,
+      },
+      { cause },
+    );
+  }
 }
 interface Owner {
   readonly name: string;
@@ -86,13 +114,19 @@ export function defineCapability<T>(name: string): Capability<T> {
   return new Capability(name);
 }
 
-interface StateDeclaration {
+export interface StateDeclaration {
   readonly ownerToken: Owner;
   readonly metadata: DeclarationMetadata;
   initialize(runtime: ComposedRuntime): void;
   release(runtime: ComposedRuntime): void;
   capture(runtime: ComposedRuntime): EncodedState;
+  captureEntries(runtime: ComposedRuntime): Iterable<EncodedStateEntry>;
   restore(runtime: ComposedRuntime, state: EncodedState): void;
+  captureEntry(runtime: ComposedRuntime, id: string | number | undefined): EncodedStateEntry | undefined;
+  entryId(entry: EncodedStateEntry): string | number | undefined;
+  migrateEntry(entry: EncodedStateEntry): EncodedStateEntry;
+  acceptsMetadata(metadata: DeclarationMetadata): boolean;
+  readonly support: { readonly value?: SupportPolicy<unknown>; readonly id?: SupportPolicy<unknown> };
 }
 export interface StateInterestHandle {
   readonly ownerToken: object;
@@ -131,14 +165,53 @@ export class ScalarHandle<T> implements StateDeclaration, WritableHandle<T> {
     return this.cell(runtime);
   }
   write(state: ReducerState, value: T): void {
-    this.cell(writableRuntime(state, this.ownerToken)).set(value);
+    const runtime = writableRuntime(state, this.ownerToken);
+    this.cell(runtime).set(value);
+    runtime.markCapturedWrite(this, undefined);
+  }
+  get support() {
+    return {
+      value:
+        this.options.support &&
+        ((value: unknown) =>
+          this.options.support?.(
+            decodeCodec(this.options.codec, {
+              schema: this.options.codec?.schema ?? '',
+              version: this.options.codec?.version ?? 0,
+              value,
+            }),
+          )),
+    };
+  }
+  captureEntry(runtime: ComposedRuntime): EncodedStateEntry {
+    return { value: encode(this.options, this.cell(runtime).get()) };
+  }
+  entryId(entry: EncodedStateEntry): undefined {
+    if (entry.id)
+      throw new CaptureError({
+        code: 'schema',
+        boundary: 'scalar resource ID',
+        owner: this.metadata.owner,
+        declaration: this.metadata.name,
+      });
+    return undefined;
+  }
+  acceptsMetadata(metadata: DeclarationMetadata): boolean {
+    return supportsCodec(this.options.codec, metadata);
+  }
+  migrateEntry(entry: EncodedStateEntry): EncodedStateEntry {
+    this.entryId(entry);
+    return { value: encode(this.options, decode(this.options.codec, entry.value, this.metadata)) };
+  }
+  *captureEntries(runtime: ComposedRuntime): Iterable<EncodedStateEntry> {
+    yield this.captureEntry(runtime);
   }
   capture(runtime: ComposedRuntime): EncodedState {
-    return { key: this.metadata.key, entries: [{ value: encode(this.options, this.cell(runtime).get()) }] };
+    return { key: this.metadata.key, entries: [...this.captureEntries(runtime)] };
   }
   restore(runtime: ComposedRuntime, state: EncodedState): void {
     if (state.entries.length !== 1 || state.entries[0].id !== undefined) throw new Error('Invalid scalar checkpoint.');
-    this.cell(runtime).set(decode(this.options.codec, state.entries[0].value));
+    this.cell(runtime).set(decode(this.options.codec, state.entries[0].value, this.metadata));
   }
 }
 
@@ -152,7 +225,11 @@ export class KeyedHandle<T, ID extends string | number> implements StateDeclarat
     readonly ownerToken: Owner,
     readonly metadata: DeclarationMetadata,
     private readonly initial: (id: ID) => T,
-    private readonly options: DeclarationOptions<T> & { readonly idCodec: ValueCodec<ID> },
+    private readonly options: DeclarationOptions<T> & {
+      readonly idCodec: ValueCodec<ID>;
+      readonly classifyId?: (id: ID) => SupportClassification;
+      readonly supportId?: SupportPolicy<ID>;
+    },
   ) {}
   initialize(runtime: ComposedRuntime): void {
     this.cells.set(runtime, new Map());
@@ -184,7 +261,9 @@ export class KeyedHandle<T, ID extends string | number> implements StateDeclarat
     return new ResourceHandle(this, id);
   }
   write(state: ReducerState, id: ID, value: T): void {
-    this.cell(writableRuntime(state, this.ownerToken), id).set(value);
+    const runtime = writableRuntime(state, this.ownerToken);
+    this.cell(runtime, id).set(value);
+    runtime.markCapturedWrite(this, id);
   }
   /** Validated bridge from an existing loader's wire address to this branded resource. */
   resourceId(interest: StateInterest): ID {
@@ -192,14 +271,73 @@ export class KeyedHandle<T, ID extends string | number> implements StateDeclarat
       throw new Error('Foreign or non-keyed resource interest.');
     return this.options.idCodec.decode(interest.id);
   }
-  capture(runtime: ComposedRuntime): EncodedState {
-    const entries: { id: EncodedValue; value: EncodedValue }[] = [];
-    for (const [id, cell] of this.map(runtime)) {
-      const value = cell.signal.get();
-      // Merely reading a default must not become application state or change replay equivalence.
-      if (!Object.is(value, cell.initial))
-        entries.push({ id: encode({ codec: this.options.idCodec }, id), value: encode(this.options, value) });
+  get support() {
+    return {
+      value:
+        this.options.support &&
+        ((value: unknown) =>
+          this.options.support?.(
+            decodeCodec(this.options.codec, {
+              schema: this.options.codec?.schema ?? '',
+              version: this.options.codec?.version ?? 0,
+              value,
+            }),
+          )),
+      id: this.options.supportId && ((value: unknown) => this.options.supportId?.(this.options.idCodec.decode(value))),
+    };
+  }
+  entryId(entry: EncodedStateEntry): ID {
+    if (!entry.id)
+      throw new CaptureError({
+        code: 'schema',
+        boundary: 'missing resource ID',
+        owner: this.metadata.owner,
+        declaration: this.metadata.name,
+      });
+    const id = decode(this.options.idCodec, entry.id, this.metadata);
+    if ((entry.id.primitive && typeof id !== entry.id.primitive) || (typeof id === 'number' && !Number.isFinite(id)))
+      throw new CaptureError({
+        code: 'schema',
+        boundary: 'resource primitive kind',
+        owner: this.metadata.owner,
+        declaration: this.metadata.name,
+      });
+    return id;
+  }
+  private encodeId(id: ID): EncodedValue {
+    return {
+      ...encode({ codec: this.options.idCodec, classify: this.options.classifyId }, id),
+      primitive: typeof id === 'number' ? 'number' : 'string',
+    };
+  }
+  acceptsMetadata(metadata: DeclarationMetadata): boolean {
+    return (
+      supportsCodec(this.options.codec, metadata) &&
+      supportsCodec(this.options.idCodec, { schema: metadata.idSchema, version: metadata.idVersion })
+    );
+  }
+  migrateEntry(entry: EncodedStateEntry): EncodedStateEntry {
+    return {
+      id: this.encodeId(this.entryId(entry)),
+      value: encode(this.options, decode(this.options.codec, entry.value, this.metadata)),
+    };
+  }
+  captureEntry(runtime: ComposedRuntime, address: string | number | undefined): EncodedStateEntry | undefined {
+    const id = this.options.idCodec.decode(address);
+    const cell = this.map(runtime).get(id);
+    if (!cell || Object.is(cell.signal.get(), cell.initial)) return undefined;
+    return { id: this.encodeId(id), value: encode(this.options, cell.signal.get()) };
+  }
+  *captureEntries(runtime: ComposedRuntime): Iterable<EncodedStateEntry> {
+    // Incremental cold capture can stop at its size bound before encoding another cell.
+    for (const id of this.map(runtime).keys()) {
+      const entry = this.captureEntry(runtime, id);
+      if (entry) yield entry;
     }
+  }
+  capture(runtime: ComposedRuntime): EncodedState {
+    const entries = [...this.captureEntries(runtime)];
+    entries.sort((a, b) => compareResourceIds(this.entryId(a), this.entryId(b)));
     return { key: this.metadata.key, entries };
   }
   restore(runtime: ComposedRuntime, state: EncodedState): void {
@@ -207,10 +345,10 @@ export class KeyedHandle<T, ID extends string | number> implements StateDeclarat
     if (map.size !== 0) throw new Error('Restore requires a fresh runtime.');
     for (const entry of state.entries) {
       if (!entry.id) throw new Error('Missing resource ID in checkpoint.');
-      const id = decode(this.options.idCodec, entry.id);
+      const id = this.entryId(entry);
       if (map.has(id)) throw new Error('Duplicate resource in checkpoint.');
       map.set(id, {
-        signal: atom(this.metadata.key, decode(this.options.codec, entry.value)),
+        signal: atom(this.metadata.key, decode(this.options.codec, entry.value, this.metadata)),
         initial: this.initial(id),
       });
     }
@@ -278,9 +416,17 @@ interface EventDeclaration {
   initialize(runtime: ComposedRuntime): void;
   release(runtime: ComposedRuntime): void;
   decode(event: EncodedEvent): Publication;
+  migrate(event: EncodedEvent): EncodedEvent;
+  acceptsMetadata(metadata: DeclarationMetadata): boolean;
+  support(value: unknown): import('./support-policy.js').SupportDecision | undefined;
+}
+interface ReactionBudget {
+  remaining: number;
 }
 export abstract class Publication {
   abstract readonly kind: 'event';
+  abstract readonly reactionDepth: number;
+  abstract readonly reactionBudget: ReactionBudget | undefined;
   abstract reduce(runtime: ComposedRuntime): void;
   abstract notify(runtime: ComposedRuntime): void;
   abstract capture(): EncodedEvent;
@@ -291,17 +437,27 @@ class TypedPublication<T> extends Publication {
   constructor(
     private readonly handle: EventHandle<T>,
     private readonly payload: T,
+    private readonly expectedAdmission?: boolean,
+    readonly reactionDepth = 0,
+    readonly reactionBudget: ReactionBudget | undefined = undefined,
   ) {
     super();
   }
   reduce(runtime: ComposedRuntime): void {
     this.admitted = this.handle.reduce(runtime, this.payload);
+    if (this.expectedAdmission !== undefined && this.expectedAdmission !== this.admitted)
+      throw new CaptureError({
+        code: 'decision',
+        boundary: 'replayed admission',
+        owner: this.handle.metadata.owner,
+        declaration: this.handle.metadata.name,
+      });
   }
   notify(runtime: ComposedRuntime): void {
     this.handle.notify(runtime, this.payload, this.admitted);
   }
   capture(): EncodedEvent {
-    return this.handle.capture(this.payload);
+    return { ...this.handle.capture(this.payload), admitted: this.admitted, reactionDepth: this.reactionDepth };
   }
 }
 export class EventHandle<T> implements EventDeclaration {
@@ -358,24 +514,57 @@ export class EventHandle<T> implements EventDeclaration {
   publisher(runtime: ComposedRuntime): (payload: T) => void {
     return this.slot(runtime).publisher;
   }
-  publication(payload: T): Publication {
-    return new TypedPublication(this, payload);
+  publication(payload: T, reactionDepth = 0, reactionBudget?: ReactionBudget): Publication {
+    return new TypedPublication(this, payload, undefined, reactionDepth, reactionBudget);
   }
   capture(payload: T): EncodedEvent {
     return { key: this.metadata.key, payload: encode(this.options, payload) };
   }
+  support(value: unknown) {
+    if (!this.options.support) return undefined;
+    return this.options.support(
+      decodeCodec(this.options.codec, {
+        schema: this.options.codec?.schema ?? '',
+        version: this.options.codec?.version ?? 0,
+        value,
+      }),
+    );
+  }
+  acceptsMetadata(metadata: DeclarationMetadata): boolean {
+    return supportsCodec(this.options.codec, metadata);
+  }
+  migrate(event: EncodedEvent): EncodedEvent {
+    return { ...event, payload: encode(this.options, decode(this.options.codec, event.payload, this.metadata)) };
+  }
   decode(event: EncodedEvent): Publication {
-    return this.publication(decode(this.options.codec, event.payload));
+    return new TypedPublication(
+      this,
+      decode(this.options.codec, event.payload, this.metadata),
+      event.admitted,
+      event.reactionDepth ?? 0,
+    );
   }
 }
 
 export interface LibraryDefinition<Exports> {
   readonly name: string;
+  readonly version?: number;
+  /** Payload upgrades remain codec-owned; accepting a library version never bypasses value validation. */
+  readonly previousVersions?: readonly number[];
   readonly requires: readonly { readonly name: string; resolve(binding: BindingIdentity | undefined): unknown }[];
   readonly setup: (scope: LibraryScope) => Exports;
 }
 export function defineLibrary<Exports>(definition: LibraryDefinition<Exports>): LibraryDefinition<Exports> {
-  return Object.freeze({ ...definition, requires: Object.freeze([...definition.requires]) });
+  if (definition.version !== undefined && (!Number.isSafeInteger(definition.version) || definition.version < 1))
+    throw new RangeError('Library version must be a positive safe integer.');
+  for (const previous of definition.previousVersions ?? [])
+    if (!Number.isSafeInteger(previous) || previous < 1 || previous >= (definition.version ?? 1))
+      throw new RangeError('Accepted library versions must precede the current version.');
+  return Object.freeze({
+    ...definition,
+    previousVersions: Object.freeze([...(definition.previousVersions ?? [])]),
+    requires: Object.freeze([...definition.requires]),
+  });
 }
 export interface MountedLibrary<Exports> {
   readonly definition: LibraryDefinition<Exports>;
@@ -388,6 +577,7 @@ export class LibraryScope {
   readonly states: StateDeclaration[] = [];
   readonly events: EventDeclaration[] = [];
   readonly references = new Set<object>();
+  readonly requiredEffects: EffectCodecDescriptor[] = [];
   readonly installations: ((runtime: ComposedRuntime, state: ReducerState) => void)[] = [];
   private readonly names = new Set<string>();
   private sealed = false;
@@ -444,9 +634,22 @@ export class LibraryScope {
   keyed<T, ID extends string | number>(
     name: string,
     initial: (id: ID) => T,
-    options: DeclarationOptions<T> & { readonly idCodec: ValueCodec<ID> },
+    options: DeclarationOptions<T> & {
+      readonly idCodec: ValueCodec<ID>;
+      readonly classifyId?: (id: ID) => SupportClassification;
+      readonly supportId?: SupportPolicy<ID>;
+    },
   ): KeyedHandle<T, ID> {
-    const handle = new KeyedHandle(this.ownerToken, this.metadata(name, 'keyed', options), initial, options);
+    const handle = new KeyedHandle(
+      this.ownerToken,
+      Object.freeze({
+        ...this.metadata(name, 'keyed', options),
+        idSchema: options.idCodec.schema,
+        idVersion: options.idCodec.version,
+      }),
+      initial,
+      options,
+    );
     this.states.push(handle);
     return handle;
   }
@@ -470,11 +673,37 @@ export class LibraryScope {
     this.references.add(event.ownerToken);
     this.installations.push((runtime, state) => event.addReducer(runtime, (payload) => reducer(state, payload)));
   }
+  /** Pure successor-wave publication. Replay consumes the recorded outputs instead of generating them twice. */
+  react<Input, Output>(
+    source: EventHandle<Input>,
+    target: EventHandle<Output>,
+    plan: (state: StateReader, event: Input) => Output | undefined,
+  ): void {
+    if (this.sealed) throw new Error('Cannot change a mounted library.');
+    this.references.add(source.ownerToken);
+    this.references.add(target.ownerToken);
+    this.installations.push((runtime) => {
+      if (runtime.mode === 'replay') return;
+      runtime.listen(source, (event, admitted) => {
+        if (!admitted) return;
+        const result = plan(runtime.reader, event);
+        if (result !== undefined) runtime.publishReaction(target, result);
+      });
+    });
+  }
+  /** A checked cold-path requirement, not a dependency container or fallback interpreter. */
+  requireEffect<Effect extends EffectCodecDescriptor>(effect: Effect): Effect {
+    if (this.sealed || effect.ownerToken !== this.ownerToken || this.requiredEffects.includes(effect))
+      throw new Error('Foreign, duplicate or closed required effect.');
+    this.requiredEffects.push(effect);
+    return effect;
+  }
   /** @internal */ seal(): void {
     this.sealed = true;
     Object.freeze(this.states);
     Object.freeze(this.events);
     Object.freeze(this.installations);
+    Object.freeze(this.requiredEffects);
   }
 }
 export function mountLibrary<Exports>(
@@ -498,9 +727,16 @@ export function mountLibrary<Exports>(
   return Object.freeze({ definition, owner, exports, scope });
 }
 
+export type RuntimeDiagnosticPhase = 'boundary' | 'planner' | 'decoder' | 'reducer' | 'reaction' | 'cleanup';
+export interface RuntimeDiagnostic {
+  readonly code: 'runtime-boundary-failure';
+  readonly phase: RuntimeDiagnosticPhase;
+  readonly wave: number;
+}
 export interface RuntimeOptions {
   readonly scheduler?: DispatchScheduler;
   readonly mode?: 'live' | 'replay';
+  readonly maxReactionSteps?: number;
   readonly onError?: (cause: unknown) => void;
 }
 export interface ExternalStore<T> {
@@ -567,6 +803,32 @@ export class ComposedRuntime implements StateReader {
   private closed = false;
   private inReducer = false;
   private wave = 0;
+  private reactionDepth = 0;
+  private reactionBudget: ReactionBudget | undefined;
+  private readonly pendingExecutions = new Set<Promise<void>>();
+  private readonly providedEffects = new Set<EffectCodecDescriptor>();
+  private readinessChecked = false;
+  private readonly diagnosticListeners = new Set<(diagnostic: RuntimeDiagnostic) => void>();
+  private reportingDiagnostic = false;
+
+  get waveNumber(): number {
+    return this.wave;
+  }
+  private capturedWrite: ((state: StateDeclaration, id: string | number | undefined) => void) | undefined;
+  /** @internal Only an execution-disabled checkpoint interpreter needs incremental write capture. */
+  observeCapturedWrites(listener: (state: StateDeclaration, id: string | number | undefined) => void): () => void {
+    if (this.mode !== 'replay' || this.capturedWrite)
+      throw new Error('Checkpoint write capture requires an unobserved replay runtime.');
+    this.capturedWrite = listener;
+    return this.manage(() => {
+      this.capturedWrite = undefined;
+    });
+  }
+  /** @internal One optional branch when capture is absent; no live dirty map or payload allocation. */
+  markCapturedWrite(state: StateDeclaration, id: string | number | undefined): void {
+    this.capturedWrite?.(state, id);
+  }
+
   private readonly flushScheduled = () => {
     this.scheduled = false;
     if (!this.closed) {
@@ -582,6 +844,8 @@ export class ComposedRuntime implements StateReader {
     private readonly options: RuntimeOptions = {},
   ) {
     this.mode = options.mode ?? 'live';
+    if (!Number.isSafeInteger(options.maxReactionSteps ?? 64) || (options.maxReactionSteps ?? 64) < 1)
+      throw new RangeError('maxReactionSteps must be a positive safe integer.');
     this.scheduler = options.scheduler ?? microtaskScheduler;
     this.reader = Object.freeze({
       read: <T>(handle: ReadableHandle<T>) => this.read(handle),
@@ -652,7 +916,90 @@ export class ComposedRuntime implements StateReader {
     this.cleanups.add(stop);
     return stop;
   }
-  reportError(cause: unknown): void {
+  /** Fail before rendering a feature with a declared but unbound interpreter. */
+  assertReady(): void {
+    if (this.disposed) throw new Error('Disposed runtime.');
+    if (this.readinessChecked || this.mode === 'replay') return;
+    for (const mount of this.composition.mounts)
+      for (const requirement of mount.scope.requiredEffects)
+        if (!this.providedEffects.has(requirement))
+          throw new Error(`Missing required effect: ${requirement.metadata.owner}/${requirement.metadata.key}`);
+    this.readinessChecked = true;
+  }
+  /** @internal Called by the existing effect binder, never by screen components. */
+  provideEffect(effect: EffectCodecDescriptor): () => void {
+    this.assertOwner(effect.ownerToken);
+    this.providedEffects.add(effect);
+    this.readinessChecked = false;
+    return this.manage(() => {
+      this.providedEffects.delete(effect);
+      this.readinessChecked = false;
+    });
+  }
+  /** @internal Track actual completion, including cooperative iterator finalization. */
+  trackExecution(task: Promise<void>): void {
+    this.pendingExecutions.add(task);
+    void task.then(
+      () => {
+        this.pendingExecutions.delete(task);
+      },
+      (cause: unknown) => {
+        this.pendingExecutions.delete(task);
+        this.reportError(cause, 'cleanup');
+      },
+    );
+  }
+  async drain(): Promise<void> {
+    do {
+      if (!this.disposed) this.flush();
+      if (this.pendingExecutions.size === 0) return;
+      await Promise.allSettled([...this.pendingExecutions]);
+    } while (this.pendingExecutions.size > 0 || (!this.disposed && !this.idle));
+  }
+  /** Abort is not physical termination. This awaits actual settlement and can wait on non-cooperative work. */
+  async disposeAsync(): Promise<void> {
+    this.dispose();
+    await this.drain();
+  }
+  /** @internal Pure library reactions are the only producer of nonzero reaction depth. */
+  publishReaction<T>(event: EventHandle<T>, payload: NoInfer<T>): void {
+    this.assertOwner(event.ownerToken);
+    if (this.mode === 'replay') throw new Error('Replay must not regenerate recorded reactions.');
+    if (!this.reactionBudget) this.reactionBudget = { remaining: this.options.maxReactionSteps ?? 64 };
+    const budget = this.reactionBudget;
+    if (budget.remaining === 0)
+      throw new CaptureError({
+        code: 'size-limit',
+        boundary: 'reaction steps',
+        limit: this.options.maxReactionSteps ?? 64,
+      });
+    budget.remaining--;
+    this.queue.publish(event.publication(payload, this.reactionDepth + 1, budget));
+  }
+  observeDiagnostics(listener: (diagnostic: RuntimeDiagnostic) => void): () => void {
+    this.diagnosticListeners.add(listener);
+    return this.manage(() => {
+      this.diagnosticListeners.delete(listener);
+    });
+  }
+  private diagnostic(phase: RuntimeDiagnosticPhase): void {
+    if (this.reportingDiagnostic || this.diagnosticListeners.size === 0 || this.disposed) return;
+    this.reportingDiagnostic = true;
+    try {
+      const diagnostic: RuntimeDiagnostic = Object.freeze({ code: 'runtime-boundary-failure', phase, wave: this.wave });
+      for (const listener of this.diagnosticListeners) {
+        try {
+          listener(diagnostic);
+        } catch {
+          /* A failing diagnostic observer cannot recursively diagnose itself. */
+        }
+      }
+    } finally {
+      this.reportingDiagnostic = false;
+    }
+  }
+  reportError(cause: unknown, phase: RuntimeDiagnosticPhase = 'boundary'): void {
+    this.diagnostic(phase);
     // Error reporters must not turn an already handled async failure into an unhandled rejection.
     try {
       if (this.options.onError) this.options.onError(cause);
@@ -745,6 +1092,7 @@ export class ComposedRuntime implements StateReader {
             const event = events[index];
             if (event?.kind === 'interest') this.queue.publish(event);
           }
+        this.diagnostic('reducer');
         throw cause;
       }
       const wave = ++this.wave;
@@ -758,8 +1106,13 @@ export class ComposedRuntime implements StateReader {
       }
       for (let index = 0; index < count && !this.disposed; index++) {
         const event = events[index];
-        if (event?.kind === 'event') event.notify(this);
-        else if (event) this.interestBatch.append(event.changes);
+        if (event?.kind === 'event') {
+          this.reactionDepth = event.reactionDepth;
+          this.reactionBudget = event.reactionBudget;
+          event.notify(this);
+          this.reactionDepth = 0;
+          this.reactionBudget = undefined;
+        } else if (event) this.interestBatch.append(event.changes);
       }
       const changes = this.interestBatch.take();
       if (changes.length > 0)
@@ -811,6 +1164,8 @@ export class ComposedRuntime implements StateReader {
     this.interestBatch.clear();
     this.interestListeners.clear();
     this.waveObservers.clear();
+    this.diagnosticListeners.clear();
+    this.providedEffects.clear();
     for (const event of this.composition.events.values()) event.release(this);
     for (const state of this.composition.states) state.release(this);
     this.closed = true;

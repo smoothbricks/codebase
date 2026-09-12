@@ -51,6 +51,7 @@ export function createStateBusReact(composition: StateBusComposition) {
   function Provider({ runtime, children }: { readonly runtime: ComposedRuntime; readonly children?: ReactNode }) {
     if (runtime.composition !== composition || runtime.disposed)
       throw new Error('Provider received a foreign or disposed runtime.');
+    runtime.assertReady();
     return createElement(RuntimeContext.Provider, { value: runtime }, children);
   }
   return Object.freeze({ Provider, useRuntime: useComposedRuntime, useStateValue, useKeyedState, useEventPublisher });

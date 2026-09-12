@@ -1,8 +1,12 @@
+import { CaptureError, captureBytes, captureLimit, captureValue, compareResourceIds } from './capture.js';
+import { decodeCodec } from './codec.js';
 import type {
   ComposedRuntime,
   DeclarationMetadata,
   EncodedEvent,
   EncodedState,
+  EncodedStateEntry,
+  EncodedValue,
   StateBusComposition,
   SupportClassification,
   WaveObserver,
@@ -25,6 +29,7 @@ export interface RecordedScenario {
   readonly waves: readonly RecordedWave[];
   /** False after eviction or support filtering; such a record MUST NOT be called replay-equivalent. */
   readonly complete: boolean;
+  readonly checkpointWave?: number;
 }
 export interface ScenarioRecorder {
   snapshot(): RecordedScenario;
@@ -32,14 +37,52 @@ export interface ScenarioRecorder {
   reset(): void;
   dispose(): void;
 }
-export function captureCheckpoint(runtime: ComposedRuntime): StateCheckpoint {
-  if (!runtime.idle || runtime.disposed) throw new Error('Checkpoint requires a live, quiescent dispatch queue.');
+export function ownEncoded(value: EncodedValue, maxBytes?: number): EncodedValue {
+  return Object.freeze({ ...value, value: captureValue(value.value, maxBytes).value });
+}
+export function ownEntry(entry: EncodedStateEntry, maxBytes?: number): EncodedStateEntry {
   return Object.freeze({
-    formatVersion: 1,
-    schema: runtime.composition.metadata,
-    states: Object.freeze(runtime.composition.states.map((state) => state.capture(runtime))),
+    ...(entry.id ? { id: ownEncoded(entry.id, maxBytes) } : {}),
+    value: ownEncoded(entry.value, maxBytes),
   });
 }
+export function ownEvent(event: EncodedEvent, maxBytes?: number): EncodedEvent {
+  return Object.freeze({ ...event, payload: ownEncoded(event.payload, maxBytes) });
+}
+export interface CheckpointCaptureOptions {
+  readonly maxBytes?: number;
+  readonly maxEntryBytes?: number;
+}
+export function captureCheckpoint(runtime: ComposedRuntime, options: CheckpointCaptureOptions = {}): StateCheckpoint {
+  if (!runtime.idle || runtime.disposed) throw new Error('Checkpoint requires a live, quiescent dispatch queue.');
+  const maxBytes = captureLimit(options.maxBytes ?? 8 * 1024 * 1024, 'maxBytes');
+  const maxEntryBytes = captureLimit(options.maxEntryBytes ?? maxBytes, 'maxEntryBytes');
+  const states: EncodedState[] = [];
+  let bytes = captureBytes({ formatVersion: 1, schema: runtime.composition.metadata, states: [] }, maxBytes);
+  function account(size: number): void {
+    bytes += size;
+    if (bytes > maxBytes) throw new CaptureError({ code: 'size-limit', boundary: 'checkpoint', limit: maxBytes });
+  }
+  for (const declaration of runtime.composition.states) {
+    const key = declaration.metadata.key;
+    account(captureBytes({ key, entries: [] }, maxBytes) + (states.length > 0 ? 1 : 0));
+    const entries: EncodedStateEntry[] = [];
+    for (const entry of declaration.captureEntries(runtime)) {
+      if (bytes >= maxBytes) throw new CaptureError({ code: 'size-limit', boundary: 'checkpoint', limit: maxBytes });
+      const value = ownEntry(entry, Math.min(maxEntryBytes, maxBytes - bytes));
+      account(captureBytes(value, maxEntryBytes) + (entries.length > 0 ? 1 : 0));
+      entries.push(value);
+    }
+    entries.sort((a, b) => {
+      const left = declaration.entryId(a);
+      const right = declaration.entryId(b);
+      return left === undefined || right === undefined ? 0 : compareResourceIds(left, right);
+    });
+    states.push(Object.freeze({ key, entries: Object.freeze(entries) }));
+  }
+  return Object.freeze({ formatVersion: 1, schema: runtime.composition.metadata, states: Object.freeze(states) });
+}
+
 export function recordScenario(
   runtime: ComposedRuntime,
   { maxEvents = 1024 }: { readonly maxEvents?: number } = {},
@@ -61,7 +104,7 @@ export function recordScenario(
       try {
         for (let index = 0; index < length; index++) {
           const event = queue[index];
-          if (event?.kind === 'event') events.push(event.capture());
+          if (event?.kind === 'event') events.push(ownEvent(event.capture()));
         }
       } catch (cause) {
         complete = false;
@@ -105,7 +148,7 @@ export function recordScenario(
 }
 function checkSchema(composition: StateBusComposition, checkpoint: StateCheckpoint): void {
   if (checkpoint.formatVersion !== 1 || checkpoint.schema.length !== composition.metadata.length)
-    throw new Error('Incompatible checkpoint schema.');
+    throw new CaptureError({ code: 'schema', boundary: 'checkpoint declaration set' });
   for (let index = 0; index < checkpoint.schema.length; index++) {
     const before = checkpoint.schema[index];
     const after = composition.metadata[index];
@@ -113,9 +156,19 @@ function checkSchema(composition: StateBusComposition, checkpoint: StateCheckpoi
       before.key !== after.key ||
       before.kind !== after.kind ||
       before.schema !== after.schema ||
-      before.version !== after.version
+      before.version !== after.version ||
+      before.idSchema !== after.idSchema ||
+      before.idVersion !== after.idVersion
     )
-      throw new Error('Incompatible checkpoint schema.');
+      throw new CaptureError({
+        code: 'schema',
+        boundary: 'checkpoint declaration',
+        owner: after.owner,
+        declaration: after.name,
+        schema: before.schema,
+        fromVersion: before.version,
+        toVersion: after.version,
+      });
   }
 }
 export function replayScenario(composition: StateBusComposition, scenario: RecordedScenario): ComposedRuntime {
@@ -133,7 +186,9 @@ export function replayScenario(composition: StateBusComposition, scenario: Recor
       if (!state) throw new Error('Missing checkpoint state.');
       declaration.restore(runtime, state);
     }
-    let previousWave = 0;
+    let previousWave = scenario.checkpointWave ?? 0;
+    if (!Number.isSafeInteger(previousWave) || previousWave < 0)
+      throw new CaptureError({ code: 'schema', boundary: 'checkpoint wave' });
     for (const wave of scenario.waves) {
       if (!Number.isSafeInteger(wave.wave) || wave.wave <= previousWave)
         throw new Error('Invalid recorded wave order.');
@@ -148,8 +203,19 @@ export function replayScenario(composition: StateBusComposition, scenario: Recor
   }
 }
 
-export interface RecordedEffectOutcome {
+export interface RecordedEffectInstruction {
+  readonly kind: 'instruction';
   readonly effect: string;
+  readonly classification?: SupportClassification;
+  readonly schema: string;
+  readonly version: number;
+  readonly value: unknown;
+}
+export type RecordedEffectCapture = RecordedEffectOutcome | RecordedEffectInstruction;
+export interface RecordedEffectOutcome {
+  readonly kind?: 'outcome';
+  readonly effect: string;
+  readonly classification?: SupportClassification;
   readonly schema: string;
   readonly version: number;
   readonly value: unknown;
@@ -157,29 +223,84 @@ export interface RecordedEffectOutcome {
 export function captureEffectOutcome<C, P extends EffectPlan, O, R>(
   definition: EffectDefinition<C, P, O, R>,
   outcome: EffectOutcome<P, O>,
+  maxBytes?: number,
 ): RecordedEffectOutcome {
   const codec = definition.codec;
   if (!codec) throw new Error('An effect outcome codec is required for capture.');
   return Object.freeze({
+    kind: 'outcome',
     effect: definition.metadata.key,
+    classification: definition.classify?.(outcome) ?? 'unclassified',
     schema: codec.schema,
     version: codec.version,
-    value: codec.encode(outcome),
+    value: captureValue(codec.encode(outcome), maxBytes).value,
   });
 }
 export function decodeEffectOutcome<C, P extends EffectPlan, O, R>(
   definition: EffectDefinition<C, P, O, R>,
   outcome: RecordedEffectOutcome,
 ): EffectOutcome<P, O> {
-  const codec = definition.codec;
-  if (
-    !codec ||
-    definition.metadata.key !== outcome.effect ||
-    codec.schema !== outcome.schema ||
-    codec.version !== outcome.version
-  )
-    throw new Error('Incompatible effect outcome.');
-  return codec.decode(outcome.value);
+  if (outcome.effect !== definition.metadata.key)
+    throw new CaptureError({
+      code: 'schema',
+      boundary: 'Incompatible effect outcome',
+      owner: definition.metadata.owner,
+      declaration: outcome.effect,
+    });
+  try {
+    return decodeCodec(definition.codec, outcome);
+  } catch (cause) {
+    throw new CaptureError(
+      {
+        code: 'schema',
+        boundary: 'Incompatible effect outcome',
+        owner: definition.metadata.owner,
+        declaration: outcome.effect,
+        schema: outcome.schema,
+        fromVersion: outcome.version,
+        toVersion: definition.codec?.version,
+      },
+      { cause },
+    );
+  }
+}
+export function captureEffectInstruction<C, P extends EffectPlan, O, R>(
+  definition: EffectDefinition<C, P, O, R>,
+  plan: P,
+  maxBytes?: number,
+): RecordedEffectInstruction {
+  const codec = definition.instructionCodec;
+  if (!codec) throw new Error('An instruction codec is required for capture.');
+  return Object.freeze({
+    kind: 'instruction',
+    effect: definition.metadata.key,
+    schema: codec.schema,
+    version: codec.version,
+    value: captureValue(codec.encode(plan), maxBytes).value,
+    classification: definition.classifyInstruction?.(plan) ?? 'unclassified',
+  });
+}
+export function decodeEffectInstruction<C, P extends EffectPlan, O, R>(
+  definition: EffectDefinition<C, P, O, R>,
+  instruction: RecordedEffectInstruction,
+): P {
+  try {
+    if (instruction.effect !== definition.metadata.key) throw new Error('Foreign instruction.');
+    return decodeCodec(definition.instructionCodec, instruction);
+  } catch (cause) {
+    throw new CaptureError(
+      {
+        code: 'schema',
+        boundary: 'effect instruction',
+        owner: definition.metadata.owner,
+        declaration: instruction.effect,
+        schema: instruction.schema,
+        fromVersion: instruction.version,
+        toVersion: definition.instructionCodec?.version,
+      },
+      { cause },
+    );
+  }
 }
 /** Support exports are intentionally non-replayable when a policy removes data. Codecs own field-level redaction. */
 export function classifyScenario(
