@@ -1,3 +1,4 @@
+export * from './composition.js';
 export * from './identifiers.js';
 export * from './model.js';
 export * from './ports.js';
