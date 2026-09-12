@@ -10,7 +10,7 @@ import type { DeclarationMetadata, EncodedStateEntry, EncodedValue, StateBusComp
 import type { EffectCodecDescriptor } from './effects.js';
 import { ownEntry, ownEvent, type RecordedScenario, replayScenario, type StateCheckpoint } from './recording.js';
 import type { RecordedEffectPosition, RollingScenario } from './rolling.js';
-import { projectSupport, type SupportPolicy } from './support-policy.js';
+import { isRedactedSupport, projectSupport, type SupportPolicy } from './support-policy.js';
 
 export interface CaptureLibraryVersion {
   readonly owner: string;
@@ -113,6 +113,29 @@ function validateVersions(composition: StateBusComposition, capture: CaptureMani
   }
   if (remaining.size > 0) throw new CaptureError({ code: 'schema', boundary: 'missing library' });
 }
+function checkCaptures(envelope: CaptureEnvelope): void {
+  const effects = new Map(envelope.manifest.effects.map((effect) => [effect.key, effect]));
+  if (effects.size !== envelope.manifest.effects.length) refuse(undefined, 'duplicate manifest effect');
+  if (!Number.isSafeInteger(envelope.evictedEffects) || envelope.evictedEffects < 0)
+    refuse(undefined, 'invalid effect eviction count');
+  let sequence = 0;
+  let afterWave = 0;
+  for (const entry of envelope.captures) {
+    const effect = effects.get(entry.capture.effect);
+    if (
+      !effect ||
+      entry.capture.schema !== (entry.capture.kind === 'instruction' ? effect.instructionSchema : effect.schema) ||
+      entry.capture.version !== (entry.capture.kind === 'instruction' ? effect.instructionVersion : effect.version) ||
+      !Number.isSafeInteger(entry.sequence) ||
+      entry.sequence <= sequence ||
+      !Number.isSafeInteger(entry.afterWave) ||
+      entry.afterWave < afterWave
+    )
+      refuse(undefined, 'effect codec/causal position');
+    sequence = entry.sequence;
+    afterWave = entry.afterWave;
+  }
+}
 function checkEnvelope(
   composition: StateBusComposition,
   envelope: CaptureEnvelope,
@@ -135,6 +158,7 @@ function checkEnvelope(
     if (!header || (header.kind !== 'scalar' && header.kind !== 'keyed') || stateKeys.has(state.key))
       refuse(header, 'invalid checkpoint declaration');
     stateKeys.add(state.key);
+    if (header.kind === 'scalar' && state.entries.length !== 1) refuse(header, 'invalid scalar checkpoint');
     for (const entry of state.entries) {
       if (
         entry.value.schema !== header.schema ||
@@ -146,6 +170,9 @@ function checkEnvelope(
         refuse(header, 'value header differs from manifest');
     }
   }
+  for (const header of headers.values())
+    if ((header.kind === 'scalar' || header.kind === 'keyed') && !stateKeys.has(header.key))
+      refuse(header, 'missing checkpoint declaration');
   for (const wave of envelope.scenario.waves)
     for (const event of wave.events) {
       const header = headers.get(event.key);
@@ -157,6 +184,7 @@ function checkEnvelope(
       )
         refuse(header, 'event header differs from manifest');
     }
+  checkCaptures(envelope);
   const current = manifest(composition, effects);
   if (!allowPrevious && canonicalCapture(current) !== canonicalCapture(envelope.manifest))
     throw new CaptureError({ code: 'schema', boundary: 'composition/effect codec manifest' });
@@ -191,23 +219,6 @@ export function createCaptureEnvelope(
     evictedEffects: 'evictedEffects' in scenario ? scenario.evictedEffects : 0,
   });
   checkEnvelope(composition, captured, effects, false);
-  // Every retained outcome must have a declared codec version in the same mounted composition.
-  const codecs = effectMap(composition, effects);
-  for (const { capture } of captured.captures) {
-    const descriptor = codecs.get(capture.effect);
-    if (
-      !descriptor ||
-      (capture.kind === 'instruction' ? descriptor.metadata.instructionSchema : descriptor.metadata.schema) !==
-        capture.schema ||
-      (capture.kind === 'instruction' ? descriptor.metadata.instructionVersion : descriptor.metadata.version) !==
-        capture.version
-    )
-      throw new CaptureError({
-        code: 'schema',
-        boundary: 'missing or incompatible outcome codec',
-        declaration: capture.effect,
-      });
-  }
   captureBytes(captured, options.maxBytes);
   return captured;
 }
@@ -302,8 +313,7 @@ export function migrateCaptureEnvelope(
   checkEnvelope(composition, envelope, effects, true);
   const codecs = effectMap(composition, effects);
   const oldEffects = new Map(envelope.manifest.effects.map((effect) => [effect.key, effect]));
-  if (oldEffects.size !== envelope.manifest.effects.length || oldEffects.size !== codecs.size)
-    refuse(undefined, 'changed effect declaration set');
+  if (oldEffects.size !== codecs.size) refuse(undefined, 'changed effect declaration set');
   for (const [key, descriptor] of codecs) {
     const old = oldEffects.get(key);
     if (!old || old.owner !== descriptor.metadata.owner) refuse(undefined, 'changed effect ownership');
@@ -322,22 +332,9 @@ export function migrateCaptureEnvelope(
         toVersion: descriptor.metadata.version,
       });
   }
-  let sequence = 0;
   const outcomes = envelope.captures.map((entry) => {
     const descriptor = codecs.get(entry.capture.effect);
-    const old = oldEffects.get(entry.capture.effect);
-    if (
-      !descriptor ||
-      !old ||
-      entry.capture.schema !== (entry.capture.kind === 'instruction' ? old.instructionSchema : old.schema) ||
-      entry.capture.version !== (entry.capture.kind === 'instruction' ? old.instructionVersion : old.version) ||
-      !Number.isSafeInteger(entry.sequence) ||
-      entry.sequence <= sequence ||
-      !Number.isSafeInteger(entry.afterWave) ||
-      entry.afterWave < 0
-    )
-      refuse(undefined, 'outcome codec/causal position');
-    sequence = entry.sequence;
+    if (!descriptor) refuse(undefined, 'missing effect codec');
     return Object.freeze({ ...entry, capture: descriptor.migrateCapture(entry.capture) });
   });
   const result: CaptureEnvelope = Object.freeze({
@@ -362,6 +359,8 @@ export function replayCaptureEnvelope(
 
 export interface SupportExportOptions {
   readonly consent?: boolean;
+  /** Build IDs, owner/library names and codec metadata are private unless explicitly projected. */
+  readonly metadata?: SupportPolicy<Pick<CaptureEnvelope, 'application' | 'manifest' | 'migratedForBuild'>>;
   readonly environment?: SupportPolicy<unknown>;
   readonly effects?: readonly EffectCodecDescriptor[];
   readonly maxBytes?: number;
@@ -390,6 +389,13 @@ export function exportSupportCapture(
   const consent = options.consent ?? false;
   const stateMap = new Map(composition.states.map((state) => [state.metadata.key, state]));
   const codecs = effectMap(composition, effects);
+  const declarationIndices = new Map(envelope.manifest.declarations.map((entry, index) => [entry.key, index]));
+  const effectIndices = new Map(envelope.manifest.effects.map((entry, index) => [entry.key, index]));
+  function reference(indices: ReadonlyMap<string, number>, key: string): number {
+    const index = indices.get(key);
+    if (index === undefined) refuse(undefined, 'missing support reference');
+    return index;
+  }
   function projected(value: EncodedValue, policy: SupportPolicy<unknown> | undefined): unknown {
     return projectSupport(value.classification, policy, value.value, consent, maxEntryBytes);
   }
@@ -398,11 +404,13 @@ export function exportSupportCapture(
     if (!declaration) refuse(undefined, 'unknown support state');
     const policy = declaration.support;
     return {
-      key: state.key,
-      entries: state.entries.map((entry: EncodedStateEntry) => ({
-        ...(entry.id ? { id: projected(entry.id, policy.id) } : {}),
-        value: projected(entry.value, policy.value),
-      })),
+      declaration: reference(declarationIndices, state.key),
+      entries: state.entries.map((entry: EncodedStateEntry) => {
+        if (!entry.id) return { value: projected(entry.value, policy.value) };
+        const id = projected(entry.id, policy.id);
+        // Refusing an address also refuses its associated value before decoding/projecting it.
+        return { id, value: isRedactedSupport(id) ? id : projected(entry.value, policy.value) };
+      }),
     };
   });
   const waves = envelope.scenario.waves.map((wave) => ({
@@ -411,7 +419,7 @@ export function exportSupportCapture(
       const declaration = composition.events.get(event.key);
       if (!declaration) refuse(undefined, 'unknown support event');
       return {
-        key: event.key,
+        declaration: reference(declarationIndices, event.key),
         admitted: event.admitted,
         payload: projected(event.payload, (value) => declaration.support(value)),
       };
@@ -423,7 +431,7 @@ export function exportSupportCapture(
     return {
       sequence: entry.sequence,
       afterWave: entry.afterWave,
-      effect: entry.capture.effect,
+      effect: reference(effectIndices, entry.capture.effect),
       value: projectSupport(
         entry.capture.classification ?? 'unclassified',
         () => descriptor.supportCapture(entry.capture),
@@ -433,20 +441,32 @@ export function exportSupportCapture(
       ),
     };
   });
+  const metadataPolicy = options.metadata;
   const payload = captureValue(
     {
-      application: {
-        buildId: envelope.application.buildId,
-        environment: projectSupport(
-          'unclassified',
-          options.environment,
-          envelope.application.environment,
-          consent,
-          maxEntryBytes,
-        ),
-      },
-      libraries: envelope.manifest.libraries,
-      effects: envelope.manifest.effects,
+      // Numeric references retain relationships, not raw private names. An approved metadata
+      // projection can map these canonical manifest indexes to application-owned public aliases.
+      metadata: projectSupport(
+        'unclassified',
+        metadataPolicy
+          ? () =>
+              metadataPolicy({
+                application: envelope.application,
+                manifest: envelope.manifest,
+                migratedForBuild: envelope.migratedForBuild,
+              })
+          : undefined,
+        undefined,
+        consent,
+        maxEntryBytes,
+      ),
+      environment: projectSupport(
+        'unclassified',
+        options.environment,
+        envelope.application.environment,
+        consent,
+        maxEntryBytes,
+      ),
       checkpointWave: envelope.scenario.checkpointWave ?? 0,
       states,
       waves,
