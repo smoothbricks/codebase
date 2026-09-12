@@ -62,7 +62,7 @@ interface BindingIdentity {
 }
 export class CapabilityBinding<T> implements BindingIdentity {
   // Invariant type witness; no consumer casts or ambient augmentation are needed.
-  declare private readonly type: (value: T) => T;
+  private declare readonly type: (value: T) => T;
   constructor(readonly capability: object) {
     Object.freeze(this);
   }
