@@ -17,6 +17,9 @@ cold setup/growth, warmed exact-count lookup and unchanged view-prop comparison.
 validation and is not a zero-allocation phase. The warmed scratch phase excludes publication; the owned-wave phase
 includes it. High-cardinality waves are processed fully and then clear the bounded address cache rather than retaining
 an unlimited interner. Raw JSON is written under `.cache/benchmarks/exact-interest-<engine>-<order>.json`.
+The package-contract CI job executes all four engine/order combinations through these same Nx targets and retains the
+raw samples with its tarball/consumer evidence. Semantic or retained-output mismatches fail the job. Latency samples
+are diagnostic: a shared CI runner is not a dedicated-hardware percentile/noise-regression gate.
 
 These are reproducible diagnostics, not a whole-runtime allocation or browser frame-time certificate. Process memory
 snapshots are not per-operation allocation counts, effective-memory peak/retained bounds or GC pause measurements.

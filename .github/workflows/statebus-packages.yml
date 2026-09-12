@@ -37,12 +37,23 @@ jobs:
         run: bun install --frozen-lockfile
       - name: Build and verify actual packed consumers
         run: nx run statebus-core:verify-packages --output-style=static
+      - name: Record exact-interest phase diagnostics in both engine orderings
+        env:
+          STATEBUS_BENCH_COMMIT: ${{ github.sha }}
+        run: |
+          for order in baseline-first candidate-first; do
+            STATEBUS_BENCH_ORDER="$order" nx run statebus-core:bench-exact-interest --output-style=static
+            STATEBUS_BENCH_ORDER="$order" nx run statebus-core:bench-exact-interest:v8 --output-style=static
+          done
       - name: Record tracked source and revision for reproducible verification
         if: always()
         run: |
           mkdir -p .cache/statebus-packages
           git archive HEAD | gzip > .cache/statebus-packages/source.tar.gz
           git rev-parse HEAD > .cache/statebus-packages/revision.txt
+          if [ -d packages/statebus-core/.cache/benchmarks ]; then
+            cp packages/statebus-core/.cache/benchmarks/exact-interest-*.json .cache/statebus-packages/
+          fi
       - uses: actions/upload-artifact@v7.0.1
         if: always()
         with:
