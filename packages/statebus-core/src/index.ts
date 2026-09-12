@@ -32,6 +32,9 @@ declare module '@smoothbricks/statebus-core' {
 }
 
 export { StateBus } from './api.js';
+export * from './composition.js';
+export { type DispatchScheduler, ManualScheduler, microtaskScheduler } from './dispatch.js';
+export * from './effects.js';
 export type { StateInterest, StateInterestChange, StateInterestKey } from './interest.js';
 export {
   mergeStateInterests,
@@ -42,6 +45,7 @@ export {
 } from './interest.js';
 export { ManualStateBus } from './manual.js';
 export { MicrotaskStateBus } from './microtask.js';
+export * from './recording.js';
 export type {
   AnyEvent,
   AnyListener,
