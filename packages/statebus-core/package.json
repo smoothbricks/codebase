@@ -25,7 +25,8 @@
   "files": [
     "dist",
     "src",
-    "!**/*.tsbuildinfo"
+    "!**/*.tsbuildinfo",
+    "CONSUMER.md"
   ],
   "homepage": "https://smoothbricks.dev/statebus",
   "keywords": [
@@ -61,7 +62,10 @@
           "cwd": "{projectRoot}/src",
           "timeoutMs": 120000,
           "killAfterMs": 10000
-        }
+        },
+        "dependsOn": [
+          "verify-packages"
+        ]
       },
       "bench": {
         "executor": "nx:run-commands",
@@ -107,14 +111,23 @@
               "statebus-data-loader",
               "statebus-tanstack-query",
               "statebus-navigation-core",
-              "statebus-navigation-browser"
+              "statebus-navigation-browser",
+              "lmao",
+              "arrow-builder",
+              "validation"
             ]
           }
         ],
         "options": {
           "command": "bun scripts/verify-packages.mjs",
           "cwd": "{projectRoot}"
-        }
+        },
+        "inputs": [
+          "default",
+          "^default",
+          "{workspaceRoot}/packages/cli/src/monorepo/published-exports.ts",
+          "{workspaceRoot}/packages/statebus-core/scripts/consumer/**/*"
+        ]
       }
     },
     "tags": [

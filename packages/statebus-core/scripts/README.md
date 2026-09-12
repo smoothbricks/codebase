@@ -1,6 +1,6 @@
 # StateBus packed-consumer contract
 
-Run `nx run statebus-core:verify-packages`. The target first builds all six StateBus packages, then runs Bun's real
+Run `nx run statebus-core:verify-packages`. The target first builds all six StateBus packages plus LMAO/codec dependencies, then runs Bun's real
 `pm pack` for each one. It inspects their public metadata, JavaScript/declaration exports and rewritten inter-package
 versions, then installs the unmodified tarballs into two temporary consumers outside the workspace: Bun's isolated
 and hoisted linkers. Each consumer passes strict declaration checking with `skipLibCheck: false` and runs under both
@@ -17,9 +17,21 @@ consumer lockfile. Consumer installs disable global-store links and lifecycle sc
 or installed into the user's project. The temporary consumers are removed even on failure.
 
 The tarballs, consumer lockfiles and checksummed result manifest are written to `.cache/statebus-packages/`. A stale
-success manifest is removed before a rerun; the new manifest is written only after both consumers pass. The fixture
-is stored as text because its declaration merging belongs to the consumer, not this core's source schema or Nx graph.
-It is copied to `consumer.ts` and fully typechecked on every run. Explicit Nx dependencies build the package set.
+success manifest is removed before a rerun; the new manifest is written only after both consumers pass.
+
+## Consumer project
+
+`consumer/` is an ordinary TypeScript project, not text templates. `platform/` covers the six-package public exports,
+legacy declaration merging and negative platform contracts. `composed/` contains the inventory library, generated
+codecs, integration scenarios, failure/replay cases and compile-negative API contracts. Each has a checked-in
+`tsconfig.json`; neither inherits the workspace's source aliases or development export conditions.
+
+The verifier copies the authored project unchanged to each temporary installation, then compiles and runs it against
+the installed package exports. Local `dist`, `node_modules` and `.cache` directories are excluded from copying.
+The nested `statebus-consumer` Nx project owns these imports so they cannot introduce a dependency from core back
+to React or the loader packages. `nx lint statebus-consumer` checks the real TypeScript with Biome;
+`nx test statebus-consumer` delegates to the same built-package verification target. Both programs use strict
+public-declaration checks with unused-local checks and `noEmitOnError`. See `../CONSUMER.md` for the API contract.
 
 `StateBus package contracts` runs this target on pull requests and main. It also runs the exact-interest Mitata target
 under Node/V8 and Bun in both orders, checking semantic equivalence and retaining individual raw samples. These are
@@ -43,3 +55,7 @@ isolated and hoisted packed consumers also compile negative contracts for
 `Buffer`, `process`, `Bun`, `require` and `__dirname` with the real transitive
 exports. Reintroducing those globals fails validation rather than silently
 weakening platform neutrality. Declaration checking remains strict.
+
+The separate composed scenario program explicitly enables Node test-harness types
+for its assertions and execution adapters. It does not share a TypeScript program
+with the platform-neutral consumer, so it cannot mask those negative contracts.

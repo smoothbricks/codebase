@@ -1,4 +1,5 @@
 import { atom } from '@tldraw/state';
+import { DispatchQueue } from './dispatch.js';
 import { type StateInterest, StateInterestBatch, type StateInterestChange, StateInterestRegistry } from './interest.js';
 import { SubscriberCountBatch } from './subscriber-counts.js';
 import type {
@@ -144,47 +145,23 @@ export abstract class StateBus implements StateBusReader {
     this.state = Object.freeze(s) as WritableState;
   }
 
-  // Keep backing capacity between waves; length = 0 can discard the backing store.
-  // Slots are cleared after dispatch so retaining capacity never retains payloads.
-  private queuedEventCount = 0;
-  private eventQueue = new Array<AnyEvent | undefined>(32).fill(undefined);
-  private dispatchingEventQueue = new Array<AnyEvent | undefined>(32).fill(undefined);
   private listeners: AnyTopicListenerMap = {};
-  private dispatching = false;
   private readonly interestCounts = new SubscriberCountBatch<StateKeys>();
-
   private readonly interestChanges = new StateInterestBatch<StateKeys>();
-
-  dispatchEvents() {
-    // A listener may request a flush, but must not interrupt the current wave.
-    if (this.dispatching) return;
-    this.dispatching = true;
-    try {
-      this.dispatchQueuedEvents();
-    } finally {
-      this.dispatching = false;
-      // A failed reducer may have published work before throwing.
-      if (this.queuedEventCount > 0) this.scheduleDispatch();
-    }
-  }
-
-  private dispatchQueuedEvents() {
-    while (this.queuedEventCount > 0) {
-      const eventQueue = this.eventQueue;
-      const eventCount = this.queuedEventCount;
-      this.queuedEventCount = 0;
-      // Reuse queue storage. Publications during this wave enter the other queue.
-      this.eventQueue = this.dispatchingEventQueue;
-      this.dispatchingEventQueue = eventQueue;
+  private readonly queue = new DispatchQueue<AnyEvent>(
+    (events, count) => {
       try {
-        this.dispatchWave(eventQueue, eventCount);
+        this.dispatchWave(events, count);
       } finally {
-        // Never retain or replay a failed wave when this storage is reused.
-        for (let index = 0; index < eventCount; index += 1) eventQueue[index] = undefined;
         this.interestCounts.clear();
         this.interestChanges.clear();
       }
-    }
+    },
+    () => this.scheduleDispatch(),
+  );
+
+  dispatchEvents() {
+    this.queue.flush();
   }
 
   private dispatchWave(eventQueue: readonly (AnyEvent | undefined)[], eventCount: number): void {
@@ -255,11 +232,7 @@ export abstract class StateBus implements StateBusReader {
   protected abstract scheduleDispatch(): void;
 
   publish(event: AnyEvent) {
-    const length = ++this.queuedEventCount;
-    this.eventQueue[length - 1] = event;
-    // The active dispatcher already drains every queued successor wave.
-    if (!this.dispatching) this.scheduleDispatch();
-    return length;
+    return this.queue.publish(event);
   }
 
   subscribe<Topic extends Topics, Type extends EventTypes<Topic>>(
