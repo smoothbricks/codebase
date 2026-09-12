@@ -31,7 +31,7 @@ jobs:
           import { join } from 'node:path';
           const text = readFileSync('bun.lock', 'utf8');
           const names = ['@tldraw/state', '@tldraw/state-react', '@tanstack/query-core', 'typescript', 'react', 'react-dom', '@types/react', '@types/react-dom', '@types/node', '@types/bun', 'happy-dom', 'fast-check', '@biomejs/biome', 'tslib', 'typia', 'ttsc'];
-          const dependencies = {'@smoothbricks/lmao':'0.3.13'};
+          const dependencies = {'@smoothbricks/lmao':'0.3.13', '@typescript/native':'npm:typescript@7.0.2'};
           for (const name of names) {
             const line = text.split('\n').find(line => line.trimStart().startsWith(JSON.stringify(name) + ': ['));
             if (!line) throw new Error('Missing locked dependency ' + name);
@@ -44,7 +44,8 @@ jobs:
           bun install --ignore-scripts
           cp "$(command -v bun)" ./bun
           export TTSC_CACHE_DIR="$destination/ttsc-cache"
-          printf '%s\n' '{"compilerOptions":{"target":"ES2022","module":"NodeNext","moduleResolution":"NodeNext","strict":true,"skipLibCheck":true,"outDir":"out","plugins":[{"transform":"typia/lib/transform"}]},"include":["warm.ts"]}' > tsconfig.json
+          export TTSC_TSGO_BINARY="$destination/node_modules/@typescript/native/bin/tsc"
+          printf '%s\n' '{"compilerOptions":{"target":"ES2022","module":"NodeNext","moduleResolution":"NodeNext","strict":true,"skipLibCheck":true,"types":[],"outDir":"out","plugins":[{"transform":"typia/lib/transform"}]},"include":["warm.ts"]}' > tsconfig.json
           printf '%s\n' 'import typia from "typia"; export const validate = typia.createAssert<{ id: string }>();' > warm.ts
           bun node_modules/ttsc/lib/launcher/ttsc.js -p tsconfig.json
           tar -czf "$GITHUB_WORKSPACE/statebus-development-inputs.tar.gz" node_modules package.json bun.lock bun ttsc-cache
