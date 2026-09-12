@@ -1,6 +1,14 @@
 import { type Atom, atom, computed, react, type Signal, transaction } from '@tldraw/state';
 import { DispatchQueue, type DispatchScheduler, microtaskScheduler } from './dispatch.js';
 import { type StateInterest, StateInterestBatch, type StateInterestChange, StateInterestRegistry } from './interest.js';
+import {
+  type CapturedEntry,
+  type CaptureSink,
+  compareResourceKeys,
+  type StateCapture,
+  trackState,
+  visitState,
+} from './state-capture.js';
 
 export interface ValueCodec<T> {
   readonly schema: string;
@@ -92,6 +100,8 @@ interface StateDeclaration {
   initialize(runtime: ComposedRuntime): void;
   release(runtime: ComposedRuntime): void;
   capture(runtime: ComposedRuntime): EncodedState;
+  [visitState](runtime: ComposedRuntime, sink: CaptureSink): boolean;
+  [trackState](runtime: ComposedRuntime): StateCapture;
   restore(runtime: ComposedRuntime, state: EncodedState): void;
 }
 export interface StateInterestHandle {
@@ -107,6 +117,7 @@ interface WritableHandle<T> extends ReadableHandle<T> {
 
 export class ScalarHandle<T> implements StateDeclaration, WritableHandle<T> {
   private readonly cells = new WeakMap<ComposedRuntime, Atom<T>>();
+  private checkpointWrites: WeakMap<ComposedRuntime, { dirty: boolean }> | undefined;
   readonly interest: StateInterest;
   constructor(
     readonly ownerToken: Owner,
@@ -121,6 +132,7 @@ export class ScalarHandle<T> implements StateDeclaration, WritableHandle<T> {
   }
   release(runtime: ComposedRuntime): void {
     this.cells.delete(runtime);
+    this.checkpointWrites?.delete(runtime);
   }
   private cell(runtime: ComposedRuntime): Atom<T> {
     const cell = this.cells.get(runtime);
@@ -131,7 +143,34 @@ export class ScalarHandle<T> implements StateDeclaration, WritableHandle<T> {
     return this.cell(runtime);
   }
   write(state: ReducerState, value: T): void {
-    this.cell(writableRuntime(state, this.ownerToken)).set(value);
+    const runtime = writableRuntime(state, this.ownerToken);
+    this.cell(runtime).set(value);
+    // Live reductions do not allocate, collect addresses or consult capture registries.
+    if (runtime.mode === 'replay') {
+      const writes = this.checkpointWrites?.get(runtime);
+      if (writes) writes.dirty = true;
+    }
+  }
+  [visitState](runtime: ComposedRuntime, sink: CaptureSink): boolean {
+    return sink(undefined, { value: encode(this.options, this.cell(runtime).get()) });
+  }
+  [trackState](runtime: ComposedRuntime): StateCapture {
+    runtime.assertOwner(this.ownerToken);
+    if (runtime.mode !== 'replay' || this.checkpointWrites?.has(runtime))
+      throw new Error('Checkpoint write tracking requires an untracked replay runtime.');
+    const writes = { dirty: false };
+    this.checkpointWrites ??= new WeakMap();
+    this.checkpointWrites.set(runtime, writes);
+    return {
+      drain: (sink) => {
+        if (!writes.dirty) return true;
+        writes.dirty = false;
+        return this[visitState](runtime, sink);
+      },
+      dispose: () => {
+        this.checkpointWrites?.delete(runtime);
+      },
+    };
   }
   capture(runtime: ComposedRuntime): EncodedState {
     return { key: this.metadata.key, entries: [{ value: encode(this.options, this.cell(runtime).get()) }] };
@@ -148,6 +187,7 @@ interface KeyedCell<T> {
 }
 export class KeyedHandle<T, ID extends string | number> implements StateDeclaration {
   private readonly cells = new WeakMap<ComposedRuntime, Map<ID, KeyedCell<T>>>();
+  private checkpointWrites: WeakMap<ComposedRuntime, Set<ID>> | undefined;
   constructor(
     readonly ownerToken: Owner,
     readonly metadata: DeclarationMetadata,
@@ -159,6 +199,7 @@ export class KeyedHandle<T, ID extends string | number> implements StateDeclarat
   }
   release(runtime: ComposedRuntime): void {
     this.cells.delete(runtime);
+    this.checkpointWrites?.delete(runtime);
   }
   private map(runtime: ComposedRuntime): Map<ID, KeyedCell<T>> {
     const map = this.cells.get(runtime);
@@ -184,7 +225,9 @@ export class KeyedHandle<T, ID extends string | number> implements StateDeclarat
     return new ResourceHandle(this, id);
   }
   write(state: ReducerState, id: ID, value: T): void {
-    this.cell(writableRuntime(state, this.ownerToken), id).set(value);
+    const runtime = writableRuntime(state, this.ownerToken);
+    this.cell(runtime, id).set(value);
+    if (runtime.mode === 'replay') this.checkpointWrites?.get(runtime)?.add(id);
   }
   /** Validated bridge from an existing loader's wire address to this branded resource. */
   resourceId(interest: StateInterest): ID {
@@ -192,13 +235,55 @@ export class KeyedHandle<T, ID extends string | number> implements StateDeclarat
       throw new Error('Foreign or non-keyed resource interest.');
     return this.options.idCodec.decode(interest.id);
   }
-  capture(runtime: ComposedRuntime): EncodedState {
-    const entries: { id: EncodedValue; value: EncodedValue }[] = [];
+  private captureCell(id: ID, cell: KeyedCell<T>): CapturedEntry | undefined {
+    const value = cell.signal.get();
+    // Merely reading a default must not become application state or change replay equivalence.
+    return Object.is(value, cell.initial)
+      ? undefined
+      : {
+          id: encode({ codec: this.options.idCodec }, id),
+          value: encode(this.options, value),
+        };
+  }
+  [visitState](runtime: ComposedRuntime, sink: CaptureSink): boolean {
     for (const [id, cell] of this.map(runtime)) {
-      const value = cell.signal.get();
-      // Merely reading a default must not become application state or change replay equivalence.
-      if (!Object.is(value, cell.initial))
-        entries.push({ id: encode({ codec: this.options.idCodec }, id), value: encode(this.options, value) });
+      const entry = this.captureCell(id, cell);
+      if (entry && !sink(id, entry)) return false;
+    }
+    return true;
+  }
+  [trackState](runtime: ComposedRuntime): StateCapture {
+    runtime.assertOwner(this.ownerToken);
+    if (runtime.mode !== 'replay' || this.checkpointWrites?.has(runtime))
+      throw new Error('Checkpoint write tracking requires an untracked replay runtime.');
+    const writes = new Set<ID>();
+    this.checkpointWrites ??= new WeakMap();
+    this.checkpointWrites.set(runtime, writes);
+    return {
+      drain: (sink) => {
+        const cells = this.map(runtime);
+        for (const id of writes) {
+          const cell = cells.get(id);
+          if (cell && !sink(id, this.captureCell(id, cell))) return false;
+        }
+        writes.clear();
+        return true;
+      },
+      dispose: () => {
+        writes.clear();
+        this.checkpointWrites?.delete(runtime);
+      },
+    };
+  }
+  capture(runtime: ComposedRuntime): EncodedState {
+    const entries: CapturedEntry[] = [];
+    // Canonicalization is an explicit checkpoint boundary, never an ordinary keyed read.
+    const cells = this.map(runtime);
+    for (const id of [...cells.keys()].sort(compareResourceKeys)) {
+      const cell = cells.get(id);
+      if (!cell) continue;
+      const entry = this.captureCell(id, cell);
+      if (entry) entries.push(entry);
     }
     return { key: this.metadata.key, entries };
   }
@@ -607,6 +692,10 @@ export class ComposedRuntime implements StateReader {
       this.dispose();
       throw cause;
     }
+  }
+  /** Last successfully committed dispatch wave; interest-only waves also have positions. */
+  get waveNumber(): number {
+    return this.wave;
   }
   get disposed(): boolean {
     return this.closed || this.closing;

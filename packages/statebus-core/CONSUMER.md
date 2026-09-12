@@ -311,3 +311,125 @@ return, async failure, failed reductions; count-bounded support capture; and equ
 These source changes do not publish package versions or migrate a downstream screen by themselves.
 The application must replace its old store/query boundary, bind its real operations, and verify its
 own checkpoint/event stream before calling that screen fully migrated.
+
+## Rolling local journals
+
+`recordJournal` adds a replayable rolling window without replacing composition, effects or the finite
+`recordScenario` API. It is **lossless local capture, not a sanitized support export**. Import
+`recordJournal`, `JournalRecorder`, `JournalLimits`, `JournalSnapshot`, `JournalCapture`,
+`JournalOutcome`, `JournalOutcomeReceipt`, `JournalUsage` and `JournalRefusal` from
+`@smoothbricks/statebus-core`.
+
+```ts
+const journal = recordJournal(runtime, {
+  maxEvents: 512,
+  maxEventBytes: 512 * 1024,
+  maxOutcomes: 64,
+  maxOutcomeBytes: 256 * 1024,
+  maxCheckpointBytes: 4 * 1024 * 1024,
+  maxCaptureBytes: 5 * 1024 * 1024,
+});
+const effect = bindEffect(runtime, model.effect, {
+  execute,
+  failure,
+  capture: (outcome) => {
+    const receipt = journal.captureOutcome(model.effect, outcome);
+    // The application may surface a refusal without cancelling the admitted operation.
+    if (receipt.kind === 'refused') reportCaptureRefusal(receipt.reason);
+  },
+});
+const result = journal.snapshot();
+if (result.kind === 'recorded') {
+  const replay = replayScenario(composition, result.capture.scenario);
+  // Read/compare replayed state, then dispose this independently owned runtime.
+  replay.dispose();
+} else {
+  reportCaptureRefusal(result.reason);
+}
+```
+
+All limits are optional overrides of bounded defaults: 1,024 events / 1 MiB of event waves,
+256 outcomes / 1 MiB of outcome history, an 8 MiB checkpoint and a 12 MiB cold capture.
+Resolved limits are available as `journal.limits`. Start recording at a quiescent runtime boundary;
+`dispose()` releases the journal observer, replay cursor and its change trackers. Runtime disposal
+also stops its journal. Already retained snapshots remain independent and immutable.
+
+### What advances and what is bounded
+
+The recorder takes an initial checkpoint once. When count or encoded-byte pressure evicts a **whole
+successful wave**, an isolated instance of the existing replay runtime applies that wave to the
+checkpoint cursor. No operations, query loaders or imperative event listeners are installed there.
+Only cells written by that replayed wave are encoded into the checkpoint index; unrelated keyed
+cells are not traversed or encoded again. A checkpoint's total bound is checked after the atomic
+wave, so moving a value between keys is not refused merely because addition preceded deletion.
+
+Live reads are unchanged. Live writes do not collect capture addresses; the small write-tracking
+branch applies only to a replay cursor with tracking installed. The journal's wave and outcome rings
+retain capacity but clear removed payload slots; no surviving suffix is repeatedly shifted. The
+finite recorder's behavior is unchanged: after eviction it still reports `complete: false` and
+`replayScenario` still refuses it. A short finite recording is not proof of rolling acceptance.
+
+The returned `JournalUsage` reports **UTF-8 JSON transport bytes**, not a heap-size estimate:
+
+| Limit | Counted representation |
+| --- | --- |
+| `maxEvents` | Sum of event counts in retained whole waves |
+| `maxEventBytes` | The retained `RecordedWave[]`, including brackets and commas |
+| `maxOutcomes`, `maxOutcomeBytes` | Retained `JournalOutcome[]` count and its complete JSON array bytes |
+| `maxCheckpointBytes` | The complete `StateCheckpoint`, including schema and declaration framing |
+| `maxCaptureBytes` | The complete `JournalCapture` envelope returned by `snapshot()` |
+
+Section sizes are maintained incrementally. The cold export bound is checked from those sizes and
+small envelope framing **before** constructing the checkpoint arrays. No whole-application clone
+or JSON encoding occurs on ordinary publication or checkpoint advancement. Payload encoding/copying
+occurs only while a journal is installed, at its explicit capture boundary.
+
+Codecs must produce JSON-portable representations with lossless application-owned decode semantics.
+The journal detaches and freezes that representation; it never retains a mutable dispatch scratch
+array, an operation's plan object, or a codec's reusable output object. As with JSON transport,
+undefined object properties are omitted and codecs must handle that deliberately. Cycles and other
+JSON encoding failures refuse capture. The library cannot certify an arbitrary user-supplied codec's
+round-trip fidelity: use generated validators and domain round-trip properties.
+
+These limits do **not** bound application state, the replay cursor's live atom/cache footprint,
+codec execution/temporary allocation, or snapshots retained by the caller. An application must
+bound a single payload before its codec constructs it. The current implementation reports no
+allocation bytes/op, universal heap bound, GC-pause improvement or V8 optimization-status claim.
+
+### Refusal, outcomes and causal positions
+
+Oversized initial/growing checkpoints, oversized indivisible waves and oversized outcomes stop the
+journal with an explicit `kind: 'refused'` result. It never keeps a partial wave or labels a missing
+history replayable. Codec/replay failures likewise stop capture, report a programming error through
+the runtime error channel, and return a portable refusal without the raw exception. Production
+reduction and admitted operations continue independently. Start a new journal explicitly after
+correcting a refusal. A `capture-limit` refusal is export-only: it leaves local recording active.
+
+`checkpointWave` identifies the last evicted domain wave (or the initial checkpoint position);
+`lastWave` identifies the last successful live wave, including interest-only waves. Wave positions
+are retained, not renumbered. `runtime.waveNumber` exposes the current successful position.
+The checkpoint plus suffix replays domain admission decisions as well as ordinary state changes.
+Failed reducer waves do not enter either the retained suffix or the checkpoint cursor.
+
+Outcome history is a separately bounded decoder-input archive, not a second source of state events.
+Each entry retains its original plan/request identity, effect codec identity/version, sequence and
+`afterWave` position. A request may have moved into the checkpoint before its outcome arrives; that
+late outcome still works with `decodeEffectOutcome` and the same pure decoder. The result event in
+the main journal remains the authority for state replay. When old outcomes are evicted,
+`outcomesDropped` explicitly reports the truncated side history; a replayable state window is not a
+claim to retain every past operation outcome. Do not publish the archived outcomes a second time
+when replaying a scenario that already includes their result events.
+
+Checkpoint entries have canonical **raw resource-key order**: finite numbers numerically first,
+then strings in UTF-16 code-unit order. Numeric `7` and string `'7'` remain separate; `0` and `-0`
+share native Map identity. Application ID codecs must preserve that identity on a JSON round trip.
+Sorting happens only at checkpoint/export boundaries, never during a keyed read or subscription.
+This ordering is not a version-migration registry or a canonical privacy/support envelope.
+
+`scripts/consumer/composed/journal.ts` exercises long generated streams, both bounds independently,
+failed waves and admission decisions, late outcomes, mount isolation, canonical numeric/string
+keys, immutable retained captures, byte accounting, atomic relocation, refusal and disposal. It runs
+through the same real-package gate under Node/Bun and isolated/hoisted installations. The 1,500-cell
+capture-work diagnostic counts codec invocations during 1,199 evictions; it is **not** an allocation
+measurement. Library migrations, strict deny-by-default support export, reactions and awaitable
+operation drain remain separate contracts, not claims made by this local journal.
