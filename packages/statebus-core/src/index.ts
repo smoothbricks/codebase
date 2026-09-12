@@ -32,7 +32,30 @@ declare module '@smoothbricks/statebus-core' {
 }
 
 export { StateBus } from './api.js';
+export {
+  CaptureError,
+  type CaptureIssue,
+  type CaptureValue,
+  canonicalCapture,
+  captureBytes,
+  captureValue,
+} from './capture.js';
+export {
+  type CaptureEnvelope,
+  type CaptureEnvelopeOptions,
+  type CaptureLibraryVersion,
+  type CaptureManifest,
+  createCaptureEnvelope,
+  exportSupportCapture,
+  migrateCaptureEnvelope,
+  migrateScenario,
+  replayCaptureEnvelope,
+  type SupportArtifact,
+  type SupportExportOptions,
+} from './capture-envelope.js';
+export { type CodecMigration, evolveCodec } from './codec.js';
 export * from './composition.js';
+export { bindRuntimeDiagnostics } from './diagnostics.js';
 export { type DispatchScheduler, ManualScheduler, microtaskScheduler } from './dispatch.js';
 export * from './effects.js';
 export type { StateInterest, StateInterestChange, StateInterestKey } from './interest.js';
@@ -45,7 +68,42 @@ export {
 } from './interest.js';
 export { ManualStateBus } from './manual.js';
 export { MicrotaskStateBus } from './microtask.js';
-export * from './recording.js';
+export {
+  captureCheckpoint,
+  captureEffectInstruction,
+  captureEffectOutcome,
+  classifyScenario,
+  decodeEffectInstruction,
+  decodeEffectOutcome,
+  recordScenario,
+  replayScenario,
+  type CheckpointCaptureOptions,
+  type RecordedEffectCapture,
+  type RecordedEffectInstruction,
+  type RecordedEffectOutcome,
+  type RecordedScenario,
+  type RecordedWave,
+  type ScenarioRecorder,
+  type StateCheckpoint,
+} from './recording.js';
+export {
+  type RecordedEffectPosition,
+  type RollingCaptureLimits,
+  type RollingCaptureStats,
+  type RollingScenario,
+  type RollingScenarioRecorder,
+  recordRollingScenario,
+} from './rolling.js';
+export {
+  consentSupport,
+  publicSupport,
+  type RedactedValue,
+  type RedactionReason,
+  redactSupport,
+  type SupportDecision,
+  type SupportPolicy,
+  secretSupport,
+} from './support-policy.js';
 export type {
   AnyEvent,
   AnyListener,
