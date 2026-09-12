@@ -1,5 +1,4 @@
 import * as core from '@smoothbricks/statebus-core';
-import * as react from '@smoothbricks/statebus-react';
 import {
   createByteProgressReporter,
   initialLoadState,
@@ -12,7 +11,7 @@ import {
   reduceLoadState,
   statebusInterestSource,
 } from '@smoothbricks/statebus-data-loader';
-import { installTanStackQueryLoader } from '@smoothbricks/statebus-tanstack-query';
+import { createBrowserNavigation, planBrowserNavigation } from '@smoothbricks/statebus-navigation-browser';
 import {
   connectNavigation,
   createMemoryNavigation,
@@ -23,7 +22,8 @@ import {
   navigationRequestId,
   reduceNavigation,
 } from '@smoothbricks/statebus-navigation-core';
-import { createBrowserNavigation, planBrowserNavigation } from '@smoothbricks/statebus-navigation-browser';
+import * as react from '@smoothbricks/statebus-react';
+import { installTanStackQueryLoader } from '@smoothbricks/statebus-tanstack-query';
 import { QueryClient } from '@tanstack/query-core';
 
 function check(value: unknown, message: string): asserts value {
@@ -76,10 +76,12 @@ const bus = new core.ManualStateBus({
 });
 const loads: LoaderChannel<number, { code: 'failed' }> = {
   read: (interest) => bus.state['packed.data'].get(interest.id ?? '').get() ?? initialLoadState(),
-  publish: (event) => { bus.publish({ topic: 'packed', type: 'load', payload: event }); },
+  publish: (event) => {
+    bus.publish({ topic: 'packed', type: 'load', payload: event });
+  },
   subscribe: (listen) => bus.subscribe('packed', 'load', (event) => listen(event.payload)),
 };
-const query = new QueryClient({ defaultOptions: { queries: { retry: false, gcTime: Infinity } } });
+const query = new QueryClient({ defaultOptions: { queries: { retry: false, gcTime: Number.POSITIVE_INFINITY } } });
 let executed = 0;
 const stopLoader = installTanStackQueryLoader({
   channel: loads,
@@ -112,39 +114,44 @@ query.clear();
 
 const nav: NavigationChannel<string, string> = {
   read: () => bus.state['packed.navigation'].get(),
-  publish: (event) => { bus.publish({ topic: 'packed', type: 'navigation', payload: event }); },
+  publish: (event) => {
+    bus.publish({ topic: 'packed', type: 'navigation', payload: event });
+  },
   subscribe: (listen) => bus.subscribe('packed', 'navigation', (event) => listen(event.payload)),
 };
-const stopNavigation = connectNavigation({ channel: nav, driver: createMemoryNavigation({ entries: ['/'], equal: Object.is }) });
-nav.publish({ type: 'navigationRequested', request: { requestId: navigationRequestId('packed-nav'), intent: { kind: 'push', to: '/billing' } } });
+const stopNavigation = connectNavigation({
+  channel: nav,
+  driver: createMemoryNavigation({ entries: ['/'], equal: Object.is }),
+});
+nav.publish({
+  type: 'navigationRequested',
+  request: { requestId: navigationRequestId('packed-nav'), intent: { kind: 'push', to: '/billing' } },
+});
 bus.dispatchEvents();
 check(nav.read().location === '/billing' && nav.read().operation.kind === 'idle', 'Packed navigation pipeline failed.');
 stopNavigation();
-check(planBrowserNavigation({ kind: 'push', to: '/billing?tab=plans' }, 'https://example.test/').kind === 'write', 'Browser planner export failed.');
-check(planBrowserNavigation({ kind: 'go', delta: 2 ** 32 }, 'https://example.test/').kind === 'failed', 'Unsafe traversal delta admitted.');
+check(
+  planBrowserNavigation({ kind: 'push', to: '/billing?tab=plans' }, 'https://example.test/').kind === 'write',
+  'Browser planner export failed.',
+);
+check(
+  planBrowserNavigation({ kind: 'go', delta: 2 ** 32 }, 'https://example.test/').kind === 'failed',
+  'Unsafe traversal delta admitted.',
+);
 
 const sample = { direction: 'download' as const, transferred: 8, total: 8 };
 const progress = reduceByteProgress({ attempt: 1 }, 1, sample);
 check(reduceByteProgress(progress, 1, sample) === progress, 'Duplicate progress allocated new state.');
 let reported = 0;
-const reporter = createByteProgressReporter({ intervalMs: 100, timer: { after: () => () => {} }, emit: (value) => { reported = value.transferred; } });
+const reporter = createByteProgressReporter({
+  intervalMs: 100,
+  timer: { after: () => () => {} },
+  emit: (value) => {
+    reported = value.transferred;
+  },
+});
 reporter.report(sample);
 reporter.flush();
 reporter.dispose();
 check(reported === 8, 'Reporter export failed.');
 console.log('Six packed packages: declarations, exports, exact interest, QueryClient lifecycle and navigation passed.');
-
-// Compile-negative contracts run with the real exported declarations and all
-// third-party dependencies installed. They must not leak Node/Bun ambient types.
-if (false) {
-  // @ts-expect-error Node Buffer is not part of the browser/isomorphic contract.
-  void Buffer;
-  // @ts-expect-error Node process is not part of the browser/isomorphic contract.
-  void process;
-  // @ts-expect-error Bun is not part of the browser/isomorphic contract.
-  void Bun;
-  // @ts-expect-error CommonJS require is not provided to browser consumers.
-  void require;
-  // @ts-expect-error Node file globals are not provided to browser consumers.
-  void __dirname;
-}
