@@ -84,9 +84,16 @@ try {
     const manifest = JSON.parse(readFileSync(require.resolve(`${dep}/package.json`), 'utf8'));
     dependencies[dep] = manifest.version;
   }
-  for (const name of names) dependencies[`@smoothbricks/${name}`] = `file:${join(artifacts, `${name}.tgz`)}`;
+  const overrides = {};
+  for (const name of names) {
+    const tarball = `file:${join(artifacts, `${name}.tgz`)}`;
+    dependencies[`@smoothbricks/${name}`] = tarball;
+    // These versions are deliberately unpublished. Transitive resolution must use the
+    // same inspected tarballs, not fall back to registry packages with matching names.
+    overrides[`@smoothbricks/${name}`] = tarball;
+  }
   rmSync(nodeModules, { recursive: true, force: true });
-  const consumerManifest = { name: 'statebus-packed-consumer', private: true, type: 'module', dependencies };
+  const consumerManifest = { name: 'statebus-packed-consumer', private: true, type: 'module', dependencies, overrides };
   writeFileSync(join(consumer, 'package.json'), JSON.stringify(consumerManifest, null, 2));
   const runtimeEnv = { ...process.env, NODE_ENV: 'test' };
   execFileSync('bun', ['install', '--ignore-scripts', '--linker=hoisted'], {
@@ -134,7 +141,7 @@ try {
   execFileSync('node', [join(consumer, 'out', 'consumer.js')], { cwd: consumer, env: runtimeEnv, stdio: 'inherit' });
   // Published manifests select built exports even when Bun's development condition is active.
   execFileSync('bun', [join(consumer, 'out', 'consumer.js')], { cwd: consumer, env: runtimeEnv, stdio: 'inherit' });
-  for (const name of ['codecs', 'library', 'scenario']) {
+  for (const name of ['codecs', 'library', 'scenario', 'edge-cases']) {
     writeFileSync(
       join(consumer, `${name}.ts`),
       readFileSync(new URL(`./consumer/${name}.fixture.txt`, import.meta.url)),
@@ -154,7 +161,7 @@ try {
         skipLibCheck: false,
       },
       // Deliberately exclude the legacy fixture and its ambient module augmentation.
-      include: ['codecs.ts', 'library.ts', 'scenario.ts'],
+      include: ['codecs.ts', 'library.ts', 'scenario.ts', 'edge-cases.ts'],
     }),
   );
   execFileSync(
@@ -162,19 +169,21 @@ try {
     [join(nodeModules, 'typescript', 'bin', 'tsc'), '-p', join(consumer, 'tsconfig.composed.json')],
     { cwd: consumer, stdio: 'inherit' },
   );
-  // React StrictMode checks need its development build, while StateBus must resolve built JS.
-  // Node selects the import condition in either environment; its assertion rejects source paths.
-  execFileSync('node', [join(consumer, 'composed', 'scenario.js')], {
+  // Generate the example's codecs from its imported public types using the repository's
+  // normal compiler. The preceding strict tsc pass still checks all package declarations.
+  execFileSync('ttsc', ['-p', join(consumer, 'tsconfig.composed.json'), '--emit'], {
     cwd: consumer,
     env: runtimeEnv,
     stdio: 'inherit',
   });
-  // React's test build keeps act/StrictMode; every package resolution is independently checked.
-  execFileSync('bun', [join(consumer, 'composed', 'scenario.js')], {
-    cwd: consumer,
-    env: runtimeEnv,
-    stdio: 'inherit',
-  });
+  // Both runners select built StateBus exports and development React for act/StrictMode.
+  for (const executable of ['scenario', 'edge-cases'])
+    for (const runner of ['node', 'bun'])
+      execFileSync(runner, [join(consumer, 'composed', `${executable}.js`)], {
+        cwd: consumer,
+        env: runtimeEnv,
+        stdio: 'inherit',
+      });
   writeFileSync(
     join(artifacts, 'validation.json'),
     `${JSON.stringify(

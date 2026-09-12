@@ -188,7 +188,10 @@ the application's `failure` function. Do not invent a parallel result or tracing
 4. Decode the typed outcome and publish the result event into a successor wave.
 
 The composed API uses atom transactions: a failed reducer wave rolls back its atom writes and
-starts no effects. The legacy API keeps its previous non-transactional reducer semantics.
+starts no effects. Interest acquisition/final-zero facts describe live subscriptions, so they are
+redelivered in a successor wave after rollback; failed domain commands are not retried. Capture
+observer failures are reported without suppressing already-admitted effects. The legacy API keeps
+its previous non-transactional reducer semantics.
 Programmer errors in planners/decoders go to the runtime's error reporter. Execution rejection is
 mapped by the supplied typed `failure` function; no Promise rejection is left unobserved.
 
@@ -267,17 +270,22 @@ Help or diagnostics UI is not part of this API.
 Run the repository target:
 
 ```sh
-bunx nx run statebus-core:verify-packages
+nx run statebus-core:verify-packages
 ```
 
 It is also a dependency of `statebus-core:test`. The verifier packs the real packages using the
-release export-manifest transform, extracts the tarballs into a temporary external consumer,
-strictly typechecks public declarations (including negative branded-ID/capability tests), and runs
-the consumer under Node and Bun. Every relevant package resolution must point inside an extracted
-`node_modules/.../dist` directory. The composed fixture excludes the legacy ambient fixture.
+release export-manifest transform, installs tarballs and exact direct dependency versions into a
+temporary external consumer, and retains its resolved lockfile. Consumer overrides ensure every
+transitive workspace dependency also uses those same tarballs, not an unpublished registry version.
+Strict declaration checks (including negative branded-ID/capability tests) retain `skipLibCheck: false`.
+Every relevant package resolution must point inside the installed `node_modules/.../dist` directory.
+The composed fixture excludes the legacy ambient fixture.
 
-The executable example lives in `scripts/consumer/{library,codecs,scenario}.fixture.txt`; the verifier
-materializes these as `.ts` files outside the workspace. It uses synthetic inventory resources,
+The executable example lives in `scripts/consumer/{library,codecs,scenario,edge-cases}.fixture.txt`;
+the verifier materializes these as `.ts` files outside the workspace. Its codecs are generated from
+the actual public types by the normal ttsc/Typia compiler, not hand-maintained loader schemas. The
+edge cases include a JSON-transported checkpoint/event envelope validated before no-I/O replay.
+Both suites run against built package exports under Node and Bun. They use synthetic inventory resources,
 real ReactDOM/StrictMode, real QueryClient, real LMAO `Result` values, and controlled operations.
 The LMAO `Op` binding is typechecked; no production service is contacted by the fixture.
 

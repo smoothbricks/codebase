@@ -137,6 +137,9 @@ export function bindEffect<C, P extends EffectPlan, O, R>(
         }
       } else emit(plan, job, await source);
     } catch (cause) {
+      // Keep the request reserved through the complete notification wave even when execute
+      // throws before returning a Promise. Otherwise its same-wave duplicate starts again.
+      await Promise.resolve();
       if (current(plan.requestId, job)) {
         try {
           emit(plan, job, operations.failure(cause, plan));

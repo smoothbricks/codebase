@@ -1,152 +1,32 @@
-// Small, explicit synthetic codecs exercise the public boundary. Production applications may supply
-// their existing generated validators here; StateBus never constructs validators during dispatch.
-import { assertRecord } from '@smoothbricks/validation';
-import { Err, Ok, type Result } from '@smoothbricks/lmao';
-import type { EffectOutcome, ValueCodec } from '@smoothbricks/statebus-core';
-import {
-  loadRequestId,
-  loadFingerprint,
-  type LoadRequest,
-  type LoaderEvent,
-  type LoadState,
-  type Loaded,
-  type LoadProgress,
-  type ByteCount,
-  type ByteSample,
-} from '@smoothbricks/statebus-data-loader';
+import { Err, type ErrResult, Ok, type OkResult, type Result } from '@smoothbricks/lmao';
+import type { EffectOutcome, RecordedScenario, ValueCodec } from '@smoothbricks/statebus-core';
+import type { LoaderEvent, LoadState } from '@smoothbricks/statebus-data-loader';
+import typia from 'typia';
 
 declare const shelfBrand: unique symbol;
 declare const requestBrand: unique symbol;
-export type ShelfId = string & { readonly [shelfBrand]: true };
-export type RequestId = string & { readonly [requestBrand]: true };
-export function shelfId(value: string): ShelfId;
-export function shelfId(value: string): string {
-  if (!value.startsWith('shelf:')) throw new Error('Invalid shelf ID.');
-  return value;
+export type ShelfId = `shelf:${string}` & { readonly [shelfBrand]: true };
+export type RequestId = `request:${string}` & { readonly [requestBrand]: true };
+const assertShelfId = typia.createAssert<ShelfId>();
+const assertRequestId = typia.createAssert<RequestId>();
+export function shelfId(value: string): ShelfId {
+  return assertShelfId(value);
 }
-export function requestId(value: string): RequestId;
-export function requestId(value: string): string {
-  if (!value.startsWith('request:')) throw new Error('Invalid request ID.');
-  return value;
+export function requestId(value: string): RequestId {
+  return assertRequestId(value);
 }
-function string(value: unknown): string {
-  if (typeof value !== 'string') throw new Error('Expected string.');
-  return value;
-}
-function number(value: unknown): number {
-  if (typeof value !== 'number' || !Number.isFinite(value)) throw new Error('Expected finite number.');
-  return value;
-}
+
+// Validators are generated once by the normal ttsc/Typia compiler. They validate the actual
+// public contracts; no mirrored loader schema, hand-written property walker or consumer cast.
 function codec<T>(schema: string, decode: (value: unknown) => T): ValueCodec<T> {
-  return { schema, version: 1, encode: (value) => structuredClone(decode(value)), decode };
+  return { schema, version: 1, encode: (value) => structuredClone(value), decode };
 }
-export const numberCodec = codec('inventory.number', number);
-export const shelfCodec: ValueCodec<ShelfId> = codec('inventory.shelf-id', (value) => shelfId(string(value)));
-export const requestCodec: ValueCodec<RequestId | null> = codec('inventory.request-id', (value) =>
-  value === null ? null : requestId(string(value)),
-);
-function loaded(value: unknown): Loaded<number> {
-  assertRecord(value);
-  return { value: number(value.value), receivedAt: number(value.receivedAt) };
-}
-function previous(value: unknown): Loaded<number> | undefined {
-  return value === undefined ? undefined : loaded(value);
-}
-function bytes(value: unknown): ByteCount {
-  assertRecord(value);
-  return { transferred: number(value.transferred), total: value.total === undefined ? undefined : number(value.total) };
-}
-function progress(value: unknown): LoadProgress {
-  assertRecord(value);
-  return {
-    attempt: number(value.attempt),
-    upload: value.upload === undefined ? undefined : bytes(value.upload),
-    download: value.download === undefined ? undefined : bytes(value.download),
-  };
-}
-function request(value: unknown): LoadRequest {
-  assertRecord(value);
-  assertRecord(value.interest);
-  const rawId = value.interest.id;
-  const interest = {
-    key: string(value.interest.key),
-    id: rawId === undefined ? undefined : typeof rawId === 'number' ? number(rawId) : string(rawId),
-  };
-  const reason = value.reason;
-  const policy = value.policy;
-  if (reason !== 'interest' && reason !== 'refresh' && reason !== 'retry') throw new Error('Invalid load reason.');
-  if (policy !== 'drop-duplicate' && policy !== 'latest-wins') throw new Error('Invalid load policy.');
-  return {
-    interest,
-    requestId: loadRequestId(string(value.requestId)),
-    fingerprint: loadFingerprint(string(value.fingerprint)),
-    at: number(value.at),
-    reason,
-    policy,
-  };
-}
-export const loadStateCodec: ValueCodec<LoadState<number, string>> = codec('inventory.load-state', (value) => {
-  assertRecord(value);
-  switch (value.kind) {
-    case 'not-requested':
-      return { kind: 'not-requested' };
-    case 'loading':
-      return {
-        kind: 'loading',
-        request: request(value.request),
-        previous: previous(value.previous),
-        progress: progress(value.progress),
-      };
-    case 'ready':
-      return { kind: 'ready', request: request(value.request), data: loaded(value.data) };
-    case 'failed':
-      return {
-        kind: 'failed',
-        request: request(value.request),
-        previous: previous(value.previous),
-        error: string(value.error),
-      };
-    case 'cancelled':
-      return { kind: 'cancelled', request: request(value.request), previous: previous(value.previous) };
-    default:
-      throw new Error('Invalid load state.');
-  }
-});
-export const loadEventCodec: ValueCodec<LoaderEvent<number, string>> = codec('inventory.load-event', (value) => {
-  assertRecord(value);
-  const accepted = request(value.request);
-  switch (value.type) {
-    case 'loadRequested':
-      return { type: 'loadRequested', request: accepted };
-    case 'loadAttemptStarted':
-      return { type: 'loadAttemptStarted', request: accepted, attempt: number(value.attempt) };
-    case 'loadProgressed': {
-      assertRecord(value.sample);
-      const direction = value.sample.direction;
-      if (direction !== 'upload' && direction !== 'download') throw new Error('Invalid direction.');
-      const sample: ByteSample = { direction, ...bytes(value.sample) };
-      return {
-        type: 'loadProgressed',
-        request: accepted,
-        attempt: number(value.attempt),
-        sample,
-        at: number(value.at),
-      };
-    }
-    case 'loadSucceeded':
-      return { type: 'loadSucceeded', request: accepted, value: number(value.value), at: number(value.at) };
-    case 'loadFailed':
-      return { type: 'loadFailed', request: accepted, error: string(value.error) };
-    case 'loadCancelled': {
-      const reason = value.reason;
-      if (reason !== 'unobserved' && reason !== 'superseded' && reason !== 'cancelled')
-        throw new Error('Invalid cancellation reason.');
-      return { type: 'loadCancelled', request: accepted, reason };
-    }
-    default:
-      throw new Error('Invalid loader event.');
-  }
-});
+export const numberCodec = codec('inventory.number', typia.createAssert<number>());
+export const shelfCodec = codec('inventory.shelf-id', assertShelfId);
+export const requestCodec = codec('inventory.request-id', typia.createAssert<RequestId | null>());
+export const loadStateCodec = codec('inventory.load-state', typia.createAssert<LoadState<number, string>>());
+export const loadEventCodec = codec('inventory.load-event', typia.createAssert<LoaderEvent<number, string>>());
+
 export interface Adjust {
   readonly shelfId: ShelfId;
   readonly requestId: RequestId;
@@ -160,21 +40,12 @@ export interface AdjustPlan {
 export type AdjustResult =
   | { readonly kind: 'ok'; readonly shelfId: ShelfId; readonly requestId: RequestId; readonly value: number }
   | { readonly kind: 'err'; readonly shelfId: ShelfId; readonly requestId: RequestId; readonly error: string };
-export const adjustCodec: ValueCodec<Adjust> = codec('inventory.adjust', (value) => {
-  assertRecord(value);
-  return {
-    shelfId: shelfId(string(value.shelfId)),
-    requestId: requestId(string(value.requestId)),
-    add: number(value.add),
-  };
-});
-export const adjustResultCodec: ValueCodec<AdjustResult> = codec('inventory.adjusted', (value) => {
-  assertRecord(value);
-  const identity = { shelfId: shelfId(string(value.shelfId)), requestId: requestId(string(value.requestId)) };
-  if (value.kind === 'ok') return { ...identity, kind: 'ok', value: number(value.value) };
-  if (value.kind === 'err') return { ...identity, kind: 'err', error: string(value.error) };
-  throw new Error('Invalid mutation result.');
-});
+export const adjustCodec = codec('inventory.adjust', typia.createAssert<Adjust>());
+export const adjustResultCodec = codec('inventory.adjusted', typia.createAssert<AdjustResult>());
+
+// A captured result carries public result data, never live span ownership or class methods.
+type DetachedResult = Pick<OkResult<number>, 'success' | 'value'> | Pick<ErrResult<string>, 'success' | 'error'>;
+const assertOutcome = typia.createAssert<EffectOutcome<AdjustPlan, DetachedResult>>();
 export const outcomeCodec: ValueCodec<EffectOutcome<AdjustPlan, Result<number, string>>> = {
   schema: 'inventory.adjust-outcome',
   version: 1,
@@ -183,16 +54,9 @@ export const outcomeCodec: ValueCodec<EffectOutcome<AdjustPlan, Result<number, s
     outcome: outcome.success ? { success: true, value: outcome.value } : { success: false, error: outcome.error },
   }),
   decode(value) {
-    assertRecord(value);
-    assertRecord(value.plan);
-    assertRecord(value.outcome);
-    const plan: AdjustPlan = {
-      shelfId: shelfId(string(value.plan.shelfId)),
-      requestId: requestId(string(value.plan.requestId)),
-      next: number(value.plan.next),
-    };
-    if (value.outcome.success === true) return { plan, outcome: new Ok(number(value.outcome.value)) };
-    if (value.outcome.success === false) return { plan, outcome: new Err(string(value.outcome.error)) };
-    throw new Error('Invalid operation outcome.');
+    const { plan, outcome } = assertOutcome(value);
+    return { plan, outcome: outcome.success ? new Ok(outcome.value) : new Err(outcome.error) };
   },
 };
+// Storage/import boundary: validate the envelope here, then each declaration's codec validates its value.
+export const parseScenario = typia.json.createAssertParse<RecordedScenario>();

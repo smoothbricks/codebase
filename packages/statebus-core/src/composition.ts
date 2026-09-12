@@ -724,19 +724,38 @@ export class ComposedRuntime implements StateReader {
   }
   private dispatchWave(events: readonly (Publication | InterestPublication | undefined)[], count: number): void {
     try {
-      transaction(() => {
-        this.inReducer = true;
-        try {
+      try {
+        transaction(() => {
+          this.inReducer = true;
+          try {
+            for (let index = 0; index < count; index++) {
+              const event = events[index];
+              if (event?.kind === 'event') event.reduce(this);
+            }
+          } finally {
+            this.inReducer = false;
+          }
+        });
+      } catch (cause) {
+        // Leases describe live subscriptions, not reducer state. A rollback must not lose
+        // their acquisition/final-zero facts. Requeue only interest in a successor wave;
+        // never retry the failed domain events or notify their execution boundaries.
+        if (!this.disposed)
           for (let index = 0; index < count; index++) {
             const event = events[index];
-            if (event?.kind === 'event') event.reduce(this);
+            if (event?.kind === 'interest') this.queue.publish(event);
           }
-        } finally {
-          this.inReducer = false;
-        }
-      });
+        throw cause;
+      }
       const wave = ++this.wave;
-      for (const observer of this.waveObservers) observer.committed(wave, events, count);
+      for (const observer of this.waveObservers) {
+        try {
+          observer.committed(wave, events, count);
+        } catch (cause) {
+          // Capture/diagnostic failures must not suppress effects after committed admission.
+          this.reportError(cause);
+        }
+      }
       for (let index = 0; index < count && !this.disposed; index++) {
         const event = events[index];
         if (event?.kind === 'event') event.notify(this);
