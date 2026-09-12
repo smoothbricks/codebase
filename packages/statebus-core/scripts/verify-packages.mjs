@@ -1,19 +1,10 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import {
-  existsSync,
-  mkdirSync,
-  mkdtempSync,
-  readFileSync,
-  realpathSync,
-  rmSync,
-  symlinkSync,
-  writeFileSync,
-} from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { join, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const root = fileURLToPath(new URL('../../..', import.meta.url));
@@ -33,17 +24,20 @@ const manifests = new Map(
 );
 const artifacts = join(root, '.cache', 'statebus-packages');
 mkdirSync(artifacts, { recursive: true });
-const consumer = mkdtempSync(join(tmpdir(), 'statebus-packaged-consumer-'));
-const nodeModules = join(consumer, 'node_modules');
+// A failed rerun must not leave a previous success report in the uploaded artifact.
+rmSync(join(artifacts, 'validation.json'), { force: true });
+const temporary = mkdtempSync(join(tmpdir(), 'statebus-packaged-consumer-'));
 const external = new Map();
+const dependencies = {};
 const summaries = [];
+const consumers = [];
 try {
   for (const name of names) {
     const manifest = manifests.get(name);
     const source = join(root, 'packages', name);
     const archive = join(artifacts, `${name}.tgz`);
     execFileSync('bun', ['pm', 'pack', '--filename', archive, '--quiet'], { cwd: source, stdio: 'inherit' });
-    const target = join(nodeModules, '@smoothbricks', name);
+    const target = join(temporary, 'inspected', name);
     mkdirSync(target, { recursive: true });
     execFileSync('tar', ['-xzf', archive, '-C', target, '--strip-components=1']);
     const packed = JSON.parse(readFileSync(join(target, 'package.json'), 'utf8'));
@@ -62,72 +56,89 @@ try {
         );
       } else external.set(dep, source);
     }
+    dependencies[packed.name] = `file:${archive}`;
     summaries.push({
       name: packed.name,
       version: packed.version,
       sha256: createHash('sha256').update(readFileSync(archive)).digest('hex'),
     });
   }
-  // Only third-party dependencies may use the already-verified workspace install.
-  // Every StateBus package and its transitive StateBus imports resolve to extracted tarballs.
+  // Pin direct third-party inputs to the repository's frozen install, but let Bun
+  // install a real consumer dependency graph. Symlinking workspace packages into
+  // /tmp made their declarations resolve peers from the workspace/global store,
+  // bypassing the consumer's @types/react and hiding dependency-closure problems.
   for (const dep of ['typescript', '@types/node']) external.set(dep, root);
   for (const dep of ['@types/react', '@types/react-dom']) external.set(dep, join(root, 'packages', 'statebus-react'));
   for (const [dep, source] of external) {
     const require = createRequire(join(source, 'package.json'));
-    const manifest = require.resolve(`${dep}/package.json`);
-    const target = join(nodeModules, dep);
-    mkdirSync(dirname(target), { recursive: true });
-    symlinkSync(dirname(realpathSync(manifest)), target, 'dir');
+    dependencies[dep] = JSON.parse(readFileSync(require.resolve(`${dep}/package.json`), 'utf8')).version;
   }
-  writeFileSync(
-    join(consumer, 'package.json'),
-    JSON.stringify({ name: 'statebus-packed-consumer', private: true, type: 'module' }),
-  );
-  writeFileSync(join(consumer, 'consumer.ts'), readFileSync(new URL('./packed-consumer.fixture.txt', import.meta.url)));
-  writeFileSync(
-    join(consumer, 'tsconfig.json'),
-    JSON.stringify({
-      compilerOptions: {
-        strict: true,
-        module: 'NodeNext',
-        moduleResolution: 'NodeNext',
-        target: 'ES2022',
-        lib: ['ES2024', 'DOM'],
-        outDir: 'out',
-        types: [],
-        skipLibCheck: false,
-      },
-      include: ['consumer.ts'],
-    }),
-  );
-  const require = createRequire(join(consumer, 'package.json'));
-  for (const name of names) {
-    const resolved = realpathSync(require.resolve(`@smoothbricks/${name}`));
-    assert.ok(
-      resolved.startsWith(join(nodeModules, '@smoothbricks', name)),
-      `Unexpected workspace/source resolution: ${resolved}`,
+  for (const linker of ['isolated', 'hoisted']) {
+    const consumer = join(temporary, linker);
+    const nodeModules = join(consumer, 'node_modules');
+    mkdirSync(consumer);
+    writeFileSync(
+      join(consumer, 'package.json'),
+      JSON.stringify({ name: 'statebus-packed-consumer', private: true, type: 'module', dependencies }),
     );
+    // Keep every dependency inside this disposable install, including with Bun's
+    // isolated linker. No workspace source, global store, or TS paths overrides.
+    writeFileSync(join(consumer, 'bunfig.toml'), `[install]\nlinker = "${linker}"\nglobalStore = false\n`);
+    execFileSync('bun', ['install', '--backend=copyfile', '--ignore-scripts'], { cwd: consumer, stdio: 'inherit' });
+    execFileSync('bun', ['install', '--frozen-lockfile', '--ignore-scripts'], { cwd: consumer, stdio: 'inherit' });
+    writeFileSync(
+      join(consumer, 'consumer.ts'),
+      readFileSync(new URL('./packed-consumer.fixture.txt', import.meta.url)),
+    );
+    writeFileSync(
+      join(consumer, 'tsconfig.json'),
+      JSON.stringify({
+        compilerOptions: {
+          strict: true,
+          module: 'NodeNext',
+          moduleResolution: 'NodeNext',
+          target: 'ES2022',
+          lib: ['ES2024', 'DOM'],
+          outDir: 'out',
+          types: [],
+          skipLibCheck: false,
+        },
+        include: ['consumer.ts'],
+      }),
+    );
+    const require = createRequire(join(consumer, 'package.json'));
+    for (const name of names) {
+      const resolved = realpathSync(require.resolve(`@smoothbricks/${name}`));
+      assert.ok(resolved.startsWith(`${nodeModules}${sep}`), `Unexpected workspace/source resolution: ${resolved}`);
+      // Check bytes as well as location: a registry/source fallback must not pass.
+      assert.deepEqual(readFileSync(resolved), readFileSync(join(temporary, 'inspected', name, 'dist', 'index.js')));
+      assert.equal(require(`@smoothbricks/${name}/package.json`).version, manifests.get(name).version);
+    }
+    execFileSync('node', [join(nodeModules, 'typescript', 'bin', 'tsc'), '-p', join(consumer, 'tsconfig.json')], {
+      cwd: consumer,
+      stdio: 'inherit',
+    });
+    execFileSync('node', [join(consumer, 'out', 'consumer.js')], { cwd: consumer, stdio: 'inherit' });
+    execFileSync('bun', [join(consumer, 'out', 'consumer.js')], { cwd: consumer, stdio: 'inherit' });
+    const lockfile = readFileSync(join(consumer, 'bun.lock'));
+    writeFileSync(join(artifacts, `consumer-${linker}.bun.lock`), lockfile);
+    consumers.push({ linker, lockfileSha256: createHash('sha256').update(lockfile).digest('hex') });
   }
-  execFileSync('node', [join(nodeModules, 'typescript', 'bin', 'tsc'), '-p', join(consumer, 'tsconfig.json')], {
-    cwd: consumer,
-    stdio: 'inherit',
-  });
-  execFileSync('node', [join(consumer, 'out', 'consumer.js')], { cwd: consumer, stdio: 'inherit' });
-  execFileSync('bun', [join(consumer, 'out', 'consumer.js')], { cwd: consumer, stdio: 'inherit' });
   writeFileSync(
     join(artifacts, 'validation.json'),
     `${JSON.stringify(
       {
-        formatVersion: 1,
+        formatVersion: 2,
         sourceCommit: process.env.GITHUB_SHA ?? process.env.STATEBUS_BENCH_COMMIT ?? 'working-tree',
         versions: process.versions,
         packages: summaries,
-        verified: ['strict declarations', 'Node consumer', 'Bun consumer', 'packed workspace resolutions'],
+        consumers,
+        verified: ['strict declarations', 'Node consumer', 'Bun consumer', 'packed dependency installations'],
       },
       null,
       2,
     )}\n`,
   );
 } finally {
-  rmSync(consumer, { recursive: true, force: true });
+  rmSync(temporary, { recursive: true, force: true });
 }
