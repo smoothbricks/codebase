@@ -1,0 +1,48 @@
+name: StateBus development inputs
+on:
+  push:
+    branches: [feat/statebus-composition]
+    paths: ['.github/workflows/statebus-development-inputs.yml']
+permissions:
+  contents: read
+jobs:
+  inputs:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6.0.2
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - name: Prepare public dependency inputs at lockfile versions
+        shell: bash
+        run: |
+          set -euo pipefail
+          destination=$(mktemp -d)
+          export STATEBUS_INPUTS="$destination"
+          node --input-type=module <<'JS'
+          import { readFileSync, writeFileSync } from 'node:fs';
+          import { join } from 'node:path';
+          const text = readFileSync('bun.lock', 'utf8');
+          const names = ['@tldraw/state', '@tldraw/state-react', '@tanstack/query-core', 'typescript', 'react', 'react-dom', '@types/react', '@types/react-dom', '@types/node', '@types/bun', 'happy-dom', 'fast-check', '@biomejs/biome', 'tslib'];
+          const dependencies = {};
+          for (const name of names) {
+            const line = text.split('\n').find(line => line.trimStart().startsWith(JSON.stringify(name) + ': ['));
+            if (!line) throw new Error('Missing locked dependency ' + name);
+            const identity = JSON.parse(line.slice(line.indexOf('[') + 1, line.indexOf(',', line.indexOf('['))));
+            dependencies[name] = identity.slice(name.length + 1);
+          }
+          writeFileSync(join(process.env.STATEBUS_INPUTS, 'package.json'), JSON.stringify({private:true, type:'module', dependencies}));
+          JS
+          cd "$destination"
+          bun install --ignore-scripts
+          cp "$(command -v bun)" ./bun
+          tar -czf "$GITHUB_WORKSPACE/statebus-development-inputs.tar.gz" node_modules package.json bun.lock bun
+      - uses: actions/upload-artifact@v7.0.1
+        with:
+          name: statebus-development-inputs
+          path: statebus-development-inputs.tar.gz
+          retention-days: 2
+          if-no-files-found: error
