@@ -43,6 +43,7 @@ export {
   StateInterestRegistry,
   stateInterestKey,
 } from './interest.js';
+export * from './journal.js';
 export { ManualStateBus } from './manual.js';
 export { MicrotaskStateBus } from './microtask.js';
 export * from './recording.js';
