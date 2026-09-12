@@ -69,20 +69,20 @@ export {
 export { ManualStateBus } from './manual.js';
 export { MicrotaskStateBus } from './microtask.js';
 export {
+  type CheckpointCaptureOptions,
   captureCheckpoint,
   captureEffectInstruction,
   captureEffectOutcome,
   classifyScenario,
   decodeEffectInstruction,
   decodeEffectOutcome,
-  recordScenario,
-  replayScenario,
-  type CheckpointCaptureOptions,
   type RecordedEffectCapture,
   type RecordedEffectInstruction,
   type RecordedEffectOutcome,
   type RecordedScenario,
   type RecordedWave,
+  recordScenario,
+  replayScenario,
   type ScenarioRecorder,
   type StateCheckpoint,
 } from './recording.js';
