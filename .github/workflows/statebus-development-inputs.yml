@@ -8,7 +8,7 @@ permissions:
 jobs:
   inputs:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v6.0.2
         with:
@@ -16,6 +16,10 @@ jobs:
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: 1.4.2
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.26'
+          cache: false
       - name: Prepare public dependency inputs at lockfile versions
         shell: bash
         run: |
@@ -26,8 +30,8 @@ jobs:
           import { readFileSync, writeFileSync } from 'node:fs';
           import { join } from 'node:path';
           const text = readFileSync('bun.lock', 'utf8');
-          const names = ['@tldraw/state', '@tldraw/state-react', '@tanstack/query-core', 'typescript', 'react', 'react-dom', '@types/react', '@types/react-dom', '@types/node', '@types/bun', 'happy-dom', 'fast-check', '@biomejs/biome', 'tslib', 'typia'];
-          const dependencies = {'@smoothbricks/lmao':'latest'};
+          const names = ['@tldraw/state', '@tldraw/state-react', '@tanstack/query-core', 'typescript', 'react', 'react-dom', '@types/react', '@types/react-dom', '@types/node', '@types/bun', 'happy-dom', 'fast-check', '@biomejs/biome', 'tslib', 'typia', 'ttsc'];
+          const dependencies = {'@smoothbricks/lmao':'0.3.13'};
           for (const name of names) {
             const line = text.split('\n').find(line => line.trimStart().startsWith(JSON.stringify(name) + ': ['));
             if (!line) throw new Error('Missing locked dependency ' + name);
@@ -39,7 +43,11 @@ jobs:
           cd "$destination"
           bun install --ignore-scripts
           cp "$(command -v bun)" ./bun
-          tar -czf "$GITHUB_WORKSPACE/statebus-development-inputs.tar.gz" node_modules package.json bun.lock bun
+          export TTSC_CACHE_DIR="$destination/ttsc-cache"
+          printf '%s\n' '{"compilerOptions":{"target":"ES2022","module":"NodeNext","moduleResolution":"NodeNext","strict":true,"skipLibCheck":true,"outDir":"out","plugins":[{"transform":"typia/lib/transform"}]},"include":["warm.ts"]}' > tsconfig.json
+          printf '%s\n' 'import typia from "typia"; export const validate = typia.createAssert<{ id: string }>();' > warm.ts
+          bun node_modules/ttsc/lib/launcher/ttsc.js -p tsconfig.json
+          tar -czf "$GITHUB_WORKSPACE/statebus-development-inputs.tar.gz" node_modules package.json bun.lock bun ttsc-cache
       - uses: actions/upload-artifact@v7.0.1
         with:
           name: statebus-development-inputs
