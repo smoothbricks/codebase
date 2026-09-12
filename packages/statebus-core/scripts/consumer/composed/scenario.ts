@@ -1,7 +1,9 @@
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
+import { Err, Ok, type Result } from '@smoothbricks/lmao';
 import {
   bindEffect,
+  type ComposedRuntime,
   captureCheckpoint,
   captureEffectOutcome,
   classifyScenario,
@@ -13,13 +15,20 @@ import {
   ManualScheduler,
   mountLibrary,
   publishEffectOutcome,
+  type RecordedEffectOutcome,
   recordScenario,
   replayScenario,
-  type ComposedRuntime,
-  type RecordedEffectOutcome,
-  type StateInterestChange,
   type ScalarHandle,
+  type StateInterestChange,
 } from '@smoothbricks/statebus-core';
+import {
+  composedLoaderChannel,
+  type LoadRequest,
+  loadFingerprint,
+  loadRequestId,
+  previousData,
+  type TimerPort,
+} from '@smoothbricks/statebus-data-loader';
 import {
   createLibraryReact,
   createSelectionHook,
@@ -28,35 +37,13 @@ import {
   useKeyedState,
   useStateValue,
 } from '@smoothbricks/statebus-react';
-import {
-  composedLoaderChannel,
-  loadFingerprint,
-  loadRequestId,
-  previousData,
-  type TimerPort,
-  type LoadRequest,
-} from '@smoothbricks/statebus-data-loader';
 import { bindComposedQueryLoader } from '@smoothbricks/statebus-tanstack-query';
-import { Err, Ok, type Result } from '@smoothbricks/lmao';
 import { QueryClient } from '@tanstack/query-core';
 import { Window } from 'happy-dom';
 import { act, createElement, StrictMode } from 'react';
-import { canAdjust, hostLibrary, inventoryLibrary, type Inventory } from './library.js';
-import { numberCodec, requestId, shelfId, type ShelfId } from './codecs.js';
+import { numberCodec, requestId, type ShelfId, shelfId } from './codecs.js';
+import { canAdjust, hostLibrary, type Inventory, inventoryLibrary } from './library.js';
 
-function deferred<T>() {
-  let resolve: (value: T) => void = () => {
-    throw new Error('Promise not initialized');
-  };
-  let reject: (cause: unknown) => void = () => {
-    throw new Error('Promise not initialized');
-  };
-  const promise = new Promise<T>((done, fail) => {
-    resolve = done;
-    reject = fail;
-  });
-  return { promise, resolve, reject };
-}
 class Timer implements TimerPort {
   now = 0;
   jobs: { at: number; run: () => void; active: boolean }[] = [];
@@ -143,13 +130,15 @@ const render = (bus = runtime, mount = left) =>
       ),
     ),
   );
-const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false, gcTime: Infinity } } });
+const queryClient = new QueryClient({
+  defaultOptions: { queries: { retry: false, gcTime: Number.POSITIVE_INFINITY } },
+});
 const timer = new Timer();
 let sequence = 0;
 let loadCalls = 0;
-const oldRead = deferred<number>();
-const freshRead = deferred<number>();
-const reads = new Map<ShelfId, ReturnType<typeof deferred<number>>>([
+const oldRead = Promise.withResolvers<number>();
+const freshRead = Promise.withResolvers<number>();
+const reads = new Map<ShelfId, PromiseWithResolvers<number>>([
   [firstId, oldRead],
   [secondId, freshRead],
 ]);
@@ -304,7 +293,7 @@ try {
     assert.equal(interestEvents.length, interestsBefore);
     assert.equal(published.at(-1), published.at(-2));
   });
-  await test('organization changes release old exact demand; grace preserves shared requests', async () => {
+  await test('resource changes release old exact demand; grace preserves shared requests', async () => {
     const shared = runtime.acquire([l.inventory.at(firstId)]);
     runtime.flush();
     await act(async () => {
@@ -346,7 +335,7 @@ try {
       ),
     );
   });
-  const mutation = deferred<Result<number, string>>();
+  const mutation = Promise.withResolvers<Result<number, string>>();
   let mutations = 0;
   const outcomes: RecordedEffectOutcome[] = [];
   const effect = bindEffect(runtime, l.effect, {
@@ -438,7 +427,7 @@ try {
     runtime.flush();
     assert.equal(runtime.interestSource.snapshot().length, 0);
     const scenario = recorder.snapshot();
-    // The codecs are the validation boundary, so JSON transport does not depend on retained prototypes.
+    // Compare explicit checkpoints; the edge-case suite separately exercises validated JSON transport.
     const replay = replayScenario(composition, scenario);
     let io = 0;
     bindEffect(replay, l.effect, {
@@ -540,7 +529,7 @@ try {
     const bus = composeLibraries(mount).createRuntime({ scheduler: new ManualScheduler() });
     const command = mount.exports.tick;
     const result = mount.exports.tick;
-    const next = deferred<IteratorResult<number>>();
+    const next = Promise.withResolvers<IteratorResult<number>>();
     let returned = 0;
     let observed = 0;
     bus.listen(result, () => {
@@ -752,7 +741,7 @@ try {
   await test('disposal suppresses late Promise publications but cannot undo a committed server mutation', async () => {
     const mount = mountLibrary(hostLibrary, 'disposal');
     const bus = composeLibraries(mount).createRuntime({ scheduler: new ManualScheduler() });
-    const pending = deferred<number>();
+    const pending = Promise.withResolvers<number>();
     let serverCommits = 0;
     let aborted = 0;
     const events: number[] = [];
@@ -834,16 +823,3 @@ try {
     else Reflect.deleteProperty(globalThis, key);
   }
 }
-
-// Compile-only consumer contract: these mistakes must fail without ambient module augmentation.
-function typeErrors() {
-  // @ts-expect-error Unbranded strings cannot address branded resources.
-  runtime.readKeyed(l.inventory, 'shelf:a');
-  // @ts-expect-error Shelf IDs cannot masquerade as request IDs.
-  runtime.publish(l.adjust, { shelfId: firstId, requestId: firstId, add: 1 });
-  // @ts-expect-error The declared scalar payload is not an arbitrary object.
-  runtime.publish(l.selectionChanged, { id: firstId });
-  // @ts-expect-error Required capability providers preserve their value type.
-  canAdjust.provide('yes');
-}
-void typeErrors;

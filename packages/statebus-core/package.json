@@ -125,7 +125,8 @@
         "inputs": [
           "default",
           "^default",
-          "{workspaceRoot}/packages/cli/src/monorepo/published-exports.ts"
+          "{workspaceRoot}/packages/cli/src/monorepo/published-exports.ts",
+          "{workspaceRoot}/packages/statebus-core/scripts/consumer/**/*"
         ]
       }
     },

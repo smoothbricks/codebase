@@ -1,0 +1,12 @@
+{
+  "compilerOptions": {
+    "strict": true,
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "target": "ES2022",
+    "lib": ["ES2024", "DOM"],
+    "noEmitOnError": true,
+    "noUnusedLocals": true,
+    "skipLibCheck": false
+  }
+}

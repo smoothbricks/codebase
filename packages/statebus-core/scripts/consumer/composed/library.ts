@@ -1,33 +1,33 @@
+import { Err, type Op, type OpContext, type Result, type SpanContext } from '@smoothbricks/lmao';
 import {
+  bindEffect,
+  type ComposedRuntime,
   defineCapability,
   defineEffect,
   defineLibrary,
-  bindEffect,
-  type ComposedRuntime,
   type EffectDefinition,
 } from '@smoothbricks/statebus-core';
 import {
   initialLoadState,
-  reduceComposedLoader,
-  type LoadState,
   type LoaderEvent,
+  type LoadState,
+  reduceComposedLoader,
 } from '@smoothbricks/statebus-data-loader';
-import { Err, type Op, type OpContext, type Result, type SpanContext } from '@smoothbricks/lmao';
 import {
-  shelfId,
-  shelfCodec,
-  requestCodec,
-  numberCodec,
-  loadStateCodec,
-  loadEventCodec,
-  adjustCodec,
-  adjustResultCodec,
-  outcomeCodec,
   type Adjust,
   type AdjustPlan,
   type AdjustResult,
+  adjustCodec,
+  adjustResultCodec,
+  loadEventCodec,
+  loadStateCodec,
+  numberCodec,
+  outcomeCodec,
   type RequestId,
+  requestCodec,
   type ShelfId,
+  shelfCodec,
+  shelfId,
 } from './codecs.js';
 
 export const canAdjust = defineCapability<boolean>('inventory.can-adjust');
