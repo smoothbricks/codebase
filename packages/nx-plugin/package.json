@@ -66,6 +66,96 @@
       "development": "./src/cargo-toolchain-policy.ts",
       "import": "./dist/cargo-toolchain-policy.js",
       "default": "./dist/cargo-toolchain-policy.js"
+    },
+    "./workspace-manifest": {
+      "types": "./dist/workspace-manifest.d.ts",
+      "development": "./src/workspace-manifest.ts",
+      "import": "./dist/workspace-manifest.js",
+      "default": "./dist/workspace-manifest.js"
+    },
+    "./workspace-package-policy": {
+      "types": "./dist/workspace-package-policy.d.ts",
+      "development": "./src/workspace-package-policy.ts",
+      "import": "./dist/workspace-package-policy.js",
+      "default": "./dist/workspace-package-policy.js"
+    },
+    "./deploy-policy": {
+      "types": "./dist/deploy-policy.d.ts",
+      "development": "./src/deploy-policy.ts",
+      "import": "./dist/deploy-policy.js",
+      "default": "./dist/deploy-policy.js"
+    },
+    "./managed-assets": {
+      "types": "./dist/managed-assets.d.ts",
+      "development": "./src/managed-assets.ts",
+      "import": "./dist/managed-assets.js",
+      "default": "./dist/managed-assets.js"
+    },
+    "./managed-files/generator": {
+      "types": "./dist/managed-files/generator.d.ts",
+      "development": "./src/managed-files/generator.ts",
+      "import": "./dist/managed-files/generator.js",
+      "default": "./dist/managed-files/generator.js"
+    },
+    "./managed-files/managed-content": {
+      "types": "./dist/managed-files/managed-content.d.ts",
+      "development": "./src/managed-files/managed-content.ts",
+      "import": "./dist/managed-files/managed-content.js",
+      "default": "./dist/managed-files/managed-content.js"
+    },
+    "./managed-files/tree": {
+      "types": "./dist/managed-files/tree.d.ts",
+      "development": "./src/managed-files/tree.ts",
+      "import": "./dist/managed-files/tree.js",
+      "default": "./dist/managed-files/tree.js"
+    },
+    "./managed-files/files": {
+      "types": "./dist/managed-files/files.d.ts",
+      "development": "./src/managed-files/files.ts",
+      "import": "./dist/managed-files/files.js",
+      "default": "./dist/managed-files/files.js"
+    },
+    "./managed-files/paths": {
+      "types": "./dist/managed-files/paths.d.ts",
+      "development": "./src/managed-files/paths.ts",
+      "import": "./dist/managed-files/paths.js",
+      "default": "./dist/managed-files/paths.js"
+    },
+    "./managed-files/ci-workflow": {
+      "types": "./dist/managed-files/ci-workflow.d.ts",
+      "development": "./src/managed-files/ci-workflow.ts",
+      "import": "./dist/managed-files/ci-workflow.js",
+      "default": "./dist/managed-files/ci-workflow.js"
+    },
+    "./managed-files/publish-workflow": {
+      "types": "./dist/managed-files/publish-workflow.d.ts",
+      "development": "./src/managed-files/publish-workflow.ts",
+      "import": "./dist/managed-files/publish-workflow.js",
+      "default": "./dist/managed-files/publish-workflow.js"
+    },
+    "./managed-files/github-runs-on": {
+      "types": "./dist/managed-files/github-runs-on.d.ts",
+      "development": "./src/managed-files/github-runs-on.ts",
+      "import": "./dist/managed-files/github-runs-on.js",
+      "default": "./dist/managed-files/github-runs-on.js"
+    },
+    "./managed-files/pr-preview-cleanup-workflow": {
+      "types": "./dist/managed-files/pr-preview-cleanup-workflow.d.ts",
+      "development": "./src/managed-files/pr-preview-cleanup-workflow.ts",
+      "import": "./dist/managed-files/pr-preview-cleanup-workflow.js",
+      "default": "./dist/managed-files/pr-preview-cleanup-workflow.js"
+    },
+    "./managed-files/private-npm-policy": {
+      "types": "./dist/managed-files/private-npm-policy.d.ts",
+      "development": "./src/managed-files/private-npm-policy.ts",
+      "import": "./dist/managed-files/private-npm-policy.js",
+      "default": "./dist/managed-files/private-npm-policy.js"
+    },
+    "./managed-files/context": {
+      "types": "./dist/managed-files/context.d.ts",
+      "development": "./src/managed-files/context.ts",
+      "import": "./dist/managed-files/context.js",
+      "default": "./dist/managed-files/context.js"
     }
   },
   "bin": {
@@ -86,7 +176,7 @@
           "command": "bun test --timeout=30000",
           "cwd": "{projectRoot}",
           "timeoutMs": 120000,
-          "killAfterMs": 1e4
+          "killAfterMs": 10000.0
         }
       }
     },
@@ -103,7 +193,8 @@
     "loader.js",
     "generators.json",
     "executors.json",
-    "!**/*.tsbuildinfo"
+    "!**/*.tsbuildinfo",
+    "managed"
   ],
   "license": "MIT",
   "publishConfig": {
@@ -119,10 +210,14 @@
     "nx": "latest",
     "smol-toml": "^1.6.1",
     "tslib": "^2.8.1",
-    "typia": "14.0.2"
+    "typia": "14.0.2",
+    "make-synchronized": "^0.8.0",
+    "prettier": "^3.6.1",
+    "yaml": "^2.9.0"
   },
   "devDependencies": {
     "@smoothbricks/lmao": "workspace:*",
-    "@smoothbricks/validation": "workspace:*"
+    "@smoothbricks/validation": "workspace:*",
+    "fast-check": "^4.4.0"
   }
 }

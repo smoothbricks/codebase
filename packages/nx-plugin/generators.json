@@ -19,6 +19,11 @@
       "factory": "./dist/generators/make-public/generator.js",
       "schema": "./src/generators/make-public/schema.json",
       "description": "Promote a private package to public npm publication"
+    },
+    "managed-files": {
+      "factory": "./dist/managed-files/generator.js",
+      "schema": "./src/managed-files/schema.json",
+      "description": "Synchronize managed monorepo files from workspace conventions and the Nx graph"
     }
   }
 }

@@ -5,6 +5,8 @@ import { readJson, updateJson } from 'nx/src/devkit-exports.js';
 
 import { CARGO_TEST_TARGET } from './cargo-workspace.js';
 
+export const MANAGED_FILES_SYNC_GENERATOR = '@smoothbricks/nx-plugin:managed-files';
+
 export interface NxPolicyIssue {
   path: string;
   message: string;
@@ -22,9 +24,7 @@ export const BUILD_OUTPUT_DEPENDENCIES = [
   '*-wasm',
 ] as const;
 
-export const MACOS_PLATFORM_TARGET_GLOBS = ['*-macos', '*-ios'] as const;
-export const LINUX_PLATFORM_TARGET_GLOBS = ['*-linux'] as const;
-export const PLATFORM_TARGET_GLOBS = [...MACOS_PLATFORM_TARGET_GLOBS, ...LINUX_PLATFORM_TARGET_GLOBS] as const;
+export { LINUX_PLATFORM_TARGET_GLOBS, MACOS_PLATFORM_TARGET_GLOBS, PLATFORM_TARGET_GLOBS } from './platform-targets.js';
 
 const buildOutputTargetSuffixes = BUILD_OUTPUT_DEPENDENCIES.map((glob) => glob.slice(1));
 
@@ -152,6 +152,12 @@ export function applyWorkspaceConfig(nxJson: Record<string, unknown>): boolean {
   const nextPlugins = upsertNxPlugin(pluginsWithoutNxTypeScript, smoothBricksNxPlugin);
   if (JSON.stringify(currentPlugins) !== JSON.stringify(nextPlugins)) {
     nxJson.plugins = nextPlugins;
+    changed = true;
+  }
+  const sync = recordProperty(nxJson, 'sync') ?? {};
+  const generators = Array.isArray(sync.globalGenerators) ? sync.globalGenerators : [];
+  if (!generators.includes(MANAGED_FILES_SYNC_GENERATOR)) {
+    nxJson.sync = { ...sync, globalGenerators: [...generators, MANAGED_FILES_SYNC_GENERATOR] };
     changed = true;
   }
   return changed;

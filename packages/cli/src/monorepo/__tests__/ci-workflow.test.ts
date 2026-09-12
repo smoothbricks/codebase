@@ -6,16 +6,16 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { format } from 'prettier';
-import typia from 'typia';
-import type { PackageCargoGitOrigin } from '../../lib/json.js';
 import {
   type CiWorkflowDefinitionOptions,
   CiWorkflowStepKind,
   cargoCredentialStepLines,
   defineCiWorkflow,
   renderCiWorkflowYaml,
-} from '../ci-workflow.js';
+} from '@smoothbricks/nx-plugin/managed-files/ci-workflow';
+import { format } from 'prettier';
+import typia from 'typia';
+import type { PackageCargoGitOrigin } from '../../lib/json.js';
 
 const nixosRunsOn = ['nixos-latest-x64', 'self-hosted'] as const;
 

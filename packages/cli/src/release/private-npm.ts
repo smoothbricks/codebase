@@ -1,9 +1,10 @@
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
-import type { PackageJson, PackagePrivateNpmConfig } from '../lib/json.js';
+import { privateNpmWorkflowConfig } from '@smoothbricks/nx-plugin/managed-files/private-npm-policy';
+import type { PackagePrivateNpmConfig } from '../lib/json.js';
 import { runResult } from '../lib/run.js';
 import {
   getWorkspacePackageManifests,
@@ -11,7 +12,6 @@ import {
   type PackageInfo,
   readPackageJson,
   readPackageJsonObject,
-  workspaceDependencyFields,
 } from '../lib/workspace.js';
 import {
   type DurableState,
@@ -161,21 +161,6 @@ function npmrcScopeRegistry(root: string, scope: string): string | null {
 
 const NPMRC_TOKEN_ENV = /^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$/;
 
-function npmrcAuthTokenEnv(root: string, scope: string): string | undefined {
-  const registry = npmrcScopeRegistry(root, scope);
-  if (!registry) {
-    return undefined;
-  }
-  let url: URL;
-  try {
-    url = new URL(registry);
-  } catch {
-    return undefined;
-  }
-  const pathname = url.pathname.endsWith('/') ? url.pathname : `${url.pathname}/`;
-  return NPMRC_TOKEN_ENV.exec(npmrcValue(root, `//${url.host}${pathname}:_authToken`) ?? '')?.[1];
-}
-
 function npmrcValue(root: string, key: string): string | null {
   const candidates = [join(root, '.npmrc'), join(homedir(), '.npmrc')];
   for (const path of candidates) {
@@ -206,33 +191,6 @@ function nameInPrivateScope(name: string, scope: string): boolean {
   return name === scope || name.startsWith(`${scope}/`);
 }
 
-function workspaceConsumesPrivateScope(root: string, scope: string): boolean {
-  const rootJson = readPackageJsonObject(join(root, 'package.json'));
-  const manifests: PackageJson[] = [
-    ...(rootJson ? [rootJson] : []),
-    ...getWorkspacePackageManifests(root).map((pkg) => pkg.json),
-  ];
-  for (const json of manifests) {
-    for (const field of workspaceDependencyFields) {
-      const deps = json[field];
-      if (!deps) {
-        continue;
-      }
-      for (const [name, spec] of Object.entries(deps)) {
-        if (
-          nameInPrivateScope(name, scope) &&
-          !spec.startsWith('workspace:') &&
-          !spec.startsWith('link:') &&
-          !spec.startsWith('file:')
-        ) {
-          return true;
-        }
-      }
-    }
-  }
-  return false;
-}
-
 function workspacePublishesPrivateScope(root: string, scope: string): boolean {
   return listPrivatePackages(root).some((pkg) => nameInPrivateScope(pkg.name, scope));
 }
@@ -245,31 +203,14 @@ function workspacePublishesPrivateScope(root: string, scope: string): boolean {
  * scope from the registry does not receive a read token.
  */
 export function resolvePrivateNpmWorkflowConfig(root: string): PackagePrivateNpmConfig | undefined {
-  const declared = readPackageJsonObject(join(root, 'package.json'))?.smoo?.privateNpm;
-  if (!declared) {
-    return undefined;
-  }
-  const consumes = workspaceConsumesPrivateScope(root, declared.scope);
-  const publishes = workspacePublishesPrivateScope(root, declared.scope);
-  if (!consumes && !publishes) {
-    return undefined;
-  }
-  const npmrcEnv = npmrcAuthTokenEnv(root, declared.scope);
-  // A publishing workspace reads the registry too: every release after the
-  // first checks the previous tag's durable state, and that check runs in the
-  // producer jobs that never see the publish credential. A declared read token
-  // therefore always renders; only the .npmrc fallback stays consumer-only, so
-  // a publish token is never promoted into a read role by inference.
-  const readTokenEnv = declared.readTokenEnv ?? (consumes ? npmrcEnv : undefined);
-  const publishTokenEnv = publishes ? (declared.publishTokenEnv ?? npmrcEnv) : undefined;
-  if (!readTokenEnv && !publishTokenEnv) {
-    return undefined;
-  }
-  return {
-    scope: declared.scope,
-    ...(readTokenEnv ? { readTokenEnv } : {}),
-    ...(publishTokenEnv ? { publishTokenEnv } : {}),
-  };
+  const manifest = readPackageJsonObject(join(root, 'package.json')) ?? {};
+  const npmrcPath = join(root, '.npmrc');
+  return privateNpmWorkflowConfig(
+    manifest.smoo?.privateNpm,
+    manifest,
+    getWorkspacePackageManifests(root).map((pkg) => pkg.json),
+    existsSync(npmrcPath) ? readFileSync(npmrcPath, 'utf8') : '',
+  );
 }
 
 /** Throwing variant for publish/status paths: refuses with zero network I/O. */

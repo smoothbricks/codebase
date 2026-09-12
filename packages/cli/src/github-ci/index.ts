@@ -1,10 +1,10 @@
 import { spawn } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { appendFile } from 'node:fs/promises';
+import { PERMANENT_DEPLOY_TAG, STAGING_DEPLOY_TAG, stageDeploysProject } from '@smoothbricks/nx-plugin/deploy-policy';
 import { PLATFORM_TARGET_GLOBS } from '@smoothbricks/nx-plugin/workspace-config-policy';
 import { $ } from 'bun';
 import typia from 'typia';
-import { PERMANENT_DEPLOY_TAG, STAGING_DEPLOY_TAG, stageDeploysProject } from '../lib/deploy-tags.js';
 import {
   ciPushBranches,
   isNonEmpty,

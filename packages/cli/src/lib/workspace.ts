@@ -1,3 +1,15 @@
+import {
+  isPublishablePackage,
+  type RepositoryInfo,
+  repositoryInfo,
+} from '@smoothbricks/nx-plugin/workspace-package-policy';
+
+export {
+  isPublishablePackage,
+  type RepositoryInfo,
+  repositoryInfo,
+} from '@smoothbricks/nx-plugin/workspace-package-policy';
+
 import { readdirSync, statSync } from 'node:fs';
 import { dirname, join, relative } from 'node:path';
 import { isSmoothBricksCodebasePackageName } from './cli-package.js';
@@ -32,11 +44,6 @@ export interface WorkspacePackageManifest {
   json: PackageJson;
 }
 
-export interface RepositoryInfo {
-  type: string;
-  url: string;
-}
-
 export const workspaceDependencyFields = [
   'dependencies',
   'devDependencies',
@@ -55,12 +62,6 @@ export type PublishableNpmTag = (typeof publishableNpmTags)[number];
  * private:true still means NEVER publish, not "publish privately"; both tags
  * together are rejected by tag validation.
  */
-export function isPublishablePackage(pkg: Pick<PackageInfo, 'private' | 'tags'>): boolean {
-  if (pkg.private) {
-    return false;
-  }
-  return pkg.tags.includes('npm:public') !== pkg.tags.includes('npm:private');
-}
 
 export function listPrivatePackages(root: string): PackageInfo[] {
   return getWorkspacePackages(root).filter((pkg) => isPublishablePackage(pkg) && pkg.tags.includes('npm:private'));
@@ -273,21 +274,6 @@ export function getNxTags(pkg: PackageJson): string[] {
     return [];
   }
   return tags.filter((tag): tag is string => typeof tag === 'string');
-}
-
-export function repositoryInfo(pkg: PackageJson): RepositoryInfo | null {
-  const repository = pkg.repository;
-  if (typeof repository === 'string') {
-    return { type: 'git', url: repository };
-  }
-  if (!repository || typeof repository !== 'object') {
-    return null;
-  }
-  const url = repository.url;
-  if (!url) {
-    return null;
-  }
-  return { type: repository.type ?? 'git', url };
 }
 
 export function sameRepositoryAfterNormalization(left: string, right: string): boolean {

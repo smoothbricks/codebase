@@ -26,6 +26,7 @@ import {
 function validNxJson(): Record<string, unknown> {
   return {
     plugins: ['@smoothbricks/nx-plugin'],
+    sync: { globalGenerators: ['@smoothbricks/nx-plugin:managed-files'] },
     targetDefaults: validTargetDefaults(),
     namedInputs: validNamedInputs(),
   };
@@ -344,8 +345,7 @@ describe('pure core: applyWorkspaceConfig', () => {
 
   it('accepts custom precise production inputs unchanged', () => {
     const nxJson: Record<string, unknown> = {
-      plugins: validPlugins(),
-      targetDefaults: validTargetDefaults(),
+      ...validNxJson(),
       namedInputs: {
         ...validNamedInputs(),
         production: ['{projectRoot}/src/**/*.rs', '{projectRoot}/Cargo.toml', '!{projectRoot}/**/*.test.*'],
@@ -524,3 +524,15 @@ function readPluginNames(value: unknown): unknown[] {
   const plugins: unknown[] = value;
   return plugins.map((plugin) => (typeof plugin === 'string' ? plugin : expectRecord(plugin).plugin));
 }
+
+describe('managed-file sync registration', () => {
+  it('preserves other generators and is idempotent', () => {
+    const nxJson = { sync: { applyChanges: true, globalGenerators: ['example:sync'] } };
+    applyWorkspaceConfig(nxJson);
+    expect(nxJson.sync).toEqual({
+      applyChanges: true,
+      globalGenerators: ['example:sync', '@smoothbricks/nx-plugin:managed-files'],
+    });
+    expect(applyWorkspaceConfig(nxJson)).toBe(false);
+  });
+});

@@ -118,7 +118,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
     const workspace = await createWorkspace();
     try {
       await workspace.write(
-        'packages/cli/managed/raw/tooling/typescript-api/package.json',
+        'packages/nx-plugin/managed/raw/tooling/typescript-api/package.json',
         '{"name":"@smoothbricks/typescript-api","private":true}\n',
       );
       await workspace.write(
@@ -127,7 +127,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       );
 
       const managed = await inferTargets(
-        ['packages/cli/managed/raw/tooling/typescript-api/package.json'],
+        ['packages/nx-plugin/managed/raw/tooling/typescript-api/package.json'],
         undefined,
         workspace.context,
       );

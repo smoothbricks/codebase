@@ -1,7 +1,8 @@
 {
   "$schema": "./node_modules/nx/schemas/nx-schema.json",
   "sync": {
-    "applyChanges": true
+    "applyChanges": true,
+    "globalGenerators": ["@smoothbricks/nx-plugin:managed-files"]
   },
   "tui": {
     "enabled": false
@@ -16,11 +17,7 @@
       "!{projectRoot}/**/*.spec.*"
     ],
     "sharedGlobals": ["{workspaceRoot}/.github/workflows/ci.yml"],
-    "externalRustCrates": [
-      {
-        "runtime": "sh -c 'set -e; t=$(mktemp); trap \"rm -f \\\"$t\\\"\" EXIT; for d in \"/Users/danny/Dev/_fork/minigraf\"; do if [ ! -d \"$d\" ]; then echo \"externalRustCrates: missing $d\" >&2; exit 1; fi; files=$(cd \"$d\" && find . \\( -name target -o -name .git -o -name node_modules -o -name .fseventsd -o -name .cowshed -o -name .Trashes -o -name .TemporaryItems \\) -prune -o -type f \\( -name \"*.rs\" -o -name \"Cargo.toml\" \\) -print); if [ -z \"$files\" ]; then echo \"externalRustCrates: $d contributes no rust sources; a path dep that moved leaves this hashing nothing and every cached rust verdict unsound\" >&2; exit 1; fi; (cd \"$d\" && printf \"%s\\n\" \"$files\" | sort | xargs shasum -a 256) >> \"$t\"; done; shasum -a 256 < \"$t\" | cut -d\" \" -f1'"
-      }
-    ],
+    "externalRustCrates": [{ "runtime": "smoo-nx-cargo-hash" }],
     "rustWorkspace": [
       "{workspaceRoot}/Cargo.toml",
       "{workspaceRoot}/Cargo.lock",

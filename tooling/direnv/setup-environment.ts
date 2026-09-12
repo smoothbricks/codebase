@@ -1,1 +1,1 @@
-../../packages/cli/managed/raw/tooling/direnv/setup-environment.ts
+../../packages/nx-plugin/managed/raw/tooling/direnv/setup-environment.ts
