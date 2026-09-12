@@ -162,7 +162,7 @@ try {
       stdio: 'inherit',
     });
     // Both runners select built StateBus exports and development React for act/StrictMode.
-    for (const executable of ['scenario', 'edge-cases'])
+    for (const executable of ['scenario', 'edge-cases', 'archive'])
       for (const runner of ['node', 'bun'])
         execFileSync(runner, [join(consumer, 'dist', 'composed', `${executable}.js`)], {
           cwd: consumer,
@@ -191,6 +191,7 @@ try {
           'LMAO Op/Result binding',
           'generated typed codecs',
           'React lifecycle and no-I/O JSON replay',
+          'library migrations and deny-by-default support exports',
         ],
       },
       null,
