@@ -78,6 +78,43 @@
             "command": "node --expose-gc benchmarks/interest.mjs"
           }
         }
+      },
+      "bench-exact-interest": {
+        "executor": "nx:run-commands",
+        "cache": false,
+        "dependsOn": [
+          "tsc-js"
+        ],
+        "options": {
+          "command": "bun benchmarks/exact-interest.mjs",
+          "cwd": "{projectRoot}"
+        },
+        "configurations": {
+          "v8": {
+            "command": "node --expose-gc benchmarks/exact-interest.mjs"
+          }
+        }
+      },
+      "verify-packages": {
+        "executor": "nx:run-commands",
+        "cache": false,
+        "dependsOn": [
+          {
+            "target": "build",
+            "projects": [
+              "statebus-core",
+              "statebus-react",
+              "statebus-data-loader",
+              "statebus-tanstack-query",
+              "statebus-navigation-core",
+              "statebus-navigation-browser"
+            ]
+          }
+        ],
+        "options": {
+          "command": "bun scripts/verify-packages.mjs",
+          "cwd": "{projectRoot}"
+        }
       }
     },
     "tags": [

@@ -1,0 +1,22 @@
+{
+  "extends": "./tsconfig.lib.json",
+  "compilerOptions": {
+    "composite": false,
+    "declaration": false,
+    "declarationMap": false,
+    "emitDeclarationOnly": false,
+    "noEmit": true,
+    "types": ["bun"],
+    "lib": ["es2024"]
+  },
+  "include": ["src/**/*.test.ts", "src/**/__tests__/**/*.ts"],
+  "exclude": [],
+  "references": [
+    {
+      "path": "./tsconfig.lib.json"
+    },
+    {
+      "path": "../statebus-core/tsconfig.lib.json"
+    }
+  ]
+}

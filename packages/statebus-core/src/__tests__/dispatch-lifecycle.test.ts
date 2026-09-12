@@ -1,8 +1,9 @@
 import { describe, expect, it } from 'bun:test';
 import { ManualStateBus } from '../manual.js';
 import type { Event, StateBusConfig } from '../types.js';
+import { initialTestState } from './test-state.js';
 
-const initialState = { counter: 0, counter1: 0, counter2: 0 };
+const initialState = initialTestState();
 
 function createBus(reducers: StateBusConfig['reducers'] = {}) {
   return new ManualStateBus({ initialState, reducers });
@@ -59,7 +60,7 @@ describe('state interest lifecycle', () => {
   it('coalesces independent keys and StrictMode churn into their final counts', () => {
     const bus = createBus();
     const observed: Event<'statebus', 'substateInterest'>['payload'][] = [];
-    bus.subscribe('statebus', 'substateInterest', (event) => observed.push(event.payload));
+    bus.subscribe('statebus', 'substateInterest', (event) => observed.push({ subscribers: event.payload.subscribers }));
     const release = bus.substateInterest(['counter']);
     release();
     bus.substateInterest(['counter']);
@@ -81,7 +82,7 @@ describe('state interest lifecycle', () => {
       payload: Object.freeze({ subscribers: Object.freeze({ counter1: 2 }) }),
     } as const);
     const observed: Event<'statebus', 'substateInterest'>['payload'][] = [];
-    bus.subscribe('statebus', 'substateInterest', (event) => observed.push(event.payload));
+    bus.subscribe('statebus', 'substateInterest', (event) => observed.push({ subscribers: event.payload.subscribers }));
     bus.publish(first);
     bus.publish(second);
     bus.dispatchEvents();
@@ -132,7 +133,7 @@ it('keeps every delivered interest payload intact after later waves', () => {
   const retained: Event<'statebus', 'substateInterest'>['payload'][] = [];
   bus.subscribe('statebus', 'substateInterest', (event) => {
     Object.freeze(event.payload.subscribers);
-    retained.push(event.payload);
+    retained.push({ subscribers: event.payload.subscribers });
   });
   const releaseFirst = bus.substateInterest(['counter']);
   const releaseSecond = bus.substateInterest(['counter1']);

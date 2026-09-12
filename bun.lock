@@ -256,6 +256,46 @@
         "typescript": "^6.0.3",
       },
     },
+    "packages/statebus-data-loader": {
+      "name": "@smoothbricks/statebus-data-loader",
+      "version": "0.1.0",
+      "dependencies": {
+        "@smoothbricks/statebus-core": "workspace:*",
+        "tslib": "^2.8.1",
+      },
+      "devDependencies": {
+        "fast-check": "^4.4.0",
+      },
+    },
+    "packages/statebus-navigation-browser": {
+      "name": "@smoothbricks/statebus-navigation-browser",
+      "version": "0.1.0",
+      "dependencies": {
+        "@smoothbricks/statebus-navigation-core": "workspace:*",
+        "tslib": "^2.8.1",
+      },
+      "devDependencies": {
+        "@smoothbricks/statebus-core": "workspace:*",
+        "@smoothbricks/statebus-react": "workspace:*",
+        "@types/react": "^19.2.14",
+        "@types/react-dom": "^19.2.3",
+        "fast-check": "^4.4.0",
+        "playwright": "^1.62.1",
+        "react": "^19.2.5",
+        "react-dom": "^19.2.5",
+      },
+    },
+    "packages/statebus-navigation-core": {
+      "name": "@smoothbricks/statebus-navigation-core",
+      "version": "0.1.0",
+      "dependencies": {
+        "tslib": "^2.8.1",
+      },
+      "devDependencies": {
+        "@smoothbricks/statebus-core": "workspace:*",
+        "fast-check": "^4.4.0",
+      },
+    },
     "packages/statebus-react": {
       "name": "@smoothbricks/statebus-react",
       "version": "0.1.5-next.0",
@@ -267,9 +307,29 @@
       },
       "devDependencies": {
         "@types/react": "^19.2.14",
+        "@types/react-dom": "^19.2.3",
+        "happy-dom": "^20.11.0",
+        "react": "^19.2.5",
+        "react-dom": "^19.2.5",
       },
       "peerDependencies": {
         "react": ">=18.0.0",
+      },
+    },
+    "packages/statebus-tanstack-query": {
+      "name": "@smoothbricks/statebus-tanstack-query",
+      "version": "0.1.0",
+      "dependencies": {
+        "@smoothbricks/statebus-core": "workspace:*",
+        "@smoothbricks/statebus-data-loader": "workspace:*",
+        "tslib": "^2.8.1",
+      },
+      "devDependencies": {
+        "@tanstack/query-core": "^5.101.4",
+        "fast-check": "^4.4.0",
+      },
+      "peerDependencies": {
+        "@tanstack/query-core": "^5.101.4",
       },
     },
     "packages/time": {
@@ -1744,7 +1804,15 @@
 
     "@smoothbricks/statebus-core": ["@smoothbricks/statebus-core@workspace:packages/statebus-core"],
 
+    "@smoothbricks/statebus-data-loader": ["@smoothbricks/statebus-data-loader@workspace:packages/statebus-data-loader"],
+
+    "@smoothbricks/statebus-navigation-browser": ["@smoothbricks/statebus-navigation-browser@workspace:packages/statebus-navigation-browser"],
+
+    "@smoothbricks/statebus-navigation-core": ["@smoothbricks/statebus-navigation-core@workspace:packages/statebus-navigation-core"],
+
     "@smoothbricks/statebus-react": ["@smoothbricks/statebus-react@workspace:packages/statebus-react"],
+
+    "@smoothbricks/statebus-tanstack-query": ["@smoothbricks/statebus-tanstack-query@workspace:packages/statebus-tanstack-query"],
 
     "@smoothbricks/time": ["@smoothbricks/time@workspace:packages/time"],
 
@@ -3857,6 +3925,10 @@
     "pino-std-serializers": ["pino-std-serializers@7.1.0", "", {}, "sha512-BndPH67/JxGExRgiX1dX0w1FvZck5Wa4aal9198SrRhZjH3GxKQUKIBnYJTdj2HDN3UQAS06HlfcSbQj2OHmaw=="],
 
     "pirates": ["pirates@4.0.7", "", {}, "sha512-TfySrs/5nm8fQJDcBDuUng3VOUKsd7S+zqvbOTiGXHfxX4wK31ard+hoNuvkicM/2YFzlpDgABOevKSsB4G/FA=="],
+
+    "playwright": ["playwright@1.63.0", "", { "dependencies": { "playwright-core": "1.63.0" }, "bin": { "playwright": "cli.js" } }, "sha512-+7ziBLidS4NaNCdt57SUDT+wYmmd5fmiQejUic/kb+YsYSCPyOOE9sebzMjNmQrsnNpDJqd4WHvV/8lfKfUDUg=="],
+
+    "playwright-core": ["playwright-core@1.63.0", "", { "bin": { "playwright-core": "cli.js" } }, "sha512-rYCsBF/M5HjUch52bbtVONEFjv6Xu8sm8h72dNlR5bzIE1fvC/bxgspzkjSfU+MweEMmPM8KJebG6nnyxo5mCg=="],
 
     "plist": ["plist@3.1.1", "", { "dependencies": { "@xmldom/xmldom": "^0.9.10", "base64-js": "^1.5.1", "xmlbuilder": "^15.1.1" } }, "sha512-ZIfcLJC+7E7FBFnDxm9MPmt7D+DidyQ26lewieO75AdhA2ayMtsJSES0iWzqJQbcVRSrTufQoy0DR94xHue0oA=="],
 

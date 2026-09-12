@@ -1,3 +1,4 @@
+import type { StateInterestChange } from './interest.js';
 import type { StateKeys } from './types.js';
 
 export type { Computed } from '@tldraw/state';
@@ -18,7 +19,12 @@ declare module '@smoothbricks/statebus-core' {
     // Topics
     statebus: {
       // Event types
-      substateInterest: { subscribers: Partial<Record<StateKeys, number>> };
+      substateInterest: {
+        /** Aggregate demand per property, including keyed consumers. */
+        subscribers: Partial<Record<StateKeys, number>>;
+        /** Exact addresses emitted by the runtime. Keyed providers must use these, never aggregate counts. */
+        changes?: readonly StateInterestChange<StateKeys>[];
+      };
       error: Error;
       dispatchCompleted: { reducers: number; listeners: number };
     };
@@ -26,6 +32,14 @@ declare module '@smoothbricks/statebus-core' {
 }
 
 export { StateBus } from './api.js';
+export type { StateInterest, StateInterestChange, StateInterestKey } from './interest.js';
+export {
+  mergeStateInterests,
+  StateInterestBatch,
+  StateInterestMap,
+  StateInterestRegistry,
+  stateInterestKey,
+} from './interest.js';
 export { ManualStateBus } from './manual.js';
 export { MicrotaskStateBus } from './microtask.js';
 export type {
@@ -58,4 +72,4 @@ export type {
   WritableState,
 } from './types.js';
 export type { ViewFunction, ViewProps } from './view.js';
-export { computed, sortedKeyValuePairs } from './view.js';
+export { captureViewProps, computed, sameViewProps } from './view.js';

@@ -6,7 +6,8 @@
     "tsBuildInfoFile": "dist/tsconfig.lib.tsbuildinfo",
     "emitDeclarationOnly": false,
     "forceConsistentCasingInFileNames": true,
-    "types": ["node"]
+    "types": [],
+    "lib": ["ES2022", "WebWorker"]
   },
   "include": ["src/**/*.ts"],
   "references": [],

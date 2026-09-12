@@ -1,5 +1,6 @@
 import type { ByID, Events, States } from '@smoothbricks/statebus-core';
 import type { Atom, Signal as Substate } from '@tldraw/state';
+import type { StateInterest, StateInterestChange } from './interest.js';
 
 // #region Events
 export type Topics = keyof Events;
@@ -56,7 +57,7 @@ export interface StateBusConfig {
 
 // #region Substate
 /** A state key is a key of the states object */
-export type StateKeys = keyof States;
+export type StateKeys = Extract<keyof States, string>;
 export type StateValue<BT extends StateKeys> = States[BT] extends ByID<infer T> ? T | undefined : States[BT];
 
 export type StatePropKey<SK extends StateKeys> = States[SK] extends ByID<infer _T> ? never : SK;
@@ -114,7 +115,8 @@ export type AnyTopicListenerMap = { [T in Topics]?: { [ET in AnyEventType]?: Set
 // #endregion
 
 export interface SubstateRepository {
-  substateInterest<SK extends StateKeys>(keys: SK[]): () => void;
+  substateInterest<SK extends StateKeys>(keys: readonly (SK | StateInterest<SK>)[]): () => void;
+  getStateInterests(): readonly StateInterestChange<StateKeys>[];
   substateInterestCount: ReadonlyMap<string, number>;
 }
 
