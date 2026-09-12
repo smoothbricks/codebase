@@ -98,8 +98,11 @@ export function reduceNavigation<Target, Location>(
     case 'navigationGuardChanged': {
       if (state.guard === event.reason) return state;
       // A guard arriving in the same wave must precede execution of an admitted intent.
+      // Keep an existing confirmation current, but do not implicitly confirm when a guard clears.
       const operation =
-        event.reason && state.operation.kind === 'requested'
+        event.reason &&
+        (state.operation.kind === 'requested' ||
+          (state.operation.kind === 'blocked' && state.operation.reason !== event.reason))
           ? { kind: 'blocked' as const, request: state.operation.request, reason: event.reason }
           : state.operation;
       return { ...state, guard: event.reason, operation };

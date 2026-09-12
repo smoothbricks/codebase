@@ -76,6 +76,17 @@ describe('navigation production wiring', () => {
       await test.tick();
       expect(history.current()).toBe('/editor');
       expect(test.channel.read().operation.kind).toBe('blocked');
+      test.channel.publish({ type: 'navigationGuardChanged', reason: 'Upload still in progress' });
+      await test.tick();
+      expect(test.channel.read().operation).toEqual({
+        kind: 'blocked',
+        request: {
+          requestId: navigationRequestId('billing'),
+          intent: { kind: 'push', to: '/settings/billing?tab=invoices' },
+        },
+        reason: 'Upload still in progress',
+      });
+      expect(history.current()).toBe('/editor');
       test.channel.publish({ type: 'navigationConfirmed', requestId: navigationRequestId('billing') });
       await test.tick();
       expect(test.channel.read().location).toBe('/settings/billing?tab=invoices');

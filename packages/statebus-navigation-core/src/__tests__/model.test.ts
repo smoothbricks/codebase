@@ -60,6 +60,44 @@ describe('navigation reducer properties', () => {
     );
   });
 
+  it('refreshes blocked reasons across guard streams without admitting or mutating the request', () => {
+    fc.assert(
+      fc.property(fc.array(fc.string({ minLength: 1 }), { minLength: 2, maxLength: 40 }), (reasons) => {
+        let state = reduceNavigation(initialNavigationState<string, string>('/editor'), {
+          type: 'navigationGuardChanged',
+          reason: reasons[0],
+        });
+        state = reduceNavigation(state, { type: 'navigationRequested', request });
+        for (const reason of reasons) {
+          const previous = Object.freeze(state);
+          const operation = Object.freeze(previous.operation);
+          const next = reduceNavigation(previous, { type: 'navigationGuardChanged', reason });
+          expect(next.guard).toBe(reason);
+          expect(next.operation).toEqual({ kind: 'blocked', request, reason });
+          expect(next.location).toBe('/editor');
+          expect(next.lastRequestId).toBe(request.requestId);
+          expect(admittedNavigation(next, request.requestId)).toBeUndefined();
+          expect(previous.operation).toBe(operation);
+          expect(reduceNavigation(next, { type: 'navigationGuardChanged', reason })).toBe(next);
+          if (previous.guard === reason) expect(next).toBe(previous);
+          state = next;
+        }
+        // Removing a guard must not implicitly confirm a pending user decision.
+        const cleared = reduceNavigation(state, { type: 'navigationGuardChanged' });
+        expect(cleared.operation).toBe(state.operation);
+        expect(admittedNavigation(cleared, request.requestId)).toBeUndefined();
+        const restored = reduceNavigation(cleared, {
+          type: 'navigationGuardChanged',
+          reason: state.guard,
+        });
+        expect(restored.operation).toBe(state.operation);
+        const confirmed = reduceNavigation(restored, { type: 'navigationConfirmed', requestId: request.requestId });
+        expect(admittedNavigation(confirmed, request.requestId)).toBe(request);
+      }),
+      { numRuns: 500, seed: 230104 },
+    );
+  });
+
   it('refuses stale acknowledgements but accepts actual locations without acknowledging newer intent', () => {
     fc.assert(
       fc.property(fc.string(), (observed) => {
