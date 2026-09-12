@@ -30,7 +30,7 @@ describe('StateBus React exports', () => {
 
   it('should export ManualStateBus for testing', () => {
     const bus = new ManualStateBus({
-      initialState: { counter: 0 },
+      initialState: { counter: 0, testRecords: () => undefined },
       reducers: {
         test: {
           increment: (state, payload) => {
@@ -58,7 +58,7 @@ describe('StateBus React exports', () => {
 
 it('exports the microtask scheduler without requiring requestAnimationFrame', async () => {
   const bus = new MicrotaskStateBus({
-    initialState: { counter: 0 },
+    initialState: { counter: 0, testRecords: () => undefined },
     reducers: { test: { increment: (state, amount) => state.counter.set(amount) } },
   });
   bus.publish({ topic: 'test', type: 'increment', payload: 8 });

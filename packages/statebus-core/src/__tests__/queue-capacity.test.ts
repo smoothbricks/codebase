@@ -1,9 +1,10 @@
 import { describe, expect, it } from 'bun:test';
 import { ManualStateBus } from '../manual.js';
 import { MicrotaskStateBus } from '../microtask.js';
+import { initialTestState } from './test-state.js';
 
 const increment = (payload: number) => ({ topic: 'count', type: 'increment', payload }) as const;
-const initialState = { counter: 0, counter1: 0, counter2: 0 };
+const initialState = initialTestState();
 
 describe('retained queue capacity', () => {
   it('preserves order across growth and subsequent smaller waves', () => {
