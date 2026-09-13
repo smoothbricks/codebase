@@ -157,7 +157,16 @@ export type EffectPolicy = 'parallel' | 'serialize' | 'latest-wins' | 'drop-dupl
 export type EffectCancellation = 'cancelled' | 'superseded' | 'duplicate';
 export type EffectSource<T> = T | Promise<T>;
 export type EffectStream<T> = Iterable<T> | AsyncIterable<T>;
+/** Explicit execution admission limit. The application's existing failure mapper owns the typed outcome. */
+export class EffectCapacityError extends Error {
+  readonly code = 'effect-capacity';
+  constructor(readonly limit: number) {
+    super(`Effect capacity ${limit} exhausted.`);
+  }
+}
 interface EffectHooks<Plan, Outcome> {
+  /** Active (including cancelled-but-unsettled) plus queued work. Defaults to 1024 per binding. */
+  readonly maxPending?: number;
   readonly failure: (cause: unknown, plan: Plan) => Outcome;
   readonly capture?: (outcome: EffectOutcome<Plan, Outcome>) => void;
   readonly captureInstruction?: (plan: Plan) => void;
@@ -179,19 +188,32 @@ export interface EffectBinding<ID extends string | number = string | number, Key
 interface Job<P extends EffectPlan> {
   readonly plan: P;
   readonly key: string | number;
-  readonly controller: AbortController;
+  controller: AbortController | undefined;
   readonly group: Group<P>;
   closeIterator: (() => Promise<void>) | undefined;
   closed: boolean;
   started: boolean;
-  queueIndex: number;
+  readonly sequence: number;
+  previous: Job<P> | undefined;
+  next: Job<P> | undefined;
 }
 interface Group<P extends EffectPlan> {
   active: number;
-  next: number;
-  queue: (Job<P> | undefined)[];
+  first: Job<P> | undefined;
+  last: Job<P> | undefined;
 }
 const bound = new WeakMap<ComposedRuntime, Map<string, object>>();
+// Native abort() otherwise constructs an exception for every cancellation. The reason is
+// immutable shared protocol data; request identity remains in the plan/result, not an Error.
+const EFFECT_ABORTED = Object.freeze(new DOMException('StateBus operation cancelled.', 'AbortError'));
+const SETTLED = Promise.resolve();
+const INACTIVE_BINDING = Object.freeze({
+  cancel: () => false,
+  cancelKey: () => 0,
+  drain: () => SETTLED,
+  dispose: () => {},
+  disposeAsync: () => SETTLED,
+});
 function asyncValues<T>(source: EffectStream<T>): source is AsyncIterable<T> {
   return source !== null && typeof source === 'object' && Symbol.asyncIterator in source;
 }
@@ -201,7 +223,15 @@ export function publishEffectOutcome<C, P extends EffectPlan, O, R>(
   definition: EffectDefinition<C, P, O, R>,
   captured: EffectOutcome<P, O>,
 ): void {
-  const event = definition.decode(captured.plan, captured.outcome);
+  publishDecoded(runtime, definition, captured.plan, captured.outcome);
+}
+function publishDecoded<C, P extends EffectPlan, O, R>(
+  runtime: ComposedRuntime,
+  definition: EffectDefinition<C, P, O, R>,
+  plan: P,
+  outcome: O,
+): void {
+  const event = definition.decode(plan, outcome);
   if (event !== undefined && !runtime.disposed) runtime.publish(definition.result, event);
 }
 
@@ -217,14 +247,11 @@ export function bindEffect<C, P extends EffectPlan, O, R>(
   runtime.assertOwner(definition.command.ownerToken);
   runtime.assertOwner(definition.result.ownerToken);
   // No interpreter subscription, request, promise, or iterator is installed during replay.
-  if (runtime.mode === 'replay')
-    return Object.freeze({
-      cancel: () => false,
-      cancelKey: () => 0,
-      drain: async () => {},
-      dispose: () => {},
-      disposeAsync: async () => {},
-    });
+  if (runtime.mode === 'replay') return INACTIVE_BINDING;
+  const maxPending = operations.maxPending ?? 1024;
+  if (!Number.isSafeInteger(maxPending) || maxPending < 1)
+    throw new RangeError('maxPending must be a positive safe integer.');
+  const capacityError = new EffectCapacityError(maxPending);
   let bindings = bound.get(runtime);
   if (!bindings) {
     bindings = new Map();
@@ -236,8 +263,12 @@ export function bindEffect<C, P extends EffectPlan, O, R>(
   const policy = definition.policy ?? 'parallel';
   const jobs = new Map<P['requestId'], Job<P>>();
   const groups = new Map<string | number, Group<P>>();
-  const parallelGroup: Group<P> = { active: 0, next: 0, queue: [] };
-  const pending = new Set<Promise<void>>();
+  // Intrusive per-key lists: no queue nodes, suffix copies, or scans of unrelated groups.
+  let outstanding = 0;
+  let running = 0;
+  let sequence = 0;
+  let drainPromise: Promise<void> | undefined;
+  let resolveDrain: (() => void) | undefined;
   const seen = new Set<P['requestId']>();
   let seenWave = -1;
   let disposed = false;
@@ -253,16 +284,28 @@ export function bindEffect<C, P extends EffectPlan, O, R>(
       runtime.reportError(cause, 'decoder');
     }
   }
+  function unlink(job: Job<P>): void {
+    const { group, previous, next } = job;
+    if (previous) previous.next = next;
+    else group.first = next;
+    if (next) next.previous = previous;
+    else group.last = previous;
+    job.previous = undefined;
+    job.next = undefined;
+  }
+  function releaseGroup(key: string | number, group: Group<P>): void {
+    if (group.active === 0 && !group.first && groups.get(key) === group) groups.delete(key);
+  }
   function cancelJob(job: Job<P>, reason: EffectCancellation): void {
     if (job.closed) return;
     job.closed = true;
-    if (!job.started && job.queueIndex >= 0) {
-      job.group.queue[job.queueIndex] = undefined;
-      job.queueIndex = -1;
-      trim(job.group);
-    }
+    unlink(job);
+    if (!job.started) outstanding--;
     if (jobs.get(job.plan.requestId) === job) jobs.delete(job.plan.requestId);
-    job.controller.abort();
+    releaseGroup(job.key, job.group);
+    // Revoke membership before callbacks. A cancelled active task still owns its capacity
+    // until it physically settles; abort cannot disguise unbounded non-cooperative work.
+    job.controller?.abort(EFFECT_ABORTED);
     if (job.closeIterator) void job.closeIterator().catch((cause: unknown) => runtime.reportError(cause, 'cleanup'));
     cancellation(job.plan, reason);
   }
@@ -272,14 +315,18 @@ export function bindEffect<C, P extends EffectPlan, O, R>(
     cancelJob(job, 'cancelled');
     return true;
   }
-  function cancelKey(key: OperationKey<P>): number {
+  function cancelGroup(group: Group<P>, through: number, reason: EffectCancellation): number {
     let count = 0;
-    for (const job of jobs.values())
-      if (job.key === key) {
-        cancelJob(job, 'cancelled');
-        count++;
-      }
+    // Callbacks may cancel other jobs or append new work; never cancel beyond this call's frontier.
+    while (group.first && group.first.sequence <= through) {
+      cancelJob(group.first, reason);
+      count++;
+    }
     return count;
+  }
+  function cancelKey(key: OperationKey<P>): number {
+    const group = groups.get(key);
+    return group ? cancelGroup(group, sequence, 'cancelled') : 0;
   }
   function emit(job: Job<P>, outcome: O): void {
     if (!current(job)) return;
@@ -289,40 +336,27 @@ export function bindEffect<C, P extends EffectPlan, O, R>(
       runtime.reportError(cause);
     }
     try {
-      if (current(job)) publishEffectOutcome(runtime, definition, { plan: job.plan, outcome });
+      if (current(job)) publishDecoded(runtime, definition, job.plan, outcome);
     } catch (cause) {
       runtime.reportError(cause, 'decoder');
     }
   }
-  function trim(group: Group<P>): void {
-    while (group.next < group.queue.length && group.queue[group.next] === undefined) group.next++;
-    if (group.next === group.queue.length) {
-      group.queue.length = 0;
-      group.next = 0;
-    } else if (group.next >= 64 && group.next * 2 >= group.queue.length) {
-      group.queue = group.queue.slice(group.next);
-      group.next = 0;
-      for (let index = 0; index < group.queue.length; index++) {
-        const job = group.queue[index];
-        if (job) job.queueIndex = index;
-      }
-    }
-  }
   function pump(key: string | number, group: Group<P>): void {
     if (disposed || runtime.disposed) return;
-    while (group.active === 0 && group.next < group.queue.length) {
-      const job = group.queue[group.next];
-      group.queue[group.next++] = undefined;
-      if (job) job.queueIndex = -1;
-      if (job && !job.closed) start(job);
-    }
-    trim(group);
-    if (group.active === 0 && group.queue.length === 0 && groups.get(key) === group) groups.delete(key);
+    if (policy === 'serialize' && group.active === 0 && group.first) start(group.first);
+    releaseGroup(key, group);
   }
-  async function execute(job: Job<P>): Promise<void> {
+  function settled(): void {
+    if (running !== 0 || !resolveDrain) return;
+    const resolve = resolveDrain;
+    resolveDrain = undefined;
+    drainPromise = undefined;
+    resolve();
+  }
+  async function execute(job: Job<P>, signal: AbortSignal): Promise<void> {
     try {
       if ('stream' in operations) {
-        const source = operations.stream(job.plan, { signal: job.controller.signal });
+        const source = operations.stream(job.plan, { signal });
         const iterator = asyncValues(source) ? source[Symbol.asyncIterator]() : source[Symbol.iterator]();
         let closed: Promise<void> | undefined;
         job.closeIterator = () => {
@@ -341,11 +375,11 @@ export function bindEffect<C, P extends EffectPlan, O, R>(
         } finally {
           await job.closeIterator();
         }
-      } else emit(job, await operations.execute(job.plan, { signal: job.controller.signal }));
+      } else emit(job, await operations.execute(job.plan, { signal }));
     } catch (cause) {
       // An operation can throw before reaching its first await. Match Promise rejection
       // timing so failure outcomes never enter the caller's command flush synchronously.
-      await Promise.resolve();
+      await SETTLED;
       if (current(job)) {
         try {
           emit(job, operations.failure(cause, job.plan));
@@ -354,30 +388,43 @@ export function bindEffect<C, P extends EffectPlan, O, R>(
         }
       }
     } finally {
-      // Reserve the entire notification wave even for direct outcomes and synchronous throws.
-      await Promise.resolve();
-      if (jobs.get(job.plan.requestId) === job) jobs.delete(job.plan.requestId);
-      job.closed = true;
+      if (!job.closed) {
+        unlink(job);
+        jobs.delete(job.plan.requestId);
+        job.closed = true;
+      }
+      outstanding--;
       job.group.active--;
-      pump(job.key, job.group);
+      running--;
+      try {
+        pump(job.key, job.group);
+      } finally {
+        settled();
+      }
     }
   }
   function start(job: Job<P>): void {
     if (!current(job)) return;
     job.started = true;
     job.group.active++;
-    const task = execute(job);
-    pending.add(task);
-    runtime.trackExecution(task);
-    void task.then(
-      () => {
-        pending.delete(task);
-      },
-      (cause: unknown) => {
-        pending.delete(task);
-        runtime.reportError(cause, 'cleanup');
-      },
-    );
+    running++;
+    job.controller = new AbortController();
+    runtime.trackExecution(execute(job, job.controller.signal));
+  }
+  function overloaded(plan: P): void {
+    // Refusal is an operational outcome, not an executed job or an unhandled exception.
+    try {
+      const outcome = operations.failure(capacityError, plan);
+      if (disposed || runtime.disposed) return;
+      try {
+        operations.capture?.({ plan, outcome });
+      } catch (cause) {
+        runtime.reportError(cause);
+      }
+      if (!disposed && !runtime.disposed) publishDecoded(runtime, definition, plan, outcome);
+    } catch (cause) {
+      runtime.reportError(cause);
+    }
   }
   const stop = runtime.listen(definition.command, (command, admitted) => {
     if (!admitted || disposed) return;
@@ -388,45 +435,54 @@ export function bindEffect<C, P extends EffectPlan, O, R>(
       runtime.reportError(cause, 'planner');
       return;
     }
-    if (!plan) return;
+    if (!plan || disposed || runtime.disposed) return;
     if (runtime.waveNumber !== seenWave) {
       seen.clear();
       seenWave = runtime.waveNumber;
     }
     if (seen.has(plan.requestId) || jobs.has(plan.requestId)) return;
     seen.add(plan.requestId);
+    const key = plan.operationKey ?? plan.requestId;
+    let group = groups.get(key);
+    if (policy === 'drop-duplicate' && group && group.active > 0) {
+      cancellation(plan, 'duplicate');
+      return;
+    }
+    if (outstanding === maxPending) {
+      overloaded(plan);
+      return;
+    }
+    if (!group) {
+      group = { active: 0, first: undefined, last: undefined };
+      groups.set(key, group);
+    }
+    const job: Job<P> = {
+      plan,
+      key,
+      group,
+      controller: undefined,
+      closeIterator: undefined,
+      closed: false,
+      started: false,
+      sequence: ++sequence,
+      previous: group.last,
+      next: undefined,
+    };
+    if (group.last) group.last.next = job;
+    else group.first = job;
+    group.last = job;
+    jobs.set(plan.requestId, job);
+    outstanding++;
+    if (policy === 'latest-wins') cancelGroup(group, job.sequence - 1, 'superseded');
+    // Capture is injected code and can dispose/cancel synchronously. Reserve the request
+    // first, then recheck it before executing or retaining it in the serialized queue.
+    if (!current(job)) return;
     try {
       operations.captureInstruction?.(plan);
     } catch (cause) {
       runtime.reportError(cause);
     }
-    const key = plan.operationKey ?? plan.requestId;
-    let group = policy === 'parallel' ? parallelGroup : groups.get(key);
-    if (!group) {
-      group = { active: 0, next: 0, queue: [] };
-      groups.set(key, group);
-    }
-    if (policy === 'drop-duplicate' && group.active > 0) {
-      cancellation(plan, 'duplicate');
-      return;
-    }
-    if (policy === 'latest-wins')
-      for (const previous of jobs.values()) if (previous.key === key) cancelJob(previous, 'superseded');
-    const job: Job<P> = {
-      plan,
-      key,
-      group,
-      controller: new AbortController(),
-      closeIterator: undefined,
-      closed: false,
-      started: false,
-      queueIndex: -1,
-    };
-    jobs.set(plan.requestId, job);
-    if (policy === 'serialize' && group.active > 0) {
-      job.queueIndex = group.queue.length;
-      group.queue.push(job);
-    } else start(job);
+    if (current(job) && (policy !== 'serialize' || group.active === 0)) start(job);
   });
   const dispose = runtime.manage(() => {
     if (disposed) return;
@@ -434,17 +490,18 @@ export function bindEffect<C, P extends EffectPlan, O, R>(
     stop();
     releaseRequirement();
     for (const job of jobs.values()) cancelJob(job, 'cancelled');
-    for (const group of groups.values()) {
-      group.queue.length = 0;
-      group.next = 0;
-    }
     jobs.clear();
     groups.clear();
     seen.clear();
     bindings.delete(definition.metadata.key);
   });
-  async function drain(): Promise<void> {
-    while (pending.size > 0) await Promise.allSettled([...pending]);
+  function drain(): Promise<void> {
+    if (running === 0) return SETTLED;
+    // Only callers that actually wait allocate a completion promise. All waiters share it.
+    drainPromise ??= new Promise<void>((resolve) => {
+      resolveDrain = resolve;
+    });
+    return drainPromise;
   }
   return Object.freeze({
     cancel,

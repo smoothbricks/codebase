@@ -56,7 +56,7 @@ export {
 export { type CodecMigration, evolveCodec } from './codec.js';
 export * from './composition.js';
 export { bindRuntimeDiagnostics } from './diagnostics.js';
-export { type DispatchScheduler, ManualScheduler, microtaskScheduler } from './dispatch.js';
+export { DispatchCycleError, type DispatchScheduler, ManualScheduler, microtaskScheduler } from './dispatch.js';
 export * from './effects.js';
 export type { StateInterest, StateInterestChange, StateInterestKey } from './interest.js';
 export {

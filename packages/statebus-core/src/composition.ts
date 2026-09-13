@@ -737,6 +737,8 @@ export interface RuntimeOptions {
   readonly scheduler?: DispatchScheduler;
   readonly mode?: 'live' | 'replay';
   readonly maxReactionSteps?: number;
+  /** Fail-stop a non-quiescing synchronous listener cascade; explicit flush resumes the retained queue. */
+  readonly maxWavesPerFlush?: number;
   readonly onError?: (cause: unknown) => void;
 }
 export interface ExternalStore<T> {
@@ -805,7 +807,25 @@ export class ComposedRuntime implements StateReader {
   private wave = 0;
   private reactionDepth = 0;
   private reactionBudget: ReactionBudget | undefined;
-  private readonly pendingExecutions = new Set<Promise<void>>();
+  private pendingExecutions = 0;
+  private completion: Promise<void> | undefined;
+  private resolveCompletion: (() => void) | undefined;
+  private readonly executionFinished = () => {
+    this.pendingExecutions--;
+    if (this.pendingExecutions === 0 && this.resolveCompletion) {
+      const resolve = this.resolveCompletion;
+      this.resolveCompletion = undefined;
+      this.completion = undefined;
+      resolve();
+    }
+  };
+  private readonly executionFailed = (cause: unknown) => {
+    try {
+      this.reportError(cause, 'cleanup');
+    } finally {
+      this.executionFinished();
+    }
+  };
   private readonly providedEffects = new Set<EffectCodecDescriptor>();
   private readinessChecked = false;
   private readonly diagnosticListeners = new Set<(diagnostic: RuntimeDiagnostic) => void>();
@@ -830,6 +850,9 @@ export class ComposedRuntime implements StateReader {
   }
 
   private readonly flushScheduled = () => {
+    // A microtask cannot physically be cancelled. Never let a stale scheduled callback
+    // resume a manually flushed or cycle-paused queue.
+    if (!this.scheduled) return;
     this.scheduled = false;
     if (!this.closed) {
       try {
@@ -859,6 +882,7 @@ export class ComposedRuntime implements StateReader {
           this.scheduler.schedule(this.flushScheduled);
         }
       },
+      options.maxWavesPerFlush,
     );
     try {
       for (const state of composition.states) state.initialize(this);
@@ -880,6 +904,9 @@ export class ComposedRuntime implements StateReader {
   }
   get idle(): boolean {
     return this.queue.idle;
+  }
+  get dispatchPaused(): boolean {
+    return this.queue.suspended;
   }
   assertOwner(owner: object): void {
     if (this.disposed || !this.composition.owners.has(owner)) throw new Error('Foreign handle or disposed runtime.');
@@ -938,24 +965,26 @@ export class ComposedRuntime implements StateReader {
   }
   /** @internal Track actual completion, including cooperative iterator finalization. */
   trackExecution(task: Promise<void>): void {
-    this.pendingExecutions.add(task);
-    void task.then(
-      () => {
-        this.pendingExecutions.delete(task);
-      },
-      (cause: unknown) => {
-        this.pendingExecutions.delete(task);
-        this.reportError(cause, 'cleanup');
-      },
-    );
+    this.pendingExecutions++;
+    // Stable per-runtime callbacks replace per-task closures and a second Set of promises.
+    try {
+      void task.then(this.executionFinished, this.executionFailed);
+    } catch (cause) {
+      this.executionFinished();
+      throw cause;
+    }
   }
   async drain(): Promise<void> {
     do {
       if (!this.disposed) this.flush();
-      if (this.pendingExecutions.size === 0) return;
-      await Promise.allSettled([...this.pendingExecutions]);
-    } while (this.pendingExecutions.size > 0 || (!this.disposed && !this.idle));
+      if (this.pendingExecutions === 0) return;
+      this.completion ??= new Promise<void>((resolve) => {
+        this.resolveCompletion = resolve;
+      });
+      await this.completion;
+    } while (this.pendingExecutions > 0 || (!this.disposed && !this.idle));
   }
+
   /** Abort is not physical termination. This awaits actual settlement and can wait on non-cooperative work. */
   async disposeAsync(): Promise<void> {
     this.dispose();
