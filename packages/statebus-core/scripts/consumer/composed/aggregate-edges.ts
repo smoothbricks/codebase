@@ -610,6 +610,7 @@ await test('cancelled QueryClient work cannot free aggregate capacity before tra
     runtime.flush();
     assert.equal(executions, 0);
     assert.equal(runtime.read(second.total), -1);
+    assert.equal(runtime.work.pending, 1);
     let drained = false;
     const waiting = runtime.drain().then(() => {
       drained = true;
@@ -676,12 +677,18 @@ await test('stored QueryClient callbacks cannot restart transport without fresh 
     assert.equal(calls, 1);
     runtime.publish(second.command, 1);
     runtime.flush();
-    await assert.rejects(queryClient.fetchQuery({ queryKey: ['retained', 1], retry: false }), RuntimeCapacityError);
+    // Refetch preserves the query's existing queryFn; fetchQuery with replacement options
+    // deliberately replaces it and would test missing query configuration instead.
+    await assert.rejects(
+      queryClient.refetchQueries({ queryKey: ['retained', 1], exact: true }, { throwOnError: true }),
+      RuntimeCapacityError,
+    );
     assert.equal(calls, 1);
     assert.equal(runtime.work.pending, 1);
     pending.resolve(1);
     await runtime.drain();
-    assert.equal(await queryClient.fetchQuery({ queryKey: ['retained', 1], retry: false }), 2);
+    await queryClient.refetchQueries({ queryKey: ['retained', 1], exact: true }, { throwOnError: true });
+    assert.equal(queryClient.getQueryData(['retained', 1]), 2);
     await runtime.drain();
     assert.equal(runtime.work.pending, 0);
   } finally {
@@ -791,7 +798,7 @@ await test('generated multi-binding cancel/settle streams agree with actual pend
         } finally {
           runtime.dispose();
         }
-      },
+      }),
     ),
     { seed: 148201, numRuns: 50 },
   );
