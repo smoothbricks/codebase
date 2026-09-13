@@ -157,3 +157,8 @@ ambient-schema API, not the separate value-level library composition/replay impl
 See [the composed consumer contract](./CONSUMER.md) for independently owned libraries, composition-bound
 React providers, typed effect/loader bindings and deterministic no-I/O replay. The legacy ambient API
 above remains compatible; new reusable libraries do not need module augmentation.
+
+See [retained replay and execution lifecycle](./REPLAY.md) for rolling checkpoints, library-owned codec
+migrations, deny-default support projections, operation policies, pure reactions and awaitable cleanup.
+The guide distinguishes lossless local recordings from explicitly non-replayable support artifacts
+and documents byte-limit, privacy and cancellation boundaries.
