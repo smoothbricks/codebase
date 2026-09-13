@@ -11,9 +11,9 @@ import {
   type EffectOutcome,
   ManualScheduler,
   mountLibrary,
+  type RollingScenarioRecorder,
   recordRollingScenario,
   replayScenario,
-  type RollingScenarioRecorder,
   type ValueCodec,
 } from '@smoothbricks/statebus-core';
 import typia from 'typia';
@@ -98,10 +98,19 @@ function test(name: string, run: () => void): void {
 function accounting(recorder: RollingScenarioRecorder): void {
   const snapshot = recorder.snapshot();
   const stats = recorder.stats();
-  assert.equal(stats.events, snapshot.waves.reduce((sum, wave) => sum + wave.events.length, 0));
-  assert.equal(stats.eventBytes, snapshot.waves.reduce((sum, wave) => sum + captureBytes(wave), 0));
+  assert.equal(
+    stats.events,
+    snapshot.waves.reduce((sum, wave) => sum + wave.events.length, 0),
+  );
+  assert.equal(
+    stats.eventBytes,
+    snapshot.waves.reduce((sum, wave) => sum + captureBytes(wave), 0),
+  );
   assert.equal(stats.effects, snapshot.effects.length);
-  assert.equal(stats.effectBytes, snapshot.effects.reduce((sum, entry) => sum + captureBytes(entry), 0));
+  assert.equal(
+    stats.effectBytes,
+    snapshot.effects.reduce((sum, entry) => sum + captureBytes(entry), 0),
+  );
   assert.equal(stats.checkpointBytes, captureBytes(snapshot.checkpoint));
   assert.ok(captureBytes(snapshot) <= recorder.limits.maxCaptureBytes);
   assert.ok(stats.events <= recorder.limits.maxEvents);
@@ -178,7 +187,7 @@ test('capacity-one wrap, failed waves and reset preserve independently owned sna
   }
 });
 
-test('instruction/outcome history obeys independent count and byte limits without aliasing old snapshots', () => {
+test('outcome history obeys independent count and byte limits without aliasing old snapshots', () => {
   for (const budget of [
     { maxEffects: 3, maxEffectBytes: 1_000_000 },
     { maxEffects: 100, maxEffectBytes: 700 },
@@ -221,7 +230,10 @@ test('instruction/outcome history obeys independent count and byte limits withou
 
 test('oversized checkpoints clear retained payloads and do not cancel production writes', () => {
   const errors: unknown[] = [];
-  const runtime = composition.createRuntime({ scheduler: new ManualScheduler(), onError: (cause) => errors.push(cause) });
+  const runtime = composition.createRuntime({
+    scheduler: new ManualScheduler(),
+    onError: (cause) => errors.push(cause),
+  });
   runtime.publish(model.write, { id: 1, value: 7 });
   runtime.flush();
   const bound = captureBytes(captureCheckpoint(runtime));
@@ -234,7 +246,10 @@ test('oversized checkpoints clear retained payloads and do not cancel production
     runtime.flush();
     runtime.publish(model.write, { id: 3, value: 9 });
     runtime.flush();
-    assert.throws(() => recorder.snapshot(), (error) => error instanceof CaptureError && error.issue.code === 'size-limit');
+    assert.throws(
+      () => recorder.snapshot(),
+      (error) => error instanceof CaptureError && error.issue.code === 'size-limit',
+    );
     const stats = recorder.stats();
     assert.equal(stats.events, 0);
     assert.equal(stats.effects, 0);
@@ -259,7 +274,10 @@ test('exact cold-envelope limit is checked before allocating a checkpoint snapsh
   const recorder = recordRollingScenario(runtime, { maxCaptureBytes: limit - 1 });
   try {
     const before = recorder.stats().checkpointMaterializations;
-    assert.throws(() => recorder.snapshot(), (error) => error instanceof CaptureError && error.issue.code === 'size-limit');
+    assert.throws(
+      () => recorder.snapshot(),
+      (error) => error instanceof CaptureError && error.issue.code === 'size-limit',
+    );
     assert.equal(recorder.stats().checkpointMaterializations, before);
     assert.equal(recorder.stats().refusal, undefined, 'An export refusal must not stop local recording.');
     const exact = recordRollingScenario(runtime, { maxCaptureBytes: limit });
