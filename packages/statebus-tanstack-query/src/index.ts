@@ -3,6 +3,7 @@ import {
   type StateInterestChange,
   StateInterestMap,
   stateInterestKey,
+  type WorkAdmission,
 } from '@smoothbricks/statebus-core';
 import {
   type ByteProgressSink,
@@ -51,6 +52,8 @@ export interface TanStackLoaderOptions<T, Failure> {
   readonly onError?: (cause: unknown) => void;
   /** Observe actual completion, including an aborted transport that settles later. */
   readonly trackExecution?: (task: Promise<void>) => void;
+  /** Shared runtime admission, taken before query setup and held through actual transport completion. */
+  readonly work?: WorkAdmission;
   readonly requestId: () => LoadRequestId;
   readonly now: () => number;
   readonly fingerprint?: (interest: StateInterest) => LoadFingerprint;
@@ -70,7 +73,12 @@ export interface TanStackLoaderOptions<T, Failure> {
 interface QueryJob<T> {
   readonly request: LoadRequest;
   readonly address: StateInterest;
-  readonly group: QueryGroup<T>;
+  group: QueryGroup<T> | undefined;
+  readonly work: WorkAdmission | undefined;
+  requestPending: boolean;
+  transports: number;
+  workReleased: boolean;
+  installed: boolean;
   closed: boolean;
   stopObservation: () => void;
 }
@@ -145,7 +153,7 @@ export function installTanStackQueryLoader<T, Failure>(options: TanStackLoaderOp
   function close(job: QueryJob<T>, reason?: 'unobserved' | 'superseded'): void {
     if (job.closed) return;
     job.closed = true;
-    job.group.jobs.delete(job);
+    job.group?.jobs.delete(job);
     cleanup(job.stopObservation);
     if (jobs.get(job.address) === job) {
       clearRelease(job.address);
@@ -203,14 +211,45 @@ export function installTanStackQueryLoader<T, Failure>(options: TanStackLoaderOp
     }
   }
 
-  async function start(request: LoadRequest): Promise<void> {
+  function start(request: LoadRequest): void {
     const address = request.interest;
     const previous = jobs.get(address);
     if (previous?.request.requestId === request.requestId) return;
-    let job: QueryJob<T> | undefined;
+    const work = options.work;
+    if (work && !work.tryAcquire()) {
+      // Refuse outside QueryClient: retry settings must not turn capacity exhaustion
+      // into an unbounded retry queue or execute transport without admission.
+      try {
+        const error = options.failure(work.capacityError);
+        if (!disposed && isLoadAccepted(channel.read(request.interest), request))
+          channel.publish({ type: 'loadFailed', request, error });
+      } catch (cause) {
+        reportError(cause);
+      }
+      return;
+    }
+    const job: QueryJob<T> = {
+      request,
+      address,
+      group: undefined,
+      work,
+      requestPending: true,
+      transports: 0,
+      workReleased: false,
+      installed: false,
+      closed: false,
+      stopObservation: ignoreSettlement,
+    };
+    trackExecution(executeRequest(job, previous).catch(reportError));
+  }
+
+  async function executeRequest(job: QueryJob<T>, previous: QueryJob<T> | undefined): Promise<void> {
+    const { request, address } = job;
     let queryHash: string | undefined;
     try {
       const definition = options.query(request);
+      // A query-options callback may synchronously dispose the boundary or replace this request.
+      if (disposed || jobs.get(address) !== previous) return;
       queryHash = hashKey(definition.queryKey);
       let group = groups.get(queryHash);
       if (!group) {
@@ -226,19 +265,16 @@ export function installTanStackQueryLoader<T, Failure>(options: TanStackLoaderOp
         enabled: false,
       });
       const unsubscribe = observer.subscribe(() => {});
-      job = {
-        request,
-        address,
-        group,
-        closed: false,
-        stopObservation() {
-          unsubscribe();
-          const query = observer.getCurrentQuery();
-          // A paused/offline query may not have consumed its AbortSignal yet. Releasing its final
-          // observer must cancel that pending retryer as well, not wait indefinitely for reconnect.
-          if (query.getObserversCount() === 0) void query.cancel({ revert: true });
-        },
+      job.group = group;
+      job.stopObservation = () => {
+        unsubscribe();
+        const query = observer.getCurrentQuery();
+        // A paused/offline query may not have consumed its AbortSignal yet. Releasing its final
+        // observer must cancel that pending retryer as well, not wait indefinitely for reconnect.
+        if (query.getObserversCount() === 0) void query.cancel({ revert: true });
       };
+      if (disposed || jobs.get(address) !== previous) return;
+      job.installed = true;
       jobs.set(address, job);
       group.jobs.add(job);
       if (group.attempt > 0) channel.publish({ type: 'loadAttemptStarted', request, attempt: group.attempt });
@@ -250,50 +286,70 @@ export function installTanStackQueryLoader<T, Failure>(options: TanStackLoaderOp
         ...queryOptions,
         // StateBus decides when to ask; QueryClient may fulfill that request from its bounded execution cache.
         queryFn: async ({ signal }) => {
-          const attempt = ++executionGroup.attempt;
-          emitGroup(executionGroup, (accepted) => ({ type: 'loadAttemptStarted', request: accepted, attempt }));
-          const progress = createByteProgressReporter({
-            timer,
-            intervalMs: progressIntervalMs,
-            emit: (sample) =>
-              emitGroup(executionGroup, (accepted) => ({
-                type: 'loadProgressed',
-                request: accepted,
-                attempt,
-                sample,
-                at: options.now(),
-              })),
-          });
-          const abort = () => progress.dispose();
-          signal.addEventListener('abort', abort, { once: true });
+          // One admitted logical read owns its QueryClient waiter and every transport attempt.
+          // Query cancellation may settle that waiter early, but cannot release its last slot
+          // while the transport is still running. Retry attempts reuse the same reservation.
+          const ownsRequest = job.requestPending && job.transports === 0;
+          // QueryClient may reuse its stored queryFn for an external refetch. Such work
+          // cannot borrow an already-released (or concurrently used) request reservation.
+          if (!ownsRequest && job.work && !job.work.tryAcquire()) throw job.work.capacityError;
+          if (ownsRequest) job.transports++;
           try {
-            if (signal.aborted) throw signal.reason;
-            const execution = execute({ signal, request, attempt, reportBytes: progress.reportBytes });
-            // Query cancellation settles fetchQuery before a non-cooperative transport finishes.
-            // Track both lifetimes; expected query rejections still go through the domain classifier.
-            if (options.trackExecution) trackExecution(execution.then(ignoreSettlement, ignoreSettlement));
-            return await execution;
-          } finally {
-            // Publish the last measured bytes before success/failure, even when no interval has elapsed.
+            const attempt = ++executionGroup.attempt;
+            emitGroup(executionGroup, (accepted) => ({ type: 'loadAttemptStarted', request: accepted, attempt }));
+            const progress = createByteProgressReporter({
+              timer,
+              intervalMs: progressIntervalMs,
+              emit: (sample) =>
+                emitGroup(executionGroup, (accepted) => ({
+                  type: 'loadProgressed',
+                  request: accepted,
+                  attempt,
+                  sample,
+                  at: options.now(),
+                })),
+            });
+            const abort = () => progress.dispose();
+            signal.addEventListener('abort', abort, { once: true });
             try {
-              if (!signal.aborted) progress.flush();
+              if (signal.aborted) throw signal.reason;
+              const execution = execute({ signal, request, attempt, reportBytes: progress.reportBytes });
+              // Query cancellation settles fetchQuery before a non-cooperative transport finishes.
+              // Track both lifetimes; expected query rejections still go through the domain classifier.
+              if (options.trackExecution) trackExecution(execution.then(ignoreSettlement, ignoreSettlement));
+              return await execution;
             } finally {
-              progress.dispose();
-              signal.removeEventListener('abort', abort);
+              // Publish the last measured bytes before success/failure, even when no interval has elapsed.
+              try {
+                if (!signal.aborted) progress.flush();
+              } finally {
+                progress.dispose();
+                signal.removeEventListener('abort', abort);
+              }
             }
+          } finally {
+            if (ownsRequest) {
+              job.transports--;
+              releaseWork(job);
+            } else job.work?.release();
           }
         },
       });
       if (current(job)) channel.publish({ type: 'loadSucceeded', request, value, at: options.now() });
     } catch (cause) {
-      if (!job && previous) close(previous, 'superseded');
-      if (!disposed && (!job || current(job)) && isLoadAccepted(channel.read(request.interest), request)) {
+      if (!job.installed && previous) close(previous, 'superseded');
+      if (!disposed && (!job.installed || current(job)) && isLoadAccepted(channel.read(request.interest), request)) {
         channel.publish({ type: 'loadFailed', request, error: options.failure(cause) });
       }
     } finally {
-      if (job) close(job);
-      // Keep a shared group's byte fanout alive until its last admitted consumer settles.
-      if (queryHash !== undefined && groups.get(queryHash)?.jobs.size === 0) groups.delete(queryHash);
+      try {
+        close(job);
+        // Keep a shared group's byte fanout alive until its last admitted consumer settles.
+        if (queryHash !== undefined && groups.get(queryHash)?.jobs.size === 0) groups.delete(queryHash);
+      } finally {
+        job.requestPending = false;
+        releaseWork(job);
+      }
     }
   }
 
@@ -329,8 +385,7 @@ export function installTanStackQueryLoader<T, Failure>(options: TanStackLoaderOp
         event.type === 'loadRequested' &&
         isLoadAccepted(channel.read(event.request.interest), event.request)
       ) {
-        // Handle adapter/classifier failures too: void start(...) alone loses those rejections.
-        trackExecution(start(event.request).catch(reportError));
+        start(event.request);
       }
     });
     stopInterest = options.interests.subscribe(onInterests);
@@ -347,7 +402,10 @@ export function installTanStackQueryLoader<T, Failure>(options: TanStackLoaderOp
 /** Runtime-owned binding of the existing QueryClient execution boundary. Replay installs no I/O. */
 export function bindComposedQueryLoader<T, Failure, ID extends string | number>(
   binding: import('@smoothbricks/statebus-data-loader').ComposedLoaderBinding<T, Failure, ID>,
-  options: Omit<TanStackLoaderOptions<T, Failure>, 'channel' | 'interests' | 'matches' | 'onError' | 'trackExecution'>,
+  options: Omit<
+    TanStackLoaderOptions<T, Failure>,
+    'channel' | 'interests' | 'matches' | 'onError' | 'trackExecution' | 'work'
+  >,
 ): () => void {
   const { runtime, channel, interests, matches } = binding;
   if (runtime.mode === 'replay') return () => {};
@@ -360,9 +418,18 @@ export function bindComposedQueryLoader<T, Failure, ID extends string | number>(
       matches,
       onError: (cause) => runtime.reportError(cause),
       trackExecution: (task) => runtime.trackExecution(task),
+      work: runtime.work,
     }),
   );
 }
 
 // One stable completion callback; transports keep their typed values on their original Promise.
 function ignoreSettlement(): void {}
+
+// This state lives in the existing job, not a second per-request lease or Promise wrapper.
+// A shared query uses one slot per logical read, not another slot for each retry/transport.
+function releaseWork<T>(job: QueryJob<T>): void {
+  if (job.workReleased || job.requestPending || job.transports !== 0) return;
+  job.workReleased = true;
+  job.work?.release();
+}

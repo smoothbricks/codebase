@@ -5,6 +5,7 @@ import { DispatchQueue, type DispatchScheduler, microtaskScheduler } from './dis
 import type { EffectCodecDescriptor } from './effects.js';
 import { type StateInterest, StateInterestBatch, type StateInterestChange, StateInterestRegistry } from './interest.js';
 import type { SupportPolicy } from './support-policy.js';
+import { type WorkAdmission, WorkBudget } from './work.js';
 
 export interface ValueCodec<T> {
   readonly schema: string;
@@ -734,6 +735,8 @@ export interface RuntimeDiagnostic {
   readonly wave: number;
 }
 export interface RuntimeOptions {
+  /** Queued plus actually running work across all effect/loader bindings. Defaults to 4096. */
+  readonly maxPendingWork?: number;
   readonly scheduler?: DispatchScheduler;
   readonly mode?: 'live' | 'replay';
   readonly maxReactionSteps?: number;
@@ -788,6 +791,9 @@ export function composeLibraries(...mounts: readonly MountedLibrary<unknown>[]):
 }
 
 export class ComposedRuntime implements StateReader {
+  /** Shared execution admission. Components publish commands; boundary adapters own acquisitions. */
+  readonly work: WorkAdmission;
+  private readonly workBudget: WorkBudget;
   readonly mode: 'live' | 'replay';
   readonly reader: StateReader;
   private readonly scheduler: DispatchScheduler;
@@ -867,6 +873,8 @@ export class ComposedRuntime implements StateReader {
     private readonly options: RuntimeOptions = {},
   ) {
     this.mode = options.mode ?? 'live';
+    this.work = this.workBudget = new WorkBudget(options.maxPendingWork ?? 4096);
+    if (this.mode === 'replay') this.workBudget.close();
     if (!Number.isSafeInteger(options.maxReactionSteps ?? 64) || (options.maxReactionSteps ?? 64) < 1)
       throw new RangeError('maxReactionSteps must be a positive safe integer.');
     this.scheduler = options.scheduler ?? microtaskScheduler;
@@ -963,7 +971,7 @@ export class ComposedRuntime implements StateReader {
       this.readinessChecked = false;
     });
   }
-  /** @internal Track actual completion, including cooperative iterator finalization. */
+  /** @internal Observe already-started completion. Admission MUST happen before starting work. */
   trackExecution(task: Promise<void>): void {
     this.pendingExecutions++;
     // Stable per-runtime callbacks replace per-task closures and a second Set of promises.
@@ -977,12 +985,17 @@ export class ComposedRuntime implements StateReader {
   async drain(): Promise<void> {
     do {
       if (!this.disposed) this.flush();
-      if (this.pendingExecutions === 0) return;
-      this.completion ??= new Promise<void>((resolve) => {
-        this.resolveCompletion = resolve;
-      });
-      await this.completion;
-    } while (this.pendingExecutions > 0 || (!this.disposed && !this.idle));
+      if (this.pendingExecutions > 0) {
+        this.completion ??= new Promise<void>((resolve) => {
+          this.resolveCompletion = resolve;
+        });
+        await this.completion;
+      } else if (this.work.pending > 0) {
+        // A capture/abort callback can call drain after admission but before execution starts.
+        // Queued/reserved work counts even when no completion Promise has been registered yet.
+        await this.workBudget.drain();
+      } else return;
+    } while (this.pendingExecutions > 0 || this.work.pending > 0 || (!this.disposed && !this.idle));
   }
 
   /** Abort is not physical termination. This awaits actual settlement and can wait on non-cooperative work. */
@@ -1172,6 +1185,7 @@ export class ComposedRuntime implements StateReader {
     if (this.disposed) return;
     const finalInterest = this.interests.snapshot().map(({ interest }) => Object.freeze({ interest, subscribers: 0 }));
     this.closing = true;
+    this.workBudget.close();
     if (finalInterest.length > 0)
       for (const listener of this.interestListeners) {
         try {

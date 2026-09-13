@@ -67,6 +67,7 @@ export function connectBrowserNavigation(
       driver,
       onError: options.onError,
       trackExecution: options.trackExecution,
+      work: options.work,
     });
     stopGuard = channel.subscribe(updateGuard);
     updateGuard();

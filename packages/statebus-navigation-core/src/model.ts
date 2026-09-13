@@ -36,6 +36,7 @@ export interface NavigationFailure {
     | 'unsafe-protocol'
     | 'cross-origin'
     | 'unsupported'
+    | 'capacity'
     | 'driver-failed'
     | 'cancelled'
     | 'disposed';

@@ -42,6 +42,8 @@ export interface NavigationConnectionOptions<Target, Location> {
   readonly onError?: (cause: unknown) => void;
   /** The composed runtime can track actual asynchronous driver completion. */
   readonly trackExecution?: (task: Promise<void>) => void;
+  /** Structural admission port; pass the host runtime's work without a platform/core dependency. */
+  readonly work?: { tryAcquire(): boolean; release(): void };
 }
 
 /** Composition-owned wiring only. Admission, guards and transition decisions live in the reducer. */
@@ -51,7 +53,7 @@ export function connectNavigation<Target, Location>(
   let disposed = false;
   let lastStarted: NavigationRequestId | undefined;
   let activeScope: AbortController | undefined;
-  const { channel, driver } = options;
+  const { channel, driver, work } = options;
   let stopLocation: (() => void) | undefined;
   let stopRequests: (() => void) | undefined;
   function report(cause: unknown): void {
@@ -85,6 +87,7 @@ export function connectNavigation<Target, Location>(
   }
   function execute(request: NavigationRequest<Target>, signal: AbortSignal): void {
     const finish = (outcome: NavigationOutcome) => {
+      work?.release();
       if (disposed || signal.aborted || lastStarted !== request.requestId) return;
       try {
         channel.publish(
@@ -148,6 +151,12 @@ export function connectNavigation<Target, Location>(
       lastStarted = id;
       abort();
       if (disposed || lastStarted !== id) return;
+      // Reserve before creating the controller or invoking a native/custom driver. Aborting
+      // a previous request did not release its slot: it may ignore cancellation and finish later.
+      if (work && !work.tryAcquire()) {
+        channel.publish({ type: 'navigationFailed', requestId: id, error: CAPACITY_EXHAUSTED });
+        return;
+      }
       activeScope = new AbortController();
       execute(request, activeScope.signal);
     });
@@ -159,6 +168,10 @@ export function connectNavigation<Target, Location>(
   return dispose;
 }
 
+const CAPACITY_EXHAUSTED: NavigationFailure = Object.freeze({
+  code: 'capacity',
+  message: 'The runtime work capacity is exhausted.',
+});
 const DRIVER_FAILED: NavigationOutcome = Object.freeze({
   kind: 'failed',
   error: Object.freeze({ code: 'driver-failed', message: 'The navigation driver failed.' }),

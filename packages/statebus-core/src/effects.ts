@@ -252,6 +252,7 @@ export function bindEffect<C, P extends EffectPlan, O, R>(
   if (!Number.isSafeInteger(maxPending) || maxPending < 1)
     throw new RangeError('maxPending must be a positive safe integer.');
   const capacityError = new EffectCapacityError(maxPending);
+  const work = runtime.work;
   let bindings = bound.get(runtime);
   if (!bindings) {
     bindings = new Map();
@@ -300,7 +301,10 @@ export function bindEffect<C, P extends EffectPlan, O, R>(
     if (job.closed) return;
     job.closed = true;
     unlink(job);
-    if (!job.started) outstanding--;
+    if (!job.started) {
+      outstanding--;
+      work.release();
+    }
     if (jobs.get(job.plan.requestId) === job) jobs.delete(job.plan.requestId);
     releaseGroup(job.key, job.group);
     // Revoke membership before callbacks. A cancelled active task still owns its capacity
@@ -394,6 +398,7 @@ export function bindEffect<C, P extends EffectPlan, O, R>(
         job.closed = true;
       }
       outstanding--;
+      work.release();
       job.group.active--;
       running--;
       try {
@@ -411,10 +416,10 @@ export function bindEffect<C, P extends EffectPlan, O, R>(
     job.controller = new AbortController();
     runtime.trackExecution(execute(job, job.controller.signal));
   }
-  function overloaded(plan: P): void {
+  function overloaded(plan: P, cause: unknown): void {
     // Refusal is an operational outcome, not an executed job or an unhandled exception.
     try {
-      const outcome = operations.failure(capacityError, plan);
+      const outcome = operations.failure(cause, plan);
       if (disposed || runtime.disposed) return;
       try {
         operations.capture?.({ plan, outcome });
@@ -449,7 +454,13 @@ export function bindEffect<C, P extends EffectPlan, O, R>(
       return;
     }
     if (outstanding === maxPending) {
-      overloaded(plan);
+      overloaded(plan, capacityError);
+      return;
+    }
+    // Reserve before allocating/queuing a job or invoking capture/abort callbacks. Binding
+    // disposal or replacement cannot bypass a runtime's still-unsettled work budget.
+    if (!work.tryAcquire()) {
+      overloaded(plan, work.capacityError);
       return;
     }
     if (!group) {
