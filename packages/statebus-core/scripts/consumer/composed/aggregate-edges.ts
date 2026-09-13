@@ -798,7 +798,7 @@ await test('generated multi-binding cancel/settle streams agree with actual pend
         } finally {
           runtime.dispose();
         }
-      }),
+      },
     ),
     { seed: 148201, numRuns: 50 },
   );
