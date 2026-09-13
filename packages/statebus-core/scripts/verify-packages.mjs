@@ -95,6 +95,9 @@ try {
     assert.ok(existsSync(join(target, packed.exports['.'].types)));
     assert.ok(existsSync(join(target, packed.exports['.'].import)));
     assert.ok(!existsSync(join(target, 'node_modules')));
+    if (name === 'statebus-core')
+      for (const guide of ['CONSUMER.md', 'REPLAY.md', 'EXECUTION.md'])
+        assert.ok(existsSync(join(target, guide)), `Missing published consumer guide: ${guide}`);
     for (const [dep, version] of Object.entries({ ...packed.dependencies, ...packed.peerDependencies })) {
       if (dep.startsWith('@smoothbricks/') && manifests.has(dep.slice('@smoothbricks/'.length))) {
         assert.equal(
@@ -208,6 +211,8 @@ try {
       'support-edges',
       'journal-edges',
       'loader-edges',
+      'runtime-edges',
+      'navigation-edges',
     ])
       for (const runner of ['node', 'bun'])
         run(`${linker}: ${runner} ${executable}`, runner, [join(consumer, 'dist', 'composed', `${executable}.js`)], {
@@ -244,6 +249,8 @@ try {
           'deny-default support metadata, IDs and portable failures',
           'fixed journal capacity, atomic checkpoint bounds and pre-materialization refusal',
           'loader setup rollback, failure handling and transport drain',
+          'bounded effect admission, group-local cancellation and dispatch recovery',
+          'navigation cleanup, completion tracking and boolean React selectors',
         ],
       },
       null,

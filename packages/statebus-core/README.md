@@ -162,3 +162,6 @@ See [retained replay and execution lifecycle](./REPLAY.md) for rolling checkpoin
 migrations, deny-default support projections, operation policies, pure reactions and awaitable cleanup.
 The guide distinguishes lossless local recordings from explicitly non-replayable support artifacts
 and documents byte-limit, privacy and cancellation boundaries.
+
+See [execution capacity and the broader runtime audit](./EXECUTION.md) for overload behavior,
+navigation cleanup, React selector corrections and reproducible execution measurements.
