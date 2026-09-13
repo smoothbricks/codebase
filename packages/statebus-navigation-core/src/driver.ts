@@ -35,63 +35,66 @@ export interface NavigationChannel<Target, Location> {
   read(): NavigationState<Target, Location>;
 }
 
-/** Composition-owned wiring only. Admission, guards and transition decisions live in the reducer. */
-export function connectNavigation<Target, Location>(options: {
+export interface NavigationConnectionOptions<Target, Location> {
   readonly channel: NavigationChannel<Target, Location>;
   readonly driver: NavigationDriver<Target, Location>;
-}): () => void {
+  /** Programmer/adapter failures, not normal navigation outcomes. */
+  readonly onError?: (cause: unknown) => void;
+  /** The composed runtime can track actual asynchronous driver completion. */
+  readonly trackExecution?: (task: Promise<void>) => void;
+}
+
+/** Composition-owned wiring only. Admission, guards and transition decisions live in the reducer. */
+export function connectNavigation<Target, Location>(
+  options: NavigationConnectionOptions<Target, Location>,
+): () => void {
   let disposed = false;
   let lastStarted: NavigationRequestId | undefined;
   let activeScope: AbortController | undefined;
   const { channel, driver } = options;
-  // Read before installing listeners so a faulty adapter cannot leave a half-installed connection.
-  const initialLocation = driver.current();
-  const stopLocation = driver.subscribe((observation) => {
-    if (!disposed) channel.publish({ type: 'locationObserved', ...observation });
-  });
-  let stopRequests: () => void;
-  try {
-    stopRequests = channel.subscribe((event) => {
-      if (disposed) return;
-      const state = channel.read();
-      const operation = state.operation;
-      if (
-        activeScope &&
-        ((operation.kind !== 'requested' && operation.kind !== 'dispatched') ||
-          operation.request.requestId !== lastStarted)
-      ) {
-        activeScope.abort();
-        activeScope = undefined;
-      }
-      if (event.type !== 'navigationRequested' && event.type !== 'navigationConfirmed') return;
-      const id = event.type === 'navigationRequested' ? event.request.requestId : event.requestId;
-      const request = admittedNavigation(state, id);
-      if (!request || lastStarted === id) return;
-      lastStarted = id;
-      activeScope?.abort();
-      activeScope = new AbortController();
-      execute(request, activeScope.signal);
-    });
-  } catch (cause) {
-    stopLocation();
-    throw cause;
+  let stopLocation: (() => void) | undefined;
+  let stopRequests: (() => void) | undefined;
+  function report(cause: unknown): void {
+    try {
+      if (options.onError) options.onError(cause);
+      else console.error('StateBus navigation boundary failure', cause);
+    } catch {
+      // A failed observer must not convert a handled async error into an unhandled rejection.
+    }
   }
-  try {
-    channel.publish({ type: 'locationObserved', source: 'initial', location: initialLocation });
-  } catch (cause) {
-    stopRequests();
-    stopLocation();
-    throw cause;
+  function release(stop: (() => void) | undefined): void {
+    try {
+      stop?.();
+    } catch (cause) {
+      report(cause);
+    }
   }
-
+  function abort(): void {
+    const scope = activeScope;
+    activeScope = undefined;
+    scope?.abort();
+  }
+  function dispose(): void {
+    if (disposed) return;
+    disposed = true;
+    abort();
+    release(stopRequests);
+    release(stopLocation);
+    stopRequests = undefined;
+    stopLocation = undefined;
+  }
   function execute(request: NavigationRequest<Target>, signal: AbortSignal): void {
     const finish = (outcome: NavigationOutcome) => {
       if (disposed || signal.aborted || lastStarted !== request.requestId) return;
-      channel.publish(
-        outcome.kind === 'dispatched'
-          ? { type: 'navigationDispatched', requestId: request.requestId }
-          : { type: 'navigationFailed', requestId: request.requestId, error: outcome.error },
-      );
+      try {
+        channel.publish(
+          outcome.kind === 'dispatched'
+            ? { type: 'navigationDispatched', requestId: request.requestId }
+            : { type: 'navigationFailed', requestId: request.requestId, error: outcome.error },
+        );
+      } catch (cause) {
+        report(cause);
+      }
     };
     const failed = () => finish(DRIVER_FAILED);
     let outcome: NavigationOutcome | Promise<NavigationOutcome>;
@@ -101,19 +104,59 @@ export function connectNavigation<Target, Location>(options: {
       failed();
       return;
     }
-    // Synchronous history implementations need no promise/microtask just to acknowledge a write.
+    // Synchronous history writes still need no Promise to acknowledge a write.
     if ('kind' in outcome) finish(outcome);
-    else void outcome.then(finish, failed);
+    else {
+      const task = outcome.then(finish, failed);
+      // Observe first, then expose completion to a caller hook that itself may throw.
+      void task.catch(report);
+      try {
+        options.trackExecution?.(task);
+      } catch (cause) {
+        report(cause);
+      }
+    }
   }
-
-  return () => {
-    if (disposed) return;
-    disposed = true;
-    activeScope?.abort();
-    activeScope = undefined;
-    stopRequests();
-    stopLocation();
-  };
+  try {
+    const initialLocation = driver.current();
+    stopLocation = driver.subscribe((observation) => {
+      if (!disposed) {
+        try {
+          channel.publish({ type: 'locationObserved', ...observation });
+        } catch (cause) {
+          report(cause);
+        }
+      }
+    });
+    stopRequests = channel.subscribe((event) => {
+      if (disposed) return;
+      const state = channel.read();
+      const operation = state.operation;
+      const observedRequest = lastStarted;
+      if (
+        activeScope &&
+        ((operation.kind !== 'requested' && operation.kind !== 'dispatched') ||
+          operation.request.requestId !== lastStarted)
+      )
+        abort();
+      // Abort observers can synchronously submit newer navigation through a host port.
+      if (disposed || lastStarted !== observedRequest) return;
+      if (event.type !== 'navigationRequested' && event.type !== 'navigationConfirmed') return;
+      const id = event.type === 'navigationRequested' ? event.request.requestId : event.requestId;
+      const request = admittedNavigation(state, id);
+      if (!request || lastStarted === id) return;
+      lastStarted = id;
+      abort();
+      if (disposed || lastStarted !== id) return;
+      activeScope = new AbortController();
+      execute(request, activeScope.signal);
+    });
+    channel.publish({ type: 'locationObserved', source: 'initial', location: initialLocation });
+  } catch (cause) {
+    dispose();
+    throw cause;
+  }
+  return dispose;
 }
 
 const DRIVER_FAILED: NavigationOutcome = Object.freeze({

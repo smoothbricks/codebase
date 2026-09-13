@@ -2,7 +2,7 @@ import { computed as computedSignal } from '@tldraw/state';
 
 import type { ReadonlyState, StateBusReader, StateKeys } from './types.js';
 
-export type ViewPrimitiveProp = undefined | null | string | number;
+export type ViewPrimitiveProp = undefined | null | boolean | string | number;
 export type ViewProps = ViewPrimitiveProp | Readonly<Record<string, ViewPrimitiveProp>>;
 export type ViewFunction<SK extends StateKeys, Props extends ViewProps, R> = (
   states: Pick<ReadonlyState, SK>,
