@@ -25,7 +25,12 @@ export function redactSupport(reason: RedactionReason): RedactedValue {
 }
 /** Internal result identity; never inspect untrusted object fields to recognize a refusal. */
 export function isRedactedSupport(value: unknown): boolean {
-  return value === markers.unclassified || value === markers.secret || value === markers.excluded || value === markers.consent;
+  return (
+    value === markers.unclassified ||
+    value === markers.secret ||
+    value === markers.excluded ||
+    value === markers.consent
+  );
 }
 export function publicSupport<T>(project: (value: T) => unknown): SupportPolicy<T> {
   return (value) => ({ kind: 'public', value: project(value) });
