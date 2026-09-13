@@ -20,7 +20,6 @@ import {
 const journal = recordRollingScenario(runtime, {
   maxEvents: 512,
   maxEventBytes: 1024 * 1024,
-  maxEffects: 128,
   maxEffectBytes: 512 * 1024,
 });
 
@@ -54,34 +53,20 @@ The defaults are:
 | --- | ---: | --- |
 | `maxEvents` | 1,024 | Publications in retained complete waves |
 | `maxEventBytes` | 2 MiB | Sum of encoded retained wave records |
-| `maxEffects` | 256 | Retained instruction/outcome records |
 | `maxEffectBytes` | 1 MiB | Sum of instruction/outcome records with sequence and wave framing |
 | `maxCheckpointBytes` | 4 MiB | Encoded checkpoint, including declarations and retained cells |
-| `maxCaptureBytes` | 8 MiB | Complete rolling capture, including outer framing |
+| `maxCaptureBytes` | 8 MiB | Fully materialized rolling capture |
 | `maxEntryBytes` | 256 KiB | An encoded event, checkpoint entry or framed effect record |
 
-All limits must be positive safe integers; queue capacities must also fit the JavaScript array
-index range. Configuration owns startup memory costs: do not specify needlessly large capacities.
-The two stream byte counters count their records, not outer array/envelope framing. The recorder
-combines those exact section sizes and framing before materializing a cold capture, so an oversized
-export does not first allocate checkpoint arrays or traverse all retained payloads again.
-`createCaptureEnvelope` additionally checks its own `maxBytes`, including application/manifest metadata.
-
-Wave and effect queues allocate their slots once at recorder setup and reuse them across eviction
-and reset. Removed slots are cleared, not deleted. No suffix copying or per-record size wrapper is
-needed; numeric byte sizes have separate fixed storage. Captured payloads remain detached and
-immutable, never recycled while a caller may retain them. Checkpoint setup reuses already-owned
-entries; existing cells are replaced without deleting/reinserting their Map keys. These are source
-level work reductions, not measured bytes/op or latency improvements.
+All limits must be positive safe integers. The whole-capture check includes outer envelope framing;
+the two stream counters are not estimates of the final artifact size. `createCaptureEnvelope`
+also checks its own `maxBytes`, including application and manifest metadata.
 
 An indivisible wave or record that cannot fit is refused, not truncated into something labeled
-replayable. The checkpoint's total bound is checked after the whole atomic wave: adding a new
-address before removing the old one must not cause a false refusal when final state fits.
-A growing checkpoint refusal disposes the interpreter and clears partial checkpoint/journal payloads.
-The production wave has already committed: capture failure must not suppress admitted operations or
-roll production state back. `stats().refusal` exposes the recorded failure, and `snapshot()` throws
-`CaptureError` until an explicit successful `reset()`. A cold-export size refusal alone does not
-stop recording. `stats().effects` reports retained instruction/outcome count alongside its byte total.
+replayable. A checkpoint that grows beyond its bound also refuses recording and disposes the
+checkpoint interpreter. The production wave has already committed: capture failure must not
+suppress admitted operations or roll production state back. `stats().refusal` exposes the recorded
+failure, and `snapshot()` throws `CaptureError` until an explicit successful `reset()`.
 
 `reset()` starts from current state at a quiescent event queue and clears retained history.
 `dispose()` removes recorder observation and the replay interpreter. Already returned snapshots
@@ -269,13 +254,6 @@ contract. It is not a substitute for these explicit field/ID/metadata projection
 
 ## Execution policies, reactions and cleanup
 
-See [EXECUTION.md](./EXECUTION.md) for the current admission-capacity defaults, overload outcomes,
-listener-cycle recovery, navigation lifetime contract and separately measured execution benchmark.
-`operations.maxPending` bounds queued plus actual running work per effect binding (default 1024),
-including aborted operations that have not settled. Capacity refusal uses `EffectCapacityError`
-through the application's existing failure mapper and decoder; it never silently drops an admitted
-command. This is separate from journal retention limits.
-
 The existing effect boundary now accepts either `execute`, returning one value or Promise, or
 `stream`, returning an iterable or async iterable. The distinction is explicit: an array-shaped
 outcome from `execute` is one value, not a stream. Direct values and synchronous operation failures
@@ -303,10 +281,9 @@ either wait pending, and client cancellation cannot roll back a server mutation.
 
 For pure cross-library follow-up publications, use `scope.react(source, target, project)`.
 The projector reads batch-final state and emits into a successor wave without inventing an I/O
-operation. Both handles must belong to the composition; cross-library handles can be supplied
-through typed capabilities. Publishing a public command does not grant permission to write its
-owner's state directly. `maxReactionSteps` bounds total reaction fanout per causal root, not just
-depth. A later asynchronous effect result starts a new causal root.
+operation. Targets remain owned by the declaring library; sources can be supplied through typed
+capabilities. `maxReactionSteps` bounds total reaction fanout per causal root, not just depth.
+A later asynchronous effect result starts a new causal root.
 
 A library marks required interpreters with `scope.requireEffect(defineEffect(...))`.
 After binding operations, call `runtime.assertReady()`. Composition-bound React providers do
@@ -323,33 +300,11 @@ Run `nx lint statebus-core` before `nx test statebus-core`. The existing test de
 `nx run statebus-core:verify-packages`; no alternate preview workflow is required.
 
 That verifier uses real tarballs, strict public declarations and native Typia-generated validators
-under Node and Bun with both isolated and hoisted consumer installations. Its ten composed
-programs are `scenario`, `edge-cases`, `capture-scenarios`, `execution-scenarios`, `support-edges`,
-`journal-edges`, `loader-edges`, `runtime-edges`, `navigation-edges` and `aggregate-edges`. They cover generated long
-streams, byte pressure, rollback, immutable captures, typed migrations, operation policy/cleanup,
-replay without I/O, support privacy, malformed-envelope rejection, atomic checkpoint relocation,
-queue wrap/reset, pre-materialization refusal, execution overload/reentrancy and navigation cleanup.
+under Node and Bun with both isolated and hoisted consumer installations. Its five composed
+programs are `scenario`, `edge-cases`, `capture-scenarios`, `execution-scenarios` and `support-edges`.
+They cover generated long streams, byte pressure, rollback, immutable captures, typed migrations,
+operation policy/cleanup, replay without I/O, support privacy and malformed envelope rejection.
 
 Byte counters are canonical JSON UTF-8, not live heap, GC, latency or allocation measurements.
 Changed-cell encoding and checkpoint materialization counters describe that work only. No
 zero-allocation or engine-optimization claim follows from these tests.
-
-The journal's capacity is **not** a runtime-wide memory guarantee. Effects and composed query
-loaders now share `maxPendingWork` across bindings, in addition to each effect's local limit.
-Composed runtime `maxWavesPerFlush` stops runaway imperative cascades at complete-wave boundaries
-and retains the paused queue for explicit recovery. Application state, pending event storage, one
-wave's size and elapsed execution time remain outside those bounds.
-See EXECUTION.md for the measured synthetic allocation/timing comparison and its limits; journal
-byte accounting alone does not establish those performance results.
-
-A performance acceptance run must separate unrecorded composed dispatch, active effects, retained
-recording/eviction and cold export. Report actual allocation/GC evidence and tail latency separately
-from logical byte/count bounds. The existing exact-interest diagnostics do not measure all those
-paths. Reusing journal slots does not make owned payload capture or JavaScript execution allocation-free.
-
-
-Aggregate execution admission is configured with `RuntimeOptions.maxPendingWork` (default 4096).
-All effect and composed QueryClient bindings in the same runtime share it; cancelled-but-unsettled
-work still counts, and rebinding cannot bypass it. See [aggregate admission](./EXECUTION.md#aggregate-runtime-admission)
-for exact read/retry semantics, `RuntimeCapacityError`, the `runtime.work` execution-boundary port,
-and the distinction between admitted work and pending event storage.
