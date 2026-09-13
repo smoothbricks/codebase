@@ -200,7 +200,14 @@ try {
       stdio: 'inherit',
     });
     // Both runners select built StateBus exports and development React for act/StrictMode.
-    for (const executable of ['scenario', 'edge-cases', 'capture-scenarios', 'execution-scenarios', 'support-edges'])
+    for (const executable of [
+      'scenario',
+      'edge-cases',
+      'capture-scenarios',
+      'execution-scenarios',
+      'support-edges',
+      'journal-edges',
+    ])
       for (const runner of ['node', 'bun'])
         run(`${linker}: ${runner} ${executable}`, runner, [join(consumer, 'dist', 'composed', `${executable}.js`)], {
           cwd: consumer,
@@ -234,6 +241,7 @@ try {
           'owned codec migrations and causal positions',
           'typed execution policies, reactions and awaitable cleanup',
           'deny-default support metadata, IDs and portable failures',
+          'fixed journal capacity, atomic checkpoint bounds and pre-materialization refusal',
         ],
       },
       null,

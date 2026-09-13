@@ -17,6 +17,8 @@ import {
 export interface RollingCaptureLimits {
   readonly maxEvents: number;
   readonly maxEventBytes: number;
+  /** Maximum retained instruction/outcome records; reserves queue slots at setup. Default: 256. */
+  readonly maxEffects: number;
   /** Includes captured instructions/outcomes and their causal framing, not just payloads. */
   readonly maxEffectBytes: number;
   readonly maxCheckpointBytes: number;
@@ -26,6 +28,7 @@ export interface RollingCaptureLimits {
 const defaults: RollingCaptureLimits = Object.freeze({
   maxEvents: 1024,
   maxEventBytes: 2 * 1024 * 1024,
+  maxEffects: 256,
   maxEffectBytes: 1024 * 1024,
   maxCheckpointBytes: 4 * 1024 * 1024,
   maxCaptureBytes: 8 * 1024 * 1024,
@@ -47,6 +50,7 @@ export interface RollingScenario extends RecordedScenario {
 export interface RollingCaptureStats {
   readonly events: number;
   readonly eventBytes: number;
+  readonly effects: number;
   readonly effectBytes: number;
   readonly checkpointBytes: number;
   readonly checkpointWave: number;
@@ -68,36 +72,62 @@ export interface RollingScenarioRecorder {
   dispose(): void;
 }
 
-/** A cursor queue releases retired references; compaction is amortized, never a shift per publication. */
-class Journal<T> {
-  private items: (T | undefined)[] = [];
+/** Fixed queue storage. Retiring a record never copies the suffix or allocates a size wrapper. */
+class Journal<T extends object> {
+  private readonly items: (T | undefined)[] = [];
+  private readonly sizes: Float64Array;
   private start = 0;
-  get length(): number {
-    return this.items.length - this.start;
+  private count = 0;
+  private retainedBytes = 0;
+
+  constructor(private readonly capacity: number) {
+    if (!Number.isSafeInteger(capacity) || capacity < 1 || capacity > 0xffff_ffff)
+      throw new RangeError('Journal capacity must fit the array index range.');
+    // Initialize actual elements rather than holes. These two buffers never grow or shrink.
+    this.sizes = new Float64Array(capacity);
+    for (let index = 0; index < capacity; index++) this.items.push(undefined);
   }
-  push(item: T): void {
-    this.items.push(item);
+  get length(): number {
+    return this.count;
+  }
+  get bytes(): number {
+    return this.retainedBytes;
+  }
+  push(item: T, bytes: number): void {
+    if (this.count === this.capacity) throw new Error('Journal capacity invariant violated.');
+    let index = this.start + this.count;
+    if (index >= this.capacity) index -= this.capacity;
+    this.items[index] = item;
+    this.sizes[index] = bytes;
+    this.retainedBytes += bytes;
+    this.count++;
   }
   take(): T | undefined {
-    if (this.start === this.items.length) return undefined;
+    if (this.count === 0) return undefined;
     const item = this.items[this.start];
-    this.items[this.start++] = undefined;
-    if (this.start >= 64 && this.start * 2 >= this.items.length) {
-      this.items = this.items.slice(this.start);
-      this.start = 0;
-    }
+    if (item === undefined) throw new Error('Missing retained journal record.');
+    this.items[this.start] = undefined;
+    this.retainedBytes -= this.sizes[this.start];
+    this.sizes[this.start] = 0;
+    this.start++;
+    if (this.start === this.capacity) this.start = 0;
+    this.count--;
     return item;
   }
-  values(): T[] {
+  values(): readonly T[] {
     const values: T[] = [];
-    for (let index = this.start; index < this.items.length; index++) {
-      const item = this.items[index];
-      if (item !== undefined) values.push(item);
+    let position = this.start;
+    for (let index = 0; index < this.count; index++) {
+      const item = this.items[position];
+      if (item === undefined) throw new Error('Missing retained journal record.');
+      values.push(item);
+      position++;
+      if (position === this.capacity) position = 0;
     }
-    return values;
+    return Object.freeze(values);
   }
   clear(): void {
-    this.items.length = 0;
+    for (let remaining = this.count; remaining > 0; remaining--) this.take();
     this.start = 0;
   }
 }
@@ -108,6 +138,9 @@ interface Sized<T> {
 interface CellIndex {
   readonly declaration: StateDeclaration;
   readonly entries: Map<string | number | undefined, Sized<EncodedStateEntry>>;
+}
+function compareCellIds(left: string | number | undefined, right: string | number | undefined): number {
+  return left === undefined || right === undefined ? 0 : compareResourceIds(left, right);
 }
 
 /**
@@ -130,8 +163,9 @@ export function recordRollingScenario(
         owner: metadata.owner,
         declaration: metadata.name,
       });
-  const journal = new Journal<Sized<RecordedWave>>();
-  const effects = new Journal<Sized<RecordedEffectPosition>>();
+  // Every retained wave has at least one event, so maxEvents also bounds wave slots.
+  const journal = new Journal<RecordedWave>(limits.maxEvents);
+  const effects = new Journal<RecordedEffectPosition>(limits.maxEffects);
   const cells = new Map<string, CellIndex>();
   const dirty = new Map<StateDeclaration, Set<string | number | undefined>>();
   const dirtyStates: (StateDeclaration | undefined)[] = [];
@@ -139,8 +173,6 @@ export function recordRollingScenario(
   let mirror: ComposedRuntime;
   let checkpointWave = 0;
   let eventCount = 0;
-  let eventBytes = 0;
-  let effectBytes = 0;
   let checkpointBytes = 0;
   let evictedWaves = 0;
   let evictedEffects = 0;
@@ -159,21 +191,22 @@ export function recordRollingScenario(
   }
   function checkpoint(): StateCheckpoint {
     materializations++;
+    const states = [];
+    for (const [key, cell] of cells) {
+      const entries: EncodedStateEntry[] = [];
+      // Sort primitive keys, not temporary [key, value] pairs for every cell.
+      const ids = [...cell.entries.keys()].sort(compareCellIds);
+      for (const id of ids) {
+        const entry = cell.entries.get(id);
+        if (!entry) throw new Error('Missing checkpoint cell.');
+        entries.push(entry.value);
+      }
+      states.push(Object.freeze({ key, entries: Object.freeze(entries) }));
+    }
     return Object.freeze({
       formatVersion: 1,
       schema: runtime.composition.metadata,
-      states: Object.freeze(
-        [...cells].map(([key, cell]) =>
-          Object.freeze({
-            key,
-            entries: Object.freeze(
-              [...cell.entries]
-                .sort(([a], [b]) => (a === undefined || b === undefined ? 0 : compareResourceIds(a, b)))
-                .map(([, entry]) => entry.value),
-            ),
-          }),
-        ),
-      ),
+      states: Object.freeze(states),
     });
   }
   function initialize(): ComposedRuntime {
@@ -189,16 +222,19 @@ export function recordRollingScenario(
       { ...initial, states: initial.states.map((state) => ({ key: state.key, entries: [] })) },
       limits.maxCheckpointBytes,
     );
-    for (const declaration of runtime.composition.states) {
-      const state = initial.states.find((entry) => entry.key === declaration.metadata.key);
-      if (!state) throw new Error('Missing initial checkpoint declaration.');
+    for (let position = 0; position < runtime.composition.states.length; position++) {
+      const declaration = runtime.composition.states[position];
+      const state = initial.states[position];
+      if (!state || state.key !== declaration.metadata.key)
+        throw new Error('Initial checkpoint declaration order differs from composition.');
       const entries: CellIndex['entries'] = new Map();
       cells.set(state.key, { declaration, entries });
       for (const entry of state.entries) {
-        const owned = sizedEntry(entry);
-        checkpointBytes += owned.bytes + (entries.size > 0 ? 1 : 0);
+        // captureCheckpoint already detached and froze these entries. Do not copy them again.
+        const bytes = captureBytes(entry, limits.maxEntryBytes);
+        checkpointBytes += bytes + (entries.size > 0 ? 1 : 0);
         bound(checkpointBytes, limits.maxCheckpointBytes, 'checkpoint');
-        entries.set(declaration.entryId(entry), owned);
+        entries.set(declaration.entryId(entry), { value: entry, bytes });
         encodedEntries++;
       }
     }
@@ -228,11 +264,16 @@ export function recordRollingScenario(
       cause instanceof CaptureError
         ? cause.issue
         : Object.freeze({ code: 'incomplete', boundary: 'checkpoint interpreter' });
-    // Do not keep an unbounded/invalid interpreter alive after a refused checkpoint.
     mirror.dispose();
     dirty.clear();
     dirtyStates.length = 0;
     dirtyCount = 0;
+    // Refusal must release oversized/partial retained data, not merely hide it behind snapshot().
+    cells.clear();
+    journal.clear();
+    effects.clear();
+    eventCount = 0;
+    checkpointBytes = 0;
     runtime.reportError(new CaptureError(refusal, { cause }));
   }
   function advance(wave: RecordedWave): void {
@@ -249,21 +290,24 @@ export function recordRollingScenario(
         const before = index.entries.get(id);
         const next = declaration.captureEntry(mirror, id);
         const after = next && sizedEntry(next);
-        if (before) {
-          checkpointBytes -= before.bytes + (index.entries.size > 1 ? 1 : 0);
-          index.entries.delete(id);
-        }
         if (after) {
-          checkpointBytes += after.bytes + (index.entries.size > 0 ? 1 : 0);
-          bound(checkpointBytes, limits.maxCheckpointBytes, 'rolling checkpoint');
+          bound(after.bytes, limits.maxCheckpointBytes, 'rolling checkpoint entry');
+          checkpointBytes += after.bytes - (before?.bytes ?? 0) + (!before && index.entries.size > 0 ? 1 : 0);
+          // Replacing an existing cell does not delete/reinsert its Map key.
           index.entries.set(id, after);
           encodedEntries++;
+        } else if (before) {
+          checkpointBytes -= before.bytes + (index.entries.size > 1 ? 1 : 0);
+          index.entries.delete(id);
         }
       }
       ids.clear();
       dirtyStates[dirtyPosition] = undefined;
     }
     dirtyCount = 0;
+    // A successful wave is atomic. Add-before-delete relocation must be checked at its final size,
+    // not refused because a transient prefix happens to contain both the old and new addresses.
+    bound(checkpointBytes, limits.maxCheckpointBytes, 'rolling checkpoint');
     checkpointWave = wave.wave;
     evictedWaves++;
   }
@@ -274,14 +318,11 @@ export function recordRollingScenario(
       capture,
     });
     const bytes = captureBytes(value, Math.min(limits.maxEntryBytes, limits.maxEffectBytes));
-    while (effectBytes + bytes > limits.maxEffectBytes) {
-      const removed = effects.take();
-      if (!removed) throw new Error('Invalid effect journal accounting.');
-      effectBytes -= removed.bytes;
+    while (effects.length === limits.maxEffects || effects.bytes + bytes > limits.maxEffectBytes) {
+      if (!effects.take()) throw new Error('Invalid effect journal accounting.');
       evictedEffects++;
     }
-    effects.push({ value, bytes });
-    effectBytes += bytes;
+    effects.push(value, bytes);
   }
   const observer: WaveObserver = {
     committed(wave, queue, length) {
@@ -304,16 +345,14 @@ export function recordRollingScenario(
         if (events.length === 0) return;
         const value: RecordedWave = Object.freeze({ wave, events: Object.freeze(events) });
         // Evict BEFORE append; an oversized incoming whole wave is refused without dropping its prefix.
-        while (eventCount + events.length > limits.maxEvents || eventBytes + bytes > limits.maxEventBytes) {
+        while (eventCount + events.length > limits.maxEvents || journal.bytes + bytes > limits.maxEventBytes) {
           const removed = journal.take();
           if (!removed) throw new Error('Invalid journal accounting.');
-          advance(removed.value);
-          eventCount -= removed.value.events.length;
-          eventBytes -= removed.bytes;
+          advance(removed);
+          eventCount -= removed.events.length;
         }
-        journal.push({ value, bytes });
+        journal.push(value, bytes);
         eventCount += events.length;
-        eventBytes += bytes;
       } catch (cause) {
         refuse(cause);
       }
@@ -334,8 +373,9 @@ export function recordRollingScenario(
     stats: () =>
       Object.freeze({
         events: eventCount,
-        eventBytes,
-        effectBytes,
+        eventBytes: journal.bytes,
+        effects: effects.length,
+        effectBytes: effects.bytes,
         checkpointBytes,
         checkpointWave,
         evictedWaves,
@@ -347,19 +387,35 @@ export function recordRollingScenario(
     snapshot() {
       if (refusal) throw new CaptureError(refusal);
       if (!runtime.disposed && !runtime.idle) throw new Error('Snapshot requires a quiescent event queue.');
-      // This is a user-requested cold materialization, not a per-wave whole-state copy.
-      bound(checkpointBytes + eventBytes + effectBytes, limits.maxCaptureBytes, 'capture envelope');
-      const value: RollingScenario = Object.freeze({
+      const framing = captureBytes({
         formatVersion: 1,
-        checkpoint: checkpoint(),
+        checkpoint: null,
         checkpointWave,
-        waves: Object.freeze(journal.values().map((entry) => entry.value)),
-        effects: Object.freeze(effects.values().map((entry) => entry.value)),
+        waves: [],
+        effects: [],
         evictedEffects,
         complete: true,
       });
-      captureBytes(value, limits.maxCaptureBytes);
-      return value;
+      // Replace null (4 bytes) and add the retained array contents/commas. Section sizes are
+      // already known: refuse the exact whole envelope before materializing any checkpoint arrays.
+      const bytes =
+        framing -
+        4 +
+        checkpointBytes +
+        journal.bytes +
+        Math.max(0, journal.length - 1) +
+        effects.bytes +
+        Math.max(0, effects.length - 1);
+      bound(bytes, limits.maxCaptureBytes, 'capture envelope');
+      return Object.freeze({
+        formatVersion: 1,
+        checkpoint: checkpoint(),
+        checkpointWave,
+        waves: journal.values(),
+        effects: effects.values(),
+        evictedEffects,
+        complete: true,
+      });
     },
     outcomeSink<C, P extends EffectPlan, O, R>(definition: EffectDefinition<C, P, O, R>) {
       runtime.assertOwner(definition.command.ownerToken);
@@ -395,15 +451,7 @@ export function recordRollingScenario(
       mirror.dispose();
       journal.clear();
       effects.clear();
-      eventCount =
-        eventBytes =
-        effectBytes =
-        evictedWaves =
-        evictedEffects =
-        encodedEntries =
-        materializations =
-        sequence =
-          0;
+      eventCount = evictedWaves = evictedEffects = encodedEntries = materializations = sequence = 0;
       refusal = undefined;
       try {
         mirror = initialize();
