@@ -892,7 +892,7 @@ async function createProjectTargets(
       executor: '@smoothbricks/nx-plugin:typescript-emit',
       cache: true,
       inputs: ['production', '^production', ...TYPESCRIPT_TOOLCHAIN_INPUTS, '{projectRoot}/tsconfig.lib.json'],
-      outputs: inferTypescriptOutputs(libTsconfigPath, packageJsonPath),
+      outputs: inferTypescriptOutputs(libTsconfigPath, packageJsonPath, declaredTargets),
       dependsOn: ['^*-js', ...(cargoWasmConfig ? ['cargo-wasm'] : [])],
       options: {
         ...(executableOutputs.length > 0 ? { executableOutputs } : {}),
@@ -1731,22 +1731,46 @@ interface ResolvedNapiConfig {
   targets: string[];
 }
 
-function inferTypescriptOutputs(tsconfigPath: string, packageJsonPath: string): string[] {
+const TYPESCRIPT_EMIT_EXTENSIONS = ['js', 'cjs', 'mjs', 'jsx', 'd.ts', 'd.cts', 'd.mts'];
+
+function inferTypescriptOutputs(
+  tsconfigPath: string,
+  packageJsonPath: string,
+  declaredTargets: Record<string, unknown>,
+): string[] {
   const tsconfig: unknown = readJsonFile(tsconfigPath);
   const compilerOptions = isRecord(tsconfig) && isRecord(tsconfig.compilerOptions) ? tsconfig.compilerOptions : null;
   const outDir = compilerOptions?.outDir;
-  if (typeof outDir !== 'string' || outDir.length === 0) {
-    // No .tsbuildinfo here: the emit executor overlays incremental: false, so
-    // tsc-js never writes one and a declared-but-absent output fails the
-    // release-candidate output inspection.
-    return ['{projectRoot}/dist/**/*.{js,cjs,mjs,jsx,d.ts,d.cts,d.mts}{,.map}'];
+  let directory = 'dist';
+  if (typeof outDir === 'string' && outDir.length > 0) {
+    directory = posix.normalize(outDir.replaceAll('\\', '/'));
+    if (directory === '.' || directory === '..' || directory.startsWith('../') || directory.startsWith('/')) {
+      throw new Error(`${packageJsonPath}: tsconfig.lib.json compilerOptions.outDir must stay inside the project`);
+    }
   }
 
-  const normalized = posix.normalize(outDir.replaceAll('\\', '/'));
-  if (normalized === '.' || normalized === '..' || normalized.startsWith('../') || normalized.startsWith('/')) {
-    throw new Error(`${packageJsonPath}: tsconfig.lib.json compilerOptions.outDir must stay inside the project`);
-  }
-  return [`{projectRoot}/${normalized}`];
+  // Nx deletes a cache hit's declared outputs before restoring them, so a
+  // claim on the whole outDir also deleted whatever a sibling bundler emitted
+  // there (tsdown's .mjs/.d.mts) whenever tsc-js restored after it. Claim only
+  // the file families tsc emits that no other declared target already owns.
+  // No .tsbuildinfo: the emit executor overlays incremental: false, so tsc-js
+  // never writes one and a declared-but-absent output fails the
+  // release-candidate output inspection.
+  const siblingOutputs = Object.entries(declaredTargets).flatMap(([name, target]) =>
+    name !== 'tsc-js' && isRecord(target) && Array.isArray(target.outputs)
+      ? target.outputs.flatMap((output) =>
+          typeof output === 'string' && output.startsWith('{projectRoot}/')
+            ? [output.slice('{projectRoot}/'.length)]
+            : [],
+        )
+      : [],
+  );
+  const owned = TYPESCRIPT_EMIT_EXTENSIONS.filter((extension) =>
+    [`${directory}/emitted.${extension}`, `${directory}/emitted.${extension}.map`].every((file) =>
+      siblingOutputs.every((output) => !file.startsWith(`${output}/`) && !posix.matchesGlob(file, output)),
+    ),
+  );
+  return owned.length === 0 ? [] : [`{projectRoot}/${directory}/**/*.{${owned.join(',')}}{,.map}`];
 }
 
 function resolveNapiConfig(

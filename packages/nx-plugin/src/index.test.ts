@@ -265,6 +265,36 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
     }
   });
 
+  it('leaves a sibling bundler sole owner of the files it emits into the same outDir', async () => {
+    // Nx deletes a cache hit's declared outputs before restoring them. A tsc-js
+    // claim on the whole outDir deleted tsdown's .mjs/.d.mts whenever tsc-js
+    // restored after tsdown-js, and put back whatever its own snapshot held.
+    const workspace = await createWorkspace();
+    try {
+      await workspace.write(
+        'packages/example/package.json',
+        JSON.stringify({
+          name: 'example',
+          nx: {
+            targets: {
+              'tsdown-js': {
+                command: 'tsdown',
+                outputs: ['{projectRoot}/dist/**/*.mjs', '{projectRoot}/dist/**/*.d.mts'],
+              },
+            },
+          },
+        }),
+      );
+      await workspace.write('packages/example/tsconfig.lib.json', '{"compilerOptions":{"outDir":"dist"}}\n');
+
+      const targets = await inferProjectTargets(workspace, 'packages/example/package.json');
+
+      expect(targets['tsc-js']?.outputs).toEqual(['{projectRoot}/dist/**/*.{js,cjs,jsx,d.ts,d.cts}{,.map}']);
+    } finally {
+      await workspace.cleanup();
+    }
+  });
+
   it('hashes the manifests without their versions for checks, raw for artifacts', async () => {
     const workspace = await createWorkspace();
     try {
@@ -1195,7 +1225,9 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       const targets = await inferProjectTargets(workspace, 'packages/cowshed/package.json');
 
       expect(targets['cargo-wasm']).toBeUndefined();
-      expect(targets['tsc-js']?.outputs).toEqual(['{projectRoot}/dist/ts']);
+      expect(targets['tsc-js']?.outputs).toEqual([
+        '{projectRoot}/dist/ts/**/*.{js,cjs,mjs,jsx,d.ts,d.cts,d.mts}{,.map}',
+      ]);
       // This fixture declares all four supported triples, so on EVERY supported
       // runner the host's own triple is present and native: the host provider is
       // that platform target and `cargo-napi` is never inferred. Tying the native
