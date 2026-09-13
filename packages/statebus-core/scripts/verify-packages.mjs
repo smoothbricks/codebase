@@ -175,6 +175,7 @@ try {
       'journal-edges',
       'loader-edges',
       'runtime-edges',
+      'aggregate-edges',
       'navigation-edges',
     ])
       for (const runner of ['node', 'bun'])
@@ -208,6 +209,7 @@ try {
           'rolling checkpoint and effect retention',
           'owned codec migrations and causal positions',
           'typed execution policies, reactions and awaitable cleanup',
+          'aggregate runtime admission across effects and query loaders',
           'deny-default support metadata, IDs and portable failures',
           'fixed journal capacity, atomic checkpoint bounds and pre-materialization refusal',
           'loader setup rollback, failure handling and transport drain',

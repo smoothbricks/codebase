@@ -32,7 +32,7 @@ const observer = new PerformanceObserver((list) => {
 });
 observer.observe({ entryTypes: ['gc'] });
 
-function model(policy) {
+function model(policy, maxPendingWork) {
   const definition = defineLibrary({
     name: 'execution-benchmark',
     requires: [],
@@ -53,6 +53,7 @@ function model(policy) {
   const errors = [];
   const runtime = composeLibraries(mount).createRuntime({
     scheduler: new ManualScheduler(),
+    maxPendingWork,
     onError: (error) => errors.push(error),
   });
   return { runtime, errors, ...mount.exports };
@@ -63,7 +64,7 @@ function sumProfile(node) {
   return bytes;
 }
 async function run(keys) {
-  const { runtime, errors, command, effect } = model('latest-wins');
+  const { runtime, errors, command, effect } = model('latest-wins', keys + count + 1024);
   const operation = Promise.withResolvers();
   let calls = 0;
   const binding = bindEffect(runtime, effect, {

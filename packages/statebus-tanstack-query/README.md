@@ -101,3 +101,20 @@ Runtime job/count/grace lookups use the core's structural interest index, not JS
 encodes an address only when creating a new logical request. Renewing/releasing demand for already-bound work needs no
 address serialization. QueryClient query hashing is its own request/cache boundary, not the StateBus read/render path.
 The published request keeps its typed structural address for diagnostics and stale-result checks.
+
+
+## Shared runtime work capacity
+
+`bindComposedQueryLoader` uses the runtime's `maxPendingWork` budget automatically, shared with all
+other effect and query bindings. One logical read owns its slot from before query/observer setup
+until its QueryClient waiter **and** actual transport settle. Retries keep the same slot and request
+ID; multiple observers sharing transport still account for their distinct logical reads. Paused
+queries count until cancelled or completed. Abort, unmount and interpreter replacement do not
+hide unfinished transport work from the aggregate budget.
+
+Exhaustion reaches the existing `failure` mapper as `RuntimeCapacityError`, then a `loadFailed`
+event; it does not enter QueryClient's retry machinery or start a transport. Demand remains in
+StateBus, and application policy owns a later retry. The low-level `installTanStackQueryLoader`
+accepts an optional `work: WorkAdmission` port for the same admission protocol; the composed helper
+supplies `runtime.work` without caller wiring. `trackExecution` remains completion observation,
+not retroactive admission of operations that have already started.

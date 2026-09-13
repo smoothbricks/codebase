@@ -135,3 +135,5 @@ export type {
 } from './types.js';
 export type { ViewFunction, ViewProps } from './view.js';
 export { captureViewProps, computed, sameViewProps } from './view.js';
+
+export { RuntimeCapacityError, type WorkAdmission } from './work.js';

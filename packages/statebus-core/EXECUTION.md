@@ -29,8 +29,9 @@ const binding = bindEffect(runtime, model.effect, {
 });
 ```
 
-Capacity applies to all operation keys in the binding. At capacity, even `latest-wins` refuses a new
-request instead of cancelling an old operation and pretending that its resources were freed.
+The local capacity applies to all operation keys in the binding. The runtime-wide `maxPendingWork`
+budget must also admit the request; see [aggregate admission](#aggregate-runtime-admission).
+At capacity, even `latest-wins` refuses a new request instead of cancelling an old operation and pretending that its resources were freed.
 Ordinary direct/Promise execution outcomes remain asynchronous. Overload refusal can be decoded
 while the command wave is notifying listeners, but its result still reduces in a successor wave.
 That result does not represent an external operation, and no instruction-executed claim is made.
@@ -81,6 +82,7 @@ owner can attach the existing runtime, rather than create a navigation store:
 const stop = runtime.manage(connectBrowserNavigation({
   window,
   channel, // Application-owned port over declared navigation events/state.
+  work: runtime.work,
   onError: cause => runtime.reportError(cause),
   trackExecution: task => runtime.trackExecution(task),
 }));
@@ -148,6 +150,10 @@ improvement**. JIT tiering and shared-host noise explain some non-monotonic smal
 This evidence supports removal of unrelated-key linear scans and reduced observed allocation work;
 it does not certify browser/app latency, zero allocation, all V8 shapes, or a universal memory bound.
 
+These measurements precede aggregate admission. They do not measure the new shared counter.
+The harness now explicitly sets both runtime and binding headroom for this workload so capacity
+refusal is not mistaken for a scheduling speedup.
+
 ## Regression gate and remaining scope
 
 The existing real-package verifier additionally runs `runtime-edges.ts` and `navigation-edges.ts`:
@@ -162,3 +168,70 @@ No speculative rewrite was made to working interest or chunk-progress loops. Que
 retry and grace logic stays with the existing loader implementation. Scheduling domains remain
 binding-local, capture migrations remain payload-only, and sanitized-support artifacts are not
 replayable. Those limits are not silently presented as completion of the entire application brief.
+
+
+## Aggregate runtime admission
+
+`composition.createRuntime({ maxPendingWork: 4096 })` owns one execution budget for the entire
+runtime, shared automatically by every `bindEffect` and `bindComposedQueryLoader`. The default
+is 4,096; the limit must be a positive safe integer and is validated before state initialization.
+`runtime.work.limit` and `runtime.work.pending` expose allocation-free counter reads. Separate
+runtime instances never share this budget, even when they use the same composition and handles.
+
+Effect jobs reserve before queuing, capture callbacks, supersession or operation invocation. Both
+binding-local `operations.maxPending` and the aggregate limit must allow admission. A queued job
+releases when cancelled before execution. A running job keeps its slot through actual completion,
+including iterator finalization, even after cancellation, binding disposal or replacement. Rebinding
+an interpreter cannot reset the runtime's count. At exhaustion, the existing failure mapper receives
+`RuntimeCapacityError` (`code: 'runtime-capacity'`, `limit`) and the pure decoder publishes the typed
+outcome in the successor wave. No operation starts and no replacement abort is triggered for that
+refused job. Capacity errors are allocated once per runtime, not once per refused submission.
+
+An admitted loader read reserves **before query configuration and observer setup**. It owns one
+slot for its QueryClient waiter plus its actual transport. Shared query work still has one slot per
+logical StateBus read: transport deduplication does not erase each consumer's waiter and lifecycle.
+Retries reuse that read's slot and request ID; no extra slot is taken just to run its transport.
+Cancelling a QueryClient waiter cannot release the slot while an abort-ignoring transport is still
+running. Stored query functions invoked later by an external QueryClient refetch acquire fresh
+transport admission instead of reusing the old request's released reservation.
+
+Loader capacity refusal goes directly through its typed `failure`/`loadFailed` path, outside
+QueryClient, so QueryClient retry configuration cannot accumulate automatic retries for refused
+StateBus requests. Cached reads also require logical-read admission. Resource interest remains
+accurate; application policy decides when to retry after capacity becomes available. No polling,
+unbounded wait queue, silent dropping of admitted results, or automatic mutation retry is added.
+
+The low-level loader's optional `work` port is the exported `WorkAdmission` interface. The composed
+binding supplies `runtime.work` automatically; callers cannot replace it through composed options.
+Other application-owned execution adapters can participate using that same port. It is a trusted
+execution-boundary protocol: each successful `tryAcquire()` must be paired with exactly one
+`release()` after all owned work settles, normally in `finally`. Do not release on unmount/abort,
+share a reservation between independent operations, or release another adapter's work. Calling
+release with no outstanding admission throws an invariant error. Admission itself returns a boolean,
+not a per-operation lease/wrapper object or another dependency-injection container.
+
+`runtime.drain()` observes outstanding reservations as well as registered completion tasks. This
+covers calls made reentrantly from a capture callback after reservation but before a task Promise
+exists. Disposal closes admission before invoking cleanup/abort listeners and does **not** reset
+pending counts. Non-cooperative work can therefore outlive synchronous disposal or keep
+`disposeAsync()` pending; actual settlement eventually releases its slot exactly once.
+
+`connectNavigation` and `connectBrowserNavigation` accept `work: runtime.work` alongside the
+existing `trackExecution` hook. They refuse before invoking a native/custom driver, release
+synchronous history writes immediately, and retain asynchronous work until genuine settlement.
+Refusal publishes `navigationFailed` with the typed error code `capacity`. Their small structural
+port keeps platform-neutral navigation independent of the StateBus implementation.
+
+The pre-existing `trackExecution(task)` observes a Promise that has already started; it cannot
+retroactively admit or prevent arbitrary external work. Direct clients and custom interpreters
+must acquire `runtime.work` before starting work to participate in this bound.
+The budget covers registered interpreters, not JavaScript executed outside these boundaries.
+Pending event storage, application state, payload bytes and execution time are separate limits.
+The dispatch queue's existing whole-wave cycle guard remains unchanged in this aggregate-work change.
+
+The aggregate tests use the normal packed-consumer gate. They cover same-wave requests across
+libraries, independent runtimes, queued cancellation, disposed/rebound interpreters, reentrant
+capture/abort/drain, iterator finalization, mixed effect/loader pressure, shared queries, retry
+identity, paused reads, reused query callbacks, setup failures, navigation/history refusal and replayed overload results.
+Generated multi-binding cancel/settle traces compare the count with the outstanding operations.
+These assert capacity and ownership invariants, not a new allocation/GC or tail-latency measurement.

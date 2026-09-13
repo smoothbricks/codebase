@@ -323,9 +323,9 @@ Run `nx lint statebus-core` before `nx test statebus-core`. The existing test de
 `nx run statebus-core:verify-packages`; no alternate preview workflow is required.
 
 That verifier uses real tarballs, strict public declarations and native Typia-generated validators
-under Node and Bun with both isolated and hoisted consumer installations. Its nine composed
+under Node and Bun with both isolated and hoisted consumer installations. Its ten composed
 programs are `scenario`, `edge-cases`, `capture-scenarios`, `execution-scenarios`, `support-edges`,
-`journal-edges`, `loader-edges`, `runtime-edges` and `navigation-edges`. They cover generated long
+`journal-edges`, `loader-edges`, `runtime-edges`, `navigation-edges` and `aggregate-edges`. They cover generated long
 streams, byte pressure, rollback, immutable captures, typed migrations, operation policy/cleanup,
 replay without I/O, support privacy, malformed-envelope rejection, atomic checkpoint relocation,
 queue wrap/reset, pre-materialization refusal, execution overload/reentrancy and navigation cleanup.
@@ -334,11 +334,11 @@ Byte counters are canonical JSON UTF-8, not live heap, GC, latency or allocation
 Changed-cell encoding and checkpoint materialization counters describe that work only. No
 zero-allocation or engine-optimization claim follows from these tests.
 
-The journal's capacity is **not** a runtime-wide overload guarantee. Effects now have per-binding
-pending-work limits, group-local supersession and counter-based completion tracking. Composed
-runtime `maxWavesPerFlush` stops runaway imperative cascades at complete-wave boundaries and retains
-the paused queue for explicit recovery. It does not bound one wave's size or elapsed time. Aggregate
-work across arbitrary bindings, application state and pending event storage are not globally bounded.
+The journal's capacity is **not** a runtime-wide memory guarantee. Effects and composed query
+loaders now share `maxPendingWork` across bindings, in addition to each effect's local limit.
+Composed runtime `maxWavesPerFlush` stops runaway imperative cascades at complete-wave boundaries
+and retains the paused queue for explicit recovery. Application state, pending event storage, one
+wave's size and elapsed execution time remain outside those bounds.
 See EXECUTION.md for the measured synthetic allocation/timing comparison and its limits; journal
 byte accounting alone does not establish those performance results.
 
@@ -346,3 +346,10 @@ A performance acceptance run must separate unrecorded composed dispatch, active 
 recording/eviction and cold export. Report actual allocation/GC evidence and tail latency separately
 from logical byte/count bounds. The existing exact-interest diagnostics do not measure all those
 paths. Reusing journal slots does not make owned payload capture or JavaScript execution allocation-free.
+
+
+Aggregate execution admission is configured with `RuntimeOptions.maxPendingWork` (default 4096).
+All effect and composed QueryClient bindings in the same runtime share it; cancelled-but-unsettled
+work still counts, and rebinding cannot bypass it. See [aggregate admission](./EXECUTION.md#aggregate-runtime-admission)
+for exact read/retry semantics, `RuntimeCapacityError`, the `runtime.work` execution-boundary port,
+and the distinction between admitted work and pending event storage.
