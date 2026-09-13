@@ -20,6 +20,7 @@ import {
 const journal = recordRollingScenario(runtime, {
   maxEvents: 512,
   maxEventBytes: 1024 * 1024,
+  maxEffects: 128,
   maxEffectBytes: 512 * 1024,
 });
 
@@ -53,20 +54,34 @@ The defaults are:
 | --- | ---: | --- |
 | `maxEvents` | 1,024 | Publications in retained complete waves |
 | `maxEventBytes` | 2 MiB | Sum of encoded retained wave records |
+| `maxEffects` | 256 | Retained instruction/outcome records |
 | `maxEffectBytes` | 1 MiB | Sum of instruction/outcome records with sequence and wave framing |
 | `maxCheckpointBytes` | 4 MiB | Encoded checkpoint, including declarations and retained cells |
-| `maxCaptureBytes` | 8 MiB | Fully materialized rolling capture |
+| `maxCaptureBytes` | 8 MiB | Complete rolling capture, including outer framing |
 | `maxEntryBytes` | 256 KiB | An encoded event, checkpoint entry or framed effect record |
 
-All limits must be positive safe integers. The whole-capture check includes outer envelope framing;
-the two stream counters are not estimates of the final artifact size. `createCaptureEnvelope`
-also checks its own `maxBytes`, including application and manifest metadata.
+All limits must be positive safe integers; queue capacities must also fit the JavaScript array
+index range. Configuration owns startup memory costs: do not specify needlessly large capacities.
+The two stream byte counters count their records, not outer array/envelope framing. The recorder
+combines those exact section sizes and framing before materializing a cold capture, so an oversized
+export does not first allocate checkpoint arrays or traverse all retained payloads again.
+`createCaptureEnvelope` additionally checks its own `maxBytes`, including application/manifest metadata.
+
+Wave and effect queues allocate their slots once at recorder setup and reuse them across eviction
+and reset. Removed slots are cleared, not deleted. No suffix copying or per-record size wrapper is
+needed; numeric byte sizes have separate fixed storage. Captured payloads remain detached and
+immutable, never recycled while a caller may retain them. Checkpoint setup reuses already-owned
+entries; existing cells are replaced without deleting/reinserting their Map keys. These are source
+level work reductions, not measured bytes/op or latency improvements.
 
 An indivisible wave or record that cannot fit is refused, not truncated into something labeled
-replayable. A checkpoint that grows beyond its bound also refuses recording and disposes the
-checkpoint interpreter. The production wave has already committed: capture failure must not
-suppress admitted operations or roll production state back. `stats().refusal` exposes the recorded
-failure, and `snapshot()` throws `CaptureError` until an explicit successful `reset()`.
+replayable. The checkpoint's total bound is checked after the whole atomic wave: adding a new
+address before removing the old one must not cause a false refusal when final state fits.
+A growing checkpoint refusal disposes the interpreter and clears partial checkpoint/journal payloads.
+The production wave has already committed: capture failure must not suppress admitted operations or
+roll production state back. `stats().refusal` exposes the recorded failure, and `snapshot()` throws
+`CaptureError` until an explicit successful `reset()`. A cold-export size refusal alone does not
+stop recording. `stats().effects` reports retained instruction/outcome count alongside its byte total.
 
 `reset()` starts from current state at a quiescent event queue and clears retained history.
 `dispose()` removes recorder observation and the replay interpreter. Already returned snapshots
@@ -301,11 +316,24 @@ Run `nx lint statebus-core` before `nx test statebus-core`. The existing test de
 `nx run statebus-core:verify-packages`; no alternate preview workflow is required.
 
 That verifier uses real tarballs, strict public declarations and native Typia-generated validators
-under Node and Bun with both isolated and hoisted consumer installations. Its five composed
-programs are `scenario`, `edge-cases`, `capture-scenarios`, `execution-scenarios` and `support-edges`.
-They cover generated long streams, byte pressure, rollback, immutable captures, typed migrations,
-operation policy/cleanup, replay without I/O, support privacy and malformed envelope rejection.
+under Node and Bun with both isolated and hoisted consumer installations. Its six composed
+programs are `scenario`, `edge-cases`, `capture-scenarios`, `execution-scenarios`, `support-edges`
+and `journal-edges`. They cover generated long streams, byte pressure, rollback, immutable captures,
+typed migrations, operation policy/cleanup, replay without I/O, support privacy, malformed envelope
+rejection, atomic checkpoint relocation, fixed-capacity queue wrap/reset and pre-materialization refusal.
 
 Byte counters are canonical JSON UTF-8, not live heap, GC, latency or allocation measurements.
 Changed-cell encoding and checkpoint materialization counters describe that work only. No
 zero-allocation or engine-optimization claim follows from these tests.
+
+The journal's capacity is **not** a runtime-wide overload guarantee. Pending dispatch publications,
+in-flight effects and serialized effect queues still lack configured capacity/backpressure limits.
+Reaction fanout bounds do not prevent arbitrary imperative listeners from refilling the dispatch
+queue forever. Per-key supersession currently scans a binding's active jobs, and effect completion
+uses Promise/Set bookkeeping that has not been allocation-profiled. Those paths need explicit work
+budgets and measured evaluation before claiming uniformly bounded execution or minimized allocations.
+
+A performance acceptance run must separate unrecorded composed dispatch, active effects, retained
+recording/eviction and cold export. Report actual allocation/GC evidence and tail latency separately
+from logical byte/count bounds. The existing exact-interest diagnostics do not measure all those
+paths. Reusing journal slots does not make owned payload capture or JavaScript execution allocation-free.
