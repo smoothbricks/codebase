@@ -269,6 +269,13 @@ contract. It is not a substitute for these explicit field/ID/metadata projection
 
 ## Execution policies, reactions and cleanup
 
+See [EXECUTION.md](./EXECUTION.md) for the current admission-capacity defaults, overload outcomes,
+listener-cycle recovery, navigation lifetime contract and separately measured execution benchmark.
+`operations.maxPending` bounds queued plus actual running work per effect binding (default 1024),
+including aborted operations that have not settled. Capacity refusal uses `EffectCapacityError`
+through the application's existing failure mapper and decoder; it never silently drops an admitted
+command. This is separate from journal retention limits.
+
 The existing effect boundary now accepts either `execute`, returning one value or Promise, or
 `stream`, returning an iterable or async iterable. The distinction is explicit: an array-shaped
 outcome from `execute` is one value, not a stream. Direct values and synchronous operation failures
@@ -316,22 +323,24 @@ Run `nx lint statebus-core` before `nx test statebus-core`. The existing test de
 `nx run statebus-core:verify-packages`; no alternate preview workflow is required.
 
 That verifier uses real tarballs, strict public declarations and native Typia-generated validators
-under Node and Bun with both isolated and hoisted consumer installations. Its six composed
-programs are `scenario`, `edge-cases`, `capture-scenarios`, `execution-scenarios`, `support-edges`
-and `journal-edges`. They cover generated long streams, byte pressure, rollback, immutable captures,
-typed migrations, operation policy/cleanup, replay without I/O, support privacy, malformed envelope
-rejection, atomic checkpoint relocation, fixed-capacity queue wrap/reset and pre-materialization refusal.
+under Node and Bun with both isolated and hoisted consumer installations. Its nine composed
+programs are `scenario`, `edge-cases`, `capture-scenarios`, `execution-scenarios`, `support-edges`,
+`journal-edges`, `loader-edges`, `runtime-edges` and `navigation-edges`. They cover generated long
+streams, byte pressure, rollback, immutable captures, typed migrations, operation policy/cleanup,
+replay without I/O, support privacy, malformed-envelope rejection, atomic checkpoint relocation,
+queue wrap/reset, pre-materialization refusal, execution overload/reentrancy and navigation cleanup.
 
 Byte counters are canonical JSON UTF-8, not live heap, GC, latency or allocation measurements.
 Changed-cell encoding and checkpoint materialization counters describe that work only. No
 zero-allocation or engine-optimization claim follows from these tests.
 
-The journal's capacity is **not** a runtime-wide overload guarantee. Pending dispatch publications,
-in-flight effects and serialized effect queues still lack configured capacity/backpressure limits.
-Reaction fanout bounds do not prevent arbitrary imperative listeners from refilling the dispatch
-queue forever. Per-key supersession currently scans a binding's active jobs, and effect completion
-uses Promise/Set bookkeeping that has not been allocation-profiled. Those paths need explicit work
-budgets and measured evaluation before claiming uniformly bounded execution or minimized allocations.
+The journal's capacity is **not** a runtime-wide overload guarantee. Effects now have per-binding
+pending-work limits, group-local supersession and counter-based completion tracking. Composed
+runtime `maxWavesPerFlush` stops runaway imperative cascades at complete-wave boundaries and retains
+the paused queue for explicit recovery. It does not bound one wave's size or elapsed time. Aggregate
+work across arbitrary bindings, application state and pending event storage are not globally bounded.
+See EXECUTION.md for the measured synthetic allocation/timing comparison and its limits; journal
+byte accounting alone does not establish those performance results.
 
 A performance acceptance run must separate unrecorded composed dispatch, active effects, retained
 recording/eviction and cold export. Report actual allocation/GC evidence and tail latency separately
