@@ -207,6 +207,7 @@ try {
       'execution-scenarios',
       'support-edges',
       'journal-edges',
+      'loader-edges',
     ])
       for (const runner of ['node', 'bun'])
         run(`${linker}: ${runner} ${executable}`, runner, [join(consumer, 'dist', 'composed', `${executable}.js`)], {
@@ -242,6 +243,7 @@ try {
           'typed execution policies, reactions and awaitable cleanup',
           'deny-default support metadata, IDs and portable failures',
           'fixed journal capacity, atomic checkpoint bounds and pre-materialization refusal',
+          'loader setup rollback, failure handling and transport drain',
         ],
       },
       null,

@@ -47,6 +47,10 @@ export interface TanStackLoaderOptions<T, Failure> {
   readonly matches: (interest: StateInterest) => boolean;
   readonly query: (request: LoadRequest) => LoaderQuery<T>;
   readonly failure: (cause: unknown) => Failure;
+  /** Programming errors in adapters/classifiers, not operational query failures. */
+  readonly onError?: (cause: unknown) => void;
+  /** Observe actual completion, including an aborted transport that settles later. */
+  readonly trackExecution?: (task: Promise<void>) => void;
   readonly requestId: () => LoadRequestId;
   readonly now: () => number;
   readonly fingerprint?: (interest: StateInterest) => LoadFingerprint;
@@ -96,6 +100,33 @@ export function installTanStackQueryLoader<T, Failure>(options: TanStackLoaderOp
   const counts = new StateInterestMap<number>();
   const pendingRelease = new StateInterestMap<() => void>();
   let disposed = false;
+  let stopRequests: (() => void) | undefined;
+  let stopInterest: (() => void) | undefined;
+
+  function reportError(cause: unknown): void {
+    try {
+      if (options.onError) options.onError(cause);
+      else console.error('StateBus loader boundary error', cause);
+    } catch (error) {
+      console.error('StateBus loader error reporter failed', error);
+    }
+  }
+
+  function trackExecution(task: Promise<void>): void {
+    try {
+      options.trackExecution?.(task);
+    } catch (cause) {
+      reportError(cause);
+    }
+  }
+
+  function cleanup(stop: (() => void) | undefined): void {
+    try {
+      stop?.();
+    } catch (cause) {
+      reportError(cause);
+    }
+  }
 
   function current(job: QueryJob<T>): boolean {
     return (
@@ -115,7 +146,7 @@ export function installTanStackQueryLoader<T, Failure>(options: TanStackLoaderOp
     if (job.closed) return;
     job.closed = true;
     job.group.jobs.delete(job);
-    job.stopObservation();
+    cleanup(job.stopObservation);
     if (jobs.get(job.address) === job) {
       clearRelease(job.address);
       jobs.delete(job.address);
@@ -237,12 +268,19 @@ export function installTanStackQueryLoader<T, Failure>(options: TanStackLoaderOp
           signal.addEventListener('abort', abort, { once: true });
           try {
             if (signal.aborted) throw signal.reason;
-            return await execute({ signal, request, attempt, reportBytes: progress.reportBytes });
+            const execution = execute({ signal, request, attempt, reportBytes: progress.reportBytes });
+            // Query cancellation settles fetchQuery before a non-cooperative transport finishes.
+            // Track both lifetimes; expected query rejections still go through the domain classifier.
+            if (options.trackExecution) trackExecution(execution.then(ignoreSettlement, ignoreSettlement));
+            return await execution;
           } finally {
             // Publish the last measured bytes before success/failure, even when no interval has elapsed.
-            if (!signal.aborted) progress.flush();
-            progress.dispose();
-            signal.removeEventListener('abort', abort);
+            try {
+              if (!signal.aborted) progress.flush();
+            } finally {
+              progress.dispose();
+              signal.removeEventListener('abort', abort);
+            }
           }
         },
       });
@@ -259,46 +297,72 @@ export function installTanStackQueryLoader<T, Failure>(options: TanStackLoaderOp
     }
   }
 
-  const stopRequests = channel.subscribe((event) => {
-    if (disposed || !options.matches(event.request.interest)) return;
-    if (event.type === 'loadCancelled') {
-      const job = jobs.get(event.request.interest);
-      const state = channel.read(event.request.interest);
-      if (
-        job &&
-        state.kind === 'cancelled' &&
-        sameLoadRequest(state.request, event.request) &&
-        sameLoadRequest(job.request, event.request)
-      )
-        close(job);
-    } else if (event.type === 'loadRequested' && isLoadAccepted(channel.read(event.request.interest), event.request)) {
-      void start(event.request);
-    }
-  });
-  const stopInterest = options.interests.subscribe(onInterests);
-  // Late installation must see already-mounted screens, not wait for an unrelated remount.
-  onInterests(options.interests.snapshot());
-  return () => {
+  function dispose(): void {
     if (disposed) return;
     disposed = true;
-    stopInterest();
-    stopRequests();
-    for (const cancel of pendingRelease.values()) cancel();
+    cleanup(stopInterest);
+    cleanup(stopRequests);
+    stopInterest = undefined;
+    stopRequests = undefined;
+    for (const cancel of pendingRelease.values()) cleanup(cancel);
     pendingRelease.clear();
     for (const job of jobs.values()) close(job);
     jobs.clear();
     groups.clear();
     counts.clear();
-  };
+  }
+
+  try {
+    stopRequests = channel.subscribe((event) => {
+      if (disposed || !options.matches(event.request.interest)) return;
+      if (event.type === 'loadCancelled') {
+        const job = jobs.get(event.request.interest);
+        const state = channel.read(event.request.interest);
+        if (
+          job &&
+          state.kind === 'cancelled' &&
+          sameLoadRequest(state.request, event.request) &&
+          sameLoadRequest(job.request, event.request)
+        )
+          close(job);
+      } else if (
+        event.type === 'loadRequested' &&
+        isLoadAccepted(channel.read(event.request.interest), event.request)
+      ) {
+        // Handle adapter/classifier failures too: void start(...) alone loses those rejections.
+        trackExecution(start(event.request).catch(reportError));
+      }
+    });
+    stopInterest = options.interests.subscribe(onInterests);
+    // Late installation must see already-mounted screens, not wait for an unrelated remount.
+    onInterests(options.interests.snapshot());
+  } catch (cause) {
+    // No half-installed executor survives a failing subscription, snapshot or demand callback.
+    dispose();
+    throw cause;
+  }
+  return dispose;
 }
 
 /** Runtime-owned binding of the existing QueryClient execution boundary. Replay installs no I/O. */
 export function bindComposedQueryLoader<T, Failure, ID extends string | number>(
   binding: import('@smoothbricks/statebus-data-loader').ComposedLoaderBinding<T, Failure, ID>,
-  options: Omit<TanStackLoaderOptions<T, Failure>, 'channel' | 'interests' | 'matches'>,
+  options: Omit<TanStackLoaderOptions<T, Failure>, 'channel' | 'interests' | 'matches' | 'onError' | 'trackExecution'>,
 ): () => void {
   const { runtime, channel, interests, matches } = binding;
   if (runtime.mode === 'replay') return () => {};
   if (runtime.disposed) throw new Error('Cannot bind a loader to a disposed runtime.');
-  return runtime.manage(installTanStackQueryLoader({ ...options, channel, interests, matches }));
+  return runtime.manage(
+    installTanStackQueryLoader({
+      ...options,
+      channel,
+      interests,
+      matches,
+      onError: (cause) => runtime.reportError(cause),
+      trackExecution: (task) => runtime.trackExecution(task),
+    }),
+  );
 }
+
+// One stable completion callback; transports keep their typed values on their original Promise.
+function ignoreSettlement(): void {}
