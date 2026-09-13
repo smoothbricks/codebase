@@ -281,9 +281,10 @@ either wait pending, and client cancellation cannot roll back a server mutation.
 
 For pure cross-library follow-up publications, use `scope.react(source, target, project)`.
 The projector reads batch-final state and emits into a successor wave without inventing an I/O
-operation. Targets remain owned by the declaring library; sources can be supplied through typed
-capabilities. `maxReactionSteps` bounds total reaction fanout per causal root, not just depth.
-A later asynchronous effect result starts a new causal root.
+operation. Both handles must belong to the composition; cross-library handles can be supplied
+through typed capabilities. Publishing a public command does not grant permission to write its
+owner's state directly. `maxReactionSteps` bounds total reaction fanout per causal root, not just
+depth. A later asynchronous effect result starts a new causal root.
 
 A library marks required interpreters with `scope.requireEffect(defineEffect(...))`.
 After binding operations, call `runtime.assertReady()`. Composition-bound React providers do
