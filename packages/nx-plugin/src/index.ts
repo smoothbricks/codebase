@@ -1752,12 +1752,15 @@ function inferTypescriptOutputs(
   // Nx deletes a cache hit's declared outputs before restoring them, so a
   // claim on the whole outDir also deleted whatever a sibling bundler emitted
   // there (tsdown's .mjs/.d.mts) whenever tsc-js restored after it. Claim only
-  // the file families tsc emits that no other declared target already owns.
+  // the file families tsc emits that no other `*-js` target already owns.
+  // Only a `*-js` sibling may take a family: dependents reach this package
+  // through `^*-js`, and Nx restores nothing for a cache hit without outputs,
+  // so a family ceded to `build` or a `*-web` target reached no dependent.
   // No .tsbuildinfo: the emit executor overlays incremental: false, so tsc-js
   // never writes one and a declared-but-absent output fails the
   // release-candidate output inspection.
   const siblingOutputs = Object.entries(declaredTargets).flatMap(([name, target]) =>
-    name !== 'tsc-js' && isRecord(target) && Array.isArray(target.outputs)
+    name !== 'tsc-js' && name.endsWith('-js') && isRecord(target) && Array.isArray(target.outputs)
       ? target.outputs.flatMap((output) =>
           typeof output === 'string' && output.startsWith('{projectRoot}/')
             ? [output.slice('{projectRoot}/'.length)]

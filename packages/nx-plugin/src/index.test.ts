@@ -295,6 +295,29 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
     }
   });
 
+  it('keeps the files it emits when the other claimant sits outside the *-js dependency edge', async () => {
+    // Dependents wait on `^*-js` only. Ceding the outDir to a `build` target left
+    // tsc-js with no outputs, and Nx restores nothing for a cache hit without
+    // outputs, so a dependent compiled against a missing dist/index.d.ts.
+    const workspace = await createWorkspace();
+    try {
+      await workspace.write(
+        'packages/example/package.json',
+        JSON.stringify({
+          name: 'example',
+          nx: { targets: { build: { command: 'ttsc -p tsconfig.build.json', outputs: ['{projectRoot}/dist'] } } },
+        }),
+      );
+      await workspace.write('packages/example/tsconfig.lib.json', '{"compilerOptions":{"outDir":"dist"}}\n');
+
+      const targets = await inferProjectTargets(workspace, 'packages/example/package.json');
+
+      expect(targets['tsc-js']?.outputs).toEqual(['{projectRoot}/dist/**/*.{js,cjs,mjs,jsx,d.ts,d.cts,d.mts}{,.map}']);
+    } finally {
+      await workspace.cleanup();
+    }
+  });
+
   it('hashes the manifests without their versions for checks, raw for artifacts', async () => {
     const workspace = await createWorkspace();
     try {
