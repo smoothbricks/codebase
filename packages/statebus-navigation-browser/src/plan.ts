@@ -8,6 +8,8 @@ export type BrowserNavigationPlan =
   | { readonly kind: 'failed'; readonly error: NavigationFailure };
 
 const UNCHANGED: BrowserNavigationPlan = Object.freeze({ kind: 'unchanged' });
+const BACK: BrowserNavigationPlan = Object.freeze({ kind: 'traverse', delta: -1 });
+const FORWARD: BrowserNavigationPlan = Object.freeze({ kind: 'traverse', delta: 1 });
 const INVALID: BrowserNavigationPlan = Object.freeze({
   kind: 'failed',
   error: Object.freeze({ code: 'invalid-target', message: 'The navigation target is invalid.' }),
@@ -25,9 +27,9 @@ const CROSS_ORIGIN: BrowserNavigationPlan = Object.freeze({
 export function planBrowserNavigation(intent: NavigationIntent<string>, baseHref: string): BrowserNavigationPlan {
   switch (intent.kind) {
     case 'back':
-      return { kind: 'traverse', delta: -1 };
+      return BACK;
     case 'forward':
-      return { kind: 'traverse', delta: 1 };
+      return FORWARD;
     case 'go':
       return Number.isInteger(intent.delta) &&
         intent.delta !== 0 &&

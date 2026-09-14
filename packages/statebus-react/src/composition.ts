@@ -23,8 +23,8 @@ import {
   useSyncExternalStore,
 } from 'react';
 
-// A context token is not a store. Every provider receives an explicitly owned runtime.
-const RuntimeContext = createContext<ComposedRuntime | null>(null);
+// Package-internal context shared by all bindings; never exported from the package root.
+export const RuntimeContext = createContext<ComposedRuntime | null>(null);
 export function useComposedRuntime(): ComposedRuntime {
   const runtime = useContext(RuntimeContext);
   if (!runtime || runtime.disposed) throw new Error('A live composition-bound StateBus provider is required.');
@@ -51,6 +51,7 @@ export function createStateBusReact(composition: StateBusComposition) {
   function Provider({ runtime, children }: { readonly runtime: ComposedRuntime; readonly children?: ReactNode }) {
     if (runtime.composition !== composition || runtime.disposed)
       throw new Error('Provider received a foreign or disposed runtime.');
+    runtime.assertReady();
     return createElement(RuntimeContext.Provider, { value: runtime }, children);
   }
   return Object.freeze({ Provider, useRuntime: useComposedRuntime, useStateValue, useKeyedState, useEventPublisher });
@@ -91,8 +92,8 @@ export function createLibraryReact<Exports>(definition: LibraryDefinition<Export
   return Object.freeze({ Provider, useLibrary, createSelectionHook: createLibrarySelectionHook });
 }
 
-/** Preserve the committed binding until its runtime, mount/definition or primitive props actually change. */
-function useSelectionBinding<Props extends ViewProps, Key, Value>(
+/** Package-internal shared committed binding; abandoned renders cannot retarget the live store. */
+export function useSelectionBinding<Props extends ViewProps, Key, Value>(
   runtime: ComposedRuntime,
   key: Key,
   props: Props,

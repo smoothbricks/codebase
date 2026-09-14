@@ -27,9 +27,11 @@ export function createMemoryNavigation<Location>(options: {
   return {
     current,
     subscribe(listener) {
-      listeners.add(listener);
+      // A callback can have multiple independent leases, just as in the browser driver.
+      const forward = (observation: NavigationObservation<Location>) => listener(observation);
+      listeners.add(forward);
       return () => {
-        listeners.delete(listener);
+        listeners.delete(forward);
       };
     },
     execute(request, { signal }): NavigationOutcome {
@@ -42,7 +44,9 @@ export function createMemoryNavigation<Location>(options: {
             error: { code: 'unsupported', message: 'External navigation is disabled in memory history.' },
           };
         case 'push':
-          entries.splice(index + 1, entries.length, intent.to);
+          // Truncate the forward branch without splice's discarded-array allocation.
+          entries.length = index + 1;
+          entries.push(intent.to);
           index += 1;
           break;
         case 'replace':
@@ -50,7 +54,9 @@ export function createMemoryNavigation<Location>(options: {
           break;
         case 'navigate':
           if (options.equal(current(), intent.to)) break;
-          entries.splice(index + 1, entries.length, intent.to);
+          // Truncate the forward branch without splice's discarded-array allocation.
+          entries.length = index + 1;
+          entries.push(intent.to);
           index += 1;
           break;
         case 'back':

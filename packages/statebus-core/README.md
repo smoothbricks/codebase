@@ -1,159 +1,145 @@
 # StateBus Core
 
-Platform-agnostic core types and runtime for StateBus.
-
-Use this package for:
-
-- module augmentation of `States` and `Events`
-- reducers, listeners, and typed state access
-- `ManualStateBus` in tests and non-DOM environments
-- `MicrotaskStateBus` for application commands without waiting for a browser frame
-- `computed()` helpers that do not depend on React
-
-If you are building a React app, import from `@smoothbricks/statebus-react` for the app-facing package surface.
-
-## Install
-
-```bash
-bun add @smoothbricks/statebus-core
-```
-
-## Define Your App Types
-
-Declare your application `States` and `Events` by augmenting `@smoothbricks/statebus-core`:
+Build a typed API for a reusable library or an application. The factory assembles existing StateBus
+declarations and bindings; only the returned `createBus` creates a live StateBus instance.
 
 ```ts
-import type { ByID } from '@smoothbricks/statebus-core';
+import { createBusApi, ManualScheduler } from '@smoothbricks/statebus-core';
 
-declare module '@smoothbricks/statebus-core' {
-  interface States {
-    counter: number;
-    post: ByID<{ title: string; body: string }>;
-  }
-
-  interface Events {
-    count: {
-      increment: number;
-      decrement: number;
-    };
-  }
-}
-```
-
-Make sure the declaration file is included by TypeScript.
-
-## Basic Usage
-
-```ts
-import { ManualStateBus } from '@smoothbricks/statebus-core';
-
-const bus = new ManualStateBus({
-  initialState: {
-    counter: 0,
-    post: () => undefined,
-  },
-  reducers: {
-    count: {
-      increment: (state, payload) => {
-        state.counter.update((value) => value + payload);
-      },
-      decrement: (state, payload) => {
-        state.counter.update((value) => value - payload);
-      },
-    },
+export const counter = createBusApi({
+  name: 'counter',
+  setup(builder) {
+    const count = builder.scalar('count', () => 0);
+    const increment = builder.event<number>('increment');
+    builder.reduce(increment, (state, amount) => {
+      state.set(count, state.read(count) + amount);
+    });
+    return { count, increment };
   },
 });
 
-bus.publish({ topic: 'count', type: 'increment', payload: 1 });
-bus.dispatchEvents();
-```
-
-## Derived State
-
-```ts
-import { computed, ManualStateBus } from '@smoothbricks/statebus-core';
-
-const bus = new ManualStateBus({
-  initialState: { counter: 0, post: () => undefined },
-  reducers: {},
+const app = createBusApi({
+  name: 'application',
+  libraries: { counter },
+  setup(builder, libraries) {
+    const counterEvents = libraries.get('counter');
+    const updates = builder.scalar('updates', () => 0);
+    builder.reduce(counterEvents.increment, state => {
+      state.set(updates, state.read(updates) + 1);
+    });
+    return { updates };
+  },
 });
 
-const doubledCounter = computed(bus, 'doubledCounter', (state) => state.counter.get() * 2, undefined);
+const { createBus } = app;
+const bus = createBus({ scheduler: new ManualScheduler() });
+const access = counter.getBus(bus);
+access.publish(access.exports.increment, 3);
+bus.flush();
+access.read(access.exports.count); // 3
+bus.read(app.getBus(bus).exports.updates); // 1
+bus.dispose();
 ```
 
-## Public Exports
+`counter.createBus()` creates a standalone instance; `app.createBus()` includes the counter and
+application declarations in one instance. `counter.getBus(appBus)` selects the counter's handles
+inside that app bus. It neither creates nor synchronizes a second store. The same API can be
+included by another API, nested or included more than once.
 
-`@smoothbricks/statebus-core` exports the platform-agnostic surface, including:
+The React package's `createBusApi` adds `Provider`, `useBus` and fine-grained subscription hooks to
+this same factory. Core stays independent of React. See the [React guide](../statebus-react/README.md)
+for the complete standalone/hosted connector and repeated-library selection.
 
-- `StateBus`
-- `ManualStateBus`
-- `MicrotaskStateBus`
-- `computed`
-- `sameViewProps`, `captureViewProps`
-- `StateInterest`, nominal `StateInterestKey`, `StateInterestMap`, `StateInterestBatch`, and `StateInterestRegistry`
-- bus, event, state, and reducer types
-- `Computed`, `Atom`, and related signal-adjacent types needed by consumers
+## Public factory contract
 
-## Migration From `@smoothbricks/statebus`
+`createBusApi({ name, setup, libraries?, requires?, bindings?, version?, previousVersions? })`
+returns a `BusApi<Exports, Libraries>`. `Exports` is inferred from `setup`; child names and exports
+are inferred from `libraries`. A parent receives its children's resolved exports through the
+second setup argument, `libraries.get(name)`. The existing builder owns scalar/keyed declarations,
+event/command reducers, reactions, capabilities and required effects.
 
-The legacy monolithic package has been removed.
+Setup is synchronous declaration work, not an operation or state initializer. It runs for each
+inclusion while assembling its containing API. It must not start I/O or close over a live bus.
+Initial scalar state is created only by `createBus`; keyed defaults remain lazy. Required capability
+bindings and ownership references are checked before the factory returns.
 
-- `declare module '@smoothbricks/statebus'` -> `declare module '@smoothbricks/statebus-core'`
-- `StateBus` from the old package split into:
-  - `ManualStateBus` in `@smoothbricks/statebus-core`
-  - `StateBus` (RAF-backed browser implementation) in `@smoothbricks/statebus-react`
+| Returned function | Purpose |
+| --- | --- |
+| `createBus(options?)` | Create an independently owned live instance, defaulting to microtask scheduling |
+| `getBus(instance, within?)` | Obtain stable typed access to this API in that instance |
+| `replayScenario(scenario)` | Restore a new execution-disabled instance using the existing replay engine |
+| `createCaptureEnvelope(scenario, options)` | Add the assembled declaration/library manifest and build provenance |
+| `migrateCaptureEnvelope(envelope, options)` | Apply registered codec migrations against this API's declarations |
+| `replayCaptureEnvelope(envelope, effects?)` | Validate and replay an envelope without executing production operations |
 
-## Dispatch and subscription lifecycle
+`BusAccess` exposes `exports`, `instance`, `read`, `readKeyed`, `publish`, `publisher` and
+`library(name)`. It is a stable selection of declarations, not a state snapshot or independently
+running object. `access.instance` is exactly the StateBus returned by `createBus`. The child access
+returned by `app.getBus(bus).library('counter')` equals `counter.getBus(bus)` for a unique inclusion.
 
-`MicrotaskStateBus` batches synchronous publications into a microtask. Its callback is bound once per runtime;
-listener publications are drained as subsequent waves without scheduling an extra empty microtask. `ManualStateBus`
-uses the same dispatch logic with explicit flushing. The React package's `StateBus` alias remains animation-frame
-based; import `MicrotaskStateBus` explicitly for command-driven application state.
+Including the same API twice creates distinct handles, metadata, state and effect slots. An
+unqualified lookup of that API then refuses ambiguity; use the parent's typed `library(name)`
+selection as `within` or as a React provider scope. Foreign-instance scopes and disposed buses
+are rejected rather than silently retargeted.
 
-All events in a wave reduce before any listener runs. Nested flush requests do not interrupt that wave. Interest
-listeners receive the last count for each property, including terminal zero. Cleanup is idempotent and captures the
-original subscribed addresses, not the caller's mutable array. Exact `{ key, id? }` changes accompany the aggregate
-property counts. Keyed loaders must use these exact changes: numeric `7`, string `'7'`, and absent IDs are distinct.
-Removing and recreating an interested ByID entry preserves its signal; final release does not evict application data.
+## Execution, capture and lifetime
 
-A single interest event passes through unchanged. Multiple interest payloads use one wave-owned subscriber record,
-with each incoming payload traversed once. The record is transferred at publication and is never recycled: callers
-may retain old events without seeing later counts. There are no intermediate prefix copies per notification. Ordinary
-waves with no interest do not construct coalescing records.
+Bind effects and loaders once at the application's execution boundary using the selected exports
+and the actual bus instance. `bindEffect`, `composedLoaderChannel` and `bindComposedQueryLoader`
+keep their existing execution, sharing, request identity and cancellation behavior. The API factory
+does not create a QueryClient or another dependency-injection/operation framework.
 
-A throwing reducer is still a programmer error, not an operational-result event or a transactional rollback. Its
-remaining wave is discarded, queue storage is cleared, and already-enqueued successor work remains scheduled. Earlier
-state changes in that failed wave are not rolled back.
+Each application mount, test or Storybook scenario owns its bus and operation lifetime. Unmount
+React roots before disposing a shared bus. Screen cleanup releases exact interest, not the entire
+application instance. `bus.drain()` and `bus.disposeAsync()` retain their actual-completion contracts.
 
-Validate with `nx lint statebus-core`, `nx test statebus-core`, and the corresponding `statebus-react` targets.
-The focused [interest benchmark](https://github.com/smoothbricks/codebase/blob/main/packages/statebus-core/benchmarks/README.md) records owned-flush latency separately from allocation claims.
+Recording still requires declaration codecs. `recordScenario(bus)` and `recordRollingScenario(bus)`
+use the same capture implementation; replay instances disable operations and QueryClient bindings.
+See [REPLAY.md](./REPLAY.md) for lossless local capture versus sanitized support export and
+[EXECUTION.md](./EXECUTION.md) for execution policies, performance evidence and explicit bounds.
 
+Library namespaces and identity routing are resolved while building the API, never reconstructed
+by reads, publications or renders. Stable access objects are prepared once per bus before rendering.
+This does not claim zero allocations, measured throughput improvement or universal V8 monomorphism.
 
-## Exact-interest ownership and hot paths
+The lower-level composed and ambient APIs remain exported for existing boundary integrations;
+[CONSUMER.md](./CONSUMER.md) documents those primitives. New application/library connectors can use
+`createBusApi` without assembling mounts, compositions and React factories themselves.
 
-`stateInterestKey(address)` is a cold-path wire/fingerprint codec returning a branded `StateInterestKey`. It is not a
-runtime indexing strategy. `StateInterestMap` indexes the original key/ID primitives; count reads and keyed-signal
-retention checks do not construct a descriptor or encode JSON. Scalar interest is not a wildcard subscription to every
-keyed value. ByID consumers acquire the exact ID they render.
+## Verification
 
-Each runtime has one `StateInterestBatch`. Appending a wave visits each change once, writes reusable dirty slots, and
-keeps the last count per address in first-occurrence order. A unique single payload passes through unchanged. Combining
-multiple payloads allocates only the final owned change array; the runtime never mutates it after transfer. Numeric
-`0` and `-0` share an ID, consistent with native Map semantics. Non-finite numeric IDs are refused on lease acquisition.
+```sh
+nx lint statebus-core
+nx test statebus-core
+nx run statebus-core:verify-packages
+```
 
-The resolved-slot cache is capped at 1,024 addresses between waves. A larger wave is not dropped: it is processed and
-then its address cache is cleared. Scratch/queue arrays retain high-water capacity while clearing all used references.
-This bounds cached identities, not total application state or the maximum size of a caller's wave. Lease construction,
-new addresses, cache resets/growth, and published snapshots have allocation costs; warmed reads and slot updates avoid
-new address encodings and intermediate collections. Public snapshot ownership is never weakened to recycle storage.
+The real-package gate installs built tarballs outside the workspace, checks strict public
+TypeScript declarations, and executes Node and Bun consumers under isolated and hoisted layouts.
+`scripts/consumer/composed/bus-api.ts` reuses the existing synthetic inventory reducer/planner/
+decoder and real ReactDOM/QueryClient tests for the unified factory. No source-path aliases or
+application-specific ambient schema are required.
 
-`sameViewProps` compares own enumerable primitive fields using `Object.is`, without sorting/encoding or coercion.
-`captureViewProps` copies record props only when binding a new computation; the previously exported formatting/JSON
-identity helpers are removed. Computation names are diagnostic labels, not identity keys. This is still the existing
-ambient-schema API, not the separate value-level library composition/replay implementation.
+### Required capabilities supplied by a sibling
 
-## Value-level composition and external consumers
+Use `libraryBindings` to supply an included API's existing required capabilities from other included
+APIs. The callback replaces that occurrence's standalone `bindings`; it runs during declaration
+resolution, never on bus creation, reads, publication or rendering.
 
-See [the composed consumer contract](./CONSUMER.md) for independently owned libraries, composition-bound
-React providers, typed effect/loader bindings and deterministic no-I/O replay. The legacy ambient API
-above remains compatible; new reusable libraries do not need module augmentation.
+```ts
+const app = createBusApi({
+  name: 'application',
+  libraries: { inventory, session },
+  libraryBindings: {
+    inventory: libraries => [sessionAccess.provide(libraries.get('session'))],
+  },
+  setup: () => ({}),
+});
+```
+
+The application's `sessionAccess` capability retains its value type. Dependencies resolve before
+consumers regardless of object property order. Missing/incompatible/duplicate bindings and cycles
+fail before any live state initializes. Including the application twice resolves each inventory
+against its own session occurrence. A library's standalone policy remains explicit in its `bindings`;
+no second session bus or runtime-time dependency container is introduced. The React factory accepts
+the same configuration and its existing hooks select these bound handles in the shared bus.

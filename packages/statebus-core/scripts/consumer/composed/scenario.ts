@@ -544,7 +544,7 @@ try {
         decode: (_plan, outcome: number) => outcome,
       }),
       {
-        execute: () => ({
+        stream: () => ({
           [Symbol.asyncIterator]: () => ({
             next: () => next.promise,
             return: async () => {
