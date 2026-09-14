@@ -32,6 +32,7 @@ declare module '@smoothbricks/statebus-core' {
 }
 
 export { StateBus } from './api.js';
+export * from './bus-api.js';
 export {
   CaptureError,
   type CaptureIssue,
