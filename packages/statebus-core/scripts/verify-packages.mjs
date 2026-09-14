@@ -215,6 +215,7 @@ try {
       'aggregate-edges',
       'navigation-edges',
       'bus-api',
+      'api-bindings',
     ])
       for (const runner of ['node', 'bun'])
         run(`${linker}: ${runner} ${executable}`, runner, [join(consumer, 'dist', 'composed', `${executable}.js`)], {
@@ -255,6 +256,7 @@ try {
           'bounded effect admission, group-local cancellation and dispatch recovery',
           'navigation cleanup, completion tracking and boolean React selectors',
           'unified library/application API, hosted hooks and repeated-library selection',
+          'typed sibling capability bindings, cycle refusal and hosted session admission',
         ],
       },
       null,
