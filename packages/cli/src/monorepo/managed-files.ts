@@ -32,6 +32,7 @@ import { resolvePrivateNpmWorkflowConfig } from '../release/private-npm.js';
 import type { DeploymentStage } from '../wrangler/stage.js';
 import { type CiCrossTestArchive, privateNpmReadTokenJobEnv, renderCiWorkflowYaml } from './ci-workflow.js';
 import { renderRunsOnLine } from './github-runs-on.js';
+import { formatManagedContent } from './managed-format.js';
 import { renderPrPreviewCleanupWorkflowYaml } from './pr-preview-cleanup-workflow.js';
 import { renderPublishWorkflowYaml } from './publish-workflow.js';
 
@@ -361,21 +362,40 @@ export function managedFileTargetsForContext(context: ManagedFileContext): strin
 }
 
 export async function applyManagedFiles(root: string, mode: 'update' | 'check' | 'diff'): Promise<FileResult[]> {
-  const context = await getManagedFileContext(root);
-  return managedFiles.map((file) => applyManagedFile(root, file, mode, context));
+  return applyManagedFilesForContext(root, mode, await getManagedFileContext(root));
 }
 
-function applyManagedFile(
+/**
+ * Apply against an already-resolved context. The context is the only part of
+ * this flow that needs a real Nx graph, so taking it as an argument lets a
+ * fixture repository exercise the whole write-and-compare path.
+ */
+export async function applyManagedFilesForContext(
+  root: string,
+  mode: 'update' | 'check' | 'diff',
+  context: ManagedFileContext,
+): Promise<FileResult[]> {
+  const results: FileResult[] = [];
+  for (const file of managedFiles) {
+    results.push(await applyManagedFile(root, file, mode, context));
+  }
+  return results;
+}
+
+async function applyManagedFile(
   root: string,
   file: ManagedFile,
   mode: 'update' | 'check' | 'diff',
   context: ManagedFileContext,
-): FileResult {
+): Promise<FileResult> {
   if (!managedFileApplies(file, context)) {
     return { target: file.target, action: 'skipped' };
   }
   const target = resolve(root, file.target);
-  const content = getManagedContent(file, context);
+  // Both sides of the comparison and the bytes written are the consumer's
+  // formatter's output, so a repository whose formatter disagrees with the
+  // generator's raw rendering sees no drift and no rewrite.
+  const content = await formatManagedContent(root, file.target, getManagedContent(file, context));
   if (existsSync(target)) {
     const info = lstatSync(target);
     if (info.isSymbolicLink()) {

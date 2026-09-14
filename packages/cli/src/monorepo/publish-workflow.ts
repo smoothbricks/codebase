@@ -4,9 +4,6 @@ import {
   LINUX_PLATFORM_TARGET_GLOBS,
   MACOS_PLATFORM_TARGET_GLOBS,
 } from '@smoothbricks/nx-plugin/workspace-config-policy';
-import { makeModuleSynchronized } from 'make-synchronized';
-import type * as PrettierModule from 'prettier';
-import type { Options as PrettierOptions } from 'prettier';
 import { isSmoothBricksCodebasePackageName } from '../lib/cli-package.js';
 import type {
   PackageCargoCredentialsConfig,
@@ -26,26 +23,6 @@ import {
   sourceCheckoutsStepLines,
 } from './ci-workflow.js';
 import { GITHUB_HOSTED_LINUX_RUNNER, renderRunsOnLine, type WorkflowRunsOn } from './github-runs-on.js';
-
-const PUBLISH_WORKFLOW_FORMAT_OPTIONS = Object.freeze({
-  parser: 'yaml',
-  printWidth: 120,
-  proseWrap: 'always',
-  // Mirrors .prettierrc: git-format-staged reformats the committed workflow
-  // with the repo config on every commit, so the render must agree or the
-  // first empty-string scalar (default: '') drifts on quote style alone.
-  singleQuote: true,
-} satisfies PrettierOptions);
-
-// @prettier/sync is unusable here: its module body eagerly instantiates a
-// synchronized module for the bare specifier "prettier", which resolves from
-// make-synchronized's own package directory inside its worker. Under Bun's
-// isolated install store that directory only sees make-synchronized's declared
-// dependencies, so the import throws a ResolveMessage that Bun then fails to
-// structured-clone across postMessage ("Cannot serialize worker response").
-// Resolving the entry HERE keys resolution to this package, which declares
-// prettier, and hands the worker an absolute URL that loads in any store layout.
-const synchronizedPrettier = makeModuleSynchronized<typeof PrettierModule>(import.meta.resolve('prettier'));
 
 export type PublishWorkflowBump = 'auto' | 'patch' | 'minor' | 'major' | 'prerelease';
 export type PublishWorkflowCondition =
@@ -432,32 +409,29 @@ function shouldRunStep(
   return true;
 }
 
+/**
+ * The workflow as this generator composes it. The consumer's own formatter has
+ * the last word on the bytes that land on disk — see `formatManagedContent` —
+ * so nothing here encodes one repository's Prettier preferences.
+ */
 export function renderPublishWorkflowYaml(options: PublishWorkflowDefinitionOptions = {}): string {
-  let workflow: string;
   if (options.release === false) {
-    const steps = definePublishWorkflow(options).steps;
-    workflow = `${renderPublishWorkflowHeader(options)}${renderPublishWorkflowSteps(steps, options)}`;
-  } else if (hasMacosPlatformTargets(options) && !skipsPublishHandoff(options)) {
-    workflow = renderPlatformPublishWorkflowYaml(options);
-  } else if (hasMacosPlatformTargets(options)) {
-    // A linux-cross producer runs the Apple targets on the publisher's own
-    // runner. Splitting jobs then buys nothing and costs a real transfer: the
-    // outputs get tarred, uploaded, downloaded into a second checkout, and two
-    // more devenv setups pay for themselves twice. One job, no artifacts.
-    workflow = `${renderPublishWorkflowHeader(options)}${renderSingleJobPublishWorkflowSteps(
-      definePublishWorkflow(options).steps,
-      options,
-    )}`;
-  } else if (hasLinuxPlatformTargets(options)) {
-    workflow = `${renderPublishWorkflowHeader(options)}${renderSingleJobPublishWorkflowSteps(
-      definePublishWorkflow(options).steps,
-      options,
-    )}`;
-  } else {
-    const steps = definePublishWorkflow(options).steps;
-    workflow = `${renderPublishWorkflowHeader(options)}${renderPublishWorkflowSteps(steps, options)}`;
+    return `${renderPublishWorkflowHeader(options)}${renderPublishWorkflowSteps(definePublishWorkflow(options).steps, options)}`;
   }
-  return synchronizedPrettier.format(workflow, PUBLISH_WORKFLOW_FORMAT_OPTIONS);
+  if (hasMacosPlatformTargets(options) && !skipsPublishHandoff(options)) {
+    return renderPlatformPublishWorkflowYaml(options);
+  }
+  // A linux-cross producer runs the Apple targets on the publisher's own
+  // runner. Splitting jobs then buys nothing and costs a real transfer: the
+  // outputs get tarred, uploaded, downloaded into a second checkout, and two
+  // more devenv setups pay for themselves twice. One job, no artifacts.
+  if (hasMacosPlatformTargets(options) || hasLinuxPlatformTargets(options)) {
+    return `${renderPublishWorkflowHeader(options)}${renderSingleJobPublishWorkflowSteps(
+      definePublishWorkflow(options).steps,
+      options,
+    )}`;
+  }
+  return `${renderPublishWorkflowHeader(options)}${renderPublishWorkflowSteps(definePublishWorkflow(options).steps, options)}`;
 }
 
 function renderPublishWorkflowHeader(options: PublishWorkflowDefinitionOptions): string {

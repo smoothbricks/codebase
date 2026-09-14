@@ -8,8 +8,8 @@ import {
   MACOS_PLATFORM_TARGET_GLOBS,
   PLATFORM_TARGET_GLOBS,
 } from '@smoothbricks/nx-plugin/workspace-config-policy';
-import { format } from 'prettier';
 import typia from 'typia';
+import { formatManagedContent } from '../managed-format.js';
 import {
   definePublishWorkflow,
   type PublishWorkflowBump,
@@ -22,6 +22,17 @@ import {
 } from '../publish-workflow.js';
 
 const nixosRunsOn = ['nixos-latest-x64', 'self-hosted'] as const;
+const REPO_ROOT = join(import.meta.dir, '..', '..', '..', '..', '..');
+const PUBLISH_WORKFLOW_TARGET = '.github/workflows/publish.yml';
+/**
+ * What actually lands on disk: the renderer composes structure, the managed
+ * writer formats it with the consuming repository's own Prettier config.
+ * Structural assertions below run on these bytes, not the raw template, so a
+ * hand-folded line Prettier would join (or a joined line it would fold) does
+ * not read as a missing step.
+ */
+const formattedPublishWorkflow = (rendered: string): Promise<string> =>
+  formatManagedContent(REPO_ROOT, PUBLISH_WORKFLOW_TARGET, rendered);
 
 /**
  * What `smoo monorepo` derives from this repository's own Nx graph: macOS and
@@ -43,21 +54,17 @@ describe('publish workflow definition', () => {
     expect(rendered).toContain('smoo monorepo validate --projects "${{ steps.version.outputs.projects }}"');
     const packageRoot = join(import.meta.dir, '..', '..', '..');
     await expect(readFile(join(packageRoot, '..', '..', '.github/workflows/publish.yml'), 'utf8')).resolves.toBe(
-      rendered,
+      await formattedPublishWorkflow(rendered),
     );
   });
 
-  it('renders workflow bytes that are stable under the repository Prettier config', async () => {
-    const rendered = renderPublishWorkflowYaml(codebaseWorkflowOptions);
+  it('writes workflow bytes the repository formatter leaves alone on a second pass', async () => {
+    const formatted = await formattedPublishWorkflow(renderPublishWorkflowYaml(codebaseWorkflowOptions));
 
-    await expect(
-      format(rendered, {
-        parser: 'yaml',
-        printWidth: 120,
-        proseWrap: 'always',
-        singleQuote: true,
-      }),
-    ).resolves.toBe(rendered);
+    // The bytes on disk are a fixed point of the consuming repository's own
+    // formatter: `update` writes them once, the commit hook agrees, and
+    // `check` afterwards reports only drift that is real.
+    await expect(formattedPublishWorkflow(formatted)).resolves.toBe(formatted);
   });
 
   it('gives every publish job the declared remote cache, in bytes Prettier keeps', async () => {
@@ -70,8 +77,12 @@ describe('publish workflow definition', () => {
       NX_SELF_HOSTED_REMOTE_CACHE_SERVER: 'http://10.89.0.1:8765',
       NX_SELF_HOSTED_REMOTE_CACHE_ACCESS_TOKEN: '${{ secrets.NX_REMOTE_CACHE_TOKEN }}',
     };
-    const platform = renderPublishWorkflowYaml({ ...codebaseWorkflowOptions, remoteCache });
-    const single = renderPublishWorkflowYaml({ repoName: '@smoothbricks/codebase', remoteCache });
+    const platform = await formattedPublishWorkflow(
+      renderPublishWorkflowYaml({ ...codebaseWorkflowOptions, remoteCache }),
+    );
+    const single = await formattedPublishWorkflow(
+      renderPublishWorkflowYaml({ repoName: '@smoothbricks/codebase', remoteCache }),
+    );
 
     expect(Bun.YAML.parse(platform)).toMatchObject({
       jobs: {
@@ -84,9 +95,7 @@ describe('publish workflow definition', () => {
     expect(renderPublishWorkflowYaml(codebaseWorkflowOptions)).not.toContain('NX_SELF_HOSTED');
     // A workflow the repository Prettier config would rewrite drifts on the
     // first commit hook, so the cache lines must already be its output.
-    await expect(
-      format(platform, { parser: 'yaml', printWidth: 120, proseWrap: 'always', singleQuote: true }),
-    ).resolves.toBe(platform);
+    await expect(formattedPublishWorkflow(platform)).resolves.toBe(platform);
   });
 
   it('passes the projects selector to the version and platform-output steps', async () => {
@@ -330,16 +339,20 @@ describe('publish workflow definition', () => {
     );
   });
 
-  it('renders parallel native producers and a dependent publish-only final job', () => {
-    const linuxOnly = renderPublishWorkflowYaml({
-      repoName: '@smoothbricks/codebase',
-      platformTargetGlobs: LINUX_PLATFORM_TARGET_GLOBS,
-    });
-    const native = renderPublishWorkflowYaml({
-      repoName: '@smoothbricks/codebase',
-      platformTargetGlobs: PLATFORM_TARGET_GLOBS,
-      runsOn: [...nixosRunsOn],
-    });
+  it('renders parallel native producers and a dependent publish-only final job', async () => {
+    const linuxOnly = await formattedPublishWorkflow(
+      renderPublishWorkflowYaml({
+        repoName: '@smoothbricks/codebase',
+        platformTargetGlobs: LINUX_PLATFORM_TARGET_GLOBS,
+      }),
+    );
+    const native = await formattedPublishWorkflow(
+      renderPublishWorkflowYaml({
+        repoName: '@smoothbricks/codebase',
+        platformTargetGlobs: PLATFORM_TARGET_GLOBS,
+        runsOn: [...nixosRunsOn],
+      }),
+    );
     const linuxCandidate = native.slice(
       native.indexOf('  linux-release-candidate:'),
       native.indexOf('  macos-platform:'),
