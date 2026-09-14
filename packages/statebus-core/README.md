@@ -119,3 +119,27 @@ TypeScript declarations, and executes Node and Bun consumers under isolated and 
 `scripts/consumer/composed/bus-api.ts` reuses the existing synthetic inventory reducer/planner/
 decoder and real ReactDOM/QueryClient tests for the unified factory. No source-path aliases or
 application-specific ambient schema are required.
+
+### Required capabilities supplied by a sibling
+
+Use `libraryBindings` to supply an included API's existing required capabilities from other included
+APIs. The callback replaces that occurrence's standalone `bindings`; it runs during declaration
+resolution, never on bus creation, reads, publication or rendering.
+
+```ts
+const app = createBusApi({
+  name: 'application',
+  libraries: { inventory, session },
+  libraryBindings: {
+    inventory: libraries => [sessionAccess.provide(libraries.get('session'))],
+  },
+  setup: () => ({}),
+});
+```
+
+The application's `sessionAccess` capability retains its value type. Dependencies resolve before
+consumers regardless of object property order. Missing/incompatible/duplicate bindings and cycles
+fail before any live state initializes. Including the application twice resolves each inventory
+against its own session occurrence. A library's standalone policy remains explicit in its `bindings`;
+no second session bus or runtime-time dependency container is introduced. The React factory accepts
+the same configuration and its existing hooks select these bound handles in the shared bus.

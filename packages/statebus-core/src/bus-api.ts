@@ -48,6 +48,12 @@ export interface BusApiSpecification<Exports, Libraries extends BusApiLibraries>
   readonly requires?: LibraryDefinition<Exports>['requires'];
   readonly bindings?: Parameters<typeof mountLibrary>[2];
   readonly libraries?: Libraries;
+  /** Resolve an included library's required capabilities from its siblings, once before any bus exists. */
+  readonly libraryBindings?: {
+    readonly [Key in keyof Libraries]?: (
+      libraries: LibraryExports<NoInfer<Libraries>>,
+    ) => NonNullable<Parameters<typeof mountLibrary>[2]>;
+  };
   readonly setup: (builder: LibraryScope, libraries: LibraryExports<Libraries>) => Exports;
 }
 
@@ -75,7 +81,11 @@ export interface BusApi<Exports, Libraries extends BusApiLibraries = Record<neve
 
 interface ApiRecipe {
   readonly name: string;
-  instantiate(namespace: string, declarations: MountedLibrary<unknown>[]): ApiNode;
+  instantiate(
+    namespace: string,
+    declarations: MountedLibrary<unknown>[],
+    bindings?: Parameters<typeof mountLibrary>[2],
+  ): ApiNode;
 }
 interface ApiNode {
   readonly recipe: ApiRecipe;
@@ -125,21 +135,48 @@ export function createBusApi<Exports, Libraries extends BusApiLibraries = Record
     dependencies.set(key, library[apiIdentity]);
   }
 
+  const childBindings = new Map<
+    string,
+    (libraries: LibraryExports<Libraries>) => NonNullable<Parameters<typeof mountLibrary>[2]>
+  >();
+  for (const key in specification.libraryBindings) {
+    if (!Object.hasOwn(specification.libraryBindings, key)) continue;
+    const resolve = specification.libraryBindings[key];
+    if (!dependencies.has(key) || typeof resolve !== 'function')
+      throw new Error(`Unknown or invalid library binding '${key}'.`);
+    childBindings.set(key, resolve);
+  }
+
   const recipe: ApiRecipe = {
     name,
-    instantiate(namespace, declarations) {
+    instantiate(namespace, declarations, suppliedBindings = bindings) {
       const children = new Map<string, ApiNode>();
-      for (const [key, dependency] of dependencies) {
-        // Length-delimited paths are resolved only on this cold construction path.
-        children.set(key, dependency.instantiate(`${namespace}${key.length}:${key}`, declarations));
+      const resolving = new Set<string>();
+      function child(key: string): ApiNode {
+        const existing = children.get(key);
+        if (existing) return existing;
+        const dependency = dependencies.get(key);
+        if (!dependency) throw new Error(`Unknown library '${key}'.`);
+        if (resolving.has(key)) throw new Error(`Cyclic library bindings at '${name}/${key}'.`);
+        resolving.add(key);
+        try {
+          const resolve = childBindings.get(key);
+          const bindings = resolve?.(libraryExports);
+          if (resolve && !Array.isArray(bindings)) throw new Error(`Invalid library bindings at '${name}/${key}'.`);
+          // Resolve capability dependencies before their consumers, without creating live state.
+          const node = dependency.instantiate(`${namespace}${key.length}:${key}`, declarations, bindings);
+          children.set(key, node);
+          return node;
+        } finally {
+          resolving.delete(key);
+        }
       }
       function get<Key extends keyof Libraries & string>(key: Key): BusApiExports<Libraries[Key]>;
       function get(key: string): unknown {
-        const child = children.get(key);
-        if (!child) throw new Error(`Unknown library '${key}'.`);
-        return child.model;
+        return child(key).model;
       }
       const libraryExports: LibraryExports<Libraries> = Object.freeze({ get });
+      for (const key of dependencies.keys()) child(key);
       const definition = defineLibrary({
         name,
         version,
@@ -147,7 +184,7 @@ export function createBusApi<Exports, Libraries extends BusApiLibraries = Record
         requires,
         setup: (builder) => setup(builder, libraryExports),
       });
-      const declaration = mountLibrary(definition, namespace, bindings);
+      const declaration = mountLibrary(definition, namespace, suppliedBindings);
       declarations.push(declaration);
       const accesses = new WeakMap<StateBusInstance, BusAccess<Exports, Libraries>>();
       const descendants = new Map<ApiRecipe, ApiNode | null>();
