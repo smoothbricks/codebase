@@ -1,8 +1,8 @@
 import assert from 'node:assert/strict';
 import { Err, Ok } from '@smoothbricks/lmao';
 import {
-  bindEffect,
   type BusApiLibraries,
+  bindEffect,
   captureCheckpoint,
   createBusApi as createCoreBusApi,
   defineCapability,
