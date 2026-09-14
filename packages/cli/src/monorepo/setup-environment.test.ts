@@ -53,7 +53,7 @@ async function withManagedRepository(
     for (const name of ['setup-environment.ts', 'secret-references.ts']) {
       await copyFile(join(MANAGED, 'direnv', name), join(root, 'tooling', 'direnv', name));
     }
-    for (const hook of ['pre-commit', 'commit-msg', 'pre-push']) {
+    for (const hook of ['pre-commit', 'post-commit', 'commit-msg', 'pre-push']) {
       await writeFile(join(root, 'tooling', 'git-hooks', `${hook}.sh`), '#!/usr/bin/env bash\nexit 0\n');
     }
     await writeFile(

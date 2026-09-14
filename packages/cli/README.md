@@ -345,6 +345,19 @@ After formatting, the hook runs `smoo monorepo validate --fail-fast --only-if-ne
 commits fast while still catching incomplete package setup and conditional managed-file drift when a new workspace
 package manifest is staged.
 
+The generated post-commit hook restores the index for the paths the commit just wrote. `git commit --only -- <paths>` is
+a partial commit: git stages those paths from the working tree into the real index, locks it, and builds the commit from
+a separate throwaway index it hands the pre-commit hook. The formatter's rewrite therefore reaches the commit and the
+working tree while the real index keeps the pre-format blob, so `git diff --cached HEAD` reports a path as staged
+immediately after committing it and the next bare `git commit` would sweep that entry in under another message. No
+pre-commit hook can fix this itself: the real index is locked while it runs. The repair only ever touches paths the
+commit wrote, which is what makes it safe in a worktree several agents share.
+
+Unlike the other hooks, `.git/hooks/post-commit` is not a symlink to the managed script but a fenced
+`# >>> smoo post-commit >>>` block that calls it. Tools that nudge a backup or a mirror after every commit install
+themselves by appending such a block to that same file; a symlink would delete their block, and their next install would
+write through the link into the managed template. Installing is idempotent and leaves foreign blocks untouched.
+
 The generated commit-msg hook delegates conventional commit validation to:
 
 ```bash
@@ -723,8 +736,8 @@ not, and the network may answer neither. The clients' own retry ladders stay off
 genuine not-found costs exactly one request, while a failure that never reached a verdict — connection reset, DNS
 failure, timeout, 5xx — is retried up to three times with bounded backoff. When every attempt dies in transport the run
 refuses, naming the package, the version and the transport error, instead of guessing: read as missing it would
-republish a version that exists, and read as present it would skip one that does not. That refusal is a network
-failure, not a release failure — nothing was published or skipped by the query, so the run is safe to re-dispatch.
+republish a version that exists, and read as present it would skip one that does not. That refusal is a network failure,
+not a release failure — nothing was published or skipped by the query, so the run is safe to re-dispatch.
 
 Pending release state should be a suffix of the release-target timeline because `repair-pending` runs before every
 publish. Once a complete release target is reached, older targets are assumed complete; an observed gap in repair state

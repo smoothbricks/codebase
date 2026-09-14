@@ -260,6 +260,12 @@ const managedFiles: ManagedFile[] = [
   },
   {
     kind: 'raw',
+    source: 'tooling/git-hooks/post-commit.sh',
+    target: 'tooling/git-hooks/post-commit.sh',
+    executable: true,
+  },
+  {
+    kind: 'raw',
     source: 'tooling/git-hooks/commit-msg.sh',
     target: 'tooling/git-hooks/commit-msg.sh',
     executable: true,
