@@ -1,12 +1,13 @@
 import { describe, expect, it } from 'bun:test';
 import { mkdir, mkdtemp, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join, relative } from 'node:path';
+import { dirname, join, relative } from 'node:path';
 import { type ProjectTargets, readProjectTargets } from '../nx/index.js';
 import { expandNxTargetDependencyRuns, expandNxTargetRuns } from './index.js';
 import { applyCollectedOutputs, collectNxOutputs } from './outputs.js';
 
 const SOURCE_SHA = 'c'.repeat(40);
+const GLOB_MAGIC = /[*?{[]/;
 
 function cowshedShapedProject(): ProjectTargets {
   return {
@@ -230,9 +231,20 @@ async function plantDeclaredOutputs(
       const projectRoot = project.root;
       if (projectRoot === undefined) continue;
       for (const output of project.targetOutputs?.get(run.target) ?? []) {
-        const directory = join(root, output.replace('{projectRoot}', projectRoot));
-        await mkdir(directory, { recursive: true });
-        const file = join(directory, run.target);
+        const declared = output.replace('{projectRoot}', projectRoot);
+        // A glob output names the files a target owns rather than a directory
+        // to fill, so plant under its literal prefix with a name the pattern
+        // accepts. Planting the pattern itself would create a directory named
+        // after the glob and leave the collector nothing to match.
+        const glob = GLOB_MAGIC.test(declared) ? new Bun.Glob(declared) : null;
+        const path = glob
+          ? `${declared.slice(0, declared.search(GLOB_MAGIC)).replace(/\/+$/, '')}/${run.target}.js`
+          : `${declared}/${run.target}`;
+        if (glob && !glob.match(path)) {
+          throw new Error(`Planted ${path} does not match declared output ${output}.`);
+        }
+        const file = join(root, path);
+        await mkdir(dirname(file), { recursive: true });
         // 0o755 because `applyCollectedOutputs` must carry the executable bit
         // of a platform binary through the collect tree.
         await writeFile(file, `${run.target} artifact`, { mode: 0o755 });
@@ -248,7 +260,9 @@ describe('publish collect containment probe against the resolved graph', () => {
     const projects = await readProjectTargets(join(import.meta.dir, '../../../..'));
     const cowshed = projects.find((project) => project.project === 'cowshed');
     expect(cowshed?.targetOutputs?.get('build')).toBeUndefined();
-    expect(cowshed?.targetOutputs?.get('tsc-js')).toEqual(['{projectRoot}/dist/ts']);
+    expect(cowshed?.targetOutputs?.get('tsc-js')).toEqual([
+      '{projectRoot}/dist/ts/**/*.{js,cjs,mjs,jsx,d.ts,d.cts,d.mts}{,.map}',
+    ]);
 
     const buildRuns = expandNxTargetDependencyRuns(
       expandNxTargetRuns(projects, { targets: 'build', projects: 'cowshed' }).runs,
@@ -288,7 +302,9 @@ describe('publish collect containment probe against the resolved graph', () => {
         buildManifest.files.some((file) => file.path.includes('/dist/bin/') || file.path.includes('/dist/native/')),
       ).toBe(false);
       expect(
-        buildManifest.files.some((file) => file.target === 'tsc-js' && file.path === 'packages/cowshed/dist/ts/tsc-js'),
+        buildManifest.files.some(
+          (file) => file.target === 'tsc-js' && file.path === 'packages/cowshed/dist/ts/tsc-js.js',
+        ),
       ).toBe(true);
 
       expect(macosManifest.files.map((file) => file.path).sort()).toEqual(
