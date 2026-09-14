@@ -32,8 +32,32 @@ declare module '@smoothbricks/statebus-core' {
 }
 
 export { StateBus } from './api.js';
+export * from './bus-api.js';
+export {
+  CaptureError,
+  type CaptureIssue,
+  type CaptureValue,
+  canonicalCapture,
+  captureBytes,
+  captureValue,
+} from './capture.js';
+export {
+  type CaptureEnvelope,
+  type CaptureEnvelopeOptions,
+  type CaptureLibraryVersion,
+  type CaptureManifest,
+  createCaptureEnvelope,
+  exportSupportCapture,
+  migrateCaptureEnvelope,
+  migrateScenario,
+  replayCaptureEnvelope,
+  type SupportArtifact,
+  type SupportExportOptions,
+} from './capture-envelope.js';
+export { type CodecMigration, evolveCodec } from './codec.js';
 export * from './composition.js';
-export { type DispatchScheduler, ManualScheduler, microtaskScheduler } from './dispatch.js';
+export { bindRuntimeDiagnostics } from './diagnostics.js';
+export { DispatchCycleError, type DispatchScheduler, ManualScheduler, microtaskScheduler } from './dispatch.js';
 export * from './effects.js';
 export type { StateInterest, StateInterestChange, StateInterestKey } from './interest.js';
 export {
@@ -45,7 +69,42 @@ export {
 } from './interest.js';
 export { ManualStateBus } from './manual.js';
 export { MicrotaskStateBus } from './microtask.js';
-export * from './recording.js';
+export {
+  type CheckpointCaptureOptions,
+  captureCheckpoint,
+  captureEffectInstruction,
+  captureEffectOutcome,
+  classifyScenario,
+  decodeEffectInstruction,
+  decodeEffectOutcome,
+  type RecordedEffectCapture,
+  type RecordedEffectInstruction,
+  type RecordedEffectOutcome,
+  type RecordedScenario,
+  type RecordedWave,
+  recordScenario,
+  replayScenario,
+  type ScenarioRecorder,
+  type StateCheckpoint,
+} from './recording.js';
+export {
+  type RecordedEffectPosition,
+  type RollingCaptureLimits,
+  type RollingCaptureStats,
+  type RollingScenario,
+  type RollingScenarioRecorder,
+  recordRollingScenario,
+} from './rolling.js';
+export {
+  consentSupport,
+  publicSupport,
+  type RedactedValue,
+  type RedactionReason,
+  redactSupport,
+  type SupportDecision,
+  type SupportPolicy,
+  secretSupport,
+} from './support-policy.js';
 export type {
   AnyEvent,
   AnyListener,
@@ -77,3 +136,5 @@ export type {
 } from './types.js';
 export type { ViewFunction, ViewProps } from './view.js';
 export { captureViewProps, computed, sameViewProps } from './view.js';
+
+export { RuntimeCapacityError, type WorkAdmission } from './work.js';
