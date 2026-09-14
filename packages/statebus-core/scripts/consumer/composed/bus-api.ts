@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
+import { Err, Ok } from '@smoothbricks/lmao';
 import {
   bindEffect,
+  type BusApiLibraries,
   captureCheckpoint,
   createBusApi as createCoreBusApi,
   defineCapability,
@@ -8,18 +10,16 @@ import {
   recordScenario,
   type StateBusInstance,
 } from '@smoothbricks/statebus-core';
-import { composedLoaderChannel, previousData } from '@smoothbricks/statebus-data-loader';
-import { createBusApi } from '@smoothbricks/statebus-react';
+import { composedLoaderChannel, loadRequestId, previousData } from '@smoothbricks/statebus-data-loader';
+import { createBusApi, type ReactBusApi } from '@smoothbricks/statebus-react';
 import { bindComposedQueryLoader } from '@smoothbricks/statebus-tanstack-query';
 import { QueryClient } from '@tanstack/query-core';
-import { Ok, Err } from '@smoothbricks/lmao';
 import { Window } from 'happy-dom';
 import { act, createElement as h, StrictMode } from 'react';
-import { loadRequestId } from '@smoothbricks/statebus-data-loader';
-import { numberCodec, requestId, shelfId, type ShelfId } from './codecs.js';
+import { type Adjust, numberCodec, requestId, type ShelfId, shelfId } from './codecs.js';
 import { canAdjust, inventoryLibrary } from './library.js';
 
-// The same production consumer reducer/planner/decoder now feeds ONE library/application factory.
+// Reuse the existing consumer's production reducer/planner/decoder through one API factory.
 const inventory = createBusApi({
   name: 'factory-inventory',
   requires: inventoryLibrary.requires,
@@ -78,9 +78,7 @@ await test('one factory builds libraries and applications without creating live 
     assert.notEqual(leaf.getBus(one), leaf.getBus(two));
     assert.equal(leaf.getBus(one).read(leaf.getBus(one).exports.value), 1);
     assert.equal(leaf.getBus(two).read(leaf.getBus(two).exports.value), 2);
-    assert.equal(Reflect.has(host, 'createRuntime'), false);
-    assert.equal(Reflect.has(host, 'composition'), false);
-    assert.equal(Reflect.has(host, 'mounts'), false);
+    for (const key of ['createRuntime', 'composition', 'mounts']) assert.equal(Reflect.has(host, key), false);
   } finally {
     one.dispose();
     two.dispose();
@@ -136,18 +134,46 @@ await test('required bindings refuse before a bus or component can be created', 
     /Missing or incompatible/,
   );
   assert.throws(
-    () => createCoreBusApi({
-      name: 'duplicate', requires: [permission],
-      bindings: [permission.provide(true), permission.provide(false)], setup: () => ({}),
-    }),
+    () =>
+      createCoreBusApi({
+        name: 'duplicate',
+        requires: [permission],
+        bindings: [permission.provide(true), permission.provide(false)],
+        setup: () => ({}),
+      }),
     /Duplicate/,
   );
+});
+
+await test('bound access reuses functions and performs no codec or serialization work on reads/publication', () => {
+  const bus = app.createBus({ scheduler: new ManualScheduler() });
+  const access = telemetry.getBus(bus);
+  const original = JSON.stringify;
+  try {
+    JSON.stringify = () => {
+      throw new Error('Serialization outside a capture boundary');
+    };
+    const publish = access.publisher(access.exports.tick);
+    for (let index = 0; index < 100; index++) {
+      assert.equal(telemetry.getBus(bus), access);
+      assert.equal(access.publisher(access.exports.tick), publish);
+      publish(1);
+      bus.flush();
+      assert.equal(access.read(access.exports.ticks), index + 1);
+    }
+  } finally {
+    JSON.stringify = original;
+    bus.dispose();
+  }
 });
 
 const browser = new Window({ url: 'https://bus-api.example.test/' });
 const saved = new Map<string, PropertyDescriptor | undefined>();
 for (const [key, value] of Object.entries({
-  window: browser, document: browser.document, HTMLElement: browser.HTMLElement, Node: browser.Node,
+  window: browser,
+  document: browser.document,
+  HTMLElement: browser.HTMLElement,
+  Node: browser.Node,
   IS_REACT_ACT_ENVIRONMENT: true,
 })) {
   saved.set(key, Object.getOwnPropertyDescriptor(globalThis, key));
@@ -157,39 +183,55 @@ try {
   const { createRoot } = await import('react-dom/client');
   let selections = 0;
   let observedInstance: StateBusInstance | undefined;
-  let publishAdjustment: ReturnType<typeof inventory.useEventPublisher<Parameters<typeof inventoryLibrary.setup>[0]>> | undefined;
-  // Keep the actual inferred command publisher below; no hand-restated event shape or source-path import.
-  const publishers: ReturnType<typeof inventory.getBus>['publisher'][] = [];
+  const publishers: ((command: Adjust) => void)[] = [];
   const accesses: ReturnType<typeof inventory.getBus>[] = [];
+  const {
+    useBus: useInventoryBus,
+    useStateValue: useInventoryState,
+    useKeyedState: useInventoryResource,
+    useEventPublisher: useInventoryPublisher,
+  } = inventory;
   const useSummary = inventory.createSelectionHook(
     'inventory.factory-summary',
     (state, model, props: { id: ShelfId }) => {
       selections++;
-      return { stock: state.readKeyed(model.inventory, props.id), incoming: state.readKeyed(model.incoming, props.id) };
+      return {
+        stock: state.readKeyed(model.inventory, props.id),
+        incoming: state.readKeyed(model.incoming, props.id),
+      };
     },
     (model, props) => [model.inventory.at(props.id), model.incoming.at(props.id)],
   );
   function Connector() {
-    const access = inventory.useBus();
+    const access = useInventoryBus();
     observedInstance = access.instance;
     accesses.push(access);
-    publishers.push(access.publisher);
-    const id = inventory.useStateValue((model) => model.selected);
-    const value = inventory.useKeyedState((model) => model.inventory, id);
-    const emit = inventory.useEventPublisher((model) => model.adjust);
+    const id = useInventoryState((model) => model.selected);
+    const value = useInventoryResource((model) => model.inventory, id);
+    const emit = useInventoryPublisher((model) => model.adjust);
+    publishers.push(emit);
     const summary = useSummary({ id });
-    return h('button', {
-      onClick: () => emit({ shelfId: id, requestId: requestId('request:click'), add: 1 }),
-    }, `${id}:${previousData(value)?.value ?? value.kind}:${summary.incoming.kind}`);
+    return h(
+      'button',
+      {
+        type: 'button',
+        onClick: () => emit({ shelfId: id, requestId: requestId('request:click'), add: 1 }),
+      },
+      `${id}:${previousData(value)?.value ?? value.kind}:${summary.incoming.kind}`,
+    );
   }
-  void publishAdjustment;
-  function connect(bus: StateBusInstance, scope = inventory.getBus(bus)) {
+  function connect(bus: StateBusInstance, scope = inventory.getBus(bus), pendingMutation?: Promise<number>) {
     const model = scope.exports;
-    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false, gcTime: Number.POSITIVE_INFINITY } } });
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false, gcTime: Number.POSITIVE_INFINITY } },
+    });
     let sequence = 0;
     let reads = 0;
     let mutations = 0;
-    for (const [state, event, value] of [[model.inventory, model.load, 5], [model.incoming, model.loadIncoming, 2]] as const) {
+    for (const [state, event, value] of [
+      [model.inventory, model.load, 5],
+      [model.incoming, model.loadIncoming, 2],
+    ] as const) {
       const binding = composedLoaderChannel(bus, state, event);
       bindComposedQueryLoader(binding, {
         queryClient,
@@ -198,70 +240,88 @@ try {
         failure: () => 'network',
         query: (request) => ({
           queryKey: [state.metadata.key, binding.resourceId(request.interest)],
-          execute: async () => { reads++; return value; },
+          execute: async () => {
+            reads++;
+            return value;
+          },
         }),
       });
     }
     bindEffect(bus, model.effect, {
-      execute: async (plan) => { mutations++; return new Ok(plan.next); },
+      execute: async (plan) => {
+        mutations++;
+        return new Ok(pendingMutation ? await pendingMutation : plan.next);
+      },
       failure: () => new Err('network'),
     });
     return { queryClient, reads: () => reads, mutations: () => mutations };
   }
 
-  await test('the unchanged library connector works standalone or under only its host Provider', async () => {
-    for (const api of [inventory, app]) {
-      const bus = api.createBus({ scheduler: new ManualScheduler() });
-      const model = inventory.getBus(bus).exports;
-      const execution = connect(bus);
-      const recorder = recordScenario(bus);
-      const node = document.createElement('div');
-      const root = createRoot(node);
-      try {
-        await act(async () => {
-          root.render(h(StrictMode, null, h(api.Provider, { bus }, h(Connector))));
-          await Promise.resolve();
+  async function exerciseConnector<Exports, Libraries extends BusApiLibraries>(
+    api: ReactBusApi<Exports, Libraries>,
+    hosted: boolean,
+  ): Promise<void> {
+    const { createBus, Provider } = api;
+    const bus = createBus({ scheduler: new ManualScheduler() });
+    const model = inventory.getBus(bus).exports;
+    const execution = connect(bus);
+    const recorder = recordScenario(bus);
+    const node = document.createElement('div');
+    const root = createRoot(node);
+    try {
+      await act(() => root.render(h(StrictMode, null, h(Provider, { bus }, h(Connector)))));
+      await act(() => bus.drain());
+      assert.equal(observedInstance, bus, 'Library hooks must use the host bus, never a nested store.');
+      assert.equal(execution.reads(), 2, 'Stock and incoming demand load independently.');
+      assert.ok(node.textContent?.includes('shelf:a:5:ready'));
+      const command = { shelfId: shelfId('shelf:a'), requestId: requestId('request:factory'), add: 3 };
+      await act(async () => {
+        bus.publish(model.adjust, command);
+        bus.publish(model.adjust, command);
+        await bus.drain();
+      });
+      assert.equal(execution.mutations(), 1);
+      assert.ok(node.textContent?.includes('shelf:a:8:ready'));
+      if (hosted) {
+        const before = selections;
+        const host = app.getBus(bus);
+        const child = host.library('telemetry');
+        await act(() => {
+          bus.publish(child.exports.tick, 1);
+          bus.flush();
         });
-        await act(() => bus.drain());
-        assert.equal(observedInstance, bus, 'Library hooks must use the host bus, never a nested store.');
-        assert.equal(execution.reads(), 2, 'Stock and incoming demand load independently.');
-        assert.ok(node.textContent?.includes('shelf:a:5:ready'));
-        const command = { shelfId: shelfId('shelf:a'), requestId: requestId('request:factory'), add: 3 };
-        await act(async () => {
-          bus.publish(model.adjust, command);
-          bus.publish(model.adjust, command);
-          await bus.drain();
-        });
-        assert.equal(execution.mutations(), 1);
-        assert.ok(node.textContent?.includes('shelf:a:8:ready'));
-        if (api === app) {
-          const before = selections;
-          const host = app.getBus(bus);
-          const child = host.library('telemetry');
-          await act(() => { bus.publish(child.exports.tick, 1); bus.flush(); });
-          assert.equal(selections, before, 'Unrelated host state cannot reconstruct library snapshots.');
-          assert.equal(bus.read(host.exports.completed), 1);
-        }
-        const capture = recorder.snapshot();
-        const replay = api.replayScenario(capture);
-        try {
-          assert.equal(inventory.getBus(replay).instance, replay);
-          assert.deepEqual(captureCheckpoint(replay), captureCheckpoint(bus));
-          let io = 0;
-          bindEffect(replay, inventory.getBus(replay).exports.effect, {
-            execute: () => { io++; return new Ok(0); }, failure: () => new Err('forbidden'),
-          });
-          assert.equal(io, 0);
-        } finally { replay.dispose(); }
-        await act(() => root.unmount());
-        bus.flush();
-        assert.deepEqual(bus.interestSource.snapshot(), []);
-      } finally {
-        recorder.dispose();
-        bus.dispose();
-        execution.queryClient.clear();
+        assert.equal(selections, before, 'Unrelated host state cannot reconstruct library snapshots.');
+        assert.equal(bus.read(host.exports.completed), 1);
       }
+      const capture = recorder.snapshot();
+      const replay = api.replayScenario(capture);
+      try {
+        assert.equal(inventory.getBus(replay).instance, replay);
+        assert.deepEqual(captureCheckpoint(replay), captureCheckpoint(bus));
+        let io = 0;
+        bindEffect(replay, inventory.getBus(replay).exports.effect, {
+          execute: () => {
+            io++;
+            return new Ok(0);
+          },
+          failure: () => new Err('forbidden'),
+        });
+        assert.equal(io, 0);
+      } finally {
+        replay.dispose();
+      }
+    } finally {
+      await act(() => root.unmount());
+      bus.flush();
+      assert.deepEqual(bus.interestSource.snapshot(), []);
+      recorder.dispose();
+      bus.dispose();
+      execution.queryClient.clear();
     }
+  }
+  await test('the unchanged library connector works standalone or under only its host Provider', async () => {
+    await exerciseConnector(inventory, false);
+    await exerciseConnector(app, true);
   });
 
   await test('explicit repeated-library selection and bus switching replace leases without replacing the connector', async () => {
@@ -287,18 +347,72 @@ try {
       await render(a, right);
       a.flush();
       assert.equal(accesses.at(-1), right);
-      assert.equal(a.interestSource.snapshot().some((entry) => entry.interest.key === left.exports.inventory.metadata.key), false);
+      assert.notEqual(publishers.at(-1), publisher);
+      assert.equal(
+        a.interestSource.snapshot().some((entry) => entry.interest.key === left.exports.inventory.metadata.key),
+        false,
+      );
       await render(b, other);
       a.flush();
       assert.equal(observedInstance, b);
       assert.deepEqual(a.interestSource.snapshot(), []);
       assert.equal(accesses.at(-1), other);
+    } finally {
       await act(() => root.unmount());
       b.flush();
       assert.deepEqual(b.interestSource.snapshot(), []);
-    } finally {
-      a.dispose(); b.dispose();
+      a.dispose();
+      b.dispose();
       for (const boundary of execution) boundary.queryClient.clear();
+    }
+  });
+
+  await test('a late old-resource mutation cannot retarget the new factory-hook selection', async () => {
+    const bus = app.createBus({ scheduler: new ManualScheduler() });
+    const scope = inventory.getBus(bus);
+    const model = scope.exports;
+    const pending = Promise.withResolvers<number>();
+    const execution = connect(bus, scope, pending.promise);
+    const node = document.createElement('div');
+    const root = createRoot(node);
+    const oldId = shelfId('shelf:a');
+    const newId = shelfId('shelf:b');
+    try {
+      await act(() => root.render(h(app.Provider, { bus }, h(Connector))));
+      await act(() => bus.drain());
+      await act(async () => {
+        bus.publish(model.adjust, { shelfId: oldId, requestId: requestId('request:late'), add: 3 });
+        bus.flush();
+        bus.publish(model.selectionChanged, newId);
+        bus.flush();
+      });
+      await act(async () => {
+        for (let step = 0; step < 24; step++) {
+          await Promise.resolve();
+          bus.flush();
+        }
+      });
+      assert.equal(execution.mutations(), 1);
+      assert.ok(node.textContent?.includes('shelf:b:5:ready'));
+      assert.equal(
+        bus.interestSource.snapshot().some((entry) => entry.interest.id === oldId),
+        false,
+      );
+      await act(async () => {
+        pending.resolve(8);
+        await bus.drain();
+      });
+      assert.ok(node.textContent?.includes('shelf:b:5:ready'));
+      assert.equal(previousData(bus.readKeyed(model.inventory, oldId))?.value, 8);
+      assert.equal(previousData(bus.readKeyed(model.inventory, newId))?.value, 5);
+    } finally {
+      pending.resolve(8);
+      await act(() => bus.drain());
+      await act(() => root.unmount());
+      bus.flush();
+      assert.deepEqual(bus.interestSource.snapshot(), []);
+      bus.dispose();
+      execution.queryClient.clear();
     }
   });
 
@@ -309,7 +423,7 @@ try {
     inventory.useKeyedState((model) => model.inventory, 'shelf:unbranded');
     // @ts-expect-error Factory-bound publishers retain the actual command payload.
     inventory.useEventPublisher((model) => model.adjust)('untyped');
-    // @ts-expect-error A configured library is an API, not a live bus instance.
+    // @ts-expect-error An included library is an API, not a live bus instance.
     createCoreBusApi({ name: 'invalid', libraries: { inventory: inventory.createBus() }, setup: () => ({}) });
   }
   void negativeTypes;

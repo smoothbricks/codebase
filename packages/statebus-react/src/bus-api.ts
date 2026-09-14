@@ -1,10 +1,10 @@
 import {
-  createBusApi as createCoreBusApi,
   type BusAccess,
   type BusAccessReference,
-  type BusApi as CoreBusApi,
   type BusApiLibraries,
   type BusApiSpecification,
+  type BusApi as CoreBusApi,
+  createBusApi as createCoreBusApi,
   type EventHandle,
   type KeyedHandle,
   type ReadableHandle,
@@ -13,14 +13,7 @@ import {
   type StateReader,
   type ViewProps,
 } from '@smoothbricks/statebus-core';
-import {
-  createContext,
-  createElement,
-  type ReactNode,
-  useContext,
-  useMemo,
-  useSyncExternalStore,
-} from 'react';
+import { createContext, createElement, type ReactNode, useContext, useMemo, useSyncExternalStore } from 'react';
 import { RuntimeContext, useSelectionBinding } from './composition.js';
 
 const ApiContext = createContext<BusAccessReference | null>(null);
@@ -59,7 +52,7 @@ export function createBusApi<Exports, Libraries extends BusApiLibraries = Record
     const instance = bus ?? scope?.instance;
     if (!instance) throw new Error('A bus API Provider requires a bus or a selected scope.');
     if (scope && parent && scope.instance !== parent.instance)
-      throw new Error('A library scope cannot select another provider\'s StateBus.');
+      throw new Error("A library scope cannot select another provider's StateBus.");
     const access = api.getBus(instance, scope);
     instance.assertReady();
     return createElement(
@@ -115,5 +108,13 @@ export function createBusApi<Exports, Libraries extends BusApiLibraries = Record
       );
     };
   }
-  return Object.freeze({ ...api, Provider, useBus, useStateValue, useKeyedState, useEventPublisher, createSelectionHook });
+  return Object.freeze({
+    ...api,
+    Provider,
+    useBus,
+    useStateValue,
+    useKeyedState,
+    useEventPublisher,
+    createSelectionHook,
+  });
 }
