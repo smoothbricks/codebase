@@ -1,25 +1,25 @@
 import {
+  type CaptureEnvelope,
+  type CaptureEnvelopeOptions,
+  createCaptureEnvelope,
+  migrateCaptureEnvelope,
+  replayCaptureEnvelope,
+} from './capture-envelope.js';
+import {
+  type ComposedRuntime,
   composeLibraries,
   defineLibrary,
-  mountLibrary,
-  type ComposedRuntime,
   type EventHandle,
   type LibraryDefinition,
   type LibraryScope,
   type MountedLibrary,
+  mountLibrary,
   type RuntimeOptions,
   type StateBusComposition,
   type StateReader,
 } from './composition.js';
-import {
-  createCaptureEnvelope,
-  migrateCaptureEnvelope,
-  replayCaptureEnvelope,
-  type CaptureEnvelope,
-  type CaptureEnvelopeOptions,
-} from './capture-envelope.js';
 import type { EffectCodecDescriptor } from './effects.js';
-import { replayScenario, type RecordedScenario } from './recording.js';
+import { type RecordedScenario, replayScenario } from './recording.js';
 
 const apiIdentity = Symbol('StateBus API');
 const accessIdentity = Symbol('StateBus access');
@@ -34,9 +34,8 @@ export interface BusApiReference {
 }
 export type BusApiLibraries = Readonly<Record<string, BusApiReference>>;
 export type BusApiExports<Api> = Api extends BusApi<infer Exports, infer _Libraries> ? Exports : never;
-export type BusApiAccess<Api> = Api extends BusApi<infer Exports, infer Libraries>
-  ? BusAccess<Exports, Libraries>
-  : never;
+export type BusApiAccess<Api> =
+  Api extends BusApi<infer Exports, infer Libraries> ? BusAccess<Exports, Libraries> : never;
 
 /** Available only while declaring the parent. Child handles are already resolved and typed. */
 export interface LibraryExports<Libraries extends BusApiLibraries> {
@@ -120,7 +119,8 @@ export function createBusApi<Exports, Libraries extends BusApiLibraries = Record
   const bindings = Object.freeze([...(specification.bindings ?? [])]);
   const previousVersions = Object.freeze([...(specification.previousVersions ?? [])]);
   const dependencies = new Map<string, ApiRecipe>();
-  for (const [key, library] of Object.entries(specification.libraries ?? {})) {
+  const libraries: BusApiLibraries = specification.libraries ?? {};
+  for (const [key, library] of Object.entries(libraries)) {
     if (!key || !library?.[apiIdentity]) throw new Error('A library entry needs a name and a bus API.');
     dependencies.set(key, library[apiIdentity]);
   }
