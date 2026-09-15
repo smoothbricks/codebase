@@ -13,7 +13,9 @@ import {
   type LibraryDefinition,
   type LibraryScope,
   type MountedLibrary,
-  mountLibrary,
+  type mountLibrary,
+  mountResolvedLibrary,
+  RequiredBindings,
   type RuntimeOptions,
   type StateBusComposition,
   type StateReader,
@@ -48,10 +50,14 @@ export interface BusApiSpecification<Exports, Libraries extends BusApiLibraries>
   readonly requires?: LibraryDefinition<Exports>['requires'];
   readonly bindings?: Parameters<typeof mountLibrary>[2];
   readonly libraries?: Libraries;
-  /** Resolve an included library's required capabilities from its siblings, once before any bus exists. */
+  /**
+   * Resolve an included library's required capabilities from its siblings, or explicitly forward this
+   * occurrence's own declared `requires` through `parent`, once before any bus exists.
+   */
   readonly libraryBindings?: {
     readonly [Key in keyof Libraries]?: (
       libraries: LibraryExports<NoInfer<Libraries>>,
+      parent: RequiredBindings,
     ) => NonNullable<Parameters<typeof mountLibrary>[2]>;
   };
   readonly setup: (builder: LibraryScope, libraries: LibraryExports<Libraries>) => Exports;
@@ -137,7 +143,7 @@ export function createBusApi<Exports, Libraries extends BusApiLibraries = Record
 
   const childBindings = new Map<
     string,
-    (libraries: LibraryExports<Libraries>) => NonNullable<Parameters<typeof mountLibrary>[2]>
+    (libraries: LibraryExports<Libraries>, parent: RequiredBindings) => NonNullable<Parameters<typeof mountLibrary>[2]>
   >();
   for (const key in specification.libraryBindings) {
     if (!Object.hasOwn(specification.libraryBindings, key)) continue;
@@ -150,6 +156,16 @@ export function createBusApi<Exports, Libraries extends BusApiLibraries = Record
   const recipe: ApiRecipe = {
     name,
     instantiate(namespace, declarations, suppliedBindings = bindings) {
+      const definition = defineLibrary({
+        name,
+        version,
+        previousVersions,
+        requires,
+        setup: (builder) => setup(builder, libraryExports),
+      });
+      // Validate this occurrence's exact bindings (a parent's override or the standalone defaults)
+      // before children can forward them. The same object is sealed when this occurrence mounts.
+      const parent = new RequiredBindings(definition.requires, suppliedBindings);
       const children = new Map<string, ApiNode>();
       const resolving = new Set<string>();
       function child(key: string): ApiNode {
@@ -161,7 +177,7 @@ export function createBusApi<Exports, Libraries extends BusApiLibraries = Record
         resolving.add(key);
         try {
           const resolve = childBindings.get(key);
-          const bindings = resolve?.(libraryExports);
+          const bindings = resolve?.(libraryExports, parent);
           if (resolve && !Array.isArray(bindings)) throw new Error(`Invalid library bindings at '${name}/${key}'.`);
           // Resolve capability dependencies before their consumers, without creating live state.
           const node = dependency.instantiate(`${namespace}${key.length}:${key}`, declarations, bindings);
@@ -177,14 +193,7 @@ export function createBusApi<Exports, Libraries extends BusApiLibraries = Record
       }
       const libraryExports: LibraryExports<Libraries> = Object.freeze({ get });
       for (const key of dependencies.keys()) child(key);
-      const definition = defineLibrary({
-        name,
-        version,
-        previousVersions,
-        requires,
-        setup: (builder) => setup(builder, libraryExports),
-      });
-      const declaration = mountLibrary(definition, namespace, suppliedBindings);
+      const declaration = mountResolvedLibrary(definition, namespace, parent);
       declarations.push(declaration);
       const accesses = new WeakMap<StateBusInstance, BusAccess<Exports, Libraries>>();
       const descendants = new Map<ApiRecipe, ApiNode | null>();

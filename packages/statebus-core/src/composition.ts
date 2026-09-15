@@ -104,7 +104,7 @@ export class Capability<T> {
     this.values.set(binding, { value });
     return binding;
   }
-  /** @internal Resolution is performed exactly once, while mounting. */
+  /** @internal Idempotent declaration-time lookup; validation and explicit forwarding may resolve a binding repeatedly. */
   resolve(binding: BindingIdentity | undefined): T {
     const entry = binding && this.values.get(binding);
     if (!entry) throw new Error(`Missing or incompatible required binding: ${this.name}`);
@@ -113,6 +113,36 @@ export class Capability<T> {
 }
 export function defineCapability<T>(name: string): Capability<T> {
   return new Capability(name);
+}
+const sealRequiredBindings = Symbol('sealRequiredBindings');
+/** One library occurrence's validated bindings. It resolves only that occurrence's declared requirements. */
+export class RequiredBindings {
+  private readonly required: ReadonlySet<object>;
+  private readonly supplied = new Map<object, BindingIdentity>();
+  private sealed = false;
+  /** @internal Validation runs once per occurrence, before its children, setup or any live state. */
+  constructor(
+    readonly requires: LibraryDefinition<unknown>['requires'],
+    bindings: readonly BindingIdentity[],
+  ) {
+    const required = new Set<object>(requires);
+    if (required.size !== requires.length) throw new Error('Duplicate required capability.');
+    for (const binding of bindings) {
+      if (!required.has(binding.capability) || this.supplied.has(binding.capability))
+        throw new Error('Duplicate or incompatible capability binding.');
+      this.supplied.set(binding.capability, binding);
+    }
+    for (const capability of requires) capability.resolve(this.supplied.get(capability));
+    this.required = required;
+  }
+  require<T>(capability: Capability<T>): T {
+    if (this.sealed) throw new Error('Bindings are resolved only during library setup.');
+    if (!this.required.has(capability)) throw new Error(`Undeclared required binding: ${capability.name}`);
+    return capability.resolve(this.supplied.get(capability));
+  }
+  /** @internal */ [sealRequiredBindings](): void {
+    this.sealed = true;
+  }
 }
 
 export interface StateDeclaration {
@@ -584,8 +614,7 @@ export class LibraryScope {
   private sealed = false;
   constructor(
     owner: string,
-    private readonly bindings: ReadonlyMap<object, BindingIdentity>,
-    private readonly requirements: ReadonlySet<object>,
+    private readonly bindings: RequiredBindings,
   ) {
     this.ownerToken = Object.freeze({ name: owner });
   }
@@ -615,8 +644,7 @@ export class LibraryScope {
   }
   require<T>(capability: Capability<T>): T {
     if (this.sealed) throw new Error('Bindings are resolved only during library setup.');
-    if (!this.requirements.has(capability)) throw new Error(`Undeclared required binding: ${capability.name}`);
-    const value = capability.resolve(this.bindings.get(capability));
+    const value = this.bindings.require(capability);
     // Handle-valued requirements also require their owning mount in the composition.
     if (
       value instanceof ScalarHandle ||
@@ -713,18 +741,21 @@ export function mountLibrary<Exports>(
   bindings: readonly BindingIdentity[] = [],
 ): MountedLibrary<Exports> {
   if (!owner) throw new Error('A library mount needs an owner.');
-  const required = new Set<object>(definition.requires);
-  if (required.size !== definition.requires.length) throw new Error('Duplicate required capability.');
-  const supplied = new Map<object, BindingIdentity>();
-  for (const binding of bindings) {
-    if (!required.has(binding.capability) || supplied.has(binding.capability))
-      throw new Error('Duplicate or incompatible capability binding.');
-    supplied.set(binding.capability, binding);
-  }
-  for (const capability of definition.requires) capability.resolve(supplied.get(capability));
-  const scope = new LibraryScope(owner, supplied, required);
+  return mountResolvedLibrary(definition, owner, new RequiredBindings(definition.requires, bindings));
+}
+/** @internal Mount with bindings already validated for this exact definition, e.g. after children forwarded them. */
+export function mountResolvedLibrary<Exports>(
+  definition: LibraryDefinition<Exports>,
+  owner: string,
+  bindings: RequiredBindings,
+): MountedLibrary<Exports> {
+  if (!owner) throw new Error('A library mount needs an owner.');
+  if (bindings.requires !== definition.requires)
+    throw new Error('Library bindings were resolved for a different definition.');
+  const scope = new LibraryScope(owner, bindings);
   const exports = definition.setup(scope);
   scope.seal();
+  bindings[sealRequiredBindings]();
   return Object.freeze({ definition, owner, exports, scope });
 }
 
