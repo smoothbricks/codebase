@@ -1,6 +1,6 @@
 {
   "name": "@smoothbricks/statebus-navigation-browser",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "type": "module",
   "description": "Explicitly owned browser history and URL-observation adapter for StateBus navigation.",
   "license": "MIT",

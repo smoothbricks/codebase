@@ -1,6 +1,6 @@
 {
   "name": "@smoothbricks/statebus-navigation-core",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "type": "module",
   "description": "Platform-neutral navigation intent, observation and reducer contracts for StateBus.",
   "license": "MIT",
