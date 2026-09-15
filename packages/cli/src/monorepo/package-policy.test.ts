@@ -8,6 +8,9 @@ import {
   BOUNDED_TEST_PER_TEST_TIMEOUT_MS,
   BOUNDED_TEST_TIMEOUT_MS,
 } from '@smoothbricks/nx-plugin/bounded-test-policy';
+import { generateManagedFiles } from '@smoothbricks/nx-plugin/managed-files/generator';
+import { FsTree } from 'nx/src/generators/tree.js';
+import { finishManagedFiles } from './managed-fs.js';
 
 const TIMEOUT_FLAG = `--timeout=${BOUNDED_TEST_PER_TEST_TIMEOUT_MS}`;
 
@@ -27,6 +30,11 @@ import {
   validateTestFileLocations,
   validateWorkspaceDependencies,
 } from './package-policy.js';
+
+async function reconcileManagedFiles(root: string): Promise<void> {
+  const tree = new FsTree(root, false);
+  finishManagedFiles(root, tree, await generateManagedFiles(tree, {}), 'update');
+}
 
 const buildOutputDependencies = [
   '^build',
@@ -821,6 +829,7 @@ describe('workspace package script policy', () => {
 
       expect(validateWorkspaceDependencies(root)).toBe(2);
 
+      await reconcileManagedFiles(root);
       applyWorkspaceDependencyDefaults(root);
 
       const testTsconfig = await readJson(join(root, 'packages/app/tsconfig.test.json'));
@@ -850,6 +859,7 @@ describe('workspace package script policy', () => {
       const firstPackage = await readFile(join(root, 'packages/app/package.json'), 'utf8');
       const firstProjectConfig = await readFile(join(root, 'packages/app/tsconfig.json'), 'utf8');
       const firstTestConfig = await readFile(join(root, 'packages/app/tsconfig.test.json'), 'utf8');
+      await reconcileManagedFiles(root);
       applyWorkspaceDependencyDefaults(root);
       expect(await readFile(join(root, 'packages/app/package.json'), 'utf8')).toBe(firstPackage);
       expect(await readFile(join(root, 'packages/app/tsconfig.json'), 'utf8')).toBe(firstProjectConfig);
@@ -869,6 +879,7 @@ describe('workspace package script policy', () => {
         extends: '../../tsconfig.base.json',
         compilerOptions: { rootDir: 'src' },
       });
+      await reconcileManagedFiles(root);
       applyWorkspaceDependencyDefaults(root);
       expect(validateWorkspaceDependencies(root)).toBe(0);
 
@@ -878,6 +889,7 @@ describe('workspace package script policy', () => {
       });
       expect(validateWorkspaceDependencies(root)).toBe(1);
 
+      await reconcileManagedFiles(root);
       applyWorkspaceDependencyDefaults(root);
       const repaired = await readJson(join(root, 'packages/app/tsconfig.test.json'));
       expect(repaired).toMatchObject({ compilerOptions: { lib: ['es2024'] } });
@@ -900,6 +912,7 @@ describe('workspace package script policy', () => {
 
       expect(validateWorkspaceDependencies(root)).toBe(2);
 
+      await reconcileManagedFiles(root);
       applyWorkspaceDependencyDefaults(root);
 
       const testTsconfig = await readJson(join(root, 'packages/app/tsconfig.test.json'));
@@ -942,6 +955,7 @@ describe('workspace package script policy', () => {
     try {
       expect(validateWorkspaceDependencies(root)).toBe(2);
 
+      await reconcileManagedFiles(root);
       applyWorkspaceDependencyDefaults(root);
 
       const testTsconfig = await readJson(join(root, 'packages/app/tsconfig.test.json'));
@@ -1005,6 +1019,7 @@ describe('workspace package script policy', () => {
     try {
       expect(validateWorkspaceDependencies(root)).toBe(7);
 
+      await reconcileManagedFiles(root);
       applyWorkspaceDependencyDefaults(root);
 
       const app = await readJson(join(root, 'packages/app/package.json'));
@@ -1170,6 +1185,7 @@ describe('workspace package script policy', () => {
     try {
       expect(validateWorkspaceDependencies(root)).toBe(3);
 
+      await reconcileManagedFiles(root);
       applyWorkspaceDependencyDefaults(root);
 
       const app = await readJson(join(root, 'packages/app/package.json'));
