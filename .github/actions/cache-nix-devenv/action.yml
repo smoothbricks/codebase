@@ -27,8 +27,8 @@ runs:
           ${{ github.workspace }}/tooling/direnv/.direnv
         key:
           ${{ runner.os }}-${{ runner.arch }}-devenv-v3-${{ hashFiles('tooling/direnv/devenv.yaml',
-          'tooling/direnv/devenv.nix', 'tooling/direnv/devenv.lock', 'tooling/direnv/envrc.sh',
-          'tooling/direnv/setup-environment.ts') }}
+          'tooling/direnv/devenv.nix', 'tooling/direnv/devenv.smoo.nix', 'tooling/direnv/devenv.lock',
+          'tooling/direnv/envrc.sh', 'tooling/direnv/setup-environment.ts') }}
         restore-keys: |
           ${{ runner.os }}-${{ runner.arch }}-devenv-v3-
 
@@ -41,5 +41,5 @@ runs:
           ${{ github.workspace }}/tooling/direnv/.direnv
         key:
           ${{ runner.os }}-${{ runner.arch }}-devenv-v3-${{ hashFiles('tooling/direnv/devenv.yaml',
-          'tooling/direnv/devenv.nix', 'tooling/direnv/devenv.lock', 'tooling/direnv/envrc.sh',
-          'tooling/direnv/setup-environment.ts') }}
+          'tooling/direnv/devenv.nix', 'tooling/direnv/devenv.smoo.nix', 'tooling/direnv/devenv.lock',
+          'tooling/direnv/envrc.sh', 'tooling/direnv/setup-environment.ts') }}

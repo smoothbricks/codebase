@@ -72,6 +72,13 @@
           }
         ],
         "cache": true,
+        "inputs": [
+          "default",
+          "^default",
+          {
+            "env": "PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH"
+          }
+        ],
         "parallelism": false,
         "options": {
           "command": "smoo playwright run bun test --timeout=30000 browser",

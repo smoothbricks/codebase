@@ -18,9 +18,20 @@
   pkgs,
   ...
 }: {
-  # Nx otherwise defaults to three workers. Scale to the cores available in each
-  # developer shell or CI runner; explicit --parallel flags still take precedence.
-  env.NX_PARALLEL = "100%";
+  env = lib.mkMerge [
+    {
+      # Nx otherwise defaults to three workers. Scale to the cores available in each
+      # developer shell or CI runner; explicit --parallel flags still take precedence.
+      NX_PARALLEL = "100%";
+    }
+    # Playwright's downloaded Ubuntu browser has no runtime closure on NixOS
+    # (CI reached the executable, then failed loading libglib-2.0.so.0). Use
+    # the lock-pinned Nix browser and its libraries; smoo passes this executable
+    # to the child before Playwright imports. Darwin keeps its native browser path.
+    (lib.mkIf pkgs.stdenv.hostPlatform.isLinux {
+      PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH = lib.getExe pkgs.chromium;
+    })
+  ];
   # sccache is deliberately absent from this shell. It used to export
   # RUSTC_WRAPPER=sccache as a BARE NAME, which PATH then resolved per project —
   # which is precisely how an unpatched binary from one profile came to serve
@@ -209,25 +220,27 @@
   # the obvious one is a decoy. `.nodes.nixpkgs` is not what `pkgs` is; the
   # authoritative path is `.nodes.root.inputs.nixpkgs`, which indirects to
   # `nixpkgs_2`.
-  packages = [
-    (import inputs.nixpkgs-go {inherit (pkgs.stdenv.hostPlatform) system;}).go
-    pkgs.nodejs_26
-    pkgs.binaryen
-    # Test runner for inferred Cargo test targets. Generated targets must never
-    # depend on an ambient host installation that CI does not reproduce.
-    pkgs.cargo-nextest
-    # Target-dir GC for the inferred cargo-sweep target: cargo never removes
-    # superseded artifacts on its own (a busy workspace accumulated ~18k stale
-    # variants per crate and 26 GB of junk before this existed), and a sweep
-    # prunes them without touching the warm current-fingerprint surface.
-    pkgs.cargo-sweep
-    # The stable-toolchain arm of smoo's workspace feature-unification policy:
-    # `cargo hakari` generates and wires the workspace-hack crate that unifies
-    # features when `[resolver] feature-unification` — nightly-only, and what
-    # the channel above selects — is unavailable. `smoo monorepo validate` runs
-    # `cargo hakari verify` for a workspace that took that route.
-    pkgs.cargo-hakari
-  ];
+  packages =
+    [
+      (import inputs.nixpkgs-go {inherit (pkgs.stdenv.hostPlatform) system;}).go
+      pkgs.nodejs_26
+      pkgs.binaryen
+      # Test runner for inferred Cargo test targets. Generated targets must never
+      # depend on an ambient host installation that CI does not reproduce.
+      pkgs.cargo-nextest
+      # Target-dir GC for the inferred cargo-sweep target: cargo never removes
+      # superseded artifacts on its own (a busy workspace accumulated ~18k stale
+      # variants per crate and 26 GB of junk before this existed), and a sweep
+      # prunes them without touching the warm current-fingerprint surface.
+      pkgs.cargo-sweep
+      # The stable-toolchain arm of smoo's workspace feature-unification policy:
+      # `cargo hakari` generates and wires the workspace-hack crate that unifies
+      # features when `[resolver] feature-unification` — nightly-only, and what
+      # the channel above selects — is unavailable. `smoo monorepo validate` runs
+      # `cargo hakari verify` for a workspace that took that route.
+      pkgs.cargo-hakari
+    ]
+    ++ lib.optionals pkgs.stdenv.hostPlatform.isLinux [pkgs.chromium];
 
   enterShell = lib.mkMerge [
     # Prologue, in order:

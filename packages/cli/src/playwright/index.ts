@@ -28,9 +28,9 @@ const defaultDependencies: ChromiumSetupDependencies = {
 };
 
 /**
- * Ensure Chromium is available without polluting ephemeral GitHub runners.
- * Persistent host runners and developer machines may install into their
- * respective caches; ephemeral GitHub runners must use their image's browser.
+ * A configured executable owns its runtime closure (notably on NixOS).
+ * Otherwise host runners and developers may install into their caches;
+ * ephemeral GitHub runners must use their image's browser.
  */
 export async function ensureChromium(
   cwd = process.cwd(),
@@ -38,6 +38,14 @@ export async function ensureChromium(
 ): Promise<ChromiumSetupResult> {
   const { env, exists, run: runCommand } = dependencies;
   const githubActions = env.GITHUB_ACTIONS === 'true';
+  const configuredExecutable = env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH;
+  if (configuredExecutable) {
+    if (!exists(configuredExecutable)) {
+      throw new Error(`Configured Chromium executable does not exist: ${configuredExecutable}`);
+    }
+    console.log(`Using configured Chromium: ${configuredExecutable}`);
+    return { mode: 'system', executablePath: configuredExecutable };
+  }
 
   if (githubActions && exists(HOST_CACHE_ROOT)) {
     // Host setup provisions the XDG cache directory, not arbitrary siblings
@@ -52,13 +60,10 @@ export async function ensureChromium(
   }
 
   if (githubActions) {
-    const candidates = [env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH, ...SYSTEM_CHROME_PATHS].filter(
-      (path): path is string => typeof path === 'string' && path.length > 0,
-    );
-    const executablePath = candidates.find(exists);
+    const executablePath = SYSTEM_CHROME_PATHS.find(exists);
     if (!executablePath) {
       throw new Error(
-        `GitHub-hosted runner has no preinstalled Chromium. Refusing to download; searched: ${candidates.join(', ')}`,
+        `GitHub-hosted runner has no preinstalled Chromium. Refusing to download; searched: ${SYSTEM_CHROME_PATHS.join(', ')}`,
       );
     }
     console.log(`Using preinstalled Chromium: ${executablePath}`);
