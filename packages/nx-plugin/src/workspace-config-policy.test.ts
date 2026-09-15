@@ -26,6 +26,7 @@ import {
 function validNxJson(): Record<string, unknown> {
   return {
     plugins: ['@smoothbricks/nx-plugin'],
+    sync: { globalGenerators: ['@smoothbricks/nx-plugin:managed-files'] },
     targetDefaults: validTargetDefaults(),
     namedInputs: validNamedInputs(),
   };
@@ -344,8 +345,7 @@ describe('pure core: applyWorkspaceConfig', () => {
 
   it('accepts custom precise production inputs unchanged', () => {
     const nxJson: Record<string, unknown> = {
-      plugins: validPlugins(),
-      targetDefaults: validTargetDefaults(),
+      ...validNxJson(),
       namedInputs: {
         ...validNamedInputs(),
         production: ['{projectRoot}/src/**/*.rs', '{projectRoot}/Cargo.toml', '!{projectRoot}/**/*.test.*'],

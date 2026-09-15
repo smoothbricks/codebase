@@ -1,9 +1,9 @@
 import { describe, expect, it } from 'bun:test';
 import { existsSync, readFileSync } from 'node:fs';
 import { copyFile, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
 
 /**
  * The measurement THE RULE exists for, taken against the real script.
@@ -16,7 +16,12 @@ import { fileURLToPath } from 'node:url';
  * declared provider commands pointed at a counter.
  */
 
-const MANAGED = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..', 'managed', 'raw', 'tooling');
+const MANAGED = resolve(
+  dirname(createRequire(import.meta.url).resolve('@smoothbricks/nx-plugin/package.json')),
+  'managed',
+  'raw',
+  'tooling',
+);
 
 interface ShellEntry {
   readonly exitCode: number;
