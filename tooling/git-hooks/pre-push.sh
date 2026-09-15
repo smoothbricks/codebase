@@ -1,1 +1,1 @@
-../../packages/cli/managed/raw/tooling/git-hooks/pre-push.sh
+../../packages/nx-plugin/managed/raw/tooling/git-hooks/pre-push.sh

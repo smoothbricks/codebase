@@ -314,7 +314,7 @@ Managed files include:
 - [GitHub Actions] workflows under `.github/workflows`
 - Local composite [GitHub Actions] under `.github/actions`
 
-When a managed target is a symlink, `smoo` leaves it alone. SmoothBricks uses symlinks back to `packages/cli/managed` so
+Matching in-workspace source symlinks are preserved. Broken, escaping, or drifted symlinks are reported instead of followed. SmoothBricks uses symlinks back to `packages/nx-plugin/managed` so
 changes to the CLI package are tested immediately. Downstream repos receive ordinary committed copies.
 
 The publish workflow is conditional. Repositories with no owned release packages skip `.github/workflows/publish.yml` in

@@ -524,3 +524,15 @@ function readPluginNames(value: unknown): unknown[] {
   const plugins: unknown[] = value;
   return plugins.map((plugin) => (typeof plugin === 'string' ? plugin : expectRecord(plugin).plugin));
 }
+
+describe('managed-file sync registration', () => {
+  it('preserves other generators and is idempotent', () => {
+    const nxJson = { sync: { applyChanges: true, globalGenerators: ['example:sync'] } };
+    applyWorkspaceConfig(nxJson);
+    expect(nxJson.sync).toEqual({
+      applyChanges: true,
+      globalGenerators: ['example:sync', '@smoothbricks/nx-plugin:managed-files'],
+    });
+    expect(applyWorkspaceConfig(nxJson)).toBe(false);
+  });
+});

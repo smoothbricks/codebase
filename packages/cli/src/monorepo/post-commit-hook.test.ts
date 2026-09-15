@@ -2,16 +2,11 @@ import { describe, expect, it } from 'bun:test';
 import { spawnSync } from 'node:child_process';
 import { copyFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, join, resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { join } from 'node:path';
+import { managedAssetsRoot } from '@smoothbricks/nx-plugin/managed-assets';
 import { printCommandOutput } from '../lib/run.js';
 
-const hookScript = resolve(
-  dirname(fileURLToPath(import.meta.url)),
-  '..',
-  '..',
-  'managed/raw/tooling/git-hooks/post-commit.sh',
-);
+const hookScript = join(managedAssetsRoot, 'raw/tooling/git-hooks/post-commit.sh');
 
 // Stand-in for git-format-staged, performing the same two writes: it rewrites
 // the blobs in whichever index git handed the hook, and writes the formatted

@@ -1,8 +1,9 @@
 import { createHash } from 'node:crypto';
+import type { DeploymentStage } from '@smoothbricks/nx-plugin/deploy-policy';
 import typia from 'typia';
 import { derivedStagingName, hasStageLabel, replaceExactToken, replaceHostnameLabel } from './stage-labels.js';
 
-export type DeploymentStage = 'staging' | 'production' | `pr${number}`;
+export type { DeploymentStage } from '@smoothbricks/nx-plugin/deploy-policy';
 
 const MAX_PULL_REQUEST_NUMBER = 999_999_999;
 const STAGE_PATTERN = /^(?:staging|production|pr[1-9][0-9]{0,8})$/;

@@ -8,7 +8,7 @@ SELF_PATH="$(realpath "$0")"
 
 # Locate this repository's tooling/ from the INVOCATION path, not from
 # realpath($0). WHY: tooling/devenv is a symlink into
-# packages/cli/managed/raw/tooling/, so realpath lands inside the managed
+# packages/nx-plugin/managed/raw/tooling/, so realpath lands inside the managed
 # template, whose tooling/direnv holds no devenv.yaml — `devenv update` then ran
 # against a directory with nothing to update, printed nothing, and exited 0. A
 # lock-updating command that silently succeeds without updating anything is the
@@ -67,7 +67,7 @@ export DEVENV_SHELL_PWD="$ORIGINAL_PWD"
 
 # Run the actual devenv command with all arguments passed through.
 # For updates, refresh nvfetcher-managed overlay sources first so packages like
-# jmunch-mcp and jcodemunch-mcp are current before devenv.lock is updated.
+# overlay tools are current before devenv.lock is updated.
 if [ "${1:-}" = "update" ]; then
     if [ -f "$DEVENV_DIR/nixpkgs-overlay/nvfetcher.toml" ]; then
       echo "Running nvfetcher for nixpkgs-overlay/..."

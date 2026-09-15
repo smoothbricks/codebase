@@ -8,19 +8,14 @@
  * `smoo secrets run` runs THIS package's copy of the same file. One
  * implementation, so the command and the shell cannot disagree about a group.
  *
- * It is loaded, not statically imported, and that is forced rather than
- * chosen: the file is a raw bootstrap script that must load before any
- * workspace package and before the Typia transform exists, so it lives
- * outside `src` — outside this package's compiled `rootDir`, which a static
- * import may not cross. A dynamic `import()` reaches it in both layouts
- * (`src/secrets/` and `dist/secrets/` are each two directories below the
- * package root), and typia validates what comes back: the same boundary
- * ../monorepo/packed-package.ts puts around a foreign module. `require` is
- * not the alternative — under a Bun loader plugin, which this package's own
- * tests preload, every module is async and `require` of one throws.
+ * The Nx plugin ships this raw bootstrap asset. Resolve it from the installed
+ * plugin, not a checkout-relative path, so source and published layouts agree.
+ * It remains outside compiled src: bootstrap runs before the Typia preload.
  */
 
-import { fileURLToPath, pathToFileURL } from 'node:url';
+import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
+import { managedAssetsRoot } from '@smoothbricks/nx-plugin/managed-assets';
 import typia from 'typia';
 
 /** A declared `smoo.secrets` entry with its group settled. */
@@ -59,7 +54,7 @@ const isSecretReferencesModule = typia.createIs<SecretReferencesModule>();
 const isGroupedSecrets = typia.createIs<GroupedSecret[]>();
 const isSecretResolution = typia.createIs<SecretResolution>();
 
-const RESOLVER_PATH = fileURLToPath(new URL('../../managed/raw/tooling/direnv/secret-references.ts', import.meta.url));
+const RESOLVER_PATH = join(managedAssetsRoot, 'raw/tooling/direnv/secret-references.ts');
 
 interface SecretReferences {
   readSecretGroups: (root: string) => unknown;

@@ -1,7 +1,10 @@
 import { fileURLToPath } from 'node:url';
 import { readJsonObject } from './json.js';
 
-export const smoothBricksCodebasePackageName = '@smoothbricks/codebase';
+export {
+  isSmoothBricksCodebasePackageName,
+  smoothBricksCodebasePackageName,
+} from '@smoothbricks/nx-plugin/workspace-package-policy';
 export const cliPackageVersion = readCliPackageVersion();
 
 function readCliPackageVersion(): string {
@@ -11,8 +14,4 @@ function readCliPackageVersion(): string {
     throw new Error('Unable to read @smoothbricks/cli package version.');
   }
   return version;
-}
-
-export function isSmoothBricksCodebasePackageName(name: string | undefined): boolean {
-  return name === smoothBricksCodebasePackageName;
 }

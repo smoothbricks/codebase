@@ -1,11 +1,13 @@
 /* biome-ignore-all lint/suspicious/noTemplateCurlyInString: GitHub Actions expressions are emitted literally. */
 
+import { parse as parseYaml } from 'yaml';
+
 import {
   cargoCrossTestArchiveFile,
   cargoCrossTestArchiveTargetName,
   cargoCrossTestTargetName,
-} from '@smoothbricks/nx-plugin/cross-check-policy';
-import { PRODUCTION_PUSH_DEPLOY_TAG } from '../lib/deploy-tags.js';
+} from '../cross-check-policy.js';
+import { PRODUCTION_PUSH_DEPLOY_TAG } from '../deploy-policy.js';
 import type {
   NonEmptyArray,
   PackageCargoCredentialsConfig,
@@ -15,7 +17,7 @@ import type {
   PackageSmooGithub,
   PackageSmooGithubEnvironments,
   PackageSourceCheckoutConfig,
-} from '../lib/json.js';
+} from '../workspace-manifest.js';
 import { renderRunsOnLine } from './github-runs-on.js';
 
 export enum CiWorkflowStepKind {
@@ -1024,7 +1026,7 @@ function stagingPushBranch(options: CiWorkflowDefinitionOptions): string {
  * names the platform itself accepts.
  */
 function yamlScalar(value: string): string {
-  if (/^[A-Za-z0-9_][A-Za-z0-9_./-]*$/.test(value) && Bun.YAML.parse(value) === value) {
+  if (/^[A-Za-z0-9_][A-Za-z0-9_./-]*$/.test(value) && parseYaml(value) === value) {
     return value;
   }
   return JSON.stringify(value);

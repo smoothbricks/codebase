@@ -1,0 +1,8 @@
+{
+  "$schema": "https://json-schema.org/schema",
+  "$id": "SmoothbricksManagedFiles",
+  "title": "Synchronize managed monorepo files",
+  "type": "object",
+  "properties": {},
+  "additionalProperties": false
+}

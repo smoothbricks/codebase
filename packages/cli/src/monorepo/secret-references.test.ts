@@ -2,8 +2,9 @@ import { describe, expect, it } from 'bun:test';
 import { existsSync, readFileSync } from 'node:fs';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
-import type { SecretSpec } from '../../managed/raw/tooling/direnv/secret-references.ts';
+import { join } from 'node:path';
+import { managedAssetsRoot } from '@smoothbricks/nx-plugin/managed-assets';
+import type { SecretSpec } from '../../../nx-plugin/managed/raw/tooling/direnv/secret-references.ts';
 
 /**
  * The resolver under test is a managed raw script: at runtime it loads as
@@ -14,16 +15,7 @@ import type { SecretSpec } from '../../managed/raw/tooling/direnv/secret-referen
  * test loads the raw module in a plain `bun -e` child the same way
  * setup-environment.ts does, with no preloads in the chain.
  */
-const RAW_RESOLVER = resolve(
-  import.meta.dir,
-  '..',
-  '..',
-  'managed',
-  'raw',
-  'tooling',
-  'direnv',
-  'secret-references.ts',
-);
+const RAW_RESOLVER = join(managedAssetsRoot, 'raw/tooling/direnv/secret-references.ts');
 
 // The child scripts import the raw module dynamically on purpose: a static
 // value import would route it through the ttsc/Typia transform preloads, which

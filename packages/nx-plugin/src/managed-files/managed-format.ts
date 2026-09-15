@@ -83,6 +83,8 @@ export async function formatManagedContent(root: string, target: string, content
   if (info.ignored || info.inferredParser === null) {
     return content;
   }
+  // Prettier resolves configuration from disk, not pending Nx Tree edits. If
+  // another generator stages formatter config, the next run after flush converges.
   let options: PrettierOptions | null;
   try {
     options = await prettier.resolveConfig(path, { editorconfig: true });
