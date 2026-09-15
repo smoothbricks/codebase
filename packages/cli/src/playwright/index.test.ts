@@ -26,17 +26,28 @@ function setupDependencies(
 describe('ensureChromium', () => {
   it('uses preinstalled Chrome without invoking Playwright install on an ephemeral GitHub runner', async () => {
     const calls: RunCall[] = [];
-    const executablePath = '/fixture/google-chrome';
+    const executablePath = '/usr/bin/google-chrome';
 
+    const result = await ensureChromium(
+      '/workspace/package',
+      setupDependencies({ GITHUB_ACTIONS: 'true' }, [executablePath], calls),
+    );
+
+    expect(result).toEqual({ mode: 'system', executablePath });
+    expect(calls).toEqual([]);
+  });
+
+  it('uses the configured Nix browser instead of downloading an incompatible host binary', async () => {
+    const calls: RunCall[] = [];
+    const executablePath = '/nix/store/fixture-chromium/bin/chromium';
     const result = await ensureChromium(
       '/workspace/package',
       setupDependencies(
         { GITHUB_ACTIONS: 'true', PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH: executablePath },
-        [executablePath],
+        ['/var/cache/ci', executablePath],
         calls,
       ),
     );
-
     expect(result).toEqual({ mode: 'system', executablePath });
     expect(calls).toEqual([]);
   });

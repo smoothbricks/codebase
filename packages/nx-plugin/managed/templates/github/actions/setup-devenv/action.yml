@@ -200,7 +200,7 @@ runs:
           /nix
           ~/.cache/nix
         # prettier-ignore
-        primary-key: ${{ runner.os }}-${{ runner.arch }}-nix-v6-${{ hashFiles('tooling/direnv/devenv.yaml', 'tooling/direnv/devenv.nix', 'tooling/direnv/devenv.lock') }}
+        primary-key: ${{ runner.os }}-${{ runner.arch }}-nix-v6-${{ hashFiles('tooling/direnv/devenv.yaml', 'tooling/direnv/devenv.nix', 'tooling/direnv/devenv.smoo.nix', 'tooling/direnv/devenv.lock') }}
         restore-prefixes-first-match: ${{ runner.os }}-${{ runner.arch }}-nix-v6-
         gc-max-store-size: 1G
 

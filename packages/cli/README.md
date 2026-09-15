@@ -181,9 +181,11 @@ workflow is now required, without making every commit pay for full validation.
 
 Browser-test targets can use `smoo playwright run bun test --timeout=30000 browser`. The command prepares Chromium
 through the shared browser policy, then starts the child with the selected browser location in its environment before
-Playwright is imported. Host runners use the configured Playwright cache or their XDG cache; ephemeral GitHub runners
-use their preinstalled browser without downloading. Developer machines use their configured or default Playwright cache.
-Targets using this command must depend on the CLI build as well as their application build.
+Playwright is imported. `PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH` takes precedence: managed Linux shells provide lock-pinned
+Nix Chromium with its complete runtime closure, rather than an Ubuntu download missing NixOS libraries. Without a
+configured executable, host runners use the configured Playwright cache or their XDG cache; ephemeral GitHub runners use
+their preinstalled browser without downloading. Developer machines use their configured or default cache. Targets using
+this command must depend on the CLI build as well as their application build.
 
 ## Publishable Packages
 
