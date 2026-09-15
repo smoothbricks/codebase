@@ -4,7 +4,7 @@ import { variants } from './generate/index.js';
 import { dispatchCiWorkflow, ensureCiPullRequest } from './github-ci/api.js';
 import { cliPackageVersion } from './lib/cli-package.js';
 import { decode, findRepoRoot, printCommandOutput } from './lib/run.js';
-import { ensureChromium } from './playwright/index.js';
+import { ensureChromium, runWithChromium } from './playwright/index.js';
 import { resolvePrConflicts } from './pr/index.js';
 import { secretsSet, secretsStatus, secretsSync } from './secrets/commands.js';
 import { secretsRun } from './secrets/run.js';
@@ -524,13 +524,20 @@ function buildProgram(): Command {
       }
     });
 
-  const playwright = program.command('playwright').description('Manage Playwright browsers');
+  const playwright = program.command('playwright').description('Manage Playwright browsers').enablePositionalOptions();
   const playwrightEnsure = playwright.command('ensure').description('Ensure a Playwright browser is available');
   playwrightEnsure
     .command('chromium')
     .description('Ensure Chromium is available for browser tests')
     .action(async () => {
       await ensureChromium();
+    });
+  playwright
+    .command('run <command> [args...]')
+    .description('Run a command with Chromium prepared and its browser path in the child environment')
+    .passThroughOptions()
+    .action(async (command: string, args: string[]) => {
+      await runWithChromium(command, args);
     });
 
   const secrets = program
