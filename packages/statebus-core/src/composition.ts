@@ -104,7 +104,7 @@ export class Capability<T> {
     this.values.set(binding, { value });
     return binding;
   }
-  /** @internal Resolution is performed exactly once, while mounting. */
+  /** @internal Idempotent declaration-time lookup; validation and explicit forwarding may resolve a binding repeatedly. */
   resolve(binding: BindingIdentity | undefined): T {
     const entry = binding && this.values.get(binding);
     if (!entry) throw new Error(`Missing or incompatible required binding: ${this.name}`);

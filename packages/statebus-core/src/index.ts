@@ -55,7 +55,43 @@ export {
   type SupportExportOptions,
 } from './capture-envelope.js';
 export { type CodecMigration, evolveCodec } from './codec.js';
-export * from './composition.js';
+export {
+  Capability,
+  CapabilityBinding,
+  ComposedRuntime,
+  composeLibraries,
+  type DeclarationMetadata,
+  type DeclarationOptions,
+  defineCapability,
+  defineLibrary,
+  type EncodedEvent,
+  type EncodedState,
+  type EncodedStateEntry,
+  type EncodedValue,
+  EventHandle,
+  type ExternalStore,
+  KeyedHandle,
+  type LibraryDefinition,
+  LibraryScope,
+  type MountedLibrary,
+  mountLibrary,
+  Publication,
+  type ReadableHandle,
+  ReducerState,
+  type RequiredBindings,
+  ResourceHandle,
+  type RuntimeDiagnostic,
+  type RuntimeDiagnosticPhase,
+  type RuntimeOptions,
+  ScalarHandle,
+  StateBusComposition,
+  type StateDeclaration,
+  type StateInterestHandle,
+  type StateReader,
+  type SupportClassification,
+  type ValueCodec,
+  type WaveObserver,
+} from './composition.js';
 export { bindRuntimeDiagnostics } from './diagnostics.js';
 export { DispatchCycleError, type DispatchScheduler, ManualScheduler, microtaskScheduler } from './dispatch.js';
 export * from './effects.js';

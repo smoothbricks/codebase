@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import * as publicCore from '@smoothbricks/statebus-core';
 import {
   type BusApiExports,
   bindEffect,
@@ -106,6 +107,8 @@ async function test(name: string, run: () => void | Promise<void>): Promise<void
 
 await test('host -> CMS -> feature forwards the exact hosted auth, never the standalone default', async () => {
   // cms, host and portal (twice) each resolved one editor occurrence while being declared.
+  assert.equal(Object.hasOwn(publicCore, 'mountResolvedLibrary'), false);
+  assert.equal(Object.hasOwn(publicCore, 'RequiredBindings'), false);
   assert.equal(editorForwards, 4);
   assert.equal(hostForwards, 1);
   assert.equal(authInitializations, 0);
