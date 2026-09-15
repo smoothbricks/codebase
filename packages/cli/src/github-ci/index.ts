@@ -3,7 +3,6 @@ import { readFileSync } from 'node:fs';
 import { appendFile } from 'node:fs/promises';
 import { PERMANENT_DEPLOY_TAG, STAGING_DEPLOY_TAG, stageDeploysProject } from '@smoothbricks/nx-plugin/deploy-policy';
 import { PLATFORM_TARGET_GLOBS } from '@smoothbricks/nx-plugin/workspace-config-policy';
-import { $ } from 'bun';
 import typia from 'typia';
 import {
   ciPushBranches,
@@ -13,7 +12,7 @@ import {
   parseStringArrayText,
   readSmooGithub,
 } from '../lib/json.js';
-import { decode, printCommandOutput, run, runStatus, runText } from '../lib/run.js';
+import { printCommandOutput, run, runStatus, runText } from '../lib/run.js';
 import { type ProjectTargets, readProjectTargets } from '../nx/index.js';
 import { type DeploymentStage, isPullRequestStage, parseDeploymentStage, pullRequestStage } from '../wrangler/stage.js';
 import { ciApiContext, ciApiRequest } from './api.js';
@@ -725,26 +724,47 @@ async function postGithubStatus(name: string, state: string, description: string
   });
 }
 
+interface GithubWorkflowJob {
+  name: string;
+  status: string;
+  runner_name: string | null;
+  html_url: string;
+}
+
+/** GITHUB_JOB is a workflow key, not the display name returned by the jobs API. */
+export function githubStepUrlForJobs(
+  jobs: readonly GithubWorkflowJob[],
+  runnerName: string,
+  step: string,
+): string | null {
+  const job = jobs.find((candidate) => candidate.runner_name === runnerName && candidate.status === 'in_progress');
+  if (!job) return null;
+  return step ? `${job.html_url}#step:${step}:1` : job.html_url;
+}
+
 async function getGithubStepUrl(step: string): Promise<string | null> {
   const repository = process.env.GITHUB_REPOSITORY;
   const runId = process.env.GITHUB_RUN_ID;
-  const job = process.env.GITHUB_JOB;
-  if (!repository || !runId || !job) {
+  if (!repository || !runId) {
     return null;
   }
   const { forgejo, htmlBase } = ciApiContext();
   if (forgejo) return `${htmlBase}/${repository}/actions/runs/${runId}`;
-  const result =
-    await $`gh api -H ${'Accept: application/vnd.github+json'} ${`/repos/${repository}/actions/runs/${runId}/jobs`} --jq ${`.jobs[] | select(.name == "${job}") | .id`}`
-      .quiet()
-      .nothrow();
-  const jobId = decode(result.stdout).trim();
-  if (!jobId) {
-    return `${htmlBase}/${repository}/actions/runs/${runId}`;
+  const runnerName = process.env.RUNNER_NAME;
+  if (!runnerName) throw new Error('Cannot link GitHub Actions logs without RUNNER_NAME.');
+  const attempt = process.env.GITHUB_RUN_ATTEMPT ?? '1';
+  for (let page = 1; ; page++) {
+    const response = await ciApiRequest(
+      `/actions/runs/${runId}/attempts/${attempt}/jobs?per_page=100&page=${page}`,
+      'GET',
+    );
+    const { jobs } = typia.json.assertParse<{ jobs: GithubWorkflowJob[] }>(await response.text());
+    const url = githubStepUrlForJobs(jobs, runnerName, step);
+    if (url) return url;
+    if (jobs.length < 100) {
+      throw new Error(`Cannot find the running GitHub Actions job for runner "${runnerName}" in run ${runId}.`);
+    }
   }
-  return step
-    ? `${htmlBase}/${repository}/actions/runs/${runId}/job/${jobId}#step:${step}:1`
-    : `${htmlBase}/${repository}/actions/runs/${runId}/job/${jobId}`;
 }
 
 export function githubCommitStatusesWritable(

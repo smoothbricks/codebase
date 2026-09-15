@@ -11,6 +11,7 @@ import {
   githubCiNxDeploy,
   githubCiNxRunMany,
   githubCommitStatusesWritable,
+  githubStepUrlForJobs,
   nxRunManyArgs,
   nxRunManyBatchArgs,
   nxSmartArgs,
@@ -58,6 +59,33 @@ describe('GitHub commit status permissions', () => {
     expect(
       githubCommitStatusesWritable({ GITHUB_EVENT_NAME: 'push', GITHUB_REPOSITORY: 'owner/repo' }, undefined),
     ).toBe(true);
+  });
+});
+
+describe('GitHub Actions step links', () => {
+  const runUrl = 'https://github.com/smoothbricks/codebase/actions/runs/34967722056';
+
+  it('links the running job on this runner, independently of workflow keys and display names', () => {
+    const runner = 'bread-main-s6wltmlyvjgk';
+    const jobUrl = `${runUrl}/job/104376095985`;
+    const jobs = [
+      { name: runner, runner_name: 'another-runner', status: 'in_progress', html_url: `${runUrl}/job/1` },
+      { name: 'Validate', runner_name: runner, status: 'completed', html_url: `${runUrl}/job/2` },
+      { name: 'Validate', runner_name: runner, status: 'in_progress', html_url: jobUrl },
+    ];
+
+    expect(githubStepUrlForJobs(jobs, runner, '8')).toBe(`${jobUrl}#step:8:1`);
+    expect(githubStepUrlForJobs(jobs, runner, '')).toBe(jobUrl);
+  });
+
+  it('does not select another runner or a finished job when the current job is absent', () => {
+    expect(
+      githubStepUrlForJobs(
+        [{ name: 'Validate', runner_name: 'another-runner', status: 'in_progress', html_url: `${runUrl}/job/1` }],
+        'current-runner',
+        '8',
+      ),
+    ).toBeNull();
   });
 });
 
