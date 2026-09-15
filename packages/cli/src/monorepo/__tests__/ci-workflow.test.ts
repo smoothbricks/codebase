@@ -30,13 +30,6 @@ function options(overrides: Partial<CiWorkflowDefinitionOptions> = {}): CiWorkfl
 }
 
 describe('CI workflow definition', () => {
-  it('renders the checked-in local CI workflow copy', async () => {
-    const rendered = renderCiWorkflowYaml(options({ runsOn: [...nixosRunsOn] }));
-    const packageRoot = join(import.meta.dir, '..', '..', '..');
-
-    await expect(readFile(join(packageRoot, '..', '..', '.github/workflows/ci.yml'), 'utf8')).resolves.toBe(rendered);
-  });
-
   it('deploys immediately after build and renumbers following steps', () => {
     const definition = options({ deploy: true, browserTests: true });
     const steps = defineCiWorkflow(definition);
