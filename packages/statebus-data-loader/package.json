@@ -34,6 +34,9 @@
   "devDependencies": {
     "fast-check": "^4.4.0"
   },
+  "scripts": {
+    "test": "nx run statebus-data-loader:test --outputStyle=stream"
+  },
   "nx": {
     "name": "statebus-data-loader",
     "tags": [

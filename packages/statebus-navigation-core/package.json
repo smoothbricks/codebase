@@ -31,8 +31,11 @@
     "tslib": "^2.8.1"
   },
   "devDependencies": {
-    "fast-check": "^4.4.0",
-    "@smoothbricks/statebus-core": "workspace:*"
+    "@smoothbricks/statebus-core": "workspace:*",
+    "fast-check": "^4.4.0"
+  },
+  "scripts": {
+    "test": "nx run statebus-navigation-core:test --outputStyle=stream"
   },
   "nx": {
     "name": "statebus-navigation-core",

@@ -9,11 +9,23 @@
     "types": ["bun"],
     "lib": ["es2024"]
   },
-  "include": ["src/**/*.test.ts", "src/**/__tests__/**/*.ts"],
+  "include": [
+    "src/**/*.test.ts",
+    "src/**/__tests__/**/*.ts",
+    "src/**/*.spec.ts",
+    "src/**/__tests__/**/*.tsx",
+    "src/test-suite-tracer.ts"
+  ],
   "exclude": [],
   "references": [
     {
       "path": "./tsconfig.lib.json"
+    },
+    {
+      "path": "../statebus-core/tsconfig.lib.json"
+    },
+    {
+      "path": "../statebus-data-loader/tsconfig.lib.json"
     }
   ]
 }

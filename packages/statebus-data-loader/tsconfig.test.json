@@ -6,13 +6,23 @@
     "declarationMap": false,
     "emitDeclarationOnly": false,
     "noEmit": true,
-    "types": ["bun"]
+    "types": ["bun"],
+    "lib": ["ES2022", "WebWorker"]
   },
-  "include": ["src/**/*.test.ts", "src/**/__tests__/**/*.ts"],
+  "include": [
+    "src/**/*.test.ts",
+    "src/**/__tests__/**/*.ts",
+    "src/**/*.spec.ts",
+    "src/**/__tests__/**/*.tsx",
+    "src/test-suite-tracer.ts"
+  ],
   "exclude": [],
   "references": [
     {
       "path": "./tsconfig.lib.json"
+    },
+    {
+      "path": "../statebus-core/tsconfig.lib.json"
     }
   ]
 }
