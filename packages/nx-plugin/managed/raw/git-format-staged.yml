@@ -63,7 +63,7 @@ formatters:
       - '!*.tsv'
       # Workflow templates carry __SMOO_*__ placeholders in key position and are
       # not YAML until rendered; the rendered copies are formatted on write.
-      - '!packages/cli/managed/templates/github/workflows/*.yml'
+      - '!packages/nx-plugin/managed/templates/github/workflows/*.yml'
 
   # rustfmt for Rust files
   rustfmt:

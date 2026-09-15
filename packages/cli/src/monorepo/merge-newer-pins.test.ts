@@ -2,16 +2,11 @@ import { describe, expect, it } from 'bun:test';
 import { spawnSync } from 'node:child_process';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, join, resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { join } from 'node:path';
+import { managedAssetsRoot } from '@smoothbricks/nx-plugin/managed-assets';
 import { printCommandOutput } from '../lib/run.js';
 
-const script = resolve(
-  dirname(fileURLToPath(import.meta.url)),
-  '..',
-  '..',
-  'managed/raw/tooling/direnv/merge-newer-pins.sh',
-);
+const script = join(managedAssetsRoot, 'raw/tooling/direnv/merge-newer-pins.sh');
 
 // Invoke the merge driver as git does: `driver %O %A %B %P`, result written to %A (ours).
 function mergedOurs(oursContent: string, theirsContent: string): string {

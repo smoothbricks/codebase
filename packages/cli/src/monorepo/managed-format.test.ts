@@ -3,12 +3,13 @@ import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { managedAssetsRoot } from '@smoothbricks/nx-plugin/managed-assets';
+import { BIOME_OWNED_EXTENSIONS, formatManagedContent } from '@smoothbricks/nx-plugin/managed-files/managed-format';
 import typia from 'typia';
 import { applyManagedFilesForContext, type ManagedFileContext } from './managed-files.js';
-import { BIOME_OWNED_EXTENSIONS, formatManagedContent } from './managed-format.js';
 
 const PRETTIER_CLI = join(dirname(fileURLToPath(import.meta.resolve('prettier'))), 'bin', 'prettier.cjs');
-const GIT_FORMAT_STAGED_CONFIG = join(import.meta.dir, '..', '..', 'managed', 'raw', 'git-format-staged.yml');
+const GIT_FORMAT_STAGED_CONFIG = join(managedAssetsRoot, 'raw', 'git-format-staged.yml');
 
 /**
  * A consumer whose Prettier config disagrees with the generator's raw

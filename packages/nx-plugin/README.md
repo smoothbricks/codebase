@@ -339,3 +339,20 @@ The generator rewrites `package.json` so `nx.targets.test` uses:
 - `timeoutMs: 600000`
 - `killAfterMs: 10000`
 - package script alias `nx run <project>:test --outputStyle=stream`
+
+## Managed workspace files
+
+`nx generate @smoothbricks/nx-plugin:managed-files` stages the same managed files as
+`smoo monorepo update`, without installing packages or resolving secrets. Use Nx
+`--dry-run` to inspect the changes. The workspace defaults register this generator
+for `nx sync` and `nx sync:check`.
+
+The plugin owns the packaged templates, pure rendering and content-preservation
+functions. The generator reads workspace files through Nx `Tree` and uses Nx's
+resolved project graph for inferred targets. The CLI only supplies the filesystem
+and process boundary. There is no separate serialized change plan.
+
+Files with a `# smoo-local` tail or `# smoo-local-begin` / `# smoo-local-end` blocks
+retain those sections. Matching source symlinks are preserved; conflicting local
+blocks and broken or external links are reported instead of overwritten. The
+generator does not remove a repository-owned file when a capability is disabled.
