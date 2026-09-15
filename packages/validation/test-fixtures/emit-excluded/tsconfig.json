@@ -1,0 +1,17 @@
+{
+  // The governing program: every source this fixture owns, including the deploy
+  // entry point under scripts/. This is the shape a deploy target has — one
+  // program over src + scripts, because the script imports src and a
+  // project-referenced file outside `include` is a hard TS6307 — and the reason
+  // "nearest tsconfig.lib.json" is the wrong question to ask about a file.
+  "compilerOptions": {
+    "target": "esnext",
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "strict": true,
+    "skipLibCheck": true,
+    "noEmit": true,
+    "types": []
+  },
+  "include": ["src/**/*.ts", "scripts/**/*.ts"]
+}

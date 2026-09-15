@@ -1,0 +1,13 @@
+{
+  // The emit program: `src/` alone, which is what a published bundle carries.
+  // `scripts/deploy.ts` is deliberately not in it — it is an operator entry
+  // point, not library output — so this project's program cannot transform it,
+  // and a router that picks this config by name loses its validators.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "outDir": "dist",
+    "rootDir": "src"
+  },
+  "include": ["src/**/*.ts"]
+}
