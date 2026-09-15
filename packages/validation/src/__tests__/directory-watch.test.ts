@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'bun:test';
-import { mkdtempSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, statSync, unlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { type DirectoryEvent, type DirectoryWatch, pollingDirectoryWatch } from '../bun/directory-watch.js';
@@ -54,12 +54,18 @@ describe('polling directory watch', () => {
     const { directory, events, advance } = observe();
     const file = join(directory, 'edited.ts');
     writeFileSync(file, 'export const a = 1;\n');
+    const stamped = statSync(file);
     advance();
     events.length = 0;
 
-    // Same name, same length: only the content stamp tells these apart, and a
-    // generation proved against the old bytes must not survive this write.
+    // Same name, same length, so only the timestamp separates these bytes — and
+    // how finely is the filesystem's business, not this test's: APFS advances
+    // per write, a Linux runner stamped two writes 0.3 ms apart identically and
+    // this case failed there. Setting the mtime is what makes the rewrite a
+    // rewrite on every filesystem, exactly as an editor's seconds-later save
+    // would. A generation proved against the old bytes must not survive it.
     writeFileSync(file, 'export const a = 2;\n');
+    utimesSync(file, stamped.atime, new Date(stamped.mtime.getTime() + 2_000));
     advance();
 
     expect(events).toEqual([['change', 'edited.ts']]);

@@ -65,9 +65,20 @@ interface Observed {
  * Read one directory's entries with a stamp that changes on any write.
  *
  * Inode and mode catch replacement and permission flips, size catches a
- * truncation, and nanosecond mtime catches an in-place rewrite inside the same
- * millisecond — which is exactly the write a generation proof must not miss.
- * `statSync` with `bigint` is the only stat carrying nanoseconds.
+ * truncation, and mtime read through `statSync`'s `bigint` form — the only
+ * stat carrying nanoseconds — catches an in-place rewrite that changes neither.
+ *
+ * That last one is only as fine as the filesystem's own timestamps, and the
+ * difference is measurable: on APFS three same-length rewrites of one file in a
+ * tight loop produced three distinct mtimes (60 us and 23 us apart), while on a
+ * Linux CI runner two such writes 0.3 ms apart shared one — Linux stamps inodes
+ * from a coarse clock. So a same-length in-place rewrite inside one timestamp
+ * tick is invisible here, which is the boundary Node's own `fs.watchFile` and
+ * TypeScript's polling watchers have too. Closing it means hashing contents,
+ * and this seam re-reads every entry of every observed directory four times a
+ * second for the life of the process: that is stat-cheap and read-expensive, so
+ * the stamp stays metadata. Nothing rewrites a source inside one tick except a
+ * generator, and ttsc compares input hashes when it proves a generation.
  *
  * Returns `undefined` when the directory itself is gone.
  */
