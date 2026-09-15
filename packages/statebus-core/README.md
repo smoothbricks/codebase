@@ -143,3 +143,34 @@ fail before any live state initializes. Including the application twice resolves
 against its own session occurrence. A library's standalone policy remains explicit in its `bindings`;
 no second session bus or runtime-time dependency container is introduced. The React factory accepts
 the same configuration and its existing hooks select these bound handles in the shared bus.
+
+### Forwarding a parent's required capability
+
+A callback's second argument, `parent`, resolves this API occurrence's own declared `requires`
+from the bindings actually supplied to that occurrence: the containing API's `libraryBindings`
+override when it is hosted, otherwise its standalone `bindings`.
+
+```ts
+const cms = createBusApi({
+  name: 'cms',
+  requires: [cmsAuth],
+  bindings: [cmsAuth.provide(null)],
+  libraries: { content, media, editor },
+  libraryBindings: {
+    editor: (_libraries, parent) => [editorAuth.provide(parent.require(cmsAuth))],
+  },
+  setup: (scope) => ({ access: scope.require(cmsAuth) }),
+});
+const host = createBusApi({
+  name: 'host',
+  libraries: { auth, cms },
+  libraryBindings: { cms: (libraries) => [cmsAuth.provide(libraries.get('auth'))] },
+  setup: () => ({}),
+});
+```
+
+Nothing is inherited implicitly: a child that declares the parent's token still receives only the
+bindings its parent forwards. `parent.require` returns the capability's value type, refuses a
+capability absent from the parent's `requires`, and refuses after declaration resolution. The
+parent's bindings are validated once, before any child callback runs; the one-argument form is
+unchanged. Each occurrence, including two CMS occurrences in one host, forwards its own values.
