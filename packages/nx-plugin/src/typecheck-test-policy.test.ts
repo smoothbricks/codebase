@@ -3,19 +3,21 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 
-import { addProjectConfiguration, readJson, writeJson } from 'nx/src/devkit-exports.js';
+import { addProjectConfiguration, readJson, type Tree, writeJson } from 'nx/src/devkit-exports.js';
 import { createTreeWithEmptyWorkspace } from 'nx/src/devkit-testing-exports.js';
+import { FsTree, flushChanges } from 'nx/src/generators/tree.js';
+import { inspectManagedPaths } from './managed-files/paths.js';
+import { assertNoManagedConflicts, stageManagedFiles } from './managed-files/tree.js';
 
 import {
   applyTypecheckTestDefaults,
-  applyTypecheckTestPolicy,
-  applyTypecheckTestPolicyTree,
   checkTsconfigTestReference,
   checkTypecheckTestConfig,
   checkTypecheckTestPolicy,
   checkTypecheckTestPolicyTree,
   detectPackageTestRunners,
   removeTsconfigTestReference,
+  renderTypecheckTestFiles,
 } from './typecheck-test-policy.js';
 
 // ---------------------------------------------------------------------------
@@ -25,6 +27,29 @@ import {
 async function writeJsonFs(path: string, value: unknown): Promise<void> {
   await mkdir(dirname(path), { recursive: true });
   await writeFile(path, `${JSON.stringify(value, null, 2)}\n`);
+}
+
+function applyTypecheckTestPolicyTree(tree: Tree): boolean {
+  const results = stageManagedFiles(tree, renderTypecheckTestFiles(tree));
+  assertNoManagedConflicts(results);
+  return results.some((result) => result.action === 'created' || result.action === 'updated');
+}
+
+function applyTypecheckTestPolicy(root: string): boolean {
+  const tree = new FsTree(root, false);
+  const files = renderTypecheckTestFiles(tree);
+  const results = stageManagedFiles(
+    tree,
+    files,
+    inspectManagedPaths(
+      root,
+      files.map((file) => file.target),
+    ),
+  );
+  assertNoManagedConflicts(results);
+  const changes = tree.listChanges();
+  flushChanges(root, changes);
+  return changes.length > 0;
 }
 
 async function readJsonFs(path: string): Promise<unknown> {

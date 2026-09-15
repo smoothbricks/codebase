@@ -45,10 +45,4 @@ describe('Bun bootstrap imports', () => {
     expect(typeof policy.packageNxProjectName).toBe('function');
     expect(Array.isArray(policy.BUILD_OUTPUT_DEPENDENCIES)).toBe(true);
   });
-
-  it('imports typecheck-test-policy', async () => {
-    const policy = await import('./typecheck-test-policy.js');
-    expect(typeof policy.checkTypecheckTestPolicy).toBe('function');
-    expect(typeof policy.applyTypecheckTestPolicy).toBe('function');
-  });
 });

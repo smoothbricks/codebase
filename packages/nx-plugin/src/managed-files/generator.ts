@@ -1,4 +1,5 @@
 import { createProjectGraphAsync, getProjects, joinPathFragments, readJson, type Tree } from 'nx/src/devkit-exports.js';
+import { renderTypecheckTestFiles } from '../typecheck-test-policy.js';
 import type { PackageJson } from '../workspace-manifest.js';
 import { deriveManagedFileContext, type WorkspaceProjects } from './context.js';
 import { type ManagedFileContext, renderManagedFiles } from './files.js';
@@ -9,7 +10,8 @@ import { assertNoManagedConflicts, type FileResult, type ManagedPathInfo, stageM
 /**
  * All workspace content comes from Tree. The supplied graph is Nx's resolved
  * graph, not getProjects(Tree), which intentionally omits plugin-inferred targets.
- * This generator changes no graph inputs, installs nothing, and resolves no secrets.
+ * The shared test-config renderer reads staged manifests too; no generation
+ * installs dependencies or resolves secrets.
  */
 export async function generateManagedFiles(
   tree: Tree,
@@ -37,7 +39,7 @@ export async function generateManagedFilesForContext(
   context: ManagedFileContext,
   pathInfo?: ReadonlyMap<string, ManagedPathInfo>,
 ): Promise<FileResult[]> {
-  const files = renderManagedFiles(context);
+  const files = [...renderManagedFiles(context), ...renderTypecheckTestFiles(tree)];
   for (const file of files) {
     if (file.content !== null) file.content = await formatManagedContent(tree.root, file.target, file.content);
   }
