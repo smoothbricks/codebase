@@ -7,6 +7,12 @@ The plugin owns the templates and workflow renderers. Repository manifests are r
 information comes from the resolved Nx graph passed at the boundary. `getProjects(Tree)` is used for workspace manifest
 locations, not as a substitute for plugin-inferred targets. No generator installs dependencies or resolves secrets.
 
+Test-runner packages also reconcile `tsconfig.test.json` through this generator. The shared test-typecheck policy
+supplies no-emit defaults and workspace references from Tree, preserves declared test runtime options and `extends`, and
+removes test-project references from package-root `tsconfig.json`. Check and diff report those same changes without
+writing; update and native generation apply them with the other managed files. A config that already satisfies policy
+keeps its exact bytes. If a needed repair would discard JSONC comments, generation refuses and names the config instead.
+
 The content-ownership and context-derivation functions are pure. Generation stages changes in `Tree`. Updates flush
 those changes with Nx; checks inspect them without writing. There is no serialized plan, second change journal, or
 rollback system. A failed apply may leave a partial diff. Correct the failure and rerun, or use Git to restore the

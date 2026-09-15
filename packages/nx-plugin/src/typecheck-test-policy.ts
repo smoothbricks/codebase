@@ -1,7 +1,9 @@
-import { existsSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { join, relative } from 'node:path';
 import type { Tree } from 'nx/src/devkit-exports.js';
-import { getProjects, readJson, readProjectConfiguration, updateJson, writeJson } from 'nx/src/devkit-exports.js';
+import { getProjects, readJson, readProjectConfiguration } from 'nx/src/devkit-exports.js';
+import { ManagedContentConflict } from './managed-files/managed-content.js';
+import type { ManagedFile } from './managed-files/tree.js';
 
 import type { NxPolicyIssue } from './workspace-config-policy.js';
 
@@ -41,7 +43,7 @@ export function detectPackageTestRunners(
         continue;
       }
       const options = recordProperty(target, 'options');
-      const command = options ? stringProperty(options, 'command') : null;
+      const command = (options ? stringProperty(options, 'command') : null) ?? stringProperty(target, 'command');
       if (command) {
         const runner = detectTestRunnerFromCommand(command);
         if (runner) {
@@ -58,7 +60,7 @@ export function detectPackageTestRunners(
         continue;
       }
       const options = recordProperty(target, 'options');
-      const command = options ? stringProperty(options, 'command') : null;
+      const command = (options ? stringProperty(options, 'command') : null) ?? stringProperty(target, 'command');
       if (command) {
         const runner = detectTestRunnerFromCommand(command);
         if (runner) {
@@ -161,8 +163,8 @@ export function applyTypecheckTestDefaults(
     referencePaths: string[];
   },
 ): boolean {
-  const extendsValue = options.tsconfigLibExtends ?? '../../tsconfig.base.json';
-  let changed = setMissingStringProperty(tsconfigTest, 'extends', extendsValue);
+  let changed = !Object.hasOwn(tsconfigTest, 'extends');
+  if (changed) tsconfigTest.extends = options.tsconfigLibExtends ?? '../../tsconfig.base.json';
 
   const compilerOptions = getOrCreateRecord(tsconfigTest, 'compilerOptions');
 
@@ -275,11 +277,11 @@ export function checkTypecheckTestPolicyTree(tree: Tree): NxPolicyIssue[] {
 }
 
 /**
- * Fix all workspace packages' tsconfig.test.json configuration using an Nx Tree.
- * Returns whether any files changed.
+ * Render test typechecking policy from the caller's Tree. The managed generator
+ * owns staging, permission checks, and flushing together with its other files.
  */
-export function applyTypecheckTestPolicyTree(tree: Tree): boolean {
-  let changed = false;
+export function renderTypecheckTestFiles(tree: Tree): ManagedFile[] {
+  const files: ManagedFile[] = [];
   const workspacePackages = collectWorkspacePackagesTree(tree);
 
   for (const [projectName, config] of getProjects(tree)) {
@@ -309,32 +311,36 @@ export function applyTypecheckTestPolicyTree(tree: Tree): boolean {
     // Collect reference paths
     const referencePaths = collectReferencePathsTree(tree, config.root, pkg, workspacePackages);
 
-    if (
-      applyTypecheckTestDefaults(tsconfigTest, {
-        testRunners,
-        tsconfigLibExtends,
-        libCompilerOptions: libCompilerOptions ?? undefined,
-        referencePaths,
-      }) ||
-      isNew
-    ) {
-      writeJson(tree, tsconfigTestPath, tsconfigTest);
-      changed = true;
-    }
+    const changed = applyTypecheckTestDefaults(tsconfigTest, {
+      testRunners,
+      tsconfigLibExtends,
+      libCompilerOptions: libCompilerOptions ?? undefined,
+      referencePaths,
+    });
+    files.push(renderTsconfig(tree, tsconfigTestPath, tsconfigTest, changed || isNew));
 
     // Remove test reference from tsconfig.json
     const tsconfigPath = `${config.root}/tsconfig.json`;
     if (tree.exists(tsconfigPath)) {
-      updateJson(tree, tsconfigPath, (tsconfig: Record<string, unknown>) => {
-        if (removeTsconfigTestReference(tsconfig)) {
-          changed = true;
-        }
-        return tsconfig;
-      });
+      const tsconfig = readJson<Record<string, unknown>>(tree, tsconfigPath);
+      files.push(renderTsconfig(tree, tsconfigPath, tsconfig, removeTsconfigTestReference(tsconfig)));
     }
   }
 
-  return changed;
+  return files;
+}
+
+function renderTsconfig(tree: Tree, target: string, config: Record<string, unknown>, changed: boolean): ManagedFile {
+  const current = tree.read(target, 'utf8');
+  if (!changed) return { target, content: current };
+  // A documented config cannot survive JSON.stringify. Preserve its reasoning
+  // and refuse before the shared generator stages or flushes any managed file.
+  if (current !== null && hasJsonComments(current)) {
+    throw new ManagedContentConflict(
+      `${target} carries comments a rewrite would delete; apply the no-emit test typecheck policy by hand`,
+    );
+  }
+  return { target, content: `${JSON.stringify(config, null, 2)}\n` };
 }
 
 /**
@@ -410,79 +416,6 @@ export function checkTypecheckTestPolicy(root: string): NxPolicyIssue[] {
     issues.push(...refIssues);
   }
   return issues;
-}
-
-/**
- * Fix all workspace packages' tsconfig.test.json configuration.
- * Returns whether any files changed.
- */
-export function applyTypecheckTestPolicy(root: string): boolean {
-  const workspaceNames = getWorkspacePackageNames(root);
-  let changed = false;
-
-  for (const packageJsonPath of listWorkspacePackageJsonPaths(root)) {
-    const pkg = readJsonObject(packageJsonPath);
-    if (!pkg) {
-      continue;
-    }
-    const packageDir = packageJsonPath.slice(0, -'/package.json'.length);
-    const packagePath = relative(root, packageDir);
-    if (packagePath === '' || packagePath === '.') {
-      continue;
-    }
-
-    const testRunners = detectPackageTestRunners(pkg);
-    if (testRunners.size === 0) {
-      continue;
-    }
-
-    // Create/update tsconfig.test.json
-    const tsconfigTestPath = join(root, packagePath, 'tsconfig.test.json');
-    const existing = readJsonObject(tsconfigTestPath);
-    const tsconfigTest = existing ?? {};
-    let fileChanged = existing === null;
-
-    // Read lib tsconfig for extends and compiler options
-    const libTsconfig = readJsonObject(join(root, packagePath, 'tsconfig.lib.json'));
-    const tsconfigLibExtends = stringProperty(libTsconfig ?? {}, 'extends') ?? '../../tsconfig.base.json';
-    const libCompilerOptions = libTsconfig ? recordProperty(libTsconfig, 'compilerOptions') : null;
-
-    // Collect reference paths
-    const referencePaths = collectTsconfigTestReferencePaths(root, packagePath, pkg, workspaceNames);
-
-    fileChanged =
-      applyTypecheckTestDefaults(tsconfigTest, {
-        testRunners,
-        tsconfigLibExtends,
-        libCompilerOptions: libCompilerOptions ?? undefined,
-        referencePaths,
-      }) || fileChanged;
-
-    if (fileChanged) {
-      // A documented tsconfig cannot survive JSON.stringify, so the policy says
-      // what it wants instead of quietly deleting the reasoning. The check
-      // half (checkTypecheckTestPolicy) reports the same drift, so CI still
-      // fails until a human applies it.
-      if (existsSync(tsconfigTestPath) && hasJsonComments(readFileSync(tsconfigTestPath, 'utf8'))) {
-        console.error(
-          `refused        ${packagePath}/tsconfig.test.json carries comments a rewrite would delete; apply the policy by hand`,
-        );
-        continue;
-      }
-      writeJsonObjectFs(tsconfigTestPath, tsconfigTest);
-      changed = true;
-    }
-
-    // Remove ./tsconfig.test.json from tsconfig.json references if present
-    const projectTsconfigPath = join(root, packagePath, 'tsconfig.json');
-    const projectTsconfig = readJsonObject(projectTsconfigPath);
-    if (projectTsconfig && removeTsconfigTestReference(projectTsconfig)) {
-      writeJsonObjectFs(projectTsconfigPath, projectTsconfig);
-      changed = true;
-    }
-  }
-
-  return changed;
 }
 
 function detectTestRunnerFromCommand(command: string): TestRunner | null {
@@ -704,9 +637,8 @@ function collectTsconfigTestReferencePaths(
  * documented one. Returning null there meant "file absent", and the caller
  * regenerated it from scratch: a `lib` the test program declared, an
  * `exclude`, an extra `include` glob and every comment explaining them
- * disappeared on the next `smoo monorepo update`. Comments are stripped for
- * parsing only; a caller that intends to write back must decide what to do
- * about them (see writeJsonObjectFs's caller).
+ * disappeared on the next update. Comments are stripped for parsing only;
+ * renderTsconfig refuses a policy repair that would discard them.
  */
 function readJsonObject(path: string): Record<string, unknown> | null {
   if (!existsSync(path)) {
@@ -774,10 +706,6 @@ function stripJsonComments(text: string): string {
   return output.replace(/,(\s*[}\]])/g, '$1');
 }
 
-function writeJsonObjectFs(path: string, value: Record<string, unknown>): void {
-  writeFileSync(path, `${JSON.stringify(value, null, 2)}\n`);
-}
-
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
@@ -801,14 +729,6 @@ function getOrCreateRecord(record: Record<string, unknown>, key: string): Record
   const next: Record<string, unknown> = {};
   record[key] = next;
   return next;
-}
-
-function setMissingStringProperty(record: Record<string, unknown>, key: string, value: string): boolean {
-  if (typeof record[key] === 'string') {
-    return false;
-  }
-  record[key] = value;
-  return true;
 }
 
 function setBooleanProperty(record: Record<string, unknown>, key: string, value: boolean): boolean {

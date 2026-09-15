@@ -22,7 +22,7 @@ import {
   SMOO_NX_RELEASE_TAG_PATTERN,
   SMOO_NX_VERSION_ACTIONS,
 } from '@smoothbricks/nx-plugin/release-config-policy';
-import { applyTypecheckTestPolicy, checkTypecheckTestPolicy } from '@smoothbricks/nx-plugin/typecheck-test-policy';
+import { checkTypecheckTestPolicy } from '@smoothbricks/nx-plugin/typecheck-test-policy';
 import {
   applyWorkspaceConfigPolicy,
   checkWorkspaceConfigPolicy,
@@ -173,11 +173,6 @@ export function applyWorkspaceDependencyDefaults(root: string, options: PackageT
     console.log('updated        package Nx target policy');
   } else {
     console.log('unchanged      package Nx target policy');
-  }
-  if (applyTypecheckTestPolicy(root)) {
-    console.log('updated        tsconfig.test.json policy');
-  } else {
-    console.log('unchanged      tsconfig.test.json policy');
   }
   if (applyWorkspaceBoundedTestTargetPolicy(root, options)) {
     console.log('updated        package test targets bounded execution policy');
