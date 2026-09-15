@@ -28,7 +28,8 @@ const artifacts = join(root, '.cache', 'statebus-packages');
 mkdirSync(artifacts, { recursive: true });
 // A failed rerun must not leave a previous success report in the uploaded artifact.
 rmSync(join(artifacts, 'validation.json'), { force: true });
-const temporary = mkdtempSync(join(tmpdir(), 'statebus-packaged-consumer-'));
+// Compare canonical paths on hosts where the OS temp directory is a symlink.
+const temporary = realpathSync(mkdtempSync(join(tmpdir(), 'statebus-packaged-consumer-')));
 const external = new Map();
 const dependencies = {};
 const overrides = {};
@@ -179,6 +180,7 @@ try {
       'navigation-edges',
       'bus-api',
       'api-bindings',
+      'parent-bindings',
     ])
       for (const runner of ['node', 'bun'])
         execFileSync(runner, [join(consumer, 'dist', 'composed', `${executable}.js`)], {
@@ -219,6 +221,7 @@ try {
           'navigation cleanup, completion tracking and boolean React selectors',
           'unified library/application API, hosted hooks and repeated-library selection',
           'typed sibling capability bindings, cycle refusal and hosted session admission',
+          'explicit parent capability forwarding across nested and repeated occurrences',
         ],
       },
       null,

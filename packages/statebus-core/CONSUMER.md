@@ -30,7 +30,7 @@ import { bindComposedQueryLoader } from '@smoothbricks/statebus-tanstack-query';
 `read`, `readKeyed`, `publisher`, `publish`, `listen`, `binding`, `selection`, `acquire`, `flush`,
 `manage`, and `dispose`. `interestSource.snapshot()` and `interestSource.subscribe()` expose exact
 addresses, not aggregate property demand. `ScalarHandle`, `KeyedHandle`, `ResourceHandle`,
-`EventHandle`, `Capability`, `CapabilityBinding`, `LibraryDefinition`, `MountedLibrary`,
+`EventHandle`, `Capability`, `CapabilityBinding`, `RequiredBindings`, `LibraryDefinition`, `MountedLibrary`,
 `ReducerState`, `StateInterestHandle`, `RecordedScenario` and `EffectOutcome` are exported types.
 
 ## Independent ownership, one hosted runtime
@@ -65,6 +65,9 @@ uncomposed library. Provider and
 boundary installation reject foreign mounts/handles. Effect command/result handles and loader
 state/event handles must have the same owner. Binding an effect slot twice in one runtime fails.
 Capability value types are checked by TypeScript; validate untrusted configuration before `provide`.
+With `createBusApi`, a `libraryBindings` callback may forward its own occurrence's declared
+requirements to a child through its second argument (`parent.require(capability)`, a
+`RequiredBindings`); see the package README. Forwarding is explicit and resolved once per occurrence.
 
 Resolved names live in immutable metadata. Reads, publications and React renders do not build
 prefixes, stringify resource IDs, or reconstruct schemas. Wire addresses are exposed for existing
