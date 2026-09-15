@@ -1,6 +1,6 @@
 {
   "name": "@smoothbricks/statebus-tanstack-query",
-  "version": "0.1.1",
+  "version": "0.1.2-next.0",
   "type": "module",
   "description": "Interest-driven QueryClient execution and graceful cancellation for StateBus.",
   "license": "MIT",
