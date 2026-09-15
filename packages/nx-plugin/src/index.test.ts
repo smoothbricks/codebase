@@ -410,6 +410,210 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
     }
   });
 
+  it('hashes every tsconfig the extends chain reaches, not just the one the command names', async () => {
+    const workspace = await createWorkspace();
+    try {
+      // The shape that made this a silent cache hit: the options a check
+      // resolves live one file ABOVE the config its command names.
+      await workspace.write('tsconfig.base.json', '{"compilerOptions":{"strict":true}}\n');
+      await workspace.write(
+        'packages/tsconfig.base.json',
+        '{"extends":"../tsconfig.base.json","compilerOptions":{"noUnusedLocals":true}}\n',
+      );
+      await workspace.write('packages/example/package.json', '{"name":"example"}\n');
+      await workspace.write('packages/example/tsconfig.lib.json', '{"extends":"../tsconfig.base.json"}\n');
+      // A deeper chain reached from the other config, named without the
+      // extension TypeScript lets a specifier omit.
+      await workspace.write('packages/example/tsconfig.strict.json', '{"extends":"../tsconfig.base"}\n');
+      await workspace.write('packages/example/tsconfig.test.json', '{"extends":"./tsconfig.strict.json"}\n');
+
+      const targets = await inferProjectTargets(workspace, 'packages/example/package.json');
+
+      // Every file in the chain, once, whichever config reached it.
+      const configChain = [
+        '{workspaceRoot}/tsconfig.base.json',
+        '{workspaceRoot}/packages/tsconfig.base.json',
+        '{workspaceRoot}/packages/example/tsconfig.strict.json',
+      ];
+      const checkToolchain = [
+        '{workspaceRoot}/patches/**/*',
+        ...configChain,
+        { json: '{workspaceRoot}/package.json', excludeFields: ['version'] },
+        { json: '{workspaceRoot}/bun.lock', excludeFields: ['workspaces'] },
+      ];
+      expect(targets.typecheck?.inputs).toEqual([
+        'versionlessProduction',
+        '^production',
+        ...checkToolchain,
+        '{projectRoot}/tsconfig.lib.json',
+      ]);
+      expect(targets['typecheck-tests']?.inputs).toEqual([
+        'versionlessDefault',
+        '^production',
+        ...checkToolchain,
+        '{projectRoot}/tsconfig.test.json',
+      ]);
+      // An emit reads the same options, and a stale artifact is worse than a
+      // stale verdict.
+      expect(targets['tsc-js']?.inputs).toEqual([
+        'production',
+        '^production',
+        '{workspaceRoot}/package.json',
+        '{workspaceRoot}/bun.lock',
+        '{workspaceRoot}/patches/**/*',
+        ...configChain,
+        '{projectRoot}/tsconfig.lib.json',
+      ]);
+      // Typed lint runs the same program (`projectService`), so its verdict
+      // moves with the same files.
+      expect(targets.lint?.inputs).toEqual(expect.arrayContaining(configChain));
+    } finally {
+      await workspace.cleanup();
+    }
+  });
+
+  it('refuses a project whose tsconfig extends a file that is not there', async () => {
+    const workspace = await createWorkspace();
+    try {
+      await workspace.write('packages/example/package.json', '{"name":"example"}\n');
+      await workspace.write('packages/example/tsconfig.lib.json', '{"extends":"../tsconfig.base.json"}\n');
+
+      // Fail-closed, and the only safe direction: an ancestor left out of the
+      // hash is a cached verdict nobody can invalidate. Nx wraps a createNodes
+      // throw, so the reason lives in the nested error.
+      const failure = await inferProjectTargets(workspace, 'packages/example/package.json').then(
+        () => undefined,
+        (error: unknown) => error,
+      );
+      if (!(failure instanceof AggregateCreateNodesError)) {
+        throw new Error(`expected AggregateCreateNodesError, got ${String(failure)}`);
+      }
+      expect(failure.errors[0]?.[1]?.message).toMatch(/"extends": "\.\.\/tsconfig\.base\.json" names no file/);
+    } finally {
+      await workspace.cleanup();
+    }
+  });
+
+  it('walks an extends cycle once, and leaves an installed config to the lockfile wherever it is stored', async () => {
+    const workspace = await createWorkspace();
+    // WHERE an installed config's bytes sit is the installer's business: bun
+    // keeps them in a global store and points node_modules at it, so this one
+    // is outside the workspace entirely.
+    const store = await mkdtemp(join(tmpdir(), 'smoothbricks-nx-plugin-store-'));
+    try {
+      await workspace.write('tsconfig.base.json', '{"compilerOptions":{"strict":true}}\n');
+      await workspace.write('packages/example/package.json', '{"name":"example"}\n');
+      // TypeScript rejects a cycle; this walk must terminate on one anyway,
+      // with both files hashed.
+      await workspace.write('packages/example/tsconfig.lib.json', '{"extends":"./tsconfig.cycle.json"}\n');
+      await workspace.write('packages/example/tsconfig.cycle.json', '{"extends":"./tsconfig.lib.json"}\n');
+      // Which bytes are in that store is pinned by the lockfile and the root
+      // manifest, both already inputs; naming the path would hash nothing.
+      await writeFile(join(store, 'package.json'), '{"name":"@fixture/tsconfig"}\n');
+      await writeFile(join(store, 'tsconfig.json'), '{"compilerOptions":{"noUnusedLocals":true}}\n');
+      await mkdir(join(workspace.context.workspaceRoot, 'node_modules/@fixture'), { recursive: true });
+      await symlink(store, join(workspace.context.workspaceRoot, 'node_modules/@fixture/tsconfig'), 'dir');
+      await workspace.write('packages/example/tsconfig.test.json', '{"extends":"@fixture/tsconfig/tsconfig.json"}\n');
+
+      const { result: targets, stderr } = await withCapturedStderr(() =>
+        inferProjectTargets(workspace, 'packages/example/package.json'),
+      );
+      const inputs = targets.typecheck?.inputs ?? [];
+
+      expect(inputs).toEqual([
+        'versionlessProduction',
+        '^production',
+        '{workspaceRoot}/patches/**/*',
+        '{workspaceRoot}/tsconfig.base.json',
+        '{workspaceRoot}/packages/example/tsconfig.cycle.json',
+        '{workspaceRoot}/packages/example/tsconfig.lib.json',
+        { json: '{workspaceRoot}/package.json', excludeFields: ['version'] },
+        { json: '{workspaceRoot}/bun.lock', excludeFields: ['workspaces'] },
+        '{projectRoot}/tsconfig.lib.json',
+      ]);
+      expect(JSON.stringify(inputs)).not.toContain('node_modules');
+      // And silently, because nothing was lost. The noisy version of this fires
+      // on every graph build in a workspace that installs one Expo package.
+      expect(stderr).toBe('');
+    } finally {
+      await rm(store, { recursive: true, force: true });
+      await workspace.cleanup();
+    }
+  });
+
+  it("hashes a workspace member's config reached through its package name", async () => {
+    const workspace = await createWorkspace();
+    try {
+      const root = workspace.context.workspaceRoot;
+      await workspace.write('tsconfig.base.json', '{"compilerOptions":{"strict":true}}\n');
+      // The other half of that judgement: a package name can resolve to
+      // workspace SOURCE, which no lockfile pins. Dropping it would be the
+      // original bug wearing a package name.
+      await workspace.write('packages/tsconfig/package.json', '{"name":"@fixture/tsconfig"}\n');
+      await workspace.write(
+        'packages/tsconfig/base.json',
+        '{"extends":"../../tsconfig.base.json","compilerOptions":{"noUnusedLocals":true}}\n',
+      );
+      await mkdir(join(root, 'node_modules/@fixture'), { recursive: true });
+      await symlink(join(root, 'packages/tsconfig'), join(root, 'node_modules/@fixture/tsconfig'), 'dir');
+      await workspace.write('packages/example/package.json', '{"name":"example"}\n');
+      await workspace.write('packages/example/tsconfig.lib.json', '{"extends":"@fixture/tsconfig/base.json"}\n');
+
+      const { result: targets, stderr } = await withCapturedStderr(() =>
+        inferProjectTargets(workspace, 'packages/example/package.json'),
+      );
+
+      expect(targets.typecheck?.inputs).toEqual([
+        'versionlessProduction',
+        '^production',
+        '{workspaceRoot}/patches/**/*',
+        '{workspaceRoot}/tsconfig.base.json',
+        '{workspaceRoot}/packages/tsconfig/base.json',
+        { json: '{workspaceRoot}/package.json', excludeFields: ['version'] },
+        { json: '{workspaceRoot}/bun.lock', excludeFields: ['workspaces'] },
+        '{projectRoot}/tsconfig.lib.json',
+      ]);
+      expect(stderr).toBe('');
+    } finally {
+      await workspace.cleanup();
+    }
+  });
+
+  it('says so when an extends chain leaves the workspace, where nothing can hash it', async () => {
+    const workspace = await createWorkspace();
+    const outside = await mkdtemp(join(tmpdir(), 'smoothbricks-nx-plugin-outside-'));
+    try {
+      await writeFile(join(outside, 'tsconfig.base.json'), '{"compilerOptions":{"noUnusedLocals":true}}\n');
+      await workspace.write('packages/example/package.json', '{"name":"example"}\n');
+      await workspace.write(
+        'packages/example/tsconfig.lib.json',
+        `${JSON.stringify({ extends: join(outside, 'tsconfig.base.json') })}\n`,
+      );
+
+      const { result: targets, stderr } = await withCapturedStderr(() =>
+        inferProjectTargets(workspace, 'packages/example/package.json'),
+      );
+
+      // Nx hashes workspace files only, and no lockfile pins this one either,
+      // so the verdict really can go stale. A silent drop here is the bug this
+      // walk exists to close, so it is said out loud instead.
+      expect(stderr).toContain(join(outside, 'tsconfig.base.json'));
+      expect(stderr).toContain('outside the workspace');
+      expect(targets.typecheck?.inputs).toEqual([
+        'versionlessProduction',
+        '^production',
+        '{workspaceRoot}/patches/**/*',
+        '{workspaceRoot}/tsconfig.base.json',
+        { json: '{workspaceRoot}/package.json', excludeFields: ['version'] },
+        { json: '{workspaceRoot}/bun.lock', excludeFields: ['workspaces'] },
+        '{projectRoot}/tsconfig.lib.json',
+      ]);
+    } finally {
+      await rm(outside, { recursive: true, force: true });
+      await workspace.cleanup();
+    }
+  });
+
   it('rebuilds current library declarations before test typechecking after clean', async () => {
     const workspace = await createWorkspace();
     try {
@@ -2015,6 +2219,25 @@ interface WorkspaceFixture {
   context: CreateNodesContextV2;
   write(filePath: string, contents: string): Promise<void>;
   cleanup(): Promise<void>;
+}
+
+/**
+ * What inference told the operator while it ran. The plugin degrades out loud
+ * — a hash it cannot make complete is a cache verdict nobody can invalidate —
+ * so the stream is part of its behavior, not decoration.
+ */
+async function withCapturedStderr<T>(run: () => Promise<T>): Promise<{ result: T; stderr: string }> {
+  const original = process.stderr.write.bind(process.stderr);
+  let stderr = '';
+  process.stderr.write = (chunk: string | Uint8Array) => {
+    stderr += typeof chunk === 'string' ? chunk : new TextDecoder().decode(chunk);
+    return true;
+  };
+  try {
+    return { result: await run(), stderr };
+  } finally {
+    process.stderr.write = original;
+  }
 }
 
 /**

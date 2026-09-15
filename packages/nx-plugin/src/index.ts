@@ -1,7 +1,7 @@
-import { existsSync } from 'node:fs';
+import { existsSync, realpathSync } from 'node:fs';
 import { readdir, readFile } from 'node:fs/promises';
 import { createRequire } from 'node:module';
-import { dirname, join, posix, relative } from 'node:path';
+import { dirname, isAbsolute, join, posix, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import {
@@ -60,14 +60,19 @@ export const DEPLOY_BUILD_TARGET = 'deploy-build';
 
 /** The workspace-wide manifests a release rewrites: the version of every member, and the lockfile mirror of it. */
 const RELEASE_REWRITTEN_WORKSPACE_INPUTS = ['{workspaceRoot}/package.json', '{workspaceRoot}/bun.lock'];
-const TYPESCRIPT_TOOLCHAIN_INPUTS = [
-  ...RELEASE_REWRITTEN_WORKSPACE_INPUTS,
-  '{workspaceRoot}/patches/**/*',
-  '{workspaceRoot}/tsconfig.base.json',
-];
+/** Installed-toolchain files a TypeScript task reads that no config can name. */
+const TYPESCRIPT_PATCH_INPUTS = ['{workspaceRoot}/patches/**/*'];
 /**
- * The same toolchain for a check, with the two release-rewritten files hashed
- * by field instead of by byte.
+ * The workspace's own base config, hashed for every TypeScript task whether or
+ * not this project's chain reaches it: it is where a workspace puts the options
+ * it means to apply to everything, and a project with no TypeScript config of
+ * its own has no chain to reach it with.
+ */
+const WORKSPACE_TSCONFIG_BASE_INPUT = '{workspaceRoot}/tsconfig.base.json';
+
+/**
+ * The two release-rewritten files hashed by field instead of by byte, for a
+ * check that only reads them.
  *
  * A `json` input is hashed by Nx's own hasher, so this costs no process. The
  * lockfile's `workspaces` section is the mirror of each member's manifest —
@@ -75,11 +80,160 @@ const TYPESCRIPT_TOOLCHAIN_INPUTS = [
  * hashed from the member's own `package.json`. Dropping that section keeps the
  * resolution table, which is the reason the lockfile is an input at all.
  */
-const VERSIONLESS_TOOLCHAIN_INPUTS = [
-  ...TYPESCRIPT_TOOLCHAIN_INPUTS.filter((input) => !RELEASE_REWRITTEN_WORKSPACE_INPUTS.includes(input)),
+const VERSIONLESS_TOOLCHAIN_MANIFEST_INPUTS = [
   { json: '{workspaceRoot}/package.json', excludeFields: ['version'] },
   { json: '{workspaceRoot}/bun.lock', excludeFields: ['workspaces'] },
 ];
+
+/** A path segment Nx's workspace file map never carries, so a fileset naming it hashes nothing. */
+const NODE_MODULES_SEGMENT = /(?:^|\/)node_modules(?:\/|$)/;
+
+/**
+ * Every config file whose compiler options decide this project's TypeScript
+ * verdicts: the workspace base, plus every file reachable by `extends` from the
+ * configs its commands hand to `tsc`.
+ *
+ * Hashing only the named config is the bug this closes. A workspace whose
+ * project configs extend an INTERMEDIATE base — `packages/tsconfig.base.json`
+ * extending the root one — hashed the root and the named file and nothing in
+ * between, so flipping `noUnusedLocals` in the intermediate left every
+ * typecheck, test typecheck and emit serving its previous answer from cache:
+ * a pass for sources the compiler would now reject.
+ *
+ * Fail-closed. An `extends` that resolves to no file throws and names both
+ * files, because the only alternative is to drop an ancestor from the hash —
+ * which is the silence above. The ancestors this cannot name as a fileset are
+ * the two kinds Nx has no fileset for; see {@link configChainInput}.
+ */
+function typescriptConfigChainInputs(configPaths: readonly string[], workspaceRoot: string): string[] {
+  const inputs = new Set([WORKSPACE_TSCONFIG_BASE_INPUT]);
+  const walked = new Set<string>();
+  for (const configPath of configPaths) {
+    addTypescriptConfigAncestors(configPath, workspaceRoot, inputs, walked);
+  }
+  return [...inputs];
+}
+
+/**
+ * One config's ancestors; `walked` both dedupes shared bases and breaks an
+ * `extends` cycle.
+ *
+ * The walk stops at an ancestor Nx cannot hash, because everything reachable
+ * from an installed config is installed too: the lockfile pins that whole
+ * subtree, and parsing it could only invent failures for a dependency's own
+ * chain.
+ */
+function addTypescriptConfigAncestors(
+  configPath: string,
+  workspaceRoot: string,
+  inputs: Set<string>,
+  walked: Set<string>,
+): void {
+  if (walked.has(configPath)) return;
+  walked.add(configPath);
+  for (const specifier of typescriptConfigExtends(configPath)) {
+    const ancestor = resolveTypescriptConfigExtends(specifier, configPath);
+    const input = configChainInput(ancestor, configPath, workspaceRoot);
+    if (input === null) continue;
+    inputs.add(input);
+    addTypescriptConfigAncestors(ancestor.path, workspaceRoot, inputs, walked);
+  }
+}
+
+/** What one config extends: a single specifier, or the ordered list TypeScript 5.0 added. */
+function typescriptConfigExtends(configPath: string): string[] {
+  const config: unknown = readJsonFile(configPath, { expectComments: true });
+  if (!isRecord(config)) throw new Error(`${configPath} is not a TypeScript configuration object`);
+  const extended = config.extends;
+  if (extended === undefined) return [];
+  const specifiers: unknown[] = Array.isArray(extended) ? extended : [extended];
+  return specifiers.map((specifier) => {
+    if (typeof specifier !== 'string' || specifier.length === 0) {
+      throw new Error(`${configPath}: "extends" must name config files, not ${JSON.stringify(extended)}`);
+    }
+    return specifier;
+  });
+}
+
+/** Where one ancestor's bytes live, which is what decides whether Nx can hash them. */
+interface ConfigAncestor {
+  path: string;
+  /**
+   * Reached through Node module resolution rather than a path, so a lockfile
+   * decides which bytes are there — wherever the installer chose to put them.
+   * A workspace member resolved this way is still workspace source; see
+   * {@link configChainInput}.
+   */
+  installed: boolean;
+}
+
+/**
+ * One `extends` specifier as an absolute path, by TypeScript's own rules: a
+ * relative or rooted specifier is a path — with the `.json` extension it may
+ * omit — and anything else is a Node specifier resolved from the extending file.
+ */
+function resolveTypescriptConfigExtends(specifier: string, fromConfigPath: string): ConfigAncestor {
+  if (specifier.startsWith('./') || specifier.startsWith('../') || isAbsolute(specifier)) {
+    const direct = resolve(dirname(fromConfigPath), specifier);
+    const candidates = direct.endsWith('.json') ? [direct] : [direct, `${direct}.json`];
+    const found = candidates.find((candidate) => existsSync(candidate));
+    if (found !== undefined) return { path: found, installed: false };
+    throw new Error(
+      `${fromConfigPath}: "extends": "${specifier}" names no file (looked for ${candidates.join(', ')}). ` +
+        'Every config in the chain is hashed, so one that cannot be found cannot be left out of the hash either.',
+    );
+  }
+  // A package config may be named by file or bare; TypeScript accepts both.
+  const candidates = specifier.endsWith('.json') ? [specifier] : [specifier, `${specifier}/tsconfig.json`];
+  const nodeRequire = createRequire(fromConfigPath);
+  for (const candidate of candidates) {
+    try {
+      return { path: nodeRequire.resolve(candidate), installed: true };
+    } catch {
+      // Not this spelling of the package config; try the next, then refuse.
+    }
+  }
+  throw new Error(
+    `${fromConfigPath}: "extends": "${specifier}" resolves to no installed config (tried ${candidates.join(', ')}). ` +
+      'Every config in the chain is hashed, so one that cannot be found cannot be left out of the hash either.',
+  );
+}
+
+/**
+ * The fileset name for one ancestor, or `null` when Nx cannot hash that file.
+ *
+ * Nx hashes workspace files that are not in node_modules, so two ancestor
+ * kinds cannot be named — and they are not the same thing:
+ *
+ *   - a dependency's config: `bun.lock` and the root manifest decide which
+ *     bytes are installed, and both are already inputs. Where they sit is the
+ *     installer's business — bun keeps them in a global store outside the
+ *     workspace entirely — so this is settled by HOW the specifier resolved,
+ *     not by where it landed. A workspace member reached through its package
+ *     name is workspace source, and is hashed as such.
+ *   - a path above the workspace root: nothing hashes it and nothing pins it,
+ *     so an edit there really can serve a stale verdict. Said out loud,
+ *     because the silent version of exactly that is the bug this walk closes.
+ */
+function configChainInput(ancestor: ConfigAncestor, fromConfigPath: string, workspaceRoot: string): string | null {
+  let relativePath = relative(workspaceRoot, ancestor.path).replaceAll('\\', '/');
+  if (relativePath.startsWith('../')) {
+    // Node resolves a package to its REAL path, and a workspace root can itself
+    // be reached through a symlink (macOS `/var` → `/private/var`): a workspace
+    // member then looks like a file above the root. Believe the real root
+    // before concluding anything is outside.
+    relativePath = relative(realpathSync(workspaceRoot), ancestor.path).replaceAll('\\', '/');
+  }
+  const outsideWorkspace = relativePath.length === 0 || relativePath.startsWith('../') || isAbsolute(relativePath);
+  if (!outsideWorkspace && !NODE_MODULES_SEGMENT.test(relativePath)) return `{workspaceRoot}/${relativePath}`;
+  if (!ancestor.installed) {
+    process.stderr.write(
+      `@smoothbricks/nx-plugin: ${fromConfigPath} extends ${ancestor.path}, which is outside the workspace. ` +
+        'Nx hashes workspace files only, so a change to it will not invalidate this project\u2019s TypeScript tasks.\n',
+    );
+  }
+  return null;
+}
 
 /**
  * A project's own manifest, hashed without the version a release rewrites.
@@ -829,6 +983,8 @@ async function createProjectTargets(
   const validationTargets: string[] = [];
   const libTsconfigPath = join(absoluteProjectRoot, 'tsconfig.lib.json');
   const hasLibTsconfig = existsSync(libTsconfigPath);
+  const testTsconfigPath = join(absoluteProjectRoot, 'tsconfig.test.json');
+  const hasTestTsconfig = existsSync(testTsconfigPath);
   const cargoTomlPath = join(absoluteProjectRoot, 'Cargo.toml');
   const isCargoWorkspace =
     existsSync(cargoTomlPath) && CARGO_WORKSPACE_PATTERN.test(await readFile(cargoTomlPath, 'utf-8'));
@@ -849,7 +1005,18 @@ async function createProjectTargets(
   const crateInputs =
     versionless !== null && hasCrateManifests ? await versionlessCrateInputs(projectRoot, workspaceRoot) : [];
   const versionlessProjectInputs = versionless === null ? [] : [...VERSIONLESS_PACKAGE_INPUTS, ...crateInputs];
-  const checkInputs = versionless === null ? TYPESCRIPT_TOOLCHAIN_INPUTS : VERSIONLESS_TOOLCHAIN_INPUTS;
+  // The options a TypeScript task's answer really depends on, which is the
+  // whole `extends` chain of the configs its commands name and not just those
+  // two files. Resolved once per project: every target below shares it.
+  const typescriptConfigChain = typescriptConfigChainInputs(
+    [...(hasLibTsconfig ? [libTsconfigPath] : []), ...(hasTestTsconfig ? [testTsconfigPath] : [])],
+    workspaceRoot,
+  );
+  const toolchainInputs = [...RELEASE_REWRITTEN_WORKSPACE_INPUTS, ...TYPESCRIPT_PATCH_INPUTS, ...typescriptConfigChain];
+  const checkInputs =
+    versionless === null
+      ? toolchainInputs
+      : [...TYPESCRIPT_PATCH_INPUTS, ...typescriptConfigChain, ...VERSIONLESS_TOOLCHAIN_MANIFEST_INPUTS];
   const selfProduction = versionless === null ? 'production' : VERSIONLESS_PRODUCTION_INPUT;
   const selfDefault = versionless === null ? 'default' : VERSIONLESS_DEFAULT_INPUT;
   const dependencyProduction =
@@ -891,7 +1058,7 @@ async function createProjectTargets(
     targets['tsc-js'] = {
       executor: '@smoothbricks/nx-plugin:typescript-emit',
       cache: true,
-      inputs: ['production', '^production', ...TYPESCRIPT_TOOLCHAIN_INPUTS, '{projectRoot}/tsconfig.lib.json'],
+      inputs: ['production', '^production', ...toolchainInputs, '{projectRoot}/tsconfig.lib.json'],
       outputs: inferTypescriptOutputs(libTsconfigPath, packageJsonPath),
       dependsOn: ['^*-js', ...(cargoWasmConfig ? ['cargo-wasm'] : [])],
       options: {
@@ -913,7 +1080,6 @@ async function createProjectTargets(
     };
   }
 
-  const hasTestTsconfig = existsSync(join(absoluteProjectRoot, 'tsconfig.test.json'));
   if (hasTestTsconfig) {
     targets['typecheck-tests'] = {
       executor: 'nx:run-commands',
