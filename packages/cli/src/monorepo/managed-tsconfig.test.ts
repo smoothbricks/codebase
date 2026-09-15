@@ -23,7 +23,7 @@ function workspace(): FsTree {
     nx: { name: 'app', targets: { test: { command: 'bun test' } } },
   });
   writeJson(tree, 'packages/app/tsconfig.lib.json', {
-    extends: '../../tsconfig.base.json',
+    extends: ['../../tsconfig.base.json', './tsconfig.runtime.json'],
     compilerOptions: { lib: ['es2020'], rootDir: 'src', outDir: 'dist' },
   });
   writeJson(tree, 'packages/app/tsconfig.json', {
@@ -57,6 +57,7 @@ describe('managed test tsconfig reconciliation', () => {
     await reconcile(new FsTree(root, false), 'update');
     const updated = new FsTree(root, false);
     expect(readJson(updated, testConfigPath)).toMatchObject({
+      extends: ['../../tsconfig.base.json', './tsconfig.runtime.json'],
       compilerOptions: { noEmit: true, composite: false, types: ['bun'] },
       references: [{ path: './tsconfig.lib.json' }],
     });
