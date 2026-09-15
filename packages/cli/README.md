@@ -58,6 +58,9 @@ smoo github-ci nx-deploy [--stage <stage>] [--mode <auto|affected|run-many>] [--
 smoo github-ci apply-outputs <directories...> --source-sha <sha>
 smoo github-ci dispatch-workflow --workflow <workflow> --ref <ref>
 smoo github-ci ensure-pull-request --head <branch> --base <branch> --title <title> --body <body>
+
+smoo playwright ensure chromium
+smoo playwright run <command> [args...]
 ```
 
 ## Initialization
@@ -173,6 +176,14 @@ intentionally ignored because [Node.js] 10 is not part of the supported package 
 package manifests. If none are staged, it exits successfully without running the full validator. The generated
 pre-commit hook uses this mode so adding a package rechecks conditional managed files, including whether the publish
 workflow is now required, without making every commit pay for full validation.
+
+## Browser Tests
+
+Browser-test targets can use `smoo playwright run bun test --timeout=30000 browser`. The command prepares Chromium
+through the shared browser policy, then starts the child with the selected browser location in its environment before
+Playwright is imported. Host runners use the configured Playwright cache or their XDG cache; ephemeral GitHub runners
+use their preinstalled browser without downloading. Developer machines use their configured or default Playwright cache.
+Targets using this command must depend on the CLI build as well as their application build.
 
 ## Publishable Packages
 
@@ -314,8 +325,9 @@ Managed files include:
 - [GitHub Actions] workflows under `.github/workflows`
 - Local composite [GitHub Actions] under `.github/actions`
 
-Matching in-workspace source symlinks are preserved. Broken, escaping, or drifted symlinks are reported instead of followed. SmoothBricks uses symlinks back to `packages/nx-plugin/managed` so
-changes to the CLI package are tested immediately. Downstream repos receive ordinary committed copies.
+Matching in-workspace source symlinks are preserved. Broken, escaping, or drifted symlinks are reported instead of
+followed. SmoothBricks uses symlinks back to `packages/nx-plugin/managed` so changes to the CLI package are tested
+immediately. Downstream repos receive ordinary committed copies.
 
 The publish workflow is conditional. Repositories with no owned release packages skip `.github/workflows/publish.yml` in
 `init`, `check`, and `diff`; adding a new owned package makes the workflow required on the next validation run.

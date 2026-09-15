@@ -41,21 +41,29 @@ describe('ensureChromium', () => {
     expect(calls).toEqual([]);
   });
 
-  it('installs Chromium into the persistent host-runner cache', async () => {
+  it('honors a configured browser cache before the host XDG cache', async () => {
     const calls: RunCall[] = [];
 
     const result = await ensureChromium(
       '/workspace/package',
-      setupDependencies({ GITHUB_ACTIONS: 'true' }, ['/var/cache/ci'], calls),
+      setupDependencies(
+        {
+          GITHUB_ACTIONS: 'true',
+          PLAYWRIGHT_BROWSERS_PATH: '/fixture/browser-cache',
+          XDG_CACHE_HOME: '/var/cache/ci/xdg',
+        },
+        ['/var/cache/ci'],
+        calls,
+      ),
     );
 
-    expect(result).toEqual({ mode: 'persistent-cache', browserCachePath: '/var/cache/ci/ms-playwright' });
+    expect(result).toEqual({ mode: 'persistent-cache', browserCachePath: '/fixture/browser-cache' });
     expect(calls).toEqual([
       {
         command: 'playwright',
         args: ['install', 'chromium', '--only-shell'],
         cwd: '/workspace/package',
-        env: { PLAYWRIGHT_BROWSERS_PATH: '/var/cache/ci/ms-playwright' },
+        env: { PLAYWRIGHT_BROWSERS_PATH: '/fixture/browser-cache' },
       },
     ]);
   });

@@ -1,8 +1,8 @@
 import { existsSync } from 'node:fs';
+import { join } from 'node:path';
 import { run } from '../lib/run.js';
 
 const HOST_CACHE_ROOT = '/var/cache/ci';
-const HOST_BROWSER_CACHE = `${HOST_CACHE_ROOT}/ms-playwright`;
 const SYSTEM_CHROME_PATHS = [
   '/usr/bin/google-chrome',
   '/usr/bin/chromium-browser',
@@ -40,11 +40,15 @@ export async function ensureChromium(
   const githubActions = env.GITHUB_ACTIONS === 'true';
 
   if (githubActions && exists(HOST_CACHE_ROOT)) {
+    // Host setup provisions the XDG cache directory, not arbitrary siblings
+    // under /var/cache/ci. Honor an explicit Playwright cache before that default.
+    const browserCachePath =
+      env.PLAYWRIGHT_BROWSERS_PATH ?? join(env.XDG_CACHE_HOME ?? `${HOST_CACHE_ROOT}/xdg`, 'ms-playwright');
     await runCommand('playwright', ['install', 'chromium', '--only-shell'], cwd, {
-      PLAYWRIGHT_BROWSERS_PATH: HOST_BROWSER_CACHE,
+      PLAYWRIGHT_BROWSERS_PATH: browserCachePath,
     });
-    console.log(`Chromium ready in persistent cache: ${HOST_BROWSER_CACHE}`);
-    return { mode: 'persistent-cache', browserCachePath: HOST_BROWSER_CACHE };
+    console.log(`Chromium ready in persistent cache: ${browserCachePath}`);
+    return { mode: 'persistent-cache', browserCachePath };
   }
 
   if (githubActions) {
@@ -70,4 +74,21 @@ export async function ensureChromium(
   );
   console.log(browserCachePath ? `Chromium ready in configured cache: ${browserCachePath}` : 'Chromium ready.');
   return browserCachePath ? { mode: 'developer-cache', browserCachePath } : { mode: 'developer-cache' };
+}
+
+/** Launch after setup so Playwright reads the selected cache before its first import. */
+export async function runWithChromium(
+  command: string,
+  args: string[],
+  cwd = process.cwd(),
+  dependencies: ChromiumSetupDependencies = defaultDependencies,
+): Promise<void> {
+  const browser = await ensureChromium(cwd, dependencies);
+  const environment: Record<string, string> | undefined =
+    browser.mode === 'system'
+      ? { PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH: browser.executablePath }
+      : browser.browserCachePath
+        ? { PLAYWRIGHT_BROWSERS_PATH: browser.browserCachePath }
+        : undefined;
+  await dependencies.run(command, args, cwd, environment);
 }

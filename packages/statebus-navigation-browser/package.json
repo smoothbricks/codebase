@@ -63,12 +63,18 @@
       "test-browser": {
         "executor": "@smoothbricks/nx-plugin:bounded-exec",
         "dependsOn": [
-          "build"
+          "build",
+          {
+            "target": "build",
+            "projects": [
+              "cli"
+            ]
+          }
         ],
         "cache": true,
         "parallelism": false,
         "options": {
-          "command": "bun test --timeout=30000 browser",
+          "command": "smoo playwright run bun test --timeout=30000 browser",
           "cwd": "{projectRoot}",
           "timeoutMs": 180000,
           "killAfterMs": 10000
