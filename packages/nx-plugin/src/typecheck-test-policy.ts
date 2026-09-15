@@ -2,6 +2,7 @@ import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { join, relative } from 'node:path';
 import type { Tree } from 'nx/src/devkit-exports.js';
 import { getProjects, readJson, readProjectConfiguration } from 'nx/src/devkit-exports.js';
+import typia from 'typia';
 import { ManagedContentConflict } from './managed-files/managed-content.js';
 import type { ManagedFile } from './managed-files/tree.js';
 
@@ -158,7 +159,7 @@ export function applyTypecheckTestDefaults(
   tsconfigTest: Record<string, unknown>,
   options: {
     testRunners: ReadonlySet<TestRunner>;
-    tsconfigLibExtends?: string;
+    tsconfigLibExtends?: string | string[];
     libCompilerOptions?: Record<string, unknown>;
     referencePaths: string[];
   },
@@ -304,8 +305,7 @@ export function renderTypecheckTestFiles(tree: Tree): ManagedFile[] {
     // Read lib tsconfig for extends and compiler options
     const libTsconfigPath = `${config.root}/tsconfig.lib.json`;
     const libTsconfig = tree.exists(libTsconfigPath) ? readJson<Record<string, unknown>>(tree, libTsconfigPath) : null;
-    const tsconfigLibExtends =
-      (libTsconfig ? stringProperty(libTsconfig, 'extends') : null) ?? '../../tsconfig.base.json';
+    const tsconfigLibExtends = tsconfigExtends(libTsconfig) ?? '../../tsconfig.base.json';
     const libCompilerOptions = libTsconfig ? recordProperty(libTsconfig, 'compilerOptions') : null;
 
     // Collect reference paths
@@ -389,7 +389,7 @@ export function checkTypecheckTestPolicy(root: string): NxPolicyIssue[] {
       issues.push(...absoluteIssues);
       if (absoluteIssues.length === 0) {
         const libTsconfig = readJsonObject(join(root, packagePath, 'tsconfig.lib.json'));
-        const tsconfigLibExtends = stringProperty(libTsconfig ?? {}, 'extends') ?? '../../tsconfig.base.json';
+        const tsconfigLibExtends = tsconfigExtends(libTsconfig) ?? '../../tsconfig.base.json';
         const libCompilerOptions = libTsconfig ? recordProperty(libTsconfig, 'compilerOptions') : null;
         const referencePaths = collectTsconfigTestReferencePaths(root, packagePath, pkg, workspaceNames);
         const normalized = structuredClone(tsconfig);
@@ -708,6 +708,11 @@ function stripJsonComments(text: string): string {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+/** TypeScript 5 accepts ordered base-config arrays as well as a single base. */
+function tsconfigExtends(config: Record<string, unknown> | null): string | string[] | undefined {
+  return typia.assert<string | string[] | undefined>(config?.extends);
 }
 
 function stringProperty(record: Record<string, unknown>, key: string): string | null {
