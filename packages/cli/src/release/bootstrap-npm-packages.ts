@@ -19,7 +19,6 @@ export interface BootstrapNpmPackagesShell<Package extends ReleasePackageInfo = 
   packageVersionExists(name: string, version: string): Promise<boolean>;
   login(): Promise<void>;
   publishPlaceholder(pkg: Package, env?: Record<string, string>): Promise<void>;
-  promptOtp(packageName: string): Promise<string>;
   wait(milliseconds: number): Promise<void>;
   log(message: string): void;
 }
@@ -59,12 +58,14 @@ export async function bootstrapNpmPackages<Package extends ReleasePackageInfo>(
   if (!options.skipLogin) {
     await shell.login();
   }
+  // Supplying an OTP forces npm's legacy auth mode. Unless explicitly requested,
+  // leave verification to npm so its browser session can be remembered and reused.
+  const publishEnv = options.otp === undefined ? undefined : { NPM_CONFIG_OTP: options.otp };
   // Upload every placeholder before waiting for npm registry propagation. Keeping the
   // phases separate prevents one slow package from blocking the remaining uploads.
   for (const pkg of missing) {
     shell.log(`${pkg.name}: publishing npm placeholder.`);
-    const otp = options.otp ?? (await shell.promptOtp(pkg.name));
-    await shell.publishPlaceholder(pkg, { NPM_CONFIG_OTP: otp });
+    await shell.publishPlaceholder(pkg, publishEnv);
   }
 
   await waitForPublishedPackages(shell, missing);

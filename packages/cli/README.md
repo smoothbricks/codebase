@@ -787,8 +787,10 @@ Publishing:
   before CI publish runs; use `smoo release trust-publisher --bootstrap` locally to publish `0.0.0-bootstrap.0` under
   the `bootstrap` dist-tag for new package names before configuring trust.
 - `smoo release bootstrap-npm-packages` scans owned `npm:public` release packages missing from npm, runs
-  `npm login --auth-type=web` unless `--skip-login` is passed, and publishes a minimal placeholder package with
-  `--access public --tag bootstrap`. It supports `--dry-run` and `--package <name...>` for targeted bootstraps.
+  `npm login --auth-type=web` once unless `--skip-login` is passed, and publishes a minimal placeholder package with
+  `--access public --tag bootstrap`. npm inherits the terminal and owns browser verification, including its five-minute
+  remember option; smoo does not prompt for an OTP per package. `--otp` explicitly opts into numeric OTP authentication.
+  It supports `--dry-run` and `--package <name...>` for targeted bootstraps.
 - `smoo release trust-publisher` configures [npm trusted publishing][npm-trusted-publishing] for every owned release
   package. It uses the root `package.json` `repository.url` as the GitHub `owner/repo`, uses `publish.yml` as the
   trusted workflow, grants that workflow npm's `--allow-publish` permission, and runs `npm trust` from PATH, where the

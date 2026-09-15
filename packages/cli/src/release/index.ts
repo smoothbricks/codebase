@@ -2,8 +2,6 @@ import { existsSync, readFileSync } from 'node:fs';
 import { appendFile, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { createInterface } from 'node:readline/promises';
-import { Writable } from 'node:stream';
 import { setTimeout as delay } from 'node:timers/promises';
 import { $ } from 'bun';
 import typia from 'typia';
@@ -410,7 +408,6 @@ export async function releaseTrustPublisher(root: string, options: ReleaseTrustP
             packageVersionExists: (name, version) => npmVersionExists(root, name, version),
             login: () => runNpm(root, ['login', '--auth-type=web']),
             publishPlaceholder: (pkg, env) => publishPlaceholderPackage(root, pkg, env),
-            promptOtp: (packageName) => promptForNpmOtp(packageName),
             wait: delay,
             log: (message) => console.log(message),
           },
@@ -621,7 +618,6 @@ export async function releaseBootstrapNpmPackages(
       packageVersionExists: (name, version) => npmVersionExists(root, name, version),
       login: () => runNpm(root, ['login', '--auth-type=web']),
       publishPlaceholder: (pkg, env) => publishPlaceholderPackage(root, pkg, env),
-      promptOtp: (packageName) => promptForNpmOtp(packageName),
       wait: delay,
       log: (message) => console.log(message),
     },
@@ -2075,7 +2071,12 @@ function githubRepositoryFromUrl(url: string): string {
 }
 
 async function runNpm(root: string, npmArgs: string[], env?: Record<string, string>): Promise<void> {
-  await run('npm', npmArgs, root, env);
+  // npm disables browser OTP challenges when stdin or stdout is piped. Let npm
+  // own authentication, including its remembered browser verification session.
+  const status = await runInteractiveStatus('npm', npmArgs, root, env);
+  if (status !== 0) {
+    throw new Error(npmCommandFailedMessage(npmArgs, status));
+  }
 }
 
 async function runNpmTrust(
@@ -2200,30 +2201,4 @@ async function runNpmPublish(root: string, npmArgs: string[]): Promise<void> {
 
 function missingNpmPackagePublishGuidance(pkg: Pick<ReleasePackage, 'name'>): string {
   return `${pkg.name} does not exist on npm yet. Run smoo release trust-publisher --bootstrap locally before rerunning the Publish workflow.`;
-}
-
-async function promptForNpmOtp(packageName: string): Promise<string> {
-  if (!process.stdin.isTTY || !process.stdout.isTTY) {
-    throw new Error(
-      `npm requires a one-time password for ${packageName}. Pass --otp <code> in non-interactive shells.`,
-    );
-  }
-
-  const mutedOutput = new Writable({
-    write(_chunk, _encoding, callback) {
-      callback();
-    },
-  });
-  const rl = createInterface({ input: process.stdin, output: mutedOutput, terminal: true });
-  process.stdout.write(`Enter npm OTP for ${packageName}: `);
-  try {
-    const otp = (await rl.question('')).trim();
-    process.stdout.write('\n');
-    if (!otp) {
-      throw new Error(`npm OTP is required for ${packageName}.`);
-    }
-    return otp;
-  } finally {
-    rl.close();
-  }
 }

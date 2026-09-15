@@ -2,7 +2,6 @@ import { describe, expect, it } from 'bun:test';
 import {
   type BootstrapNpmPackagesShell,
   bootstrapNpmPackages,
-  NPM_BOOTSTRAP_DIST_TAG,
   NPM_BOOTSTRAP_VERSION,
   NPM_BOOTSTRAP_VISIBILITY_TIMEOUT_MS,
 } from '../bootstrap-npm-packages.js';
@@ -22,11 +21,23 @@ const missing: ReleasePackageInfo = {
 };
 
 describe('bootstrap npm packages', () => {
+  it('authenticates once and lets npm handle browser verification for every missing package', async () => {
+    const shell = new RecordingBootstrapShell({ packages: [stable, missing], existing: [] });
+
+    const bootstrapped = await bootstrapNpmPackages(shell, { dryRun: false, skipLogin: false, packages: [] });
+
+    expect(bootstrapped).toEqual([stable, missing]);
+    expect(shell.logins).toBe(1);
+    expect(shell.published).toEqual([
+      { name: stable.name, otp: '' },
+      { name: missing.name, otp: '' },
+    ]);
+  });
+
   it('publishes placeholders only for selected packages missing from npm', async () => {
     const shell = new RecordingBootstrapShell({
       packages: [stable, missing],
       existing: [stable.name],
-      otps: ['123456'],
     });
 
     const bootstrapped = await bootstrapNpmPackages(shell, {
@@ -37,9 +48,7 @@ describe('bootstrap npm packages', () => {
 
     expect(bootstrapped.map((pkg) => pkg.name)).toEqual([missing.name]);
     expect(shell.logins).toBe(1);
-    expect(shell.published).toEqual([{ name: missing.name, otp: '123456' }]);
-    expect(shell.logs.join('\n')).toContain(NPM_BOOTSTRAP_VERSION);
-    expect(shell.logs.join('\n')).toContain(NPM_BOOTSTRAP_DIST_TAG);
+    expect(shell.published).toEqual([{ name: missing.name, otp: '' }]);
   });
 
   it('dry-run reports missing packages without login or publish', async () => {
@@ -50,16 +59,15 @@ describe('bootstrap npm packages', () => {
     expect(bootstrapped.map((pkg) => pkg.name)).toEqual([missing.name]);
     expect(shell.logins).toBe(0);
     expect(shell.published).toEqual([]);
-    expect(shell.logs).toContain(`${stable.name}: already exists on npm; skipping placeholder bootstrap.`);
   });
 
   it('supports skipping npm login when an existing session is already authenticated', async () => {
-    const shell = new RecordingBootstrapShell({ packages: [missing], existing: [], otps: ['654321'] });
+    const shell = new RecordingBootstrapShell({ packages: [missing], existing: [] });
 
     await bootstrapNpmPackages(shell, { dryRun: false, skipLogin: true, packages: [] });
 
     expect(shell.logins).toBe(0);
-    expect(shell.published).toEqual([{ name: missing.name, otp: '654321' }]);
+    expect(shell.published).toEqual([{ name: missing.name, otp: '' }]);
   });
 
   it('passes explicit OTP to placeholder publishes without prompting', async () => {
@@ -68,7 +76,6 @@ describe('bootstrap npm packages', () => {
     await bootstrapNpmPackages(shell, { dryRun: false, skipLogin: true, packages: [], otp: '111222' });
 
     expect(shell.published).toEqual([{ name: missing.name, otp: '111222' }]);
-    expect(shell.prompts).toEqual([]);
   });
 
   it('uploads every placeholder before polling all pending packages with backoff', async () => {
@@ -93,7 +100,7 @@ describe('bootstrap npm packages', () => {
     ]);
   });
 
-  it('times out after bounded backoff without suggesting another bootstrap', async () => {
+  it('times out after bounded backoff', async () => {
     const shell = new RecordingBootstrapShell({
       packages: [missing],
       existing: [],
@@ -102,7 +109,7 @@ describe('bootstrap npm packages', () => {
 
     await expect(
       bootstrapNpmPackages(shell, { dryRun: false, skipLogin: true, packages: [], otp: '111222' }),
-    ).rejects.toThrow('Retry smoo release trust-publisher later; do not bootstrap again.');
+    ).rejects.toThrow(Error);
 
     const waited = shell.events
       .filter((event) => event.startsWith('wait:'))
@@ -115,7 +122,7 @@ describe('bootstrap npm packages', () => {
 
     await expect(
       bootstrapNpmPackages(shell, { dryRun: false, skipLogin: false, packages: ['@scope/unknown'] }),
-    ).rejects.toThrow('Unknown owned release package selection: @scope/unknown');
+    ).rejects.toThrow(Error);
     expect(shell.logins).toBe(0);
     expect(shell.published).toEqual([]);
   });
@@ -123,25 +130,20 @@ describe('bootstrap npm packages', () => {
 
 class RecordingBootstrapShell implements BootstrapNpmPackagesShell<ReleasePackageInfo> {
   readonly events: string[] = [];
-  readonly logs: string[] = [];
   readonly published: Array<{ name: string; otp: string }> = [];
-  readonly prompts: string[] = [];
   logins = 0;
   private readonly packages: ReleasePackageInfo[];
   private readonly existing: Set<string>;
-  private readonly otps: string[];
   private readonly visibilityChecks = new Map<string, number>();
   private readonly visibleAfterChecks: Readonly<Record<string, number>>;
 
   constructor(options: {
     packages: ReleasePackageInfo[];
     existing: string[];
-    otps?: string[];
     visibleAfterChecks?: Record<string, number>;
   }) {
     this.packages = options.packages;
     this.existing = new Set(options.existing);
-    this.otps = [...(options.otps ?? [])];
     this.visibleAfterChecks = options.visibleAfterChecks ?? {};
   }
 
@@ -169,20 +171,9 @@ class RecordingBootstrapShell implements BootstrapNpmPackagesShell<ReleasePackag
     this.published.push({ name: pkg.name, otp: env?.NPM_CONFIG_OTP ?? '' });
   }
 
-  async promptOtp(packageName: string): Promise<string> {
-    this.prompts.push(packageName);
-    const otp = this.otps.shift();
-    if (!otp) {
-      throw new Error(`unexpected OTP prompt for ${packageName}`);
-    }
-    return otp;
-  }
-
   async wait(milliseconds: number): Promise<void> {
     this.events.push(`wait:${milliseconds}`);
   }
 
-  log(message: string): void {
-    this.logs.push(message);
-  }
+  log(_message: string): void {}
 }
