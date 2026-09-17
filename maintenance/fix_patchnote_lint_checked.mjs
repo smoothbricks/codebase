@@ -4,7 +4,6 @@ import { createRequire } from 'node:module';
 import { dirname, join, relative } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
-// The original source already declares the provider tuple; use it as the authority.
 let repair = readFileSync(process.env.REPAIR_SOURCE, 'utf8');
 const lines = repair.split('\n');
 const providerLines = lines.filter(line => line.startsWith("replace(pkg+'src/types.ts', \"export type SupportedProvider"));
@@ -20,8 +19,8 @@ const temporary = join(process.env.RUNNER_TEMP,'patchnote-repair.mjs');
 writeFileSync(temporary,repair);
 await import(pathToFileURL(temporary).href);
 
-// Keep the public optional config shape. Only the internal default values need
-// their known required members when merging a supplied partial section.
+// Public config keeps its optional API; only the internal defaults need their
+// known required fields while resolving partial sections.
 const path = 'packages/patchnote/src/config.ts';
 let source = readFileSync(path,'utf8');
 assert.equal(source.split('export const defaultConfig =').length, 2);
@@ -32,15 +31,21 @@ for (const name of ['expo','syncpack','nix','provenanceCheck','deprecationCheck'
 }
 writeFileSync(path,source);
 
-// Selecting the command-call overload once avoids casting Execa's overloaded
-// binding/template interface at every dependency-injection boundary.
 const adapter = 'packages/patchnote/src/executor.ts';
 assert.ok(!existsSync(adapter));
 writeFileSync(adapter, `import { execa } from 'execa';
-import type { CommandExecutor } from './types.js';
+import typia from 'typia';
+import type { CommandExecutor, ExecutorResult } from './types.js';
 
-/** Select Execa's command-call overload; preserve its result, options and rejection. */
-export const executeCommand: CommandExecutor = (file, args, options) => execa(file, args, options);
+/**
+ * Adapt Execa's overloaded API to the text-only command port. Missing captured
+ * streams (inherit/ignore/buffer:false) are empty text; binary/object output is
+ * refused rather than asserted to be a string. Options and rejections pass through.
+ */
+export const executeCommand: CommandExecutor = async (file, args, options) => {
+  const result = typia.assert<Partial<ExecutorResult>>(await execa(file, args, options));
+  return { stdout: result.stdout ?? '', stderr: result.stderr ?? '', exitCode: result.exitCode };
+};
 `);
 const listed = join(process.env.RUNNER_TEMP,'patchnote-changed.json');
 const paths = JSON.parse(readFileSync(listed,'utf8'));
@@ -70,6 +75,11 @@ for (const file of paths.filter(file => file.startsWith('packages/patchnote/src/
     edits.push([statement.getStart(ast),statement.end,replacement]);
   }
   for (const [start,end,replacement] of edits.sort((a,b)=>b[0]-a[0])) text = text.slice(0,start)+replacement+text.slice(end);
+  if (file.endsWith('/commands/onboard.ts')) {
+    const obsolete = "    const { execa } = await import('execa');\n";
+    assert.equal(text.split(obsolete).length, 2);
+    text = text.replace(obsolete, '');
+  }
   const module = relative(dirname(file),adapter).replace(/\.ts$/,'.js');
   text = `import { executeCommand } from '${module.startsWith('.') ? module : './'+module}';\n` + text;
   writeFileSync(file,text);
@@ -80,4 +90,19 @@ const test = 'packages/patchnote/test/lint-boundaries.test.ts';
 writeFileSync(test,readFileSync(test,'utf8')
   .replace('defaultConfig.expo.enabled','defaultConfig.expo?.enabled')
   .replace("import { execa } from 'execa';", "import { executeCommand } from '../src/executor.js';")
-  .replace('const execute: CommandExecutor = execa;', 'const execute: CommandExecutor = executeCommand;'));
+  .replace('const execute: CommandExecutor = execa;', 'const execute: CommandExecutor = executeCommand;') + `
+
+describe('text executor output modes', () => {
+  test('represents uncaptured streams as empty text without changing execution', async () => {
+    const result = await executeCommand(process.execPath, ['-e', 'process.stdout.write("ignored")'], { stdio: 'ignore' });
+    expect(result).toEqual({ stdout: '', stderr: '', exitCode: 0 });
+  });
+  test('retains a nonzero exit code when the caller requests non-throwing execution', async () => {
+    const result = await executeCommand(process.execPath, ['-e', 'process.exit(7)'], { reject: false });
+    expect(result.exitCode).toBe(7);
+  });
+  test('refuses a binary result instead of passing bytes off as text', async () => {
+    await expect(executeCommand(process.execPath, ['-e', 'process.stdout.write("bytes")'], { encoding: 'buffer' })).rejects.toThrow();
+  });
+});
+`);
