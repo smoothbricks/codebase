@@ -1,0 +1,857 @@
+diff --git a/bun.lock b/bun.lock
+index b66fe75..8b02dc4 100644
+--- a/bun.lock
++++ b/bun.lock
+@@ -177,7 +177,7 @@
+     },
+     "packages/patchnote": {
+       "name": "@smoothbricks/patchnote",
+-      "version": "0.2.0",
++      "version": "0.2.1",
+       "bin": {
+         "patchnote": "./dist/cli.js",
+       },
+@@ -190,12 +190,15 @@
+         "micromatch": "^4.0.8",
+         "semver": "^7.7.4",
+         "tslib": "^2.8.1",
++        "typia": "12.0.2",
+         "yaml": "^2.8.1",
+       },
+       "devDependencies": {
++        "@smoothbricks/validation": "workspace:*",
+         "@types/bun": "^1.3.1",
+         "@types/micromatch": "^4.0.10",
+         "@types/semver": "^7.7.1",
++        "@typia/unplugin": "^12.0.1",
+         "memfs": "^4.17.0",
+       },
+     },
+diff --git a/packages/patchnote/build.ts b/packages/patchnote/build.ts
+index 60c92c7..dcfab91 100644
+--- a/packages/patchnote/build.ts
++++ b/packages/patchnote/build.ts
+@@ -1,3 +1,4 @@
++import UnpluginTypia from '@typia/unplugin/bun';
+ import { $, build } from 'bun';
+ 
+ console.log('Building patchnote CLI...');
+@@ -15,6 +16,7 @@ const bundleResult = await build({
+   format: 'esm',
+   minify: false,
+   sourcemap: 'none',
++  plugins: [UnpluginTypia({ log: false })],
+   external: [
+     // Keep external dependencies
+     'commander',
+@@ -41,6 +43,7 @@ const libResult = await build({
+   format: 'esm',
+   minify: false,
+   sourcemap: 'none',
++  plugins: [UnpluginTypia({ log: false })],
+   external: ['commander', 'execa', 'fast-glob', 'yaml'],
+   naming: {
+     entry: 'index.js',
+diff --git a/packages/patchnote/bunfig.toml b/packages/patchnote/bunfig.toml
+new file mode 100644
+index 0000000..0265502
+--- /dev/null
++++ b/packages/patchnote/bunfig.toml
+@@ -0,0 +1 @@
++preload = ["@smoothbricks/validation/bun/preload"]
+diff --git a/packages/patchnote/package.json b/packages/patchnote/package.json
+index 038b898..e0fda21 100644
+--- a/packages/patchnote/package.json
++++ b/packages/patchnote/package.json
+@@ -39,13 +39,16 @@
+     "micromatch": "^4.0.8",
+     "semver": "^7.7.4",
+     "tslib": "^2.8.1",
+-    "yaml": "^2.8.1"
++    "yaml": "^2.8.1",
++    "typia": "12.0.2"
+   },
+   "devDependencies": {
+     "@types/bun": "^1.3.1",
+     "@types/micromatch": "^4.0.10",
+     "@types/semver": "^7.7.1",
+-    "memfs": "^4.17.0"
++    "memfs": "^4.17.0",
++    "@typia/unplugin": "^12.0.1",
++    "@smoothbricks/validation": "workspace:*"
+   },
+   "keywords": [
+     "dependencies",
+@@ -116,6 +119,11 @@
+           "cwd": "{projectRoot}",
+           "parallel": false
+         }
++      },
++      "build": {
++        "dependsOn": [
++          "^build"
++        ]
+       }
+     }
+   }
+diff --git a/packages/patchnote/src/ai/ai-client.ts b/packages/patchnote/src/ai/ai-client.ts
+index 8373249..b407471 100644
+--- a/packages/patchnote/src/ai/ai-client.ts
++++ b/packages/patchnote/src/ai/ai-client.ts
+@@ -1,3 +1,4 @@
++import typia from 'typia';
+ /**
+  * Multi-provider AI client for changelog analysis
+  *
+@@ -8,7 +9,7 @@
+ 
+ import type { PatchnoteConfig } from '../config.js';
+ import type { Logger } from '../logger.js';
+-import type { SendPromptOptions, SupportedProvider } from '../types.js';
++import { type SendPromptOptions, SUPPORTED_PROVIDERS, type SupportedProvider } from '../types.js';
+ import { PROVIDER_CONFIGS } from './providers.js';
+ 
+ const DEFAULT_MAX_TOKENS = 4096;
+@@ -38,10 +39,11 @@ export function resolveProvider(config: PatchnoteConfig): { provider: SupportedP
+   }
+ 
+   // 3. Fallback: try other providers
+-  for (const [name, cfg] of Object.entries(PROVIDER_CONFIGS)) {
++  for (const name of SUPPORTED_PROVIDERS) {
++    const cfg = PROVIDER_CONFIGS[name];
+     if (name === configuredProvider) continue;
+     const key = process.env[cfg.envVar];
+-    if (key) return { provider: name as SupportedProvider, apiKey: key };
++    if (key) return { provider: name, apiKey: key };
+   }
+ 
+   // 4. No keys available
+@@ -106,9 +108,9 @@ export async function sendPrompt(
+     throw new Error(`${provider} API error ${response.status}: ${errorText}`);
+   }
+ 
+-  const data = (await response.json()) as {
++  const data = typia.assert<{
+     choices?: Array<{ message?: { content?: string } }>;
+-  };
++  }>(await response.json());
+ 
+   const content = data.choices?.[0]?.message?.content;
+   if (!content) {
+diff --git a/packages/patchnote/src/auth/github-client.ts b/packages/patchnote/src/auth/github-client.ts
+index f4b1a69..0ddfbcc 100644
+--- a/packages/patchnote/src/auth/github-client.ts
++++ b/packages/patchnote/src/auth/github-client.ts
+@@ -1,3 +1,4 @@
++import typia from 'typia';
+ /**
+  * GitHub CLI client for PR operations
+  * Uses gh CLI for all GitHub operations
+@@ -14,7 +15,7 @@ export class GitHubCLIClient implements IGitHubClient {
+   private executor: CommandExecutor;
+ 
+   constructor(executor?: CommandExecutor) {
+-    this.executor = executor || (execa as unknown as CommandExecutor);
++    this.executor = executor || execa;
+   }
+ 
+   async listUpdatePRs(repoRoot: string): Promise<GitHubPR[]> {
+@@ -25,15 +26,10 @@ export class GitHubCLIClient implements IGitHubClient {
+         { cwd: repoRoot },
+       );
+ 
+-      const parsed = JSON.parse(stdout);
+-
+-      // Validate that gh CLI returned an array
+-      if (!Array.isArray(parsed)) {
+-        throw new Error(`Expected array from gh pr list, got ${typeof parsed}`);
+-      }
+-
+-      // Return all PRs - let the caller filter by branch prefix
+-      return parsed as GitHubPR[];
++      const parsed = typia.json.validateParse<GitHubPR[]>(stdout);
++      if (!parsed.success) throw new Error('Expected array of valid PRs from gh pr list');
++      // Return all PRs - let the caller filter by branch prefix.
++      return parsed.data;
+     } catch (error: unknown) {
+       throw this.enhanceError(error, 'list PRs');
+     }
+@@ -45,15 +41,9 @@ export class GitHubCLIClient implements IGitHubClient {
+         cwd: repoRoot,
+       });
+ 
+-      const parsed = JSON.parse(stdout);
+-
+-      // Validate that gh CLI returned an object with mergeable field
+-      if (typeof parsed !== 'object' || parsed === null || !('mergeable' in parsed)) {
+-        throw new Error('Expected object with mergeable field from gh pr view');
+-      }
+-
+-      const data = parsed as { mergeable: 'MERGEABLE' | 'CONFLICTING' | 'UNKNOWN' };
+-      return data.mergeable === 'CONFLICTING';
++      const parsed = typia.json.validateParse<{ mergeable: 'MERGEABLE' | 'CONFLICTING' | 'UNKNOWN' }>(stdout);
++      if (!parsed.success) throw new Error('Expected object with mergeable field from gh pr view');
++      return parsed.data.mergeable === 'CONFLICTING';
+     } catch (error: unknown) {
+       throw this.enhanceError(error, `check PR #${prNumber} conflicts`);
+     }
+@@ -159,11 +149,9 @@ export class GitHubCLIClient implements IGitHubClient {
+         { cwd: repoRoot },
+       );
+ 
+-      const parsed = JSON.parse(stdout);
+-      if (!Array.isArray(parsed)) {
+-        throw new Error(`Expected array from gh pr list, got ${typeof parsed}`);
+-      }
+-      return parsed.length > 0 ? (parsed[0] as GitHubPR) : null;
++      const parsed = typia.json.validateParse<GitHubPR[]>(stdout);
++      if (!parsed.success) throw new Error('Expected array of valid PRs from gh pr list');
++      return parsed.data[0] ?? null;
+     } catch (error: unknown) {
+       throw this.enhanceError(error, 'find PR by head branch');
+     }
+@@ -190,7 +178,7 @@ export class GitHubCLIClient implements IGitHubClient {
+    */
+   private enhanceError(error: unknown, operation: string): Error {
+     const errorMessage = error instanceof Error ? error.message : String(error);
+-    const stderr = (error as { stderr?: string }).stderr || '';
++    const stderr = typia.is<Pick<Awaited<ReturnType<CommandExecutor>>, 'stderr'>>(error) ? error.stderr : '';
+ 
+     // Check for common error patterns
+     const is401 = errorMessage.includes('401') || stderr.includes('401') || errorMessage.includes('Unauthorized');
+diff --git a/packages/patchnote/src/changelog/fetcher.ts b/packages/patchnote/src/changelog/fetcher.ts
+index d2b789f..192275c 100644
+--- a/packages/patchnote/src/changelog/fetcher.ts
++++ b/packages/patchnote/src/changelog/fetcher.ts
+@@ -1,3 +1,4 @@
++import typia from 'typia';
+ /**
+  * Fetch changelogs for package updates
+  */
+@@ -19,7 +20,7 @@ async function fetchNpmChangelog(packageName: string, version: string): Promise<
+       return null;
+     }
+ 
+-    const data = rawData as { versions?: Record<string, { repository?: { url?: string } }> };
++    const data = typia.assert<{ versions?: Record<string, { repository?: { url?: string } }> }>(rawData);
+     if (!data.versions) {
+       console.warn(`No versions found in npm registry response for ${packageName}`);
+       return null;
+@@ -27,7 +28,7 @@ async function fetchNpmChangelog(packageName: string, version: string): Promise<
+     const versionData = data.versions?.[version];
+ 
+     // Check for repository URL
+-    const repository = versionData?.repository || (data as { repository?: { url?: string } }).repository;
++    const repository = versionData?.repository || typia.assert<{ repository?: { url?: string } }>(data).repository;
+     if (repository?.url) {
+       const githubMatch = repository.url.match(/github\.com[/:]([^/]+\/[^/.]+)/);
+       if (githubMatch) {
+@@ -59,7 +60,7 @@ async function fetchGitHubChangelog(packageName: string, version: string): Promi
+       const response = await fetch(url, { signal: AbortSignal.timeout(30_000) });
+ 
+       if (response.ok) {
+-        const data = (await response.json()) as { body?: string; html_url?: string };
++        const data = typia.assert<{ body?: string; html_url?: string }>(await response.json());
+         return data.body || data.html_url || null;
+       }
+     }
+@@ -84,7 +85,7 @@ async function fetchChangelogContent(url: string): Promise<string | null> {
+ 
+     const contentType = response.headers.get('content-type');
+     if (contentType?.includes('application/json')) {
+-      const data = (await response.json()) as { body?: string };
++      const data = typia.assert<{ body?: string }>(await response.json());
+       return data.body || JSON.stringify(data, null, 2);
+     }
+ 
+@@ -167,10 +168,10 @@ export async function fetchChangelogs(
+  */
+ export function generateSimpleChangelog(updates: PackageUpdate[]): string {
+   const sections = {
+-    major: [] as PackageUpdate[],
+-    minor: [] as PackageUpdate[],
+-    patch: [] as PackageUpdate[],
+-    unknown: [] as PackageUpdate[],
++    major: typia.assert<PackageUpdate[]>([]),
++    minor: typia.assert<PackageUpdate[]>([]),
++    patch: typia.assert<PackageUpdate[]>([]),
++    unknown: typia.assert<PackageUpdate[]>([]),
+   };
+ 
+   // Group by update type
+diff --git a/packages/patchnote/src/cli.ts b/packages/patchnote/src/cli.ts
+index 8a838cc..f604190 100644
+--- a/packages/patchnote/src/cli.ts
++++ b/packages/patchnote/src/cli.ts
+@@ -238,7 +238,7 @@ program
+   .action(async (options) => {
+     const config = await setupConfig();
+     const { rebaseOpenPRs } = await import('./commands/rebase-open-prs.js');
+-    await rebaseOpenPRs(config, { ...getUpdateOptions(), maxAgeDays: Number.parseInt(options.maxAge) });
++    await rebaseOpenPRs(config, { ...getUpdateOptions(), maxAgeDays: Number.parseInt(options.maxAge, 10) });
+   });
+ 
+ // Parse arguments and run
+diff --git a/packages/patchnote/src/commands/onboard.ts b/packages/patchnote/src/commands/onboard.ts
+index d1e680a..e0b0478 100644
+--- a/packages/patchnote/src/commands/onboard.ts
++++ b/packages/patchnote/src/commands/onboard.ts
+@@ -177,7 +177,7 @@ export async function onboard(
+   // Reset working tree after dry-run to avoid committing lock file artifacts
+   try {
+     const { execa } = await import('execa');
+-    await (executor || (execa as unknown as CommandExecutor))('git', ['checkout', '.'], { cwd: repoRoot });
++    await (executor || execa)('git', ['checkout', '.'], { cwd: repoRoot });
+   } catch {
+     // Ignore reset errors
+   }
+diff --git a/packages/patchnote/src/commands/rebase-open-prs.ts b/packages/patchnote/src/commands/rebase-open-prs.ts
+index a455816..8e59f7b 100644
+--- a/packages/patchnote/src/commands/rebase-open-prs.ts
++++ b/packages/patchnote/src/commands/rebase-open-prs.ts
+@@ -12,7 +12,7 @@ import type { PatchnoteConfig } from '../config.js';
+ import { fetch, getCurrentBranch, push, rebase, switchBranch } from '../git.js';
+ import type { CommandExecutor, GitHubPR, IGitHubClient, RebaseOpenPRsOptions, RebaseResult } from '../types.js';
+ 
+-const defaultExecutor = execa as unknown as CommandExecutor;
++const defaultExecutor = execa;
+ 
+ /**
+  * Build topological rebase order from a list of PRs.
+@@ -135,8 +135,8 @@ export async function rebaseOpenPRs(
+   // 4. Dry-run mode: list planned actions without mutating
+   if (options.dryRun) {
+     logger?.info('Dry-run mode: listing planned rebase actions\n');
+-    for (let i = 0; i < levels.length; i++) {
+-      for (const pr of levels[i]!) {
++    for (const [i, level] of levels.entries()) {
++      for (const pr of level) {
+         const rebaseTarget =
+           pr.baseRefName && pr.baseRefName !== baseBranch ? `origin/${pr.baseRefName}` : `origin/${baseBranch}`;
+         logger?.info(`  PR #${pr.number} (${pr.headRefName}) -> rebase onto ${rebaseTarget}`);
+diff --git a/packages/patchnote/src/commands/setup.ts b/packages/patchnote/src/commands/setup.ts
+index e73f425..82b208f 100644
+--- a/packages/patchnote/src/commands/setup.ts
++++ b/packages/patchnote/src/commands/setup.ts
+@@ -18,10 +18,7 @@ import type { CommandExecutor, GitHubAppCredentials, SetupOptions } from '../typ
+  * Open a URL in the user's default browser using platform-specific commands.
+  * Does NOT add the `open` npm package as a dependency.
+  */
+-async function openBrowser(
+-  url: string,
+-  executor: CommandExecutor = execa as unknown as CommandExecutor,
+-): Promise<void> {
++async function openBrowser(url: string, executor: CommandExecutor = execa): Promise<void> {
+   const platform = process.platform;
+   if (platform === 'darwin') {
+     await executor('open', [url]);
+@@ -38,7 +35,7 @@ async function openBrowser(
+ export async function setup(
+   _config: PatchnoteConfig,
+   options: SetupOptions,
+-  executor: CommandExecutor = execa as unknown as CommandExecutor,
++  executor: CommandExecutor = execa,
+ ): Promise<void> {
+   p.intro('Setting up GitHub App for patchnote');
+ 
+diff --git a/packages/patchnote/src/commands/validate-setup.ts b/packages/patchnote/src/commands/validate-setup.ts
+index 17fa620..447fd38 100644
+--- a/packages/patchnote/src/commands/validate-setup.ts
++++ b/packages/patchnote/src/commands/validate-setup.ts
+@@ -1,3 +1,4 @@
++import typia from 'typia';
+ /**
+  * Validates patchnote setup
+  * Checks GitHub CLI, authentication, app installation, permissions, and config
+@@ -21,7 +22,7 @@ interface ValidationResult {
+ export async function validateSetup(
+   logger: Logger,
+   repoRoot?: string,
+-  executor: CommandExecutor = execa as unknown as CommandExecutor,
++  executor: CommandExecutor = execa,
+ ): Promise<number> {
+   logger.info('🔍 Validating patchnote setup...\n');
+ 
+@@ -138,7 +139,7 @@ async function checkGitHubAppInstalled(
+     };
+   } catch (error: unknown) {
+     // Check if it's a 404 (not installed) vs other errors
+-    const stderr = (error as { stderr?: string }).stderr || '';
++    const stderr = typia.is<Pick<Awaited<ReturnType<CommandExecutor>>, 'stderr'>>(error) ? error.stderr : '';
+     const message = error instanceof Error ? error.message : '';
+     const is404 = stderr.includes('404') || message.includes('404');
+ 
+diff --git a/packages/patchnote/src/config.ts b/packages/patchnote/src/config.ts
+index 95f6b4d..217ff15 100644
+--- a/packages/patchnote/src/config.ts
++++ b/packages/patchnote/src/config.ts
+@@ -1,3 +1,4 @@
++import typia from 'typia';
+ /**
+  * Configuration for the patchnote tool
+  */
+@@ -213,7 +214,7 @@ export interface PatchnoteConfigInput extends DeepPartial<PatchnoteConfig> {
+ /**
+  * Default configuration
+  */
+-export const defaultConfig: PatchnoteConfig = {
++const baseConfig = {
+   expo: {
+     enabled: false,
+     autoDetect: true, // Auto-detect Expo projects by default
+@@ -272,7 +273,8 @@ export const defaultConfig: PatchnoteConfig = {
+     branchPrefix: 'chore/lock-file-maintenance',
+   },
+   logger: new ConsoleLogger(LogLevel.INFO),
+-};
++} satisfies PatchnoteConfig;
++export const defaultConfig: PatchnoteConfig = baseConfig;
+ 
+ /**
+  * Config file names to search for (in order of preference)
+@@ -331,28 +333,20 @@ export async function loadConfig(searchPath?: string, explicitConfigPath?: strin
+   }
+ 
+   try {
+-    let userConfig: DeepPartial<PatchnoteConfig>;
++    let userConfig: PatchnoteConfigInput;
+ 
+     // Load TypeScript config using dynamic import
+     if (configPath.endsWith('.ts')) {
+       const module = await import(pathToFileURL(configPath).href);
+-      userConfig = module.default || module;
++      userConfig = typia.assert<PatchnoteConfigInput>(module.default ?? module);
+     } else {
+       // Load JSON config
+       const fileContent = await readFile(configPath, 'utf-8');
+-      userConfig = JSON.parse(fileContent) as DeepPartial<PatchnoteConfig>;
+-    }
+-
+-    // Validate basic structure
+-    if (typeof userConfig !== 'object' || userConfig === null || Array.isArray(userConfig)) {
+-      console.warn(
+-        `Invalid config file at ${configPath}: expected object, got ${Array.isArray(userConfig) ? 'array' : typeof userConfig}`,
+-      );
+-      return { ...defaultConfig };
++      userConfig = typia.json.assertParse<PatchnoteConfigInput>(fileContent);
+     }
+ 
+     // Extract extends field (not part of PatchnoteConfig)
+-    const { extends: presetRefs, ...localConfig } = userConfig as PatchnoteConfigInput;
++    const { extends: presetRefs, ...localConfig } = userConfig;
+ 
+     if (presetRefs && presetRefs.length > 0) {
+       const resolvedPresets = await resolvePresets(presetRefs);
+@@ -416,31 +410,31 @@ export function mergeConfig(userConfig: DeepPartial<PatchnoteConfig>): Patchnote
+   return {
+     ...defaultConfig,
+     ...userConfig,
+-    expo: userConfig.expo ? { ...defaultConfig.expo, ...userConfig.expo } : defaultConfig.expo,
+-    syncpack: userConfig.syncpack ? { ...defaultConfig.syncpack, ...userConfig.syncpack } : defaultConfig.syncpack,
+-    nix: userConfig.nix ? { ...defaultConfig.nix, ...userConfig.nix } : defaultConfig.nix,
++    expo: userConfig.expo ? { ...baseConfig.expo, ...userConfig.expo } : defaultConfig.expo,
++    syncpack: userConfig.syncpack ? { ...baseConfig.syncpack, ...userConfig.syncpack } : defaultConfig.syncpack,
++    nix: userConfig.nix ? { ...baseConfig.nix, ...userConfig.nix } : defaultConfig.nix,
+     prStrategy: { ...defaultConfig.prStrategy, ...(userConfig.prStrategy || {}) },
+     autoMerge: { ...defaultConfig.autoMerge, ...(userConfig.autoMerge || {}) },
+     provenanceCheck: userConfig.provenanceCheck
+-      ? { ...defaultConfig.provenanceCheck, ...userConfig.provenanceCheck }
++      ? { ...baseConfig.provenanceCheck, ...userConfig.provenanceCheck }
+       : defaultConfig.provenanceCheck,
+     deprecationCheck: userConfig.deprecationCheck
+-      ? { ...defaultConfig.deprecationCheck, ...userConfig.deprecationCheck }
++      ? { ...baseConfig.deprecationCheck, ...userConfig.deprecationCheck }
+       : defaultConfig.deprecationCheck,
+     ai: { ...defaultConfig.ai, ...(userConfig.ai || {}) },
+-    git: userConfig.git ? { ...defaultConfig.git, ...userConfig.git } : defaultConfig.git,
++    git: userConfig.git ? { ...baseConfig.git, ...userConfig.git } : defaultConfig.git,
+     semanticCommits: userConfig.semanticCommits
+-      ? { ...defaultConfig.semanticCommits, ...userConfig.semanticCommits }
++      ? { ...baseConfig.semanticCommits, ...userConfig.semanticCommits }
+       : defaultConfig.semanticCommits,
+-    filters: userConfig.filters ? { ...defaultConfig.filters, ...userConfig.filters } : defaultConfig.filters,
++    filters: userConfig.filters ? { ...baseConfig.filters, ...userConfig.filters } : defaultConfig.filters,
+     grouping: userConfig.grouping ?? defaultConfig.grouping,
+     packageRules: userConfig.packageRules ?? defaultConfig.packageRules,
+     lockFileMaintenance: userConfig.lockFileMaintenance
+-      ? { ...defaultConfig.lockFileMaintenance, ...userConfig.lockFileMaintenance }
++      ? { ...baseConfig.lockFileMaintenance, ...userConfig.lockFileMaintenance }
+       : defaultConfig.lockFileMaintenance,
+     // Logger is runtime-only, always use default logger (can be overridden later)
+     logger: defaultConfig.logger,
+-  } as PatchnoteConfig;
++  };
+ }
+ 
+ /**
+diff --git a/packages/patchnote/src/deprecated/checker.ts b/packages/patchnote/src/deprecated/checker.ts
+index 511de6f..961d557 100644
+--- a/packages/patchnote/src/deprecated/checker.ts
++++ b/packages/patchnote/src/deprecated/checker.ts
+@@ -1,3 +1,4 @@
++import typia from 'typia';
+ /**
+  * npm deprecated package detection
+  *
+@@ -27,7 +28,7 @@ export async function getDeprecationStatus(packageName: string, version: string)
+     const response = await fetch(url, { signal: AbortSignal.timeout(30_000) });
+     if (!response.ok) return null;
+ 
+-    const data = (await response.json()) as { deprecated?: string };
++    const data = typia.assert<{ deprecated?: string }>(await response.json());
+     return data.deprecated ?? null;
+   } catch {
+     return null; // Fail open: treat fetch errors as "unknown" (not deprecated)
+diff --git a/packages/patchnote/src/deprecated/replacements.ts b/packages/patchnote/src/deprecated/replacements.ts
+index d0d87c1..2bdf642 100644
+--- a/packages/patchnote/src/deprecated/replacements.ts
++++ b/packages/patchnote/src/deprecated/replacements.ts
+@@ -1,3 +1,4 @@
++import typia from 'typia';
+ /**
+  * Renovate replacement mapping lookup
+  *
+@@ -22,7 +23,7 @@ let _replacements: ReplacementsData | null = null;
+ 
+ function getReplacements(): ReplacementsData {
+   if (!_replacements) {
+-    _replacements = JSON.parse(readFileSync(dataPath, 'utf-8')) as ReplacementsData;
++    _replacements = typia.json.assertParse<ReplacementsData>(readFileSync(dataPath, 'utf-8'));
+   }
+   return _replacements;
+ }
+diff --git a/packages/patchnote/src/expo/sdk-checker.ts b/packages/patchnote/src/expo/sdk-checker.ts
+index acef616..72a623c 100644
+--- a/packages/patchnote/src/expo/sdk-checker.ts
++++ b/packages/patchnote/src/expo/sdk-checker.ts
+@@ -1,3 +1,4 @@
++import typia from 'typia';
+ /**
+  * Expo SDK version checking utilities
+  */
+@@ -44,7 +45,7 @@ export async function getLatestExpoSDK(): Promise<ExpoSDKVersion> {
+     }
+ 
+     const data = await response.json();
+-    const version = (data as { version: string }).version;
++    const version = typia.assert<{ version: string }>(data).version;
+ 
+     // Extract SDK version from package version
+     // Expo versions are like "~52.0.0" or "52.0.0"
+diff --git a/packages/patchnote/src/expo/versions-fetcher.ts b/packages/patchnote/src/expo/versions-fetcher.ts
+index 8892994..a8d8723 100644
+--- a/packages/patchnote/src/expo/versions-fetcher.ts
++++ b/packages/patchnote/src/expo/versions-fetcher.ts
+@@ -1,3 +1,4 @@
++import typia from 'typia';
+ /**
+  * Fetch Expo recommended package versions for a specific SDK
+  */
+@@ -21,7 +22,7 @@ export async function fetchExpoVersions(sdkVersion: string): Promise<ExpoPackage
+       throw new Error(`Failed to fetch Expo versions: ${response.statusText}`);
+     }
+ 
+-    const bundledModules = (await response.json()) as Record<string, string>;
++    const bundledModules = typia.assert<Record<string, string>>(await response.json());
+ 
+     // Also fetch React/React Native versions from the SDK
+     const packageJsonUrl = `https://raw.githubusercontent.com/expo/expo/sdk-${majorVersion}/packages/expo/package.json`;
+@@ -31,9 +32,9 @@ export async function fetchExpoVersions(sdkVersion: string): Promise<ExpoPackage
+     let reactNativeVersion = '0.76.0'; // fallback
+ 
+     if (packageJsonResponse.ok) {
+-      const packageJson = (await packageJsonResponse.json()) as {
++      const packageJson = typia.assert<{
+         peerDependencies?: { react?: string; 'react-native'?: string };
+-      };
++      }>(await packageJsonResponse.json());
+       reactVersion = packageJson.peerDependencies?.react || reactVersion;
+       reactNativeVersion = packageJson.peerDependencies?.['react-native'] || reactNativeVersion;
+     }
+diff --git a/packages/patchnote/src/git.ts b/packages/patchnote/src/git.ts
+index ccf2c85..0b08d09 100644
+--- a/packages/patchnote/src/git.ts
++++ b/packages/patchnote/src/git.ts
+@@ -11,7 +11,7 @@ import type { CommandExecutor } from './types.js';
+  * Default executor - execa cast to CommandExecutor type
+  * The cast is safe because execa's Result extends our ExecutorResult interface
+  */
+-const defaultExecutor = execa as unknown as CommandExecutor;
++const defaultExecutor = execa;
+ 
+ /**
+  * Get the current git branch
+diff --git a/packages/patchnote/src/pr/stacking.ts b/packages/patchnote/src/pr/stacking.ts
+index c95120d..7399aa3 100644
+--- a/packages/patchnote/src/pr/stacking.ts
++++ b/packages/patchnote/src/pr/stacking.ts
+@@ -9,7 +9,7 @@ import type { Logger } from '../logger.js';
+ import type { CommandExecutor, IGitHubClient, OpenPR } from '../types.js';
+ 
+ /** Default executor - execa cast to CommandExecutor type */
+-const defaultExecutor = execaOriginal as unknown as CommandExecutor;
++const defaultExecutor = execaOriginal;
+ 
+ /**
+  * Get list of open update PRs
+diff --git a/packages/patchnote/src/provenance/checker.ts b/packages/patchnote/src/provenance/checker.ts
+index 93b61f3..5d23c63 100644
+--- a/packages/patchnote/src/provenance/checker.ts
++++ b/packages/patchnote/src/provenance/checker.ts
+@@ -1,3 +1,4 @@
++import typia from 'typia';
+ /**
+  * npm provenance downgrade detection
+  *
+@@ -28,13 +29,13 @@ export async function getProvenanceStatus(packageName: string, version: string):
+     const response = await fetch(url, { signal: AbortSignal.timeout(30_000) });
+     if (!response.ok) return false;
+ 
+-    const data = (await response.json()) as {
++    const data = typia.assert<{
+       dist?: {
+         attestations?: {
+           provenance?: { predicateType: string };
+         };
+       };
+-    };
++    }>(await response.json());
+ 
+     return !!data.dist?.attestations?.provenance;
+   } catch {
+diff --git a/packages/patchnote/src/setup/credential-store.ts b/packages/patchnote/src/setup/credential-store.ts
+index 35db721..ddb6bc1 100644
+--- a/packages/patchnote/src/setup/credential-store.ts
++++ b/packages/patchnote/src/setup/credential-store.ts
+@@ -10,7 +10,7 @@ import type { CommandExecutor, GitHubAppCredentials } from '../types.js';
+  * Detect the GitHub organization from the current repository.
+  * Uses `gh repo view` to get the repo owner.
+  */
+-export async function detectOrg(executor: CommandExecutor = execa as unknown as CommandExecutor): Promise<string> {
++export async function detectOrg(executor: CommandExecutor = execa): Promise<string> {
+   const { stdout } = await executor('gh', ['repo', 'view', '--json', 'owner', '--jq', '.owner.login']);
+   return stdout.trim();
+ }
+@@ -19,9 +19,7 @@ export async function detectOrg(executor: CommandExecutor = execa as unknown as
+  * Check if the GitHub CLI is authenticated.
+  * Returns true if `gh auth status` succeeds, false otherwise.
+  */
+-export async function checkAuthScopes(
+-  executor: CommandExecutor = execa as unknown as CommandExecutor,
+-): Promise<boolean> {
++export async function checkAuthScopes(executor: CommandExecutor = execa): Promise<boolean> {
+   try {
+     await executor('gh', ['auth', 'status']);
+     return true;
+@@ -34,10 +32,7 @@ export async function checkAuthScopes(
+  * Exchange a temporary manifest code for GitHub App credentials.
+  * Calls `gh api POST /app-manifests/{code}/conversions` and parses the response.
+  */
+-export async function exchangeCode(
+-  code: string,
+-  executor: CommandExecutor = execa as unknown as CommandExecutor,
+-): Promise<GitHubAppCredentials> {
++export async function exchangeCode(code: string, executor: CommandExecutor = execa): Promise<GitHubAppCredentials> {
+   const { stdout } = await executor('gh', ['api', 'POST', `/app-manifests/${code}/conversions`]);
+   const data = JSON.parse(stdout);
+   return {
+@@ -56,7 +51,7 @@ export async function exchangeCode(
+  */
+ export async function storeCredentials(
+   options: { org: string; appId: number; pem: string },
+-  executor: CommandExecutor = execa as unknown as CommandExecutor,
++  executor: CommandExecutor = execa,
+ ): Promise<void> {
+   // Set App ID as org variable
+   await executor('gh', [
+@@ -81,10 +76,7 @@ export async function storeCredentials(
+  * Delete a GitHub App by slug. Best-effort rollback helper.
+  * Silently catches errors since this is used during cleanup.
+  */
+-export async function deleteApp(
+-  slug: string,
+-  executor: CommandExecutor = execa as unknown as CommandExecutor,
+-): Promise<void> {
++export async function deleteApp(slug: string, executor: CommandExecutor = execa): Promise<void> {
+   try {
+     await executor('gh', ['api', '-X', 'DELETE', `/apps/${slug}`]);
+   } catch {
+diff --git a/packages/patchnote/src/types.ts b/packages/patchnote/src/types.ts
+index abeeb06..9b31bcb 100644
+--- a/packages/patchnote/src/types.ts
++++ b/packages/patchnote/src/types.ts
+@@ -13,19 +13,21 @@ export interface ExecutorResult {
+   stdout: string;
+   /** Standard error */
+   stderr: string;
+-  /** Exit code */
+-  exitCode: number;
++  /** Exit code; undefined when no exit code was produced (for example, a signal). */
++  exitCode: number | undefined;
+ }
+ 
+ /**
+  * Deep partial type - makes all properties and nested properties optional
+  * Useful for partial configuration updates
+  */
+-export type DeepPartial<T> = T extends object
+-  ? {
+-      [P in keyof T]?: DeepPartial<T[P]>;
+-    }
+-  : T;
++export type DeepPartial<T> = T extends readonly unknown[]
++  ? T
++  : T extends object
++    ? {
++        [P in keyof T]?: DeepPartial<T[P]>;
++      }
++    : T;
+ 
+ /**
+  * Update type classification
+diff --git a/packages/patchnote/src/updaters/bun.ts b/packages/patchnote/src/updaters/bun.ts
+index 964cec9..6f7bedb 100644
+--- a/packages/patchnote/src/updaters/bun.ts
++++ b/packages/patchnote/src/updaters/bun.ts
+@@ -83,7 +83,7 @@ export function parsePackageJsonDiff(diff: string): PackageUpdate[] {
+     // Check for section headers
+     const sectionMatch = line.match(sectionPattern);
+     if (sectionMatch) {
+-      currentSection = sectionMatch[1] as 'dependencies' | 'devDependencies';
++      currentSection = sectionMatch[1] === 'devDependencies' ? 'devDependencies' : 'dependencies';
+       continue;
+     }
+ 
+@@ -323,7 +323,7 @@ export async function refreshLockFile(
+     packageManager?: ProjectSetup['packageManager'];
+   } = {},
+ ): Promise<{ changed: boolean; error?: string }> {
+-  const { dryRun = false, logger, executor = execa as unknown as CommandExecutor } = options;
++  const { dryRun = false, logger, executor = execa } = options;
+   const pm = getPackageManagerCommands(options.packageManager ?? 'bun');
+ 
+   if (dryRun) {
+diff --git a/packages/patchnote/test/commands/rebase-open-prs.test.ts b/packages/patchnote/test/commands/rebase-open-prs.test.ts
+index 1f3c79f..3e1506c 100644
+--- a/packages/patchnote/test/commands/rebase-open-prs.test.ts
++++ b/packages/patchnote/test/commands/rebase-open-prs.test.ts
+@@ -5,7 +5,7 @@
+ import { describe, expect, test } from 'bun:test';
+ import { buildRebaseOrder, rebaseOpenPRs } from '../../src/commands/rebase-open-prs.js';
+ import type { PatchnoteConfig } from '../../src/config.js';
+-import type { CommandExecutor, GitHubPR, IGitHubClient, RebaseResult } from '../../src/types.js';
++import type { CommandExecutor, GitHubPR, IGitHubClient } from '../../src/types.js';
+ 
+ // --- Helpers ---
+ 
+diff --git a/packages/patchnote/test/git/modification-functions.test.ts b/packages/patchnote/test/git/modification-functions.test.ts
+index e62a602..7df52c6 100644
+--- a/packages/patchnote/test/git/modification-functions.test.ts
++++ b/packages/patchnote/test/git/modification-functions.test.ts
+@@ -332,7 +332,7 @@ describe('rebase', () => {
+ 
+   test('should return false on conflict and auto-abort', async () => {
+     let callCount = 0;
+-    const mock = async (cmd: string | URL, args?: readonly string[], opts?: Record<string, unknown>) => {
++    const mock = async (cmd: string | URL, args?: readonly string[]) => {
+       callCount++;
+       const command = typeof cmd === 'string' ? cmd : cmd.toString();
+       const key = [command, ...(args || [])].join(' ');
+diff --git a/packages/patchnote/test/lint-boundaries.test.ts b/packages/patchnote/test/lint-boundaries.test.ts
+new file mode 100644
+index 0000000..e429b30
+--- /dev/null
++++ b/packages/patchnote/test/lint-boundaries.test.ts
+@@ -0,0 +1,74 @@
++import { afterEach, describe, expect, test } from 'bun:test';
++import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
++import { tmpdir } from 'node:os';
++import { join } from 'node:path';
++import { execa } from 'execa';
++import { GitHubCLIClient } from '../src/auth/github-client.js';
++import { defaultConfig, loadConfig, mergeConfig } from '../src/config.js';
++import type { CommandExecutor } from '../src/types.js';
++import { createMockExeca } from './helpers/mock-execa.js';
++
++const roots: string[] = [];
++afterEach(async () => {
++  await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
++});
++describe('validated command and configuration boundaries', () => {
++  test('the real text executor satisfies the injectable contract without assertions', async () => {
++    const execute: CommandExecutor = execa;
++    const result = await execute(process.execPath, [
++      '-e',
++      'process.stdout.write("text"); process.stderr.write("diagnostic")',
++    ]);
++    expect(result.stdout).toBe('text');
++    expect(result.stderr).toBe('diagnostic');
++    expect(result.exitCode).toBe(0);
++  });
++  test('rejects malformed members, not only a non-array PR response', async () => {
++    for (const value of [
++      [null],
++      [{}],
++      [{ number: '123', title: 'bad', headRefName: 'branch', createdAt: '2026-01-01', url: 'url' }],
++    ]) {
++      const client = new GitHubCLIClient(
++        createMockExeca({
++          'gh pr list --json number,title,headRefName,baseRefName,createdAt,url --state open': JSON.stringify(value),
++        }),
++      );
++      await expect(client.listUpdatePRs('/repo')).rejects.toThrow('Expected array');
++    }
++  });
++  test('refuses undeclared mergeability values', async () => {
++    const client = new GitHubCLIClient(
++      createMockExeca({
++        'gh pr view 123 --json mergeable': JSON.stringify({ mergeable: 'invented' }),
++      }),
++    );
++    await expect(client.checkPRConflicts('/repo', 123)).rejects.toThrow('mergeable');
++  });
++  test('enhancing an operational rejection cannot crash on null or a primitive', async () => {
++    for (const failure of [null, undefined, 'offline']) {
++      const executor: CommandExecutor = async () => {
++        throw failure;
++      };
++      await expect(new GitHubCLIClient(executor).listUpdatePRs('/repo')).rejects.toThrow('Failed to list PRs');
++    }
++  });
++  test('invalid nested config falls back instead of leaking an invalid runtime type', async () => {
++    const root = await mkdtemp(join(tmpdir(), 'patchnote-config-boundary-'));
++    roots.push(root);
++    await mkdir(join(root, 'tooling'));
++    await writeFile(join(root, 'tooling/patchnote.json'), JSON.stringify({ prStrategy: { maxStackDepth: 'many' } }));
++    expect((await loadConfig(root, 'tooling/patchnote.json')).prStrategy.maxStackDepth).toBe(
++      defaultConfig.prStrategy.maxStackDepth,
++    );
++  });
++  test('configuration merges replace complete list elements and retain required defaults', () => {
++    const config = mergeConfig({
++      expo: { projects: [{ packageJsonPath: 'apps/mobile/package.json' }] },
++      packageRules: [{ match: 'react' }],
++    });
++    expect(config.expo?.projects).toEqual([{ packageJsonPath: 'apps/mobile/package.json' }]);
++    expect(config.expo?.enabled).toBe(defaultConfig.expo?.enabled);
++    expect(config.packageRules).toEqual([{ match: 'react' }]);
++  });
++});
+diff --git a/packages/patchnote/tsconfig.lib.json b/packages/patchnote/tsconfig.lib.json
+index e291c73..4f5c900 100644
+--- a/packages/patchnote/tsconfig.lib.json
++++ b/packages/patchnote/tsconfig.lib.json
+@@ -7,7 +7,12 @@
+     "tsBuildInfoFile": "dist/tsconfig.lib.tsbuildinfo",
+     "emitDeclarationOnly": true,
+     "forceConsistentCasingInFileNames": true,
+-    "types": ["node", "bun"]
++    "types": ["node", "bun"],
++    "plugins": [
++      {
++        "transform": "typia/lib/transform"
++      }
++    ]
+   },
+   "include": ["src/**/*.ts"],
+   "exclude": ["src/**/*.test.ts"],
