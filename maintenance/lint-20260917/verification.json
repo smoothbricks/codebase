@@ -1,6 +1,6 @@
 {
   "source": "115142bc063ee989df55844d70117d3176bfc3fe",
-  "run_id": "35209363077",
+  "run_id": "35209630720",
   "lint": "failure",
   "tests": "skipped",
   "built_node": "skipped",
@@ -20,6 +20,7 @@
     "packages/patchnote/src/config.ts",
     "packages/patchnote/src/deprecated/checker.ts",
     "packages/patchnote/src/deprecated/replacements.ts",
+    "packages/patchnote/src/executor.ts",
     "packages/patchnote/src/expo/sdk-checker.ts",
     "packages/patchnote/src/expo/versions-fetcher.ts",
     "packages/patchnote/src/git.ts",
