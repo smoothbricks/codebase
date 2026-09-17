@@ -17,13 +17,13 @@ Generating type declarations...
 Type declarations generated!
 Build complete! Output: dist/cli.js, dist/index.js, dist/index.d.ts
 ::endgroup::
-::group::❌ > nx run @smoothbricks/patchnote:test
+::group::✅ > nx run @smoothbricks/patchnote:test
 
 $ bun test
 bun test v1.3.13 (bf2e2cec)
 
 ::group::test/presets.test.ts:
-✓ mergePartials > mergePartials({}, {}) returns {}
+✓ mergePartials > mergePartials({}, {}) returns {} [2.00ms]
 ✓ mergePartials > mergePartials shallow-merges each config section
 ✓ mergePartials > mergePartials preserves array-replace semantics for packageRules
 ✓ mergePartials > mergePartials preserves array-replace semantics for grouping
@@ -41,14 +41,14 @@ bun test v1.3.13 (bf2e2cec)
 ✓ resolvePreset > cycle detection throws Error matching "Circular"
 ✓ resolvePresets > resolvePresets([]) returns {}
 ✓ resolvePresets > resolvePresets with single preset returns that preset
-✓ resolvePresets > resolvePresets merges left-to-right (aggressive wins where overlapping) [1.00ms]
-✓ resolvePresets > resolvePresets with conservative then aggressive merges correctly
+✓ resolvePresets > resolvePresets merges left-to-right (aggressive wins where overlapping)
+✓ resolvePresets > resolvePresets with conservative then aggressive merges correctly [1.00ms]
 
 ::endgroup::
 
 ::group::test/config.test.ts:
-✓ sanitizeConfigForLogging > should redact API key when present
-✓ sanitizeConfigForLogging > should handle missing API key gracefully [1.00ms]
+✓ sanitizeConfigForLogging > should redact API key when present [1.00ms]
+✓ sanitizeConfigForLogging > should handle missing API key gracefully
 ✓ sanitizeConfigForLogging > should not modify original config
 ✓ mergeConfig > should merge partial config with defaults
 ✓ mergeConfig > should merge partial config with explicit projects
@@ -58,33 +58,17 @@ bun test v1.3.13 (bf2e2cec)
 ✓ mergeConfig > should allow disabling features
 ✓ mergeConfig > should merge multiple Expo projects
 ✓ mergeConfig > should allow disabling Expo auto-detection
-✓ defaultConfig > should have sensible defaults
+✓ defaultConfig > should have sensible defaults [1.00ms]
 ✓ loadConfig > should return defaults when no config file exists [1.00ms]
 ✓ loadConfig > should load and merge config from tooling/patchnote.json [1.00ms]
-✓ loadConfig > should load config from tooling/patchnote.json [1.00ms]
+✓ loadConfig > should load config from tooling/patchnote.json
 ✓ loadConfig > should prefer tooling/patchnote.ts over tooling/patchnote.json [1.00ms]
-Failed to parse config file at /tmp/patchnote-test-ZJh4Kd/tooling/patchnote.json: JSON Parse error: Expected '}'
-✓ loadConfig > should return defaults on invalid JSON
-Failed to load config file at /tmp/patchnote-test-Qn69vx/tooling/patchnote.json: Error on typia.json.assertParse(): invalid type on $input, expect to be PatchnoteConfigInput
-✓ loadConfig > should return defaults on non-object JSON [1.00ms]
-Failed to load config file at /tmp/patchnote-test-PBS8fp/tooling/patchnote.json: Error on typia.json.assertParse(): invalid type on $input.ai.provider, expect to be ("gemini" | "zai" | undefined)
-380 | 
-381 |     writeFileSync(join(toolingDir, 'patchnote.json'), JSON.stringify(fullConfig, null, 2));
-382 | 
-383 |     const config = await loadConfig(tmpDir);
-384 | 
-385 |     expect(config.expo?.enabled).toBe(true);
-                                       ^
-error: expect(received).toBe(expected)
-
-Expected: true
-Received: false
-
-      at <anonymous> (/home/runner/work/codebase/codebase/packages/patchnote/test/config.test.ts:385:34)
-
-::error file=packages/patchnote/test/config.test.ts,line=385,col=34,title=error: expect(received).toBe(expected)::Expected: true%0AReceived: false%0A%0A      at <anonymous> (/home/runner/work/codebase/codebase/packages/patchnote/test/config.test.ts:385:34)
-✗ loadConfig > should handle config with all optional fields set [1.00ms]
-✓ loadConfig > should search parent directories for config file [1.00ms]
+Failed to parse config file at /tmp/patchnote-test-vNFR67/tooling/patchnote.json: JSON Parse error: Expected '}'
+✓ loadConfig > should return defaults on invalid JSON [1.00ms]
+Failed to load config file at /tmp/patchnote-test-91YFjb/tooling/patchnote.json: Error on typia.json.assertParse(): invalid type on $input, expect to be PatchnoteConfigInput
+✓ loadConfig > should return defaults on non-object JSON
+✓ loadConfig > should handle config with all optional fields set [1.00ms]
+✓ loadConfig > should search parent directories for config file
 ✓ loadConfig > should load config from an explicit config path [22.00ms]
 
 ::endgroup::
@@ -93,17 +77,17 @@ Received: false
 ✓ filterUpdates > empty/undefined filters > returns all updates when filters is undefined
 ✓ filterUpdates > empty/undefined filters > returns all updates when both exclude and include are empty
 ✓ filterUpdates > empty/undefined filters > returns all updates when filter config has no arrays
-✓ filterUpdates > exclude patterns > excludes exact package name [3.00ms]
-✓ filterUpdates > exclude patterns > excludes scoped packages with glob
+✓ filterUpdates > exclude patterns > excludes exact package name [2.00ms]
+✓ filterUpdates > exclude patterns > excludes scoped packages with glob [1.00ms]
 ✓ filterUpdates > exclude patterns > excludes multiple exact names [1.00ms]
-✓ filterUpdates > exclude patterns > brace expansion removes multiple packages [1.00ms]
-✓ filterUpdates > include patterns > keeps only matching packages
-✓ filterUpdates > include patterns > keeps scoped packages with glob [1.00ms]
+✓ filterUpdates > exclude patterns > brace expansion removes multiple packages
+✓ filterUpdates > include patterns > keeps only matching packages [1.00ms]
+✓ filterUpdates > include patterns > keeps scoped packages with glob
 ✓ filterUpdates > precedence: exclude wins over include > package matching both exclude and include is excluded
 ✓ filterUpdates > logging > logs excluded packages with reason
-✓ filterUpdates > logging > logs not-in-include-list packages with reason
+✓ filterUpdates > logging > logs not-in-include-list packages with reason [1.00ms]
 ✓ filterUpdates > logging > does not log when no logger provided
-✓ filterUpdates > downgrades filtering > filters downgrades array the same way as updates [1.00ms]
+✓ filterUpdates > downgrades filtering > filters downgrades array the same way as updates
 
 ::endgroup::
 
@@ -121,22 +105,22 @@ Received: false
 ✓ Semantic Commits > CONVENTIONAL_COMMIT_REGEX > matches revert commits
 ✓ Semantic Commits > CONVENTIONAL_COMMIT_REGEX > matches scoped commits
 ✓ Semantic Commits > CONVENTIONAL_COMMIT_REGEX > matches breaking change indicator
-✓ Semantic Commits > CONVENTIONAL_COMMIT_REGEX > does not match non-conventional commits
+✓ Semantic Commits > CONVENTIONAL_COMMIT_REGEX > does not match non-conventional commits [1.00ms]
 ✓ Semantic Commits > detectSemanticCommits > returns false for empty array
 ✓ Semantic Commits > detectSemanticCommits > returns true when >50% of commits are conventional
 ✓ Semantic Commits > detectSemanticCommits > returns false when <=50% of commits are conventional
 ✓ Semantic Commits > detectSemanticCommits > returns true when exactly >50% (threshold boundary)
 ✓ Semantic Commits > detectSemanticCommits > returns false when exactly 50%
 ✓ Semantic Commits > detectSemanticCommits > handles scoped commits
-✓ Semantic Commits > getRecentCommitMessages > returns last N commit messages from HEAD [1.00ms]
+✓ Semantic Commits > getRecentCommitMessages > returns last N commit messages from HEAD
 ✓ Semantic Commits > getRecentCommitMessages > returns last N commit messages from specified branch
 ✓ Semantic Commits > getRecentCommitMessages > filters empty lines
-✓ Semantic Commits > resolveSemanticPrefix > returns configured prefix when enabled=true
+✓ Semantic Commits > resolveSemanticPrefix > returns configured prefix when enabled=true [1.00ms]
 ✓ Semantic Commits > resolveSemanticPrefix > returns null when enabled=false
-✓ Semantic Commits > resolveSemanticPrefix > returns prefix when auto mode detects conventional repo [1.00ms]
+✓ Semantic Commits > resolveSemanticPrefix > returns prefix when auto mode detects conventional repo
 ✓ Semantic Commits > resolveSemanticPrefix > returns null when auto mode detects non-conventional repo
 ✓ Semantic Commits > resolveSemanticPrefix > returns devPrefix when all updates have isDev=true
-✓ Semantic Commits > resolveSemanticPrefix > returns prefix when updates are mixed dev and prod
+✓ Semantic Commits > resolveSemanticPrefix > returns prefix when updates are mixed dev and prod [1.00ms]
 ✓ Semantic Commits > resolveSemanticPrefix > returns prefix when updates are all prod
 ✓ Semantic Commits > resolveSemanticPrefix > returns prefix when updates have no isDev set (undefined)
 ✓ Semantic Commits > resolveSemanticPrefix > uses defaultConfig values when semanticCommits is undefined
@@ -144,19 +128,19 @@ Received: false
 ::endgroup::
 
 ::group::test/grouping.test.ts:
-✓ partitionUpdates > with no config returns all updates in a single "default" group
+✓ partitionUpdates > with no config returns all updates in a single "default" group [1.00ms]
 ✓ partitionUpdates > with empty config returns all updates in "default" group
 ✓ partitionUpdates > with separateMajor=true moves major updates to "major" group
 ✓ partitionUpdates > with separateMinorPatch=true splits into minor, patch, and default groups
 ✓ partitionUpdates > with both separateMajor and separateMinorPatch creates up to 4 groups
-✓ partitionUpdates > with name-pattern groups moves matching packages to named group [1.00ms]
+✓ partitionUpdates > with name-pattern groups moves matching packages to named group
 ✓ partitionUpdates > with groups accepting string[] match patterns
-✓ partitionUpdates > semver grouping takes precedence over name-pattern grouping
+✓ partitionUpdates > semver grouping takes precedence over name-pattern grouping [1.00ms]
 ✓ partitionUpdates > empty result groups are not included in returned Map
 ✓ partitionUpdates > preserves all update data in returned groups
 ✓ partitionUpdates > returns Map<string, PackageUpdate[]>
-✓ partitionUpdates > multiple name-pattern groups partition correctly [1.00ms]
-✓ partitionUpdates > full combination: semver + name patterns + default
+✓ partitionUpdates > multiple name-pattern groups partition correctly
+✓ partitionUpdates > full combination: semver + name patterns + default [1.00ms]
 
 ::endgroup::
 
@@ -170,31 +154,31 @@ Received: false
 ✓ matchesPattern > regex miss
 ✓ matchesPattern > invalid regex returns false without throwing
 ✓ resolvePolicy > no matching rules returns empty policy
-✓ resolvePolicy > single matching rule with automerge
-✓ resolvePolicy > later rule overrides earlier (last-match-wins) [1.00ms]
-✓ resolvePolicy > partial override preserves earlier fields [1.00ms]
+✓ resolvePolicy > single matching rule with automerge [1.00ms]
+✓ resolvePolicy > later rule overrides earlier (last-match-wins)
+✓ resolvePolicy > partial override preserves earlier fields
 ✓ resolvePolicy > updateTypes constraint: rule with updateTypes patch does not match minor update
 ✓ resolvePolicy > updateTypes constraint: rule with updateTypes patch matches patch update
-✓ resolvePolicy > depTypes constraint: devDependencies matches isDev=true
-✓ resolvePolicy > depTypes constraint: dependencies does not match isDev=true [1.00ms]
+✓ resolvePolicy > depTypes constraint: devDependencies matches isDev=true [1.00ms]
+✓ resolvePolicy > depTypes constraint: dependencies does not match isDev=true
 ✓ resolvePolicy > depTypes constraint: dependencies matches isDev=undefined
 ✓ resolvePolicy > array match patterns: matches if any pattern hits
 ✓ resolvePolicy > array match patterns: no match if none hit
 ✓ applyPackageRules > undefined rules returns all updates unchanged with empty policies map
 ✓ applyPackageRules > empty rules array returns all updates unchanged with empty policies map
 ✓ applyPackageRules > ignore action removes package from updates list
-✓ applyPackageRules > allowedVersions filters out update outside range [2.00ms]
-✓ applyPackageRules > allowedVersions keeps update within range
-✓ applyPackageRules > pin action sets allowedVersions to ~major.minor from fromVersion [1.00ms]
+✓ applyPackageRules > allowedVersions filters out update outside range [4.00ms]
+✓ applyPackageRules > allowedVersions keeps update within range [1.00ms]
+✓ applyPackageRules > pin action sets allowedVersions to ~major.minor from fromVersion
 ✓ applyPackageRules > pin action keeps update within pinned range
-✓ applyPackageRules > group action stored in policy but no filtering effect [1.00ms]
+✓ applyPackageRules > group action stored in policy but no filtering effect
 ✓ applyPackageRules > automerge action stored in policy but no filtering effect
-✓ applyPackageRules > logs ignored packages when logger provided
+✓ applyPackageRules > logs ignored packages when logger provided [1.00ms]
 ✓ applyPackageRules > logs version-rejected packages when logger provided
 ✓ applyPackageRules > policies map contains resolved policy for non-filtered packages
 ✓ resolveAutoMerge > empty policies map falls back to global shouldAutoMerge
 ✓ resolveAutoMerge > empty policies with global mode none returns false
-✓ resolveAutoMerge > all packages have automerge: true returns true regardless of global mode [1.00ms]
+✓ resolveAutoMerge > all packages have automerge: true returns true regardless of global mode
 ✓ resolveAutoMerge > any package has automerge: false returns false regardless of global mode
 ✓ resolveAutoMerge > mixed: some with automerge true, some without automerge set falls back to global
 ✓ resolveAutoMerge > no policies set automerge falls back to global shouldAutoMerge
@@ -202,16 +186,18 @@ Received: false
 ::endgroup::
 
 ::group::test/lint-boundaries.test.ts:
-✓ validated command and configuration boundaries > the real text executor satisfies the injectable contract without assertions [342.00ms]
+✓ validated command and configuration boundaries > the real text executor satisfies the injectable contract without assertions [320.00ms]
 ✓ validated command and configuration boundaries > rejects malformed members, not only a non-array PR response [1.00ms]
 ✓ validated command and configuration boundaries > refuses undeclared mergeability values [1.00ms]
 ✓ validated command and configuration boundaries > enhancing an operational rejection cannot crash on null or a primitive
-Failed to load config file at /tmp/patchnote-config-boundary-dWsaqZ/tooling/patchnote.json: Error on typia.json.assertParse(): invalid type on $input.prStrategy.maxStackDepth, expect to be (number | undefined)
-✓ validated command and configuration boundaries > invalid nested config falls back instead of leaking an invalid runtime type [4.00ms]
+Failed to load config file at /tmp/patchnote-config-boundary-u5jcX7/tooling/patchnote.json: Error on typia.json.assertParse(): invalid type on $input.prStrategy.maxStackDepth, expect to be (number | undefined)
+✓ validated command and configuration boundaries > invalid nested config falls back instead of leaking an invalid runtime type [8.00ms]
 ✓ validated command and configuration boundaries > configuration merges replace complete list elements and retain required defaults
-✓ text executor output modes > represents uncaptured streams as empty text without changing execution [321.00ms]
-✓ text executor output modes > retains a nonzero exit code when the caller requests non-throwing execution [313.00ms]
-✓ text executor output modes > refuses a binary result instead of passing bytes off as text [2.00ms]
+✓ text executor output modes > represents uncaptured streams as empty text without changing execution [314.00ms]
+✓ text executor output modes > retains a nonzero exit code when the caller requests non-throwing execution [322.00ms]
+✓ text executor output modes > rejects known non-text modes before even resolving the executable
+Failed to load config file at /tmp/patchnote-provider-boundary-GBPwnJ/tooling/patchnote.json: Error on typia.json.assertParse(): invalid type on $input.ai.provider, expect to be ("gemini" | "zai" | undefined)
+✓ text executor output modes > an unsupported provider cannot admit the rest of an invalid configuration [4.00ms]
 
 ::endgroup::
 
@@ -220,19 +206,19 @@ Failed to load config file at /tmp/patchnote-config-boundary-dWsaqZ/tooling/patc
 ✓ ai-client > PROVIDER_CONFIGS > should contain gemini config with correct values
 ✓ ai-client > sendPrompt > should send prompt and return response text [1.00ms]
 ✓ ai-client > sendPrompt > should send correct request body
-✓ ai-client > sendPrompt > should send authorization header [1.00ms]
+✓ ai-client > sendPrompt > should send authorization header
 ✓ ai-client > sendPrompt > should use model override from options
-✓ ai-client > sendPrompt > should fall back to ZAI_API_KEY env var
+✓ ai-client > sendPrompt > should fall back to ZAI_API_KEY env var [1.00ms]
 ✓ ai-client > sendPrompt > should throw when no API key available
 ✓ ai-client > sendPrompt > should throw on HTTP error with provider name
 ✓ ai-client > sendPrompt > should throw when no content in response
-✓ ai-client > sendPrompt > should trim response text [1.00ms]
+✓ ai-client > sendPrompt > should trim response text
 ✓ ai-client > sendPrompt > should send to Z.AI URL when provider is zai
 ✓ ai-client > gemini provider > should send to Gemini URL when provider is gemini
 ✓ ai-client > gemini provider > should use gemini-2.5-flash as default model
-✓ ai-client > gemini provider > should use GEMINI_API_KEY env var when no config.ai.apiKey
+✓ ai-client > gemini provider > should use GEMINI_API_KEY env var when no config.ai.apiKey [1.00ms]
 ✓ ai-client > gemini provider > should throw gemini-specific error on HTTP error
-✓ ai-client > resolveProvider > should return configured provider when config.ai.apiKey is set [1.00ms]
+✓ ai-client > resolveProvider > should return configured provider when config.ai.apiKey is set
 ✓ ai-client > resolveProvider > should return configured provider when matching env var is set
 ✓ ai-client > resolveProvider > should fall back to gemini when ZAI_API_KEY missing but GEMINI_API_KEY present
 ✓ ai-client > resolveProvider > should fall back to zai when GEMINI_API_KEY missing but ZAI_API_KEY present
@@ -242,25 +228,25 @@ Failed to load config file at /tmp/patchnote-config-boundary-dWsaqZ/tooling/patc
 ✓ ai-client > getProviderTokenBudget > should return gemini default budget (128k) for gemini provider
 ✓ ai-client > getProviderTokenBudget > should return config override when set
 ✓ ai-client > getProviderTokenBudget > should return fallback budget based on resolved provider when falling back
-✓ ai-client > shutdownAIClient > should be a no-op
+✓ ai-client > shutdownAIClient > should be a no-op [1.00ms]
 
 ::endgroup::
 
 ::group::test/ai/token-counter.test.ts:
-✓ token-counter > countTokens > should count tokens for simple text [17.00ms]
+✓ token-counter > countTokens > should count tokens for simple text [2.00ms]
 ✓ token-counter > countTokens > should count tokens for longer text
 ✓ token-counter > countTokens > should handle empty string
 ✓ token-counter > countTokens > should handle whitespace only [1.00ms]
 ✓ token-counter > countTokens > should handle code snippets
 ✓ token-counter > countTokens > should handle special characters
-✓ token-counter > countTokens > should handle unicode characters [7.00ms]
+✓ token-counter > countTokens > should handle unicode characters [4.00ms]
 ✓ token-counter > exceedsTokenLimit > should return true when content exceeds limit [1.00ms]
 ✓ token-counter > exceedsTokenLimit > should return false when content is within limit
 ✓ token-counter > exceedsTokenLimit > should return false when content equals limit
 ✓ token-counter > exceedsTokenLimit > should return true when content exceeds limit by one
 ✓ token-counter > exceedsTokenLimit > should handle zero limit
 ✓ token-counter > exceedsTokenLimit > should handle empty text with any limit
-✓ token-counter > token counting accuracy > should be more accurate than character-based estimation [1.00ms]
+✓ token-counter > token counting accuracy > should be more accurate than character-based estimation
 
 ::endgroup::
 
@@ -274,52 +260,52 @@ Failed to load config file at /tmp/patchnote-config-boundary-dWsaqZ/tooling/patc
 ✓ zai-client (backward compat re-export) > sendPrompt > should throw on HTTP error
 ✓ zai-client (backward compat re-export) > sendPrompt > should throw when no content in response
 ✓ zai-client (backward compat re-export) > sendPrompt > should trim response text
-✓ zai-client (backward compat re-export) > shutdownAIClient > should be a no-op [1.00ms]
+✓ zai-client (backward compat re-export) > shutdownAIClient > should be a no-op
 
 ::endgroup::
 
 ::group::test/changelog/analyzer.test.ts:
 ✓ Changelog Analyzer > generateCommitMessage > generates title with breaking changes warning for major updates
-✓ Changelog Analyzer > generateCommitMessage > generates normal title for non-breaking updates [1.00ms]
-✓ Changelog Analyzer > generateCommitMessage > generates fallback summary with grouped updates
+✓ Changelog Analyzer > generateCommitMessage > generates normal title for non-breaking updates
+✓ Changelog Analyzer > generateCommitMessage > generates fallback summary with grouped updates [1.00ms]
 ✓ Changelog Analyzer > generateCommitMessage > includes total update count
 ✓ Changelog Analyzer > generateCommitMessage > includes ecosystem information
 ✓ Changelog Analyzer > generateCommitMessage > handles empty updates array
-✓ Changelog Analyzer > generateCommitMessage > handles unknown update types [1.00ms]
+✓ Changelog Analyzer > generateCommitMessage > handles unknown update types
 ✓ Changelog Analyzer > generateCommitMessage > uses semantic prefix in title when provided
-✓ Changelog Analyzer > generateCommitMessage > uses semantic prefix with breaking changes
+✓ Changelog Analyzer > generateCommitMessage > uses semantic prefix with breaking changes [1.00ms]
 ✓ Changelog Analyzer > generateCommitMessage > uses default chore prefix when semantic prefix is null
 ✓ Changelog Analyzer > generateCommitMessage > uses default chore prefix when semantic prefix is undefined
-✓ Changelog Analyzer > analyzeChangelogs > fallback behavior (no API key) > falls back to fallback summary when no API key available [1.00ms]
+✓ Changelog Analyzer > analyzeChangelogs > fallback behavior (no API key) > falls back to fallback summary when no API key available
 ✓ Changelog Analyzer > analyzeChangelogs > fallback summary formatting > includes changelog URLs in fallback summary
 ✓ Changelog Analyzer > analyzeChangelogs > fallback summary formatting > groups updates by type in fallback summary [1.00ms]
 ✓ Changelog Analyzer > analyzeChangelogs > fallback summary formatting > includes downgrades section in fallback summary
 ✓ Changelog Analyzer > analyzeChangelogs > fallback summary formatting > includes ecosystem labels for non-npm packages
 ✓ Changelog Analyzer > renderReleaseNotesSection > renders collapsible details blocks for packages with changelog content
 ✓ Changelog Analyzer > renderReleaseNotesSection > skips entries where changelog content starts with http (URL-only)
-✓ Changelog Analyzer > renderReleaseNotesSection > truncates individual changelog content exceeding 2000 chars [1.00ms]
-✓ Changelog Analyzer > renderReleaseNotesSection > returns empty string when changelogs map is empty
+✓ Changelog Analyzer > renderReleaseNotesSection > truncates individual changelog content exceeding 2000 chars
+✓ Changelog Analyzer > renderReleaseNotesSection > returns empty string when changelogs map is empty [1.00ms]
 ✓ Changelog Analyzer > renderReleaseNotesSection > stops adding entries when approaching character budget
 ✓ Changelog Analyzer > renderReleaseNotesSection > renders multiple packages each with their own details block
 ✓ Changelog Analyzer > generateCommitMessage with changelogs > includes details blocks when changelogs map has content
 ✓ Changelog Analyzer > generateCommitMessage with changelogs > does not include details block for URL-only changelogs
-✓ Changelog Analyzer > analyzeChangelogs with release notes embedding > fallback mode (no API key) includes details blocks when changelogs have content [1.00ms]
+✓ Changelog Analyzer > analyzeChangelogs with release notes embedding > fallback mode (no API key) includes details blocks when changelogs have content
 
 ::endgroup::
 
 ::group::test/changelog/fetcher.test.ts:
-✓ Changelog Fetcher > generateSimpleChangelog > groups updates by type
-✓ Changelog Fetcher > generateSimpleChangelog > handles empty updates [1.00ms]
+✓ Changelog Fetcher > generateSimpleChangelog > groups updates by type [1.00ms]
+✓ Changelog Fetcher > generateSimpleChangelog > handles empty updates
 ✓ Changelog Fetcher > generateSimpleChangelog > handles only major updates
 ✓ Changelog Fetcher > generateSimpleChangelog > handles unknown update types
 ✓ Changelog Fetcher > generateSimpleChangelog > handles mixed ecosystems
-✓ Changelog Fetcher > fetchChangelog > returns null when fetch fails [1.00ms]
-✓ Changelog Fetcher > fetchChangelog > logs info message when fetching
+✓ Changelog Fetcher > fetchChangelog > returns null when fetch fails
+✓ Changelog Fetcher > fetchChangelog > logs info message when fetching [1.00ms]
 ✓ Changelog Fetcher > fetchChangelogs > populates changelogUrl field on update objects [1.00ms]
 ✓ Changelog Fetcher > fetchChangelogs > processes updates in batches
 ✓ Changelog Fetcher > fetchChangelogs > returns empty map for empty updates
 ✓ Changelog Fetcher > fetchChangelogs > logs summary of fetched changelogs
-✓ Changelog Fetcher > fetchChangelogs > respects maxConcurrent parameter [133.00ms]
+✓ Changelog Fetcher > fetchChangelogs > respects maxConcurrent parameter [134.00ms]
 ✓ Changelog Fetcher > fetchChangelog - npm registry > constructs GitHub release URL from npm registry data [1.00ms]
 Failed to fetch npm changelog for react@19.1.0: Network error
 Failed to fetch GitHub changelog for react@19.1.0: Network error
@@ -334,14 +320,14 @@ Failed to fetch GitHub changelog for react@19.1.0: Network error
 ::group::test/template/integration.test.ts:
 ✓ Integration: template rendering pipeline > default template with fallback (AI disabled) contains key sections [1.00ms]
 ✓ Integration: template rendering pipeline > custom template only includes requested sections
-✓ Integration: template rendering pipeline > empty variables do not produce triple-newlines in final output
-✓ Integration: template rendering pipeline > all sections present when every variable is populated [1.00ms]
+✓ Integration: template rendering pipeline > empty variables do not produce triple-newlines in final output [1.00ms]
+✓ Integration: template rendering pipeline > all sections present when every variable is populated
 ✓ Integration: template rendering pipeline > config prBodyTemplate overrides default
 
 ::endgroup::
 
 ::group::test/template/renderer.test.ts:
-✓ renderTemplate > replaces known variables [2.00ms]
+✓ renderTemplate > replaces known variables
 ✓ renderTemplate > preserves unknown variables
 ✓ renderTemplate > replaces undefined variable with empty string
 ✓ renderTemplate > replaces empty string variable with empty string
@@ -374,41 +360,41 @@ Failed to fetch GitHub changelog for react@19.1.0: Network error
 ✓ getCurrentBranch > should return branch name
 ✓ getCurrentBranch > should trim whitespace
 ✓ getCurrentBranch > should handle branch names with slashes
-✓ getCurrentBranch > should throw when not in git repo [1.00ms]
+✓ getCurrentBranch > should throw when not in git repo
 ✓ isWorkingDirectoryClean > should return true for clean repo
 ✓ isWorkingDirectoryClean > should return false for dirty repo
-✓ isWorkingDirectoryClean > should return false for repo with untracked files
+✓ isWorkingDirectoryClean > should return false for repo with untracked files [1.00ms]
 ✓ isWorkingDirectoryClean > should handle whitespace-only output as clean
-✓ getChangedFiles > should return empty array for clean repo [1.00ms]
+✓ getChangedFiles > should return empty array for clean repo
 ✓ getChangedFiles > should parse modified files
 ✓ getChangedFiles > should parse new files
 ✓ getChangedFiles > should handle mixed status codes
 ✓ getChangedFiles > should filter empty lines
 ✓ getChangedFiles > should strip status codes from filenames
 ✓ getChangedFiles > should handle single file
-✓ branchExists > should return true for existing local branch [1.00ms]
+✓ branchExists > should return true for existing local branch
 ✓ branchExists > should return true for existing remote branch
-✓ branchExists > should return false for non-existent local branch
+✓ branchExists > should return false for non-existent local branch [1.00ms]
 ✓ branchExists > should return false for non-existent remote branch
 ✓ branchExists > should handle branch names with slashes
-✓ getLastCommitMessage > should return last commit message [2.00ms]
+✓ getLastCommitMessage > should return last commit message
 ✓ getLastCommitMessage > should trim whitespace
-✓ getLastCommitMessage > should handle multi-line commit messages [1.00ms]
+✓ getLastCommitMessage > should handle multi-line commit messages
 ✓ getLastCommitMessage > should handle empty commit message
 ✓ hasConflicts > should return false when no conflicts
 ✓ hasConflicts > should return true when conflicts exist
 ✓ hasConflicts > should return true on merge-tree error
-✓ getRepoRoot > should return absolute path [1.00ms]
+✓ getRepoRoot > should return absolute path
 ✓ getRepoRoot > should trim whitespace
-✓ getRepoRoot > should accept Unix absolute paths [1.00ms]
+✓ getRepoRoot > should accept Unix absolute paths
 ✓ getRepoRoot > should accept Windows absolute paths
 ✓ getRepoRoot > should accept Windows paths with forward slashes
 ✓ getRepoRoot > should throw on empty output
 ✓ getRepoRoot > should throw on relative path
 ✓ getRepoRoot > should throw on path starting with dot
 ✓ getRepoRoot > should throw on path with only whitespace
-✓ getDiff > should return diff between branches [1.00ms]
-✓ getDiff > should handle file filtering
+✓ getDiff > should return diff between branches
+✓ getDiff > should handle file filtering [1.00ms]
 ✓ getDiff > should handle empty diff
 ✓ getDiff > should work without file filtering
 ✓ getDiff > should handle commit SHAs
@@ -421,133 +407,98 @@ Failed to fetch GitHub changelog for react@19.1.0: Network error
 ✓ createBranch > should handle branch names with slashes
 ✓ createBranch > should throw when branch already exists
 ✓ createBranch > should throw when base branch does not exist
-✓ switchBranch > should switch to branch
+✓ switchBranch > should switch to branch [1.00ms]
 ✓ switchBranch > should handle branch names with slashes
 ✓ switchBranch > should throw when branch does not exist
-✓ stageFiles > should stage single file [1.00ms]
+✓ stageFiles > should stage single file
 ✓ stageFiles > should stage multiple files
 ✓ stageFiles > should handle files with spaces
 ✓ stageFiles > should throw when file does not exist
 ✓ stageAll > should stage all changes
 ✓ commit > should create commit with message only
 ✓ commit > should create commit with message and body
-✓ commit > should handle multi-line commit bodies [1.00ms]
+✓ commit > should handle multi-line commit bodies
 ✓ commit > should handle commit messages with quotes
 ✓ commit > should throw when nothing staged
 ✓ push > should push without force
-✓ push > should push with force flag
+✓ push > should push with force flag [1.00ms]
 ✓ push > should handle different remote names
 ✓ push > should throw on network error
-✓ push > should throw when push rejected [1.00ms]
+✓ push > should throw when push rejected
 ✓ push > should throw when remote does not exist
 ✓ pushWithUpstream > should push with upstream tracking
 ✓ pushWithUpstream > should handle different remote names
 ✓ pushWithUpstream > should throw on network error
-✓ fetch > should fetch from remote
+✓ fetch > should fetch from remote [1.00ms]
 ✓ fetch > should handle different remote names
-✓ fetch > should throw on network error [1.00ms]
+✓ fetch > should throw on network error
 ✓ fetch > should throw when remote does not exist
 ✓ rebase > should return true on successful rebase
 ✓ rebase > should return false on conflict and auto-abort
-✓ rebase > should handle abort failure gracefully
+✓ rebase > should handle abort failure gracefully [1.00ms]
 ✓ rebase > should use correct cwd
-✓ abortRebase > should call git rebase --abort [1.00ms]
+✓ abortRebase > should call git rebase --abort
 ✓ abortRebase > should throw when not in rebase state
 ✓ restoreWorkingTree > restores all files when no excludePatterns
 ✓ restoreWorkingTree > restores all files when excludePatterns is empty
-✓ restoreWorkingTree > excludes files matching patterns
+✓ restoreWorkingTree > excludes files matching patterns [1.00ms]
 ✓ restoreWorkingTree > does nothing when all files are excluded
 
 ::endgroup::
 
 ::group::test/git/workflow-functions.test.ts:
 ✓ createUpdateCommit > should stage all and commit with message
-✓ createUpdateCommit > should stage all and commit with message and body
+✓ createUpdateCommit > should stage all and commit with message and body [1.00ms]
 ✓ createUpdateCommit > should use repoRoot from config if present
-✓ createUpdateCommit > should call getRepoRoot if repoRoot not in config [1.00ms]
+✓ createUpdateCommit > should call getRepoRoot if repoRoot not in config
 ✓ createUpdateCommit > should propagate stageAll errors
 ✓ createUpdateCommit > should propagate commit errors
-✓ createUpdateBranch > should create branch and push
-✓ createUpdateBranch > should use config remote (default: origin) [1.00ms]
+✓ createUpdateBranch > should create branch and push [1.00ms]
+✓ createUpdateBranch > should use config remote (default: origin)
 ✓ createUpdateBranch > should use custom remote from config
 ✓ createUpdateBranch > should support custom baseBranch
 ✓ createUpdateBranch > should use repoRoot from config if present
 ✓ createUpdateBranch > should call getRepoRoot if repoRoot not in config
-✓ createUpdateBranch > should propagate createBranch errors
-✓ createUpdateBranch > should propagate push errors [1.00ms]
+✓ createUpdateBranch > should propagate createBranch errors [1.00ms]
+✓ createUpdateBranch > should propagate push errors
 
 ::endgroup::
 
 ::group::test/syncpack/generator.test.ts:
-
-# Unhandled error between tests
--------------------------------
-41 |     this[kState] |= kDefaultUTF8Encoding;
-42 |   else if (@Buffer.isEncoding(defaultEncoding))
-43 |     this.defaultEncoding = defaultEncoding;
-44 |   else
-45 |     throw @makeErrorWithCode(254, defaultEncoding);
-46 |     this.decoder = new StringDecoder(options.encoding), this.encoding = options.encoding;
-                        ^
-TypeError: Unknown encoding: buffer
- code: "ERR_UNKNOWN_ENCODING"
-
-      at new ReadableState (internal:streams/readable:46:20)
-      at new Readable (internal:streams/readable:150:28)
-      at constructNativeReadable (internal:streams/native-readable:5:61)
-      at #getBunSpawnIo (node:child_process:568:129)
-      at get (node:child_process:793:59)
-      at #createStdioObject (node:child_process:616:27)
-      at get (node:child_process:819:68)
-      at <anonymous> (node:child_process:676:19)
-
-::error file=packages/patchnote/internal:streams/readable,line=46,col=20,title=TypeError: Unknown encoding: buffer::%0A      at new ReadableState (internal:streams/readable:46:20)%0A      at new Readable (internal:streams/readable:150:28)%0A      at constructNativeReadable (internal:streams/native-readable:5:61)%0A      at #getBunSpawnIo (node:child_process:568:129)%0A      at get (node:child_process:793:59)%0A      at #createStdioObject (node:child_process:616:27)%0A      at get (node:child_process:819:68)%0A      at <anonymous> (node:child_process:676:19)
--------------------------------
-
-
-# Unhandled error between tests
--------------------------------
-41 |     this[kState] |= kDefaultUTF8Encoding;
-42 |   else if (@Buffer.isEncoding(defaultEncoding))
-43 |     this.defaultEncoding = defaultEncoding;
-44 |   else
-45 |     throw @makeErrorWithCode(254, defaultEncoding);
-46 |     this.decoder = new StringDecoder(options.encoding), this.encoding = options.encoding;
-                        ^
-TypeError: Unknown encoding: buffer
- code: "ERR_UNKNOWN_ENCODING"
-
-      at new ReadableState (internal:streams/readable:46:20)
-      at new Readable (internal:streams/readable:150:28)
-      at constructNativeReadable (internal:streams/native-readable:5:61)
-      at #getBunSpawnIo (node:child_process:568:129)
-      at #handleOnExit (node:child_process:502:43)
-
-::error file=packages/patchnote/internal:streams/readable,line=46,col=20,title=TypeError: Unknown encoding: buffer::%0A      at new ReadableState (internal:streams/readable:46:20)%0A      at new Readable (internal:streams/readable:150:28)%0A      at constructNativeReadable (internal:streams/native-readable:5:61)%0A      at #getBunSpawnIo (node:child_process:568:129)%0A      at #handleOnExit (node:child_process:502:43)
--------------------------------
-
+✓ Syncpack Generator > generateExpoVersionGroups > generates version groups from Expo packages [1.00ms]
+✓ Syncpack Generator > generateExpoVersionGroups > creates separate version groups for each package
+✓ Syncpack Generator > generateExpoVersionGroups > handles empty packages
+✓ Syncpack Generator > generateWorkspaceRules > generates workspace protocol rules for multiple scopes
+✓ Syncpack Generator > generateWorkspaceRules > generates rules for single scope
+✓ Syncpack Generator > generateWorkspaceRules > returns empty array when no scopes provided
+✓ Syncpack Generator > generateWorkspaceRules > creates glob patterns with wildcard
+✓ Syncpack Generator > mergeSyncpackConfig > merges Expo version groups with existing config
+✓ Syncpack Generator > mergeSyncpackConfig > preserves custom rules when flag is true
+✓ Syncpack Generator > mergeSyncpackConfig > replaces all rules when preserveCustomRules is false [1.00ms]
+✓ Syncpack Generator > mergeSyncpackConfig > handles empty existing config
+✓ Syncpack Generator > mergeSyncpackConfig > preserves other syncpack config properties
 
 ::endgroup::
 
 ::group::test/utils/project-detection.test.ts:
-✓ project-detection > detectProjectSetup > should detect Expo project [13.00ms]
-✓ project-detection > detectProjectSetup > should detect Expo in devDependencies [1.00ms]
+✓ project-detection > detectProjectSetup > should detect Expo project [9.00ms]
+✓ project-detection > detectProjectSetup > should detect Expo in devDependencies [2.00ms]
 ✓ project-detection > detectProjectSetup > should detect package manager: bun (bun.lock) [3.00ms]
 ✓ project-detection > detectProjectSetup > should detect package manager: bun (bun.lockb) [1.00ms]
-✓ project-detection > detectProjectSetup > should detect package manager: pnpm [1.00ms]
-✓ project-detection > detectProjectSetup > should detect package manager: yarn [1.00ms]
-✓ project-detection > detectProjectSetup > should default to npm when no lock file found [1.00ms]
+✓ project-detection > detectProjectSetup > should detect package manager: pnpm [2.00ms]
+✓ project-detection > detectProjectSetup > should detect package manager: yarn [2.00ms]
+✓ project-detection > detectProjectSetup > should default to npm when no lock file found [10.00ms]
 ✓ project-detection > detectProjectSetup > should detect Nix from flake.nix [1.00ms]
 ✓ project-detection > detectProjectSetup > should detect Nix from .envrc [1.00ms]
 ✓ project-detection > detectProjectSetup > should detect syncpack from .syncpackrc.json [1.00ms]
-✓ project-detection > detectProjectSetup > should detect syncpack from .syncpackrc.yml [1.00ms]
-✓ project-detection > detectProjectSetup > should handle missing package.json [1.00ms]
-✓ project-detection > detectProjectSetup > should handle invalid package.json [2.00ms]
-✓ project-detection > detectProjectSetup > should detect all features in a full setup [1.00ms]
-✓ project-detection > detectProjectSetup > should detect Nix from nested devenv directory [4.00ms]
-✓ project-detection > detectProjectSetup > should detect Nix from devenv.yaml anywhere [1.00ms]
+✓ project-detection > detectProjectSetup > should detect syncpack from .syncpackrc.yml [3.00ms]
+✓ project-detection > detectProjectSetup > should handle missing package.json [2.00ms]
+✓ project-detection > detectProjectSetup > should handle invalid package.json [1.00ms]
+✓ project-detection > detectProjectSetup > should detect all features in a full setup [3.00ms]
+✓ project-detection > detectProjectSetup > should detect Nix from nested devenv directory [3.00ms]
+✓ project-detection > detectProjectSetup > should detect Nix from devenv.yaml anywhere [16.00ms]
 ✓ project-detection > detectProjectSetup > should detect Nix from .envrc in subdirectory [1.00ms]
-✓ project-detection > detectProjectSetup > should detect untracked Nix files (not yet committed) [1.00ms]
+✓ project-detection > detectProjectSetup > should detect untracked Nix files (not yet committed) [2.00ms]
 
 ::endgroup::
 
@@ -559,16 +510,16 @@ TypeError: Unknown encoding: buffer
 ✓ Workspace Detector > generateWorkspacePrefixes > preserves scope order
 ✓ Workspace Detector > getWorkspacePatterns > reads pnpm-workspace.yaml when it exists [1.00ms]
 ✓ Workspace Detector > getWorkspacePatterns > filters out exclusion patterns from pnpm-workspace.yaml [1.00ms]
-✓ Workspace Detector > getWorkspacePatterns > reads package.json workspaces (array format) when no pnpm-workspace.yaml
-✓ Workspace Detector > getWorkspacePatterns > reads package.json workspaces (object format with .packages) when no pnpm-workspace.yaml [1.00ms]
-✓ Workspace Detector > getWorkspacePatterns > returns empty array when neither source has workspace config
-✓ Workspace Detector > getWorkspacePatterns > returns empty array for empty directory (no package.json) [1.00ms]
+✓ Workspace Detector > getWorkspacePatterns > reads package.json workspaces (array format) when no pnpm-workspace.yaml [1.00ms]
+✓ Workspace Detector > getWorkspacePatterns > reads package.json workspaces (object format with .packages) when no pnpm-workspace.yaml
+✓ Workspace Detector > getWorkspacePatterns > returns empty array when neither source has workspace config [1.00ms]
+✓ Workspace Detector > getWorkspacePatterns > returns empty array for empty directory (no package.json)
 ✓ Workspace Detector > getWorkspacePatterns > reads pnpm-workspace.yaml with inline array format
-✓ Workspace Detector > getWorkspacePatterns > reads pnpm-workspace.yaml with comments on lines [1.00ms]
-✓ Workspace Detector > getWorkspacePatterns > reads pnpm-workspace.yaml with unquoted patterns
-✓ Workspace Detector > getWorkspacePatterns > reads pnpm-workspace.yaml with double-quoted patterns [2.00ms]
+✓ Workspace Detector > getWorkspacePatterns > reads pnpm-workspace.yaml with comments on lines [2.00ms]
+✓ Workspace Detector > getWorkspacePatterns > reads pnpm-workspace.yaml with unquoted patterns [1.00ms]
+✓ Workspace Detector > getWorkspacePatterns > reads pnpm-workspace.yaml with double-quoted patterns [1.00ms]
 ✓ Workspace Detector > parsePnpmWorkspaceYaml > parses block list format
-✓ Workspace Detector > parsePnpmWorkspaceYaml > parses inline array format [1.00ms]
+✓ Workspace Detector > parsePnpmWorkspaceYaml > parses inline array format
 ✓ Workspace Detector > parsePnpmWorkspaceYaml > parses inline array with double quotes
 ✓ Workspace Detector > parsePnpmWorkspaceYaml > strips inline comments
 ✓ Workspace Detector > parsePnpmWorkspaceYaml > filters exclusion patterns
@@ -586,7 +537,7 @@ TypeError: Unknown encoding: buffer
 ✓ validatePathWithinBase > should block absolute paths outside base
 ✓ validatePathWithinBase > should block paths that resolve outside base
 ✓ validatePathWithinBase > should allow base directory itself
-✓ validatePathWithinBase > should block parent directory access [1.00ms]
+✓ validatePathWithinBase > should block parent directory access
 ✓ validatePathWithinBase > should block sibling directory access
 ✓ validatePathWithinBase > should handle paths with trailing slashes
 ✓ safeResolve > should resolve safe relative paths
@@ -600,7 +551,7 @@ TypeError: Unknown encoding: buffer
 ✓ safeResolve > should handle empty string
 ✓ safeResolve > should work with real-world package.json path
 ✓ safeResolve > should work with real-world syncpack config path
-✓ safeResolve > should block traversal even with legitimate-looking file [1.00ms]
+✓ safeResolve > should block traversal even with legitimate-looking file
 ✓ Cross-platform path handling > should handle Windows-style paths (when on Windows)
 ✓ Cross-platform path handling > should block Windows-style path traversal
 ✓ Edge cases and attack vectors > should handle paths with spaces
@@ -612,7 +563,7 @@ TypeError: Unknown encoding: buffer
 ✓ Real-world use cases from patchnote > should work with update-expo.ts packageJsonPath
 ✓ Real-world use cases from patchnote > should work with update-expo.ts syncpackPath
 ✓ Real-world use cases from patchnote > should block malicious packageJsonPath
-✓ Real-world use cases from patchnote > should work with nested package.json in workspace
+✓ Real-world use cases from patchnote > should work with nested package.json in workspace [1.00ms]
 
 ::endgroup::
 
@@ -628,16 +579,16 @@ TypeError: Unknown encoding: buffer
 ✓ getProvenanceStatus > returns true when registry response has dist.attestations.provenance [1.00ms]
 ✓ getProvenanceStatus > returns false when registry response has no attestations field
 ✓ getProvenanceStatus > returns false on fetch error (fail open)
-✓ getProvenanceStatus > returns false on non-OK response status [1.00ms]
+✓ getProvenanceStatus > returns false on non-OK response status
 ✓ getProvenanceStatus > properly encodes scoped package names
-✓ checkProvenanceDowngrades > sets provenanceDowngraded=true when fromVersion has provenance and toVersion does not
+✓ checkProvenanceDowngrades > sets provenanceDowngraded=true when fromVersion has provenance and toVersion does not [1.00ms]
 ✓ checkProvenanceDowngrades > does NOT set provenanceDowngraded when fromVersion has no provenance
-✓ checkProvenanceDowngrades > does NOT set provenanceDowngraded when both versions have provenance [1.00ms]
+✓ checkProvenanceDowngrades > does NOT set provenanceDowngraded when both versions have provenance
 ✓ checkProvenanceDowngrades > does NOT set provenanceDowngraded when neither has provenance
 ✓ checkProvenanceDowngrades > skips non-npm ecosystem packages
-✓ checkProvenanceDowngrades > short-circuits: only fetches toVersion if fromVersion has provenance
-✓ checkProvenanceDowngrades > processes packages in batches respecting maxConcurrent [40.00ms]
-✓ checkProvenanceDowngrades > logs warning for each downgrade detected
+✓ checkProvenanceDowngrades > short-circuits: only fetches toVersion if fromVersion has provenance [1.00ms]
+✓ checkProvenanceDowngrades > processes packages in batches respecting maxConcurrent [38.00ms]
+✓ checkProvenanceDowngrades > logs warning for each downgrade detected [1.00ms]
 
 ::endgroup::
 
@@ -650,22 +601,22 @@ TypeError: Unknown encoding: buffer
 ✓ PR Stacking Workflow - Conflict Handling > should stack on conflicting PR when stopOnConflicts=false [1.00ms]
 ✓ PR Stacking Workflow - Conflict Handling > should fall back to main when latest PR has conflicts even with older non-conflicting PRs
 ✓ PR Stacking Workflow - Conflict Handling > should create on main when all existing PRs have conflicts
-✓ PR Stacking Workflow - Stacking Disabled > should always create PRs on main when stacking is disabled [1.00ms]
-✓ PR Stacking Workflow - Stacking Disabled > should not auto-close PRs when stacking is disabled
+✓ PR Stacking Workflow - Stacking Disabled > should always create PRs on main when stacking is disabled
+✓ PR Stacking Workflow - Stacking Disabled > should not auto-close PRs when stacking is disabled [1.00ms]
 ✓ PR Stacking Workflow - Custom Base Branch > should use custom base branch when no existing PRs
 ✓ PR Stacking Workflow - Custom Base Branch > should fall back to custom base branch on conflicts
-✓ PR Stacking Workflow - getOpenUpdatePRs Integration > should correctly filter and sort PRs in workflow [1.00ms]
-✓ PR Stacking Workflow - autoCloseOldPRs Integration > should close multiple PRs when significantly over maxStackDepth
+✓ PR Stacking Workflow - getOpenUpdatePRs Integration > should correctly filter and sort PRs in workflow
+✓ PR Stacking Workflow - autoCloseOldPRs Integration > should close multiple PRs when significantly over maxStackDepth [1.00ms]
 
 ::endgroup::
 
 ::group::test/integration/config.test.ts:
 ✓ Config Integration - loadConfig > should load default configuration
-✓ Config Integration - loadConfig > should return a new object each time (not same reference)
+✓ Config Integration - loadConfig > should return a new object each time (not same reference) [1.00ms]
 ✓ Config Integration - loadConfig > should have all required configuration sections
 ✓ Config Integration - loadConfig > should have sensible defaults
 ✓ Config Integration - mergeConfig Deep Merging > should merge empty config with defaults
-✓ Config Integration - mergeConfig Deep Merging > should override top-level scalar values [1.00ms]
+✓ Config Integration - mergeConfig Deep Merging > should override top-level scalar values
 ✓ Config Integration - mergeConfig Deep Merging > should deep merge prStrategy section
 ✓ Config Integration - mergeConfig Deep Merging > should deep merge git section
 ✓ Config Integration - mergeConfig Deep Merging > should deep merge ai section
@@ -674,7 +625,7 @@ TypeError: Unknown encoding: buffer
 ✓ Config Integration - mergeConfig Deep Merging > should handle undefined optional sections correctly
 ✓ Config Integration - Realistic Scenarios > minimal config for simple project
 ✓ Config Integration - Realistic Scenarios > config for Expo project with stacking disabled
-✓ Config Integration - Realistic Scenarios > config for monorepo with custom base branch and aggressive stacking [1.00ms]
+✓ Config Integration - Realistic Scenarios > config for monorepo with custom base branch and aggressive stacking
 ✓ Config Integration - Realistic Scenarios > config with all features enabled
 ✓ Config Integration - Realistic Scenarios > config overriding all default branch and prefix settings
 ✓ Config Integration - Realistic Scenarios > config for monorepo with multiple Expo projects
@@ -682,10 +633,10 @@ TypeError: Unknown encoding: buffer
 ✓ Config Integration - Filter Config Merging > mergeConfig with no filters uses defaults (empty arrays)
 ✓ Config Integration - Filter Config Merging > mergeConfig with exclude only keeps default include
 ✓ Config Integration - Filter Config Merging > mergeConfig with include only keeps default exclude
-✓ Config Integration - Filter Config Merging > mergeConfig with both exclude and include preserves both
+✓ Config Integration - Filter Config Merging > mergeConfig with both exclude and include preserves both [1.00ms]
 ✓ Config Integration - sanitizeConfigForLogging > should redact API key
 ✓ Config Integration - sanitizeConfigForLogging > should handle missing API key
-✓ Config Integration - sanitizeConfigForLogging > should preserve all non-sensitive configuration [1.00ms]
+✓ Config Integration - sanitizeConfigForLogging > should preserve all non-sensitive configuration
 ✓ Config Integration - sanitizeConfigForLogging > should be safe to log sanitized config
 ✓ Config Integration - Type Safety > should enforce required prStrategy fields
 ✓ Config Integration - Type Safety > should enforce required autoMerge fields
@@ -696,18 +647,18 @@ TypeError: Unknown encoding: buffer
 ✓ Config Integration - Script Mode > isConfigScript > should return false for .json files [1.00ms]
 ✓ Config Integration - Script Mode > isConfigScript > should return false for non-.ts files
 ✓ Config Integration - Script Mode > isConfigScript > should return false for malformed .ts files [1.00ms]
-✓ Config Integration - Script Mode > isConfigScript > should return false for .ts file with syntax errors
+✓ Config Integration - Script Mode > isConfigScript > should return false for .ts file with syntax errors [1.00ms]
 ✓ Config Integration - Script Mode > executeConfigScript > should execute async function export [1.00ms]
 ✓ Config Integration - Script Mode > executeConfigScript > should execute sync function export [1.00ms]
-✓ Config Integration - Script Mode > executeConfigScript > should throw error if config does not export a function [1.00ms]
+✓ Config Integration - Script Mode > executeConfigScript > should throw error if config does not export a function [2.00ms]
 ✓ Config Integration - Script Mode > executeConfigScript > should propagate errors thrown during script execution
-✓ Config Integration - Script Mode > executeConfigScript > should allow script to access node built-ins [1.00ms]
-✓ Config Integration - Script Mode > executeConfigScript > should handle script that returns a value [1.00ms]
-✓ Config Integration - Script Mode > Script Mode Integration > should verify example script file exists
+✓ Config Integration - Script Mode > executeConfigScript > should allow script to access node built-ins [2.00ms]
+✓ Config Integration - Script Mode > executeConfigScript > should handle script that returns a value [2.00ms]
+✓ Config Integration - Script Mode > Script Mode Integration > should verify example script file exists [1.00ms]
 ✓ Config Integration - Script Mode > Script Mode Integration > should distinguish between declarative config and script mode [1.00ms]
-✓ Config Integration - extends presets > loadConfig with extends: ["patchnote:recommended"] applies preset values [7.00ms]
-✓ Config Integration - extends presets > local config overrides preset values [4.00ms]
-✓ Config Integration - extends presets > multiple presets merge in order, then local config wins [3.00ms]
+✓ Config Integration - extends presets > loadConfig with extends: ["patchnote:recommended"] applies preset values [8.00ms]
+✓ Config Integration - extends presets > local config overrides preset values [3.00ms]
+✓ Config Integration - extends presets > multiple presets merge in order, then local config wins [6.00ms]
 Failed to load config file at /home/runner/work/codebase/codebase/packages/patchnote/test-temp-extends-presets/config-bad-preset.ts: Unknown built-in preset: patchnote:does-not-exist. Available presets: recommended, aggressive, conservative
 ✓ Config Integration - extends presets > extends with unknown preset returns defaults (error handled) [4.00ms]
 ✓ Config Integration - extends presets > resolved config has no extends property [3.00ms]
@@ -716,26 +667,26 @@ Failed to load config file at /home/runner/work/codebase/codebase/packages/patch
 ::endgroup::
 
 ::group::test/deprecated/formatter.test.ts:
-✓ formatDeprecationWarnings > returns empty string when no deprecated packages
+✓ formatDeprecationWarnings > returns empty string when no deprecated packages [1.00ms]
 ✓ formatDeprecationWarnings > returns markdown section with heading for deprecated packages
 ✓ formatDeprecationWarnings > includes deprecation message for each deprecated package
 ✓ formatDeprecationWarnings > includes replacement suggestion arrow when replacementName is set
-✓ formatDeprecationWarnings > omits version suffix when replacementVersion is empty string [1.00ms]
+✓ formatDeprecationWarnings > omits version suffix when replacementVersion is empty string
 ✓ formatDeprecationWarnings > returns empty string for empty array
 
 ::endgroup::
 
 ::group::test/deprecated/checker.test.ts:
 ✓ getDeprecationStatus > returns deprecation message when registry response has deprecated field
-✓ getDeprecationStatus > returns null when no deprecated field present [1.00ms]
-✓ getDeprecationStatus > returns null on fetch error (fail open)
+✓ getDeprecationStatus > returns null when no deprecated field present
+✓ getDeprecationStatus > returns null on fetch error (fail open) [1.00ms]
 ✓ getDeprecationStatus > returns null on 404 response
 ✓ getDeprecationStatus > properly encodes scoped package names in URL
 ✓ checkDeprecations > sets deprecatedMessage on PackageUpdate when toVersion is deprecated [1.00ms]
 ✓ checkDeprecations > does NOT set deprecatedMessage when toVersion is not deprecated
-✓ checkDeprecations > sets replacementName and replacementVersion when Renovate mapping exists [1.00ms]
-✓ checkDeprecations > skips non-npm ecosystem packages
-✓ checkDeprecations > processes packages in batches respecting maxConcurrent [47.00ms]
+✓ checkDeprecations > sets replacementName and replacementVersion when Renovate mapping exists
+✓ checkDeprecations > skips non-npm ecosystem packages [1.00ms]
+✓ checkDeprecations > processes packages in batches respecting maxConcurrent [38.00ms]
 ✓ checkDeprecations > logs warning for each deprecated package found
 
 ::endgroup::
@@ -749,43 +700,43 @@ Failed to load config file at /home/runner/work/codebase/codebase/packages/patch
 
 ::group::test/updaters/bun-lock-maintenance.test.ts:
 ✓ refreshLockFile > runs bun install --force and returns changed: true when bun.lock changed
-✓ refreshLockFile > returns changed: true when bun.lockb changed (binary lock format) [1.00ms]
+✓ refreshLockFile > returns changed: true when bun.lockb changed (binary lock format)
 ✓ refreshLockFile > returns changed: false when git diff shows no lock file changes
 ✓ refreshLockFile > in dry-run mode does NOT run bun install --force
-✓ refreshLockFile > passes correct cwd to execa
+✓ refreshLockFile > passes correct cwd to execa [1.00ms]
 ✓ refreshLockFile > catches errors from bun install --force and returns changed: false with error
-✓ refreshLockFile > with packageManager: pnpm runs pnpm install --force and checks pnpm-lock.yaml [1.00ms]
+✓ refreshLockFile > with packageManager: pnpm runs pnpm install --force and checks pnpm-lock.yaml
 ✓ refreshLockFile > with packageManager: npm runs npm install --package-lock-only and checks package-lock.json
 ✓ refreshLockFile > with packageManager: yarn runs yarn install --force and checks yarn.lock
 
 ::endgroup::
 
 ::group::test/updaters/nixpkgs.test.ts:
-✓ Nixpkgs Overlay Updater > updateNixpkgsOverlay - without nvfetcher > fails without nvfetcher available [6.00ms]
+✓ Nixpkgs Overlay Updater > updateNixpkgsOverlay - without nvfetcher > fails without nvfetcher available [7.00ms]
 ✓ Nixpkgs Overlay Updater > updateNixpkgsOverlay - without nvfetcher > logs info message before attempting update [3.00ms]
-✓ Nixpkgs Overlay Updater > updateNixpkgsOverlay - error handling > handles non-existent directory [3.00ms]
+✓ Nixpkgs Overlay Updater > updateNixpkgsOverlay - error handling > handles non-existent directory [2.00ms]
 ✓ Nixpkgs Overlay Updater > updateNixpkgsOverlay - error handling > returns error when nvfetcher not available [2.00ms]
 
 ::endgroup::
 
 ::group::test/updaters/devenv.test.ts:
-✓ Devenv Updater > updateDevenv - without valid devenv setup > returns failure when devenv.nix is missing [3.00ms]
-✓ Devenv Updater > updateDevenv - without valid devenv setup > handles missing lock file gracefully [3.00ms]
-✓ Devenv Updater > updateDevenv - without valid devenv setup > logs info message before attempting update [2.00ms]
-✓ Devenv Updater > updateDevenv - error handling > handles non-existent directory [1.00ms]
+✓ Devenv Updater > updateDevenv - without valid devenv setup > returns failure when devenv.nix is missing [6.00ms]
+✓ Devenv Updater > updateDevenv - without valid devenv setup > handles missing lock file gracefully [1.00ms]
+✓ Devenv Updater > updateDevenv - without valid devenv setup > logs info message before attempting update [1.00ms]
+✓ Devenv Updater > updateDevenv - error handling > handles non-existent directory [2.00ms]
 ✓ Devenv Updater > updateDevenv - lock file parsing (requires devenv) > fails with lock file when devenv.nix is missing [1.00ms]
 ✓ Devenv Updater > updateDevenv - lock file parsing (requires devenv) > fails with empty lock file when devenv.nix is missing [1.00ms]
 ✓ Devenv Updater > updateDevenv - lock file parsing (requires devenv) > fails with partial lock file when devenv.nix is missing [1.00ms]
 ✓ isVersionDowngrade > detects simple version downgrade
-✓ isVersionDowngrade > detects upgrade is not downgrade [1.00ms]
+✓ isVersionDowngrade > detects upgrade is not downgrade
 ✓ isVersionDowngrade > handles same version
 ✓ isVersionDowngrade > handles special markers
 ✓ isVersionDowngrade > handles patch versions like p3
 ✓ isVersionDowngrade > handles single number versions
-✓ parseDixOutput > parses upgrades and separates from downgrades
+✓ parseDixOutput > parses upgrades and separates from downgrades [1.00ms]
 ✓ parseDixOutput > skips packages with same version (rebuild only)
 ✓ parseDixOutput > parses changed packages with multiple versions
-✓ parseDixOutput > parses added packages as updates [1.00ms]
+✓ parseDixOutput > parses added packages as updates
 ✓ parseDixOutput > parses removed packages as downgrades (informational)
 ✓ parseDixOutput > parses mixed output with upgrades, downgrades, added, and removed
 ✓ parseDixOutput > returns empty arrays for empty output
@@ -802,21 +753,21 @@ Failed to load config file at /home/runner/work/codebase/codebase/packages/patch
 ✓ getPackageManagerCommands > runScriptArgs > bun returns correct run script args
 ✓ getPackageManagerCommands > runScriptArgs > npm returns correct run script args
 ✓ getPackageManagerCommands > runScriptArgs > pnpm returns correct run script args
-✓ getPackageManagerCommands > runScriptArgs > yarn returns correct run script args [1.00ms]
+✓ getPackageManagerCommands > runScriptArgs > yarn returns correct run script args
 
 ::endgroup::
 
 ::group::test/updaters/bun.test.ts:
-✓ Bun Updater > parsePackageJsonDiff > parses single package version change
+✓ Bun Updater > parsePackageJsonDiff > parses single package version change [1.00ms]
 ✓ Bun Updater > parsePackageJsonDiff > parses multiple package changes
 ✓ Bun Updater > parsePackageJsonDiff > handles scoped packages
 ✓ Bun Updater > parsePackageJsonDiff > strips semver prefixes
 ✓ Bun Updater > parsePackageJsonDiff > classifies update types correctly
 ✓ Bun Updater > parsePackageJsonDiff > ignores non-version changes
 ✓ Bun Updater > parsePackageJsonDiff > returns empty array for no changes
-✓ Bun Updater > parseBunUpdateOutput > parses single package update [1.00ms]
+✓ Bun Updater > parseBunUpdateOutput > parses single package update
 ✓ Bun Updater > parseBunUpdateOutput > parses multiple package updates
-✓ Bun Updater > parseBunUpdateOutput > handles scoped package names
+✓ Bun Updater > parseBunUpdateOutput > handles scoped package names [1.00ms]
 ✓ Bun Updater > parseBunUpdateOutput > handles packages with hyphens and slashes
 ✓ Bun Updater > parseBunUpdateOutput > handles prerelease versions
 ✓ Bun Updater > parseBunUpdateOutput > classifies update types correctly
@@ -825,10 +776,10 @@ Failed to load config file at /home/runner/work/codebase/codebase/packages/patch
 ✓ Bun Updater > parseBunUpdateOutput > handles downgrade arrows
 ✓ Bun Updater > parseBunUpdateOutput > handles add symbol for new packages
 ✓ Bun Updater > parseBunUpdateOutput > sets isDev to false for all entries (unknown from stdout)
-✓ Bun Updater > parseBunOutdated > parses basic outdated output [1.00ms]
+✓ Bun Updater > parseBunOutdated > parses basic outdated output
 ✓ Bun Updater > parseBunOutdated > sets isDev=true for packages with (dev) suffix
 ✓ Bun Updater > parseBunOutdated > sets isDev=false for packages without (dev) suffix
-✓ Bun Updater > parseBunOutdated > correctly sets isDev for mixed packages
+✓ Bun Updater > parseBunOutdated > correctly sets isDev for mixed packages [1.00ms]
 ✓ Bun Updater > parsePackageJsonDiff isDev tracking > sets isDev=false for dependencies section
 ✓ Bun Updater > parsePackageJsonDiff isDev tracking > sets isDev=true for devDependencies section
 ✓ Bun Updater > parsePackageJsonDiff isDev tracking > tracks section transitions correctly
@@ -841,74 +792,74 @@ Failed to load config file at /home/runner/work/codebase/codebase/packages/patch
 ✓ Action Wrapper Workflow Generation > Template File > should have push trigger and rebase-open-prs job in template
 ✓ Action Wrapper Workflow Generation > Template File > should have runtime auth detection and action usage in template
 ✓ Action Wrapper Workflow Generation > Template File > should have conditional AI skip logic
-✓ Action Wrapper Workflow Generation > Generated Workflows > Without AI (--skip-ai) > should generate valid YAML [308.00ms]
-✓ Action Wrapper Workflow Generation > Generated Workflows > Without AI (--skip-ai) > should have no leftover template placeholders [272.00ms]
-✓ Action Wrapper Workflow Generation > Generated Workflows > Without AI (--skip-ai) > should have header without AI suffix on first line [285.00ms]
+✓ Action Wrapper Workflow Generation > Generated Workflows > Without AI (--skip-ai) > should generate valid YAML [294.00ms]
+✓ Action Wrapper Workflow Generation > Generated Workflows > Without AI (--skip-ai) > should have no leftover template placeholders [279.00ms]
+✓ Action Wrapper Workflow Generation > Generated Workflows > Without AI (--skip-ai) > should have header without AI suffix on first line [284.00ms]
 ✓ Action Wrapper Workflow Generation > Generated Workflows > Without AI (--skip-ai) > should use the patchnote action step [273.00ms]
-✓ Action Wrapper Workflow Generation > Generated Workflows > Without AI (--skip-ai) > should set skip-ai input to true [270.00ms]
-✓ Action Wrapper Workflow Generation > Generated Workflows > With AI (zai) > should generate valid YAML [275.00ms]
-✓ Action Wrapper Workflow Generation > Generated Workflows > With AI (zai) > should have no leftover template placeholders [268.00ms]
-✓ Action Wrapper Workflow Generation > Generated Workflows > With AI (zai) > should have correct header with AI on first line [267.00ms]
-✓ Action Wrapper Workflow Generation > Generated Workflows > With AI (zai) > should use the patchnote action step [272.00ms]
-✓ Action Wrapper Workflow Generation > Generated Workflows > With AI (zai) > should pass runtime skip-ai expression and ZAI secret env [274.00ms]
-✓ Action Wrapper Workflow Generation > Generated Workflows > Runtime Auth Detection > should have conditional GitHub App token step [268.00ms]
-✓ Action Wrapper Workflow Generation > Generated Workflows > Runtime Auth Detection > should pass token fallback into the action [267.00ms]
-✓ Action Wrapper Workflow Generation > Generated Workflows > Runtime Auth Detection > should have three-tier token fallback in priority order: app-token, PATCHNOTE_TOKEN, github.token [269.00ms]
-✓ Action Wrapper Workflow Generation > Generated Workflows > Runtime Auth Detection > should have runtime skip-ai flag handling [266.00ms]
-✓ Action Wrapper Workflow Generation > Generated Workflows > Common Workflow Properties > without AI should have correct workflow structure [272.00ms]
-✓ Action Wrapper Workflow Generation > Generated Workflows > Common Workflow Properties > with Free AI (default) should have correct workflow structure [262.00ms]
+✓ Action Wrapper Workflow Generation > Generated Workflows > Without AI (--skip-ai) > should set skip-ai input to true [272.00ms]
+✓ Action Wrapper Workflow Generation > Generated Workflows > With AI (zai) > should generate valid YAML [276.00ms]
+✓ Action Wrapper Workflow Generation > Generated Workflows > With AI (zai) > should have no leftover template placeholders [269.00ms]
+✓ Action Wrapper Workflow Generation > Generated Workflows > With AI (zai) > should have correct header with AI on first line [275.00ms]
+✓ Action Wrapper Workflow Generation > Generated Workflows > With AI (zai) > should use the patchnote action step [270.00ms]
+✓ Action Wrapper Workflow Generation > Generated Workflows > With AI (zai) > should pass runtime skip-ai expression and ZAI secret env [269.00ms]
+✓ Action Wrapper Workflow Generation > Generated Workflows > Runtime Auth Detection > should have conditional GitHub App token step [272.00ms]
+✓ Action Wrapper Workflow Generation > Generated Workflows > Runtime Auth Detection > should pass token fallback into the action [270.00ms]
+✓ Action Wrapper Workflow Generation > Generated Workflows > Runtime Auth Detection > should have three-tier token fallback in priority order: app-token, PATCHNOTE_TOKEN, github.token [270.00ms]
+✓ Action Wrapper Workflow Generation > Generated Workflows > Runtime Auth Detection > should have runtime skip-ai flag handling [269.00ms]
+✓ Action Wrapper Workflow Generation > Generated Workflows > Common Workflow Properties > without AI should have correct workflow structure [269.00ms]
+✓ Action Wrapper Workflow Generation > Generated Workflows > Common Workflow Properties > with Free AI (default) should have correct workflow structure [274.00ms]
 ✓ Action Wrapper Workflow Generation > Generated Workflows > Common Workflow Properties > without AI should have required workflow steps [269.00ms]
-✓ Action Wrapper Workflow Generation > Generated Workflows > Common Workflow Properties > with Free AI (default) should have required workflow steps [273.00ms]
-✓ Action Wrapper Workflow Generation > Generated Workflows > Optional wrapper settings > should support workflow name and schedule overrides [274.00ms]
-✓ Action Wrapper Workflow Generation > Generated Workflows > Optional wrapper settings > should support explicit config path [278.00ms]
-✓ Action Wrapper Workflow Generation > Generated Workflows > Push Trigger and Rebase Job > should have push trigger on base branch [266.00ms]
-✓ Action Wrapper Workflow Generation > Generated Workflows > Push Trigger and Rebase Job > should have no leftover {{BASE_BRANCH}} placeholder [268.00ms]
-✓ Action Wrapper Workflow Generation > Generated Workflows > Push Trigger and Rebase Job > should have workflow_dispatch with command input [274.00ms]
-✓ Action Wrapper Workflow Generation > Generated Workflows > Push Trigger and Rebase Job > should have conditional update-deps job (not on push) [270.00ms]
-✓ Action Wrapper Workflow Generation > Generated Workflows > Push Trigger and Rebase Job > should have rebase-open-prs job [266.00ms]
-✓ Action Wrapper Workflow Generation > Generated Workflows > Push Trigger and Rebase Job > should have rebase job with correct condition [276.00ms]
-✓ Action Wrapper Workflow Generation > Generated Workflows > Push Trigger and Rebase Job > should have concurrency group on rebase job [272.00ms]
-✓ Action Wrapper Workflow Generation > Generated Workflows > Push Trigger and Rebase Job > should have full git history checkout in rebase job [269.00ms]
-✓ Action Wrapper Workflow Generation > Generated Workflows > Push Trigger and Rebase Job > should have GH_TOKEN env var in rebase step [268.00ms]
+✓ Action Wrapper Workflow Generation > Generated Workflows > Common Workflow Properties > with Free AI (default) should have required workflow steps [270.00ms]
+✓ Action Wrapper Workflow Generation > Generated Workflows > Optional wrapper settings > should support workflow name and schedule overrides [269.00ms]
+✓ Action Wrapper Workflow Generation > Generated Workflows > Optional wrapper settings > should support explicit config path [274.00ms]
+✓ Action Wrapper Workflow Generation > Generated Workflows > Push Trigger and Rebase Job > should have push trigger on base branch [276.00ms]
+✓ Action Wrapper Workflow Generation > Generated Workflows > Push Trigger and Rebase Job > should have no leftover {{BASE_BRANCH}} placeholder [270.00ms]
+✓ Action Wrapper Workflow Generation > Generated Workflows > Push Trigger and Rebase Job > should have workflow_dispatch with command input [269.00ms]
+✓ Action Wrapper Workflow Generation > Generated Workflows > Push Trigger and Rebase Job > should have conditional update-deps job (not on push) [269.00ms]
+✓ Action Wrapper Workflow Generation > Generated Workflows > Push Trigger and Rebase Job > should have rebase-open-prs job [273.00ms]
+✓ Action Wrapper Workflow Generation > Generated Workflows > Push Trigger and Rebase Job > should have rebase job with correct condition [271.00ms]
+✓ Action Wrapper Workflow Generation > Generated Workflows > Push Trigger and Rebase Job > should have concurrency group on rebase job [268.00ms]
+✓ Action Wrapper Workflow Generation > Generated Workflows > Push Trigger and Rebase Job > should have full git history checkout in rebase job [268.00ms]
+✓ Action Wrapper Workflow Generation > Generated Workflows > Push Trigger and Rebase Job > should have GH_TOKEN env var in rebase step [273.00ms]
 ✓ Action Wrapper Workflow Generation > Generated Workflows > Documentation Links > should link to GETTING-STARTED guide [268.00ms]
 
 ::endgroup::
 
 ::group::test/commands/validate-setup.test.ts:
-✓ validateSetup > should return 0 when all checks pass [7.00ms]
+✓ validateSetup > should return 0 when all checks pass [1.00ms]
 ✓ validateSetup > should return 1 when gh CLI is not installed [1.00ms]
 ✓ validateSetup > should return 1 when gh CLI is not authenticated
-✓ validateSetup > should return 1 when GitHub App is not installed (404)
+✓ validateSetup > should return 1 when GitHub App is not installed (404) [1.00ms]
 ✓ validateSetup > should return 1 when GitHub App has insufficient permissions
-✓ validateSetup > should return 1 when GitHub App credentials are not configured [1.00ms]
-✓ validateSetup > should pass when config file exists and is valid
+✓ validateSetup > should return 1 when GitHub App credentials are not configured
+✓ validateSetup > should pass when config file exists and is valid [1.00ms]
 ✓ validateSetup > should handle missing permissions gracefully
 ✓ validateSetup > should detect when installation check fails for non-404 reasons
-✓ validateSetup > should handle malformed permissions JSON
-✓ validateSetup > should verify all commands are called in order [1.00ms]
+✓ validateSetup > should handle malformed permissions JSON [1.00ms]
+✓ validateSetup > should verify all commands are called in order
 
 ::endgroup::
 
 ::group::test/commands/onboard.test.ts:
 ✓ onboard > constants > ONBOARD_BRANCH should be chore/configure-patchnote
-✓ onboard > constants > ONBOARD_PR_TITLE should be Configure Patchnote [1.00ms]
+✓ onboard > constants > ONBOARD_PR_TITLE should be Configure Patchnote
 ✓ onboard > buildOnboardingPRBody > should include welcome header
 ✓ onboard > buildOnboardingPRBody > should include detected project setup section
 ✓ onboard > buildOnboardingPRBody > should include proposed configuration code block
 ✓ onboard > buildOnboardingPRBody > should include next steps section
 ✓ onboard > buildOnboardingPRBody > should show "No outdated dependencies" when updates array is empty
 ✓ onboard > buildOnboardingPRBody > should show update preview table when updates exist
-✓ onboard > buildOnboardingPRBody > should cap preview at 50 packages with overflow message
+✓ onboard > buildOnboardingPRBody > should cap preview at 50 packages with overflow message [1.00ms]
 ✓ onboard > buildOnboardingPRBody > should show Expo as Yes when detected
 ✓ onboard > buildOnboardingPRBody > should show Nix as No when not detected
 
 ::endgroup::
 
 ::group::test/commands/lock-file-maintenance.test.ts:
-✓ lockFileMaintenance command > exits early with message when no lock file changes detected [2.00ms]
+✓ lockFileMaintenance command > exits early with message when no lock file changes detected [3.00ms]
 ✓ lockFileMaintenance command > in dry-run mode reports status without creating PR [1.00ms]
-✓ lockFileMaintenance command > stages only bun.lock and bun.lockb, not all changes [1.00ms]
-✓ lockFileMaintenance command > creates branch with correct prefix format
+✓ lockFileMaintenance command > stages only bun.lock and bun.lockb, not all changes
+✓ lockFileMaintenance command > creates branch with correct prefix format [1.00ms]
 ✓ lockFileMaintenance command > creates PR targeting base branch (main) directly, not stacked [1.00ms]
 ✓ lockFileMaintenance command > skips git operations when skipGit is true
 ✓ lockFileMaintenance command > handles PR creation failure by cleaning up remote branch [1.00ms]
@@ -916,7 +867,7 @@ Failed to load config file at /home/runner/work/codebase/codebase/packages/patch
 ::endgroup::
 
 ::group::test/commands/update-deps.test.ts:
-✓ update-deps command > Update result aggregation > should aggregate updates from multiple ecosystems
+✓ update-deps command > Update result aggregation > should aggregate updates from multiple ecosystems [1.00ms]
 ✓ update-deps command > Update result aggregation > should handle empty update results
 ✓ update-deps command > Update result aggregation > should collect errors from failed updaters
 ✓ update-deps command > Update type detection > should detect breaking changes
@@ -945,10 +896,10 @@ Failed to load config file at /home/runner/work/codebase/codebase/packages/patch
 ✓ init command > Project detection > should detect package manager from lock files
 ✓ init command > Project detection > should handle minimal project (npm only)
 ✓ init command > Project detection > should handle complex project (all features)
-✓ init command > Config generation - JSON format > should generate minimal JSON config [1.00ms]
+✓ init command > Config generation - JSON format > should generate minimal JSON config
 ✓ init command > Config generation - JSON format > should generate Expo-enabled JSON config
 ✓ init command > Config generation - JSON format > should generate Nix-enabled JSON config
-✓ init command > Config generation - JSON format > should generate all-features JSON config
+✓ init command > Config generation - JSON format > should generate all-features JSON config [1.00ms]
 ✓ init command > Config generation - TypeScript format > should generate TypeScript config structure
 ✓ init command > Config generation - TypeScript format > should use boolean literals in TypeScript config
 ✓ init command > Init options > should handle --yes flag (non-interactive)
@@ -960,7 +911,7 @@ Failed to load config file at /home/runner/work/codebase/codebase/packages/patch
 ✓ init command > File path generation > should generate correct TypeScript config path
 ✓ init command > File path generation > should generate correct tooling directory path
 ✓ init command > Overwrite logic > should detect existing config
-✓ init command > Overwrite logic > should allow overwrite with --yes flag [1.00ms]
+✓ init command > Overwrite logic > should allow overwrite with --yes flag
 ✓ init command > Overwrite logic > should skip overwrite in dry-run mode
 ✓ init command > Workflow generation integration > should generate workflow without auth type (runtime detection)
 ✓ init command > Workflow generation integration > should pass enableAI to workflow generator
@@ -979,23 +930,23 @@ Failed to load config file at /home/runner/work/codebase/codebase/packages/patch
 ::group::test/commands/rebase-open-prs.test.ts:
 ✓ buildRebaseOrder > should return empty array for no PRs
 ✓ buildRebaseOrder > should put independent PRs all in level 0
-✓ buildRebaseOrder > should order stacked PRs correctly (base first, then children)
+✓ buildRebaseOrder > should order stacked PRs correctly (base first, then children) [1.00ms]
 ✓ buildRebaseOrder > should handle diamond dependencies
 ✓ buildRebaseOrder > should treat PRs with missing baseRefName as roots
 ✓ rebaseOpenPRs > should return empty results when no patchnote PRs exist [1.00ms]
-✓ rebaseOpenPRs > should return empty results when no PRs match branch prefix [1.00ms]
-✓ rebaseOpenPRs > should successfully rebase a single PR
+✓ rebaseOpenPRs > should return empty results when no PRs match branch prefix
+✓ rebaseOpenPRs > should successfully rebase a single PR [1.00ms]
 ✓ rebaseOpenPRs > should force-push after successful rebase
-✓ rebaseOpenPRs > should skip stale PRs (older than maxAgeDays) [1.00ms]
+✓ rebaseOpenPRs > should skip stale PRs (older than maxAgeDays)
 ✓ rebaseOpenPRs > should handle conflict on rebase (abort + comment)
-✓ rebaseOpenPRs > should cascade parent conflict to child PRs (parent-conflict)
-✓ rebaseOpenPRs > should rebase stacked PRs in topological order [1.00ms]
-✓ rebaseOpenPRs > should skip branch-missing when checkout fails
-✓ rebaseOpenPRs > should restore original branch after all operations [1.00ms]
+✓ rebaseOpenPRs > should cascade parent conflict to child PRs (parent-conflict) [1.00ms]
+✓ rebaseOpenPRs > should rebase stacked PRs in topological order
+✓ rebaseOpenPRs > should skip branch-missing when checkout fails [1.00ms]
+✓ rebaseOpenPRs > should restore original branch after all operations
 ✓ rebaseOpenPRs > should restore original branch even on error
 ✓ rebaseOpenPRs > should not fetch/rebase/push in dry-run mode
-✓ rebaseOpenPRs > should use stacked PR branch as rebase target for child PRs
-✓ rebaseOpenPRs > should handle mixed stale and active PRs [1.00ms]
+✓ rebaseOpenPRs > should use stacked PR branch as rebase target for child PRs [1.00ms]
+✓ rebaseOpenPRs > should handle mixed stale and active PRs
 ✓ rebaseOpenPRs > should use configured remote name
 
 ::endgroup::
@@ -1018,49 +969,49 @@ Failed to load config file at /home/runner/work/codebase/codebase/packages/patch
 ✓ getMaxUpdateSeverity > should return major for single major update
 ✓ getMaxUpdateSeverity > should return unknown for single unknown update
 ✓ getMaxUpdateSeverity > should return highest severity for mixed types
-✓ getMaxUpdateSeverity > should return unknown when any update is unknown [1.00ms]
+✓ getMaxUpdateSeverity > should return unknown when any update is unknown
 
 ::endgroup::
 
 ::group::test/auth/github-client.test.ts:
 ✓ GitHubCLIClient > listUpdatePRs > should parse gh CLI JSON output correctly
 ✓ GitHubCLIClient > listUpdatePRs > should return empty array when no PRs exist
-✓ GitHubCLIClient > listUpdatePRs > should use correct gh CLI command [1.00ms]
+✓ GitHubCLIClient > listUpdatePRs > should use correct gh CLI command
 ✓ GitHubCLIClient > listUpdatePRs > should throw on malformed JSON
-✓ GitHubCLIClient > listUpdatePRs > should throw on non-array JSON response
+✓ GitHubCLIClient > listUpdatePRs > should throw on non-array JSON response [1.00ms]
 ✓ GitHubCLIClient > checkPRConflicts > should return true for CONFLICTING status
 ✓ GitHubCLIClient > checkPRConflicts > should return false for MERGEABLE status
 ✓ GitHubCLIClient > checkPRConflicts > should return false for UNKNOWN status
 ✓ GitHubCLIClient > checkPRConflicts > should use correct gh CLI command
 ✓ GitHubCLIClient > checkPRConflicts > should throw on malformed JSON
 ✓ GitHubCLIClient > checkPRConflicts > should throw on JSON without mergeable field
-✓ GitHubCLIClient > createPR > should extract PR number from URL
+✓ GitHubCLIClient > createPR > should extract PR number from URL [1.00ms]
 ✓ GitHubCLIClient > createPR > should handle URL without trailing newline
-✓ GitHubCLIClient > createPR > should throw if URL format is invalid [1.00ms]
+✓ GitHubCLIClient > createPR > should throw if URL format is invalid
 ✓ GitHubCLIClient > createPR > should use correct gh CLI command with all options
-✓ GitHubCLIClient > createPR with metadata > should add --label flags for each label
+✓ GitHubCLIClient > createPR with metadata > should add --label flags for each label [1.00ms]
 ✓ GitHubCLIClient > createPR with metadata > should add --assignee flags for each assignee
-✓ GitHubCLIClient > createPR with metadata > should add --reviewer flags for each reviewer [1.00ms]
+✓ GitHubCLIClient > createPR with metadata > should add --reviewer flags for each reviewer
 ✓ GitHubCLIClient > createPR with metadata > should add --draft flag when draft is true
 ✓ GitHubCLIClient > createPR with metadata > should not add metadata flags when not provided
 ✓ GitHubCLIClient > createPR with metadata > should add all metadata flags together in correct order
 ✓ GitHubCLIClient > closePR > should call gh pr close with correct arguments
 ✓ GitHubCLIClient > closePR > should handle PR number as string correctly
-✓ GitHubCLIClient > closePR > should not return anything [1.00ms]
+✓ GitHubCLIClient > closePR > should not return anything
 ✓ GitHubCLIClient > enableAutoMerge > should call gh pr merge with --auto and --squash for squash strategy
 ✓ GitHubCLIClient > enableAutoMerge > should call gh pr merge with --auto and --rebase for rebase strategy
 ✓ GitHubCLIClient > enableAutoMerge > should call gh pr merge with --auto and --merge for merge strategy
 ✓ GitHubCLIClient > enableAutoMerge > should use correct cwd
-✓ GitHubCLIClient > enableAutoMerge > should throw enhanced error on failure [1.00ms]
-✓ GitHubCLIClient > findPRByHead > should return PR when matching open PR exists
+✓ GitHubCLIClient > enableAutoMerge > should throw enhanced error on failure
+✓ GitHubCLIClient > findPRByHead > should return PR when matching open PR exists [1.00ms]
 ✓ GitHubCLIClient > findPRByHead > should return null when no matching PR exists
 ✓ GitHubCLIClient > findPRByHead > should use correct gh CLI args and cwd
-✓ GitHubCLIClient > findPRByHead > should throw enhanced error on failure [1.00ms]
+✓ GitHubCLIClient > findPRByHead > should throw enhanced error on failure
 ✓ GitHubCLIClient > editPR > should call gh pr edit with correct args
 ✓ GitHubCLIClient > editPR > should use correct cwd
 ✓ GitHubCLIClient > editPR > should throw enhanced error on failure
-✓ GitHubCLIClient > commentOnPR > should call gh pr comment with correct arguments
-✓ GitHubCLIClient > commentOnPR > should use correct cwd [1.00ms]
+✓ GitHubCLIClient > commentOnPR > should call gh pr comment with correct arguments [1.00ms]
+✓ GitHubCLIClient > commentOnPR > should use correct cwd
 ✓ GitHubCLIClient > commentOnPR > should throw enhanced error on failure
 ✓ GitHubCLIClient > constructor > should use provided executor
 ✓ GitHubCLIClient > constructor > should use default executor (execa) when not provided
@@ -1068,11 +1019,11 @@ Failed to load config file at /home/runner/work/codebase/codebase/packages/patch
 ::endgroup::
 
 ::group::test/setup/local-server.test.ts:
-✓ startCallbackServer > returns port, waitForCode, and close [5.00ms]
+✓ startCallbackServer > returns port, waitForCode, and close [4.00ms]
 ✓ startCallbackServer > serves manifest HTML page on GET / [7.00ms]
-✓ startCallbackServer > resolves waitForCode with code from GET /callback?code=XYZ [5.00ms]
+✓ startCallbackServer > resolves waitForCode with code from GET /callback?code=XYZ [6.00ms]
 ✓ startCallbackServer > responds with success HTML on callback [4.00ms]
-✓ startCallbackServer > rejects waitForCode on timeout [105.00ms]
+✓ startCallbackServer > rejects waitForCode on timeout [104.00ms]
 
 ::endgroup::
 
@@ -1081,27 +1032,27 @@ Failed to load config file at /home/runner/work/codebase/codebase/packages/patch
 ✓ buildManifest > uses provided appName in name field
 ✓ buildManifest > uses provided port in redirect_url
 ✓ buildManifest > includes org in description
-✓ generateManifestPage > returns HTML with auto-submitting form POST to GitHub [1.00ms]
+✓ generateManifestPage > returns HTML with auto-submitting form POST to GitHub
 ✓ generateManifestPage > HTML-escapes manifest JSON to prevent XSS
 ✓ generateManifestPage > includes redirect message in body
 
 ::endgroup::
 
 ::group::test/setup/credential-store.test.ts:
-✓ detectOrg > calls gh repo view and returns trimmed stdout
+✓ detectOrg > calls gh repo view and returns trimmed stdout [1.00ms]
 ✓ detectOrg > throws when gh command fails
 ✓ checkAuthScopes > returns true when gh auth status succeeds
-✓ checkAuthScopes > returns false when gh auth status fails [1.00ms]
+✓ checkAuthScopes > returns false when gh auth status fails
 ✓ storeCredentials > calls gh variable set for app ID and gh secret set for PEM
-✓ deleteApp > calls gh api DELETE for the app slug
+✓ deleteApp > calls gh api DELETE for the app slug [1.00ms]
 ✓ deleteApp > does not throw when delete fails (best-effort)
 ✓ exchangeCode > calls gh api POST and parses credentials from response
-✓ exchangeCode > throws when gh api call fails [1.00ms]
+✓ exchangeCode > throws when gh api call fails
 
 ::endgroup::
 
 ::group::test/expo/sdk-checker.test.ts:
-✓ Expo SDK Checker > compareVersions > returns -1 when first version is lower
+✓ Expo SDK Checker > compareVersions > returns -1 when first version is lower [1.00ms]
 ✓ Expo SDK Checker > compareVersions > returns 0 when versions are equal
 ✓ Expo SDK Checker > compareVersions > returns 1 when first version is higher
 ✓ Expo SDK Checker > compareVersions > handles versions with different part counts
@@ -1109,13 +1060,13 @@ Failed to load config file at /home/runner/work/codebase/codebase/packages/patch
 ::endgroup::
 
 ::group::test/pr/pure-functions.test.ts:
-✓ generateBranchName > should generate branch name with current date [1.00ms]
+✓ generateBranchName > should generate branch name with current date
 ✓ generateBranchName > should use current date if not provided
 ✓ generateBranchName > should handle different branch prefixes
 ✓ generateBranchName > should handle branch prefix without slash
 ✓ generateBranchName > should insert groupName between prefix and date
 ✓ generateBranchName > should insert "major" groupName into branch name
-✓ generateBranchName > should produce current format when groupName is undefined [1.00ms]
+✓ generateBranchName > should produce current format when groupName is undefined
 ✓ generatePRTitle > should generate PR title without breaking changes flag
 ✓ generatePRTitle > should generate PR title without breaking changes when explicitly false
 ✓ generatePRTitle > should add breaking changes note when flag is true
@@ -1130,19 +1081,19 @@ Failed to load config file at /home/runner/work/codebase/codebase/packages/patch
 ::endgroup::
 
 ::group::test/pr/query-functions.test.ts:
-✓ checkPRConflicts > should return true for conflicting PR [1.00ms]
+✓ checkPRConflicts > should return true for conflicting PR
 ✓ checkPRConflicts > should return false for mergeable PR
 ✓ checkPRConflicts > should return false for unknown mergeable state
 ✓ checkPRConflicts > should call gh with correct arguments
-✓ checkPRConflicts > should return true on error (fail-safe: assume conflicts) [1.00ms]
+✓ checkPRConflicts > should return true on error (fail-safe: assume conflicts)
 ✓ getOpenUpdatePRs > should return empty array when no PRs exist
-✓ getOpenUpdatePRs > should filter PRs by branch prefix
-✓ getOpenUpdatePRs > should sort PRs by creation date (oldest first) [1.00ms]
+✓ getOpenUpdatePRs > should filter PRs by branch prefix [1.00ms]
+✓ getOpenUpdatePRs > should sort PRs by creation date (oldest first)
 ✓ getOpenUpdatePRs > should check conflicts for each PR
 ✓ getOpenUpdatePRs > should handle date parsing [1.00ms]
 ✓ getOpenUpdatePRs > should throw on error (callers handle fallback)
 ✓ getOpenUpdatePRs > should throw for non-array response
-✓ getOpenUpdatePRs > should include all PR fields [1.00ms]
+✓ getOpenUpdatePRs > should include all PR fields
 
 ::endgroup::
 
@@ -1155,8 +1106,8 @@ Failed to load config file at /home/runner/work/codebase/codebase/packages/patch
 ✓ createPR with metadata pass-through > should pass labels from config to GitHub client
 ✓ createPR with metadata pass-through > should pass draft from config to GitHub client
 ✓ createPR with metadata pass-through > should not add metadata flags when config has no metadata
-✓ autoCloseOldPRs > should not close PRs if autoCloseOldPRs is disabled [1.00ms]
-✓ autoCloseOldPRs > should not close PRs if under maxStackDepth
+✓ autoCloseOldPRs > should not close PRs if autoCloseOldPRs is disabled
+✓ autoCloseOldPRs > should not close PRs if under maxStackDepth [1.00ms]
 ✓ autoCloseOldPRs > should close oldest PRs when at maxStackDepth
 ✓ autoCloseOldPRs > should close multiple PRs when over maxStackDepth
 ✓ autoCloseOldPRs > should continue on close error [1.00ms]
@@ -1165,41 +1116,32 @@ Failed to load config file at /home/runner/work/codebase/codebase/packages/patch
 
 ::group::test/pr/stacking-algorithm.test.ts:
 ✓ determineBaseBranch > should return main when stacking is disabled
-✓ determineBaseBranch > should return main when no open PRs exist [1.00ms]
-✓ determineBaseBranch > should return latest PR branch when one PR exists without conflicts
+✓ determineBaseBranch > should return main when no open PRs exist
+✓ determineBaseBranch > should return latest PR branch when one PR exists without conflicts [1.00ms]
 ✓ determineBaseBranch > should return latest PR branch when multiple PRs exist
 ✓ determineBaseBranch > should return main when latest PR has conflicts and stopOnConflicts is true
 ✓ determineBaseBranch > should return latest PR branch when it has conflicts but stopOnConflicts is false
-✓ determineBaseBranch > should use custom base branch from config [1.00ms]
+✓ determineBaseBranch > should use custom base branch from config
 ✓ determineBaseBranch > should default to main when git config is not set
-✓ determineBaseBranch > should filter PRs by branch prefix
+✓ determineBaseBranch > should filter PRs by branch prefix [1.00ms]
 ✓ determineBaseBranch > should handle older PRs with conflicts correctly
-✓ createStackedPR > should determine base, auto-close, and create PR [1.00ms]
-✓ createStackedPR > should auto-close old PRs when at maxStackDepth
+✓ createStackedPR > should determine base, auto-close, and create PR
+✓ createStackedPR > should auto-close old PRs when at maxStackDepth [1.00ms]
 ✓ createStackedPR > should base on main when no existing PRs
 ✓ createStackedPR > should base on main when latest PR has conflicts
-✓ createStackedPR > should not auto-close when autoCloseOldPRs is disabled [1.00ms]
+✓ createStackedPR > should not auto-close when autoCloseOldPRs is disabled
 
 ::endgroup::
 
-1 tests failed:
-✗ loadConfig > should handle config with all optional fields set [1.00ms]
-
- 886 pass
- 1 fail
- 2 errors
- 1766 expect() calls
-Ran 887 tests across 51 files. [20.74s]
-error: script "test" exited with code 1
+ 900 pass
+ 0 fail
+ 1807 expect() calls
+Ran 900 tests across 51 files. [20.22s]
 ::endgroup::
 
 
- NX   Running target test for project @smoothbricks/patchnote and 2 tasks it depends on failed
+ NX   Successfully ran target test for project @smoothbricks/patchnote and 2 tasks it depends on
 
-Failed tasks:
-
-- @smoothbricks/patchnote:test
-
-Hint: run the command with --verbose for more details.
+Nx read the output from the cache instead of running the command for 2 out of 3 tasks.
 
 
