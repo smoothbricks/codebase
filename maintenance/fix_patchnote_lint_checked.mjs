@@ -10,6 +10,10 @@ const providerLines = lines.filter(line => line.startsWith("replace(pkg+'src/typ
 assert.equal(providerLines.length, 1);
 repair = lines.filter(line => !providerLines.includes(line)).join('\n');
 repair = repair.replace("require('@typia/unplugin/package.json').version", "JSON.parse(read('package.json')).devDependencies['@typia/unplugin']");
+const executorGuard = "assert.equal(expression.getText(tree), 'execa', `${path}: unsupported executor assertion`);";
+assert.equal(repair.split(executorGuard).length, 2);
+repair = repair.replace(executorGuard, "assert.ok(['execa', 'execaOriginal'].includes(expression.getText(tree)), `${path}: unsupported executor assertion`);");
+repair = repair.replace("edits.push([node.getStart(tree), node.end, 'execa']);", "edits.push([node.getStart(tree), node.end, expression.getText(tree)]);");
 const temporary = join(process.env.RUNNER_TEMP,'patchnote-repair.mjs');
 writeFileSync(temporary,repair);
 await import(pathToFileURL(temporary).href);
