@@ -3,7 +3,7 @@ Resolving dependencies
 Resolved, downloaded and extracted [30]
 Saved lockfile
 
-Saved bun.lock (1794 packages) [141.00ms]
+Saved bun.lock (1794 packages) [162.00ms]
 bun install v1.3.13 (bf2e2cec)
 
 $ ts-patch install
@@ -11,21 +11,6 @@ $ ts-patch install
 [!] typescript.js is already patched with the latest version. For details, run: ts-patch check
 [+] ts-patch installed!
 
-Checked 1686 installs across 1794 packages (no changes) [583.00ms]
-packages/patchnote/src/commands/onboard.ts:180:13 lint/correctness/noUnusedVariables ━━━━━━━━━━━━━━━
-
-  ! This variable execa is unused.
-  
-    178 │   // Reset working tree after dry-run to avoid committing lock file artifacts
-    179 │   try {
-  > 180 │     const { execa } = await import('execa');
-        │             ^^^^^
-    181 │     await (executor || executeCommand)('git', ['checkout', '.'], { cwd: repoRoot });
-    182 │   } catch {
-  
-  i Unused variables are often the result of typos, incomplete refactors, or other sources of bugs.
-  
-
-Checked 26 files in 155ms. Fixed 17 files.
-Found 1 warning.
+Checked 1686 installs across 1794 packages (no changes) [440.00ms]
+Checked 26 files in 99ms. Fixed 17 files.
 
