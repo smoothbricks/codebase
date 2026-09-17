@@ -15,10 +15,16 @@ jobs:
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
         with:
           bun-version: 1.4.2
-      - name: Prove the regression test fails before the repair
+      - name: Run the dependency-free regression in a clean fixture
         run: |
+          fixture="$RUNNER_TEMP/cache-scope-fixture"
+          mkdir -p "$fixture/packages/nx-plugin/src/managed-files" "$fixture/packages/nx-plugin/managed/templates/github/actions/setup-devenv"
+          cp packages/nx-plugin/src/managed-files/github-host-cache-isolation.test.ts "$fixture/packages/nx-plugin/src/managed-files/"
+          cp packages/nx-plugin/managed/templates/github/actions/setup-devenv/action.yml "$fixture/packages/nx-plugin/managed/templates/github/actions/setup-devenv/"
+          echo "CACHE_FIXTURE=$fixture" >> "$GITHUB_ENV"
+          cd "$fixture"
           if bun test packages/nx-plugin/src/managed-files/github-host-cache-isolation.test.ts; then
-            echo 'Expected the unpatched shared cache scope to fail the regression test.' >&2
+            echo 'Expected the unpatched cache scope to fail the regression test.' >&2
             exit 1
           fi
       - name: Repair the managed template and its checked-in consumer
@@ -41,10 +47,10 @@ jobs:
                   text = text.replace(old, new)
               path.write_text(text)
           PY
-          bun test packages/nx-plugin/src/managed-files/github-host-cache-isolation.test.ts
-          # Formatting only; no repository lifecycle scripts or install.
           bunx --package @biomejs/biome@2.5.12 biome format --write packages/nx-plugin/src/managed-files/github-host-cache-isolation.test.ts
-          bun test packages/nx-plugin/src/managed-files/github-host-cache-isolation.test.ts
+          cp packages/nx-plugin/managed/templates/github/actions/setup-devenv/action.yml "$CACHE_FIXTURE/packages/nx-plugin/managed/templates/github/actions/setup-devenv/"
+          cp packages/nx-plugin/src/managed-files/github-host-cache-isolation.test.ts "$CACHE_FIXTURE/packages/nx-plugin/src/managed-files/"
+          (cd "$CACHE_FIXTURE" && bun test packages/nx-plugin/src/managed-files/github-host-cache-isolation.test.ts)
           git diff --check
       - name: Commit only the reviewed template and regression test
         run: |
