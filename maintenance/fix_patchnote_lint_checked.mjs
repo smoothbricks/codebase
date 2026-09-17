@@ -19,8 +19,6 @@ const temporary = join(process.env.RUNNER_TEMP,'patchnote-repair.mjs');
 writeFileSync(temporary,repair);
 await import(pathToFileURL(temporary).href);
 
-// Public config keeps its optional API; only the internal defaults need their
-// known required fields while resolving partial sections.
 const path = 'packages/patchnote/src/config.ts';
 let source = readFileSync(path,'utf8');
 assert.equal(source.split('export const defaultConfig =').length, 2);
@@ -30,6 +28,7 @@ for (const name of ['expo','syncpack','nix','provenanceCheck','deprecationCheck'
   source = source.replaceAll(`...defaultConfig.${name}`, `...baseConfig.${name}`);
 }
 writeFileSync(path,source);
+writeFileSync('packages/patchnote/bunfig.toml', 'preload = ["@smoothbricks/validation/bun/preload"]\n\n[test]\npreload = ["@smoothbricks/validation/bun/preload"]\n');
 
 const adapter = 'packages/patchnote/src/executor.ts';
 assert.ok(!existsSync(adapter));
@@ -82,10 +81,30 @@ for (const file of paths.filter(file => file.startsWith('packages/patchnote/src/
   }
   const module = relative(dirname(file),adapter).replace(/\.ts$/,'.js');
   text = `import { executeCommand } from '${module.startsWith('.') ? module : './'+module}';\n` + text;
+  text = text.replace('Default executor - execa cast to CommandExecutor type\n * The cast is safe because execa\'s Result extends our ExecutorResult interface', 'Default text executor; callers can inject the same port in tests.');
   writeFileSync(file,text);
 }
 paths.push(adapter);
 writeFileSync(listed,JSON.stringify(paths));
+
+// Construct internal collections with annotations, not runtime validators.
+const changelog = 'packages/patchnote/src/changelog/fetcher.ts';
+let text = readFileSync(changelog,'utf8');
+assert.equal(text.split('typia.assert<PackageUpdate[]>([])').length, 5);
+text = text.replace('const sections = {', "const sections: Record<PackageUpdate['updateType'], PackageUpdate[]> = {")
+  .replaceAll('typia.assert<PackageUpdate[]>([])','[]');
+// A repository descriptor is inspected only after selecting the requested version.
+// An unrelated version's descriptor must not invalidate an otherwise usable response.
+text = text.replace('typia.assert<{ versions?: Record<string, { repository?: { url?: string } }> }>(rawData)',
+  'typia.assert<{ versions?: Record<string, { repository?: unknown } | null>; repository?: unknown }>(rawData)')
+  .replace('typia.assert<{ repository?: { url?: string } }>(data).repository','data.repository')
+  .replace('if (repository?.url)', 'if (typia.is<{ url: string }>(repository) && repository.url)')
+  .replaceAll('body?: string','body?: string | null');
+writeFileSync(changelog,text);
+for (const file of paths.filter(file => file.endsWith('.ts') && file !== adapter)) {
+  const text = readFileSync(file,'utf8');
+  writeFileSync(file,text.replace(/^((?:import [^\n]+;\n)+)(\/\*\*[\s\S]*?\*\/)\n+/, '$2\n\n$1'));
+}
 const test = 'packages/patchnote/test/lint-boundaries.test.ts';
 writeFileSync(test,readFileSync(test,'utf8')
   .replace('defaultConfig.expo.enabled','defaultConfig.expo?.enabled')
