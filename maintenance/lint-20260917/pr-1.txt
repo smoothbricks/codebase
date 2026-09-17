@@ -1,0 +1,671 @@
+pr-lint.log
+
+ NX   Running target lint for project @smoothbricks/patchnote and 2 tasks it depends on:
+
+
+
+::group::✅ > nx run @smoothbricks/patchnote:build
+
+$ bun run build.ts
+Building patchnote CLI...
+Bundling CLI with Bun...
+Bundling library entry point...
+Library build complete! Output: dist/index.js
+Generating type declarations...
+Type declarations generated!
+Build complete! Output: dist/cli.js, dist/index.js, dist/index.d.ts
+::endgroup::
+::group::✅ > nx run @smoothbricks/patchnote:typecheck
+
+> tsc --build --emitDeclarationOnly
+
+::endgroup::
+::group::❌ > nx run @smoothbricks/patchnote:lint
+
+> biome check --files-ignore-unknown=true packages/patchnote
+
+packages/patchnote/src/cli.ts:241:70 lint/correctness/useParseIntRadix  FIXABLE  ━━━━━━━━━━━━━━━━━━━
+
+  i Missing radix parameter
+  
+    239 │     const config = await setupConfig();
+    240 │     const { rebaseOpenPRs } = await import('./commands/rebase-open-prs.js');
+  > 241 │     await rebaseOpenPRs(config, { ...getUpdateOptions(), maxAgeDays: Number.parseInt(options.maxAge) });
+        │                                                                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    242 │   });
+    243 │ 
+  
+  i Add a non-fractional number between 2 and 36
+  
+  i Unsafe fix: Add a radix of 10
+  
+    241 │ ····await·rebaseOpenPRs(config,·{·...getUpdateOptions(),·maxAgeDays:·Number.parseInt(options.maxAge,·10)·});
+        │                                                                                                    ++++     
+
+packages/patchnote/src/commands/rebase-open-prs.ts:139:24 lint/style/noNonNullAssertion ━━━━━━━━━━━━
+
+  ! Forbidden non-null assertion.
+  
+    137 │     logger?.info('Dry-run mode: listing planned rebase actions\n');
+    138 │     for (let i = 0; i < levels.length; i++) {
+  > 139 │       for (const pr of levels[i]!) {
+        │                        ^^^^^^^^^^
+    140 │         const rebaseTarget =
+    141 │           pr.baseRefName && pr.baseRefName !== baseBranch ? `origin/${pr.baseRefName}` : `origin/${baseBranch}`;
+  
+
+packages/patchnote/test/commands/rebase-open-prs.test.ts:8:57 lint/correctness/noUnusedImports  FIXABLE  ━━━━━━━━━━
+
+  ! Several of these imports are unused.
+  
+     6 │ import { buildRebaseOrder, rebaseOpenPRs } from '../../src/commands/rebase-open-prs.js';
+     7 │ import type { PatchnoteConfig } from '../../src/config.js';
+   > 8 │ import type { CommandExecutor, GitHubPR, IGitHubClient, RebaseResult } from '../../src/types.js';
+       │                                                         ^^^^^^^^^^^^
+     9 │ 
+    10 │ // --- Helpers ---
+  
+  i Unused imports might be the result of an incomplete refactoring.
+  
+  i Unsafe fix: Remove the unused imports.
+  
+    8 │ import·type·{·CommandExecutor,·GitHubPR,·IGitHubClient,·RebaseResult·}·from·'../../src/types.js';
+      │                                                         -------------                            
+
+packages/patchnote/test/git/modification-functions.test.ts:335:70 lint/correctness/noUnusedFunctionParameters  FIXABLE  ━━━━━━━━━━
+
+  ! This parameter is unused.
+  
+    333 │   test('should return false on conflict and auto-abort', async () => {
+    334 │     let callCount = 0;
+  > 335 │     const mock = async (cmd: string | URL, args?: readonly string[], opts?: Record<string, unknown>) => {
+        │                                                                      ^^^^
+    336 │       callCount++;
+    337 │       const command = typeof cmd === 'string' ? cmd : cmd.toString();
+  
+  i Unused parameters might be the result of an incomplete refactoring.
+  
+  i Unsafe fix: If this is intentional, prepend opts with an underscore.
+  
+    333 333 │     test('should return false on conflict and auto-abort', async () => {
+    334 334 │       let callCount = 0;
+    335     │ - ····const·mock·=·async·(cmd:·string·|·URL,·args?:·readonly·string[],·opts?:·Record<string,·unknown>)·=>·{
+        335 │ + ····const·mock·=·async·(cmd:·string·|·URL,·args?:·readonly·string[],·_opts?:·Record<string,·unknown>)·=>·{
+    336 336 │         callCount++;
+    337 337 │         const command = typeof cmd === 'string' ? cmd : cmd.toString();
+  
+
+Checked 107 files in 177ms. No fixes applied.
+Found 3 warnings.
+Found 1 info.
+> eslint packages/patchnote/src
+
+
+/home/runner/work/codebase/codebase/packages/patchnote/src/ai/ai-client.ts
+   44:33  error  Unsafe type assertion: type '"zai" | "gemini"' is more narrow than the original type                                                                           @typescript-eslint/no-unsafe-type-assertion
+  109:16  error  Unsafe type assertion: type '{ choices?: { message?: { content?: string | undefined; } | undefined; }[] | undefined; }' is more narrow than the original type  @typescript-eslint/no-unsafe-type-assertion
+
+/home/runner/work/codebase/codebase/packages/patchnote/src/auth/github-client.ts
+   17:34  error  Unsafe type assertion: type 'CommandExecutor' is more narrow than the original type                   @typescript-eslint/no-unsafe-type-assertion
+   36:14  error  Unsafe assertion from `any` detected: consider using type guards or a safer assertion                 @typescript-eslint/no-unsafe-type-assertion
+   55:20  error  Unsafe assertion from `any` detected: consider using type guards or a safer assertion                 @typescript-eslint/no-unsafe-type-assertion
+  166:35  error  Unsafe assertion from `any` detected: consider using type guards or a safer assertion                 @typescript-eslint/no-unsafe-type-assertion
+  193:21  error  Unsafe type assertion: type '{ stderr?: string | undefined; }' is more narrow than the original type  @typescript-eslint/no-unsafe-type-assertion
+
+/home/runner/work/codebase/codebase/packages/patchnote/src/changelog/fetcher.ts
+  30:52  error  Unsafe type assertion: type '{ repository?: { url?: string | undefined; } | undefined; }' is more narrow than the original type    @typescript-eslint/no-unsafe-type-assertion
+  62:22  error  Unsafe type assertion: type '{ body?: string | undefined; html_url?: string | undefined; }' is more narrow than the original type  @typescript-eslint/no-unsafe-type-assertion
+  87:20  error  Unsafe type assertion: type '{ body?: string | undefined; }' is more narrow than the original type                                 @typescript-eslint/no-unsafe-type-assertion
+
+/home/runner/work/codebase/codebase/packages/patchnote/src/commands/onboard.ts
+  180:25  error  Unsafe type assertion: type 'CommandExecutor' is more narrow than the original type  @typescript-eslint/no-unsafe-type-assertion
+
+/home/runner/work/codebase/codebase/packages/patchnote/src/commands/rebase-open-prs.ts
+  15:25  error  Unsafe type assertion: type 'CommandExecutor' is more narrow than the original type  @typescript-eslint/no-unsafe-type-assertion
+
+/home/runner/work/codebase/codebase/packages/patchnote/src/commands/setup.ts
+  23:31  error  Unsafe type assertion: type 'CommandExecutor' is more narrow than the original type  @typescript-eslint/no-unsafe-type-assertion
+  41:31  error  Unsafe type assertion: type 'CommandExecutor' is more narrow than the original type  @typescript-eslint/no-unsafe-type-assertion
+
+/home/runner/work/codebase/codebase/packages/patchnote/src/commands/validate-setup.ts
+   24:31  error  Unsafe type assertion: type 'CommandExecutor' is more narrow than the original type                   @typescript-eslint/no-unsafe-type-assertion
+  141:21  error  Unsafe type assertion: type '{ stderr?: string | undefined; }' is more narrow than the original type  @typescript-eslint/no-unsafe-type-assertion
+
+/home/runner/work/codebase/codebase/packages/patchnote/src/config.ts
+  343:20  error  Unsafe assertion from `any` detected: consider using type guards or a safer assertion  @typescript-eslint/no-unsafe-type-assertion
+  416:10  error  Always prefer const x: T = { ... }                                                     @typescript-eslint/consistent-type-assertions
+  416:10  error  Unsafe type assertion: type 'PatchnoteConfig' is more narrow than the original type    @typescript-eslint/no-unsafe-type-assertion
+
+/home/runner/work/codebase/codebase/packages/patchnote/src/deprecated/checker.ts
+  30:18  error  Unsafe type assertion: type '{ deprecated?: string | undefined; }' is more narrow than the original type  @typescript-eslint/no-unsafe-type-assertion
+
+/home/runner/work/codebase/codebase/packages/patchnote/src/deprecated/replacements.ts
+  25:21  error  Unsafe assertion from `any` detected: consider using type guards or a safer assertion  @typescript-eslint/no-unsafe-type-assertion
+
+/home/runner/work/codebase/codebase/packages/patchnote/src/expo/sdk-checker.ts
+  47:22  error  Unsafe type assertion: type '{ version: string; }' is more narrow than the original type  @typescript-eslint/no-unsafe-type-assertion
+
+/home/runner/work/codebase/codebase/packages/patchnote/src/expo/versions-fetcher.ts
+  24:28  error  Unsafe type assertion: type 'Record<string, string>' is more narrow than the original type                                                                                    @typescript-eslint/no-unsafe-type-assertion
+  34:27  error  Unsafe type assertion: type '{ peerDependencies?: { react?: string | undefined; 'react-native'?: string | undefined; } | undefined; }' is more narrow than the original type  @typescript-eslint/no-unsafe-type-assertion
+
+/home/runner/work/codebase/codebase/packages/patchnote/src/git.ts
+  14:25  error  Unsafe type assertion: type 'CommandExecutor' is more narrow than the original type  @typescript-eslint/no-unsafe-type-assertion
+
+/home/runner/work/codebase/codebase/packages/patchnote/src/pr/stacking.ts
+  12:25  error  Unsafe type assertion: type 'CommandExecutor' is more narrow than the original type  @typescript-eslint/no-unsafe-type-assertion
+
+/home/runner/work/codebase/codebase/packages/patchnote/src/provenance/checker.ts
+  31:18  error  Unsafe type assertion: type '{ dist?: { attestations?: { provenance?: { predicateType: string; } | undefined; } | undefined; } | undefined; }' is more narrow than the original type  @typescript-eslint/no-unsafe-type-assertion
+
+/home/runner/work/codebase/codebase/packages/patchnote/src/setup/credential-store.ts
+  13:61  error  Unsafe type assertion: type 'CommandExecutor' is more narrow than the original type  @typescript-eslint/no-unsafe-type-assertion
+  23:31  error  Unsafe type assertion: type 'CommandExecutor' is more narrow than the original type  @typescript-eslint/no-unsafe-type-assertion
+  39:31  error  Unsafe type assertion: type 'CommandExecutor' is more narrow than the original type  @typescript-eslint/no-unsafe-type-assertion
+  59:31  error  Unsafe type assertion: type 'CommandExecutor' is more narrow than the original type  @typescript-eslint/no-unsafe-type-assertion
+  86:31  error  Unsafe type assertion: type 'CommandExecutor' is more narrow than the original type  @typescript-eslint/no-unsafe-type-assertion
+
+/home/runner/work/codebase/codebase/packages/patchnote/src/updaters/bun.ts
+   86:24  error  Unsafe type assertion: type '"dependencies" | "devDependencies"' is more narrow than the original type  @typescript-eslint/no-unsafe-type-assertion
+  326:46  error  Unsafe type assertion: type 'CommandExecutor' is more narrow than the original type                     @typescript-eslint/no-unsafe-type-assertion
+
+✖ 34 problems (34 errors, 0 warnings)
+
+Warning: command "eslint packages/patchnote/src" exited with non-zero status code::endgroup::
+
+
+ NX   Running target lint for project @smoothbricks/patchnote and 2 tasks it depends on failed
+
+Failed tasks:
+
+- @smoothbricks/patchnote:lint
+
+Hint: run the command with --verbose for more details.
+
+
+
+biome.log
+Checked 107 files in 177ms. No fixes applied.
+
+
+eslint.log
+
+
+ESLINT
+[
+  {
+    "file": "packages/patchnote/src/ai/ai-client.ts",
+    "messages": [
+      {
+        "ruleId": "@typescript-eslint/no-unsafe-type-assertion",
+        "severity": 2,
+        "message": "Unsafe type assertion: type '\"zai\" | \"gemini\"' is more narrow than the original type.",
+        "line": 44,
+        "column": 33,
+        "nodeType": "TSAsExpression",
+        "messageId": "unsafeTypeAssertion",
+        "endLine": 44,
+        "endColumn": 58
+      },
+      {
+        "ruleId": "@typescript-eslint/no-unsafe-type-assertion",
+        "severity": 2,
+        "message": "Unsafe type assertion: type '{ choices?: { message?: { content?: string | undefined; } | undefined; }[] | undefined; }' is more narrow than the original type.",
+        "line": 109,
+        "column": 16,
+        "nodeType": "TSAsExpression",
+        "messageId": "unsafeTypeAssertion",
+        "endLine": 111,
+        "endColumn": 4
+      }
+    ]
+  },
+  {
+    "file": "packages/patchnote/src/auth/github-client.ts",
+    "messages": [
+      {
+        "ruleId": "@typescript-eslint/no-unsafe-type-assertion",
+        "severity": 2,
+        "message": "Unsafe type assertion: type 'CommandExecutor' is more narrow than the original type.",
+        "line": 17,
+        "column": 34,
+        "nodeType": "TSAsExpression",
+        "messageId": "unsafeTypeAssertion",
+        "endLine": 17,
+        "endColumn": 69
+      },
+      {
+        "ruleId": "@typescript-eslint/no-unsafe-type-assertion",
+        "severity": 2,
+        "message": "Unsafe assertion from `any` detected: consider using type guards or a safer assertion.",
+        "line": 36,
+        "column": 14,
+        "nodeType": "TSAsExpression",
+        "messageId": "unsafeOfAnyTypeAssertion",
+        "endLine": 36,
+        "endColumn": 34
+      },
+      {
+        "ruleId": "@typescript-eslint/no-unsafe-type-assertion",
+        "severity": 2,
+        "message": "Unsafe assertion from `any` detected: consider using type guards or a safer assertion.",
+        "line": 55,
+        "column": 20,
+        "nodeType": "TSAsExpression",
+        "messageId": "unsafeOfAnyTypeAssertion",
+        "endLine": 55,
+        "endColumn": 84
+      },
+      {
+        "ruleId": "@typescript-eslint/no-unsafe-type-assertion",
+        "severity": 2,
+        "message": "Unsafe assertion from `any` detected: consider using type guards or a safer assertion.",
+        "line": 166,
+        "column": 35,
+        "nodeType": "TSAsExpression",
+        "messageId": "unsafeOfAnyTypeAssertion",
+        "endLine": 166,
+        "endColumn": 56
+      },
+      {
+        "ruleId": "@typescript-eslint/no-unsafe-type-assertion",
+        "severity": 2,
+        "message": "Unsafe type assertion: type '{ stderr?: string | undefined; }' is more narrow than the original type.",
+        "line": 193,
+        "column": 21,
+        "nodeType": "TSAsExpression",
+        "messageId": "unsafeTypeAssertion",
+        "endLine": 193,
+        "endColumn": 49
+      }
+    ]
+  },
+  {
+    "file": "packages/patchnote/src/changelog/fetcher.ts",
+    "messages": [
+      {
+        "ruleId": "@typescript-eslint/no-unsafe-type-assertion",
+        "severity": 2,
+        "message": "Unsafe type assertion: type '{ repository?: { url?: string | undefined; } | undefined; }' is more narrow than the original type.",
+        "line": 30,
+        "column": 52,
+        "nodeType": "TSAsExpression",
+        "messageId": "unsafeTypeAssertion",
+        "endLine": 30,
+        "endColumn": 93
+      },
+      {
+        "ruleId": "@typescript-eslint/no-unsafe-type-assertion",
+        "severity": 2,
+        "message": "Unsafe type assertion: type '{ body?: string | undefined; html_url?: string | undefined; }' is more narrow than the original type.",
+        "line": 62,
+        "column": 22,
+        "nodeType": "TSAsExpression",
+        "messageId": "unsafeTypeAssertion",
+        "endLine": 62,
+        "endColumn": 85
+      },
+      {
+        "ruleId": "@typescript-eslint/no-unsafe-type-assertion",
+        "severity": 2,
+        "message": "Unsafe type assertion: type '{ body?: string | undefined; }' is more narrow than the original type.",
+        "line": 87,
+        "column": 20,
+        "nodeType": "TSAsExpression",
+        "messageId": "unsafeTypeAssertion",
+        "endLine": 87,
+        "endColumn": 64
+      }
+    ]
+  },
+  {
+    "file": "packages/patchnote/src/commands/onboard.ts",
+    "messages": [
+      {
+        "ruleId": "@typescript-eslint/no-unsafe-type-assertion",
+        "severity": 2,
+        "message": "Unsafe type assertion: type 'CommandExecutor' is more narrow than the original type.",
+        "line": 180,
+        "column": 25,
+        "nodeType": "TSAsExpression",
+        "messageId": "unsafeTypeAssertion",
+        "endLine": 180,
+        "endColumn": 60
+      }
+    ]
+  },
+  {
+    "file": "packages/patchnote/src/commands/rebase-open-prs.ts",
+    "messages": [
+      {
+        "ruleId": "@typescript-eslint/no-unsafe-type-assertion",
+        "severity": 2,
+        "message": "Unsafe type assertion: type 'CommandExecutor' is more narrow than the original type.",
+        "line": 15,
+        "column": 25,
+        "nodeType": "TSAsExpression",
+        "messageId": "unsafeTypeAssertion",
+        "endLine": 15,
+        "endColumn": 60
+      }
+    ]
+  },
+  {
+    "file": "packages/patchnote/src/commands/setup.ts",
+    "messages": [
+      {
+        "ruleId": "@typescript-eslint/no-unsafe-type-assertion",
+        "severity": 2,
+        "message": "Unsafe type assertion: type 'CommandExecutor' is more narrow than the original type.",
+        "line": 23,
+        "column": 31,
+        "nodeType": "TSAsExpression",
+        "messageId": "unsafeTypeAssertion",
+        "endLine": 23,
+        "endColumn": 66
+      },
+      {
+        "ruleId": "@typescript-eslint/no-unsafe-type-assertion",
+        "severity": 2,
+        "message": "Unsafe type assertion: type 'CommandExecutor' is more narrow than the original type.",
+        "line": 41,
+        "column": 31,
+        "nodeType": "TSAsExpression",
+        "messageId": "unsafeTypeAssertion",
+        "endLine": 41,
+        "endColumn": 66
+      }
+    ]
+  },
+  {
+    "file": "packages/patchnote/src/commands/validate-setup.ts",
+    "messages": [
+      {
+        "ruleId": "@typescript-eslint/no-unsafe-type-assertion",
+        "severity": 2,
+        "message": "Unsafe type assertion: type 'CommandExecutor' is more narrow than the original type.",
+        "line": 24,
+        "column": 31,
+        "nodeType": "TSAsExpression",
+        "messageId": "unsafeTypeAssertion",
+        "endLine": 24,
+        "endColumn": 66
+      },
+      {
+        "ruleId": "@typescript-eslint/no-unsafe-type-assertion",
+        "severity": 2,
+        "message": "Unsafe type assertion: type '{ stderr?: string | undefined; }' is more narrow than the original type.",
+        "line": 141,
+        "column": 21,
+        "nodeType": "TSAsExpression",
+        "messageId": "unsafeTypeAssertion",
+        "endLine": 141,
+        "endColumn": 49
+      }
+    ]
+  },
+  {
+    "file": "packages/patchnote/src/config.ts",
+    "messages": [
+      {
+        "ruleId": "@typescript-eslint/no-unsafe-type-assertion",
+        "severity": 2,
+        "message": "Unsafe assertion from `any` detected: consider using type guards or a safer assertion.",
+        "line": 343,
+        "column": 20,
+        "nodeType": "TSAsExpression",
+        "messageId": "unsafeOfAnyTypeAssertion",
+        "endLine": 343,
+        "endColumn": 75
+      },
+      {
+        "ruleId": "@typescript-eslint/consistent-type-assertions",
+        "severity": 2,
+        "message": "Always prefer const x: T = { ... }.",
+        "line": 416,
+        "column": 10,
+        "nodeType": "TSAsExpression",
+        "messageId": "unexpectedObjectTypeAssertion",
+        "endLine": 443,
+        "endColumn": 23,
+        "suggestions": [
+          {
+            "messageId": "replaceObjectTypeAssertionWithSatisfies",
+            "data": {
+              "cast": "PatchnoteConfig"
+            },
+            "fix": {
+              "range": [
+                13052,
+                14772
+              ],
+              "text": "{\n    ...defaultConfig,\n    ...userConfig,\n    expo: userConfig.expo ? { ...defaultConfig.expo, ...userConfig.expo } : defaultConfig.expo,\n    syncpack: userConfig.syncpack ? { ...defaultConfig.syncpack, ...userConfig.syncpack } : defaultConfig.syncpack,\n    nix: userConfig.nix ? { ...defaultConfig.nix, ...userConfig.nix } : defaultConfig.nix,\n    prStrategy: { ...defaultConfig.prStrategy, ...(userConfig.prStrategy || {}) },\n    autoMerge: { ...defaultConfig.autoMerge, ...(userConfig.autoMerge || {}) },\n    provenanceCheck: userConfig.provenanceCheck\n      ? { ...defaultConfig.provenanceCheck, ...userConfig.provenanceCheck }\n      : defaultConfig.provenanceCheck,\n    deprecationCheck: userConfig.deprecationCheck\n      ? { ...defaultConfig.deprecationCheck, ...userConfig.deprecationCheck }\n      : defaultConfig.deprecationCheck,\n    ai: { ...defaultConfig.ai, ...(userConfig.ai || {}) },\n    git: userConfig.git ? { ...defaultConfig.git, ...userConfig.git } : defaultConfig.git,\n    semanticCommits: userConfig.semanticCommits\n      ? { ...defaultConfig.semanticCommits, ...userConfig.semanticCommits }\n      : defaultConfig.semanticCommits,\n    filters: userConfig.filters ? { ...defaultConfig.filters, ...userConfig.filters } : defaultConfig.filters,\n    grouping: userConfig.grouping ?? defaultConfig.grouping,\n    packageRules: userConfig.packageRules ?? defaultConfig.packageRules,\n    lockFileMaintenance: userConfig.lockFileMaintenance\n      ? { ...defaultConfig.lockFileMaintenance, ...userConfig.lockFileMaintenance }\n      : defaultConfig.lockFileMaintenance,\n    // Logger is runtime-only, always use default logger (can be overridden later)\n    logger: defaultConfig.logger,\n  } satisfies PatchnoteConfig"
+            },
+            "desc": "Use const x = { ... } satisfies PatchnoteConfig instead."
+          }
+        ]
+      },
+      {
+        "ruleId": "@typescript-eslint/no-unsafe-type-assertion",
+        "severity": 2,
+        "message": "Unsafe type assertion: type 'PatchnoteConfig' is more narrow than the original type.",
+        "line": 416,
+        "column": 10,
+        "nodeType": "TSAsExpression",
+        "messageId": "unsafeTypeAssertion",
+        "endLine": 443,
+        "endColumn": 23
+      }
+    ]
+  },
+  {
+    "file": "packages/patchnote/src/deprecated/checker.ts",
+    "messages": [
+      {
+        "ruleId": "@typescript-eslint/no-unsafe-type-assertion",
+        "severity": 2,
+        "message": "Unsafe type assertion: type '{ deprecated?: string | undefined; }' is more narrow than the original type.",
+        "line": 30,
+        "column": 18,
+        "nodeType": "TSAsExpression",
+        "messageId": "unsafeTypeAssertion",
+        "endLine": 30,
+        "endColumn": 68
+      }
+    ]
+  },
+  {
+    "file": "packages/patchnote/src/deprecated/replacements.ts",
+    "messages": [
+      {
+        "ruleId": "@typescript-eslint/no-unsafe-type-assertion",
+        "severity": 2,
+        "message": "Unsafe assertion from `any` detected: consider using type guards or a safer assertion.",
+        "line": 25,
+        "column": 21,
+        "nodeType": "TSAsExpression",
+        "messageId": "unsafeOfAnyTypeAssertion",
+        "endLine": 25,
+        "endColumn": 84
+      }
+    ]
+  },
+  {
+    "file": "packages/patchnote/src/expo/sdk-checker.ts",
+    "messages": [
+      {
+        "ruleId": "@typescript-eslint/no-unsafe-type-assertion",
+        "severity": 2,
+        "message": "Unsafe type assertion: type '{ version: string; }' is more narrow than the original type.",
+        "line": 47,
+        "column": 22,
+        "nodeType": "TSAsExpression",
+        "messageId": "unsafeTypeAssertion",
+        "endLine": 47,
+        "endColumn": 49
+      }
+    ]
+  },
+  {
+    "file": "packages/patchnote/src/expo/versions-fetcher.ts",
+    "messages": [
+      {
+        "ruleId": "@typescript-eslint/no-unsafe-type-assertion",
+        "severity": 2,
+        "message": "Unsafe type assertion: type 'Record<string, string>' is more narrow than the original type.",
+        "line": 24,
+        "column": 28,
+        "nodeType": "TSAsExpression",
+        "messageId": "unsafeTypeAssertion",
+        "endLine": 24,
+        "endColumn": 77
+      },
+      {
+        "ruleId": "@typescript-eslint/no-unsafe-type-assertion",
+        "severity": 2,
+        "message": "Unsafe type assertion: type '{ peerDependencies?: { react?: string | undefined; 'react-native'?: string | undefined; } | undefined; }' is more narrow than the original type.",
+        "line": 34,
+        "column": 27,
+        "nodeType": "TSAsExpression",
+        "messageId": "unsafeTypeAssertion",
+        "endLine": 36,
+        "endColumn": 8
+      }
+    ]
+  },
+  {
+    "file": "packages/patchnote/src/git.ts",
+    "messages": [
+      {
+        "ruleId": "@typescript-eslint/no-unsafe-type-assertion",
+        "severity": 2,
+        "message": "Unsafe type assertion: type 'CommandExecutor' is more narrow than the original type.",
+        "line": 14,
+        "column": 25,
+        "nodeType": "TSAsExpression",
+        "messageId": "unsafeTypeAssertion",
+        "endLine": 14,
+        "endColumn": 60
+      }
+    ]
+  },
+  {
+    "file": "packages/patchnote/src/pr/stacking.ts",
+    "messages": [
+      {
+        "ruleId": "@typescript-eslint/no-unsafe-type-assertion",
+        "severity": 2,
+        "message": "Unsafe type assertion: type 'CommandExecutor' is more narrow than the original type.",
+        "line": 12,
+        "column": 25,
+        "nodeType": "TSAsExpression",
+        "messageId": "unsafeTypeAssertion",
+        "endLine": 12,
+        "endColumn": 68
+      }
+    ]
+  },
+  {
+    "file": "packages/patchnote/src/provenance/checker.ts",
+    "messages": [
+      {
+        "ruleId": "@typescript-eslint/no-unsafe-type-assertion",
+        "severity": 2,
+        "message": "Unsafe type assertion: type '{ dist?: { attestations?: { provenance?: { predicateType: string; } | undefined; } | undefined; } | undefined; }' is more narrow than the original type.",
+        "line": 31,
+        "column": 18,
+        "nodeType": "TSAsExpression",
+        "messageId": "unsafeTypeAssertion",
+        "endLine": 37,
+        "endColumn": 6
+      }
+    ]
+  },
+  {
+    "file": "packages/patchnote/src/setup/credential-store.ts",
+    "messages": [
+      {
+        "ruleId": "@typescript-eslint/no-unsafe-type-assertion",
+        "severity": 2,
+        "message": "Unsafe type assertion: type 'CommandExecutor' is more narrow than the original type.",
+        "line": 13,
+        "column": 61,
+        "nodeType": "TSAsExpression",
+        "messageId": "unsafeTypeAssertion",
+        "endLine": 13,
+        "endColumn": 96
+      },
+      {
+        "ruleId": "@typescript-eslint/no-unsafe-type-assertion",
+        "severity": 2,
+        "message": "Unsafe type assertion: type 'CommandExecutor' is more narrow than the original type.",
+        "line": 23,
+        "column": 31,
+        "nodeType": "TSAsExpression",
+        "messageId": "unsafeTypeAssertion",
+        "endLine": 23,
+        "endColumn": 66
+      },
+      {
+        "ruleId": "@typescript-eslint/no-unsafe-type-assertion",
+        "severity": 2,
+        "message": "Unsafe type assertion: type 'CommandExecutor' is more narrow than the original type.",
+        "line": 39,
+        "column": 31,
+        "nodeType": "TSAsExpression",
+        "messageId": "unsafeTypeAssertion",
+        "endLine": 39,
+        "endColumn": 66
+      },
+      {
+        "ruleId": "@typescript-eslint/no-unsafe-type-assertion",
+        "severity": 2,
+        "message": "Unsafe type assertion: type 'CommandExecutor' is more narrow than the original type.",
+        "line": 59,
+        "column": 31,
+        "nodeType": "TSAsExpression",
+        "messageId": "unsafeTypeAssertion",
+        "endLine": 59,
+        "endColumn": 66
+      },
+      {
+        "ruleId": "@typescript-eslint/no-unsafe-type-assertion",
+        "severity": 2,
+        "message": "Unsafe type assertion: type 'CommandExecutor' is more narrow than the original type.",
+        "line": 86,
+        "column": 31,
+        "nodeType": "TSAsExpression",
+        "messageId": "unsafeTypeAssertion",
+        "endLine": 86,
+        "endColumn": 66
+      }
+    ]
+  },
+  {
+    "file": "packages/patchnote/src/updaters/bun.ts",
+    "messages": [
+      {
+        "ruleId": "@typescript-eslint/no-unsafe-type-assertion",
+        "severity": 2,
+        "message": "Unsafe type assertion: type '\"dependencies\" | \"devDependencies\"' is more narrow than the original type.",
+        "line": 86,
+        "column": 24,
+        "nodeType": "TSAsExpression",
+        "messageId": "unsafeTypeAssertion",
+        "endLine": 86,
+        "endColumn": 77
+      },
+      {
+        "ruleId": "@typescript-eslint/no-unsafe-type-assertion",
+        "severity": 2,
+        "message": "Unsafe type assertion: type 'CommandExecutor' is more narrow than the original type.",
+        "line": 326,
+        "column": 46,
+        "nodeType": "TSAsExpression",
+        "messageId": "unsafeTypeAssertion",
+        "endLine": 326,
+        "endColumn": 81
+      }
+    ]
+  }
+]
