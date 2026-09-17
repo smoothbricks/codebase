@@ -1,9 +1,9 @@
 {
   "source": "115142bc063ee989df55844d70117d3176bfc3fe",
-  "run_id": "35210401589",
+  "run_id": "35210892110",
   "lint": "success",
-  "tests": "failure",
-  "built_node": "skipped",
+  "tests": "success",
+  "built_node": "success",
   "paths": [
     "bun.lock",
     "packages/patchnote/build.ts",
@@ -30,8 +30,11 @@
     "packages/patchnote/src/types.ts",
     "packages/patchnote/src/updaters/bun.ts",
     "packages/patchnote/test/commands/rebase-open-prs.test.ts",
+    "packages/patchnote/test/config.test.ts",
     "packages/patchnote/test/git/modification-functions.test.ts",
     "packages/patchnote/test/lint-boundaries.test.ts",
     "packages/patchnote/tsconfig.lib.json"
-  ]
+  ],
+  "candidate": "04b104470e1d513f17bc31096444ebeb58be9ef4",
+  "tree": "a9c631bd19fe55f1f0731ef7525eaff290fa0177"
 }
