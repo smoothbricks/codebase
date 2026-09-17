@@ -226,7 +226,7 @@ index f4b1a69..dd86e6b 100644
      // Check for common error patterns
      const is401 = errorMessage.includes('401') || stderr.includes('401') || errorMessage.includes('Unauthorized');
 diff --git a/packages/patchnote/src/changelog/fetcher.ts b/packages/patchnote/src/changelog/fetcher.ts
-index d2b789f..0148f51 100644
+index d2b789f..3e6c18f 100644
 --- a/packages/patchnote/src/changelog/fetcher.ts
 +++ b/packages/patchnote/src/changelog/fetcher.ts
 @@ -2,6 +2,7 @@
@@ -254,7 +254,7 @@ index d2b789f..0148f51 100644
      // Check for repository URL
 -    const repository = versionData?.repository || (data as { repository?: { url?: string } }).repository;
 -    if (repository?.url) {
-+    const repository = versionData?.repository || typia.assert<{ repository?: { url?: string } }>(data).repository;
++    const repository = versionData?.repository || data.repository;
 +    if (typia.is<{ url: string }>(repository) && repository.url) {
        const githubMatch = repository.url.match(/github\.com[/:]([^/]+\/[^/.]+)/);
        if (githubMatch) {
@@ -578,20 +578,23 @@ index d0d87c1..8cfcb43 100644
  }
 diff --git a/packages/patchnote/src/executor.ts b/packages/patchnote/src/executor.ts
 new file mode 100644
-index 0000000..534a095
+index 0000000..a0db721
 --- /dev/null
 +++ b/packages/patchnote/src/executor.ts
-@@ -0,0 +1,13 @@
+@@ -0,0 +1,16 @@
 +import { execa } from 'execa';
 +import typia from 'typia';
 +import type { CommandExecutor, ExecutorResult } from './types.js';
 +
 +/**
 + * Adapt Execa's overloaded API to the text-only command port. Missing captured
-+ * streams (inherit/ignore/buffer:false) are empty text; binary/object output is
-+ * refused rather than asserted to be a string. Options and rejections pass through.
++ * streams (inherit/ignore/buffer:false) are empty text. Reject known non-text
++ * modes before spawning; validate custom stream results without casting them.
 + */
 +export const executeCommand: CommandExecutor = async (file, args, options) => {
++  if (options?.encoding === 'buffer' || options?.lines === true) {
++    throw new TypeError('CommandExecutor requires text output; binary and line-array modes are unsupported');
++  }
 +  const result = typia.assert<Partial<ExecutorResult>>(await execa(file, args, options));
 +  return { stdout: result.stdout ?? '', stderr: result.stderr ?? '', exitCode: result.exitCode };
 +};
@@ -860,6 +863,31 @@ index 1f3c79f..3e1506c 100644
  
  // --- Helpers ---
  
+diff --git a/packages/patchnote/test/config.test.ts b/packages/patchnote/test/config.test.ts
+index 252e926..ef7bf96 100644
+--- a/packages/patchnote/test/config.test.ts
++++ b/packages/patchnote/test/config.test.ts
+@@ -367,8 +367,8 @@ describe('loadConfig', () => {
+         minCoverage: 80,
+       },
+       ai: {
+-        provider: 'anthropic',
+-        model: 'claude-opus-4-5-20250929',
++        provider: 'gemini',
++        model: 'custom-model',
+         apiKey: 'test-key',
+       },
+       git: {
+@@ -388,7 +388,8 @@ describe('loadConfig', () => {
+     expect(config.nix?.enabled).toBe(true);
+     expect(config.prStrategy.stackingEnabled).toBe(false);
+     expect(config.autoMerge.mode).toBe('patch');
+-    expect(config.ai.model).toBe('claude-opus-4-5-20250929');
++    expect(config.ai.provider).toBe('gemini');
++    expect(config.ai.model).toBe('custom-model');
+     expect(config.git?.baseBranch).toBe('develop');
+     expect(config.repoRoot).toBe('/custom/path');
+   });
 diff --git a/packages/patchnote/test/git/modification-functions.test.ts b/packages/patchnote/test/git/modification-functions.test.ts
 index e62a602..7df52c6 100644
 --- a/packages/patchnote/test/git/modification-functions.test.ts
@@ -875,10 +903,10 @@ index e62a602..7df52c6 100644
        const key = [command, ...(args || [])].join(' ');
 diff --git a/packages/patchnote/test/lint-boundaries.test.ts b/packages/patchnote/test/lint-boundaries.test.ts
 new file mode 100644
-index 0000000..127bd2d
+index 0000000..8bec99c
 --- /dev/null
 +++ b/packages/patchnote/test/lint-boundaries.test.ts
-@@ -0,0 +1,92 @@
+@@ -0,0 +1,106 @@
 +import { afterEach, describe, expect, test } from 'bun:test';
 +import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 +import { tmpdir } from 'node:os';
@@ -965,10 +993,24 @@ index 0000000..127bd2d
 +    const result = await executeCommand(process.execPath, ['-e', 'process.exit(7)'], { reject: false });
 +    expect(result.exitCode).toBe(7);
 +  });
-+  test('refuses a binary result instead of passing bytes off as text', async () => {
-+    await expect(
-+      executeCommand(process.execPath, ['-e', 'process.stdout.write("bytes")'], { encoding: 'buffer' }),
-+    ).rejects.toThrow();
++  test('rejects known non-text modes before even resolving the executable', async () => {
++    for (const options of [{ encoding: 'buffer' }, { lines: true }] as const) {
++      await expect(executeCommand('patchnote-test-executable-that-does-not-exist', [], options)).rejects.toThrow(
++        'requires text output',
++      );
++    }
++  });
++  test('an unsupported provider cannot admit the rest of an invalid configuration', async () => {
++    const root = await mkdtemp(join(tmpdir(), 'patchnote-provider-boundary-'));
++    roots.push(root);
++    await mkdir(join(root, 'tooling'));
++    await writeFile(
++      join(root, 'tooling/patchnote.json'),
++      JSON.stringify({ ai: { provider: 'unsupported' }, prStrategy: { maxStackDepth: 99 } }),
++    );
++    const config = await loadConfig(root, 'tooling/patchnote.json');
++    expect(config.ai.provider).toBe(defaultConfig.ai.provider);
++    expect(config.prStrategy.maxStackDepth).toBe(defaultConfig.prStrategy.maxStackDepth);
 +  });
 +});
 diff --git a/packages/patchnote/tsconfig.lib.json b/packages/patchnote/tsconfig.lib.json
