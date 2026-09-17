@@ -38,10 +38,13 @@ import type { CommandExecutor, ExecutorResult } from './types.js';
 
 /**
  * Adapt Execa's overloaded API to the text-only command port. Missing captured
- * streams (inherit/ignore/buffer:false) are empty text; binary/object output is
- * refused rather than asserted to be a string. Options and rejections pass through.
+ * streams (inherit/ignore/buffer:false) are empty text. Reject known non-text
+ * modes before spawning; validate custom stream results without casting them.
  */
 export const executeCommand: CommandExecutor = async (file, args, options) => {
+  if (options?.encoding === 'buffer' || options?.lines === true) {
+    throw new TypeError('CommandExecutor requires text output; binary and line-array modes are unsupported');
+  }
   const result = typia.assert<Partial<ExecutorResult>>(await execa(file, args, options));
   return { stdout: result.stdout ?? '', stderr: result.stderr ?? '', exitCode: result.exitCode };
 };
@@ -85,22 +88,32 @@ for (const file of paths.filter(file => file.startsWith('packages/patchnote/src/
   writeFileSync(file,text);
 }
 paths.push(adapter);
-writeFileSync(listed,JSON.stringify(paths));
 
-// Construct internal collections with annotations, not runtime validators.
 const changelog = 'packages/patchnote/src/changelog/fetcher.ts';
 let text = readFileSync(changelog,'utf8');
 assert.equal(text.split('typia.assert<PackageUpdate[]>([])').length, 5);
 text = text.replace('const sections = {', "const sections: Record<PackageUpdate['updateType'], PackageUpdate[]> = {")
   .replaceAll('typia.assert<PackageUpdate[]>([])','[]');
-// A repository descriptor is inspected only after selecting the requested version.
-// An unrelated version's descriptor must not invalidate an otherwise usable response.
 text = text.replace('typia.assert<{ versions?: Record<string, { repository?: { url?: string } }> }>(rawData)',
   'typia.assert<{ versions?: Record<string, { repository?: unknown } | null>; repository?: unknown }>(rawData)')
+  .replace('(typia.assert<{ repository?: { url?: string } }>(data)).repository','data.repository')
   .replace('typia.assert<{ repository?: { url?: string } }>(data).repository','data.repository')
   .replace('if (repository?.url)', 'if (typia.is<{ url: string }>(repository) && repository.url)')
   .replaceAll('body?: string','body?: string | null');
+assert.ok(!text.includes('>(data).repository') && !text.includes('>(data)).repository'));
 writeFileSync(changelog,text);
+
+// This fixture exercises valid optional settings, not an unsupported AI provider.
+const fixture = 'packages/patchnote/test/config.test.ts';
+let fixtureSource = readFileSync(fixture,'utf8');
+const oldProvider = "provider: 'anthropic',\n        model: 'claude-opus-4-5-20250929'";
+assert.equal(fixtureSource.split(oldProvider).length, 2);
+fixtureSource = fixtureSource.replace(oldProvider, "provider: 'gemini',\n        model: 'custom-model'");
+assert.equal(fixtureSource.split("expect(config.ai.model).toBe('claude-opus-4-5-20250929');").length, 2);
+fixtureSource = fixtureSource.replace("expect(config.ai.model).toBe('claude-opus-4-5-20250929');", "expect(config.ai.provider).toBe('gemini');\n    expect(config.ai.model).toBe('custom-model');");
+writeFileSync(fixture,fixtureSource);
+paths.push(fixture);
+writeFileSync(listed,JSON.stringify(paths));
 for (const file of paths.filter(file => file.endsWith('.ts') && file !== adapter)) {
   const text = readFileSync(file,'utf8');
   writeFileSync(file,text.replace(/^((?:import [^\n]+;\n)+)(\/\*\*[\s\S]*?\*\/)\n+/, '$2\n\n$1'));
@@ -120,8 +133,19 @@ describe('text executor output modes', () => {
     const result = await executeCommand(process.execPath, ['-e', 'process.exit(7)'], { reject: false });
     expect(result.exitCode).toBe(7);
   });
-  test('refuses a binary result instead of passing bytes off as text', async () => {
-    await expect(executeCommand(process.execPath, ['-e', 'process.stdout.write("bytes")'], { encoding: 'buffer' })).rejects.toThrow();
+  test('rejects known non-text modes before even resolving the executable', async () => {
+    for (const options of [{ encoding: 'buffer' }, { lines: true }] as const) {
+      await expect(executeCommand('patchnote-test-executable-that-does-not-exist', [], options)).rejects.toThrow('requires text output');
+    }
+  });
+  test('an unsupported provider cannot admit the rest of an invalid configuration', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'patchnote-provider-boundary-'));
+    roots.push(root);
+    await mkdir(join(root,'tooling'));
+    await writeFile(join(root,'tooling/patchnote.json'), JSON.stringify({ ai: { provider: 'unsupported' }, prStrategy: { maxStackDepth: 99 } }));
+    const config = await loadConfig(root,'tooling/patchnote.json');
+    expect(config.ai.provider).toBe(defaultConfig.ai.provider);
+    expect(config.prStrategy.maxStackDepth).toBe(defaultConfig.prStrategy.maxStackDepth);
   });
 });
 `);
