@@ -8,7 +8,7 @@
 > tsc --build tsconfig.lib.json
 
 ::endgroup::
-::group::❌ > nx run @smoothbricks/patchnote:build
+::group::✅ > nx run @smoothbricks/patchnote:build
 
 $ bun run build.ts
 Building patchnote CLI...
@@ -16,36 +16,25 @@ Bundling CLI with Bun...
 Bundling library entry point...
 Library build complete! Output: dist/index.js
 Generating type declarations...
-src/commands/onboard.ts(180,11): error TS6133: 'execa' is declared but its value is never read.
-src/executor.ts(5,73): error TS2322: Type 'ResultPromise<Options>' is not assignable to type 'Promise<ExecutorResult>'.
-  Type 'Omit<ChildProcess, unique symbol | "pid" | "stdin" | "stdout" | "stderr" | "all" | "stdio" | "kill" | "iterable" | "readable" | "writable" | "duplex" | "pipe" | "sendMessage" | "getOneMessage" | "getEachMessage"> & { ...; } & { ...; } & PipableSubprocess & Promise<...>' is not assignable to type 'Promise<ExecutorResult>'.
-    Types of property 'then' are incompatible.
-      Type '<TResult1 = Result<Options>, TResult2 = never>(onfulfilled?: ((value: Result<Options>) => TResult1 | PromiseLike<TResult1>) | null | undefined, onrejected?: ((reason: any) => TResult2 | PromiseLike<...>) | ... 1 more ... | undefined) => Promise<...>' is not assignable to type '<TResult1 = ExecutorResult, TResult2 = never>(onfulfilled?: ((value: ExecutorResult) => TResult1 | PromiseLike<TResult1>) | null | undefined, onrejected?: ((reason: any) => TResult2 | PromiseLike<...>) | ... 1 more ... | undefined) => Promise<...>'.
-        Types of parameters 'onfulfilled' and 'onfulfilled' are incompatible.
-          Types of parameters 'value' and 'value' are incompatible.
-            Type 'Result<Options>' is not assignable to type 'ExecutorResult'.
-              Types of property 'stdout' are incompatible.
-                Type 'string | string[] | unknown[] | Uint8Array<ArrayBufferLike> | undefined' is not assignable to type 'string'.
-                  Type 'undefined' is not assignable to type 'string'.
-ShellError: Failed with exit code 1
- exitCode: 1,
-   stdout: "src/commands/onboard.ts(180,11): error TS6133: 'execa' is declared but its value is never read.\nsrc/executor.ts(5,73): error TS2322: Type 'ResultPromise<Options>' is not assignable to type 'Promise<ExecutorResult>'.\n  Type 'Omit<ChildProcess, unique symbol | \"pid\" | \"stdin\" | \"stdout\" | \"stderr\" | \"all\" | \"stdio\" | \"kill\" | \"iterable\" | \"readable\" | \"writable\" | \"duplex\" | \"pipe\" | \"sendMessage\" | \"getOneMessage\" | \"getEachMessage\"> & { ...; } & { ...; } & PipableSubprocess & Promise<...>' is not assignable to type 'Promise<ExecutorResult>'.\n    Types of property 'then' are incompatible.\n      Type '<TResult1 = Result<Options>, TResult2 = never>(onfulfilled?: ((value: Result<Options>) => TResult1 | PromiseLike<TResult1>) | null | undefined, onrejected?: ((reason: any) => TResult2 | PromiseLike<...>) | ... 1 more ... | undefined) => Promise<...>' is not assignable to type '<TResult1 = ExecutorResult, TResult2 = never>(onfulfilled?: ((value: ExecutorResult) => TResult1 | PromiseLike<TResult1>) | null | undefined, onrejected?: ((reason: any) => TResult2 | PromiseLike<...>) | ... 1 more ... | undefined) => Promise<...>'.\n        Types of parameters 'onfulfilled' and 'onfulfilled' are incompatible.\n          Types of parameters 'value' and 'value' are incompatible.\n            Type 'Result<Options>' is not assignable to type 'ExecutorResult'.\n              Types of property 'stdout' are incompatible.\n                Type 'string | string[] | unknown[] | Uint8Array<ArrayBufferLike> | undefined' is not assignable to type 'string'.\n                  Type 'undefined' is not assignable to type 'string'.\n",
-   stderr: "",
+Type declarations generated!
+Build complete! Output: dist/cli.js, dist/index.js, dist/index.d.ts
+::endgroup::
+::group::✅ > nx run @smoothbricks/patchnote:typecheck
 
-      at ShellPromise (unknown:75:16)
-      at BunShell (unknown:191:35)
+> tsc --build --emitDeclarationOnly
 
-Bun v1.3.13 (Linux x64)
-error: script "build" exited with code 1
+::endgroup::
+::group::✅ > nx run @smoothbricks/patchnote:lint
+
+> biome check --files-ignore-unknown=true packages/patchnote
+
+Checked 109 files in 190ms. No fixes applied.
+> eslint packages/patchnote/src
+
 ::endgroup::
 
 
- NX   Running target lint for project @smoothbricks/patchnote and 3 tasks it depends on failed
+ NX   Successfully ran target lint for project @smoothbricks/patchnote and 3 tasks it depends on
 
-Failed tasks:
-
-- @smoothbricks/patchnote:build
-
-Hint: run the command with --verbose for more details.
 
 
