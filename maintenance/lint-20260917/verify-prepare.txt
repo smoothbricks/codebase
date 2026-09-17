@@ -3,7 +3,7 @@ Resolving dependencies
 Resolved, downloaded and extracted [30]
 Saved lockfile
 
-Saved bun.lock (1794 packages) [128.00ms]
+Saved bun.lock (1794 packages) [141.00ms]
 bun install v1.3.13 (bf2e2cec)
 
 $ ts-patch install
@@ -11,33 +11,21 @@ $ ts-patch install
 [!] typescript.js is already patched with the latest version. For details, run: ts-patch check
 [+] ts-patch installed!
 
-Checked 1686 installs across 1794 packages (no changes) [392.00ms]
-packages/patchnote/src/commands/rebase-open-prs.ts:138:17 lint/correctness/noUnusedVariables  FIXABLE  ━━━━━━━━━━
+Checked 1686 installs across 1794 packages (no changes) [583.00ms]
+packages/patchnote/src/commands/onboard.ts:180:13 lint/correctness/noUnusedVariables ━━━━━━━━━━━━━━━
 
-  ! This variable i is unused.
+  ! This variable execa is unused.
   
-    136 │   if (options.dryRun) {
-    137 │     logger?.info('Dry-run mode: listing planned rebase actions\n');
-  > 138 │     for (const [i, level] of levels.entries()) {
-        │                 ^
-    139 │       for (const pr of level) {
-    140 │         const rebaseTarget =
+    178 │   // Reset working tree after dry-run to avoid committing lock file artifacts
+    179 │   try {
+  > 180 │     const { execa } = await import('execa');
+        │             ^^^^^
+    181 │     await (executor || executeCommand)('git', ['checkout', '.'], { cwd: repoRoot });
+    182 │   } catch {
   
   i Unused variables are often the result of typos, incomplete refactors, or other sources of bugs.
   
-  i Unsafe fix: If this is intentional, prepend i with an underscore.
-  
-    136 136 │     if (options.dryRun) {
-    137 137 │       logger?.info('Dry-run mode: listing planned rebase actions\n');
-    138     │ - ····for·(const·[i,·level]·of·levels.entries())·{
-        138 │ + ····for·(const·[_i,·level]·of·levels.entries())·{
-    139 139 │         for (const pr of level) {
-    140 140 │           const rebaseTarget =
-  
 
-Skipped 1 suggested fixes.
-If you wish to apply the suggested (unsafe) fixes, use the command biome check --write --unsafe
-
-Checked 25 files in 88ms. Fixed 13 files.
+Checked 26 files in 155ms. Fixed 17 files.
 Found 1 warning.
 
