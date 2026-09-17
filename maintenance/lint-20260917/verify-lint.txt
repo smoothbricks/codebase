@@ -16,89 +16,20 @@ Bundling CLI with Bun...
 Bundling library entry point...
 Library build complete! Output: dist/index.js
 Generating type declarations...
-src/auth/github-client.ts(18,5): error TS2322: Type 'ExecaMethod<{}> | CommandExecutor' is not assignable to type 'CommandExecutor'.
-  Type 'ExecaMethod<{}>' is not assignable to type 'CommandExecutor'.
-    Type 'ExecaMethod<any>' is not assignable to type 'Promise<ExecutorResult>'.
-src/commands/rebase-open-prs.ts(84,3): error TS2322: Type 'ExecaMethod<{}>' is not assignable to type 'CommandExecutor'.
-  Type 'ExecaMethod<any>' is not assignable to type 'Promise<ExecutorResult>'.
-src/commands/rebase-open-prs.ts(138,17): error TS6133: 'i' is declared but its value is never read.
-src/commands/setup.ts(21,41): error TS2322: Type 'ExecaMethod<{}>' is not assignable to type 'CommandExecutor'.
-  Type 'ExecaMethod<any>' is not assignable to type 'Promise<ExecutorResult>'.
-src/commands/setup.ts(38,3): error TS2322: Type 'ExecaMethod<{}>' is not assignable to type 'CommandExecutor'.
-  Type 'ExecaMethod<any>' is not assignable to type 'Promise<ExecutorResult>'.
-src/commands/validate-setup.ts(25,3): error TS2322: Type 'ExecaMethod<{}>' is not assignable to type 'CommandExecutor'.
-  Type 'ExecaMethod<any>' is not assignable to type 'Promise<ExecutorResult>'.
-src/git.ts(19,58): error TS2322: Type 'ExecaMethod<{}>' is not assignable to type 'CommandExecutor'.
-  Type 'ExecaMethod<any>' is not assignable to type 'Promise<ExecutorResult>'.
-src/git.ts(31,3): error TS2322: Type 'ExecaMethod<{}>' is not assignable to type 'CommandExecutor'.
-  Type 'ExecaMethod<any>' is not assignable to type 'Promise<ExecutorResult>'.
-src/git.ts(44,3): error TS2322: Type 'ExecaMethod<{}>' is not assignable to type 'CommandExecutor'.
-  Type 'ExecaMethod<any>' is not assignable to type 'Promise<ExecutorResult>'.
-src/git.ts(65,3): error TS2322: Type 'ExecaMethod<{}>' is not assignable to type 'CommandExecutor'.
-  Type 'ExecaMethod<any>' is not assignable to type 'Promise<ExecutorResult>'.
-src/git.ts(84,3): error TS2322: Type 'ExecaMethod<{}>' is not assignable to type 'CommandExecutor'.
-  Type 'ExecaMethod<any>' is not assignable to type 'Promise<ExecutorResult>'.
-src/git.ts(100,3): error TS2322: Type 'ExecaMethod<{}>' is not assignable to type 'CommandExecutor'.
-  Type 'ExecaMethod<any>' is not assignable to type 'Promise<ExecutorResult>'.
-src/git.ts(120,3): error TS2322: Type 'ExecaMethod<{}>' is not assignable to type 'CommandExecutor'.
-  Type 'ExecaMethod<any>' is not assignable to type 'Promise<ExecutorResult>'.
-src/git.ts(150,3): error TS2322: Type 'ExecaMethod<{}>' is not assignable to type 'CommandExecutor'.
-  Type 'ExecaMethod<any>' is not assignable to type 'Promise<ExecutorResult>'.
-src/git.ts(160,50): error TS2322: Type 'ExecaMethod<{}>' is not assignable to type 'CommandExecutor'.
-  Type 'ExecaMethod<any>' is not assignable to type 'Promise<ExecutorResult>'.
-src/git.ts(173,3): error TS2322: Type 'ExecaMethod<{}>' is not assignable to type 'CommandExecutor'.
-  Type 'ExecaMethod<any>' is not assignable to type 'Promise<ExecutorResult>'.
-src/git.ts(190,3): error TS2322: Type 'ExecaMethod<{}>' is not assignable to type 'CommandExecutor'.
-  Type 'ExecaMethod<any>' is not assignable to type 'Promise<ExecutorResult>'.
-src/git.ts(209,3): error TS2322: Type 'ExecaMethod<{}>' is not assignable to type 'CommandExecutor'.
-  Type 'ExecaMethod<any>' is not assignable to type 'Promise<ExecutorResult>'.
-src/git.ts(223,3): error TS2322: Type 'ExecaMethod<{}>' is not assignable to type 'CommandExecutor'.
-  Type 'ExecaMethod<any>' is not assignable to type 'Promise<ExecutorResult>'.
-src/git.ts(243,3): error TS2322: Type 'ExecaMethod<{}>' is not assignable to type 'CommandExecutor'.
-  Type 'ExecaMethod<any>' is not assignable to type 'Promise<ExecutorResult>'.
-src/git.ts(262,3): error TS2322: Type 'ExecaMethod<{}>' is not assignable to type 'CommandExecutor'.
-  Type 'ExecaMethod<any>' is not assignable to type 'Promise<ExecutorResult>'.
-src/git.ts(277,3): error TS2322: Type 'ExecaMethod<{}>' is not assignable to type 'CommandExecutor'.
-  Type 'ExecaMethod<any>' is not assignable to type 'Promise<ExecutorResult>'.
-src/git.ts(293,56): error TS2322: Type 'ExecaMethod<{}>' is not assignable to type 'CommandExecutor'.
-  Type 'ExecaMethod<any>' is not assignable to type 'Promise<ExecutorResult>'.
-src/git.ts(319,3): error TS2322: Type 'ExecaMethod<{}>' is not assignable to type 'CommandExecutor'.
-  Type 'ExecaMethod<any>' is not assignable to type 'Promise<ExecutorResult>'.
-src/git.ts(334,3): error TS2322: Type 'ExecaMethod<{}>' is not assignable to type 'CommandExecutor'.
-  Type 'ExecaMethod<any>' is not assignable to type 'Promise<ExecutorResult>'.
-src/git.ts(353,53): error TS2322: Type 'ExecaMethod<{}>' is not assignable to type 'CommandExecutor'.
-  Type 'ExecaMethod<any>' is not assignable to type 'Promise<ExecutorResult>'.
-src/git.ts(365,3): error TS2322: Type 'ExecaMethod<{}>' is not assignable to type 'CommandExecutor'.
-  Type 'ExecaMethod<any>' is not assignable to type 'Promise<ExecutorResult>'.
-src/git.ts(385,3): error TS2322: Type 'ExecaMethod<{}>' is not assignable to type 'CommandExecutor'.
-  Type 'ExecaMethod<any>' is not assignable to type 'Promise<ExecutorResult>'.
-src/git.ts(405,3): error TS2322: Type 'ExecaMethod<{}>' is not assignable to type 'CommandExecutor'.
-  Type 'ExecaMethod<any>' is not assignable to type 'Promise<ExecutorResult>'.
-src/pr/stacking.ts(21,3): error TS2322: Type 'ExecaMethod<{}>' is not assignable to type 'CommandExecutor'.
-  Type 'ExecaMethod<any>' is not assignable to type 'Promise<ExecutorResult>'.
-src/pr/stacking.ts(63,3): error TS2322: Type 'ExecaMethod<{}>' is not assignable to type 'CommandExecutor'.
-  Type 'ExecaMethod<any>' is not assignable to type 'Promise<ExecutorResult>'.
-src/pr/stacking.ts(88,3): error TS2322: Type 'ExecaMethod<{}>' is not assignable to type 'CommandExecutor'.
-  Type 'ExecaMethod<any>' is not assignable to type 'Promise<ExecutorResult>'.
-src/pr/stacking.ts(147,3): error TS2322: Type 'ExecaMethod<{}>' is not assignable to type 'CommandExecutor'.
-  Type 'ExecaMethod<any>' is not assignable to type 'Promise<ExecutorResult>'.
-src/pr/stacking.ts(200,3): error TS2322: Type 'ExecaMethod<{}>' is not assignable to type 'CommandExecutor'.
-  Type 'ExecaMethod<any>' is not assignable to type 'Promise<ExecutorResult>'.
-src/pr/stacking.ts(312,3): error TS2322: Type 'ExecaMethod<{}>' is not assignable to type 'CommandExecutor'.
-  Type 'ExecaMethod<any>' is not assignable to type 'Promise<ExecutorResult>'.
-src/setup/credential-store.ts(13,33): error TS2322: Type 'ExecaMethod<{}>' is not assignable to type 'CommandExecutor'.
-  Type 'ExecaMethod<any>' is not assignable to type 'Promise<ExecutorResult>'.
-src/setup/credential-store.ts(22,39): error TS2322: Type 'ExecaMethod<{}>' is not assignable to type 'CommandExecutor'.
-  Type 'ExecaMethod<any>' is not assignable to type 'Promise<ExecutorResult>'.
-src/setup/credential-store.ts(35,50): error TS2322: Type 'ExecaMethod<{}>' is not assignable to type 'CommandExecutor'.
-  Type 'ExecaMethod<any>' is not assignable to type 'Promise<ExecutorResult>'.
-src/setup/credential-store.ts(54,3): error TS2322: Type 'ExecaMethod<{}>' is not assignable to type 'CommandExecutor'.
-  Type 'ExecaMethod<any>' is not assignable to type 'Promise<ExecutorResult>'.
-src/setup/credential-store.ts(79,47): error TS2322: Type 'ExecaMethod<{}>' is not assignable to type 'CommandExecutor'.
-  Type 'ExecaMethod<any>' is not assignable to type 'Promise<ExecutorResult>'.
+src/commands/onboard.ts(180,11): error TS6133: 'execa' is declared but its value is never read.
+src/executor.ts(5,73): error TS2322: Type 'ResultPromise<Options>' is not assignable to type 'Promise<ExecutorResult>'.
+  Type 'Omit<ChildProcess, unique symbol | "pid" | "stdin" | "stdout" | "stderr" | "all" | "stdio" | "kill" | "iterable" | "readable" | "writable" | "duplex" | "pipe" | "sendMessage" | "getOneMessage" | "getEachMessage"> & { ...; } & { ...; } & PipableSubprocess & Promise<...>' is not assignable to type 'Promise<ExecutorResult>'.
+    Types of property 'then' are incompatible.
+      Type '<TResult1 = Result<Options>, TResult2 = never>(onfulfilled?: ((value: Result<Options>) => TResult1 | PromiseLike<TResult1>) | null | undefined, onrejected?: ((reason: any) => TResult2 | PromiseLike<...>) | ... 1 more ... | undefined) => Promise<...>' is not assignable to type '<TResult1 = ExecutorResult, TResult2 = never>(onfulfilled?: ((value: ExecutorResult) => TResult1 | PromiseLike<TResult1>) | null | undefined, onrejected?: ((reason: any) => TResult2 | PromiseLike<...>) | ... 1 more ... | undefined) => Promise<...>'.
+        Types of parameters 'onfulfilled' and 'onfulfilled' are incompatible.
+          Types of parameters 'value' and 'value' are incompatible.
+            Type 'Result<Options>' is not assignable to type 'ExecutorResult'.
+              Types of property 'stdout' are incompatible.
+                Type 'string | string[] | unknown[] | Uint8Array<ArrayBufferLike> | undefined' is not assignable to type 'string'.
+                  Type 'undefined' is not assignable to type 'string'.
 ShellError: Failed with exit code 1
  exitCode: 1,
-   stdout: "src/auth/github-client.ts(18,5): error TS2322: Type 'ExecaMethod<{}> | CommandExecutor' is not assignable to type 'CommandExecutor'.\n  Type 'ExecaMethod<{}>' is not assignable to type 'CommandExecutor'.\n    Type 'ExecaMethod<any>' is not assignable to type 'Promise<ExecutorResult>'.\nsrc/commands/rebase-open-prs.ts(84,3): error TS2322: Type 'ExecaMethod<{}>' is not assignable to type 'CommandExecutor'.\n  Type 'ExecaMethod<any>' is not assignable to type 'Promise<ExecutorResult>'.\nsrc/commands/rebase-open-prs.ts(138,17): error TS6133: 'i' is declared but its value is never read.\nsrc/commands/setup.ts(21,41): error TS2322: Type 'ExecaMethod<{}>' is not assignable to type 'CommandExecutor'.\n  Type 'ExecaMethod<any>' is not assignable to type 'Promise<ExecutorResult>'.\nsrc/commands/setup.ts(38,3): error TS2322: Type 'ExecaMethod<{}>' is not assignable to type 'CommandExecutor'.\n  Type 'ExecaMethod<any>' is not assignable to type 'Promise<ExecutorResult>'.\nsrc/commands/validate-setup.ts(25,3): error TS2322: Type 'ExecaMethod<{}>' is not assignable to type 'CommandExecutor'.\n  Type 'ExecaMethod<any>' is not assignable to type 'Promise<ExecutorResult>'.\nsrc/git.ts(19,58): error TS2322: Type 'ExecaMethod<{}>' is not assignable to type 'CommandExecutor'.\n  Type 'ExecaMethod<any>' is not assignable to type 'Promise<ExecutorResult>'.\nsrc/git.ts(31,3): error TS2322: Type 'ExecaMethod<{}>' is not assignable to type 'CommandExecutor'.\n  Type 'ExecaMethod<any>' is not assignable to type 'Promise<ExecutorResult>'.\nsrc/git.ts(44,3): error TS2322: Type 'ExecaMethod<{}>' is not assignable to type 'CommandExecutor'.\n  Type 'ExecaMethod<any>' is not assignable to type 'Promise<ExecutorResult>'.\nsrc/git.ts(65,3): error TS2322: Type 'ExecaMethod<{}>' is not assignable to type 'CommandExecutor'.\n  Type 'ExecaMethod<any>' is not assignable to type 'Promise<ExecutorResult>'.\nsrc/git.ts(84,3): error TS2322: Type 'ExecaMethod<{}>' is not assignable to type 'CommandExecutor'.\n  Type 'ExecaMethod<any>' is not assignable to type 'Promise<ExecutorResult>'.\nsrc/git.ts(100,3): error TS2322: Type 'ExecaMethod<{}>' is not assignable to type 'CommandExecutor'.\n  Type 'ExecaMethod<any>' is not assignable to type 'Promise<ExecutorResult>'.\nsrc/git.ts(120,3): error TS2322: Type 'ExecaMethod<{}>' is not assignable to type 'CommandExecutor'.\n  Type 'ExecaMethod<any>' is not assignable to type 'Promise<ExecutorResult>'.\nsrc/git.ts(150,3): error TS2322: Type 'ExecaMethod<{}>' is not assignable to type 'CommandExecutor'.\n  Type 'ExecaMethod<any>' is not assignable to type 'Promise<ExecutorResult>'.\nsrc/git.ts(160,50): error TS2322: Type 'ExecaMethod<{}>' is not assignable to type 'CommandExecutor'.\n  Type 'ExecaMethod<any>' is not assignable to type 'Promise<ExecutorResult>'.\nsrc/git.ts(173,3): error TS2322: Type 'ExecaMethod<{}>' is not assignable to type 'CommandExecutor'.\n  Type 'ExecaMethod<any>' is not assignable to type 'Promise<ExecutorResult>'.\nsrc/git.ts(190,3): error TS2322: Type 'ExecaMethod<{}>' is not assignable to type 'CommandExecutor'.\n  Type 'ExecaMethod<any>' is not assignable to type 'Promise<ExecutorResult>'.\nsrc/git.ts(209,3): error TS2322: Type 'ExecaMethod<{}>' is not assignable to type 'CommandExecutor'.\n  Type 'ExecaMethod<any>' is not assignable to type 'Promise<ExecutorResult>'.\nsrc/git.ts(223,3): error TS2322: Type 'ExecaMethod<{}>' is not assignable to type 'CommandExecutor'.\n  Type 'ExecaMethod<any>' is not assignable to type 'Promise<ExecutorResult>'.\nsrc/git.ts(243,3): error TS2322: Type 'ExecaMethod<{}>' is not assignable to type 'CommandExecutor'.\n  Type 'ExecaMethod<any>' is not assignable to type 'Promise<ExecutorResult>'.\nsrc/git.ts(262,3): error TS2322: Type 'ExecaMethod<{}>' is not assignable to type 'CommandExecutor'.\n  Type 'ExecaMethod<any>' is not assignable to type 'Promise<ExecutorResult>'.\nsrc/git.ts(277,3): error TS2322: Type 'ExecaMethod<{}>' is not assignable to type 'CommandExecutor'.\n  Type 'ExecaMethod<any>' is not assignable to type 'Promise<ExecutorResult>'.\nsrc/git.ts(293,56): error TS2322: Type 'ExecaMethod<{}>' is not assignable to type 'CommandExecutor'.\n  Type 'ExecaMethod<any>' is not assignable to type 'Promise<ExecutorResult>'.\nsrc/git.ts(319,3): error TS2322: Type 'ExecaMethod<{}>' is not assignable to type 'CommandExecutor'.\n  Type 'ExecaMethod<any>' is not assignable to type 'Promise<ExecutorResult>'.\nsrc/git.ts(334,3): error TS2322: Type 'ExecaMethod<{}>' is not assignable to type 'CommandExecutor'.\n  Type 'ExecaMethod<any>' is not assignable to type 'Promise<ExecutorResult>'.\nsrc/git.ts(353,53): error TS2322: Type 'ExecaMethod<{}>' is not assignable to type 'CommandExecutor'.\n  Type 'ExecaMethod<any>' is not assignable to type 'Promise<ExecutorResult>'.\nsrc/git.ts(365,3): error TS2322: Type 'ExecaMethod<{}>' is not assignable to type 'CommandExecutor'.\n  Type 'ExecaMethod<any>' is not assignable to type 'Promise<ExecutorResult>'.\nsrc/git.ts(385,3): error TS2322: Type 'ExecaMethod<{}>' is not assignable to type 'CommandExecutor'.\n  Type 'ExecaMethod<any>' is not assignable to type 'Promise<ExecutorResult>'.\nsrc/git.ts(405,3): error TS2322: Type 'ExecaMethod<{}>' is not assignable to type 'CommandExecutor'.\n  Type 'ExecaMethod<any>' is not assignable to type 'Promise<ExecutorResult>'.\nsrc/pr/stacking.ts(21,3): error TS2322: Type 'ExecaMethod<{}>' is not assignable to type 'CommandExecutor'.\n  Type 'ExecaMethod<any>' is not assignable to type 'Promise<ExecutorResult>'.\nsrc/pr/stacking.ts(63,3): error TS2322: Type 'ExecaMethod<{}>' is not assignable to type 'CommandExecutor'.\n  Type 'ExecaMethod<any>' is not assignable to type 'Promise<ExecutorResult>'.\nsrc/pr/stacking.ts(88,3): error TS2322: Type 'ExecaMethod<{}>' is not assignable to type 'CommandExecutor'.\n  Type 'ExecaMethod<any>' is not assignable to type 'Promise<ExecutorResult>'.\nsrc/pr/stacking.ts(147,3): error TS2322: Type 'ExecaMethod<{}>' is not assignable to type 'CommandExecutor'.\n  Type 'ExecaMethod<any>' is not assignable to type 'Promise<ExecutorResult>'.\nsrc/pr/stacking.ts(200,3): error TS2322: Type 'ExecaMethod<{}>' is not assignable to type 'CommandExecutor'.\n  Type 'ExecaMethod<any>' is not assignable to type 'Promise<ExecutorResult>'.\nsrc/pr/stacking.ts(312,3): error TS2322: Type 'ExecaMethod<{}>' is not assignable to type 'CommandExecutor'.\n  Type 'ExecaMethod<any>' is not assignable to type 'Promise<ExecutorResult>'.\nsrc/setup/credential-store.ts(13,33): error TS2322: Type 'ExecaMethod<{}>' is not assignable to type 'CommandExecutor'.\n  Type 'ExecaMethod<any>' is not assignable to type 'Promise<ExecutorResult>'.\nsrc/setup/credential-store.ts(22,39): error TS2322: Type 'ExecaMethod<{}>' is not assignable to type 'CommandExecutor'.\n  Type 'ExecaMethod<any>' is not assignable to type 'Promise<ExecutorResult>'.\nsrc/setup/credential-store.ts(35,50): error TS2322: Type 'ExecaMethod<{}>' is not assignable to type 'CommandExecutor'.\n  Type 'ExecaMethod<any>' is not assignable to type 'Promise<ExecutorResult>'.\nsrc/setup/credential-store.ts(54,3): error TS2322: Type 'ExecaMethod<{}>' is not assignable to type 'CommandExecutor'.\n  Type 'ExecaMethod<any>' is not assignable to type 'Promise<ExecutorResult>'.\nsrc/setup/credential-store.ts(79,47): error TS2322: Type 'ExecaMethod<{}>' is not assignable to type 'CommandExecutor'.\n  Type 'ExecaMethod<any>' is not assignable to type 'Promise<ExecutorResult>'.\n",
+   stdout: "src/commands/onboard.ts(180,11): error TS6133: 'execa' is declared but its value is never read.\nsrc/executor.ts(5,73): error TS2322: Type 'ResultPromise<Options>' is not assignable to type 'Promise<ExecutorResult>'.\n  Type 'Omit<ChildProcess, unique symbol | \"pid\" | \"stdin\" | \"stdout\" | \"stderr\" | \"all\" | \"stdio\" | \"kill\" | \"iterable\" | \"readable\" | \"writable\" | \"duplex\" | \"pipe\" | \"sendMessage\" | \"getOneMessage\" | \"getEachMessage\"> & { ...; } & { ...; } & PipableSubprocess & Promise<...>' is not assignable to type 'Promise<ExecutorResult>'.\n    Types of property 'then' are incompatible.\n      Type '<TResult1 = Result<Options>, TResult2 = never>(onfulfilled?: ((value: Result<Options>) => TResult1 | PromiseLike<TResult1>) | null | undefined, onrejected?: ((reason: any) => TResult2 | PromiseLike<...>) | ... 1 more ... | undefined) => Promise<...>' is not assignable to type '<TResult1 = ExecutorResult, TResult2 = never>(onfulfilled?: ((value: ExecutorResult) => TResult1 | PromiseLike<TResult1>) | null | undefined, onrejected?: ((reason: any) => TResult2 | PromiseLike<...>) | ... 1 more ... | undefined) => Promise<...>'.\n        Types of parameters 'onfulfilled' and 'onfulfilled' are incompatible.\n          Types of parameters 'value' and 'value' are incompatible.\n            Type 'Result<Options>' is not assignable to type 'ExecutorResult'.\n              Types of property 'stdout' are incompatible.\n                Type 'string | string[] | unknown[] | Uint8Array<ArrayBufferLike> | undefined' is not assignable to type 'string'.\n                  Type 'undefined' is not assignable to type 'string'.\n",
    stderr: "",
 
       at ShellPromise (unknown:75:16)
