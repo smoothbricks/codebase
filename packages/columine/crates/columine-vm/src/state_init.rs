@@ -681,7 +681,7 @@ pub fn init_state(
     let num_slots = view.num_slots;
     let init_code = view.init_code;
 
-    // State header (format v2): magic(4) + format_version(1) + program_version(2)
+    // State header: magic(4) + format_version(1) + program_version(2)
     // + ruleset_version(2) + num_slots(1) + num_vars(1) + num_bitvecs(1) + flags(1)
     // + reserved(19).
     bytes::write_u32(state, 0, STATE_MAGIC);
