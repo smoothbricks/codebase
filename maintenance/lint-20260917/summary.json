@@ -1,0 +1,190 @@
+{
+  "inspected": "2026-09-17T09:59:57.352214+00:00",
+  "source": "115142bc063ee989df55844d70117d3176bfc3fe",
+  "lint_exit": 1,
+  "verification_run": "35208086290",
+  "open_prs": [
+    {
+      "pr": 34,
+      "head": "8e6803bbc4095b915a37b94a5575f217dc71e662",
+      "branch": "fix/ci-host-cache-ref-isolation",
+      "draft": false,
+      "runs": [
+        {
+          "id": 35168079259,
+          "name": "StateBus browser tests",
+          "status": "completed",
+          "conclusion": "success",
+          "jobs": [
+            {
+              "name": "chromium",
+              "id": 105033562083,
+              "status": "completed",
+              "conclusion": "success",
+              "failed_steps": []
+            }
+          ]
+        },
+        {
+          "id": 35168079264,
+          "name": "CI",
+          "status": "completed",
+          "conclusion": "success",
+          "jobs": [
+            {
+              "name": "Validate",
+              "id": 105033561960,
+              "status": "completed",
+              "conclusion": "success",
+              "failed_steps": []
+            }
+          ]
+        },
+        {
+          "id": 35168079214,
+          "name": "StateBus package contracts",
+          "status": "completed",
+          "conclusion": "success",
+          "jobs": [
+            {
+              "name": "consumer",
+              "id": 105033561685,
+              "status": "completed",
+              "conclusion": "success",
+              "failed_steps": []
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "pr": 32,
+      "head": "7f5a5725aac03ac77e09d14a5b0bfcab5b4d90d8",
+      "branch": "feat/statebus-parent-capability-forwarding",
+      "draft": false,
+      "runs": [
+        {
+          "id": 35024636126,
+          "name": "CI",
+          "status": "completed",
+          "conclusion": "success",
+          "jobs": [
+            {
+              "name": "Validate",
+              "id": 104568581044,
+              "status": "completed",
+              "conclusion": "success",
+              "failed_steps": []
+            }
+          ]
+        },
+        {
+          "id": 35024636108,
+          "name": "StateBus browser tests",
+          "status": "completed",
+          "conclusion": "success",
+          "jobs": [
+            {
+              "name": "chromium",
+              "id": 104568582131,
+              "status": "completed",
+              "conclusion": "success",
+              "failed_steps": []
+            }
+          ]
+        },
+        {
+          "id": 35024636106,
+          "name": "StateBus package contracts",
+          "status": "completed",
+          "conclusion": "success",
+          "jobs": [
+            {
+              "name": "consumer",
+              "id": 104568581189,
+              "status": "completed",
+              "conclusion": "success",
+              "failed_steps": []
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "pr": 29,
+      "head": "8ed2b70065172fb8f2b7f852ea7e82f0276df98c",
+      "branch": "feat/statebus-retained-replay",
+      "draft": false,
+      "runs": [
+        {
+          "id": 34902153173,
+          "name": "CI",
+          "status": "completed",
+          "conclusion": "success",
+          "jobs": [
+            {
+              "name": "Validate",
+              "id": 104170369742,
+              "status": "completed",
+              "conclusion": "success",
+              "failed_steps": []
+            }
+          ]
+        },
+        {
+          "id": 34902153188,
+          "name": "StateBus browser tests",
+          "status": "completed",
+          "conclusion": "success",
+          "jobs": [
+            {
+              "name": "chromium",
+              "id": 104170369943,
+              "status": "completed",
+              "conclusion": "success",
+              "failed_steps": []
+            }
+          ]
+        },
+        {
+          "id": 34902153139,
+          "name": "StateBus package contracts",
+          "status": "completed",
+          "conclusion": "success",
+          "jobs": [
+            {
+              "name": "consumer",
+              "id": 104170369470,
+              "status": "completed",
+              "conclusion": "success",
+              "failed_steps": []
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "pr": 1,
+      "head": "115142bc063ee989df55844d70117d3176bfc3fe",
+      "branch": "feat/add-dep-updater-package",
+      "draft": true,
+      "runs": [
+        {
+          "id": 35208043464,
+          "name": "CI",
+          "status": "in_progress",
+          "conclusion": null,
+          "jobs": [
+            {
+              "name": "main",
+              "id": 105158560876,
+              "status": "in_progress",
+              "conclusion": null,
+              "failed_steps": []
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
