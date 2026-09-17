@@ -139,20 +139,27 @@ index 8373249..b407471 100644
    const content = data.choices?.[0]?.message?.content;
    if (!content) {
 diff --git a/packages/patchnote/src/auth/github-client.ts b/packages/patchnote/src/auth/github-client.ts
-index f4b1a69..0ddfbcc 100644
+index f4b1a69..d7352bf 100644
 --- a/packages/patchnote/src/auth/github-client.ts
 +++ b/packages/patchnote/src/auth/github-client.ts
-@@ -1,3 +1,4 @@
+@@ -1,9 +1,10 @@
 +import typia from 'typia';
++import { executeCommand } from '../executor.js';
  /**
   * GitHub CLI client for PR operations
   * Uses gh CLI for all GitHub operations
+  */
+ 
+-import { execa } from 'execa';
+ import type { CommandExecutor, GitHubPR, IGitHubClient, MergeStrategy } from '../types.js';
+ 
+ /**
 @@ -14,7 +15,7 @@ export class GitHubCLIClient implements IGitHubClient {
    private executor: CommandExecutor;
  
    constructor(executor?: CommandExecutor) {
 -    this.executor = executor || (execa as unknown as CommandExecutor);
-+    this.executor = executor || execa;
++    this.executor = executor || executeCommand;
    }
  
    async listUpdatePRs(repoRoot: string): Promise<GitHubPR[]> {
@@ -293,28 +300,44 @@ index 8a838cc..f604190 100644
  
  // Parse arguments and run
 diff --git a/packages/patchnote/src/commands/onboard.ts b/packages/patchnote/src/commands/onboard.ts
-index d1e680a..e0b0478 100644
+index d1e680a..76d6211 100644
 --- a/packages/patchnote/src/commands/onboard.ts
 +++ b/packages/patchnote/src/commands/onboard.ts
-@@ -177,7 +177,7 @@ export async function onboard(
+@@ -1,3 +1,4 @@
++import { executeCommand } from '../executor.js';
+ /**
+  * Onboarding command -- creates a "Configure Patchnote" PR on first CI run
+  * when no config file exists. Mirrors the Renovate onboarding pattern.
+@@ -177,7 +178,7 @@ export async function onboard(
    // Reset working tree after dry-run to avoid committing lock file artifacts
    try {
      const { execa } = await import('execa');
 -    await (executor || (execa as unknown as CommandExecutor))('git', ['checkout', '.'], { cwd: repoRoot });
-+    await (executor || execa)('git', ['checkout', '.'], { cwd: repoRoot });
++    await (executor || executeCommand)('git', ['checkout', '.'], { cwd: repoRoot });
    } catch {
      // Ignore reset errors
    }
 diff --git a/packages/patchnote/src/commands/rebase-open-prs.ts b/packages/patchnote/src/commands/rebase-open-prs.ts
-index a455816..8e59f7b 100644
+index a455816..aeb9769 100644
 --- a/packages/patchnote/src/commands/rebase-open-prs.ts
 +++ b/packages/patchnote/src/commands/rebase-open-prs.ts
-@@ -12,7 +12,7 @@ import type { PatchnoteConfig } from '../config.js';
+@@ -1,3 +1,4 @@
++import { executeCommand } from '../executor.js';
+ /**
+  * Rebase open patchnote PRs onto updated base branch
+  *
+@@ -6,13 +7,12 @@
+  * are rebased in topological order (base-of-stack first).
+  */
+ 
+-import { execa } from 'execa';
+ import { GitHubCLIClient } from '../auth/github-client.js';
+ import type { PatchnoteConfig } from '../config.js';
  import { fetch, getCurrentBranch, push, rebase, switchBranch } from '../git.js';
  import type { CommandExecutor, GitHubPR, IGitHubClient, RebaseOpenPRsOptions, RebaseResult } from '../types.js';
  
 -const defaultExecutor = execa as unknown as CommandExecutor;
-+const defaultExecutor = execa;
++const defaultExecutor = executeCommand;
  
  /**
   * Build topological rebase order from a list of PRs.
@@ -324,16 +347,30 @@ index a455816..8e59f7b 100644
      logger?.info('Dry-run mode: listing planned rebase actions\n');
 -    for (let i = 0; i < levels.length; i++) {
 -      for (const pr of levels[i]!) {
-+    for (const [i, level] of levels.entries()) {
++    for (const level of levels) {
 +      for (const pr of level) {
          const rebaseTarget =
            pr.baseRefName && pr.baseRefName !== baseBranch ? `origin/${pr.baseRefName}` : `origin/${baseBranch}`;
          logger?.info(`  PR #${pr.number} (${pr.headRefName}) -> rebase onto ${rebaseTarget}`);
 diff --git a/packages/patchnote/src/commands/setup.ts b/packages/patchnote/src/commands/setup.ts
-index e73f425..82b208f 100644
+index e73f425..4f15f86 100644
 --- a/packages/patchnote/src/commands/setup.ts
 +++ b/packages/patchnote/src/commands/setup.ts
-@@ -18,10 +18,7 @@ import type { CommandExecutor, GitHubAppCredentials, SetupOptions } from '../typ
+@@ -1,3 +1,4 @@
++import { executeCommand } from '../executor.js';
+ /**
+  * Setup command for automating GitHub App creation via the manifest flow.
+  *
+@@ -7,7 +8,7 @@
+  */
+ 
+ import * as p from '@clack/prompts';
+-import { execa } from 'execa';
++
+ import type { PatchnoteConfig } from '../config.js';
+ import { checkAuthScopes, deleteApp, detectOrg, exchangeCode, storeCredentials } from '../setup/credential-store.js';
+ import { startCallbackServer } from '../setup/local-server.js';
+@@ -18,10 +19,7 @@ import type { CommandExecutor, GitHubAppCredentials, SetupOptions } from '../typ
   * Open a URL in the user's default browser using platform-specific commands.
   * Does NOT add the `open` npm package as a dependency.
   */
@@ -341,34 +378,41 @@ index e73f425..82b208f 100644
 -  url: string,
 -  executor: CommandExecutor = execa as unknown as CommandExecutor,
 -): Promise<void> {
-+async function openBrowser(url: string, executor: CommandExecutor = execa): Promise<void> {
++async function openBrowser(url: string, executor: CommandExecutor = executeCommand): Promise<void> {
    const platform = process.platform;
    if (platform === 'darwin') {
      await executor('open', [url]);
-@@ -38,7 +35,7 @@ async function openBrowser(
+@@ -38,7 +36,7 @@ async function openBrowser(
  export async function setup(
    _config: PatchnoteConfig,
    options: SetupOptions,
 -  executor: CommandExecutor = execa as unknown as CommandExecutor,
-+  executor: CommandExecutor = execa,
++  executor: CommandExecutor = executeCommand,
  ): Promise<void> {
    p.intro('Setting up GitHub App for patchnote');
  
 diff --git a/packages/patchnote/src/commands/validate-setup.ts b/packages/patchnote/src/commands/validate-setup.ts
-index 17fa620..447fd38 100644
+index 17fa620..acf45b8 100644
 --- a/packages/patchnote/src/commands/validate-setup.ts
 +++ b/packages/patchnote/src/commands/validate-setup.ts
-@@ -1,3 +1,4 @@
+@@ -1,9 +1,10 @@
 +import typia from 'typia';
++import { executeCommand } from '../executor.js';
  /**
   * Validates patchnote setup
   * Checks GitHub CLI, authentication, app installation, permissions, and config
+  */
+ 
+-import { execa } from 'execa';
+ import { loadConfig } from '../config.js';
+ import type { Logger } from '../logger.js';
+ import type { CommandExecutor } from '../types.js';
 @@ -21,7 +22,7 @@ interface ValidationResult {
  export async function validateSetup(
    logger: Logger,
    repoRoot?: string,
 -  executor: CommandExecutor = execa as unknown as CommandExecutor,
-+  executor: CommandExecutor = execa,
++  executor: CommandExecutor = executeCommand,
  ): Promise<number> {
    logger.info('🔍 Validating patchnote setup...\n');
  
@@ -520,6 +564,17 @@ index d0d87c1..2bdf642 100644
    }
    return _replacements;
  }
+diff --git a/packages/patchnote/src/executor.ts b/packages/patchnote/src/executor.ts
+new file mode 100644
+index 0000000..f4e4b08
+--- /dev/null
++++ b/packages/patchnote/src/executor.ts
+@@ -0,0 +1,5 @@
++import { execa } from 'execa';
++import type { CommandExecutor } from './types.js';
++
++/** Select Execa's command-call overload; preserve its result, options and rejection. */
++export const executeCommand: CommandExecutor = (file, args, options) => execa(file, args, options);
 diff --git a/packages/patchnote/src/expo/sdk-checker.ts b/packages/patchnote/src/expo/sdk-checker.ts
 index acef616..72a623c 100644
 --- a/packages/patchnote/src/expo/sdk-checker.ts
@@ -569,28 +624,47 @@ index 8892994..a8d8723 100644
        reactNativeVersion = packageJson.peerDependencies?.['react-native'] || reactNativeVersion;
      }
 diff --git a/packages/patchnote/src/git.ts b/packages/patchnote/src/git.ts
-index ccf2c85..0b08d09 100644
+index ccf2c85..9f5f7d3 100644
 --- a/packages/patchnote/src/git.ts
 +++ b/packages/patchnote/src/git.ts
+@@ -1,8 +1,8 @@
++import { executeCommand } from './executor.js';
+ /**
+  * Git operations helpers
+  */
+ 
+-import { execa } from 'execa';
+ import type { PatchnoteConfig } from './config.js';
+ import type { Logger } from './logger.js';
+ import type { CommandExecutor } from './types.js';
 @@ -11,7 +11,7 @@ import type { CommandExecutor } from './types.js';
   * Default executor - execa cast to CommandExecutor type
   * The cast is safe because execa's Result extends our ExecutorResult interface
   */
 -const defaultExecutor = execa as unknown as CommandExecutor;
-+const defaultExecutor = execa;
++const defaultExecutor = executeCommand;
  
  /**
   * Get the current git branch
 diff --git a/packages/patchnote/src/pr/stacking.ts b/packages/patchnote/src/pr/stacking.ts
-index c95120d..7399aa3 100644
+index c95120d..77fdcf6 100644
 --- a/packages/patchnote/src/pr/stacking.ts
 +++ b/packages/patchnote/src/pr/stacking.ts
-@@ -9,7 +9,7 @@ import type { Logger } from '../logger.js';
+@@ -1,15 +1,15 @@
++import { executeCommand } from '../executor.js';
+ /**
+  * Stacked PR management
+  */
+ 
+-import { execa as execaOriginal } from 'execa';
+ import { GitHubCLIClient } from '../auth/github-client.js';
+ import type { PatchnoteConfig } from '../config.js';
+ import type { Logger } from '../logger.js';
  import type { CommandExecutor, IGitHubClient, OpenPR } from '../types.js';
  
  /** Default executor - execa cast to CommandExecutor type */
 -const defaultExecutor = execaOriginal as unknown as CommandExecutor;
-+const defaultExecutor = execaOriginal;
++const defaultExecutor = executeCommand;
  
  /**
   * Get list of open update PRs
@@ -620,15 +694,25 @@ index 93b61f3..5d23c63 100644
      return !!data.dist?.attestations?.provenance;
    } catch {
 diff --git a/packages/patchnote/src/setup/credential-store.ts b/packages/patchnote/src/setup/credential-store.ts
-index 35db721..ddb6bc1 100644
+index 35db721..bd85ead 100644
 --- a/packages/patchnote/src/setup/credential-store.ts
 +++ b/packages/patchnote/src/setup/credential-store.ts
-@@ -10,7 +10,7 @@ import type { CommandExecutor, GitHubAppCredentials } from '../types.js';
+@@ -1,16 +1,16 @@
++import { executeCommand } from '../executor.js';
+ /**
+  * GitHub CLI wrappers for storing credentials as organization secrets/variables.
+  * All functions follow the CommandExecutor dependency injection pattern.
+  */
+ 
+-import { execa } from 'execa';
+ import type { CommandExecutor, GitHubAppCredentials } from '../types.js';
+ 
+ /**
   * Detect the GitHub organization from the current repository.
   * Uses `gh repo view` to get the repo owner.
   */
 -export async function detectOrg(executor: CommandExecutor = execa as unknown as CommandExecutor): Promise<string> {
-+export async function detectOrg(executor: CommandExecutor = execa): Promise<string> {
++export async function detectOrg(executor: CommandExecutor = executeCommand): Promise<string> {
    const { stdout } = await executor('gh', ['repo', 'view', '--json', 'owner', '--jq', '.owner.login']);
    return stdout.trim();
  }
@@ -639,32 +723,29 @@ index 35db721..ddb6bc1 100644
 -export async function checkAuthScopes(
 -  executor: CommandExecutor = execa as unknown as CommandExecutor,
 -): Promise<boolean> {
-+export async function checkAuthScopes(executor: CommandExecutor = execa): Promise<boolean> {
++export async function checkAuthScopes(executor: CommandExecutor = executeCommand): Promise<boolean> {
    try {
      await executor('gh', ['auth', 'status']);
      return true;
-@@ -34,10 +32,7 @@ export async function checkAuthScopes(
-  * Exchange a temporary manifest code for GitHub App credentials.
-  * Calls `gh api POST /app-manifests/{code}/conversions` and parses the response.
+@@ -36,7 +34,7 @@ export async function checkAuthScopes(
   */
--export async function exchangeCode(
--  code: string,
+ export async function exchangeCode(
+   code: string,
 -  executor: CommandExecutor = execa as unknown as CommandExecutor,
--): Promise<GitHubAppCredentials> {
-+export async function exchangeCode(code: string, executor: CommandExecutor = execa): Promise<GitHubAppCredentials> {
++  executor: CommandExecutor = executeCommand,
+ ): Promise<GitHubAppCredentials> {
    const { stdout } = await executor('gh', ['api', 'POST', `/app-manifests/${code}/conversions`]);
    const data = JSON.parse(stdout);
-   return {
-@@ -56,7 +51,7 @@ export async function exchangeCode(
+@@ -56,7 +54,7 @@ export async function exchangeCode(
   */
  export async function storeCredentials(
    options: { org: string; appId: number; pem: string },
 -  executor: CommandExecutor = execa as unknown as CommandExecutor,
-+  executor: CommandExecutor = execa,
++  executor: CommandExecutor = executeCommand,
  ): Promise<void> {
    // Set App ID as org variable
    await executor('gh', [
-@@ -81,10 +76,7 @@ export async function storeCredentials(
+@@ -81,10 +79,7 @@ export async function storeCredentials(
   * Delete a GitHub App by slug. Best-effort rollback helper.
   * Silently catches errors since this is used during cleanup.
   */
@@ -672,7 +753,7 @@ index 35db721..ddb6bc1 100644
 -  slug: string,
 -  executor: CommandExecutor = execa as unknown as CommandExecutor,
 -): Promise<void> {
-+export async function deleteApp(slug: string, executor: CommandExecutor = execa): Promise<void> {
++export async function deleteApp(slug: string, executor: CommandExecutor = executeCommand): Promise<void> {
    try {
      await executor('gh', ['api', '-X', 'DELETE', `/apps/${slug}`]);
    } catch {
@@ -710,10 +791,15 @@ index abeeb06..9b31bcb 100644
  /**
   * Update type classification
 diff --git a/packages/patchnote/src/updaters/bun.ts b/packages/patchnote/src/updaters/bun.ts
-index 964cec9..6f7bedb 100644
+index 964cec9..85119e5 100644
 --- a/packages/patchnote/src/updaters/bun.ts
 +++ b/packages/patchnote/src/updaters/bun.ts
-@@ -83,7 +83,7 @@ export function parsePackageJsonDiff(diff: string): PackageUpdate[] {
+@@ -1,3 +1,4 @@
++import { executeCommand } from '../executor.js';
+ /**
+  * Dependency updater (supports bun, npm, pnpm, yarn)
+  */
+@@ -83,7 +84,7 @@ export function parsePackageJsonDiff(diff: string): PackageUpdate[] {
      // Check for section headers
      const sectionMatch = line.match(sectionPattern);
      if (sectionMatch) {
@@ -722,12 +808,12 @@ index 964cec9..6f7bedb 100644
        continue;
      }
  
-@@ -323,7 +323,7 @@ export async function refreshLockFile(
+@@ -323,7 +324,7 @@ export async function refreshLockFile(
      packageManager?: ProjectSetup['packageManager'];
    } = {},
  ): Promise<{ changed: boolean; error?: string }> {
 -  const { dryRun = false, logger, executor = execa as unknown as CommandExecutor } = options;
-+  const { dryRun = false, logger, executor = execa } = options;
++  const { dryRun = false, logger, executor = executeCommand } = options;
    const pm = getPackageManagerCommands(options.packageManager ?? 'bun');
  
    if (dryRun) {
@@ -759,7 +845,7 @@ index e62a602..7df52c6 100644
        const key = [command, ...(args || [])].join(' ');
 diff --git a/packages/patchnote/test/lint-boundaries.test.ts b/packages/patchnote/test/lint-boundaries.test.ts
 new file mode 100644
-index 0000000..e429b30
+index 0000000..35b19ce
 --- /dev/null
 +++ b/packages/patchnote/test/lint-boundaries.test.ts
 @@ -0,0 +1,74 @@
@@ -767,9 +853,9 @@ index 0000000..e429b30
 +import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 +import { tmpdir } from 'node:os';
 +import { join } from 'node:path';
-+import { execa } from 'execa';
 +import { GitHubCLIClient } from '../src/auth/github-client.js';
 +import { defaultConfig, loadConfig, mergeConfig } from '../src/config.js';
++import { executeCommand } from '../src/executor.js';
 +import type { CommandExecutor } from '../src/types.js';
 +import { createMockExeca } from './helpers/mock-execa.js';
 +
@@ -779,7 +865,7 @@ index 0000000..e429b30
 +});
 +describe('validated command and configuration boundaries', () => {
 +  test('the real text executor satisfies the injectable contract without assertions', async () => {
-+    const execute: CommandExecutor = execa;
++    const execute: CommandExecutor = executeCommand;
 +    const result = await execute(process.execPath, [
 +      '-e',
 +      'process.stdout.write("text"); process.stderr.write("diagnostic")',
