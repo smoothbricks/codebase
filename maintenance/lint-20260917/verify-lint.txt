@@ -28,7 +28,7 @@ Build complete! Output: dist/cli.js, dist/index.js, dist/index.d.ts
 
 > biome check --files-ignore-unknown=true packages/patchnote
 
-Checked 109 files in 219ms. No fixes applied.
+Checked 109 files in 206ms. No fixes applied.
 > eslint packages/patchnote/src
 
 ::endgroup::
