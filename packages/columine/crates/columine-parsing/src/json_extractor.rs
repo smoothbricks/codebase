@@ -310,11 +310,6 @@ pub fn extract_json_events(
             return Err(err);
         }
         count += 1;
-        // An exactly-capacity batch is legal; reject only when more events
-        // follow a full batch.
-        if count >= columns.capacity as usize && !parser.is_array_end() {
-            return Err(ExtractionError::TooManyEvents);
-        }
     }
     parser
         .next_token()
@@ -1819,6 +1814,22 @@ mod tests {
             ),
             Ok(1)
         );
+        c.reset();
+        let mut diagnostic = ExtractionDiagnostic::default();
+        assert_eq!(
+            extract_json_events(
+                br#"[{"id":"1"},{"id":"2"}]"#,
+                &config(&fields, &["id"]),
+                &mut c,
+                &mut work,
+                &mut diagnostic,
+            ),
+            Err(ExtractionError::TooManyEvents),
+        );
+        assert_eq!(diagnostic.stage, diagnostic_stage::COLUMN);
+        assert_eq!(diagnostic.detail, diagnostic_detail::TOO_MANY_EVENTS);
+        assert_eq!(u32::from(diagnostic.row_index), c.capacity);
+        assert_eq!(c.count, 1, "the refused row is never committed");
     }
     /// The undeclared-carrier writer is lazy: a tiny work buffer is fine as
     /// long as every field is declared.
