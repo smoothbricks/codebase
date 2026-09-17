@@ -3,7 +3,7 @@ Resolving dependencies
 Resolved, downloaded and extracted [30]
 Saved lockfile
 
-Saved bun.lock (1794 packages) [115.00ms]
+Saved bun.lock (1794 packages) [120.00ms]
 bun install v1.3.13 (bf2e2cec)
 
 $ ts-patch install
@@ -11,6 +11,6 @@ $ ts-patch install
 [!] typescript.js is already patched with the latest version. For details, run: ts-patch check
 [+] ts-patch installed!
 
-Checked 1686 installs across 1794 packages (no changes) [514.00ms]
-Checked 26 files in 130ms. Fixed 20 files.
+Checked 1686 installs across 1794 packages (no changes) [670.00ms]
+Checked 27 files in 277ms. Fixed 20 files.
 
