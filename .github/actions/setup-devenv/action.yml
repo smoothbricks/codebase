@@ -73,8 +73,10 @@ runs:
     # and that DB lives in workspace-data. Since CI and Publish sit in
     # different concurrency groups they run simultaneously on one host, so a
     # repository-wide tree let one workflow rewrite the other's graph state
-    # mid-read; that is what failed a release with a bare non-zero
-    # `nx show project`. Per lane they stay warm and never overlap.
+    # mid-read. CI concurrency is per workflow/ref, not workflow alone:
+    # separate PRs and jobs must never share mutable graph or eval state.
+    # Hash the exact identity (not a lossy path slug); keep cache artifacts
+    # and their metadata DB together, warm across runs of the same ref/job.
     - name: 📂 Locate the Nx cache on the shared bind
       if: steps.runner-kind.outputs.host == 'true'
       shell: bash
@@ -83,7 +85,8 @@ runs:
         NX_CACHE_LANE: ${{ github.workflow }}
       run: |
         lane=$(printf '%s' "$NX_CACHE_LANE" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9._-' '-')
-        NX_CACHE_ROOT="/var/cache/ci/nx/$NX_CACHE_REPO/${lane:-default}"
+        scope=$(printf '%s\0%s\0%s\0%s\0%s' "$GITHUB_WORKFLOW" "$GITHUB_REF" "$GITHUB_JOB" "$RUNNER_OS" "$RUNNER_ARCH" | git hash-object --stdin)
+        NX_CACHE_ROOT="/var/cache/ci/nx/$NX_CACHE_REPO/${lane:-default}/$scope"
         mkdir -p "$NX_CACHE_ROOT/cache" "$NX_CACHE_ROOT/workspace-data"
         {
           echo "NX_CACHE_DIRECTORY=$NX_CACHE_ROOT/cache"
@@ -99,8 +102,8 @@ runs:
     # .devenv (eval SQLite, gc roots, profile) and .direnv survive the job, so
     # the next job on this host evaluates nothing and downloads nothing. The
     # Actions cache segment below is the ephemeral runners' substitute for this.
-    # Scoped per job as well as lane: two jobs of one run are parallel, and one
-    # eval-cache.db has one writer.
+    # Scoped per workflow/ref/job/platform like Nx: separate PR runs and
+    # jobs can overlap, and one eval-cache.db must have only one writer.
     #
     # The eval cache keys on canonical absolute paths, and act's host executor
     # checks out under <cache>/<random 8 chars>/hostexecutor - a new path every
@@ -123,12 +126,13 @@ runs:
         DEVENV_STATE_JOB: ${{ github.job }}
       run: |
         lane=$(printf '%s' "$DEVENV_STATE_LANE" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9._-' '-')
-        root="/var/cache/ci/devenv/$DEVENV_STATE_REPO/${lane:-default}/$DEVENV_STATE_JOB"
+        scope=$(printf '%s\0%s\0%s\0%s\0%s' "$GITHUB_WORKFLOW" "$GITHUB_REF" "$GITHUB_JOB" "$RUNNER_OS" "$RUNNER_ARCH" | git hash-object --stdin)
+        root="/var/cache/ci/devenv/$DEVENV_STATE_REPO/${lane:-default}/$DEVENV_STATE_JOB/$scope"
         mkdir -p "$root/.devenv" "$root/.direnv"
         rm -rf tooling/direnv/.devenv tooling/direnv/.direnv
         ln -s "$root/.devenv" tooling/direnv/.devenv
         ln -s "$root/.direnv" tooling/direnv/.direnv
-        stable="/work/$DEVENV_STATE_REPO/${lane:-default}/$DEVENV_STATE_JOB"
+        stable="/work/$DEVENV_STATE_REPO/${lane:-default}/$DEVENV_STATE_JOB/$scope"
         if mkdir -p "$stable" && sudo mount --bind "$GITHUB_WORKSPACE" "$stable"; then
           echo "DEVENV_WORKDIR=$stable" >> "$GITHUB_ENV"
           echo "devenv state: $root (workspace bind-mounted at $stable)"
