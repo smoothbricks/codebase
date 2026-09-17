@@ -211,8 +211,7 @@ pub struct ProcessError {
     pub diagnostic: Option<ResultDiagnostic>,
 }
 
-const INITIAL_WORK_BUFFER_SIZE: usize = 64 * 1024;
-const INITIAL_FALLBACK_WORK_BUFFER_SIZE: usize = 16 * 1024;
+const INITIAL_WORK_BUFFER_SIZE: usize = 256;
 const MAX_WORK_BUFFER_SIZE: usize = MAX_VALUE_BYTES as usize;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -306,8 +305,8 @@ impl EventProcessor {
             last_validation_diagnostic: None,
             schema_config,
             options,
-            work_buffer: vec![0; INITIAL_WORK_BUFFER_SIZE],
-            fallback_work_buffer: vec![0; INITIAL_FALLBACK_WORK_BUFFER_SIZE],
+            work_buffer: Vec::new(),
+            fallback_work_buffer: Vec::new(),
         })
     }
 
@@ -747,6 +746,16 @@ impl EventProcessor {
         config: &ExtractionConfig,
         diagnostic: &mut json_extractor::ExtractionDiagnostic,
     ) -> Result<usize, json_extractor::ExtractionError> {
+        // A processor that never sees a format retains no scratch allocation
+        // for it. The first extraction starts small; overflow proves growth.
+        let buffer = if format == InputFormat::Json {
+            &mut self.fallback_work_buffer
+        } else {
+            &mut self.work_buffer
+        };
+        if buffer.is_empty() {
+            buffer.resize(INITIAL_WORK_BUFFER_SIZE, 0);
+        }
         loop {
             self.dynamic_columns.reset();
             let result = match format {
@@ -1077,10 +1086,8 @@ mod tests {
     /// the admission options surface the overflow — the drift axis pinned.
     #[test]
     fn msgpack_growth_is_options_dependent() {
-        // The undeclared carrier schema forces the msgpack workspace into use with
-        // an undeclared field large enough to overflow the initial 64K...
-        // growing 64K deliberately is slow; instead shrink the buffers to
-        // make the axis observable cheaply.
+        // An undeclared carrier forces the workspace into use. A small
+        // reservation makes the growth-policy boundary observable cheaply.
         let fields = vec![
             SignalSchemaField::new(ArrowType::Utf8, false),
             SignalSchemaField::new(ArrowType::Binary, true),
@@ -1117,6 +1124,54 @@ mod tests {
             ResultCode::Ok,
             "columine options: workspace grows and the batch succeeds"
         );
+    }
+
+    #[test]
+    fn lazy_workspaces_match_presized_carrier_extraction_across_growth() {
+        let fields = [
+            SignalSchemaField::new(ArrowType::Utf8, false),
+            SignalSchemaField::new(ArrowType::Binary, true),
+        ];
+        let names = format!("id\0{}\0", columine_parsing::UNDECLARED_COLUMN_NAME);
+        let schema = schema_with_names(&fields, names.as_bytes());
+        let options = ParseOptions {
+            base_path: false,
+            msgpack_growth: true,
+            diagnostics: true,
+        };
+        let mut lazy = EventProcessor::new(options, 2, schema.clone()).unwrap();
+        let mut presized = EventProcessor::new(options, 2, schema).unwrap();
+        presized.work_buffer.resize(64 * 1024, 0);
+        presized.fallback_work_buffer.resize(16 * 1024, 0);
+        let mut actual = vec![0; 256 * 1024];
+        let mut expected = vec![0; 256 * 1024];
+
+        for length in [0, 255, 256, 257, 4096, 65_537, 1] {
+            let value = "x".repeat(length);
+            let json = format!(r#"[{{"id":"a","extra":"{value}"}}]"#);
+            let mut msgpack = vec![0x82, 0xa2, b'i', b'd', 0xa1, b'a', 0xa5];
+            msgpack.extend(b"extra");
+            msgpack.push(0xdb);
+            msgpack.extend(u32::try_from(length).unwrap().to_be_bytes());
+            msgpack.extend(value.as_bytes());
+            for (input, format) in [
+                (json.as_bytes(), InputFormat::Json),
+                (msgpack.as_slice(), InputFormat::MsgpackStream),
+            ] {
+                assert_eq!(
+                    lazy.create_log_entry(input, format, &mut actual),
+                    ResultCode::Ok
+                );
+                assert_eq!(
+                    presized.create_log_entry(input, format, &mut expected),
+                    ResultCode::Ok
+                );
+                let (_, offset, length, rows, _) = read_result_header(&actual);
+                assert_eq!(rows, 1);
+                let end = (offset + length) as usize;
+                assert_eq!(&actual[..end], &expected[..end]);
+            }
+        }
     }
 
     /// A msgpack stream one event past the column plane is refused as
