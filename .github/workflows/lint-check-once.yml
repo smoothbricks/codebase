@@ -1,0 +1,110 @@
+name: Reproduce PR lint
+on:
+  push:
+    branches: [maintenance/lint-check-20260917]
+    paths: [.github/workflows/lint-check-once.yml]
+permissions:
+  contents: write
+  actions: read
+  pull-requests: read
+concurrency:
+  group: maintenance-lint-check-20260917
+  cancel-in-progress: false
+jobs:
+  lint:
+    if: github.repository == 'smoothbricks/codebase' && github.ref == 'refs/heads/maintenance/lint-check-20260917'
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          ref: 115142bc063ee989df55844d70117d3176bfc3fe
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
+        with:
+          bun-version: 1.3.13
+      - name: Install the frozen dependency graph
+        run: |
+          bun install --frozen-lockfile
+          echo "$GITHUB_WORKSPACE/node_modules/.bin" >> "$GITHUB_PATH"
+      - name: Reproduce the project's real Nx lint target
+        run: |
+          set +e
+          nx lint @smoothbricks/patchnote --output-style=static > "$RUNNER_TEMP/pr-lint.log" 2>&1
+          result=$?
+          printf '%s\n' "$result" > "$RUNNER_TEMP/pr-lint.exit"
+          tail -n 120 "$RUNNER_TEMP/pr-lint.log"
+          exit "$result"
+      - name: Retain focused linter diagnostics
+        if: always()
+        run: |
+          if test -x node_modules/.bin/biome; then
+            node_modules/.bin/biome check --files-ignore-unknown=true --diagnostic-level=error --max-diagnostics=100 packages/patchnote > "$RUNNER_TEMP/biome.log" 2>&1 || true
+          fi
+          if test -x node_modules/.bin/eslint; then
+            node_modules/.bin/eslint packages/patchnote/src --format=json > "$RUNNER_TEMP/eslint.json" 2> "$RUNNER_TEMP/eslint.log" || true
+          fi
+      - name: Record current checks and exact lint diagnostics
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 - <<'PY'
+          import base64, concurrent.futures, datetime, json, os, pathlib, re, urllib.error, urllib.parse, urllib.request
+          root = 'https://api.github.com/repos/smoothbricks/codebase/'
+          branch = 'maintenance/lint-check-20260917'
+          def api(path, data=None, method=None):
+              req = urllib.request.Request(root + path, data=None if data is None else json.dumps(data).encode(), method=method,
+                  headers={'Authorization':'Bearer '+os.environ['GH_TOKEN'], 'Accept':'application/vnd.github+json'})
+              with urllib.request.urlopen(req, timeout=60) as response:
+                  return json.load(response)
+          def save(path, text):
+              payload = {'message':'chore: record exact-head lint diagnostics [skip ci]', 'branch':branch,
+                  'content':base64.b64encode(text.encode()).decode()}
+              try:
+                  payload['sha'] = api('contents/'+path+'?ref='+urllib.parse.quote(branch, safe=''))['sha']
+              except urllib.error.HTTPError as error:
+                  if error.code != 404: raise
+              api('contents/'+path, payload, 'PUT')
+          tmp = pathlib.Path(os.environ['RUNNER_TEMP'])
+          parts = []
+          for name in ['pr-lint.log', 'biome.log', 'eslint.log']:
+              path = tmp/name
+              if path.is_file():
+                  text = re.sub(r'\x1b\[[0-9;]*[A-Za-z]', '', path.read_text())
+                  parts.append(name+'\n'+text[-90000:])
+          path = tmp/'eslint.json'
+          if path.is_file():
+              try:
+                  rows = json.loads(path.read_text())
+                  errors = [{'file': row['filePath'].removeprefix(os.getcwd()+'/'), 'messages': row['messages']} for row in rows if row['messages']]
+                  parts.append('ESLINT\n'+json.dumps(errors, indent=2))
+              except json.JSONDecodeError:
+                  parts.append(path.read_text()[-10000:])
+          save('maintenance/lint-20260917/pr-1.txt', '\n\n'.join(parts)+'\n')
+          def inspect(pr):
+              sha = pr['head']['sha']
+              runs = api('actions/runs?'+urllib.parse.urlencode({'head_sha':sha,'per_page':100}))['workflow_runs']
+              seen = set()
+              summaries = []
+              for run in runs:
+                  if run['workflow_id'] in seen: continue
+                  seen.add(run['workflow_id'])
+                  jobs = api(f"actions/runs/{run['id']}/jobs?per_page=100")['jobs']
+                  summaries.append({'id':run['id'],'name':run['name'],'status':run['status'],'conclusion':run['conclusion'],
+                      'jobs':[{'name':j['name'],'id':j['id'],'status':j['status'],'conclusion':j['conclusion'],
+                          'failed_steps':[s['name'] for s in j.get('steps',[]) if s.get('conclusion') == 'failure']} for j in jobs]})
+              return {'pr':pr['number'],'head':sha,'branch':pr['head']['ref'],'draft':pr['draft'],'runs':summaries}
+          with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+              checks = list(pool.map(inspect, api('pulls?state=open&per_page=100')))
+          result = {'inspected':datetime.datetime.now(datetime.timezone.utc).isoformat(),
+              'source':'115142bc063ee989df55844d70117d3176bfc3fe',
+              'lint_exit':int((tmp/'pr-lint.exit').read_text()) if (tmp/'pr-lint.exit').is_file() else None,
+              'verification_run':os.environ['GITHUB_RUN_ID'], 'open_prs':checks}
+          save('maintenance/lint-20260917/summary.json',json.dumps(result,indent=2)+'\n')
+          print(json.dumps(result,indent=2))
+          PY
