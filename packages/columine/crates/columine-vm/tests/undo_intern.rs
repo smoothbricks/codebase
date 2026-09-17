@@ -5,11 +5,14 @@
 
 use columine_types::types::{
     AggType, DERIVED_FACT_EMPTY_IDENTITY, DERIVED_FACT_TOMBSTONE_IDENTITY, EMPTY_KEY,
-    STATE_HEADER_SIZE, SlotMetaOffset, SlotType, TOMBSTONE,
+    STATE_HEADER_SIZE, SlotMetaOffset, SlotType,
 };
 use columine_vm::bitmap_ops::BitmapEnv;
 use columine_vm::bytes;
 use columine_vm::hash_table::{ENTRY_NONE, ENTRY_U32, FlatTable};
+use columine_vm::hashmap_ops::batch_map_remove;
+use columine_vm::hashset_ops::batch_set_remove;
+use columine_vm::hooks::NoVm;
 use columine_vm::meta::SlotMetaView;
 use columine_vm::undo_log::{
     FLAT_UNDO_ENTRY_SIZE, FlatUndoEntry, FlatUndoOp, rollback_agg_update, rollback_count_update,
@@ -105,12 +108,9 @@ fn rollback_map_delete_restores_key_value_and_increments_size() {
     let meta = meta_of(&state);
     let tbl = map_table(&meta);
 
-    // Insert then manually tombstone (simulating what the VM does on delete)
+    // Insert, then exercise the production deletion path before restoring it.
     tbl.upsert_u32(&mut state, 42, 100);
-    let pos = tbl.find(&state, 42).expect("inserted");
-    tbl.set_key_at(&mut state, pos, TOMBSTONE);
-    let size = tbl.size(&state);
-    tbl.set_size(&mut state, size - 1);
+    batch_map_remove(false, &mut state, &meta, 0, &[42], &mut NoVm);
     assert!(!tbl.contains(&state, 42));
 
     assert!(rollback_map_delete(&mut state, &meta, 42, 100, 0));
@@ -119,9 +119,9 @@ fn rollback_map_delete_restores_key_value_and_increments_size() {
     assert_eq!(tbl.size(&state), 1);
 }
 
-///  "rollbackSetInsert — tombstones element"
+/// Rollback removes a set insertion.
 #[test]
-fn rollback_set_insert_tombstones_element() {
+fn rollback_set_insert_removes_element() {
     let mut state = mk_slot_state(16, SlotType::HashSet as u8);
     let meta = meta_of(&state);
     let tbl = set_table(&meta);
@@ -200,10 +200,7 @@ fn rollback_set_delete_restores_element() {
     let tbl = set_table(&meta);
 
     tbl.insert_key(&mut state, 42);
-    let pos = tbl.find(&state, 42).expect("inserted");
-    tbl.set_key_at(&mut state, pos, TOMBSTONE);
-    let size = tbl.size(&state);
-    tbl.set_size(&mut state, size - 1);
+    batch_set_remove(false, &mut state, &meta, 0, &[42], &mut NoVm);
 
     assert!(rollback_set_delete(&mut state, &meta, 42));
     assert!(tbl.contains(&state, 42));
@@ -232,9 +229,8 @@ fn rollback_helpers_return_false_on_mismatched_state() {
 }
 
 // ---------------------------------------------------------------------------
-// Rollback round trips restore logical state, not byte-exact state: insert
-// rollback writes TOMBSTONE where the insert found EMPTY, and dead cells keep
-// stale value/timestamp bytes outside the live table.
+// Rollback round trips restore logical state. Cluster compaction can relocate
+// survivors, so byte placement is not the rollback contract.
 // ---------------------------------------------------------------------------
 
 /// Live logical content of a map slot: (key → (value, ts_bits)) + size.
@@ -257,19 +253,6 @@ fn set_content(state: &[u8], meta: &SlotMetaView) -> (Vec<u32>, u32) {
     let tbl = set_table(meta);
     let live: Vec<u32> = (1u32..=8).filter(|&k| tbl.contains(state, k)).collect();
     (live, tbl.size(state))
-}
-
-/// Pins the residue that makes rollback logical-not-byte-exact: rolling back
-/// a fresh insert leaves TOMBSTONE (), not EMPTY_KEY.
-#[test]
-fn rollback_of_insert_leaves_tombstone_not_empty() {
-    let mut state = mk_slot_state(16, HASHMAP_NO_TS);
-    let meta = meta_of(&state);
-    let tbl = map_table(&meta);
-    tbl.upsert_u32(&mut state, 42, 100);
-    let pos = tbl.find(&state, 42).unwrap();
-    assert!(rollback_map_insert(&mut state, &meta, 42));
-    assert_eq!(tbl.key_at(&state, pos), TOMBSTONE);
 }
 
 /// A journaled map mutation, as 's map paths would record it.
@@ -350,9 +333,7 @@ proptest! {
                         let prev_value = tbl.entry_u32_at(&state, pos);
                         let toff = ts_off(&meta, pos);
                         let prev_ts_bits = u64::from_le_bytes(state[toff..toff + 8].try_into().unwrap());
-                        tbl.set_key_at(&mut state, pos, TOMBSTONE);
-                        let size = tbl.size(&state);
-                        tbl.set_size(&mut state, size - 1);
+                        batch_map_remove(false, &mut state, &meta, 0, &[key], &mut NoVm);
                         journal.push(FlatUndoEntry {
                             op: FlatUndoOp::MapDelete,
                             slot: 0, pad1: 0, pad2: 0,
@@ -404,10 +385,8 @@ proptest! {
                         slot: 0, pad1: 0, pad2: 0, key, prev_value: 0, aux: 0,
                     });
                 }
-            } else if let Some(pos) = tbl.find(&state, key) {
-                tbl.set_key_at(&mut state, pos, TOMBSTONE);
-                let size = tbl.size(&state);
-                tbl.set_size(&mut state, size - 1);
+            } else if tbl.find(&state, key).is_some() {
+                batch_set_remove(false, &mut state, &meta, 0, &[key], &mut NoVm);
                 journal.push(FlatUndoEntry {
                     op: FlatUndoOp::SetDelete,
                     slot: 0, pad1: 0, pad2: 0, key, prev_value: 0, aux: 0,

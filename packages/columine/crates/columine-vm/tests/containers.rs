@@ -355,46 +355,6 @@ fn iteration_order_pinned_with_collision() {
     assert_eq!(seq, vec![(1, 20), (5, 4), (6, 30), (7, 1), (8, 10)]);
 }
 
-/// Tombstone reuse changes placement and iteration order: after removing 4,
-/// reinserting 30 probes past the tombstone, while inserting 36 reuses it.
-#[test]
-fn iteration_order_after_tombstone_reuse() {
-    let mut buf = vec![0u8; 4096];
-    let state_meta = {
-        let mut s = mk_slot_state(16, 0x01); // HASHSET
-        std::mem::swap(&mut buf, &mut s);
-        meta_of(&buf)
-    };
-    let mut hooks = NoVm;
-    assert_eq!(
-        batch_set_insert(
-            false,
-            &mut buf,
-            &state_meta,
-            0,
-            &[1, 4, 10, 20, 30],
-            None,
-            &mut hooks
-        ),
-        ErrorCode::Ok
-    );
-    batch_set_remove(false, &mut buf, &state_meta, 0, &[4], &mut hooks);
-
-    let tbl = bind_slot_set(&state_meta);
-    // 30 still found via probe past the tombstone at its home slot 5.
-    assert!(tbl.contains(&buf, 30));
-    assert_eq!(tbl.find(&buf, 30), Some(6));
-
-    // hash_key(50,16) == 5 (computed): the tombstone slot is reused.
-    assert_eq!(hash_key(50, 16), 5);
-    assert_eq!(
-        batch_set_insert(false, &mut buf, &state_meta, 0, &[50], None, &mut hooks),
-        ErrorCode::Ok
-    );
-    let seq: Vec<(u32, u32)> = tbl.iter_live(&buf).collect();
-    assert_eq!(seq, vec![(1, 20), (5, 50), (6, 30), (7, 1), (8, 10)]);
-}
-
 // ---------------------------------------------------------------------------
 //  test blocks
 // ---------------------------------------------------------------------------
@@ -550,9 +510,9 @@ fn batch_upsert_latest_f64() {
     assert_eq!(tbl.get_u32(&state, 10), Some(200));
 }
 
-///  `test "batchMapRemove — removes and tombstones"`
+/// Removing a key preserves the remaining map and publishes its change flag.
 #[test]
-fn batch_remove_tombstones() {
+fn batch_remove_preserves_other_keys() {
     let mut state = mk_slot_state(16, 0x00);
     let meta = meta_of(&state);
     let mut hooks = NoVm;
@@ -926,7 +886,7 @@ fn single_upsert_i64_mode() {
 /// Additional coverage: single-key removal mirrors batch removal and is
 /// exercised directly here.
 #[test]
-fn single_remove_tombstones() {
+fn single_remove_preserves_other_entries() {
     let mut state = mk_slot_state(16, 0x40);
     let meta = meta_of(&state);
     let mut hooks = NoVm;
@@ -1059,9 +1019,9 @@ fn set_remove_one_at_a_time_works() {
 }
 
 // ---------------------------------------------------------------------------
-// Property tests independently re-derive placement from the hash-table
-// specification (home slot, linear probing, first-tombstone reuse, 70% load).
-// They compare full key-region bytes, so probe and sentinel drift fails loudly.
+// The control model retains the prior tombstone kernel. The differential
+// checks its membership/admission semantics against compacting deletion;
+// rehash placement remains a separately tested byte-level contract.
 // ---------------------------------------------------------------------------
 
 struct RefModel {
@@ -1265,9 +1225,8 @@ proptest! {
 }
 
 proptest! {
-    /// Arbitrary insert/remove interleavings: the keys-region BYTES equal the
-    /// reference model cell-for-cell, size matches, and the live-key
-    /// iteration sequence (the `vm_map_iter_*` order) matches exactly.
+    /// Differential against the pre-compaction tombstone kernel. Logical
+    /// membership and admission must agree even though physical cells move.
     #[test]
     fn set_ops_match_reference_model(ops in proptest::collection::vec(op_strategy(), 0..200)) {
         let cap = 16u32;
@@ -1291,23 +1250,20 @@ proptest! {
 
         let tbl = bind_slot_set(&meta);
         prop_assert_eq!(tbl.size(&state), model.size);
-        for pos in 0..cap {
-            prop_assert_eq!(tbl.key_at(&state, pos), model.cells[pos as usize],
-                "cell {} diverged", pos);
-        }
-        let seq: Vec<(u32, u32)> = tbl.iter_live(&state).collect();
-        prop_assert_eq!(seq, model.live_seq());
+        let mut actual: Vec<u32> = tbl.iter_live(&state).map(|(_, key)| key).collect();
+        let mut expected: Vec<u32> = model.live_seq().into_iter().map(|(_, key)| key).collect();
+        actual.sort_unstable();
+        expected.sort_unstable();
+        prop_assert_eq!(actual, expected);
     }
 
-    /// Map contents differential vs std::HashMap under Last strategy, plus
-    /// model byte-parity of the keys region.
+    /// Map contents differential vs std::HashMap under Last strategy.
     #[test]
     fn map_last_matches_std_hashmap(ops in proptest::collection::vec(op_strategy(), 0..200)) {
         let cap = 32u32;
         let mut state = mk_slot_state(cap, 0x40); // HASHMAP, no timestamps
         let meta = meta_of(&state);
         let mut hooks = NoVm;
-        let mut model = RefModel::new(cap);
         let mut oracle: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
 
         for (n, op) in ops.iter().enumerate() {
@@ -1319,7 +1275,6 @@ proptest! {
                         Strategy::Last, false, &mut state, &meta, 0,
                         &[k], &[v], None, CmpType::F64, &mut hooks,
                     );
-                    model.insert(k);
                     // Oracle updates only when the table accepted the write:
                     // overwrite always lands; a NEW key lands unless refused
                     // by the load factor (CapacityExceeded).
@@ -1331,7 +1286,6 @@ proptest! {
                 }
                 Op::Remove(k) => {
                     batch_map_remove(false, &mut state, &meta, 0, &[k], &mut hooks);
-                    model.remove(k);
                     oracle.remove(&k);
                 }
             }
@@ -1341,9 +1295,6 @@ proptest! {
         prop_assert_eq!(tbl.size(&state), oracle.len() as u32);
         for (&k, &v) in &oracle {
             prop_assert_eq!(tbl.get_u32(&state, k), Some(v));
-        }
-        for pos in 0..cap {
-            prop_assert_eq!(tbl.key_at(&state, pos), model.cells[pos as usize]);
         }
     }
 
@@ -1382,4 +1333,71 @@ proptest! {
             prop_assert_eq!(dst.get_u32(&buf, k), Some(v));
         }
     }
+}
+
+#[test]
+fn wrapped_cluster_deletion_preserves_comparison_values_through_undo() {
+    let mut state = mk_slot_state(16, 0x00);
+    let meta = meta_of(&state);
+    let table = bind_slot_map(&meta);
+    let mut hooks = NoVm;
+    let timestamps: Vec<u8> = [10u64, 20, 30]
+        .into_iter()
+        .flat_map(u64::to_le_bytes)
+        .collect();
+    assert_eq!(
+        batch_map_upsert(
+            Strategy::Latest,
+            false,
+            &mut state,
+            &meta,
+            0,
+            &[3, 18, 24],
+            &[30, 180, 240],
+            Some(&timestamps),
+            CmpType::I64,
+            &mut hooks,
+        ),
+        ErrorCode::Ok,
+    );
+    // These keys share home cell 15, so removing 3 moves 18 across the wrap.
+    batch_map_remove(false, &mut state, &meta, 0, &[3], &mut hooks);
+    assert_eq!(
+        single_map_upsert(
+            Strategy::Latest,
+            false,
+            &mut state,
+            &meta,
+            0,
+            18,
+            999,
+            19,
+            CmpType::I64,
+            &mut hooks,
+        ),
+        ErrorCode::Ok,
+    );
+    assert_eq!(table.get_u32(&state, 18), Some(180));
+    assert!(columine_vm::undo_log::rollback_map_insert(
+        &mut state, &meta, 24
+    ));
+    assert_eq!(
+        single_map_upsert(
+            Strategy::Latest,
+            false,
+            &mut state,
+            &meta,
+            0,
+            18,
+            181,
+            21,
+            CmpType::I64,
+            &mut hooks,
+        ),
+        ErrorCode::Ok,
+    );
+    assert_eq!(table.get_u32(&state, 18), Some(181));
+    assert_eq!(table.get_u32(&state, 3), None);
+    assert_eq!(table.get_u32(&state, 24), None);
+    assert_eq!(table.size(&state), 1);
 }

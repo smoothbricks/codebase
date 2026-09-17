@@ -171,6 +171,8 @@ pub(crate) fn find_key_pair(
 /// Index of the first live key cell at or after `from`, or `cap` when the scan
 /// is exhausted. This ascending-cell order is THE iteration ABI exported to
 /// TypeScript backends; both sentinels mark dead cells and are skipped.
+/// Deletion may move a surviving key across the scan cursor (including wrapping
+/// from cell zero to the last cell); a mutation invalidates a saved position.
 #[inline]
 pub(crate) fn next_live_key(state: &[u8], keys_off: u32, cap: u32, from: u32) -> u32 {
     (from..cap)
@@ -361,6 +363,43 @@ impl FlatTable {
         let size = self.size(state);
         self.set_size(state, size + 1);
         Some(true)
+    }
+
+    /// Erase a known live cell by closing its linear-probe cluster. No tombstone
+    /// remains. `moved` carries an optional caller-owned side lane along with
+    /// each relocated entry. The returned final vacancy lets that caller clear
+    /// the side lane too. Size publication belongs to the caller, so eviction
+    /// can still publish its batch count once.
+    ///
+    /// Admission leaves an empty cell (70% maximum load); every follower moves
+    /// only when its probe path crosses the hole. All positions are mask-wrapped.
+    pub fn erase_at(
+        &self,
+        state: &mut [u8],
+        mut hole: u32,
+        mut moved: impl FnMut(&mut [u8], u32, u32),
+    ) -> u32 {
+        debug_assert!(self.cap.is_power_of_two());
+        debug_assert!(self.key_at(state, hole) < TOMBSTONE);
+        let mask = self.cap - 1;
+        let mut scan = (hole + 1) & mask;
+        while self.key_at(state, scan) != EMPTY_KEY {
+            let key = self.key_at(state, scan);
+            let home = hash_key(key, self.cap);
+            if (scan.wrapping_sub(home) & mask) >= (scan.wrapping_sub(hole) & mask) {
+                self.set_key_at(state, hole, key);
+                if self.entry_size != 0 {
+                    self.raw_entry_copy(state, self.entries_off + scan * self.entry_size, hole);
+                }
+                moved(state, scan, hole);
+                hole = scan;
+            }
+            scan = (scan + 1) & mask;
+        }
+        self.set_key_at(state, hole, EMPTY_KEY);
+        let start = (self.entries_off + hole * self.entry_size) as usize;
+        state[start..start + self.entry_size as usize].fill(0);
+        hole
     }
 
     /// Move live entries into a fresh inline-header table. The destination has

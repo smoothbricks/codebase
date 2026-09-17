@@ -11,7 +11,10 @@ pub const STATE_HEADER_SIZE: u32 = 32;
 pub const PROGRAM_HASH_PREFIX: u32 = 32;
 pub const PROGRAM_HEADER_SIZE: u32 = 46;
 pub const RETE_HEADER_SIZE: u32 = 16;
-pub const STATE_FORMAT_VERSION: u8 = 2;
+/// Format 3 uses compacting flat-map/set deletion. Older images must be
+/// reinitialized by the consumer before execution; their tombstones are not
+/// valid input to a compaction kernel.
+pub const STATE_FORMAT_VERSION: u8 = 3;
 /// Program-format magic in little-endian wire order: ASCII bytes `C L M 1`.
 pub const PROGRAM_MAGIC: u32 = 0x314D_4C43;
 /// The default program-magic acceptance set for public embedders.

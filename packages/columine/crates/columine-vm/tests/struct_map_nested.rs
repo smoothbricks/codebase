@@ -937,9 +937,9 @@ proptest! {
             }
         }
 
-        // Iteration: the exported walk, the bound view, and the model must all
-        // agree. Flat and unary struct tables share the home position, so their
-        // cell sequences are identical, not merely equivalent as sets.
+        // Exported and bound walks agree within each layout. Flat tables
+        // compact on deletion; struct tables retain stable tombstone positions,
+        // so only logical membership is comparable between those layouts.
         let bound: Vec<(u32, u32, u32)> = map
             .iter_live(&map_state)
             .map(|(pos, key)| (pos, key, map.entry_u32_at(&map_state, pos)))
@@ -977,7 +977,10 @@ proptest! {
                 .push((pos, vm_struct_map_iter_key(&struct_state, SLOT_OFFSET, 1, pos)));
             pos = vm_struct_map_iter_next(&struct_state, SLOT_OFFSET, capacity, 1, pos);
         }
-        prop_assert_eq!(&struct_cells, &live_cells);
+        prop_assert_eq!(
+            struct_cells.iter().map(|&(_, key)| key).collect::<std::collections::BTreeSet<_>>(),
+            live_cells.iter().map(|&(_, key)| key).collect::<std::collections::BTreeSet<_>>()
+        );
 
         // Exact-pair tables home on `hash_key_pair`, so only the key set is
         // comparable across layouts, never the cell order.

@@ -2694,3 +2694,25 @@ fn ts_scalar_latest_program_writes_value_and_cmp() {
     assert_eq!(42.5, value, "scalar value written");
     assert_eq!(5000.0, cmp_ts, "cmp timestamp written");
 }
+
+#[test]
+fn incompatible_state_format_is_refused_without_mutating_the_image() {
+    let program = build_test_program(16, 0);
+    let mut state = init(&program);
+    state[columine_types::types::StateHeaderOffset::FORMAT_VERSION as usize] =
+        columine_types::types::STATE_FORMAT_VERSION - 1;
+    let before = state.clone();
+    let mut vm = Vm::default();
+    let keys = [3u32];
+    let values = [30u32];
+    let cols = [u32s_as_bytes(&keys), u32s_as_bytes(&values)];
+    assert_eq!(
+        vm.execute_batch(&mut state, &program, &cols, 1),
+        ErrorCode::InvalidState as u32
+    );
+    assert_eq!(
+        vm.evict_all_expired(&mut state, 100.0),
+        Err(ErrorCode::InvalidState)
+    );
+    assert_eq!(state, before);
+}

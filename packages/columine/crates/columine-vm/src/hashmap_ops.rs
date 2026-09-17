@@ -292,7 +292,27 @@ pub fn batch_map_upsert(
     ErrorCode::Ok
 }
 
-/// Remove a batch of keys by writing tombstones.
+/// Compact a map cell and its optional comparison/timestamp side lane. The
+/// caller already resolved the cell and owns size/change-flag publication.
+pub(crate) fn erase_slot_map_at(
+    state: &mut [u8],
+    meta: &SlotMetaView,
+    table: &FlatTable,
+    pos: u32,
+) {
+    let has_timestamps = meta.has_hashmap_timestamp_storage();
+    let hole = table.erase_at(state, pos, |state, from, to| {
+        if has_timestamps {
+            let value = read_cmp_slot(state, meta, from);
+            write_cmp_slot(state, meta, to, value);
+        }
+    });
+    if has_timestamps {
+        write_cmp_slot(state, meta, hole, 0);
+    }
+}
+
+/// Remove a batch of keys by closing their probe clusters.
 pub fn batch_map_remove(
     delta_mode: bool,
     state: &mut [u8],
@@ -346,7 +366,7 @@ pub fn batch_map_remove(
             hooks.remove_ttl_entries_for_key(state, meta, key);
         }
 
-        tbl.set_key_at(state, pos, columine_types::types::TOMBSTONE);
+        erase_slot_map_at(state, meta, &tbl, pos);
         let size = tbl.size(state);
         tbl.set_size(state, size - 1);
         had_remove = true;

@@ -180,15 +180,15 @@ fn ts_off(meta: &SlotMetaView, pos: u32) -> u32 {
     meta.offset + meta.capacity * 8 + pos * 8
 }
 
-// Rollback is logical rather than byte-exact: inserts leave TOMBSTONE keys,
-// and dead cells retain stale value/timestamp bytes outside the logical table.
-/// Roll back a map insertion by writing a tombstone and decrementing size.
+// Rollback restores logical contents. Compaction can relocate surviving keys,
+// so a saved physical iterator position does not survive an undo operation.
+/// Roll back a map insertion by closing the probe cluster and decrementing size.
 pub fn rollback_map_insert(state: &mut [u8], meta: &SlotMetaView, key: u32) -> bool {
     let tbl = bind_map(meta);
     let Some(pos) = tbl.find(state, key) else {
         return false;
     };
-    tbl.set_key_at(state, pos, columine_types::types::TOMBSTONE);
+    crate::hashmap_ops::erase_slot_map_at(state, meta, &tbl, pos);
     let size = tbl.size(state);
     tbl.set_size(state, size - 1);
     true
@@ -266,13 +266,13 @@ pub fn rollback_scalar_update(state: &mut [u8], meta: &SlotMetaView, value: u64,
     bytes::write_f64(state, meta.offset + 8, ts);
 }
 
-/// Roll back a set insertion by writing a tombstone and decrementing size.
+/// Roll back a set insertion by closing the probe cluster and decrementing size.
 pub fn rollback_set_insert(state: &mut [u8], meta: &SlotMetaView, elem: u32) -> bool {
     let tbl = bind_set(meta);
     let Some(pos) = tbl.find(state, elem) else {
         return false;
     };
-    tbl.set_key_at(state, pos, columine_types::types::TOMBSTONE);
+    tbl.erase_at(state, pos, |_, _, _| {});
     let size = tbl.size(state);
     tbl.set_size(state, size - 1);
     true

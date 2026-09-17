@@ -36,8 +36,9 @@ use columine_types::DEFAULT_ACCEPTED_PROGRAM_MAGICS;
 use columine_types::types::{
     AggType, ChangeFlag, DERIVED_FACT_TOMBSTONE_IDENTITY, EMPTY_KEY, ErrorCode,
     MAX_GUARD_COMPONENTS, MAX_SCATTER_ROUTES, Opcode, PROGRAM_HASH_PREFIX, PROGRAM_HEADER_SIZE,
-    ProgramHeader, SLOT_META_SIZE, STATE_HEADER_SIZE, STATE_MAGIC, SlotMetaOffset, SlotType,
-    StateHeaderOffset, StructFieldType, TOMBSTONE, align8, struct_field_size,
+    ProgramHeader, SLOT_META_SIZE, STATE_FORMAT_VERSION, STATE_HEADER_SIZE, STATE_MAGIC,
+    SlotMetaOffset, SlotType, StateHeaderOffset, StructFieldType, TOMBSTONE, align8,
+    struct_field_size,
 };
 use core::sync::atomic::Ordering;
 
@@ -341,7 +342,7 @@ fn remove_entry_by_key(
             let tbl = hashmap_ops::bind_slot_map(meta);
             match tbl.find(state, key) {
                 Some(pos) => {
-                    tbl.set_key_at(state, pos, TOMBSTONE);
+                    hashmap_ops::erase_slot_map_at(state, meta, &tbl, pos);
                     true
                 }
                 None => false,
@@ -351,7 +352,7 @@ fn remove_entry_by_key(
             let tbl = hashset_ops::bind_slot_set(meta);
             match tbl.find(state, key) {
                 Some(pos) => {
-                    tbl.set_key_at(state, pos, TOMBSTONE);
+                    tbl.erase_at(state, pos, |_, _, _| {});
                     true
                 }
                 None => false,
@@ -2955,7 +2956,9 @@ impl Vm {
 
     /// Evict every expired entry, returning a count that cannot collide with an error.
     pub fn evict_all_expired(&mut self, state: &mut [u8], now: f64) -> Result<u32, ErrorCode> {
-        if bytes::read_u32(state, 0) != STATE_MAGIC {
+        if bytes::read_u32(state, 0) != STATE_MAGIC
+            || state[StateHeaderOffset::FORMAT_VERSION as usize] != STATE_FORMAT_VERSION
+        {
             return Err(ErrorCode::InvalidState);
         }
         let num_slots = state[StateHeaderOffset::NUM_SLOTS as usize];
@@ -2980,7 +2983,9 @@ impl Vm {
         batch_len: u32,
         mut live: Option<&mut LiveColumns<'_, '_>>,
     ) -> u32 {
-        if bytes::read_u32(state, 0) != STATE_MAGIC {
+        if bytes::read_u32(state, 0) != STATE_MAGIC
+            || state[StateHeaderOffset::FORMAT_VERSION as usize] != STATE_FORMAT_VERSION
+        {
             return INVALID_STATE;
         }
         if (program.len() as u32) < PROGRAM_HEADER_SIZE {

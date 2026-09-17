@@ -6,7 +6,7 @@
 use crate::hash_table::{ENTRY_NONE, FlatTable};
 use crate::hooks::{MutationRecord, VmHooks};
 use crate::meta::SlotMetaView;
-use columine_types::types::{ChangeFlag, ErrorCode, SlotMetaOffset, SlotType, TOMBSTONE};
+use columine_types::types::{ChangeFlag, ErrorCode, SlotMetaOffset, SlotType};
 
 /// Bind the key-only table for a HASHSET slot.
 pub fn bind_slot_set(meta: &SlotMetaView) -> FlatTable {
@@ -150,7 +150,7 @@ pub fn batch_set_remove(
             hooks.remove_ttl_entries_for_key(state, meta, elem);
         }
 
-        tbl.set_key_at(state, pos, TOMBSTONE);
+        tbl.erase_at(state, pos, |_, _, _| {});
         let size = tbl.size(state);
         tbl.set_size(state, size - 1);
         had_remove = true;
