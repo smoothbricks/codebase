@@ -1,4 +1,4 @@
-name: Reproduce PR lint
+name: Verify PR lint repair
 on:
   push:
     branches: [maintenance/lint-check-20260917]
@@ -14,8 +14,15 @@ jobs:
   lint:
     if: github.repository == 'smoothbricks/codebase' && github.ref == 'refs/heads/maintenance/lint-check-20260917'
     runs-on: ubuntu-latest
-    timeout-minutes: 12
+    timeout-minutes: 15
     steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+      - name: Retain reviewed repair helpers
+        run: |
+          cp maintenance/fix_patchnote_lint.mjs "$RUNNER_TEMP/repair-source.mjs"
+          cp maintenance/fix_patchnote_lint_checked.mjs "$RUNNER_TEMP/repair-checked.mjs"
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
           ref: 115142bc063ee989df55844d70117d3176bfc3fe
@@ -27,84 +34,112 @@ jobs:
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
         with:
           bun-version: 1.3.13
-      - name: Install the frozen dependency graph
+      - name: Install the exact original dependency graph
         run: |
           bun install --frozen-lockfile
           echo "$GITHUB_WORKSPACE/node_modules/.bin" >> "$GITHUB_PATH"
-      - name: Reproduce the project's real Nx lint target
+      - name: Apply guarded type and validation repairs
+        env:
+          REPAIR_SOURCE: ${{ runner.temp }}/repair-source.mjs
+        run: node "$RUNNER_TEMP/repair-checked.mjs"
+      - name: Update only the newly declared dependency edges and format the patch
+        run: |
+          bun install --lockfile-only --ignore-scripts
+          bun install --frozen-lockfile
+          python3 - <<'PY'
+          import json, os, subprocess
+          paths = json.load(open(os.environ['RUNNER_TEMP']+'/patchnote-changed.json'))
+          subprocess.run(['biome','check','--write','--files-ignore-unknown=true',*paths],check=True)
+          PY
+      - name: Verify the real lint target and its build and types prerequisites
+        id: lint
         run: |
           set +e
-          nx lint @smoothbricks/patchnote --output-style=static > "$RUNNER_TEMP/pr-lint.log" 2>&1
+          nx lint @smoothbricks/patchnote --output-style=static > "$RUNNER_TEMP/verify-lint.log" 2>&1
           result=$?
-          printf '%s\n' "$result" > "$RUNNER_TEMP/pr-lint.exit"
-          tail -n 120 "$RUNNER_TEMP/pr-lint.log"
+          printf '%s\n' "$result" > "$RUNNER_TEMP/verify-lint.exit"
+          tail -n 130 "$RUNNER_TEMP/verify-lint.log"
           exit "$result"
-      - name: Retain focused linter diagnostics
-        if: always()
+      - name: Run the full package test target
+        id: tests
         run: |
-          if test -x node_modules/.bin/biome; then
-            node_modules/.bin/biome check --files-ignore-unknown=true --diagnostic-level=error --max-diagnostics=100 packages/patchnote > "$RUNNER_TEMP/biome.log" 2>&1 || true
-          fi
-          if test -x node_modules/.bin/eslint; then
-            node_modules/.bin/eslint packages/patchnote/src --format=json > "$RUNNER_TEMP/eslint.json" 2> "$RUNNER_TEMP/eslint.log" || true
-          fi
-      - name: Record current checks and exact lint diagnostics
+          set +e
+          nx test @smoothbricks/patchnote --output-style=static > "$RUNNER_TEMP/verify-tests.log" 2>&1
+          result=$?
+          printf '%s\n' "$result" > "$RUNNER_TEMP/verify-tests.exit"
+          tail -n 130 "$RUNNER_TEMP/verify-tests.log"
+          exit "$result"
+      - name: Verify the built CLI and validation outside Bun's preload
+        id: packed
+        run: |
+          node packages/patchnote/dist/cli.js --help
+          node --input-type=module <<'JS'
+          import assert from 'node:assert/strict';
+          import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises';
+          import { tmpdir } from 'node:os';
+          import { join } from 'node:path';
+          import { loadConfig, defaultConfig } from './packages/patchnote/dist/index.js';
+          const root = await mkdtemp(join(tmpdir(),'patchnote-built-'));
+          try {
+            await mkdir(join(root,'tooling'));
+            const path = join(root,'tooling/patchnote.json');
+            await writeFile(path,JSON.stringify({prStrategy:{maxStackDepth:12}}));
+            assert.equal((await loadConfig(root,'tooling/patchnote.json')).prStrategy.maxStackDepth,12);
+            await writeFile(path,JSON.stringify({prStrategy:{maxStackDepth:'invalid'}}));
+            assert.equal((await loadConfig(root,'tooling/patchnote.json')).prStrategy.maxStackDepth,defaultConfig.prStrategy.maxStackDepth);
+          } finally { await rm(root,{recursive:true,force:true}); }
+          console.log('Built Node validation passed');
+          JS
+          git diff --check
+      - name: Record diagnostics and prepare a verified commit without moving the PR
         if: always()
         env:
           GH_TOKEN: ${{ github.token }}
+          LINT_OUTCOME: ${{ steps.lint.outcome }}
+          TEST_OUTCOME: ${{ steps.tests.outcome }}
+          PACKED_OUTCOME: ${{ steps.packed.outcome }}
         run: |
           python3 - <<'PY'
-          import base64, concurrent.futures, datetime, json, os, pathlib, re, urllib.error, urllib.parse, urllib.request
-          root = 'https://api.github.com/repos/smoothbricks/codebase/'
-          branch = 'maintenance/lint-check-20260917'
-          def api(path, data=None, method=None):
-              req = urllib.request.Request(root + path, data=None if data is None else json.dumps(data).encode(), method=method,
-                  headers={'Authorization':'Bearer '+os.environ['GH_TOKEN'], 'Accept':'application/vnd.github+json'})
-              with urllib.request.urlopen(req, timeout=60) as response:
-                  return json.load(response)
-          def save(path, text):
-              payload = {'message':'chore: record exact-head lint diagnostics [skip ci]', 'branch':branch,
-                  'content':base64.b64encode(text.encode()).decode()}
-              try:
-                  payload['sha'] = api('contents/'+path+'?ref='+urllib.parse.quote(branch, safe=''))['sha']
+          import base64, json, os, pathlib, re, subprocess, urllib.error, urllib.parse, urllib.request
+          root='https://api.github.com/repos/smoothbricks/codebase/'
+          branch='maintenance/lint-check-20260917'
+          expected='115142bc063ee989df55844d70117d3176bfc3fe'
+          def api(path,data=None,method=None):
+              request=urllib.request.Request(root+path,data=None if data is None else json.dumps(data).encode(),method=method,
+                  headers={'Authorization':'Bearer '+os.environ['GH_TOKEN'],'Accept':'application/vnd.github+json'})
+              with urllib.request.urlopen(request,timeout=60) as response: return json.load(response)
+          def save(path,text):
+              payload={'message':'chore: retain lint repair verification [skip ci]','branch':branch,'content':base64.b64encode(text.encode()).decode()}
+              try: payload['sha']=api('contents/'+path+'?ref='+urllib.parse.quote(branch,safe=''))['sha']
               except urllib.error.HTTPError as error:
-                  if error.code != 404: raise
-              api('contents/'+path, payload, 'PUT')
-          tmp = pathlib.Path(os.environ['RUNNER_TEMP'])
-          parts = []
-          for name in ['pr-lint.log', 'biome.log', 'eslint.log']:
-              path = tmp/name
-              if path.is_file():
-                  text = re.sub(r'\x1b\[[0-9;]*[A-Za-z]', '', path.read_text())
-                  parts.append(name+'\n'+text[-90000:])
-          path = tmp/'eslint.json'
-          if path.is_file():
-              try:
-                  rows = json.loads(path.read_text())
-                  errors = [{'file': row['filePath'].removeprefix(os.getcwd()+'/'), 'messages': row['messages']} for row in rows if row['messages']]
-                  parts.append('ESLINT\n'+json.dumps(errors, indent=2))
-              except json.JSONDecodeError:
-                  parts.append(path.read_text()[-10000:])
-          save('maintenance/lint-20260917/pr-1.txt', '\n\n'.join(parts)+'\n')
-          def inspect(pr):
-              sha = pr['head']['sha']
-              runs = api('actions/runs?'+urllib.parse.urlencode({'head_sha':sha,'per_page':100}))['workflow_runs']
-              seen = set()
-              summaries = []
-              for run in runs:
-                  if run['workflow_id'] in seen: continue
-                  seen.add(run['workflow_id'])
-                  jobs = api(f"actions/runs/{run['id']}/jobs?per_page=100")['jobs']
-                  summaries.append({'id':run['id'],'name':run['name'],'status':run['status'],'conclusion':run['conclusion'],
-                      'jobs':[{'name':j['name'],'id':j['id'],'status':j['status'],'conclusion':j['conclusion'],
-                          'failed_steps':[s['name'] for s in j.get('steps',[]) if s.get('conclusion') == 'failure']} for j in jobs]})
-              return {'pr':pr['number'],'head':sha,'branch':pr['head']['ref'],'draft':pr['draft'],'runs':summaries}
-          with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
-              checks = list(pool.map(inspect, api('pulls?state=open&per_page=100')))
-          result = {'inspected':datetime.datetime.now(datetime.timezone.utc).isoformat(),
-              'source':'115142bc063ee989df55844d70117d3176bfc3fe',
-              'lint_exit':int((tmp/'pr-lint.exit').read_text()) if (tmp/'pr-lint.exit').is_file() else None,
-              'verification_run':os.environ['GITHUB_RUN_ID'], 'open_prs':checks}
-          save('maintenance/lint-20260917/summary.json',json.dumps(result,indent=2)+'\n')
+                  if error.code!=404: raise
+              api('contents/'+path,payload,'PUT')
+          tmp=pathlib.Path(os.environ['RUNNER_TEMP'])
+          result={'source':expected,'run_id':os.environ['GITHUB_RUN_ID'],'lint':os.environ['LINT_OUTCOME'],'tests':os.environ['TEST_OUTCOME'],'built_node':os.environ['PACKED_OUTCOME']}
+          for name in ['verify-lint','verify-tests']:
+              path=tmp/(name+'.log')
+              if path.exists():
+                  text=re.sub(r'\x1b\[[0-9;]*[A-Za-z]','',path.read_text())
+                  save('maintenance/lint-20260917/'+name+'.txt',text[-180000:]+'\n')
+          listed=tmp/'patchnote-changed.json'
+          if listed.exists():
+              paths=json.loads(listed.read_text())+['bun.lock']
+              extras=subprocess.check_output(['git','diff','--name-only'],text=True).splitlines()
+              paths+= [p for p in extras if p.startswith('packages/patchnote/') and p.endswith('.json')]
+              paths=sorted(set(paths))
+              assert all(p.startswith('packages/patchnote/') or p=='bun.lock' for p in paths)
+              subprocess.run(['git','add','--intent-to-add','--',*paths],check=True)
+              diff=subprocess.check_output(['git','diff','--',*paths],text=True)
+              save('maintenance/lint-20260917/repair.diff',diff)
+              result['paths']=paths
+              if all(result[k]=='success' for k in ['lint','tests','built_node']):
+                  assert api('pulls/1')['head']['sha']==expected,'PR head changed; refuse stale candidate'
+                  entries=[{'path':p,'mode':'100644','type':'blob','content':pathlib.Path(p).read_text()} for p in paths]
+                  parent=api('git/commits/'+expected)
+                  tree=api('git/trees',{'base_tree':parent['tree']['sha'],'tree':entries},'POST')
+                  commit=api('git/commits',{'message':'fix(patchnote): validate external data and remove unsafe assertions','tree':tree['sha'],'parents':[expected]},'POST')
+                  result['candidate']=commit['sha']
+                  result['tree']=tree['sha']
+          save('maintenance/lint-20260917/verification.json',json.dumps(result,indent=2)+'\n')
           print(json.dumps(result,indent=2))
           PY
