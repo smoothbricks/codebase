@@ -1,7 +1,10 @@
 import { describe, expect, test } from 'bun:test';
 import { readFileSync } from 'node:fs';
 
-const action = readFileSync(new URL('../../managed/templates/github/actions/setup-devenv/action.yml', import.meta.url), 'utf8');
+const action = readFileSync(
+  new URL('../../managed/templates/github/actions/setup-devenv/action.yml', import.meta.url),
+  'utf8',
+);
 const assignments = action.split('\n').filter((line) => line.trimStart().startsWith('scope=$('));
 
 function scope(overrides: Record<string, string> = {}): string {
