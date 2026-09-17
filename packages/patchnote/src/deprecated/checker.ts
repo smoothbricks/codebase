@@ -7,6 +7,7 @@
  * Deprecation is informational only -- it never blocks auto-merge.
  */
 
+import typia from 'typia';
 import type { Logger } from '../logger.js';
 import type { PackageUpdate } from '../types.js';
 import { findReplacement } from './replacements.js';
@@ -27,7 +28,7 @@ export async function getDeprecationStatus(packageName: string, version: string)
     const response = await fetch(url, { signal: AbortSignal.timeout(30_000) });
     if (!response.ok) return null;
 
-    const data = (await response.json()) as { deprecated?: string };
+    const data = typia.assert<{ deprecated?: string }>(await response.json());
     return data.deprecated ?? null;
   } catch {
     return null; // Fail open: treat fetch errors as "unknown" (not deprecated)

@@ -6,13 +6,13 @@
  * are rebased in topological order (base-of-stack first).
  */
 
-import { execa } from 'execa';
 import { GitHubCLIClient } from '../auth/github-client.js';
 import type { PatchnoteConfig } from '../config.js';
+import { executeCommand } from '../executor.js';
 import { fetch, getCurrentBranch, push, rebase, switchBranch } from '../git.js';
 import type { CommandExecutor, GitHubPR, IGitHubClient, RebaseOpenPRsOptions, RebaseResult } from '../types.js';
 
-const defaultExecutor = execa as unknown as CommandExecutor;
+const defaultExecutor = executeCommand;
 
 /**
  * Build topological rebase order from a list of PRs.
@@ -135,8 +135,8 @@ export async function rebaseOpenPRs(
   // 4. Dry-run mode: list planned actions without mutating
   if (options.dryRun) {
     logger?.info('Dry-run mode: listing planned rebase actions\n');
-    for (let i = 0; i < levels.length; i++) {
-      for (const pr of levels[i]!) {
+    for (const level of levels) {
+      for (const pr of level) {
         const rebaseTarget =
           pr.baseRefName && pr.baseRefName !== baseBranch ? `origin/${pr.baseRefName}` : `origin/${baseBranch}`;
         logger?.info(`  PR #${pr.number} (${pr.headRefName}) -> rebase onto ${rebaseTarget}`);

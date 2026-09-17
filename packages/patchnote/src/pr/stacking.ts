@@ -2,14 +2,14 @@
  * Stacked PR management
  */
 
-import { execa as execaOriginal } from 'execa';
 import { GitHubCLIClient } from '../auth/github-client.js';
 import type { PatchnoteConfig } from '../config.js';
+import { executeCommand } from '../executor.js';
 import type { Logger } from '../logger.js';
 import type { CommandExecutor, IGitHubClient, OpenPR } from '../types.js';
 
 /** Default executor - execa cast to CommandExecutor type */
-const defaultExecutor = execaOriginal as unknown as CommandExecutor;
+const defaultExecutor = executeCommand;
 
 /**
  * Get list of open update PRs

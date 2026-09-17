@@ -7,6 +7,7 @@
 
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
+import typia from 'typia';
 
 export interface ReplacementSuggestion {
   replacementName: string;
@@ -22,7 +23,7 @@ let _replacements: ReplacementsData | null = null;
 
 function getReplacements(): ReplacementsData {
   if (!_replacements) {
-    _replacements = JSON.parse(readFileSync(dataPath, 'utf-8')) as ReplacementsData;
+    _replacements = typia.json.assertParse<ReplacementsData>(readFileSync(dataPath, 'utf-8'));
   }
   return _replacements;
 }

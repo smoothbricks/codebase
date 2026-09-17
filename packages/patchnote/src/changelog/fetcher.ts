@@ -2,6 +2,7 @@
  * Fetch changelogs for package updates
  */
 
+import typia from 'typia';
 import type { PackageUpdate } from '../types.js';
 
 /**
@@ -19,7 +20,9 @@ async function fetchNpmChangelog(packageName: string, version: string): Promise<
       return null;
     }
 
-    const data = rawData as { versions?: Record<string, { repository?: { url?: string } }> };
+    const data = typia.assert<{ versions?: Record<string, { repository?: unknown } | null>; repository?: unknown }>(
+      rawData,
+    );
     if (!data.versions) {
       console.warn(`No versions found in npm registry response for ${packageName}`);
       return null;
@@ -27,8 +30,8 @@ async function fetchNpmChangelog(packageName: string, version: string): Promise<
     const versionData = data.versions?.[version];
 
     // Check for repository URL
-    const repository = versionData?.repository || (data as { repository?: { url?: string } }).repository;
-    if (repository?.url) {
+    const repository = versionData?.repository || data.repository;
+    if (typia.is<{ url: string }>(repository) && repository.url) {
       const githubMatch = repository.url.match(/github\.com[/:]([^/]+\/[^/.]+)/);
       if (githubMatch) {
         const repo = githubMatch[1];
@@ -59,7 +62,7 @@ async function fetchGitHubChangelog(packageName: string, version: string): Promi
       const response = await fetch(url, { signal: AbortSignal.timeout(30_000) });
 
       if (response.ok) {
-        const data = (await response.json()) as { body?: string; html_url?: string };
+        const data = typia.assert<{ body?: string | null; html_url?: string }>(await response.json());
         return data.body || data.html_url || null;
       }
     }
@@ -84,7 +87,7 @@ async function fetchChangelogContent(url: string): Promise<string | null> {
 
     const contentType = response.headers.get('content-type');
     if (contentType?.includes('application/json')) {
-      const data = (await response.json()) as { body?: string };
+      const data = typia.assert<{ body?: string | null }>(await response.json());
       return data.body || JSON.stringify(data, null, 2);
     }
 
@@ -166,11 +169,11 @@ export async function fetchChangelogs(
  * Generate simple changelog summary without AI
  */
 export function generateSimpleChangelog(updates: PackageUpdate[]): string {
-  const sections = {
-    major: [] as PackageUpdate[],
-    minor: [] as PackageUpdate[],
-    patch: [] as PackageUpdate[],
-    unknown: [] as PackageUpdate[],
+  const sections: Record<PackageUpdate['updateType'], PackageUpdate[]> = {
+    major: [],
+    minor: [],
+    patch: [],
+    unknown: [],
   };
 
   // Group by update type

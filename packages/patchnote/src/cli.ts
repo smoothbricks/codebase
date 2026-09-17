@@ -238,7 +238,7 @@ program
   .action(async (options) => {
     const config = await setupConfig();
     const { rebaseOpenPRs } = await import('./commands/rebase-open-prs.js');
-    await rebaseOpenPRs(config, { ...getUpdateOptions(), maxAgeDays: Number.parseInt(options.maxAge) });
+    await rebaseOpenPRs(config, { ...getUpdateOptions(), maxAgeDays: Number.parseInt(options.maxAge, 10) });
   });
 
 // Parse arguments and run

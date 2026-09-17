@@ -3,14 +3,14 @@
  * All functions follow the CommandExecutor dependency injection pattern.
  */
 
-import { execa } from 'execa';
+import { executeCommand } from '../executor.js';
 import type { CommandExecutor, GitHubAppCredentials } from '../types.js';
 
 /**
  * Detect the GitHub organization from the current repository.
  * Uses `gh repo view` to get the repo owner.
  */
-export async function detectOrg(executor: CommandExecutor = execa as unknown as CommandExecutor): Promise<string> {
+export async function detectOrg(executor: CommandExecutor = executeCommand): Promise<string> {
   const { stdout } = await executor('gh', ['repo', 'view', '--json', 'owner', '--jq', '.owner.login']);
   return stdout.trim();
 }
@@ -19,9 +19,7 @@ export async function detectOrg(executor: CommandExecutor = execa as unknown as 
  * Check if the GitHub CLI is authenticated.
  * Returns true if `gh auth status` succeeds, false otherwise.
  */
-export async function checkAuthScopes(
-  executor: CommandExecutor = execa as unknown as CommandExecutor,
-): Promise<boolean> {
+export async function checkAuthScopes(executor: CommandExecutor = executeCommand): Promise<boolean> {
   try {
     await executor('gh', ['auth', 'status']);
     return true;
@@ -36,7 +34,7 @@ export async function checkAuthScopes(
  */
 export async function exchangeCode(
   code: string,
-  executor: CommandExecutor = execa as unknown as CommandExecutor,
+  executor: CommandExecutor = executeCommand,
 ): Promise<GitHubAppCredentials> {
   const { stdout } = await executor('gh', ['api', 'POST', `/app-manifests/${code}/conversions`]);
   const data = JSON.parse(stdout);
@@ -56,7 +54,7 @@ export async function exchangeCode(
  */
 export async function storeCredentials(
   options: { org: string; appId: number; pem: string },
-  executor: CommandExecutor = execa as unknown as CommandExecutor,
+  executor: CommandExecutor = executeCommand,
 ): Promise<void> {
   // Set App ID as org variable
   await executor('gh', [
@@ -81,10 +79,7 @@ export async function storeCredentials(
  * Delete a GitHub App by slug. Best-effort rollback helper.
  * Silently catches errors since this is used during cleanup.
  */
-export async function deleteApp(
-  slug: string,
-  executor: CommandExecutor = execa as unknown as CommandExecutor,
-): Promise<void> {
+export async function deleteApp(slug: string, executor: CommandExecutor = executeCommand): Promise<void> {
   try {
     await executor('gh', ['api', '-X', 'DELETE', `/apps/${slug}`]);
   } catch {

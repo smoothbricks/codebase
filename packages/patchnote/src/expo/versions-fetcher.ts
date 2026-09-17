@@ -2,6 +2,7 @@
  * Fetch Expo recommended package versions for a specific SDK
  */
 
+import typia from 'typia';
 import type { ExpoPackageVersions } from '../types.js';
 
 /**
@@ -21,7 +22,7 @@ export async function fetchExpoVersions(sdkVersion: string): Promise<ExpoPackage
       throw new Error(`Failed to fetch Expo versions: ${response.statusText}`);
     }
 
-    const bundledModules = (await response.json()) as Record<string, string>;
+    const bundledModules = typia.assert<Record<string, string>>(await response.json());
 
     // Also fetch React/React Native versions from the SDK
     const packageJsonUrl = `https://raw.githubusercontent.com/expo/expo/sdk-${majorVersion}/packages/expo/package.json`;
@@ -31,9 +32,9 @@ export async function fetchExpoVersions(sdkVersion: string): Promise<ExpoPackage
     let reactNativeVersion = '0.76.0'; // fallback
 
     if (packageJsonResponse.ok) {
-      const packageJson = (await packageJsonResponse.json()) as {
+      const packageJson = typia.assert<{
         peerDependencies?: { react?: string; 'react-native'?: string };
-      };
+      }>(await packageJsonResponse.json());
       reactVersion = packageJson.peerDependencies?.react || reactVersion;
       reactNativeVersion = packageJson.peerDependencies?.['react-native'] || reactNativeVersion;
     }

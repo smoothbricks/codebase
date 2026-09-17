@@ -9,6 +9,7 @@
  * (packages that never had provenance are not flagged).
  */
 
+import typia from 'typia';
 import type { Logger } from '../logger.js';
 import type { PackageUpdate } from '../types.js';
 
@@ -28,13 +29,13 @@ export async function getProvenanceStatus(packageName: string, version: string):
     const response = await fetch(url, { signal: AbortSignal.timeout(30_000) });
     if (!response.ok) return false;
 
-    const data = (await response.json()) as {
+    const data = typia.assert<{
       dist?: {
         attestations?: {
           provenance?: { predicateType: string };
         };
       };
-    };
+    }>(await response.json());
 
     return !!data.dist?.attestations?.provenance;
   } catch {

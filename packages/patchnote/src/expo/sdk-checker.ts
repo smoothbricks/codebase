@@ -3,6 +3,7 @@
  */
 
 import { readFile } from 'node:fs/promises';
+import typia from 'typia';
 import type { ExpoSDKVersion } from '../types.js';
 
 /**
@@ -44,7 +45,7 @@ export async function getLatestExpoSDK(): Promise<ExpoSDKVersion> {
     }
 
     const data = await response.json();
-    const version = (data as { version: string }).version;
+    const version = typia.assert<{ version: string }>(data).version;
 
     // Extract SDK version from package version
     // Expo versions are like "~52.0.0" or "52.0.0"

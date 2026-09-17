@@ -3,6 +3,7 @@
  */
 
 import { execa } from 'execa';
+import { executeCommand } from '../executor.js';
 import type { Logger } from '../logger.js';
 import type { CommandExecutor, PackageUpdate, ProjectSetup, UpdateResult } from '../types.js';
 import { isExecutableAvailable } from '../utils/project-detection.js';
@@ -83,7 +84,7 @@ export function parsePackageJsonDiff(diff: string): PackageUpdate[] {
     // Check for section headers
     const sectionMatch = line.match(sectionPattern);
     if (sectionMatch) {
-      currentSection = sectionMatch[1] as 'dependencies' | 'devDependencies';
+      currentSection = sectionMatch[1] === 'devDependencies' ? 'devDependencies' : 'dependencies';
       continue;
     }
 
@@ -323,7 +324,7 @@ export async function refreshLockFile(
     packageManager?: ProjectSetup['packageManager'];
   } = {},
 ): Promise<{ changed: boolean; error?: string }> {
-  const { dryRun = false, logger, executor = execa as unknown as CommandExecutor } = options;
+  const { dryRun = false, logger, executor = executeCommand } = options;
   const pm = getPackageManagerCommands(options.packageManager ?? 'bun');
 
   if (dryRun) {

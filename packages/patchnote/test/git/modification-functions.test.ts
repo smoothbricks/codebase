@@ -332,7 +332,7 @@ describe('rebase', () => {
 
   test('should return false on conflict and auto-abort', async () => {
     let callCount = 0;
-    const mock = async (cmd: string | URL, args?: readonly string[], opts?: Record<string, unknown>) => {
+    const mock = async (cmd: string | URL, args?: readonly string[]) => {
       callCount++;
       const command = typeof cmd === 'string' ? cmd : cmd.toString();
       const key = [command, ...(args || [])].join(' ');

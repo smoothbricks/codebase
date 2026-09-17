@@ -7,7 +7,12 @@
     "tsBuildInfoFile": "dist/tsconfig.lib.tsbuildinfo",
     "emitDeclarationOnly": true,
     "forceConsistentCasingInFileNames": true,
-    "types": ["node", "bun"]
+    "types": ["node", "bun"],
+    "plugins": [
+      {
+        "transform": "typia/lib/transform"
+      }
+    ]
   },
   "include": ["src/**/*.ts"],
   "exclude": ["src/**/*.test.ts"],

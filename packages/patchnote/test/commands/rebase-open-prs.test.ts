@@ -5,7 +5,7 @@
 import { describe, expect, test } from 'bun:test';
 import { buildRebaseOrder, rebaseOpenPRs } from '../../src/commands/rebase-open-prs.js';
 import type { PatchnoteConfig } from '../../src/config.js';
-import type { CommandExecutor, GitHubPR, IGitHubClient, RebaseResult } from '../../src/types.js';
+import type { CommandExecutor, GitHubPR, IGitHubClient } from '../../src/types.js';
 
 // --- Helpers ---
 

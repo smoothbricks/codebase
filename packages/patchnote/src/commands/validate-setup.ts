@@ -3,8 +3,9 @@
  * Checks GitHub CLI, authentication, app installation, permissions, and config
  */
 
-import { execa } from 'execa';
+import typia from 'typia';
 import { loadConfig } from '../config.js';
+import { executeCommand } from '../executor.js';
 import type { Logger } from '../logger.js';
 import type { CommandExecutor } from '../types.js';
 
@@ -21,7 +22,7 @@ interface ValidationResult {
 export async function validateSetup(
   logger: Logger,
   repoRoot?: string,
-  executor: CommandExecutor = execa as unknown as CommandExecutor,
+  executor: CommandExecutor = executeCommand,
 ): Promise<number> {
   logger.info('🔍 Validating patchnote setup...\n');
 
@@ -138,7 +139,7 @@ async function checkGitHubAppInstalled(
     };
   } catch (error: unknown) {
     // Check if it's a 404 (not installed) vs other errors
-    const stderr = (error as { stderr?: string }).stderr || '';
+    const stderr = typia.is<Pick<Awaited<ReturnType<CommandExecutor>>, 'stderr'>>(error) ? error.stderr : '';
     const message = error instanceof Error ? error.message : '';
     const is404 = stderr.includes('404') || message.includes('404');
 

@@ -6,9 +6,10 @@
  * any provider with an available API key.
  */
 
+import typia from 'typia';
 import type { PatchnoteConfig } from '../config.js';
 import type { Logger } from '../logger.js';
-import type { SendPromptOptions, SupportedProvider } from '../types.js';
+import { type SendPromptOptions, SUPPORTED_PROVIDERS, type SupportedProvider } from '../types.js';
 import { PROVIDER_CONFIGS } from './providers.js';
 
 const DEFAULT_MAX_TOKENS = 4096;
@@ -38,10 +39,11 @@ export function resolveProvider(config: PatchnoteConfig): { provider: SupportedP
   }
 
   // 3. Fallback: try other providers
-  for (const [name, cfg] of Object.entries(PROVIDER_CONFIGS)) {
+  for (const name of SUPPORTED_PROVIDERS) {
+    const cfg = PROVIDER_CONFIGS[name];
     if (name === configuredProvider) continue;
     const key = process.env[cfg.envVar];
-    if (key) return { provider: name as SupportedProvider, apiKey: key };
+    if (key) return { provider: name, apiKey: key };
   }
 
   // 4. No keys available
@@ -106,9 +108,9 @@ export async function sendPrompt(
     throw new Error(`${provider} API error ${response.status}: ${errorText}`);
   }
 
-  const data = (await response.json()) as {
+  const data = typia.assert<{
     choices?: Array<{ message?: { content?: string } }>;
-  };
+  }>(await response.json());
 
   const content = data.choices?.[0]?.message?.content;
   if (!content) {

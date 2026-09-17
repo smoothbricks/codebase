@@ -1,0 +1,4 @@
+preload = ["@smoothbricks/validation/bun/preload"]
+
+[test]
+preload = ["@smoothbricks/validation/bun/preload"]

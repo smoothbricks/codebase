@@ -7,8 +7,8 @@
  */
 
 import * as p from '@clack/prompts';
-import { execa } from 'execa';
 import type { PatchnoteConfig } from '../config.js';
+import { executeCommand } from '../executor.js';
 import { checkAuthScopes, deleteApp, detectOrg, exchangeCode, storeCredentials } from '../setup/credential-store.js';
 import { startCallbackServer } from '../setup/local-server.js';
 import { buildManifest, generateManifestPage } from '../setup/manifest.js';
@@ -18,10 +18,7 @@ import type { CommandExecutor, GitHubAppCredentials, SetupOptions } from '../typ
  * Open a URL in the user's default browser using platform-specific commands.
  * Does NOT add the `open` npm package as a dependency.
  */
-async function openBrowser(
-  url: string,
-  executor: CommandExecutor = execa as unknown as CommandExecutor,
-): Promise<void> {
+async function openBrowser(url: string, executor: CommandExecutor = executeCommand): Promise<void> {
   const platform = process.platform;
   if (platform === 'darwin') {
     await executor('open', [url]);
@@ -38,7 +35,7 @@ async function openBrowser(
 export async function setup(
   _config: PatchnoteConfig,
   options: SetupOptions,
-  executor: CommandExecutor = execa as unknown as CommandExecutor,
+  executor: CommandExecutor = executeCommand,
 ): Promise<void> {
   p.intro('Setting up GitHub App for patchnote');
 

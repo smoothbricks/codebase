@@ -2,16 +2,15 @@
  * Git operations helpers
  */
 
-import { execa } from 'execa';
 import type { PatchnoteConfig } from './config.js';
+import { executeCommand } from './executor.js';
 import type { Logger } from './logger.js';
 import type { CommandExecutor } from './types.js';
 
 /**
- * Default executor - execa cast to CommandExecutor type
- * The cast is safe because execa's Result extends our ExecutorResult interface
+ * Default text executor; callers can inject the same port in tests.
  */
-const defaultExecutor = execa as unknown as CommandExecutor;
+const defaultExecutor = executeCommand;
 
 /**
  * Get the current git branch

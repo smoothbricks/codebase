@@ -3,7 +3,8 @@
  * Uses gh CLI for all GitHub operations
  */
 
-import { execa } from 'execa';
+import typia from 'typia';
+import { executeCommand } from '../executor.js';
 import type { CommandExecutor, GitHubPR, IGitHubClient, MergeStrategy } from '../types.js';
 
 /**
@@ -14,7 +15,7 @@ export class GitHubCLIClient implements IGitHubClient {
   private executor: CommandExecutor;
 
   constructor(executor?: CommandExecutor) {
-    this.executor = executor || (execa as unknown as CommandExecutor);
+    this.executor = executor || executeCommand;
   }
 
   async listUpdatePRs(repoRoot: string): Promise<GitHubPR[]> {
@@ -25,15 +26,10 @@ export class GitHubCLIClient implements IGitHubClient {
         { cwd: repoRoot },
       );
 
-      const parsed = JSON.parse(stdout);
-
-      // Validate that gh CLI returned an array
-      if (!Array.isArray(parsed)) {
-        throw new Error(`Expected array from gh pr list, got ${typeof parsed}`);
-      }
-
-      // Return all PRs - let the caller filter by branch prefix
-      return parsed as GitHubPR[];
+      const parsed = typia.json.validateParse<GitHubPR[]>(stdout);
+      if (!parsed.success) throw new Error('Expected array of valid PRs from gh pr list');
+      // Return all PRs - let the caller filter by branch prefix.
+      return parsed.data;
     } catch (error: unknown) {
       throw this.enhanceError(error, 'list PRs');
     }
@@ -45,15 +41,9 @@ export class GitHubCLIClient implements IGitHubClient {
         cwd: repoRoot,
       });
 
-      const parsed = JSON.parse(stdout);
-
-      // Validate that gh CLI returned an object with mergeable field
-      if (typeof parsed !== 'object' || parsed === null || !('mergeable' in parsed)) {
-        throw new Error('Expected object with mergeable field from gh pr view');
-      }
-
-      const data = parsed as { mergeable: 'MERGEABLE' | 'CONFLICTING' | 'UNKNOWN' };
-      return data.mergeable === 'CONFLICTING';
+      const parsed = typia.json.validateParse<{ mergeable: 'MERGEABLE' | 'CONFLICTING' | 'UNKNOWN' }>(stdout);
+      if (!parsed.success) throw new Error('Expected object with mergeable field from gh pr view');
+      return parsed.data.mergeable === 'CONFLICTING';
     } catch (error: unknown) {
       throw this.enhanceError(error, `check PR #${prNumber} conflicts`);
     }
@@ -159,11 +149,9 @@ export class GitHubCLIClient implements IGitHubClient {
         { cwd: repoRoot },
       );
 
-      const parsed = JSON.parse(stdout);
-      if (!Array.isArray(parsed)) {
-        throw new Error(`Expected array from gh pr list, got ${typeof parsed}`);
-      }
-      return parsed.length > 0 ? (parsed[0] as GitHubPR) : null;
+      const parsed = typia.json.validateParse<GitHubPR[]>(stdout);
+      if (!parsed.success) throw new Error('Expected array of valid PRs from gh pr list');
+      return parsed.data[0] ?? null;
     } catch (error: unknown) {
       throw this.enhanceError(error, 'find PR by head branch');
     }
@@ -190,7 +178,7 @@ export class GitHubCLIClient implements IGitHubClient {
    */
   private enhanceError(error: unknown, operation: string): Error {
     const errorMessage = error instanceof Error ? error.message : String(error);
-    const stderr = (error as { stderr?: string }).stderr || '';
+    const stderr = typia.is<Pick<Awaited<ReturnType<CommandExecutor>>, 'stderr'>>(error) ? error.stderr : '';
 
     // Check for common error patterns
     const is401 = errorMessage.includes('401') || stderr.includes('401') || errorMessage.includes('Unauthorized');

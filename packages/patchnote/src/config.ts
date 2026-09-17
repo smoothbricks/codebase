@@ -6,6 +6,7 @@ import { existsSync, realpathSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { isAbsolute, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
+import typia from 'typia';
 import { getRepoRoot } from './git.js';
 import { ConsoleLogger, type Logger, LogLevel } from './logger.js';
 import { mergePartials, resolvePresets } from './presets.js';
@@ -213,7 +214,7 @@ export interface PatchnoteConfigInput extends DeepPartial<PatchnoteConfig> {
 /**
  * Default configuration
  */
-export const defaultConfig: PatchnoteConfig = {
+const baseConfig = {
   expo: {
     enabled: false,
     autoDetect: true, // Auto-detect Expo projects by default
@@ -272,7 +273,8 @@ export const defaultConfig: PatchnoteConfig = {
     branchPrefix: 'chore/lock-file-maintenance',
   },
   logger: new ConsoleLogger(LogLevel.INFO),
-};
+} satisfies PatchnoteConfig;
+export const defaultConfig: PatchnoteConfig = baseConfig;
 
 /**
  * Config file names to search for (in order of preference)
@@ -331,28 +333,20 @@ export async function loadConfig(searchPath?: string, explicitConfigPath?: strin
   }
 
   try {
-    let userConfig: DeepPartial<PatchnoteConfig>;
+    let userConfig: PatchnoteConfigInput;
 
     // Load TypeScript config using dynamic import
     if (configPath.endsWith('.ts')) {
       const module = await import(pathToFileURL(configPath).href);
-      userConfig = module.default || module;
+      userConfig = typia.assert<PatchnoteConfigInput>(module.default ?? module);
     } else {
       // Load JSON config
       const fileContent = await readFile(configPath, 'utf-8');
-      userConfig = JSON.parse(fileContent) as DeepPartial<PatchnoteConfig>;
-    }
-
-    // Validate basic structure
-    if (typeof userConfig !== 'object' || userConfig === null || Array.isArray(userConfig)) {
-      console.warn(
-        `Invalid config file at ${configPath}: expected object, got ${Array.isArray(userConfig) ? 'array' : typeof userConfig}`,
-      );
-      return { ...defaultConfig };
+      userConfig = typia.json.assertParse<PatchnoteConfigInput>(fileContent);
     }
 
     // Extract extends field (not part of PatchnoteConfig)
-    const { extends: presetRefs, ...localConfig } = userConfig as PatchnoteConfigInput;
+    const { extends: presetRefs, ...localConfig } = userConfig;
 
     if (presetRefs && presetRefs.length > 0) {
       const resolvedPresets = await resolvePresets(presetRefs);
@@ -416,31 +410,31 @@ export function mergeConfig(userConfig: DeepPartial<PatchnoteConfig>): Patchnote
   return {
     ...defaultConfig,
     ...userConfig,
-    expo: userConfig.expo ? { ...defaultConfig.expo, ...userConfig.expo } : defaultConfig.expo,
-    syncpack: userConfig.syncpack ? { ...defaultConfig.syncpack, ...userConfig.syncpack } : defaultConfig.syncpack,
-    nix: userConfig.nix ? { ...defaultConfig.nix, ...userConfig.nix } : defaultConfig.nix,
+    expo: userConfig.expo ? { ...baseConfig.expo, ...userConfig.expo } : defaultConfig.expo,
+    syncpack: userConfig.syncpack ? { ...baseConfig.syncpack, ...userConfig.syncpack } : defaultConfig.syncpack,
+    nix: userConfig.nix ? { ...baseConfig.nix, ...userConfig.nix } : defaultConfig.nix,
     prStrategy: { ...defaultConfig.prStrategy, ...(userConfig.prStrategy || {}) },
     autoMerge: { ...defaultConfig.autoMerge, ...(userConfig.autoMerge || {}) },
     provenanceCheck: userConfig.provenanceCheck
-      ? { ...defaultConfig.provenanceCheck, ...userConfig.provenanceCheck }
+      ? { ...baseConfig.provenanceCheck, ...userConfig.provenanceCheck }
       : defaultConfig.provenanceCheck,
     deprecationCheck: userConfig.deprecationCheck
-      ? { ...defaultConfig.deprecationCheck, ...userConfig.deprecationCheck }
+      ? { ...baseConfig.deprecationCheck, ...userConfig.deprecationCheck }
       : defaultConfig.deprecationCheck,
     ai: { ...defaultConfig.ai, ...(userConfig.ai || {}) },
-    git: userConfig.git ? { ...defaultConfig.git, ...userConfig.git } : defaultConfig.git,
+    git: userConfig.git ? { ...baseConfig.git, ...userConfig.git } : defaultConfig.git,
     semanticCommits: userConfig.semanticCommits
-      ? { ...defaultConfig.semanticCommits, ...userConfig.semanticCommits }
+      ? { ...baseConfig.semanticCommits, ...userConfig.semanticCommits }
       : defaultConfig.semanticCommits,
-    filters: userConfig.filters ? { ...defaultConfig.filters, ...userConfig.filters } : defaultConfig.filters,
+    filters: userConfig.filters ? { ...baseConfig.filters, ...userConfig.filters } : defaultConfig.filters,
     grouping: userConfig.grouping ?? defaultConfig.grouping,
     packageRules: userConfig.packageRules ?? defaultConfig.packageRules,
     lockFileMaintenance: userConfig.lockFileMaintenance
-      ? { ...defaultConfig.lockFileMaintenance, ...userConfig.lockFileMaintenance }
+      ? { ...baseConfig.lockFileMaintenance, ...userConfig.lockFileMaintenance }
       : defaultConfig.lockFileMaintenance,
     // Logger is runtime-only, always use default logger (can be overridden later)
     logger: defaultConfig.logger,
-  } as PatchnoteConfig;
+  };
 }
 
 /**

@@ -367,8 +367,8 @@ describe('loadConfig', () => {
         minCoverage: 80,
       },
       ai: {
-        provider: 'anthropic',
-        model: 'claude-opus-4-5-20250929',
+        provider: 'gemini',
+        model: 'custom-model',
         apiKey: 'test-key',
       },
       git: {
@@ -388,7 +388,8 @@ describe('loadConfig', () => {
     expect(config.nix?.enabled).toBe(true);
     expect(config.prStrategy.stackingEnabled).toBe(false);
     expect(config.autoMerge.mode).toBe('patch');
-    expect(config.ai.model).toBe('claude-opus-4-5-20250929');
+    expect(config.ai.provider).toBe('gemini');
+    expect(config.ai.model).toBe('custom-model');
     expect(config.git?.baseBranch).toBe('develop');
     expect(config.repoRoot).toBe('/custom/path');
   });

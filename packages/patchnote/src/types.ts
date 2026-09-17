@@ -13,19 +13,21 @@ export interface ExecutorResult {
   stdout: string;
   /** Standard error */
   stderr: string;
-  /** Exit code */
-  exitCode: number;
+  /** Exit code; undefined when no exit code was produced (for example, a signal). */
+  exitCode: number | undefined;
 }
 
 /**
  * Deep partial type - makes all properties and nested properties optional
  * Useful for partial configuration updates
  */
-export type DeepPartial<T> = T extends object
-  ? {
-      [P in keyof T]?: DeepPartial<T[P]>;
-    }
-  : T;
+export type DeepPartial<T> = T extends readonly unknown[]
+  ? T
+  : T extends object
+    ? {
+        [P in keyof T]?: DeepPartial<T[P]>;
+      }
+    : T;
 
 /**
  * Update type classification

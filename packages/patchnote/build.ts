@@ -1,3 +1,4 @@
+import UnpluginTypia from '@typia/unplugin/bun';
 import { $, build } from 'bun';
 
 console.log('Building patchnote CLI...');
@@ -15,6 +16,7 @@ const bundleResult = await build({
   format: 'esm',
   minify: false,
   sourcemap: 'none',
+  plugins: [UnpluginTypia({ log: false })],
   external: [
     // Keep external dependencies
     'commander',
@@ -41,6 +43,7 @@ const libResult = await build({
   format: 'esm',
   minify: false,
   sourcemap: 'none',
+  plugins: [UnpluginTypia({ log: false })],
   external: ['commander', 'execa', 'fast-glob', 'yaml'],
   naming: {
     entry: 'index.js',

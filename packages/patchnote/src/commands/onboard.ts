@@ -7,6 +7,7 @@ import { mkdir, writeFile } from 'node:fs/promises';
 import * as p from '@clack/prompts';
 import type { PatchnoteConfig } from '../config.js';
 import { defaultConfig, loadConfig } from '../config.js';
+import { executeCommand } from '../executor.js';
 import { commit, createBranch, getRepoRoot, pushWithUpstream, stageFiles, switchBranch } from '../git.js';
 import type { CommandExecutor, OnboardOptions, PackageUpdate, ProjectSetup } from '../types.js';
 import { safeResolve } from '../utils/path-validation.js';
@@ -176,8 +177,7 @@ export async function onboard(
 
   // Reset working tree after dry-run to avoid committing lock file artifacts
   try {
-    const { execa } = await import('execa');
-    await (executor || (execa as unknown as CommandExecutor))('git', ['checkout', '.'], { cwd: repoRoot });
+    await (executor || executeCommand)('git', ['checkout', '.'], { cwd: repoRoot });
   } catch {
     // Ignore reset errors
   }
