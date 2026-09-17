@@ -1,0 +1,34 @@
+{
+  "expected": "115142bc063ee989df55844d70117d3176bfc3fe",
+  "executorAssertions": 14,
+  "boundaryAssertions": 15,
+  "paths": [
+    "packages/patchnote/src/types.ts",
+    "packages/patchnote/src/ai/ai-client.ts",
+    "packages/patchnote/src/updaters/bun.ts",
+    "packages/patchnote/src/auth/github-client.ts",
+    "packages/patchnote/src/commands/validate-setup.ts",
+    "packages/patchnote/src/config.ts",
+    "packages/patchnote/src/changelog/fetcher.ts",
+    "packages/patchnote/src/commands/onboard.ts",
+    "packages/patchnote/src/commands/rebase-open-prs.ts",
+    "packages/patchnote/src/commands/setup.ts",
+    "packages/patchnote/src/deprecated/checker.ts",
+    "packages/patchnote/src/deprecated/replacements.ts",
+    "packages/patchnote/src/expo/sdk-checker.ts",
+    "packages/patchnote/src/expo/versions-fetcher.ts",
+    "packages/patchnote/src/git.ts",
+    "packages/patchnote/src/pr/stacking.ts",
+    "packages/patchnote/src/provenance/checker.ts",
+    "packages/patchnote/src/setup/credential-store.ts",
+    "packages/patchnote/src/cli.ts",
+    "packages/patchnote/test/commands/rebase-open-prs.test.ts",
+    "packages/patchnote/test/git/modification-functions.test.ts",
+    "packages/patchnote/package.json",
+    "packages/patchnote/bunfig.toml",
+    "packages/patchnote/build.ts",
+    "packages/patchnote/tsconfig.lib.json",
+    "packages/patchnote/test/lint-boundaries.test.ts"
+  ]
+}
+
