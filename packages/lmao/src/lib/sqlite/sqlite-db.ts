@@ -27,6 +27,13 @@ export interface AsyncSQLiteDatabase {
 
 export interface AsyncSQLiteStatement {
   run(...params: unknown[]): Promise<void>;
+  /**
+   * Execute repeated bindings in order, atomically, on this statement's connection.
+   * Resolution acknowledges every row; rejection leaves none of this batch applied.
+   * An existing caller-owned transaction remains open and retains its prior writes.
+   * Drivers without an atomic bulk operation omit this capability.
+   */
+  runMany?(rows: readonly (readonly unknown[])[]): Promise<void>;
   all(...params: unknown[]): Promise<unknown[]>;
   get(...params: unknown[]): Promise<unknown>;
 }

@@ -292,7 +292,7 @@ export function buildInsertParams(segment: SpanSegment, row: number, activeUserF
   const { buffer, traceId, spanId, parentSpanId, rowOffset } = segment;
   const entryType = resolveEntryType(buffer, row);
   const timestampNs = Number(buffer.timestamp[row]);
-  const message = resolveMessage(buffer, row);
+  const message = resolveMessage(buffer, row) ?? null;
 
   const userValues = activeUserFields.map((fieldName) => {
     const directValue = readUserValue(buffer, fieldName, row);

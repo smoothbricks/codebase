@@ -118,9 +118,12 @@ export class SQLiteAsyncTracer<B extends OpContextBinding = OpContextBinding> ex
 
   async close(): Promise<void> {
     cleanupDebug('sqliteAsyncTracer.close:start');
-    await this.flush();
-    const writer = await this.writerPromise;
-    await writer.close();
+    try {
+      await this.flush();
+    } finally {
+      const writer = await this.writerPromise;
+      await writer.close();
+    }
     cleanupDebug('sqliteAsyncTracer.close:end');
   }
 }

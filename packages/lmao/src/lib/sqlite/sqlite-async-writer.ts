@@ -65,7 +65,6 @@ export class SQLiteAsyncTraceWriter {
         }
       }
 
-      await this.refreshKnownColumns();
       this.knownColumns.add(column.name);
     }
   }
@@ -88,16 +87,38 @@ export class SQLiteAsyncTraceWriter {
       statementCacheSize: this.insertStmtCache.size,
     });
     await this.init();
+    let schema: LogSchema | undefined;
+    let insertStmt: AsyncSQLiteStatement | undefined;
+    let activeUserFields: string[] = [];
+    const rows: unknown[][] = [];
+    const flushRows = async () => {
+      if (rows.length === 0) return;
+      if (!insertStmt?.runMany) throw new Error('SQLite bulk writer lost its statement');
+      await insertStmt.runMany(rows);
+      rows.length = 0;
+    };
     for (const segment of walkSpanSegments(rootBuffer)) {
-      await this.ensureColumns(segment.buffer._logSchema);
-
-      const activeUserFields = getActiveUserFields(segment.buffer._logSchema, this.knownColumns);
-      const insertStmt = this.getInsertStatement(activeUserFields);
-
+      if (schema !== segment.buffer._logSchema) {
+        // Finish the preceding schema's rows before performing DDL for the next one.
+        await flushRows();
+        schema = segment.buffer._logSchema;
+        await this.ensureColumns(schema);
+        activeUserFields = getActiveUserFields(schema, this.knownColumns);
+        insertStmt = this.getInsertStatement(activeUserFields);
+      }
+      if (!insertStmt) throw new Error('SQLite writer has no insert statement');
       for (let row = 0; row < segment.buffer._writeIndex; row++) {
-        await insertStmt.run(...buildInsertParams(segment, row, activeUserFields));
+        const params = buildInsertParams(segment, row, activeUserFields);
+        if (insertStmt.runMany) {
+          rows.push(params);
+          // Bound transport memory without one fetch and durable commit per trace row.
+          if (rows.length === 256) await flushRows();
+        } else {
+          await insertStmt.run(...params);
+        }
       }
     }
+    await flushRows();
     cleanupDebug('sqliteAsyncWriter.flush:end', { statementCacheSize: this.insertStmtCache.size });
   }
 
