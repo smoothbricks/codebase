@@ -41,14 +41,14 @@ import {
   type TtscTransformHooks,
   transformTtsc,
 } from '@ttsc/unplugin/api';
-import { type Loader, plugin } from 'bun';
-import { loadPrecompiledTestSource } from '../test-build.js';
+import type { BunLoader } from '@ttsc/unplugin/bun';
+import { plugin } from 'bun';
 import { pollingDirectoryWatch } from './directory-watch.js';
 
 /** Transformed source, in the shape Bun's runtime loader requires. */
 interface LoadedSource {
   readonly contents: string;
-  readonly loader: Loader;
+  readonly loader: BunLoader;
 }
 
 /**
@@ -113,15 +113,7 @@ plugin({
  * diagnostics still reach the operator from the project that produced them.
  */
 async function loadThroughOwningProject(path: string): Promise<LoadedSource> {
-  const compiled = await loadPrecompiledTestSource(path);
-  if (compiled !== null) {
-    const map = Buffer.from(JSON.stringify(compiled.map)).toString('base64');
-    return {
-      contents: `${compiled.code}\n//# sourceMappingURL=data:application/json;base64,${map}`,
-      loader: compiled.loader,
-    };
-  }
-  const loader: Loader = /x$/i.test(path) ? 'tsx' : 'ts';
+  const loader: BunLoader = /x$/i.test(path) ? 'tsx' : 'ts';
   const source = await readFile(path, 'utf8');
   // Not a transform target: hand the source back for Bun to transpile, because
   // `Bun.plugin()` rejects an undefined `onLoad` result.

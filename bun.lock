@@ -221,17 +221,16 @@
       },
       "dependencies": {
         "@nx/js": "latest",
-        "@smoothbricks/validation": "workspace:*",
         "nx": "latest",
         "prettier": "^3.6.1",
         "smol-toml": "^1.6.1",
         "tslib": "^2.8.1",
-        "ttsc": "0.30.4",
         "typia": "14.0.2",
         "yaml": "^2.9.0",
       },
       "devDependencies": {
         "@smoothbricks/lmao": "workspace:*",
+        "@smoothbricks/validation": "workspace:*",
         "fast-check": "^4.4.0",
       },
     },
@@ -349,12 +348,11 @@
       "name": "@smoothbricks/validation",
       "version": "0.1.10-next.0",
       "dependencies": {
-        "@jridgewell/trace-mapping": "^0.3.31",
-        "@ttsc/unplugin": "0.30.4",
         "tslib": "^2.8.1",
-        "typia": "14.0.6",
+        "typia": "14.0.2",
       },
       "devDependencies": {
+        "@ttsc/unplugin": "0.30.4",
         "ttsc": "0.30.4",
         "typescript": "^6.0.3",
       },
