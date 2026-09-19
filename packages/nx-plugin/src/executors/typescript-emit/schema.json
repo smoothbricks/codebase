@@ -2,9 +2,15 @@
   "$schema": "https://json-schema.org/schema",
   "version": 2,
   "title": "TypeScript emit executor",
-  "description": "Emit transformer-generated JavaScript with ttsc and declarations with native tsc",
+  "description": "Emit transformed library or test artifacts with ttsc before execution",
   "type": "object",
   "properties": {
+    "kind": {
+      "type": "string",
+      "enum": ["library", "javascript", "tests"],
+      "default": "library",
+      "description": "Library emits JavaScript and declarations; javascript honors a separate declaration target; tests emit private runner artifacts"
+    },
     "executableOutputs": {
       "type": "array",
       "description": "Package bin outputs to make executable after JavaScript emit",

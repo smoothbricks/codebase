@@ -146,7 +146,7 @@ export function checkTsconfigTestReference(
       path: join(packagePath, 'tsconfig.json'),
       message:
         'must not reference ./tsconfig.test.json. ' +
-        'Test typechecking is run by the inferred typecheck-tests target with tsc --noEmit, not TypeScript build mode.',
+        'Test typechecking is run by the inferred typecheck-tests target with ttsc --noEmit, not TypeScript build mode.',
     },
   ];
 }

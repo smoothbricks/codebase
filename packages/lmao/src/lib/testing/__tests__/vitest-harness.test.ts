@@ -13,7 +13,11 @@ async function runFixture(name: string) {
     const root = fileURLToPath(new URL('../../../../', import.meta.url));
     const config = join(directory, 'vitest.config.mjs');
     const settings = { test: { include: [fixture], maxWorkers: 1 } } satisfies ViteUserConfig;
-    await writeFile(config, `export default ${JSON.stringify(settings)};`);
+    await writeFile(
+      config,
+      `import { precompiledTestPlugin } from ${JSON.stringify(import.meta.resolve('@smoothbricks/validation/test-build'))};\n` +
+        `export default { ...${JSON.stringify(settings)}, plugins: [precompiledTestPlugin()] };`,
+    );
     const command = Bun.spawn(
       [
         process.execPath,

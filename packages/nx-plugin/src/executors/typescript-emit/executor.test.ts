@@ -1,133 +1,95 @@
 import { describe, expect, it } from 'bun:test';
 import { existsSync } from 'node:fs';
-import { chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
+import { loadPrecompiledTestSource, PRECOMPILED_TEST_ENV } from '@smoothbricks/validation/test-build';
 
-import { type CompilerInvocation, runTypeScriptEmit } from './executor.js';
+import typescriptEmitExecutor from './executor.js';
+
+async function fixture() {
+  const root = await mkdtemp(join(tmpdir(), 'smoo-typescript-emit-'));
+  await mkdir(join(root, 'src'));
+  await writeFile(join(root, 'package.json'), JSON.stringify({ type: 'module' }));
+  await writeFile(
+    join(root, 'tsconfig.lib.json'),
+    JSON.stringify({
+      compilerOptions: {
+        target: 'ES2022',
+        module: 'NodeNext',
+        rootDir: 'src',
+        outDir: 'dist',
+        declaration: true,
+        declarationMap: true,
+        emitDeclarationOnly: true,
+        types: [],
+        skipLibCheck: true,
+      },
+      include: ['src/**/*.ts'],
+    }),
+  );
+  await writeFile(
+    join(root, 'src/index.ts'),
+    '#!/usr/bin/env node\nexport function identity<T>(value: T): T { return value; }\n',
+  );
+  return root;
+}
 
 describe('@smoothbricks/nx-plugin TypeScript emit executor', () => {
-  it('runs transformed JavaScript and native declaration lanes with project references preserved', async () => {
-    const root = await mkdtemp(join(tmpdir(), 'smoo-typescript-emit-'));
-    const projectRoot = join(root, 'packages/example');
-    await mkdir(projectRoot, { recursive: true });
-    await writeFile(
-      join(projectRoot, 'tsconfig.lib.json'),
-      '{\n  // Project references are intentionally not inherited through extends.\n  "references": [{ "path": "../dependency/tsconfig.lib.json" }]\n}\n',
-    );
-
-    const invocations: CompilerInvocation[] = [];
-    let overlayContents = '';
-    let overlayPath = '';
+  it('emits executable JavaScript and usable generic declarations', async () => {
+    const root = await fixture();
     try {
-      const result = await runTypeScriptEmit(
-        { cwd: 'packages/example', tsConfig: 'tsconfig.lib.json' },
-        { root },
-        async (invocation) => {
-          invocations.push(invocation);
-          if (invocation.command === 'ttsc') {
-            overlayPath = invocation.args[1] ?? '';
-            overlayContents = await readFile(overlayPath, 'utf8');
-          }
-          return true;
-        },
+      expect(
+        await typescriptEmitExecutor(
+          { cwd: root, tsConfig: 'tsconfig.lib.json', executableOutputs: ['dist/index.js'] },
+          { root },
+        ),
+      ).toEqual({ success: true });
+      expect((await stat(join(root, 'dist/index.js'))).mode & 0o111).toBe(0o111);
+      expect(await readFile(join(root, 'dist/index.d.ts'), 'utf8')).toContain('identity<T>(value: T): T');
+      const child = Bun.spawn(
+        ['bun', '-e', "import { identity } from './dist/index.js'; process.stdout.write(String(identity(42)))"],
+        { cwd: root, stdout: 'pipe', stderr: 'pipe' },
       );
-
-      expect(result).toEqual({ success: true });
-      expect(invocations).toHaveLength(2);
-      expect(invocations[0]).toEqual({
-        command: 'ttsc',
-        args: ['-p', overlayPath, '--emit'],
-        cwd: projectRoot,
-      });
-      expect(overlayPath).toMatch(/\/\.ttsc-js-\d+-[0-9a-f-]+\.json$/);
-      expect(overlayContents).toBe(
-        `${JSON.stringify(
-          {
-            extends: './tsconfig.lib.json',
-            compilerOptions: {
-              composite: false,
-              declaration: false,
-              declarationMap: false,
-              emitDeclarationOnly: false,
-              incremental: false,
-            },
-            references: [{ path: '../dependency/tsconfig.lib.json' }],
-          },
-          null,
-          2,
-        )}\n`,
-      );
-      expect(invocations[1]).toEqual({
-        command: 'tsc',
-        args: ['-p', overlayPath, '--emitDeclarationOnly', '--declaration', '--declarationMap'],
-        cwd: projectRoot,
-      });
-      expect(existsSync(overlayPath)).toBe(false);
+      const text = await new Response(child.stdout).text();
+      expect(await child.exited).toBe(0);
+      expect(Number(text)).toBe(42);
     } finally {
       await rm(root, { recursive: true, force: true });
     }
   });
 
-  it('makes emitted package bins executable before declaration emit', async () => {
-    const root = await mkdtemp(join(tmpdir(), 'smoo-typescript-emit-bin-'));
-    const projectRoot = join(root, 'packages/example');
-    const emittedBin = join(projectRoot, 'dist/bin/example.js');
-    await mkdir(projectRoot, { recursive: true });
-    await writeFile(join(projectRoot, 'tsconfig.lib.json'), '{}\n');
-
-    let executableBeforeDeclarations = false;
+  it('builds the no-emit test program outside published outputs without modifying its config', async () => {
+    const root = await fixture();
+    const testConfig = JSON.stringify({
+      extends: './tsconfig.lib.json',
+      compilerOptions: {
+        noEmit: true,
+        composite: false,
+        declaration: false,
+        declarationMap: false,
+        emitDeclarationOnly: false,
+      },
+    });
+    await writeFile(join(root, 'tsconfig.test.json'), testConfig);
+    const previousMode = process.env[PRECOMPILED_TEST_ENV];
+    process.env[PRECOMPILED_TEST_ENV] = '1';
     try {
-      const result = await runTypeScriptEmit(
-        {
-          cwd: 'packages/example',
-          executableOutputs: ['./dist/bin/example.js'],
-          tsConfig: 'tsconfig.lib.json',
-        },
-        { root },
-        async (invocation) => {
-          if (invocation.command === 'ttsc') {
-            await mkdir(join(projectRoot, 'dist/bin'), { recursive: true });
-            await writeFile(emittedBin, '#!/usr/bin/env node\n');
-            await chmod(emittedBin, 0o644);
-          } else {
-            executableBeforeDeclarations = ((await stat(emittedBin)).mode & 0o111) === 0o111;
-          }
-          return true;
-        },
-      );
-
-      expect(result).toEqual({ success: true });
-      expect(executableBeforeDeclarations).toBe(true);
-      expect((await stat(emittedBin)).mode & 0o111).toBe(0o111);
+      expect(
+        await typescriptEmitExecutor({ cwd: root, tsConfig: 'tsconfig.test.json', kind: 'tests' }, { root }),
+      ).toEqual({ success: true });
+      expect(existsSync(join(root, '.cache/test-build/src/index.js'))).toBe(true);
+      expect(existsSync(join(root, '.cache/test-build/src/index.d.ts'))).toBe(false);
+      expect(existsSync(join(root, 'dist'))).toBe(false);
+      expect(await readFile(join(root, 'tsconfig.test.json'), 'utf8')).toBe(testConfig);
+      const loaded = await loadPrecompiledTestSource(join(root, 'src/index.ts'));
+      expect(loaded?.map.sources).toEqual([pathToFileURL(join(root, 'src/index.ts')).href]);
+      await rm(join(root, '.cache/test-build'), { recursive: true });
+      await expect(loadPrecompiledTestSource(join(root, 'src/index.ts'))).rejects.toThrow();
     } finally {
-      await rm(root, { recursive: true, force: true });
-    }
-  });
-
-  it('does not emit declarations when transformed JavaScript fails and still removes its overlay', async () => {
-    const root = await mkdtemp(join(tmpdir(), 'smoo-typescript-emit-'));
-    const projectRoot = join(root, 'packages/example');
-    await mkdir(projectRoot, { recursive: true });
-    await writeFile(join(projectRoot, 'tsconfig.lib.json'), '{}\n');
-
-    const invocations: CompilerInvocation[] = [];
-    let overlayPath = '';
-    try {
-      const result = await runTypeScriptEmit(
-        { cwd: projectRoot, tsConfig: 'tsconfig.lib.json' },
-        { root },
-        async (invocation) => {
-          invocations.push(invocation);
-          overlayPath = invocation.args[1] ?? '';
-          return false;
-        },
-      );
-
-      expect(result).toEqual({ success: false });
-      expect(invocations.map(({ command }) => command)).toEqual(['ttsc']);
-      expect(existsSync(overlayPath)).toBe(false);
-    } finally {
+      if (previousMode === undefined) delete process.env[PRECOMPILED_TEST_ENV];
+      else process.env[PRECOMPILED_TEST_ENV] = previousMode;
       await rm(root, { recursive: true, force: true });
     }
   });

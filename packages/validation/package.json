@@ -44,9 +44,14 @@
       "import": "./dist/testing/index.js",
       "default": "./dist/testing/index.js"
     },
+    "./test-build": {
+      "types": "./dist/test-build.d.ts",
+      "import": "./dist/test-build.js",
+      "default": "./dist/test-build.js"
+    },
     "./bun/preload": {
-      "bun": "./src/bun/preload.ts",
-      "development": "./src/bun/preload.ts",
+      "types": "./dist/bun/preload.d.ts",
+      "bun": "./dist/bun/preload.js",
       "default": "./dist/bun/preload.js"
     }
   },
@@ -56,12 +61,13 @@
     "!**/*.tsbuildinfo"
   ],
   "dependencies": {
+    "@jridgewell/trace-mapping": "^0.3.31",
+    "@ttsc/unplugin": "0.30.4",
     "tslib": "^2.8.1",
-    "typia": "14.0.2"
+    "typia": "14.0.6"
   },
   "devDependencies": {
-    "@ttsc/unplugin": "0.28.3",
-    "ttsc": "0.28.3",
+    "ttsc": "0.30.4",
     "typescript": "^6.0.3"
   },
   "license": "MIT",

@@ -8,7 +8,7 @@
     "typescript-emit": {
       "implementation": "./dist/executors/typescript-emit/executor.js",
       "schema": "./src/executors/typescript-emit/schema.json",
-      "description": "Emit transformed JavaScript with ttsc and declarations with native tsc"
+      "description": "Emit transformed library or test artifacts with ttsc before execution"
     },
     "clean-outputs": {
       "implementation": "./dist/executors/clean-outputs/executor.js",

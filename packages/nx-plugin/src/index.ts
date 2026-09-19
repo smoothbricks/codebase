@@ -3,7 +3,11 @@ import { readdir, readFile } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import { dirname, isAbsolute, join, posix, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-
+import {
+  PRECOMPILED_TEST_ENV,
+  TYPESCRIPT_LIBRARY_MANIFEST,
+  TYPESCRIPT_TEST_OUTPUT_DIRECTORY,
+} from '@smoothbricks/validation/test-build';
 import {
   type CreateNodesContextV2,
   type CreateNodesResultV2,
@@ -13,7 +17,6 @@ import {
 } from 'nx/src/devkit-exports.js';
 import { AggregateCreateNodesError } from 'nx/src/project-graph/error-types.js';
 import { parse as parseToml } from 'smol-toml';
-
 import { BOUNDED_TEST_KILL_AFTER_MS, BOUNDED_TEST_TIMEOUT_MS } from './bounded-test-policy.js';
 import { CARGO_TOOLCHAIN_NAMED_INPUT, CARGO_TOOLCHAIN_PIN_INPUTS } from './cargo-toolchain-policy.js';
 import {
@@ -49,6 +52,7 @@ import {
 } from './cross-check-policy.js';
 import { hashVersionlessCrateManifests } from './manifest-hash.js';
 import { isNonSourceDirectory } from './source-directories.js';
+import { TYPESCRIPT_TEST_COMPILE_TARGET } from './typescript-test-build.js';
 import { isBuildOutputTargetName, isTestRunnerTargetName, PLATFORM_TARGET_GLOBS } from './workspace-config-policy.js';
 
 export { CARGO_TEST_COMPILE_TARGET };
@@ -91,7 +95,7 @@ const NODE_MODULES_SEGMENT = /(?:^|\/)node_modules(?:\/|$)/;
 /**
  * Every config file whose compiler options decide this project's TypeScript
  * verdicts: the workspace base, plus every file reachable by `extends` from the
- * configs its commands hand to `tsc`.
+ * configs its commands hand to `ttsc`.
  *
  * Hashing only the named config is the bug this closes. A workspace whose
  * project configs extend an INTERMEDIATE base — `packages/tsconfig.base.json`
@@ -1051,15 +1055,15 @@ async function createProjectTargets(
     // Build every JavaScript output lane before resolving package exports, without pulling
     // unrelated Wasm, N-API, native, or web outputs onto the compiler critical path.
     //
-    // ttsc transforms the source program before declaration emit, so typia's
-    // generated implementation identifiers are not valid declaration inputs.
-    // The executor gives ttsc a JS-only overlay and emits declarations from the
-    // original project with native tsc.
+    // ttsc owns JavaScript and declarations in one compiler invocation.
     targets['tsc-js'] = {
       executor: '@smoothbricks/nx-plugin:typescript-emit',
       cache: true,
       inputs: ['production', '^production', ...toolchainInputs, '{projectRoot}/tsconfig.lib.json'],
-      outputs: inferTypescriptOutputs(libTsconfigPath, packageJsonPath),
+      outputs: [
+        ...inferTypescriptOutputs(libTsconfigPath, packageJsonPath),
+        `{projectRoot}/${TYPESCRIPT_LIBRARY_MANIFEST}`,
+      ],
       dependsOn: ['^*-js', ...(cargoWasmConfig ? ['cargo-wasm'] : [])],
       options: {
         ...(executableOutputs.length > 0 ? { executableOutputs } : {}),
@@ -1074,20 +1078,28 @@ async function createProjectTargets(
       outputs: [],
       dependsOn: ['^*-js', ...(cargoWasmConfig ? ['cargo-wasm'] : [])],
       options: {
-        command: 'tsc -p tsconfig.lib.json --noEmit',
+        command: 'ttsc -p tsconfig.lib.json --noEmit',
         cwd: projectRoot,
       },
     };
   }
 
   if (hasTestTsconfig) {
+    targets[TYPESCRIPT_TEST_COMPILE_TARGET] = {
+      executor: '@smoothbricks/nx-plugin:typescript-emit',
+      cache: true,
+      inputs: [selfDefault, dependencyProduction, ...toolchainInputs, ...typescriptConfigChain],
+      outputs: [`{projectRoot}/${TYPESCRIPT_TEST_OUTPUT_DIRECTORY}`],
+      dependsOn: ['^build', ...(hasLibTsconfig ? ['tsc-js'] : [])],
+      options: { kind: 'tests', tsConfig: 'tsconfig.test.json', cwd: projectRoot },
+    };
     targets['typecheck-tests'] = {
       executor: 'nx:run-commands',
       cache: true,
       inputs: [selfDefault, dependencyProduction, ...checkInputs, '{projectRoot}/tsconfig.test.json'],
       dependsOn: ['typecheck'],
       options: {
-        command: 'tsc -p tsconfig.test.json --noEmit',
+        command: 'ttsc -p tsconfig.test.json --noEmit',
         cwd: projectRoot,
       },
     };
@@ -1095,7 +1107,7 @@ async function createProjectTargets(
       executor: 'nx:run-commands',
       continuous: true,
       options: {
-        command: 'tsc -p tsconfig.test.json --noEmit --watch',
+        command: 'ttsc -p tsconfig.test.json --noEmit --watch',
         cwd: projectRoot,
       },
     };
@@ -1382,10 +1394,24 @@ async function createProjectTargets(
     }
   }
 
-  if ('test' in declaredTargets && targets.test === undefined) {
+  if (('test' in declaredTargets || typeof packageJson.scripts?.test === 'string') && targets.test === undefined) {
     targets.test = {
-      dependsOn: ['^build', 'build'],
+      dependsOn: ['^build', 'build', ...(hasTestTsconfig ? [TYPESCRIPT_TEST_COMPILE_TARGET] : [])],
+      ...(hasTestTsconfig ? { options: { env: { [PRECOMPILED_TEST_ENV]: '1' } } } : {}),
     };
+  }
+  if (hasTestTsconfig) {
+    // Named runner targets need the same preparation as `test`. Their timers
+    // start only after the compiler target has produced its private artifacts.
+    for (const name of Object.keys(declaredTargets)) {
+      if (name === 'test' || !isTestRunnerTargetName(name)) continue;
+      const inferred = targets[name] ?? {};
+      targets[name] = {
+        ...inferred,
+        dependsOn: [...(inferred.dependsOn ?? ['^build', 'build']), TYPESCRIPT_TEST_COMPILE_TARGET],
+        options: { ...inferred.options, env: { ...inferred.options?.env, [PRECOMPILED_TEST_ENV]: '1' } },
+      };
+    }
   }
 
   // Every `cargoFrozen` command needs a registry cache holding the whole locked
@@ -1649,6 +1675,7 @@ async function createProjectTargets(
           // Compiling the test executables is unbounded preparation. Cargo
           // reuses its incremental state; Nx never restores that shared state.
           ...(cargoTestCompileDependency ? [cargoTestCompileDependency] : []),
+          ...(hasTestTsconfig ? [TYPESCRIPT_TEST_COMPILE_TARGET] : []),
           ...buildOutputTargetNames([...Object.keys(declaredTargets), ...Object.keys(targets)]),
           ...cargoWriterNames,
         ]),

@@ -1,11 +1,14 @@
-import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { once } from 'node:events';
-import { chmod, rm, stat, writeFile } from 'node:fs/promises';
-import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
-
-import { readJsonFile } from 'nx/src/devkit-exports.js';
-
+import { chmod, mkdir, rm, stat, writeFile } from 'node:fs/promises';
+import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
+import { readTsConfig } from '@nx/js';
+import {
+  TYPESCRIPT_LIBRARY_MANIFEST,
+  TYPESCRIPT_TEST_MANIFEST,
+  TYPESCRIPT_TEST_OUTPUT_DIRECTORY,
+  typescriptEmissionManifest,
+} from '@smoothbricks/validation/test-build';
+import { TtscCompiler } from 'ttsc';
 import type { TypeScriptEmitOptions } from './schema.js';
 
 interface TypeScriptEmitContext {
@@ -16,65 +19,67 @@ interface TypeScriptEmitResult {
   success: boolean;
 }
 
-interface TsConfigJson {
-  references?: unknown;
-}
-
-export interface CompilerInvocation {
-  command: 'tsc' | 'ttsc';
-  args: string[];
-  cwd: string;
-}
-
-export type CompilerRunner = (invocation: CompilerInvocation) => Promise<boolean>;
-
-export default function typescriptEmitExecutor(
+export default async function typescriptEmitExecutor(
   options: TypeScriptEmitOptions,
   context: TypeScriptEmitContext,
-): Promise<TypeScriptEmitResult> {
-  return runTypeScriptEmit(options, context, runCompiler);
-}
-
-export async function runTypeScriptEmit(
-  options: TypeScriptEmitOptions,
-  context: TypeScriptEmitContext,
-  runner: CompilerRunner,
 ): Promise<TypeScriptEmitResult> {
   const cwd = isAbsolute(options.cwd) ? options.cwd : join(context.root, options.cwd);
-  const tsConfigPath = isAbsolute(options.tsConfig) ? options.tsConfig : join(cwd, options.tsConfig);
-  const tsConfig = readJsonFile<TsConfigJson>(tsConfigPath);
-  const overlayPath = join(dirname(tsConfigPath), `.ttsc-js-${process.pid}-${randomUUID()}.json`);
+  const tests = options.kind === 'tests';
+  const declarations = !tests && options.kind !== 'javascript';
+  const tsConfigPath = resolve(cwd, options.tsConfig);
+  const project = readTsConfig(tsConfigPath);
+  const configDirectory = join(cwd, '.cache', 'ttsc-config');
+  await mkdir(configDirectory, { recursive: true });
+  const overlayPath = join(configDirectory, `${randomUUID()}.json`);
+  // The public ttsc API captures real emitted artifacts. Its supported config
+  // wrapper changes emission only; original input globs and references remain.
   const overlay = {
-    extends: `./${basename(tsConfigPath)}`,
+    extends: tsConfigPath,
     compilerOptions: {
-      composite: false,
-      declaration: false,
-      declarationMap: false,
+      noEmit: false,
       emitDeclarationOnly: false,
+      composite: false,
       incremental: false,
+      declaration: declarations,
+      declarationMap: declarations,
+      sourceMap: true,
+      inlineSources: true,
+      rewriteRelativeImportExtensions: true,
+      ...(tests ? { rootDir: cwd, outDir: join(cwd, TYPESCRIPT_TEST_OUTPUT_DIRECTORY) } : {}),
     },
-    ...(Array.isArray(tsConfig.references) ? { references: tsConfig.references } : {}),
+    references: project.projectReferences,
   };
-
-  await writeFile(overlayPath, `${JSON.stringify(overlay, null, 2)}\n`, { flag: 'wx' });
+  await writeFile(overlayPath, JSON.stringify(overlay), { flag: 'wx' });
   try {
-    const javascriptSucceeded = await runner({
-      command: 'ttsc',
-      args: ['-p', overlayPath, '--emit'],
+    const result = new TtscCompiler({
       cwd,
-    });
-    if (!javascriptSucceeded) {
+      tsconfig: overlayPath,
+      projectRoot: dirname(tsConfigPath),
+      pluginConfigDir: dirname(tsConfigPath),
+    }).compile();
+    if (result.type === 'exception') {
+      console.error(result.error);
       return { success: false };
     }
+    for (const diagnostic of result.diagnostics ?? []) console.error(diagnostic);
+    if (result.type === 'failure') return { success: false };
 
-    await makePackageBinsExecutable(cwd, options.executableOutputs ?? []);
-
-    const declarationsSucceeded = await runner({
-      command: 'tsc',
-      args: ['-p', overlayPath, '--emitDeclarationOnly', '--declaration', '--declarationMap'],
-      cwd,
-    });
-    return { success: declarationsSucceeded };
+    const manifest = typescriptEmissionManifest(cwd, result.output);
+    if (tests) await rm(join(cwd, TYPESCRIPT_TEST_OUTPUT_DIRECTORY), { recursive: true, force: true });
+    for (const [name, content] of Object.entries(result.output)) {
+      const outputPath = resolve(cwd, name);
+      const owned = relative(cwd, outputPath);
+      if (isAbsolute(owned) || owned === '..' || owned.startsWith(`..${sep}`)) {
+        throw new Error(`Compiler output must stay inside the project: ${name}`);
+      }
+      await mkdir(dirname(outputPath), { recursive: true });
+      await writeFile(outputPath, content);
+    }
+    const manifestPath = join(cwd, tests ? TYPESCRIPT_TEST_MANIFEST : TYPESCRIPT_LIBRARY_MANIFEST);
+    await mkdir(dirname(manifestPath), { recursive: true });
+    await writeFile(manifestPath, JSON.stringify(manifest));
+    if (!tests) await makePackageBinsExecutable(cwd, options.executableOutputs ?? []);
+    return { success: true };
   } finally {
     await rm(overlayPath, { force: true });
   }
@@ -93,24 +98,6 @@ async function makePackageBinsExecutable(cwd: string, outputs: readonly string[]
       throw new Error(`Executable output must stay inside the project: ${output}`);
     }
     const outputStat = await stat(outputPath);
-    // TypeScript creates emitted files with the process default mode. A package
-    // bin that loses its execute bits is present but unusable through
-    // node_modules/.bin, so restore the semantic guarantee declared by `bin`.
     await chmod(outputPath, outputStat.mode | 0o111);
-  }
-}
-
-async function runCompiler(invocation: CompilerInvocation): Promise<boolean> {
-  const child = spawn(invocation.command, invocation.args, {
-    cwd: invocation.cwd,
-    stdio: 'inherit',
-    windowsHide: true,
-  });
-  try {
-    await once(child, 'exit');
-    return child.exitCode === 0 && child.signalCode === null;
-  } catch (error) {
-    console.error(`${invocation.command}: ${error instanceof Error ? error.message : String(error)}`);
-    return false;
   }
 }

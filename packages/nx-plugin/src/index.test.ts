@@ -168,7 +168,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
     }
   });
 
-  it('splits transformed JavaScript emit from native declarations and typechecking', async () => {
+  it('uses the transformer-aware compiler and separates artifact inputs from validation inputs', async () => {
     const workspace = await createWorkspace();
     try {
       await workspace.write(
@@ -200,9 +200,12 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         ...toolchainInputs,
         '{projectRoot}/tsconfig.lib.json',
       ]);
-      expect(targets['tsc-js']?.outputs).toEqual(['{projectRoot}/dist/**/*.{js,cjs,mjs,jsx,d.ts,d.cts,d.mts}{,.map}']);
+      expect(targets['tsc-js']?.outputs).toEqual([
+        '{projectRoot}/dist/**/*.{js,cjs,mjs,jsx,d.ts,d.cts,d.mts}{,.map}',
+        '{projectRoot}/.cache/ttsc-library.json',
+      ]);
       expect(targets.typecheck?.options).toMatchObject({
-        command: 'tsc -p tsconfig.lib.json --noEmit',
+        command: 'ttsc -p tsconfig.lib.json --noEmit',
         cwd: 'packages/example',
       });
       const checkToolchainInputs = [
@@ -219,13 +222,16 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       ]);
       expect(targets.build?.executor).toBe('nx:noop');
       expect(targets.build?.cache).toBe(true);
-      expect(targets.build?.dependsOn).toEqual(['^build', 'tsc-js']);
+      expect(targets.build?.dependsOn).toEqual(['^build', 'ttsc-test-compile', 'tsc-js']);
       // An `nx:noop` aggregate writes no file, so it must claim none: a
       // `{projectRoot}/dist` claim here would double-cache its children's bytes
       // and make `github-ci nx-run-many --collect-outputs` attribute every file
       // under dist to `build`, including the platform artifacts that collect
       // deliberately leaves to the platform step.
       expect(targets.build?.outputs).toBeUndefined();
+      expect(targets['ttsc-test-compile']?.dependsOn).toEqual(['^build', 'tsc-js']);
+      expect(targets.test?.dependsOn).toContain('ttsc-test-compile');
+      expect(targets['ttsc-test-compile']?.outputs).toEqual(['{projectRoot}/.cache/test-build']);
       expect(targets.clean?.executor).toBe('@smoothbricks/nx-plugin:clean-outputs');
       expect(targets.clean?.cache).toBe(false);
 
@@ -233,7 +239,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       expect(targets['typecheck-tests']?.cache).toBe(true);
       expect(targets['typecheck-tests']?.dependsOn).toEqual(['tsc-js', 'typecheck']);
       expect(targets['typecheck-tests']?.options).toMatchObject({
-        command: 'tsc -p tsconfig.test.json --noEmit',
+        command: 'ttsc -p tsconfig.test.json --noEmit',
         cwd: 'packages/example',
       });
       expect(targets['typecheck-tests']?.inputs).toEqual([
@@ -246,7 +252,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       expect(targets['typecheck-tests:watch']?.executor).toBe('nx:run-commands');
       expect(targets['typecheck-tests:watch']?.continuous).toBe(true);
       expect(targets['typecheck-tests:watch']?.options).toMatchObject({
-        command: 'tsc -p tsconfig.test.json --noEmit --watch',
+        command: 'ttsc -p tsconfig.test.json --noEmit --watch',
         cwd: 'packages/example',
       });
 
@@ -1399,7 +1405,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       const targets = await inferProjectTargets(workspace, 'packages/cowshed/package.json');
 
       expect(targets['cargo-wasm']).toBeUndefined();
-      expect(targets['tsc-js']?.outputs).toEqual(['{projectRoot}/dist/ts']);
+      expect(targets['tsc-js']?.outputs).toEqual(['{projectRoot}/dist/ts', '{projectRoot}/.cache/ttsc-library.json']);
       // This fixture declares all four supported triples, so on EVERY supported
       // runner the host's own triple is present and native: the host provider is
       // that platform target and `cargo-napi` is never inferred. Tying the native
