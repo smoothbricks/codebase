@@ -67,7 +67,19 @@ export interface ManagedFileContext {
   crossTestArchives: CiCrossTestArchive[];
 }
 
+/** Temporary upstream compiler repairs distributed to smoo-managed Bun workspaces. */
+export const managedTtscPatch = {
+  version: '0.30.4',
+  key: 'ttsc@0.30.4',
+  path: 'patches/ttsc@0.30.4.patch',
+} as const;
+
 const managedFiles: ManagedFileDescriptor[] = [
+  {
+    kind: 'raw',
+    source: managedTtscPatch.path,
+    target: managedTtscPatch.path,
+  },
   {
     kind: 'raw',
     source: 'envrc',

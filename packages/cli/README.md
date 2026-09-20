@@ -280,6 +280,13 @@ compiler API, so workspace `typescript` stays on TypeScript 6. After install, se
 ([oven-sh/bun#33834](https://github.com/oven-sh/bun/issues/33834)). Both dependencies and the environment binding are
 required: TypeScript 7 under the unscoped name breaks Nx API calls such as `readConfigFile`.
 
+For `ttsc@0.30.4`, smoo temporarily distributes `patches/ttsc@0.30.4.patch` and registers it in the root
+`patchedDependencies` before `smoo monorepo update` runs Bun installation. The patch repairs native meta-property
+emission and import-extension handling during the compiler's internal forced-emission diagnostic pass; user `--noEmit`
+still writes no output. The packaged managed asset is the source, so clean managed installs receive the same repair
+without a compiler fork or edits to the dependency cache. The registration applies only to that exact compiler version;
+the repository's lockfile continues to own its compiler pin.
+
 Explicit Nx target names must not contain `:`. Nx already uses colon syntax at the CLI boundary:
 `project:target:configuration`. Allowing target names like `build:wasm` makes command parsing and package-script aliases
 look like configurations, and it prevents a clean split between concrete tool-output targets and aggregate targets.

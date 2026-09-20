@@ -1,5 +1,6 @@
 import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
+import { managedTtscPatch } from '@smoothbricks/nx-plugin/managed-files/files';
 import typia from 'typia';
 import { cliPackageVersion, isSmoothBricksCodebasePackageName } from '../lib/cli-package.js';
 import {
@@ -72,7 +73,7 @@ const rootDevDependencies: RequiredDependency[] = [
   // ttsc participates in cache keys and vendors the Go SDK that
   // `smoo monorepo check` matches against devenv's pinned Go, so it is an exact
   // pin the repository owns, read back from bun.lock rather than restated here.
-  { name: 'ttsc', fallbackVersion: '0.28.3', pinnedFromLockfile: true },
+  { name: 'ttsc', fallbackVersion: managedTtscPatch.version, pinnedFromLockfile: true },
   // Nx and typescript-eslint still load the TypeScript JS API (6.x).
   // Compilation is exclusively delegated to ttsc by the Nx plugin targets.
   { name: 'typescript', fallbackVersion: '^6.0.3', minimumVersion: '6.0.0', prefix: '^' },
@@ -128,7 +129,7 @@ export async function validateToolConfig(root: string): Promise<number> {
   const context = await readToolContext(root);
   return (
     validateRootDevDependencies(context.policy, context.rootPackage) +
-    validateObsoleteTtscPatchRemoved(context.rootPackage) +
+    validateTtscPatch(context.rootPackage) +
     validateToolingPackage(root, context.policy) +
     validateToolingWorkspace(context.rootPackage) +
     validateDevenvPackages(root)
@@ -156,7 +157,7 @@ export async function applyRootDevDependencyDefaults(root: string, context: Tool
     delete devDependencies[cliPackageName];
     changed = true;
   }
-  changed = removeObsoleteTtscPatch(pkg) || changed;
+  changed = syncTtscPatch(pkg) || changed;
   if (changed) {
     writeJsonObject(join(root, 'package.json'), pkg);
     console.log('updated        package.json workspace tool dependencies');
@@ -185,7 +186,7 @@ async function applyRootPackageToolDefaults(root: string, context: ToolContext):
     dependencyChanged = true;
   }
   workspaceChanged = addWorkspacePattern(pkg, 'tooling');
-  dependencyChanged = removeObsoleteTtscPatch(pkg) || dependencyChanged;
+  dependencyChanged = syncTtscPatch(pkg) || dependencyChanged;
   if (dependencyChanged || workspaceChanged) {
     writeJsonObject(join(root, 'package.json'), pkg);
   }
@@ -304,15 +305,35 @@ function removeObsoleteTtscPatch(pkg: PackageJson): boolean {
   return true;
 }
 
-function validateObsoleteTtscPatchRemoved(rootPackage: PackageJson | null): number {
-  const patchedDependencies = rootPackage?.patchedDependencies;
-  if (!patchedDependencies || !(obsoleteTtscPatchedDependencyKey in patchedDependencies)) {
-    return 0;
+function syncTtscPatch(pkg: PackageJson): boolean {
+  let changed = removeObsoleteTtscPatch(pkg);
+  if (pkg.devDependencies?.ttsc === managedTtscPatch.version) {
+    const patches = pkg.patchedDependencies ?? {};
+    changed = setStringProperty(patches, managedTtscPatch.key, managedTtscPatch.path) || changed;
+    pkg.patchedDependencies = patches;
   }
-  console.error(
-    `package.json patchedDependencies.${obsoleteTtscPatchedDependencyKey} must be removed; every supported ttsc emits typia declarations without the obsolete patch`,
-  );
-  return 1;
+  return changed;
+}
+
+function validateTtscPatch(rootPackage: PackageJson | null): number {
+  const patches = rootPackage?.patchedDependencies;
+  let failures = 0;
+  if (patches && obsoleteTtscPatchedDependencyKey in patches) {
+    console.error(
+      `package.json patchedDependencies.${obsoleteTtscPatchedDependencyKey} is obsolete; run smoo monorepo update`,
+    );
+    failures++;
+  }
+  if (
+    rootPackage?.devDependencies?.ttsc === managedTtscPatch.version &&
+    patches?.[managedTtscPatch.key] !== managedTtscPatch.path
+  ) {
+    console.error(
+      `package.json patchedDependencies.${managedTtscPatch.key} must be ${managedTtscPatch.path}; run smoo monorepo update`,
+    );
+    failures++;
+  }
+  return failures;
 }
 
 export function validateToolingPackage(root: string, policy: ToolPolicy): number {
