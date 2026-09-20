@@ -1,3 +1,93 @@
+diff --git a/driver/program.go b/driver/program.go
+--- a/driver/program.go
++++ b/driver/program.go
+@@ -476,6 +476,12 @@ func forceEmit(parsed *tsoptions.ParsedCommandLine) {
+   options := parsed.ParsedConfig.CompilerOptions
+   options.NoEmit = core.TSFalse
+   options.EmitDeclarationOnly = core.TSFalse
++  // Match the CLI's --emit override: TypeScript-extension imports must become
++  // JavaScript-extension imports when an analysis-only program is emitted,
++  // including private plugin traversals whose caller discards the output.
++  if options.AllowImportingTsExtensions.IsTrue() {
++    options.RewriteRelativeImportExtensions = core.TSTrue
++  }
+ }
+ 
+ // forceNoEmit sets noEmit so the program type-checks without writing files.
+diff --git a/driver/force_emit_analysis_options_test.go b/driver/force_emit_analysis_options_test.go
+new file mode 100644
+--- /dev/null
++++ b/driver/force_emit_analysis_options_test.go
+@@ -0,0 +1,69 @@
++package driver
++
++import (
++	"os"
++	"path/filepath"
++	"strings"
++	"testing"
++
++	shimast "github.com/microsoft/typescript-go/shim/ast"
++	shimcompiler "github.com/microsoft/typescript-go/shim/compiler"
++	shimprinter "github.com/microsoft/typescript-go/shim/printer"
++)
++
++func TestForceEmitRewritesAnalysisOnlyImports(t *testing.T) {
++	root, err := filepath.EvalSymlinks(t.TempDir())
++	if err != nil {
++		t.Fatal(err)
++	}
++	files := map[string]string{
++		"tsconfig.json": `{"compilerOptions":{"target":"ES2022","module":"ESNext","moduleResolution":"Bundler","types":[],"strict":true,"noEmit":true,"noEmitOnError":true,"allowImportingTsExtensions":true,"outDir":"out"},"files":["index.ts","dependency.ts"]}`,
++		"dependency.ts": `export const value = 7;`,
++		"index.ts": `import { value } from "./dependency.ts"; export const result = value;`,
++	}
++	for name, text := range files {
++		if err := os.WriteFile(filepath.Join(root, name), []byte(text), 0o644); err != nil {
++			t.Fatal(err)
++		}
++	}
++	analysis, diagnostics, err := LoadProgram(root, "tsconfig.json", LoadProgramOptions{})
++	if err != nil || CountErrors(diagnostics) != 0 {
++		t.Fatalf("analysis load failed: %v; %v", err, diagnostics)
++	}
++	defer analysis.Close()
++	if diagnostics := analysis.Diagnostics(); CountErrors(diagnostics) != 0 {
++		t.Fatalf("valid analysis-only imports failed checking: %v", diagnostics)
++	}
++	diagnostics, err = analysis.EmitWithPluginTransformer(
++		func(_ *shimprinter.EmitContext, source *shimast.SourceFile) *shimast.SourceFile {
++			t.Fatal("analysis-only program ran a JavaScript emit hook")
++			return source
++		},
++		func(name, text string, _ *shimcompiler.WriteFileData) error {
++			t.Fatalf("analysis-only program wrote %s", name)
++			return nil
++		},
++	)
++	if err != nil || CountErrors(diagnostics) != 0 {
++		t.Fatalf("analysis-only emit failed: %v; %v", err, diagnostics)
++	}
++	emitting, diagnostics, err := LoadProgram(root, "tsconfig.json", LoadProgramOptions{ForceEmit: true})
++	if err != nil || CountErrors(diagnostics) != 0 {
++		t.Fatalf("forced emit load failed: %v; %v", err, diagnostics)
++	}
++	defer emitting.Close()
++	output := make(map[string]string)
++	diagnostics, err = emitting.EmitWithPluginTransformer(
++		func(_ *shimprinter.EmitContext, source *shimast.SourceFile) *shimast.SourceFile { return source },
++		func(name, text string, _ *shimcompiler.WriteFileData) error {
++			output[filepath.Base(name)] = text
++			return nil
++		},
++	)
++	if err != nil || CountErrors(diagnostics) != 0 {
++		t.Fatalf("forced emit rejected analysis-only imports: %v; %v", err, diagnostics)
++	}
++	if !strings.Contains(output["index.js"], `from "./dependency.js"`) {
++		t.Fatalf("forced emit did not rewrite the runtime import: %s", output["index.js"])
++	}
++}
 diff --git a/node_modules/ttsc/driver/emit_meta_properties_test.go b/driver/emit_meta_properties_test.go
 new file mode 100644
 index 0000000000000000000000000000000000000000..fbd4e7520f47592d2fb8613706768bd4f46e05ce
