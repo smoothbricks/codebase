@@ -45,15 +45,23 @@ try {
     const manifest = manifests.get(name);
     const source = join(root, 'packages', name);
     const archive = join(artifacts, `${name}.tgz`);
-    const manifestPath = join(source, 'package.json');
-    const original = readFileSync(manifestPath);
-    // Use the release packer's pure transform; never patch an already-created tarball.
-    writeFileSync(manifestPath, `${JSON.stringify(prunePublishedExports(manifest).manifest, null, 2)}\n`);
-    try {
-      execFileSync('bun', ['pm', 'pack', '--filename', archive, '--quiet'], { cwd: source, stdio: 'inherit' });
-    } finally {
-      writeFileSync(manifestPath, original);
-    }
+    // Let Bun select published files and resolve workspace ranges without
+    // mutating manifests that concurrent compiler tasks are reading.
+    const sourceArchive = join(temporary, `${name}-source.tgz`);
+    execFileSync('bun', ['pm', 'pack', '--filename', sourceArchive, '--ignore-scripts', '--quiet'], {
+      cwd: source,
+      stdio: 'inherit',
+    });
+    const staged = join(temporary, 'staged', name);
+    mkdirSync(staged, { recursive: true });
+    execFileSync('tar', ['-xzf', sourceArchive, '-C', staged, '--strip-components=1']);
+    const stagedManifestPath = join(staged, 'package.json');
+    const stagedManifest = JSON.parse(readFileSync(stagedManifestPath, 'utf8'));
+    writeFileSync(stagedManifestPath, `${JSON.stringify(prunePublishedExports(stagedManifest).manifest, null, 2)}\n`);
+    execFileSync('bun', ['pm', 'pack', '--filename', archive, '--ignore-scripts', '--quiet'], {
+      cwd: staged,
+      stdio: 'inherit',
+    });
     const target = join(temporary, 'inspected', name);
     mkdirSync(target, { recursive: true });
     execFileSync('tar', ['-xzf', archive, '-C', target, '--strip-components=1']);
