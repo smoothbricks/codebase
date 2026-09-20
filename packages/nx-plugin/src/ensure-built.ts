@@ -7,7 +7,7 @@ import { join, resolve } from 'node:path';
 import type * as NxConfiguration from 'nx/src/config/nx-json';
 import type { NxJsonConfiguration } from 'nx/src/config/nx-json';
 import type { ProjectGraph, ProjectGraphProjectNode } from 'nx/src/config/project-graph';
-import type { Task } from 'nx/src/config/task-graph';
+import type { Task, TaskGraph } from 'nx/src/config/task-graph';
 import type * as NxDaemonClient from 'nx/src/daemon/client/client';
 import type * as NxHashTask from 'nx/src/hasher/hash-task';
 import type * as NxTaskHasher from 'nx/src/hasher/task-hasher';
@@ -84,6 +84,7 @@ export type MissReason =
   | { readonly kind: 'not-cached'; readonly taskId: string }
   | { readonly kind: 'cached-failure'; readonly taskId: string; readonly code: number }
   | { readonly kind: 'stale-outputs'; readonly taskId: string }
+  | { readonly kind: 'stale-inputs'; readonly taskId: string }
   | { readonly kind: 'cache-disabled'; readonly taskId: string }
   | { readonly kind: 'no-daemon'; readonly taskId: string };
 
@@ -159,6 +160,8 @@ export function describeMiss(reason: MissReason): string {
       return `${reason.taskId} last failed with exit code ${reason.code}`;
     case 'stale-outputs':
       return `${reason.taskId} outputs are missing or modified on disk`;
+    case 'stale-inputs':
+      return `${reason.taskId} inputs changed since the Nx daemon last looked`;
     case 'cache-disabled':
       return `the Nx cache is disabled, so ${reason.taskId} must run`;
     case 'no-daemon':
@@ -299,11 +302,10 @@ async function ensureBuiltInWorkspace(
     delete process.env.NX_DISABLE_NX_CACHE;
   }
 
-  await refreshWorkspaceContext(workspaceRoot, requireNx);
-
   const { readNxJson } = requireNx('nx/src/config/nx-json');
   const { splitArgsIntoNxArgsAndOverrides } = requireNx('nx/src/utils/command-line-utils');
   const { setEnvVarsBasedOnArgs } = requireNx('nx/src/tasks-runner/run-command');
+  const { createTaskGraph } = requireNx('nx/src/tasks-runner/create-task-graph');
   const hooks = requireNx('nx/src/project-graph/plugins/tasks-execution-hooks');
 
   const nxJson = readNxJson();
@@ -323,6 +325,23 @@ async function ensureBuiltInWorkspace(
   // the probe keys differently from the CLI.
   setEnvVarsBasedOnArgs(nxArgs, loadDotEnvFiles);
 
+  performance.mark('ensureBuilt:graph:start');
+  const { projectGraph } = await daemonClient.getProjectGraphAndSourceMaps();
+  requireProject(projectGraph, selector.project);
+  const taskGraph = createTaskGraph(
+    projectGraph,
+    {},
+    [selector.project],
+    [selector.target],
+    selector.configuration,
+    overrides,
+    false,
+  );
+  const tasks = Object.values(taskGraph.tasks);
+  performance.measure('ensureBuilt:graph', 'ensureBuilt:graph:start');
+
+  const inputsChanged = await refreshWorkspaceContext(workspaceRoot, tasks, requireNx);
+
   const runId = randomUUID();
   const startTime = Date.now();
   // Plugin `preTasksExecution` hooks inject environment variables, and declared
@@ -338,14 +357,16 @@ async function ensureBuiltInWorkspace(
 
   performance.mark('ensureBuilt:probe:start');
   let reason: MissReason | null;
+  const selectorTaskId =
+    selector.configuration === undefined
+      ? `${selector.project}:${selector.target}`
+      : `${selector.project}:${selector.target}:${selector.configuration}`;
   if (process.env.NX_SKIP_NX_CACHE === 'true' || process.env.NX_DISABLE_NX_CACHE === 'true') {
-    const taskId =
-      selector.configuration === undefined
-        ? `${selector.project}:${selector.target}`
-        : `${selector.project}:${selector.target}:${selector.configuration}`;
-    reason = { kind: 'cache-disabled', taskId };
+    reason = { kind: 'cache-disabled', taskId: selectorTaskId };
+  } else if (inputsChanged) {
+    reason = { kind: 'stale-inputs', taskId: selectorTaskId };
   } else {
-    reason = await probe(nxJson, nxArgs, overrides, selector, requireNx);
+    reason = await probe(nxJson, nxArgs, projectGraph, taskGraph, tasks, requireNx);
   }
   performance.measure('ensureBuilt:probe', 'ensureBuilt:probe:start');
   const outcome =
@@ -395,13 +416,25 @@ function bindWorkspaceRoot(workspaceRoot: string, requireNx: WorkspaceNxRequire)
  * The daemon drains delivered watcher events before serving its graph, but an
  * OS event can still be in flight after a write has completed. Its graph and
  * hashes can then agree with each other while both describe yesterday's files.
- * Take Nx's native, ignore-aware disk snapshot before consulting either; its
- * metadata cache reuses unchanged file hashes. Reconcile only changed paths,
- * including additions/deletions, so a warm hit never invalidates the graph.
+ * Take Nx's native, ignore-aware disk snapshot and compare it with the
+ * daemon's file table; its metadata cache reuses unchanged file hashes.
+ *
+ * Any difference is handed to the daemon so its next graph is current, but
+ * that only schedules a recomputation, and a probe meanwhile would hash
+ * against the file map it already has. So the caller does not probe: if any
+ * differing path is not a declared output of a task in the graph, this
+ * returns true and the target is run, which lets Nx's own runner wait for the
+ * recomputation. Output paths are exempt because a build's own writes are the
+ * commonest thing to reach here before the watcher does, and treating them as
+ * a miss would make every hit after a build replay the cached log.
  */
-async function refreshWorkspaceContext(workspaceRoot: string, requireNx: WorkspaceNxRequire): Promise<void> {
+async function refreshWorkspaceContext(
+  workspaceRoot: string,
+  tasks: Task[],
+  requireNx: WorkspaceNxRequire,
+): Promise<boolean> {
   const { daemonClient } = requireNx('nx/src/daemon/client/client');
-  const { WorkspaceContext } = requireNx('nx/src/native');
+  const { WorkspaceContext, matchOutputPaths } = requireNx('nx/src/native');
   const { workspaceDataDirectoryForWorkspace } = requireNx('nx/src/utils/cache-directory');
   performance.mark('ensureBuilt:inputs:start');
   const previousFiles = await daemonClient.getWorkspaceContextFileData();
@@ -423,42 +456,35 @@ async function refreshWorkspaceContext(workspaceRoot: string, requireNx: Workspa
     previousHashes.delete(file);
   }
   const deletedFiles = [...previousHashes.keys()];
-  if (createdFiles.length > 0 || updatedFiles.length > 0 || deletedFiles.length > 0) {
+  const changed = [...createdFiles, ...updatedFiles, ...deletedFiles];
+  let inputsChanged = false;
+  if (changed.length > 0) {
     await daemonClient.updateWorkspaceContext(createdFiles, updatedFiles, deletedFiles);
+    // The same matcher the task runner uses to collect outputs, over the union
+    // of every task's declared outputs. A negation declared by one task then
+    // also excludes another task's output, which errs toward a miss.
+    const outputs = tasks.flatMap((task) => task.outputs);
+    inputsChanged = matchOutputPaths(outputs, changed).includes(false);
   }
   performance.measure('ensureBuilt:inputs', 'ensureBuilt:inputs:start');
+  return inputsChanged;
 }
 
 /** `null` when the target is already built; otherwise the first reason it is not. */
 async function probe(
   nxJson: NxJsonConfiguration,
   nxArgs: NxArgs,
-  overrides: Record<string, unknown>,
-  selector: TargetSelector,
+  projectGraph: ProjectGraph,
+  taskGraph: TaskGraph,
+  tasks: Task[],
   requireNx: WorkspaceNxRequire,
 ): Promise<MissReason | null> {
   const { daemonClient } = requireNx('nx/src/daemon/client/client');
-  const { createTaskGraph } = requireNx('nx/src/tasks-runner/create-task-graph');
   const { DaemonBasedTaskHasher } = requireNx('nx/src/hasher/task-hasher');
   const { getTaskDetails, hashTasks } = requireNx('nx/src/hasher/hash-task');
   const { getTaskSpecificEnv } = requireNx('nx/src/tasks-runner/task-env');
   const { getCache } = requireNx('nx/src/tasks-runner/cache');
   const { getRunnerOptions } = requireNx('nx/src/tasks-runner/run-command');
-
-  performance.mark('ensureBuilt:graph:start');
-  const { projectGraph } = await daemonClient.getProjectGraphAndSourceMaps();
-  requireProject(projectGraph, selector.project);
-  const taskGraph = createTaskGraph(
-    projectGraph,
-    {},
-    [selector.project],
-    [selector.target],
-    selector.configuration,
-    overrides,
-    false,
-  );
-  const tasks = Object.values(taskGraph.tasks);
-  performance.measure('ensureBuilt:graph', 'ensureBuilt:graph:start');
 
   // `isCloudDefault: false` because these options are only read here by the
   // hasher, which looks at `selectivelyHashTsConfig`; the cloud credentials the

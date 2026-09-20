@@ -270,6 +270,10 @@ through the inferred `typecheck-tests` target, not through `tsc --build`.
 hashes. A full hit returns without running tasks or printing output. A miss runs the task graph through Nx's in-process
 runner with streaming output; only a workspace with the daemon disabled falls back to its checkout-local `nx` CLI.
 
+Before hashing, it compares a native snapshot of the workspace with the daemon's file table. A write the daemon's
+watcher has not delivered yet counts as a miss unless every changed path is a declared output of a task in the graph, so
+a build's own artifacts never turn the next call noisy, and an edit made moments before the call never hits stale.
+
 ```typescript
 import { ensureBuilt } from '@smoothbricks/nx-plugin/ensure-built';
 
@@ -342,17 +346,14 @@ The generator rewrites `package.json` so `nx.targets.test` uses:
 
 ## Managed workspace files
 
-`nx generate @smoothbricks/nx-plugin:managed-files` stages the same managed files as
-`smoo monorepo update`, without installing packages or resolving secrets. Use Nx
-`--dry-run` to inspect the changes. The workspace defaults register this generator
-for `nx sync` and `nx sync:check`.
+`nx generate @smoothbricks/nx-plugin:managed-files` stages the same managed files as `smoo monorepo update`, without
+installing packages or resolving secrets. Use Nx `--dry-run` to inspect the changes. The workspace defaults register
+this generator for `nx sync` and `nx sync:check`.
 
-The plugin owns the packaged templates, pure rendering and content-preservation
-functions. The generator reads workspace files through Nx `Tree` and uses Nx's
-resolved project graph for inferred targets. The CLI only supplies the filesystem
+The plugin owns the packaged templates, pure rendering and content-preservation functions. The generator reads workspace
+files through Nx `Tree` and uses Nx's resolved project graph for inferred targets. The CLI only supplies the filesystem
 and process boundary. There is no separate serialized change plan.
 
-Files with a `# smoo-local` tail or `# smoo-local-begin` / `# smoo-local-end` blocks
-retain those sections. Matching source symlinks are preserved; conflicting local
-blocks and broken or external links are reported instead of overwritten. The
-generator does not remove a repository-owned file when a capability is disabled.
+Files with a `# smoo-local` tail or `# smoo-local-begin` / `# smoo-local-end` blocks retain those sections. Matching
+source symlinks are preserved; conflicting local blocks and broken or external links are reported instead of
+overwritten. The generator does not remove a repository-owned file when a capability is disabled.

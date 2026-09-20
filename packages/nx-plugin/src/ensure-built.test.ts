@@ -123,6 +123,7 @@ describe('describeMiss', () => {
       describeMiss({ kind: 'not-cached', taskId: 'app:build' }),
       describeMiss({ kind: 'cached-failure', taskId: 'app:build', code: 7 }),
       describeMiss({ kind: 'stale-outputs', taskId: 'app:build' }),
+      describeMiss({ kind: 'stale-inputs', taskId: 'app:build' }),
       describeMiss({ kind: 'cache-disabled', taskId: 'app:build' }),
       describeMiss({ kind: 'no-daemon', taskId: 'app:build' }),
     ];
@@ -275,6 +276,9 @@ describe('smoo-nx-exec', () => {
   let workspace = '';
   const report = () => join(workspace, 'report');
   const marker = () => join(workspace, 'packages', 'app', 'dist', 'marker.txt');
+  // Outside the workspace: a log inside it would be an undeclared output the
+  // snapshot diff rightly reports as a changed input.
+  const builds = () => `${workspace}-lib-builds.log`;
 
   beforeAll(async () => {
     // Realpath because macOS puts the temp directory behind a /private
@@ -303,8 +307,7 @@ describe('smoo-nx-exec', () => {
             inputs: ['{projectRoot}/source*.txt'],
             outputs: ['{projectRoot}/dist'],
             options: {
-              command:
-                'mkdir -p dist && cat source*.txt > dist/lib.txt && cat dist/lib.txt >> ../../.nx/lib-builds.log',
+              command: `mkdir -p dist && cat source*.txt > dist/lib.txt && cat dist/lib.txt >> ${builds()}`,
               cwd: '{projectRoot}',
             },
           },
@@ -356,6 +359,7 @@ describe('smoo-nx-exec', () => {
     if (workspace) {
       await nx(workspace, ['daemon', '--stop']);
       await rm(workspace, { recursive: true, force: true });
+      await rm(builds(), { force: true });
     }
   });
 
@@ -444,14 +448,13 @@ describe('smoo-nx-exec', () => {
   });
 
   it('runs again when a dependency\u0027s own inputs change', async () => {
-    const builds = join(workspace, '.nx', 'lib-builds.log');
-    const before = await readFile(builds, 'utf-8');
+    const before = await readFile(builds(), 'utf-8');
     await writeFile(join(workspace, 'packages', 'lib', 'source.txt'), 'lib changed\n');
     const changed = await runBin(workspace, ['app:build', '--', './report']);
     expect(changed.code).toBe(0);
     expect(await readFile(join(workspace, 'packages', 'lib', 'dist', 'lib.txt'), 'utf-8')).toBe('lib changed\n');
     expect(await readFile(marker(), 'utf-8')).toBe('built\nlib changed\n');
-    expect(await readFile(builds, 'utf-8')).toBe(`${before}lib changed\n`);
+    expect(await readFile(builds(), 'utf-8')).toBe(`${before}lib changed\n`);
 
     // And the graph settles back to silence, which is only reachable if the
     // dependent-outputs task was hashed too.
@@ -459,10 +462,10 @@ describe('smoo-nx-exec', () => {
     expect(settled.code).toBe(0);
     expect(settled.stderr).toBe('');
     expect(settled.stdout.split('\n')[0]).toBe(MARKER);
-    expect(await readFile(builds, 'utf-8')).toBe(`${before}lib changed\n`);
+    expect(await readFile(builds(), 'utf-8')).toBe(`${before}lib changed\n`);
   });
 
-  it('refreshes added and deleted dependency inputs before returning a hit', async () => {
+  it('runs again when a dependency input is added or deleted', async () => {
     const addedSource = join(workspace, 'packages', 'lib', 'source2.txt');
     await writeFile(addedSource, 'added\n');
     const added = await runBin(workspace, ['app:build', '--', './report']);
