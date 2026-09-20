@@ -4,27 +4,45 @@ import { existsSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { join, resolve } from 'node:path';
 
+import type * as NxConfiguration from 'nx/src/config/nx-json';
 import type { NxJsonConfiguration } from 'nx/src/config/nx-json';
 import type { ProjectGraph, ProjectGraphProjectNode } from 'nx/src/config/project-graph';
 import type { Task } from 'nx/src/config/task-graph';
+import type * as NxDaemonClient from 'nx/src/daemon/client/client';
+import type * as NxHashTask from 'nx/src/hasher/hash-task';
+import type * as NxTaskHasher from 'nx/src/hasher/task-hasher';
+import type * as NxNative from 'nx/src/native';
+import type * as NxExecutionHooks from 'nx/src/project-graph/plugins/tasks-execution-hooks';
+import type * as NxProjectGraph from 'nx/src/project-graph/project-graph';
+import type * as NxCache from 'nx/src/tasks-runner/cache';
+import type * as NxCreateTaskGraph from 'nx/src/tasks-runner/create-task-graph';
 import type { TaskResults } from 'nx/src/tasks-runner/life-cycle';
+import type * as NxRunCommand from 'nx/src/tasks-runner/run-command';
+import type * as NxTaskEnv from 'nx/src/tasks-runner/task-env';
+import type * as NxCacheDirectory from 'nx/src/utils/cache-directory';
+import type * as NxCommandLineUtils from 'nx/src/utils/command-line-utils';
 import type { NxArgs } from 'nx/src/utils/command-line-utils';
+import type * as NxExitCodes from 'nx/src/utils/exit-codes';
+import type * as NxPerfLogging from 'nx/src/utils/perf-logging';
+import type * as NxWorkspaceRoot from 'nx/src/utils/workspace-root';
 
 interface NxRuntimeModules {
-  readonly 'nx/src/config/nx-json': typeof import('nx/src/config/nx-json');
-  readonly 'nx/src/daemon/client/client': typeof import('nx/src/daemon/client/client');
-  readonly 'nx/src/hasher/hash-task': typeof import('nx/src/hasher/hash-task');
-  readonly 'nx/src/hasher/task-hasher': typeof import('nx/src/hasher/task-hasher');
-  readonly 'nx/src/project-graph/plugins/tasks-execution-hooks': typeof import('nx/src/project-graph/plugins/tasks-execution-hooks');
-  readonly 'nx/src/project-graph/project-graph': typeof import('nx/src/project-graph/project-graph');
-  readonly 'nx/src/tasks-runner/cache': typeof import('nx/src/tasks-runner/cache');
-  readonly 'nx/src/tasks-runner/create-task-graph': typeof import('nx/src/tasks-runner/create-task-graph');
-  readonly 'nx/src/tasks-runner/run-command': typeof import('nx/src/tasks-runner/run-command');
-  readonly 'nx/src/tasks-runner/task-env': typeof import('nx/src/tasks-runner/task-env');
-  readonly 'nx/src/utils/command-line-utils': typeof import('nx/src/utils/command-line-utils');
-  readonly 'nx/src/utils/exit-codes': typeof import('nx/src/utils/exit-codes');
-  readonly 'nx/src/utils/perf-logging': typeof import('nx/src/utils/perf-logging');
-  readonly 'nx/src/utils/workspace-root': typeof import('nx/src/utils/workspace-root');
+  readonly 'nx/src/config/nx-json': typeof NxConfiguration;
+  readonly 'nx/src/daemon/client/client': typeof NxDaemonClient;
+  readonly 'nx/src/hasher/hash-task': typeof NxHashTask;
+  readonly 'nx/src/hasher/task-hasher': typeof NxTaskHasher;
+  readonly 'nx/src/native': typeof NxNative;
+  readonly 'nx/src/project-graph/plugins/tasks-execution-hooks': typeof NxExecutionHooks;
+  readonly 'nx/src/project-graph/project-graph': typeof NxProjectGraph;
+  readonly 'nx/src/tasks-runner/cache': typeof NxCache;
+  readonly 'nx/src/tasks-runner/create-task-graph': typeof NxCreateTaskGraph;
+  readonly 'nx/src/tasks-runner/run-command': typeof NxRunCommand;
+  readonly 'nx/src/tasks-runner/task-env': typeof NxTaskEnv;
+  readonly 'nx/src/utils/cache-directory': typeof NxCacheDirectory;
+  readonly 'nx/src/utils/command-line-utils': typeof NxCommandLineUtils;
+  readonly 'nx/src/utils/exit-codes': typeof NxExitCodes;
+  readonly 'nx/src/utils/perf-logging': typeof NxPerfLogging;
+  readonly 'nx/src/utils/workspace-root': typeof NxWorkspaceRoot;
 }
 
 type WorkspaceNxRequire = <Specifier extends keyof NxRuntimeModules>(
@@ -202,10 +220,10 @@ export function firstStaleOutputs(tasks: readonly Task[], matches: readonly bool
  * when they already are.
  *
  * "Already built" is the hot path, because a checkout-local CLI wrapper pays it
- * on every invocation. So it never spawns the `nx` CLI: the project graph, the
- * task hashes and the on-disk output verification are daemon round-trips, the
- * cache lookup is a local SQLite read, and Nx's task runner is only invoked
- * once something is known to need running.
+ * on every invocation. So it never spawns the `nx` CLI: a native filesystem
+ * snapshot refreshes the daemon's inputs, the task hashes and on-disk output
+ * verification are daemon round-trips, and the cache lookup is a local SQLite
+ * read. Nx's task runner is only invoked once something needs running.
  *
  * With the daemon disabled there is no probe to make — hashing would have to
  * build the project graph in this process, and no service holds the recorded
@@ -280,6 +298,8 @@ async function ensureBuiltInWorkspace(
     delete process.env.NX_SKIP_NX_CACHE;
     delete process.env.NX_DISABLE_NX_CACHE;
   }
+
+  await refreshWorkspaceContext(workspaceRoot, requireNx);
 
   const { readNxJson } = requireNx('nx/src/config/nx-json');
   const { splitArgsIntoNxArgsAndOverrides } = requireNx('nx/src/utils/command-line-utils');
@@ -369,6 +389,44 @@ function bindWorkspaceRoot(workspaceRoot: string, requireNx: WorkspaceNxRequire)
       `ensureBuilt: Nx is already bound to workspace root ${boundRoot}, cannot switch to ${workspaceRoot}`,
     );
   }
+}
+
+/**
+ * The daemon drains delivered watcher events before serving its graph, but an
+ * OS event can still be in flight after a write has completed. Its graph and
+ * hashes can then agree with each other while both describe yesterday's files.
+ * Take Nx's native, ignore-aware disk snapshot before consulting either; its
+ * metadata cache reuses unchanged file hashes. Reconcile only changed paths,
+ * including additions/deletions, so a warm hit never invalidates the graph.
+ */
+async function refreshWorkspaceContext(workspaceRoot: string, requireNx: WorkspaceNxRequire): Promise<void> {
+  const { daemonClient } = requireNx('nx/src/daemon/client/client');
+  const { WorkspaceContext } = requireNx('nx/src/native');
+  const { workspaceDataDirectoryForWorkspace } = requireNx('nx/src/utils/cache-directory');
+  performance.mark('ensureBuilt:inputs:start');
+  const previousFiles = await daemonClient.getWorkspaceContextFileData();
+  const previousHashes = new Map<string, string>();
+  for (const { file, hash } of previousFiles) {
+    previousHashes.set(file, hash);
+  }
+  // A context is a snapshot, not a watcher. Do not reuse one across calls.
+  const context = new WorkspaceContext(workspaceRoot, workspaceDataDirectoryForWorkspace(workspaceRoot));
+  const createdFiles: string[] = [];
+  const updatedFiles: string[] = [];
+  for (const { file, hash } of context.allFileData()) {
+    const previousHash = previousHashes.get(file);
+    if (previousHash === undefined) {
+      createdFiles.push(file);
+    } else if (previousHash !== hash) {
+      updatedFiles.push(file);
+    }
+    previousHashes.delete(file);
+  }
+  const deletedFiles = [...previousHashes.keys()];
+  if (createdFiles.length > 0 || updatedFiles.length > 0 || deletedFiles.length > 0) {
+    await daemonClient.updateWorkspaceContext(createdFiles, updatedFiles, deletedFiles);
+  }
+  performance.measure('ensureBuilt:inputs', 'ensureBuilt:inputs:start');
 }
 
 /** `null` when the target is already built; otherwise the first reason it is not. */

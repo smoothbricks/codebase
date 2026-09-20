@@ -300,9 +300,13 @@ describe('smoo-nx-exec', () => {
           build: {
             executor: 'nx:run-commands',
             cache: true,
-            inputs: ['{projectRoot}/source.txt'],
+            inputs: ['{projectRoot}/source*.txt'],
             outputs: ['{projectRoot}/dist'],
-            options: { command: 'mkdir -p dist && cat source.txt > dist/lib.txt', cwd: '{projectRoot}' },
+            options: {
+              command:
+                'mkdir -p dist && cat source*.txt > dist/lib.txt && cat dist/lib.txt >> ../../.nx/lib-builds.log',
+              cwd: '{projectRoot}',
+            },
           },
         },
       }),
@@ -323,7 +327,10 @@ describe('smoo-nx-exec', () => {
             inputs: ['{projectRoot}/source.txt', { dependentTasksOutputFiles: '**/*' }],
             outputs: ['{projectRoot}/dist'],
             dependsOn: ['^build'],
-            options: { command: 'mkdir -p dist && cat source.txt > dist/marker.txt', cwd: '{projectRoot}' },
+            options: {
+              command: 'mkdir -p dist && cat source.txt ../lib/dist/lib.txt > dist/marker.txt',
+              cwd: '{projectRoot}',
+            },
           },
           broken: {
             executor: 'nx:run-commands',
@@ -437,13 +444,36 @@ describe('smoo-nx-exec', () => {
   });
 
   it('runs again when a dependency\u0027s own inputs change', async () => {
+    const builds = join(workspace, '.nx', 'lib-builds.log');
+    const before = await readFile(builds, 'utf-8');
     await writeFile(join(workspace, 'packages', 'lib', 'source.txt'), 'lib changed\n');
     const changed = await runBin(workspace, ['app:build', '--', './report']);
     expect(changed.code).toBe(0);
     expect(await readFile(join(workspace, 'packages', 'lib', 'dist', 'lib.txt'), 'utf-8')).toBe('lib changed\n');
+    expect(await readFile(marker(), 'utf-8')).toBe('built\nlib changed\n');
+    expect(await readFile(builds, 'utf-8')).toBe(`${before}lib changed\n`);
 
     // And the graph settles back to silence, which is only reachable if the
     // dependent-outputs task was hashed too.
+    const settled = await runBin(workspace, ['app:build', '--', './report']);
+    expect(settled.code).toBe(0);
+    expect(settled.stderr).toBe('');
+    expect(settled.stdout.split('\n')[0]).toBe(MARKER);
+    expect(await readFile(builds, 'utf-8')).toBe(`${before}lib changed\n`);
+  });
+
+  it('refreshes added and deleted dependency inputs before returning a hit', async () => {
+    const addedSource = join(workspace, 'packages', 'lib', 'source2.txt');
+    await writeFile(addedSource, 'added\n');
+    const added = await runBin(workspace, ['app:build', '--', './report']);
+    expect(added.code).toBe(0);
+    expect(await readFile(marker(), 'utf-8')).toBe('built\nlib changed\nadded\n');
+
+    await rm(addedSource);
+    const removed = await runBin(workspace, ['app:build', '--', './report']);
+    expect(removed.code).toBe(0);
+    expect(await readFile(marker(), 'utf-8')).toBe('built\nlib changed\n');
+
     const settled = await runBin(workspace, ['app:build', '--', './report']);
     expect(settled.code).toBe(0);
     expect(settled.stderr).toBe('');
