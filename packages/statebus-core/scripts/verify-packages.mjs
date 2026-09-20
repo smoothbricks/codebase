@@ -28,7 +28,7 @@ const artifacts = join(root, '.cache', 'statebus-packages');
 mkdirSync(artifacts, { recursive: true });
 // A failed rerun must not leave a previous success report in the uploaded artifact.
 rmSync(join(artifacts, 'validation.json'), { force: true });
-const temporary = mkdtempSync(join(tmpdir(), 'statebus-packaged-consumer-'));
+const temporary = realpathSync(mkdtempSync(join(tmpdir(), 'statebus-packaged-consumer-')));
 const external = new Map();
 const dependencies = {};
 const overrides = {};
