@@ -113,7 +113,7 @@ export class Ok<V, T extends LogSchema = LogSchema> {
 
   /** protected, not private: getResultClasses() subclasses Ok per schema to install row-1 fluent setters. */
   protected readonly _state: WriterState | undefined;
-  private declare _writer: BoundResultWriter<T, V, never> | undefined;
+  declare private _writer: BoundResultWriter<T, V, never> | undefined;
 
   constructor(value: V, state?: WriterState) {
     this.value = value;
@@ -257,7 +257,7 @@ export class Err<E, T extends LogSchema = LogSchema> {
 
   /** protected, not private: getResultClasses() subclasses Err per schema to install row-1 fluent setters. */
   protected readonly _state: WriterState | undefined;
-  private declare _writer: BoundResultWriter<T, never, E> | undefined;
+  declare private _writer: BoundResultWriter<T, never, E> | undefined;
 
   constructor(error: E, state?: WriterState) {
     this.error = error;
@@ -519,9 +519,8 @@ export function getResultClasses<T extends LogSchema>(WriterClass: ResultWriterC
   let classes = resultClassCache.get(WriterClass);
   if (!classes) {
     class SchemaOk<V> extends Ok<V, T> {
-      protected declare readonly _state: WriterState;
+      declare protected readonly _state: WriterState;
 
-      // biome-ignore lint/complexity/noUselessConstructor: Require state here; the standalone base constructor allows none.
       constructor(value: V, state: WriterState) {
         super(value, state);
       }
@@ -532,9 +531,8 @@ export function getResultClasses<T extends LogSchema>(WriterClass: ResultWriterC
     }
 
     class SchemaErr<E> extends Err<E, T> {
-      protected declare readonly _state: WriterState;
+      declare protected readonly _state: WriterState;
 
-      // biome-ignore lint/complexity/noUselessConstructor: Require state here; the standalone base constructor allows none.
       constructor(error: E, state: WriterState) {
         super(error, state);
       }
