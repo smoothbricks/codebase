@@ -7,7 +7,7 @@
  * transform reached this file and the module it imports.
  */
 import typia from 'typia';
-import { isDeployConfig } from '../src/config.ts';
+import { isDeployConfig } from '../src/public.ts';
 
 interface DeployPlan {
   stage: string;

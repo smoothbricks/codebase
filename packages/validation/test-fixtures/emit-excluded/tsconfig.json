@@ -13,5 +13,6 @@
     "noEmit": true,
     "types": []
   },
-  "include": ["src/**/*.ts", "scripts/**/*.ts"]
+  "include": ["src/**/*.ts", "scripts/**/*.ts"],
+  "exclude": ["src/config.ts"]
 }

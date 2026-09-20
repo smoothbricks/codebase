@@ -8,16 +8,12 @@
  * Usage in bunfig.toml:
  *   preload = ["@smoothbricks/validation/bun/preload"]
  *
- * A file can only be transformed by a project whose program contains it: ttsc
- * emits the files its program holds, and asking it for any other file yields
- * "ttsc transform did not return output for <file>". Which project that is
- * cannot be read off a path. `tsconfig.lib.json` is the emit program and lists
- * `src/` alone, so an entry point deliberately kept out of the bundle — a
- * `scripts/deploy.ts` that only the repo-wide program lists — is not in it, and
- * routing by "nearest lib config" claimed exactly those files and lost their
- * validators. So the path decides only which project to ASK FIRST; the compiler
- * decides. Each candidate is tried in turn and the first program that holds the
- * file transforms it.
+ * A runtime entry point may be excluded from the library's emit program. Use
+ * TypeScript's config parser to prefer the nearest project that explicitly
+ * includes the requested source, rather than treating an unchanged transform
+ * result as proof of membership. Files reached only through imports need not
+ * be configured roots, so they retain the nearest project's native transform.
+ * No second TypeScript Program or TypeChecker is constructed.
  *
  * This drives `@ttsc/unplugin`'s public transform API rather than its
  * `bun-register`/`bun` adapter for one reason: that adapter calls
@@ -37,12 +33,14 @@ import {
   beginTtscTransformBuild,
   createTtscTransformCache,
   isTransformTarget,
+  readTsconfigSourceSnapshot,
   resolveOptions,
   type TtscTransformHooks,
   transformTtsc,
 } from '@ttsc/unplugin/api';
 import type { BunLoader } from '@ttsc/unplugin/bun';
 import { plugin } from 'bun';
+import ts from 'typescript';
 import { pollingDirectoryWatch } from './directory-watch.js';
 
 /** Transformed source, in the shape Bun's runtime loader requires. */
@@ -68,14 +66,7 @@ const WATCH_POLL_INTERVAL_MS = 250;
  */
 const SOURCE_FILE_PATTERN = /^[^\0]*\.[cm]?tsx?$/;
 const TEST_SOURCE_PATTERN = /(?:^|[/\\])(?:__tests__|tests)(?:[/\\])|\.(?:test|spec)\.[cm]?tsx?$/;
-/** The compiler's verdict that the project's program does not hold the file. */
-const MISSING_PROGRAM_OUTPUT = /^ttsc transform did not return output for /;
-/**
- * Config names in the order a source is offered to them. The intended home
- * first — tests belong to the test program, everything else to the emit
- * program — then the repo-wide program that lists what the narrow ones leave
- * out, then the remaining one.
- */
+/** Candidate preference within each directory; configured source owners win. */
 const TEST_FIRST = ['tsconfig.test.json', 'tsconfig.json', 'tsconfig.lib.json'] as const;
 const LIB_FIRST = ['tsconfig.lib.json', 'tsconfig.json', 'tsconfig.test.json'] as const;
 /**
@@ -92,6 +83,19 @@ const cache = createTtscTransformCache({ watch: pollingDirectoryWatch(WATCH_POLL
  * candidate list ends with, and takes its value type from that.
  */
 const optionsByProject = new Map([['', resolveOptions({ project: undefined })]]);
+interface ProjectRoots {
+  readonly snapshot: ReturnType<typeof readTsconfigSourceSnapshot>;
+  readonly files: ReadonlySet<string>;
+  readonly queriedFiles: Set<string>;
+}
+const rootsByProject = new Map<string, ProjectRoots>();
+const configHost: ts.ParseConfigFileHost = {
+  ...ts.sys,
+  onUnRecoverableConfigFileDiagnostic(diagnostic) {
+    throw new Error(ts.flattenDiagnosticMessageText(diagnostic.messageText, '\n'));
+  },
+};
+const canonicalPath = ts.sys.useCaseSensitiveFileNames ? (path: string) => path : (path: string) => path.toLowerCase();
 
 plugin({
   name: 'ttsc-project-router',
@@ -104,40 +108,45 @@ plugin({
   },
 });
 
-/**
- * Transform one source with the first candidate project whose program holds it.
- *
- * Only the "no output for this file" verdict moves on to the next candidate:
- * that one means the project was the wrong question. A compiler failure or
- * exception is the answer to the right question and is rethrown untouched, so
- * diagnostics still reach the operator from the project that produced them.
- */
+/** Select a configured source owner without rejecting transitive imports. */
 async function loadThroughOwningProject(path: string): Promise<LoadedSource> {
   const loader: BunLoader = /x$/i.test(path) ? 'tsx' : 'ts';
   const source = await readFile(path, 'utf8');
-  // Not a transform target: hand the source back for Bun to transpile, because
-  // `Bun.plugin()` rejects an undefined `onLoad` result.
+  // Bun's runtime onLoad hook requires source even for a no-op transform.
   if (!isTransformTarget(path)) return { contents: source, loader };
 
   const candidates = candidateProjects(path);
-  let firstVerdict: Error | undefined;
-  for (const project of candidates) {
-    try {
-      const result = await transformTtsc(path, source, optionsFor(project), undefined, cache, TRANSFORM_HOOKS);
-      // A no-op transform returns nothing; the file is still this program's.
-      return { contents: result?.code ?? source, loader };
-    } catch (error) {
-      if (!(error instanceof Error) || !MISSING_PROGRAM_OUTPUT.test(error.message)) throw error;
-      firstVerdict ??= error;
-    }
-  }
+  const project =
+    candidates.find((candidate) => candidate !== undefined && isConfiguredRoot(candidate, path)) ?? candidates[0];
+  const result = await transformTtsc(path, source, optionsFor(project), undefined, cache, TRANSFORM_HOOKS);
+  return { contents: result?.code ?? source, loader };
+}
 
-  throw new Error(
-    `No TypeScript project holds ${path}, so its transforms (Typia, LMAO) cannot be applied. ` +
-      `Tried ${candidates.map((candidate) => candidate ?? 'the nearest tsconfig.json').join(', ')}. ` +
-      'Add the file to a project\'s "include" — the repo-wide tsconfig.json is where entry points kept out of the emit program belong.',
-    { cause: firstVerdict },
-  );
+/** Config-chain edits invalidate root selection independently of native output. */
+function isConfiguredRoot(project: string, file: string): boolean {
+  const snapshot = readTsconfigSourceSnapshot(project);
+  const key = canonicalPath(file);
+  const existing = rootsByProject.get(project);
+  if (
+    existing !== undefined &&
+    existing.snapshot.length === snapshot.length &&
+    existing.snapshot.every(
+      (entry, index) => entry.path === snapshot[index]?.path && entry.contents === snapshot[index]?.contents,
+    ) &&
+    (existing.files.has(key) || existing.queriedFiles.has(key))
+  ) {
+    return existing.files.has(key);
+  }
+  // A newly requested path can have appeared beneath an unchanged include glob.
+  // Reparse its directory membership rather than retaining a negative answer.
+  const parsed = ts.getParsedCommandLineOfConfigFile(project, undefined, configHost);
+  const roots: ProjectRoots = {
+    snapshot,
+    files: new Set(parsed?.fileNames.map(canonicalPath)),
+    queriedFiles: new Set([key]),
+  };
+  rootsByProject.set(project, roots);
+  return roots.files.has(key);
 }
 
 /**
