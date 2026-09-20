@@ -214,10 +214,10 @@
   "dependencies": {
     "@nx/js": "latest",
     "nx": "latest",
-    "prettier": "^3.6.1",
+    "prettier": "^3.9.8",
     "smol-toml": "^1.6.1",
     "tslib": "^2.8.1",
-    "typia": "14.0.2",
+    "typia": "14.0.6",
     "yaml": "^2.9.0"
   },
   "devDependencies": {

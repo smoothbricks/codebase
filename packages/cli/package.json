@@ -85,13 +85,13 @@
     "@smoothbricks/validation": "workspace:*",
     "commander": "^14.0.3",
     "nx": "latest",
-    "prettier": "^3.6.1",
+    "prettier": "^3.9.8",
     "publint": "^0.3.18",
     "semver": "^7.7.4",
     "sherif": "^1.11.1",
     "toml-eslint-parser": "^1.0.3",
     "tslib": "^2.8.1",
-    "typia": "14.0.2"
+    "typia": "14.0.6"
   },
   "devDependencies": {
     "fast-check": "^4.4.0"

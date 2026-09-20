@@ -302,13 +302,13 @@
     ]
   },
   "dependencies": {
-    "typia": "14.0.2"
+    "typia": "14.0.6"
   },
   "devDependencies": {
     "@napi-rs/cli": "3.7.3",
     "@smoothbricks/lmao": "workspace:*",
     "@smoothbricks/validation": "workspace:*",
-    "@types/node": "^26.5.1",
+    "@types/node": "^26.6.2",
     "typescript": "^6.0.3"
   },
   "optionalDependencies": {

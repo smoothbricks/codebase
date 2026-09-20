@@ -52,7 +52,7 @@ interface RegistryPackument {
 const isRegistryPackument = typia.createIs<RegistryPackument>();
 const rootDevDependencies: RequiredDependency[] = [
   { name: '@biomejs/biome', fallbackVersion: '^2.3.5', minimumVersion: '2.3.0', prefix: '^' },
-  { name: '@nx/js', fallbackVersion: '23.1.0', minimumVersion: '23.1.0' },
+  { name: '@nx/js', fallbackVersion: '23.2.1', minimumVersion: '23.1.0' },
   {
     name: '@smoothbricks/nx-plugin',
     fallbackVersion: '^0.3.0',
@@ -68,7 +68,7 @@ const rootDevDependencies: RequiredDependency[] = [
     prefix: '^',
     useWorkspaceRangeInCodebase: true,
   },
-  { name: 'nx', fallbackVersion: '23.1.0', minimumVersion: '23.1.0' },
+  { name: 'nx', fallbackVersion: '23.2.1', minimumVersion: '23.1.0' },
   { name: 'prettier', fallbackVersion: '^3.6.1', minimumVersion: '3.6.0', prefix: '^' },
   // ttsc participates in cache keys and vendors the Go SDK that
   // `smoo monorepo check` matches against devenv's pinned Go, so it is an exact
