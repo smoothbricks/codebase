@@ -468,9 +468,19 @@ describe('smoo-nx-exec', () => {
   it('runs again when a dependency input is added or deleted', async () => {
     const addedSource = join(workspace, 'packages', 'lib', 'source2.txt');
     await writeFile(addedSource, 'added\n');
-    const added = await runBin(workspace, ['app:build', '--', './report']);
+    const added = await runBin(workspace, ['app:build', '--', './report'], { NX_VERBOSE_LOGGING: 'true' });
     expect(added.code).toBe(0);
-    expect(await readFile(marker(), 'utf-8')).toBe('built\nlib changed\nadded\n');
+    const markerAfterAdd = await readFile(marker(), 'utf-8');
+    if (markerAfterAdd !== 'built\nlib changed\nadded\n') {
+      // DIAGNOSTIC: fails only on the CI runner; dump everything that decides a hit.
+      const daemonLog = join(workspace, '.nx', 'workspace-data', 'd', 'daemon.log');
+      const log = existsSync(daemonLog) ? await readFile(daemonLog, 'utf-8') : '(no daemon log)';
+      const listing = Bun.spawnSync(['ls', '-la', join(workspace, 'packages', 'lib')]).stdout.toString();
+      const gitStatus = Bun.spawnSync(['git', '-C', workspace, 'status', '--short', '--ignored']).stdout.toString();
+      throw new Error(
+        `marker=${JSON.stringify(markerAfterAdd)}\nstdout=${added.stdout}\nstderr=${added.stderr}\nlib/=${listing}\ngit status --ignored:\n${gitStatus}\ndaemon.log (tail):\n${log.slice(-6000)}`,
+      );
+    }
 
     await rm(addedSource);
     const removed = await runBin(workspace, ['app:build', '--', './report']);
