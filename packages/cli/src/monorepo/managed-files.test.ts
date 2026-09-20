@@ -29,7 +29,7 @@ const CACHE_ACTIONS = [
   { name: 'setup-devenv', osKeyLines: 2 },
   { name: 'cache-nix-devenv', osKeyLines: 3 },
   { name: 'cache-node-modules', osKeyLines: 2 },
-  { name: 'cache-ttsc-plugins', osKeyLines: 2 },
+  { name: 'cache-ttsc-plugins', osKeyLines: 1 },
   { name: 'cache-nx', osKeyLines: 2 },
 ] as const;
 

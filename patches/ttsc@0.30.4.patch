@@ -226,7 +226,7 @@ new file mode 100644
 index 0000000000000000000000000000000000000000..cfc7e4c88332ce423098e52b15b4186befa55234
 --- /dev/null
 +++ b/lib/plugin/internal/prepareTypeScriptGoSource.js
-@@ -0,0 +1,56 @@
+@@ -0,0 +1,67 @@
 +"use strict";
 +var __importDefault = (this && this.__importDefault) || function (mod) {
 +    return (mod && mod.__esModule) ? mod : { "default": mod };
@@ -241,9 +241,12 @@ index 0000000000000000000000000000000000000000..cfc7e4c88332ce423098e52b15b4186b
 +const SOURCE_SHA256 = "dc70cd1b719895c1df583e23755b85081d3d9979d16933e4c2732b98b4563603";
 +/** Compile the pinned reference-walker fix without modifying Go's module cache. */
 +function prepareTypeScriptGoSource(cwd, query) {
-+    const [version, directory, replacement] = query([
-+        "list", "-m", "-f", "{{.Version}}\n{{.Dir}}\n{{if .Replace}}replaced{{end}}", MODULE,
-+    ]).trim().split(/\r?\n/);
++    const pinned = process.env.TTSC_TYPESCRIPT_GO_DIR;
++    const [version, directory, replacement] = pinned
++        ? [VERSION, pinned, undefined]
++        : query([
++            "list", "-m", "-f", "{{.Version}}\n{{.Dir}}\n{{if .Replace}}replaced{{end}}", MODULE,
++        ]).trim().split(/\r?\n/);
 +    if (version !== VERSION || !directory || replacement) {
 +        throw new Error(`ttsc: native compiler patch requires ${MODULE}@${VERSION}; resolved ${version} at ${directory}${replacement ? " (replaced)" : ""}`);
 +    }
@@ -277,9 +280,17 @@ index 0000000000000000000000000000000000000000..cfc7e4c88332ce423098e52b15b4186b
 +        if (entry.isDirectory())
 +            copyCompilerDirectory(from, to, replacedFile);
 +        else if (entry.isFile())
-+            node_fs_1.default.copyFileSync(from, to, node_fs_1.default.constants.COPYFILE_FICLONE);
++            copyFileForScratch(from, to);
 +        else
 +            throw new Error(`ttsc: unsupported entry in native compiler source: ${from}`);
++    }
++}
++function copyFileForScratch(from, to) {
++    try {
++        node_fs_1.default.copyFileSync(from, to, node_fs_1.default.constants.COPYFILE_FICLONE);
++    }
++    catch {
++        node_fs_1.default.copyFileSync(from, to);
 +    }
 +}
 +//# sourceMappingURL=prepareTypeScriptGoSource.js.map
@@ -2061,7 +2072,7 @@ new file mode 100644
 index 0000000000000000000000000000000000000000..6036663c2b5b81194bc46641b2ac37c083978732
 --- /dev/null
 +++ b/src/plugin/internal/prepareTypeScriptGoSource.ts
-@@ -0,0 +1,55 @@
+@@ -0,0 +1,66 @@
 +import crypto from "node:crypto";
 +import fs from "node:fs";
 +import path from "node:path";
@@ -2075,9 +2086,12 @@ index 0000000000000000000000000000000000000000..6036663c2b5b81194bc46641b2ac37c0
 +  cwd: string,
 +  query: (args: readonly string[]) => string,
 +): void {
-+  const [version, directory, replacement] = query([
-+    "list", "-m", "-f", "{{.Version}}\n{{.Dir}}\n{{if .Replace}}replaced{{end}}", MODULE,
-+  ]).trim().split(/\r?\n/);
++  const pinned = process.env.TTSC_TYPESCRIPT_GO_DIR;
++  const [version, directory, replacement] = pinned
++    ? [VERSION, pinned, undefined]
++    : query([
++        "list", "-m", "-f", "{{.Version}}\n{{.Dir}}\n{{if .Replace}}replaced{{end}}", MODULE,
++      ]).trim().split(/\r?\n/);
 +  if (version !== VERSION || !directory || replacement) {
 +    throw new Error(`ttsc: native compiler patch requires ${MODULE}@${VERSION}; resolved ${version} at ${directory}${replacement ? " (replaced)" : ""}`);
 +  }
@@ -2113,8 +2127,16 @@ index 0000000000000000000000000000000000000000..6036663c2b5b81194bc46641b2ac37c0
 +    const to = path.join(destination, entry.name);
 +    if (from === replacedFile) continue;
 +    if (entry.isDirectory()) copyCompilerDirectory(from, to, replacedFile);
-+    else if (entry.isFile()) fs.copyFileSync(from, to, fs.constants.COPYFILE_FICLONE);
++    else if (entry.isFile()) copyFileForScratch(from, to);
 +    else throw new Error(`ttsc: unsupported entry in native compiler source: ${from}`);
++  }
++}
++
++function copyFileForScratch(from: string, to: string): void {
++  try {
++    fs.copyFileSync(from, to, fs.constants.COPYFILE_FICLONE);
++  } catch {
++    fs.copyFileSync(from, to);
 +  }
 +}
 diff --git a/lib/internal/projectInputPathIdentity.js b/lib/internal/projectInputPathIdentity.js

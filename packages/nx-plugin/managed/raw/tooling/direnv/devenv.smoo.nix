@@ -17,12 +17,25 @@
   lib,
   pkgs,
   ...
-}: {
+}: let
+  # ttsc's native-plugin patch compiles microsoft/typescript-go with one
+  # corrected file. `go list -m` only fills `.Dir` after the module is already
+  # in GOMODCACHE, which CI does not restore (and GOPROXY is often off under
+  # nix). Pin the commit ttsc 0.30.4's patch requires so the tree is in the
+  # devenv closure and TTSC_TYPESCRIPT_GO_DIR names it.
+  typescriptGo = pkgs.fetchFromGitHub {
+    owner = "microsoft";
+    repo = "typescript-go";
+    rev = "56ab4af42157";
+    hash = "sha256-ebjX+1+9axEqsnZXCRZSumA38gPNdmoz98tMt2oftN4=";
+  };
+in {
   env = lib.mkMerge [
     {
       # Nx otherwise defaults to three workers. Scale to the cores available in each
       # developer shell or CI runner; explicit --parallel flags still take precedence.
       NX_PARALLEL = "100%";
+      TTSC_TYPESCRIPT_GO_DIR = "${typescriptGo}";
     }
     # Playwright's downloaded Ubuntu browser has no runtime closure on NixOS
     # (CI reached the executable, then failed loading libglib-2.0.so.0). Use
