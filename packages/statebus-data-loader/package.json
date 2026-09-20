@@ -1,6 +1,6 @@
 {
   "name": "@smoothbricks/statebus-data-loader",
-  "version": "0.1.2-next.0",
+  "version": "0.1.2",
   "type": "module",
   "description": "Typed data-loader lifecycle, admission and transport progress for StateBus.",
   "license": "MIT",

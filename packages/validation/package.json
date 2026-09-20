@@ -1,6 +1,6 @@
 {
   "name": "@smoothbricks/validation",
-  "version": "0.1.10-next.0",
+  "version": "0.1.10",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/smoothbricks/codebase.git",
