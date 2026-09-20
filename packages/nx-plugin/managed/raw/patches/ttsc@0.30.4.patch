@@ -2117,3 +2117,117 @@ index 0000000000000000000000000000000000000000..6036663c2b5b81194bc46641b2ac37c0
 +    else throw new Error(`ttsc: unsupported entry in native compiler source: ${from}`);
 +  }
 +}
+diff --git a/lib/internal/projectInputPathIdentity.js b/lib/internal/projectInputPathIdentity.js
+--- a/lib/internal/projectInputPathIdentity.js
++++ b/lib/internal/projectInputPathIdentity.js
+@@ -170,6 +170,11 @@
+                 rejectedAlternate = true;
+                 continue;
+             }
++            // A sandbox that refuses to stat a sibling says nothing about the
++            // filesystem's case semantics: neither proof of insensitivity nor of
++            // sensitivity. Skip the entry; another may answer.
++            if (isDeniedFilesystemEntry(error))
++                continue;
+             throw error;
+         }
+     }
+@@ -194,7 +199,9 @@
+                     return false;
+                 }
+                 catch (error) {
+-                    if (isMissingFilesystemEntry(error) === false)
++                    // Same reasoning one level up: a refused realpath is not a
++                    // case-sensitivity answer, so keep walking instead of throwing.
++                    if (!isMissingFilesystemEntry(error) && !isDeniedFilesystemEntry(error))
+                         throw error;
+                 }
+             }
+@@ -271,6 +278,11 @@
+         "code" in error &&
+         (error.code === "ENOENT" || error.code === "ENOTDIR"));
+ }
++function isDeniedFilesystemEntry(error) {
++    return (error instanceof Error &&
++        "code" in error &&
++        (error.code === "EPERM" || error.code === "EACCES"));
++}
+ function createProjectInputPathIdentityContext(operations = {}) {
+     return createFilesystemPathIdentityContext(operations);
+ }
+diff --git a/src/internal/projectInputPathIdentity.ts b/src/internal/projectInputPathIdentity.ts
+--- a/src/internal/projectInputPathIdentity.ts
++++ b/src/internal/projectInputPathIdentity.ts
+@@ -250,6 +250,10 @@
+         rejectedAlternate = true;
+         continue;
+       }
++      // A sandbox that refuses to stat a sibling says nothing about the
++      // filesystem's case semantics: neither proof of insensitivity nor of
++      // sensitivity. Skip the entry; another may answer.
++      if (isDeniedFilesystemEntry(error)) continue;
+       throw error;
+     }
+   }
+@@ -271,7 +275,9 @@
+           operations.realpath(pathApi.join(parent, alternate));
+           return false;
+         } catch (error) {
+-          if (isMissingFilesystemEntry(error) === false) throw error;
++          // Same reasoning one level up: a refused realpath is not a
++          // case-sensitivity answer, so keep walking instead of throwing.
++          if (!isMissingFilesystemEntry(error) && !isDeniedFilesystemEntry(error)) throw error;
+         }
+       }
+       current = parent;
+@@ -368,6 +374,14 @@
+   );
+ }
+ 
++function isDeniedFilesystemEntry(error: unknown): boolean {
++  return (
++    error instanceof Error &&
++    "code" in error &&
++    (error.code === "EPERM" || error.code === "EACCES")
++  );
++}
++
+ export type ProjectInputPathIdentity = FilesystemPathIdentity;
+ export type ProjectInputPathIdentityOperations =
+   FilesystemPathIdentityOperations;
+diff --git a/shim/printer/shim.go b/shim/printer/shim.go
+--- a/shim/printer/shim.go
++++ b/shim/printer/shim.go
+@@ -4,6 +4,8 @@
+ package printer
+ 
+ import (
++	"github.com/microsoft/typescript-go/internal/sourcemap"
++	"github.com/microsoft/typescript-go/internal/tspath"
+   "github.com/microsoft/typescript-go/internal/ast"
+   innerprinter "github.com/microsoft/typescript-go/internal/printer"
+ )
+@@ -59,3 +61,23 @@
+ func EmitSourceFile(p *Printer, sourceFile *ast.SourceFile) string {
+   return p.EmitSourceFile(sourceFile)
+ }
++
++// SourceMapGenerator is the generator the printer records positions into
++// (internal/sourcemap.Generator), and NewSourceMapGenerator starts one for
++// the generated file named file; RawSourceMap is its decoded form. Exposed
++// here rather than as a shim module of their own so the shim tree gains no
++// directory.
++type SourceMapGenerator = sourcemap.Generator
++type RawSourceMap = sourcemap.RawSourceMap
++
++func NewSourceMapGenerator(file string, sourceRoot string, sourcesDirectoryPath string) *SourceMapGenerator {
++	return sourcemap.NewGenerator(file, sourceRoot, sourcesDirectoryPath, tspath.ComparePathsOptions{})
++}
++
++// EmitSourceFileWithSourceMap renders the full source file and records every
++// mapped position into generator, returning the emitted text.
++func EmitSourceFileWithSourceMap(p *Printer, sourceFile *ast.SourceFile, generator *SourceMapGenerator) string {
++	writer := NewTextWriter(p.Options.NewLine.GetNewLineCharacter(), 0)
++	p.Write(sourceFile.AsNode(), sourceFile, writer, generator)
++	return writer.String()
++}
