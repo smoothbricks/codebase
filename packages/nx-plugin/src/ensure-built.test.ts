@@ -314,7 +314,10 @@ describe('smoo-nx-exec', () => {
         },
       }),
     );
-    await writeFile(join(workspace, 'packages', 'lib', 'source.txt'), 'lib\n');
+    // Digit-suffixed so `source*.txt` expands in the same order under every
+    // locale: en_US.UTF-8 collation ignores punctuation at the first level and
+    // would put `source2.txt` before `source.txt`.
+    await writeFile(join(workspace, 'packages', 'lib', 'source1.txt'), 'lib\n');
     await writeFile(
       join(workspace, 'packages', 'app', 'project.json'),
       JSON.stringify({
@@ -449,7 +452,7 @@ describe('smoo-nx-exec', () => {
 
   it('runs again when a dependency\u0027s own inputs change', async () => {
     const before = await readFile(builds(), 'utf-8');
-    await writeFile(join(workspace, 'packages', 'lib', 'source.txt'), 'lib changed\n');
+    await writeFile(join(workspace, 'packages', 'lib', 'source1.txt'), 'lib changed\n');
     const changed = await runBin(workspace, ['app:build', '--', './report']);
     expect(changed.code).toBe(0);
     expect(await readFile(join(workspace, 'packages', 'lib', 'dist', 'lib.txt'), 'utf-8')).toBe('lib changed\n');
@@ -468,19 +471,9 @@ describe('smoo-nx-exec', () => {
   it('runs again when a dependency input is added or deleted', async () => {
     const addedSource = join(workspace, 'packages', 'lib', 'source2.txt');
     await writeFile(addedSource, 'added\n');
-    const added = await runBin(workspace, ['app:build', '--', './report'], { NX_VERBOSE_LOGGING: 'true' });
+    const added = await runBin(workspace, ['app:build', '--', './report']);
     expect(added.code).toBe(0);
-    const markerAfterAdd = await readFile(marker(), 'utf-8');
-    if (markerAfterAdd !== 'built\nlib changed\nadded\n') {
-      // DIAGNOSTIC: fails only on the CI runner; dump everything that decides a hit.
-      const daemonLog = join(workspace, '.nx', 'workspace-data', 'd', 'daemon.log');
-      const log = existsSync(daemonLog) ? await readFile(daemonLog, 'utf-8') : '(no daemon log)';
-      const listing = Bun.spawnSync(['ls', '-la', join(workspace, 'packages', 'lib')]).stdout.toString();
-      const gitStatus = Bun.spawnSync(['git', '-C', workspace, 'status', '--short', '--ignored']).stdout.toString();
-      throw new Error(
-        `marker=${JSON.stringify(markerAfterAdd)}\nstdout=${added.stdout}\nstderr=${added.stderr}\nlib/=${listing}\ngit status --ignored:\n${gitStatus}\ndaemon.log (tail):\n${log.slice(-6000)}`,
-      );
-    }
+    expect(await readFile(marker(), 'utf-8')).toBe('built\nlib changed\nadded\n');
 
     await rm(addedSource);
     const removed = await runBin(workspace, ['app:build', '--', './report']);
