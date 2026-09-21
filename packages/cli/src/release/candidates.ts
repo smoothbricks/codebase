@@ -287,3 +287,14 @@ function stableJson(value: unknown): unknown {
   }
   return value;
 }
+
+/** How a `<projectName>@<version>` pin relates to `pkg` at HEAD: no such tag, unchanged since it, or changed since it. */
+export async function packagePinFreshness<Package extends ReleasePackageInfo>(
+  shell: AutoReleaseCandidateShell,
+  pkg: Package,
+  version: string,
+): Promise<'untagged' | 'fresh' | 'stale'> {
+  const ref = `refs/tags/${pkg.projectName}@${version}`;
+  if (!(await shell.gitRefExists(ref))) return 'untagged';
+  return (await packageHasReleasableChangesSince(shell, ref, pkg)) ? 'stale' : 'fresh';
+}

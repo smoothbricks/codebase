@@ -10,7 +10,12 @@ import { parsePackageJsonText } from '../lib/json.js';
 import { printCommandOutput, runResult } from '../lib/run.js';
 import type { PackageInfo } from '../lib/workspace.js';
 import { listPublishablePackages } from '../lib/workspace.js';
-import { readPackedPackageJson, validatePackedWorkspaceDependencies } from './packed-manifest.js';
+import {
+  readPackedPackageJson,
+  validatePackedDependencyFreshness,
+  validatePackedExportConditions,
+  validatePackedWorkspaceDependencies,
+} from './packed-manifest.js';
 import { withPublishManifest } from './publish-manifest.js';
 
 export async function validatePackedPublishablePackages(root: string): Promise<number> {
@@ -44,7 +49,9 @@ export async function validatePackedPublishablePackageManifest(
 ): Promise<number> {
   let failures = 0;
   for (const pkg of selectedPublishablePackages(root, projects)) {
-    failures += await validatePackedPublishablePackageTool(root, pkg, validatePackedManifest);
+    failures += await validatePackedPublishablePackageTool(root, pkg, (r, p, packed) =>
+      validatePackedManifest(r, p, packed, projects ?? []),
+    );
   }
   return failures;
 }
@@ -95,10 +102,16 @@ async function validatePackedManifest(
   root: string,
   pkg: PackageInfo,
   packed: { path: string; arrayBuffer: ArrayBuffer },
+  releasing: readonly string[],
 ): Promise<number> {
   let failures = 0;
   const packedPackage = await readPackedPackageJson(root, packed.path, pkg.name);
-  for (const message of validatePackedWorkspaceDependencies(root, pkg, packedPackage, { mode: 'install' })) {
+  const messages = [
+    ...validatePackedWorkspaceDependencies(root, pkg, packedPackage, { mode: 'install' }),
+    ...validatePackedExportConditions(pkg, packedPackage),
+    ...(await validatePackedDependencyFreshness(root, pkg, packedPackage, releasing)),
+  ];
+  for (const message of messages) {
     console.error(message);
     failures++;
   }
