@@ -335,6 +335,35 @@ describe('release project selection', () => {
     });
   });
 
+  it('a named release closes over the workspace dependencies that carry unreleased changes', async () => {
+    await withFixtureRepo(async (root) => {
+      // b depends on a and on c; a changed since its release, c did not.
+      const c: ReleasePackageInfo = { name: '@scope/c', projectName: 'c', path: 'packages/c', version: '1.0.0' };
+      await writePackage(root, a.name, a.path, a.version);
+      await writePackage(root, c.name, c.path, c.version);
+      await mkdir(join(root, b.path), { recursive: true });
+      await writeFile(
+        join(root, b.path, 'package.json'),
+        `${JSON.stringify({ name: b.name, version: b.version, dependencies: { [a.name]: 'workspace:*', [c.name]: 'workspace:*' } }, null, 2)}\n`,
+      );
+      await git(root, ['add', '.']);
+      await git(root, ['commit', '-m', 'initial packages']);
+      await tag(root, 'a@1.0.0', '2025-01-01T00:00:00Z');
+      await tag(root, 'b@1.0.0', '2025-01-01T00:00:01Z');
+      await tag(root, 'c@1.0.0', '2025-01-01T00:00:02Z');
+
+      await mkdir(join(root, a.path, 'src'), { recursive: true });
+      await writeFile(join(root, a.path, 'src/index.ts'), 'export const changed = true;\n');
+      await git(root, ['add', join(a.path, 'src/index.ts')]);
+      await git(root, ['commit', '-m', 'feat(a): package local']);
+
+      // b is built against a's HEAD; releasing b alone would pin a@1.0.0, a build nobody tested.
+      await expect(
+        releaseCandidatePackages(gitCandidateShell(root), [a, b, c], { mode: 'named', projects: ['b'] }),
+      ).resolves.toEqual([a, b]);
+    });
+  });
+
   it('releases the whole fleet only when the selection is all', async () => {
     await withFixtureRepo(async (root) => {
       await writePackage(root, a.name, a.path, a.version);

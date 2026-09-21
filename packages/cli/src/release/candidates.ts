@@ -90,7 +90,13 @@ export function parseReleaseProjectSelection(
 /**
  * The bump specifier never widens the release set: an explicit patch/minor/
  * major/prerelease only forces the version step for whatever this selection
- * picks. Named projects and `all` bypass change detection on purpose.
+ * picks. Named projects and `all` bypass change detection on purpose — for
+ * the named projects themselves. A named release still closes over the
+ * workspace dependencies that carry unreleased changes: the named package is
+ * built against its dependency's HEAD source, so pinning that dependency at
+ * its last published version ships a build nobody tested (an `@axe.sc/axe`
+ * released against an `axe-client-ts` whose stale publish still advertised a
+ * `development` export pointing at unshipped source).
  */
 export async function releaseCandidatePackages<Package extends ReleasePackageInfo>(
   shell: AutoReleaseCandidateShell,
@@ -101,9 +107,40 @@ export async function releaseCandidatePackages<Package extends ReleasePackageInf
     return packages;
   }
   if (selection.mode === 'named') {
-    return packages.filter((pkg) => selection.projects.includes(pkg.projectName));
+    const named = new Set(selection.projects);
+    await closeOverChangedWorkspaceDependencies(shell, packages, named);
+    return packages.filter((pkg) => named.has(pkg.projectName));
   }
   return autoReleaseCandidatePackages(shell, packages);
+}
+
+const workspaceDependencyFields = ['dependencies', 'optionalDependencies'] as const;
+
+/** Adds to `selected` every workspace dependency (transitively) of a selected package that is an auto-release candidate. */
+async function closeOverChangedWorkspaceDependencies<Package extends ReleasePackageInfo>(
+  shell: AutoReleaseCandidateShell,
+  packages: Package[],
+  selected: Set<string>,
+): Promise<void> {
+  const byName = new Map(packages.map((pkg) => [pkg.name, pkg]));
+  const queue = packages.filter((pkg) => selected.has(pkg.projectName));
+  const visited = new Set<string>();
+  for (let next = queue.pop(); next !== undefined; next = queue.pop()) {
+    if (visited.has(next.projectName)) continue;
+    visited.add(next.projectName);
+    const manifest = await shell.currentPackageJson(next.path);
+    for (const field of workspaceDependencyFields) {
+      const declared = manifest?.[field];
+      if (declared === undefined) continue;
+      for (const name of Object.keys(declared)) {
+        const dependency = byName.get(name);
+        if (dependency === undefined || selected.has(dependency.projectName)) continue;
+        if (await isAutoReleaseCandidate(shell, dependency)) selected.add(dependency.projectName);
+        // Walk the dependency either way: an unchanged link can sit in front of a changed one.
+        queue.push(dependency);
+      }
+    }
+  }
 }
 
 async function isAutoReleaseCandidate<Package extends ReleasePackageInfo>(
