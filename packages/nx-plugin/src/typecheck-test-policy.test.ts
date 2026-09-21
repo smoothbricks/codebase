@@ -204,6 +204,7 @@ describe('applyTypecheckTestDefaults', () => {
     const changed = applyTypecheckTestDefaults(tsconfigTest, {
       testRunners: new Set(['bun'] as const),
       referencePaths: ['./tsconfig.lib.json'],
+      isNew: true,
     });
     expect(changed).toBe(true);
     expect(tsconfigTest.extends).toBe('../../tsconfig.base.json');
@@ -222,6 +223,22 @@ describe('applyTypecheckTestDefaults', () => {
 
     const references = expectReferences(tsconfigTest.references);
     expect(references).toContainEqual({ path: './tsconfig.lib.json' });
+  });
+
+  it('leaves an inherited include alone: minting one narrows the program to nothing', () => {
+    // A package keeping its suites in `test/` inherits src + test + tooling
+    // from its tsconfig.json. Writing `include` with src-test globs replaced
+    // that with a program of zero files, which passed the gate by compiling
+    // nothing (the false green the policy exists to prevent).
+    const declared: Record<string, unknown> = { extends: './tsconfig.json', compilerOptions: { noEmit: true } };
+    applyTypecheckTestDefaults(declared, { testRunners: new Set(['bun'] as const), referencePaths: [] });
+    expect(Object.hasOwn(declared, 'include')).toBe(false);
+    // Same for `types`: declaring it would drop the workers types the program inherits.
+    expect(Object.hasOwn(expectRecord(declared.compilerOptions), 'types')).toBe(false);
+
+    const explicit: Record<string, unknown> = { extends: './tsconfig.json', include: ['test/**/*.ts'] };
+    applyTypecheckTestDefaults(explicit, { testRunners: new Set(['bun'] as const), referencePaths: [] });
+    expect(expectStringArray(explicit.include)).toEqual(expect.arrayContaining(['test/**/*.ts', 'src/**/*.test.ts']));
   });
 
   it('fills compiler options the test program left out and keeps the ones it declared', () => {
@@ -350,7 +367,7 @@ describe('typecheck test policy (Tree)', () => {
     });
     writeJson(tree, 'packages/app/tsconfig.lib.json', {
       extends: '../../tsconfig.base.json',
-      compilerOptions: { baseUrl: '.', rootDir: 'src', outDir: 'dist' },
+      compilerOptions: { composite: true, baseUrl: '.', rootDir: 'src', outDir: 'dist' },
     });
 
     const changed = applyTypecheckTestPolicyTree(tree);
@@ -370,6 +387,35 @@ describe('typecheck test policy (Tree)', () => {
 
     const references = expectReferences(tsconfig.references);
     expect(references).toContainEqual({ path: './tsconfig.lib.json' });
+  });
+
+  it('references only composite lib programs (TS6306 otherwise)', () => {
+    const tree = createTreeWithEmptyWorkspace();
+    for (const [name, composite] of [
+      ['app', false],
+      ['lib', true],
+    ] as const) {
+      addProjectConfiguration(tree, name, { root: `packages/${name}`, targets: {} });
+      if (tree.exists(`packages/${name}/project.json`)) tree.delete(`packages/${name}/project.json`);
+      writeJson(tree, `packages/${name}/package.json`, {
+        name: `@scope/${name}`,
+        scripts: { test: 'bun test' },
+        nx: { name },
+        ...(name === 'app' ? { dependencies: { '@scope/lib': 'workspace:*' } } : {}),
+      });
+      writeJson(tree, `packages/${name}/tsconfig.lib.json`, {
+        extends: '../../tsconfig.base.json',
+        compilerOptions: { rootDir: 'src', outDir: 'dist', ...(composite ? { composite: true } : {}) },
+      });
+    }
+
+    applyTypecheckTestPolicyTree(tree);
+    const references = expectReferences(
+      readJson<Record<string, unknown>>(tree, 'packages/app/tsconfig.test.json').references,
+    );
+    // The app's own emit program is not composite: its sources are in the
+    // test program by glob, not by reference. The composite dependency is.
+    expect(references).toEqual([{ path: '../lib/tsconfig.lib.json' }]);
   });
 
   it('detects bun test in project.json targets', () => {
@@ -513,7 +559,7 @@ describe('typecheck test policy (Tree)', () => {
     writeJson(tree, 'packages/lib/package.json', { name: '@scope/lib' });
     writeJson(tree, 'packages/lib/tsconfig.lib.json', {
       extends: '../../tsconfig.base.json',
-      compilerOptions: {},
+      compilerOptions: { composite: true },
     });
 
     // App that depends on lib
@@ -526,7 +572,7 @@ describe('typecheck test policy (Tree)', () => {
     });
     writeJson(tree, 'packages/app/tsconfig.lib.json', {
       extends: '../../tsconfig.base.json',
-      compilerOptions: {},
+      compilerOptions: { composite: true },
     });
 
     expect(applyTypecheckTestPolicyTree(tree)).toBe(true);
@@ -758,6 +804,7 @@ describe('typecheck test policy', () => {
       await writeJsonFs(join(root, 'packages/app/tsconfig.lib.json'), {
         extends: '../../tsconfig.base.json',
         compilerOptions: {
+          composite: true,
           baseUrl: '.',
           module: 'esnext',
           moduleResolution: 'bundler',
@@ -795,7 +842,7 @@ describe('typecheck test policy', () => {
       });
       await writeJsonFs(join(root, 'packages/lib/tsconfig.lib.json'), {
         extends: '../../tsconfig.base.json',
-        compilerOptions: {},
+        compilerOptions: { composite: true },
       });
       await writeJsonFs(join(root, 'packages/app/package.json'), {
         name: '@scope/app',
@@ -804,7 +851,7 @@ describe('typecheck test policy', () => {
       });
       await writeJsonFs(join(root, 'packages/app/tsconfig.lib.json'), {
         extends: '../../tsconfig.base.json',
-        compilerOptions: {},
+        compilerOptions: { composite: true },
       });
 
       expect(applyTypecheckTestPolicy(root)).toBe(true);

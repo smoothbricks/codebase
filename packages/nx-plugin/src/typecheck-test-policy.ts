@@ -162,6 +162,8 @@ export function applyTypecheckTestDefaults(
     tsconfigLibExtends?: string | string[];
     libCompilerOptions?: Record<string, unknown>;
     referencePaths: string[];
+    /** The file did not exist: a fresh program gets the src-test globs. */
+    isNew?: boolean;
   },
 ): boolean {
   let changed = !Object.hasOwn(tsconfigTest, 'extends');
@@ -190,7 +192,11 @@ export function applyTypecheckTestDefaults(
   changed = setBooleanProperty(compilerOptions, 'emitDeclarationOnly', false) || changed;
   changed = setBooleanProperty(compilerOptions, 'noEmit', true) || changed;
 
-  if (options.testRunners.has('bun')) {
+  // `types`, like `include` below, replaces what `extends` provides the
+  // moment it is declared: a program inheriting workers + bun types from its
+  // tsconfig.json would be left with `["bun"]` alone. Merge only into a
+  // declared list or a new file.
+  if (options.testRunners.has('bun') && (options.isNew || Object.hasOwn(compilerOptions, 'types'))) {
     changed = mergeStringListProperty(compilerOptions, 'types', ['bun']) || changed;
   }
 
@@ -203,14 +209,22 @@ export function applyTypecheckTestDefaults(
     changed = true;
   }
 
-  changed =
-    mergeStringListProperty(tsconfigTest, 'include', [
-      'src/**/*.test.ts',
-      'src/**/*.spec.ts',
-      'src/**/__tests__/**/*.ts',
-      'src/**/__tests__/**/*.tsx',
-      'src/test-suite-tracer.ts',
-    ]) || changed;
+  // A test program that declares no `include` inherits one from `extends`
+  // (a package keeping its suites in `test/` alongside src, tooling and
+  // scripts as one program). Minting `include` there REPLACES the inherited
+  // set with globs that match nothing, and a program of zero files passes the
+  // gate by compiling nothing. Only a program that already declares `include`,
+  // or a new file, gets the src-test globs merged in.
+  if (options.isNew || Object.hasOwn(tsconfigTest, 'include')) {
+    changed =
+      mergeStringListProperty(tsconfigTest, 'include', [
+        'src/**/*.test.ts',
+        'src/**/*.spec.ts',
+        'src/**/__tests__/**/*.ts',
+        'src/**/__tests__/**/*.tsx',
+        'src/test-suite-tracer.ts',
+      ]) || changed;
+  }
 
   for (const referencePath of options.referencePaths) {
     changed = addTsconfigReference(tsconfigTest, referencePath) || changed;
@@ -316,6 +330,7 @@ export function renderTypecheckTestFiles(tree: Tree): ManagedFile[] {
       tsconfigLibExtends,
       libCompilerOptions: libCompilerOptions ?? undefined,
       referencePaths,
+      isNew,
     });
     files.push(renderTsconfig(tree, tsconfigTestPath, tsconfigTest, changed || isNew));
 
@@ -506,8 +521,16 @@ function collectReferencePathsTree(
   workspacePackages: TreeWorkspacePackage[],
 ): string[] {
   const paths: string[] = [];
+  // A project reference is only legal to a `composite` program (TS6306); a
+  // lib tsconfig that is not composite — an application target's emit
+  // program — is included by the test program's own globs instead.
+  const isComposite = (path: string): boolean => {
+    if (!tree.exists(path)) return false;
+    const compilerOptions = recordProperty(readJson<Record<string, unknown>>(tree, path), 'compilerOptions');
+    return compilerOptions?.composite === true;
+  };
   const libTsconfigPath = `${packageRoot}/tsconfig.lib.json`;
-  if (tree.exists(libTsconfigPath)) {
+  if (isComposite(libTsconfigPath)) {
     paths.push('./tsconfig.lib.json');
   }
 
@@ -519,7 +542,7 @@ function collectReferencePathsTree(
       const depPkg = packagesByName.get(depName);
       if (!depPkg) continue;
       const depTsconfig = `${depPkg.path}/tsconfig.lib.json`;
-      if (!tree.exists(depTsconfig)) continue;
+      if (!isComposite(depTsconfig)) continue;
       const refPath = relative(packageRoot, depTsconfig).replaceAll('\\', '/');
       if (!paths.includes(refPath)) paths.push(refPath);
     }
