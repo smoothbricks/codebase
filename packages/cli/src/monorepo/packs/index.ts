@@ -7,6 +7,7 @@ import {
   validateCargoCachePolicy,
   validateCargoToolchainInputs,
 } from '../cargo-policy.js';
+import { validateConsumedScopedDependenciesExist, validateNoMachineLocalSpecifiers } from '../consumed-scope.js';
 import { validateGoToolchainAgreement } from '../go-toolchain.js';
 import { syncBunLockfileVersions, validateBunLockfileVersions } from '../lockfile.js';
 import { validateDevenvModuleImport, warnOnManagedFileDrift } from '../managed-files.js';
@@ -160,6 +161,12 @@ const packs: MonorepoPack[] = [
     },
     validatePreBuild(ctx) {
       return validatePublicTags(ctx.root) + validatePublicPackageMetadata(ctx.root);
+    },
+  },
+  {
+    name: 'consumed-scoped-dependencies',
+    async validatePreBuild(ctx) {
+      return validateNoMachineLocalSpecifiers(ctx.root) + (await validateConsumedScopedDependenciesExist(ctx.root));
     },
   },
   {

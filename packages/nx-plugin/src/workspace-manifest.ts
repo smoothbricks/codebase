@@ -273,6 +273,8 @@ export interface PackageJson {
   optionalDependencies?: StringMap;
   /** Bun patchedDependencies map (package@version → patch path). */
   patchedDependencies?: StringMap;
+  overrides?: StringMap;
+  resolutions?: StringMap;
   engines?: StringMap;
   scripts?: StringMap;
   publishConfig?: PackagePublishConfig;

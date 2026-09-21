@@ -1831,7 +1831,7 @@ export async function npmVersionExists(root: string, name: string, version: stri
   );
 }
 
-async function npmPackageExists(root: string, name: string): Promise<boolean> {
+export async function npmPackageExists(root: string, name: string): Promise<boolean> {
   const registry = selectRegistryForPackage(root, name);
   if (!registry) {
     assertPublicStatusAllowed(root, name);
