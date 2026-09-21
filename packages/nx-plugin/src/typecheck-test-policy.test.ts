@@ -389,11 +389,13 @@ describe('typecheck test policy (Tree)', () => {
     expect(references).toContainEqual({ path: './tsconfig.lib.json' });
   });
 
-  it('references only composite lib programs (TS6306 otherwise)', () => {
+  it('references only composite lib programs (TS6306 otherwise), resolving composite through extends', () => {
     const tree = createTreeWithEmptyWorkspace();
+    writeJson(tree, 'tsconfig.composite.json', { compilerOptions: { composite: true } });
     for (const [name, composite] of [
-      ['app', false],
-      ['lib', true],
+      ['app', 'no'],
+      ['lib', 'own'],
+      ['inherits', 'base'],
     ] as const) {
       addProjectConfiguration(tree, name, { root: `packages/${name}`, targets: {} });
       if (tree.exists(`packages/${name}/project.json`)) tree.delete(`packages/${name}/project.json`);
@@ -401,11 +403,12 @@ describe('typecheck test policy (Tree)', () => {
         name: `@scope/${name}`,
         scripts: { test: 'bun test' },
         nx: { name },
-        ...(name === 'app' ? { dependencies: { '@scope/lib': 'workspace:*' } } : {}),
+        ...(name === 'app' ? { dependencies: { '@scope/lib': 'workspace:*', '@scope/inherits': 'workspace:*' } } : {}),
       });
       writeJson(tree, `packages/${name}/tsconfig.lib.json`, {
-        extends: '../../tsconfig.base.json',
-        compilerOptions: { rootDir: 'src', outDir: 'dist', ...(composite ? { composite: true } : {}) },
+        extends:
+          composite === 'base' ? ['../../tsconfig.base.json', '../../tsconfig.composite'] : '../../tsconfig.base.json',
+        compilerOptions: { rootDir: 'src', outDir: 'dist', ...(composite === 'own' ? { composite: true } : {}) },
       });
     }
 
@@ -414,8 +417,9 @@ describe('typecheck test policy (Tree)', () => {
       readJson<Record<string, unknown>>(tree, 'packages/app/tsconfig.test.json').references,
     );
     // The app's own emit program is not composite: its sources are in the
-    // test program by glob, not by reference. The composite dependency is.
-    expect(references).toEqual([{ path: '../lib/tsconfig.lib.json' }]);
+    // test program by glob, not by reference. The composite dependencies are —
+    // whether composite is declared on the file or inherited from a base.
+    expect(references).toEqual([{ path: '../lib/tsconfig.lib.json' }, { path: '../inherits/tsconfig.lib.json' }]);
   });
 
   it('detects bun test in project.json targets', () => {

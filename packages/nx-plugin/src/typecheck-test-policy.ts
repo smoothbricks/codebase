@@ -1,5 +1,5 @@
 import { existsSync, readdirSync, readFileSync } from 'node:fs';
-import { join, relative } from 'node:path';
+import { dirname, join, relative } from 'node:path';
 import type { Tree } from 'nx/src/devkit-exports.js';
 import { getProjects, readJson, readProjectConfiguration } from 'nx/src/devkit-exports.js';
 import typia from 'typia';
@@ -524,11 +524,9 @@ function collectReferencePathsTree(
   // A project reference is only legal to a `composite` program (TS6306); a
   // lib tsconfig that is not composite — an application target's emit
   // program — is included by the test program's own globs instead.
-  const isComposite = (path: string): boolean => {
-    if (!tree.exists(path)) return false;
-    const compilerOptions = recordProperty(readJson<Record<string, unknown>>(tree, path), 'compilerOptions');
-    return compilerOptions?.composite === true;
-  };
+  // `composite` is usually inherited from tsconfig.base.json, so the option is
+  // resolved through the `extends` chain, not read off the one file.
+  const isComposite = (path: string): boolean => resolveTsconfigOption(tree, path, 'composite') === true;
   const libTsconfigPath = `${packageRoot}/tsconfig.lib.json`;
   if (isComposite(libTsconfigPath)) {
     paths.push('./tsconfig.lib.json');
@@ -747,6 +745,29 @@ function recordProperty(record: Record<string, unknown> | null, key: string): Re
   if (!record) return null;
   const value = record[key];
   return isRecord(value) ? value : null;
+}
+
+/**
+ * A tsconfig compiler option as TypeScript would see it: the file's own value,
+ * else the nearest base in its `extends` chain (an array extends applies
+ * left-to-right, so the last base naming the option wins). Bases that are not
+ * relative paths (package configs) are outside the tree and contribute nothing.
+ */
+function resolveTsconfigOption(tree: Tree, path: string, option: string): unknown {
+  if (!tree.exists(path)) return undefined;
+  const config = readJson<Record<string, unknown>>(tree, path);
+  const own = recordProperty(config, 'compilerOptions')?.[option];
+  if (own !== undefined) return own;
+  const bases = config.extends;
+  const baseList = typeof bases === 'string' ? [bases] : Array.isArray(bases) ? bases : [];
+  for (let i = baseList.length - 1; i >= 0; i--) {
+    const base = baseList[i];
+    if (typeof base !== 'string' || !base.startsWith('.')) continue;
+    const basePath = join(dirname(path), base.endsWith('.json') ? base : `${base}.json`);
+    const inherited = resolveTsconfigOption(tree, basePath, option);
+    if (inherited !== undefined) return inherited;
+  }
+  return undefined;
 }
 
 function getOrCreateRecord(record: Record<string, unknown>, key: string): Record<string, unknown> {
