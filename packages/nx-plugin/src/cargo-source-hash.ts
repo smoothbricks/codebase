@@ -39,13 +39,21 @@ const ancestorInputs = ['Cargo.toml', '.cargo/config', '.cargo/config.toml'];
  * in-workspace Rust inputs. Build scripts' other data/environment inputs remain
  * explicit Nx inputs, just as they are for in-workspace crates.
  */
+// Nx hashes a runtime input's stdout AND stderr. Cargo reports lock contention
+// on stderr ("Blocking waiting for file lock on package cache") a
+// timing-dependent number of times when Nx hashes many tasks at once, which
+// made one unchanged tree produce four different task hashes per run. Cargo's
+// stderr is kept for the failure path only, where execFileSync attaches it to
+// the thrown error.
+const CARGO_STDIO: ['ignore', 'pipe', 'pipe'] = ['ignore', 'pipe', 'pipe'];
+
 export async function hashCargoPathInputs(manifestPath: string, workspaceRoot: string): Promise<string> {
   const root = await realpath(workspaceRoot);
   const metadata = parseMetadata(
     execFileSync(
       'cargo',
       ['metadata', '--format-version', '1', '--locked', '--offline', '--manifest-path', resolve(manifestPath)],
-      { cwd: root, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, stdio: ['ignore', 'pipe', 'inherit'] },
+      { cwd: root, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, stdio: CARGO_STDIO },
     ),
   );
   const cargoRoot = await realpath(metadata.workspace_root);
@@ -76,7 +84,7 @@ export async function hashCargoPathInputs(manifestPath: string, workspaceRoot: s
     const governingManifest = execFileSync(
       'cargo',
       ['locate-project', '--workspace', '--manifest-path', manifest, '--message-format', 'plain'],
-      { cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'inherit'] },
+      { cwd: root, encoding: 'utf8', stdio: CARGO_STDIO },
     ).trim();
     files.add(await realpath(governingManifest));
     for (const target of pkg.targets) files.add(await realpath(target.src_path));

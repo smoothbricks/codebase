@@ -49,3 +49,44 @@ it.each(['app', '.'])('invalidates transitive and inherited Cargo inputs with Nx
     await rm(root, { recursive: true, force: true });
   }
 });
+
+it('the runtime input is byte-identical under cargo lock contention: nothing on stderr', async () => {
+  // Nx hashes a runtime input's stdout and stderr together, and hashes once per
+  // distinct task env, so the bin runs many times at once at the start of a
+  // run. Cargo reports package-cache lock contention on stderr; a private
+  // CARGO_HOME makes that contention real here.
+  const root = await mkdtemp(join(tmpdir(), 'cargo-hash-'));
+  const manifest = join(root, 'Cargo.toml');
+  try {
+    await mkdir(join(root, 'src'), { recursive: true });
+    await writeFile(manifest, '[package]\nname="app"\nversion="0.1.0"\nedition="2021"\n[workspace]\n');
+    await writeFile(join(root, 'src', 'lib.rs'), 'pub fn run() {}\n');
+    const env = { ...process.env, CARGO_HOME: join(root, '.cargo-home') };
+    execFileSync('cargo', ['generate-lockfile', '--offline', '--manifest-path', manifest], { stdio: 'pipe', env });
+    // The built bin under node, exactly as nx.json's runtime input invokes it (test depends on build).
+    const bin = join(import.meta.dir, '..', 'dist', 'bin', 'smoo-nx-cargo-hash.js');
+    const runs = await Promise.all(
+      Array.from({ length: 8 }, async () => {
+        const proc = Bun.spawn(['node', bin, manifest], {
+          cwd: root,
+          env,
+          stdout: 'pipe',
+          stderr: 'pipe',
+        });
+        const [stdout, stderr, exitCode] = await Promise.all([
+          new Response(proc.stdout).text(),
+          new Response(proc.stderr).text(),
+          proc.exited,
+        ]);
+        return { stdout, stderr, exitCode };
+      }),
+    );
+    for (const run of runs) {
+      expect(run.exitCode).toBe(0);
+      expect(run.stderr).toBe('');
+    }
+    expect(new Set(runs.map((run) => run.stdout)).size).toBe(1);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
