@@ -1816,7 +1816,7 @@ async function assertRemoteTagExists(root: string, tag: string): Promise<void> {
  * it — status must never fall back to npmjs for a private-tagged package,
  * even when no scope configuration exists.
  */
-async function npmVersionExists(root: string, name: string, version: string): Promise<boolean> {
+export async function npmVersionExists(root: string, name: string, version: string): Promise<boolean> {
   const registry = selectRegistryForPackage(root, name);
   if (!registry) {
     assertPublicStatusAllowed(root, name);

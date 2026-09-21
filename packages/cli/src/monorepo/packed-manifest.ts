@@ -4,6 +4,7 @@ import type { PackageInfo } from '../lib/workspace.js';
 import { getWorkspacePackages, workspaceDependencyFields } from '../lib/workspace.js';
 import { releaseCandidateShell } from '../release/candidate-shell.js';
 import { packagePinFreshness } from '../release/candidates.js';
+import { npmVersionExists } from '../release/index.js';
 import { publishPackDependencyVersion } from './lockfile.js';
 
 export async function readPackedPackageJson(root: string, tarball: string, packageName: string): Promise<PackageJson> {
@@ -128,7 +129,16 @@ export async function validatePackedDependencyFreshness(
       const dep = workspacePackages.find((pkg) => pkg.name === name);
       if (!dep || pinned.includes('-') || releasing.includes(dep.projectName)) continue;
       const verdict = await packagePinFreshness(shell, dep, pinned);
-      if (verdict === 'fresh') continue;
+      if (verdict === 'fresh') {
+        // The tag is the promise; the registry is the fact. A publish that failed
+        // after tagging leaves a pin every consumer install refuses.
+        if (!(await npmVersionExists(root, name, pinned))) {
+          failures.push(
+            `${sourcePackage.path}: packed ${field}.${name} pins ${pinned}, which the registry does not hold; publish ${dep.projectName}@${pinned} first (release repair-pending) or release ${dep.projectName} in the same run.`,
+          );
+        }
+        continue;
+      }
       failures.push(
         verdict === 'untagged'
           ? `${sourcePackage.path}: packed ${field}.${name} pins ${pinned}, which no release tagged (${dep.projectName}@${pinned}); release ${dep.projectName} in the same run.`
