@@ -200,6 +200,16 @@ describe('release orchestration', () => {
     expect(shell.cleanChecks).toBe(0);
   });
 
+  it('refuses an auto bump for a package with no release tag and names the bump to use', async () => {
+    const shell = new RecordingVersionShell({ releasePackagesAtHead: [[]], releaseVersionPackages: [stable] });
+    shell.untagged.add(stable.projectName);
+
+    await expect(runReleaseVersion(shell, { bump: 'auto', dryRun: true })).rejects.toThrow(
+      `First release of ${stable.projectName}: no ${stable.projectName}@* tag exists, so --bump auto cannot derive a version. Rerun with an explicit bump (--bump patch).`,
+    );
+    expect(shell.nxRuns).toEqual([]);
+  });
+
   it('no-ops an explicit bump when the changed-set selection is empty', async () => {
     const shell = new RecordingVersionShell({ releasePackagesAtHead: [[]], releaseVersionPackages: [] });
 
@@ -433,6 +443,12 @@ class RecordingVersionShell implements ReleaseVersionShell<ReleasePackageInfo> {
 
   async releasePackagesAtHead(): Promise<ReleasePackageInfo[]> {
     return this.releaseBatches.shift() ?? [];
+  }
+
+  untagged = new Set<string>();
+
+  async hasReleaseTag(pkg: ReleasePackageInfo): Promise<boolean> {
+    return !this.untagged.has(pkg.projectName);
   }
 
   async releaseVersionPackages(): Promise<ReleasePackageInfo[]> {

@@ -113,3 +113,9 @@ async function packageHasHistory(root: string, packagePath: string): Promise<boo
   }
   return decode(result.stdout).trim().length > 0;
 }
+
+/** Whether any `<projectName>@*` tag exists, prerelease or stable. */
+export async function hasAnyReleaseTag(root: string, projectName: string): Promise<boolean> {
+  const result = await $`git tag --list ${`${projectName}@*`}`.cwd(root).quiet().nothrow();
+  return result.exitCode === 0 && decode(result.stdout).trim().length > 0;
+}

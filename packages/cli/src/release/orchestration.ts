@@ -84,6 +84,8 @@ export interface ReleaseRepairOutputsShell<Package extends ReleasePackageInfo = 
 export interface ReleaseVersionShell<Package extends ReleasePackageInfo = ReleasePackageInfo> {
   releasePackagesAtHead(): Promise<Package[]>;
   releaseVersionPackages(): Promise<Package[]>;
+  /** Whether any `<projectName>@*` release tag exists for the package. */
+  hasReleaseTag(pkg: Package): Promise<boolean>;
   gitHead(): Promise<string>;
   runNxReleaseVersion(packages: Package[], bump: string, dryRun: boolean): Promise<Package[]>;
   assertCleanGitTree(): Promise<void>;
@@ -119,6 +121,18 @@ export async function runReleaseVersion<Package extends ReleasePackageInfo>(
   const versionPackages = await shell.releaseVersionPackages();
   if (versionPackages.length === 0) {
     return { mode: 'none', packages: [], status: 'no-release-needed' };
+  }
+  if (options.bump === 'auto') {
+    // Nx derives an automatic bump from the commits since the package's last
+    // release tag; with no tag it reads the whole history and fails on the
+    // first commit whose scope it cannot resolve. A first release names its bump.
+    const first = [];
+    for (const pkg of versionPackages) if (!(await shell.hasReleaseTag(pkg))) first.push(pkg.projectName);
+    if (first.length > 0) {
+      throw new Error(
+        `First release of ${first.join(', ')}: no ${first.map((name) => `${name}@*`).join(', ')} tag exists, so --bump auto cannot derive a version. Rerun with an explicit bump (--bump patch).`,
+      );
+    }
   }
 
   const headBeforeVersioning = await shell.gitHead();

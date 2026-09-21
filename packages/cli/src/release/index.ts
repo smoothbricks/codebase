@@ -58,7 +58,7 @@ import {
   NPM_BOOTSTRAP_DIST_TAG,
   NPM_BOOTSTRAP_VERSION,
 } from './bootstrap-npm-packages.js';
-import { gitRefExists, releaseCandidateShell } from './candidate-shell.js';
+import { gitRefExists, hasAnyReleaseTag, releaseCandidateShell } from './candidate-shell.js';
 import { parseReleaseProjectSelection, type ReleaseProjectSelection, releaseCandidatePackages } from './candidates.js';
 import {
   type ReleaseTagRecord as CoreReleaseTagRecord,
@@ -201,6 +201,7 @@ export async function releaseVersion(root: string, options: ReleaseVersionOption
       releasePackagesAtHead: () => releasePackagesAtHead(root, packages),
       releaseVersionPackages: async () =>
         releaseCandidatePackages(await releaseCandidateShell(root), packages, selection),
+      hasReleaseTag: (pkg) => hasAnyReleaseTag(root, pkg.projectName),
       gitHead: () => gitHead(root),
       runNxReleaseVersion: (releasePackages, releaseBump, dryRun) =>
         runNxReleaseVersion(root, releasePackageProjects(releasePackages), releaseBump, dryRun),
