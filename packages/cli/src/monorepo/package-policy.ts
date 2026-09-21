@@ -612,7 +612,9 @@ export function validateWorkspaceDependencies(root: string, options: PackageTarg
   let failures = 0;
   failures += validateCiSkipTags(root, options);
   failures += validateCargoCrossLintTargets(root, options);
-  const workspaceNames = new Set(getWorkspacePackages(root).map((pkg) => pkg.name));
+  const workspacePackages = getWorkspacePackages(root);
+  const workspaceNames = new Set(workspacePackages.map((pkg) => pkg.name));
+  const publishableNames = new Set(listPublishablePackages(root).map((pkg) => pkg.name));
   for (const pkg of listPackageJsonRecords(root)) {
     for (const field of workspaceDependencyFields) {
       const dependencies = pkg.json[field];
@@ -622,6 +624,20 @@ export function validateWorkspaceDependencies(root: string, options: PackageTarg
       for (const [name, range] of Object.entries(dependencies)) {
         if (workspaceNames.has(name) && range !== 'workspace:*') {
           console.error(`${pkg.path}: ${field}.${name} must use workspace:*`);
+          failures++;
+        }
+        // A shipped package's runtime dependency must ship through the same
+        // release, or every publish pins whatever someone once pushed by hand:
+        // @axe.sc/axe released against an untagged axe-client-ts for months.
+        if (
+          field !== 'devDependencies' &&
+          publishableNames.has(pkg.name) &&
+          workspaceNames.has(name) &&
+          !publishableNames.has(name)
+        ) {
+          console.error(
+            `${pkg.path}: ${field}.${name} is a workspace package the release never publishes (no npm:public/npm:private tag); tag it, or drop the dependency.`,
+          );
           failures++;
         }
       }

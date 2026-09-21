@@ -472,6 +472,38 @@ describe('Nx project name policy', () => {
   });
 });
 
+describe('published packages depend only on published workspace packages', () => {
+  it('rejects a runtime dependency on an untagged workspace package and accepts it as a devDependency', async () => {
+    const root = await createWorkspace({
+      rootName: '@smoothbricks/codebase',
+      packages: [
+        { dir: 'client', name: '@smoothbricks/client', nx: { name: 'client' } },
+        {
+          dir: 'sdk',
+          name: '@smoothbricks/sdk',
+          nx: { name: 'sdk', tags: ['npm:private'] },
+          dependencies: { '@smoothbricks/client': 'workspace:*' },
+        },
+        {
+          dir: 'tools',
+          name: '@smoothbricks/tools',
+          nx: { name: 'tools', tags: ['npm:private'] },
+          devDependencies: { '@smoothbricks/client': 'workspace:*' },
+        },
+      ],
+    });
+    try {
+      const errors = captureConsoleErrors();
+      expect(validateWorkspaceDependencies(root)).toBe(1);
+      expect(errors.join('\n')).toContain(
+        'packages/sdk: dependencies.@smoothbricks/client is a workspace package the release never publishes',
+      );
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('workspace package script policy', () => {
   it('rejects all colon-style package Nx targets', async () => {
     const root = await createWorkspace({
@@ -1439,6 +1471,7 @@ async function createWorkspace(input: {
     private?: boolean;
     version?: string | null;
     dependencies?: Record<string, string>;
+    devDependencies?: Record<string, string>;
     scripts?: Record<string, string>;
     nx?: Record<string, unknown>;
   }>;
@@ -1459,6 +1492,7 @@ async function createWorkspace(input: {
       ...(pkg.version === null ? {} : { version: pkg.version ?? '0.0.0' }),
       ...(pkg.private === undefined ? {} : { private: pkg.private }),
       ...(pkg.dependencies ? { dependencies: pkg.dependencies } : {}),
+      ...(pkg.devDependencies ? { devDependencies: pkg.devDependencies } : {}),
       ...(pkg.scripts ? { scripts: pkg.scripts } : {}),
       ...(pkg.nx ? { nx: pkg.nx } : {}),
     });
