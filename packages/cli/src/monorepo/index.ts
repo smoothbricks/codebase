@@ -33,6 +33,7 @@ import {
   validatePublicPackageMetadata,
   validatePublicTags,
   validateRootPackagePolicy,
+  validateSingletonPeerDependencies,
   validateTestFileLocations,
   validateWorkspaceDependencies,
 } from './package-policy.js';
@@ -148,6 +149,7 @@ export async function checkManagedFiles(root: string, options: { warn?: boolean 
     validateNxReleaseConfig(root) +
     validatePublicTags(root) +
     validatePublicPackageMetadata(root) +
+    validateSingletonPeerDependencies(root) +
     validateTestFileLocations(root) +
     validateNoStaleTestOutput(root) +
     validateWorkspaceDependencies(root, { resolvedTargetsByProject: resolvedTargets }) +

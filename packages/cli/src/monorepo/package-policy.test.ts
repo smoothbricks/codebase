@@ -27,6 +27,7 @@ import {
   validateNxReleaseConfig,
   validatePublicTags,
   validateRootPackagePolicy,
+  validateSingletonPeerDependencies,
   validateTestFileLocations,
   validateWorkspaceDependencies,
 } from './package-policy.js';
@@ -347,6 +348,38 @@ describe('publishable npm tag policy', () => {
       expect(validatePublicTags(root)).toBe(2);
       expect(errors.join('\n')).toContain('private:true means never publish');
       expect(listPublishablePackages(root)).toEqual([]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('singleton peer dependency policy', () => {
+  afterEach(() => {
+    console.error = originalConsoleError;
+  });
+
+  it("refuses react in a publishable package's dependencies but not in an application's", async () => {
+    const root = await createWorkspace({
+      rootName: '@smoothbricks/codebase',
+      packages: [
+        { dir: 'ui', name: '@smoothbricks/ui', dependencies: { react: '^19.2.8' }, nx: { tags: ['npm:public'] } },
+        {
+          dir: 'widgets',
+          name: '@smoothbricks/widgets',
+          dependencies: { 'react-dom': '^19.2.8' },
+          nx: { tags: ['npm:private'] },
+        },
+        { dir: 'app', name: '@smoothbricks/app', private: true, dependencies: { react: '^19.2.8' } },
+      ],
+    });
+    try {
+      const errors = captureConsoleErrors();
+      expect(validateSingletonPeerDependencies(root)).toBe(2);
+      const report = errors.join('\n');
+      expect(report).toContain('packages/ui: dependencies.react');
+      expect(report).toContain('packages/widgets: dependencies.react-dom');
+      expect(report).not.toContain('packages/app');
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -1412,6 +1445,8 @@ async function createWorkspace(input: {
   files?: Record<string, string>;
 }): Promise<string> {
   const root = await mkdtemp(join(tmpdir(), 'smoo-package-policy-'));
+  // Library programs are composite by inheritance, as in a real workspace.
+  await writeJson(join(root, 'tsconfig.base.json'), { compilerOptions: { composite: true } });
   await writeJson(join(root, 'package.json'), {
     name: input.rootName,
     version: '0.0.0',

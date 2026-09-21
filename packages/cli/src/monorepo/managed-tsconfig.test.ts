@@ -18,6 +18,8 @@ function workspace(): FsTree {
   const tree = new FsTree(root, false);
   writeJson(tree, 'package.json', { name: '@fixture/workspace', workspaces: ['packages/*'] });
   writeJson(tree, 'nx.json', {});
+  // Library programs are composite by inheritance, as in a real workspace.
+  writeJson(tree, 'tsconfig.base.json', { compilerOptions: { composite: true } });
   writeJson(tree, 'packages/app/package.json', {
     name: '@fixture/app',
     nx: { name: 'app', targets: { test: { command: 'bun test' } } },
@@ -71,7 +73,7 @@ describe('managed test tsconfig reconciliation', () => {
   it('uses staged package dependencies and test runtime options instead of disk snapshots', async () => {
     const tree = workspace();
     writeJson(tree, 'packages/dependency/package.json', { name: '@fixture/dependency', nx: { name: 'dependency' } });
-    writeJson(tree, 'packages/dependency/tsconfig.lib.json', {});
+    writeJson(tree, 'packages/dependency/tsconfig.lib.json', { extends: '../../tsconfig.base.json' });
     writeJson(tree, 'packages/app/package.json', {
       name: '@fixture/app',
       devDependencies: { '@fixture/dependency': 'workspace:*' },

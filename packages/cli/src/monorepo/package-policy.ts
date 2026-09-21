@@ -51,11 +51,40 @@ import {
   getWorkspacePackages,
   listPackageJsonRecords,
   listPublicPackages,
+  listPublishablePackages,
   packageRepositoryInfo,
   repositoryInfo,
   sameRepositoryAfterNormalization,
   workspaceDependencyFields,
 } from '../lib/workspace.js';
+
+/**
+ * Packages that must exist exactly once in a consumer's module graph. A library
+ * that lists one as a hard dependency ships a second copy the moment the consumer
+ * pins a different range — React then throws "Invalid hook call" from the second
+ * copy, and there is no diagnostic pointing at the package that caused it. The
+ * only build entitled to own its React is an application (private: true).
+ */
+const singletonPeerPackages = ['react', 'react-dom'] as const;
+
+export function validateSingletonPeerDependencies(root: string): number {
+  let failures = 0;
+  for (const pkg of listPublishablePackages(root)) {
+    const dependencies = pkg.json.dependencies;
+    if (!dependencies) {
+      continue;
+    }
+    for (const name of singletonPeerPackages) {
+      if (name in dependencies) {
+        console.error(
+          `${pkg.path}: dependencies.${name} ships a second ${name} into consumers; declare it in peerDependencies (and devDependencies for the package's own tests)`,
+        );
+        failures++;
+      }
+    }
+  }
+  return failures;
+}
 
 export type { PackageTargetPolicyOptions as WorkspaceDependencyDefaultOptions, ResolvedProjectTargets };
 export { SMOO_NX_RELEASE_TAG_PATTERN, SMOO_NX_VERSION_ACTIONS };
