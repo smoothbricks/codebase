@@ -93,6 +93,25 @@ describe('managed-file inline local blocks', () => {
     );
   });
 
+  it('fences a TypeScript managed file with // markers and re-emits the same prefix', () => {
+    // setup-environment.ts is a managed TypeScript file; `# smoo-local-begin`
+    // is not a comment there. A repo-owned block (the dev-links re-link after
+    // install) used `//` fences that the update never recognised and dropped.
+    const current = [
+      'const a = 1;',
+      '// smoo-local-begin',
+      'linkDevPackages();',
+      '// smoo-local-end',
+      'const b = 2;',
+    ].join('\n');
+    const { withoutInline, blocks } = extractInlineLocalBlocks(current);
+    expect(withoutInline).toBe(['const a = 1;', 'const b = 2;'].join('\n'));
+    expect(blocks).toEqual([{ anchor: 'const a = 1;', lines: 'linkDevPackages();', markerPrefix: '//' }]);
+    expect(reinsertInlineLocalBlocks(['const a = 1;', 'const b = 3;'].join('\n'), blocks)).toBe(
+      ['const a = 1;', '// smoo-local-begin', 'linkDevPackages();', '// smoo-local-end', 'const b = 3;'].join('\n'),
+    );
+  });
+
   it('preserves marker indentation when refreshing nested configuration', () => {
     const markerIndent = '      ';
     const current = [

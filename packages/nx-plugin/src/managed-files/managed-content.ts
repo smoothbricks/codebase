@@ -34,11 +34,25 @@ export function splitLocalSection(current: string): { managed: string; localTail
  */
 export const INLINE_LOCAL_BEGIN = '# smoo-local-begin';
 export const INLINE_LOCAL_END = '# smoo-local-end';
+/**
+ * The markers are line comments, so a managed file whose language does not
+ * comment with `#` (a TypeScript setup script) fences its repo-owned block
+ * with `//` instead: `// smoo-local-begin`. The prefix a block was written
+ * with is the prefix it is re-emitted with.
+ */
+const INLINE_MARKER = /^\s*(#|\/\/) smoo-local-(begin|end)$/;
+
+function inlineMarker(line: string | undefined): { kind: 'begin' | 'end'; prefix: string } | undefined {
+  const match = line === undefined ? null : INLINE_MARKER.exec(line);
+  return match === null ? undefined : { kind: match[2] === 'begin' ? 'begin' : 'end', prefix: match[1] };
+}
 
 export interface InlineLocalBlock {
   anchor: string;
   lines: string;
   markerIndent?: string;
+  /** The comment prefix the markers were written with; `#` unless stated. */
+  markerPrefix?: string;
   /** Distinguishes no lines from one deliberately blank line. */
   empty?: true;
 }
@@ -53,16 +67,17 @@ export function extractInlineLocalBlocks(managed: string): { withoutInline: stri
   let i = 0;
   while (i < lines.length) {
     const line = lines[i];
-    if (line !== undefined && line.trim() === INLINE_LOCAL_BEGIN) {
+    const marker = inlineMarker(line);
+    if (line !== undefined && marker?.kind === 'begin') {
       const anchor = kept.at(-1);
       if (anchor === undefined) {
         throw new ManagedContentConflict(`${INLINE_LOCAL_BEGIN} on line ${i + 1} has no preceding anchor line`);
       }
       const blockLines: string[] = [];
       i += 1;
-      while (i < lines.length && lines[i]?.trim() !== INLINE_LOCAL_END) {
+      while (i < lines.length && inlineMarker(lines[i])?.kind !== 'end') {
         const blockLine = lines[i];
-        if (blockLine.trim() === INLINE_LOCAL_BEGIN) {
+        if (inlineMarker(blockLine)?.kind === 'begin') {
           throw new ManagedContentConflict(`${INLINE_LOCAL_BEGIN} on line ${i + 1} is nested`);
         }
         blockLines.push(blockLine);
@@ -79,11 +94,12 @@ export function extractInlineLocalBlocks(managed: string): { withoutInline: stri
         lines: blockLines.join('\n'),
         ...(blockLines.length === 0 ? { empty: true as const } : {}),
         ...(markerIndent === '' ? {} : { markerIndent }),
+        ...(marker.prefix === '#' ? {} : { markerPrefix: marker.prefix }),
       });
       i += 1; // skip the END marker line itself
       continue;
     }
-    if (line.trim() === INLINE_LOCAL_END) {
+    if (inlineMarker(line)?.kind === 'end') {
       throw new ManagedContentConflict(`${INLINE_LOCAL_END} on line ${i + 1} has no matching ${INLINE_LOCAL_BEGIN}`);
     }
     kept.push(line);
@@ -109,11 +125,12 @@ export function reinsertInlineLocalBlocks(content: string, blocks: InlineLocalBl
     }
     const index = matches[0];
     const markerIndent = block.markerIndent ?? '';
+    const prefix = block.markerPrefix ?? '#';
     const inserted = additions.get(index) ?? [];
     inserted.push(
-      `${markerIndent}${INLINE_LOCAL_BEGIN}`,
+      `${markerIndent}${prefix} smoo-local-begin`,
       ...(block.empty ? [] : block.lines.split('\n')),
-      `${markerIndent}${INLINE_LOCAL_END}`,
+      `${markerIndent}${prefix} smoo-local-end`,
     );
     additions.set(index, inserted);
   }
