@@ -1,7 +1,16 @@
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { ensureNx, ensureNxTargets, type NxTargetConfig, type PackageJson, writeJsonObject } from '../lib/json.js';
+import {
+  ensureNx,
+  ensureNxTargets,
+  type NxTargetConfig,
+  type PackageJson,
+  readSmooGithub,
+  writeJsonObject,
+} from '../lib/json.js';
 import { getWorkspacePackageManifests } from '../lib/workspace.js';
+import { readWranglerSourceConfig } from '../wrangler/source-config.js';
+import { readDeclaredSecretNames, readSecretStageMap } from '../wrangler/stage-secrets.js';
 
 interface WranglerProject {
   label: string;
@@ -122,6 +131,7 @@ export function validateWrangler(root: string): number {
       console.log(`⨯ ${project.label}: missing wrangler-types nx target`);
       projectProblems++;
     }
+    projectProblems += validateRequiredSecretsDeclared(root, project);
     if (!gitignoreCoversSecrets) {
       console.log(`⨯ ${project.label}: root .gitignore must ignore .dev.vars and worker-configuration.d.ts`);
       projectProblems++;
@@ -132,4 +142,52 @@ export function validateWrangler(root: string): number {
     problems += projectProblems;
   }
   return problems;
+}
+
+/**
+ * Every secret an env block `required`s must be a NAME the project declares in
+ * `.dev.vars.example` — that list is the only source deploy-stage supplies
+ * values from — and must reach CI through `smoo.github.deploySecrets` when the
+ * managed workflows deploy the stage. A required secret declared nowhere
+ * makes every preview deploy die in wrangler with "required secrets have
+ * not been set".
+ */
+function validateRequiredSecretsDeclared(root: string, project: WranglerProject): number {
+  if (!existsSync(join(project.dir, '.dev.vars.example'))) return 0;
+  const declared = new Set(readDeclaredSecretNames(project.dir));
+  const deploySecrets = readSmooGithub(root)?.deploySecrets;
+  const ciProvided = deploySecrets ? new Set(Object.keys(deploySecrets)) : null;
+  // A name scoped to no stage is local-only by declaration and never rides through CI.
+  const stageMap = readSecretStageMap(project.dir);
+  const localOnly = (name: string) => stageMap[name]?.length === 0;
+  let problems = 0;
+  let document: ReturnType<typeof readWranglerSourceConfig>['document'];
+  try {
+    document = readWranglerSourceConfig(project.dir).document;
+  } catch {
+    return 0; // an unreadable config is reported by the deploy path with its own message
+  }
+  for (const [envName, env] of Object.entries(document.env ?? {})) {
+    const required = requiredSecretsOf(env?.secrets);
+    for (const name of required) {
+      if (!declared.has(name)) {
+        console.log(
+          `⨯ ${project.label}: [env.${envName}.secrets] requires ${name}, which .dev.vars.example does not declare; deploy-stage can never supply it. Declare the name there.`,
+        );
+        problems++;
+      } else if (ciProvided && !ciProvided.has(name) && !localOnly(name)) {
+        console.log(
+          `⨯ ${project.label}: [env.${envName}.secrets] requires ${name}, which smoo.github.deploySecrets does not map; the managed workflows deploy without it. Map it (and set the GitHub secret).`,
+        );
+        problems++;
+      }
+    }
+  }
+  return problems;
+}
+
+function requiredSecretsOf(secrets: unknown): string[] {
+  if (typeof secrets !== 'object' || secrets === null) return [];
+  const required = Reflect.get(secrets, 'required');
+  return Array.isArray(required) ? required.filter((name): name is string => typeof name === 'string') : [];
 }
