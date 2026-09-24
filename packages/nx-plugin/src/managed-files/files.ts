@@ -249,7 +249,7 @@ export function renderManagedFiles(context: ManagedFileContext): ManagedFile[] {
 
 /** Renders a generated workflow through its real managed-file descriptor, so the context wiring is covered. */
 export function renderManagedWorkflowForTest(
-  source: 'ci-workflow' | 'publish-workflow',
+  source: 'ci-workflow' | 'publish-workflow' | 'pr-preview-cleanup-workflow',
   context: ManagedFileContext,
 ): string {
   const file = managedFiles.find((candidate) => candidate.kind === 'generated' && candidate.source === source);
@@ -307,7 +307,14 @@ function getManagedContent(file: ManagedFileDescriptor, context: ManagedFileCont
       });
     }
     if (file.source === 'pr-preview-cleanup-workflow') {
-      return renderPrPreviewCleanupWorkflowYaml({ runsOn: context.ciRunsOn });
+      return renderPrPreviewCleanupWorkflowYaml({
+        runsOn: context.ciRunsOn,
+        privateNpm: context.privateNpm,
+        sourceCheckouts: context.sourceCheckouts,
+        cargoCredentials: context.cargoCredentials,
+        environments: context.ciEnvironments,
+        deploySecrets: context.ciDeploySecrets,
+      });
     }
     throw new Error(`Unknown generated managed file source ${file.source}`);
   }

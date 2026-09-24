@@ -1041,9 +1041,16 @@ function stagingRefLiteral(options: CiWorkflowDefinitionOptions): string {
   return `'refs/heads/${stagingPushBranch(options).replaceAll("'", "''")}'`;
 }
 
-function environmentLine(name: string | undefined): string {
+/** A job's `environment:` line, or nothing when no GitHub Environment is declared. */
+export function environmentLine(name: string | undefined): string {
   return name ? `    environment: ${yamlScalar(name)}\n` : '';
 }
+
+/** The Cloudflare credentials a deploy step carries, env var name → default repository secret name. */
+const CLOUDFLARE_DEPLOY_SECRETS: Record<string, string> = {
+  CLOUDFLARE_API_TOKEN: 'CLOUDFLARE_API_TOKEN',
+  CLOUDFLARE_ACCOUNT_ID: 'CLOUDFLARE_ACCOUNT_ID',
+};
 
 /**
  * The step-scoped `env:` block for a deploy step. Step scope is the property
@@ -1057,11 +1064,22 @@ function environmentLine(name: string | undefined): string {
  * once in `deploySecrets` instead of being overridden here.
  */
 export function deployStepSecretEnvLines(config: DeployStepSecretConfig): string[] {
-  const cloudflare: Record<string, string> =
-    config.deployProvider === 'cloudflare'
-      ? { CLOUDFLARE_API_TOKEN: 'CLOUDFLARE_API_TOKEN', CLOUDFLARE_ACCOUNT_ID: 'CLOUDFLARE_ACCOUNT_ID' }
-      : {};
+  const cloudflare = config.deployProvider === 'cloudflare' ? CLOUDFLARE_DEPLOY_SECRETS : {};
   return secretEnvLines({ ...cloudflare, ...config.deploySecrets });
+}
+
+/**
+ * The step env for a step that acts on Cloudflare as the stage deploy did: the
+ * two Cloudflare credentials, read from the secrets `deployStepSecretEnvLines`
+ * names for them, and none of the other deploy secrets, which such a step
+ * never uses.
+ */
+export function cloudflareCredentialEnvLines(deploySecrets: Record<string, string> | undefined): string[] {
+  const credentials = Object.entries(CLOUDFLARE_DEPLOY_SECRETS).map(([name, secret]) => [
+    name,
+    deploySecrets?.[name] ?? secret,
+  ]);
+  return secretEnvLines(Object.fromEntries(credentials));
 }
 
 /** A step-level `env:` block mapping env var names to repository secrets; nothing when there are none. */

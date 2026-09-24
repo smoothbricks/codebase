@@ -450,10 +450,12 @@ The bootstrap script is intentionally small. It only handles work required befor
 - `pushBranches`: the first entry is the branch whose pushes deploy the staging stage (default `main`).
 - `environments.staging` / `environments.production`: GitHub Environments put on the validate + e2e jobs and on the
   production-on-push job respectively. The staging Environment goes on Validate for every run of a deploying repo, pull
-  requests included, so a staging Environment with required reviewers would gate every pull request's Validate.
+  requests included, so a staging Environment with required reviewers would gate every pull request's Validate. It also
+  goes on the PR preview cleanup job, so the cleanup reads the Cloudflare credentials the stage deploy read.
 - `deploySecrets`: extra secrets for deploy steps, as a map of env var name → repository secret name, rendered
   `NAME: ${{ secrets.SECRET }}` (GitHub forbids `GITHUB_`-prefixed secret names, so the two may differ). The keys
-  `CLOUDFLARE_API_TOKEN` / `CLOUDFLARE_ACCOUNT_ID` replace the default Cloudflare mapping.
+  `CLOUDFLARE_API_TOKEN` / `CLOUDFLARE_ACCOUNT_ID` replace the default Cloudflare mapping, on the PR preview cleanup job
+  too; the cleanup gets only those two.
 - `e2eSecrets`: the same map shape for the e2e-deployment step only.
 - `previewUrls`: required URL templates for pull-request stages (`{stage}` is replaced, and required in every template).
   The first one becomes the GitHub deployment URL, all are listed in the step summary. There is no default: a
@@ -538,7 +540,8 @@ two versions.
 Pushes to the staging push branch queue behind a running workflow instead of canceling it, so a newer push never cancels
 a production deployment mid-flight. Pull requests and other branches keep canceling superseded runs. The e2e and
 production jobs repeat the Cargo credential and sibling-source preflight before SetupDevenv, so their `--step` anchors
-shift with the configuration instead of staying fixed.
+shift with the configuration instead of staying fixed. The PR preview cleanup job runs the same preflight and carries
+the same job-level Cargo and private npm read tokens, since its SetupDevenv resolves the same declarations.
 
 ### Private dependency configuration (`package.json` → `smoo.github.cargoCredentials`)
 
