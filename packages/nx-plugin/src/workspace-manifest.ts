@@ -47,7 +47,7 @@ export interface PackagePublishConfig {
 }
 
 export interface PackageSmooGithubEnvironments {
-  /** GitHub Environment for the staging deploy and e2e jobs. */
+  /** GitHub Environment for the staging deploy, e2e and PR preview cleanup jobs. */
   staging?: string;
   /** GitHub Environment for the production-on-push deploy job. */
   production?: string;
