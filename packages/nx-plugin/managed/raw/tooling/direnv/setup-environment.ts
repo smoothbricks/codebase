@@ -10,7 +10,6 @@ import {
   symlinkSync,
   writeFileSync,
 } from 'node:fs';
-import { mkdir, rmdir, stat } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import path from 'node:path';
 import { $ } from 'bun';
@@ -78,12 +77,6 @@ async function resolveProjectRoot(): Promise<string> {
 
 const projectRoot = await resolveProjectRoot();
 
-// A legitimate concurrent setup finishes well within this; anything older is a
-// leftover from an interrupted run (CTRL-C/kill before the finally-cleanup) and
-// would otherwise wedge every future shell load behind the 120s spin + EEXIST.
-// NOTE: must be declared ABOVE the top-level setup block below — module consts
-// are not hoisted, and the lock loop runs during that block.
-const STALE_LOCK_MS = 10 * 60_000;
 // Unscoped require("typescript") must expose the TS6 compiler API for Nx.
 // @typescript/native installs another package also named "typescript" (TS7). Bun's
 // isolated linker RACES the node_modules/.bun/node_modules/typescript fallback link
@@ -124,28 +117,24 @@ try {
   // and package resolution/Typia transforms are not available yet.
   if (process.env.CI) {
     await resolveSecrets();
-    // Concurrent devenv activations share one node_modules, so the CI
-    // installs race exactly like local ones (EEXIST link failures under
-    // parallel shells). Serialize them under the same setup lock. Nothing
-    // that exits the process may run inside the callback: process.exit
-    // skips the finally that releases the lock and strands it, so failures
-    // are captured inside and reported outside.
+    // Failures are captured and reported below. Exiting in the catch would
+    // skip the git-diff diagnostic that follows a frozen-lockfile miss.
+    // bun install already races concurrent installs with an atomic cache
+    // rename; this script does not add a second mutex around it.
     let frozenError: unknown;
     let fallbackError: unknown;
-    await withSetupLock(async () => {
+    try {
+      await runSetupCommand('bun install --frozen-lockfile', $`bun install --frozen-lockfile`, { quiet: false });
+    } catch (error) {
+      frozenError = error;
+      console.error('! Failed to install dependencies with frozen lockfile');
+      replayCapturedOutput(error);
       try {
-        await runSetupCommand('bun install --frozen-lockfile', $`bun install --frozen-lockfile`, { quiet: false });
-      } catch (error) {
-        frozenError = error;
-        console.error('! Failed to install dependencies with frozen lockfile');
-        replayCapturedOutput(error);
-        try {
-          await runSetupCommand('bun install', $`bun install`, { quiet: false });
-        } catch (fallback) {
-          fallbackError = fallback;
-        }
+        await runSetupCommand('bun install', $`bun install`, { quiet: false });
+      } catch (fallback) {
+        fallbackError = fallback;
       }
-    });
+    }
     if (fallbackError !== undefined) {
       reportSetupFailure(fallbackError);
     }
@@ -214,19 +203,15 @@ async function installLocalDependencies(): Promise<unknown> {
   } catch (error) {
     return error;
   }
-  // bun install runs the root prepare script. Multiple concurrent direnv
-  // activations can otherwise race while mutating the same files under
-  // node_modules. Nothing that exits the process may run inside the callback
-  // (see the CI branch), so the failure is returned, not thrown.
-  let installError: unknown;
-  await withSetupLock(async () => {
-    try {
-      await runSetupCommand('bun install --no-summary', $`bun install --no-summary`);
-    } catch (error) {
-      installError = error;
-    }
-  });
-  return installError;
+  // Returned, not thrown: the caller still wires git config, then reports a
+  // degraded shell. Same reason as the CI branch — bun install's own rename
+  // is the concurrency control, not a lock in this script.
+  try {
+    await runSetupCommand('bun install --no-summary', $`bun install --no-summary`);
+  } catch (error) {
+    return error;
+  }
+  return undefined;
 }
 
 function ensureTypeScriptApiPackage(root: string): void {
@@ -455,59 +440,6 @@ async function runSetupCommand(
   if (result.exitCode !== 0) {
     throw new CapturedCommandError(command, result.exitCode, result.stdout, result.stderr);
   }
-}
-
-async function withSetupLock<T>(fn: () => Promise<T>): Promise<T> {
-  const lockDir = path.join(projectRoot, 'tooling/direnv/.devenv/setup-environment.lock');
-  await acquireLock(lockDir);
-  try {
-    return await fn();
-  } finally {
-    await rmdir(lockDir).catch(() => undefined);
-  }
-}
-
-async function acquireLock(lockDir: string): Promise<void> {
-  const deadline = Date.now() + 120_000;
-  while (true) {
-    try {
-      await mkdir(lockDir, { recursive: false });
-      return;
-    } catch (error) {
-      if (!isFileExistsError(error) || Date.now() > deadline) {
-        throw error;
-      }
-      if (await isStaleLock(lockDir)) {
-        // Surface the self-heal so an interrupted-run leftover is visible in
-        // the direnv log rather than silently absorbed.
-        console.error(`! Breaking stale setup lock (${lockDir}) left by an interrupted run`);
-        // Best-effort: if a concurrent process breaks it first, the rmdir
-        // fails silently and the next mkdir attempt settles the race.
-        await rmdir(lockDir).catch(() => undefined);
-        continue;
-      }
-      await Bun.sleep(100);
-    }
-  }
-}
-
-async function isStaleLock(lockDir: string): Promise<boolean> {
-  try {
-    const info = await stat(lockDir);
-    return Date.now() - info.mtimeMs > STALE_LOCK_MS;
-  } catch (error) {
-    // Only "lock vanished" is expected here (a concurrent process released
-    // it); anything else must surface — a swallowed ReferenceError in this
-    // exact spot once disabled stale detection entirely.
-    if (error instanceof Error && 'code' in error && error.code === 'ENOENT') {
-      return false; // gone — let the mkdir retry acquire it
-    }
-    throw error;
-  }
-}
-
-function isFileExistsError(error: unknown): boolean {
-  return error instanceof Error && 'code' in error && error.code === 'EEXIST';
 }
 
 function reportSetupFailure(error: unknown): never {

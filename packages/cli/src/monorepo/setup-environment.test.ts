@@ -50,10 +50,7 @@ async function withManagedRepository(
   const root = await mkdtemp(join(tmpdir(), 'smoo-shell-entry-'));
   const ledgers = await mkdtemp(join(tmpdir(), 'smoo-shell-entry-ledger-'));
   try {
-    // `.devenv/` is devenv's own state directory, and the setup lock is
-    // created inside it: a managed repository always has one by the time
-    // this script runs.
-    await mkdir(join(root, 'tooling', 'direnv', '.devenv'), { recursive: true });
+    await mkdir(join(root, 'tooling', 'direnv'), { recursive: true });
     await mkdir(join(root, 'tooling', 'git-hooks'), { recursive: true });
     for (const name of ['setup-environment.ts', 'secret-references.ts']) {
       await copyFile(join(MANAGED, 'direnv', name), join(root, 'tooling', 'direnv', name));
