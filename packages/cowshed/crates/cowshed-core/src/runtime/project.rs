@@ -31,6 +31,7 @@ use crate::metadata::WorkspaceName;
 #[cfg(target_os = "macos")]
 use crate::repository::OwnedRepoIds;
 use crate::repository::{RepoId, RepositoryBinding};
+#[cfg(target_os = "macos")]
 use crate::timing::timed_async;
 
 const ROUTER_CAPACITY: usize = 64;
