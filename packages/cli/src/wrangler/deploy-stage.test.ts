@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import {
   CloudflareApiError,
   type CloudflareClient,
+  CloudflareRestClient,
   type CloudflareZone,
   type D1DatabaseRecord,
   type DnsRecord,
@@ -18,6 +19,7 @@ import {
   childEnvironment,
   cleanupPullRequest,
   deployStage,
+  describeCleanup,
   type ProcessResult,
   type ProcessRunner,
   type ProcessRunOptions,
@@ -30,6 +32,7 @@ import {
   readCachedLiveVersion,
 } from './live-version.js';
 import type { LiveKvNamespace } from './stage.js';
+import { STAGE_RECORDS_BUCKET, type StageRecord, stageRecordKey } from './stage-records.js';
 
 const HASH = '16577780061662788004';
 const FIXTURE = `[env.staging]
@@ -158,9 +161,12 @@ class FakeCloudflare implements CloudflareClient {
   records: Record<string, DnsRecord[]> = {};
   objects: Record<string, string[]> = {};
   d1Databases: D1DatabaseRecord[] = [];
+  /** Every listing asked for, with its argument, so a test can prove what was never read. */
+  reads: string[] = [];
   mutations: string[] = [];
 
   async listKvNamespaces(): Promise<LiveKvNamespace[]> {
+    this.reads.push('kv');
     return this.namespaces;
   }
   async createKvNamespace(title: string): Promise<LiveKvNamespace> {
@@ -171,8 +177,10 @@ class FakeCloudflare implements CloudflareClient {
   }
   async deleteKvNamespace(id: string): Promise<void> {
     this.mutations.push(`delete-kv:${id}`);
+    this.namespaces = this.namespaces.filter((namespace) => namespace.id !== id);
   }
   async listR2Buckets(): Promise<R2Bucket[]> {
+    this.reads.push('r2');
     return this.buckets;
   }
   async createR2Bucket(name: string): Promise<void> {
@@ -180,6 +188,7 @@ class FakeCloudflare implements CloudflareClient {
     this.buckets.push({ name });
   }
   async listR2Objects(bucket: string, prefix = ''): Promise<string[]> {
+    this.reads.push(`objects:${bucket}:${prefix}`);
     return (this.objects[bucket] ?? []).filter((key) => key.startsWith(prefix));
   }
   async putR2Object(bucket: string, key: string): Promise<void> {
@@ -190,11 +199,14 @@ class FakeCloudflare implements CloudflareClient {
   }
   async deleteR2Object(bucket: string, key: string): Promise<void> {
     this.mutations.push(`delete-object:${bucket}:${key}`);
+    this.objects[bucket] = (this.objects[bucket] ?? []).filter((candidate) => candidate !== key);
   }
   async deleteR2Bucket(name: string): Promise<void> {
     this.mutations.push(`delete-r2:${name}`);
+    this.buckets = this.buckets.filter((bucket) => bucket.name !== name);
   }
   async listWorkerScripts(): Promise<WorkerScript[]> {
+    this.reads.push('workers');
     return this.scripts;
   }
   async listWorkerSecrets(workerName: string): Promise<string[]> {
@@ -213,8 +225,10 @@ class FakeCloudflare implements CloudflareClient {
   }
   async deleteWorkerScript(name: string): Promise<void> {
     this.mutations.push(`delete-worker:${name}`);
+    this.scripts = this.scripts.filter((script) => script.id !== name);
   }
   async listWorkerDomains(): Promise<WorkerDomain[]> {
+    this.reads.push('domains');
     return this.domains;
   }
   async createWorkerDomain(hostname: string, workerName: string): Promise<void> {
@@ -222,11 +236,14 @@ class FakeCloudflare implements CloudflareClient {
   }
   async deleteWorkerDomain(id: string): Promise<void> {
     this.mutations.push(`delete-domain:${id}`);
+    this.domains = this.domains.filter((domain) => domain.id !== id);
   }
-  async listZones(): Promise<CloudflareZone[]> {
-    return this.zones;
+  async listZones(name?: string): Promise<CloudflareZone[]> {
+    this.reads.push(name === undefined ? 'zones' : `zones:${name}`);
+    return name === undefined ? this.zones : this.zones.filter((zone) => zone.name === name);
   }
   async listWorkerRoutes(zoneId: string): Promise<WorkerRoute[]> {
+    this.reads.push(`routes:${zoneId}`);
     return this.routes[zoneId] ?? [];
   }
   async createWorkerRoute(zoneId: string, pattern: string, workerName: string): Promise<void> {
@@ -234,8 +251,10 @@ class FakeCloudflare implements CloudflareClient {
   }
   async deleteWorkerRoute(zoneId: string, routeId: string): Promise<void> {
     this.mutations.push(`delete-route:${zoneId}:${routeId}`);
+    this.routes[zoneId] = (this.routes[zoneId] ?? []).filter((route) => route.id !== routeId);
   }
   async listDnsRecords(zoneId: string): Promise<DnsRecord[]> {
+    this.reads.push(`dns:${zoneId}`);
     return this.records[zoneId] ?? [];
   }
   async createDnsRecord(zoneId: string, name: string, content: string): Promise<void> {
@@ -243,8 +262,10 @@ class FakeCloudflare implements CloudflareClient {
   }
   async deleteDnsRecord(zoneId: string, recordId: string): Promise<void> {
     this.mutations.push(`delete-dns:${zoneId}:${recordId}`);
+    this.records[zoneId] = (this.records[zoneId] ?? []).filter((record) => record.id !== recordId);
   }
   async listD1Databases(): Promise<D1DatabaseRecord[]> {
+    this.reads.push('d1');
     return this.d1Databases;
   }
   async createD1Database(name: string): Promise<D1DatabaseRecord> {
@@ -255,6 +276,7 @@ class FakeCloudflare implements CloudflareClient {
   }
   async deleteD1Database(uuid: string): Promise<void> {
     this.mutations.push(`delete-d1:${uuid}`);
+    this.d1Databases = this.d1Databases.filter((database) => database.uuid !== uuid);
   }
 }
 
@@ -771,84 +793,443 @@ ENVIRONMENT = "production"
   });
 });
 
-describe('cleanup-pr exact stage matching', () => {
+const SCOPE = 'github.com/acme/app';
+const PR7_PREFIX = 'v1/github.com%2Facme%2Fapp/pr7/';
+
+/** Writes `records` into the fake's record bucket the way a deploy of `stage` under `scope` would. */
+function recordStage(
+  cloudflare: FakeCloudflare,
+  records: StageRecord[],
+  { scope = SCOPE, stage = 'pr7' }: { scope?: string; stage?: `pr${number}` } = {},
+): string[] {
+  if (!cloudflare.buckets.some((bucket) => bucket.name === STAGE_RECORDS_BUCKET)) {
+    cloudflare.buckets.push({ name: STAGE_RECORDS_BUCKET });
+  }
+  const keys = records.map((record) => stageRecordKey(scope, stage, record));
+  cloudflare.objects[STAGE_RECORDS_BUCKET] = [...(cloudflare.objects[STAGE_RECORDS_BUCKET] ?? []), ...keys];
+  return keys;
+}
+
+/** A workspace root naming `github.com/acme/app`; no `GITHUB_REPOSITORY`, so no CI cross-check. */
+async function cleanupRoot(): Promise<string> {
+  const root = await mkdtemp(join(tmpdir(), 'smoo-cleanup-test-'));
+  roots.push(root);
+  await writeRepositoryRoot(root);
+  return root;
+}
+
+function cleanup(root: string, prNumber: number, cloudflare: CloudflareClient) {
+  return cleanupPullRequest(root, prNumber, { cloudflare, processEnv: {} });
+}
+
+/** Everything two Workers of one stage recorded: each binds the shared KV namespace and DNS record. */
+const FULL_STAGE: StageRecord[] = [
+  { kind: 'worker', worker: 'api-pr7' },
+  { kind: 'kv', worker: 'api-pr7', title: 'sessions-pr7' },
+  { kind: 'd1', worker: 'api-pr7', name: 'site-pr7-db' },
+  { kind: 'dns', worker: 'api-pr7', zone: 'example.test', name: '*.pr7.example.test' },
+  { kind: 'worker', worker: 'web-pr7' },
+  { kind: 'kv', worker: 'web-pr7', title: 'sessions-pr7' },
+  { kind: 'r2', worker: 'web-pr7', bucket: 'media-pr7' },
+  { kind: 'domain', worker: 'web-pr7', hostname: 'app.pr7.example.test' },
+  { kind: 'route', worker: 'web-pr7', zone: 'example.test', pattern: '*.pr7.example.test/*' },
+  { kind: 'dns', worker: 'web-pr7', zone: 'example.test', name: '*.pr7.example.test' },
+];
+
+/** The live account a FULL_STAGE deploy leaves behind, next to items that are not the stage's. */
+function liveFullStage(cloudflare: FakeCloudflare): void {
+  cloudflare.scripts = [{ id: 'api-pr7' }, { id: 'web-pr7' }, { id: 'other-pr7' }, { id: 'web-staging' }];
+  cloudflare.namespaces = [
+    { id: 'kv-sessions', title: 'sessions-pr7' },
+    { id: 'kv-other', title: 'other-pr7' },
+  ];
+  cloudflare.d1Databases = [
+    { uuid: 'd1-site', name: 'site-pr7-db' },
+    { uuid: 'd1-other', name: 'other-pr7-db' },
+  ];
+  cloudflare.buckets.push({ name: 'media-pr7' }, { name: 'other-pr7' });
+  cloudflare.objects['media-pr7'] = ['one', 'nested/two'];
+  cloudflare.objects['other-pr7'] = ['keep'];
+  // Mixed case and a trailing dot, as Cloudflare may answer them.
+  cloudflare.domains = [
+    { id: 'domain-app', hostname: 'App.PR7.example.test', service: 'web-pr7' },
+    { id: 'domain-other', hostname: 'other.pr7.example.test', service: 'other-pr7' },
+  ];
+  cloudflare.zones = [
+    { id: 'zone-example', name: 'example.test' },
+    { id: 'zone-unrelated', name: 'unrelated.test' },
+  ];
+  cloudflare.routes['zone-example'] = [
+    { id: 'route-web', pattern: '*.PR7.example.test/*', script: 'web-pr7' },
+    { id: 'route-other', pattern: 'other.pr7.example.test/*', script: 'other-pr7' },
+  ];
+  cloudflare.records['zone-example'] = [
+    { id: 'dns-wildcard', name: '*.pr7.Example.test.', type: 'CNAME', content: 'PR7.example.test' },
+    { id: 'dns-other', name: '*.other.pr7.example.test', type: 'CNAME', content: 'other.pr7.example.test' },
+  ];
+}
+
+describe('cleanup-pr from stage records', () => {
   it('rejects an invalid PR before touching the client', async () => {
     const cloudflare = new FakeCloudflare();
-    let calls = 0;
-    cloudflare.listWorkerDomains = async () => {
-      calls += 1;
-      return [];
-    };
 
-    await expect(cleanupPullRequest('/unused', 0, { cloudflare })).rejects.toThrow(/1 through 999999999/);
-    expect(calls).toBe(0);
+    await expect(cleanup(await cleanupRoot(), 0, cloudflare)).rejects.toThrow(/1 through 999999999/);
+    expect(cloudflare.reads).toEqual([]);
   });
 
-  it('deletes only exact hyphen/dot-delimited pr123 resources and is idempotent for missing resources', async () => {
+  it('refuses a root without a repository before any Cloudflare call', async () => {
+    const root = await cleanupRoot();
+    await writeFile(join(root, 'package.json'), '{ "name": "@acme/app" }\n');
     const cloudflare = new FakeCloudflare();
-    cloudflare.domains = [
-      { id: 'domain-123', hostname: 'app.pr123.example.test' },
-      { id: 'domain-1234', hostname: 'app.pr1234.example.test' },
-    ];
-    cloudflare.zones = [{ id: 'zone', name: 'example.test' }];
-    cloudflare.routes.zone = [
-      { id: 'route-123', pattern: '*.pr123.example.test/*' },
-      { id: 'route-1234', pattern: '*.pr1234.example.test/*' },
-    ];
-    cloudflare.records.zone = [
-      { id: 'dns-123', name: '*.pr123.example.test', type: 'CNAME', content: 'pr123.example.test' },
-      { id: 'dns-staging', name: '*.staging.example.test', type: 'CNAME', content: 'staging.example.test' },
-    ];
-    cloudflare.scripts = [{ id: 'app-pr123' }, { id: 'app-pr1234' }, { id: 'app-staging' }];
-    cloudflare.namespaces = [
-      { id: 'kv-123', title: 'org-profiles-pr123' },
-      { id: 'kv-1234', title: 'org-profiles-pr1234' },
-    ];
-    cloudflare.buckets = [{ name: 'app-media-pr123' }, { name: 'app-media-pr1234' }];
-    cloudflare.objects['app-media-pr123'] = ['one', 'nested/two'];
 
-    const result = await cleanupPullRequest('/unused', 123, { cloudflare });
-
-    expect(result.deleted).toEqual({
-      workers: 1,
-      routes: 1,
-      domains: 1,
-      kvNamespaces: 1,
-      r2Buckets: 1,
-      r2Objects: 2,
-      dnsRecords: 1,
-      d1Databases: 0,
-    });
-    expect(cloudflare.mutations.join('\n')).toContain('delete-worker:app-pr123');
-    expect(cloudflare.mutations.join('\n')).not.toContain('pr1234');
-    expect(cloudflare.mutations.join('\n')).not.toContain('staging');
+    await expect(cleanup(root, 7, cloudflare)).rejects.toThrow(`${join(root, 'package.json')} declares no repository`);
+    expect(cloudflare.reads).toEqual([]);
   });
 
-  it('deletes D1 databases carrying the stage segment and reports them', async () => {
+  it('reads nothing else and deletes nothing when the account has no record bucket', async () => {
     const cloudflare = new FakeCloudflare();
-    cloudflare.d1Databases = [
-      { uuid: 'd1-keep', name: 'site-staging-db' },
-      { uuid: 'd1-gone', name: 'site-pr7-db' },
-      { uuid: 'd1-other', name: 'site-pr70-db' },
-    ];
+    cloudflare.scripts = [{ id: 'web-pr7' }];
 
-    const result = await cleanupPullRequest('/unused', 7, { cloudflare });
+    const result = await cleanup(await cleanupRoot(), 7, cloudflare);
 
-    expect(cloudflare.mutations).toContain('delete-d1:d1-gone');
-    expect(cloudflare.mutations).not.toContain('delete-d1:d1-keep');
-    expect(cloudflare.mutations).not.toContain('delete-d1:d1-other');
-    expect(result.deleted.d1Databases).toBe(1);
-  });
-
-  it('lists D1 before deleting anything so a listing failure cannot partial-clean', async () => {
-    const cloudflare = new FakeCloudflare();
-    cloudflare.scripts = [{ id: 'app-pr7' }];
-    cloudflare.listD1Databases = async () => {
-      throw new Error('D1 listing forbidden');
-    };
-
-    await expect(cleanupPullRequest('/unused', 7, { cloudflare })).rejects.toThrow(/D1 listing forbidden/);
+    expect(result).toMatchObject({ stage: 'pr7', scope: SCOPE, recorded: 0, alreadyGone: 0, leftInPlace: [] });
+    expect(cloudflare.reads).toEqual(['r2']);
     expect(cloudflare.mutations).toEqual([]);
+  });
+
+  it('reads nothing else and deletes nothing when the stage has no keys, whatever other stages and repositories hold', async () => {
+    const cloudflare = new FakeCloudflare();
+    recordStage(cloudflare, [{ kind: 'worker', worker: 'web-pr70' }], { stage: 'pr70' });
+    recordStage(cloudflare, [{ kind: 'worker', worker: 'web-pr7' }], { scope: 'github.com/acme/other' });
+    cloudflare.scripts = [{ id: 'web-pr7' }, { id: 'web-pr70' }];
+
+    const result = await cleanup(await cleanupRoot(), 7, cloudflare);
+
+    expect(result.recorded).toBe(0);
+    expect(cloudflare.reads).toEqual(['r2', `objects:${STAGE_RECORDS_BUCKET}:${PR7_PREFIX}`]);
+    expect(cloudflare.mutations).toEqual([]);
+  });
+
+  it('deletes exactly the recorded items, each once, in dependency order, and the records last', async () => {
+    const cloudflare = new FakeCloudflare();
+    const keys = recordStage(cloudflare, FULL_STAGE);
+    const otherScope = recordStage(cloudflare, [{ kind: 'worker', worker: 'other-pr7' }], {
+      scope: 'github.com/acme/other',
+    });
+    liveFullStage(cloudflare);
+
+    const result = await cleanup(await cleanupRoot(), 7, cloudflare);
+
+    expect(cloudflare.mutations).toEqual([
+      'delete-domain:domain-app',
+      'delete-route:zone-example:route-web',
+      'delete-dns:zone-example:dns-wildcard',
+      'delete-worker:api-pr7',
+      'delete-worker:web-pr7',
+      'delete-kv:kv-sessions',
+      'delete-object:media-pr7:one',
+      'delete-object:media-pr7:nested/two',
+      'delete-r2:media-pr7',
+      'delete-d1:d1-site',
+      ...keys.map((key) => `delete-object:${STAGE_RECORDS_BUCKET}:${key}`),
+    ]);
+    expect(result).toEqual({
+      stage: 'pr7',
+      scope: SCOPE,
+      recorded: FULL_STAGE.length,
+      deleted: {
+        workers: 2,
+        routes: 1,
+        domains: 1,
+        dnsRecords: 1,
+        kvNamespaces: 1,
+        r2Buckets: 1,
+        r2Objects: 2,
+        d1Databases: 1,
+      },
+      alreadyGone: 0,
+      leftInPlace: [],
+    });
+    expect(cloudflare.objects[STAGE_RECORDS_BUCKET]).toEqual(otherScope);
+    // Only the recorded zone, found by its name; never a listing of every zone.
+    expect(cloudflare.reads.filter((read) => read.startsWith('zones'))).toEqual(['zones:example.test']);
+    expect(cloudflare.reads).not.toContain('routes:zone-unrelated');
+    expect(cloudflare.reads).not.toContain('dns:zone-unrelated');
+  });
+
+  it('lists only what a record names a kind of', async () => {
+    const cloudflare = new FakeCloudflare();
+    recordStage(cloudflare, [{ kind: 'worker', worker: 'web-pr7' }]);
+    cloudflare.scripts = [{ id: 'web-pr7' }];
+
+    await cleanup(await cleanupRoot(), 7, cloudflare);
+
+    expect(cloudflare.reads).toEqual(['r2', `objects:${STAGE_RECORDS_BUCKET}:${PR7_PREFIX}`, 'workers']);
+  });
+
+  it('leaves a recorded route or custom domain another Worker now holds in place and says so', async () => {
+    const cloudflare = new FakeCloudflare();
+    recordStage(cloudflare, [
+      { kind: 'domain', worker: 'web-pr7', hostname: 'app.pr7.example.test' },
+      { kind: 'route', worker: 'web-pr7', zone: 'example.test', pattern: '*.pr7.example.test/*' },
+    ]);
+    cloudflare.domains = [{ id: 'domain-app', hostname: 'app.pr7.example.test', service: 'other-worker' }];
+    cloudflare.zones = [{ id: 'zone-example', name: 'example.test' }];
+    cloudflare.routes['zone-example'] = [{ id: 'route-web', pattern: '*.pr7.example.test/*', script: 'other-worker' }];
+
+    const result = await cleanup(await cleanupRoot(), 7, cloudflare);
+
+    expect(cloudflare.mutations.filter((mutation) => !mutation.includes(STAGE_RECORDS_BUCKET))).toEqual([]);
+    expect(result.leftInPlace).toEqual([
+      'custom domain app.pr7.example.test (bound to other-worker)',
+      'route *.pr7.example.test/* (bound to other-worker)',
+    ]);
+    expect(result.alreadyGone).toBe(0);
+  });
+
+  it('leaves in place the wildcard DNS record a route left in place still needs', async () => {
+    const cloudflare = new FakeCloudflare();
+    recordStage(cloudflare, [
+      { kind: 'route', worker: 'web-pr7', zone: 'example.test', pattern: '*.pr7.example.test/*' },
+      { kind: 'dns', worker: 'web-pr7', zone: 'example.test', name: '*.pr7.example.test' },
+      { kind: 'route', worker: 'web-pr7', zone: 'example.test', pattern: '*.api.pr7.example.test/*' },
+      { kind: 'dns', worker: 'web-pr7', zone: 'example.test', name: '*.api.pr7.example.test' },
+    ]);
+    cloudflare.zones = [{ id: 'zone-example', name: 'example.test' }];
+    cloudflare.routes['zone-example'] = [
+      { id: 'route-web', pattern: '*.pr7.example.test/*', script: 'other-worker' },
+      { id: 'route-api', pattern: '*.api.pr7.example.test/*', script: 'web-pr7' },
+    ];
+    cloudflare.records['zone-example'] = [
+      { id: 'dns-web', name: '*.pr7.example.test', type: 'CNAME', content: 'pr7.example.test' },
+      { id: 'dns-api', name: '*.api.pr7.example.test', type: 'CNAME', content: 'api.pr7.example.test' },
+    ];
+
+    const result = await cleanup(await cleanupRoot(), 7, cloudflare);
+
+    expect(cloudflare.mutations.filter((mutation) => !mutation.includes(STAGE_RECORDS_BUCKET))).toEqual([
+      'delete-route:zone-example:route-api',
+      'delete-dns:zone-example:dns-api',
+    ]);
+    expect(result.leftInPlace).toEqual([
+      'route *.pr7.example.test/* (bound to other-worker)',
+      'DNS record *.pr7.example.test (serves route *.pr7.example.test/*)',
+    ]);
+    expect(result.alreadyGone).toBe(0);
+  });
+
+  it("deletes a route and custom domain that moved between Workers of the stage, with the route's DNS record", async () => {
+    const cloudflare = new FakeCloudflare();
+    recordStage(cloudflare, [
+      { kind: 'domain', worker: 'web-pr7', hostname: 'app.pr7.example.test' },
+      { kind: 'route', worker: 'web-pr7', zone: 'example.test', pattern: '*.pr7.example.test/*' },
+      { kind: 'dns', worker: 'web-pr7', zone: 'example.test', name: '*.pr7.example.test' },
+      { kind: 'domain', worker: 'api-pr7', hostname: 'app.pr7.example.test' },
+      { kind: 'route', worker: 'api-pr7', zone: 'example.test', pattern: '*.pr7.example.test/*' },
+      { kind: 'dns', worker: 'api-pr7', zone: 'example.test', name: '*.pr7.example.test' },
+    ]);
+    cloudflare.domains = [{ id: 'domain-app', hostname: 'app.pr7.example.test', service: 'api-pr7' }];
+    cloudflare.zones = [{ id: 'zone-example', name: 'example.test' }];
+    cloudflare.routes['zone-example'] = [{ id: 'route-web', pattern: '*.pr7.example.test/*', script: 'api-pr7' }];
+    cloudflare.records['zone-example'] = [
+      { id: 'dns-web', name: '*.pr7.example.test', type: 'CNAME', content: 'pr7.example.test' },
+    ];
+
+    const result = await cleanup(await cleanupRoot(), 7, cloudflare);
+
+    expect(cloudflare.mutations.filter((mutation) => !mutation.includes(STAGE_RECORDS_BUCKET))).toEqual([
+      'delete-domain:domain-app',
+      'delete-route:zone-example:route-web',
+      'delete-dns:zone-example:dns-web',
+    ]);
+    expect(result.leftInPlace).toEqual([]);
+    expect(result.alreadyGone).toBe(0);
+  });
+
+  it('deletes a recorded route bound to no Worker, with its DNS record', async () => {
+    const cloudflare = new FakeCloudflare();
+    recordStage(cloudflare, [
+      { kind: 'route', worker: 'web-pr7', zone: 'example.test', pattern: '*.pr7.example.test/*' },
+      { kind: 'dns', worker: 'web-pr7', zone: 'example.test', name: '*.pr7.example.test' },
+    ]);
+    cloudflare.zones = [{ id: 'zone-example', name: 'example.test' }];
+    cloudflare.routes['zone-example'] = [{ id: 'route-web', pattern: '*.pr7.example.test/*' }];
+    cloudflare.records['zone-example'] = [
+      { id: 'dns-web', name: '*.pr7.example.test', type: 'CNAME', content: 'pr7.example.test' },
+    ];
+
+    const result = await cleanup(await cleanupRoot(), 7, cloudflare);
+
+    expect(cloudflare.mutations.filter((mutation) => !mutation.includes(STAGE_RECORDS_BUCKET))).toEqual([
+      'delete-route:zone-example:route-web',
+      'delete-dns:zone-example:dns-web',
+    ]);
+    expect(result.leftInPlace).toEqual([]);
+  });
+
+  it('counts a recorded item that no longer exists as already gone', async () => {
+    const cloudflare = new FakeCloudflare();
+    const keys = recordStage(cloudflare, [
+      { kind: 'worker', worker: 'web-pr7' },
+      { kind: 'kv', worker: 'web-pr7', title: 'sessions-pr7' },
+      { kind: 'd1', worker: 'web-pr7', name: 'site-pr7-db' },
+      { kind: 'r2', worker: 'web-pr7', bucket: 'media-pr7' },
+      { kind: 'domain', worker: 'web-pr7', hostname: 'app.pr7.example.test' },
+      // A zone the account no longer has: its routes and records went with it.
+      { kind: 'route', worker: 'web-pr7', zone: 'gone.test', pattern: '*.pr7.gone.test/*' },
+      { kind: 'dns', worker: 'web-pr7', zone: 'example.test', name: '*.pr7.example.test' },
+    ]);
+    cloudflare.scripts = [];
+    cloudflare.zones = [{ id: 'zone-example', name: 'example.test' }];
+
+    const result = await cleanup(await cleanupRoot(), 7, cloudflare);
+
+    expect(result.alreadyGone).toBe(7);
+    expect(Object.values(result.deleted).every((count) => count === 0)).toBe(true);
+    expect(cloudflare.mutations).toEqual(keys.map((key) => `delete-object:${STAGE_RECORDS_BUCKET}:${key}`));
+  });
+
+  it('keeps every record when a delete fails, and a re-run finishes what is left', async () => {
+    const cloudflare = new FakeCloudflare();
+    const keys = recordStage(cloudflare, FULL_STAGE);
+    liveFullStage(cloudflare);
+    const deleteWorkerScript = cloudflare.deleteWorkerScript.bind(cloudflare);
+    cloudflare.deleteWorkerScript = async () => {
+      throw new Error('Worker delete refused');
+    };
+    const root = await cleanupRoot();
+
+    await expect(cleanup(root, 7, cloudflare)).rejects.toThrow(/Worker delete refused/);
+    expect(cloudflare.objects[STAGE_RECORDS_BUCKET]).toEqual(keys);
+    expect(cloudflare.mutations.some((mutation) => mutation.includes(STAGE_RECORDS_BUCKET))).toBe(false);
+
+    cloudflare.deleteWorkerScript = deleteWorkerScript;
+    const rerun = await cleanup(root, 7, cloudflare);
+
+    // The domain, route and DNS record went in the first run.
+    expect(rerun.alreadyGone).toBe(3);
+    expect(rerun.deleted).toMatchObject({ workers: 2, kvNamespaces: 1, r2Buckets: 1, d1Databases: 1, domains: 0 });
+    expect(cloudflare.objects[STAGE_RECORDS_BUCKET]).toEqual([]);
+  });
+
+  it('refuses the whole stage before any delete when one key is not its own', async () => {
+    for (const stray of [`${PR7_PREFIX}web-pr8/worker`, `${PR7_PREFIX}web-pr7/junk`, `${PR7_PREFIX}web-pr7`]) {
+      const cloudflare = new FakeCloudflare();
+      recordStage(cloudflare, [{ kind: 'worker', worker: 'web-pr7' }]);
+      cloudflare.objects[STAGE_RECORDS_BUCKET]?.push(stray);
+      cloudflare.scripts = [{ id: 'web-pr7' }, { id: 'web-pr8' }];
+
+      await expect(cleanup(await cleanupRoot(), 7, cloudflare)).rejects.toThrow(stray);
+      expect(cloudflare.mutations).toEqual([]);
+    }
+  });
+
+  it('deletes two recorded Workers that bind each other', async () => {
+    // Cloudflare refuses to delete a Worker another Worker still binds unless the delete is forced;
+    // this account answers exactly that way, so whichever Worker went first would stop an unforced cleanup.
+    const keys = [
+      stageRecordKey(SCOPE, 'pr7', { kind: 'worker', worker: 'api-pr7' }),
+      stageRecordKey(SCOPE, 'pr7', { kind: 'worker', worker: 'web-pr7' }),
+    ];
+    const bindings: Record<string, string> = { 'api-pr7': 'web-pr7', 'web-pr7': 'api-pr7' };
+    const scripts = new Set(['api-pr7', 'web-pr7']);
+    const deleted: string[] = [];
+    const answer = (result: unknown, status = 200) =>
+      new Response(JSON.stringify({ success: status < 400, result, errors: [] }), { status });
+    const client = new CloudflareRestClient('account-1', 'token', async (input, init) => {
+      const url = new URL(input);
+      const path = url.pathname.replace('/client/v4/accounts/account-1', '');
+      const method = init?.method ?? 'GET';
+      if (method === 'GET' && path === '/r2/buckets') return answer([{ name: STAGE_RECORDS_BUCKET }]);
+      if (method === 'GET' && path === `/r2/buckets/${STAGE_RECORDS_BUCKET}/objects`) {
+        return answer(keys.map((key) => ({ key })));
+      }
+      if (method === 'GET' && path === '/workers/scripts') return answer([...scripts].map((id) => ({ id })));
+      const worker = /^\/workers\/scripts\/([^/]+)$/.exec(path)?.[1];
+      if (method === 'DELETE' && worker) {
+        const boundBy = bindings[worker];
+        if (boundBy && scripts.has(boundBy) && url.searchParams.get('force') !== 'true') {
+          return answer(null, 400);
+        }
+        scripts.delete(worker);
+        deleted.push(worker);
+        return answer(null);
+      }
+      if (method === 'DELETE' && path.startsWith(`/r2/buckets/${STAGE_RECORDS_BUCKET}/objects/`)) return answer(null);
+      throw new Error(`unexpected ${method} ${path}`);
+    });
+
+    const result = await cleanupPullRequest(await cleanupRoot(), 7, { cloudflare: client, processEnv: {} });
+
+    expect(deleted).toEqual(['api-pr7', 'web-pr7']);
+    expect(result.deleted.workers).toBe(2);
+  });
+});
+
+describe('describeCleanup', () => {
+  const nothingDeleted = {
+    workers: 0,
+    routes: 0,
+    domains: 0,
+    dnsRecords: 0,
+    kvNamespaces: 0,
+    r2Buckets: 0,
+    r2Objects: 0,
+    d1Databases: 0,
+  };
+
+  it('names every count, what was already gone and what was left in place', () => {
+    expect(
+      describeCleanup({
+        stage: 'pr7',
+        scope: SCOPE,
+        recorded: 23,
+        deleted: {
+          workers: 3,
+          domains: 2,
+          routes: 4,
+          dnsRecords: 1,
+          kvNamespaces: 2,
+          r2Buckets: 1,
+          r2Objects: 15,
+          d1Databases: 0,
+        },
+        alreadyGone: 2,
+        leftInPlace: ['route *.pr7.example.com/* (bound to other-worker)'],
+      }),
+    ).toBe(
+      'Cleaned pr7 of github.com/acme/app from 23 records: deleted 3 Workers, 2 custom domains, 4 routes, 1 DNS record, 2 KV namespaces, 1 R2 bucket (15 objects), 0 D1 databases; 2 recorded items were already gone; left in place: route *.pr7.example.com/* (bound to other-worker).',
+    );
+  });
+
+  it('leaves out the left-in-place clause when nothing was left, and counts in the singular', () => {
+    expect(
+      describeCleanup({
+        stage: 'pr7',
+        scope: SCOPE,
+        recorded: 1,
+        deleted: { ...nothingDeleted, workers: 1, r2Buckets: 2, r2Objects: 1, d1Databases: 1 },
+        alreadyGone: 1,
+        leftInPlace: [],
+      }),
+    ).toBe(
+      'Cleaned pr7 of github.com/acme/app from 1 record: deleted 1 Worker, 0 custom domains, 0 routes, 0 DNS records, 0 KV namespaces, 2 R2 buckets (1 object), 1 D1 database; 1 recorded item was already gone.',
+    );
+  });
+
+  it('says why a stage without records deleted nothing', () => {
+    expect(
+      describeCleanup({
+        stage: 'pr7',
+        scope: SCOPE,
+        recorded: 0,
+        deleted: nothingDeleted,
+        alreadyGone: 0,
+        leftInPlace: [],
+      }),
+    ).toBe(
+      'Nothing is recorded for pr7 of github.com/acme/app, so nothing was deleted (a pull request that deployed nothing, or a stage deployed before smoo recorded stages).',
+    );
   });
 });
 

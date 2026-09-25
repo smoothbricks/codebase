@@ -8,6 +8,9 @@ import {
   type CloudflareClient,
   CloudflareRestClient,
   type D1DatabaseRecord,
+  type DnsRecord,
+  type WorkerDomain,
+  type WorkerRoute,
 } from './cloudflare.js';
 import { type FlatWranglerConfig, parseFlatWranglerConfig } from './flat-config.js';
 import {
@@ -26,7 +29,6 @@ import {
   type DeploymentStage,
   derivePullRequestDocument,
   derivePullRequestStageConfig,
-  hasExactStageSegment,
   isPullRequestStage,
   type LiveKvNamespace,
   type PullRequestResourcePlan,
@@ -39,9 +41,12 @@ import {
 } from './stage.js';
 import { wildcardDnsRecord } from './stage-labels.js';
 import {
+  parseStageRecordKey,
   plannedStageRecords,
   STAGE_RECORDS_BUCKET,
+  type StageRecord,
   stageRecordKeys,
+  stageRecordPrefix,
   stageRecordScope,
   zoneContaining,
 } from './stage-records.js';
@@ -529,108 +534,370 @@ async function ensureD1Databases(
   return derivedIds;
 }
 
-export interface CleanupResult {
-  stage: `pr${number}`;
-  deleted: {
-    workers: number;
-    routes: number;
-    domains: number;
-    kvNamespaces: number;
-    r2Buckets: number;
-    r2Objects: number;
-    dnsRecords: number;
-    d1Databases: number;
-  };
+export interface CleanupCounts {
+  workers: number;
+  routes: number;
+  domains: number;
+  dnsRecords: number;
+  kvNamespaces: number;
+  r2Buckets: number;
+  r2Objects: number;
+  d1Databases: number;
 }
 
+export interface CleanupResult {
+  stage: `pr${number}`;
+  /** The repository whose records were read, as `host/owner/repo`. */
+  scope: string;
+  /** How many record keys the stage had. */
+  recorded: number;
+  deleted: CleanupCounts;
+  /** Recorded items that no longer existed, each counted once. */
+  alreadyGone: number;
+  /** Recorded items another owner now holds, by name; they were not deleted. */
+  leftInPlace: string[];
+}
+
+/**
+ * Deletes what the deploys of this repository's `prN` stage recorded (`stage-records.ts`), and
+ * nothing else: every item is resolved before the first delete, a route or custom domain a Worker
+ * outside the stage now holds is left alone, and the records go last, so a cleanup that stops halfway is
+ * finished by running it again.
+ */
 export async function cleanupPullRequest(
-  cwd: string,
+  root: string,
   prNumber: number,
   dependencies: WranglerCommandDependencies = {},
 ): Promise<CleanupResult> {
   const stage = pullRequestStage(prNumber);
   const processEnv = dependencies.processEnv ?? process.env;
+  const scope = stageRecordScope(root, processEnv);
   const cloudflare =
     dependencies.cloudflare ??
     new CloudflareRestClient(
       requiredEnvironmentValue(processEnv.CLOUDFLARE_ACCOUNT_ID, 'CLOUDFLARE_ACCOUNT_ID'),
       requiredEnvironmentValue(processEnv.CLOUDFLARE_API_TOKEN, 'CLOUDFLARE_API_TOKEN'),
     );
-  void cwd;
-  const deleted = {
-    workers: 0,
-    routes: 0,
-    domains: 0,
-    kvNamespaces: 0,
-    r2Buckets: 0,
-    r2Objects: 0,
-    dnsRecords: 0,
-    d1Databases: 0,
+  const result: CleanupResult = {
+    stage,
+    scope,
+    recorded: 0,
+    deleted: {
+      workers: 0,
+      routes: 0,
+      domains: 0,
+      dnsRecords: 0,
+      kvNamespaces: 0,
+      r2Buckets: 0,
+      r2Objects: 0,
+      d1Databases: 0,
+    },
+    alreadyGone: 0,
+    leftInPlace: [],
+  };
+  const { keys, records, buckets } = await readStageRecords(cloudflare, scope, stage);
+  result.recorded = keys.length;
+  if (keys.length === 0) return result;
+  const targets = await resolveCleanupTargets(cloudflare, records, buckets);
+  result.alreadyGone = targets.alreadyGone;
+  result.leftInPlace = targets.leftInPlace;
+  try {
+    await deleteCleanupTargets(cloudflare, targets, result.deleted);
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    throw new Error(
+      `Cleaning ${stage} of ${scope} stopped: ${detail.replace(/\.?$/, '.')} Its records are kept, so running cleanup-pr again finishes it.`,
+      { cause: error },
+    );
+  }
+  for (const key of keys) await cloudflare.deleteR2Object(STAGE_RECORDS_BUCKET, key);
+  return result;
+}
+
+/** The one line `smoo wrangler cleanup-pr` prints. */
+export function describeCleanup(result: CleanupResult): string {
+  const stage = `${result.stage} of ${result.scope}`;
+  if (result.recorded === 0) {
+    return `Nothing is recorded for ${stage}, so nothing was deleted (a pull request that deployed nothing, or a stage deployed before smoo recorded stages).`;
+  }
+  const { deleted } = result;
+  const counts = [
+    count(deleted.workers, 'Worker'),
+    count(deleted.domains, 'custom domain'),
+    count(deleted.routes, 'route'),
+    count(deleted.dnsRecords, 'DNS record'),
+    count(deleted.kvNamespaces, 'KV namespace'),
+    `${count(deleted.r2Buckets, 'R2 bucket')} (${count(deleted.r2Objects, 'object')})`,
+    count(deleted.d1Databases, 'D1 database'),
+  ].join(', ');
+  const gone =
+    result.alreadyGone === 1
+      ? '1 recorded item was already gone'
+      : `${result.alreadyGone} recorded items were already gone`;
+  const left = result.leftInPlace.length > 0 ? `; left in place: ${result.leftInPlace.join(', ')}` : '';
+  return `Cleaned ${stage} from ${count(result.recorded, 'record')}: deleted ${counts}; ${gone}${left}.`;
+}
+
+function count(amount: number, noun: string): string {
+  return `${amount} ${noun}${amount === 1 ? '' : 's'}`;
+}
+
+/**
+ * The stage's record keys and what they say. No record bucket means nothing is recorded. One key
+ * that is not the stage's own refuses the whole cleanup before anything is deleted.
+ */
+async function readStageRecords(
+  cloudflare: CloudflareClient,
+  scope: string,
+  stage: `pr${number}`,
+): Promise<{ keys: string[]; records: StageRecord[]; buckets: Set<string> }> {
+  const buckets = await r2BucketNames(cloudflare);
+  if (!buckets.has(STAGE_RECORDS_BUCKET)) return { keys: [], records: [], buckets };
+  const keys = await cloudflare.listR2Objects(STAGE_RECORDS_BUCKET, stageRecordPrefix(scope, stage));
+  return { keys, records: keys.map((key) => parseStageRecordKey(scope, stage, key)), buckets };
+}
+
+/** Every live item the records name, found before the first delete. */
+interface CleanupTargets {
+  domains: WorkerDomain[];
+  routes: { zoneId: string; route: WorkerRoute }[];
+  dnsRecords: { zoneId: string; record: DnsRecord }[];
+  workers: string[];
+  kvNamespaces: LiveKvNamespace[];
+  r2Buckets: { name: string; keys: string[] }[];
+  d1Databases: D1DatabaseRecord[];
+  alreadyGone: number;
+  leftInPlace: string[];
+}
+
+type RecordOf<K extends StageRecord['kind']> = Extract<StageRecord, { kind: K }>;
+
+/**
+ * Looks up each distinct recorded item; an item several Workers recorded (a shared KV namespace,
+ * a wildcard DNS record, a route that moved between them) is one item. A route or custom domain is
+ * the stage's own while no Worker outside the stage holds it. Only the kinds and zones the records
+ * name are listed.
+ */
+async function resolveCleanupTargets(
+  cloudflare: CloudflareClient,
+  records: StageRecord[],
+  buckets: Set<string>,
+): Promise<CleanupTargets> {
+  const distinct = [...new Map(records.map((record) => [recordIdentity(record), record])).values()];
+  const of = <K extends StageRecord['kind']>(kind: K) =>
+    distinct.filter((record): record is RecordOf<K> => record.kind === kind);
+  const stageWorkers = new Set(records.map((record) => record.worker));
+  /** Another owner's name, or undefined when the stage (or nobody) holds the item. */
+  const otherOwner = (owner: string | undefined) =>
+    owner !== undefined && !stageWorkers.has(owner) ? owner : undefined;
+  const targets: CleanupTargets = {
+    domains: [],
+    routes: [],
+    dnsRecords: [],
+    workers: [],
+    kvNamespaces: [],
+    r2Buckets: [],
+    d1Databases: [],
+    alreadyGone: 0,
+    leftInPlace: [],
+  };
+  /** Adds what was found, or counts it as already gone. */
+  const found = <T>(list: T[], item: T | undefined) => {
+    if (item === undefined) targets.alreadyGone += 1;
+    else list.push(item);
   };
 
-  // Every listing, D1 included, must succeed before the first delete: a missing D1
-  // permission must not leave workers/KV/R2 already gone.
-  const domains = await cloudflare.listWorkerDomains();
-  const zones = await cloudflare.listZones();
-  const routesByZone = [];
-  const dnsByZone = [];
-  for (const zone of zones) {
-    routesByZone.push({ zone, routes: await cloudflare.listWorkerRoutes(zone.id) });
-    dnsByZone.push({ zone, records: await cloudflare.listDnsRecords(zone.id) });
+  const domains = of('domain');
+  const liveDomains = domains.length > 0 ? await cloudflare.listWorkerDomains() : [];
+  for (const record of domains) {
+    const domain = liveDomains.find((candidate) => sameName(candidate.hostname, record.hostname));
+    const owner = otherOwner(domain?.service);
+    if (owner !== undefined) {
+      targets.leftInPlace.push(`custom domain ${record.hostname} (bound to ${owner})`);
+    } else {
+      found(targets.domains, domain);
+    }
   }
-  const scripts = await cloudflare.listWorkerScripts();
-  const namespaces = await cloudflare.listKvNamespaces();
-  const buckets = await cloudflare.listR2Buckets();
-  const objectsByBucket = [];
-  for (const bucket of buckets) {
-    if (!hasExactStageSegment(bucket.name, stage)) continue;
-    objectsByBucket.push({ bucket, keys: await cloudflare.listR2Objects(bucket.name) });
-  }
-  const databases = await cloudflare.listD1Databases();
 
-  for (const domain of domains) {
-    if (!hasExactStageSegment(domain.hostname, stage)) continue;
+  await resolveZoneTargets(cloudflare, of('route'), of('dns'), otherOwner, targets, found);
+
+  const workers = of('worker');
+  const scripts = new Set(workers.length > 0 ? (await cloudflare.listWorkerScripts()).map((script) => script.id) : []);
+  for (const record of workers) found(targets.workers, scripts.has(record.worker) ? record.worker : undefined);
+
+  const kv = of('kv');
+  const namespaces = kv.length > 0 ? await cloudflare.listKvNamespaces() : [];
+  for (const record of kv)
+    found(
+      targets.kvNamespaces,
+      namespaces.find((namespace) => namespace.title === record.title),
+    );
+
+  for (const record of of('r2')) {
+    const exists = buckets.has(record.bucket);
+    found(
+      targets.r2Buckets,
+      exists ? { name: record.bucket, keys: await cloudflare.listR2Objects(record.bucket) } : undefined,
+    );
+  }
+
+  const d1 = of('d1');
+  const databases = d1.length > 0 ? await cloudflare.listD1Databases() : [];
+  for (const record of d1)
+    found(
+      targets.d1Databases,
+      databases.find((database) => database.name === record.name),
+    );
+  return targets;
+}
+
+/**
+ * Resolves the recorded routes and wildcard DNS records within their zones. A wildcard DNS record
+ * that a route left in place still serves stays too, or that route's hosts would stop resolving.
+ */
+async function resolveZoneTargets(
+  cloudflare: CloudflareClient,
+  routes: RecordOf<'route'>[],
+  dns: RecordOf<'dns'>[],
+  otherOwner: (owner: string | undefined) => string | undefined,
+  targets: CleanupTargets,
+  found: <T>(list: T[], item: T | undefined) => void,
+): Promise<void> {
+  const zoneIds = await recordedZoneIds(cloudflare, [...routes, ...dns]);
+  const routeTable = perZone((zoneId) => cloudflare.listWorkerRoutes(zoneId));
+  /** The pattern of each route left in place, by the `zone/name` of the wildcard DNS record it needs. */
+  const neededDns = new Map<string, string>();
+  for (const record of routes) {
+    const zoneId = zoneIds.get(record.zone);
+    const route = (await routeTable(zoneId)).find(
+      (candidate) => candidate.pattern.toLowerCase() === record.pattern.toLowerCase(),
+    );
+    const owner = otherOwner(route?.script);
+    if (owner !== undefined) {
+      targets.leftInPlace.push(`route ${record.pattern} (bound to ${owner})`);
+      const wildcard = wildcardDnsRecord({ pattern: record.pattern, zoneName: record.zone });
+      if (wildcard) neededDns.set(`${hostName(record.zone)}/${hostName(wildcard.name)}`, record.pattern);
+    } else {
+      found(targets.routes, zoneId !== undefined && route ? { zoneId, route } : undefined);
+    }
+  }
+  const dnsTable = perZone((zoneId) => cloudflare.listDnsRecords(zoneId));
+  for (const record of dns) {
+    const zoneId = zoneIds.get(record.zone);
+    // Only the proxied CNAME the deploy creates, `*.<host>` -> `<host>`; anything else under the
+    // name is not the one it made.
+    const target = record.name.replace(/^\*\./, '');
+    const live = (await dnsTable(zoneId)).find(
+      (candidate) =>
+        candidate.type === 'CNAME' && sameName(candidate.name, record.name) && sameName(candidate.content, target),
+    );
+    const servedRoute = neededDns.get(`${hostName(record.zone)}/${hostName(record.name)}`);
+    if (live && servedRoute !== undefined) {
+      targets.leftInPlace.push(`DNS record ${record.name} (serves route ${servedRoute})`);
+    } else {
+      found(targets.dnsRecords, zoneId !== undefined && live ? { zoneId, record: live } : undefined);
+    }
+  }
+}
+
+/** Lists a zone's table at most once, however many records name the zone; a zone that is gone has none. */
+function perZone<T>(list: (zoneId: string) => Promise<T[]>): (zoneId: string | undefined) => Promise<T[]> {
+  const tables = new Map<string, Promise<T[]>>();
+  return (zoneId) => {
+    if (zoneId === undefined) return Promise.resolve([]);
+    let table = tables.get(zoneId);
+    if (table === undefined) {
+      table = list(zoneId);
+      tables.set(zoneId, table);
+    }
+    return table;
+  };
+}
+
+/** Each recorded zone's id, looked up by name within the account; a zone that is gone has none. */
+async function recordedZoneIds(
+  cloudflare: CloudflareClient,
+  records: (RecordOf<'route'> | RecordOf<'dns'>)[],
+): Promise<Map<string, string | undefined>> {
+  const ids = new Map<string, string | undefined>();
+  for (const { zone } of records) {
+    if (ids.has(zone)) continue;
+    ids.set(zone, (await cloudflare.listZones(zone)).find((candidate) => sameName(candidate.name, zone))?.id);
+  }
+  return ids;
+}
+
+/**
+ * Deletes in dependency order: what routes traffic to a Worker before the Worker, the Worker
+ * before the storage it binds, a bucket's objects before the bucket. A custom domain takes its own
+ * DNS record with it.
+ */
+async function deleteCleanupTargets(
+  cloudflare: CloudflareClient,
+  targets: CleanupTargets,
+  deleted: CleanupCounts,
+): Promise<void> {
+  for (const domain of targets.domains) {
     await cloudflare.deleteWorkerDomain(domain.id);
     deleted.domains += 1;
   }
-  for (const { zone, routes } of routesByZone) {
-    for (const route of routes) {
-      if (!hasExactStageSegment(route.pattern, stage)) continue;
-      await cloudflare.deleteWorkerRoute(zone.id, route.id);
-      deleted.routes += 1;
-    }
+  for (const { zoneId, route } of targets.routes) {
+    await cloudflare.deleteWorkerRoute(zoneId, route.id);
+    deleted.routes += 1;
   }
-  for (const { zone, records } of dnsByZone) {
-    for (const record of records) {
-      if (!hasExactStageSegment(record.name, stage)) continue;
-      await cloudflare.deleteDnsRecord(zone.id, record.id);
-      deleted.dnsRecords += 1;
-    }
+  for (const { zoneId, record } of targets.dnsRecords) {
+    await cloudflare.deleteDnsRecord(zoneId, record.id);
+    deleted.dnsRecords += 1;
   }
-  for (const script of scripts) {
-    if (!hasExactStageSegment(script.id, stage)) continue;
-    await cloudflare.deleteWorkerScript(script.id);
+  for (const worker of targets.workers) {
+    await cloudflare.deleteWorkerScript(worker);
     deleted.workers += 1;
   }
-  for (const namespace of namespaces) {
-    if (!hasExactStageSegment(namespace.title, stage)) continue;
+  for (const namespace of targets.kvNamespaces) {
     await cloudflare.deleteKvNamespace(namespace.id);
     deleted.kvNamespaces += 1;
   }
-  for (const { bucket, keys } of objectsByBucket) {
-    for (const key of keys) {
+  for (const bucket of targets.r2Buckets) {
+    for (const key of bucket.keys) {
       await cloudflare.deleteR2Object(bucket.name, key);
       deleted.r2Objects += 1;
     }
     await cloudflare.deleteR2Bucket(bucket.name);
     deleted.r2Buckets += 1;
   }
-  for (const database of databases) {
-    if (!hasExactStageSegment(database.name, stage)) continue;
+  for (const database of targets.d1Databases) {
     await cloudflare.deleteD1Database(database.uuid);
     deleted.d1Databases += 1;
   }
-  return { stage, deleted };
+}
+
+/** One recorded item, whichever Worker of the stage recorded it. */
+function recordIdentity(record: StageRecord): string {
+  switch (record.kind) {
+    case 'worker':
+      return `worker/${record.worker}`;
+    case 'kv':
+      return `kv/${record.title}`;
+    case 'd1':
+      return `d1/${record.name}`;
+    case 'r2':
+      return `r2/${record.bucket}`;
+    case 'domain':
+      return `domain/${hostName(record.hostname)}`;
+    case 'route':
+      return `route/${hostName(record.zone)}/${record.pattern.toLowerCase()}`;
+    case 'dns':
+      return `dns/${hostName(record.zone)}/${hostName(record.name)}`;
+  }
+}
+
+/** DNS names compare case-insensitively, and a trailing dot names the same host. */
+function hostName(name: string): string {
+  return name.toLowerCase().replace(/\.$/, '');
+}
+
+function sameName(left: string, right: string): boolean {
+  return hostName(left) === hostName(right);
 }
 
 async function reconcileStageResources(
