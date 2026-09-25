@@ -545,7 +545,10 @@ Pushes to the staging push branch queue behind a running workflow instead of can
 a production deployment mid-flight. Pull requests and other branches keep canceling superseded runs. The e2e and
 production jobs repeat the Cargo credential and sibling-source preflight before SetupDevenv, so their `--step` anchors
 shift with the configuration instead of staying fixed. The PR preview cleanup job runs the same preflight and carries
-the same job-level Cargo and private npm read tokens, since its SetupDevenv resolves the same declarations.
+the same job-level Cargo and private npm read tokens, since its SetupDevenv resolves the same declarations. It shares
+CI's concurrency group, `CI-${{ github.ref }}`: closing a pull request cancels that pull request's running CI run, so
+the cleanup starts only after its stage deploy has stopped, and a reopened pull request's CI run cancels a running
+cleanup, whose kept records let the next close finish the stage.
 
 ### Private dependency configuration (`package.json` → `smoo.github.cargoCredentials`)
 

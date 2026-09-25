@@ -7,6 +7,7 @@ import type {
   PackageSourceCheckoutConfig,
 } from '../workspace-manifest.js';
 import {
+  CI_CONCURRENCY_GROUP,
   CiWorkflowStepKind,
   cargoCredentialJobEnvLines,
   cargoCredentialStepLines,
@@ -66,6 +67,12 @@ on:
 
 permissions:
   contents: read
+
+# CI's group: closing the pull request cancels its running CI run, so the
+# cleanup starts only after that run's stage deploy has stopped.
+concurrency:
+  group: ${CI_CONCURRENCY_GROUP}
+  cancel-in-progress: true
 
 jobs:
   cleanup:

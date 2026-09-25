@@ -44,6 +44,43 @@ describe('PR preview cleanup workflow', () => {
     expect(rendered).toContain('CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}');
   });
 
+  // A close's pull_request event carries the same github.ref as the pull
+  // request's CI runs, so sharing CI's group makes the close cancel a running
+  // stage deploy and start the cleanup only after that deploy has stopped.
+  describe("in the pull request's CI concurrency group", () => {
+    /** The workflow-level `concurrency:` block, up to the next top-level key. */
+    function concurrencyBlock(workflow: string): string[] {
+      const lines = workflow.split('\n');
+      const start = lines.indexOf('concurrency:');
+      expect(start).toBeGreaterThan(-1);
+      const end = lines.findIndex((line, index) => index > start && /^\S/.test(line));
+      return lines.slice(start + 1, end).filter((line) => line.trim() !== '' && !/^\s*#/.test(line));
+    }
+
+    function groupLine(workflow: string): string | undefined {
+      return concurrencyBlock(workflow).find((line) => line.trim().startsWith('group:'));
+    }
+
+    it('cancels the run it finds in progress in that group', () => {
+      expect(concurrencyBlock(renderPrPreviewCleanupWorkflowYaml())).toEqual([
+        '  group: CI-${{ github.ref }}',
+        '  cancel-in-progress: true',
+      ]);
+    });
+
+    it('with the group both CI variants render, whatever the forge calls the workflow', () => {
+      const deploying = renderCiWorkflowYaml(deployingCi);
+      const validating = renderCiWorkflowYaml({ ...deployingCi, deploy: false });
+      const cleanup = renderPrPreviewCleanupWorkflowYaml({ runsOn: 'ubuntu-latest' });
+
+      expect(groupLine(cleanup)).toBe('  group: CI-${{ github.ref }}');
+      expect(groupLine(deploying)).toBe(groupLine(cleanup));
+      expect(groupLine(validating)).toBe(groupLine(cleanup));
+      expect(deploying).not.toContain('github.workflow');
+      expect(validating).not.toContain('github.workflow');
+    });
+  });
+
   describe('in a repository that installs from a private npm registry', () => {
     const privateNpm = {
       scope: '@priv.test',
