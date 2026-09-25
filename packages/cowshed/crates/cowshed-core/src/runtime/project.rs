@@ -4264,6 +4264,49 @@ mod rebase_recovery_tests {
     }
 
     #[tokio::test]
+    async fn land_moves_only_the_branch_main_has_checked_out() {
+        let root = std::env::temp_dir().join(format!(
+            "cowshed-land-target-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&root).expect("create fixture repository");
+        run_git(&root, &["init", "--initial-branch=main"]);
+        run_git(&root, &["config", "user.name", "Cowshed Test"]);
+        run_git(&root, &["config", "user.email", "cowshed@example.invalid"]);
+        commit_file(&root, "base\n", "base");
+        require_target_checked_out(&root, "main")
+            .await
+            .expect("main is checked out");
+
+        run_git(&root, &["checkout", "-b", "probe"]);
+        let error = require_target_checked_out(&root, "main")
+            .await
+            .expect_err("a checkout on another branch would move that branch");
+        assert_eq!(error.code, crate::error::ErrorCode::Conflict);
+        assert!(
+            error.message.contains("branch probe") && error.message.contains("target main"),
+            "the refusal names both branches: {}",
+            error.message
+        );
+        assert!(
+            error.hint.contains("check out main"),
+            "the hint names the fix: {}",
+            error.hint
+        );
+
+        run_git(&root, &["checkout", "--detach"]);
+        let error = require_target_checked_out(&root, "main")
+            .await
+            .expect_err("a detached checkout has no branch to move");
+        assert!(
+            error.message.contains("a detached HEAD"),
+            "{}",
+            error.message
+        );
+        std::fs::remove_dir_all(root).expect("remove fixture repository");
+    }
+
+    #[tokio::test]
     async fn a_failed_rebase_restores_the_attached_branch_and_allows_the_next_rebase() {
         let root = std::env::temp_dir().join(format!(
             "cowshed-rebase-recovery-{}",
@@ -6116,7 +6159,9 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
         if let Some(expected) = options.expected_workspace_incarnation.as_ref() {
             Self::require_exact_incarnation(&current, expected)?;
         }
-        let source_head = git_oid(&current_snapshot_mount(self, &current)?).await?;
+        let source_mount = current_snapshot_mount(self, &current)?;
+        let source_repository = crate::git::GitRepository::from_root(&source_mount);
+        let source_head = git_oid(&source_mount).await?;
         if options
             .expected_source_head
             .as_ref()
@@ -6127,10 +6172,28 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                 "refresh the workspace revision and retry land",
             ));
         }
+        // The check runs in the working tree but only the head commit lands, so uncommitted work
+        // would pass validation without landing, and would then refuse the retire after main had
+        // already moved. The same reading of "work" as `rm` makes, so land refuses exactly the
+        // trees retirement would.
+        if source_repository
+            .is_dirty_by(Some(&self.substrate_config.checkout_path))
+            .await?
+        {
+            return Err(CowshedError::conflict(
+                format!(
+                    "workspace {workspace} has uncommitted work, which the check would validate but land would leave behind"
+                ),
+                format!(
+                    "commit the work in the workspace or discard it, then retry: cowshed land {workspace}"
+                ),
+            ));
+        }
         let target_branch = options
             .target_branch
             .clone()
             .unwrap_or_else(|| DEFAULT_LANDING_BRANCH.to_owned());
+        require_target_checked_out(&self.descriptor.git_root, &target_branch).await?;
         let target_ref = format!("refs/heads/{target_branch}");
         let previous = git_optional_ref_oid(&self.descriptor.git_root, &target_ref).await?;
         require_expected_ref(
@@ -6202,16 +6265,12 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
         // Land has no branch-name contract with the workspace: it fetches whatever branch the
         // workspace has checked out, whether an agent named it `cowshed/<ws>`, `wt/<ws>`, or
         // anything else. Only the resolved head is load-bearing.
-        let source_mount = current_snapshot_mount(self, &current)?;
-        let source_branch = crate::git::GitRepository::from_root(&source_mount)
-            .current_branch()
-            .await?
-            .ok_or_else(|| {
-                CowshedError::conflict(
-                    format!("workspace {workspace} has no checked-out branch to land"),
-                    "check out a branch in the workspace and retry land",
-                )
-            })?;
+        let source_branch = source_repository.current_branch().await?.ok_or_else(|| {
+            CowshedError::conflict(
+                format!("workspace {workspace} has no checked-out branch to land"),
+                "check out a branch in the workspace and retry land",
+            )
+        })?;
         let preservation_ref = format!("refs/cowshed/{workspace}/heads/{source_branch}");
         run_git(
             &self.descriptor.git_root,
@@ -6236,13 +6295,29 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                 "re-run the check against the new head and retry land",
             ));
         }
+        // Read again at the merge: the check can run for minutes, and main's checkout can be
+        // switched to another branch while it does.
+        require_target_checked_out(&self.descriptor.git_root, &target_branch).await?;
         run_git(
             &self.descriptor.git_root,
             ["merge", "--ff-only", source_head.as_str()],
         )
         .await?;
         if retire {
-            self.remove(workspace, RemoveOptions::default()).await?;
+            // Main has already moved, so a refused retire must not read as a refused land: the
+            // retry its hint names would land nothing.
+            self.remove(workspace.clone(), RemoveOptions::default())
+                .await
+                .map_err(|kept| {
+                    CowshedError::new(
+                        kept.code,
+                        format!(
+                            "landed {source_head} on {target_branch}, but workspace {workspace} was kept: {}",
+                            kept.message
+                        ),
+                        kept.hint,
+                    )
+                })?;
         }
         Ok(LandReport {
             landed_head: source_head,
@@ -8091,6 +8166,32 @@ fn current_snapshot_mount(
     workspace: &NativeWorkspace,
 ) -> Result<PathBuf> {
     host.workspace_mount_path(workspace.derived.workspace.name())
+}
+
+/// Refuse a land whose target is not the branch main's checkout has checked out.
+///
+/// Land fast-forwards through main's checkout, and `merge` moves whichever branch that checkout
+/// is on, so any other target would be reported as landed while a different branch moved.
+/// Updating a branch that is not checked out is a separate path this runtime does not have.
+#[cfg(target_os = "macos")]
+async fn require_target_checked_out(git_root: &Path, target_branch: &str) -> Result<()> {
+    let checked_out = crate::git::GitRepository::from_root(git_root)
+        .current_branch()
+        .await?;
+    if checked_out.as_deref() == Some(target_branch) {
+        return Ok(());
+    }
+    let actual = checked_out.map_or_else(
+        || "a detached HEAD".to_owned(),
+        |branch| format!("branch {branch}"),
+    );
+    Err(CowshedError::conflict(
+        format!("main's checkout has {actual} checked out, not the land target {target_branch}"),
+        format!(
+            "check out {target_branch} in {}, then retry land",
+            git_root.display()
+        ),
+    ))
 }
 
 #[cfg(target_os = "macos")]

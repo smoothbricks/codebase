@@ -738,9 +738,14 @@ paths.
 
 ### `cowshed land <name> [--check <cmd>]`
 
-The full close-out in one primitive: rebase onto main, validate (`--check`, or `.cowshed.toml` `[land] check`) inside
-the sandbox, fast-forward main's repo from the workspace, retire the workspace. Any failing step exits 4 with the
-workspace intact. `--no-retire` keeps the workspace; `--push-only` stops after validation for review-gated flows.
+The full close-out in one primitive: validate (`--check`, or `.cowshed.toml` `[land] check`) inside the sandbox,
+fast-forward main's checkout to the workspace's branch, retire the workspace. A dirty tree, read the way `rm` reads it,
+is refused before the check runs: the check sees the working tree but only the commit lands. Land does not rebase; when
+main has moved past the workspace's base the fast-forward is refused, and `cowshed rebase <name>` is the next step. Any
+failing step before the fast-forward exits 4 with the workspace intact. A retire refused after the fast-forward keeps
+the workspace and exits with that refusal, whose message starts with what landed, so the retry is `cowshed rm`, not
+another land. The target (`--target`, default `main`) must be the branch main's checkout has checked out. `--no-retire`
+keeps the workspace; `--push-only` stops after validation for review-gated flows.
 
 ## Time travel
 

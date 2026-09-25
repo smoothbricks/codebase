@@ -2369,13 +2369,13 @@ const LAND: CommandSpec = CommandSpec {
     trailing: "",
     summary: "land a workspace",
     about: &[
-        "The whole close-out as one primitive: rebase onto the target branch, run the checks inside the sandbox, fast-forward main's repository from the workspace, retire the workspace. Any failing step stops there and leaves the workspace intact, so a landing is all-or-nothing without being a long-lived transaction.",
+        "The whole close-out as one primitive: run the checks inside the sandbox, fast-forward main's checkout to the workspace's branch, retire the workspace. The target must be the branch main's checkout has checked out, and a dirty tree is refused before the checks run, since they see the working tree but only the commit lands. Land does not rebase: when main has moved past the workspace's base, the fast-forward is refused and `cowshed rebase <ws>` is the next step. Any step that fails before the fast-forward leaves the workspace intact; a retire refused after it says what landed, and the next step is `cowshed rm`.",
         "Landing is also what `rm` measures against: the ancestry gate a removal enforces is satisfied by the branch this command delivers to.",
     ],
     options: &[
         Opt {
             spelling: "--target <branch>",
-            meaning: "land onto this branch of main's repository instead of main",
+            meaning: "land onto this branch instead of main; main's checkout must have it checked out",
         },
         Opt {
             spelling: "--check <cmd>",

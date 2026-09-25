@@ -54,7 +54,7 @@ direnv users need nothing extra.
 | Attach or detach all    | `cowshed attach --all` / `cowshed detach --all`                      | Mount or park all session workspaces.                           |
 | Checkpoint or restore   | `cowshed checkpoint <ws> <label>` / `cowshed restore <ws> <label>`   | Save or roll back an image.                                     |
 | Rebase                  | `cowshed rebase <ws>`                                                | Rebase the workspace branch onto main.                          |
-| Land with a check       | `cowshed land <ws> --target main --check '<bare command>'`           | Rebase, check, fast-forward main, and retire on success.        |
+| Land with a check       | `cowshed land <ws> --target main --check '<bare command>'`           | Check, fast-forward main, and retire on success.                |
 | Deliver a branch        | `cowshed push <ws> --branch <name>`                                  | Put the workspace branch in main's repository for review.       |
 | Retire                  | `cowshed rm <ws>`                                                    | Remove a landed workspace.                                      |
 | Reclaim                 | `cowshed gc --dry-run` / `cowshed gc`                                | Review, then reclaim orphaned storage.                          |
@@ -68,9 +68,9 @@ direnv users need nothing extra.
 3. Run the same check there: `cowshed exec <ws> -- <bare command>`.
 4. Land with `cowshed land <ws> --target main --check '<bare command>'`. The check is one bare command, not a shell
    pipeline.
-5. A successful `land` retires by default. If it was run with `--no-retire`, or if you used `push`, run
-   `cowshed rm <ws>` after main contains the workspace `HEAD`. Do not use `--abandon` unless destroying unlanded commits
-   is intentional.
+5. A successful `land` retires by default. If it was run with `--no-retire`, if you used `push`, or if land's error says
+   it landed but kept the workspace, run `cowshed rm <ws>` after main contains the workspace `HEAD` (never land again:
+   main already moved). Do not use `--abandon` unless destroying unlanded commits is intentional.
 
 ## Keep builds shareable
 
