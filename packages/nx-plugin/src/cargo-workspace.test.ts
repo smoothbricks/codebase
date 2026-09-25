@@ -136,10 +136,11 @@ describe('Cargo workspace layouts', () => {
         absoluteProjectRoot: join(root, 'packages/app'),
         memberDir: 'crates/app',
       });
-      expect(matches(inputs, 'packages/base/src/lib.rs', 'packages/app')).toBe(true);
-      expect(matches(inputs, '.cargo/config.toml', 'packages/app')).toBe(true);
-      expect(matches(inputs, 'packages/rust-toolchain.toml', 'packages/app')).toBe(true);
-      expect(matches(inputs, 'packages/base/target/debug/output', 'packages/app')).toBe(false);
+      expect(matches(inputs, 'packages/app/crates/app/src/lib.rs')).toBe(true);
+      expect(matches(inputs, 'packages/base/src/lib.rs')).toBe(true);
+      expect(matches(inputs, '.cargo/config.toml')).toBe(true);
+      expect(matches(inputs, 'packages/rust-toolchain.toml')).toBe(true);
+      expect(matches(inputs, 'packages/base/target/debug/output')).toBe(false);
       expect(inputs).not.toContain('externalRustCrates');
       expect(inputs.some((input) => input.includes('../'))).toBe(false);
     } finally {
@@ -269,12 +270,18 @@ describe('Cargo workspace layouts', () => {
   });
 });
 
-function matches(inputs: readonly string[], path: string, projectRoot = ''): boolean {
-  const filesets = inputs.filter((input) => input.includes('{projectRoot}') || input.includes('{workspaceRoot}'));
-  const match = (input: string): boolean =>
-    new Glob(
-      input.replace('{projectRoot}/', projectRoot ? `${projectRoot}/` : '').replace('{workspaceRoot}/', ''),
-    ).match(path);
+/**
+ * Whether Nx would hash `path` (workspace-relative) under `inputs`.
+ *
+ * Only `{workspaceRoot}` filesets resolve here. Nx resolves a `{projectRoot}`
+ * fileset against the files its project owns, which a directory prefix cannot
+ * model: resolving it as one would pass the very inputs that hash nothing once
+ * a nested project owns the crate, so this harness refuses them instead.
+ */
+function matches(inputs: readonly string[], path: string): boolean {
+  expect(inputs.filter((input) => input.includes('{projectRoot}'))).toEqual([]);
+  const filesets = inputs.filter((input) => input.includes('{workspaceRoot}'));
+  const match = (input: string): boolean => new Glob(input.replace('{workspaceRoot}/', '')).match(path);
   return (
     filesets.some((input) => !input.startsWith('!') && match(input)) &&
     !filesets.some((input) => input.startsWith('!') && match(input.slice(1)))

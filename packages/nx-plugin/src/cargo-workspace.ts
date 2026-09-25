@@ -221,7 +221,6 @@ export interface CargoPackageTestInputsOptions {
   /** The cargo workspace root holding the top-level `Cargo.toml`. */
   absoluteProjectRoot: string;
   memberDir: string;
-  inputRoot?: string;
   /** Shared across every call of one graph computation; see {@link createCargoInputsCache}. */
   cache?: CargoInputsCache;
 }
@@ -247,7 +246,7 @@ export function createCargoInputsCache(): CargoInputsCache {
 
 export function cargoPackageTestInputs(options: CargoPackageTestInputsOptions): Promise<string[]> {
   const cache = options.cache ?? createCargoInputsCache();
-  const key = `${options.absoluteProjectRoot}\0${options.memberDir}\0${options.inputRoot ?? '{projectRoot}'}`;
+  const key = `${options.absoluteProjectRoot}\0${options.memberDir}`;
   const cached = cache.results.get(key);
   if (cached !== undefined) return cached;
   const derived = deriveCargoPackageTestInputs(options, cache);
@@ -256,9 +255,16 @@ export function cargoPackageTestInputs(options: CargoPackageTestInputsOptions): 
 }
 
 async function deriveCargoPackageTestInputs(
-  { workspaceRoot, absoluteProjectRoot, memberDir, inputRoot = '{projectRoot}' }: CargoPackageTestInputsOptions,
+  { workspaceRoot, absoluteProjectRoot, memberDir }: CargoPackageTestInputsOptions,
   cache: CargoInputsCache,
 ): Promise<string[]> {
+  // Every fileset is anchored at `{workspaceRoot}`, never `{projectRoot}`: Nx
+  // hashes a `{projectRoot}` glob against only the files its project OWNS, and
+  // a nested Nx project owns the crates under it. A repository-root cargo
+  // workspace whose members live in `packages/*` would then hash none of its
+  // members' sources, and its archive would cache-hit against edited crates
+  // while every per-crate runner reran on the stale binaries.
+  const inputRoot = posix.join('{workspaceRoot}', relative(workspaceRoot, absoluteProjectRoot).split(sep).join('/'));
   const loadManifest = (path: string): Promise<TomlTable> => {
     const normalized = resolve(path);
     const cached = cache.manifests.get(normalized);

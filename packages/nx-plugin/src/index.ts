@@ -2358,8 +2358,10 @@ async function addCargoTestTargets(
     if (plan.package.projectRoot !== projectRoot) {
       continue;
     }
-    const inputRoot =
-      projectRoot === workspace.projectRoot ? '{projectRoot}' : posix.join('{workspaceRoot}', workspace.projectRoot);
+    // Workspace-anchored for the reason `cargoPackageTestInputs` gives: a
+    // `{projectRoot}` glob hashes only files this project owns, and sibling
+    // manifests belong to whichever nested project holds them.
+    const inputRoot = posix.join('{workspaceRoot}', workspace.projectRoot);
     // A workspace nextest build unifies features across every selected member.
     // A sibling manifest can therefore change this crate's tests without being
     // a path dependency. Track those manifests, not unrelated sibling sources.
@@ -2373,7 +2375,6 @@ async function addCargoTestTargets(
           workspaceRoot,
           absoluteProjectRoot: join(workspaceRoot, workspace.projectRoot),
           memberDir: plan.package.dir,
-          inputRoot,
           cache: workspace.inputsCache,
         })),
         ...workspace.packages.map((member) => posix.join(inputRoot, member.package.dir, 'Cargo.toml')),
