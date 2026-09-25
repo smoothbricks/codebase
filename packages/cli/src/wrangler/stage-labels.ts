@@ -1,6 +1,7 @@
 // How a staging value becomes a pull-request stage's: the label rewrites shared by the TOML
-// derivation (stage.ts) and the flat-config derivation (flat-config.ts). Internal to the
-// package; the published `./wrangler/stage` entry does not re-export it.
+// derivation (stage.ts) and the flat-config derivation (flat-config.ts), and the hostnames a
+// stage's routes serve. Internal to the package; the published `./wrangler/stage` entry does
+// not re-export it.
 
 // The predicate and the rewriter share one regex so they cannot drift:
 // `hasStageLabel(v)` is true exactly when `replaceHostnameLabel(v, stage)` would change `v`.
@@ -33,4 +34,25 @@ export function derivedStagingName(value: string, stage: `pr${number}`, what: st
     throw new Error(`${what} ${value} has no exact staging segment.`);
   }
   return derived;
+}
+
+/**
+ * The lowercase host a route pattern serves, minus a leading `*.` and any path: `*.pr7.example.com/*`
+ * and the pathless `*.pr7.example.com` both give `pr7.example.com`.
+ */
+export function routeHostname(pattern: string): string {
+  return pattern.split('/', 1)[0].replace(/^\*\./, '').toLowerCase();
+}
+
+/**
+ * The proxied CNAME `*.<host>` → `<host>` that a `*.` route with a declared zone needs, and nothing
+ * for any other route. Reconcile creates the record from this, so there is one derivation of it.
+ */
+export function wildcardDnsRecord(route: {
+  pattern: string;
+  zoneName?: string;
+}): { zoneName: string; name: string; content: string } | undefined {
+  if (!route.pattern.startsWith('*.') || !route.zoneName) return undefined;
+  const hostname = routeHostname(route.pattern);
+  return { zoneName: route.zoneName, name: `*.${hostname}`, content: hostname };
 }
