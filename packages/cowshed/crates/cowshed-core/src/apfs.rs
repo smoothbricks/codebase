@@ -97,12 +97,12 @@ pub trait CommandRunner {
 
 /// The bound every spawned disk child (attach/detach, inventory, mount) answers inside.
 ///
-/// A hung `hdiutil`/`diskutil` child used to wedge the store operation that spawned it
-/// forever — one stuck workspace took down every other workspace's verbs, and the daemon
+/// Without it a hung `hdiutil`/`diskutil` child wedges the store operation that spawned it
+/// forever — one stuck workspace takes down every other workspace's verbs, and the daemon
 /// startup pass with them. On expiry the child is killed and the item reports a timeout
 /// ("deferred") so the queue continues and the next pass retries it; the per-leg
-/// [`timed_apfs_step`] span such a child was stuck inside now terminates with
-/// `status=err` and the waited elapsed instead of never closing.
+/// [`timed_apfs_step`] span such a child was stuck inside terminates with `status=err` and
+/// the waited elapsed instead of never closing.
 ///
 /// 120 seconds is generous against normally sub-second disk children and stays inside the
 /// enclosing per-operation budgets even when a pass pays it once per workspace; tests
@@ -6052,7 +6052,7 @@ mod tests {
         assert_eq!(whole_device_from("/dev/disk"), None);
         assert_eq!(whole_device_from("/dev/not-a-disk"), None);
         // The whole identifier must be well-formed, not just its unit prefix: a malformed tail
-        // used to be silently truncated into a plausible container.
+        // must not be truncated into a plausible container.
         assert_eq!(whole_device_from("/dev/disk12sx"), None);
         assert_eq!(whole_device_from("/dev/disk01s1"), None);
 

@@ -2513,11 +2513,9 @@ impl NativeProjectRuntimeHost {
     /// four at once:
     ///
     /// * its **marker** (`.cowshed/workspace.json`) and its **detached sidecar**, both of which
-    ///   name `projectRoot`. Rewriting only main's pair — which is all this used to do — is what
-    ///   left every session of a relocated project naming a directory that had stopped being a
-    ///   repository, and
-    ///   what made `doctor` report "workspace marker identity does not match" with no remedy in
-    ///   sight;
+    ///   name `projectRoot`. Rewriting only main's pair would leave every session of a relocated
+    ///   project naming a directory that has stopped being a repository, and `doctor` reporting
+    ///   "workspace marker identity does not match" with no remedy in sight;
     /// * its **`main` remote**, or its **linked-worktree registration** when it is a git-worktree
     ///   workspace;
     /// * its **merge drivers**, whose absolute program paths die with the old checkout and take
@@ -9303,8 +9301,8 @@ fn main_name() -> WorkspaceName {
 ///
 /// They are free functions rather than inline `CowshedError::conflict` calls for one reason: the
 /// invariant that *no removal refusal may name the flag that overrides it* is only enforceable if
-/// the refusals can be enumerated and swept. Tonight's incident was a coordinator script that
-/// learned `--force` from a refusal that prescribed it, so the hints here name safe remedies only —
+/// the refusals can be enumerated and swept. A coordinator script that reads a destructive flag in
+/// a refusal's hint learns to reach for it by reflex, so the hints here name safe remedies only —
 /// land it, commit it, finish the merge — and the destructive flag is documented where a human
 /// reads options deliberately, in `cowshed rm`'s usage text.
 #[cfg(target_os = "macos")]
@@ -9325,8 +9323,8 @@ fn removal_dirty_refusal(workspace: &WorkspaceName) -> CowshedError {
 
 /// The one place that decides whether a removal may destroy a session's object store.
 ///
-/// Pure, and separated from the measurement on purpose: this is the decision an incident turned
-/// into a gate, and a decision worth testing directly is worth being able to test without a
+/// Pure, and separated from the measurement on purpose: this is the decision that destroys commits
+/// or refuses to, and a decision worth testing directly is worth being able to test without a
 /// substrate. `Some` means the caller authorized an abandonment and there is genuinely something to
 /// bundle before deleting.
 #[cfg(target_os = "macos")]
@@ -9345,7 +9343,7 @@ fn removal_landed_decision(
     Err(removal_unlanded_refusal(workspace, head, &landed))
 }
 
-/// The gate the incident turned on: these commits exist nowhere but the image about to be deleted.
+/// Why the gate exists: these commits exist nowhere but the image about to be deleted.
 #[cfg(target_os = "macos")]
 fn removal_unlanded_refusal(
     workspace: &WorkspaceName,
