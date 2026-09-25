@@ -627,6 +627,7 @@ function buildProgram(): Command {
     .action(async (options: { stage: string; config?: string; versionEndpoint?: string }) => {
       await deployStage(process.cwd(), {
         stage: options.stage,
+        repositoryRoot: await findRepoRoot(),
         ...(options.config ? { config: resolve(options.config) } : {}),
         ...(options.versionEndpoint ? { versionEndpoint: options.versionEndpoint } : {}),
       });

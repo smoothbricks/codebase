@@ -46,6 +46,9 @@ pattern = "*.staging.example.test/*"
 zone_name = "example.test"
 `;
 
+/** The record keys of `fixture-worker-pr123`, as the fake logs their writes. */
+const RECORDED_PR123 = 'put-record:v1/github.com%2Facme%2Fapp/pr123/fixture-worker-pr123';
+
 const roots: string[] = [];
 
 function requiredTestValue<T>(value: T | undefined, name: string): T {
@@ -176,8 +179,14 @@ class FakeCloudflare implements CloudflareClient {
     this.mutations.push(`create-r2:${name}`);
     this.buckets.push({ name });
   }
-  async listR2Objects(bucket: string): Promise<string[]> {
-    return this.objects[bucket] ?? [];
+  async listR2Objects(bucket: string, prefix = ''): Promise<string[]> {
+    return (this.objects[bucket] ?? []).filter((key) => key.startsWith(prefix));
+  }
+  async putR2Object(bucket: string, key: string): Promise<void> {
+    this.mutations.push(`put-record:${key}`);
+    const keys = this.objects[bucket] ?? [];
+    if (!keys.includes(key)) keys.push(key);
+    this.objects[bucket] = keys;
   }
   async deleteR2Object(bucket: string, key: string): Promise<void> {
     this.mutations.push(`delete-object:${bucket}:${key}`);
@@ -256,7 +265,11 @@ describe('deploy-stage against live state', () => {
       versions: [{ version_id: 'version-1', percentage: 100 }],
     });
 
-    const result = await deployStage(root, { stage: 'pr123' }, dependencies(runner, new FakeCloudflare()));
+    const result = await deployStage(
+      root,
+      { stage: 'pr123', repositoryRoot: root },
+      dependencies(runner, new FakeCloudflare()),
+    );
 
     expect(result.action).toBe('remote-cache-hit');
     // Two reads and nothing else. This is what makes a redundant deploy — the one a cross-project
@@ -274,7 +287,11 @@ describe('deploy-stage against live state', () => {
       versions: [{ version_id: 'version-2', percentage: 100 }],
     });
 
-    const result = await deployStage(root, { stage: 'pr123' }, dependencies(runner, new FakeCloudflare()));
+    const result = await deployStage(
+      root,
+      { stage: 'pr123', repositoryRoot: root },
+      dependencies(runner, new FakeCloudflare()),
+    );
 
     expect(result.action).toBe('activated');
     const shiftIndex = runner.calls.findIndex((call) => call.args[0] === 'versions' && call.args[1] === 'deploy');
@@ -291,7 +308,11 @@ describe('deploy-stage against live state', () => {
     });
     runner.propagationPolls = 3;
 
-    const result = await deployStage(root, { stage: 'pr123' }, dependencies(runner, new FakeCloudflare()));
+    const result = await deployStage(
+      root,
+      { stage: 'pr123', repositoryRoot: root },
+      dependencies(runner, new FakeCloudflare()),
+    );
 
     expect(result.action).toBe('activated');
     const statusReads = runner.calls.filter((call) => call.args[0] === 'deployments').length;
@@ -305,7 +326,9 @@ describe('deploy-stage against live state', () => {
     });
     runner.propagationPolls = Number.POSITIVE_INFINITY;
 
-    await expect(deployStage(root, { stage: 'pr123' }, dependencies(runner, new FakeCloudflare()))).rejects.toThrow(
+    await expect(
+      deployStage(root, { stage: 'pr123', repositoryRoot: root }, dependencies(runner, new FakeCloudflare())),
+    ).rejects.toThrow(
       `fixture-worker-pr123: deployed version nx-${HASH} was not serving traffic after 10s; live is an untagged version (version-2)`,
     );
   });
@@ -320,7 +343,7 @@ describe('deploy-stage against live state', () => {
 
     await deployStage(
       root,
-      { stage: 'pr123' },
+      { stage: 'pr123', repositoryRoot: root },
       { ...dependencies(runner, new FakeCloudflare()), liveVersionCacheDirectory: cacheDirectory },
     );
 
@@ -346,7 +369,7 @@ describe('deploy-stage against live state', () => {
 
     const result = await deployStage(
       root,
-      { stage: 'pr123', versionEndpoint: 'https://fixture.example.test/__version' },
+      { stage: 'pr123', repositoryRoot: root, versionEndpoint: 'https://fixture.example.test/__version' },
       {
         ...dependencies(runner, new FakeCloudflare()),
         wait: { ...fakeWait(), fetch: stubFetch },
@@ -371,7 +394,7 @@ describe('deploy-stage against live state', () => {
     await expect(
       deployStage(
         root,
-        { stage: 'pr123', versionEndpoint: 'https://fixture.example.test/__version' },
+        { stage: 'pr123', repositoryRoot: root, versionEndpoint: 'https://fixture.example.test/__version' },
         { ...dependencies(runner, new FakeCloudflare()), wait: { ...fakeWait(), fetch: stubFetch } },
       ),
     ).rejects.toThrow(
@@ -386,7 +409,7 @@ describe('deploy-stage against live state', () => {
 
     const result = await deployStage(
       root,
-      { stage: 'pr123' },
+      { stage: 'pr123', repositoryRoot: root },
       {
         ...dependencies(runner, new FakeCloudflare()),
         processEnv: {
@@ -426,7 +449,7 @@ describe('deploy-stage against live state', () => {
 
     const result = await deployStage(
       root,
-      { stage: 'staging' },
+      { stage: 'staging', repositoryRoot: root },
       {
         runner,
         cloudflare,
@@ -456,7 +479,7 @@ describe('deploy-stage against live state', () => {
     await expect(
       deployStage(
         root,
-        { stage: 'pr123' },
+        { stage: 'pr123', repositoryRoot: root },
         {
           ...dependencies(new FakeRunner([], {}), cloudflare),
           processEnv: {
@@ -482,7 +505,11 @@ describe('deploy-stage against live state', () => {
       throw new Error('record already exists');
     };
 
-    const result = await deployStage(root, { stage: 'pr123' }, dependencies(new FakeRunner([], {}), cloudflare));
+    const result = await deployStage(
+      root,
+      { stage: 'pr123', repositoryRoot: root },
+      dependencies(new FakeRunner([], {}), cloudflare),
+    );
 
     expect(result.action).toBe('deployed');
     expect(createAttempts).toBe(1);
@@ -498,9 +525,13 @@ zone_name = "example.test"
     const cloudflare = new FakeCloudflare();
     cloudflare.zones = [{ id: 'zone', name: 'example.test' }];
 
-    await deployStage(root, { stage: 'pr123' }, dependencies(new FakeRunner([], {}), cloudflare));
+    await deployStage(root, { stage: 'pr123', repositoryRoot: root }, dependencies(new FakeRunner([], {}), cloudflare));
 
     expect(cloudflare.mutations).toEqual([
+      'create-r2:smoo-stage-records',
+      `${RECORDED_PR123}/worker`,
+      `${RECORDED_PR123}/route/example.test/*.pr123.example.test`,
+      `${RECORDED_PR123}/dns/example.test/*.pr123.example.test`,
       'create-dns:zone:*.pr123.example.test:pr123.example.test',
       'create-route:zone:*.pr123.example.test:fixture-worker-pr123',
     ]);
@@ -527,10 +558,7 @@ ENVIRONMENT = "production"
     const root = await fixtureRoot(STAGED_FIXTURE);
     await writeFile(join(root, '.dev.vars.example'), secrets.map((name) => `${name}=""\n`).join(''));
     if (secretStages) {
-      await writeFile(
-        join(root, 'package.json'),
-        `${JSON.stringify({ name: '@acme/api', smoo: { wrangler: { secretStages } } }, null, 2)}\n`,
-      );
+      await writeRepositoryRoot(root, { name: '@acme/api', smoo: { wrangler: { secretStages } } });
     }
     return root;
   }
@@ -547,7 +575,11 @@ ENVIRONMENT = "production"
     const cloudflare = new FakeCloudflare();
 
     await expect(
-      deployStage(root, { stage: 'production' }, { runner, cloudflare, processEnv: environment() }),
+      deployStage(
+        root,
+        { stage: 'production', repositoryRoot: root },
+        { runner, cloudflare, processEnv: environment() },
+      ),
     ).rejects.toThrow(
       /Refusing to deploy fixture-worker-production to production[\s\S]*SESSION_SECRET[\s\S]*OAUTH_STATE_KEY/,
     );
@@ -565,7 +597,7 @@ ENVIRONMENT = "production"
     await expect(
       deployStage(
         root,
-        { stage: 'production' },
+        { stage: 'production', repositoryRoot: root },
         { runner: new FakeRunner([], {}), cloudflare, processEnv: environment() },
       ),
     ).rejects.toThrow(/Refusing to deploy fixture-worker-production to production[\s\S]*OAUTH_STATE_KEY/);
@@ -579,7 +611,7 @@ ENVIRONMENT = "production"
     const cloudflare = new FakeCloudflare();
 
     await expect(
-      deployStage(root, { stage: 'pr77' }, dependencies(new FakeRunner([], {}), cloudflare)),
+      deployStage(root, { stage: 'pr77', repositoryRoot: root }, dependencies(new FakeRunner([], {}), cloudflare)),
     ).rejects.toThrow(/fixture-worker-pr77[\s\S]*SESSION_SECRET — unscoped, so every stage requires it/);
     expect(cloudflare.mutations).toEqual([]);
   });
@@ -589,7 +621,11 @@ ENVIRONMENT = "production"
     const runner = new FakeRunner([], {});
     const cloudflare = new FakeCloudflare();
 
-    const result = await deployStage(root, { stage: 'production' }, { runner, cloudflare, processEnv: environment() });
+    const result = await deployStage(
+      root,
+      { stage: 'production', repositoryRoot: root },
+      { runner, cloudflare, processEnv: environment() },
+    );
 
     expect(result).toMatchObject({ action: 'deployed', workerName: 'fixture-worker-production' });
     expect(runner.secretsPathSeen).toBeUndefined();
@@ -606,7 +642,7 @@ ENVIRONMENT = "production"
     try {
       const result = await deployStage(
         root,
-        { stage: 'production' },
+        { stage: 'production', repositoryRoot: root },
         {
           runner,
           cloudflare,
@@ -635,7 +671,11 @@ ENVIRONMENT = "production"
       const root = await scopedRoot(['API_TOKEN', 'E2E_CONTROL_TOKEN'], scopes);
       const runner = new FakeRunner([], {});
 
-      await deployStage(root, { stage }, { runner, cloudflare: new FakeCloudflare(), processEnv: environment(values) });
+      await deployStage(
+        root,
+        { stage, repositoryRoot: root },
+        { runner, cloudflare: new FakeCloudflare(), processEnv: environment(values) },
+      );
 
       expect(JSON.parse(requiredTestValue(runner.secretsJson, `secrets JSON for ${stage}`))).toEqual(values);
     }
@@ -649,7 +689,7 @@ ENVIRONMENT = "production"
     // `!scope?.length` would collapse them and ship a local-development value to every stage.
     const result = await deployStage(
       root,
-      { stage: 'production' },
+      { stage: 'production', repositoryRoot: root },
       {
         runner,
         cloudflare: new FakeCloudflare(),
@@ -670,7 +710,7 @@ ENVIRONMENT = "production"
     await expect(
       deployStage(
         root,
-        { stage: 'production' },
+        { stage: 'production', repositoryRoot: root },
         { runner: new FakeRunner([], {}), cloudflare, processEnv: environment() },
       ),
     ).rejects.toThrow(/keeps out of production[\s\S]*E2E_CONTROL_TOKEN — scoped to staging, preview/);
@@ -683,7 +723,7 @@ ENVIRONMENT = "production"
     await expect(
       deployStage(
         root,
-        { stage: 'production' },
+        { stage: 'production', repositoryRoot: root },
         { runner: new FakeRunner([], {}), cloudflare: new FakeCloudflare(), processEnv: environment() },
       ),
     ).rejects.toThrow(/secretStages scopes E2E_CONTROL_TOEKN, which .dev.vars.example does not declare/);
@@ -695,7 +735,7 @@ ENVIRONMENT = "production"
     await expect(
       deployStage(
         root,
-        { stage: 'production' },
+        { stage: 'production', repositoryRoot: root },
         { runner: new FakeRunner([], {}), cloudflare: new FakeCloudflare(), processEnv: environment() },
       ),
     ).rejects.toThrow(
@@ -710,7 +750,7 @@ ENVIRONMENT = "production"
 
     const refused = await deployStage(
       root,
-      { stage: 'production' },
+      { stage: 'production', repositoryRoot: root },
       { runner, cloudflare, processEnv: environment({ API_TOKEN: 'api-value' }) },
     ).catch((error: unknown) => (error instanceof Error ? error.message : String(error)));
 
@@ -722,7 +762,7 @@ ENVIRONMENT = "production"
     cloudflare.secrets['fixture-worker-production'] = ['SESSION_SECRET'];
     await deployStage(
       root,
-      { stage: 'production' },
+      { stage: 'production', repositoryRoot: root },
       { runner, cloudflare, processEnv: environment({ API_TOKEN: 'api-value' }) },
     );
 
@@ -863,6 +903,7 @@ const FLAT_PRODUCTION_FIXTURE = JSON.stringify(
 async function flatFixtureRoot(fixture = FLAT_FIXTURE): Promise<{ root: string; configPath: string }> {
   const root = await mkdtemp(join(tmpdir(), 'smoo-wrangler-flat-'));
   roots.push(root);
+  await writeRepositoryRoot(root);
   const serverDir = join(root, '.out', 'server');
   await mkdir(serverDir, { recursive: true });
   const configPath = join(serverDir, 'wrangler.json');
@@ -881,7 +922,11 @@ describe('deployStage with a flat JSON config', () => {
 
     // The build that produced the config runs with CLOUDFLARE_ENV set, so the deploy process inherits it.
     const result = await withProcessEnv({ CLOUDFLARE_ENV: 'staging', CLOUDFLARE_ACCOUNT_ID: 'account-1' }, () =>
-      deployStage(root, { stage: 'staging', config: configPath }, dependencies(runner, cloudflare)),
+      deployStage(
+        root,
+        { stage: 'staging', repositoryRoot: root, config: configPath },
+        dependencies(runner, cloudflare),
+      ),
     );
 
     expect(result).toEqual({
@@ -916,7 +961,11 @@ describe('deployStage with a flat JSON config', () => {
     cloudflare.d1Databases = [{ uuid: 'd1-staging', name: 'fixture-website-staging-db' }];
     cloudflare.zones = [{ id: 'zone-1', name: 'example.test' }];
 
-    const result = await deployStage(root, { stage: 'staging', config: configPath }, dependencies(runner, cloudflare));
+    const result = await deployStage(
+      root,
+      { stage: 'staging', repositoryRoot: root, config: configPath },
+      dependencies(runner, cloudflare),
+    );
 
     expect(result.action).toBe('deployed');
     expect(runner.calls.map((call) => call.args[0])).not.toContain('d1');
@@ -936,7 +985,11 @@ describe('deployStage with a flat JSON config', () => {
       derivedConfig = JSON.parse(await readFile(args[index + 1] ?? '', 'utf8'));
     };
 
-    const result = await deployStage(root, { stage: 'pr7', config: configPath }, dependencies(runner, cloudflare));
+    const result = await deployStage(
+      root,
+      { stage: 'pr7', repositoryRoot: root, config: configPath },
+      dependencies(runner, cloudflare),
+    );
 
     expect(result.workerName).toBe('fixture-website-preview-pr7');
     expect(cloudflare.mutations).toContain('create-kv:fixture-SESSION-pr7');
@@ -973,7 +1026,7 @@ describe('deployStage with a flat JSON config', () => {
 
     const result = await deployStage(
       root,
-      { stage: 'production', config: configPath },
+      { stage: 'production', repositoryRoot: root, config: configPath },
       dependencies(runner, cloudflare),
     );
 
@@ -1005,7 +1058,11 @@ describe('deployStage with a flat JSON config', () => {
     cloudflare.scripts = [{ id: 'fixture-website-preview-staging' }];
     cloudflare.domains = [{ id: 'domain-1', hostname: 'next.example.com', service: 'fixture-website-preview-staging' }];
 
-    const result = await deployStage(root, { stage: 'staging', config: configPath }, dependencies(runner, cloudflare));
+    const result = await deployStage(
+      root,
+      { stage: 'staging', repositoryRoot: root, config: configPath },
+      dependencies(runner, cloudflare),
+    );
 
     expect(result.action).toBe('remote-cache-hit');
     expect(runner.calls.map((call) => call.args.slice(0, 2))).toEqual([
@@ -1025,7 +1082,11 @@ describe('deployStage with a flat JSON config', () => {
     cloudflare.scripts = [{ id: 'fixture-website-preview-staging' }];
     cloudflare.domains = [{ id: 'domain-1', hostname: 'next.example.com', service: 'fixture-website-preview-staging' }];
 
-    const result = await deployStage(root, { stage: 'staging', config: configPath }, dependencies(runner, cloudflare));
+    const result = await deployStage(
+      root,
+      { stage: 'staging', repositoryRoot: root, config: configPath },
+      dependencies(runner, cloudflare),
+    );
 
     expect(result.action).toBe('activated');
     expect(runner.calls.map((call) => call.args.slice(0, 2))).toEqual([
@@ -1051,7 +1112,7 @@ describe('deployStage with a flat JSON config', () => {
     cloudflare.d1Databases = [{ uuid: 'd1-staging', name: 'fixture-website-staging-db' }];
 
     await expect(
-      deployStage(root, { stage: 'pr7', config: configPath }, dependencies(runner, cloudflare)),
+      deployStage(root, { stage: 'pr7', repositoryRoot: root, config: configPath }, dependencies(runner, cloudflare)),
     ).rejects.toThrow(/wrangler exploded/);
     const leftovers = (await readdir(join(root, '.out', 'server'))).filter((name) =>
       name.startsWith('.wrangler.smoo-'),
@@ -1070,7 +1131,11 @@ describe('deployStage with a flat JSON config', () => {
     cloudflare.namespaces = [{ id: 'kv-staging', title: 'fixture-SESSION-staging' }];
 
     await expect(
-      deployStage(root, { stage: 'pr7', config: configPath }, dependencies(new FakeRunner(), cloudflare)),
+      deployStage(
+        root,
+        { stage: 'pr7', repositoryRoot: root, config: configPath },
+        dependencies(new FakeRunner(), cloudflare),
+      ),
     ).rejects.toThrow(/pinned/);
     expect(cloudflare.mutations).toEqual([]);
   });
@@ -1086,7 +1151,11 @@ describe('deployStage with a flat JSON config', () => {
     cloudflare.namespaces = [{ id: 'kv-staging', title: 'fixture-SESSION-staging' }];
 
     await expect(
-      deployStage(root, { stage: 'pr7', config: configPath }, dependencies(new FakeRunner(), cloudflare)),
+      deployStage(
+        root,
+        { stage: 'pr7', repositoryRoot: root, config: configPath },
+        dependencies(new FakeRunner(), cloudflare),
+      ),
     ).rejects.toThrow(/no exact staging segment/);
     expect(cloudflare.mutations).toEqual([]);
   });
@@ -1100,7 +1169,11 @@ describe('deployStage with a flat JSON config', () => {
     cloudflare.scripts = [];
 
     await expect(
-      deployStage(root, { stage: 'pr7', config: configPath }, dependencies(new FakeRunner(), cloudflare)),
+      deployStage(
+        root,
+        { stage: 'pr7', repositoryRoot: root, config: configPath },
+        dependencies(new FakeRunner(), cloudflare),
+      ),
     ).rejects.toThrow(/Refusing to deploy fixture-website-preview-pr7 to pr7[\s\S]*FIXTURE_SECRET/);
     expect(cloudflare.mutations).toEqual([]);
   });
@@ -1110,7 +1183,11 @@ describe('deployStage with a flat JSON config', () => {
     await writeFile(configPath, JSON.stringify({ name: 'x-staging', env: { staging: {} } }));
 
     await expect(
-      deployStage(root, { stage: 'staging', config: configPath }, dependencies(new FakeRunner(), new FakeCloudflare())),
+      deployStage(
+        root,
+        { stage: 'staging', repositoryRoot: root, config: configPath },
+        dependencies(new FakeRunner(), new FakeCloudflare()),
+      ),
     ).rejects.toThrow(/env blocks/);
   });
 
@@ -1118,7 +1195,11 @@ describe('deployStage with a flat JSON config', () => {
     const { root, configPath } = await flatFixtureRoot('{');
 
     await expect(
-      deployStage(root, { stage: 'staging', config: configPath }, dependencies(new FakeRunner(), new FakeCloudflare())),
+      deployStage(
+        root,
+        { stage: 'staging', repositoryRoot: root, config: configPath },
+        dependencies(new FakeRunner(), new FakeCloudflare()),
+      ),
     ).rejects.toThrow(`${configPath} is not valid JSON: `);
   });
 });
@@ -1160,7 +1241,11 @@ describe('deployStage with a JSONC source config', () => {
     cloudflare.scripts = [{ id: 'fixture-worker-staging' }];
     cloudflare.zones = [{ id: 'zone-1', name: 'example.test' }];
 
-    const result = await deployStage(root, { stage: 'staging' }, dependencies(runner, cloudflare));
+    const result = await deployStage(
+      root,
+      { stage: 'staging', repositoryRoot: root },
+      dependencies(runner, cloudflare),
+    );
 
     expect(result).toMatchObject({ workerName: 'fixture-worker-staging', action: 'deployed' });
     const deploy = requiredTestValue(
@@ -1188,7 +1273,7 @@ describe('deployStage with a JSONC source config', () => {
       derivedConfig = JSON.parse(await readFile(derivedPath ?? '', 'utf8'));
     };
 
-    const result = await deployStage(root, { stage: 'pr123' }, dependencies(runner, cloudflare));
+    const result = await deployStage(root, { stage: 'pr123', repositoryRoot: root }, dependencies(runner, cloudflare));
 
     expect(result).toMatchObject({ workerName: 'fixture-worker-pr123', action: 'deployed' });
     // Wrangler picks its parser by extension, so the derived config is JSON whatever the source was.
@@ -1223,10 +1308,218 @@ describe('deployStage with a JSONC source config', () => {
     await writeFile(join(root, 'wrangler.toml'), FIXTURE);
     const cloudflare = new FakeCloudflare();
 
-    await expect(deployStage(root, { stage: 'staging' }, dependencies(new FakeRunner(), cloudflare))).rejects.toThrow(
-      `${root} declares more than one Wrangler configuration: wrangler.jsonc, wrangler.toml.`,
+    await expect(
+      deployStage(root, { stage: 'staging', repositoryRoot: root }, dependencies(new FakeRunner(), cloudflare)),
+    ).rejects.toThrow(`${root} declares more than one Wrangler configuration: wrangler.jsonc, wrangler.toml.`);
+    expect(cloudflare.mutations).toEqual([]);
+  });
+});
+
+/**
+ * A pull-request stage writes down everything it will create before it creates any of it, so the
+ * cleanup can delete exactly what this repository's stage made and nothing another repository did.
+ */
+describe('deployStage records a pull-request stage before creating it', () => {
+  /** Puts the wrangler commands that change something into the same log as the Cloudflare mutations. */
+  function logWranglerInto(runner: FakeRunner, cloudflare: FakeCloudflare): void {
+    runner.onCall = async (args) => {
+      cloudflare.mutations.push(`wrangler ${args[0]}`);
+    };
+  }
+
+  it('records every item of a TOML stage, each key once, before it creates any of them', async () => {
+    const root = await fixtureRoot(`${ROUTED_FIXTURE}
+[[env.staging.routes]]
+pattern = "*.staging.example.test/api/*"
+zone_name = "example.test"
+
+[[env.staging.kv_namespaces]]
+binding = "SESSIONS"
+id = "kv-staging"
+`);
+    const runner = new FakeRunner([], {});
+    const cloudflare = new FakeCloudflare();
+    cloudflare.namespaces = [{ id: 'kv-staging', title: 'fixture-sessions-staging' }];
+    cloudflare.zones = [{ id: 'zone', name: 'example.test' }];
+    logWranglerInto(runner, cloudflare);
+
+    await deployStage(root, { stage: 'pr123', repositoryRoot: root }, dependencies(runner, cloudflare));
+
+    // Both `*.` routes serve one host, so they share one DNS record and one key.
+    expect(cloudflare.mutations).toEqual([
+      'create-r2:smoo-stage-records',
+      `${RECORDED_PR123}/worker`,
+      `${RECORDED_PR123}/kv/fixture-sessions-pr123`,
+      `${RECORDED_PR123}/route/example.test/*.pr123.example.test%2F*`,
+      `${RECORDED_PR123}/dns/example.test/*.pr123.example.test`,
+      `${RECORDED_PR123}/route/example.test/*.pr123.example.test%2Fapi%2F*`,
+      'create-kv:fixture-sessions-pr123',
+      'create-dns:zone:*.pr123.example.test:pr123.example.test',
+      'create-route:zone:*.pr123.example.test/*:fixture-worker-pr123',
+      'create-route:zone:*.pr123.example.test/api/*:fixture-worker-pr123',
+      'wrangler deploy',
+    ]);
+  });
+
+  it('records a JSONC stage before it creates any of it', async () => {
+    const root = await fixtureRoot(JSONC_FIXTURE, 'wrangler.jsonc');
+    const runner = new FakeRunner([], {});
+    const cloudflare = new FakeCloudflare();
+    cloudflare.zones = [{ id: 'zone-1', name: 'example.test' }];
+    logWranglerInto(runner, cloudflare);
+
+    await deployStage(root, { stage: 'pr123', repositoryRoot: root }, dependencies(runner, cloudflare));
+
+    expect(cloudflare.mutations).toEqual([
+      'create-r2:smoo-stage-records',
+      `${RECORDED_PR123}/worker`,
+      `${RECORDED_PR123}/route/example.test/*.pr123.example.test%2F*`,
+      `${RECORDED_PR123}/dns/example.test/*.pr123.example.test`,
+      'create-dns:zone-1:*.pr123.example.test:pr123.example.test',
+      'create-route:zone-1:*.pr123.example.test/*:fixture-worker-pr123',
+      'wrangler deploy',
+    ]);
+  });
+
+  it('records a stage derived from a flat config before it creates any of it', async () => {
+    const { root, configPath } = await flatFixtureRoot();
+    const runner = new FakeRunner([], {});
+    const cloudflare = new FakeCloudflare();
+    cloudflare.namespaces = [{ id: 'kv-staging', title: 'fixture-SESSION-staging' }];
+    cloudflare.d1Databases = [{ uuid: 'd1-staging', name: 'fixture-website-staging-db' }];
+    logWranglerInto(runner, cloudflare);
+
+    await deployStage(
+      root,
+      { stage: 'pr7', repositoryRoot: root, config: configPath },
+      dependencies(runner, cloudflare),
+    );
+
+    const recorded = 'put-record:v1/github.com%2Facme%2Fapp/pr7/fixture-website-preview-pr7';
+    expect(cloudflare.mutations).toEqual([
+      'create-r2:smoo-stage-records',
+      `${recorded}/worker`,
+      `${recorded}/kv/fixture-SESSION-pr7`,
+      `${recorded}/d1/fixture-website-pr7-db`,
+      `${recorded}/route/example.test/site.pr7.example.test%2F*`,
+      'create-kv:fixture-SESSION-pr7',
+      'create-d1:fixture-website-pr7-db',
+      'wrangler d1',
+      'wrangler deploy',
+    ]);
+  });
+
+  it('records again on a push whose build is already live', async () => {
+    const root = await fixtureRoot();
+    const runner = new FakeRunner([{ id: 'version-1', annotations: { 'workers/tag': `nx-${HASH}` } }], {
+      versions: [{ version_id: 'version-1', percentage: 100 }],
+    });
+    const cloudflare = new FakeCloudflare();
+    cloudflare.buckets = [{ name: 'smoo-stage-records' }];
+
+    const result = await deployStage(root, { stage: 'pr123', repositoryRoot: root }, dependencies(runner, cloudflare));
+
+    // A stage deployed before records existed gets them on its next push, build unchanged or not.
+    expect(result.action).toBe('remote-cache-hit');
+    expect(cloudflare.mutations).toEqual([`${RECORDED_PR123}/worker`]);
+  });
+
+  it('continues when a parallel deploy creates the record bucket first', async () => {
+    const root = await fixtureRoot();
+    const cloudflare = new FakeCloudflare();
+    cloudflare.createR2Bucket = async (name) => {
+      cloudflare.buckets.push({ name });
+      throw new Error('bucket already exists');
+    };
+
+    const result = await deployStage(
+      root,
+      { stage: 'pr123', repositoryRoot: root },
+      dependencies(new FakeRunner([], {}), cloudflare),
+    );
+
+    expect(result.action).toBe('deployed');
+    expect(cloudflare.mutations).toEqual([`${RECORDED_PR123}/worker`]);
+  });
+
+  it('creates nothing when a record cannot be written, and names R2 write only for a 403', async () => {
+    for (const [status, namesPermission] of [
+      [403, true],
+      [429, false],
+    ] as const) {
+      const root = await fixtureRoot(ROUTED_FIXTURE);
+      const runner = new FakeRunner([], {});
+      const cloudflare = new FakeCloudflare();
+      cloudflare.zones = [{ id: 'zone', name: 'example.test' }];
+      const refusal = new CloudflareApiError('Cloudflare API /r2 failed: refused', status, [10000]);
+      cloudflare.putR2Object = async () => {
+        throw refusal;
+      };
+
+      const error = await deployStage(
+        root,
+        { stage: 'pr123', repositoryRoot: root },
+        dependencies(runner, cloudflare),
+      ).catch((thrown: unknown) => thrown);
+
+      expect(error).toBeInstanceOf(Error);
+      expect(error).toMatchObject({ cause: refusal });
+      const message = error instanceof Error ? error.message : '';
+      expect(message).toStartWith(
+        'Recording pr123 in R2 bucket smoo-stage-records failed, so nothing was created: Cloudflare API /r2 failed: refused',
+      );
+      expect(message.includes('The deploy token needs R2 write (Workers R2 Storage: Edit).')).toBe(namesPermission);
+      // The record bucket is the one thing that exists; nothing the stage would use does.
+      expect(cloudflare.mutations).toEqual(['create-r2:smoo-stage-records']);
+      expect(runner.calls).toEqual([]);
+    }
+  });
+
+  it('does not name R2 write when the zone listing behind a record is what was refused', async () => {
+    const root = await fixtureRoot(`${FIXTURE}
+[[env.staging.routes]]
+pattern = "site.staging.example.test/*"
+`);
+    const cloudflare = new FakeCloudflare();
+    cloudflare.listZones = async () => {
+      throw new CloudflareApiError('Cloudflare API /zones failed: refused', 403, [10000]);
+    };
+
+    const error = await deployStage(
+      root,
+      { stage: 'pr123', repositoryRoot: root },
+      dependencies(new FakeRunner([], {}), cloudflare),
+    ).catch((thrown: unknown) => thrown);
+
+    expect(error instanceof Error ? error.message : '').toBe(
+      'Recording pr123 in R2 bucket smoo-stage-records failed, so nothing was created: Cloudflare API /zones failed: refused',
     );
     expect(cloudflare.mutations).toEqual([]);
+  });
+
+  it('refuses a pull-request stage whose root manifest names no repository, before any Cloudflare call', async () => {
+    const root = await fixtureRoot();
+    await writeFile(join(root, 'package.json'), '{ "name": "@acme/app" }\n');
+    const touched: string[] = [];
+    const cloudflare = new Proxy(new FakeCloudflare(), {
+      get(target, property, receiver) {
+        touched.push(String(property));
+        return Reflect.get(target, property, receiver);
+      },
+    });
+
+    await expect(
+      deployStage(root, { stage: 'pr123', repositoryRoot: root }, dependencies(new FakeRunner([], {}), cloudflare)),
+    ).rejects.toThrow(`${join(root, 'package.json')} declares no repository`);
+    expect(touched).toEqual([]);
+
+    // Staging and production are never recorded, so they never read the root manifest.
+    const staging = await deployStage(
+      root,
+      { stage: 'staging', repositoryRoot: root },
+      dependencies(new FakeRunner([], {}), new FakeCloudflare()),
+    );
+    expect(staging.action).toBe('deployed');
   });
 });
 
@@ -1244,11 +1537,24 @@ async function withProcessEnv<T>(variables: Record<string, string>, action: () =
   }
 }
 
+/**
+ * A project directory that is also its repository's root: `nx.json`, and a root manifest naming the
+ * repository a pull-request stage is recorded under.
+ */
 async function fixtureRoot(config = FIXTURE, file = 'wrangler.toml'): Promise<string> {
   const root = await mkdtemp(join(tmpdir(), 'smoo-wrangler-test-'));
   roots.push(root);
+  await writeRepositoryRoot(root);
   await writeFile(join(root, file), config);
   return root;
+}
+
+async function writeRepositoryRoot(root: string, manifest: Record<string, unknown> = {}): Promise<void> {
+  await writeFile(join(root, 'nx.json'), '{}\n');
+  await writeFile(
+    join(root, 'package.json'),
+    `${JSON.stringify({ name: '@acme/app', repository: { type: 'git', url: 'https://github.com/acme/app.git' }, ...manifest }, null, 2)}\n`,
+  );
 }
 
 /**

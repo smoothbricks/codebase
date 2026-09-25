@@ -465,8 +465,11 @@ The bootstrap script is intentionally small. It only handles work required befor
   zone's real hostname in place of `<zone>`).
 
 Cloudflare deploys and cleanups need `CLOUDFLARE_ACCOUNT_ID` and `CLOUDFLARE_API_TOKEN`. The token needs Workers
-Scripts, Workers KV, R2, and D1 write, plus Zone DNS and Workers Routes write for preview hostnames. A token without D1
-access makes cleanup refuse before it deletes anything rather than half-clean a stage.
+Scripts, Workers KV, R2, and D1 write, plus Zone DNS and Workers Routes write for preview hostnames. A pull-request
+deploy needs R2 even in a repository that binds no R2: it records what it will create in the account's
+`smoo-stage-records` bucket first, so R2 must be enabled on the Cloudflare account (once, in the dashboard) and the
+token needs R2 write, or the deploy fails before creating anything. A token without D1 access makes cleanup refuse
+before it deletes anything rather than half-clean a stage.
 
 A wrong value type anywhere in `smoo.github` fails `smoo monorepo update` and `smoo github-ci nx-deploy` with the
 offending path, rather than silently falling back to the defaults.
@@ -851,6 +854,25 @@ resource in the `CLOUDFLARE_ACCOUNT_ID` account carrying the `prN` segment, D1 i
 token can reach are not listed. It matches on that segment alone, not on the repository, so one Cloudflare account must
 host only one repository's pull-request stages: closing pull request 7 in one repository would delete another
 repository's `pr7` Workers, KV namespaces, R2 buckets and D1 databases.
+
+Before a `prN` deploy creates anything, it records every item its plan names: the Worker, its KV namespaces, D1
+databases and R2 buckets, custom domains, routes and wildcard DNS records. Each is one empty object in the R2 bucket
+`smoo-stage-records`, keyed by repository, stage and Worker, so a deploy that fails halfway leaves nothing unrecorded.
+Items the stage finds already there are recorded too. There is one such bucket per Cloudflare account, shared by every
+repository that deploys there; never delete it. A route is recorded under its zone: `zone_name`, else the zone its
+`zone_id` names, else the most specific zone of the account containing its host. A route none of those resolves is
+refused; declare its `zone_name`.
+
+The repository is the `repository` of the workspace root's `package.json` (found by git; the root must hold `nx.json`),
+as `host/owner/repo` whatever form it is written in: `https://`, `git+ssh://`, `git@host:owner/repo`, `github:`,
+`gitlab:`, `bitbucket:` or bare `owner/repo`. A `prN` deploy without one is refused before any Cloudflare call. In CI,
+where `GITHUB_REPOSITORY` is set, its owner/repo must match, so a fork, a template copy or a copied manifest that keeps
+another repository's URL is refused rather than recorded as that repository. Renaming the repository starts new records;
+the old ones stay behind.
+
+Upgrading to a smoo that records stages: pull-request deploys now need R2, even without R2 bindings (enabled on the
+account once, in the dashboard, and R2 write on the token), and a root `package.json` with `repository`. An open pull
+request's next push records its stage. `staging` and `production` deploys record nothing and read no root manifest.
 
 - `--config` deploys ignore `CLOUDFLARE_ENV`. There is no `--env` flag for a flat config, so wrangler would otherwise
   fall back to that variable and rename the worker after it.
