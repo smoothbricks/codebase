@@ -272,11 +272,24 @@ Per-command cost does not grow with history or with the number of warm workspace
 under `/private/cowshed/store/telemetry/` (they are write-only telemetry; authority is the image inventory); the host
 APFS inventory is queried only for the cowshed container, and attaching an image lists only that image's container; one
 project open validates the repository binding and reads the inventory once for every workspace it recovers. When a
-command is still slow, the wait is in a host process, not in cowshed — while it runs,
-`ps -o pid,ppid,etime,args -ax | grep -E 'diskutil|hdiutil|git'` names it. The first `diskutil mount` of a freshly
-cloned image takes seconds on a host with dozens of attached images (the same volume re-mounts in a fraction of that
-after publication); that is DiskArbitration's cost per attached image, so `cowshed rm` what you no longer need and
-`cowshed gc` the trash.
+command is still slow on a wait in a host process, `ps -o pid,ppid,etime,args -ax | grep -E 'diskutil|hdiutil|git'`
+names it while it runs.
+
+`cowshed new` prints a `cowshed: apfs canonical/<step>` or `cowshed: new <step>` span with its elapsed time for every
+step, so the slow step is named on stderr. On a large repository two steps carry nearly all of the time:
+
+- **The first write into the fresh clone**, inside `apfs canonical/attach` or `apfs canonical/mount`, whichever writes
+  first. The clone call shares main's image extent map and returns in milliseconds; the first write to either file makes
+  APFS copy that map, at about 12 µs per extent. Main's image fragments with every write it takes while clones share its
+  blocks, so the cost grows with how long main has been in use: an image with 2.1 million extents costs 25 s on a quiet
+  host and 45–70 s on a busy one, one with 470 thousand costs 4 s, and a freshly written 4 GiB file with 256 extents
+  costs 5 ms. A one-byte write into a plain `cp -c` clone of the image file reproduces the cost with no disk image
+  attached, so it is not the mount itself and does not depend on how many images are attached. Deleting a written clone
+  (`cowshed rm`, `cowshed gc`) pays about half as much per extent. `new --from <ws>` pays the same cost for the source
+  workspace's image. Only rewriting main's image file contiguously lowers it, which needs main detached, and cowshed has
+  no verb that does it.
+- **`new links`**, the walk over the whole tree for symlinks that point outside it, which costs about 5 s over a million
+  entries.
 
 ## "cowshed volumes owned by another user"
 

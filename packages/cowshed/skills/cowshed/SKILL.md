@@ -10,11 +10,14 @@ description:
 # cowshed — warm workspaces for parallel agents
 
 A cowshed workspace is a full standalone checkout — source, `.git`, `node_modules`, `target/`, every build cache —
-cloned copy-on-write from the repository's warm `main` image. The clone itself is milliseconds; what you wait for is the
-host mounting it — `cowshed new` on a large repository takes 25–50 s on a host with dozens of attached images
-(`diskutil mount` pays DiskArbitration's per-attached-image cost, plus a few seconds of git initialization), so
-`cowshed rm` what you no longer need. A `git worktree` gives an agent a cold tree whose build cache starts empty and a
-first build that costs minutes; a cowshed workspace starts warm.
+cloned copy-on-write from the repository's warm `main` image. A `git worktree` gives an agent a cold tree whose build
+cache starts empty and a first build that costs minutes; a cowshed workspace starts warm. `cowshed new` on a large,
+long-used repository still takes tens of seconds, and nearly all of it is two steps. The clone call returns in
+milliseconds, but the clone's first write, during its attach or mount, makes APFS copy the extent map of main's image
+file. That copy costs about 12 µs per extent, and main's image fragments with every write it takes while clones share
+its blocks: 2.1 million extents cost 25 s on a quiet host and over a minute on a busy one. Then setup walks the whole
+tree for symlinks that point outside it, about 5 s over a million entries. The number of attached images does not
+matter.
 
 ## Use it
 

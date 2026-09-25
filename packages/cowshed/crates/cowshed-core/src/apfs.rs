@@ -363,19 +363,16 @@ impl Default for VolumeVisibilityGrace {
 /// The wait a just-detached whole device is given to leave the attachment inventory.
 ///
 /// `hdiutil detach` / `diskutil eject` returning zero means the kernel let go; Disk Arbitration
-/// announcing the departure to the next `attach` is a second, lagging step — the same
-/// announce-lag class [`VolumeVisibilityGrace`] covers on the attach side. The clone commit
-/// detaches its staging device and then attaches the same-UUID bytes as the canonical image
-/// back-to-back; when DA has not yet processed the departure, the re-attach stalls inside
-/// kernel/DA contention for tens of seconds (measured 24–62s; a direct `/sbin/mount_apfs`
-/// bypass hung 47.9s, so no XPC-layer workaround avoids it).
+/// announcing the departure is a second, lagging step — the same announce-lag class
+/// [`VolumeVisibilityGrace`] covers on the attach side. A verb that detaches an image and then
+/// attaches it again, as `resize` does, should not start the attach while the old device is
+/// still listed.
 ///
 /// After every whole-device detach the backend therefore polls `hdiutil info -plist` until the
 /// device is gone, logging each outcome. The bound is generous against a normally sub-second
 /// departure and the outcome is always soft: at the bound the operation proceeds exactly as it
-/// would have without the check, but loudly, so the next investigation can measure whether
-/// lingering departures correlate with hangs instead of needing dtrace. No blind sleeps: the
-/// first poll runs immediately, and a departed device costs one inventory read and no waiting.
+/// would have without the check, but loudly. No blind sleeps: the first poll runs immediately,
+/// and a departed device costs one inventory read (tens of milliseconds) and no waiting.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DetachSettleGrace {
     pub total: Duration,
@@ -1461,15 +1458,14 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
     }
 
     /// Bounded, logged confirmation that a detached whole device left the attachment
-    /// inventory before any later attach re-enters Disk Arbitration. The poll is keyed on the
-    /// device rather than an image path: after a detach there may be no image to scope by, and
-    /// the question is whether the device is gone at all.
+    /// inventory before any later attach. The poll is keyed on the device rather than an image
+    /// path: after a detach there may be no image to scope by, and the question is whether the
+    /// device is gone at all.
     ///
-    /// Soft by design, and that is the measurement contract: a lingering or unreadable
-    /// inventory is logged loudly and the operation proceeds exactly as it would have without
-    /// the check. Failing a successful detach over announcement lag would turn transient DA
-    /// slowness under load into user-facing failures; the logs will show whether lingering
-    /// departures correlate with hangs, and only then should the bound harden.
+    /// Soft by design: a lingering or unreadable inventory is logged and the operation proceeds
+    /// exactly as it would have without the check. Failing a detach that succeeded over the
+    /// inventory's announcement lag would turn a slow departure under load into a user-facing
+    /// failure.
     fn settle_detached_device(&self, whole_device: &str) {
         let mut waited = Duration::ZERO;
         loop {
@@ -1490,7 +1486,7 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
             }
             if waited >= self.settle.total {
                 eprintln!(
-                    "cowshed: apfs detach-settle {whole_device} STILL PRESENT after {:?}; proceeding — a lingering departure may stall the next attach in DA contention",
+                    "cowshed: apfs detach-settle {whole_device} STILL PRESENT after {:?}; proceeding without confirmation",
                     self.settle.total
                 );
                 return;
