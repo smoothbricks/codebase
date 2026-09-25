@@ -1607,7 +1607,13 @@ fn skill_requires_a_known_action_and_takes_no_positional_arguments() {
 /// unknown verb. CommandSpec `about` prose is not a hint call site.
 #[test]
 fn every_next_hint_verb_in_source_is_a_registered_command() {
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    // Read at runtime, not through `env!`: the per-crate runners execute one workspace-wide
+    // nextest archive, which may have been built in another checkout, and the macro would scan
+    // that checkout's source (or, once it is gone, nothing). The runner exports the remapped
+    // manifest directory of the workspace it runs in.
+    let manifest_directory = std::env::var("CARGO_MANIFEST_DIR")
+        .expect("the test runner exports CARGO_MANIFEST_DIR to the test process");
+    let root = std::path::Path::new(&manifest_directory).join("src");
     let mut source = String::new();
     collect_rust_source(&root, &mut source);
     let mut hints = HashSet::new();
