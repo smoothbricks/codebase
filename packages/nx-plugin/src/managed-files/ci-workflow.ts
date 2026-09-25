@@ -211,6 +211,14 @@ export function defineCiWorkflow(options: CiWorkflowDefinitionOptions): CiWorkfl
   return steps.map((step, index) => ({ ...step, number: index + 2 }));
 }
 
+/**
+ * CI's concurrency group, spelled literally rather than from `github.workflow`
+ * (which a forge may fill with the file name), so the PR preview cleanup can
+ * join the same group: a pull request's close then cancels its running CI and
+ * the cleanup starts only after that run's stage deploy has stopped.
+ */
+export const CI_CONCURRENCY_GROUP = 'CI-${{ github.ref }}';
+
 export function renderCiWorkflowYaml(options: CiWorkflowDefinitionOptions): string {
   const steps = defineCiWorkflow(options);
   return [
@@ -244,13 +252,13 @@ ${
   # running workflow instead of canceling it, so a newer push never cancels the
   # deploy job mid-flight. Pull requests and other branches keep canceling
   # superseded runs.
-  group: \${{ github.workflow }}-\${{ github.ref }}
+  group: ${CI_CONCURRENCY_GROUP}
   cancel-in-progress: \${{ github.ref != ${stagingRefLiteral(options)} }}`
     : `  # This workflow validates and never deploys, so there is no in-flight
   # deployment for a newer push to protect: every ref cancels its superseded
   # runs. Queuing them instead serializes the staging branch, and a burst of
   # pushes then reports the newest commit one full run per queued push late.
-  group: \${{ github.workflow }}-\${{ github.ref }}
+  group: ${CI_CONCURRENCY_GROUP}
   cancel-in-progress: true`
 }
 
