@@ -10,6 +10,7 @@ use tokio::process::Command;
 
 use crate::api::dto::GitOid;
 use crate::error::{CowshedError, Result};
+use crate::timing::timed_async;
 use crate::workspace_environment::WORKSPACE_ENVIRONMENT_PATH;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1600,20 +1601,28 @@ impl GitRepository {
         // The `.git` directory arrived by CoW carrying every remote main had, including network
         // URLs. Replaying this loop is safe: an earlier pass leaves either no remotes or the local
         // cowshed-owned `main`, which configure_main_remote recreates below.
-        for remote in self.remote_names().await? {
-            let output = self.run(["remote", "remove", remote.as_str()]).await?;
-            ensure_git_success("remove inherited remote", output)?;
-        }
-        self.restore_inherited_links(main_mount).await?;
-        let main_remote = self.configure_main_remote(main_mount).await?;
+        timed_async("new", "remotes", async {
+            for remote in self.remote_names().await? {
+                let output = self.run(["remote", "remove", remote.as_str()]).await?;
+                ensure_git_success("remove inherited remote", output)?;
+            }
+            Ok::<_, CowshedError>(())
+        })
+        .await?;
+        timed_async("new", "links", self.restore_inherited_links(main_mount)).await?;
+        let main_remote =
+            timed_async("new", "main-remote", self.configure_main_remote(main_mount)).await?;
 
-        if branch_ready {
-            let (_, branch_ref) = workspace_branch(name);
-            self.ensure_workspace_branch_checked_out(&branch, &branch_ref)
-                .await?;
-        } else {
-            self.switch_to_workspace_branch(&branch, start).await?;
-        }
+        timed_async("new", "branch", async {
+            if branch_ready {
+                let (_, branch_ref) = workspace_branch(name);
+                self.ensure_workspace_branch_checked_out(&branch, &branch_ref)
+                    .await
+            } else {
+                self.switch_to_workspace_branch(&branch, start).await
+            }
+        })
+        .await?;
         Ok(main_remote)
     }
 

@@ -4,7 +4,6 @@ pub mod rekey;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Instant;
 
 use async_trait::async_trait;
 use thiserror::Error;
@@ -18,6 +17,7 @@ use crate::metadata::{
     ImageCapacity, ImageFormat, WorkspaceIncarnation, WorkspaceName, WorkspaceRole,
 };
 use crate::repository::{OwnedRepoIds, RepoId};
+use crate::timing::timed_async;
 
 use super::lifecycle::{
     AdoptPlan, AdoptRequest, CheckpointFact, CheckpointPlan, CheckpointRef, CreatePlan,
@@ -1052,14 +1052,12 @@ where
             preserve_prepared_clone::<H>,
         );
 
-        eprintln!("cowshed: apfs canonical/init start");
-        let init_started = Instant::now();
-        let initialized = initialize(prepared.get().stage.clone()).await;
-        eprintln!(
-            "cowshed: apfs canonical/init done elapsed={:?} status={}",
-            init_started.elapsed(),
-            if initialized.is_ok() { "ok" } else { "err" }
-        );
+        let initialized = timed_async(
+            "apfs",
+            "canonical/init",
+            initialize(prepared.get().stage.clone()),
+        )
+        .await;
         if let Err(initializer) = initialized {
             // The callback can already have changed state outside the image (Git branches,
             // worktree registrations, remotes). The PendingFence is the rollback boundary: keep

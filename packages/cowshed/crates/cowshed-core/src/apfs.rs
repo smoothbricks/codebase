@@ -391,25 +391,14 @@ impl Default for DetachSettleGrace {
     }
 }
 
-/// One per-leg timing span on the existing log path (stderr, alongside the crate's other
-/// `cowshed:` diagnostics): a start line when the step begins and a done line with the waited
-/// duration and outcome, so the next mount-hang investigation reads timestamps instead of
-/// needing dtrace. Unconditional by design — captured by the test harness on success, visible
-/// in production. A wrong `leg` only mislabels a log line, never behavior.
+/// One backend step inside a [`crate::timing`] span labelled `apfs <leg>/<step>`, so a slow
+/// lifecycle verb names the storage step that spent the time.
 pub(crate) fn timed_apfs_step<T, E>(
     leg: &str,
     step: &'static str,
     operation: impl FnOnce() -> Result<T, E>,
 ) -> Result<T, E> {
-    eprintln!("cowshed: apfs {leg}/{step} start");
-    let started = std::time::Instant::now();
-    let result = operation();
-    eprintln!(
-        "cowshed: apfs {leg}/{step} done elapsed={:?} status={}",
-        started.elapsed(),
-        if result.is_ok() { "ok" } else { "err" }
-    );
-    result
+    crate::timing::timed(format_args!("apfs {leg}/{step}"), operation)
 }
 
 /// The leg a backend step serves, derived from the image path it touches: staging state lives

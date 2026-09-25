@@ -31,6 +31,7 @@ use crate::metadata::WorkspaceName;
 #[cfg(target_os = "macos")]
 use crate::repository::OwnedRepoIds;
 use crate::repository::{RepoId, RepositoryBinding};
+use crate::timing::timed_async;
 
 const ROUTER_CAPACITY: usize = 64;
 const STARTUP_LIFECYCLE_ATTEMPTS: usize = 8;
@@ -4626,7 +4627,12 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
             let receipt = self
                 .substrate
                 .execute_create_staged(plan, move |stage| async move {
-                    crate::inherited_daemons::macos::discard_in(&stage.mount_point).await?;
+                    timed_async(
+                        "new",
+                        "daemons",
+                        crate::inherited_daemons::macos::discard_in(&stage.mount_point),
+                    )
+                    .await?;
                     let repository = crate::git::GitRepository::from_root(&stage.mount_point);
                     if git_worktree {
                         // Registration may have replaced the cloned `.git` directory with a
@@ -4642,7 +4648,12 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                             .await?;
                         repository.ensure_workspace_environment_wiring().await?;
                     } else {
-                        repository.ensure_workspace_environment_wiring().await?;
+                        timed_async(
+                            "new",
+                            "environment",
+                            repository.ensure_workspace_environment_wiring(),
+                        )
+                        .await?;
                         repository
                             .prepare_workspace_resumable(
                                 &destination.to_string(),
@@ -4655,7 +4666,12 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                     // A sandboxed child reads this file as its whole global Git configuration.
                     // Capturing at mint is what makes `git commit` in a fresh workspace author
                     // as the operator instead of failing for want of an identity.
-                    repository.inherit_identity_from(&source_mount).await
+                    timed_async(
+                        "new",
+                        "identity",
+                        repository.inherit_identity_from(&source_mount),
+                    )
+                    .await
                 })
                 .await
                 .map_err(native_staged_error)?;
@@ -4663,21 +4679,29 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
             if options.register {
                 self.register_workspace_in_main(&workspace).await?;
             }
-            self.commitments
-                .record(super::supervisor::CommitmentDraft::WorkspaceIntroduced {
-                    repo_id: self.descriptor.repo_id.clone(),
-                    workspace_incarnation: receipt.workspace.incarnation().clone(),
-                })
-                .await?;
-            self.complete_lifecycle_intent(
-                &workspace,
-                crate::storage::recovery::LifecycleIntentCompletion::Workspace(
-                    receipt.workspace.incarnation().clone(),
+            timed_async(
+                "new",
+                "commitment",
+                self.commitments
+                    .record(super::supervisor::CommitmentDraft::WorkspaceIntroduced {
+                        repo_id: self.descriptor.repo_id.clone(),
+                        workspace_incarnation: receipt.workspace.incarnation().clone(),
+                    }),
+            )
+            .await?;
+            timed_async(
+                "new",
+                "journal",
+                self.complete_lifecycle_intent(
+                    &workspace,
+                    crate::storage::recovery::LifecycleIntentCompletion::Workspace(
+                        receipt.workspace.incarnation().clone(),
+                    ),
                 ),
             )
             .await?;
-            self.ensure_supervisor(&workspace).await?;
-            self.snapshot_named(&workspace).await
+            timed_async("new", "supervisor", self.ensure_supervisor(&workspace)).await?;
+            timed_async("new", "snapshot", self.snapshot_named(&workspace)).await
         }
         .await
     }
