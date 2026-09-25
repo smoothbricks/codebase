@@ -168,7 +168,8 @@ export interface PullRequestResourcePlan {
   kvNamespaces: PullRequestKvResource[];
   d1Databases: PullRequestD1Resource[];
   r2Buckets: R2Binding[];
-  routes: Array<{ pattern: string; zoneName?: string; customDomain: boolean }>;
+  /** `zoneId` is the route's `zone_id`, which names its zone when `zone_name` does not. */
+  routes: Array<{ pattern: string; zoneName?: string; zoneId?: string; customDomain: boolean }>;
 }
 export interface ConfiguredStageResourcePlan {
   stage: DeploymentStage;
@@ -291,6 +292,7 @@ export function planPullRequestBindings(
     .map((route) => ({
       pattern: replaceHostnameLabel(route.pattern, stage),
       ...(typeof route.zone_name === 'string' ? { zoneName: route.zone_name } : {}),
+      ...(typeof route.zone_id === 'string' ? { zoneId: route.zone_id } : {}),
       customDomain: route.custom_domain === true,
     }));
   return {

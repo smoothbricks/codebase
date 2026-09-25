@@ -3,7 +3,12 @@ import { readFile, rm, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { parseJsonFileText } from '../lib/json.js';
 import { mergeEnv, printCommandOutput } from '../lib/run.js';
-import { type CloudflareClient, CloudflareRestClient, type D1DatabaseRecord } from './cloudflare.js';
+import {
+  CloudflareApiError,
+  type CloudflareClient,
+  CloudflareRestClient,
+  type D1DatabaseRecord,
+} from './cloudflare.js';
 import { type FlatWranglerConfig, parseFlatWranglerConfig } from './flat-config.js';
 import {
   awaitLiveVersion,
@@ -33,6 +38,13 @@ import {
   pullRequestStage,
 } from './stage.js';
 import { wildcardDnsRecord } from './stage-labels.js';
+import {
+  plannedStageRecords,
+  STAGE_RECORDS_BUCKET,
+  stageRecordKeys,
+  stageRecordScope,
+  zoneContaining,
+} from './stage-records.js';
 import {
   planStageSecrets,
   readDeclaredSecretNames,
@@ -102,6 +114,8 @@ export interface DeployStageResult {
 export interface DeployStageOptions {
   /** `staging`, `production`, or `prN`. */
   stage: string;
+  /** The repository root; its package.json names the repository a `prN` stage is recorded under. */
+  repositoryRoot: string;
   /** A build-generated flat wrangler.json to deploy instead of the project's own config (see `prepareFlatConfig`). */
   config?: string;
   /**
@@ -119,6 +133,8 @@ export async function deployStage(
 ): Promise<DeployStageResult> {
   const stage = parseDeploymentStage(options.stage);
   const processEnv = dependencies.processEnv ?? process.env;
+  // Before any Cloudflare call: a stage whose records cannot be scoped must not start creating.
+  const recordScope = isPullRequestStage(stage) ? stageRecordScope(options.repositoryRoot, processEnv) : undefined;
   const accountId = processEnv.CLOUDFLARE_ACCOUNT_ID;
   const apiToken = processEnv.CLOUDFLARE_API_TOKEN;
   if (!accountId) throw new Error('CLOUDFLARE_ACCOUNT_ID is required.');
@@ -135,12 +151,13 @@ export async function deployStage(
     if (value) secretValues[name] = value;
   }
   const gate = stageSecretGate(secretPlan, new Set(Object.keys(secretValues)), cloudflare);
+  const record = stageRecorder(recordScope, cloudflare);
   let temporaryConfigPath: string | undefined;
   let temporarySecretsPath: string | undefined;
   try {
     const prepared = options.config
-      ? await prepareFlatConfig(options.config, stage, accountId, gate, cloudflare)
-      : await prepareSourceConfig(cwd, stage, accountId, gate, cloudflare);
+      ? await prepareFlatConfig(options.config, stage, accountId, gate, record, cloudflare)
+      : await prepareSourceConfig(cwd, stage, accountId, gate, record, cloudflare);
     temporaryConfigPath = prepared.temporaryConfigPath;
     // The pull-request path already ran this before provisioning; the gate answers once per Worker.
     // Everything below here writes to Cloudflare.
@@ -252,6 +269,7 @@ async function prepareSourceConfig(
   stage: DeploymentStage,
   accountId: string,
   gate: SecretGate,
+  record: StageRecorder,
   cloudflare: CloudflareClient,
 ): Promise<PreparedConfig> {
   const source = readWranglerSourceConfig(cwd);
@@ -265,7 +283,13 @@ async function prepareSourceConfig(
   }
   const liveNamespaces = await cloudflare.listKvNamespaces();
   const plan = planPullRequestResources(source.document, stage, liveNamespaces);
-  const { kvNamespaceIds, d1DatabaseIds } = await provisionPullRequestResources(plan, gate, cloudflare, liveNamespaces);
+  const { kvNamespaceIds, d1DatabaseIds } = await provisionPullRequestResources(
+    plan,
+    gate,
+    record,
+    cloudflare,
+    liveNamespaces,
+  );
   const derived = derivePullRequestDocument(source.document, { stage, accountId, kvNamespaceIds, d1DatabaseIds });
   // JSON whatever the source format was: wrangler picks its parser by extension, and a file
   // written to be read once and deleted has no reader for the comments a TOML rewrite preserved.
@@ -286,6 +310,7 @@ async function prepareFlatConfig(
   stage: DeploymentStage,
   accountId: string,
   gate: SecretGate,
+  record: StageRecorder,
   cloudflare: CloudflareClient,
 ): Promise<PreparedConfig> {
   const flat = parseJsonFileText(configPath, await readFile(configPath, 'utf8'), parseFlatWranglerConfig);
@@ -298,7 +323,13 @@ async function prepareFlatConfig(
   }
   const liveNamespaces = await cloudflare.listKvNamespaces();
   const plan = planPullRequestBindings(flat, stage, liveNamespaces);
-  const { kvNamespaceIds, d1DatabaseIds } = await provisionPullRequestResources(plan, gate, cloudflare, liveNamespaces);
+  const { kvNamespaceIds, d1DatabaseIds } = await provisionPullRequestResources(
+    plan,
+    gate,
+    record,
+    cloudflare,
+    liveNamespaces,
+  );
   const derived = derivePullRequestStageConfig(flat, { stage, accountId, kvNamespaceIds, d1DatabaseIds });
   // Beside the original: its main/assets/migrations paths are relative to the file.
   const temporaryConfigPath = join(dirname(configPath), `.wrangler.smoo-${process.pid}-${randomUUID()}.json`);
@@ -376,20 +407,78 @@ async function assertStageSecrets(
   if (refusal) throw new Error(refusal);
 }
 
-/** Isolation refusals already ran in the plan; the gate below is the last one before the first write. */
+/**
+ * Isolation refusals already ran in the plan; the gate below is the last one before the first write,
+ * and the record the first write. Everything this deploy creates afterwards, here, in reconcile and
+ * in `wrangler deploy`, is already recorded, so a deploy that dies halfway leaves nothing unrecorded.
+ */
 async function provisionPullRequestResources(
   plan: PullRequestResourcePlan,
   gate: SecretGate,
+  record: StageRecorder,
   cloudflare: CloudflareClient,
   liveNamespaces: LiveKvNamespace[],
 ): Promise<{ kvNamespaceIds: Map<string, string>; d1DatabaseIds: Map<string, string> }> {
   await gate(plan.workerName);
+  await record(plan);
   const kvNamespaceIds = await ensureKvNamespaces(plan.kvNamespaces, liveNamespaces, cloudflare);
   const d1DatabaseIds =
     plan.d1Databases.length === 0
       ? new Map<string, string>()
       : await ensureD1Databases(plan.d1Databases, await cloudflare.listD1Databases(), cloudflare);
   return { kvNamespaceIds, d1DatabaseIds };
+}
+
+/**
+ * Writes down, in the account's `smoo-stage-records` bucket, every item a pull-request plan will
+ * create (`stage-records.ts`). Items the stage finds already there are recorded too: they carry the
+ * stage's name, so they are its own, and that is how a stage deployed before records existed gets
+ * them on its next push.
+ */
+type StageRecorder = (plan: PullRequestResourcePlan) => Promise<void>;
+
+function stageRecorder(scope: string | undefined, cloudflare: CloudflareClient): StageRecorder {
+  return async (plan) => {
+    if (scope === undefined) {
+      throw new Error(`${plan.stage} was planned as a pull-request stage without a record scope.`);
+    }
+    let writing = false;
+    try {
+      const keys = stageRecordKeys(scope, plan.stage, await plannedStageRecords(plan, () => cloudflare.listZones()));
+      writing = true;
+      await ensureR2Bucket(STAGE_RECORDS_BUCKET, await r2BucketNames(cloudflare), cloudflare);
+      // One after another: parallel writes would only trade a clear first failure for several.
+      for (const key of keys) await cloudflare.putR2Object(STAGE_RECORDS_BUCKET, key, '');
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      // Only a refusal of the R2 calls names the permission: a 429, a 5xx or a network failure is
+      // not one, and neither is a zone listing refused while planning the records.
+      const refused = writing && error instanceof CloudflareApiError && error.status === 403;
+      const reason = refused
+        ? `${detail.replace(/\.$/, '')}. The deploy token needs R2 write (Workers R2 Storage: Edit).`
+        : detail;
+      const message = `Recording ${plan.stage} in R2 bucket ${STAGE_RECORDS_BUCKET} failed, so nothing was created: ${reason}`;
+      throw new Error(message, { cause: error });
+    }
+  };
+}
+
+async function r2BucketNames(cloudflare: CloudflareClient): Promise<Set<string>> {
+  return new Set((await cloudflare.listR2Buckets()).map((bucket) => bucket.name));
+}
+
+/**
+ * Creates the bucket unless `existing` names it. A create that fails because a parallel deploy made
+ * the bucket first is a success.
+ */
+async function ensureR2Bucket(name: string, existing: Set<string>, cloudflare: CloudflareClient): Promise<void> {
+  if (existing.has(name)) return;
+  try {
+    await cloudflare.createR2Bucket(name);
+  } catch (error) {
+    if (!(await r2BucketNames(cloudflare)).has(name)) throw error;
+  }
+  existing.add(name);
 }
 
 /** Creates every planned namespace that is not live yet, mapping staging ids to the stage's own ids. */
@@ -556,16 +645,9 @@ async function reconcileStageResources(
     }
   }
 
-  const buckets = new Set((await cloudflare.listR2Buckets()).map((bucket) => bucket.name));
+  const buckets = await r2BucketNames(cloudflare);
   for (const binding of plan.r2Buckets) {
-    if (buckets.has(binding.bucketName)) continue;
-    try {
-      await cloudflare.createR2Bucket(binding.bucketName);
-    } catch (error) {
-      const exists = (await cloudflare.listR2Buckets()).some((bucket) => bucket.name === binding.bucketName);
-      if (!exists) throw error;
-    }
-    buckets.add(binding.bucketName);
+    await ensureR2Bucket(binding.bucketName, buckets, cloudflare);
   }
 
   const zones = await cloudflare.listZones();
@@ -604,11 +686,7 @@ async function reconcileStageResources(
     if (existing) {
       throw new Error(`Custom domain ${route.pattern} is already attached to ${existing.service ?? 'another Worker'}.`);
     }
-    const zone = route.zoneName
-      ? zoneByName.get(route.zoneName)
-      : zones
-          .filter((candidate) => route.pattern === candidate.name || route.pattern.endsWith(`.${candidate.name}`))
-          .sort((left, right) => right.name.length - left.name.length)[0];
+    const zone = route.zoneName ? zoneByName.get(route.zoneName) : zoneContaining(zones, route.pattern);
     if (!zone) throw new Error(`No accessible Cloudflare zone contains custom domain ${route.pattern}.`);
     await cloudflare.createWorkerDomain(route.pattern, plan.workerName, zone.id);
   }

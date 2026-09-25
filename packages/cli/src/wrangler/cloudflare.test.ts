@@ -418,3 +418,52 @@ describe('CloudflareRestClient reads that carry nothing', () => {
     expect(String(error)).toContain('/accounts/account-1/d1/database');
   });
 });
+
+describe('CloudflareRestClient R2 objects', () => {
+  it('puts an object at the key, each segment percent-encoded once and its slashes literal', async () => {
+    const requests: Array<{ call: string; contentType: string | null; body: unknown }> = [];
+    const client = new CloudflareRestClient('account-1', 'token', async (input, init) => {
+      requests.push({
+        call: `${init?.method ?? 'GET'} ${input}`,
+        contentType: new Headers(init?.headers).get('Content-Type'),
+        body: init?.body,
+      });
+      return new Response(JSON.stringify({ success: true, result: { key: 'stored' } }), { status: 200 });
+    });
+
+    await client.putR2Object('smoo-stage-records', 'v1/github.com%2Facme%2Fapp/pr7/web-pr7/route/example.com/*', '');
+
+    expect(requests).toEqual([
+      {
+        call: `PUT ${V4}/accounts/account-1/r2/buckets/smoo-stage-records/objects/v1/github.com%252Facme%252Fapp/pr7/web-pr7/route/example.com/*`,
+        contentType: 'application/octet-stream',
+        body: '',
+      },
+    ]);
+  });
+
+  it('sends the prefix on every cursor page and keeps only the keys under it', async () => {
+    const { fetcher, calls } = pageFetcher([
+      {
+        success: true,
+        result: { objects: [{ key: 'v1/scope/pr7/web-pr7/worker' }, { key: 'v1/scope/pr70/web-pr70/worker' }] },
+        result_info: { cursor: 'cursor-2', is_truncated: true },
+      },
+      {
+        success: true,
+        result: { objects: [{ key: 'v1/scope/pr7/web-pr7/kv/web-sessions-pr7' }] },
+        result_info: { is_truncated: false },
+      },
+    ]);
+    const client = new CloudflareRestClient('account-1', 'token', fetcher);
+
+    await expect(client.listR2Objects('smoo-stage-records', 'v1/scope/pr7/')).resolves.toEqual([
+      'v1/scope/pr7/web-pr7/worker',
+      'v1/scope/pr7/web-pr7/kv/web-sessions-pr7',
+    ]);
+    expect(calls).toEqual([
+      `GET ${V4}/accounts/account-1/r2/buckets/smoo-stage-records/objects?prefix=v1%2Fscope%2Fpr7%2F&per_page=1000`,
+      `GET ${V4}/accounts/account-1/r2/buckets/smoo-stage-records/objects?prefix=v1%2Fscope%2Fpr7%2F&per_page=1000&cursor=cursor-2`,
+    ]);
+  });
+});
