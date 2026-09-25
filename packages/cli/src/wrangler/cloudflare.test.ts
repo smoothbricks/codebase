@@ -265,7 +265,24 @@ describe('CloudflareRestClient page-numbered listings', () => {
     const client = new CloudflareRestClient('account-1', 'token', fetcher);
 
     await expect(client.listZones()).resolves.toHaveLength(1);
-    expect(calls).toEqual([`GET ${V4}/zones?per_page=50&page=1`]);
+    expect(calls).toEqual([`GET ${V4}/zones?account.id=account-1&per_page=50&page=1`]);
+  });
+
+  it("lists only the zones of the client's account, on every page", async () => {
+    // Unfiltered, `GET /zones` answers every account the token reaches, and a Worker route or custom
+    // domain can only bind a zone of the Worker's own account.
+    const zones = Array.from({ length: 50 }, (_, i) => ({ id: `zone-${i}`, name: `z${i}.example.test` }));
+    const { fetcher, calls } = pageFetcher([
+      { success: true, result: zones, result_info: { total_pages: 2 } },
+      { success: true, result: [{ id: 'zone-50', name: 'z50.example.test' }], result_info: { total_pages: 2 } },
+    ]);
+    const client = new CloudflareRestClient('account-1', 'token', fetcher);
+
+    await expect(client.listZones()).resolves.toHaveLength(51);
+    expect(calls).toEqual([
+      `GET ${V4}/zones?account.id=account-1&per_page=50&page=1`,
+      `GET ${V4}/zones?account.id=account-1&per_page=50&page=2`,
+    ]);
   });
 
   it('refuses a listing that never reports its end', async () => {

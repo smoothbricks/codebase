@@ -844,7 +844,10 @@ staging template and derives a copy beside it: worker name (`<base>-prN` from a 
 hostname label (hosts without a `staging` label are pinned to staging and dropped; a template whose routes are all
 pinned is refused, since the stage would deploy unrouted), KV namespaces created by title, R2 buckets, D1 databases
 created by name with their migrations applied, `services` bindings and rate limits. Cleanup (`cleanup-pr`) removes every
-resource carrying the `prN` segment, D1 included.
+resource in the `CLOUDFLARE_ACCOUNT_ID` account carrying the `prN` segment, D1 included; zones of other accounts the
+token can reach are not listed. It matches on that segment alone, not on the repository, so one Cloudflare account must
+host only one repository's pull-request stages: closing pull request 7 in one repository would delete another
+repository's `pr7` Workers, KV namespaces, R2 buckets and D1 databases.
 
 - `--config` deploys ignore `CLOUDFLARE_ENV`. There is no `--env` flag for a flat config, so wrangler would otherwise
   fall back to that variable and rename the worker after it.

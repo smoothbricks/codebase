@@ -164,7 +164,7 @@ export class CloudflareRestClient implements CloudflareClient {
   private readonly accountPath: string;
 
   constructor(
-    accountId: string,
+    private readonly accountId: string,
     private readonly apiToken: string,
     private readonly fetcher: CloudflareFetcher = fetch,
   ) {
@@ -260,7 +260,10 @@ export class CloudflareRestClient implements CloudflareClient {
   }
 
   listZones(): Promise<CloudflareZone[]> {
-    return this.listPages('/zones', isCloudflareZones, ZONE_PAGE_SIZE);
+    // Unfiltered, `GET /zones` answers the zones of every account the token reaches. A Worker route or
+    // custom domain binds only a zone of the Worker's own account, and every other listing here is
+    // scoped to that account, so zones are too.
+    return this.listPages('/zones', isCloudflareZones, ZONE_PAGE_SIZE, { 'account.id': this.accountId });
   }
 
   listWorkerRoutes(zoneId: string): Promise<WorkerRoute[]> {
@@ -326,10 +329,16 @@ export class CloudflareRestClient implements CloudflareClient {
     return envelope.result;
   }
 
-  private async listPages<T>(path: string, isItems: (value: unknown) => value is T[], perPage: number): Promise<T[]> {
+  private async listPages<T>(
+    path: string,
+    isItems: (value: unknown) => value is T[],
+    perPage: number,
+    filter: Record<string, string> = {},
+  ): Promise<T[]> {
     const items: T[] = [];
     for (let page = 1; page <= MAX_LIST_PAGES; page += 1) {
-      const envelope = await this.request(`${path}?per_page=${perPage}&page=${page}`);
+      const query = new URLSearchParams({ ...filter, per_page: String(perPage), page: String(page) });
+      const envelope = await this.request(`${path}?${query.toString()}`);
       if (!isItems(envelope.result)) {
         throw new Error(`Cloudflare returned an invalid paginated result for ${path}.`);
       }
