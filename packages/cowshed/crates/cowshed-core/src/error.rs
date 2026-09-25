@@ -107,6 +107,40 @@ impl CowshedError {
         Self::new(ErrorCode::Integrity, message, hint)
     }
 
+    /// An operation on cowshed's own storage failed; `hint` is the repair for a storage fault.
+    ///
+    /// EPERM anywhere in `source`'s chain is not a storage fault. Permission bits answer EACCES;
+    /// EPERM is a sandbox refusing a path it withholds from the calling process — an agent
+    /// harness shell, or a `cowshed exec` child calling cowshed again, typically allowed to
+    /// open the store's existing lock files but not to create the temp file every durable
+    /// publication starts with. The store is intact then, so "repair storage" would send the
+    /// caller after a defect that does not exist: the move is to run the verb where the store is
+    /// writable.
+    pub fn storage_failure(
+        message: impl Into<String>,
+        source: &(dyn std::error::Error + 'static),
+        hint: impl Into<String>,
+    ) -> Self {
+        let mut cause = Some(source);
+        while let Some(error) = cause {
+            if error
+                .downcast_ref::<std::io::Error>()
+                .and_then(std::io::Error::raw_os_error)
+                == Some(libc::EPERM)
+            {
+                return Self::sandbox_denied(
+                    format!(
+                        "{}: the process running cowshed is sandboxed away from cowshed's store",
+                        message.into()
+                    ),
+                    "rerun the command from a shell whose sandbox allows writing the cowshed store",
+                );
+            }
+            cause = error.source();
+        }
+        Self::environment_missing(message, hint)
+    }
+
     pub fn internal(message: impl Into<String>) -> Self {
         Self::new(ErrorCode::Internal, message, "cowshed doctor --json")
     }
@@ -202,6 +236,40 @@ mod tests {
             assert_eq!(json, spelling);
             let back: ErrorCode = serde_json::from_value(json).expect("error code deserializes");
             assert_eq!(back, code);
+        }
+    }
+
+    #[test]
+    fn a_sandbox_refusing_a_store_write_is_sandbox_denied_not_a_storage_fault() {
+        let refused = std::io::Error::from_raw_os_error(libc::EPERM);
+        let error =
+            CowshedError::storage_failure("cannot persist journal", &refused, "repair storage");
+        assert_eq!(error.code, ErrorCode::SandboxDenied);
+        assert!(error.message.starts_with("cannot persist journal: "));
+        assert!(
+            error
+                .hint
+                .contains("sandbox allows writing the cowshed store")
+        );
+
+        // Found through a wrapping error's source chain, the way storage errors carry it.
+        let wrapped = crate::metadata::MetadataError::Io {
+            path: "/store/.journal.tmp.1".into(),
+            source: std::io::Error::from_raw_os_error(libc::EPERM),
+        };
+        let error = CowshedError::storage_failure("cannot persist journal", &wrapped, "repair");
+        assert_eq!(error.code, ErrorCode::SandboxDenied);
+    }
+
+    #[test]
+    fn a_store_write_failing_for_any_other_reason_keeps_the_storage_repair() {
+        for errno in [libc::EACCES, libc::ENOSPC, libc::ENOENT] {
+            let failed = std::io::Error::from_raw_os_error(errno);
+            let error =
+                CowshedError::storage_failure("cannot persist journal", &failed, "repair storage");
+            assert_eq!(error.code, ErrorCode::EnvironmentMissing, "errno {errno}");
+            assert_eq!(error.message, "cannot persist journal");
+            assert_eq!(error.hint, "repair storage");
         }
     }
 

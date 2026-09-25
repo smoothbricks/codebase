@@ -205,11 +205,12 @@ impl LifecycleIntentJournal {
     pub fn persist(&self, path: &Path) -> CowshedResult<()> {
         self.validate()?;
         write_json(path, self).map_err(|error| {
-            CowshedError::environment_missing(
+            CowshedError::storage_failure(
                 format!(
                     "cannot persist lifecycle intent journal {}: {error}",
                     path.display()
                 ),
+                &error,
                 "repair cowshed storage and retry the lifecycle operation",
             )
         })
@@ -450,11 +451,12 @@ impl RepositoryIdentityIntent {
         self.validate(store_root)?;
         let path = Self::path(store_root);
         write_json(&path, self).map_err(|error| {
-            CowshedError::environment_missing(
+            CowshedError::storage_failure(
                 format!(
                     "cannot persist repository identity intent {}: {error}",
                     path.display()
                 ),
+                &error,
                 "repair cowshed storage and retry `cowshed mv main --repo-id`",
             )
         })
@@ -482,11 +484,12 @@ impl RepositoryIdentityIntent {
         match std::fs::remove_file(&path) {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(CowshedError::environment_missing(
+            Err(error) => Err(CowshedError::storage_failure(
                 format!(
                     "cannot clear repository identity intent {}: {error}",
                     path.display()
                 ),
+                &error,
                 "repair cowshed storage and retry `cowshed mv main --repo-id`",
             )),
         }

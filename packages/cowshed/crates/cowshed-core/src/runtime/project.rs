@@ -1787,11 +1787,12 @@ impl NativeProjectRuntimeHost {
                 CowshedError::internal(format!("project storage provisioning task failed: {error}"))
             })?
             .map_err(|error| {
-                CowshedError::environment_missing(
+                CowshedError::storage_failure(
                     format!(
                         "cannot provision project storage {}: {error}",
                         project_root.display()
                     ),
+                    &error,
                     "repair cowshed storage and retry adoption",
                 )
             })?;
@@ -9117,9 +9118,11 @@ fn native_storage_error(error: crate::storage::apfs::ApfsStorageError) -> Cowshe
         | crate::storage::apfs::ApfsStorageError::Host(message) => {
             CowshedError::integrity(message, "cowshed doctor --json")
         }
-        other => {
-            CowshedError::environment_missing(other.to_string(), "repair APFS storage and retry")
-        }
+        other => CowshedError::storage_failure(
+            other.to_string(),
+            &other,
+            "repair APFS storage and retry",
+        ),
     }
 }
 

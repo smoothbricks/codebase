@@ -95,3 +95,6 @@ direnv users need nothing extra.
   exits; `cowshed --help` documents the mapping. Under `exec`, the child's status passes through.
 - A missing host volume is `environment-missing`: run `cowshed doctor`, then its `next:` command. `doctor` mutates
   nothing.
+- `sandbox-denied` from a lifecycle verb such as `new` or `rm` means the shell running cowshed is itself sandboxed away
+  from cowshed's store (the kernel answered EPERM on a store path). The store is intact; rerun the verb from a shell
+  whose sandbox allows writing the store.

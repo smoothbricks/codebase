@@ -13,16 +13,16 @@ Every cowshed command follows the same I/O discipline:
   `cowshed:`; suggested follow-up commands are prefixed `next:`. Agents and humans read the same hints.
 - **Exit codes** are stable:
 
-| Code | Meaning                          | Typical cause                                                                                                                       |
-| ---- | -------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
-| 0    | ok                               | —                                                                                                                                   |
-| 1    | internal error (bug — report it) | panic, unexpected hdiutil/diskutil failure                                                                                          |
-| 2    | usage                            | unknown flag, missing argument                                                                                                      |
-| 3    | not-found                        | no such workspace/project/checkpoint                                                                                                |
-| 4    | conflict                         | name in use, workspace busy, restore over unsaved work                                                                              |
-| 5    | env-missing                      | gateway, storage, mount, or executable unavailable; configured devenv refresh failed                                                |
-| 6    | sandbox-denied                   | command blocked by the sandbox, confirmed by authoritative evidence; stderr names the path/domain and the grant that would allow it |
-| 7    | integrity                        | committed job content missing, mutated, rolled back, or from outside the workspace's lineage                                        |
+| Code | Meaning                          | Typical cause                                                                                                                                                                                                                         |
+| ---- | -------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 0    | ok                               | —                                                                                                                                                                                                                                     |
+| 1    | internal error (bug — report it) | panic, unexpected hdiutil/diskutil failure                                                                                                                                                                                            |
+| 2    | usage                            | unknown flag, missing argument                                                                                                                                                                                                        |
+| 3    | not-found                        | no such workspace/project/checkpoint                                                                                                                                                                                                  |
+| 4    | conflict                         | name in use, workspace busy, restore over unsaved work                                                                                                                                                                                |
+| 5    | env-missing                      | gateway, storage, mount, or executable unavailable; configured devenv refresh failed                                                                                                                                                  |
+| 6    | sandbox-denied                   | command blocked by the sandbox, confirmed by authoritative evidence; stderr names the path/domain and the grant that would allow it; also the shell running cowshed being sandboxed away from cowshed's store (EPERM on a store path) |
+| 7    | integrity                        | committed job content missing, mutated, rolled back, or from outside the workspace's lineage                                                                                                                                          |
 
 `cowshed exec` passes the child's exit code through **unchanged**; failures of cowshed's own exec wrapper (mount gone
 mid-run, profile generation failed, integrity verification failed, …) use 100–106 so they can never collide with a child
