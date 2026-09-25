@@ -4306,6 +4306,48 @@ mod rebase_recovery_tests {
             .expect("a following cowshed rebase can start");
         std::fs::remove_dir_all(root).expect("remove fixture repository");
     }
+
+    #[tokio::test]
+    async fn a_dirty_tree_refuses_even_under_autostash_instead_of_succeeding_over_conflicts() {
+        let root = std::env::temp_dir().join(format!(
+            "cowshed-rebase-autostash-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&root).expect("create fixture repository");
+        run_git(&root, &["init", "--initial-branch=main"]);
+        run_git(&root, &["config", "user.name", "Cowshed Test"]);
+        run_git(&root, &["config", "user.email", "cowshed@example.invalid"]);
+        // Set here rather than inherited, so the fixture reproduces the operator configuration
+        // under which git's autostash re-apply conflicted and still exited 0.
+        run_git(&root, &["config", "rebase.autoStash", "true"]);
+        commit_file(&root, "base\n", "base");
+        run_git(&root, &["checkout", "-b", "workspace"]);
+        let source_head = git_oid(&root).await.expect("source head");
+        run_git(&root, &["checkout", "main"]);
+        commit_file(&root, "main\n", "main side");
+        run_git(&root, &["checkout", "workspace"]);
+        std::fs::write(root.join("README.md"), "uncommitted\n").expect("dirty the tree");
+
+        let error = run_git_rebase_atomically(&root, "main", &source_head)
+            .await
+            .expect_err("a dirty tree is refused, not autostashed");
+        assert_eq!(error.code, crate::error::ErrorCode::Conflict);
+        assert!(
+            error.hint.contains("uncommitted work"),
+            "the refusal names the move: {}",
+            error.hint
+        );
+
+        let status = git(&root, &["status", "--porcelain"]);
+        assert_eq!(
+            String::from_utf8_lossy(&status.stdout),
+            " M README.md\n",
+            "the uncommitted change is still in place and nothing is unmerged"
+        );
+        assert_eq!(git_oid(&root).await.expect("unmoved head"), source_head);
+        assert!(git(&root, &["stash", "list"]).stdout.is_empty());
+        std::fs::remove_dir_all(root).expect("remove fixture repository");
+    }
 }
 #[cfg(target_os = "macos")]
 #[async_trait]
@@ -8055,7 +8097,12 @@ async fn run_git_rebase_atomically(root: &Path, onto: &str, source_head: &GitOid
     let rebase_state = [git_dir.join("rebase-merge"), git_dir.join("rebase-apply")];
     let had_rebase_state = rebase_state.iter().any(|path| path.exists());
 
-    let output = invoke(root, &["rebase", onto]).await?;
+    // `--no-autostash` overrides a user's `rebase.autoStash`. Autostash stashes a dirty tree,
+    // rebases, then re-applies the stash; a re-apply that conflicts leaves unmerged paths and a
+    // parked stash yet exits 0, so this verb would report success over a conflicted tree. Without
+    // it git refuses a dirty tree before touching anything, which the classifier below turns into
+    // "commit or discard the uncommitted work".
+    let output = invoke(root, &["rebase", "--no-autostash", onto]).await?;
     let primary = match require_git_success("git operation", &output) {
         Ok(()) => return Ok(()),
         Err(error) => error,
@@ -8230,6 +8277,7 @@ fn require_git_success(operation: &str, output: &std::process::Output) -> Result
             || stderr.contains("would be overwritten by checkout")
             || stderr.contains("untracked working tree files would be overwritten")
             || stderr.contains("cannot rebase: Your index contains uncommitted changes")
+            || stderr.contains("cannot rebase: You have unstaged changes")
         {
             CowshedError::conflict(
                 message,
