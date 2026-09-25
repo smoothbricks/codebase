@@ -8,7 +8,6 @@ publish.workspace = true
 repository.workspace = true
 
 [dependencies]
-columine-types = { path = "../columine-types" }
 arrow-ipc = { workspace = true }
 arrow-schema = { workspace = true }
 
