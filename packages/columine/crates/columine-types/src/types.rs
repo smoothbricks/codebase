@@ -372,12 +372,12 @@ impl StructFieldType {
     }
 }
 
-/// Eviction entries use a 16-byte, 16-aligned representation on native and
-/// wasm32 targets. `repr(C, align(16))` preserves that layout and its
-/// little-endian byte image (`timestamp@0`, `key_or_idx@8`, `value@12`).
-///
-/// The 16-byte alignment is required by the typed accessors; offsets must
-/// remain aligned when TTL buffers are laid out.
+/// One eviction-index entry: `timestamp:f64 @0`, `key_or_idx:u32 @8`,
+/// `value:u32 @12`, 16 bytes. `repr(C, align(16))` pins those offsets and the
+/// size TTL buffer layout multiplies by. The VM and the TypeScript host read
+/// and write entries through explicit little-endian accessors at these
+/// offsets, never through the struct's in-memory image, so the stored bytes do
+/// not depend on the host's byte order.
 #[repr(C, align(16))]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct EvictionEntry {
@@ -848,166 +848,6 @@ pub struct V2i64 {
     pub lanes: [i64; 2],
 }
 
-/// Transient view over a slot's raw metadata bytes.
-///
-/// The struct has no layout contract and never crosses the ABI; `get_slot_meta`
-/// constructs it from state bytes and it lives only inside a call. The
-/// `SlotMetaOffset` constants define the 48-byte metadata record.
-#[derive(Clone, Copy, Debug)]
-pub struct SlotMeta {
-    pub size_ptr: *mut u32,
-    pub change_flags_ptr: *mut u8,
-    pub eviction_index_size_ptr: *mut u32,
-    pub evicted_count_ptr: *mut u32,
-    pub offset: u32,
-    pub capacity: u32,
-    pub ttl_seconds: f32,
-    pub grace_seconds: f32,
-    pub eviction_index_offset: u32,
-    pub eviction_index_capacity: u32,
-    pub evicted_buffer_offset: u32,
-    pub type_flags: SlotTypeFlags,
-    pub agg_type: AggType,
-    pub timestamp_field_idx: u8,
-    pub start_of: DurationUnit,
-}
-
-impl SlotMeta {
-    /// Helper to get `slot_type` from `type_flags`.
-    pub const fn slot_type(self) -> SlotType {
-        match self.type_flags.slot_type() {
-            Some(slot_type) => slot_type,
-            // `die!` is not const-callable; a bare `panic!()` keeps this fn
-            // const while shipping no message string in the wasm artifact.
-            #[cfg(target_arch = "wasm32")]
-            None => panic!(),
-            #[cfg(not(target_arch = "wasm32"))]
-            None => panic!("invariant: slot metadata contains an invalid slot type"),
-        }
-    }
-
-    /// Helper to check whether TTL is enabled.
-    pub const fn has_ttl(self) -> bool {
-        self.type_flags.has_ttl()
-    }
-
-    /// Helper to check whether eviction triggers RETE rules.
-    pub const fn has_evict_trigger(self) -> bool {
-        self.type_flags.has_evict_trigger()
-    }
-
-    /// HASHMAP timestamp/comparison side-array availability.
-    pub fn has_hash_map_timestamp_storage(self) -> bool {
-        self.slot_type() == SlotType::HashMap && !self.type_flags.no_hashmap_timestamps()
-    }
-
-    /// Calculate the cutoff time for eviction after JS has applied startOf/timezone.
-    /// `cutoff = now - ttl_seconds - grace_seconds`.
-    pub fn cutoff(self, now: f64) -> f64 {
-        now - f64::from(self.ttl_seconds) - f64::from(self.grace_seconds)
-    }
-}
-
-/// # Safety
-///
-/// `state_base` must point to a writable, correctly initialized VM state
-/// buffer whose slot metadata is available at `slot`.
-pub unsafe fn get_slot_meta(state_base: *mut u8, slot: u8) -> SlotMeta {
-    let meta_offset = STATE_HEADER_SIZE as usize + usize::from(slot) * SLOT_META_SIZE as usize;
-    let meta_bytes = unsafe { state_base.add(meta_offset) };
-    let read_u32 =
-        |off: u32| unsafe { meta_bytes.add(off as usize).cast::<u32>().read_unaligned() };
-    let type_flags =
-        SlotTypeFlags::from_byte(unsafe { *meta_bytes.add(SlotMetaOffset::TYPE_FLAGS as usize) });
-    let slot_type = type_flags
-        .slot_type()
-        .unwrap_or_else(|| crate::die!("invariant: slot metadata contains an invalid slot type"));
-    let agg_byte = unsafe { *meta_bytes.add(SlotMetaOffset::AGG_TYPE as usize) };
-    let agg_type = if matches!(slot_type, SlotType::Aggregate | SlotType::Scalar) {
-        AggType::from_u8(agg_byte)
-            .unwrap_or_else(|| crate::die!("invariant: slot metadata contains an invalid agg type"))
-    } else {
-        AggType::Sum
-    };
-    let start_of =
-        DurationUnit::from_u8(unsafe { *meta_bytes.add(SlotMetaOffset::START_OF as usize) })
-            .unwrap_or_else(|| {
-                crate::die!("invariant: slot metadata contains an invalid duration unit")
-            });
-
-    SlotMeta {
-        offset: read_u32(SlotMetaOffset::OFFSET),
-        capacity: read_u32(SlotMetaOffset::CAPACITY),
-        size_ptr: unsafe { meta_bytes.add(SlotMetaOffset::SIZE as usize).cast() },
-        type_flags,
-        agg_type,
-        change_flags_ptr: unsafe { meta_bytes.add(SlotMetaOffset::CHANGE_FLAGS as usize) },
-        timestamp_field_idx: unsafe {
-            *meta_bytes.add(SlotMetaOffset::TIMESTAMP_FIELD_IDX as usize)
-        },
-        ttl_seconds: unsafe {
-            meta_bytes
-                .add(SlotMetaOffset::TTL_SECONDS as usize)
-                .cast::<f32>()
-                .read_unaligned()
-        },
-        grace_seconds: unsafe {
-            meta_bytes
-                .add(SlotMetaOffset::GRACE_SECONDS as usize)
-                .cast::<f32>()
-                .read_unaligned()
-        },
-        start_of,
-        eviction_index_offset: read_u32(SlotMetaOffset::EVICTION_INDEX_OFFSET),
-        eviction_index_capacity: read_u32(SlotMetaOffset::EVICTION_INDEX_CAPACITY),
-        eviction_index_size_ptr: unsafe {
-            meta_bytes
-                .add(SlotMetaOffset::EVICTION_INDEX_SIZE as usize)
-                .cast()
-        },
-        evicted_buffer_offset: read_u32(SlotMetaOffset::EVICTED_BUFFER_OFFSET),
-        evicted_count_ptr: unsafe {
-            meta_bytes
-                .add(SlotMetaOffset::EVICTED_COUNT as usize)
-                .cast()
-        },
-    }
-}
-
-/// # Safety
-///
-/// `meta.change_flags_ptr` must be valid for one writable byte.
-pub unsafe fn set_change_flag(meta: SlotMeta, flag: u8) {
-    unsafe { *meta.change_flags_ptr |= flag };
-}
-
-/// # Safety
-///
-/// `state_base` must point to writable VM state metadata for `num_slots`.
-pub unsafe fn clear_all_change_flags(state_base: *mut u8, num_slots: u8) {
-    for slot in 0..num_slots {
-        let offset = STATE_HEADER_SIZE as usize
-            + usize::from(slot) * SLOT_META_SIZE as usize
-            + SlotMetaOffset::CHANGE_FLAGS as usize;
-        unsafe { *state_base.add(offset) = 0 };
-    }
-}
-
-/// # Safety
-///
-/// `state_base` must point to initialized VM state metadata for `num_slots`.
-pub unsafe fn has_relevant_changes(state_base: *const u8, num_slots: u8) -> bool {
-    for slot in 0..num_slots {
-        let offset = STATE_HEADER_SIZE as usize
-            + usize::from(slot) * SLOT_META_SIZE as usize
-            + SlotMetaOffset::CHANGE_FLAGS as usize;
-        if unsafe { *state_base.add(offset) } != 0 {
-            return true;
-        }
-    }
-    false
-}
-
 pub const fn align8(n: u32) -> u32 {
     (n + 7) & !7
 }
@@ -1087,38 +927,6 @@ pub fn struct_field_offset(num_fields: u8, field_types: &[u8], target_field: u8)
     offset
 }
 
-/// # Safety
-///
-/// `ptrs` must point to an array containing `idx` and that entry must be a
-/// correctly aligned `u32` column.
-pub unsafe fn get_col_u32(ptrs: *const *const u8, idx: u8) -> *const u32 {
-    unsafe { (*ptrs.add(usize::from(idx))).cast() }
-}
-
-/// # Safety
-///
-/// `ptrs` must point to an array containing `idx` and that entry must be a
-/// correctly aligned `f64` column.
-pub unsafe fn get_col_f64(ptrs: *const *const u8, idx: u8) -> *const f64 {
-    unsafe { (*ptrs.add(usize::from(idx))).cast() }
-}
-
-/// # Safety
-///
-/// `ptrs` must point to an array containing `idx` and that entry must be a
-/// correctly aligned `i64` column.
-pub unsafe fn get_col_i64(ptrs: *const *const u8, idx: u8) -> *const i64 {
-    unsafe { (*ptrs.add(usize::from(idx))).cast() }
-}
-
-/// # Safety
-///
-/// `ptrs` must point to an array containing `idx` and that entry must be a
-/// correctly aligned column of `T` values.
-pub unsafe fn get_col_as<T>(ptrs: *const *const u8, idx: u8) -> *const T {
-    unsafe { (*ptrs.add(usize::from(idx))).cast() }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1165,32 +973,6 @@ mod tests {
     }
 
     #[test]
-    fn get_slot_meta_reads_through_named_offsets() {
-        let mut state = vec![0u8; (STATE_HEADER_SIZE + SLOT_META_SIZE) as usize];
-        let meta = STATE_HEADER_SIZE as usize;
-        let write_u32 = |buf: &mut [u8], off: u32, value: u32| {
-            let start = meta + off as usize;
-            buf[start..start + 4].copy_from_slice(&value.to_le_bytes());
-        };
-        state[meta + SlotMetaOffset::TYPE_FLAGS as usize] = SlotType::HashMap as u8;
-        state[meta + SlotMetaOffset::START_OF as usize] = DurationUnit::None as u8;
-        write_u32(&mut state, SlotMetaOffset::OFFSET, 7);
-        write_u32(&mut state, SlotMetaOffset::CAPACITY, 42);
-        write_u32(&mut state, SlotMetaOffset::EVICTION_INDEX_OFFSET, 100);
-        write_u32(&mut state, SlotMetaOffset::EVICTION_INDEX_CAPACITY, 200);
-        write_u32(&mut state, SlotMetaOffset::EVICTED_BUFFER_OFFSET, 300);
-        let slot = unsafe { get_slot_meta(state.as_mut_ptr(), 0) };
-        assert_eq!(slot.offset, 7);
-        assert_eq!(slot.capacity, 42);
-        assert_eq!(slot.eviction_index_offset, 100);
-        assert_eq!(slot.eviction_index_capacity, 200);
-        assert_eq!(slot.evicted_buffer_offset, 300);
-        assert_eq!(slot.slot_type(), SlotType::HashMap);
-        assert_eq!(slot.agg_type, AggType::Sum);
-        assert_eq!(slot.start_of, DurationUnit::None);
-    }
-
-    #[test]
     fn condition_tree_state_layout_is_stable() {
         // The representation is C-compatible: two consecutive u32 fields.
         assert_eq!(size_of::<ConditionTreeState>(), 8);
@@ -1211,25 +993,6 @@ mod tests {
         assert_eq!(size_of::<V2i64>(), 16);
         assert_eq!(align_of::<V2i64>(), 16);
         assert_eq!(offset_of!(V2i64, lanes), 0);
-    }
-
-    // SlotMeta deliberately has NO layout test: its pointer fields and
-    // transient, call-local role give it no cross-target layout contract.
-
-    #[test]
-    fn eviction_entry_byte_image_matches_packed_le_layout() {
-        // Independently computed: struct.pack('<dII', 1234.5, 42, 7).
-        let entry = EvictionEntry {
-            timestamp: 1234.5,
-            key_or_idx: 42,
-            value: 7,
-        };
-        let mut bytes = [0u8; 16];
-        // Safety: EvictionEntry is repr(C), size 16, and Copy.
-        unsafe {
-            core::ptr::copy_nonoverlapping((&raw const entry).cast::<u8>(), bytes.as_mut_ptr(), 16);
-        }
-        assert_eq!(bytes, [0, 0, 0, 0, 0, 74, 147, 64, 42, 0, 0, 0, 7, 0, 0, 0]);
     }
 
     #[test]

@@ -67,6 +67,9 @@ pub const COLUMINE_EP_EXPORTS: &[&str] = &[
 /// state, columns, and IPC output through it.
 pub const EXPORTED_MEMORY: &str = "memory";
 
+#[cfg(feature = "audit")]
+use std::{borrow::ToOwned, format, string::String, vec::Vec};
+
 /// One export entry of a wasm module: name and external kind (0 = function,
 /// 2 = memory).
 #[cfg(feature = "audit")]

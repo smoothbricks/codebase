@@ -8,10 +8,21 @@
 //! surface.
 //!
 //! The `audit` feature adds the test-support surface the ABI tripwires need:
-//! `abi_registry_fixture` (the frozen cutover snapshot),  `audit_parser` (the
+//! `abi_registry_fixture` (the frozen cutover snapshot), `audit_parser` (the
 //! source scraper that harvests live declarations to compare against it), and
 //! `wasm_abi::parse_exports`. It is off by default so none of that enters the
 //! link set of the shipped wasm artifacts.
+//!
+//! The ABI tables are layout facts with no effects, so the crate links no std
+//! and carries no `unsafe`: the linker, not review, keeps them that way. Only
+//! the `audit` surface reads files and formats errors, and it pulls std in for
+//! itself.
+
+#![no_std]
+#![forbid(unsafe_code)]
+
+#[cfg(feature = "audit")]
+extern crate std;
 
 #[cfg(feature = "audit")]
 pub mod abi_registry_fixture;

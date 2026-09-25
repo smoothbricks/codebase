@@ -4,8 +4,8 @@
 //! audit runs in three crates (columine-types, columine-vm, and a RETE
 //! consumer crate) against their Rust registry and dispatch sources;
 //! integration tests cannot share code across crates any other way without
-//! duplicating the parser. The module is `#[doc(hidden)]`, compiled only when
-//! referenced, and has zero runtime callers.
+//! duplicating the parser. The module is `#[doc(hidden)]`, compiled only under
+//! the `audit` feature, and has zero runtime callers.
 //!
 //! These are TRIPWIRES, not compilers: line-oriented scans over Rust sources.
 //! Every consumer must pair a harvest with a sanity FLOOR (assert the
@@ -16,6 +16,8 @@
 
 use std::collections::BTreeSet;
 use std::path::Path;
+use std::string::{String, ToString};
+use std::vec::Vec;
 
 /// Read a Rust source file relative to a crate's `CARGO_MANIFEST_DIR`,
 /// panicking with the resolved path on failure so a moved audit input fails
