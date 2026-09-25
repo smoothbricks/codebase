@@ -468,8 +468,9 @@ Cloudflare deploys and cleanups need `CLOUDFLARE_ACCOUNT_ID` and `CLOUDFLARE_API
 Scripts, Workers KV, R2, and D1 write, plus Zone DNS and Workers Routes write for preview hostnames. A pull-request
 deploy needs R2 even in a repository that binds no R2: it records what it will create in the account's
 `smoo-stage-records` bucket first, so R2 must be enabled on the Cloudflare account (once, in the dashboard) and the
-token needs R2 write, or the deploy fails before creating anything. A token without D1 access makes cleanup refuse
-before it deletes anything rather than half-clean a stage.
+token needs R2 write, or the deploy fails before creating anything. Cleanup reads only the zones its stage's records
+name, and lists D1 only when a D1 database was recorded. It makes every lookup before its first delete, so a token
+missing a permission the stage needs makes cleanup refuse rather than half-clean the stage.
 
 A wrong value type anywhere in `smoo.github` fails `smoo monorepo update` and `smoo github-ci nx-deploy` with the
 offending path, rather than silently falling back to the defaults.
@@ -849,11 +850,8 @@ Astro adapters emit). `staging` and `production` deploy it as-is, with no `--env
 staging template and derives a copy beside it: worker name (`<base>-prN` from a `-staging` name), routes and vars by
 hostname label (hosts without a `staging` label are pinned to staging and dropped; a template whose routes are all
 pinned is refused, since the stage would deploy unrouted), KV namespaces created by title, R2 buckets, D1 databases
-created by name with their migrations applied, `services` bindings and rate limits. Cleanup (`cleanup-pr`) removes every
-resource in the `CLOUDFLARE_ACCOUNT_ID` account carrying the `prN` segment, D1 included; zones of other accounts the
-token can reach are not listed. It matches on that segment alone, not on the repository, so one Cloudflare account must
-host only one repository's pull-request stages: closing pull request 7 in one repository would delete another
-repository's `pr7` Workers, KV namespaces, R2 buckets and D1 databases.
+created by name with their migrations applied, `services` bindings and rate limits. `smoo wrangler cleanup-pr` (below)
+deletes what those deploys recorded.
 
 Before a `prN` deploy creates anything, it records every item its plan names: the Worker, its KV namespaces, D1
 databases and R2 buckets, custom domains, routes and wildcard DNS records. Each is one empty object in the R2 bucket
@@ -872,7 +870,10 @@ the old ones stay behind.
 
 Upgrading to a smoo that records stages: pull-request deploys now need R2, even without R2 bindings (enabled on the
 account once, in the dashboard, and R2 write on the token), and a root `package.json` with `repository`. An open pull
-request's next push records its stage. `staging` and `production` deploys record nothing and read no root manifest.
+request's next push records its stage. Stages deployed by an older smoo carry no record, so cleanup reports "Nothing is
+recorded" for a pull request closed without another push; delete its `*-prN` items by hand once. There is no fallback
+sweep by name, since that would delete other repositories' stages again. `staging` and `production` deploys record
+nothing and read no root manifest.
 
 - `--config` deploys ignore `CLOUDFLARE_ENV`. There is no `--env` flag for a flat config, so wrangler would otherwise
   fall back to that variable and rename the worker after it.
@@ -894,6 +895,36 @@ request's next push records its stage. `staging` and `production` deploys record
 - A non-wildcard route gets no DNS record from this command; the stage's wildcard record must already exist.
 - D1 migrations are auto-confirmed: the command captures wrangler's output, so wrangler sees a non-interactive session
   and answers its own "apply migrations?" prompt with yes. Point it only at a stage you mean to migrate.
+
+### `smoo wrangler cleanup-pr --pr <number>`
+
+Deletes a closed pull request's stage: exactly what this repository's `prN` deploys recorded in the account's
+`smoo-stage-records` bucket, and nothing else. It reads only its own repository's keys for that stage, so another
+repository deploying into the same account, or this repository's `pr70`, is never touched. It runs from anywhere in the
+workspace; the repository is read from the root `package.json` the same way the deploy reads it.
+
+- Every recorded item is looked up before the first delete. A recorded zone is found by name within the
+  `CLOUDFLARE_ACCOUNT_ID` account, and only recorded zones and recorded kinds are listed.
+- A recorded item that no longer exists counts as already gone. A recorded route or custom domain that a Worker outside
+  the stage now holds is left in place and named in the output, and so is the wildcard DNS record such a route still
+  needs.
+- Deletes run in dependency order: custom domains, routes, wildcard DNS records, Workers, KV namespaces, each R2
+  bucket's objects and then the bucket, D1 databases. A Worker is deleted even while another Worker still binds it,
+  since a stage's Workers bind each other. A custom domain's own DNS record goes with the domain.
+- The records are deleted last. If a delete fails, the command stops with every record kept, and running it again
+  finishes the stage.
+- It prints one line, such as `Cleaned pr7 of github.com/acme/app from 23 records: deleted 3 Workers, ...`, or
+  `Nothing is recorded for pr7 of github.com/acme/app, ...` when the stage has no records. Both exit 0.
+
+Known gaps:
+
+- A deploy of the same stage that runs outside the pull request's CI concurrency group (a runner that ignores
+  `concurrency`, or a local deploy during the cleanup) can create an item after the cleanup looked it up. The cleanup
+  then deletes that item's record, and the item is left without one.
+- Re-running an old failed cleanup job replays the `closed` event. If the pull request was reopened and deployed since,
+  the re-run deletes that open pull request's live stage.
+- Wrangler's own Workers Sites namespace (`__<worker>-workers_sites_assets`) is not in the plan, so it is not recorded
+  and not deleted.
 
 ## Why This Shape
 

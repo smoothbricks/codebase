@@ -58,11 +58,13 @@ export interface CloudflareClient {
   listWorkerScripts(): Promise<WorkerScript[]>;
   /** Names only; the Worker's stored values are write-only from outside. */
   listWorkerSecrets(workerName: string): Promise<string[]>;
+  /** Also while another Worker still binds it: a stage's Workers bind each other. */
   deleteWorkerScript(name: string): Promise<void>;
   listWorkerDomains(): Promise<WorkerDomain[]>;
   createWorkerDomain(hostname: string, workerName: string, zoneId: string): Promise<void>;
   deleteWorkerDomain(id: string): Promise<void>;
-  listZones(): Promise<CloudflareZone[]>;
+  /** The account's zones, or only the one named `name`. */
+  listZones(name?: string): Promise<CloudflareZone[]>;
   listWorkerRoutes(zoneId: string): Promise<WorkerRoute[]>;
   createWorkerRoute(zoneId: string, pattern: string, workerName: string): Promise<void>;
   deleteWorkerRoute(zoneId: string, routeId: string): Promise<void>;
@@ -251,7 +253,11 @@ export class CloudflareRestClient implements CloudflareClient {
   }
 
   deleteWorkerScript(name: string): Promise<void> {
-    return this.mutate(`${this.accountPath}/workers/scripts/${encodeURIComponent(name)}`, { method: 'DELETE' });
+    // Without `force`, Cloudflare refuses to delete a Worker another Worker binds (a service
+    // binding), so of two stage Workers binding each other neither could go first.
+    return this.mutate(`${this.accountPath}/workers/scripts/${encodeURIComponent(name)}?force=true`, {
+      method: 'DELETE',
+    });
   }
 
   listWorkerDomains(): Promise<WorkerDomain[]> {
@@ -269,11 +275,13 @@ export class CloudflareRestClient implements CloudflareClient {
     return this.mutate(`${this.accountPath}/workers/domains/${encodeURIComponent(id)}`, { method: 'DELETE' });
   }
 
-  listZones(): Promise<CloudflareZone[]> {
+  listZones(name?: string): Promise<CloudflareZone[]> {
     // Unfiltered, `GET /zones` answers the zones of every account the token reaches. A Worker route or
     // custom domain binds only a zone of the Worker's own account, and every other listing here is
     // scoped to that account, so zones are too.
-    return this.listPages('/zones', isCloudflareZones, ZONE_PAGE_SIZE, { 'account.id': this.accountId });
+    const filter: Record<string, string> = { 'account.id': this.accountId };
+    if (name !== undefined) filter.name = name;
+    return this.listPages('/zones', isCloudflareZones, ZONE_PAGE_SIZE, filter);
   }
 
   listWorkerRoutes(zoneId: string): Promise<WorkerRoute[]> {

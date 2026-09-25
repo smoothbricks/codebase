@@ -285,6 +285,14 @@ describe('CloudflareRestClient page-numbered listings', () => {
     ]);
   });
 
+  it('finds a zone by name within the account', async () => {
+    const { fetcher, calls } = pageFetcher([{ success: true, result: [{ id: 'zone-1', name: 'example.test' }] }]);
+    const client = new CloudflareRestClient('account-1', 'token', fetcher);
+
+    await expect(client.listZones('example.test')).resolves.toEqual([{ id: 'zone-1', name: 'example.test' }]);
+    expect(calls).toEqual([`GET ${V4}/zones?account.id=account-1&name=example.test&per_page=50&page=1`]);
+  });
+
   it('refuses a listing that never reports its end', async () => {
     const { fetcher, calls } = pageFetcher([
       {
@@ -384,6 +392,22 @@ describe('CloudflareRestClient unpaginated listings', () => {
     await expect(client.listWorkerScripts()).resolves.toEqual([{ id: 'site-pr7' }]);
     await expect(client.listWorkerRoutes('zone-1')).resolves.toHaveLength(1);
     expect(calls).toEqual([`GET ${V4}/accounts/account-1/workers/scripts`, `GET ${V4}/zones/zone-1/workers/routes`]);
+  });
+});
+
+describe('CloudflareRestClient Worker delete', () => {
+  it('deletes a Worker even while another Worker still binds it', async () => {
+    // Without `force`, Cloudflare refuses to delete a Worker another one binds, and a stage's
+    // Workers bind each other: whichever went first would stop the cleanup.
+    const calls: string[] = [];
+    const client = new CloudflareRestClient('account-1', 'token', async (input, init) => {
+      calls.push(`${init?.method ?? 'GET'} ${input}`);
+      return new Response(JSON.stringify({ success: true, result: null }), { status: 200 });
+    });
+
+    await client.deleteWorkerScript('api-pr7');
+
+    expect(calls).toEqual([`DELETE ${V4}/accounts/account-1/workers/scripts/api-pr7?force=true`]);
   });
 });
 

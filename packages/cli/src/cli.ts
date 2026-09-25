@@ -8,7 +8,7 @@ import { ensureChromium, runWithChromium } from './playwright/index.js';
 import { resolvePrConflicts } from './pr/index.js';
 import { secretsSet, secretsStatus, secretsSync } from './secrets/commands.js';
 import { secretsRun } from './secrets/run.js';
-import { cleanupPullRequest, deployStage } from './wrangler/deploy-stage.js';
+import { cleanupPullRequest, deployStage, describeCleanup } from './wrangler/deploy-stage.js';
 import { deployedVersion } from './wrangler/deployed-version.js';
 import { scaffold } from './wrangler/scaffold.js';
 
@@ -650,9 +650,10 @@ function buildProgram(): Command {
     });
   wrangler
     .command('cleanup-pr')
+    .description('Delete what the deploys of this repository\u2019s prN stage recorded, then those records')
     .requiredOption('--pr <number>', 'pull-request number')
     .action(async (options: { pr: string }) => {
-      await cleanupPullRequest(process.cwd(), Number(options.pr));
+      console.log(describeCleanup(await cleanupPullRequest(await findRepoRoot(), Number(options.pr))));
     });
 
   return program;
