@@ -4287,6 +4287,11 @@ mod rebase_recovery_tests {
             "git's conflict remains the reported failure: {}",
             error.message
         );
+        assert!(
+            error.hint.contains("rolled back") && error.hint.contains("git rebase main"),
+            "the hint names the by-hand replay, not markers the rollback removed: {}",
+            error.hint
+        );
 
         let branch = git(&root, &["symbolic-ref", "--short", "HEAD"]);
         assert!(
@@ -4318,8 +4323,8 @@ mod rebase_recovery_tests {
         run_git(&root, &["init", "--initial-branch=main"]);
         run_git(&root, &["config", "user.name", "Cowshed Test"]);
         run_git(&root, &["config", "user.email", "cowshed@example.invalid"]);
-        // Set here rather than inherited, so the fixture reproduces the operator configuration
-        // under which git's autostash re-apply conflicted and still exited 0.
+        // Set in the fixture rather than inherited from the host: a repository can enable it for
+        // every clone through a tracked config include, and the verb must refuse either way.
         run_git(&root, &["config", "rebase.autoStash", "true"]);
         commit_file(&root, "base\n", "base");
         run_git(&root, &["checkout", "-b", "workspace"]);
@@ -8098,16 +8103,21 @@ async fn run_git_rebase_atomically(root: &Path, onto: &str, source_head: &GitOid
     let rebase_state = [git_dir.join("rebase-merge"), git_dir.join("rebase-apply")];
     let had_rebase_state = rebase_state.iter().any(|path| path.exists());
 
-    // `--no-autostash` overrides a user's `rebase.autoStash`. Autostash stashes a dirty tree,
-    // rebases, then re-applies the stash; a re-apply that conflicts leaves unmerged paths and a
-    // parked stash yet exits 0, so this verb would report success over a conflicted tree. Without
-    // it git refuses a dirty tree before touching anything, which the classifier below turns into
-    // "commit or discard the uncommitted work".
+    // `--no-autostash` overrides `rebase.autoStash` from every config layer, including a
+    // repository's tracked include that enables it for all its clones. Autostash stashes a dirty
+    // tree, rebases, then re-applies the stash; a re-apply that conflicts leaves unmerged paths
+    // and a parked stash yet exits 0, so this verb would report success over a conflicted tree.
+    // Without it git refuses a dirty tree before touching anything, which the classifier below
+    // turns into "commit or discard the uncommitted work".
     let output = invoke(root, &["rebase", "--no-autostash", onto]).await?;
     let primary = match require_git_success("git operation", &output) {
         Ok(()) => return Ok(()),
         Err(error) => error,
     };
+    // git's "could not apply <commit>" is a replayed commit that conflicted. The rollback below
+    // removes every conflict marker, so the classifier's "resolve the git conflict" would send
+    // the reader after markers that are gone; a replay conflict gets the by-hand replay instead.
+    let replay_conflicted = String::from_utf8_lossy(&output.stderr).contains("could not apply");
 
     // A state that predates this command belongs to the user. Never turn a refused retry into
     // authority to abort or delete an operation cowshed did not start.
@@ -8162,7 +8172,14 @@ async fn run_git_rebase_atomically(root: &Path, onto: &str, source_head: &GitOid
         Err(error) => failures.push(format!("cannot resolve restored HEAD: {}", error.message)),
     }
 
-    if failures.is_empty() {
+    if failures.is_empty() && replay_conflicted {
+        Err(CowshedError::conflict(
+            primary.message,
+            format!(
+                "the rebase was rolled back and the workspace is as it was: run `git rebase {onto}` inside the workspace, resolve the conflicts git names, and finish that rebase there"
+            ),
+        ))
+    } else if failures.is_empty() {
         Err(primary)
     } else {
         Err(CowshedError::integrity(

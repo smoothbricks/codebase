@@ -110,12 +110,16 @@ impl CowshedError {
     /// An operation on cowshed's own storage failed; `hint` is the repair for a storage fault.
     ///
     /// EPERM anywhere in `source`'s chain is not a storage fault. Permission bits answer EACCES;
-    /// EPERM is a sandbox refusing a path it withholds from the calling process — an agent
-    /// harness shell, or a `cowshed exec` child calling cowshed again, typically allowed to
-    /// open the store's existing lock files but not to create the temp file every durable
-    /// publication starts with. The store is intact then, so "repair storage" would send the
-    /// caller after a defect that does not exist: the move is to run the verb where the store is
-    /// writable.
+    /// the kernel's other EPERM sources are an immutable flag, unlinking another user's file in
+    /// a sticky directory, and a system-protected path, and cowshed's own storage — store and
+    /// mount-root directories the operator owns, never sticky, never flagged — has none of
+    /// them. What remains is a sandbox refusing a path it withholds from the calling process:
+    /// an agent harness shell, or a `cowshed exec` child calling cowshed again, typically
+    /// allowed to open the store's existing lock files but not to create the temp file every
+    /// durable publication starts with. The failing operation and its storage path are known
+    /// here, which is what makes the errno authoritative enough for exit 6. The store is intact
+    /// then, so "repair storage" would send the caller after a defect that does not exist: the
+    /// move is to run the verb where the store is writable.
     pub fn storage_failure(
         message: impl Into<String>,
         source: &(dyn std::error::Error + 'static),

@@ -13,23 +13,23 @@ Every cowshed command follows the same I/O discipline:
   `cowshed:`; suggested follow-up commands are prefixed `next:`. Agents and humans read the same hints.
 - **Exit codes** are stable:
 
-| Code | Meaning                          | Typical cause                                                                                                                                                                                                                         |
-| ---- | -------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 0    | ok                               | —                                                                                                                                                                                                                                     |
-| 1    | internal error (bug — report it) | panic, unexpected hdiutil/diskutil failure                                                                                                                                                                                            |
-| 2    | usage                            | unknown flag, missing argument                                                                                                                                                                                                        |
-| 3    | not-found                        | no such workspace/project/checkpoint                                                                                                                                                                                                  |
-| 4    | conflict                         | name in use, workspace busy, restore over unsaved work                                                                                                                                                                                |
-| 5    | env-missing                      | gateway, storage, mount, or executable unavailable; configured devenv refresh failed                                                                                                                                                  |
-| 6    | sandbox-denied                   | command blocked by the sandbox, confirmed by authoritative evidence; stderr names the path/domain and the grant that would allow it; also the shell running cowshed being sandboxed away from cowshed's store (EPERM on a store path) |
-| 7    | integrity                        | committed job content missing, mutated, rolled back, or from outside the workspace's lineage                                                                                                                                          |
+| Code | Meaning                          | Typical cause                                                                                                                                                                                                                                                                                                                        |
+| ---- | -------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| 0    | ok                               | —                                                                                                                                                                                                                                                                                                                                    |
+| 1    | internal error (bug — report it) | panic, unexpected hdiutil/diskutil failure                                                                                                                                                                                                                                                                                           |
+| 2    | usage                            | unknown flag, missing argument                                                                                                                                                                                                                                                                                                       |
+| 3    | not-found                        | no such workspace/project/checkpoint                                                                                                                                                                                                                                                                                                 |
+| 4    | conflict                         | name in use, workspace busy, restore over unsaved work                                                                                                                                                                                                                                                                               |
+| 5    | env-missing                      | gateway, storage, mount, or executable unavailable; configured devenv refresh failed                                                                                                                                                                                                                                                 |
+| 6    | sandbox-denied                   | command blocked by the sandbox, confirmed by authoritative evidence, with stderr naming the path/domain and the grant that would allow it; or the shell running cowshed is itself sandboxed away from cowshed's store (EPERM on a store path), where no grant helps and the hint is to rerun from a shell allowed to write the store |
+| 7    | integrity                        | committed job content missing, mutated, rolled back, or from outside the workspace's lineage                                                                                                                                                                                                                                         |
 
 `cowshed exec` passes the child's exit code through **unchanged**; failures of cowshed's own exec wrapper (mount gone
 mid-run, profile generation failed, integrity verification failed, …) use 100–106 so they can never collide with a child
 that legitimately exits 1–7. Exit 6 is reported only when cowshed has authoritative evidence of a denial — the gateway
-logged the egress decision, or the kernel sandbox telemetry names the blocked operation; otherwise the child's ordinary
-exit passes through untouched. Exit 7 is reported only for an established content integrity failure, never for a summary
-mismatch or ordinary child output.
+logged the egress decision, the kernel sandbox telemetry names the blocked operation, or cowshed's own write to a
+storage path it owns failed with EPERM; otherwise the child's ordinary exit passes through untouched. Exit 7 is reported
+only for an established content integrity failure, never for a summary mismatch or ordinary child output.
 
 The JSON envelope is uniform:
 
@@ -722,10 +722,15 @@ cowshed: mirror /private/cowshed/caches/repo-mirrors/github.com/tinylibs/tinyben
 tinybench
 ```
 
-### `cowshed rebase <name>`
+### `cowshed rebase [<name>] [--onto <rev>]`
 
-Brings the workspace branch up to current main (`git fetch host && git rebase host/main`, run inside the sandbox).
-Conflicts abort cleanly and exit 4 naming the conflicted paths.
+Brings the workspace branch up to current main: cowshed points the workspace's `main` remote at main's checkout
+(`cowshed-main` in a workspace where something else already holds that name), fetches it, and runs
+`git rebase --no-autostash main/main` in the workspace; `--onto` names another revision. A dirty tree is refused before
+anything moves (exit 4: commit or discard the uncommitted work first). Autostash stays off even when the repository's
+config turns it on, because a stash re-apply that conflicts leaves unmerged paths behind and still exits 0. A conflict
+aborts the rebase, restores the branch to the commit it had before, and exits 4 with git's output naming the conflicted
+paths.
 
 ### `cowshed land <name> [--check <cmd>]`
 

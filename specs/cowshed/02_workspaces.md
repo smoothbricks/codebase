@@ -29,10 +29,10 @@ The invariant is checked, not assumed. One built-in scanner (`cowshed-core::secr
 
 - **`cowshed adopt` — blocking gate.** Full-tree scan before the image is created (skipping cache roots and `.git`
   objects). Findings refuse the adopt (exit 4) with per-file stderr guidance: migrate the value to the gateway Keychain,
-  delete the file, or `cowshed adopt --quarantine`, which moves findings to `/private/cowshed/store/<owner>/<repo>/quarantine/` (the
-  primary component-safe `repo_id` path; mode 0600, original paths preserved) so dependent tooling fails loudly instead
-  of leaking silently. There is no "adopt anyway" flag — main's image is cloned to every future workspace; adopt is the
-  one moment the invariant is cheap to establish.
+  delete the file, or `cowshed adopt --quarantine`, which moves findings to
+  `/private/cowshed/store/<owner>/<repo>/quarantine/` (the primary component-safe `repo_id` path; mode 0600, original
+  paths preserved) so dependent tooling fails loudly instead of leaking silently. There is no "adopt anyway" flag —
+  main's image is cloned to every future workspace; adopt is the one moment the invariant is cheap to establish.
 - **`cowshed push` and autosave — delta gate.** Scans only content new relative to the base commit (cheap). Push refuses
   with exit 4 and names the offending hunks; autosave skips the snapshot and emits one `cowshed:` warning — it never
   blocks work, but it never propagates a finding to the host repo either. This closes the write side: an agent that
@@ -62,12 +62,13 @@ not a best-effort script:
    break a tie only among remotes for that same identity. Record the selected remote name and its credential-, query-,
    and fragment-free URL, and validate that URL still normalizes to the recorded primary `repo_id`. Programmatic callers
    supply the same explicit identity as `AdoptOptions.repo_id`; the coordinator rejects any disagreement with the
-   provisional binding before image mutation. Load trusted policy only from `/private/cowshed/store/<owner>/<repo>/policy.json`.
-   Also require that `<root>.pre-cowshed` does **not** already exist (exit 4 — a previous adopt left state behind;
-   resolve it first). Ensure host setup is present — declaratively validated when home-manager/nix-darwin owns it
-   (`programs.cowshed`/`services.cowshed`, 14_nix.md), imperatively applied otherwise — and both dedicated volumes
-   exist: lazily create and mount `cowshed.store` (at `/private/cowshed/store`) then `cowshed.caches` (nested; ordering and the
-   volume marker in 01_storage.md) before any image is created.
+   provisional binding before image mutation. Load trusted policy only from
+   `/private/cowshed/store/<owner>/<repo>/policy.json`. Also require that `<root>.pre-cowshed` does **not** already
+   exist (exit 4 — a previous adopt left state behind; resolve it first). Ensure host setup is present — declaratively
+   validated when home-manager/nix-darwin owns it (`programs.cowshed`/`services.cowshed`, 14_nix.md), imperatively
+   applied otherwise — and both dedicated volumes exist: lazily create and mount `cowshed.store` (at
+   `/private/cowshed/store`) then `cowshed.caches` (nested; ordering and the volume marker in 01_storage.md) before any
+   image is created.
 2. Select the supported format, then create the image under a staged, non-enumerated, format-specific name:
    `<owner>/<repo>/.staging/main-<incarnation>.asif` for ASIF or
    `<owner>/<repo>/.staging/main-<incarnation>.sparseimage` for SPARSE. Both components come from the validated primary
@@ -92,11 +93,11 @@ not a best-effort script:
 
 ## Checkout layouts
 
-Main mounts at the checkout's original path — one layout, no per-project choice to record — and every other
-workspace mounts at `<mount-root>/<owner>/<repo>/<workspace>`, where the mount root is host configuration (default
-`~/.cowshed/mnt`, set via `cowshed setup --mount-root`; see 01_storage.md). The root holds only mountpoint directories (empty when detached) and is plain per-user directories on
-Data; nothing is written inside any checkout, so no Git exclusion is required for them. Changing the root requires
-every workspace detached and is refused otherwise.
+Main mounts at the checkout's original path — one layout, no per-project choice to record — and every other workspace
+mounts at `<mount-root>/<owner>/<repo>/<workspace>`, where the mount root is host configuration (default
+`~/.cowshed/mnt`, set via `cowshed setup --mount-root`; see 01_storage.md). The root holds only mountpoint directories
+(empty when detached) and is plain per-user directories on Data; nothing is written inside any checkout, so no Git
+exclusion is required for them. Changing the root requires every workspace detached and is refused otherwise.
 
 **Direct mount** (default). `main` mounts at the checkout's original path. Publication renames the original tree to
 `<root>.pre-cowshed`, recreates the emptied directory as the mountpoint with the stub `.envrc` inside it, and attaches
@@ -133,8 +134,8 @@ needs nothing from the user's tree to finish it, and `<root>.pre-cowshed` does n
 retained until the user deletes it; cowshed never auto-deletes it.
 
 Adopting is reversible, and reverses the same way: `cowshed rm main --restore` detaches, swaps the retained
-`<root>.pre-cowshed` tree back against whatever publication left at the checkout path — the emptied
-mountpoint directory — and removes the displaced artifact. The checkout path is never absent during the restore either.
+`<root>.pre-cowshed` tree back against whatever publication left at the checkout path — the emptied mountpoint directory
+— and removes the displaced artifact. The checkout path is never absent during the restore either.
 
 ## `cowshed mv` — rename a workspace or move the checkout
 
@@ -179,15 +180,15 @@ one that overlaps cowshed storage or the current checkout. A dirty tree is _not_
 working tree is carried across untouched rather than republished, so there is nothing for a fence to protect.
 
 A user who moves an adopted checkout by hand has not broken anything: `cowshed doctor` accepts a checkout path that
-resolves to the workspace's volume root wherever it now sits, and `cowshed attach` converges the recorded path onto the observed one. `mv <ws>` is the sanctioned front door;
-convergence is the safety net under it.
+resolves to the workspace's volume root wherever it now sits, and `cowshed attach` converges the recorded path onto the
+observed one. `mv <ws>` is the sanctioned front door; convergence is the safety net under it.
 
 Convergence needs an observation the controller cannot make for itself. `current_dir(2)` reports main's mount rather
-than the name the user reached it by, and it witnesses where the checkout actually lives. The CLI therefore carries its invocation directory into `attach`, and convergence
-fires only when that observation is unambiguous: the path sits inside main's mount, the checkout root above it resolves
-to that mount, that root lies outside cowshed's own storage — so the mount path is never mistaken for the user's
-checkout — and it differs from what is recorded. The layout is recorded from the same observation: a checkout that is a
-mount is direct mount by construction. An `attach` with no
+than the name the user reached it by, and it witnesses where the checkout actually lives. The CLI therefore carries its
+invocation directory into `attach`, and convergence fires only when that observation is unambiguous: the path sits
+inside main's mount, the checkout root above it resolves to that mount, that root lies outside cowshed's own storage —
+so the mount path is never mistaken for the user's checkout — and it differs from what is recorded. The layout is
+recorded from the same observation: a checkout that is a mount is direct mount by construction. An `attach` with no
 observation converges nothing rather than guessing.
 
 ## `cowshed new <name>` — create a session workspace
@@ -243,14 +244,13 @@ says what the remote is — the main workspace — so `git fetch main`, `git log
 as what they do, and an agent that knows nothing about cowshed guesses it correctly on the first try.
 
 The URL is the canonical mount, never the recorded checkout path, and the two differ by checkout layout (see "Checkout
-layout"): they are the same directory. Recording a separate checkout path would put a path outside the workspace's read grants
-into its git config and would dangle the moment the checkout moves; the canonical mount is the path the substrate owns,
-the path the grants already cover, and the path `cowshed mv` maintains. `mv` rewrites the remote in every mounted
+layout"): they are the same directory. Recording a separate checkout path would put a path outside the workspace's read
+grants into its git config and would dangle the moment the checkout moves; the canonical mount is the path the substrate
+owns, the path the grants already cover, and the path `cowshed mv` maintains. `mv` rewrites the remote in every mounted
 workspace as part of the same transaction that moves the mount, for the same reason it rewrites the volume label. A
 workspace that was detached while main moved has no volume to write into; `attach` re-runs the same idempotent
 configuration when the workspace is next used, so the repair rides the front door a workspace already passes through
-rather than needing a verb of its own. Both paths are the
-idempotent no-op the remote configuration is built to be.
+rather than needing a verb of its own. Both paths are the idempotent no-op the remote configuration is built to be.
 
 A fresh mint starts from a clean slate: the workspace's `.git` arrives by CoW carrying every remote main had, network
 URLs included, so mint **strips them all** before configuring its own. That is the "no remote URL ever exists inside a
@@ -300,12 +300,12 @@ gains three steps between attach and publication:
    worktree must not carry one — two registrations claiming the same worktree id is precisely the failure mode that
    makes cloning an already-linked worktree wrong (see the prototype report).
 2. Register the worktree against main's repository and plant the pointer file, using **main's canonical mount** as the
-   repository path, which is the checkout path. The registration must name the real mount path rather than any alias
-   for the same reason the `main` remote does — a registration recorded through an alias breaks when it moves,
-   and `git worktree repair` would then have two plausible paths and no way to choose. Because the tree is already
-   present from the clone, nothing is checked out: cowshed registers with `--no-checkout`, relocates the pointer onto
-   the mount root, and reconciles both directions with `git -C <main-canonical-mount> worktree repair <mount>`, which is
-   the primitive git provides for exactly this two-way pointer fixup. `git worktree add` insists on creating the path it
+   repository path, which is the checkout path. The registration must name the real mount path rather than any alias for
+   the same reason the `main` remote does — a registration recorded through an alias breaks when it moves, and
+   `git worktree repair` would then have two plausible paths and no way to choose. Because the tree is already present
+   from the clone, nothing is checked out: cowshed registers with `--no-checkout`, relocates the pointer onto the mount
+   root, and reconciles both directions with `git -C <main-canonical-mount> worktree repair <mount>`, which is the
+   primitive git provides for exactly this two-way pointer fixup. `git worktree add` insists on creating the path it
    registers, so the registration is taken out through a staging directory inside the image and the pointer file is
    moved up to the mount root afterwards; the staging directory's name is the worktree id git derives from it, which is
    why it is the workspace name and not anything mount-derived — a `--slot` mount does not carry the name, and
@@ -340,9 +340,8 @@ It is also a hole in the isolation, stated plainly. The sandbox needs read and w
 user's own repository. The profile carries that hole as a distinct, controller-owned carve-back on
 `<main-canonical-mount>/.git` and nothing wider, emitted after every deny that would otherwise close it (04_sandbox.md).
 It cannot be an ordinary read/write grant: grants are refused outright when they intersect a protected path, and main's
-mount is one — the denied project root under
-direct mount. Main's working tree stays as unreachable as any other workspace's, and a workspace that did not ask for
-`--git-worktree` never has any of it.
+mount is one — the denied project root under direct mount. Main's working tree stays as unreachable as any other
+workspace's, and a workspace that did not ask for `--git-worktree` never has any of it.
 
 **Checkpoint and restore refuse** on a git-worktree workspace, exit 4, with `next:` hints. The image is not
 self-contained: a checkpoint clone would capture a tree whose history lives in a repository it does not include, so the
@@ -528,10 +527,10 @@ no credential helper, and no `insteadOf` rewriting inside any workspace.
 
 - **`cowshed repo mirror <url>`** — a control-plane RPC, not workspace git. The gateway checks the workspace's repo
   grants (`cowshed grant <ws> --repo github.com/org/*` — repo-scoped, finer than host egress), executes the fetch itself
-  with Keychain-held credentials into a bare mirror it owns at `/private/cowshed/caches/repo-mirrors/<host>/<org>/<repo>.git`,
-  writes one audit line, and returns the mirror path on stdout. Mirrors are created by the gateway with its own config —
-  no agent-writable git config is ever in the loop — and are fetch-only, sandbox-read-only (01_storage.md,
-  05_gateway.md).
+  with Keychain-held credentials into a bare mirror it owns at
+  `/private/cowshed/caches/repo-mirrors/<host>/<org>/<repo>.git`, writes one audit line, and returns the mirror path on
+  stdout. Mirrors are created by the gateway with its own config — no agent-writable git config is ever in the loop —
+  and are fetch-only, sandbox-read-only (01_storage.md, 05_gateway.md).
 - **`cowshed repo clone <url> [dir]`** — sugar: mirror, then a local `git clone --dissociate <mirror>` run inside the
   sandbox.
 
@@ -565,9 +564,11 @@ but `land` still requires a named branch as its fast-forward target.
 
 - Default mode: fetch the selected host revision inside the workspace, then rebase the `cowshed/<name>` branch onto that
   exact object ID. The whole step runs **inside the workspace sandbox** — the fetch from the main workspace mount is a
-  read (covered by the baseline), and every write lands in the workspace's own repository. Conflicts abort the rebase
-  (`git rebase --abort`), leave the workspace exactly as it was, and exit 4 with `next:` hints naming the conflicted
-  paths.
+  read (covered by the baseline), and every write lands in the workspace's own repository. A dirty tree is refused
+  before the rebase starts (exit 4, commit or discard first): the rebase runs with `--no-autostash` whatever the
+  repository's config says, because an autostash re-apply that conflicts leaves unmerged paths and a parked stash yet
+  exits 0. Conflicts abort the rebase (`git rebase --abort`), leave the workspace exactly as it was, and exit 4 with
+  `next:` hints naming the conflicted paths and the by-hand replay.
 - `--fresh`: divergence-shedding rebase. Create a new clone from the selected current host revision, replay the branch
   onto it (`git format-patch`/`am`, or cherry-pick range), then **transplant identity** — the new clone inherits the
   workspace's name, canonical mount path, token, and grant-file binding; the old clone is destroyed (11_shell.md
@@ -677,9 +678,9 @@ at login by a launchd agent; Linux uses its platform service/controller lifecycl
 Every workspace image carries its environment in the in-image private namespace as a plain `source`-able file:
 `.cowshed/env` exports `GOENV` (pointing at the workspace's `.cowshed/cache/go/env`), `COWSHED_WORKSPACE_TOKEN`
 (controller-minted, read from `.cowshed/token`), and on macOS `COWSHED_PORT_BASE` from detached metadata's exact
-`portBlock`. Linux has no port block and omits the line. Cowshed rewrites this file whenever it rewrites the token —
-at create/fork/restore — so values are always current; nothing is derived from cwd, guessed from a slot, or trusted
-from a marker alone.
+`portBlock`. Linux has no port block and omits the line. Cowshed rewrites this file whenever it rewrites the token — at
+create/fork/restore — so values are always current; nothing is derived from cwd, guessed from a slot, or trusted from a
+marker alone.
 
 The repo-visible wiring is one line. When a checkout has no `.envrc`, cowshed writes:
 
@@ -693,8 +694,8 @@ direnv; agent processes get the same environment injected at spawn by the superv
 to print these exports on demand.
 
 **Empty mountpoints are not user-visible state.** A mountpoint directory exists only while its workspace is attached;
-detach removes it. Main workspaces are always-mounted: the gateway mounts every main across every adopted project
-before reporting healthy (05_gateway.md), and doctor treats an unreachable main as a critical finding. There is no
+detach removes it. Main workspaces are always-mounted: the gateway mounts every main across every adopted project before
+reporting healthy (05_gateway.md), and doctor treats an unreachable main as a critical finding. There is no
 detached-main state for a user to stumble over.
 
 ## Tradeoffs

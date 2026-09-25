@@ -2335,7 +2335,7 @@ const REBASE: CommandSpec = CommandSpec {
     trailing: "",
     summary: "rebase a workspace",
     about: &[
-        "Brings the workspace branch up to current main, run inside the sandbox. A conflict aborts cleanly and names the conflicted paths, leaving the workspace as it was. Naming no workspace rebases the one you are standing in.",
+        "Brings the workspace branch up to current main: fetches main's checkout into the workspace and rebases onto it. A dirty tree is refused before anything moves; commit or discard the uncommitted work first. A conflict aborts cleanly and names the conflicted paths, leaving the workspace as it was. Naming no workspace rebases the one you are standing in.",
     ],
     options: &[
         Opt {
