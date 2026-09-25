@@ -2344,10 +2344,10 @@ fn ensure_git_success(operation: &str, output: Output) -> Result<()> {
 /// entry in that tree would be. Returns the ignored paths in git's order.
 pub async fn ignored_by(checkout: &Path, relative: &[&[u8]]) -> Vec<Vec<u8>> {
     use tokio::io::AsyncWriteExt;
-    let mut child = match tokio::process::Command::new("git")
+    let mut child = match Command::new("git")
         .arg("-C")
         .arg(checkout)
-        .args(["check-ignore", "--stdin", "-z", "--no-index"])
+        .args(CHECK_IGNORE_BATCH)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
@@ -2356,24 +2356,77 @@ pub async fn ignored_by(checkout: &Path, relative: &[&[u8]]) -> Vec<Vec<u8>> {
         Ok(child) => child,
         Err(_) => return Vec::new(),
     };
-    let mut input = Vec::new();
+    let input = nul_joined(relative);
+    let stdin = child.stdin.take();
+    // Written while `wait_with_output` drains stdout, never before it: see `git_batch_blocking`.
+    let write = async move {
+        if let Some(mut stdin) = stdin {
+            let _ = stdin.write_all(&input).await;
+        }
+    };
+    let ((), output) = tokio::join!(write, child.wait_with_output());
+    match output {
+        Ok(output) => nul_fields(&output.stdout),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// [`ignored_by`] for a caller that is not async.
+pub fn ignored_by_blocking(checkout: &Path, relative: &[&[u8]]) -> Vec<Vec<u8>> {
+    nul_fields(&git_batch_blocking(
+        checkout,
+        CHECK_IGNORE_BATCH,
+        nul_joined(relative),
+    ))
+}
+
+const CHECK_IGNORE_BATCH: &[&str] = &["check-ignore", "--stdin", "-z", "--no-index"];
+
+/// Runs one batch git verb in `checkout` with `input` on stdin and returns its stdout, empty when
+/// git cannot be started. The input is written from its own thread while this one drains stdout.
+/// Batch verbs answer as they read, so writing all of the input before reading any answer
+/// deadlocks as soon as the answers fill the stdout pipe: git blocks writing its stdout, the
+/// caller blocks writing git's stdin, and neither returns.
+fn git_batch_blocking(checkout: &Path, args: &[&str], input: Vec<u8>) -> Vec<u8> {
+    let mut child = match std::process::Command::new("git")
+        .arg("-C")
+        .arg(checkout)
+        .args(args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(_) => return Vec::new(),
+    };
+    let writer = child.stdin.take().map(|mut stdin| {
+        std::thread::spawn(move || {
+            let _ = stdin.write_all(&input);
+        })
+    });
+    let output = child.wait_with_output();
+    if let Some(writer) = writer {
+        let _ = writer.join();
+    }
+    output.map(|output| output.stdout).unwrap_or_default()
+}
+
+fn nul_joined(relative: &[&[u8]]) -> Vec<u8> {
+    let mut input = Vec::with_capacity(relative.iter().map(|path| path.len() + 1).sum());
     for path in relative {
         input.extend_from_slice(path);
         input.push(0);
     }
-    if let Some(mut stdin) = child.stdin.take() {
-        let _ = stdin.write_all(&input).await;
-        drop(stdin);
-    }
-    match child.wait_with_output().await {
-        Ok(output) => output
-            .stdout
-            .split(|byte| *byte == 0)
-            .filter(|path| !path.is_empty())
-            .map(<[u8]>::to_vec)
-            .collect(),
-        Err(_) => Vec::new(),
-    }
+    input
+}
+
+fn nul_fields(stdout: &[u8]) -> Vec<Vec<u8>> {
+    stdout
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+        .map(<[u8]>::to_vec)
+        .collect()
 }
 
 /// `(XY, path)` per `--porcelain=v1 -z` record; a rename's second path field is consumed
@@ -2485,7 +2538,8 @@ mod tests {
 
     use super::{
         CowshedUpstream, FALLBACK_MAIN_REMOTE, GitRepository, MAIN_REMOTE, MainRemote, RemoteUrl,
-        ensure_git_success, git_message, is_git_repository, parse_lines, workspace_remote_name,
+        ensure_git_success, git_message, ignored_by, ignored_by_blocking, is_git_repository,
+        parse_lines, workspace_remote_name,
     };
     static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -2581,6 +2635,51 @@ mod tests {
         assert!(git.is_dirty().await.expect("own rules"));
         assert!(!git.is_dirty_by(Some(&main)).await.expect("main's rules"));
         fs::remove_dir_all(main).expect("remove main fixture");
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    /// Enough ignored paths that git's answers overflow the stdout pipe many times over.
+    fn pipe_overflowing_paths() -> Vec<Vec<u8>> {
+        (0..40_000)
+            .map(|index| format!("node_modules/pkg-{index}/lib/index.js").into_bytes())
+            .collect()
+    }
+
+    /// Writing every path before reading any answer deadlocked once git's answers filled the
+    /// stdout pipe (a retired worktree's `node_modules` was enough): both sides blocked writing.
+    /// A regression must fail this test, not hang it, so the batch runs under a deadline.
+    #[test]
+    fn a_check_ignore_batch_larger_than_the_pipe_finishes() {
+        let root = repository();
+        fs::write(root.join(".gitignore"), "node_modules/\n").expect("ignore rules");
+        let paths = pipe_overflowing_paths();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let checkout = root.clone();
+        let asked = paths.clone();
+        std::thread::spawn(move || {
+            let borrowed: Vec<&[u8]> = asked.iter().map(Vec::as_slice).collect();
+            let _ = sender.send(ignored_by_blocking(&checkout, &borrowed));
+        });
+        let ignored = receiver
+            .recv_timeout(std::time::Duration::from_secs(120))
+            .expect("check-ignore batch deadlocked");
+        assert_eq!(ignored, paths);
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    #[tokio::test]
+    async fn an_async_check_ignore_batch_larger_than_the_pipe_finishes() {
+        let root = repository();
+        fs::write(root.join(".gitignore"), "node_modules/\n").expect("ignore rules");
+        let paths = pipe_overflowing_paths();
+        let borrowed: Vec<&[u8]> = paths.iter().map(Vec::as_slice).collect();
+        let ignored = tokio::time::timeout(
+            std::time::Duration::from_secs(120),
+            ignored_by(&root, &borrowed),
+        )
+        .await
+        .expect("check-ignore batch deadlocked");
+        assert_eq!(ignored, paths);
         fs::remove_dir_all(root).expect("remove fixture");
     }
 

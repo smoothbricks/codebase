@@ -5759,7 +5759,10 @@ fn remove_stray_junk(
         .iter()
         .map(|(_, relative, _)| relative.as_slice())
         .collect();
-    let ignored = stray_ignored_set(checkout, &judged);
+    let ignored: std::collections::BTreeSet<Vec<u8>> =
+        crate::git::ignored_by_blocking(checkout, &judged)
+            .into_iter()
+            .collect();
     let mut kept = Vec::new();
     let mut removals: Vec<(PathBuf, bool)> = hidden;
     for (path, relative, is_dir) in strays {
@@ -5795,38 +5798,6 @@ fn remove_stray_junk(
         }
     }
     Ok(kept)
-}
-
-/// The subset of `relative` paths the checkout's gitignore rules ignore, in one process.
-fn stray_ignored_set(checkout: &Path, relative: &[&[u8]]) -> std::collections::BTreeSet<Vec<u8>> {
-    use std::io::Write;
-    let mut child = match std::process::Command::new("git")
-        .arg("-C")
-        .arg(checkout)
-        .args(["check-ignore", "--stdin", "-z", "--no-index"])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-    {
-        Ok(child) => child,
-        Err(_) => return std::collections::BTreeSet::new(),
-    };
-    if let Some(mut stdin) = child.stdin.take() {
-        for path in relative {
-            let _ = stdin.write_all(path);
-            let _ = stdin.write_all(&[0]);
-        }
-    }
-    match child.wait_with_output() {
-        Ok(output) => output
-            .stdout
-            .split(|byte| *byte == 0)
-            .filter(|path| !path.is_empty())
-            .map(<[u8]>::to_vec)
-            .collect(),
-        Err(_) => std::collections::BTreeSet::new(),
-    }
 }
 
 fn io_error(operation: &'static str, path: &Path, source: io::Error) -> ApfsStorageError {
@@ -5929,7 +5900,6 @@ mod tests {
         fs::write(mount.join("packages/wire/build.log"), "x").expect("ignored by glob");
         fs::create_dir_all(mount.join("packages/wire/src")).expect("src");
         fs::write(mount.join("packages/wire/src/lib.rs"), "fn a() {}").expect("work");
-
         let kept = remove_stray_junk(&mount, &checkout).expect("sweep");
         assert_eq!(kept, vec![mount.join("packages/wire/src/lib.rs")]);
         assert!(!mount.join(".nx").exists());
