@@ -2380,6 +2380,64 @@ pub fn ignored_by_blocking(checkout: &Path, relative: &[&[u8]]) -> Vec<Vec<u8>> 
     ))
 }
 
+/// The regular `files` whose exact bytes are already a blob in `checkout`'s repository: content
+/// git can reproduce, so deleting the file loses nothing. `--no-filters` hashes the bytes as they
+/// are, so a file only a clean filter would turn into a stored blob is never judged held; a path
+/// that cannot travel on one line of `--stdin-paths` (it contains a newline) is never judged held.
+/// Any disagreement between what was asked and what git answered judges nothing held.
+pub fn held_by_repository_blocking(checkout: &Path, files: &[&Path]) -> Vec<PathBuf> {
+    let asked: Vec<&Path> = files
+        .iter()
+        .copied()
+        .filter(|path| !path.as_os_str().as_bytes().contains(&b'\n'))
+        .collect();
+    if asked.is_empty() {
+        return Vec::new();
+    }
+    let mut paths = Vec::new();
+    for path in &asked {
+        paths.extend_from_slice(path.as_os_str().as_bytes());
+        paths.push(b'\n');
+    }
+    let hashes = git_batch_blocking(
+        checkout,
+        &["hash-object", "--no-filters", "--stdin-paths"],
+        paths,
+    );
+    let oids: Vec<&[u8]> = hashes
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .collect();
+    if oids.len() != asked.len() {
+        return Vec::new();
+    }
+    let mut query = Vec::new();
+    for oid in &oids {
+        query.extend_from_slice(oid);
+        query.push(b'\n');
+    }
+    let answers = git_batch_blocking(checkout, &["cat-file", "--batch-check"], query);
+    let answers: Vec<&[u8]> = answers
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .collect();
+    if answers.len() != oids.len() {
+        return Vec::new();
+    }
+    asked
+        .into_iter()
+        .zip(oids)
+        .zip(answers)
+        .filter(|((_, oid), answer)| {
+            answer.starts_with(oid)
+                && answer
+                    .get(oid.len()..)
+                    .is_some_and(|rest| rest.starts_with(b" blob "))
+        })
+        .map(|((path, _), _)| path.to_path_buf())
+        .collect()
+}
+
 const CHECK_IGNORE_BATCH: &[&str] = &["check-ignore", "--stdin", "-z", "--no-index"];
 
 /// Runs one batch git verb in `checkout` with `input` on stdin and returns its stdout, empty when
@@ -2538,8 +2596,8 @@ mod tests {
 
     use super::{
         CowshedUpstream, FALLBACK_MAIN_REMOTE, GitRepository, MAIN_REMOTE, MainRemote, RemoteUrl,
-        ensure_git_success, git_message, ignored_by, ignored_by_blocking, is_git_repository,
-        parse_lines, workspace_remote_name,
+        ensure_git_success, git_message, held_by_repository_blocking, ignored_by,
+        ignored_by_blocking, is_git_repository, parse_lines, workspace_remote_name,
     };
     static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -2681,6 +2739,25 @@ mod tests {
         .expect("check-ignore batch deadlocked");
         assert_eq!(ignored, paths);
         fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    /// Only a regular file whose exact bytes the repository already stores is held; a
+    /// same-named file with other bytes, and a path that cannot travel on one line, are not.
+    #[test]
+    fn held_files_are_exactly_the_ones_git_already_stores() {
+        let root = repository();
+        let outside = repository();
+        let copy = outside.join("copy-of-readme");
+        fs::write(&copy, "test\n").expect("held copy");
+        let edited = outside.join("README.edited");
+        fs::write(&edited, "test, edited\n").expect("unheld edit");
+        let newline = outside.join("two\nlines");
+        fs::write(&newline, "test\n").expect("held bytes, unsendable name");
+        let held = held_by_repository_blocking(&root, &[&copy, &edited, &newline]);
+        assert_eq!(held, vec![copy]);
+        assert!(held_by_repository_blocking(&root, &[]).is_empty());
+        fs::remove_dir_all(root).expect("remove fixture");
+        fs::remove_dir_all(outside).expect("remove outside fixture");
     }
 
     #[tokio::test]

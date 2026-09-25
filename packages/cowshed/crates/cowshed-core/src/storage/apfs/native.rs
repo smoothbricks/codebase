@@ -5716,16 +5716,22 @@ fn metadata_workspace_ref(
     .map_err(|_| ApfsStorageError::Host("invalid detached workspace identity".to_owned()))
 }
 
-/// Deletes every stray under an unmounted mountpoint that is junk - hidden, or ignored by the
-/// project's gitignore rules judged from its checkout - and returns the paths that were kept
-/// because they are neither. One walk collects the candidates, one `check-ignore` judges them,
-/// and directories emptied by the deletions are removed bottom-up.
+/// Deletes every stray under an unmounted mountpoint that is junk - hidden, ignored by the
+/// project's gitignore rules judged from its checkout, or a regular file whose exact bytes the
+/// project's repository already holds as a blob - and returns the paths that were kept because
+/// they are none of these. One walk collects the candidates, one `check-ignore` judges them, one
+/// `hash-object` + `cat-file` pair judges what is left, and directories emptied by the deletions
+/// are removed bottom-up.
+///
+/// A file git can reproduce byte for byte is not unsaved work: the left-behind copy of a checkout
+/// (a mountpoint that was once a worktree) is exactly that, and would otherwise pin its
+/// mountpoint forever.
 fn remove_stray_junk(
     mount_point: &Path,
     checkout: &Path,
 ) -> Result<Vec<PathBuf>, ApfsStorageError> {
-    // (absolute path, relative form for check-ignore, is directory)
-    let mut strays: Vec<(PathBuf, Vec<u8>, bool)> = Vec::new();
+    // (absolute path, relative form for check-ignore, is directory, is regular file)
+    let mut strays: Vec<(PathBuf, Vec<u8>, bool, bool)> = Vec::new();
     let mut hidden: Vec<(PathBuf, bool)> = Vec::new();
     let mut stack = vec![mount_point.to_path_buf()];
     let mut visited = Vec::new();
@@ -5752,23 +5758,38 @@ fn remove_stray_junk(
                 judged.push(b'/');
                 stack.push(path.clone());
             }
-            strays.push((path, judged, file_type.is_dir()));
+            strays.push((path, judged, file_type.is_dir(), file_type.is_file()));
         }
     }
     let judged: Vec<&[u8]> = strays
         .iter()
-        .map(|(_, relative, _)| relative.as_slice())
+        .map(|(_, relative, _, _)| relative.as_slice())
         .collect();
     let ignored: std::collections::BTreeSet<Vec<u8>> =
         crate::git::ignored_by_blocking(checkout, &judged)
             .into_iter()
             .collect();
+    let mut unjudged_files = Vec::new();
     let mut kept = Vec::new();
     let mut removals: Vec<(PathBuf, bool)> = hidden;
-    for (path, relative, is_dir) in strays {
+    for (path, relative, is_dir, is_file) in strays {
         if ignored.contains(&relative) {
             removals.push((path, is_dir));
+        } else if is_file {
+            unjudged_files.push(path);
         } else if !is_dir {
+            kept.push(path);
+        }
+    }
+    let unjudged: Vec<&Path> = unjudged_files.iter().map(PathBuf::as_path).collect();
+    let held: std::collections::BTreeSet<PathBuf> =
+        crate::git::held_by_repository_blocking(checkout, &unjudged)
+            .into_iter()
+            .collect();
+    for path in unjudged_files {
+        if held.contains(&path) {
+            removals.push((path, false));
+        } else {
             kept.push(path);
         }
     }
@@ -5865,8 +5886,9 @@ fn clone_lineage_from(marker_path: &Path, repo: &RepoId) -> Vec<WorkspaceIncarna
 mod tests {
     use super::*;
 
-    /// A retired mountpoint's strays: hidden and gitignored ones go, a visible file the
-    /// project's rules do not ignore stays and is named.
+    /// A retired mountpoint's strays: hidden and gitignored ones go, so does a copy of a file the
+    /// repository already stores, and a visible file with bytes git does not hold stays and is
+    /// named.
     #[test]
     fn stray_junk_is_deleted_and_work_is_kept() {
         let root = std::env::temp_dir().join(format!(
@@ -5900,8 +5922,35 @@ mod tests {
         fs::write(mount.join("packages/wire/build.log"), "x").expect("ignored by glob");
         fs::create_dir_all(mount.join("packages/wire/src")).expect("src");
         fs::write(mount.join("packages/wire/src/lib.rs"), "fn a() {}").expect("work");
+        // A left-behind copy of a committed file: git reproduces it byte for byte.
+        fs::write(checkout.join("committed.rs"), "fn held() {}\n").expect("committed source");
+        for args in [
+            &["add", "committed.rs"][..],
+            &[
+                "-c",
+                "user.name=Cowshed Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "-qm",
+                "held",
+            ][..],
+        ] {
+            assert!(
+                std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(&checkout)
+                    .args(args)
+                    .status()
+                    .expect("git")
+                    .success()
+            );
+        }
+        fs::write(mount.join("packages/wire/src/held.rs"), "fn held() {}\n").expect("held copy");
+
         let kept = remove_stray_junk(&mount, &checkout).expect("sweep");
         assert_eq!(kept, vec![mount.join("packages/wire/src/lib.rs")]);
+        assert!(!mount.join("packages/wire/src/held.rs").exists());
         assert!(!mount.join(".nx").exists());
         assert!(!mount.join(".envrc").exists());
         assert!(!mount.join("packages/wire/generated").exists());
