@@ -204,7 +204,9 @@ Budget: ≤ 1 s cold. No pool, no pre-warming.
 3. Attach without mounting, run `fsck_apfs -q` against the clone's APFS volume device, then mount at
    `<mount-root>/<owner>/<repo>/<name>` — extension and detached `imageFormat` must agree, then attach dispatches to
    `diskutil image attach --noMount` for ASIF or `hdiutil attach -nomount` for SPARSE (flags per 01_storage.md) —
-   ~235–400 ms typical. Verification precedes the first mount; a clone never mounts unchecked.
+   ~235–400 ms typical for a freshly written image. The first write into the clone, in attach or mount, also copies the
+   source image's extent map (01_storage.md, "Clone cost follows extents, not size"), which on a long-used main is tens
+   of seconds. Verification precedes the first mount; a clone never mounts unchecked.
 4. On fsck failure, delete the clone and retry once from a fresh sync. (Measured: 10/10 clonefiles taken under a
    continuous writer plus a streaming 128 MiB dd passed both `fsck_apfs -q` and a full `-n` check, mountable and
    readable, on both formats — this path is a safety net that is expected to essentially never fire; the fork-mid-write
@@ -218,10 +220,16 @@ Budget: ≤ 1 s cold. No pool, no pre-warming.
    private netns on `127.0.0.1:7644` (04_sandbox.md/05_gateway.md). Mark `<mount>/.envrc` direnv-trusted. In-image Bun,
    Cargo, Go, and proxy wiring uses the platform endpoint, and tool shims are placed at `.cowshed/bin/`; there is no git
    network wiring — workspace git is local-only (see "Remote code ingress").
-6. Inside the mount, under the workspace's closed sandbox: configure the `main` remote (see "The `main` remote") and
-   `git switch -c cowshed/<name>` from the checked-out state. The `.git` directory arrived complete via CoW — the
-   workspace is a standalone repository with **no linked-worktree registration and no back-references** into the host
-   checkout, unless it was created with `--git-worktree` (see "Git-worktree workspaces").
+6. Re-resolve inherited escaping symlinks. A relative symlink whose target climbs above the tree root (the entry
+   `bun install` writes for a `link:` dependency, say) was computed against main's depth and lands somewhere else at the
+   workspace's mount depth, so it is rewritten to the absolute path it named in main; one whose target does not exist in
+   main either is refused by name rather than repointed at a guess. In-tree and absolute links are left alone. Finding
+   them reads every directory of the fresh volume, concurrently, and is the largest setup cost after the clone's first
+   write (about 5 s over a million entries). Then, inside the mount, under the workspace's closed sandbox: configure the
+   `main` remote (see "The `main` remote") and `git switch -c cowshed/<name>` from the checked-out state. The `.git`
+   directory arrived complete via CoW — the workspace is a standalone repository with **no linked-worktree registration
+   and no back-references** into the host checkout, unless it was created with `--git-worktree` (see "Git-worktree
+   workspaces").
 7. Record the audit
    `ControllerCommitment::Fork(ForkCommitment { version, order, repo_id, source_incarnation, destination_incarnation })`;
    the new marker carries `lineage` = main's incarnation followed by main's own lineage, which is what authorizes the
@@ -236,6 +244,53 @@ same call returns that incarnation instead of creating a second workspace or rep
 Flags: `--ref <rev>` (after branching, `git switch -c cowshed/<name> <rev>` instead of main's state),
 `--from <workspace>` (clone a session instead of main — sugar over `cowshed fork`), `--register` (see "The `main`
 remote"), `--git-worktree` (see "Git-worktree workspaces"), `--browse`.
+
+### Publication and crash recovery
+
+`new` and `fork` publish the destination before they mount it, and a crash resumes rather than rolls back. The lifecycle
+intent is durable before storage mutation. Clone metadata is written at the canonical sidecar before the payload
+appears, in publication state `PendingFence`, which keeps the destination out of ordinary enumeration until
+initialization and post-callback validation finish. Activation is one atomic sidecar rewrite from `PendingFence` to
+`Active`; the mounted attachment is then retained. The normal path has no staging mount, detach, image rename, canonical
+reattach, or remount.
+
+| Kill window                                                      | Durable state                                                  | Recovery action and guard                                                                                                                                                                                   |
+| ---------------------------------------------------------------- | -------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Before pending metadata                                          | Intent only                                                    | Re-run create/fork normally.                                                                                                                                                                                |
+| After sidecar, before complete clone                             | Sidecar only, or a failed clone                                | A clone failure reclaims both artifacts; startup recovery removes a sidecar-only record. No partial payload is admitted as resumable.                                                                       |
+| After clone, before attach                                       | C + `PendingFence`                                             | Reuse the metadata incarnation and original operation identity; never clone over C.                                                                                                                         |
+| After attach, before mount                                       | C + `PendingFence` + unmounted attachment                      | An exact inventory match is detached and settled, then the ordinary verified attach/fsck path repeats before mounting.                                                                                      |
+| After mount, during image-local preparation                      | C + `PendingFence` + canonical kernel mount                    | Exact source-device and canonical mount flags reuse the existing attachment; ambiguous or foreign mounts fail closed. Rename and credential publication are idempotent.                                     |
+| During the initializer                                           | The same pending mounted C, possibly with external Git effects | Cancellation and initializer errors preserve C and the mount. The retry receives explicit `stage.resuming` authority; the branch and worktree state machines continue only their exact cowshed-owned state. |
+| After the marker write                                           | The same pending mounted C                                     | An already-current marker is validated rather than rewritten, so lineage never duplicates itself.                                                                                                           |
+| After the callback, before or during activation                  | Pending or `Active` sidecar (atomic rewrite)                   | Pending reruns the callback and validation; `Active` is listed as current. No intermediate publication state exists.                                                                                        |
+| After activation, before downstream effects or intent completion | `Active` C + pending lifecycle intent                          | Startup recovery reruns optional main registration and append-safe commitments, then records exact completion. Slot binding is retained across errors, and rebinding the exact owner is a no-op.            |
+| After completion                                                 | `Active` C + completed intent                                  | Reissuing returns the recorded incarnation; supervisor startup is start-or-reuse.                                                                                                                           |
+
+Every initializer step can run again:
+
+| Step                                                              | Replay rule                                                                                                                            |
+| ----------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------- |
+| inherited daemon discard                                          | Not-found is success; deletion is deterministic.                                                                                       |
+| environment hook                                                  | Check-first, with an append-open recheck.                                                                                              |
+| inherited remotes and links, local `main` remote                  | An empty loop or a deterministic rewrite, plus ownership-checked remote configuration.                                                 |
+| standalone branch                                                 | A fresh preparation refuses a collision; a storage-authorized resume reuses and checks out only `cowshed/<name>`.                      |
+| linked-worktree registration                                      | Exact admin and pointer states continue through staging-pointer relocation and `worktree repair`; mixed or foreign states fail closed. |
+| marker                                                            | An exact current marker validates and skips the rewrite.                                                                               |
+| credentials                                                       | Atomically overwritten while still unpublished.                                                                                        |
+| slot                                                              | Binding the same workspace to the same slot is idempotent, and the binding stays owned by the pending intent.                          |
+| optional registration, commitments, intent completion, supervisor | Set or check first, append-safe telemetry, overwrite-safe completion, start-or-reuse.                                                  |
+
+**Rollback was rejected.** Initialization changes state outside the image: the `cowshed/<name>` branch and, for a
+git-worktree workspace, its registration live in main's repository. Deleting the image of a crashed create orphans them,
+compensating is itself crashable, and deleting a branch that acquired commits between the crash and the reclaim loses
+work. Rolling back would also need a fence for the corpse and a reclaim rule anyway, and it has a window in which a
+crash after a successful initialization deletes complete work. Resume never deletes state a user can reach.
+
+**Mounting the staging image and renaming it under the live mount was rejected.** It renames an attached image's backing
+file, after which the `hdiutil info` inventory, keyed by the path the image was opened with, reads a mounted image as
+detached. A crash during initialization would also leave a staging image mounted at the canonical mountpoint, which the
+staging-mount collector does not retire, so the retry would find its own mountpoint busy.
 
 ## The `main` remote
 

@@ -121,6 +121,12 @@ every clone automatically). Main and sessions use identical wiring; only the san
   owned by root, so cowshed chowns the volume root to the user immediately after creation.
 - **Capacity**: 100 GiB sparse. Capacity is a cap, not an allocation; images occupy only written blocks. Override per
   project via `.cowshed.toml` `capacity`.
+- **Clone cost follows extents, not size**: `clonefile` of an image returns in milliseconds because the clone shares the
+  source file's extent map, and the first write to either file copies that map, at about 12 µs per extent on the store
+  volume. A main image fragments with every write it takes while clones share its blocks, so a long-used main is slow to
+  clone even though the clone call is instant: a one-byte write into a plain `cp -c` clone of a 2.1M-extent image took
+  25.7 s with no image attached, a 473k-extent image 4.4 s, and a freshly written 256-extent file 5 ms. `new` and `fork`
+  pay it inside attach or mount, whichever writes first; deleting a written clone pays about half as much per extent.
 - **Filesystem**: APFS, case sensitivity matching the volume that holds the adopted repository (queried via
   `pathconf(_PC_CASE_SENSITIVE)` at adopt time) so git behavior is identical inside and outside.
 - **Volume name**: the repository name for `main`, `<repo> — <workspace>` for every other workspace. The volume name is
