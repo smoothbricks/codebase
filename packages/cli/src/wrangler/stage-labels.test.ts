@@ -1,5 +1,11 @@
 import { describe, expect, it } from 'bun:test';
-import { hasStageLabel, replaceExactToken, replaceHostnameLabel } from './stage-labels.js';
+import {
+  hasStageLabel,
+  replaceExactToken,
+  replaceHostnameLabel,
+  routeHostname,
+  wildcardDnsRecord,
+} from './stage-labels.js';
 
 describe('hasStageLabel', () => {
   it('detects the staging label as a hostname segment', () => {
@@ -25,5 +31,31 @@ describe('label rewrites', () => {
   it('rewrites the staging hostname label and the exact hyphen-delimited token', () => {
     expect(replaceHostnameLabel('*.staging.example.com/*', 'pr7')).toBe('*.pr7.example.com/*');
     expect(replaceExactToken('site-staging-db', 'staging', 'pr7')).toBe('site-pr7-db');
+  });
+});
+
+describe('routeHostname', () => {
+  it('is the host a route pattern serves, without its wildcard label or path', () => {
+    expect(routeHostname('*.pr7.example.com')).toBe('pr7.example.com');
+    expect(routeHostname('*.pr7.example.com/*')).toBe('pr7.example.com');
+    expect(routeHostname('site.pr7.example.com/api/*')).toBe('site.pr7.example.com');
+  });
+
+  it('is lowercase, since hostnames do not distinguish case', () => {
+    expect(routeHostname('*.PR7.Example.com/*')).toBe('pr7.example.com');
+  });
+});
+
+describe('wildcardDnsRecord', () => {
+  it('points the wildcard name at the host a zoned *. route serves, with or without a path', () => {
+    const record = { zoneName: 'example.com', name: '*.pr7.example.com', content: 'pr7.example.com' };
+    expect(wildcardDnsRecord({ pattern: '*.pr7.example.com/*', zoneName: 'example.com' })).toEqual(record);
+    expect(wildcardDnsRecord({ pattern: '*.pr7.example.com', zoneName: 'example.com' })).toEqual(record);
+    expect(wildcardDnsRecord({ pattern: '*.PR7.Example.com/*', zoneName: 'example.com' })).toEqual(record);
+  });
+
+  it('is nothing for a route without a zone name or without a leading *. label', () => {
+    expect(wildcardDnsRecord({ pattern: '*.pr7.example.com/*' })).toBeUndefined();
+    expect(wildcardDnsRecord({ pattern: 'site.pr7.example.com/*', zoneName: 'example.com' })).toBeUndefined();
   });
 });

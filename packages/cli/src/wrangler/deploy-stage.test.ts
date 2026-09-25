@@ -488,6 +488,23 @@ describe('deploy-stage against live state', () => {
     expect(createAttempts).toBe(1);
     expect(cloudflare.records.zone?.map((record) => record.name)).toEqual(['*.pr123.example.test']);
   });
+
+  it('points the wildcard DNS record of a route without a path at the whole host', async () => {
+    const root = await fixtureRoot(`${FIXTURE}
+[[env.staging.routes]]
+pattern = "*.staging.example.test"
+zone_name = "example.test"
+`);
+    const cloudflare = new FakeCloudflare();
+    cloudflare.zones = [{ id: 'zone', name: 'example.test' }];
+
+    await deployStage(root, { stage: 'pr123' }, dependencies(new FakeRunner([], {}), cloudflare));
+
+    expect(cloudflare.mutations).toEqual([
+      'create-dns:zone:*.pr123.example.test:pr123.example.test',
+      'create-route:zone:*.pr123.example.test:fixture-worker-pr123',
+    ]);
+  });
 });
 
 /**

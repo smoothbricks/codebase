@@ -32,6 +32,7 @@ import {
   planStageResources,
   pullRequestStage,
 } from './stage.js';
+import { wildcardDnsRecord } from './stage-labels.js';
 import {
   planStageSecrets,
   readDeclaredSecretNames,
@@ -571,24 +572,23 @@ async function reconcileStageResources(
   const zoneByName = new Map(zones.map((zone) => [zone.name, zone]));
   const dnsNamesByZone = new Map<string, Set<string>>();
   for (const route of plan.routes) {
-    if (!route.pattern.startsWith('*.') || !route.zoneName) continue;
-    const zone = zoneByName.get(route.zoneName);
-    if (!zone) throw new Error(`Cloudflare zone ${route.zoneName} is not available to the deployment token.`);
-    const hostname = route.pattern.slice(0, route.pattern.indexOf('/')).replace(/^\*\./, '');
-    const wildcard = `*.${hostname}`;
+    const wildcard = wildcardDnsRecord(route);
+    if (!wildcard) continue;
+    const zone = zoneByName.get(wildcard.zoneName);
+    if (!zone) throw new Error(`Cloudflare zone ${wildcard.zoneName} is not available to the deployment token.`);
     let names = dnsNamesByZone.get(zone.id);
     if (!names) {
       names = new Set((await cloudflare.listDnsRecords(zone.id)).map((record) => record.name));
       dnsNamesByZone.set(zone.id, names);
     }
-    if (!names.has(wildcard)) {
+    if (!names.has(wildcard.name)) {
       try {
-        await cloudflare.createDnsRecord(zone.id, wildcard, hostname);
+        await cloudflare.createDnsRecord(zone.id, wildcard.name, wildcard.content);
       } catch (error) {
-        const exists = (await cloudflare.listDnsRecords(zone.id)).some((record) => record.name === wildcard);
+        const exists = (await cloudflare.listDnsRecords(zone.id)).some((record) => record.name === wildcard.name);
         if (!exists) throw error;
       }
-      names.add(wildcard);
+      names.add(wildcard.name);
     }
   }
 
