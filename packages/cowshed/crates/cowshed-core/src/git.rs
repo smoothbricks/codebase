@@ -697,10 +697,17 @@ impl GitRepository {
         self.is_dirty_by(None).await
     }
 
-    /// [`Self::is_dirty`] with a second reading of junk: an untracked path the PROJECT's own
-    /// gitignore rules ignore, judged from `checkout` (the adopted main). A clone carries the
-    /// ignore file of the commit it was cut from, so bench output main learned to ignore an
-    /// hour later still reads as work in every older clone unless the current rules decide.
+    /// [`Self::is_dirty`] judged against `checkout` (the adopted main), which adds two readings
+    /// of an untracked path that is not work.
+    ///
+    /// One is a path the PROJECT's own gitignore rules ignore. A clone carries the ignore file
+    /// of the commit it was cut from, so bench output main learned to ignore an hour later still
+    /// reads as work in every older clone unless the current rules decide.
+    ///
+    /// The other is a path main's checkout holds with the same content. An untracked file left
+    /// in main arrives in every clone, so reading it as work would make every workspace of that
+    /// project unremovable and fail every `land` at its retire step. Main still holds every
+    /// byte of such a path, so retiring the workspace loses nothing.
     pub async fn is_dirty_by(&self, checkout: Option<&Path>) -> Result<bool> {
         let output = self.porcelain_status("read repository status").await?;
         let mut untracked: Vec<&[u8]> = Vec::new();
@@ -719,9 +726,38 @@ impl GitRepository {
         let Some(checkout) = checkout else {
             return Ok(true);
         };
-        // One check-ignore for every untracked path, not one process per path.
+        // One check-ignore for every untracked path, not one process per path. It answers in
+        // input order, so the ignored paths are a subsequence of `untracked` and one pass
+        // separates them.
         let ignored = ignored_by(checkout, &untracked).await;
-        Ok(untracked.len() != ignored.len())
+        let mut ignored = ignored.iter().map(Vec::as_slice).peekable();
+        let unignored: Vec<PathBuf> = untracked
+            .into_iter()
+            .filter(|path| {
+                let is_ignored = ignored.peek() == Some(path);
+                if is_ignored {
+                    ignored.next();
+                }
+                !is_ignored
+            })
+            .map(|path| PathBuf::from(OsStr::from_bytes(path)))
+            .collect();
+        if unignored.is_empty() {
+            return Ok(false);
+        }
+        let root = self.root.clone();
+        let checkout = checkout.to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            unignored
+                .iter()
+                .any(|relative| !held_by_checkout(&root, &checkout, relative))
+        })
+        .await
+        .map_err(|source| {
+            CowshedError::internal(format!(
+                "comparing untracked files with main's checkout panicked: {source}"
+            ))
+        })
     }
 
     pub async fn ensure_cowshed_excludes(&self) -> Result<()> {
@@ -2513,6 +2549,50 @@ fn porcelain_records(stdout: &[u8]) -> impl Iterator<Item = (&[u8], &[u8])> {
 }
 
 /// An untracked path with a hidden component: junk, never work.
+/// Whether main's `checkout` holds exactly what this workspace's `root` holds at the untracked
+/// `relative` path: a regular file with the same bytes, or a symlink with the same target.
+///
+/// Anything that cannot be read on either side, or any other kind of entry, answers no, which
+/// can only cost a refusal and never a lost file.
+fn held_by_checkout(root: &Path, checkout: &Path, relative: &Path) -> bool {
+    let ours = root.join(relative);
+    let theirs = checkout.join(relative);
+    let (Ok(our_kind), Ok(their_kind)) =
+        (fs::symlink_metadata(&ours), fs::symlink_metadata(&theirs))
+    else {
+        return false;
+    };
+    if our_kind.file_type().is_symlink() && their_kind.file_type().is_symlink() {
+        return matches!(
+            (fs::read_link(&ours), fs::read_link(&theirs)),
+            (Ok(our_target), Ok(their_target)) if our_target == their_target
+        );
+    }
+    our_kind.is_file()
+        && their_kind.is_file()
+        && our_kind.len() == their_kind.len()
+        && same_bytes(&ours, &theirs).unwrap_or(false)
+}
+
+/// Byte-for-byte equality of two files already known to be the same length.
+fn same_bytes(left: &Path, right: &Path) -> std::io::Result<bool> {
+    const CHUNK: usize = 64 * 1024;
+    let mut left = File::open(left)?;
+    let mut right = File::open(right)?;
+    let mut left_chunk = vec![0_u8; CHUNK];
+    let mut right_chunk = vec![0_u8; CHUNK];
+    loop {
+        let read = left.read(&mut left_chunk)?;
+        if read == 0 {
+            return Ok(right.read(&mut right_chunk)? == 0);
+        }
+        right.read_exact(&mut right_chunk[..read])?;
+        if left_chunk[..read] != right_chunk[..read] {
+            return Ok(false);
+        }
+    }
+}
+
 fn is_untracked_junk(status: &[u8], path: &[u8]) -> bool {
     status == b"??" && is_hidden_path(path)
 }
@@ -2701,6 +2781,45 @@ mod tests {
         fs::write(root.join("bench/results/run-1/out.txt"), "1\n").expect("bench output");
         assert!(git.is_dirty().await.expect("own rules"));
         assert!(!git.is_dirty_by(Some(&main)).await.expect("main's rules"));
+        fs::remove_dir_all(main).expect("remove main fixture");
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    #[tokio::test]
+    async fn an_untracked_path_main_holds_identically_was_inherited_not_written() {
+        let root = repository();
+        let main = repository();
+        let git = GitRepository::from_root(&root);
+        for tree in [&root, &main] {
+            fs::create_dir_all(tree.join("tooling")).expect("tooling dir");
+            fs::write(tree.join("tooling/prune.ts"), "export {};\n").expect("script");
+            symlink("../README", tree.join("tooling/readme")).expect("link");
+        }
+        assert!(
+            git.is_dirty().await.expect("own reading"),
+            "with no main to compare against, an untracked file is work"
+        );
+        assert!(
+            !git.is_dirty_by(Some(&main)).await.expect("main holds both"),
+            "a file and a link main holds identically came with the clone"
+        );
+
+        // Same length, different bytes: written in the workspace.
+        fs::write(root.join("tooling/prune.ts"), "export {}\n;").expect("edit");
+        assert!(git.is_dirty_by(Some(&main)).await.expect("edited file"));
+        fs::write(root.join("tooling/prune.ts"), "export {};\n").expect("restore");
+
+        // A link repointed in the workspace.
+        fs::remove_file(root.join("tooling/readme")).expect("unlink");
+        symlink("../notes", root.join("tooling/readme")).expect("relink");
+        assert!(git.is_dirty_by(Some(&main)).await.expect("repointed link"));
+        fs::remove_file(root.join("tooling/readme")).expect("unlink");
+        symlink("../README", root.join("tooling/readme")).expect("restore link");
+
+        // A file main does not have.
+        fs::write(root.join("notes.rs"), "fn main() {}\n").expect("new file");
+        assert!(git.is_dirty_by(Some(&main)).await.expect("new file"));
+
         fs::remove_dir_all(main).expect("remove main fixture");
         fs::remove_dir_all(root).expect("remove fixture");
     }

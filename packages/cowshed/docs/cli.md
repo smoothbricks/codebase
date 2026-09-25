@@ -450,6 +450,10 @@ The two overrides authorize different losses and neither substitutes for the oth
 | `--force`   | transient state: a dirty tree, an in-progress merge, a busy mount | the landed-ancestry gate |
 | `--abandon` | the landed-ancestry gate — commits `main` does not contain        | transient state          |
 
+A dirty tree is a tracked change, or an untracked file that is not hidden, not ignored by main's current gitignore
+rules, and not held by main's checkout with the same content at the same path: an untracked file left in main arrives in
+every clone and is not the workspace's work.
+
 `--abandon` has no short spelling, and it is the only way to delete unlanded commits. Before deleting, it writes a Git
 bundle of `main..HEAD` beside the retired image in `sessions/.trash/<ws>-<tip>.bundle` and prints what it destroyed, so
 even a deliberate abandonment is recoverable:
