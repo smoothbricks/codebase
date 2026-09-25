@@ -55,7 +55,7 @@ describe('CI workflow definition', () => {
     expect(rendered).toContain('id: deploy');
     expect(rendered).toContain('smoo github-ci nx-deploy --mode run-many --name "Deploy Stage" --step 7');
     expect(rendered).toContain('smoo github-ci nx-smart --target test-browser --name "Browser Tests" --step 10');
-    expect(rendered).toContain('group: ${{ github.workflow }}-${{ github.ref }}');
+    expect(rendered).toContain('group: CI-${{ github.ref }}');
     expect(rendered).toContain("cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}");
     expect(rendered).toContain('github.event.pull_request.head.repo.full_name == github.repository');
     expect(rendered).toContain("github.ref == 'refs/heads/main'");

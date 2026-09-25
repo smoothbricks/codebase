@@ -510,6 +510,37 @@ describe('CI workflow rendering by repo shape', () => {
     );
   });
 
+  it('threads the declared private npm read token into the preview cleanup job', () => {
+    const privateNpm = { scope: '@priv.test', readTokenEnv: 'PRIV_NPM_READ_TOKEN' };
+    const cleanup = renderManagedWorkflowForTest('pr-preview-cleanup-workflow', { ...deploying, privateNpm });
+
+    expect(cleanup).toContain('    env:\n      PRIV_NPM_READ_TOKEN: ${{ secrets.PRIV_NPM_READ_TOKEN }}\n    steps:\n');
+    expect(renderManagedWorkflowForTest('pr-preview-cleanup-workflow', deploying)).not.toMatch(/^ {4}env:/m);
+  });
+
+  it('threads the staging environment, Cloudflare deploy secrets and sibling sources into the preview cleanup job', () => {
+    const cleanup = renderManagedWorkflowForTest('pr-preview-cleanup-workflow', {
+      ...deploying,
+      ciEnvironments: { staging: 'staging' },
+      ciDeploySecrets: { CLOUDFLARE_API_TOKEN: 'CF_STAGE_TOKEN' },
+      sourceCheckouts: [{ path: '../shared', repository: 'https://git.example.test/shared.git' }],
+    });
+
+    expect(cleanup).toContain('    environment: staging\n');
+    expect(cleanup).toContain('          CLOUDFLARE_API_TOKEN: ${{ secrets.CF_STAGE_TOKEN }}\n');
+    expect(cleanup).toContain('git clone --filter=blob:none https://git.example.test/shared.git "$root/../shared"');
+  });
+
+  it('threads the declared Cargo credentials into the preview cleanup job', () => {
+    const cleanup = renderManagedWorkflowForTest('pr-preview-cleanup-workflow', {
+      ...deploying,
+      cargoCredentials: { gitOrigins: [{ origin: 'https://git.example.test', tokenEnv: 'SOURCE_READ_TOKEN' }] },
+    });
+
+    expect(cleanup).toContain('    env:\n      SOURCE_READ_TOKEN: ${{ secrets.SOURCE_READ_TOKEN }}\n    steps:\n');
+    expect(cleanup).toContain('      - name: Prepare Cargo credentials\n');
+  });
+
   it('threads environments and secrets from the context into the workflow', () => {
     const rendered = renderManagedWorkflowForTest('ci-workflow', {
       ...deploying,

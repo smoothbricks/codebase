@@ -50,17 +50,21 @@ export interface CloudflareClient {
   deleteKvNamespace(id: string): Promise<void>;
   listR2Buckets(): Promise<R2Bucket[]>;
   createR2Bucket(name: string): Promise<void>;
-  listR2Objects(bucket: string): Promise<string[]>;
+  /** Every key in the bucket, or only the keys under `prefix`. */
+  listR2Objects(bucket: string, prefix?: string): Promise<string[]>;
+  putR2Object(bucket: string, key: string, body: string): Promise<void>;
   deleteR2Object(bucket: string, key: string): Promise<void>;
   deleteR2Bucket(name: string): Promise<void>;
   listWorkerScripts(): Promise<WorkerScript[]>;
   /** Names only; the Worker's stored values are write-only from outside. */
   listWorkerSecrets(workerName: string): Promise<string[]>;
+  /** Also while another Worker still binds it: a stage's Workers bind each other. */
   deleteWorkerScript(name: string): Promise<void>;
   listWorkerDomains(): Promise<WorkerDomain[]>;
   createWorkerDomain(hostname: string, workerName: string, zoneId: string): Promise<void>;
   deleteWorkerDomain(id: string): Promise<void>;
-  listZones(): Promise<CloudflareZone[]>;
+  /** The account's zones, or only the one named `name`. */
+  listZones(name?: string): Promise<CloudflareZone[]>;
   listWorkerRoutes(zoneId: string): Promise<WorkerRoute[]>;
   createWorkerRoute(zoneId: string, pattern: string, workerName: string): Promise<void>;
   deleteWorkerRoute(zoneId: string, routeId: string): Promise<void>;
@@ -164,7 +168,7 @@ export class CloudflareRestClient implements CloudflareClient {
   private readonly accountPath: string;
 
   constructor(
-    accountId: string,
+    private readonly accountId: string,
     private readonly apiToken: string,
     private readonly fetcher: CloudflareFetcher = fetch,
   ) {
@@ -205,20 +209,28 @@ export class CloudflareRestClient implements CloudflareClient {
     return this.mutate(`${this.accountPath}/r2/buckets`, { method: 'POST', body: JSON.stringify({ name }) });
   }
 
-  async listR2Objects(bucket: string): Promise<string[]> {
+  async listR2Objects(bucket: string, prefix?: string): Promise<string[]> {
     const objects = await this.listCursor(
       `${this.accountPath}/r2/buckets/${encodeURIComponent(bucket)}/objects`,
       (result) => (isR2Objects(result) ? result : isR2ObjectPage(result) ? result.objects : undefined),
+      prefix === undefined ? {} : { prefix },
     );
-    return objects.map((object) => object.key);
+    const keys = objects.map((object) => object.key);
+    // Filtered here as well, so a server that ignored `prefix` could cost a longer listing but
+    // never hand a caller a key outside what it asked for.
+    return prefix === undefined ? keys : keys.filter((key) => key.startsWith(prefix));
+  }
+
+  putR2Object(bucket: string, key: string, body: string): Promise<void> {
+    return this.mutate(this.r2ObjectPath(bucket, key), {
+      method: 'PUT',
+      body,
+      headers: { 'Content-Type': 'application/octet-stream' },
+    });
   }
 
   deleteR2Object(bucket: string, key: string): Promise<void> {
-    // The endpoint requires literal slashes in an object key and percent-encoding everywhere else.
-    const objectPath = key.split('/').map(encodeURIComponent).join('/');
-    return this.mutate(`${this.accountPath}/r2/buckets/${encodeURIComponent(bucket)}/objects/${objectPath}`, {
-      method: 'DELETE',
-    });
+    return this.mutate(this.r2ObjectPath(bucket, key), { method: 'DELETE' });
   }
 
   deleteR2Bucket(name: string): Promise<void> {
@@ -241,7 +253,11 @@ export class CloudflareRestClient implements CloudflareClient {
   }
 
   deleteWorkerScript(name: string): Promise<void> {
-    return this.mutate(`${this.accountPath}/workers/scripts/${encodeURIComponent(name)}`, { method: 'DELETE' });
+    // Without `force`, Cloudflare refuses to delete a Worker another Worker binds (a service
+    // binding), so of two stage Workers binding each other neither could go first.
+    return this.mutate(`${this.accountPath}/workers/scripts/${encodeURIComponent(name)}?force=true`, {
+      method: 'DELETE',
+    });
   }
 
   listWorkerDomains(): Promise<WorkerDomain[]> {
@@ -259,8 +275,13 @@ export class CloudflareRestClient implements CloudflareClient {
     return this.mutate(`${this.accountPath}/workers/domains/${encodeURIComponent(id)}`, { method: 'DELETE' });
   }
 
-  listZones(): Promise<CloudflareZone[]> {
-    return this.listPages('/zones', isCloudflareZones, ZONE_PAGE_SIZE);
+  listZones(name?: string): Promise<CloudflareZone[]> {
+    // Unfiltered, `GET /zones` answers the zones of every account the token reaches. A Worker route or
+    // custom domain binds only a zone of the Worker's own account, and every other listing here is
+    // scoped to that account, so zones are too.
+    const filter: Record<string, string> = { 'account.id': this.accountId };
+    if (name !== undefined) filter.name = name;
+    return this.listPages('/zones', isCloudflareZones, ZONE_PAGE_SIZE, filter);
   }
 
   listWorkerRoutes(zoneId: string): Promise<WorkerRoute[]> {
@@ -317,6 +338,18 @@ export class CloudflareRestClient implements CloudflareClient {
     return this.mutate(`${this.accountPath}/d1/database/${encodeURIComponent(uuid)}`, { method: 'DELETE' });
   }
 
+  /**
+   * The object endpoint takes the key as its trailing path: slashes literal, everything else
+   * percent-encoded, decoded once by the server. `wrangler r2 object put` addresses the same path
+   * (`putRemoteObject` in wrangler's src/r2/helpers/object.ts) with the key's slashes literal but
+   * the rest unescaped, so a `%` in a key would reach the server as an escape; each segment
+   * encoded here sends it as `%25`, and the stored key is exactly the one given.
+   */
+  private r2ObjectPath(bucket: string, key: string): string {
+    const objectPath = key.split('/').map(encodeURIComponent).join('/');
+    return `${this.accountPath}/r2/buckets/${encodeURIComponent(bucket)}/objects/${objectPath}`;
+  }
+
   /** An endpoint that answers its whole collection at once. */
   private async listOnce<T>(path: string, isItems: (value: unknown) => value is T[]): Promise<T[]> {
     const envelope = await this.request(path);
@@ -326,10 +359,16 @@ export class CloudflareRestClient implements CloudflareClient {
     return envelope.result;
   }
 
-  private async listPages<T>(path: string, isItems: (value: unknown) => value is T[], perPage: number): Promise<T[]> {
+  private async listPages<T>(
+    path: string,
+    isItems: (value: unknown) => value is T[],
+    perPage: number,
+    filter: Record<string, string> = {},
+  ): Promise<T[]> {
     const items: T[] = [];
     for (let page = 1; page <= MAX_LIST_PAGES; page += 1) {
-      const envelope = await this.request(`${path}?per_page=${perPage}&page=${page}`);
+      const query = new URLSearchParams({ ...filter, per_page: String(perPage), page: String(page) });
+      const envelope = await this.request(`${path}?${query.toString()}`);
       if (!isItems(envelope.result)) {
         throw new Error(`Cloudflare returned an invalid paginated result for ${path}.`);
       }
@@ -344,11 +383,16 @@ export class CloudflareRestClient implements CloudflareClient {
     throw new Error(`Cloudflare paged ${path} past ${MAX_LIST_PAGES} pages without reporting an end.`);
   }
 
-  private async listCursor<T>(path: string, readRows: (result: unknown) => T[] | undefined): Promise<T[]> {
+  private async listCursor<T>(
+    path: string,
+    readRows: (result: unknown) => T[] | undefined,
+    filter: Record<string, string> = {},
+  ): Promise<T[]> {
     const items: T[] = [];
     let cursor: string | undefined;
     for (let page = 1; page <= MAX_LIST_PAGES; page += 1) {
-      const query = new URLSearchParams({ per_page: String(PAGE_SIZE) });
+      // The filter goes on every page, not only the first: nothing documents that a cursor carries it.
+      const query = new URLSearchParams({ ...filter, per_page: String(PAGE_SIZE) });
       if (cursor !== undefined) query.set('cursor', cursor);
       const envelope = await this.request(`${path}?${query.toString()}`);
       const rows = readRows(envelope.result);
