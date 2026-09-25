@@ -1603,20 +1603,10 @@ impl GitRepository {
         }
     }
 
-    /// Configure a fresh standalone workspace. Branch collisions remain strict.
+    /// Configure local-only workspace Git. A fresh preparation refuses an existing branch; it
+    /// continues this clone's branch only when `resuming` proves the canonical image came from
+    /// the pending lifecycle record.
     pub async fn prepare_workspace(
-        &self,
-        name: &str,
-        main_mount: &Path,
-        start: Option<&str>,
-    ) -> Result<MainRemote> {
-        self.prepare_workspace_resumable(name, main_mount, start, false)
-            .await
-    }
-
-    /// Configure local-only workspace Git, continuing this clone's branch only when `resuming`
-    /// proves the canonical image came from the pending lifecycle record.
-    pub async fn prepare_workspace_resumable(
         &self,
         name: &str,
         main_mount: &Path,
@@ -3160,7 +3150,7 @@ mod tests {
 
         let repo = GitRepository::from_root(&root);
         assert_eq!(
-            repo.prepare_workspace("raven", &root, Some("main"))
+            repo.prepare_workspace("raven", &root, Some("main"), false)
                 .await
                 .expect("prepare workspace"),
             MainRemote::Canonical
@@ -3181,7 +3171,7 @@ mod tests {
     async fn standalone_workspace_resume_accepts_only_its_current_branch() {
         let root = repository();
         let repo = GitRepository::from_root(&root);
-        repo.prepare_workspace("raven", &root, Some("main"))
+        repo.prepare_workspace("raven", &root, Some("main"), false)
             .await
             .expect("initial preparation");
 
@@ -3192,7 +3182,7 @@ mod tests {
             .status()
             .expect("move HEAD away after branch creation");
         assert!(switched.success());
-        repo.prepare_workspace_resumable("raven", &root, Some("main"), true)
+        repo.prepare_workspace("raven", &root, Some("main"), true)
             .await
             .expect("resume current workspace branch");
         assert_eq!(
@@ -3203,7 +3193,7 @@ mod tests {
             Some("cowshed/raven")
         );
         let error = repo
-            .prepare_workspace("raven", &root, Some("main"))
+            .prepare_workspace("raven", &root, Some("main"), false)
             .await
             .expect_err("fresh operation still refuses the existing branch");
         assert_eq!(error.code.as_str(), "conflict");
@@ -3624,7 +3614,7 @@ mod tests {
         let root = repository();
         let main_mount = PathBuf::from(OsString::from_vec(b"/tmp/cowshed-main-\xff".to_vec()));
         let repo = GitRepository::from_root(&root);
-        repo.prepare_workspace("raven", &main_mount, None)
+        repo.prepare_workspace("raven", &main_mount, None, false)
             .await
             .expect("prepare workspace");
 

@@ -4697,7 +4697,7 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                         )
                         .await?;
                         repository
-                            .prepare_workspace_resumable(
+                            .prepare_workspace(
                                 &destination.to_string(),
                                 &main_mount,
                                 start.as_deref(),
