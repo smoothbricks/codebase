@@ -1,6 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from 'bun:test';
 import { spawn } from 'node:child_process';
-import { existsSync } from 'node:fs';
 import { chmod, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -260,15 +259,9 @@ function runBuiltBin(workspace: string, args: readonly string[]): Promise<BinRun
   return runBinWith('node', builtBinEntry, workspace, args, {});
 }
 
-function nx(workspace: string, args: readonly string[]): Promise<number | null> {
-  const child = spawn(join(repoRoot, 'node_modules', '.bin', 'nx'), [...args], {
-    cwd: workspace,
-    env: fixtureNxEnvironment({ NX_WORKSPACE_ROOT_PATH: workspace }),
-    stdio: 'ignore',
-  });
-  return new Promise((settle, reject) => {
-    child.once('error', reject);
-    child.once('close', (code) => settle(code));
+function nx(workspace: string, args: readonly string[]): Promise<BinRun> {
+  return runBinWith('node', join(repoRoot, 'node_modules', '.bin', 'nx'), workspace, args, {
+    NX_WORKSPACE_ROOT_PATH: workspace,
   });
 }
 
@@ -366,12 +359,18 @@ describe('smoo-nx-exec', () => {
     }
   });
 
-  it('builds the whole dependency graph on the first run, then execs the binary', async () => {
+  it('reuses the normal Nx CLI cache before executing the binary', async () => {
+    const built = await nx(workspace, ['run-many', '-t', 'build', '-p', 'app', '--outputStyle=static-failures-only']);
+    expect(built.code, built.stdout + built.stderr).toBe(0);
+    expect(await readFile(marker(), 'utf-8')).toBe('built\nlib\n');
+    expect(await readFile(builds(), 'utf-8')).toBe('lib\n');
+
     const run = await runBin(workspace, ['app:build', '--', './report', 'one']);
     expect(run.code).toBe(0);
-    expect(run.stdout).toContain(`${MARKER} one`);
-    expect(existsSync(marker())).toBe(true);
-    expect(existsSync(join(workspace, 'packages', 'lib', 'dist', 'lib.txt'))).toBe(true);
+    expect(run.stderr).toBe('');
+    expect(run.stdout.split('\n')[0]).toBe(`${MARKER} one`);
+    expect(await readFile(marker(), 'utf-8')).toBe('built\nlib\n');
+    expect(await readFile(builds(), 'utf-8')).toBe('lib\n');
   });
 
   it('stays completely silent on a full cache hit', async () => {
@@ -381,6 +380,8 @@ describe('smoo-nx-exec', () => {
     // Nothing but the exec'd binary's own output: no Nx banner, no task log.
     expect(run.stdout.split('\n')[0]).toBe(MARKER);
     expect(run.stdout).not.toContain('nx run');
+    expect(await readFile(marker(), 'utf-8')).toBe('built\nlib\n');
+    expect(await readFile(builds(), 'utf-8')).toBe('lib\n');
   });
 
   it('runs the emitted wrapper under Node without losing the hot path', async () => {
@@ -442,12 +443,14 @@ describe('smoo-nx-exec', () => {
   });
 
   it('runs again once a recorded output is gone from the working tree', async () => {
+    const before = await readFile(builds(), 'utf-8');
     await rm(marker());
     const run = await runBin(workspace, ['app:build', '--', './report'], { NX_VERBOSE_LOGGING: 'true' });
     expect(run.code).toBe(0);
     expect(run.stderr).toContain('outputs are missing or modified on disk');
     expect(run.stdout).toContain(MARKER);
-    expect(existsSync(marker())).toBe(true);
+    expect(await readFile(marker(), 'utf-8')).toBe('built\nlib\n');
+    expect(await readFile(builds(), 'utf-8')).toBe(before);
   });
 
   it('runs again when a dependency\u0027s own inputs change', async () => {

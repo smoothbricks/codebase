@@ -273,6 +273,13 @@ through the inferred `typecheck-tests` target, not through `tsc --build`.
 hashes. A full hit returns without running tasks or printing output. A miss runs the task graph through Nx's in-process
 runner with streaming output; only a workspace with the daemon disabled falls back to its checkout-local `nx` CLI.
 
+The probe and runner use the workspace's installed Nx and its normal cache configuration. A build performed by the Nx
+CLI can satisfy the next wrapper invocation without re-executing tasks; changed inputs still go through Nx's runner.
+Both invocations must use the same cache location. Relative `NX_CACHE_DIRECTORY` and `NX_WORKSPACE_DATA_DIRECTORY`
+values resolve against the Nx workspace root, so they remain checkout-local when inherited by another shell. Absolute
+paths remain caller-controlled, including deliberately shared CI locations; an absolute path inherited from another
+checkout does not become local merely because the working directory changed.
+
 Before hashing, it compares a native snapshot of the workspace with the daemon's file table. A write the daemon's
 watcher has not delivered yet counts as a miss unless every changed path is a declared output of a task in the graph, so
 a build's own artifacts never turn the next call noisy, and an edit made moments before the call never hits stale.
