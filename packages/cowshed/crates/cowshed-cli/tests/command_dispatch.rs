@@ -1,3 +1,7 @@
+#[cfg(target_os = "macos")]
+#[path = "command_dispatch/checked_landing.rs"]
+mod checked_landing;
+
 use async_trait::async_trait;
 use cowshed_cli::args::parse_args;
 use cowshed_cli::output::Output;
@@ -45,6 +49,8 @@ struct FakeService {
     grants: GrantSet,
     exec_grants: Option<GrantSet>,
     shutdown_error: Option<CowshedError>,
+    #[cfg(target_os = "macos")]
+    checked_landing: Option<checked_landing::Fixture>,
 }
 
 impl Default for FakeService {
@@ -73,6 +79,8 @@ impl Default for FakeService {
             exec_grants: None,
             shutdowns: None,
             shutdown_error: None,
+            #[cfg(target_os = "macos")]
+            checked_landing: None,
         }
     }
 }
@@ -80,10 +88,14 @@ impl Default for FakeService {
 #[async_trait]
 impl CliService for FakeService {
     async fn reconcile_gateway(&mut self) -> Result<()> {
-        match self.fail_reconcile_gateway.take() {
-            Some(error) => Err(error),
-            None => Ok(()),
+        if let Some(error) = self.fail_reconcile_gateway.take() {
+            return Err(error);
         }
+        #[cfg(target_os = "macos")]
+        if let Some(fixture) = self.checked_landing.as_mut() {
+            return fixture.reconcile(&self.grants).await;
+        }
+        Ok(())
     }
 
     async fn adopt(&mut self, options: AdoptOptions) -> Result<WorkspaceInfo> {
@@ -293,6 +305,10 @@ impl CliService for FakeService {
     }
 
     async fn land(&mut self, name: &str, options: LandOptions) -> Result<LandReport> {
+        #[cfg(target_os = "macos")]
+        if let Some(fixture) = self.checked_landing.as_mut() {
+            return fixture.land(options).await;
+        }
         self.land_options = Some(options.clone());
         self.events.push(format!("land:{name}:{options:?}"));
         Ok(LandReport {

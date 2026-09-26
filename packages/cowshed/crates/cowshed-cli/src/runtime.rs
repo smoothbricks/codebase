@@ -1328,7 +1328,13 @@ where
 }
 
 fn requires_gateway_before_dispatch(command: &Command) -> bool {
-    matches!(command, Command::Exec(_))
+    // Landing checks execute directly through the supervisor, bypassing Exec's dispatch path.
+    // Refresh their gateway authority before any check runs; checkless land needs no preflight.
+    match command {
+        Command::Exec(_) => true,
+        Command::Land(args) => !args.checks.is_empty(),
+        _ => false,
+    }
 }
 
 fn success() -> DispatchExit {

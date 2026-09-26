@@ -481,6 +481,7 @@ dependencies = [
  "cowshed-core",
  "cowshed-gateway",
  "libc",
+ "rcgen",
  "serde",
  "serde_json",
  "sha2",
