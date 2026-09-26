@@ -206,6 +206,14 @@ impl ActorBridge {
         Self::from_runtime(project_root, runtime).await
     }
 
+    pub async fn open_existing_for_removal(
+        project_root: &Path,
+        workspace: WorkspaceName,
+    ) -> Result<Self> {
+        let runtime = ProjectRuntime::open_existing_for_removal(project_root, workspace).await?;
+        Self::from_runtime(project_root, runtime).await
+    }
+
     /// [`Self::open_existing`] for the identity-change verb alone (`cowshed mv … --repo-id`).
     pub async fn open_existing_for_identity_change(project_root: &Path) -> Result<Self> {
         let runtime = ProjectRuntime::open_existing_for_identity_change(project_root).await?;
@@ -3528,12 +3536,21 @@ where
         let mut setup = NativeAdoptHostSetup::for_canonical_home()?;
         let _ = prepare_adopt_host_storage(&mut setup, output).await?;
     }
-    let bridge = match mode {
-        RuntimeOpenMode::Provision => ActorBridge::open_for_adopt(&root, requested_repo_id).await,
-        RuntimeOpenMode::ExistingOnly => ActorBridge::open_existing(&root).await,
-        RuntimeOpenMode::IdentityChange => {
-            ActorBridge::open_existing_for_identity_change(&root).await
+    let bridge = match &cli.command {
+        Command::Remove(args) => {
+            let workspace = WorkspaceName::new(&args.workspace)
+                .map_err(|error| usage(error.to_string(), "use a valid workspace name"))?;
+            ActorBridge::open_existing_for_removal(&root, workspace).await
         }
+        _ => match mode {
+            RuntimeOpenMode::Provision => {
+                ActorBridge::open_for_adopt(&root, requested_repo_id).await
+            }
+            RuntimeOpenMode::ExistingOnly => ActorBridge::open_existing(&root).await,
+            RuntimeOpenMode::IdentityChange => {
+                ActorBridge::open_existing_for_identity_change(&root).await
+            }
+        },
     };
     let bridge = match bridge {
         Ok(bridge) => bridge,

@@ -1884,10 +1884,9 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
     ) -> Result<RetiredRef, ApfsStorageError> {
         let metadata = DetachedWorkspaceMetadata::read_for_image(trash_image)
             .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
-        if metadata.repo_id != *repo
-            || metadata.image_format != format
-            || metadata.publication_state != PublicationState::Active
-        {
+        // Trash path and sidecar identity, not canonical publication state, authorize
+        // reclamation. An unfinished clone can be retired without becoming runnable.
+        if metadata.repo_id != *repo || metadata.image_format != format {
             return Err(ApfsStorageError::MarkerMismatch(format!(
                 "retired metadata disagrees with trash image {}",
                 trash_image.display()

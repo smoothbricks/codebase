@@ -42,6 +42,10 @@ pub enum LifecycleIntent {
     Retire {
         workspace: WorkspaceName,
         options: RemoveOptions,
+        /// Original create/fork intent when retiring an unpublished clone. Its source is
+        /// needed to verify the pending image after a crash; ordinary retirements omit it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin: Option<Box<LifecycleIntent>>,
     },
 }
 
@@ -290,6 +294,26 @@ impl LifecycleIntentJournal {
         discard
     }
 
+    /// A refused unpublished-clone retirement must leave its create/fork recovery
+    /// authority intact. Only a prepared record can be returned to that state.
+    pub fn restore_prepared_clone_intent(&mut self, workspace: &WorkspaceName) -> bool {
+        let Some(record) = self.entries.get_mut(workspace) else {
+            return false;
+        };
+        if record.completion.is_some() || record.phase != LifecycleIntentPhase::Prepared {
+            return false;
+        }
+        let LifecycleIntent::Retire {
+            origin: Some(origin),
+            ..
+        } = &record.operation
+        else {
+            return false;
+        };
+        record.operation = (**origin).clone();
+        true
+    }
+
     pub fn complete(
         &mut self,
         workspace: &WorkspaceName,
@@ -326,6 +350,21 @@ impl LifecycleIntentJournal {
                         "lifecycle intent record {workspace} disagrees with target {}",
                         record.operation.target()
                     ),
+                    "repair the lifecycle intent journal, then reopen cowshed",
+                ));
+            }
+            if let LifecycleIntent::Retire {
+                origin: Some(origin),
+                ..
+            } = &record.operation
+                && (origin.target() != workspace
+                    || !matches!(
+                        origin.as_ref(),
+                        LifecycleIntent::Create { .. } | LifecycleIntent::Fork { .. }
+                    ))
+            {
+                return Err(CowshedError::integrity(
+                    format!("pending retirement for {workspace} has no matching clone intent"),
                     "repair the lifecycle intent journal, then reopen cowshed",
                 ));
             }

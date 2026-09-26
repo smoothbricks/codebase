@@ -290,6 +290,7 @@ impl ProjectRuntime {
             requested_repo_id,
             continuity_from_environment()?,
             BindingRemoteValidation::Strict,
+            None,
         )
         .await
     }
@@ -315,6 +316,7 @@ impl ProjectRuntime {
             None,
             continuity_from_environment()?,
             BindingRemoteValidation::ForIdentityChange,
+            None,
         )
         .await
     }
@@ -331,6 +333,24 @@ impl ProjectRuntime {
             None,
             continuity,
             BindingRemoteValidation::Strict,
+            None,
+        )
+        .await
+    }
+
+    /// Opens only for a named retirement. A conflicting pending clone cannot be activated
+    /// while another workspace holds its endpoint; retirement still uses the usual safety fences.
+    pub async fn open_existing_for_removal(
+        project_root: impl AsRef<Path>,
+        workspace: WorkspaceName,
+    ) -> Result<Self> {
+        Self::open_native(
+            project_root.as_ref(),
+            crate::storage::bootstrap::native::NativeBootstrapMode::ExistingOnly,
+            None,
+            continuity_from_environment()?,
+            BindingRemoteValidation::Strict,
+            Some(workspace),
         )
         .await
     }
@@ -341,10 +361,11 @@ impl ProjectRuntime {
         requested_repo_id: Option<RepoId>,
         continuity: crate::storage::audit::ContinuityAudit,
         validation: BindingRemoteValidation,
+        recovery_removal_target: Option<WorkspaceName>,
     ) -> Result<Self> {
         #[cfg(target_os = "macos")]
         {
-            let host = NativeProjectRuntimeHost::open(
+            let mut host = NativeProjectRuntimeHost::open(
                 project_root,
                 mode,
                 requested_repo_id.as_ref(),
@@ -352,6 +373,7 @@ impl ProjectRuntime {
                 validation,
             )
             .await?;
+            host.recovery_removal_target = recovery_removal_target;
             Self::start(host).await
         }
         #[cfg(not(target_os = "macos"))]
@@ -362,6 +384,7 @@ impl ProjectRuntime {
                 requested_repo_id,
                 continuity,
                 validation,
+                recovery_removal_target,
             );
             Err(CowshedError::environment_missing(
                 "the native cowshed project runtime requires macOS APFS",
@@ -1400,6 +1423,8 @@ struct NativeProjectRuntimeHost {
     /// opened for the identity change skips the pairing that verb exists to supersede; every
     /// other host heals transport moves exactly like a fresh open would.
     binding_remote_validation: BindingRemoteValidation,
+    /// Only a named remove invocation may defer colliding pending clone replay.
+    recovery_removal_target: Option<WorkspaceName>,
 }
 
 #[cfg(target_os = "macos")]
@@ -1921,6 +1946,7 @@ impl NativeProjectRuntimeHost {
             lifecycle_intents_path,
             lifecycle_intents,
             binding_remote_validation: validation,
+            recovery_removal_target: None,
         })
     }
     async fn replace_lifecycle_intents(
@@ -1976,6 +2002,16 @@ impl NativeProjectRuntimeHost {
             return Err(CowshedError::internal(format!(
                 "prepared retirement for {workspace} disappeared during recovery"
             )));
+        }
+        self.replace_lifecycle_intents(next).await
+    }
+    async fn restore_prepared_clone_intent(&mut self, workspace: &WorkspaceName) -> Result<()> {
+        let mut next = self.lifecycle_intents.clone();
+        if !next.restore_prepared_clone_intent(workspace) {
+            return Err(CowshedError::integrity(
+                format!("prepared clone retirement for {workspace} changed during recovery"),
+                "cowshed doctor --json",
+            ));
         }
         self.replace_lifecycle_intents(next).await
     }
@@ -2040,8 +2076,71 @@ impl NativeProjectRuntimeHost {
         if pending.is_empty() {
             return Ok(false);
         }
+        // A named retirement is the one operation that can repair a duplicate endpoint.
+        // Preserve unfinished clone intents without activating them while their stored
+        // grants collide; every other opening retains strict replay and the allocator and
+        // gateway still reject the duplicate. Any other inventory error remains a refusal.
+        let defer_conflicting_clones = if let Some(target) = self.recovery_removal_target.as_ref()
+            && pending.iter().any(|record| {
+                matches!(
+                    &record.operation,
+                    LifecycleIntent::Create { .. } | LifecycleIntent::Fork { .. }
+                )
+            }) {
+            let storage = crate::storage::bootstrap::ValidatedHostStorage::new(
+                self.home.clone(),
+                crate::storage::bootstrap::CanonicalRoots::global(),
+            );
+            match crate::gateway_inventory::NativeGatewayInventory::new(storage)
+                .all_reserved_port_bases()
+                .await
+            {
+                Ok(_) => false,
+                Err(crate::gateway_inventory::GatewayInventoryError::DuplicatePortBlock(base)) => {
+                    let active_base = match self.current(target).await {
+                        Ok(current) => current.metadata.grants.port_block.map(|block| block.base()),
+                        Err(error) if error.code == ErrorCode::NotFound => None,
+                        Err(error) => return Err(error),
+                    };
+                    let target_owns_base = active_base == Some(base)
+                        || self.pending_metadata().await?.iter().any(|(_, metadata)| {
+                            &metadata.workspace == target
+                                && metadata
+                                    .grants
+                                    .port_block
+                                    .is_some_and(|block| block.base() == base)
+                        });
+                    if !target_owns_base {
+                        return Err(native_integrity_error(
+                            crate::gateway_inventory::GatewayInventoryError::DuplicatePortBlock(
+                                base,
+                            ),
+                        ));
+                    }
+                    // Every pending replay is deferred: even unrelated fresh creations need
+                    // store-wide allocation, which rightly refuses while this duplicate exists.
+                    // Their journal records remain intact, and only the named owner can retire.
+                    true
+                }
+                Err(error) => return Err(native_integrity_error(error)),
+            }
+        } else {
+            false
+        };
         async {
             for record in pending {
+                if defer_conflicting_clones
+                    && matches!(
+                        &record.operation,
+                        LifecycleIntent::Create { .. } | LifecycleIntent::Fork { .. }
+                    )
+                {
+                    eprintln!(
+                        "cowshed: retaining unfinished clone {} until the duplicate port block is retired",
+                        record.operation.target()
+                    );
+                    continue;
+                }
                 let phase = record.phase;
                 match record.operation {
                     LifecycleIntent::Adopt { options } => match self.current(&main_name()).await {
@@ -2131,23 +2230,41 @@ impl NativeProjectRuntimeHost {
                     LifecycleIntent::Retire {
                         workspace,
                         options: _,
+                        origin,
                     } if phase == LifecycleIntentPhase::Prepared => {
                         let expected_mount = self.workspace_mount_path(&workspace)?;
                         match self.current(&workspace).await {
                             // Existing authoritative state proves retirement never published.
                             // Discarding this request prevents a refusal from becoming a deferred
                             // deletion on every later command.
+                            Ok(_) if origin.is_some() => {
+                                return Err(CowshedError::integrity(
+                                    format!("pending retirement target {workspace} became active"),
+                                    "cowshed doctor --json",
+                                ));
+                            }
                             Ok(_) => {
                                 self.discard_prepared_retire_intent(&workspace).await?;
                             }
                             // Absence is the publication fence: an older process crossed it but
                             // died before recording the result, so retain idempotent completion.
                             Err(error) if error.code == ErrorCode::NotFound => {
-                                self.complete_lifecycle_intent(
-                                    &workspace,
-                                    LifecycleIntentCompletion::Retire(RemoveReport::default()),
-                                )
-                                .await?;
+                                if origin.is_some()
+                                    && self
+                                        .pending_metadata()
+                                        .await?
+                                        .iter()
+                                        .any(|(_, metadata)| metadata.workspace == workspace)
+                                {
+                                    // A prepared retirement has not authorized deletion.
+                                    self.restore_prepared_clone_intent(&workspace).await?;
+                                } else {
+                                    self.complete_lifecycle_intent(
+                                        &workspace,
+                                        LifecycleIntentCompletion::Retire(RemoveReport::default()),
+                                    )
+                                    .await?;
+                                }
                             }
                             // An unreadable target is not evidence either way. Fail closed rather
                             // than throwing away the only recovery record, and say which target
@@ -2163,17 +2280,37 @@ impl NativeProjectRuntimeHost {
                             }
                         }
                     }
-                    LifecycleIntent::Retire { workspace, options } => {
+                    LifecycleIntent::Retire {
+                        workspace,
+                        options,
+                        origin,
+                    } => {
                         match self.current(&workspace).await {
+                            Ok(_) if origin.is_some() => {
+                                return Err(CowshedError::integrity(
+                                    format!("pending retirement target {workspace} became active"),
+                                    "cowshed doctor --json",
+                                ));
+                            }
                             Ok(_) => {
                                 self.remove(workspace, options).await?;
                             }
                             Err(error) if error.code == ErrorCode::NotFound => {
-                                self.complete_lifecycle_intent(
-                                    &workspace,
-                                    LifecycleIntentCompletion::Retire(RemoveReport::default()),
-                                )
-                                .await?;
+                                if origin.is_some()
+                                    && self
+                                        .pending_metadata()
+                                        .await?
+                                        .iter()
+                                        .any(|(_, metadata)| metadata.workspace == workspace)
+                                {
+                                    self.remove(workspace, options).await?;
+                                } else {
+                                    self.complete_lifecycle_intent(
+                                        &workspace,
+                                        LifecycleIntentCompletion::Retire(RemoveReport::default()),
+                                    )
+                                    .await?;
+                                }
                             }
                             Err(error) => return Err(error),
                         }
@@ -2964,11 +3101,22 @@ impl NativeProjectRuntimeHost {
         &self,
         workspace: &NativeWorkspace,
     ) -> Result<NativeRemovalGitFence> {
-        let root = current_snapshot_mount(self, workspace)?;
-        let git = crate::git::GitRepository::from_root(root);
+        self.removal_git_fence_at(
+            &current_snapshot_mount(self, workspace)?,
+            workspace.derived.workspace.incarnation(),
+        )
+        .await
+    }
+
+    async fn removal_git_fence_at(
+        &self,
+        mount: &Path,
+        incarnation: &WorkspaceIncarnation,
+    ) -> Result<NativeRemovalGitFence> {
+        let git = crate::git::GitRepository::from_root(mount);
         let head = git.head_oid().await?;
         Ok(NativeRemovalGitFence {
-            incarnation: workspace.derived.workspace.incarnation().clone(),
+            incarnation: incarnation.clone(),
             head,
             dirty: git
                 .is_dirty_by(Some(&self.substrate_config.checkout_path))
@@ -3110,11 +3258,11 @@ impl NativeProjectRuntimeHost {
     /// conservative oid range whose objects are actually being retired.
     async fn bundle_abandoned_work(
         &self,
-        workspace: &NativeWorkspace,
+        workspace: &WorkspaceName,
         fence: &NativeRemovalGitFence,
         landed: NativeLandedState,
     ) -> Result<AbandonedWork> {
-        let mount = current_snapshot_mount(self, workspace)?;
+        let mount = self.workspace_mount_path(workspace)?;
         let target_head = landed.commits.target_head().cloned();
         let git = crate::git::GitRepository::from_root(&mount);
         let git = match target_head.as_ref() {
@@ -3132,11 +3280,7 @@ impl NativeProjectRuntimeHost {
             .project()
             .sessions
             .join(crate::storage::recovery::TRASH_NAMESPACE);
-        let bundle = trash.join(format!(
-            "{}-{}.bundle",
-            workspace.derived.workspace.name().as_str(),
-            fence.head
-        ));
+        let bundle = trash.join(format!("{}-{}.bundle", workspace.as_str(), fence.head));
         let directory = trash.clone();
         crate::storage::lifecycle::dispatch_blocking(move || {
             std::fs::create_dir_all(&directory).map_err(|error| {
@@ -3417,6 +3561,34 @@ impl NativeProjectRuntimeHost {
             .map_err(native_integrity_error)?;
         reserve_port_grants(&inventory, &reservation_root, used).await
     }
+    /// A retried clone uses the grant already fenced into its canonical image. A fresh
+    /// operation alone needs a process-lifetime claim until that image owns the block.
+    async fn destination_grants(
+        &self,
+        destination: &WorkspaceName,
+        resuming: bool,
+    ) -> Result<(GrantSet, Option<PortGrantReservation>)> {
+        if resuming
+            && let Some((_, metadata)) = self
+                .pending_metadata()
+                .await?
+                .into_iter()
+                .find(|(_, metadata)| &metadata.workspace == destination)
+        {
+            // A pending sidecar owns this grant; an independently published duplicate must
+            // refuse before the pending workspace can be activated or served.
+            let roots = crate::storage::bootstrap::CanonicalRoots::global();
+            let storage =
+                crate::storage::bootstrap::ValidatedHostStorage::new(self.home.clone(), roots);
+            crate::gateway_inventory::NativeGatewayInventory::new(storage)
+                .all_reserved_port_bases()
+                .await
+                .map_err(native_integrity_error)?;
+            return Ok((metadata.grants, None));
+        }
+        let reservation = self.fresh_grants().await?;
+        Ok((reservation.grants.clone(), Some(reservation)))
+    }
 
     async fn snapshot_named(&self, name: &WorkspaceName) -> Result<WorkspaceSnapshot> {
         let current = self.current(name).await?;
@@ -3567,6 +3739,172 @@ impl NativeProjectRuntimeHost {
         Ok(())
     }
 
+    async fn retire_pending_workspace(
+        &mut self,
+        workspace: &WorkspaceName,
+        options: RemoveOptions,
+        origin: crate::storage::recovery::LifecycleIntent,
+        metadata: crate::metadata::DetachedWorkspaceMetadata,
+    ) -> Result<RemoveReport> {
+        use super::supervisor::{CommitmentDraft, CommitmentSink};
+        use crate::storage::lifecycle::{
+            Destination, LifecyclePlanner, MountIntent, MountState, Substrate,
+        };
+
+        if metadata.repo_id != self.descriptor.repo_id
+            || metadata.workspace != *workspace
+            || metadata.publication_state != crate::metadata::PublicationState::PendingFence
+        {
+            return Err(CowshedError::integrity(
+                format!("pending retirement metadata does not name {workspace}"),
+                "cowshed doctor --json",
+            ));
+        }
+        let (source_name, fork) = match &origin {
+            crate::storage::recovery::LifecycleIntent::Create {
+                workspace: target,
+                options,
+            } if target == workspace => (
+                options.from_workspace.clone().unwrap_or_else(main_name),
+                false,
+            ),
+            crate::storage::recovery::LifecycleIntent::Fork {
+                source,
+                destination,
+            } if destination == workspace => (source.clone(), true),
+            _ => {
+                return Err(CowshedError::integrity(
+                    format!("pending workspace {workspace} has no matching create or fork intent"),
+                    "cowshed doctor --json",
+                ));
+            }
+        };
+        let info = metadata
+            .require_info_snapshot()
+            .map_err(native_integrity_error)?;
+        let source = self.current(&source_name).await?;
+        let identity = self
+            .operation_identity(
+                metadata.grants.clone(),
+                info.branch.clone(),
+                info.forked_from.clone(),
+                info.git_worktree,
+            )
+            .await?;
+        let destination = Destination {
+            repo: self.descriptor.repo_id.clone(),
+            name: workspace.clone(),
+            topology_revision: source.derived.workspace.topology_revision(),
+            identity,
+        };
+        let plan = if fork {
+            PendingClonePlan::Fork(
+                self.substrate
+                    .plan_fork(&source.derived.workspace, destination)
+                    .map_err(native_integrity_error)?,
+            )
+        } else {
+            PendingClonePlan::Create(
+                self.substrate
+                    .plan_create(&source.derived.workspace, destination)
+                    .map_err(native_integrity_error)?,
+            )
+        };
+        let main = self.current(&main_name()).await?;
+        let main_detached = matches!(main.derived.mount_state, MountState::Detached);
+        if main_detached {
+            self.substrate
+                .ensure_mounted(&main.derived.workspace, MountIntent { browse: false })
+                .await
+                .map_err(native_storage_error)?;
+        }
+        let retire_intent = crate::storage::recovery::LifecycleIntent::Retire {
+            workspace: workspace.clone(),
+            options,
+            origin: Some(Box::new(origin)),
+        };
+        let previous = self
+            .lifecycle_intents
+            .get(workspace)
+            .is_some_and(|record| record.operation == retire_intent && record.completion.is_none());
+        let substrate = self.substrate.clone();
+        let result = async {
+            let (retired, abandoned) = substrate
+                .execute_pending_clone_retirement(plan, |stage| {
+                    let this = &mut *self;
+                    async move {
+                        let first = this
+                            .removal_git_fence_at(&stage.mount_point, stage.workspace.incarnation())
+                            .await?;
+                        if !options.force {
+                            Self::require_session_state_clean(workspace, &first)?;
+                        }
+                        this.require_session_landed(workspace, &first, options.abandon)
+                            .await?;
+                        this.stop_supervisor(workspace).await?;
+                        let last = this
+                            .removal_git_fence_at(&stage.mount_point, stage.workspace.incarnation())
+                            .await?;
+                        if last.head != first.head {
+                            return Err(removal_head_moved_refusal(
+                                workspace,
+                                &first.head,
+                                &last.head,
+                            ));
+                        }
+                        if !options.force {
+                            Self::require_session_state_clean(workspace, &last)?;
+                        }
+                        let abandoning = this
+                            .require_session_landed(workspace, &last, options.abandon)
+                            .await?;
+                        if !previous {
+                            this.begin_lifecycle_intent(retire_intent).await?;
+                        }
+                        this.mark_lifecycle_intent_mutating(workspace).await?;
+                        let abandoned = match abandoning {
+                            Some(landed) => {
+                                Some(this.bundle_abandoned_work(workspace, &last, landed).await?)
+                            }
+                            None => None,
+                        };
+                        this.unregister_workspace_in_main(workspace, info.git_worktree)
+                            .await?;
+                        Ok::<_, CowshedError>(abandoned)
+                    }
+                })
+                .await
+                .map_err(native_staged_error)?;
+            self.commitments
+                .record(CommitmentDraft::WorkspaceRetired {
+                    repo_id: self.descriptor.repo_id.clone(),
+                    workspace_incarnation: retired.workspace().incarnation().clone(),
+                })
+                .await?;
+            self.release_slot(workspace).await?;
+            let report = RemoveReport { abandoned };
+            self.complete_lifecycle_intent(
+                workspace,
+                crate::storage::recovery::LifecycleIntentCompletion::Retire(report.clone()),
+            )
+            .await?;
+            std::mem::drop(tokio::spawn(async move {
+                let _ = substrate.reclaim(retired).await;
+            }));
+            Ok(report)
+        }
+        .await;
+        if main_detached {
+            let main = self.current(&main_name()).await?;
+            self.stop_supervisor(&main_name()).await?;
+            self.substrate
+                .unmount(&main.derived.workspace)
+                .await
+                .map_err(native_storage_error)?;
+        }
+        result
+    }
+
     async fn retire_workspace(&mut self, current: NativeWorkspace) -> Result<()> {
         use super::supervisor::CommitmentSink;
         use crate::storage::lifecycle::{LifecyclePlanner, Substrate};
@@ -3646,6 +3984,29 @@ struct NativeWorkspace {
     derived: crate::storage::lifecycle::DerivedWorkspace,
     metadata: crate::metadata::DetachedWorkspaceMetadata,
     image: PathBuf,
+}
+
+#[cfg(target_os = "macos")]
+enum PendingClonePlan {
+    Create(crate::storage::lifecycle::CreatePlan),
+    Fork(crate::storage::lifecycle::ForkPlan),
+}
+
+#[cfg(target_os = "macos")]
+impl crate::storage::lifecycle::ImmutablePlan for PendingClonePlan {
+    fn expected(&self) -> &[crate::storage::lifecycle::LifecycleFact] {
+        match self {
+            Self::Create(plan) => crate::storage::lifecycle::ImmutablePlan::expected(plan),
+            Self::Fork(plan) => crate::storage::lifecycle::ImmutablePlan::expected(plan),
+        }
+    }
+
+    fn operation(&self) -> &crate::storage::lifecycle::Operation {
+        match self {
+            Self::Create(plan) => crate::storage::lifecycle::ImmutablePlan::operation(plan),
+            Self::Fork(plan) => crate::storage::lifecycle::ImmutablePlan::operation(plan),
+        }
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -4628,15 +4989,19 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                     "choose a slot within the project's range",
                 )
             })?;
+        let resuming = self
+            .lifecycle_intents
+            .get(&workspace)
+            .is_some_and(|record| record.operation == intent && record.completion.is_none());
         self.begin_lifecycle_intent(intent).await?;
         if let Some(slot) = slot {
             self.bind_slot(&workspace, slot).await?;
         }
         async {
-            let reservation = self.fresh_grants().await?;
+            let (grants, _reservation) = self.destination_grants(&workspace, resuming).await?;
             let identity = self
                 .operation_identity(
-                    reservation.grants.clone(),
+                    grants,
                     Some(format!("cowshed/{workspace}")),
                     None,
                     git_worktree,
@@ -4855,11 +5220,15 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
             self.require_main_mounted_for_git_worktree(&destination)
                 .await?;
         }
+        let resuming = self
+            .lifecycle_intents
+            .get(&destination)
+            .is_some_and(|record| record.operation == intent && record.completion.is_none());
         self.begin_lifecycle_intent(intent).await?;
-        let reservation = self.fresh_grants().await?;
+        let (grants, _reservation) = self.destination_grants(&destination, resuming).await?;
         let identity = self
             .operation_identity(
-                reservation.grants.clone(),
+                grants,
                 Some(format!("cowshed/{destination}")),
                 Some(source.clone()),
                 source_is_git_worktree,
@@ -5629,6 +5998,7 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
         let intent = crate::storage::recovery::LifecycleIntent::Retire {
             workspace: workspace.clone(),
             options,
+            origin: None,
         };
         let was_pending = self
             .lifecycle_intents
@@ -5644,6 +6014,57 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
         }
 
         let mut current = match self.current(&workspace).await {
+            Err(error) if error.code == ErrorCode::NotFound && !workspace.is_main() => {
+                if let Some((_, metadata)) = self
+                    .pending_metadata()
+                    .await?
+                    .into_iter()
+                    .find(|(_, metadata)| metadata.workspace == workspace)
+                {
+                    let record = self.lifecycle_intents.get(&workspace).ok_or_else(|| {
+                        CowshedError::integrity(
+                            format!("pending workspace {workspace} has no lifecycle intent"),
+                            "cowshed doctor --json",
+                        )
+                    })?;
+                    let origin = match &record.operation {
+                        crate::storage::recovery::LifecycleIntent::Create { .. }
+                        | crate::storage::recovery::LifecycleIntent::Fork { .. }
+                            if record.completion.is_none() =>
+                        {
+                            record.operation.clone()
+                        }
+                        crate::storage::recovery::LifecycleIntent::Retire {
+                            options: original,
+                            origin: Some(origin),
+                            ..
+                        } if *original == options && record.completion.is_none() => {
+                            (**origin).clone()
+                        }
+                        _ => {
+                            return Err(CowshedError::integrity(
+                                format!(
+                                    "pending workspace {workspace} has no unfinished matching lifecycle intent"
+                                ),
+                                "cowshed doctor --json",
+                            ));
+                        }
+                    };
+                    return self
+                        .retire_pending_workspace(&workspace, options, origin, metadata)
+                        .await;
+                }
+                if was_pending {
+                    let report = RemoveReport::default();
+                    self.complete_lifecycle_intent(
+                        &workspace,
+                        crate::storage::recovery::LifecycleIntentCompletion::Retire(report.clone()),
+                    )
+                    .await?;
+                    return Ok(report);
+                }
+                return Err(error);
+            }
             Err(error) if error.code == ErrorCode::NotFound && was_pending => {
                 let report = RemoveReport::default();
                 self.complete_lifecycle_intent(
@@ -5786,7 +6207,7 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
             // preservation artifact that has not proved its own recoverability authorizes nothing.
             let abandoned = match abandoning {
                 Some(landed) => Some(
-                    self.bundle_abandoned_work(&current, &final_fence, landed)
+                    self.bundle_abandoned_work(&workspace, &final_fence, landed)
                         .await?,
                 ),
                 None => None,
@@ -8898,9 +9319,7 @@ fn native_retired_refs(
     project_root: &Path,
     repo_id: &RepoId,
 ) -> Result<Vec<crate::storage::lifecycle::RetiredRef>> {
-    use crate::metadata::{
-        DetachedWorkspaceMetadata, ImageFormat, PublicationState, WorkspaceRole,
-    };
+    use crate::metadata::{DetachedWorkspaceMetadata, ImageFormat, WorkspaceRole};
     use crate::storage::lifecycle::{LifecycleWorkspace, RetiredRef, Revision};
 
     let trash = project_root
@@ -8955,10 +9374,9 @@ fn native_retired_refs(
         }
         let metadata = DetachedWorkspaceMetadata::read_for_image(&entry.path())
             .map_err(native_integrity_error)?;
-        if metadata.repo_id != *repo_id
-            || metadata.image_format != format
-            || metadata.publication_state != PublicationState::Active
-        {
+        // The exact trash name, sidecar and repository are the retirement fence. A clone
+        // retired before activation retains PendingFence; it was never a runnable image.
+        if metadata.repo_id != *repo_id || metadata.image_format != format {
             return Err(CowshedError::integrity(
                 format!(
                     "retired workspace metadata identity mismatch: {}",
@@ -9056,6 +9474,79 @@ mod retired_recovery_tests {
             crate::storage::lifecycle::Revision::new(5)
         );
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn retired_pending_clone_uses_exact_trash_identity_even_after_name_reuse() {
+        let root = std::env::temp_dir().join(format!(
+            "cowshed-retired-pending-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let project_root = root.join("example-org/example-app");
+        let trash = project_root.join("sessions/.trash");
+        std::fs::create_dir_all(&trash).expect("trash");
+        let repo_id = RepoId::parse("example-org/example-app").expect("repo");
+        let name = WorkspaceName::new("idle").expect("workspace");
+        let incarnation =
+            WorkspaceIncarnation::new("0198f2c0b7e34dc795f17b238b331c80").expect("incarnation");
+        let image = trash.join(format!("idle-{}.sparseimage", incarnation.as_str()));
+        std::fs::write(&image, b"retired pending clone").expect("retired image");
+        let mut grants =
+            GrantSet::closed_baseline(Some(PortBlock::new(49_136, 16).expect("port block")))
+                .expect("grants");
+        grants.revision = 4;
+        DetachedWorkspaceMetadata {
+            version: SIDECAR_VERSION,
+            repo_id: repo_id.clone(),
+            workspace: name.clone(),
+            workspace_incarnation: incarnation.clone(),
+            image_format: ImageFormat::Sparse,
+            platform: Platform::Macos,
+            publication_state: PublicationState::PendingFence,
+            updated_at: "2026-07-14T00:00:00Z".into(),
+            grants,
+            info_snapshot: None,
+        }
+        .write_for_image(&image)
+        .expect("retired sidecar");
+
+        let retired = native_retired_refs(&project_root, &repo_id)
+            .expect("retired pending image is recoverable from its exact trash identity");
+        assert_eq!(retired.len(), 1);
+        assert_eq!(retired[0].workspace().incarnation(), &incarnation);
+        assert_eq!(
+            retired[0].resulting_revision(),
+            crate::storage::lifecycle::Revision::new(5)
+        );
+        assert!(image.exists(), "recovery does not delete the image");
+
+        let mut mismatched =
+            DetachedWorkspaceMetadata::read_for_image(&image).expect("read retired metadata");
+        mismatched.workspace = WorkspaceName::new("other").expect("foreign workspace");
+        mismatched
+            .write_for_image(&image)
+            .expect("change metadata identity");
+        native_retired_refs(&project_root, &repo_id)
+            .expect_err("a mismatched workspace identity cannot authorize reclamation");
+        mismatched.workspace = name.clone();
+        mismatched
+            .write_for_image(&image)
+            .expect("restore metadata identity");
+
+        let live = project_root.join("sessions/idle.sparseimage");
+        std::fs::write(&live, b"new workspace").expect("new canonical image");
+        mismatched.workspace_incarnation =
+            WorkspaceIncarnation::new("1198f2c0b7e34dc795f17b238b331c80").expect("new incarnation");
+        mismatched.publication_state = PublicationState::Active;
+        mismatched
+            .write_for_image(&live)
+            .expect("new canonical metadata");
+        let retired = native_retired_refs(&project_root, &repo_id)
+            .expect("new use of the name cannot invalidate old retired trash");
+        assert_eq!(retired[0].workspace().incarnation(), &incarnation);
+        assert!(live.exists(), "discovery cannot touch the new workspace");
+        assert!(image.exists(), "discovery cannot delete old retired bytes");
+        std::fs::remove_dir_all(root).expect("cleanup fixture");
     }
 
     #[test]
@@ -11645,6 +12136,93 @@ mod port_reservation_tests {
             .expect("claim after owner release")
             .expect("successful owner releases marker");
         std::fs::remove_file(released).expect("release probe");
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[tokio::test]
+    async fn interrupted_pending_clone_keeps_its_port_after_the_creator_exits() {
+        let root = root("pending-clone");
+        let (inventory, layout) = inventory(&root);
+        let staging = root.join("store/.staging");
+        let first = reserve_port_grants(&inventory, &staging, Default::default())
+            .await
+            .expect("initial allocation");
+        let first_base = first.grants.port_block.expect("first block").base();
+        let name = WorkspaceName::session("unfinished").expect("session");
+        let image = layout
+            .session_image(&name, ImageFormat::Sparse)
+            .expect("session image");
+        std::fs::create_dir_all(image.image().parent().expect("session directory"))
+            .expect("session directory");
+        std::fs::write(image.image(), b"interrupted clone").expect("image");
+        DetachedWorkspaceMetadata {
+            version: SIDECAR_VERSION,
+            repo_id: RepoId::parse("acme/widget").expect("repo"),
+            workspace: name,
+            workspace_incarnation: WorkspaceIncarnation::new("0198f2c0b7e34dc795f17b238b331c80")
+                .expect("incarnation"),
+            image_format: ImageFormat::Sparse,
+            platform: Platform::Macos,
+            publication_state: PublicationState::PendingFence,
+            updated_at: "2026-07-14T00:00:00Z".to_owned(),
+            grants: first.grants.clone(),
+            info_snapshot: None,
+        }
+        .write_for_image(image.image())
+        .expect("pending metadata");
+        drop(first);
+        let marker = staging.join(format!("port-{first_base}.reservation"));
+        symlink(i32::MAX.to_string(), &marker).expect("dead creator marker");
+
+        // A pending image is not a runnable workspace, but its persisted grant remains owned.
+        assert!(
+            inventory.all_projects().await.expect("published inventory")[0]
+                .workspaces
+                .is_empty()
+        );
+        assert_eq!(
+            inventory
+                .all_reserved_port_bases()
+                .await
+                .expect("reserved inventory"),
+            std::collections::BTreeSet::from([first_base])
+        );
+        let second = reserve_port_grants(&inventory, &staging, Default::default())
+            .await
+            .expect("allocation after creator death");
+        assert_eq!(
+            second.grants.port_block.expect("second block").base(),
+            first_base + PORT_BLOCK_SIZE
+        );
+        drop(second);
+        let main = layout.main_image(ImageFormat::Sparse).expect("main image");
+        std::fs::write(main.image(), b"published clone").expect("main payload");
+        let mut published =
+            DetachedWorkspaceMetadata::read_for_image(image.image()).expect("pending sidecar");
+        published.workspace = WorkspaceName::main();
+        published.publication_state = PublicationState::Active;
+        published
+            .write_for_image(main.image())
+            .expect("conflicting published grant");
+        assert!(matches!(
+            inventory.all_reserved_port_bases().await,
+            Err(crate::gateway_inventory::GatewayInventoryError::DuplicatePortBlock(base))
+                if base == first_base
+        ));
+        std::fs::remove_file(main.image()).expect("remove conflicting payload");
+        std::fs::remove_file(crate::metadata::sidecar_path(main.image()))
+            .expect("remove conflicting sidecar");
+        published.workspace = WorkspaceName::session("foreign").expect("foreign name");
+        published.publication_state = PublicationState::PendingFence;
+        published
+            .write_for_image(image.image())
+            .expect("mismatched pending identity");
+        assert!(matches!(
+            inventory.all_reserved_port_bases().await,
+            Err(crate::gateway_inventory::GatewayInventoryError::Apfs(
+                crate::storage::apfs::ApfsStorageError::Host(_)
+            ))
+        ));
         std::fs::remove_dir_all(root).expect("cleanup");
     }
 

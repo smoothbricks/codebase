@@ -841,7 +841,12 @@ impl NativeGatewayInventory {
                     message: error.to_string(),
                 }
             })?;
-            for fact in authoritative.storage {
+            let active_names = authoritative
+                .storage
+                .iter()
+                .map(|fact| fact.workspace.name())
+                .collect::<BTreeSet<_>>();
+            for fact in &authoritative.storage {
                 let image = canonical_image_paths(&layout, &fact.workspace)?;
                 let metadata =
                     read_current_metadata(self.storage.store(), image.image(), &fact.workspace)?;
@@ -857,8 +862,106 @@ impl NativeGatewayInventory {
                     return Err(GatewayInventoryError::DuplicatePortBlock(base));
                 }
             }
+            // Incomplete clones cannot be served, but a canonical pending payload owns its
+            // stored grant even after its creator exits. Sidecar-only fences are reclaimed
+            // during recovery; until the payload exists, the live PID marker protects the claim.
+            if !active_names.contains(&WorkspaceName::main())
+                && let Some(image) = existing_main_image(&layout)?
+            {
+                Self::reserve_pending_port_base(
+                    self.storage.store(),
+                    &repo,
+                    &WorkspaceName::main(),
+                    &image,
+                    &mut bases,
+                )?;
+            }
+            let sessions = &layout.project().sessions;
+            let entries = match fs::read_dir(sessions) {
+                Ok(entries) => entries
+                    .map(|entry| {
+                        entry.map(|entry| entry.path()).map_err(|source| {
+                            io_error("enumerating session images", sessions, source)
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
+                Err(source) => {
+                    return Err(io_error("enumerating session images", sessions, source));
+                }
+            };
+            for image in crate::storage::discover_session_images(entries).map_err(|error| {
+                GatewayInventoryError::InvalidMetadata {
+                    path: sessions.to_owned(),
+                    message: error.to_string(),
+                }
+            })? {
+                // Published images were already validated above. Only pending sidecars
+                // need reading after the canonical directory enumeration.
+                if !active_names.contains(image.workspace()) {
+                    Self::reserve_pending_port_base(
+                        self.storage.store(),
+                        &repo,
+                        image.workspace(),
+                        image.path(),
+                        &mut bases,
+                    )?;
+                }
+            }
         }
         Ok(bases)
+    }
+
+    fn reserve_pending_port_base(
+        store_root: &Path,
+        repo: &RepoId,
+        workspace: &WorkspaceName,
+        image: &Path,
+        bases: &mut BTreeSet<u16>,
+    ) -> Result<(), GatewayInventoryError> {
+        verify_no_symlinks(store_root, image).map_err(|error| {
+            GatewayInventoryError::InvalidMetadata {
+                path: image.to_owned(),
+                message: error.to_string(),
+            }
+        })?;
+        let sidecar = sidecar_path(image);
+        verify_no_symlinks(store_root, &sidecar).map_err(|error| {
+            GatewayInventoryError::InvalidMetadata {
+                path: sidecar.clone(),
+                message: error.to_string(),
+            }
+        })?;
+        let metadata = DetachedWorkspaceMetadata::read_for_image(image).map_err(|error| {
+            GatewayInventoryError::InvalidMetadata {
+                path: sidecar.clone(),
+                message: error.to_string(),
+            }
+        })?;
+        if metadata.repo_id != *repo || metadata.workspace != *workspace {
+            return Err(GatewayInventoryError::InvalidMetadata {
+                path: sidecar,
+                message: "canonical pending metadata identity does not match its image".to_owned(),
+            });
+        }
+        if metadata.publication_state != PublicationState::PendingFence {
+            return Err(GatewayInventoryError::InvalidMetadata {
+                path: sidecar,
+                message: "canonical image was not present in the published inventory".to_owned(),
+            });
+        }
+        let base = metadata
+            .grants
+            .port_block
+            .ok_or_else(|| GatewayInventoryError::MissingPortBlock {
+                repo: repo.clone(),
+                workspace: workspace.clone(),
+            })?
+            .base();
+        if !bases.insert(base) {
+            return Err(GatewayInventoryError::DuplicatePortBlock(base));
+        }
+        Ok(())
     }
 
     fn all_attached_blocking(&self) -> Result<Vec<GatewaySessionFact>, GatewayInventoryError> {

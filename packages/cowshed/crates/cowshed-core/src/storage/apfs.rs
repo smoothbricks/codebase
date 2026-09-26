@@ -1043,6 +1043,7 @@ where
                         identity,
                     },
                     incarnations.as_ref(),
+                    false,
                 )
             })
             .await?;
@@ -1077,6 +1078,111 @@ where
             Applied::Lifecycle(receipt) => Ok(receipt),
             _ => Err(ApfsStorageError::UnexpectedResult.into()),
         }
+    }
+
+    /// Retire an unfinished clone without ever publishing it as runnable. Inspection runs
+    /// on its verified mount under the image lock; a refusal preserves the pending payload.
+    pub async fn execute_pending_clone_retirement<P, F, Fut, R, E>(
+        &self,
+        plan: P,
+        inspect: F,
+    ) -> Result<(RetiredRef, R), StagedExecutionError<E>>
+    where
+        P: ImmutablePlan,
+        F: FnOnce(WorkspaceStage) -> Fut + Send,
+        Fut: Future<Output = Result<R, E>> + Send,
+        R: Send,
+        E: Send,
+    {
+        let backend = CheckedApfsBackend {
+            host: Arc::clone(&self.host),
+            lane: Arc::clone(&self.lane),
+            config: Arc::clone(&self.config),
+            incarnations: Arc::clone(&self.incarnations),
+            expected: plan.expected().to_vec(),
+        };
+        let mut guard = backend.acquire(plan.operation()).await?;
+        let actual = backend
+            .read_authoritative(&mut guard, plan.expected())
+            .await?;
+        revalidate(plan.expected(), &actual).map_err(ApfsStorageError::from)?;
+
+        let host = Arc::clone(&self.host);
+        let config = Arc::clone(&self.config);
+        let incarnations = Arc::clone(&self.incarnations);
+        let expected = plan.expected().to_vec();
+        let operation = plan.operation().clone();
+        let prepared = self
+            .lane
+            .dispatch(move || {
+                let (source, destination, format, identity, fork) = match &operation {
+                    Operation::Create {
+                        source,
+                        destination,
+                        format,
+                        identity,
+                    } => (source, destination, *format, identity, false),
+                    Operation::Fork {
+                        source,
+                        destination,
+                        format,
+                        identity,
+                    } => (source, destination, *format, identity, true),
+                    _ => {
+                        return Err(ApfsStorageError::InvalidPlan(
+                            "pending clone retirement requires a create or fork plan",
+                        ));
+                    }
+                };
+                prepare_clone_stage(
+                    host.as_ref(),
+                    &config,
+                    &expected,
+                    CloneExecution {
+                        source,
+                        destination,
+                        format,
+                        fork,
+                        identity,
+                    },
+                    incarnations.as_ref(),
+                    true,
+                )
+            })
+            .await?;
+        let prepared = StagedCallbackGuard::new(
+            Arc::clone(&self.host),
+            prepared,
+            preserve_prepared_clone::<H>,
+        );
+        let value = match inspect(prepared.get().stage.clone()).await {
+            Ok(value) => value,
+            Err(error) => {
+                let _prepared = prepared.into_prepared();
+                return Err(StagedExecutionError::Initializer(error));
+            }
+        };
+        let prepared = prepared.into_prepared();
+        let host = Arc::clone(&self.host);
+        let config = Arc::clone(&self.config);
+        let retired = self
+            .lane
+            .dispatch(move || {
+                let PreparedClone {
+                    stage,
+                    attachment,
+                    image,
+                } = prepared;
+                let trash = retired_image_path(&config, &stage.workspace)?;
+                let revision = stage.workspace.revision().get().checked_add(1).ok_or(
+                    ApfsStorageError::InvalidPlan("pending retirement revision overflow"),
+                )?;
+                host.detach(attachment, DetachIntent::Release)?;
+                host.retire_image(&image, &trash)?;
+                Ok(RetiredRef::new(stage.workspace, Revision::new(revision)))
+            })
+            .await?;
+        Ok((retired, value))
     }
 
     pub async fn execute_checkpoint_staged<F, Fut, E>(
@@ -2235,6 +2341,7 @@ fn prepare_clone_stage<H: ApfsExecutionHost>(
     expected: &[LifecycleFact],
     execution: CloneExecution<'_>,
     incarnations: &dyn IncarnationSource,
+    require_resume: bool,
 ) -> Result<PreparedClone<H::Attachment>, ApfsStorageError> {
     let CloneExecution {
         source: source_name,
@@ -2253,6 +2360,11 @@ fn prepare_clone_stage<H: ApfsExecutionHost>(
         format,
         requested_identity,
     )?;
+    if require_resume && resumed.is_none() {
+        return Err(ApfsStorageError::InvalidPlan(
+            "pending clone retirement requires the exact unfinished image",
+        ));
+    }
     let (workspace, identity, canonical_image, resuming) = match resumed {
         Some(resumed) => (resumed.workspace, resumed.identity, resumed.image, true),
         None => {
@@ -2338,6 +2450,20 @@ fn prepare_clone_stage<H: ApfsExecutionHost>(
             )
         })
     });
+    if resuming {
+        // A failed retry must not destroy the original pending image: initialization may
+        // already have changed Git state outside the image.
+        return prepared.map(|()| PreparedClone {
+            stage: WorkspaceStage {
+                workspace,
+                mount_point: canonical_mount,
+                companion: canonical_companion,
+                resuming,
+            },
+            attachment,
+            image: canonical_image,
+        });
+    }
     if let Err(primary) = prepared {
         return combine_cleanup(
             "clone preparation",

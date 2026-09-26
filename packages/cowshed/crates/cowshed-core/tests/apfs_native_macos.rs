@@ -1439,6 +1439,53 @@ fn retired_reclaim_excludes_workspace_immediately_and_removes_every_restore_arti
     assert!(!mountpoint.exists());
 }
 
+#[test]
+fn retired_pending_clone_reclaims_without_touching_reused_name() {
+    const RETIRED: &str = "00000000000000000000000000000004";
+    const LIVE: &str = "00000000000000000000000000000005";
+    let fixture = Fixture::new("retired-pending-reclaim");
+    let config = fixture.config();
+    let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
+    let host = native_host(&fixture, RecordingRunner::default());
+    let name = WorkspaceName::session("reused").expect("session workspace");
+    let canonical = layout
+        .session_image(&name, ImageFormat::Sparse)
+        .expect("session image");
+    create_image(canonical.image(), ImageFormat::Sparse);
+    write_session_metadata(canonical.image(), "reused", RETIRED, ImageFormat::Sparse);
+    let mut pending = DetachedWorkspaceMetadata::read_for_image(canonical.image())
+        .expect("pending clone metadata");
+    pending.publication_state = PublicationState::PendingFence;
+    pending
+        .write_for_image(canonical.image())
+        .expect("record pending clone");
+
+    let trash = layout
+        .project()
+        .sessions
+        .join(format!(".trash/reused-{RETIRED}.sparseimage"));
+    host.retire_image(canonical.image(), &trash)
+        .expect("retire unpublished clone");
+    create_image(canonical.image(), ImageFormat::Sparse);
+    write_session_metadata(canonical.image(), "reused", LIVE, ImageFormat::Sparse);
+
+    let retired = RetiredRef::new(session_workspace("reused", RETIRED), Revision::new(1));
+    host.reclaim_retired(&config, &retired)
+        .expect("reclaim pending clone by exact retired identity");
+    assert!(!trash.exists(), "retired clone image was reclaimed");
+    assert!(
+        !sidecar_path(&trash).exists(),
+        "retired clone sidecar was reclaimed"
+    );
+    assert!(
+        canonical.image().exists(),
+        "new incarnation retains its image"
+    );
+    let current = DetachedWorkspaceMetadata::read_for_image(canonical.image())
+        .expect("new incarnation retains its sidecar");
+    assert_eq!(current.workspace_incarnation.as_str(), LIVE);
+}
+
 /// Trash entries are keyed `<name>-<incarnation>`, but `checkpoints/<name>` and the mountpoint are
 /// keyed on the name alone. Re-minting a retired name hands the new lifetime those same two paths,
 /// so a live workspace has to withhold them from a stranded retirement of its name without

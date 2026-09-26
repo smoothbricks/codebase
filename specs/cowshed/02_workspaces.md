@@ -254,6 +254,11 @@ initialization and post-callback validation finish. Activation is one atomic sid
 `Active`; the mounted attachment is then retained. The normal path has no staging mount, detach, image rename, canonical
 reattach, or remount.
 
+On macOS, a complete canonical `PendingFence` image reserves its persisted `portBlock` even after its creator exits.
+Allocation scans include those reservations without making the workspace visible or runnable. A dead creator's PID claim
+may be reclaimed, but that never releases a block still owned by an image. Resuming `new` or `fork` reuses the stored
+grant rather than allocating a temporary second block. Duplicate ownership remains an integrity refusal.
+
 | Kill window                                                      | Durable state                                                  | Recovery action and guard                                                                                                                                                                                   |
 | ---------------------------------------------------------------- | -------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Before pending metadata                                          | Intent only                                                    | Re-run create/fork normally.                                                                                                                                                                                |
@@ -697,8 +702,9 @@ step.
 
 ## `cowshed rm <ws>` — perceived-instant deletion
 
-1. Refuse (exit 4) when the branch has commits absent from the host repository, unless `--force` — the unsaved-work
-   safety net.
+1. Refuse (exit 4) unless the workspace's HEAD is contained in live main by ancestry or patch equivalence. `--force`
+   permits loss of dirty/in-progress state, not unlanded commits. Explicit `--abandon` requires a verified recovery
+   bundle before retiring unlanded work.
 2. Stop the supervisor: TERM → grace → KILL across the whole descendant tree (11_shell.md). Teardown precedes retirement
    — live children would otherwise hold the mount busy and keep enforcing stale launch-time authority after the grants
    disappear.
@@ -717,10 +723,20 @@ step.
    then the empty checkpoint and mountpoint directories. Interrupted cleanup is resumed idempotently by `cowshed gc`
    only from exact, revalidated retirement trash metadata; a missing canonical image alone is never cleanup authority.
 
-Removal likewise persists its exact options before attachment or retirement. If a process dies after canonical
-retirement but before acknowledging the call, startup observes the workspace absent, records the first removal result,
-and a retry returns it without applying retirement twice. If the canonical workspace remains, the pending intent reruns
-the safety fences and retirement.
+Removal persists its exact options before the authorized retirement mutation. If a process dies after canonical
+retirement but before acknowledging the call, startup observes the workspace absent and records completion without
+retiring it twice. A prepared request that never crossed the safety fence is discarded, not a deferred deletion; an
+authorized mutating request reruns the safety fences and retirement.
+
+A named `rm` can retire an unfinished `new` or `fork` without activating it. The exact pending image is mounted and
+validated under its image lock, then receives the same dirty-state, HEAD-stability and landed-work checks as an active
+workspace. A refusal preserves the image and original clone intent. Once retirement is authorized, its journal record
+retains the original clone source so an interrupted removal can recover.
+
+If the named target owns a duplicate port block, removal-scoped startup leaves unfinished clone intents intact instead
+of replaying them through the conflicting allocator. Only the named target is retired; its peers keep their grants.
+Other openings and unrelated integrity failures still refuse. The retired image is validated by its exact trash path,
+repository, format and incarnation; being unpublished before retirement does not invalidate that recovery fact.
 
 `cowshed rm main --restore` is the adoption rollback described above and maps to `RemoveOptions.restore`; plain
 `cowshed rm main` requires `--force` and a clean `git status` (exit 4 otherwise).

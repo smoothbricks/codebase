@@ -60,6 +60,7 @@ fn intent(operation: &str) -> LifecycleIntent {
                 force: true,
                 ..RemoveOptions::default()
             },
+            origin: None,
         },
         other => panic!("unknown crash fixture operation {other}"),
     }
@@ -68,6 +69,7 @@ fn retire(name: &str, options: RemoveOptions) -> LifecycleIntent {
     LifecycleIntent::Retire {
         workspace: workspace(name),
         options,
+        origin: None,
     }
 }
 
@@ -274,6 +276,51 @@ fn mutating_retirement_remains_recoverable_after_a_crash() {
         journal.get(&name).is_some(),
         "a crash after mutation begins must retain its recovery record"
     );
+}
+
+#[test]
+fn refused_pending_retirement_restores_the_clone_and_a_new_removal_can_be_authorized() {
+    let root = TestRoot::new("pending-refusal");
+    let path = root.path().join(LIFECYCLE_INTENTS_FILE);
+    let name = workspace("pending");
+    let clone = LifecycleIntent::Fork {
+        source: workspace("main"),
+        destination: name.clone(),
+    };
+    let mut journal = LifecycleIntentJournal::default();
+    journal.begin(clone.clone());
+    journal.begin(LifecycleIntent::Retire {
+        workspace: name.clone(),
+        options: RemoveOptions::default(),
+        origin: Some(Box::new(clone.clone())),
+    });
+    journal
+        .persist(&path)
+        .expect("persist interrupted retirement");
+
+    let mut reopened = LifecycleIntentJournal::load(&path).expect("reopen pending retirement");
+    assert!(reopened.restore_prepared_clone_intent(&name));
+    assert_eq!(reopened.get(&name).unwrap().operation, clone);
+    reopened.begin(LifecycleIntent::Retire {
+        workspace: name.clone(),
+        options: RemoveOptions {
+            abandon: true,
+            ..RemoveOptions::default()
+        },
+        origin: Some(Box::new(clone)),
+    });
+    reopened
+        .mark_mutating(&name)
+        .expect("begin authorized retirement");
+    assert!(!reopened.restore_prepared_clone_intent(&name));
+    reopened
+        .persist(&path)
+        .expect("persist mutating retirement");
+    let recovered = LifecycleIntentJournal::load(&path).expect("reopen mutating retirement");
+    let LifecycleIntent::Retire { options, .. } = &recovered.get(&name).unwrap().operation else {
+        panic!("retirement remains recoverable");
+    };
+    assert!(options.abandon);
 }
 
 #[test]

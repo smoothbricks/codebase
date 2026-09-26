@@ -2562,3 +2562,78 @@ async fn pending_canonical_clone_resumes_without_reclone_and_activates_after_ini
         1
     );
 }
+
+#[tokio::test]
+async fn pending_clone_retirement_inspects_before_trash_without_activation() {
+    let host = FakeHost::default();
+    let source = LifecycleWorkspace::new(
+        repo(),
+        WorkspaceName::main(),
+        incarnation(5),
+        Revision::new(5),
+        Revision::new(10),
+        WorkspaceRole::Main,
+        ImageFormat::Sparse,
+    )
+    .expect("source");
+    host.seed(&source);
+    let name = WorkspaceName::new("unfinished").expect("destination");
+    let pending = LifecycleWorkspace::new(
+        repo(),
+        name.clone(),
+        incarnation(9),
+        Revision::new(6),
+        Revision::new(11),
+        WorkspaceRole::Workspace,
+        ImageFormat::Sparse,
+    )
+    .expect("pending");
+    let original = identity();
+    host.resume_clone_from(
+        pending.clone(),
+        original.clone(),
+        "/store/acme--widget/sessions/unfinished.sparseimage",
+    );
+    let substrate = substrate(host.clone(), CountingLane::default());
+    let plan = substrate
+        .plan_create(
+            &source,
+            Destination {
+                repo: repo(),
+                name,
+                topology_revision: Revision::new(11),
+                identity: original,
+            },
+        )
+        .expect("retirement plan");
+    let refusal = substrate
+        .execute_pending_clone_retirement(plan.clone(), |stage| async move {
+            assert!(stage.resuming);
+            Err::<(), _>("unlanded commits")
+        })
+        .await
+        .expect_err("Git safety refusal keeps the pending clone");
+    assert!(matches!(
+        refusal,
+        cowshed_core::storage::apfs::StagedExecutionError::Initializer("unlanded commits")
+    ));
+    assert!(
+        !host
+            .events()
+            .iter()
+            .any(|event| event == "atomic-retire-to-trash")
+    );
+    let (retired, proof) = substrate
+        .execute_pending_clone_retirement(plan, |stage| async move {
+            assert_eq!(stage.workspace, pending);
+            Ok::<_, &'static str>("landed")
+        })
+        .await
+        .expect("retire verified pending clone");
+    assert_eq!(proof, "landed");
+    assert_eq!(retired.workspace().revision(), Revision::new(6));
+    let events = host.events();
+    assert!(events.iter().any(|event| event == "atomic-retire-to-trash"));
+    assert!(!events.iter().any(|event| event == "activate-pending-clone"));
+    assert!(!events.iter().any(|event| event.starts_with("clone:")));
+}
