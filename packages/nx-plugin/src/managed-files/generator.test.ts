@@ -138,7 +138,11 @@ describe('managed-files generator', () => {
   it('stages nothing on a fresh Tree after applying the first generation', async () => {
     const root = mkdtempSync(join(tmpdir(), 'smoo-generator-'));
     temporaryRoots.push(root);
-    const first = workspace();
+    // Both passes must resolve the same consumer formatter configuration.
+    // A /virtual first pass and a real second pass disagree when TMPDIR is
+    // inside a workspace with inherited Prettier settings.
+    flushChanges(root, workspace().listChanges());
+    const first = new FsTree(root, false);
     await generate(first);
     flushChanges(root, first.listChanges());
     const second = new FsTree(root, false);
