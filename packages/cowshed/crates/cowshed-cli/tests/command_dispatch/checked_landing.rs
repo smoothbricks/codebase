@@ -3,6 +3,7 @@ use cowshed_cli::gateway_service::{ControlSocket, reconcile_project};
 use cowshed_core::gateway_sessions::{
     SessionInventory, policy_from_grants, project_session_prefix, stable_workspace_id,
 };
+use cowshed_core::workspace_environment::PORT_BASE_ENV;
 use cowshed_gateway::{
     ArrowAuditConfig, ArrowAuditSink, AuthorizedTarget, CanonicalTarget, ConnectError,
     CredentialError, CredentialProvider, CredentialQuery, CredentialRecord, Gateway, GatewayConfig,
@@ -12,12 +13,12 @@ use cowshed_gateway::{
 };
 use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
 use std::fs;
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::AsyncWriteExt;
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{UnixListener, UnixStream};
 use tokio::process::Command;
 use tokio::task::JoinHandle;
 
@@ -36,7 +37,7 @@ impl CredentialProvider for NoCredentials {
     }
 }
 
-struct LocalUpstream(SocketAddr);
+struct LocalUpstream(PathBuf);
 
 #[async_trait]
 impl UpstreamConnector for LocalUpstream {
@@ -53,7 +54,9 @@ impl UpstreamConnector for LocalUpstream {
             cowshed_gateway::CanonicalHost::Dns(host) if host == UPSTREAM_HOST
         ));
         assert_eq!(target.purpose, UpstreamPurpose::PlainHttp);
-        let stream = TcpStream::connect(self.0).await.map_err(ConnectError::Io)?;
+        let stream = UnixStream::connect(&self.0)
+            .await
+            .map_err(ConnectError::Io)?;
         Ok(UpstreamConnection {
             io: Box::new(stream),
             transport: NegotiatedTransport::Http1,
@@ -80,15 +83,18 @@ pub(super) struct Fixture {
 }
 
 impl Fixture {
-    async fn new() -> Self {
+    async fn new(gateway_port: Option<u16>) -> Self {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let root = Path::new("/tmp").join(format!("cs-land-{}-{nonce}", std::process::id()));
-        fs::create_dir(&root).unwrap();
-        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
-        let root = root.canonicalize().unwrap();
+        let socket_root = std::env::var_os("XDG_RUNTIME_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/tmp"))
+            .join(format!("cs-land-{}-{nonce}", std::process::id()));
+        fs::create_dir(&socket_root).unwrap();
+        fs::set_permissions(&socket_root, fs::Permissions::from_mode(0o700)).unwrap();
+        let root = socket_root.canonicalize().unwrap();
         let parent = root.join("parent");
         let workspace = root.join("topic");
         fs::create_dir(&parent).unwrap();
@@ -101,8 +107,8 @@ impl Fixture {
         git(&workspace, ["add", "feature.txt"]).await;
         git(&workspace, ["commit", "-q", "-m", "feature"]).await;
 
-        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
-        let upstream_address = listener.local_addr().unwrap();
+        let upstream_address = socket_root.join("upstream.sock");
+        let listener = UnixListener::bind(&upstream_address).unwrap();
         let upstream = tokio::spawn(async move {
             loop {
                 let (mut stream, _) = listener.accept().await.unwrap();
@@ -127,7 +133,7 @@ impl Fixture {
         let cache = root.join("cache");
         fs::create_dir(&cache).unwrap();
         fs::set_permissions(&cache, fs::Permissions::from_mode(0o700)).unwrap();
-        let control_path = root.join("gateway.sock");
+        let control_path = socket_root.join("gateway.sock");
         let audit_root = root.join("audit");
         fs::create_dir(&audit_root).unwrap();
         fs::set_permissions(&audit_root, fs::Permissions::from_mode(0o700)).unwrap();
@@ -160,7 +166,16 @@ impl Fixture {
             upstream,
             repo,
             identity,
-            endpoint: SocketAddr::from((Ipv4Addr::LOCALHOST, MACOS_PORT_MIN)),
+            // The enclosing sandbox's real gateway owns IPv4 at its assigned
+            // base. An isolated IPv6 listener uses that same admitted port.
+            endpoint: SocketAddr::new(
+                if gateway_port.is_some() {
+                    IpAddr::V6(Ipv6Addr::LOCALHOST)
+                } else {
+                    IpAddr::V4(Ipv4Addr::LOCALHOST)
+                },
+                gateway_port.unwrap_or(MACOS_PORT_MIN),
+            ),
             token: WorkspaceToken::from_bytes([19; 32]),
             ca: WorkspaceCa::new(certificate.pem(), key.serialize_pem()).unwrap(),
             grants: GrantSet::default(),
@@ -168,7 +183,9 @@ impl Fixture {
         };
         // Install atomically rather than probing then releasing a port: another test process
         // or the host gateway may already own any candidate block.
-        for port in (MACOS_PORT_MIN..MACOS_PORT_MAX).step_by(usize::from(MACOS_PORT_BLOCK_SIZE)) {
+        let first = gateway_port.unwrap_or(MACOS_PORT_MIN);
+        let end = gateway_port.map_or(MACOS_PORT_MAX, |port| port + 1);
+        for port in (first..end).step_by(usize::from(MACOS_PORT_BLOCK_SIZE)) {
             fixture.endpoint.set_port(port);
             match fixture
                 .gateway
@@ -308,7 +325,10 @@ async fn git<const N: usize>(root: &Path, args: [&str; N]) -> String {
 
 #[tokio::test]
 async fn checked_land_uses_new_egress_grants_without_an_intervening_exec() {
-    let fixture = Fixture::new().await;
+    let gateway_port = std::env::var(PORT_BASE_ENV)
+        .ok()
+        .map(|port| port.parse().expect("assigned gateway port"));
+    let fixture = Fixture::new(gateway_port).await;
     let expected_head = git(&fixture.workspace, ["rev-parse", "HEAD"]).await;
     let mut service = FakeService {
         checked_landing: Some(fixture),
@@ -334,7 +354,7 @@ async fn checked_land_uses_new_egress_grants_without_an_intervening_exec() {
 
 #[tokio::test]
 async fn checked_land_keeps_target_ref_unchanged_when_gateway_reconciliation_fails() {
-    let mut fixture = Fixture::new().await;
+    let mut fixture = Fixture::new(None).await;
     let original_head = git(&fixture.parent, ["rev-parse", "main"]).await;
     fixture.stop_gateway().await;
     let mut service = FakeService {
@@ -365,7 +385,7 @@ async fn checked_land_keeps_target_ref_unchanged_when_gateway_reconciliation_fai
 
 #[tokio::test]
 async fn checkless_land_does_not_require_gateway_reconciliation() {
-    let mut fixture = Fixture::new().await;
+    let mut fixture = Fixture::new(None).await;
     let expected_head = git(&fixture.workspace, ["rev-parse", "HEAD"]).await;
     fixture.stop_gateway().await;
     let mut service = FakeService {
