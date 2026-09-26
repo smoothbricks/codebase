@@ -207,7 +207,7 @@
           "{projectRoot}/src/wire-fixtures.json"
         ],
         "options": {
-          "command": "COWSHED_WIRE_FIXTURES=write cargo --frozen test -p cowshed-napi --quiet the_committed_wire_corpus_is_what_core_serializes && bunx biome format --write src/wire-fixtures.json",
+          "command": "COWSHED_WIRE_FIXTURES=write cargo --frozen test -p cowshed-napi --quiet the_committed_wire_corpus_is_what_core_serializes && biome format --write src/wire-fixtures.json",
           "cwd": "packages/cowshed"
         }
       },

@@ -32,8 +32,8 @@ try {
       'only',
       '--user-config-file',
       'none',
-      '--config-file',
-      'packages/nx-plugin/nextest.toml',
+      '--tool-config-file',
+      `smoo:${join(checkout, 'packages/nx-plugin/nextest.toml')}`,
     ],
     {
       cwd: checkout,
