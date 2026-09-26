@@ -34,6 +34,8 @@ const ancestorInputs = ['Cargo.toml', '.cargo/config', '.cargo/config.toml'];
  * patches, and transitive path dependencies. A locked offline query observes
  * that graph without fetching dependencies or changing the lockfile. Git and
  * registry packages are immutable inputs already identified by Cargo.lock.
+ * By default, Nx's in-workspace inputs own workspace packages; includeWorkspace
+ * also covers those packages for custom targets without inferred Cargo inputs.
  *
  * This covers Rust sources and Cargo configuration, matching the plugin's
  * in-workspace Rust inputs. Build scripts' other data/environment inputs remain
@@ -47,7 +49,11 @@ const ancestorInputs = ['Cargo.toml', '.cargo/config', '.cargo/config.toml'];
 // the thrown error.
 const CARGO_STDIO: ['ignore', 'pipe', 'pipe'] = ['ignore', 'pipe', 'pipe'];
 
-export async function hashCargoPathInputs(manifestPath: string, workspaceRoot: string): Promise<string> {
+export async function hashCargoPathInputs(
+  manifestPath: string,
+  workspaceRoot: string,
+  options?: { includeWorkspace?: boolean },
+): Promise<string> {
   const root = await realpath(workspaceRoot);
   const metadata = parseMetadata(
     execFileSync(
@@ -65,18 +71,20 @@ export async function hashCargoPathInputs(manifestPath: string, workspaceRoot: s
     if (pkg.source !== null) continue;
     const manifest = await realpath(pkg.manifest_path);
     const directory = dirname(manifest);
-    const fromRoot = relative(root, directory);
-    const fromCargo = relative(cargoRoot, directory);
-    if (
-      fromRoot !== '..' &&
-      !fromRoot.startsWith(`..${sep}`) &&
-      !isAbsolute(fromRoot) &&
-      fromCargo !== '..' &&
-      !fromCargo.startsWith(`..${sep}`) &&
-      !isAbsolute(fromCargo) &&
-      !fromRoot.split(sep).includes('node_modules')
-    )
-      continue;
+    if (!options?.includeWorkspace) {
+      const fromRoot = relative(root, directory);
+      const fromCargo = relative(cargoRoot, directory);
+      if (
+        fromRoot !== '..' &&
+        !fromRoot.startsWith(`..${sep}`) &&
+        !isAbsolute(fromRoot) &&
+        fromCargo !== '..' &&
+        !fromCargo.startsWith(`..${sep}`) &&
+        !isAbsolute(fromCargo) &&
+        !fromRoot.split(sep).includes('node_modules')
+      )
+        continue;
+    }
     directories.add(directory);
     files.add(manifest);
     // Cargo resolves explicit package.workspace ownership as well as ancestor
@@ -88,7 +96,7 @@ export async function hashCargoPathInputs(manifestPath: string, workspaceRoot: s
     ).trim();
     files.add(await realpath(governingManifest));
     for (const target of pkg.targets) files.add(await realpath(target.src_path));
-    // An external member can inherit edition, lint policy, dependencies and
+    // A member can inherit edition, lint policy, dependencies and
     // profiles from a workspace above its package directory. Those manifests
     // are not descendants of the source roots returned by Cargo metadata.
     for (let ancestor = dirname(directory); !ancestors.has(ancestor); ancestor = dirname(ancestor)) {

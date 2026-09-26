@@ -90,9 +90,9 @@ source replacement, credentials, and toolchain settings; forwarding it with `--c
 access may consequently serialize on Cargo's package-cache lock. Clippy's dedicated target directory keeps its check
 artifacts out of the test build directory without splitting one directory per crate.
 
-### External Rust sources
+### Cargo source runtime inputs
 
-For a repository-root Cargo workspace, declare the shared input once:
+For inferred Cargo targets in a repository-root Cargo workspace, declare the external-source input once:
 
 ```json
 {
@@ -106,11 +106,39 @@ For a package-root Cargo workspace, pass its manifest relative to the Nx root:
 `smoo-nx-cargo-hash packages/example/Cargo.toml`. A shared input covering several Cargo workspaces includes one runtime
 entry per manifest.
 
-The command queries `cargo metadata --locked --offline` and hashes the resolved external path packages, including
-transitive dependencies, Rust sources, target source files, governing Cargo manifests, and Cargo configuration. It also
-covers path packages under `node_modules`, which Nx's normal file map ignores. Adding or moving a dependency does not
+By default, the command queries `cargo metadata --locked --offline` and hashes the resolved external path packages,
+including transitive dependencies, Rust sources, target source files, governing Cargo manifests, and Cargo
+configuration. It also covers path packages under `node_modules`, which Nx's normal file map ignores. Packages inside
+both the Nx and Cargo workspaces are left to the plugin's inferred file inputs. Adding or moving a dependency does not
 require maintaining a second list of source roots. The command refuses missing dependencies or an unavailable locked
 dependency cache instead of emitting a partial digest.
+
+Custom Cargo targets that replace inferred inputs need the in-workspace source closure too. Use
+`smoo-nx-cargo-hash --include-workspace [Cargo.toml]` to include every mutable local package from the same locked,
+offline Cargo metadata result. For a repository-root Cargo workspace:
+
+```json
+{
+  "namedInputs": {
+    "externalRustCrates": [{ "runtime": "smoo-nx-cargo-hash" }],
+    "cargoSources": [
+      { "runtime": "smoo-nx-cargo-hash --include-workspace" },
+      "{workspaceRoot}/Cargo.lock",
+      "{workspaceRoot}/devenv.lock",
+      "{workspaceRoot}/tooling/direnv/devenv.lock"
+    ]
+  }
+}
+```
+
+Name `cargoSources` in each custom Cargo target's `inputs`, alongside its own scripts and non-Rust build inputs. Keep
+`externalRustCrates` for the plugin's external-source inference contract; unrelated TypeScript targets do not need
+`cargoSources`. For a package-root workspace, pass `--include-workspace packages/example/Cargo.toml` and name that
+workspace's `Cargo.lock`. An Nx `^production` input only follows existing project graph edges; it cannot replace a
+missing Cargo dependency closure.
+
+The helper exposes the same choice as `hashCargoPathInputs(manifestPath, workspaceRoot, { includeWorkspace: true })`.
+Omitting the options, or setting `includeWorkspace: false`, retains the external-only behavior.
 
 Git and registry dependencies are identified by `Cargo.lock`; uncommitted changes in a Git repository are not changes to
 a pinned Git dependency. Local `path` dependencies stay live and their source edits change the digest. Build-script data
