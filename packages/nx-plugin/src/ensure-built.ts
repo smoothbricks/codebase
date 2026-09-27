@@ -19,6 +19,7 @@ import type * as NxCreateTaskGraph from 'nx/src/tasks-runner/create-task-graph';
 import type { TaskResults } from 'nx/src/tasks-runner/life-cycle';
 import type * as NxRunCommand from 'nx/src/tasks-runner/run-command';
 import type * as NxTaskEnv from 'nx/src/tasks-runner/task-env';
+import type * as NxTasksRunnerUtils from 'nx/src/tasks-runner/utils';
 import type * as NxCacheDirectory from 'nx/src/utils/cache-directory';
 import type * as NxCommandLineUtils from 'nx/src/utils/command-line-utils';
 import type { NxArgs } from 'nx/src/utils/command-line-utils';
@@ -38,6 +39,7 @@ interface NxRuntimeModules {
   readonly 'nx/src/tasks-runner/create-task-graph': typeof NxCreateTaskGraph;
   readonly 'nx/src/tasks-runner/run-command': typeof NxRunCommand;
   readonly 'nx/src/tasks-runner/task-env': typeof NxTaskEnv;
+  readonly 'nx/src/tasks-runner/utils': typeof NxTasksRunnerUtils;
   readonly 'nx/src/utils/cache-directory': typeof NxCacheDirectory;
   readonly 'nx/src/utils/command-line-utils': typeof NxCommandLineUtils;
   readonly 'nx/src/utils/exit-codes': typeof NxExitCodes;
@@ -485,6 +487,7 @@ async function probe(
   const { getTaskSpecificEnv } = requireNx('nx/src/tasks-runner/task-env');
   const { getCache } = requireNx('nx/src/tasks-runner/cache');
   const { getRunnerOptions } = requireNx('nx/src/tasks-runner/run-command');
+  const { getExecutorNameForTask } = requireNx('nx/src/tasks-runner/utils');
 
   // `isCloudDefault: false` because these options are only read here by the
   // hasher, which looks at `selectivelyHashTsConfig`; the cloud credentials the
@@ -512,6 +515,15 @@ async function probe(
   await hashTasks(hasher, projectGraph, taskGraph, perTaskEnvs, getTaskDetails(), tasks);
   performance.measure('ensureBuilt:hash', 'ensureBuilt:hash:start');
 
+  // An `nx:noop` task has no command: Nx completes it without spawning
+  // anything, and normalizes a command-less target that only names dependencies
+  // to one. A cache record would vouch for no work — the tasks it aggregates are
+  // in this graph and answer for themselves — so none is required. Demanding one
+  // made every call through an uncacheable aggregate hand the whole graph to Nx,
+  // which replays each dependency's cached log. Outputs a noop declares are
+  // still verified below, with every other task's.
+  const recordedTasks = tasks.filter((task) => getExecutorNameForTask(task, projectGraph) !== 'nx:noop');
+
   // Nx's own factory, but deliberately never `init()`ed: that is what makes
   // this a local-only, side-effect-free question. `init()` attaches the remote
   // cache — a network round-trip, and a download is precisely the work this
@@ -520,12 +532,12 @@ async function probe(
   // disk already match, so the cache directory is never read.
   performance.mark('ensureBuilt:cache:start');
   const cache = getCache(runnerOptions);
-  const cachedResults = await cache.getBatch(tasks.filter((task) => task.cache && task.hash));
+  const cachedResults = await cache.getBatch(recordedTasks.filter((task) => task.cache && task.hash));
   const cachedCodeByHash = new Map<string, number>();
   for (const [hash, result] of cachedResults) {
     cachedCodeByHash.set(hash, result.code);
   }
-  const cacheMiss = firstCacheMiss(tasks, cachedCodeByHash);
+  const cacheMiss = firstCacheMiss(recordedTasks, cachedCodeByHash);
   performance.measure('ensureBuilt:cache', 'ensureBuilt:cache:start');
   if (cacheMiss) {
     return cacheMiss;

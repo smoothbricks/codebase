@@ -301,6 +301,10 @@ through the inferred `typecheck-tests` target, not through `tsc --build`.
 hashes. A full hit returns without running tasks or printing output. A miss runs the task graph through Nx's in-process
 runner with streaming output; only a workspace with the daemon disabled falls back to its checkout-local `nx` CLI.
 
+An `nx:noop` task, including a command-less target that Nx normalizes to one, runs nothing and so needs no cache record:
+the tasks it aggregates answer in its place, and any outputs it declares are verified like every other task's. Any other
+uncacheable task is a miss on every call, because only running it can say whether its side effects are current.
+
 The probe and runner use the workspace's installed Nx and its normal cache configuration. A build performed by the Nx
 CLI can satisfy the next wrapper invocation without re-executing tasks; changed inputs still go through Nx's runner.
 Both invocations must use the same cache location. Relative `NX_CACHE_DIRECTORY` and `NX_WORKSPACE_DATA_DIRECTORY`

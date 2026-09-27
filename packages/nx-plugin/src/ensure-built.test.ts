@@ -272,6 +272,7 @@ describe('smoo-nx-exec', () => {
   // Outside the workspace: a log inside it would be an undeclared output the
   // snapshot diff rightly reports as a changed input.
   const builds = () => `${workspace}-lib-builds.log`;
+  const ships = () => `${workspace}-app-ships.log`;
 
   beforeAll(async () => {
     // Realpath because macOS puts the temp directory behind a /private
@@ -336,6 +337,20 @@ describe('smoo-nx-exec', () => {
             cache: true,
             options: { command: 'exit 3', cwd: '{projectRoot}' },
           },
+          // A command-less aggregate, as Nx normalizes any target that only
+          // names dependencies. It declares no `cache`, so it is uncacheable.
+          stage: {
+            executor: 'nx:noop',
+            dependsOn: ['build'],
+          },
+          // A cacheable leaf that reaches its build only through the aggregate.
+          ship: {
+            executor: 'nx:run-commands',
+            cache: true,
+            inputs: ['{projectRoot}/source.txt'],
+            dependsOn: ['stage'],
+            options: { command: `cat dist/marker.txt >> ${ships()}`, cwd: '{projectRoot}' },
+          },
         },
         implicitDependencies: ['lib'],
       }),
@@ -356,6 +371,7 @@ describe('smoo-nx-exec', () => {
       await nx(workspace, ['daemon', '--stop']);
       await rm(workspace, { recursive: true, force: true });
       await rm(builds(), { force: true });
+      await rm(ships(), { force: true });
     }
   });
 
@@ -381,6 +397,23 @@ describe('smoo-nx-exec', () => {
     expect(run.stdout.split('\n')[0]).toBe(MARKER);
     expect(run.stdout).not.toContain('nx run');
     expect(await readFile(marker(), 'utf-8')).toBe('built\nlib\n');
+    expect(await readFile(builds(), 'utf-8')).toBe('lib\n');
+  });
+
+  it('stays silent through an uncacheable nx:noop aggregate, which has no command to run', async () => {
+    const first = await runBin(workspace, ['app:ship', '--', './report']);
+    expect(first.code, first.stdout + first.stderr).toBe(0);
+    expect(await readFile(ships(), 'utf-8')).toBe('built\nlib\n');
+
+    // Every task but the aggregate is now a recorded success. Treating the
+    // aggregate like an uncacheable command hands the whole graph back to Nx,
+    // which replays each dependency's cached log on every invocation.
+    const again = await runBin(workspace, ['app:ship', '--', './report']);
+    expect(again.code).toBe(0);
+    expect(again.stderr).toBe('');
+    expect(again.stdout.split('\n')[0], again.stdout).toBe(MARKER);
+    expect(again.stdout).not.toContain('nx run');
+    expect(await readFile(ships(), 'utf-8')).toBe('built\nlib\n');
     expect(await readFile(builds(), 'utf-8')).toBe('lib\n');
   });
 
