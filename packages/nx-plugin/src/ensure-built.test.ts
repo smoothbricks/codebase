@@ -9,13 +9,7 @@ import type { Task } from 'nx/src/config/task-graph';
 
 import { signalToCode } from 'nx/src/utils/exit-codes';
 
-import {
-  cliExitOutcome,
-  describeMiss,
-  firstCacheMiss,
-  firstStaleOutputs,
-  parseTargetSelector,
-} from './ensure-built.js';
+import { cliExitOutcome, describeMiss, firstCacheMiss, parseTargetSelector, unvouched } from './ensure-built.js';
 
 function task(overrides: Partial<Task> & Pick<Task, 'id'>): Task {
   const [project, target] = overrides.id.split(':');
@@ -97,20 +91,20 @@ describe('firstCacheMiss', () => {
   });
 });
 
-describe('firstStaleOutputs', () => {
+describe('unvouched', () => {
   const tasks = [task({ id: 'lib:build', outputs: ['lib/dist'] }), task({ id: 'app:build', outputs: ['app/dist'] })];
 
   it('clears outputs the daemon vouches for', () => {
-    expect(firstStaleOutputs(tasks, [true, true])).toBeNull();
+    expect(unvouched(tasks, [true, true])).toEqual([]);
   });
 
-  it('reports the task whose outputs no longer match', () => {
-    expect(firstStaleOutputs(tasks, [true, false])).toEqual({ kind: 'stale-outputs', taskId: 'app:build' });
+  it('keeps the tasks whose outputs the daemon does not vouch for', () => {
+    expect(unvouched(tasks, [true, false]).map(({ id }) => id)).toEqual(['app:build']);
   });
 
-  it('treats a missing verdict as stale rather than as a hit', () => {
-    expect(firstStaleOutputs(tasks, [true])).toEqual({ kind: 'stale-outputs', taskId: 'app:build' });
-    expect(firstStaleOutputs(tasks, [])).toEqual({ kind: 'stale-outputs', taskId: 'lib:build' });
+  it('treats a missing verdict as unvouched rather than as a hit', () => {
+    expect(unvouched(tasks, [true]).map(({ id }) => id)).toEqual(['app:build']);
+    expect(unvouched(tasks, []).map(({ id }) => id)).toEqual(['lib:build', 'app:build']);
   });
 });
 
@@ -414,6 +408,34 @@ describe('smoo-nx-exec', () => {
     expect(again.stdout.split('\n')[0], again.stdout).toBe(MARKER);
     expect(again.stdout).not.toContain('nx run');
     expect(await readFile(ships(), 'utf-8')).toBe('built\nlib\n');
+    expect(await readFile(builds(), 'utf-8')).toBe('lib\n');
+  });
+
+  it('stays silent when the daemon has lost its record of outputs that still match the cache', async () => {
+    // The daemon's output records live in memory and are lossy: a restart
+    // drops every one, and in a busy workspace a restore's own write events can
+    // be processed after Nx's 2 s grace and erase the record just made. Either
+    // way the working tree still holds exactly the cached bytes.
+    const stopped = await nx(workspace, ['daemon', '--stop']);
+    expect(stopped.code, stopped.stdout + stopped.stderr).toBe(0);
+
+    const run = await runBin(workspace, ['app:build', '--', './report']);
+    expect(run.code).toBe(0);
+    expect(run.stderr).toBe('');
+    expect(run.stdout.split('\n')[0], run.stdout).toBe(MARKER);
+    expect(await readFile(builds(), 'utf-8')).toBe('lib\n');
+  });
+
+  it('never vouches for rewritten output bytes the daemon holds no record of', async () => {
+    const stopped = await nx(workspace, ['daemon', '--stop']);
+    expect(stopped.code, stopped.stdout + stopped.stderr).toBe(0);
+    // Same length, different bytes: only a content comparison can tell.
+    await writeFile(marker(), 'BUILT\nLIB\n');
+
+    const run = await runBin(workspace, ['app:build', '--', './report'], { NX_VERBOSE_LOGGING: 'true' });
+    expect(run.code).toBe(0);
+    expect(run.stderr).toContain('app:build outputs are missing or modified on disk');
+    expect(await readFile(marker(), 'utf-8')).toBe('built\nlib\n');
     expect(await readFile(builds(), 'utf-8')).toBe('lib\n');
   });
 

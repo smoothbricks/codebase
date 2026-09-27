@@ -316,6 +316,14 @@ Before hashing, it compares a native snapshot of the workspace with the daemon's
 watcher has not delivered yet counts as a miss unless every changed path is a declared output of a task in the graph, so
 a build's own artifacts never turn the next call noisy, and an edit made moments before the call never hits stale.
 
+The daemon's output records are lossy: they are held in memory, tracked per collapsed directory, and erased by writes it
+processes more than two seconds late — including, on a busy daemon, a restore's own writes. When it cannot vouch for a
+task's outputs, the working tree is compared with Nx's local cache artifact for that exact task hash, entry by entry as
+Nx's restore expands them: each entry must be reachable through real directories and hold the same node types, symlink
+text (never followed), file permission bits and bytes. A tree the restore would leave unchanged is a hit, and the
+daemon's record is re-armed as Nx's runner does after a restore. A missing or empty artifact, any difference, a read
+error, or a write observed during the comparison is a miss.
+
 ```typescript
 import { ensureBuilt } from '@smoothbricks/nx-plugin/ensure-built';
 

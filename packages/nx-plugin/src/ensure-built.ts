@@ -1,8 +1,9 @@
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { existsSync } from 'node:fs';
+import type { BigIntStats } from 'node:fs';
+import { closeSync, existsSync, lstatSync, openSync, readdirSync, readlinkSync, readSync } from 'node:fs';
 import { createRequire } from 'node:module';
-import { join, resolve } from 'node:path';
+import { isAbsolute, join, resolve } from 'node:path';
 
 import type * as NxConfiguration from 'nx/src/config/nx-json';
 import type { NxJsonConfiguration } from 'nx/src/config/nx-json';
@@ -205,19 +206,15 @@ export function firstCacheMiss(
 }
 
 /**
- * First task whose recorded outputs are no longer the bytes on disk.
+ * The entries the daemon does not vouch for.
  *
- * `matches[index]` is the daemon's verdict for `tasks[index]`. A short or
- * ragged array counts as stale rather than as a hit: a missing verdict is not a
- * positive one, and being wrong here means exec'ing a binary that was deleted.
+ * `verdicts[index]` is the daemon's verdict for `entries[index]`. A short or
+ * ragged array leaves the remainder unvouched rather than cleared: a missing
+ * verdict is not a positive one, and being wrong here means exec'ing a binary
+ * that was deleted.
  */
-export function firstStaleOutputs(tasks: readonly Task[], matches: readonly boolean[]): MissReason | null {
-  for (let index = 0; index < tasks.length; index += 1) {
-    if (matches[index] !== true) {
-      return { kind: 'stale-outputs', taskId: tasks[index].id };
-    }
-  }
-  return null;
+export function unvouched<Entry>(entries: readonly Entry[], verdicts: readonly boolean[]): Entry[] {
+  return entries.filter((_, index) => verdicts[index] !== true);
 }
 
 /**
@@ -368,7 +365,7 @@ async function ensureBuiltInWorkspace(
   } else if (inputsChanged) {
     reason = { kind: 'stale-inputs', taskId: selectorTaskId };
   } else {
-    reason = await probe(nxJson, nxArgs, projectGraph, taskGraph, tasks, requireNx);
+    reason = await probe(workspaceRoot, nxJson, nxArgs, projectGraph, taskGraph, tasks, requireNx);
   }
   performance.measure('ensureBuilt:probe', 'ensureBuilt:probe:start');
   const outcome =
@@ -474,6 +471,7 @@ async function refreshWorkspaceContext(
 
 /** `null` when the target is already built; otherwise the first reason it is not. */
 async function probe(
+  workspaceRoot: string,
   nxJson: NxJsonConfiguration,
   nxArgs: NxArgs,
   projectGraph: ProjectGraph,
@@ -528,8 +526,8 @@ async function probe(
   // this a local-only, side-effect-free question. `init()` attaches the remote
   // cache — a network round-trip, and a download is precisely the work this
   // probe exists to detect — and asserts that the cache directory matches the
-  // database. Neither matters here: a hit is only declared when the outputs on
-  // disk already match, so the cache directory is never read.
+  // database. Neither matters here: the directory is read only to compare
+  // outputs against, and an artifact missing from it is a miss.
   performance.mark('ensureBuilt:cache:start');
   const cache = getCache(runnerOptions);
   const cachedResults = await cache.getBatch(recordedTasks.filter((task) => task.cache && task.hash));
@@ -546,22 +544,257 @@ async function probe(
   // A cache record only proves the task once succeeded with these inputs. The
   // artifact this facility is about — the binary that is about to be exec'd —
   // lives in the working tree, where anything may have deleted or rewritten it
-  // since. Only the daemon can settle that, because it holds the recorded
-  // output hashes.
-  const withOutputs: Task[] = [];
-  const outputEntries: { outputs: string[]; hash: string }[] = [];
+  // since. The daemon answers that cheaply from the output hashes it recorded
+  // when Nx last wrote them.
+  const claims: OutputClaim[] = [];
   for (const task of tasks) {
-    const hash = task.hash;
-    if (task.outputs.length === 0 || hash === undefined) {
-      continue;
+    if (task.outputs.length > 0 && task.hash !== undefined) {
+      claims.push({ taskId: task.id, outputs: task.outputs, hash: task.hash });
     }
-    withOutputs.push(task);
-    outputEntries.push({ outputs: task.outputs, hash });
   }
   performance.mark('ensureBuilt:outputs:start');
-  const matches = await daemonClient.outputsHashesMatchBatch(outputEntries);
+  const verdicts = await daemonClient.outputsHashesMatchBatch(claims.map(({ outputs, hash }) => ({ outputs, hash })));
   performance.measure('ensureBuilt:outputs', 'ensureBuilt:outputs:start');
-  return firstStaleOutputs(withOutputs, matches);
+  const doubted = unvouched(claims, verdicts);
+  if (doubted.length === 0) {
+    return null;
+  }
+
+  // Its records are lossy, though, and a lost record is not a changed output.
+  // They live in memory, so a restart drops every one. They are kept per
+  // collapsed directory (Nx tracks at most three paths per level), so a write
+  // anywhere under `packages/` voids a task whose outputs span four projects.
+  // And a write the daemon processes more than 2 s after a record erases it,
+  // which a daemon busy hashing does to a restore's own writes — so each
+  // restore guarantees the next one. What settles the question is what a hit
+  // would restore: Nx's own local artifact for this exact hash. A working tree
+  // that already holds every entry of it is what the restore would leave.
+  // Anything else — no artifact, a difference, an error while reading — stays
+  // a miss.
+  performance.mark('ensureBuilt:artifacts:start');
+  const { expandOutputs } = requireNx('nx/src/native');
+  const comparison: ArtifactComparison = {
+    expandOutputs,
+    left: Buffer.allocUnsafe(COMPARE_CHUNK_BYTES),
+    right: Buffer.allocUnsafe(COMPARE_CHUNK_BYTES),
+    observed: [],
+    realDirectories: new Set(),
+  };
+  for (const claim of doubted) {
+    // `recordedTasks` excludes `nx:noop`, so a noop's declared outputs have no
+    // artifact here and stay a miss.
+    const artifact = cachedResults.get(claim.hash);
+    if (artifact === undefined || !outputsMatchArtifact(comparison, workspaceRoot, artifact.outputsPath, claim)) {
+      return { kind: 'stale-outputs', taskId: claim.taskId };
+    }
+  }
+  // A write that landed while the bytes were being compared would otherwise be
+  // recorded as current.
+  const movedBeforeRecord = firstMovedClaim(comparison.observed);
+  if (movedBeforeRecord !== null) {
+    return { kind: 'stale-outputs', taskId: movedBeforeRecord };
+  }
+  // Re-arm the daemon the way Nx's runner does after restoring outputs, so the
+  // next call is back on the cheap path.
+  await daemonClient.recordOutputsHashBatch(doubted.map(({ outputs, hash }) => ({ outputs, hash })));
+  const movedDuringRecord = firstMovedClaim(comparison.observed);
+  performance.measure('ensureBuilt:artifacts', 'ensureBuilt:artifacts:start');
+  return movedDuringRecord === null ? null : { kind: 'stale-outputs', taskId: movedDuringRecord };
+}
+
+/** A task's declared outputs, resolved to workspace-relative paths, and the hash they were cached under. */
+interface OutputClaim {
+  readonly taskId: string;
+  readonly outputs: string[];
+  readonly hash: string;
+}
+
+/** A working-tree node as it was when compared, so a later write to it can be noticed. */
+interface ObservedNode {
+  readonly taskId: string;
+  readonly path: string;
+  readonly stats: BigIntStats;
+}
+
+interface ArtifactComparison {
+  readonly expandOutputs: typeof NxNative.expandOutputs;
+  readonly left: Buffer;
+  readonly right: Buffer;
+  readonly observed: ObservedNode[];
+  /** Workspace directories already proven real (not symlinks) on the way to an entry. */
+  readonly realDirectories: Set<string>;
+}
+
+/** Read size for byte comparison: large enough to stream a binary quickly, small enough never to load one whole. */
+const COMPARE_CHUNK_BYTES = 1 << 20;
+
+/**
+ * Whether restoring `claim` from the artifact would leave the working tree as
+ * it is.
+ *
+ * The entries are the ones Nx's restore copies: `expandOutputs` over the
+ * artifact root with the task's outputs, globs and negations included. That
+ * walk is bounded by the artifact, which holds nothing but outputs, and it
+ * needs no reading of the pattern here. A restore replaces each entry whole
+ * and touches nothing else, so a working-tree file that matches a glob but is
+ * absent from the artifact survives it and is no difference. An output path
+ * Nx would refuse to restore (absolute, or climbing out with `..`), an
+ * artifact holding no entry at all, and system errors while reading are all
+ * misses.
+ */
+function outputsMatchArtifact(
+  comparison: ArtifactComparison,
+  workspaceRoot: string,
+  artifactRoot: string,
+  claim: OutputClaim,
+): boolean {
+  if (claim.outputs.some((output) => isAbsolute(output) || output.split('/').includes('..'))) {
+    return false;
+  }
+  try {
+    const entries = comparison.expandOutputs(artifactRoot, claim.outputs);
+    return (
+      entries.length > 0 &&
+      entries.every(
+        (entry) =>
+          throughRealDirectories(comparison.realDirectories, workspaceRoot, entry) &&
+          sameTree(comparison, claim.taskId, join(workspaceRoot, entry), join(artifactRoot, entry)),
+      )
+    );
+  } catch (error) {
+    if (isSystemError(error)) {
+      return false;
+    }
+    throw error;
+  }
+}
+
+/**
+ * Whether every directory between the workspace root and `entry` is a real
+ * directory. A restore realizes a symlinked parent as a directory, so reading
+ * an entry through one would compare bytes the restore does not leave there —
+ * and would read the filesystem behind a link.
+ */
+function throughRealDirectories(realDirectories: Set<string>, workspaceRoot: string, entry: string): boolean {
+  let directory = workspaceRoot;
+  const segments = entry.split('/');
+  for (const segment of segments.slice(0, -1)) {
+    directory = join(directory, segment);
+    if (realDirectories.has(directory)) {
+      continue;
+    }
+    if (lstatSync(directory, { throwIfNoEntry: false })?.isDirectory() !== true) {
+      return false;
+    }
+    realDirectories.add(directory);
+  }
+  return true;
+}
+
+/**
+ * Whether `actual` is `expected` as a restore would recreate it: same node
+ * type; a symlink by its text, never followed, because the link is what Nx
+ * stores and restores; a file by permission bits and bytes; a directory by its
+ * entry names and each entry in turn. Every working-tree node compared is
+ * observed, so a write during the comparison can be caught afterwards.
+ */
+function sameTree(comparison: ArtifactComparison, taskId: string, actual: string, expected: string): boolean {
+  const actualStats = lstatSync(actual, { bigint: true, throwIfNoEntry: false });
+  const expectedStats = lstatSync(expected, { bigint: true, throwIfNoEntry: false });
+  if (actualStats === undefined || expectedStats === undefined) {
+    return false;
+  }
+  comparison.observed.push({ taskId, path: actual, stats: actualStats });
+  if (expectedStats.isSymbolicLink()) {
+    return actualStats.isSymbolicLink() && readlinkSync(actual) === readlinkSync(expected);
+  }
+  if (expectedStats.isFile()) {
+    return (
+      actualStats.isFile() &&
+      actualStats.size === expectedStats.size &&
+      (actualStats.mode & 0o7777n) === (expectedStats.mode & 0o7777n) &&
+      sameBytes(comparison, actual, expected, Number(expectedStats.size))
+    );
+  }
+  if (expectedStats.isDirectory()) {
+    if (!actualStats.isDirectory()) {
+      return false;
+    }
+    const names = readdirSync(actual).sort();
+    const expectedNames = readdirSync(expected).sort();
+    if (names.length !== expectedNames.length) {
+      return false;
+    }
+    for (let index = 0; index < names.length; index += 1) {
+      if (names[index] !== expectedNames[index]) {
+        return false;
+      }
+    }
+    return names.every((name) => sameTree(comparison, taskId, join(actual, name), join(expected, name)));
+  }
+  return false;
+}
+
+/** Byte equality of two files already known to be `size` bytes, streamed through the comparison's buffers. */
+function sameBytes(comparison: ArtifactComparison, actual: string, expected: string, size: number): boolean {
+  const actualFd = openSync(actual, 'r');
+  try {
+    const expectedFd = openSync(expected, 'r');
+    try {
+      for (let offset = 0; offset < size; offset += COMPARE_CHUNK_BYTES) {
+        const length = Math.min(COMPARE_CHUNK_BYTES, size - offset);
+        // A short read means the file changed length since it was sized.
+        if (
+          readSync(actualFd, comparison.left, 0, length, offset) !== length ||
+          readSync(expectedFd, comparison.right, 0, length, offset) !== length ||
+          comparison.left.compare(comparison.right, 0, length, 0, length) !== 0
+        ) {
+          return false;
+        }
+      }
+      return true;
+    } finally {
+      closeSync(expectedFd);
+    }
+  } finally {
+    closeSync(actualFd);
+  }
+}
+
+/**
+ * The task owning the first observed node that is no longer the node it was
+ * compared as: replaced (device, inode), rewritten (size, mtime) or otherwise
+ * touched (mode, ctime).
+ */
+function firstMovedClaim(observed: readonly ObservedNode[]): string | null {
+  for (const { taskId, path, stats } of observed) {
+    let current: BigIntStats | undefined;
+    try {
+      current = lstatSync(path, { bigint: true, throwIfNoEntry: false });
+    } catch (error) {
+      if (isSystemError(error)) {
+        return taskId;
+      }
+      throw error;
+    }
+    if (
+      current === undefined ||
+      current.dev !== stats.dev ||
+      current.ino !== stats.ino ||
+      current.mode !== stats.mode ||
+      current.size !== stats.size ||
+      current.mtimeNs !== stats.mtimeNs ||
+      current.ctimeNs !== stats.ctimeNs
+    ) {
+      return taskId;
+    }
+  }
+  return null;
+}
+
+/** An operating-system or native-binding failure, as opposed to a programming error. */
+function isSystemError(error: unknown): boolean {
+  return error instanceof Error && 'code' in error && typeof error.code === 'string';
 }
 
 interface CompletedRun {
