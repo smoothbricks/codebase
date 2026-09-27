@@ -1627,20 +1627,26 @@ async function createProjectTargets(
     };
   }
 
-  // No `outputs`, deliberately: this aggregate runs no command, so every file
-  // under dist belongs to the concrete target that emitted it. Claiming
-  // `{projectRoot}/dist` here would cache the children's bytes a second time
-  // under the aggregate's hash, and would make `smoo github-ci nx-run-many
-  // --collect-outputs` attribute to `build` whatever sits under dist — including
-  // platform-target artifacts the collect excludes on purpose and stale
-  // artifacts of targets that never ran. Two collected trees then claim one
-  // binary and `apply-outputs` rejects the overlap. `lint` and `test` are
+  // Empty `outputs`, deliberately and explicitly: this aggregate runs no
+  // command, so every file under dist belongs to the concrete target that
+  // emitted it. Claiming `{projectRoot}/dist` here would cache the children's
+  // bytes a second time under the aggregate's hash, and would make `smoo
+  // github-ci nx-run-many --collect-outputs` attribute to `build` whatever sits
+  // under dist — including platform-target artifacts the collect excludes on
+  // purpose and stale artifacts of targets that never ran. Two collected trees
+  // then claim one binary and `apply-outputs` rejects the overlap. Omitting the
+  // key is not the same thing: Nx gives a `build` or `prepare` target without
+  // `outputs` its legacy defaults (`{projectRoot}/dist`, `/build`, `/public`,
+  // `dist/{projectRoot}`), so a cache hit on the aggregate — whose key does
+  // not move when only a child's own inputs do — restored the children's
+  // previous dist over what they had just emitted. `lint` and `test` are
   // aggregates on the same terms. Same reason nx.json must not put `outputs` in
   // targetDefaults.build (see validateBuildTargetDefault).
   if (hasOrdinaryBuildOutputTarget) {
     targets.build = {
       executor: 'nx:noop',
       cache: true,
+      outputs: [],
       // `cargo-napi` is both an output family and a serialized cargo writer, so
       // the two sources overlap; the Set keeps one edge per target while holding
       // the order the families are listed in.

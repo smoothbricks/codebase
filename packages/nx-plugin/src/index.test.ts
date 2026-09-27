@@ -93,6 +93,90 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
     }
   }, 120_000);
 
+  it('never restores a stale child artifact from the cached build aggregate', async () => {
+    const workspace = await createWorkspace();
+    const root = workspace.context.workspaceRoot;
+    const repositoryRoot = fileURLToPath(new URL('../../../', import.meta.url));
+    try {
+      await symlink(join(repositoryRoot, 'node_modules'), join(root, 'node_modules'), 'dir');
+      await workspace.write(
+        'package.json',
+        '{"name":"aggregate-workspace","private":true,"workspaces":["packages/*"]}\n',
+      );
+      await workspace.write(
+        'nx.json',
+        JSON.stringify({
+          plugins: [fileURLToPath(new URL('../dist/index.js', import.meta.url))],
+          namedInputs: { default: ['{projectRoot}/**/*'] },
+        }),
+      );
+      // Emitted artifacts are not sources, so the aggregate's own inputs never see them.
+      await workspace.write('.gitignore', 'dist\n.nx\nnode_modules\n');
+      await workspace.write('toolchain.txt', 'toolchain-1\n');
+      await workspace.write('packages/app/source.txt', 'source\n');
+      // The emitter keys on one input outside its project, as a transform or
+      // toolchain does. The inferred `build` aggregate hashes only the project,
+      // so a toolchain change moves the emitter's key and not the aggregate's.
+      await workspace.write(
+        'packages/app/package.json',
+        JSON.stringify({
+          name: 'app',
+          private: true,
+          nx: {
+            targets: {
+              'emit-js': {
+                executor: 'nx:run-commands',
+                cache: true,
+                inputs: ['{projectRoot}/source.txt', '{workspaceRoot}/toolchain.txt'],
+                outputs: ['{projectRoot}/dist'],
+                options: {
+                  command: 'mkdir -p dist && cat source.txt ../../toolchain.txt > dist/app.js',
+                  cwd: '{projectRoot}',
+                },
+              },
+            },
+          },
+        }),
+      );
+      const build = async () => {
+        const child = Bun.spawn(['bun', join(repositoryRoot, 'node_modules/.bin/nx'), 'run', 'app:build'], {
+          cwd: root,
+          env: {
+            ...process.env,
+            PATH: `${join(repositoryRoot, 'node_modules/.bin')}:${process.env.PATH ?? ''}`,
+            NX_DAEMON: 'false',
+            NX_ISOLATE_PLUGINS: 'false',
+            NX_WORKSPACE_DATA_DIRECTORY: join(root, '.nx/workspace-data'),
+            NX_CACHE_DIRECTORY: join(root, '.nx/cache'),
+          },
+          stdout: 'pipe',
+          stderr: 'pipe',
+        });
+        const [exitCode, stdout, stderr] = await Promise.all([
+          child.exited,
+          new Response(child.stdout).text(),
+          new Response(child.stderr).text(),
+        ]);
+        return { exitCode, output: stdout + stderr };
+      };
+      const artifact = () => readFile(join(root, 'packages/app/dist/app.js'), 'utf8');
+
+      const first = await build();
+      expect(first.exitCode, first.output).toBe(0);
+      expect(await artifact()).toBe('source\ntoolchain-1\n');
+
+      await workspace.write('toolchain.txt', 'toolchain-2\n');
+      const second = await build();
+      expect(second.exitCode, second.output).toBe(0);
+      // The emitter reran on its new key. The aggregate's key did not move, so
+      // it replays from cache — and a replay must not put back the dist it
+      // would have claimed on the first run.
+      expect(await artifact(), second.output).toBe('source\ntoolchain-2\n');
+    } finally {
+      await workspace.cleanup();
+    }
+  }, 120_000);
+
   it('names standalone package projects from package metadata', async () => {
     const workspace = await createWorkspace();
     try {
@@ -220,12 +304,6 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       expect(targets.build?.executor).toBe('nx:noop');
       expect(targets.build?.cache).toBe(true);
       expect(targets.build?.dependsOn).toEqual(['^build', 'tsc-js']);
-      // An `nx:noop` aggregate writes no file, so it must claim none: a
-      // `{projectRoot}/dist` claim here would double-cache its children's bytes
-      // and make `github-ci nx-run-many --collect-outputs` attribute every file
-      // under dist to `build`, including the platform artifacts that collect
-      // deliberately leaves to the platform step.
-      expect(targets.build?.outputs).toBeUndefined();
       expect(targets.clean?.executor).toBe('@smoothbricks/nx-plugin:clean-outputs');
       expect(targets.clean?.cache).toBe(false);
 
