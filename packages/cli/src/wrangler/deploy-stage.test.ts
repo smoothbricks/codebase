@@ -1239,7 +1239,7 @@ describe('describeCleanup', () => {
     );
   });
 
-  it('says why a stage without records deleted nothing', () => {
+  it('says a stage without records deleted nothing, and that an older stage is still live', () => {
     expect(
       describeCleanup({
         stage: 'pr7',
@@ -1250,7 +1250,7 @@ describe('describeCleanup', () => {
         leftInPlace: [],
       }),
     ).toBe(
-      'Nothing is recorded for pr7 of github.com/acme/app, so nothing was deleted (a pull request that deployed nothing, or a stage deployed before smoo recorded stages).',
+      'Nothing is recorded for pr7 of github.com/acme/app, so nothing was deleted. That finishes only a pull request that deployed nothing: whatever a stage deployed before smoo recorded stages is still live, and has to be deleted by hand.',
     );
   });
 });

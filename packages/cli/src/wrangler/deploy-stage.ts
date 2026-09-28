@@ -618,7 +618,8 @@ export async function cleanupPullRequest(
 export function describeCleanup(result: CleanupResult): string {
   const stage = `${result.stage} of ${result.scope}`;
   if (result.recorded === 0) {
-    return `Nothing is recorded for ${stage}, so nothing was deleted (a pull request that deployed nothing, or a stage deployed before smoo recorded stages).`;
+    // Exit 0 either way: cleanup cannot tell the two apart, so the line must not read as "done".
+    return `Nothing is recorded for ${stage}, so nothing was deleted. That finishes only a pull request that deployed nothing: whatever a stage deployed before smoo recorded stages is still live, and has to be deleted by hand.`;
   }
   const { deleted } = result;
   const counts = [
