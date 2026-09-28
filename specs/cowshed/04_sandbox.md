@@ -372,7 +372,9 @@ These anchors are trust configuration, not secrets, so they are exported/written
    requested cwd and literal argv. The supervisor neither evaluates repository shell code nor parses and reconstructs
    its exported environment. Failed activation prevents command execution. The child profile's final rule denies every
    mutation beneath `.cowshed/job/**`; no startup hook, named session, one-shot, or descendant receives supervisor
-   artifact-write authority. Request-specific `--ro` may narrow further but never add authority.
+   artifact-write authority. Request-specific `--ro` narrows only that job's child profile, never the supervisor's
+   artifact-write authority or later jobs. The effective mode is read-only whenever either the request or the configured
+   workspace ceiling is read-only; a read-write request cannot widen a read-only ceiling.
 5. Read stdout and stderr as separate opaque byte streams, incrementally hash and quota-account them, and begin in
    bounded memory. Terminal streams at or below the inline limit are stored as Arrow Binary in a complete protected
    batch. A stream creates `.cowshed/job/<numeric-id>/out` or `err` only when it crosses that limit or a checkpoint/live

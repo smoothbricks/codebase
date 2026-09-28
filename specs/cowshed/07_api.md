@@ -902,7 +902,10 @@ One boundary answer, no ambiguity:
   `OutputPublication {path,policy}`. They clone/reflink/copy the sealed protected artifact after terminal state, never
   hardlink, never change `StreamInfo.storage`, and report publication failure separately from process state.
 - **Cancellation** is an `AbortSignal` on `ExecOptions`, attachments, and `JobHandle.logs`/`wait`; aborting stops the
-  client operation, not the durable job. Callers invoke `JobHandle.kill()` explicitly.
+  client operation, not the durable job. Callers invoke `JobHandle.kill()` explicitly. A completed explicit kill or
+  workspace retirement records `JobState::Killed` while retaining the operating system's actual `ExitStatus`. A child
+  that handles SIGTERM may report `Exited`, including code zero; a child terminated by the signal reports `Signaled`.
+  Both are valid in `JobInfo` and `ExecRecord`; neither may omit the observed exit status.
 - **Binary stdin** is supported without shell interpolation: `ExecOptions.stdin` accepts inline `Uint8Array`,
   backpressured `AsyncIterable<Uint8Array>`, or a workspace-relative file object with the canonical no-follow open.
 - **Stdin lifecycle is observable.** Open occurs after `JobId` allocation; EOF closes child stdin once, cancellation
