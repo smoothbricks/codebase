@@ -558,6 +558,25 @@ zone_name = "example.test"
       'create-route:zone:*.pr123.example.test:fixture-worker-pr123',
     ]);
   });
+
+  it('refuses a staging wildcard route no listed zone binds, naming its Worker, before it creates anything', async () => {
+    const root = await fixtureRoot(`${FIXTURE}
+[[env.staging.routes]]
+pattern = "*.staging.example.test/*"
+zone_name = "exmaple.test"
+`);
+    const runner = new FakeRunner([], {});
+    const cloudflare = new FakeCloudflare();
+    cloudflare.zones = [{ id: 'zone', name: 'example.test' }];
+
+    await expect(
+      deployStage(root, { stage: 'staging', repositoryRoot: root }, dependencies(runner, cloudflare)),
+    ).rejects.toThrow(
+      'Route *.staging.example.test/* of fixture-worker-staging binds to no zone the token lists in the CLOUDFLARE_ACCOUNT_ID account: none is its zone_name exmaple.test or a parent of it.',
+    );
+    expect(cloudflare.mutations).toEqual([]);
+    expect(runner.calls).toEqual([]);
+  });
 });
 
 /**
@@ -1904,7 +1923,32 @@ id = "kv-staging"
     }
   });
 
-  it('does not name R2 write when the zone listing behind a record is what was refused', async () => {
+  it('reads a refused R2 bucket listing as an R2 failure that names R2 write, once the records are planned', async () => {
+    const root = await fixtureRoot(ROUTED_FIXTURE);
+    const runner = new FakeRunner([], {});
+    const cloudflare = new FakeCloudflare();
+    cloudflare.zones = [{ id: 'zone', name: 'example.test' }];
+    const refusal = new CloudflareApiError('Cloudflare API /r2/buckets failed: refused', 403, [10000]);
+    cloudflare.listR2Buckets = async () => {
+      throw refusal;
+    };
+
+    const error = await deployStage(
+      root,
+      { stage: 'pr123', repositoryRoot: root },
+      dependencies(runner, cloudflare),
+    ).catch((thrown: unknown) => thrown);
+
+    expect(error).toMatchObject({
+      message:
+        'Recording pr123 in R2 bucket smoo-stage-records failed, so nothing was created: Cloudflare API /r2/buckets failed: refused. The deploy token needs R2 write (Workers R2 Storage: Edit).',
+      cause: refusal,
+    });
+    expect(cloudflare.mutations).toEqual([]);
+    expect(runner.calls).toEqual([]);
+  });
+
+  it('reads a refused zone listing as a failure to plan the records, not an R2 one', async () => {
     const root = await fixtureRoot(`${FIXTURE}
 [[env.staging.routes]]
 pattern = "site.staging.example.test/*"
@@ -1921,12 +1965,12 @@ pattern = "site.staging.example.test/*"
     ).catch((thrown: unknown) => thrown);
 
     expect(error instanceof Error ? error.message : '').toBe(
-      'Recording pr123 in R2 bucket smoo-stage-records failed, so nothing was created: Cloudflare API /zones failed: refused',
+      'Planning the records of pr123 failed, so nothing was created: Cloudflare API /zones failed: refused',
     );
     expect(cloudflare.mutations).toEqual([]);
   });
 
-  it('refuses a route whose zone_name the account does not list, before it records or creates anything', async () => {
+  it('refuses a route whose zone_name the account does not list, naming its Worker, before it records or creates anything', async () => {
     // Recorded verbatim, the zone would stop every cleanup of the stage: records are only ever added.
     const root = await fixtureRoot(`${FIXTURE}
 [[env.staging.routes]]
@@ -1943,10 +1987,12 @@ zone_name = "exmaple.test"
       dependencies(runner, cloudflare),
     ).catch((thrown: unknown) => thrown);
 
+    // Nothing about R2 failed: the refusal comes while the records are planned, before any is written.
     expect(error instanceof Error ? error.message : '').toBe(
-      'Recording pr123 in R2 bucket smoo-stage-records failed, so nothing was created: Route *.pr123.example.test/* binds to no zone the token lists in the CLOUDFLARE_ACCOUNT_ID account: none is its zone_name exmaple.test or a parent of it.',
+      'Planning the records of pr123 failed, so nothing was created: Route *.pr123.example.test/* of fixture-worker-pr123 binds to no zone the token lists in the CLOUDFLARE_ACCOUNT_ID account: none is its zone_name exmaple.test or a parent of it.',
     );
     expect(cloudflare.mutations).toEqual([]);
+    expect(cloudflare.reads).not.toContain('r2');
     expect(runner.calls).toEqual([]);
   });
 

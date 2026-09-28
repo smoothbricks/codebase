@@ -177,7 +177,7 @@ export async function plannedStageRecords(
   /** The real name of the account zone `route` is bound in, as a record carries it. */
   const boundZone = async (route: PlannedRoute) => {
     listed ??= zones();
-    return routeBindingZone(route, await listed).name.toLowerCase();
+    return routeBindingZone(route, worker, await listed).name.toLowerCase();
   };
   for (const route of plan.routes) {
     if (route.customDomain) {
@@ -207,11 +207,12 @@ export function zoneContaining(zones: CloudflareZone[], hostname: string): Cloud
  * The account zone a route is bound in, found the way `wrangler deploy` finds it: the zone its
  * `zone_id` names, or the most specific one that is its `zone_name` or a parent of it, whatever the
  * case, or, when it declares neither, the most specific one containing its host. A `*.` route's
- * wildcard DNS record is created and recorded in it too. Refuses a route none of those finds, since
- * a recorded zone the account does not list stops every cleanup of the stage.
+ * wildcard DNS record is created and recorded in it too. Refuses a route none of those finds, naming
+ * it and its Worker, since a recorded zone the account does not list stops every cleanup of the stage.
  */
 export function routeBindingZone(
   route: Pick<PlannedRoute, 'pattern' | 'zoneName' | 'zoneId'>,
+  worker: string,
   zones: CloudflareZone[],
 ): CloudflareZone {
   const host = routeHostname(route.pattern);
@@ -225,7 +226,7 @@ export function routeBindingZone(
         ? `is its zone_name ${route.zoneName} or a parent of it`
         : `contains its host ${host}`;
     throw new Error(
-      `Route ${route.pattern} binds to no zone the token lists in the CLOUDFLARE_ACCOUNT_ID account: none ${missing}.`,
+      `Route ${route.pattern} of ${worker} binds to no zone the token lists in the CLOUDFLARE_ACCOUNT_ID account: none ${missing}.`,
     );
   }
   return zone;

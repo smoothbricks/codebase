@@ -449,18 +449,24 @@ function stageRecorder(scope: string | undefined, cloudflare: CloudflareClient):
     if (scope === undefined) {
       throw new Error(`${plan.stage} was planned as a pull-request stage without a record scope.`);
     }
-    let writing = false;
+    let keys: string[];
     try {
-      const keys = stageRecordKeys(scope, plan.stage, await plannedStageRecords(plan, () => cloudflare.listZones()));
-      writing = true;
+      keys = stageRecordKeys(scope, plan.stage, await plannedStageRecords(plan, () => cloudflare.listZones()));
+    } catch (error) {
+      // Nothing touched R2 yet: a refused zone listing or a route no zone binds is not an R2 failure.
+      const detail = error instanceof Error ? error.message : String(error);
+      throw new Error(`Planning the records of ${plan.stage} failed, so nothing was created: ${detail}`, {
+        cause: error,
+      });
+    }
+    try {
       await ensureR2Bucket(STAGE_RECORDS_BUCKET, await r2BucketNames(cloudflare), cloudflare);
       // One after another: parallel writes would only trade a clear first failure for several.
       for (const key of keys) await cloudflare.putR2Object(STAGE_RECORDS_BUCKET, key, '');
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
-      // Only a refusal of the R2 calls names the permission: a 429, a 5xx or a network failure is
-      // not one, and neither is a zone listing refused while planning the records.
-      const refused = writing && error instanceof CloudflareApiError && error.status === 403;
+      // Only a refusal names the permission: a 429, a 5xx or a network failure is not one.
+      const refused = error instanceof CloudflareApiError && error.status === 403;
       const reason = refused
         ? `${detail.replace(/\.$/, '')}. The deploy token needs R2 write (Workers R2 Storage: Edit).`
         : detail;
@@ -963,7 +969,7 @@ async function reconcileStageResources(
     const wildcard = wildcardDnsRecord(route);
     if (!wildcard) continue;
     // The zone the route is bound in, which a pull-request stage recorded the record under.
-    const zone = routeBindingZone(route, zones);
+    const zone = routeBindingZone(route, plan.workerName, zones);
     let names = dnsNamesByZone.get(zone.id);
     if (!names) {
       names = new Set((await cloudflare.listDnsRecords(zone.id)).map((record) => record.name));
