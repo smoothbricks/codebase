@@ -917,6 +917,10 @@ workspace; the repository is read from the root `package.json` the same way the 
 
 - Every recorded item is looked up before the first delete. A recorded zone is found by name within the
   `CLOUDFLARE_ACCOUNT_ID` account, and only recorded zones and recorded kinds are listed.
+- A recorded zone the token does not list stops the command before anything is deleted, with every record kept. A token
+  narrowed to fewer zones lists exactly what a deleted zone would, so the absence does not show that the zone's routes
+  and DNS records are gone. Give the token Zone Read on it and run the command again; for a zone that was really
+  deleted, delete the records that name it by hand.
 - A recorded item that no longer exists counts as already gone. A recorded route or custom domain that a Worker outside
   the stage now holds is left in place and named in the output, and so is the wildcard DNS record such a route still
   needs.

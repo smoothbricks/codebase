@@ -768,7 +768,7 @@ async function resolveZoneTargets(
   /** The pattern of each route left in place, by the `zone/name` of the wildcard DNS record it needs. */
   const neededDns = new Map<string, string>();
   for (const record of routes) {
-    const zoneId = zoneIds.get(record.zone);
+    const zoneId = zoneIds(record.zone);
     const route = (await routeTable(zoneId)).find(
       (candidate) => candidate.pattern.toLowerCase() === record.pattern.toLowerCase(),
     );
@@ -778,12 +778,12 @@ async function resolveZoneTargets(
       const wildcard = wildcardDnsRecord({ pattern: record.pattern, zoneName: record.zone });
       if (wildcard) neededDns.set(`${hostName(record.zone)}/${hostName(wildcard.name)}`, record.pattern);
     } else {
-      found(targets.routes, zoneId !== undefined && route ? { zoneId, route } : undefined);
+      found(targets.routes, route ? { zoneId, route } : undefined);
     }
   }
   const dnsTable = perZone((zoneId) => cloudflare.listDnsRecords(zoneId));
   for (const record of dns) {
-    const zoneId = zoneIds.get(record.zone);
+    const zoneId = zoneIds(record.zone);
     // Only the proxied CNAME the deploy creates, `*.<host>` -> `<host>`; anything else under the
     // name is not the one it made.
     const target = record.name.replace(/^\*\./, '');
@@ -795,16 +795,15 @@ async function resolveZoneTargets(
     if (live && servedRoute !== undefined) {
       targets.leftInPlace.push(`DNS record ${record.name} (serves route ${servedRoute})`);
     } else {
-      found(targets.dnsRecords, zoneId !== undefined && live ? { zoneId, record: live } : undefined);
+      found(targets.dnsRecords, live ? { zoneId, record: live } : undefined);
     }
   }
 }
 
-/** Lists a zone's table at most once, however many records name the zone; a zone that is gone has none. */
-function perZone<T>(list: (zoneId: string) => Promise<T[]>): (zoneId: string | undefined) => Promise<T[]> {
+/** Lists a zone's table at most once, however many records name the zone. */
+function perZone<T>(list: (zoneId: string) => Promise<T[]>): (zoneId: string) => Promise<T[]> {
   const tables = new Map<string, Promise<T[]>>();
   return (zoneId) => {
-    if (zoneId === undefined) return Promise.resolve([]);
     let table = tables.get(zoneId);
     if (table === undefined) {
       table = list(zoneId);
@@ -814,17 +813,33 @@ function perZone<T>(list: (zoneId: string) => Promise<T[]>): (zoneId: string | u
   };
 }
 
-/** Each recorded zone's id, looked up by name within the account; a zone that is gone has none. */
+/**
+ * Each recorded zone's id, looked up by name within the account. A zone the token does not list
+ * refuses the cleanup before anything is deleted: a token narrowed to fewer zones lists exactly
+ * what a deleted zone would, so the absence does not show that the zone's routes and DNS records
+ * are gone, and deleting their records would lose the only trace of them.
+ */
 async function recordedZoneIds(
   cloudflare: CloudflareClient,
   records: (RecordOf<'route'> | RecordOf<'dns'>)[],
-): Promise<Map<string, string | undefined>> {
-  const ids = new Map<string, string | undefined>();
-  for (const { zone } of records) {
-    if (ids.has(zone)) continue;
-    ids.set(zone, (await cloudflare.listZones(zone)).find((candidate) => sameName(candidate.name, zone))?.id);
+): Promise<(zone: string) => string> {
+  const ids = new Map<string, string>();
+  const unlisted: string[] = [];
+  for (const zone of new Set(records.map((record) => record.zone))) {
+    const id = (await cloudflare.listZones(zone)).find((candidate) => sameName(candidate.name, zone))?.id;
+    if (id === undefined) unlisted.push(zone);
+    else ids.set(zone, id);
   }
-  return ids;
+  if (unlisted.length > 0) {
+    throw new Error(
+      `The token lists no zone ${unlisted.join(', ')} in the CLOUDFLARE_ACCOUNT_ID account, though the stage's records name ${unlisted.length === 1 ? 'it' : 'them'}. A zone the token cannot see may still hold the stage's routes and DNS records, so nothing was deleted and every record is kept. Give the token Zone Read on ${unlisted.length === 1 ? 'that zone' : 'those zones'} and run cleanup-pr again; for a zone that was deleted, delete the stage's records that name it from the ${STAGE_RECORDS_BUCKET} bucket by hand.`,
+    );
+  }
+  return (zone) => {
+    const id = ids.get(zone);
+    if (id === undefined) throw new Error(`Zone ${zone} is not one the stage's records name.`);
+    return id;
+  };
 }
 
 /**

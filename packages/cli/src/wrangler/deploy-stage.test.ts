@@ -1075,8 +1075,7 @@ describe('cleanup-pr from stage records', () => {
       { kind: 'd1', worker: 'web-pr7', name: 'site-pr7-db' },
       { kind: 'r2', worker: 'web-pr7', bucket: 'media-pr7' },
       { kind: 'domain', worker: 'web-pr7', hostname: 'app.pr7.example.test' },
-      // A zone the account no longer has: its routes and records went with it.
-      { kind: 'route', worker: 'web-pr7', zone: 'gone.test', pattern: '*.pr7.gone.test/*' },
+      { kind: 'route', worker: 'web-pr7', zone: 'example.test', pattern: '*.pr7.example.test/*' },
       { kind: 'dns', worker: 'web-pr7', zone: 'example.test', name: '*.pr7.example.test' },
     ]);
     cloudflare.scripts = [];
@@ -1087,6 +1086,29 @@ describe('cleanup-pr from stage records', () => {
     expect(result.alreadyGone).toBe(7);
     expect(Object.values(result.deleted).every((count) => count === 0)).toBe(true);
     expect(cloudflare.mutations).toEqual(keys.map((key) => `delete-object:${STAGE_RECORDS_BUCKET}:${key}`));
+  });
+
+  it('deletes nothing and keeps every record when the token lists no zone a record names', async () => {
+    // A token narrowed to fewer zones lists exactly what a deleted zone would: nothing. That
+    // absence does not show the zone's routes and DNS records are gone, and deleting their
+    // records would lose the only trace of them.
+    const cloudflare = new FakeCloudflare();
+    const keys = recordStage(cloudflare, [
+      { kind: 'worker', worker: 'web-pr7' },
+      { kind: 'route', worker: 'web-pr7', zone: 'example.test', pattern: '*.pr7.example.test/*' },
+      { kind: 'route', worker: 'web-pr7', zone: 'hidden.test', pattern: '*.pr7.hidden.test/*' },
+      { kind: 'dns', worker: 'web-pr7', zone: 'hidden.test', name: '*.pr7.hidden.test' },
+      { kind: 'dns', worker: 'web-pr7', zone: 'other-hidden.test', name: '*.pr7.other-hidden.test' },
+    ]);
+    cloudflare.scripts = [{ id: 'web-pr7' }];
+    cloudflare.zones = [{ id: 'zone-example', name: 'example.test' }];
+    cloudflare.routes['zone-example'] = [{ id: 'route-web', pattern: '*.pr7.example.test/*', script: 'web-pr7' }];
+
+    await expect(cleanup(await cleanupRoot(), 7, cloudflare)).rejects.toThrow(
+      /hidden\.test, other-hidden\.test.*nothing was deleted and every record is kept/s,
+    );
+    expect(cloudflare.mutations).toEqual([]);
+    expect(cloudflare.objects[STAGE_RECORDS_BUCKET]).toEqual(keys);
   });
 
   it('keeps every record when a delete fails, and a re-run finishes what is left', async () => {
