@@ -552,12 +552,10 @@ carries the base branch's ref, not the pull request's. Closing a pull request ca
 run, so the cleanup starts only after its stage deploy has stopped, and a reopened pull request's CI run cancels a
 running cleanup, whose kept records let the next close finish the stage.
 
-Upgrading from a smoo that named a pull request's group after its ref: a run started from the old workflow is in the old
-group, which the new cleanup neither waits for nor cancels, so a deploy still running there can recreate an item after
-the cleanup deleted it and its record. Before merging the upgrade, let every running pull-request CI run finish, or
-cancel it and see it stopped. An open pull request's runs join the new group from its next push; re-running an old run
-keeps the old workflow. For a pull request closed while an old run was still deploying, check its `*-prN` items by hand:
-its records cannot show what such a run created after the cleanup.
+Upgrading from a smoo that named a pull request's group after its ref: follow
+[Upgrading to a smoo that records stages](#upgrading-to-a-smoo-that-records-stages), which covers the group change. A
+run keeps the workflow of the commit it runs, so an old run stays in the old group, which the new cleanup neither waits
+for nor cancels.
 
 ### Private dependency configuration (`package.json` → `smoo.github.cargoCredentials`)
 
@@ -868,7 +866,7 @@ deletes what those deploys recorded.
 Before a `prN` deploy creates anything, it records every item its plan names: the Worker, its KV namespaces, D1
 databases and R2 buckets, custom domains, routes and wildcard DNS records. Each is one empty object in the R2 bucket
 `smoo-stage-records`, keyed by repository, stage and Worker, so a deploy that fails halfway leaves nothing unrecorded.
-Items the stage finds already there are recorded too. There is one such bucket per Cloudflare account, shared by every
+Planned items already there are recorded too. There is one such bucket per Cloudflare account, shared by every
 repository that deploys there; never delete it. A route is recorded under the zone `wrangler deploy` binds it in: the
 one its `zone_id` names, else the most specific zone of the account that is its `zone_name` or a parent of it, else the
 most specific one containing its host. A route none of those finds is refused before anything is recorded or created.
@@ -878,14 +876,10 @@ as `host/owner/repo` whatever form it is written in: `https://`, `git+ssh://`, `
 `gitlab:`, `bitbucket:` or bare `owner/repo`. A `prN` deploy without one is refused before any Cloudflare call. In CI,
 where `GITHUB_REPOSITORY` is set, its owner/repo must match, so a fork, a template copy or a copied manifest that keeps
 another repository's URL is refused rather than recorded as that repository. Renaming the repository starts new records;
-the old ones stay behind.
+the old ones stay behind. `staging` and `production` deploys record nothing and read no root manifest.
 
-Upgrading to a smoo that records stages: pull-request deploys now need R2, even without R2 bindings (enabled on the
-account once, in the dashboard, and R2 write on the token), and a root `package.json` with `repository`. An open pull
-request's next push records its stage. Stages deployed by an older smoo carry no record, so cleanup reports "Nothing is
-recorded" for a pull request closed without another push; delete its `*-prN` items by hand once. There is no fallback
-sweep by name, since that would delete other repositories' stages again. `staging` and `production` deploys record
-nothing and read no root manifest.
+Upgrading from a smoo that did not record stages: follow
+[Upgrading to a smoo that records stages](#upgrading-to-a-smoo-that-records-stages).
 
 - `--config` deploys ignore `CLOUDFLARE_ENV`. There is no `--env` flag for a flat config, so wrangler would otherwise
   fall back to that variable and rename the worker after it.
@@ -945,8 +939,53 @@ Known gaps:
   then deletes that item's record, and the item is left without one.
 - Re-running an old failed cleanup job replays the `closed` event. If the pull request was reopened and deployed since,
   the re-run deletes that open pull request's live stage.
+- Re-running a CI or cleanup run started before the upgrade to this smoo runs that run's old workflow: CI in the old
+  concurrency group, which the cleanup neither waits for nor cancels, and the cleanup as the old sweep by name. See
+  [Upgrading to a smoo that records stages](#upgrading-to-a-smoo-that-records-stages).
 - Wrangler's own Workers Sites namespace (`__<worker>-workers_sites_assets`) is not in the plan, so it is not recorded
   and not deleted.
+
+### Upgrading to a smoo that records stages
+
+The upgrade changes three things at once. A `prN` deploy records its stage before it creates anything, so it needs R2
+and a root `repository` (see `smoo wrangler deploy-stage` above). A pull request's CI concurrency group was
+`${{ github.workflow }}-${{ github.ref }}` (`CI-refs/pull/N/merge` on GitHub) and is now `CI-N`. The cleanup workflow
+ran in no group, and its `cleanup-pr` deleted every item in the account whose name carries `prN`, whichever repository
+deployed it; it now runs in the pull request's CI group and deletes only what the stage's records name.
+
+Every run uses the workflow file, and with it the group and the smoo, of the commit it runs:
+
+- A pull request's CI run uses its test merge commit: its head merged into its base. A pull request based on the branch
+  the upgrade merges into switches at its next push. A stacked pull request, based on another feature branch, keeps the
+  old workflow, group and smoo until that base contains the upgrade (after a rebase or merge of the base, or a retarget
+  of the pull request), and switches at its first push after that.
+- A close runs the cleanup workflow of the commit it carries. A close whose commit predates the upgrade, such as that of
+  a stacked pull request whose base does not contain it yet, runs the old sweep by name in no concurrency group.
+- A re-run uses the workflow of the run it repeats.
+
+An old CI run is in the old group, which the new cleanup neither waits for nor cancels, so a deploy still running there
+can recreate an item after the cleanup deleted it and its record. The procedure:
+
+1. Before the upgrade's own pull request deploys, enable R2 on the account (once, in the dashboard), give the deploy
+   token R2 write, and give the root `package.json` a `repository`. Pull-request deploys need R2 even without R2
+   bindings.
+2. Just before merging the upgrade, let every pull request's CI and PR Preview Cleanup run that is running, queued or
+   waiting finish, or cancel it and see it stopped. A queued old run can start after the merge, with the old workflow
+   and group.
+3. Merge the upgrade.
+4. Bring a stacked pull request's base up to the upgrade (rebase or merge the base, or retarget the pull request) only
+   while none of the pull requests this moves has a run running, queued or waiting. Before the first push to each of
+   them after that, check again that it has none. Close a stacked pull request only once its base contains the upgrade;
+   closed earlier, it runs the old cleanup.
+5. Never re-run a CI or cleanup run started before the upgrade. Where such a cleanup failed, delete that stage's `*-prN`
+   items by hand instead.
+6. After the cleanup of each pull request that was open across the upgrade, check its `*-prN` items by hand and delete
+   what is left, whatever the cleanup's line says, `Cleaned ...` included. Its first deploy on the new smoo records only
+   what its current configuration deploys: an item an older smoo deployed for the stage that the configuration no longer
+   names stays unrecorded, and so does an item an old run still deploying created after the cleanup. A pull request
+   closed before any deploy on the new smoo has no records, so the new cleanup reports `Nothing is recorded`.
+
+There is no fallback sweep by name, since that would delete other repositories' stages again.
 
 ## Why This Shape
 

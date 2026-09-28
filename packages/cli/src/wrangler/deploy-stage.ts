@@ -437,9 +437,9 @@ async function provisionPullRequestResources(
 
 /**
  * Writes down, in the account's `smoo-stage-records` bucket, every item a pull-request plan will
- * create (`stage-records.ts`). Items the stage finds already there are recorded too: they carry the
- * stage's name, so they are its own, and that is how a stage deployed before records existed gets
- * them on its next push.
+ * create (`stage-records.ts`). Planned items the stage finds already there are recorded too: they
+ * carry the stage's name, so they are its own, and that is how a stage deployed before records
+ * existed gets them on its next push, though only for what its current configuration deploys.
  */
 type StageRecorder = (plan: PullRequestResourcePlan) => Promise<void>;
 
