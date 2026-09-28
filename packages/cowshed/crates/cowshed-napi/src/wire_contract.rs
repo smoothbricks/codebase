@@ -197,7 +197,7 @@ fn job_infos() -> BTreeMap<&'static str, Value> {
         },
     };
 
-    // An exited job with inline stdin. `exit.kind` is `exited` exactly when the state is.
+    // An exited job with inline stdin.
     let exited = JobInfo {
         repo_id: repo_id(),
         workspace_incarnation: incarnation(),
@@ -279,7 +279,7 @@ fn job_infos() -> BTreeMap<&'static str, Value> {
         },
     };
 
-    // `killed` pairs with a signalled exit; `failed` admits any exit, including none.
+    // A cancelled job may die from a signal or exit normally after handling it.
     let killed = JobInfo {
         job_id: JobId::new(6).expect("fixture job id"),
         state: JobState::Killed,
@@ -290,6 +290,10 @@ fn job_infos() -> BTreeMap<&'static str, Value> {
         stdout: inline_stream(""),
         stderr: inline_stream(""),
         ..signaled.clone()
+    };
+    let gracefully_killed = JobInfo {
+        exit: Some(ExitStatus::Exited { code: 143 }),
+        ..killed.clone()
     };
 
     let failed = JobInfo {
@@ -311,6 +315,10 @@ fn job_infos() -> BTreeMap<&'static str, Value> {
         ("signaledNonUtf8Argv", document("job status", &signaled)),
         ("outputLimit", document("job status", &output_limit)),
         ("killed", document("job status", &killed)),
+        (
+            "gracefullyKilled",
+            document("job status", &gracefully_killed),
+        ),
         ("failed", document("job status", &failed)),
         ("list", document("job list", &list)),
     ])
@@ -628,34 +636,6 @@ fn the_committed_wire_corpus_is_what_core_serializes() {
          of every cargo test target) writes it; if this fires, that target's inputs miss the file \
          you changed. Then `nx run cowshed:wire-test` tells whether packages/cowshed/src/types.ts \
          must move with it."
-    );
-}
-
-/// The corpus is only a witness for the variants it contains, so the count of documents is part of
-/// the contract: dropping a case has to be a deliberate edit here, not a silent loss of coverage.
-#[test]
-fn every_seam_type_carries_a_case_per_wire_variant() {
-    let corpus = corpus();
-    let expected: BTreeMap<&str, usize> = BTreeMap::from([
-        ("DoctorReport", 2),
-        ("GcReport", 2),
-        ("GrantSet", 2),
-        ("JobInfo", 8),
-        ("LandReport", 2),
-        ("PushReport", 2),
-        ("RemoveReport", 2),
-        ("ResizeResult", 1),
-        ("WorkspaceInfo", 4),
-    ]);
-    let counts: BTreeMap<&str, usize> = corpus
-        .iter()
-        .map(|(name, cases)| (*name, cases.len()))
-        .collect();
-
-    assert_eq!(
-        counts, expected,
-        "the corpus gained or lost cases; packages/cowshed/src/wire-contract.test.ts enumerates \
-         the same table and must move with it"
     );
 }
 

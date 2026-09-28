@@ -587,6 +587,39 @@ async fn open_named(handle: &WorkspaceSupervisorHandle, name: &str) -> SessionTo
 }
 
 #[tokio::test]
+async fn graceful_requested_cancellation_keeps_its_actual_exit_serializable() {
+    let mut h = harness(1, 1024, false, false);
+    for code in [0, 143] {
+        let job = h
+            .handle
+            .exec(None, request(StdinSource::Empty))
+            .await
+            .unwrap();
+        let spawned = h.spawned.recv().await.unwrap();
+        assert_eq!(
+            h.process.recv().await.unwrap(),
+            ProcessObservation::StdinClosed(job)
+        );
+        let handle = h.handle.clone();
+        let cancelled = tokio::spawn(async move { handle.kill(job).await });
+        assert_eq!(
+            h.process.recv().await.unwrap(),
+            ProcessObservation::Signal(job, ProcessSignal::Term)
+        );
+        complete(&spawned, b"", b"", ExitStatus::Exited { code }).await;
+        cancelled.await.unwrap().unwrap();
+        let info = h.handle.info(job).await.unwrap();
+        assert_eq!(info.state, JobState::Killed);
+        assert_eq!(info.exit, Some(ExitStatus::Exited { code }));
+        let encoded = serde_json::to_value(&info)
+            .expect("a cancelled child may catch SIGTERM and exit normally");
+        let decoded: cowshed_core::api::JobInfo = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded.state, JobState::Killed);
+        assert_eq!(decoded.exit, Some(ExitStatus::Exited { code }));
+    }
+}
+
+#[tokio::test]
 async fn non_utf8_argv_reaches_spawn_and_job_info_without_loss() {
     let mut h = harness(1, 1024, false, false);
     let raw = vec![0xff, b'x', 0x80];

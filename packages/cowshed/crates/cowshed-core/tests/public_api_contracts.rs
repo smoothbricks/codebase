@@ -535,6 +535,23 @@ fn exec_record_enforces_terminal_invariants_both_directions() {
     assert_eq!(record.argv[0].as_os_str().as_bytes(), &[0xff]);
     assert_eq!(serde_json::to_value(&record).unwrap(), value);
 
+    for exit in [
+        json!({"kind":"exited","code":0}),
+        json!({"kind":"exited","code":143}),
+        json!({"kind":"signaled","signal":15,"coreDumped":false}),
+    ] {
+        let mut cancelled = value.clone();
+        cancelled["state"] = json!("killed");
+        cancelled["exit"] = exit;
+        let record: ExecRecord = serde_json::from_value(cancelled.clone())
+            .expect("requested cancellation preserves the actual process exit");
+        assert_eq!(serde_json::to_value(record).unwrap(), cancelled);
+    }
+    let mut missing_exit = value.clone();
+    missing_exit["state"] = json!("killed");
+    missing_exit.as_object_mut().unwrap().remove("exit");
+    assert!(serde_json::from_value::<ExecRecord>(missing_exit).is_err());
+
     let mut invalid_record = record;
     invalid_record.state = JobState::Running;
     assert!(serde_json::to_value(invalid_record).is_err());

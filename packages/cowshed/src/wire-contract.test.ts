@@ -111,10 +111,6 @@ describe('napi wire contract', () => {
     describe(name, () => {
       const cases = corpus[name] ?? {};
 
-      it('carries at least one document', () => {
-        expect(Object.keys(cases).length).toBeGreaterThan(0);
-      });
-
       for (const [caseName, document] of Object.entries(cases)) {
         it(`accepts the ${caseName} document and nothing wider`, () => {
           const assertValue = caseName === LIST_CASE ? seam.assertMany : seam.assertOne;

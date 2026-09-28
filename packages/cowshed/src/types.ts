@@ -282,7 +282,7 @@ export type CommandArg = TaggedBytes;
 /** Stream bytes small enough to live in the job DTO instead of a protected file. */
 export type BinaryPayload = TaggedBytes;
 
-/** How a process ended. Both the `signaled` and `killed` job states carry `signaled`. */
+/** Actual process exit. A `killed` job may exit normally after handling its cancellation signal. */
 export type ExitStatus =
   | { readonly kind: 'exited'; readonly code: number }
   | { readonly kind: 'signaled'; readonly signal: number; readonly coreDumped: boolean };

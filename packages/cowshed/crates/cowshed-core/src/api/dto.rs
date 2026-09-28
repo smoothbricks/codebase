@@ -1585,7 +1585,10 @@ impl JobInfo {
         }
         match (&self.state, &self.exit) {
             (JobState::Exited, Some(ExitStatus::Exited { .. }))
-            | (JobState::Signaled | JobState::Killed, Some(ExitStatus::Signaled { .. }))
+            | (JobState::Signaled, Some(ExitStatus::Signaled { .. }))
+            // Cancellation is the supervisor's decision; the child may handle
+            // SIGTERM and exit normally. Preserve the actual wait status.
+            | (JobState::Killed, Some(_))
             | (JobState::OutputLimit | JobState::Failed, _)
             | (JobState::Queued | JobState::Running, None) => {}
             _ => {
@@ -1747,7 +1750,8 @@ impl ExecRecord {
         }
         match (&self.state, &self.exit) {
             (JobState::Exited, Some(ExitStatus::Exited { .. }))
-            | (JobState::Signaled | JobState::Killed, Some(ExitStatus::Signaled { .. }))
+            | (JobState::Signaled, Some(ExitStatus::Signaled { .. }))
+            | (JobState::Killed, Some(_))
             | (JobState::OutputLimit | JobState::Failed, _) => {}
             _ => {
                 return Err(DtoError::InvalidJobProjection(
