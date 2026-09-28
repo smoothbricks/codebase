@@ -278,17 +278,26 @@ bucket_name = "web-media-staging"
       return recorded?.kind === 'route' ? recorded.zone : undefined;
     }
 
-    // wrangler deploy binds a route in the zone its zone_id names, else in the most specific account
-    // zone that is its zone_name or a parent of it, else in the one containing its host.
-    it('is the zone zone_id names, even when zone_name names another zone', async () => {
-      expect(
-        await routeZone({
-          pattern: 'api.pr7.example.com/*',
-          zoneName: 'pr7.example.com',
-          zoneId: 'zone-apex',
-          customDomain: false,
-        }),
-      ).toBe('example.com');
+    // wrangler deploy binds a route in the zone its zone_id names, or in the most specific account
+    // zone that is its zone_name or a parent of it, or, when it declares neither, in the one
+    // containing its host.
+    it('is never chosen between zone_id and zone_name: the plan refuses a route declaring both, as wrangler does', () => {
+      const config = parseWranglerConfig(
+        'wrangler.toml',
+        `[env.staging]
+name = "web-staging"
+
+[[env.staging.routes]]
+pattern = "api.staging.example.com/*"
+zone_name = "staging.example.com"
+zone_id = "zone-apex"
+`,
+        'toml',
+      );
+
+      expect(() => planPullRequestResources(config, 'pr7', [])).toThrow(
+        'Route api.staging.example.com/* of web-staging declares both zone_id and zone_name, which wrangler refuses; declare only one of the two.',
+      );
     });
 
     it('is the zone zone_id names, even when a more specific zone contains the host', async () => {
@@ -319,12 +328,7 @@ bucket_name = "web-media-staging"
         `Route api.pr7.example.org/* ${refusal}: none contains its host api.pr7.example.org.`,
       );
       await expect(
-        routeZone({
-          pattern: 'api.pr7.example.com/*',
-          zoneName: 'example.com',
-          zoneId: 'zone-gone',
-          customDomain: false,
-        }),
+        routeZone({ pattern: 'api.pr7.example.com/*', zoneId: 'zone-gone', customDomain: false }),
       ).rejects.toThrow(`Route api.pr7.example.com/* ${refusal}: none has its zone_id zone-gone.`);
       await expect(
         routeZone({ pattern: 'api.pr7.example.com/*', zoneName: 'exmaple.com', customDomain: false }),

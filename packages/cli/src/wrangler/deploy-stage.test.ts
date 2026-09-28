@@ -1950,6 +1950,35 @@ zone_name = "exmaple.test"
     expect(runner.calls).toEqual([]);
   });
 
+  it('refuses a route that declares both zone_id and zone_name, as wrangler does, before it records or creates anything', async () => {
+    // Reconcile would create the route in the zone_name's zone, a record could name the zone_id's,
+    // and wrangler deploy would then refuse the config and bind the route nowhere.
+    const root = await fixtureRoot(`${FIXTURE}
+[[env.staging.routes]]
+pattern = "*.staging.example.test/*"
+zone_name = "example.test"
+zone_id = "zone-other"
+`);
+    const runner = new FakeRunner([], {});
+    const cloudflare = new FakeCloudflare();
+    cloudflare.zones = [
+      { id: 'zone', name: 'example.test' },
+      { id: 'zone-other', name: 'other.test' },
+    ];
+
+    const error = await deployStage(
+      root,
+      { stage: 'pr123', repositoryRoot: root },
+      dependencies(runner, cloudflare),
+    ).catch((thrown: unknown) => thrown);
+
+    expect(error instanceof Error ? error.message : '').toBe(
+      'Route *.staging.example.test/* of fixture-worker-staging declares both zone_id and zone_name, which wrangler refuses; declare only one of the two.',
+    );
+    expect(cloudflare.mutations).toEqual([]);
+    expect(runner.calls).toEqual([]);
+  });
+
   it('refuses a pull-request stage whose root manifest names no repository, before any Cloudflare call', async () => {
     const root = await fixtureRoot();
     await writeFile(join(root, 'package.json'), '{ "name": "@acme/app" }\n');

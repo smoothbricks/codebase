@@ -168,7 +168,7 @@ export interface PullRequestResourcePlan {
   kvNamespaces: PullRequestKvResource[];
   d1Databases: PullRequestD1Resource[];
   r2Buckets: R2Binding[];
-  /** `zoneId` is the route's `zone_id`, which names its zone when `zone_name` does not. */
+  /** `zoneId` is the route's `zone_id`; a route has it or `zoneName`, never both. */
   routes: Array<{ pattern: string; zoneName?: string; zoneId?: string; customDomain: boolean }>;
 }
 export interface ConfiguredStageResourcePlan {
@@ -289,12 +289,20 @@ export function planPullRequestBindings(
   }));
   const routes = (config.routes ?? [])
     .filter((route) => hasStageLabel(route.pattern))
-    .map((route) => ({
-      pattern: replaceHostnameLabel(route.pattern, stage),
-      ...(typeof route.zone_name === 'string' ? { zoneName: route.zone_name } : {}),
-      ...(typeof route.zone_id === 'string' ? { zoneId: route.zone_id } : {}),
-      customDomain: route.custom_domain === true,
-    }));
+    .map((route) => {
+      // wrangler refuses such a config, and nothing here could say which zone the route belongs to.
+      if (typeof route.zone_name === 'string' && typeof route.zone_id === 'string') {
+        throw new Error(
+          `Route ${route.pattern} of ${config.name} declares both zone_id and zone_name, which wrangler refuses; declare only one of the two.`,
+        );
+      }
+      return {
+        pattern: replaceHostnameLabel(route.pattern, stage),
+        ...(typeof route.zone_name === 'string' ? { zoneName: route.zone_name } : {}),
+        ...(typeof route.zone_id === 'string' ? { zoneId: route.zone_id } : {}),
+        customDomain: route.custom_domain === true,
+      };
+    });
   return {
     stage,
     workerName: stageResourceName(workerBaseName, stage),

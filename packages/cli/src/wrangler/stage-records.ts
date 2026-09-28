@@ -204,9 +204,9 @@ export function zoneContaining(zones: CloudflareZone[], hostname: string): Cloud
 
 /**
  * The name of the account zone a route is bound in, found the way `wrangler deploy` finds it: the
- * zone its `zone_id` names, else the most specific one that is its `zone_name` or a parent of it,
- * else the most specific one containing its host. Refuses a route none of those finds, since a
- * recorded zone the account does not list stops every cleanup of the stage.
+ * zone its `zone_id` names, or the most specific one that is its `zone_name` or a parent of it, or,
+ * when it declares neither, the most specific one containing its host. Refuses a route none of
+ * those finds, since a recorded zone the account does not list stops every cleanup of the stage.
  */
 async function routeZone(route: PlannedRoute, zones: () => Promise<CloudflareZone[]>): Promise<string> {
   const listed = await zones();
