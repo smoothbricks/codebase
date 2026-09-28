@@ -160,7 +160,10 @@ export function parseStageRecordKey(scope: string, stage: `pr${number}`, key: st
   return record;
 }
 
-/** The records one pull-request plan implies; `zones` is read once, and only for a route without `zone_name`. */
+/**
+ * The records one pull-request plan implies. `zones` is read once, and only when the plan has a
+ * route that is not a custom domain.
+ */
 export async function plannedStageRecords(
   plan: PullRequestResourcePlan,
   zones: () => Promise<CloudflareZone[]>,
@@ -200,18 +203,26 @@ export function zoneContaining(zones: CloudflareZone[], hostname: string): Cloud
 }
 
 /**
- * The name of the zone a route binds: declared, else the one its `zone_id` names (even when a more
- * specific zone contains the host), else the most specific one containing its host.
+ * The name of the account zone a route is bound in, found the way `wrangler deploy` finds it: the
+ * zone its `zone_id` names, else the most specific one that is its `zone_name` or a parent of it,
+ * else the most specific one containing its host. Refuses a route none of those finds, since a
+ * recorded zone the account does not list stops every cleanup of the stage.
  */
 async function routeZone(route: PlannedRoute, zones: () => Promise<CloudflareZone[]>): Promise<string> {
-  if (route.zoneName) return route.zoneName.toLowerCase();
   const listed = await zones();
+  const host = routeHostname(route.pattern);
   const zone = route.zoneId
     ? listed.find((candidate) => candidate.id === route.zoneId)
-    : zoneContaining(listed, routeHostname(route.pattern));
+    : zoneContaining(listed, route.zoneName ?? host);
   if (!zone) {
-    const missing = route.zoneId ? `has the zone_id ${route.zoneId}` : 'contains its host';
-    throw new Error(`No Cloudflare zone of the account ${missing} for route ${route.pattern}; declare its zone_name.`);
+    const missing = route.zoneId
+      ? `has its zone_id ${route.zoneId}`
+      : route.zoneName !== undefined
+        ? `is its zone_name ${route.zoneName} or a parent of it`
+        : `contains its host ${host}`;
+    throw new Error(
+      `Route ${route.pattern} binds to no zone the token lists in the CLOUDFLARE_ACCOUNT_ID account: none ${missing}.`,
+    );
   }
   return zone.name.toLowerCase();
 }

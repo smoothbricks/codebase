@@ -258,7 +258,7 @@ bucket_name = "web-media-staging"
         { pattern: '*.pr7.example.com/*', zoneName: 'example.com', customDomain: false },
         { pattern: '*.pr7.example.com/api/*', zoneName: 'example.com', customDomain: false },
       ]),
-      zoneListing([]).list,
+      zoneListing([{ id: 'zone-apex', name: 'example.com' }]).list,
     );
 
     expect(stageRecordKeys(SCOPE, 'pr7', records).filter((key) => key.includes('/dns/'))).toEqual([
@@ -278,19 +278,17 @@ bucket_name = "web-media-staging"
       return recorded?.kind === 'route' ? recorded.zone : undefined;
     }
 
-    it('is the declared zone_name, lowercased, without listing zones', async () => {
-      const listing = zoneListing(zones);
-      const records = await plannedStageRecords(
-        plan([{ pattern: 'api.pr7.example.com/*', zoneName: 'Example.com', zoneId: 'zone-sub', customDomain: false }]),
-        listing.list,
-      );
-      expect(records[1]).toEqual({
-        kind: 'route',
-        worker: 'web-pr7',
-        zone: 'example.com',
-        pattern: 'api.pr7.example.com/*',
-      });
-      expect(listing.calls()).toBe(0);
+    // wrangler deploy binds a route in the zone its zone_id names, else in the most specific account
+    // zone that is its zone_name or a parent of it, else in the one containing its host.
+    it('is the zone zone_id names, even when zone_name names another zone', async () => {
+      expect(
+        await routeZone({
+          pattern: 'api.pr7.example.com/*',
+          zoneName: 'pr7.example.com',
+          zoneId: 'zone-apex',
+          customDomain: false,
+        }),
+      ).toBe('example.com');
     });
 
     it('is the zone zone_id names, even when a more specific zone contains the host', async () => {
@@ -299,27 +297,55 @@ bucket_name = "web-media-staging"
       );
     });
 
+    it('is the most specific account zone that is zone_name or a parent of it, whatever the host', async () => {
+      expect(await routeZone({ pattern: 'api.pr7.example.com/*', zoneName: 'Example.com', customDomain: false })).toBe(
+        'example.com',
+      );
+      expect(
+        await routeZone({ pattern: 'api.pr7.example.com/*', zoneName: 'Api.Pr7.Example.com', customDomain: false }),
+      ).toBe('pr7.example.com');
+      expect(
+        await routeZone({ pattern: 'api.pr7.example.com/*', zoneName: 'www.example.com', customDomain: false }),
+      ).toBe('example.com');
+    });
+
     it('is otherwise the most specific account zone containing the host', async () => {
       expect(await routeZone({ pattern: 'API.pr7.example.com/*', customDomain: false })).toBe('pr7.example.com');
     });
 
-    it('refuses a route no account zone contains, asking for zone_name', async () => {
-      await expect(routeZone({ pattern: 'api.pr7.example.org/*', customDomain: false })).rejects.toThrow(/zone_name/);
+    it('refuses a route no account zone binds, naming the route and what was looked for', async () => {
+      const refusal = 'binds to no zone the token lists in the CLOUDFLARE_ACCOUNT_ID account';
+      await expect(routeZone({ pattern: 'api.pr7.example.org/*', customDomain: false })).rejects.toThrow(
+        `Route api.pr7.example.org/* ${refusal}: none contains its host api.pr7.example.org.`,
+      );
       await expect(
-        routeZone({ pattern: 'api.pr7.example.com/*', zoneId: 'zone-gone', customDomain: false }),
-      ).rejects.toThrow(/zone_name/);
+        routeZone({
+          pattern: 'api.pr7.example.com/*',
+          zoneName: 'example.com',
+          zoneId: 'zone-gone',
+          customDomain: false,
+        }),
+      ).rejects.toThrow(`Route api.pr7.example.com/* ${refusal}: none has its zone_id zone-gone.`);
+      await expect(
+        routeZone({ pattern: 'api.pr7.example.com/*', zoneName: 'exmaple.com', customDomain: false }),
+      ).rejects.toThrow(`Route api.pr7.example.com/* ${refusal}: none is its zone_name exmaple.com or a parent of it.`);
     });
 
-    it('lists the zones at most once per plan', async () => {
+    it('lists the zones at most once per plan, and only for a plan with a route', async () => {
       const listing = zoneListing(zones);
       await plannedStageRecords(
         plan([
           { pattern: 'api.pr7.example.com/*', customDomain: false },
-          { pattern: 'web.pr7.example.com/*', customDomain: false },
+          { pattern: 'web.pr7.example.com/*', zoneName: 'example.com', customDomain: false },
+          { pattern: 'pr7.example.com', customDomain: true },
         ]),
         listing.list,
       );
       expect(listing.calls()).toBe(1);
+
+      const domainsOnly = zoneListing(zones);
+      await plannedStageRecords(plan([{ pattern: 'pr7.example.com', customDomain: true }]), domainsOnly.list);
+      expect(domainsOnly.calls()).toBe(0);
     });
   });
 });

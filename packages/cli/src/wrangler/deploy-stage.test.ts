@@ -1513,6 +1513,7 @@ describe('deployStage with a flat JSON config', () => {
     const cloudflare = new FakeCloudflare();
     cloudflare.namespaces = [{ id: 'kv-staging', title: 'fixture-SESSION-staging' }];
     cloudflare.d1Databases = [{ uuid: 'd1-staging', name: 'fixture-website-staging-db' }];
+    cloudflare.zones = [{ id: 'zone-1', name: 'example.test' }];
 
     await expect(
       deployStage(root, { stage: 'pr7', repositoryRoot: root, config: configPath }, dependencies(runner, cloudflare)),
@@ -1790,6 +1791,7 @@ id = "kv-staging"
     const cloudflare = new FakeCloudflare();
     cloudflare.namespaces = [{ id: 'kv-staging', title: 'fixture-SESSION-staging' }];
     cloudflare.d1Databases = [{ uuid: 'd1-staging', name: 'fixture-website-staging-db' }];
+    cloudflare.zones = [{ id: 'zone-1', name: 'example.test' }];
     logWranglerInto(runner, cloudflare);
 
     await deployStage(
@@ -1898,6 +1900,30 @@ pattern = "site.staging.example.test/*"
       'Recording pr123 in R2 bucket smoo-stage-records failed, so nothing was created: Cloudflare API /zones failed: refused',
     );
     expect(cloudflare.mutations).toEqual([]);
+  });
+
+  it('refuses a route whose zone_name the account does not list, before it records or creates anything', async () => {
+    // Recorded verbatim, the zone would stop every cleanup of the stage: records are only ever added.
+    const root = await fixtureRoot(`${FIXTURE}
+[[env.staging.routes]]
+pattern = "*.staging.example.test/*"
+zone_name = "exmaple.test"
+`);
+    const runner = new FakeRunner([], {});
+    const cloudflare = new FakeCloudflare();
+    cloudflare.zones = [{ id: 'zone', name: 'example.test' }];
+
+    const error = await deployStage(
+      root,
+      { stage: 'pr123', repositoryRoot: root },
+      dependencies(runner, cloudflare),
+    ).catch((thrown: unknown) => thrown);
+
+    expect(error instanceof Error ? error.message : '').toBe(
+      'Recording pr123 in R2 bucket smoo-stage-records failed, so nothing was created: Route *.pr123.example.test/* binds to no zone the token lists in the CLOUDFLARE_ACCOUNT_ID account: none is its zone_name exmaple.test or a parent of it.',
+    );
+    expect(cloudflare.mutations).toEqual([]);
+    expect(runner.calls).toEqual([]);
   });
 
   it('refuses a pull-request stage whose root manifest names no repository, before any Cloudflare call', async () => {

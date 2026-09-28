@@ -869,9 +869,9 @@ Before a `prN` deploy creates anything, it records every item its plan names: th
 databases and R2 buckets, custom domains, routes and wildcard DNS records. Each is one empty object in the R2 bucket
 `smoo-stage-records`, keyed by repository, stage and Worker, so a deploy that fails halfway leaves nothing unrecorded.
 Items the stage finds already there are recorded too. There is one such bucket per Cloudflare account, shared by every
-repository that deploys there; never delete it. A route is recorded under its zone: `zone_name`, else the zone its
-`zone_id` names, else the most specific zone of the account containing its host. A route none of those resolves is
-refused; declare its `zone_name`.
+repository that deploys there; never delete it. A route is recorded under the zone `wrangler deploy` binds it in: the
+one its `zone_id` names, else the most specific zone of the account that is its `zone_name` or a parent of it, else the
+most specific one containing its host. A route none of those finds is refused before anything is recorded or created.
 
 The repository is the `repository` of the workspace root's `package.json` (found by git; the root must hold `nx.json`),
 as `host/owner/repo` whatever form it is written in: `https://`, `git+ssh://`, `git@host:owner/repo`, `github:`,
