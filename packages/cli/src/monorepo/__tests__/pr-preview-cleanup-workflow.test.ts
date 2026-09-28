@@ -101,47 +101,80 @@ describe('PR preview cleanup workflow', () => {
       return lines.slice(start + 1, end).filter((line) => line.trim() !== '' && !/^\s*#/.test(line));
     }
 
-    /**
-     * The group `workflow` joins for `github`. Only what a group here may use is understood: text,
-     * and `${{ }}` expressions of `github.*` paths joined by `||`, which yields its first truthy
-     * operand as GitHub's does. Anything else throws, so a new expression cannot pass unevaluated.
-     */
-    function groupFor(workflow: string, github: GithubContext): string {
-      const line = concurrencyBlock(workflow).find((candidate) => candidate.trim().startsWith('group:'));
-      const template = requiredGroup(line).trim().slice('group:'.length).trim();
-      return template.replace(/\$\{\{(.*?)\}\}/g, (_, expression: string) => {
-        for (const operand of expression.split('||').map((part) => part.trim())) {
-          if (!/^github(\.[a-z_]+)+$/.test(operand)) throw new Error(`Cannot evaluate ${expression.trim()}.`);
-          const value = operand
-            .split('.')
-            .slice(1)
-            .reduce<unknown>(
-              (context, key) =>
-                typeof context === 'object' && context !== null ? Reflect.get(context, key) : undefined,
-              github,
-            );
-          if (value) return String(value);
-        }
-        return '';
-      });
+    /** The value of the concurrency block's `key:` line. */
+    function concurrencyValue(workflow: string, key: string): string {
+      const line = concurrencyBlock(workflow).find((candidate) => candidate.trim().startsWith(`${key}:`));
+      if (line === undefined) throw new Error(`The concurrency block has no ${key}.`);
+      return line.trim().slice(`${key}:`.length).trim();
     }
 
-    function requiredGroup(line: string | undefined): string {
-      if (line === undefined) throw new Error('The concurrency block has no group.');
-      return line;
+    /**
+     * The value of one `${{ }}` expression for `github`. Only what a concurrency block here may use
+     * is understood: `github.*` paths joined by `||`, which yields its first truthy operand as
+     * GitHub's does, and one `github.*` path compared with `!=` to a single-quoted string, which
+     * ignores case as GitHub's does. Anything else throws, so a new expression cannot pass
+     * unevaluated.
+     */
+    function evaluate(expression: string, github: GithubContext): string | boolean {
+      const comparison = /^(github(?:\.[a-z_]+)+) != '([^']*)'$/.exec(expression.trim());
+      if (comparison) {
+        const value = contextValue(comparison[1], github);
+        if (typeof value !== 'string') throw new Error(`Cannot compare ${comparison[1]} as a string.`);
+        return value.toLowerCase() !== comparison[2].toLowerCase();
+      }
+      for (const operand of expression.split('||').map((part) => part.trim())) {
+        if (!/^github(\.[a-z_]+)+$/.test(operand)) throw new Error(`Cannot evaluate ${expression.trim()}.`);
+        const value = contextValue(operand, github);
+        if (value) return String(value);
+      }
+      return '';
+    }
+
+    /** The value a `github.*` path names in `github`, or undefined where the context has none. */
+    function contextValue(path: string, github: GithubContext): unknown {
+      return path
+        .split('.')
+        .slice(1)
+        .reduce<unknown>(
+          (context, key) => (typeof context === 'object' && context !== null ? Reflect.get(context, key) : undefined),
+          github,
+        );
+    }
+
+    /** The group `workflow` joins for `github`: its text, with each `${{ }}` expression evaluated. */
+    function groupFor(workflow: string, github: GithubContext): string {
+      return concurrencyValue(workflow, 'group').replace(/\$\{\{(.*?)\}\}/g, (_, expression: string) =>
+        String(evaluate(expression, github)),
+      );
+    }
+
+    /** Whether the run `workflow` starts for `github` cancels the run in progress in its group. */
+    function cancelsFor(workflow: string, github: GithubContext): boolean {
+      const value = concurrencyValue(workflow, 'cancel-in-progress');
+      if (value === 'true' || value === 'false') return value === 'true';
+      const expression = /^\$\{\{(.*)\}\}$/.exec(value)?.[1];
+      const cancels = expression === undefined ? undefined : evaluate(expression, github);
+      if (typeof cancels !== 'boolean') throw new Error(`Cannot evaluate cancel-in-progress: ${value}.`);
+      return cancels;
     }
 
     const cleanup = renderPrPreviewCleanupWorkflowYaml({ runsOn: 'ubuntu-latest' });
+    // CI that runs on pushes to the events' base branch, and deploys staging from
+    // it where it deploys, so the merge's push is a run CI starts. That run queues
+    // behind a running staging deploy instead of canceling it; a validating CI has
+    // no deploy to protect and cancels.
+    const baseBranchCi: Parameters<typeof renderCiWorkflowYaml>[0] = { ...deployingCi, pushBranches: ['private'] };
     const ciVariants = {
-      deploying: renderCiWorkflowYaml(deployingCi),
-      validating: renderCiWorkflowYaml({ ...deployingCi, deploy: false }),
+      deploying: { ci: renderCiWorkflowYaml(baseBranchCi), stagingPushCancels: false },
+      validating: { ci: renderCiWorkflowYaml({ ...baseBranchCi, deploy: false }), stagingPushCancels: true },
     };
 
     it('cancels the run it finds in progress in that group', () => {
-      expect(concurrencyBlock(cleanup)).toContain('  cancel-in-progress: true');
+      expect(cancelsFor(cleanup, events.prClosedMerged)).toBe(true);
+      expect(cancelsFor(cleanup, events.prClosedUnmerged)).toBe(true);
     });
 
-    for (const [variant, ci] of Object.entries(ciVariants)) {
+    for (const [variant, { ci, stagingPushCancels }] of Object.entries(ciVariants)) {
       describe(`with ${variant} CI`, () => {
         it('whether the close merged the pull request or not', () => {
           const prCi = groupFor(ci, events.prSynchronize);
@@ -150,7 +183,13 @@ describe('PR preview cleanup workflow', () => {
           expect(groupFor(cleanup, events.prClosedUnmerged)).toBe(prCi);
         });
 
+        it("where the pull request's own runs cancel the run in progress too", () => {
+          expect(cancelsFor(ci, events.prSynchronize)).toBe(true);
+          expect(cancelsFor(ci, events.prSynchronizeOnForgejo)).toBe(true);
+        });
+
         it("never in the group of the base branch's own run after the merge", () => {
+          expect(cancelsFor(ci, events.pushToBase)).toBe(stagingPushCancels);
           expect(groupFor(cleanup, events.prClosedMerged)).not.toBe(groupFor(ci, events.pushToBase));
         });
 
