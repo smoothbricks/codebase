@@ -1950,6 +1950,38 @@ zone_name = "exmaple.test"
     expect(runner.calls).toEqual([]);
   });
 
+  it("creates and records a wildcard route's DNS record in the account zone the route is bound in", async () => {
+    // wrangler deploy binds each route in example.test, the most specific account zone that is its
+    // zone_name or a parent of it, whatever the case; neither zone_name is an account zone as written.
+    for (const [zoneName, pattern, host] of [
+      ['preview.example.test', '*.staging.preview.example.test/*', 'pr123.preview.example.test'],
+      ['Example.test', '*.staging.example.test/*', 'pr123.example.test'],
+    ]) {
+      const root = await fixtureRoot(`${FIXTURE}
+[[env.staging.routes]]
+pattern = "${pattern}"
+zone_name = "${zoneName}"
+`);
+      const runner = new FakeRunner([], {});
+      const cloudflare = new FakeCloudflare();
+      cloudflare.zones = [{ id: 'zone', name: 'example.test' }];
+      logWranglerInto(runner, cloudflare);
+
+      await deployStage(root, { stage: 'pr123', repositoryRoot: root }, dependencies(runner, cloudflare));
+
+      // Reconcile creates only a route whose zone_name is its zone's name as written; wrangler deploy
+      // binds this one.
+      expect(cloudflare.mutations).toEqual([
+        'create-r2:smoo-stage-records',
+        `${RECORDED_PR123}/worker`,
+        `${RECORDED_PR123}/route/example.test/*.${host}%2F*`,
+        `${RECORDED_PR123}/dns/example.test/*.${host}`,
+        `create-dns:zone:*.${host}:${host}`,
+        'wrangler deploy',
+      ]);
+    }
+  });
+
   it('refuses a route that declares both zone_id and zone_name, as wrangler does, before it records or creates anything', async () => {
     // Reconcile would create the route in the zone_name's zone, a record could name the zone_id's,
     // and wrangler deploy would then refuse the config and bind the route nowhere.

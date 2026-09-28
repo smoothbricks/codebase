@@ -43,6 +43,7 @@ import { wildcardDnsRecord } from './stage-labels.js';
 import {
   parseStageRecordKey,
   plannedStageRecords,
+  routeBindingZone,
   STAGE_RECORDS_BUCKET,
   type StageRecord,
   stageRecordKey,
@@ -959,8 +960,8 @@ async function reconcileStageResources(
   for (const route of plan.routes) {
     const wildcard = wildcardDnsRecord(route);
     if (!wildcard) continue;
-    const zone = zoneByName.get(wildcard.zoneName);
-    if (!zone) throw new Error(`Cloudflare zone ${wildcard.zoneName} is not available to the deployment token.`);
+    // The zone the route is bound in, which a pull-request stage recorded the record under.
+    const zone = routeBindingZone(route, zones);
     let names = dnsNamesByZone.get(zone.id);
     if (!names) {
       names = new Set((await cloudflare.listDnsRecords(zone.id)).map((record) => record.name));

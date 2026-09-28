@@ -162,7 +162,7 @@ export function parseStageRecordKey(scope: string, stage: `pr${number}`, key: st
 
 /**
  * The records one pull-request plan implies. `zones` is read once, and only when the plan has a
- * route that is not a custom domain.
+ * route or a wildcard DNS record to place in a zone.
  */
 export async function plannedStageRecords(
   plan: PullRequestResourcePlan,
@@ -174,19 +174,20 @@ export async function plannedStageRecords(
   for (const { name } of plan.d1Databases) records.push({ kind: 'd1', worker, name });
   for (const { bucketName } of plan.r2Buckets) records.push({ kind: 'r2', worker, bucket: bucketName });
   let listed: Promise<CloudflareZone[]> | undefined;
-  const accountZones = () => {
+  /** The real name of the account zone `route` is bound in, as a record carries it. */
+  const boundZone = async (route: PlannedRoute) => {
     listed ??= zones();
-    return listed;
+    return routeBindingZone(route, await listed).name.toLowerCase();
   };
   for (const route of plan.routes) {
     if (route.customDomain) {
       records.push({ kind: 'domain', worker, hostname: route.pattern.toLowerCase() });
     } else {
-      records.push({ kind: 'route', worker, zone: await routeZone(route, accountZones), pattern: route.pattern });
+      records.push({ kind: 'route', worker, zone: await boundZone(route), pattern: route.pattern });
     }
-    // The one derivation reconcile creates the record from, so what is recorded is what is created.
+    // What reconcile creates, in the zone it creates it in, so what is recorded is what is created.
     const dns = wildcardDnsRecord(route);
-    if (dns) records.push({ kind: 'dns', worker, zone: dns.zoneName.toLowerCase(), name: dns.name });
+    if (dns) records.push({ kind: 'dns', worker, zone: await boundZone(route), name: dns.name });
   }
   return records;
 }
@@ -203,17 +204,20 @@ export function zoneContaining(zones: CloudflareZone[], hostname: string): Cloud
 }
 
 /**
- * The name of the account zone a route is bound in, found the way `wrangler deploy` finds it: the
- * zone its `zone_id` names, or the most specific one that is its `zone_name` or a parent of it, or,
- * when it declares neither, the most specific one containing its host. Refuses a route none of
- * those finds, since a recorded zone the account does not list stops every cleanup of the stage.
+ * The account zone a route is bound in, found the way `wrangler deploy` finds it: the zone its
+ * `zone_id` names, or the most specific one that is its `zone_name` or a parent of it, whatever the
+ * case, or, when it declares neither, the most specific one containing its host. A `*.` route's
+ * wildcard DNS record is created and recorded in it too. Refuses a route none of those finds, since
+ * a recorded zone the account does not list stops every cleanup of the stage.
  */
-async function routeZone(route: PlannedRoute, zones: () => Promise<CloudflareZone[]>): Promise<string> {
-  const listed = await zones();
+export function routeBindingZone(
+  route: Pick<PlannedRoute, 'pattern' | 'zoneName' | 'zoneId'>,
+  zones: CloudflareZone[],
+): CloudflareZone {
   const host = routeHostname(route.pattern);
   const zone = route.zoneId
-    ? listed.find((candidate) => candidate.id === route.zoneId)
-    : zoneContaining(listed, route.zoneName ?? host);
+    ? zones.find((candidate) => candidate.id === route.zoneId)
+    : zoneContaining(zones, route.zoneName ?? host);
   if (!zone) {
     const missing = route.zoneId
       ? `has its zone_id ${route.zoneId}`
@@ -224,7 +228,7 @@ async function routeZone(route: PlannedRoute, zones: () => Promise<CloudflareZon
       `Route ${route.pattern} binds to no zone the token lists in the CLOUDFLARE_ACCOUNT_ID account: none ${missing}.`,
     );
   }
-  return zone.name.toLowerCase();
+  return zone;
 }
 
 /** The fields after `<worker>/<kind>`, in key order. */

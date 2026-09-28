@@ -868,9 +868,10 @@ databases and R2 buckets, custom domains, routes and wildcard DNS records. Each 
 `smoo-stage-records`, keyed by repository, stage and Worker, so a deploy that fails halfway leaves nothing unrecorded.
 Planned items already there are recorded too. There is one such bucket per Cloudflare account, shared by every
 repository that deploys there; never delete it. A route is recorded under the zone `wrangler deploy` binds it in: the
-one its `zone_id` names, or the most specific zone of the account that is its `zone_name` or a parent of it, or, when it
-declares neither, the most specific one containing its host. A route that declares both, which wrangler refuses, or that
-none of those finds is refused before anything is recorded or created.
+one its `zone_id` names, or the most specific zone of the account that is its `zone_name` or a parent of it, ignoring
+letter case, or, when it declares neither, the most specific one containing its host. A `*.` route with a `zone_name`
+gets its wildcard DNS record created and recorded in that same zone. A route that declares both, which wrangler refuses,
+or that none of those finds is refused before anything is recorded or created.
 
 The repository is the `repository` of the workspace root's `package.json` (found by git; the root must hold `nx.json`),
 as `host/owner/repo` whatever form it is written in: `https://`, `git+ssh://`, `git@host:owner/repo`, `github:`,

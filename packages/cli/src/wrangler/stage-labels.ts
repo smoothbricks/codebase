@@ -47,12 +47,14 @@ export function routeHostname(pattern: string): string {
 /**
  * The proxied CNAME `*.<host>` → `<host>` that a `*.` route with a declared zone needs, and nothing
  * for any other route. Reconcile creates the record from this, so there is one derivation of it.
+ * It goes in the zone the route is bound in (`routeBindingZone`), which zone_name need not spell,
+ * so no zone comes from here.
  */
 export function wildcardDnsRecord(route: {
   pattern: string;
   zoneName?: string;
-}): { zoneName: string; name: string; content: string } | undefined {
+}): { name: string; content: string } | undefined {
   if (!route.pattern.startsWith('*.') || !route.zoneName) return undefined;
   const hostname = routeHostname(route.pattern);
-  return { zoneName: route.zoneName, name: `*.${hostname}`, content: hostname };
+  return { name: `*.${hostname}`, content: hostname };
 }

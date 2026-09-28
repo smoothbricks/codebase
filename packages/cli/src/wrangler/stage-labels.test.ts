@@ -47,8 +47,9 @@ describe('routeHostname', () => {
 });
 
 describe('wildcardDnsRecord', () => {
+  // No zone: the record goes in the zone the route is bound in, which zone_name need not spell.
   it('points the wildcard name at the host a zoned *. route serves, with or without a path', () => {
-    const record = { zoneName: 'example.com', name: '*.pr7.example.com', content: 'pr7.example.com' };
+    const record = { name: '*.pr7.example.com', content: 'pr7.example.com' };
     expect(wildcardDnsRecord({ pattern: '*.pr7.example.com/*', zoneName: 'example.com' })).toEqual(record);
     expect(wildcardDnsRecord({ pattern: '*.pr7.example.com', zoneName: 'example.com' })).toEqual(record);
     expect(wildcardDnsRecord({ pattern: '*.PR7.Example.com/*', zoneName: 'example.com' })).toEqual(record);

@@ -352,4 +352,36 @@ zone_id = "zone-apex"
       expect(domainsOnly.calls()).toBe(0);
     });
   });
+
+  // Reconcile creates a `*.` route's DNS record in the zone the route is bound in, not in the zone
+  // its zone_name spells, so the record is recorded under that zone as well.
+  describe('the zone a wildcard DNS record is recorded under', () => {
+    const zones = zoneListing([{ id: 'zone-apex', name: 'example.com' }]).list;
+
+    it('is the account zone its route is bound in when zone_name names a subdomain of that zone', async () => {
+      expect(
+        await plannedStageRecords(
+          plan([{ pattern: '*.pr7.preview.example.com/*', zoneName: 'preview.example.com', customDomain: false }]),
+          zones,
+        ),
+      ).toEqual([
+        { kind: 'worker', worker: 'web-pr7' },
+        { kind: 'route', worker: 'web-pr7', zone: 'example.com', pattern: '*.pr7.preview.example.com/*' },
+        { kind: 'dns', worker: 'web-pr7', zone: 'example.com', name: '*.pr7.preview.example.com' },
+      ]);
+    });
+
+    it('is the account zone its route is bound in when zone_name differs from that zone only in case', async () => {
+      expect(
+        await plannedStageRecords(
+          plan([{ pattern: '*.pr7.example.com/*', zoneName: 'Example.COM', customDomain: false }]),
+          zones,
+        ),
+      ).toEqual([
+        { kind: 'worker', worker: 'web-pr7' },
+        { kind: 'route', worker: 'web-pr7', zone: 'example.com', pattern: '*.pr7.example.com/*' },
+        { kind: 'dns', worker: 'web-pr7', zone: 'example.com', name: '*.pr7.example.com' },
+      ]);
+    });
+  });
 });
