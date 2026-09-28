@@ -1607,6 +1607,34 @@ describe('deployStage with a flat JSON config', () => {
     expect(cloudflare.mutations).toEqual([]);
   });
 
+  it('refuses a route that declares both zone_id and zone_name on every stage, before mutating Cloudflare', async () => {
+    const { root, configPath } = await flatFixtureRoot(
+      JSON.stringify({
+        ...JSON.parse(FLAT_FIXTURE),
+        routes: [{ pattern: '*.staging.example.test/*', zone_name: 'example.test', zone_id: 'zone-other' }],
+      }),
+    );
+    for (const stage of ['staging', 'pr7']) {
+      const runner = new FakeRunner();
+      const cloudflare = new FakeCloudflare();
+      cloudflare.namespaces = [{ id: 'kv-staging', title: 'fixture-SESSION-staging' }];
+      cloudflare.d1Databases = [{ uuid: 'd1-staging', name: 'fixture-website-staging-db' }];
+      cloudflare.zones = [
+        { id: 'zone-1', name: 'example.test' },
+        { id: 'zone-other', name: 'other.test' },
+      ];
+      cloudflare.scripts = [{ id: 'fixture-website-preview-staging' }];
+
+      await expect(
+        deployStage(root, { stage, repositoryRoot: root, config: configPath }, dependencies(runner, cloudflare)),
+      ).rejects.toThrow(
+        'Route *.staging.example.test/* of fixture-website-preview-staging declares both zone_id and zone_name, which wrangler refuses; declare only one of the two.',
+      );
+      expect(cloudflare.mutations).toEqual([]);
+      expect(runner.calls).toEqual([]);
+    }
+  });
+
   it('rejects a first flat PR Worker with missing manifest secrets before mutating Cloudflare', async () => {
     const { root, configPath } = await flatFixtureRoot();
     // The manifest is read from the working directory, not from beside the --config file.
@@ -2047,6 +2075,36 @@ zone_id = "zone-other"
     const error = await deployStage(
       root,
       { stage: 'pr123', repositoryRoot: root },
+      dependencies(runner, cloudflare),
+    ).catch((thrown: unknown) => thrown);
+
+    expect(error instanceof Error ? error.message : '').toBe(
+      'Route *.staging.example.test/* of fixture-worker-staging declares both zone_id and zone_name, which wrangler refuses; declare only one of the two.',
+    );
+    expect(cloudflare.mutations).toEqual([]);
+    expect(runner.calls).toEqual([]);
+  });
+
+  it('refuses a route that declares both zone_id and zone_name on a staging deploy too, before reconcile creates anything', async () => {
+    // Staging records nothing, but reconcile would create the wildcard DNS record and the route in
+    // the zone_name's zone, and wrangler deploy would then refuse the config and leave both behind.
+    const root = await fixtureRoot(`${FIXTURE}
+[[env.staging.routes]]
+pattern = "*.staging.example.test/*"
+zone_name = "example.test"
+zone_id = "zone-other"
+`);
+    const runner = new FakeRunner([], {});
+    const cloudflare = new FakeCloudflare();
+    cloudflare.zones = [
+      { id: 'zone', name: 'example.test' },
+      { id: 'zone-other', name: 'other.test' },
+    ];
+    cloudflare.scripts = [{ id: 'fixture-worker-staging' }];
+
+    const error = await deployStage(
+      root,
+      { stage: 'staging', repositoryRoot: root },
       dependencies(runner, cloudflare),
     ).catch((thrown: unknown) => thrown);
 

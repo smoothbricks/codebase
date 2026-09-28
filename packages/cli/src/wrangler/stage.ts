@@ -218,6 +218,7 @@ function stageEnvironmentConfig(document: WranglerDocument, stage: DeploymentSta
 function environmentStageConfig(environment: WranglerEnvironment, label: string): StageConfigFields {
   const config: StageConfigFields = { ...environment, name: requiredString(environment, 'name', label) };
   if (environment.routes !== undefined) config.routes = readStageRoutes(environment.routes);
+  assertOneZonePerRoute(config.name, config.routes);
   if (isUnknownRecord(environment.vars)) config.vars = environment.vars;
   if (environment.kv_namespaces !== undefined) config.kv_namespaces = readKvBindings(environment.kv_namespaces);
   if (environment.r2_buckets !== undefined) config.r2_buckets = readR2Buckets(environment.r2_buckets);
@@ -246,6 +247,19 @@ export function assertPullRequestRoutable(name: string, routes: StageRoute[] | u
   const patterns = list.map((route) => route.pattern).join(', ');
   throw new Error(
     `Every route of ${name} is pinned (no staging label): ${patterns}. A pull-request stage would deploy unrouted and Wrangler would expose it on workers.dev; add a stage-derivable route such as site.staging.<zone>/*.`,
+  );
+}
+
+/**
+ * Refuses a route that declares both `zone_id` and `zone_name`, which wrangler refuses for every
+ * stage. Checked as the routes are read, so no deploy records, reconciles or creates anything for
+ * a config wrangler would then reject: nothing could say which zone the route is bound in.
+ */
+export function assertOneZonePerRoute(name: string, routes: StageRoute[] | undefined): void {
+  const route = (routes ?? []).find((row) => typeof row.zone_name === 'string' && typeof row.zone_id === 'string');
+  if (!route) return;
+  throw new Error(
+    `Route ${route.pattern} of ${name} declares both zone_id and zone_name, which wrangler refuses; declare only one of the two.`,
   );
 }
 
@@ -289,20 +303,12 @@ export function planPullRequestBindings(
   }));
   const routes = (config.routes ?? [])
     .filter((route) => hasStageLabel(route.pattern))
-    .map((route) => {
-      // wrangler refuses such a config, and nothing here could say which zone the route belongs to.
-      if (typeof route.zone_name === 'string' && typeof route.zone_id === 'string') {
-        throw new Error(
-          `Route ${route.pattern} of ${config.name} declares both zone_id and zone_name, which wrangler refuses; declare only one of the two.`,
-        );
-      }
-      return {
-        pattern: replaceHostnameLabel(route.pattern, stage),
-        ...(typeof route.zone_name === 'string' ? { zoneName: route.zone_name } : {}),
-        ...(typeof route.zone_id === 'string' ? { zoneId: route.zone_id } : {}),
-        customDomain: route.custom_domain === true,
-      };
-    });
+    .map((route) => ({
+      pattern: replaceHostnameLabel(route.pattern, stage),
+      ...(typeof route.zone_name === 'string' ? { zoneName: route.zone_name } : {}),
+      ...(typeof route.zone_id === 'string' ? { zoneId: route.zone_id } : {}),
+      customDomain: route.custom_domain === true,
+    }));
   return {
     stage,
     workerName: stageResourceName(workerBaseName, stage),

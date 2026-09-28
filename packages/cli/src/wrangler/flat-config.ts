@@ -1,6 +1,6 @@
 import typia from 'typia';
 import { formatValidationErrors } from '../lib/json.js';
-import type { StageConfigFields } from './stage.js';
+import { assertOneZonePerRoute, type StageConfigFields } from './stage.js';
 
 /**
  * A Wrangler configuration with no `env` blocks: the shape build tools emit
@@ -24,5 +24,6 @@ export function parseFlatWranglerConfig(json: string): FlatWranglerConfig {
   if (result.data.env !== undefined) {
     throw new Error('A flat Wrangler configuration must not declare env blocks; it is already resolved for one stage.');
   }
+  assertOneZonePerRoute(result.data.name, result.data.routes);
   return result.data;
 }

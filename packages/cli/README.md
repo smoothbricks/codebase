@@ -870,8 +870,9 @@ Planned items already there are recorded too. There is one such bucket per Cloud
 repository that deploys there; never delete it. A route is recorded under the zone `wrangler deploy` binds it in: the
 one its `zone_id` names, or the most specific zone of the account that is its `zone_name` or a parent of it, ignoring
 letter case, or, when it declares neither, the most specific one containing its host. A `*.` route with a `zone_name`
-gets its wildcard DNS record created and recorded in that same zone. A route that declares both, which wrangler refuses,
-or that none of those finds is refused before anything is recorded or created.
+gets its wildcard DNS record created and recorded in that same zone. A route that none of those finds is refused before
+anything is recorded or created. A route that declares both `zone_id` and `zone_name`, which wrangler refuses, is
+refused on any stage, `staging` and `production` too, as the configuration is read and before anything is created.
 
 The repository is the `repository` of the workspace root's `package.json` (found by git; the root must hold `nx.json`),
 as `host/owner/repo` whatever form it is written in: `https://`, `git+ssh://`, `git@host:owner/repo`, `github:`,
