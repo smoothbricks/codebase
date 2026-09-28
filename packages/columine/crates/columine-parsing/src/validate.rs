@@ -12,7 +12,7 @@
 //! began as a number or a bigint is [`ValueKind::CanonicalInt64`], proven by
 //! [`ValueView::as_canonical_i64`]. Each numeric schema judges that exact value
 //! against its own bounds: `bigint` accepts every `i64`, `number` only the
-//! integers a double represents exactly (`±(2^53 − 1)`), and `i32`/`u32` their
+//! safe integral JavaScript numbers (`±(2^53 − 1)`), and `i32`/`u32` their
 //! ranges. A union still requires exactly one matching variant, so a safe
 //! integer under `number | bigint` is ambiguous while a wider one is a bigint.
 use std::{collections::BTreeMap, fmt};
@@ -709,13 +709,14 @@ fn validate_bigint(path: &str, value: &dyn ValueView) -> Result<(), PayloadViola
 }
 
 /// A number is any finite JSON/MessagePack number. A canonical int64 is a
-/// number only while a double represents it exactly; beyond `±(2^53 − 1)` it
-/// fits `bigint` alone.
+/// number only within the safe-integer range `±(2^53 − 1)`; wider values fit
+/// `bigint` alone, even when an individual value is representable as a double.
 fn validate_number(path: &str, value: &dyn ValueView) -> Result<(), PayloadViolation> {
-    if !matches!(value.kind(), ValueKind::Number | ValueKind::CanonicalInt64) {
+    let kind = value.kind();
+    if !matches!(kind, ValueKind::Number | ValueKind::CanonicalInt64) {
         return Err(PayloadViolation::shape(path, "number", value));
     }
-    if value.kind() == ValueKind::CanonicalInt64 {
+    if kind == ValueKind::CanonicalInt64 {
         const MAX_SAFE_INTEGER: i64 = (1_i64 << 53) - 1;
         return match value.as_canonical_i64() {
             Some(number) if (-MAX_SAFE_INTEGER..=MAX_SAFE_INTEGER).contains(&number) => Ok(()),
