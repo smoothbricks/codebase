@@ -1088,25 +1088,49 @@ describe('cleanup-pr from stage records', () => {
     expect(cloudflare.mutations).toEqual(keys.map((key) => `delete-object:${STAGE_RECORDS_BUCKET}:${key}`));
   });
 
-  it('deletes nothing and keeps every record when the token lists no zone a record names', async () => {
+  it('deletes nothing and keeps every record when the token does not list a zone a record names', async () => {
     // A token narrowed to fewer zones lists exactly what a deleted zone would: nothing. That
     // absence does not show the zone's routes and DNS records are gone, and deleting their
     // records would lose the only trace of them.
     const cloudflare = new FakeCloudflare();
-    const keys = recordStage(cloudflare, [
+    const listed: StageRecord[] = [
       { kind: 'worker', worker: 'web-pr7' },
+      { kind: 'worker', worker: 'api-pr7' },
       { kind: 'route', worker: 'web-pr7', zone: 'example.test', pattern: '*.pr7.example.test/*' },
+    ];
+    const hidden: StageRecord[] = [
       { kind: 'route', worker: 'web-pr7', zone: 'hidden.test', pattern: '*.pr7.hidden.test/*' },
       { kind: 'dns', worker: 'web-pr7', zone: 'hidden.test', name: '*.pr7.hidden.test' },
+      // The same route recorded by a second Worker is a second record naming the zone.
+      { kind: 'route', worker: 'api-pr7', zone: 'hidden.test', pattern: '*.pr7.hidden.test/*' },
+    ];
+    const otherHidden: StageRecord[] = [
       { kind: 'dns', worker: 'web-pr7', zone: 'other-hidden.test', name: '*.pr7.other-hidden.test' },
-    ]);
-    cloudflare.scripts = [{ id: 'web-pr7' }];
+    ];
+    const keys = recordStage(cloudflare, [...listed, ...hidden, ...otherHidden]);
+    const keyOf = (record: StageRecord) => stageRecordKey(SCOPE, 'pr7', record);
+    cloudflare.scripts = [{ id: 'web-pr7' }, { id: 'api-pr7' }];
     cloudflare.zones = [{ id: 'zone-example', name: 'example.test' }];
     cloudflare.routes['zone-example'] = [{ id: 'route-web', pattern: '*.pr7.example.test/*', script: 'web-pr7' }];
 
-    await expect(cleanup(await cleanupRoot(), 7, cloudflare)).rejects.toThrow(
-      /hidden\.test, other-hidden\.test.*nothing was deleted and every record is kept/s,
+    const refusal = await cleanup(await cleanupRoot(), 7, cloudflare).catch((thrown: unknown) =>
+      thrown instanceof Error ? thrown.message : String(thrown),
     );
+
+    expect(refusal).toContain('The token lists no zone hidden.test, other-hidden.test in the CLOUDFLARE_ACCOUNT_ID');
+    expect(refusal).toContain('nothing was deleted and every record is kept');
+    expect(refusal).toContain('Zone Read, Zone DNS write and Workers Routes write');
+    expect(refusal).not.toContain('example.test');
+    // Each unlisted zone, followed by the keys of exactly the records that name it.
+    expect(refusal).toContain(
+      [
+        '  hidden.test:',
+        ...hidden.map((record) => `    ${keyOf(record)}`),
+        '  other-hidden.test:',
+        ...otherHidden.map((record) => `    ${keyOf(record)}`),
+      ].join('\n'),
+    );
+    for (const record of listed) expect(refusal).not.toContain(keyOf(record));
     expect(cloudflare.mutations).toEqual([]);
     expect(cloudflare.objects[STAGE_RECORDS_BUCKET]).toEqual(keys);
   });

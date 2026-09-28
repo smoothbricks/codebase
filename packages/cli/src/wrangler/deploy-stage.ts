@@ -45,6 +45,7 @@ import {
   plannedStageRecords,
   STAGE_RECORDS_BUCKET,
   type StageRecord,
+  stageRecordKey,
   stageRecordKeys,
   stageRecordPrefix,
   stageRecordScope,
@@ -598,7 +599,9 @@ export async function cleanupPullRequest(
   const { keys, records, buckets } = await readStageRecords(cloudflare, scope, stage);
   result.recorded = keys.length;
   if (keys.length === 0) return result;
-  const targets = await resolveCleanupTargets(cloudflare, records, buckets);
+  const targets = await resolveCleanupTargets(cloudflare, records, buckets, (record) =>
+    stageRecordKey(scope, stage, record),
+  );
   result.alreadyGone = targets.alreadyGone;
   result.leftInPlace = targets.leftInPlace;
   try {
@@ -683,6 +686,7 @@ async function resolveCleanupTargets(
   cloudflare: CloudflareClient,
   records: StageRecord[],
   buckets: Set<string>,
+  recordKey: (record: StageRecord) => string,
 ): Promise<CleanupTargets> {
   const distinct = [...new Map(records.map((record) => [recordIdentity(record), record])).values()];
   const of = <K extends StageRecord['kind']>(kind: K) =>
@@ -720,7 +724,8 @@ async function resolveCleanupTargets(
     }
   }
 
-  await resolveZoneTargets(cloudflare, of('route'), of('dns'), otherOwner, targets, found);
+  const zoneIds = await recordedZoneIds(cloudflare, records, recordKey);
+  await resolveZoneTargets(cloudflare, zoneIds, of('route'), of('dns'), otherOwner, targets, found);
 
   const workers = of('worker');
   const scripts = new Set(workers.length > 0 ? (await cloudflare.listWorkerScripts()).map((script) => script.id) : []);
@@ -758,13 +763,13 @@ async function resolveCleanupTargets(
  */
 async function resolveZoneTargets(
   cloudflare: CloudflareClient,
+  zoneIds: (zone: string) => string,
   routes: RecordOf<'route'>[],
   dns: RecordOf<'dns'>[],
   otherOwner: (owner: string | undefined) => string | undefined,
   targets: CleanupTargets,
   found: <T>(list: T[], item: T | undefined) => void,
 ): Promise<void> {
-  const zoneIds = await recordedZoneIds(cloudflare, [...routes, ...dns]);
   const routeTable = perZone((zoneId) => cloudflare.listWorkerRoutes(zoneId));
   /** The pattern of each route left in place, by the `zone/name` of the wildcard DNS record it needs. */
   const neededDns = new Map<string, string>();
@@ -818,22 +823,36 @@ function perZone<T>(list: (zoneId: string) => Promise<T[]>): (zoneId: string) =>
  * Each recorded zone's id, looked up by name within the account. A zone the token does not list
  * refuses the cleanup before anything is deleted: a token narrowed to fewer zones lists exactly
  * what a deleted zone would, so the absence does not show that the zone's routes and DNS records
- * are gone, and deleting their records would lose the only trace of them.
+ * are gone, and deleting their records would lose the only trace of them. The refusal lists, per
+ * such zone, the key of every record naming it: exactly what to delete once the zone is really gone.
  */
 async function recordedZoneIds(
   cloudflare: CloudflareClient,
-  records: (RecordOf<'route'> | RecordOf<'dns'>)[],
+  records: StageRecord[],
+  recordKey: (record: StageRecord) => string,
 ): Promise<(zone: string) => string> {
+  const zoned = records.filter(
+    (record): record is RecordOf<'route'> | RecordOf<'dns'> => record.kind === 'route' || record.kind === 'dns',
+  );
   const ids = new Map<string, string>();
   const unlisted: string[] = [];
-  for (const zone of new Set(records.map((record) => record.zone))) {
+  for (const zone of new Set(zoned.map((record) => record.zone))) {
     const id = (await cloudflare.listZones(zone)).find((candidate) => sameName(candidate.name, zone))?.id;
     if (id === undefined) unlisted.push(zone);
     else ids.set(zone, id);
   }
   if (unlisted.length > 0) {
     throw new Error(
-      `The token lists no zone ${unlisted.join(', ')} in the CLOUDFLARE_ACCOUNT_ID account, though the stage's records name ${unlisted.length === 1 ? 'it' : 'them'}. A zone the token cannot see may still hold the stage's routes and DNS records, so nothing was deleted and every record is kept. Give the token Zone Read on ${unlisted.length === 1 ? 'that zone' : 'those zones'} and run cleanup-pr again; for a zone that was deleted, delete the stage's records that name it from the ${STAGE_RECORDS_BUCKET} bucket by hand.`,
+      [
+        `The token lists no zone ${unlisted.join(', ')} in the CLOUDFLARE_ACCOUNT_ID account, though the stage's records name ${unlisted.length === 1 ? 'it' : 'them'}. A zone the token cannot see may still hold the stage's routes and DNS records, so nothing was deleted and every record is kept.`,
+        // Zone Read alone would only move the failure: cleanup lists and deletes the zone's routes and DNS records.
+        'For a zone that still exists, give the token what a deploy needs on it (Zone Read, Zone DNS write and Workers Routes write) and run cleanup-pr again.',
+        `For a zone that was deleted, delete exactly the objects listed under it below from the ${STAGE_RECORDS_BUCKET} bucket, for example in the Cloudflare dashboard, and run cleanup-pr again. Each key is listed as stored, with percent-encoded segments: a tool that encodes it again addresses a different object.`,
+        ...unlisted.flatMap((zone) => [
+          `  ${zone}:`,
+          ...zoned.filter((record) => record.zone === zone).map((record) => `    ${recordKey(record)}`),
+        ]),
+      ].join('\n'),
     );
   }
   return (zone) => {

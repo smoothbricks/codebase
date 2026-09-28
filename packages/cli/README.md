@@ -465,8 +465,8 @@ The bootstrap script is intentionally small. It only handles work required befor
   zone's real hostname in place of `<zone>`).
 
 Cloudflare deploys and cleanups need `CLOUDFLARE_ACCOUNT_ID` and `CLOUDFLARE_API_TOKEN`. The token needs Workers
-Scripts, Workers KV, R2, and D1 write, plus Zone DNS and Workers Routes write for preview hostnames. A pull-request
-deploy needs R2 even in a repository that binds no R2: it records what it will create in the account's
+Scripts, Workers KV, R2, and D1 write, plus Zone Read, Zone DNS write and Workers Routes write for preview hostnames. A
+pull-request deploy needs R2 even in a repository that binds no R2: it records what it will create in the account's
 `smoo-stage-records` bucket first, so R2 must be enabled on the Cloudflare account (once, in the dashboard) and the
 token needs R2 write, or the deploy fails before creating anything. Cleanup reads only the zones its stage's records
 name, and lists D1 only when a D1 database was recorded. It makes every lookup before its first delete, so a token
@@ -919,8 +919,11 @@ workspace; the repository is read from the root `package.json` the same way the 
   `CLOUDFLARE_ACCOUNT_ID` account, and only recorded zones and recorded kinds are listed.
 - A recorded zone the token does not list stops the command before anything is deleted, with every record kept. A token
   narrowed to fewer zones lists exactly what a deleted zone would, so the absence does not show that the zone's routes
-  and DNS records are gone. Give the token Zone Read on it and run the command again; for a zone that was really
-  deleted, delete the records that name it by hand.
+  and DNS records are gone. For a zone that still exists, give the token what a deploy needs on it (Zone Read, Zone DNS
+  write and Workers Routes write) and run the command again. For a zone that was really deleted, delete the records that
+  name it, and only those: its route and DNS records, under `v1/<scope>/prN/<worker>/route/<zone>/` and
+  `v1/<scope>/prN/<worker>/dns/<zone>/`. The error lists each of their keys as stored, with percent-encoded segments;
+  delete the objects by exactly those keys, for example in the Cloudflare dashboard, then run the command again.
 - A recorded item that no longer exists counts as already gone. A recorded route or custom domain that a Worker outside
   the stage now holds is left in place and named in the output, and so is the wildcard DNS record such a route still
   needs.
