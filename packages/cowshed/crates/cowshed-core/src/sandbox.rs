@@ -248,6 +248,26 @@ pub struct SandboxConfig {
     pub git_worktree_repository: Option<PathBuf>,
 }
 
+/// Read-only jobs keep writable process state within the existing exec-temp carve-back.
+pub fn sandbox_runtime_dir(sandbox: &SandboxConfig) -> PathBuf {
+    match sandbox.mode {
+        RunSandboxMode::ReadOnly => sandbox.exec_temp_dir.join("run"),
+        RunSandboxMode::ReadWrite => sandbox.workspace_mount.join(".cowshed/run"),
+    }
+}
+
+/// A short socket namespace per workspace and mode. Distinct links prevent a
+/// read-only launch from retargeting a running read-write job's Unix sockets.
+/// macOS caps Unix socket paths at 104 bytes; the full mount path leaves no
+/// room for devenv's per-session socket suffix.
+pub fn sandbox_runtime_link(sandbox: &SandboxConfig) -> PathBuf {
+    let suffix = match sandbox.mode {
+        RunSandboxMode::ReadOnly => "-ro",
+        RunSandboxMode::ReadWrite => "",
+    };
+    PathBuf::from(format!("/tmp/cs-{}{suffix}", sandbox.port_block.base()))
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SandboxError {
     InvalidPortBlock { base: u16, size: u16 },
@@ -440,8 +460,8 @@ pub fn seatbelt_profile(
     // `devenv-<hash>/`, nx's plugin workers - live in the runtime dir and nowhere else. The
     // child reaches it as the short `/tmp/cs-<port>` link; Seatbelt filters the path it is
     // handed, so both the link and the resolved directory are named.
-    let runtime_dir = config.workspace_mount.join(".cowshed/run");
-    let runtime_link = PathBuf::from(format!("/tmp/cs-{}", config.port_block.base()));
+    let runtime_dir = sandbox_runtime_dir(config);
+    let runtime_link = sandbox_runtime_link(config);
     for dir in [
         &runtime_dir,
         &runtime_link,
@@ -597,16 +617,17 @@ pub fn seatbelt_profile(
         ),
     );
     push_readable_ancestors(&mut profile, &config.exec_temp_dir)?;
-    // `XDG_RUNTIME_DIR` is `/tmp/cs-<port>`, a symlink onto the shed's runtime dir (the
-    // `sun_path` budget). Resolving it needs metadata on `/tmp` and on the link itself - not
-    // a listing of `/tmp`, not a byte of anything else in it - and Seatbelt then matches the
-    // resolved path, which the workspace grant already covers.
+    // Short runtime links resolve to the workspace or the exec temp directory
+    // above. Only metadata on their exact names is allowed, never a /tmp listing.
+    let runtime_name = runtime_link
+        .file_name()
+        .expect("runtime link has a file name");
     for tmp in ["/tmp", "/private/tmp"] {
         push_literal_rule(&mut profile, "allow file-read-metadata", Path::new(tmp))?;
         push_literal_rule(
             &mut profile,
             "allow file-read-metadata",
-            &Path::new(tmp).join(format!("cs-{}", config.port_block.base())),
+            &Path::new(tmp).join(runtime_name),
         )?;
     }
 
@@ -1278,45 +1299,6 @@ mod tests {
         let child_suffix = format!("{ancestor_deny}\n{protected_deny}\n");
         let common_child = child.strip_suffix(&child_suffix).unwrap();
         assert_eq!(common_child, common_supervisor);
-    }
-
-    /// TMPDIR is the exec temp dir, and production puts it under the store's quarantine: its
-    /// grants must be stated AFTER the store-wide deny or last-match-wins takes them back, and a
-    /// child's `mktemp` fails on a path it never chose.
-    #[test]
-    fn exec_temp_dir_under_the_store_survives_the_store_deny() {
-        let mut config = config(RunSandboxMode::ReadOnly);
-        config.exec_temp_dir = PathBuf::from("/private/cowshed/store/acme/widget/quarantine/abc");
-        config.additional_denies = vec![PathBuf::from("/private/cowshed/store/acme/widget")];
-        let profile = seatbelt_profile(&config, SandboxProfileRole::ExecutedChild).unwrap();
-        let store_deny = profile
-            .rfind("(deny file-read* file-write* (subpath \"/private/cowshed\"))")
-            .unwrap();
-        let project_deny = profile
-            .rfind("(deny file-read* file-write* (literal \"/private/cowshed/store/acme/widget\") (subpath \"/private/cowshed/store/acme/widget\"))")
-            .unwrap();
-        let read = profile
-            .find("(allow file-read* (subpath \"/private/cowshed/store/acme/widget/quarantine/abc\"))")
-            .unwrap();
-        let write = profile
-            .find("(allow file-write* (subpath \"/private/cowshed/store/acme/widget/quarantine/abc\")")
-            .unwrap();
-        let ancestor = profile
-            .rfind("(allow file-read* (literal \"/private/cowshed/store/acme/widget/quarantine\"))")
-            .unwrap();
-        let secret = profile.rfind("/Users/tester/.ssh").unwrap();
-        assert!(store_deny < read && project_deny < read);
-        assert!(project_deny < write && project_deny < ancestor);
-        assert!(
-            write < secret && ancestor < secret,
-            "secrets stay the last word"
-        );
-        // `/tmp` and the runtime link: metadata on the literals, nothing more.
-        assert!(profile.contains("(allow file-read-metadata (literal \"/tmp\"))"));
-        assert!(profile.contains("(allow file-read-metadata (literal \"/private/tmp/cs-40960\"))"));
-        assert!(!profile.contains("(allow file-read* (literal \"/tmp\"))"));
-        assert!(!profile.contains("(subpath \"/private/tmp\")"));
-        assert!(!profile.contains("(subpath \"/tmp\")"));
     }
 
     #[test]

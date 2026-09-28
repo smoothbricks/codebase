@@ -1,17 +1,152 @@
-//! Shared filesystem-publication plumbing: the temp-artifact grammar, the directory durability
-//! barrier, and the one atomic private-file writer.
-//!
-//! Everything here is plain POSIX — nothing Darwin-specific — so a Linux port reuses this module
-//! unchanged. The one writer deliberately NOT covered is the root-context marker writer in the
-//! macOS bootstrap adapter: it anchors on a directory file descriptor because an unprivileged
-//! user controls names beside its destination, and that hardening belongs to the platform
-//! adapter that carries the privilege.
+//! Shared filesystem-publication and anchored directory-preparation primitives.
+//! The temp-artifact grammar, durability barrier and atomic private-file writer
+//! coexist with a directory capability for host writes below child-mutable names.
+//! These are POSIX operations shared by Darwin and Linux. The privileged bootstrap
+//! marker adapter retains its own root-context publication policy.
 
-use std::ffi::{OsStr, OsString};
+use std::ffi::{CStr, CString, OsStr, OsString};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufWriter, Write};
+use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+
+/// A held directory capability. Child preparation never re-resolves a mutable
+/// parent path after it has been opened.
+pub(crate) struct AnchoredDirectory(File);
+
+impl AnchoredDirectory {
+    /// Open/create a canonical absolute chain without following any symlink.
+    /// One path buffer supplies all NUL-terminated components to openat.
+    pub(crate) fn create(path: &Path) -> io::Result<Self> {
+        if !path.is_absolute() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "directory must be absolute",
+            ));
+        }
+        let mut components = CString::new(path.as_os_str().as_bytes())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "directory contains NUL"))?
+            .into_bytes_with_nul();
+        for byte in &mut components {
+            if *byte == b'/' {
+                *byte = 0;
+            }
+        }
+        let mut directory = Self(
+            OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open("/")?,
+        );
+        for component in components.split_inclusive(|byte| *byte == 0) {
+            if component.len() == 1 {
+                continue;
+            }
+            let component = CStr::from_bytes_with_nul(component)
+                .expect("split components have exactly one trailing NUL");
+            directory = directory.child(component)?;
+        }
+        Ok(directory)
+    }
+
+    pub(crate) fn child(&self, name: &CStr) -> io::Result<Self> {
+        validate_directory_leaf(name)?;
+        let open = || {
+            // SAFETY: the held parent fd and NUL-terminated name outlive the call.
+            // NOFOLLOW and DIRECTORY refuse links and non-directory substitutions.
+            unsafe {
+                libc::openat(
+                    self.0.as_raw_fd(),
+                    name.as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            }
+        };
+        let mut fd = open();
+        if fd < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::NotFound {
+                return Err(error);
+            }
+            // SAFETY: mkdirat resolves one leaf beneath the held parent, never a path.
+            if unsafe { libc::mkdirat(self.0.as_raw_fd(), name.as_ptr(), 0o700) } != 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() != io::ErrorKind::AlreadyExists {
+                    return Err(error);
+                }
+            }
+            fd = open();
+        }
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: a successful openat returned a new owned directory descriptor.
+        Ok(Self(unsafe { File::from_raw_fd(fd) }))
+    }
+
+    /// Keep real private cache entries, preserve matching links, and replace
+    /// stale links without following any mutable parent or destination.
+    pub(crate) fn ensure_symlink(&self, name: &CStr, target: &Path) -> io::Result<()> {
+        validate_directory_leaf(name)?;
+        let target = CString::new(target.as_os_str().as_bytes())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "link target contains NUL"))?;
+        let mut buffer = [0u8; 4096];
+        // SAFETY: the fd/name are live and the buffer is writable for its full length.
+        let count = unsafe {
+            libc::readlinkat(
+                self.0.as_raw_fd(),
+                name.as_ptr(),
+                buffer.as_mut_ptr().cast(),
+                buffer.len(),
+            )
+        };
+        if count >= 0 {
+            let count = usize::try_from(count).expect("non-negative readlink length");
+            if count == buffer.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "link target exceeds buffer",
+                ));
+            }
+            if buffer[..count] == *target.as_bytes() {
+                return Ok(());
+            }
+            // SAFETY: unlinkat removes this directory entry, not its link target.
+            if unsafe { libc::unlinkat(self.0.as_raw_fd(), name.as_ptr(), 0) } != 0 {
+                return Err(io::Error::last_os_error());
+            }
+        } else {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::EINVAL) {
+                return Ok(());
+            }
+            if error.kind() != io::ErrorKind::NotFound {
+                return Err(error);
+            }
+        }
+        // SAFETY: the target and leaf are NUL-terminated; the held parent anchors creation.
+        if unsafe { libc::symlinkat(target.as_ptr(), self.0.as_raw_fd(), name.as_ptr()) } == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+}
+
+fn validate_directory_leaf(name: &CStr) -> io::Result<()> {
+    let name = name.to_bytes();
+    if name.is_empty() || name == b"." || name == b".." || name.contains(&b'/') {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "expected one directory entry",
+        ))
+    } else {
+        Ok(())
+    }
+}
 
 /// The one temp-artifact grammar: `.{final_name}.tmp.{discriminator}`.
 ///
@@ -202,6 +337,38 @@ impl Drop for TempCleanup {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn directory_capability_survives_parent_rename_without_following_its_replacement() {
+        let temporary = std::env::temp_dir().join(format!("fsio-anchor-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&temporary).unwrap();
+        let root = fs::canonicalize(&temporary).unwrap();
+        let parent = root.join("private");
+        let outside = root.join("outside");
+        fs::create_dir(&outside).unwrap();
+        let directory = AnchoredDirectory::create(&parent).unwrap();
+        let moved = root.join("moved");
+        fs::rename(&parent, &moved).unwrap();
+        std::os::unix::fs::symlink(&outside, &parent).unwrap();
+
+        directory.child(c"registry").unwrap().child(c"src").unwrap();
+        directory
+            .ensure_symlink(c"cache", &root.join("cache-target"))
+            .unwrap();
+        assert!(moved.join("registry/src").is_dir());
+        assert_eq!(
+            fs::read_link(moved.join("cache")).unwrap(),
+            root.join("cache-target")
+        );
+        for name in ["registry", "cache"] {
+            assert_eq!(
+                fs::symlink_metadata(outside.join(name)).unwrap_err().kind(),
+                io::ErrorKind::NotFound
+            );
+        }
+        assert!(AnchoredDirectory::create(&parent).is_err());
+        fs::remove_dir_all(temporary).unwrap();
+    }
 
     #[test]
     fn temp_names_hide_carry_the_final_name_and_are_recognized() {

@@ -16,10 +16,10 @@ use cowshed_core::metadata::{PortBlock, WorkspaceIncarnation, WorkspaceName};
 use cowshed_core::repository::RepoId;
 use cowshed_core::runtime::supervisor::{
     ProcessEvent, ProcessSpawnRequest, SpawnSink, SystemSpawnSink, WorkspaceAuthoritySnapshot,
-    sandbox_runtime_dir, sandbox_runtime_link,
 };
 use cowshed_core::sandbox::{
-    RunSandboxMode, SandboxConfig, SandboxGrants, SandboxProfileRole, seatbelt_profile,
+    RunSandboxMode, SandboxConfig, SandboxGrants, SandboxProfileRole, sandbox_runtime_dir,
+    sandbox_runtime_link, seatbelt_profile,
 };
 use cowshed_core::storage::job_artifact::StreamKind;
 use cowshed_core::workspace_credentials::WORKSPACE_TOKEN_PATH;
@@ -230,10 +230,12 @@ fn install_real_tool(sandbox: &SandboxConfig, name: &str) {
 #[tokio::test]
 #[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
 async fn host_controller_nx_runtime_directory_supports_real_unix_socket_roundtrips() {
-    let root = scratch("nx-socket");
-    let sandbox = workspace(&root, 41_056);
-    install_real_tool(&sandbox, "node");
-    let script = r#"
+    for mode in [RunSandboxMode::ReadWrite, RunSandboxMode::ReadOnly] {
+        let root = scratch("nx-socket");
+        let mut sandbox = workspace(&root, 41_056);
+        sandbox.mode = mode;
+        install_real_tool(&sandbox, "node");
+        let script = r#"
 const net = require('node:net');
 const fs = require('node:fs');
 const directory = process.env.NX_SOCKET_DIR;
@@ -247,20 +249,64 @@ server.listen(path, () => {
     client.on('end', () => server.close());
 });
 "#;
-    let (exit, stdout, stderr) = run_in_sandbox(
-        &sandbox,
-        &sandbox.workspace_mount,
-        vec!["node".into(), "-e".into(), script.into()],
-    )
-    .await;
-    assert_eq!(
-        exit,
-        ExitStatus::Exited { code: 0 },
-        "private Unix socket roundtrip failed: {}",
-        String::from_utf8_lossy(&stderr)
-    );
-    assert_eq!(stdout, b"nx-private-socket");
-    std::fs::remove_dir_all(root).expect("remove test workspace");
+        let (exit, stdout, stderr) = run_in_sandbox(
+            &sandbox,
+            &sandbox.workspace_mount,
+            vec!["node".into(), "-e".into(), script.into()],
+        )
+        .await;
+        assert_eq!(
+            exit,
+            ExitStatus::Exited { code: 0 },
+            "{mode:?} private Unix socket roundtrip failed: {}",
+            String::from_utf8_lossy(&stderr)
+        );
+        assert_eq!(stdout, b"nx-private-socket");
+        std::fs::remove_dir_all(root).expect("remove test workspace");
+    }
+}
+
+#[tokio::test]
+#[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
+async fn host_controller_private_environment_symlinks_cannot_redirect_host_preparation() {
+    for mode in [RunSandboxMode::ReadOnly, RunSandboxMode::ReadWrite] {
+        let root = scratch("environment-symlink");
+        let mut sandbox = workspace(&root, 41_072);
+        sandbox.mode = mode;
+        let outside = root.join("denied");
+        std::fs::create_dir(&outside).expect("outside sentinel directory");
+        sandbox.additional_denies.push(outside.clone());
+        let (exit, _, stderr) = run_in_sandbox(
+            &sandbox,
+            &sandbox.workspace_mount,
+            vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "mv \"$HOME/.cargo\" \"$HOME/.cargo.saved\" && ln -s \"$1\" \"$HOME/.cargo\""
+                    .into(),
+                "plant".into(),
+                outside.as_os_str().to_owned(),
+            ],
+        )
+        .await;
+        assert_eq!(exit, ExitStatus::Exited { code: 0 }, "{stderr:?}");
+        let request = spawn_request(
+            &sandbox,
+            &sandbox.workspace_mount,
+            vec!["/usr/bin/true".into()],
+        );
+        let (events, _receiver) = mpsc::channel(16);
+        let result = SystemSpawnSink.spawn(request, events).await;
+        assert!(
+            !outside.join("registry").exists(),
+            "a sandboxed child redirected the controller's next directory creation"
+        );
+        let Err(error) = result else {
+            panic!("symlinked private registry must refuse before spawning");
+        };
+        assert_eq!(error.code, cowshed_core::ErrorCode::Integrity);
+        std::fs::remove_dir_all(root).expect("remove test workspace");
+    }
 }
 
 #[tokio::test]

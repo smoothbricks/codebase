@@ -24,9 +24,12 @@ use crate::exec::{
     ExecError, SandboxExecRequest, SpawnPlan, classify_spawn_error, plan_exec,
     prepare_child_descriptors,
 };
+use crate::fsio::AnchoredDirectory;
 use crate::metadata::{WorkspaceIncarnation, WorkspaceName};
 use crate::repository::{OwnedRepoIds, RepoId};
-use crate::sandbox::{SandboxConfig, SandboxProfileRole, seatbelt_profile};
+use crate::sandbox::{
+    SandboxConfig, SandboxProfileRole, sandbox_runtime_dir, sandbox_runtime_link, seatbelt_profile,
+};
 use crate::storage::audit::AuditSinkError;
 use crate::workspace_environment::{GO_ENV, NODE_CA_ENV, PORT_BASE_ENV, WORKSPACE_TOKEN_ENV};
 use cowshed_gateway_types::WorkspaceToken;
@@ -829,55 +832,32 @@ fn gateway_proxy_url(port_base: &str, workspace_token: &WorkspaceToken) -> Strin
 /// time. Linking is what makes the profile's read grant reachable: Seatbelt matches resolved
 /// paths, so these links carry the host registry's authority, which is read-only.
 ///
-/// `src` — where cargo unpacks an archive — is a real directory inside the mount, so a crate the
-/// host downloaded but never built still unpacks, per workspace, and copy-on-write hands a warm
-/// one to every clone. A host with no registry yet yields no links and an ordinary empty
+/// `src` — where cargo unpacks an archive — stays in the private environment, so a crate the
+/// host downloaded but never built still unpacks locally. In-image environments remain copy-on-write.
+/// A host with no registry yet yields no links and an ordinary empty
 /// `$CARGO_HOME`; an existing real directory is left alone, because it is a workspace's own
 /// registry state and losing it is worse than not sharing.
-async fn link_cargo_registry(private_home: &Path, host_home: &Path) -> Result<()> {
+fn link_cargo_registry(private_home: &AnchoredDirectory, host_home: &Path) -> Result<()> {
     let host_registry = crate::sandbox::host_cargo_registry(host_home);
-    let registry = private_home.join(".cargo/registry");
-    let unpacked = registry.join("src");
-    tokio::fs::create_dir_all(&unpacked)
-        .await
-        .map_err(|error| {
-            CowshedError::environment_missing(
-                format!(
-                    "cannot prepare sandbox cargo registry {}: {error}",
-                    unpacked.display()
-                ),
-                "reattach the workspace and retry",
-            )
-        })?;
+    let registry = private_home
+        .child(c".cargo")
+        .and_then(|cargo| cargo.child(c"registry"))
+        .map_err(private_environment_error)?;
+    registry.child(c"src").map_err(private_environment_error)?;
+    let mut name_buffer = [0u8; 256];
     for directory in crate::sandbox::SHARED_CARGO_REGISTRY_DIRECTORIES {
         let target = host_registry.join(directory);
         if !target.is_dir() {
             continue;
         }
-        let link = registry.join(directory);
-        match tokio::fs::read_link(&link).await {
-            Ok(existing) if existing == target => continue,
-            Ok(_) => tokio::fs::remove_file(&link).await.map_err(|error| {
-                CowshedError::environment_missing(
-                    format!(
-                        "cannot replace stale sandbox cargo link {}: {error}",
-                        link.display()
-                    ),
-                    "reattach the workspace and retry",
-                )
-            })?,
-            Err(_) if link.exists() => continue,
-            Err(_) => {}
-        }
-        tokio::fs::symlink(&target, &link).await.map_err(|error| {
-            CowshedError::environment_missing(
-                format!(
-                    "cannot link sandbox cargo cache {}: {error}",
-                    link.display()
-                ),
-                "reattach the workspace and retry",
-            )
-        })?;
+        let name = &mut name_buffer[..=directory.len()];
+        name[..directory.len()].copy_from_slice(directory.as_bytes());
+        name[directory.len()] = 0;
+        let name = std::ffi::CStr::from_bytes_with_nul(name)
+            .expect("canonical cargo cache names are bounded directory leaves");
+        registry
+            .ensure_symlink(name, &target)
+            .map_err(private_environment_error)?;
     }
     Ok(())
 }
@@ -904,61 +884,31 @@ pub fn shared_nix_cache_directory() -> PathBuf {
 /// and an environment that cannot be shared must not fail the spawn), a link that already
 /// resolves to the shared directory is kept, a stale link is replaced, and a real directory a
 /// workspace already owns is left alone.
-async fn link_nix_cache(private_cache: &Path) -> Result<()> {
-    if !Path::new(crate::storage::bootstrap::CACHES_ROOT).is_dir() {
+fn link_nix_cache(private_cache: &AnchoredDirectory) -> Result<()> {
+    let root = Path::new(crate::storage::bootstrap::CACHES_ROOT);
+    if !root.is_dir() {
         return Ok(());
     }
-    let target = shared_nix_cache_directory();
-    tokio::fs::create_dir_all(&target).await.map_err(|error| {
-        CowshedError::environment_missing(
-            format!(
-                "cannot prepare the shared nix cache {}: {error}",
-                target.display()
-            ),
-            "run cowshed setup to repair the caches volume, then retry",
-        )
-    })?;
-    let link = private_cache.join("nix");
-    match tokio::fs::read_link(&link).await {
-        Ok(existing) if existing == target => return Ok(()),
-        Ok(_) => tokio::fs::remove_file(&link).await.map_err(|error| {
-            CowshedError::environment_missing(
-                format!(
-                    "cannot replace stale sandbox nix cache link {}: {error}",
-                    link.display()
-                ),
-                "reattach the workspace and retry",
-            )
-        })?,
-        Err(_) if link.exists() => return Ok(()),
-        Err(_) => {}
+    AnchoredDirectory::create(root)
+        .and_then(|root| root.child(c"nix"))
+        .and_then(|nix| nix.child(c"cache"))
+        .map_err(private_environment_error)?;
+    private_cache
+        .ensure_symlink(c"nix", &shared_nix_cache_directory())
+        .map_err(private_environment_error)
+}
+
+fn private_environment_error(error: io::Error) -> CowshedError {
+    let message = format!("cannot safely prepare the sandbox private environment: {error}");
+    let hint = "repair the workspace private environment, then retry cowshed exec";
+    if error.raw_os_error() == Some(libc::ELOOP)
+        || error.kind() == io::ErrorKind::NotADirectory
+        || error.kind() == io::ErrorKind::InvalidInput
+    {
+        CowshedError::integrity(message, hint)
+    } else {
+        CowshedError::environment_missing(message, hint)
     }
-    tokio::fs::symlink(&target, &link).await.map_err(|error| {
-        CowshedError::environment_missing(
-            format!("cannot link sandbox nix cache {}: {error}", link.display()),
-            "reattach the workspace and retry",
-        )
-    })
-}
-
-/// The runtime directory a sandboxed child owns: `<mount>/.cowshed/run`, on the shed.
-///
-/// It lives beside the private HOME, the one tree the executed-child profile grants writes
-/// to; it is copy-on-write with the clone and gone with it. The child does not see this path
-/// as `XDG_RUNTIME_DIR` - it sees [`sandbox_runtime_link`], a short `/tmp` symlink onto it,
-/// because a unix socket path is capped at 104 bytes (`sun_path`) and a mount at
-/// `<mount root>/<owner>/<repo>/<workspace>/.cowshed/run` leaves devenv's `devenv-<hash>/`
-/// sockets no room.
-pub fn sandbox_runtime_dir(sandbox: &SandboxConfig) -> PathBuf {
-    sandbox.workspace_mount.join(".cowshed/run")
-}
-
-/// The short path a child sees as `XDG_RUNTIME_DIR`: `/tmp/cs-<port base>`, a symlink onto
-/// [`sandbox_runtime_dir`]. The port block base is unique per attached workspace on this
-/// host, which is what makes the name collision-free without another identifier. Seatbelt
-/// matches the RESOLVED path, so the grant a socket under it needs is the shed's own.
-pub fn sandbox_runtime_link(sandbox: &SandboxConfig) -> PathBuf {
-    PathBuf::from(format!("/tmp/cs-{}", sandbox.port_block.base()))
 }
 
 /// Points [`sandbox_runtime_link`] at the runtime dir and sweeps every `/tmp/cs-*` link whose
@@ -1070,33 +1020,33 @@ async fn sandboxed_command(
             )
         },
     )?;
-    let private_home = private_root.join("home");
-    let private_config = private_root.join("config");
-    let private_cache = private_root.join("cache");
-    let private_data = private_root.join("data");
+    // direnv approval and tool state use the already-authorized exec-temp
+    // carve-back for read-only jobs, not a new workspace-wide write grant.
+    let environment_root = match sandbox.mode {
+        crate::sandbox::RunSandboxMode::ReadOnly => &sandbox.exec_temp_dir,
+        crate::sandbox::RunSandboxMode::ReadWrite => &private_root,
+    };
+    let private_home = environment_root.join("home");
+    let private_config = environment_root.join("config");
+    let private_cache = environment_root.join("cache");
+    let private_data = environment_root.join("data");
     let private_runtime = sandbox_runtime_dir(sandbox);
-    // exec_temp_dir joins the loop because it is exported as TMPDIR below.
-    // Exporting a directory without creating it makes every child that
-    // shells out to mktemp fail on a path the child never chose.
-    for directory in [
-        &private_home,
-        &private_config,
-        &private_cache,
-        &private_data,
-        &private_runtime,
-        &sandbox.exec_temp_dir,
-    ] {
-        tokio::fs::create_dir_all(directory)
-            .await
-            .map_err(|error| {
-                CowshedError::environment_missing(
-                    format!(
-                        "cannot prepare sandbox environment directory {}: {error}",
-                        directory.display()
-                    ),
-                    "reattach the workspace and retry",
-                )
-            })?;
+    // Keep directory capabilities through link preparation: a running child
+    // may rename these paths, but cannot redirect a host write through a link.
+    let environment =
+        AnchoredDirectory::create(environment_root).map_err(private_environment_error)?;
+    let home_directory = environment
+        .child(c"home")
+        .map_err(private_environment_error)?;
+    let cache_directory = environment
+        .child(c"cache")
+        .map_err(private_environment_error)?;
+    for name in [c"config", c"data", c"run"] {
+        environment.child(name).map_err(private_environment_error)?;
+    }
+    // TMPDIR must exist even when read-write environment state lives elsewhere.
+    if sandbox.mode == crate::sandbox::RunSandboxMode::ReadWrite {
+        AnchoredDirectory::create(&sandbox.exec_temp_dir).map_err(private_environment_error)?;
     }
     let token_path = sandbox
         .workspace_mount
@@ -1121,8 +1071,8 @@ async fn sandboxed_command(
             "reattach the workspace to mint fresh credentials",
         )
     })?;
-    link_cargo_registry(&private_home, &sandbox.home).await?;
-    link_nix_cache(&private_cache).await?;
+    link_cargo_registry(&home_directory, &sandbox.home)?;
+    link_nix_cache(&cache_directory)?;
     link_runtime_dir(sandbox, &private_runtime).await?;
     // Host-side preparation: adopted bindings are controller metadata, not child-readable
     // files. The Git directory probe runs under the narrower GitDiscovery child profile.
@@ -4094,7 +4044,7 @@ mod sandbox_environment_tests {
         let root =
             std::env::temp_dir().join(format!("cowshed-{label}-{}", Uuid::new_v4().simple()));
         std::fs::create_dir_all(&root).unwrap();
-        root
+        std::fs::canonicalize(root).unwrap()
     }
 
     #[test]
@@ -4223,8 +4173,8 @@ mod sandbox_environment_tests {
         );
     }
 
-    #[tokio::test]
-    async fn cargo_registry_links_the_host_download_cache_and_keeps_unpacking_local() {
+    #[test]
+    fn cargo_registry_links_the_host_download_cache_and_keeps_unpacking_local() {
         let root = scratch("cargo-registry");
         let host_home = root.join("host");
         let private_home = root.join("mount/.cowshed/home");
@@ -4233,9 +4183,8 @@ mod sandbox_environment_tests {
             std::fs::create_dir_all(host_registry.join(directory)).unwrap();
         }
 
-        link_cargo_registry(&private_home, &host_home)
-            .await
-            .unwrap();
+        let private_directory = AnchoredDirectory::create(&private_home).unwrap();
+        link_cargo_registry(&private_directory, &host_home).unwrap();
 
         let registry = private_home.join(".cargo/registry");
         for directory in crate::sandbox::SHARED_CARGO_REGISTRY_DIRECTORIES {
@@ -4255,9 +4204,7 @@ mod sandbox_environment_tests {
         let stale = registry.join("index");
         std::fs::remove_file(&stale).unwrap();
         std::os::unix::fs::symlink(root.join("elsewhere"), &stale).unwrap();
-        link_cargo_registry(&private_home, &host_home)
-            .await
-            .unwrap();
+        link_cargo_registry(&private_directory, &host_home).unwrap();
         assert_eq!(
             std::fs::read_link(&stale).unwrap(),
             host_registry.join("index")
@@ -4270,16 +4217,15 @@ mod sandbox_environment_tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
-    #[tokio::test]
-    async fn cargo_registry_yields_an_ordinary_home_without_a_host_cache() {
+    #[test]
+    fn cargo_registry_yields_an_ordinary_home_without_a_host_cache() {
         let root = scratch("cargo-registry-absent");
         let host_home = root.join("host");
         let private_home = root.join("mount/.cowshed/home");
         std::fs::create_dir_all(&host_home).unwrap();
 
-        link_cargo_registry(&private_home, &host_home)
-            .await
-            .unwrap();
+        let private_directory = AnchoredDirectory::create(&private_home).unwrap();
+        link_cargo_registry(&private_directory, &host_home).unwrap();
 
         let registry = private_home.join(".cargo/registry");
         assert!(registry.join("src").is_dir());
@@ -4293,9 +4239,7 @@ mod sandbox_environment_tests {
         std::fs::create_dir_all(owned.join("index.crates.io-0000000000000000")).unwrap();
         std::fs::create_dir_all(crate::sandbox::host_cargo_registry(&host_home).join("index"))
             .unwrap();
-        link_cargo_registry(&private_home, &host_home)
-            .await
-            .unwrap();
+        link_cargo_registry(&private_directory, &host_home).unwrap();
         assert!(std::fs::read_link(&owned).is_err());
         assert!(owned.join("index.crates.io-0000000000000000").is_dir());
 
