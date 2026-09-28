@@ -622,9 +622,11 @@ export async function cleanupPullRequest(
 export function describeCleanup(result: CleanupResult): string {
   const stage = `${result.stage} of ${result.scope}`;
   if (result.recorded === 0) {
-    // No deploy, a finished earlier cleanup (records go last) and an older smoo's unrecorded deploy all
-    // leave zero records. Exit 0 for each: cleanup cannot tell them apart, so the line names all three.
-    return `Nothing is recorded for ${stage}, so nothing was deleted: the pull request deployed nothing, an earlier cleanup already removed its stage, or an older smoo deployed it without records, in which case its items may still be live and have to be found and deleted by hand.`;
+    // No deploy and a finished earlier cleanup (records go last) leave zero records under this scope; so do
+    // an older smoo's unrecorded deploy and a deploy recorded while the root package.json named another
+    // repository. Exit 0 for each: cleanup cannot tell them apart, so the line claims none of them and
+    // says which may have left the stage live.
+    return `Nothing is recorded for ${stage}, so nothing was deleted. That is expected when the pull request deployed nothing or an earlier cleanup finished its stage. A stage an older smoo deployed, or one deployed while the root package.json named another repository, has no records here and may still be live, so check for its items by hand and delete what is left.`;
   }
   const { deleted } = result;
   const counts = [

@@ -929,10 +929,13 @@ workspace; the repository is read from the root `package.json` the same way the 
 - The records are deleted last. If a delete fails, the command stops with every record kept, and running it again
   finishes the stage.
 - It prints one line, such as `Cleaned pr7 of github.com/acme/app from 23 records: deleted 3 Workers, ...`, or
-  `Nothing is recorded for pr7 of github.com/acme/app, so nothing was deleted: ...` when the stage has no records. A
-  stage has none when its pull request deployed nothing, when an earlier cleanup already removed it, or when an older
-  smoo deployed it; cleanup cannot tell these apart, so the line names all three. Both exit 0, so a green cleanup job
-  for a stage deployed by an older smoo does not mean its items are gone: the line says they may still be live.
+  `Nothing is recorded for pr7 of github.com/acme/app, so nothing was deleted. ...` when the stage has no records. That
+  is expected when the pull request deployed nothing or an earlier cleanup already removed its stage. A stage an older
+  smoo deployed has none either, and neither does one deployed while the root `package.json` named another repository,
+  such as before a rename: cleanup reads only the records of the repository that file names now (see renaming the
+  repository in `smoo wrangler deploy-stage` above). Cleanup cannot tell these cases apart, so the line claims none of
+  them. Both lines exit 0, so a green cleanup job does not mean the stage's items are gone: the line says they may still
+  be live and have to be checked for by hand.
 
 Known gaps:
 
