@@ -424,6 +424,7 @@ fn spawn_request(sandbox: &SandboxConfig, cwd: &Path, argv: Vec<OsString>) -> Pr
         executed_child_profile: seatbelt_profile(sandbox, SandboxProfileRole::ExecutedChild)
             .expect("child profile"),
         sandbox: sandbox.clone(),
+        mode: cowshed_core::api::RunSandboxMode::ReadWrite,
     }
 }
 

@@ -204,6 +204,8 @@ pub struct ProcessSpawnRequest {
     pub env: BTreeMap<String, String>,
     pub devenv_dir: Option<PathBuf>,
     pub sandbox: SandboxConfig,
+    /// Requested narrowing of `sandbox`, which retains the supervisor's ceiling.
+    pub mode: crate::api::dto::RunSandboxMode,
     pub trusted_supervisor_profile: String,
     pub executed_child_profile: String,
 }
@@ -1218,9 +1220,21 @@ pub struct SystemSpawnSink;
 impl SpawnSink for SystemSpawnSink {
     async fn spawn(
         &mut self,
-        request: ProcessSpawnRequest,
+        mut request: ProcessSpawnRequest,
         events: mpsc::Sender<ProcessEvent>,
     ) -> Result<Box<dyn RunningProcess>> {
+        if request.trusted_supervisor_profile
+            != seatbelt_profile(&request.sandbox, SandboxProfileRole::TrustedSupervisor)
+                .map_err(map_sandbox_error)?
+        {
+            return Err(CowshedError::integrity(
+                "trusted-supervisor Seatbelt profile changed between admission and spawn",
+                "cowshed doctor --json",
+            ));
+        }
+        if request.mode == crate::api::dto::RunSandboxMode::ReadOnly {
+            request.sandbox.mode = crate::sandbox::RunSandboxMode::ReadOnly;
+        }
         let mut plan = plan_exec(
             SandboxExecRequest {
                 argv: request.argv,
@@ -1234,15 +1248,6 @@ impl SpawnSink for SystemSpawnSink {
         }) {
             return Err(CowshedError::integrity(
                 "executed-child Seatbelt profile changed between admission and spawn",
-                "cowshed doctor --json",
-            ));
-        }
-        if request.trusted_supervisor_profile
-            != seatbelt_profile(&request.sandbox, SandboxProfileRole::TrustedSupervisor)
-                .map_err(map_sandbox_error)?
-        {
-            return Err(CowshedError::integrity(
-                "trusted-supervisor Seatbelt profile changed between admission and spawn",
                 "cowshed doctor --json",
             ));
         }
@@ -2354,7 +2359,7 @@ impl SupervisorActor {
         let ExecRequest {
             argv,
             cwd,
-            mode: _,
+            mode,
             env,
             trace,
             stdin,
@@ -2489,8 +2494,15 @@ impl SupervisorActor {
                     return;
                 }
             };
+        // The request may narrow the configured ceiling, never widen it. Keep this
+        // per job so a read-only invocation does not alter later jobs or the
+        // supervisor's authority to seal their protected artifacts.
+        let mut child_sandbox = self.sandbox.clone();
+        if mode == crate::api::dto::RunSandboxMode::ReadOnly {
+            child_sandbox.mode = crate::sandbox::RunSandboxMode::ReadOnly;
+        }
         let executed_child_profile =
-            match seatbelt_profile(&self.sandbox, SandboxProfileRole::ExecutedChild)
+            match seatbelt_profile(&child_sandbox, SandboxProfileRole::ExecutedChild)
                 .map_err(map_sandbox_error)
             {
                 Ok(profile) => profile,
@@ -2502,6 +2514,7 @@ impl SupervisorActor {
                     return;
                 }
             };
+        child_sandbox.mode = self.sandbox.mode;
         let spawn = self
             .spawner
             .spawn(
@@ -2516,7 +2529,8 @@ impl SupervisorActor {
                         .unwrap_or_default(),
                     env: merged_env,
                     devenv_dir: None,
-                    sandbox: self.sandbox.clone(),
+                    sandbox: child_sandbox,
+                    mode,
                     trusted_supervisor_profile,
                     executed_child_profile,
                 },

@@ -586,6 +586,102 @@ async fn open_named(handle: &WorkspaceSupervisorHandle, name: &str) -> SessionTo
     handle.open_session(Some(name.into())).await.unwrap()
 }
 
+#[cfg(target_os = "macos")]
+#[tokio::test]
+#[ignore = "requires an unsandboxed macOS host-controller process"]
+async fn host_controller_exec_mode_enforces_each_request_without_widening_the_ceiling() {
+    for ceiling in [
+        cowshed_core::sandbox::RunSandboxMode::ReadWrite,
+        cowshed_core::sandbox::RunSandboxMode::ReadOnly,
+    ] {
+        let (mut supervisor_config, root) = isolated_config("exec-mode");
+        supervisor_config.sandbox.mode = ceiling;
+        supervisor_config.default_cwd = None;
+        // A configured temp tree may sit beneath a denied store. Its narrow carve-back
+        // must survive that deny without granting writes to the workspace.
+        let denied_store = root.join("private-store");
+        supervisor_config.sandbox.exec_temp_dir = denied_store.join("tmp");
+        supervisor_config
+            .sandbox
+            .additional_denies
+            .push(denied_store);
+        let mount = supervisor_config.workspace_root.clone();
+        std::fs::create_dir_all(&supervisor_config.sandbox.home).unwrap();
+        std::fs::create_dir_all(&supervisor_config.sandbox.exec_temp_dir).unwrap();
+        std::fs::create_dir_all(mount.join(".cowshed/bin")).unwrap();
+        std::fs::write(
+            mount.join(cowshed_core::workspace_credentials::WORKSPACE_TOKEN_PATH),
+            cowshed_gateway_types::WorkspaceToken::from_bytes([7; 32]).encode(),
+        )
+        .unwrap();
+        std::fs::write(mount.join("readable"), b"readable\n").unwrap();
+        let mut h = harness_with_config(supervisor_config, 1, 1024, false, false);
+        for (index, mode) in [
+            RunSandboxMode::ReadOnly,
+            RunSandboxMode::ReadWrite,
+            RunSandboxMode::ReadOnly,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let target = format!("write-{index}");
+            let mut exec = request(StdinSource::Empty);
+            exec.mode = mode;
+            exec.cwd = None;
+            exec.argv = [
+                "/bin/sh",
+                "-c",
+                "printf state > \"$XDG_DATA_HOME/probe\" && printf state > \"$HOME/probe\" && mkdir -p \"$XDG_RUNTIME_DIR/test\" && /bin/cat readable && printf written > \"$1\"",
+                "probe",
+                &target,
+            ]
+            .into_iter()
+            .map(CommandArg::from)
+            .collect();
+            let job = h.handle.exec(None, exec).await.unwrap();
+            let spawned = h.spawned.recv().await.unwrap();
+            // Run the admitted request through the production spawn checks and the
+            // kernel. A profile-only probe misses the supervisor/child role boundary.
+            let (events, mut received) = mpsc::channel(16);
+            let mut process = cowshed_core::runtime::supervisor::SystemSpawnSink
+                .spawn(spawned.request, events)
+                .await
+                .expect("spawn admitted job");
+            process.close_stdin().unwrap();
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+            let mut eof_count = 0;
+            let mut exit = None;
+            while exit.is_none() || eof_count != 2 {
+                let event = received.recv().await.expect("complete process events");
+                match &event {
+                    ProcessEvent::Output { stream, bytes, .. } => match stream {
+                        StreamKind::Stdout => stdout.extend_from_slice(bytes),
+                        StreamKind::Stderr => stderr.extend_from_slice(bytes),
+                    },
+                    ProcessEvent::OutputEof { .. } => eof_count += 1,
+                    ProcessEvent::Exited { exit: status, .. } => exit = Some(status.clone()),
+                    ProcessEvent::WaitFailed { error, .. } => panic!("wait failed: {error}"),
+                    _ => {}
+                }
+                spawned.events.send(event).await.unwrap();
+            }
+            h.handle.wait(job).await.unwrap();
+            assert_eq!(stdout, b"readable\n");
+            let writable = mode == RunSandboxMode::ReadWrite
+                && ceiling == cowshed_core::sandbox::RunSandboxMode::ReadWrite;
+            assert_eq!(
+                exit == Some(ExitStatus::Exited { code: 0 }),
+                writable,
+                "request {mode:?} under ceiling {ceiling:?}: {}",
+                String::from_utf8_lossy(&stderr)
+            );
+            assert_eq!(mount.join(target).exists(), writable);
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
 #[tokio::test]
 async fn graceful_requested_cancellation_keeps_its_actual_exit_serializable() {
     let mut h = harness(1, 1024, false, false);
