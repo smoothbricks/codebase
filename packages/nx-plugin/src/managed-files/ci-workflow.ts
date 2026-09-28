@@ -212,12 +212,16 @@ export function defineCiWorkflow(options: CiWorkflowDefinitionOptions): CiWorkfl
 }
 
 /**
- * CI's concurrency group, spelled literally rather than from `github.workflow`
- * (which a forge may fill with the file name), so the PR preview cleanup can
- * join the same group: a pull request's close then cancels its running CI and
- * the cleanup starts only after that run's stage deploy has stopped.
+ * CI's concurrency group: one per pull request, by its number, and one per ref
+ * for pushes. The PR preview cleanup joins the same group, so a pull request's
+ * close cancels its running CI and the cleanup starts only after that run's
+ * stage deploy has stopped. The number, not `github.ref`, names a pull
+ * request's group: a close that merged it carries the base branch's ref, which
+ * would put the cleanup in the base branch's own group, and a forge may spell a
+ * pull request's ref after its merge or after its head. Spelled literally
+ * rather than from `github.workflow`, which a forge may fill with the file name.
  */
-export const CI_CONCURRENCY_GROUP = 'CI-${{ github.ref }}';
+export const CI_CONCURRENCY_GROUP = 'CI-${{ github.event.pull_request.number || github.ref }}';
 
 export function renderCiWorkflowYaml(options: CiWorkflowDefinitionOptions): string {
   const steps = defineCiWorkflow(options);
@@ -248,10 +252,10 @@ ${options.deploy ? '  deployments: write\n' : ''}  statuses: write
 concurrency:
 ${
   options.deploy
-    ? `  # One in-flight run per ref. Pushes to the staging push branch queue behind a
-  # running workflow instead of canceling it, so a newer push never cancels the
-  # deploy job mid-flight. Pull requests and other branches keep canceling
-  # superseded runs.
+    ? `  # One in-flight run per pull request, and per ref for pushes. Pushes to the
+  # staging push branch queue behind a running workflow instead of canceling it,
+  # so a newer push never cancels the deploy job mid-flight. Pull requests and
+  # other branches keep canceling superseded runs.
   group: ${CI_CONCURRENCY_GROUP}
   cancel-in-progress: \${{ github.ref != ${stagingRefLiteral(options)} }}`
     : `  # This workflow validates and never deploys, so there is no in-flight

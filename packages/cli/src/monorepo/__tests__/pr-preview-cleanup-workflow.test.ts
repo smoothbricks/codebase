@@ -44,10 +44,54 @@ describe('PR preview cleanup workflow', () => {
     expect(rendered).toContain('CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}');
   });
 
-  // A close's pull_request event carries the same github.ref as the pull
-  // request's CI runs, so sharing CI's group makes the close cancel a running
-  // stage deploy and start the cleanup only after that deploy has stopped.
+  // Sharing the pull request's CI group makes the close cancel a running stage
+  // deploy and start the cleanup only after that deploy has stopped. The group
+  // is evaluated against the contexts GitHub sends, because a close's github.ref
+  // is not the pull request's: a merged close carries the base branch's ref.
   describe("in the pull request's CI concurrency group", () => {
+    /** The `github` context fields a concurrency group may read. */
+    interface GithubContext {
+      event_name: 'push' | 'pull_request';
+      ref: string;
+      event: { action?: string; pull_request?: { number: number; merged: boolean } };
+    }
+
+    /** Pull request 102 of a repository whose base branch is `private`, as GitHub documents each event. */
+    const pr102 = { number: 102, merged: false };
+    const events = {
+      prSynchronize: {
+        event_name: 'pull_request',
+        ref: 'refs/pull/102/merge',
+        event: { action: 'synchronize', pull_request: pr102 },
+      },
+      prClosedUnmerged: {
+        event_name: 'pull_request',
+        ref: 'refs/pull/102/merge',
+        event: { action: 'closed', pull_request: pr102 },
+      },
+      // "If a pull request was closed as a result of being merged, it will be the
+      // fully qualified ref of the branch it was merged into."
+      prClosedMerged: {
+        event_name: 'pull_request',
+        ref: 'refs/heads/private',
+        event: { action: 'closed', pull_request: { ...pr102, merged: true } },
+      },
+      // Forgejo spells a pull request's ref after its head, not its merge.
+      prSynchronizeOnForgejo: {
+        event_name: 'pull_request',
+        ref: 'refs/pull/102/head',
+        event: { action: 'synchronize', pull_request: pr102 },
+      },
+      otherPrSynchronize: {
+        event_name: 'pull_request',
+        ref: 'refs/pull/103/merge',
+        event: { action: 'synchronize', pull_request: { number: 103, merged: false } },
+      },
+      // The push the merge makes to the base branch, and a push to another branch.
+      pushToBase: { event_name: 'push', ref: 'refs/heads/private', event: {} },
+      pushToBranch: { event_name: 'push', ref: 'refs/heads/feature', event: {} },
+    } satisfies Record<string, GithubContext>;
+
     /** The workflow-level `concurrency:` block, up to the next top-level key. */
     function concurrencyBlock(workflow: string): string[] {
       const lines = workflow.split('\n');
@@ -57,28 +101,74 @@ describe('PR preview cleanup workflow', () => {
       return lines.slice(start + 1, end).filter((line) => line.trim() !== '' && !/^\s*#/.test(line));
     }
 
-    function groupLine(workflow: string): string | undefined {
-      return concurrencyBlock(workflow).find((line) => line.trim().startsWith('group:'));
+    /**
+     * The group `workflow` joins for `github`. Only what a group here may use is understood: text,
+     * and `${{ }}` expressions of `github.*` paths joined by `||`, which yields its first truthy
+     * operand as GitHub's does. Anything else throws, so a new expression cannot pass unevaluated.
+     */
+    function groupFor(workflow: string, github: GithubContext): string {
+      const line = concurrencyBlock(workflow).find((candidate) => candidate.trim().startsWith('group:'));
+      const template = requiredGroup(line).trim().slice('group:'.length).trim();
+      return template.replace(/\$\{\{(.*?)\}\}/g, (_, expression: string) => {
+        for (const operand of expression.split('||').map((part) => part.trim())) {
+          if (!/^github(\.[a-z_]+)+$/.test(operand)) throw new Error(`Cannot evaluate ${expression.trim()}.`);
+          const value = operand
+            .split('.')
+            .slice(1)
+            .reduce<unknown>(
+              (context, key) =>
+                typeof context === 'object' && context !== null ? Reflect.get(context, key) : undefined,
+              github,
+            );
+          if (value) return String(value);
+        }
+        return '';
+      });
     }
 
+    function requiredGroup(line: string | undefined): string {
+      if (line === undefined) throw new Error('The concurrency block has no group.');
+      return line;
+    }
+
+    const cleanup = renderPrPreviewCleanupWorkflowYaml({ runsOn: 'ubuntu-latest' });
+    const ciVariants = {
+      deploying: renderCiWorkflowYaml(deployingCi),
+      validating: renderCiWorkflowYaml({ ...deployingCi, deploy: false }),
+    };
+
     it('cancels the run it finds in progress in that group', () => {
-      expect(concurrencyBlock(renderPrPreviewCleanupWorkflowYaml())).toEqual([
-        '  group: CI-${{ github.ref }}',
-        '  cancel-in-progress: true',
-      ]);
+      expect(concurrencyBlock(cleanup)).toContain('  cancel-in-progress: true');
     });
 
-    it('with the group both CI variants render, whatever the forge calls the workflow', () => {
-      const deploying = renderCiWorkflowYaml(deployingCi);
-      const validating = renderCiWorkflowYaml({ ...deployingCi, deploy: false });
-      const cleanup = renderPrPreviewCleanupWorkflowYaml({ runsOn: 'ubuntu-latest' });
+    for (const [variant, ci] of Object.entries(ciVariants)) {
+      describe(`with ${variant} CI`, () => {
+        it('whether the close merged the pull request or not', () => {
+          const prCi = groupFor(ci, events.prSynchronize);
 
-      expect(groupLine(cleanup)).toBe('  group: CI-${{ github.ref }}');
-      expect(groupLine(deploying)).toBe(groupLine(cleanup));
-      expect(groupLine(validating)).toBe(groupLine(cleanup));
-      expect(deploying).not.toContain('github.workflow');
-      expect(validating).not.toContain('github.workflow');
-    });
+          expect(groupFor(cleanup, events.prClosedMerged)).toBe(prCi);
+          expect(groupFor(cleanup, events.prClosedUnmerged)).toBe(prCi);
+        });
+
+        it("never in the group of the base branch's own run after the merge", () => {
+          expect(groupFor(cleanup, events.prClosedMerged)).not.toBe(groupFor(ci, events.pushToBase));
+        });
+
+        it('whatever ref the forge gives the pull request', () => {
+          expect(groupFor(ci, events.prSynchronizeOnForgejo)).toBe(groupFor(cleanup, events.prClosedMerged));
+        });
+
+        it("never in another pull request's group", () => {
+          expect(groupFor(ci, events.otherPrSynchronize)).not.toBe(groupFor(cleanup, events.prClosedMerged));
+        });
+
+        it('while pushes keep one group per ref, whatever the forge calls the workflow', () => {
+          expect(groupFor(ci, events.pushToBase)).toBe('CI-refs/heads/private');
+          expect(groupFor(ci, events.pushToBranch)).toBe('CI-refs/heads/feature');
+          expect(ci).not.toContain('github.workflow');
+        });
+      });
+    }
   });
 
   describe('in a repository that installs from a private npm registry', () => {

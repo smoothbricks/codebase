@@ -546,9 +546,18 @@ a production deployment mid-flight. Pull requests and other branches keep cancel
 production jobs repeat the Cargo credential and sibling-source preflight before SetupDevenv, so their `--step` anchors
 shift with the configuration instead of staying fixed. The PR preview cleanup job runs the same preflight and carries
 the same job-level Cargo and private npm read tokens, since its SetupDevenv resolves the same declarations. It shares
-CI's concurrency group, `CI-${{ github.ref }}`: closing a pull request cancels that pull request's running CI run, so
-the cleanup starts only after its stage deploy has stopped, and a reopened pull request's CI run cancels a running
-cleanup, whose kept records let the next close finish the stage.
+the pull request's CI concurrency group, `CI-${{ github.event.pull_request.number || github.ref }}`: one group per pull
+request, by its number, and one per ref for pushes. The number names it because a close that merged the pull request
+carries the base branch's ref, not the pull request's. Closing a pull request cancels that pull request's running CI
+run, so the cleanup starts only after its stage deploy has stopped, and a reopened pull request's CI run cancels a
+running cleanup, whose kept records let the next close finish the stage.
+
+Upgrading from a smoo that named a pull request's group after its ref: a run started from the old workflow is in the old
+group, which the new cleanup neither waits for nor cancels, so a deploy still running there can recreate an item after
+the cleanup deleted it and its record. Before merging the upgrade, let every running pull-request CI run finish, or
+cancel it and see it stopped. An open pull request's runs join the new group from its next push; re-running an old run
+keeps the old workflow. For a pull request closed while an old run was still deploying, check its `*-prN` items by hand:
+its records cannot show what such a run created after the cleanup.
 
 ### Private dependency configuration (`package.json` → `smoo.github.cargoCredentials`)
 

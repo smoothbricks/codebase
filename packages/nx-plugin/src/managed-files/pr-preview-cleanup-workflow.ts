@@ -68,8 +68,9 @@ on:
 permissions:
   contents: read
 
-# CI's group: closing the pull request cancels its running CI run, so the
-# cleanup starts only after that run's stage deploy has stopped.
+# The pull request's CI group, named by its number whether the close merged it
+# or not: closing it cancels its running CI run, so the cleanup starts only
+# after that run's stage deploy has stopped.
 concurrency:
   group: ${CI_CONCURRENCY_GROUP}
   cancel-in-progress: true
