@@ -932,7 +932,7 @@ workspace; the repository is read from the root `package.json` the same way the 
 - It prints one line, such as `Cleaned pr7 of github.com/acme/app from 23 records: deleted 3 Workers, ...`, or
   `Nothing is recorded for pr7 of github.com/acme/app, so nothing was deleted. ...` when the stage has no records. Both
   exit 0, so a green cleanup job for a stage deployed by an older smoo does not mean its items are gone: the line says
-  they are still live.
+  they may still be live.
 
 Known gaps:
 
