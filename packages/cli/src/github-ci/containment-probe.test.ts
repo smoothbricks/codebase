@@ -247,7 +247,9 @@ describe('publish collect containment probe against the resolved graph', () => {
   it('collects cowshed tsc-js and macos platform trees without overlap', async () => {
     const projects = await readProjectTargets(join(import.meta.dir, '../../../..'));
     const cowshed = projects.find((project) => project.project === 'cowshed');
-    expect(cowshed?.targetOutputs?.get('build')).toBeUndefined();
+    // The inferred aggregate declares an explicit empty output list, so a
+    // cached replay of `build` can never restore bytes its children own.
+    expect(cowshed?.targetOutputs?.get('build')).toEqual([]);
     expect(cowshed?.targetOutputs?.get('tsc-js')).toEqual(['{projectRoot}/dist/ts']);
 
     const buildRuns = expandNxTargetDependencyRuns(
