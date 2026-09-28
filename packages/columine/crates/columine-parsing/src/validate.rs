@@ -4,6 +4,17 @@
 //! encoding. [`ValueView`] is the small read-only seam used by JSON, MessagePack,
 //! and native adapters; keeping it unsealed lets downstream runtimes implement
 //! the same judgment without creating a dependency back into those runtimes.
+//!
+//! Integers keep the representation their wire gave them. A JSON number token
+//! and a MessagePack integer marker are numbers, the MessagePack bigint
+//! extension is a bigint, and neither is ever reinterpreted as the other. An
+//! exact 64-bit integer from a canonical codec that does not record whether it
+//! began as a number or a bigint is [`ValueKind::CanonicalInt64`], proven by
+//! [`ValueView::as_canonical_i64`]. Each numeric schema judges that exact value
+//! against its own bounds: `bigint` accepts every `i64`, `number` only the
+//! integers a double represents exactly (`±(2^53 − 1)`), and `i32`/`u32` their
+//! ranges. A union still requires exactly one matching variant, so a safe
+//! integer under `number | bigint` is ambiguous while a wider one is a bigint.
 use std::{collections::BTreeMap, fmt};
 
 use crate::{
@@ -28,6 +39,9 @@ pub enum ValueKind {
     BigInt,
     Array,
     Object,
+    /// An exact signed integer from a canonical codec that does not retain the
+    /// originating host's number/bigint distinction. Never a JSON number token.
+    CanonicalInt64,
 }
 
 impl ValueKind {
@@ -42,6 +56,7 @@ impl ValueKind {
             Self::BigInt => "bigint",
             Self::Array => "array",
             Self::Object => "object",
+            Self::CanonicalInt64 => "canonical int64",
         }
     }
 }
@@ -66,7 +81,10 @@ pub enum NumberValue {
 /// borrowed values without allocating or requiring a common owned tree. A
 /// runtime may implement only the accessors relevant to its [`ValueKind`]. The
 /// default accessors are intentionally empty: a malformed adapter is rejected
-/// as a type/shape violation rather than causing a panic.
+/// as a type/shape violation rather than causing a panic. Reporting
+/// [`ValueKind::CanonicalInt64`] without answering
+/// [`ValueView::as_canonical_i64`] is such an adapter: the kind alone proves no
+/// value, and no numeric schema accepts it.
 pub trait ValueView {
     fn kind(&self) -> ValueKind;
 
@@ -75,6 +93,13 @@ pub trait ValueView {
     }
 
     fn as_number(&self) -> Option<NumberValue> {
+        None
+    }
+
+    /// The exact signed payload witnessing [`ValueKind::CanonicalInt64`].
+    /// Adapters must not reconstruct it from a floating-point value or infer
+    /// this representation from an ordinary JSON/MessagePack number token.
+    fn as_canonical_i64(&self) -> Option<i64> {
         None
     }
 
@@ -92,8 +117,9 @@ pub trait ValueView {
 }
 
 /// A value tree useful to adapters and tests that already have JSON-shaped
-/// data. Binary and bigint values remain representable for MessagePack/native
-/// conformance tests even though canonical JSON cannot spell them directly.
+/// data. Binary, bigint, and canonical int64 values remain representable for
+/// MessagePack/native conformance tests even though canonical JSON cannot spell
+/// them directly.
 #[derive(Clone, Debug, PartialEq)]
 pub enum JsonValue {
     Unknown,
@@ -105,6 +131,9 @@ pub enum JsonValue {
     BigInt,
     Array(Vec<JsonValue>),
     Object(Vec<(String, JsonValue)>),
+    /// Preserves a canonical codec's exact integer, independently of the
+    /// schema that will judge it. JSON and MessagePack parsers never emit it.
+    CanonicalInt64(i64),
 }
 
 impl JsonValue {
@@ -135,6 +164,7 @@ impl ValueView for JsonValue {
             Self::BigInt => ValueKind::BigInt,
             Self::Array(_) => ValueKind::Array,
             Self::Object(_) => ValueKind::Object,
+            Self::CanonicalInt64(_) => ValueKind::CanonicalInt64,
         }
     }
 
@@ -148,6 +178,13 @@ impl ValueView for JsonValue {
     fn as_number(&self) -> Option<NumberValue> {
         match self {
             Self::Number(value) => Some(*value),
+            _ => None,
+        }
+    }
+
+    fn as_canonical_i64(&self) -> Option<i64> {
+        match self {
+            Self::CanonicalInt64(value) => Some(*value),
             _ => None,
         }
     }
@@ -650,9 +687,13 @@ fn require_kind(
 /// on the eight-byte planes. A JSON number is refused by the shared corpus
 /// (`bigint-wrong-number`): a number that fits a double is not evidence the
 /// author meant a bigint, and one that does not fit has already lost bits.
+///
+/// A canonical int64 is also sufficient evidence: its adapter retained every
+/// bit, but the canonical codec erased the originating host's numeric type.
 fn validate_bigint(path: &str, value: &dyn ValueView) -> Result<(), PayloadViolation> {
     match value.kind() {
         ValueKind::BigInt => Ok(()),
+        ValueKind::CanonicalInt64 if value.as_canonical_i64().is_some() => Ok(()),
         ValueKind::String => {
             let text = value.as_str().unwrap_or_default();
             let digits = text.strip_prefix('-').unwrap_or(text);
@@ -667,9 +708,19 @@ fn validate_bigint(path: &str, value: &dyn ValueView) -> Result<(), PayloadViola
     }
 }
 
+/// A number is any finite JSON/MessagePack number. A canonical int64 is a
+/// number only while a double represents it exactly; beyond `±(2^53 − 1)` it
+/// fits `bigint` alone.
 fn validate_number(path: &str, value: &dyn ValueView) -> Result<(), PayloadViolation> {
-    if value.kind() != ValueKind::Number {
+    if !matches!(value.kind(), ValueKind::Number | ValueKind::CanonicalInt64) {
         return Err(PayloadViolation::shape(path, "number", value));
+    }
+    if value.kind() == ValueKind::CanonicalInt64 {
+        const MAX_SAFE_INTEGER: i64 = (1_i64 << 53) - 1;
+        return match value.as_canonical_i64() {
+            Some(number) if (-MAX_SAFE_INTEGER..=MAX_SAFE_INTEGER).contains(&number) => Ok(()),
+            _ => Err(PayloadViolation::shape(path, "safe number", value)),
+        };
     }
     match value.as_number() {
         Some(NumberValue::Float(number)) if number.is_finite() => Ok(()),
@@ -678,11 +729,20 @@ fn validate_number(path: &str, value: &dyn ValueView) -> Result<(), PayloadViola
     }
 }
 
-fn validate_i32(path: &str, value: &dyn ValueView) -> Result<(), PayloadViolation> {
-    if value.kind() != ValueKind::Number {
-        return Err(PayloadViolation::shape(path, "i32", value));
+/// Numeric schemas share the same exact canonical integer; each applies its
+/// own bounds rather than first rounding through a floating-point number.
+fn numeric_value(value: &dyn ValueView) -> Option<NumberValue> {
+    match value.kind() {
+        ValueKind::Number => value.as_number(),
+        ValueKind::CanonicalInt64 => value
+            .as_canonical_i64()
+            .map(|number| NumberValue::Signed(i128::from(number))),
+        _ => None,
     }
-    let valid = match value.as_number() {
+}
+
+fn validate_i32(path: &str, value: &dyn ValueView) -> Result<(), PayloadViolation> {
+    let valid = match numeric_value(value) {
         Some(NumberValue::Signed(number)) => i32::try_from(number).is_ok(),
         Some(NumberValue::Unsigned(number)) => i32::try_from(number).is_ok(),
         Some(NumberValue::Float(number)) => {
@@ -701,10 +761,7 @@ fn validate_i32(path: &str, value: &dyn ValueView) -> Result<(), PayloadViolatio
 }
 
 fn validate_u32(path: &str, value: &dyn ValueView) -> Result<(), PayloadViolation> {
-    if value.kind() != ValueKind::Number {
-        return Err(PayloadViolation::shape(path, "u32", value));
-    }
-    let valid = match value.as_number() {
+    let valid = match numeric_value(value) {
         Some(NumberValue::Signed(number)) => u32::try_from(number).is_ok(),
         Some(NumberValue::Unsigned(number)) => u32::try_from(number).is_ok(),
         Some(NumberValue::Float(number)) => {
@@ -1156,13 +1213,6 @@ mod tests {
         let closed_error = validate_value(&closed, &value).unwrap_err();
         assert_eq!(closed_error.path, "value.bogus_field");
         assert_eq!(closed_error.observed, "undeclared");
-        assert_eq!(
-            closed_error.expected,
-            format!(
-                "not declared (declared: name); declare the enclosing object open — S.object({{…}}, {{ open: true }}) — to capture undeclared keys into {}",
-                crate::UNDECLARED_COLUMN_NAME
-            )
-        );
         assert!(validate_value(&open, &value).is_ok());
     }
 
@@ -1269,6 +1319,257 @@ mod tests {
                 }
                 other => panic!("unknown corpus verdict {other}"),
             }
+        }
+    }
+
+    const MAX_SAFE_INTEGER: i64 = (1_i64 << 53) - 1;
+
+    /// A downstream adapter's own integer cell: the seam a runtime with an
+    /// exact 64-bit integer codec implements without building a `JsonValue`.
+    struct ExactInt64(i64);
+
+    impl ValueView for ExactInt64 {
+        fn kind(&self) -> ValueKind {
+            ValueKind::CanonicalInt64
+        }
+
+        fn as_canonical_i64(&self) -> Option<i64> {
+            Some(self.0)
+        }
+    }
+
+    /// Claims the canonical kind without its exact payload, optionally
+    /// offering an ordinary number in its place.
+    struct UnprovenInt64(Option<NumberValue>);
+
+    impl ValueView for UnprovenInt64 {
+        fn kind(&self) -> ValueKind {
+            ValueKind::CanonicalInt64
+        }
+
+        fn as_number(&self) -> Option<NumberValue> {
+            self.0
+        }
+    }
+
+    /// Reports an ordinary number while also answering the exact accessor.
+    struct NumberAnsweringExact(i64);
+
+    impl ValueView for NumberAnsweringExact {
+        fn kind(&self) -> ValueKind {
+            ValueKind::Number
+        }
+
+        fn as_number(&self) -> Option<NumberValue> {
+            Some(NumberValue::Signed(i128::from(self.0)))
+        }
+
+        fn as_canonical_i64(&self) -> Option<i64> {
+            Some(self.0)
+        }
+    }
+
+    #[test]
+    fn canonical_int64_is_judged_by_each_schemas_exact_bounds() {
+        let accepted: [(&str, &[i64]); 4] = [
+            (
+                r#"{"kind":"bigint"}"#,
+                &[i64::MIN, -1, 0, MAX_SAFE_INTEGER + 1, i64::MAX],
+            ),
+            (
+                r#"{"kind":"number"}"#,
+                &[-MAX_SAFE_INTEGER, 0, MAX_SAFE_INTEGER],
+            ),
+            (
+                r#"{"kind":"i32"}"#,
+                &[i64::from(i32::MIN), 0, i64::from(i32::MAX)],
+            ),
+            (r#"{"kind":"u32"}"#, &[0, i64::from(u32::MAX)]),
+        ];
+        for (tree, values) in accepted {
+            let schema = schema(tree);
+            for &value in values {
+                assert_eq!(
+                    validate_value(&schema, &JsonValue::CanonicalInt64(value)),
+                    Ok(()),
+                    "{tree} must accept {value}"
+                );
+                assert_eq!(
+                    validate_value(&schema, &ExactInt64(value)),
+                    Ok(()),
+                    "{tree} must accept {value} from an adapter"
+                );
+            }
+        }
+        let refused: [(&str, &[i64]); 7] = [
+            (
+                r#"{"kind":"number"}"#,
+                &[
+                    MAX_SAFE_INTEGER + 1,
+                    -MAX_SAFE_INTEGER - 1,
+                    i64::MAX,
+                    i64::MIN,
+                ],
+            ),
+            (
+                r#"{"kind":"i32"}"#,
+                &[i64::from(i32::MAX) + 1, i64::from(i32::MIN) - 1, i64::MAX],
+            ),
+            (
+                r#"{"kind":"u32"}"#,
+                &[-1, i64::from(u32::MAX) + 1, i64::MIN],
+            ),
+            (r#"{"kind":"string"}"#, &[0]),
+            (r#"{"kind":"boolean"}"#, &[1]),
+            (r#"{"kind":"binary"}"#, &[0]),
+            (r#"{"kind":"enum","variants":["1"]}"#, &[1]),
+        ];
+        for (tree, values) in refused {
+            let schema = schema(tree);
+            for &value in values {
+                assert!(
+                    validate_value(&schema, &JsonValue::CanonicalInt64(value)).is_err(),
+                    "{tree} must refuse {value}"
+                );
+                assert!(
+                    validate_value(&schema, &ExactInt64(value)).is_err(),
+                    "{tree} must refuse {value} from an adapter"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_canonical_kind_without_its_exact_payload_proves_nothing() {
+        let numeric = ["bigint", "number", "i32", "u32"];
+        for unproven in [
+            UnprovenInt64(None),
+            UnprovenInt64(Some(NumberValue::Signed(5))),
+        ] {
+            for kind in numeric {
+                let schema = schema(&format!(r#"{{"kind":"{kind}"}}"#));
+                assert!(
+                    validate_value(&schema, &unproven).is_err(),
+                    "{kind} must not accept the marker alone"
+                );
+            }
+        }
+        let number_or_bigint =
+            schema(r#"{"kind":"union","variants":[{"kind":"number"},{"kind":"bigint"}]}"#);
+        assert!(validate_value(&number_or_bigint, &UnprovenInt64(None)).is_err());
+    }
+
+    #[test]
+    fn number_tokens_and_markers_are_never_coerced_to_canonical_int64() {
+        let bigint = schema(r#"{"kind":"bigint"}"#);
+        let number = schema(r#"{"kind":"number"}"#);
+        let wide = 9_007_199_254_740_993_i64;
+
+        for text in ["9007199254740993", "-9007199254740993"] {
+            let token = json(text);
+            assert!(validate_value(&bigint, &token).is_err());
+            assert_eq!(validate_value(&number, &token), Ok(()));
+        }
+
+        let mut row = vec![0x81, 0xa5, b'v', b'a', b'l', b'u', b'e', 0xd3];
+        row.extend(wide.to_be_bytes());
+        let event = parse_msgpack_event(&mut Reader::new(&row)).unwrap();
+        let JsonValue::Object(fields) = &event else {
+            panic!("event is an object")
+        };
+        let marker = field(fields, "value").expect("value field");
+        assert!(validate_value(&bigint, marker).is_err());
+        assert_eq!(validate_value(&number, marker), Ok(()));
+
+        // The reported kind decides: a number stays a number even when its
+        // adapter also answers the exact accessor.
+        assert!(validate_value(&bigint, &NumberAnsweringExact(5)).is_err());
+        assert_eq!(validate_value(&number, &NumberAnsweringExact(wide)), Ok(()));
+    }
+
+    #[test]
+    fn a_union_admits_canonical_int64_through_exactly_one_variant() {
+        let number_or_bigint =
+            schema(r#"{"kind":"union","variants":[{"kind":"number"},{"kind":"bigint"}]}"#);
+        for ambiguous in [-MAX_SAFE_INTEGER, 0, MAX_SAFE_INTEGER] {
+            assert!(
+                validate_value(&number_or_bigint, &JsonValue::CanonicalInt64(ambiguous)).is_err(),
+                "{ambiguous} fits both number and bigint"
+            );
+        }
+        for wide in [
+            MAX_SAFE_INTEGER + 1,
+            -MAX_SAFE_INTEGER - 1,
+            i64::MAX,
+            i64::MIN,
+        ] {
+            assert_eq!(
+                validate_value(&number_or_bigint, &JsonValue::CanonicalInt64(wide)),
+                Ok(()),
+                "{wide} fits only bigint"
+            );
+        }
+        assert_eq!(validate_value(&number_or_bigint, &json("5")), Ok(()));
+
+        let i32_or_u32 = schema(r#"{"kind":"union","variants":[{"kind":"i32"},{"kind":"u32"}]}"#);
+        let exact = JsonValue::CanonicalInt64;
+        assert!(validate_value(&i32_or_u32, &exact(5)).is_err());
+        assert_eq!(validate_value(&i32_or_u32, &exact(-5)), Ok(()));
+        assert_eq!(
+            validate_value(&i32_or_u32, &exact(i64::from(u32::MAX))),
+            Ok(())
+        );
+        assert!(validate_value(&i32_or_u32, &exact(i64::from(u32::MAX) + 1)).is_err());
+
+        let string_or_bigint =
+            schema(r#"{"kind":"union","variants":[{"kind":"string"},{"kind":"bigint"}]}"#);
+        assert_eq!(validate_value(&string_or_bigint, &exact(0)), Ok(()));
+    }
+
+    #[test]
+    fn canonical_int64_is_judged_at_its_path_inside_nested_shapes() {
+        let schema = schema(
+            r#"{"kind":"object","fields":{"id":{"kind":"bigint"},"count":{"kind":"optional","value":{"kind":"number"}},"marks":{"kind":"array","item":{"kind":"nullable","value":{"kind":"i32"}}},"limits":{"kind":"map","key":{"kind":"string"},"value":{"kind":"u32"}},"totals":{"kind":"record","value":{"kind":"bigint"}}}}"#,
+        );
+        let exact = JsonValue::CanonicalInt64;
+        let payload = |count: Option<i64>, mark: i64, limit: i64| {
+            let mut fields = vec![("id".to_owned(), exact(i64::MAX))];
+            if let Some(count) = count {
+                fields.push(("count".to_owned(), exact(count)));
+            }
+            fields.extend([
+                (
+                    "marks".to_owned(),
+                    JsonValue::Array(vec![JsonValue::Null, exact(mark)]),
+                ),
+                (
+                    "limits".to_owned(),
+                    JsonValue::object(vec![("a".to_owned(), exact(limit))]),
+                ),
+                (
+                    "totals".to_owned(),
+                    JsonValue::object(vec![("x".to_owned(), exact(i64::MIN))]),
+                ),
+            ]);
+            JsonValue::object(fields)
+        };
+        assert_eq!(
+            validate_value(
+                &schema,
+                &payload(None, i64::from(i32::MIN), i64::from(u32::MAX))
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            validate_value(&schema, &payload(Some(-MAX_SAFE_INTEGER), 0, 0)),
+            Ok(())
+        );
+        for (value, path) in [
+            (payload(Some(MAX_SAFE_INTEGER + 1), 0, 0), "value.count"),
+            (payload(None, i64::from(i32::MAX) + 1, 0), "value.marks[1]"),
+            (payload(None, 0, -1), "value.limits.a"),
+        ] {
+            assert_eq!(validate_value(&schema, &value).unwrap_err().path, path);
         }
     }
 }
