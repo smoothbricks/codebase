@@ -934,8 +934,10 @@ workspace; the repository is read from the root `package.json` the same way the 
   smoo deployed has none either, and neither does one deployed while the root `package.json` named another repository,
   such as before a rename: cleanup reads only the records of the repository that file names now (see renaming the
   repository in `smoo wrangler deploy-stage` above). Cleanup cannot tell these cases apart, so the line claims none of
-  them. Both lines exit 0, so a green cleanup job does not mean the stage's items are gone: the line says they may still
-  be live and have to be checked for by hand.
+  them. Both lines exit 0, so a green cleanup job that printed `Nothing is recorded` does not mean the stage's items are
+  gone: that line says they may still be live and have to be checked for by hand. A `Cleaned` line covers only what the
+  records name, which for a stage deployed across the upgrade can miss items (see
+  [Upgrading to a smoo that records stages](#upgrading-to-a-smoo-that-records-stages)).
 
 Known gaps:
 
