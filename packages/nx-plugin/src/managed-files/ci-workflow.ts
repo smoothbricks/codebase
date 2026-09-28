@@ -259,9 +259,10 @@ ${
   group: ${CI_CONCURRENCY_GROUP}
   cancel-in-progress: \${{ github.ref != ${stagingRefLiteral(options)} }}`
     : `  # This workflow validates and never deploys, so there is no in-flight
-  # deployment for a newer push to protect: every ref cancels its superseded
-  # runs. Queuing them instead serializes the staging branch, and a burst of
-  # pushes then reports the newest commit one full run per queued push late.
+  # deployment for a newer push to protect: every pull request, and every ref
+  # for pushes, cancels its superseded runs. Queuing them instead serializes
+  # the staging branch, and a burst of pushes then reports the newest commit
+  # one full run per queued push late.
   group: ${CI_CONCURRENCY_GROUP}
   cancel-in-progress: true`
 }
