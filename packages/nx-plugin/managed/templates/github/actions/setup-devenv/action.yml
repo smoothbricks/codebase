@@ -73,19 +73,26 @@ runs:
     # and that DB lives in workspace-data. Since CI and Publish sit in
     # different concurrency groups they run simultaneously on one host, so a
     # repository-wide tree let one workflow rewrite the other's graph state
-    # mid-read. CI concurrency is per workflow/ref, not workflow alone:
-    # separate PRs and jobs must never share mutable graph or eval state.
+    # mid-read. Per workflow alone is not enough either: CI's concurrency
+    # group is per pull request (by number), or per ref for pushes, so
+    # separate PRs and jobs run at once and must never share mutable graph
+    # or eval state. The scope hashes that same identity, not github.ref: a
+    # merged close carries the base branch's ref, so two pull requests'
+    # cleanups merged a minute apart would share one scope while running in
+    # different concurrency groups.
     # Hash the exact identity (not a lossy path slug); keep cache artifacts
-    # and their metadata DB together, warm across runs of the same ref/job.
+    # and their metadata DB together, warm across runs of the same pull
+    # request or ref and job.
     - name: 📂 Locate the Nx cache on the shared bind
       if: steps.runner-kind.outputs.host == 'true'
       shell: bash
       env:
         NX_CACHE_REPO: ${{ github.repository }}
         NX_CACHE_LANE: ${{ github.workflow }}
+        SCOPE_REF: ${{ github.event.pull_request.number || github.ref }}
       run: |
         lane=$(printf '%s' "$NX_CACHE_LANE" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9._-' '-')
-        scope=$(printf '%s\0%s\0%s\0%s\0%s' "$GITHUB_WORKFLOW" "$GITHUB_REF" "$GITHUB_JOB" "$RUNNER_OS" "$RUNNER_ARCH" | git hash-object --stdin)
+        scope=$(printf '%s\0%s\0%s\0%s\0%s' "$GITHUB_WORKFLOW" "$SCOPE_REF" "$GITHUB_JOB" "$RUNNER_OS" "$RUNNER_ARCH" | git hash-object --stdin)
         NX_CACHE_ROOT="/var/cache/ci/nx/$NX_CACHE_REPO/${lane:-default}/$scope"
         mkdir -p "$NX_CACHE_ROOT/cache" "$NX_CACHE_ROOT/workspace-data"
         {
@@ -102,8 +109,12 @@ runs:
     # .devenv (eval SQLite, gc roots, profile) and .direnv survive the job, so
     # the next job on this host evaluates nothing and downloads nothing. The
     # Actions cache segment below is the ephemeral runners' substitute for this.
-    # Scoped per workflow/ref/job/platform like Nx: separate PR runs and
-    # jobs can overlap, and one eval-cache.db must have only one writer.
+    # Scoped per workflow, pull request (by number) or ref for pushes, job and
+    # platform, like Nx: separate PR runs and jobs can overlap, and one
+    # eval-cache.db must have only one writer. Not per github.ref: a merged
+    # close carries the base branch's ref, so two pull requests' cleanups
+    # would share this state and the second's bind mount below would shadow
+    # the first's workspace.
     #
     # The eval cache keys on canonical absolute paths, and act's host executor
     # checks out under <cache>/<random 8 chars>/hostexecutor - a new path every
@@ -124,9 +135,10 @@ runs:
         DEVENV_STATE_REPO: ${{ github.repository }}
         DEVENV_STATE_LANE: ${{ github.workflow }}
         DEVENV_STATE_JOB: ${{ github.job }}
+        SCOPE_REF: ${{ github.event.pull_request.number || github.ref }}
       run: |
         lane=$(printf '%s' "$DEVENV_STATE_LANE" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9._-' '-')
-        scope=$(printf '%s\0%s\0%s\0%s\0%s' "$GITHUB_WORKFLOW" "$GITHUB_REF" "$GITHUB_JOB" "$RUNNER_OS" "$RUNNER_ARCH" | git hash-object --stdin)
+        scope=$(printf '%s\0%s\0%s\0%s\0%s' "$GITHUB_WORKFLOW" "$SCOPE_REF" "$GITHUB_JOB" "$RUNNER_OS" "$RUNNER_ARCH" | git hash-object --stdin)
         root="/var/cache/ci/devenv/$DEVENV_STATE_REPO/${lane:-default}/$DEVENV_STATE_JOB/$scope"
         mkdir -p "$root/.devenv" "$root/.direnv"
         rm -rf tooling/direnv/.devenv tooling/direnv/.direnv
