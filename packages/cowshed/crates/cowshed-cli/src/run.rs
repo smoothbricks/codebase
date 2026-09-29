@@ -9,6 +9,8 @@
 use std::ffi::{OsStr, OsString};
 use std::io;
 
+use tokio::signal::unix::{Signal, SignalKind, signal};
+
 use cowshed_core::CowshedError;
 use cowshed_gateway::{GATEWAY_GIT_FETCH_HELPER_ARG, run_gateway_git_fetch_helper};
 
@@ -17,53 +19,80 @@ use crate::{
     setup_service, skill,
 };
 
+/// How one invocation ends.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Ending {
+    /// The command ran to its end. Jobs it backgrounded outlive the process by design.
+    Finished(i32),
+    /// A signal cut the command short. Nothing will observe or cancel the jobs it started once
+    /// this process is gone, so the process must end them before it exits.
+    Interrupted { signal: i32 },
+}
+
+impl Ending {
+    pub fn exit_code(self) -> i32 {
+        match self {
+            Self::Finished(code) => code,
+            Self::Interrupted { signal } => 128 + signal,
+        }
+    }
+}
+
 /// Run one CLI invocation. `arguments` excludes argv[0].
 ///
-/// Returns the process exit code; it never exits the process itself, because an
-/// in-process host (the addon) must be allowed to flush and unwind normally.
-pub async fn run(arguments: Vec<OsString>) -> i32 {
+/// Returns how the invocation ended; it never exits the process itself, because only the caller
+/// owns the async runtime whose shutdown an interrupted command needs.
+pub async fn run(arguments: Vec<OsString>) -> Ending {
     if arguments
         .first()
         .is_some_and(|argument| argument == OsStr::new(GATEWAY_GIT_FETCH_HELPER_ARG))
     {
         if arguments.len() != 1 {
             eprintln!("cowshed: the internal gateway git helper accepts no arguments");
-            return 2;
+            return Ending::Finished(2);
         }
-        return match run_gateway_git_fetch_helper() {
+        return Ending::Finished(match run_gateway_git_fetch_helper() {
             Ok(()) => 0,
             Err(error) => {
                 eprintln!("cowshed: gateway git helper failed: {error}");
                 1
             }
-        };
+        });
     }
     match parse_then_invoke_service(&arguments, run_parsed).await {
-        Ok(exit_code) => exit_code,
+        Ok(ending) => ending,
         Err(error) => {
             let command_map = error.command_map();
             // Only a refused line needs the argv walked: an accepted one answers from
             // `parsed.global`, so scanning it up front was three passes nothing read.
             let globals = args::globals_before_child_argv(&arguments);
             let error = CowshedError::usage(error.message, error.hint);
-            emit_error(error, command_map, globals.json, globals.quiet)
+            Ending::Finished(emit_error(error, command_map, globals.json, globals.quiet))
         }
     }
 }
 
-async fn parse_then_invoke_service<F, Fut>(
+async fn parse_then_invoke_service<F, Fut, T>(
     arguments: &[OsString],
     invoke: F,
-) -> Result<i32, args::UsageError>
+) -> Result<T, args::UsageError>
 where
     F: FnOnce(args::Cli) -> Fut,
-    Fut: Future<Output = i32>,
+    Fut: Future<Output = T>,
 {
     let parsed = args::parse_args(arguments)?;
     Ok(invoke(parsed).await)
 }
 
-async fn run_parsed(parsed: args::Cli) -> i32 {
+async fn run_parsed(parsed: args::Cli) -> Ending {
+    Ending::Finished(match run_command(parsed).await {
+        Ok(code) => code,
+        Err(signal) => return Ending::Interrupted { signal },
+    })
+}
+
+/// Runs one parsed command to its exit code, or answers the signal that interrupted it.
+async fn run_command(parsed: args::Cli) -> Result<i32, i32> {
     let json = parsed.global.json;
     let stdout = io::stdout();
     let stderr = io::stderr();
@@ -75,32 +104,32 @@ async fn run_parsed(parsed: args::Cli) -> i32 {
             Some(spec) => spec.page(),
             None => help::overview(),
         };
-        return match output.bare(page.as_bytes()) {
+        return Ok(match output.bare(page.as_bytes()) {
             Ok(()) => 0,
             Err(write_error) => {
                 eprintln!("cowshed: failed to write command result: {write_error}");
                 1
             }
-        };
+        });
     }
 
     if matches!(parsed.command, args::Command::Version) {
         let version = format!("cowshed {}\n", args::package_version());
-        return match output.bare(version.as_bytes()) {
+        return Ok(match output.bare(version.as_bytes()) {
             Ok(()) => 0,
             Err(write_error) => {
                 eprintln!("cowshed: failed to write command result: {write_error}");
                 1
             }
-        };
+        });
     }
     if let args::Command::Skill(skill_args) = &parsed.command {
         let outcome = skill::dispatch(skill_args, &parsed.global, &mut output);
-        return finish(outcome, &mut output, json);
+        return Ok(finish(outcome, &mut output, json));
     }
     if let args::Command::Gateway(action) = &parsed.command {
         let outcome = gateway_service::dispatch(*action, parsed.global.json, &mut output).await;
-        return finish(outcome, &mut output, json);
+        return Ok(finish(outcome, &mut output, json));
     }
     // Enrolment is a host operation with a project subject: it needs the repository identity a
     // credential record binds to, and nothing else the project bridge provides.
@@ -111,28 +140,91 @@ async fn run_parsed(parsed: args::Cli) -> i32 {
             }
             Err(error) => Err(error),
         };
-        return finish(outcome, &mut output, json);
+        return Ok(finish(outcome, &mut output, json));
     }
     if let args::Command::Sccache(action) = &parsed.command {
         let outcome =
             sccache_service::dispatch(action.clone(), parsed.global.json, &mut output).await;
-        return finish(outcome, &mut output, json);
+        return Ok(finish(outcome, &mut output, json));
     }
     // `setup` has no project and no workspace: its subject is the host, so it dispatches here
     // beside the other host services rather than through the project runtime bridge.
     if let args::Command::Setup(setup_args) = &parsed.command {
         let outcome =
             setup_service::dispatch_native(setup_args, parsed.global.json, &mut output).await;
-        return finish(outcome, &mut output, json);
+        return Ok(finish(outcome, &mut output, json));
     }
-    let outcome = match runtime_dispatch(&parsed.command) {
-        RuntimeDispatch::Host => runtime::run_host_command(parsed, &mut output).await,
-        RuntimeDispatch::Project => {
-            runtime::run_bridge_command(parsed, tokio::io::stdin(), &mut output).await
+    // Project and host commands run the controller in this process, and its workspace supervisors
+    // run jobs as children in their own process groups, out of reach of the terminal's signals.
+    // The long-running services above own their signals, so only this section is interruptible.
+    let mut interrupts = Interrupts::install();
+    let outcome = {
+        let command = async {
+            match runtime_dispatch(&parsed.command) {
+                RuntimeDispatch::Host => runtime::run_host_command(parsed, &mut output).await,
+                RuntimeDispatch::Project => {
+                    runtime::run_bridge_command(parsed, tokio::io::stdin(), &mut output).await
+                }
+            }
+            .map(|exit| exit.code)
+        };
+        tokio::select! {
+            outcome = command => outcome,
+            signal = interrupts.received() => return Err(signal),
+        }
+    };
+    Ok(finish(outcome, &mut output, json))
+}
+
+/// The signals that end an interactive command early: Ctrl-C, a closed terminal, a polite kill.
+enum Interrupts {
+    Watched {
+        interrupt: Signal,
+        hangup: Signal,
+        terminate: Signal,
+    },
+    /// Installing a handler failed; the command still runs, and says what an interrupt now costs.
+    Unwatched,
+}
+
+impl Interrupts {
+    fn install() -> Self {
+        match Self::watch() {
+            Ok(watched) => watched,
+            Err(error) => {
+                eprintln!(
+                    "cowshed: cannot watch for interrupts ({error}); interrupting this command \
+                     will leave the jobs it started running"
+                );
+                Self::Unwatched
+            }
         }
     }
-    .map(|exit| exit.code);
-    finish(outcome, &mut output, json)
+
+    fn watch() -> io::Result<Self> {
+        Ok(Self::Watched {
+            interrupt: signal(SignalKind::interrupt())?,
+            hangup: signal(SignalKind::hangup())?,
+            terminate: signal(SignalKind::terminate())?,
+        })
+    }
+
+    /// The number of the first watched signal to arrive; never resolves when unwatched.
+    async fn received(&mut self) -> i32 {
+        match self {
+            Self::Watched {
+                interrupt,
+                hangup,
+                terminate,
+            } => tokio::select! {
+                Some(()) = interrupt.recv() => libc::SIGINT,
+                Some(()) = hangup.recv() => libc::SIGHUP,
+                Some(()) = terminate.recv() => libc::SIGTERM,
+                else => std::future::pending().await,
+            },
+            Self::Unwatched => std::future::pending().await,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
