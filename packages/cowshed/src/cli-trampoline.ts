@@ -40,11 +40,12 @@ export function packageRootFromModule(moduleUrl: string): string {
   return resolve(moduleDirectory, '..');
 }
 
-// Exactly the daemon-control verbs, deliberately narrower than the host-management set (gateway,
-// sccache, skill, setup): only launchd-managed daemons make the installed copy authoritative, and
-// `setup` must run the invoking binary because it is what WRITES the stable install — routing it
-// through a stale install would have the old binary reinstall itself.
-const SERVICE_VERBS: Record<string, true> = { gateway: true, sccache: true };
+// Exactly the daemon-control verbs that run from the installed copy, deliberately narrower than
+// the host-management set (gateway, sccache, skill, setup). `setup` and `gateway` must run the
+// invoking binary: `setup` WRITES the stable install, and `gateway start`/`status` compare the
+// daemon's executable with the one asking. Run from the installed copy, a stale gateway compared
+// with itself, looked current, and was never replaced.
+const SERVICE_VERBS: Record<string, true> = { sccache: true };
 
 function isServiceVerb(argv: readonly string[] | undefined): boolean {
   // The verb is the first non-flag token: `--json gateway status` routes like `gateway status`.
@@ -60,11 +61,10 @@ export function resolveCliBackend(options: CliResolutionOptions): CliBackend {
   const searched: string[] = [];
 
   if (isServiceVerb(options.argv)) {
-    // launchd keeps running the installed copy, so for daemon verbs it is authoritative even when
-    // stale; gateway start refreshes its bytes from whichever allowed binary invoked it. A missing
-    // install falls through so the first-ever start can bootstrap from the invoking binary — the
-    // Rust side refuses a workspace copy with exit 5 and the install path, never installing a
-    // dangling agent.
+    // launchd keeps running the installed copy, so for these verbs it is authoritative even when
+    // stale. A missing install falls through so the first-ever start can bootstrap from the
+    // invoking binary — the Rust side refuses a workspace copy with exit 5 and the install path,
+    // never installing a dangling agent.
     const stableBinary = hostStableCowshedBinary(options.home ?? homedir());
     searched.push(stableBinary);
     if (fileExists(stableBinary)) {

@@ -172,27 +172,37 @@ describe('cowshed CLI trampoline', () => {
     ).rejects.toMatchObject({ code: 'ENOENT' });
   });
 
-  it('routes daemon verbs through the host-stable install ahead of packaged binaries', async () => {
+  it('runs gateway verbs from the invoking build, so it can see and replace a stale daemon', async () => {
     const root = await fixtureRoot();
     const packaged = join(root, 'dist', 'bin', 'darwin-arm64', 'cowshed');
     const stable = hostStableCowshedBinary(join(root, 'home'));
     await Promise.all([fixtureFile(packaged), fixtureFile(stable)]);
     const spawns: Array<{ executable: string; argv: readonly string[] }> = [];
 
-    const exitCode = await runCli(['gateway', 'status'], {
-      packageRoot: root,
-      workspaceRoot: root,
-      platform: 'darwin',
-      arch: 'arm64',
-      home: join(root, 'home'),
-      async spawnBinary(executable, argv) {
-        spawns.push({ executable, argv });
-        return 0;
-      },
-    });
+    for (const argv of [
+      ['gateway', 'status'],
+      ['gateway', 'start'],
+    ]) {
+      const exitCode = await runCli(argv, {
+        packageRoot: root,
+        workspaceRoot: root,
+        platform: 'darwin',
+        arch: 'arm64',
+        home: join(root, 'home'),
+        async spawnBinary(executable, spawnedArgv) {
+          spawns.push({ executable, argv: spawnedArgv });
+          return 0;
+        },
+      });
+      expect(exitCode).toBe(0);
+    }
 
-    expect(exitCode).toBe(0);
-    expect(spawns).toEqual([{ executable: stable, argv: ['gateway', 'status'] }]);
+    // Run from the installed copy, `gateway start` compared that copy with itself and never
+    // replaced it, and `status` could not tell a daemon left on an older build from this one.
+    expect(spawns).toEqual([
+      { executable: packaged, argv: ['gateway', 'status'] },
+      { executable: packaged, argv: ['gateway', 'start'] },
+    ]);
   });
 
   it('detects daemon verbs after leading flags', async () => {
