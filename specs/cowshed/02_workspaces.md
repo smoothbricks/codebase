@@ -140,15 +140,21 @@ Adopting is reversible, and reverses the same way: `cowshed rm main --restore` d
 The restore refuses (exit 4) when main's head is contained by neither the retained checkout's head nor a remote ref:
 commits made in main after adoption would be lost with its image. `--restore --abandon` authorizes exactly that loss and
 keeps it recoverable: before anything moves, main's history beyond the retained head (all of it when that head is not an
-ancestor) is written to `<root>.pre-cowshed/.git/cowshed/abandoned-main-<tip>.bundle`, verified, and reported as
-abandoned work; the swap carries it to `<root>/.git/cowshed/`. `--abandon` on main without `--restore` is a usage error.
+ancestor) is written to `abandoned-main-<tip>.bundle` in a `cowshed/` directory of the retained checkout's Git directory
+(`<root>.pre-cowshed/.git/cowshed/` for an ordinary checkout, which the swap carries to `<root>/.git/cowshed/`),
+verified, and reported as abandoned work against the retained checkout's branch. `--abandon` on main without `--restore`
+is a usage error.
 
 Unbinding is last. Removing main first records the checkout path in the project store (`checkout-root.json`), because
 main's images — the only other record naming it — are retired and then reclaimed. A restore interrupted after retiring
 main is finished by the same command from the checkout: the project root lookup matches that record when no main image
-exists, which is what reaches a checkout with no remote. Unbinding removes terminal storage, the controller's own state
-and the mount tree, then the binding, then the checkout record, so a process that dies at any point leaves either a
-bound project that command reopens or none.
+exists, which is what reaches a checkout with no remote. The finishing run reports no abandoned work; the bundle the
+interrupted run wrote stays where it was reported. Unbinding removes terminal storage, the controller's own state and
+the mount tree, then the binding, then the checkout record, so a process that dies at any point leaves either a bound
+project that command reopens or none. The binding's absence is the completion: a run that finds the project already
+unbound — its own open-time recovery may have finished the pending restore — succeeds without writing anything. A death
+between the last two removals leaves an unbound store directory holding only `checkout-root.json`; nothing bound reads
+it, and a later adoption's main image outranks it.
 
 ## `cowshed mv` — rename a workspace or move the checkout
 

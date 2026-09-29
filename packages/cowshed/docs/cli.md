@@ -480,18 +480,21 @@ Plain `cowshed rm main` throws the warm main image away instead, and needs `--fo
 
 A restore refuses (exit 4) when main's head is in neither the retained checkout nor a remote ref, because restoring
 would drop commits made in main after adoption. `cowshed rm main --restore --abandon` restores anyway, and first bundles
-main's history beyond the retained head into the restored checkout's `.git/cowshed/abandoned-main-<tip>.bundle`.
-`--abandon` on main needs `--restore`. Recover from the restored checkout:
+main's history beyond the retained head into the restored checkout's Git directory —
+`.git/cowshed/abandoned-main-<tip>.bundle` for an ordinary checkout; the report names the path. `--abandon` on main
+needs `--restore`. Recover from the restored checkout:
 
 ```sh
 git fetch .git/cowshed/abandoned-main-<tip>.bundle HEAD:refs/heads/recovered-main
 ```
 
 A restore interrupted after main was retired is finished by running the same command again from the checkout. A checkout
-with no remote is still found then: removing main records the checkout's path in the project store first.
+with no remote is still found then: removing main records the checkout's path in the project store first. The finishing
+run reports no abandoned work; the bundle the interrupted run reported stays where it said.
 
 Nothing on stdout — `rm` has no answer to give. With `--json`, the result is `{}`, or
-`{"abandoned":{"head":…,"targetBranch":"main","targetHead":…,"unlandedCommits":9,"bundle":…}}` after an abandonment.
+`{"abandoned":{"head":…,"targetBranch":"main","targetHead":…,"unlandedCommits":9,"bundle":…}}` after an abandonment. For
+main, `targetBranch` is the retained checkout's branch (`HEAD` when it is detached).
 
 ## Daily work
 
@@ -557,6 +560,11 @@ Long commands auto-background at the soft timeout (default 120 s; `--timeout <du
 immediately) and keep running under the workspace supervisor. `cowshed exec` accepts `--session <name>` for a persistent
 named shell whose cwd, variables, and jobs survive across calls. There is no `cowshed job` verb; reattach with
 `cowshed exec --session` or print the numeric job id from `--background`.
+
+Interrupting `cowshed` itself — Ctrl-C, a closed terminal, SIGTERM — while it still runs a command ends that command and
+every job it started and still runs: SIGTERM, then SIGKILL after a short grace. `cowshed` then dies by the same signal,
+so a loop around it stops too. A job that already went to the background when the invocation returned is untouched, and
+a signal the process inherited as ignored (`nohup`, a background job of a script) stays ignored.
 
 Every job has separate stdout/stderr `StreamInfo { storage, bytes, sha256, summary }` handles. `storage` is
 `Captured { artifact }` or `Redirect { source, artifact }`; `artifact` is `Inline { data: BinaryData }` or
