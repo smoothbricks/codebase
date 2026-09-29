@@ -137,6 +137,19 @@ Adopting is reversible, and reverses the same way: `cowshed rm main --restore` d
 `<root>.pre-cowshed` tree back against whatever publication left at the checkout path — the emptied mountpoint directory
 — and removes the displaced artifact. The checkout path is never absent during the restore either.
 
+The restore refuses (exit 4) when main's head is contained by neither the retained checkout's head nor a remote ref:
+commits made in main after adoption would be lost with its image. `--restore --abandon` authorizes exactly that loss and
+keeps it recoverable: before anything moves, main's history beyond the retained head (all of it when that head is not an
+ancestor) is written to `<root>.pre-cowshed/.git/cowshed/abandoned-main-<tip>.bundle`, verified, and reported as
+abandoned work; the swap carries it to `<root>/.git/cowshed/`. `--abandon` on main without `--restore` is a usage error.
+
+Unbinding is last. Removing main first records the checkout path in the project store (`checkout-root.json`), because
+main's images — the only other record naming it — are retired and then reclaimed. A restore interrupted after retiring
+main is finished by the same command from the checkout: the project root lookup matches that record when no main image
+exists, which is what reaches a checkout with no remote. Unbinding removes terminal storage, the controller's own state
+and the mount tree, then the binding, then the checkout record, so a process that dies at any point leaves either a
+bound project that command reopens or none.
+
 ## `cowshed mv` — rename a workspace or move the checkout
 
 Renaming is a lifecycle operation, not a filesystem accident, for the same reason `rm` is: it has to own the unmount

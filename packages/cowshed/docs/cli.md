@@ -478,6 +478,18 @@ git fetch <bundle> HEAD:refs/heads/recovered-raven
 `cowshed rm main --restore` is the reverse of `adopt`: it puts the pre-adoption checkout back and unbinds the project.
 Plain `cowshed rm main` throws the warm main image away instead, and needs `--force`.
 
+A restore refuses (exit 4) when main's head is in neither the retained checkout nor a remote ref, because restoring
+would drop commits made in main after adoption. `cowshed rm main --restore --abandon` restores anyway, and first bundles
+main's history beyond the retained head into the restored checkout's `.git/cowshed/abandoned-main-<tip>.bundle`.
+`--abandon` on main needs `--restore`. Recover from the restored checkout:
+
+```sh
+git fetch .git/cowshed/abandoned-main-<tip>.bundle HEAD:refs/heads/recovered-main
+```
+
+A restore interrupted after main was retired is finished by running the same command again from the checkout. A checkout
+with no remote is still found then: removing main records the checkout's path in the project store first.
+
 Nothing on stdout — `rm` has no answer to give. With `--json`, the result is `{}`, or
 `{"abandoned":{"head":…,"targetBranch":"main","targetHead":…,"unlandedCommits":9,"bundle":…}}` after an abandonment.
 
