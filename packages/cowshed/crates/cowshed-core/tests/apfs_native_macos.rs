@@ -57,22 +57,57 @@ fn device_info_plist(device: &str, volume_name: &str) -> Vec<u8> {
     .into_bytes()
 }
 
-fn successful_output(request: &CommandRequest) -> CommandOutput {
-    let args: Vec<_> = request
-        .args
-        .iter()
-        .map(|argument| argument.to_string_lossy())
-        .collect();
-    let stdout = if request.program == Path::new("/usr/bin/hdiutil") && args == ["info", "-plist"] {
-        EMPTY_ATTACHMENT_INVENTORY.as_bytes().to_vec()
-    } else if args.first().is_some_and(|argument| argument == "attach") {
-        ATTACH_PLIST.as_bytes().to_vec()
-    } else if args.starts_with(&["apfs".into(), "list".into()]) {
-        APFS_LIST_PLIST.as_bytes().to_vec()
-    } else {
-        Vec::new()
-    };
-    CommandOutput::success(stdout)
+/// What `hdiutil info -plist` reports in these fixtures: every image the fake attached and has
+/// not detached, holding the fixture's devices. Every device detach re-reads it first to prove
+/// the device still belongs to that image, so the fake must remember what it attached.
+#[derive(Clone, Default)]
+struct FakeInventory(Arc<Mutex<Vec<String>>>);
+
+impl FakeInventory {
+    fn respond(&self, request: &CommandRequest) -> CommandOutput {
+        let args: Vec<_> = request
+            .args
+            .iter()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect();
+        let hdiutil = request.program == Path::new("/usr/bin/hdiutil");
+        let mut attached = self.0.lock().expect("fake inventory");
+        let stdout = if hdiutil && args == ["info", "-plist"] {
+            inventory_plist(&attached)
+        } else if args.first().is_some_and(|argument| argument == "attach") {
+            attached.push(args.last().expect("attached image").clone());
+            ATTACH_PLIST.as_bytes().to_vec()
+        } else if args.starts_with(&["apfs".into(), "list".into()]) {
+            APFS_LIST_PLIST.as_bytes().to_vec()
+        } else {
+            if args
+                .first()
+                .is_some_and(|argument| argument == "detach" || argument == "eject")
+            {
+                // Every fixture attachment holds the same devices, so a detach releases all.
+                attached.clear();
+            }
+            Vec::new()
+        };
+        CommandOutput::success(stdout)
+    }
+}
+
+fn inventory_plist(images: &[String]) -> Vec<u8> {
+    let mut plist = String::from(r#"<?xml version="1.0"?><plist><dict><key>images</key><array>"#);
+    for image in images {
+        plist.push_str("<dict><key>image-path</key><string>");
+        plist.push_str(image);
+        plist.push_str("</string><key>system-entities</key><array>");
+        for device in ["/dev/disk9", "/dev/disk9s2", "/dev/disk10s1"] {
+            plist.push_str("<dict><key>dev-entry</key><string>");
+            plist.push_str(device);
+            plist.push_str("</string></dict>");
+        }
+        plist.push_str("</array></dict>");
+    }
+    plist.push_str("</array></dict></plist>");
+    plist.into_bytes()
 }
 
 #[derive(Clone)]
@@ -80,6 +115,7 @@ struct RecordingRunner {
     calls: Arc<AtomicUsize>,
     requests: Arc<Mutex<Vec<CommandRequest>>>,
     volume_name: Arc<Mutex<String>>,
+    inventory: FakeInventory,
 }
 
 impl Default for RecordingRunner {
@@ -88,6 +124,7 @@ impl Default for RecordingRunner {
             calls: Arc::default(),
             requests: Arc::default(),
             volume_name: Arc::new(Mutex::new("cowshed.acme--widget.main".to_owned())),
+            inventory: FakeInventory::default(),
         }
     }
 }
@@ -128,7 +165,7 @@ impl CommandRunner for RecordingRunner {
                 &volume_name,
             )))
         } else {
-            Ok(successful_output(request))
+            Ok(self.inventory.respond(request))
         }
     }
 }
@@ -138,6 +175,7 @@ struct FailingDetachRunner {
     calls: Arc<AtomicUsize>,
     failures_remaining: Arc<AtomicUsize>,
     detach_attempts: Arc<Mutex<Vec<bool>>>,
+    inventory: FakeInventory,
 }
 
 impl FailingDetachRunner {
@@ -146,6 +184,7 @@ impl FailingDetachRunner {
             calls: Arc::default(),
             failures_remaining: Arc::new(AtomicUsize::new(failures)),
             detach_attempts: Arc::default(),
+            inventory: FakeInventory::default(),
         }
     }
 }
@@ -195,7 +234,7 @@ impl CommandRunner for FailingDetachRunner {
                 "couldn't unmount disk17 - Resource busy\n",
             ))
         } else {
-            Ok(successful_output(request))
+            Ok(self.inventory.respond(request))
         }
     }
 }
@@ -862,8 +901,8 @@ fn mount_registry_actor_owns_attachment_state_and_blocks_mounted_compaction() {
         .expect("detach retained image");
     assert_eq!(
         runner.calls(),
-        8,
-        "inventory, attach, device inspection, volume resolution, fsck, mount, detach, and detach-settle cross the command boundary"
+        9,
+        "inventory, attach, device inspection, volume resolution, fsck, mount, the detach's identity read, detach, and detach-settle cross the command boundary"
     );
 }
 
@@ -1903,8 +1942,8 @@ fn reverse_teardown_drains_actor_state_and_detaches_every_attachment() {
 
     assert_eq!(
         runner.calls(),
-        7,
-        "inventory, attach, inspect, resolve, fsck, detach, and detach-settle"
+        8,
+        "inventory, attach, inspect, resolve, fsck, the detach's identity read, detach, and detach-settle"
     );
 }
 
@@ -1975,8 +2014,8 @@ fn direct_detach_crosses_the_backend_boundary() {
 
     assert_eq!(
         runner.calls(),
-        7,
-        "inventory, attach, inspect, resolve, fsck, detach, and detach-settle"
+        8,
+        "inventory, attach, inspect, resolve, fsck, the detach's identity read, detach, and detach-settle"
     );
 }
 
@@ -4848,6 +4887,11 @@ fn resizing_a_detached_workspace_grows_the_image_then_the_container_and_verifies
             ],
             vec![
                 "/usr/bin/hdiutil".to_owned(),
+                "info".into(),
+                "-plist".into()
+            ],
+            vec![
+                "/usr/bin/hdiutil".to_owned(),
                 "detach".into(),
                 "/dev/disk9".into(),
             ],
@@ -4857,7 +4901,7 @@ fn resizing_a_detached_workspace_grows_the_image_then_the_container_and_verifies
                 "-plist".into()
             ],
         ],
-        "a detached workspace is grown, verified, handed back detached, and settle-confirmed"
+        "a detached workspace is grown, verified, handed back detached by its image identity, and settle-confirmed"
     );
 }
 

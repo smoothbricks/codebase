@@ -1000,7 +1000,9 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
         let new_devices: BTreeSet<_> = after.difference(before).cloned().collect();
         let mut detach = Vec::new();
         for device in &new_devices {
-            if let Err(error) = self.detach_device(format, device, DetachIntent::Release) {
+            if let Err(error) =
+                self.detach_image_device(image, format, device, DetachIntent::Release)
+            {
                 detach.push(AttachmentDetachFailure {
                     device: device.clone(),
                     error: Box::new(error),
@@ -1166,8 +1168,12 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
             ],
         );
         if let Err(primary) = self.run_checked("format ASIF APFS volume", format) {
-            return match self.detach_device(ImageFormat::Asif, &whole_device, DetachIntent::Release)
-            {
+            return match self.detach_image_device(
+                path,
+                ImageFormat::Asif,
+                &whole_device,
+                DetachIntent::Release,
+            ) {
                 Ok(()) => Err(self.cleanup_failed_asif(path, primary)),
                 Err(detach) => Err(ApfsError::AsifCreationAndCleanupFailed {
                     primary: Box::new(primary),
@@ -1176,7 +1182,12 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
                 }),
             };
         }
-        self.detach_device(ImageFormat::Asif, &whole_device, DetachIntent::Release)?;
+        self.detach_image_device(
+            path,
+            ImageFormat::Asif,
+            &whole_device,
+            DetachIntent::Release,
+        )?;
         Ok(())
     }
 
@@ -1375,7 +1386,12 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
         let volume_device = match self.resolve_apfs_volume(&candidate) {
             Ok(volume_device) => volume_device,
             Err(resolution) => {
-                return match self.detach_device(format, &whole_device, DetachIntent::Release) {
+                return match self.detach_image_device(
+                    image,
+                    format,
+                    &whole_device,
+                    DetachIntent::Release,
+                ) {
                     Ok(()) => Err(resolution),
                     Err(detach) => Err(ApfsError::VolumeResolutionAndDetachFailed {
                         whole_device,
@@ -1452,12 +1468,29 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
         self.run_checked("detach image", request).map(|_| ())
     }
 
-    fn detach_device(
+    /// Detach `whole_device` only while the inventory still shows `image` holding it.
+    ///
+    /// A `/dev/diskN` name read earlier is not an identity: once its image detaches, the kernel
+    /// hands the same name to the next attach anywhere on the host, and detaching the recorded
+    /// name would take that image away from its owner. The image path `hdiutil` recorded at
+    /// attach time is the identity (it survives renaming the file while attached), so the device
+    /// is re-read against it immediately before every detach. An image that no longer holds the
+    /// device is already released; nothing is detached and the refusal is logged.
+    fn detach_image_device(
         &self,
+        image: &Path,
         format: ImageFormat,
         whole_device: &str,
         intent: DetachIntent,
     ) -> Result<(), ApfsError> {
+        let held = self.attached_whole_devices(image)?;
+        if !held.contains(whole_device) {
+            eprintln!(
+                "cowshed: apfs detach {} no longer holds {whole_device} (holds {held:?}); not detaching a device it does not own",
+                image.display()
+            );
+            return Ok(());
+        }
         self.detach_target_checked(format, DetachTarget::Device(whole_device), intent)?;
         self.settle_detached_device(whole_device);
         Ok(())
@@ -1692,7 +1725,7 @@ impl<R: CommandRunner, S: Sleeper> ApfsBackend for MacOsApfsBackend<R, S> {
             return Ok(attachment);
         }
 
-        match self.detach_device(format, &attachment.whole_device, DetachIntent::Release) {
+        match self.detach(&attachment, DetachIntent::Release) {
             Ok(()) => Err(ApfsError::VerificationFailed { request, output }),
             Err(detach) => Err(ApfsError::VerificationAndDetachFailed {
                 request,
@@ -1736,7 +1769,12 @@ impl<R: CommandRunner, S: Sleeper> ApfsBackend for MacOsApfsBackend<R, S> {
     }
 
     fn detach(&self, attachment: &AttachedImage, intent: DetachIntent) -> Result<(), ApfsError> {
-        self.detach_device(attachment.format, &attachment.whole_device, intent)
+        self.detach_image_device(
+            &attachment.image,
+            attachment.format,
+            &attachment.whole_device,
+            intent,
+        )
     }
 
     fn detach_target(
@@ -3028,6 +3066,16 @@ mod tests {
         plist
     }
 
+    /// The identity read every device detach makes first: the inventory still shows `image`
+    /// (resolved the way the backend resolves it) holding `device`.
+    fn holding(image: impl AsRef<Path>, device: &str) -> CommandOutput {
+        let image = attachment_inventory_path(image.as_ref()).unwrap();
+        CommandOutput::success(attachment_inventory(&[(
+            image.to_str().unwrap(),
+            &[device][..],
+        )]))
+    }
+
     fn temp_path(label: &str, extension: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
             "cowshed-apfs-{label}-{}-{:?}.{extension}",
@@ -3483,6 +3531,7 @@ mod tests {
             CommandOutput::success(SPARSE_DEVICE_INFO_PLIST),
             CommandOutput::success(SPARSE_VOLUME_LIST_PLIST),
             CommandOutput::failure(8, "not clean"),
+            holding("session.sparseimage", "/dev/disk4"),
             CommandOutput::success([]),
             CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY),
         ]));
@@ -3501,11 +3550,12 @@ mod tests {
                 && argv(&request) == ["-q", "/dev/rdisk5s2"]
         ));
         let requests = backend.runner().requests();
-        assert_eq!(requests.len(), 7);
+        assert_eq!(requests.len(), 8);
         assert_eq!(requests[4].program, Path::new(FSCK_APFS));
         assert_eq!(argv(&requests[4]), ["-q", "/dev/rdisk5s2"]);
-        assert_eq!(requests[5].program, Path::new(HDIUTIL));
-        assert_eq!(argv(&requests[5]), ["detach", "/dev/disk4"]);
+        assert_eq!(argv(&requests[5]), ["info", "-plist"]);
+        assert_eq!(requests[6].program, Path::new(HDIUTIL));
+        assert_eq!(argv(&requests[6]), ["detach", "/dev/disk4"]);
         assert!(
             !requests
                 .iter()
@@ -3528,6 +3578,7 @@ mod tests {
             CommandOutput::success(EMPTY_VOLUME_LIST_PLIST),
             CommandOutput::success(SPARSE_DEVICE_INFO_PLIST),
             CommandOutput::success(EMPTY_VOLUME_LIST_PLIST),
+            holding("session.sparseimage", "/dev/disk4"),
             CommandOutput::success([]),
             CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY),
         ]);
@@ -3543,7 +3594,7 @@ mod tests {
             } if candidate == "/dev/disk4s1"
         ));
         let requests = backend.runner().requests();
-        assert_eq!(requests.len(), 10);
+        assert_eq!(requests.len(), 11);
         for round in 0..3 {
             assert_eq!(
                 argv(&requests[2 + round * 2]),
@@ -3554,8 +3605,9 @@ mod tests {
                 ["apfs", "list", "-plist", "disk5"]
             );
         }
-        assert_eq!(requests[8].program, Path::new(HDIUTIL));
-        assert_eq!(argv(&requests[8]), ["detach", "/dev/disk4"]);
+        assert_eq!(argv(&requests[8]), ["info", "-plist"]);
+        assert_eq!(requests[9].program, Path::new(HDIUTIL));
+        assert_eq!(argv(&requests[9]), ["detach", "/dev/disk4"]);
         assert_eq!(
             backend.sleeper.waits().len(),
             2,
@@ -3570,6 +3622,7 @@ mod tests {
             CommandOutput::success(SPARSE_ATTACH_PLIST),
             CommandOutput::success(SPARSE_DEVICE_INFO_PLIST),
             CommandOutput::success(AMBIGUOUS_VOLUME_LIST_PLIST),
+            holding("session.sparseimage", "/dev/disk4"),
             CommandOutput::failure(HDIUTIL_DETACH_BUSY, []),
             CommandOutput::failure(HDIUTIL_DETACH_BUSY, []),
             CommandOutput::failure(HDIUTIL_DETACH_BUSY, []),
@@ -3612,9 +3665,9 @@ mod tests {
         // The cleanup detach is a Release: it holds the volume to the full grace and then forces,
         // and only a dissent that outlasts even that is reported beside the resolution failure.
         let requests = backend.runner().requests();
-        assert_eq!(requests.len(), 8);
-        assert_eq!(argv(&requests[4]), ["detach", "/dev/disk4"]);
-        assert_eq!(argv(&requests[7]), ["detach", "-force", "/dev/disk4"]);
+        assert_eq!(requests.len(), 9);
+        assert_eq!(argv(&requests[5]), ["detach", "/dev/disk4"]);
+        assert_eq!(argv(&requests[8]), ["detach", "-force", "/dev/disk4"]);
     }
 
     #[test]
@@ -3624,6 +3677,7 @@ mod tests {
             CommandOutput::success(SPARSE_ATTACH_PLIST),
             CommandOutput::success(SPARSE_DEVICE_INFO_PLIST),
             CommandOutput::failure(3, "list failed"),
+            holding("session.sparseimage", "/dev/disk4"),
             CommandOutput::success([]),
             CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY),
         ]));
@@ -3643,8 +3697,8 @@ mod tests {
             }
         ));
         let requests = backend.runner().requests();
-        assert_eq!(requests.len(), 6);
-        assert_eq!(argv(&requests[4]), ["detach", "/dev/disk4"]);
+        assert_eq!(requests.len(), 7);
+        assert_eq!(argv(&requests[5]), ["detach", "/dev/disk4"]);
     }
 
     #[test]
@@ -3653,6 +3707,7 @@ mod tests {
             CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY),
             CommandOutput::success(SPARSE_ATTACH_PLIST),
             CommandOutput::failure(1, "Could not find disk"),
+            holding("session.sparseimage", "/dev/disk4"),
             CommandOutput::success([]),
             CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY),
         ]));
@@ -3672,8 +3727,8 @@ mod tests {
             }
         ));
         let requests = backend.runner().requests();
-        assert_eq!(requests.len(), 5);
-        assert_eq!(argv(&requests[3]), ["detach", "/dev/disk4"]);
+        assert_eq!(requests.len(), 6);
+        assert_eq!(argv(&requests[4]), ["detach", "/dev/disk4"]);
     }
 
     #[test]
@@ -3693,6 +3748,7 @@ mod tests {
             info_without_container(),
             info_without_container(),
             info_without_container(),
+            holding("session.sparseimage", "/dev/disk4"),
             CommandOutput::success([]),
             CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY),
         ]);
@@ -3707,14 +3763,14 @@ mod tests {
             } if candidate == "/dev/disk4s1"
         ));
         let requests = backend.runner().requests();
-        assert_eq!(requests.len(), 7);
+        assert_eq!(requests.len(), 8);
         assert!(
             !requests
                 .iter()
                 .any(|request| argv(request).first().is_some_and(|arg| arg == "apfs")),
             "no container inventory is walked when the device is not in a container"
         );
-        assert_eq!(argv(&requests[5]), ["detach", "/dev/disk4"]);
+        assert_eq!(argv(&requests[6]), ["detach", "/dev/disk4"]);
     }
 
     #[test]
@@ -3776,7 +3832,7 @@ mod tests {
             BTreeSet::from(["/dev/disk20".into()])
         );
         let requests = backend.runner().requests();
-        assert_eq!(requests.len(), 6);
+        assert_eq!(requests.len(), 7);
         assert_eq!(argv(&requests[0]), ["info", "-plist"]);
         assert_eq!(
             argv(&requests[1]),
@@ -3790,8 +3846,9 @@ mod tests {
             ]
         );
         assert_eq!(argv(&requests[2]), ["info", "-plist"]);
-        assert_eq!(argv(&requests[3]), ["eject", "/dev/disk8"]);
-        assert_eq!(argv(&requests[5]), ["info", "-plist"]);
+        assert_eq!(argv(&requests[3]), ["info", "-plist"]);
+        assert_eq!(argv(&requests[4]), ["eject", "/dev/disk8"]);
+        assert_eq!(argv(&requests[6]), ["info", "-plist"]);
         assert!(!requests.iter().any(|request| {
             let args = argv(request);
             args.iter()
@@ -3822,7 +3879,7 @@ mod tests {
             BTreeSet::from(["/dev/disk20".into()])
         );
         let requests = backend.runner().requests();
-        assert_eq!(requests.len(), 6);
+        assert_eq!(requests.len(), 7);
         assert_eq!(argv(&requests[0]), ["info", "-plist"]);
         assert_eq!(
             argv(&requests[1]),
@@ -3837,8 +3894,9 @@ mod tests {
             ]
         );
         assert_eq!(argv(&requests[2]), ["info", "-plist"]);
-        assert_eq!(argv(&requests[3]), ["detach", "/dev/disk9"]);
-        assert_eq!(argv(&requests[5]), ["info", "-plist"]);
+        assert_eq!(argv(&requests[3]), ["info", "-plist"]);
+        assert_eq!(argv(&requests[4]), ["detach", "/dev/disk9"]);
+        assert_eq!(argv(&requests[6]), ["info", "-plist"]);
     }
 
     #[test]
@@ -3903,12 +3961,13 @@ mod tests {
             other => panic!("unexpected error: {other}"),
         }
         let requests = backend.runner().requests();
-        assert_eq!(requests.len(), 6);
+        assert_eq!(requests.len(), 7);
         assert_eq!(argv(&requests[0])[..3], ["image", "create", "blank"]);
         assert_eq!(argv(&requests[1]), ["info", "-plist"]);
         assert_eq!(argv(&requests[3]), ["info", "-plist"]);
-        assert_eq!(argv(&requests[4]), ["eject", "/dev/disk8"]);
-        assert_eq!(argv(&requests[5]), ["info", "-plist"]);
+        assert_eq!(argv(&requests[4]), ["info", "-plist"]);
+        assert_eq!(argv(&requests[5]), ["eject", "/dev/disk8"]);
+        assert_eq!(argv(&requests[6]), ["info", "-plist"]);
         fs::remove_file(image).unwrap();
     }
 
@@ -3920,6 +3979,7 @@ mod tests {
         let backend = MacOsApfsBackend::new(RecordingRunner::with_outputs([
             CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY),
             CommandOutput::success("<plist><dict><key>malformed"),
+            CommandOutput::success(attached.as_bytes()),
             CommandOutput::success(attached.as_bytes()),
             CommandOutput::failure(16, "busy after eject"),
             CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY),
@@ -3942,9 +4002,9 @@ mod tests {
             other => panic!("unexpected error: {other}"),
         }
         let requests = backend.runner().requests();
-        assert_eq!(requests.len(), 5);
-        assert_eq!(argv(&requests[3]), ["eject", "/dev/disk8"]);
-        assert_eq!(argv(&requests[4]), ["info", "-plist"]);
+        assert_eq!(requests.len(), 6);
+        assert_eq!(argv(&requests[4]), ["eject", "/dev/disk8"]);
+        assert_eq!(argv(&requests[5]), ["info", "-plist"]);
     }
 
     #[test]
@@ -4057,6 +4117,7 @@ mod tests {
             CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY),
             CommandOutput::success(BLANK_ASIF_PLIST),
             CommandOutput::success([]),
+            holding(".staging/auto.asif", "/dev/disk8"),
             CommandOutput::success([]),
             CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY),
         ]));
@@ -4091,6 +4152,7 @@ mod tests {
                 Path::new(HDIUTIL),
                 Path::new(DISKUTIL),
                 Path::new(NEWFS_APFS),
+                Path::new(HDIUTIL),
                 Path::new(DISKUTIL),
                 Path::new(HDIUTIL),
             ]
@@ -4128,8 +4190,9 @@ mod tests {
             argv(&requests[4]),
             ["-U", "502", "-G", "20", "-i", "-v", "main", "/dev/disk8"]
         );
-        assert_eq!(argv(&requests[5]), ["eject", "/dev/disk8"]);
-        assert_eq!(argv(&requests[6]), ["info", "-plist"]);
+        assert_eq!(argv(&requests[5]), ["info", "-plist"]);
+        assert_eq!(argv(&requests[6]), ["eject", "/dev/disk8"]);
+        assert_eq!(argv(&requests[7]), ["info", "-plist"]);
     }
 
     #[test]
@@ -4184,6 +4247,7 @@ mod tests {
             CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY),
             CommandOutput::success(BLANK_ASIF_PLIST),
             CommandOutput::success([]),
+            holding(".staging/exact.asif", "/dev/disk8"),
             CommandOutput::success([]),
             CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY),
         ]));
@@ -4207,7 +4271,7 @@ mod tests {
             }
         );
         let requests = backend.runner().requests();
-        assert_eq!(requests.len(), 6);
+        assert_eq!(requests.len(), 7);
         assert_eq!(
             requests
                 .iter()
@@ -4218,6 +4282,7 @@ mod tests {
                 Path::new(HDIUTIL),
                 Path::new(DISKUTIL),
                 Path::new(NEWFS_APFS),
+                Path::new(HDIUTIL),
                 Path::new(DISKUTIL),
                 Path::new(HDIUTIL),
             ]
@@ -4226,8 +4291,9 @@ mod tests {
             argv(&requests[3]),
             ["-U", "501", "-G", "80", "-i", "-v", "main", "/dev/disk8"]
         );
-        assert_eq!(argv(&requests[4]), ["eject", "/dev/disk8"]);
-        assert_eq!(argv(&requests[5]), ["info", "-plist"]);
+        assert_eq!(argv(&requests[4]), ["info", "-plist"]);
+        assert_eq!(argv(&requests[5]), ["eject", "/dev/disk8"]);
+        assert_eq!(argv(&requests[6]), ["info", "-plist"]);
     }
 
     #[test]
@@ -4352,6 +4418,7 @@ mod tests {
             CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY),
             CommandOutput::success(BLANK_ASIF_PLIST),
             CommandOutput::success([]),
+            holding(".staging/sensitive-asif.asif", "/dev/disk8"),
             CommandOutput::success([]),
             CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY),
         ]));
@@ -4370,7 +4437,7 @@ mod tests {
         assert_eq!(created.format, ImageFormat::Asif);
         assert_eq!(created.path, Path::new(".staging/sensitive-asif.asif"));
         let requests = backend.runner().requests();
-        assert_eq!(requests.len(), 6);
+        assert_eq!(requests.len(), 7);
         assert_eq!(
             argv(&requests[3]),
             [
@@ -4479,6 +4546,7 @@ mod tests {
             CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY),
             CommandOutput::success(BLANK_ASIF_PLIST),
             CommandOutput::failure(70, "format failed"),
+            holding(&image, "/dev/disk8"),
             CommandOutput::success([]),
             CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY),
         ]));
@@ -4507,10 +4575,11 @@ mod tests {
         ));
         assert!(!image.exists());
         let requests = backend.runner().requests();
-        assert_eq!(requests.len(), 6);
+        assert_eq!(requests.len(), 7);
         assert_eq!(requests[3].program, Path::new(NEWFS_APFS));
-        assert_eq!(argv(&requests[4]), ["eject", "/dev/disk8"]);
-        assert_eq!(requests[5].program, Path::new(HDIUTIL));
+        assert_eq!(argv(&requests[4]), ["info", "-plist"]);
+        assert_eq!(argv(&requests[5]), ["eject", "/dev/disk8"]);
+        assert_eq!(requests[6].program, Path::new(HDIUTIL));
     }
 
     #[test]
@@ -4523,6 +4592,7 @@ mod tests {
             CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY),
             CommandOutput::success(BLANK_ASIF_PLIST),
             CommandOutput::failure(70, "format failed"),
+            holding(&image, "/dev/disk8"),
             CommandOutput::failure(16, "busy"),
         ]));
         let error = backend
@@ -4576,6 +4646,7 @@ mod tests {
             CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY),
             CommandOutput::success(BLANK_ASIF_PLIST),
             CommandOutput::failure(70, "format failed"),
+            holding(&image, "/dev/disk8"),
             CommandOutput::success([]),
             CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY),
         ]));
@@ -4624,6 +4695,7 @@ mod tests {
             CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY),
             CommandOutput::success(BLANK_ASIF_PLIST),
             CommandOutput::success([]),
+            holding(&image, "/dev/disk8"),
             CommandOutput::failure(16, "busy"),
         ]));
         let error = backend
@@ -4877,45 +4949,79 @@ mod tests {
         assert!(matches!(error, CloneFileError::UnsupportedPlatform));
     }
 
-    #[test]
-    fn public_detach_delegates_format_and_whole_device() {
-        let backend = graced_backend([
-            CommandOutput::success([]),
-            CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY),
-        ]);
-        let attachment = AttachedImage {
-            image: PathBuf::from("session.sparseimage"),
+    /// An attachment for identity tests: an absolute image path, as the inventory records it.
+    fn identity_attachment(label: &str) -> AttachedImage {
+        AttachedImage {
+            image: temp_path(label, ImageFormat::Sparse.extension()),
             format: ImageFormat::Sparse,
             whole_device: "/dev/disk12".into(),
             volume_device: "/dev/disk12s1".into(),
-        };
+        }
+    }
+
+    #[test]
+    fn public_detach_delegates_format_and_whole_device() {
+        let attachment = identity_attachment("delegates");
+        let backend = graced_backend([
+            holding(&attachment.image, &attachment.whole_device),
+            CommandOutput::success([]),
+            CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY),
+        ]);
 
         backend.detach(&attachment, DetachIntent::Release).unwrap();
 
         let requests = backend.runner().requests();
-        assert_eq!(requests.len(), 2);
-        assert_eq!(requests[0].program, Path::new(HDIUTIL));
-        assert_eq!(argv(&requests[0]), ["detach", "/dev/disk12"]);
-        assert_eq!(argv(&requests[1]), ["info", "-plist"]);
+        assert_eq!(requests.len(), 3);
+        assert_eq!(argv(&requests[0]), ["info", "-plist"]);
+        assert_eq!(requests[1].program, Path::new(HDIUTIL));
+        assert_eq!(argv(&requests[1]), ["detach", "/dev/disk12"]);
+        assert_eq!(argv(&requests[2]), ["info", "-plist"]);
+    }
+
+    /// A device name is only a name for this image while the image holds it. Once the image is
+    /// gone, the kernel hands the same `/dev/diskN` to the next attach, and detaching the recorded
+    /// name would take another image away from its owner.
+    #[test]
+    fn detach_leaves_a_recorded_device_that_now_belongs_to_another_image() {
+        let attachment = identity_attachment("reused-device");
+        let reused =
+            attachment_inventory(&[("/tmp/someone-else.sparseimage", &["/dev/disk12"][..])]);
+        let backend = graced_backend([CommandOutput::success(reused.as_bytes())]);
+
+        backend.detach(&attachment, DetachIntent::Release).unwrap();
+
+        let requests = backend.runner().requests();
+        assert_eq!(
+            requests.len(),
+            1,
+            "no detach of another image's device: {requests:?}"
+        );
+        assert_eq!(argv(&requests[0]), ["info", "-plist"]);
+    }
+
+    #[test]
+    fn detach_of_an_image_no_longer_attached_issues_no_detach() {
+        let attachment = identity_attachment("already-gone");
+        let backend = graced_backend([CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY)]);
+
+        backend.detach(&attachment, DetachIntent::Release).unwrap();
+
+        assert_eq!(backend.runner().requests().len(), 1);
     }
 
     /// Detach-settle: a device already gone from the inventory costs one read and no waiting.
     #[test]
     fn detach_settle_returns_without_sleep_when_device_already_gone() {
+        let attachment = identity_attachment("settle-gone");
         let backend = graced_backend([
+            holding(&attachment.image, &attachment.whole_device),
             CommandOutput::success([]),
             CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY),
         ]);
-        let attachment = AttachedImage {
-            image: PathBuf::from("session.sparseimage"),
-            format: ImageFormat::Sparse,
-            whole_device: "/dev/disk12".into(),
-            volume_device: "/dev/disk12s1".into(),
-        };
         backend.detach(&attachment, DetachIntent::Release).unwrap();
         let requests = backend.runner().requests();
-        assert_eq!(requests.len(), 2);
-        assert_eq!(argv(&requests[1]), ["info", "-plist"]);
+        assert_eq!(requests.len(), 3);
+        assert_eq!(argv(&requests[2]), ["info", "-plist"]);
         assert!(
             backend.sleeper.waits().is_empty(),
             "no blind sleeps: departed on the first poll"
@@ -4927,20 +5033,16 @@ mod tests {
     fn detach_settle_polls_until_departure_then_returns() {
         let lingering =
             attachment_inventory(&[("/tmp/cowshed-lingering.sparseimage", &["/dev/disk12"][..])]);
+        let attachment = identity_attachment("settle-polls");
         let backend = graced_backend([
+            holding(&attachment.image, &attachment.whole_device),
             CommandOutput::success([]),
             CommandOutput::success(lingering.as_bytes()),
             CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY),
         ]);
-        let attachment = AttachedImage {
-            image: PathBuf::from("session.sparseimage"),
-            format: ImageFormat::Sparse,
-            whole_device: "/dev/disk12".into(),
-            volume_device: "/dev/disk12s1".into(),
-        };
         backend.detach(&attachment, DetachIntent::Release).unwrap();
         let requests = backend.runner().requests();
-        assert_eq!(requests.len(), 3);
+        assert_eq!(requests.len(), 4);
         assert_eq!(
             *backend.sleeper.waits(),
             [Duration::from_millis(10)],
@@ -4955,20 +5057,16 @@ mod tests {
     fn detach_settle_proceeds_loudly_at_bound_while_device_lingers() {
         let lingering =
             attachment_inventory(&[("/tmp/cowshed-lingering.sparseimage", &["/dev/disk12"][..])]);
+        let attachment = identity_attachment("settle-bound");
         let backend = graced_backend([
+            holding(&attachment.image, &attachment.whole_device),
             CommandOutput::success([]),
             CommandOutput::success(lingering.as_bytes()),
             CommandOutput::success(lingering.as_bytes()),
             CommandOutput::success(lingering.as_bytes()),
         ]);
-        let attachment = AttachedImage {
-            image: PathBuf::from("session.sparseimage"),
-            format: ImageFormat::Sparse,
-            whole_device: "/dev/disk12".into(),
-            volume_device: "/dev/disk12s1".into(),
-        };
         backend.detach(&attachment, DetachIntent::Release).unwrap();
-        assert_eq!(backend.runner().requests().len(), 4);
+        assert_eq!(backend.runner().requests().len(), 5);
         assert_eq!(
             *backend.sleeper.waits(),
             [Duration::from_millis(10), Duration::from_millis(10)],
