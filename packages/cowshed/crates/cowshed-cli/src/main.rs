@@ -7,6 +7,11 @@ use cowshed_cli::run::{Ending, run_interruptible};
 const INTERRUPTED_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 
 fn main() {
+    // First, before the runtime starts any thread: this binary is also every workspace's warm
+    // exec host, and in that role it never returns from here.
+    if let Err(error) = cowshed_core::runtime::shell_host::dispatch() {
+        eprintln!("cowshed: cannot locate this executable for warm workspace shells: {error}");
+    }
     let arguments: Vec<OsString> = std::env::args_os().skip(1).collect();
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()

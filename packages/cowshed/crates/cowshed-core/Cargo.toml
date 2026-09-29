@@ -13,6 +13,13 @@ publish.workspace = true
 [package.metadata.smoothbricks.test]
 shards = 3
 
+# The warm exec host as its own binary, for tests that run the real host without a CLI.
+[[bin]]
+name = "cowshed-shell-host"
+path = "src/bin/shell_host.rs"
+test = false
+bench = false
+
 [[bin]]
 name = "apfs-benchmark"
 path = "src/bin/apfs_benchmark.rs"
@@ -33,6 +40,8 @@ bytes = "1"
 cowshed-gateway-types = { path = "../cowshed-gateway-types" }
 getrandom = "0.3"
 libc = "0.2"
+# DIRENV_WATCHES is zlib-deflated; a pure-Rust inflate, bounded at the call site.
+miniz_oxide = "0.8"
 plist = "1"
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring", "zeroize"] }
 serde.workspace = true

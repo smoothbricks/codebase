@@ -423,17 +423,22 @@ These anchors are trust configuration, not secrets, so they are exported/written
    `ProtectedRecord::Job(JobArtifactRecord)` admission batch, and record the audit
    `ControllerCommitment::Admission(AdmissionCommitment)` before process creation. Only the trusted supervisor opens the
    protected record stream; the audit record is telemetry and gates nothing.
-4. Compile and install the child profile before starting shell activation. The trusted parent contributes identity,
-   cache wiring (03_caches.md), `TRACEPARENT`, and caller env filtered to build-configuration variables, then sets the
-   private HOME/XDG directories, proxy credentials, runtime directory, and bootstrap PATH. Inside that restriction and
-   the job's process group, canonical shell activation launches the original command: `direnv exec` for the nearest
-   workspace-contained `.envrc`, or `devenv shell` for a configured devenv-only project. Activation retains the
-   requested cwd and literal argv. The supervisor neither evaluates repository shell code nor parses and reconstructs
-   its exported environment. Failed activation prevents command execution. The child profile's final rule denies every
-   mutation beneath `.cowshed/job/**`; no startup hook, named session, one-shot, or descendant receives supervisor
+4. Compile the child profile before starting shell activation. The trusted parent contributes identity, cache wiring
+   (03_caches.md), `TRACEPARENT`, and caller env filtered to build-configuration variables, then sets the private
+   HOME/XDG directories, proxy credentials, runtime directory, and bootstrap PATH. Inside that restriction, canonical
+   shell activation owns the environment the command sees. A command under the nearest workspace-contained `.envrc` runs
+   in a warm exec host (11_shell.md): a process started under the same child profile that approved and evaluated that
+   `.envrc` once and forks the command into the job's own process group, with the job's own pipes, the requested cwd,
+   the literal argv, and the caller env laid over the activated environment. A host that activates for a job belongs to
+   that job until its command starts, so the activation's output, failure and kill are the job's. A configured
+   devenv-only project enters `devenv shell` inside the job's own child. The supervisor neither evaluates repository
+   shell code nor parses and reconstructs its exported environment; it reads only the watch list direnv recorded, to
+   decide when a host is stale. Failed activation prevents command execution. The child profile's final rule denies
+   every mutation beneath `.cowshed/job/**`; no startup hook, exec host, one-shot, or descendant receives supervisor
    artifact-write authority. Request-specific `--ro` narrows only that job's child profile, never the supervisor's
-   artifact-write authority or later jobs. The effective mode is read-only whenever either the request or the configured
-   workspace ceiling is read-only; a read-write request cannot widen a read-only ceiling.
+   artifact-write authority or later jobs, and a read-only job runs only in a host started under the read-only profile.
+   The effective mode is read-only whenever either the request or the configured workspace ceiling is read-only; a
+   read-write request cannot widen a read-only ceiling.
 5. Read stdout and stderr as separate opaque byte streams, incrementally hash and quota-account them, and begin in
    bounded memory. Terminal streams at or below the inline limit are stored as Arrow Binary in a complete protected
    batch. A stream creates `.cowshed/job/<numeric-id>/out` or `err` only when it crosses that limit or a checkpoint/live
@@ -498,19 +503,28 @@ guarantees cowshed owns:
 - **direnv trust is path-keyed.** Approval belongs to the workspace's private direnv configuration, never the host
   user's trust store. Before activation, cowshed approves only the selected workspace-contained `.envrc` using that
   private configuration. Selection walks upward from the requested cwd and stops at the workspace boundary; an unrelated
-  ancestor's `.envrc` is not authorized or evaluated. `cowshed exec` runs
-  `direnv exec <envrc-directory> <original argv...>` inside the executed-child sandbox and job process group. Missing
-  direnv, failed approval, or failed activation stops the command rather than silently launching an unactivated
-  environment. Repository shell exports, including PATH additions and SDK selection, reach the command unchanged; the
-  bootstrap PATH is not reapplied after activation. Host HOME, direnv configuration, and credentials are not imported.
+  ancestor's `.envrc` is not authorized or evaluated. The `.envrc` is evaluated by `direnv export json` inside a warm
+  exec host, or by `direnv exec <envrc-directory> <original argv...>` in a one-shot child; either way inside the
+  executed-child sandbox, never in the supervisor. Missing direnv, failed approval, or failed activation stops the
+  command rather than silently launching an unactivated environment. Repository shell exports, including PATH additions
+  and SDK selection, reach the command unchanged; the bootstrap PATH is not reapplied after activation. Host HOME,
+  direnv configuration, and credentials are not imported.
 
 ### Evaluating an edited `devenv.nix` inside its workspace
 
 A workspace that edits `devenv.nix` must evaluate and activate the edit in that workspace, not first discover its effect
 after landing. Canonical activation owns this: `.envrc` runs the repository's direnv/devenv integration, including shell
 entry hooks and its own cache invalidation. Without a workspace-contained `.envrc`, a configured devenv project runs
-through `devenv shell`. Cowshed does not substitute `print-dev-env --json`, persist an environment snapshot, or recreate
-shell entry behavior from exported variables.
+through `devenv shell` for each command.
+
+Cowshed keeps an activated shell alive across commands, and its invalidation is direnv's own watch set, never a snapshot
+of exported variables (11_shell.md). Every input the evaluation read — `.envrc`, its approval, `devenv.nix`,
+`devenv.lock`, `devenv.yaml`, anything the repository names with `watch_file` — is on the list direnv recorded for it; a
+change to any of them makes the next command activate a fresh shell, which runs the entry hooks again, and a change to
+anything else leaves the warm shell in use. That is the only rule that is both cheap and truthful: re-evaluating per
+command pays a Nix evaluation every time, while replaying exported variables skips entry hooks and cannot know which
+inputs the evaluation depended on. Cowshed does not substitute `print-dev-env --json` or recreate shell entry behavior
+from exported variables.
 
 The initial sandbox PATH supplies the activation tools from admitted host tool roots and the workspace's private bin.
 The activated shell then owns PATH and SDK selection, including workspace-local executables such as `node_modules/.bin`.

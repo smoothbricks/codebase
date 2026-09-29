@@ -4345,6 +4345,13 @@ impl NativeProjectRuntimeHost {
                 )
             })?
             .credential_env_names(self.descriptor.repo_id.as_str()),
+            shell_host: super::shell_host::registered(),
+            // This supervisor lives only as long as the controller process that opened the
+            // project; a spare activated for it would be thrown away when that process exits.
+            shell_pool: super::shell_pool::ShellPoolConfig {
+                prewarm: false,
+                ..super::shell_pool::ShellPoolConfig::default()
+            },
         };
         let handle =
             super::supervisor::WorkspaceSupervisor::start(config, self.commitments.clone())?;

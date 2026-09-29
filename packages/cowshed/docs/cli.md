@@ -557,9 +557,17 @@ raven$ bun run dev          # vite reads $PORT; open http://localhost:40961 in y
 ### Background work
 
 Long commands auto-background at the soft timeout (default 120 s; `--timeout <dur>` tunes it, `--background` forces it
-immediately) and keep running under the workspace supervisor. `cowshed exec` accepts `--session <name>` for a persistent
-named shell whose cwd, variables, and jobs survive across calls. There is no `cowshed job` verb; reattach with
+immediately) and keep running under the workspace supervisor. `cowshed exec` accepts `--session <name>` for a named
+session whose cwd, variables, and jobs carry across calls. There is no `cowshed job` verb; reattach with
 `cowshed exec --session` or print the numeric job id from `--background`.
+
+Commands under the workspace `.envrc` run in a warm shell: the supervisor activates the `.envrc` once and starts each
+command from that activated environment, so only the first command after the workspace shell's inputs change pays for
+direnv/devenv evaluation. Those inputs are exactly what direnv itself watches — the `.envrc`, `devenv.nix`,
+`devenv.lock`, anything named with `watch_file`. Edit one and the next command re-activates, showing direnv's output on
+its stderr; every other command starts warm with only its own output. A `cd` or `export` inside one command never
+reaches the next. The warm shells live as long as the `cowshed` process that runs the workspace supervisor, so separate
+`cowshed exec` invocations each activate once.
 
 Interrupting `cowshed` itself — Ctrl-C, a closed terminal, SIGTERM — while it still runs a command ends that command and
 every job it started and still runs: SIGTERM, then SIGKILL after a short grace. `cowshed` then dies by the same signal,

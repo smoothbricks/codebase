@@ -89,8 +89,8 @@ struct FakeProcess {
 }
 
 impl RunningProcess for FakeProcess {
-    fn pid(&self) -> u32 {
-        self.pid
+    fn pid(&self) -> Option<u32> {
+        Some(self.pid)
     }
 
     fn try_write_stdin(&mut self, bytes: Bytes) -> Result<bool> {
@@ -374,6 +374,8 @@ fn config() -> WorkspaceSupervisorConfig {
         actor_capacity: 8,
         event_capacity: 8,
         credential_env_names: std::collections::BTreeSet::new(),
+        shell_host: None,
+        shell_pool: Default::default(),
     }
 }
 
@@ -644,7 +646,7 @@ async fn host_controller_exec_mode_enforces_each_request_without_widening_the_ce
             // Run the admitted request through the production spawn checks and the
             // kernel. A profile-only probe misses the supervisor/child role boundary.
             let (events, mut received) = mpsc::channel(16);
-            let mut process = cowshed_core::runtime::supervisor::SystemSpawnSink
+            let mut process = cowshed_core::runtime::supervisor::SystemSpawnSink::default()
                 .spawn(spawned.request, events)
                 .await
                 .expect("spawn admitted job");

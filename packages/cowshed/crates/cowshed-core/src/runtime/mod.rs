@@ -2,6 +2,10 @@
 mod macos;
 
 pub mod project;
+pub mod shell_host;
+mod shell_job;
+pub mod shell_pool;
+pub mod shell_watch;
 pub mod supervisor;
 
 pub use project::{

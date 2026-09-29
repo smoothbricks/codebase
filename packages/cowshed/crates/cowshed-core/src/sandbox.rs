@@ -797,6 +797,15 @@ pub fn seatbelt_profile(
             &config.workspace_mount.join(protected),
         )?;
     }
+    // The staged exec host every warm shell runs as. A job that could replace it would run its
+    // own program as every later command's parent, able to forge their wait status.
+    push_exact_and_subpath_rule(
+        &mut profile,
+        "deny file-write*",
+        &config
+            .workspace_mount
+            .join(crate::runtime::shell_host::SHELL_HOST_DIRECTORY),
+    )?;
 
     match role {
         SandboxProfileRole::TrustedSupervisor => {

@@ -30,6 +30,10 @@ login LaunchAgent may attach permanent workspaces proactively, but explicit `att
 **direnv says `.envrc is blocked` in a workspace.** This is expected until that clone path is authorized. Run
 `direnv allow`; `cowshed attach` repairs mounts but deliberately does not change trust.
 
+**A command does not see an edited shell file.** A warm workspace shell re-activates when a file direnv recorded as an
+input changes. A file your `.envrc` reads without telling direnv (a sourced script, a lockfile an install step uses) is
+not on that list: add `watch_file <path>` to the `.envrc`, and edits to it re-activate the next command.
+
 **devenv refresh fails during `cowshed exec`.** With `[devenv] dir` in `.cowshed.toml` (or a root `devenv.nix`), cowshed
 watches the configuration inputs and refreshes the environment before the next sandbox process. A missing configured
 `devenv.nix`, missing `devenv` executable, or evaluation error fails closed with exit 5 and devenv's stderr; cowshed

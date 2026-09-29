@@ -2,21 +2,63 @@
 
 `cowshed-shell` is the process-management layer between `cowshed-core` (which owns _what may run where_ — substrate,
 mounts, sandbox profiles, grants) and every client that runs commands (CLI, MCP, CI, NAPI). It provides one long-lived
-supervisor per workspace holding a pool of warm shells with the composed environment already loaded, a framed stdio
-protocol over a Unix socket, job control, and the single exec-record capture that all clients consume.
+supervisor per workspace holding warm exec hosts with the workspace shell already activated, a framed stdio protocol
+over a Unix socket, job control, and the single exec-record capture that all clients consume.
 
 ## Shell activation and process reuse
 
 A fresh workspace is a CoW clone of main, including its `.direnv`/`.devenv` caches. These are inputs to canonical
-activation, not proof that an exported environment snapshot is current. The measured steady state is that **a warm
-`direnv exec` on a devenv repo costs ~1.3–2.9 s per invocation** — activation dominates, dwarfing `sandbox-exec` startup
-and shell init. The exec pipeline uses canonical activation rather than reconstructing an environment snapshot: every
-newly spawned command or shell enters through fail-closed `direnv exec` or configured `devenv shell` (04_sandbox.md).
-Any shell reuse must preserve that activation contract, including repository entry hooks and current workspace
-configuration. The pool's other roles:
+activation, not proof that an exported environment is current. Activation dominates command latency: **a warm
+`direnv exec` on a devenv repo costs ~1.3–5 s per invocation**, dwarfing `sandbox-exec` startup and process creation.
+Cowshed therefore activates a workspace shell once, reuses the activated process for every command until one of the
+inputs direnv recorded for that activation changes, and never replays exported variables in place of activation.
 
-- **Persistent shell state** — a named session keeps cwd, shell variables, and running jobs across calls, so an agent's
-  multi-step task is one shell, not N independent `sandbox-exec` spawns.
+**Exec hosts.** A command whose cwd lies under a workspace-contained `.envrc` runs in a warm exec host: a small cowshed
+process started under the executed-child profile, in its own process group, with the sandbox environment
+(04_sandbox.md). The host approves the `.envrc` in the workspace's private trust store and evaluates it once with
+`direnv export json`, applying the exported diff to its own environment; the repository's entry hooks run exactly as
+they do under `direnv exec`. For each command it receives the job's stdin, stdout and stderr descriptors over its
+control socket (`SCM_RIGHTS`), forks the argv into a new process group with the requested cwd and the caller's
+environment laid over the activated one, and reports the raw `waitpid` status. Nothing a command does — `cd`, `export`,
+a changed umask — reaches the host or a later command: every command is a fresh process from the same activated
+environment. The host program is staged under `.cowshed/shell-host/`, which every profile denies writes to, so no job
+can replace the parent of later commands. A configured devenv-only project, which has no direnv watch list to judge
+freshness by, enters `devenv shell` inside each job's own child.
+
+**Freshness is direnv's own.** direnv records every input an evaluation depended on — the `.envrc`, its approval files,
+each `source_up`, `use devenv` and `watch_file` target — as `DIRENV_WATCHES` (base64url of zlib-deflated JSON
+`[{path, modtime, exists}]`) and reloads when any of them changes. The supervisor decodes that list from each
+activation, subscribes the listed paths with the kernel (kqueue `EVFILT_VNODE` on macOS, inotify on Linux; the nearest
+existing ancestor for an input recorded as absent), and keeps the exact identity — device, inode, size, and nanosecond
+mtime and ctime — each had when the activation finished. direnv's whole-second `modtime` is never compared. A kernel
+event only sets the pool's dirty flag, however many inputs changed. The next command acts on it, never the event: if the
+flag is set, or an in-process stat of the listed paths finds an identity changed (the backstop for coalesced events),
+every idle host and the spare are retired and a fresh host activates for that command; a host still executing finishes
+its command and is dropped instead of returned. An activation whose own inputs moved while it ran — an input the
+previous generation listed changed identity across the evaluation, or a newly listed input's ctime is later than the
+evaluation's start — serves the command that paid for it and is never reused. A change to a path not on the list costs
+nothing. The repository decides what else counts as shell input with `watch_file`: lockfiles and devenv inputs whose
+change must rerun shell entry.
+
+**One spare and a SIEVE cache.** Hosts are pooled per shell identity: effective sandbox mode, `.envrc` directory, grant
+revision, the exact sandbox environment, and the host program. A read-only command never runs in a read-write host, and
+no host activated under one grant revision serves another. Each pool keeps one activated spare ahead of demand and a
+bounded cache (four hosts) of hosts that are executing or were just returned; a full cache evicts by SIEVE. A command
+takes the most recently returned idle host, else the spare — whose replacement starts activating in the background —
+else activates a host of its own. Commands never queue for a host. One actor owns each pool's state; nothing locks. A
+supervisor that lives only as long as a short-lived controller process keeps no spare, which would end unused with it.
+
+**Activation belongs to the job that waited on it.** A command that activates a host receives the activation's output on
+its own stdout and stderr, and until its command starts that host's process group is the job's: a kill reaches the
+activation, and a failed activation fails the job with the activation's status and discards the host. A warm command's
+streams carry only its own output. A spare's activation output is discarded; its failure only means there is no spare.
+An activation whose supervisor goes away — dropped the host, or its process exited — ends with its whole process group,
+since nothing can use its result.
+
+The layer's other roles:
+
+- **Sessions** — a named session carries a cwd and an environment overlay across calls; each of its commands runs in a
+  warm host like any other and sees the session's overlay, never another command's exports.
 - **The framed stdio protocol** — multiplexed, backpressured, language-neutral I/O for concurrent CLI, NAPI, MCP, and CI
   clients, instead of each reinventing pipe plumbing.
 - **Job control** — timeouts, auto-backgrounding, re-attach, structured capture.
@@ -29,17 +71,17 @@ replaying a supervisor-owned environment in place of its shell entry hooks.
 One supervisor process per attached workspace, spawned on first exec (or by `cowshed ensure` for warmed workspaces).
 Each instance is launched once per effective filesystem grant revision under that revision's workspace sandbox profile.
 That outer profile is the authority ceiling and gives the trusted supervisor protected-artifact write access. The
-supervisor itself never evaluates `.envrc`, sources shell startup, or runs repository hooks. It installs the
-deterministic inner child profile first, then starts canonical shell activation and every anonymous shell, named
-session, one-shot, and descendant beneath that restriction and inside the job process group. The child profile denies
-writes beneath `.cowshed/job/**` and may further narrow for ReadOnly; it never adds authority (04_sandbox.md).
+supervisor itself never evaluates `.envrc`, sources shell startup, or runs repository hooks; it reads only the watch
+list an activation reports. It compiles the deterministic inner child profile first, then starts every exec host,
+one-shot command, and descendant beneath that restriction; each command runs in its job's own process group. The child
+profile denies writes beneath `.cowshed/job/**` and may further narrow for ReadOnly; it never adds authority
+(04_sandbox.md).
 
-- Holds K warm restricted shells (default 2, `.cowshed.toml` `[shell] pool`). Shell startup uses the same canonical
-  activation as one-shot commands, inside the child sandbox; no repository-controlled startup runs in the supervisor.
-  Anonymous shells reset cwd/environment/shell variables and return to the pool after each exec.
-- **Named sessions** (`--session <name>`, `WorkspaceHandle::shell(Some(name))`) are persistent shells outside the pool:
-  state survives across calls until explicitly closed or the supervisor stops. This is how a coordinator gives one
-  subagent a stable shell for a multi-step task.
+- Holds the warm exec hosts above. Host startup and activation run inside the child sandbox; no repository-controlled
+  startup runs in the supervisor.
+- **Named sessions** (`--session <name>`, `WorkspaceHandle::shell(Some(name))`) keep a cwd, an environment overlay, and
+  the set of their background jobs until explicitly closed or the supervisor stops. They hold no process of their own.
+  This is how a coordinator gives one subagent a stable working directory and environment for a multi-step task.
 
 Execution cwd has one representation across `ExecRequest`, supervisor/session state, `JobInfo`, JSON, and Arrow:
 `Option<WorkspacePath>`. `None` denotes the workspace mount root; `Some(path)` denotes exactly one validated, normalized
@@ -292,21 +334,21 @@ client recaptures output or derives authority from summary text.
 When a coordinator applies an effective filesystem `grant`/`revoke` (04_sandbox.md, 07_api.md), the immutable outer
 profile changes. The old supervisor cannot widen or revoke its inherited authority by nesting another profile, so it:
 
-1. stops accepting new exec submissions and marks anonymous pooled shells stale;
-2. drains jobs already admitted under the old revision, then closes its pooled shells and exits;
-3. is relaunched by the controller under a supervisor profile compiled from the new grant revision; new children use
-   canonical activation under that revision, without a supervisor-owned environment snapshot;
+1. stops accepting new exec submissions; its exec hosts, keyed by the old revision, are never reused;
+2. drains jobs already admitted under the old revision, then ends its exec hosts and exits;
+3. is relaunched by the controller under a supervisor profile compiled from the new grant revision; new exec hosts
+   activate under that revision;
 4. reports the new enforced `grant_revision` on subsequent jobs.
 
 Running jobs launched under the old profile continue under it until they end or are killed. A coordinator needing a hard
 cut kills those jobs before the drain completes. No-op mutations and egress-only or simulator-only mutations do not
 restart the supervisor because they do not alter its filesystem profile.
 
-**Named sessions refuse to cross revisions.** A named session is a persistent shell pinned to the supervisor profile it
-launched with. Once a filesystem grant/revoke advances the revision, a later `run` targeting that stale session is
-rejected with `Conflict` naming the enforced and current revisions; it is never silently migrated or resumed. The caller
-opens a new named session after relaunch. Anonymous shells need no migration rule because the old pool is destroyed with
-the supervisor and a fresh pool is created under the new outer profile.
+**Named sessions refuse to cross revisions.** A named session is pinned to the supervisor profile it was opened under.
+Once a filesystem grant/revoke advances the revision, a later `run` targeting that stale session is rejected with
+`Conflict` naming the enforced and current revisions; it is never silently migrated or resumed. The caller opens a new
+named session after relaunch. Exec hosts need no migration rule: a host is keyed by the grant revision it activated
+under, so no host of the old revision serves a command of the new one.
 
 ## Teardown ordering
 
@@ -338,6 +380,22 @@ every command would pay the expensive setup cost and cannot hold persistent shel
 sandboxing pays that cost once per grant revision. A small deterministic inner profile is nevertheless mandatory for
 every shell: it removes `.cowshed/job/**` write authority and applies request-specific narrowing without regenerating or
 widening the outer profile. A one-shot exec uses the same trusted-parent/narrow-child split.
+
+**Re-entering the shell per command rejected.** `direnv exec` per job evaluates the whole `.envrc` — for a devenv
+project, a Nix evaluation and every entry hook — on every command, which is where a sandboxed command's seconds went.
+Whether that evaluation is still valid is a question direnv already answers from its own recorded watch list; asking it
+once per activation and watching the answer's inputs costs a few dozen `stat`s per command instead.
+
+**Replaying an exported environment rejected.** Capturing `direnv export`/`print-dev-env` output and applying it to
+later processes looks equivalent but is not: it skips entry hooks that do work (installs, generated files), and it has
+no truthful invalidation — only direnv knows which inputs its evaluation read. A live activated process whose freshness
+is direnv's own watch set keeps both.
+
+**A live bash as the warm shell rejected.** A job owns anonymous pipes whose other ends only the supervisor holds, a
+process group the supervisor signals, and an exact wait status. A long-lived bash can accept none of these per command:
+it cannot receive descriptors, named FIFOs are reachable by sibling jobs, and its `wait` folds a signal death into
+`128+N` and drops the core-dump flag. The exec host does exactly what bash cannot and nothing more; shell text belongs
+to a shell interpreter, not to the process that keeps the activation.
 
 **A cross-workspace shared supervisor rejected.** One supervisor serving many workspaces would straddle sandbox
 boundaries and couple unrelated workspaces' lifecycles. One supervisor per workspace keeps the boundary and teardown

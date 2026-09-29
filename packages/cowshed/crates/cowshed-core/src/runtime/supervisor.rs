@@ -77,6 +77,11 @@ pub struct WorkspaceSupervisorConfig {
     /// holds a registry credential for an origin, an ambient copy of the same token in the
     /// operator's shell has no business reaching a sandbox. Empty unless a route was enrolled.
     pub credential_env_names: BTreeSet<String>,
+    /// The program that starts this workspace's warm exec hosts. `None` runs every command
+    /// through one-shot activation, which is what a host process that cannot start exec hosts
+    /// (it never called [`super::shell_host::dispatch`]) is left with.
+    pub shell_host: Option<super::shell_host::ShellHostProgram>,
+    pub shell_pool: super::shell_pool::ShellPoolConfig,
 }
 
 impl WorkspaceSupervisorConfig {
@@ -146,6 +151,8 @@ impl Default for WorkspaceSupervisorConfig {
             actor_capacity: DEFAULT_ACTOR_CAPACITY,
             event_capacity: DEFAULT_EVENT_CAPACITY,
             credential_env_names: BTreeSet::new(),
+            shell_host: None,
+            shell_pool: super::shell_pool::ShellPoolConfig::default(),
         }
     }
 }
@@ -251,10 +258,22 @@ pub enum ProcessEvent {
     Escalate {
         job_id: JobId,
     },
+    /// A command that runs in a warm exec host started after its job was admitted.
+    Started {
+        job_id: JobId,
+        pid: u32,
+    },
+    /// A warm-shell job ended before any command started; nothing is left running.
+    LaunchFailed {
+        job_id: JobId,
+        error: CowshedError,
+    },
 }
 
 pub trait RunningProcess: Send {
-    fn pid(&self) -> u32;
+    /// `None` until the command's process exists; a warm-shell job reports it with
+    /// [`ProcessEvent::Started`].
+    fn pid(&self) -> Option<u32>;
     /// `Ok(false)` means the bounded process-input lane is full.
     fn try_write_stdin(&mut self, bytes: Bytes) -> Result<bool>;
     fn close_stdin(&mut self) -> Result<()>;
@@ -674,30 +693,59 @@ fn shell_project(
     Ok(None)
 }
 
-/// Activation is part of the executed child: it inherits the same sandbox, pipes and process
-/// group, and its failure is the job's failure. Only constant scripts are shell code; cwd and
-/// the complete original argv remain positional arguments, never interpolated shell code.
-fn activate_shell(
-    plan: &mut SpawnPlan,
+/// How a command in some cwd enters the workspace shell.
+enum ShellEntry {
+    /// The nearest workspace-contained `.envrc`, loaded by direnv.
+    Envrc(PathBuf),
+    /// A configured devenv project without an `.envrc`, entered with `devenv shell`.
+    Devenv { root: PathBuf, directory: PathBuf },
+    /// No shell to enter.
+    Bare,
+}
+
+struct ShellSelection {
+    entry: ShellEntry,
+    /// The devenv project whose evaluated profile bootstraps PATH, if any.
+    devenv_dir: Option<PathBuf>,
+}
+
+/// Select the shell entry for `cwd`: the nearest `.envrc` walking up to the workspace
+/// boundary, else a configured devenv project, else none. An unrelated ancestor's `.envrc`
+/// outside the workspace is neither authorized nor evaluated.
+fn select_shell(
     sandbox: &SandboxConfig,
+    cwd: &Path,
     configured_dir: Option<&Path>,
-) -> Result<Option<PathBuf>> {
-    let project = shell_project(&sandbox.workspace_mount, &plan.cwd, configured_dir)?;
+) -> Result<ShellSelection> {
+    let project = shell_project(&sandbox.workspace_mount, cwd, configured_dir)?;
     let mut envrc_directory = None;
-    for directory in plan
-        .cwd
+    for directory in cwd
         .ancestors()
         .take_while(|directory| directory.starts_with(&sandbox.workspace_mount))
     {
         if shell_input_exists(&sandbox.workspace_mount, &directory.join(".envrc"))? {
-            envrc_directory = Some(directory);
+            envrc_directory = Some(directory.to_path_buf());
             break;
         }
     }
-    let mut activation = if let Some(directory) = envrc_directory {
-        // Approval is private to this workspace (DIRENV_CONFIG/XDG_DATA_HOME below), never
-        // the user's host trust database. No workspace code executes until sandbox-exec.
-        vec![
+    let devenv_dir = project.as_ref().map(|(_, directory)| directory.clone());
+    let entry = match (envrc_directory, project) {
+        (Some(directory), _) => ShellEntry::Envrc(directory),
+        (None, Some((root, directory))) => ShellEntry::Devenv { root, directory },
+        (None, None) => ShellEntry::Bare,
+    };
+    Ok(ShellSelection { entry, devenv_dir })
+}
+
+/// One-shot activation is part of the executed child: it inherits the same sandbox, pipes and
+/// process group, and its failure is the job's failure. Only constant scripts are shell code;
+/// cwd and the complete original argv remain positional arguments, never interpolated shell
+/// code.
+fn wrap_one_shot(plan: &mut SpawnPlan, entry: &ShellEntry) {
+    let mut activation = match entry {
+        // Approval is private to this workspace (DIRENV_CONFIG/XDG_DATA_HOME), never the
+        // user's host trust database. No workspace code executes until sandbox-exec.
+        ShellEntry::Envrc(directory) => vec![
             OsString::from("/bin/sh"),
             OsString::from("-c"),
             OsString::from(
@@ -705,27 +753,26 @@ fn activate_shell(
             ),
             OsString::from("cowshed-direnv"),
             directory.as_os_str().to_owned(),
-        ]
-    } else if let Some((root, directory)) = &project {
-        let mut source = OsString::from("path:");
-        source.push(directory);
-        vec![
-            OsString::from("/bin/sh"),
-            OsString::from("-c"),
-            OsString::from(
-                r#"root=$1; source=$2; cwd=$3; shift 3; cd "$root" && exec devenv --from "$source" shell -- /bin/sh -c 'cd "$1" && shift && exec "$@"' cowshed-command "$cwd" "$@""#,
-            ),
-            OsString::from("cowshed-devenv"),
-            root.as_os_str().to_owned(),
-            source,
-            plan.cwd.as_os_str().to_owned(),
-        ]
-    } else {
-        return Ok(None);
+        ],
+        ShellEntry::Devenv { root, directory } => {
+            let mut source = OsString::from("path:");
+            source.push(directory);
+            vec![
+                OsString::from("/bin/sh"),
+                OsString::from("-c"),
+                OsString::from(
+                    r#"root=$1; source=$2; cwd=$3; shift 3; cd "$root" && exec devenv --from "$source" shell -- /bin/sh -c 'cd "$1" && shift && exec "$@"' cowshed-command "$cwd" "$@""#,
+                ),
+                OsString::from("cowshed-devenv"),
+                root.as_os_str().to_owned(),
+                source,
+                plan.cwd.as_os_str().to_owned(),
+            ]
+        }
+        ShellEntry::Bare => return,
     };
     activation.extend(plan.args.drain(3..));
     plan.args.extend(activation);
-    Ok(project.map(|(_, directory)| directory))
 }
 
 /// Resolve a store-backed profile for bootstrap tool discovery only.
@@ -993,21 +1040,93 @@ pub(super) fn build_environment(
         .chain(BUILD_POLICY)
 }
 
-/// Build the sandboxed `Command` for a child of this workspace.
+/// The environment every child of this workspace starts from, split by who may change what.
 ///
-/// Shell activation runs inside this command, after the sandbox and private environment are
-/// established. The PATH here discovers bootstrap tools; no environment is extracted, merged or
-/// rewritten after the workspace shell has activated.
+/// A one-shot child receives the caller's variables through [`build_environment`] with these
+/// merged over them; a warm exec host starts from exactly [`SandboxEnvironment::base`] and
+/// receives the caller's variables per command as [`SandboxEnvironment::overlay`]. Either way a
+/// name the sandbox owns or withholds never takes the caller's value.
+pub(super) struct SandboxEnvironment {
+    /// Set for every child; the caller's value for these names never passes.
+    owned: BTreeMap<OsString, OsString>,
+    /// Removed from whatever the caller supplied.
+    withheld: Vec<&'static str>,
+    /// Set unless the caller named the variable itself.
+    defaults: BTreeMap<OsString, OsString>,
+    /// A line the sandbox appends to the caller's value, or the whole value when the caller
+    /// named none, so the sandbox's line is the one that takes effect.
+    appended: BTreeMap<OsString, String>,
+}
+
+impl SandboxEnvironment {
+    fn reserved(&self, name: &str) -> bool {
+        self.owned.contains_key(OsStr::new(name)) || self.withheld.contains(&name)
+    }
+
+    /// `line` after the caller's own non-empty value, or `line` alone.
+    fn append(caller: Option<&str>, line: &str) -> OsString {
+        match caller {
+            Some(caller) if !caller.is_empty() => format!("{caller}\n{line}").into(),
+            _ => line.into(),
+        }
+    }
+
+    /// The complete environment of a one-shot child, before shell activation.
+    fn child(&self, caller: &BTreeMap<String, String>) -> BTreeMap<OsString, OsString> {
+        let mut environment: BTreeMap<OsString, OsString> = build_environment(caller)
+            .map(|(name, value)| (name.into(), value.into()))
+            .collect();
+        for name in &self.withheld {
+            environment.remove(OsStr::new(name));
+        }
+        environment.extend(self.owned.clone());
+        for (name, value) in &self.defaults {
+            environment
+                .entry(name.clone())
+                .or_insert_with(|| value.clone());
+        }
+        for (name, line) in &self.appended {
+            let caller = name.to_str().and_then(|name| caller.get(name));
+            environment.insert(name.clone(), Self::append(caller.map(String::as_str), line));
+        }
+        environment
+    }
+
+    /// The environment a warm exec host is started with and activates from.
+    pub(super) fn base(&self) -> BTreeMap<OsString, OsString> {
+        let mut environment = self.owned.clone();
+        environment.extend(self.defaults.clone());
+        for (name, line) in &self.appended {
+            environment.insert(name.clone(), Self::append(None, line));
+        }
+        environment
+    }
+
+    /// The caller's variables one command adds over its host's activated environment; applied
+    /// over [`Self::base`] they give exactly what [`Self::child`] gives a one-shot child.
+    pub(super) fn overlay(&self, caller: &BTreeMap<String, String>) -> Vec<(OsString, OsString)> {
+        build_environment(caller)
+            .filter(|(name, _)| !self.reserved(name))
+            .map(|(name, value)| {
+                let merged = match self.appended.get(OsStr::new(name)) {
+                    Some(line) => Self::append(Some(value), line),
+                    None => value.into(),
+                };
+                (name.into(), merged)
+            })
+            .collect()
+    }
+}
+
+/// Prepare the workspace's private environment host-side and describe the child environment.
 ///
-/// Caller `env` reaches the child through [`build_environment`], which is where the sandbox's
-/// own build-tool policy is merged over it; `env_clear` means nothing is inherited that is not
-/// named here, and every `env` call below wins over the caller.
-async fn sandboxed_command(
-    plan: &SpawnPlan,
+/// Shell activation runs inside the sandbox, after this. The PATH here discovers bootstrap
+/// tools; activation owns PATH from then on.
+pub(super) async fn sandbox_environment(
     sandbox: &SandboxConfig,
     devenv_dir: Option<&Path>,
-    env: &BTreeMap<String, String>,
-) -> Result<tokio::process::Command> {
+    caller: &BTreeMap<String, String>,
+) -> Result<SandboxEnvironment> {
     let private_root = sandbox.workspace_mount.join(".cowshed");
     // This directory contains controller-published credentials and Git policy. Reject an
     // inherited symlink before any host-side preparation writes through it.
@@ -1077,68 +1196,74 @@ async fn sandboxed_command(
     let gateway_http = gateway_proxy_url(&port_base, &workspace_token);
     let runtime_link = sandbox_runtime_link(sandbox);
 
-    let mut command = tokio::process::Command::new(&plan.program);
     // Local services already have a bounded direct-connect capability. Sending
     // them through the external gateway incorrectly requires an egress grant.
     // The sandbox still rejects loopback ports outside this workspace's block.
     let loopback_no_proxy = "localhost,127.0.0.1,::1";
-    command
-        .env_clear()
-        .args(&plan.args)
-        .current_dir(&plan.cwd)
-        .envs(build_environment(env))
-        .env("PATH", path)
-        .env("HOME", &private_home)
-        .env("XDG_CONFIG_HOME", &private_config)
-        .env("XDG_CACHE_HOME", &private_cache)
-        .env("XDG_DATA_HOME", &private_data)
-        .env("XDG_STATE_HOME", &private_state)
-        .env("DIRENV_CONFIG", private_config.join("direnv"))
-        .env(
-            "GIT_CONFIG_GLOBAL",
-            git_identity.as_deref().unwrap_or(Path::new("/dev/null")),
-        )
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_ATTR_NOSYSTEM", "1")
-        .env("TMPDIR", &sandbox.exec_temp_dir)
-        // devenv resolves its runtime directory as `$XDG_RUNTIME_DIR/devenv-<hash>`, falling
-        // back to `/tmp` when the variable is unset, and ignores TMPDIR by design (its runtime
-        // dir must rendezvous across invocations that may carry different TMPDIRs). The child
-        // gets the short `/tmp/cs-<port>` link: the shed's runtime dir under a name that leaves
-        // `sun_path` room for the sockets devenv keeps there.
-        .env("XDG_RUNTIME_DIR", &runtime_link)
-        // Nx ignores XDG_RUNTIME_DIR and otherwise falls back to a world-shared
-        // directory or a private HOME path longer than Unix sockets permit.
-        // Its O_NOFOLLOW admission requires a real leaf below the short alias.
-        .env("NX_SOCKET_DIR", runtime_link.join("nx"))
-        .env("PWD", &plan.cwd)
-        .env(GO_ENV, private_cache.join("go/env"))
-        // rustc-wrapper clients speak to the host-owned sccache daemon; the
-        // Seatbelt profile admits exactly this socket and denies binding it,
-        // so a client whose daemon is down fails fast instead of spawning a
-        // wrong-boundary server inside the sandbox.
-        .env(
-            "SCCACHE_SERVER_UDS",
-            crate::sandbox::sccache_server_socket(),
-        )
-        .env("SCCACHE_DIR", crate::sandbox::sccache_cache_directory())
-        .env(PORT_BASE_ENV, &port_base)
-        .env(WORKSPACE_TOKEN_ENV, encoded_token)
-        .env("HTTP_PROXY", &gateway_http)
-        .env("HTTPS_PROXY", &gateway_http)
-        .env("http_proxy", &gateway_http)
-        .env("https_proxy", &gateway_http)
-        .env("NO_PROXY", loopback_no_proxy)
-        .env("no_proxy", loopback_no_proxy);
+    let mut owned: BTreeMap<OsString, OsString> = BUILD_POLICY
+        .iter()
+        .map(|(name, value)| ((*name).into(), (*value).into()))
+        .collect();
+    let mut withheld: Vec<&'static str> = Vec::new();
+    let mut own = |name: &str, value: &OsStr| {
+        owned.insert(name.into(), value.to_owned());
+    };
+    own("PATH", &path);
+    own("HOME", private_home.as_os_str());
+    own("XDG_CONFIG_HOME", private_config.as_os_str());
+    own("XDG_CACHE_HOME", private_cache.as_os_str());
+    own("XDG_DATA_HOME", private_data.as_os_str());
+    own("XDG_STATE_HOME", private_state.as_os_str());
+    own("DIRENV_CONFIG", private_config.join("direnv").as_os_str());
+    own(
+        "GIT_CONFIG_GLOBAL",
+        git_identity
+            .as_deref()
+            .unwrap_or(Path::new("/dev/null"))
+            .as_os_str(),
+    );
+    own("GIT_CONFIG_NOSYSTEM", OsStr::new("1"));
+    own("GIT_ATTR_NOSYSTEM", OsStr::new("1"));
+    own("TMPDIR", sandbox.exec_temp_dir.as_os_str());
+    // devenv resolves its runtime directory as `$XDG_RUNTIME_DIR/devenv-<hash>`, falling
+    // back to `/tmp` when the variable is unset, and ignores TMPDIR by design (its runtime
+    // dir must rendezvous across invocations that may carry different TMPDIRs). The child
+    // gets the short `/tmp/cs-<port>` link: the shed's runtime dir under a name that leaves
+    // `sun_path` room for the sockets devenv keeps there.
+    own("XDG_RUNTIME_DIR", runtime_link.as_os_str());
+    // Nx ignores XDG_RUNTIME_DIR and otherwise falls back to a world-shared
+    // directory or a private HOME path longer than Unix sockets permit.
+    // Its O_NOFOLLOW admission requires a real leaf below the short alias.
+    own("NX_SOCKET_DIR", runtime_link.join("nx").as_os_str());
+    own(GO_ENV, private_cache.join("go/env").as_os_str());
+    // rustc-wrapper clients speak to the host-owned sccache daemon; the
+    // Seatbelt profile admits exactly this socket and denies binding it,
+    // so a client whose daemon is down fails fast instead of spawning a
+    // wrong-boundary server inside the sandbox.
+    own(
+        "SCCACHE_SERVER_UDS",
+        crate::sandbox::sccache_server_socket().as_os_str(),
+    );
+    own(
+        "SCCACHE_DIR",
+        crate::sandbox::sccache_cache_directory().as_os_str(),
+    );
+    own(PORT_BASE_ENV, OsStr::new(&port_base));
+    own(WORKSPACE_TOKEN_ENV, OsStr::new(&encoded_token));
+    for name in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"] {
+        own(name, OsStr::new(&gateway_http));
+    }
+    own("NO_PROXY", OsStr::new(loopback_no_proxy));
+    own("no_proxy", OsStr::new(loopback_no_proxy));
     // The host and every workspace reach a shared tool home through one literal path (cargo
     // fingerprints dependencies by it, Bun's isolated linker writes it into `node_modules`), so
     // the variable names the host path once the tool's caches are shared, and never passes a
     // caller's value through: without shared caches the tool follows the private HOME.
     for (variable, host_path) in sandbox.shared_tool_environment() {
         match host_path {
-            Some(host_path) => command.env(variable, host_path),
-            None => command.env_remove(variable),
-        };
+            Some(host_path) => own(variable, host_path.as_os_str()),
+            None => withheld.push(variable),
+        }
     }
     // Cargo only honors url.insteadOf through the Git CLI, so every child
     // fetches through it; uv shells out to Git and follows the same include
@@ -1148,25 +1273,24 @@ async fn sandboxed_command(
     // user's or the system's configuration. With no mapping the count is
     // pinned to zero so caller-supplied GIT_CONFIG_KEY_* entries cannot
     // smuggle configuration in.
-    command.env(
+    own(
         crate::workspace_git_fetch::CARGO_NET_GIT_FETCH_WITH_CLI_ENV,
-        crate::workspace_git_fetch::CARGO_NET_GIT_FETCH_WITH_CLI_VALUE,
+        OsStr::new(crate::workspace_git_fetch::CARGO_NET_GIT_FETCH_WITH_CLI_VALUE),
     );
     match &git_fetch_config {
         Some(path) => {
             for (key, value) in crate::workspace_git_fetch::git_fetch_include_env(path) {
-                command.env(key, value);
+                own(key, value);
             }
         }
         None => {
-            command.env("GIT_CONFIG_COUNT", "0");
-            command.env_remove("GIT_CONFIG_KEY_0");
-            command.env_remove("GIT_CONFIG_VALUE_0");
+            own("GIT_CONFIG_COUNT", OsStr::new("0"));
+            withheld.extend(["GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0"]);
         }
     }
     for key in ["LANG", "LC_ALL", "LC_CTYPE", "TERM", "COLORTERM"] {
         if let Some(value) = std::env::var_os(key) {
-            command.env(key, value);
+            own(key, &value);
         }
     }
     // Mirror, never invent: a workspace shell must see the same toolchain
@@ -1178,7 +1302,7 @@ async fn sandboxed_command(
     // sys/resource.h) while the identical build passes in the host shell.
     // The developer directory still joins PATH above so its tools are found.
     if let Some(directory) = std::env::var_os("DEVELOPER_DIR") {
-        command.env("DEVELOPER_DIR", directory);
+        own("DEVELOPER_DIR", &directory);
     }
     // Every intercepted HTTPS origin is presented with a leaf this workspace's CA signed, so a
     // client that does not trust that CA cannot reach the registry at all — measured on the
@@ -1195,14 +1319,14 @@ async fn sandboxed_command(
     // no honest merge; silently replacing an operator's anchor would change what a build was
     // compiled against without saying so, and the alternative — refusing to spawn — is worse
     // for a variable that may be entirely unrelated. It is announced instead.
-    if !env.contains_key(NODE_CA_ENV) {
-        let anchor = sandbox
-            .workspace_mount
-            .join(crate::workspace_credentials::CA_CERTIFICATE_PATH);
-        if tokio::fs::try_exists(&anchor).await.unwrap_or(false) {
-            command.env(NODE_CA_ENV, &anchor);
-        }
-    } else {
+    let mut defaults = BTreeMap::new();
+    let anchor = sandbox
+        .workspace_mount
+        .join(crate::workspace_credentials::CA_CERTIFICATE_PATH);
+    if tokio::fs::try_exists(&anchor).await.unwrap_or(false) {
+        defaults.insert(OsString::from(NODE_CA_ENV), anchor.into_os_string());
+    }
+    if caller.contains_key(NODE_CA_ENV) {
         eprintln!(
             "cowshed: {NODE_CA_ENV} was supplied by the caller; the workspace gateway CA is not \
              being added, so an intercepted HTTPS origin may fail to verify"
@@ -1250,6 +1374,7 @@ async fn sandboxed_command(
         },
     )
     .map_err(private_environment_error)?;
+    let mut appended = BTreeMap::new();
     if workspace_ca.is_some() {
         let bundle = environment_root.join(
             crate::workspace_clients::TRUST_BUNDLE_NAME
@@ -1262,32 +1387,67 @@ async fn sandboxed_command(
             crate::workspace_clients::CARGO_CA_ENV,
             crate::workspace_clients::NIX_CA_ENV,
         ] {
-            if env.contains_key(name) {
+            if caller.contains_key(name) {
                 eprintln!(
                     "cowshed: {name} was supplied by the caller; the workspace trust bundle is not \
                      being used for it, so an intercepted HTTPS origin may fail to verify"
                 );
-            } else {
-                command.env(name, &bundle);
             }
+            defaults.insert(OsString::from(name), bundle.clone().into_os_string());
         }
         // A host `nix.conf` that names its own `ssl-cert-file` outranks NIX_SSL_CERT_FILE; only
         // NIX_CONFIG, applied after every config file, outranks it. A caller's NIX_CONFIG keeps
         // its lines, with this one last so it is the setting nix applies.
-        let ssl_cert_file = format!("ssl-cert-file = {}", bundle.display());
-        command.env(
-            crate::workspace_clients::NIX_CONFIG_ENV,
-            match env.get(crate::workspace_clients::NIX_CONFIG_ENV) {
-                Some(caller) if !caller.is_empty() => format!("{caller}\n{ssl_cert_file}"),
-                _ => ssl_cert_file,
-            },
+        appended.insert(
+            OsString::from(crate::workspace_clients::NIX_CONFIG_ENV),
+            format!("ssl-cert-file = {}", bundle.display()),
         );
     }
-    Ok(command)
+    Ok(SandboxEnvironment {
+        owned,
+        withheld,
+        defaults,
+        appended,
+    })
 }
 
-#[derive(Clone, Copy, Debug, Default)]
-pub struct SystemSpawnSink;
+/// Build the sandboxed `Command` for a one-shot child of this workspace.
+///
+/// Shell activation runs inside this command, after the sandbox and private environment are
+/// established. No environment is extracted, merged or rewritten after activation; `env_clear`
+/// means nothing is inherited that is not named in `environment`.
+fn sandboxed_command(
+    plan: &SpawnPlan,
+    environment: &BTreeMap<OsString, OsString>,
+) -> tokio::process::Command {
+    let mut command = tokio::process::Command::new(&plan.program);
+    command
+        .env_clear()
+        .args(&plan.args)
+        .current_dir(&plan.cwd)
+        .envs(environment)
+        .env("PWD", &plan.cwd);
+    command
+}
+
+/// Spawns a workspace's children. With a shell host program, commands whose cwd sits under a
+/// workspace `.envrc` run in warm exec hosts; everything else, and every command when no host
+/// program was given, enters the shell one-shot inside its own child.
+#[derive(Default)]
+pub struct SystemSpawnSink {
+    shells: Option<super::shell_job::WorkspaceShells>,
+}
+
+impl SystemSpawnSink {
+    pub fn with_shell_host(
+        program: super::shell_host::ShellHostProgram,
+        config: super::shell_pool::ShellPoolConfig,
+    ) -> Self {
+        Self {
+            shells: Some(super::shell_job::WorkspaceShells::new(program, config)),
+        }
+    }
+}
 
 #[async_trait]
 impl SpawnSink for SystemSpawnSink {
@@ -1325,10 +1485,34 @@ impl SpawnSink for SystemSpawnSink {
             ));
         }
 
-        let devenv_dir =
-            activate_shell(&mut plan, &request.sandbox, request.devenv_dir.as_deref())?;
-        let mut command =
-            sandboxed_command(&plan, &request.sandbox, devenv_dir.as_deref(), &request.env).await?;
+        let selection = select_shell(&request.sandbox, &plan.cwd, request.devenv_dir.as_deref())?;
+        let environment = sandbox_environment(
+            &request.sandbox,
+            selection.devenv_dir.as_deref(),
+            &request.env,
+        )
+        .await?;
+        if let (ShellEntry::Envrc(envrc_directory), Some(shells)) =
+            (&selection.entry, self.shells.as_mut())
+        {
+            return shells.spawn(
+                super::shell_job::PooledSpawn {
+                    job_id: request.job_id,
+                    argv: plan.args.split_off(3),
+                    cwd: plan.cwd,
+                    profile: request.executed_child_profile,
+                    read_only: request.sandbox.mode == crate::sandbox::RunSandboxMode::ReadOnly,
+                    workspace_mount: request.sandbox.workspace_mount.clone(),
+                    envrc_directory: envrc_directory.clone(),
+                    environment,
+                    caller: &request.env,
+                    grant_revision: request.authority.grant_revision,
+                },
+                events,
+            );
+        }
+        wrap_one_shot(&mut plan, &selection.entry);
+        let mut command = sandboxed_command(&plan, &environment.child(&request.env));
         command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -1408,8 +1592,7 @@ impl SpawnSink for SystemSpawnSink {
         });
         Ok(Box::new(SystemRunningProcess {
             pid,
-            stdin: stdin_sender,
-            stdin_closed: false,
+            stdin: StdinLane::new(stdin_sender),
         }))
     }
 }
@@ -1420,7 +1603,7 @@ impl SpawnSink for SystemSpawnSink {
 /// reports neither an exit code nor a terminating signal, means the child has not been reaped:
 /// answering with a synthesized `SIGKILL` would let `finalize_job` seal the artifact and drain
 /// the job's waiters with a successful terminal status while the process is still running.
-fn process_termination_from_wait(
+pub(super) fn process_termination_from_wait(
     waited: io::Result<std::process::ExitStatus>,
 ) -> Result<ExitStatus> {
     let status = waited.map_err(|error| {
@@ -1449,7 +1632,7 @@ fn process_termination_from_wait(
 /// `kill(-1, ...)` is "every process the caller may signal" and `kill(0, ...)` is the caller's
 /// own group, so both are rejected before negating rather than escaping the sandbox tree. A
 /// group whose last member already exited (`ESRCH`) is the intended outcome, not a failure.
-fn kill_process_group(pid: u32, signal: i32) -> Result<()> {
+pub(super) fn kill_process_group(pid: u32, signal: i32) -> Result<()> {
     let pid = i32::try_from(pid)
         .ok()
         .filter(|pid| *pid > 1)
@@ -1468,30 +1651,33 @@ fn kill_process_group(pid: u32, signal: i32) -> Result<()> {
     }
 }
 
-enum SystemStdin {
+pub(super) enum SystemStdin {
     Write(Bytes),
     Close,
 }
 
-struct SystemRunningProcess {
-    pid: u32,
-    stdin: mpsc::Sender<SystemStdin>,
-    stdin_closed: bool,
+/// The bounded lane from the actor to a job's stdin pump.
+pub(super) struct StdinLane {
+    sender: mpsc::Sender<SystemStdin>,
+    closed: bool,
 }
 
-impl RunningProcess for SystemRunningProcess {
-    fn pid(&self) -> u32 {
-        self.pid
+impl StdinLane {
+    pub(super) fn new(sender: mpsc::Sender<SystemStdin>) -> Self {
+        Self {
+            sender,
+            closed: false,
+        }
     }
 
-    fn try_write_stdin(&mut self, bytes: Bytes) -> Result<bool> {
-        if self.stdin_closed {
+    pub(super) fn try_write(&mut self, bytes: Bytes) -> Result<bool> {
+        if self.closed {
             return Err(CowshedError::conflict(
                 "job stdin is closed",
                 "attach before closing stdin",
             ));
         }
-        match self.stdin.try_send(SystemStdin::Write(bytes)) {
+        match self.sender.try_send(SystemStdin::Write(bytes)) {
             Ok(()) => Ok(true),
             Err(mpsc::error::TrySendError::Full(_)) => Ok(false),
             Err(mpsc::error::TrySendError::Closed(_)) => Err(CowshedError::conflict(
@@ -1501,13 +1687,13 @@ impl RunningProcess for SystemRunningProcess {
         }
     }
 
-    fn close_stdin(&mut self) -> Result<()> {
-        if self.stdin_closed {
+    pub(super) fn close(&mut self) -> Result<()> {
+        if self.closed {
             return Ok(());
         }
-        match self.stdin.try_send(SystemStdin::Close) {
+        match self.sender.try_send(SystemStdin::Close) {
             Ok(()) => {
-                self.stdin_closed = true;
+                self.closed = true;
                 Ok(())
             }
             Err(mpsc::error::TrySendError::Full(_)) => Err(CowshedError::conflict(
@@ -1515,10 +1701,29 @@ impl RunningProcess for SystemRunningProcess {
                 "retry stdin close after the pending write is accepted",
             )),
             Err(mpsc::error::TrySendError::Closed(_)) => {
-                self.stdin_closed = true;
+                self.closed = true;
                 Ok(())
             }
         }
+    }
+}
+
+struct SystemRunningProcess {
+    pid: u32,
+    stdin: StdinLane,
+}
+
+impl RunningProcess for SystemRunningProcess {
+    fn pid(&self) -> Option<u32> {
+        Some(self.pid)
+    }
+
+    fn try_write_stdin(&mut self, bytes: Bytes) -> Result<bool> {
+        self.stdin.try_write(bytes)
+    }
+
+    fn close_stdin(&mut self) -> Result<()> {
+        self.stdin.close()
     }
 
     fn signal_process_tree(&mut self, signal: ProcessSignal) -> Result<()> {
@@ -1543,12 +1748,14 @@ impl RunningProcess for SystemRunningProcess {
     }
 }
 
-async fn run_system_stdin(
+pub(super) async fn run_system_stdin<W>(
     job_id: JobId,
-    mut stdin: tokio::process::ChildStdin,
+    mut stdin: W,
     mut receiver: mpsc::Receiver<SystemStdin>,
     events: mpsc::Sender<ProcessEvent>,
-) {
+) where
+    W: tokio::io::AsyncWrite + Unpin,
+{
     while let Some(message) = receiver.recv().await {
         match message {
             SystemStdin::Write(bytes) => {
@@ -1571,7 +1778,7 @@ async fn run_system_stdin(
     }
 }
 
-async fn run_system_output<R>(
+pub(super) async fn run_system_output<R>(
     job_id: JobId,
     stream: StreamKind,
     mut reader: R,
@@ -1852,9 +2059,13 @@ impl WorkspaceSupervisor {
             &config.authority,
             config.artifacts.clone(),
         )?;
+        let spawner = match config.shell_host.clone() {
+            Some(program) => SystemSpawnSink::with_shell_host(program, config.shell_pool),
+            None => SystemSpawnSink::default(),
+        };
         Self::start_with_sinks(
             config,
-            Box::new(SystemSpawnSink),
+            Box::new(spawner),
             Box::new(artifacts),
             Box::new(commitments),
         )
@@ -2697,7 +2908,7 @@ impl SupervisorActor {
         };
         match spawn {
             Ok(process) => {
-                job.info.pid = Some(process.pid());
+                job.info.pid = process.pid();
                 job.process = Some(process);
                 if background
                     && let Some(identity) = session_identity
@@ -2996,6 +3207,26 @@ impl SupervisorActor {
             }
             ProcessEvent::StdinPumpFailed { job_id, error: _ } => {
                 let _ = self.begin_kill(job_id, KillReason::StdinFailure);
+            }
+            ProcessEvent::Started { job_id, pid } => {
+                if let Some(job) = self.jobs.get_mut(&job_id) {
+                    job.info.pid = Some(pid);
+                }
+            }
+            ProcessEvent::LaunchFailed { job_id, error } => {
+                let Some(job) = self.jobs.get_mut(&job_id) else {
+                    return;
+                };
+                if job.terminal_committed {
+                    return;
+                }
+                // The same terminal shape as a spawn that failed synchronously; the job's
+                // stderr already carries the reason.
+                job.exit = Some(ExitStatus::Exited {
+                    code: error.exec_wrapper_exit_code().into(),
+                });
+                job.kill_reason = Some(KillReason::SpawnFailure);
+                release_exited_process(job);
             }
             ProcessEvent::Escalate { job_id } => {
                 if let Some(job) = self.jobs.get_mut(&job_id)
@@ -3602,7 +3833,7 @@ fn byte_count(value: usize) -> u64 {
     u64::try_from(value).expect("supported platforms have at most 64-bit usize")
 }
 
-fn map_exec_error(error: crate::exec::ExecError) -> CowshedError {
+pub(super) fn map_exec_error(error: crate::exec::ExecError) -> CowshedError {
     match error {
         crate::exec::ExecError::InvalidRequest { .. } => CowshedError::usage(
             error.to_string(),
@@ -3724,27 +3955,36 @@ mod workspace_toolchain_tests {
         .expect("workspace CA");
         let mut sandbox = sandbox_at(&mount);
         sandbox.port_block = crate::metadata::PortBlock::new(49_104, 16).expect("port block");
-        let plan = crate::exec::SpawnPlan {
-            program: PathBuf::from("/usr/bin/true"),
-            args: Vec::new(),
-            cwd: mount.clone(),
-        };
         let mut env = BTreeMap::new();
         env.insert(
             "NIX_CONFIG".to_owned(),
             "extra-experimental-features = flakes".to_owned(),
         );
+        env.insert("CALLER_ONLY".to_owned(), "kept".to_owned());
+        env.insert("HOME".to_owned(), "/caller/home".to_owned());
 
-        let command = sandboxed_command(&plan, &sandbox, None, &env)
+        let environment = sandbox_environment(&sandbox, None, &env)
             .await
-            .expect("command");
-        let vars: BTreeMap<String, String> = command
-            .as_std()
-            .get_envs()
-            .filter_map(|(name, value)| {
-                Some((name.to_str()?.to_owned(), value?.to_str()?.to_owned()))
-            })
+            .expect("environment");
+        let child = environment.child(&env);
+        // A warm exec host starts from `base` and each command adds `overlay`: the command must
+        // see exactly what a one-shot child of the same request sees.
+        let mut pooled = environment.base();
+        pooled.extend(environment.overlay(&env));
+        assert_eq!(
+            pooled, child,
+            "pooled and one-shot children see one environment"
+        );
+        let vars: BTreeMap<String, String> = child
+            .into_iter()
+            .filter_map(|(name, value)| Some((name.into_string().ok()?, value.into_string().ok()?)))
             .collect();
+        assert_eq!(vars.get("CALLER_ONLY").map(String::as_str), Some("kept"));
+        assert_eq!(
+            vars.get("HOME").map(PathBuf::from),
+            Some(mount.join(".cowshed/home")),
+            "the sandbox owns HOME"
+        );
 
         let bundle = mount.join(".cowshed/ca-bundle.pem");
         for name in ["GIT_SSL_CAINFO", "CARGO_HTTP_CAINFO", "NIX_SSL_CERT_FILE"] {
@@ -4204,6 +4444,8 @@ mod lifecycle_commitment_tests {
             actor_capacity: defaults.actor_capacity,
             event_capacity: defaults.event_capacity,
             credential_env_names: defaults.credential_env_names,
+            shell_host: None,
+            shell_pool: defaults.shell_pool,
         };
         // `list()`/`info()` answer from the actor's resident job set, which is this supervisor's
         // own lifetime and deliberately not the durable history: the artifact store holds every

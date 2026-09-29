@@ -233,11 +233,12 @@ first.
 simulators need the `--preset simulator` profile class instead (CoreSimulator IPC), not a `--sim` grant. `install` is
 additionally bound to drop-dir artifacts and the human-gating rule (14_nix.md).
 
-`cowshed exec` and `cowshed shell` accept `--session <name>` to bind to a named persistent shell in the workspace
-supervisor; without it, exec uses an anonymous pooled shell (11_shell.md). Long commands auto-background on the soft
-timeout; `--timeout <dur>` sets it and `--background` forces it immediately, printing the numeric `JobId` on stdout.
-Foregrounding versus backgrounding changes attachment only. Backgrounding forces memory-only prefixes into lazy
-protected files so later reattach/checkpoint reads are durable; it does not imply every terminal job has stream paths.
+`cowshed exec` and `cowshed shell` accept `--session <name>` to bind to a named session in the workspace supervisor,
+whose cwd and environment overlay apply to each of its commands; with or without it, the command runs in a warm exec
+host of the workspace shell (11_shell.md). Long commands auto-background on the soft timeout; `--timeout <dur>` sets it
+and `--background` forces it immediately, printing the numeric `JobId` on stdout. Foregrounding versus backgrounding
+changes attachment only. Backgrounding forces memory-only prefixes into lazy protected files so later
+reattach/checkpoint reads are durable; it does not imply every terminal job has stream paths.
 
 `--register` (on `cowshed new`) additionally adds a `cowshed/<ws>` remote in the **main** workspace pointing at the new
 workspace's canonical mount, so a human in main can fetch and review the workspace's branch in place. Off by default

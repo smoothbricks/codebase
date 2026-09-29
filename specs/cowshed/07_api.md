@@ -662,7 +662,7 @@ impl Session {
     pub async fn run(&self, req: ExecRequest) -> Result<JobHandle, CowshedError>;  // allocates a JobId
     pub async fn background(&self, req: ExecRequest) -> Result<JobHandle, CowshedError>;
     pub fn is_named(&self) -> bool;
-    pub async fn close(self) -> Result<(), CowshedError>;   // named: persist; anonymous: return to pool
+    pub async fn close(self) -> Result<(), CowshedError>;   // forgets the session's cwd/env overlay
 }
 
 /// Session uses the protected/controller record DTOs defined in the frozen API block above.

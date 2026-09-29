@@ -297,7 +297,7 @@ async fn host_controller_private_environment_symlinks_cannot_redirect_host_prepa
             vec!["/usr/bin/true".into()],
         );
         let (events, _receiver) = mpsc::channel(16);
-        let result = SystemSpawnSink.spawn(request, events).await;
+        let result = SystemSpawnSink::default().spawn(request, events).await;
         assert!(
             !outside.join("nix").exists(),
             "a sandboxed child redirected the controller's next link creation"
@@ -470,7 +470,7 @@ async fn run_in_sandbox(
 ) -> (ExitStatus, Vec<u8>, Vec<u8>) {
     let request = spawn_request(sandbox, cwd, argv);
     let (events, mut receiver) = mpsc::channel(16);
-    let mut process = SystemSpawnSink
+    let mut process = SystemSpawnSink::default()
         .spawn(request, events)
         .await
         .expect("spawn through the real sandbox");
@@ -736,7 +736,7 @@ async fn configured_missing_devenv_fails_before_command_execution() {
         ],
     );
     let (events, _) = mpsc::channel(16);
-    let error = match SystemSpawnSink.spawn(request, events).await {
+    let error = match SystemSpawnSink::default().spawn(request, events).await {
         Ok(mut process) => {
             process
                 .signal_process_tree(cowshed_core::runtime::supervisor::ProcessSignal::Kill)
