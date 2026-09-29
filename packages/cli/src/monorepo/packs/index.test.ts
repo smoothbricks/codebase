@@ -227,10 +227,7 @@ describe('monorepo validation pack phases', () => {
       await mkdir(join(root, 'crates/alpha'), { recursive: true });
       await mkdir(join(root, 'crates/beta'), { recursive: true });
       await mkdir(join(root, 'tooling/direnv'), { recursive: true });
-      await writeFile(
-        join(root, 'Cargo.toml'),
-        '[workspace]\nmembers = ["crates/*"]\n\n[profile.test]\nincremental = false\ndebug = 0\n',
-      );
+      await writeFile(join(root, 'Cargo.toml'), '[workspace]\nmembers = ["crates/*"]\n');
       await writeFile(join(root, 'crates/alpha/Cargo.toml'), '[package]\nname = "alpha"\n');
       await writeFile(join(root, 'crates/beta/Cargo.toml'), '[package]\nname = "beta"\n');
       await writeFile(join(root, 'tooling/direnv/devenv.smoo.nix'), 'languages.rust = {\n  channel = "nightly";\n};\n');

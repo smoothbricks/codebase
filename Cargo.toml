@@ -65,7 +65,3 @@ opt-level = 3
 
 [profile.wasm-release.package.columine-parsing]
 opt-level = 3
-
-[profile.test]
-incremental = false
-debug = 0

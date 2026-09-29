@@ -48,7 +48,6 @@ const manifest = {
   },
   profile: {
     release: rootManifest.profile.release,
-    test: rootManifest.profile.test,
   },
 };
 

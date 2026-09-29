@@ -308,17 +308,6 @@ function workspaceContains(root: LoadedManifest, member: LoadedManifest): boolea
   return !excludes.some((pattern) => globRegExp(pattern).test(memberPath));
 }
 
-function hasAncestorWorkspace(manifest: LoadedManifest, workspaceRoots: LoadedManifest[]): boolean {
-  return workspaceRoots.some(
-    (workspaceRoot) =>
-      workspaceRoot.directory !== manifest.directory &&
-      (() => {
-        const path = relative(workspaceRoot.directory, manifest.directory);
-        return path !== '' && path !== '..' && !path.startsWith(`..${sep}`) && !isAbsolute(path);
-      })(),
-  );
-}
-
 /**
  * The channel that will actually compile this repository.
  *
@@ -540,15 +529,6 @@ function reportManifestPolicy(manifests: LoadedManifest[], workspaceRoots: Loade
   let failures = 0;
   for (const loaded of manifests) {
     const { manifest } = loaded;
-    const ancestorWorkspace = hasAncestorWorkspace(loaded, workspaceRoots);
-    const effectiveRoot = manifest.workspace !== undefined || (manifest.package !== undefined && !ancestorWorkspace);
-    if (effectiveRoot && manifest.profile?.test?.incremental !== false) {
-      failures += report(
-        loaded.path,
-        'the effective Cargo workspace root is missing [profile.test] incremental = false; Cargo test inherits the incremental dev profile, and only non-incremental units can be shared across cowshed workspaces. Fix it by adding [profile.test] with incremental = false.',
-      );
-    }
-
     if (manifest.profile !== undefined) {
       if (isWorkspaceMember(loaded, workspaceRoots)) {
         failures += report(

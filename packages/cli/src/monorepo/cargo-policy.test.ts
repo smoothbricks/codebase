@@ -74,7 +74,7 @@ function recordingHakari(
 const NIGHTLY_DEVENV = 'languages.rust = {\n  channel = "nightly";\n};\n';
 const UNIFIED_CONFIG = '[unstable]\nfeature-unification = true\n\n[resolver]\nfeature-unification = "workspace"\n';
 const TWO_CRATE_WORKSPACE = {
-  'Cargo.toml': '[workspace]\nmembers = ["crates/*"]\n\n[profile.test]\nincremental = false\ndebug = 0\n',
+  'Cargo.toml': '[workspace]\nmembers = ["crates/*"]\n',
   'crates/alpha/Cargo.toml': '[package]\nname = "alpha"\n',
   'crates/beta/Cargo.toml': '[package]\nname = "beta"\n',
 };
@@ -94,32 +94,17 @@ describe('Cargo cache policy', () => {
     expect(result.messages).toEqual([]);
   });
 
-  it('requires a non-incremental test lane at each workspace root', async () => {
-    const missing = await check({ 'Cargo.toml': '[workspace]\nmembers = []\n' });
-    expect(missing.failures).toBe(1);
-    expect(missing.messages[0]).toContain('[profile.test] incremental = false');
+  it('lets the test profile inherit dev at every effective root', async () => {
+    const workspace = await check({ 'Cargo.toml': '[workspace]\nmembers = []\n' });
+    expect(workspace.messages).toEqual([]);
 
-    const present = await check({
-      'Cargo.toml': '[workspace]\nmembers = []\n\n[profile.test]\nincremental = false\ndebug = 0\n',
-    });
-    expect(present.failures).toBe(0);
-  });
-
-  it('requires the same lane for a standalone package root', async () => {
-    const missing = await check({ 'Cargo.toml': '[package]\nname = "standalone"\n' });
-    expect(missing.failures).toBe(1);
-    expect(missing.messages[0]).toContain('effective Cargo workspace root');
-
-    const present = await check({
-      'Cargo.toml': '[package]\nname = "standalone"\n\n[profile.test]\nincremental = false\ndebug = 0\n',
-    });
-    expect(present.failures).toBe(0);
+    const standalone = await check({ 'Cargo.toml': '[package]\nname = "standalone"\n' });
+    expect(standalone.messages).toEqual([]);
   });
 
   it('flags an explicitly cacheable profile that carries debuginfo', async () => {
     const result = await check({
-      'Cargo.toml':
-        '[workspace]\nmembers = []\n\n[profile.test]\nincremental = false\ndebug = 0\n\n[profile.cache]\nincremental = false\ndebug = 1\n',
+      'Cargo.toml': '[workspace]\nmembers = []\n\n[profile.cache]\nincremental = false\ndebug = 1\n',
     });
     expect(result.failures).toBe(1);
     expect(result.messages[0]).toContain('profile cache is cacheable');
@@ -128,8 +113,7 @@ describe('Cargo cache policy', () => {
 
   it('resolves a non-incremental inherited profile before checking debuginfo', async () => {
     const result = await check({
-      'Cargo.toml':
-        '[workspace]\nmembers = []\n\n[profile.test]\nincremental = false\ndebug = 0\n\n[profile.cache]\ninherits = "release"\ndebug = 1\n',
+      'Cargo.toml': '[workspace]\nmembers = []\n\n[profile.cache]\ninherits = "release"\ndebug = 1\n',
     });
     expect(result.failures).toBe(1);
     expect(result.messages[0]).toContain('profile cache');
@@ -138,7 +122,7 @@ describe('Cargo cache policy', () => {
   it('allows path-neutral and incremental profiles', async () => {
     const result = await check({
       'Cargo.toml':
-        '[workspace]\nmembers = []\n\n[profile.test]\nincremental = false\ndebug = 0\n\n[profile.no-debug]\nincremental = false\ndebug = 0\n\n[profile.dev-symbols]\nincremental = true\ndebug = 2\n',
+        '[workspace]\nmembers = []\n\n[profile.no-debug]\nincremental = false\ndebug = 0\n\n[profile.dev-symbols]\nincremental = true\ndebug = 2\n',
     });
     expect(result.failures).toBe(0);
   });
@@ -159,7 +143,7 @@ describe('Cargo cache policy', () => {
 
   it('flags profile tables in workspace members but not standalone package roots', async () => {
     const result = await check({
-      'Cargo.toml': '[workspace]\nmembers = ["crates/*"]\n\n[profile.test]\nincremental = false\ndebug = 0\n',
+      'Cargo.toml': '[workspace]\nmembers = ["crates/*"]\n',
       'crates/member/Cargo.toml': '[package]\nname = "member"\n\n[profile.dev]\nincremental = true\n',
     });
     expect(result.failures).toBe(1);
@@ -243,7 +227,7 @@ describe('Cargo workspace feature unification', () => {
     // both exist to stop ONE dependency being built twice with different
     // features for two members, which needs two members.
     const result = await check({
-      'Cargo.toml': '[workspace]\nmembers = ["crates/only"]\n\n[profile.test]\nincremental = false\ndebug = 0\n',
+      'Cargo.toml': '[workspace]\nmembers = ["crates/only"]\n',
       'crates/only/Cargo.toml': '[package]\nname = "only"\n',
       'tooling/direnv/devenv.smoo.nix': NIGHTLY_DEVENV,
     });
@@ -305,8 +289,7 @@ describe('Cargo workspace feature unification', () => {
     const hakari = recordingHakari();
     const result = await check(
       {
-        'Cargo.toml':
-          '[workspace]\nmembers = ["crates/*", "workspace-hack"]\n\n[profile.test]\nincremental = false\ndebug = 0\n',
+        'Cargo.toml': '[workspace]\nmembers = ["crates/*", "workspace-hack"]\n',
         'crates/alpha/Cargo.toml':
           '[package]\nname = "alpha"\n\n[dependencies]\nworkspace-hack = { path = "../../workspace-hack" }\n',
         'crates/beta/Cargo.toml':
@@ -324,8 +307,7 @@ describe('Cargo workspace feature unification', () => {
   it('flags a crate that does not depend on the workspace-hack', async () => {
     const result = await check(
       {
-        'Cargo.toml':
-          '[workspace]\nmembers = ["crates/*", "workspace-hack"]\n\n[profile.test]\nincremental = false\ndebug = 0\n',
+        'Cargo.toml': '[workspace]\nmembers = ["crates/*", "workspace-hack"]\n',
         'crates/alpha/Cargo.toml':
           '[package]\nname = "alpha"\n\n[dependencies]\nworkspace-hack = { path = "../../workspace-hack" }\n',
         'crates/beta/Cargo.toml': '[package]\nname = "beta"\n',
@@ -343,8 +325,7 @@ describe('Cargo workspace feature unification', () => {
   it('surfaces a stale workspace-hack that cargo hakari verify rejects', async () => {
     const result = await check(
       {
-        'Cargo.toml':
-          '[workspace]\nmembers = ["crates/*", "workspace-hack"]\n\n[profile.test]\nincremental = false\ndebug = 0\n',
+        'Cargo.toml': '[workspace]\nmembers = ["crates/*", "workspace-hack"]\n',
         'crates/alpha/Cargo.toml':
           '[package]\nname = "alpha"\n\n[dependencies]\nworkspace-hack = { path = "../../workspace-hack" }\n',
         'crates/beta/Cargo.toml':
