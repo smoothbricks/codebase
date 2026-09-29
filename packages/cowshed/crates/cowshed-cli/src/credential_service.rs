@@ -15,7 +15,7 @@ use std::path::Path;
 
 use cowshed_core::api::{CredentialReport, CredentialRoute as CredentialRouteReport};
 use cowshed_core::repository::RepoId;
-use cowshed_core::runtime::project::ProjectRuntime;
+use cowshed_core::runtime::project::{ProjectRuntime, RecoveryScope};
 use cowshed_core::storage::host_config::{CredentialRoute, HostConfig};
 use cowshed_core::{CowshedError, Result};
 use cowshed_gateway::{
@@ -37,7 +37,11 @@ pub async fn dispatch<W: std::io::Write + Send, E: std::io::Write + Send>(
     json: bool,
     output: &mut Output<W, E>,
 ) -> Result<i32> {
-    let runtime = ProjectRuntime::open_existing(project_root).await?;
+    // Credentials are per project and name no workspace: the open finishes only `main`'s
+    // unfinished lifecycle work, never another workspace's.
+    let runtime =
+        ProjectRuntime::open_existing(project_root, RecoveryScope::Workspaces(Default::default()))
+            .await?;
     let repo_id = runtime.descriptor().repo_id.clone();
     let store_root = runtime.descriptor().store_root.clone();
     match command {

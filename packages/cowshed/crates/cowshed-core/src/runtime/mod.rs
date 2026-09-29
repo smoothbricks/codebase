@@ -5,8 +5,8 @@ pub mod project;
 pub mod supervisor;
 
 pub use project::{
-    ProjectDescriptor, ProjectRuntime, ProjectRuntimeHost, RuntimeJobStream, RuntimeLogChunk,
-    WorkspaceSnapshot,
+    ProjectDescriptor, ProjectRuntime, ProjectRuntimeHost, RecoveryScope, RuntimeJobStream,
+    RuntimeLogChunk, WorkspaceSnapshot,
 };
 pub use supervisor::{
     CheckpointBarrier, CommitmentDraft, CommitmentPublisher, CommitmentPublisherHandle, LogChunk,

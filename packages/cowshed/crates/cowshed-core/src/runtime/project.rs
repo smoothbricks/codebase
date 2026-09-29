@@ -280,6 +280,111 @@ pub enum BindingRemoteValidation {
     ForIdentityChange,
 }
 
+/// Which unfinished lifecycle intents an opening replays, and whose failures are its own.
+///
+/// Every open finishes crash residue before it serves, but residue belongs to a workspace. A verb
+/// answers for the workspaces it names and for `main`, which every verb stands on. Another
+/// workspace's unfinished clone is not its work: finishing it can take minutes and can fail on a
+/// host fault that has nothing to do with the verb, and neither may block the verb.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RecoveryScope {
+    /// The resident controller and store-wide maintenance: every unfinished intent is replayed.
+    /// Only `main`'s is the opening's own; any other intent that fails to replay is reported and
+    /// stays journaled for a later pass.
+    Store,
+    /// A verb naming these workspaces (none, for a verb that names none): only their intents and
+    /// `main`'s are replayed, and each failure fails the verb. Every other intent stays journaled,
+    /// untouched.
+    Workspaces(std::collections::BTreeSet<WorkspaceName>),
+    /// A named retirement: [`Self::Workspaces`] of its one target, which alone may leave its own
+    /// clone intent unreplayed while that clone's grants collide, so the retirement can repair
+    /// the duplicate endpoint.
+    Removal(WorkspaceName),
+}
+
+/// What recovery does with one unfinished intent under a [`RecoveryScope`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum IntentReplay {
+    /// Another verb's work: left journaled and unleased.
+    Leave,
+    /// The opening's own work: replayed, and a failure fails the opening.
+    Own,
+    /// Store-wide residue: replayed, and a failure is reported and the record retained.
+    Residue,
+}
+
+impl RecoveryScope {
+    fn replay(&self, workspace: &WorkspaceName) -> IntentReplay {
+        if workspace.is_main() {
+            return IntentReplay::Own;
+        }
+        match self {
+            Self::Store => IntentReplay::Residue,
+            Self::Workspaces(named) if named.contains(workspace) => IntentReplay::Own,
+            Self::Removal(target) if target == workspace => IntentReplay::Own,
+            Self::Workspaces(_) | Self::Removal(_) => IntentReplay::Leave,
+        }
+    }
+
+    fn removal_target(&self) -> Option<&WorkspaceName> {
+        match self {
+            Self::Removal(target) => Some(target),
+            Self::Store | Self::Workspaces(_) => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod recovery_scope_tests {
+    use super::{IntentReplay, RecoveryScope};
+    use crate::metadata::WorkspaceName;
+
+    fn name(value: &str) -> WorkspaceName {
+        WorkspaceName::new(value).unwrap()
+    }
+
+    /// `cowshed land a` must not finish, or fail on, workspace b's unfinished clone.
+    #[test]
+    fn a_verb_replays_its_named_workspaces_and_main_and_leaves_every_other_intent() {
+        let scope = RecoveryScope::Workspaces([name("a"), name("c")].into());
+        assert_eq!(scope.replay(&name("a")), IntentReplay::Own);
+        assert_eq!(scope.replay(&name("c")), IntentReplay::Own);
+        assert_eq!(scope.replay(&name("main")), IntentReplay::Own);
+        assert_eq!(scope.replay(&name("b")), IntentReplay::Leave);
+
+        let unnamed = RecoveryScope::Workspaces(Default::default());
+        assert_eq!(unnamed.replay(&name("main")), IntentReplay::Own);
+        assert_eq!(unnamed.replay(&name("b")), IntentReplay::Leave);
+    }
+
+    #[test]
+    fn a_removal_owns_only_its_target_and_is_the_only_scope_naming_one() {
+        let scope = RecoveryScope::Removal(name("gone"));
+        assert_eq!(scope.replay(&name("gone")), IntentReplay::Own);
+        assert_eq!(scope.replay(&name("main")), IntentReplay::Own);
+        assert_eq!(scope.replay(&name("other")), IntentReplay::Leave);
+        assert_eq!(scope.removal_target(), Some(&name("gone")));
+        assert_eq!(
+            RecoveryScope::Workspaces([name("gone")].into()).removal_target(),
+            None
+        );
+        assert_eq!(RecoveryScope::Store.removal_target(), None);
+    }
+
+    /// The resident controller finishes residue everywhere, but only `main`'s failure is its own.
+    #[test]
+    fn the_store_scope_replays_everything_and_owns_only_main() {
+        assert_eq!(
+            RecoveryScope::Store.replay(&name("main")),
+            IntentReplay::Own
+        );
+        assert_eq!(
+            RecoveryScope::Store.replay(&name("b")),
+            IntentReplay::Residue
+        );
+    }
+}
+
 impl ProjectRuntime {
     /// Opens the production runtime with foreground provisioning authority.
     ///
@@ -294,21 +399,35 @@ impl ProjectRuntime {
             requested_repo_id,
             continuity_from_environment()?,
             BindingRemoteValidation::Strict,
-            None,
+            RecoveryScope::Workspaces(std::collections::BTreeSet::new()),
         )
         .await
     }
 
-    /// Opens the production runtime without storage provisioning authority.
+    /// Opens the production runtime without storage provisioning authority, for one verb.
     ///
-    /// Ordinary commands and background services must use this entrypoint. Missing or incorrectly
-    /// mounted storage fails closed without creating or mounting anything. The audit sink is the
-    /// standalone default (`COWSHED_CONTINUITY_AUDIT`, §[`crate::storage::audit`]).
-    pub async fn open_existing(project_root: impl AsRef<Path>) -> Result<Self> {
-        Self::open_existing_with_audit(project_root, continuity_from_environment()?).await
+    /// Ordinary commands must use this entrypoint, naming the workspaces the verb acts on in
+    /// `scope`: recovery then finishes only their unfinished lifecycle work and `main`'s. Missing
+    /// or incorrectly mounted storage fails closed without creating or mounting anything. The
+    /// audit sink is the standalone default (`COWSHED_CONTINUITY_AUDIT`,
+    /// §[`crate::storage::audit`]).
+    pub async fn open_existing(
+        project_root: impl AsRef<Path>,
+        scope: RecoveryScope,
+    ) -> Result<Self> {
+        Self::open_native(
+            project_root.as_ref(),
+            crate::storage::bootstrap::native::NativeBootstrapMode::ExistingOnly,
+            None,
+            continuity_from_environment()?,
+            BindingRemoteValidation::Strict,
+            scope,
+        )
+        .await
     }
 
-    /// [`Self::open_existing`] for the identity-change verb alone.
+    /// Opens for the identity-change verb alone, with [`RecoveryScope::Store`]: the verb rebinds
+    /// the whole project rather than one workspace.
     ///
     /// Only the parsed `cowshed mv … --repo-id` command may call this entrypoint: it relaxes the
     /// binding's remote check to [`BindingRemoteValidation::ForIdentityChange`] so the verb stays
@@ -320,13 +439,16 @@ impl ProjectRuntime {
             None,
             continuity_from_environment()?,
             BindingRemoteValidation::ForIdentityChange,
-            None,
+            RecoveryScope::Store,
         )
         .await
     }
 
-    /// [`Self::open_existing`] with the host's own audit sink — the entrypoint a supervising
-    /// runtime uses to route controller audit records into its durable log instead of Arrow files.
+    /// Opens the resident controller with the host's own audit sink — the entrypoint a
+    /// supervising runtime uses to route controller audit records into its durable log instead of
+    /// Arrow files. The controller serves every workspace, so it recovers with
+    /// [`RecoveryScope::Store`]: residue a crash left anywhere is finished, and residue that
+    /// cannot be finished stays journaled instead of keeping the controller down.
     pub async fn open_existing_with_audit(
         project_root: impl AsRef<Path>,
         continuity: crate::storage::audit::ContinuityAudit,
@@ -337,24 +459,7 @@ impl ProjectRuntime {
             None,
             continuity,
             BindingRemoteValidation::Strict,
-            None,
-        )
-        .await
-    }
-
-    /// Opens only for a named retirement. A conflicting pending clone cannot be activated
-    /// while another workspace holds its endpoint; retirement still uses the usual safety fences.
-    pub async fn open_existing_for_removal(
-        project_root: impl AsRef<Path>,
-        workspace: WorkspaceName,
-    ) -> Result<Self> {
-        Self::open_native(
-            project_root.as_ref(),
-            crate::storage::bootstrap::native::NativeBootstrapMode::ExistingOnly,
-            None,
-            continuity_from_environment()?,
-            BindingRemoteValidation::Strict,
-            Some(workspace),
+            RecoveryScope::Store,
         )
         .await
     }
@@ -365,7 +470,7 @@ impl ProjectRuntime {
         requested_repo_id: Option<RepoId>,
         continuity: crate::storage::audit::ContinuityAudit,
         validation: BindingRemoteValidation,
-        recovery_removal_target: Option<WorkspaceName>,
+        recovery_scope: RecoveryScope,
     ) -> Result<Self> {
         #[cfg(target_os = "macos")]
         {
@@ -377,7 +482,7 @@ impl ProjectRuntime {
                 validation,
             )
             .await?;
-            host.recovery_removal_target = recovery_removal_target;
+            host.recovery_scope = recovery_scope;
             Self::start(host).await
         }
         #[cfg(not(target_os = "macos"))]
@@ -388,7 +493,7 @@ impl ProjectRuntime {
                 requested_repo_id,
                 continuity,
                 validation,
-                recovery_removal_target,
+                recovery_scope,
             );
             Err(CowshedError::environment_missing(
                 "the native cowshed project runtime requires macOS APFS",
@@ -1433,8 +1538,8 @@ struct NativeProjectRuntimeHost {
     /// opened for the identity change skips the pairing that verb exists to supersede; every
     /// other host heals transport moves exactly like a fresh open would.
     binding_remote_validation: BindingRemoteValidation,
-    /// Only a named remove invocation may defer colliding pending clone replay.
-    recovery_removal_target: Option<WorkspaceName>,
+    /// Which unfinished lifecycle intents this opening replays; see [`RecoveryScope`].
+    recovery_scope: RecoveryScope,
 }
 
 #[cfg(target_os = "macos")]
@@ -2169,7 +2274,7 @@ impl NativeProjectRuntimeHost {
             lifecycle_intents,
             intent_leases: std::collections::BTreeMap::new(),
             binding_remote_validation: validation,
-            recovery_removal_target: None,
+            recovery_scope: RecoveryScope::Store,
         })
     }
     /// Apply `change` to the journal on disk under its lock and adopt the result, which also
@@ -2333,8 +2438,9 @@ impl NativeProjectRuntimeHost {
     /// mutated anything and is discarded: it may be the residue of a safety refusal, not durable
     /// authorization to delete on every later command. An unfinished intent whose lease another
     /// process holds is no residue at all: that process is running the operation right now, and
-    /// replaying it here would run it a second time beside the first. Reports whether recovery
-    /// mutated images or mounts, so a caller can discard an inventory read only when necessary.
+    /// replaying it here would run it a second time beside the first. Only intents inside this
+    /// opening's [`RecoveryScope`] are touched. Reports whether recovery mutated images or mounts,
+    /// so a caller can discard an inventory read only when necessary.
     async fn recover_lifecycle_intents(&mut self) -> Result<bool> {
         use super::supervisor::{CommitmentDraft, CommitmentSink};
         use crate::storage::recovery::{
@@ -2342,14 +2448,19 @@ impl NativeProjectRuntimeHost {
         };
 
         self.reload_lifecycle_intents().await?;
-        let unfinished = self
+        let (unfinished, left): (Vec<_>, Vec<_>) = self
             .lifecycle_intents
             .records()
             .filter(|(_, record)| record.completion.is_none())
-            .map(|(workspace, _)| workspace.clone())
-            .collect::<Vec<_>>();
+            .map(|(workspace, record)| (workspace.clone(), record.operation.verb()))
+            .partition(|(workspace, _)| {
+                self.recovery_scope.replay(workspace) != IntentReplay::Leave
+            });
+        for (workspace, verb) in left {
+            eprintln!("cowshed: leaving unfinished {verb} of {workspace} to a verb that names it");
+        }
         let mut claimed = Vec::with_capacity(unfinished.len());
-        for workspace in unfinished {
+        for (workspace, _) in unfinished {
             if self.claim_intent_lease(&workspace)? {
                 claimed.push(workspace);
             } else {
@@ -2374,7 +2485,7 @@ impl NativeProjectRuntimeHost {
         // Preserve unfinished clone intents without activating them while their stored
         // grants collide; every other opening retains strict replay and the allocator and
         // gateway still reject the duplicate. Any other inventory error remains a refusal.
-        let defer_conflicting_clones = if let Some(target) = self.recovery_removal_target.as_ref()
+        let defer_conflicting_clones = if let Some(target) = self.recovery_scope.removal_target()
             && pending.iter().any(|record| {
                 matches!(
                     &record.operation,
@@ -2421,20 +2532,23 @@ impl NativeProjectRuntimeHost {
         } else {
             false
         };
-        async {
-            for record in pending {
-                if defer_conflicting_clones
-                    && matches!(
-                        &record.operation,
-                        LifecycleIntent::Create { .. } | LifecycleIntent::Fork { .. }
-                    )
-                {
-                    eprintln!(
-                        "cowshed: retaining unfinished clone {} until the duplicate port block is retired",
-                        record.operation.target()
-                    );
-                    continue;
-                }
+        for record in pending {
+            if defer_conflicting_clones
+                && matches!(
+                    &record.operation,
+                    LifecycleIntent::Create { .. } | LifecycleIntent::Fork { .. }
+                )
+            {
+                eprintln!(
+                    "cowshed: retaining unfinished clone {} until the duplicate port block is retired",
+                    record.operation.target()
+                );
+                continue;
+            }
+            let workspace = record.operation.target().clone();
+            let verb = record.operation.verb();
+            let replay = self.recovery_scope.replay(&workspace);
+            let replayed: Result<()> = async {
                 let phase = record.phase;
                 match record.operation {
                     LifecycleIntent::Adopt { options } => match self.current(&main_name()).await {
@@ -2578,42 +2692,49 @@ impl NativeProjectRuntimeHost {
                         workspace,
                         options,
                         origin,
-                    } => {
-                        match self.current(&workspace).await {
-                            Ok(_) if origin.is_some() => {
-                                return Err(CowshedError::integrity(
-                                    format!("pending retirement target {workspace} became active"),
-                                    "cowshed doctor --json",
-                                ));
-                            }
-                            Ok(_) => {
-                                self.remove(workspace, options).await?;
-                            }
-                            Err(error) if error.code == ErrorCode::NotFound => {
-                                if origin.is_some()
-                                    && self
-                                        .pending_metadata()
-                                        .await?
-                                        .iter()
-                                        .any(|(_, metadata)| metadata.workspace == workspace)
-                                {
-                                    self.remove(workspace, options).await?;
-                                } else {
-                                    self.complete_lifecycle_intent(
-                                        &workspace,
-                                        LifecycleIntentCompletion::Retire(RemoveReport::default()),
-                                    )
-                                    .await?;
-                                }
-                            }
-                            Err(error) => return Err(error),
+                    } => match self.current(&workspace).await {
+                        Ok(_) if origin.is_some() => {
+                            return Err(CowshedError::integrity(
+                                format!("pending retirement target {workspace} became active"),
+                                "cowshed doctor --json",
+                            ));
                         }
-                    }
+                        Ok(_) => {
+                            self.remove(workspace, options).await?;
+                        }
+                        Err(error) if error.code == ErrorCode::NotFound => {
+                            if origin.is_some()
+                                && self
+                                    .pending_metadata()
+                                    .await?
+                                    .iter()
+                                    .any(|(_, metadata)| metadata.workspace == workspace)
+                            {
+                                self.remove(workspace, options).await?;
+                            } else {
+                                self.complete_lifecycle_intent(
+                                    &workspace,
+                                    LifecycleIntentCompletion::Retire(RemoveReport::default()),
+                                )
+                                .await?;
+                            }
+                        }
+                        Err(error) => return Err(error),
+                    },
                 }
+                Ok(())
             }
-            Ok(())
+            .await;
+            match replayed {
+                Ok(()) => {}
+                Err(error) if replay == IntentReplay::Residue => eprintln!(
+                    "cowshed: unfinished {verb} of {workspace} could not be completed ({}: {}); it stays journaled for a later pass",
+                    error.code.as_str(),
+                    error.message
+                ),
+                Err(error) => return Err(error),
+            }
         }
-        .await?;
         Ok(true)
     }
 

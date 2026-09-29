@@ -2708,7 +2708,12 @@ async fn production_open_modes_return_typed_environment_error_off_macos() {
     };
     assert_eq!(adopt_error.code, ErrorCode::EnvironmentMissing);
 
-    let existing_error = match ProjectRuntime::open_existing("/tmp/project").await {
+    let existing_error = match ProjectRuntime::open_existing(
+        "/tmp/project",
+        cowshed_core::runtime::RecoveryScope::Store,
+    )
+    .await
+    {
         Ok(_) => panic!("non-macOS existing-only open must fail"),
         Err(error) => error,
     };

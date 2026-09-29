@@ -29,7 +29,7 @@ use cowshed_core::metadata::{
 };
 use cowshed_core::metadata::{EgressMode, EgressRule};
 use cowshed_core::repository::RepoId;
-use cowshed_core::runtime::ProjectRuntime;
+use cowshed_core::runtime::{ProjectRuntime, RecoveryScope};
 use cowshed_core::storage::apfs::native::MacOsApfsExecutionHost;
 use cowshed_core::storage::apfs::rekey::RekeyReport;
 use cowshed_core::storage::apfs::{ApfsSubstrate, ApfsSubstrateConfig, DEFAULT_IMAGE_CAPACITY};
@@ -186,6 +186,61 @@ fn runtime_open_repo_id(command: &Command) -> Result<Option<RepoId>> {
     }
 }
 
+/// The workspaces whose unfinished lifecycle work this verb's open may finish (see
+/// [`RecoveryScope`]): the ones it names. A name the verb itself will reject cannot name a
+/// journaled intent, so it adds nothing; a removal alone refuses one before opening, because
+/// its scope is the name. `gc` is store maintenance and finishes residue everywhere.
+fn runtime_recovery_scope(command: &Command) -> Result<RecoveryScope> {
+    fn named<'a>(names: impl IntoIterator<Item = Option<&'a str>>) -> RecoveryScope {
+        RecoveryScope::Workspaces(
+            names
+                .into_iter()
+                .flatten()
+                .filter_map(|name| WorkspaceName::new(name).ok())
+                .collect(),
+        )
+    }
+    Ok(match command {
+        Command::Remove(args) => WorkspaceName::new(&args.workspace)
+            .map(RecoveryScope::Removal)
+            .map_err(|error| usage(error.to_string(), "use a valid workspace name"))?,
+        Command::Gc(_) => RecoveryScope::Store,
+        Command::New(args) => named([Some(args.name.as_str()), args.from.as_deref()]),
+        Command::Fork(args) => named([Some(args.source.as_str()), Some(args.destination.as_str())]),
+        Command::Move(args) => match &args.destination {
+            MoveDestination::Workspace(destination) => {
+                named([Some(args.source.as_str()), Some(destination.as_str())])
+            }
+            MoveDestination::Checkout(_) | MoveDestination::RepoId(_) => {
+                named([Some(args.source.as_str())])
+            }
+        },
+        Command::Restore(args) => named([Some(args.workspace.as_str())]),
+        Command::Exec(args) => named([Some(args.workspace.as_str())]),
+        Command::Grant(args) => named([Some(args.workspace.as_str())]),
+        Command::Resize(args) => named([Some(args.workspace.as_str())]),
+        Command::Rekey(args) => named([Some(args.workspace.as_str())]),
+        Command::Land(args) => named([Some(args.workspace.as_str())]),
+        Command::Checkpoint(args) => named([args.workspace.as_deref()]),
+        Command::Path(args) => named([args.workspace.as_deref()]),
+        Command::Attach(args) => named([args.workspace.as_deref()]),
+        Command::Detach(args) => named([args.workspace.as_deref()]),
+        Command::Push(args) => named([args.workspace.as_deref()]),
+        Command::Rebase(args) => named([args.workspace.as_deref()]),
+        Command::Adopt(_)
+        | Command::List(_)
+        | Command::Doctor(_)
+        | Command::Credential(_)
+        | Command::Mount(_)
+        | Command::Setup(_)
+        | Command::Gateway(_)
+        | Command::Sccache(_)
+        | Command::Skill(_)
+        | Command::Version
+        | Command::Help(_) => named([]),
+    })
+}
+
 pub struct ActorBridge {
     coordinator: Option<Coordinator>,
     connection: Option<JoinHandle<Result<()>>>,
@@ -201,16 +256,8 @@ impl ActorBridge {
         Self::from_runtime(project_root, runtime).await
     }
 
-    pub async fn open_existing(project_root: &Path) -> Result<Self> {
-        let runtime = ProjectRuntime::open_existing(project_root).await?;
-        Self::from_runtime(project_root, runtime).await
-    }
-
-    pub async fn open_existing_for_removal(
-        project_root: &Path,
-        workspace: WorkspaceName,
-    ) -> Result<Self> {
-        let runtime = ProjectRuntime::open_existing_for_removal(project_root, workspace).await?;
+    pub async fn open_existing(project_root: &Path, scope: RecoveryScope) -> Result<Self> {
+        let runtime = ProjectRuntime::open_existing(project_root, scope).await?;
         Self::from_runtime(project_root, runtime).await
     }
 
@@ -3427,50 +3474,53 @@ where
     }
     if diagnosis.storage_ready {
         match project_root {
-            Ok(root) => match ActorBridge::open_existing(&root).await {
-                Ok(mut bridge) => {
-                    let identity = git_identity_findings(&bridge);
-                    let project = bridge.doctor().await;
-                    let teardown = bridge.shutdown().await.err();
-                    match identity {
-                        Ok(findings) => diagnosis.findings.extend(findings),
-                        Err(error) => diagnosis.findings.push(Finding {
-                            code: "git-identity".into(),
-                            severity: FindingSeverity::Warning,
-                            message: error.message,
-                            hint: error.hint,
-                            path: Some(root.clone()),
-                        }),
+            Ok(root) => {
+                match ActorBridge::open_existing(&root, runtime_recovery_scope(&cli.command)?).await
+                {
+                    Ok(mut bridge) => {
+                        let identity = git_identity_findings(&bridge);
+                        let project = bridge.doctor().await;
+                        let teardown = bridge.shutdown().await.err();
+                        match identity {
+                            Ok(findings) => diagnosis.findings.extend(findings),
+                            Err(error) => diagnosis.findings.push(Finding {
+                                code: "git-identity".into(),
+                                severity: FindingSeverity::Warning,
+                                message: error.message,
+                                hint: error.hint,
+                                path: Some(root.clone()),
+                            }),
+                        }
+                        match project {
+                            Ok(report) => diagnosis.findings.extend(report.findings),
+                            Err(error) => diagnosis.findings.push(Finding {
+                                code: "project-doctor".into(),
+                                severity: FindingSeverity::Error,
+                                message: error.message,
+                                hint: error.hint,
+                                path: Some(root),
+                            }),
+                        }
+                        if let Some(error) = teardown {
+                            diagnosis.findings.push(Finding {
+                                code: "project-shutdown".into(),
+                                severity: FindingSeverity::Error,
+                                message: error.message,
+                                hint: error.hint,
+                                path: None,
+                            });
+                        }
                     }
-                    match project {
-                        Ok(report) => diagnosis.findings.extend(report.findings),
-                        Err(error) => diagnosis.findings.push(Finding {
-                            code: "project-doctor".into(),
-                            severity: FindingSeverity::Error,
-                            message: error.message,
-                            hint: error.hint,
-                            path: Some(root),
-                        }),
-                    }
-                    if let Some(error) = teardown {
-                        diagnosis.findings.push(Finding {
-                            code: "project-shutdown".into(),
-                            severity: FindingSeverity::Error,
-                            message: error.message,
-                            hint: error.hint,
-                            path: None,
-                        });
-                    }
+                    // A project-open failure means none of its invariants ran. Host findings remain
+                    // useful, but an unobserved project is never a healthy project.
+                    Err(error) => record_project_checks_skipped(
+                        output,
+                        &mut diagnosis.findings,
+                        Some(&error),
+                        Some(root),
+                    )?,
                 }
-                // A project-open failure means none of its invariants ran. Host findings remain
-                // useful, but an unobserved project is never a healthy project.
-                Err(error) => record_project_checks_skipped(
-                    output,
-                    &mut diagnosis.findings,
-                    Some(&error),
-                    Some(root),
-                )?,
-            },
+            }
             Err(error) => record_project_checks_skipped(
                 output,
                 &mut diagnosis.findings,
@@ -3522,7 +3572,8 @@ where
         && !args.all
     {
         let root = resolve_detach_root(&cli).await?;
-        let bridge = ActorBridge::open_existing(&root).await?;
+        let bridge =
+            ActorBridge::open_existing(&root, runtime_recovery_scope(&cli.command)?).await?;
         return dispatch_and_shutdown(bridge, cli, stdin, output).await;
     }
     let discovery = cli.command.project_discovery();
@@ -3542,21 +3593,14 @@ where
         let mut setup = NativeAdoptHostSetup::for_canonical_home()?;
         let _ = prepare_adopt_host_storage(&mut setup, output).await?;
     }
-    let bridge = match &cli.command {
-        Command::Remove(args) => {
-            let workspace = WorkspaceName::new(&args.workspace)
-                .map_err(|error| usage(error.to_string(), "use a valid workspace name"))?;
-            ActorBridge::open_existing_for_removal(&root, workspace).await
+    let bridge = match mode {
+        RuntimeOpenMode::Provision => ActorBridge::open_for_adopt(&root, requested_repo_id).await,
+        RuntimeOpenMode::ExistingOnly => {
+            ActorBridge::open_existing(&root, runtime_recovery_scope(&cli.command)?).await
         }
-        _ => match mode {
-            RuntimeOpenMode::Provision => {
-                ActorBridge::open_for_adopt(&root, requested_repo_id).await
-            }
-            RuntimeOpenMode::ExistingOnly => ActorBridge::open_existing(&root).await,
-            RuntimeOpenMode::IdentityChange => {
-                ActorBridge::open_existing_for_identity_change(&root).await
-            }
-        },
+        RuntimeOpenMode::IdentityChange => {
+            ActorBridge::open_existing_for_identity_change(&root).await
+        }
     };
     let bridge = match bridge {
         Ok(bridge) => bridge,
@@ -4461,6 +4505,45 @@ mod tests {
             runtime_open_repo_id(&parsed.command).expect("optional runtime open identity"),
             None
         );
+    }
+
+    /// A verb's open finishes only the unfinished lifecycle work of the workspaces it names:
+    /// `cowshed land a` must neither wait on nor fail with workspace b's deferred clone.
+    #[test]
+    fn each_verb_recovers_only_the_workspaces_it_names() {
+        let scope = |argv: &[&str]| {
+            let parsed = crate::args::parse_args(argv.iter().copied()).expect("arguments");
+            runtime_recovery_scope(&parsed.command)
+        };
+        let names = |values: &[&str]| {
+            RecoveryScope::Workspaces(
+                values
+                    .iter()
+                    .map(|value| WorkspaceName::new(*value).expect("workspace name"))
+                    .collect(),
+            )
+        };
+
+        assert_eq!(
+            scope(&["land", "coord-hygiene"]).unwrap(),
+            names(&["coord-hygiene"])
+        );
+        assert_eq!(scope(&["fork", "a", "b"]).unwrap(), names(&["a", "b"]));
+        assert_eq!(scope(&["mv", "a", "b"]).unwrap(), names(&["a", "b"]));
+        assert_eq!(scope(&["ls"]).unwrap(), names(&[]));
+        assert_eq!(scope(&["gc"]).unwrap(), RecoveryScope::Store);
+        assert_eq!(
+            scope(&["rm", "gone"]).unwrap(),
+            RecoveryScope::Removal(WorkspaceName::new("gone").expect("workspace name"))
+        );
+        let invalid = runtime_recovery_scope(&Command::Remove(crate::args::RemoveArgs {
+            workspace: "not/a/name".into(),
+            force: false,
+            restore: false,
+            abandon: false,
+        }))
+        .expect_err("a removal's scope is its name");
+        assert_eq!(invalid.code, ErrorCode::Usage);
     }
 
     #[test]

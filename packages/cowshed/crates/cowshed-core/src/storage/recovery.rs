@@ -61,6 +61,16 @@ impl LifecycleIntent {
             Self::Fork { destination, .. } => destination,
         }
     }
+
+    /// The verb that recorded the intent, for operator-facing reports.
+    pub fn verb(&self) -> &'static str {
+        match self {
+            Self::Adopt { .. } => "adopt",
+            Self::Create { .. } => "create",
+            Self::Fork { .. } => "fork",
+            Self::Retire { .. } => "retire",
+        }
+    }
 }
 
 /// The result needed to make an idempotent re-issue indistinguishable from the first call.
