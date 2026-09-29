@@ -3790,7 +3790,8 @@ impl NativeProjectRuntimeHost {
         }
         // A retained checkout with no resolvable HEAD (an unborn branch) only widens an
         // abandonment's bundle to main's whole history; it never makes a restore lose commits.
-        let retained_head = retained_git.head_oid().await.ok();
+        // Any other failure to read that HEAD is a broken repository, and says so.
+        let retained_head = git_optional_ref_oid(retained_git.root(), "HEAD").await?;
         Ok(MainPreservation::Unpreserved {
             head: fence.head,
             retained_head,
@@ -3800,7 +3801,8 @@ impl NativeProjectRuntimeHost {
     /// Keeps main's unpreserved commits where the restore puts them: a bundle in the retained
     /// checkout's Git directory, which the restore makes the project checkout's own. The bundle
     /// carries the retained head as well, so it fetches into an empty repository, and it is
-    /// verified that way before anything is restored.
+    /// verified that way before anything is restored. Git names that directory: a linked worktree
+    /// keeps it outside the tree, where the swap leaves it, rather than under `.git`.
     async fn bundle_abandoned_main(
         &self,
         workspace: &NativeWorkspace,
@@ -3821,7 +3823,41 @@ impl NativeProjectRuntimeHost {
             _ => None,
         };
         let name = format!("abandoned-main-{head}.bundle");
-        let staged_directory = pre_cowshed_checkout.join(".git").join("cowshed");
+        let git_dir = invoke_git(
+            pre_cowshed_checkout,
+            &["rev-parse", "--path-format=absolute", "--git-dir"],
+        )
+        .await?;
+        require_git_success("locate the retained checkout's Git directory", &git_dir)?;
+        let git_dir = {
+            use std::os::unix::ffi::OsStringExt;
+            let mut bytes = git_dir.stdout;
+            while bytes.last().is_some_and(|byte| *byte == b'\n') {
+                bytes.pop();
+            }
+            PathBuf::from(std::ffi::OsString::from_vec(bytes))
+        };
+        let staged_directory = git_dir.join("cowshed");
+        // The report names where the bundle is once the restore has swapped the trees.
+        let retained_root = tokio::fs::canonicalize(pre_cowshed_checkout)
+            .await
+            .map_err(|error| {
+                CowshedError::environment_missing(
+                    format!(
+                        "cannot resolve the retained checkout {}: {error}",
+                        pre_cowshed_checkout.display()
+                    ),
+                    "check parent-directory permissions and retry",
+                )
+            })?;
+        let final_directory = match staged_directory.strip_prefix(&retained_root) {
+            Ok(inside) => self.descriptor.git_root.join(inside),
+            Err(_) => staged_directory.clone(),
+        };
+        let target_branch = crate::git::GitRepository::from_root(pre_cowshed_checkout)
+            .current_branch()
+            .await?
+            .unwrap_or_else(|| "HEAD".to_owned());
         let directory = staged_directory.clone();
         crate::storage::lifecycle::dispatch_blocking(move || {
             std::fs::create_dir_all(&directory).map_err(|error| {
@@ -3830,7 +3866,7 @@ impl NativeProjectRuntimeHost {
                         "cannot create the abandoned-main directory {}: {error}",
                         directory.display()
                     ),
-                    "make the retained checkout's .git directory writable and retry",
+                    "make the retained checkout's Git directory writable and retry",
                 )
             })
         })
@@ -3849,15 +3885,10 @@ impl NativeProjectRuntimeHost {
             .await?;
         Ok(AbandonedWork {
             head,
-            target_branch: "the retained checkout".to_owned(),
+            target_branch,
             target_head: base,
             unlanded_commits,
-            bundle: self
-                .descriptor
-                .git_root
-                .join(".git")
-                .join("cowshed")
-                .join(name),
+            bundle: final_directory.join(name),
         })
     }
 
@@ -3998,6 +4029,22 @@ impl NativeProjectRuntimeHost {
             CowshedError::internal(format!("checkout root record task failed: {error}"))
         })?
         .map_err(native_integrity_error)
+    }
+
+    /// Whether the project's binding still stands; its absence is an unbinding's completion.
+    async fn project_is_bound(&self) -> Result<bool> {
+        let binding = &self.layout.project().repository_binding;
+        match tokio::fs::symlink_metadata(binding).await {
+            Ok(_) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(CowshedError::environment_missing(
+                format!(
+                    "cannot inspect repository binding {}: {error}",
+                    binding.display()
+                ),
+                "check controller storage permissions and retry",
+            )),
+        }
     }
 
     async fn adopt_rollback_state(
@@ -6700,8 +6747,28 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
             // so it is tried before the pending-intent completion below, which would answer the
             // retry with success while the binding still stands.
             Err(error) if options.restore && error.code == ErrorCode::NotFound => {
+                // The binding's absence is the restore's completion. Recovery at open replays a
+                // pending restore, so this very process may already have finished it and removed
+                // the project directory with the binding; there is nothing left to record or
+                // journal, and writing either would recreate that directory.
+                if !self.project_is_bound().await? {
+                    return Ok(RemoveReport::default());
+                }
                 let pre_cowshed = pre_cowshed_path(&self.descriptor.git_root)?;
-                let restored = tokio::fs::symlink_metadata(&pre_cowshed).await.is_err()
+                let pre_cowshed_absent = match tokio::fs::symlink_metadata(&pre_cowshed).await {
+                    Ok(_) => false,
+                    Err(inspect) if inspect.kind() == std::io::ErrorKind::NotFound => true,
+                    Err(inspect) => {
+                        return Err(CowshedError::environment_missing(
+                            format!(
+                                "cannot inspect retained checkout {}: {inspect}",
+                                pre_cowshed.display()
+                            ),
+                            "check parent-directory permissions and retry",
+                        ));
+                    }
+                };
+                let restored = pre_cowshed_absent
                     && self
                         .verify_checkout_identity(
                             &self.descriptor.git_root,
