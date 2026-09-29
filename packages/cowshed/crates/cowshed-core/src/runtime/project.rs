@@ -282,10 +282,12 @@ pub enum BindingRemoteValidation {
 
 /// Which unfinished lifecycle intents an opening replays, and whose failures are its own.
 ///
-/// Every open finishes crash residue before it serves, but residue belongs to a workspace. A verb
-/// answers for the workspaces it names and for `main`, which every verb stands on. Another
-/// workspace's unfinished clone is not its work: finishing it can take minutes and can fail on a
-/// host fault that has nothing to do with the verb, and neither may block the verb.
+/// Every open finishes crash residue and starts a supervisor for every mounted workspace before
+/// it serves, but both belong to a workspace. A verb answers for the workspaces it names and for
+/// `main`, which every verb stands on. Another workspace's unfinished clone, or a mounted
+/// workspace whose supervisor cannot start, is not its work: finishing or repairing it can take
+/// minutes and can fail on a fault that has nothing to do with the verb, and neither may block
+/// the verb. Such a failure is reported, and the verb that names that workspace meets it.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RecoveryScope {
     /// The resident controller and store-wide maintenance: every unfinished intent is replayed.
@@ -326,6 +328,11 @@ impl RecoveryScope {
         }
     }
 
+    /// Whether a failure concerning `workspace` fails this opening.
+    fn owns(&self, workspace: &WorkspaceName) -> bool {
+        self.replay(workspace) == IntentReplay::Own
+    }
+
     fn removal_target(&self) -> Option<&WorkspaceName> {
         match self {
             Self::Removal(target) => Some(target),
@@ -355,6 +362,9 @@ mod recovery_scope_tests {
         let unnamed = RecoveryScope::Workspaces(Default::default());
         assert_eq!(unnamed.replay(&name("main")), IntentReplay::Own);
         assert_eq!(unnamed.replay(&name("b")), IntentReplay::Leave);
+        // A mounted workspace whose supervisor cannot start fails exactly these verbs.
+        assert!(scope.owns(&name("a")) && scope.owns(&name("main")));
+        assert!(!scope.owns(&name("b")));
     }
 
     #[test]
@@ -382,6 +392,8 @@ mod recovery_scope_tests {
             RecoveryScope::Store.replay(&name("b")),
             IntentReplay::Residue
         );
+        assert!(RecoveryScope::Store.owns(&name("main")));
+        assert!(!RecoveryScope::Store.owns(&name("b")));
     }
 }
 
@@ -5279,7 +5291,17 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                 crate::storage::lifecycle::MountState::Mounted { .. }
             )
         }) {
-            self.ensure_supervisor_for(workspace).await?;
+            let name = workspace.derived.workspace.name().clone();
+            if let Err(error) = self.ensure_supervisor_for(workspace).await {
+                if self.recovery_scope.owns(&name) {
+                    return Err(error);
+                }
+                eprintln!(
+                    "cowshed: workspace {name} is mounted but its supervisor could not start ({}: {}); only a verb that names it waits on it",
+                    error.code.as_str(),
+                    error.message
+                );
+            }
         }
         Ok(())
     }
