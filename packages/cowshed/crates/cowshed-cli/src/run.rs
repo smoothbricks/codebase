@@ -1,10 +1,9 @@
 //! The CLI entrypoint, expressed as a library function.
 //!
-//! Both the `cowshed` binary and the Node-API addon's `runCli` export drive the
-//! CLI through [`run`]. Keeping dispatch here — rather than in `main.rs` — is
-//! what lets the npm package ship a CLI without a second, separately
-//! cross-compiled executable: the addon already builds for every supported
-//! target, so the CLI rides along in that same artifact.
+//! The `cowshed` binary drives the CLI through [`run_interruptible`], and a process that hosts
+//! it in-process through [`run`]. Keeping dispatch here — rather than in `main.rs` — is what lets
+//! the npm package ship a CLI without a second, separately cross-compiled executable: the addon
+//! already builds for every supported target, so the CLI rides along in that same artifact.
 
 use std::ffi::{OsStr, OsString};
 use std::io;
@@ -38,11 +37,35 @@ impl Ending {
     }
 }
 
-/// Run one CLI invocation. `arguments` excludes argv[0].
+/// Who answers the process's termination signals while a project or host command runs.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InterruptPolicy {
+    /// An in-process host owns its signals; cowshed installs no handler it could never remove.
+    LeaveToHost,
+    /// The `cowshed` process itself: an interrupt ends the command and the jobs it started.
+    EndJobs,
+}
+
+/// Run one CLI invocation inside a host process. `arguments` excludes argv[0].
 ///
-/// Returns how the invocation ended; it never exits the process itself, because only the caller
-/// owns the async runtime whose shutdown an interrupted command needs.
-pub async fn run(arguments: Vec<OsString>) -> Ending {
+/// Returns the process exit code and never touches signal dispositions, because an in-process
+/// host must keep its own and be allowed to flush and unwind normally.
+pub async fn run(arguments: Vec<OsString>) -> i32 {
+    run_with(arguments, InterruptPolicy::LeaveToHost)
+        .await
+        .exit_code()
+}
+
+/// Run one CLI invocation as the `cowshed` process. `arguments` excludes argv[0].
+///
+/// A project or host command watches SIGINT, SIGHUP and SIGTERM — each one the process did not
+/// inherit as ignored — and answers [`Ending::Interrupted`] when one arrives. The caller owns
+/// the async runtime, and shutting it down is what ends the interrupted command's jobs.
+pub async fn run_interruptible(arguments: Vec<OsString>) -> Ending {
+    run_with(arguments, InterruptPolicy::EndJobs).await
+}
+
+async fn run_with(arguments: Vec<OsString>, interrupts: InterruptPolicy) -> Ending {
     if arguments
         .first()
         .is_some_and(|argument| argument == OsStr::new(GATEWAY_GIT_FETCH_HELPER_ARG))
@@ -59,7 +82,7 @@ pub async fn run(arguments: Vec<OsString>) -> Ending {
             }
         });
     }
-    match parse_then_invoke_service(&arguments, run_parsed).await {
+    match parse_then_invoke_service(&arguments, |parsed| run_parsed(parsed, interrupts)).await {
         Ok(ending) => ending,
         Err(error) => {
             let command_map = error.command_map();
@@ -84,15 +107,15 @@ where
     Ok(invoke(parsed).await)
 }
 
-async fn run_parsed(parsed: args::Cli) -> Ending {
-    Ending::Finished(match run_command(parsed).await {
+async fn run_parsed(parsed: args::Cli, interrupts: InterruptPolicy) -> Ending {
+    Ending::Finished(match run_command(parsed, interrupts).await {
         Ok(code) => code,
         Err(signal) => return Ending::Interrupted { signal },
     })
 }
 
 /// Runs one parsed command to its exit code, or answers the signal that interrupted it.
-async fn run_command(parsed: args::Cli) -> Result<i32, i32> {
+async fn run_command(parsed: args::Cli, interrupts: InterruptPolicy) -> Result<i32, i32> {
     let json = parsed.global.json;
     let stdout = io::stdout();
     let stderr = io::stderr();
@@ -157,7 +180,10 @@ async fn run_command(parsed: args::Cli) -> Result<i32, i32> {
     // Project and host commands run the controller in this process, and its workspace supervisors
     // run jobs as children in their own process groups, out of reach of the terminal's signals.
     // The long-running services above own their signals, so only this section is interruptible.
-    let mut interrupts = Interrupts::install();
+    let mut interrupts = match interrupts {
+        InterruptPolicy::LeaveToHost => Interrupts::none(),
+        InterruptPolicy::EndJobs => Interrupts::install(),
+    };
     let outcome = {
         let command = async {
             match runtime_dispatch(&parsed.command) {
@@ -177,54 +203,88 @@ async fn run_command(parsed: args::Cli) -> Result<i32, i32> {
 }
 
 /// The signals that end an interactive command early: Ctrl-C, a closed terminal, a polite kill.
-enum Interrupts {
-    Watched {
-        interrupt: Signal,
-        hangup: Signal,
-        terminate: Signal,
-    },
-    /// Installing a handler failed; the command still runs, and says what an interrupt now costs.
-    Unwatched,
+///
+/// A signal the process inherited as ignored stays ignored: `nohup`, or a background job of a
+/// non-interactive shell, asked for exactly that, and its jobs are meant to outlive the caller.
+struct Interrupts {
+    interrupt: Option<Signal>,
+    hangup: Option<Signal>,
+    terminate: Option<Signal>,
 }
 
 impl Interrupts {
+    fn none() -> Self {
+        Self {
+            interrupt: None,
+            hangup: None,
+            terminate: None,
+        }
+    }
+
     fn install() -> Self {
-        match Self::watch() {
-            Ok(watched) => watched,
-            Err(error) => {
-                eprintln!(
-                    "cowshed: cannot watch for interrupts ({error}); interrupting this command \
-                     will leave the jobs it started running"
-                );
-                Self::Unwatched
-            }
+        Self {
+            interrupt: watch(SignalKind::interrupt(), libc::SIGINT, "SIGINT"),
+            hangup: watch(SignalKind::hangup(), libc::SIGHUP, "SIGHUP"),
+            terminate: watch(SignalKind::terminate(), libc::SIGTERM, "SIGTERM"),
         }
     }
 
-    fn watch() -> io::Result<Self> {
-        Ok(Self::Watched {
-            interrupt: signal(SignalKind::interrupt())?,
-            hangup: signal(SignalKind::hangup())?,
-            terminate: signal(SignalKind::terminate())?,
-        })
-    }
-
-    /// The number of the first watched signal to arrive; never resolves when unwatched.
+    /// The number of the first watched signal to arrive; never resolves when none is watched.
     async fn received(&mut self) -> i32 {
-        match self {
-            Self::Watched {
-                interrupt,
-                hangup,
-                terminate,
-            } => tokio::select! {
-                Some(()) = interrupt.recv() => libc::SIGINT,
-                Some(()) = hangup.recv() => libc::SIGHUP,
-                Some(()) = terminate.recv() => libc::SIGTERM,
-                else => std::future::pending().await,
-            },
-            Self::Unwatched => std::future::pending().await,
+        tokio::select! {
+            () = arrival(&mut self.interrupt) => libc::SIGINT,
+            () = arrival(&mut self.hangup) => libc::SIGHUP,
+            () = arrival(&mut self.terminate) => libc::SIGTERM,
         }
     }
+}
+
+/// Watches `kind` unless the process inherited it as ignored. A disposition that cannot be read
+/// or a handler that cannot be installed is said out loud, and that signal keeps its inherited
+/// action.
+fn watch(kind: SignalKind, number: libc::c_int, name: &str) -> Option<Signal> {
+    match inherited_as_ignored(number) {
+        Ok(true) => return None,
+        Ok(false) => {}
+        Err(error) => {
+            eprintln!(
+                "cowshed: cannot read the {name} disposition ({error}); a {name} will leave the \
+                 jobs this command started running"
+            );
+            return None;
+        }
+    }
+    match signal(kind) {
+        Ok(watched) => Some(watched),
+        Err(error) => {
+            eprintln!(
+                "cowshed: cannot watch for {name} ({error}); a {name} will leave the jobs this \
+                 command started running"
+            );
+            None
+        }
+    }
+}
+
+fn inherited_as_ignored(number: libc::c_int) -> io::Result<bool> {
+    let mut current = std::mem::MaybeUninit::<libc::sigaction>::uninit();
+    // SAFETY: with a null new action `sigaction` only reads: it writes the current disposition of
+    // `number` into `current`, which is valid for one `sigaction` struct, and changes nothing.
+    if unsafe { libc::sigaction(number, std::ptr::null(), current.as_mut_ptr()) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `sigaction` returned 0, so it initialised every field of `current`.
+    let current = unsafe { current.assume_init() };
+    Ok(current.sa_sigaction == libc::SIG_IGN)
+}
+
+async fn arrival(signal: &mut Option<Signal>) {
+    if let Some(signal) = signal
+        && signal.recv().await.is_some()
+    {
+        return;
+    }
+    std::future::pending().await
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -335,6 +395,25 @@ mod tests {
             assert!(result.is_err());
             assert!(!service_invoked.get());
         }
+    }
+
+    /// `nohup` hands its command SIGHUP ignored. Watching it anyway would let a closed terminal
+    /// end a command, and the jobs it started, that the caller asked to outlive the terminal.
+    /// Nextest runs each test in its own process, so the disposition set here reaches no other.
+    #[tokio::test]
+    async fn a_signal_inherited_as_ignored_stays_ignored() {
+        // SAFETY: SIG_IGN installs no handler code; the call only changes this process's
+        // disposition for SIGHUP, which nothing else in this test process relies on.
+        let previous = unsafe { libc::signal(libc::SIGHUP, libc::SIG_IGN) };
+        assert_ne!(previous, libc::SIG_ERR, "set SIGHUP ignored");
+
+        let interrupts = Interrupts::install();
+        assert!(interrupts.hangup.is_none(), "an ignored SIGHUP was watched");
+        assert!(interrupts.interrupt.is_some(), "SIGINT was not watched");
+        assert!(
+            inherited_as_ignored(libc::SIGHUP).expect("read SIGHUP disposition"),
+            "installing the watch replaced the inherited SIG_IGN"
+        );
     }
 
     #[test]
