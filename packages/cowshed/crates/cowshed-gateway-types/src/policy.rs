@@ -273,7 +273,12 @@ impl EgressGrant {
         if method == Method::CONNECT {
             return Ok(true);
         }
-        if self.mode != EgressMode::Intercept || !self.methods.contains(method.as_str()) {
+        if self.mode != EgressMode::Intercept {
+            return Ok(false);
+        }
+        if !self.methods.contains(method.as_str())
+            && !(method == Method::POST && is_git_upload_pack(path))
+        {
             return Ok(false);
         }
         for prefix in &self.path_prefixes {
@@ -283,6 +288,16 @@ impl EgressGrant {
         }
         Ok(false)
     }
+}
+
+/// git's smart-HTTP fetch endpoint, `<repository>/git-upload-pack`. A fetch, clone or
+/// `ls-remote` is a read, but git can only express its negotiation as a POST there (and
+/// protocol v2 POSTs even the ref listing), so an intercept grant that admits reads must admit
+/// this one POST or git through it cannot list a single ref. `git-receive-pack` — a push — is not
+/// it, nor is any other POST. The raw path is compared: an encoded separator never matches.
+fn is_git_upload_pack(path: &str) -> bool {
+    let path = path.split_once('?').map_or(path, |(path, _)| path);
+    path.ends_with("/git-upload-pack")
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -809,6 +824,57 @@ mod tests {
                 NPM_PREFIX
             )
             .expect("well-formed path")
+        );
+    }
+
+    /// git's smart-HTTP fetch is a read that git can only say as a POST: `ls-remote`, `fetch`
+    /// and `clone` POST their negotiation to `<repo>/git-upload-pack` (protocol v2 even for the
+    /// ref listing). An intercept grant admits exactly that POST; a push (`git-receive-pack`) and
+    /// every other POST stay refused.
+    #[test]
+    fn an_intercept_grant_admits_git_smart_http_fetch_and_refuses_push() {
+        let grant = EgressGrant::intercept("github.com", 443).expect("fixture grant");
+        let target = CanonicalTarget::from_authority("github.com:443", TargetScheme::Https)
+            .expect("fixture target");
+        let admitted = |method: Method, path: &str| {
+            grant
+                .admits(&target, &method, path)
+                .expect("well-formed path")
+        };
+        assert!(admitted(
+            Method::GET,
+            "/octocat/Hello-World/info/refs?service=git-upload-pack"
+        ));
+        assert!(admitted(
+            Method::POST,
+            "/octocat/Hello-World/git-upload-pack"
+        ));
+        assert!(admitted(
+            Method::POST,
+            "/octocat/Hello-World.git/git-upload-pack"
+        ));
+        assert!(!admitted(
+            Method::POST,
+            "/octocat/Hello-World/git-receive-pack"
+        ));
+        assert!(!admitted(
+            Method::POST,
+            "/octocat/Hello-World/git-upload-pack/extra"
+        ));
+        assert!(!admitted(Method::POST, "/graphql"));
+        assert!(!admitted(
+            Method::PUT,
+            "/octocat/Hello-World/git-upload-pack"
+        ));
+        let opaque = EgressGrant::opaque("github.com", 443).expect("fixture grant");
+        assert!(
+            !opaque
+                .admits(
+                    &target,
+                    &Method::POST,
+                    "/octocat/Hello-World/git-upload-pack"
+                )
+                .expect("well-formed path")
         );
     }
 

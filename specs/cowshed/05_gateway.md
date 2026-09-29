@@ -69,10 +69,13 @@ Three tiers, never mixed:
   for the project's stable `repo_id` named the exact registry origin and package/module scope. The trusted project
   policy has no admission field, so no workspace holds a mirror route beyond the public baselines; repository config
   cannot admit one either. The gateway rejects an unadmitted route before credential lookup.
-- **Granted hosts.** `cowshed grant <ws> --egress <host>` defaults to `mode: "intercept"`; `--opaque` selects a byte
-  tunnel with host-only audit and no injection. `--impersonate <profile>` affects the outbound intercepted leg only and
-  suppresses all injected headers. A project's standing egress grants (`cowshed grant --project-wide --egress <host>`,
-  04_sandbox.md) join every workspace's own. Unmatched destinations are denied.
+- **Granted hosts.** `cowshed grant <ws> --egress <host>` defaults to `mode: "intercept"`, which admits `GET` and `HEAD`
+  on the whole origin plus `POST` to a path ending in `/git-upload-pack` — git's smart-HTTP fetch, a read git can only
+  express as a POST (protocol v2 posts even the ref listing); `git-receive-pack` and every other write are refused.
+  `--opaque` selects a byte tunnel with host-only audit and no injection. `--impersonate <profile>` affects the outbound
+  intercepted leg only and suppresses all injected headers. A project's standing egress grants
+  (`cowshed grant --project-wide --egress <host>`, 04_sandbox.md) join every workspace's own. Unmatched destinations are
+  denied.
 
 ## Endpoints (data plane, per-workspace endpoint)
 
