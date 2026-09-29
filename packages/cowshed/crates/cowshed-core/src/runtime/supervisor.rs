@@ -2021,6 +2021,23 @@ struct SupervisorActor {
     command_lane_closed: bool,
 }
 
+/// The actor's run loop ends only once every job is terminal, so an actor dropped with a job still
+/// running was torn down with the runtime that hosts it. No later controller knows that job: it
+/// would run on unobserved and uncancellable, so its process tree ends here with its record. The
+/// kill is best effort; a group that already exited has nothing left to signal.
+impl Drop for SupervisorActor {
+    fn drop(&mut self) {
+        for job in self.jobs.values_mut() {
+            if job.terminal() {
+                continue;
+            }
+            if let Some(process) = job.process.as_mut() {
+                let _ = process.signal_process_tree(ProcessSignal::Kill);
+            }
+        }
+    }
+}
+
 impl SupervisorActor {
     async fn run(mut self) {
         loop {

@@ -1521,3 +1521,40 @@ async fn a_terminal_log_read_answers_from_the_sealed_artifact_not_a_retained_cop
         ErrorCode::Conflict
     );
 }
+
+/// A supervisor torn down with its hosting runtime, while a job still runs, was dropped rather
+/// than stopped. No later controller knows that job, so it must end with the supervisor instead
+/// of running on as an orphan nothing can observe or cancel.
+#[test]
+fn a_dropped_supervisor_ends_the_jobs_it_still_runs() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let (mut h, job, spawned) = runtime.block_on(async {
+        let mut h = harness(1, 1024, false, false);
+        let job = h
+            .handle
+            .exec_background(None, request(StdinSource::Empty))
+            .await
+            .unwrap();
+        let spawned = h.spawned.recv().await.unwrap();
+        (h, job, spawned)
+    });
+    let signals = |observed: Vec<ProcessObservation>| {
+        observed
+            .into_iter()
+            .filter(|observation| matches!(observation, ProcessObservation::Signal(..)))
+            .collect::<Vec<_>>()
+    };
+    let before: Vec<_> = std::iter::from_fn(|| h.process.try_recv().ok()).collect();
+    assert_eq!(signals(before), [], "nothing was signalled while it ran");
+    drop(runtime);
+    let after: Vec<_> = std::iter::from_fn(|| h.process.try_recv().ok()).collect();
+    assert_eq!(
+        signals(after),
+        [ProcessObservation::Signal(job, ProcessSignal::Kill)],
+        "the running job of a dropped supervisor"
+    );
+    drop(spawned);
+}
