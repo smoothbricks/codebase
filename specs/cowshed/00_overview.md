@@ -78,8 +78,8 @@ Agent-driven development multiplies workspaces. Three failure modes follow:
 The diagram shows the macOS/APFS substrate: ASIF images use `.asif` and `diskutil image attach`, while SPARSE fallback
 images use `.sparseimage` and `hdiutil attach`; detached metadata selects the tool and must agree with the extension
 (01_storage.md). On Linux the same logical shape holds with ZFS datasets in place of image files and the store mounted
-directly at `/private/cowshed/store` with the caches dataset nested at `/private/cowshed/caches` (09_substrates.md). Both volumes are
-dedicated: the Data volume carries no cowshed bytes (01_storage.md).
+directly at `/private/cowshed/store` with the caches dataset nested at `/private/cowshed/caches` (09_substrates.md).
+Both volumes are dedicated: the Data volume carries no cowshed bytes (01_storage.md).
 
 Gateway reachability is deliberately platform-specific. macOS package clients use the workspace's `portBlock.base`.
 Linux allocates no `portBlock`: each attached workspace has a private loopback/netns and a controller-launched trusted
@@ -101,16 +101,16 @@ validates it on every open, permits multiple bound identities with exactly one p
 `repo_id` for a local-only repository. Discovery never mints an identity: it may select a remote only when every
 normalized candidate has the same `repo_id`; distinct candidates require an explicit matching `repo_id`, with `origin`
 preferred only among remotes for that same identity. Each component is validated and encoded independently before path
-joining. Trusted project policy lives only at `/private/cowshed/store/<owner>/<repo>/policy.json`, outside every workspace and
-denied to sandboxes (01_storage.md).
+joining. Trusted project policy lives only at `/private/cowshed/store/<owner>/<repo>/policy.json`, outside every
+workspace and denied to sandboxes (01_storage.md).
 
 State is derived, never stored: the workspace clones are the registry (readdir / `zfs list`), the kernel mount table is
 the attachment state (getmntinfo), the controller-owned remote binding establishes repository identity, and an
 in-workspace marker (`.cowshed/workspace.json`) identifies a workspace incarnation. There is **no mutable state
 database**. Each project does have one bounded, controller-owned `lifecycle-intents.json` recovery journal: it persists
 the latest create/fork/remove intent per logical workspace before mutation, but never overrides the inventory. Startup
-reconciles pending intent against images, mounts, and markers, records the exact completed result, and retries only work
-whose publication is still absent.
+reconciles pending intent that no live process is executing against images, mounts, and markers, records the exact
+completed result, and retries only work whose publication is still absent.
 
 The persistent daemons are the gateway (one per host) and the per-workspace shell supervisors (11_shell.md), with the
 optional MCP socket server (12_mcp.md). Linux additionally has one ephemeral minimal connector per attached workspace;

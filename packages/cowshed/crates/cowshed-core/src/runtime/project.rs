@@ -103,6 +103,10 @@ pub trait ProjectRuntimeHost: Send + 'static {
     fn descriptor(&self) -> &ProjectDescriptor;
 
     async fn recover(&mut self) -> Result<()>;
+    /// The verb (or startup recovery) that claimed this host's lifecycle-intent leases returned:
+    /// release them, so an intent it left unfinished becomes crash residue for the next open
+    /// rather than an operation this idle process still appears to be running.
+    fn release_intent_leases(&mut self) {}
     async fn snapshots(&mut self) -> Result<Vec<WorkspaceSnapshot>>;
     async fn workspace_at(&mut self, path: PathBuf) -> Result<WorkspaceSnapshot>;
 
@@ -409,6 +413,7 @@ impl ProjectRuntime {
                 },
             }
         }
+        host.release_intent_leases();
         let descriptor = host.descriptor().clone();
         let capacity = NonZeroUsize::new(ROUTER_CAPACITY)
             .ok_or_else(|| CowshedError::internal("project router capacity is zero"))?;
@@ -471,6 +476,7 @@ impl ProjectActor {
         while let Some(command) = self.receiver.recv().await {
             let (request, reply) = command.into_parts();
             let response = self.route(request).await;
+            self.host.release_intent_leases();
             let _ = reply.send(response);
         }
     }
@@ -1419,6 +1425,10 @@ struct NativeProjectRuntimeHost {
     telemetry_root: PathBuf,
     lifecycle_intents_path: PathBuf,
     lifecycle_intents: crate::storage::recovery::LifecycleIntentJournal,
+    /// The workspaces whose lifecycle operation this process is executing in the current verb.
+    /// Released when the verb returns, so an unfinished intent it leaves behind becomes an
+    /// ordinary crash residue for the next open instead of staying owned by an idle process.
+    intent_leases: std::collections::BTreeMap<WorkspaceName, crate::storage::recovery::IntentLease>,
     /// How this host reconciles the binding's remotes, both at recovery and per verb. A host
     /// opened for the identity change skips the pairing that verb exists to supersede; every
     /// other host heals transport moves exactly like a fresh open would.
@@ -2157,38 +2167,79 @@ impl NativeProjectRuntimeHost {
             telemetry_root,
             lifecycle_intents_path,
             lifecycle_intents,
+            intent_leases: std::collections::BTreeMap::new(),
             binding_remote_validation: validation,
             recovery_removal_target: None,
         })
     }
-    async fn replace_lifecycle_intents(
+    /// Apply `change` to the journal on disk under its lock and adopt the result, which also
+    /// carries every record other processes wrote since this host last read it.
+    async fn update_lifecycle_intents<T: Send + 'static>(
         &mut self,
-        next: crate::storage::recovery::LifecycleIntentJournal,
-    ) -> Result<()> {
+        change: impl FnOnce(&mut crate::storage::recovery::LifecycleIntentJournal) -> Result<T>
+        + Send
+        + 'static,
+    ) -> Result<T> {
         let path = self.lifecycle_intents_path.clone();
-        self.lifecycle_intents = crate::storage::lifecycle::dispatch_blocking(move || {
-            next.persist(&path)?;
-            Ok::<_, CowshedError>(next)
+        let (journal, value) = crate::storage::lifecycle::dispatch_blocking(move || {
+            crate::storage::recovery::LifecycleIntentJournal::update(&path, change)
         })
         .await
         .map_err(|error| {
             CowshedError::internal(format!("lifecycle intent persistence task failed: {error}"))
         })??;
+        self.lifecycle_intents = journal;
+        Ok(value)
+    }
+
+    async fn reload_lifecycle_intents(&mut self) -> Result<()> {
+        let path = self.lifecycle_intents_path.clone();
+        self.lifecycle_intents = crate::storage::lifecycle::dispatch_blocking(move || {
+            crate::storage::recovery::LifecycleIntentJournal::load(&path)
+        })
+        .await
+        .map_err(|error| {
+            CowshedError::internal(format!("lifecycle intent read task failed: {error}"))
+        })??;
         Ok(())
+    }
+
+    /// Hold `workspace`'s intent lease for the rest of the current verb. `false` when another
+    /// live process holds it: that process is executing a lifecycle operation on `workspace`.
+    fn claim_intent_lease(&mut self, workspace: &WorkspaceName) -> Result<bool> {
+        if self.intent_leases.contains_key(workspace) {
+            return Ok(true);
+        }
+        match crate::storage::recovery::IntentLease::try_claim(
+            &self.layout.project().sessions,
+            workspace,
+        )? {
+            Some(lease) => {
+                self.intent_leases.insert(workspace.clone(), lease);
+                Ok(true)
+            }
+            None => Ok(false),
+        }
     }
 
     async fn begin_lifecycle_intent(
         &mut self,
         operation: crate::storage::recovery::LifecycleIntent,
     ) -> Result<()> {
-        let mut next = self.lifecycle_intents.clone();
-        next.begin(operation);
-        self.replace_lifecycle_intents(next).await
+        let target = operation.target().clone();
+        if !self.claim_intent_lease(&target)? {
+            return Err(another_process_is_running(&target));
+        }
+        self.update_lifecycle_intents(move |journal| {
+            journal.begin(operation);
+            Ok(())
+        })
+        .await
     }
     async fn mark_lifecycle_intent_mutating(&mut self, workspace: &WorkspaceName) -> Result<()> {
-        let mut next = self.lifecycle_intents.clone();
-        next.mark_mutating(workspace)?;
-        self.replace_lifecycle_intents(next).await
+        let workspace = workspace.clone();
+        self.update_lifecycle_intents(move |journal| journal.mark_mutating(&workspace))
+            .await
     }
     /// Records the publication-fence sub-steps as complete after staged execution
     /// succeeded. Staged success implies the sidecar, companion, and image are all
@@ -2200,32 +2251,41 @@ impl NativeProjectRuntimeHost {
     /// crash window — the safe direction.
     async fn mark_lifecycle_fence_complete(&mut self, workspace: &WorkspaceName) {
         use crate::storage::recovery::FenceStep;
-        let mut next = self.lifecycle_intents.clone();
-        let marked = [FenceStep::Sidecar, FenceStep::Companion, FenceStep::Image]
-            .into_iter()
-            .try_for_each(|step| next.mark_fence_step(workspace, step));
-        if marked.is_ok() {
-            let _ = self.replace_lifecycle_intents(next).await;
-        }
+        let workspace = workspace.clone();
+        let _ = self
+            .update_lifecycle_intents(move |journal| {
+                [FenceStep::Sidecar, FenceStep::Companion, FenceStep::Image]
+                    .into_iter()
+                    .try_for_each(|step| journal.mark_fence_step(&workspace, step))
+            })
+            .await;
     }
     async fn discard_prepared_retire_intent(&mut self, workspace: &WorkspaceName) -> Result<()> {
-        let mut next = self.lifecycle_intents.clone();
-        if !next.discard_prepared_retirement(workspace) {
-            return Err(CowshedError::internal(format!(
-                "prepared retirement for {workspace} disappeared during recovery"
-            )));
-        }
-        self.replace_lifecycle_intents(next).await
+        let workspace = workspace.clone();
+        self.update_lifecycle_intents(move |journal| {
+            if journal.discard_prepared_retirement(&workspace) {
+                Ok(())
+            } else {
+                Err(CowshedError::internal(format!(
+                    "prepared retirement for {workspace} disappeared during recovery"
+                )))
+            }
+        })
+        .await
     }
     async fn restore_prepared_clone_intent(&mut self, workspace: &WorkspaceName) -> Result<()> {
-        let mut next = self.lifecycle_intents.clone();
-        if !next.restore_prepared_clone_intent(workspace) {
-            return Err(CowshedError::integrity(
-                format!("prepared clone retirement for {workspace} changed during recovery"),
-                "cowshed doctor --json",
-            ));
-        }
-        self.replace_lifecycle_intents(next).await
+        let workspace = workspace.clone();
+        self.update_lifecycle_intents(move |journal| {
+            if journal.restore_prepared_clone_intent(&workspace) {
+                Ok(())
+            } else {
+                Err(CowshedError::integrity(
+                    format!("prepared clone retirement for {workspace} changed during recovery"),
+                    "cowshed doctor --json",
+                ))
+            }
+        })
+        .await
     }
 
     async fn complete_lifecycle_intent(
@@ -2233,9 +2293,9 @@ impl NativeProjectRuntimeHost {
         workspace: &WorkspaceName,
         completion: crate::storage::recovery::LifecycleIntentCompletion,
     ) -> Result<()> {
-        let mut next = self.lifecycle_intents.clone();
-        next.complete(workspace, completion)?;
-        self.replace_lifecycle_intents(next).await
+        let workspace = workspace.clone();
+        self.update_lifecycle_intents(move |journal| journal.complete(&workspace, completion))
+            .await
     }
 
     fn completed_workspace_intent(
@@ -2271,19 +2331,41 @@ impl NativeProjectRuntimeHost {
     /// Finishes create/fork/adopt work and authorized retire mutations a crash left pending, then
     /// records the exact result so a later start does not repeat it. A prepared retirement has not
     /// mutated anything and is discarded: it may be the residue of a safety refusal, not durable
-    /// authorization to delete on every later command. Reports whether recovery mutated images or
-    /// mounts, so a caller can discard an inventory read only when necessary.
+    /// authorization to delete on every later command. An unfinished intent whose lease another
+    /// process holds is no residue at all: that process is running the operation right now, and
+    /// replaying it here would run it a second time beside the first. Reports whether recovery
+    /// mutated images or mounts, so a caller can discard an inventory read only when necessary.
     async fn recover_lifecycle_intents(&mut self) -> Result<bool> {
         use super::supervisor::{CommitmentDraft, CommitmentSink};
         use crate::storage::recovery::{
             LifecycleIntent, LifecycleIntentCompletion, LifecycleIntentPhase,
         };
 
-        let pending = self
+        self.reload_lifecycle_intents().await?;
+        let unfinished = self
             .lifecycle_intents
             .records()
             .filter(|(_, record)| record.completion.is_none())
-            .map(|(_, record)| record.clone())
+            .map(|(workspace, _)| workspace.clone())
+            .collect::<Vec<_>>();
+        let mut claimed = Vec::with_capacity(unfinished.len());
+        for workspace in unfinished {
+            if self.claim_intent_lease(&workspace)? {
+                claimed.push(workspace);
+            } else {
+                eprintln!(
+                    "cowshed: leaving {workspace} to the cowshed process running its lifecycle operation"
+                );
+            }
+        }
+        // Read again under the leases: an owner may have finished between the first read and
+        // the claim, and its result is the record to act on.
+        self.reload_lifecycle_intents().await?;
+        let pending = claimed
+            .iter()
+            .filter_map(|workspace| self.lifecycle_intents.get(workspace))
+            .filter(|record| record.completion.is_none())
+            .cloned()
             .collect::<Vec<_>>();
         if pending.is_empty() {
             return Ok(false);
@@ -4971,6 +5053,10 @@ mod rebase_recovery_tests {
 impl ProjectRuntimeHost for NativeProjectRuntimeHost {
     fn descriptor(&self) -> &ProjectDescriptor {
         &self.descriptor
+    }
+
+    fn release_intent_leases(&mut self) {
+        self.intent_leases.clear();
     }
 
     async fn recover(&mut self) -> Result<()> {
@@ -10168,6 +10254,14 @@ fn is_git_worktree(metadata: &crate::metadata::DetachedWorkspaceMetadata) -> boo
         .info_snapshot
         .as_ref()
         .is_some_and(|info| info.git_worktree)
+}
+
+#[cfg(target_os = "macos")]
+fn another_process_is_running(workspace: &WorkspaceName) -> CowshedError {
+    CowshedError::conflict(
+        format!("another cowshed process is running a lifecycle operation on {workspace}"),
+        "wait for that operation to finish, then retry",
+    )
 }
 
 /// Split a mounted workspace marker into identity vs project-root findings.

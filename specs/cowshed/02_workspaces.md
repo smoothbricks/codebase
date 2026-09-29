@@ -259,6 +259,13 @@ Allocation scans include those reservations without making the workspace visible
 may be reclaimed, but that never releases a block still owned by an image. Resuming `new` or `fork` reuses the stored
 grant rather than allocating a temporary second block. Duplicate ownership remains an integrity refusal.
 
+Every cowshed process that opens a project shares its intent journal. Each change re-reads and rewrites the journal
+under an exclusive lock on `lifecycle-intents.json.lock`, so no process writes back a copy that predates another
+process's intent. The process executing a workspace's lifecycle operation holds that workspace's intent lease
+(`sessions/<name>.intent.lock`) until the verb returns; the kernel releases it when the process exits, however it exits.
+Startup recovery acts only on unfinished intents whose lease it can take. An intent whose lease another process holds is
+that process's running operation, not crash residue, and is never run a second time beside it.
+
 | Kill window                                                      | Durable state                                                  | Recovery action and guard                                                                                                                                                                                   |
 | ---------------------------------------------------------------- | -------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Before pending metadata                                          | Intent only                                                    | Re-run create/fork normally.                                                                                                                                                                                |

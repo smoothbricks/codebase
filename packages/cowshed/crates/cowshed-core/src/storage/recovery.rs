@@ -1,5 +1,7 @@
 use std::collections::BTreeMap;
+use std::fs::{File, OpenOptions};
 use std::io;
+use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
@@ -14,6 +16,8 @@ pub const STAGING_NAMESPACE: &str = ".staging";
 pub const TRASH_NAMESPACE: &str = ".trash";
 pub const LIFECYCLE_INTENTS_FILE: &str = "lifecycle-intents.json";
 const LIFECYCLE_INTENT_VERSION: u32 = 1;
+/// Suffix of the per-workspace lease file beside a project's session images.
+pub const INTENT_LEASE_SUFFIX: &str = ".intent.lock";
 
 /// Durable user intent written before a lifecycle verb's first mutation.
 ///
@@ -206,7 +210,36 @@ impl LifecycleIntentJournal {
         Ok(journal)
     }
 
-    pub fn persist(&self, path: &Path) -> CowshedResult<()> {
+    /// Apply one change to the journal on disk and return what the journal became.
+    ///
+    /// Every cowshed process that opens a project writes this one file, so a change is never
+    /// applied to a copy read earlier: that copy predates whatever other processes recorded since,
+    /// and writing it back erased their intents — a `new` killed after such an erasure left an
+    /// unpublished clone that nothing could finish or retire. The file is re-read and rewritten
+    /// under an exclusive lock on its `.lock` sibling, held for exactly that read and write.
+    pub fn update<T>(
+        path: &Path,
+        change: impl FnOnce(&mut Self) -> CowshedResult<T>,
+    ) -> CowshedResult<(Self, T)> {
+        let mut lock_path = path.as_os_str().to_owned();
+        lock_path.push(".lock");
+        let lock = open_lock_file(Path::new(&lock_path))?;
+        lock.lock().map_err(|error| {
+            CowshedError::environment_missing(
+                format!(
+                    "cannot lock lifecycle intent journal {}: {error}",
+                    path.display()
+                ),
+                "check controller storage permissions and retry",
+            )
+        })?;
+        let mut journal = Self::load(path)?;
+        let value = change(&mut journal)?;
+        journal.persist(path)?;
+        Ok((journal, value))
+    }
+
+    fn persist(&self, path: &Path) -> CowshedResult<()> {
         self.validate()?;
         write_json(path, self).map_err(|error| {
             CowshedError::storage_failure(
@@ -391,6 +424,62 @@ impl LifecycleIntentJournal {
         }
         Ok(())
     }
+}
+
+/// Proof that this process is executing the lifecycle operation recorded for one workspace.
+///
+/// An unfinished intent is either a crash's residue, which the next process to open the project
+/// finishes, or an operation another process is running right now, which nobody else may touch:
+/// replaying it runs it a second time beside the first — a second clone, a second bundle writer
+/// on the same trash path. The journal cannot tell the two apart; an exclusive lock can. The
+/// executing process holds one per workspace for as long as it works on it, and the kernel
+/// releases it when that process ends, however it ends.
+#[derive(Debug)]
+pub struct IntentLease {
+    _file: File,
+}
+
+impl IntentLease {
+    /// Take the lease on `workspace`'s intent, whose lock file lives in `directory`; `None`
+    /// while another process holds it.
+    pub fn try_claim(directory: &Path, workspace: &WorkspaceName) -> CowshedResult<Option<Self>> {
+        std::fs::create_dir_all(directory).map_err(|error| {
+            CowshedError::environment_missing(
+                format!(
+                    "cannot create lifecycle lease directory {}: {error}",
+                    directory.display()
+                ),
+                "check controller storage permissions and retry",
+            )
+        })?;
+        let path = directory.join(format!("{workspace}{INTENT_LEASE_SUFFIX}"));
+        let file = open_lock_file(&path)?;
+        match file.try_lock() {
+            Ok(()) => Ok(Some(Self { _file: file })),
+            Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+            Err(std::fs::TryLockError::Error(error)) => Err(CowshedError::environment_missing(
+                format!("cannot lock lifecycle lease {}: {error}", path.display()),
+                "check controller storage permissions and retry",
+            )),
+        }
+    }
+}
+
+/// Open (creating) a lock file without following a symlink planted at its name.
+fn open_lock_file(path: &Path) -> CowshedResult<File> {
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|error| {
+            CowshedError::environment_missing(
+                format!("cannot open lifecycle lock {}: {error}", path.display()),
+                "check controller storage permissions and retry",
+            )
+        })
 }
 
 /// Store-root intent for the one operation whose project directory changes name.

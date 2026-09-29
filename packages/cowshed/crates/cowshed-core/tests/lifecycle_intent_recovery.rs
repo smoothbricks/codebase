@@ -2,16 +2,18 @@ use std::fs::{self, File, OpenOptions};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use cowshed_core::api::{CreateOptions, RemoveOptions, RemoveReport};
 use cowshed_core::metadata::{WorkspaceIncarnation, WorkspaceName};
 use cowshed_core::storage::recovery::{
-    LIFECYCLE_INTENTS_FILE, LifecycleIntent, LifecycleIntentCompletion, LifecycleIntentJournal,
+    IntentLease, LIFECYCLE_INTENTS_FILE, LifecycleIntent, LifecycleIntentCompletion,
+    LifecycleIntentJournal, LifecycleIntentPhase,
 };
 
 const CHILD_MODE: &str = "COWSHED_LIFECYCLE_CRASH_CHILD";
 const CHILD_ROOT: &str = "COWSHED_LIFECYCLE_CRASH_ROOT";
+const LEASE_CHILD_ROOT: &str = "COWSHED_LIFECYCLE_LEASE_CHILD_ROOT";
 
 struct TestRoot(PathBuf);
 
@@ -96,11 +98,11 @@ fn lifecycle_intent_child() {
     let root = PathBuf::from(std::env::var_os(CHILD_ROOT).expect("child fixture root"));
     let journal_path = root.join(LIFECYCLE_INTENTS_FILE);
     let operation_intent = intent(&operation);
-    let mut journal = LifecycleIntentJournal::default();
-    journal.begin(operation_intent);
-    journal
-        .persist(&journal_path)
-        .expect("persist intent before mutation");
+    LifecycleIntentJournal::update(&journal_path, |journal| {
+        journal.begin(operation_intent);
+        Ok(())
+    })
+    .expect("persist intent before mutation");
 
     let state = state_path(&root, &operation);
     if operation == "remove" {
@@ -147,7 +149,7 @@ fn crash_then_recover(operation: &str) {
     );
 
     let journal_path = root.path().join(LIFECYCLE_INTENTS_FILE);
-    let mut reopened = LifecycleIntentJournal::load(&journal_path).expect("reopen durable intent");
+    let reopened = LifecycleIntentJournal::load(&journal_path).expect("reopen durable intent");
     let target = intent(operation).target().clone();
     let record = reopened
         .get(&target)
@@ -164,12 +166,10 @@ fn crash_then_recover(operation: &str) {
             WorkspaceIncarnation::new("a".repeat(32)).expect("fixture incarnation"),
         )
     };
-    reopened
-        .complete(&target, completion.clone())
-        .expect("reconcile published state");
-    reopened
-        .persist(&journal_path)
-        .expect("persist recovery result");
+    LifecycleIntentJournal::update(&journal_path, |journal| {
+        journal.complete(&target, completion.clone())
+    })
+    .expect("reconcile published state");
 
     let retried = LifecycleIntentJournal::load(&journal_path).expect("retry reload");
     assert_eq!(
@@ -287,35 +287,35 @@ fn refused_pending_retirement_restores_the_clone_and_a_new_removal_can_be_author
         source: workspace("main"),
         destination: name.clone(),
     };
-    let mut journal = LifecycleIntentJournal::default();
-    journal.begin(clone.clone());
-    journal.begin(LifecycleIntent::Retire {
-        workspace: name.clone(),
-        options: RemoveOptions::default(),
-        origin: Some(Box::new(clone.clone())),
-    });
-    journal
-        .persist(&path)
-        .expect("persist interrupted retirement");
+    LifecycleIntentJournal::update(&path, |journal| {
+        journal.begin(clone.clone());
+        journal.begin(LifecycleIntent::Retire {
+            workspace: name.clone(),
+            options: RemoveOptions::default(),
+            origin: Some(Box::new(clone.clone())),
+        });
+        Ok(())
+    })
+    .expect("persist interrupted retirement");
 
-    let mut reopened = LifecycleIntentJournal::load(&path).expect("reopen pending retirement");
-    assert!(reopened.restore_prepared_clone_intent(&name));
-    assert_eq!(reopened.get(&name).unwrap().operation, clone);
-    reopened.begin(LifecycleIntent::Retire {
-        workspace: name.clone(),
-        options: RemoveOptions {
-            abandon: true,
-            ..RemoveOptions::default()
-        },
-        origin: Some(Box::new(clone)),
-    });
-    reopened
-        .mark_mutating(&name)
-        .expect("begin authorized retirement");
-    assert!(!reopened.restore_prepared_clone_intent(&name));
-    reopened
-        .persist(&path)
-        .expect("persist mutating retirement");
+    LifecycleIntentJournal::update(&path, |reopened| {
+        assert!(reopened.restore_prepared_clone_intent(&name));
+        assert_eq!(reopened.get(&name).unwrap().operation, clone);
+        reopened.begin(LifecycleIntent::Retire {
+            workspace: name.clone(),
+            options: RemoveOptions {
+                abandon: true,
+                ..RemoveOptions::default()
+            },
+            origin: Some(Box::new(clone.clone())),
+        });
+        reopened
+            .mark_mutating(&name)
+            .expect("begin authorized retirement");
+        assert!(!reopened.restore_prepared_clone_intent(&name));
+        Ok(())
+    })
+    .expect("persist mutating retirement");
     let recovered = LifecycleIntentJournal::load(&path).expect("reopen mutating retirement");
     let LifecycleIntent::Retire { options, .. } = &recovered.get(&name).unwrap().operation else {
         panic!("retirement remains recoverable");
@@ -336,6 +336,116 @@ fn killed_fork_reopens_reconciles_and_retries_exactly_once() {
 #[test]
 fn killed_remove_reopens_reconciles_and_retries_exactly_once() {
     crash_then_recover("remove");
+}
+
+#[test]
+fn a_killed_create_keeps_its_intent_when_another_process_updates_the_journal() {
+    // Another cowshed process opened this project before `new` began and records its own
+    // lifecycle step after `new` was killed mid-flight. The killed create's intent is the only
+    // authority that can finish or retire its unpublished clone, so an update about a different
+    // workspace must not erase it.
+    let root = TestRoot::new("concurrent-update");
+    let journal_path = root.path().join(LIFECYCLE_INTENTS_FILE);
+
+    let status = Command::new(std::env::current_exe().expect("current test executable"))
+        .args(["--exact", "lifecycle_intent_child", "--nocapture"])
+        .env(CHILD_MODE, "create")
+        .env(CHILD_ROOT, root.path())
+        .status()
+        .expect("spawn create child");
+    assert!(!status.success(), "the create child is killed mid-flight");
+
+    LifecycleIntentJournal::update(&journal_path, |journal| {
+        journal.begin(retire("unrelated", RemoveOptions::default()));
+        Ok(())
+    })
+    .expect("record the other process's step");
+
+    let reopened = LifecycleIntentJournal::load(&journal_path).expect("reopen");
+    let killed = reopened
+        .get(&workspace("created"))
+        .expect("the killed create's intent survives the other process's update");
+    assert_eq!(killed.operation, intent("create"));
+    assert_eq!(killed.completion, None);
+    assert!(
+        reopened.get(&workspace("unrelated")).is_some(),
+        "the other process's step is recorded too"
+    );
+}
+
+#[test]
+fn lifecycle_lease_child() {
+    let Some(root) = std::env::var_os(LEASE_CHILD_ROOT).map(PathBuf::from) else {
+        return;
+    };
+    let name = workspace("removed");
+    let _lease = IntentLease::try_claim(&root.join("sessions"), &name)
+        .expect("claim lease")
+        .expect("nobody else runs this removal");
+    LifecycleIntentJournal::update(&root.join(LIFECYCLE_INTENTS_FILE), |journal| {
+        journal.begin(retire(
+            "removed",
+            RemoveOptions {
+                abandon: true,
+                ..RemoveOptions::default()
+            },
+        ));
+        journal.mark_mutating(&name)
+    })
+    .expect("record the running removal");
+    fs::write(root.join("ready"), b"bundling\n").expect("announce the running removal");
+    // Still bundling: the parent kills this process while it holds the lease.
+    std::thread::sleep(Duration::from_secs(60));
+    std::process::exit(1);
+}
+
+#[test]
+fn recovery_leaves_a_running_removal_to_its_process_and_takes_it_over_once_that_dies() {
+    // `cowshed rm --abandon` in one process is still writing its bundle when another process
+    // opens the project. Its intent is unfinished and mutating — exactly what a crash leaves —
+    // but its process is alive, and running it a second time put a second bundle writer on the
+    // same trash path and failed that open outright. Once the process dies, the same intent is
+    // crash residue that recovery must take over.
+    let root = TestRoot::new("live-lease");
+    let sessions = root.path().join("sessions");
+    let name = workspace("removed");
+    let mut child = Command::new(std::env::current_exe().expect("current test executable"))
+        .args(["--exact", "lifecycle_lease_child", "--nocapture"])
+        .env(LEASE_CHILD_ROOT, root.path())
+        .spawn()
+        .expect("spawn removal child");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !root.path().join("ready").exists() {
+        if let Some(status) = child.try_wait().expect("poll removal child") {
+            panic!("the removal child ended before announcing itself: {status}");
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the removal child never announced itself"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let journal =
+        LifecycleIntentJournal::load(&root.path().join(LIFECYCLE_INTENTS_FILE)).expect("open");
+    let record = journal.get(&name).expect("the running removal is recorded");
+    assert_eq!(record.completion, None);
+    assert_eq!(record.phase, LifecycleIntentPhase::Mutating);
+
+    assert!(
+        IntentLease::try_claim(&sessions, &name)
+            .expect("probe lease")
+            .is_none(),
+        "a removal its process is still running is not recoverable"
+    );
+
+    child.kill().expect("kill removal child");
+    child.wait().expect("reap removal child");
+    assert!(
+        IntentLease::try_claim(&sessions, &name)
+            .expect("claim lease")
+            .is_some(),
+        "a removal whose process died is recoverable"
+    );
 }
 
 #[test]

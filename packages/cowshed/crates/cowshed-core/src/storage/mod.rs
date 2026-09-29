@@ -597,13 +597,13 @@ mod tests {
         assert!(!project_root.exists());
 
         layout.provision_project().expect("provision project root");
-        let mut journal = LifecycleIntentJournal::default();
-        journal.begin(LifecycleIntent::Adopt {
-            options: AdoptOptions::default(),
-        });
-        journal
-            .persist(&project_root.join(LIFECYCLE_INTENTS_FILE))
-            .expect("first project-local write");
+        LifecycleIntentJournal::update(&project_root.join(LIFECYCLE_INTENTS_FILE), |journal| {
+            journal.begin(LifecycleIntent::Adopt {
+                options: AdoptOptions::default(),
+            });
+            Ok(())
+        })
+        .expect("first project-local write");
 
         assert!(project_root.is_dir());
         assert!(project_root.join(LIFECYCLE_INTENTS_FILE).is_file());

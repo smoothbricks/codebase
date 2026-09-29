@@ -47,12 +47,14 @@ layout root:
     repository.json                  # chosen remote binding, alternate identities, and primary designation
     policy.json                      # trusted project policy; controller-owned, mode 0600
     lifecycle-intents.json             # bounded persist-before-mutate create/fork/remove recovery journal, mode 0600
+    lifecycle-intents.json.lock        # flock held for each read-modify-write of the journal
     main{.asif|.sparseimage}          # adopted main image; exactly one format-specific extension exists
     main{.asif|.sparseimage}.grants.json  # controller-owned grants + detached metadata
     sessions/
       <workspace>{.asif|.sparseimage}     # one image per workspace
       <workspace>{.asif|.sparseimage}.grants.json  # grants + detached metadata (see 04_sandbox.md)
       <workspace>{.asif|.sparseimage}.lock         # flock target for lifecycle operations
+      <workspace>.intent.lock                      # flock the process executing <workspace>'s lifecycle intent holds
     checkpoints/
       <workspace>/<label>{.asif|.sparseimage}      # clonefile snapshot; extension is preserved
     quarantine/                      # secrets relocated by `cowshed adopt --quarantine` (02_workspaces.md)
