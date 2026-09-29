@@ -354,6 +354,29 @@ smoo monorepo diff
 The generated publish workflow is canonical Prettier YAML. Running the repository formatter over
 `.github/workflows/publish.yml` is byte-stable and does not create managed-file drift.
 
+### Shell Entry
+
+Every direnv load runs the managed devenv prologue (`tooling/direnv/devenv.smoo.nix`), and it is built to cost almost
+nothing when nothing changed:
+
+- `setup-environment.ts` runs `bun install` only when its inputs changed since the last successful install: the root and
+  every workspace member `package.json`, `bun.lock`, `bunfig.toml`, the patch files `patchedDependencies` names, and the
+  Bun version. The record lives in `node_modules/.smoo-install`, so deleting `node_modules` reinstalls; a failed install
+  records nothing and is retried on the next entry. CI always installs with `--frozen-lockfile`.
+- A repository whose `devenv.nix` enables `languages.python.uv` gets its uv workspace synced the same way
+  (`uv sync --all-packages --all-groups`, `--locked` in CI) into devenv's `UV_PROJECT_ENVIRONMENT`, with the interpreter
+  devenv provides, and activated after the sync. Its inputs are the root `pyproject.toml`, `uv.lock` and every workspace
+  member's `pyproject.toml`. The environment is bound to its path, so one copied from another checkout (a copy-on-write
+  clone) is rebuilt from the uv cache on first entry. devenv's own `languages.python.venv` and `uv.sync` must stay off;
+  the module refuses them.
+- The managed `.envrc` watches every one of those inputs (listed in `$DEVENV_STATE/install-inputs`) and the scripts
+  shell entry runs, so a shell direnv keeps loaded re-enters exactly when an install has something to do.
+- Shell secrets resolve only for an entry that installs; see below.
+- `tooling/direnv/shared-caches.sh` points `TTSC_CACHE_DIR`, `GOCACHE` and `GOMODCACHE` at
+  `/private/cowshed/caches/{ttsc,go/build,go/mod}` whenever that directory exists, so every checkout on the machine,
+  sandboxed or not, shares one warm cache. Without it, ttsc caches in the checkout's `.cache/ttsc` and Go keeps its
+  defaults. A value the caller already exported wins.
+
 ## Formatting And Git Hooks
 
 The root `lint:fix` script runs [`git-format-staged`][git-format-staged] with
@@ -655,9 +678,9 @@ Each entry names a command whose stdout is the value. An existing nonempty envir
 runs these commands at all: there, every variable comes from the job's secret store.
 
 A group says which operation resolves the credential, and shell entry — every direnv reload, every
-`devenv shell -- <command>` — resolves the `shell` group and nothing else. A provider authorises per requesting process
-lineage, so a command placed at shell entry is a credential prompt on every reload; a credential only one deliberate
-command needs belongs to that command:
+`devenv shell -- <command>` — resolves the `shell` group, only when it installs, and nothing else. A provider authorises
+per requesting process lineage, so a command placed at shell entry is a credential prompt on every reload; a credential
+only one deliberate command needs belongs to that command:
 
 ```bash
 smoo secrets run registry bun install
@@ -670,7 +693,7 @@ The group is DERIVED from declarations the repository already carries, so almost
 - `registry` — a variable `.npmrc` interpolates as `${VAR}`. An installed checkout contacts no registry, so shell entry
   defers it; a request that does contact one is what resolves it.
 - `nx-cache` — the variable `smoo.remoteCache.tokenSecret` names.
-- `shell` — everything else, resolved at shell entry because that is when it is needed.
+- `shell` — everything else, resolved by the shell entry that installs, because the install is what reads it.
 
 `group` on an entry overrides the derivation, and any label the command line can name is a group: nothing about
 `registry` or `nx-cache` is privileged in smoo, so a repository may declare `deploy` and run it the same way. An

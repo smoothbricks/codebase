@@ -127,6 +127,11 @@ const managedFiles: ManagedFileDescriptor[] = [
   },
   {
     kind: 'raw',
+    source: 'tooling/direnv/shared-caches.sh',
+    target: 'tooling/direnv/shared-caches.sh',
+  },
+  {
+    kind: 'raw',
     source: 'tooling/git-hooks/pre-commit.sh',
     target: 'tooling/git-hooks/pre-commit.sh',
     executable: true,

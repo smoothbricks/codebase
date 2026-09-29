@@ -13,6 +13,7 @@
 # Every explanation lives out here in Nix comments. Hook bodies are exported as
 # shell text, so a comment inside one becomes part of an environment variable.
 {
+  config,
   inputs,
   lib,
   pkgs,
@@ -29,6 +30,12 @@
     rev = "56ab4af42157";
     hash = "sha256-ebjX+1+9axEqsnZXCRZSumA38gPNdmoz98tMt2oftN4=";
   };
+
+  # A repository that enables uv under languages.python gets its uv workspace
+  # synced and activated by this contract (enterShell item 5), never by
+  # devenv's own python tasks.
+  python = config.languages.python;
+  uvProject = python.enable && python.uv.enable;
 in {
   env = lib.mkMerge [
     {
@@ -264,47 +271,35 @@ in {
     #    use, so a hook and a shell resolve one binary the same way.
     # 3. ttsc drives the native TypeScript 7 binary while Nx imports the TypeScript
     #    6 API, so the two must be named separately.
-    # 4. On a cowshed host, Go and ttsc caches point at the shared store, so every
-    #    workspace reads one warm cache instead of growing its own copy inside its
-    #    image. Without one, ttsc stays in-tree for the CI cache action while Go
-    #    keeps its normal per-user defaults. Both Go caches are content-addressed,
-    #    so sharing them needs no patch — unlike Rust, Go keys on content and flags
-    #    rather than on where the files live. An inherited value always wins so CI
-    #    can place any of these caches itself. GOFLAGS carries -trimpath because it
-    #    is Go's stable way to keep absolute build paths out of the artifact, and
-    #    unlike Rust's trim-paths it costs no cache reuse.
+    # 4. Go and ttsc caches: tooling/direnv/shared-caches.sh places them under
+    #    the machine's shared caches root when it exists and states why.
+    # 5. The shared setup-environment.ts bootstraps repository dependencies. It
+    #    runs `bun install` — and, for a uv project, `uv sync` — only when that
+    #    installer's inputs changed since its last successful run, so an
+    #    unchanged checkout enters in the time it takes to hash a lockfile. It
+    #    records those inputs, and the managed .envrc watches them, so a shell
+    #    that direnv keeps loaded re-enters exactly when one of them changes.
     #
-    #    ttsc's plugin builds use the Go it bundles rather than ours, so the
-    #    repository's own Go work and ttsc's plugin builds are two toolchains by
-    #    construction. Placing both caches in the shared store is what keeps that
-    #    from costing a rebuild per workspace.
+    #    The uv project environment is devenv's UV_PROJECT_ENVIRONMENT, synced
+    #    with the interpreter devenv would use and activated here after the
+    #    sync. It lives under this checkout and is bound to that path: uv writes
+    #    absolute paths into its scripts, activation files and editable
+    #    installs. A copy-on-write clone copies it along with everything else,
+    #    so setup-environment.ts records the path each environment was built
+    #    for and rebuilds one that was built somewhere else, from the uv cache.
+    #    devenv's own virtualenv and uv sync tasks are refused below: they
+    #    activate the environment from its own activation script — which in a
+    #    clone names the original checkout — before this prologue runs, and key
+    #    their skip on pyproject.toml alone.
     #
-    #    TTSC_GO_CACHE_DIR and GOCACHE stay separate for ownership, not
-    #    correctness: both caches are content-addressed, so one directory would
-    #    compile the same bytes to the same entries. What sharing loses is an
-    #    owner. ttsc reclaims a Go build cache only when it resolved that
-    #    directory itself — `ttsc clean` takes the cache whose source is
-    #    TTSC_GO_CACHE_DIR and never one whose source is a user GOCACHE, which it
-    #    treats as someone else's property. Pointing ttsc at GOCACHE therefore
-    #    produced a directory ttsc filled and no repository verb could empty,
-    #    measured at 35G here. A dedicated directory gives ttsc's half back to
-    #    `ttsc clean` and leaves GOCACHE holding only Go work this repository does
-    #    itself, which is one module.
-    #
-    #    That buys ownership, not automatic GC: ttsc prunes opportunistically only
-    #    when it owns the whole cache root, which requires TTSC_CACHE_DIR unset,
-    #    and a pinned shared root is the point of the block below. The trade is
-    #    deliberate — one warm cache every workspace shares, reclaimed by an
-    #    explicit verb, over per-workspace caches that self-trim. Go's own build
-    #    cache trimming belongs to the go command and still applies to both.
-    # 5. The shared setup-environment.ts bootstraps repository dependencies; a
-    #    failure aborts shell entry instead of yielding a half-working shell.
-    #    Repo-owned enterShell bodies merge after this prologue.
-    # 6. Shell entry resolves the `shell` group of `smoo.secrets` and nothing
-    #    else. Shell entry happens on every direnv reload and every
-    #    `devenv shell -- <command>`, and a provider command that runs then is a
-    #    credential prompt on every one of them (1Password authorises per
-    #    requesting process lineage, and this one is new each time). A
+    #    A local install failure is reported and the shell still loads, so the
+    #    tools to repair it stay available; CI fails. Repo-owned enterShell
+    #    bodies merge after this prologue.
+    # 6. Shell entry resolves the `shell` group of `smoo.secrets`, only when it
+    #    installs, and nothing else. Shell entry happens on every direnv reload
+    #    and every `devenv shell -- <command>`, and a provider command that runs
+    #    then is a credential prompt on every one of them (1Password authorises
+    #    per requesting process lineage, and this one is new each time). A
     #    credential only one deliberate command needs belongs to that command:
     #    `smoo secrets run <group> <command...>`. The full statement, and the
     #    derivation below, live in tooling/direnv/secret-references.ts.
@@ -383,19 +378,15 @@ in {
         export TMPDIR="''${TMPDIR:-/tmp}"
       fi
       export TTSC_TSGO_BINARY="$PWD/node_modules/@typescript/native/bin/tsc"
-      if [ -d "$HOME/.cowshed/caches" ]; then
-        export TTSC_CACHE_DIR="''${TTSC_CACHE_DIR:-$HOME/.cowshed/caches/ttsc}"
-        export GOCACHE="''${GOCACHE:-$HOME/.cowshed/caches/go/build}"
-        export GOMODCACHE="''${GOMODCACHE:-$HOME/.cowshed/caches/go/mod}"
-        mkdir -p "$GOCACHE" "$GOMODCACHE"
-      else
-        export TTSC_CACHE_DIR="''${TTSC_CACHE_DIR:-$PWD/.cache/ttsc}"
-      fi
-      export TTSC_GO_CACHE_DIR="''${TTSC_GO_CACHE_DIR:-$TTSC_CACHE_DIR/go-build}"
-      mkdir -p "$TTSC_CACHE_DIR" "$TTSC_GO_CACHE_DIR"
-      export GOFLAGS="''${GOFLAGS:--trimpath}"
+      . "$DEVENV_ROOT/shared-caches.sh" /private/cowshed/caches
       unset GOROOT
-      bun "$DEVENV_ROOT/setup-environment.ts" || exit $?
+      bun "$DEVENV_ROOT/setup-environment.ts"${lib.optionalString uvProject " --python ${python.package.interpreter}"} || exit $?
+      ${lib.optionalString uvProject ''
+        if [ -f pyproject.toml ]; then
+          export VIRTUAL_ENV="$UV_PROJECT_ENVIRONMENT"
+          export PATH="$VIRTUAL_ENV/bin:$PATH"
+        fi
+      ''}
       # One socket dir per Nx workspace. DEVENV_RUNTIME is keyed to the devenv
       # ROOT, so every workspace sharing one devenv - a sibling repository, a
       # copy-on-write clone, a scratch workspace created inside this shell -
@@ -431,5 +422,17 @@ in {
         cd "$DEVENV_SHELL_PWD"
       fi
     '')
+  ];
+
+  assertions = [
+    {
+      assertion = !(uvProject && (python.venv.enable || python.uv.sync.enable));
+      message = ''
+        devenv.smoo.nix syncs and activates the uv project environment itself (enterShell item 5).
+        Set languages.python.venv.enable and languages.python.uv.sync.enable to false in devenv.nix:
+        devenv's tasks activate the environment from its own activation script, which in a
+        copy-on-write clone names the original checkout, and skip the sync while uv.lock changes.
+      '';
+    }
   ];
 }

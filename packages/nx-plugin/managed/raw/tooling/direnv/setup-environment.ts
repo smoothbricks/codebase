@@ -6,12 +6,14 @@ import {
   readdirSync,
   readFileSync,
   readlinkSync,
+  realpathSync,
   rmSync,
   symlinkSync,
   writeFileSync,
 } from 'node:fs';
 import { createRequire } from 'node:module';
 import path from 'node:path';
+import { parseArgs } from 'node:util';
 import { $ } from 'bun';
 import {
   type DeferredSecret,
@@ -108,6 +110,12 @@ const POST_COMMIT_BLOCK = [
   POST_COMMIT_END,
 ].join('\n');
 
+// The managed devenv module passes `--python <interpreter>` for a uv project:
+// the interpreter devenv's languages.python would use, as a store path, so the
+// environment uv builds does not name this checkout's profile as its home.
+// Declared above the bootstrap block for the same hoisting reason as above.
+const { values: flags } = parseArgs({ options: { python: { type: 'string' } } });
+
 // Go to project root
 process.chdir(projectRoot);
 
@@ -115,7 +123,11 @@ try {
   // Bootstrap only: install deps + wire local git hooks/config.
   // Do not import workspace packages here — this script is what installs them,
   // and package resolution/Typia transforms are not available yet.
+  const bunInputs = bunInstallInputs();
+  const uvInputs = uvSyncInputs();
+  recordInstallInputs([...bunInputs, ...uvInputs]);
   if (process.env.CI) {
+    const uv = uvInstaller(uvInputs, { locked: true });
     await resolveSecrets();
     // Failures are captured and reported below. Exiting in the catch would
     // skip the git-diff diagnostic that follows a frozen-lockfile miss.
@@ -151,6 +163,9 @@ try {
       }
       process.exit(1);
     }
+    if (uv !== null) {
+      await uv.install({ quiet: false });
+    }
   } else {
     // A local secret-resolution or install failure (a provider that is not
     // signed in, an unpublished private package, a missing registry
@@ -159,7 +174,9 @@ try {
     // exit, and then bun, nx, op and every other tool needed to repair the
     // install are gone too. Report it, finish what does not depend on the
     // install, and load the shell. CI above stays strict.
-    const installError = await installLocalDependencies();
+    const uv = uvInstaller(uvInputs, { locked: false });
+    const bun = bunInstaller(bunInputs);
+    const installError = await installLocalDependencies(uv === null ? [bun] : [bun, uv]);
     if (installError === undefined) {
       // Pin unscoped typescript → API 6 for root and Bun's shared .bun hoist (Nx).
       ensureTypeScriptApiPackage(projectRoot);
@@ -174,11 +191,12 @@ try {
 }
 
 /**
- * Provider-declared secrets (smoo.secrets) resolve before any install. The
+ * Provider-declared secrets (smoo.secrets) resolve before an install. The
  * values land in THIS process environment only — bun install, the prepare
  * scripts it runs, and every later child of this script inherit them (for
  * example .npmrc `${VAR}` auth); the direnv shell itself does not, which is
- * the point: this script must never act as a global shell export.
+ * the point: this script must never act as a global shell export. Nothing
+ * else here reads them, so a shell entry that installs nothing resolves none.
  *
  * `shell` is the group, and it is what keeps a credential only a deliberate
  * command needs — a registry token, the Nx cache token — from running its
@@ -197,21 +215,285 @@ async function resolveSecrets(): Promise<void> {
   deferredSecrets.push(...resolution.deferred);
 }
 
-async function installLocalDependencies(): Promise<unknown> {
+/**
+ * Runs every installer whose inputs changed since its last successful run.
+ * Returned, not thrown: the caller still wires git config, then reports a
+ * degraded shell. Same reason as the CI branch — bun install's own rename is
+ * the concurrency control, not a lock in this script.
+ */
+async function installLocalDependencies(installers: readonly Installer[]): Promise<unknown> {
+  const pending = installers.filter((installer) => !installer.isCurrent());
+  if (pending.length === 0) {
+    return undefined;
+  }
   try {
     await resolveSecrets();
   } catch (error) {
     return error;
   }
-  // Returned, not thrown: the caller still wires git config, then reports a
-  // degraded shell. Same reason as the CI branch — bun install's own rename
-  // is the concurrency control, not a lock in this script.
-  try {
-    await runSetupCommand('bun install --no-summary', $`bun install --no-summary`);
-  } catch (error) {
-    return error;
+  for (const installer of pending) {
+    try {
+      await installer.install({ quiet: true });
+    } catch (error) {
+      return error;
+    }
   }
   return undefined;
+}
+
+/**
+ * One dependency installer shell entry drives. Shell entry runs on every
+ * direnv reload, and an installer whose inputs did not change would only
+ * re-derive the tree it already wrote — for `bun install` in a large
+ * workspace that is most of an unchanged shell entry. So each installer
+ * records the digest of its inputs after a successful run, in a stamp that
+ * lives inside what it installed (deleting node_modules or the uv environment
+ * deletes the stamp with it), and runs again only when the digest moved. A
+ * failed run records nothing, so the next entry retries it.
+ */
+interface Installer {
+  isCurrent(): boolean;
+  install(options: { quiet: boolean }): Promise<void>;
+}
+
+interface InstallStamp {
+  /** sha256 over the installer's identity and the bytes of every input file. */
+  readonly inputs: string;
+  /** The absolute path the installed tree is bound to; null when it is not bound to one. */
+  readonly environment: string | null;
+}
+
+/**
+ * `bun install`. Its result is location-independent: the isolated linker
+ * links packages from the install cache by absolute path and workspace
+ * members by relative path, so a copy of this checkout at another path — a
+ * copy-on-write clone — is installed exactly when this one is. Besides the
+ * stamp, the TypeScript API package must still resolve through its link, the
+ * one package every managed repository installs, which catches a cache that
+ * was pruned out from under node_modules.
+ */
+function bunInstaller(inputs: readonly string[]): Installer {
+  const stampPath = path.join(projectRoot, 'node_modules', '.smoo-install');
+  const identity = ['bun install', Bun.version, Bun.revision];
+  return {
+    isCurrent: () =>
+      readInstallStamp(stampPath)?.inputs === inputsDigest(identity, inputs) &&
+      findInstalledTypeScriptApiPackage(projectRoot) !== null,
+    install: async ({ quiet }) => {
+      await runSetupCommand('bun install --no-summary', $`bun install --no-summary`, { quiet });
+      writeInstallStamp(stampPath, { inputs: inputsDigest(identity, inputs), environment: null });
+    },
+  };
+}
+
+/**
+ * `uv sync` for a repository whose devenv shell enables uv: the managed
+ * module passes `--python` exactly then, devenv exports the environment's
+ * path as UV_PROJECT_ENVIRONMENT, and a root pyproject.toml is the uv
+ * project. Null for any other shell — the flag, not an inherited variable,
+ * decides, because an outer shell's UV_PROJECT_ENVIRONMENT leaks into a
+ * checkout that syncs nothing.
+ *
+ * Every package of the workspace and every dependency group is installed,
+ * which is what `bun install` does for the JavaScript half: a development
+ * shell carries the whole workspace. CI adds `--locked`, the counterpart of
+ * `--frozen-lockfile`.
+ *
+ * Unlike node_modules, the environment is bound to its path: uv writes it
+ * into entry-point shebangs, activation scripts and editable installs. A
+ * clone copies the environment along with the stamp that says it is current,
+ * so the stamp also records the path it was built for, and an environment
+ * built anywhere else is removed and rebuilt — from the uv cache, which is
+ * where every wheel it held already is.
+ */
+function uvInstaller(inputs: readonly string[], options: { locked: boolean }): Installer | null {
+  const python = flags.python;
+  if (python === undefined || !existsSync(path.join(projectRoot, 'pyproject.toml'))) {
+    return null;
+  }
+  const environment = process.env.UV_PROJECT_ENVIRONMENT;
+  if (environment === undefined) {
+    throw new Error(
+      'setup-environment.ts was given --python but UV_PROJECT_ENVIRONMENT is unset: ' +
+        "devenv's languages.python.uv exports it, and uv would otherwise build .venv at the project root.",
+    );
+  }
+  const stampPath = path.join(environment, '.smoo-sync');
+  const argv = ['sync', '--python', python, '--all-packages', '--all-groups', ...(options.locked ? ['--locked'] : [])];
+  const uv = Bun.which('uv');
+  const identity = ['uv', ...argv, environment, uv === null ? 'uv not on PATH' : realpathSync(uv)];
+  return {
+    isCurrent: () => {
+      const stamp = readInstallStamp(stampPath);
+      return stamp?.environment === environment && stamp.inputs === inputsDigest(identity, inputs);
+    },
+    install: async ({ quiet }) => {
+      const builtFor = readInstallStamp(stampPath)?.environment ?? null;
+      if (builtFor !== environment && existsSync(environment)) {
+        console.error(
+          `setup-environment: rebuilding ${environment}: ` +
+            (builtFor === null ? 'nothing records where it was built' : `it was built for ${builtFor}`),
+        );
+        rmSync(environment, { recursive: true, force: true });
+      }
+      // An inherited VIRTUAL_ENV names some other environment; uv would warn
+      // that it does not match the project environment and ignore it.
+      const env = Object.fromEntries(Object.entries(process.env).filter(([name]) => name !== 'VIRTUAL_ENV'));
+      await runSetupCommand(`uv ${argv.join(' ')}`, $`uv ${argv}`.env(env), { quiet });
+      writeInstallStamp(stampPath, { inputs: inputsDigest(identity, inputs), environment });
+    },
+  };
+}
+
+/**
+ * What `bun install` reads, relative to the project root and sorted: the root
+ * manifest (dependencies, catalogs, overrides, patchedDependencies), every
+ * workspace member's manifest, the lockfile, bunfig.toml, and the patch files
+ * it applies.
+ */
+function bunInstallInputs(): string[] {
+  const manifest = parseOrUndefined(() => JSON.parse(readFileSync(path.join(projectRoot, 'package.json'), 'utf8')));
+  const workspaces = field(manifest, 'workspaces');
+  const patterns = Array.isArray(workspaces) ? stringList(workspaces) : stringList(field(workspaces, 'packages'));
+  const patchedDependencies = field(manifest, 'patchedDependencies');
+  const patches =
+    typeof patchedDependencies === 'object' && patchedDependencies !== null
+      ? stringList(Object.values(patchedDependencies))
+      : [];
+  const inputs = ['package.json', 'bun.lock', 'bun.lockb', 'bunfig.toml', ...workspaceFiles(patterns, 'package.json')];
+  return [...new Set([...inputs, ...patches])].sort();
+}
+
+/**
+ * What `uv sync` reads, relative to the project root and sorted: the root
+ * pyproject.toml, uv.lock, and every workspace member's pyproject.toml.
+ */
+function uvSyncInputs(): string[] {
+  const pyproject = path.join(projectRoot, 'pyproject.toml');
+  const project = existsSync(pyproject)
+    ? parseOrUndefined(() => Bun.TOML.parse(readFileSync(pyproject, 'utf8')))
+    : undefined;
+  const workspace = field(field(field(project, 'tool'), 'uv'), 'workspace');
+  const patterns = [
+    ...stringList(field(workspace, 'members')),
+    ...stringList(field(workspace, 'exclude')).map((pattern) => `!${pattern}`),
+  ];
+  return [...new Set(['pyproject.toml', 'uv.lock', ...workspaceFiles(patterns, 'pyproject.toml')])].sort();
+}
+
+/**
+ * A manifest that does not parse contributes no members, never a failure
+ * here: its bytes are still an input, so the installer runs and reports the
+ * parse error itself, loudly and in its own words.
+ */
+function parseOrUndefined(parse: () => unknown): unknown {
+  try {
+    return parse();
+  } catch {
+    return undefined;
+  }
+}
+
+/** The member manifests a workspace glob list selects; `!pattern` excludes. */
+function workspaceFiles(patterns: readonly string[], manifest: string): string[] {
+  const excluded = patterns
+    .filter((pattern) => pattern.startsWith('!'))
+    .map((pattern) => new Bun.Glob(pattern.slice(1)));
+  const files: string[] = [];
+  for (const pattern of patterns.filter((candidate) => !candidate.startsWith('!'))) {
+    for (const match of new Bun.Glob(path.posix.join(pattern, manifest)).scanSync({
+      cwd: projectRoot,
+      onlyFiles: true,
+    })) {
+      const member = path.posix.dirname(match);
+      if (!match.split('/').includes('node_modules') && !excluded.some((glob) => glob.match(member))) {
+        files.push(match);
+      }
+    }
+  }
+  return files;
+}
+
+function field(value: unknown, key: string): unknown {
+  return typeof value === 'object' && value !== null && Object.hasOwn(value, key) ? Reflect.get(value, key) : undefined;
+}
+
+function stringList(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : [];
+}
+
+/**
+ * Inputs enter the digest by their path relative to the project root, so the
+ * same bytes at another checkout path digest the same; an installer whose
+ * result is bound to a path carries that path in its identity instead.
+ */
+function inputsDigest(identity: readonly string[], inputs: readonly string[]): string {
+  const hasher = new Bun.CryptoHasher('sha256');
+  for (const part of identity) {
+    hasher.update(`${part}\0`);
+  }
+  for (const input of inputs) {
+    const bytes = readFileIfPresent(path.join(projectRoot, input));
+    hasher.update(`${input}\0${bytes === null ? 'absent' : `present ${bytes.byteLength}`}\0`);
+    if (bytes !== null) {
+      hasher.update(bytes);
+    }
+  }
+  return hasher.digest('hex');
+}
+
+function readInstallStamp(file: string): InstallStamp | null {
+  const bytes = readFileIfPresent(file);
+  if (bytes === null) {
+    return null;
+  }
+  // A torn or foreign stamp proves nothing was installed, which is what an
+  // absent one says too: the installer runs and writes a fresh one.
+  const stamp = parseOrUndefined(() => JSON.parse(bytes.toString('utf8')));
+  const inputs = field(stamp, 'inputs');
+  const environment = field(stamp, 'environment');
+  return typeof inputs === 'string' && (typeof environment === 'string' || environment === null)
+    ? { inputs, environment }
+    : null;
+}
+
+function writeInstallStamp(file: string, stamp: InstallStamp): void {
+  mkdirSync(path.dirname(file), { recursive: true });
+  writeFileSync(file, `${JSON.stringify(stamp)}\n`);
+}
+
+function readFileIfPresent(file: string): Buffer | null {
+  try {
+    return readFileSync(file);
+  } catch (error) {
+    if (error instanceof Error && 'code' in error && error.code === 'ENOENT') {
+      return null;
+    }
+    throw error;
+  }
+}
+
+/**
+ * The files whose change must re-run shell entry's installs, one absolute
+ * path per line in $DEVENV_STATE/install-inputs. The managed .envrc watches
+ * each of them, so a shell direnv keeps loaded re-enters exactly when an
+ * installer would do something. The uv half is recorded whether or not this
+ * shell syncs one, so that adding a pyproject.toml is itself a change.
+ */
+function recordInstallInputs(inputs: readonly string[]): void {
+  const state = process.env.DEVENV_STATE;
+  if (state === undefined) {
+    return;
+  }
+  const file = path.join(state, 'install-inputs');
+  const content = `${[...new Set(inputs)]
+    .sort()
+    .map((input) => path.join(projectRoot, input))
+    .join('\n')}\n`;
+  if (readFileIfPresent(file)?.toString('utf8') !== content) {
+    mkdirSync(state, { recursive: true });
+    writeFileSync(file, content);
+  }
 }
 
 function ensureTypeScriptApiPackage(root: string): void {
@@ -225,11 +507,17 @@ function ensureTypeScriptApiPackage(root: string): void {
 
   // Root bare require("typescript") and Bun store-local requires (nx lives under
   // node_modules/.bun/...) must both see the API package — not @typescript/native's TS7.
-  forceSymlink(path.join(root, 'node_modules', 'typescript'), apiPackageRoot);
-  forceSymlink(path.join(root, 'node_modules', '.bun', 'node_modules', 'typescript'), apiPackageRoot);
-
-  assertTypescriptApiAt(path.join(root, 'node_modules', 'typescript'), apiPackageRoot);
-  assertTypescriptApiAt(path.join(root, 'node_modules', '.bun', 'node_modules', 'typescript'), apiPackageRoot);
+  // A link this call did not have to write still points at the package it was
+  // verified against, so only a rewritten link pays for loading the compiler
+  // API again (a tenth of a second, on every shell entry that installs nothing).
+  const relinked = [
+    forceSymlink(path.join(root, 'node_modules', 'typescript'), apiPackageRoot),
+    forceSymlink(path.join(root, 'node_modules', '.bun', 'node_modules', 'typescript'), apiPackageRoot),
+  ];
+  if (relinked.includes(true)) {
+    assertTypescriptApiAt(path.join(root, 'node_modules', 'typescript'), apiPackageRoot);
+    assertTypescriptApiAt(path.join(root, 'node_modules', '.bun', 'node_modules', 'typescript'), apiPackageRoot);
+  }
 
   const nativeBin = path.join(root, 'node_modules', '@typescript', 'native', 'bin', 'tsc');
   const rootPackageJson = path.join(root, 'package.json');
@@ -279,7 +567,8 @@ function findInstalledTypeScriptApiPackage(root: string): string | null {
   return null;
 }
 
-function forceSymlink(linkPath: string, targetPath: string): void {
+/** Points linkPath at targetPath; true when the link had to be (re)written. */
+function forceSymlink(linkPath: string, targetPath: string): boolean {
   mkdirSync(path.dirname(linkPath), { recursive: true });
   const relativeTarget = path.relative(path.dirname(linkPath), targetPath);
   let current: string | null = null;
@@ -292,10 +581,11 @@ function forceSymlink(linkPath: string, targetPath: string): void {
     current === relativeTarget ||
     (current !== null && path.resolve(path.dirname(linkPath), current) === targetPath)
   ) {
-    return;
+    return false;
   }
   rmSync(linkPath, { recursive: true, force: true });
   symlinkSync(relativeTarget, linkPath);
+  return true;
 }
 
 function assertTypescriptApiAt(typescriptRoot: string, expectedTarget: string): void {

@@ -14,7 +14,29 @@ watch_file tooling/direnv/envrc.sh
 # Load local extensions and overrides from the project root (the gitignored
 # .envrc-local); capture it before we cd into tooling/direnv, since envrc.sh
 # leaves us there and a bare relative path would resolve under tooling/direnv.
-local_override="$PWD/.envrc-local"
+project_root="$PWD"
+local_override="$project_root/.envrc-local"
 cd tooling/direnv
 . envrc.sh
+
+# Re-enter exactly when shell entry has something to do. The scripts it runs
+# decide what that is, and setup-environment.ts records the files its install
+# stamps cover — lockfiles, every workspace manifest, bunfig.toml, patches,
+# every pyproject.toml — one per line in $DEVENV_STATE/install-inputs. A shell
+# direnv keeps loaded, or a pool of them gated on direnv's watches, then
+# reinstalls after a pull or a manifest edit and stays put otherwise.
+install_inputs=()
+if [ -f "${DEVENV_STATE:-}/install-inputs" ]; then
+  while IFS= read -r install_input; do
+    install_inputs+=("$install_input")
+  done <"$DEVENV_STATE/install-inputs"
+fi
+watch_file \
+  "$project_root/tooling/direnv/repo-path" \
+  "$project_root/tooling/direnv/shared-caches.sh" \
+  "$project_root/tooling/direnv/setup-environment.ts" \
+  "$project_root/tooling/direnv/secret-references.ts" \
+  "$project_root/tooling/direnv/toolchain-stamp.ts" \
+  ${install_inputs[@]+"${install_inputs[@]}"}
+
 source_env_if_exists "$local_override"

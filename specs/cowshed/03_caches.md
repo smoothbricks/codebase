@@ -168,8 +168,10 @@ them there; they contain the endpoint URL, whose userinfo is the workspace token
   `/private/cowshed/caches/sccache` (below). Go and ttsc remain direct-configured:
   `/private/cowshed/caches/go/{mod,build}` through Go's env file and `/private/cowshed/caches/ttsc` through
   `TTSC_CACHE_DIR`; the supervisor creates the three directories before a child runs, because a child granted writes
-  inside one cannot create its parent. Gateway artifacts remain outside every writable tool root at `mirror/` and
-  `repo-mirrors/`.
+  inside one cannot create its parent. A smoo-managed repository shell (`tooling/direnv/shared-caches.sh`) exports
+  `TTSC_CACHE_DIR`, `GOCACHE` and `GOMODCACHE` naming those same directories whenever `/private/cowshed/caches` exists,
+  on the host and in every sandbox alike, so one path reaches each cache from every checkout. Gateway artifacts remain
+  outside every writable tool root at `mirror/` and `repo-mirrors/`.
 
   **Every checkout reaches a shared tool home through the host's literal path.** Cargo fingerprints a registry or git
   dependency by the absolute path of its source under `$CARGO_HOME` (measured: the same registry reached through a
