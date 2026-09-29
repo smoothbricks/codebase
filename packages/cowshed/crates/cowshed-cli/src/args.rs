@@ -2036,7 +2036,7 @@ fn parse_exec(matches: &ArgMatches) -> Result<Command, UsageError> {
 const GRANT: CommandSpec = CommandSpec {
     name: "grant",
     missing: "grant requires a workspace",
-    args: "<ws> | --project-wide",
+    args: "<ws>",
     trailing: "",
     summary: "grant filesystem and network access",
     about: &[
