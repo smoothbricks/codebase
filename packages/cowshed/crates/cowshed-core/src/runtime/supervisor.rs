@@ -1183,6 +1183,81 @@ async fn sandboxed_command(
              being added, so an intercepted HTTPS origin may fail to verify"
         );
     }
+    // Registry clients find the gateway's mirror routes, and one-file TLS clients find a bundle
+    // that trusts the workspace CA, in the private environment (crate::workspace_clients) —
+    // republished before every spawn so a rotated token or a moved endpoint is never served
+    // stale. The mirror files need only the endpoint and the token; the bundle needs the CA.
+    let anchor = sandbox
+        .workspace_mount
+        .join(crate::workspace_credentials::CA_CERTIFICATE_PATH);
+    let workspace_ca = match tokio::fs::read(&anchor).await {
+        Ok(bytes) => Some(bytes),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(CowshedError::integrity(
+                format!("cannot read workspace CA {}: {error}", anchor.display()),
+                "reattach the workspace to mint fresh credentials",
+            ));
+        }
+    };
+    let system_bundle = match &workspace_ca {
+        Some(_) => crate::workspace_clients::system_trust_bundle().map_err(|error| {
+            CowshedError::environment_missing(
+                format!(
+                    "cannot read the platform trust bundle {}: {error}",
+                    crate::workspace_clients::SYSTEM_TRUST_BUNDLE
+                ),
+                "restore the platform CA bundle, then retry cowshed exec",
+            )
+        })?,
+        None => Vec::new(),
+    };
+    let gateway_base = format!("http://127.0.0.1:{port_base}");
+    let token = workspace_token.encode();
+    crate::workspace_clients::publish_client_wiring(
+        &environment,
+        &crate::workspace_clients::ClientWiring {
+            gateway_http: &gateway_base,
+            token: &token,
+            workspace_ca: workspace_ca.as_deref(),
+            system_bundle: &system_bundle,
+            environment: environment_root,
+        },
+    )
+    .map_err(private_environment_error)?;
+    if workspace_ca.is_some() {
+        let bundle = environment_root.join(
+            crate::workspace_clients::TRUST_BUNDLE_NAME
+                .to_str()
+                .expect("the bundle name is ASCII"),
+        );
+        // Same rule as NODE_EXTRA_CA_CERTS above: a caller's own anchor is kept and announced.
+        for name in [
+            crate::workspace_clients::GIT_CA_ENV,
+            crate::workspace_clients::CARGO_CA_ENV,
+            crate::workspace_clients::NIX_CA_ENV,
+        ] {
+            if env.contains_key(name) {
+                eprintln!(
+                    "cowshed: {name} was supplied by the caller; the workspace trust bundle is not \
+                     being used for it, so an intercepted HTTPS origin may fail to verify"
+                );
+            } else {
+                command.env(name, &bundle);
+            }
+        }
+        // A host `nix.conf` that names its own `ssl-cert-file` outranks NIX_SSL_CERT_FILE; only
+        // NIX_CONFIG, applied after every config file, outranks it. A caller's NIX_CONFIG keeps
+        // its lines, with this one last so it is the setting nix applies.
+        let ssl_cert_file = format!("ssl-cert-file = {}", bundle.display());
+        command.env(
+            crate::workspace_clients::NIX_CONFIG_ENV,
+            match env.get(crate::workspace_clients::NIX_CONFIG_ENV) {
+                Some(caller) if !caller.is_empty() => format!("{caller}\n{ssl_cert_file}"),
+                _ => ssl_cert_file,
+            },
+        );
+    }
     Ok(command)
 }
 
@@ -3604,6 +3679,99 @@ mod workspace_toolchain_tests {
             ));
         std::fs::create_dir_all(&root).expect("scratch root");
         root
+    }
+
+    /// A child finds every package manager's route to the gateway, and every one-file TLS client
+    /// finds a bundle that trusts both the platform roots and the workspace CA — from the files
+    /// and variables the host prepared before the spawn, with no tracked file touched.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn a_child_finds_its_mirror_clients_and_a_trust_bundle_with_the_workspace_ca() {
+        let root = scratch("clients");
+        let mount = root.join("workspace");
+        std::fs::create_dir_all(mount.join(".cowshed")).expect("private root");
+        std::fs::create_dir_all(root.join("home")).expect("home");
+        std::fs::write(mount.join(".cowshed/token"), "A".repeat(43)).expect("token");
+        std::fs::write(
+            mount.join(".cowshed/ca.pem"),
+            b"-----BEGIN CERTIFICATE-----\nWORKSPACE\n-----END CERTIFICATE-----\n",
+        )
+        .expect("workspace CA");
+        let mut sandbox = sandbox_at(&mount);
+        sandbox.port_block = crate::metadata::PortBlock::new(49_104, 16).expect("port block");
+        let plan = crate::exec::SpawnPlan {
+            program: PathBuf::from("/usr/bin/true"),
+            args: Vec::new(),
+            cwd: mount.clone(),
+        };
+        let mut env = BTreeMap::new();
+        env.insert(
+            "NIX_CONFIG".to_owned(),
+            "extra-experimental-features = flakes".to_owned(),
+        );
+
+        let command = sandboxed_command(&plan, &sandbox, None, &env)
+            .await
+            .expect("command");
+        let vars: BTreeMap<String, String> = command
+            .as_std()
+            .get_envs()
+            .filter_map(|(name, value)| {
+                Some((name.to_str()?.to_owned(), value?.to_str()?.to_owned()))
+            })
+            .collect();
+
+        let bundle = mount.join(".cowshed/ca-bundle.pem");
+        for name in ["GIT_SSL_CAINFO", "CARGO_HTTP_CAINFO", "NIX_SSL_CERT_FILE"] {
+            assert_eq!(
+                vars.get(name).map(PathBuf::from),
+                Some(bundle.clone()),
+                "{name}"
+            );
+        }
+        // nix.conf's own `ssl-cert-file` outranks NIX_SSL_CERT_FILE; NIX_CONFIG outranks
+        // nix.conf, and a caller's NIX_CONFIG keeps its own lines.
+        assert_eq!(
+            vars.get("NIX_CONFIG").map(String::as_str),
+            Some(
+                format!(
+                    "extra-experimental-features = flakes\nssl-cert-file = {}",
+                    bundle.display()
+                )
+                .as_str()
+            )
+        );
+        let bundle_bytes = std::fs::read_to_string(&bundle).expect("bundle");
+        assert!(bundle_bytes.ends_with("WORKSPACE\n-----END CERTIFICATE-----\n"));
+        assert!(
+            bundle_bytes.len() > 10_000,
+            "platform roots precede the workspace CA"
+        );
+
+        let private = mount.join(".cowshed");
+        let token = "A".repeat(43);
+        assert_eq!(
+            std::fs::read_to_string(private.join("config/.bunfig.toml")).expect("bunfig"),
+            format!(
+                "[install]\nregistry = {{ url = \"http://127.0.0.1:49104/npm/\", token = \"{token}\" }}\n"
+            )
+        );
+        assert_eq!(
+            vars.get("XDG_CONFIG_HOME").map(PathBuf::from),
+            Some(private.join("config"))
+        );
+        let go_env = std::fs::read_to_string(private.join("cache/go/env")).expect("go env");
+        assert!(go_env.contains("GOPROXY=http://127.0.0.1:49104/go\n"));
+        assert_eq!(
+            vars.get("GOENV").map(PathBuf::from),
+            Some(private.join("cache/go/env"))
+        );
+        assert!(
+            std::fs::read_to_string(private.join("home/.netrc"))
+                .expect("netrc")
+                .contains(&format!("password {token}"))
+        );
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]

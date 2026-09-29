@@ -35,10 +35,15 @@ topology is platform-specific:
 
 Every data-plane request additionally carries exactly `Proxy-Authorization: Bearer <opaque-token>`. The token is 32
 random bytes encoded as unpadded base64url, lives at `.cowshed/token` mode 0600, and is defense in depth rather than the
-workspace selector: the already-selected macOS listener or Linux socket chooses the workspace before comparison. The
-gateway accepts no alternate header, cookie, query parameter, URL userinfo, or path token; it strips
-`Proxy-Authorization` before any upstream request. It decodes the presented value to bytes, rejects malformed or
-wrong-length values, and compares all 32 bytes in constant time. Missing or mismatched token is 401.
+workspace selector: the already-selected macOS listener or Linux socket chooses the workspace before comparison. A proxy
+client may present it as `Proxy-Authorization: Basic` with the token as password (what curl, libcurl, reqwest and Go
+send for proxy-URL userinfo). One alternate header exists: on the local mirror routes — origin-form `/npm/`, `/cargo/`
+and `/go/` requests to the workspace's own endpoint — a registry client's own `Authorization` (`Bearer <token>` from
+bun's registry token, `Basic` from Go's netrc) carries the same token, because a registry client cannot be told to send
+`Proxy-Authorization` to its registry; an absolute-form or tunnelled request's `Authorization` is the client's own and
+authenticates nothing. The gateway accepts no cookie, query parameter, URL userinfo, or path token; it strips
+`Proxy-Authorization` and `Authorization` before any upstream request. It decodes the presented value to bytes, rejects
+malformed or wrong-length values, and compares all 32 bytes in constant time. Missing or mismatched token is 401.
 
 Create and fork mint a token. Restore stops admissions, drains the Linux connector and gateway connections, kills the
 connector cgroup, rotates the token, unlinks/recreates the Linux socket and namespace-local connector when applicable,
@@ -87,8 +92,10 @@ verified while filling and again on every cache read, and committed by atomic re
 ### `/cargo/` — cargo sparse registry mirror
 
 Serves `config.json`, sparse index files, and crate downloads. crates.io is anonymous baseline; alternate or
-credentialed registries require exact-origin and crate-scope admission. Workspaces use source replacement pointing to
-their own platform endpoint.
+credentialed registries require exact-origin and crate-scope admission. Workspaces do not route cargo through it: every
+sandbox builds with one literal `CARGO_HOME` whose registry is shared host-wide (03_caches.md), so cargo reaches
+crates.io through intercepted egress (`index.crates.io`, `static.crates.io`) and the route serves clients configured for
+it explicitly.
 
 ### `/go/` — Go module proxy mirror
 

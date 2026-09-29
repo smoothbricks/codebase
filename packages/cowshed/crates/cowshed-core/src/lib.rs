@@ -24,6 +24,7 @@ pub mod sandbox;
 pub mod secrets;
 pub mod storage;
 mod timing;
+pub mod workspace_clients;
 pub mod workspace_credentials;
 pub mod workspace_environment;
 pub mod workspace_git_fetch;

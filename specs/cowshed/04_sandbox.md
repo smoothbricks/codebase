@@ -368,19 +368,22 @@ Granted egress is intercepted by default: the gateway terminates TLS under the *
 The CA **private key** lives with the gateway on the store volume, next to the grant file, and is denied to every
 sandbox exactly like the grant file — a workspace can never sign its own leaves or read another workspace's key. The CA
 **certificate** is public and ships in-image as a trust anchor: **the workspace holds only public trust anchors**, never
-a secret. cowshed wires the anchor into the tools that honor an environment/config anchor (written at new/fork, with the
-CA cert placed in-image, and re-asserted by `ensure`):
+a secret. cowshed wires the anchor into the tools that honor an environment anchor, before every exec: Node and Bun get
+the certificate itself as an additive anchor; clients that read exactly one CA file get the **workspace trust bundle**
+`.cowshed/ca-bundle.pem` — the platform roots (`/etc/ssl/cert.pem` on macOS, `/etc/ssl/certs/ca-certificates.crt` on
+Linux) followed by the workspace CA — so an opaque tunnel, which presents the real upstream certificate, still verifies.
+A caller that sets one of these variables itself keeps it, and the exec says so on stderr.
 
-| Tool family                     | Anchor                                                                                                     |
-| ------------------------------- | ---------------------------------------------------------------------------------------------------------- |
-| OpenSSL CLI, curl, most C tools | `SSL_CERT_FILE`                                                                                            |
-| Node / Bun                      | `NODE_EXTRA_CA_CERTS` (Bun support is a **verification item**, not assumed)                                |
-| git                             | `GIT_SSL_CAINFO`                                                                                           |
-| Python requests                 | `REQUESTS_CA_BUNDLE`                                                                                       |
-| Deno                            | `DENO_CERT`                                                                                                |
-| cargo                           | `http.cainfo` in the in-image cargo config                                                                 |
-| JVM (gradle)                    | a per-workspace PKCS12 truststore cowshed generates in-image                                               |
-| Go-built tools                  | `SSL_CERT_FILE` on Linux; **on macOS Go uses the platform verifier** (Security.framework) — see gaps below |
+| Tool family | Anchor                                                                                                                                                                                                                                          |
+| ----------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Node / Bun  | `NODE_EXTRA_CA_CERTS` = the workspace CA certificate                                                                                                                                                                                            |
+| git         | `GIT_SSL_CAINFO` = the trust bundle                                                                                                                                                                                                             |
+| cargo       | `CARGO_HTTP_CAINFO` = the trust bundle (cargo's environment spelling of `http.cainfo`; there is no per-workspace cargo config — 03_caches.md)                                                                                                   |
+| nix         | `NIX_SSL_CERT_FILE` = the trust bundle, and `ssl-cert-file = <bundle>` appended to `NIX_CONFIG`: a host `nix.conf` naming its own `ssl-cert-file` outranks `NIX_SSL_CERT_FILE` (measured on Determinate Nix 2.35), and `NIX_CONFIG` outranks it |
+
+`SSL_CERT_FILE` is not set: nix and devenv own it for the whole toolchain, and a devenv shell replaces it with its own
+bundle. Python requests (`REQUESTS_CA_BUNDLE`), Deno (`DENO_CERT`) and the JVM read anchors cowshed does not wire, so
+they verify an intercepted host only when their own configuration trusts the bundle.
 
 **Known gaps** (documented, not silently broken):
 

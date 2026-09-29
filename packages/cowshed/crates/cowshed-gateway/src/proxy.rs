@@ -185,7 +185,10 @@ async fn handle_request(
     }
     let authentication = match inherited_authentication {
         Authentication::Generation(generation) => Authentication::Generation(generation),
-        Authentication::Bearer(_) => Authentication::Bearer(proxy_token(request.headers())),
+        Authentication::Bearer(_) => Authentication::Bearer(presented_token(
+            request.headers(),
+            header::PROXY_AUTHORIZATION,
+        )),
     };
     if request.method() == Method::CONNECT {
         if fixed_target.is_some() {
@@ -212,6 +215,17 @@ async fn handle_request(
             )
             .await);
         }
+    };
+    // A registry client speaks to its registry, not to a proxy: bun sends its configured token as
+    // `Authorization: Bearer`, Go's netrc as `Authorization: Basic`, and neither can be told to
+    // send `Proxy-Authorization` to a registry. On the local mirror routes — origin-form requests
+    // to this workspace's own endpoint — that header carries the same single token. Nowhere else:
+    // an absolute-form or tunnelled request's `Authorization` belongs to the client's upstream.
+    let authentication = match (authentication, &target) {
+        (Authentication::Bearer(None), RequestTarget::LocalMirror) => {
+            Authentication::Bearer(presented_token(request.headers(), header::AUTHORIZATION))
+        }
+        (authentication, _) => authentication,
     };
     let (path, trace_id) = extract_mirror_trace(&path, audit_kind).unwrap_or((path, None));
     let intent = RequestIntent {
@@ -2377,11 +2391,11 @@ where
 ///
 /// Both spellings hand the same opaque token to the same constant-time comparison; neither is
 /// weaker than the other, and the token is stripped before upstream forwarding either way.
-fn proxy_token(headers: &HeaderMap) -> Option<String> {
-    let values: Vec<_> = headers
-        .get_all(header::PROXY_AUTHORIZATION)
-        .iter()
-        .collect();
+///
+/// `name` is `Proxy-Authorization` for every request, and `Authorization` only for a registry
+/// client on a local mirror route (see `handle_request`).
+fn presented_token(headers: &HeaderMap, name: HeaderName) -> Option<String> {
+    let values: Vec<_> = headers.get_all(name).iter().collect();
     if values.len() != 1 {
         return None;
     }

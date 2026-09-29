@@ -69,36 +69,43 @@ rule: read-at-build caches may live off-image freely, because nothing ever refli
 Wiring is carried primarily by **files and host paths**. Files travel with the image through clone/fork/checkpoint and
 cover processes cowshed never spawned (IDE terminals, launchd jobs, CI runner steps). The exception is standard generic
 HTTP proxy variables, which are emitted by the workspace environment wiring because ordinary proxy-aware tools consume
-them there; they always contain an endpoint URL, never credentials.
+them there; they contain the endpoint URL, whose userinfo is the workspace token (below).
 
-- **In-image config files**, written at adopt/new/fork with platform-specific endpoint values and re-validated by
-  `ensure`. cowshed lists the paths it owns in the workspace repo's `.git/info/exclude` — repo-local ignore that travels
-  with every clone — so per-workspace rewrites never dirty `git status`. Define `GATEWAY_HTTP` as
-  `http://127.0.0.1:<portBlock.base>` on macOS and exactly `http://127.0.0.1:7644` on Linux. The Linux address is served
-  by the trusted connector inside that workspace's private netns; package clients do not speak Unix sockets. No Linux
-  `portBlock` or synthetic base exists.
-  - `bunfig.toml` at the workspace root: `install.registry = "<GATEWAY_HTTP>/npm"` and
+- **Private-environment config files**, written when the workspace is minted (adopt/new/fork, and rekey/restore's fresh
+  token) and republished before every exec, so a rotated token or a moved endpoint is never served stale. They live in
+  the workspace's private environment — `.cowshed/{home,config,cache}`, which a cowshed-spawned child gets as `HOME`,
+  `XDG_CONFIG_HOME` and `XDG_CACHE_HOME` — never in a tracked file, so a rewrite never dirties `git status`. A read-only
+  exec gets the same files under its exec-temp environment. Define `GATEWAY_HTTP` as `http://127.0.0.1:<portBlock.base>`
+  on macOS and exactly `http://127.0.0.1:7644` on Linux. The Linux address is served by the trusted connector inside
+  that workspace's private netns; package clients do not speak Unix sockets. No Linux `portBlock` or synthetic base
+  exists.
+  - **bun: the global bunfig** at `$XDG_CONFIG_HOME/.bunfig.toml`:
+    `[install] registry = { url = "<GATEWAY_HTTP>/npm/", token = "<workspace token>" }`. **Measured (bun 1.4.2): bun
+    reads `$XDG_CONFIG_HOME/.bunfig.toml` whenever `XDG_CONFIG_HOME` is set, and `$HOME/.bunfig.toml` only when it is
+    not; it reads that global file alongside the repository's own `bunfig.toml`, which still wins for any key it sets;
+    and it sends the token as `Authorization: Bearer`**, which the gateway accepts on its mirror routes (05_gateway.md).
+    The repository's committed `bunfig.toml` keeps only what is identical everywhere:
     `[install.cache] dir = ".cowshed/cache/bun"` — **verified (bun 1.3.14): the relative path is honored and resolves
-    against the project root, not the invocation cwd** — one committed line, identical for main, workspaces, and CI.
-    Caution, same verification: the `[install] cacheDir` spelling is _silently ignored_ (falls back to the global cache
-    with no error); `cowshed doctor` checks for that misspelling.
-  - cargo config: source replacement of crates.io with `sparse+<GATEWAY_HTTP>/cargo/`,
-    `[build] rustc-wrapper = "sccache"` when sccache is present, and `[env]` setting `SCCACHE_SERVER_UDS` to the
-    expanded absolute host socket path (`/private/cowshed/store/sccache.sock`; cargo never expands `~`) so wrapper
-    invocations reach the host-owned sccache daemon (below) from processes cowshed never spawned — **verified (cargo
-    1.97): `[env]` values reach every rustc-wrapper invocation; no environment fallback is needed.** Host-global
-    settings live in the host-owned `~/.cargo/config.toml` (never on the cache volume — see relocation below);
-    per-workspace ones live in the in-image `.cargo/config.toml`. Endpoint plus the registry authentication mechanism
-    carry the token; the URL never contains it (05_gateway.md).
+    against the project root, not the invocation cwd**. Caution, same verification: the `[install] cacheDir` spelling is
+    _silently ignored_ (falls back to the global cache with no error); `cowshed doctor` checks for that misspelling.
+  - **cargo: no registry configuration at all.** Every sandbox builds with one literal `CARGO_HOME` — the host's
+    `~/.cargo`, whose `registry` and `git` are relocated to the caches volume (below) — because cargo fingerprints a
+    registry or git dependency by its absolute source path under `CARGO_HOME`: the same crate reached through another
+    path, even a symlink to the same bytes, recompiles it and everything above it. So there is no per-workspace
+    `$CARGO_HOME/config.toml` to carry a crates.io source replacement, and `~/.cargo/config.toml` stays host-owned and
+    denied. Cargo reaches crates.io through the proxy variables (below), intercepted, trusting the workspace trust
+    bundle through `CARGO_HTTP_CAINFO` (04_sandbox.md); `index.crates.io` and `static.crates.io` are project-standing
+    egress grants. Downloads land once per host in the shared registry. Git dependencies resolve through the fetch
+    mappings to local clones when their checkouts are granted, and otherwise through intercepted `github.com`.
   - No git remote/proxy config is written: workspace git speaks only local filesystem remotes (the `main` remote and
     gateway-owned bare mirrors — 05_gateway.md), so there is nothing to route through the gateway and no credential
     helper inside the image.
-  - **Go env file** at `.cowshed/cache/go/env` (the `go env -w` format), reached via a `GOENV` export (below). Go is the
-    one toolchain with **no project-level config file** — settings live in a single user-global env file
+  - **Go env file** at `$XDG_CACHE_HOME/go/env` (the `go env -w` format), reached via a `GOENV` export (below). Go is
+    the one toolchain with **no project-level config file** — settings live in a single user-global env file
     (`os.UserConfigDir()/go/env`, measured default `~/Library/Application Support/go/env`) overridable only by `GOENV` —
-    and `GOPROXY` is per-workspace. The in-image file pins: `GOPROXY=<GATEWAY_HTTP>/go` (no `,direct` fallback — misses
-    fail at the gateway with the offline/denied distinction, 05_gateway.md), `GOSUMDB=sum.golang.org` (verification
-    rides the proxy's sumdb passthrough), `GOMODCACHE=/private/cowshed/caches/go/mod` and
+    and `GOPROXY` is per-workspace. The file pins: `GOPROXY=<GATEWAY_HTTP>/go` (no `,direct` fallback — misses fail at
+    the gateway with the offline/denied distinction, 05_gateway.md), `GOSUMDB=sum.golang.org` (verification rides the
+    proxy's sumdb passthrough), `GOMODCACHE=/private/cowshed/caches/go/mod` and
     `GOCACHE=/private/cowshed/caches/go/build` (shared, layer 3), `GOPATH=<mount>/.cowshed/cache/go/path` and
     `GOBIN=<mount>/.cowshed/cache/go/bin` (in-image, workspace-keyed — `go install` binaries are the `~/.cargo/bin`
     persistence-escape hazard and must never land on the shared volume). Net effect: **`~/go` is never created**
@@ -107,11 +114,18 @@ them there; they always contain an endpoint URL, never credentials.
     is nix/devenv-provided and pinned, and `auto` silently downloading Go toolchains contradicts the declarative
     environment — a project that deliberately overrides to `auto` gets its downloads in `GOMODCACHE`, i.e. on the caches
     volume, never in `$HOME`. A host-global `go env -w` file instead of `GOENV` is rejected: `GOPROXY` is per-workspace
-    identity, and a global file could select another workspace's endpoint.
+    identity, and a global file could select another workspace's endpoint. Go authenticates to the mirror through the
+    netrc its module fetcher reads (`GOAUTH=netrc`, the default): `$HOME/.netrc` in the private environment names
+    `machine 127.0.0.1` with the workspace token as its password, which Go sends as `Authorization: Basic` — the URL
+    never carries it.
 - **Generic proxy variables.** Workspace env wiring sets `HTTP_PROXY`, `HTTPS_PROXY`, `http_proxy`, and `https_proxy` to
-  `<GATEWAY_HTTP>` and configures `NO_PROXY`/`no_proxy` only for the workspace's own local services. On Linux these
-  variables therefore resolve to `http://127.0.0.1:7644`; on macOS they resolve to the workspace block base. The token
-  is still carried only as `Proxy-Authorization`, never in any variable or URL.
+  `<GATEWAY_HTTP>` with the workspace token as its userinfo (`http://cowshed:<token>@…`), and configures
+  `NO_PROXY`/`no_proxy` only for the workspace's own local services. On Linux these variables therefore resolve to
+  `http://127.0.0.1:7644`; on macOS they resolve to the workspace block base. Userinfo is the one channel standard
+  clients (curl, libcurl so cargo, reqwest, Go) turn into `Proxy-Authorization: Basic` on the first CONNECT; the token
+  authenticates against nothing but this workspace's own endpoint.
+- **Trust bundle.** `.cowshed/ca-bundle.pem` in the private environment holds the platform roots followed by the
+  workspace CA, and is what `GIT_SSL_CAINFO`, `CARGO_HTTP_CAINFO` and nix read (04_sandbox.md).
 - **In-image tool shims** at `.cowshed/bin/`, PATH-prepended by the same `.envrc` wiring (so they travel with every
   clone and cover every process spawned in the workspace, IDE terminals included). Today that is one shim: the **`xcrun`
   wrapper** — pure `exec /usr/bin/xcrun "$@"` passthrough for everything except the simulator-control verbs (`simctl`,
@@ -175,9 +189,9 @@ them there; they always contain an endpoint URL, never credentials.
 - **Environment variables: at most three load-bearing.**
   - `BUN_INSTALL_CACHE_DIR` is **retired** — its verification passed (relative `[install.cache] dir` works, above); the
     committed bunfig line is the wiring and no export exists.
-  - `COWSHED_GATEWAY_TOKEN` is one candidate: it dies if bun accepts the token via the registry auth mechanism against
-    the in-image bunfig (the port already identifies the workspace — 05_gateway.md). If not, this is a load-bearing
-    export. (There is no git credential helper to consider — git is local-only.)
+  - The workspace token needs no registry export: bun takes it from the private bunfig's registry `token`, Go from the
+    private netrc, and the gateway reads it from their own `Authorization` header on the mirror routes (05_gateway.md).
+    Generic proxy clients carry it as proxy userinfo (below). (There is no git credential helper to consider.)
   - `GOENV=<mount>/.cowshed/cache/go/env` is the other: Go has no directory-scoped config, so the in-image env file is
     reachable only through this export. It rides the in-image `.envrc`/direnv like the rest of the wiring —
     `cowshed exec`'s fail-closed shell activation (04_sandbox.md) carries it, and IDE-spawned tools (gopls) get it via

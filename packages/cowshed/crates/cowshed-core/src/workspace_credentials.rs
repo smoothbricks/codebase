@@ -128,6 +128,14 @@ pub fn mint_workspace_credentials(
     publish_asset(&certificate_path, certificate_pem.as_bytes())?;
     publish_asset(&token_path, token.as_bytes())?;
     write_workspace_environment(mount_point, workspace_mount, &token, platform, port_block)?;
+    publish_minted_client_wiring(
+        &credential_directory,
+        workspace_mount,
+        &token,
+        certificate_pem.as_bytes(),
+        platform,
+        port_block,
+    )?;
     sync_directory(&credential_directory, "syncing credential directory")?;
 
     // A certificate minted a line above carries the current identity, so the tightest possible
@@ -248,6 +256,64 @@ fn credential_subject(
         workspace.as_str(),
         incarnation.as_str()
     )
+}
+
+/// The package-manager and trust wiring a minted workspace starts with, in its private
+/// environment (`.cowshed/`), as the child will see it under the canonical mount. Every exec
+/// republishes it; minting it here means a new, adopted, or forked workspace never exists without
+/// it.
+fn publish_minted_client_wiring(
+    credential_directory: &Path,
+    workspace_mount: &Path,
+    token: &str,
+    workspace_ca: &[u8],
+    platform: Platform,
+    port_block: Option<PortBlock>,
+) -> Result<(), WorkspaceCredentialError> {
+    let Some(gateway_http) = crate::workspace_clients::gateway_http(platform, port_block) else {
+        return Err(WorkspaceCredentialError::Environment(
+            WorkspaceEnvironmentError::InvalidPortWiring {
+                platform,
+                port_block,
+            },
+        ));
+    };
+    let system_bundle = crate::workspace_clients::system_trust_bundle().map_err(|source| {
+        io_failure(
+            "reading the platform trust bundle",
+            Path::new(crate::workspace_clients::SYSTEM_TRUST_BUNDLE),
+            source,
+        )
+    })?;
+    // Anchored at its resolved path: the directory itself was just checked to be a real
+    // directory, and no child runs while a workspace is minted, but the mount's own ancestry may
+    // pass through a platform link (`/var` → `/private/var`), which the anchored walk refuses.
+    let root = fs::canonicalize(credential_directory)
+        .and_then(|resolved| crate::fsio::AnchoredDirectory::create(&resolved))
+        .map_err(|source| {
+            io_failure(
+                "opening the private environment",
+                credential_directory,
+                source,
+            )
+        })?;
+    crate::workspace_clients::publish_client_wiring(
+        &root,
+        &crate::workspace_clients::ClientWiring {
+            gateway_http: &gateway_http,
+            token,
+            workspace_ca: Some(workspace_ca),
+            system_bundle: &system_bundle,
+            environment: &workspace_mount.join(CREDENTIAL_DIRECTORY),
+        },
+    )
+    .map_err(|source| {
+        io_failure(
+            "publishing package-manager wiring",
+            credential_directory,
+            source,
+        )
+    })
 }
 
 fn ensure_credential_directory(mount_point: &Path) -> Result<PathBuf, WorkspaceCredentialError> {

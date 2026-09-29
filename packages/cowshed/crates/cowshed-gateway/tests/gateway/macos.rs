@@ -1058,6 +1058,87 @@ async fn local_mirror_route_rewrites_only_the_admitted_scope() {
     gateway.drain().await.expect("drain gateway");
 }
 
+/// A registry client talks to its registry, not to a proxy, so it can only send the token in its
+/// own `Authorization` header: bun as `Bearer` (bunfig `token`), Go as `Basic` (netrc). On the
+/// local mirror routes that header carries the workspace token; it is still one exact token,
+/// another workspace's is refused, and it never reaches the upstream. Anywhere else —
+/// absolute-form proxying — `Authorization` is the client's own and authenticates nothing here.
+#[tokio::test]
+async fn a_registry_clients_authorization_header_authenticates_only_the_mirror_routes() {
+    let (upstream_port, mut captured, _upstream) = http_fixture(2, None).await;
+    let endpoint = free_endpoint();
+    let gateway = gateway(
+        test_config(),
+        Arc::new(NoCredentials),
+        Arc::new(LocalConnector {
+            health: UpstreamHealth::Healthy,
+            observed: None,
+        }),
+        Arc::new(DiscardAudit),
+    )
+    .await;
+    let policy = WorkspacePolicy {
+        grants: vec![grant("isolated.test", upstream_port)],
+        mirrors: vec![MirrorRoute {
+            local_prefix: "/npm/".to_owned(),
+            upstream_origin: format!("https://mirror.test:{upstream_port}"),
+            protocol: MirrorProtocol::Npm,
+            admitted_prefixes: vec!["/".to_owned()],
+            credentialed: false,
+        }],
+    };
+    let (session, token, _) = session(
+        "registry-client",
+        "owner/repo-registry",
+        WorkspaceEndpoint::Tcp(endpoint),
+        11,
+        1,
+        policy,
+    );
+    gateway
+        .handle()
+        .install(session)
+        .await
+        .expect("install session");
+
+    for authorization in [
+        format!("Bearer {token}"),
+        basic_credential("cowshed", &token),
+    ] {
+        let request = format!(
+            "GET /npm/left-pad HTTP/1.1\r\nHost: {endpoint}\r\nAuthorization: {authorization}\r\nConnection: close\r\n\r\n"
+        );
+        let response = proxy_request(endpoint, request).await;
+        assert!(
+            response.starts_with("HTTP/1.1 200"),
+            "{authorization}: {response}"
+        );
+        let forwarded = captured.recv().await.expect("captured mirror request");
+        assert!(
+            forwarded.starts_with("GET /left-pad HTTP/1.1"),
+            "{forwarded}"
+        );
+        assert!(
+            !forwarded.to_ascii_lowercase().contains("authorization"),
+            "the workspace token reached the upstream: {forwarded}"
+        );
+    }
+
+    let forged = format!(
+        "GET /npm/left-pad HTTP/1.1\r\nHost: {endpoint}\r\nAuthorization: Bearer {}\r\nConnection: close\r\n\r\n",
+        "B".repeat(43)
+    );
+    let response = proxy_request(endpoint, forged).await;
+    assert!(response.starts_with("HTTP/1.1 407"), "{response}");
+
+    let proxied = format!(
+        "GET http://isolated.test:{upstream_port}/allowed HTTP/1.1\r\nHost: isolated.test:{upstream_port}\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n\r\n"
+    );
+    let response = proxy_request(endpoint, proxied).await;
+    assert!(response.starts_with("HTTP/1.1 407"), "{response}");
+    gateway.drain().await.expect("drain gateway");
+}
+
 #[tokio::test]
 async fn opaque_connect_preserves_bytes_exactly() {
     let upstream = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))

@@ -9,7 +9,7 @@ use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufWriter, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
-use std::os::unix::ffi::OsStrExt;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
@@ -133,6 +133,96 @@ impl AnchoredDirectory {
         } else {
             Err(io::Error::last_os_error())
         }
+    }
+
+    /// Publish `contents` as the private regular file `name` beneath this directory.
+    ///
+    /// A file that already holds exactly these bytes is left in place, so republishing unchanged
+    /// wiring before every spawn costs one read. Otherwise the bytes go to an exclusively created
+    /// 0600 temp sibling, are synced, and are renamed over `name`. Nothing is followed: a link a
+    /// child planted at `name` is replaced by the rename, never written through.
+    pub(crate) fn publish_file(&self, name: &CStr, contents: &[u8]) -> io::Result<()> {
+        validate_directory_leaf(name)?;
+        if self.read_regular_file(name)?.as_deref() == Some(contents) {
+            return Ok(());
+        }
+        let temp = CString::new(
+            temp_name(
+                OsStr::from_bytes(name.to_bytes()),
+                uuid::Uuid::new_v4().simple(),
+            )
+            .into_vec(),
+        )
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "file name contains NUL"))?;
+        // SAFETY: the held directory fd and NUL-terminated leaf outlive the call; EXCL and
+        // NOFOLLOW refuse any entry already at the temp name, a link included.
+        let fd = unsafe {
+            libc::openat(
+                self.0.as_raw_fd(),
+                temp.as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0o600,
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: a successful openat returned a new owned file descriptor.
+        let mut file = unsafe { File::from_raw_fd(fd) };
+        let published = (|| {
+            file.write_all(contents)?;
+            file.set_permissions(
+                <fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o600),
+            )?;
+            file.sync_all()?;
+            // SAFETY: both names are leaves beneath the same held directory fd.
+            if unsafe {
+                libc::renameat(
+                    self.0.as_raw_fd(),
+                    temp.as_ptr(),
+                    self.0.as_raw_fd(),
+                    name.as_ptr(),
+                )
+            } != 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            self.0.sync_all()
+        })();
+        if published.is_err() {
+            // SAFETY: removes this directory's own temp entry, never a link target.
+            unsafe { libc::unlinkat(self.0.as_raw_fd(), temp.as_ptr(), 0) };
+        }
+        published
+    }
+
+    /// The bytes of `name` when it is a regular file; `None` when it is absent or anything else
+    /// (a link, a directory, a FIFO), which publication then replaces.
+    fn read_regular_file(&self, name: &CStr) -> io::Result<Option<Vec<u8>>> {
+        // SAFETY: the held directory fd and NUL-terminated leaf outlive the call. NONBLOCK keeps a
+        // FIFO planted at `name` from stalling the open; it is rejected as not regular below.
+        let fd = unsafe {
+            libc::openat(
+                self.0.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            let error = io::Error::last_os_error();
+            return match error.raw_os_error() {
+                Some(libc::ENOENT | libc::ELOOP) => Ok(None),
+                _ => Err(error),
+            };
+        }
+        // SAFETY: a successful openat returned a new owned file descriptor.
+        let mut file = unsafe { File::from_raw_fd(fd) };
+        if !file.metadata()?.is_file() {
+            return Ok(None);
+        }
+        let mut bytes = Vec::new();
+        io::Read::read_to_end(&mut file, &mut bytes)?;
+        Ok(Some(bytes))
     }
 }
 
