@@ -2069,11 +2069,11 @@ const REMOVE: CommandSpec = CommandSpec {
         },
         Opt {
             spelling: "--restore",
-            meaning: "main only: put the pre-adoption checkout back and unbind the project, the reverse of adopt",
+            meaning: "main only: put the pre-adoption checkout back and unbind the project, the reverse of adopt. Refused while main's head is preserved neither by the retained checkout nor by a remote ref, unless --abandon is given",
         },
         Opt {
             spelling: "--abandon",
-            meaning: "the sole authorization for destroying commits main does not contain, and needed only for those: a workspace whose work is upstream by patch equivalence passes without it. Before deleting, main..HEAD is bundled into sessions/.trash/<ws>-<tip>.bundle and the abandonment reported, so the commits stay recoverable by fetching that bundle — the uncommitted tree is not bundled and does not survive",
+            meaning: "the sole authorization for destroying commits main does not contain, and needed only for those: a workspace whose work is upstream by patch equivalence passes without it. Before deleting, main..HEAD is bundled into sessions/.trash/<ws>-<tip>.bundle and the abandonment reported, so the commits stay recoverable by fetching that bundle — the uncommitted tree is not bundled and does not survive. With --restore on main, it authorizes restoring past commits nothing else preserves: they are bundled into .git/cowshed/abandoned-main-<tip>.bundle of the restored checkout first",
         },
     ],
 };
@@ -2089,9 +2089,10 @@ fn parse_remove(matches: &ArgMatches) -> Result<Command, UsageError> {
             USAGE,
         ));
     }
-    if abandon && workspace == "main" {
+    if abandon && workspace == "main" && !restore {
         return Err(UsageError::new(
-            "--abandon applies to session workspaces, whose commits main can contain",
+            "--abandon on main needs --restore: it keeps main's unpreserved commits in a bundle \
+             inside the restored checkout",
             USAGE,
         ));
     }
@@ -3300,15 +3301,23 @@ mod tests {
         };
         assert!(both.force && both.abandon);
 
-        // No short spelling, and nothing on main to abandon: main *is* the branch.
+        // No short spelling. On main, `--abandon` authorizes only what a restore would otherwise
+        // refuse to lose, so it is refused without `--restore`.
         assert!(parse_args(["rm", "raven", "-a"]).is_err());
         let error = parse_args(["rm", "main", "--abandon"]).expect_err("main has no landed gate");
-        assert!(error.message.contains("--abandon"));
+        assert!(error.message.contains("--restore"), "{}", error.message);
         // Usage text is where the flags are documented deliberately.
         assert_eq!(
             error.hint,
             "cowshed rm <ws> [--force] [--restore] [--abandon]"
         );
+        let Command::Remove(discard) = parse_args(["rm", "main", "--restore", "--abandon"])
+            .unwrap()
+            .command
+        else {
+            panic!("expected remove")
+        };
+        assert!(discard.restore && discard.abandon && !discard.force);
     }
 
     /// Which verbs may omit `<ws>` is a parser-level fact, and the split is deliberate: acting on

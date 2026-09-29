@@ -1860,12 +1860,11 @@ fn clean_terminal_project_storage(project_root: &Path, binding: &Path) -> Result
     Ok(())
 }
 
-/// Everything the controller still keeps for a project whose binding is gone. Nothing reopens an
-/// unbound project, so its lifecycle journal, deletion log, checkout layout and slot bindings go,
-/// and with them its store directory, its mount tree and each owner directory they leave empty.
-/// What the user put in the store — `policy.json`, `waivers.json`, `quarantine/` — stays, and
-/// keeps the store directory with it. The store side goes first, so a mount tree that cannot go is
-/// the only thing an error leaves behind.
+/// Everything the controller keeps for a project it is unbinding. Nothing reopens an unbound
+/// project, so its lifecycle journal, deletion log, checkout layout and slot bindings go, and with
+/// them its mount tree and each owner directory they leave empty; the store directory goes once
+/// the binding does. What the user put in the store — `policy.json`, `waivers.json`,
+/// `quarantine/` — stays, and keeps the store directory with it.
 #[cfg(target_os = "macos")]
 fn remove_unbound_project_state(paths: &crate::repository::ProjectPaths) -> Result<()> {
     for file in [
@@ -1981,10 +1980,10 @@ fn plan_empty_directories_on(path: &Path, device: u64, plan: &mut Vec<PathBuf>) 
     if !metadata.file_type().is_dir() || metadata.dev() != device {
         return Err(CowshedError::integrity(
             format!(
-                "the project is unbound, but its mount tree still holds {}",
+                "the project stays bound: its mount tree still holds {}",
                 path.display()
             ),
-            "move that entry aside, then delete the project's mount tree",
+            "move that entry aside, then retry cowshed rm main --restore",
         ));
     }
     for entry in std::fs::read_dir(path).map_err(inspect)? {
@@ -3753,11 +3752,13 @@ impl NativeProjectRuntimeHost {
         })
     }
 
-    async fn require_main_restore_safe(
+    /// Whether main's head survives the restore: held by the retained checkout (a branch or a
+    /// Cowshed preservation ref) or by a remote-tracking ref. Transient Git work refuses outright.
+    async fn main_restore_preservation(
         &self,
         workspace: &NativeWorkspace,
         pre_cowshed_checkout: &Path,
-    ) -> Result<()> {
+    ) -> Result<MainPreservation> {
         let fence = self.removal_git_fence(workspace).await?;
         if fence.dirty || fence.in_progress.is_some() {
             return Err(CowshedError::conflict(
@@ -3781,16 +3782,80 @@ impl NativeProjectRuntimeHost {
         let preserved_remotely = current_git
             .commit_is_remote_preserved(fence.head.as_str())
             .await?;
-        if !preserved_locally && !preserved_remotely {
-            return Err(CowshedError::conflict(
-                format!(
-                    "main head {} is not preserved by the retained checkout or a remote ref",
-                    fence.head
-                ),
-                "push main to its remote so its commits survive, then retry",
-            ));
+        if preserved_locally || preserved_remotely {
+            return Ok(MainPreservation::Preserved);
         }
-        Ok(())
+        // A retained checkout with no resolvable HEAD (an unborn branch) only widens an
+        // abandonment's bundle to main's whole history; it never makes a restore lose commits.
+        let retained_head = retained_git.head_oid().await.ok();
+        Ok(MainPreservation::Unpreserved {
+            head: fence.head,
+            retained_head,
+        })
+    }
+
+    /// Keeps main's unpreserved commits where the restore puts them: a bundle in the retained
+    /// checkout's Git directory, which the restore makes the project checkout's own. The bundle
+    /// carries the retained head as well, so it fetches into an empty repository, and it is
+    /// verified that way before anything is restored.
+    async fn bundle_abandoned_main(
+        &self,
+        workspace: &NativeWorkspace,
+        pre_cowshed_checkout: &Path,
+        head: GitOid,
+        retained_head: Option<GitOid>,
+    ) -> Result<AbandonedWork> {
+        let main_git =
+            crate::git::GitRepository::from_root(current_snapshot_mount(self, workspace)?);
+        let base = match retained_head {
+            Some(retained)
+                if main_git
+                    .commit_is_ancestor(retained.as_str(), head.as_str())
+                    .await? =>
+            {
+                Some(retained)
+            }
+            _ => None,
+        };
+        let name = format!("abandoned-main-{head}.bundle");
+        let staged_directory = pre_cowshed_checkout.join(".git").join("cowshed");
+        let directory = staged_directory.clone();
+        crate::storage::lifecycle::dispatch_blocking(move || {
+            std::fs::create_dir_all(&directory).map_err(|error| {
+                CowshedError::environment_missing(
+                    format!(
+                        "cannot create the abandoned-main directory {}: {error}",
+                        directory.display()
+                    ),
+                    "make the retained checkout's .git directory writable and retry",
+                )
+            })
+        })
+        .await
+        .map_err(|error| {
+            CowshedError::internal(format!("abandoned-main directory task failed: {error}"))
+        })??;
+        // `HEAD`, not the fence oid: a raw oid advertises no fetchable ref in a bundle, and the
+        // fence already proved main's HEAD is exactly `head`.
+        let unlanded_commits = main_git
+            .bundle_commits(
+                &staged_directory.join(&name),
+                base.as_ref().map(GitOid::as_str),
+                "HEAD",
+            )
+            .await?;
+        Ok(AbandonedWork {
+            head,
+            target_branch: "the retained checkout".to_owned(),
+            target_head: base,
+            unlanded_commits,
+            bundle: self
+                .descriptor
+                .git_root
+                .join(".git")
+                .join("cowshed")
+                .join(name),
+        })
     }
 
     async fn verify_checkout_identity(&self, path: &Path, description: &str) -> Result<()> {
@@ -3840,11 +3905,11 @@ impl NativeProjectRuntimeHost {
         Ok(())
     }
 
-    /// Removes the binding of a project whose main was restored, then everything else the
-    /// controller kept for it. The lifecycle journal goes with the rest: the binding's absence is
-    /// the removal's completion, and nothing reopens the project to read one. A process that dies
-    /// between the binding's removal and that cleanup leaves the rest behind, with nothing left to
-    /// retry it against.
+    /// Unbinds a project whose main was restored: the terminal storage, the controller's own
+    /// state (lifecycle journal included) and the mount tree go first, and the binding last, so a
+    /// process that dies part way leaves a project still bound and a retry that finishes the
+    /// job. The binding's absence is the removal's completion; its store directory and emptied
+    /// owner directories go right after it.
     async fn unbind_restored_project(&self) -> Result<()> {
         let paths = self.layout.project().clone();
         let expected = self.descriptor.binding.clone();
@@ -3882,6 +3947,7 @@ impl NativeProjectRuntimeHost {
                     ));
                 }
                 clean_terminal_project_storage(&paths.project_root, path)?;
+                remove_unbound_project_state(&paths)?;
                 std::fs::remove_file(path).map_err(|error| {
                     CowshedError::environment_missing(
                         format!(
@@ -3903,7 +3969,11 @@ impl NativeProjectRuntimeHost {
                         )
                     })?;
             }
-            remove_unbound_project_state(&paths)
+            remove_directory_if_empty(&paths.project_root)?;
+            match paths.project_root.parent() {
+                Some(owner) => remove_directory_if_empty(owner),
+                None => Ok(()),
+            }
         })
         .await
         .map_err(|error| CowshedError::internal(format!("binding cleanup task failed: {error}")))?
@@ -4484,6 +4554,17 @@ struct NativeWorkspace {
     derived: crate::storage::lifecycle::DerivedWorkspace,
     metadata: crate::metadata::DetachedWorkspaceMetadata,
     image: PathBuf,
+}
+
+/// Whether a main restore loses commits. `retained_head` is where the retained checkout stands,
+/// when it names one; an abandonment bundles main's history beyond it.
+#[cfg(target_os = "macos")]
+enum MainPreservation {
+    Preserved,
+    Unpreserved {
+        head: GitOid,
+        retained_head: Option<GitOid>,
+    },
 }
 
 #[cfg(target_os = "macos")]
@@ -6496,13 +6577,15 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                 "remove a session without --restore",
             ));
         }
-        // `--abandon` authorizes destroying commits the project's main branch does not contain.
-        // Main *is* that branch, so on main the flag has nothing to authorize and accepting it
-        // would let a script carry one spelling for both and lose main to a typo.
-        if options.abandon && workspace.is_main() {
+        // `--abandon` authorizes destroying commits nothing else holds. On a session that is
+        // commits the project's main branch does not contain; main *is* that branch, so on main
+        // the flag authorizes only what a restore would otherwise refuse to lose, and without
+        // `--restore` it would let a script carry one spelling for both and lose main to a typo.
+        if options.abandon && workspace.is_main() && !options.restore {
             return Err(CowshedError::usage(
-                "--abandon applies to session workspaces, whose commits main can contain",
-                "recover the pre-adoption checkout instead: cowshed rm main --restore",
+                "--abandon on main needs --restore: it keeps main's unpreserved commits in a \
+                 bundle inside the restored checkout",
+                "cowshed rm main --restore --abandon",
             ));
         }
         if workspace.is_main() && !options.restore && !options.force {
@@ -6591,16 +6674,10 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                 }
                 return Err(error);
             }
-            Err(error) if error.code == ErrorCode::NotFound && was_pending => {
-                let report = RemoveReport::default();
-                self.complete_lifecycle_intent(
-                    &workspace,
-                    crate::storage::recovery::LifecycleIntentCompletion::Retire(report.clone()),
-                )
-                .await?;
-                return Ok(report);
-            }
             Ok(current) => current,
+            // A restore's retry reaches here once main is retired. It must finish the unbinding,
+            // so it is tried before the pending-intent completion below, which would answer the
+            // retry with success while the binding still stands.
             Err(error) if options.restore && error.code == ErrorCode::NotFound => {
                 let pre_cowshed = pre_cowshed_path(&self.descriptor.git_root)?;
                 let restored = tokio::fs::symlink_metadata(&pre_cowshed).await.is_err()
@@ -6621,6 +6698,15 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                 }
                 return Err(error);
             }
+            Err(error) if error.code == ErrorCode::NotFound && was_pending => {
+                let report = RemoveReport::default();
+                self.complete_lifecycle_intent(
+                    &workspace,
+                    crate::storage::recovery::LifecycleIntentCompletion::Retire(report.clone()),
+                )
+                .await?;
+                return Ok(report);
+            }
             Err(error) => return Err(error),
         };
 
@@ -6635,6 +6721,7 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                 CowshedError::internal(format!("terminal storage check failed: {error}"))
             })??;
             let initial_rollback_state = self.adopt_rollback_state(&current, &pre_cowshed).await?;
+            let mut abandoned = None;
             if !options.force && initial_rollback_state != NativeAdoptRollbackState::Complete {
                 self.verify_checkout_identity(&pre_cowshed, "retained pre-cowshed checkout")
                     .await?;
@@ -6647,7 +6734,27 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                         .map_err(native_storage_error)?;
                     current = self.current(&workspace).await?;
                 }
-                if let Err(error) = self.require_main_restore_safe(&current, &pre_cowshed).await {
+                let preserved = match self.main_restore_preservation(&current, &pre_cowshed).await {
+                    Ok(MainPreservation::Preserved) => Ok(()),
+                    Ok(MainPreservation::Unpreserved {
+                        head,
+                        retained_head,
+                    }) if options.abandon => self
+                        .bundle_abandoned_main(&current, &pre_cowshed, head, retained_head)
+                        .await
+                        .map(|work| abandoned = Some(work)),
+                    Ok(MainPreservation::Unpreserved { head, .. }) => Err(CowshedError::conflict(
+                        format!(
+                            "main head {head} is not preserved by the retained checkout or a \
+                                 remote ref"
+                        ),
+                        "push main to its remote so its commits survive, or keep them only \
+                             as a bundle in the restored checkout: cowshed rm main --restore \
+                             --abandon",
+                    )),
+                    Err(error) => Err(error),
+                };
+                if let Err(error) = preserved {
                     if initially_detached {
                         self.substrate
                             .unmount(&current.derived.workspace)
@@ -6684,7 +6791,7 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
             }
             self.retire_restored_main(current).await?;
             self.unbind_restored_project().await?;
-            return Ok(RemoveReport::default());
+            return Ok(RemoveReport { abandoned });
         }
 
         let initially_detached = matches!(current.derived.mount_state, MountState::Detached);
