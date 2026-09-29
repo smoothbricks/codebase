@@ -20,6 +20,8 @@ import {
   cleanupPullRequest,
   deployStage,
   describeCleanup,
+  describeInventory,
+  inventoryPullRequest,
   type ProcessResult,
   type ProcessRunner,
   type ProcessRunOptions,
@@ -1228,6 +1230,228 @@ describe('cleanup-pr from stage records', () => {
 
     expect(deleted).toEqual(['api-pr7', 'web-pr7']);
     expect(result.deleted.workers).toBe(2);
+  });
+});
+
+function inventory(root: string, prNumber: number, cloudflare: CloudflareClient) {
+  return inventoryPullRequest(root, prNumber, { cloudflare, processEnv: {} });
+}
+
+describe('cleanup-pr --dry-run inventory', () => {
+  it('reads exactly what the deleting run reads, and lists every live item by name and id, deleting nothing', async () => {
+    const deleting = new FakeCloudflare();
+    const previewing = new FakeCloudflare();
+    const keys = recordStage(previewing, FULL_STAGE);
+    recordStage(deleting, FULL_STAGE);
+    liveFullStage(previewing);
+    liveFullStage(deleting);
+
+    const result = await inventory(await cleanupRoot(), 7, previewing);
+    const cleaned = await cleanup(await cleanupRoot(), 7, deleting);
+
+    // The preview resolved the same items the deleting run deleted, from the same reads.
+    expect(previewing.reads).toEqual(deleting.reads);
+    expect(cleaned.recorded).toBe(FULL_STAGE.length);
+    expect(deleting.mutations.length).toBeGreaterThan(0);
+    expect(result).toEqual({
+      stage: 'pr7',
+      scope: SCOPE,
+      recorded: FULL_STAGE.length,
+      candidates: {
+        workers: ['api-pr7', 'web-pr7'],
+        domains: [{ id: 'domain-app', hostname: 'App.PR7.example.test' }],
+        routes: [{ zoneId: 'zone-example', id: 'route-web', pattern: '*.PR7.example.test/*' }],
+        dnsRecords: [{ zoneId: 'zone-example', id: 'dns-wildcard', name: '*.pr7.Example.test.' }],
+        kvNamespaces: [{ id: 'kv-sessions', title: 'sessions-pr7' }],
+        r2Buckets: [{ name: 'media-pr7', objectCount: 2 }],
+        d1Databases: [{ uuid: 'd1-site', name: 'site-pr7-db' }],
+      },
+      alreadyGone: 0,
+      leftInPlace: [],
+    });
+    expect(previewing.mutations).toEqual([]);
+    expect(previewing.objects[STAGE_RECORDS_BUCKET]).toEqual(keys);
+  });
+
+  it('names what another Worker now holds exactly as the deleting run does, and deletes nothing', async () => {
+    const records: StageRecord[] = [
+      { kind: 'worker', worker: 'web-pr7' },
+      { kind: 'domain', worker: 'web-pr7', hostname: 'app.pr7.example.test' },
+      { kind: 'route', worker: 'web-pr7', zone: 'example.test', pattern: '*.pr7.example.test/*' },
+      { kind: 'dns', worker: 'web-pr7', zone: 'example.test', name: '*.pr7.example.test' },
+    ];
+    const deleting = new FakeCloudflare();
+    const previewing = new FakeCloudflare();
+    const keys = recordStage(previewing, records);
+    recordStage(deleting, records);
+    for (const cloudflare of [deleting, previewing]) {
+      cloudflare.scripts = [{ id: 'web-pr7' }, { id: 'other-worker' }];
+      cloudflare.zones = [{ id: 'zone-example', name: 'example.test' }];
+      cloudflare.domains = [{ id: 'domain-app', hostname: 'app.pr7.example.test', service: 'other-worker' }];
+      cloudflare.routes['zone-example'] = [
+        { id: 'route-web', pattern: '*.pr7.example.test/*', script: 'other-worker' },
+      ];
+      cloudflare.records['zone-example'] = [
+        { id: 'dns-wildcard', name: '*.pr7.example.test', type: 'CNAME', content: 'pr7.example.test' },
+      ];
+    }
+
+    const result = await inventory(await cleanupRoot(), 7, previewing);
+    const cleaned = await cleanup(await cleanupRoot(), 7, deleting);
+
+    expect(result.leftInPlace).toEqual(cleaned.leftInPlace);
+    expect(result.leftInPlace).toEqual([
+      'custom domain app.pr7.example.test (bound to other-worker)',
+      'route *.pr7.example.test/* (bound to other-worker)',
+      'DNS record *.pr7.example.test (serves route *.pr7.example.test/*)',
+    ]);
+    expect(result.candidates.workers).toEqual(['web-pr7']);
+    expect(previewing.mutations).toEqual([]);
+    expect(previewing.objects[STAGE_RECORDS_BUCKET]).toEqual(keys);
+  });
+
+  it('refuses like the deleting run when a recorded zone is not visible, keeping every record', async () => {
+    const cloudflare = new FakeCloudflare();
+    const keys = recordStage(cloudflare, [
+      { kind: 'worker', worker: 'web-pr7' },
+      { kind: 'route', worker: 'web-pr7', zone: 'hidden.test', pattern: '*.pr7.hidden.test/*' },
+      { kind: 'dns', worker: 'web-pr7', zone: 'hidden.test', name: '*.pr7.hidden.test' },
+    ]);
+    cloudflare.scripts = [{ id: 'web-pr7' }];
+    cloudflare.zones = [{ id: 'zone-example', name: 'example.test' }];
+
+    const refusal = await inventory(await cleanupRoot(), 7, cloudflare).catch((thrown: unknown) =>
+      thrown instanceof Error ? thrown.message : String(thrown),
+    );
+
+    expect(refusal).toContain('The token lists no zone hidden.test in the CLOUDFLARE_ACCOUNT_ID');
+    expect(refusal).toContain('nothing was deleted and every record is kept');
+    expect(cloudflare.mutations).toEqual([]);
+    expect(cloudflare.objects[STAGE_RECORDS_BUCKET]).toEqual(keys);
+  });
+
+  it('counts recorded items that no longer exist exactly as the deleting run does, and deletes nothing', async () => {
+    const records: StageRecord[] = [
+      { kind: 'worker', worker: 'web-pr7' },
+      { kind: 'kv', worker: 'web-pr7', title: 'sessions-pr7' },
+      { kind: 'd1', worker: 'web-pr7', name: 'site-pr7-db' },
+      { kind: 'r2', worker: 'web-pr7', bucket: 'media-pr7' },
+      { kind: 'domain', worker: 'web-pr7', hostname: 'app.pr7.example.test' },
+      { kind: 'route', worker: 'web-pr7', zone: 'example.test', pattern: '*.pr7.example.test/*' },
+      { kind: 'dns', worker: 'web-pr7', zone: 'example.test', name: '*.pr7.example.test' },
+    ];
+    const deleting = new FakeCloudflare();
+    const previewing = new FakeCloudflare();
+    const keys = recordStage(previewing, records);
+    recordStage(deleting, records);
+    for (const cloudflare of [deleting, previewing]) {
+      cloudflare.scripts = [];
+      cloudflare.zones = [{ id: 'zone-example', name: 'example.test' }];
+    }
+
+    const result = await inventory(await cleanupRoot(), 7, previewing);
+    const cleaned = await cleanup(await cleanupRoot(), 7, deleting);
+
+    expect(result.alreadyGone).toBe(cleaned.alreadyGone);
+    expect(result.alreadyGone).toBe(7);
+    expect(result.candidates).toEqual({
+      workers: [],
+      domains: [],
+      routes: [],
+      dnsRecords: [],
+      kvNamespaces: [],
+      r2Buckets: [],
+      d1Databases: [],
+    });
+    expect(previewing.mutations).toEqual([]);
+    expect(previewing.objects[STAGE_RECORDS_BUCKET]).toEqual(keys);
+  });
+
+  it('reports no records explicitly, reads nothing else, and keeps the legacy-stage warning', async () => {
+    const cloudflare = new FakeCloudflare();
+    recordStage(cloudflare, [{ kind: 'worker', worker: 'web-pr70' }], { stage: 'pr70' });
+
+    const result = await inventory(await cleanupRoot(), 7, cloudflare);
+
+    expect(result.recorded).toBe(0);
+    expect(result.candidates).toEqual({
+      workers: [],
+      domains: [],
+      routes: [],
+      dnsRecords: [],
+      kvNamespaces: [],
+      r2Buckets: [],
+      d1Databases: [],
+    });
+    expect(result.warning).toContain('an older smoo deployed');
+    expect(result.warning).toContain('named another repository');
+    expect(cloudflare.reads).toEqual(['r2', `objects:${STAGE_RECORDS_BUCKET}:${PR7_PREFIX}`]);
+    expect(cloudflare.mutations).toEqual([]);
+  });
+});
+
+describe('describeInventory', () => {
+  const noCandidates = {
+    workers: [],
+    domains: [],
+    routes: [],
+    dnsRecords: [],
+    kvNamespaces: [],
+    r2Buckets: [],
+    d1Databases: [],
+  };
+
+  it('names what would be deleted, what is already gone and what was left in place, and says nothing was deleted', () => {
+    expect(
+      describeInventory({
+        stage: 'pr7',
+        scope: SCOPE,
+        recorded: 6,
+        candidates: {
+          workers: ['web-pr7'],
+          domains: [],
+          routes: [{ zoneId: 'zone-example', id: 'route-web', pattern: '*.pr7.example.com/*' }],
+          dnsRecords: [],
+          kvNamespaces: [{ id: 'kv-a', title: 'sessions-pr7' }],
+          r2Buckets: [{ name: 'media-pr7', objectCount: 15 }],
+          d1Databases: [],
+        },
+        alreadyGone: 2,
+        leftInPlace: ['route *.pr7.example.com/* (bound to other-worker)'],
+      }),
+    ).toBe(
+      'Dry run for pr7 of github.com/acme/app from 6 records: would delete 1 Worker, 0 custom domains, 1 route, 0 DNS records, 1 KV namespace, 1 R2 bucket (15 objects), 0 D1 databases; 2 recorded items are already gone; left in place: route *.pr7.example.com/* (bound to other-worker). Nothing was deleted.',
+    );
+  });
+
+  it("counts one already-gone item in the singular, in the dry run's present tense", () => {
+    expect(
+      describeInventory({
+        stage: 'pr7',
+        scope: SCOPE,
+        recorded: 1,
+        candidates: noCandidates,
+        alreadyGone: 1,
+        leftInPlace: [],
+      }),
+    ).toBe(
+      'Dry run for pr7 of github.com/acme/app from 1 record: would delete 0 Workers, 0 custom domains, 0 routes, 0 DNS records, 0 KV namespaces, 0 R2 buckets (0 objects), 0 D1 databases; 1 recorded item is already gone. Nothing was deleted.',
+    );
+  });
+
+  it('says a stage without records would delete nothing, without implying its items are gone', () => {
+    expect(
+      describeInventory({
+        stage: 'pr7',
+        scope: SCOPE,
+        recorded: 0,
+        candidates: noCandidates,
+        alreadyGone: 0,
+        leftInPlace: [],
+      }),
+    ).toBe(
+      'Nothing is recorded for pr7 of github.com/acme/app, so cleanup-pr would delete nothing. That is expected when the pull request deployed nothing or an earlier cleanup finished its stage. A stage an older smoo deployed, or one deployed while the root package.json named another repository, has no records here and may still be live, so check for its items by hand and delete what is left.',
+    );
   });
 });
 
