@@ -1023,6 +1023,7 @@ mod parity_tests {
             | Command::Setup(_)
             | Command::Mount(_)
             | Command::Rekey(_)
+            | Command::Defrag(_)
             | Command::Version
             | Command::Help(_) => None,
         }
@@ -1069,6 +1070,7 @@ mod parity_tests {
         (&["skill", "install"], None),
         (&["mount", "main", "--repo-id", "acme/widget"], None),
         (&["rekey", "parity"], None),
+        (&["defrag", "parity"], None),
         (&["help"], None),
         (&["setup"], None),
         (&["--version"], None),

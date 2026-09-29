@@ -21,10 +21,10 @@ use cowshed_core::storage::apfs::{
     ResumableStage, RetireExecutionError, volume_key,
 };
 use cowshed_core::storage::lifecycle::{
-    AdoptRequest, CheckpointFact, Destination, KernelMountFact, LifecycleFact, LifecyclePlanner,
-    LifecycleWorkspace, MountIntent, MountState, OperationIdentity, Pin, ResizeOutcome,
-    RestoreMode, RetiredRef, Revision, StorageFact, StorageGcPlan, StorageGcReport, Substrate,
-    SubstrateStats,
+    AdoptRequest, CheckpointFact, DefragmentOutcome, Destination, ExtentCount, KernelMountFact,
+    LifecycleFact, LifecyclePlanner, LifecycleWorkspace, MountIntent, MountState,
+    OperationIdentity, Pin, ResizeOutcome, RestoreMode, RetiredRef, Revision, StorageFact,
+    StorageGcPlan, StorageGcReport, Substrate, SubstrateStats,
 };
 use proptest::prelude::*;
 
@@ -495,6 +495,21 @@ impl ApfsExecutionHost for FakeHost {
         Ok(ResizeOutcome {
             previous: DEFAULT_IMAGE_CAPACITY,
             capacity,
+        })
+    }
+
+    fn defragment(
+        &self,
+        workspace: &LifecycleWorkspace,
+        image: &Path,
+        _: &Path,
+    ) -> Result<DefragmentOutcome, ApfsStorageError> {
+        self.record_path(image);
+        self.record(format!("defragment:{}", workspace.name()));
+        Ok(DefragmentOutcome {
+            previous: ExtentCount::new(2),
+            extents: ExtentCount::new(1),
+            bytes: 0,
         })
     }
 

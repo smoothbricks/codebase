@@ -225,7 +225,8 @@ Budget: ≤ 1 s cold. No pool, no pre-warming.
    `diskutil image attach --noMount` for ASIF or `hdiutil attach -nomount` for SPARSE (flags per 01_storage.md) —
    ~235–400 ms typical for a freshly written image. The first write into the clone, in attach or mount, also copies the
    source image's extent map (01_storage.md, "Clone cost follows extents, not size"), which on a long-used main is tens
-   of seconds. Verification precedes the first mount; a clone never mounts unchecked.
+   of seconds until `cowshed defrag main` rewrites main contiguously. Verification precedes the first mount; a clone
+   never mounts unchecked.
 4. On fsck failure, delete the clone and retry once from a fresh sync. (Measured: 10/10 clonefiles taken under a
    continuous writer plus a streaming 128 MiB dd passed both `fsck_apfs -q` and a full `-n` check, mountable and
    readable, on both formats — this path is a safety net that is expected to essentially never fire; the fork-mid-write

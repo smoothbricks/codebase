@@ -141,6 +141,10 @@ pub trait ProjectRuntimeHost: Send + 'static {
         workspace: WorkspaceName,
         capacity: String,
     ) -> Result<crate::api::dto::ResizeResult>;
+    async fn defragment(
+        &mut self,
+        workspace: WorkspaceName,
+    ) -> Result<crate::api::dto::DefragmentResult>;
     async fn checkpoint(
         &mut self,
         workspace: WorkspaceName,
@@ -647,6 +651,7 @@ impl ProjectActor {
             "coordinator.land" => self.coordinator_land(request).await,
             "coordinator.restore" => self.coordinator_restore(request).await,
             "coordinator.resize" => self.coordinator_resize(request).await,
+            "coordinator.defragment" => self.coordinator_defragment(request).await,
             "coordinator.detach" => self.coordinator_detach(request).await,
             "coordinator.assignSlot" => self.coordinator_assign_slot(request).await,
             "coordinator.destroy" => self.coordinator_destroy(request).await,
@@ -923,6 +928,14 @@ impl ProjectActor {
         let params: ResizeParams = decode_params(request.params(), request.method())?;
         self.require_repo(&params.repo_id)?;
         let result = self.host.resize(params.workspace, params.capacity).await?;
+        json_response(result)
+    }
+
+    async fn coordinator_defragment(&mut self, request: RouterRequest) -> Result<RouterResponse> {
+        require_coordinator(request.authority())?;
+        let params: WorkspaceParams = decode_params(request.params(), request.method())?;
+        self.require_repo(&params.repo_id)?;
+        let result = self.host.defragment(params.workspace).await?;
         json_response(result)
     }
 
@@ -6515,6 +6528,38 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
         })
     }
 
+    /// Rewrite a workspace's image contiguously, restoring the mount state the verb found it in.
+    ///
+    /// The supervisor is stopped first for the reason `resize` stops it: the image has to leave
+    /// the kernel to be copied, and a supervisor holding the mount would keep it busy.
+    async fn defragment(
+        &mut self,
+        workspace: WorkspaceName,
+    ) -> Result<crate::api::dto::DefragmentResult> {
+        use crate::storage::lifecycle::Substrate;
+        self.validate_binding().await?;
+        let current = self.current(&workspace).await?;
+        let was_mounted = matches!(
+            current.derived.mount_state,
+            crate::storage::lifecycle::MountState::Mounted { .. }
+        );
+        self.stop_supervisor(&workspace).await?;
+        let outcome = self
+            .substrate
+            .defragment(&current.derived.workspace)
+            .await
+            .map_err(native_storage_error)?;
+        if was_mounted {
+            self.ensure_supervisor(&workspace).await?;
+        }
+        Ok(crate::api::dto::DefragmentResult {
+            workspace,
+            previous_extents: outcome.previous.get(),
+            extents: outcome.extents.get(),
+            bytes: outcome.bytes,
+        })
+    }
+
     async fn checkpoint(
         &mut self,
         workspace: WorkspaceName,
@@ -7987,6 +8032,61 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                 native_storage_error(error),
             )),
         }
+        // Every clone of main copies main's extent map on its first write, so the count predicts
+        // what the next `new` will pay before it is paid.
+        if let Some(image) = companion_images
+            .iter()
+            .find(|(name, _)| name.is_main())
+            .map(|(_, image)| image.clone())
+        {
+            let counted = image.clone();
+            let extents = crate::storage::lifecycle::dispatch_blocking(move || {
+                crate::storage::apfs::extents::count_extents(&counted)
+            })
+            .await;
+            findings.push(match extents {
+                Ok(Ok(extents)) => main_extents_finding(image, extents),
+                Ok(Err(error)) => main_extents_unread(image, error.to_string()),
+                Err(error) => main_extents_unread(image, error.to_string()),
+            });
+        }
+        // An interrupted rewrite leaves a full copy of the image beside it, which nothing lists as
+        // an image and `gc` does not collect: say so, with its size, until a rewrite replaces it.
+        let siblings = companion_images
+            .iter()
+            .map(|(name, image)| {
+                (
+                    name.clone(),
+                    crate::storage::apfs::extents::rewrite_sibling(image),
+                )
+            })
+            .collect::<Vec<_>>();
+        findings.extend(
+            crate::storage::lifecycle::dispatch_blocking(move || {
+                siblings
+                    .into_iter()
+                    .filter_map(|(name, sibling)| {
+                        use std::os::unix::fs::MetadataExt;
+                        let metadata = std::fs::symlink_metadata(&sibling).ok()?;
+                        Some(crate::api::dto::Finding {
+                            code: "defrag-leftover".into(),
+                            severity: crate::api::dto::FindingSeverity::Warning,
+                            message: format!(
+                                "{} is the copy an interrupted or still-running cowshed defrag {name} was writing; it holds {} bytes",
+                                sibling.display(),
+                                metadata.blocks().saturating_mul(crate::apfs::SECTOR_BYTES)
+                            ),
+                            hint: format!(
+                                "cowshed defrag {name} replaces it; with no defrag running, deleting it is safe"
+                            ),
+                            path: Some(sibling),
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .await
+            .unwrap_or_default(),
+        );
         // Recovery quarantines a companion-less workspace and continues, so the failure never
         // reaches `doctor` as an error: the tombstones and the live images are read here, from
         // the same store-side facts, instead.
@@ -10613,6 +10713,14 @@ fn native_storage_error(error: crate::storage::apfs::ApfsStorageError) -> Cowshe
                 "cowshed resize <workspace> <capacity larger than the current one>",
             )
         }
+        // A volume too full for the rewrite's copy is the operator's to free, and nothing was
+        // touched: the storage is healthy, so the generic repair hint would mislead.
+        error @ crate::storage::apfs::ApfsStorageError::InsufficientSpace { .. } => {
+            CowshedError::environment_missing(
+                error.to_string(),
+                "free space on the store volume (cowshed gc reclaims what cowshed can), then retry",
+            )
+        }
         // A missing CA companion names its own remedy: only `rekey` rebuilds the companion,
         // so the generic doctor hint would send the reader after the wrong problem. The
         // workspace rides in the hint from the image's file name with the format's own
@@ -11012,6 +11120,55 @@ fn merge_driver_finding(
     }
 }
 
+/// The first-write cost at which main's extent map alone spends the budget `cowshed new` has for
+/// its whole cold path (08_testing.md), and the rewrite starts paying for itself.
+#[cfg(target_os = "macos")]
+const CLONE_FIRST_WRITE_BUDGET: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Main's extent count and the first-write cost each new clone of it is predicted to pay.
+///
+/// Below the budget the count is reported for the record, with nothing to do; at or above it the
+/// finding warns and names the rewrite.
+#[cfg(target_os = "macos")]
+fn main_extents_finding(
+    image: PathBuf,
+    extents: crate::storage::lifecycle::ExtentCount,
+) -> crate::api::dto::Finding {
+    let cost = extents.first_write_cost();
+    let costly = cost >= CLONE_FIRST_WRITE_BUDGET;
+    crate::api::dto::Finding {
+        code: "main-extents".into(),
+        severity: if costly {
+            crate::api::dto::FindingSeverity::Warning
+        } else {
+            crate::api::dto::FindingSeverity::Info
+        },
+        message: format!(
+            "main's image has {extents} extents; the first write into each new clone copies that map, predicted to take {cost:.1?}"
+        ),
+        hint: if costly {
+            "cowshed defrag main".into()
+        } else {
+            String::new()
+        },
+        path: Some(image),
+    }
+}
+
+/// Main's extents could not be read, so the clone cost is unknown rather than fine.
+#[cfg(target_os = "macos")]
+fn main_extents_unread(image: PathBuf, error: String) -> crate::api::dto::Finding {
+    crate::api::dto::Finding {
+        code: "main-extents".into(),
+        severity: crate::api::dto::FindingSeverity::Warning,
+        message: format!(
+            "could not count main's image extents, so the first-write cost of a new clone is unknown: {error}"
+        ),
+        hint: "check that the store volume is readable, then rerun cowshed doctor".into(),
+        path: Some(image),
+    }
+}
+
 #[cfg(target_os = "macos")]
 fn cowshed_upstream_finding(
     workspace_name: &WorkspaceName,
@@ -11391,6 +11548,32 @@ mod doctor_hint_tests {
                 PathBuf::from("/mnt/raven"),
             )
             .is_none()
+        );
+    }
+
+    #[test]
+    fn main_extents_warn_with_the_rewrite_once_a_clone_first_write_spends_the_new_budget() {
+        use crate::api::dto::FindingSeverity;
+        use crate::storage::lifecycle::ExtentCount;
+
+        let image = PathBuf::from("/store/acme/widget/main.sparseimage");
+        // 12 µs per extent: 83,333 extents copy in just under a second, 83,334 in just over.
+        let under = main_extents_finding(image.clone(), ExtentCount::new(83_333));
+        assert_eq!(under.code, "main-extents");
+        assert_eq!(under.severity, FindingSeverity::Info);
+        assert_eq!(under.hint, "");
+        assert!(under.message.contains("83333 extents"), "{}", under.message);
+
+        let over = main_extents_finding(image.clone(), ExtentCount::new(83_334));
+        assert_eq!(over.severity, FindingSeverity::Warning);
+        assert_eq!(over.hint, "cowshed defrag main");
+        assert_eq!(over.path, Some(image.clone()));
+
+        let measured = main_extents_finding(image, ExtentCount::new(2_110_000));
+        assert!(
+            measured.message.contains("25.3s"),
+            "the 2.11M-extent main that took 25.7 s predicts about that: {}",
+            measured.message
         );
     }
 

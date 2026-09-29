@@ -37,9 +37,9 @@ use sha2::{Digest, Sha256};
 use super::super::bootstrap::is_reserved_store_namespace;
 use super::super::deletion_log::{self, DeletionKind, DeletionOp};
 use super::super::lifecycle::{
-    CheckpointFact, KernelMountFact, LifecycleFact, LifecycleWorkspace, OperationIdentity, Pin,
-    ResizeOutcome, RetiredRef, Revision, StorageFact, StorageGcCandidate, StorageGcPlan,
-    StorageGcReason, StorageGcReport, StorageGcRetained, SubstrateStats,
+    CheckpointFact, DefragmentOutcome, KernelMountFact, LifecycleFact, LifecycleWorkspace,
+    OperationIdentity, Pin, ResizeOutcome, RetiredRef, Revision, StorageFact, StorageGcCandidate,
+    StorageGcPlan, StorageGcReason, StorageGcReport, StorageGcRetained, SubstrateStats,
 };
 use super::super::{
     CheckpointLabel, WORKSPACE_MARKER_PATH, discover_session_images, verify_no_symlinks,
@@ -47,9 +47,10 @@ use super::super::{
 use super::{
     ApfsExecutionHost, ApfsStorageError, ApfsSubstrateConfig, LockMode, MarkerExpectation,
     MetadataPolicy, PendingPublicationFact, PublicationError, ResumableClone, ResumableStage,
-    companion_path, layout, main_aware_mount_point, recovery_staging_mount, retired_image_below,
-    split_retired_stem, volume_key,
+    companion_path, extents, layout, main_aware_mount_point, recovery_staging_mount,
+    retired_image_below, split_retired_stem, volume_key,
 };
+use crate::timing::timed;
 
 const CHECKPOINT_FACT_VERSION: u32 = 1;
 const CHECKPOINT_FACT_SUFFIX: &str = ".checkpoint.json";
@@ -2987,23 +2988,66 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
         }
     }
 
-    /// Hand back the attachment a failed resize step left behind, reporting the original failure.
+    /// Hand back the attachment a failed step left behind, reporting the original failure.
     ///
-    /// The image is already grown at this point and stays grown: the resize itself succeeded, and
-    /// re-running the verb converges. What must not survive is a stray attachment nothing owns.
-    fn abandon_resized_attachment(
+    /// Whatever the step already did to the image stays done — a grown image stays grown, a
+    /// rewritten one stays rewritten — and re-running its verb converges. What must not survive is
+    /// a stray attachment nothing owns.
+    fn abandon_attachment(
         &self,
         attachment: AttachedImage,
         primary: ApfsStorageError,
+        operation: &'static str,
     ) -> ApfsStorageError {
         match self.backend.detach(&attachment, DetachIntent::Release) {
             Ok(()) => primary,
             Err(cleanup) => ApfsStorageError::Cleanup {
-                operation: "detach the attachment a failed resize left behind",
+                operation,
                 primary: Box::new(primary),
                 cleanup: Box::new(cleanup.into()),
             },
         }
+    }
+}
+
+const RESIZE_CLEANUP: &str = "detach the attachment a failed resize left behind";
+const DEFRAGMENT_CLEANUP: &str = "detach the attachment a failed defragment left behind";
+
+impl<R> MacOsApfsExecutionHost<R>
+where
+    R: CommandRunner + Send + Sync + 'static,
+{
+    /// Leave a freshly attached image in the mount state its verb found the workspace in: mounted
+    /// with its marker validated, or released again. A failed mount or marker check releases the
+    /// attachment and reports the failure under `operation`.
+    fn hand_back_attachment(
+        &self,
+        workspace: &LifecycleWorkspace,
+        attachment: AttachedImage,
+        mount_point: &Path,
+        was_mounted: bool,
+        operation: &'static str,
+    ) -> Result<(), ApfsStorageError> {
+        if !was_mounted {
+            return self
+                .backend
+                .detach(&attachment, DetachIntent::Release)
+                .map_err(Into::into);
+        }
+        if let Err(primary) = self
+            .backend
+            .mount(&attachment, mount_point, MountAccess::ReadWrite, false)
+            .map_err(ApfsStorageError::from)
+            .and_then(|()| {
+                self.validate_marker(
+                    mount_point,
+                    &MarkerExpectation::owned(&self.config, workspace),
+                )
+            })
+        {
+            return Err(self.abandon_attachment(attachment, primary, operation));
+        }
+        self.retain_mounted(workspace, attachment).map(|_| ())
     }
 }
 
@@ -3754,46 +3798,117 @@ where
 
         let attachment = self.backend.attach_verified(image, format)?;
         if let Err(primary) = self.backend.grow_container(&attachment) {
-            return Err(self.abandon_resized_attachment(attachment, primary.into()));
+            return Err(self.abandon_attachment(attachment, primary.into(), RESIZE_CLEANUP));
         }
         let observed = match self.backend.attached_capacity(image) {
             Ok(observed) => observed,
-            Err(primary) => return Err(self.abandon_resized_attachment(attachment, primary.into())),
+            Err(primary) => {
+                return Err(self.abandon_attachment(attachment, primary.into(), RESIZE_CLEANUP));
+            }
         };
         if observed < capacity {
-            return Err(self.abandon_resized_attachment(
+            return Err(self.abandon_attachment(
                 attachment,
                 ApfsStorageError::ResizeNotObserved {
                     requested: capacity,
                     observed,
                 },
+                RESIZE_CLEANUP,
             ));
         }
-
-        if !was_mounted {
-            self.backend.detach(&attachment, DetachIntent::Release)?;
-            return Ok(ResizeOutcome {
-                previous,
-                capacity: observed,
-            });
-        }
-        if let Err(primary) = self
-            .backend
-            .mount(&attachment, mount_point, MountAccess::ReadWrite, false)
-            .map_err(ApfsStorageError::from)
-            .and_then(|()| {
-                self.validate_marker(
-                    mount_point,
-                    &MarkerExpectation::owned(&self.config, workspace),
-                )
-            })
-        {
-            return Err(self.abandon_resized_attachment(attachment, primary));
-        }
-        self.retain_mounted(workspace, attachment)?;
+        self.hand_back_attachment(
+            workspace,
+            attachment,
+            mount_point,
+            was_mounted,
+            RESIZE_CLEANUP,
+        )?;
         Ok(ResizeOutcome {
             previous,
             capacity: observed,
+        })
+    }
+
+    fn defragment(
+        &self,
+        workspace: &LifecycleWorkspace,
+        image: &Path,
+        mount_point: &Path,
+    ) -> Result<DefragmentOutcome, ApfsStorageError> {
+        self.verify_controller_path(image)?;
+        self.verify_controller_path(mount_point)?;
+        // Both refusals below come before anything is detached, so a workspace that cannot be
+        // rewritten is left exactly as it was found.
+        let previous = extents::count_extents(image)?;
+        extents::require_room_for_rewrite(image)?;
+
+        let was_mounted = self
+            .mount_source
+            .mounts()?
+            .into_iter()
+            .any(|mount| mount.mount_point == mount_point);
+        self.detach_mounted(workspace, DetachIntent::WhenIdle)?;
+        // Copying an image the kernel still holds would copy whatever it has not yet written back,
+        // and the rename would leave the attachment serving a file that no longer has a name. The
+        // mount is gone at this point; an attachment without one is left for its owner to release.
+        match self.backend.attached_capacity(image) {
+            Err(ApfsError::ImageNotAttached(_)) => {}
+            Ok(_) => {
+                return Err(ApfsStorageError::Host(format!(
+                    "{} is still attached with nothing mounted at {}; `hdiutil info` names its device, and it has to be detached before the image can be rewritten",
+                    image.display(),
+                    mount_point.display()
+                )));
+            }
+            Err(error) => return Err(error.into()),
+        }
+
+        let bytes = match timed(
+            format_args!("apfs defragment/rewrite {}", image.display()),
+            || extents::rewrite_contiguously(image),
+        ) {
+            Ok(bytes) => bytes,
+            // The image is untouched: the copy never replaced it. A mounted workspace goes back on
+            // its mount rather than staying detached over a failure that changed nothing.
+            Err(primary) if was_mounted => {
+                return Err(
+                    match self
+                        .backend
+                        .attach_verified(image, workspace.format())
+                        .map_err(ApfsStorageError::from)
+                        .and_then(|attachment| {
+                            self.hand_back_attachment(
+                                workspace,
+                                attachment,
+                                mount_point,
+                                true,
+                                DEFRAGMENT_CLEANUP,
+                            )
+                        }) {
+                        Ok(()) => primary,
+                        Err(cleanup) => ApfsStorageError::Cleanup {
+                            operation: "remount the workspace a failed rewrite detached",
+                            primary: Box::new(primary),
+                            cleanup: Box::new(cleanup),
+                        },
+                    },
+                );
+            }
+            Err(primary) => return Err(primary),
+        };
+
+        let attachment = self.backend.attach_verified(image, workspace.format())?;
+        self.hand_back_attachment(
+            workspace,
+            attachment,
+            mount_point,
+            was_mounted,
+            DEFRAGMENT_CLEANUP,
+        )?;
+        Ok(DefragmentOutcome {
+            previous,
+            extents: extents::count_extents(image)?,
+            bytes,
         })
     }
 

@@ -15,16 +15,17 @@ use cowshed_core::metadata::{
     WorkspaceName,
 };
 use cowshed_core::repository::RepoId;
+use cowshed_core::storage::apfs::extents::{count_extents, rewrite_sibling};
 use cowshed_core::storage::apfs::native::MacOsApfsExecutionHost;
 use cowshed_core::storage::apfs::{
     ApfsStorageError, ApfsSubstrate, ApfsSubstrateConfig, CheckoutLayout, IncarnationSource,
     TokioApfsBlockingLane,
 };
 use cowshed_core::storage::lifecycle::{
-    AdoptRequest, Destination, LifecyclePlanner, MountIntent, OperationIdentity, Pin, RestoreMode,
-    Revision, Substrate,
+    AdoptRequest, Destination, LifecyclePlanner, MountIntent, MountState, OperationIdentity, Pin,
+    RestoreMode, Revision, Substrate,
 };
-use cowshed_core::storage::{CheckpointLabel, StorageLayout};
+use cowshed_core::storage::{CheckpointLabel, StorageLayout, WORKSPACE_MARKER_PATH};
 
 struct IntegrationRoot {
     path: PathBuf,
@@ -195,12 +196,16 @@ impl Drop for ChurnGuard {
 /// One `#[test]` per image format, deliberately not a loop over both.
 ///
 /// Each format drives a complete, independent substrate lifecycle — adopt, mount, 128 MiB
-/// write, clone under writer churn, checkpoint, restore, stats, retire, reclaim, GC, detach —
-/// and each is bounded by the harness's PER-TEST deadline. Running both inside one test spent
+/// write, clone under writer churn, checkpoint, restore, stats, defragment (a busy refusal, then
+/// the rewrite of main's image fragmented under a clone), retire, reclaim, GC, detach — and each
+/// is bounded by the harness's PER-TEST deadline. The defragment phase lives here, not in a test
+/// of its own, because its own test pays adopt's attaches again: one did, and under host
+/// contention stalled past the 30s default inside adopt. Running both inside one test spent
 /// 27.4s of a 30s budget on an idle host (Sparse 14.8s + Asif 10.6s), leaving 8.6% headroom, so
 /// ordinary host variance read as a test failure. Split, each scenario answers for its own wall
 /// time against the whole budget, and a format that regresses names itself instead of being one
-/// of two suspects behind a single timeout.
+/// of two suspects behind a single timeout. The defragment phase adds about 4s to either format
+/// (4.1s for Asif at load ~40), which the 60s deadline's 3× margin over the slower format holds.
 ///
 /// These two share the host's APFS driver and Disk Arbitration, so they are serialized against
 /// each other by the `real-apfs` nextest test group rather than by living in one test body.
@@ -413,6 +418,85 @@ fn run_format(format: ImageFormat) -> Result<String, Box<dyn Error>> {
             "source + pre-restore undo checkpoints"
         );
 
+        // Defragment: main fragments by taking writes while a clone shares its blocks. Rewrite
+        // every other page of the detached image under a clone, then the verb, busy and idle.
+        // Lifecycle verbs take the workspace as the store derives it now, revision included.
+        let defragment_phase = Instant::now();
+        let restored = substrate
+            .list(&repo)
+            .await
+            .map_err(|error| std::io::Error::other(format!("list: {error}")))?
+            .into_iter()
+            .map(|derived| derived.workspace)
+            .find(|workspace| workspace.name().is_main())
+            .ok_or("restored main is not listed")?;
+        substrate
+            .unmount(&restored)
+            .await
+            .map_err(|error| std::io::Error::other(format!("unmount main: {error}")))?;
+        let image = StorageLayout::new(&store, &repo)?
+            .main_image(format)?
+            .image()
+            .to_owned();
+        let rewritten_pages = fragment_under_clone(&image)?;
+        let fragmented = count_extents(&image)?;
+        assert!(
+            fragmented.get() >= 1_000,
+            "rewriting {rewritten_pages} pages under a clone left only {fragmented} extents"
+        );
+        substrate
+            .ensure_mounted(&restored, MountIntent { browse: false })
+            .await
+            .map_err(|error| std::io::Error::other(format!("remount main: {error}")))?;
+        // An open file is work in flight: the rewrite refuses before it touches the image.
+        let held = File::open(&payload)?;
+        let inode = fs::metadata(&image)?.ino();
+        let refused = substrate
+            .defragment(&restored)
+            .await
+            .expect_err("a busy main refuses the rewrite");
+        assert!(
+            matches!(refused, ApfsStorageError::Apfs(_))
+                && refused.to_string().contains("detach image failed"),
+            "unexpected refusal: {refused}"
+        );
+        assert_eq!(
+            fs::metadata(&image)?.ino(),
+            inode,
+            "a refused rewrite keeps the image"
+        );
+        assert!(!fs::exists(rewrite_sibling(&image))?);
+        drop(held);
+        let defragment_started = Instant::now();
+        let defragmented = substrate
+            .defragment(&restored)
+            .await
+            .map_err(|error| std::io::Error::other(format!("defragment: {error}")))?;
+        let defragment_elapsed = defragment_started.elapsed();
+        assert!(
+            defragmented.previous >= fragmented
+                && defragmented.extents.get().saturating_mul(10) <= defragmented.previous.get(),
+            "the rewrite lays the data out in at most a tenth of the extents: {defragmented:?}"
+        );
+        assert_ne!(fs::metadata(&image)?.ino(), inode, "the image is a new file");
+        assert!(!fs::exists(rewrite_sibling(&image))?);
+        assert!(matches!(
+            substrate
+                .mount_state(&restored)
+                .await
+                .map_err(|error| std::io::Error::other(format!("mount state: {error}")))?,
+            MountState::Mounted { .. }
+        ));
+        assert_eq!(fs::read(&payload)?, b"checkpoint baseline\n");
+        let streamed = fs::read(&stream)?;
+        assert_eq!(streamed.len(), 128 * 1024 * 1024);
+        assert!(streamed.iter().all(|byte| *byte == 0x5a));
+        let marker = cowshed_core::metadata::WorkspaceMarker::read_from(
+            &checkout_path.join(WORKSPACE_MARKER_PATH),
+        )?;
+        assert_eq!(&marker.workspace_incarnation, restored.incarnation());
+        let defragment_phase = defragment_phase.elapsed();
+
         let retire = substrate.plan_retire(&fork)?;
         let retired = substrate
             .execute_retire(retire)
@@ -432,11 +516,13 @@ fn run_format(format: ImageFormat) -> Result<String, Box<dyn Error>> {
             .map_err(|error| std::io::Error::other(format!("execute gc: {error}")))?;
 
         Ok(format!(
-            "lifecycle={:?}, fork={fork_elapsed:?}, logical={}, allocated={}, checkpoints={}",
+            "lifecycle={:?}, fork={fork_elapsed:?}, logical={}, allocated={}, checkpoints={}, defragment phase={defragment_phase:?} verb={defragment_elapsed:?} ({rewritten_pages} pages rewritten under a clone, extents {} -> {})",
             started.elapsed(),
             stats.logical_bytes,
             stats.allocated_bytes,
-            stats.checkpoint_count
+            stats.checkpoint_count,
+            defragmented.previous,
+            defragmented.extents
         ))
     });
 
@@ -478,4 +564,36 @@ fn spawn_churn(
         }
         Ok(())
     })
+}
+
+/// Fragment `image` the way a main fragments: rewrite every other 16 KiB page, contents
+/// unchanged, while a clone shares its blocks, so each rewritten page moves and splits the map.
+/// 16 KiB is the Apple silicon VM page; a smaller write would dirty, and move, a whole page anyway.
+fn fragment_under_clone(image: &Path) -> Result<u64, Box<dyn Error>> {
+    use std::os::unix::fs::FileExt;
+
+    let holder = image.with_file_name("fragment-holder");
+    let cloned = std::process::Command::new("/bin/cp")
+        .arg("-c")
+        .arg(image)
+        .arg(&holder)
+        .status()?;
+    if !cloned.success() {
+        return Err(format!("cp -c {} failed: {cloned}", image.display()).into());
+    }
+    let file = fs::OpenOptions::new().read(true).write(true).open(image)?;
+    let length = file.metadata()?.len();
+    let mut page = vec![0_u8; 16 * 1024];
+    let page_bytes = u64::try_from(page.len())?;
+    let mut rewritten = 0;
+    let mut offset = 0;
+    while offset + page_bytes <= length {
+        file.read_exact_at(&mut page, offset)?;
+        file.write_all_at(&page, offset)?;
+        rewritten += 1;
+        offset += 2 * page_bytes;
+    }
+    file.sync_all()?;
+    fs::remove_file(&holder)?;
+    Ok(rewritten)
 }

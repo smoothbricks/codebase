@@ -5070,6 +5070,171 @@ fn resizing_a_mounted_workspace_puts_it_back_on_its_mount() {
         .expect("the resized attachment is owned by the mount registry");
 }
 
+/// A mounted fixture main whose detach the runner refuses `busy` times, plus its host.
+fn defragment_fixture(
+    test: &str,
+    busy: usize,
+) -> (
+    Fixture,
+    PathBuf,
+    PathBuf,
+    ResizeRunner,
+    MacOsApfsExecutionHost<ResizeRunner>,
+) {
+    let fixture = Fixture::new(test);
+    let image = StorageLayout::new(&fixture.root, &repo())
+        .expect("layout")
+        .main_image(ImageFormat::Sparse)
+        .expect("image")
+        .image()
+        .to_owned();
+    create_image(&image, ImageFormat::Sparse);
+    let mount = main_mount(&fixture);
+    plant_mount_marker(&fixture, &mount);
+    mint_credentials(
+        &workspace(ImageFormat::Sparse),
+        &mount,
+        &fixture.root.join("defragment.ca.key"),
+    )
+    .expect("workspace credentials");
+    let runner = ResizeRunner::new(
+        &image,
+        ImageCapacity::from_gibibytes(100),
+        ImageCapacity::from_gibibytes(100),
+    )
+    .failing_detach(busy);
+    let host = resize_host(
+        &fixture,
+        runner.clone(),
+        vec![KernelMountSnapshot::new(
+            7,
+            mount.clone(),
+            "/dev/disk10s1",
+            true,
+            true,
+        )],
+    );
+    (fixture, image, mount, runner, host)
+}
+
+#[test]
+fn defragment_refuses_a_busy_workspace_before_touching_the_image() {
+    let (_fixture, image, mount, runner, host) = defragment_fixture("defragment-busy", 1);
+    let before = std::fs::metadata(&image).expect("image").ino();
+
+    let error = host
+        .defragment(&workspace(ImageFormat::Sparse), &image, &mount)
+        .expect_err("a busy volume refuses the rewrite rather than being torn out");
+
+    assert_eq!(
+        error.to_string(),
+        format!(
+            "APFS operation failed: detach image failed: executable \"/usr/bin/hdiutil\", argv [\"detach\", {:?}], exit status 16; stdout: <empty>; stderr: couldn't unmount disk17 - Resource busy",
+            mount.as_os_str()
+        )
+    );
+    assert_eq!(
+        std::fs::metadata(&image).expect("image").ino(),
+        before,
+        "a workspace that would not detach keeps its image"
+    );
+    assert!(
+        !std::fs::exists(cowshed_core::storage::apfs::extents::rewrite_sibling(
+            &image
+        ))
+        .expect("stat sibling"),
+        "a refused rewrite never starts a copy"
+    );
+    assert!(
+        runner
+            .argv()
+            .iter()
+            .all(|argv| argv.get(1).is_none_or(|verb| verb != "attach")),
+        "nothing is attached for a refused rewrite: {:?}",
+        runner.argv()
+    );
+}
+
+#[test]
+fn defragmenting_a_mounted_workspace_replaces_the_image_then_puts_it_back_on_its_mount() {
+    let (_fixture, image, mount, runner, host) = defragment_fixture("defragment-mounted", 0);
+    let before = std::fs::metadata(&image).expect("image");
+
+    let outcome = host
+        .defragment(&workspace(ImageFormat::Sparse), &image, &mount)
+        .expect("defragment a mounted workspace");
+
+    let after = std::fs::metadata(&image).expect("image");
+    assert_ne!(after.ino(), before.ino(), "the image is a new file");
+    assert_eq!(std::fs::read(&image).expect("image"), b"fixture");
+    assert_eq!(after.permissions().mode(), before.permissions().mode());
+    assert_eq!(outcome.bytes, 7);
+    let argv = runner.argv();
+    let detached = argv
+        .iter()
+        .position(|command| command.get(1).is_some_and(|verb| verb == "detach"))
+        .expect("the mounted volume is detached first");
+    let attached = argv
+        .iter()
+        .position(|command| command.get(1).is_some_and(|verb| verb == "attach"))
+        .expect("the rewritten image is attached and verified");
+    let fsck = argv
+        .iter()
+        .position(|command| command[0] == "/sbin/fsck_apfs")
+        .expect("the rewritten image is checked before it is mounted");
+    let remounted = argv
+        .iter()
+        .position(|command| command[0] == "/sbin/mount_apfs")
+        .expect("the workspace is mounted again");
+    assert!(
+        detached < attached && attached < fsck && fsck < remounted,
+        "defragment must detach, rewrite, verify, then remount: {argv:?}"
+    );
+    assert!(
+        argv[remounted].contains(&mount.to_string_lossy().into_owned()),
+        "the workspace returns to its own mount point: {:?}",
+        argv[remounted]
+    );
+    host.detach_mounted(&workspace(ImageFormat::Sparse), DetachIntent::Release)
+        .expect("the rewritten attachment is owned by the mount registry");
+}
+
+#[test]
+fn a_failed_rewrite_leaves_the_image_untouched_and_puts_the_workspace_back_on_its_mount() {
+    let (_fixture, image, mount, runner, host) = defragment_fixture("defragment-failed", 0);
+    let before = std::fs::metadata(&image).expect("image").ino();
+    // A directory where the copy has to go: the rewrite cannot clear it, so it fails before a
+    // byte is copied.
+    let sibling = cowshed_core::storage::apfs::extents::rewrite_sibling(&image);
+    std::fs::create_dir(&sibling).expect("obstruct the rewrite");
+    std::fs::write(sibling.join("occupant"), b"x").expect("occupy the obstruction");
+
+    let error = host
+        .defragment(&workspace(ImageFormat::Sparse), &image, &mount)
+        .expect_err("an obstructed rewrite fails");
+
+    assert!(
+        matches!(
+            &error,
+            ApfsStorageError::Io { operation, path, .. }
+                if *operation == "remove an interrupted rewrite's copy" && *path == sibling
+        ),
+        "unexpected failure: {error}"
+    );
+    assert_eq!(std::fs::metadata(&image).expect("image").ino(), before);
+    assert_eq!(std::fs::read(&image).expect("image"), b"fixture");
+    assert!(
+        runner
+            .argv()
+            .iter()
+            .any(|command| command[0] == "/sbin/mount_apfs"),
+        "the untouched image goes back on its mount: {:?}",
+        runner.argv()
+    );
+    host.detach_mounted(&workspace(ImageFormat::Sparse), DetachIntent::Release)
+        .expect("the restored attachment is owned by the mount registry");
+}
+
 /// SliceA quarantine: a published canonical image whose grants sidecar exists but whose CA
 /// companion is missing must not abort the store-wide pass. Recovery quarantines the sidecar
 /// (+ companion if present) into `<project>/quarantine/<ws>-<unix_ts>/` with a tombstone,

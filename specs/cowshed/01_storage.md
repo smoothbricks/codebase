@@ -129,6 +129,17 @@ every clone automatically). Main and sessions use identical wiring; only the san
   clone even though the clone call is instant: a one-byte write into a plain `cp -c` clone of a 2.1M-extent image took
   25.7 s with no image attached, a 473k-extent image 4.4 s, and a freshly written 256-extent file 5 ms. `new` and `fork`
   pay it inside attach or mount, whichever writes first; deleting a written clone pays about half as much per extent.
+  `doctor` counts main's extents with one `F_LOG2PHYS_EXT` query per contiguous run (2.1M extents read in 2.6 s) and
+  reports them as `main-extents`, a warning naming `cowshed defrag main` once the predicted first-write cost reaches the
+  1 s cold-`new` budget (08_testing.md). `defrag` is the one remedy: it detaches the workspace exactly as `resize` does
+  — a busy volume refuses before the image is touched — copies the image's data regions with plain `pread`/`pwrite` into
+  `<image>.defrag` beside it (never `clonefile`, `copyfile(3)`, or `std::fs::copy`, all of which clone on APFS and would
+  share the old map), punches the source's holes back into the copy, `F_FULLFSYNC`s it, renames it over the image, syncs
+  the directory, and verifies the result by attaching it before restoring the mount state it found. The copy needs, and
+  keeps, free space equal to the image's allocated bytes while earlier clones and checkpoints still share the old
+  blocks; the verb refuses before detaching when the store volume lacks it. Nothing enumerates `<image>.defrag` as an
+  image or sidecar; the next `defrag` replaces one an interrupted run left, and `doctor` names it until then. Mains are
+  never detached implicitly (the gateway keeps them mounted), so no path rewrites main on its own.
 - **Filesystem**: APFS, case sensitivity matching the volume that holds the adopted repository (queried via
   `pathconf(_PC_CASE_SENSITIVE)` at adopt time) so git behavior is identical inside and outside.
 - **Volume name**: the repository name for `main`, `<repo> — <workspace>` for every other workspace. The volume name is

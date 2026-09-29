@@ -14,14 +14,14 @@ pub use cowshed_core::api::ProjectWorkspaces;
 use cowshed_core::api::server::{ConnectionAuthority, serve_controller_connection};
 use cowshed_core::api::{
     AdoptOptions, AttachOptions, BranchName, CheckpointInfo, CheckpointOptions, CheckpointResult,
-    CommandArg, Coordinator, CreateOptions, DoctorReport, EmptyResult, ExecRequest, ExitStatus,
-    ExpectedRefHead, Finding, FindingSeverity, GatewayStatus, GcOptions, GcReason, GcReport,
-    GitOid, GrantDelta, GrantSet, JobInfo, JobStream, LandOptions, LandReport, LandingCommits,
-    MountResult, OutputPublication, ProjectGrantDelta, ProjectGrants, PublicationPolicy,
-    PushOptions, PushReport, RebaseOptions, RemoveOptions, RemoveReport, ResizeResult,
-    RevisionResult, RevisionTarget, RunSandboxMode, SccacheStatus, StdinSource as CoreStdinSource,
-    UtcTimestamp, WorkspaceInfo, WorkspaceLanding, WorkspacePath, WorkspaceState,
-    validate_command_argv,
+    CommandArg, Coordinator, CreateOptions, DefragmentResult, DoctorReport, EmptyResult,
+    ExecRequest, ExitStatus, ExpectedRefHead, Finding, FindingSeverity, GatewayStatus, GcOptions,
+    GcReason, GcReport, GitOid, GrantDelta, GrantSet, JobInfo, JobStream, LandOptions, LandReport,
+    LandingCommits, MountResult, OutputPublication, ProjectGrantDelta, ProjectGrants,
+    PublicationPolicy, PushOptions, PushReport, RebaseOptions, RemoveOptions, RemoveReport,
+    ResizeResult, RevisionResult, RevisionTarget, RunSandboxMode, SccacheStatus,
+    StdinSource as CoreStdinSource, UtcTimestamp, WorkspaceInfo, WorkspaceLanding, WorkspacePath,
+    WorkspaceState, validate_command_argv,
 };
 use cowshed_core::git::GitRepository;
 use cowshed_core::host_caches::{self, HostCacheState};
@@ -107,6 +107,7 @@ pub trait CliService: Send {
     async fn attach(&mut self, workspace: &str, options: AttachOptions) -> Result<WorkspaceInfo>;
     async fn detach(&mut self, workspace: &str) -> Result<()>;
     async fn resize(&mut self, workspace: &str, capacity: &str) -> Result<ResizeResult>;
+    async fn defragment(&mut self, workspace: &str) -> Result<DefragmentResult>;
     async fn rekey(&mut self, workspace: &str) -> Result<RekeyReport> {
         let _ = workspace;
         Err(CowshedError::environment_missing(
@@ -166,6 +167,7 @@ fn runtime_open_mode(command: &Command) -> RuntimeOpenMode {
         | Command::Attach(_)
         | Command::Detach(_)
         | Command::Resize(_)
+        | Command::Defrag(_)
         | Command::Rekey(_)
         | Command::Gc(_)
         | Command::Push(_)
@@ -226,6 +228,7 @@ fn runtime_recovery_scope(command: &Command) -> Result<RecoveryScope> {
             GrantTarget::Project => named([]),
         },
         Command::Resize(args) => named([Some(args.workspace.as_str())]),
+        Command::Defrag(args) => named([Some(args.workspace.as_str())]),
         Command::Rekey(args) => named([Some(args.workspace.as_str())]),
         Command::Land(args) => named([Some(args.workspace.as_str())]),
         Command::Checkpoint(args) => named([args.workspace.as_deref()]),
@@ -530,6 +533,10 @@ impl CliService for ActorBridge {
 
     async fn resize(&mut self, workspace: &str, capacity: &str) -> Result<ResizeResult> {
         self.coordinator()?.resize(workspace, capacity).await
+    }
+
+    async fn defragment(&mut self, workspace: &str) -> Result<DefragmentResult> {
+        self.coordinator()?.defragment(workspace).await
     }
 
     async fn rekey(&mut self, workspace: &str) -> Result<RekeyReport> {
@@ -1195,6 +1202,32 @@ where
                 .guidance(&format!(
                     "workspace {} grew from {} to {}",
                     result.workspace, result.previous_capacity, result.capacity
+                ))
+                .map_err(output_error)?;
+            Ok(success())
+        }
+        Command::Defrag(args) => {
+            use cowshed_core::storage::lifecycle::ExtentCount;
+
+            let result = service.defragment(&args.workspace).await?;
+            // Like resize: the workspace is back as it was found, on a new attachment.
+            service.reconcile_gateway().await?;
+            if json {
+                output.success(result.clone()).map_err(output_error)?;
+            } else {
+                output
+                    .bare_line(result.extents.to_string().as_bytes())
+                    .map_err(output_error)?;
+            }
+            let previous = ExtentCount::new(result.previous_extents);
+            let extents = ExtentCount::new(result.extents);
+            output
+                .guidance(&format!(
+                    "workspace {} rewritten contiguously: {previous} extents -> {extents}, {} bytes copied; a clone's first write now copies a map predicted at {:.1?} instead of {:.1?}",
+                    result.workspace,
+                    result.bytes,
+                    extents.first_write_cost(),
+                    previous.first_write_cost()
                 ))
                 .map_err(output_error)?;
             Ok(success())

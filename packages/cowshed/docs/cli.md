@@ -625,6 +625,33 @@ Capacity itself is chosen once, at `cowshed adopt --capacity <size>` (default `1
 that mints an image — `new` and `fork` clone main's and inherit its capacity, so `resize` is how a clone gets a bigger
 one.
 
+### `cowshed defrag <name|main>`
+
+Rewrite one workspace's image so its data is contiguous again, and print the extent count it ends with.
+
+```
+$ cowshed defrag main
+6
+cowshed: workspace main rewritten contiguously: 2110000 extents -> 6, 239059476480 bytes copied; a clone's first write now copies a map predicted at 72.0µs instead of 25.3s
+```
+
+`new` and `fork` clone an image in milliseconds because the clone shares the source's extent map, but the first write to
+the clone copies that map, at about 12 µs per extent. Main fragments with every write it takes while clones share its
+blocks, so a long-used main can hold millions of extents and make every new workspace wait tens of seconds inside its
+attach. `cowshed doctor` reports main's extent count and the first-write cost it predicts as `main-extents`, and warns
+with this verb as the hint once that cost reaches a second.
+
+The workspace leaves the kernel exactly as it does for `resize`: a volume with a file open or a job running refuses
+before the image is touched, so run it while the checkout is idle. The data is then copied with plain reads and writes
+(never a clone, which would share the old extent map) into `<image>.defrag` beside the image, flushed, renamed over the
+image, verified by attaching it, and mounted again if it was mounted. A copy that fails leaves the image untouched and
+the workspace back on its mount.
+
+The copy needs as much free space on the store volume as the image has allocated, checked before anything is detached,
+and it keeps that space: clones and checkpoints taken earlier still share the old blocks, so the space comes back only
+as they are removed. Main fragments again as it takes writes while new clones share it; rerun the verb when `doctor`
+warns.
+
 ### `cowshed rekey <name|main>`
 
 Rebuild one keyless workspace's CA identity and print its name. The quarantined grants sidecar is republished beside the

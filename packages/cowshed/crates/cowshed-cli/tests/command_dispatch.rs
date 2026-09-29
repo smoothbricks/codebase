@@ -225,6 +225,16 @@ impl CliService for FakeService {
         })
     }
 
+    async fn defragment(&mut self, name: &str) -> Result<DefragmentResult> {
+        self.events.push(format!("defragment:{name}"));
+        Ok(DefragmentResult {
+            workspace: WorkspaceName::new(name).unwrap(),
+            previous_extents: 2,
+            extents: 1,
+            bytes: 0,
+        })
+    }
+
     async fn doctor(&mut self) -> Result<DoctorReport> {
         self.events.push("doctor".into());
         Ok(DoctorReport {
@@ -1558,6 +1568,9 @@ impl CliService for SerializedCreateService {
         unreachable!()
     }
     async fn resize(&mut self, _: &str, _: &str) -> Result<ResizeResult> {
+        unreachable!()
+    }
+    async fn defragment(&mut self, _: &str) -> Result<DefragmentResult> {
         unreachable!()
     }
     async fn doctor(&mut self) -> Result<DoctorReport> {

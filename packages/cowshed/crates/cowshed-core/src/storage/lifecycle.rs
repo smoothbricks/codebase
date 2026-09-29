@@ -1,5 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use thiserror::Error;
@@ -739,6 +741,49 @@ pub struct ResizeOutcome {
     pub capacity: ImageCapacity,
 }
 
+/// How many physically contiguous runs a file's allocated bytes occupy.
+///
+/// This, not the file's size, is what cloning an image costs: `clonefile` shares the source's
+/// extent map, and the first write to either file copies that map (01_storage.md, "Clone cost
+/// follows extents, not size").
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct ExtentCount(u64);
+
+impl ExtentCount {
+    /// Nanoseconds the first write into a clone pays per extent of its source, measured on the
+    /// store volume: 25.7 s for a 2.11M-extent image, 4.4 s for 473k.
+    pub const FIRST_WRITE_NANOS_PER_EXTENT: u64 = 12_000;
+
+    pub const fn new(extents: u64) -> Self {
+        Self(extents)
+    }
+
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+
+    /// The time the first write into a clone of this file is predicted to spend copying the map.
+    pub const fn first_write_cost(self) -> Duration {
+        // Saturating: only a count no file can have overflows u64 nanoseconds.
+        Duration::from_nanos(self.0.saturating_mul(Self::FIRST_WRITE_NANOS_PER_EXTENT))
+    }
+}
+
+impl fmt::Display for ExtentCount {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+/// What a completed defragmentation changed: the image's extents before and after its data was
+/// rewritten contiguously, and how many bytes of data the rewrite copied.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DefragmentOutcome {
+    pub previous: ExtentCount,
+    pub extents: ExtentCount,
+    pub bytes: u64,
+}
+
 /// Canonical persistent fact read from an image/dataset and its sidecar.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StorageFact {
@@ -919,6 +964,11 @@ pub trait Substrate: LifecyclePlanner {
         workspace: &LifecycleWorkspace,
         capacity: ImageCapacity,
     ) -> Result<ResizeOutcome, Self::Error>;
+    /// Rewrite the workspace's image contiguously, leaving it mounted exactly as it was found.
+    async fn defragment(
+        &self,
+        workspace: &LifecycleWorkspace,
+    ) -> Result<DefragmentOutcome, Self::Error>;
     async fn caches_root(&self) -> Result<PathBuf, Self::Error>;
     async fn stats(&self, workspace: &LifecycleWorkspace) -> Result<SubstrateStats, Self::Error>;
     async fn preview_gc(&self, repo: &RepoId) -> Result<StorageGcPlan, Self::Error>;

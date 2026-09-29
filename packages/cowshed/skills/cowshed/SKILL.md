@@ -59,6 +59,7 @@ direnv users need nothing extra.
 | Retire                  | `cowshed rm <ws>`                                                    | Remove a landed workspace.                                      |
 | Reclaim                 | `cowshed gc --dry-run` / `cowshed gc`                                | Review, then reclaim orphaned storage.                          |
 | Grow an image           | `cowshed resize <ws> <size>`                                         | Grow an image; resize never shrinks it.                         |
+| Make clones cheap again | `cowshed defrag main`                                                | Rewrite main contiguously when doctor warns `main-extents`.     |
 | Rename or move          | `cowshed mv <ws> <new-name>` / `cowshed mv main <new-checkout-path>` | Rename a workspace or move the adopted checkout.                |
 
 ## Merge flow

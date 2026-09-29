@@ -30,6 +30,7 @@ pub static COMMANDS: &[&CommandSpec] = &[
     &DETACH,
     &MOUNT,
     &RESIZE,
+    &DEFRAG,
     &REKEY,
     &GC,
     &PUSH,
@@ -75,6 +76,7 @@ pub enum Command {
     Detach(DetachArgs),
     Mount(MountArgs),
     Resize(ResizeArgs),
+    Defrag(DefragArgs),
     Rekey(RekeyArgs),
     Gc(GcArgs),
     Push(PushArgs),
@@ -116,6 +118,7 @@ impl Command {
             | Self::Remove(_)
             | Self::Attach(_)
             | Self::Resize(_)
+            | Self::Defrag(_)
             | Self::Rekey(_)
             | Self::Gc(_)
             | Self::Push(_)
@@ -394,6 +397,12 @@ pub enum MountTarget {
 pub struct ResizeArgs {
     pub workspace: String,
     pub capacity: OsString,
+}
+
+/// `defrag <ws|main>` — rewrite one workspace's image contiguously.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DefragArgs {
+    pub workspace: String,
 }
 
 /// `rekey <ws|main>` — rebuild one keyless workspace's CA identity.
@@ -745,6 +754,7 @@ fn cli_command() -> ClapCommand {
                 .arg(positional("workspace", 0..=1))
                 .arg(positional("size", 0..=1)),
         )
+        .subcommand(leaf("defrag").arg(positional("workspace", 0..=1)))
         .subcommand(leaf("rekey").arg(positional("workspace", 0..=1)))
         .subcommand(leaf("gc").arg(flag("dry-run")))
         .subcommand(leaf("push").arg(positional("workspace", 0..=1)).args([
@@ -899,6 +909,7 @@ fn cli_from_matches(matches: ArgMatches) -> Result<Cli, UsageError> {
         "detach" => parse_detach(leaf)?,
         "mount" => parse_mount(leaf)?,
         "resize" => parse_resize(leaf)?,
+        "defrag" => parse_defrag(leaf)?,
         "rekey" => parse_rekey(leaf)?,
         "gc" => parse_gc(leaf)?,
         "push" => parse_push(leaf)?,
@@ -2305,6 +2316,26 @@ fn parse_resize(matches: &ArgMatches) -> Result<Command, UsageError> {
     }))
 }
 
+const DEFRAG: CommandSpec = CommandSpec {
+    name: "defrag",
+    missing: "defrag requires a workspace",
+    args: "<ws|main>",
+    trailing: "",
+    summary: "rewrite an image contiguously",
+    about: &[
+        "Rewrites one workspace's image so its data is contiguous again. A clone shares its source's extent map and the first write to it copies that map, at about 12 µs per extent, so a main that has fragmented into millions of extents makes every `new` and `fork` wait tens of seconds; `cowshed doctor` reports main's extent count and the cost it predicts.",
+        "The workspace is detached the way `resize` detaches it — a volume with a file open or a job running refuses before the image is touched — then its data is copied with plain reads and writes into a sibling, flushed, renamed over the image, verified by attaching it, and mounted again if it was mounted. The copy needs as much free space as the image has allocated, and keeps it while older clones and checkpoints still share the old blocks.",
+    ],
+    options: &[],
+};
+
+fn parse_defrag(matches: &ArgMatches) -> Result<Command, UsageError> {
+    const USAGE: &CommandSpec = &DEFRAG;
+    Ok(Command::Defrag(DefragArgs {
+        workspace: require_workspace(matches, "workspace", false, USAGE, USAGE.missing)?,
+    }))
+}
+
 const REKEY: CommandSpec = CommandSpec {
     name: "rekey",
     missing: "rekey requires a workspace",
@@ -3659,6 +3690,7 @@ mod tests {
             (&["detach", "raven"], NotUsed),
             (&["detach", "--all"], NotUsed),
             (&["resize", "raven", "32GiB"], Required),
+            (&["defrag", "main"], Required),
             (&["rekey", "raven"], Required),
             (&["gc"], Required),
             (&["push", "raven"], Required),
@@ -3712,6 +3744,7 @@ mod tests {
             (&["rm"], "rm requires a workspace"),
             (&["detach"], "detach requires a workspace"),
             (&["resize"], "resize requires a workspace"),
+            (&["defrag"], "defrag requires a workspace"),
             (&["rekey"], "rekey requires a workspace"),
             (&["land"], "land requires a workspace"),
             (&["gateway"], "gateway action is required"),

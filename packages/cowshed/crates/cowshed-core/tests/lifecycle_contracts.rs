@@ -254,6 +254,21 @@ impl Substrate for ContractSubstrate {
         }
     }
 
+    async fn defragment(
+        &self,
+        workspace: &LifecycleWorkspace,
+    ) -> Result<DefragmentOutcome, Self::Error> {
+        if workspace == &self.workspace {
+            Ok(DefragmentOutcome {
+                previous: ExtentCount::new(2),
+                extents: ExtentCount::new(1),
+                bytes: 0,
+            })
+        } else {
+            Err("wrong workspace")
+        }
+    }
+
     async fn caches_root(&self) -> Result<PathBuf, Self::Error> {
         Ok(PathBuf::from("/canonical/caches"))
     }

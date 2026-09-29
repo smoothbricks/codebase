@@ -2185,6 +2185,17 @@ pub struct ResizeResult {
     pub capacity: String,
 }
 
+/// What `cowshed defrag` changed: the image's extents before and after its data was rewritten
+/// contiguously, and the data bytes the rewrite copied.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DefragmentResult {
+    pub workspace: WorkspaceName,
+    pub previous_extents: u64,
+    pub extents: u64,
+    pub bytes: u64,
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase", deny_unknown_fields)]
 pub struct CheckpointOptions {
@@ -2534,6 +2545,7 @@ result_bodies!(
     RekeyResult,
     RevisionResult,
     ResizeResult,
+    DefragmentResult,
     SlotResult,
     WorkspaceInfo,
     JobInfo,

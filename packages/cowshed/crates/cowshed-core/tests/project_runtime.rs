@@ -8,10 +8,10 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use cowshed_core::api::dto::{
     AbandonedWork, AdoptOptions, AttachOptions, CheckpointInfo, CheckpointOptions, CheckpointQuota,
-    CheckpointResult, CommandArg, CreateOptions, DoctorReport, Finding, FindingSeverity, GcOptions,
-    GcReport, GitOid, GrantDelta, GrantSet, ImageFormat, JobId, JobInfo, LandOptions, LandReport,
-    MirrorInfo, PortBlock, PushOptions, PushReport, RebaseOptions, RemoveOptions, RemoveReport,
-    ResizeResult, WorkspaceInfo, WorkspaceState,
+    CheckpointResult, CommandArg, CreateOptions, DefragmentResult, DoctorReport, Finding,
+    FindingSeverity, GcOptions, GcReport, GitOid, GrantDelta, GrantSet, ImageFormat, JobId,
+    JobInfo, LandOptions, LandReport, MirrorInfo, PortBlock, PushOptions, PushReport,
+    RebaseOptions, RemoveOptions, RemoveReport, ResizeResult, WorkspaceInfo, WorkspaceState,
 };
 use cowshed_core::api::server::{ConnectionAuthority, RouterHandle};
 use cowshed_core::metadata::{WorkspaceIncarnation, WorkspaceName, WorkspaceRole};
@@ -565,6 +565,16 @@ impl ProjectRuntimeHost for FakeHost {
             workspace,
             previous_capacity: "100g".to_owned(),
             capacity,
+        })
+    }
+
+    async fn defragment(&mut self, workspace: WorkspaceName) -> Result<DefragmentResult> {
+        self.workspace(&workspace)?;
+        Ok(DefragmentResult {
+            workspace,
+            previous_extents: 2,
+            extents: 1,
+            bytes: 0,
         })
     }
 

@@ -292,8 +292,10 @@ step, so the slow step is named on stderr. On a large repository two steps carry
   costs 5 ms. A one-byte write into a plain `cp -c` clone of the image file reproduces the cost with no disk image
   attached, so it is not the mount itself and does not depend on how many images are attached. Deleting a written clone
   (`cowshed rm`, `cowshed gc`) pays about half as much per extent. `new --from <ws>` pays the same cost for the source
-  workspace's image. Only rewriting main's image file contiguously lowers it, which needs main detached, and cowshed has
-  no verb that does it.
+  workspace's image. `cowshed doctor` reports main's extent count and the cost it predicts as `main-extents`, and warns
+  once that cost reaches a second. Only rewriting main's image file contiguously lowers it: `cowshed defrag main`, run
+  while the checkout is idle, since main has to leave the kernel for the copy and a busy volume refuses. It needs as
+  much free space as main's image has allocated and keeps it while older clones still share the old blocks.
 - **`new links`**, the walk over the whole tree for symlinks that point outside it, which costs about 5 s over a million
   entries.
 

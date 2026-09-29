@@ -1,3 +1,4 @@
+pub mod extents;
 pub mod native;
 pub mod rekey;
 
@@ -21,12 +22,12 @@ use crate::timing::timed_async;
 
 use super::lifecycle::{
     AdoptPlan, AdoptRequest, CheckpointFact, CheckpointPlan, CheckpointRef, CreatePlan,
-    DerivedWorkspace, Destination, ExecuteError, ForkPlan, ImmutablePlan, KernelMountFact,
-    LifecycleBackend, LifecycleFact, LifecyclePlanner, LifecycleReceipt, LifecycleWorkspace,
-    MountIntent, MountState, Operation, OperationIdentity, Pin, PlanError, PurePlanner,
-    ResizeOutcome, RestoreMode, RestorePlan, RestoreReceipt, RetirePlan, RetiredRef, Revision,
-    StorageFact, StorageGcPlan, StorageGcReport, Substrate, SubstrateStats, execute_checked,
-    revalidate,
+    DefragmentOutcome, DerivedWorkspace, Destination, ExecuteError, ForkPlan, ImmutablePlan,
+    KernelMountFact, LifecycleBackend, LifecycleFact, LifecyclePlanner, LifecycleReceipt,
+    LifecycleWorkspace, MountIntent, MountState, Operation, OperationIdentity, Pin, PlanError,
+    PurePlanner, ResizeOutcome, RestoreMode, RestorePlan, RestoreReceipt, RetirePlan, RetiredRef,
+    Revision, StorageFact, StorageGcPlan, StorageGcReport, Substrate, SubstrateStats,
+    execute_checked, revalidate,
 };
 use super::{CheckpointLabel, PRE_RESTORE_PREFIX, StorageLayout, StorageLayoutError};
 
@@ -523,6 +524,19 @@ pub trait ApfsExecutionHost: Send + Sync + 'static {
         mount_point: &Path,
         capacity: ImageCapacity,
     ) -> Result<ResizeOutcome, ApfsStorageError>;
+    /// Rewrite the workspace's image contiguously and restore the mount state it was found in.
+    ///
+    /// Exactly as `resize` does, a mounted workspace is detached non-forcibly first, so a volume
+    /// with work in flight refuses the rewrite before the image is touched. The data is copied
+    /// with plain reads and writes into a sibling no enumeration reads as an image, flushed,
+    /// renamed over the image, and verified by attaching it before it is mounted again. A copy
+    /// that fails leaves the image untouched and puts the workspace back where it was.
+    fn defragment(
+        &self,
+        workspace: &LifecycleWorkspace,
+        image: &Path,
+        mount_point: &Path,
+    ) -> Result<DefragmentOutcome, ApfsStorageError>;
     /// Detach adopted main and atomically restore its exact retained host checkout.
     ///
     /// Implementations derive retry state solely from `source_checkout`, its exact
@@ -707,6 +721,14 @@ pub enum ApfsStorageError {
     ResizeNotObserved {
         requested: ImageCapacity,
         observed: ImageCapacity,
+    },
+    #[error(
+        "rewriting {path} needs {needed} free bytes on its volume and {available} are available"
+    )]
+    InsufficientSpace {
+        path: PathBuf,
+        needed: u64,
+        available: u64,
     },
     #[error("unexpected lifecycle operation result")]
     UnexpectedResult,
@@ -1717,6 +1739,25 @@ where
             let image = canonical_image_path(&config, &workspace)?;
             let mount_point = mount_point(&config, &workspace)?;
             host.resize(&workspace, &image, &mount_point, capacity)
+        })
+        .await
+    }
+
+    async fn defragment(
+        &self,
+        workspace: &LifecycleWorkspace,
+    ) -> Result<DefragmentOutcome, Self::Error> {
+        let lock_paths = vec![workspace_lock_path(
+            &self.config,
+            workspace.repo(),
+            workspace.name(),
+            workspace.format(),
+        )?];
+        let workspace = workspace.clone();
+        self.dispatch_with_locks(lock_paths, true, move |host, config| {
+            let image = canonical_image_path(&config, &workspace)?;
+            let mount_point = mount_point(&config, &workspace)?;
+            host.defragment(&workspace, &image, &mount_point)
         })
         .await
     }

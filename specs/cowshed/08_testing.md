@@ -217,6 +217,9 @@ Covered flows:
   MiB dd passed both `fsck_apfs -q` and a full `-n` check, mountable and readable, on both SPARSE and ASIF; a non-synced
   clone may miss the last writes — freshness, not consistency. This tier keeps that regression-pinned.)
 - checkpoint/restore round-trip (restore undo image `pre-restore-…` present);
+- defrag, per format: main fragmented by rewriting pages while a clone shares them refuses the rewrite while a file is
+  open on its volume (image untouched), then, idle, comes back in at most a tenth of its extents with its data, marker,
+  and mount unchanged (01_storage.md, "Clone cost follows extents, not size");
 - ensure healing matrix: detached image, wrong-flag mount, missing/wrong-flag `cowshed.store` and `cowshed.caches`
   volumes (lazy recreate + canonical-flag remount, 01_storage.md), stub `.envrc`;
 - lazy volume creation at adopt: both dedicated volumes created idempotently before the first image; **Time Machine

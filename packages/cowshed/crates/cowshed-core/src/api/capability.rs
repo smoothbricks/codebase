@@ -1,10 +1,10 @@
 use super::dto::{
     AdoptOptions, AttachOptions, CheckpointOptions, CheckpointQuota, CheckpointResult,
-    CreateOptions, DoctorReport, EmptyResult, ExecRequest, GcOptions, GcReport, GitOid, GrantDelta,
-    GrantSet, JobId, JobInfo, JobState, LandOptions, LandReport, MirrorInfo, ProjectGrantDelta,
-    ProjectGrants, PushOptions, PushReport, RebaseOptions, RemoveOptions, RemoveReport,
-    ResizeResult, RevisionResult, RunSandboxMode, StdinSource, WorkspaceIncarnation, WorkspaceInfo,
-    validate_command_argv,
+    CreateOptions, DefragmentResult, DoctorReport, EmptyResult, ExecRequest, GcOptions, GcReport,
+    GitOid, GrantDelta, GrantSet, JobId, JobInfo, JobState, LandOptions, LandReport, MirrorInfo,
+    ProjectGrantDelta, ProjectGrants, PushOptions, PushReport, RebaseOptions, RemoveOptions,
+    RemoveReport, ResizeResult, RevisionResult, RunSandboxMode, StdinSource, WorkspaceIncarnation,
+    WorkspaceInfo, validate_command_argv,
 };
 use super::frame;
 use super::peer_credentials::PeerCredentialsError;
@@ -1439,6 +1439,17 @@ impl Coordinator {
                 "workspace": workspace,
                 "capacity": capacity,
             }),
+        )
+        .await
+    }
+
+    /// Rewrite a workspace's image contiguously, so a clone of it stops paying for its extents on
+    /// the first write. A busy workspace refuses before its image is touched.
+    pub async fn defragment(&self, workspace: &str) -> Result<DefragmentResult> {
+        call_typed(
+            &self.runtime,
+            "coordinator.defragment",
+            json!({ "repoId": self.project.repo_id, "workspace": workspace }),
         )
         .await
     }
