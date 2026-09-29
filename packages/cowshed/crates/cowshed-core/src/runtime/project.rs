@@ -1527,8 +1527,18 @@ async fn reserve_port_grants(
     ))
 }
 
+/// One entry an unbinding may delete from terminal project storage.
 #[cfg(target_os = "macos")]
-fn remove_terminal_storage_tree(path: &Path) -> Result<()> {
+enum TerminalEntry {
+    Lock(PathBuf),
+    Directory(PathBuf),
+}
+
+/// Plans the removal of a terminal storage tree, children before their directory: only empty
+/// directories and the zero-length locks retired workspaces leave behind qualify. Anything else is
+/// refused before a single entry is removed.
+#[cfg(target_os = "macos")]
+fn plan_terminal_storage_tree(path: &Path, plan: &mut Vec<TerminalEntry>) -> Result<()> {
     let metadata = match std::fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -1562,17 +1572,10 @@ fn remove_terminal_storage_tree(path: &Path) -> Result<()> {
                     "check controller storage permissions and retry",
                 )
             })?;
-            remove_terminal_storage_tree(&entry.path())?;
+            plan_terminal_storage_tree(&entry.path(), plan)?;
         }
-        std::fs::remove_dir(path).map_err(|error| {
-            CowshedError::environment_missing(
-                format!(
-                    "cannot remove terminal project directory {}: {error}",
-                    path.display()
-                ),
-                "check controller storage permissions and retry",
-            )
-        })
+        plan.push(TerminalEntry::Directory(path.to_owned()));
+        Ok(())
     } else if metadata.file_type().is_file()
         && metadata.len() == 0
         && path
@@ -1580,15 +1583,8 @@ fn remove_terminal_storage_tree(path: &Path) -> Result<()> {
             .and_then(|name| name.to_str())
             .is_some_and(|name| name.ends_with(".lock"))
     {
-        std::fs::remove_file(path).map_err(|error| {
-            CowshedError::environment_missing(
-                format!(
-                    "cannot remove terminal project lock {}: {error}",
-                    path.display()
-                ),
-                "check controller storage permissions and retry",
-            )
-        })
+        plan.push(TerminalEntry::Lock(path.to_owned()));
+        Ok(())
     } else {
         Err(CowshedError::integrity(
             format!(
@@ -1598,6 +1594,47 @@ fn remove_terminal_storage_tree(path: &Path) -> Result<()> {
             "run cowshed doctor --json before removing the project binding",
         ))
     }
+}
+
+#[cfg(target_os = "macos")]
+fn remove_terminal_storage_tree(path: &Path) -> Result<()> {
+    let mut plan = Vec::new();
+    plan_terminal_storage_tree(path, &mut plan)?;
+    for entry in plan {
+        let (removed, path) = match &entry {
+            TerminalEntry::Lock(path) => (std::fs::remove_file(path), path),
+            TerminalEntry::Directory(path) => (std::fs::remove_dir(path), path),
+        };
+        removed.map_err(|error| {
+            CowshedError::environment_missing(
+                format!(
+                    "cannot remove terminal project storage {}: {error}",
+                    path.display()
+                ),
+                "check controller storage permissions and retry",
+            )
+        })?;
+    }
+    Ok(())
+}
+
+/// Refuses a main restore whose `sessions` tree an unbinding could not delete: a live
+/// workspace's image or grants, an unreclaimed retired image, or an `rm --abandon` bundle kept for
+/// its owner. The restore checks this before it retires main, because the same refusal after it
+/// leaves a binding no command can remove.
+#[cfg(target_os = "macos")]
+fn require_terminal_sessions(sessions: &Path) -> Result<()> {
+    plan_terminal_storage_tree(sessions, &mut Vec::new()).map_err(|error| match error.code {
+        ErrorCode::Integrity => CowshedError::conflict(
+            format!(
+                "main cannot be restored while the project's sessions hold more than locks: {}",
+                error.message
+            ),
+            "remove every session workspace (cowshed rm <ws>), delete the rm --abandon bundles in \
+             the project's sessions/.trash you no longer need, run cowshed gc, then retry",
+        ),
+        _ => error,
+    })
 }
 
 #[cfg(target_os = "macos")]
@@ -1639,6 +1676,124 @@ fn clean_terminal_project_storage(project_root: &Path, binding: &Path) -> Result
         }
     }
     Ok(())
+}
+
+/// Everything the controller still keeps for a project whose binding is gone. Nothing reopens an
+/// unbound project, so its lifecycle journal, deletion log, checkout layout and slot bindings go,
+/// and with them its store directory, its mount tree and each owner directory they leave empty.
+/// What the user put in the store — `policy.json`, `waivers.json`, `quarantine/` — stays, and
+/// keeps the store directory with it.
+#[cfg(target_os = "macos")]
+fn remove_unbound_project_state(paths: &crate::repository::ProjectPaths) -> Result<()> {
+    for file in [
+        paths
+            .project_root
+            .join(crate::storage::recovery::LIFECYCLE_INTENTS_FILE),
+        paths
+            .project_root
+            .join(crate::storage::deletion_log::DELETION_LOG_FILE),
+        paths.checkout_layout.clone(),
+        paths.slot_bindings.clone(),
+    ] {
+        match std::fs::remove_file(&file) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(CowshedError::environment_missing(
+                    format!(
+                        "cannot remove unbound project state {}: {error}",
+                        file.display()
+                    ),
+                    "check controller storage permissions and retry",
+                ));
+            }
+        }
+    }
+    remove_empty_mount_tree(&paths.mount_root)?;
+    for directory in [
+        Some(paths.project_root.as_path()),
+        paths.project_root.parent(),
+        paths.mount_root.parent(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        match std::fs::remove_dir(directory) {
+            Ok(()) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::DirectoryNotEmpty
+                ) => {}
+            Err(error) => {
+                return Err(CowshedError::environment_missing(
+                    format!(
+                        "cannot remove unbound project directory {}: {error}",
+                        directory.display()
+                    ),
+                    "check controller storage permissions and retry",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// An unbound project's mount tree holds only the mountpoints of retired workspaces and
+/// `.staging`: empty directories on the volume the tree lives on. Those go; a file, or a directory
+/// on another device (a volume still mounted there), is reported and nothing below it is touched.
+#[cfg(target_os = "macos")]
+fn remove_empty_mount_tree(root: &Path) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    match std::fs::symlink_metadata(root) {
+        Ok(metadata) => remove_empty_directory_on(root, metadata.dev()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(CowshedError::environment_missing(
+            format!(
+                "cannot inspect unbound project mount tree {}: {error}",
+                root.display()
+            ),
+            "check mount root permissions and retry",
+        )),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn remove_empty_directory_on(path: &Path, device: u64) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    let inspect = |error: std::io::Error| {
+        CowshedError::environment_missing(
+            format!(
+                "cannot inspect unbound project mount tree {}: {error}",
+                path.display()
+            ),
+            "check mount root permissions and retry",
+        )
+    };
+    let metadata = std::fs::symlink_metadata(path).map_err(inspect)?;
+    if !metadata.file_type().is_dir() || metadata.dev() != device {
+        return Err(CowshedError::integrity(
+            format!(
+                "the unbound project's mount tree still holds {}",
+                path.display()
+            ),
+            "move it aside; the project is unbound and nothing else of it remains",
+        ));
+    }
+    for entry in std::fs::read_dir(path).map_err(inspect)? {
+        remove_empty_directory_on(&entry.map_err(inspect)?.path(), device)?;
+    }
+    std::fs::remove_dir(path).map_err(|error| {
+        CowshedError::environment_missing(
+            format!(
+                "cannot remove unbound project mount tree {}: {error}",
+                path.display()
+            ),
+            "check mount root permissions and retry",
+        )
+    })
 }
 
 #[cfg(any(test, target_os = "macos"))]
@@ -3399,13 +3554,17 @@ impl NativeProjectRuntimeHost {
         Ok(())
     }
 
-    async fn remove_project_binding_after_restore(&self) -> Result<()> {
-        let path = self.layout.project().repository_binding.clone();
+    /// Removes the binding of a project whose main was restored, then everything else the
+    /// controller kept for it. The lifecycle journal goes with the rest: the binding's absence is
+    /// the removal's completion, and nothing reopens the project to read one.
+    async fn unbind_restored_project(&self) -> Result<()> {
+        let paths = self.layout.project().clone();
         let expected = self.descriptor.binding.clone();
         crate::storage::lifecycle::dispatch_blocking(move || {
-            let metadata = match std::fs::symlink_metadata(&path) {
-                Ok(metadata) => metadata,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            let path = &paths.repository_binding;
+            let bound = match std::fs::symlink_metadata(path) {
+                Ok(metadata) => Some(metadata),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
                 Err(error) => {
                     return Err(CowshedError::environment_missing(
                         format!(
@@ -3416,58 +3575,47 @@ impl NativeProjectRuntimeHost {
                     ));
                 }
             };
-            if !metadata.file_type().is_file() {
-                return Err(CowshedError::integrity(
-                    format!(
-                        "repository binding is not a regular file: {}",
-                        path.display()
-                    ),
-                    "move the collision aside and retry",
-                ));
-            }
-            let actual = crate::metadata::read_json::<RepositoryBinding>(&path)
-                .map_err(native_integrity_error)?;
-            if actual != expected {
-                return Err(CowshedError::integrity(
-                    "repository binding changed during adoption rollback",
-                    "restore the exact binding and retry",
-                ));
-            }
-            let parent = path
-                .parent()
-                .ok_or_else(|| CowshedError::internal("repository binding has no parent"))?;
-            clean_terminal_project_storage(parent, &path)?;
-            std::fs::remove_file(&path).map_err(|error| {
-                CowshedError::environment_missing(
-                    format!(
-                        "cannot remove repository binding {}: {error}",
-                        path.display()
-                    ),
-                    "check controller storage permissions and retry",
-                )
-            })?;
-            std::fs::File::open(parent)
-                .and_then(|directory| directory.sync_all())
-                .map_err(|error| {
+            if let Some(metadata) = bound {
+                if !metadata.file_type().is_file() {
+                    return Err(CowshedError::integrity(
+                        format!(
+                            "repository binding is not a regular file: {}",
+                            path.display()
+                        ),
+                        "move the collision aside and retry",
+                    ));
+                }
+                let actual = crate::metadata::read_json::<RepositoryBinding>(path)
+                    .map_err(native_integrity_error)?;
+                if actual != expected {
+                    return Err(CowshedError::integrity(
+                        "repository binding changed during adoption rollback",
+                        "restore the exact binding and retry",
+                    ));
+                }
+                clean_terminal_project_storage(&paths.project_root, path)?;
+                std::fs::remove_file(path).map_err(|error| {
                     CowshedError::environment_missing(
                         format!(
-                            "cannot sync repository binding directory {}: {error}",
-                            parent.display()
+                            "cannot remove repository binding {}: {error}",
+                            path.display()
                         ),
                         "check controller storage permissions and retry",
                     )
                 })?;
-            match std::fs::remove_dir(parent) {
-                Ok(()) => Ok(()),
-                Err(error) if error.kind() == std::io::ErrorKind::DirectoryNotEmpty => Ok(()),
-                Err(error) => Err(CowshedError::environment_missing(
-                    format!(
-                        "cannot remove terminal project directory {}: {error}",
-                        parent.display()
-                    ),
-                    "check controller storage permissions and retry",
-                )),
+                std::fs::File::open(&paths.project_root)
+                    .and_then(|directory| directory.sync_all())
+                    .map_err(|error| {
+                        CowshedError::environment_missing(
+                            format!(
+                                "cannot sync repository binding directory {}: {error}",
+                                paths.project_root.display()
+                            ),
+                            "check controller storage permissions and retry",
+                        )
+                    })?;
             }
+            remove_unbound_project_state(&paths)
         })
         .await
         .map_err(|error| CowshedError::internal(format!("binding cleanup task failed: {error}")))?
@@ -6090,14 +6238,8 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                         self.begin_lifecycle_intent(intent.clone()).await?;
                     }
                     self.mark_lifecycle_intent_mutating(&workspace).await?;
-                    self.remove_project_binding_after_restore().await?;
-                    let report = RemoveReport::default();
-                    self.complete_lifecycle_intent(
-                        &workspace,
-                        crate::storage::recovery::LifecycleIntentCompletion::Retire(report.clone()),
-                    )
-                    .await?;
-                    return Ok(report);
+                    self.unbind_restored_project().await?;
+                    return Ok(RemoveReport::default());
                 }
                 return Err(error);
             }
@@ -6106,6 +6248,14 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
 
         if options.restore {
             let pre_cowshed = pre_cowshed_path(&self.descriptor.git_root)?;
+            let sessions = self.layout.project().sessions.clone();
+            crate::storage::lifecycle::dispatch_blocking(move || {
+                require_terminal_sessions(&sessions)
+            })
+            .await
+            .map_err(|error| {
+                CowshedError::internal(format!("session storage check failed: {error}"))
+            })??;
             let initial_rollback_state = self.adopt_rollback_state(&current, &pre_cowshed).await?;
             if !options.force && initial_rollback_state != NativeAdoptRollbackState::Complete {
                 self.verify_checkout_identity(&pre_cowshed, "retained pre-cowshed checkout")
@@ -6155,14 +6305,8 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                 ));
             }
             self.retire_restored_main(current).await?;
-            self.remove_project_binding_after_restore().await?;
-            let report = RemoveReport::default();
-            self.complete_lifecycle_intent(
-                &workspace,
-                crate::storage::recovery::LifecycleIntentCompletion::Retire(report.clone()),
-            )
-            .await?;
-            return Ok(report);
+            self.unbind_restored_project().await?;
+            return Ok(RemoveReport::default());
         }
 
         let initially_detached = matches!(current.derived.mount_state, MountState::Detached);
@@ -12280,7 +12424,10 @@ mod port_reservation_tests {
 
 #[cfg(all(test, target_os = "macos"))]
 mod terminal_project_cleanup_tests {
-    use super::clean_terminal_project_storage;
+    use super::{
+        clean_terminal_project_storage, remove_unbound_project_state, require_terminal_sessions,
+    };
+    use crate::repository::{ProjectPaths, RepoId};
 
     fn root(label: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
@@ -12328,6 +12475,124 @@ mod terminal_project_cleanup_tests {
         assert_eq!(error.code.as_str(), "integrity");
         assert_eq!(std::fs::read(&image).expect("image preserved"), b"image");
         assert!(binding.is_file());
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// A store root and a mount root side by side under one scratch directory, the way the
+    /// host lays them out, holding one project each.
+    fn project(label: &str) -> (std::path::PathBuf, ProjectPaths) {
+        let root = root(label);
+        let repo = RepoId::parse("example-org/example-app").expect("repo id");
+        let paths = ProjectPaths::with_mount_root(root.join("store"), root.join("mnt"), &repo)
+            .expect("project paths");
+        std::fs::create_dir_all(&paths.project_root).expect("project root");
+        std::fs::create_dir_all(paths.mount_root.join(".staging/main-orphan")).expect("staging");
+        std::fs::create_dir_all(paths.mount_root.join("raven")).expect("retired mountpoint");
+        for file in [
+            paths.project_root.join("lifecycle-intents.json"),
+            paths.project_root.join("deletion-log.jsonl"),
+            paths.checkout_layout.clone(),
+            paths.slot_bindings.clone(),
+        ] {
+            std::fs::write(file, b"controller state").expect("controller state");
+        }
+        (root, paths)
+    }
+
+    #[test]
+    fn an_unbound_project_leaves_no_store_or_mount_directory() {
+        let (root, paths) = project("unbound");
+
+        remove_unbound_project_state(&paths).expect("unbound state removal");
+        assert!(!paths.project_root.exists(), "store directory remains");
+        assert!(!paths.mount_root.exists(), "mount tree remains");
+        assert!(
+            !paths.project_root.parent().expect("owner").exists(),
+            "empty owner directory remains in the store"
+        );
+        assert!(
+            !paths.mount_root.parent().expect("owner").exists(),
+            "empty owner directory remains under the mount root"
+        );
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn an_unbound_project_keeps_what_its_user_wrote() {
+        let (root, paths) = project("user-files");
+        std::fs::write(&paths.policy, b"policy").expect("policy");
+        std::fs::write(&paths.waivers, b"waivers").expect("waivers");
+        std::fs::create_dir_all(&paths.quarantine).expect("quarantine");
+        std::fs::write(paths.quarantine.join(".env"), b"moved aside").expect("quarantined");
+        let sibling = paths
+            .project_root
+            .parent()
+            .expect("owner")
+            .join("other-app");
+        std::fs::create_dir_all(&sibling).expect("sibling project");
+
+        remove_unbound_project_state(&paths).expect("unbound state removal");
+        assert_eq!(std::fs::read(&paths.policy).expect("policy"), b"policy");
+        assert_eq!(std::fs::read(&paths.waivers).expect("waivers"), b"waivers");
+        assert_eq!(
+            std::fs::read(paths.quarantine.join(".env")).expect("quarantined"),
+            b"moved aside"
+        );
+        for controller in [
+            paths.project_root.join("lifecycle-intents.json"),
+            paths.project_root.join("deletion-log.jsonl"),
+            paths.checkout_layout.clone(),
+            paths.slot_bindings.clone(),
+        ] {
+            assert!(!controller.exists(), "{} remains", controller.display());
+        }
+        assert!(sibling.is_dir(), "another project's directory went too");
+        assert!(!paths.mount_root.exists(), "mount tree remains");
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn an_unbound_mount_tree_holding_a_file_is_reported_and_kept() {
+        let (root, paths) = project("mount-file");
+        let stray = paths.mount_root.join("raven/notes.txt");
+        std::fs::write(&stray, b"left in a mountpoint").expect("stray file");
+
+        let error = remove_unbound_project_state(&paths)
+            .expect_err("a file under the mount tree is not an empty mountpoint");
+        assert_eq!(error.code.as_str(), "integrity");
+        assert_eq!(
+            std::fs::read(&stray).expect("stray kept"),
+            b"left in a mountpoint"
+        );
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn a_session_artifact_refuses_before_anything_is_removed() {
+        let (root, paths) = project("session-artifact");
+        let lock = paths.sessions.join("raven.sparseimage.lock");
+        let bundle = paths.sessions.join(".trash/raven-0123.bundle");
+        std::fs::create_dir_all(bundle.parent().expect("trash")).expect("trash");
+        std::fs::write(&lock, b"").expect("lock");
+        std::fs::write(&bundle, b"abandoned commits").expect("bundle");
+
+        let error = require_terminal_sessions(&paths.sessions)
+            .expect_err("an abandon bundle must refuse the restore");
+        assert_eq!(error.code.as_str(), "conflict");
+        assert!(
+            error.message.contains("raven-0123.bundle"),
+            "{}",
+            error.message
+        );
+        assert!(lock.is_file(), "the check removed a lock");
+        assert_eq!(
+            std::fs::read(&bundle).expect("bundle kept"),
+            b"abandoned commits"
+        );
+
+        std::fs::remove_file(&bundle).expect("bundle removed by its owner");
+        require_terminal_sessions(&paths.sessions).expect("locks and empty directories pass");
+        assert!(lock.is_file(), "the check removed a lock");
         std::fs::remove_dir_all(root).expect("cleanup");
     }
 }
