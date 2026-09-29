@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 pub const MARKER_VERSION: u32 = 1;
 pub const SIDECAR_VERSION: u32 = 1;
 pub const CHECKOUT_LAYOUT_VERSION: u32 = 1;
+pub const CHECKOUT_ROOT_VERSION: u32 = 1;
 pub const SLOT_BINDINGS_VERSION: u32 = 1;
 pub const PORT_BLOCK_SIZE: u16 = 16;
 pub const MACOS_PORT_BLOCK_MIN: u16 = 40_960;
@@ -507,6 +508,72 @@ impl<'de> Deserialize<'de> for CheckoutLayoutRecord {
         let record = Self {
             version: wire.version,
             checkout_layout: wire.checkout_layout,
+        };
+        record.validate().map_err(serde::de::Error::custom)?;
+        Ok(record)
+    }
+}
+
+/// The project-level record of where the checkout is, written when main is removed.
+///
+/// While main has an image, its sidecar names the checkout. Removing main takes that image to the
+/// trash and then to reclamation, and a project still bound afterwards — a restore that died
+/// before it unbound — has no other record connecting its checkout to its identity. A checkout
+/// with no remote cannot supply the identity itself, so this record is what reopens it.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CheckoutRootRecord {
+    version: u32,
+    checkout_root: PathBuf,
+}
+
+impl CheckoutRootRecord {
+    pub fn new(checkout_root: &Path) -> Result<Self, MetadataError> {
+        let record = Self {
+            version: CHECKOUT_ROOT_VERSION,
+            checkout_root: checkout_root.to_owned(),
+        };
+        record.validate()?;
+        Ok(record)
+    }
+
+    pub fn checkout_root(&self) -> &Path {
+        &self.checkout_root
+    }
+
+    fn validate(&self) -> Result<(), MetadataError> {
+        if self.version != CHECKOUT_ROOT_VERSION {
+            return Err(MetadataError::UnsupportedVersion {
+                kind: "checkout root record",
+                version: self.version,
+            });
+        }
+        if !self.checkout_root.is_absolute() {
+            return Err(MetadataError::InvalidPath {
+                path: self.checkout_root.clone(),
+                reason: "path is not absolute",
+            });
+        }
+        Ok(())
+    }
+}
+
+impl<'de> Deserialize<'de> for CheckoutRootRecord {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct Wire {
+            version: u32,
+            checkout_root: PathBuf,
+        }
+
+        let wire = Wire::deserialize(deserializer)?;
+        let record = Self {
+            version: wire.version,
+            checkout_root: wire.checkout_root,
         };
         record.validate().map_err(serde::de::Error::custom)?;
         Ok(record)

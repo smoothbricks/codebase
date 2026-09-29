@@ -10,8 +10,8 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
 
 use crate::metadata::{
-    CheckoutLayout, CheckoutLayoutRecord, ImageFormat, MetadataError, SlotBindings,
-    SlotBindingsRecord, WorkspaceName, append_suffix, sidecar_path,
+    CheckoutLayout, CheckoutLayoutRecord, CheckoutRootRecord, ImageFormat, MetadataError,
+    SlotBindings, SlotBindingsRecord, WorkspaceName, append_suffix, sidecar_path,
 };
 use crate::repository::{PathLayoutError, ProjectPaths, RepoId};
 
@@ -298,6 +298,25 @@ impl StorageLayout {
         crate::metadata::write_json(
             &self.project.checkout_layout,
             &CheckoutLayoutRecord::new(layout),
+        )
+    }
+
+    /// The checkout root main's removal recorded, or `None` when main has never been removed.
+    /// A present record that does not parse fails closed.
+    pub fn recorded_checkout_root(&self) -> Result<Option<PathBuf>, MetadataError> {
+        match crate::metadata::read_json::<CheckoutRootRecord>(&self.project.checkout_root) {
+            Ok(record) => Ok(Some(record.checkout_root().to_owned())),
+            Err(MetadataError::Io { source, .. }) if source.kind() == io::ErrorKind::NotFound => {
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    pub fn record_checkout_root(&self, checkout_root: &Path) -> Result<(), MetadataError> {
+        crate::metadata::write_json(
+            &self.project.checkout_root,
+            &CheckoutRootRecord::new(checkout_root)?,
         )
     }
 

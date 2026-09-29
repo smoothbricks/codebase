@@ -793,34 +793,49 @@ impl NativeGatewayInventory {
                     return Err(io_error("enumerating retirement trash", &trash, source));
                 }
             }
-            let claims_root = images.into_iter().try_fold(false, |claimed, image| {
-                verify_no_symlinks(self.storage.store(), &image).map_err(|error| {
-                    GatewayInventoryError::InvalidMetadata {
-                        path: image.clone(),
+            // Main's images name the checkout while any exists. Removing main takes them away, and
+            // it records the root in the store first, so a project still bound afterwards is found
+            // from its checkout through that record — and only then, so the record never outvotes
+            // an image.
+            let claims_root = if images.is_empty() {
+                layout
+                    .recorded_checkout_root()
+                    .map_err(|error| GatewayInventoryError::InvalidMetadata {
+                        path: layout.project().checkout_root.clone(),
                         message: error.to_string(),
-                    }
-                })?;
-                let metadata =
-                    DetachedWorkspaceMetadata::read_for_image(&image).map_err(|error| {
+                    })?
+                    .and_then(|root| fs::canonicalize(root).ok())
+                    .is_some_and(|root| root == expected)
+            } else {
+                images.into_iter().try_fold(false, |claimed, image| {
+                    verify_no_symlinks(self.storage.store(), &image).map_err(|error| {
                         GatewayInventoryError::InvalidMetadata {
-                            path: sidecar_path(&image),
+                            path: image.clone(),
                             message: error.to_string(),
                         }
                     })?;
-                if metadata.repo_id != repo || !metadata.workspace.is_main() {
-                    return Err(GatewayInventoryError::InvalidMetadata {
-                        path: sidecar_path(&image),
-                        message: "main image metadata identity does not match its binding"
-                            .to_owned(),
-                    });
-                }
-                let matches = metadata
-                    .info_snapshot
-                    .as_ref()
-                    .and_then(|info| fs::canonicalize(&info.project_root).ok())
-                    .is_some_and(|root| root == expected);
-                Ok::<_, GatewayInventoryError>(claimed || matches)
-            })?;
+                    let metadata =
+                        DetachedWorkspaceMetadata::read_for_image(&image).map_err(|error| {
+                            GatewayInventoryError::InvalidMetadata {
+                                path: sidecar_path(&image),
+                                message: error.to_string(),
+                            }
+                        })?;
+                    if metadata.repo_id != repo || !metadata.workspace.is_main() {
+                        return Err(GatewayInventoryError::InvalidMetadata {
+                            path: sidecar_path(&image),
+                            message: "main image metadata identity does not match its binding"
+                                .to_owned(),
+                        });
+                    }
+                    let matches = metadata
+                        .info_snapshot
+                        .as_ref()
+                        .and_then(|info| fs::canonicalize(&info.project_root).ok())
+                        .is_some_and(|root| root == expected);
+                    Ok::<_, GatewayInventoryError>(claimed || matches)
+                })?
+            };
             if claims_root && matched.replace(repo).is_some() {
                 return Err(GatewayInventoryError::AmbiguousProjectRoot(
                     project_root.to_owned(),
@@ -2457,6 +2472,66 @@ mod tests {
                 .repository_for_project_root(&fixture.root.join("checkout-widget"))
                 .await
                 .expect("recover retired main binding"),
+            Some(repo)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_bound_project_whose_main_images_are_gone_is_found_by_its_recorded_checkout_root() {
+        let fixture = Fixture::new("reclaimed-main");
+        let repo = RepoId::parse("acme/widget").expect("repo");
+        fixture.bind(&repo);
+        let checkout = fixture.root.join("checkout-widget");
+        fs::create_dir_all(&checkout).expect("restored checkout");
+        StorageLayout::new(fixture.storage.store(), &repo)
+            .expect("layout")
+            .record_checkout_root(&checkout)
+            .expect("checkout root record");
+        let inventory = NativeGatewayInventory::new(fixture.storage.clone());
+
+        assert_eq!(
+            inventory
+                .repository_for_project_root(&checkout)
+                .await
+                .expect("resolve a project with no main image"),
+            Some(repo)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_recorded_checkout_root_never_overrides_what_main_images_record() {
+        let fixture = Fixture::new("image-precedence");
+        let repo = RepoId::parse("acme/widget").expect("repo");
+        fixture.bind(&repo);
+        fixture.workspace(
+            &repo,
+            WorkspaceName::new("main").expect("main"),
+            "00000000000000000000000000000001",
+            4,
+            false,
+            true,
+        );
+        let stale = fixture.root.join("checkout-before-move");
+        fs::create_dir_all(&stale).expect("stale checkout");
+        StorageLayout::new(fixture.storage.store(), &repo)
+            .expect("layout")
+            .record_checkout_root(&stale)
+            .expect("checkout root record");
+        let inventory = NativeGatewayInventory::new(fixture.storage.clone());
+
+        assert_eq!(
+            inventory
+                .repository_for_project_root(&stale)
+                .await
+                .expect("resolve the stale root"),
+            None,
+            "main's image names the checkout while it exists"
+        );
+        assert_eq!(
+            inventory
+                .repository_for_project_root(&fixture.root.join("checkout-widget"))
+                .await
+                .expect("resolve the imaged root"),
             Some(repo)
         );
     }

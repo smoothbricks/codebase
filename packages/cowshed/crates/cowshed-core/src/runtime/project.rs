@@ -1863,8 +1863,8 @@ fn clean_terminal_project_storage(project_root: &Path, binding: &Path) -> Result
 /// Everything the controller keeps for a project it is unbinding. Nothing reopens an unbound
 /// project, so its lifecycle journal, deletion log, checkout layout and slot bindings go, and with
 /// them its mount tree and each owner directory they leave empty; the store directory goes once
-/// the binding does. What the user put in the store — `policy.json`, `waivers.json`,
-/// `quarantine/` — stays, and keeps the store directory with it.
+/// the binding and the checkout root record after it do. What the user put in the store —
+/// `policy.json`, `waivers.json`, `quarantine/` — stays, and keeps the store directory with it.
 #[cfg(target_os = "macos")]
 fn remove_unbound_project_state(paths: &crate::repository::ProjectPaths) -> Result<()> {
     for file in [
@@ -1877,19 +1877,7 @@ fn remove_unbound_project_state(paths: &crate::repository::ProjectPaths) -> Resu
         paths.checkout_layout.clone(),
         paths.slot_bindings.clone(),
     ] {
-        match std::fs::remove_file(&file) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(CowshedError::environment_missing(
-                    format!(
-                        "cannot remove unbound project state {}: {error}",
-                        file.display()
-                    ),
-                    "check controller storage permissions and retry",
-                ));
-            }
-        }
+        remove_unbound_file(&file)?;
     }
     remove_directory_if_empty(&paths.project_root)?;
     if let Some(owner) = paths.project_root.parent() {
@@ -1900,6 +1888,21 @@ fn remove_unbound_project_state(paths: &crate::repository::ProjectPaths) -> Resu
         remove_directory_if_empty(owner)?;
     }
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn remove_unbound_file(file: &Path) -> Result<()> {
+    match std::fs::remove_file(file) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(CowshedError::environment_missing(
+            format!(
+                "cannot remove unbound project state {}: {error}",
+                file.display()
+            ),
+            "check controller storage permissions and retry",
+        )),
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -3908,8 +3911,9 @@ impl NativeProjectRuntimeHost {
     /// Unbinds a project whose main was restored: the terminal storage, the controller's own
     /// state (lifecycle journal included) and the mount tree go first, and the binding last, so a
     /// process that dies part way leaves a project still bound and a retry that finishes the
-    /// job. The binding's absence is the removal's completion; its store directory and emptied
-    /// owner directories go right after it.
+    /// job. The binding's absence is the removal's completion. The checkout root record goes right
+    /// after it — it is what reopens a still-bound project whose main image is gone — and the store
+    /// directory and emptied owner directories after that.
     async fn unbind_restored_project(&self) -> Result<()> {
         let paths = self.layout.project().clone();
         let expected = self.descriptor.binding.clone();
@@ -3969,6 +3973,7 @@ impl NativeProjectRuntimeHost {
                         )
                     })?;
             }
+            remove_unbound_file(&paths.checkout_root)?;
             remove_directory_if_empty(&paths.project_root)?;
             match paths.project_root.parent() {
                 Some(owner) => remove_directory_if_empty(owner),
@@ -3977,6 +3982,22 @@ impl NativeProjectRuntimeHost {
         })
         .await
         .map_err(|error| CowshedError::internal(format!("binding cleanup task failed: {error}")))?
+    }
+
+    /// Main's images are the record of where the checkout is, and removing main takes them away.
+    /// The root goes into the store first, so a removal that dies before it unbinds leaves a
+    /// project its checkout still reopens, remote or no remote.
+    async fn record_checkout_root(&self) -> Result<()> {
+        let layout = self.layout.clone();
+        let checkout_root = self.descriptor.git_root.clone();
+        crate::storage::lifecycle::dispatch_blocking(move || {
+            layout.record_checkout_root(&checkout_root)
+        })
+        .await
+        .map_err(|error| {
+            CowshedError::internal(format!("checkout root record task failed: {error}"))
+        })?
+        .map_err(native_integrity_error)
     }
 
     async fn adopt_rollback_state(
@@ -6689,6 +6710,10 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                         .await
                         .is_ok();
                 if restored {
+                    // This open may have been the one that reclaimed main's retired image, and
+                    // with it the last image naming this checkout; a restore stranded before the
+                    // record existed gets it here, before anything else can fail.
+                    self.record_checkout_root().await?;
                     if !was_pending {
                         self.begin_lifecycle_intent(intent.clone()).await?;
                     }
@@ -6709,6 +6734,9 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
             }
             Err(error) => return Err(error),
         };
+        if workspace.is_main() {
+            self.record_checkout_root().await?;
+        }
 
         if options.restore {
             let pre_cowshed = pre_cowshed_path(&self.descriptor.git_root)?;
@@ -13133,6 +13161,23 @@ mod terminal_project_cleanup_tests {
         }
         assert!(sibling.is_dir(), "another project's directory went too");
         assert!(!paths.mount_root.exists(), "mount tree remains");
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// The unbinding removes this state while the binding still stands; a process that dies right
+    /// after must leave the project reopenable from its checkout, and main's image is already gone.
+    #[test]
+    fn unbound_state_removal_keeps_what_reopens_a_still_bound_project() {
+        let (root, paths) = project("still-bound");
+        std::fs::write(&paths.repository_binding, b"binding").expect("binding");
+        std::fs::write(&paths.checkout_root, b"checkout root").expect("checkout root");
+
+        remove_unbound_project_state(&paths).expect("unbound state removal");
+        assert!(paths.repository_binding.is_file(), "binding went");
+        assert_eq!(
+            std::fs::read(&paths.checkout_root).expect("checkout root record"),
+            b"checkout root"
+        );
         std::fs::remove_dir_all(root).expect("cleanup");
     }
 
