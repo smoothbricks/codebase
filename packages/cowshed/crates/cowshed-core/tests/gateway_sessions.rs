@@ -49,6 +49,8 @@ fn status(sessions: Vec<SessionStatus>) -> GatewayStatus {
     GatewayStatus {
         version: env!("CARGO_PKG_VERSION").to_owned(),
         draining: false,
+        drain_cause: None,
+        executable_sha256: None,
         sessions,
         active: 0,
         queued: 0,

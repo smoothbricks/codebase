@@ -2362,6 +2362,25 @@ pub struct GatewayStatus {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub daemon_version: Option<String>,
     pub active_workspaces: u64,
+    /// Why the answering daemon is draining. A draining daemon refuses every new session, so the
+    /// gateway is not healthy while this is present, however promptly its socket answers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drain_cause: Option<String>,
+    /// Present when the answering daemon runs other bytes than this CLI. Both report version
+    /// 0.1.0 across every build, so only the executables' contents can tell them apart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stale_daemon: Option<StaleDaemonBinary>,
+}
+
+/// The daemon and CLI executables, when their contents differ.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct StaleDaemonBinary {
+    /// SHA-256 of the daemon's executable, or `None` for a daemon too old to report it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub daemon_sha256: Option<String>,
+    /// SHA-256 of the executable of the CLI that asked.
+    pub cli_sha256: String,
 }
 
 /// Health of the host-owned sccache LaunchAgent.

@@ -94,6 +94,14 @@ attached sessions from repository bindings, mount/incarnation facts, grants, and
 Detached and retired workspaces are never installed. SIGTERM and SIGINT stop admissions and drain the gateway before
 exit.
 
+An audit failure closes the gateway: it cuts in-flight streams, refuses every new session, reports `draining` with the
+failure as its cause, and exits once its drain completes, so `KeepAlive` restarts it instead of leaving a daemon that
+answers its control socket while serving nothing. `cowshed gateway status` and `doctor` call the gateway healthy only
+when the daemon answers, is not draining, and runs the same bytes as the CLI asking. Every build reports package version
+0.1.0, so the daemon reports the SHA-256 of its own executable instead, and a mismatch names the remedy
+`cowshed gateway stop --purge && cowshed gateway start` (a plain `stop` keeps the installed copy). `start` restarts a
+daemon it finds running other bytes once, and refuses with that remedy if the mismatch survives the restart.
+
 Every ordinary `exec`, `attach`, and `doctor` invocation reconciles the current project before use. Attach, detach,
 restore, removal, and other lifecycle publication paths reconcile again before success is printed, replacing changed
 revisions/tokens and removing stale project sessions. The gateway's session table is a cache of host inventory, never an

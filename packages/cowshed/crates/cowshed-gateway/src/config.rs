@@ -235,6 +235,9 @@ pub struct GatewayConfig {
     pub timeouts: GatewayTimeouts,
     pub command_capacity: NonZeroUsize,
     pub mirror_cache: MirrorCacheConfig,
+    /// SHA-256 of the executable this daemon runs, reported in its status so a client can tell
+    /// whether the daemon is running the same build it is.
+    pub executable_sha256: Option<String>,
 }
 
 impl Default for GatewayConfig {
@@ -251,6 +254,7 @@ impl Default for GatewayConfig {
             timeouts: GatewayTimeouts::default(),
             command_capacity: NonZeroUsize::new(1024).expect("1024 is non-zero"),
             mirror_cache: MirrorCacheConfig::default(),
+            executable_sha256: None,
         }
     }
 }

@@ -508,6 +508,38 @@ async fn proxy_request(endpoint: SocketAddr, request: String) -> String {
     String::from_utf8(response).expect("HTTP response is UTF-8")
 }
 
+/// A gateway an audit failure closed is either still draining its in-flight work — and says so,
+/// naming the failure — or has already stopped. It never answers as if it were serving.
+async fn assert_refusing_after_audit_failure(gateway: &Gateway) {
+    match gateway.handle().status().await {
+        Ok(status) => {
+            assert!(status.draining, "a fail-closed gateway reports draining");
+            assert!(
+                status
+                    .drain_cause
+                    .as_deref()
+                    .is_some_and(|cause| cause.contains("audit")),
+                "a draining gateway names its cause: {:?}",
+                status.drain_cause
+            );
+        }
+        Err(GatewayError::Stopped) => {}
+        Err(other) => panic!("unexpected gateway status failure: {other}"),
+    }
+}
+
+/// Once its drain completes, a fail-closed gateway stops with the audit failure, so the daemon
+/// exits and is restarted instead of draining forever.
+async fn assert_stops_with_audit_failure(gateway: &mut Gateway) {
+    let stopped = timeout(Duration::from_secs(5), gateway.stopped())
+        .await
+        .expect("a fail-closed gateway stops once its drain completes");
+    assert!(
+        matches!(stopped, Err(GatewayError::Audit(_))),
+        "the gateway stops with the audit failure that closed it: {stopped:?}"
+    );
+}
+
 async fn await_reclaimed(gateway: &Gateway) {
     timeout(Duration::from_secs(1), async {
         loop {
@@ -1846,8 +1878,11 @@ async fn revision_tombstone_and_rotation_preserve_authority() {
     gateway.drain().await.expect("drain gateway");
 }
 
+/// An audit sink that fails closes the gateway: in-flight work is cut, new work is refused, the
+/// status says why it is draining, and once the drain completes the gateway stops with the audit
+/// error instead of draining forever behind a healthy-looking control socket.
 #[tokio::test]
-async fn audit_failure_is_fail_closed_and_marks_gateway_draining() {
+async fn audit_failure_is_fail_closed_drains_and_stops_the_gateway() {
     let upstream = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
         .await
         .expect("bind active HTTP upstream");
@@ -1866,7 +1901,7 @@ async fn audit_failure_is_fail_closed_and_marks_gateway_draining() {
         assert!(trailing.is_empty(), "bytes arrived after audit hard-stop");
     });
     let endpoint = free_endpoint();
-    let gateway = gateway(
+    let mut gateway = gateway(
         test_config(),
         Arc::new(NoCredentials),
         Arc::new(LocalConnector {
@@ -1912,12 +1947,12 @@ async fn audit_failure_is_fail_closed_and_marks_gateway_draining() {
         denied.is_empty() || denied.starts_with("HTTP/1.1 503"),
         "{denied}"
     );
-    assert!(gateway.handle().status().await.expect("status").draining);
+    assert_refusing_after_audit_failure(&gateway).await;
     timeout(Duration::from_secs(1), active_upstream)
         .await
         .expect("active stream did not close")
         .expect("active upstream task");
-    await_reclaimed(&gateway).await;
+    assert_stops_with_audit_failure(&mut gateway).await;
     let replacement = session(
         "audit-failure",
         "owner/repo-audit-failure",
@@ -1929,7 +1964,7 @@ async fn audit_failure_is_fail_closed_and_marks_gateway_draining() {
     .0;
     assert!(matches!(
         gateway.handle().install(replacement).await,
-        Err(GatewayError::Draining)
+        Err(GatewayError::Stopped)
     ));
     drop(gateway);
 }
@@ -2850,7 +2885,7 @@ async fn h2_session_cancellation_closes_stream_and_is_audited() {
 async fn h2_audit_failure_hard_stops_the_negotiated_connection() {
     let calls = Arc::new(AtomicUsize::new(0));
     let endpoint = free_endpoint();
-    let gateway = gateway(
+    let mut gateway = gateway(
         test_config(),
         Arc::new(NoCredentials),
         Arc::new(CountingFailConnector {
@@ -2895,13 +2930,13 @@ async fn h2_audit_failure_hard_stops_the_negotiated_connection() {
         .expect("audit hard-stop left h2 connection running")
         .expect("h2 connection task join")
         .expect_err("audit hard-stop unexpectedly completed h2 cleanly");
-    assert!(gateway.handle().status().await.expect("status").draining);
+    assert_refusing_after_audit_failure(&gateway).await;
     assert_eq!(
         calls.load(Ordering::SeqCst),
         1,
         "upstream connector ran before malformed h2 request was rejected"
     );
-    await_reclaimed(&gateway).await;
+    assert_stops_with_audit_failure(&mut gateway).await;
     drop(gateway);
 }
 

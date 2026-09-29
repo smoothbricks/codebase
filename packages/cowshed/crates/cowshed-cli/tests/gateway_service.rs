@@ -11,8 +11,8 @@ use cowshed_cli::launchd::{
     STABLE_BINARY_MODE,
 };
 use cowshed_cli::output::Output;
-use cowshed_core::Result;
 use cowshed_core::api::GatewayStatus as CliGatewayStatus;
+use cowshed_core::{CowshedError, Result};
 
 use std::collections::VecDeque;
 use std::ffi::OsString;
@@ -205,6 +205,38 @@ impl GatewayDrain for FakeDrainer {
         self.0.store(true, Ordering::SeqCst);
         Ok(())
     }
+
+    async fn stopped(&mut self) -> CowshedError {
+        std::future::pending().await
+    }
+}
+
+/// A gateway whose actor already stopped on its own, as an audit fail-closed one does.
+struct StoppedGateway;
+
+#[async_trait]
+impl GatewayDrain for StoppedGateway {
+    async fn drain(self) -> Result<()> {
+        panic!("a gateway that stopped by itself is not drained again")
+    }
+
+    async fn stopped(&mut self) -> CowshedError {
+        CowshedError::internal("the gateway stopped: audit sink failed")
+    }
+}
+
+/// The daemon must not outlive a gateway that stopped by itself: it ends with that failure, so
+/// launchd restarts it, instead of waiting for a shutdown signal that never comes.
+#[tokio::test]
+async fn a_gateway_that_stops_by_itself_ends_the_daemon_with_its_cause() {
+    let error = drain_after_shutdown(StoppedGateway, std::future::pending())
+        .await
+        .expect_err("the daemon ends when its gateway stops");
+    assert!(
+        error.message.contains("audit sink failed"),
+        "{}",
+        error.message
+    );
 }
 
 #[tokio::test]
@@ -229,6 +261,8 @@ fn gateway_status_json_uses_the_frozen_success_envelope_only() {
             cli_version: "1.4.0".into(),
             daemon_version: Some("1.3.0".into()),
             active_workspaces: 2,
+            drain_cause: None,
+            stale_daemon: None,
         },
     )
     .expect("status emits");
@@ -274,6 +308,8 @@ fn gateway_status_names_launchd_socket_and_both_versions() {
                 cli_version: "1.4.0".into(),
                 daemon_version: daemon_version.map(str::to_owned),
                 active_workspaces: 0,
+                drain_cause: None,
+                stale_daemon: None,
             },
         )
         .expect("status emits");

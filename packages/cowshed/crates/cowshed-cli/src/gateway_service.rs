@@ -8,7 +8,7 @@ use crate::launchd::{
 };
 use crate::output::Output;
 use async_trait::async_trait;
-use cowshed_core::api::{EmptyResult, GatewayStatus as CliGatewayStatus};
+use cowshed_core::api::{EmptyResult, GatewayStatus as CliGatewayStatus, StaleDaemonBinary};
 use cowshed_core::repository::RepoId;
 use cowshed_core::{
     CowshedError, NativeGatewayInventory, Result, ValidatedHostStorage,
@@ -18,6 +18,7 @@ use cowshed_gateway::{
     ArrowAuditConfig, ControlError, Gateway, GatewayConfig, GatewayControlClient, GatewayHandle,
     GatewayStatus, MirrorCacheConfig, WorkspaceSession,
 };
+use sha2::{Digest as _, Sha256};
 use std::fs;
 use std::io::{self, Read as _, Write};
 use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
@@ -159,6 +160,8 @@ impl GatewayPaths {
 #[async_trait]
 pub trait GatewayDrain: Send {
     async fn drain(self) -> Result<()>;
+    /// Resolves only if the gateway stops without being asked to, with why it stopped.
+    async fn stopped(&mut self) -> CowshedError;
 }
 
 #[async_trait]
@@ -168,15 +171,34 @@ impl GatewayDrain for Gateway {
             .await
             .map_err(|error| CowshedError::internal(format!("could not drain gateway: {error}")))
     }
+
+    async fn stopped(&mut self) -> CowshedError {
+        match Gateway::stopped(self).await {
+            Ok(()) => CowshedError::internal("the gateway stopped without being asked to drain"),
+            Err(error) => CowshedError::internal(format!("the gateway stopped: {error}")),
+        }
+    }
 }
 
-pub async fn drain_after_shutdown<D, F>(daemon: D, shutdown: F) -> Result<()>
+/// Serve until the shutdown signal, then drain — or until the gateway stops on its own, which
+/// ends the daemon with that failure so launchd restarts it. A gateway that has failed closed
+/// refuses every session; a daemon that outlived it would answer status as if it were serving.
+pub async fn drain_after_shutdown<D, F>(mut daemon: D, shutdown: F) -> Result<()>
 where
     D: GatewayDrain,
     F: Future<Output = Result<()>>,
 {
-    shutdown.await?;
-    daemon.drain().await
+    let stopped = tokio::select! {
+        signal = shutdown => {
+            signal?;
+            None
+        }
+        reason = daemon.stopped() => Some(reason),
+    };
+    match stopped {
+        Some(reason) => Err(reason),
+        None => daemon.drain().await,
+    }
 }
 
 /// How long to wait for `launchctl bootout` to actually finish.
@@ -359,13 +381,47 @@ where
     let uid = effective_uid();
     let written = executor.execute_install(&plan).map_err(launchd_error)?;
     install_and_activate_gateway(&mut executor, &home, &source, &spec, written)?;
+    let cli_sha256 = executable_sha256(&source)?;
 
     let client = GatewayControlClient::new(paths.control_socket.clone()).map_err(control_error)?;
     let mut progress = StartProgress::new(recorded_project_count(&storage).await);
     let started = tokio::time::Instant::now();
+    let mut restarted = false;
     loop {
         if let Ok(status) = client.status().await {
-            return Ok(cli_status(true, true, paths.control_socket, Some(&status)));
+            let reported = cli_status(
+                true,
+                paths.control_socket.clone(),
+                Some(&status),
+                &cli_sha256,
+            );
+            match (&reported.drain_cause, &reported.stale_daemon) {
+                (None, None) => return Ok(reported),
+                // launchd kept the process it already had: the plist did not change, so
+                // activation did not restart it onto the bytes just installed. Restart it once.
+                (None, Some(_)) if !restarted => {
+                    activate_launch_agent(
+                        &mut executor,
+                        uid,
+                        spec.target(),
+                        InstallOutcome::Changed,
+                    )?;
+                    restarted = true;
+                }
+                (None, Some(stale)) => {
+                    return Err(CowshedError::conflict(
+                        format!(
+                            "the gateway still runs a different cowshed binary after a restart (daemon sha256 {}, cli sha256 {})",
+                            stale.daemon_sha256.as_deref().unwrap_or("unreported"),
+                            stale.cli_sha256
+                        ),
+                        STALE_DAEMON_REMEDY,
+                    ));
+                }
+                // A draining daemon exits once its in-flight work ends and launchd restarts it;
+                // it is not healthy until then.
+                (Some(_), _) => {}
+            }
         }
         let waited = started.elapsed();
         if waited >= START_DEADLINE {
@@ -533,12 +589,8 @@ pub(crate) async fn service_status() -> Result<CliGatewayStatus> {
     } else {
         None
     };
-    Ok(cli_status(
-        installed,
-        status.is_some(),
-        socket,
-        status.as_ref(),
-    ))
+    let cli_sha256 = executable_sha256(&running_executable()?)?;
+    Ok(cli_status(installed, socket, status.as_ref(), &cli_sha256))
 }
 
 async fn run_daemon() -> Result<()> {
@@ -555,7 +607,11 @@ async fn run_daemon() -> Result<()> {
     let inventory = NativeSessionInventory::new(storage);
     // The git credential helper is this same binary, which launchd started from the host-stable
     // path: a helper spawned by the daemon has to keep resolving for as long as the daemon runs.
-    let config = paths.config(effective_uid(), running_executable()?);
+    let executable = running_executable()?;
+    let config = GatewayConfig {
+        executable_sha256: Some(executable_sha256(&executable)?),
+        ..paths.config(effective_uid(), executable)
+    };
     let telemetry = ArrowAuditConfig::new(paths.telemetry.clone())
         .map_err(|error| CowshedError::internal(format!("invalid gateway telemetry: {error}")))?;
     let gateway = Gateway::start_host(config, telemetry)
@@ -644,20 +700,60 @@ async fn wait_for_shutdown_signal() -> Result<()> {
     }
 }
 
+/// What `gateway status` reports, from launchd's answer, the daemon's own answer, and the digest
+/// of this CLI's executable. A daemon that answers is healthy only when it is not draining and
+/// runs the same bytes as the CLI asking.
 fn cli_status(
     installed: bool,
-    running: bool,
     socket: PathBuf,
     status: Option<&GatewayStatus>,
+    cli_sha256: &str,
 ) -> CliGatewayStatus {
     CliGatewayStatus {
         installed,
-        running,
+        running: status.is_some(),
         socket,
         cli_version: env!("CARGO_PKG_VERSION").to_owned(),
         daemon_version: status.map(|status| status.version.clone()),
         active_workspaces: status.map_or(0, |status| status.sessions.len() as u64),
+        drain_cause: status.and_then(|status| {
+            status.draining.then(|| {
+                status
+                    .drain_cause
+                    .clone()
+                    .unwrap_or_else(|| "the daemon reports draining without a cause".to_owned())
+            })
+        }),
+        stale_daemon: status.and_then(|status| {
+            (status.executable_sha256.as_deref() != Some(cli_sha256)).then(|| StaleDaemonBinary {
+                daemon_sha256: status.executable_sha256.clone(),
+                cli_sha256: cli_sha256.to_owned(),
+            })
+        }),
     }
+}
+
+/// The remedy for a daemon running other bytes than the CLI: a plain `stop` keeps the installed
+/// copy and `start` does not restart a process whose plist did not change.
+const STALE_DAEMON_REMEDY: &str = "cowshed gateway stop --purge && cowshed gateway start";
+
+/// SHA-256 of an executable's contents, lowercase hex.
+pub(crate) fn executable_sha256(path: &Path) -> Result<String> {
+    let mut file = open_for_compare(path)?;
+    let mut hasher = Sha256::new();
+    let mut chunk = vec![0u8; COMPARE_CHUNK_BYTES];
+    loop {
+        let read = fill(&mut file, &mut chunk).map_err(|error| compare_error(path, error))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&chunk[..read]);
+    }
+    Ok(hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
 }
 
 pub fn emit_gateway_status<W: Write, E: Write>(
@@ -669,7 +765,17 @@ pub fn emit_gateway_status<W: Write, E: Write>(
         output.success(status).map_err(output_error)?;
         return Ok(());
     }
-    let state = if status.running {
+    let state = if let Some(cause) = &status.drain_cause {
+        format!(
+            "gateway is draining and refuses new sessions: {cause}; it exits once its in-flight work ends, and launchd restarts it"
+        )
+    } else if let Some(stale) = &status.stale_daemon {
+        format!(
+            "gateway runs a different cowshed binary than this CLI (daemon sha256 {}, cli sha256 {}); replace it: {STALE_DAEMON_REMEDY}",
+            stale.daemon_sha256.as_deref().unwrap_or("unreported"),
+            stale.cli_sha256
+        )
+    } else if status.running {
         format!(
             "gateway is healthy: launchd loaded; control socket answers at {}",
             status.socket.display()
@@ -1304,6 +1410,66 @@ mod tests {
         );
 
         fs::remove_dir_all(&root).ok();
+    }
+
+    fn daemon(draining: bool, cause: Option<&str>, sha256: Option<&str>) -> GatewayStatus {
+        GatewayStatus {
+            version: "0.1.0".into(),
+            draining,
+            drain_cause: cause.map(str::to_owned),
+            executable_sha256: sha256.map(str::to_owned),
+            sessions: Vec::new(),
+            active: 0,
+            queued: 0,
+        }
+    }
+
+    /// Healthy means answering, serving, and running this CLI's bytes; the version string, the
+    /// same for every build, decides nothing.
+    #[test]
+    fn a_daemon_is_healthy_only_when_it_serves_and_runs_the_cli_bytes() {
+        let socket = PathBuf::from("/private/cowshed/store/gateway.sock");
+        let healthy = cli_status(
+            true,
+            socket.clone(),
+            Some(&daemon(false, None, Some("aa"))),
+            "aa",
+        );
+        assert!(healthy.running);
+        assert_eq!((healthy.drain_cause, healthy.stale_daemon), (None, None));
+
+        let stale = cli_status(
+            true,
+            socket.clone(),
+            Some(&daemon(false, None, Some("bb"))),
+            "aa",
+        );
+        assert_eq!(
+            stale.stale_daemon,
+            Some(StaleDaemonBinary {
+                daemon_sha256: Some("bb".into()),
+                cli_sha256: "aa".into(),
+            })
+        );
+
+        // A daemon from before the digest was reported is older than any build that asks.
+        let unreported = cli_status(true, socket.clone(), Some(&daemon(false, None, None)), "aa");
+        assert_eq!(
+            unreported.stale_daemon.map(|stale| stale.daemon_sha256),
+            Some(None)
+        );
+
+        let draining = cli_status(
+            true,
+            socket.clone(),
+            Some(&daemon(true, Some("audit sink failed"), Some("aa"))),
+            "aa",
+        );
+        assert_eq!(draining.drain_cause.as_deref(), Some("audit sink failed"));
+
+        let silent = cli_status(true, socket.clone(), None, "aa");
+        assert!(!silent.running);
+        assert_eq!((silent.drain_cause, silent.stale_daemon), (None, None));
     }
 
     /// The guidance for an unavailable gateway has to work on a host where the

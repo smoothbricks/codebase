@@ -10,6 +10,14 @@ pub struct GatewayStatus {
     /// Version of the daemon process that answered the control request.
     pub version: String,
     pub draining: bool,
+    /// Why the daemon is draining, while it is. A draining daemon refuses every new session, so a
+    /// status that answers is not a healthy one until this is `None`.
+    #[serde(default)]
+    pub drain_cause: Option<String>,
+    /// SHA-256 of the executable the daemon process runs, when its supervisor recorded it. A
+    /// version string cannot tell two builds of one release apart; these bytes can.
+    #[serde(default)]
+    pub executable_sha256: Option<String>,
     pub sessions: Vec<SessionStatus>,
     pub active: usize,
     pub queued: usize,

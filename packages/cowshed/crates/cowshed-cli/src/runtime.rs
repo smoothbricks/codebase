@@ -3117,17 +3117,27 @@ fn gateway_findings(status: &GatewayStatus) -> Vec<Finding> {
             path: Some(status.socket.clone()),
         }
     }];
-    if let Some(daemon_version) = status.daemon_version.as_deref()
-        && daemon_version != status.cli_version
-    {
+    if let Some(cause) = status.drain_cause.as_deref() {
         findings.push(Finding {
-            code: "gateway-version-skew".into(),
+            code: "gateway-draining".into(),
+            severity: FindingSeverity::Error,
+            message: format!("gateway is draining and refuses new sessions: {cause}"),
+            hint: "wait for launchd to restart the gateway; if it keeps draining: cowshed gateway stop && cowshed gateway start".into(),
+            path: Some(status.socket.clone()),
+        });
+    }
+    // Every build reports the same package version, so only the executables' bytes tell a
+    // daemon left running an older build apart from this one.
+    if let Some(stale) = status.stale_daemon.as_ref() {
+        findings.push(Finding {
+            code: "gateway-stale-binary".into(),
             severity: FindingSeverity::Warning,
             message: format!(
-                "gateway version skew: cli {}; daemon {}",
-                status.cli_version, daemon_version
+                "gateway runs a different cowshed binary than this CLI: daemon sha256 {}; cli sha256 {}",
+                stale.daemon_sha256.as_deref().unwrap_or("unreported"),
+                stale.cli_sha256
             ),
-            hint: "cowshed gateway stop && cowshed gateway start".into(),
+            hint: "cowshed gateway stop --purge && cowshed gateway start".into(),
             path: Some(status.socket.clone()),
         });
     }
@@ -4308,26 +4318,57 @@ mod tests {
         );
     }
 
+    /// Two builds of one release report the same version, so a daemon left running an older
+    /// build is only visible by its bytes; a plain restart would keep the installed copy.
     #[test]
-    fn gateway_version_skew_is_a_warning_with_a_restart_hint() {
+    fn a_daemon_running_other_bytes_is_a_stale_binary_with_the_purge_remedy() {
         let status = GatewayStatus {
             installed: true,
             running: true,
             socket: PathBuf::from("/private/cowshed/store/gateway.sock"),
-            cli_version: "2.0.0".into(),
-            daemon_version: Some("1.9.0".into()),
+            cli_version: "0.1.0".into(),
+            daemon_version: Some("0.1.0".into()),
             active_workspaces: 0,
+            drain_cause: None,
+            stale_daemon: Some(cowshed_core::api::StaleDaemonBinary {
+                daemon_sha256: Some("13f1eec0".into()),
+                cli_sha256: "b4223cd0".into(),
+            }),
         };
 
         let findings = gateway_findings(&status);
-        let skew = findings
+        let stale = findings
             .iter()
-            .find(|finding| finding.code == "gateway-version-skew")
-            .expect("version skew finding");
-        assert_eq!(skew.severity, FindingSeverity::Warning);
-        assert_eq!(skew.hint, "cowshed gateway stop && cowshed gateway start");
-        assert!(skew.message.contains("cli 2.0.0"));
-        assert!(skew.message.contains("daemon 1.9.0"));
+            .find(|finding| finding.code == "gateway-stale-binary")
+            .expect("stale binary finding");
+        assert_eq!(stale.severity, FindingSeverity::Warning);
+        assert_eq!(
+            stale.hint,
+            "cowshed gateway stop --purge && cowshed gateway start"
+        );
+        assert!(stale.message.contains("13f1eec0") && stale.message.contains("b4223cd0"));
+    }
+
+    /// A draining daemon still answers its control socket, but it refuses every session: doctor
+    /// must say so as an error rather than list it as a healthy gateway.
+    #[test]
+    fn a_draining_gateway_is_an_error_naming_its_cause() {
+        let findings = gateway_findings(&GatewayStatus {
+            installed: true,
+            running: true,
+            socket: PathBuf::from("/private/cowshed/store/gateway.sock"),
+            cli_version: "0.1.0".into(),
+            daemon_version: Some("0.1.0".into()),
+            active_workspaces: 0,
+            drain_cause: Some("audit sink failed, so the gateway fails closed: disk full".into()),
+            stale_daemon: None,
+        });
+        let draining = findings
+            .iter()
+            .find(|finding| finding.code == "gateway-draining")
+            .expect("draining finding");
+        assert_eq!(draining.severity, FindingSeverity::Error);
+        assert!(draining.message.contains("disk full"));
     }
 
     #[test]
@@ -4339,6 +4380,8 @@ mod tests {
             cli_version: "2.0.0".into(),
             daemon_version: None,
             active_workspaces: 0,
+            drain_cause: None,
+            stale_daemon: None,
         });
         assert_eq!(gateway[0].code, "gateway-down");
         assert_eq!(gateway[0].severity, FindingSeverity::Error);

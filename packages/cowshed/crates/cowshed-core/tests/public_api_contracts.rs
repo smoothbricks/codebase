@@ -824,6 +824,8 @@ fn reports_gateway_and_audit_shapes_are_frozen() {
         cli_version: "1.4.0".into(),
         daemon_version: Some("1.3.0".into()),
         active_workspaces: 2,
+        drain_cause: None,
+        stale_daemon: None,
     };
     assert_eq!(
         serde_json::to_value(status).unwrap(),

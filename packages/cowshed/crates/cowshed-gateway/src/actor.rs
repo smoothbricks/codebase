@@ -329,6 +329,19 @@ impl Gateway {
         self.handle.clone()
     }
 
+    /// Resolves when the actor stops without being asked to — after an audit failure closed the
+    /// gateway and its drain completed — with the error that stopped it. A daemon waits on this
+    /// beside its shutdown signal so a gateway that can no longer serve exits and is restarted.
+    /// Once it has resolved, the actor is gone and later calls answer [`GatewayError::Stopped`].
+    pub async fn stopped(&mut self) -> Result<(), GatewayError> {
+        let Some(actor) = self.actor.as_mut() else {
+            return Err(GatewayError::Stopped);
+        };
+        let joined = actor.await;
+        self.actor = None;
+        joined.map_err(|error| GatewayError::Task(error.to_string()))?
+    }
+
     pub async fn drain(mut self) -> Result<(), GatewayError> {
         if let Some(control) = self.control.take() {
             control.stop().await;
@@ -887,7 +900,13 @@ impl Actor {
                     }
                 }
             }
-            if self.drain_reply.is_some() && self.finish_drain().await? {
+            // An audit failure drains exactly like a requested shutdown, and has to finish like
+            // one: once the in-flight work is gone the actor stops with that failure, so the
+            // daemon exits and its supervisor restarts it, instead of refusing every session
+            // forever behind a control socket that still answers.
+            if (self.drain_reply.is_some() || self.audit_failure.is_some())
+                && self.finish_drain().await?
+            {
                 return Ok(());
             }
         }
@@ -1561,6 +1580,11 @@ impl Actor {
         GatewayStatus {
             version: env!("CARGO_PKG_VERSION").to_owned(),
             draining: self.draining,
+            drain_cause: self.draining.then(|| match &self.audit_failure {
+                Some(error) => format!("audit sink failed, so the gateway fails closed: {error}"),
+                None => "the gateway is shutting down".to_owned(),
+            }),
+            executable_sha256: self.config.executable_sha256.clone(),
             sessions,
             active: self.global_active,
             queued: self.global_queued,
