@@ -5011,7 +5011,7 @@ fn resizing_a_mounted_workspace_puts_it_back_on_its_mount() {
         .expect("the image is grown");
     let remounted = argv
         .iter()
-        .position(|command| command.contains(&"mount".to_owned()))
+        .position(|command| command[0] == "/sbin/mount_apfs")
         .expect("the workspace is mounted again");
     assert!(
         detached_first < grew && grew < remounted,

@@ -19,6 +19,12 @@ use crate::device::{DISKUTIL, container_of, identifier_depth};
 
 const HDIUTIL: &str = "/usr/bin/hdiutil";
 const FSCK_APFS: &str = "/sbin/fsck_apfs";
+/// The kernel mount helper. Workspace volumes are mounted with it rather than `diskutil mount`
+/// because `diskutil` routes the mount through Disk Arbitration, which serialises every client
+/// on the host: under a loaded fleet a mount that `mount_apfs` completes in about a second was
+/// measured queueing for 68 s at the median and past the 120 s child deadline at the tail.
+/// Disk Arbitration still observes the mounted volume, so eject and inventory keep working.
+const MOUNT_APFS: &str = "/sbin/mount_apfs";
 const NEWFS_APFS: &str = "/System/Library/Filesystems/apfs.fs/Contents/Resources/newfs_apfs";
 const SYNC: &str = "/bin/sync";
 const SW_VERS: &str = "/usr/bin/sw_vers";
@@ -1708,25 +1714,23 @@ impl<R: CommandRunner, S: Sleeper> ApfsBackend for MacOsApfsBackend<R, S> {
             path: mount_point.to_owned(),
             source,
         })?;
-        let mut args = vec![OsString::from("mount")];
-        if access == MountAccess::ReadOnly {
-            args.push(OsString::from("readOnly"));
-        }
-        if !browse {
-            args.push(OsString::from("nobrowse"));
-        }
-        args.extend([
-            OsString::from("-mountOptions"),
-            OsString::from("owners"),
-            OsString::from("-mountPoint"),
-            mount_point.as_os_str().to_owned(),
-            OsString::from(&attachment.volume_device),
-        ]);
+        let options = match (access, browse) {
+            (MountAccess::ReadWrite, false) => "nobrowse,owners",
+            (MountAccess::ReadWrite, true) => "owners",
+            (MountAccess::ReadOnly, false) => "rdonly,nobrowse,owners",
+            (MountAccess::ReadOnly, true) => "rdonly,owners",
+        };
+        let request = CommandRequest::new(
+            MOUNT_APFS,
+            [
+                OsString::from("-o"),
+                OsString::from(options),
+                OsString::from(&attachment.volume_device),
+                mount_point.as_os_str().to_owned(),
+            ],
+        );
         timed_apfs_step(apfs_step_leg(&attachment.image), "mount", || {
-            self.run_checked(
-                "mount verified APFS volume",
-                CommandRequest::new(DISKUTIL, args),
-            )
+            self.run_checked("mount verified APFS volume", request)
         })
         .map(|_| ())
     }
@@ -3361,7 +3365,7 @@ mod tests {
                 Path::new(DISKUTIL),
                 Path::new(DISKUTIL),
                 Path::new(FSCK_APFS),
-                Path::new(DISKUTIL),
+                Path::new(MOUNT_APFS),
             ]
         );
         assert_eq!(argv(&requests[0]), ["info", "-plist"]);
@@ -3375,56 +3379,51 @@ mod tests {
         assert_eq!(argv(&requests[3]), ["apfs", "list", "-plist", "disk10"]);
         assert_eq!(argv(&requests[4]), ["-q", "/dev/rdisk10s1"]);
         assert_eq!(
-            argv(&requests[5])[..5],
+            argv(&requests[5]),
             [
-                "mount",
-                "nobrowse",
-                "-mountOptions",
-                "owners",
-                "-mountPoint"
+                "-o".to_owned(),
+                "nobrowse,owners".to_owned(),
+                "/dev/disk10s1".to_owned(),
+                mount.to_string_lossy().into_owned(),
             ]
         );
-        assert_eq!(argv(&requests[5]).last().unwrap(), "/dev/disk10s1");
         let _ = fs::remove_dir(mount);
     }
 
+    /// The mount never goes through Disk Arbitration: `diskutil mount` queues behind every
+    /// other arbitration client and was measured at 68 s median and the full 120 s child
+    /// deadline under load, against about a second for the kernel mount of the same volume.
     #[test]
-    fn mount_access_and_browse_selection_construct_exact_diskutil_arguments() {
+    fn mount_access_and_browse_selection_construct_exact_mount_apfs_arguments() {
         let attachment = AttachedImage {
             image: PathBuf::from("session.sparseimage"),
             format: ImageFormat::Sparse,
             whole_device: "/dev/disk4".into(),
             volume_device: "/dev/disk5s2".into(),
         };
-        for (access, browse) in [
-            (MountAccess::ReadWrite, false),
-            (MountAccess::ReadWrite, true),
-            (MountAccess::ReadOnly, false),
-            (MountAccess::ReadOnly, true),
+        for (access, browse, options) in [
+            (MountAccess::ReadWrite, false, "nobrowse,owners"),
+            (MountAccess::ReadWrite, true, "owners"),
+            (MountAccess::ReadOnly, false, "rdonly,nobrowse,owners"),
+            (MountAccess::ReadOnly, true, "rdonly,owners"),
         ] {
             let backend =
                 MacOsApfsBackend::new(RecordingRunner::with_outputs([CommandOutput::success([])]));
             let mount = temp_path(&format!("mount-{access:?}-{browse}"), "mount");
             backend.mount(&attachment, &mount, access, browse).unwrap();
 
-            let mut expected = vec!["mount".to_owned()];
-            if access == MountAccess::ReadOnly {
-                expected.push("readOnly".to_owned());
-            }
-            if !browse {
-                expected.push("nobrowse".to_owned());
-            }
-            expected.extend([
-                "-mountOptions".to_owned(),
-                "owners".to_owned(),
-                "-mountPoint".to_owned(),
-                mount.to_string_lossy().into_owned(),
-                "/dev/disk5s2".to_owned(),
-            ]);
             let requests = backend.runner().requests();
             assert_eq!(requests.len(), 1);
-            assert_eq!(requests[0].program, Path::new(DISKUTIL));
-            assert_eq!(argv(&requests[0]), expected);
+            assert_eq!(requests[0].program, Path::new(MOUNT_APFS));
+            assert_eq!(
+                argv(&requests[0]),
+                [
+                    "-o".to_owned(),
+                    options.to_owned(),
+                    "/dev/disk5s2".to_owned(),
+                    mount.to_string_lossy().into_owned(),
+                ]
+            );
             fs::remove_dir(mount).unwrap();
         }
     }
