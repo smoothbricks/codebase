@@ -266,6 +266,12 @@ process's intent. The process executing a workspace's lifecycle operation holds 
 Startup recovery acts only on unfinished intents whose lease it can take. An intent whose lease another process holds is
 that process's running operation, not crash residue, and is never run a second time beside it.
 
+A `PendingFence` clone that no unfinished intent names, and that no process is creating (its intent lease and its
+image's lifecycle lock are both free), is abandoned: nothing will finish it, and because it was never published nothing
+ever ran in it. `gc` and `doctor --repair` retire it as the create or fork its own metadata records, under the ordinary
+pending-clone retirement checks, and `rm <name>` accepts it the same way. A retirement those checks refuse leaves the
+clone in place and names the refusal. `gc` never compacts or deletes a `PendingFence` image directly.
+
 | Kill window                                                      | Durable state                                                  | Recovery action and guard                                                                                                                                                                                   |
 | ---------------------------------------------------------------- | -------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Before pending metadata                                          | Intent only                                                    | Re-run create/fork normally.                                                                                                                                                                                |

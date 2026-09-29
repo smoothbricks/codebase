@@ -787,6 +787,52 @@ fn stats_count_only_images_and_gc_drains_session_trash_then_compacts_detached_sp
 }
 
 #[test]
+fn gc_sweeps_around_an_unpublished_clone_without_compacting_or_deleting_it() {
+    // A `new` killed after its sidecar went down leaves the clone PendingFence under its
+    // canonical name. That is lifecycle state — finished by its intent, or retired by the
+    // project once nothing is creating it — never a detached image, and one such residue must
+    // not fail the reclaim of everything else in the project.
+    let fixture = Fixture::new("pending-clone-gc");
+    let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
+    let pending_name = WorkspaceName::session("pending").expect("workspace");
+    let pending = layout
+        .session_image(&pending_name, ImageFormat::Sparse)
+        .expect("pending");
+    create_image(pending.image(), ImageFormat::Sparse);
+    let mut pending_metadata = metadata(ImageFormat::Sparse);
+    set_metadata_workspace(&mut pending_metadata, pending_name);
+    pending_metadata.publication_state = PublicationState::PendingFence;
+    pending_metadata
+        .write_for_image(pending.image())
+        .expect("pending metadata");
+    let trash = layout
+        .project()
+        .sessions
+        .join(".trash/retired-00000000000000000000000000000001.sparseimage");
+    create_image(&trash, ImageFormat::Sparse);
+    let mut retired_metadata = metadata(ImageFormat::Sparse);
+    set_metadata_workspace(
+        &mut retired_metadata,
+        WorkspaceName::session("retired").expect("retired workspace"),
+    );
+    retired_metadata
+        .write_for_image(&trash)
+        .expect("retired metadata");
+    let runner = RecordingRunner::default();
+    let host = native_host(&fixture, runner.clone());
+
+    let report = execute_gc(&host, &fixture.config()).expect("an unpublished clone cannot fail gc");
+    assert_eq!(report.reclaimed, 1, "the retired image is still reclaimed");
+    assert!(!trash.exists());
+    assert!(
+        pending.image().exists(),
+        "gc never deletes an unpublished clone"
+    );
+    assert!(sidecar_path(pending.image()).exists());
+    assert_eq!(runner.calls(), 0, "an unpublished clone is not compacted");
+}
+
+#[test]
 fn mount_registry_actor_owns_attachment_state_and_blocks_mounted_compaction() {
     let fixture = Fixture::new("mount-registry");
     let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");

@@ -4028,13 +4028,80 @@ impl NativeProjectRuntimeHost {
         Ok(())
     }
 
+    /// Unpublished clones nothing will ever finish: no unfinished lifecycle intent names them (a
+    /// crash residue that one names is finished by recovery), and no process is creating them —
+    /// neither under an intent lease nor under the image's lifecycle lock, which a create or fork
+    /// of any cowshed version holds for as long as it works on the image. Such a clone was never
+    /// published, so nothing ever ran in it. Each one comes back with its intent lease held by
+    /// this verb, so no other process can take it up while it is retired.
+    async fn abandoned_pending_clones(
+        &mut self,
+    ) -> Result<Vec<(PathBuf, crate::metadata::DetachedWorkspaceMetadata)>> {
+        self.reload_lifecycle_intents().await?;
+        let mut abandoned = Vec::new();
+        for (image, metadata) in self.pending_metadata().await? {
+            let workspace = &metadata.workspace;
+            if workspace.is_main()
+                || self
+                    .lifecycle_intents
+                    .get(workspace)
+                    .is_some_and(|record| record.completion.is_none())
+                || !self.claim_intent_lease(workspace)?
+                || image_lifecycle_lock_is_held(&image)?
+            {
+                continue;
+            }
+            abandoned.push((image, metadata));
+        }
+        Ok(abandoned)
+    }
+
+    /// Retire every [abandoned](Self::abandoned_pending_clones) clone, or with `dry_run` only name
+    /// them. A clone whose retirement is refused — say its history is not in main — stays, named
+    /// with the refusal and its next step; it no longer blocks the rest of `gc`.
+    async fn retire_abandoned_pending_clones(&mut self, dry_run: bool) -> Result<()> {
+        for (image, metadata) in self.abandoned_pending_clones().await? {
+            let workspace = metadata.workspace.clone();
+            if dry_run {
+                eprintln!(
+                    "cowshed: would retire {workspace}, an unfinished clone its creating process \
+                     abandoned before publishing it: {}",
+                    image.display()
+                );
+                continue;
+            }
+            let origin = abandoned_clone_origin(&metadata)?;
+            let options = RemoveOptions {
+                force: true,
+                ..RemoveOptions::default()
+            };
+            match self
+                .retire_pending_workspace(&workspace, options, origin, metadata)
+                .await
+            {
+                Ok(_) => eprintln!(
+                    "cowshed: retired {workspace}, an unfinished clone its creating process \
+                     abandoned before publishing it"
+                ),
+                Err(error) => eprintln!(
+                    "cowshed: kept unfinished clone {workspace}: {}\nnext: {}",
+                    error.message, error.hint
+                ),
+            }
+        }
+        Ok(())
+    }
+
+    /// Retire an unpublished clone without ever publishing it. The retired image is left in trash
+    /// for the caller to reclaim: `rm` does so in the background, while `gc` sweeps it in the same
+    /// pass instead of racing a background reclaim with its own plan.
     async fn retire_pending_workspace(
         &mut self,
         workspace: &WorkspaceName,
         options: RemoveOptions,
         origin: crate::storage::recovery::LifecycleIntent,
         metadata: crate::metadata::DetachedWorkspaceMetadata,
-    ) -> Result<RemoveReport> {
+    ) -> Result<(RemoveReport, crate::storage::lifecycle::RetiredRef)> {
         use super::supervisor::{CommitmentDraft, CommitmentSink};
         use crate::storage::lifecycle::{
             Destination, LifecyclePlanner, MountIntent, MountState, Substrate,
@@ -4177,10 +4244,7 @@ impl NativeProjectRuntimeHost {
                 crate::storage::recovery::LifecycleIntentCompletion::Retire(report.clone()),
             )
             .await?;
-            std::mem::drop(tokio::spawn(async move {
-                let _ = substrate.reclaim(retired).await;
-            }));
-            Ok(report)
+            Ok((report, retired))
         }
         .await;
         if main_detached {
@@ -6308,33 +6372,40 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
 
         let mut current = match self.current(&workspace).await {
             Err(error) if error.code == ErrorCode::NotFound && !workspace.is_main() => {
-                if let Some((_, metadata)) = self
+                if let Some((image, metadata)) = self
                     .pending_metadata()
                     .await?
                     .into_iter()
                     .find(|(_, metadata)| metadata.workspace == workspace)
                 {
-                    let record = self.lifecycle_intents.get(&workspace).ok_or_else(|| {
-                        CowshedError::integrity(
-                            format!("pending workspace {workspace} has no lifecycle intent"),
-                            "cowshed doctor --json",
-                        )
-                    })?;
-                    let origin = match &record.operation {
-                        crate::storage::recovery::LifecycleIntent::Create { .. }
-                        | crate::storage::recovery::LifecycleIntent::Fork { .. }
-                            if record.completion.is_none() =>
-                        {
-                            record.operation.clone()
+                    let unfinished = self
+                        .lifecycle_intents
+                        .get(&workspace)
+                        .filter(|record| record.completion.is_none())
+                        .map(|record| record.operation.clone());
+                    let origin = match unfinished {
+                        // No intent names this clone, so nothing will ever finish it; once no
+                        // process is still creating it, it is retired from its own metadata.
+                        None => {
+                            if !self.claim_intent_lease(&workspace)?
+                                || image_lifecycle_lock_is_held(&image)?
+                            {
+                                return Err(another_process_is_running(&workspace));
+                            }
+                            abandoned_clone_origin(&metadata)?
                         }
-                        crate::storage::recovery::LifecycleIntent::Retire {
+                        Some(
+                            operation @ (crate::storage::recovery::LifecycleIntent::Create {
+                                ..
+                            }
+                            | crate::storage::recovery::LifecycleIntent::Fork { .. }),
+                        ) => operation,
+                        Some(crate::storage::recovery::LifecycleIntent::Retire {
                             options: original,
                             origin: Some(origin),
                             ..
-                        } if *original == options && record.completion.is_none() => {
-                            (**origin).clone()
-                        }
-                        _ => {
+                        }) if original == options => *origin,
+                        Some(_) => {
                             return Err(CowshedError::integrity(
                                 format!(
                                     "pending workspace {workspace} has no unfinished matching lifecycle intent"
@@ -6343,9 +6414,14 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                             ));
                         }
                     };
-                    return self
+                    let (report, retired) = self
                         .retire_pending_workspace(&workspace, options, origin, metadata)
-                        .await;
+                        .await?;
+                    let substrate = self.substrate.clone();
+                    std::mem::drop(tokio::spawn(async move {
+                        let _ = substrate.reclaim(retired).await;
+                    }));
+                    return Ok(report);
                 }
                 if was_pending {
                     let report = RemoveReport::default();
@@ -6546,6 +6622,8 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
         use crate::storage::lifecycle::{StorageGcReason, Substrate};
 
         self.validate_binding().await?;
+        self.retire_abandoned_pending_clones(options.dry_run)
+            .await?;
         let plan = self
             .substrate
             .preview_gc(&self.descriptor.repo_id)
@@ -7154,17 +7232,48 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                 error,
             )),
         }
+        let abandoned = match self.abandoned_pending_clones().await {
+            Ok(abandoned) => abandoned
+                .into_iter()
+                .map(|(image, _)| image)
+                .collect::<std::collections::BTreeSet<_>>(),
+            Err(error) => {
+                findings.push(native_finding(
+                    "pending-integrity",
+                    crate::api::dto::FindingSeverity::Error,
+                    error,
+                ));
+                std::collections::BTreeSet::new()
+            }
+        };
         match self.pending_metadata().await {
             Ok(pending) => {
                 for (image, metadata) in pending {
+                    let (message, hint) = if abandoned.contains(&image) {
+                        (
+                            format!(
+                                "workspace {} is an unfinished clone its creating process \
+                                 abandoned; it was never published",
+                                metadata.workspace
+                            ),
+                            "cowshed gc retires it (so does cowshed doctor --repair)".to_owned(),
+                        )
+                    } else {
+                        (
+                            format!(
+                                "workspace {} is pending publication by a lifecycle operation",
+                                metadata.workspace
+                            ),
+                            "the operation finishes it, or the next cowshed command does if its \
+                             process died"
+                                .to_owned(),
+                        )
+                    };
                     findings.push(crate::api::dto::Finding {
                         code: "pending-publication".into(),
                         severity: crate::api::dto::FindingSeverity::Warning,
-                        message: format!(
-                            "workspace {} is pending its restore fence",
-                            metadata.workspace
-                        ),
-                        hint: "retry restore after repairing the image or gateway evidence".into(),
+                        message,
+                        hint,
                         path: Some(image),
                     });
                 }
@@ -10262,6 +10371,65 @@ fn another_process_is_running(workspace: &WorkspaceName) -> CowshedError {
         format!("another cowshed process is running a lifecycle operation on {workspace}"),
         "wait for that operation to finish, then retry",
     )
+}
+
+/// The clone intent an abandoned clone's own metadata implies: a fork when it records its
+/// source, otherwise a create from main. A create `--from` a workspace records no source, so it
+/// is retired as a create from main: the source only anchors the pending image's identity checks,
+/// and the retirement's containment check against main still guards the clone's history.
+#[cfg(target_os = "macos")]
+fn abandoned_clone_origin(
+    metadata: &crate::metadata::DetachedWorkspaceMetadata,
+) -> Result<crate::storage::recovery::LifecycleIntent> {
+    let info = metadata
+        .require_info_snapshot()
+        .map_err(native_integrity_error)?;
+    Ok(match &info.forked_from {
+        Some(source) => crate::storage::recovery::LifecycleIntent::Fork {
+            source: source.clone(),
+            destination: metadata.workspace.clone(),
+        },
+        None => crate::storage::recovery::LifecycleIntent::Create {
+            workspace: metadata.workspace.clone(),
+            options: CreateOptions {
+                git_worktree: info.git_worktree,
+                ..CreateOptions::default()
+            },
+        },
+    })
+}
+
+/// Whether a process holds `image`'s lifecycle lock right now — the lock a create, fork, restore
+/// or retirement holds on the image for as long as it works on it.
+#[cfg(target_os = "macos")]
+fn image_lifecycle_lock_is_held(image: &Path) -> Result<bool> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let mut lock = image.as_os_str().to_owned();
+    lock.push(".lock");
+    let lock = PathBuf::from(lock);
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&lock)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(CowshedError::environment_missing(
+                format!("cannot open lifecycle lock {}: {error}", lock.display()),
+                "check controller storage permissions and retry",
+            ));
+        }
+    };
+    match file.try_lock() {
+        Ok(()) => Ok(false),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(true),
+        Err(std::fs::TryLockError::Error(error)) => Err(CowshedError::environment_missing(
+            format!("cannot probe lifecycle lock {}: {error}", lock.display()),
+            "check controller storage permissions and retry",
+        )),
+    }
 }
 
 /// Split a mounted workspace marker into identity vs project-root findings.

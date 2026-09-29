@@ -2654,12 +2654,17 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
             if metadata.repo_id != *repo
                 || metadata.workspace != *discovered.workspace()
                 || metadata.image_format != discovered.format()
-                || metadata.publication_state != PublicationState::Active
             {
                 return Err(ApfsStorageError::MarkerMismatch(format!(
                     "detached metadata disagrees with session image {}",
                     path.display()
                 )));
+            }
+            // An unpublished clone is lifecycle state, not a detached image: its create's intent
+            // finishes it, or the project retires it once nothing is creating it. Refusing it
+            // here failed the reclaim of everything else in the project along with it.
+            if metadata.publication_state == PublicationState::PendingFence {
+                continue;
             }
             examined = examined
                 .checked_add(1)
