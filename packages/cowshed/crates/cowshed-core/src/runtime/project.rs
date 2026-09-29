@@ -1618,16 +1618,61 @@ fn remove_terminal_storage_tree(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Refuses a main restore whose `sessions` tree an unbinding could not delete: a live
-/// workspace's image or grants, an unreclaimed retired image, or an `rm --abandon` bundle kept for
-/// its owner. The restore checks this before it retires main, because the same refusal after it
-/// leaves a binding no command can remove.
+/// The project store trees an unbinding deletes once main is retired; they may hold nothing but
+/// empty directories and zero-length locks by then.
 #[cfg(target_os = "macos")]
-fn require_terminal_sessions(sessions: &Path) -> Result<()> {
-    plan_terminal_storage_tree(sessions, &mut Vec::new()).map_err(|error| match error.code {
+const TERMINAL_STORAGE_TREES: [&str; 3] = [
+    crate::storage::recovery::STAGING_NAMESPACE,
+    crate::repository::CHECKPOINTS_DIRECTORY,
+    crate::repository::SESSIONS_DIRECTORY,
+];
+
+/// Refuses a main restore whose terminal storage the unbinding could not delete: a live
+/// workspace's image or grants, an unreclaimed retired image, a staged image, another workspace's
+/// checkpoint, or an `rm --abandon` bundle kept for its owner. Main's own checkpoints are exempt:
+/// main's retirement reclaims them with its image. The restore checks this before it retires main,
+/// because the same refusal after it leaves a binding no command can remove.
+#[cfg(target_os = "macos")]
+fn require_terminal_storage(project_root: &Path) -> Result<()> {
+    let mut plan = Vec::new();
+    let planned = TERMINAL_STORAGE_TREES.into_iter().try_for_each(|name| {
+        let tree = project_root.join(name);
+        if name != crate::repository::CHECKPOINTS_DIRECTORY {
+            return plan_terminal_storage_tree(&tree, &mut plan);
+        }
+        let entries = match std::fs::read_dir(&tree) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => {
+                return Err(CowshedError::environment_missing(
+                    format!(
+                        "cannot enumerate terminal project storage {}: {error}",
+                        tree.display()
+                    ),
+                    "check controller storage permissions and retry",
+                ));
+            }
+        };
+        for entry in entries {
+            let entry = entry.map_err(|error| {
+                CowshedError::environment_missing(
+                    format!(
+                        "cannot read terminal project storage {}: {error}",
+                        tree.display()
+                    ),
+                    "check controller storage permissions and retry",
+                )
+            })?;
+            if entry.file_name() != main_name().as_str() {
+                plan_terminal_storage_tree(&entry.path(), &mut plan)?;
+            }
+        }
+        Ok(())
+    });
+    planned.map_err(|error| match error.code {
         ErrorCode::Integrity => CowshedError::conflict(
             format!(
-                "main cannot be restored while the project's sessions hold more than locks: {}",
+                "main cannot be restored while the project's storage holds more than locks: {}",
                 error.message
             ),
             "remove every session workspace (cowshed rm <ws>), delete the rm --abandon bundles in \
@@ -1639,11 +1684,7 @@ fn require_terminal_sessions(sessions: &Path) -> Result<()> {
 
 #[cfg(target_os = "macos")]
 fn clean_terminal_project_storage(project_root: &Path, binding: &Path) -> Result<()> {
-    for name in [
-        crate::storage::recovery::STAGING_NAMESPACE,
-        "checkpoints",
-        "sessions",
-    ] {
+    for name in TERMINAL_STORAGE_TREES {
         remove_terminal_storage_tree(&project_root.join(name))?;
     }
     for entry in std::fs::read_dir(project_root).map_err(|error| {
@@ -1682,7 +1723,8 @@ fn clean_terminal_project_storage(project_root: &Path, binding: &Path) -> Result
 /// unbound project, so its lifecycle journal, deletion log, checkout layout and slot bindings go,
 /// and with them its store directory, its mount tree and each owner directory they leave empty.
 /// What the user put in the store — `policy.json`, `waivers.json`, `quarantine/` — stays, and
-/// keeps the store directory with it.
+/// keeps the store directory with it. The store side goes first, so a mount tree that cannot go is
+/// the only thing an error leaves behind.
 #[cfg(target_os = "macos")]
 fn remove_unbound_project_state(paths: &crate::repository::ProjectPaths) -> Result<()> {
     for file in [
@@ -1709,58 +1751,80 @@ fn remove_unbound_project_state(paths: &crate::repository::ProjectPaths) -> Resu
             }
         }
     }
+    remove_directory_if_empty(&paths.project_root)?;
+    if let Some(owner) = paths.project_root.parent() {
+        remove_directory_if_empty(owner)?;
+    }
     remove_empty_mount_tree(&paths.mount_root)?;
-    for directory in [
-        Some(paths.project_root.as_path()),
-        paths.project_root.parent(),
-        paths.mount_root.parent(),
-    ]
-    .into_iter()
-    .flatten()
-    {
-        match std::fs::remove_dir(directory) {
-            Ok(()) => {}
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::NotFound | std::io::ErrorKind::DirectoryNotEmpty
-                ) => {}
-            Err(error) => {
-                return Err(CowshedError::environment_missing(
-                    format!(
-                        "cannot remove unbound project directory {}: {error}",
-                        directory.display()
-                    ),
-                    "check controller storage permissions and retry",
-                ));
-            }
-        }
+    if let Some(owner) = paths.mount_root.parent() {
+        remove_directory_if_empty(owner)?;
     }
     Ok(())
 }
 
-/// An unbound project's mount tree holds only the mountpoints of retired workspaces and
-/// `.staging`: empty directories on the volume the tree lives on. Those go; a file, or a directory
-/// on another device (a volume still mounted there), is reported and nothing below it is touched.
 #[cfg(target_os = "macos")]
-fn remove_empty_mount_tree(root: &Path) -> Result<()> {
-    use std::os::unix::fs::MetadataExt;
-
-    match std::fs::symlink_metadata(root) {
-        Ok(metadata) => remove_empty_directory_on(root, metadata.dev()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+fn remove_directory_if_empty(directory: &Path) -> Result<()> {
+    match std::fs::remove_dir(directory) {
+        Ok(()) => Ok(()),
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::DirectoryNotEmpty
+            ) =>
+        {
+            Ok(())
+        }
         Err(error) => Err(CowshedError::environment_missing(
             format!(
-                "cannot inspect unbound project mount tree {}: {error}",
-                root.display()
+                "cannot remove unbound project directory {}: {error}",
+                directory.display()
             ),
-            "check mount root permissions and retry",
+            "check controller storage permissions and retry",
         )),
     }
 }
 
+/// An unbound project's mount tree holds only the mountpoints of retired workspaces and
+/// `.staging`: empty directories on the volume the tree lives on. The whole tree is planned
+/// first; a file, or a directory on another device (a volume still mounted there), is reported and
+/// nothing of the tree is removed.
 #[cfg(target_os = "macos")]
-fn remove_empty_directory_on(path: &Path, device: u64) -> Result<()> {
+fn remove_empty_mount_tree(root: &Path) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    let device = match std::fs::symlink_metadata(root) {
+        Ok(metadata) => metadata.dev(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(CowshedError::environment_missing(
+                format!(
+                    "cannot inspect unbound project mount tree {}: {error}",
+                    root.display()
+                ),
+                "check mount root permissions and retry",
+            ));
+        }
+    };
+    let mut plan = Vec::new();
+    plan_empty_directories_on(root, device, &mut plan)?;
+    for directory in plan {
+        std::fs::remove_dir(&directory).map_err(|error| {
+            CowshedError::environment_missing(
+                format!(
+                    "cannot remove unbound project mount tree {}: {error}",
+                    directory.display()
+                ),
+                "check mount root permissions and retry",
+            )
+        })?;
+    }
+    Ok(())
+}
+
+/// Plans the removal of `path`, children before their directory, if it and everything below it are
+/// directories on `device`.
+#[cfg(target_os = "macos")]
+fn plan_empty_directories_on(path: &Path, device: u64, plan: &mut Vec<PathBuf>) -> Result<()> {
     use std::os::unix::fs::MetadataExt;
 
     let inspect = |error: std::io::Error| {
@@ -1776,24 +1840,17 @@ fn remove_empty_directory_on(path: &Path, device: u64) -> Result<()> {
     if !metadata.file_type().is_dir() || metadata.dev() != device {
         return Err(CowshedError::integrity(
             format!(
-                "the unbound project's mount tree still holds {}",
+                "the project is unbound, but its mount tree still holds {}",
                 path.display()
             ),
-            "move it aside; the project is unbound and nothing else of it remains",
+            "move that entry aside, then delete the project's mount tree",
         ));
     }
     for entry in std::fs::read_dir(path).map_err(inspect)? {
-        remove_empty_directory_on(&entry.map_err(inspect)?.path(), device)?;
+        plan_empty_directories_on(&entry.map_err(inspect)?.path(), device, plan)?;
     }
-    std::fs::remove_dir(path).map_err(|error| {
-        CowshedError::environment_missing(
-            format!(
-                "cannot remove unbound project mount tree {}: {error}",
-                path.display()
-            ),
-            "check mount root permissions and retry",
-        )
-    })
+    plan.push(path.to_owned());
+    Ok(())
 }
 
 #[cfg(any(test, target_os = "macos"))]
@@ -3556,7 +3613,9 @@ impl NativeProjectRuntimeHost {
 
     /// Removes the binding of a project whose main was restored, then everything else the
     /// controller kept for it. The lifecycle journal goes with the rest: the binding's absence is
-    /// the removal's completion, and nothing reopens the project to read one.
+    /// the removal's completion, and nothing reopens the project to read one. A process that dies
+    /// between the binding's removal and that cleanup leaves the rest behind, with nothing left to
+    /// retry it against.
     async fn unbind_restored_project(&self) -> Result<()> {
         let paths = self.layout.project().clone();
         let expected = self.descriptor.binding.clone();
@@ -6248,13 +6307,13 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
 
         if options.restore {
             let pre_cowshed = pre_cowshed_path(&self.descriptor.git_root)?;
-            let sessions = self.layout.project().sessions.clone();
+            let project_root = self.layout.project().project_root.clone();
             crate::storage::lifecycle::dispatch_blocking(move || {
-                require_terminal_sessions(&sessions)
+                require_terminal_storage(&project_root)
             })
             .await
             .map_err(|error| {
-                CowshedError::internal(format!("session storage check failed: {error}"))
+                CowshedError::internal(format!("terminal storage check failed: {error}"))
             })??;
             let initial_rollback_state = self.adopt_rollback_state(&current, &pre_cowshed).await?;
             if !options.force && initial_rollback_state != NativeAdoptRollbackState::Complete {
@@ -12425,7 +12484,7 @@ mod port_reservation_tests {
 #[cfg(all(test, target_os = "macos"))]
 mod terminal_project_cleanup_tests {
     use super::{
-        clean_terminal_project_storage, remove_unbound_project_state, require_terminal_sessions,
+        clean_terminal_project_storage, remove_unbound_project_state, require_terminal_storage,
     };
     use crate::repository::{ProjectPaths, RepoId};
 
@@ -12552,7 +12611,7 @@ mod terminal_project_cleanup_tests {
     }
 
     #[test]
-    fn an_unbound_mount_tree_holding_a_file_is_reported_and_kept() {
+    fn an_unbound_mount_tree_holding_a_file_is_reported_and_kept_whole() {
         let (root, paths) = project("mount-file");
         let stray = paths.mount_root.join("raven/notes.txt");
         std::fs::write(&stray, b"left in a mountpoint").expect("stray file");
@@ -12560,39 +12619,75 @@ mod terminal_project_cleanup_tests {
         let error = remove_unbound_project_state(&paths)
             .expect_err("a file under the mount tree is not an empty mountpoint");
         assert_eq!(error.code.as_str(), "integrity");
+        assert!(error.message.contains("notes.txt"), "{}", error.message);
         assert_eq!(
             std::fs::read(&stray).expect("stray kept"),
             b"left in a mountpoint"
+        );
+        assert!(
+            paths.mount_root.join(".staging/main-orphan").is_dir(),
+            "the refused tree was partly removed"
+        );
+        assert!(
+            !paths.project_root.exists(),
+            "the store side must go before the mount tree is refused"
         );
         std::fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[test]
-    fn a_session_artifact_refuses_before_anything_is_removed() {
-        let (root, paths) = project("session-artifact");
-        let lock = paths.sessions.join("raven.sparseimage.lock");
-        let bundle = paths.sessions.join(".trash/raven-0123.bundle");
-        std::fs::create_dir_all(bundle.parent().expect("trash")).expect("trash");
-        std::fs::write(&lock, b"").expect("lock");
-        std::fs::write(&bundle, b"abandoned commits").expect("bundle");
+    fn anything_the_unbinding_could_not_delete_refuses_before_anything_is_removed() {
+        for (label, artifact) in [
+            ("bundle", "sessions/.trash/raven-0123.bundle"),
+            ("session", "sessions/raven.sparseimage.grants.json"),
+            ("staged", ".staging/raven-4567.sparseimage"),
+            ("checkpoint", "checkpoints/raven/before.sparseimage"),
+        ] {
+            let (root, paths) = project(label);
+            let lock = paths.sessions.join("raven.sparseimage.lock");
+            let artifact = paths.project_root.join(artifact);
+            std::fs::create_dir_all(artifact.parent().expect("parent")).expect("parent");
+            std::fs::create_dir_all(&paths.sessions).expect("sessions");
+            std::fs::write(&lock, b"").expect("lock");
+            std::fs::write(&artifact, b"retained").expect("artifact");
 
-        let error = require_terminal_sessions(&paths.sessions)
-            .expect_err("an abandon bundle must refuse the restore");
-        assert_eq!(error.code.as_str(), "conflict");
-        assert!(
-            error.message.contains("raven-0123.bundle"),
-            "{}",
-            error.message
-        );
-        assert!(lock.is_file(), "the check removed a lock");
+            let error = require_terminal_storage(&paths.project_root)
+                .expect_err("a retained artifact must refuse the restore");
+            assert_eq!(error.code.as_str(), "conflict", "{label}");
+            assert!(
+                error
+                    .message
+                    .contains(artifact.file_name().expect("name").to_str().expect("utf-8")),
+                "{label}: {}",
+                error.message
+            );
+            assert!(lock.is_file(), "{label}: the check removed a lock");
+            assert_eq!(
+                std::fs::read(&artifact).expect("artifact kept"),
+                b"retained"
+            );
+
+            std::fs::remove_file(&artifact).expect("artifact removed by its owner");
+            require_terminal_storage(&paths.project_root)
+                .expect("locks and empty directories pass");
+            assert!(lock.is_file(), "{label}: the check removed a lock");
+            std::fs::remove_dir_all(root).expect("cleanup");
+        }
+    }
+
+    #[test]
+    fn mains_own_checkpoints_do_not_refuse_its_restore() {
+        let (root, paths) = project("main-checkpoint");
+        let checkpoint = paths.checkpoints.join("main/before.sparseimage");
+        std::fs::create_dir_all(checkpoint.parent().expect("parent")).expect("parent");
+        std::fs::write(&checkpoint, b"main checkpoint").expect("checkpoint");
+
+        require_terminal_storage(&paths.project_root)
+            .expect("main's retirement reclaims its own checkpoints");
         assert_eq!(
-            std::fs::read(&bundle).expect("bundle kept"),
-            b"abandoned commits"
+            std::fs::read(&checkpoint).expect("checkpoint kept"),
+            b"main checkpoint"
         );
-
-        std::fs::remove_file(&bundle).expect("bundle removed by its owner");
-        require_terminal_sessions(&paths.sessions).expect("locks and empty directories pass");
-        assert!(lock.is_file(), "the check removed a lock");
         std::fs::remove_dir_all(root).expect("cleanup");
     }
 }
