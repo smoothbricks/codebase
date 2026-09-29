@@ -328,9 +328,16 @@ impl RecoveryScope {
         }
     }
 
-    /// Whether a failure concerning `workspace` fails this opening.
-    fn owns(&self, workspace: &WorkspaceName) -> bool {
-        self.replay(workspace) == IntentReplay::Own
+    /// Whether a mounted workspace's supervisor failing to start fails this opening: it does for
+    /// the workspaces the opening owns, except a removal's target. A removal retires its target
+    /// rather than serving it, so a workspace whose supervisor cannot start stays removable.
+    fn needs_supervisor(&self, workspace: &WorkspaceName) -> bool {
+        match self {
+            Self::Removal(target) if target == workspace => false,
+            Self::Store | Self::Workspaces(_) | Self::Removal(_) => {
+                self.replay(workspace) == IntentReplay::Own
+            }
+        }
     }
 
     fn removal_target(&self) -> Option<&WorkspaceName> {
@@ -363,8 +370,8 @@ mod recovery_scope_tests {
         assert_eq!(unnamed.replay(&name("main")), IntentReplay::Own);
         assert_eq!(unnamed.replay(&name("b")), IntentReplay::Leave);
         // A mounted workspace whose supervisor cannot start fails exactly these verbs.
-        assert!(scope.owns(&name("a")) && scope.owns(&name("main")));
-        assert!(!scope.owns(&name("b")));
+        assert!(scope.needs_supervisor(&name("a")) && scope.needs_supervisor(&name("main")));
+        assert!(!scope.needs_supervisor(&name("b")));
     }
 
     #[test]
@@ -379,6 +386,10 @@ mod recovery_scope_tests {
             None
         );
         assert_eq!(RecoveryScope::Store.removal_target(), None);
+        // Retiring a workspace never waits on its supervisor, which may be what is broken.
+        assert!(!scope.needs_supervisor(&name("gone")));
+        assert!(scope.needs_supervisor(&name("main")));
+        assert!(!scope.needs_supervisor(&name("other")));
     }
 
     /// The resident controller finishes residue everywhere, but only `main`'s failure is its own.
@@ -392,8 +403,8 @@ mod recovery_scope_tests {
             RecoveryScope::Store.replay(&name("b")),
             IntentReplay::Residue
         );
-        assert!(RecoveryScope::Store.owns(&name("main")));
-        assert!(!RecoveryScope::Store.owns(&name("b")));
+        assert!(RecoveryScope::Store.needs_supervisor(&name("main")));
+        assert!(!RecoveryScope::Store.needs_supervisor(&name("b")));
     }
 }
 
@@ -5293,7 +5304,7 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
         }) {
             let name = workspace.derived.workspace.name().clone();
             if let Err(error) = self.ensure_supervisor_for(workspace).await {
-                if self.recovery_scope.owns(&name) {
+                if self.recovery_scope.needs_supervisor(&name) {
                     return Err(error);
                 }
                 eprintln!(
