@@ -11,32 +11,40 @@ Nearly every cache in scope is content-addressed with immutable entries — bun'
 object as cargo's registry. Concurrency safety therefore discriminates nothing; what matters is the cache's role at use
 time:
 
-- **Read-at-build caches** — cargo registry, Go module + build caches, sccache, zig global cache, gradle. The tool reads
-  sources or artifacts from the cache and writes its output somewhere else. The cache is only ever read at build time,
-  so sharing it costs nothing. These live on the shared cache volume.
-- **Clone-materializing caches** — bun. `bun install` materializes `node_modules` by _cloning from the cache_: the cache
-  is the reflink source. APFS clonefile is strictly same-volume, so cache placement decides whether install runs at
-  clonefile speed or copyfile speed. These must live **reflink-reachable from the workspace** — on APFS, inside the
-  workspace image.
+- **Read-at-build caches** — cargo registry, Go module + build caches, uv, ttsc plugins, sccache, zig global cache,
+  gradle. The tool reads sources or artifacts from the cache and writes its output somewhere else. The cache is only
+  ever read at build time, so sharing it costs nothing. These live on the shared cache volume.
+- **Link-target caches** — bun with its isolated linker (`[install] linker = "isolated"`). `bun install` extracts each
+  package once into `<cache>/links/<name>@<version>-<hash>` and writes `node_modules/.bun/<name>@<version>` as an
+  absolute symlink to it, so the cache's path is part of every checkout's `node_modules`. These live on the shared cache
+  volume too, and every checkout reaches them through **one literal path** (Wiring, host-level relocation).
+- **Clone-materializing caches** — a tool that materializes the workspace by _cloning out of its cache_: the cache is
+  the reflink source. APFS clonefile is strictly same-volume, so cache placement decides whether install runs at
+  clonefile speed or copyfile speed. Such a cache must live **reflink-reachable from the workspace** — on APFS, inside
+  the workspace image.
 
-Why placement decides it (measured, so it is not re-litigated — bun 1.3.14, warm caches, lockfile pinned, 83 packages /
-1,579 files / 59 MB `node_modules`, `rm -rf node_modules` + reinstall ×3): **in-volume cache: 0.03 s and 480 KiB of
-volume space consumed** (99.2% of blocks shared with the cache — clonefile confirmed); **cross-volume cache: 0.18 s (6×)
-and a full 59 MB copy, zero sharing**. For delta installs the two placements are nearly a wash — the gateway mirror
-already dedupes the download. The deciding case is **full materialization**: a wiped `node_modules`, a big lockfile
-churn, a fresh adopt — at large-repository scale (~90k objects, GBs) the measured 6× ratio lands in the
-seconds-vs-tens-of-seconds band (for a repository with roughly 100k objects); the measured relationship is the project
-benchmark's 100k-file copy took ~7.5 s for 256-byte files; real file sizes are worse). The measured 0.8% marginal disk
-also proves the "cache and `node_modules` share blocks in-image" claim: carrying the cache in the image is nearly free.
-The cost is sibling workspaces duplicating entries fetched post-clone — bounded, ephemeral, reclaimed at rm/land.
+Why placement decides it for a clone-materializing cache (measured with bun's clonefile backend, so it is not
+re-litigated — bun 1.3.14, warm caches, lockfile pinned, 83 packages / 1,579 files / 59 MB `node_modules`,
+`rm -rf node_modules` + reinstall ×3): **in-volume cache: 0.03 s and 480 KiB of volume space consumed** (99.2% of blocks
+shared with the cache — clonefile confirmed); **cross-volume cache: 0.18 s (6×) and a full 59 MB copy, zero sharing**.
+For delta installs the two placements are nearly a wash — the gateway mirror already dedupes the download. The deciding
+case is **full materialization**: a wiped `node_modules`, a big lockfile churn, a fresh adopt — at large-repository
+scale (~90k objects, GBs) the measured 6× ratio lands in the seconds-vs-tens-of-seconds band.
+
+Why the link-target cache is shared rather than in-image: the links in `node_modules/.bun` name the cache by absolute
+path, so they are byte-identical in main and every clone only if every checkout's bun uses the same cache path. A
+per-image cache cannot give that. Main's image and each clone mount at their own paths, so a clone's inherited links
+name main's cache — a sibling mount the sandbox denies — until its own `bun install` relinks every package into a
+private copy of the cache the clone carries; `node_modules` then differs from main's in every workspace. Linking needs
+no reflink, so the cache's volume never enters an install's cost.
 
 ## The three layers
 
-| Layer                         | Contents                                                                                                                  | Location                                                                                                       | Sharing                                   |
-| ----------------------------- | ------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------- | ----------------------------------------- |
-| 1. Gateway mirrors            | npm tarballs, crate files, registry metadata, bare repository mirrors                                                     | `/private/cowshed/caches/mirror` and `/private/cowshed/caches/repo-mirrors` (gateway-owned, sandbox-read-only) | Global, written only by cowshed-gateway   |
-| 2. Clone-materializing caches | bun install cache — **today: bun, on APFS; possibly nothing at all on ZFS**                                               | Inside each workspace image under `.cowshed/cache/bun`                                                         | Inherited from main via CoW at clone time |
-| 3. Read-at-build caches       | Cargo registry/git extraction caches, Go module + build caches, sccache, zig global cache, gradle, Nix eval/fetcher state | Dedicated writable roots under `/private/cowshed/caches/` reached through tool defaults or direct config       | Shared writable by all workspaces         |
+| Layer                                   | Contents                                                                                                                                                                                | Location                                                                                                                   | Sharing                                   |
+| --------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------- |
+| 1. Gateway mirrors                      | npm tarballs, crate files, registry metadata, bare repository mirrors                                                                                                                   | `/private/cowshed/caches/mirror` and `/private/cowshed/caches/repo-mirrors` (gateway-owned, sandbox-read-only)             | Global, written only by cowshed-gateway   |
+| 2. Clone-materializing caches           | caches a tool reflinks out of into the workspace — **none today**: bun's isolated linker links into its cache instead                                                                   | Inside each workspace image                                                                                                | Inherited from main via CoW at clone time |
+| 3. Read-at-build and link-target caches | Cargo registry/git extraction caches, bun global install cache, uv cache, Go module + build caches, ttsc plugins, sccache, zig global cache, gradle, Nix eval/fetcher and profile state | Dedicated writable roots under `/private/cowshed/caches/` reached through the host's literal default path or direct config | Shared writable by all workspaces         |
 
 Layer 1 removes duplicate _downloads_ (and stores compressed bytes once, ever). Bare repository mirrors live only at
 `/private/cowshed/caches/repo-mirrors/<host>/<path>.git`; they are written by the gateway's `repo mirror` control-plane
@@ -44,14 +52,14 @@ verb and are read-only to workspaces and main. Cargo's `~/.cargo/git` is **not**
 writable Cargo extraction/index cache at `/private/cowshed/caches/cargo/git`. The two have distinct ownership,
 permissions, and paths, so a Cargo process can never mutate gateway repository mirrors. Layer 2 is one special case, not
 a category: it exists exactly where a tool reflinks out of its cache and the substrate cannot reflink across volume
-boundaries. Layer 3 caches are read at build time and write nowhere near the workspace, so sharing them is free.
+boundaries, and no cache in scope does that today. Layer 3 caches are read at build time or linked to, and write nowhere
+near the workspace, so sharing them is free.
 
-**ZFS may empty layer 2** (verify item, not a promise): OpenZFS 2.2 block cloning (BRT) works across datasets within a
-pool — something APFS clonefile cannot do across volumes. If bun's Linux copy path goes through `copy_file_range` (which
-BRT intercepts), a pool-shared bun cache gets reflink speed anyway, and on ZFS every cache is shared with zero
-duplication and no speed penalty. Bun's Linux _default_ backend is hardlink, which cannot cross datasets either; the
-open question is specifically what its copyfile backend calls. Until verified, the ZFS substrate keeps the bun cache
-in-dataset like APFS does.
+**ZFS may widen layer 2** (verify item, not a promise): OpenZFS 2.2 block cloning (BRT) works across datasets within a
+pool — something APFS clonefile cannot do across volumes. A clone-materializing cache whose copy path goes through
+`copy_file_range` (which BRT intercepts) would get reflink speed from a pool-shared location, so on ZFS layer 2 could
+share with zero duplication and no speed penalty. Bun's Linux _default_ backend is hardlink, which cannot cross
+datasets; its isolated linker needs neither.
 
 **Workspace-keyed state** — `target/`, materialized `node_modules`, `DerivedData`, `.nx`, `.zig-cache`, Metro/Expo
 caches — is not shareable concurrently under any mechanism. It stays in-image, warm because the image was cloned from
@@ -62,7 +70,7 @@ main.
 A clone-materializing cache must live where the substrate can reflink from it into the workspace — on APFS, the same
 volume; on ZFS, the same pool (pending the BRT verification). Any placement that breaks reachability silently downgrades
 materialization from clonefile to copyfile. This replaces the earlier, broader "no cache dependency outside the volume"
-rule: read-at-build caches may live off-image freely, because nothing ever reflinks or hardlinks out of them.
+rule: read-at-build and link-target caches may live off-image freely, because nothing reflinks or hardlinks out of them.
 
 ## Wiring
 
@@ -84,10 +92,9 @@ them there; they contain the endpoint URL, whose userinfo is the workspace token
     reads `$XDG_CONFIG_HOME/.bunfig.toml` whenever `XDG_CONFIG_HOME` is set, and `$HOME/.bunfig.toml` only when it is
     not; it reads that global file alongside the repository's own `bunfig.toml`, which still wins for any key it sets;
     and it sends the token as `Authorization: Bearer`**, which the gateway accepts on its mirror routes (05_gateway.md).
-    The repository's committed `bunfig.toml` keeps only what is identical everywhere:
-    `[install.cache] dir = ".cowshed/cache/bun"` — **verified (bun 1.3.14): the relative path is honored and resolves
-    against the project root, not the invocation cwd**. Caution, same verification: the `[install] cacheDir` spelling is
-    _silently ignored_ (falls back to the global cache with no error); `cowshed doctor` checks for that misspelling.
+    Neither bunfig names a cache directory: bun's global install cache is the shared link-target cache every checkout
+    reaches through the host's literal path (host-level relocation below), and an `[install.cache] dir` inside the
+    checkout would write each checkout's own path into its `node_modules/.bun` links.
   - **cargo: no registry configuration at all.** Every sandbox builds with one literal `CARGO_HOME` — the host's
     `~/.cargo`, whose `registry` and `git` are relocated to the caches volume (below) — because cargo fingerprints a
     registry or git dependency by its absolute source path under `CARGO_HOME`: the same crate reached through another
@@ -135,37 +142,49 @@ them there; they contain the endpoint URL, whose userinfo is the workspace token
   gateway's `/sim/` endpoint (05_gateway.md) under the `sim` grant axis (04_sandbox.md). Tools that hardcode
   `/usr/bin/xcrun` bypass the shim and degrade to dev-local simulators — the safe default.
 - **Host-level relocation, once — cache subtrees only**: `cowshed setup --imperative-host-setup` (idempotent, re-checked
-  by `doctor`) makes the read-at-build tools' _cache_ directories resolve to these exact dedicated roots:
+  by `doctor`) makes the shared tools' _cache_ directories resolve to these exact dedicated roots:
 
-  | Tool default         | cowshed.caches target                    |
-  | -------------------- | ---------------------------------------- |
-  | `~/.cargo/registry`  | `/private/cowshed/caches/cargo/registry` |
-  | `~/.cargo/git`       | `/private/cowshed/caches/cargo/git`      |
-  | `~/.cache/zig`       | `/private/cowshed/caches/zig`            |
-  | `~/.gradle/caches`   | `/private/cowshed/caches/gradle/caches`  |
-  | `~/.cache/nix`       | `/private/cowshed/caches/nix/cache`      |
-  | `~/.local/state/nix` | `/private/cowshed/caches/nix/state`      |
+  | Tool default           | cowshed.caches target                       |
+  | ---------------------- | ------------------------------------------- |
+  | `~/.cargo/registry`    | `/private/cowshed/caches/cargo/registry`    |
+  | `~/.cargo/git`         | `/private/cowshed/caches/cargo/git`         |
+  | `~/.bun/install/cache` | `/private/cowshed/caches/bun/install/cache` |
+  | `~/.cache/uv`          | `/private/cowshed/caches/uv`                |
+  | `~/.cache/zig`         | `/private/cowshed/caches/zig`               |
+  | `~/.gradle/caches`     | `/private/cowshed/caches/gradle/caches`     |
+  | `~/.cache/nix`         | `/private/cowshed/caches/nix/cache`         |
+  | `~/.local/state/nix`   | `/private/cowshed/caches/nix/state`         |
 
   Each host path becomes a symlink to its target. An absent host path is linked; a real directory is moved first — a
   copy across volumes into a staging directory beside the target, published with one rename, and only then is the
-  original removed — provided the target is missing or empty. A host path and a target that both hold a cache, or a host
-  path that already links elsewhere, is a conflict: setup leaves both exactly as they are, names them, and exits
-  non-zero. Cargo's two move while setup holds cargo's own `.package-cache` and `.package-cache-mutate` locks, so no
-  cargo process reads or writes them mid-copy; a cargo process holding a lock refuses the run. sccache's platform cache
-  is not linked: the store is daemon-write-only, and `cowshed setup` instead writes sccache's own config so a store-less
-  client caches in `/private/cowshed/caches/sccache` (below). Go remains direct-configured as
-  `/private/cowshed/caches/go/{mod,build}`. Gateway artifacts remain outside every writable tool root at `mirror/` and
+  original removed — provided the target is missing or empty. The copy keeps symlinks, modes, times and hard links
+  (`ditto` on macOS, where `cp -a` splits hard links; `cp -a` on Linux): cargo's git checkouts share inodes with its
+  databases, and a copy that split them would grow the cache several-fold. A host path and a target that both hold a
+  cache, or a host path that already links elsewhere, is a conflict: setup leaves both exactly as they are, names them,
+  and exits non-zero. Cargo's two move while setup holds cargo's own `.package-cache` and `.package-cache-mutate` locks,
+  so no cargo process reads or writes them mid-copy; a cargo process holding a lock refuses the run. bun and uv offer no
+  host-wide lock to take, so their caches move only while no install runs. sccache's platform cache is not linked: the
+  store is daemon-write-only, and `cowshed setup` instead writes sccache's own config so a store-less client caches in
+  `/private/cowshed/caches/sccache` (below). Go and ttsc remain direct-configured:
+  `/private/cowshed/caches/go/{mod,build}` through Go's env file and `/private/cowshed/caches/ttsc` through
+  `TTSC_CACHE_DIR`; the supervisor creates the three directories before a child runs, because a child granted writes
+  inside one cannot create its parent. Gateway artifacts remain outside every writable tool root at `mirror/` and
   `repo-mirrors/`.
 
-  **Every checkout builds against the host's literal `$CARGO_HOME`.** Cargo fingerprints a registry or git dependency by
-  the absolute path of its source under `$CARGO_HOME` (measured: the same registry reached through a different
-  `$CARGO_HOME` path, even a symlink to the same bytes, recompiles the dependency and everything built on it). A
-  sandbox's `$CARGO_HOME` following its private `HOME` would therefore rebuild every dependency a clone's copied
-  `target/` already holds. Once both of cargo's caches are relocated, every sandboxed child gets
-  `CARGO_HOME=<host home>/.cargo` — the path the host itself builds against — and its profile admits exactly that
-  directory, its two cache links, and the files cargo writes at its root (the package-cache locks and the
-  `.global-cache` usage database with its journal). Until then a sandbox keeps a private `$CARGO_HOME` and `doctor`
-  reports each unshared cache.
+  **Every checkout reaches a shared tool home through the host's literal path.** Cargo fingerprints a registry or git
+  dependency by the absolute path of its source under `$CARGO_HOME` (measured: the same registry reached through a
+  different `$CARGO_HOME` path, even a symlink to the same bytes, recompiles the dependency and everything built on it),
+  and bun's isolated linker writes its cache's path into every `node_modules/.bun` link. A sandbox whose tools followed
+  its private `HOME` would rebuild every dependency a clone's copied `target/` already holds and relink `node_modules`
+  into a cache no other checkout has. Once all of a tool's caches are relocated, every sandboxed child is pointed at the
+  host's own default path — `CARGO_HOME=<host home>/.cargo`, `BUN_INSTALL_CACHE_DIR=<host home>/.bun/install/cache`,
+  `UV_CACHE_DIR=<host home>/.cache/uv` — and its profile admits exactly: the shared directories read-write; literal
+  reads of the host path, its ancestors, and cargo's `registry` and `git` links; and read-write literals for the files
+  cargo writes at its root (the package-cache locks and the `.global-cache` usage database with its journal). Nothing
+  else in a host tool home is granted. A caller's own value for these variables never reaches the child. Until a tool's
+  caches are relocated the sandbox keeps the tool's private default under its private `HOME`, and `doctor` reports each
+  unshared cache; an unshared bun cache stays readable, never writable, so the links a clone inherited from main's
+  `node_modules` keep resolving.
 
   **The parent config directories stay on the host.** `~/.cargo/config.toml`, `~/.cargo/config`,
   `~/.cargo/credentials.toml`, `~/.cargo/credentials`, `~/.cargo/bin` (on PATH), and `~/.gradle/gradle.properties` are
@@ -187,8 +206,9 @@ them there; they contain the endpoint URL, whose userinfo is the workspace token
   be fixed.
 
 - **Environment variables: at most three load-bearing.**
-  - `BUN_INSTALL_CACHE_DIR` is **retired** — its verification passed (relative `[install.cache] dir` works, above); the
-    committed bunfig line is the wiring and no export exists.
+  - The shared tool home variables (`CARGO_HOME`, `BUN_INSTALL_CACHE_DIR`, `UV_CACHE_DIR`, above) are not wiring in this
+    sense: supervisor-spawned children get them only to undo their private `HOME`, each names the host's own default
+    path, and every process cowshed never spawned resolves that same path unconfigured.
   - The workspace token needs no registry export: bun takes it from the private bunfig's registry `token`, Go from the
     private netrc, and the gateway reads it from their own `Authorization` header on the mirror routes (05_gateway.md).
     Generic proxy clients carry it as proxy userinfo (below). (There is no git credential helper to consider.)
@@ -269,12 +289,11 @@ table is advisory metadata, not a gate.
    workspace installs with zero grants; the port+token still identify and audit every request.
 2. The gateway fetches it upstream once (credentials injected), stores it content-addressed on the caches volume, and
    serves it — over loopback, so no WAN duplication across workspaces.
-3. bun extracts into the workspace's in-image cache and materializes into `node_modules` via clonefile — new inodes land
-   inside the image, never on the host volume. cargo extracts into the shared registry, and go extracts into the shared
-   `GOMODCACHE` (0444 entries, internally locked, built for exactly this cross-consumer sharing), where every workspace
-   and main read them thereafter.
-4. Extracted bun-cache bytes duplicate only across sessions that independently adopt the same new package, and only
-   until those branches land and later workspaces clone a main that includes them — bounded, ephemeral duplication.
+3. bun extracts into the shared global cache and links `node_modules/.bun` to the extracted package; cargo extracts into
+   the shared registry, and go extracts into the shared `GOMODCACHE` (0444 entries, internally locked, built for exactly
+   this cross-consumer sharing), where every workspace and main read them thereafter.
+4. Extracted bytes land once on the caches volume: a package any checkout installed is already extracted for every
+   other.
 
 ## Known limitations
 
@@ -284,17 +303,18 @@ table is advisory metadata, not a gate.
   paths, and projects may opt into `trim-paths`/`--remap-path-prefix`. cowshed does not force compiler flags.
 - **Poisoning model.** Lockfile integrity hashes protect _downloads_ (layer 1 is verified by the package managers
   themselves), not cache _reuse_: layers 2–3 are trusted once written. State this plainly: the layer-3 write scope a
-  sandbox holds includes cargo's `registry/src` and the Go caches — caches that _main itself compiles from_, so a
-  poisoned entry can influence main's next build. That is an accepted risk under the confinement threat model
-  (semi-trusted agents running the user's own code), bounded by write scope — a sandboxed workspace can write only the
-  designated layer-3 subtrees, never the gateway mirror or `repo-mirrors` (layer 1, gateway-only) and never relocated
-  Cargo/Gradle _config_ (host-side, deny-listed — see relocation above). The sccache store left that direct write scope
-  entirely (Wiring): it is daemon-write-only, so poisoning it means going through the daemon's compile path rather than
-  writing entries — the same trust class with one fewer direct write surface, traded against the daemon's named
-  confused-deputy surface (04_sandbox.md). Go's posture within that scope is notably stronger than cargo's: module
-  downloads verify against `go.sum` plus the checksum database, extraction is ziphash-verified, and `GOMODCACHE` entries
-  land read-only (0444) — tampering requires an explicit chmod, which the escape suite exercises (04_sandbox.md);
-  `GOCACHE` is the sccache-analog and shares its trust level.
+  sandbox holds includes cargo's `registry/src`, bun's global cache (whose `links/` main's `node_modules` resolves
+  into), uv's cache and the Go caches — caches that _main itself compiles from_, so a poisoned entry can influence
+  main's next build. That is an accepted risk under the confinement threat model (semi-trusted agents running the user's
+  own code), bounded by write scope — a sandboxed workspace can write only the designated layer-3 subtrees, never the
+  gateway mirror or `repo-mirrors` (layer 1, gateway-only) and never relocated Cargo/Gradle _config_ (host-side,
+  deny-listed — see relocation above). The sccache store left that direct write scope entirely (Wiring): it is
+  daemon-write-only, so poisoning it means going through the daemon's compile path rather than writing entries — the
+  same trust class with one fewer direct write surface, traded against the daemon's named confused-deputy surface
+  (04_sandbox.md). Go's posture within that scope is notably stronger than cargo's: module downloads verify against
+  `go.sum` plus the checksum database, extraction is ziphash-verified, and `GOMODCACHE` entries land read-only (0444) —
+  tampering requires an explicit chmod, which the escape suite exercises (04_sandbox.md); `GOCACHE` is the
+  sccache-analog and shares its trust level.
 - **Proxy-unaware tools.** Tools that hardcode registries need per-tool shims in the wiring step; the shim list grows by
   experience and lives in cowshed-core, not user config.
 - **Simulator and Xcode state.** CoreSimulator device sets (`~/Library/Developer/CoreSimulator`) are **dev-uid host
@@ -309,13 +329,15 @@ table is advisory metadata, not a gate.
 **"Concurrent-safe → shared" as the discriminator rejected.** An earlier framing placed caches by sharing safety, which
 classified cargo's registry alongside bun's cache (both content-addressed, both immutable-entry, both effectively
 concurrent-safe) and hid the property that actually matters. Safety is table stakes; _use_ is the discriminator. Cargo
-never reflinks from its registry into `target/` — sharing it costs nothing. Bun's cache is a reflink source — its
-placement is a speed decision. The spec says so plainly to keep the next redesign from rediscovering it.
+never reflinks from its registry into `target/` — sharing it costs nothing. A cache that is a reflink source makes its
+placement a speed decision, and a cache that is a link target makes its path a correctness decision. The spec says so
+plainly to keep the next redesign from rediscovering it.
 
-**Bun cache on the shared volume (on APFS) rejected.** It would deduplicate extracted bytes globally but moves the
-reflink source across a volume boundary, downgrading every full materialization from seconds (clonefile) to tens of
-seconds (copyfile) — pessimizing the hot path to optimize a bounded, ephemeral duplication the mirror has already made
-cheap. On ZFS this tradeoff may not exist at all (BRT crosses datasets); that is the verification's point.
+**Bun cache inside each image rejected.** A per-image cache keeps full materialization at clonefile speed only for a
+tool that clones out of its cache (the measurements above). Under the isolated linker it buys no speed and breaks
+correctness: `node_modules/.bun` links name the cache path, so a per-image cache makes them differ between main and
+every clone, a clone's inherited links point into main's image (a sibling the sandbox denies), and every clone carries a
+full copy of the cache (measured: a 5.5 GB copy inherited by every clone of one large repository).
 
 **Environment-variable wiring (the original twelve exports) rejected.** Identity vars duplicated the marker file; the
 gateway URL duplicated the config files that actually consume it; four cache paths duplicated what a one-time relocation
@@ -324,7 +346,8 @@ wrapper invocations) _and_ stays a load-bearing export, because non-cargo compil
 file that carries it. Environment survives only processes cowshed spawns; files and host paths survive everything. What
 remains is at most three exports (the gateway token, pending its own verification; `GOENV` — Go's lack of any
 directory-scoped config makes it the one toolchain where a file cannot carry per-workspace wiring; and
-`SCCACHE_SERVER_UDS`, the host daemon endpoint) — the bun cache export already died to its verification.
+`SCCACHE_SERVER_UDS`, the host daemon endpoint). The shared tool home variables are not wiring in this sense: they name
+the host's own default paths and exist only to undo a sandbox's private `HOME`.
 
 **Gateway-proxied sccache rejected.** Routing sccache through cowshed-gateway would mean translating sccache's own
 client-server protocol for zero policy gain — the gateway mediates _egress_, and the sccache daemon never leaves the

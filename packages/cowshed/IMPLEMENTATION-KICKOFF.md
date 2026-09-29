@@ -68,11 +68,10 @@ directly, Bun/Node applications use `cowshed-napi`, and shell-based agents use t
   `.cowshed-volume.json` distinguishes mounted from bare — absent means unmounted, heal before acting. Workspace mounts
   at `<mount-root>/<owner>/<repo>/<ws>` (the host-configured root defaults to `~/.cowshed/mnt`; primary `repo_id`, with
   each component separately validated and encoded; nobrowse, owners on, NOT /Volumes). Data-volume home footprint: one
-  empty mountpoint directory. Rationale: Data's local
-  snapshots would pin churned image blocks (path-level tmutil exclusion doesn't stop snapshotting); dedicated volumes
-  also collapse backup policy to per-volume decisions and separate fsck/corruption domains by rebuildability class.
-  Sandbox consequence: ONE `~/.cowshed` subtree deny + carve-backs replaces the enumerated store/sibling-mount denies
-  (04_sandbox.md). Spec: 01_storage.md.
+  empty mountpoint directory. Rationale: Data's local snapshots would pin churned image blocks (path-level tmutil
+  exclusion doesn't stop snapshotting); dedicated volumes also collapse backup policy to per-volume decisions and
+  separate fsck/corruption domains by rebuildability class. Sandbox consequence: ONE `~/.cowshed` subtree deny +
+  carve-backs replaces the enumerated store/sibling-mount denies (04_sandbox.md). Spec: 01_storage.md.
 - **Declarative host setup + deployment postures (14_nix.md)**: on nix hosts, `programs.cowshed` (home-manager) owns the
   cache-subtree symlinks, launchd agents, go env defaults, and TM exclusions declaratively — `adopt`/`doctor` VALIDATE
   and never mutate when HM owns the host (detection: HM symlinks resolve into /nix/store); imperative mode stays the
@@ -241,10 +240,11 @@ folded into the specs):
   and full `-n`; sync-before-clone is filesystem freshness, not crash-consistency. Checkpoint still requires the
   separate supervisor artifact barrier so process-resident captured bytes and its manifest are durable;
   regression-pinned in 08_testing.md.
-- (a) bunfig relative `install.cache.dir` → **works, resolves to project root** (bun 1.3.14); `BUN_INSTALL_CACHE_DIR`
-  retired. `[install] cacheDir` is silently ignored — doctor checks for it.
-- Cross-volume bun install cost → **measured 6× slower + full-copy** (0.03 s/480 KiB in-volume vs 0.18 s/59 MB
-  cross-volume, 1,579-file tree) — in-image placement confirmed (03_caches.md).
+- (a) bunfig relative `install.cache.dir` → **works, resolves to project root** (bun 1.3.14); `[install] cacheDir` is
+  silently ignored. Unused: under the isolated linker every checkout shares bun's global cache through one literal path
+  (03_caches.md).
+- Cross-volume bun install cost (clonefile backend) → **measured 6× slower + full-copy** (0.03 s/480 KiB in-volume vs
+  0.18 s/59 MB cross-volume, 1,579-file tree) — the basis of 03_caches.md's reflink-reachability rule.
 - (d) cargo `[env]` → **reaches all rustc-wrapper invocations** (cargo 1.97); `SCCACHE_SERVER_UDS` rides there, no env
   fallback.
 - (e) SBPL semantics → **ranges don't parse; last-match-wins (denies must be emitted last); implicit bind-on-connect

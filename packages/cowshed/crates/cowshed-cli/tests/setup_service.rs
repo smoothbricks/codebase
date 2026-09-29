@@ -19,8 +19,9 @@ use cowshed_cli::setup_service::{
     HostArtifactRemoval, HostSetup, MainMounts, SccacheInstall, WorkspaceCensus,
     dispatch as setup_dispatch,
 };
-use cowshed_core::host_caches::{HostCache, HostCacheRelocation, Relocation};
+use cowshed_core::host_caches::{HostCacheRelocation, Relocation};
 use cowshed_core::repository::RepoId;
+use cowshed_core::sandbox::HostCache;
 use cowshed_core::storage::bootstrap::{
     FstabOutcome, HostAction, HostActionOutcome, HostActionResult, HostSetupPlan, HostSetupReport,
     HostUninstallPlan, UninstallFstabOutcome, UninstallReport, UninstallServiceOutcome,

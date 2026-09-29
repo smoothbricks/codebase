@@ -442,7 +442,7 @@ impl HostSetup for NativeHostSetup {
     async fn relocate_host_caches(&mut self) -> Result<Vec<HostCacheRelocation>> {
         let home = self.home.clone();
         tokio::task::spawn_blocking(move || {
-            let cargo_home = cowshed_core::sandbox::host_cargo_home(&home);
+            let cargo_home = cowshed_core::sandbox::CARGO.host_path(&home);
             let _cargo_lock = if cargo_home.is_dir() {
                 match host_caches::try_lock_cargo_caches(&cargo_home) {
                     Ok(Some(lock)) => Some(lock),

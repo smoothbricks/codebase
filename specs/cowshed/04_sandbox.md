@@ -89,10 +89,21 @@ Shape:
 ;; (03_caches.md) — clients speak to the host daemon over the socket above
 ;; and never touch the store directly.
 (allow file-write*
+  (subpath "/private/cowshed/caches/cargo/registry")
+  (subpath "/private/cowshed/caches/cargo/git")
+  (subpath "/private/cowshed/caches/bun/install/cache")
+  (subpath "/private/cowshed/caches/uv")
   (subpath "/private/cowshed/caches/zig")
-  (subpath "/private/cowshed/caches/gradle")
+  (subpath "/private/cowshed/caches/gradle/caches")
+  (subpath "/private/cowshed/caches/nix/cache")
+  (subpath "/private/cowshed/caches/nix/state")
   (subpath "/private/cowshed/caches/go/mod")
-  (subpath "/private/cowshed/caches/go/build"))
+  (subpath "/private/cowshed/caches/go/build")
+  (subpath "/private/cowshed/caches/ttsc"))
+;; A shared tool home (03_caches.md) is reached through the host's literal path:
+;; once its caches are relocated, literal reads of that path and its ancestors
+;; (plus cargo's registry/git links and read-write literals for cargo's root
+;; state files) — never a subpath of a host tool home.
 (allow file-read* file-read-data file-write* (subpath "<workspace mount>")) ;; own mount ONLY
 
 ;; Secrets: denied after the scoped allows. The explicit file-read-data deny
@@ -156,11 +167,14 @@ Notes:
   the gateway writes layer-1 artifacts — 03_caches.md, 05_gateway.md).
 - `~/.cargo` and `~/.gradle` are deliberately _not_ relocated wholesale to the cache volume — only their cache subtrees
   are (03_caches.md). The deny list above pins their config, credential, and PATH-resolved binary paths to the host
-  precisely because the cache volume is sandbox-writable. Once cargo's two caches are relocated, a child builds with
-  `CARGO_HOME=~/.cargo` (the host's literal path, which is what keeps cargo's dependency fingerprints equal across
-  checkouts), and its profile adds exactly: a literal read of `~/.cargo`, of its `registry` and `git` links, and
-  read-write literals for cargo's root state files `.package-cache`, `.package-cache-mutate`, `.global-cache` and
-  `.global-cache-journal`. The denies above still follow every one of those grants.
+  precisely because the cache volume is sandbox-writable. Once a shared tool's caches are relocated, a child is pointed
+  at the host's literal path — `CARGO_HOME=~/.cargo`, `BUN_INSTALL_CACHE_DIR=~/.bun/install/cache`,
+  `UV_CACHE_DIR=~/.cache/uv` (the one path that keeps cargo's dependency fingerprints and bun's `node_modules/.bun`
+  links equal across checkouts) — and its profile adds exactly: literal reads of that path and its ancestors, of cargo's
+  `registry` and `git` links, and read-write literals for cargo's root state files `.package-cache`,
+  `.package-cache-mutate`, `.global-cache` and `.global-cache-journal`. Nothing else in `~/.cargo`, `~/.bun` or
+  `~/.cache` is granted. Until bun's cache is relocated, `~/.bun/install/cache` stays readable, never writable: a
+  clone's `node_modules` carries main's links into it. The denies above still follow every one of those grants.
 - The `~/go` deny is a **misconfiguration tripwire, not secret protection**: once the in-image `GOENV` wiring
   (03_caches.md) is in place nothing should ever touch `~/go` — `GOMODCACHE`/`GOCACHE` live on the caches volume,
   `GOPATH`/`GOBIN` in-image. A go invocation that missed the wiring (unwrapped spawn, editor without direnv) would
@@ -474,10 +488,13 @@ guarantees cowshed owns:
   needed.
 - **Nix client state**: the closed baseline's writable roots additionally include the shared cache subtrees `nix/cache`
   and `nix/state` under `/private/cowshed/caches` (eval/fetcher caches, profiles state). These are small SQLite files;
-  they stay on the host and are shared across workspaces like any concurrency-safe cache. They live under the cowshed
-  caches root rather than under the user's `~/.cache` and `~/.local/state`, because the sandbox never grants a path
-  inside the real `$HOME` — the workspace's `HOME`, `XDG_CONFIG_HOME`, and `XDG_CACHE_HOME` are all private, in-image
-  directories, and admitting the user's own would hand every workspace the rest of what those roots contain.
+  they stay on the host and are shared across workspaces like any concurrency-safe cache. Every child's `HOME`,
+  `XDG_CONFIG_HOME`, `XDG_CACHE_HOME`, `XDG_DATA_HOME` and `XDG_STATE_HOME` are private, in-image directories; before a
+  child runs, the supervisor links its `XDG_CACHE_HOME/nix` to `nix/cache` and its `XDG_STATE_HOME/nix` to `nix/state`
+  (a stale link is replaced, a real directory a workspace owns is left alone, and a host without the caches volume keeps
+  plain private directories). The user's own `~/.cache` and `~/.local/state` are never granted beyond the literal reads
+  a shared tool home's path needs (above): admitting them would hand every workspace the rest of what those roots
+  contain.
 - **direnv trust is path-keyed.** Approval belongs to the workspace's private direnv configuration, never the host
   user's trust store. Before activation, cowshed approves only the selected workspace-contained `.envrc` using that
   private configuration. Selection walks upward from the requested cwd and stops at the workspace boundary; an unrelated

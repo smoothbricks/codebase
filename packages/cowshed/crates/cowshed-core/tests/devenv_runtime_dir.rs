@@ -93,7 +93,7 @@ fn workspace(root: &Path, port_base: u16) -> SandboxConfig {
         additional_denies: Vec::new(),
         shed_links: Vec::new(),
         git_worktree_repository: None,
-        shared_cargo_home: None,
+        shared_tool_homes: Vec::new(),
     }
 }
 
@@ -283,7 +283,7 @@ async fn host_controller_private_environment_symlinks_cannot_redirect_host_prepa
             vec![
                 "/bin/sh".into(),
                 "-c".into(),
-                "mv \"$HOME/.cargo\" \"$HOME/.cargo.saved\" && ln -s \"$1\" \"$HOME/.cargo\""
+                "mv \"$XDG_STATE_HOME\" \"$XDG_STATE_HOME.saved\" && ln -s \"$1\" \"$XDG_STATE_HOME\""
                     .into(),
                 "plant".into(),
                 outside.as_os_str().to_owned(),
@@ -299,15 +299,49 @@ async fn host_controller_private_environment_symlinks_cannot_redirect_host_prepa
         let (events, _receiver) = mpsc::channel(16);
         let result = SystemSpawnSink.spawn(request, events).await;
         assert!(
-            !outside.join("registry").exists(),
-            "a sandboxed child redirected the controller's next directory creation"
+            !outside.join("nix").exists(),
+            "a sandboxed child redirected the controller's next link creation"
         );
         let Err(error) = result else {
-            panic!("symlinked private registry must refuse before spawning");
+            panic!("a symlinked private state root must refuse before spawning");
         };
         assert_eq!(error.code, cowshed_core::ErrorCode::Integrity);
         std::fs::remove_dir_all(root).expect("remove test workspace");
     }
+}
+
+/// Every child gets a private `XDG_STATE_HOME` beside its other XDG roots, and Nix's state under
+/// it is the shared directory on the caches volume, as its cache under `XDG_CACHE_HOME` is.
+#[tokio::test]
+#[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
+async fn host_controller_children_get_a_private_state_home_sharing_nix_state() {
+    let root = scratch("state-home");
+    let sandbox = workspace(&root, 41_088);
+    let mount = sandbox.workspace_mount.clone();
+    let (exit, stdout, stderr) = run_in_sandbox(
+        &sandbox,
+        &mount,
+        vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            "printf '%s\\n' \"$XDG_STATE_HOME\" && if [ -L \"$XDG_STATE_HOME/nix\" ]; then /usr/bin/readlink \"$XDG_STATE_HOME/nix\"; fi"
+                .into(),
+        ],
+    )
+    .await;
+    assert_eq!(
+        exit,
+        ExitStatus::Exited { code: 0 },
+        "{}",
+        String::from_utf8_lossy(&stderr)
+    );
+    let caches = Path::new(cowshed_core::storage::bootstrap::CACHES_ROOT);
+    let mut expected = format!("{}\n", mount.join(".cowshed/state").display());
+    if caches.is_dir() {
+        expected.push_str(&format!("{}\n", caches.join("nix/state").display()));
+    }
+    assert_eq!(String::from_utf8_lossy(&stdout), expected);
+    std::fs::remove_dir_all(root).expect("remove test workspace");
 }
 
 #[tokio::test]

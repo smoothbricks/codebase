@@ -101,23 +101,88 @@ pub fn sccache_cache_directory() -> PathBuf {
     Path::new(CACHES_ROOT).join("sccache")
 }
 
-/// Cargo's two caches, shared read-write by the host and every sandbox.
-///
-/// `registry` holds cargo's index, the fetched `.crate` archives and their unpacked sources;
-/// `git` holds the bare databases of git dependencies and their checkouts. Both are
-/// read-at-build caches (03_caches.md, third layer): cargo writes an entry once per crate or
-/// revision and every later build only reads it, so one copy serves every workspace. Host setup
-/// relocates `~/.cargo/registry` and `~/.cargo/git` to these directories.
-pub const SHARED_CARGO_CACHE_DIRECTORIES: [&str; 2] = ["registry", "git"];
-
-/// `<caches>/cargo/<directory>` for one [`SHARED_CARGO_CACHE_DIRECTORIES`] entry.
-pub fn shared_cargo_cache_directory(caches: &Path, directory: &str) -> PathBuf {
-    caches.join("cargo").join(directory)
+/// One host cache path and the directory on the caches volume it belongs in.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HostCache {
+    pub host: PathBuf,
+    pub shared: PathBuf,
 }
 
-/// The host's own `$CARGO_HOME`.
-pub fn host_cargo_home(home: &Path) -> PathBuf {
-    home.join(".cargo")
+impl HostCache {
+    /// Whether the host path already resolves to the shared directory.
+    pub fn is_shared(&self) -> bool {
+        matches!(
+            (
+                std::fs::canonicalize(&self.host),
+                std::fs::canonicalize(&self.shared),
+            ),
+            (Ok(host), Ok(shared)) if host == shared
+        )
+    }
+}
+
+/// A tool cache every checkout on the host reaches through ONE literal path: the host's own
+/// default, which links into the caches volume.
+///
+/// Cargo and Bun record where their cache lives, so no other spelling of the same bytes shares
+/// it. Cargo fingerprints a registry or git dependency by the absolute path of its source under
+/// `$CARGO_HOME`: a `$CARGO_HOME` at any other path — a sandbox's private HOME, even one whose
+/// `registry` links to the same bytes — dirties every dependency a clone's copied `target/`
+/// holds. Bun's isolated linker writes `node_modules/.bun/<package>` as absolute symlinks into
+/// its install cache, so main's `node_modules` and every clone's resolve only if each names the
+/// same cache path. A sandboxed child is therefore pointed at the host path through `variable`
+/// once host setup has relocated the tool's caches ([`shared_tool_homes`]); until then it keeps
+/// the tool's private default under the sandbox HOME, and `cowshed doctor` says why.
+#[derive(Debug, Eq, PartialEq)]
+pub struct SharedToolHome {
+    /// The variable that points a sandboxed child at the host path.
+    pub variable: &'static str,
+    /// The tool's own default directory under HOME: the host uses it unconfigured.
+    pub home: &'static str,
+    pub layout: SharedLayout,
+    /// Checkouts hold symlinks into the cache (Bun's isolated linker), so while the host path is
+    /// still a private directory it stays readable to every sandbox: a cloned `node_modules`
+    /// would otherwise resolve to EPERM inside the sandbox while the same tree works on the host.
+    pub linked_from_checkouts: bool,
+}
+
+/// Where a [`SharedToolHome`]'s bytes live on the caches volume.
+#[derive(Debug, Eq, PartialEq)]
+pub enum SharedLayout {
+    /// The host path itself links to this directory under the caches root.
+    Whole(&'static str),
+    /// The host path stays a host directory holding configuration, credentials or binaries that
+    /// never leave it. Only the `(child, directory under the caches root)` links inside it are
+    /// shared, and `state_files` are the only files the tool writes at its root beside them.
+    Split {
+        links: &'static [(&'static str, &'static str)],
+        state_files: &'static [&'static str],
+    },
+}
+
+impl SharedToolHome {
+    /// `<home>/<self.home>`: the literal path the host and every sandbox use.
+    pub fn host_path(&self, home: &Path) -> PathBuf {
+        home.join(self.home)
+    }
+
+    /// Each host link with the shared directory it must resolve to.
+    pub fn links(&self, home: &Path, caches: &Path) -> Vec<HostCache> {
+        let host = self.host_path(home);
+        match &self.layout {
+            SharedLayout::Whole(shared) => vec![HostCache {
+                host,
+                shared: caches.join(shared),
+            }],
+            SharedLayout::Split { links, .. } => links
+                .iter()
+                .map(|(child, shared)| HostCache {
+                    host: host.join(child),
+                    shared: caches.join(shared),
+                })
+                .collect(),
+        }
+    }
 }
 
 /// What cargo itself writes at the root of `$CARGO_HOME` while it resolves and builds: the
@@ -129,33 +194,55 @@ pub const CARGO_HOME_STATE_FILES: [&str; 4] = [
     ".global-cache-journal",
 ];
 
-/// The host's `$CARGO_HOME`, when its caches are the shared ones.
-///
-/// Every checkout on the host must build against this one literal path. Cargo fingerprints a
-/// registry or git dependency by the absolute path of its source under `$CARGO_HOME`, so a
-/// `$CARGO_HOME` at any other path — a sandbox's private HOME, even one whose `registry` links to
-/// the same bytes — marks every dependency, and everything built on it, dirty: a clone's copied
-/// `target/` would rebuild from scratch. Sharing the path is therefore only possible once host
-/// setup has relocated both caches; until then a sandbox keeps a private `$CARGO_HOME`, and
-/// `cowshed doctor` says why.
-pub fn shared_host_cargo_home(home: &Path, caches: &Path) -> Option<PathBuf> {
-    let cargo_home = host_cargo_home(home);
-    SHARED_CARGO_CACHE_DIRECTORIES
+/// Cargo's `registry` (index, fetched `.crate` archives, unpacked sources) and `git` (bare
+/// databases and checkouts of git dependencies). Both are read-at-build caches (03_caches.md,
+/// third layer): cargo writes an entry once per crate or revision and every later build only
+/// reads it. The rest of `~/.cargo` — configuration, credentials, `bin` — stays on the host and
+/// behind the secret denies.
+pub static CARGO: SharedToolHome = SharedToolHome {
+    variable: "CARGO_HOME",
+    home: ".cargo",
+    layout: SharedLayout::Split {
+        links: &[("registry", "cargo/registry"), ("git", "cargo/git")],
+        state_files: &CARGO_HOME_STATE_FILES,
+    },
+    linked_from_checkouts: false,
+};
+
+/// Bun's global install cache. The isolated linker extracts each package once into
+/// `<cache>/links/<name>@<version>-<hash>` and writes `node_modules/.bun/<name>@<version>` as an
+/// absolute symlink to it, so the cache path is part of every checkout's `node_modules`: main's
+/// links and a clone's resolve only if both name the same path, and a sandboxed `bun install`
+/// against any other cache relinks the clone away from main's.
+pub static BUN: SharedToolHome = SharedToolHome {
+    variable: "BUN_INSTALL_CACHE_DIR",
+    home: ".bun/install/cache",
+    layout: SharedLayout::Whole("bun/install/cache"),
+    linked_from_checkouts: true,
+};
+
+/// uv's cache of wheels, source distributions and built packages, shared by the same one-path
+/// rule so every checkout's `uv sync` reads what any one of them fetched or built.
+pub static UV: SharedToolHome = SharedToolHome {
+    variable: "UV_CACHE_DIR",
+    home: ".cache/uv",
+    layout: SharedLayout::Whole("uv"),
+    linked_from_checkouts: false,
+};
+
+/// Every tool home a sandbox shares with the host once its caches are relocated.
+pub static SHARED_TOOL_HOMES: [&SharedToolHome; 3] = [&CARGO, &BUN, &UV];
+
+/// The [`SHARED_TOOL_HOMES`] whose host links all resolve to their shared directories.
+pub fn shared_tool_homes(home: &Path, caches: &Path) -> Vec<&'static SharedToolHome> {
+    SHARED_TOOL_HOMES
         .into_iter()
-        .all(|directory| {
-            matches!(
-                (
-                    std::fs::canonicalize(cargo_home.join(directory)),
-                    std::fs::canonicalize(shared_cargo_cache_directory(caches, directory)),
-                ),
-                (Ok(host), Ok(shared)) if host == shared
-            )
-        })
-        .then_some(cargo_home)
+        .filter(|tool| tool.links(home, caches).iter().all(HostCache::is_shared))
+        .collect()
 }
 
-/// Tool caches host setup relocates onto the caches volume beside cargo's, as `(path under HOME,
-/// path under the caches root)`; every sandbox shares the second read-write.
+/// Tool caches host setup relocates onto the caches volume beside the shared tool homes, as
+/// `(path under HOME, path under the caches root)`; every sandbox shares the second read-write.
 pub const RELOCATED_TOOL_CACHES: [(&str, &str); 4] = [
     (".cache/zig", "zig"),
     (".gradle/caches", "gradle/caches"),
@@ -163,22 +250,11 @@ pub const RELOCATED_TOOL_CACHES: [(&str, &str); 4] = [
     (".local/state/nix", "nix/state"),
 ];
 
-/// Go's module and build caches, shared like the relocated ones but configured directly through
-/// Go's env file (03_caches.md), so nothing on the host is relocated for them.
-const DIRECT_TOOL_CACHES: [&str; 2] = ["go/mod", "go/build"];
-
-/// The host bun install cache, shared read-only with every sandbox.
-///
-/// Bun's isolated linker does not copy a package into `node_modules/.bun`: it symlinks
-/// `node_modules/.bun/<name>@<version>` to `~/.bun/install/cache/links/<name>@<version>-<hash>`,
-/// an extracted, content-hashed, immutable tarball. A workspace clone therefore carries links
-/// into the host cache, and Seatbelt matches the RESOLVED path - without this grant every
-/// `require` through such a link fails with EPERM inside the sandbox while the same tree works
-/// on the host. The download side is shared read-only, and `~/.bun` otherwise (the `bun` binary
-/// under `bin`, `.bunfig`) gets no grant.
-pub fn host_bun_install_cache(home: &Path) -> PathBuf {
-    home.join(".bun/install/cache")
-}
+/// Caches shared like the relocated ones but named directly by the tool's own configuration —
+/// Go's module and build caches through its env file (03_caches.md), ttsc's compiled plugins
+/// through `TTSC_CACHE_DIR` — so nothing on the host is relocated for them, and the supervisor
+/// creates them before a child runs.
+pub const DIRECT_TOOL_CACHES: [&str; 3] = ["go/mod", "go/build", "ttsc"];
 
 /// A symlink beside the workspace mount — `<mount_root>/<org>/<project>/<name>` — that an
 /// operator planted so a relative dependency (`../<name>`) resolves from every workspace of the
@@ -287,9 +363,29 @@ pub struct SandboxConfig {
     /// by exactly the workspaces that asked for `--git-worktree` and never implied by the
     /// baseline.
     pub git_worktree_repository: Option<PathBuf>,
-    /// The host `$CARGO_HOME` every child builds against, when its caches are the shared ones
-    /// ([`shared_host_cargo_home`]); `None` leaves `$CARGO_HOME` following the private HOME.
-    pub shared_cargo_home: Option<PathBuf>,
+    /// The tool homes whose caches are the shared ones ([`shared_tool_homes`]); every child uses
+    /// their host paths, and every other tool keeps its private default under the sandbox HOME.
+    pub shared_tool_homes: Vec<&'static SharedToolHome>,
+}
+
+impl SandboxConfig {
+    /// Each [`SHARED_TOOL_HOMES`] variable, naming the host path when this sandbox shares the
+    /// tool and `None` when the tool keeps its private default under the sandbox HOME.
+    ///
+    /// The variables are the sandbox's, never the caller's: any other path would defeat the one
+    /// literal path the host and every checkout share.
+    pub fn shared_tool_environment(
+        &self,
+    ) -> impl Iterator<Item = (&'static str, Option<PathBuf>)> + '_ {
+        SHARED_TOOL_HOMES.into_iter().map(|tool| {
+            (
+                tool.variable,
+                self.shared_tool_homes
+                    .contains(&tool)
+                    .then(|| tool.host_path(&self.home)),
+            )
+        })
+    }
 }
 
 /// Read-only jobs keep writable process state within the existing exec-temp carve-back.
@@ -579,34 +675,33 @@ pub fn seatbelt_profile(
         push_readable_ancestors(&mut profile, socket)?;
     }
     push_subpath_rule(&mut profile, "allow file-read*", caches)?;
-    // A child reaches these through the host `$CARGO_HOME`'s relocated `registry` and `git`
-    // links, and Seatbelt matches the resolved path.
-    for directory in SHARED_CARGO_CACHE_DIRECTORIES {
-        push_subpath_rule(
-            &mut profile,
-            "allow file-read* file-write*",
-            &shared_cargo_cache_directory(caches, directory),
-        )?;
-    }
-    if let Some(cargo_home) = &config.shared_cargo_home {
-        // The directory and its two cache links resolve for cargo; the only files a child may
-        // write at the root are cargo's own locks and usage database. Nothing else there is
-        // granted, and its configuration, credentials and binaries stay hard denies.
-        push_readable_ancestors(&mut profile, cargo_home)?;
-        push_literal_rule(&mut profile, "allow file-read*", cargo_home)?;
-        for directory in SHARED_CARGO_CACHE_DIRECTORIES {
-            push_literal_rule(
-                &mut profile,
-                "allow file-read*",
-                &cargo_home.join(directory),
-            )?;
+    for tool in SHARED_TOOL_HOMES {
+        // A child reaches these through the host path's links, and Seatbelt matches the
+        // resolved path.
+        for link in tool.links(&config.home, caches) {
+            push_subpath_rule(&mut profile, "allow file-read* file-write*", &link.shared)?;
         }
-        for file in CARGO_HOME_STATE_FILES {
-            push_literal_rule(
-                &mut profile,
-                "allow file-read* file-write*",
-                &cargo_home.join(file),
-            )?;
+        let host = tool.host_path(&config.home);
+        if config.shared_tool_homes.contains(&tool) {
+            // The host path and its links resolve for the tool, and at the root of a split home
+            // the tool writes its own state files. Nothing else in the host tool home is
+            // granted; configuration, credentials and binaries there stay hard denies.
+            push_readable_ancestors(&mut profile, &host)?;
+            if let SharedLayout::Split { links, state_files } = &tool.layout {
+                for (child, _) in *links {
+                    push_literal_rule(&mut profile, "allow file-read*", &host.join(child))?;
+                }
+                for file in *state_files {
+                    push_literal_rule(
+                        &mut profile,
+                        "allow file-read* file-write*",
+                        &host.join(file),
+                    )?;
+                }
+            }
+        } else if tool.linked_from_checkouts {
+            push_subpath_rule(&mut profile, "allow file-read*", &host)?;
+            push_readable_ancestors(&mut profile, &host)?;
         }
     }
     // sccache is deliberately absent: every disk-cache read and write happens inside the
@@ -624,9 +719,6 @@ pub fn seatbelt_profile(
             &caches.join(suffix),
         )?;
     }
-    let bun_cache = host_bun_install_cache(&config.home);
-    push_subpath_rule(&mut profile, "allow file-read*", &bun_cache)?;
-    push_readable_ancestors(&mut profile, &bun_cache)?;
     push_subpath_rule(&mut profile, "allow file-read*", &config.workspace_mount)?;
     if config.mode == RunSandboxMode::ReadWrite {
         push_subpath_rule(&mut profile, "allow file-write*", &config.workspace_mount)?;
@@ -904,7 +996,7 @@ mod tests {
             allowed_unix_sockets: vec![PathBuf::from("/var/run/nix/daemon-socket/socket")],
             additional_denies: vec![],
             git_worktree_repository: None,
-            shared_cargo_home: None,
+            shared_tool_homes: Vec::new(),
         }
     }
 
@@ -1187,18 +1279,19 @@ mod tests {
     #[test]
     fn a_shared_cargo_home_grants_its_caches_and_state_files_only() {
         let mut config = config(RunSandboxMode::ReadWrite);
-        config.shared_cargo_home = Some(PathBuf::from("/Users/tester/.cargo"));
+        config.shared_tool_homes = vec![&CARGO];
         let profile = seatbelt_profile(&config, SandboxProfileRole::ExecutedChild).unwrap();
 
-        for directory in SHARED_CARGO_CACHE_DIRECTORIES {
-            let path = shared_cargo_cache_directory(Path::new(CACHES_ROOT), directory);
+        for directory in ["registry", "git"] {
             assert!(
                 profile.contains(&format!(
-                    "(allow file-read* file-write* (subpath \"{}\"))",
-                    path.display()
+                    "(allow file-read* file-write* (subpath \"/private/cowshed/caches/cargo/{directory}\"))"
                 )),
                 "{directory} is not shared read-write"
             );
+            assert!(profile.contains(&format!(
+                "(allow file-read* (literal \"/Users/tester/.cargo/{directory}\"))"
+            )));
         }
         assert!(profile.contains("(allow file-read* (literal \"/Users/tester/.cargo\"))"));
         for file in CARGO_HOME_STATE_FILES {
@@ -1242,56 +1335,182 @@ mod tests {
         );
     }
 
+    fn scratch_home(label: &str) -> (PathBuf, PathBuf, PathBuf) {
+        let root = std::env::temp_dir().join(format!(
+            "cowshed-shared-{label}-{}-{}",
+            std::process::id(),
+            NEXT_SANDBOX_DIR.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let home = root.join("home");
+        let caches = root.join("caches");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&caches).unwrap();
+        (root, home, caches)
+    }
+
+    /// What a child of a sandbox built for this host gets for every shared tool variable.
+    fn exported(
+        home: &Path,
+        caches: &Path,
+    ) -> std::collections::BTreeMap<&'static str, Option<PathBuf>> {
+        let mut config = config(RunSandboxMode::ReadWrite);
+        config.home = home.to_path_buf();
+        config.shared_tool_homes = shared_tool_homes(home, caches);
+        config.shared_tool_environment().collect()
+    }
+
     /// Only a `$CARGO_HOME` whose `registry` and `git` both resolve to the shared caches is shared.
     #[test]
     fn the_host_cargo_home_is_shared_only_when_both_caches_resolve_to_the_shared_ones() {
-        let root =
-            std::env::temp_dir().join(format!("cowshed-shared-cargo-home-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        let home = root.join("home");
-        let caches = root.join("caches");
-        let cargo_home = host_cargo_home(&home);
-        std::fs::create_dir_all(&cargo_home).unwrap();
-        for directory in SHARED_CARGO_CACHE_DIRECTORIES {
-            std::fs::create_dir_all(shared_cargo_cache_directory(&caches, directory)).unwrap();
+        let (root, home, caches) = scratch_home("cargo");
+        let cargo_home = home.join(".cargo");
+        fs::create_dir_all(&cargo_home).unwrap();
+        for directory in ["registry", "git"] {
+            fs::create_dir_all(caches.join("cargo").join(directory)).unwrap();
         }
 
         // An unrelocated host: real directories are private caches, not the shared ones.
-        std::fs::create_dir_all(cargo_home.join("registry")).unwrap();
-        std::os::unix::fs::symlink(
-            shared_cargo_cache_directory(&caches, "git"),
-            cargo_home.join("git"),
-        )
-        .unwrap();
-        assert_eq!(shared_host_cargo_home(&home, &caches), None);
+        fs::create_dir_all(cargo_home.join("registry")).unwrap();
+        std::os::unix::fs::symlink(caches.join("cargo/git"), cargo_home.join("git")).unwrap();
+        assert_eq!(exported(&home, &caches).get("CARGO_HOME"), Some(&None));
 
         // A link that resolves anywhere else is not sharing either.
-        std::fs::remove_dir(cargo_home.join("registry")).unwrap();
+        fs::remove_dir(cargo_home.join("registry")).unwrap();
         std::os::unix::fs::symlink(root.join("elsewhere"), cargo_home.join("registry")).unwrap();
-        assert_eq!(shared_host_cargo_home(&home, &caches), None);
+        assert_eq!(exported(&home, &caches).get("CARGO_HOME"), Some(&None));
 
-        std::fs::remove_file(cargo_home.join("registry")).unwrap();
-        std::os::unix::fs::symlink(
-            shared_cargo_cache_directory(&caches, "registry"),
-            cargo_home.join("registry"),
-        )
-        .unwrap();
-        assert_eq!(shared_host_cargo_home(&home, &caches), Some(cargo_home));
+        fs::remove_file(cargo_home.join("registry")).unwrap();
+        std::os::unix::fs::symlink(caches.join("cargo/registry"), cargo_home.join("registry"))
+            .unwrap();
+        assert_eq!(
+            exported(&home, &caches).get("CARGO_HOME"),
+            Some(&Some(cargo_home))
+        );
 
-        std::fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(root).unwrap();
     }
 
-    /// Bun's isolated linker symlinks `node_modules/.bun/<pkg>` into the host install cache, so a
-    /// cloned `node_modules` resolves into `~/.bun/install/cache`; the grant is read-only and no
-    /// wider than the cache (`~/.bun/bin` stays as it was).
+    /// A child is pointed at Bun's and uv's host cache paths only once each path is the link into
+    /// the caches volume; before, each tool keeps its private default. Each tool is decided on its
+    /// own links.
     #[test]
-    fn host_bun_install_cache_is_readable_download_cache_only() {
-        let config = config(RunSandboxMode::ReadWrite);
+    fn bun_and_uv_are_exported_only_once_their_host_caches_are_the_shared_ones() {
+        let (root, home, caches) = scratch_home("bun-uv");
+        fs::create_dir_all(caches.join("bun/install/cache")).unwrap();
+        fs::create_dir_all(caches.join("uv")).unwrap();
+
+        // An unrelocated host: Bun's cache is a real host directory, uv has none yet.
+        fs::create_dir_all(home.join(".bun/install/cache")).unwrap();
+        let unshared = exported(&home, &caches);
+        assert_eq!(unshared.get("BUN_INSTALL_CACHE_DIR"), Some(&None));
+        assert_eq!(unshared.get("UV_CACHE_DIR"), Some(&None));
+
+        fs::remove_dir(home.join(".bun/install/cache")).unwrap();
+        std::os::unix::fs::symlink(
+            caches.join("bun/install/cache"),
+            home.join(".bun/install/cache"),
+        )
+        .unwrap();
+        let bun_only = exported(&home, &caches);
         assert_eq!(
-            host_bun_install_cache(&config.home),
-            PathBuf::from("/Users/tester/.bun/install/cache")
+            bun_only.get("BUN_INSTALL_CACHE_DIR"),
+            Some(&Some(home.join(".bun/install/cache")))
         );
+        assert_eq!(bun_only.get("UV_CACHE_DIR"), Some(&None));
+
+        fs::create_dir_all(home.join(".cache")).unwrap();
+        std::os::unix::fs::symlink(caches.join("uv"), home.join(".cache/uv")).unwrap();
+        let both = exported(&home, &caches);
+        assert_eq!(
+            both.get("UV_CACHE_DIR"),
+            Some(&Some(home.join(".cache/uv")))
+        );
+        // Each tool is decided on its own links: cargo's are not relocated here.
+        assert_eq!(both.get("CARGO_HOME"), Some(&None));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A shared cache that is the whole host path grants the link and its ancestors as literals:
+    /// the child resolves through them into the shared directory, and nothing else in the host
+    /// tool home — `~/.bun/bin`, the rest of `~/.cache` — is granted. The secret denies still
+    /// follow every one of those grants.
+    #[test]
+    fn a_shared_cache_home_grants_its_link_and_ancestors_and_nothing_else() {
+        let mut config = config(RunSandboxMode::ReadWrite);
+        config.shared_tool_homes = SHARED_TOOL_HOMES.to_vec();
         let profile = seatbelt_profile(&config, SandboxProfileRole::ExecutedChild).unwrap();
+        let secret = profile
+            .find("(deny file-read* file-write* (literal \"/Users/tester/.ssh\")")
+            .expect("secret deny");
+        for link in [
+            "/Users/tester/.bun/install/cache",
+            "/Users/tester/.cache/uv",
+        ] {
+            for ancestor in Path::new(link).ancestors() {
+                let grant = format!("(allow file-read* (literal \"{}\"))", ancestor.display());
+                let last = profile
+                    .rfind(&grant)
+                    .unwrap_or_else(|| panic!("{} is not readable", ancestor.display()));
+                assert!(last < secret, "the secret denies must follow {grant}");
+            }
+            assert!(
+                !profile.contains(&format!("(subpath \"{link}\")")),
+                "{link} is a link; nothing is granted under its own spelling"
+            );
+        }
+        for home in ["/Users/tester/.bun", "/Users/tester/.cache"] {
+            assert!(!profile.contains(&format!("(subpath \"{home}\")")));
+        }
+    }
+
+    /// Every shared cache directory on the caches volume is sandbox-writable, whether the host
+    /// reaches it through a relocated link or a tool's own configuration; the sccache store stays
+    /// daemon-write-only.
+    #[test]
+    fn every_shared_cache_directory_is_writable_and_the_sccache_store_is_not() {
+        let profile = seatbelt_profile(
+            &config(RunSandboxMode::ReadWrite),
+            SandboxProfileRole::ExecutedChild,
+        )
+        .unwrap();
+        for directory in [
+            "cargo/registry",
+            "cargo/git",
+            "bun/install/cache",
+            "uv",
+            "ttsc",
+            "go/mod",
+            "go/build",
+            "zig",
+            "gradle/caches",
+            "nix/cache",
+            "nix/state",
+        ] {
+            assert!(
+                profile.contains(&format!(
+                    "(allow file-read* file-write* (subpath \"/private/cowshed/caches/{directory}\"))"
+                )),
+                "{directory} is not sandbox-writable"
+            );
+        }
+        assert!(!profile.contains(
+            "(allow file-read* file-write* (subpath \"/private/cowshed/caches/sccache\"))"
+        ));
+    }
+
+    /// Until the host's Bun cache is relocated, main's `node_modules` links into the host
+    /// directory itself, and a clone carries the same links: the cache stays readable, no wider
+    /// than the cache (`~/.bun/bin` stays as it was). An unshared uv cache is private and grants
+    /// nothing on the host.
+    #[test]
+    fn an_unshared_bun_cache_stays_readable_for_the_links_checkouts_hold() {
+        let profile = seatbelt_profile(
+            &config(RunSandboxMode::ReadWrite),
+            SandboxProfileRole::ExecutedChild,
+        )
+        .unwrap();
         assert!(
             profile.contains("(allow file-read* (subpath \"/Users/tester/.bun/install/cache\"))")
         );
@@ -1301,6 +1520,7 @@ mod tests {
         assert!(profile.contains("(allow file-read* (literal \"/Users/tester/.bun\"))"));
         assert!(profile.contains("(allow file-read* (literal \"/Users/tester/.bun/install\"))"));
         assert!(!profile.contains("(allow file-read* (subpath \"/Users/tester/.bun\"))"));
+        assert!(!profile.contains("\"/Users/tester/.cache"));
     }
 
     #[test]

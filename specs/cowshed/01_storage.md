@@ -458,6 +458,6 @@ the workspaces.
 
 **Images on the caches volume rejected.** Co-locating images with caches unlocks no additional sharing: container
 volumes already pool free space, and the reflink boundary that matters is the image's _inner_ filesystem — clonefile
-cannot cross it regardless of where the image file sits (the same wall that keeps bun's cache in-image, 03_caches.md).
-The only same-volume relationship images need is with each other. Merging would also destroy the caches volume's
-defining property — that deleting it is always safe.
+cannot cross it regardless of where the image file sits (the wall 03_caches.md's reflink-reachability rule names). The
+only same-volume relationship images need is with each other. Merging would also destroy the caches volume's defining
+property — that deleting it is always safe.

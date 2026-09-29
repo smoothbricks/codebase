@@ -2,41 +2,30 @@
 //! "Host-level relocation").
 //!
 //! Every sandbox shares these caches through the caches volume; relocating the host's copies makes
-//! the host one more sharer instead of a separate island. For cargo it is more than disk: a
-//! sandbox builds against the host's literal `$CARGO_HOME` only once both of its caches are the
-//! shared ones ([`crate::sandbox::shared_host_cargo_home`]), and that literal path is what keeps a
-//! clone's copied `target/` fresh.
+//! the host one more sharer instead of a separate island. For the shared tool homes it is more
+//! than disk: a sandbox uses the host's literal tool path only once every one of the tool's caches
+//! is the shared one ([`crate::sandbox::shared_tool_homes`]), and that literal path is what keeps
+//! a clone's copied `target/` fresh and its `node_modules` links resolving.
 
 use std::fs;
 use std::io;
 use std::os::unix::io::AsRawFd;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 
-use crate::sandbox::{
-    CARGO_HOME_STATE_FILES, RELOCATED_TOOL_CACHES, SHARED_CARGO_CACHE_DIRECTORIES, host_cargo_home,
-    shared_cargo_cache_directory,
-};
+use crate::sandbox::{CARGO_HOME_STATE_FILES, HostCache, RELOCATED_TOOL_CACHES, SHARED_TOOL_HOMES};
 
-/// One host cache and the shared directory it belongs in.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct HostCache {
-    pub host: PathBuf,
-    pub shared: PathBuf,
-}
-
-/// Every host cache setup relocates: cargo's two, then the other tools'.
+/// Every host cache setup relocates: the shared tool homes' links, then the other tools'.
 pub fn host_caches(home: &Path, caches: &Path) -> impl Iterator<Item = HostCache> {
-    let cargo_home = host_cargo_home(home);
-    let cargo = SHARED_CARGO_CACHE_DIRECTORIES.map(|directory| HostCache {
-        host: cargo_home.join(directory),
-        shared: shared_cargo_cache_directory(caches, directory),
-    });
-    let tools = RELOCATED_TOOL_CACHES.map(|(host, shared)| HostCache {
+    let tools = SHARED_TOOL_HOMES
+        .into_iter()
+        .flat_map(|tool| tool.links(home, caches))
+        .collect::<Vec<_>>();
+    let relocated = RELOCATED_TOOL_CACHES.map(|(host, shared)| HostCache {
         host: home.join(host),
         shared: caches.join(shared),
     });
-    cargo.into_iter().chain(tools)
+    tools.into_iter().chain(relocated)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -58,11 +47,7 @@ pub fn inspect(cache: &HostCache) -> HostCacheState {
         Err(error) => return HostCacheState::Conflict(format!("cannot inspect it: {error}")),
     };
     if metadata.file_type().is_symlink() {
-        if let (Ok(host), Ok(shared)) = (
-            fs::canonicalize(&cache.host),
-            fs::canonicalize(&cache.shared),
-        ) && host == shared
-        {
+        if cache.is_shared() {
             return HostCacheState::Shared;
         }
         return HostCacheState::Conflict(match fs::read_link(&cache.host) {
@@ -165,20 +150,36 @@ fn move_directory(from: &Path, to: &Path) -> io::Result<()> {
         Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error),
         _ => {}
     }
-    // `cp -a` keeps symlinks as links, modes and times: cargo's and nix's caches are content
-    // and metadata both, and a copy that followed links or reset mtimes would not be the same
-    // cache.
-    let status = Command::new("/bin/cp")
-        .arg("-a")
-        .arg(from)
-        .arg(&staging)
-        .status()?;
-    if !status.success() {
+    if let Err(error) = copy_tree(from, &staging) {
         let _ = fs::remove_dir_all(&staging);
-        return Err(io::Error::other(format!("cp -a exited with {status}")));
+        return Err(error);
     }
     fs::rename(&staging, to)?;
     fs::remove_dir_all(from)
+}
+
+/// The copy that preserves a cache: symlinks stay links, modes and times survive, and so do hard
+/// links. Cargo's and nix's caches are content and metadata both, and cargo's git checkouts share
+/// inodes with its databases; a copy that followed links, reset times or split hard links would
+/// not be the same cache. macOS `cp -a` splits hard links and `ditto` keeps them; GNU `cp -a`
+/// keeps them too.
+#[cfg(target_os = "macos")]
+const COPY_TREE: (&str, &[&str]) = ("/usr/bin/ditto", &[]);
+#[cfg(not(target_os = "macos"))]
+const COPY_TREE: (&str, &[&str]) = ("/bin/cp", &["-a"]);
+
+/// Copy the tree at `from` to a new directory `to` with [`COPY_TREE`].
+fn copy_tree(from: &Path, to: &Path) -> io::Result<()> {
+    let (program, options) = COPY_TREE;
+    let status = Command::new(program)
+        .args(options)
+        .arg(from)
+        .arg(to)
+        .status()?;
+    if !status.success() {
+        return Err(io::Error::other(format!("{program} exited with {status}")));
+    }
+    Ok(())
 }
 
 /// Cargo's own package-cache locks, held exclusively while its caches move.
@@ -215,6 +216,8 @@ pub fn try_lock_cargo_caches(cargo_home: &Path) -> io::Result<Option<CargoCacheL
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sandbox::shared_tool_homes;
+    use std::path::PathBuf;
 
     fn scratch(name: &str) -> PathBuf {
         let root =
@@ -229,6 +232,64 @@ mod tests {
             host: root.join("home/.cargo/registry"),
             shared: root.join("caches/cargo/registry"),
         }
+    }
+
+    /// One setup run relocates every shared tool's caches, after which every sandbox is pointed
+    /// at every tool's host path; a populated cache arrives on the caches volume intact.
+    #[test]
+    fn relocating_every_host_cache_shares_every_tool_home() {
+        let root = scratch("every");
+        let home = root.join("home");
+        let caches = root.join("caches");
+        let package = home.join(".bun/install/cache/links/widget@1.0.0");
+        fs::create_dir_all(&package).unwrap();
+        fs::write(package.join("package.json"), b"{}").unwrap();
+
+        for cache in host_caches(&home, &caches) {
+            let relocation = relocate(cache);
+            assert!(relocation.outcome.is_ok(), "{relocation:?}");
+        }
+        let shared: Vec<&str> = shared_tool_homes(&home, &caches)
+            .into_iter()
+            .map(|tool| tool.variable)
+            .collect();
+        assert_eq!(
+            shared,
+            ["CARGO_HOME", "BUN_INSTALL_CACHE_DIR", "UV_CACHE_DIR"]
+        );
+        assert_eq!(
+            fs::read(caches.join("bun/install/cache/links/widget@1.0.0/package.json")).unwrap(),
+            b"{}"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The relocation copy is the same cache, hard links included: Cargo's git checkouts share
+    /// inodes with its databases, and a copy that splits them grows the cache (measured on a
+    /// cargo git cache: 8.5G before a link-splitting copy, 21G after).
+    #[test]
+    #[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
+    fn host_controller_the_relocation_copy_keeps_hard_links() {
+        use std::os::unix::fs::MetadataExt;
+
+        let root = scratch("hard-links");
+        let from = root.join("cache");
+        fs::create_dir_all(from.join("db")).unwrap();
+        fs::create_dir_all(from.join("checkouts")).unwrap();
+        fs::write(from.join("db/object"), b"bytes").unwrap();
+        fs::hard_link(from.join("db/object"), from.join("checkouts/object")).unwrap();
+
+        let to = root.join("copy");
+        copy_tree(&from, &to).unwrap();
+        let original = fs::metadata(to.join("db/object")).unwrap();
+        let alias = fs::metadata(to.join("checkouts/object")).unwrap();
+        assert_eq!(
+            (original.ino(), original.nlink()),
+            (alias.ino(), 2),
+            "the copy split one file into two"
+        );
+        assert_eq!(fs::read(to.join("checkouts/object")).unwrap(), b"bytes");
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

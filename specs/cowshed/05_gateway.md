@@ -245,7 +245,7 @@ Two distinct situations, not to be conflated:
 
 - **Gateway absent** (daemon not running): there is no local process to serve anything — registry requests fail until it
   starts. `cowshed ensure` warns and `cowshed doctor` exits 5 with the kickstart command in the `next:` hint. Builds
-  that need no new packages still work: the in-image bun cache covers locked, previously-installed dependencies.
+  that need no new packages still work: the shared bun cache covers locked, previously-installed dependencies.
 - **Gateway up, upstream offline**: mirror cache hits are served without upstream — anything previously seen installs on
   a plane. Misses fail fast with a `cowshed:` note distinguishing "offline" from "denied" so agents don't request grants
   to fix a network outage.

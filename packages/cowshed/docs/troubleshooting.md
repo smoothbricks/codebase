@@ -146,15 +146,18 @@ free space with everything else.
 Cargo's shared writable caches are `/private/cowshed/caches/cargo/{registry,git}`; gateway-owned bare repository mirrors
 are separate at `/private/cowshed/caches/repo-mirrors` and must remain sandbox-read-only.
 
-**A workspace rebuilds every dependency its copied `target/` already holds, or refetches a crate the host has.** Cargo
-fingerprints a registry or git dependency by the absolute path of its source under `$CARGO_HOME`, so every checkout must
-build against one literal `$CARGO_HOME`. A sandbox uses the host's own `~/.cargo` only once `~/.cargo/registry` and
-`~/.cargo/git` both link to `/private/cowshed/caches/cargo/{registry,git}`; until then it keeps a private `$CARGO_HOME`
-in its own HOME, starts with empty caches, and dirties every dependency. `cowshed doctor` reports each unshared cache as
-`host-cache-unshared`; `cowshed setup --imperative-host-setup` moves the host's caches onto the caches volume and links
-them back. It holds cargo's own package-cache locks while cargo's caches move and refuses while a cargo process holds
-one, so run it once builds are idle. A host cache and a shared directory that both already hold a cache are a conflict
-it leaves untouched: keep one, delete the other, and rerun.
+**A workspace rebuilds every dependency its copied `target/` already holds, refetches a crate the host has, or its
+`bun install` relinks all of `node_modules`.** Cargo fingerprints a registry or git dependency by the absolute path of
+its source under `$CARGO_HOME`, and Bun's isolated linker writes its cache path into every `node_modules/.bun` link, so
+every checkout must use one literal path for each. A sandbox uses the host's own `~/.cargo` only once
+`~/.cargo/registry` and `~/.cargo/git` both link to `/private/cowshed/caches/cargo/{registry,git}`, the host's
+`~/.bun/install/cache` only once it links to `/private/cowshed/caches/bun/install/cache`, and the host's `~/.cache/uv`
+only once it links to `/private/cowshed/caches/uv`; until then that tool keeps a private cache in the sandbox's own
+HOME. `cowshed doctor` reports each unshared cache as `host-cache-unshared`; `cowshed setup --imperative-host-setup`
+moves the host's caches onto the caches volume and links them back. It holds cargo's own package-cache locks while
+cargo's caches move and refuses while a cargo process holds one; Bun and uv have no such lock, so run it once builds and
+installs are idle. A host cache and a shared directory that both already hold a cache are a conflict it leaves
+untouched: keep one, delete the other, and rerun.
 
 **Nix cache/state points at the host filesystem.** On declarative hosts the module must own
 `~/.cache/nix → /private/cowshed/caches/nix/cache` and `~/.local/state/nix → /private/cowshed/caches/nix/state`; `setup`

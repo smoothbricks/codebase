@@ -3338,9 +3338,10 @@ fn sccache_finding(status: &SccacheStatus) -> Finding {
 
 /// Every host cache that does not resolve to its shared directory on the caches volume.
 ///
-/// Cargo's two decide more than disk: until both are shared, a sandbox keeps a private
-/// `$CARGO_HOME`, and cargo, which fingerprints dependencies by their absolute source path, then
-/// rebuilds every dependency a clone's copied `target/` already holds.
+/// A shared tool home's caches decide more than disk: until all of a tool's are shared, a
+/// sandbox keeps the tool's private default, where cargo rebuilds every dependency a clone's
+/// copied `target/` already holds (it fingerprints dependencies by their absolute source path)
+/// and a sandboxed `bun install` relinks `node_modules` into a cache no other checkout has.
 fn host_cache_findings(home: &Path) -> Vec<Finding> {
     host_caches::host_caches(home, Path::new(CACHES_ROOT))
         .filter_map(|cache| {

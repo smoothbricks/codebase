@@ -653,7 +653,7 @@ mod tests {
             allowed_unix_sockets: Vec::new(),
             additional_denies: Vec::new(),
             git_worktree_repository: None,
-            shared_cargo_home: None,
+            shared_tool_homes: Vec::new(),
         }
     }
 

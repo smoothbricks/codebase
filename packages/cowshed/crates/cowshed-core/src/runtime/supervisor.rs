@@ -1,7 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::ffi::OsString;
+use std::ffi::{CStr, OsStr, OsString};
 use std::fs;
 use std::io;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -138,7 +139,7 @@ impl Default for WorkspaceSupervisorConfig {
                 additional_denies: Vec::new(),
                 shed_links: Vec::new(),
                 git_worktree_repository: None,
-                shared_cargo_home: None,
+                shared_tool_homes: Vec::new(),
             },
             artifacts: ArtifactConfig::default(),
             term_grace: Duration::from_secs(2),
@@ -833,40 +834,67 @@ fn gateway_proxy_url(port_base: &str, workspace_token: &WorkspaceToken) -> Strin
     )
 }
 
-/// The shared nix client cache every sandbox reads and writes: `/private/cowshed/caches/nix/cache`.
+/// The private XDG roots under which Nix keeps client state, each named the same as its shared
+/// directory under `<caches>/nix`: `<root>/<name>/nix` links to `<caches>/nix/<name>`.
 ///
 /// Nix keeps its fetcher cache (URL and lock-hash to store path), tarball cache, git cache and
-/// evaluation cache under `$XDG_CACHE_HOME/nix`. cowshed hands every child a private
-/// `XDG_CACHE_HOME`, so a freshly minted workspace starts with an EMPTY nix cache and the sandboxed
-/// `devenv print-dev-env` evaluation re-fetches every flake input the lock names — through the
-/// gateway proxy, which admits nothing without an egress grant. The store paths already exist
-/// (the host fetched them), only the client-side index is missing. Sharing one cache directory on
-/// the caches volume, which the executed-child profile carves back read-write beside the cargo
-/// caches, lets every workspace see what any one of them has fetched; nix serialises access to
-/// its sqlite indexes itself.
-pub fn shared_nix_cache_directory() -> PathBuf {
-    Path::new(crate::storage::bootstrap::CACHES_ROOT).join("nix/cache")
-}
+/// evaluation cache under `$XDG_CACHE_HOME/nix`, and profile and channel state under
+/// `$XDG_STATE_HOME/nix`. cowshed hands every child private XDG roots, so a freshly minted
+/// workspace would start with an EMPTY nix cache and the sandboxed `devenv print-dev-env`
+/// evaluation would re-fetch every flake input the lock names — through the gateway proxy, which
+/// admits nothing without an egress grant. The store paths already exist (the host fetched them),
+/// only the client-side index is missing. Sharing one directory each on the caches volume, which
+/// the executed-child profile carves back read-write, lets every workspace see what any one of
+/// them has fetched; nix serialises access to its sqlite indexes itself.
+const NIX_CLIENT_DIRECTORIES: [&CStr; 2] = [c"cache", c"state"];
 
-/// Point the private `XDG_CACHE_HOME/nix` at [`shared_nix_cache_directory`].
+/// Create the private `home`, `config`, `data`, `run` and Nix client (`cache`, `state`) roots
+/// under `environment_root`, point each Nix client root's `nix` at its shared directory under
+/// `caches`, and create the [`crate::sandbox::DIRECT_TOOL_CACHES`] there: a child granted writes
+/// inside one of those cannot create its parent, and nothing on the host is relocated for them.
 ///
-/// A host without the shared resource gets no link and
-/// the private cache stands (a CI runner or a box before `cowshed setup` has no caches volume,
-/// and an environment that cannot be shared must not fail the spawn), a link that already
-/// resolves to the shared directory is kept, a stale link is replaced, and a real directory a
-/// workspace already owns is left alone.
-fn link_nix_cache(private_cache: &AnchoredDirectory) -> Result<()> {
-    let root = Path::new(crate::storage::bootstrap::CACHES_ROOT);
-    if !root.is_dir() {
-        return Ok(());
+/// A host without the caches root gets no links and the private directories stand (a CI runner
+/// or a box before `cowshed setup` has no caches volume, and an environment that cannot be
+/// shared must not fail the spawn), a link that already resolves to the shared directory is
+/// kept, a stale link is replaced, and a real directory a workspace already owns is left alone.
+///
+/// Returns the held environment directory, through which the host publishes the rest of the
+/// private environment.
+fn prepare_private_environment(
+    environment_root: &Path,
+    caches: &Path,
+) -> Result<AnchoredDirectory> {
+    // Keep directory capabilities through link preparation: a running child
+    // may rename these paths, but cannot redirect a host write through a link.
+    let environment =
+        AnchoredDirectory::create(environment_root).map_err(private_environment_error)?;
+    for name in [c"home", c"config", c"data", c"run"] {
+        environment.child(name).map_err(private_environment_error)?;
     }
-    AnchoredDirectory::create(root)
-        .and_then(|root| root.child(c"nix"))
-        .and_then(|nix| nix.child(c"cache"))
-        .map_err(private_environment_error)?;
-    private_cache
-        .ensure_symlink(c"nix", &shared_nix_cache_directory())
-        .map_err(private_environment_error)
+    let shared_nix = if caches.is_dir() {
+        for directory in crate::sandbox::DIRECT_TOOL_CACHES {
+            AnchoredDirectory::create(&caches.join(directory))
+                .map_err(private_environment_error)?;
+        }
+        Some(
+            AnchoredDirectory::create(caches)
+                .and_then(|caches| caches.child(c"nix"))
+                .map_err(private_environment_error)?,
+        )
+    } else {
+        None
+    };
+    for name in NIX_CLIENT_DIRECTORIES {
+        let private = environment.child(name).map_err(private_environment_error)?;
+        if let Some(shared_nix) = &shared_nix {
+            shared_nix.child(name).map_err(private_environment_error)?;
+            let target = caches.join("nix").join(OsStr::from_bytes(name.to_bytes()));
+            private
+                .ensure_symlink(c"nix", &target)
+                .map_err(private_environment_error)?;
+        }
+    }
+    Ok(environment)
 }
 
 fn private_environment_error(error: io::Error) -> CowshedError {
@@ -1001,17 +1029,12 @@ async fn sandboxed_command(
     let private_config = environment_root.join("config");
     let private_cache = environment_root.join("cache");
     let private_data = environment_root.join("data");
+    let private_state = environment_root.join("state");
     let private_runtime = sandbox_runtime_dir(sandbox);
-    // Keep directory capabilities through link preparation: a running child
-    // may rename these paths, but cannot redirect a host write through a link.
-    let environment =
-        AnchoredDirectory::create(environment_root).map_err(private_environment_error)?;
-    let cache_directory = environment
-        .child(c"cache")
-        .map_err(private_environment_error)?;
-    for name in [c"home", c"config", c"data", c"run"] {
-        environment.child(name).map_err(private_environment_error)?;
-    }
+    let environment = prepare_private_environment(
+        environment_root,
+        Path::new(crate::storage::bootstrap::CACHES_ROOT),
+    )?;
     // TMPDIR must exist even when read-write environment state lives elsewhere.
     if sandbox.mode == crate::sandbox::RunSandboxMode::ReadWrite {
         AnchoredDirectory::create(&sandbox.exec_temp_dir).map_err(private_environment_error)?;
@@ -1039,7 +1062,6 @@ async fn sandboxed_command(
             "reattach the workspace to mint fresh credentials",
         )
     })?;
-    link_nix_cache(&cache_directory)?;
     link_runtime_dir(sandbox, &private_runtime).await?;
     // Host-side preparation: adopted bindings are controller metadata, not child-readable
     // files. The Git directory probe runs under the narrower GitDiscovery child profile.
@@ -1070,6 +1092,7 @@ async fn sandboxed_command(
         .env("XDG_CONFIG_HOME", &private_config)
         .env("XDG_CACHE_HOME", &private_cache)
         .env("XDG_DATA_HOME", &private_data)
+        .env("XDG_STATE_HOME", &private_state)
         .env("DIRENV_CONFIG", private_config.join("direnv"))
         .env(
             "GIT_CONFIG_GLOBAL",
@@ -1107,14 +1130,16 @@ async fn sandboxed_command(
         .env("https_proxy", &gateway_http)
         .env("NO_PROXY", loopback_no_proxy)
         .env("no_proxy", loopback_no_proxy);
-    // Cargo fingerprints a registry or git dependency by the absolute path of its source under
-    // `$CARGO_HOME`, so the host and every workspace build against one literal path or a clone's
-    // copied `target/` rebuilds every dependency. A caller's own value would defeat that either
-    // way, so it never passes through: without shared caches cargo follows the private HOME.
-    match &sandbox.shared_cargo_home {
-        Some(cargo_home) => command.env("CARGO_HOME", cargo_home),
-        None => command.env_remove("CARGO_HOME"),
-    };
+    // The host and every workspace reach a shared tool home through one literal path (cargo
+    // fingerprints dependencies by it, Bun's isolated linker writes it into `node_modules`), so
+    // the variable names the host path once the tool's caches are shared, and never passes a
+    // caller's value through: without shared caches the tool follows the private HOME.
+    for (variable, host_path) in sandbox.shared_tool_environment() {
+        match host_path {
+            Some(host_path) => command.env(variable, host_path),
+            None => command.env_remove(variable),
+        };
+    }
     // Cargo only honors url.insteadOf through the Git CLI, so every child
     // fetches through it; uv shells out to Git and follows the same include
     // with no extra wiring. The include points at the managed file
@@ -3666,7 +3691,7 @@ mod workspace_toolchain_tests {
             additional_denies: Vec::new(),
             shed_links: Vec::new(),
             git_worktree_repository: None,
-            shared_cargo_home: None,
+            shared_tool_homes: Vec::new(),
         }
     }
 
@@ -4269,6 +4294,50 @@ mod sandbox_environment_tests {
             gateway_proxy_url("40960", &token),
             format!("http://cowshed:{encoded}@127.0.0.1:40960")
         );
+    }
+
+    /// Nix keeps profile and channel state under `$XDG_STATE_HOME/nix` as it keeps its fetcher
+    /// cache under `$XDG_CACHE_HOME/nix`. Both private roots link into the caches volume, so
+    /// every workspace sees the Nix client state any one of them wrote; a host without the caches
+    /// volume keeps plain private roots and fails nothing.
+    #[test]
+    fn the_private_nix_client_roots_link_to_the_shared_ones() {
+        let root = scratch("private-environment");
+        let environment = root.join("environment");
+        let caches = root.join("caches");
+        std::fs::create_dir_all(&caches).unwrap();
+        prepare_private_environment(&environment, &caches).unwrap();
+        for name in ["cache", "state"] {
+            assert_eq!(
+                std::fs::read_link(environment.join(name).join("nix")).ok(),
+                Some(caches.join("nix").join(name)),
+                "{name}/nix"
+            );
+            assert!(caches.join("nix").join(name).is_dir(), "{name}");
+        }
+
+        let bare = root.join("bare");
+        prepare_private_environment(&bare, &root.join("no-caches-volume")).unwrap();
+        for name in ["home", "config", "cache", "data", "state", "run"] {
+            assert!(bare.join(name).is_dir(), "{name}");
+        }
+        assert!(std::fs::symlink_metadata(bare.join("state/nix")).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Nothing on the host is relocated for the caches a tool's own configuration names (Go's
+    /// env file, `TTSC_CACHE_DIR`), and a child granted writes inside one cannot create its
+    /// parent: the directories exist before any child runs.
+    #[test]
+    fn directly_configured_caches_exist_before_a_child_runs() {
+        let root = scratch("direct-caches");
+        let caches = root.join("caches");
+        std::fs::create_dir_all(&caches).unwrap();
+        prepare_private_environment(&root.join("environment"), &caches).unwrap();
+        for directory in ["go/mod", "go/build", "ttsc"] {
+            assert!(caches.join(directory).is_dir(), "{directory}");
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     fn built(caller: &[(&str, &str)]) -> BTreeMap<String, String> {
