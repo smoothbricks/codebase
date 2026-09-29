@@ -114,15 +114,28 @@ require maintaining a second list of source roots. The command refuses missing d
 dependency cache instead of emitting a partial digest.
 
 Custom Cargo targets that replace inferred inputs need the in-workspace source closure too. Use
-`smoo-nx-cargo-hash --include-workspace [Cargo.toml]` to include every mutable local package from the same locked,
-offline Cargo metadata result. For a repository-root Cargo workspace:
+`smoo-nx-cargo-hash --include-workspace --closure <directory> [Cargo.toml]` to hash the locked, offline resolve closure
+of the local packages under `<directory>`: those packages and every mutable local package they reach through normal,
+build or dev dependencies, inside or outside the Nx workspace. An edit to a workspace member outside that closure leaves
+the digest unchanged. Nx does not substitute `{projectRoot}` into runtime inputs, so each project that owns custom Cargo
+targets declares its own `cargoSources` and names its directory. For a repository-root Cargo workspace, `nx.json`
+declares:
 
 ```json
 {
   "namedInputs": {
-    "externalRustCrates": [{ "runtime": "smoo-nx-cargo-hash" }],
+    "externalRustCrates": [{ "runtime": "smoo-nx-cargo-hash" }]
+  }
+}
+```
+
+and `packages/example/project.json` (or the `nx` key of its `package.json`) declares:
+
+```json
+{
+  "namedInputs": {
     "cargoSources": [
-      { "runtime": "smoo-nx-cargo-hash --include-workspace" },
+      { "runtime": "smoo-nx-cargo-hash --include-workspace --closure packages/example" },
       "{workspaceRoot}/Cargo.lock",
       "{workspaceRoot}/devenv.lock",
       "{workspaceRoot}/tooling/direnv/devenv.lock"
@@ -133,12 +146,20 @@ offline Cargo metadata result. For a repository-root Cargo workspace:
 
 Name `cargoSources` in each custom Cargo target's `inputs`, alongside its own scripts and non-Rust build inputs. Keep
 `externalRustCrates` for the plugin's external-source inference contract; unrelated TypeScript targets do not need
-`cargoSources`. For a package-root workspace, pass `--include-workspace packages/example/Cargo.toml` and name that
-workspace's `Cargo.lock`. An Nx `^production` input only follows existing project graph edges; it cannot replace a
-missing Cargo dependency closure.
+`cargoSources`. Without `--closure`, `--include-workspace` hashes every mutable local package in the Cargo workspace.
+For a package-root workspace, pass its manifest last and name that workspace's `Cargo.lock`. An Nx `^production` input
+only follows existing project graph edges; it cannot replace a missing Cargo dependency closure.
 
-The helper exposes the same choice as `hashCargoPathInputs(manifestPath, workspaceRoot, { includeWorkspace: true })`.
-Omitting the options, or setting `includeWorkspace: false`, retains the external-only behavior.
+Files git ignores beneath a package directory are not hashed, matching Nx's own file inputs. A generated source is its
+producer's output: the consuming target depends on the producer and hashes the source through
+`dependentTasksOutputFiles`, so a tree that has not generated it yet hashes like one that has. A package whose own
+directory git ignores, such as one installed under `node_modules`, keeps all of its sources, and a directory outside any
+Git repository ignores nothing.
+
+The helper exposes the same choices as
+`hashCargoPathInputs(manifestPath, workspaceRoot, { includeWorkspace: true, closure: 'packages/example' })`, resolving
+`closure` like `manifestPath`. Omitting the options, or setting `includeWorkspace: false`, retains the external-only
+behavior.
 
 Git and registry dependencies are identified by `Cargo.lock`; uncommitted changes in a Git repository are not changes to
 a pinned Git dependency. Local `path` dependencies stay live and their source edits change the digest. Build-script data

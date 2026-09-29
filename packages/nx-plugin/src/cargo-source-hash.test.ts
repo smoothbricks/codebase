@@ -95,7 +95,8 @@ async function workspaceCargoFixture(root: string) {
   const workspace = join(root, 'workspace');
   const manifest = join(workspace, 'Cargo.toml');
   const sources = {
-    'workspace/Cargo.toml': '[workspace]\nmembers=["packages/app","crates/bridge","crates/leaf"]\nresolver="2"\n',
+    'workspace/Cargo.toml':
+      '[workspace]\nmembers=["packages/app","crates/bridge","crates/leaf","crates/unrelated"]\nresolver="2"\n',
     'workspace/packages/app/Cargo.toml':
       '[package]\nname="app"\nversion="0.1.0"\nedition="2021"\n[dependencies]\nbridge={path="../../crates/bridge"}\n',
     'workspace/packages/app/src/main.rs': 'fn main() { println!("{}", bridge::answer()); }\n',
@@ -104,6 +105,8 @@ async function workspaceCargoFixture(root: string) {
     'workspace/crates/bridge/src/lib.rs': 'pub fn answer() -> u8 { leaf::answer() + external::answer() }\n',
     'workspace/crates/leaf/Cargo.toml': '[package]\nname="leaf"\nversion="0.1.0"\nedition="2021"\n',
     'workspace/crates/leaf/src/lib.rs': 'pub fn answer() -> u8 { 1 }\n',
+    'workspace/crates/unrelated/Cargo.toml': '[package]\nname="unrelated"\nversion="0.1.0"\nedition="2021"\n',
+    'workspace/crates/unrelated/src/lib.rs': 'pub fn unrelated() -> u8 { 3 }\n',
     'external/Cargo.toml': '[package]\nname="external"\nversion="0.1.0"\nedition="2021"\n[workspace]\n',
     'external/src/lib.rs': 'pub fn answer() -> u8 { 10 }\n',
   };
@@ -167,11 +170,21 @@ it('include-workspace CLI accepts an optional manifest and refuses unsupported a
     expect(changed.stdout).not.toBe(included.stdout);
     expect(await run(['--include-workspace'])).toEqual(changed);
 
+    const closure = await run(['--include-workspace', '--closure', 'crates/leaf', 'Cargo.toml']);
+    expect(closure.exitCode, closure.stderr).toBe(0);
+    expect(closure.stderr).toBe('');
+    expect(closure.stdout).not.toBe(changed.stdout);
+    expect(await run(['--closure', 'crates/leaf', '--include-workspace'])).toEqual(closure);
+
     for (const args of [
       ['--unknown'],
       ['--include-workspace', '--unknown'],
       ['Cargo.toml', '--include-workspace'],
       ['--include-workspace', 'Cargo.toml', 'extra'],
+      ['--include-workspace', '--include-workspace'],
+      ['--closure'],
+      ['--closure', '--include-workspace'],
+      ['--closure', 'crates/leaf', '--closure', 'packages/app'],
     ]) {
       const refused = await run(args);
       expect(refused.exitCode, refused.stderr).toBe(2);
@@ -179,6 +192,88 @@ it('include-workspace CLI accepts an optional manifest and refuses unsupported a
     }
   } finally {
     await rm(root, { recursive: true, force: true });
+  }
+});
+
+it('closure hashes the dependency closure of one directory and ignores unrelated workspace members', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'cargo-hash-closure-'));
+  try {
+    const { workspace, manifest, leafSource } = await workspaceCargoFixture(root);
+    const app = { includeWorkspace: true, closure: join(workspace, 'packages/app') };
+    const leaf = { includeWorkspace: true, closure: join(workspace, 'crates/leaf') };
+    const initial = await hashCargoPathInputs(manifest, workspace, app);
+    const leafOnly = await hashCargoPathInputs(manifest, workspace, leaf);
+    const whole = await hashCargoPathInputs(manifest, workspace, { includeWorkspace: true });
+
+    await writeFile(join(workspace, 'crates/unrelated/src/lib.rs'), 'pub fn unrelated() -> u8 { 4 }\n');
+    expect(await hashCargoPathInputs(manifest, workspace, app)).toBe(initial);
+    expect(await hashCargoPathInputs(manifest, workspace, { includeWorkspace: true })).not.toBe(whole);
+
+    await writeFile(join(workspace, 'crates/bridge/src/lib.rs'), 'pub fn answer() -> u8 { leaf::answer() }\n');
+    const bridgeChanged = await hashCargoPathInputs(manifest, workspace, app);
+    expect(bridgeChanged).not.toBe(initial);
+    expect(await hashCargoPathInputs(manifest, workspace, leaf)).toBe(leafOnly);
+
+    await writeFile(leafSource, 'pub fn answer() -> u8 { 2 }\n');
+    expect(await hashCargoPathInputs(manifest, workspace, app)).not.toBe(bridgeChanged);
+    expect(await hashCargoPathInputs(manifest, workspace, leaf)).not.toBe(leafOnly);
+
+    // The external package is reached through bridge, so the app closure sees it and the leaf closure does not.
+    const appBefore = await hashCargoPathInputs(manifest, workspace, app);
+    const leafBefore = await hashCargoPathInputs(manifest, workspace, leaf);
+    await writeFile(join(root, 'external/src/lib.rs'), 'pub fn answer() -> u8 { 20 }\n');
+    expect(await hashCargoPathInputs(manifest, workspace, app)).not.toBe(appBefore);
+    expect(await hashCargoPathInputs(manifest, workspace, leaf)).toBe(leafBefore);
+
+    await mkdir(join(workspace, 'docs'), { recursive: true });
+    await expect(
+      hashCargoPathInputs(manifest, workspace, { includeWorkspace: true, closure: join(workspace, 'docs') }),
+    ).rejects.toThrow('no local Cargo package lies under');
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+it('leaves gitignored sources beneath a package out of the digest but keeps an ignored package root', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'cargo-hash-ignored-'));
+  try {
+    const { workspace, manifest } = await workspaceCargoFixture(root);
+    execFileSync('git', ['init', '--quiet', workspace], { stdio: 'pipe' });
+    await writeFile(join(workspace, '.gitignore'), 'target/\ngenerated.rs\ncrates/leaf/\n');
+    const options = { includeWorkspace: true };
+    const initial = await hashCargoPathInputs(manifest, workspace, options);
+
+    // A source a producer generates later: a fresh tree and a built one hash alike.
+    await writeFile(join(workspace, 'crates/bridge/src/generated.rs'), 'pub const GENERATED: u8 = 1;\n');
+    expect(await hashCargoPathInputs(manifest, workspace, options)).toBe(initial);
+
+    // An untracked source nobody ignores is an edit like any other.
+    await writeFile(join(workspace, 'crates/bridge/src/extra.rs'), 'pub const EXTRA: u8 = 1;\n');
+    const untracked = await hashCargoPathInputs(manifest, workspace, options);
+    expect(untracked).not.toBe(initial);
+
+    // A package whose own directory is ignored still hashes its sources.
+    await writeFile(join(workspace, 'crates/leaf/src/lib.rs'), 'pub fn answer() -> u8 { 3 }\n');
+    expect(await hashCargoPathInputs(manifest, workspace, options)).not.toBe(untracked);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+it('hashes a Cargo workspace that lives inside a directory its enclosing repository ignores', async () => {
+  // A sandbox's TMPDIR, or a checkout under another repository's ignored scratch directory: every
+  // package sits beneath one ignored ancestor, where `git ls-files` refuses the pathspec outright.
+  const repository = await mkdtemp(join(tmpdir(), 'cargo-hash-enclosed-'));
+  try {
+    execFileSync('git', ['init', '--quiet', repository], { stdio: 'pipe' });
+    await writeFile(join(repository, '.gitignore'), 'scratch/\n');
+    const { workspace, manifest, leafSource } = await workspaceCargoFixture(join(repository, 'scratch/deep'));
+    const options = { includeWorkspace: true };
+    const initial = await hashCargoPathInputs(manifest, workspace, options);
+    await writeFile(leafSource, 'pub fn answer() -> u8 { 2 }\n');
+    expect(await hashCargoPathInputs(manifest, workspace, options)).not.toBe(initial);
+  } finally {
+    await rm(repository, { recursive: true, force: true });
   }
 });
 
