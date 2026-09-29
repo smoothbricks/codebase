@@ -399,19 +399,29 @@ mod tests {
 
     /// `nohup` hands its command SIGHUP ignored. Watching it anyway would let a closed terminal
     /// end a command, and the jobs it started, that the caller asked to outlive the terminal.
-    /// Nextest runs each test in its own process, so the disposition set here reaches no other.
+    /// SIGINT starts at its default action whatever this test process inherited, so the watched
+    /// case is exercised too, and SIGHUP is put back afterwards; the SIGINT and SIGTERM watches
+    /// stay installed, which only matters where tests share a process (nextest gives each its own).
     #[tokio::test]
     async fn a_signal_inherited_as_ignored_stays_ignored() {
-        // SAFETY: SIG_IGN installs no handler code; the call only changes this process's
-        // disposition for SIGHUP, which nothing else in this test process relies on.
-        let previous = unsafe { libc::signal(libc::SIGHUP, libc::SIG_IGN) };
-        assert_ne!(previous, libc::SIG_ERR, "set SIGHUP ignored");
+        // SAFETY: SIG_DFL and SIG_IGN install no handler code; the calls only change this
+        // process's dispositions for SIGINT and SIGHUP, and SIGHUP's is restored below.
+        let interrupt = unsafe { libc::signal(libc::SIGINT, libc::SIG_DFL) };
+        assert_ne!(interrupt, libc::SIG_ERR, "set SIGINT to its default");
+        // SAFETY: see above.
+        let hangup = unsafe { libc::signal(libc::SIGHUP, libc::SIG_IGN) };
+        assert_ne!(hangup, libc::SIG_ERR, "set SIGHUP ignored");
 
         let interrupts = Interrupts::install();
+        let hangup_still_ignored = inherited_as_ignored(libc::SIGHUP);
+        // SAFETY: restores the disposition this test found, a value `signal` itself returned.
+        let restored = unsafe { libc::signal(libc::SIGHUP, hangup) };
+        assert_ne!(restored, libc::SIG_ERR, "restore SIGHUP");
+
         assert!(interrupts.hangup.is_none(), "an ignored SIGHUP was watched");
         assert!(interrupts.interrupt.is_some(), "SIGINT was not watched");
         assert!(
-            inherited_as_ignored(libc::SIGHUP).expect("read SIGHUP disposition"),
+            hangup_still_ignored.expect("read SIGHUP disposition"),
             "installing the watch replaced the inherited SIG_IGN"
         );
     }
