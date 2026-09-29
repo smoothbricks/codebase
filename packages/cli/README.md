@@ -905,7 +905,7 @@ Upgrading from a smoo that did not record stages: follow
 - D1 migrations are auto-confirmed: the command captures wrangler's output, so wrangler sees a non-interactive session
   and answers its own "apply migrations?" prompt with yes. Point it only at a stage you mean to migrate.
 
-### `smoo wrangler cleanup-pr --pr <number>`
+### `smoo wrangler cleanup-pr --pr <number> [--dry-run] [--json]`
 
 Deletes a closed pull request's stage: exactly what this repository's `prN` deploys recorded in the account's
 `smoo-stage-records` bucket, and nothing else. It reads only its own repository's keys for that stage, so another
@@ -929,6 +929,15 @@ workspace; the repository is read from the root `package.json` the same way the 
   since a stage's Workers bind each other. A custom domain's own DNS record goes with the domain.
 - The records are deleted last. If a delete fails, the command stops with every record kept, and running it again
   finishes the stage.
+- `--dry-run` lists what cleanup would delete and deletes nothing: the same records, the same lookups and the same
+  refusals as the deleting run (including the invisible-zone refusal), resolved before anything would be written. With
+  `--json` it prints the inventory as JSON — the stage, the scope, how many records it read, every candidate by name and
+  id, how many recorded items are already gone, and what would be left in place; R2 buckets appear with their object
+  counts only, never their keys or contents. `--json` without `--dry-run` prints the deleting run's own result as JSON.
+  A stage with no records is reported as `recorded: 0` with the same warning the sentence carries: no records never
+  means the stage's items are gone. On a refusal or a failed delete — an unreadable repository manifest, an invisible
+  zone, a delete that stops partway — the command exits nonzero, prints the error to stderr, and prints no JSON at all;
+  `--json` reports only a successful run.
 - It prints one line, such as `Cleaned pr7 of github.com/acme/app from 23 records: deleted 3 Workers, ...`, or
   `Nothing is recorded for pr7 of github.com/acme/app, so nothing was deleted. ...` when the stage has no records. That
   is expected when the pull request deployed nothing or an earlier cleanup already removed its stage. A stage an older

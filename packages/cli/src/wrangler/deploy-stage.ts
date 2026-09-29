@@ -564,6 +564,33 @@ export interface CleanupResult {
   alreadyGone: number;
   /** Recorded items another owner now holds, by name; they were not deleted. */
   leftInPlace: string[];
+  /** Present exactly when `recorded` is 0: no records never says the stage's items are gone. */
+  warning?: string;
+}
+
+/** Each live item a cleanup would delete, named the way its API answers it; never an R2 object body. */
+export interface CleanupCandidates {
+  workers: string[];
+  domains: { id: string; hostname: string }[];
+  routes: { zoneId: string; id: string; pattern: string }[];
+  dnsRecords: { zoneId: string; id: string; name: string }[];
+  kvNamespaces: { id: string; title: string }[];
+  /** The bucket and how many objects it holds; the keys themselves are not listed. */
+  r2Buckets: { name: string; objectCount: number }[];
+  d1Databases: { uuid: string; name: string }[];
+}
+
+/** A read-only account of what `cleanupPullRequest` would delete, resolved without deleting anything. */
+export interface CleanupInventory {
+  stage: `pr${number}`;
+  scope: string;
+  /** How many record keys the stage had; 0 says nothing is recorded, never that a stage is gone. */
+  recorded: number;
+  candidates: CleanupCandidates;
+  alreadyGone: number;
+  leftInPlace: string[];
+  /** Present exactly when `recorded` is 0: no records never says the stage's items are gone. */
+  warning?: string;
 }
 
 /**
@@ -577,19 +604,11 @@ export async function cleanupPullRequest(
   prNumber: number,
   dependencies: WranglerCommandDependencies = {},
 ): Promise<CleanupResult> {
-  const stage = pullRequestStage(prNumber);
-  const processEnv = dependencies.processEnv ?? process.env;
-  const scope = stageRecordScope(root, processEnv);
-  const cloudflare =
-    dependencies.cloudflare ??
-    new CloudflareRestClient(
-      requiredEnvironmentValue(processEnv.CLOUDFLARE_ACCOUNT_ID, 'CLOUDFLARE_ACCOUNT_ID'),
-      requiredEnvironmentValue(processEnv.CLOUDFLARE_API_TOKEN, 'CLOUDFLARE_API_TOKEN'),
-    );
+  const { cloudflare, scope, stage, keys, targets } = await resolveStageCleanup(root, prNumber, dependencies);
   const result: CleanupResult = {
     stage,
     scope,
-    recorded: 0,
+    recorded: keys.length,
     deleted: {
       workers: 0,
       routes: 0,
@@ -600,17 +619,10 @@ export async function cleanupPullRequest(
       r2Objects: 0,
       d1Databases: 0,
     },
-    alreadyGone: 0,
-    leftInPlace: [],
+    alreadyGone: targets.alreadyGone,
+    leftInPlace: targets.leftInPlace,
+    ...(keys.length === 0 ? { warning: noRecordsWarning() } : {}),
   };
-  const { keys, records, buckets } = await readStageRecords(cloudflare, scope, stage);
-  result.recorded = keys.length;
-  if (keys.length === 0) return result;
-  const targets = await resolveCleanupTargets(cloudflare, records, buckets, (record) =>
-    stageRecordKey(scope, stage, record),
-  );
-  result.alreadyGone = targets.alreadyGone;
-  result.leftInPlace = targets.leftInPlace;
   try {
     await deleteCleanupTargets(cloudflare, targets, result.deleted);
   } catch (error) {
@@ -624,6 +636,95 @@ export async function cleanupPullRequest(
   return result;
 }
 
+/**
+ * The read-only inventory of a `prN` stage: the same records and target resolution `cleanupPullRequest`
+ * runs, deleting nothing. `recorded: 0` says the stage has no records — a pull request that deployed
+ * nothing, or one deployed before smoo recorded stages — never that its resources were confirmed gone.
+ */
+export async function inventoryPullRequest(
+  root: string,
+  prNumber: number,
+  dependencies: WranglerCommandDependencies = {},
+): Promise<CleanupInventory> {
+  const { scope, stage, keys, targets } = await resolveStageCleanup(root, prNumber, dependencies);
+  return {
+    stage,
+    scope,
+    recorded: keys.length,
+    candidates: cleanupCandidates(targets),
+    alreadyGone: targets.alreadyGone,
+    leftInPlace: targets.leftInPlace,
+    ...(keys.length === 0 ? { warning: noRecordsWarning() } : {}),
+  };
+}
+
+interface ResolvedStageCleanup {
+  cloudflare: CloudflareClient;
+  scope: string;
+  stage: `pr${number}`;
+  keys: string[];
+  targets: CleanupTargets;
+}
+
+/** Reads the stage's records and resolves every live item they name, before any delete; deletes nothing. */
+async function resolveStageCleanup(
+  root: string,
+  prNumber: number,
+  dependencies: WranglerCommandDependencies,
+): Promise<ResolvedStageCleanup> {
+  const stage = pullRequestStage(prNumber);
+  const processEnv = dependencies.processEnv ?? process.env;
+  const scope = stageRecordScope(root, processEnv);
+  const cloudflare =
+    dependencies.cloudflare ??
+    new CloudflareRestClient(
+      requiredEnvironmentValue(processEnv.CLOUDFLARE_ACCOUNT_ID, 'CLOUDFLARE_ACCOUNT_ID'),
+      requiredEnvironmentValue(processEnv.CLOUDFLARE_API_TOKEN, 'CLOUDFLARE_API_TOKEN'),
+    );
+  const { keys, records, buckets } = await readStageRecords(cloudflare, scope, stage);
+  const targets =
+    keys.length === 0
+      ? emptyCleanupTargets()
+      : await resolveCleanupTargets(cloudflare, records, buckets, (record) => stageRecordKey(scope, stage, record));
+  return { cloudflare, scope, stage, keys, targets };
+}
+
+/** The live items of `targets`, named the way each API answers them; no R2 object bodies, no secrets. */
+function cleanupCandidates(targets: CleanupTargets): CleanupCandidates {
+  return {
+    workers: targets.workers,
+    domains: targets.domains.map((domain) => ({ id: domain.id, hostname: domain.hostname })),
+    routes: targets.routes.map(({ zoneId, route }) => ({ zoneId, id: route.id, pattern: route.pattern })),
+    dnsRecords: targets.dnsRecords.map(({ zoneId, record }) => ({ zoneId, id: record.id, name: record.name })),
+    kvNamespaces: targets.kvNamespaces.map((namespace) => ({ id: namespace.id, title: namespace.title })),
+    r2Buckets: targets.r2Buckets.map((bucket) => ({ name: bucket.name, objectCount: bucket.keys.length })),
+    d1Databases: targets.d1Databases.map((database) => ({ uuid: database.uuid, name: database.name })),
+  };
+}
+
+function emptyCleanupTargets(): CleanupTargets {
+  return {
+    domains: [],
+    routes: [],
+    dnsRecords: [],
+    workers: [],
+    kvNamespaces: [],
+    r2Buckets: [],
+    d1Databases: [],
+    alreadyGone: 0,
+    leftInPlace: [],
+  };
+}
+
+/**
+ * Why zero records never means the stage's items are gone. The deleting line and the dry-run line
+ * (and the JSON inventory's `warning`) carry the same explanation, so no output claims a stage that
+ * an older smoo deployed, or one recorded under another repository, was cleaned.
+ */
+function noRecordsWarning(): string {
+  return 'That is expected when the pull request deployed nothing or an earlier cleanup finished its stage. A stage an older smoo deployed, or one deployed while the root package.json named another repository, has no records here and may still be live, so check for its items by hand and delete what is left.';
+}
+
 /** The one line `smoo wrangler cleanup-pr` prints. */
 export function describeCleanup(result: CleanupResult): string {
   const stage = `${result.stage} of ${result.scope}`;
@@ -632,24 +733,54 @@ export function describeCleanup(result: CleanupResult): string {
     // an older smoo's unrecorded deploy and a deploy recorded while the root package.json named another
     // repository. Exit 0 for each: cleanup cannot tell them apart, so the line claims none of them and
     // says which may have left the stage live.
-    return `Nothing is recorded for ${stage}, so nothing was deleted. That is expected when the pull request deployed nothing or an earlier cleanup finished its stage. A stage an older smoo deployed, or one deployed while the root package.json named another repository, has no records here and may still be live, so check for its items by hand and delete what is left.`;
+    return `Nothing is recorded for ${stage}, so nothing was deleted. ${noRecordsWarning()}`;
   }
   const { deleted } = result;
-  const counts = [
-    count(deleted.workers, 'Worker'),
-    count(deleted.domains, 'custom domain'),
-    count(deleted.routes, 'route'),
-    count(deleted.dnsRecords, 'DNS record'),
-    count(deleted.kvNamespaces, 'KV namespace'),
-    `${count(deleted.r2Buckets, 'R2 bucket')} (${count(deleted.r2Objects, 'object')})`,
-    count(deleted.d1Databases, 'D1 database'),
+  return `Cleaned ${stage} from ${count(result.recorded, 'record')}: deleted ${countsPhrase(deleted)}; ${gonePhrase(result.alreadyGone, 'was')}${leftPhrase(result.leftInPlace)}.`;
+}
+
+/** The one line `smoo wrangler cleanup-pr --dry-run` prints; the same shape as `describeCleanup`, deleting nothing. */
+export function describeInventory(inventory: CleanupInventory): string {
+  const stage = `${inventory.stage} of ${inventory.scope}`;
+  if (inventory.recorded === 0) {
+    return `Nothing is recorded for ${stage}, so cleanup-pr would delete nothing. ${noRecordsWarning()}`;
+  }
+  const { candidates } = inventory;
+  const counts = countsPhrase({
+    workers: candidates.workers.length,
+    domains: candidates.domains.length,
+    routes: candidates.routes.length,
+    dnsRecords: candidates.dnsRecords.length,
+    kvNamespaces: candidates.kvNamespaces.length,
+    r2Buckets: candidates.r2Buckets.length,
+    r2Objects: candidates.r2Buckets.reduce((total, bucket) => total + bucket.objectCount, 0),
+    d1Databases: candidates.d1Databases.length,
+  });
+  return `Dry run for ${stage} from ${count(inventory.recorded, 'record')}: would delete ${counts}; ${gonePhrase(inventory.alreadyGone, 'is')}${leftPhrase(inventory.leftInPlace)}. Nothing was deleted.`;
+}
+
+/** The seven-kind deletion counts, phrased once for both the deleting line and the dry-run line. */
+function countsPhrase(counts: CleanupCounts): string {
+  return [
+    count(counts.workers, 'Worker'),
+    count(counts.domains, 'custom domain'),
+    count(counts.routes, 'route'),
+    count(counts.dnsRecords, 'DNS record'),
+    count(counts.kvNamespaces, 'KV namespace'),
+    `${count(counts.r2Buckets, 'R2 bucket')} (${count(counts.r2Objects, 'object')})`,
+    count(counts.d1Databases, 'D1 database'),
   ].join(', ');
-  const gone =
-    result.alreadyGone === 1
-      ? '1 recorded item was already gone'
-      : `${result.alreadyGone} recorded items were already gone`;
-  const left = result.leftInPlace.length > 0 ? `; left in place: ${result.leftInPlace.join(', ')}` : '';
-  return `Cleaned ${stage} from ${count(result.recorded, 'record')}: deleted ${counts}; ${gone}${left}.`;
+}
+
+/** The already-gone clause; a dry run speaks in the present, the deleting run in the past. */
+function gonePhrase(amount: number, tense: 'is' | 'was'): string {
+  if (amount === 1) return `1 recorded item ${tense} already gone`;
+  return `${amount} recorded items ${tense === 'is' ? 'are' : 'were'} already gone`;
+}
+
+/** The left-in-place clause, or nothing when the stage's every recorded item is its own to delete. */
+function leftPhrase(items: string[]): string {
+  return items.length > 0 ? `; left in place: ${items.join(', ')}` : '';
 }
 
 function count(amount: number, noun: string): string {
@@ -705,17 +836,7 @@ async function resolveCleanupTargets(
   /** Another owner's name, or undefined when the stage (or nobody) holds the item. */
   const otherOwner = (owner: string | undefined) =>
     owner !== undefined && !stageWorkers.has(owner) ? owner : undefined;
-  const targets: CleanupTargets = {
-    domains: [],
-    routes: [],
-    dnsRecords: [],
-    workers: [],
-    kvNamespaces: [],
-    r2Buckets: [],
-    d1Databases: [],
-    alreadyGone: 0,
-    leftInPlace: [],
-  };
+  const targets: CleanupTargets = emptyCleanupTargets();
   /** Adds what was found, or counts it as already gone. */
   const found = <T>(list: T[], item: T | undefined) => {
     if (item === undefined) targets.alreadyGone += 1;
