@@ -257,6 +257,11 @@ pub trait RunningProcess: Send {
     fn try_write_stdin(&mut self, bytes: Bytes) -> Result<bool>;
     fn close_stdin(&mut self) -> Result<()>;
     fn signal_process_tree(&mut self, signal: ProcessSignal) -> Result<()>;
+    /// Collects the process's exit status if it has already exited, so a later signal to its group
+    /// reaches only the members still running. Only a supervisor that is going away asks: its own
+    /// wait for the process will never run, and an exited but unreaped leader is exactly what
+    /// makes Darwin refuse a group signal with EPERM instead of reporting the group gone.
+    fn reap_if_exited(&mut self) {}
 }
 
 #[async_trait]
@@ -1457,6 +1462,17 @@ impl RunningProcess for SystemRunningProcess {
             },
         )
     }
+
+    fn reap_if_exited(&mut self) {
+        let Ok(pid) = i32::try_from(self.pid) else {
+            return;
+        };
+        let mut status = 0;
+        // SAFETY: `WNOHANG` makes `waitpid` return at once, `status` is a valid out-pointer for
+        // the call, and `pid` is this process's own child. A still-running child answers 0 and an
+        // already-reaped one ECHILD; both leave nothing to collect, which is the point.
+        unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+    }
 }
 
 async fn run_system_stdin(
@@ -2029,9 +2045,10 @@ struct SupervisorActor {
 /// that stops its own children on SIGTERM (Nx's task runner stops task trees it keeps in their
 /// own sessions, beyond this group) gets to. Nothing runs after a drop, so the grace is waited out
 /// here, blocking, and only when a job was still running. A host that wants its jobs' cleanup to
-/// be asynchronous cancels them before it drops the runtime. A group that already exited has
-/// nothing left to signal; any other failure to signal is reported, because the job then outlives
-/// its supervisor.
+/// be asynchronous cancels them before it drops the runtime. Before each signal an exited leader
+/// is reaped, since its own wait will never run and Darwin refuses a group holding only unreaped
+/// members with EPERM; a group left with no member has nothing to signal. Any other failure to
+/// signal is reported, because the job then outlives its supervisor.
 impl Drop for SupervisorActor {
     fn drop(&mut self) {
         let grace = self.term_grace;
@@ -2045,10 +2062,12 @@ impl Drop for SupervisorActor {
             return;
         }
         for (id, process) in &mut running {
+            process.reap_if_exited();
             report_unsignalled(*id, process.signal_process_tree(ProcessSignal::Term));
         }
         std::thread::sleep(grace);
         for (id, process) in &mut running {
+            process.reap_if_exited();
             report_unsignalled(*id, process.signal_process_tree(ProcessSignal::Kill));
         }
     }
