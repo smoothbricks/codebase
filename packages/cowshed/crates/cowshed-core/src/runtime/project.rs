@@ -290,9 +290,9 @@ pub enum BindingRemoteValidation {
 /// the verb. Such a failure is reported, and the verb that names that workspace meets it.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RecoveryScope {
-    /// The resident controller and store-wide maintenance: every unfinished intent is replayed.
-    /// Only `main`'s is the opening's own; any other intent that fails to replay is reported and
-    /// stays journaled for a later pass.
+    /// Store-wide maintenance (`gc`): every unfinished intent is replayed. Only `main`'s is the
+    /// opening's own; any other intent that fails to replay is reported and stays journaled for
+    /// a later pass.
     Store,
     /// A verb naming these workspaces (none, for a verb that names none): only their intents and
     /// `main`'s are replayed, and each failure fails the verb. Every other intent stays journaled,
@@ -392,7 +392,7 @@ mod recovery_scope_tests {
         assert!(!scope.needs_supervisor(&name("other")));
     }
 
-    /// The resident controller finishes residue everywhere, but only `main`'s failure is its own.
+    /// `gc` finishes residue everywhere, but only `main`'s failure is its own.
     #[test]
     fn the_store_scope_replays_everything_and_owns_only_main() {
         assert_eq!(
@@ -449,8 +449,8 @@ impl ProjectRuntime {
         .await
     }
 
-    /// Opens for the identity-change verb alone, with [`RecoveryScope::Store`]: the verb rebinds
-    /// the whole project rather than one workspace.
+    /// Opens for the identity-change verb alone. The verb rebinds the project rather than any
+    /// session workspace, so it finishes only `main`'s unfinished lifecycle work.
     ///
     /// Only the parsed `cowshed mv … --repo-id` command may call this entrypoint: it relaxes the
     /// binding's remote check to [`BindingRemoteValidation::ForIdentityChange`] so the verb stays
@@ -462,16 +462,16 @@ impl ProjectRuntime {
             None,
             continuity_from_environment()?,
             BindingRemoteValidation::ForIdentityChange,
-            RecoveryScope::Store,
+            RecoveryScope::Workspaces(std::collections::BTreeSet::new()),
         )
         .await
     }
 
     /// Opens the resident controller with the host's own audit sink — the entrypoint a
     /// supervising runtime uses to route controller audit records into its durable log instead of
-    /// Arrow files. The controller serves every workspace, so it recovers with
-    /// [`RecoveryScope::Store`]: residue a crash left anywhere is finished, and residue that
-    /// cannot be finished stays journaled instead of keeping the controller down.
+    /// Arrow files. The controller starts with only `main`'s unfinished lifecycle work: residue
+    /// another workspace left is finished by `gc` or by the verb that names it, and never delays
+    /// or fails the controller that every other workspace is waiting on.
     pub async fn open_existing_with_audit(
         project_root: impl AsRef<Path>,
         continuity: crate::storage::audit::ContinuityAudit,
@@ -482,7 +482,7 @@ impl ProjectRuntime {
             None,
             continuity,
             BindingRemoteValidation::Strict,
-            RecoveryScope::Store,
+            RecoveryScope::Workspaces(std::collections::BTreeSet::new()),
         )
         .await
     }
@@ -2297,7 +2297,7 @@ impl NativeProjectRuntimeHost {
             lifecycle_intents,
             intent_leases: std::collections::BTreeMap::new(),
             binding_remote_validation: validation,
-            recovery_scope: RecoveryScope::Store,
+            recovery_scope: RecoveryScope::Workspaces(std::collections::BTreeSet::new()),
         })
     }
     /// Apply `change` to the journal on disk under its lock and adopt the result, which also
