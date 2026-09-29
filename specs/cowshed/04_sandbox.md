@@ -198,14 +198,15 @@ Notes:
   chosen remote URL. The binding records that remote and validates the identifier against it; multiple bound identities
   may exist but exactly one is primary. A local-only repository requires an explicit `repo_id`, and discovery may
   propose an identity but never silently mint one. For that identity cowshed computes the canonical-path union of (1)
-  built-in secret and control-plane denies, (2) operator denies from trusted
-  `/private/cowshed/store/<owner>/<repo>/policy.json`, and (3) additional denies declared by the repository.
-  Repository-controlled config may add denies but cannot remove, replace, mask, or carve back either earlier layer. The
-  trusted path is constructed as `/private/cowshed/store/<owner>/<repo>/policy.json`: `owner` and `repo` are separately
-  lowercased and validated as non-empty `[a-z0-9._-]+` segments; `.`, `..`, separators, percent-encoded separators, and
-  decoded aliases are rejected before any join. The policy is read by the controller, never through a
-  repository-relative path, and the resulting deny snapshot is recorded with the grant revision. Missing policy means no
-  operator-added entries; malformed or unreadable policy fails closed before supervisor launch.
+  built-in secret and control-plane denies and (2) additional denies declared by the repository. Repository-controlled
+  config may add denies but cannot remove, replace, mask, or carve back the built-in layer. The trusted project policy
+  `/private/cowshed/store/<owner>/<repo>/policy.json` carries no denies: it holds the project's checkpoint quotas and
+  its standing grants ([Project-standing grants](#project-standing-grants)). Its path is constructed as
+  `/private/cowshed/store/<owner>/<repo>/policy.json`: `owner` and `repo` are separately lowercased and validated as
+  non-empty `[a-z0-9._-]+` segments; `.`, `..`, separators, percent-encoded separators, and decoded aliases are rejected
+  before any join. The policy is read by the controller, never through a repository-relative path. Missing policy is the
+  empty policy; a malformed or unreadable one, or one with a field cowshed does not know, fails closed before supervisor
+  launch and serves no gateway session of the project.
 
 ## Grants
 
@@ -265,6 +266,41 @@ Controller-owned, host-readable while the image is detached, outside the workspa
   restore, never inherited by a fork, and omitted on Linux. Linux records no synthetic port alias; its per-workspace
   Unix gateway socket and private loopback namespace are runtime topology, not grant authority.
 
+### Project-standing grants
+
+A project's standing grants are the read paths and egress hosts every workspace of the project runs under — main, new
+workspaces, and forks — in addition to its own. They live in the trusted project policy, beside its checkpoint quotas:
+
+```json
+{
+  "checkpointQuotas": { "raven": { "maxCount": 4, "maxBytes": 10737418240 } },
+  "grants": {
+    "revision": 3,
+    "read": ["/Users/alice/Dev/acme/shared-fixtures"],
+    "egress": [{ "host": "index.crates.io" }, { "host": "github.com" }]
+  }
+}
+```
+
+- **Reads and egress only.** A standing write grant would hand every workspace, forks included, one shared writable tree
+  outside its image; a write grant stays a per-workspace decision.
+- **Composition.** A workspace's grant snapshot is its own grant file plus the standing grants: reads are the sorted
+  union, and egress is the workspace's rules plus every standing rule for a host the workspace does not name — a
+  workspace rule for the same host (its ports, mode, impersonation) is kept as written. Standing grants add; they never
+  subtract. A fork never copies another workspace's own grants, and holds the standing ones like every workspace does.
+- **Effective revision.** The standing grants carry their own `revision`, advanced by every effective change and never
+  reset. The revision a workspace's supervisor launches under, its jobs record, and its gateway session is installed at
+  is the workspace's own revision plus the project's: each only grows, so the sum grows whenever either does, and a
+  standing-grant change is picked up exactly as a workspace grant change is — at the next supervisor launch, and at the
+  next gateway reconcile, which reinstalls the session at the higher revision.
+- **Validation.** A standing read path is canonicalized like a workspace grant and refused (exit 6) when it intersects
+  the effective deny union of the project's workspaces, checked against main with its own grants plus the candidate; the
+  per-workspace part of that union is each workspace's own mount, which the mount-root deny covers for all of them. An
+  egress host the gateway cannot turn into a grant is a usage error before anything is written, because it would
+  otherwise take every session of the project down at the next reconcile.
+- **Writes.** `cowshed grant --project-wide` (06_cli.md) and `Coordinator::grant_project` / `revoke_project` (07_api.md)
+  rewrite the policy with the same crash-safe replacement as a grant file; `expected_revision` is the same CAS.
+
 ### Mutation contract
 
 Grant files are small, but they are the authority record — mutations are specified exactly:
@@ -294,6 +330,7 @@ Grant files are small, but they are the authority record — mutations are speci
 
 ```
 cowshed grant  <ws> [--read <path>]… [--write <path>]… [--egress <host[:port]>]… [--sim <verb>]…
+cowshed grant  --project-wide [--read <path>]… [--egress <host[:port]>]…
 cowshed revoke <ws> [--read <path>]… [--write <path>]… [--egress <host>]… [--sim <verb>]… [--all]
 ```
 

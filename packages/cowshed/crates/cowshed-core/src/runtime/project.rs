@@ -19,9 +19,10 @@ use crate::api::dto::LandingCommits;
 use crate::api::dto::{
     AdoptOptions, AttachOptions, CheckpointOptions, CheckpointQuota, CheckpointResult, CommandArg,
     CreateOptions, DoctorReport, EmptyResult, ExecRequest, GcOptions, GcReport, GitOid, GrantDelta,
-    GrantSet, JobId, JobInfo, LandOptions, LandReport, MirrorInfo, PushOptions, PushReport,
-    RebaseOptions, RemoveOptions, RemoveReport, RevisionResult, RunSandboxMode, StdinSource,
-    WorkspaceIncarnation, WorkspaceInfo, validate_command_argv,
+    GrantSet, JobId, JobInfo, LandOptions, LandReport, MirrorInfo, ProjectGrantDelta,
+    ProjectGrants, PushOptions, PushReport, RebaseOptions, RemoveOptions, RemoveReport,
+    RevisionResult, RunSandboxMode, StdinSource, WorkspaceIncarnation, WorkspaceInfo,
+    validate_command_argv,
 };
 use crate::api::server::{
     ConnectionAuthority, RouterCommand, RouterHandle, RouterRequest, RouterResponse,
@@ -159,6 +160,15 @@ pub trait ProjectRuntimeHost: Send + 'static {
         delta: GrantDelta,
         revoke: bool,
     ) -> Result<GrantSet>;
+    /// The project's standing grants from the trusted project policy.
+    async fn project_grants(&mut self) -> Result<ProjectGrants>;
+    /// Add (or, with `revoke`, remove) project-standing grants; every workspace of the project
+    /// runs under them from its next supervisor launch.
+    async fn grant_project(
+        &mut self,
+        delta: ProjectGrantDelta,
+        revoke: bool,
+    ) -> Result<ProjectGrants>;
     async fn assign_slot(&mut self, workspace: WorkspaceName, slot: u32) -> Result<()>;
     async fn set_checkpoint_quota(
         &mut self,
@@ -630,6 +640,9 @@ impl ProjectActor {
             "coordinator.changeRepoId" => self.coordinator_change_repo_id(request).await,
             "coordinator.grant" => self.coordinator_grant(request, false).await,
             "coordinator.revoke" => self.coordinator_grant(request, true).await,
+            "coordinator.projectGrants" => self.coordinator_project_grants(request).await,
+            "coordinator.grantProject" => self.coordinator_grant_project(request, false).await,
+            "coordinator.revokeProject" => self.coordinator_grant_project(request, true).await,
             "coordinator.rebase" => self.coordinator_rebase(request).await,
             "coordinator.land" => self.coordinator_land(request).await,
             "coordinator.restore" => self.coordinator_restore(request).await,
@@ -848,6 +861,27 @@ impl ProjectActor {
             .grant(params.workspace, params.delta, revoke)
             .await?;
         json_response(grants)
+    }
+
+    async fn coordinator_project_grants(
+        &mut self,
+        request: RouterRequest,
+    ) -> Result<RouterResponse> {
+        require_coordinator(request.authority())?;
+        let params: RepoParams = decode_params(request.params(), request.method())?;
+        self.require_repo(&params.repo_id)?;
+        json_response(self.host.project_grants().await?)
+    }
+
+    async fn coordinator_grant_project(
+        &mut self,
+        request: RouterRequest,
+        revoke: bool,
+    ) -> Result<RouterResponse> {
+        require_coordinator(request.authority())?;
+        let params: ProjectGrantParams = decode_params(request.params(), request.method())?;
+        self.require_repo(&params.repo_id)?;
+        json_response(self.host.grant_project(params.delta, revoke).await?)
     }
 
     async fn coordinator_rebase(&mut self, request: RouterRequest) -> Result<RouterResponse> {
@@ -1356,6 +1390,13 @@ struct GrantParams {
     repo_id: RepoId,
     workspace: WorkspaceName,
     delta: GrantDelta,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ProjectGrantParams {
+    repo_id: RepoId,
+    delta: ProjectGrantDelta,
 }
 
 #[derive(Deserialize)]
@@ -3457,23 +3498,13 @@ impl NativeProjectRuntimeHost {
 
     async fn checkpoint_quota(&self, workspace: &WorkspaceName) -> Result<Option<CheckpointQuota>> {
         let path = self.layout.project().policy.clone();
-        let workspace = workspace.to_string();
+        let workspace = workspace.clone();
         crate::storage::lifecycle::dispatch_blocking(move || {
-            let policy: std::collections::BTreeMap<String, CheckpointQuota> =
-                match crate::metadata::read_json(&path) {
-                    Ok(policy) => policy,
-                    Err(crate::metadata::MetadataError::Io { source, .. })
-                        if source.kind() == std::io::ErrorKind::NotFound =>
-                    {
-                        return Ok(None);
-                    }
-                    Err(error) => return Err(error),
-                };
-            Ok(policy.get(&workspace).copied())
+            read_project_policy(&path)
+                .map(|policy| policy.checkpoint_quotas.get(&workspace).copied())
         })
         .await
         .map_err(|error| CowshedError::internal(format!("checkpoint quota task failed: {error}")))?
-        .map_err(native_integrity_error)
     }
 
     async fn enforce_checkpoint_quota(&self, workspace: &NativeWorkspace) -> Result<()> {
@@ -4235,9 +4266,12 @@ impl NativeProjectRuntimeHost {
             self.advance_gateway_revision(&current).await?;
             current = self.current(name).await?;
         }
+        // The effective revision covers the project's standing grants too, so a project grant
+        // change relaunches the supervisor exactly as a workspace grant change does.
+        let grants = effective_workspace_grants(&self.layout, &current.metadata.grants)?;
         if let Some(handle) = self.supervisors.get(name)
             && handle.snapshot().workspace_incarnation == *current.derived.workspace.incarnation()
-            && handle.snapshot().grant_revision == current.metadata.grants.revision
+            && handle.snapshot().grant_revision == grants.revision
         {
             return Ok(handle.clone());
         }
@@ -4257,6 +4291,7 @@ impl NativeProjectRuntimeHost {
             &self.layout,
             &self.telemetry_root,
             &current,
+            &grants,
             mount.clone(),
             self.workspace_mount_path(&main_name())?,
         )?;
@@ -4270,7 +4305,7 @@ impl NativeProjectRuntimeHost {
                 repo_id: self.descriptor.repo_id.clone(),
                 workspace: name.clone(),
                 workspace_incarnation: current.derived.workspace.incarnation().clone(),
-                grant_revision: current.metadata.grants.revision,
+                grant_revision: grants.revision,
                 lifecycle_revision: current.derived.workspace.revision().get(),
             },
             owned_repo_ids: self.owned_repo_ids()?,
@@ -7119,33 +7154,18 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                     let previous = current.metadata.grants.clone();
                     apply_grant_delta(&mut current.metadata.grants, delta, revoke);
 
+                    // Validated as the workspace will run: its own grants plus the project's.
+                    let effective = effective_workspace_grants(&layout, &current.metadata.grants)?;
                     let config = supervisor_sandbox(
                         &home,
                         &layout,
                         &telemetry_root,
                         &current,
+                        &effective,
                         mount,
                         main_mount,
                     )?;
-                    if let Err(error) = crate::sandbox::validate_sandbox_config(&config) {
-                        return Err(match error {
-                            crate::sandbox::SandboxError::GrantIntersectsDeny { .. } => {
-                                CowshedError::sandbox_denied(
-                                    error.to_string(),
-                                    "choose a path outside workspace, controller, project, and credential roots",
-                                )
-                            }
-                            crate::sandbox::SandboxError::InvalidPath { .. } => {
-                                CowshedError::usage(
-                                    error.to_string(),
-                                    "choose an absolute filesystem path",
-                                )
-                            }
-                            crate::sandbox::SandboxError::InvalidPortBlock { .. } => {
-                                native_integrity_error(error)
-                            }
-                        });
-                    }
+                    validate_grant_sandbox(&config)?;
                     if current.metadata.grants == previous {
                         return Ok((previous, None));
                     }
@@ -7156,26 +7176,107 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                         .revision
                         .checked_add(1)
                         .ok_or_else(|| CowshedError::internal("grant revision overflow"))?;
+                    let effective_revision = effective
+                        .revision
+                        .checked_add(1)
+                        .ok_or_else(|| CowshedError::internal("grant revision overflow"))?;
                     let published = current.metadata.grants.clone();
                     current
                         .metadata
                         .write_for_image(&image)
                         .map_err(native_integrity_error)?;
-                    Ok((published, Some(config)))
+                    Ok((published, Some((config, effective_revision))))
                 })()
             })
             .await
             .map_err(native_storage_error)??;
 
-        if let Some(config) = replacement_config
+        if let Some((config, effective_revision)) = replacement_config
             && let Some(handle) = self.supervisors.remove(&workspace)
         {
             let replacement = handle
-                .advance_authority(published.revision, topology_revision, config)
+                .advance_authority(effective_revision, topology_revision, config)
                 .await?;
             self.supervisors.insert(workspace, replacement);
         }
         Ok(published)
+    }
+
+    async fn project_grants(&mut self) -> Result<crate::project_policy::ProjectGrants> {
+        self.validate_binding().await?;
+        let path = self.layout.project().policy.clone();
+        crate::storage::lifecycle::dispatch_blocking(move || read_project_policy(&path))
+            .await
+            .map_err(|error| CowshedError::internal(error.to_string()))?
+            .map(|policy| policy.grants)
+    }
+
+    async fn grant_project(
+        &mut self,
+        mut delta: ProjectGrantDelta,
+        revoke: bool,
+    ) -> Result<crate::project_policy::ProjectGrants> {
+        self.validate_binding().await?;
+        normalize_grant_paths(&mut delta.read)?;
+        // Every workspace runs under the project's grants, so the candidate is validated as the
+        // one workspace every project has runs: main, with its own grants plus the candidate. The
+        // denies that differ between workspaces are their own mounts, which the mount-root deny
+        // covers for all of them alike.
+        let main = self.current(&main_name()).await?;
+        let main_mount = self.workspace_mount_path(&main_name())?;
+        let path = self.layout.project().policy.clone();
+        let home = self.home.clone();
+        let layout = self.layout.clone();
+        let telemetry_root = self.telemetry_root.clone();
+        crate::storage::lifecycle::dispatch_blocking(move || -> Result<_> {
+            let mut policy = read_project_policy(&path)?;
+            if delta
+                .expected_revision
+                .is_some_and(|revision| revision != policy.grants.revision)
+            {
+                return Err(CowshedError::conflict(
+                    "project grant revision is stale",
+                    "refresh project grants and retry",
+                ));
+            }
+            let previous = policy.grants.clone();
+            update_ordered_set(&mut policy.grants.read, delta.read, revoke);
+            update_set(&mut policy.grants.egress, delta.egress, revoke);
+            if policy.grants == previous {
+                return Ok(previous);
+            }
+            // A host the gateway cannot turn into a grant would take every session of the
+            // project down at its next reconcile; refuse it here instead.
+            crate::gateway_sessions::policy_from_grants(&GrantSet {
+                egress: policy.grants.egress.clone(),
+                ..GrantSet::default()
+            })
+            .map_err(|error| {
+                CowshedError::usage(error.message, "name a DNS host or IP address to egress to")
+            })?;
+            let effective =
+                crate::project_policy::effective_grants(&main.metadata.grants, &policy.grants)
+                    .map_err(|error| CowshedError::internal(error.to_string()))?;
+            let config = supervisor_sandbox(
+                &home,
+                &layout,
+                &telemetry_root,
+                &main,
+                &effective,
+                main_mount.clone(),
+                main_mount,
+            )?;
+            validate_grant_sandbox(&config)?;
+            policy.grants.revision = policy
+                .grants
+                .revision
+                .checked_add(1)
+                .ok_or_else(|| CowshedError::internal("project grant revision overflow"))?;
+            policy.write(&path).map_err(native_integrity_error)?;
+            Ok(policy.grants)
+        })
+        .await
+        .map_err(|error| CowshedError::internal(error.to_string()))?
     }
 
     async fn assign_slot(&mut self, workspace: WorkspaceName, slot: u32) -> Result<()> {
@@ -7218,23 +7319,13 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
         self.validate_binding().await?;
         self.current(&workspace).await?;
         let path = self.layout.project().policy.clone();
-        crate::storage::lifecycle::dispatch_blocking(move || {
-            let mut policy: std::collections::BTreeMap<String, CheckpointQuota> =
-                match crate::metadata::read_json(&path) {
-                    Ok(policy) => policy,
-                    Err(crate::metadata::MetadataError::Io { source, .. })
-                        if source.kind() == std::io::ErrorKind::NotFound =>
-                    {
-                        std::collections::BTreeMap::new()
-                    }
-                    Err(error) => return Err(error),
-                };
-            policy.insert(workspace.to_string(), quota);
-            crate::metadata::write_json(&path, &policy)
+        crate::storage::lifecycle::dispatch_blocking(move || -> Result<()> {
+            let mut policy = read_project_policy(&path)?;
+            policy.checkpoint_quotas.insert(workspace, quota);
+            policy.write(&path).map_err(native_integrity_error)
         })
         .await
         .map_err(|error| CowshedError::internal(error.to_string()))?
-        .map_err(native_integrity_error)
     }
 
     async fn rebase(&mut self, workspace: WorkspaceName, options: RebaseOptions) -> Result<GitOid> {
@@ -10017,12 +10108,54 @@ mod grant_unit_tests {
     }
 }
 
+/// The grants `workspace` runs under: its own plus the project's standing grants from the trusted
+/// project policy. One reader for every consumer — the supervisor sandbox, its reuse check, and
+/// the grant verbs' validation — so none of them can see a different snapshot than the gateway
+/// session built from the same policy.
+#[cfg(target_os = "macos")]
+fn effective_workspace_grants(
+    layout: &crate::storage::StorageLayout,
+    workspace: &GrantSet,
+) -> Result<GrantSet> {
+    let project = read_project_policy(&layout.project().policy)?;
+    crate::project_policy::effective_grants(workspace, &project.grants)
+        .map_err(|error| CowshedError::integrity(error.to_string(), "cowshed doctor --json"))
+}
+
+/// The trusted project policy; a policy that cannot be read completely fails closed before any
+/// supervisor launches or any grant is recorded against it.
+#[cfg(target_os = "macos")]
+fn read_project_policy(path: &Path) -> Result<crate::project_policy::ProjectPolicy> {
+    crate::project_policy::ProjectPolicy::read(path).map_err(|error| {
+        CowshedError::integrity(
+            format!("project policy {} is unreadable: {error}", path.display()),
+            "repair or remove the project policy file",
+        )
+    })
+}
+
+/// Refuse a grant snapshot the sandbox would refuse at launch, with the remedy for each cause.
+#[cfg(target_os = "macos")]
+fn validate_grant_sandbox(config: &crate::sandbox::SandboxConfig) -> Result<()> {
+    crate::sandbox::validate_sandbox_config(config).map_err(|error| match error {
+        crate::sandbox::SandboxError::GrantIntersectsDeny { .. } => CowshedError::sandbox_denied(
+            error.to_string(),
+            "choose a path outside workspace, controller, project, and credential roots",
+        ),
+        crate::sandbox::SandboxError::InvalidPath { .. } => {
+            CowshedError::usage(error.to_string(), "choose an absolute filesystem path")
+        }
+        crate::sandbox::SandboxError::InvalidPortBlock { .. } => native_integrity_error(error),
+    })
+}
+
 #[cfg(target_os = "macos")]
 fn supervisor_sandbox(
     home: &Path,
     layout: &crate::storage::StorageLayout,
     telemetry_root: &Path,
     current: &NativeWorkspace,
+    grants: &GrantSet,
     mount: PathBuf,
     main_mount: PathBuf,
 ) -> Result<crate::sandbox::SandboxConfig> {
@@ -10039,16 +10172,14 @@ fn supervisor_sandbox(
             )
         })?,
         workspace_mount: mount,
-        port_block: current.metadata.grants.port_block.ok_or_else(|| {
+        port_block: grants.port_block.ok_or_else(|| {
             CowshedError::integrity("workspace has no port block", "cowshed doctor --json")
         })?,
         mode: crate::sandbox::RunSandboxMode::ReadWrite,
         grants: crate::sandbox::SandboxGrants {
-            read: current.metadata.grants.read.clone(),
-            write: current.metadata.grants.write.clone(),
-            egress: current
-                .metadata
-                .grants
+            read: grants.read.clone(),
+            write: grants.write.clone(),
+            egress: grants
                 .egress
                 .iter()
                 .map(|rule| crate::sandbox::EgressGrant {

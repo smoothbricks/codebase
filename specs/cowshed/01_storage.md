@@ -45,7 +45,7 @@ layout root:
   .cowshed-volume.json               # volume marker: its ABSENCE means "not mounted" (see mount ordering below)
   <owner>/<repo>/                    # primary repo_id, encoded one component at a time
     repository.json                  # chosen remote binding, alternate identities, and primary designation
-    policy.json                      # trusted project policy; controller-owned, mode 0600
+    policy.json                      # trusted project policy (checkpoint quotas, standing grants); controller-owned, 0600
     lifecycle-intents.json             # bounded persist-before-mutate create/fork/remove recovery journal, mode 0600
     lifecycle-intents.json.lock        # flock held for each read-modify-write of the journal
     main{.asif|.sparseimage}          # adopted main image; exactly one format-specific extension exists

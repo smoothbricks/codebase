@@ -1,5 +1,5 @@
 use crate::args::{
-    AdoptArgs, Cli, Command, ExecArgs, MoveDestination, ProjectDiscovery,
+    AdoptArgs, Cli, Command, ExecArgs, GrantTarget, MoveDestination, ProjectDiscovery,
     StdinSource as CliStdinSource,
 };
 use crate::gateway_service;
@@ -17,10 +17,11 @@ use cowshed_core::api::{
     CommandArg, Coordinator, CreateOptions, DoctorReport, EmptyResult, ExecRequest, ExitStatus,
     ExpectedRefHead, Finding, FindingSeverity, GatewayStatus, GcOptions, GcReason, GcReport,
     GitOid, GrantDelta, GrantSet, JobInfo, JobStream, LandOptions, LandReport, LandingCommits,
-    MountResult, OutputPublication, PublicationPolicy, PushOptions, PushReport, RebaseOptions,
-    RemoveOptions, RemoveReport, ResizeResult, RevisionResult, RevisionTarget, RunSandboxMode,
-    SccacheStatus, StdinSource as CoreStdinSource, UtcTimestamp, WorkspaceInfo, WorkspaceLanding,
-    WorkspacePath, WorkspaceState, validate_command_argv,
+    MountResult, OutputPublication, ProjectGrantDelta, ProjectGrants, PublicationPolicy,
+    PushOptions, PushReport, RebaseOptions, RemoveOptions, RemoveReport, ResizeResult,
+    RevisionResult, RevisionTarget, RunSandboxMode, SccacheStatus, StdinSource as CoreStdinSource,
+    UtcTimestamp, WorkspaceInfo, WorkspaceLanding, WorkspacePath, WorkspaceState,
+    validate_command_argv,
 };
 use cowshed_core::git::GitRepository;
 use cowshed_core::host_caches::{self, HostCacheState};
@@ -117,6 +118,8 @@ pub trait CliService: Send {
     async fn gc(&mut self, options: GcOptions) -> Result<GcReport>;
     async fn grants(&mut self, workspace: &str) -> Result<GrantSet>;
     async fn grant(&mut self, workspace: &str, delta: GrantDelta) -> Result<GrantSet>;
+    async fn project_grants(&mut self) -> Result<ProjectGrants>;
+    async fn grant_project(&mut self, delta: ProjectGrantDelta) -> Result<ProjectGrants>;
     async fn push(&mut self, workspace: &str, options: PushOptions) -> Result<PushReport>;
     async fn rebase(&mut self, workspace: &str, options: RebaseOptions) -> Result<GitOid>;
     async fn land(&mut self, workspace: &str, options: LandOptions) -> Result<LandReport>;
@@ -218,7 +221,10 @@ fn runtime_recovery_scope(command: &Command) -> Result<RecoveryScope> {
         },
         Command::Restore(args) => named([Some(args.workspace.as_str())]),
         Command::Exec(args) => named([Some(args.workspace.as_str())]),
-        Command::Grant(args) => named([Some(args.workspace.as_str())]),
+        Command::Grant(args) => match &args.target {
+            GrantTarget::Workspace(workspace) => named([Some(workspace.as_str())]),
+            GrantTarget::Project => named([]),
+        },
         Command::Resize(args) => named([Some(args.workspace.as_str())]),
         Command::Rekey(args) => named([Some(args.workspace.as_str())]),
         Command::Land(args) => named([Some(args.workspace.as_str())]),
@@ -595,6 +601,14 @@ impl CliService for ActorBridge {
 
     async fn grant(&mut self, workspace: &str, delta: GrantDelta) -> Result<GrantSet> {
         self.coordinator()?.grant(workspace, delta).await
+    }
+
+    async fn project_grants(&mut self) -> Result<ProjectGrants> {
+        self.coordinator()?.project_grants().await
+    }
+
+    async fn grant_project(&mut self, delta: ProjectGrantDelta) -> Result<ProjectGrants> {
+        self.coordinator()?.grant_project(delta).await
     }
 
     async fn push(&mut self, workspace: &str, options: PushOptions) -> Result<PushReport> {
@@ -1017,24 +1031,19 @@ where
         Command::Grant(args) => {
             let changed =
                 !args.read.is_empty() || !args.write.is_empty() || !args.egress.is_empty();
+            let workspace = match args.target {
+                GrantTarget::Workspace(workspace) => workspace,
+                GrantTarget::Project => {
+                    return grant_project(service, output, json, args.read, args.egress).await;
+                }
+            };
             let requested: Vec<PathBuf> =
                 args.read.iter().chain(args.write.iter()).cloned().collect();
-            // A host is admitted for the ports an intercept grant defaults to; the mode and the
-            // per-port narrowing belong to trusted policy, not to a flag on this verb.
-            let egress: Vec<EgressRule> = args
-                .egress
-                .iter()
-                .map(|host| EgressRule {
-                    host: host.clone(),
-                    ports: Vec::new(),
-                    mode: EgressMode::default(),
-                    impersonate: None,
-                })
-                .collect();
+            let egress = egress_rules(&args.egress);
             let grants = if changed {
                 service
                     .grant(
-                        &args.workspace,
+                        &workspace,
                         GrantDelta {
                             read: args.read,
                             write: args.write,
@@ -1044,7 +1053,7 @@ where
                     )
                     .await?
             } else {
-                service.grants(&args.workspace).await?
+                service.grants(&workspace).await?
             };
             if json {
                 output.success(grants.clone()).map_err(output_error)?;
@@ -1072,7 +1081,7 @@ where
                 output
                     .guidance(&format!(
                         "grants for {} now: {} read, {} write, {} egress",
-                        args.workspace,
+                        workspace,
                         grants.read.len(),
                         grants.write.len(),
                         grants.egress.len()
@@ -1084,7 +1093,7 @@ where
                 output
                     .hint(&format!(
                         "cowshed exec {} -- <retry your command>",
-                        args.workspace
+                        workspace
                     ))
                     .map_err(output_error)?;
             }
@@ -1687,6 +1696,73 @@ fn emit_mount<W: Write, E: Write>(
 /// `cowshed grant <ws>` could answer "nothing here" for a workspace that could reach a
 /// registry. The ports are the effective ones, so the line says what is admitted rather than
 /// what happened to be typed.
+/// Egress rules for hosts named on the command line: the ports an intercept grant defaults to. The
+/// mode and the per-port narrowing belong to trusted policy, not to a flag on this verb.
+fn egress_rules(hosts: &[String]) -> Vec<EgressRule> {
+    hosts
+        .iter()
+        .map(|host| EgressRule {
+            host: host.clone(),
+            ports: Vec::new(),
+            mode: EgressMode::default(),
+            impersonate: None,
+        })
+        .collect()
+}
+
+/// `cowshed grant --project-wide`: print or extend the project's standing grants.
+async fn grant_project<S: CliService, W: Write, E: Write>(
+    service: &mut S,
+    output: &mut Output<W, E>,
+    json: bool,
+    read: Vec<PathBuf>,
+    egress: Vec<String>,
+) -> Result<DispatchExit> {
+    let changed = !read.is_empty() || !egress.is_empty();
+    let grants = if changed {
+        service
+            .grant_project(ProjectGrantDelta {
+                read,
+                egress: egress_rules(&egress),
+                expected_revision: None,
+            })
+            .await?
+    } else {
+        service.project_grants().await?
+    };
+    if json {
+        output.success(grants.clone()).map_err(output_error)?;
+    } else if !changed {
+        emit_grants(
+            output,
+            &GrantSet {
+                read: grants.read.clone(),
+                egress: grants.egress.clone(),
+                ..GrantSet::default()
+            },
+        )?;
+    }
+    if changed {
+        output
+            .guidance(&format!(
+                "project grants now: {} read, {} egress (revision {})",
+                grants.read.len(),
+                grants.egress.len(),
+                grants.revision
+            ))
+            .map_err(output_error)?;
+        output
+            .guidance(
+                "every workspace of this project holds them from its next exec or shell, on top of its own grants",
+            )
+            .map_err(output_error)?;
+        output
+            .hint("cowshed exec <ws> -- <retry your command>")
+            .map_err(output_error)?;
+    }
+    Ok(success())
+}
+
 fn emit_grants<W: Write, E: Write>(output: &mut Output<W, E>, grants: &GrantSet) -> Result<()> {
     for (kind, paths) in [
         (b"read".as_slice(), &grants.read),

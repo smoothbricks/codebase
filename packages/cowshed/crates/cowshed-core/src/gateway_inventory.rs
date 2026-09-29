@@ -1108,6 +1108,16 @@ impl NativeGatewayInventory {
             &layout.project().project_root,
             &layout.project().repository_binding,
         )?;
+        // The project's standing grants join every workspace's own, read once per project so all
+        // of its sessions are derived from one policy. A policy that cannot be read completely
+        // serves no session of this project rather than a session without it.
+        let project_policy = &layout.project().policy;
+        let project_grants = crate::project_policy::ProjectPolicy::read(project_policy)
+            .map_err(|error| GatewayInventoryError::InvalidMetadata {
+                path: project_policy.clone(),
+                message: error.to_string(),
+            })?
+            .grants;
         let mut facts = Vec::new();
         for workspace in derived {
             let MountState::Mounted { mount_id } = workspace.mount_state else {
@@ -1151,14 +1161,19 @@ impl NativeGatewayInventory {
                 mount,
                 image_paths.ca_private_key(),
             )?;
+            let grants = crate::project_policy::effective_grants(&metadata.grants, &project_grants)
+                .map_err(|error| GatewayInventoryError::InvalidMetadata {
+                    path: project_policy.clone(),
+                    message: error.to_string(),
+                })?;
             facts.push(GatewaySessionFact {
                 repo_id: repo_id.clone(),
                 workspace: workspace.workspace.name().clone(),
                 incarnation: workspace.workspace.incarnation().clone(),
-                revision: metadata.grants.revision,
+                revision: grants.revision,
                 mount_id,
                 mount: mount.clone(),
-                grants: metadata.grants,
+                grants,
                 port_block,
                 credentials,
             });
@@ -2127,6 +2142,78 @@ mod tests {
                 .expect("reserved port bases"),
             BTreeSet::from([MACOS_PORT_BLOCK_MIN, MACOS_PORT_BLOCK_MIN + PORT_BLOCK_SIZE])
         );
+    }
+
+    /// A project's standing grants reach every workspace's gateway session, on top of its own,
+    /// and advance the session revision the gateway requires to grow; a sibling project's
+    /// sessions are untouched.
+    #[tokio::test]
+    async fn project_grants_join_every_session_of_their_project_and_advance_its_revision() {
+        let fixture = Fixture::new("project-grants");
+        let (repo_a, _repo_b, source) = two_project_store(&fixture);
+        let policy_path = StorageLayout::new(fixture.storage.store(), &repo_a)
+            .expect("layout")
+            .project()
+            .policy
+            .clone();
+        crate::project_policy::ProjectPolicy {
+            grants: crate::project_policy::ProjectGrants {
+                revision: 2,
+                read: vec![PathBuf::from("/opt/shared")],
+                egress: vec![crate::metadata::EgressRule {
+                    host: "registry.example.test".to_owned(),
+                    ports: Vec::new(),
+                    mode: crate::metadata::EgressMode::Intercept,
+                    impersonate: None,
+                }],
+            },
+            ..crate::project_policy::ProjectPolicy::default()
+        }
+        .write(&policy_path)
+        .expect("project policy");
+        let inventory = NativeGatewayInventory::with_source(
+            fixture.storage.clone(),
+            source as Arc<dyn InventorySource>,
+        );
+
+        let facts = inventory.all_attached().await.expect("attached inventory");
+        let alpha = facts
+            .iter()
+            .find(|fact| fact.repo_id == repo_a)
+            .expect("alpha session");
+        assert_eq!(alpha.revision, 9);
+        assert_eq!(alpha.grants.revision, 9);
+        assert_eq!(alpha.grants.read, [PathBuf::from("/opt/shared")]);
+        assert_eq!(
+            alpha
+                .grants
+                .egress
+                .iter()
+                .map(|rule| rule.host.as_str())
+                .collect::<Vec<_>>(),
+            ["registry.example.test"]
+        );
+        let beta = facts
+            .iter()
+            .find(|fact| fact.repo_id != repo_a)
+            .expect("beta session");
+        assert_eq!(beta.revision, 7);
+        assert!(beta.grants.egress.is_empty());
+
+        // A policy the controller cannot read completely serves no session of its project, and
+        // costs no other project its sessions.
+        fs::write(
+            &policy_path,
+            br#"{ "grants": { "write": ["/opt/shared"] } }"#,
+        )
+        .expect("bad");
+        assert!(inventory.project_attached(&repo_a).await.is_err());
+        let facts = inventory
+            .all_attached()
+            .await
+            .expect("other projects still served");
+        assert!(facts.iter().all(|fact| fact.repo_id != repo_a));
+        assert_eq!(facts.len(), 1);
     }
 
     /// One macOS port block belongs to at most one workspace host-wide: the block is the

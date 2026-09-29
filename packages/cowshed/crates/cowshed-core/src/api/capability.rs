@@ -1,9 +1,10 @@
 use super::dto::{
     AdoptOptions, AttachOptions, CheckpointOptions, CheckpointQuota, CheckpointResult,
     CreateOptions, DoctorReport, EmptyResult, ExecRequest, GcOptions, GcReport, GitOid, GrantDelta,
-    GrantSet, JobId, JobInfo, JobState, LandOptions, LandReport, MirrorInfo, PushOptions,
-    PushReport, RebaseOptions, RemoveOptions, RemoveReport, ResizeResult, RevisionResult,
-    RunSandboxMode, StdinSource, WorkspaceIncarnation, WorkspaceInfo, validate_command_argv,
+    GrantSet, JobId, JobInfo, JobState, LandOptions, LandReport, MirrorInfo, ProjectGrantDelta,
+    ProjectGrants, PushOptions, PushReport, RebaseOptions, RemoveOptions, RemoveReport,
+    ResizeResult, RevisionResult, RunSandboxMode, StdinSource, WorkspaceIncarnation, WorkspaceInfo,
+    validate_command_argv,
 };
 use super::frame;
 use super::peer_credentials::PeerCredentialsError;
@@ -1340,6 +1341,41 @@ impl Coordinator {
     pub async fn revoke(&self, workspace: &str, delta: GrantDelta) -> Result<GrantSet> {
         self.grant_call("coordinator.revoke", workspace, delta)
             .await
+    }
+
+    /// The project's standing grants: what every workspace of this project runs under in
+    /// addition to its own.
+    pub async fn project_grants(&self) -> Result<ProjectGrants> {
+        call_typed(
+            &self.runtime,
+            "coordinator.projectGrants",
+            json!({ "repoId": self.project.repo_id }),
+        )
+        .await
+    }
+
+    pub async fn grant_project(&self, delta: ProjectGrantDelta) -> Result<ProjectGrants> {
+        self.project_grant_call("coordinator.grantProject", delta)
+            .await
+    }
+
+    pub async fn revoke_project(&self, delta: ProjectGrantDelta) -> Result<ProjectGrants> {
+        self.project_grant_call("coordinator.revokeProject", delta)
+            .await
+    }
+
+    async fn project_grant_call(
+        &self,
+        method: &'static str,
+        delta: ProjectGrantDelta,
+    ) -> Result<ProjectGrants> {
+        let delta = encode_value("project grant delta", &delta)?;
+        call_typed(
+            &self.runtime,
+            method,
+            json!({ "repoId": self.project.repo_id, "delta": delta }),
+        )
+        .await
     }
 
     async fn grant_call(

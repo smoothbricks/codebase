@@ -329,9 +329,19 @@ pub struct ExecArgs {
     pub replace_output: bool,
 }
 
+/// Whose grants `grant` reads or changes.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum GrantTarget {
+    /// One workspace's own grants (`cowshed grant <ws>`).
+    Workspace(String),
+    /// The project's standing grants every workspace runs under (`cowshed grant --project-wide`),
+    /// held in the trusted project policy.
+    Project,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GrantArgs {
-    pub workspace: String,
+    pub target: GrantTarget,
     pub read: Vec<PathBuf>,
     pub write: Vec<PathBuf>,
     /// Hosts this workspace may reach through the gateway. Network reach is a separate decision
@@ -706,6 +716,7 @@ fn cli_command() -> ClapCommand {
         .subcommand(
             leaf("grant")
                 .arg(positional("workspace", 0..=1))
+                .arg(flag("project-wide"))
                 .args([path_values("read"), path_values("write")])
                 .arg(append_value("egress")),
         )
@@ -2025,15 +2036,20 @@ fn parse_exec(matches: &ArgMatches) -> Result<Command, UsageError> {
 const GRANT: CommandSpec = CommandSpec {
     name: "grant",
     missing: "grant requires a workspace",
-    args: "<ws>",
+    args: "<ws> | --project-wide",
     trailing: "",
     summary: "grant filesystem and network access",
     about: &[
         "Adds read-only or writable host paths to one workspace's sandbox grant snapshot. Paths are normalized, deduplicated, sorted, and recorded outside the workspace image; they apply from the next exec or shell. With no flags, prints the current filesystem grants.",
         "A grant cannot cover the workspace mount, another cowshed mount, controller state, project policy roots, or credential-bearing paths.",
         "A path is recorded under its resolved spelling. A symlink planted beside the workspace so `../<name>` resolves (for example `<shed>/<org>/<project>/<name>` pointing at a sibling repository) is readable through the link exactly when its target is granted; grant the target, not the link.",
+        "`--project-wide` changes the project's standing grants instead: read paths and egress hosts every workspace of the project — main, new, and forks — runs under in addition to its own, from its next exec or shell. They live in the trusted project policy; a fork never copies another workspace's own grants. A write grant stays per workspace. With no other flags, prints the project's standing grants.",
     ],
     options: &[
+        Opt {
+            spelling: "--project-wide",
+            meaning: "change or print the project's standing grants instead of one workspace's; takes --read and --egress",
+        },
         Opt {
             spelling: "--read <path...>",
             meaning: "allow reads beneath one or more absolute host paths; repeat the flag to add more",
@@ -2051,8 +2067,31 @@ const GRANT: CommandSpec = CommandSpec {
 
 fn parse_grant(matches: &ArgMatches) -> Result<Command, UsageError> {
     const USAGE: &CommandSpec = &GRANT;
+    let target = if flagged(matches, "project-wide") {
+        if os(matches, "workspace").is_some() {
+            return Err(UsageError::new(
+                "grant names one workspace or the whole project, not both",
+                USAGE,
+            ));
+        }
+        if matches.get_many::<PathBuf>("write").is_some() {
+            return Err(UsageError::new(
+                "a project-wide grant carries reads and egress; a write grant is a per-workspace decision",
+                USAGE,
+            ));
+        }
+        GrantTarget::Project
+    } else {
+        GrantTarget::Workspace(require_workspace(
+            matches,
+            "workspace",
+            false,
+            USAGE,
+            USAGE.missing,
+        )?)
+    };
     Ok(Command::Grant(GrantArgs {
-        workspace: require_workspace(matches, "workspace", false, USAGE, USAGE.missing)?,
+        target,
         read: matches
             .get_many::<PathBuf>("read")
             .map(|paths| paths.cloned().collect())
@@ -2532,7 +2571,7 @@ mod tests {
         let Command::Grant(grant) = parsed.command else {
             panic!("expected grant")
         };
-        assert_eq!(grant.workspace, "raven");
+        assert_eq!(grant.target, GrantTarget::Workspace("raven".to_owned()));
         assert_eq!(
             grant.read,
             [
@@ -2546,6 +2585,52 @@ mod tests {
             Command::Grant(grant).project_discovery(),
             ProjectDiscovery::Required
         );
+    }
+
+    /// `--project-wide` names the project's standing grants instead of one workspace's, from the
+    /// same project discovery every verb uses. It takes reads and egress; a write grant stays a
+    /// per-workspace decision, and naming a workspace alongside it is refused, not guessed.
+    #[test]
+    fn grant_project_wide_targets_the_project_and_refuses_a_workspace_or_a_write() {
+        let listed = parse_args(["grant", "--project-wide"]).expect("project listing parses");
+        let Command::Grant(listed) = listed.command else {
+            panic!("expected grant")
+        };
+        assert_eq!(listed.target, GrantTarget::Project);
+        assert!(listed.read.is_empty() && listed.egress.is_empty());
+
+        let parsed = parse_args([
+            "grant",
+            "--project-wide",
+            "--read",
+            "/opt/shared",
+            "--egress",
+            "github.com",
+            "--egress",
+            "index.crates.io",
+        ])
+        .expect("project grant parses");
+        let Command::Grant(grant) = parsed.command else {
+            panic!("expected grant")
+        };
+        assert_eq!(grant.target, GrantTarget::Project);
+        assert_eq!(grant.read, [PathBuf::from("/opt/shared")]);
+        assert_eq!(grant.egress, ["github.com", "index.crates.io"]);
+        assert_eq!(
+            Command::Grant(grant).project_discovery(),
+            ProjectDiscovery::Required
+        );
+
+        for refused in [
+            vec!["grant", "raven", "--project-wide", "--read", "/opt/shared"],
+            vec!["grant", "--project-wide", "--write", "/opt/output"],
+        ] {
+            let error = parse_args(refused.clone()).expect_err("refused");
+            assert_eq!(error.kind, UsageErrorKind::InvalidArguments, "{refused:?}");
+        }
+        // Without a target the verb still asks for the workspace, as before.
+        let missing = parse_args(["grant", "--read", "/opt/shared"]).expect_err("no target");
+        assert!(missing.message.contains("grant requires a workspace"));
     }
 
     /// The pre-parse walk answers about output shape exactly as the parser would, and it does not

@@ -75,6 +75,8 @@ struct DurableState {
     pending_restore: Option<DurableWorkspace>,
     pending_has_evidence: bool,
     checkpoint_quotas: std::collections::BTreeMap<String, CheckpointQuota>,
+    #[serde(default)]
+    project_grants: cowshed_core::api::dto::ProjectGrants,
 }
 
 #[derive(Clone, Debug)]
@@ -851,6 +853,29 @@ impl ProjectRuntimeHost for FakeHost {
         }
         current.grants.revision += 1;
         let result = current.grants.clone();
+        self.persist()?;
+        Ok(result)
+    }
+
+    async fn project_grants(&mut self) -> Result<cowshed_core::api::dto::ProjectGrants> {
+        Ok(self.state.project_grants.clone())
+    }
+
+    async fn grant_project(
+        &mut self,
+        delta: cowshed_core::api::dto::ProjectGrantDelta,
+        revoke: bool,
+    ) -> Result<cowshed_core::api::dto::ProjectGrants> {
+        let grants = &mut self.state.project_grants;
+        if revoke {
+            grants.read.retain(|path| !delta.read.contains(path));
+            grants.egress.retain(|rule| !delta.egress.contains(rule));
+        } else {
+            grants.read.extend(delta.read);
+            grants.egress.extend(delta.egress);
+        }
+        grants.revision += 1;
+        let result = grants.clone();
         self.persist()?;
         Ok(result)
     }

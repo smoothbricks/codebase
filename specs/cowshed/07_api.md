@@ -425,6 +425,10 @@ impl Coordinator {
     pub async fn fork(&self, src: &str, dst: &str) -> Result<WorkspaceRef, CowshedError>;
     pub async fn grant(&self, ws: &str, delta: GrantDelta) -> Result<GrantSet, CowshedError>;
     pub async fn revoke(&self, ws: &str, delta: GrantDelta) -> Result<GrantSet, CowshedError>;
+    // The project's standing grants (04: reads and egress every workspace runs under).
+    pub async fn project_grants(&self) -> Result<ProjectGrants, CowshedError>;
+    pub async fn grant_project(&self, delta: ProjectGrantDelta) -> Result<ProjectGrants, CowshedError>;
+    pub async fn revoke_project(&self, delta: ProjectGrantDelta) -> Result<ProjectGrants, CowshedError>;
     pub async fn rebase(&self, ws: &str, opts: RebaseOptions) -> Result<GitOid, CowshedError>;
     pub async fn land(&self, ws: &str, opts: LandOptions) -> Result<LandReport, CowshedError>;
     pub async fn restore(&self, ws: &str, label: &str) -> Result<(), CowshedError>;

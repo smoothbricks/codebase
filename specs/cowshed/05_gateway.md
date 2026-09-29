@@ -12,25 +12,26 @@ are coordinator-only.
 ## Placement and identity
 
 The host-only control plane is host-netns `127.0.0.1:7644` (override `COWSHED_GATEWAY_PORT`) plus
-`/private/cowshed/store/gateway.sock` for status, audit tail, and coordinator verbs. Neither host endpoint is reachable from a
-workspace, and the sandbox baseline denies both. Linux separately reuses the numeric address `127.0.0.1:7644` inside
-each private netns for its data-plane connector; namespace separation makes it a different listener. Data-plane topology
-is platform-specific:
+`/private/cowshed/store/gateway.sock` for status, audit tail, and coordinator verbs. Neither host endpoint is reachable
+from a workspace, and the sandbox baseline denies both. Linux separately reuses the numeric address `127.0.0.1:7644`
+inside each private netns for its data-plane connector; namespace separation makes it a different listener. Data-plane
+topology is platform-specific:
 
 - **macOS — port block.** Every workspace, main included, gets a contiguous block of 16 ports from 40960–49151.
   `portBlock` is allocated at new/fork (adopt for main), preserved across restore, and present only in macOS grant
   files. The gateway binds `base`; `base+1 … base+15` are workspace service ports. Seatbelt permits a workspace to
   connect only to its own block. The destination `base` listener is the primary, kernel-enforced workspace identity.
 - **Linux — Unix socket, private netns, and trusted connector.** No `portBlock` is allocated. The controller creates
-  `/private/cowshed/store/run/gateway/<workspaceIncarnation>.sock` under a 0700 directory with mode 0600 and bind-mounts that one
-  socket as `/run/cowshed/gateway.sock` inside the workspace's private network namespace. The namespace has loopback up
-  but no veth, routed interface, or default route. For ordinary package/proxy clients, the controller launches exactly
-  one trusted minimal connector in that netns under a controller-owned process identity and dedicated cgroup that
-  workspace processes cannot signal, ptrace, inspect, or join. It binds only IPv4 `127.0.0.1:7644`, accepts no
-  non-loopback traffic, and forwards bytes bidirectionally and unchanged only to `/run/cowshed/gateway.sock`. It parses
-  no protocol, owns no policy, token, CA key, registry credential, or upstream-network authority, and cannot select a
-  different Unix socket. The socket inode plus private netns is the primary workspace identity; `127.0.0.1:7644` is only
-  a namespace-local compatibility endpoint, so fixed service ports neither collide nor reach siblings.
+  `/private/cowshed/store/run/gateway/<workspaceIncarnation>.sock` under a 0700 directory with mode 0600 and bind-mounts
+  that one socket as `/run/cowshed/gateway.sock` inside the workspace's private network namespace. The namespace has
+  loopback up but no veth, routed interface, or default route. For ordinary package/proxy clients, the controller
+  launches exactly one trusted minimal connector in that netns under a controller-owned process identity and dedicated
+  cgroup that workspace processes cannot signal, ptrace, inspect, or join. It binds only IPv4 `127.0.0.1:7644`, accepts
+  no non-loopback traffic, and forwards bytes bidirectionally and unchanged only to `/run/cowshed/gateway.sock`. It
+  parses no protocol, owns no policy, token, CA key, registry credential, or upstream-network authority, and cannot
+  select a different Unix socket. The socket inode plus private netns is the primary workspace identity;
+  `127.0.0.1:7644` is only a namespace-local compatibility endpoint, so fixed service ports neither collide nor reach
+  siblings.
 
 Every data-plane request additionally carries exactly `Proxy-Authorization: Bearer <opaque-token>`. The token is 32
 random bytes encoded as unpadded base64url, lives at `.cowshed/token` mode 0600, and is defense in depth rather than the
@@ -45,7 +46,9 @@ and atomically rewrites the in-image token before new execution is admitted. Det
 kill, and socket unlink without rotating persistent authority; attach creates the socket and connector before admitting
 execs. The old token and every pre-restore keep-alive or tunnel are therefore invalid immediately; a preserved macOS
 port does not preserve authority. A policy miss after successful endpoint and token authentication is 403 with a
-machine-parsable grant hint.
+machine-parsable grant hint naming both remedies, the standing one first:
+`cowshed grant --project-wide --egress <host:port>` (every workspace of the project) or
+`cowshed grant <ws> --egress <host:port>` (that workspace).
 
 Main is a first-class data-plane client with identical platform wiring and policy. Gateway startup and absence are
 covered under "Availability and offline behavior".
@@ -57,13 +60,14 @@ Three tiers, never mixed:
 - **Public registry mirrors are baseline broker policy.** Anonymous public npm, crates.io, `proxy.golang.org`, and the
   public checksum database are available with zero grants. Baseline does not include scoped registries, private module
   namespaces, alternate credentialed registries, or any request that would attach a credential.
-- **Admitted private/credentialed registry routes.** A private upstream is usable only when the current project's
-  trusted policy for its stable `repo_id` admits the exact registry origin and package/module scope. Repository config
-  may request a route but cannot admit itself. The gateway rejects an unadmitted route before credential lookup;
-  admission is project-scoped and does not become fleet-wide baseline access.
+- **Admitted private/credentialed registry routes.** A private upstream would be usable only when a trusted admission
+  for the project's stable `repo_id` named the exact registry origin and package/module scope. The trusted project
+  policy has no admission field, so no workspace holds a mirror route beyond the public baselines; repository config
+  cannot admit one either. The gateway rejects an unadmitted route before credential lookup.
 - **Granted hosts.** `cowshed grant <ws> --egress <host>` defaults to `mode: "intercept"`; `--opaque` selects a byte
   tunnel with host-only audit and no injection. `--impersonate <profile>` affects the outbound intercepted leg only and
-  suppresses all injected headers. Unmatched destinations are denied.
+  suppresses all injected headers. A project's standing egress grants (`cowshed grant --project-wide --egress <host>`,
+  04_sandbox.md) join every workspace's own. Unmatched destinations are denied.
 
 ## Endpoints (data plane, per-workspace endpoint)
 
@@ -241,10 +245,10 @@ Two distinct situations, not to be conflated:
 
 ## Audit events
 
-One audit event per decision, written as **Arrow segments** under `/private/cowshed/store/telemetry/` (schema, flush policy, and
-durability window in 13_telemetry.md) — on the store volume, denied to every sandbox (04_sandbox.md), because this is
-the authoritative egress record. There is no separate audit file and no separate gateway log file: audit events and
-gateway operational events are rows in the same telemetry store, distinguished by `kind`.
+One audit event per decision, written as **Arrow segments** under `/private/cowshed/store/telemetry/` (schema, flush
+policy, and durability window in 13_telemetry.md) — on the store volume, denied to every sandbox (04_sandbox.md),
+because this is the authoritative egress record. There is no separate audit file and no separate gateway log file: audit
+events and gateway operational events are rows in the same telemetry store, distinguished by `kind`.
 
 Read it with `cowshed audit` (06_cli.md) — human tables by default, `--json`/`--ndjson` to pipe. The same events,
 rendered:

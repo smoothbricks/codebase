@@ -435,8 +435,15 @@ impl WorkspacePolicy {
                 Err(_) => return Err(PolicyDenial::InvalidPath),
             }
         }
+        // Both remedies, the standing one first: a host a project's builds need (a registry, a
+        // forge) belongs in every workspace, and granting it one workspace at a time is how the
+        // grant sets of a project's workspaces drift apart.
+        let authority = target.authority();
         Err(PolicyDenial::NotGranted {
-            hint: format!("cowshed grant <ws> --egress {}", target.authority()),
+            hint: format!(
+                "cowshed grant --project-wide --egress {authority} (every workspace of this project) \
+                 or cowshed grant <ws> --egress {authority} (this workspace)"
+            ),
         })
     }
 
@@ -875,9 +882,17 @@ mod tests {
         // case is another destination; the exact namespace lives in the credential's own scope.
         let elsewhere = CanonicalTarget::from_authority("elsewhere.test:443", TargetScheme::Https)
             .expect("fixture target");
-        assert!(matches!(
-            policy.authorize(&elsewhere, &Method::GET, "/api/packages/owner/npm/pkg"),
-            Err(PolicyDenial::NotGranted { .. })
-        ));
+        let Err(PolicyDenial::NotGranted { hint }) =
+            policy.authorize(&elsewhere, &Method::GET, "/api/packages/owner/npm/pkg")
+        else {
+            panic!("an ungranted destination is NotGranted");
+        };
+        // The denial teaches both remedies: the standing grant every workspace of the project
+        // holds, and the one-workspace grant.
+        assert_eq!(
+            hint,
+            "cowshed grant --project-wide --egress elsewhere.test:443 (every workspace of this project) \
+             or cowshed grant <ws> --egress elsewhere.test:443 (this workspace)"
+        );
     }
 }
