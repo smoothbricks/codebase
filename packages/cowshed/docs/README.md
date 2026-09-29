@@ -117,7 +117,7 @@ rules, start with [usage.md](usage.md).
 | Repository binding                                                  | `/private/cowshed/store/<owner>/<repo>/repository.json`                                |
 | Shared writable build caches (Cargo, sccache, zig, Gradle, Go, Nix) | exact tool subdirectories under `/private/cowshed/caches`                              |
 | Gateway registry and repository mirrors                             | `/private/cowshed/caches/{mirror,repo-mirrors}` (gateway-owned, sandbox-read-only)     |
-| Host cargo registry (index + `.crate` archives)                     | `~/.cargo/registry/{index,cache}` (host-owned, sandbox-read-only)                      |
+| Host cache directories (Cargo, zig, Gradle, Nix)                    | symlinks into `/private/cowshed/caches` (`cowshed setup --imperative-host-setup`)      |
 
 Before adoption, cowshed derives a stable lowercase `owner/repo` identity from configured remotes when the choice is
 unambiguous. The binding is recorded and revalidated whenever the project opens. Moving the checkout does not change the
@@ -141,14 +141,16 @@ mounted per-workspace Unix gateway socket, which remains the primary endpoint id
 _inside_ each workspace image — inherited from main via copy-on-write — because bun clones out of it, and clonefile
 can't cross volumes; that keeps `bun install` on its fast path. Read-at-build caches are shared under
 `/private/cowshed/caches`: Cargo uses distinct writable `cargo/{registry,git}` directories; Go uses `go/{mod,build}`;
-Nix uses `nix/{cache,state}`; sccache, zig, and Gradle have named roots. A sandbox's `$CARGO_HOME` follows its private
-`HOME`, so it reaches the host's own `~/.cargo/registry/{index,cache}` read-only through links planted at exec, and
-unpacks into a writable `registry/src` inside the mount: a crate the host already downloaded builds offline in every
-workspace. Gateway artifacts are not Cargo caches: registry objects live under `mirror/` and bare repository mirrors
-under `repo-mirrors/`, both gateway-owned and read-only to workspaces. On declarative hosts, the system/home-manager
-module owns all relocations, including `~/.cache/nix → nix/cache` and `~/.local/state/nix → nix/state`; cowshed only
-validates them. `cowshed adopt --imperative-host-setup` is an explicit exception for non-declarative hosts, never an
-automatic fallback after declarative validation fails.
+Nix uses `nix/{cache,state}`; sccache, zig, and Gradle have named roots. `cowshed setup --imperative-host-setup` moves
+the host's own caches there and links them back, and from then on every sandbox builds with `CARGO_HOME` set to the
+host's own `~/.cargo`: cargo fingerprints a dependency by the absolute path of its source under `$CARGO_HOME`, so one
+literal path is what lets a clone's copied `target/` stay fresh instead of rebuilding every dependency. A crate anything
+on the host has already downloaded builds offline in every workspace. Gateway artifacts are not Cargo caches: registry
+objects live under `mirror/` and bare repository mirrors under `repo-mirrors/`, both gateway-owned and read-only to
+workspaces. On declarative hosts, the system/home-manager module owns all relocations, including
+`~/.cache/nix → nix/cache` and `~/.local/state/nix → nix/state`; cowshed only validates them.
+`cowshed setup --imperative-host-setup` is an explicit exception for non-declarative hosts, never an automatic fallback
+after declarative validation fails.
 
 ## Reusing compiled output across workspaces
 

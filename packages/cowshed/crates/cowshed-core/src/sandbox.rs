@@ -101,30 +101,71 @@ pub fn sccache_cache_directory() -> PathBuf {
     Path::new(CACHES_ROOT).join("sccache")
 }
 
-/// The host cargo registry subdirectories every sandbox reads.
+/// Cargo's two caches, shared read-write by the host and every sandbox.
 ///
-/// `index` and `cache` are the download side of cargo's registry: resolved index entries and the
-/// `.crate` archives fetched for them. They are pure network artifacts, digest-checked by cargo
-/// against the index it stores beside them, so sharing the host's copy costs nothing and saves
-/// every workspace from refetching a crate the host already has.
-///
-/// `src` is deliberately absent: it is the *output* of unpacking an archive, so a sandbox has to
-/// be able to create it. It stays inside the private HOME, where a workspace's mount carries it
-/// and copy-on-write hands it to every clone.
-pub const SHARED_CARGO_REGISTRY_DIRECTORIES: [&str; 2] = ["index", "cache"];
+/// `registry` holds cargo's index, the fetched `.crate` archives and their unpacked sources;
+/// `git` holds the bare databases of git dependencies and their checkouts. Both are
+/// read-at-build caches (03_caches.md, third layer): cargo writes an entry once per crate or
+/// revision and every later build only reads it, so one copy serves every workspace. Host setup
+/// relocates `~/.cargo/registry` and `~/.cargo/git` to these directories.
+pub const SHARED_CARGO_CACHE_DIRECTORIES: [&str; 2] = ["registry", "git"];
 
-/// The host cargo registry, shared read-only with every sandbox.
-///
-/// The private HOME the supervisor exports makes `$CARGO_HOME` a per-workspace directory, so
-/// nothing in the host registry is reachable by cargo's default path resolution. This is the path
-/// the supervisor links the shared subdirectories to and the profile grants read access on.
-///
-/// Only `registry` is named. `~/.cargo` also holds `config.toml`, `credentials.toml`, and `bin`
-/// — a registry credential, a global build configuration, and binaries on `PATH` — each an
-/// explicit hard deny, and none of them a cache.
-pub fn host_cargo_registry(home: &Path) -> PathBuf {
-    home.join(".cargo/registry")
+/// `<caches>/cargo/<directory>` for one [`SHARED_CARGO_CACHE_DIRECTORIES`] entry.
+pub fn shared_cargo_cache_directory(caches: &Path, directory: &str) -> PathBuf {
+    caches.join("cargo").join(directory)
 }
+
+/// The host's own `$CARGO_HOME`.
+pub fn host_cargo_home(home: &Path) -> PathBuf {
+    home.join(".cargo")
+}
+
+/// What cargo itself writes at the root of `$CARGO_HOME` while it resolves and builds: the
+/// package-cache locks, and the global-cache usage database with its rollback journal.
+pub const CARGO_HOME_STATE_FILES: [&str; 4] = [
+    ".package-cache",
+    ".package-cache-mutate",
+    ".global-cache",
+    ".global-cache-journal",
+];
+
+/// The host's `$CARGO_HOME`, when its caches are the shared ones.
+///
+/// Every checkout on the host must build against this one literal path. Cargo fingerprints a
+/// registry or git dependency by the absolute path of its source under `$CARGO_HOME`, so a
+/// `$CARGO_HOME` at any other path — a sandbox's private HOME, even one whose `registry` links to
+/// the same bytes — marks every dependency, and everything built on it, dirty: a clone's copied
+/// `target/` would rebuild from scratch. Sharing the path is therefore only possible once host
+/// setup has relocated both caches; until then a sandbox keeps a private `$CARGO_HOME`, and
+/// `cowshed doctor` says why.
+pub fn shared_host_cargo_home(home: &Path, caches: &Path) -> Option<PathBuf> {
+    let cargo_home = host_cargo_home(home);
+    SHARED_CARGO_CACHE_DIRECTORIES
+        .into_iter()
+        .all(|directory| {
+            matches!(
+                (
+                    std::fs::canonicalize(cargo_home.join(directory)),
+                    std::fs::canonicalize(shared_cargo_cache_directory(caches, directory)),
+                ),
+                (Ok(host), Ok(shared)) if host == shared
+            )
+        })
+        .then_some(cargo_home)
+}
+
+/// Tool caches host setup relocates onto the caches volume beside cargo's, as `(path under HOME,
+/// path under the caches root)`; every sandbox shares the second read-write.
+pub const RELOCATED_TOOL_CACHES: [(&str, &str); 4] = [
+    (".cache/zig", "zig"),
+    (".gradle/caches", "gradle/caches"),
+    (".cache/nix", "nix/cache"),
+    (".local/state/nix", "nix/state"),
+];
+
+/// Go's module and build caches, shared like the relocated ones but configured directly through
+/// Go's env file (03_caches.md), so nothing on the host is relocated for them.
+const DIRECT_TOOL_CACHES: [&str; 2] = ["go/mod", "go/build"];
 
 /// The host bun install cache, shared read-only with every sandbox.
 ///
@@ -133,8 +174,8 @@ pub fn host_cargo_registry(home: &Path) -> PathBuf {
 /// an extracted, content-hashed, immutable tarball. A workspace clone therefore carries links
 /// into the host cache, and Seatbelt matches the RESOLVED path - without this grant every
 /// `require` through such a link fails with EPERM inside the sandbox while the same tree works
-/// on the host. Same posture as [`host_cargo_registry`]: the download side is shared read-only,
-/// and `~/.bun` otherwise (the `bun` binary under `bin`, `.bunfig`) gets no grant.
+/// on the host. The download side is shared read-only, and `~/.bun` otherwise (the `bun` binary
+/// under `bin`, `.bunfig`) gets no grant.
 pub fn host_bun_install_cache(home: &Path) -> PathBuf {
     home.join(".bun/install/cache")
 }
@@ -246,6 +287,9 @@ pub struct SandboxConfig {
     /// by exactly the workspaces that asked for `--git-worktree` and never implied by the
     /// baseline.
     pub git_worktree_repository: Option<PathBuf>,
+    /// The host `$CARGO_HOME` every child builds against, when its caches are the shared ones
+    /// ([`shared_host_cargo_home`]); `None` leaves `$CARGO_HOME` following the private HOME.
+    pub shared_cargo_home: Option<PathBuf>,
 }
 
 /// Read-only jobs keep writable process state within the existing exec-temp carve-back.
@@ -535,38 +579,50 @@ pub fn seatbelt_profile(
         push_readable_ancestors(&mut profile, socket)?;
     }
     push_subpath_rule(&mut profile, "allow file-read*", caches)?;
-    for suffix in [
-        "cargo/registry",
-        "cargo/git",
-        // sccache is deliberately absent: every disk-cache read and write
-        // happens inside the host-owned sccache daemon (source-verified for
-        // sccache 0.16 — DiskCache is instantiated only in the server), which
-        // workspaces reach over the allowed unix socket. Sandboxes keep read
-        // through the caches-wide allow above; the store stays daemon-write-only.
-        "zig",
-        "gradle/caches",
-        "go/mod",
-        "go/build",
-        "nix/cache",
-        "nix/state",
-    ] {
+    // A child reaches these through the host `$CARGO_HOME`'s relocated `registry` and `git`
+    // links, and Seatbelt matches the resolved path.
+    for directory in SHARED_CARGO_CACHE_DIRECTORIES {
+        push_subpath_rule(
+            &mut profile,
+            "allow file-read* file-write*",
+            &shared_cargo_cache_directory(caches, directory),
+        )?;
+    }
+    if let Some(cargo_home) = &config.shared_cargo_home {
+        // The directory and its two cache links resolve for cargo; the only files a child may
+        // write at the root are cargo's own locks and usage database. Nothing else there is
+        // granted, and its configuration, credentials and binaries stay hard denies.
+        push_readable_ancestors(&mut profile, cargo_home)?;
+        push_literal_rule(&mut profile, "allow file-read*", cargo_home)?;
+        for directory in SHARED_CARGO_CACHE_DIRECTORIES {
+            push_literal_rule(
+                &mut profile,
+                "allow file-read*",
+                &cargo_home.join(directory),
+            )?;
+        }
+        for file in CARGO_HOME_STATE_FILES {
+            push_literal_rule(
+                &mut profile,
+                "allow file-read* file-write*",
+                &cargo_home.join(file),
+            )?;
+        }
+    }
+    // sccache is deliberately absent: every disk-cache read and write happens inside the
+    // host-owned sccache daemon (source-verified for sccache 0.16 — DiskCache is instantiated
+    // only in the server), which workspaces reach over the allowed unix socket. Sandboxes keep
+    // read through the caches-wide allow above; the store stays daemon-write-only.
+    for suffix in RELOCATED_TOOL_CACHES
+        .map(|(_, shared)| shared)
+        .into_iter()
+        .chain(DIRECT_TOOL_CACHES)
+    {
         push_subpath_rule(
             &mut profile,
             "allow file-read* file-write*",
             &caches.join(suffix),
         )?;
-    }
-    // The host cargo registry, reached through symlinks the supervisor plants in the private
-    // HOME's `.cargo`. Seatbelt matches the resolved path, so the link is inert without these
-    // rules and the grant has to name the host path, not the link. `file-read-data` on `/` is not
-    // enough: cargo lists the index and stats archives, and that is `file-read*` metadata, which
-    // no rule grants inside the user's home. Read-only is the whole posture — the download side of
-    // the registry is shared, the unpacked side is per-workspace and writable.
-    let cargo_registry = host_cargo_registry(&config.home);
-    for directory in SHARED_CARGO_REGISTRY_DIRECTORIES {
-        let path = cargo_registry.join(directory);
-        push_subpath_rule(&mut profile, "allow file-read*", &path)?;
-        push_readable_ancestors(&mut profile, &path)?;
     }
     let bun_cache = host_bun_install_cache(&config.home);
     push_subpath_rule(&mut profile, "allow file-read*", &bun_cache)?;
@@ -690,7 +746,9 @@ fn hard_denies<'a>(
         Cow::Owned(home.join(".npmrc")),
         Cow::Owned(home.join(".pypirc")),
         Cow::Owned(home.join(".cargo/config.toml")),
+        Cow::Owned(home.join(".cargo/config")),
         Cow::Owned(home.join(".cargo/credentials.toml")),
+        Cow::Owned(home.join(".cargo/credentials")),
         Cow::Owned(home.join(".cargo/bin")),
         Cow::Owned(home.join(".gradle/gradle.properties")),
         Cow::Owned(home.join("go")),
@@ -846,6 +904,7 @@ mod tests {
             allowed_unix_sockets: vec![PathBuf::from("/var/run/nix/daemon-socket/socket")],
             additional_denies: vec![],
             git_worktree_repository: None,
+            shared_cargo_home: None,
         }
     }
 
@@ -1122,53 +1181,104 @@ mod tests {
         assert!(store_deny < socket_literal);
     }
 
-    /// The download side of the host cargo registry is readable, the credential side is not, and
-    /// nothing in the host registry becomes writable.
+    /// With shared caches, a child builds against the host `$CARGO_HOME`: the caches are shared
+    /// read-write, and at the root it may write cargo's locks and usage database and nothing else.
+    /// Configuration, credentials and binaries stay denied, after every grant.
     #[test]
-    fn host_cargo_registry_is_readable_download_cache_only() {
-        let config = config(RunSandboxMode::ReadWrite);
-        assert_eq!(
-            host_cargo_registry(&config.home),
-            PathBuf::from("/Users/tester/.cargo/registry")
-        );
+    fn a_shared_cargo_home_grants_its_caches_and_state_files_only() {
+        let mut config = config(RunSandboxMode::ReadWrite);
+        config.shared_cargo_home = Some(PathBuf::from("/Users/tester/.cargo"));
         let profile = seatbelt_profile(&config, SandboxProfileRole::ExecutedChild).unwrap();
 
-        for directory in SHARED_CARGO_REGISTRY_DIRECTORIES {
-            let path = format!("/Users/tester/.cargo/registry/{directory}");
+        for directory in SHARED_CARGO_CACHE_DIRECTORIES {
+            let path = shared_cargo_cache_directory(Path::new(CACHES_ROOT), directory);
             assert!(
-                profile.contains(&format!("(allow file-read* (subpath \"{path}\"))")),
-                "{directory} is not readable"
-            );
-            assert!(
-                !profile.contains(&format!(
-                    "(allow file-read* file-write* (subpath \"{path}\"))"
+                profile.contains(&format!(
+                    "(allow file-read* file-write* (subpath \"{}\"))",
+                    path.display()
                 )),
-                "{directory} must never be writable"
+                "{directory} is not shared read-write"
             );
         }
-        // Unpacking is the sandbox's own work inside the private HOME; granting the host's
-        // unpacked tree would hand a workspace paths it must never be able to alias.
-        assert!(!profile.contains("/Users/tester/.cargo/registry/src"));
-
-        // Path resolution needs the exact ancestors, and no more: `~/.cargo` is readable as a
-        // directory while its credential, global config, and PATH binaries stay denied.
         assert!(profile.contains("(allow file-read* (literal \"/Users/tester/.cargo\"))"));
-        assert!(!profile.contains("(allow file-read* (subpath \"/Users/tester/.cargo\"))"));
-        for denied in ["config.toml", "credentials.toml", "bin"] {
+        for file in CARGO_HOME_STATE_FILES {
+            assert!(profile.contains(&format!(
+                "(allow file-read* file-write* (literal \"/Users/tester/.cargo/{file}\"))"
+            )));
+        }
+        assert!(!profile.contains("(subpath \"/Users/tester/.cargo\")"));
+        for denied in [
+            "config.toml",
+            "config",
+            "credentials.toml",
+            "credentials",
+            "bin",
+        ] {
             let path = format!("/Users/tester/.cargo/{denied}");
-            let grant = profile
-                .rfind("(allow file-read* (subpath \"/Users/tester/.cargo/registry/index\"))")
-                .unwrap();
             let deny = profile
                 .rfind(&format!(
                     "(deny file-read* file-write* (literal \"{path}\") (subpath \"{path}\"))"
                 ))
                 .unwrap_or_else(|| panic!("{denied} must stay denied"));
-            assert!(
-                grant < deny,
-                "{denied} deny must outlive the registry grant"
-            );
+            let last_grant = profile
+                .rfind("(allow file-read* file-write* (literal \"/Users/tester/.cargo/")
+                .unwrap();
+            assert!(last_grant < deny, "{denied} deny must outlive the grants");
         }
+    }
+
+    /// Without shared caches `$CARGO_HOME` stays in the private HOME and nothing in the host's is
+    /// granted.
+    #[test]
+    fn an_unshared_cargo_home_grants_nothing_in_the_host_cargo_home() {
+        let profile = seatbelt_profile(
+            &config(RunSandboxMode::ReadWrite),
+            SandboxProfileRole::ExecutedChild,
+        )
+        .unwrap();
+        assert!(!profile.contains("(allow file-read* (literal \"/Users/tester/.cargo\"))"));
+        assert!(
+            !profile.contains("(allow file-read* file-write* (literal \"/Users/tester/.cargo/")
+        );
+    }
+
+    /// Only a `$CARGO_HOME` whose `registry` and `git` both resolve to the shared caches is shared.
+    #[test]
+    fn the_host_cargo_home_is_shared_only_when_both_caches_resolve_to_the_shared_ones() {
+        let root =
+            std::env::temp_dir().join(format!("cowshed-shared-cargo-home-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let home = root.join("home");
+        let caches = root.join("caches");
+        let cargo_home = host_cargo_home(&home);
+        std::fs::create_dir_all(&cargo_home).unwrap();
+        for directory in SHARED_CARGO_CACHE_DIRECTORIES {
+            std::fs::create_dir_all(shared_cargo_cache_directory(&caches, directory)).unwrap();
+        }
+
+        // An unrelocated host: real directories are private caches, not the shared ones.
+        std::fs::create_dir_all(cargo_home.join("registry")).unwrap();
+        std::os::unix::fs::symlink(
+            shared_cargo_cache_directory(&caches, "git"),
+            cargo_home.join("git"),
+        )
+        .unwrap();
+        assert_eq!(shared_host_cargo_home(&home, &caches), None);
+
+        // A link that resolves anywhere else is not sharing either.
+        std::fs::remove_dir(cargo_home.join("registry")).unwrap();
+        std::os::unix::fs::symlink(root.join("elsewhere"), cargo_home.join("registry")).unwrap();
+        assert_eq!(shared_host_cargo_home(&home, &caches), None);
+
+        std::fs::remove_file(cargo_home.join("registry")).unwrap();
+        std::os::unix::fs::symlink(
+            shared_cargo_cache_directory(&caches, "registry"),
+            cargo_home.join("registry"),
+        )
+        .unwrap();
+        assert_eq!(shared_host_cargo_home(&home, &caches), Some(cargo_home));
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     /// Bun's isolated linker symlinks `node_modules/.bun/<pkg>` into the host install cache, so a

@@ -102,7 +102,8 @@ Shape:
   (subpath "~/.ssh") (subpath "~/.gnupg") (subpath "~/.aws")
   (subpath "~/.config/gh") (literal "~/.netrc")
   (literal "~/.npmrc") (literal "~/.pypirc")           ;; user-level, may hold auth
-  (literal "~/.cargo/config.toml") (literal "~/.cargo/credentials.toml")
+  (literal "~/.cargo/config.toml") (literal "~/.cargo/config")
+  (literal "~/.cargo/credentials.toml") (literal "~/.cargo/credentials")
   (subpath "~/.cargo/bin")                             ;; on PATH — write = persistence escape
   (literal "~/.gradle/gradle.properties")
   (subpath "~/go")                                     ;; misconfig tripwire, not a secret (see notes)
@@ -155,7 +156,11 @@ Notes:
   the gateway writes layer-1 artifacts — 03_caches.md, 05_gateway.md).
 - `~/.cargo` and `~/.gradle` are deliberately _not_ relocated wholesale to the cache volume — only their cache subtrees
   are (03_caches.md). The deny list above pins their config, credential, and PATH-resolved binary paths to the host
-  precisely because the cache volume is sandbox-writable.
+  precisely because the cache volume is sandbox-writable. Once cargo's two caches are relocated, a child builds with
+  `CARGO_HOME=~/.cargo` (the host's literal path, which is what keeps cargo's dependency fingerprints equal across
+  checkouts), and its profile adds exactly: a literal read of `~/.cargo`, of its `registry` and `git` links, and
+  read-write literals for cargo's root state files `.package-cache`, `.package-cache-mutate`, `.global-cache` and
+  `.global-cache-journal`. The denies above still follow every one of those grants.
 - The `~/go` deny is a **misconfiguration tripwire, not secret protection**: once the in-image `GOENV` wiring
   (03_caches.md) is in place nothing should ever touch `~/go` — `GOMODCACHE`/`GOCACHE` live on the caches volume,
   `GOPATH`/`GOBIN` in-image. A go invocation that missed the wiring (unwrapped spawn, editor without direnv) would

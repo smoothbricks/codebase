@@ -11,8 +11,8 @@ _validating_, and the deployment postures (which uid runs all of this). The NixO
 ```nix
 programs.cowshed = {
   enable = true;               # puts the cowshed binary in home.packages
-  relocations = true;          # cache-subtree symlinks: ~/.cargo/{registry,git}, ~/.cache/zig,
-                               #   ~/.gradle/caches (+ other gradle cache dirs), sccache default → /private/cowshed/caches/…
+  relocations = true;          # cache-subtree symlinks: ~/.cargo/{registry,git}, ~/.cache/zig, ~/.gradle/caches,
+                               #   ~/.cache/nix, ~/.local/state/nix → /private/cowshed/caches/… (03_caches.md table)
   gateway.launchd = true;      # dev.cowshed.gateway LaunchAgent (HM manages ~/Library/LaunchAgents on darwin)
   sccache.launchd = true;      # dev.cowshed.sccache LaunchAgent: host-owned foreground sccache UDS server
                                #   (03_caches.md "The sccache daemon"); imperative counterpart: cowshed sccache start
@@ -26,8 +26,8 @@ programs.cowshed = {
 ```
 
 With the module enabled, cowshed's last `~/Library` residue (the launchd plists) becomes a home-manager generation —
-declared, rollbackable, never drifting. Combined with the store volume mounted at `/private/cowshed/store` (01_storage.md), the
-Data-volume home footprint is: one empty mountpoint directory, plus HM-managed artifacts.
+declared, rollbackable, never drifting. Combined with the store volume mounted at `/private/cowshed/store`
+(01_storage.md), the Data-volume home footprint is: one empty mountpoint directory, plus HM-managed artifacts.
 
 On Linux, `programs.cowshed.linuxConnector` (and `services.cowshed-runner` in CI) installs the controller-side launcher
 and declares the dedicated connector uid/process restrictions and cgroup subtree. The launcher may enter the already
@@ -57,10 +57,11 @@ not configured: HM-created symlinks resolve into `/nix/store` (verification item
 `repo_id`, normalized from a chosen remote URL to lowercase `owner/repo`. The binding records that chosen remote and
 validation requires its URL to produce the recorded `repo_id`; discovery may propose a binding but never silently mint
 one. Multiple bindings may exist with exactly one primary, while a local-only repository requires an explicit `repo_id`.
-Trusted policy lives at `/private/cowshed/store/<owner>/<repo>/policy.json`, with `owner` and `repo` encoded as separate, path-safe
-components. Home-manager or the trusted host bootstrap owns that file; `adopt`, `ensure`, workspaces, agents, and
-repository content may validate it but never create or rewrite it. Missing policy or an inconsistent binding is a
-bootstrap error with a declarative remediation hint, never an imperative fallback derived from a checkout path.
+Trusted policy lives at `/private/cowshed/store/<owner>/<repo>/policy.json`, with `owner` and `repo` encoded as
+separate, path-safe components. Home-manager or the trusted host bootstrap owns that file; `adopt`, `ensure`,
+workspaces, agents, and repository content may validate it but never create or rewrite it. Missing policy or an
+inconsistent binding is a bootstrap error with a declarative remediation hint, never an imperative fallback derived from
+a checkout path.
 
 **What stays imperative always**, on every host: volume creation (`diskutil apfs addVolume` — stateful, hardware-
 adjacent) and every per-project/per-workspace artifact (images, grants, tokens, CA keys). Native volume creation is
@@ -77,14 +78,14 @@ workspace authority.
 ## Deployment postures
 
 Paths are uid-relative under every posture: cowshed state is rooted at `/private/cowshed/store`, and trusted policy is
-`/private/cowshed/store/<owner>/<repo>/policy.json`. A posture decides _which uid owns that root and its policy_, never derives a
-second identity from a machine-local checkout path. Host activation and repository bootstrap MUST run as that owning uid
-(or a trusted system service writing on its behalf); a workspace, remote editor, or personal-session broker cannot
-bootstrap policy. Changing postures is an explicit reprovision into the new owner's root, not a recursive `chown`,
-shared-policy mount, or rediscovery. Multiple repository identities remain separate path-safe owner/repo trees, with the
-binding's single primary identity selecting the default policy. Fixed cross-user state was considered and rejected:
-sharing would force a group-ACL model through controller-owned policy and grant files (0600), supervisor and gateway
-sockets, volume ownership, and Keychain access. Same-uid-or-nothing.
+`/private/cowshed/store/<owner>/<repo>/policy.json`. A posture decides _which uid owns that root and its policy_, never
+derives a second identity from a machine-local checkout path. Host activation and repository bootstrap MUST run as that
+owning uid (or a trusted system service writing on its behalf); a workspace, remote editor, or personal-session broker
+cannot bootstrap policy. Changing postures is an explicit reprovision into the new owner's root, not a recursive
+`chown`, shared-policy mount, or rediscovery. Multiple repository identities remain separate path-safe owner/repo trees,
+with the binding's single primary identity selecting the default policy. Fixed cross-user state was considered and
+rejected: sharing would force a group-ACL model through controller-owned policy and grant files (0600), supervisor and
+gateway sockets, volume ownership, and Keychain access. Same-uid-or-nothing.
 
 ### Posture A — single account (default)
 
@@ -249,10 +250,10 @@ remote-backend shell or explicit uid switch is fine and expected.
 
 ## Tradeoffs
 
-**Imperative-only host setup rejected.** `adopt` silently symlinking `~/.cargo/registry` on a home-manager host is
-exactly the out-of-band drift HM users adopted HM to eliminate; the next `home-manager switch` may fight it. Dual-mode
-costs one detection check and keeps both audiences: nix hosts get generation-owned state, everyone else keeps
-zero-config adopt.
+**Imperative-only host setup rejected.** cowshed symlinking `~/.cargo/registry` on a home-manager host is exactly the
+out-of-band drift HM users adopted HM to eliminate; the next `home-manager switch` may fight it. Dual-mode costs one
+detection check and keeps both audiences: nix hosts get generation-owned state, everyone else relocates with one
+explicit `cowshed setup --imperative-host-setup`.
 
 **Fixed shared path rejected** (see Deployment postures): a group-writable shared state root breaks the 0600
 controller-owned policy and grant model and Keychain scoping for no gain — the uid boundary is the point of posture B,

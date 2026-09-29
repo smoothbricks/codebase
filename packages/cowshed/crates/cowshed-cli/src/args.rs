@@ -199,6 +199,10 @@ pub struct SetupArgs {
     /// Build the patched sccache from cowshed's own nix flake, root the result, and start its
     /// LaunchAgent. Opt-in because not every cowshed user writes Rust and it requires nix.
     pub sccache: bool,
+    /// Relocate the host's own read-at-build caches onto the caches volume. Opt-in because it
+    /// moves directories out of the user's home, which only a host no declarative manager owns may
+    /// have done imperatively.
+    pub imperative_host_setup: bool,
 }
 
 /// `start` takes the cache cap because the cap is the one thing a host operator has to be able to
@@ -636,6 +640,7 @@ fn cli_command() -> ClapCommand {
             flag("uninstall"),
             flag("force"),
             flag("sccache"),
+            flag("imperative-host-setup"),
             value("mount-root"),
         ]))
         .subcommand(leaf("new").arg(positional("name", 0..=1)).args([
@@ -1560,6 +1565,10 @@ const SETUP: CommandSpec = CommandSpec {
             spelling: "--sccache",
             meaning: "build the patched sccache from the shipped nix flake, root it, and run it as a LaunchAgent (requires nix)",
         },
+        Opt {
+            spelling: "--imperative-host-setup",
+            meaning: "move the host's cargo, zig, gradle and nix caches onto the caches volume and link them back (hosts no declarative manager owns)",
+        },
     ],
 };
 
@@ -1580,6 +1589,7 @@ fn parse_setup(matches: &ArgMatches, global: &GlobalOptions) -> Result<Command, 
         None => None,
     };
     let sccache = flagged(matches, "sccache");
+    let imperative_host_setup = flagged(matches, "imperative-host-setup");
     if mount_root.is_some() && (uninstall || force) {
         return Err(UsageError::new(
             "--mount-root cannot be combined with --uninstall",
@@ -1589,6 +1599,12 @@ fn parse_setup(matches: &ArgMatches, global: &GlobalOptions) -> Result<Command, 
     if sccache && (uninstall || force) {
         return Err(UsageError::new(
             "--sccache installs sccache; --uninstall removes it",
+            USAGE,
+        ));
+    }
+    if imperative_host_setup && (uninstall || force) {
+        return Err(UsageError::new(
+            "--imperative-host-setup relocates the host caches; --uninstall leaves them alone",
             USAGE,
         ));
     }
@@ -1603,6 +1619,7 @@ fn parse_setup(matches: &ArgMatches, global: &GlobalOptions) -> Result<Command, 
         force,
         mount_root,
         sccache,
+        imperative_host_setup,
     }))
 }
 
@@ -2936,6 +2953,7 @@ mod tests {
             force: false,
             mount_root: None,
             sccache: false,
+            imperative_host_setup: false,
         };
         assert_eq!(
             parse_args(["setup"]).unwrap().command,
@@ -2957,6 +2975,7 @@ mod tests {
                 force: false,
                 mount_root: None,
                 sccache: false,
+                imperative_host_setup: false,
             })
         );
         assert_eq!(
@@ -2968,6 +2987,7 @@ mod tests {
                 force: true,
                 mount_root: None,
                 sccache: false,
+                imperative_host_setup: false,
             })
         );
 
@@ -2980,12 +3000,29 @@ mod tests {
                 force: false,
                 mount_root: None,
                 sccache: true,
+                imperative_host_setup: false,
             })
         );
         let error = parse_args(["setup", "--sccache", "--uninstall"]).unwrap_err();
         assert_eq!(
             error.message,
             "--sccache installs sccache; --uninstall removes it"
+        );
+
+        // Relocating the host caches is opt-in too, and never part of a teardown.
+        assert_eq!(
+            parse_args(["setup", "--imperative-host-setup"])
+                .unwrap()
+                .command,
+            Command::Setup(SetupArgs {
+                imperative_host_setup: true,
+                ..REPAIR
+            })
+        );
+        let error = parse_args(["setup", "--imperative-host-setup", "--uninstall"]).unwrap_err();
+        assert_eq!(
+            error.message,
+            "--imperative-host-setup relocates the host caches; --uninstall leaves them alone"
         );
 
         let Command::Setup(configured) =

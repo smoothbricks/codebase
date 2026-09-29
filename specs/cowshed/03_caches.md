@@ -120,37 +120,57 @@ them there; they always contain an endpoint URL, never credentials.
   reach the personal session); personal-session devices appear as explicitly-named remote targets and route through the
   gateway's `/sim/` endpoint (05_gateway.md) under the `sim` grant axis (04_sandbox.md). Tools that hardcode
   `/usr/bin/xcrun` bypass the shim and degrade to dev-local simulators — the safe default.
-- **Host-level relocation, once — cache subtrees only**: at first adopt on a host (idempotent, re-checked by `doctor`),
-  the read-at-build tools' _cache_ directories resolve to these exact dedicated roots:
+- **Host-level relocation, once — cache subtrees only**: `cowshed setup --imperative-host-setup` (idempotent, re-checked
+  by `doctor`) makes the read-at-build tools' _cache_ directories resolve to these exact dedicated roots:
 
-  | Tool default           | cowshed.caches target                    |
-  | ---------------------- | ---------------------------------------- |
-  | `~/.cargo/registry`    | `/private/cowshed/caches/cargo/registry` |
-  | `~/.cargo/git`         | `/private/cowshed/caches/cargo/git`      |
-  | `~/.cache/zig`         | `/private/cowshed/caches/zig`            |
-  | `~/.gradle/caches`     | `/private/cowshed/caches/gradle/caches`  |
-  | sccache platform cache | `/private/cowshed/caches/sccache`        |
-  | `~/.cache/nix`         | `/private/cowshed/caches/nix/cache`      |
-  | `~/.local/state/nix`   | `/private/cowshed/caches/nix/state`      |
+  | Tool default         | cowshed.caches target                    |
+  | -------------------- | ---------------------------------------- |
+  | `~/.cargo/registry`  | `/private/cowshed/caches/cargo/registry` |
+  | `~/.cargo/git`       | `/private/cowshed/caches/cargo/git`      |
+  | `~/.cache/zig`       | `/private/cowshed/caches/zig`            |
+  | `~/.gradle/caches`   | `/private/cowshed/caches/gradle/caches`  |
+  | `~/.cache/nix`       | `/private/cowshed/caches/nix/cache`      |
+  | `~/.local/state/nix` | `/private/cowshed/caches/nix/state`      |
 
-  Go remains direct-configured as `/private/cowshed/caches/go/{mod,build}`. Gateway artifacts remain outside every
-  writable tool root at `mirror/` and `repo-mirrors/`.
+  Each host path becomes a symlink to its target. An absent host path is linked; a real directory is moved first — a
+  copy across volumes into a staging directory beside the target, published with one rename, and only then is the
+  original removed — provided the target is missing or empty. A host path and a target that both hold a cache, or a host
+  path that already links elsewhere, is a conflict: setup leaves both exactly as they are, names them, and exits
+  non-zero. Cargo's two move while setup holds cargo's own `.package-cache` and `.package-cache-mutate` locks, so no
+  cargo process reads or writes them mid-copy; a cargo process holding a lock refuses the run. sccache's platform cache
+  is not linked: the store is daemon-write-only, and `cowshed setup` instead writes sccache's own config so a store-less
+  client caches in `/private/cowshed/caches/sccache` (below). Go remains direct-configured as
+  `/private/cowshed/caches/go/{mod,build}`. Gateway artifacts remain outside every writable tool root at `mirror/` and
+  `repo-mirrors/`.
 
-  **The parent config directories stay on the host.** `~/.cargo/config.toml`, `~/.cargo/credentials.toml`,
-  `~/.cargo/bin` (on PATH), and `~/.gradle/gradle.properties` are _not_ relocated and are on the secret deny list
-  (04_sandbox.md) — relocating them wholesale would put user config, credentials, and PATH-resolved binaries on a
-  sandbox-writable volume, a persistence-escape surface. No `CARGO_HOME`, `ZIG_GLOBAL_CACHE_DIR`, `GRADLE_USER_HOME`, or
-  `SCCACHE_DIR` exports exist in workspaces (`SCCACHE_DIR` is pinned only in the host sccache daemon's launchd
+  **Every checkout builds against the host's literal `$CARGO_HOME`.** Cargo fingerprints a registry or git dependency by
+  the absolute path of its source under `$CARGO_HOME` (measured: the same registry reached through a different
+  `$CARGO_HOME` path, even a symlink to the same bytes, recompiles the dependency and everything built on it). A
+  sandbox's `$CARGO_HOME` following its private `HOME` would therefore rebuild every dependency a clone's copied
+  `target/` already holds. Once both of cargo's caches are relocated, every sandboxed child gets
+  `CARGO_HOME=<host home>/.cargo` — the path the host itself builds against — and its profile admits exactly that
+  directory, its two cache links, and the files cargo writes at its root (the package-cache locks and the
+  `.global-cache` usage database with its journal). Until then a sandbox keeps a private `$CARGO_HOME` and `doctor`
+  reports each unshared cache.
+
+  **The parent config directories stay on the host.** `~/.cargo/config.toml`, `~/.cargo/config`,
+  `~/.cargo/credentials.toml`, `~/.cargo/credentials`, `~/.cargo/bin` (on PATH), and `~/.gradle/gradle.properties` are
+  _not_ relocated and are on the secret deny list (04_sandbox.md) — relocating them wholesale would put user config,
+  credentials, and PATH-resolved binaries on a sandbox-writable volume, a persistence-escape surface; a sandbox building
+  against the host `$CARGO_HOME` still cannot read or write any of them. No `ZIG_GLOBAL_CACHE_DIR`, `GRADLE_USER_HOME`,
+  or `SCCACHE_DIR` exports exist in workspaces (`SCCACHE_DIR` is pinned only in the host sccache daemon's launchd
   environment). Go needs no symlink at all — `GOMODCACHE`/`GOCACHE` are directly configurable in its env file (above),
   which is strictly cleaner than relocating a default path. Profile generation canonicalizes symlinked paths when
   emitting write grants (the `/var` → `/private/var` handling generalizes).
 
   On home-manager/NixOS/nix-darwin hosts this relocation is **declarative and mandatory**: the module creates the exact
-  links/bindings above as generation-managed artifacts, including the two Nix subdirectories, and `adopt`/`ensure` only
-  validate. They never mutate module-owned paths. The sole exception is an explicitly imperative, non-declarative host:
-  when no supported declarative manager owns the paths, `cowshed adopt --imperative-host-setup` may create the same
-  links after an explicit confirmation. There is no automatic fallback from failed declarative validation; mixed
-  ownership is a conflict and `doctor` points to the declarative option that must be fixed.
+  links/bindings above as generation-managed artifacts, including the two Nix subdirectories, and `setup`/`ensure` only
+  validate. They never mutate module-owned paths: a host path that links into `/nix/store` anywhere but its target is a
+  conflict naming the module. The sole exception is an explicitly imperative, non-declarative host: when no supported
+  declarative manager owns the paths, `cowshed setup --imperative-host-setup` creates the same links; the flag is the
+  confirmation, and a default `setup` never moves anything out of the user's home. There is no automatic fallback from
+  failed declarative validation; mixed ownership is a conflict and `doctor` points to the declarative option that must
+  be fixed.
 
 - **Environment variables: at most three load-bearing.**
   - `BUN_INSTALL_CACHE_DIR` is **retired** — its verification passed (relative `[install.cache] dir` works, above); the

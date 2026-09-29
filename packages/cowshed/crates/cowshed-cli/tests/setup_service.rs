@@ -19,6 +19,7 @@ use cowshed_cli::setup_service::{
     HostArtifactRemoval, HostSetup, MainMounts, SccacheInstall, WorkspaceCensus,
     dispatch as setup_dispatch,
 };
+use cowshed_core::host_caches::{HostCache, HostCacheRelocation, Relocation};
 use cowshed_core::repository::RepoId;
 use cowshed_core::storage::bootstrap::{
     FstabOutcome, HostAction, HostActionOutcome, HostActionResult, HostSetupPlan, HostSetupReport,
@@ -51,6 +52,9 @@ struct FakeHost {
     /// What `setup --sccache` found, so the opt-in rows and the non-zero exit are provable without
     /// nix, a flake, or launchd.
     sccache_install: SccacheInstall,
+    /// What `setup --imperative-host-setup` did to each host cache, so the rows and the exit are
+    /// provable without moving anything out of a real home.
+    relocations: Vec<HostCacheRelocation>,
 }
 
 /// A setup plan whose `non_destructive` is derived exactly the way core derives it — no
@@ -129,6 +133,7 @@ impl Default for FakeHost {
                     "/Users/dev/Library/Application Support/dev.cowshed/nix/sccache",
                 ),
             },
+            relocations: Vec::new(),
         }
     }
 }
@@ -191,6 +196,11 @@ impl HostSetup for FakeHost {
         Ok(self.sccache_install.clone())
     }
 
+    async fn relocate_host_caches(&mut self) -> Result<Vec<HostCacheRelocation>> {
+        self.events.push(String::from("relocate-host-caches"));
+        Ok(self.relocations.clone())
+    }
+
     async fn configure_mount_root(&mut self, mount_root: &std::path::Path) -> Result<PathBuf> {
         self.events
             .push(format!("configure-mount-root:{}", mount_root.display()));
@@ -206,24 +216,28 @@ const REPAIR: SetupArgs = SetupArgs {
     force: false,
     mount_root: None,
     sccache: false,
+    imperative_host_setup: false,
 };
 const REPAIR_WITH_SCCACHE: SetupArgs = SetupArgs {
     uninstall: false,
     force: false,
     mount_root: None,
     sccache: true,
+    imperative_host_setup: false,
 };
 const UNINSTALL: SetupArgs = SetupArgs {
     uninstall: true,
     force: false,
     mount_root: None,
     sccache: false,
+    imperative_host_setup: false,
 };
 const FORCED_UNINSTALL: SetupArgs = SetupArgs {
     uninstall: true,
     force: true,
     mount_root: None,
     sccache: false,
+    imperative_host_setup: false,
 };
 
 struct Streams {
@@ -1549,6 +1563,7 @@ async fn setup_mount_root_prints_the_configured_path() {
         force: false,
         mount_root: Some(PathBuf::from("/Users/dev/.cowshed/mnt")),
         sccache: false,
+        imperative_host_setup: false,
     };
     let streams = run(&mut host, args, false, false).await;
     assert_eq!(streams.exit, 0);
@@ -1572,6 +1587,7 @@ async fn setup_mount_root_json_is_empty_success() {
         force: false,
         mount_root: Some(PathBuf::from("/Users/dev/.cowshed/mnt")),
         sccache: false,
+        imperative_host_setup: false,
     };
     let streams = run(&mut host, args, true, false).await;
     assert_eq!(streams.exit, 0);
@@ -1592,6 +1608,7 @@ async fn setup_mount_root_refuses_while_workspaces_are_attached() {
         force: false,
         mount_root: Some(PathBuf::from("/Users/dev/.cowshed/mnt")),
         sccache: false,
+        imperative_host_setup: false,
     };
     let error = refusal(&mut host, args).await;
     assert_eq!(error.code, ErrorCode::Conflict);
@@ -1911,5 +1928,83 @@ async fn a_rooted_build_whose_daemon_never_answered_points_at_launchd() {
             .contains("/nix/store/abc-sccache-0.17.0-cowshed/bin/sccache is installed and rooted"),
         "{}",
         streams.stderr
+    );
+}
+
+/// Relocation is opt-in, runs only onto volumes that came up, names every cache it touched or left,
+/// and a cache left in place fails the run: a scripted setup reading exit 0 would believe the host
+/// shares a cache it does not.
+#[tokio::test]
+async fn a_host_cache_left_in_place_is_named_and_fails_the_run() {
+    let registry = HostCache {
+        host: PathBuf::from("/Users/dev/.cargo/registry"),
+        shared: PathBuf::from("/private/cowshed/caches/cargo/registry"),
+    };
+    let nix = HostCache {
+        host: PathBuf::from("/Users/dev/.cache/nix"),
+        shared: PathBuf::from("/private/cowshed/caches/nix/cache"),
+    };
+    let mut host = FakeHost {
+        relocations: vec![
+            HostCacheRelocation {
+                cache: registry,
+                outcome: Ok(Relocation::Moved),
+            },
+            HostCacheRelocation {
+                cache: nix,
+                outcome: Err(String::from(
+                    "/private/cowshed/caches/nix/cache already holds a cache too",
+                )),
+            },
+        ],
+        ..FakeHost::default()
+    };
+    let args = SetupArgs {
+        imperative_host_setup: true,
+        ..REPAIR
+    };
+
+    let (streams, error) = failing_run(&mut host, args, false).await;
+
+    assert_eq!(error.code.as_str(), "conflict");
+    assert!(
+        error.hint.contains("cowshed setup --imperative-host-setup"),
+        "{}",
+        error.hint
+    );
+    assert!(
+        streams.stderr.contains(
+            "moved /Users/dev/.cargo/registry to /private/cowshed/caches/cargo/registry and linked it back"
+        ),
+        "{}",
+        streams.stderr
+    );
+    assert!(
+        streams
+            .stderr
+            .contains("left /Users/dev/.cache/nix where it is: /private/cowshed/caches/nix/cache already holds a cache too"),
+        "{}",
+        streams.stderr
+    );
+    let relocate = host
+        .events
+        .iter()
+        .position(|event| event == "relocate-host-caches")
+        .expect("the opt-in asks the host to relocate");
+    let execute = host
+        .events
+        .iter()
+        .position(|event| event == "execute")
+        .expect("storage is executed");
+    assert!(execute < relocate, "{:?}", host.events);
+
+    let mut default_host = FakeHost::default();
+    run(&mut default_host, REPAIR, false, false).await;
+    assert!(
+        !default_host
+            .events
+            .contains(&String::from("relocate-host-caches")),
+        "a default setup moved host caches: {:?}",
+        default_host.events
     );
 }

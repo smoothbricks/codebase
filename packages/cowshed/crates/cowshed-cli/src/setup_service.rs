@@ -30,13 +30,14 @@ use crate::sccache_service::{
 };
 use async_trait::async_trait;
 use cowshed_core::api::EmptyResult;
+use cowshed_core::host_caches::{self, HostCacheRelocation, Relocation};
 use cowshed_core::metadata::ImageFormat;
 use cowshed_core::sandbox::sccache_cache_directory;
 use cowshed_core::storage::bootstrap::{
-    FstabOutcome, HostAction, HostActionOutcome, HostActionResult, HostSetupPlan, HostSetupReport,
-    HostUninstallPlan, UninstallFstabOutcome, UninstallReport, UninstallServiceOutcome,
-    VolumeOutcome, VolumeState, execute_host_setup, execute_host_uninstall, plan_host_setup,
-    plan_host_uninstall,
+    CACHES_ROOT, FstabOutcome, HostAction, HostActionOutcome, HostActionResult, HostSetupPlan,
+    HostSetupReport, HostUninstallPlan, UninstallFstabOutcome, UninstallReport,
+    UninstallServiceOutcome, VolumeOutcome, VolumeState, execute_host_setup,
+    execute_host_uninstall, plan_host_setup, plan_host_uninstall,
 };
 use cowshed_core::storage::host_config::{
     AttachedWorkspace, HostConfigError, execute_mount_root_change, plan_mount_root_change,
@@ -242,6 +243,11 @@ pub trait HostSetup: Send {
     /// default-provided because there is no honest default: a host that silently answered
     /// "nothing to do" would report a successful install of something it never built.
     async fn install_sccache(&mut self) -> Result<SccacheInstall>;
+    /// Move the host's own read-at-build caches onto the caches volume and link them back.
+    ///
+    /// Called only for `setup --imperative-host-setup`, after the volumes are up; a default run
+    /// never moves anything out of the user's home.
+    async fn relocate_host_caches(&mut self) -> Result<Vec<HostCacheRelocation>>;
     /// Reconcile installed host-service binaries with the build running this repair.
     ///
     /// Default-empty so test hosts modelling only the volume flows stay valid; the native host
@@ -428,6 +434,45 @@ impl HostSetup for NativeHostSetup {
         sccache_client_config::apply(&path, &SharedStore::new(directory, capacity))
     }
 
+    /// Relocate every host cache, holding cargo's own package-cache locks while cargo's move.
+    ///
+    /// On a blocking thread: a move across volumes is a copy of gigabytes. A cargo process that
+    /// holds its lock right now refuses the whole run instead of racing a copy of the caches it
+    /// is writing.
+    async fn relocate_host_caches(&mut self) -> Result<Vec<HostCacheRelocation>> {
+        let home = self.home.clone();
+        tokio::task::spawn_blocking(move || {
+            let cargo_home = cowshed_core::sandbox::host_cargo_home(&home);
+            let _cargo_lock = if cargo_home.is_dir() {
+                match host_caches::try_lock_cargo_caches(&cargo_home) {
+                    Ok(Some(lock)) => Some(lock),
+                    Ok(None) => {
+                        return Err(CowshedError::conflict(
+                            format!(
+                                "a cargo process holds {}'s package-cache lock",
+                                cargo_home.display()
+                            ),
+                            "let running cargo builds finish, then cowshed setup --imperative-host-setup",
+                        ));
+                    }
+                    Err(error) => {
+                        return Err(CowshedError::internal(format!(
+                            "could not take cargo's package-cache lock in {}: {error}",
+                            cargo_home.display()
+                        )));
+                    }
+                }
+            } else {
+                None
+            };
+            Ok(host_caches::host_caches(&home, Path::new(CACHES_ROOT))
+                .map(host_caches::relocate)
+                .collect())
+        })
+        .await
+        .map_err(|error| CowshedError::internal(format!("host cache relocation failed: {error}")))?
+    }
+
     /// Build the flake, root the result, and start the agent on that store path.
     ///
     /// Storage first, deliberately: the daemon's cache lives on the caches volume, and starting a
@@ -570,7 +615,14 @@ where
     if args.uninstall {
         return uninstall(setup, args.force, json, output).await;
     }
-    repair(setup, args.sccache, json, output).await
+    repair(
+        setup,
+        args.sccache,
+        args.imperative_host_setup,
+        json,
+        output,
+    )
+    .await
 }
 
 async fn set_mount_root<S, W, E>(
@@ -622,6 +674,7 @@ fn host_config_error(error: HostConfigError) -> CowshedError {
 async fn repair<S, W, E>(
     setup: &mut S,
     sccache_requested: bool,
+    relocation_requested: bool,
     json: bool,
     output: &mut Output<W, E>,
 ) -> Result<i32>
@@ -664,6 +717,11 @@ where
         (None, true) => setup.install_sccache().await?,
         _ => SccacheInstall::NotRequested,
     };
+    // Opt-in, and only onto volumes that came up: the caches move onto the caches volume.
+    let relocations = match (&failure, relocation_requested) {
+        (None, true) => setup.relocate_host_caches().await?,
+        _ => Vec::new(),
+    };
     if json {
         // The frozen envelope has no partial state, so a failed run answers `ok:false` and the
         // per-action detail goes to stderr — where progress belongs with `--json` anyway. Silently
@@ -697,6 +755,7 @@ where
             output,
         )?;
     }
+    emit_host_caches(&relocations, output)?;
     if let Some(failure) = failure {
         return Err(partial_setup_failure(failure));
     }
@@ -718,7 +777,36 @@ where
     if let Some(failure) = sccache_install.failure() {
         return Err(failure);
     }
+    let unrelocated = relocations
+        .iter()
+        .filter(|relocation| relocation.outcome.is_err())
+        .count();
+    if unrelocated > 0 {
+        return Err(CowshedError::conflict(
+            format!("{unrelocated} host cache(s) were left where they are"),
+            "resolve each cache named above, then cowshed setup --imperative-host-setup",
+        ));
+    }
     Ok(0)
+}
+
+/// One line per host cache: where it now resolves, or why it was left alone.
+fn emit_host_caches<W: Write, E: Write>(
+    relocations: &[HostCacheRelocation],
+    output: &mut Output<W, E>,
+) -> Result<()> {
+    for relocation in relocations {
+        let host = relocation.cache.host.display();
+        let shared = relocation.cache.shared.display();
+        let line = match &relocation.outcome {
+            Ok(Relocation::AlreadyShared) => format!("{host} already resolves to {shared}"),
+            Ok(Relocation::Linked) => format!("linked {host} to {shared}"),
+            Ok(Relocation::Moved) => format!("moved {host} to {shared} and linked it back"),
+            Err(reason) => format!("left {host} where it is: {reason}"),
+        };
+        output.guidance(&line).map_err(output_error)?;
+    }
+    Ok(())
 }
 
 async fn uninstall<S, W, E>(

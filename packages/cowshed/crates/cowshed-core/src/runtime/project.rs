@@ -9870,6 +9870,7 @@ mod grant_unit_tests {
             allowed_unix_sockets: Vec::new(),
             additional_denies: vec![project_root.to_path_buf()],
             git_worktree_repository: None,
+            shared_cargo_home: None,
         }
     }
 
@@ -10068,6 +10069,10 @@ fn supervisor_sandbox(
             telemetry_root.to_path_buf(),
         ],
         git_worktree_repository: git_worktree_repository(&current.metadata, main_mount),
+        shared_cargo_home: crate::sandbox::shared_host_cargo_home(
+            home,
+            Path::new(crate::storage::bootstrap::CACHES_ROOT),
+        ),
     })
 }
 

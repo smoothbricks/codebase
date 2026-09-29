@@ -364,6 +364,7 @@ fn config() -> WorkspaceSupervisorConfig {
             additional_denies: Vec::new(),
             shed_links: Vec::new(),
             git_worktree_repository: None,
+            shared_cargo_home: None,
         },
         artifacts: ArtifactConfig {
             combined_output_quota_bytes: 1024,

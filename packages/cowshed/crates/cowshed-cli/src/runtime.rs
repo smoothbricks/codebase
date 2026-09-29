@@ -23,6 +23,7 @@ use cowshed_core::api::{
     WorkspacePath, WorkspaceState, validate_command_argv,
 };
 use cowshed_core::git::GitRepository;
+use cowshed_core::host_caches::{self, HostCacheState};
 use cowshed_core::metadata::{
     DetachedWorkspaceMetadata, ImageCapacity, ImageFormat, SlotId, WorkspaceIncarnation,
     WorkspaceName, WorkspaceRole,
@@ -3259,6 +3260,35 @@ fn sccache_finding(status: &SccacheStatus) -> Finding {
     }
 }
 
+/// Every host cache that does not resolve to its shared directory on the caches volume.
+///
+/// Cargo's two decide more than disk: until both are shared, a sandbox keeps a private
+/// `$CARGO_HOME`, and cargo, which fingerprints dependencies by their absolute source path, then
+/// rebuilds every dependency a clone's copied `target/` already holds.
+fn host_cache_findings(home: &Path) -> Vec<Finding> {
+    host_caches::host_caches(home, Path::new(CACHES_ROOT))
+        .filter_map(|cache| {
+            let unshared = format!(
+                "{} is not the shared cache {}",
+                cache.host.display(),
+                cache.shared.display()
+            );
+            let message = match host_caches::inspect(&cache) {
+                HostCacheState::Shared => return None,
+                HostCacheState::Absent | HostCacheState::Movable => unshared,
+                HostCacheState::Conflict(reason) => format!("{unshared}: {reason}"),
+            };
+            Some(Finding {
+                code: "host-cache-unshared".into(),
+                severity: FindingSeverity::Warning,
+                message,
+                hint: "cowshed setup --imperative-host-setup".into(),
+                path: Some(cache.host),
+            })
+        })
+        .collect()
+}
+
 struct HostDiagnosis {
     storage_ready: bool,
     findings: Vec<Finding>,
@@ -3287,6 +3317,7 @@ async fn diagnose_host() -> Result<HostDiagnosis> {
         diagnosis.findings.extend(retired_mount_layout_findings(
             CanonicalRoots::global().store(),
         ));
+        diagnosis.findings.extend(host_cache_findings(&home));
     }
     match gateway_service::service_status().await {
         Ok(status) => diagnosis.findings.extend(gateway_findings(&status)),

@@ -146,17 +146,20 @@ free space with everything else.
 Cargo's shared writable caches are `/private/cowshed/caches/cargo/{registry,git}`; gateway-owned bare repository mirrors
 are separate at `/private/cowshed/caches/repo-mirrors` and must remain sandbox-read-only.
 
-**A sandbox refetches a crate the host already has.** `$CARGO_HOME` follows the private `HOME`, so each workspace has
-its own `.cargo`. Its `registry/index` and `registry/cache` are symlinks to the host's, read-only, and `registry/src` —
-where cargo unpacks — is real and writable inside the mount. A crate already downloaded on the host therefore builds
-offline in a workspace. If those links are missing, the exec predates them or the host has no `~/.cargo/registry` yet;
-the next `cowshed exec` plants them. A real directory sitting where a link belongs is left alone on purpose: that is a
-workspace's own registry state, and cowshed will not delete it to share the host's.
+**A workspace rebuilds every dependency its copied `target/` already holds, or refetches a crate the host has.** Cargo
+fingerprints a registry or git dependency by the absolute path of its source under `$CARGO_HOME`, so every checkout must
+build against one literal `$CARGO_HOME`. A sandbox uses the host's own `~/.cargo` only once `~/.cargo/registry` and
+`~/.cargo/git` both link to `/private/cowshed/caches/cargo/{registry,git}`; until then it keeps a private `$CARGO_HOME`
+in its own HOME, starts with empty caches, and dirties every dependency. `cowshed doctor` reports each unshared cache as
+`host-cache-unshared`; `cowshed setup --imperative-host-setup` moves the host's caches onto the caches volume and links
+them back. It holds cargo's own package-cache locks while cargo's caches move and refuses while a cargo process holds
+one, so run it once builds are idle. A host cache and a shared directory that both already hold a cache are a conflict
+it leaves untouched: keep one, delete the other, and rerun.
 
 **Nix cache/state points at the host filesystem.** On declarative hosts the module must own
-`~/.cache/nix → /private/cowshed/caches/nix/cache` and `~/.local/state/nix → /private/cowshed/caches/nix/state`; `adopt`
+`~/.cache/nix → /private/cowshed/caches/nix/cache` and `~/.local/state/nix → /private/cowshed/caches/nix/state`; `setup`
 and `doctor` only validate. Fix the declarative configuration rather than allowing cowshed to mutate it. The explicit
-`cowshed adopt --imperative-host-setup` fallback is only for a host with no supported declarative owner; it is never an
+`cowshed setup --imperative-host-setup` fallback is only for a host with no supported declarative owner; it is never an
 automatic recovery from mixed or broken ownership.
 
 ## Path-sensitive caches (why a fresh workspace rebuilds more than expected)

@@ -93,6 +93,7 @@ fn workspace(root: &Path, port_base: u16) -> SandboxConfig {
         additional_denies: Vec::new(),
         shed_links: Vec::new(),
         git_worktree_repository: None,
+        shared_cargo_home: None,
     }
 }
 

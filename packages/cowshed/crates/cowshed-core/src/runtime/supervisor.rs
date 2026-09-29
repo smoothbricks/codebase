@@ -138,6 +138,7 @@ impl Default for WorkspaceSupervisorConfig {
                 additional_denies: Vec::new(),
                 shed_links: Vec::new(),
                 git_worktree_repository: None,
+                shared_cargo_home: None,
             },
             artifacts: ArtifactConfig::default(),
             term_grace: Duration::from_secs(2),
@@ -832,43 +833,6 @@ fn gateway_proxy_url(port_base: &str, workspace_token: &WorkspaceToken) -> Strin
     )
 }
 
-/// Point the private HOME's `$CARGO_HOME` registry at the host's download cache.
-///
-/// `$CARGO_HOME` follows `HOME`, so exporting a private HOME hands cargo an empty registry and
-/// every workspace refetches crates the host already has — over the gateway, one CONNECT at a
-/// time. Linking is what makes the profile's read grant reachable: Seatbelt matches resolved
-/// paths, so these links carry the host registry's authority, which is read-only.
-///
-/// `src` — where cargo unpacks an archive — stays in the private environment, so a crate the
-/// host downloaded but never built still unpacks locally. In-image environments remain copy-on-write.
-/// A host with no registry yet yields no links and an ordinary empty
-/// `$CARGO_HOME`; an existing real directory is left alone, because it is a workspace's own
-/// registry state and losing it is worse than not sharing.
-fn link_cargo_registry(private_home: &AnchoredDirectory, host_home: &Path) -> Result<()> {
-    let host_registry = crate::sandbox::host_cargo_registry(host_home);
-    let registry = private_home
-        .child(c".cargo")
-        .and_then(|cargo| cargo.child(c"registry"))
-        .map_err(private_environment_error)?;
-    registry.child(c"src").map_err(private_environment_error)?;
-    let mut name_buffer = [0u8; 256];
-    for directory in crate::sandbox::SHARED_CARGO_REGISTRY_DIRECTORIES {
-        let target = host_registry.join(directory);
-        if !target.is_dir() {
-            continue;
-        }
-        let name = &mut name_buffer[..=directory.len()];
-        name[..directory.len()].copy_from_slice(directory.as_bytes());
-        name[directory.len()] = 0;
-        let name = std::ffi::CStr::from_bytes_with_nul(name)
-            .expect("canonical cargo cache names are bounded directory leaves");
-        registry
-            .ensure_symlink(name, &target)
-            .map_err(private_environment_error)?;
-    }
-    Ok(())
-}
-
 /// The shared nix client cache every sandbox reads and writes: `/private/cowshed/caches/nix/cache`.
 ///
 /// Nix keeps its fetcher cache (URL and lock-hash to store path), tarball cache, git cache and
@@ -878,7 +842,7 @@ fn link_cargo_registry(private_home: &AnchoredDirectory, host_home: &Path) -> Re
 /// gateway proxy, which admits nothing without an egress grant. The store paths already exist
 /// (the host fetched them), only the client-side index is missing. Sharing one cache directory on
 /// the caches volume, which the executed-child profile carves back read-write beside the cargo
-/// registry, lets every workspace see what any one of them has fetched; nix serialises access to
+/// caches, lets every workspace see what any one of them has fetched; nix serialises access to
 /// its sqlite indexes itself.
 pub fn shared_nix_cache_directory() -> PathBuf {
     Path::new(crate::storage::bootstrap::CACHES_ROOT).join("nix/cache")
@@ -886,7 +850,7 @@ pub fn shared_nix_cache_directory() -> PathBuf {
 
 /// Point the private `XDG_CACHE_HOME/nix` at [`shared_nix_cache_directory`].
 ///
-/// Same posture as [`link_cargo_registry`]: a host without the shared resource gets no link and
+/// A host without the shared resource gets no link and
 /// the private cache stands (a CI runner or a box before `cowshed setup` has no caches volume,
 /// and an environment that cannot be shared must not fail the spawn), a link that already
 /// resolves to the shared directory is kept, a stale link is replaced, and a real directory a
@@ -1042,13 +1006,10 @@ async fn sandboxed_command(
     // may rename these paths, but cannot redirect a host write through a link.
     let environment =
         AnchoredDirectory::create(environment_root).map_err(private_environment_error)?;
-    let home_directory = environment
-        .child(c"home")
-        .map_err(private_environment_error)?;
     let cache_directory = environment
         .child(c"cache")
         .map_err(private_environment_error)?;
-    for name in [c"config", c"data", c"run"] {
+    for name in [c"home", c"config", c"data", c"run"] {
         environment.child(name).map_err(private_environment_error)?;
     }
     // TMPDIR must exist even when read-write environment state lives elsewhere.
@@ -1078,7 +1039,6 @@ async fn sandboxed_command(
             "reattach the workspace to mint fresh credentials",
         )
     })?;
-    link_cargo_registry(&home_directory, &sandbox.home)?;
     link_nix_cache(&cache_directory)?;
     link_runtime_dir(sandbox, &private_runtime).await?;
     // Host-side preparation: adopted bindings are controller metadata, not child-readable
@@ -1147,6 +1107,14 @@ async fn sandboxed_command(
         .env("https_proxy", &gateway_http)
         .env("NO_PROXY", loopback_no_proxy)
         .env("no_proxy", loopback_no_proxy);
+    // Cargo fingerprints a registry or git dependency by the absolute path of its source under
+    // `$CARGO_HOME`, so the host and every workspace build against one literal path or a clone's
+    // copied `target/` rebuilds every dependency. A caller's own value would defeat that either
+    // way, so it never passes through: without shared caches cargo follows the private HOME.
+    match &sandbox.shared_cargo_home {
+        Some(cargo_home) => command.env("CARGO_HOME", cargo_home),
+        None => command.env_remove("CARGO_HOME"),
+    };
     // Cargo only honors url.insteadOf through the Git CLI, so every child
     // fetches through it; uv shells out to Git and follows the same include
     // with no extra wiring. The include points at the managed file
@@ -3623,6 +3591,7 @@ mod workspace_toolchain_tests {
             additional_denies: Vec::new(),
             shed_links: Vec::new(),
             git_worktree_repository: None,
+            shared_cargo_home: None,
         }
     }
 
@@ -4248,79 +4217,6 @@ mod sandbox_environment_tests {
             WorkspaceToken::parse(non_canonical).is_err(),
             "a 43-character alphabet-valid string that is not 32 encoded bytes must be refused"
         );
-    }
-
-    #[test]
-    fn cargo_registry_links_the_host_download_cache_and_keeps_unpacking_local() {
-        let root = scratch("cargo-registry");
-        let host_home = root.join("host");
-        let private_home = root.join("mount/.cowshed/home");
-        let host_registry = crate::sandbox::host_cargo_registry(&host_home);
-        for directory in ["index", "cache", "src"] {
-            std::fs::create_dir_all(host_registry.join(directory)).unwrap();
-        }
-
-        let private_directory = AnchoredDirectory::create(&private_home).unwrap();
-        link_cargo_registry(&private_directory, &host_home).unwrap();
-
-        let registry = private_home.join(".cargo/registry");
-        for directory in crate::sandbox::SHARED_CARGO_REGISTRY_DIRECTORIES {
-            assert_eq!(
-                std::fs::read_link(registry.join(directory)).unwrap(),
-                host_registry.join(directory)
-            );
-        }
-        // Unpacking must stay writable inside the mount, so `src` is a real directory and never a
-        // link onto the read-only host tree.
-        let unpacked = registry.join("src");
-        assert!(unpacked.is_dir());
-        assert!(std::fs::read_link(&unpacked).is_err());
-        std::fs::write(unpacked.join("witness"), b"unpacked").unwrap();
-
-        // Idempotent across execs, and a stale link from an earlier host layout is replaced.
-        let stale = registry.join("index");
-        std::fs::remove_file(&stale).unwrap();
-        std::os::unix::fs::symlink(root.join("elsewhere"), &stale).unwrap();
-        link_cargo_registry(&private_directory, &host_home).unwrap();
-        assert_eq!(
-            std::fs::read_link(&stale).unwrap(),
-            host_registry.join("index")
-        );
-        assert_eq!(
-            std::fs::read(unpacked.join("witness")).unwrap(),
-            b"unpacked"
-        );
-
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn cargo_registry_yields_an_ordinary_home_without_a_host_cache() {
-        let root = scratch("cargo-registry-absent");
-        let host_home = root.join("host");
-        let private_home = root.join("mount/.cowshed/home");
-        std::fs::create_dir_all(&host_home).unwrap();
-
-        let private_directory = AnchoredDirectory::create(&private_home).unwrap();
-        link_cargo_registry(&private_directory, &host_home).unwrap();
-
-        let registry = private_home.join(".cargo/registry");
-        assert!(registry.join("src").is_dir());
-        for directory in crate::sandbox::SHARED_CARGO_REGISTRY_DIRECTORIES {
-            assert!(!registry.join(directory).exists());
-        }
-
-        // A workspace that built its own registry before the host had one keeps it: losing a real
-        // directory of registry state is worse than not sharing the host's.
-        let owned = registry.join("index");
-        std::fs::create_dir_all(owned.join("index.crates.io-0000000000000000")).unwrap();
-        std::fs::create_dir_all(crate::sandbox::host_cargo_registry(&host_home).join("index"))
-            .unwrap();
-        link_cargo_registry(&private_directory, &host_home).unwrap();
-        assert!(std::fs::read_link(&owned).is_err());
-        assert!(owned.join("index.crates.io-0000000000000000").is_dir());
-
-        std::fs::remove_dir_all(root).unwrap();
     }
 }
 
