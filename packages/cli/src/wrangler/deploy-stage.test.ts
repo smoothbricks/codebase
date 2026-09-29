@@ -914,6 +914,8 @@ describe('cleanup-pr from stage records', () => {
     const result = await cleanup(await cleanupRoot(), 7, cloudflare);
 
     expect(result).toMatchObject({ stage: 'pr7', scope: SCOPE, recorded: 0, alreadyGone: 0, leftInPlace: [] });
+    expect(result.warning).toContain('an older smoo deployed');
+    expect(result.warning).toContain('named another repository');
     expect(cloudflare.reads).toEqual(['r2']);
     expect(cloudflare.mutations).toEqual([]);
   });

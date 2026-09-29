@@ -8,7 +8,13 @@ import { ensureChromium, runWithChromium } from './playwright/index.js';
 import { resolvePrConflicts } from './pr/index.js';
 import { secretsSet, secretsStatus, secretsSync } from './secrets/commands.js';
 import { secretsRun } from './secrets/run.js';
-import { cleanupPullRequest, deployStage, describeCleanup } from './wrangler/deploy-stage.js';
+import {
+  cleanupPullRequest,
+  deployStage,
+  describeCleanup,
+  describeInventory,
+  inventoryPullRequest,
+} from './wrangler/deploy-stage.js';
 import { deployedVersion } from './wrangler/deployed-version.js';
 import { scaffold } from './wrangler/scaffold.js';
 
@@ -652,8 +658,19 @@ function buildProgram(): Command {
     .command('cleanup-pr')
     .description('Delete what the deploys of this repository\u2019s prN stage recorded, then those records')
     .requiredOption('--pr <number>', 'pull-request number')
-    .action(async (options: { pr: string }) => {
-      console.log(describeCleanup(await cleanupPullRequest(await findRepoRoot(), Number(options.pr))));
+    .option('--dry-run', 'list what cleanup would delete and delete nothing')
+    .option('--json', 'write the result as JSON instead of a sentence')
+    .action(async (options: { pr: string; dryRun?: boolean; json?: boolean }) => {
+      const root = await findRepoRoot();
+      const pr = Number(options.pr);
+      const json = options.json === true;
+      if (options.dryRun === true) {
+        const inventory = await inventoryPullRequest(root, pr);
+        console.log(json ? JSON.stringify(inventory, null, 2) : describeInventory(inventory));
+        return;
+      }
+      const result = await cleanupPullRequest(root, pr);
+      console.log(json ? JSON.stringify(result, null, 2) : describeCleanup(result));
     });
 
   return program;

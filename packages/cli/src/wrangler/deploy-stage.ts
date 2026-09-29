@@ -564,6 +564,8 @@ export interface CleanupResult {
   alreadyGone: number;
   /** Recorded items another owner now holds, by name; they were not deleted. */
   leftInPlace: string[];
+  /** Present exactly when `recorded` is 0: no records never says the stage's items are gone. */
+  warning?: string;
 }
 
 /** Each live item a cleanup would delete, named the way its API answers it; never an R2 object body. */
@@ -619,6 +621,7 @@ export async function cleanupPullRequest(
     },
     alreadyGone: targets.alreadyGone,
     leftInPlace: targets.leftInPlace,
+    ...(keys.length === 0 ? { warning: noRecordsWarning() } : {}),
   };
   try {
     await deleteCleanupTargets(cloudflare, targets, result.deleted);
