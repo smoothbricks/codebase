@@ -1524,7 +1524,8 @@ async fn a_terminal_log_read_answers_from_the_sealed_artifact_not_a_retained_cop
 
 /// A supervisor torn down with its hosting runtime, while a job still runs, was dropped rather
 /// than stopped. No later controller knows that job, so it must end with the supervisor instead
-/// of running on as an orphan nothing can observe or cancel.
+/// of running on as an orphan nothing can observe or cancel — asked first, so a job that stops
+/// its own children on SIGTERM gets to, and killed after the grace.
 #[test]
 fn a_dropped_supervisor_ends_the_jobs_it_still_runs() {
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -1553,7 +1554,10 @@ fn a_dropped_supervisor_ends_the_jobs_it_still_runs() {
     let after: Vec<_> = std::iter::from_fn(|| h.process.try_recv().ok()).collect();
     assert_eq!(
         signals(after),
-        [ProcessObservation::Signal(job, ProcessSignal::Kill)],
+        [
+            ProcessObservation::Signal(job, ProcessSignal::Term),
+            ProcessObservation::Signal(job, ProcessSignal::Kill),
+        ],
         "the running job of a dropped supervisor"
     );
     drop(spawned);

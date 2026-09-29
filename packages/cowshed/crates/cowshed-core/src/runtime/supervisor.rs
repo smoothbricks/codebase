@@ -2023,18 +2023,45 @@ struct SupervisorActor {
 
 /// The actor's run loop ends only once every job is terminal, so an actor dropped with a job still
 /// running was torn down with the runtime that hosts it. No later controller knows that job: it
-/// would run on unobserved and uncancellable, so its process tree ends here with its record. The
-/// kill is best effort; a group that already exited has nothing left to signal.
+/// would run on unobserved and uncancellable, so its process tree ends here with its record.
+///
+/// It ends by the protocol every kill follows — SIGTERM, the term grace, then SIGKILL — so a job
+/// that stops its own children on SIGTERM (Nx's task runner stops task trees it keeps in their
+/// own sessions, beyond this group) gets to. Nothing runs after a drop, so the grace is waited out
+/// here, blocking, and only when a job was still running. A host that wants its jobs' cleanup to
+/// be asynchronous cancels them before it drops the runtime. A group that already exited has
+/// nothing left to signal; any other failure to signal is reported, because the job then outlives
+/// its supervisor.
 impl Drop for SupervisorActor {
     fn drop(&mut self) {
-        for job in self.jobs.values_mut() {
-            if job.terminal() {
-                continue;
-            }
-            if let Some(process) = job.process.as_mut() {
-                let _ = process.signal_process_tree(ProcessSignal::Kill);
-            }
+        let grace = self.term_grace;
+        let mut running = self
+            .jobs
+            .iter_mut()
+            .filter(|(_, job)| !job.terminal())
+            .filter_map(|(id, job)| job.process.as_mut().map(|process| (*id, process)))
+            .collect::<Vec<_>>();
+        if running.is_empty() {
+            return;
         }
+        for (id, process) in &mut running {
+            report_unsignalled(*id, process.signal_process_tree(ProcessSignal::Term));
+        }
+        std::thread::sleep(grace);
+        for (id, process) in &mut running {
+            report_unsignalled(*id, process.signal_process_tree(ProcessSignal::Kill));
+        }
+    }
+}
+
+fn report_unsignalled(job: JobId, signalled: Result<()>) {
+    if let Err(error) = signalled {
+        eprintln!(
+            "cowshed: could not signal job {} of a supervisor that is going away, so it may keep \
+             running: {}",
+            job.get(),
+            error.message
+        );
     }
 }
 
