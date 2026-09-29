@@ -171,12 +171,27 @@ automatic recovery from mixed or broken ownership.
 
 ## Path-sensitive caches (why a fresh workspace rebuilds more than expected)
 
-Cargo incremental state and Xcode DerivedData key on **absolute paths**. Main (fixed path) reuses them perfectly; a
-workspace at `<mount-root>/<owner>/<repo>/<workspace>` does not, so first builds there redo path-keyed work even though
-everything else is warm. This is physics, not breakage. Mitigations, in order: let sccache absorb it (shared,
-path-tolerant for most rustc invocations; already wired); add `--remap-path-prefix`/`trim-paths` to your cargo config if
-the rebuild tax bothers you; keep long-lived personal workspaces (their own paths stay stable, so their incremental
-state stays valid). `bun install`, `node_modules`, zig, and gradle caches are path-independent — unaffected.
+Cargo keys a workspace crate on its path relative to the package, so a workspace at
+`<mount-root>/<owner>/<repo>/<workspace>` finds the units main built fresh (measured: a dev build of a mid-size crate in
+a fresh clone, 208 of 208 units fresh, the incremental workspace crates included). When a fresh workspace still
+rebuilds, run the build with `CARGO_LOG=cargo::compiler::fingerprint=info` and read the `dirty:` reason of the first
+unit that rebuilt:
+
+- **No fingerprint at all** — main never built that unit. The usual cause is a `test` profile that differs from `dev`
+  (every dependency then has two units, and main held the other one) or a toolchain bump since main was last warmed: let
+  `test` inherit `dev`, and warm main with `cowshed exec main -- <canonical build>`.
+- **`PathToSourceChanged`** — a dependency was built under another `$CARGO_HOME`; see the shared cargo caches above.
+- **`the rerun-if-changed instructions changed`** — a build script watches a path outside its package by absolute path;
+  print it relative to the package instead, which is how cargo resolves it.
+- **Incremental on one side only** — the host shell exports `CI`, which turns incremental off for workspace crates
+  whatever the profile says, while a sandbox child never inherits it; build through `cowshed exec`.
+
+The one path problem cargo never reports is the opposite one: a unit that compiled `env!("CARGO_MANIFEST_DIR")` in stays
+fresh in every clone, so a test built in main reads main's files from inside the workspace. Read the variable at run
+time (cargo and nextest set it for every test).
+
+Xcode DerivedData does key on absolute paths: slot mounts (`new --slot`) recycle a stable path for it. `bun install`,
+`node_modules`, zig, and gradle caches are path-independent.
 
 ## sccache reports a 0% hit rate and the shared cache never grows
 

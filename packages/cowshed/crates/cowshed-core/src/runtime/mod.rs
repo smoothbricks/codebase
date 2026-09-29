@@ -1,6 +1,3 @@
-#[cfg(target_os = "macos")]
-mod macos;
-
 pub mod project;
 pub mod shell_host;
 mod shell_job;

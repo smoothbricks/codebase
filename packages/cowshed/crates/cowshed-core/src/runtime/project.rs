@@ -7492,21 +7492,7 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
         let retire = options.retire;
         let handle = self.ensure_supervisor(&workspace).await?;
         for check in options.check.unwrap_or_default() {
-            let job_id = handle
-                .exec(
-                    None,
-                    ExecRequest {
-                        argv: vec!["/bin/sh".into(), "-c".into(), check.clone().into()],
-                        cwd: None,
-                        mode: RunSandboxMode::ReadWrite,
-                        env: super::macos::acceptance_check_environment(),
-                        trace: None,
-                        stdin: StdinSource::Empty,
-                        stdout_copy: None,
-                        stderr_copy: None,
-                    },
-                )
-                .await?;
+            let job_id = handle.exec(None, land_check_request(&check)).await?;
             let info = handle.wait(job_id).await?;
             let exit_code = match info.exit {
                 Some(crate::api::dto::ExitStatus::Exited { code }) => Some(code),
@@ -9763,6 +9749,43 @@ fn require_expected_ref(
             format!("{dimension} revision is stale"),
             "refresh repository revisions and retry",
         ))
+    }
+}
+
+/// The job one `land --check` command runs as: an ordinary read-write child of the workspace.
+///
+/// It carries no environment of its own, so a check builds the units an interactive command
+/// builds. Forcing `CARGO_INCREMENTAL=0` here once made every workspace member a separate unit,
+/// recompiled on each landing, and put members into sccache with the landing workspace's
+/// absolute source paths in their debuginfo.
+#[cfg(target_os = "macos")]
+fn land_check_request(check: &str) -> ExecRequest {
+    ExecRequest {
+        argv: vec!["/bin/sh".into(), "-c".into(), check.into()],
+        cwd: None,
+        mode: RunSandboxMode::ReadWrite,
+        env: std::collections::HashMap::new(),
+        trace: None,
+        stdin: StdinSource::Empty,
+        stdout_copy: None,
+        stderr_copy: None,
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod land_check_tests {
+    use std::collections::BTreeMap;
+
+    use super::land_check_request;
+    use crate::runtime::supervisor::build_environment;
+
+    #[test]
+    fn a_land_check_leaves_incremental_to_the_profile() {
+        let caller = land_check_request("cargo test").env.into_iter().collect();
+        assert_eq!(
+            build_environment(&caller).collect::<BTreeMap<_, _>>(),
+            BTreeMap::from([("RUSTC_WRAPPER", "sccache"), ("SCCACHE_BASEDIR_CWD", "1")])
+        );
     }
 }
 

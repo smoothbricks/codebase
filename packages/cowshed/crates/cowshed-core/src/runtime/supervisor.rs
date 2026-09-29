@@ -1024,11 +1024,11 @@ const BUILD_POLICY: [(&str, &str); 2] =
 ///
 /// `CARGO_INCREMENTAL` is deliberately not in the policy, so whatever the caller names arrives
 /// verbatim and an unnamed one stays unset. Cargo then decides per profile, which is the right
-/// decision on both lanes at once: `dev` stays incremental and local, while shared lanes declare
-/// `incremental = false` in the profile and so reach sccache without anyone forcing anything.
-/// Forcing 0 here bought the shared cache nothing it did not already have and cost every
-/// interactive build a full recompile — measured on a one-line edit to a mid-size crate, ~1.7s
-/// incremental against ~20-32s with `CARGO_INCREMENTAL=0`.
+/// decision for both halves of a build at once: workspace crates stay incremental and local,
+/// while dependencies are always non-incremental and so reach sccache without anyone forcing
+/// anything. Forcing 0 here bought the shared cache nothing it did not already have and cost
+/// every interactive build a full recompile — measured on a one-line edit to a mid-size crate,
+/// ~1.7s incremental against ~20-32s with `CARGO_INCREMENTAL=0`.
 pub(super) fn build_environment(
     caller: &BTreeMap<String, String>,
 ) -> impl Iterator<Item = (&str, &str)> {

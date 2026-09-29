@@ -428,11 +428,12 @@ mounts are not excluded: the bundled sccache normalizes the residual path-bearin
 sibling paths share entries with each other. A slot buys the one input normalization cannot reach — cargo's
 `-C metadata`, a hash sccache never sees.
 
-`CARGO_INCREMENTAL` is not set, at any mount. Cargo decides it per profile, and that is the decision that serves both
-lanes: `dev` stays incremental and local (a one-line edit rebuilds in ~1.7s, against ~20-32s with incremental forced
-off), while shared lanes declare `incremental = false` in the profile and so reach the cache without anyone forcing
-anything. The single exception is a `cowshed land --check` command: nobody is waiting on it and its output is worth
-storing, so it runs with `CARGO_INCREMENTAL=0` and leaves cacheable units behind for the next landing.
+`CARGO_INCREMENTAL` is not set, at any mount and for any command, `cowshed land --check` included. Cargo decides it per
+profile, which serves both halves of a build: workspace crates in `dev` and `test` stay incremental and local (a
+one-line edit rebuilds in ~1.7s, against ~20-32s with incremental forced off), while their dependencies are always
+non-incremental and reach the cache without anyone forcing anything. A land check therefore builds the same units an
+interactive command builds; forcing `CARGO_INCREMENTAL=0` there would compile every workspace crate a second time and
+store it with the landing workspace's absolute paths in its debuginfo.
 
 `main` cannot take a slot — its mount is fixed by the project's checkout layout.
 

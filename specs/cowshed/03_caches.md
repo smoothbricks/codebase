@@ -188,6 +188,17 @@ them there; they contain the endpoint URL, whose userinfo is the workspace token
   unshared cache; an unshared bun cache stays readable, never writable, so the links a clone inherited from main's
   `node_modules` keep resolving.
 
+  **A clone is warm only for the units its origin built.** Cargo keys a unit on its profile, and whether it compiles
+  incrementally is part of that key. A `test` profile that differs from `dev` makes `cargo test` and `cargo build` two
+  builds of every dependency, and a main warmed by one hands its clones nothing for the other; so `test` inherits `dev`,
+  and `smoo monorepo check` asks nothing of it. Dependencies are never incremental and, through the one `$CARGO_HOME`,
+  are path-identical in every checkout, so the compile cache shares them as they are; workspace crates stay incremental.
+  For the same reason no cowshed-launched child — `land --check` included — sets `CARGO_INCREMENTAL`. Cargo itself turns
+  incremental off for workspace crates whenever `CI` is set: its precedence is `CARGO_INCREMENTAL`, then
+  `build.incremental`, then `CI`, and only then the profile's `incremental`, so no profile key outranks `CI`. A host
+  shell exporting `CI` therefore builds different units for those crates than a sandbox child, which never inherits it,
+  and main is warmed through `cowshed exec main --`.
+
   **The parent config directories stay on the host.** `~/.cargo/config.toml`, `~/.cargo/config`,
   `~/.cargo/credentials.toml`, `~/.cargo/credentials`, `~/.cargo/bin` (on PATH), and `~/.gradle/gradle.properties` are
   _not_ relocated and are on the secret deny list (04_sandbox.md) — relocating them wholesale would put user config,
@@ -299,10 +310,12 @@ table is advisory metadata, not a gate.
 
 ## Known limitations
 
-- **Path-keyed warm state.** Cargo incremental fingerprints and DerivedData embed absolute paths. Main (fixed
-  mountpoint) keeps its warm state forever; sessions mount at per-name paths and take a partial cold hit on first build.
-  Mitigations: shared sccache (layer 3) absorbs most rustc recompilation, slot mounts (`new --slot`) recycle stable
-  paths, and projects may opt into `trim-paths`/`--remap-path-prefix`. cowshed does not force compiler flags.
+- **Path-keyed warm state.** Cargo keys a workspace crate on its package-relative path, so a session at a per-name mount
+  finds main's units fresh; what stays path-keyed is whatever a build records absolutely — a dependency's `$CARGO_HOME`
+  path (one literal path, above) and a build script's watched path outside its package — and Xcode DerivedData. Slot
+  mounts (`new --slot`) recycle stable paths for those. A compiled-in `env!("CARGO_MANIFEST_DIR")` is worse than
+  path-keyed: cargo does not fingerprint the checkout path, so the inherited unit stays fresh and reads its origin's
+  files; the path is read at run time instead, where cargo and nextest set it. cowshed does not force compiler flags.
 - **Poisoning model.** Lockfile integrity hashes protect _downloads_ (layer 1 is verified by the package managers
   themselves), not cache _reuse_: layers 2–3 are trusted once written. State this plainly: the layer-3 write scope a
   sandbox holds includes cargo's `registry/src`, bun's global cache (whose `links/` main's `node_modules` resolves

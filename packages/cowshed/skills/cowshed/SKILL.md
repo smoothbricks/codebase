@@ -77,14 +77,16 @@ direnv users need nothing extra.
 
 - Never point agents at a shared external build directory. `target/` is inside each workspace image and already warm; an
   external shared target restores contention and serializes builds on Cargo's per-target-directory lock.
-- Never set `CARGO_INCREMENTAL`. Setting it to `1` hard-fails the sccache wrapper at Cargo's version probe; setting it
-  to `0` discards incremental compilation for no gain. Leave it unset: local dev units stay incremental while Cargo's
-  non-incremental units use the shared host cache.
-- A profile can be shared across workspaces or carry debuginfo, not both. Shared lanes (`test`, `release`, and gate
-  builds) need `debug = 0`; debuginfo lanes stay incremental and local. Define `[profile.test]` with
-  `incremental = false`, or test builds cannot be shared.
-- Keep `env!("CARGO_MANIFEST_DIR")` out of shared-lane non-test code. It embeds the mount path and guarantees a cache
-  miss at a new workspace path.
+- Never set `CARGO_INCREMENTAL`, not even for a land check. Setting it to `1` hard-fails the sccache wrapper at Cargo's
+  version probe; setting it to `0` discards incremental compilation and makes every workspace crate a second unit. Leave
+  it unset: workspace crates stay incremental while their dependencies use the shared host cache.
+- Let `test` inherit `dev`: no `[profile.test]` overrides. `cargo test` then reuses the dependencies `cargo build`
+  compiled, and the `target/` a new workspace clones from main is warm for both.
+- A non-incremental profile (`release`, gate builds) is shared across workspaces, so it carries `debug = 0`; a profile
+  with debuginfo stays incremental.
+- Never compile `env!("CARGO_MANIFEST_DIR")` in, tests included. Cargo does not fingerprint the checkout path, so a
+  workspace runs the test binaries it cloned from main and a baked path reads main's files. Read it at run time with
+  `std::env::var_os("CARGO_MANIFEST_DIR")`, which cargo and nextest set for every test.
 - After a lockfile or toolchain bump, re-warm main's image with `cowshed exec main -- <canonical build>` so new clones
   inherit the dependency graph.
 - The compile cache is a host daemon. Start it deliberately with `cowshed sccache start --capacity <size>`; a client
