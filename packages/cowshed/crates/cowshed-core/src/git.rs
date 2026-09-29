@@ -1103,6 +1103,11 @@ impl GitRepository {
     /// `head` MUST be a ref spelling — `HEAD` or a branch — never a raw oid. `git bundle create`
     /// names a bundle's fetchable tip after refs in its revision arguments, so a raw oid alone
     /// produces a bundle with no advertised ref and git rejects it as empty.
+    ///
+    /// A retried removal finds the bundle its earlier attempt already wrote for this exact range
+    /// and keeps it: the artifact is written once. A new bundle is written beside its final name
+    /// and renamed into place once verified, so no attempt shares git's lock file with another
+    /// writer of the same name, and the final name never holds a partial bundle.
     pub async fn bundle_commits(
         &self,
         destination: &Path,
@@ -1117,19 +1122,83 @@ impl GitRepository {
             Some(target) => self.commits_ahead_of(target, head).await?,
             None => self.commits_ahead(None, head).await?,
         };
+        let existing = tokio::fs::try_exists(destination).await.map_err(|error| {
+            CowshedError::environment_missing(
+                format!(
+                    "cannot inspect abandonment bundle {}: {error}",
+                    destination.display()
+                ),
+                "repair the cowshed store and retry removal",
+            )
+        })?;
+        if existing {
+            match self
+                .verify_bundle(destination, &expected_head, target, commit_count)
+                .await
+            {
+                Ok(()) => return Ok(commit_count),
+                Err(error) => eprintln!(
+                    "cowshed: replacing {}, which does not hold this range: {}",
+                    destination.display(),
+                    error.message
+                ),
+            }
+        }
+        let file_name = destination.file_name().ok_or_else(|| {
+            CowshedError::integrity(
+                format!(
+                    "abandonment bundle has no file name: {}",
+                    destination.display()
+                ),
+                "repair the cowshed store and retry removal",
+            )
+        })?;
+        let mut staged_name = OsString::from(".");
+        staged_name.push(file_name);
+        staged_name.push(format!(".{}.partial", uuid::Uuid::new_v4().simple()));
+        let staged = destination.with_file_name(staged_name);
         let mut args = vec![
             OsString::from("bundle"),
             OsString::from("create"),
-            destination.as_os_str().to_owned(),
+            staged.as_os_str().to_owned(),
             OsString::from(head),
         ];
         if let Some(target) = target {
             args.push(OsString::from(target));
         }
-        let output = self.run(args).await?;
-        ensure_git_success("write commit bundle", output)?;
-        self.verify_bundle(destination, &expected_head, target, commit_count)
-            .await?;
+        let written = async {
+            let output = self.run(args).await?;
+            ensure_git_success("write commit bundle", output)?;
+            self.verify_bundle(&staged, &expected_head, target, commit_count)
+                .await?;
+            tokio::fs::rename(&staged, destination)
+                .await
+                .map_err(|error| {
+                    CowshedError::environment_missing(
+                        format!(
+                            "cannot publish abandonment bundle {}: {error}",
+                            destination.display()
+                        ),
+                        "repair the cowshed store and retry removal",
+                    )
+                })
+        }
+        .await;
+        if let Err(error) = written {
+            return Err(match tokio::fs::remove_file(&staged).await {
+                Ok(()) => error,
+                Err(cleanup) if cleanup.kind() == std::io::ErrorKind::NotFound => error,
+                Err(cleanup) => CowshedError::new(
+                    error.code,
+                    format!(
+                        "{}; the partial bundle {} could not be removed either: {cleanup}",
+                        error.message,
+                        staged.display()
+                    ),
+                    error.hint,
+                ),
+            });
+        }
         Ok(commit_count)
     }
 
@@ -4107,6 +4176,42 @@ mod tests {
                 .expect("workspace branch remains"),
             Some("cowshed/history-diverged".to_owned()),
             "verification failure must leave workspace refs untouched"
+        );
+
+        fs::remove_dir_all(workspace).expect("remove fixture");
+    }
+
+    #[tokio::test]
+    async fn a_retried_abandonment_keeps_its_verified_bundle_and_ignores_a_lock_at_its_name() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let workspace = repository();
+        let repo = GitRepository::from_root(&workspace);
+        let base = repo.head_oid().await.expect("read base");
+        git(&workspace, &["switch", "-qc", "cowshed/retried"]);
+        commit_on(&workspace, "one");
+        commit_on(&workspace, "two");
+        let bundle = workspace.join("retried.bundle");
+        // An earlier writer of this bundle — a removal killed mid-`git bundle create`, or one a
+        // stale binary is still running — holds git's lock file at the bundle's own name.
+        fs::write(workspace.join("retried.bundle.lock"), b"another writer\n")
+            .expect("plant the other writer's lock");
+
+        let written = repo
+            .bundle_commits(&bundle, Some(base.as_str()), "HEAD")
+            .await
+            .expect("a lock at the bundle's name cannot fail the removal");
+        let first = fs::metadata(&bundle).expect("bundle written").ino();
+        let retried = repo
+            .bundle_commits(&bundle, Some(base.as_str()), "HEAD")
+            .await
+            .expect("the retry reports the same range");
+        assert_eq!(written, 2);
+        assert_eq!(retried, written);
+        assert_eq!(
+            fs::metadata(&bundle).expect("bundle kept").ino(),
+            first,
+            "a retry keeps the verified bundle rather than writing a second one over it"
         );
 
         fs::remove_dir_all(workspace).expect("remove fixture");

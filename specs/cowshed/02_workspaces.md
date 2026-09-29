@@ -717,7 +717,9 @@ step.
 
 1. Refuse (exit 4) unless the workspace's HEAD is contained in live main by ancestry or patch equivalence. `--force`
    permits loss of dirty/in-progress state, not unlanded commits. Explicit `--abandon` requires a verified recovery
-   bundle before retiring unlanded work.
+   bundle, `sessions/.trash/<ws>-<head>.bundle`, before retiring unlanded work. It is written beside that name and
+   renamed into place once verified; a retried removal that finds a bundle verifying for the same range keeps it instead
+   of writing another.
 2. Stop the supervisor: TERM → grace → KILL across the whole descendant tree (11_shell.md). Teardown precedes retirement
    — live children would otherwise hold the mount busy and keep enforcing stale launch-time authority after the grants
    disappear.
