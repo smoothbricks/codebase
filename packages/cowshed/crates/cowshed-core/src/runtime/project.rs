@@ -304,7 +304,9 @@ pub enum RecoveryScope {
     Removal(WorkspaceName),
 }
 
-/// What recovery does with one unfinished intent under a [`RecoveryScope`].
+/// What recovery does with one unfinished intent under a [`RecoveryScope`]. Only the native
+/// macOS host recovers, so only it asks.
+#[cfg(target_os = "macos")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum IntentReplay {
     /// Another verb's work: left journaled and unleased.
@@ -315,6 +317,7 @@ enum IntentReplay {
     Residue,
 }
 
+#[cfg(target_os = "macos")]
 impl RecoveryScope {
     fn replay(&self, workspace: &WorkspaceName) -> IntentReplay {
         if workspace.is_main() {
@@ -348,7 +351,7 @@ impl RecoveryScope {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 mod recovery_scope_tests {
     use super::{IntentReplay, RecoveryScope};
     use crate::metadata::WorkspaceName;
