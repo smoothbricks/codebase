@@ -538,12 +538,10 @@ volume, where local snapshots pin their rewritten blocks and backup policy needs
 dedicated volumes cost nothing (container space-sharing) and reduce cowshed's `~/Library` footprint to the launchd
 plists that must live there.
 
-**A `store/` sub-mountpoint rejected.** Mounting the store volume at `/private/cowshed/store/store` left
-`/private/cowshed/store` as a real Data-volume directory holding one wrapper level that meant nothing to users ("store
-with nested telemetry"). Mounting the volume at `/private/cowshed/store` itself makes the dotdir a door, not a room: one
-empty mountpoint inode on Data, every other path one level shorter, and "cowshed stuff lives in the cowshed" is
-literally true. The costs — mount ordering and the bare-directory guard above — are machinery `attach` already had for
-the workspaces.
+**A sub-mountpoint below the store root rejected.** The store volume mounts at `/private/cowshed/store` itself, not at a
+directory beneath a Data-volume wrapper: one empty mountpoint inode on Data, no wrapper level that means nothing to
+users, and every path one level shorter. The costs — mount ordering and the bare-directory guard above — are machinery
+`attach` already had for the workspaces.
 
 **Images on the caches volume rejected.** Co-locating images with caches unlocks no additional sharing: container
 volumes already pool free space, and the reflink boundary that matters is the image's _inner_ filesystem — clonefile
