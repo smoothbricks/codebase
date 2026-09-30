@@ -96,7 +96,7 @@ The layer's other roles:
   warm host like any other and sees the session's overlay, never another command's exports.
 - **The framed stdio protocol** — multiplexed, backpressured, language-neutral I/O for concurrent CLI, NAPI, MCP, and CI
   clients, instead of each reinventing pipe plumbing.
-- **Job control** — timeouts, auto-backgrounding, re-attach, structured capture.
+- **Job control** — waiting, caller timeouts, backgrounding, re-attach, structured capture.
 
 The CoW clone and warm build caches are distinct from shell reuse. Neither justifies bypassing repository activation or
 replaying a supervisor-owned environment in place of its shell entry hooks.
@@ -267,13 +267,15 @@ produced them, and the new allocator starts above the inherited maximum. Thus th
 `(repoId, workspaceIncarnation, jobId)`: `jobId` is the familiar workspace-local handle, while the full tuple remains
 unique across checkpoint copies and recycled workspace names.
 
-- **Soft timeout → auto-background.** A foreground command's output streams to the caller while it runs. At its soft
-  timeout (`--timeout`, default `[shell] soft_timeout` = 120 s) the client reads the job's status: a job still running
-  is detached, and a job that ended meanwhile is not — its output is drained to EOF and its exit is the command's,
-  because a finished job has nothing to reattach to. Before acknowledging detachment, the supervisor promotes each
-  memory-resident stream prefix to its protected file; the files then keep growing and `job-backgrounded` fires. The
-  client already has the job id and can poll or reattach. A later checkpoint uses the barrier/manifest protocol below.
-- **`--background`** forces the same detachment and promotion immediately.
+- **Foreground commands wait.** A foreground command's output streams to the caller while it runs, and the caller waits
+  for its end however long it runs; there is no default timeout. A caller that sets one (`--timeout`) reads the job's
+  status when it passes: a job still running is detached and the caller is told it still runs, never given a success
+  that stands in for the command's; a job that ended meanwhile is not detached — its output is drained to EOF and its
+  exit is the command's, because a finished job has nothing to reattach to. Before acknowledging detachment, the
+  supervisor promotes each memory-resident stream prefix to its protected file; the files then keep growing and
+  `job-backgrounded` fires. The client already has the job id and can poll or reattach through the API. A later
+  checkpoint uses the barrier/manifest protocol below.
+- **`--background`** detaches and promotes immediately, and the caller gets the job id.
 - **Hard timeout** (`[shell] hard_timeout`, unset by default, set by CI — 10_ci.md) → SIGTERM, then SIGKILL after a
   grace, drain both pipes to EOF, then mark the job `killed:timeout`.
 - **Combined output quota.** Each job has one configurable quota across stdout and stderr, default **1 GiB**. Accounting
@@ -283,10 +285,10 @@ unique across checkpoint copies and recycled workspace names.
   both pipes to EOF without retaining post-boundary payload. After drain and artifact sealing, the authoritative
   terminal state is `output-limit`, with configured limit and observed crossing recorded. Summary truncation remains an
   independent bounded projection.
-- **Re-attach**: `cowshed job attach` / `Job::attach` re-opens stdio to a running job from the client's last
-  acknowledged stream offsets, representation-transparently across memory/file promotion.
-- **Logs**: `cowshed job logs` / `Job::logs` resolves `StreamInfo.storage.artifact`; callers never need to distinguish
-  inline Arrow Binary from a protected file and no path is promised.
+- **Re-attach**: `Job::attach` re-opens stdio to a running job from the client's last acknowledged stream offsets,
+  representation-transparently across memory/file promotion.
+- **Logs**: `Job::logs` resolves `StreamInfo.storage.artifact`; callers never need to distinguish inline Arrow Binary
+  from a protected file and no path is promised.
 
 ### Exec records, stream storage, and tiered authority
 
@@ -407,9 +409,9 @@ mount and must resolve to a regular file beneath it. EOF closes child stdin exac
 incomplete delivery without implicitly killing the job. `JobInfo.stdin` and job/trace metadata carry stdin kind, bytes
 delivered, completion, and normalized relative source where applicable; inline stdin contents never enter telemetry.
 
-Inspect with `cowshed ps <ws> --json`, `cowshed job list <ws> --json`, or `lmao-inspect` (13_telemetry.md). This is the
-only capture implementation. CLI, MCP, NAPI, and CI consume the same protected evidence and controller commitments; no
-client recaptures output or derives authority from summary text.
+Inspect with `WorkspaceHandle::list_jobs`, `cowshed exec --json` (the final `JobInfo`), or `lmao-inspect`
+(13_telemetry.md). This is the only capture implementation. CLI, MCP, NAPI, and CI consume the same protected evidence
+and controller commitments; no client recaptures output or derives authority from summary text.
 
 ## Grant-change propagation
 

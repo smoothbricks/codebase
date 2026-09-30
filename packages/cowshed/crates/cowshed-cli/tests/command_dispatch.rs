@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use cowshed_cli::args::parse_args;
 use cowshed_cli::output::Output;
 use cowshed_cli::runtime::{
-    CliService, ExecCommand, ExecPresentation, ExecResult, ProjectWorkspaces, dispatch,
+    CliService, ExecCommand, ExecEnd, ExecPresentation, ExecResult, ProjectWorkspaces, dispatch,
     dispatch_and_shutdown,
 };
 use cowshed_core::api::*;
@@ -386,7 +386,11 @@ impl CliService for FakeService {
         }
         Ok(ExecResult {
             info: job_info(argv, self.child_exit.clone()),
-            backgrounded: command.background,
+            end: if command.background {
+                ExecEnd::Backgrounded
+            } else {
+                ExecEnd::Finished
+            },
         })
     }
 

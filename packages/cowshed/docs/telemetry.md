@@ -116,5 +116,5 @@ An in-workspace agent doesn't configure any of this — `TRACEPARENT` is already
 capability-scoped: a coordinator queries continuity commitments, while a worker sees one-workspace job views through the
 supervisor/controller capability. Ordinary responses are bounded: they expose lifecycle metadata, typed artifact
 handles, hashes, summaries, and may include small `Inline.data` bytes tagged as `utf8` or `base64`. Unbounded bytes
-require explicit `cowshed job logs`, `cowshed job attach`, or artifact-read streaming and remain separate for stdout and
+require explicit `JobHandle.logs`, `JobHandle.attach`, or artifact-read streaming and remain separate for stdout and
 stderr.

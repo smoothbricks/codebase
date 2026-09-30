@@ -28,8 +28,8 @@ use crate::gateway_service::{
 };
 use crate::output::Output;
 use crate::runtime::{
-    DispatchExit, ExecPresentation, ExecResult, ForegroundJob, emit_mount_path, exec_command,
-    exec_presentation, output_error, relay_foreground, report_exec, success,
+    DispatchExit, ExecEnd, ExecPresentation, ExecResult, ForegroundJob, emit_mount_path,
+    exec_command, exec_presentation, output_error, relay_foreground, report_exec, success,
 };
 
 /// Whether the resident path answered, and if not, what the controller path still needs.
@@ -83,7 +83,12 @@ where
                 stderr,
             )
             .await?;
-            Ok(Answer::Answered(report_exec(output, json, result)?))
+            Ok(Answer::Answered(report_exec(
+                output,
+                json,
+                &args.workspace,
+                result,
+            )?))
         }
         _ => Ok(Answer::Declined(stdin)),
     }
@@ -166,7 +171,7 @@ async fn run(
     resident: Resident,
     request: ExecRequest,
     background: bool,
-    timeout: Duration,
+    timeout: Option<Duration>,
     presentation: ExecPresentation,
     stdout: &mut (dyn Write + Send),
     stderr: &mut (dyn Write + Send),
@@ -179,7 +184,7 @@ async fn run(
         let info = link.clone().info(job).await?;
         return Ok(ExecResult {
             info,
-            backgrounded: true,
+            end: ExecEnd::Backgrounded,
         });
     }
     let _relay = span("resident", "relay");

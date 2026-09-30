@@ -57,14 +57,13 @@ use std::time::Duration;
 use tokio::io::AsyncRead;
 use tokio::task::JoinHandle;
 
-const DEFAULT_FOREGROUND_TIMEOUT: Duration = Duration::from_secs(120);
-
 pub struct ExecCommand {
     pub workspace: String,
     pub request: ExecRequest,
     pub session: Option<String>,
     pub background: bool,
-    pub timeout: Duration,
+    /// How long to wait for the command (`--timeout`); `None` waits until it ends.
+    pub timeout: Option<Duration>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -75,7 +74,19 @@ pub enum ExecPresentation {
 
 pub struct ExecResult {
     pub info: JobInfo,
-    pub backgrounded: bool,
+    pub end: ExecEnd,
+}
+
+/// How one `cowshed exec` left its job.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExecEnd {
+    /// The job ended while the exec relayed it; its end is the command's.
+    Finished,
+    /// The caller asked not to wait (`--background`).
+    Backgrounded,
+    /// The job still ran when the caller's `--timeout` passed. It keeps running, and the exec
+    /// has no output or status of the command's to give.
+    StillRunning { after: Duration },
 }
 
 #[async_trait]
@@ -666,7 +677,7 @@ impl CliService for ActorBridge {
             job.detach().await?;
             return Ok(ExecResult {
                 info,
-                backgrounded: true,
+                end: ExecEnd::Backgrounded,
             });
         }
         let _relay = cowshed_core::timing::span("exec", "relay");
@@ -720,15 +731,15 @@ impl ForegroundJob for JobHandle {
     }
 }
 
-/// Relay one foreground job to this process until it ends or its soft timeout passes.
+/// Relay one foreground job to this process until it ends, or until the caller's `timeout`.
 ///
-/// The job's output streams to `stdout` and `stderr` the whole time. At the soft timeout its
-/// status decides: a job still running is detached and reported backgrounded; a job that ended
-/// meanwhile has nothing to reattach to, so its output is drained to EOF and its end is the
-/// command's.
+/// The job's output streams to `stdout` and `stderr` the whole time. With no timeout the relay
+/// lasts as long as the job. When a timeout passes, the job's status decides: a job still
+/// running is detached and reported still running; a job that ended meanwhile has nothing to
+/// reattach to, so its output is drained to EOF and its end is the command's.
 pub(crate) async fn relay_foreground(
     job: &impl ForegroundJob,
-    timeout: Duration,
+    timeout: Option<Duration>,
     presentation: ExecPresentation,
     stdout: &mut (dyn Write + Send),
     stderr: &mut (dyn Write + Send),
@@ -749,21 +760,25 @@ pub(crate) async fn relay_foreground(
         }
     };
     tokio::pin!(finished);
+    let finished_now = |info| ExecResult {
+        info,
+        end: ExecEnd::Finished,
+    };
+    let Some(timeout) = timeout else {
+        return Ok(finished_now(finished.await?));
+    };
     tokio::select! {
-        info = &mut finished => return Ok(ExecResult { info: info?, backgrounded: false }),
+        info = &mut finished => return Ok(finished_now(info?)),
         () = tokio::time::sleep(timeout) => {}
     }
     let info = job.status().await?;
     if info.state.is_terminal() {
-        return Ok(ExecResult {
-            info: finished.await?,
-            backgrounded: false,
-        });
+        return Ok(finished_now(finished.await?));
     }
     job.detach().await?;
     Ok(ExecResult {
         info,
-        backgrounded: true,
+        end: ExecEnd::StillRunning { after: timeout },
     })
 }
 
@@ -1064,12 +1079,13 @@ where
             Ok(success())
         }
         Command::Exec(args) => {
+            let workspace = args.workspace.clone();
             let command = exec_command(args, stdin)?;
             let (stdout, stderr) = output.writers_mut();
             let result = service
                 .exec(command, exec_presentation(json), stdout, stderr)
                 .await?;
-            report_exec(output, json, result)
+            report_exec(output, json, &workspace, result)
         }
         Command::Grant(args) => {
             let changed =
@@ -1675,11 +1691,7 @@ pub(crate) fn exec_command<R: AsyncRead + Send + 'static>(
             policy,
         })
     };
-    let timeout = args
-        .timeout
-        .map(parse_duration)
-        .transpose()?
-        .unwrap_or(DEFAULT_FOREGROUND_TIMEOUT);
+    let timeout = args.timeout.map(parse_duration).transpose()?;
     Ok(ExecCommand {
         workspace: args.workspace,
         request: ExecRequest {
@@ -1797,25 +1809,59 @@ pub(crate) fn exec_presentation(json: bool) -> ExecPresentation {
     }
 }
 
-/// How an exec ends: the job record for JSON, the job id for a job left running, and otherwise
-/// the child's own exit status as this process's.
+/// How an exec ends: the child's own exit status, the job id of a job asked to run on, or a
+/// conflict for a job still running when the caller's timeout passed — never a success that
+/// stands in for a command that has not ended.
 pub(crate) fn report_exec<W: Write, E: Write>(
     output: &mut Output<W, E>,
     json: bool,
+    workspace: &str,
     result: ExecResult,
 ) -> Result<DispatchExit> {
-    if json {
-        output.success(result.info).map_err(output_error)?;
-        Ok(success())
-    } else if result.backgrounded {
-        output
-            .bare_line(result.info.job_id.get().to_string().as_bytes())
-            .map_err(output_error)?;
-        Ok(success())
-    } else {
-        Ok(DispatchExit {
+    let job = result.info.job_id.get();
+    let reach = format!(
+        "reach it through the cowshed API: worker(\"{workspace}\").job({job}) waits for it, \
+         reads its logs or kills it; no CLI verb reattaches to a job"
+    );
+    match result.end {
+        ExecEnd::StillRunning { after } => {
+            let error = CowshedError::conflict(
+                format!(
+                    "job {job} still runs in workspace {workspace} after the {after:?} timeout; \
+                     its output and exit status are not this command's"
+                ),
+                reach,
+            );
+            if json {
+                output.json_error(error).map_err(output_error)?;
+            } else {
+                output.error(&error.message).map_err(output_error)?;
+                output.hint(&error.hint).map_err(output_error)?;
+            }
+            Ok(DispatchExit {
+                code: i32::from(ErrorCode::Conflict.exec_wrapper_exit_code()),
+            })
+        }
+        ExecEnd::Backgrounded if json => {
+            output.success(result.info).map_err(output_error)?;
+            Ok(success())
+        }
+        ExecEnd::Backgrounded => {
+            output
+                .bare_line(job.to_string().as_bytes())
+                .map_err(output_error)?;
+            output
+                .guidance(&format!("job {job} runs in workspace {workspace}; {reach}"))
+                .map_err(output_error)?;
+            Ok(success())
+        }
+        ExecEnd::Finished if json => {
+            output.success(result.info).map_err(output_error)?;
+            Ok(success())
+        }
+        ExecEnd::Finished => Ok(DispatchExit {
             code: child_exit_code(&result.info)?,
-        })
+        }),
     }
 }
 
@@ -4242,7 +4288,7 @@ mod tests {
             let (mut stdout, mut stderr) = (terminal.clone(), Terminal::default());
             let relay = relay_foreground(
                 &handle,
-                Duration::from_secs(60),
+                Some(Duration::from_secs(60)),
                 ExecPresentation::Raw,
                 &mut stdout,
                 &mut stderr,
@@ -4264,7 +4310,7 @@ mod tests {
                 .await
                 .expect("the relay returns once the job ends")
                 .expect("relay");
-            assert!(!result.backgrounded);
+            assert_eq!(result.end, ExecEnd::Finished);
             assert_eq!(result.info.exit, Some(ExitStatus::Exited { code: 0 }));
             assert_eq!(terminal.contents(), FIRST);
         }
@@ -4281,7 +4327,7 @@ mod tests {
                 Duration::from_secs(5),
                 relay_foreground(
                     &handle,
-                    Duration::from_millis(50),
+                    Some(Duration::from_millis(50)),
                     ExecPresentation::Raw,
                     &mut stdout,
                     &mut stderr,
@@ -4290,33 +4336,132 @@ mod tests {
             .await
             .expect("the relay returns")
             .expect("relay");
-            assert!(!result.backgrounded, "a finished job is not backgrounded");
+            assert_eq!(
+                result.end,
+                ExecEnd::Finished,
+                "a finished job is not left running"
+            );
             assert_eq!(result.info.exit, Some(ExitStatus::Exited { code: 3 }));
             assert_eq!(terminal.contents(), FIRST);
             assert!(!job.detached.load(Ordering::SeqCst));
         }
 
-        #[tokio::test]
-        async fn a_job_still_running_at_the_soft_timeout_is_detached() {
+        /// The exec a caller writes with no `--timeout` waits for its job however long the job
+        /// runs: a day of paused time passes with the job still running and the exec still
+        /// relaying it, and it then reports the job's own end.
+        #[tokio::test(start_paused = true)]
+        async fn a_foreground_exec_waits_for_its_job_however_long_it_runs() {
             let job = ScriptedJob::new(false, 0);
             let handle = connect(&job).await;
-            let (mut stdout, mut stderr) = (Terminal::default(), Terminal::default());
-            let result = tokio::time::timeout(
-                Duration::from_secs(5),
-                relay_foreground(
-                    &handle,
-                    Duration::from_millis(50),
-                    ExecPresentation::Raw,
-                    &mut stdout,
-                    &mut stderr,
+            let Command::Exec(args) = crate::args::parse_args(["exec", "main", "--", "build"])
+                .expect("arguments")
+                .command
+            else {
+                unreachable!("an exec invocation parses as exec");
+            };
+            let command = exec_command(args, tokio::io::empty()).expect("exec command");
+            let terminal = Terminal::default();
+            let (mut stdout, mut stderr) = (terminal.clone(), Terminal::default());
+            let relay = relay_foreground(
+                &handle,
+                command.timeout,
+                ExecPresentation::Raw,
+                &mut stdout,
+                &mut stderr,
+            );
+            tokio::pin!(relay);
+            tokio::select! {
+                result = &mut relay => panic!(
+                    "the exec stopped waiting while its job ran: {:?}",
+                    result.map(|result| result.info.state)
                 ),
+                () = tokio::time::sleep(Duration::from_secs(24 * 60 * 60)) => {}
+            }
+            job.end();
+            let result = relay.await.expect("relay");
+            assert_eq!(result.info.exit, Some(ExitStatus::Exited { code: 0 }));
+            assert_eq!(terminal.contents(), FIRST);
+            assert!(!job.detached.load(Ordering::SeqCst));
+        }
+
+        /// A job still running when the caller's `--timeout` passes keeps running, and the exec
+        /// fails: it has no output or status of the command's to give, so it exits with the
+        /// conflict wrapper code and names the job and how to reach it.
+        #[tokio::test]
+        async fn a_job_still_running_at_the_callers_timeout_fails_the_exec_and_names_the_job() {
+            for json in [false, true] {
+                let job = ScriptedJob::new(false, 0);
+                let handle = connect(&job).await;
+                let (mut stdout, mut stderr) = (Terminal::default(), Terminal::default());
+                let result = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    relay_foreground(
+                        &handle,
+                        Some(Duration::from_millis(50)),
+                        ExecPresentation::Raw,
+                        &mut stdout,
+                        &mut stderr,
+                    ),
+                )
+                .await
+                .expect("the relay returns at the caller's timeout")
+                .expect("relay");
+                assert!(job.detached.load(Ordering::SeqCst));
+                let mut output = Output::new(Vec::new(), Vec::new(), false);
+                let exit = report_exec(&mut output, json, "main", result).expect("report");
+                let (stdout, stderr) = output.into_inner();
+                let (stdout, stderr) = (
+                    String::from_utf8(stdout).expect("utf-8"),
+                    String::from_utf8(stderr).expect("utf-8"),
+                );
+                assert_eq!(
+                    exit.code,
+                    i32::from(ErrorCode::Conflict.exec_wrapper_exit_code()),
+                    "stdout {stdout:?}, stderr {stderr:?}"
+                );
+                let said = if json {
+                    let envelope: serde_json::Value =
+                        serde_json::from_str(&stdout).expect("a JSON envelope");
+                    assert_eq!(envelope["ok"], json!(false));
+                    assert_eq!(envelope["error"]["code"], json!("conflict"));
+                    format!(
+                        "{} {}",
+                        envelope["error"]["message"], envelope["error"]["hint"]
+                    )
+                } else {
+                    assert_eq!(stdout, "", "no job id passes for the command's output");
+                    stderr
+                };
+                assert!(said.contains("job 1"), "{said}");
+                assert!(
+                    said.contains(".job(1)"),
+                    "names how to reach the job: {said}"
+                );
+            }
+        }
+
+        /// `--background` asks not to wait: the job id is the command's output and the exec
+        /// succeeds, and stderr says how to reach the job.
+        #[test]
+        fn a_backgrounded_exec_prints_its_job_and_how_to_reach_it() {
+            let job = ScriptedJob::new(false, 0);
+            let info: JobInfo = serde_json::from_value(job.info()).expect("a job record");
+            let mut output = Output::new(Vec::new(), Vec::new(), false);
+            let exit = report_exec(
+                &mut output,
+                false,
+                "main",
+                ExecResult {
+                    info,
+                    end: ExecEnd::Backgrounded,
+                },
             )
-            .await
-            .expect("the relay returns at the soft timeout")
-            .expect("relay");
-            assert!(result.backgrounded);
-            assert!(result.info.exit.is_none());
-            assert!(job.detached.load(Ordering::SeqCst));
+            .expect("report");
+            let (stdout, stderr) = output.into_inner();
+            assert_eq!(exit.code, 0);
+            assert_eq!(stdout, b"1\n");
+            let stderr = String::from_utf8(stderr).expect("utf-8");
+            assert!(stderr.contains(".job(1)"), "{stderr}");
         }
     }
 

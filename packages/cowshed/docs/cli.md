@@ -560,12 +560,14 @@ raven$ bun run dev          # vite reads $PORT; open http://localhost:40961 in y
 
 ### Background work
 
-A foreground `cowshed exec` shows the command's output as it is written. A command still running at the soft timeout
-(default 120 s; `--timeout <dur>` tunes it, `--background` forces it immediately) auto-backgrounds: `cowshed exec`
-prints its numeric job id and exits 0 while the command keeps running under the workspace supervisor. A command that
-finishes just as the timeout fires is not backgrounded; `cowshed exec` prints the rest of its output and exits with its
-code. `cowshed exec` accepts `--session <name>` for a named session whose cwd, variables, and jobs carry across calls.
-There is no `cowshed job` verb; reattach with `cowshed exec --session` or print the numeric job id from `--background`.
+A foreground `cowshed exec` shows the command's output as it is written, waits for the command however long it runs, and
+exits with the command's status. `--timeout <dur>` stops waiting after that long: a command still running keeps running
+under the workspace supervisor, and `cowshed exec` exits 103 with an error naming its job, because it has no output or
+status of the command's to give. A command that finishes just as the timeout fires is waited for; `cowshed exec` prints
+the rest of its output and exits with its code. `--background` prints the numeric job id and returns at once, exit 0,
+naming on stderr how to reach the job. No CLI verb reattaches to a job; the cowshed API does (`worker("<ws>").job(<id>)`
+waits for it, reads its logs or kills it — see [integrations.md](integrations.md)). `cowshed exec` accepts
+`--session <name>` for a named session whose cwd and variables carry across calls.
 
 Commands under the workspace `.envrc` run in a warm shell: the supervisor activates the `.envrc` once and starts each
 command from that activated environment, so only the first command after the workspace shell's inputs change pays for

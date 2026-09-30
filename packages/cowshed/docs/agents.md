@@ -27,7 +27,7 @@ cowshed new task-4821 --project "$PROJECT" --json
 - **Parse ordinary control stdout.** It contains one answer: a path, a name, TSV rows, or a bounded `--json` envelope.
   Job/status JSON is bounded control transport: it carries lifecycle fields, `StreamInfo`, hashes, summaries, and may
   carry a small `Inline.data` value tagged as `utf8` or `base64`. Unbounded output is available only through explicit
-  foreground streaming, `cowshed job logs`, `cowshed job attach`, or artifact reads.
+  foreground streaming of `cowshed exec`, the API's `JobHandle.logs` and `JobHandle.attach`, or artifact reads.
 - **Read stderr.** All guidance lives there, in greppable, prefixed lines:
   - `cowshed: ...` — what just happened, or why something failed
   - `next: <command>` — concrete follow-up commands, valid to run as-is
@@ -119,8 +119,8 @@ also an independent clone/reflink/copy, never a hardlink.
 Ordinary agent responses remain bounded and control-only. They carry lifecycle metadata, `StreamInfo`, and redacted
 summaries. A small `Inline.data` artifact may appear in the response's tagged `utf8`/`base64` representation; the bound
 prevents an unbounded byte array, base64 blob, or decoded stdout/stderr copy. To consume full-fidelity output of any
-size, use `cowshed job logs <ws> <id>`, `cowshed job attach <ws> <id>`, or the frontend's raw artifact stream. These
-paths preserve arbitrary binary bytes and keep stdout and stderr separate.
+size, use the foreground output of `cowshed exec`, the API's `JobHandle.logs` and `JobHandle.attach`, or the frontend's
+raw artifact stream. These paths preserve arbitrary binary bytes and keep stdout and stderr separate.
 
 The supervisor is the sole writer under protected `.cowshed/job/**`. Every executed shell, named session, and descendant
 receives a child restriction that denies writes there before repository-controlled startup; completed batches and files

@@ -1994,7 +1994,7 @@ const EXEC: CommandSpec = CommandSpec {
     summary: "run an argv command",
     about: &[
         "Runs one argv — never a shell string — inside the workspace's sandbox, with the cwd at the workspace root. Child stdout and stderr pass through as opaque bytes and the child's exit code passes through untouched; only a denial cowshed has authoritative evidence for is reported as one.",
-        "Long commands auto-background at the soft timeout and keep running under the workspace supervisor. Reattach with `cowshed exec --session` or `--background`.",
+        "Waits for the command however long it runs and exits with its status. With `--timeout`, a command still running then keeps running under the workspace supervisor and exec exits 103 naming its job; `--background` prints the job id and returns at once. No CLI verb reattaches to a job: the cowshed API does. `--session` keeps a named session's cwd and variables across calls.",
     ],
     options: &[
         Opt {
@@ -2023,11 +2023,11 @@ const EXEC: CommandSpec = CommandSpec {
         },
         Opt {
             spelling: "--timeout <dur>",
-            meaning: "soft timeout before the command auto-backgrounds (default 120s)",
+            meaning: "stop waiting after this long; a command still running keeps running and exec exits 103 naming its job",
         },
         Opt {
             spelling: "--background",
-            meaning: "background the command immediately instead of waiting for the soft timeout",
+            meaning: "print the job id and return without waiting",
         },
         Opt {
             spelling: "--stdout-copy <rel>",

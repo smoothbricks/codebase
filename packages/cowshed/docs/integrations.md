@@ -99,8 +99,8 @@ repository-controlled startup; complete record batches and sealed spill files ar
 Control messages, N-API objects, MCP results, JSON envelopes, and controller audit records never duplicate unbounded raw
 output. A bounded `JobInfo` carries lifecycle metadata, `StreamInfo`, byte counts, hashes, redacted summaries, and may
 carry small `Inline.data` bytes tagged as `utf8` or `base64`. Larger or live output remains a handle. Full-fidelity
-output of any size is available through explicit raw byte streams returned by `cowshed job logs`, `cowshed job attach`,
-or artifact-read APIs, with stdout and stderr kept separate.
+output of any size is available through explicit raw byte streams returned by `JobHandle.logs`, `JobHandle.attach`, or
+artifact-read APIs, with stdout and stderr kept separate.
 
 The controller Unix-socket lane keeps JSON strictly control-only. An RPC header may declare top-level camel-case
 `binaryLength`; the actor then transfers exactly one separate u32-length-prefixed raw frame, capped at 64 KiB, before

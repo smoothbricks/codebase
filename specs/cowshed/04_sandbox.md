@@ -164,7 +164,7 @@ deny creating children, opening for write, truncating, replacing, renaming, unli
 reaching a protected inode through a symlink, hardlink, bind mount, alternate spelling, `/proc`, or inherited
 descriptor. The supervisor marks every writable protected-artifact descriptor and controller-writer channel
 close-on-exec/non-inheritable before spawning any shell. No protected inode may have a hardlink alias in a
-workspace-writable subtree. Read access may remain available for representation-transparent `cowshed job logs` and
+workspace-writable subtree. Read access may remain available for representation-transparent `Job::logs` and
 workspace-local inspection; write authority does not.
 
 This split also applies to a one-shot `cowshed exec` that does not use the persistent pool: the trusted cowshed parent
