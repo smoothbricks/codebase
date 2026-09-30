@@ -2,8 +2,9 @@ import { describe, expect, it } from 'bun:test';
 import { createHash } from 'node:crypto';
 import { mkdir, mkdtemp, rename, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { dirname, join, posix } from 'node:path';
 
+import { resetWorkspaceContext, updateFilesInContext } from 'nx/src/utils/workspace-context.js';
 import { hashVersionlessCrateManifests, updateVersionlessCrateManifest } from './manifest-hash.js';
 
 const CRATE_MANIFEST = `[package]
@@ -141,6 +142,20 @@ describe('versionless crate manifest hashing', () => {
     });
   });
 
+  it('hashes only the manifests Nx indexes, never ones under ignored build output', async () => {
+    await withProject(async (project) => {
+      const baseline = await hashVersionlessCrateManifests(project.root, project.workspaceRoot);
+      // A build that copies crates into ignored output (a vendored dist, a
+      // cache restore) must neither move the digest nor be read at all: a
+      // restore may delete that tree while the digest is computed.
+      await project.write('.gitignore', 'generated/\n');
+      await project.write('generated/crate/Cargo.toml', CRATE_MANIFEST.replace('1.0.200', '9.9.9'));
+      project.refreshIndex();
+
+      expect(await hashVersionlessCrateManifests(project.root, project.workspaceRoot)).toBe(baseline);
+    });
+  });
+
   it('hashes a manifest it cannot read instead of dropping it', async () => {
     await withProject(async (project) => {
       await project.write('crates/core/Cargo.toml', 'this is not toml [[[');
@@ -169,6 +184,8 @@ interface ProjectFixture {
   root: string;
   write(path: string, contents: string): Promise<void>;
   move(from: string, to: string): Promise<void>;
+  /** Rebuild Nx's file index for the fixture, as a fresh Nx process would. */
+  refreshIndex(): void;
 }
 
 async function withProject(body: (project: ProjectFixture) => Promise<void>): Promise<void> {
@@ -191,7 +208,10 @@ async function withProject(body: (project: ProjectFixture) => Promise<void>): Pr
         const target = join(workspaceRoot, root, to);
         await mkdir(dirname(target), { recursive: true });
         await rename(join(workspaceRoot, root, from), target);
+        // What Nx's file watcher reports to the index for a move.
+        updateFilesInContext(workspaceRoot, [posix.join(root, to)], [posix.join(root, from)]);
       },
+      refreshIndex: resetWorkspaceContext,
     });
   } finally {
     await rm(workspaceRoot, { recursive: true, force: true });

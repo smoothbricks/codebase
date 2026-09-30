@@ -1,8 +1,8 @@
 import { createHash, type Hash } from 'node:crypto';
-import { readdir, readFile } from 'node:fs/promises';
-import { join, sep } from 'node:path';
+import { readFile } from 'node:fs/promises';
+import { join, posix } from 'node:path';
 
-import { isNonSourceDirectory } from './source-directories.js';
+import { globWithWorkspaceContext } from 'nx/src/utils/workspace-context.js';
 
 /**
  * A release rewrites `version` in every manifest it publishes. Those manifests
@@ -150,41 +150,38 @@ export function updateVersionlessCrateManifest(hash: Hash, manifest: Buffer): vo
  * answer: the dependency the digest describes really did change.
  */
 export async function hashVersionlessCrateManifests(projectRoot: string, workspaceRoot: string): Promise<string> {
-  const root = join(workspaceRoot, projectRoot);
-  const paths: string[] = [];
-  await collectCrateManifests(root, '', paths);
-  paths.sort();
-  const manifests = await Promise.all(paths.map((path) => readFile(join(root, path))));
+  const manifests = await Promise.all(
+    (await listCrateManifests(projectRoot, workspaceRoot)).map(async (path) => ({
+      path,
+      bytes: await readFile(join(workspaceRoot, projectRoot, path)),
+    })),
+  );
   const hash = createHash('sha256');
   hash.update(DIGEST_TAG);
   hash.update(SEPARATOR);
-  for (let index = 0; index < paths.length; index++) {
-    hash.update(paths[index] as string);
+  for (const { path, bytes } of manifests) {
+    hash.update(path);
     hash.update(SEPARATOR);
-    updateVersionlessCrateManifest(hash, manifests[index] as Buffer);
+    updateVersionlessCrateManifest(hash, bytes);
     hash.update(SEPARATOR);
   }
   return hash.digest('hex');
 }
 
-/** Collects manifest paths relative to the project root, `/`-separated so the digest is platform-independent. */
-async function collectCrateManifests(directory: string, prefix: string, found: string[]): Promise<void> {
-  // No `catch`: an unreadable directory would otherwise hash as an empty
-  // manifest set, which is the silent-staleness failure this module exists to
-  // avoid. The caller degrades to the raw manifests instead. Symlinked
-  // directories are not entries `isDirectory` reports, so the walk cannot loop
-  // and matches what Nx keeps in its file map.
-  for (const entry of await readdir(directory, { withFileTypes: true })) {
-    if (entry.isDirectory()) {
-      // The exclusions every source walk in this plugin uses, so the digest
-      // covers the same files Nx keeps in its file map.
-      if (!isNonSourceDirectory(entry.name)) {
-        await collectCrateManifests(`${directory}${sep}${entry.name}`, `${prefix}${entry.name}/`, found);
-      }
-    } else if (entry.name === CARGO_MANIFEST) {
-      found.push(`${prefix}${entry.name}`);
-    }
-  }
+/**
+ * Crate manifest paths relative to the project root, `/`-separated and sorted,
+ * so the digest is platform-independent. They come from Nx's own workspace
+ * file index — exactly the files the project's `Cargo.toml` exclusion removes
+ * from its filesets, with `.gitignore` applied — rather than from a walk of
+ * the tree: a walk reads ignored build output, which an Nx cache restore can
+ * delete while it is being read. No `catch`: a listing or read that fails
+ * would otherwise hash as a smaller manifest set, the silent staleness this
+ * module exists to avoid; the caller degrades to the raw manifests instead.
+ */
+async function listCrateManifests(projectRoot: string, workspaceRoot: string): Promise<string[]> {
+  const prefix = projectRoot === '.' ? '' : `${posix.normalize(projectRoot)}/`;
+  const files = await globWithWorkspaceContext(workspaceRoot, [`${prefix}**/${CARGO_MANIFEST}`]);
+  return files.map((file) => file.slice(prefix.length)).sort();
 }
 
 /** `from` is just past the `[`. */
