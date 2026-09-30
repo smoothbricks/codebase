@@ -9,10 +9,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use cowshed_core::apfs::{ApfsCaseSensitivity, SystemCommandRunner, volume_name};
+use cowshed_core::apfs::{SystemCommandRunner, volume_name};
 use cowshed_core::metadata::{
-    GrantSet, ImageCapacity, ImageFormat, MACOS_PORT_MIN, NEW_PORT_BLOCK_SIZE, PortBlock,
-    WorkspaceName,
+    GrantSet, ImageCapacity, MACOS_PORT_MIN, NEW_PORT_BLOCK_SIZE, PortBlock, WorkspaceName,
 };
 use cowshed_core::repository::RepoId;
 use cowshed_core::storage::apfs::extents::{count_extents, rewrite_sibling};
@@ -37,13 +36,9 @@ struct IntegrationRoot {
 const ROOT_PREFIX: &str = "/private/tmp/cowshed-itest-";
 
 impl IntegrationRoot {
-    fn new(format: ImageFormat) -> Result<Self, Box<dyn Error>> {
+    fn new() -> Result<Self, Box<dyn Error>> {
         sweep_dead_runs();
-        let path = PathBuf::from(format!(
-            "{ROOT_PREFIX}{}-{}",
-            std::process::id(),
-            format.extension()
-        ));
+        let path = PathBuf::from(format!("{ROOT_PREFIX}{}", std::process::id()));
         if path.exists() {
             detach_images(|image| image.starts_with(&*path.to_string_lossy()));
             fs::remove_dir_all(&path)?;
@@ -193,35 +188,28 @@ impl Drop for ChurnGuard {
     }
 }
 
-/// One `#[test]` per image format, deliberately not a loop over both.
+/// One complete substrate lifecycle on real APFS images — adopt, mount, a stream write, clone
+/// under writer churn, checkpoint, restore, stats, defragment (a busy refusal, then the rewrite of
+/// main's image fragmented under a clone), retire, reclaim, GC, detach — bounded by the harness's
+/// PER-TEST deadline. The defragment phase lives here, not in a test of its own, because its own
+/// test pays adopt's attaches again: one did, and under host contention stalled past the 30s
+/// default inside adopt.
 ///
-/// Each format drives a complete, independent substrate lifecycle — adopt, mount, a stream
-/// write, clone under writer churn, checkpoint, restore, stats, defragment (a
-/// busy refusal, then the rewrite of main's image fragmented under a clone), retire, reclaim, GC,
-/// detach — and each is bounded by the harness's PER-TEST deadline. The defragment phase lives
-/// here, not in a test of its own, because its own test pays adopt's attaches again: one did, and
-/// under host contention stalled past the 30s default inside adopt. Running both inside one test
-/// spent 27.4s of a 30s budget on an idle host (Sparse 14.8s + Asif 10.6s), leaving 8.6% headroom,
-/// so ordinary host variance read as a test failure. Split, each scenario answers for its own wall
-/// time against the whole budget, and a format that regresses names itself instead of being one
-/// of two suspects behind a single timeout.
+/// It also proves the image contract of specs/cowshed/01_storage.md from the kernel's side: the
+/// image adopt creates mounts as case-sensitive APFS whose root the invoking user owns, nothing ran
+/// as root to make it so, and a clone of it is case-sensitive too.
 ///
 /// The data work is sized to what the assertions need, not to the image: on a hosted CI runner
-/// the disk is the slow part. There the Asif lifecycle's APFS phases took 20s of a run that passed
-/// 60s, the rest spent writing a 128 MiB stream and moving every other page of the whole image.
-/// The stream is [`STREAM_MEBIBYTES`] MiB, and [`FRAGMENTED_PAGES`] pages move.
-///
-/// These two share the host's APFS driver and Disk Arbitration, so they are serialized against
-/// each other by the `real-apfs` nextest test group rather than by living in one test body.
-/// Neither format is optional: a missing capability is a failure, never a skip.
-#[test]
-fn real_apfs_sparse_substrate_lifecycle() {
-    run_lifecycle(ImageFormat::Sparse);
-}
-
+/// the disk is the slow part. The stream is [`STREAM_MEBIBYTES`] MiB, and [`FRAGMENTED_PAGES`]
+/// pages move. The host's APFS driver and Disk Arbitration are shared with every other real-APFS
+/// test through the `real-apfs` nextest test group. A missing capability is a failure, never a
+/// skip.
 #[test]
 fn real_apfs_asif_substrate_lifecycle() {
-    run_lifecycle(ImageFormat::Asif);
+    match run_lifecycle() {
+        Ok(evidence) => eprintln!("APFS: {evidence}"),
+        Err(error) => panic!("required APFS capability failed: {error}"),
+    }
 }
 
 /// The stream written before the clone: data the clone shares and the defragment rewrite moves.
@@ -231,28 +219,22 @@ const STREAM_MEBIBYTES: usize = 32;
 /// ones, is an extent, so this leaves about twice the 1000 extents the lifecycle asserts.
 const FRAGMENTED_PAGES: u64 = 1_200;
 
-fn run_lifecycle(format: ImageFormat) {
-    match run_format(format) {
-        Ok(evidence) => eprintln!("APFS {format:?}: {evidence}"),
-        Err(error) => panic!("required APFS {format:?} capability failed: {error}"),
-    }
-}
-
-fn run_format(format: ImageFormat) -> Result<String, Box<dyn Error>> {
-    let root = IntegrationRoot::new(format)?;
+fn run_lifecycle() -> Result<String, Box<dyn Error>> {
+    // SAFETY: `geteuid` reads this process's credentials; it takes no pointers and cannot fail.
+    assert_ne!(
+        unsafe { libc::geteuid() },
+        0,
+        "image creation is proven unprivileged, so the test must not run as root"
+    );
+    let root = IntegrationRoot::new()?;
     let store = root.path.join("store");
     let caches = store.join("caches");
     let checkout_path = root.path.join("main-mount");
     fs::create_dir_all(&store)?;
     fs::create_dir_all(&caches)?;
     fs::create_dir_all(&checkout_path)?;
-    let config = ApfsSubstrateConfig::new(
-        &store,
-        &caches,
-        &checkout_path,
-        ApfsCaseSensitivity::Insensitive,
-    )
-    .with_capacity(ImageCapacity::from_gibibytes(1));
+    let config = ApfsSubstrateConfig::new(&store, &caches, &checkout_path)
+        .with_capacity(ImageCapacity::from_gibibytes(1));
     let identity = || -> Result<OperationIdentity, Box<dyn Error>> {
         Ok(OperationIdentity {
             project_root: checkout_path.clone(),
@@ -260,7 +242,7 @@ fn run_format(format: ImageFormat) -> Result<String, Box<dyn Error>> {
             created_at: "2026-07-13T00:00:00Z".to_owned(),
             branch: Some("main".to_owned()),
             forked_from: None,
-            created_trace: format!("apfs-integration-{}", format.extension()),
+            created_trace: "apfs-integration".to_owned(),
             git_worktree: false,
             grants: GrantSet::closed_baseline(Some(PortBlock::new(
                 MACOS_PORT_MIN,
@@ -285,17 +267,9 @@ fn run_format(format: ImageFormat) -> Result<String, Box<dyn Error>> {
 
     let started = Instant::now();
     let result: Result<String, Box<dyn Error>> = runtime.block_on(async {
-        // Format-distinct, matching the per-format `IntegrationRoot`: the two lifecycle tests
-        // share a pid, so a pid-only identity would give both the same StorageLayout keys and
-        // the same (human-facing) volume label, leaving per-format evidence ambiguous to read.
-        let repo = RepoId::parse(&format!(
-            "cowshed/itest-{}-{}",
-            std::process::id(),
-            format.extension()
-        ))?;
+        let repo = RepoId::parse(&format!("cowshed/itest-{}", std::process::id()))?;
         let adopt = substrate.plan_adopt(AdoptRequest {
             repo: repo.clone(),
-            format,
             capacity: ImageCapacity::from_gibibytes(1),
             topology_revision: Revision::new(0),
             source_checkout: checkout_path.clone(),
@@ -307,13 +281,6 @@ fn run_format(format: ImageFormat) -> Result<String, Box<dyn Error>> {
             .await
             .map_err(|error| std::io::Error::other(format!("adopt: {error}")))?
             .workspace;
-        if main.format() != format {
-            return Err(std::io::Error::other(format!(
-                "requested {format:?}, native capability selected {:?}",
-                main.format()
-            ))
-            .into());
-        }
         // Main mounts at the adopted checkout path itself, with the original tree retained beside
         // it.
         assert_eq!(
@@ -330,6 +297,7 @@ fn run_format(format: ImageFormat) -> Result<String, Box<dyn Error>> {
         let mounted_root = fs::metadata(&checkout_path)?;
         assert_eq!(mounted_root.uid(), unsafe { libc::getuid() });
         assert_eq!(mounted_root.gid(), unsafe { libc::getgid() });
+        assert_case_sensitive(&checkout_path)?;
         // The label adoption gave main's volume, read from the kernel rather than from Disk
         // Arbitration's cache.
         let main_label = volume_label(&repo, &WorkspaceName::new("main")?);
@@ -337,6 +305,8 @@ fn run_format(format: ImageFormat) -> Result<String, Box<dyn Error>> {
 
         let payload = checkout_path.join("payload.txt");
         fs::write(&payload, b"checkpoint baseline\n")?;
+        fs::write(checkout_path.join("Case"), b"upper")?;
+        fs::write(checkout_path.join("case"), b"lower")?;
         let stream = checkout_path.join("stream.bin");
         write_stream(&stream, STREAM_MEBIBYTES)?;
         let churn_stop = Arc::new(AtomicBool::new(false));
@@ -382,6 +352,10 @@ fn run_format(format: ImageFormat) -> Result<String, Box<dyn Error>> {
             fs::read(fork_mount.join("payload.txt"))?,
             b"checkpoint baseline\n"
         );
+        // The clone carries its source's volume, case sensitivity included.
+        assert_eq!(fs::read(fork_mount.join("Case"))?, b"upper");
+        assert_eq!(fs::read(fork_mount.join("case"))?, b"lower");
+        assert_case_sensitive(&fork_mount)?;
         assert_eq!(
             fs::metadata(fork_mount.join("stream.bin"))?.len(),
             u64::try_from(STREAM_MEBIBYTES * 1024 * 1024)?
@@ -443,7 +417,7 @@ fn run_format(format: ImageFormat) -> Result<String, Box<dyn Error>> {
             .await
             .map_err(|error| std::io::Error::other(format!("unmount main: {error}")))?;
         let image = StorageLayout::new(&store, &repo)?
-            .main_image(format)?
+            .main_image()?
             .image()
             .to_owned();
         let rewritten_pages = fragment_under_clone(&image)?;
@@ -605,4 +579,22 @@ fn fragment_under_clone(image: &Path) -> Result<u64, Box<dyn Error>> {
     file.sync_all()?;
     fs::remove_file(&holder)?;
     Ok(rewritten)
+}
+
+/// The volume at `mount` folds no case: the kernel reports it case-sensitive, and two names that
+/// differ only in case are two files.
+fn assert_case_sensitive(mount: &Path) -> Result<(), Box<dyn Error>> {
+    let path = std::ffi::CString::new(mount.as_os_str().as_encoded_bytes())?;
+    // SAFETY: `path` is a NUL-terminated C string that outlives the call.
+    let sensitive = unsafe { libc::pathconf(path.as_ptr(), libc::_PC_CASE_SENSITIVE) };
+    assert_eq!(sensitive, 1, "{} is not case-sensitive", mount.display());
+    let upper = mount.join("CaseProbe");
+    let lower = mount.join("caseprobe");
+    fs::write(&upper, b"U")?;
+    fs::write(&lower, b"l")?;
+    assert_eq!(fs::read(&upper)?, b"U");
+    assert_eq!(fs::read(&lower)?, b"l");
+    fs::remove_file(upper)?;
+    fs::remove_file(lower)?;
+    Ok(())
 }

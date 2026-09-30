@@ -297,7 +297,6 @@ fn restore_previous_plist(plist: &Path, previous: &[u8]) -> String {
 /// finds no daemon starts a server of its own over the same directory, and two servers deriving
 /// two different caps would make the shared store's eviction bound depend on which one started.
 pub(crate) async fn derived_capacity(storage: &ValidatedHostStorage) -> Result<ImageCapacity> {
-    use cowshed_core::metadata::ImageFormat;
     use cowshed_core::storage::StorageLayout;
     use std::os::unix::fs::MetadataExt as _;
 
@@ -315,13 +314,10 @@ pub(crate) async fn derived_capacity(storage: &ValidatedHostStorage) -> Result<I
                 project.repo_id
             ))
         })?;
-        for format in [ImageFormat::Asif, ImageFormat::Sparse] {
-            let Ok(image) = layout.main_image(format) else {
-                continue;
-            };
-            if let Ok(metadata) = fs::metadata(image.image()) {
-                bytes = bytes.saturating_add(metadata.blocks().saturating_mul(512));
-            }
+        if let Ok(image) = layout.main_image()
+            && let Ok(metadata) = fs::metadata(image.image())
+        {
+            bytes = bytes.saturating_add(metadata.blocks().saturating_mul(512));
         }
     }
     let gibibytes = bytes.div_ceil(ImageCapacity::GIBIBYTE);

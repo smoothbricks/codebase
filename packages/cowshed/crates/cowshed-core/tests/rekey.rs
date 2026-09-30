@@ -18,10 +18,9 @@ use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 
 use cowshed_core::metadata::{
-    DetachedWorkspaceMetadata, GrantSet, ImageFormat, MACOS_PORT_MIN, MARKER_VERSION,
-    NEW_PORT_BLOCK_SIZE, Platform, PortBlock, PublicationState, SIDECAR_VERSION,
-    WorkspaceIncarnation, WorkspaceInfoSnapshot, WorkspaceMarker, WorkspaceName, WorkspaceRole,
-    sidecar_path, write_json,
+    DetachedWorkspaceMetadata, GrantSet, MACOS_PORT_MIN, MARKER_VERSION, NEW_PORT_BLOCK_SIZE,
+    Platform, PortBlock, PublicationState, SIDECAR_VERSION, WorkspaceIncarnation,
+    WorkspaceInfoSnapshot, WorkspaceMarker, WorkspaceName, WorkspaceRole, sidecar_path, write_json,
 };
 use cowshed_core::repository::RepoId;
 use cowshed_core::storage::StorageLayout;
@@ -71,7 +70,6 @@ fn sidecar(
         repo_id: repo.clone(),
         workspace: workspace.clone(),
         workspace_incarnation: incarnation.clone(),
-        image_format: ImageFormat::Sparse,
         platform: Platform::Macos,
         publication_state: PublicationState::Active,
         updated_at: "2026-07-14T00:00:00Z".to_owned(),
@@ -104,12 +102,12 @@ fn base_fixture(case: &str, name: &str) -> (PathBuf, Fixture) {
     let paths = layout.project().clone();
 
     let image = if workspace.is_main() {
-        let main = layout.main_image(ImageFormat::Sparse).expect("main image");
+        let main = layout.main_image().expect("main image");
         fs::create_dir_all(main.image().parent().expect("image parent")).expect("image parent");
         main.image().to_owned()
     } else {
         fs::create_dir_all(&paths.sessions).expect("sessions");
-        paths.sessions.join(format!("{name}.sparseimage"))
+        paths.sessions.join(format!("{name}.asif"))
     };
     fs::write(&image, b"image").expect("image");
 
@@ -125,7 +123,6 @@ fn base_fixture(case: &str, name: &str) -> (PathBuf, Fixture) {
             workspace: workspace.clone(),
             workspace_incarnation: incarnation.clone(),
             role: WorkspaceRole::for_name(&workspace),
-            image_format: ImageFormat::Sparse,
             base_commit: "8f31c2d".to_owned(),
             created_at: "2026-07-14T00:00:00Z".to_owned(),
             forked_from: None,
@@ -165,9 +162,9 @@ fn quarantined_fixture(case: &str, name: &str) -> Fixture {
         QUARANTINED_REVISION,
         &root.join("checkout"),
     )
-    .write_for_image(&entry.join(format!("{name}.sparseimage")))
+    .write_for_image(&entry.join(format!("{name}.asif")))
     .expect("quarantined sidecar");
-    let quarantined_sidecar_path = sidecar_path(&entry.join(format!("{name}.sparseimage")));
+    let quarantined_sidecar_path = sidecar_path(&entry.join(format!("{name}.asif")));
     assert!(quarantined_sidecar_path.is_file());
     let tombstone = serde_json::json!({
         "version": 1,
@@ -284,7 +281,6 @@ fn rekey_refuses_a_workspace_that_is_already_keyed() {
         Revision::new(LIVE_REVISION),
         Revision::new(LIVE_REVISION),
         WorkspaceRole::Workspace,
-        ImageFormat::Sparse,
     )
     .expect("lifecycle workspace");
     let companion = PathBuf::from(format!("{}.ca.key", fixture.image.display()));

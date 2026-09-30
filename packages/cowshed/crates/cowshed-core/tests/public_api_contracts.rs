@@ -218,7 +218,6 @@ fn workspace_info_attached_and_detached_shapes_are_frozen() {
         workspace: workspace(),
         workspace_incarnation: incarnation(),
         role: WorkspaceRole::Workspace,
-        image_format: ImageFormat::Asif,
         mount: PathBuf::from("/Users/tester/.cowshed/mnt/acme/widget/raven"),
         state: WorkspaceState::Attached,
         branch: Some("raven".into()),
@@ -241,7 +240,6 @@ fn workspace_info_attached_and_detached_shapes_are_frozen() {
             "workspace": "raven",
             "workspaceIncarnation": "0198f2c0b7e34dc795f17b238b331c80",
             "role": "workspace",
-            "imageFormat": "asif",
             "mount": "/Users/tester/.cowshed/mnt/acme/widget/raven",
             "state": "attached",
             "branch": "raven",
@@ -671,10 +669,9 @@ fn all_lifecycle_options_use_camel_case_and_omit_only_optionals() {
             repo_id: Some(repo()),
             capacity: Some("100g".into()),
             quarantine: true,
-            image_format: Some(ImageFormat::Sparse),
         })
         .unwrap(),
-        json!({"repoId":"acme/widget","capacity":"100g","quarantine":true,"imageFormat":"sparse"})
+        json!({"repoId":"acme/widget","capacity":"100g","quarantine":true})
     );
     assert_eq!(
         serde_json::to_value(CreateOptions {

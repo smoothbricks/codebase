@@ -20,7 +20,6 @@ export class CowshedError extends Error {
 }
 
 export type WorkspaceRole = 'main' | 'workspace';
-export type ImageFormat = 'asif' | 'sparse';
 export type WorkspaceState = 'attached' | 'detached';
 export type EgressMode = 'intercept' | 'opaque';
 export type SimVerb = 'openurl' | 'install';
@@ -43,7 +42,6 @@ export interface WorkspaceInfo {
   readonly workspace: string;
   readonly workspaceIncarnation: string;
   readonly role: WorkspaceRole;
-  readonly imageFormat: ImageFormat;
   readonly mount: string;
   readonly state: WorkspaceState;
   readonly branch?: string;
@@ -107,7 +105,6 @@ export interface AdoptOptions {
   readonly repoId?: string;
   readonly capacity?: string;
   readonly quarantine?: boolean;
-  readonly imageFormat?: ImageFormat;
 }
 
 export interface CreateOptions {
@@ -278,8 +275,7 @@ export interface GcCandidate {
     | 'orphanStagingMetadata'
     | 'orphanStagingMount'
     | 'orphanMountpoint'
-    | 'expiredCheckpoint'
-    | 'detachedImageCompaction';
+    | 'expiredCheckpoint';
 }
 
 export interface GcReport {

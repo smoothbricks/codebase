@@ -41,9 +41,9 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::metadata::{
-    DetachedWorkspaceMetadata, ImageFormat, PublicationState, WorkspaceIncarnation,
-    WorkspaceMarker, WorkspaceName, WorkspaceRole, image_from_sidecar_path, read_json,
-    sidecar_path,
+    DetachedWorkspaceMetadata, PublicationState, WorkspaceIncarnation, WorkspaceMarker,
+    WorkspaceName, WorkspaceRole, image_from_sidecar_path, read_json, sidecar_path,
+    validate_image_path,
 };
 use crate::repository::RepoId;
 use crate::storage::{StorageLayout, WORKSPACE_MARKER_PATH};
@@ -186,11 +186,9 @@ pub fn rekey_workspace(
     let project = layout.project();
     let source = locate_source(layout, workspace)?;
 
-    let format = ImageFormat::from_image_path(&source.image).map_err(|error| {
-        RekeyError::IdentityMismatch {
-            workspace: workspace.to_string(),
-            detail: error.to_string(),
-        }
+    validate_image_path(&source.image).map_err(|error| RekeyError::IdentityMismatch {
+        workspace: workspace.to_string(),
+        detail: error.to_string(),
     })?;
     if !project.contains(&source.image) {
         return Err(RekeyError::IdentityMismatch {
@@ -204,12 +202,13 @@ pub fn rekey_workspace(
             detail: format!("image is gone: {}", source.image.display()),
         });
     }
-    let canonical = layout.canonical_image(workspace, format).map_err(|error| {
-        RekeyError::IdentityMismatch {
-            workspace: workspace.to_string(),
-            detail: error.to_string(),
-        }
-    })?;
+    let canonical =
+        layout
+            .canonical_image(workspace)
+            .map_err(|error| RekeyError::IdentityMismatch {
+                workspace: workspace.to_string(),
+                detail: error.to_string(),
+            })?;
     if canonical.image() != source.image {
         return Err(RekeyError::IdentityMismatch {
             workspace: workspace.to_string(),
@@ -235,7 +234,6 @@ pub fn rekey_workspace(
         workspace,
         &source.base.workspace_incarnation,
         &source.base.repo_id,
-        format,
         mount_point,
     )?;
 
@@ -298,7 +296,6 @@ pub fn rekey_workspace(
         crate::storage::lifecycle::Revision::new(revision),
         crate::storage::lifecycle::Revision::new(revision),
         role,
-        format,
     )
     .map_err(|error| RekeyError::IdentityMismatch {
         workspace: workspace.to_string(),
@@ -530,47 +527,36 @@ fn quarantine_source(
 }
 
 /// Identity from the live canonical sidecar, for the companion-missing case
-/// the recovery pass has not quarantined yet. Both image formats are
-/// probed; two live images for one workspace is a refusal, not a guess.
+/// the recovery pass has not quarantined yet.
 fn live_source(
     layout: &StorageLayout,
     workspace: &WorkspaceName,
 ) -> Result<IdentitySource, RekeyError> {
-    let mut found: Option<(PathBuf, DetachedWorkspaceMetadata)> = None;
-    for format in [ImageFormat::Asif, ImageFormat::Sparse] {
-        let paths = layout.canonical_image(workspace, format).map_err(|error| {
-            RekeyError::IdentityMismatch {
+    let paths =
+        layout
+            .canonical_image(workspace)
+            .map_err(|error| RekeyError::IdentityMismatch {
                 workspace: workspace.to_string(),
                 detail: error.to_string(),
-            }
-        })?;
-        if !paths.image().is_file() {
-            continue;
-        }
-        let base = DetachedWorkspaceMetadata::read_for_image(paths.image()).map_err(|error| {
-            RekeyError::NoIdentity {
-                workspace: workspace.to_string(),
-                detail: format!(
-                    "live sidecar {} does not read: {error}",
-                    sidecar_path(paths.image()).display()
-                ),
-            }
-        })?;
-        if found.is_some() {
-            return Err(RekeyError::IdentityMismatch {
-                workspace: workspace.to_string(),
-                detail: "two live images claim this workspace".to_owned(),
-            });
-        }
-        found = Some((paths.image().to_owned(), base));
+            })?;
+    if !paths.image().is_file() {
+        return Err(RekeyError::NoIdentity {
+            workspace: workspace.to_string(),
+            detail: "no quarantine entry names this workspace and no live image exists".to_owned(),
+        });
     }
-    let (image, base) = found.ok_or_else(|| RekeyError::NoIdentity {
-        workspace: workspace.to_string(),
-        detail: "no quarantine entry names this workspace and no live image exists".to_owned(),
+    let base = DetachedWorkspaceMetadata::read_for_image(paths.image()).map_err(|error| {
+        RekeyError::NoIdentity {
+            workspace: workspace.to_string(),
+            detail: format!(
+                "live sidecar {} does not read: {error}",
+                sidecar_path(paths.image()).display()
+            ),
+        }
     })?;
     Ok(IdentitySource {
         origin: SourceOrigin::Live,
-        image,
+        image: paths.image().to_owned(),
         base,
         entry_dir: None,
     })
@@ -582,7 +568,6 @@ fn prove_mount(
     workspace: &WorkspaceName,
     incarnation: &WorkspaceIncarnation,
     repo: &RepoId,
-    format: ImageFormat,
     mount_point: &Path,
 ) -> Result<(), RekeyError> {
     let marker_path = mount_point.join(WORKSPACE_MARKER_PATH);
@@ -595,7 +580,6 @@ fn prove_mount(
     if marker.repo_id != *repo
         || marker.workspace != *workspace
         || marker.workspace_incarnation != *incarnation
-        || marker.image_format != format
     {
         return Err(RekeyError::NotMounted {
             workspace: workspace.to_string(),

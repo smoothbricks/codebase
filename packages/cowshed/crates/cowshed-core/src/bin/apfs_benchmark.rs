@@ -4,11 +4,11 @@ mod macos {
     use std::time::{Duration, Instant};
 
     use cowshed_core::apfs::{
-        ApfsBackend, ApfsCaseSensitivity, AttachedImage, CreateImageRequest, DetachIntent,
-        ImageFormatSelection, MacOsApfsBackend, SystemCommandRunner,
+        ApfsBackend, AttachedImage, CreateImageRequest, DetachIntent, MacOsApfsBackend,
+        SystemCommandRunner,
     };
     use cowshed_core::copy::copy_until_quiescent_blocking;
-    use cowshed_core::metadata::{ImageCapacity, ImageFormat};
+    use cowshed_core::metadata::{IMAGE_EXTENSION, ImageCapacity};
 
     pub fn run() {
         let mut arguments = std::env::args_os();
@@ -23,18 +23,7 @@ mod macos {
             return;
         }
 
-        let formats = [ImageFormat::Sparse, ImageFormat::Asif];
-        let mut completed = 0;
-        for format in formats {
-            benchmark_format(format)
-                .unwrap_or_else(|error| panic!("APFS {format:?} benchmark failed: {error}"));
-            completed += 1;
-        }
-        assert_eq!(
-            completed,
-            formats.len(),
-            "both APFS formats must complete the benchmark"
-        );
+        benchmark_image().unwrap_or_else(|error| panic!("APFS benchmark failed: {error}"));
     }
 
     fn benchmark_tree_copy(source: &Path) -> Result<(), Box<dyn std::error::Error>> {
@@ -99,11 +88,10 @@ mod macos {
         }
     }
 
-    fn benchmark_format(format: ImageFormat) -> Result<(), Box<dyn std::error::Error>> {
+    fn benchmark_image() -> Result<(), Box<dyn std::error::Error>> {
         let root = BenchmarkRoot(PathBuf::from(format!(
-            "/private/tmp/cowshed-bench-{}-{}",
+            "/private/tmp/cowshed-bench-{}",
             std::process::id(),
-            format.extension()
         )));
         if root.0.exists() {
             std::fs::remove_dir_all(&root.0)?;
@@ -113,39 +101,35 @@ mod macos {
         let request = CreateImageRequest {
             staged_stem: root.0.join("source"),
             capacity: ImageCapacity::from_gibibytes(1),
-            volume_name: format!("cowshed.bench.{}", format.extension()),
-            case_sensitivity: ApfsCaseSensitivity::Insensitive,
+            volume_name: "cowshed.bench".to_owned(),
             owner_uid: unsafe { libc::getuid() },
             owner_gid: unsafe { libc::getgid() },
-            image_format: ImageFormatSelection::Exact(format),
         };
         let created = backend.create_staged_image(&request)?;
 
         let result = (|| -> Result<(), Box<dyn std::error::Error>> {
             let mut clone_samples = Vec::with_capacity(21);
             for index in 0..21 {
-                let clone = root.0.join(format!("clone-{index}.{}", format.extension()));
+                let clone = root.0.join(format!("clone-{index}.{IMAGE_EXTENSION}"));
                 let started = Instant::now();
-                backend.clone_image(&created.path, &clone, format)?;
+                backend.clone_image(&created, &clone)?;
                 clone_samples.push(started.elapsed());
-                backend.delete_image(&clone, format)?;
+                backend.delete_image(&clone)?;
             }
             clone_samples.sort_unstable();
             let clone_median = clone_samples[clone_samples.len() / 2];
             let clone_max = *clone_samples.last().expect("clone samples");
             if clone_median >= Duration::from_millis(50) {
-                return Err(
-                    format!("{format:?} clonefile median regressed: {clone_median:?}").into(),
-                );
+                return Err(format!("clonefile median regressed: {clone_median:?}").into());
             }
             if clone_max >= Duration::from_millis(250) {
-                return Err(format!("{format:?} clonefile max regressed: {clone_max:?}").into());
+                return Err(format!("clonefile max regressed: {clone_max:?}").into());
             }
 
             let mut attach_samples = Vec::with_capacity(10);
             for _ in 0..10 {
                 let started = Instant::now();
-                let attachment = backend.attach_verified(&created.path, format)?;
+                let attachment = backend.attach_verified(&created)?;
                 let guard = AttachmentGuard {
                     backend: &backend,
                     attachment: Some(attachment),
@@ -156,20 +140,18 @@ mod macos {
             attach_samples.sort_unstable();
             let attach_median = attach_samples[attach_samples.len() / 2];
             if attach_median >= Duration::from_secs(2) {
-                return Err(
-                    format!("{format:?} attach+fsck median regressed: {attach_median:?}").into(),
-                );
+                return Err(format!("attach+fsck median regressed: {attach_median:?}").into());
             }
             if clone_median >= attach_median {
                 return Err("clonefile must remain cheaper than attach+fsck".into());
             }
             eprintln!(
-                "APFS {format:?}: clone median={clone_median:?} max={clone_max:?}; attach+fsck median={attach_median:?}"
+                "APFS: clone median={clone_median:?} max={clone_max:?}; attach+fsck median={attach_median:?}"
             );
             Ok(())
         })();
 
-        let delete = backend.delete_image(&created.path, format);
+        let delete = backend.delete_image(&created);
         let remove_root = std::fs::remove_dir_all(&root.0);
         let mut failures = Vec::new();
         if let Err(error) = result {

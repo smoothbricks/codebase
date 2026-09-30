@@ -32,7 +32,6 @@ use crate::sccache_service::{
 use async_trait::async_trait;
 use cowshed_core::api::EmptyResult;
 use cowshed_core::host_caches::{self, HostCacheRelocation, Relocation};
-use cowshed_core::metadata::ImageFormat;
 use cowshed_core::repository::RepoId;
 use cowshed_core::sandbox::sccache_cache_directory;
 use cowshed_core::storage::bootstrap::{
@@ -642,15 +641,11 @@ fn count_project_workspaces(layout: &StorageLayout) -> std::result::Result<usize
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => return Err(format!("could not read {}: {error}", sessions.display())),
     }
-    let mut workspaces = discover_session_images(entries)
-        .map_err(|error| format!("could not enumerate session images: {error}"))?
-        .len();
-    for format in [ImageFormat::Asif, ImageFormat::Sparse] {
-        if let Ok(image) = layout.main_image(format)
-            && fs::symlink_metadata(image.image()).is_ok()
-        {
-            workspaces += 1;
-        }
+    let mut workspaces = discover_session_images(entries).len();
+    if let Ok(image) = layout.main_image()
+        && fs::symlink_metadata(image.image()).is_ok()
+    {
+        workspaces += 1;
     }
     Ok(workspaces)
 }

@@ -48,9 +48,10 @@ slow-timeout = { period = "180s", terminate-after = 1 }
 #
 # That spec sets the house rule for real-substrate timing: "CI asserts with a 3×
 # multiplier to absorb runner noise". `apfs_integration.rs` measured its lifecycle
-# at 14.8s (Sparse) and 10.6s (Asif) on an IDLE host, so under the repo's own noise
-# model CI needs 44.4s and 31.8s. A 30s deadline was therefore unreachable by
-# construction: the test was not slow, the bound contradicted the spec.
+# at 14.8s on an IDLE host when it still ran a second image format, so under the
+# repo's own noise model CI needed 44.4s. A 30s deadline was therefore unreachable
+# by construction: the test was not slow, the bound contradicted the spec. The
+# one-format lifecycle measures 6.6-10.6s idle, so the bound below still covers it.
 #
 # Nor is the cost reducible. The same spec's "Attach floor verdict: not
 # flag-reducible" records that `-noverify` saves ~15ms (noise), `-noautofsck`
@@ -63,8 +64,7 @@ slow-timeout = { period = "180s", terminate-after = 1 }
 #
 # The alternative was splitting the lifecycle into phase-scoped tests so each fits
 # 30s. It loses: every split pays that attach constant again, so the suite's total
-# wall time rises to buy a smaller per-test bound. Splitting Sparse from Asif was
-# worth it because it bought failure ATTRIBUTION; splitting phases buys only a
+# wall time rises to buy a smaller per-test bound; splitting phases buys only a
 # number.
 #
 # 60s is 3× the worst idle measurement (44.4s) rounded up, not a guess. It stays

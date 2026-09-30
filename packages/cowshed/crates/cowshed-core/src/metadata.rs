@@ -41,11 +41,6 @@ pub enum MetadataError {
         workspace: String,
         role: WorkspaceRole,
     },
-    ImageFormatMismatch {
-        path: PathBuf,
-        format: ImageFormat,
-        actual_extension: Option<String>,
-    },
     UnsupportedImageExtension {
         path: PathBuf,
         actual_extension: Option<String>,
@@ -101,23 +96,12 @@ impl fmt::Display for MetadataError {
                     "workspace {workspace:?} does not agree with role {role:?}"
                 )
             }
-            Self::ImageFormatMismatch {
-                path,
-                format,
-                actual_extension,
-            } => write!(
-                f,
-                "image {} has extension {:?}, which does not agree with imageFormat {:?}",
-                path.display(),
-                actual_extension,
-                format
-            ),
             Self::UnsupportedImageExtension {
                 path,
                 actual_extension,
             } => write!(
                 f,
-                "image {} has unsupported extension {:?}; expected .asif or .sparseimage",
+                "image {} has extension {:?}; every workspace image is .{IMAGE_EXTENSION}",
                 path.display(),
                 actual_extension
             ),
@@ -160,77 +144,36 @@ fn io_error(path: &Path, source: io::Error) -> MetadataError {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum ImageFormat {
-    Asif,
-    Sparse,
+/// Every workspace image is an ASIF file holding one case-sensitive APFS volume
+/// (specs/cowshed/01_storage.md): one extension, no alias, nothing inferred from anything else.
+pub const IMAGE_EXTENSION: &str = "asif";
+
+/// Whether `path` names `<stem>.asif`.
+pub fn is_image_path(path: &Path) -> bool {
+    path.extension() == Some(OsStr::new(IMAGE_EXTENSION))
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
-pub enum AttachTool {
-    DiskutilImage,
-    Hdiutil,
-}
-
-impl ImageFormat {
-    pub const fn extension(self) -> &'static str {
-        match self {
-            Self::Asif => "asif",
-            Self::Sparse => "sparseimage",
-        }
-    }
-
-    pub const fn image_extension(self) -> &'static str {
-        match self {
-            Self::Asif => ".asif",
-            Self::Sparse => ".sparseimage",
-        }
-    }
-
-    pub const fn attach_tool(self) -> AttachTool {
-        match self {
-            Self::Asif => AttachTool::DiskutilImage,
-            Self::Sparse => AttachTool::Hdiutil,
-        }
-    }
-
-    pub fn from_image_path(path: &Path) -> Result<Self, MetadataError> {
-        match path.extension().and_then(OsStr::to_str) {
-            Some("asif") => Ok(Self::Asif),
-            Some("sparseimage") => Ok(Self::Sparse),
-            extension => Err(MetadataError::UnsupportedImageExtension {
-                path: path.to_owned(),
-                actual_extension: extension.map(str::to_owned),
-            }),
-        }
-    }
-
-    pub fn validate_path(self, path: &Path) -> Result<(), MetadataError> {
-        let actual = path.extension().and_then(OsStr::to_str);
-        if actual == Some(self.extension()) {
-            Ok(())
-        } else {
-            Err(MetadataError::ImageFormatMismatch {
-                path: path.to_owned(),
-                format: self,
-                actual_extension: actual.map(str::to_owned),
-            })
-        }
+/// Refuses any path that is not `<stem>.asif`, naming the extension it found.
+pub fn validate_image_path(path: &Path) -> Result<(), MetadataError> {
+    if is_image_path(path) {
+        Ok(())
+    } else {
+        Err(MetadataError::UnsupportedImageExtension {
+            path: path.to_owned(),
+            actual_extension: path.extension().and_then(OsStr::to_str).map(str::to_owned),
+        })
     }
 }
 
 /// A disk-image capacity, held as an exact byte count.
 ///
-/// Capacities are spelled `100g`, `200g`, `1t` on the command line and the units are binary:
-/// that is what `hdiutil` has always meant by them, and therefore what every image cowshed has
-/// ever created is sized in. `diskutil`'s image verbs read the same letters as decimal SI, so
-/// cowshed hands neither tool a unit — it resolves the letters here once and passes the byte
-/// count, the one spelling both tools agree on and the only one a resize can be verified
-/// against afterwards.
+/// Capacities are spelled `100g`, `200g`, `1t` on the command line and the units are binary,
+/// which is what every image cowshed has ever created is sized in. `diskutil`'s image verbs read
+/// the same letters as decimal SI, so cowshed hands it no unit — it resolves the letters here once
+/// and passes the byte count, the only spelling a resize can be verified against afterwards.
 ///
 /// The smallest unit accepted from a caller is a mebibyte, which keeps every requested capacity
-/// a whole number of the 4 KiB blocks both resize tools round to. A request that had to be
+/// a whole number of the 4 KiB blocks a resize rounds to. A request that had to be
 /// rounded could not be checked against what the image reports back.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ImageCapacity(u64);
@@ -268,7 +211,7 @@ impl ImageCapacity {
     pub const MEBIBYTE: u64 = 1024 * Self::KIBIBYTE;
     pub const GIBIBYTE: u64 = 1024 * Self::MEBIBYTE;
     pub const TEBIBYTE: u64 = 1024 * Self::GIBIBYTE;
-    /// The block size both `hdiutil resize` and `diskutil image resize` round a request to.
+    /// The block size `diskutil image resize` rounds a request to.
     const BLOCK: u64 = 4 * Self::KIBIBYTE;
 
     pub const fn from_gibibytes(count: u64) -> Self {
@@ -743,7 +686,6 @@ pub struct WorkspaceMarker {
     pub workspace: WorkspaceName,
     pub workspace_incarnation: WorkspaceIncarnation,
     pub role: WorkspaceRole,
-    pub image_format: ImageFormat,
     pub base_commit: String,
     pub created_at: String,
     pub forked_from: Option<WorkspaceName>,
@@ -768,7 +710,6 @@ struct WorkspaceMarkerWire {
     workspace: WorkspaceName,
     workspace_incarnation: WorkspaceIncarnation,
     role: WorkspaceRole,
-    image_format: ImageFormat,
     base_commit: String,
     created_at: String,
     forked_from: Option<WorkspaceName>,
@@ -790,7 +731,6 @@ impl<'de> Deserialize<'de> for WorkspaceMarker {
             workspace: wire.workspace,
             workspace_incarnation: wire.workspace_incarnation,
             role: wire.role,
-            image_format: wire.image_format,
             base_commit: wire.base_commit,
             created_at: wire.created_at,
             forked_from: wire.forked_from,
@@ -1097,7 +1037,6 @@ pub struct DetachedWorkspaceMetadata {
     pub repo_id: RepoId,
     pub workspace: WorkspaceName,
     pub workspace_incarnation: WorkspaceIncarnation,
-    pub image_format: ImageFormat,
     pub platform: Platform,
     pub publication_state: PublicationState,
     pub updated_at: String,
@@ -1113,7 +1052,6 @@ struct DetachedWorkspaceMetadataWire {
     repo_id: RepoId,
     workspace: WorkspaceName,
     workspace_incarnation: WorkspaceIncarnation,
-    image_format: ImageFormat,
     platform: Platform,
     publication_state: PublicationState,
     updated_at: String,
@@ -1133,7 +1071,6 @@ impl<'de> Deserialize<'de> for DetachedWorkspaceMetadata {
             repo_id: wire.repo_id,
             workspace: wire.workspace,
             workspace_incarnation: wire.workspace_incarnation,
-            image_format: wire.image_format,
             platform: wire.platform,
             publication_state: wire.publication_state,
             updated_at: wire.updated_at,
@@ -1175,7 +1112,7 @@ impl DetachedWorkspaceMetadata {
 
     pub fn validate(&self, image_path: &Path) -> Result<(), MetadataError> {
         self.validate_deserialized()?;
-        self.image_format.validate_path(image_path)?;
+        validate_image_path(image_path)?;
         Ok(())
     }
 
@@ -1287,7 +1224,6 @@ mod tests {
             "workspace": "raven",
             "workspaceIncarnation": "0198f2c0b7e34dc795f17b238b331c80",
             "publicationState": "active",
-            "imageFormat": "asif",
             "platform": "macos",
             "updatedAt": "2026-07-11T12:34:56Z",
             "revision": 7,
@@ -1319,7 +1255,6 @@ mod tests {
             "workspace": "raven",
             "workspaceIncarnation": "0198f2c0b7e34dc795f17b238b331c80",
             "role": "workspace",
-            "imageFormat": "asif",
             "baseCommit": "8f31c2d",
             "createdAt": "2026-07-11T12:00:00Z",
             "forkedFrom": null,
@@ -1373,7 +1308,6 @@ mod tests {
             "workspace": "raven",
             "workspaceIncarnation": "0198f2c0b7e34dc795f17b238b331c80",
             "role": "workspace",
-            "imageFormat": "sparse",
             "baseCommit": "8f31c2d",
             "createdAt": "2026-07-11T12:00:00Z",
             "forkedFrom": null,
@@ -1469,7 +1403,6 @@ mod tests {
         #[test]
         fn valid_marker_schemas_round_trip_across_roles(
             main in any::<bool>(),
-            sparse in any::<bool>(),
             session_suffix in 0_u16..=u16::MAX,
         ) {
             let (workspace, role) = if main {
@@ -1484,7 +1417,6 @@ mod tests {
                 "workspace": workspace,
                 "workspaceIncarnation": "0198f2c0b7e34dc795f17b238b331c80",
                 "role": role,
-                "imageFormat": if sparse { "sparse" } else { "asif" },
                 "baseCommit": "8f31c2d",
                 "createdAt": "2026-07-11T12:00:00Z",
                 "forkedFrom": null,
@@ -1502,12 +1434,10 @@ mod tests {
         #[test]
         fn valid_sidecar_schemas_round_trip_across_platforms(
             macos in any::<bool>(),
-            sparse in any::<bool>(),
             size_log2 in 1_u32..=13,
             block in any::<u16>(),
         ) {
             let mut expected = frozen_sidecar_json();
-            expected["imageFormat"] = json!(if sparse { "sparse" } else { "asif" });
             if macos {
                 let size = 1_u16 << size_log2;
                 let blocks = (MACOS_PORT_MAX - MACOS_PORT_MIN + 1) / size;
@@ -1568,41 +1498,48 @@ mod tests {
     }
 
     #[test]
-    fn formats_and_extensions_must_agree() {
-        assert_eq!(ImageFormat::Asif.attach_tool(), AttachTool::DiskutilImage);
-        assert_eq!(ImageFormat::Sparse.attach_tool(), AttachTool::Hdiutil);
-        ImageFormat::Asif
-            .validate_path(Path::new("raven.asif"))
-            .unwrap();
-        ImageFormat::Sparse
-            .validate_path(Path::new("raven.sparseimage"))
-            .unwrap();
-        assert!(matches!(
-            ImageFormat::Asif.validate_path(Path::new("raven.sparseimage")),
-            Err(MetadataError::ImageFormatMismatch { .. })
-        ));
-        assert!(matches!(
-            ImageFormat::Sparse.validate_path(Path::new("raven.asif")),
-            Err(MetadataError::ImageFormatMismatch { .. })
-        ));
+    fn only_asif_paths_are_workspace_images() {
+        validate_image_path(Path::new("raven.asif")).unwrap();
+        for refused in ["raven.sparseimage", "raven.img", "raven", "raven.asif.lock"] {
+            assert!(
+                matches!(
+                    validate_image_path(Path::new(refused)),
+                    Err(MetadataError::UnsupportedImageExtension { .. })
+                ),
+                "{refused} is not a workspace image"
+            );
+        }
+    }
+
+    /// Metadata written before one image format carried `imageFormat`. Nothing migrates it: the
+    /// unknown field refuses the whole record, so an old sidecar or marker is never half-read.
+    #[test]
+    fn metadata_naming_an_image_format_is_refused() {
+        let mut sidecar = frozen_sidecar_json();
+        sidecar["imageFormat"] = json!("sparse");
+        let error = serde_json::from_value::<DetachedWorkspaceMetadata>(sidecar).unwrap_err();
         assert!(
-            ImageFormat::Asif
-                .validate_path(Path::new("raven.img"))
-                .is_err()
+            error.to_string().contains("unknown field `imageFormat`"),
+            "{error}"
+        );
+
+        let mut marker = serde_json::to_value(marker_from_json()).unwrap();
+        marker["imageFormat"] = json!("asif");
+        let error = serde_json::from_value::<WorkspaceMarker>(marker).unwrap_err();
+        assert!(
+            error.to_string().contains("unknown field `imageFormat`"),
+            "{error}"
         );
     }
 
     #[test]
-    fn detached_metadata_rejects_crossed_extension_before_use() {
-        let directory = temp_directory("format-mismatch");
+    fn detached_metadata_beside_a_non_asif_image_is_refused_before_use() {
+        let directory = temp_directory("sparse-image");
         let image = directory.join("raven.sparseimage");
         write_json(&sidecar_path(&image), &frozen_sidecar_json()).unwrap();
         assert!(matches!(
             DetachedWorkspaceMetadata::read_for_image(&image),
-            Err(MetadataError::ImageFormatMismatch {
-                format: ImageFormat::Asif,
-                ..
-            })
+            Err(MetadataError::UnsupportedImageExtension { .. })
         ));
         fs::remove_dir_all(directory).unwrap();
     }
@@ -1942,7 +1879,7 @@ mod tests {
         let wrong_image = directory.join("wrong.sparseimage");
         assert!(matches!(
             metadata.write_for_image(&wrong_image),
-            Err(MetadataError::ImageFormatMismatch { .. })
+            Err(MetadataError::UnsupportedImageExtension { .. })
         ));
         assert!(!sidecar_path(&wrong_image).exists());
         fs::remove_dir_all(directory).unwrap();

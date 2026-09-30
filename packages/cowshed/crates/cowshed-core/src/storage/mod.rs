@@ -1,4 +1,3 @@
-use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::fmt;
 use std::fs;
@@ -10,7 +9,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
 
 use crate::metadata::{
-    CheckoutRootRecord, ImageFormat, MetadataError, SlotBindings, SlotBindingsRecord,
+    CheckoutRootRecord, IMAGE_EXTENSION, MetadataError, SlotBindings, SlotBindingsRecord,
     WorkspaceName, append_suffix, sidecar_path,
 };
 use crate::repository::{PathLayoutError, ProjectPaths, RepoId};
@@ -186,24 +185,23 @@ impl StorageLayout {
         })
     }
 
-    pub fn main_image(&self, format: ImageFormat) -> Result<ImagePaths, StorageLayoutError> {
-        self.image_below(&self.project.project_root, "main", format)
+    pub fn main_image(&self) -> Result<ImagePaths, StorageLayoutError> {
+        self.image_below(&self.project.project_root, "main")
     }
 
-    pub fn staged_main_image(&self, format: ImageFormat) -> Result<ImagePaths, StorageLayoutError> {
+    pub fn staged_main_image(&self) -> Result<ImagePaths, StorageLayoutError> {
         let staging = checked_child(&self.project.project_root, STAGING_NAMESPACE)?;
-        self.image_below(&staging, "main", format)
+        self.image_below(&staging, "main")
     }
 
     pub fn session_image(
         &self,
         workspace: &WorkspaceName,
-        format: ImageFormat,
     ) -> Result<ImagePaths, StorageLayoutError> {
         if workspace.is_main() {
             return Err(StorageLayoutError::MainIsNotSession);
         }
-        self.image_below(&self.project.sessions, workspace.as_str(), format)
+        self.image_below(&self.project.sessions, workspace.as_str())
     }
 
     /// The canonical image for a workspace: main lives at the project root, every session under
@@ -211,12 +209,11 @@ impl StorageLayout {
     pub fn canonical_image(
         &self,
         workspace: &WorkspaceName,
-        format: ImageFormat,
     ) -> Result<ImagePaths, StorageLayoutError> {
         if workspace.is_main() {
-            self.main_image(format)
+            self.main_image()
         } else {
-            self.session_image(workspace, format)
+            self.session_image(workspace)
         }
     }
 
@@ -224,10 +221,9 @@ impl StorageLayout {
         &self,
         workspace: &WorkspaceName,
         label: &CheckpointLabel,
-        format: ImageFormat,
     ) -> Result<ImagePaths, StorageLayoutError> {
         let workspace_directory = checked_child(&self.project.checkpoints, workspace.as_str())?;
-        self.image_below(&workspace_directory, label.as_str(), format)
+        self.image_below(&workspace_directory, label.as_str())
     }
 
     /// Where this workspace mounts.
@@ -300,13 +296,8 @@ impl StorageLayout {
         )
     }
 
-    fn image_below(
-        &self,
-        directory: &Path,
-        stem: &str,
-        format: ImageFormat,
-    ) -> Result<ImagePaths, StorageLayoutError> {
-        let file_name = format!("{stem}{}", format.image_extension());
+    fn image_below(&self, directory: &Path, stem: &str) -> Result<ImagePaths, StorageLayoutError> {
+        let file_name = format!("{stem}.{IMAGE_EXTENSION}");
         let image = checked_child(directory, &file_name)?;
         if !self.project.contains(&image) {
             return Err(StorageLayoutError::EscapesStoreRoot);
@@ -319,17 +310,12 @@ impl StorageLayout {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DiscoveredSessionImage {
     workspace: WorkspaceName,
-    format: ImageFormat,
     path: PathBuf,
 }
 
 impl DiscoveredSessionImage {
     pub fn workspace(&self) -> &WorkspaceName {
         &self.workspace
-    }
-
-    pub fn format(&self) -> ImageFormat {
-        self.format
     }
 
     pub fn path(&self) -> &Path {
@@ -339,48 +325,32 @@ impl DiscoveredSessionImage {
 
 /// Select only published session images from a directory listing.
 ///
-/// Sidecars, locks, staging directories, temporary names, invalid workspace names, and
-/// unsupported extensions are deliberately invisible. A workspace published in both formats
-/// is rejected instead of choosing one arbitrarily.
+/// Sidecars, locks, staging directories, temporary names, invalid workspace names, and every
+/// file that is not `<name>.asif` are deliberately invisible.
 pub fn discover_session_images(
     entries: impl IntoIterator<Item = PathBuf>,
-) -> Result<Vec<DiscoveredSessionImage>, StorageLayoutError> {
-    let mut discovered = BTreeMap::<WorkspaceName, DiscoveredSessionImage>::new();
-    for path in entries {
-        let Some(file_name) = path.file_name().and_then(OsStr::to_str) else {
-            continue;
-        };
-        let Some((stem, format)) = image_name(file_name) else {
-            continue;
-        };
-        let Ok(workspace) = WorkspaceName::session(stem) else {
-            continue;
-        };
-        let image = DiscoveredSessionImage {
-            workspace: workspace.clone(),
-            format,
-            path,
-        };
-        if let Some(previous) = discovered.insert(workspace.clone(), image) {
-            return Err(StorageLayoutError::DuplicateWorkspaceFormats {
-                workspace,
-                first: previous.format,
-                second: format,
-            });
-        }
-    }
-    Ok(discovered.into_values().collect())
+) -> Vec<DiscoveredSessionImage> {
+    let mut discovered = entries
+        .into_iter()
+        .filter_map(|path| {
+            let stem = path
+                .file_name()
+                .and_then(OsStr::to_str)
+                .and_then(image_stem)?;
+            let workspace = WorkspaceName::session(stem).ok()?;
+            Some(DiscoveredSessionImage { workspace, path })
+        })
+        .collect::<Vec<_>>();
+    discovered.sort_by(|left, right| left.workspace.cmp(&right.workspace));
+    discovered
 }
 
-fn image_name(file_name: &str) -> Option<(&str, ImageFormat)> {
-    for format in [ImageFormat::Asif, ImageFormat::Sparse] {
-        if let Some(stem) = file_name.strip_suffix(format.image_extension())
-            && !stem.is_empty()
-        {
-            return Some((stem, format));
-        }
-    }
-    None
+/// The non-empty stem of `<stem>.asif`.
+fn image_stem(file_name: &str) -> Option<&str> {
+    file_name
+        .strip_suffix(IMAGE_EXTENSION)
+        .and_then(|name| name.strip_suffix('.'))
+        .filter(|stem| !stem.is_empty())
 }
 
 /// Days since 1970-01-01 to a proleptic-Gregorian civil date (Howard Hinnant's algorithm,
@@ -538,12 +508,6 @@ pub enum StorageLayoutError {
         #[source]
         source: io::Error,
     },
-    #[error("workspace {workspace} exists in both {first:?} and {second:?} formats")]
-    DuplicateWorkspaceFormats {
-        workspace: WorkspaceName,
-        first: ImageFormat,
-        second: ImageFormat,
-    },
     #[error(transparent)]
     PathLayout(#[from] PathLayoutError),
     #[error(transparent)]
@@ -622,36 +586,27 @@ mod tests {
     }
 
     #[test]
-    fn maps_every_image_format_and_complete_sibling_suffix() {
+    fn maps_the_asif_image_and_its_complete_sibling_suffixes() {
         let layout = layout();
         let raven = WorkspaceName::session("raven").unwrap();
-        for (format, extension) in [
-            (ImageFormat::Asif, ".asif"),
-            (ImageFormat::Sparse, ".sparseimage"),
-        ] {
-            let paths = layout.session_image(&raven, format).unwrap();
-            assert!(paths.image.to_string_lossy().ends_with(extension));
-            assert_eq!(
-                paths.sidecar,
-                PathBuf::from(format!(
-                    "/private/cowshed/store/acme/widget/sessions/raven{extension}.grants.json"
-                ))
-            );
-            assert_eq!(
-                paths.lock,
-                PathBuf::from(format!(
-                    "/private/cowshed/store/acme/widget/sessions/raven{extension}.lock"
-                ))
-            );
-            assert_eq!(
-                paths.ca_private_key,
-                PathBuf::from(format!(
-                    "/private/cowshed/store/acme/widget/sessions/raven{extension}.ca.key"
-                ))
-            );
-            assert_eq!(ImageFormat::from_image_path(&paths.image).unwrap(), format);
-            format.validate_path(&paths.image).unwrap();
-        }
+        let paths = layout.session_image(&raven).unwrap();
+        assert_eq!(
+            paths.image,
+            Path::new("/private/cowshed/store/acme/widget/sessions/raven.asif")
+        );
+        assert_eq!(
+            paths.sidecar,
+            Path::new("/private/cowshed/store/acme/widget/sessions/raven.asif.grants.json")
+        );
+        assert_eq!(
+            paths.lock,
+            Path::new("/private/cowshed/store/acme/widget/sessions/raven.asif.lock")
+        );
+        assert_eq!(
+            paths.ca_private_key,
+            Path::new("/private/cowshed/store/acme/widget/sessions/raven.asif.ca.key")
+        );
+        crate::metadata::validate_image_path(&paths.image).unwrap();
     }
 
     #[test]
@@ -660,18 +615,15 @@ mod tests {
         let raven = WorkspaceName::session("raven").unwrap();
         let label = CheckpointLabel::new("ci-fail.2026-07-11").unwrap();
         assert_eq!(
-            layout.main_image(ImageFormat::Asif).unwrap().image,
+            layout.main_image().unwrap().image,
             Path::new("/private/cowshed/store/acme/widget/main.asif")
         );
         assert_eq!(
-            layout.staged_main_image(ImageFormat::Sparse).unwrap().image,
-            Path::new("/private/cowshed/store/acme/widget/.staging/main.sparseimage")
+            layout.staged_main_image().unwrap().image,
+            Path::new("/private/cowshed/store/acme/widget/.staging/main.asif")
         );
         assert_eq!(
-            layout
-                .checkpoint_image(&raven, &label, ImageFormat::Asif)
-                .unwrap()
-                .image,
+            layout.checkpoint_image(&raven, &label).unwrap().image,
             Path::new(
                 "/private/cowshed/store/acme/widget/checkpoints/raven/ci-fail.2026-07-11.asif"
             )
@@ -899,10 +851,12 @@ mod tests {
     }
 
     #[test]
-    fn enumeration_returns_only_published_images_and_rejects_duplicates() {
+    fn enumeration_returns_only_published_asif_images() {
         let entries = [
             "/store/sessions/raven.asif",
             "/store/sessions/owl.sparseimage",
+            "/store/sessions/owl.sparseimage.grants.json",
+            "/store/sessions/finch.asif",
             "/store/sessions/raven.asif.grants.json",
             "/store/sessions/raven.asif.lock",
             "/store/sessions/main.asif",
@@ -912,22 +866,18 @@ mod tests {
             "/store/sessions/upper.Asif",
         ]
         .map(PathBuf::from);
-        let images = discover_session_images(entries).unwrap();
+        let images = discover_session_images(entries);
         assert_eq!(
             images
                 .iter()
-                .map(|image| (image.workspace.as_str(), image.format))
+                .map(|image| (image.workspace.as_str(), image.path()))
                 .collect::<Vec<_>>(),
-            vec![("owl", ImageFormat::Sparse), ("raven", ImageFormat::Asif)]
+            [
+                ("finch", Path::new("/store/sessions/finch.asif")),
+                ("raven", Path::new("/store/sessions/raven.asif")),
+            ],
+            "sorted by workspace; a .sparseimage is not a workspace image"
         );
-
-        assert!(matches!(
-            discover_session_images([
-                PathBuf::from("raven.asif"),
-                PathBuf::from("raven.sparseimage")
-            ]),
-            Err(StorageLayoutError::DuplicateWorkspaceFormats { .. })
-        ));
     }
 
     #[cfg(unix)]
@@ -987,9 +937,9 @@ mod tests {
             let layout = StorageLayout::new("/store", &repo_id).unwrap();
             let workspace = WorkspaceName::new(workspace).unwrap();
             let image = if workspace.is_main() {
-                layout.main_image(ImageFormat::Asif).unwrap()
+                layout.main_image().unwrap()
             } else {
-                layout.session_image(&workspace, ImageFormat::Asif).unwrap()
+                layout.session_image(&workspace).unwrap()
             };
             prop_assert!(layout.project().contains(&image.image));
             prop_assert!(!image.image.components().any(|part| matches!(part, Component::ParentDir)));
@@ -1002,7 +952,7 @@ mod tests {
                 PathBuf::from(format!(".{stem}.sparseimage")),
                 PathBuf::from(format!("{stem}.asif.tmp")),
             ];
-            prop_assert!(discover_session_images(names).unwrap().is_empty());
+            prop_assert!(discover_session_images(names).is_empty());
         }
 
         #[test]

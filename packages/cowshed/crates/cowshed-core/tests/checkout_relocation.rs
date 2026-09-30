@@ -21,7 +21,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use cowshed_core::checkout::CheckoutRecord;
 use cowshed_core::git::{GitRepository, MainRemote, MergeDriverState};
 use cowshed_core::metadata::{
-    DetachedWorkspaceMetadata, ImageFormat, MARKER_VERSION, Platform, PortBlock, PublicationState,
+    DetachedWorkspaceMetadata, MARKER_VERSION, Platform, PortBlock, PublicationState,
     SIDECAR_VERSION, WorkspaceIncarnation, WorkspaceInfoSnapshot, WorkspaceMarker, WorkspaceName,
     WorkspaceRole, write_json,
 };
@@ -57,7 +57,7 @@ impl Relocated {
         let live_root = root.join("dev/projects/example-app");
         let session = root.join("mnt/example-org/example-app/relocated-session");
         let store = root.join("store/example-org/example-app");
-        let image = store.join("sessions/relocated-session.sparseimage");
+        let image = store.join("sessions/relocated-session.asif");
         for path in [&live_root, &session] {
             fs::create_dir_all(path).expect("fixture tree");
         }
@@ -116,7 +116,6 @@ impl Relocated {
             workspace: workspace(),
             workspace_incarnation: incarnation(),
             role: WorkspaceRole::Workspace,
-            image_format: ImageFormat::Sparse,
             base_commit: "0123456789abcdef0123456789abcdef01234567".to_owned(),
             created_at: "2026-08-01T00:00:00Z".to_owned(),
             forked_from: None,
@@ -173,7 +172,6 @@ impl Relocated {
             repo_id: repo(),
             workspace: workspace(),
             workspace_incarnation: incarnation(),
-            image_format: ImageFormat::Sparse,
             platform: Platform::Macos,
             publication_state: PublicationState::Active,
             updated_at: "2026-08-28T00:00:00Z".to_owned(),

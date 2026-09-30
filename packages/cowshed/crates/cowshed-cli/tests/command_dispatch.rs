@@ -10,7 +10,7 @@ use cowshed_cli::runtime::{
     dispatch_and_shutdown,
 };
 use cowshed_core::api::*;
-use cowshed_core::metadata::{ImageFormat, WorkspaceIncarnation, WorkspaceName, WorkspaceRole};
+use cowshed_core::metadata::{WorkspaceIncarnation, WorkspaceName, WorkspaceRole};
 use cowshed_core::repository::RepoId;
 use cowshed_core::{CowshedError, ErrorCode, Result};
 use std::collections::HashSet;
@@ -420,7 +420,6 @@ fn workspace_for(repo_id: &str, name: &str, state: WorkspaceState) -> WorkspaceI
         } else {
             WorkspaceRole::Workspace
         },
-        image_format: ImageFormat::Asif,
         mount: PathBuf::from(format!("/mnt/{name}")),
         state,
         branch: Some(if name == "main" {
@@ -668,7 +667,7 @@ async fn all_nine_parser_commands_dispatch_and_obey_machine_output_contracts() {
     assert_eq!(stdout, b"/mnt/main\n");
     assert_eq!(
         stderr,
-        b"cowshed: created main.asif for acme/widget (capacity 100g, asif)\nnext: cowshed new <name>\n"
+        b"cowshed: created main.asif for acme/widget (capacity 100g)\nnext: cowshed new <name>\n"
     );
 
     let (_, stdout, stderr) = run(&mut service, ["new", "raven", "--browse"]).await;
@@ -838,7 +837,7 @@ async fn adopt_delegates_explicit_identity_and_quarantine_with_exact_output() {
     );
     assert_eq!(
         stderr,
-        b"cowshed: created main.asif for acme/widget (capacity 100g, asif)\nnext: cowshed new <name>\n"
+        b"cowshed: created main.asif for acme/widget (capacity 100g)\nnext: cowshed new <name>\n"
     );
     assert_eq!(
         service.adopt_options,
@@ -847,7 +846,6 @@ async fn adopt_delegates_explicit_identity_and_quarantine_with_exact_output() {
             repo_id: Some(RepoId::parse("local/widget").unwrap()),
             capacity: Some("100g".into()),
             quarantine: true,
-            image_format: None,
         })
     );
 

@@ -2137,7 +2137,6 @@ mod tests {
                 )
                 .unwrap(),
                 role: crate::metadata::WorkspaceRole::Workspace,
-                image_format: crate::metadata::ImageFormat::Asif,
                 mount: PathBuf::from("/mnt/raven"),
                 state: super::super::dto::WorkspaceState::Detached,
                 branch: None,

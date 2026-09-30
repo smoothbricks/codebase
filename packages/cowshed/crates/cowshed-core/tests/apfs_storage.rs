@@ -4,13 +4,10 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use cowshed_core::apfs::{
-    ApfsCaseSensitivity, CreateImageRequest, CreatedImage, DetachIntent, ImageFormatSelection,
-    MountAccess,
-};
+use cowshed_core::apfs::{CreateImageRequest, DetachIntent, MountAccess};
 use cowshed_core::metadata::{
-    GrantSet, ImageCapacity, ImageFormat, MACOS_PORT_MIN, NEW_PORT_BLOCK_SIZE, PortBlock,
-    WorkspaceIncarnation, WorkspaceName, WorkspaceRole,
+    GrantSet, IMAGE_EXTENSION, ImageCapacity, MACOS_PORT_MIN, NEW_PORT_BLOCK_SIZE, PortBlock,
+    WorkspaceIncarnation, WorkspaceName, WorkspaceRole, is_image_path,
 };
 use cowshed_core::repository::RepoId;
 use cowshed_core::storage::CheckpointLabel;
@@ -29,16 +26,13 @@ use cowshed_core::storage::lifecycle::{
 use proptest::prelude::*;
 
 #[derive(Clone, Debug)]
-struct FakeAttachment {
-    format: ImageFormat,
-}
+struct FakeAttachment;
 
 #[derive(Default)]
 struct FakeState {
     events: Vec<String>,
     published: BTreeMap<(RepoId, WorkspaceName), StorageFact>,
     mounted: BTreeMap<(RepoId, WorkspaceName), KernelMountFact>,
-    formats: BTreeMap<(RepoId, WorkspaceName), ImageFormat>,
     staged: BTreeMap<PathBuf, StorageFact>,
     pending: BTreeMap<PathBuf, StorageFact>,
     checkpoints: Vec<CheckpointFact>,
@@ -110,7 +104,6 @@ impl FakeHost {
     fn seed(&self, workspace: &LifecycleWorkspace) {
         let key = (workspace.repo().clone(), workspace.name().clone());
         let mut state = self.state.lock().expect("fake state");
-        state.formats.insert(key.clone(), workspace.format());
         state.published.insert(
             key,
             StorageFact {
@@ -119,10 +112,9 @@ impl FakeHost {
             },
         );
     }
-    fn resume_adopt_from(&self, image: impl Into<PathBuf>, format: ImageFormat) {
+    fn resume_adopt_from(&self, image: impl Into<PathBuf>) {
         self.state.lock().expect("fake state").resumable_adopt = Some(ResumableStage {
             image: image.into(),
-            format,
         });
     }
 
@@ -243,42 +235,9 @@ impl ApfsExecutionHost for FakeHost {
             .collect())
     }
 
-    fn resolve_format(
-        &self,
-        repo: &RepoId,
-        workspace: &WorkspaceName,
-    ) -> Result<ImageFormat, ApfsStorageError> {
-        self.record("resolve-format");
-        self.state
-            .lock()
-            .expect("fake state")
-            .formats
-            .get(&(repo.clone(), workspace.clone()))
-            .copied()
-            .ok_or_else(|| ApfsStorageError::Host("missing fake format".to_owned()))
-    }
-
-    fn create_staged(
-        &self,
-        request: &CreateImageRequest,
-        requested: ImageFormat,
-    ) -> Result<CreatedImage, ApfsStorageError> {
-        let valid_selection = match requested {
-            ImageFormat::Asif => request.image_format == ImageFormatSelection::Auto,
-            ImageFormat::Sparse => {
-                request.image_format == ImageFormatSelection::Exact(ImageFormat::Sparse)
-            }
-        };
-        if !valid_selection {
-            return Err(ApfsStorageError::Host(
-                "format selection disagreed with requested lifecycle format".to_owned(),
-            ));
-        }
-        self.record(format!("create:{requested:?}:{}", request.capacity));
-        Ok(CreatedImage {
-            path: request.staged_stem.with_extension(requested.extension()),
-            format: requested,
-        })
+    fn create_staged(&self, request: &CreateImageRequest) -> Result<PathBuf, ApfsStorageError> {
+        self.record(format!("create:{}", request.capacity));
+        Ok(request.staged_stem.with_extension(IMAGE_EXTENSION))
     }
 
     fn clone_image(
@@ -286,14 +245,13 @@ impl ApfsExecutionHost for FakeHost {
         source: &Path,
         _: Option<&Path>,
         destination: &Path,
-        format: ImageFormat,
     ) -> Result<(), ApfsStorageError> {
-        if source.extension() != destination.extension()
-            || destination.extension().and_then(|value| value.to_str()) != Some(format.extension())
-        {
-            return Err(ApfsStorageError::Host("clone format changed".to_owned()));
+        if !is_image_path(source) || !is_image_path(destination) {
+            return Err(ApfsStorageError::Host(
+                "clone between paths that are not images".to_owned(),
+            ));
         }
-        self.record(format!("clone:{format:?}"));
+        self.record("clone");
         Ok(())
     }
     fn resumable_staged_adopt(
@@ -316,7 +274,6 @@ impl ApfsExecutionHost for FakeHost {
         _: &LifecycleWorkspace,
         _: &WorkspaceName,
         _: Revision,
-        _: ImageFormat,
         _: &OperationIdentity,
     ) -> Result<Option<ResumableClone>, ApfsStorageError> {
         Ok(self
@@ -327,18 +284,14 @@ impl ApfsExecutionHost for FakeHost {
             .clone())
     }
 
-    fn attach_verified(
-        &self,
-        image: &Path,
-        format: ImageFormat,
-    ) -> Result<Self::Attachment, ApfsStorageError> {
-        if image.extension().and_then(|value| value.to_str()) != Some(format.extension()) {
+    fn attach_verified(&self, image: &Path) -> Result<Self::Attachment, ApfsStorageError> {
+        if !is_image_path(image) {
             return Err(ApfsStorageError::Host(
-                "format/extension mismatch before attach".to_owned(),
+                "attach of a path that is not an image".to_owned(),
             ));
         }
-        self.record(format!("attach-no-mount+fsck:{format:?}"));
-        Ok(FakeAttachment { format })
+        self.record("attach-no-mount+fsck");
+        Ok(FakeAttachment)
     }
 
     fn copy_tree(&self, _: &Path, _: &Path) -> Result<(), ApfsStorageError> {
@@ -347,7 +300,7 @@ impl ApfsExecutionHost for FakeHost {
     }
     fn mount(
         &self,
-        attachment: &Self::Attachment,
+        _: &Self::Attachment,
         mount_point: &Path,
         _: MountAccess,
         _: bool,
@@ -362,12 +315,7 @@ impl ApfsExecutionHost for FakeHost {
             .lock()
             .expect("mounted paths")
             .insert(mount_point.to_owned());
-        self.record(format!("mount:{:?}", attachment.format));
-        Ok(())
-    }
-
-    fn chown_volume_root(&self, _: &Path) -> Result<(), ApfsStorageError> {
-        self.record("chown-root");
+        self.record("mount");
         Ok(())
     }
 
@@ -531,7 +479,6 @@ impl ApfsExecutionHost for FakeHost {
         let mut state = self.state.lock().expect("fake state");
         if let Some(fact) = state.staged.remove(staged) {
             let key = (fact.workspace.repo().clone(), fact.workspace.name().clone());
-            state.formats.insert(key.clone(), fact.workspace.format());
             state.published.insert(key, fact);
         }
         Ok(())
@@ -710,7 +657,6 @@ impl ApfsExecutionHost for FakeHost {
             .remove(canonical)
             .ok_or_else(|| ApfsStorageError::PendingPublication(canonical.to_owned()))?;
         let key = (fact.workspace.repo().clone(), fact.workspace.name().clone());
-        state.formats.insert(key.clone(), fact.workspace.format());
         state.published.insert(key, fact);
         Ok(())
     }
@@ -731,7 +677,6 @@ impl ApfsExecutionHost for FakeHost {
             ));
         }
         let key = (workspace.repo().clone(), workspace.name().clone());
-        state.formats.insert(key.clone(), workspace.format());
         state.published.insert(key, fact);
         state.resumable_clone = None;
         Ok(())
@@ -749,7 +694,7 @@ impl ApfsExecutionHost for FakeHost {
         Ok(())
     }
 
-    fn reclaim_image(&self, image: &Path, _: ImageFormat) -> Result<(), ApfsStorageError> {
+    fn reclaim_image(&self, image: &Path) -> Result<(), ApfsStorageError> {
         self.record("idempotent-reclaim");
         let mut state = self.state.lock().expect("fake state");
         state.staged.remove(image);
@@ -877,7 +822,6 @@ impl ApfsExecutionHost for FakeHost {
             }
             state.events.push("recover-pending-publication".to_owned());
             let key = (fact.workspace.repo().clone(), fact.workspace.name().clone());
-            state.formats.insert(key.clone(), fact.workspace.format());
             state.published.insert(key, fact);
         }
         Ok(())
@@ -891,11 +835,6 @@ impl ApfsExecutionHost for FakeHost {
             checkpoint_bytes: 3072,
             pinned_checkpoint_bytes: 2048,
         })
-    }
-
-    fn compact(&self, _: &Path, format: ImageFormat) -> Result<bool, ApfsStorageError> {
-        self.record(format!("compact:{format:?}"));
-        Ok(format == ImageFormat::Sparse)
     }
 
     fn preview_gc(
@@ -980,10 +919,9 @@ fn identity() -> OperationIdentity {
     }
 }
 
-fn adopt_request(format: ImageFormat) -> AdoptRequest {
+fn adopt_request() -> AdoptRequest {
     AdoptRequest {
         repo: repo(),
-        format,
         capacity: DEFAULT_IMAGE_CAPACITY,
         topology_revision: Revision::new(0),
         source_checkout: PathBuf::from("/project"),
@@ -992,7 +930,7 @@ fn adopt_request(format: ImageFormat) -> AdoptRequest {
     }
 }
 
-fn workspace(name: &str, format: ImageFormat, revision: u64) -> LifecycleWorkspace {
+fn workspace(name: &str, revision: u64) -> LifecycleWorkspace {
     let name = WorkspaceName::new(name).expect("workspace name");
     LifecycleWorkspace::new(
         repo(),
@@ -1005,19 +943,13 @@ fn workspace(name: &str, format: ImageFormat, revision: u64) -> LifecycleWorkspa
         } else {
             WorkspaceRole::Workspace
         },
-        format,
     )
     .expect("workspace ref")
 }
 
 fn substrate(host: FakeHost, lane: CountingLane) -> ApfsSubstrate<FakeHost, CountingLane> {
     ApfsSubstrate::with_lane_and_incarnations(
-        ApfsSubstrateConfig::new(
-            "/store",
-            "/store/caches",
-            "/project",
-            ApfsCaseSensitivity::Insensitive,
-        ),
+        ApfsSubstrateConfig::new("/store", "/store/caches", "/project"),
         host,
         lane,
         FixedIncarnations::default(),
@@ -1051,13 +983,11 @@ fn assert_no_orphan_stage(host: &FakeHost) {
 }
 
 #[tokio::test]
-async fn adopt_uses_exact_format_and_verify_before_mount_order() {
+async fn adopt_verifies_the_staged_image_before_it_mounts_it() {
     let host = FakeHost::default();
     let lane = CountingLane::default();
     let substrate = substrate(host.clone(), lane.clone());
-    let plan = substrate
-        .plan_adopt(adopt_request(ImageFormat::Sparse))
-        .expect("adopt plan");
+    let plan = substrate.plan_adopt(adopt_request()).expect("adopt plan");
 
     let callback_host = host.clone();
     let receipt = substrate
@@ -1091,7 +1021,6 @@ async fn adopt_uses_exact_format_and_verify_before_mount_order() {
         .await
         .expect("adopt");
 
-    assert_eq!(receipt.workspace.format(), ImageFormat::Sparse);
     assert_eq!(receipt.workspace.revision(), Revision::new(1));
     assert_eq!(receipt.workspace.incarnation(), &incarnation(0));
     assert_eq!(receipt.workspace.topology_revision(), Revision::new(1));
@@ -1105,10 +1034,10 @@ async fn adopt_uses_exact_format_and_verify_before_mount_order() {
         [
             "lock:1",
             "observe",
-            "create:Sparse:100g",
+            "create:100g",
             "atomic-metadata+parent-fsync:Fresh",
-            "attach-no-mount+fsck:Sparse",
-            "mount:Sparse",
+            "attach-no-mount+fsck",
+            "mount",
             "copy-until-quiescent",
             "mint-workspace-credentials",
             "marker-identity:apfs-storage",
@@ -1122,8 +1051,8 @@ async fn adopt_uses_exact_format_and_verify_before_mount_order() {
             "atomic-publish-image",
             // ...then the swap plants the mountpoint at the checkout path, and main mounts there.
             "atomic-adopt-checkout-vacate",
-            "attach-no-mount+fsck:Sparse",
-            "mount:Sparse",
+            "attach-no-mount+fsck",
+            "mount",
             "validate-marker",
             "retain-mounted",
         ]
@@ -1144,14 +1073,9 @@ async fn adopt_uses_exact_format_and_verify_before_mount_order() {
 #[tokio::test]
 async fn interrupted_adopt_clones_the_partial_stage_and_resumes_tree_copy() {
     let host = FakeHost::default();
-    host.resume_adopt_from(
-        "/store/acme/widget/.staging/main-partial.sparseimage",
-        ImageFormat::Sparse,
-    );
+    host.resume_adopt_from("/store/acme/widget/.staging/main-partial.asif");
     let substrate = substrate(host.clone(), CountingLane::default());
-    let plan = substrate
-        .plan_adopt(adopt_request(ImageFormat::Sparse))
-        .expect("adopt plan");
+    let plan = substrate.plan_adopt(adopt_request()).expect("adopt plan");
 
     substrate
         .execute_adopt_staged(plan, |_| async { Ok::<(), &'static str>(()) })
@@ -1162,7 +1086,7 @@ async fn interrupted_adopt_clones_the_partial_stage_and_resumes_tree_copy() {
     assert!(!events.iter().any(|event| event.starts_with("create:")));
     let clone = events
         .iter()
-        .position(|event| event == "clone:Sparse")
+        .position(|event| event == "clone")
         .expect("partial stage clone");
     let copy = events
         .iter()
@@ -1181,9 +1105,7 @@ async fn direct_mount_adopt_swaps_the_checkout_before_attaching_it() {
     let host = FakeHost::default();
     let lane = CountingLane::default();
     let substrate = substrate(host.clone(), lane.clone());
-    let plan = substrate
-        .plan_adopt(adopt_request(ImageFormat::Sparse))
-        .expect("adopt plan");
+    let plan = substrate.plan_adopt(adopt_request()).expect("adopt plan");
 
     substrate
         .execute_adopt_staged(plan, |_stage| async { Ok::<(), &'static str>(()) })
@@ -1206,8 +1128,8 @@ async fn direct_mount_adopt_swaps_the_checkout_before_attaching_it() {
             // The swap plants the mountpoint and the self-healing stub at the checkout path...
             "atomic-adopt-checkout-vacate",
             // ...and only then can anything be attached there.
-            "attach-no-mount+fsck:Sparse",
-            "mount:Sparse",
+            "attach-no-mount+fsck",
+            "mount",
             "validate-marker",
             "retain-mounted",
         ]
@@ -1219,9 +1141,7 @@ async fn initializer_failure_detaches_reclaims_and_never_publishes() {
     let host = FakeHost::default();
     let lane = CountingLane::default();
     let substrate = substrate(host.clone(), lane.clone());
-    let plan = substrate
-        .plan_adopt(adopt_request(ImageFormat::Sparse))
-        .expect("adopt plan");
+    let plan = substrate.plan_adopt(adopt_request()).expect("adopt plan");
     let callback_host = host.clone();
 
     let error = substrate
@@ -1262,9 +1182,7 @@ async fn credential_mint_failure_reclaims_adopt_stage_before_publication() {
     let host = FakeHost::default();
     host.fail_next_credentials();
     let substrate = substrate(host.clone(), CountingLane::default());
-    let plan = substrate
-        .plan_adopt(adopt_request(ImageFormat::Sparse))
-        .expect("adopt plan");
+    let plan = substrate.plan_adopt(adopt_request()).expect("adopt plan");
 
     substrate
         .execute_adopt_staged(plan, |_| async { Ok::<(), &'static str>(()) })
@@ -1291,9 +1209,7 @@ async fn initializer_and_cleanup_errors_are_both_preserved() {
     let host = FakeHost::default();
     host.fail_next_reclaim();
     let substrate = substrate(host.clone(), CountingLane::default());
-    let plan = substrate
-        .plan_adopt(adopt_request(ImageFormat::Sparse))
-        .expect("adopt plan");
+    let plan = substrate.plan_adopt(adopt_request()).expect("adopt plan");
 
     let error = substrate
         .execute_adopt_staged(plan, |_| async { Err("tool wiring rejected") })
@@ -1323,17 +1239,12 @@ async fn adopt_rejects_each_source_identity_mismatch_before_mutation() {
         let host = FakeHost::default();
         let lane = CountingLane::default();
         let substrate = ApfsSubstrate::with_lane_and_incarnations(
-            ApfsSubstrateConfig::new(
-                "/store",
-                "/store/caches",
-                checkout_path,
-                ApfsCaseSensitivity::Insensitive,
-            ),
+            ApfsSubstrateConfig::new("/store", "/store/caches", checkout_path),
             host.clone(),
             lane.clone(),
             FixedIncarnations::default(),
         );
-        let mut request = adopt_request(ImageFormat::Sparse);
+        let mut request = adopt_request();
         request.identity.project_root = PathBuf::from(project_root);
         let plan = substrate.plan_adopt(request).expect("adopt plan");
 
@@ -1361,9 +1272,7 @@ async fn adopt_rejects_each_source_identity_mismatch_before_mutation() {
 async fn ensure_mounted_is_idempotent_for_an_already_mounted_workspace() {
     let host = FakeHost::default();
     let substrate = substrate(host.clone(), CountingLane::default());
-    let plan = substrate
-        .plan_adopt(adopt_request(ImageFormat::Sparse))
-        .expect("adopt plan");
+    let plan = substrate.plan_adopt(adopt_request()).expect("adopt plan");
     let workspace = substrate
         .execute_adopt_staged(plan, |_| async { Ok::<(), &'static str>(()) })
         .await
@@ -1390,9 +1299,7 @@ async fn marker_mismatch_detaches_and_reclaims_staging_before_publication() {
     let host = FakeHost::default();
     host.fail_next_marker();
     let substrate = substrate(host.clone(), CountingLane::default());
-    let plan = substrate
-        .plan_adopt(adopt_request(ImageFormat::Asif))
-        .expect("adopt plan");
+    let plan = substrate.plan_adopt(adopt_request()).expect("adopt plan");
 
     let error = substrate
         .execute_adopt_staged(plan, |_| async { Ok::<(), &'static str>(()) })
@@ -1412,7 +1319,7 @@ async fn marker_mismatch_detaches_and_reclaims_staging_before_publication() {
 #[tokio::test]
 async fn restore_staging_failure_leaves_the_old_workspace_untouched() {
     let host = FakeHost::default();
-    let current = workspace("raven", ImageFormat::Sparse, 7);
+    let current = workspace("raven", 7);
     host.seed(&current);
     let substrate = substrate(host.clone(), CountingLane::default());
     let checkpoint = cowshed_core::storage::lifecycle::CheckpointRef::new(
@@ -1445,7 +1352,7 @@ async fn restore_staging_failure_leaves_the_old_workspace_untouched() {
     assert!(!events.contains(&"atomic-restore-swap+undo".to_owned()));
     assert!(events.contains(&"idempotent-reclaim".to_owned()));
     assert!(!events.contains(&"detach-mounted:Release".to_owned()));
-    assert!(!events.contains(&"attach-no-mount+fsck:Sparse".to_owned()));
+    assert!(!events.contains(&"attach-no-mount+fsck".to_owned()));
     assert_eq!(
         host.list(&repo()).expect("active workspace"),
         vec![StorageFact {
@@ -1458,7 +1365,7 @@ async fn restore_staging_failure_leaves_the_old_workspace_untouched() {
 #[tokio::test]
 async fn restore_post_swap_marker_failure_rolls_back_and_remounts_old_image() {
     let host = FakeHost::default();
-    let current = workspace("raven", ImageFormat::Sparse, 7);
+    let current = workspace("raven", 7);
     host.seed(&current);
     let substrate = substrate(host.clone(), CountingLane::default());
     let checkpoint = cowshed_core::storage::lifecycle::CheckpointRef::new(
@@ -1500,7 +1407,7 @@ async fn restore_post_swap_marker_failure_rolls_back_and_remounts_old_image() {
     assert!(
         events[rollback + 1..]
             .iter()
-            .any(|event| event == "attach-no-mount+fsck:Sparse")
+            .any(|event| event == "attach-no-mount+fsck")
     );
     assert_eq!(events.last().map(String::as_str), Some("retain-mounted"));
 }
@@ -1508,7 +1415,7 @@ async fn restore_post_swap_marker_failure_rolls_back_and_remounts_old_image() {
 #[tokio::test]
 async fn restore_metadata_publication_failure_rolls_back_after_verified_mount() {
     let host = FakeHost::default();
-    let current = workspace("raven", ImageFormat::Sparse, 7);
+    let current = workspace("raven", 7);
     host.seed(&current);
     let substrate = substrate(host.clone(), CountingLane::default());
     let checkpoint = cowshed_core::storage::lifecycle::CheckpointRef::new(
@@ -1552,7 +1459,7 @@ async fn restore_metadata_publication_failure_rolls_back_after_verified_mount() 
 #[tokio::test]
 async fn lifecycle_receipts_preserve_exact_revisions_topology_and_checkpoint_pin() {
     let host = FakeHost::default();
-    let source = workspace("main", ImageFormat::Sparse, 5);
+    let source = workspace("main", 5);
     host.seed(&source);
     let substrate = substrate(host.clone(), CountingLane::default());
 
@@ -1721,7 +1628,7 @@ async fn lifecycle_receipts_preserve_exact_revisions_topology_and_checkpoint_pin
 #[tokio::test]
 async fn repeated_restore_preserves_checkpoint_replaced_and_destination_identities() {
     let host = FakeHost::default();
-    let original = workspace("main", ImageFormat::Sparse, 7);
+    let original = workspace("main", 7);
     host.seed(&original);
     let substrate = substrate(host.clone(), CountingLane::default());
     let label = CheckpointLabel::new("retained-origin").expect("checkpoint label");
@@ -1798,7 +1705,7 @@ async fn repeated_restore_preserves_checkpoint_replaced_and_destination_identiti
 #[tokio::test]
 async fn staged_retire_fences_after_durable_undiscovery_and_preserves_trash_on_failure() {
     let host = FakeHost::default();
-    let current = workspace("raven", ImageFormat::Asif, 4);
+    let current = workspace("raven", 4);
     host.seed(&current);
     let substrate = substrate(host.clone(), CountingLane::default());
     let plan = substrate.plan_retire(&current).expect("retire plan");
@@ -1833,7 +1740,7 @@ async fn staged_retire_fences_after_durable_undiscovery_and_preserves_trash_on_f
 #[tokio::test]
 async fn restored_main_retirement_is_a_distinct_fenced_terminal_path() {
     let host = FakeHost::default();
-    let main = workspace("main", ImageFormat::Sparse, 4);
+    let main = workspace("main", 4);
     host.seed(&main);
     let substrate = substrate(host.clone(), CountingLane::default());
     let callback_host = host.clone();
@@ -1866,7 +1773,7 @@ async fn restored_main_retirement_is_a_distinct_fenced_terminal_path() {
 #[tokio::test]
 async fn retire_reclaim_stats_and_gc_cross_only_the_blocking_lane() {
     let host = FakeHost::default();
-    let current = workspace("raven", ImageFormat::Asif, 4);
+    let current = workspace("raven", 4);
     host.seed(&current);
     let lane = CountingLane::default();
     let substrate = substrate(host.clone(), lane.clone());
@@ -1913,9 +1820,7 @@ async fn retire_reclaim_stats_and_gc_cross_only_the_blocking_lane() {
 async fn aborting_adopt_callback_detaches_and_reclaims_the_stage() {
     let host = FakeHost::default();
     let substrate = substrate(host.clone(), CountingLane::default());
-    let plan = substrate
-        .plan_adopt(adopt_request(ImageFormat::Sparse))
-        .expect("adopt plan");
+    let plan = substrate.plan_adopt(adopt_request()).expect("adopt plan");
     let entered = Arc::new(AtomicBool::new(false));
     let callback_entered = Arc::clone(&entered);
     let task = tokio::spawn(async move {
@@ -1941,7 +1846,7 @@ async fn aborting_adopt_callback_detaches_and_reclaims_the_stage() {
 async fn aborting_create_and_fork_callbacks_preserves_each_pending_clone_for_resume() {
     for fork in [false, true] {
         let host = FakeHost::default();
-        let source = workspace("main", ImageFormat::Sparse, 5);
+        let source = workspace("main", 5);
         host.seed(&source);
         let initial_substrate = substrate(host.clone(), CountingLane::default());
         let destination_name = WorkspaceName::session(if fork {
@@ -2044,7 +1949,7 @@ async fn aborting_create_and_fork_callbacks_preserves_each_pending_clone_for_res
 #[tokio::test]
 async fn checkpoint_barrier_runs_under_lock_before_snapshot_clone() {
     let host = FakeHost::default();
-    let source = workspace("main", ImageFormat::Sparse, 5);
+    let source = workspace("main", 5);
     host.seed(&source);
     let substrate = substrate(host.clone(), CountingLane::default());
     let callback_host = host.clone();
@@ -2069,7 +1974,7 @@ async fn checkpoint_barrier_runs_under_lock_before_snapshot_clone() {
                     !callback_host
                         .events()
                         .iter()
-                        .any(|event| event.starts_with("clone:")),
+                        .any(|event| event.as_str() == "clone"),
                     "snapshot clone started before the artifact barrier completed"
                 );
                 callback_host.record("artifact-barrier+manifest-fsync");
@@ -2086,7 +1991,7 @@ async fn checkpoint_barrier_runs_under_lock_before_snapshot_clone() {
         .expect("barrier event");
     let clone = events
         .iter()
-        .position(|event| event == "clone:Sparse")
+        .position(|event| event == "clone")
         .expect("snapshot clone");
     let publication = events
         .iter()
@@ -2099,7 +2004,7 @@ async fn checkpoint_barrier_runs_under_lock_before_snapshot_clone() {
 #[tokio::test]
 async fn aborting_checkpoint_barrier_creates_no_snapshot_or_fact() {
     let host = FakeHost::default();
-    let source = workspace("main", ImageFormat::Sparse, 5);
+    let source = workspace("main", 5);
     host.seed(&source);
     let substrate = substrate(host.clone(), CountingLane::default());
     let plan = substrate
@@ -2123,12 +2028,7 @@ async fn aborting_checkpoint_barrier_creates_no_snapshot_or_fact() {
     abort_at_callback(task, entered).await;
 
     assert_no_orphan_stage(&host);
-    assert!(
-        !host
-            .events()
-            .iter()
-            .any(|event| event.starts_with("clone:"))
-    );
+    assert!(!host.events().iter().any(|event| event.as_str() == "clone"));
     assert!(host.checkpoints(&repo()).expect("checkpoints").is_empty());
 }
 
@@ -2136,7 +2036,7 @@ async fn aborting_checkpoint_barrier_creates_no_snapshot_or_fact() {
 async fn aborting_restore_prepare_callback_cleans_replace_and_verify_mounts() {
     for mode in [RestoreMode::Replace, RestoreMode::VerifyOnly] {
         let host = FakeHost::default();
-        let current = workspace("raven", ImageFormat::Sparse, 7);
+        let current = workspace("raven", 7);
         host.seed(&current);
         let substrate = substrate(host.clone(), CountingLane::default());
         let checkpoint = cowshed_core::storage::lifecycle::CheckpointRef::new(
@@ -2189,7 +2089,7 @@ async fn aborting_restore_prepare_callback_cleans_replace_and_verify_mounts() {
 #[tokio::test]
 async fn aborting_restore_fence_leaves_recoverable_pending_publication() {
     let host = FakeHost::default();
-    let current = workspace("raven", ImageFormat::Sparse, 7);
+    let current = workspace("raven", 7);
     host.seed(&current);
     let substrate = substrate(host.clone(), CountingLane::default());
     let checkpoint = cowshed_core::storage::lifecycle::CheckpointRef::new(
@@ -2267,7 +2167,7 @@ async fn aborting_restore_fence_leaves_recoverable_pending_publication() {
 #[tokio::test]
 async fn adoption_rollback_detaches_before_atomic_restore_and_never_copies() {
     let host = FakeHost::default();
-    let main = workspace("main", ImageFormat::Asif, 1);
+    let main = workspace("main", 1);
     host.seed(&main);
     let substrate = substrate(host.clone(), CountingLane::default());
 
@@ -2296,7 +2196,7 @@ async fn adoption_rollback_detaches_before_atomic_restore_and_never_copies() {
             .any(|paths| paths == [Path::new("/project"), Path::new("/project.pre-cowshed")])
     );
 
-    let session = workspace("raven", ImageFormat::Asif, 2);
+    let session = workspace("raven", 2);
     let before = host.events();
     let error = substrate
         .restore_adopted_checkout(&session, Path::new("/project.pre-cowshed"))
@@ -2308,18 +2208,17 @@ async fn adoption_rollback_detaches_before_atomic_restore_and_never_copies() {
 
 proptest! {
     #[test]
-    fn clone_checkpoint_and_fork_preserve_format_and_extension(
-        sparse in any::<bool>(),
+    fn clone_checkpoint_and_fork_each_clone_one_image(
         operations in prop::collection::vec(0_u8..=2, 1..20),
     ) {
-        let format = if sparse { ImageFormat::Sparse } else { ImageFormat::Asif };
+        let count = operations.len();
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .expect("runtime");
         runtime.block_on(async {
             let host = FakeHost::default();
-            let source = workspace("main", format, 1);
+            let source = workspace("main", 1);
             host.seed(&source);
             let substrate = substrate(host.clone(), CountingLane::default());
             for (index, operation) in operations.into_iter().enumerate() {
@@ -2336,13 +2235,12 @@ proptest! {
                                 identity: identity(),
                             },
                         ).expect("create plan");
-                        let receipt = substrate
+                        substrate
                             .execute_create_staged(plan, |_| async {
                                 Ok::<(), &'static str>(())
                             })
                             .await
                             .expect("create");
-                        prop_assert_eq!(receipt.workspace.format(), format);
                     }
                     1 => {
                         let destination = WorkspaceName::session(format!("fork-{index}"))
@@ -2356,13 +2254,12 @@ proptest! {
                                 identity: identity(),
                             },
                         ).expect("fork plan");
-                        let receipt = substrate
+                        substrate
                             .execute_fork_staged(plan, |_| async {
                                 Ok::<(), &'static str>(())
                             })
                             .await
                             .expect("fork");
-                        prop_assert_eq!(receipt.workspace.format(), format);
                     }
                     _ => {
                         let plan = substrate.plan_checkpoint(
@@ -2371,18 +2268,19 @@ proptest! {
                                 .expect("label"),
                             Pin::Automatic,
                         ).expect("checkpoint plan");
-                        let checkpoint = substrate
+                        substrate
                             .execute_checkpoint_staged(plan, |_| async {
                                 Ok::<(), &'static str>(())
                             })
                             .await
                             .expect("checkpoint");
-                        prop_assert_eq!(checkpoint.workspace().format(), format);
                     }
                 }
             }
-            let expected = format!("clone:{format:?}");
-            prop_assert!(host.events().iter().filter(|event| event.starts_with("clone:")).all(|event| event == &expected));
+            // The fake refuses a clone between paths that are not `<name>.asif`, so each operation
+            // above succeeding is the proof that it cloned an image to an image.
+            let clones = host.events().iter().filter(|event| event.as_str() == "clone").count();
+            prop_assert_eq!(clones, count);
             Ok(())
         })?;
     }
@@ -2393,7 +2291,7 @@ proptest! {
 #[tokio::test]
 async fn create_uses_one_canonical_attach_and_mount_without_detach_churn() {
     let host = FakeHost::default();
-    let source = workspace("main", ImageFormat::Sparse, 1);
+    let source = workspace("main", 1);
     host.seed(&source);
     let substrate = substrate(host.clone(), CountingLane::default());
     let plan = substrate
@@ -2424,7 +2322,7 @@ async fn create_uses_one_canonical_attach_and_mount_without_detach_churn() {
     assert_eq!(
         events
             .iter()
-            .filter(|event| event.as_str() == "attach-no-mount+fsck:Sparse")
+            .filter(|event| event.as_str() == "attach-no-mount+fsck")
             .count(),
         1,
         "one canonical attachment, got {events:?}"
@@ -2432,7 +2330,7 @@ async fn create_uses_one_canonical_attach_and_mount_without_detach_churn() {
     assert_eq!(
         events
             .iter()
-            .filter(|event| event.starts_with("mount:"))
+            .filter(|event| event.as_str() == "mount")
             .count(),
         1,
         "one canonical mount, got {events:?}"
@@ -2466,7 +2364,6 @@ async fn pending_canonical_clone_resumes_without_reclone_and_activates_after_ini
         Revision::new(5),
         Revision::new(10),
         WorkspaceRole::Main,
-        ImageFormat::Sparse,
     )
     .expect("source");
     host.seed(&source);
@@ -2478,14 +2375,13 @@ async fn pending_canonical_clone_resumes_without_reclone_and_activates_after_ini
         Revision::new(6),
         Revision::new(11),
         WorkspaceRole::Workspace,
-        ImageFormat::Sparse,
     )
     .expect("resumed workspace");
     let original_identity = identity();
     host.resume_clone_from(
         resumed.clone(),
         original_identity.clone(),
-        "/store/acme--widget/sessions/hedge.sparseimage",
+        "/store/acme--widget/sessions/hedge.asif",
     );
     let substrate = substrate(host.clone(), CountingLane::default());
     let plan = substrate
@@ -2516,7 +2412,7 @@ async fn pending_canonical_clone_resumes_without_reclone_and_activates_after_ini
     assert_eq!(receipt.workspace.topology_revision(), Revision::new(11));
     let events = host.events();
     assert!(
-        !events.iter().any(|event| event.starts_with("clone:")),
+        !events.iter().any(|event| event.as_str() == "clone"),
         "resume must not clone over the pending payload: {events:?}"
     );
     assert!(
@@ -2544,7 +2440,6 @@ async fn pending_clone_retirement_inspects_before_trash_without_activation() {
         Revision::new(5),
         Revision::new(10),
         WorkspaceRole::Main,
-        ImageFormat::Sparse,
     )
     .expect("source");
     host.seed(&source);
@@ -2556,14 +2451,13 @@ async fn pending_clone_retirement_inspects_before_trash_without_activation() {
         Revision::new(6),
         Revision::new(11),
         WorkspaceRole::Workspace,
-        ImageFormat::Sparse,
     )
     .expect("pending");
     let original = identity();
     host.resume_clone_from(
         pending.clone(),
         original.clone(),
-        "/store/acme--widget/sessions/unfinished.sparseimage",
+        "/store/acme--widget/sessions/unfinished.asif",
     );
     let substrate = substrate(host.clone(), CountingLane::default());
     let plan = substrate
@@ -2606,5 +2500,5 @@ async fn pending_clone_retirement_inspects_before_trash_without_activation() {
     let events = host.events();
     assert!(events.iter().any(|event| event == "atomic-retire-to-trash"));
     assert!(!events.iter().any(|event| event == "activate-pending-clone"));
-    assert!(!events.iter().any(|event| event.starts_with("clone:")));
+    assert!(!events.iter().any(|event| event.as_str() == "clone"));
 }

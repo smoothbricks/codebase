@@ -349,7 +349,7 @@ mod tests {
     #[test]
     fn append_and_find_round_trip() {
         let project = temp_project("round-trip");
-        let image = project.join("sessions/ws.sparseimage");
+        let image = project.join("sessions/ws.asif");
         let companion = companion_path_for(&image);
         log_deletion(
             &project,
@@ -369,7 +369,7 @@ mod tests {
     #[test]
     fn malformed_lines_do_not_hide_evidence() {
         let project = temp_project("malformed");
-        let image = project.join("sessions/ws.sparseimage");
+        let image = project.join("sessions/ws.asif");
         let companion = companion_path_for(&image);
         std::fs::write(project.join(DELETION_LOG_FILE), b"{not json}\n\n").expect("corrupt prefix");
         log_deletion(
@@ -390,7 +390,7 @@ mod tests {
     #[test]
     fn newest_tombstone_wins() {
         let project = temp_project("newest");
-        let image = project.join("sessions/ws.sparseimage");
+        let image = project.join("sessions/ws.asif");
         let companion = companion_path_for(&image);
         let older = DeletionLogEntry {
             at: "2026-01-01T00:00:00Z".to_owned(),
@@ -419,7 +419,7 @@ mod tests {
     #[test]
     fn missing_log_means_no_removal() {
         let project = temp_project("missing");
-        let image = project.join("sessions/ws.sparseimage");
+        let image = project.join("sessions/ws.asif");
         assert!(find_companion_removal(&project, &image).is_none());
         let _ = std::fs::remove_dir_all(&project);
     }
@@ -427,7 +427,7 @@ mod tests {
     #[test]
     fn append_never_fails_on_unwritable_project() {
         let project = temp_project("read-only");
-        let image = project.join("sessions/ws.sparseimage");
+        let image = project.join("sessions/ws.asif");
         // A directory where the log path cannot be created: the call must swallow the
         // error, never panic, so the op it records still succeeds.
         std::fs::create_dir_all(project.join(DELETION_LOG_FILE)).expect("block the log path");
@@ -446,34 +446,34 @@ mod tests {
     fn project_layouts_resolve() {
         let root = PathBuf::from("/store/acme/widget");
         assert_eq!(
-            project_and_workspace_for_image(&root.join("sessions/demo.sparseimage")),
+            project_and_workspace_for_image(&root.join("sessions/demo.asif")),
             Some((root.clone(), "demo".to_owned())),
         );
 
         let incarnation = "00000000000000000000000000000001";
         assert_eq!(
             project_and_workspace_for_image(
-                &root.join(format!(".staging/demo-{incarnation}.sparseimage")),
+                &root.join(format!(".staging/demo-{incarnation}.asif")),
             ),
             Some((root.clone(), "demo".to_owned())),
         );
         assert_eq!(
             project_and_workspace_for_image(
-                &root.join(format!("sessions/.trash/demo-{incarnation}.sparseimage")),
+                &root.join(format!("sessions/.trash/demo-{incarnation}.asif")),
             ),
             Some((root.clone(), "demo".to_owned())),
         );
         assert_eq!(
-            project_and_workspace_for_image(&root.join("checkpoints/demo/one.sparseimage")),
+            project_and_workspace_for_image(&root.join("checkpoints/demo/one.asif")),
             Some((root.clone(), "demo".to_owned())),
         );
         assert_eq!(
-            project_and_workspace_for_image(&root.join("main.sparseimage")),
+            project_and_workspace_for_image(&root.join("main.asif")),
             Some((root.clone(), "main".to_owned())),
         );
 
         assert_eq!(
-            project_and_workspace_for_image(Path::new("relative/path.sparseimage")),
+            project_and_workspace_for_image(Path::new("relative/path.asif")),
             None
         );
         assert_eq!(

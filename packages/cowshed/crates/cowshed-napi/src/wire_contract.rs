@@ -23,12 +23,12 @@ use cowshed_core::{
     api::{
         AbandonedWork, BinaryData, CheckpointInfo, CommandArg, DoctorReport, EgressMode,
         EgressRule, ExitStatus, Finding, FindingSeverity, GcCandidate, GcReason, GcReport, GitOid,
-        GrantSet, ImageFormat, JobId, JobInfo, JobState, LandReport, LandingCommits,
-        OutputLimitInfo, OutputStorage, OutputSummary, PortBlock, ProtectedOutput, PushReport,
-        RemoveReport, RepoRule, ResizeResult, Sha256Digest, SimVerb, SpanId, StdinInfo, StdinKind,
-        StreamInfo, TraceContext, TraceId, UtcTimestamp, WarmAdmission, WarmRange,
-        WorkspaceIncarnation, WorkspaceInfo, WorkspaceLanding, WorkspaceName, WorkspacePath,
-        WorkspaceRole, WorkspaceState,
+        GrantSet, JobId, JobInfo, JobState, LandReport, LandingCommits, OutputLimitInfo,
+        OutputStorage, OutputSummary, PortBlock, ProtectedOutput, PushReport, RemoveReport,
+        RepoRule, ResizeResult, Sha256Digest, SimVerb, SpanId, StdinInfo, StdinKind, StreamInfo,
+        TraceContext, TraceId, UtcTimestamp, WarmAdmission, WarmRange, WorkspaceIncarnation,
+        WorkspaceInfo, WorkspaceLanding, WorkspaceName, WorkspacePath, WorkspaceRole,
+        WorkspaceState,
     },
     repository::RepoId,
 };
@@ -390,7 +390,6 @@ fn workspace_infos() -> BTreeMap<&'static str, Value> {
         workspace: workspace_name("main"),
         workspace_incarnation: incarnation(),
         role: WorkspaceRole::Main,
-        image_format: ImageFormat::Asif,
         mount: PathBuf::from("/Users/fixture/Dev/codebase"),
         state: WorkspaceState::Attached,
         branch: None,
@@ -404,7 +403,6 @@ fn workspace_infos() -> BTreeMap<&'static str, Value> {
     let measured = WorkspaceInfo {
         workspace: workspace_name("cs-seam"),
         role: WorkspaceRole::Workspace,
-        image_format: ImageFormat::Sparse,
         mount: PathBuf::from("/Users/fixture/Dev/.cowshed/codebase/cs-seam"),
         state: WorkspaceState::Detached,
         branch: Some("cowshed/cs-seam".to_owned()),
@@ -556,7 +554,6 @@ fn reports() -> BTreeMap<&'static str, BTreeMap<&'static str, Value>> {
             GcReason::OrphanStagingMount,
             GcReason::OrphanMountpoint,
             GcReason::ExpiredCheckpoint,
-            GcReason::DetachedImageCompaction,
         ]
         .into_iter()
         .enumerate()
@@ -586,11 +583,11 @@ fn reports() -> BTreeMap<&'static str, BTreeMap<&'static str, Value>> {
         healthy: false,
         findings: vec![
             Finding {
-                code: "storage.sparse-fallback".to_owned(),
+                code: "no-adopted-checkout".to_owned(),
                 severity: FindingSeverity::Info,
-                message: "the host fell back to a sparse image".to_owned(),
-                hint: "upgrade to a host that supports ASIF".to_owned(),
-                path: None,
+                message: "fixture/codebase: recorded in the store but has no adopted checkout path, so the project inventory skips it".to_owned(),
+                hint: String::new(),
+                path: Some(PathBuf::from("/private/cowshed/store/fixture/codebase")),
             },
             Finding {
                 code: "gateway.certificate-expiring".to_owned(),

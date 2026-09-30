@@ -18,11 +18,10 @@
 //! and touches nothing else.
 
 use async_trait::async_trait;
-use cowshed_core::apfs::{ApfsCaseSensitivity, SystemCommandRunner};
+use cowshed_core::apfs::SystemCommandRunner;
 use cowshed_core::api::MountResult;
 use cowshed_core::metadata::{
-    DetachedWorkspaceMetadata, ImageFormat, MetadataError, PublicationState, WorkspaceName,
-    read_json,
+    DetachedWorkspaceMetadata, MetadataError, PublicationState, WorkspaceName, read_json,
 };
 use cowshed_core::repository::{RepoId, RepositoryBinding};
 use cowshed_core::storage::StorageLayout;
@@ -44,8 +43,8 @@ pub struct ResolvedMainMount {
     /// The adopted checkout path from the sidecar record, which is where main mounts — possibly
     /// an empty stub, never consulted for git state.
     pub checkout_path: PathBuf,
-    /// Canonical main images present in the store, in scan order.
-    pub images: Vec<PathBuf>,
+    /// The canonical main image the checkout path was read from.
+    pub image: PathBuf,
     /// The project's store directory, where every record above lives.
     pub project_root: PathBuf,
 }
@@ -99,29 +98,19 @@ pub fn resolve_main_mount(store_root: &Path, repo_id: &RepoId) -> Result<Resolve
         )));
     }
 
-    // Same derivation the gateway inventory uses: at most one canonical main
-    // image, and the checkout path comes from its sidecar's Active snapshot.
-    let mut found: Option<PathBuf> = None;
-    let mut images = Vec::new();
-    for format in [ImageFormat::Asif, ImageFormat::Sparse] {
-        let image = layout
-            .main_image(format)
-            .map_err(|error| integrity(format!("invalid store layout for {repo_id}: {error}",)))?
-            .image()
-            .to_owned();
-        if !image.try_exists().map_err(|source| {
-            integrity(format!(
-                "could not inspect canonical main image {}: {source}",
-                image.display()
-            ))
-        })? {
-            continue;
-        }
-        if found.is_some() {
-            return Err(integrity(format!(
-                "project {repo_id} holds duplicate canonical main image formats",
-            )));
-        }
+    // Same derivation the gateway inventory uses: the checkout path comes from the canonical
+    // main image's Active snapshot.
+    let image = layout
+        .main_image()
+        .map_err(|error| integrity(format!("invalid store layout for {repo_id}: {error}",)))?
+        .image()
+        .to_owned();
+    let found = if image.try_exists().map_err(|source| {
+        integrity(format!(
+            "could not inspect canonical main image {}: {source}",
+            image.display()
+        ))
+    })? {
         let metadata = DetachedWorkspaceMetadata::read_for_image(&image)
             .map_err(|error| integrity(format!("invalid main metadata for {repo_id}: {error}",)))?;
         if metadata.repo_id != *repo_id || !metadata.workspace.is_main() {
@@ -129,11 +118,11 @@ pub fn resolve_main_mount(store_root: &Path, repo_id: &RepoId) -> Result<Resolve
                 "canonical main metadata identity mismatch for {repo_id}",
             )));
         }
-        if metadata.publication_state == PublicationState::Active {
-            found = Some(metadata.info_snapshot.project_root);
-        }
-        images.push(image);
-    }
+        (metadata.publication_state == PublicationState::Active)
+            .then_some(metadata.info_snapshot.project_root)
+    } else {
+        None
+    };
     let checkout_path = found.ok_or_else(|| {
         CowshedError::not_found(
             format!(
@@ -146,7 +135,7 @@ pub fn resolve_main_mount(store_root: &Path, repo_id: &RepoId) -> Result<Resolve
     Ok(ResolvedMainMount {
         repo_id: repo_id.clone(),
         checkout_path,
-        images,
+        image,
         project_root: project.project_root.clone(),
     })
 }
@@ -199,7 +188,6 @@ impl MainMountBackend for NativeMainMountBackend {
             self.storage.store(),
             self.storage.caches(),
             &resolved.checkout_path,
-            ApfsCaseSensitivity::Sensitive,
         );
         let host = MacOsApfsExecutionHost::new(SystemCommandRunner, config.clone())
             .map_err(storage_error)?;
@@ -236,13 +224,8 @@ fn storage_error(error: ApfsStorageError) -> CowshedError {
         // host defect, so neither must point at `doctor`.
         ref error @ ApfsStorageError::MissingCaCompanion { ref image, .. } => {
             let workspace = image
-                .file_name()
+                .file_stem()
                 .and_then(|name| name.to_str())
-                .and_then(|name| {
-                    ImageFormat::from_image_path(image)
-                        .ok()
-                        .and_then(|format| name.strip_suffix(format.image_extension()))
-                })
                 .unwrap_or("workspace");
             CowshedError::integrity(error.to_string(), format!("cowshed rekey {workspace}"))
         }

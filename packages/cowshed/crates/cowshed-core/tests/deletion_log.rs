@@ -7,7 +7,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use cowshed_core::apfs::{ApfsCaseSensitivity, CommandOutput, CommandRequest, CommandRunner};
+use cowshed_core::apfs::{CommandOutput, CommandRequest, CommandRunner};
 use cowshed_core::metadata::WorkspaceName;
 use cowshed_core::repository::RepoId;
 use cowshed_core::storage::apfs::native::MacOsApfsExecutionHost;
@@ -53,7 +53,6 @@ impl Fixture {
             &self.root,
             self.root.join("caches"),
             self.root.join("mount"),
-            ApfsCaseSensitivity::Insensitive,
         )
     }
 
@@ -107,7 +106,7 @@ fn orphan_gc_run_writes_tombstone_and_classifies_missing_companion() {
     let fixture = Fixture::new("orphan-tombstone");
     let project = fixture.project_root();
     let staging = project.join(".staging");
-    let image = staging.join(format!("orphan-{INCARNATION}.sparseimage"));
+    let image = staging.join(format!("orphan-{INCARNATION}.asif"));
     std::fs::create_dir_all(&staging).expect("staging dir");
     std::fs::write(&image, b"orphan payload").expect("orphan image");
     let companion = companion_path(&image);
@@ -143,7 +142,7 @@ fn orphan_gc_run_writes_tombstone_and_classifies_missing_companion() {
     }
 
     // A companion with no tombstone anywhere is an external deletion, not ours.
-    let foreign = staging.join(format!("foreign-{INCARNATION}.sparseimage"));
+    let foreign = staging.join(format!("foreign-{INCARNATION}.asif"));
     match classify_missing_companion(&project, &foreign, None, false) {
         CompanionAbsence::RemovedExternally => {}
         other => panic!("expected external deletion, got {other:?}"),
@@ -196,7 +195,7 @@ fn sweep_removes_stale_empty_session_mountpoint() {
 #[test]
 fn fence_sub_steps_distinguish_crash_window_from_external_deletion() {
     let workspace = WorkspaceName::new("demo").expect("workspace");
-    let image = PathBuf::from("/store/acme/widget/sessions/demo.sparseimage");
+    let image = PathBuf::from("/store/acme/widget/sessions/demo.asif");
     let project = PathBuf::from("/store/acme/widget");
 
     let mut journal = LifecycleIntentJournal::default();
@@ -259,7 +258,7 @@ fn unreadable_log_never_fails_the_op() {
     let staging = project.join(".staging");
     // A directory where the log file should be makes every log open fail.
     std::fs::create_dir_all(project.join(DELETION_LOG_FILE)).expect("block the log");
-    let image = staging.join(format!("chaos-{INCARNATION}.sparseimage"));
+    let image = staging.join(format!("chaos-{INCARNATION}.asif"));
     std::fs::create_dir_all(&staging).expect("staging dir");
     std::fs::write(&image, b"chaos payload").expect("chaos image");
     std::fs::create_dir_all(project.join("sessions")).expect("sessions dir");

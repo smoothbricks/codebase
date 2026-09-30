@@ -15,7 +15,7 @@ use cowshed_cli::mount_main::{
 };
 use cowshed_cli::output::Output;
 use cowshed_core::metadata::{
-    DetachedWorkspaceMetadata, GrantSet, ImageFormat, Platform, PublicationState, SIDECAR_VERSION,
+    DetachedWorkspaceMetadata, GrantSet, Platform, PublicationState, SIDECAR_VERSION,
     WorkspaceIncarnation, WorkspaceInfoSnapshot, WorkspaceName, WorkspaceRole, read_json,
     write_json,
 };
@@ -87,7 +87,7 @@ impl Fixture {
         );
         let image = StorageLayout::new(&self.store, repo)
             .expect("layout")
-            .main_image(ImageFormat::Sparse)
+            .main_image()
             .expect("main image paths")
             .image()
             .to_owned();
@@ -99,7 +99,6 @@ impl Fixture {
             workspace: WorkspaceName::new("main").expect("fixed main"),
             workspace_incarnation: WorkspaceIncarnation::new("0123456789abcdef0123456789abcdef")
                 .expect("incarnation"),
-            image_format: ImageFormat::Sparse,
             platform: Platform::Linux,
             publication_state: PublicationState::Active,
             updated_at: "2026-07-14T00:00:00Z".to_owned(),
@@ -267,8 +266,13 @@ async fn resolves_main_by_repo_id_from_empty_stub_without_git() {
 
     assert_eq!(resolved.repo_id, repo());
     assert_eq!(resolved.checkout_path, stub, "main mounts at its checkout");
-    assert!(
-        !resolved.images.is_empty(),
+    assert_eq!(
+        resolved.image,
+        StorageLayout::new(&fixture.store, &repo())
+            .expect("layout")
+            .main_image()
+            .expect("main image paths")
+            .image(),
         "resolution reports the canonical main image it read"
     );
 }

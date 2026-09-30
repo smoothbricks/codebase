@@ -310,7 +310,7 @@ fn current_metadata(
     marker: &WorkspaceMarker,
 ) -> Result<DetachedWorkspaceMetadata, Decline> {
     let image = layout
-        .canonical_image(&marker.workspace, marker.image_format)
+        .canonical_image(&marker.workspace)
         .map_err(|_| Decline::Records)?;
     let image = image.image();
     let sidecar = sidecar_path(image);
@@ -322,7 +322,6 @@ fn current_metadata(
         || metadata.repo_id != marker.repo_id
         || metadata.workspace != marker.workspace
         || metadata.workspace_incarnation != marker.workspace_incarnation
-        || metadata.image_format != marker.image_format
     {
         return Err(Decline::StaleMount);
     }
@@ -333,8 +332,8 @@ fn current_metadata(
 mod tests {
     use super::*;
     use crate::metadata::{
-        GrantSet, ImageFormat, MARKER_VERSION, NEW_PORT_BLOCK_SIZE, Platform, PortBlock,
-        SIDECAR_VERSION, WorkspaceIncarnation, WorkspaceInfoSnapshot, WorkspaceRole, write_json,
+        GrantSet, MARKER_VERSION, NEW_PORT_BLOCK_SIZE, Platform, PortBlock, SIDECAR_VERSION,
+        WorkspaceIncarnation, WorkspaceInfoSnapshot, WorkspaceRole, write_json,
     };
     use crate::storage::recovery::{
         LIFECYCLE_INTENTS_FILE, LifecycleIntent, LifecycleIntentJournal,
@@ -405,14 +404,10 @@ mod tests {
             fixture.workspace(&WorkspaceName::main(), &fixture.checkout, 1, 2);
             fixture.workspace(&raven(), &fixture.raven_mount, 2, 5);
             for index in 0..RETIRED_SESSIONS {
-                let leftover = project
-                    .sessions
-                    .join(format!("retired-{index}.sparseimage"));
+                let leftover = project.sessions.join(format!("retired-{index}.asif"));
                 std::fs::write(sidecar_path(&leftover), b"{ not a sidecar").expect("garbage");
                 std::fs::write(
-                    project
-                        .sessions
-                        .join(format!("retired-{index}.sparseimage.lock")),
+                    project.sessions.join(format!("retired-{index}.asif.lock")),
                     b"",
                 )
                 .expect("lock");
@@ -423,7 +418,7 @@ mod tests {
         fn workspace(&self, name: &WorkspaceName, mount: &Path, id: u8, revision: u64) {
             let image = self
                 .layout
-                .canonical_image(name, ImageFormat::Sparse)
+                .canonical_image(name)
                 .expect("image")
                 .image()
                 .to_path_buf();
@@ -440,7 +435,6 @@ mod tests {
                 repo_id: repo(),
                 workspace: name.clone(),
                 workspace_incarnation: incarnation(id),
-                image_format: ImageFormat::Sparse,
                 platform: Platform::Macos,
                 publication_state: PublicationState::Active,
                 updated_at: "2026-07-14T00:00:00Z".to_owned(),
@@ -470,7 +464,6 @@ mod tests {
                     workspace: name.clone(),
                     workspace_incarnation: incarnation(id),
                     role: WorkspaceRole::for_name(name),
-                    image_format: ImageFormat::Sparse,
                     base_commit: "0123456789abcdef0123456789abcdef01234567".to_owned(),
                     created_at: "2026-07-14T00:00:00Z".to_owned(),
                     forked_from: None,

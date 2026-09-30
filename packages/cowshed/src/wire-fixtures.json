@@ -7,9 +7,10 @@
     "unhealthy": {
       "findings": [
         {
-          "code": "storage.sparse-fallback",
-          "hint": "upgrade to a host that supports ASIF",
-          "message": "the host fell back to a sparse image",
+          "code": "no-adopted-checkout",
+          "hint": "",
+          "message": "fixture/codebase: recorded in the store but has no adopted checkout path, so the project inventory skips it",
+          "path": "/private/cowshed/store/fixture/codebase",
           "severity": "info"
         },
         {
@@ -67,12 +68,6 @@
           "identity": "e77b9a9ae9e30b0dbdb6f510a264ef9de781501d7b6b92ae89eb059c5ab743db",
           "path": "/Users/fixture/Dev/.cowshed/gc/5",
           "reason": "expiredCheckpoint"
-        },
-        {
-          "bytes": 7168,
-          "identity": "67586e98fad27da0b9968bc039a1ef34c939b9b8e523a8bef89d478608c5ecf6",
-          "path": "/Users/fixture/Dev/.cowshed/gc/6",
-          "reason": "detachedImageCompaction"
         }
       ],
       "dryRun": true,
@@ -1120,7 +1115,6 @@
   "WorkspaceInfo": {
     "landingIndeterminate": {
       "checkpoints": [],
-      "imageFormat": "asif",
       "landing": {
         "commits": {
           "reason": "the target branch does not exist",
@@ -1151,7 +1145,6 @@
         }
       ],
       "createdAt": "2026-01-02T03:04:05Z",
-      "imageFormat": "sparse",
       "landing": {
         "commits": {
           "behind": 5,
@@ -1174,7 +1167,6 @@
     "list": [
       {
         "checkpoints": [],
-        "imageFormat": "asif",
         "mount": "/Users/fixture/Dev/codebase",
         "repoId": "smoothbricks/codebase",
         "role": "main",
@@ -1199,7 +1191,6 @@
           }
         ],
         "createdAt": "2026-01-02T03:04:05Z",
-        "imageFormat": "sparse",
         "landing": {
           "commits": {
             "behind": 5,
@@ -1221,7 +1212,6 @@
       },
       {
         "checkpoints": [],
-        "imageFormat": "asif",
         "landing": {
           "commits": {
             "reason": "the target branch does not exist",
@@ -1239,7 +1229,6 @@
     ],
     "main": {
       "checkpoints": [],
-      "imageFormat": "asif",
       "mount": "/Users/fixture/Dev/codebase",
       "repoId": "smoothbricks/codebase",
       "role": "main",

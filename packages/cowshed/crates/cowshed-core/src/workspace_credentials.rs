@@ -565,7 +565,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::metadata::{ImageFormat, WorkspaceRole};
+    use crate::metadata::WorkspaceRole;
     use crate::storage::lifecycle::Revision;
 
     /// The tightest owned set for a workspace: exactly the identity it answers to.
@@ -581,7 +581,6 @@ mod tests {
             Revision::new(7),
             Revision::new(3),
             WorkspaceRole::Workspace,
-            ImageFormat::Sparse,
         )
         .expect("lifecycle workspace")
     }
@@ -745,7 +744,7 @@ mod tests {
         let root = test_root("contract");
         let mount = root.join("mount");
         fs::create_dir(&mount).expect("mount");
-        let key_path = root.join("staged.sparseimage.ca.key");
+        let key_path = root.join("staged.asif.ca.key");
         let workspace = workspace("00112233445566778899aabbccddeeff");
 
         mint_credentials(&workspace, &mount, &key_path).expect("mint credentials");

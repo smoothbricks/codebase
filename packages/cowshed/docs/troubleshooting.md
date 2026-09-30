@@ -25,7 +25,7 @@ run the repository's `devenv:allow` command once at that workspace path. The mou
 `.cowshed/env`; no command prints those exports on demand. Cowshed never reads or writes devenv's trust database. The
 login LaunchAgent may attach permanent workspaces proactively, but explicit `attach` remains the recovery command.
 
-**Finder ejected a volume** (or `hdiutil detach` by hand): use the same explicit `cowshed attach` recovery.
+**Finder ejected a volume** (or `diskutil eject` by hand): use the same explicit `cowshed attach` recovery.
 
 **direnv says `.envrc is blocked` in a workspace.** This is expected until that clone path is authorized. Run
 `direnv allow`; `cowshed attach` repairs mounts but deliberately does not change trust.
@@ -132,15 +132,21 @@ not override a pin. Unpin explicitly before expecting GC to remove it.
 
 ## Disk usage
 
-Images are sparse and grow with churn; deleted files inside a volume don't shrink the image file until compaction.
-`cowshed gc` compacts detached images, removes orphans, and prunes expired checkpoints:
+Images are sparse files that grow with churn; deleting files inside a volume does not shrink the image file. `cowshed gc`
+reclaims retired images, removes orphans, and prunes expired checkpoints (`--dry-run` lists each candidate first):
 
 ```
+$ cowshed gc --dry-run
+44023414784
+cowshed: would delete /private/cowshed/store/acme/widget/sessions/.trash/fox-3f2a….asif (18203238400 bytes; reason: workspace was retired)
+…
+cowshed: dry run examined 12 objects; 4 candidates, 44023414784 bytes deletable
 $ cowshed gc
-cowshed: compacted fox.asif 18.2g -> 6.1g
-cowshed: pruned 3 checkpoints of rm'd workspaces (41.0g)
-next: cowshed ls   # nothing live was touched
+44023414784
 ```
+
+A main that has taken years of writes under clones is slow to clone, not large: `cowshed doctor` reports `main-extents`
+and names `cowshed defrag main` when the next `new` would pay for it.
 
 Attribution: `du` on the images directory tells you per-workspace cost; _inside_ a mounted workspace, normal `du` works
 — it's just APFS. Remember clones share extents: ten fresh workspaces cost ~zero until they diverge, so "sum of image

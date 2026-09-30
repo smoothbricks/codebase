@@ -9,7 +9,7 @@ use crate::probe;
 use async_trait::async_trait;
 use base64::Engine as _;
 use bytes::Bytes;
-use cowshed_core::apfs::{ApfsCaseSensitivity, SystemCommandRunner};
+use cowshed_core::apfs::SystemCommandRunner;
 pub use cowshed_core::api::ProjectWorkspaces;
 use cowshed_core::api::server::{ConnectionAuthority, serve_controller_connection};
 use cowshed_core::api::{
@@ -26,7 +26,7 @@ use cowshed_core::api::{
 use cowshed_core::git::GitRepository;
 use cowshed_core::host_caches::{self, HostCacheState};
 use cowshed_core::metadata::{
-    DetachedWorkspaceMetadata, ImageCapacity, ImageFormat, SlotId, WorkspaceIncarnation,
+    DetachedWorkspaceMetadata, IMAGE_EXTENSION, ImageCapacity, SlotId, WorkspaceIncarnation,
     WorkspaceName, WorkspaceRole,
 };
 use cowshed_core::metadata::{EgressMode, EgressRule};
@@ -927,15 +927,8 @@ where
             emit_mount(output, json, &info)?;
             output
                 .guidance(&format!(
-                    "created {}.{} for {} (capacity {}, {})",
-                    info.workspace,
-                    info.image_format.extension(),
-                    info.repo_id,
-                    capacity,
-                    match info.image_format {
-                        ImageFormat::Asif => "asif",
-                        ImageFormat::Sparse => "sparse",
-                    }
+                    "created {}.{IMAGE_EXTENSION} for {} (capacity {capacity})",
+                    info.workspace, info.repo_id,
                 ))
                 .map_err(output_error)?;
             match gateway {
@@ -1499,7 +1492,6 @@ fn adopt_options(args: AdoptArgs) -> Result<AdoptOptions> {
         repo_id: args.repo_id.map(os_repo_id).transpose()?,
         capacity: args.capacity.map(os_capacity).transpose()?,
         quarantine: args.quarantine,
-        image_format: None,
     })
 }
 
@@ -2160,12 +2152,7 @@ async fn attach_project_sessions_from_store(
 ) -> Result<Vec<WorkspaceInfo>> {
     let layout = StorageLayout::new(storage.store(), &project.repo_id)
         .map_err(attach_store_storage_error)?;
-    let config = ApfsSubstrateConfig::new(
-        storage.store(),
-        storage.caches(),
-        &project.project_root,
-        ApfsCaseSensitivity::Sensitive,
-    );
+    let config = ApfsSubstrateConfig::new(storage.store(), storage.caches(), &project.project_root);
     let host = MacOsApfsExecutionHost::new(SystemCommandRunner, config.clone())
         .map_err(attach_store_storage_error)?;
     let substrate = ApfsSubstrate::new(config, host);
@@ -2197,7 +2184,7 @@ fn store_workspace_info(
     derived: &DerivedWorkspace,
 ) -> Result<WorkspaceInfo> {
     let image = layout
-        .session_image(derived.workspace.name(), derived.workspace.format())
+        .session_image(derived.workspace.name())
         .map_err(attach_store_storage_error)?;
     let metadata = DetachedWorkspaceMetadata::read_for_image(image.image())
         .map_err(attach_store_storage_error)?;
@@ -2211,7 +2198,6 @@ fn store_workspace_info(
         workspace: derived.workspace.name().clone(),
         workspace_incarnation: derived.workspace.incarnation().clone(),
         role: derived.workspace.role(),
-        image_format: derived.workspace.format(),
         mount: layout
             .workspace_mount(derived.workspace.name())
             .map_err(attach_store_storage_error)?,
@@ -2301,12 +2287,7 @@ async fn detach_project_sessions_from_store(
     storage: &ValidatedHostStorage,
     project: &AdoptedProject,
 ) -> Result<usize> {
-    let config = ApfsSubstrateConfig::new(
-        storage.store(),
-        storage.caches(),
-        &project.project_root,
-        ApfsCaseSensitivity::Sensitive,
-    );
+    let config = ApfsSubstrateConfig::new(storage.store(), storage.caches(), &project.project_root);
     let host = MacOsApfsExecutionHost::new(SystemCommandRunner, config.clone())
         .map_err(detach_store_storage_error)?;
     let substrate = ApfsSubstrate::new(config, host);
@@ -2383,13 +2364,7 @@ pub(crate) fn resolve_session_project_root(store: &Path, workspace: &str) -> Res
             };
             let images = discover_session_images(
                 entries.filter_map(|entry| entry.ok().map(|entry| entry.path())),
-            )
-            .map_err(|error| {
-                CowshedError::conflict(
-                    error.to_string(),
-                    "cowshed --project <git-root> detach <ws>",
-                )
-            })?;
+            );
             for image in images {
                 if image.workspace() != &wanted {
                     continue;
@@ -2493,7 +2468,6 @@ const fn gc_reason(reason: GcReason) -> &'static str {
         GcReason::OrphanStagingMount => "orphaned staging mountpoint",
         GcReason::OrphanMountpoint => "orphaned mountpoint",
         GcReason::ExpiredCheckpoint => "expired checkpoint",
-        GcReason::DetachedImageCompaction => "detached image compaction",
     }
 }
 
@@ -3960,8 +3934,8 @@ mod tests {
         use super::*;
         use bytes::Bytes;
         use cowshed_core::api::dto::{
-            CommandArg, ExecCommand as JobCommand, ExitStatus, GrantSet, ImageFormat,
-            RunSandboxMode, StdinSource, WorkspaceState,
+            CommandArg, ExecCommand as JobCommand, ExitStatus, GrantSet, RunSandboxMode,
+            StdinSource, WorkspaceState,
         };
         use cowshed_core::api::server::{RouterHandle, RouterResponse};
         use cowshed_core::metadata::{WorkspaceIncarnation, WorkspaceName, WorkspaceRole};
@@ -4086,7 +4060,6 @@ mod tests {
                             workspace_incarnation: WorkspaceIncarnation::new(INCARNATION)
                                 .expect("incarnation"),
                             role: WorkspaceRole::Main,
-                            image_format: ImageFormat::Asif,
                             mount: PathBuf::from("/w/widget"),
                             state: WorkspaceState::Attached,
                             branch: None,
@@ -4484,7 +4457,7 @@ mod tests {
             },
             UnreachableMain {
                 repo_id: RepoId::parse("acme/beta").expect("repo"),
-                image: PathBuf::from("/store/acme/beta/main.sparseimage"),
+                image: PathBuf::from("/store/acme/beta/main.asif"),
                 mountpoint: PathBuf::from("/checkouts/beta"),
                 reason: "main's volume is not mounted".into(),
             },
@@ -5491,7 +5464,6 @@ mod tests {
             "workspace": workspace,
             "workspaceIncarnation": "0198f2c0b7e34dc795f17b238b331c80",
             "publicationState": "active",
-            "imageFormat": "asif",
             "platform": "macos",
             "updatedAt": "2026-07-11T12:34:56Z",
             "revision": 1,

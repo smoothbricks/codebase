@@ -68,7 +68,6 @@ export {
   type GcReport,
   type GrantDelta,
   type GrantSet,
-  type ImageFormat,
   type JobAttachment,
   type JobCommand,
   type JobFailure,

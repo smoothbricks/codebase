@@ -11,9 +11,9 @@ use cowshed_core::api::dto::{
     AbandonedWork, AdoptOptions, AttachOptions, CheckpointInfo, CheckpointOptions, CheckpointQuota,
     CheckpointResult, CommandArg, CreateOptions, DefragmentResult, DoctorReport, ExecCommand,
     ExecRequest, Finding, FindingSeverity, GcOptions, GcReport, GitOid, GrantDelta, GrantSet,
-    ImageFormat, JobId, JobInfo, JobState, LandOptions, LandReport, MirrorInfo, PortBlock,
-    PushOptions, PushReport, RebaseOptions, RemoveOptions, RemoveReport, ResizeResult,
-    RunSandboxMode, StdinSource, WorkspaceInfo, WorkspaceState,
+    JobId, JobInfo, JobState, LandOptions, LandReport, MirrorInfo, PortBlock, PushOptions,
+    PushReport, RebaseOptions, RemoveOptions, RemoveReport, ResizeResult, RunSandboxMode,
+    StdinSource, WorkspaceInfo, WorkspaceState,
 };
 use cowshed_core::api::server::{ConnectionAuthority, RouterHandle, serve_controller_connection};
 use cowshed_core::metadata::{
@@ -322,7 +322,6 @@ impl FakeHost {
                 } else {
                     WorkspaceRole::Workspace
                 },
-                image_format: ImageFormat::Asif,
                 mount: workspace.mount.clone().unwrap_or_else(|| {
                     if workspace.name.is_main() {
                         self.descriptor.git_root.clone()
@@ -1905,7 +1904,6 @@ async fn opening_the_project_accepts_a_workspace_mount_and_still_refuses_a_stran
             "workspace": "task",
             "workspaceIncarnation": "0198f2c0b7e34dc795f17b238b331c80",
             "role": "workspace",
-            "imageFormat": "asif",
             "baseCommit": "0123456789abcdef",
             "createdAt": "2026-07-13T00:00:00Z",
             "createdTrace": "fixture",

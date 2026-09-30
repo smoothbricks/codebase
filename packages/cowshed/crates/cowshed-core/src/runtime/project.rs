@@ -2393,7 +2393,6 @@ impl NativeProjectRuntimeHost {
             bootstrap.roots().store(),
             bootstrap.roots().caches(),
             &git_root,
-            crate::apfs::ApfsCaseSensitivity::Sensitive,
         );
         let host = crate::storage::apfs::native::MacOsApfsExecutionHost::new(
             crate::apfs::SystemCommandRunner,
@@ -3057,7 +3056,7 @@ impl NativeProjectRuntimeHost {
                 .into_iter()
                 .map(|derived| {
                     let image = layout
-                        .canonical_image(derived.workspace.name(), derived.workspace.format())?
+                        .canonical_image(derived.workspace.name())?
                         .image()
                         .to_path_buf();
                     let metadata =
@@ -3108,24 +3107,15 @@ impl NativeProjectRuntimeHost {
     async fn pending_metadata(
         &self,
     ) -> Result<Vec<(PathBuf, crate::metadata::DetachedWorkspaceMetadata)>> {
-        let main_images = [
-            self.layout
-                .main_image(crate::metadata::ImageFormat::Asif)
-                .map_err(native_integrity_error)?
-                .image()
-                .to_path_buf(),
-            self.layout
-                .main_image(crate::metadata::ImageFormat::Sparse)
-                .map_err(native_integrity_error)?
-                .image()
-                .to_path_buf(),
-        ];
+        let main_image = self
+            .layout
+            .main_image()
+            .map_err(native_integrity_error)?
+            .image()
+            .to_path_buf();
         let sessions = self.layout.project().sessions.clone();
         crate::storage::lifecycle::dispatch_blocking(move || {
-            let mut images = main_images
-                .into_iter()
-                .filter(|image| image.exists())
-                .collect::<Vec<_>>();
+            let mut images = Vec::from_iter(main_image.exists().then_some(main_image));
             let entries = match std::fs::read_dir(&sessions) {
                 Ok(entries) => entries
                     .map(|entry| {
@@ -3153,7 +3143,6 @@ impl NativeProjectRuntimeHost {
             };
             images.extend(
                 crate::storage::discover_session_images(entries)
-                    .map_err(native_integrity_error)?
                     .into_iter()
                     .map(|image| image.path().to_path_buf()),
             );
@@ -3225,15 +3214,12 @@ impl NativeProjectRuntimeHost {
     ///
     /// The marker is read through main's mount, so this is only usable while main is mounted; the
     /// sidecar half is store-side and always reachable.
-    fn checkout_record(
-        &self,
-        workspace: &NativeWorkspace,
-    ) -> Result<crate::checkout::CheckoutRecord> {
+    fn checkout_record(&self) -> Result<crate::checkout::CheckoutRecord> {
         Ok(crate::checkout::CheckoutRecord {
             mount_point: self.workspace_mount_path(&main_name())?,
             image: self
                 .layout
-                .main_image(workspace.derived.workspace.format())
+                .main_image()
                 .map_err(native_integrity_error)?
                 .image()
                 .to_path_buf(),
@@ -3441,7 +3427,7 @@ impl NativeProjectRuntimeHost {
             return Ok(());
         }
         let mount_point = self.workspace_mount_path(&main)?;
-        let record = self.checkout_record(&current)?;
+        let record = self.checkout_record()?;
         let store_root = self.descriptor.store_root.clone();
         let observed = observed.to_owned();
         let probe_mount = mount_point.clone();
@@ -5887,9 +5873,6 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
             options.quarantine,
         )
         .await?;
-        let format = options
-            .image_format
-            .unwrap_or(crate::metadata::ImageFormat::Asif);
         // Capacity is fixed for the image's lifetime at creation; `cowshed resize` is what moves
         // it afterwards. An unset option means the project default rather than "no capacity".
         let capacity = match options.capacity.as_deref() {
@@ -5909,7 +5892,6 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
             .substrate
             .plan_adopt(crate::storage::lifecycle::AdoptRequest {
                 repo: self.descriptor.repo_id.clone(),
-                format,
                 capacity,
                 topology_revision: crate::storage::lifecycle::Revision::new(0),
                 source_checkout: self.descriptor.git_root.clone(),
@@ -6433,7 +6415,7 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                 "cowshed doctor --json",
             ));
         }
-        let record = self.checkout_record(&current)?;
+        let record = self.checkout_record()?;
 
         if detached {
             let prepare_record = record.clone();
@@ -6458,8 +6440,7 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                 .await
                 .map_err(native_storage_error)?;
             self.advance_gateway_revision(&current).await?;
-            let current = self.current(&main).await?;
-            let mounted_record = self.checkout_record(&current)?;
+            let mounted_record = self.checkout_record()?;
             let mounted_destination = destination.clone();
             crate::storage::lifecycle::dispatch_blocking(move || {
                 mounted_record.rewrite_project_root(&mounted_destination)
@@ -7352,9 +7333,6 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                     StorageGcReason::ExpiredCheckpoint => {
                         crate::api::dto::GcReason::ExpiredCheckpoint
                     }
-                    StorageGcReason::DetachedImageCompaction => {
-                        crate::api::dto::GcReason::DetachedImageCompaction
-                    }
                 },
             })
             .collect::<Vec<_>>();
@@ -7425,7 +7403,7 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
         let mut current = self.current(&workspace).await?;
         let lock_path = self
             .layout
-            .canonical_image(&workspace, current.derived.workspace.format())
+            .canonical_image(&workspace)
             .map_err(native_integrity_error)?
             .lock()
             .to_owned();
@@ -10789,7 +10767,9 @@ fn native_retired_refs(
     project_root: &Path,
     repo_id: &RepoId,
 ) -> Result<Vec<crate::storage::lifecycle::RetiredRef>> {
-    use crate::metadata::{DetachedWorkspaceMetadata, ImageFormat, WorkspaceRole};
+    use crate::metadata::{
+        DetachedWorkspaceMetadata, IMAGE_EXTENSION, WorkspaceRole, is_image_path,
+    };
     use crate::storage::lifecycle::{LifecycleWorkspace, RetiredRef, Revision};
 
     let trash = project_root
@@ -10814,19 +10794,15 @@ fn native_retired_refs(
     };
     let mut images = entries
         .into_iter()
-        .filter_map(|entry| {
-            ImageFormat::from_image_path(&entry.path())
-                .ok()
-                .map(|format| (entry, format))
-        })
+        .filter(|entry| is_image_path(&entry.path()))
         .collect::<Vec<_>>();
-    images.sort_by_key(|(entry, _)| entry.file_name());
+    images.sort_by_key(std::fs::DirEntry::file_name);
 
     let mut retired = Vec::new();
     retired
         .try_reserve(images.len())
         .map_err(|_| CowshedError::internal("cannot reserve retired workspace recovery facts"))?;
-    for (entry, format) in images {
+    for entry in images {
         let file_type = entry.file_type().map_err(|error| {
             CowshedError::integrity(
                 format!("cannot inspect retired workspace image: {error}"),
@@ -10846,7 +10822,7 @@ fn native_retired_refs(
             .map_err(native_integrity_error)?;
         // The exact trash name, sidecar and repository are the retirement fence. A clone
         // retired before activation retains PendingFence; it was never a runnable image.
-        if metadata.repo_id != *repo_id || metadata.image_format != format {
+        if metadata.repo_id != *repo_id {
             return Err(CowshedError::integrity(
                 format!(
                     "retired workspace metadata identity mismatch: {}",
@@ -10856,10 +10832,9 @@ fn native_retired_refs(
             ));
         }
         let expected = trash.join(format!(
-            "{}-{}.{}",
+            "{}-{}.{IMAGE_EXTENSION}",
             metadata.workspace.as_str(),
             metadata.workspace_incarnation.as_str(),
-            format.extension()
         ));
         if entry.path() != expected {
             return Err(CowshedError::integrity(
@@ -10879,7 +10854,6 @@ fn native_retired_refs(
             revision,
             revision,
             role,
-            format,
         )
         .map_err(native_integrity_error)?;
         let resulting_revision = revision
@@ -10901,8 +10875,7 @@ fn native_retired_refs(
 mod retired_recovery_tests {
     use super::*;
     use crate::metadata::{
-        DetachedWorkspaceMetadata, GrantSet, ImageFormat, Platform, PortBlock, PublicationState,
-        SIDECAR_VERSION,
+        DetachedWorkspaceMetadata, GrantSet, Platform, PortBlock, PublicationState, SIDECAR_VERSION,
     };
 
     #[test]
@@ -10926,7 +10899,6 @@ mod retired_recovery_tests {
             repo_id: repo_id.clone(),
             workspace: WorkspaceName::new("raven").unwrap(),
             workspace_incarnation: incarnation.clone(),
-            image_format: ImageFormat::Asif,
             platform: Platform::Macos,
             publication_state: PublicationState::Active,
             updated_at: "2026-07-14T00:00:00Z".into(),
@@ -10969,7 +10941,7 @@ mod retired_recovery_tests {
         let name = WorkspaceName::new("idle").expect("workspace");
         let incarnation =
             WorkspaceIncarnation::new("0198f2c0b7e34dc795f17b238b331c80").expect("incarnation");
-        let image = trash.join(format!("idle-{}.sparseimage", incarnation.as_str()));
+        let image = trash.join(format!("idle-{}.asif", incarnation.as_str()));
         std::fs::write(&image, b"retired pending clone").expect("retired image");
         let mut grants =
             GrantSet::closed_baseline(Some(PortBlock::new(49_136, 16).expect("port block")))
@@ -10980,7 +10952,6 @@ mod retired_recovery_tests {
             repo_id: repo_id.clone(),
             workspace: name.clone(),
             workspace_incarnation: incarnation.clone(),
-            image_format: ImageFormat::Sparse,
             platform: Platform::Macos,
             publication_state: PublicationState::PendingFence,
             updated_at: "2026-07-14T00:00:00Z".into(),
@@ -11023,7 +10994,7 @@ mod retired_recovery_tests {
             .write_for_image(&image)
             .expect("restore metadata identity");
 
-        let live = project_root.join("sessions/idle.sparseimage");
+        let live = project_root.join("sessions/idle.asif");
         std::fs::write(&live, b"new workspace").expect("new canonical image");
         mismatched.workspace_incarnation =
             WorkspaceIncarnation::new("1198f2c0b7e34dc795f17b238b331c80").expect("new incarnation");
@@ -11050,7 +11021,7 @@ mod retired_recovery_tests {
         std::fs::create_dir_all(&trash).unwrap();
         let repo_id = RepoId::parse("acme/widget").unwrap();
         let incarnation = WorkspaceIncarnation::new("2198f2c0b7e34dc795f17b238b331c80").unwrap();
-        let image = trash.join(format!("main-{}.sparseimage", incarnation.as_str()));
+        let image = trash.join(format!("main-{}.asif", incarnation.as_str()));
         std::fs::write(&image, b"retired main image").unwrap();
         let mut grants = GrantSet::closed_baseline(Some(
             PortBlock::new(crate::metadata::MACOS_PORT_MAX - 15, 16).unwrap(),
@@ -11062,7 +11033,6 @@ mod retired_recovery_tests {
             repo_id: repo_id.clone(),
             workspace: WorkspaceName::new("main").unwrap(),
             workspace_incarnation: incarnation.clone(),
-            image_format: ImageFormat::Sparse,
             platform: Platform::Macos,
             publication_state: PublicationState::Active,
             updated_at: "2026-07-14T00:00:00Z".into(),
@@ -11230,21 +11200,14 @@ fn native_storage_error(error: crate::storage::apfs::ApfsStorageError) -> Cowshe
         }
         // A missing CA companion names its own remedy: only `rekey` rebuilds the companion,
         // so the generic doctor hint would send the reader after the wrong problem. The
-        // workspace rides in the hint from the image's file name with the format's own
-        // extension stripped — `file_stem` would leave `cargo-wasmbench.sparse` behind on a
-        // `.sparseimage` — while both paths stay in the message, where neither is guessable
-        // from the other.
+        // workspace rides in the hint from the image's file stem, while both paths stay in the
+        // message, where neither is guessable from the other.
         ref error @ crate::storage::apfs::ApfsStorageError::MissingCaCompanion {
             ref image, ..
         } => {
             let workspace = image
-                .file_name()
+                .file_stem()
                 .and_then(|name| name.to_str())
-                .and_then(|name| {
-                    crate::metadata::ImageFormat::from_image_path(image)
-                        .ok()
-                        .and_then(|format| name.strip_suffix(format.image_extension()))
-                })
                 .unwrap_or("workspace");
             CowshedError::integrity(error.to_string(), format!("cowshed rekey {workspace}"))
         }
@@ -11881,9 +11844,7 @@ fn missing_ca_companion_finding(
 mod doctor_hint_tests {
     use super::*;
     use crate::git::{CowshedUpstream, MergeDriver, MergeDriverState};
-    use crate::metadata::{
-        ImageFormat, MARKER_VERSION, WorkspaceIncarnation, WorkspaceMarker, WorkspaceRole,
-    };
+    use crate::metadata::{MARKER_VERSION, WorkspaceIncarnation, WorkspaceMarker, WorkspaceRole};
     use std::path::PathBuf;
 
     fn marker(project_root: &str, workspace: &str) -> WorkspaceMarker {
@@ -11895,7 +11856,6 @@ mod doctor_hint_tests {
             workspace_incarnation: WorkspaceIncarnation::new("0198f2c0b7e34dc795f17b238b331c80")
                 .expect("incarnation"),
             role: WorkspaceRole::Workspace,
-            image_format: ImageFormat::Asif,
             base_commit: "8f31c2d".into(),
             created_at: "2026-07-11T12:00:00Z".into(),
             forked_from: None,
@@ -12056,7 +12016,7 @@ mod doctor_hint_tests {
         use crate::api::dto::FindingSeverity;
         use crate::storage::lifecycle::ExtentCount;
 
-        let image = PathBuf::from("/store/acme/widget/main.sparseimage");
+        let image = PathBuf::from("/store/acme/widget/main.asif");
         // 12 µs per extent: 83,333 extents copy in just under a second, 83,334 in just over.
         let under = main_extents_finding(image.clone(), ExtentCount::new(83_333));
         assert_eq!(under.code, "main-extents");
@@ -12233,12 +12193,12 @@ mod doctor_hint_tests {
     }
 
     #[test]
-    fn sparseimage_hint_strips_the_full_extension() {
+    fn missing_companion_hint_names_the_workspace_from_the_image_stem() {
         let rendered =
             native_storage_error(crate::storage::apfs::ApfsStorageError::MissingCaCompanion {
                 layout: "canonical",
-                image: PathBuf::from("/store/acme/widget/cargo-wasmbench.sparseimage"),
-                companion: PathBuf::from("/store/acme/widget/cargo-wasmbench.sparseimage.ca.key"),
+                image: PathBuf::from("/store/acme/widget/cargo-wasmbench.asif"),
+                companion: PathBuf::from("/store/acme/widget/cargo-wasmbench.asif.ca.key"),
             });
         assert_eq!(rendered.code, ErrorCode::Integrity);
         assert_eq!(rendered.hint, "cowshed rekey cargo-wasmbench");
@@ -12364,7 +12324,7 @@ mod doctor_hint_tests {
 mod git_worktree_tests {
     use super::*;
     use crate::metadata::{
-        DetachedWorkspaceMetadata, GrantSet, ImageFormat, Platform, PortBlock, PublicationState,
+        DetachedWorkspaceMetadata, GrantSet, Platform, PortBlock, PublicationState,
         SIDECAR_VERSION, WorkspaceIncarnation, WorkspaceInfoSnapshot, WorkspaceRole,
     };
 
@@ -12375,7 +12335,6 @@ mod git_worktree_tests {
             workspace: WorkspaceName::new("raven").expect("workspace name"),
             workspace_incarnation: WorkspaceIncarnation::new("0198f2c0b7e34dc795f17b238b331c80")
                 .expect("incarnation"),
-            image_format: ImageFormat::Asif,
             platform: Platform::Macos,
             publication_state: PublicationState::Active,
             updated_at: "2026-07-13T00:00:00Z".to_owned(),
@@ -12489,9 +12448,9 @@ mod workspace_marker_reader_tests {
 mod workspace_origin_tests {
     use super::*;
     use crate::metadata::{
-        DetachedWorkspaceMetadata, GrantSet, ImageFormat, MARKER_VERSION, Platform, PortBlock,
-        PublicationState, SIDECAR_VERSION, WorkspaceIncarnation, WorkspaceInfoSnapshot,
-        WorkspaceMarker, WorkspaceRole,
+        DetachedWorkspaceMetadata, GrantSet, MARKER_VERSION, Platform, PortBlock, PublicationState,
+        SIDECAR_VERSION, WorkspaceIncarnation, WorkspaceInfoSnapshot, WorkspaceMarker,
+        WorkspaceRole,
     };
     use crate::storage::lifecycle::{
         DerivedWorkspace, LifecycleWorkspace, MountState, Revision, StorageFact,
@@ -12525,7 +12484,6 @@ mod workspace_origin_tests {
                 )
                 .expect("incarnation"),
                 role,
-                image_format: ImageFormat::Asif,
                 base_commit: "0123456789abcdef".to_owned(),
                 created_at: "2026-07-13T00:00:00Z".to_owned(),
                 forked_from: None,
@@ -12552,7 +12510,6 @@ mod workspace_origin_tests {
             Revision::new(1),
             Revision::new(1),
             role,
-            ImageFormat::Asif,
         )
         .expect("lifecycle workspace")
     }
@@ -12566,7 +12523,6 @@ mod workspace_origin_tests {
             repo_id: RepoId::parse("acme/widget").expect("repo"),
             workspace: WorkspaceName::new("main").expect("main"),
             workspace_incarnation: incarnation,
-            image_format: ImageFormat::Asif,
             platform: Platform::Macos,
             publication_state: PublicationState::Active,
             updated_at: "2026-07-13T00:00:00Z".to_owned(),
@@ -12775,11 +12731,7 @@ mod workspace_origin_tests {
         )
         .expect("explicit detached-main relocation accepts retired roots");
 
-        let image = layout
-            .main_image(ImageFormat::Asif)
-            .expect("main paths")
-            .image()
-            .to_owned();
+        let image = layout.main_image().expect("main paths").image().to_owned();
         std::fs::write(&image, b"main image").expect("image");
         metadata.write_for_image(&image).expect("sidecar");
         let record = crate::checkout::CheckoutRecord {
@@ -13568,7 +13520,7 @@ mod binding_tests {
 
     #[tokio::test]
     async fn startup_pending_restore_destination_is_absent_until_restore_fence() {
-        use crate::metadata::{ImageFormat, WorkspaceRole};
+        use crate::metadata::WorkspaceRole;
         use crate::runtime::supervisor::{CommitmentDraft, CommitmentPublisher, CommitmentSink};
         use crate::storage::apfs::PendingPublicationFact;
         use crate::storage::lifecycle::{LifecycleWorkspace, Revision, StorageFact};
@@ -13589,7 +13541,6 @@ mod binding_tests {
             Revision::new(1),
             Revision::new(11),
             WorkspaceRole::Main,
-            ImageFormat::Sparse,
         )
         .expect("source workspace");
         let destination_workspace = LifecycleWorkspace::new(
@@ -13599,7 +13550,6 @@ mod binding_tests {
             Revision::new(2),
             Revision::new(11),
             WorkspaceRole::Main,
-            ImageFormat::Sparse,
         )
         .expect("destination workspace");
         let facts = vec![
@@ -13614,7 +13564,7 @@ mod binding_tests {
         ];
         let pending = PendingPublicationFact {
             workspace: destination_workspace,
-            image: root.join("main.sparseimage"),
+            image: root.join("main.asif"),
             mount_point: root.join("mount"),
             source_checkpoint: "baseline".to_owned(),
             source_incarnation: source.clone(),
@@ -13654,9 +13604,8 @@ mod port_reservation_tests {
     use super::{claim_port_block, reserve_port_grants};
     use crate::gateway_inventory::NativeGatewayInventory;
     use crate::metadata::{
-        DetachedWorkspaceMetadata, GrantSet, ImageFormat, MACOS_PORT_MIN, NEW_PORT_BLOCK_SIZE,
-        Platform, PortBlock, PublicationState, SIDECAR_VERSION, WorkspaceIncarnation,
-        WorkspaceName,
+        DetachedWorkspaceMetadata, GrantSet, MACOS_PORT_MIN, NEW_PORT_BLOCK_SIZE, Platform,
+        PortBlock, PublicationState, SIDECAR_VERSION, WorkspaceIncarnation, WorkspaceName,
     };
     use crate::repository::{BoundIdentity, RepoId, RepositoryBinding};
     use crate::storage::StorageLayout;
@@ -13712,7 +13661,7 @@ mod port_reservation_tests {
             .expect("first allocation");
         let first_base = first.grants.port_block.expect("first block").base();
         assert_eq!(first_base, MACOS_PORT_MIN);
-        let image = layout.main_image(ImageFormat::Sparse).expect("main image");
+        let image = layout.main_image().expect("main image");
         std::fs::write(image.image(), b"detached image fixture").expect("image");
         DetachedWorkspaceMetadata {
             version: SIDECAR_VERSION,
@@ -13720,7 +13669,6 @@ mod port_reservation_tests {
             workspace: WorkspaceName::main(),
             workspace_incarnation: WorkspaceIncarnation::new("0198f2c0b7e34dc795f17b238b331c80")
                 .expect("incarnation"),
-            image_format: ImageFormat::Sparse,
             platform: Platform::Macos,
             publication_state: PublicationState::Active,
             updated_at: "2026-07-14T00:00:00Z".to_owned(),
@@ -13784,9 +13732,7 @@ mod port_reservation_tests {
             .expect("initial allocation");
         let first_base = first.grants.port_block.expect("first block").base();
         let name = WorkspaceName::session("unfinished").expect("session");
-        let image = layout
-            .session_image(&name, ImageFormat::Sparse)
-            .expect("session image");
+        let image = layout.session_image(&name).expect("session image");
         std::fs::create_dir_all(image.image().parent().expect("session directory"))
             .expect("session directory");
         std::fs::write(image.image(), b"interrupted clone").expect("image");
@@ -13796,7 +13742,6 @@ mod port_reservation_tests {
             workspace: name,
             workspace_incarnation: WorkspaceIncarnation::new("0198f2c0b7e34dc795f17b238b331c80")
                 .expect("incarnation"),
-            image_format: ImageFormat::Sparse,
             platform: Platform::Macos,
             publication_state: PublicationState::PendingFence,
             updated_at: "2026-07-14T00:00:00Z".to_owned(),
@@ -13843,7 +13788,7 @@ mod port_reservation_tests {
             first_base + NEW_PORT_BLOCK_SIZE
         );
         drop(second);
-        let main = layout.main_image(ImageFormat::Sparse).expect("main image");
+        let main = layout.main_image().expect("main image");
         std::fs::write(main.image(), b"published clone").expect("main payload");
         let mut published =
             DetachedWorkspaceMetadata::read_for_image(image.image()).expect("pending sidecar");
@@ -13926,7 +13871,6 @@ mod port_reservation_tests {
                     "0198f2c0b7e34dc795f17b238b331c80",
                 )
                 .expect("incarnation"),
-                image_format: ImageFormat::Sparse,
                 platform: Platform::Macos,
                 publication_state,
                 updated_at: "2026-07-14T00:00:00Z".to_owned(),
@@ -13947,7 +13891,7 @@ mod port_reservation_tests {
             .expect("publish block");
         };
         let published = PortBlock::new(MACOS_PORT_MIN + 16, 16).expect("live 16-port block");
-        let main = layout.main_image(ImageFormat::Sparse).expect("main image");
+        let main = layout.main_image().expect("main image");
         publish(
             main.image(),
             WorkspaceName::main(),
@@ -13957,9 +13901,7 @@ mod port_reservation_tests {
         let pending_name = WorkspaceName::session("unfinished").expect("session");
         let pending_block =
             PortBlock::new(MACOS_PORT_MIN + 64 + 48, 16).expect("pending 16-port block");
-        let pending = layout
-            .session_image(&pending_name, ImageFormat::Sparse)
-            .expect("session image");
+        let pending = layout.session_image(&pending_name).expect("session image");
         publish(
             pending.image(),
             pending_name,
@@ -13976,9 +13918,7 @@ mod port_reservation_tests {
             PortBlock::new(MACOS_PORT_MIN + 128, NEW_PORT_BLOCK_SIZE).expect("expected block")
         );
         let second_name = WorkspaceName::session("second").expect("session");
-        let second_image = layout
-            .session_image(&second_name, ImageFormat::Sparse)
-            .expect("session image");
+        let second_image = layout.session_image(&second_name).expect("session image");
         publish(
             second_image.image(),
             second_name,
@@ -14049,8 +13989,8 @@ mod terminal_project_cleanup_tests {
         std::fs::create_dir_all(root.join(".staging")).expect("staging");
         std::fs::create_dir_all(root.join("checkpoints/main")).expect("checkpoints");
         std::fs::create_dir_all(root.join("sessions/.trash")).expect("trash");
-        std::fs::write(root.join("sessions/raven.sparseimage.lock"), b"").expect("session lock");
-        std::fs::write(root.join("main.sparseimage.lock"), b"").expect("main lock");
+        std::fs::write(root.join("sessions/raven.asif.lock"), b"").expect("session lock");
+        std::fs::write(root.join("main.asif.lock"), b"").expect("main lock");
         std::fs::write(&binding, b"binding").expect("binding");
         std::fs::write(root.join("policy.json"), b"preserve").expect("policy");
 
@@ -14063,7 +14003,7 @@ mod terminal_project_cleanup_tests {
         assert!(!root.join(".staging").exists());
         assert!(!root.join("checkpoints").exists());
         assert!(!root.join("sessions").exists());
-        assert!(!root.join("main.sparseimage.lock").exists());
+        assert!(!root.join("main.asif.lock").exists());
         std::fs::remove_dir_all(root).expect("cleanup");
     }
 
@@ -14071,7 +14011,7 @@ mod terminal_project_cleanup_tests {
     fn cleanup_preserves_and_rejects_an_unreclaimed_image() {
         let root = root("blocked");
         let binding = root.join("repository.json");
-        let image = root.join("sessions/.trash/main-retired.sparseimage");
+        let image = root.join("sessions/.trash/main-retired.asif");
         std::fs::create_dir_all(image.parent().expect("trash")).expect("trash");
         std::fs::write(&image, b"image").expect("retained image");
         std::fs::write(&binding, b"binding").expect("binding");
@@ -14201,12 +14141,12 @@ mod terminal_project_cleanup_tests {
     fn anything_the_unbinding_could_not_delete_refuses_before_anything_is_removed() {
         for (label, artifact) in [
             ("bundle", "sessions/.trash/raven-0123.bundle"),
-            ("session", "sessions/raven.sparseimage.grants.json"),
-            ("staged", ".staging/raven-4567.sparseimage"),
-            ("checkpoint", "checkpoints/raven/before.sparseimage"),
+            ("session", "sessions/raven.asif.grants.json"),
+            ("staged", ".staging/raven-4567.asif"),
+            ("checkpoint", "checkpoints/raven/before.asif"),
         ] {
             let (root, paths) = project(label);
-            let lock = paths.sessions.join("raven.sparseimage.lock");
+            let lock = paths.sessions.join("raven.asif.lock");
             let artifact = paths.project_root.join(artifact);
             std::fs::create_dir_all(artifact.parent().expect("parent")).expect("parent");
             std::fs::create_dir_all(&paths.sessions).expect("sessions");
@@ -14240,7 +14180,7 @@ mod terminal_project_cleanup_tests {
     #[test]
     fn mains_own_checkpoints_do_not_refuse_its_restore() {
         let (root, paths) = project("main-checkpoint");
-        let checkpoint = paths.checkpoints.join("main/before.sparseimage");
+        let checkpoint = paths.checkpoints.join("main/before.asif");
         std::fs::create_dir_all(checkpoint.parent().expect("parent")).expect("parent");
         std::fs::write(&checkpoint, b"main checkpoint").expect("checkpoint");
 

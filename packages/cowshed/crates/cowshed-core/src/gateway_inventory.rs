@@ -8,13 +8,13 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use thiserror::Error;
 
-use crate::apfs::{ApfsCaseSensitivity, SystemCommandRunner};
+use crate::apfs::SystemCommandRunner;
 #[cfg(test)]
 use crate::api::dto::WorkspaceState;
 use crate::api::dto::{ProjectWorkspaces, WorkspaceInfo};
 use crate::metadata::{
-    DetachedWorkspaceMetadata, GrantSet, ImageFormat, PortBlock, PublicationState,
-    ReservedPortBlocks, WorkspaceIncarnation, WorkspaceName, sidecar_path,
+    DetachedWorkspaceMetadata, GrantSet, PortBlock, PublicationState, ReservedPortBlocks,
+    WorkspaceIncarnation, WorkspaceName, sidecar_path,
 };
 use crate::repository::{OwnedRepoIds, RepoId, RepositoryBinding};
 use crate::storage::apfs::native::{
@@ -255,12 +255,7 @@ fn project_substrate_config(
     storage: &ValidatedHostStorage,
     checkout_path: PathBuf,
 ) -> ApfsSubstrateConfig {
-    ApfsSubstrateConfig::new(
-        storage.store(),
-        storage.caches(),
-        checkout_path,
-        ApfsCaseSensitivity::Sensitive,
-    )
+    ApfsSubstrateConfig::new(storage.store(), storage.caches(), checkout_path)
 }
 
 /// One project's mount side, opened once and mounting nothing on its own.
@@ -745,19 +740,16 @@ impl NativeGatewayInventory {
                 }
             })?;
             let mut images = Vec::new();
-            for format in [ImageFormat::Asif, ImageFormat::Sparse] {
-                let image = layout
-                    .main_image(format)
-                    .map_err(|error| GatewayInventoryError::InvalidMetadata {
-                        path: layout.project().project_root.clone(),
-                        message: error.to_string(),
-                    })?
-                    .image()
-                    .to_owned();
-                if fs::symlink_metadata(&image).is_ok_and(|metadata| metadata.file_type().is_file())
-                {
-                    images.push(image);
-                }
+            let image = layout
+                .main_image()
+                .map_err(|error| GatewayInventoryError::InvalidMetadata {
+                    path: layout.project().project_root.clone(),
+                    message: error.to_string(),
+                })?
+                .image()
+                .to_owned();
+            if fs::symlink_metadata(&image).is_ok_and(|metadata| metadata.file_type().is_file()) {
+                images.push(image);
             }
             let trash = layout.project().sessions.join(".trash");
             match fs::read_dir(&trash) {
@@ -770,7 +762,7 @@ impl NativeGatewayInventory {
                             .file_name()
                             .and_then(|name| name.to_str())
                             .is_some_and(|name| name.starts_with("main-"))
-                            && ImageFormat::from_image_path(&path).is_ok()
+                            && crate::metadata::is_image_path(&path)
                             && fs::symlink_metadata(&path)
                                 .is_ok_and(|metadata| metadata.file_type().is_file())
                         {
@@ -890,12 +882,7 @@ impl NativeGatewayInventory {
                     return Err(io_error("enumerating session images", sessions, source));
                 }
             };
-            for image in crate::storage::discover_session_images(entries).map_err(|error| {
-                GatewayInventoryError::InvalidMetadata {
-                    path: sessions.to_owned(),
-                    message: error.to_string(),
-                }
-            })? {
+            for image in crate::storage::discover_session_images(entries) {
                 // Published images were already validated above. Only pending sidecars
                 // need reading after the canonical directory enumeration.
                 if !active_names.contains(image.workspace()) {
@@ -1411,46 +1398,25 @@ pub(crate) fn authoritative_checkout_path(
     layout: &StorageLayout,
     repo: &RepoId,
 ) -> Result<Option<PathBuf>, GatewayInventoryError> {
-    let mut found = None;
-    for format in [ImageFormat::Asif, ImageFormat::Sparse] {
-        let paths =
-            layout
-                .main_image(format)
-                .map_err(|error| GatewayInventoryError::InvalidMetadata {
-                    path: layout.project().project_root.clone(),
-                    message: error.to_string(),
-                })?;
-        if !paths
-            .image()
-            .try_exists()
-            .map_err(|source| io_error("inspecting canonical main image", paths.image(), source))?
-        {
-            continue;
+    let Some(image) = existing_main_image(layout)? else {
+        return Ok(None);
+    };
+    let metadata = DetachedWorkspaceMetadata::read_for_image(&image).map_err(|error| {
+        GatewayInventoryError::InvalidMetadata {
+            path: sidecar_path(&image),
+            message: error.to_string(),
         }
-        if found.is_some() {
-            return Err(GatewayInventoryError::InvalidMetadata {
-                path: layout.project().project_root.clone(),
-                message: "duplicate canonical main image formats".to_owned(),
-            });
-        }
-        let metadata =
-            DetachedWorkspaceMetadata::read_for_image(paths.image()).map_err(|error| {
-                GatewayInventoryError::InvalidMetadata {
-                    path: sidecar_path(paths.image()),
-                    message: error.to_string(),
-                }
-            })?;
-        if metadata.repo_id != *repo || !metadata.workspace.is_main() {
-            return Err(GatewayInventoryError::InvalidMetadata {
-                path: sidecar_path(paths.image()),
-                message: "canonical main metadata identity mismatch".to_owned(),
-            });
-        }
-        if metadata.publication_state == PublicationState::Active {
-            found = Some(metadata.info_snapshot.project_root);
-        }
+    })?;
+    if metadata.repo_id != *repo || !metadata.workspace.is_main() {
+        return Err(GatewayInventoryError::InvalidMetadata {
+            path: sidecar_path(&image),
+            message: "canonical main metadata identity mismatch".to_owned(),
+        });
     }
-    Ok(found)
+    if metadata.publication_state != PublicationState::Active {
+        return Ok(None);
+    }
+    Ok(Some(metadata.info_snapshot.project_root))
 }
 
 fn expected_mount_paths(
@@ -1483,28 +1449,23 @@ fn workspace_mountpoint(
         })
 }
 
-/// The canonical main image this project actually holds, in whichever format it was written.
-///
-/// The store holds at most one: `authoritative_checkout_path` rejects a project carrying both, so
-/// the first hit is the answer rather than a candidate.
+/// The canonical main image this project holds, if it holds one.
 fn existing_main_image(layout: &StorageLayout) -> Result<Option<PathBuf>, GatewayInventoryError> {
-    for format in [ImageFormat::Asif, ImageFormat::Sparse] {
-        let paths =
-            layout
-                .main_image(format)
-                .map_err(|error| GatewayInventoryError::InvalidMetadata {
-                    path: layout.project().project_root.clone(),
-                    message: error.to_string(),
-                })?;
-        if paths
-            .image()
-            .try_exists()
-            .map_err(|source| io_error("inspecting canonical main image", paths.image(), source))?
-        {
-            return Ok(Some(paths.image().to_owned()));
-        }
+    let paths = layout
+        .main_image()
+        .map_err(|error| GatewayInventoryError::InvalidMetadata {
+            path: layout.project().project_root.clone(),
+            message: error.to_string(),
+        })?;
+    if paths
+        .image()
+        .try_exists()
+        .map_err(|source| io_error("inspecting canonical main image", paths.image(), source))?
+    {
+        Ok(Some(paths.image().to_owned()))
+    } else {
+        Ok(None)
     }
-    Ok(None)
 }
 
 /// Why this project's main is not mounted, or `None` when it is.
@@ -1586,7 +1547,7 @@ fn canonical_image_paths(
     layout: &StorageLayout,
     workspace: &crate::storage::lifecycle::LifecycleWorkspace,
 ) -> Result<crate::storage::ImagePaths, GatewayInventoryError> {
-    let result = layout.canonical_image(workspace.name(), workspace.format());
+    let result = layout.canonical_image(workspace.name());
     result.map_err(|error| GatewayInventoryError::InvalidMetadata {
         path: layout.project().project_root.clone(),
         message: error.to_string(),
@@ -1624,7 +1585,6 @@ pub fn read_current_metadata(
         || metadata.repo_id != *workspace.repo()
         || metadata.workspace != *workspace.name()
         || metadata.workspace_incarnation != *workspace.incarnation()
-        || metadata.image_format != workspace.format()
         || metadata.grants.revision != workspace.revision().get()
     {
         return Err(GatewayInventoryError::InvalidMetadata {
@@ -1819,7 +1779,6 @@ mod tests {
                 Revision::new(revision),
                 Revision::new(revision),
                 role,
-                ImageFormat::Sparse,
             )
             .expect("workspace");
             let image = canonical_image_paths(&layout, &workspace).expect("image paths");
@@ -1860,7 +1819,6 @@ mod tests {
                 repo_id: repo.clone(),
                 workspace: name.clone(),
                 workspace_incarnation: workspace.incarnation().clone(),
-                image_format: ImageFormat::Sparse,
                 platform: Platform::Macos,
                 publication_state: PublicationState::Active,
                 updated_at: "2026-07-14T00:00:00Z".to_owned(),
@@ -2419,7 +2377,7 @@ mod tests {
             canonical_image_paths(&layout, &storage.workspace).expect("canonical image");
         let trash = layout.project().sessions.join(".trash");
         fs::create_dir_all(&trash).expect("trash");
-        let retired = trash.join("main-retired.sparseimage");
+        let retired = trash.join("main-retired.asif");
         fs::rename(canonical.image(), &retired).expect("retire image");
         fs::rename(sidecar_path(canonical.image()), sidecar_path(&retired))
             .expect("retire metadata");
@@ -2678,7 +2636,6 @@ mod tests {
             Revision::new(1),
             Revision::new(1),
             role,
-            ImageFormat::Sparse,
         )
         .expect("workspace")
     }
@@ -2834,10 +2791,8 @@ mod tests {
             false,
         );
         let layout = StorageLayout::new(fixture.storage.store(), &repo).expect("layout");
-        let duplicate = layout.main_image(ImageFormat::Asif).expect("asif paths");
-        fs::create_dir_all(duplicate.image().parent().expect("image parent"))
-            .expect("image parent");
-        fs::write(duplicate.image(), b"corrupt duplicate").expect("duplicate image");
+        let main = layout.main_image().expect("main paths");
+        fs::write(main.sidecar(), b"{\"version\": 1, \"corrupt\"").expect("corrupt sidecar");
         let inventory = NativeGatewayInventory::new(fixture.storage.clone());
 
         let error = inventory
@@ -2902,11 +2857,7 @@ mod tests {
             .expect("main reachability");
 
         let layout = StorageLayout::new(fixture.storage.store(), &detached).expect("layout");
-        let image = layout
-            .main_image(ImageFormat::Sparse)
-            .expect("main image")
-            .image()
-            .to_owned();
+        let image = layout.main_image().expect("main image").image().to_owned();
         assert_eq!(
             unreachable,
             vec![UnreachableMain {

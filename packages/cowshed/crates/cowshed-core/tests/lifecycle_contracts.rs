@@ -4,8 +4,8 @@ use std::thread::ThreadId;
 
 use async_trait::async_trait;
 use cowshed_core::metadata::{
-    GrantSet, ImageCapacity, ImageFormat, MACOS_PORT_MIN, NEW_PORT_BLOCK_SIZE, PortBlock,
-    WorkspaceIncarnation, WorkspaceName, WorkspaceRole,
+    GrantSet, ImageCapacity, MACOS_PORT_MIN, NEW_PORT_BLOCK_SIZE, PortBlock, WorkspaceIncarnation,
+    WorkspaceName, WorkspaceRole,
 };
 use cowshed_core::repository::RepoId;
 use cowshed_core::storage::CheckpointLabel;
@@ -45,7 +45,6 @@ fn workspace(name: &str, revision: u64, topology: u64) -> LifecycleWorkspace {
         } else {
             WorkspaceRole::Workspace
         },
-        ImageFormat::Asif,
     )
     .unwrap()
 }
@@ -435,7 +434,6 @@ fn restore_rejects_each_checkpoint_identity_mismatch() {
             ws.revision(),
             ws.topology_revision(),
             ws.role(),
-            ws.format(),
         )
         .unwrap(),
         workspace("other", 3, 5),
@@ -446,7 +444,6 @@ fn restore_rejects_each_checkpoint_identity_mismatch() {
             ws.revision(),
             ws.topology_revision(),
             ws.role(),
-            ws.format(),
         )
         .unwrap(),
     ];

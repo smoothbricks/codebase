@@ -1,8 +1,8 @@
 use crate::error::CowshedError;
 use crate::metadata::DetachedWorkspaceMetadata;
 pub use crate::metadata::{
-    EgressMode, EgressRule, GrantSet, ImageFormat, Platform, PortBlock, RepoRule, SimVerb,
-    WorkspaceIncarnation, WorkspaceName, WorkspaceRole,
+    EgressMode, EgressRule, GrantSet, Platform, PortBlock, RepoRule, SimVerb, WorkspaceIncarnation,
+    WorkspaceName, WorkspaceRole,
 };
 use crate::repository::{BoundIdentity, RepoId};
 use crate::storage::bootstrap::{HostSetupReport, UninstallReport};
@@ -477,7 +477,6 @@ pub struct WorkspaceInfo {
     pub workspace: WorkspaceName,
     pub workspace_incarnation: WorkspaceIncarnation,
     pub role: WorkspaceRole,
-    pub image_format: ImageFormat,
     pub mount: PathBuf,
     pub state: WorkspaceState,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -512,7 +511,6 @@ impl WorkspaceInfo {
             workspace: derived.workspace.name().clone(),
             workspace_incarnation: derived.workspace.incarnation().clone(),
             role: derived.workspace.role(),
-            image_format: derived.workspace.format(),
             mount,
             state: match derived.mount_state {
                 MountState::Detached => WorkspaceState::Detached,
@@ -695,7 +693,6 @@ pub enum GcReason {
     OrphanStagingMount,
     OrphanMountpoint,
     ExpiredCheckpoint,
-    DetachedImageCompaction,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -2325,8 +2322,6 @@ pub struct AdoptOptions {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub capacity: Option<String>,
     pub quarantine: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub image_format: Option<ImageFormat>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]

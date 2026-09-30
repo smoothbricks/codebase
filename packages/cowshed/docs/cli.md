@@ -1084,8 +1084,7 @@ workspace.
 
 ### `cowshed gc`
 
-Deletes orphaned images and stale mountpoint dirs, prunes expired checkpoints, compacts detached images, and reports
-what it freed. Safe to run anytime; `rm`, `land`, and `restore` also run it opportunistically.
+Deletes retired and orphaned images and stale mountpoint dirs, prunes expired checkpoints, and reports what it freed. Safe to run anytime; `rm`, `land`, and `restore` also run it opportunistically.
 
 ### `cowshed doctor`
 

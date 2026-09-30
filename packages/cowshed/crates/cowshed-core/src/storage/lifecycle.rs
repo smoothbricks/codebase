@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use thiserror::Error;
 
 use crate::metadata::{
-    GrantSet, ImageCapacity, ImageFormat, WorkspaceIncarnation, WorkspaceName, WorkspaceRole,
+    GrantSet, ImageCapacity, WorkspaceIncarnation, WorkspaceName, WorkspaceRole,
 };
 use crate::repository::RepoId;
 
@@ -35,7 +35,6 @@ pub struct LifecycleWorkspace {
     revision: Revision,
     topology_revision: Revision,
     role: WorkspaceRole,
-    format: ImageFormat,
 }
 
 impl LifecycleWorkspace {
@@ -46,7 +45,6 @@ impl LifecycleWorkspace {
         revision: Revision,
         topology_revision: Revision,
         role: WorkspaceRole,
-        format: ImageFormat,
     ) -> Result<Self, PlanError> {
         if name.is_main() != (role == WorkspaceRole::Main) {
             return Err(PlanError::RoleNameMismatch { name, role });
@@ -58,7 +56,6 @@ impl LifecycleWorkspace {
             revision,
             topology_revision,
             role,
-            format,
         })
     }
     pub fn repo(&self) -> &RepoId {
@@ -78,9 +75,6 @@ impl LifecycleWorkspace {
     }
     pub const fn role(&self) -> WorkspaceRole {
         self.role
-    }
-    pub const fn format(&self) -> ImageFormat {
-        self.format
     }
 }
 
@@ -251,7 +245,6 @@ pub struct OperationIdentity {
 pub enum Operation {
     Adopt {
         repo: RepoId,
-        format: ImageFormat,
         capacity: ImageCapacity,
         source_checkout: PathBuf,
         pre_cowshed_checkout: PathBuf,
@@ -260,38 +253,32 @@ pub enum Operation {
     Create {
         source: WorkspaceName,
         destination: WorkspaceName,
-        format: ImageFormat,
         identity: OperationIdentity,
     },
     Fork {
         source: WorkspaceName,
         destination: WorkspaceName,
-        format: ImageFormat,
         identity: OperationIdentity,
     },
     Checkpoint {
         workspace: WorkspaceName,
         label: CheckpointLabel,
         pin: Pin,
-        format: ImageFormat,
     },
     Restore {
         workspace: WorkspaceName,
         label: CheckpointLabel,
         mode: RestoreMode,
-        format: ImageFormat,
         identity: OperationIdentity,
     },
     Retire {
         workspace: WorkspaceName,
-        format: ImageFormat,
     },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AdoptRequest {
     pub repo: RepoId,
-    pub format: ImageFormat,
     /// Capacity main's image is minted at.
     pub capacity: ImageCapacity,
     pub topology_revision: Revision,
@@ -392,7 +379,6 @@ impl LifecyclePlanner for PurePlanner {
             }],
             operation: Operation::Adopt {
                 repo: request.repo,
-                format: request.format,
                 capacity: request.capacity,
                 source_checkout: request.source_checkout,
                 pre_cowshed_checkout: request.pre_cowshed_checkout,
@@ -411,7 +397,6 @@ impl LifecyclePlanner for PurePlanner {
             operation: Operation::Create {
                 source: from.name.clone(),
                 destination: destination.name,
-                format: from.format,
                 identity: destination.identity,
             },
         })
@@ -427,7 +412,6 @@ impl LifecyclePlanner for PurePlanner {
             operation: Operation::Fork {
                 source: from.name.clone(),
                 destination: destination.name,
-                format: from.format,
                 identity: destination.identity,
             },
         })
@@ -444,7 +428,6 @@ impl LifecyclePlanner for PurePlanner {
                 workspace: workspace.name.clone(),
                 label,
                 pin,
-                format: workspace.format,
             },
         })
     }
@@ -475,7 +458,6 @@ impl LifecyclePlanner for PurePlanner {
                 workspace: workspace.name.clone(),
                 label: checkpoint.label.clone(),
                 mode,
-                format: workspace.format,
                 identity,
             },
         })
@@ -488,7 +470,6 @@ impl LifecyclePlanner for PurePlanner {
             expected: vec![LifecycleFact::active(workspace)],
             operation: Operation::Retire {
                 workspace: workspace.name.clone(),
-                format: workspace.format,
             },
         })
     }
@@ -567,7 +548,6 @@ pub enum StorageGcReason {
     /// visible file gc names and keeps.
     OrphanMountpoint,
     ExpiredCheckpoint,
-    DetachedImageCompaction,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -576,7 +556,6 @@ pub struct StorageGcCandidate {
     path: PathBuf,
     bytes: u64,
     reason: StorageGcReason,
-    format: Option<ImageFormat>,
 }
 
 impl StorageGcCandidate {
@@ -585,14 +564,12 @@ impl StorageGcCandidate {
         path: PathBuf,
         bytes: u64,
         reason: StorageGcReason,
-        format: Option<ImageFormat>,
     ) -> Self {
         Self {
             identity,
             path,
             bytes,
             reason,
-            format,
         }
     }
 
@@ -610,10 +587,6 @@ impl StorageGcCandidate {
 
     pub const fn reason(&self) -> StorageGcReason {
         self.reason
-    }
-
-    pub(crate) const fn format(&self) -> Option<ImageFormat> {
-        self.format
     }
 }
 

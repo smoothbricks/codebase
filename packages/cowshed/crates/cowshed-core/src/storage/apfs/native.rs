@@ -18,14 +18,15 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::io::{AsRawFd, FromRawFd};
 
 use crate::apfs::{
-    ApfsBackend, ApfsError, AttachedImage, CommandRunner, CreateImageRequest, CreatedImage,
-    DetachIntent, DetachTarget, ImageFormatSelection, MacOsApfsBackend, MountAccess,
+    ApfsBackend, ApfsError, AttachedImage, CommandRunner, CreateImageRequest, DetachIntent,
+    DetachTarget, MacOsApfsBackend, MountAccess,
 };
 use crate::copy::copy_until_quiescent_blocking;
 use crate::metadata::{
-    DetachedWorkspaceMetadata, GRANTS_SIDECAR_SUFFIX, ImageCapacity, ImageFormat, MARKER_VERSION,
-    Platform, PublicationState, SIDECAR_VERSION, WorkspaceIncarnation, WorkspaceInfoSnapshot,
-    WorkspaceMarker, WorkspaceName, WorkspaceRole, sidecar_path,
+    DetachedWorkspaceMetadata, GRANTS_SIDECAR_SUFFIX, IMAGE_EXTENSION, ImageCapacity,
+    MARKER_VERSION, Platform, PublicationState, SIDECAR_VERSION, WorkspaceIncarnation,
+    WorkspaceInfoSnapshot, WorkspaceMarker, WorkspaceName, WorkspaceRole, is_image_path,
+    sidecar_path,
 };
 use crate::repository::{CHECKPOINTS_DIRECTORY, OwnedRepoIds, RepoId, SESSIONS_DIRECTORY};
 use crate::workspace_credentials::{
@@ -331,18 +332,17 @@ fn restore_recovery_fact(
             path.display()
         )));
     }
-    validate_restore_recovery_lineage(config, &fact, metadata.image_format)?;
+    validate_restore_recovery_lineage(config, &fact)?;
     Ok(fact)
 }
 
 fn validate_restore_recovery_lineage(
     config: &ApfsSubstrateConfig,
     fact: &RestoreRecoveryFactWire,
-    format: ImageFormat,
 ) -> Result<(), ApfsStorageError> {
     let storage = layout(config, &fact.repo_id)?;
     let source = storage
-        .checkpoint_image(&fact.workspace, &fact.source_checkpoint, format)?
+        .checkpoint_image(&fact.workspace, &fact.source_checkpoint)?
         .image()
         .to_owned();
     let source_metadata = DetachedWorkspaceMetadata::read_for_image(&source)
@@ -350,7 +350,6 @@ fn validate_restore_recovery_lineage(
     if source_metadata.repo_id != fact.repo_id
         || source_metadata.workspace != fact.workspace
         || source_metadata.workspace_incarnation != fact.source_incarnation
-        || source_metadata.image_format != format
     {
         return Err(ApfsStorageError::MarkerMismatch(format!(
             "restore recovery fact disagrees with checkpoint source metadata: source={}",
@@ -362,17 +361,15 @@ fn validate_restore_recovery_lineage(
         .checkpoints
         .join(fact.workspace.as_str())
         .join(format!(
-            "{}{}.{}",
+            "{}{}.{IMAGE_EXTENSION}",
             super::PRE_RESTORE_PREFIX,
             fact.destination_incarnation,
-            format.extension()
         ));
     let undo_metadata = DetachedWorkspaceMetadata::read_for_image(&undo)
         .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
     if undo_metadata.repo_id != fact.repo_id
         || undo_metadata.workspace != fact.workspace
         || undo_metadata.workspace_incarnation != fact.replaced_incarnation
-        || undo_metadata.image_format != format
     {
         return Err(ApfsStorageError::MarkerMismatch(format!(
             "restore recovery fact disagrees with replaced generation metadata: undo={}",
@@ -401,7 +398,6 @@ fn gc_reason_tag(reason: StorageGcReason) -> &'static [u8] {
         StorageGcReason::OrphanStagingMount => b"orphan-staging-mount",
         StorageGcReason::OrphanMountpoint => b"orphan-mountpoint",
         StorageGcReason::ExpiredCheckpoint => b"expired-checkpoint",
-        StorageGcReason::DetachedImageCompaction => b"detached-image-compaction",
     }
 }
 
@@ -409,7 +405,6 @@ fn gc_candidate(
     reason: StorageGcReason,
     path: &Path,
     associated_paths: &[PathBuf],
-    format: Option<ImageFormat>,
     extra_identity: &[u8],
 ) -> Result<StorageGcCandidate, ApfsStorageError> {
     let mut hasher = Sha256::new();
@@ -459,7 +454,6 @@ fn gc_candidate(
         path.to_owned(),
         bytes,
         reason,
-        format,
     ))
 }
 
@@ -828,11 +822,14 @@ fn dir_is_mounted(directory: &Path) -> Result<bool, ApfsStorageError> {
     Ok(directory_dev != parent_dev)
 }
 
-fn staged_image_format(path: &Path) -> Option<ImageFormat> {
-    let format = ImageFormat::from_image_path(path).ok()?;
-    let stem = path.file_stem()?.to_str()?;
-    staged_stem_workspace(stem)?;
-    Some(format)
+/// A staged image: `<name>-<incarnation>.asif` under the staging namespace.
+fn is_staged_image(path: &Path) -> bool {
+    is_image_path(path)
+        && path
+            .file_stem()
+            .and_then(OsStr::to_str)
+            .and_then(staged_stem_workspace)
+            .is_some()
 }
 
 /// The workspace a staging stem (`<name>-<incarnation>`, or the `recover-` prefixed form recovery
@@ -898,12 +895,12 @@ struct MountedAttachment {
 }
 
 struct RetiredCheckpointArtifacts {
-    images: Vec<(PathBuf, ImageFormat)>,
+    images: Vec<PathBuf>,
     paths: Vec<PathBuf>,
 }
 
 struct RetiredCleanupArtifacts {
-    checkpoint_images: Vec<(PathBuf, ImageFormat)>,
+    checkpoint_images: Vec<PathBuf>,
     paths: Vec<PathBuf>,
     mount_point: Option<PathBuf>,
 }
@@ -927,11 +924,9 @@ enum NameScope {
 /// Read off the trash filenames rather than each sidecar because `retired_authority` already proves
 /// the two agree for every entry a plan contains, and because this answer must be identical during
 /// preview and at execution time or every plan would revalidate as stale.
-fn retired_name_owners(
-    images: &[(PathBuf, ImageFormat)],
-) -> BTreeMap<WorkspaceName, WorkspaceIncarnation> {
+fn retired_name_owners(images: &[PathBuf]) -> BTreeMap<WorkspaceName, WorkspaceIncarnation> {
     let mut owners = BTreeMap::new();
-    for (image, _) in images {
+    for image in images {
         let Some((name, incarnation)) = image
             .file_stem()
             .and_then(|stem| stem.to_str())
@@ -1076,7 +1071,7 @@ impl MountedRegistry {
 }
 
 /// Real filesystem adapter for [`super::ApfsSubstrate`]. Native image commands are never
-/// reconstructed here: every create/clone/attach/fsck/mount/detach/delete/compact operation is
+/// reconstructed here: every create/clone/attach/fsck/mount/detach/delete operation is
 /// delegated to [`MacOsApfsBackend`].
 pub struct MacOsApfsExecutionHost<R> {
     backend: MacOsApfsBackend<R>,
@@ -1208,31 +1203,22 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
         repo: &RepoId,
         workspace: &WorkspaceName,
     ) -> Result<Option<(PathBuf, DetachedWorkspaceMetadata)>, ApfsStorageError> {
-        let layout = layout(&self.config, repo)?;
-        let mut found = None;
-        for format in [ImageFormat::Asif, ImageFormat::Sparse] {
-            let image = layout
-                .canonical_image(workspace, format)?
-                .image()
-                .to_owned();
-            if image.exists() {
-                if found.is_some() {
-                    return Err(ApfsStorageError::Host(format!(
-                        "duplicate ASIF/SPARSE stem for {repo}/{workspace}"
-                    )));
-                }
-                let metadata = DetachedWorkspaceMetadata::read_for_image(&image)
-                    .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
-                if metadata.repo_id != *repo || metadata.workspace != *workspace {
-                    return Err(ApfsStorageError::Host(format!(
-                        "detached metadata identity mismatch for {}",
-                        image.display()
-                    )));
-                }
-                found = Some((image, metadata));
-            }
+        let image = layout(&self.config, repo)?
+            .canonical_image(workspace)?
+            .image()
+            .to_owned();
+        if !image.exists() {
+            return Ok(None);
         }
-        Ok(found)
+        let metadata = DetachedWorkspaceMetadata::read_for_image(&image)
+            .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
+        if metadata.repo_id != *repo || metadata.workspace != *workspace {
+            return Err(ApfsStorageError::Host(format!(
+                "detached metadata identity mismatch for {}",
+                image.display()
+            )));
+        }
+        Ok(Some((image, metadata)))
     }
 
     fn find_checkpoint(
@@ -1241,26 +1227,16 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
         workspace: &WorkspaceName,
         label: &CheckpointLabel,
     ) -> Result<Option<DetachedWorkspaceMetadata>, ApfsStorageError> {
-        let layout = layout(&self.config, repo)?;
-        let mut found = None;
-        for format in [ImageFormat::Asif, ImageFormat::Sparse] {
-            let image = layout
-                .checkpoint_image(workspace, label, format)?
-                .image()
-                .to_owned();
-            if image.exists() {
-                if found.is_some() {
-                    return Err(ApfsStorageError::Host(format!(
-                        "duplicate checkpoint formats for {repo}/{workspace}/{label}"
-                    )));
-                }
-                found = Some(
-                    DetachedWorkspaceMetadata::read_for_image(&image)
-                        .map_err(|error| ApfsStorageError::Host(error.to_string()))?,
-                );
-            }
+        let image = layout(&self.config, repo)?
+            .checkpoint_image(workspace, label)?
+            .image()
+            .to_owned();
+        if !image.exists() {
+            return Ok(None);
         }
-        Ok(found)
+        DetachedWorkspaceMetadata::read_for_image(&image)
+            .map(Some)
+            .map_err(|error| ApfsStorageError::Host(error.to_string()))
     }
 
     fn observed_workspace(
@@ -1560,7 +1536,7 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
             });
         }
         let entries = read_dir_paths(&layout.project().sessions, "enumerate session images")?;
-        for discovered in discover_session_images(entries)? {
+        for discovered in discover_session_images(entries) {
             let metadata = DetachedWorkspaceMetadata::read_for_image(discovered.path())
                 .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
             if metadata.repo_id != *repo || metadata.workspace != *discovered.workspace() {
@@ -1636,42 +1612,9 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
         Ok(())
     }
 
-    fn kernel_mount_fact(
-        &self,
-        metadata: &DetachedWorkspaceMetadata,
-    ) -> Result<Option<KernelMountFact>, ApfsStorageError> {
-        let expected = self.expected_mount_point(metadata)?;
-        let Some(mount) = self
-            .mount_source
-            .mounts()?
-            .into_iter()
-            .find(|mount| mount.mount_point == expected)
-        else {
-            return Ok(None);
-        };
-        self.validate_kernel_mount(
-            &mount,
-            &expected,
-            &metadata.repo_id,
-            &metadata.workspace,
-            &metadata.workspace_incarnation,
-        )?;
-        Ok(Some(KernelMountFact {
-            mount_id: mount.mount_id,
-            volume_key: volume_key(&metadata.repo_id, &metadata.workspace),
-        }))
-    }
-
-    fn image_is_kernel_mounted(&self, image: &Path) -> Result<bool, ApfsStorageError> {
-        let metadata = DetachedWorkspaceMetadata::read_for_image(image)
-            .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
-        Ok(self.kernel_mount_fact(&metadata)?.is_some())
-    }
-
     fn detached_image_incarnation(
         &self,
         image: &Path,
-        format: ImageFormat,
         mount_point: &Path,
     ) -> Result<String, ApfsStorageError>
     where
@@ -1682,7 +1625,7 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
         }
         fs::create_dir_all(mount_point)
             .map_err(|error| io_error("create recovery mount", mount_point, error))?;
-        let attachment = self.backend.attach_verified(image, format)?;
+        let attachment = self.backend.attach_verified(image)?;
         if let Err(primary) =
             self.backend
                 .mount(&attachment, mount_point, MountAccess::ReadOnly, false)
@@ -1720,11 +1663,7 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
         }
     }
 
-    fn transient_lock_path(
-        project: &Path,
-        image: &Path,
-        format: ImageFormat,
-    ) -> Result<PathBuf, ApfsStorageError> {
+    fn transient_lock_path(project: &Path, image: &Path) -> Result<PathBuf, ApfsStorageError> {
         let stem = image
             .file_stem()
             .and_then(|value| value.to_str())
@@ -1744,11 +1683,11 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
             _ => stem,
         };
         let image = if workspace == "main" {
-            project.join(format!("main.{}", format.extension()))
+            project.join(format!("main.{IMAGE_EXTENSION}"))
         } else {
             project
                 .join(SESSIONS_DIRECTORY)
-                .join(format!("{workspace}.{}", format.extension()))
+                .join(format!("{workspace}.{IMAGE_EXTENSION}"))
         };
         let mut lock: OsString = image.as_os_str().to_owned();
         lock.push(".lock");
@@ -1780,26 +1719,23 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
         project: &Path,
         repo: &RepoId,
         trash_image: &Path,
-        format: ImageFormat,
     ) -> Result<RetiredRef, ApfsStorageError> {
         let metadata = DetachedWorkspaceMetadata::read_for_image(trash_image)
             .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
         // Trash path and sidecar identity, not canonical publication state, authorize
         // reclamation. An unfinished clone can be retired without becoming runnable.
-        if metadata.repo_id != *repo || metadata.image_format != format {
+        if metadata.repo_id != *repo {
             return Err(ApfsStorageError::MarkerMismatch(format!(
                 "retired metadata disagrees with trash image {}",
                 trash_image.display()
             )));
         }
         let workspace = metadata_workspace_ref(&metadata)?;
-        // `format` is the enumeration's observed on-disk format, deliberately not the metadata's:
-        // the check is that the found file sits exactly where its own format says it should.
+        // The found file must sit exactly where its own sidecar says the retirement put it.
         let expected_trash = retired_image_below(
             &project.join(SESSIONS_DIRECTORY),
             workspace.name(),
             workspace.incarnation(),
-            format,
         );
         if trash_image != expected_trash {
             return Err(ApfsStorageError::MarkerMismatch(format!(
@@ -1859,7 +1795,7 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
                 return Err(io_error("enumerate retired checkpoints", &directory, error));
             }
         };
-        let mut images = BTreeMap::new();
+        let mut images = BTreeSet::new();
         for path in &entries {
             let metadata = fs::symlink_metadata(path)
                 .map_err(|error| io_error("inspect retired checkpoint artifact", path, error))?;
@@ -1869,8 +1805,8 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
                     path.display()
                 )));
             }
-            if let Ok(format) = ImageFormat::from_image_path(path) {
-                images.insert(path.clone(), format);
+            if is_image_path(path) {
+                images.insert(path.clone());
                 continue;
             }
             if path
@@ -1879,8 +1815,8 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
                 .is_some_and(|name| name.ends_with(GRANTS_SIDECAR_SUFFIX))
             {
                 let image = image_from_sidecar(path)?;
-                if let Ok(format) = ImageFormat::from_image_path(&image) {
-                    images.entry(image).or_insert(format);
+                if is_image_path(&image) {
+                    images.insert(image);
                 }
             }
         }
@@ -1888,12 +1824,11 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
 
         let mut expected = BTreeSet::new();
         let mut labels = BTreeSet::new();
-        for (image, format) in &images {
+        for image in &images {
             let metadata = DetachedWorkspaceMetadata::read_for_image(image)
                 .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
             if metadata.repo_id != *retired.workspace().repo()
                 || metadata.workspace != *retired.workspace().name()
-                || metadata.image_format != *format
                 || metadata.publication_state != PublicationState::Active
             {
                 return Err(ApfsStorageError::MarkerMismatch(format!(
@@ -2036,13 +1971,12 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
         project: &Path,
         repo: &RepoId,
         trash_image: &Path,
-        format: ImageFormat,
         expected: Option<&RetiredRef>,
     ) -> Result<(), ApfsStorageError>
     where
         R: CommandRunner + Send + Sync + 'static,
     {
-        let authority = self.retired_authority(project, repo, trash_image, format)?;
+        let authority = self.retired_authority(project, repo, trash_image)?;
         if expected.is_some_and(|expected| expected.workspace() != authority.workspace()) {
             return Err(ApfsStorageError::MarkerMismatch(format!(
                 "retired cleanup authority changed for {}",
@@ -2061,8 +1995,8 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
             owners.get(authority.workspace().name()),
         )?;
         let cleanup = self.retired_cleanup_artifacts(project, &authority, trash_image, scope)?;
-        for (image, image_format) in cleanup.checkpoint_images {
-            self.reclaim_image(&image, image_format)?;
+        for image in cleanup.checkpoint_images {
+            self.reclaim_image(&image)?;
         }
         if scope == NameScope::Owned {
             let checkpoint_directory = project
@@ -2109,17 +2043,14 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
                 }
             }
         }
-        self.reclaim_image(trash_image, format)
+        self.reclaim_image(trash_image)
     }
 
-    fn retired_trash_images(
-        &self,
-        trash: &Path,
-    ) -> Result<Vec<(PathBuf, ImageFormat)>, ApfsStorageError> {
-        let mut images = BTreeMap::new();
+    fn retired_trash_images(&self, trash: &Path) -> Result<Vec<PathBuf>, ApfsStorageError> {
+        let mut images = BTreeSet::new();
         for path in regular_file_children(trash)? {
-            if let Ok(format) = ImageFormat::from_image_path(&path) {
-                images.insert(path, format);
+            if is_image_path(&path) {
+                images.insert(path);
                 continue;
             }
             if path
@@ -2128,8 +2059,8 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
                 .is_some_and(|name| name.ends_with(GRANTS_SIDECAR_SUFFIX))
             {
                 let image = image_from_sidecar(&path)?;
-                if let Ok(format) = ImageFormat::from_image_path(&image) {
-                    images.entry(image).or_insert(format);
+                if is_image_path(&image) {
+                    images.insert(image);
                 }
             }
         }
@@ -2157,7 +2088,7 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
                     continue;
                 }
                 let canonical = image_from_sidecar(&sidecar)?;
-                if canonical.exists() || ImageFormat::from_image_path(&canonical).is_err() {
+                if canonical.exists() || !is_image_path(&canonical) {
                     continue;
                 }
                 let Ok(metadata) = DetachedWorkspaceMetadata::read_for_image(&canonical) else {
@@ -2198,17 +2129,12 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
     }
 
     /// Detach a staging mountpoint if the kernel still holds a volume there, then remove the
-    /// directory. The format picks the detach tool; a mount whose image is gone is detached as a
-    /// sparse image, the only format `hdiutil` attaches under a plain mountpoint.
+    /// directory.
     ///
     /// Returns whether the directory was actually removed: an already-absent mountpoint is
     /// success without removal, and the caller logs a tombstone only for a real removal so
     /// the deletion log never claims an unlink that did not happen.
-    fn retire_staging_mount(
-        &self,
-        mount_point: &Path,
-        format: ImageFormat,
-    ) -> Result<bool, ApfsStorageError>
+    fn retire_staging_mount(&self, mount_point: &Path) -> Result<bool, ApfsStorageError>
     where
         R: CommandRunner,
     {
@@ -2218,11 +2144,8 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
             .into_iter()
             .any(|mount| mount.mount_point == mount_point);
         if mounted {
-            self.backend.detach_target(
-                format,
-                DetachTarget::MountPoint(mount_point),
-                DetachIntent::Release,
-            )?;
+            self.backend
+                .detach_target(DetachTarget::MountPoint(mount_point), DetachIntent::Release)?;
         }
         match fs::remove_dir(mount_point) {
             Ok(()) => sync_parent_path(mount_point).map(|()| true),
@@ -2270,8 +2193,8 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
         // mount root is an orphan directory.
         let mut named_mountpoints: BTreeSet<String> = BTreeSet::new();
         named_mountpoints.insert(WorkspaceName::main().as_str().to_owned());
-        for (path, format) in trash_images {
-            let retired = self.retired_authority(project, repo, &path, format)?;
+        for path in trash_images {
+            let retired = self.retired_authority(project, repo, &path)?;
             named_mountpoints.insert(retired.workspace().name().as_str().to_owned());
             let scope = self.retired_name_scope(
                 retired.workspace(),
@@ -2290,13 +2213,11 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
                 &self.config,
                 repo,
                 retired.workspace().name(),
-                format,
             )?);
             candidates.push(gc_candidate(
                 StorageGcReason::RetiredWorkspace,
                 &path,
                 &artifacts,
-                Some(format),
                 &[],
             )?);
         }
@@ -2310,11 +2231,11 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
         // the mount root were never enumerated at all. So every staging entry is judged by
         // those two signs: owned is retained (and counted), unowned is garbage.
         let staging = project.join(super::STAGING_NAMESPACE);
-        let mut staged_images = BTreeMap::new();
+        let mut staged_images = BTreeSet::new();
         let mut staged_sidecars = BTreeMap::new();
         for path in regular_file_children(&staging)? {
-            if let Some(format) = staged_image_format(&path) {
-                staged_images.insert(path, format);
+            if is_staged_image(&path) {
+                staged_images.insert(path);
                 continue;
             }
             if path
@@ -2323,14 +2244,14 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
                 .is_some_and(|name| name.ends_with(GRANTS_SIDECAR_SUFFIX))
             {
                 let image = image_from_sidecar(&path)?;
-                if staged_image_format(&image).is_some() {
+                if is_staged_image(&image) {
                     staged_sidecars.insert(image, path);
                 }
             }
         }
         let recoverable = self.recoverable_staged_stems(project, repo)?;
         let mut staged_stems = BTreeSet::new();
-        for (image, format) in &staged_images {
+        for image in &staged_images {
             examined = examined
                 .checked_add(1)
                 .ok_or(ApfsStorageError::InvalidPlan("GC examined count overflow"))?;
@@ -2340,7 +2261,7 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
                 .map(str::to_owned)
                 .unwrap_or_default();
             staged_stems.insert(stem.clone());
-            let lock = Self::transient_lock_path(project, image, *format)?;
+            let lock = Self::transient_lock_path(project, image)?;
             if recoverable.contains(&stem) || !self.lock_is_free(&lock, held_locks)? {
                 retained_active = retained_active
                     .checked_add(1)
@@ -2352,21 +2273,17 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
                 StorageGcReason::OrphanStagingImage,
                 image,
                 &image_gc_paths(image),
-                Some(*format),
                 &[],
             )?);
         }
         for (image, sidecar) in &staged_sidecars {
-            if staged_images.contains_key(image) {
+            if staged_images.contains(image) {
                 continue;
             }
             examined = examined
                 .checked_add(1)
                 .ok_or(ApfsStorageError::InvalidPlan("GC examined count overflow"))?;
-            let Some(format) = staged_image_format(image) else {
-                continue;
-            };
-            let lock = Self::transient_lock_path(project, image, format)?;
+            let lock = Self::transient_lock_path(project, image)?;
             if !self.lock_is_free(&lock, held_locks)? {
                 retained_active = retained_active
                     .checked_add(1)
@@ -2378,7 +2295,6 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
                 StorageGcReason::OrphanStagingMetadata,
                 sidecar,
                 std::slice::from_ref(sidecar),
-                None,
                 &[],
             )?);
         }
@@ -2408,7 +2324,6 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
                         StorageGcReason::OrphanStagingMount,
                         &mount_point,
                         &[],
-                        None,
                         &[],
                     )?);
                 }
@@ -2420,28 +2335,18 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
             examined = examined
                 .checked_add(1)
                 .ok_or(ApfsStorageError::InvalidPlan("GC examined count overflow"))?;
-            let locks = [
-                super::workspace_lock_path(&self.config, repo, &workspace, ImageFormat::Sparse)?,
-                super::workspace_lock_path(&self.config, repo, &workspace, ImageFormat::Asif)?,
-            ];
-            let mut free = true;
-            for lock in &locks {
-                if !self.lock_is_free(lock, held_locks)? {
-                    free = false;
-                }
-            }
-            if !free {
+            let lock = super::workspace_lock_path(&self.config, repo, &workspace)?;
+            if !self.lock_is_free(&lock, held_locks)? {
                 retained_active = retained_active
                     .checked_add(1)
                     .ok_or(ApfsStorageError::InvalidPlan("GC retained count overflow"))?;
                 continue;
             }
-            lock_paths.extend(locks);
+            lock_paths.push(lock);
             candidates.push(gc_candidate(
                 StorageGcReason::OrphanStagingMount,
                 &mount_point,
                 &[],
-                None,
                 &[],
             )?);
         }
@@ -2466,14 +2371,13 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
             }
             let mut checkpoints = Vec::new();
             for image in regular_file_children(&workspace_directory)? {
-                let Ok(format) = ImageFormat::from_image_path(&image) else {
+                if !is_image_path(&image) {
                     continue;
-                };
+                }
                 lock_paths.push(super::workspace_lock_path(
                     &self.config,
                     repo,
                     &workspace_name,
-                    format,
                 )?);
                 let fact_path = checkpoint_fact_path(&image);
                 if !fact_path.exists() {
@@ -2503,11 +2407,11 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
                 let modified = fs::metadata(&image)
                     .and_then(|metadata| metadata.modified())
                     .map_err(|error| io_error("read checkpoint age", &image, error))?;
-                checkpoints.push((modified, image, format, fact));
+                checkpoints.push((modified, image, fact));
             }
             checkpoints
                 .sort_by(|left, right| right.0.cmp(&left.0).then_with(|| right.1.cmp(&left.1)));
-            for (index, (modified, image, format, fact)) in checkpoints.into_iter().enumerate() {
+            for (index, (modified, image, fact)) in checkpoints.into_iter().enumerate() {
                 examined = examined
                     .checked_add(1)
                     .ok_or(ApfsStorageError::InvalidPlan("GC examined count overflow"))?;
@@ -2533,51 +2437,13 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
                     StorageGcReason::ExpiredCheckpoint,
                     &image,
                     &image_gc_paths(&image),
-                    Some(format),
                     &identity,
                 )?);
             }
         }
 
-        for discovered in discover_session_images(session_entries)? {
+        for discovered in discover_session_images(session_entries) {
             named_mountpoints.insert(discovered.workspace().as_str().to_owned());
-            if discovered.format() != ImageFormat::Sparse {
-                continue;
-            }
-            let path = discovered.path();
-            lock_paths.push(Self::lock_path_for_image(path));
-            if self.image_is_kernel_mounted(path)? {
-                continue;
-            }
-            let metadata = DetachedWorkspaceMetadata::read_for_image(path)
-                .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
-            if metadata.repo_id != *repo
-                || metadata.workspace != *discovered.workspace()
-                || metadata.image_format != discovered.format()
-            {
-                return Err(ApfsStorageError::MarkerMismatch(format!(
-                    "detached metadata disagrees with session image {}",
-                    path.display()
-                )));
-            }
-            // An unpublished clone is lifecycle state, not a detached image: its create's intent
-            // finishes it, or the project retires it once nothing is creating it. Refusing it
-            // here failed the reclaim of everything else in the project along with it.
-            if metadata.publication_state == PublicationState::PendingFence {
-                continue;
-            }
-            examined = examined
-                .checked_add(1)
-                .ok_or(ApfsStorageError::InvalidPlan("GC examined count overflow"))?;
-            let identity = serde_json::to_vec(&metadata)
-                .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
-            candidates.push(gc_candidate(
-                StorageGcReason::DetachedImageCompaction,
-                path,
-                std::slice::from_ref(&path.to_owned()),
-                Some(ImageFormat::Sparse),
-                &identity,
-            )?);
         }
 
         candidates.sort_by(|left, right| {
@@ -2610,7 +2476,6 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
                     StorageGcReason::OrphanMountpoint,
                     &path,
                     &[],
-                    None,
                     &[],
                 )?);
             }
@@ -2657,30 +2522,18 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
         for candidate in plan.candidates() {
             match candidate.reason() {
                 StorageGcReason::RetiredWorkspace => {
-                    let format = candidate.format().ok_or(ApfsStorageError::InvalidPlan(
-                        "retired workspace GC candidate has no format",
-                    ))?;
-                    self.reclaim_retired_authority(
-                        project,
-                        plan.repo(),
-                        candidate.path(),
-                        format,
-                        None,
-                    )?;
+                    self.reclaim_retired_authority(project, plan.repo(), candidate.path(), None)?;
                     report.freed_bytes = report.freed_bytes.checked_add(candidate.bytes()).ok_or(
                         ApfsStorageError::InvalidPlan("GC freed byte accounting overflow"),
                     )?;
                 }
                 StorageGcReason::OrphanStagingImage => {
-                    let format = candidate.format().ok_or(ApfsStorageError::InvalidPlan(
-                        "image GC candidate has no format",
-                    ))?;
                     // The volume first: an image deleted under a live attachment keeps its
                     // blocks until the kernel lets go, and the mountpoint would outlive it.
                     if let Some(stem) = candidate.path().file_stem().and_then(|stem| stem.to_str())
                     {
                         let mount_point = self.staging_mount_point(plan.repo(), stem)?;
-                        if self.retire_staging_mount(&mount_point, format)? {
+                        if self.retire_staging_mount(&mount_point)? {
                             let workspace = staged_stem_workspace(stem)
                                 .map(|name| name.as_str().to_owned())
                                 .unwrap_or_default();
@@ -2694,7 +2547,7 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
                             );
                         }
                     }
-                    self.reclaim_image(candidate.path(), format)?;
+                    self.reclaim_image(candidate.path())?;
                     report.freed_bytes = report.freed_bytes.checked_add(candidate.bytes()).ok_or(
                         ApfsStorageError::InvalidPlan("GC freed byte accounting overflow"),
                     )?;
@@ -2707,7 +2560,7 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
                         .and_then(staged_stem_workspace)
                         .is_some();
                     if parses {
-                        if self.retire_staging_mount(candidate.path(), ImageFormat::Sparse)? {
+                        if self.retire_staging_mount(candidate.path())? {
                             let workspace = candidate
                                 .path()
                                 .file_name()
@@ -2801,10 +2654,7 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
                     }
                 }
                 StorageGcReason::ExpiredCheckpoint => {
-                    let format = candidate.format().ok_or(ApfsStorageError::InvalidPlan(
-                        "image GC candidate has no format",
-                    ))?;
-                    self.reclaim_image(candidate.path(), format)?;
+                    self.reclaim_image(candidate.path())?;
                     report.freed_bytes = report.freed_bytes.checked_add(candidate.bytes()).ok_or(
                         ApfsStorageError::InvalidPlan("GC freed byte accounting overflow"),
                     )?;
@@ -2834,24 +2684,6 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
                     report.freed_bytes = report.freed_bytes.checked_add(candidate.bytes()).ok_or(
                         ApfsStorageError::InvalidPlan("GC freed byte accounting overflow"),
                     )?;
-                }
-                StorageGcReason::DetachedImageCompaction => {
-                    let before =
-                        allocated_file_bytes(&fs::metadata(candidate.path()).map_err(|error| {
-                            io_error("read pre-compaction statistics", candidate.path(), error)
-                        })?);
-                    self.backend
-                        .compact_image(candidate.path(), ImageFormat::Sparse)?;
-                    let after =
-                        allocated_file_bytes(&fs::metadata(candidate.path()).map_err(|error| {
-                            io_error("read post-compaction statistics", candidate.path(), error)
-                        })?);
-                    report.freed_bytes = report
-                        .freed_bytes
-                        .checked_add(before.saturating_sub(after))
-                        .ok_or(ApfsStorageError::InvalidPlan(
-                            "GC freed byte accounting overflow",
-                        ))?;
                 }
             }
             report.reclaimed = report
@@ -3037,38 +2869,7 @@ where
             .collect()
     }
 
-    fn resolve_format(
-        &self,
-        repo: &RepoId,
-        workspace: &WorkspaceName,
-    ) -> Result<ImageFormat, ApfsStorageError> {
-        let (image, metadata) =
-            self.find_canonical_image(repo, workspace)?
-                .ok_or(ApfsStorageError::Host(format!(
-                    "published workspace is missing: {repo}/{workspace}"
-                )))?;
-        if metadata.publication_state == PublicationState::PendingFence {
-            return Err(ApfsStorageError::PendingPublication(image));
-        }
-        Ok(metadata.image_format)
-    }
-
-    fn create_staged(
-        &self,
-        request: &CreateImageRequest,
-        requested: ImageFormat,
-    ) -> Result<CreatedImage, ApfsStorageError> {
-        let valid_selection = match requested {
-            ImageFormat::Asif => request.image_format == ImageFormatSelection::Auto,
-            ImageFormat::Sparse => {
-                request.image_format == ImageFormatSelection::Exact(ImageFormat::Sparse)
-            }
-        };
-        if !valid_selection {
-            return Err(ApfsStorageError::InvalidPlan(
-                "lifecycle image format selection disagrees with the plan",
-            ));
-        }
+    fn create_staged(&self, request: &CreateImageRequest) -> Result<PathBuf, ApfsStorageError> {
         self.verify_controller_path(&request.staged_stem)?;
         Self::ensure_parent(&request.staged_stem)?;
         self.backend
@@ -3081,21 +2882,18 @@ where
         source: &Path,
         source_mount: Option<&Path>,
         destination: &Path,
-        format: ImageFormat,
     ) -> Result<(), ApfsStorageError> {
         self.verify_controller_path(source)?;
         self.verify_controller_path(destination)?;
         DetachedWorkspaceMetadata::read_for_image(source)
             .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
-        format
-            .validate_path(source)
-            .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
-        format
-            .validate_path(destination)
-            .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
+        for path in [source, destination] {
+            crate::metadata::validate_image_path(path)
+                .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
+        }
         Self::ensure_parent(destination)?;
         self.backend
-            .sync_and_clone(source, source_mount, destination, format)
+            .sync_and_clone(source, source_mount, destination)
             .map_err(Into::into)
     }
 
@@ -3105,11 +2903,10 @@ where
         source: &LifecycleWorkspace,
         destination: &WorkspaceName,
         destination_topology: Revision,
-        format: ImageFormat,
         requested_identity: &OperationIdentity,
     ) -> Result<Option<ResumableClone>, ApfsStorageError> {
         let image = layout(config, source.repo())?
-            .session_image(destination, format)?
+            .session_image(destination)?
             .image()
             .to_owned();
         let sidecar = sidecar_path(&image);
@@ -3135,7 +2932,6 @@ where
             expected_revision,
             Revision::new(destination_topology.get() + 1),
             WorkspaceRole::Workspace,
-            metadata.image_format,
         )
         .map_err(|_| {
             ApfsStorageError::MarkerMismatch(format!(
@@ -3145,7 +2941,7 @@ where
         })?;
         let info = &metadata.info_snapshot;
         // Every leg but base_commit guards structural identity: wrong repo, slot, role,
-        // format, generation, checkout, branch, ancestry, or worktree mode resumes into
+        // generation, checkout, branch, ancestry, or worktree mode resumes into
         // the wrong workspace and must refuse. Base commit is provenance, not identity —
         // the resumed record keeps the residue's own base (see `identity` below), and a
         // workspace forked from an older main is routine: rebase and land reconcile lag
@@ -3154,7 +2950,6 @@ where
         if workspace.repo() != source.repo()
             || workspace.name() != destination
             || workspace.role() != WorkspaceRole::Workspace
-            || workspace.format() != format
             || metadata.grants.revision != expected_revision.get()
             || info.project_root != requested_identity.project_root
             || info.branch != requested_identity.branch
@@ -3203,7 +2998,7 @@ where
                 continue;
             }
             let image = image_from_sidecar(&sidecar)?;
-            if !image.exists() || companion_path(&image).exists() {
+            if !is_image_path(&image) || !image.exists() || companion_path(&image).exists() {
                 continue;
             }
             let metadata = DetachedWorkspaceMetadata::read_for_image(&image)
@@ -3216,10 +3011,7 @@ where
             {
                 continue;
             }
-            let candidate = ResumableStage {
-                image,
-                format: metadata.image_format,
-            };
+            let candidate = ResumableStage { image };
             if resumable.replace(candidate).is_some() {
                 return Err(ApfsStorageError::MarkerMismatch(format!(
                     "multiple incomplete adoption stages match {}",
@@ -3237,20 +3029,10 @@ where
             .map_err(|error| ApfsStorageError::Host(error.to_string()))
     }
 
-    fn attach_verified(
-        &self,
-        image: &Path,
-        format: ImageFormat,
-    ) -> Result<Self::Attachment, ApfsStorageError> {
+    fn attach_verified(&self, image: &Path) -> Result<Self::Attachment, ApfsStorageError> {
         self.verify_controller_path(image)?;
         let metadata = DetachedWorkspaceMetadata::read_for_image(image)
             .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
-        if metadata.image_format != format {
-            return Err(ApfsStorageError::Host(format!(
-                "detached metadata format disagrees with requested attachment for {}",
-                image.display()
-            )));
-        }
         if metadata.publication_state == PublicationState::PendingFence
             && !image
                 .components()
@@ -3258,9 +3040,7 @@ where
         {
             return Err(ApfsStorageError::PendingPublication(image.to_owned()));
         }
-        self.backend
-            .attach_verified(image, format)
-            .map_err(Into::into)
+        self.backend.attach_verified(image).map_err(Into::into)
     }
 
     fn mount(
@@ -3279,9 +3059,8 @@ where
     fn attach_and_mount_resumable(
         &self,
         image: &Path,
-        format: ImageFormat,
         mount_point: &Path,
-        workspace: &LifecycleWorkspace,
+        _workspace: &LifecycleWorkspace,
     ) -> Result<Self::Attachment, ApfsStorageError> {
         self.verify_controller_path(image)?;
         self.verify_controller_path(mount_point)?;
@@ -3292,7 +3071,7 @@ where
             .find(|mount| mount.mount_point == mount_point);
         let existing = self
             .backend
-            .existing_attachment(image, format)
+            .existing_attachment(image)
             .map_err(ApfsStorageError::from)?;
 
         if let Some(mount) = mounted {
@@ -3313,11 +3092,6 @@ where
                     attachment.volume_device()
                 )));
             }
-            if workspace.format() != attachment.format() {
-                return Err(ApfsStorageError::InvalidPlan(
-                    "pending clone attachment format disagrees with workspace",
-                ));
-            }
             return Ok(attachment);
         }
 
@@ -3331,7 +3105,7 @@ where
         }
         let attachment = self
             .backend
-            .attach_verified(image, format)
+            .attach_verified(image)
             .map_err(ApfsStorageError::from)?;
         match self.mount(&attachment, mount_point, MountAccess::ReadWrite, false) {
             Ok(()) => Ok(attachment),
@@ -3343,35 +3117,6 @@ where
                     cleanup: Box::new(cleanup),
                 }),
             },
-        }
-    }
-
-    fn chown_volume_root(&self, mount_point: &Path) -> Result<(), ApfsStorageError> {
-        self.verify_controller_path(mount_point)?;
-        #[cfg(unix)]
-        {
-            let path = CString::new(mount_point.as_os_str().as_bytes())
-                .map_err(|_| ApfsStorageError::Host("mount point contains NUL".to_owned()))?;
-            // SAFETY: `path` is a `CString`, so the pointer is NUL-terminated and
-            // lives for the call. `getuid`/`getgid` read this process's credentials;
-            // they take no pointers and cannot fail.
-            let result = unsafe { libc::chown(path.as_ptr(), libc::getuid(), libc::getgid()) };
-            if result == 0 {
-                Ok(())
-            } else {
-                Err(io_error(
-                    "chown ASIF volume root",
-                    mount_point,
-                    io::Error::last_os_error(),
-                ))
-            }
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = mount_point;
-            Err(ApfsStorageError::Host(
-                "ASIF ownership transfer requires a Unix host".to_owned(),
-            ))
         }
     }
 
@@ -3430,7 +3175,6 @@ where
             && existing.workspace == *workspace.name()
             && existing.workspace_incarnation == *workspace.incarnation()
             && existing.role == workspace.role()
-            && existing.image_format == workspace.format()
             && existing.base_commit == identity.base_commit
             && existing.created_at == identity.created_at
             && existing.forked_from.as_ref() == forked_from
@@ -3456,7 +3200,6 @@ where
             workspace: workspace.name().clone(),
             workspace_incarnation: workspace.incarnation().clone(),
             role: workspace.role(),
-            image_format: workspace.format(),
             base_commit: identity.base_commit.clone(),
             created_at: identity.created_at.clone(),
             forked_from: forked_from.cloned(),
@@ -3486,7 +3229,6 @@ where
         if expected.repos.accepts(&marker.repo_id)
             && marker.workspace == expected.workspace
             && marker.workspace_incarnation == expected.incarnation
-            && marker.image_format == expected.format
         {
             validate_public_workspace_assets(
                 &expected.repos,
@@ -3497,11 +3239,10 @@ where
             .map_err(|error| ApfsStorageError::MarkerMismatch(error.to_string()))
         } else {
             Err(ApfsStorageError::MarkerMismatch(format!(
-                "{} does not match {}/{}/{:?}",
+                "{} does not match {}/{}",
                 marker_path.display(),
                 expected.repos,
                 expected.workspace,
-                expected.format
             )))
         }
     }
@@ -3625,11 +3366,7 @@ where
             }
             return self
                 .backend
-                .detach_target(
-                    workspace.format(),
-                    DetachTarget::MountPoint(&mount_point),
-                    intent,
-                )
+                .detach_target(DetachTarget::MountPoint(&mount_point), intent)
                 .map_err(Into::into);
         };
         let result = self.backend.detach(&entry.attachment, intent);
@@ -3664,14 +3401,13 @@ where
     ) -> Result<ResizeOutcome, ApfsStorageError> {
         self.verify_controller_path(image)?;
         self.verify_controller_path(mount_point)?;
-        let format = workspace.format();
         // The capacity to compare against comes from whichever authority can see the image right
         // now: the kernel's attachment inventory while it is attached, the image's own resize
         // limits while it is not. Reading it before anything is detached keeps a refused resize
         // from disturbing a live workspace.
         let previous = match self.backend.attached_capacity(image) {
             Ok(capacity) => capacity,
-            Err(ApfsError::ImageNotAttached(_)) => self.backend.image_capacity(image, format)?,
+            Err(ApfsError::ImageNotAttached(_)) => self.backend.image_capacity(image)?,
             Err(error) => return Err(error.into()),
         };
         if capacity <= previous {
@@ -3687,9 +3423,9 @@ where
             .into_iter()
             .any(|mount| mount.mount_point == mount_point);
         self.detach_mounted(workspace, DetachIntent::WhenIdle)?;
-        self.backend.resize_image(image, format, capacity)?;
+        self.backend.resize_image(image, capacity)?;
 
-        let attachment = self.backend.attach_verified(image, format)?;
+        let attachment = self.backend.attach_verified(image)?;
         if let Err(primary) = self.backend.grow_container(&attachment) {
             return Err(self.abandon_attachment(attachment, primary.into(), RESIZE_CLEANUP));
         }
@@ -3767,7 +3503,7 @@ where
                 return Err(
                     match self
                         .backend
-                        .attach_verified(image, workspace.format())
+                        .attach_verified(image)
                         .map_err(ApfsStorageError::from)
                         .and_then(|attachment| {
                             self.hand_back_attachment(
@@ -3790,7 +3526,7 @@ where
             Err(primary) => return Err(primary),
         };
 
-        let attachment = self.backend.attach_verified(image, workspace.format())?;
+        let attachment = self.backend.attach_verified(image)?;
         self.hand_back_attachment(
             workspace,
             attachment,
@@ -3833,16 +3569,10 @@ where
         self.verify_controller_path(canonical)
             .map_err(PublicationError::rolled_back)?;
         Self::ensure_parent(canonical).map_err(PublicationError::rolled_back)?;
-        let staged_format = ImageFormat::from_image_path(staged).map_err(|error| {
-            PublicationError::rolled_back(ApfsStorageError::Host(error.to_string()))
-        })?;
-        let canonical_format = ImageFormat::from_image_path(canonical).map_err(|error| {
-            PublicationError::rolled_back(ApfsStorageError::Host(error.to_string()))
-        })?;
-        if staged_format != canonical_format {
-            return Err(PublicationError::rolled_back(
-                ApfsStorageError::InvalidPlan("canonical publication must preserve image format"),
-            ));
+        for path in [staged, canonical] {
+            crate::metadata::validate_image_path(path).map_err(|error| {
+                PublicationError::rolled_back(ApfsStorageError::Host(error.to_string()))
+            })?;
         }
         if canonical.exists() {
             return Err(PublicationError::forward_only(ApfsStorageError::Host(
@@ -3910,7 +3640,7 @@ where
             let verified = (|| {
                 let actual = DetachedWorkspaceMetadata::read_for_image(canonical)
                     .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
-                if actual != expected_metadata || actual.image_format != canonical_format {
+                if actual != expected_metadata {
                     return Err(ApfsStorageError::Host(format!(
                         "durable canonical publication identity mismatch: {}",
                         canonical.display()
@@ -4086,9 +3816,7 @@ where
         source_image: Option<&Path>,
     ) -> Result<(), ApfsStorageError> {
         self.verify_controller_path(image)?;
-        workspace
-            .format()
-            .validate_path(image)
+        crate::metadata::validate_image_path(image)
             .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
         let preserved = match (policy, source_image) {
             (MetadataPolicy::Preserve | MetadataPolicy::PendingFence, Some(source)) => Some(
@@ -4158,7 +3886,6 @@ where
             repo_id: workspace.repo().clone(),
             workspace: workspace.name().clone(),
             workspace_incarnation: workspace.incarnation().clone(),
-            image_format: workspace.format(),
             platform: Platform::Macos,
             publication_state: match policy {
                 MetadataPolicy::FreshPendingFence | MetadataPolicy::PendingFence => {
@@ -4186,7 +3913,6 @@ where
         if metadata.repo_id != *workspace.repo()
             || metadata.workspace != *workspace.name()
             || metadata.workspace_incarnation != *workspace.incarnation()
-            || metadata.image_format != workspace.format()
             || metadata.grants.revision != workspace.revision().get()
             || metadata.publication_state != PublicationState::PendingFence
         {
@@ -4389,7 +4115,6 @@ where
         if metadata.repo_id != *workspace.repo()
             || metadata.workspace != *workspace.name()
             || metadata.workspace_incarnation != *workspace.incarnation()
-            || metadata.image_format != workspace.format()
             || metadata.grants.revision != revision.get()
             || metadata.publication_state != PublicationState::PendingFence
         {
@@ -4446,11 +4171,7 @@ where
         })?;
         fs::rename(&undo_sidecar, &canonical_sidecar)
             .map_err(|error| io_error("restore displaced metadata", &canonical_sidecar, error))?;
-        self.backend.delete_image(
-            staged,
-            ImageFormat::from_image_path(staged)
-                .map_err(|error| ApfsStorageError::Host(error.to_string()))?,
-        )?;
+        self.backend.delete_image(staged)?;
         Self::remove_sidecar(staged)?;
         Self::remove_companion(staged)?;
         fs::remove_file(&undo_companion)
@@ -4503,11 +4224,11 @@ where
         sync_parent_path(trash)
     }
 
-    fn reclaim_image(&self, image: &Path, format: ImageFormat) -> Result<(), ApfsStorageError> {
+    fn reclaim_image(&self, image: &Path) -> Result<(), ApfsStorageError> {
         self.verify_controller_path(image)?;
         match fs::symlink_metadata(image) {
             Ok(metadata) if metadata.file_type().is_file() => {
-                self.backend.delete_image(image, format)?;
+                self.backend.delete_image(image)?;
                 deletion_log::log_deletion_for_image(
                     image,
                     DeletionOp::ReclaimImage,
@@ -4572,7 +4293,6 @@ where
             &project.join(SESSIONS_DIRECTORY),
             retired.workspace().name(),
             retired.workspace().incarnation(),
-            retired.workspace().format(),
         );
         let sidecar = sidecar_path(&trash);
         let trash_exists = trash
@@ -4584,13 +4304,7 @@ where
         if !trash_exists && !sidecar_exists {
             return Ok(());
         }
-        self.reclaim_retired_authority(
-            &project,
-            retired.workspace().repo(),
-            &trash,
-            retired.workspace().format(),
-            Some(retired),
-        )
+        self.reclaim_retired_authority(&project, retired.workspace().repo(), &trash, Some(retired))
     }
 
     fn list(&self, repo: &RepoId) -> Result<Vec<StorageFact>, ApfsStorageError> {
@@ -4623,7 +4337,7 @@ where
             &storage.project().sessions,
             "enumerate pending session images",
         )?;
-        for discovered in discover_session_images(entries)? {
+        for discovered in discover_session_images(entries) {
             let metadata = DetachedWorkspaceMetadata::read_for_image(discovered.path())
                 .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
             if !restore_recovery_fact_path(discovered.path()).exists() {
@@ -4702,7 +4416,7 @@ where
                 continue;
             };
             for image in regular_file_children(&workspace_directory)? {
-                if ImageFormat::from_image_path(&image).is_err() {
+                if !is_image_path(&image) {
                     continue;
                 }
                 let fact_path = checkpoint_fact_path(&image);
@@ -4763,6 +4477,11 @@ where
                         continue;
                     }
                     let canonical = image_from_sidecar(&canonical_sidecar)?;
+                    // Only `<name>.asif` is a workspace image; any other sidecar is not cowshed's
+                    // state and is left alone rather than read.
+                    if !is_image_path(&canonical) {
+                        continue;
+                    }
                     if canonical.exists() {
                         let metadata = DetachedWorkspaceMetadata::read_for_image(&canonical)
                             .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
@@ -4777,23 +4496,14 @@ where
                         self.check_canonical_companion(&project, &metadata, &canonical)?;
                         continue;
                     }
-                    let Ok(format) = ImageFormat::from_image_path(&canonical) else {
-                        continue;
-                    };
                     let metadata = DetachedWorkspaceMetadata::read_for_image(&canonical)
                         .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
-                    if metadata.image_format != format {
-                        return Err(ApfsStorageError::Host(format!(
-                            "canonical sidecar format disagrees with image path: {}",
-                            canonical_sidecar.display()
-                        )));
-                    }
                     let storage = layout(config, &metadata.repo_id)?;
                     let expected = if metadata.workspace.is_main() {
-                        storage.main_image(format)?.image().to_owned()
+                        storage.main_image()?.image().to_owned()
                     } else {
                         storage
-                            .session_image(&metadata.workspace, format)?
+                            .session_image(&metadata.workspace)?
                             .image()
                             .to_owned()
                     };
@@ -4808,10 +4518,8 @@ where
                         continue;
                     }
                     let staged = project.join(super::STAGING_NAMESPACE).join(format!(
-                        "{}-{}.{}",
-                        metadata.workspace,
-                        metadata.workspace_incarnation,
-                        format.extension()
+                        "{}-{}.{IMAGE_EXTENSION}",
+                        metadata.workspace, metadata.workspace_incarnation,
                     ));
                     let staged_companion = companion_path(&staged);
                     let canonical_companion = companion_path(&canonical);
@@ -4934,23 +4642,19 @@ where
                         continue;
                     }
                     let staged = image_from_sidecar(&path)?;
+                    if !is_image_path(&staged) {
+                        continue;
+                    }
                     let metadata = DetachedWorkspaceMetadata::read_for_image(&staged)
                         .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
                     let storage = layout(config, &metadata.repo_id)?;
                     if storage.project().project_root != project {
                         continue;
                     }
-                    let canonical = if metadata.workspace.is_main() {
-                        storage
-                            .main_image(metadata.image_format)?
-                            .image()
-                            .to_owned()
-                    } else {
-                        storage
-                            .session_image(&metadata.workspace, metadata.image_format)?
-                            .image()
-                            .to_owned()
-                    };
+                    let canonical = storage
+                        .canonical_image(&metadata.workspace)?
+                        .image()
+                        .to_owned();
                     let Some(_guard) = self.recovery_lock(&canonical, held_locks)? else {
                         continue;
                     };
@@ -4964,10 +4668,9 @@ where
                         .checkpoints
                         .join(metadata.workspace.as_str())
                         .join(format!(
-                            "{}{}.{}",
+                            "{}{}.{IMAGE_EXTENSION}",
                             super::PRE_RESTORE_PREFIX,
                             metadata.workspace_incarnation,
-                            metadata.image_format.extension()
                         ));
                     if sidecar_path(&restore_undo).exists() {
                         continue;
@@ -5030,6 +4733,9 @@ where
             undo_sidecars.sort();
             for undo_sidecar in undo_sidecars {
                 let undo = image_from_sidecar(&undo_sidecar)?;
+                if !is_image_path(&undo) {
+                    continue;
+                }
                 let Some(replacement_incarnation) = undo
                     .file_stem()
                     .and_then(|stem| stem.to_str())
@@ -5056,17 +4762,10 @@ where
                 {
                     continue;
                 }
-                let canonical = if old_metadata.workspace.is_main() {
-                    storage
-                        .main_image(old_metadata.image_format)?
-                        .image()
-                        .to_owned()
-                } else {
-                    storage
-                        .session_image(&old_metadata.workspace, old_metadata.image_format)?
-                        .image()
-                        .to_owned()
-                };
+                let canonical = storage
+                    .canonical_image(&old_metadata.workspace)?
+                    .image()
+                    .to_owned();
                 let Some(_guard) = self.recovery_lock(&canonical, held_locks)? else {
                     continue;
                 };
@@ -5080,10 +4779,9 @@ where
                     .project_root
                     .join(super::STAGING_NAMESPACE)
                     .join(format!(
-                        "{}-{}.{}",
+                        "{}-{}.{IMAGE_EXTENSION}",
                         old_metadata.workspace.as_str(),
                         replacement_incarnation,
-                        old_metadata.image_format.extension()
                     ));
                 let recovery_fact_path = restore_recovery_fact_path(&canonical);
                 if !canonical.exists() {
@@ -5119,11 +4817,7 @@ where
                             undo_sidecar.display()
                         )));
                     }
-                    validate_restore_recovery_lineage(
-                        config,
-                        &recovery_fact,
-                        old_metadata.image_format,
-                    )?;
+                    validate_restore_recovery_lineage(config, &recovery_fact)?;
                 } else if !staged.exists() && sidecar_path(&canonical).exists() {
                     let canonical_metadata = DetachedWorkspaceMetadata::read_for_image(&canonical)
                         .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
@@ -5161,8 +4855,7 @@ where
                     }
                     if undo.exists() {
                         if staged.exists() {
-                            self.backend
-                                .delete_image(&staged, old_metadata.image_format)?;
+                            self.backend.delete_image(&staged)?;
                         }
                     } else if staged.exists() {
                         let displaced_companion =
@@ -5207,11 +4900,7 @@ where
                     &old_metadata.workspace,
                     replacement_incarnation,
                 );
-                let incarnation = self.detached_image_incarnation(
-                    &canonical,
-                    old_metadata.image_format,
-                    &recovery_mount,
-                )?;
+                let incarnation = self.detached_image_incarnation(&canonical, &recovery_mount)?;
                 let canonical_is_replacement = if incarnation == replacement_incarnation {
                     true
                 } else if incarnation == old_metadata.workspace_incarnation.as_str() {
@@ -5320,8 +5009,7 @@ where
                 }
 
                 if staged.exists() {
-                    self.backend
-                        .delete_image(&staged, old_metadata.image_format)?;
+                    self.backend.delete_image(&staged)?;
                 }
                 Self::remove_sidecar(&staged)?;
                 Self::remove_companion(&staged)?;
@@ -5352,9 +5040,7 @@ where
         workspace: &LifecycleWorkspace,
         image: &Path,
     ) -> Result<SubstrateStats, ApfsStorageError> {
-        workspace
-            .format()
-            .validate_path(image)
+        crate::metadata::validate_image_path(image)
             .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
         let detached = DetachedWorkspaceMetadata::read_for_image(image)
             .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
@@ -5364,7 +5050,6 @@ where
         if detached.repo_id != *workspace.repo()
             || detached.workspace != *workspace.name()
             || detached.workspace_incarnation != *workspace.incarnation()
-            || detached.image_format != workspace.format()
         {
             return Err(ApfsStorageError::MarkerMismatch(format!(
                 "detached metadata disagrees with active image {}",
@@ -5383,14 +5068,13 @@ where
         let mut checkpoint_bytes = 0_u64;
         let mut pinned_checkpoint_bytes = 0_u64;
         for checkpoint_image in regular_file_children(&checkpoint_directory)? {
-            let Ok(checkpoint_format) = ImageFormat::from_image_path(&checkpoint_image) else {
+            if !is_image_path(&checkpoint_image) {
                 continue;
-            };
+            }
             let checkpoint_metadata = DetachedWorkspaceMetadata::read_for_image(&checkpoint_image)
                 .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
             if checkpoint_metadata.repo_id != *workspace.repo()
                 || checkpoint_metadata.workspace != *workspace.name()
-                || checkpoint_metadata.image_format != checkpoint_format
                 || checkpoint_metadata.publication_state != PublicationState::Active
             {
                 return Err(ApfsStorageError::MarkerMismatch(format!(
@@ -5466,23 +5150,6 @@ where
         })
     }
 
-    fn compact(&self, image: &Path, format: ImageFormat) -> Result<bool, ApfsStorageError> {
-        self.verify_controller_path(image)?;
-        if format != ImageFormat::Sparse {
-            return Err(ApfsStorageError::InvalidPlan(
-                "detached compaction is supported only for SPARSE images",
-            ));
-        }
-        if self.image_is_kernel_mounted(image)? {
-            return Err(ApfsStorageError::Host(format!(
-                "cannot compact mounted image: {}",
-                image.display()
-            )));
-        }
-        self.backend.compact_image(image, format)?;
-        Ok(true)
-    }
-
     fn preview_gc(
         &self,
         config: &ApfsSubstrateConfig,
@@ -5549,7 +5216,6 @@ fn metadata_workspace_ref(
         revision,
         revision,
         role,
-        metadata.image_format,
     )
     .map_err(|_| ApfsStorageError::Host("invalid detached workspace identity".to_owned()))
 }
@@ -5831,7 +5497,6 @@ mod tests {
             workspace: WorkspaceName::new("raven").unwrap(),
             workspace_incarnation: source.clone(),
             role: crate::metadata::WorkspaceRole::Workspace,
-            image_format: crate::metadata::ImageFormat::Sparse,
             base_commit: "8f31c2d".into(),
             created_at: "2026-08-23T00:00:00Z".into(),
             forked_from: None,
@@ -5924,7 +5589,7 @@ mod tests {
             directory,
             "enumerate session images",
             [
-                Ok(PathBuf::from("/sessions/a.sparseimage")),
+                Ok(PathBuf::from("/sessions/a.asif")),
                 Err(io::Error::from_raw_os_error(libc::EIO)),
             ],
         )

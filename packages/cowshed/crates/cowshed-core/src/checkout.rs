@@ -169,8 +169,8 @@ pub fn observed_checkout(observed: &Path, mount_point: &Path) -> Option<PathBuf>
 mod tests {
     use super::*;
     use crate::metadata::{
-        ImageFormat, MARKER_VERSION, Platform, PublicationState, SIDECAR_VERSION,
-        WorkspaceIncarnation, WorkspaceInfoSnapshot, WorkspaceName, WorkspaceRole,
+        MARKER_VERSION, Platform, PublicationState, SIDECAR_VERSION, WorkspaceIncarnation,
+        WorkspaceInfoSnapshot, WorkspaceName, WorkspaceRole,
     };
     use crate::repository::RepoId;
 
@@ -221,7 +221,6 @@ mod tests {
                 workspace: workspace.clone(),
                 workspace_incarnation: incarnation(),
                 role: WorkspaceRole::Main,
-                image_format: ImageFormat::Asif,
                 base_commit: "0123456789abcdef".to_owned(),
                 created_at: "2026-07-13T00:00:00Z".to_owned(),
                 forked_from: None,
@@ -238,7 +237,6 @@ mod tests {
                 repo_id,
                 workspace,
                 workspace_incarnation: incarnation(),
-                image_format: ImageFormat::Asif,
                 platform: Platform::Macos,
                 publication_state: PublicationState::Active,
                 updated_at: "2026-07-13T00:00:00Z".to_owned(),

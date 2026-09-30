@@ -159,7 +159,6 @@ describe('Cowshed Node-API bindings', () => {
             workspace: 'main',
             workspaceIncarnation: incarnation,
             role: 'main',
-            imageFormat: 'asif',
             mount: '/w/widget',
             state: 'attached',
             checkpoints: [],

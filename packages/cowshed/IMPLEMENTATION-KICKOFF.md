@@ -21,11 +21,12 @@ directly, Bun/Node applications use `cowshed-napi`, and shell-based agents use t
 
 ## Decisions already made (do not relitigate)
 
-- **Substrate**: clonefile'd sparse images (Option B). Shadows rejected (2.34× worse sync writes, base-file GC
-  dependency). **ASIF default on Tahoe — measured** (2.1× create, 2.5× write, 5.6× read, 2.3× metadata vs SPARSE;
-  clonefile equal; attach ~75 ms slower), SPARSE/hdiutil fallback pre-Tahoe. Attach **branches on the marker's
-  `imageFormat`**: `diskutil image attach` for ASIF (hdiutil refuses it), `hdiutil attach` for SPARSE; ASIF volume roots
-  are chowned after create (diskutil leaves them root-owned). 01_storage.md.
+- **Substrate**: clonefile'd disk images (Option B). Shadows rejected (2.34× worse sync writes, base-file GC
+  dependency). **One format: ASIF holding one case-sensitive APFS volume** — measured faster than SPARSE on every row
+  (2.1× create, 2.5× write, 5.6× read, 2.3× metadata; clonefile equal) and equal to case-insensitive ASIF within noise.
+  No fallback, no format field anywhere, macOS 26 is the floor. Created unprivileged: blank `--fs None` image, attach
+  `--noMount`, `newfs_apfs -U/-G … -e`, eject; attach is `diskutil image attach`, and `hdiutil` only reads the
+  attachment inventory. 01_storage.md.
 - **No templates**: main-as-base. `cowshed adopt` turns the existing checkout into an image mounted at its original
   path; `cowshed new` clones main's live image (sync + clonefile, crash-consistent). Safe because secrets never live in
   worktrees (gateway holds them; no `.env` files). The invariant is enforced, not assumed: a built-in scanner gates
@@ -230,8 +231,8 @@ then targeted verification plus the repository's full Rust checks and a CLI tran
 **Resolved experiments** (2026-07-11, harnesses + results in `specs/cowshed/prototypes/apfs-workspace-bench/`; verdicts
 folded into the specs):
 
-- ASIF vs SPARSE → **ASIF default on Tahoe** (2.1× create, 2.5× write, 5.6× read, 2.3× metadata; attach ~75 ms slower;
-  hdiutil cannot attach ASIF — `diskutil image attach` branch required).
+- ASIF vs SPARSE → **ASIF only, case-sensitive** (2.1× create, 2.5× write, 5.6× read, 2.3× metadata; hdiutil cannot
+  attach ASIF, so attach is `diskutil image attach`; case-sensitive ASIF equals case-insensitive within noise).
 - Attach latency floor → **not flag-reducible** (`-noverify` ~15 ms noise); only a DiskImages2/diskarbitrationd-level
   path could improve it — research item, budgets don't assume it.
 - Fork-mid-write clone validity → **10/10 clean** under continuous writer + streaming dd, both formats, `fsck_apfs -q`
