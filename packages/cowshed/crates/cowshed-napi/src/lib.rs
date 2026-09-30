@@ -1018,6 +1018,7 @@ mod parity_tests {
             Command::Doctor(_) => Some("Coordinator.doctor"),
             Command::Gateway(_)
             | Command::Credential(_)
+            | Command::Identity(_)
             | Command::Sccache(_)
             | Command::Skill(_)
             | Command::Setup(_)
@@ -1066,6 +1067,7 @@ mod parity_tests {
         (&["doctor"], Some("Coordinator.doctor")),
         (&["gateway", "status"], None),
         (&["credential", "status"], None),
+        (&["identity", "add", "forge"], None),
         (&["sccache", "status"], None),
         (&["skill", "install"], None),
         (&["mount", "main", "--repo-id", "acme/widget"], None),
