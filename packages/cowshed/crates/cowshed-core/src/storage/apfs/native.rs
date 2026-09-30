@@ -3180,6 +3180,7 @@ where
     fn clone_image(
         &self,
         source: &Path,
+        source_mount: Option<&Path>,
         destination: &Path,
         format: ImageFormat,
     ) -> Result<(), ApfsStorageError> {
@@ -3195,7 +3196,7 @@ where
             .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
         Self::ensure_parent(destination)?;
         self.backend
-            .sync_and_clone(source, destination, format)
+            .sync_and_clone(source, source_mount, destination, format)
             .map_err(Into::into)
     }
 

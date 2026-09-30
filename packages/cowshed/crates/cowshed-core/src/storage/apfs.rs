@@ -399,9 +399,13 @@ pub trait ApfsExecutionHost: Send + Sync + 'static {
         request: &CreateImageRequest,
         requested: ImageFormat,
     ) -> Result<CreatedImage, ApfsStorageError>;
+    /// Clone `source` to `destination` with the source's latest writes in it. `source_mount` is
+    /// where the source is mounted when it is a live workspace — its volume is what gets flushed
+    /// — and `None` for an image nothing mounts (a staged image, a checkpoint).
     fn clone_image(
         &self,
         source: &Path,
+        source_mount: Option<&Path>,
         destination: &Path,
         format: ImageFormat,
     ) -> Result<(), ApfsStorageError>;
@@ -1962,6 +1966,8 @@ enum CommittedRestore {
 struct PreparedCheckpoint {
     stage: CheckpointStage,
     source: PathBuf,
+    /// Where the checkpointed workspace is mounted, whose last writes the checkpoint must hold.
+    source_mount: PathBuf,
     label: CheckpointLabel,
     revision: Revision,
     pin: Pin,
@@ -2130,7 +2136,7 @@ fn prepare_adopt_stage<H: ApfsExecutionHost>(
     let created = match resumable {
         Some(resumable) => {
             let path = staged_stem.with_extension(resumable.format.extension());
-            host.clone_image(&resumable.image, &path, resumable.format)?;
+            host.clone_image(&resumable.image, None, &path, resumable.format)?;
             CreatedImage {
                 path,
                 format: resumable.format,
@@ -2451,7 +2457,10 @@ fn prepare_clone_stage<H: ApfsExecutionHost>(
                 Some(&source_image),
             )
         })?;
-        if let Err(primary) = host.clone_image(&source_image, &canonical_image, format) {
+        let source_mount = mount_point(config, &source)?;
+        if let Err(primary) =
+            host.clone_image(&source_image, Some(&source_mount), &canonical_image, format)
+        {
             return combine_cleanup(
                 "clone canonical payload",
                 primary,
@@ -2592,12 +2601,14 @@ fn plan_checkpoint_stage(
 ) -> Result<PreparedCheckpoint, ApfsStorageError> {
     let workspace = active_expected(expected, workspace_name, format)?;
     let source = canonical_image_path(config, &workspace)?;
+    let source_mount = mount_point(config, &workspace)?;
     let image = checkpoint_image(config, &workspace, label)?;
     let revision = Revision::new(expected_revision(expected)? + 1);
     let checkpoint = CheckpointRef::new(workspace, label.clone(), revision, pin == Pin::Pinned);
     Ok(PreparedCheckpoint {
         stage: CheckpointStage { checkpoint, image },
         source,
+        source_mount,
         label: label.clone(),
         revision,
         pin,
@@ -2609,7 +2620,12 @@ fn prepare_checkpoint_stage<H: ApfsExecutionHost>(
     host: &H,
     prepared: PreparedCheckpoint,
 ) -> Result<PreparedCheckpoint, ApfsStorageError> {
-    host.clone_image(&prepared.source, &prepared.stage.image, prepared.format)?;
+    host.clone_image(
+        &prepared.source,
+        Some(&prepared.source_mount),
+        &prepared.stage.image,
+        prepared.format,
+    )?;
     if let Err(primary) = host.publish_metadata(
         &prepared.stage.image,
         prepared.stage.checkpoint.workspace(),
@@ -2725,7 +2741,7 @@ fn prepare_restore_stage<H: ApfsExecutionHost>(
     let undo_image = undo_image(config, &current, &replacement)?;
     let staged_companion = companion_path(&staged_image);
 
-    host.clone_image(&checkpoint_image, &staged_image, format)?;
+    host.clone_image(&checkpoint_image, None, &staged_image, format)?;
     if let Err(primary) = host.publish_metadata(
         &staged_image,
         &replacement,

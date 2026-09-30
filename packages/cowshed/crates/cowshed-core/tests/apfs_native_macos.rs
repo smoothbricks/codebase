@@ -622,7 +622,7 @@ fn clone_extension_mismatch_and_asif_compaction_fail_before_commands() {
     let host = native_host(&fixture, runner.clone());
 
     let clone_error = host
-        .clone_image(source.image(), &bad_destination, ImageFormat::Asif)
+        .clone_image(source.image(), None, &bad_destination, ImageFormat::Asif)
         .expect_err("clone extension mismatch");
     assert!(
         clone_error

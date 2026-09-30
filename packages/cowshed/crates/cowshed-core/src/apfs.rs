@@ -26,7 +26,6 @@ const FSCK_APFS: &str = "/sbin/fsck_apfs";
 /// Disk Arbitration still observes the mounted volume, so eject and inventory keep working.
 const MOUNT_APFS: &str = "/sbin/mount_apfs";
 const NEWFS_APFS: &str = "/System/Library/Filesystems/apfs.fs/Contents/Resources/newfs_apfs";
-const SYNC: &str = "/bin/sync";
 const SW_VERS: &str = "/usr/bin/sw_vers";
 
 /// Unix `st_blocks` units and the unit `hdiutil` reports and accepts image extents in.
@@ -892,16 +891,28 @@ impl From<CloneFileError> for ApfsError {
 pub trait ApfsBackend {
     fn create_staged_image(&self, request: &CreateImageRequest) -> Result<CreatedImage, ApfsError>;
     fn compact_image(&self, image: &Path, format: ImageFormat) -> Result<(), ApfsError>;
-    fn sync_for_freshness(&self) -> Result<(), ApfsError>;
+    /// Make the source's latest writes part of the image a clone is about to be cut from:
+    /// its volume when `mount_point` is mounted, then the image file itself.
+    ///
+    /// Freshness, not consistency (specs/cowshed/02_workspaces.md, `cowshed new` step 1): a live
+    /// clone is always crash-consistent, but without this it can miss the source's last writes.
+    /// Only the source is flushed. The host-wide `sync(8)` this replaces also waited for every
+    /// other mounted volume's dirty data — measured at 16 s, and at 39 s inside a fork under a
+    /// host with dozens of workspaces building, against 3–676 ms for the source volume alone.
+    fn sync_for_freshness(&self, image: &Path, mount_point: Option<&Path>)
+    -> Result<(), ApfsError>;
     fn clone_image(
         &self,
         source: &Path,
         destination: &Path,
         format: ImageFormat,
     ) -> Result<(), CloneFileError>;
+    /// Clone `source` to `destination` after [`Self::sync_for_freshness`]; `source_mount` is the
+    /// source's mount point when it is a live workspace, `None` for an image nothing mounts.
     fn sync_and_clone(
         &self,
         source: &Path,
+        source_mount: Option<&Path>,
         destination: &Path,
         format: ImageFormat,
     ) -> Result<(), ApfsError>;
@@ -1670,12 +1681,33 @@ impl<R: CommandRunner, S: Sleeper> ApfsBackend for MacOsApfsBackend<R, S> {
         .map(|_| ())
     }
 
-    fn sync_for_freshness(&self) -> Result<(), ApfsError> {
-        self.run_checked(
-            "sync before clone",
-            CommandRequest::new(SYNC, std::iter::empty::<OsString>()),
-        )
-        .map(|_| ())
+    fn sync_for_freshness(
+        &self,
+        image: &Path,
+        mount_point: Option<&Path>,
+    ) -> Result<(), ApfsError> {
+        if let Some(mount_point) = mount_point.filter(|mount_point| is_mount_root(mount_point)) {
+            sync_volume(mount_point).map_err(|source| ApfsError::FileOperation {
+                operation: "sync source volume",
+                path: mount_point.to_owned(),
+                source,
+            })?;
+        }
+        fs::File::open(image)
+            .and_then(|file| {
+                use std::os::fd::AsRawFd;
+                // SAFETY: `file` owns a live descriptor for the duration of the call.
+                if unsafe { libc::fsync(file.as_raw_fd()) } == 0 {
+                    Ok(())
+                } else {
+                    Err(io::Error::last_os_error())
+                }
+            })
+            .map_err(|source| ApfsError::FileOperation {
+                operation: "sync source image",
+                path: image.to_owned(),
+                source,
+            })
     }
 
     fn clone_image(
@@ -1692,11 +1724,16 @@ impl<R: CommandRunner, S: Sleeper> ApfsBackend for MacOsApfsBackend<R, S> {
     fn sync_and_clone(
         &self,
         source: &Path,
+        source_mount: Option<&Path>,
         destination: &Path,
         format: ImageFormat,
     ) -> Result<(), ApfsError> {
+        validate_clone_path(source, format).map_err(ApfsError::from)?;
+        validate_clone_path(destination, format).map_err(ApfsError::from)?;
         let leg = apfs_step_leg(destination);
-        timed_apfs_step(leg, "sync", || self.sync_for_freshness())?;
+        timed_apfs_step(leg, "sync", || {
+            self.sync_for_freshness(source, source_mount)
+        })?;
         timed_apfs_step(leg, "clonefile", || {
             self.clone_image(source, destination, format)
                 .map_err(ApfsError::from)
@@ -2302,6 +2339,53 @@ pub fn volume_name(path: &Path) -> io::Result<OsString> {
     Ok(OsString::from_vec(
         name.strip_suffix(b"\0").unwrap_or(name).to_vec(),
     ))
+}
+
+/// Whether a volume is mounted at exactly `path`. An unmounted mount point lies on its parent's
+/// volume, and a sync meant for the source must never land on the volume holding the store.
+fn is_mount_root(path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(canonical) = fs::canonicalize(path) else {
+        return false;
+    };
+    let Some(parent) = canonical.parent() else {
+        return true;
+    };
+    match (fs::symlink_metadata(&canonical), fs::metadata(parent)) {
+        (Ok(own), Ok(parent)) => own.dev() != parent.dev(),
+        _ => false,
+    }
+}
+
+/// Flush one mounted volume and wait for it: the source's dirty data, and nobody else's.
+#[cfg(target_os = "macos")]
+fn sync_volume(mount_point: &Path) -> io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    unsafe extern "C" {
+        fn sync_volume_np(path: *const libc::c_char, flags: libc::c_int) -> libc::c_int;
+    }
+    const SYNC_VOLUME_WAIT: libc::c_int = 0x02;
+    let path = std::ffi::CString::new(mount_point.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "mount point contains NUL"))?;
+    // SAFETY: `path` is NUL-terminated and outlives the call; the flags ask only to wait.
+    match unsafe { sync_volume_np(path.as_ptr(), SYNC_VOLUME_WAIT) } {
+        0 => Ok(()),
+        // It answers the errno itself, or -1 with errno set, depending on where it failed.
+        -1 => Err(io::Error::last_os_error()),
+        errno => Err(io::Error::from_raw_os_error(errno)),
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn sync_volume(mount_point: &Path) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let volume = fs::File::open(mount_point)?;
+    // SAFETY: `volume` owns a live descriptor for the duration of the call.
+    if unsafe { libc::syncfs(volume.as_raw_fd()) } == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
 }
 
 fn is_kernel_device_path(device: &str) -> bool {
@@ -4916,12 +5000,12 @@ mod tests {
     }
 
     #[test]
-    fn sync_precedes_clone_validation_and_operation() {
-        let backend =
-            MacOsApfsBackend::new(RecordingRunner::with_outputs([CommandOutput::success([])]));
+    fn an_invalid_clone_is_refused_before_anything_is_flushed() {
+        let backend = MacOsApfsBackend::new(RecordingRunner::default());
         let error = backend
             .sync_and_clone(
                 Path::new("main.asif"),
+                None,
                 Path::new("session.sparseimage"),
                 ImageFormat::Asif,
             )
@@ -4930,10 +5014,23 @@ mod tests {
             error,
             ApfsError::Clone(CloneFileError::InvalidImagePath { .. })
         ));
-        assert_eq!(
-            backend.runner().requests().as_slice(),
-            [CommandRequest::new(SYNC, std::iter::empty::<OsString>())]
+        assert!(
+            backend.runner().requests().is_empty(),
+            "the freshness flush is two syscalls on the source, never a host-wide sync child"
         );
+    }
+
+    #[test]
+    fn only_a_mounted_volume_root_is_a_mount_root() {
+        let base = std::env::temp_dir().join(format!("cowshed-mount-root-{}", std::process::id()));
+        fs::create_dir_all(&base).unwrap();
+        assert!(
+            !is_mount_root(&base),
+            "a plain directory lies on its parent's volume"
+        );
+        assert!(!is_mount_root(&base.join("missing")));
+        assert!(is_mount_root(Path::new("/")));
+        fs::remove_dir_all(base).unwrap();
     }
 
     #[test]

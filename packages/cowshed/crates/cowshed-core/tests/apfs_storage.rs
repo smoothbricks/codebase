@@ -284,6 +284,7 @@ impl ApfsExecutionHost for FakeHost {
     fn clone_image(
         &self,
         source: &Path,
+        _: Option<&Path>,
         destination: &Path,
         format: ImageFormat,
     ) -> Result<(), ApfsStorageError> {
