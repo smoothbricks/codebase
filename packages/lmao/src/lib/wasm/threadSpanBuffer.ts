@@ -18,7 +18,9 @@
  */
 
 import { isRecord } from '@smoothbricks/validation';
+import { decodeVocabularyMessage } from '../resolveMessage.js';
 import { THREAD_ATTRIBUTE_KINDS } from '../schema/systemSchema.js';
+import { getVocabularyGeneration } from '../vocabularyRegistry.js';
 
 export { THREAD_ATTRIBUTE_KINDS };
 export type ThreadAttributeKind = (typeof THREAD_ATTRIBUTE_KINDS)[number]['discriminant'];
@@ -35,6 +37,16 @@ export const THREAD_SPAN_BUFFER_OK = 0;
  */
 export function attributeCellStride(capacity: number): number {
   return capacity + Math.ceil(capacity / 64);
+}
+
+/**
+ * The text of a static vocabulary id as the thread lane hands it to
+ * `openSpanStatic` / `appendLogStatic`: one-based, `denseIndex + 1`, because 0
+ * in a packed header means "dynamic". A provider whose store holds no copy of
+ * this process's vocabulary resolves the id here and interns the text instead.
+ */
+export function threadVocabularyText(vocabularyId: number): string {
+  return decodeVocabularyMessage(getVocabularyGeneration(), vocabularyId - 1);
 }
 
 /**

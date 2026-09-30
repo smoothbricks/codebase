@@ -136,6 +136,7 @@ export {
   THREAD_SPAN_BUFFER_OK,
   type ThreadAttributeKind,
   type ThreadSpanBufferBinding,
+  threadVocabularyText,
 } from './lib/wasm/threadSpanBuffer.js';
 export type { ThreadSpanView } from './lib/wasm/threadSpanView.js';
 // =============================================================================
