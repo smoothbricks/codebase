@@ -56,7 +56,9 @@ pub use dict::{
 };
 pub use ipc::{read_single_batch, write_ipc_stream};
 pub use source::{MockSpan, SpanSource, walk_pre_order};
-pub use thread_convert::{convert_thread_buffer, convert_thread_span_buffer};
+pub use thread_convert::{
+    convert_thread_buffer, convert_thread_span_buffer, convert_thread_span_rows,
+};
 
 #[cfg(test)]
 mod tests {

@@ -72,7 +72,9 @@ fn string_dictionary(values: &[Option<&str>]) -> (Vec<u32>, NullBuffer, StringAr
 }
 
 /// Convert a prepared window from one [`ThreadSpanBuffer`] into the system ∪
-/// schema-attribute Arrow batch.
+/// schema-attribute Arrow batch. A span still open in the window gets an
+/// exception completion stamped at `window.timestamp`: this is the one-shot
+/// form, for a store that is converted once and discarded.
 pub fn convert_thread_span_buffer(
     buffer: &mut ThreadSpanBuffer,
     vocabulary: &StableVocabularyCatalog<'_>,
@@ -94,8 +96,34 @@ pub fn convert_thread_span_buffer(
             row: window.start_row,
             column: "scope",
         })?;
-
     let rows: Vec<usize> = (window.start_row..end).collect();
+    convert_selected(buffer, vocabulary, &rows, window.timestamp)
+}
+
+/// Convert the rows [`ThreadSpanBuffer::flush_rows`] selected: the streaming
+/// form, for a long-lived store that flushes and then
+/// [`ThreadSpanBuffer::retain_open`]s. The selection never includes an open
+/// span's reserved completion row, so nothing is synthesized.
+pub fn convert_thread_span_rows(
+    buffer: &ThreadSpanBuffer,
+    vocabulary: &StableVocabularyCatalog<'_>,
+    rows: &[usize],
+) -> Result<RecordBatch, ConvertError> {
+    if let Some(&row) = rows.iter().find(|&&row| row >= buffer.row_count()) {
+        return Err(ConvertError::MissingSourceValue {
+            row,
+            column: "thread-buffer selection",
+        });
+    }
+    convert_selected(buffer, vocabulary, rows, 0)
+}
+
+fn convert_selected(
+    buffer: &ThreadSpanBuffer,
+    vocabulary: &StableVocabularyCatalog<'_>,
+    rows: &[usize],
+    open_completion_timestamp: i64,
+) -> Result<RecordBatch, ConvertError> {
     let total_rows = rows.len();
     let mut trace_values = Vec::with_capacity(total_rows);
     let mut thread_ids = Vec::with_capacity(total_rows);
@@ -113,7 +141,7 @@ pub fn convert_thread_span_buffer(
         .map(|_| Vec::with_capacity(total_rows))
         .collect();
 
-    for row in rows {
+    for &row in rows {
         let header = buffer
             .packed_header_at(row)
             .ok_or(ConvertError::MissingSourceValue {
@@ -132,7 +160,7 @@ pub fn convert_thread_span_buffer(
             })?;
         let timestamp =
             if buffer.completion_row(span_id) == Some(row) && buffer.is_span_open(span_id) {
-                window.timestamp
+                open_completion_timestamp
             } else {
                 buffer
                     .timestamp_at(row)

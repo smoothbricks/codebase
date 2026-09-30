@@ -1,6 +1,6 @@
 use arrow_array::cast::AsArray;
 use arrow_array::{Array, RecordBatch, StringArray};
-use lmao_arrow::{StableVocabularyCatalog, convert_thread_buffer};
+use lmao_arrow::{StableVocabularyCatalog, convert_thread_buffer, convert_thread_span_rows};
 use lmao_core::{ColumnValue, EntryType, FieldMeta, FieldStrategy, ThreadSpanBuffer, TraceId};
 
 static FIELDS: &[FieldMeta] = &[
@@ -112,4 +112,52 @@ fn output_has_system_prefix_then_schema_columns() {
         .downcast_ref::<StringArray>()
         .unwrap();
     assert!((0..dict.len()).any(|index| dict.value(index) == "name"));
+}
+
+#[test]
+fn a_streaming_flush_leaves_an_open_span_open_and_emits_its_completion_later() {
+    let mut buffer = ThreadSpanBuffer::new(7, 8, FIELDS);
+    let span = buffer
+        .open_span(trace(), 0, 0, "pending".into(), 10, 1)
+        .unwrap();
+    let label = buffer.intern("sku").unwrap();
+    buffer
+        .write_tag(span, 13, ColumnValue::Text(label))
+        .unwrap();
+    let mut rows = Vec::new();
+    buffer.flush_rows(&mut rows).unwrap();
+    let first = convert_thread_span_rows(&buffer, &empty_catalog(), &rows).unwrap();
+    let entries = first
+        .column(6)
+        .as_dictionary::<arrow_array::types::UInt8Type>();
+    let names = entries
+        .values()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(first.num_rows(), 1, "only the start row of an open span");
+    assert_eq!(names.value(entries.keys().value(0) as usize), "span-start");
+    buffer.retain_open();
+
+    buffer.end_ok(span, 20).unwrap();
+    buffer.flush_rows(&mut rows).unwrap();
+    let second = convert_thread_span_rows(&buffer, &empty_catalog(), &rows).unwrap();
+    assert_eq!(
+        second.num_rows(),
+        2,
+        "the final start row and the completion"
+    );
+    let labels = second
+        .column(13)
+        .as_dictionary::<arrow_array::types::UInt32Type>();
+    let values = labels
+        .values()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(values.value(labels.keys().value(0) as usize), "sku");
+    let stamps = second
+        .column(0)
+        .as_primitive::<arrow_array::types::TimestampNanosecondType>();
+    assert_eq!(stamps.value(1), 20);
 }
