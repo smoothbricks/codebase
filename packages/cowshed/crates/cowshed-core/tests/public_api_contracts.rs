@@ -60,7 +60,7 @@ fn finished_job(cwd: Option<WorkspacePath>) -> JobInfo {
         state: JobState::Signaled,
         pid: Some(4242),
         grant_revision: 9,
-        argv: vec!["bun".into(), "test".into()],
+        command: cowshed_core::api::ExecCommand::Argv(vec!["bun".into(), "test".into()]),
         cwd,
         started: timestamp(),
         duration_ms: Some(1250),
@@ -78,6 +78,7 @@ fn finished_job(cwd: Option<WorkspacePath>) -> JobInfo {
             workspace_path: Some(WorkspacePath::new("fixtures/input.bin").unwrap()),
             complete: true,
         },
+        failure: None,
     }
 }
 

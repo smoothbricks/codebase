@@ -22,7 +22,7 @@ use thiserror::Error;
 
 use crate::api::dto::{
     AdmissionCommitment, BinaryData, CheckpointCommitment, CommandArg, ControllerCommitment,
-    DtoError, ForkCommitment, JobId, JobState, MAX_ARGV_BYTES, MAX_COMMAND_ARG_BYTES,
+    DtoError, ExecCommand, ForkCommitment, JobId, JobState, MAX_ARGV_BYTES, MAX_COMMAND_ARG_BYTES,
     MAX_INLINE_OUTPUT_BYTES, OutputLimitInfo, OutputPublication, OutputStorage, OutputSummary,
     ProtectedOutput, RestoreCommitment, Sha256Digest, StreamInfo, TerminalCommitment,
     WorkspaceIntroducedCommitment, WorkspacePath, WorkspaceRetiredCommitment,
@@ -228,7 +228,7 @@ pub struct JobArtifactRecord {
     pub sequence: u64,
     pub state: JobState,
     pub grant_revision: u64,
-    pub argv: Vec<CommandArg>,
+    pub command: ExecCommand,
     pub output_limit: Option<OutputLimitInfo>,
     pub stdout: StreamInfo,
     pub stderr: StreamInfo,
@@ -236,7 +236,7 @@ pub struct JobArtifactRecord {
 
 impl JobArtifactRecord {
     pub fn validate(&self) -> Result<(), ArtifactError> {
-        validate_command_argv(&self.argv)?;
+        self.command.validate()?;
         if self.sequence == 0 {
             return Err(ArtifactError::Integrity {
                 offset: 0,
@@ -656,10 +656,10 @@ impl ArtifactStore {
         &mut self,
         job_id: JobId,
         grant_revision: u64,
-        argv: &[CommandArg],
+        command: &ExecCommand,
         mut targets: OutputTargets,
     ) -> Result<JobArtifactToken, ArtifactError> {
-        validate_command_argv(argv)?;
+        command.validate()?;
         if job_id.get() != self.next_job_id {
             return Err(ArtifactError::TokenConflict {
                 job_id,
@@ -685,7 +685,7 @@ impl ArtifactStore {
             sequence: 0,
             state: JobState::Running,
             grant_revision,
-            argv: argv.to_vec(),
+            command: command.clone(),
             output_limit: None,
             stdout: empty_stream(&targets.stdout)?,
             stderr: empty_stream(&targets.stderr)?,
@@ -695,7 +695,7 @@ impl ArtifactStore {
             job_id,
             LiveJobState {
                 grant_revision,
-                argv: argv.to_vec(),
+                command: command.clone(),
                 stdout: StreamWriterState::new(StreamKind::Stdout, targets.stdout),
                 stderr: StreamWriterState::new(StreamKind::Stderr, targets.stderr),
                 quota: QuotaLedger {
@@ -929,7 +929,7 @@ struct QuotaAdmission {
 
 struct LiveJobState {
     grant_revision: u64,
-    argv: Vec<CommandArg>,
+    command: ExecCommand,
     stdout: StreamWriterState,
     stderr: StreamWriterState,
     quota: QuotaLedger,
@@ -1147,7 +1147,7 @@ impl ArtifactStore {
                 sequence: 0,
                 state,
                 grant_revision: live.grant_revision,
-                argv: live.argv.clone(),
+                command: live.command.clone(),
                 output_limit: output_limit.clone(),
                 stdout,
                 stderr,
@@ -3003,15 +3003,32 @@ fn artifact_arg_bytes(value: &OsStr) -> Result<&[u8], ArtifactError> {
         .ok_or(ArtifactError::Dto(DtoError::InvalidPlatformCommandArgument))
 }
 
-fn command_argv_array(argv: &[CommandArg]) -> Result<ListArray, ArtifactError> {
-    validate_command_argv(argv)?;
-    let mut encoded = Vec::with_capacity(argv.len());
-    for argument in argv {
-        encoded.push(artifact_arg_bytes(argument.as_os_str())?);
-    }
-    let values = BinaryArray::from_iter_values(encoded);
-    let count = i32::try_from(argv.len())
+/// The first element of a script job's `argv` column. A real argv can never contain NUL, so a
+/// record that starts with it cannot be an argv job; its only other element is the script as
+/// its canonical JSON (`{"parts":[…],"values":[…]}`).
+const SCRIPT_RECORD_TAG: &[u8] = b"\0script";
+
+/// Bound on a recorded script's JSON: its strings are bounded at the argv total, and escaping
+/// at most multiplies that by six.
+const MAX_SCRIPT_RECORD_BYTES: usize = 6 * MAX_ARGV_BYTES + 4096;
+
+fn command_argv_array(command: &ExecCommand) -> Result<ListArray, ArtifactError> {
+    command.validate()?;
+    let script_json;
+    let encoded: Vec<&[u8]> = match command {
+        ExecCommand::Argv(argv) => argv
+            .iter()
+            .map(|argument| artifact_arg_bytes(argument.as_os_str()))
+            .collect::<Result<_, _>>()?,
+        ExecCommand::Script(script) => {
+            script_json = serde_json::to_vec(script)
+                .map_err(|error| ArtifactError::Arrow(format!("script record: {error}")))?;
+            vec![SCRIPT_RECORD_TAG, script_json.as_slice()]
+        }
+    };
+    let count = i32::try_from(encoded.len())
         .map_err(|_| ArtifactError::Arrow("too many command arguments".into()))?;
+    let values = BinaryArray::from_iter_values(encoded);
     Ok(ListArray::new(
         Arc::new(field("item", DataType::Binary, false)),
         OffsetBuffer::new(ScalarBuffer::from(vec![0_i32, count])),
@@ -3081,7 +3098,7 @@ fn job_record_to_batch(record: &JobArtifactRecord) -> Result<RecordBatch, Artifa
                 .as_ref()
                 .map(|limit| limit.crossing_bytes),
         ])),
-        Arc::new(command_argv_array(&record.argv)?),
+        Arc::new(command_argv_array(&record.command)?),
     ];
     RecordBatch::try_new(protected_record_schema(), columns)
         .map_err(|error| ArtifactError::Arrow(error.to_string()))
@@ -3125,7 +3142,7 @@ fn batch_to_job_record(batch: &RecordBatch) -> Result<JobArtifactRecord, Artifac
             ));
         }
     };
-    let argv = decode_command_argv(batch, 32)?;
+    let command = decode_command(batch, 32)?;
     Ok(JobArtifactRecord {
         repo_id,
         workspace_incarnation,
@@ -3133,7 +3150,7 @@ fn batch_to_job_record(batch: &RecordBatch) -> Result<JobArtifactRecord, Artifac
         sequence,
         state,
         grant_revision,
-        argv,
+        command,
         output_limit,
         stdout,
         stderr,
@@ -3405,12 +3422,26 @@ fn decode_stream(batch: &RecordBatch, offset: usize) -> Result<StreamInfo, Artif
     })
 }
 
-fn decode_command_argv(
-    batch: &RecordBatch,
-    index: usize,
-) -> Result<Vec<CommandArg>, ArtifactError> {
+fn decode_command(batch: &RecordBatch, index: usize) -> Result<ExecCommand, ArtifactError> {
     let values = list(batch, index)?.value(0);
     let values = downcast::<BinaryArray>(values.as_ref(), "argv.values")?;
+    if values.len() == 2
+        && !values.is_null(0)
+        && !values.is_null(1)
+        && values.value(0) == SCRIPT_RECORD_TAG
+    {
+        let json = values.value(1);
+        if json.len() > MAX_SCRIPT_RECORD_BYTES {
+            return Err(ArtifactError::Dto(DtoError::ScriptTooLarge));
+        }
+        let script = serde_json::from_slice(json)
+            .map_err(|error| ArtifactError::Arrow(format!("script record: {error}")))?;
+        return Ok(ExecCommand::Script(script));
+    }
+    decode_command_argv(values).map(ExecCommand::Argv)
+}
+
+fn decode_command_argv(values: &BinaryArray) -> Result<Vec<CommandArg>, ArtifactError> {
     if values.is_empty() || values.value(0).is_empty() {
         return Err(ArtifactError::Dto(DtoError::InvalidCommandArgv));
     }
@@ -4157,7 +4188,7 @@ mod tests {
             sequence: 1,
             state: JobState::Exited,
             grant_revision: 1,
-            argv: vec!["true".into()],
+            command: crate::api::dto::ExecCommand::Argv(vec!["true".into()]),
             output_limit: None,
             stdout: inline_stream(b""),
             stderr: inline_stream(b""),
@@ -4324,7 +4355,12 @@ mod tests {
         let mut store = store_at(&root, ArtifactConfig::default());
         let job_id = store.next_job_id().unwrap();
         let token = store
-            .begin_job(job_id, 1, &["true".into()], OutputTargets::default())
+            .begin_job(
+                job_id,
+                1,
+                &crate::api::dto::ExecCommand::Argv(vec!["true".into()]),
+                OutputTargets::default(),
+            )
             .unwrap();
         let namespace = token.namespace;
         let sealed = store.finish(token, JobState::Exited).unwrap();
@@ -4351,7 +4387,7 @@ mod tests {
             .begin_job(
                 foreign_job_id,
                 1,
-                &["true".into()],
+                &crate::api::dto::ExecCommand::Argv(vec!["true".into()]),
                 OutputTargets::default(),
             )
             .unwrap();
@@ -4492,7 +4528,12 @@ mod tests {
             .unwrap();
             let next = store.next_job_id().unwrap();
             let token = store
-                .begin_job(next, 1, &["true".into()], OutputTargets::default())
+                .begin_job(
+                    next,
+                    1,
+                    &crate::api::dto::ExecCommand::Argv(vec!["true".into()]),
+                    OutputTargets::default(),
+                )
                 .unwrap();
             store.finish(token, JobState::Exited).unwrap();
             lineage.insert(origin.clone());
@@ -4753,7 +4794,7 @@ mod tests {
             .begin_job(
                 JobId::new(1).unwrap(),
                 1,
-                &["true".into()],
+                &crate::api::dto::ExecCommand::Argv(vec!["true".into()]),
                 OutputTargets::default(),
             )
             .unwrap();
@@ -4812,7 +4853,7 @@ mod tests {
             .begin_job(
                 JobId::new(1).unwrap(),
                 1,
-                &["true".into()],
+                &crate::api::dto::ExecCommand::Argv(vec!["true".into()]),
                 OutputTargets::default(),
             )
             .unwrap();
@@ -4847,7 +4888,7 @@ mod tests {
             .begin_job(
                 JobId::new(1).unwrap(),
                 1,
-                &["true".into()],
+                &crate::api::dto::ExecCommand::Argv(vec!["true".into()]),
                 OutputTargets::default(),
             )
             .unwrap();
@@ -4881,7 +4922,7 @@ mod tests {
             .begin_job(
                 JobId::new(1).unwrap(),
                 1,
-                &["true".into()],
+                &crate::api::dto::ExecCommand::Argv(vec!["true".into()]),
                 OutputTargets::default(),
             )
             .unwrap();
@@ -4979,7 +5020,7 @@ mod tests {
             store.begin_job(
                 JobId::new(1).unwrap(),
                 1,
-                &["true".into()],
+                &crate::api::dto::ExecCommand::Argv(vec!["true".into()]),
                 OutputTargets {
                     stdout: StreamTarget::Redirect { source, descriptor },
                     stderr: StreamTarget::Captured,

@@ -13,6 +13,7 @@ async-trait = "0.1"
 base64 = "0.22"
 bytes = "1"
 cowshed-core.workspace = true
+cowshed-shell = { path = "../cowshed-shell" }
 cowshed-gateway = { path = "../cowshed-gateway" }
 clap.workspace = true
 

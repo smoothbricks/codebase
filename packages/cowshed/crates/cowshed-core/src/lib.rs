@@ -21,6 +21,7 @@ pub mod project_policy;
 pub mod repository;
 pub mod runtime;
 pub mod sandbox;
+pub mod script;
 pub mod secrets;
 pub mod storage;
 mod timing;

@@ -131,7 +131,7 @@ describe('napi wire contract', () => {
     // wire carried tagged `CommandArg` objects, so every real listJobs/status/wait parse threw.
     // Flattening argv back to bare strings must fail, or none of the above is guarding anything.
     const job = seamTypes.JobInfo.assertOne(corpus.JobInfo?.queued);
-    const flattened = { ...job, argv: job.argv.map((argument) => argument.data) };
+    const flattened = { ...job, argv: (job.argv ?? []).map((argument) => argument.data) };
 
     expect(() => seamTypes.JobInfo.assertOne(flattened)).toThrow();
     expect(() => seamTypes.JobInfo.parseOne(JSON.stringify(flattened))).toThrow();
@@ -158,10 +158,10 @@ describe('napi wire contract', () => {
   it('keeps a non-UTF-8 argument tagged rather than mangled', () => {
     const job = seamTypes.JobInfo.assertOne(corpus.JobInfo?.signaledNonUtf8Argv);
 
-    expect(job.argv.map((argument) => argument.encoding)).toEqual(['utf8', 'utf8', 'base64']);
+    expect((job.argv ?? []).map((argument) => argument.encoding)).toEqual(['utf8', 'utf8', 'base64']);
     // The tag is load-bearing: these bytes are not valid UTF-8, so a `string[]` argv would have
     // had to lose them. Decoding the tagged form must reproduce them exactly.
-    const tagged = job.argv.at(-1);
+    const tagged = job.argv?.at(-1);
     expect(tagged?.encoding).toBe('base64');
     expect(Array.from(Buffer.from(tagged?.data ?? '', 'base64'))).toEqual([0xff, 0xfe, 0x80]);
   });
@@ -174,5 +174,17 @@ describe('napi wire contract', () => {
 
     const { cwd: _cwd, ...withoutCwd } = job;
     expect(() => seamTypes.JobInfo.assertOne(withoutCwd)).toThrow();
+  });
+
+  it('admits a job with exactly one of argv and script', () => {
+    // The Rust side flattens one `ExecCommand`, so no job carries both or neither. A type that
+    // made both fields optional would accept either impossible shape.
+    const script = seamTypes.JobInfo.assertOne(corpus.JobInfo?.scriptSyntax);
+    const argv = seamTypes.JobInfo.assertOne(corpus.JobInfo?.queued);
+    expect(script.failure).toBe('scriptSyntax');
+
+    expect(() => seamTypes.JobInfo.assertOne({ ...script, argv: argv.argv })).toThrow();
+    const { script: _script, ...neither } = script;
+    expect(() => seamTypes.JobInfo.assertOne(neither)).toThrow();
   });
 });

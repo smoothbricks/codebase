@@ -1,3 +1,4 @@
+use cowshed_core::api::ExecCommand;
 use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
@@ -86,7 +87,12 @@ fn begin_with_argv(
 ) -> JobArtifactToken {
     let job_id = store.next_job_id().unwrap();
     store
-        .begin_job(job_id, grant_revision, argv, targets)
+        .begin_job(
+            job_id,
+            grant_revision,
+            &cowshed_core::api::ExecCommand::Argv(argv.to_vec()),
+            targets,
+        )
         .unwrap()
 }
 
@@ -269,11 +275,21 @@ fn stale_and_foreign_tokens_are_typed_conflicts() {
     let mut actor_store = store(root.path(), ArtifactConfig::default());
     let stale_id = actor_store.next_job_id().unwrap();
     let stale = actor_store
-        .begin_job(stale_id, 1, &["true".into()], OutputTargets::default())
+        .begin_job(
+            stale_id,
+            1,
+            &ExecCommand::Argv(vec!["true".into()]),
+            OutputTargets::default(),
+        )
         .unwrap();
     actor_store.abort(stale).unwrap();
     assert!(matches!(
-        actor_store.begin_job(stale_id, 1, &["true".into()], OutputTargets::default()),
+        actor_store.begin_job(
+            stale_id,
+            1,
+            &ExecCommand::Argv(vec!["true".into()]),
+            OutputTargets::default()
+        ),
         Err(ArtifactError::TokenConflict { .. })
     ));
 
@@ -378,7 +394,12 @@ fn unsafe_argv_rejects_before_artifact_creation_or_id_advance() {
 
     let nul = [CommandArg::from(OsString::from_vec(vec![b'x', 0]))];
     assert!(matches!(
-        store.begin_job(job_id, 1, &nul, OutputTargets::default()),
+        store.begin_job(
+            job_id,
+            1,
+            &ExecCommand::Argv(nul.to_vec()),
+            OutputTargets::default()
+        ),
         Err(ArtifactError::Dto(DtoError::CommandArgumentContainsNul))
     ));
     assert_eq!(store.next_job_id().unwrap(), job_id);
@@ -390,7 +411,12 @@ fn unsafe_argv_rejects_before_artifact_creation_or_id_advance() {
             + 1
     ]))];
     assert!(matches!(
-        store.begin_job(job_id, 1, &oversize, OutputTargets::default()),
+        store.begin_job(
+            job_id,
+            1,
+            &ExecCommand::Argv(oversize.to_vec()),
+            OutputTargets::default(),
+        ),
         Err(ArtifactError::Dto(DtoError::CommandArgumentTooLarge))
     ));
     assert_eq!(store.next_job_id().unwrap(), job_id);
@@ -408,7 +434,7 @@ fn non_utf8_argv_round_trips_through_binary_arrow_and_recovery() {
     ];
     let token = begin_with_argv(&mut store, 7, &argv, OutputTargets::default());
     let sealed = store.finish(token, JobState::Exited).unwrap();
-    assert_eq!(sealed.record.argv, argv);
+    assert_eq!(sealed.record.command, ExecCommand::Argv(argv.clone()));
 
     let schema = protected_record_schema();
     let field = schema.field_with_name("argv").unwrap();
@@ -427,8 +453,13 @@ fn non_utf8_argv_round_trips_through_binary_arrow_and_recovery() {
         })
         .next()
         .expect("terminal job record");
-    assert_eq!(recovered.argv, argv);
-    assert_eq!(recovered.argv[0].as_os_str().as_bytes(), raw);
+    assert_eq!(recovered.command, ExecCommand::Argv(argv.clone()));
+    assert_eq!(
+        recovered.command.argv().expect("an argv job")[0]
+            .as_os_str()
+            .as_bytes(),
+        raw
+    );
 }
 
 #[test]

@@ -25,10 +25,10 @@ use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _, Interest};
 use tokio::sync::mpsc;
 
 use super::shell_host::{
-    FrameReader, FrameWriter, MAX_FRAME_BYTES, REPLY_ACTIVATED, REPLY_ACTIVATION_EXITED,
-    REPLY_ACTIVATION_UNUSABLE, REPLY_APPROVED, REPLY_EXITED, REPLY_STARTED, REQUEST_ACTIVATE,
-    REQUEST_APPROVE, REQUEST_RUN, RawWaitStatus, SHELL_HOST_DIRECTORY, ShellHostProgram,
-    send_with_descriptors,
+    BINDING_ARRAY, BINDING_SCALAR, FrameReader, FrameWriter, MAX_FRAME_BYTES, REPLY_ACTIVATED,
+    REPLY_ACTIVATION_EXITED, REPLY_ACTIVATION_UNUSABLE, REPLY_APPROVED, REPLY_EXITED,
+    REPLY_SCRIPT_SYNTAX, REPLY_STARTED, REQUEST_ACTIVATE, REQUEST_APPROVE, REQUEST_RUN,
+    REQUEST_SCRIPT, RawWaitStatus, SHELL_HOST_DIRECTORY, ShellHostProgram, send_with_descriptors,
 };
 use super::shell_pool::{Acquired, Activation, Activator, ShellPool, ShellPoolConfig};
 use super::shell_watch::{ActivationEvidence, Snapshot, decode_direnv_watches};
@@ -42,11 +42,11 @@ use crate::exec::{ExecError, SANDBOX_EXEC, classify_spawn_error, prepare_child_d
 use crate::storage::job_artifact::StreamKind;
 
 /// Everything that makes one warm shell interchangeable with another: the same profile (mode
-/// and grants), the same sandbox environment, the same `.envrc`, the same host program.
+/// and grants), the same sandbox environment, the same `.envrc` or none, the same host program.
 fn pool_key(
     profile: &str,
     environment: &BTreeMap<OsString, OsString>,
-    envrc_directory: &Path,
+    envrc_directory: Option<&Path>,
     grant_revision: u64,
     program: &ShellHostProgram,
 ) -> Sha256Digest {
@@ -56,7 +56,13 @@ fn pool_key(
         bytes.extend_from_slice(value);
     };
     field(profile.as_bytes());
-    field(envrc_directory.as_os_str().as_bytes());
+    match envrc_directory {
+        Some(directory) => {
+            field(b"envrc");
+            field(directory.as_os_str().as_bytes());
+        }
+        None => field(b"bare"),
+    }
     field(&grant_revision.to_le_bytes());
     field(program.executable().as_os_str().as_bytes());
     for argument in program.arguments() {
@@ -73,20 +79,27 @@ fn pool_key(
 pub(super) struct WorkspaceShells {
     program: ShellHostProgram,
     config: ShellPoolConfig,
-    /// Keyed by (read-only, `.envrc` directory); a changed identity replaces the pool, whose
-    /// idle hosts end with it and whose executing hosts are not returned.
-    pools: BTreeMap<(bool, PathBuf), (Sha256Digest, ShellPool<HostActivator>)>,
+    /// Keyed by (read-only, `.envrc` directory or none); a changed identity replaces the pool,
+    /// whose idle hosts end with it and whose executing hosts are not returned.
+    pools: BTreeMap<(bool, Option<PathBuf>), (Sha256Digest, ShellPool<HostActivator>)>,
+}
+
+/// What a warm host runs for one job.
+pub(super) enum HostCommand {
+    Argv(Vec<OsString>),
+    Script(crate::script::RenderedScript),
 }
 
 /// One command admitted to run in a warm shell.
 pub(super) struct PooledSpawn<'a> {
     pub job_id: JobId,
-    pub argv: Vec<OsString>,
+    pub command: HostCommand,
     pub cwd: PathBuf,
     pub profile: String,
     pub read_only: bool,
     pub workspace_mount: PathBuf,
-    pub envrc_directory: PathBuf,
+    /// The `.envrc` a host activates, or `None` for a workspace with no shell configuration.
+    pub envrc_directory: Option<PathBuf>,
     pub environment: SandboxEnvironment,
     pub caller: &'a BTreeMap<String, String>,
     pub grant_revision: u64,
@@ -110,7 +123,7 @@ impl WorkspaceShells {
         let key = pool_key(
             &spawn.profile,
             &base,
-            &spawn.envrc_directory,
+            spawn.envrc_directory.as_deref(),
             spawn.grant_revision,
             &self.program,
         );
@@ -171,7 +184,7 @@ impl WorkspaceShells {
                 stderr: stderr_write,
             },
             RunCommand {
-                argv: spawn.argv,
+                command: spawn.command,
                 cwd: spawn.cwd,
                 overlay,
             },
@@ -300,7 +313,7 @@ struct JobIo {
 }
 
 struct RunCommand {
-    argv: Vec<OsString>,
+    command: HostCommand,
     cwd: PathBuf,
     overlay: Vec<(OsString, OsString)>,
 }
@@ -311,6 +324,8 @@ enum Outcome {
     Unobserved(CowshedError),
     /// No command was started; the diagnostic is already on the job's stderr.
     NotLaunched(CowshedError),
+    /// The script did not parse; the host wrote the diagnostic to the job's stderr.
+    ScriptSyntax,
 }
 
 fn decode(status: RawWaitStatus) -> Outcome {
@@ -345,6 +360,7 @@ async fn drive(
             }
             ProcessEvent::LaunchFailed { job_id, error }
         }
+        Outcome::ScriptSyntax => ProcessEvent::ScriptSyntax { job_id },
     };
     let _ = events.send(event).await;
 }
@@ -405,6 +421,7 @@ async fn run_pooled(
     let pid = match started {
         Ok(Started::Running(pid)) => pid,
         Ok(Started::Unexecutable(status)) => return decode(status),
+        Ok(Started::ScriptSyntax) => return Outcome::ScriptSyntax,
         Err(error) => {
             checkout.poison();
             return Outcome::NotLaunched(error);
@@ -449,6 +466,30 @@ enum Started {
     Running(u32),
     /// The argv could not be executed; the host already wrote why to the job's stderr.
     Unexecutable(RawWaitStatus),
+    /// The script did not parse; the host already wrote why to the job's stderr.
+    ScriptSyntax,
+}
+
+/// The first fields of a script request: its text and its bindings.
+fn script_request(script: &crate::script::RenderedScript) -> io::Result<FrameWriter> {
+    let count = u32::try_from(script.bindings.len())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "too many script bindings"))?;
+    let mut frame = FrameWriter::new(REQUEST_SCRIPT)
+        .bytes(script.text.as_bytes())?
+        .u32(count);
+    for binding in &script.bindings {
+        frame = match binding {
+            crate::script::Binding::Scalar { name, value } => frame
+                .bytes(name.as_bytes())?
+                .u32(u32::from(BINDING_SCALAR))
+                .list(std::iter::once(value.as_bytes()))?,
+            crate::script::Binding::Array { name, values } => frame
+                .bytes(name.as_bytes())?
+                .u32(u32::from(BINDING_ARRAY))
+                .list(values.iter().map(String::as_bytes))?,
+        };
+    }
+    Ok(frame)
 }
 
 fn protocol_error(what: &str, error: impl std::fmt::Display) -> CowshedError {
@@ -490,8 +531,13 @@ impl ExecHost {
     }
 
     async fn run(&mut self, command: &RunCommand, descriptors: [OwnedFd; 3]) -> Result<Started> {
-        let frame = FrameWriter::new(REQUEST_RUN)
-            .list(command.argv.iter().map(|argument| argument.as_bytes()))
+        let frame = match &command.command {
+            HostCommand::Argv(argv) => {
+                FrameWriter::new(REQUEST_RUN).list(argv.iter().map(|argument| argument.as_bytes()))
+            }
+            HostCommand::Script(script) => script_request(script),
+        };
+        let frame = frame
             .and_then(|frame| frame.bytes(command.cwd.as_os_str().as_bytes()))
             .and_then(|frame| {
                 frame.list(
@@ -519,6 +565,10 @@ impl ExecHost {
             }
             REPLY_EXITED => {
                 Started::Unexecutable(fields.i32().map_err(|e| protocol_error("reply", e))?)
+            }
+            REPLY_SCRIPT_SYNTAX => {
+                fields.bytes().map_err(|e| protocol_error("reply", e))?;
+                Started::ScriptSyntax
             }
             other => return Err(protocol_error("reply", format!("unexpected tag {other}"))),
         };
@@ -569,10 +619,19 @@ pub(super) struct HostActivator {
     workspace_mount: PathBuf,
     profile: String,
     environment: BTreeMap<OsString, OsString>,
-    envrc_directory: PathBuf,
+    /// `None` for a workspace with no shell configuration: its hosts hold the sandbox
+    /// environment itself, which no workspace file can make stale.
+    envrc_directory: Option<PathBuf>,
 }
 
 impl HostActivator {
+    /// Where the host starts: the `.envrc`'s directory, or the workspace root.
+    fn home(&self) -> &Path {
+        self.envrc_directory
+            .as_deref()
+            .unwrap_or(&self.workspace_mount)
+    }
+
     async fn spawn_host(&self) -> Result<ExecHost> {
         let mount = self.workspace_mount.clone();
         let program = self.program.clone();
@@ -590,8 +649,8 @@ impl HostActivator {
             .args(self.program.arguments())
             .env_clear()
             .envs(&self.environment)
-            .env("PWD", &self.envrc_directory)
-            .current_dir(&self.envrc_directory)
+            .env("PWD", self.home())
+            .current_dir(self.home())
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -646,7 +705,17 @@ impl HostActivator {
         predicted: Vec<PathBuf>,
         (stdout, stderr): (OwnedFd, OwnedFd),
     ) -> HostActivation {
-        let envrc = self.envrc_directory.join(".envrc");
+        let Some(envrc_directory) = &self.envrc_directory else {
+            // Nothing to evaluate and nothing to watch: the generation never goes stale.
+            let now = SystemTime::now();
+            return HostActivation::Ready(Ok(ActivationEvidence {
+                entries: Vec::new(),
+                before: Snapshot::default(),
+                started: now,
+                after: Snapshot::default(),
+            }));
+        };
+        let envrc = envrc_directory.join(".envrc");
         let request = FrameWriter::new(REQUEST_APPROVE)
             .bytes(envrc.as_os_str().as_bytes())
             .and_then(FrameWriter::finish);
@@ -674,7 +743,7 @@ impl HostActivator {
         let before = Snapshot::take(predicted.iter().map(PathBuf::as_path));
         let started = SystemTime::now();
         let request = FrameWriter::new(REQUEST_ACTIVATE)
-            .bytes(self.envrc_directory.as_os_str().as_bytes())
+            .bytes(envrc_directory.as_os_str().as_bytes())
             .and_then(FrameWriter::finish);
         let request = match request {
             Ok(request) => request,

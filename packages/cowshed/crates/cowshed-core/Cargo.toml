@@ -13,13 +13,6 @@ publish.workspace = true
 [package.metadata.smoothbricks.test]
 shards = 3
 
-# The warm exec host as its own binary, for tests that run the real host without a CLI.
-[[bin]]
-name = "cowshed-shell-host"
-path = "src/bin/shell_host.rs"
-test = false
-bench = false
-
 [[bin]]
 name = "apfs-benchmark"
 path = "src/bin/apfs_benchmark.rs"

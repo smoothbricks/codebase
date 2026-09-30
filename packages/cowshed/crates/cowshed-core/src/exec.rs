@@ -364,7 +364,10 @@ fn contains_nul(value: &OsStr) -> bool {
     value.as_encoded_bytes().contains(&0)
 }
 
-fn contained_cwd(workspace_mount: &Path, requested: &Path) -> Result<PathBuf, ExecError> {
+pub(crate) fn contained_cwd(
+    workspace_mount: &Path,
+    requested: &Path,
+) -> Result<PathBuf, ExecError> {
     if !is_lexically_canonical(workspace_mount) {
         return Err(ExecError::WrapperFailure {
             stage: WrapperStage::ValidateProfile,

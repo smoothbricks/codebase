@@ -22,7 +22,6 @@ use crate::api::dto::{
     GrantSet, JobId, JobInfo, LandOptions, LandReport, MirrorInfo, ProjectGrantDelta,
     ProjectGrants, PushOptions, PushReport, RebaseOptions, RemoveOptions, RemoveReport,
     RevisionResult, RunSandboxMode, StdinSource, WorkspaceIncarnation, WorkspaceInfo,
-    validate_command_argv,
 };
 use crate::api::server::{
     ConnectionAuthority, RouterCommand, RouterHandle, RouterRequest, RouterResponse,
@@ -1499,7 +1498,10 @@ struct ExecWire {
     workspace: WorkspaceName,
     workspace_incarnation: WorkspaceIncarnation,
     session: Option<String>,
-    argv: Vec<CommandArg>,
+    #[serde(default)]
+    argv: Option<Vec<CommandArg>>,
+    #[serde(default)]
+    script: Option<crate::api::dto::ScriptCommand>,
     cwd: Option<crate::api::dto::WorkspacePath>,
     mode: RunSandboxMode,
     env: std::collections::HashMap<String, String>,
@@ -1520,13 +1522,24 @@ enum StdinWire {
     },
 }
 
+/// The one command an exec request carries, validated before anything is admitted.
+fn exec_command(
+    argv: Option<Vec<CommandArg>>,
+    script: Option<crate::api::dto::ScriptCommand>,
+) -> Result<crate::api::dto::ExecCommand> {
+    let command = crate::api::dto::ExecCommand::from_fields(argv, script)
+        .and_then(|command| command.validate().map(|()| command))
+        .map_err(|error| {
+            CowshedError::usage(error.to_string(), "provide a valid bounded command")
+        })?;
+    Ok(command)
+}
+
 fn decode_exec_request(
     request: &RouterRequest,
 ) -> Result<(WorkerScope, Option<String>, ExecRequest)> {
     let wire: ExecWire = decode_params(request.params(), request.method())?;
-    validate_command_argv(&wire.argv).map_err(|error| {
-        CowshedError::usage(error.to_string(), "provide a valid bounded command argv")
-    })?;
+    let command = exec_command(wire.argv, wire.script)?;
     let stdin = match wire.stdin {
         StdinWire::Empty => {
             if request.upload().is_some() {
@@ -1575,7 +1588,7 @@ fn decode_exec_request(
         scope,
         wire.session,
         ExecRequest {
-            argv: wire.argv,
+            command,
             cwd: wire.cwd,
             mode,
             env: wire.env,
@@ -9942,7 +9955,11 @@ fn require_expected_ref(
 #[cfg(target_os = "macos")]
 fn land_check_request(check: &str) -> ExecRequest {
     ExecRequest {
-        argv: vec!["/bin/sh".into(), "-c".into(), check.into()],
+        command: crate::api::dto::ExecCommand::Argv(vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            check.into(),
+        ]),
         cwd: None,
         mode: RunSandboxMode::ReadWrite,
         env: std::collections::HashMap::new(),
@@ -14180,5 +14197,59 @@ mod adopt_secret_policy_tests {
             error.hint
         );
         assert!(error.hint.contains(WAIVER_EXAMPLE), "{}", error.hint);
+    }
+}
+
+#[cfg(test)]
+mod exec_admission_tests {
+    use super::{ExecWire, exec_command};
+    use crate::api::dto::ExecCommand;
+    use crate::error::ErrorCode;
+
+    fn request(command: serde_json::Value) -> ExecWire {
+        let mut wire = serde_json::json!({
+            "repoId": "acme/widget",
+            "workspace": "widget",
+            "workspaceIncarnation": "0123456789abcdef0123456789abcdef",
+            "session": null,
+            "cwd": null,
+            "mode": "readWrite",
+            "env": {},
+            "trace": null,
+            "stdin": {"kind": "empty"},
+            "stdoutCopy": null,
+            "stderrCopy": null,
+        });
+        wire.as_object_mut()
+            .expect("an object")
+            .extend(command.as_object().expect("command fields").clone());
+        serde_json::from_value(wire).expect("the request decodes")
+    }
+
+    #[test]
+    fn the_controller_admits_a_script_exec_request() {
+        let wire = request(serde_json::json!({
+            "script": {"parts": ["echo ", ""], "values": [{"word": "a b"}]},
+        }));
+        let command = exec_command(wire.argv, wire.script).expect("a script is admitted");
+        let ExecCommand::Script(script) = command else {
+            panic!("a script request became {command:?}");
+        };
+        assert_eq!(script.parts(), ["echo ", ""]);
+    }
+
+    #[test]
+    fn an_exec_request_carries_exactly_one_command() {
+        let argv = serde_json::json!([{"encoding": "utf8", "data": "true"}]);
+        let script = serde_json::json!({"parts": ["true"], "values": []});
+        for fields in [
+            serde_json::json!({"argv": argv, "script": script}),
+            serde_json::json!({}),
+            serde_json::json!({"argv": null, "script": null}),
+        ] {
+            let wire = request(fields.clone());
+            let error = exec_command(wire.argv, wire.script).expect_err("refused");
+            assert_eq!(error.code, ErrorCode::Usage, "{fields}: {error:?}");
+        }
     }
 }

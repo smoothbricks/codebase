@@ -199,13 +199,34 @@ export interface OutputPublication {
   readonly policy: 'createNew' | 'replace';
 }
 
-export interface ExecRequest {
-  /**
-   * UTF-8 arguments. Not `CommandArg[]` like `JobInfo.argv`, and deliberately so: a JS string is
-   * UTF-16 and cannot hold a non-UTF-8 byte sequence, so `string[]` is exactly the set this
-   * caller can express and `String -> CommandArg` is exact for all of it.
-   */
-  readonly argv: readonly string[];
+/** One value substituted into a script: one word, or one word per element where it stands alone. */
+export type ScriptValue = { readonly word: string } | { readonly words: readonly string[] };
+
+/**
+ * Bash-compatible shell text as a template: exactly one more literal part than values. A value is
+ * never shell text; it is substituted where it stands as a word or a piece of one.
+ */
+export interface ScriptCommand {
+  readonly parts: readonly string[];
+  readonly values: readonly ScriptValue[];
+}
+
+/** What a job runs: exactly one of a byte-exact argv and a script. */
+export type ExecCommand =
+  | {
+      /**
+       * UTF-8 arguments. Not `CommandArg[]` like `JobInfo.argv`, and deliberately so: a JS string
+       * is UTF-16 and cannot hold a non-UTF-8 byte sequence, so `string[]` is exactly the set this
+       * caller can express and `String -> CommandArg` is exact for all of it.
+       */
+      readonly argv: readonly string[];
+      readonly script?: never;
+    }
+  | { readonly script: ScriptCommand; readonly argv?: never };
+
+export type ExecRequest = ExecCommand & ExecOptions;
+
+export interface ExecOptions {
   readonly cwd?: string;
   readonly mode?: RunSandboxMode;
   readonly env?: Readonly<Record<string, string>>;
@@ -340,14 +361,20 @@ export interface TraceContext {
   readonly spanId: string;
 }
 
-export interface JobInfo {
+/** What a recorded job ran: exactly one of its argv and its script. */
+export type JobCommand =
+  | { readonly argv: readonly CommandArg[]; readonly script?: never }
+  | { readonly script: ScriptCommand; readonly argv?: never };
+
+export type JobInfo = JobInfoFields & JobCommand;
+
+export interface JobInfoFields {
   readonly repoId: string;
   readonly workspaceIncarnation: string;
   readonly jobId: number;
   readonly state: JobState;
   readonly pid?: number;
   readonly grantRevision: number;
-  readonly argv: readonly CommandArg[];
   /**
    * The job's working directory, or `null` for the workspace root. Explicitly `null` rather than
    * absent: unlike every other optional here, the controller always emits this key.
@@ -363,7 +390,12 @@ export interface JobInfo {
   /** Present exactly for the `outputLimit` state. */
   readonly outputLimit?: OutputLimitInfo;
   readonly stdin: StdinInfo;
+  /** Present only for a failed job that failed before its command ran. */
+  readonly failure?: JobFailure;
 }
+
+/** Why a job failed when no command's own status explains it. */
+export type JobFailure = 'scriptSyntax';
 
 /**
  * Affine inherited descriptor accepted by the controller handshake.

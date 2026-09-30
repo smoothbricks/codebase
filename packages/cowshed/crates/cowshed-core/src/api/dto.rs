@@ -68,6 +68,16 @@ pub enum DtoError {
     InvalidBranchName(String),
     #[error("invalid fully-qualified git ref {0:?}")]
     InvalidGitRef(String),
+    #[error(
+        "a script needs exactly one more part than values, got {parts} parts and {values} values"
+    )]
+    ScriptShape { parts: usize, values: usize },
+    #[error("script text or a script value contains NUL")]
+    ScriptContainsNul,
+    #[error("script parts and values exceed the {MAX_ARGV_BYTES}-byte total limit")]
+    ScriptTooLarge,
+    #[error("a command is exactly one of argv and script")]
+    CommandShape,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -1557,7 +1567,7 @@ pub struct JobInfo {
     pub state: JobState,
     pub pid: Option<u32>,
     pub grant_revision: u64,
-    pub argv: Vec<CommandArg>,
+    pub command: ExecCommand,
     pub cwd: Option<WorkspacePath>,
     pub started: UtcTimestamp,
     pub duration_ms: Option<u64>,
@@ -1567,11 +1577,19 @@ pub struct JobInfo {
     pub trace: TraceContext,
     pub output_limit: Option<OutputLimitInfo>,
     pub stdin: StdinInfo,
+    /// Set only for a job that failed before its command ran, for a reason its exit status
+    /// cannot name.
+    pub failure: Option<JobFailure>,
 }
 
 impl JobInfo {
     pub fn validate(&self) -> Result<(), DtoError> {
-        validate_command_argv(&self.argv)?;
+        self.command.validate()?;
+        if self.failure.is_some() && self.state != JobState::Failed {
+            return Err(DtoError::InvalidJobProjection(
+                "failure is present only for the failed state",
+            ));
+        }
         let terminal = !matches!(self.state, JobState::Queued | JobState::Running);
         if terminal != self.duration_ms.is_some() {
             return Err(DtoError::InvalidJobProjection(
@@ -1612,7 +1630,10 @@ struct JobInfoRef<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     pid: Option<u32>,
     grant_revision: u64,
-    argv: &'a [CommandArg],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    argv: Option<&'a [CommandArg]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    script: Option<&'a ScriptCommand>,
     cwd: &'a Option<WorkspacePath>,
     started: &'a UtcTimestamp,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1625,6 +1646,8 @@ struct JobInfoRef<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     output_limit: Option<&'a OutputLimitInfo>,
     stdin: &'a StdinInfo,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    failure: Option<JobFailure>,
 }
 
 #[derive(Deserialize)]
@@ -1643,7 +1666,10 @@ struct JobInfoWire {
     state: JobState,
     pid: Option<u32>,
     grant_revision: u64,
-    argv: Vec<CommandArg>,
+    #[serde(default)]
+    argv: Option<Vec<CommandArg>>,
+    #[serde(default)]
+    script: Option<ScriptCommand>,
     cwd: RequiredJobCwd,
     started: UtcTimestamp,
     duration_ms: Option<u64>,
@@ -1653,8 +1679,11 @@ struct JobInfoWire {
     trace: TraceContext,
     output_limit: Option<OutputLimitInfo>,
     stdin: StdinInfo,
+    #[serde(default)]
+    failure: Option<JobFailure>,
 }
 
+/// The wire's two mutually exclusive command spellings, `argv` and `script`, as one command.
 impl Serialize for JobInfo {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -1668,7 +1697,8 @@ impl Serialize for JobInfo {
             state: self.state,
             pid: self.pid,
             grant_revision: self.grant_revision,
-            argv: &self.argv,
+            argv: self.command.argv(),
+            script: self.command.script(),
             cwd: &self.cwd,
             started: &self.started,
             duration_ms: self.duration_ms,
@@ -1678,6 +1708,7 @@ impl Serialize for JobInfo {
             trace: &self.trace,
             output_limit: self.output_limit.as_ref(),
             stdin: &self.stdin,
+            failure: self.failure,
         }
         .serialize(serializer)
     }
@@ -1689,6 +1720,8 @@ impl<'de> Deserialize<'de> for JobInfo {
         D: Deserializer<'de>,
     {
         let wire = JobInfoWire::deserialize(deserializer)?;
+        let command =
+            ExecCommand::from_fields(wire.argv, wire.script).map_err(serde::de::Error::custom)?;
         let value = Self {
             repo_id: wire.repo_id,
             workspace_incarnation: wire.workspace_incarnation,
@@ -1696,7 +1729,7 @@ impl<'de> Deserialize<'de> for JobInfo {
             state: wire.state,
             pid: wire.pid,
             grant_revision: wire.grant_revision,
-            argv: wire.argv,
+            command,
             cwd: match wire.cwd {
                 RequiredJobCwd::Nested(path) => Some(path),
                 RequiredJobCwd::Root(()) => None,
@@ -1709,6 +1742,7 @@ impl<'de> Deserialize<'de> for JobInfo {
             trace: wire.trace,
             output_limit: wire.output_limit,
             stdin: wire.stdin,
+            failure: wire.failure,
         };
         value.validate().map_err(serde::de::Error::custom)?;
         Ok(value)
@@ -1919,10 +1953,142 @@ pub struct OutputPublication {
     pub path: WorkspacePath,
     pub policy: PublicationPolicy,
 }
+/// What a job runs.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ExecCommand {
+    /// A byte-exact argv, executed directly.
+    Argv(Vec<CommandArg>),
+    /// Bash-compatible shell text with values substituted as words (11_shell.md).
+    Script(ScriptCommand),
+}
+
+impl ExecCommand {
+    /// The command of a wire object that flattens it into optional `argv` and `script` fields.
+    pub fn from_fields(
+        argv: Option<Vec<CommandArg>>,
+        script: Option<ScriptCommand>,
+    ) -> Result<Self, DtoError> {
+        match (argv, script) {
+            (Some(argv), None) => Ok(Self::Argv(argv)),
+            (None, Some(script)) => Ok(Self::Script(script)),
+            (Some(_), Some(_)) | (None, None) => Err(DtoError::CommandShape),
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), DtoError> {
+        match self {
+            Self::Argv(argv) => validate_command_argv(argv),
+            Self::Script(script) => script.validate(),
+        }
+    }
+
+    pub fn argv(&self) -> Option<&[CommandArg]> {
+        match self {
+            Self::Argv(argv) => Some(argv),
+            Self::Script(_) => None,
+        }
+    }
+
+    pub fn script(&self) -> Option<&ScriptCommand> {
+        match self {
+            Self::Argv(_) => None,
+            Self::Script(script) => Some(script),
+        }
+    }
+}
+
+/// A script as a template: literal shell text `parts` interleaved with `values`, exactly one
+/// more part than values. Values never become shell text; each is substituted where it stands
+/// as a whole word or as part of one (`crate::script`).
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScriptCommand {
+    parts: Vec<String>,
+    values: Vec<ScriptValue>,
+}
+
+/// One value substituted into a script.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub enum ScriptValue {
+    /// Exactly one word, or one piece of a word.
+    Word(String),
+    /// One word per element where the value is a whole bare word; joined by single spaces into
+    /// one word anywhere else.
+    Words(Vec<String>),
+}
+
+impl ScriptCommand {
+    pub fn new(parts: Vec<String>, values: Vec<ScriptValue>) -> Result<Self, DtoError> {
+        let script = Self { parts, values };
+        script.validate()?;
+        Ok(script)
+    }
+
+    pub fn parts(&self) -> &[String] {
+        &self.parts
+    }
+
+    pub fn values(&self) -> &[ScriptValue] {
+        &self.values
+    }
+
+    fn validate(&self) -> Result<(), DtoError> {
+        if self.parts.len() != self.values.len() + 1 {
+            return Err(DtoError::ScriptShape {
+                parts: self.parts.len(),
+                values: self.values.len(),
+            });
+        }
+        let strings = self
+            .parts
+            .iter()
+            .chain(self.values.iter().flat_map(|value| match value {
+                ScriptValue::Word(word) => std::slice::from_ref(word),
+                ScriptValue::Words(words) => words.as_slice(),
+            }));
+        let mut total = 0_usize;
+        for string in strings {
+            if string.contains('\0') {
+                return Err(DtoError::ScriptContainsNul);
+            }
+            total = total
+                .checked_add(string.len())
+                .filter(|total| *total <= MAX_ARGV_BYTES)
+                .ok_or(DtoError::ScriptTooLarge)?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ScriptCommandWire {
+    parts: Vec<String>,
+    values: Vec<ScriptValue>,
+}
+
+impl<'de> Deserialize<'de> for ScriptCommand {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = ScriptCommandWire::deserialize(deserializer)?;
+        Self::new(wire.parts, wire.values).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Why a job failed when no command's own status explains it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum JobFailure {
+    /// The script did not parse; nothing ran.
+    ScriptSyntax,
+}
 
 #[derive(Debug)]
 pub struct ExecRequest {
-    pub argv: Vec<CommandArg>,
+    pub command: ExecCommand,
     pub cwd: Option<WorkspacePath>,
     pub mode: RunSandboxMode,
     pub env: HashMap<String, String>,

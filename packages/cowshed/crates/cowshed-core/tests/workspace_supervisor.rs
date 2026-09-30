@@ -7,10 +7,10 @@ use std::time::Duration;
 use async_trait::async_trait;
 use bytes::Bytes;
 use cowshed_core::api::{
-    CONTROLLER_COMMITMENT_VERSION, CommandArg, ControllerCommitment, ExecRequest, ExitStatus,
-    JobId, JobState, MAX_COMMAND_ARG_BYTES, OutputLimitInfo, OutputPublication, OutputStorage,
-    OutputSummary, ProtectedOutput, RunSandboxMode, Sha256Digest, StdinSource, StreamInfo,
-    WorkspacePath,
+    CONTROLLER_COMMITMENT_VERSION, CommandArg, ControllerCommitment, ExecCommand, ExecRequest,
+    ExitStatus, JobId, JobState, MAX_COMMAND_ARG_BYTES, OutputLimitInfo, OutputPublication,
+    OutputStorage, OutputSummary, ProtectedOutput, RunSandboxMode, Sha256Digest, StdinSource,
+    StreamInfo, WorkspacePath,
 };
 use cowshed_core::error::{CowshedError, ErrorCode, Result};
 use cowshed_core::metadata::{PortBlock, WorkspaceIncarnation, WorkspaceName};
@@ -22,8 +22,8 @@ use tokio::sync::mpsc;
 use cowshed_core::runtime::supervisor::{
     ArtifactSeal, ArtifactSink, ArtifactStoreSink, ArtifactWrite, CheckpointBarrier,
     CommitmentDraft, CommitmentSink, ProcessEvent, ProcessSignal, ProcessSpawnRequest,
-    RunningProcess, SessionToken, SpawnSink, WorkspaceAuthoritySnapshot, WorkspaceSupervisor,
-    WorkspaceSupervisorConfig, WorkspaceSupervisorHandle,
+    RunningProcess, SessionToken, SpawnCommand, SpawnSink, WorkspaceAuthoritySnapshot,
+    WorkspaceSupervisor, WorkspaceSupervisorConfig, WorkspaceSupervisorHandle,
 };
 
 #[derive(Debug)]
@@ -158,9 +158,9 @@ impl ArtifactSink for FakeArtifactSink {
         &mut self,
         expected_job_id: JobId,
         _grant_revision: u64,
-        argv: &[CommandArg],
+        command: &cowshed_core::api::ExecCommand,
     ) -> Result<()> {
-        assert!(!argv.is_empty());
+        assert!(command.validate().is_ok());
         assert_eq!(expected_job_id, self.next);
         self.observations
             .send(ArtifactObservation::Admit(expected_job_id))
@@ -498,7 +498,7 @@ fn real_store_harness(supervisor_config: WorkspaceSupervisorConfig) -> Harness {
 
 fn request(stdin: StdinSource) -> ExecRequest {
     ExecRequest {
-        argv: vec!["printf".into(), "payload".into()],
+        command: cowshed_core::api::ExecCommand::Argv(vec!["printf".into(), "payload".into()]),
         cwd: Some(WorkspacePath::new("packages/app").unwrap()),
         mode: RunSandboxMode::ReadWrite,
         env: BTreeMap::from([("LANG".into(), "C".into())])
@@ -631,16 +631,18 @@ async fn host_controller_exec_mode_enforces_each_request_without_widening_the_ce
             let mut exec = request(StdinSource::Empty);
             exec.mode = mode;
             exec.cwd = None;
-            exec.argv = [
-                "/bin/sh",
-                "-c",
-                "printf state > \"$XDG_DATA_HOME/probe\" && printf state > \"$HOME/probe\" && mkdir -p \"$XDG_RUNTIME_DIR/test\" && /bin/cat readable && printf written > \"$1\"",
-                "probe",
-                &target,
-            ]
-            .into_iter()
-            .map(CommandArg::from)
-            .collect();
+            exec.command = ExecCommand::Argv(
+                [
+                    "/bin/sh",
+                    "-c",
+                    "printf state > \"$XDG_DATA_HOME/probe\" && printf state > \"$HOME/probe\" && mkdir -p \"$XDG_RUNTIME_DIR/test\" && /bin/cat readable && printf written > \"$1\"",
+                    "probe",
+                    &target,
+                ]
+                .into_iter()
+                .map(CommandArg::from)
+                .collect(),
+            );
             let job = h.handle.exec(None, exec).await.unwrap();
             let spawned = h.spawned.recv().await.unwrap();
             // Run the admitted request through the production spawn checks and the
@@ -723,15 +725,23 @@ async fn non_utf8_argv_reaches_spawn_and_job_info_without_loss() {
     let mut h = harness(1, 1024, false, false);
     let raw = vec![0xff, b'x', 0x80];
     let mut exec = request(StdinSource::Empty);
-    exec.argv = vec![
+    exec.command = ExecCommand::Argv(vec![
         CommandArg::from(OsString::from_vec(raw.clone())),
         CommandArg::from("--flag"),
-    ];
+    ]);
     let job = h.handle.exec(None, exec).await.unwrap();
     let spawned = h.spawned.recv().await.unwrap();
-    assert_eq!(spawned.request.argv[0].as_os_str().as_bytes(), raw);
+    let SpawnCommand::Argv(spawned_argv) = &spawned.request.command else {
+        panic!("an argv job spawns an argv");
+    };
+    assert_eq!(spawned_argv[0].as_os_str().as_bytes(), raw);
     let info = h.handle.info(job).await.unwrap();
-    assert_eq!(info.argv[0].as_os_str().as_bytes(), raw);
+    assert_eq!(
+        info.command.argv().expect("an argv job")[0]
+            .as_os_str()
+            .as_bytes(),
+        raw
+    );
     complete(&spawned, b"", b"", ExitStatus::Exited { code: 0 }).await;
     h.handle.wait(job).await.unwrap();
 }
@@ -744,7 +754,7 @@ async fn unsafe_argv_rejects_before_artifact_commitment_or_spawn_effects() {
         OsString::from_vec(vec![b'x'; MAX_COMMAND_ARG_BYTES + 1]),
     ] {
         let mut exec = request(StdinSource::Empty);
-        exec.argv = vec![CommandArg::from(argument)];
+        exec.command = ExecCommand::Argv(vec![CommandArg::from(argument)]);
         let error = h.handle.exec(None, exec).await.unwrap_err();
         assert_eq!(error.code, ErrorCode::Usage);
         assert!(matches!(

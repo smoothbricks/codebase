@@ -1012,7 +1012,9 @@ impl ProjectRuntimeHost for FakeHost {
                 workspace,
                 mount,
                 argv: request
-                    .argv
+                    .command
+                    .argv()
+                    .expect("the runtime tests exec argv jobs")
                     .iter()
                     .map(|argument| argument.as_os_str().as_bytes().to_vec())
                     .collect(),

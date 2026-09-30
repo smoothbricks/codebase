@@ -114,7 +114,7 @@ pub struct CommandArg(OsString);
 
 
 pub struct ExecRequest {
-    pub argv: Vec<CommandArg>,
+    pub command: ExecCommand,
     pub cwd: Option<PathBuf>,            // relative to mount; default mount root
     pub mode: RunSandboxMode,            // default ReadWrite
     pub env: HashMap<String, String>,    // filtered through the build-config allowlist
@@ -123,6 +123,20 @@ pub struct ExecRequest {
     pub stdout_copy: Option<OutputPublication>,
     pub stderr_copy: Option<OutputPublication>,
 }
+
+pub enum ExecCommand {
+    Argv(Vec<CommandArg>),               // byte-exact, executed directly
+    Script(ScriptCommand),               // bash-compatible text, run by the warm host (11_shell.md)
+}
+
+/// parts.len() == values.len() + 1; no NUL anywhere; parts and values together at most MAX_ARGV_BYTES.
+/// ScriptCommand::new validates, and so does deserialization; the fields are private.
+pub struct ScriptCommand { parts: Vec<String>, values: Vec<ScriptValue> }
+pub enum ScriptValue {
+    Word(String),                        // one word, or one piece of a word
+    Words(Vec<String>),                  // one word per element as a whole bare word; else joined by spaces
+}
+pub enum JobFailure { ScriptSyntax }     // the script did not parse; nothing ran
 
 pub struct OutputPublication {
     pub path: WorkspacePath,             // writable caller-visible destination, never artifact authority
@@ -590,19 +604,23 @@ reuse those DTOs. Serde uses `camelCase`, documented enum strings, and omission 
   enum. `GcReport = { examined, reclaimed, retainedPinned, freedBytes, dryRun, candidates }`. Dry-run candidates are the
   exact immutable substrate plan and never mutable handles; execution revalidates the plan before the first effect.
 - `JobId` is a positive integer no greater than `2^53-1`.
-  `JobInfo = { repoId, workspaceIncarnation, jobId, state, pid?, grantRevision, argv, cwd, started, durationMs?, exit?, stdout, stderr, trace, outputLimit?, stdin }`.
-  Every element of `argv` is the exact tagged `CommandArg` object
-  `{encoding:"utf8",data:String} | {encoding:"base64",data:String}`. Serialization selects `utf8` if and only if the
-  Unix argument bytes are valid UTF-8; otherwise it emits canonical standard base64. Decoders deny unknown fields and
-  encodings and reject malformed or non-canonical base64, base64 used for valid UTF-8, decoded NUL, arguments above 128
-  KiB, total argv above 1 MiB, an empty vector or `argv[0]`, and a byte representation the host platform cannot
-  reproduce exactly. Validation happens before RPC dispatch, process allocation/spawn, and protected-artifact effects.
-  Protected Arrow stores `argv` as a required `List<Binary>` and recovery revalidates each raw argument and both bounds.
-  `started` is a full RFC3339 string: `Z` and numeric offsets are accepted. A `:60` value is normalized to UTC and
-  accepted only when it denotes a published IERS leap instant (for example `2016-12-31T18:59:60-05:00`); local
-  `23:59:60` alone is insufficient, and unannounced future leap seconds reject. Calendar, clock, fraction, and offset
-  ranges are validated. `exit` is the discriminated union `{kind:"exited",code}` or
-  `{kind:"signaled",signal,coreDumped}`; it is absent before a process result exists. `outputLimit` is present iff
+  `JobInfo = { repoId, workspaceIncarnation, jobId, state, pid?, grantRevision, argv | script, failure?, cwd, started, durationMs?, exit?, stdout, stderr, trace, outputLimit?, stdin }`.
+  The command is flattened: exactly one of `argv` and `script` is present, and an `ExecRequest` carries the same field.
+  `script = { parts: string[], values: ({word:string} | {words:string[]})[] }` obeys the `ScriptCommand` bounds above.
+  `failure` is present only as `"scriptSyntax"`, on a `failed` job whose script did not parse (exit
+  `{kind:"exited",code:2}`, diagnostic on stderr). Protected Arrow stores a script in the `argv` column as the two
+  arguments `\0script` and the script's JSON, a pair no argv can produce. Every element of `argv` is the exact tagged
+  `CommandArg` object `{encoding:"utf8",data:String} | {encoding:"base64",data:String}`. Serialization selects `utf8` if
+  and only if the Unix argument bytes are valid UTF-8; otherwise it emits canonical standard base64. Decoders deny
+  unknown fields and encodings and reject malformed or non-canonical base64, base64 used for valid UTF-8, decoded NUL,
+  arguments above 128 KiB, total argv above 1 MiB, an empty vector or `argv[0]`, and a byte representation the host
+  platform cannot reproduce exactly. Validation happens before RPC dispatch, process allocation/spawn, and
+  protected-artifact effects. Protected Arrow stores `argv` as a required `List<Binary>` and recovery revalidates each
+  raw argument and both bounds. `started` is a full RFC3339 string: `Z` and numeric offsets are accepted. A `:60` value
+  is normalized to UTC and accepted only when it denotes a published IERS leap instant (for example
+  `2016-12-31T18:59:60-05:00`); local `23:59:60` alone is insufficient, and unannounced future leap seconds reject.
+  Calendar, clock, fraction, and offset ranges are validated. `exit` is the discriminated union `{kind:"exited",code}`
+  or `{kind:"signaled",signal,coreDumped}`; it is absent before a process result exists. `outputLimit` is present iff
   `state == "outputLimit"`. Both serialization and deserialization enforce these state / duration / exit / output-limit
   invariants. `cwd` is required but nullable on the wire: `null` means the workspace mount root and a string means
   exactly one validated, normalized workspace-relative `WorkspacePath`. Decoders reject an omitted `cwd`; neither `""`
@@ -797,14 +815,22 @@ export interface StreamInfo {
   summary: OutputSummary;
 }
 
-export interface JobInfo {
+export type ScriptValue = { word: string } | { words: string[] };
+export interface ScriptCommand {
+  parts: string[]; // exactly one more than values
+  values: ScriptValue[];
+}
+export type JobCommand = { argv: CommandArg[]; script?: never } | { script: ScriptCommand; argv?: never };
+export type JobFailure = 'scriptSyntax';
+
+export type JobInfo = JobCommand & {
   repoId: string;
   workspaceIncarnation: string;
   jobId: JobId;
   state: 'queued' | 'running' | 'exited' | 'signaled' | 'killed' | 'outputLimit' | 'failed';
   pid?: number;
   grantRevision: number;
-  argv: CommandArg[];
+  failure?: JobFailure;
   cwd: string;
   started: Date;
   durationMs?: number;
@@ -814,7 +840,7 @@ export interface JobInfo {
   trace: TraceContext;
   stdin: StdinInfo;
   outputLimit?: { limitBytes: number; crossingBytes: number };
-}
+};
 
 export interface JobHandle {
   readonly jobId: JobId;
@@ -838,6 +864,9 @@ export interface OutputPublication {
   policy: 'createNew' | 'replace';
 }
 
+export type ExecCommand = { argv: string[]; script?: never } | { script: ScriptCommand; argv?: never };
+export type ExecRequest = ExecCommand & ExecOptions;
+
 export interface ExecOptions {
   cwd?: string;
   mode?: 'readWrite' | 'readOnly';
@@ -859,8 +888,8 @@ export interface CheckpointOptions {
 export interface WorkspaceHandle {
   readonly name: string;
   readonly mountPath: string;
-  exec(argv: Array<string | Uint8Array>, opts?: ExecOptions): Promise<JobHandle>;
-  background(argv: Array<string | Uint8Array>, opts?: ExecOptions): Promise<JobHandle>;
+  exec(request: ExecRequest): Promise<JobHandle>;
+  background(request: ExecRequest): Promise<JobHandle>;
   listJobs(): Promise<JobInfo[]>;
   job(id: JobId): Promise<JobHandle>;
   checkpoint(opts?: CheckpointOptions): Promise<string>;

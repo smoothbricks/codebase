@@ -26,6 +26,8 @@ try {
       'cowshed-core',
       '-p',
       'cowshed-cli',
+      '-p',
+      'cowshed-shell',
       '-E',
       'test(/host_controller_/)',
       '--run-ignored',

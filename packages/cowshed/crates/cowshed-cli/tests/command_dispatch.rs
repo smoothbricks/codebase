@@ -354,9 +354,13 @@ impl CliService for FakeService {
         self.events.push(format!("exec:{}", command.workspace));
         self.exec_grants = Some(self.grants.clone());
         self.presentation = Some(presentation);
-        self.argv = command
+        let argv = command
             .request
-            .argv
+            .command
+            .argv()
+            .expect("the CLI execs argv jobs")
+            .to_vec();
+        self.argv = argv
             .iter()
             .map(|arg| arg.as_os_str().as_bytes().to_vec())
             .collect();
@@ -377,7 +381,7 @@ impl CliService for FakeService {
             stderr.write_all(b"err\0").unwrap();
         }
         Ok(ExecResult {
-            info: job_info(command.request.argv, self.child_exit.clone()),
+            info: job_info(argv, self.child_exit.clone()),
             backgrounded: command.background,
         })
     }
@@ -454,7 +458,7 @@ fn job_info(argv: Vec<CommandArg>, exit: ExitStatus) -> JobInfo {
         state,
         pid: Some(42),
         grant_revision: 1,
-        argv,
+        command: cowshed_core::api::ExecCommand::Argv(argv),
         cwd: None,
         started: UtcTimestamp::new("2026-07-14T00:00:00Z").unwrap(),
         duration_ms: Some(1),
@@ -472,6 +476,7 @@ fn job_info(argv: Vec<CommandArg>, exit: ExitStatus) -> JobInfo {
             workspace_path: None,
             complete: true,
         },
+        failure: None,
     }
 }
 

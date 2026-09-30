@@ -155,7 +155,7 @@ fn job_infos() -> BTreeMap<&'static str, Value> {
         state: JobState::Queued,
         pid: None,
         grant_revision: 0,
-        argv: vec![CommandArg::from("true")],
+        command: cowshed_core::api::ExecCommand::Argv(vec![CommandArg::from("true")]),
         cwd: None,
         started: timestamp(),
         duration_ms: None,
@@ -165,6 +165,7 @@ fn job_infos() -> BTreeMap<&'static str, Value> {
         trace: trace(),
         output_limit: None,
         stdin: empty_stdin(),
+        failure: None,
     };
 
     // A running job with every optional present, a workspace-file stdin, and both stream storage
@@ -176,11 +177,11 @@ fn job_infos() -> BTreeMap<&'static str, Value> {
         state: JobState::Running,
         pid: Some(4242),
         grant_revision: 7,
-        argv: vec![
+        command: cowshed_core::api::ExecCommand::Argv(vec![
             CommandArg::from("cargo"),
             CommandArg::from("test"),
             CommandArg::from("--workspace"),
-        ],
+        ]),
         cwd: Some(workspace_path("packages/cowshed")),
         started: timestamp(),
         duration_ms: None,
@@ -195,6 +196,7 @@ fn job_infos() -> BTreeMap<&'static str, Value> {
             workspace_path: Some(workspace_path("fixtures/input.txt")),
             complete: true,
         },
+        failure: None,
     };
 
     // An exited job with inline stdin.
@@ -205,7 +207,10 @@ fn job_infos() -> BTreeMap<&'static str, Value> {
         state: JobState::Exited,
         pid: Some(4243),
         grant_revision: 7,
-        argv: vec![CommandArg::from("sh"), CommandArg::from("-c")],
+        command: cowshed_core::api::ExecCommand::Argv(vec![
+            CommandArg::from("sh"),
+            CommandArg::from("-c"),
+        ]),
         cwd: None,
         started: timestamp(),
         duration_ms: Some(1_234),
@@ -220,6 +225,7 @@ fn job_infos() -> BTreeMap<&'static str, Value> {
             workspace_path: None,
             complete: true,
         },
+        failure: None,
     };
 
     // A signalled job carrying a non-UTF-8 argument. This is the case a `string[]` argv cannot
@@ -231,11 +237,11 @@ fn job_infos() -> BTreeMap<&'static str, Value> {
         state: JobState::Signaled,
         pid: Some(4244),
         grant_revision: 9,
-        argv: vec![
+        command: cowshed_core::api::ExecCommand::Argv(vec![
             CommandArg::from("printf"),
             CommandArg::from("%s"),
             CommandArg::new(OsString::from_vec(vec![0xff, 0xfe, 0x80])),
-        ],
+        ]),
         cwd: None,
         started: timestamp(),
         duration_ms: Some(9),
@@ -248,6 +254,7 @@ fn job_infos() -> BTreeMap<&'static str, Value> {
         trace: trace(),
         output_limit: None,
         stdin: empty_stdin(),
+        failure: None,
     };
 
     // The output-limit state is the only one that carries `outputLimit`, and an incomplete
@@ -259,7 +266,7 @@ fn job_infos() -> BTreeMap<&'static str, Value> {
         state: JobState::OutputLimit,
         pid: Some(4245),
         grant_revision: 9,
-        argv: vec![CommandArg::from("yes")],
+        command: cowshed_core::api::ExecCommand::Argv(vec![CommandArg::from("yes")]),
         cwd: None,
         started: timestamp(),
         duration_ms: Some(50),
@@ -277,6 +284,7 @@ fn job_infos() -> BTreeMap<&'static str, Value> {
             workspace_path: None,
             complete: false,
         },
+        failure: None,
     };
 
     // A cancelled job may die from a signal or exit normally after handling it.
@@ -306,6 +314,29 @@ fn job_infos() -> BTreeMap<&'static str, Value> {
         ..exited.clone()
     };
 
+    // A script job is the other command variant; one that did not parse is the only failure that
+    // names its cause and carries an exit status.
+    let script_syntax = JobInfo {
+        job_id: JobId::new(8).expect("fixture job id"),
+        state: JobState::Failed,
+        command: cowshed_core::api::ExecCommand::Script(
+            cowshed_core::api::ScriptCommand::new(
+                vec!["grep -r ".into(), " src | (".into(), String::new()],
+                vec![
+                    cowshed_core::api::ScriptValue::Word("needle with spaces".into()),
+                    cowshed_core::api::ScriptValue::Words(vec!["a".into(), "b c".into()]),
+                ],
+            )
+            .expect("fixture script"),
+        ),
+        exit: Some(ExitStatus::Exited { code: 2 }),
+        pid: None,
+        stdout: inline_stream(""),
+        stderr: inline_stream("syntax error: unterminated subshell\n"),
+        failure: Some(cowshed_core::api::JobFailure::ScriptSyntax),
+        ..exited.clone()
+    };
+
     let list = vec![queued.clone(), running.clone()];
 
     BTreeMap::from([
@@ -320,6 +351,7 @@ fn job_infos() -> BTreeMap<&'static str, Value> {
             document("job status", &gracefully_killed),
         ),
         ("failed", document("job status", &failed)),
+        ("scriptSyntax", document("job status", &script_syntax)),
         ("list", document("job list", &list)),
     ])
 }

@@ -131,7 +131,11 @@ fn parse_json<T: DeserializeOwned>(kind: &'static str, value: &str) -> AddonResu
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct NapiExecRequest {
-    argv: Vec<String>,
+    /// Exactly one of `argv` and `script`.
+    #[serde(default)]
+    argv: Option<Vec<String>>,
+    #[serde(default)]
+    script: Option<cowshed_core::api::ScriptCommand>,
     #[serde(default)]
     cwd: Option<WorkspacePath>,
     #[serde(default)]
@@ -165,8 +169,20 @@ impl TryFrom<NapiExecRequest> for ExecRequest {
             (None, Some(path)) => StdinSource::WorkspaceFile(path),
             (None, None) => StdinSource::Empty,
         };
+        let command = cowshed_core::api::ExecCommand::from_fields(
+            request
+                .argv
+                .map(|argv| argv.into_iter().map(Into::into).collect()),
+            request.script,
+        )
+        .map_err(|error| {
+            AddonFailure::usage(
+                error.to_string(),
+                "provide argv for a command or script for shell text",
+            )
+        })?;
         Ok(Self {
-            argv: request.argv.into_iter().map(Into::into).collect(),
+            command,
             cwd: request.cwd,
             mode: request.mode,
             env: request.env,

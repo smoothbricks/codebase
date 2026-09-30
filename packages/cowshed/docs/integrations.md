@@ -130,6 +130,28 @@ with backpressure. EOF closes the child's stdin; cancellation closes the source 
 cancellation/termination path. Job metadata records the stdin source kind and byte count, never the input content. No
 variant interpolates a filename into a shell command.
 
+### Script jobs
+
+A job is either a byte-exact argv or a script: bash-compatible text given as literal `parts` with `values` between them,
+the shape a tagged template produces. From TypeScript:
+
+```ts
+await worker.exec({
+  script: { parts: ['grep -r ', ' src | wc -l'], values: [{ word: 'needle with spaces' }] },
+});
+```
+
+A value is never shell text. The supervisor binds each one to a shell variable and puts a reference to it where the
+value stood, so `{ word }` stays one word (or one piece of a word) whatever it contains, and `{ words }` becomes one
+word per element where it stands alone as a word. Placing a value inside a comment, inside `$'…'`, or right after an
+unpaired backslash is a `usage` error at submission. Arithmetic is not detected: in `$((…))`, `((…))`, `let`, an array
+subscript or an integer variable the shell evaluates a variable's content as an expression, so keep values out of those
+places. The script runs in the workspace's warm exec host with bash defaults (no `errexit`, no `pipefail`); a script
+that does not parse ends `failed` with `failure: "scriptSyntax"`, exit code 2, and the parser's message on stderr, and
+nothing from it runs. `JobInfo` then carries `script` instead of `argv`. Script jobs need the `cowshed` binary as the
+controller (it carries the interpreter) and a workspace that is either configured with an `.envrc` or has no shell
+configuration; a devenv-only project gets `environment-missing`.
+
 ### Shell redirects and sealed export
 
 An optional real-shell-AST fast path may recognize only a proven literal `>`/`2>` workspace destination. While the
@@ -154,6 +176,12 @@ never needs the Arrow files. Before installing workspace sessions it calls
 `cowshed_core::gateway_sessions::reconcile_native_project(&repo_id)` (or `reconcile_project` over its own
 `GatewayControl`/`SessionInventory`) so a stale session of a deleted project cannot hold the endpoint; authority for
 every decision is the image inventory, the grants files, and the controller lock — no log is replayed.
+
+Warm exec hosts and script jobs need a program to start as each workspace's host. A Rust host gets them by depending on
+`cowshed-shell` and calling `cowshed_shell::dispatch()` first in `main`, before any thread starts: the call returns at
+once in the host's own process, registers the running executable as the exec host program, and never returns in a
+process started as an exec host. Without it every argv job enters its shell once per command and every script job is
+refused as `environment-missing`.
 
 ## MCP authority delivery
 

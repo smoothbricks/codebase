@@ -1639,7 +1639,7 @@ fn exec_command<R: AsyncRead + Send + 'static>(args: ExecArgs, stdin: R) -> Resu
     Ok(ExecCommand {
         workspace: args.workspace,
         request: ExecRequest {
-            argv,
+            command: cowshed_core::api::ExecCommand::Argv(argv),
             cwd: args
                 .cwd
                 .map(|path| workspace_path(path, "cwd"))

@@ -4,7 +4,7 @@ use super::dto::{
     GitOid, GrantDelta, GrantSet, JobId, JobInfo, JobState, LandOptions, LandReport, MirrorInfo,
     ProjectGrantDelta, ProjectGrants, PushOptions, PushReport, RebaseOptions, RemoveOptions,
     RemoveReport, ResizeResult, RevisionResult, RunSandboxMode, StdinSource, WorkspaceIncarnation,
-    WorkspaceInfo, validate_command_argv,
+    WorkspaceInfo,
 };
 use super::frame;
 use super::peer_credentials::PeerCredentialsError;
@@ -202,11 +202,11 @@ impl ControllerRuntime for ActorRuntime {
         session: Option<&str>,
         request: ExecRequest,
     ) -> Result<JobId> {
-        validate_command_argv(&request.argv).map_err(|error| {
-            CowshedError::usage(error.to_string(), "provide a valid bounded command argv")
+        request.command.validate().map_err(|error| {
+            CowshedError::usage(error.to_string(), "provide a valid bounded command")
         })?;
         let ExecRequest {
-            argv,
+            command,
             cwd,
             mode,
             env,
@@ -229,12 +229,11 @@ impl ControllerRuntime for ActorRuntime {
             ),
             StdinSource::Stream(stream) => (json!({ "kind": "stream" }), None, Some(stream)),
         };
-        let params = json!({
+        let mut params = json!({
             "repoId": authority.repo_id,
             "workspace": authority.workspace,
             "workspaceIncarnation": authority.workspace_incarnation,
             "session": session,
-            "argv": argv,
             "cwd": cwd,
             "mode": mode,
             "env": env,
@@ -243,6 +242,15 @@ impl ControllerRuntime for ActorRuntime {
             "stdoutCopy": stdout_copy,
             "stderrCopy": stderr_copy,
         });
+        // Exactly one of the two keys, as the wire carries a command.
+        let (key, value) = match &command {
+            crate::api::dto::ExecCommand::Argv(argv) => ("argv", json!(argv)),
+            crate::api::dto::ExecCommand::Script(script) => ("script", json!(script)),
+        };
+        params
+            .as_object_mut()
+            .expect("a JSON object literal is an object")
+            .insert(key.to_owned(), value);
         let result = match inline {
             Some(bytes) => self.upload("worker.exec", params, bytes).await?,
             None => self.call("worker.exec", params).await?,
@@ -2054,7 +2062,7 @@ mod tests {
 
     fn exec_request(stdin: StdinSource) -> ExecRequest {
         ExecRequest {
-            argv: vec!["cat".into()],
+            command: crate::api::dto::ExecCommand::Argv(vec!["cat".into()]),
             cwd: None,
             mode: RunSandboxMode::ReadWrite,
             env: std::collections::HashMap::new(),

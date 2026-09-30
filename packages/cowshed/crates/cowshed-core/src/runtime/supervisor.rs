@@ -15,10 +15,10 @@ use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
 use crate::api::dto::{
-    BinaryData, CommandArg, ExecRequest, ExitStatus, JobId, JobInfo, JobState, OutputLimitInfo,
-    OutputPublication, OutputStorage, OutputSummary, ProtectedOutput, Sha256Digest, StdinInfo,
-    StdinKind, StdinSource, StreamInfo, TraceContext, TraceId, UtcTimestamp, WorkspacePath,
-    validate_command_argv,
+    BinaryData, CommandArg, ExecCommand, ExecRequest, ExitStatus, JobFailure, JobId, JobInfo,
+    JobState, OutputLimitInfo, OutputPublication, OutputStorage, OutputSummary, ProtectedOutput,
+    Sha256Digest, StdinInfo, StdinKind, StdinSource, StreamInfo, TraceContext, TraceId,
+    UtcTimestamp, WorkspacePath,
 };
 use crate::error::{CowshedError, Result};
 use crate::exec::{
@@ -204,11 +204,19 @@ pub enum ProcessSignal {
     Kill,
 }
 
+/// What a spawn runs, in the form the spawner executes it.
+#[derive(Clone, Debug)]
+pub enum SpawnCommand {
+    Argv(Vec<OsString>),
+    /// A script already rendered at admission (`crate::script`); only an exec host runs it.
+    Script(crate::script::RenderedScript),
+}
+
 #[derive(Clone, Debug)]
 pub struct ProcessSpawnRequest {
     pub authority: WorkspaceAuthoritySnapshot,
     pub job_id: JobId,
-    pub argv: Vec<OsString>,
+    pub command: SpawnCommand,
     pub cwd: PathBuf,
     pub env: BTreeMap<String, String>,
     pub devenv_dir: Option<PathBuf>,
@@ -268,6 +276,10 @@ pub enum ProcessEvent {
         job_id: JobId,
         error: CowshedError,
     },
+    /// A script job's text did not parse; nothing ran and its stderr carries the diagnostic.
+    ScriptSyntax {
+        job_id: JobId,
+    },
 }
 
 pub trait RunningProcess: Send {
@@ -310,7 +322,7 @@ pub struct ArtifactSeal {
 
 pub trait ArtifactSink: Send {
     fn next_job_id(&self) -> Result<JobId>;
-    fn admit(&mut self, job_id: JobId, grant_revision: u64, argv: &[CommandArg]) -> Result<()>;
+    fn admit(&mut self, job_id: JobId, grant_revision: u64, command: &ExecCommand) -> Result<()>;
     fn prepare_background(&mut self, job_id: JobId) -> Result<()>;
     fn write(&mut self, job_id: JobId, stream: StreamKind, bytes: &[u8]) -> Result<ArtifactWrite>;
     fn seal(
@@ -367,10 +379,10 @@ impl ArtifactSink for ArtifactStoreSink {
         self.store.next_job_id().map_err(map_artifact_error)
     }
 
-    fn admit(&mut self, job_id: JobId, grant_revision: u64, argv: &[CommandArg]) -> Result<()> {
+    fn admit(&mut self, job_id: JobId, grant_revision: u64, command: &ExecCommand) -> Result<()> {
         let token = self
             .store
-            .begin_job(job_id, grant_revision, argv, OutputTargets::default())
+            .begin_job(job_id, grant_revision, command, OutputTargets::default())
             .map_err(map_artifact_error)?;
         if token.job_id() != job_id || self.tokens.insert(job_id, token).is_some() {
             return Err(CowshedError::integrity(
@@ -1468,49 +1480,68 @@ impl SpawnSink for SystemSpawnSink {
         if request.mode == crate::api::dto::RunSandboxMode::ReadOnly {
             request.sandbox.mode = crate::sandbox::RunSandboxMode::ReadOnly;
         }
-        let mut plan = plan_exec(
-            SandboxExecRequest {
-                argv: request.argv,
-                cwd: request.cwd,
-            },
-            &request.sandbox,
-        )
-        .map_err(map_exec_error)?;
-        if !plan.args.get(1).is_some_and(|profile| {
-            profile.as_encoded_bytes() == request.executed_child_profile.as_bytes()
-        }) {
+        let cwd = crate::exec::contained_cwd(&request.sandbox.workspace_mount, &request.cwd)
+            .map_err(map_exec_error)?;
+        if seatbelt_profile(&request.sandbox, SandboxProfileRole::ExecutedChild)
+            .map_err(map_sandbox_error)?
+            != request.executed_child_profile
+        {
             return Err(CowshedError::integrity(
                 "executed-child Seatbelt profile changed between admission and spawn",
                 "cowshed doctor --json",
             ));
         }
-
-        let selection = select_shell(&request.sandbox, &plan.cwd, request.devenv_dir.as_deref())?;
+        let selection = select_shell(&request.sandbox, &cwd, request.devenv_dir.as_deref())?;
         let environment = sandbox_environment(
             &request.sandbox,
             selection.devenv_dir.as_deref(),
             &request.env,
         )
         .await?;
-        if let (ShellEntry::Envrc(envrc_directory), Some(shells)) =
-            (&selection.entry, self.shells.as_mut())
-        {
+        let activation = match &selection.entry {
+            ShellEntry::Envrc(directory) => Some(Some(directory.clone())),
+            ShellEntry::Bare => Some(None),
+            ShellEntry::Devenv { .. } => None,
+        };
+        let pooled = |command, environment| super::shell_job::PooledSpawn {
+            job_id: request.job_id,
+            command,
+            cwd: cwd.clone(),
+            profile: request.executed_child_profile.clone(),
+            read_only: request.sandbox.mode == crate::sandbox::RunSandboxMode::ReadOnly,
+            workspace_mount: request.sandbox.workspace_mount.clone(),
+            envrc_directory: activation.clone().flatten(),
+            environment,
+            caller: &request.env,
+            grant_revision: request.authority.grant_revision,
+        };
+        let argv = match request.command {
+            SpawnCommand::Script(script) => {
+                let (Some(shells), Some(_)) = (self.shells.as_mut(), &activation) else {
+                    return Err(CowshedError::environment_missing(
+                        "a script job runs in the workspace's exec host, which needs the cowshed \
+                         binary and a workspace .envrc or no shell configuration at all",
+                        "run the script through the cowshed CLI; a devenv-only project needs an \
+                         .envrc that uses devenv",
+                    ));
+                };
+                return shells.spawn(
+                    pooled(super::shell_job::HostCommand::Script(script), environment),
+                    events,
+                );
+            }
+            SpawnCommand::Argv(argv) => argv,
+        };
+        // Warm hosts serve commands under a workspace `.envrc`; a bare workspace and a
+        // devenv-only project keep one-shot activation for argv jobs.
+        if let (Some(Some(_)), Some(shells)) = (&activation, self.shells.as_mut()) {
             return shells.spawn(
-                super::shell_job::PooledSpawn {
-                    job_id: request.job_id,
-                    argv: plan.args.split_off(3),
-                    cwd: plan.cwd,
-                    profile: request.executed_child_profile,
-                    read_only: request.sandbox.mode == crate::sandbox::RunSandboxMode::ReadOnly,
-                    workspace_mount: request.sandbox.workspace_mount.clone(),
-                    envrc_directory: envrc_directory.clone(),
-                    environment,
-                    caller: &request.env,
-                    grant_revision: request.authority.grant_revision,
-                },
+                pooled(super::shell_job::HostCommand::Argv(argv), environment),
                 events,
             );
         }
+        let mut plan = plan_exec(SandboxExecRequest { argv, cwd }, &request.sandbox)
+            .map_err(map_exec_error)?;
         wrap_one_shot(&mut plan, &selection.entry);
         let mut command = sandboxed_command(&plan, &environment.child(&request.env));
         command
@@ -2216,6 +2247,8 @@ enum KillReason {
     ArtifactFailure,
     /// `wait(2)` never reported a status, so the child's fate is unknown.
     WaitFailure,
+    /// A script did not parse, so nothing ran.
+    ScriptSyntax,
 }
 
 struct PendingStdin {
@@ -2699,7 +2732,7 @@ impl SupervisorActor {
         }
 
         let ExecRequest {
-            argv,
+            command,
             cwd,
             mode,
             env,
@@ -2708,15 +2741,33 @@ impl SupervisorActor {
             stdout_copy,
             stderr_copy,
         } = request;
-        if let Err(error) = validate_command_argv(&argv) {
+        if let Err(error) = command.validate() {
             let _ = reply.send(Err(CowshedError::usage(
                 error.to_string(),
-                "provide a valid bounded command argv",
+                "provide a valid bounded command",
             )));
             return;
         }
-        let info_argv = argv.clone();
-        let argv_os = request_argv_to_os(argv);
+        // A script is rendered before anything is admitted, so a value that stands where no
+        // substitution can mean it is refused like any other malformed request.
+        let spawn_command = match &command {
+            ExecCommand::Argv(argv) => SpawnCommand::Argv(
+                argv.iter()
+                    .cloned()
+                    .map(CommandArg::into_os_string)
+                    .collect(),
+            ),
+            ExecCommand::Script(script) => match crate::script::render(script) {
+                Ok(rendered) => SpawnCommand::Script(rendered),
+                Err(error) => {
+                    let _ = reply.send(Err(CowshedError::usage(
+                        error.to_string(),
+                        "put script values only where a word or a quoted string stands",
+                    )));
+                    return;
+                }
+            },
+        };
         let (cwd, mut merged_env, session_identity) = match session.as_ref() {
             Some(token) => {
                 let state = self
@@ -2760,7 +2811,7 @@ impl SupervisorActor {
         };
         if let Err(error) = self
             .artifacts
-            .admit(job_id, self.authority.grant_revision, &info_argv)
+            .admit(job_id, self.authority.grant_revision, &command)
         {
             let _ = reply.send(Err(error));
             return;
@@ -2812,7 +2863,7 @@ impl SupervisorActor {
             state: JobState::Running,
             pid: None,
             grant_revision: self.authority.grant_revision,
-            argv: info_argv,
+            command,
             cwd: cwd.clone(),
             started,
             duration_ms: None,
@@ -2822,6 +2873,7 @@ impl SupervisorActor {
             trace,
             output_limit: None,
             stdin: stdin_info,
+            failure: None,
         };
         let trusted_supervisor_profile =
             match seatbelt_profile(&self.sandbox, SandboxProfileRole::TrustedSupervisor)
@@ -2863,7 +2915,7 @@ impl SupervisorActor {
                 ProcessSpawnRequest {
                     authority: self.authority.clone(),
                     job_id,
-                    argv: argv_os,
+                    command: spawn_command,
                     cwd: cwd
                         .as_ref()
                         .map(WorkspacePath::as_path)
@@ -3228,6 +3280,18 @@ impl SupervisorActor {
                 job.kill_reason = Some(KillReason::SpawnFailure);
                 release_exited_process(job);
             }
+            ProcessEvent::ScriptSyntax { job_id } => {
+                let Some(job) = self.jobs.get_mut(&job_id) else {
+                    return;
+                };
+                if job.terminal_committed {
+                    return;
+                }
+                // Bash's own status for a script that does not parse.
+                job.exit = Some(ExitStatus::Exited { code: 2 });
+                job.kill_reason = Some(KillReason::ScriptSyntax);
+                release_exited_process(job);
+            }
             ProcessEvent::Escalate { job_id } => {
                 if let Some(job) = self.jobs.get_mut(&job_id)
                     && !job.terminal()
@@ -3384,7 +3448,8 @@ impl SupervisorActor {
                 KillReason::SpawnFailure
                 | KillReason::StdinFailure
                 | KillReason::ArtifactFailure
-                | KillReason::WaitFailure,
+                | KillReason::WaitFailure
+                | KillReason::ScriptSyntax,
             ) => JobState::Failed,
             None => match job.exit.as_ref().expect("ready terminal job has exit") {
                 ExitStatus::Exited { .. } => JobState::Exited,
@@ -3450,6 +3515,8 @@ impl SupervisorActor {
         job.info.stdout = seal.stdout;
         job.info.stderr = seal.stderr;
         job.info.output_limit = seal.output_limit;
+        job.info.failure =
+            (job.kill_reason == Some(KillReason::ScriptSyntax)).then_some(JobFailure::ScriptSyntax);
         job.info.stdin.complete = true;
         if let Some(identity) = job.session_identity
             && let Some(session) = self.sessions.get_mut(&identity)
@@ -3572,10 +3639,6 @@ async fn pump_reader(
         }
         pump_one(job_id, Bytes::copy_from_slice(&buffer[..count]), events).await?;
     }
-}
-
-fn request_argv_to_os(argv: Vec<CommandArg>) -> Vec<OsString> {
-    argv.into_iter().map(CommandArg::into_os_string).collect()
 }
 
 fn stdin_info(stdin: &StdinSource) -> StdinInfo {
@@ -4354,7 +4417,7 @@ mod lifecycle_commitment_tests {
             .begin_job(
                 JobId::new(1).unwrap(),
                 7,
-                &["true".into()],
+                &crate::api::dto::ExecCommand::Argv(vec!["true".into()]),
                 OutputTargets::default(),
             )
             .unwrap();
@@ -4376,7 +4439,7 @@ mod lifecycle_commitment_tests {
             .begin_job(
                 JobId::new(2).unwrap(),
                 8,
-                &["true".into()],
+                &crate::api::dto::ExecCommand::Argv(vec!["true".into()]),
                 OutputTargets::default(),
             )
             .unwrap();
@@ -4492,7 +4555,7 @@ mod lifecycle_commitment_tests {
             .begin_job(
                 JobId::new(1).unwrap(),
                 1,
-                &["true".into()],
+                &crate::api::dto::ExecCommand::Argv(vec!["true".into()]),
                 OutputTargets::default(),
             )
             .unwrap();

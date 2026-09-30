@@ -447,7 +447,7 @@ fn spawn_request(sandbox: &SandboxConfig, cwd: &Path, argv: Vec<OsString>) -> Pr
             lifecycle_revision: 1,
         },
         job_id: JobId::new(1).expect("job id"),
-        argv,
+        command: cowshed_core::runtime::supervisor::SpawnCommand::Argv(argv),
         cwd: cwd.to_path_buf(),
         env: BTreeMap::new(),
         devenv_dir: None,

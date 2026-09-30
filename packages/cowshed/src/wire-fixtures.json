@@ -741,6 +741,79 @@
       },
       "workspaceIncarnation": "0123456789abcdef0123456789abcdef"
     },
+    "scriptSyntax": {
+      "cwd": null,
+      "durationMs": 1234,
+      "exit": {
+        "code": 2,
+        "kind": "exited"
+      },
+      "failure": "scriptSyntax",
+      "grantRevision": 7,
+      "jobId": 8,
+      "repoId": "smoothbricks/codebase",
+      "script": {
+        "parts": ["grep -r ", " src | (", ""],
+        "values": [
+          {
+            "word": "needle with spaces"
+          },
+          {
+            "words": ["a", "b c"]
+          }
+        ]
+      },
+      "started": "2026-01-02T03:04:05Z",
+      "state": "failed",
+      "stderr": {
+        "bytes": 36,
+        "sha256": "4dcc24271eb80452916e52608c2735d0aec2ffc944fb0157e1e472f4a49d9b7d",
+        "storage": {
+          "artifact": {
+            "data": {
+              "data": "syntax error: unterminated subshell\n",
+              "encoding": "utf8"
+            },
+            "kind": "inline"
+          },
+          "kind": "captured"
+        },
+        "summary": {
+          "text": "syntax error: unterminated subshell\n",
+          "truncated": false,
+          "version": 1
+        }
+      },
+      "stdin": {
+        "bytes": 5,
+        "complete": true,
+        "kind": "inline"
+      },
+      "stdout": {
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "storage": {
+          "artifact": {
+            "data": {
+              "data": "",
+              "encoding": "utf8"
+            },
+            "kind": "inline"
+          },
+          "kind": "captured"
+        },
+        "summary": {
+          "text": "",
+          "truncated": false,
+          "version": 1
+        }
+      },
+      "trace": {
+        "spanId": "0011223344556677",
+        "traceId": "00112233445566778899aabbccddeeff"
+      },
+      "workspaceIncarnation": "0123456789abcdef0123456789abcdef"
+    },
     "signaledNonUtf8Argv": {
       "argv": [
         {

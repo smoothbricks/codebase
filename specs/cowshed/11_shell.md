@@ -22,8 +22,31 @@ control socket (`SCM_RIGHTS`), forks the argv into a new process group with the 
 environment laid over the activated one, and reports the raw `waitpid` status. Nothing a command does — `cd`, `export`,
 a changed umask — reaches the host or a later command: every command is a fresh process from the same activated
 environment. The host program is staged under `.cowshed/shell-host/`, which every profile denies writes to, so no job
-can replace the parent of later commands. A configured devenv-only project, which has no direnv watch list to judge
-freshness by, enters `devenv shell` inside each job's own child.
+can replace the parent of later commands. A workspace with no shell configuration gets hosts that skip activation and
+hold the sandbox environment itself; its argv jobs keep one-shot spawns, its script jobs run in those hosts. A
+configured devenv-only project, which has no direnv watch list to judge freshness by, enters `devenv shell` inside each
+job's own child and cannot run script jobs.
+
+**Script jobs.** Besides a byte-exact argv, a job can be a script: bash-compatible shell text as a template of literal
+`parts` and `values` (`ExecCommand::Script`, 07_api.md). At admission the supervisor binds each value to a shell
+variable of its own and puts a reference to it where the value stood, quoted for that position — `"${v}"` in an unquoted
+word, `"${v[@]}"` when a list is a whole bare word (one word per element), `${v}` inside `"…"`, `'"${v}"'` inside `'…'`;
+`$(…)`, backquotes and process substitution start a fresh unquoted context. A value therefore never reaches the shell as
+text: no quoting in a value can end its word, start a command or expand anything. A value inside a comment, inside
+`$'…'` or directly after an odd run of backslashes is refused before admission. Rendering does not detect the one
+context where the shell reads a variable's content as more than data: arithmetic (`$((…))`, `((…))`, `let`, an array
+subscript, an integer variable, an arithmetic `[[ … -eq … ]]` operand), where bash and brush evaluate the content as an
+expression, so a value placed there can assign shell variables. Clients refuse those placements before submitting. The
+host parses the text with an upstream `brush` parser, so a script that does not parse fails before anything runs: the
+job ends `failed` with `failure: scriptSyntax`, status 2 as bash gives, and the parser's diagnostic on its stderr. A
+script that parses runs in a child the host forks without exec, the way bash runs a subshell: the child leads the job's
+process group (the host sets it too, so the supervisor never signals a group not yet made), resets every signal the host
+handles to its default as an exec would, holds the job's descriptors as 0, 1 and 2, builds a brush interpreter from the
+already-activated environment (no activation, no rc files) with job control off, runs the program and exits with its
+status. Every external command and descendant the script starts is in the job's group, so a kill reaches all of them and
+never the host; a killed script dies by the signal and reports it exactly; `cd`, `umask`, `ulimit`, `trap` and `exec`
+end with the child. The interpreter lives only in the host binary (the `cowshed-shell` crate), not in the supervisor
+library or its Node addon.
 
 **Freshness is direnv's own.** direnv records every input an evaluation depended on — the `.envrc`, its approval files,
 each `source_up`, `use devenv` and `watch_file` target — as `DIRENV_WATCHES` (base64url of zlib-deflated JSON
@@ -87,12 +110,14 @@ Execution cwd has one representation across `ExecRequest`, supervisor/session st
 `Option<WorkspacePath>`. `None` denotes the workspace mount root; `Some(path)` denotes exactly one validated, normalized
 workspace-relative path. Wire `cwd` is required and encodes `None` as JSON `null`; omission rejects, and neither an
 empty path nor `.` is admitted as a root sentinel. Execution argv likewise has one byte-exact representation.
-`ExecRequest.argv` and `JobInfo.argv` are `Vec<CommandArg>`, where each immutable element owns an `OsString`. On Unix
-the shared serde codec emits exactly `{encoding:"utf8",data}` iff the bytes validate as UTF-8 and otherwise canonical
-standard base64. It denies unknown fields/encodings and rejects malformed/non-canonical base64, base64 for valid UTF-8,
-decoded NUL, arguments above 128 KiB, aggregate argv above 1 MiB, and empty argv/`argv[0]`. Validation precedes RPC,
-job/artifact effects, process allocation, and spawn. The supervisor consumes arguments into `OsString` for `plan_exec`;
-no `String`, lossy rendering, or alternate supervisor wire shape exists.
+`ExecRequest.command` and `JobInfo`'s command are one `ExecCommand`: an argv or a script (above), flattened on the wire
+as exactly one of `argv` and `script`. An argv is `Vec<CommandArg>`, where each immutable element owns an `OsString`. On
+Unix the shared serde codec emits exactly `{encoding:"utf8",data}` iff the bytes validate as UTF-8 and otherwise
+canonical standard base64. It denies unknown fields/encodings and rejects malformed/non-canonical base64, base64 for
+valid UTF-8, decoded NUL, arguments above 128 KiB, aggregate argv above 1 MiB, and empty argv/`argv[0]`. A script's
+parts and values are UTF-8 strings without NUL, bounded together at the same 1 MiB, with exactly one more part than
+values. Validation precedes RPC, job/artifact effects, process allocation, and spawn. The supervisor consumes arguments
+into `OsString` for `plan_exec`; no `String`, lossy rendering, or alternate supervisor wire shape exists.
 
 - Idle timeout: the supervisor exits after `[shell] idle` (default 30 min) with no sessions and no running jobs, freeing
   memory; the next exec respawns it. `cowshed detach`/`cowshed rm` stop it immediately (teardown below).
@@ -176,9 +201,11 @@ replacement and attach otherwise discard only an incomplete trailing Arrow batch
 sealed artifact. Fork/checkpoint/restore copies start above every inherited allocation; no separate high-water file
 exists.
 
-Each admission and terminal job batch also records its immutable argv as a required Arrow `List<Binary>`. Recovery
-requires the canonical schema, non-null Binary elements, a non-empty first element, no NUL, and the same per-element and
-aggregate byte bounds before reconstructing `CommandArg`. This preserves non-UTF-8 Unix argv across crash recovery and
+Each admission and terminal job batch also records its immutable command in a required Arrow `List<Binary>` `argv`
+column. An argv job stores its arguments; a script job stores exactly two elements, `\0script` and the script's JSON — a
+first element no argv can have. Recovery requires the canonical schema and non-null Binary elements; an argv needs a
+non-empty first element, no NUL, and the same per-element and aggregate byte bounds before reconstructing `CommandArg`,
+and a script needs its JSON to decode to a valid script. This preserves non-UTF-8 Unix argv across crash recovery and
 rejects malformed complete batches as `Integrity`; protected storage never downgrades argv to Arrow Utf8.
 
 A controller-minted immutable `workspaceIncarnation` disambiguates histories copied by fork/checkpoint/restore. Each
@@ -396,6 +423,13 @@ process group the supervisor signals, and an exact wait status. A long-lived bas
 it cannot receive descriptors, named FIFOs are reachable by sibling jobs, and its `wait` folds a signal death into
 `128+N` and drops the core-dump flag. The exec host does exactly what bash cannot and nothing more; shell text belongs
 to a shell interpreter, not to the process that keeps the activation.
+
+**Scripts interpreted inside the warm host rejected.** Running a script in the host's own brush interpreter would save a
+fork but break the job contract: with job control off every external command joins the interpreter's own process group
+(so a job kill would kill the host), with it on each pipeline gets a group of its own (so `a; b &` escapes a kill), a
+command's signal death is folded into exit `128+N` with no way to report the signal, and `umask`, `ulimit`, `trap` and
+`exec` act on the host process that later commands share. A fork of the warm host costs about a millisecond and inherits
+the activated environment, so a per-script child keeps every property of an argv job without changing the interpreter.
 
 **A cross-workspace shared supervisor rejected.** One supervisor serving many workspaces would straddle sandbox
 boundaries and couple unrelated workspaces' lifecycles. One supervisor per workspace keeps the boundary and teardown

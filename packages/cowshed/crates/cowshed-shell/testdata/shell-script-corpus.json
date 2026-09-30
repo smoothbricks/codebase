@@ -1,0 +1,959 @@
+{
+  "schema": "cowshed.shell-script-corpus/v1",
+  "rows": [
+    {
+      "name": "pipe into grep",
+      "parts": ["printf 'a\\nb\\n' | grep ", ""],
+      "values": [
+        {
+          "words": ["b"]
+        }
+      ],
+      "verdict": "ok",
+      "slots": [
+        {
+          "kind": "arg",
+          "stmt": 0,
+          "word": 3
+        }
+      ],
+      "stdout": "b\n"
+    },
+    {
+      "name": "injection stays one argument",
+      "parts": ["printf '[%s]\\n' ", ""],
+      "values": [
+        {
+          "words": ["x; rm -rf / #"]
+        }
+      ],
+      "verdict": "ok",
+      "slots": [
+        {
+          "kind": "arg",
+          "stmt": 0,
+          "word": 2
+        }
+      ],
+      "stdout": "[x; rm -rf / #]\n"
+    },
+    {
+      "name": "injection inside double quotes",
+      "parts": ["printf '[%s]\\n' \"pre ", " post\""],
+      "values": [
+        {
+          "word": "\"; echo INJECTED; echo \""
+        }
+      ],
+      "verdict": "ok",
+      "slots": [
+        {
+          "kind": "arg",
+          "stmt": 0,
+          "word": 2
+        }
+      ],
+      "stdout": "[pre \"; echo INJECTED; echo \" post]\n"
+    },
+    {
+      "name": "injection inside single quotes",
+      "parts": ["printf '[%s]\\n' 'pre ", " post'"],
+      "values": [
+        {
+          "word": "it's $(echo INJECTED)"
+        }
+      ],
+      "verdict": "ok",
+      "slots": [
+        {
+          "kind": "arg",
+          "stmt": 0,
+          "word": 2
+        }
+      ],
+      "stdout": "[pre it's $(echo INJECTED) post]\n"
+    },
+    {
+      "name": "bare array spreads",
+      "parts": ["printf '[%s]\\n' ", ""],
+      "values": [
+        {
+          "words": ["a b", "c"]
+        }
+      ],
+      "verdict": "ok",
+      "slots": [
+        {
+          "kind": "arg",
+          "stmt": 0,
+          "word": 2
+        }
+      ],
+      "stdout": "[a b]\n[c]\n"
+    },
+    {
+      "name": "glued array joins",
+      "parts": ["printf '[%s]\\n' x", "y"],
+      "values": [
+        {
+          "word": "a b c"
+        }
+      ],
+      "verdict": "ok",
+      "slots": [
+        {
+          "kind": "arg",
+          "stmt": 0,
+          "word": 2
+        }
+      ],
+      "stdout": "[xa b cy]\n"
+    },
+    {
+      "name": "empty array is no word",
+      "parts": ["printf '[%s]\\n' a ", " b"],
+      "values": [
+        {
+          "words": []
+        }
+      ],
+      "verdict": "ok",
+      "slots": [
+        {
+          "kind": "arg",
+          "stmt": 0,
+          "word": 3
+        }
+      ],
+      "stdout": "[a]\n[b]\n"
+    },
+    {
+      "name": "empty string is one empty word",
+      "parts": ["printf '[%s]\\n' a ", " b"],
+      "values": [
+        {
+          "words": [""]
+        }
+      ],
+      "verdict": "ok",
+      "slots": [
+        {
+          "kind": "arg",
+          "stmt": 0,
+          "word": 3
+        }
+      ],
+      "stdout": "[a]\n[]\n[b]\n"
+    },
+    {
+      "name": "value glob stays literal",
+      "parts": ["printf '[%s]\\n' ", ""],
+      "values": [
+        {
+          "words": ["*"]
+        }
+      ],
+      "verdict": "ok",
+      "slots": [
+        {
+          "kind": "arg",
+          "stmt": 0,
+          "word": 2
+        }
+      ],
+      "stdout": "[*]\n"
+    },
+    {
+      "name": "value newline stays inside the word",
+      "parts": ["printf '[%s]\\n' ", ""],
+      "values": [
+        {
+          "words": ["line1\nline2"]
+        }
+      ],
+      "verdict": "ok",
+      "slots": [
+        {
+          "kind": "arg",
+          "stmt": 0,
+          "word": 2
+        }
+      ],
+      "stdout": "[line1\nline2]\n"
+    },
+    {
+      "name": "value expansions stay literal",
+      "parts": ["printf '[%s]\\n' ", ""],
+      "values": [
+        {
+          "words": ["$HOME `id` $(id) ${X}"]
+        }
+      ],
+      "verdict": "ok",
+      "slots": [
+        {
+          "kind": "arg",
+          "stmt": 0,
+          "word": 2
+        }
+      ],
+      "stdout": "[$HOME `id` $(id) ${X}]\n"
+    },
+    {
+      "name": "value quotes stay literal",
+      "parts": ["printf '[%s]\\n' ", ""],
+      "values": [
+        {
+          "words": ["'\"\\"]
+        }
+      ],
+      "verdict": "ok",
+      "slots": [
+        {
+          "kind": "arg",
+          "stmt": 0,
+          "word": 2
+        }
+      ],
+      "stdout": "['\"\\]\n"
+    },
+    {
+      "name": "redirect target",
+      "parts": ["printf hi > ", ""],
+      "values": [
+        {
+          "word": "/dev/stdout"
+        }
+      ],
+      "verdict": "ok",
+      "slots": [
+        {
+          "kind": "redirect",
+          "stmt": 0,
+          "word": 0
+        }
+      ],
+      "stdout": "hi"
+    },
+    {
+      "name": "assignment value",
+      "parts": ["X=", "; printf '%s\\n' \"$X\""],
+      "values": [
+        {
+          "word": "a b; echo no"
+        }
+      ],
+      "verdict": "ok",
+      "slots": [
+        {
+          "kind": "assign",
+          "stmt": 0,
+          "word": 0
+        }
+      ],
+      "stdout": "a b; echo no\n"
+    },
+    {
+      "name": "command name",
+      "parts": ["", " '[%s]\\n' z"],
+      "values": [
+        {
+          "words": ["printf"]
+        }
+      ],
+      "verdict": "ok",
+      "slots": [
+        {
+          "kind": "arg",
+          "stmt": 0,
+          "word": 0
+        }
+      ],
+      "stdout": "[z]\n"
+    },
+    {
+      "name": "inside command substitution",
+      "parts": ["printf '[%s]\\n' \"$(printf '%s' ", ")\""],
+      "values": [
+        {
+          "words": ["a b"]
+        }
+      ],
+      "verdict": "ok",
+      "slots": [
+        {
+          "kind": "arg",
+          "stmt": 0,
+          "word": 5
+        }
+      ],
+      "stdout": "[a b]\n"
+    },
+    {
+      "name": "value cannot end a statement",
+      "parts": ["printf '%s\\n' ", "; printf '%s\\n' second"],
+      "values": [
+        {
+          "words": ["first; printf injected"]
+        }
+      ],
+      "verdict": "ok",
+      "slots": [
+        {
+          "kind": "arg",
+          "stmt": 0,
+          "word": 2
+        }
+      ],
+      "stdout": "first; printf injected\nsecond\n"
+    },
+    {
+      "name": "and-or list",
+      "parts": ["false || printf '%s' ", " && printf ' done'"],
+      "values": [
+        {
+          "words": ["ran"]
+        }
+      ],
+      "verdict": "ok",
+      "slots": [
+        {
+          "kind": "arg",
+          "stmt": 1,
+          "word": 3
+        }
+      ],
+      "stdout": "ran done"
+    },
+    {
+      "name": "if then",
+      "parts": ["if test ", " = yes; then printf 'ok\\n'; fi"],
+      "values": [
+        {
+          "words": ["yes"]
+        }
+      ],
+      "verdict": "ok",
+      "slots": [
+        {
+          "kind": "arg",
+          "stmt": 0,
+          "word": 1
+        }
+      ],
+      "stdout": "ok\n"
+    },
+    {
+      "name": "stderr into stdout",
+      "parts": ["(printf '%s' ", " >&2) 2>&1"],
+      "values": [
+        {
+          "words": ["to-stderr"]
+        }
+      ],
+      "verdict": "ok",
+      "slots": [
+        {
+          "kind": "arg",
+          "stmt": 0,
+          "word": 2
+        }
+      ],
+      "stdout": "to-stderr"
+    },
+    {
+      "name": "double-quoted slot is one word",
+      "parts": ["printf '[%s]\\n' \"", "\""],
+      "values": [
+        {
+          "word": "a b"
+        }
+      ],
+      "verdict": "ok",
+      "slots": [
+        {
+          "kind": "arg",
+          "stmt": 0,
+          "word": 2
+        }
+      ],
+      "stdout": "[a b]\n"
+    },
+    {
+      "name": "even backslashes before a slot",
+      "parts": ["printf '[%s]\\n' \\\\", ""],
+      "values": [
+        {
+          "word": "v"
+        }
+      ],
+      "verdict": "ok",
+      "slots": [
+        {
+          "kind": "arg",
+          "stmt": 0,
+          "word": 2
+        }
+      ],
+      "stdout": "[\\v]\n"
+    },
+    {
+      "name": "two slots in one word",
+      "parts": ["printf '[%s]\\n' ", ":", ""],
+      "values": [
+        {
+          "word": "a"
+        },
+        {
+          "word": "b c"
+        }
+      ],
+      "verdict": "ok",
+      "slots": [
+        {
+          "kind": "arg",
+          "stmt": 0,
+          "word": 2
+        },
+        {
+          "kind": "arg",
+          "stmt": 0,
+          "word": 2
+        }
+      ],
+      "stdout": "[a:b c]\n"
+    },
+    {
+      "name": "adjacent bare slots",
+      "parts": ["printf '[%s]' ", " ", ""],
+      "values": [
+        {
+          "words": ["a"]
+        },
+        {
+          "words": ["b"]
+        }
+      ],
+      "verdict": "ok",
+      "slots": [
+        {
+          "kind": "arg",
+          "stmt": 0,
+          "word": 2
+        },
+        {
+          "kind": "arg",
+          "stmt": 0,
+          "word": 3
+        }
+      ],
+      "stdout": "[a][b]"
+    },
+    {
+      "name": "test operand",
+      "parts": ["[[ ", " == a* ]] && printf yes || printf no"],
+      "values": [
+        {
+          "word": "abc"
+        }
+      ],
+      "verdict": "ok",
+      "slots": [
+        {
+          "kind": "test",
+          "stmt": 0,
+          "word": 0
+        }
+      ],
+      "stdout": "yes"
+    },
+    {
+      "name": "value is never a pattern",
+      "parts": ["[[ abc == ", "* ]] && printf yes || printf no"],
+      "values": [
+        {
+          "word": "*"
+        }
+      ],
+      "verdict": "ok",
+      "slots": [
+        {
+          "kind": "test",
+          "stmt": 0,
+          "word": 1
+        }
+      ],
+      "stdout": "no"
+    },
+    {
+      "name": "for items",
+      "parts": ["for f in ", "; do printf '[%s]' \"$f\"; done"],
+      "values": [
+        {
+          "words": ["a b", "c"]
+        }
+      ],
+      "verdict": "ok",
+      "slots": [
+        {
+          "kind": "for",
+          "stmt": 0,
+          "word": 0
+        }
+      ],
+      "stdout": "[a b][c]"
+    },
+    {
+      "name": "case subject",
+      "parts": ["case ", " in yes) printf match;; *) printf other;; esac"],
+      "values": [
+        {
+          "word": "yes"
+        }
+      ],
+      "verdict": "ok",
+      "slots": [
+        {
+          "kind": "case",
+          "stmt": 0,
+          "word": 0
+        }
+      ],
+      "stdout": "match"
+    },
+    {
+      "name": "here-string",
+      "parts": ["cat <<< ", ""],
+      "values": [
+        {
+          "word": "hi there"
+        }
+      ],
+      "verdict": "ok",
+      "slots": [
+        {
+          "kind": "redirect",
+          "stmt": 0,
+          "word": 0
+        }
+      ],
+      "stdout": "hi there\n"
+    },
+    {
+      "name": "process substitution",
+      "parts": ["cat <(printf '%s' ", ")"],
+      "values": [
+        {
+          "words": ["ps"]
+        }
+      ],
+      "verdict": "ok",
+      "slots": [
+        {
+          "kind": "arg",
+          "stmt": 0,
+          "word": 4
+        }
+      ],
+      "stdout": "ps"
+    },
+    {
+      "name": "export value",
+      "parts": ["export HTS_CORPUS_X=", "; printf '%s\\n' \"$HTS_CORPUS_X\""],
+      "values": [
+        {
+          "word": "v w"
+        }
+      ],
+      "verdict": "ok",
+      "slots": [
+        {
+          "kind": "assign",
+          "stmt": 0,
+          "word": 0
+        }
+      ],
+      "stdout": "v w\n"
+    },
+    {
+      "name": "array elements",
+      "parts": ["a=(", ") ; printf '[%s]' \"${a[@]}\""],
+      "values": [
+        {
+          "words": ["p q", "r"]
+        }
+      ],
+      "verdict": "ok",
+      "slots": [
+        {
+          "kind": "array",
+          "stmt": 0,
+          "word": 0
+        }
+      ],
+      "stdout": "[p q][r]"
+    },
+    {
+      "name": "function argument",
+      "parts": ["f() { printf '[%s]' \"$1\"; }; f ", ""],
+      "values": [
+        {
+          "words": ["x y"]
+        }
+      ],
+      "verdict": "ok",
+      "slots": [
+        {
+          "kind": "arg",
+          "stmt": 1,
+          "word": 4
+        }
+      ],
+      "stdout": "[x y]"
+    },
+    {
+      "name": "brace expansion",
+      "parts": ["printf '[%s]' {a,b}"],
+      "values": [],
+      "verdict": "ok",
+      "slots": [],
+      "stdout": "[a][b]"
+    },
+    {
+      "name": "comment",
+      "parts": ["printf a # trailing comment"],
+      "values": [],
+      "verdict": "ok",
+      "slots": [],
+      "stdout": "a"
+    },
+    {
+      "name": "newline separates commands",
+      "parts": ["printf a\nprintf b"],
+      "values": [],
+      "verdict": "ok",
+      "slots": [],
+      "stdout": "ab"
+    },
+    {
+      "name": "exit status parameter",
+      "parts": ["false; printf '%s\\n' \"$?\""],
+      "values": [],
+      "verdict": "ok",
+      "slots": [],
+      "stdout": "1\n"
+    },
+    {
+      "name": "parameter default",
+      "parts": ["printf '%s\\n' \"${UNSET_HTS_CORPUS:-dflt}\""],
+      "values": [],
+      "verdict": "ok",
+      "slots": [],
+      "stdout": "dflt\n"
+    },
+    {
+      "name": "arithmetic expansion",
+      "parts": ["printf '%s\\n' $((1 + 2))"],
+      "values": [],
+      "verdict": "ok",
+      "slots": [],
+      "stdout": "3\n"
+    },
+    {
+      "name": "backtick substitution",
+      "parts": ["printf '%s\\n' `printf bt`"],
+      "values": [],
+      "verdict": "ok",
+      "slots": [],
+      "stdout": "bt\n"
+    },
+    {
+      "name": "brace group",
+      "parts": ["{ printf a; printf b; }"],
+      "values": [],
+      "verdict": "ok",
+      "slots": [],
+      "stdout": "ab"
+    },
+    {
+      "name": "negation",
+      "parts": ["! false && printf neg"],
+      "values": [],
+      "verdict": "ok",
+      "slots": [],
+      "stdout": "neg"
+    },
+    {
+      "name": "ansi-c string",
+      "parts": ["printf '%s\\n' $'a\\tb'"],
+      "values": [],
+      "verdict": "ok",
+      "slots": [],
+      "stdout": "a\tb\n"
+    },
+    {
+      "name": "while loop",
+      "parts": ["i=0; while test $i -lt 2; do printf x; i=$((i + 1)); done"],
+      "values": [],
+      "verdict": "ok",
+      "slots": [],
+      "stdout": "xx"
+    },
+    {
+      "name": "stderr pipe",
+      "parts": ["(printf e >&2) |& cat"],
+      "values": [],
+      "verdict": "ok",
+      "slots": [],
+      "stdout": "e"
+    },
+    {
+      "name": "escaped dollar",
+      "parts": ["printf '%s\\n' \\$HOME"],
+      "values": [],
+      "verdict": "ok",
+      "slots": [],
+      "stdout": "$HOME\n"
+    },
+    {
+      "name": "unterminated double quote",
+      "parts": ["printf \"unterminated"],
+      "values": [],
+      "verdict": "syntax"
+    },
+    {
+      "name": "unterminated single quote around a slot",
+      "parts": ["printf '", ""],
+      "values": [
+        {
+          "word": "x"
+        }
+      ],
+      "verdict": "syntax"
+    },
+    {
+      "name": "stray close paren",
+      "parts": ["printf )"],
+      "values": [],
+      "verdict": "syntax"
+    },
+    {
+      "name": "if without fi",
+      "parts": ["if true; then printf a"],
+      "values": [],
+      "verdict": "syntax"
+    },
+    {
+      "name": "dangling and",
+      "parts": ["printf a &&"],
+      "values": [],
+      "verdict": "syntax"
+    },
+    {
+      "name": "leading pipe",
+      "parts": ["| grep x"],
+      "values": [],
+      "verdict": "syntax"
+    },
+    {
+      "name": "unclosed command substitution",
+      "parts": ["printf $(printf a"],
+      "values": [],
+      "verdict": "syntax"
+    },
+    {
+      "name": "unclosed parameter expansion",
+      "parts": ["printf ${"],
+      "values": [],
+      "verdict": "syntax"
+    },
+    {
+      "name": "case without esac",
+      "parts": ["case a in a) printf a;;"],
+      "values": [],
+      "verdict": "syntax"
+    },
+    {
+      "name": "redirect without target",
+      "parts": ["printf a >"],
+      "values": [],
+      "verdict": "syntax"
+    },
+    {
+      "name": "done without loop",
+      "parts": ["done"],
+      "values": [],
+      "verdict": "syntax"
+    },
+    {
+      "name": "arithmetic expansion",
+      "parts": ["printf '%s' $((1 + ", "))"],
+      "values": [
+        {
+          "word": "2"
+        }
+      ],
+      "verdict": "placement"
+    },
+    {
+      "name": "arithmetic command",
+      "parts": ["(( ", " ))"],
+      "values": [
+        {
+          "word": "1"
+        }
+      ],
+      "verdict": "placement"
+    },
+    {
+      "name": "let",
+      "parts": ["let n=", ""],
+      "values": [
+        {
+          "word": "1"
+        }
+      ],
+      "verdict": "placement"
+    },
+    {
+      "name": "heredoc body",
+      "parts": ["cat <<EOF\n", "\nEOF"],
+      "values": [
+        {
+          "word": "x"
+        }
+      ],
+      "verdict": "placement"
+    },
+    {
+      "name": "comment",
+      "parts": ["printf a # ", ""],
+      "values": [
+        {
+          "word": "x"
+        }
+      ],
+      "verdict": "placement"
+    },
+    {
+      "name": "assignment name",
+      "parts": ["", "=1 printf a"],
+      "values": [
+        {
+          "word": "X"
+        }
+      ],
+      "verdict": "placement"
+    },
+    {
+      "name": "parameter expansion word",
+      "parts": ["printf '%s' \"${HOME:-", "}\""],
+      "values": [
+        {
+          "word": "x"
+        }
+      ],
+      "verdict": "placement"
+    },
+    {
+      "name": "parameter name",
+      "parts": ["printf '%s' $", ""],
+      "values": [
+        {
+          "word": "HOME"
+        }
+      ],
+      "verdict": "placement"
+    },
+    {
+      "name": "ansi-c string",
+      "parts": ["printf '%s' $'", "'"],
+      "values": [
+        {
+          "word": "x"
+        }
+      ],
+      "verdict": "placement"
+    },
+    {
+      "name": "arithmetic comparison",
+      "parts": ["[[ ", " -eq 1 ]]"],
+      "values": [
+        {
+          "word": "1"
+        }
+      ],
+      "verdict": "placement"
+    },
+    {
+      "name": "variable-set test",
+      "parts": ["[[ -v ", " ]]"],
+      "values": [
+        {
+          "word": "X"
+        }
+      ],
+      "verdict": "placement"
+    },
+    {
+      "name": "loop variable name",
+      "parts": ["for ", " in a; do :; done"],
+      "values": [
+        {
+          "word": "f"
+        }
+      ],
+      "verdict": "placement"
+    },
+    {
+      "name": "array subscript",
+      "parts": ["a[", "]=1"],
+      "values": [
+        {
+          "word": "0"
+        }
+      ],
+      "verdict": "placement"
+    },
+    {
+      "name": "integer declaration",
+      "parts": ["declare -i n=", ""],
+      "values": [
+        {
+          "word": "1"
+        }
+      ],
+      "verdict": "placement"
+    },
+    {
+      "name": "bare declaration operand",
+      "parts": ["export ", ""],
+      "values": [
+        {
+          "word": "X"
+        }
+      ],
+      "verdict": "placement"
+    },
+    {
+      "name": "function name",
+      "parts": ["f", "() { :; }"],
+      "values": [
+        {
+          "word": "x"
+        }
+      ],
+      "verdict": "placement"
+    },
+    {
+      "name": "file descriptor name",
+      "parts": ["exec {", "}>/dev/null"],
+      "values": [
+        {
+          "word": "fd"
+        }
+      ],
+      "verdict": "placement"
+    }
+  ]
+}

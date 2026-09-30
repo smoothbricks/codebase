@@ -15,8 +15,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use cowshed_core::api::{
-    CommandArg, ExecRequest, ExitStatus, JobInfo, JobState, RunSandboxMode, StdinSource,
-    WorkspacePath,
+    CommandArg, ExecCommand, ExecRequest, ExitStatus, JobFailure, JobInfo, JobState,
+    RunSandboxMode, ScriptCommand, ScriptValue, StdinSource, WorkspacePath,
 };
 use cowshed_core::error::Result;
 use cowshed_core::metadata::{PortBlock, WorkspaceIncarnation, WorkspaceName};
@@ -181,7 +181,7 @@ fn authority(grant_revision: u64) -> WorkspaceAuthoritySnapshot {
 
 fn request(argv: &[&str]) -> ExecRequest {
     ExecRequest {
-        argv: argv.iter().copied().map(CommandArg::from).collect(),
+        command: ExecCommand::Argv(argv.iter().copied().map(CommandArg::from).collect()),
         cwd: None,
         mode: RunSandboxMode::ReadWrite,
         env: HashMap::new(),
@@ -653,5 +653,127 @@ async fn host_controller_an_activation_ends_when_its_supervisor_process_does() {
     assert!(
         ended.is_ok(),
         "the activation of a supervisor that exited kept running as pid {pid}"
+    );
+}
+
+fn script(parts: &[&str], values: Vec<ScriptValue>) -> ExecRequest {
+    ExecRequest {
+        command: ExecCommand::Script(
+            ScriptCommand::new(
+                parts.iter().map(|part| (*part).to_owned()).collect(),
+                values,
+            )
+            .expect("a well-shaped script"),
+        ),
+        ..request(&["unused"])
+    }
+}
+
+#[tokio::test]
+#[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
+async fn host_controller_a_script_job_runs_in_the_warm_shell_with_its_values_as_data() {
+    let workspace = Workspace::new("shell-pool-script", 41_264);
+    workspace.envrc("export GREETING=hello\n");
+    let handle = workspace.supervisor(false);
+    run(&handle, sh("true")).await.ok();
+    let ran = run(
+        &handle,
+        script(
+            &["printf '%s:' \"$GREETING\" ", " | tr a-z A-Z"],
+            vec![ScriptValue::Words(vec!["x y".into(), "$(id)".into()])],
+        ),
+    )
+    .await
+    .ok();
+    assert_eq!(ran.stdout, "HELLO:X Y:$(ID):");
+    assert!(
+        matches!(ran.info.command, ExecCommand::Script(_)),
+        "the job records the script it ran"
+    );
+    assert_eq!(
+        workspace.activations(),
+        1,
+        "the script ran in the warm shell"
+    );
+}
+
+#[tokio::test]
+#[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
+async fn host_controller_a_script_that_does_not_parse_is_a_typed_failure() {
+    let workspace = Workspace::new("shell-pool-script-syntax", 41_280);
+    workspace.envrc("");
+    let handle = workspace.supervisor(false);
+    let ran = run(&handle, script(&["touch ran; if true; then"], Vec::new())).await;
+    assert_eq!(ran.info.state, JobState::Failed);
+    assert_eq!(ran.info.failure, Some(JobFailure::ScriptSyntax));
+    assert_eq!(ran.info.exit, Some(ExitStatus::Exited { code: 2 }));
+    assert!(ran.stderr.contains("does not parse"), "{}", ran.stderr);
+    assert!(!workspace.mount().join("ran").exists());
+    assert_eq!(
+        run(&handle, script(&["printf still"], Vec::new()))
+            .await
+            .ok()
+            .stdout,
+        "still",
+        "the host that refused a script keeps serving"
+    );
+}
+
+#[tokio::test]
+#[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
+async fn host_controller_killing_a_script_job_ends_every_process_it_started() {
+    let workspace = Workspace::new("shell-pool-script-kill", 41_296);
+    workspace.envrc("");
+    let handle = workspace.supervisor(false);
+    run(&handle, sh("true")).await.ok();
+    let job = handle
+        .exec(
+            None,
+            script(
+                &["sleep 300 & (sleep 301; true) & printf '%s %s\\n' $$ $! > pids; wait"],
+                Vec::new(),
+            ),
+        )
+        .await
+        .expect("admit");
+    let pids = workspace.mount().join("pids");
+    let recorded = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if let Ok(text) = std::fs::read_to_string(&pids)
+                && text.ends_with('\n')
+            {
+                return text;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the script records its pids");
+    let pids: Vec<i32> = recorded
+        .split_whitespace()
+        .map(|pid| pid.parse().expect("pid"))
+        .collect();
+    handle.kill(job).await.expect("kill");
+    let info = handle.wait(job).await.expect("killed job");
+    assert_eq!(info.state, JobState::Killed);
+    assert_eq!(
+        info.exit,
+        Some(ExitStatus::Signaled {
+            signal: libc::SIGTERM,
+            core_dumped: false,
+        })
+    );
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    for pid in pids {
+        assert!(
+            !process_alive(pid),
+            "process {pid} of the killed script survived"
+        );
+    }
+    assert_eq!(run(&handle, sh("printf again")).await.ok().stdout, "again");
+    assert_eq!(
+        workspace.activations(),
+        1,
+        "the kill never reached the warm shell"
     );
 }
