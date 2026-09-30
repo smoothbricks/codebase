@@ -43,27 +43,40 @@ layout root:
 ```
 /private/cowshed/store/                          # ← the cowshed.store volume, fstab-pinned here (see "Dedicated volumes")
   .cowshed-volume.json               # volume marker: its ABSENCE means "not mounted" (see mount ordering below)
+  host.json                          # host configuration: mount root, credential routes
+  .staging/                          # port-block reservations held while a workspace's grants are minted
   <owner>/<repo>/                    # primary repo_id, encoded one component at a time
     repository.json                  # chosen remote binding, alternate identities, and primary designation
+    checkout-root.json               # where the checkout was when main was last removed (written then, read to reopen)
+    slot-bindings.json               # build slot → workspace bindings (`new --slot`, 06_cli.md)
     policy.json                      # trusted project policy (checkpoint quotas, standing grants); controller-owned, 0600
-    lifecycle-intents.json             # bounded persist-before-mutate create/fork/remove recovery journal, mode 0600
-    lifecycle-intents.json.lock        # flock held for each read-modify-write of the journal
+    waivers.json                     # reasoned secret-scan waivers (02_workspaces.md)
+    lifecycle-intents.json           # bounded persist-before-mutate create/fork/remove recovery journal, mode 0600
+    lifecycle-intents.json.lock      # flock held for each read-modify-write of the journal
+    deletion-log.jsonl               # one line per artifact the controller unlinked (storage/deletion_log.rs)
     main.asif                        # adopted main image
     main.asif.grants.json            # controller-owned grants + detached metadata
+    main.asif.ca.key                 # main's workspace CA private key, 0600
+    main.asif.lock                   # flock target for lifecycle operations
+    .staging/                        # clones being provisioned, never enumerated
     sessions/
       <workspace>.asif               # one image per workspace
       <workspace>.asif.grants.json   # grants + detached metadata (see 04_sandbox.md)
+      <workspace>.asif.ca.key        # the workspace's CA private key, 0600
       <workspace>.asif.lock          # flock target for lifecycle operations
-      <workspace>.intent.lock                      # flock the process executing <workspace>'s lifecycle intent holds
+      <workspace>.intent.lock        # flock the process executing <workspace>'s lifecycle intent holds
+      .trash/                        # removed images awaiting reclamation (`gc`)
     checkpoints/
       <workspace>/<label>.asif       # clonefile snapshot
-    quarantine/                      # secrets relocated by `cowshed adopt --quarantine` (02_workspaces.md)
-    waivers.json                     # reasoned secret-scan waivers (02_workspaces.md)
-  gateway/
-    config.json                      # allowlist, upstream registries (optional; defaults apply)
+    quarantine/                      # secrets relocated by `cowshed adopt --quarantine`, and keyless sidecars awaiting `rekey`
   gateway.sock                       # gateway unix socket (control plane; root-level keeps sun_path short)
-  run/gateway/                       # Linux only, 0700: per-incarnation data-plane Unix sockets, each mode 0600
-    <workspaceIncarnation>.sock      # bind-mounted into exactly one attached workspace; absent after detach/restore fence
+  sccache.sock                       # the host sccache daemon's socket (03_caches.md)
+  run/
+    manager.sock                     # the daemon's supervisor manager (11_shell.md)
+    <digest>.sock                    # one workspace supervisor's socket
+    <digest>.groups                  # that supervisor's process-group ledger
+    gateway/                         # Linux only, 0700: per-incarnation data-plane Unix sockets, each mode 0600
+      <workspaceIncarnation>.sock    # bind-mounted into exactly one attached workspace; absent after detach/restore fence
   telemetry/                         # ALL telemetry: Arrow IPC segments, day-partitioned (13_telemetry.md)
     <yyyy-mm-dd>/*.arrow             #   lifecycle spans, gateway audit, grant mutations, command debug
   (rebuildable caches live on the sibling `/private/cowshed/caches` volume, not beneath this tree)
@@ -389,13 +402,13 @@ policy is deliberately blunt: any user may retire any shed, because `noowners` a
 
 ## Runtime state: derived, never stored
 
-| Question                | Source of truth                                                                                             |
-| ----------------------- | ----------------------------------------------------------------------------------------------------------- |
-| Which workspaces exist? | For the selected primary `repo_id`, `readdir` its `sessions/` images plus that project's exactly one `main` |
-| What is attached where? | Kernel mount table (`getmntinfo`), matched by mount point, identity confirmed by the in-image marker        |
-| Workspace identity      | In-image marker `.cowshed/workspace.json`                                                                   |
-| Grants                  | Sibling file `<image>.grants.json`                                                                          |
-| Concurrency             | `flock` on `<image>.lock` per lifecycle operation                                                           |
+| Question                | Source of truth                                                                                                                              |
+| ----------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
+| Which workspaces exist? | For the selected primary `repo_id`, `readdir` its `sessions/` images plus that project's exactly one `main`                                  |
+| What is attached where? | Kernel mount table (`getmntinfo`), matched by mount point, identity confirmed by the in-image marker                                         |
+| Workspace identity      | In-image marker `.cowshed/workspace.json`                                                                                                    |
+| Grants                  | Sibling file `<image>.grants.json`                                                                                                           |
+| Concurrency             | `flock` on `<image>.lock` per lifecycle operation; `<workspace>.intent.lock` held by the process executing that workspace's lifecycle intent |
 
 The detached metadata required for discovery and attach lives in `<image>.grants.json`; at minimum it contains the
 workspace identity, in addition to the grant schema in 04_sandbox.md, so `cowshed ls` and attach never mount an image to
