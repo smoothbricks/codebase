@@ -10,9 +10,9 @@
 //!   bunfig in the private environment, and sends the token in its own `Authorization` header,
 //!   never in a URL. Go is not a mirror client: `cmd/go` sends credentials only over HTTPS, so
 //!   its `GOENV` file points it at the public module proxy, reached through an opaque tunnel.
-//! - **TLS clients** that read one CA file — git, cargo, nix — get a combined trust bundle: the
-//!   platform's roots (for opaque tunnels, which present the real upstream certificate) followed
-//!   by the workspace CA (for intercepted hosts).
+//! - **TLS clients** that read one CA file — git, cargo, nix, uv and OpenSSL — get a combined
+//!   trust bundle: the platform's roots (for opaque tunnels, which present the real upstream
+//!   certificate) followed by the workspace CA (for intercepted hosts).
 //!
 //! Written when the workspace is minted and rewritten before every exec, so an endpoint that
 //! moved or a token that rotated is never served stale. Writes are idempotent: an unchanged
@@ -37,6 +37,11 @@ pub const NIX_CA_ENV: &str = "NIX_SSL_CERT_FILE";
 /// `ssl-cert-file` (measured on Determinate Nix 2.35: `/etc/nix/macos-keychain.crt`) outranks
 /// `NIX_SSL_CERT_FILE`, and only `NIX_CONFIG` outranks that file.
 pub const NIX_CONFIG_ENV: &str = "NIX_CONFIG";
+/// The CA file OpenSSL, and uv in system-certificate mode, verify against.
+pub const SSL_CERT_ENV: &str = "SSL_CERT_FILE";
+/// uv verifies against its bundled roots unless told to use the platform's, which it then reads
+/// from `SSL_CERT_FILE`.
+pub const UV_SYSTEM_CERTS_ENV: &str = "UV_SYSTEM_CERTS";
 
 /// The platform root bundle the combined bundle starts from: what an opaque-tunnelled client
 /// would verify the real upstream certificate against.

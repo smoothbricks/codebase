@@ -1411,10 +1411,13 @@ pub(super) async fn sandbox_environment(
                 .expect("the bundle name is ASCII"),
         );
         // Same rule as NODE_EXTRA_CA_CERTS above: a caller's own anchor is kept and announced.
+        // The bundle is the platform roots plus the workspace CA, a superset of what the toolchain
+        // would otherwise point SSL_CERT_FILE at, so every client that reads it keeps its trust.
         for name in [
             crate::workspace_clients::GIT_CA_ENV,
             crate::workspace_clients::CARGO_CA_ENV,
             crate::workspace_clients::NIX_CA_ENV,
+            crate::workspace_clients::SSL_CERT_ENV,
         ] {
             if caller.contains_key(name) {
                 eprintln!(
@@ -1424,6 +1427,12 @@ pub(super) async fn sandbox_environment(
             }
             defaults.insert(OsString::from(name), bundle.clone().into_os_string());
         }
+        // uv ignores SSL_CERT_FILE until told to verify with system certificates; a caller that
+        // sets UV_SYSTEM_CERTS itself keeps its choice.
+        defaults.insert(
+            OsString::from(crate::workspace_clients::UV_SYSTEM_CERTS_ENV),
+            OsString::from("true"),
+        );
         // A host `nix.conf` that names its own `ssl-cert-file` outranks NIX_SSL_CERT_FILE; only
         // NIX_CONFIG, applied after every config file, outranks it. A caller's NIX_CONFIG keeps
         // its lines, with this one last so it is the setting nix applies.
@@ -4159,13 +4168,24 @@ mod workspace_toolchain_tests {
         );
 
         let bundle = mount.join(".cowshed/ca-bundle.pem");
-        for name in ["GIT_SSL_CAINFO", "CARGO_HTTP_CAINFO", "NIX_SSL_CERT_FILE"] {
+        for name in [
+            "GIT_SSL_CAINFO",
+            "CARGO_HTTP_CAINFO",
+            "NIX_SSL_CERT_FILE",
+            "SSL_CERT_FILE",
+        ] {
             assert_eq!(
                 vars.get(name).map(PathBuf::from),
                 Some(bundle.clone()),
                 "{name}"
             );
         }
+        // uv verifies against its own bundled roots unless told to use the platform's, and then
+        // reads SSL_CERT_FILE as that platform bundle.
+        assert_eq!(
+            vars.get("UV_SYSTEM_CERTS").map(String::as_str),
+            Some("true")
+        );
         // nix.conf's own `ssl-cert-file` outranks NIX_SSL_CERT_FILE; NIX_CONFIG outranks
         // nix.conf, and a caller's NIX_CONFIG keeps its own lines.
         assert_eq!(

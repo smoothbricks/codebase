@@ -395,16 +395,20 @@ the certificate itself as an additive anchor; clients that read exactly one CA f
 Linux) followed by the workspace CA — so an opaque tunnel, which presents the real upstream certificate, still verifies.
 A caller that sets one of these variables itself keeps it, and the exec says so on stderr.
 
-| Tool family | Anchor                                                                                                                                                                                                                                          |
-| ----------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Node / Bun  | `NODE_EXTRA_CA_CERTS` = the workspace CA certificate                                                                                                                                                                                            |
-| git         | `GIT_SSL_CAINFO` = the trust bundle                                                                                                                                                                                                             |
-| cargo       | `CARGO_HTTP_CAINFO` = the trust bundle (cargo's environment spelling of `http.cainfo`; there is no per-workspace cargo config — 03_caches.md)                                                                                                   |
-| nix         | `NIX_SSL_CERT_FILE` = the trust bundle, and `ssl-cert-file = <bundle>` appended to `NIX_CONFIG`: a host `nix.conf` naming its own `ssl-cert-file` outranks `NIX_SSL_CERT_FILE` (measured on Determinate Nix 2.35), and `NIX_CONFIG` outranks it |
+| Tool family | Anchor                                                                                                                                                                                                                                                                                                                                             |
+| ----------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Node / Bun  | `NODE_EXTRA_CA_CERTS` = the workspace CA certificate                                                                                                                                                                                                                                                                                               |
+| git         | `GIT_SSL_CAINFO` = the trust bundle                                                                                                                                                                                                                                                                                                                |
+| cargo       | `CARGO_HTTP_CAINFO` = the trust bundle (cargo's environment spelling of `http.cainfo`; there is no per-workspace cargo config — 03_caches.md)                                                                                                                                                                                                      |
+| nix         | `NIX_SSL_CERT_FILE` = the trust bundle, and `ssl-cert-file = <bundle>` appended to `NIX_CONFIG`: a host `nix.conf` naming its own `ssl-cert-file` outranks `NIX_SSL_CERT_FILE` (measured on Determinate Nix 2.35), and `NIX_CONFIG` outranks it                                                                                                    |
+| OpenSSL, uv | `SSL_CERT_FILE` = the trust bundle, and `UV_SYSTEM_CERTS=true`: uv verifies against its own bundled roots unless told to use the platform's, and then takes `SSL_CERT_FILE` as that bundle (measured on uv 0.12.5: `uv sync` against intercepted `files.pythonhosted.org` fails `UnknownIssuer` with `SSL_CERT_FILE` alone and verifies with both) |
 
-`SSL_CERT_FILE` is not set: nix and devenv own it for the whole toolchain, and a devenv shell replaces it with its own
-bundle. Python requests (`REQUESTS_CA_BUNDLE`), Deno (`DENO_CERT`) and the JVM read anchors cowshed does not wire, so
-they verify an intercepted host only when their own configuration trusts the bundle.
+`SSL_CERT_FILE` names the trust bundle because the bundle is a superset of what the toolchain would otherwise point it
+at: the same platform roots, followed by the workspace CA. Every client that reads it therefore trusts everything it did
+before, and intercepted hosts as well. Shell activation runs after this environment is set, so a devenv shell whose
+activation exports its own `SSL_CERT_FILE` replaces it for that shell. Python requests (`REQUESTS_CA_BUNDLE`), Deno
+(`DENO_CERT`) and the JVM read anchors cowshed does not wire, so they verify an intercepted host only when their own
+configuration trusts the bundle.
 
 **Known gaps** (documented, not silently broken):
 
