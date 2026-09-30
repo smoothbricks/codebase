@@ -14,14 +14,21 @@ test = false
 bench = false
 
 [dependencies]
-brush-builtins = "0.2"
-brush-core = "0.5"
-brush-parser = "0.4"
 cowshed-core.workspace = true
 libc = "0.2"
 serde.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = ["rt"] }
+
+# The workspace resolves features once for every member (.cargo/config.toml), per target. An
+# unconditional edge here would put brush's closure into every wasm32 build: brush enables
+# chrono's default `wasmbind`, which links wasm-bindgen into columine's event_processor.wasm and
+# gives it `__wbindgen_*` imports no consumer provides. The host never runs on wasm32, so the
+# edge is declared only where it can be built.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+brush-builtins = "0.2"
+brush-core = "0.5"
+brush-parser = "0.4"
 
 [dev-dependencies]
 async-trait = "0.1"
