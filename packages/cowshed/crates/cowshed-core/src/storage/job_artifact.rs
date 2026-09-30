@@ -28,10 +28,17 @@ use crate::api::dto::{
     TerminalCommitment, WarmRange, WorkspaceIntroducedCommitment, WorkspacePath,
     WorkspaceRetiredCommitment, validate_command_argv,
 };
+use crate::fsio::Durability;
 use crate::metadata::WorkspaceIncarnation;
 use crate::repository::{OwnedRepoIds, RepoId};
 mod publication;
 use crate::storage::verify_no_symlinks;
+
+/// How durable a job's own records and sealed streams are before the job is admitted or answered
+/// as ended: one `fsync(2)` per record batch. Power loss ends every job anyway, and a job whose
+/// record it took is sealed lost at the next supervisor start (11_shell.md "Job control").
+/// Checkpoint manifests and every lifecycle record stay at [`Durability::PowerLoss`].
+const JOB_RECORD_DURABILITY: Durability = Durability::Device;
 
 const RECORD_MAGIC: &[u8; 8] = b"CSARROW1";
 const BATCH_MAGIC: &[u8; 8] = b"CSBATCH1";
@@ -554,6 +561,35 @@ pub struct ArtifactStore {
     live_jobs: BTreeMap<JobId, LiveJobState>,
     committed_jobs: BTreeMap<JobId, JobArtifactRecord>,
     recovery: RecoveryReport,
+    /// The records file as this store last recovered or appended to it. An append that finds it
+    /// unchanged — same inode, same length — knows every frame already, so it skips re-reading
+    /// and re-hashing the whole log; any other writer's append, a torn tail it left, or a
+    /// replacement changes one of the two and brings the full recovery back.
+    records_seen: Option<RecordsIdentity>,
+}
+
+/// Which records file, at which length.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RecordsIdentity {
+    device: u64,
+    inode: u64,
+    len: u64,
+}
+
+impl RecordsIdentity {
+    fn of(path: &Path) -> Result<Option<Self>, ArtifactError> {
+        use std::os::unix::fs::MetadataExt as _;
+
+        match fs::symlink_metadata(path) {
+            Ok(metadata) => Ok(Some(Self {
+                device: metadata.dev(),
+                inode: metadata.ino(),
+                len: metadata.len(),
+            })),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(io_error(path, error)),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -670,6 +706,7 @@ impl ArtifactStore {
         }
         ensure_record_sequence_counter(&lock, &recovery)?;
         ensure_checkpoint_barrier_counter(&lock, &recovery, &workspace_incarnation)?;
+        let records_seen = RecordsIdentity::of(&records_path)?;
         drop(lock);
         let token_namespace = Sha256Digest::compute(workspace_root.as_os_str().as_encoded_bytes());
         Ok(Self {
@@ -686,6 +723,7 @@ impl ArtifactStore {
             committed_jobs,
             recovery,
             config,
+            records_seen,
         })
     }
 
@@ -769,16 +807,18 @@ impl ArtifactStore {
         })
     }
 
-    /// Seal the jobs among `lost` that this incarnation admitted and never sealed: the jobs a
-    /// supervisor ran when it ended without seeing them end, named by its group ledger. Only the
-    /// supervisor that now holds the workspace's socket may call this, after ending their
-    /// process groups. Each gets a `failed` terminal record naming `supervisorLost` and carrying
-    /// whatever its protected spill files hold; output that was only in the lost supervisor's
-    /// memory is gone and recorded as empty. A job no ledger names is never touched: it may be
-    /// live under a supervisor of another cowshed build.
-    pub fn seal_lost(
+    /// Seal every job this incarnation admitted and never sealed: the jobs a supervisor ran when
+    /// it ended without seeing them end. Only the supervisor that now holds the workspace's
+    /// socket may call this, after ending the process groups its predecessor's ledger names:
+    /// holding the socket means no other supervisor serves the workspace, so no such job can
+    /// still be running under cowshed. A job the ledger does not name had no group left to end —
+    /// power loss took the ledger along with every process, or with the job's terminal record,
+    /// which is a job's own record and not synced past power loss (11_shell.md "Job control").
+    /// Each gets a `failed` terminal record naming `supervisorLost` and carrying whatever its
+    /// protected spill files hold; output that was only in the lost supervisor's memory is gone
+    /// and recorded as empty. None is ever reported as having succeeded.
+    pub fn seal_unterminated(
         &mut self,
-        lost: &BTreeSet<JobId>,
     ) -> Result<Vec<(JobArtifactRecord, Sha256Digest)>, ArtifactError> {
         let admitted: BTreeMap<JobId, JobArtifactRecord> = self
             .recovery
@@ -786,8 +826,7 @@ impl ArtifactStore {
             .iter()
             .filter_map(|frame| match &frame.record {
                 ProtectedRecord::Job(record)
-                    if lost.contains(&record.job_id)
-                        && record.workspace_incarnation == self.workspace_incarnation
+                    if record.workspace_incarnation == self.workspace_incarnation
                         && matches!(record.state, JobState::Queued | JobState::Running)
                         && !self.committed_jobs.contains_key(&record.job_id)
                         && !self.live_jobs.contains_key(&record.job_id) =>
@@ -830,21 +869,38 @@ impl ArtifactStore {
     ) -> Result<(JobArtifactRecord, Sha256Digest), ArtifactError> {
         let path = records_path(&self.workspace_root);
         let lock = RecordsLock::acquire(&path)?;
-        let recovery = recover_records_with_budget_under_lock(
-            &lock,
-            self.config.retained_recovery_budget_bytes,
-        )?;
-        if !matches!(record.state, JobState::Queued | JobState::Running)
-            && recovery.frames.iter().any(|frame| {
-                matches!(
-                    &frame.record,
-                    ProtectedRecord::Job(existing)
-                        if existing.workspace_incarnation == record.workspace_incarnation
-                            && existing.job_id == record.job_id
-                            && !matches!(existing.state, JobState::Queued | JobState::Running)
-                )
-            })
-        {
+        let terminal = !matches!(record.state, JobState::Queued | JobState::Running);
+        let seen = RecordsIdentity::of(&path)?;
+        // A log past the retained budget still goes through recovery, which refuses it exactly
+        // as before: the frames it retains never exceed the file's length.
+        let unchanged = seen == self.records_seen
+            && seen.is_some_and(|seen| {
+                usize::try_from(seen.len)
+                    .is_ok_and(|len| len <= self.config.retained_recovery_budget_bytes)
+            });
+        let duplicate_terminal = if unchanged {
+            // Nothing wrote the log since this store last read or appended to it: every terminal
+            // record of this incarnation is one it holds.
+            terminal
+                && record.workspace_incarnation == self.workspace_incarnation
+                && self.committed_jobs.contains_key(&record.job_id)
+        } else {
+            let recovery = recover_records_with_budget_under_lock(
+                &lock,
+                self.config.retained_recovery_budget_bytes,
+            )?;
+            terminal
+                && recovery.frames.iter().any(|frame| {
+                    matches!(
+                        &frame.record,
+                        ProtectedRecord::Job(existing)
+                            if existing.workspace_incarnation == record.workspace_incarnation
+                                && existing.job_id == record.job_id
+                                && !matches!(existing.state, JobState::Queued | JobState::Running)
+                    )
+                })
+        };
+        if duplicate_terminal {
             return Err(integrity(
                 0,
                 "duplicate terminal artifact record for job id",
@@ -857,7 +913,8 @@ impl ArtifactStore {
         let batch = job_record_to_batch(&record)?;
         let payload = encode_batch(&batch)?;
         let digest = Sha256Digest::compute(&payload);
-        append_framed_batch_under_lock(&lock, &payload, digest, None)?;
+        append_framed_batch_under_lock(&lock, &payload, digest, JOB_RECORD_DURABILITY, None)?;
+        self.records_seen = RecordsIdentity::of(&path)?;
         if !matches!(record.state, JobState::Queued | JobState::Running) {
             self.committed_jobs.insert(record.job_id, record.clone());
         }
@@ -911,7 +968,13 @@ impl ArtifactStore {
         let batch = checkpoint_manifest_to_batch(&record)?;
         let payload = encode_batch(&batch)?;
         let manifest_batch_sha256 = Sha256Digest::compute(&payload);
-        append_framed_batch_under_lock(&lock, &payload, manifest_batch_sha256, None)?;
+        append_framed_batch_under_lock(
+            &lock,
+            &payload,
+            manifest_batch_sha256,
+            Durability::PowerLoss,
+            None,
+        )?;
         Ok(SealedCheckpointManifest {
             record,
             manifest_batch_sha256,
@@ -1577,8 +1640,8 @@ impl StreamWriterState {
         let target = std::mem::replace(&mut self.target, StreamTarget::Captured);
         if let StreamTarget::Redirect { source, descriptor } = &target {
             let source_absolute = workspace_root.join(source.as_path());
-            descriptor
-                .sync_all()
+            JOB_RECORD_DURABILITY
+                .sync_file(descriptor)
                 .map_err(|error| io_error(&source_absolute, error))?;
         }
         let artifact = if let Some(buffer) = self.buffer.take() {
@@ -1687,10 +1750,13 @@ fn set_sealed_permissions(file: &File, path: &Path) -> Result<(), ArtifactError>
     Ok(())
 }
 
+/// Seal one job's spilled stream: read-only, and as durable as the job's records.
 fn seal_file(mut file: File, path: &Path) -> Result<(), ArtifactError> {
     file.flush().map_err(|error| io_error(path, error))?;
     set_sealed_permissions(&file, path)?;
-    file.sync_all().map_err(|error| io_error(path, error))?;
+    JOB_RECORD_DURABILITY
+        .sync_file(&file)
+        .map_err(|error| io_error(path, error))?;
     verify_private_file_mode(
         path,
         &file.metadata().map_err(|error| io_error(path, error))?,
@@ -2233,17 +2299,20 @@ fn read_record_sequence_counter(lock: &RecordsLock<'_>) -> Result<Option<u64>, A
 fn publish_record_sequence_counter(
     lock: &RecordsLock<'_>,
     current: u64,
+    durability: Durability,
 ) -> Result<(), ArtifactError> {
     let path = record_sequence_path(lock)?;
     let mut bytes = [0_u8; RECORD_SEQUENCE_BYTES];
     bytes[..8].copy_from_slice(RECORD_SEQUENCE_MAGIC);
     bytes[8..16].copy_from_slice(&current.to_le_bytes());
     bytes[16..24].copy_from_slice(&(!current).to_le_bytes());
-    crate::fsio::publish_private_file::<io::Error>(&path, |writer| writer.write_all(&bytes))
-        .map_err(|error| match error {
-            crate::fsio::PublishError::Io { path, source } => io_error(&path, source),
-            crate::fsio::PublishError::Write(source) => io_error(&path, source),
-        })
+    crate::fsio::publish_private_file_with::<io::Error>(&path, durability, |writer| {
+        writer.write_all(&bytes)
+    })
+    .map_err(|error| match error {
+        crate::fsio::PublishError::Io { path, source } => io_error(&path, source),
+        crate::fsio::PublishError::Write(source) => io_error(&path, source),
+    })
 }
 
 fn ensure_record_sequence_counter(
@@ -2263,7 +2332,9 @@ fn ensure_record_sequence_counter(
         // and the next allocation is `observed + 1`, so no sequence can be
         // handed out twice. Refusing instead would strand a store whose records
         // are all intact.
-        Some(durable) if durable < observed => publish_record_sequence_counter(lock, observed),
+        Some(durable) if durable < observed => {
+            publish_record_sequence_counter(lock, observed, Durability::PowerLoss)
+        }
         Some(_) => Ok(()),
         None if recovery.truncated_bytes != 0 => Err(integrity(
             0,
@@ -2273,7 +2344,7 @@ fn ensure_record_sequence_counter(
             // A pre-counter store is migrated once while holding the append lock. Appends never
             // derive from recovered frames again; after this publication, tail loss can only leave
             // the counter ahead of the log, which preserves monotonic allocation.
-            publish_record_sequence_counter(lock, observed)
+            publish_record_sequence_counter(lock, observed, Durability::PowerLoss)
         }
     }
 }
@@ -2289,8 +2360,11 @@ fn allocate_record_sequence(lock: &RecordsLock<'_>) -> Result<u64, ArtifactError
         "record sequence allocation exhausted",
     ))?;
     // Publish before appending: a crash may leave a gap, but can never hand the allocation out
-    // twice. Both writes remain under the same cross-process lock.
-    publish_record_sequence_counter(lock, next)?;
+    // twice. Both writes remain under the same cross-process lock. The counter is not synced of
+    // its own: the record's one sync follows it, the rename cannot tear, and a counter that power
+    // loss rolled back behind the log is advanced to the log's highest sequence at the next open
+    // (`ensure_record_sequence_counter`), before anything allocates.
+    publish_record_sequence_counter(lock, next, Durability::Process)?;
     Ok(next)
 }
 
@@ -2646,13 +2720,20 @@ fn append_framed_batch_impl(
     fail_after_bytes: Option<usize>,
 ) -> Result<(), ArtifactError> {
     let lock = RecordsLock::acquire(path)?;
-    append_framed_batch_under_lock(&lock, payload, digest, fail_after_bytes)
+    append_framed_batch_under_lock(
+        &lock,
+        payload,
+        digest,
+        JOB_RECORD_DURABILITY,
+        fail_after_bytes,
+    )
 }
 
 fn append_framed_batch_under_lock(
     lock: &RecordsLock<'_>,
     payload: &[u8],
     digest: Sha256Digest,
+    durability: Durability,
     mut fail_after_bytes: Option<usize>,
 ) -> Result<(), ArtifactError> {
     let path = lock.records;
@@ -2712,10 +2793,16 @@ fn append_framed_batch_under_lock(
         write_append_bytes(&mut file, digest.as_bytes(), &mut fail_after_bytes)?;
         write_append_bytes(&mut file, BATCH_TRAILER, &mut fail_after_bytes)?;
         file.flush()?;
-        file.sync_data()
+        durability.sync_file(&file)
     })();
     if let Err(error) = write_result {
-        return Err(rollback_append(&mut file, path, original_len, error));
+        return Err(rollback_append(
+            &mut file,
+            path,
+            original_len,
+            durability,
+            error,
+        ));
     }
     Ok(())
 }
@@ -2740,12 +2827,13 @@ fn rollback_append(
     file: &mut File,
     path: &Path,
     original_len: u64,
+    durability: Durability,
     primary: io::Error,
 ) -> ArtifactError {
     let rollback = file
         .set_len(original_len)
         .and_then(|_| file.seek(SeekFrom::Start(original_len)).map(|_| ()))
-        .and_then(|_| file.sync_data());
+        .and_then(|_| durability.sync_file(file));
     match rollback {
         Ok(()) => io_error(path, primary),
         Err(rollback) => ArtifactError::WriteIntegrity(format!(
@@ -2816,7 +2904,9 @@ fn recover_records_with_budget_under_lock(
             .map_err(|error| io_error(path, error))?;
         if RECORD_MAGIC.starts_with(&partial[..length]) {
             file.set_len(0).map_err(|error| io_error(path, error))?;
-            file.sync_data().map_err(|error| io_error(path, error))?;
+            JOB_RECORD_DURABILITY
+                .sync_file(&file)
+                .map_err(|error| io_error(path, error))?;
             return Ok(RecoveryReport {
                 frames: Vec::new(),
                 truncated_bytes: original_len,
@@ -2847,41 +2937,22 @@ fn recover_records_with_budget_under_lock(
                 "remaining records length does not fit platform",
             )
         })?;
-        if remaining < FRAME_HEADER_BYTES {
-            let mut partial = vec![0_u8; remaining];
-            file.read_exact(&mut partial)
-                .map_err(|error| io_error(path, error))?;
-            if is_valid_incomplete_frame_header(&partial) {
+        let present = remaining.min(FRAME_HEADER_BYTES);
+        let mut header = [0_u8; FRAME_HEADER_BYTES];
+        file.read_exact(&mut header[..present])
+            .map_err(|error| io_error(path, error))?;
+        let (payload_len, frame_len) = match frame_extent(&header[..present], remaining)
+            .map_err(|message| integrity(frame_start, message))?
+        {
+            FrameExtent::Incomplete => {
                 truncate_incomplete(&mut file, path, frame_start)?;
                 break;
             }
-            return Err(integrity(frame_start, "invalid complete batch header"));
-        }
-
-        let mut header = [0_u8; FRAME_HEADER_BYTES];
-        file.read_exact(&mut header)
-            .map_err(|error| io_error(path, error))?;
-        if &header[..8] != BATCH_MAGIC {
-            return Err(integrity(frame_start, "invalid complete batch magic"));
-        }
-        let length = u64::from_le_bytes(header[8..16].try_into().expect("eight bytes"));
-        let complement = u64::from_le_bytes(header[16..24].try_into().expect("eight bytes"));
-        if complement != !length || length > MAX_RECORD_BATCH_BYTES {
-            return Err(integrity(frame_start, "invalid complete batch length"));
-        }
-        let payload_len = usize::try_from(length).map_err(|_| {
-            integrity(
-                frame_start,
-                "record batch length does not fit this platform",
-            )
-        })?;
-        let frame_len = FRAME_OVERHEAD_BYTES
-            .checked_add(payload_len)
-            .ok_or_else(|| integrity(frame_start, "record batch length overflow"))?;
-        if remaining < frame_len {
-            truncate_incomplete(&mut file, path, frame_start)?;
-            break;
-        }
+            FrameExtent::Complete {
+                payload_len,
+                frame_len,
+            } => (payload_len, frame_len),
+        };
         let required =
             retained
                 .checked_add(frame_len)
@@ -2988,6 +3059,50 @@ fn recover_records_with_budget_under_lock(
     })
 }
 
+/// How much of a frame the bytes left at a frame's start hold.
+#[derive(Debug, Eq, PartialEq)]
+enum FrameExtent {
+    /// A frame a crash cut short: recovery cuts the log back to its start.
+    Incomplete,
+    Complete {
+        payload_len: usize,
+        frame_len: usize,
+    },
+}
+
+/// The extent of the frame starting where `remaining` bytes of the log are left, from its first
+/// `min(remaining, FRAME_HEADER_BYTES)` bytes `header`; an error names what makes it no frame.
+/// This is the whole of recovery's decision to cut a torn tail.
+fn frame_extent(header: &[u8], remaining: usize) -> Result<FrameExtent, &'static str> {
+    if remaining < FRAME_HEADER_BYTES {
+        return if is_valid_incomplete_frame_header(header) {
+            Ok(FrameExtent::Incomplete)
+        } else {
+            Err("invalid complete batch header")
+        };
+    }
+    if &header[..8] != BATCH_MAGIC {
+        return Err("invalid complete batch magic");
+    }
+    let length = u64::from_le_bytes(header[8..16].try_into().expect("eight bytes"));
+    let complement = u64::from_le_bytes(header[16..24].try_into().expect("eight bytes"));
+    if complement != !length || length > MAX_RECORD_BATCH_BYTES {
+        return Err("invalid complete batch length");
+    }
+    let payload_len =
+        usize::try_from(length).map_err(|_| "record batch length does not fit this platform")?;
+    let frame_len = FRAME_OVERHEAD_BYTES
+        .checked_add(payload_len)
+        .ok_or("record batch length overflow")?;
+    if remaining < frame_len {
+        return Ok(FrameExtent::Incomplete);
+    }
+    Ok(FrameExtent::Complete {
+        payload_len,
+        frame_len,
+    })
+}
+
 fn is_valid_incomplete_frame_header(bytes: &[u8]) -> bool {
     if bytes.len() < BATCH_MAGIC.len() {
         return BATCH_MAGIC.starts_with(bytes);
@@ -3016,12 +3131,17 @@ fn integrity(offset: usize, message: &str) -> ArtifactError {
     }
 }
 
+/// Cut the incomplete tail a crash left. Only a partial frame is ever cut, never a complete one,
+/// so the cut needs no more than the job records' own durability: power loss that undoes it
+/// brings back the same partial frame, which the next recovery cuts again.
 fn truncate_incomplete(file: &mut File, path: &Path, offset: usize) -> Result<(), ArtifactError> {
     file.set_len(offset as u64)
         .map_err(|error| io_error(path, error))?;
     file.seek(SeekFrom::Start(offset as u64))
         .map_err(|error| io_error(path, error))?;
-    file.sync_data().map_err(|error| io_error(path, error))?;
+    JOB_RECORD_DURABILITY
+        .sync_file(file)
+        .map_err(|error| io_error(path, error))?;
     Ok(())
 }
 
@@ -4625,6 +4745,41 @@ mod tests {
         .unwrap();
     }
 
+    /// A crash can stop a record's frame after any byte. Every such prefix — the header's own
+    /// bytes, the payload, the digest and the trailer — is an incomplete frame recovery cuts, and
+    /// only the whole frame is one it reads; bytes after it change nothing.
+    #[test]
+    fn a_frame_stopped_after_any_byte_is_incomplete_and_only_the_whole_frame_complete() {
+        let root = temp_root("frame-extent");
+        drop(store_at(&root, ArtifactConfig::default()));
+        let before = fs::metadata(records_path(&root)).map_or(0, |metadata| metadata.len());
+        append_protected_record(&root, ProtectedRecord::Job(valid_job_record(1)));
+        let log = fs::read(records_path(&root)).unwrap();
+        let start = usize::try_from(before).unwrap().max(RECORD_MAGIC.len());
+        let frame = &log[start..];
+        let header = &frame[..FRAME_HEADER_BYTES];
+        for present in 0..frame.len() {
+            assert_eq!(
+                frame_extent(&frame[..present.min(FRAME_HEADER_BYTES)], present),
+                Ok(FrameExtent::Incomplete),
+                "stopped after {present} of {} bytes",
+                frame.len()
+            );
+        }
+        let complete = FrameExtent::Complete {
+            payload_len: frame.len() - FRAME_OVERHEAD_BYTES,
+            frame_len: frame.len(),
+        };
+        assert_eq!(frame_extent(header, frame.len()), Ok(complete));
+        assert_eq!(
+            frame_extent(header, frame.len() + 1),
+            Ok(FrameExtent::Complete {
+                payload_len: frame.len() - FRAME_OVERHEAD_BYTES,
+                frame_len: frame.len(),
+            })
+        );
+        fs::remove_dir_all(&root).unwrap();
+    }
     #[test]
     fn record_and_manifest_validation_reject_every_invalid_boundary() {
         let valid = valid_job_record(1);

@@ -292,6 +292,64 @@ fn sealed_segment_is_private_and_its_directories_are_synced() {
     );
 }
 
+/// Counts directory syncs for one sink alone, so it runs beside every other test.
+struct CountingEnvironment {
+    date: CommitmentDate,
+    directory_syncs: Arc<AtomicUsize>,
+}
+
+impl AuditSinkEnvironment for CountingEnvironment {
+    fn utc_date(&self) -> io::Result<CommitmentDate> {
+        Ok(self.date)
+    }
+
+    fn sync_directory(&self, directory: &File) -> io::Result<()> {
+        directory.sync_all()?;
+        self.directory_syncs.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+/// A job's admission and terminal commitments are written for every exec: each takes one
+/// `fsync(2)` of its own segment and no directory sync, while a lifecycle commitment still syncs
+/// the directory its sealed name was added to.
+#[test]
+fn a_jobs_commitments_sync_no_directory_while_lifecycle_commitments_do() {
+    let root = TempRoot::new("job-durability");
+    let directory_syncs = Arc::new(AtomicUsize::new(0));
+    let mut sink = ArrowAuditSink::open_with_environment(
+        root.path(),
+        Box::new(CountingEnvironment {
+            date: date(2026, 10, 12),
+            directory_syncs: Arc::clone(&directory_syncs),
+        }),
+    )
+    .unwrap();
+    sink.record(introduced()).unwrap();
+    assert_eq!(directory_syncs.swap(0, Ordering::SeqCst), 2);
+
+    sink.record(admission(1)).unwrap();
+    sink.record(CommitmentDraft::Terminal {
+        repo_id: repo(),
+        workspace_incarnation: incarnation(),
+        job_id: JobId::new(1).unwrap(),
+        state: cowshed_core::api::JobState::Exited,
+        grant_revision: 3,
+        stdout_bytes: 0,
+        stdout_sha256: cowshed_core::api::Sha256Digest::compute(b""),
+        stderr_bytes: 0,
+        stderr_sha256: cowshed_core::api::Sha256Digest::compute(b""),
+        batch_sha256: cowshed_core::api::Sha256Digest::compute(b"batch"),
+        output_limit: None,
+    })
+    .unwrap();
+    assert_eq!(directory_syncs.load(Ordering::SeqCst), 0);
+    assert_eq!(sealed_segments(root.path()).len(), 3);
+
+    sink.record(introduced()).unwrap();
+    assert_eq!(directory_syncs.load(Ordering::SeqCst), 1);
+}
+
 #[test]
 fn off_sink_writes_nothing_and_the_publisher_still_acknowledges() {
     let root = TempRoot::new("off");

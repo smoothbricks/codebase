@@ -11,8 +11,10 @@
 //!
 //! Three sinks: [`ArrowAuditSink`] writes one sealed Arrow IPC segment per record under the
 //! telemetry root — private file, fsync, `rename(2)` without replace, directory sync — the
-//! standalone CLI's default; [`NullAuditSink`] discards; and any external implementation of the
-//! trait a host injects (an embedding runtime routes the records into its own durable log). Segment names
+//! standalone CLI's default (a job's admission and terminal records take one `fsync(2)` and no
+//! `F_FULLFSYNC`, see [`commitment_durability`]); [`NullAuditSink`] discards; and any external
+//! implementation of the trait a host injects (an embedding runtime routes the records into its
+//! own durable log). Segment names
 //! are `commitment-<order>-<writer>.arrow` with a writer-local, monotone `order` and a fresh
 //! writer id per process, so concurrent controllers never contend and no lock is needed.
 
@@ -36,7 +38,24 @@ use crate::metadata::WorkspaceIncarnation;
 use crate::repository::RepoId;
 use crate::storage::job_artifact::write_controller_commitment;
 
-use crate::fsio::rename_noreplace;
+use crate::fsio::{Durability, rename_noreplace};
+
+/// How durable one commitment is before it is acknowledged. A job's admission and terminal
+/// commitments are written for every exec and stay the job's own: they survive the writer's death
+/// (`fsync(2)`), and power loss — which ends every job — may take them, leaving a lost job for the
+/// supervisor to seal. Every other commitment records lifecycle and survives power loss.
+fn commitment_durability(commitment: &ControllerCommitment) -> Durability {
+    match commitment {
+        ControllerCommitment::Admission(_) | ControllerCommitment::Terminal(_) => {
+            Durability::Device
+        }
+        ControllerCommitment::WorkspaceIntroduced(_)
+        | ControllerCommitment::WorkspaceRetired(_)
+        | ControllerCommitment::Checkpoint(_)
+        | ControllerCommitment::Fork(_)
+        | ControllerCommitment::Restore(_) => Durability::PowerLoss,
+    }
+}
 
 const SEGMENT_PREFIX: &str = "commitment-";
 
@@ -339,8 +358,9 @@ pub enum AuditSinkError {
 /// One sealed Arrow segment per record under `<telemetry root>/<UTC date>/`.
 ///
 /// Writes are the only operation: a temporary file created `O_EXCL` with mode 0600, written,
-/// fsynced, renamed without replace to its sealed name, and the date directory synced. A segment
-/// that exists is complete; a crash leaves at most a temporary the next writer never reads.
+/// synced to the commitment's durability, renamed without replace to its sealed name, and — for
+/// a commitment that must survive power loss — the date directory synced. A segment that exists
+/// is complete; a crash leaves at most a temporary the next writer never reads.
 pub struct ArrowAuditSink {
     root: File,
     writer_id: Uuid,
@@ -405,7 +425,9 @@ impl ArrowAuditSink {
             .map_err(|error| integrity(error.to_string()))?;
         file.flush()
             .map_err(|source| io_failure("flushing audit segment", source))?;
-        file.sync_all()
+        let durability = commitment_durability(commitment);
+        durability
+            .sync_file(&file)
             .map_err(|source| io_failure("syncing audit segment", source))?;
         drop(file);
 
@@ -419,9 +441,11 @@ impl ArrowAuditSink {
         )
         .map_err(|source| io_failure("publishing audit segment", source))?;
         cleanup.disarm();
-        self.environment
-            .sync_directory(&date_directory)
-            .map_err(|source| io_failure("syncing audit directory", source))?;
+        if durability == Durability::PowerLoss {
+            self.environment
+                .sync_directory(&date_directory)
+                .map_err(|source| io_failure("syncing audit directory", source))?;
+        }
         self.environment
             .publication_point(CommitmentPublicationPoint::AfterRenameAndDirectorySync)
             .map_err(|source| io_failure("after audit segment rename", source))?;

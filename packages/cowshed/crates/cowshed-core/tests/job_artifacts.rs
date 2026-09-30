@@ -1465,15 +1465,9 @@ fn jobs_a_lost_supervisor_ran_are_sealed_failed_once_with_what_they_spilled() {
     drop(lost);
 
     let mut next = store(root.path(), config.clone());
-    let named = [
-        finished_id,
-        orphan.job_id(),
-        cowshed_core::api::JobId::new(99).unwrap(),
-    ]
-    .into_iter()
-    .collect();
-    let sealed = next.seal_lost(&named).unwrap();
+    let sealed = next.seal_unterminated().unwrap();
     assert_eq!(sealed.len(), 1, "only the admitted, unsealed job is lost");
+    assert_ne!(sealed[0].0.job_id, finished_id);
     let (record, _) = &sealed[0];
     assert_eq!(record.job_id, orphan.job_id());
     assert_eq!(record.state, JobState::Failed);
@@ -1491,7 +1485,7 @@ fn jobs_a_lost_supervisor_ran_are_sealed_failed_once_with_what_they_spilled() {
     drop(next);
 
     let mut after = store(root.path(), config);
-    assert!(after.seal_lost(&named).unwrap().is_empty(), "sealed once");
+    assert!(after.seal_unterminated().unwrap().is_empty(), "sealed once");
     let recovered = recover_records(&root.path().join(".cowshed/job/records.arrow")).unwrap();
     assert!(recovered.frames.iter().any(|frame| matches!(
         &frame.record,
@@ -1500,4 +1494,105 @@ fn jobs_a_lost_supervisor_ran_are_sealed_failed_once_with_what_they_spilled() {
                 && job.failure == Some(cowshed_core::api::JobFailure::SupervisorLost)
     )));
     assert_eq!(after.next_job_id().unwrap().get(), 3);
+}
+
+/// A job's terminal record is synced with `fsync(2)`, not past power loss, so power loss can
+/// take any suffix of it. That the cut is the same after every byte of a frame is the frame
+/// parser's own unit test (`a_frame_stopped_after_any_byte_is_incomplete...`); here the whole
+/// path runs once in each part of the terminal record's frame — gone entirely, inside its
+/// header, at the payload's edges, inside the digest and the trailer, one byte short: recovery
+/// keeps exactly the admission and the next supervisor seals the job lost. Only the complete
+/// record reports how it ended; nothing is reported as succeeded that did not durably say so.
+#[test]
+fn a_terminal_record_torn_anywhere_leaves_its_job_sealed_lost_never_succeeded() {
+    let root = TempRoot::new("torn-terminal");
+    let records = root.path().join(".cowshed/job/records.arrow");
+    let mut ran = store(root.path(), ArtifactConfig::default());
+    let token = begin(&mut ran, 3, OutputTargets::default());
+    let job = token.job_id();
+    ran.append(&token, StreamKind::Stdout, b"built").unwrap();
+    let admitted = usize::try_from(fs::metadata(&records).unwrap().len()).unwrap();
+    ran.finish(token, JobState::Exited).unwrap();
+    drop(ran);
+    let written = fs::read(&records).unwrap();
+    let ended = written.len();
+    assert!(admitted < ended);
+    let (header, digest, trailer) = (24, 32, 8);
+    let payload_end = ended - trailer - digest;
+    let tears = [
+        admitted,
+        admitted + 1,
+        admitted + header - 1,
+        admitted + header,
+        admitted + header + 1,
+        payload_end - 1,
+        payload_end,
+        payload_end + digest - 1,
+        ended - trailer,
+        ended - 1,
+    ];
+
+    let torn_at = |kept: usize| {
+        fs::write(&records, &written[..kept]).unwrap();
+        recover_records(&records).unwrap()
+    };
+    let admission = torn_at(admitted).frames;
+    for kept in tears {
+        let recovered = torn_at(kept);
+        assert_eq!(
+            recovered.frames, admission,
+            "torn after {kept} of {ended} bytes"
+        );
+        assert_eq!(
+            recovered.truncated_bytes,
+            u64::try_from(kept - admitted).unwrap(),
+            "torn after {kept} of {ended} bytes"
+        );
+    }
+
+    let final_state = || {
+        recover_records(&records)
+            .unwrap()
+            .frames
+            .iter()
+            .rev()
+            .find_map(|frame| match &frame.record {
+                ProtectedRecord::Job(record) if record.job_id == job => {
+                    Some((record.state, record.failure))
+                }
+                _ => None,
+            })
+    };
+    // Each tear leaves the next supervisor exactly the admission, so it seals the job lost.
+    for kept in tears {
+        fs::write(&records, &written[..kept]).unwrap();
+        let mut next = store(root.path(), ArtifactConfig::default());
+        let sealed = next.seal_unterminated().unwrap();
+        drop(next);
+        assert_eq!(
+            sealed
+                .iter()
+                .map(|(record, _)| record.job_id)
+                .collect::<Vec<_>>(),
+            [job],
+            "torn after {kept} of {ended} bytes"
+        );
+        assert_eq!(
+            final_state(),
+            Some((
+                JobState::Failed,
+                Some(cowshed_core::api::JobFailure::SupervisorLost)
+            )),
+            "torn after {kept} of {ended} bytes"
+        );
+    }
+
+    fs::write(&records, &written).unwrap();
+    let mut next = store(root.path(), ArtifactConfig::default());
+    assert!(
+        next.seal_unterminated().unwrap().is_empty(),
+        "a job whose end is on disk is not lost"
+    );
+    drop(next);
+    assert_eq!(final_state(), Some((JobState::Exited, None)));
 }

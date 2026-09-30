@@ -4649,9 +4649,11 @@ impl NativeProjectRuntimeHost {
         forwarders.insert(socket, task);
     }
 
-    /// Before a supervisor starts on the socket it now holds: end what its lost predecessor's
-    /// ledger still names and seal those jobs `failed` with `supervisorLost`, recording their
-    /// terminal commitments. Jobs no ledger names are never touched.
+    /// Before a supervisor starts on the socket it now holds: end the process groups its lost
+    /// predecessor's ledger still names, then seal `failed` with `supervisorLost` every job this
+    /// incarnation admitted and never sealed, recording their terminal commitments. Holding the
+    /// socket means no other supervisor serves the workspace; a job the ledger does not name lost
+    /// its ledger entry, or its terminal record, to the power loss that ended it.
     async fn seal_lost_jobs(
         &mut self,
         socket: &Path,
@@ -4660,27 +4662,12 @@ impl NativeProjectRuntimeHost {
         use super::supervisor::{CommitmentDraft, CommitmentSink as _};
 
         let ledger = super::job_groups::ledger_path(socket);
-        let lost = tokio::task::spawn_blocking(move || {
-            super::job_groups::take_lost(&ledger, LOST_JOB_GRACE)
-        })
-        .await
-        .map_err(|error| CowshedError::internal(format!("ending lost jobs failed: {error}")))?
-        .map_err(|error| {
-            CowshedError::environment_missing(
-                format!("cannot end the jobs a lost supervisor left running: {error}"),
-                "cowshed doctor --json",
-            )
-        })?;
-        if lost.is_empty() {
-            return Ok(());
-        }
-        let lost = lost
-            .into_iter()
-            .map(JobId::new)
-            .collect::<std::result::Result<std::collections::BTreeSet<_>, _>>()
+        tokio::task::spawn_blocking(move || super::job_groups::take_lost(&ledger, LOST_JOB_GRACE))
+            .await
+            .map_err(|error| CowshedError::internal(format!("ending lost jobs failed: {error}")))?
             .map_err(|error| {
-                CowshedError::integrity(
-                    format!("a job group ledger names an invalid job: {error}"),
+                CowshedError::environment_missing(
+                    format!("cannot end the jobs a lost supervisor left running: {error}"),
                     "cowshed doctor --json",
                 )
             })?;
@@ -4692,7 +4679,7 @@ impl NativeProjectRuntimeHost {
         );
         let sealed = tokio::task::spawn_blocking(move || {
             crate::storage::job_artifact::ArtifactStore::open(root, owned, incarnation, artifacts)?
-                .seal_lost(&lost)
+                .seal_unterminated()
         })
         .await
         .map_err(|error| CowshedError::internal(format!("sealing lost jobs failed: {error}")))?
@@ -4702,6 +4689,9 @@ impl NativeProjectRuntimeHost {
                 "cowshed doctor --json",
             )
         })?;
+        if sealed.is_empty() {
+            return Ok(());
+        }
         eprintln!(
             "cowshed: sealed jobs {:?} of workspace {} as lost with the supervisor that ran them",
             sealed

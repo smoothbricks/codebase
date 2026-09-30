@@ -366,6 +366,51 @@ pub(crate) enum PublishError<E> {
     Write(E),
 }
 
+/// How much of a crash a write must survive before what it records is acknowledged.
+///
+/// The level is a property of the state, not of the writer: lifecycle and authority state
+/// (workspace creation and removal, landing, grants, policy revisions) survives power loss, while
+/// a per-job record survives the death of the process that wrote it. Power loss ends every job
+/// anyway, and recovery treats a job whose record went missing or torn with it as a lost job
+/// (11_shell.md "Job control").
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Durability {
+    /// No sync: the kernel holds the bytes, so they survive the writer's death. For state that a
+    /// later open re-derives from whatever did survive.
+    Process,
+    /// `fsync(2)` on the file: the bytes reach the device, which on macOS may still lose them to
+    /// power loss. A new directory entry is not synced: losing it is losing the record.
+    Device,
+    /// `F_FULLFSYNC` on macOS (Rust's `sync_all`) on the file and on the directory holding a new
+    /// entry: survives power loss.
+    PowerLoss,
+}
+
+impl Durability {
+    pub(crate) fn sync_file(self, file: &File) -> io::Result<()> {
+        match self {
+            Self::Process => Ok(()),
+            Self::Device => {
+                // SAFETY: fsync on a descriptor the borrowed `File` keeps open.
+                if unsafe { libc::fsync(file.as_raw_fd()) } == 0 {
+                    Ok(())
+                } else {
+                    Err(io::Error::last_os_error())
+                }
+            }
+            Self::PowerLoss => file.sync_all(),
+        }
+    }
+
+    /// Make a directory entry this write created as durable as the write itself.
+    pub(crate) fn sync_new_entry(self, directory: &Path) -> io::Result<()> {
+        match self {
+            Self::Process | Self::Device => Ok(()),
+            Self::PowerLoss => sync_directory(directory),
+        }
+    }
+}
+
 /// Atomically publish a private regular file at `path`: write into a uniquely named temp sibling,
 /// fsync it, rename it over `path`, fsync the parent. A failure at any step removes the temp.
 ///
@@ -375,6 +420,17 @@ pub(crate) enum PublishError<E> {
 /// afterwards is what guarantees the private mode.
 pub(crate) fn publish_private_file<E>(
     path: &Path,
+    write: impl FnOnce(&mut BufWriter<File>) -> Result<(), E>,
+) -> Result<(), PublishError<E>> {
+    publish_private_file_with(path, Durability::PowerLoss, write)
+}
+
+/// [`publish_private_file`] at `durability`: the rename is atomic at every level, so a reader
+/// sees the old file or the new one, never a torn one; the level decides only which crash the
+/// new one survives.
+pub(crate) fn publish_private_file_with<E>(
+    path: &Path,
+    durability: Durability,
     write: impl FnOnce(&mut BufWriter<File>) -> Result<(), E>,
 ) -> Result<(), PublishError<E>> {
     let io_at = |at: &Path, source: io::Error| PublishError::Io {
@@ -414,15 +470,16 @@ pub(crate) fn publish_private_file<E>(
                 fs::Permissions::from_mode(0o600)
             })
             .map_err(|source| io_at(&temp_path, source))?;
-        writer
-            .get_ref()
-            .sync_all()
+        durability
+            .sync_file(writer.get_ref())
             .map_err(|source| io_at(&temp_path, source))?;
     }
 
     fs::rename(&temp_path, path).map_err(|source| io_at(path, source))?;
     cleanup.armed = false;
-    sync_directory(parent).map_err(|source| io_at(parent, source))?;
+    durability
+        .sync_new_entry(parent)
+        .map_err(|source| io_at(parent, source))?;
     Ok(())
 }
 

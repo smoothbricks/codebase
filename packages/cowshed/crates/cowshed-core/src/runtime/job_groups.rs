@@ -77,8 +77,8 @@ pub enum Writer {
 }
 
 /// End every group the ledger at `path` names — TERM, `grace`, then KILL — when `writer` wrote
-/// it, and mark it ended; the jobs it names stay in it until the next supervisor of the
-/// workspace seals them ([`take_lost`]). Returns the job ids whose groups were signalled.
+/// it, and mark it ended; the ledger stays until the next supervisor of the workspace takes it
+/// ([`take_lost`]). Returns the job ids whose groups were signalled.
 pub fn end_recorded(path: &Path, writer: Writer, grace: Duration) -> io::Result<Vec<u64>> {
     let Some(mut ledger) = read(path)? else {
         return Ok(Vec::new());
@@ -98,17 +98,16 @@ pub fn end_recorded(path: &Path, writer: Writer, grace: Duration) -> io::Result<
 }
 
 /// For the supervisor now holding the workspace's socket: end whatever its lost predecessor's
-/// ledger still names, remove the ledger, and return every job it names — the jobs to seal as
-/// lost. Jobs no ledger names (another cowshed build's) are never touched.
-pub fn take_lost(path: &Path, grace: Duration) -> io::Result<Vec<u64>> {
+/// ledger still names and remove the ledger. Which jobs to seal as lost is the job records' to
+/// say, not the ledger's: power loss can take the ledger with the processes it names.
+pub fn take_lost(path: &Path, grace: Duration) -> io::Result<()> {
     let Some(ledger) = read(path)? else {
-        return Ok(Vec::new());
+        return Ok(());
     };
     if !ledger.ended {
         end_groups(&ledger.groups, grace);
     }
-    std::fs::remove_file(path)?;
-    Ok(ledger.groups.iter().map(|group| group.job_id).collect())
+    std::fs::remove_file(path)
 }
 
 fn read(path: &Path) -> io::Result<Option<Ledger>> {
@@ -238,11 +237,7 @@ mod tests {
                 .is_empty(),
             "an ended ledger ends nothing twice"
         );
-        assert_eq!(
-            take_lost(&ledger, Duration::ZERO).unwrap(),
-            vec![7],
-            "the next supervisor still learns which jobs to seal"
-        );
+        take_lost(&ledger, Duration::ZERO).unwrap();
         assert!(!ledger.exists());
     }
 

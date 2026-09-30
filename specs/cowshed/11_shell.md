@@ -216,19 +216,34 @@ inheritable and no protected inode may be hardlinked into a workspace-writable p
 closes, and seals file artifacts, or writes bounded inline bytes into the terminal Job Arrow batch, before publishing
 `ControllerCommitment::Terminal(TerminalCommitment)`.
 
-Allocation is exclusive and crash-safe without a counter file or eager job directory. One supervisor is the sole
-allocator for an attached workspace. Admission appends a complete `ProtectedRecord::Job(JobArtifactRecord)` batch and
-publishes `ControllerCommitment::Admission(AdmissionCommitment)` before process creation, so spawn failure retains
-durable identity. At startup the supervisor reconciles the maximum canonical `job_id` across valid complete in-volume
-allocation batches, controller commitments for the active lineage, and canonical spill directories, then chooses
-`max + 1` (or `1` when none exist). Any disagreement or duplicate durable key is `Integrity`, not a reason to reuse a
-number. Open/recovery requires every record's `repo_id` to equal the workspace's bound repository. A record incarnation
-may differ from the current marker only when controller fork/restore/checkpoint lineage and commitments admit it as
-inherited history; an unknown historical incarnation, or any new allocation under a non-current incarnation, is
-`Integrity`. Thus copied histories are intentional but cannot smuggle a foreign repository/timeline. Supervisor
-replacement and attach otherwise discard only an incomplete trailing Arrow batch and never rewrite a complete batch or
-sealed artifact. Fork/checkpoint/restore copies start above every inherited allocation; no separate high-water file
-exists.
+Allocation is exclusive and crash-safe without an eager job directory. One supervisor is the sole allocator for an
+attached workspace. Admission appends a complete `ProtectedRecord::Job(JobArtifactRecord)` batch and publishes
+`ControllerCommitment::Admission(AdmissionCommitment)` before process creation, so spawn failure retains durable
+identity. A record's sequence comes from the `records.sequence` counter, published by atomic rename before the record is
+appended under the same lock, so a crash may leave a gap but never hands a sequence out twice. At startup the supervisor
+reconciles the maximum canonical `job_id` across valid complete in-volume allocation batches, controller commitments for
+the active lineage, and canonical spill directories, then chooses `max + 1` (or `1` when none exist). Any disagreement
+or duplicate durable key is `Integrity`, not a reason to reuse a number. Open/recovery requires every record's `repo_id`
+to equal the workspace's bound repository. A record incarnation may differ from the current marker only when controller
+fork/restore/checkpoint lineage and commitments admit it as inherited history; an unknown historical incarnation, or any
+new allocation under a non-current incarnation, is `Integrity`. Thus copied histories are intentional but cannot smuggle
+a foreign repository/timeline. Supervisor replacement and attach otherwise discard only an incomplete trailing Arrow
+batch and never rewrite a complete batch or sealed artifact. Fork/checkpoint/restore copies start above every inherited
+allocation; no separate high-water file exists.
+
+**Durability of a job's own records.** A job's records — its admission and terminal batches, its sealed spill files, and
+its admission and terminal commitments — are written for every exec and survive the death of the process that wrote
+them, not power loss: each takes exactly one `fsync(2)` of the file it appends or creates, and no directory sync, before
+the job is admitted or answered as ended; the sequence counter's rename is not synced at all. `F_FULLFSYNC` is what
+survives power loss on macOS, and on a disk image it flushes every dirty block of the whole image — tens of milliseconds
+to seconds right after a build — so it stays on lifecycle and authority state only: workspace creation and removal,
+landing, checkpoint manifests, grants and policy revisions, and every lifecycle commitment. Power loss ends every job
+anyway, and may take any suffix of the records written since: a torn trailing batch is discarded as above; a counter
+rolled back behind the log is advanced to the log's highest sequence at the next open, before anything allocates; and
+when the next supervisor takes the workspace's socket — which no other supervisor then holds — it seals every job of the
+incarnation that has an admission and no terminal record `failed` with `supervisorLost`, after ending the process groups
+its predecessor's ledger still names. A job whose terminal record was lost is therefore reported lost, never as having
+succeeded.
 
 Each admission and terminal job batch also records its immutable command in a required Arrow `List<Binary>` `argv`
 column. An argv job stores its arguments; a script job stores exactly two elements, `\0script` and the script's JSON — a
