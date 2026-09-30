@@ -328,26 +328,6 @@ reach a sibling workspace's connector/socket. Every attempt must fail and produc
 goldens (unit tier) do not substitute for this — they prove generation, not kernel enforcement. Every
 production-discovered escape becomes a permanent case.
 
-## Trace assertions (lmao-query)
-
-The escape and integration tiers assert over **emitted traces** (13_telemetry.md), not scraped text. Because lmao is
-deterministic under an injected `Clock`/`Entropy` (bit-identical trace bytes per `(build, seed, config)`), a run
-produces a stable trace the tier queries with `lmao-query` selectors:
-
-- **Escape tier** asserts denials as trace facts: `never(gateway.allow ∧ host ∉ grants)`,
-  `count(egress ∧ ¬granted) == 0`, and the ordering invariant `never(secret-read ∧ granted-ancestor)` (the denies-last
-  property, cross-checked against the unit-tier generation golden — one proves kernel enforcement, the other profile
-  text).
-- **Integration tier** asserts lifecycle causality: `every(rm ⇒ supervisor-stop precedes detach)`,
-  `every(linux-detach ⇒ connector-drain precedes connector-cgroup-kill precedes socket-unlink precedes netns-release)`,
-  `every(linux-restore ⇒ old-connector-drain precedes new-endpoint-publish)`, `every(new ⇒ fsck precedes mount)`, and
-  the escalation loop `denial → grant(rev+1) → retry` as a single connected trace.
-- **Golden trace fixtures**: the deterministic trace of `cowshed new` (and other lifecycle ops) is checked in; a diff is
-  a behavior change that must touch the spec, the same contract as the CLI goldens.
-
-This is the assertion surface `lmao-query` was built for (its `selector → count/never` shape); the tiers consume it
-rather than each re-implementing trace inspection.
-
 ## Performance budgets (regression thresholds)
 
 Measured by the integration suite with tinybench-style medians (≥ 10 samples); CI asserts with a 3× multiplier to absorb

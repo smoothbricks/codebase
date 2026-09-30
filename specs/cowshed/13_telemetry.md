@@ -10,14 +10,14 @@ projection from the Arrow store.
 ## Why lmao, not text logs
 
 Text logs record _that_ things happened. Columns make cowshed's behavior a **dataset**: the same artifact answers
-debugging (span waterfalls), security (audit joins), testing (trace assertions), and fleet ops (SLOs from real usage).
-lmao is the right substrate specifically because it is trace-first and **deterministic** — with an injected `Clock` and
-`Entropy` it emits bit-identical trace bytes for a given `(build, seed, config)` (see `packages/lmao`), which is what
-makes golden trace fixtures and the assertion surface below possible.
+debugging (span waterfalls), security (audit joins), and fleet ops (SLOs from real usage). lmao is the right substrate
+specifically because it is trace-first and **deterministic** — with an injected `Clock` and `Entropy` it emits
+bit-identical trace bytes for a given `(build, seed, config)` (see `packages/lmao`).
 
-**Dependency honesty**: lmao's Rust crates (`packages/lmao/crates`) are today a pinned-API scaffold (hot paths
-unimplemented; port order arena→core→arrow→macros→wasm→query). cowshed Phase 1 codes against the pinned
-`lmao-core`/`lmao-arrow` APIs; the overhead gates arrive with the port. Sequencing lives in the kickoff.
+**Dependency honesty**: cowshed does not depend on lmao's crates. The gateway writes lmao's Arrow trace schema itself
+(`cowshed-gateway/src/telemetry.rs`), byte-for-byte aligned with `lmao-arrow`'s, because that crate cannot be imported
+without its `lmao-core` runtime; nothing in cowshed queries traces with `lmao-query`, and no golden trace fixture
+exists.
 
 ## Trace context propagation
 
@@ -335,10 +335,8 @@ and commitment — on its own stderr, which is the daemon's log, when it runs wi
   audit records and telemetry. A worker queries one workspace's reconciled lifecycle view and reads captured bytes
   representation-transparently from protected in-volume artifacts. Controller rows never serve raw output, and protected
   rows alone never claim cross-incarnation completeness.
-- **`lmao-query` selectors are the assertion surface** for 08_testing.md. Escape/integration tiers assert over traces
-  and commitments with `never`/`count` selectors rather than scraping text. Integrity joins can require the protected
-  terminal/manifest batch digests, counts, and stream hashes to match the audit records — an after-the-fact query over
-  telemetry, not a gate.
+- **Integrity joins** can require the protected terminal/manifest batch digests, counts, and stream hashes to match the
+  audit records — an after-the-fact query over telemetry, not a gate.
 - **`cowshed doctor --bench`** reports real p50/p99 from accumulated lifecycle spans, turning the 08_testing.md budgets
   into SLOs monitored over actual usage.
 
