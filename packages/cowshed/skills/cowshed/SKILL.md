@@ -56,6 +56,8 @@ direnv users need nothing extra.
 | Checkpoint or restore   | `cowshed checkpoint <ws> <label>` / `cowshed restore <ws> <label>`   | Save or roll back an image.                                                                |
 | Rebase                  | `cowshed rebase <ws>`                                                | Rebase the workspace branch onto main.                                                     |
 | Land with a check       | `cowshed land <ws> --target main --check '<bare command>'`           | Check, fast-forward main, and retire on success.                                           |
+| Rebase within a lane    | `cowshed rebase <ws> --into <lane>`                                  | Rebase onto the lane base's branch, where the lane's other units land.                     |
+| Land into a lane base   | `cowshed land <ws> --into <lane> --check '<bare command>'`           | Check, fast-forward the lane base instead of main, and retire.                             |
 | Deliver a branch        | `cowshed push <ws> --branch <name>`                                  | Put the workspace branch in main's repository for review.                                  |
 | Retire                  | `cowshed rm <ws>`                                                    | Remove a landed workspace.                                                                 |
 | Reclaim                 | `cowshed gc --dry-run` / `cowshed gc`                                | Review, then reclaim orphaned storage.                                                     |
@@ -76,6 +78,9 @@ direnv users need nothing extra.
 6. If main's `.cowshed.toml` declares `[land] warm`, land starts that build in main as a background job and names the
    job on stderr (`main's warm step builds <base>..<head> as job N`). Do not wait for it or run it yourself: the next
    workspace cloned from main inherits whatever it has built.
+7. A unit forked from a lane base (`cowshed fork <lane> <ws>`) does steps 2 and 4 with `--into <lane>` (in place of
+   `--target main`): it rebases onto and lands into the lane base, not main. The lane base itself then rebases and lands
+   as an ordinary workspace.
 
 ## Keep builds shareable
 

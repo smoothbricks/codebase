@@ -404,7 +404,7 @@ impl RevisionTarget {
 }
 
 pub struct RebaseOptions {
-    pub onto: Option<RevisionTarget>,    // default Branch("main")
+    pub onto: Option<RevisionTarget>,    // default: what the workspace lands into; exclusive with `into`
     pub fresh: bool,
     pub expected_workspace_incarnation: Option<WorkspaceIncarnation>,
     pub expected_source_head: Option<GitOid>,
@@ -412,7 +412,7 @@ pub struct RebaseOptions {
 }
 
 pub struct LandOptions {
-    pub target_branch: Option<String>,   // default "main"
+    pub target_branch: Option<String>,   // default: the branch the target has checked out
     pub check: Option<Vec<String>>,
     pub retire: bool,
     pub push_only: bool,
@@ -439,8 +439,8 @@ pub struct WarmRange {
 
 #[serde(tag = "state")]
 pub enum WarmAdmission {
-    Started { job_id: JobId, range: WarmRange },   // main's job building `range` now
-    Queued { behind: JobId, range: WarmRange },    // the one run waiting behind main's warm job
+    Started { job_id: JobId, range: WarmRange },   // the target's job building `range` now
+    Queued { behind: JobId, range: WarmRange },    // the one run waiting behind the target's warm job
 }
 ```
 
@@ -459,8 +459,9 @@ impl Coordinator {
     pub async fn project_grants(&self) -> Result<ProjectGrants, CowshedError>;
     pub async fn grant_project(&self, delta: ProjectGrantDelta) -> Result<ProjectGrants, CowshedError>;
     pub async fn revoke_project(&self, delta: ProjectGrantDelta) -> Result<ProjectGrants, CowshedError>;
-    pub async fn rebase(&self, ws: &str, opts: RebaseOptions) -> Result<GitOid, CowshedError>;
-    pub async fn land(&self, ws: &str, opts: LandOptions) -> Result<LandReport, CowshedError>;
+    // `into`: the lane base the workspace lands into, main when None (02: "Lanes").
+    pub async fn rebase(&self, ws: &str, into: Option<&WorkspaceRef>, opts: RebaseOptions) -> Result<GitOid, CowshedError>;
+    pub async fn land(&self, ws: &str, into: Option<&WorkspaceRef>, opts: LandOptions) -> Result<LandReport, CowshedError>;
     pub async fn restore(&self, ws: &str, label: &str) -> Result<(), CowshedError>;
     pub async fn detach(&self, ws: &str) -> Result<EmptyResult, CowshedError>;
     pub async fn assign_slot(&self, ws: &str, slot: u32) -> Result<(), CowshedError>;
@@ -474,13 +475,16 @@ impl Coordinator {
 }
 ```
 
-`Coordinator::land` fast-forwards a real `refs/heads/<target_branch>`, not a hidden integration ref. When that target
-branch is checked out in the main workspace, the operation updates the checked-out branch through the main workspace so
-its `HEAD`, index, and working tree all resolve to `landed_head`; dirty state causes `Conflict`. When the target is not
-checked out, Cowshed compare-and-swaps the branch ref without disturbing the main workspace's current checkout. A target
-checked out by an unmanaged linked worktree is refused rather than leaving that worktree stale. All expected values are
+`Coordinator::land` fast-forwards a real `refs/heads/<target_branch>`, not a hidden integration ref, in the target's
+repository: main's, or with `into` the lane base's. The target branch must be the one the target's checkout has checked
+out; the operation updates it through that checkout so its `HEAD`, index, and working tree all resolve to `landed_head`,
+and dirty state causes `Conflict`. Any other branch, or a detached checkout, is refused. All expected values are
 revalidated under the target lock immediately before the fast-forward. A mismatch or non-fast-forward retains the source
 workspace and leaves the target branch and visible working state unchanged.
+
+`into` is a `WorkspaceRef`, not a name, so it carries the incarnation it was resolved at: a lane base removed and
+recreated under the same name since is refused with `Conflict`, and naming the workspace itself, or `into` together with
+`RebaseOptions::onto`, with `Usage`. The CLI's `--into <name>` resolves the reference once, when it runs.
 
 ```rust
 /// A worker's capability: it can run and observe work in *its* workspace and hand results

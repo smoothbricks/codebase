@@ -227,6 +227,33 @@ If `rm` reports a conflict, **do not reach for a flag**. The conflict is the dat
 commits that exist nowhere else, and the remedy it names — `cowshed land <ws>` — is the one that keeps them. `--force`
 will not get past it, by design; `--abandon` will, and destroys them (recoverably, via the bundle it writes) on purpose.
 
+### Lanes: one change built by several workspaces
+
+When a change is too big for one workspace, give it a lane base and fork its units from that base. Each unit lands into
+the lane base instead of main, and the lane base lands into main once, when the whole change is done:
+
+```sh
+LANE=auth-rework
+
+cowshed new "$LANE" --project "$PROJECT"
+cowshed fork "$LANE" "$LANE-schema" --project "$PROJECT"
+cowshed fork "$LANE" "$LANE-api" --project "$PROJECT"
+
+# each unit, when its work is done:
+cowshed rebase "$LANE-schema" --into "$LANE" --project "$PROJECT"
+cowshed land "$LANE-schema" --into "$LANE" --check 'just verify' --project "$PROJECT"
+
+# the lane, when every unit has landed into it:
+cowshed rebase "$LANE" --project "$PROJECT"
+cowshed land "$LANE" --check 'just verify' --project "$PROJECT"
+```
+
+`rebase --into` catches a unit up with what its lane-mates have already landed in the lane base, and `land --into` moves
+the lane base's checked-out branch, runs the lane base's warm step, and retires the unit once the lane base holds its
+commits. Cowshed keeps no record of the lane: `--into` names a workspace, and your script is what knows which units
+belong to it. If the lane base is removed and recreated under the same name while units are in flight, their lands
+refuse it rather than land into a workspace they were not forked from.
+
 ## Machine-readable operation
 
 Every command keeps control output separate from guidance:
