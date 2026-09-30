@@ -1,8 +1,11 @@
 #!/usr/bin/env bun
+import { dlopen, FFIType } from 'bun:ffi';
 import {
   chmodSync,
+  closeSync,
   existsSync,
   mkdirSync,
+  openSync,
   readdirSync,
   readFileSync,
   readlinkSync,
@@ -131,42 +134,43 @@ try {
     const uv = uvInstaller(uvInputs, { locked: true });
     await resolveSecrets();
     // Failures are captured and reported below. Exiting in the catch would
-    // skip the git-diff diagnostic that follows a frozen-lockfile miss.
-    // bun install already races concurrent installs with an atomic cache
-    // rename; this script does not add a second mutex around it.
-    let frozenError: unknown;
-    let fallbackError: unknown;
-    try {
-      await runSetupCommand('bun install --frozen-lockfile', $`bun install --frozen-lockfile`, { quiet: false });
-    } catch (error) {
-      frozenError = error;
-      console.error('! Failed to install dependencies with frozen lockfile');
-      replayCapturedOutput(error);
+    // skip the git-diff diagnostic that follows a frozen-lockfile miss. The
+    // exits inside the install lock are safe: the kernel releases it.
+    await withInstallLock(async () => {
+      let frozenError: unknown;
+      let fallbackError: unknown;
       try {
-        await runSetupCommand('bun install', $`bun install`, { quiet: false });
-      } catch (fallback) {
-        fallbackError = fallback;
+        await runSetupCommand('bun install --frozen-lockfile', $`bun install --frozen-lockfile`, { quiet: false });
+      } catch (error) {
+        frozenError = error;
+        console.error('! Failed to install dependencies with frozen lockfile');
+        replayCapturedOutput(error);
+        try {
+          await runSetupCommand('bun install', $`bun install`, { quiet: false });
+        } catch (fallback) {
+          fallbackError = fallback;
+        }
       }
-    }
-    if (fallbackError !== undefined) {
-      reportSetupFailure(fallbackError);
-    }
-    if (frozenError !== undefined) {
-      console.error('git diff after install:');
-      try {
-        await runSetupCommand('git diff', $`git diff`, { quiet: false });
-      } catch (diffError) {
-        // This diff is diagnostics for the install failure we are already
-        // reporting, so it must never become the failure: say it broke and keep
-        // the original exit path. Plain `git diff` exits 0 even when the
-        // lockfile drifted, so a non-zero here means git itself failed.
-        console.error(`! git diff failed: ${diffError instanceof Error ? diffError.message : String(diffError)}`);
+      if (fallbackError !== undefined) {
+        reportSetupFailure(fallbackError);
       }
-      process.exit(1);
-    }
-    if (uv !== null) {
-      await uv.install({ quiet: false });
-    }
+      if (frozenError !== undefined) {
+        console.error('git diff after install:');
+        try {
+          await runSetupCommand('git diff', $`git diff`, { quiet: false });
+        } catch (diffError) {
+          // This diff is diagnostics for the install failure we are already
+          // reporting, so it must never become the failure: say it broke and keep
+          // the original exit path. Plain `git diff` exits 0 even when the
+          // lockfile drifted, so a non-zero here means git itself failed.
+          console.error(`! git diff failed: ${diffError instanceof Error ? diffError.message : String(diffError)}`);
+        }
+        process.exit(1);
+      }
+      if (uv !== null) {
+        await uv.install({ quiet: false });
+      }
+    });
   } else {
     // A local secret-resolution or install failure (a provider that is not
     // signed in, an unpublished private package, a missing registry
@@ -177,11 +181,14 @@ try {
     // install, and load the shell. CI above stays strict.
     const uv = uvInstaller(uvInputs, { locked: false });
     const bun = bunInstaller(bunInputs);
-    const installError = await installLocalDependencies(uv === null ? [bun] : [bun, uv]);
-    if (installError === undefined) {
-      // Pin unscoped typescript → API 6 for root and Bun's shared .bun hoist (Nx).
-      ensureTypeScriptApiPackage(projectRoot);
-    }
+    const installError = await withInstallLock(async () => {
+      const error = await installLocalDependencies(uv === null ? [bun] : [bun, uv]);
+      if (error === undefined) {
+        // Pin unscoped typescript → API 6 for root and Bun's shared .bun hoist (Nx).
+        ensureTypeScriptApiPackage(projectRoot);
+      }
+      return error;
+    });
     await applyWorkspaceGitConfig(projectRoot);
     if (installError !== undefined) {
       reportDegradedSetup(installError);
@@ -219,8 +226,8 @@ async function resolveSecrets(): Promise<void> {
 /**
  * Runs every installer whose inputs changed since its last successful run.
  * Returned, not thrown: the caller still wires git config, then reports a
- * degraded shell. Same reason as the CI branch — bun install's own rename is
- * the concurrency control, not a lock in this script.
+ * degraded shell. Called under the install lock, so an installer another
+ * shell entry just ran is already current here.
  */
 async function installLocalDependencies(installers: readonly Installer[]): Promise<unknown> {
   const pending = installers.filter((installer) => !installer.isCurrent());
@@ -240,6 +247,42 @@ async function installLocalDependencies(installers: readonly Installer[]): Promi
     }
   }
   return undefined;
+}
+
+/**
+ * One install at a time per checkout, across processes. Shell entries race
+ * whenever two shells load at once — a shell pool warming several, two
+ * terminals, an editor beside a terminal — and two installs into one
+ * node_modules collide on its links (`EEXIST … symlink`). The second entry
+ * waits, then finds the first entry's stamps current and installs nothing.
+ *
+ * flock(2), not a lock directory or file the script creates and removes: the
+ * kernel releases it when the holder exits however it exits, so a killed
+ * shell entry cannot leave a lock behind for the next one to wait out. Bun
+ * has no flock binding, so it comes from libc; LOCK_EX and LOCK_NB have the
+ * same values on Darwin and Linux. The waiting entry says why it is waiting.
+ */
+async function withInstallLock<T>(run: () => Promise<T>): Promise<T> {
+  const LOCK_EX = 2;
+  const LOCK_NB = 4;
+  const libc = dlopen(process.platform === 'darwin' ? '/usr/lib/libSystem.B.dylib' : 'libc.so.6', {
+    flock: { args: [FFIType.i32, FFIType.i32], returns: FFIType.i32 },
+  });
+  const lockPath = path.join(projectRoot, 'node_modules', '.smoo-install.lock');
+  mkdirSync(path.dirname(lockPath), { recursive: true });
+  const fd = openSync(lockPath, 'a');
+  try {
+    if (libc.symbols.flock(fd, LOCK_EX | LOCK_NB) !== 0) {
+      console.error(`setup-environment: waiting for another shell entry's install in ${projectRoot}`);
+      while (libc.symbols.flock(fd, LOCK_EX | LOCK_NB) !== 0) {
+        await Bun.sleep(100);
+      }
+    }
+    return await run();
+  } finally {
+    closeSync(fd);
+    libc.close();
+  }
 }
 
 /**

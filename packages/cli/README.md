@@ -369,6 +369,10 @@ nothing when nothing changed:
   member's `pyproject.toml`. The environment is bound to its path, so one copied from another checkout (a copy-on-write
   clone) is rebuilt from the uv cache on first entry. devenv's own `languages.python.venv` and `uv.sync` must stay off;
   the module refuses them.
+- Shell entries in one checkout install one at a time: the install runs under a flock(2) on
+  `node_modules/.smoo-install.lock`, so a second shell loading at the same moment waits (and says so), then finds the
+  first entry's stamps current. The kernel releases the lock when its holder exits, so a killed shell entry leaves
+  nothing behind.
 - The managed `.envrc` watches every one of those inputs (listed in `$DEVENV_STATE/install-inputs`) and the scripts
   shell entry runs, so a shell direnv keeps loaded re-enters exactly when an install has something to do.
 - Shell secrets resolve only for an entry that installs; see below.

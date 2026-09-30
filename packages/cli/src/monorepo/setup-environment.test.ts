@@ -33,12 +33,17 @@ interface EntryOptions {
   readonly python?: string;
 }
 
+/** A shell entry still running, with its output piped for `finished`. */
+type ShellProcess = Bun.Subprocess<'ignore', 'pipe', 'pipe'>;
+
 interface Repository {
   readonly root: string;
   /** devenv's DEVENV_STATE for this checkout. */
   readonly state: string;
   /** Runs the real setup-environment.ts exactly as the managed devenv shell does. */
   readonly enterShell: (options?: EntryOptions) => Promise<ShellEntry>;
+  /** The same entry, returned while it runs, for a test that races or kills it. */
+  readonly startShell: () => ShellProcess;
   /** Times something recorded in the ledger: a provider command's variable, `install`, or `uv`. */
   readonly count: (name: string) => number;
   /** The argument vectors the recording `uv` received, one per run. */
@@ -147,7 +152,8 @@ function repository(root: string, ledgers: string, bin: string): Repository {
   return {
     root,
     state,
-    enterShell: async (options = {}) => enterShell(root, state, bin, options),
+    enterShell: async (options = {}) => finished(startShell(root, state, bin, options)),
+    startShell: () => startShell(root, state, bin, {}),
     count: (name) => lines(name).length,
     uvRuns: () => lines('uv').map((line) => line.split(' ')),
   };
@@ -180,8 +186,8 @@ async function git(cwd: string, args: readonly string[]): Promise<string> {
  * only what a developer machine has, so neither the CI branch nor the cowshed
  * branch can decide this run.
  */
-async function enterShell(root: string, state: string, bin: string, options: EntryOptions): Promise<ShellEntry> {
-  const proc = Bun.spawn({
+function startShell(root: string, state: string, bin: string, options: EntryOptions): ShellProcess {
+  return Bun.spawn({
     cmd: [
       'bun',
       join(root, 'tooling', 'direnv', 'setup-environment.ts'),
@@ -199,6 +205,9 @@ async function enterShell(root: string, state: string, bin: string, options: Ent
     stderr: 'pipe',
     stdin: 'ignore',
   });
+}
+
+async function finished(proc: ShellProcess): Promise<ShellEntry> {
   const [stderr, exitCode] = await Promise.all([
     new Response(proc.stderr).text(),
     (async () => {
@@ -284,6 +293,52 @@ describe('what shell entry installs', () => {
         await enter();
         await enter();
         expect(readFileSync(join(root, 'attempts'), 'utf8')).toBe('x\nx\n');
+      },
+    );
+  });
+
+  it('installs once when two shell entries start together', async () => {
+    // A shell pool warms two shells at once in one checkout. The second must
+    // wait for the first install and then find nothing left to do, not run a
+    // second install into the same node_modules. The prepare script's real
+    // second holds the first install open so the two entries overlap; the
+    // race is between processes, so there is no clock to fake.
+    await withManagedRepository({ prepare: `sleep 1; printf 'x\\n' >> installed` }, async ({ root, startShell }) => {
+      const entries = await Promise.all([finished(startShell()), finished(startShell())]);
+      expect(entries.map((entry) => entry.exitCode)).toEqual([0, 0]);
+      expect(entries.map((entry) => entry.stderr).join('')).toBe(
+        `setup-environment: waiting for another shell entry's install in ${root}\n`,
+      );
+      expect(readFileSync(join(root, 'installed'), 'utf8')).toBe('x\n');
+    });
+  });
+
+  it('lets the next entry install at once after the entry holding the install was killed', async () => {
+    await withManagedRepository(
+      {
+        // The held install parks in its prepare script, recording the pid
+        // that becomes `sleep`, so the test can kill both halves of it.
+        prepare: `if [ -f hold ]; then echo $$ > held; exec sleep 30; fi; printf 'x\\n' >> installed`,
+        files: { hold: '' },
+      },
+      async ({ root, startShell, enterShell: enter }) => {
+        const holder = startShell();
+        const held = join(root, 'held');
+        // The holder is another process; the only signal that it is inside
+        // the install is the pid file its prepare script writes.
+        for (let waited = 0; !existsSync(held) || readFileSync(held, 'utf8') === ''; waited += 50) {
+          expect(waited).toBeLessThan(20_000);
+          await Bun.sleep(50);
+        }
+        holder.kill('SIGKILL');
+        await holder.exited;
+        process.kill(Number(readFileSync(held, 'utf8').trim()), 'SIGKILL');
+        await rm(join(root, 'hold'));
+
+        const started = performance.now();
+        expect(await enter()).toEqual(HEALTHY);
+        expect(performance.now() - started).toBeLessThan(10_000);
+        expect(readFileSync(join(root, 'installed'), 'utf8')).toBe('x\n');
       },
     );
   });
