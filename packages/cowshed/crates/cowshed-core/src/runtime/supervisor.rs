@@ -2093,7 +2093,9 @@ impl WorkspaceSupervisorHandle {
     }
 
     /// Whether the supervisor holds nothing a client could come back for: no named session is
-    /// open and no job is running.
+    /// open and no job is running. Only the process serving a supervisor asks, to retire it; that
+    /// serving host is the macOS native project host.
+    #[cfg(target_os = "macos")]
     pub(super) async fn idle(&self) -> Result<bool> {
         self.call(|reply| Command::Idle { reply }).await
     }
@@ -2280,6 +2282,7 @@ pub(super) enum Command {
         reply: oneshot::Sender<Result<WorkspaceAuthoritySnapshot>>,
     },
     /// Whether no named session is open and no job is running.
+    #[cfg(target_os = "macos")]
     Idle {
         reply: oneshot::Sender<Result<bool>>,
     },
@@ -2615,6 +2618,7 @@ impl SupervisorActor {
             Command::CurrentAuthority { reply } => {
                 let _ = reply.send(Ok(self.authority.clone()));
             }
+            #[cfg(target_os = "macos")]
             Command::Idle { reply } => {
                 let idle = self.named_sessions.is_empty()
                     && self.jobs.values().all(JobStateRecord::terminal);

@@ -1148,6 +1148,7 @@ async fn forward(path: Arc<PathBuf>, command: Command) {
         Command::CurrentAuthority { reply } => {
             let _ = reply.send(hello(path).await.map(|hello| hello.authority));
         }
+        #[cfg(target_os = "macos")]
         Command::Idle { reply } => {
             // Only the process running a supervisor asks it whether it is idle.
             let _ = reply.send(Err(CowshedError::internal(
