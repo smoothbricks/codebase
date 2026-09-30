@@ -21,6 +21,16 @@ make that possible and they are absolute:
    command that exists in the parser. Hinted verbs are contract-tested against the parser so guidance can never
    reference a command that does not exist.
 
+## Launcher
+
+The npm package's `cowshed` bin is `bin/cowshed`, a POSIX shell script that execs the native binary for the host:
+`sccache` (the one daemon-control verb) runs the host-stable install launchd runs when it exists; everything else runs
+`dist/bin/<platform>/cowshed`, restoring an execute bit a publish dropped, or else `target/release/cowshed` of the
+workspace a linked checkout sits in. A host with none of them gets exit 5 naming every path looked in. It is a shell
+script rather than Node because it runs before every command, and Node's own start (~30 ms) costs more than the fastest
+verbs take in total; `exec` hands the binary the command's signals, exit status and standard streams unchanged. The
+library's `runCli` runs the CLI through the same script, so one rule picks the binary.
+
 ## Onboarding and repair
 
 Two verbs own the host story, both runnable from any directory:

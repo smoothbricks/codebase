@@ -5,10 +5,10 @@
   "sideEffects": false,
   "scripts": {
     "test": "nx run cowshed:test --outputStyle=stream",
-    "cowshed": "nx run cowshed:build && node dist/ts/cli.js"
+    "cowshed": "nx run cowshed:build && bin/cowshed"
   },
   "bin": {
-    "cowshed": "./dist/ts/cli.js"
+    "cowshed": "./bin/cowshed"
   },
   "main": "./dist/ts/index.js",
   "types": "./dist/ts/index.d.ts",
@@ -20,6 +20,7 @@
     }
   },
   "files": [
+    "bin",
     "dist",
     "skills",
     "nix"
@@ -43,9 +44,9 @@
           "build"
         ],
         "options": {
-          "comment": "Runs the TS entry, not dist/bin/darwin-arm64 directly: the trampoline resolves the host's native binary through src/platform.ts, so this works on every arch instead of only Apple Silicon.",
+          "comment": "Runs the package launcher, not dist/bin/darwin-arm64 directly: bin/cowshed resolves the host's native binary, so this works on every arch instead of only Apple Silicon.",
           "cwd": "{projectRoot}",
-          "command": "node dist/ts/cli.js {args}"
+          "command": "bin/cowshed {args}"
         }
       },
       "refresh-harnesses": {
@@ -165,7 +166,7 @@
           }
         }
       },
-      "trampoline-test": {
+      "launcher-test": {
         "executor": "@smoothbricks/nx-plugin:bounded-exec",
         "cache": true,
         "//": "dependsOn ^build so lmao/dist exists: bunfig.napi-test.toml preloads ../../lmao/dist/ts/bun/trace-preload.js, and without the edge a cold cache runs this target before lmao:build.",
@@ -174,7 +175,7 @@
           "typecheck-tests"
         ],
         "options": {
-          "command": "bun test --config=../bunfig.napi-test.toml --timeout=30000 cli-trampoline.test.ts platform.test.ts",
+          "command": "bun test --config=../bunfig.napi-test.toml --timeout=30000 launcher.test.ts platform.test.ts",
           "cwd": "{projectRoot}/src",
           "timeoutMs": 120000,
           "killAfterMs": 10000
@@ -256,7 +257,7 @@
         "executor": "nx:noop",
         "dependsOn": [
           "napi-test",
-          "trampoline-test",
+          "launcher-test",
           "wire-test",
           "verify-packaging"
         ]

@@ -3,7 +3,7 @@
 
 import { describe, expect, it } from 'bun:test';
 import { readFileSync } from 'node:fs';
-import { hostStableCowshedBinary, NATIVE_TARGETS, platformDirectory } from './platform.js';
+import { NATIVE_TARGETS, platformDirectory } from './platform.js';
 
 /**
  * `NATIVE_TARGETS` is the runtime owner of the platform → `dist` directory mapping.
@@ -62,18 +62,10 @@ describe('platform target table', () => {
   });
 
   it('refuses a host it does not ship for', () => {
-    // Fail-closed is the contract: `loadNativeModule` and `resolveCliBackend` both branch on null,
-    // and a wrong non-null answer would send them looking in a directory that never exists.
+    // Fail-closed is the contract: `loadNativeModule` branches on null, and a wrong non-null
+    // answer would send it looking in a directory that never exists.
     expect(platformDirectory('darwin', 'ia32')).toBeNull();
     expect(platformDirectory('win32', 'x64')).toBeNull();
     expect(platformDirectory('freebsd', 'arm64')).toBeNull();
-  });
-});
-
-describe('host-stable cowshed binary', () => {
-  it('joins launchd HostStableExecutable segments under home', () => {
-    expect(hostStableCowshedBinary('/Users/test')).toBe(
-      '/Users/test/Library/Application Support/dev.cowshed/bin/cowshed',
-    );
   });
 });

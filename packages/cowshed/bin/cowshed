@@ -1,0 +1,81 @@
+#!/bin/sh
+# Run the native cowshed CLI built for this host (06_cli.md "Launcher").
+#
+# The package's `bin`, and the one place that decides which binary answers. A POSIX shell script
+# rather than Node: it runs before every command, and Node's own start costs more than a resident
+# `cowshed path` takes in total. It execs the binary, so the command's signals, exit status and
+# standard streams are the binary's own.
+#
+# Which binary:
+# - `sccache`, the one daemon-control verb, runs the host-stable install that launchd runs, when
+#   it exists: for it the installed copy is authoritative even when stale. `setup` and `gateway`
+#   deliberately run the invoking binary, because `setup` writes the stable install and
+#   `gateway start`/`status` compare the daemon's executable with the one asking.
+# - otherwise the binary packaged for this host under dist/bin/<platform>/, restoring an execute
+#   bit a publish lost;
+# - otherwise target/release/cowshed of the workspace a linked checkout of this package sits in.
+set -eu
+
+# Package managers link `bin` entries, sometimes through a chain of links.
+launcher=$0
+while [ -h "$launcher" ]; do
+  target=$(readlink "$launcher")
+  case $target in
+  /*) launcher=$target ;;
+  *) launcher=${launcher%/*}/$target ;;
+  esac
+done
+package=${launcher%/*}/..
+
+# Kept in step with NATIVE_TARGETS in src/platform.ts; platform.test.ts checks this table.
+case $(uname -sm) in
+"Darwin arm64") platform=darwin-arm64 ;;
+"Darwin x86_64") platform=darwin-x64 ;;
+"Linux aarch64" | "Linux arm64") platform=linux-arm64-gnu ;;
+"Linux x86_64") platform=linux-x64-gnu ;;
+*) platform= ;;
+esac
+
+searched=
+consider() {
+  searched=${searched:+$searched, }$1
+  [ -f "$1" ]
+}
+
+# The verb is the first argument that is not a flag: `--json sccache start` routes like
+# `sccache start`.
+for argument in "$@"; do
+  case $argument in
+  -*) continue ;;
+  sccache)
+    stable=${HOME:-}/Library/Application\ Support/dev.cowshed/bin/cowshed
+    if consider "$stable"; then
+      exec "$stable" "$@"
+    fi
+    ;;
+  esac
+  break
+done
+
+if [ -n "$platform" ]; then
+  packaged=$package/dist/bin/$platform/cowshed
+  if consider "$packaged"; then
+    # A publish can apply the binaries without their execute bit; restore it once. An
+    # unwritable copy stays as it is, and exec reports the permission it lacks.
+    [ -x "$packaged" ] || chmod +x "$packaged" 2>/dev/null || :
+    exec "$packaged" "$@"
+  fi
+fi
+
+workspace=$package/../../target/release/cowshed
+if consider "$workspace"; then
+  exec "$workspace" "$@"
+fi
+
+if [ -n "$platform" ]; then
+  echo "cowshed: no cowshed CLI binary found; looked in $searched" >&2
+else
+  echo "cowshed: cowshed ships no CLI binary for $(uname -sm); looked in $searched" >&2
+fi
+echo "next: build this platform with \`nx build cowshed\`, or install a published @smoothbricks/cowshed" >&2
+exit 5
