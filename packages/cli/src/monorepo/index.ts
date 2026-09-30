@@ -134,13 +134,23 @@ export async function updateManagedFiles(root: string): Promise<void> {
   await run('bun', ['install', '--no-summary'], root);
 }
 
+/**
+ * Managed-file drift plus every package policy.
+ *
+ * `warn` makes only the DRIFT non-blocking: CI reports it and dispatches the managed-files
+ * workflow, which heals it in a review PR. Nothing heals a policy failure, so the policies fail
+ * the check either way — a `--warn` run that skipped them left every policy enforced nowhere but
+ * on a developer's machine.
+ */
 export async function checkManagedFiles(root: string, options: { warn?: boolean } = {}): Promise<void> {
+  let drifted = false;
   if (options.warn === true) {
     await warnOnManagedFileDrift(root);
-    return;
+  } else {
+    const results = await applyManagedFiles(root, 'check');
+    printResults(results);
+    drifted = results.some((result) => result.action === 'drifted');
   }
-  const results = await applyManagedFiles(root, 'check');
-  printResults(results);
   const projectTargets = await readProjectTargets(root);
   const resolvedTargets = resolvedTargetsByProject(projectTargets);
   const packageFailures =
@@ -157,8 +167,11 @@ export async function checkManagedFiles(root: string, options: { warn?: boolean 
     validateCargoCachePolicy(root) +
     validateCargoToolchainInputs(root, projectTargets) +
     validateSccachePatches(root);
-  if (results.some((result) => result.action === 'drifted') || packageFailures > 0) {
+  if (drifted) {
     throw new Error('Managed monorepo files or package conventions are out of date. Run: smoo monorepo update');
+  }
+  if (packageFailures > 0) {
+    throw new Error(`${packageFailures} monorepo package convention check(s) failed; fix the findings above.`);
   }
 }
 

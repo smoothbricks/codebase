@@ -129,7 +129,10 @@ function buildProgram(): Command {
   });
   monorepo
     .command('check')
-    .option('--warn', 'report drift as warnings (GitHub annotations) instead of failing')
+    .option(
+      '--warn',
+      'report managed-file drift as warnings (GitHub annotations) instead of failing; package policies still fail',
+    )
     .action(async (options: { warn?: boolean }) => {
       const { checkManagedFiles } = await import('./monorepo/index.js');
       await checkManagedFiles(await findRepoRoot(), { warn: options.warn });

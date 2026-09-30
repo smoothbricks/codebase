@@ -349,7 +349,11 @@ smoo monorepo check
 smoo monorepo diff
 ```
 
-`check` fails when a managed file is missing or stale. `diff` reports drift without writing files.
+`check` fails when a managed file is missing or stale, and when a package policy fails (root package, Nx names and
+release config, public tags and metadata, test locations, workspace dependencies, the devenv import, the Cargo cache and
+toolchain policies, the sccache patches). `check --warn` reports managed-file drift as warnings instead — CI runs it on
+every event and, on a default-branch push, dispatches the managed-files workflow to heal the drift — while a policy
+failure still fails it, because nothing heals one. `diff` reports drift without writing files.
 
 The generated publish workflow is canonical Prettier YAML. Running the repository formatter over
 `.github/workflows/publish.yml` is byte-stable and does not create managed-file drift.
