@@ -13,6 +13,8 @@ pub mod gateway_sessions;
 pub mod git;
 pub mod host_caches;
 mod inherited_daemons;
+#[cfg(target_os = "macos")]
+mod inherited_git_locks;
 pub mod inherited_links;
 pub mod landing;
 pub mod metadata;

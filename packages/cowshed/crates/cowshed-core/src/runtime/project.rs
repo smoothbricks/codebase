@@ -6644,6 +6644,7 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
         let receipt = self
             .substrate
             .execute_adopt_staged(plan, move |stage| async move {
+                crate::inherited_git_locks::discard_in(&stage.mount_point).await?;
                 crate::inherited_daemons::macos::discard_in(&stage.mount_point).await?;
                 let repository = crate::git::GitRepository::from_root(&stage.mount_point);
                 // The image's volume is case-sensitive; the tree it was copied from may not be.
@@ -6780,6 +6781,15 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
             let receipt = self
                 .substrate
                 .execute_create_staged(plan, move |stage| async move {
+                    // Before any Git runs in the clone: a lock a source writer held when the
+                    // image was cloned is held by nobody here, and would refuse every write to
+                    // the file it guards.
+                    timed_async(
+                        "new",
+                        "locks",
+                        crate::inherited_git_locks::discard_in(&stage.mount_point),
+                    )
+                    .await?;
                     timed_async(
                         "new",
                         "daemons",
@@ -6997,6 +7007,7 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
         let receipt = self
             .substrate
             .execute_fork_staged(plan, move |stage| async move {
+                crate::inherited_git_locks::discard_in(&stage.mount_point).await?;
                 crate::inherited_daemons::macos::discard_in(&stage.mount_point).await?;
                 let repository = crate::git::GitRepository::from_root(&stage.mount_point);
                 if source_is_git_worktree {

@@ -242,16 +242,21 @@ Budget: ≤ 1 s cold. No pool, no pre-warming.
    `<mount>/.envrc` direnv-trusted. In-image Bun, Cargo, Go, and proxy wiring uses the platform endpoint, and tool shims
    are placed at `.cowshed/bin/`; git reaches the network only through the gateway, like every other client (see "Remote
    code ingress").
-6. Re-resolve inherited escaping symlinks. A relative symlink whose target climbs above the tree root (the entry
-   `bun install` writes for a `link:` dependency, say) was computed against main's depth and lands somewhere else at the
-   workspace's mount depth, so it is rewritten to the absolute path it named in main; one whose target does not exist in
-   main either is refused by name rather than repointed at a guess. In-tree and absolute links are left alone. Finding
-   them reads every directory of the fresh volume, concurrently, and is the largest setup cost after the clone's first
-   write (about 5 s over a million entries). Then, inside the mount, under the workspace's closed sandbox: configure the
-   `main` remote (see "The `main` remote") and `git switch -c cowshed/<name>` from the checked-out state. The `.git`
-   directory arrived complete via CoW — the workspace is a standalone repository with **no linked-worktree registration
-   and no back-references** into the host checkout, unless it was created with `--git-worktree` (see "Git-worktree
-   workspaces").
+6. Drop what the clone inherited that names a process in main rather than content, before any Git or daemon runs in the
+   clone: every lock file in the workspace's own `.git` directory, and the Nx daemon's rendezvous directory
+   (`.nx/workspace-data/d`). Git takes `<file>.lock` exclusively, writes into it, and renames it over the file, so a
+   clone taken while a writer in main held one carries a lock nobody in the workspace holds — the writer's rename lands
+   in main — and every write to that file in the workspace would fail. A `.git` that is a file or a symlink names a Git
+   directory in another tree, whose locks may be live, and is not walked. Then re-resolve inherited escaping symlinks. A
+   relative symlink whose target climbs above the tree root (the entry `bun install` writes for a `link:` dependency,
+   say) was computed against main's depth and lands somewhere else at the workspace's mount depth, so it is rewritten to
+   the absolute path it named in main; one whose target does not exist in main either is refused by name rather than
+   repointed at a guess. In-tree and absolute links are left alone. Finding them reads every directory of the fresh
+   volume, concurrently, and is the largest setup cost after the clone's first write (about 5 s over a million entries).
+   Then, inside the mount, under the workspace's closed sandbox: configure the `main` remote (see "The `main` remote")
+   and `git switch -c cowshed/<name>` from the checked-out state. The `.git` directory arrived complete via CoW — the
+   workspace is a standalone repository with **no linked-worktree registration and no back-references** into the host
+   checkout, unless it was created with `--git-worktree` (see "Git-worktree workspaces").
 7. Record the audit
    `ControllerCommitment::Fork(ForkCommitment { version, order, repo_id, source_incarnation, destination_incarnation })`;
    the new marker carries `lineage` = main's incarnation followed by main's own lineage, which is what authorizes the
@@ -311,7 +316,7 @@ Every initializer step can run again:
 
 | Step                                                              | Replay rule                                                                                                                            |
 | ----------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------- |
-| inherited daemon discard                                          | Not-found is success; deletion is deterministic.                                                                                       |
+| inherited Git locks and daemon discard                            | Not-found is success; deletion is deterministic.                                                                                       |
 | environment hook                                                  | Check-first, with an append-open recheck.                                                                                              |
 | inherited remotes and links, local `main` remote                  | An empty loop or a deterministic rewrite, plus ownership-checked remote configuration.                                                 |
 | standalone branch                                                 | A fresh preparation refuses a collision; a storage-authorized resume reuses and checks out only `cowshed/<name>`.                      |
