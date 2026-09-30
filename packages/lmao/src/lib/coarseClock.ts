@@ -2,7 +2,7 @@
  * Coarse row-stamp policy — the one process-wide coarsening constant.
  *
  * Every lane that stamps log rows (js-heap `traceRoot.node`/`traceRoot.es`, the
- * WASM thread lane, `containium-trace` on the Rust side) rides the same
+ * WASM thread lane, an embedding host's Rust tracer) rides the same
  * bounded-staleness cache at the same cadence. Two coarse clocks with different
  * refresh policies in one process would produce an inconsistency nobody can
  * reproduce, so the number lives here and is imported, never redeclared.
@@ -26,7 +26,7 @@
  * WHY it is sound: rows stamped from the cache share a timestamp, and row order
  * — not stamp distinctness — is authoritative for ordering. Span start and
  * completion always read fresh through the injectable `_timestampNow` seam, so
- * durations, the quantity `axe_execution_duration_seconds` derives from the
+ * durations, the quantity a downstream execution-duration metric derives from the
  * row-0/row-1 stamps, never coarsen.
  *
  * WHY sixteen: staleness must be bounded by a fraction of buffer capacity, not
@@ -60,8 +60,8 @@ export interface StampCache {
  * ON: `traceRoot.node.ts` and `traceRoot.es.ts` import this constant; their
  * `_timestampNow` seam is the fresh/boundary read and also seeds the cache, so
  * a lane layered above them (the WASM thread lane's `boundaryTimestamp`) gets
- * precise boundaries for free. `containium-trace` carries the same number in
- * Rust as `LOG_STAMP_REFRESH` over `lmao_core::CoarseClock`.
+ * precise boundaries for free. An embedding host's Rust tracer carries the same
+ * number as `LOG_STAMP_REFRESH` over `lmao_core::CoarseClock`.
  *
  * SEAM 1 — the WASM thread lane (`wasm/threadSpanView.ts`) declares its own
  * `LOG_STAMP_REFRESH = 16` with the same invariant. Same number, so behaviour

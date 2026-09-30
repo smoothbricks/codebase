@@ -5,8 +5,8 @@
  * ~26% of on-CPU on the log-row path, but a frame is not a mechanism: that one
  * label covers the `process.hrtime.bigint()` cell, the `+` offset add, the
  * `<=` monotonic compare, and the `BigInt64Array` store. This freezes them one
- * at a time — the same method `containium-realm-spans/benches/span_write.rs`
- * used to put the Rust clock read at 16.75 of 19.4 ns/row.
+ * at a time — the same method an embedding host's realm-spans `span_write`
+ * bench used to put the Rust clock read at 16.75 of 19.4 ns/row.
  *
  * Each variant does exactly what a log row does with the stamp: produce the
  * bigint and store it into the timestamp column. Nothing else from

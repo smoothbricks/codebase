@@ -6,7 +6,7 @@
  * {@link SPAN_BUFFER_AOT_ABI_SYMBOL}. Compiler-generated code (lmao-ttsc's
  * `$$_lmaoSpanBufferAot` binding) reads that slot and nothing else, which makes
  * the slot the ONE inversion point a host has: install a conforming runtime
- * BEFORE the v1 module evaluates (a Bun preload, containium's pre-authored host
+ * BEFORE the v1 module evaluates (a Bun preload, an embedding host's pre-authored
  * script) and every compiled writer in the realm is the host's. lmao never
  * detects a host — the dependency direction is host → this published contract.
  *

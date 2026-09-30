@@ -4,7 +4,7 @@
  * The property most likely to break silently is that a span BOUNDARY still
  * reads the clock fresh. If a refactor routes `_writeSpanStart`/`_writeSpanEnd`
  * through the row cache, every log row keeps working, every ordering assertion
- * keeps passing, and `axe_execution_duration_seconds` quietly reports zero for
+ * keeps passing, and every execution-duration metric quietly reports zero for
  * every span short enough to fit inside one refresh block. These tests exist to
  * make that mistake loud.
  */

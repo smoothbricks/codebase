@@ -201,7 +201,7 @@ describe('Platform timestamp append contract', () => {
     // Log rows ride the coarse cache, so the row contract is non-decreasing.
     // The two boundaries always read fresh, so they absorb stalls and rollbacks
     // through the guard and stay strictly monotonic — that is the pair
-    // `axe_execution_duration_seconds` derives from.
+    // execution-duration metrics derive from.
     const epoch = 1_700_000_000_000_000_000n;
     const anchor = 10_000_000n;
     const ticks = [anchor, anchor, anchor - 50n, anchor + 1n, anchor - 1_000n];
