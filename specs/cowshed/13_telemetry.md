@@ -199,9 +199,11 @@ may discard/report only an incomplete trailing frame.
 The flat Arrow schema begins `record_kind, record_version, repo_id`. A Job row then uses
 `workspace_incarnation, job_id, sequence, state, grant_revision`, followed by the existing
 `stdout_storage_kind, stdout_source_path, stdout_inline_bytes, stdout_protected_path, stdout_bytes, stdout_sha256, stdout_summary_version, stdout_summary_text, stdout_summary_truncated`
-and equivalent `stderr_*` columns, optional output-limit columns, and required `argv: List<Binary>`, which holds a
-script job as the two elements `\0script` and the script's JSON. A CheckpointManifest row instead uses
-`origin_incarnation, barrier_id, visible_jobs, records_sha256`, with
+and equivalent `stderr_*` columns, optional output-limit columns, required `argv: List<Binary>`, which holds a script
+job as the two elements `\0script` and the script's JSON, and a nullable `failure` naming why a `failed` job failed when
+no status of its own says so (`supervisorLost`). Records are written at `record_version` 3; version-2 records, which
+have every column but `failure`, are read as they were, and a batch whose layout and version disagree is rejected. A
+CheckpointManifest row instead uses `origin_incarnation, barrier_id, visible_jobs, records_sha256`, with
 `visible_jobs: List<Struct<workspace_incarnation,job_id,state,stdout,stderr>>`. Columns outside the selected variant are
 null and validators reject every other null combination. Job recovery validates non-null raw argv elements, the
 non-empty first argument, NUL exclusion, the 128 KiB element limit, and the 1 MiB total before allocating OS strings,

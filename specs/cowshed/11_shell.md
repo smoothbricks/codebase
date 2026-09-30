@@ -146,6 +146,10 @@ multiplexed, and a client that disconnects abandons only its own call, never a j
 - **hello** — the supervisor answers with its protocol version, the authority it serves (repository, workspace,
   incarnation, grant and lifecycle revisions) and its pid. A client reads the version first and refuses another one by
   name (`Conflict`), so two cowshed builds never exchange a call either cannot decode.
+- **advance** — the supervisor re-reads its workspace's grants and serves under their revision from then on
+  (Grant-change propagation, below); answered with the authority it serves afterwards.
+- **drain** — the supervisor admits nothing more, lets its running jobs finish, then retires; answered at once with its
+  pid. This one request keeps its shape across protocol versions (Supervisor recovery, below).
 - **calls** — `openSession`, `sessionSnapshot`, `closeSession`, `exec`, `stdinWrite`, `stdinClose`, `streamChunk`,
   `streamEnd`, `info`, `list`, `kill`, `wait`, `logRead`, `checkpoint`, `quiesce`, `retire`: one per supervisor
   operation, each naming the authority the caller holds. The supervisor fences every call by it exactly as it fences an
@@ -379,6 +383,30 @@ Once a filesystem grant/revoke advances the revision, a later `run` targeting th
 `Conflict` naming the enforced and current revisions; it is never silently migrated or resumed. The caller opens a new
 named session after the advance. Exec hosts need no migration rule: a host is keyed by the grant revision it activated
 under, so no host of the old revision serves a command of the new one.
+
+## Supervisor recovery
+
+A supervisor that ends without retiring — killed, crashed, its machine asleep through a reboot of the daemon — leaves
+its jobs' processes running and their records admitted but never sealed. Two things put that right:
+
+- **The group ledger.** A served supervisor keeps `<store>/run/<digest>.groups` beside its socket: the process group of
+  every running job and its leader's start time, replaced whole (write, rename) whenever a job's group starts or its job
+  is sealed, and naming the supervisor process that wrote it. When the manager sees a supervisor it watches end, and
+  when it finds on its own start a socket nothing answers, it ends the groups that supervisor's ledger names — TERM, two
+  seconds, KILL — and removes the ledger. A group whose leader is alive under another start time is a reused pid and is
+  left alone; a watcher acts only on a ledger the supervisor it watched wrote, never on one a newer supervisor of the
+  workspace has written since.
+- **Sealing.** The next supervisor of the workspace binds its socket first — holding it is what makes it the workspace's
+  one supervisor — ends whatever groups the ledger still names, and then seals every job of its incarnation that was
+  admitted and never sealed: a `failed` terminal record naming `failure: supervisorLost`, carrying the bytes the job
+  spilled to its protected files (sealed read-only as a finished job's are) and nothing of what was only in the lost
+  supervisor's memory, and a terminal commitment for it. Only then does it admit anything.
+
+**Draining a supervisor of another build.** The manager of a newly started daemon asks every supervisor it cannot talk
+to — one speaking another protocol version — to drain: it admits nothing more, lets its running jobs finish, and
+retires, and the next command for its workspace gets a supervisor of the new build. `drain` is the one request whose
+shape never changes across versions, so any later daemon can retire any earlier supervisor. A supervisor of the same
+protocol keeps serving across a daemon upgrade and retires on its own when idle.
 
 ## Teardown ordering
 

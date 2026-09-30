@@ -1689,6 +1689,10 @@ enum SupervisorHome {
     ThisProcess,
 }
 
+/// How long a lost supervisor's jobs get between TERM and KILL.
+#[cfg(target_os = "macos")]
+const LOST_JOB_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// How long a served supervisor stays with no named session and no running job before it
 /// retires; the next command starts another.
 #[cfg(target_os = "macos")]
@@ -4487,6 +4491,7 @@ impl NativeProjectRuntimeHost {
             // This process is the workspace's supervisor for as long as the workspace is in
             // use: a spare activated ahead of demand is the next command's warm shell.
             shell_pool: super::shell_pool::ShellPoolConfig::default(),
+            group_ledger: Some(super::job_groups::ledger_path(&socket)),
         };
         // A workspace has one supervisor, its one job allocator: when another controller
         // process already serves it under this authority, its commands go there.
@@ -4517,9 +4522,28 @@ impl NativeProjectRuntimeHost {
             Err(_) => {}
         }
         let authority = config.authority.clone();
+        // The socket first: holding it is what makes this the workspace's one supervisor, so
+        // what the last one left running is this one's to end and seal.
+        let listener = super::supervisor_socket::bind(&socket).await?;
+        let ledger = super::job_groups::ledger_path(&socket);
+        let ended = tokio::task::spawn_blocking(move || {
+            super::job_groups::end_recorded(&ledger, super::job_groups::Writer::Any, LOST_JOB_GRACE)
+        })
+        .await
+        .map_err(|error| CowshedError::internal(format!("ending lost jobs failed: {error}")))?
+        .map_err(|error| {
+            CowshedError::environment_missing(
+                format!("cannot end the jobs a lost supervisor left running: {error}"),
+                "cowshed doctor --json",
+            )
+        })?;
+        if !ended.is_empty() {
+            eprintln!(
+                "cowshed: ended the process groups of jobs {ended:?} of workspace {name}, left by a supervisor that ended without them"
+            );
+        }
         let actor =
             super::supervisor::WorkspaceSupervisor::start(config, self.commitments.clone())?;
-        let listener = super::supervisor_socket::bind(&socket).await?;
         let (advances, advance_requests) = tokio::sync::mpsc::channel(1);
         let server = tokio::spawn(super::supervisor_socket::serve(
             listener,

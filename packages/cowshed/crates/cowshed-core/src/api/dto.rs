@@ -2084,6 +2084,9 @@ impl<'de> Deserialize<'de> for ScriptCommand {
 pub enum JobFailure {
     /// The script did not parse; nothing ran.
     ScriptSyntax,
+    /// The supervisor running the job ended without seeing it end. Its process group was
+    /// killed and its terminal record sealed by whoever found the supervisor gone.
+    SupervisorLost,
 }
 
 #[derive(Debug)]

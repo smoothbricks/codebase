@@ -395,7 +395,7 @@ export interface JobInfoFields {
 }
 
 /** Why a job failed when no command's own status explains it. */
-export type JobFailure = 'scriptSyntax';
+export type JobFailure = 'scriptSyntax' | 'supervisorLost';
 
 /**
  * Affine inherited descriptor accepted by the controller handshake.

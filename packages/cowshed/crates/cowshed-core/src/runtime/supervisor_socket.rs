@@ -81,9 +81,13 @@ enum Request {
     /// with the authority served afterwards. Jobs already running keep the profile they
     /// started under.
     Advance,
+    /// Admit nothing more, let every running job finish, then retire; answered at once with
+    /// the serving pid. Its shape never changes across protocol versions: it is how a daemon
+    /// of a newer build retires a supervisor it cannot otherwise talk to.
+    Drain,
     Call {
         authority: AuthorityWire,
-        call: Call,
+        call: Box<Call>,
         /// Length of the raw frame that follows, if any.
         bytes: usize,
     },
@@ -147,7 +151,7 @@ enum Call {
     Exec {
         session: Option<SessionWire>,
         background: bool,
-        request: ExecWire,
+        request: Box<ExecWire>,
     },
     #[serde(rename_all = "camelCase")]
     StdinWrite {
@@ -438,19 +442,29 @@ pub async fn serve(
         let retired = Arc::clone(&retired);
         let advances = advances.clone();
         tokio::spawn(async move {
-            if let Ok(Retirement::Retired) =
-                serve_call(stream, &supervisor, &streams, advances.as_ref()).await
-            {
-                retired.notify_one();
+            match serve_call(stream, &supervisor, &streams, advances.as_ref()).await {
+                Ok(Retirement::Retired) => retired.notify_one(),
+                Ok(Retirement::Draining) => {
+                    // Under the authority it holds now, which an advance may have moved.
+                    let Ok(authority) = supervisor.current_authority().await else {
+                        return;
+                    };
+                    let current = supervisor.with_authority(authority);
+                    if current.quiesce().await.is_ok() && current.retire().await.is_ok() {
+                        retired.notify_one();
+                    }
+                }
+                Ok(Retirement::Serving) | Err(_) => {}
             }
         });
     }
 }
 
-/// Whether a call left the supervisor retired.
+/// Whether a call left the supervisor retired, or asked it to retire once its jobs end.
 enum Retirement {
     Serving,
     Retired,
+    Draining,
 }
 
 async fn serve_call(
@@ -471,6 +485,17 @@ async fn serve_call(
             })?;
             write_json(&mut stream, &Response::Ok { value, bytes: 0 }).await?;
             return Ok(Retirement::Serving);
+        }
+        Request::Drain => {
+            write_json(
+                &mut stream,
+                &Response::Ok {
+                    value: to_value(&std::process::id())?,
+                    bytes: 0,
+                },
+            )
+            .await?;
+            return Ok(Retirement::Draining);
         }
         Request::Advance => {
             let advanced = match advances {
@@ -510,8 +535,8 @@ async fn serve_call(
     };
     let payload = read_bytes(&mut stream, length).await?;
     let caller = supervisor.with_authority(authority.into());
-    let retiring = matches!(call, Call::Retire);
-    let (value, bytes) = match answer(&caller, streams, call, payload).await {
+    let retiring = matches!(*call, Call::Retire);
+    let (value, bytes) = match answer(&caller, streams, *call, payload).await {
         Ok(answer) => answer,
         Err(error) => {
             write_json(&mut stream, &Response::Err(error)).await?;
@@ -594,6 +619,7 @@ async fn answer(
             background,
             request,
         } => {
+            let request = *request;
             let command =
                 ExecCommand::from_fields(request.argv, request.script).map_err(|error| {
                     CowshedError::usage(error.to_string(), "provide a valid bounded command")
@@ -806,6 +832,13 @@ pub async fn hello(path: &Path) -> Result<Hello> {
     })
 }
 
+/// Ask the supervisor at `path` to admit nothing more and retire once its running jobs end,
+/// whatever protocol it speaks otherwise; the pid serving it.
+pub async fn drain(path: &Path) -> Result<u32> {
+    let (value, _) = exchange(path, &Request::Drain, Bytes::new()).await?;
+    decode(value)
+}
+
 /// Ask the supervisor at `path` to serve under its workspace's current grants; the authority
 /// it serves afterwards.
 pub async fn advance(path: &Path) -> Result<WorkspaceAuthoritySnapshot> {
@@ -834,7 +867,7 @@ async fn round_trip(
 ) -> Result<(serde_json::Value, Bytes)> {
     let request = Request::Call {
         authority,
-        call,
+        call: Box::new(call),
         bytes: payload.len(),
     };
     exchange(path, &request, payload).await
@@ -1082,7 +1115,7 @@ async fn forward_exec(
     let call_request = Call::Exec {
         session: session.as_ref().map(SessionWire::from),
         background,
-        request: ExecWire {
+        request: Box::new(ExecWire {
             argv,
             script,
             cwd: request.cwd,
@@ -1092,7 +1125,7 @@ async fn forward_exec(
             stdin,
             stdout_copy: request.stdout_copy,
             stderr_copy: request.stderr_copy,
-        },
+        }),
     };
     let admitted = call::<JobId>(path, &authority, call_request, payload).await;
     let job_id = admitted.as_ref().ok().copied();

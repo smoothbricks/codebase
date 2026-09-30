@@ -49,7 +49,10 @@ const RECORD_SEQUENCE_BYTES: usize = 24;
 const CHECKPOINT_BARRIER_FILE_PREFIX: &str = "records.barrier.";
 const CHECKPOINT_BARRIER_MAGIC: &[u8; 8] = b"CSBAR001";
 const CHECKPOINT_BARRIER_BYTES: usize = 24;
-const RECORD_SCHEMA_VERSION: u64 = 2;
+/// The layout every new record is written in: version 3 adds the nullable `failure` column.
+const RECORD_SCHEMA_VERSION: u64 = 3;
+/// The layout records written before version 3 keep; read, never written.
+const PREVIOUS_RECORD_SCHEMA_VERSION: u64 = 2;
 #[cfg(unix)]
 const SECURE_DIRECTORY_OPEN_FLAGS: libc::c_int =
     libc::O_DIRECTORY + libc::O_NOFOLLOW + libc::O_CLOEXEC;
@@ -232,11 +235,16 @@ pub struct JobArtifactRecord {
     pub output_limit: Option<OutputLimitInfo>,
     pub stdout: StreamInfo,
     pub stderr: StreamInfo,
+    /// Why a failed job failed when no status of its own says so.
+    pub failure: Option<crate::api::dto::JobFailure>,
 }
 
 impl JobArtifactRecord {
     pub fn validate(&self) -> Result<(), ArtifactError> {
         self.command.validate()?;
+        if self.failure.is_some() && self.state != JobState::Failed {
+            return Err(integrity(0, "only a failed job record names a failure"));
+        }
         if self.sequence == 0 {
             return Err(ArtifactError::Integrity {
                 offset: 0,
@@ -417,7 +425,10 @@ pub struct CheckpointManifestRecord {
 
 impl CheckpointManifestRecord {
     pub fn validate(&self) -> Result<(), ArtifactError> {
-        if self.version != RECORD_SCHEMA_VERSION as u16 || self.barrier_id == 0 {
+        let known = [RECORD_SCHEMA_VERSION, PREVIOUS_RECORD_SCHEMA_VERSION]
+            .iter()
+            .any(|version| u64::from(self.version) == *version);
+        if !known || self.barrier_id == 0 {
             return Err(ArtifactError::Integrity {
                 offset: 0,
                 message: "invalid checkpoint manifest version or barrier".into(),
@@ -689,6 +700,7 @@ impl ArtifactStore {
             output_limit: None,
             stdout: empty_stream(&targets.stdout)?,
             stderr: empty_stream(&targets.stderr)?,
+            failure: None,
         };
         self.append_record(admission)?;
         let replaced = self.live_jobs.insert(
@@ -712,6 +724,57 @@ impl ArtifactStore {
             job_id,
             namespace: self.token_namespace,
         })
+    }
+
+    /// Seal every job of this incarnation that was admitted and never sealed: the jobs of a
+    /// supervisor that ended without seeing them end. Only a supervisor starting where no other
+    /// serves may call this, after ending their process groups. Each gets a `failed` terminal
+    /// record naming `supervisorLost` and carrying whatever its protected spill files hold; an
+    /// output still only in the lost supervisor's memory is gone and recorded as empty.
+    pub fn seal_orphans(
+        &mut self,
+    ) -> Result<Vec<(JobArtifactRecord, Sha256Digest)>, ArtifactError> {
+        let admitted: BTreeMap<JobId, JobArtifactRecord> = self
+            .recovery
+            .frames
+            .iter()
+            .filter_map(|frame| match &frame.record {
+                ProtectedRecord::Job(record)
+                    if record.workspace_incarnation == self.workspace_incarnation
+                        && matches!(record.state, JobState::Queued | JobState::Running)
+                        && !self.committed_jobs.contains_key(&record.job_id)
+                        && !self.live_jobs.contains_key(&record.job_id) =>
+                {
+                    Some((record.job_id, record.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        let mut sealed = Vec::with_capacity(admitted.len());
+        for (job_id, admission) in admitted {
+            let stdout = orphan_stream(
+                &self.workspace_root,
+                job_id,
+                StreamKind::Stdout,
+                &admission.stdout,
+            )?;
+            let stderr = orphan_stream(
+                &self.workspace_root,
+                job_id,
+                StreamKind::Stderr,
+                &admission.stderr,
+            )?;
+            sealed.push(self.append_record(JobArtifactRecord {
+                sequence: 0,
+                state: JobState::Failed,
+                output_limit: None,
+                stdout,
+                stderr,
+                failure: Some(crate::api::dto::JobFailure::SupervisorLost),
+                ..admission
+            })?);
+        }
+        Ok(sealed)
     }
 
     fn append_record(
@@ -811,6 +874,67 @@ impl ArtifactStore {
     pub fn records_prefix_sha256(&self) -> Result<Sha256Digest, ArtifactError> {
         hash_file_incrementally(&records_path(&self.workspace_root))
     }
+}
+
+/// What an orphaned job's stream holds: its protected spill file if it spilled, else nothing
+/// (its bytes were in the lost supervisor's memory). The storage keeps the admitted form.
+fn orphan_stream(
+    workspace_root: &Path,
+    job_id: JobId,
+    stream: StreamKind,
+    admitted: &StreamInfo,
+) -> Result<StreamInfo, ArtifactError> {
+    let relative = protected_stream_path(job_id, stream);
+    let absolute = workspace_root.join(&relative);
+    let (artifact, bytes, sha256) = match fs::symlink_metadata(&absolute) {
+        Ok(metadata) if metadata.is_file() => {
+            // Sealed as the job's own end would have: read-only and synced, then hashed.
+            let file = OpenOptions::new()
+                .read(true)
+                .open(&absolute)
+                .map_err(|error| io_error(&absolute, error))?;
+            seal_file(file, &absolute)?;
+            (
+                ProtectedOutput::File {
+                    path: WorkspacePath::new(&relative)?,
+                },
+                metadata.len(),
+                hash_file_incrementally(&absolute)?,
+            )
+        }
+        Ok(_) => {
+            return Err(integrity(
+                0,
+                "an orphaned job's protected stream is not a regular file",
+            ));
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => (
+            ProtectedOutput::Inline {
+                data: BinaryData::new(Vec::new())?,
+            },
+            0,
+            Sha256Digest::compute(&[]),
+        ),
+        Err(error) => {
+            return Err(ArtifactError::Io {
+                path: absolute,
+                message: error.to_string(),
+            });
+        }
+    };
+    let storage = match &admitted.storage {
+        OutputStorage::Captured { .. } => OutputStorage::Captured { artifact },
+        OutputStorage::Redirect { source, .. } => OutputStorage::Redirect {
+            source: source.clone(),
+            artifact,
+        },
+    };
+    Ok(StreamInfo {
+        storage,
+        bytes,
+        sha256,
+        summary: safe_output_summary(),
+    })
 }
 
 fn empty_stream(target: &StreamTarget) -> Result<StreamInfo, ArtifactError> {
@@ -1151,6 +1275,7 @@ impl ArtifactStore {
                 output_limit: output_limit.clone(),
                 stdout,
                 stderr,
+                failure: None,
             };
             let (record, terminal_batch_sha256) = self.append_record(record)?;
             Ok(SealedJobArtifacts {
@@ -2921,7 +3046,47 @@ fn build_protected_record_schema() -> Arc<Schema> {
             DataType::List(Arc::new(field("item", DataType::Binary, false))),
             true,
         ),
+        field("failure", DataType::Utf8, true),
     ]))
+}
+
+/// The layout of version-2 records: version 3 without the trailing `failure` column.
+fn previous_protected_record_schema() -> Arc<Schema> {
+    static SCHEMA: LazyLock<Arc<Schema>> = LazyLock::new(|| {
+        let current = protected_record_schema();
+        let fields = current.fields();
+        Arc::new(Schema::new(fields[..fields.len() - 1].to_vec()))
+    });
+    Arc::clone(&SCHEMA)
+}
+
+/// The record version a batch's layout belongs to.
+fn batch_layout_version(batch: &RecordBatch) -> Option<u64> {
+    let schema = batch.schema();
+    if schema == protected_record_schema() {
+        Some(RECORD_SCHEMA_VERSION)
+    } else if schema == previous_protected_record_schema() {
+        Some(PREVIOUS_RECORD_SCHEMA_VERSION)
+    } else {
+        None
+    }
+}
+
+fn failure_name(failure: crate::api::dto::JobFailure) -> &'static str {
+    match failure {
+        crate::api::dto::JobFailure::ScriptSyntax => "scriptSyntax",
+        crate::api::dto::JobFailure::SupervisorLost => "supervisorLost",
+    }
+}
+
+fn parse_failure(name: &str) -> Result<crate::api::dto::JobFailure, ArtifactError> {
+    match name {
+        "scriptSyntax" => Ok(crate::api::dto::JobFailure::ScriptSyntax),
+        "supervisorLost" => Ok(crate::api::dto::JobFailure::SupervisorLost),
+        other => Err(ArtifactError::Arrow(format!(
+            "unknown job failure {other:?}"
+        ))),
+    }
 }
 
 fn field(name: &str, data_type: DataType, nullable: bool) -> Field {
@@ -3099,6 +3264,7 @@ fn job_record_to_batch(record: &JobArtifactRecord) -> Result<RecordBatch, Artifa
                 .map(|limit| limit.crossing_bytes),
         ])),
         Arc::new(command_argv_array(&record.command)?),
+        Arc::new(StringArray::from(vec![record.failure.map(failure_name)])),
     ];
     RecordBatch::try_new(protected_record_schema(), columns)
         .map_err(|error| ArtifactError::Arrow(error.to_string()))
@@ -3114,9 +3280,9 @@ fn batch_to_job_record(batch: &RecordBatch) -> Result<JobArtifactRecord, Artifac
         return Err(ArtifactError::Arrow("protected record is not a job".into()));
     }
     let version = uint64(batch, 1)?.value(0);
-    if version != RECORD_SCHEMA_VERSION {
+    if Some(version) != batch_layout_version(batch) {
         return Err(ArtifactError::Arrow(format!(
-            "unsupported job record version {version}"
+            "unsupported job record version {version} for its layout"
         )));
     }
     require_job_columns(batch, 0)?;
@@ -3143,6 +3309,11 @@ fn batch_to_job_record(batch: &RecordBatch) -> Result<JobArtifactRecord, Artifac
         }
     };
     let command = decode_command(batch, 32)?;
+    let failure = if version == RECORD_SCHEMA_VERSION && !batch.column(33).is_null(0) {
+        Some(parse_failure(string(batch, 33)?.value(0))?)
+    } else {
+        None
+    };
     Ok(JobArtifactRecord {
         repo_id,
         workspace_incarnation,
@@ -3154,6 +3325,7 @@ fn batch_to_job_record(batch: &RecordBatch) -> Result<JobArtifactRecord, Artifac
         output_limit,
         stdout,
         stderr,
+        failure,
     })
 }
 
@@ -3281,6 +3453,7 @@ fn checkpoint_manifest_to_batch(
     columns.push(new_null_array(schema.field(30).data_type(), 1));
     columns.push(new_null_array(schema.field(31).data_type(), 1));
     columns.push(new_null_array(schema.field(32).data_type(), 1));
+    columns.push(new_null_array(schema.field(33).data_type(), 1));
     RecordBatch::try_new(schema, columns).map_err(|error| ArtifactError::Arrow(error.to_string()))
 }
 
@@ -3293,9 +3466,9 @@ fn protected_record_to_batch(record: &ProtectedRecord) -> Result<RecordBatch, Ar
 }
 
 fn batch_to_protected_record(batch: &RecordBatch) -> Result<ProtectedRecord, ArtifactError> {
-    if batch.num_rows() != 1 || batch.schema() != protected_record_schema() {
+    if batch.num_rows() != 1 || batch_layout_version(batch).is_none() {
         return Err(ArtifactError::Arrow(
-            "protected batch must contain one row with the canonical schema".into(),
+            "protected batch must contain one row with a canonical schema".into(),
         ));
     }
     match string(batch, 0)?.value(0) {
@@ -4180,6 +4353,54 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_version_2_record_reads_with_no_failure_and_version_3_keeps_it() {
+        // A workspace's records.arrow outlives the cowshed that wrote it: version-2 batches,
+        // without the failure column, read as they always did.
+        let record = valid_job_record(4);
+        let current = job_record_to_batch(&record).unwrap();
+        let previous = RecordBatch::try_new(
+            previous_protected_record_schema(),
+            current.columns()[..current.num_columns() - 1]
+                .iter()
+                .enumerate()
+                .map(|(index, column)| {
+                    if index == 1 {
+                        Arc::new(UInt64Array::from(vec![PREVIOUS_RECORD_SCHEMA_VERSION]))
+                            as ArrayRef
+                    } else {
+                        Arc::clone(column)
+                    }
+                })
+                .collect(),
+        )
+        .unwrap();
+        let ProtectedRecord::Job(read) = batch_to_protected_record(&previous).unwrap() else {
+            panic!("a job record");
+        };
+        assert_eq!(read, record);
+
+        let lost = JobArtifactRecord {
+            state: JobState::Failed,
+            failure: Some(crate::api::dto::JobFailure::SupervisorLost),
+            ..valid_job_record(5)
+        };
+        let ProtectedRecord::Job(read) =
+            batch_to_protected_record(&job_record_to_batch(&lost).unwrap()).unwrap()
+        else {
+            panic!("a job record");
+        };
+        assert_eq!(read.failure, lost.failure);
+
+        // A version-2 layout claiming version 3 is neither.
+        let mislabeled = RecordBatch::try_new(
+            previous_protected_record_schema(),
+            current.columns()[..current.num_columns() - 1].to_vec(),
+        )
+        .unwrap();
+        assert!(batch_to_protected_record(&mislabeled).is_err());
+    }
+
     fn valid_job_record(job_id: u64) -> JobArtifactRecord {
         JobArtifactRecord {
             repo_id: repo(),
@@ -4192,6 +4413,7 @@ mod tests {
             output_limit: None,
             stdout: inline_stream(b""),
             stderr: inline_stream(b""),
+            failure: None,
         }
     }
 

@@ -1441,3 +1441,50 @@ proptest! {
         prop_assert!(encoded.len() <= bytes.len().saturating_mul(2).saturating_add(64));
     }
 }
+
+#[test]
+fn jobs_a_lost_supervisor_admitted_are_sealed_failed_once_with_what_they_spilled() {
+    let root = TempRoot::new("orphans");
+    let config = ArtifactConfig {
+        inline_cap_bytes: 4,
+        ..ArtifactConfig::default()
+    };
+    let mut lost = store(root.path(), config.clone());
+    let finished = begin(&mut lost, 3, OutputTargets::default());
+    lost.finish(finished, JobState::Exited).unwrap();
+    let orphan = begin(&mut lost, 3, OutputTargets::default());
+    lost.append(&orphan, StreamKind::Stdout, b"spilled bytes")
+        .unwrap();
+    // The supervisor dies here: no finish, no abort.
+    drop(lost);
+
+    let mut next = store(root.path(), config.clone());
+    let sealed = next.seal_orphans().unwrap();
+    assert_eq!(sealed.len(), 1, "only the unsealed job is an orphan");
+    let (record, _) = &sealed[0];
+    assert_eq!(record.job_id, orphan.job_id());
+    assert_eq!(record.state, JobState::Failed);
+    assert_eq!(
+        record.failure,
+        Some(cowshed_core::api::JobFailure::SupervisorLost)
+    );
+    assert_eq!(record.grant_revision, 3);
+    assert_eq!(
+        read_stream(root.path(), &record.stdout).unwrap(),
+        b"spilled bytes",
+        "what the job spilled before the loss is its sealed stdout"
+    );
+    assert_eq!(record.stderr.bytes, 0);
+    drop(next);
+
+    let mut after = store(root.path(), config);
+    assert!(after.seal_orphans().unwrap().is_empty(), "sealed once");
+    let recovered = recover_records(&root.path().join(".cowshed/job/records.arrow")).unwrap();
+    assert!(recovered.frames.iter().any(|frame| matches!(
+        &frame.record,
+        ProtectedRecord::Job(job)
+            if job.job_id == orphan.job_id()
+                && job.failure == Some(cowshed_core::api::JobFailure::SupervisorLost)
+    )));
+    assert_eq!(after.next_job_id().unwrap().get(), 3);
+}

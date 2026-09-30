@@ -82,6 +82,9 @@ pub struct WorkspaceSupervisorConfig {
     /// (it never called [`super::shell_host::dispatch`]) is left with.
     pub shell_host: Option<super::shell_host::ShellHostProgram>,
     pub shell_pool: super::shell_pool::ShellPoolConfig,
+    /// Where the supervisor keeps the process groups of its running jobs for whoever finds it
+    /// gone ([`super::job_groups`]); `None` keeps no ledger.
+    pub group_ledger: Option<PathBuf>,
 }
 
 impl WorkspaceSupervisorConfig {
@@ -153,6 +156,7 @@ impl Default for WorkspaceSupervisorConfig {
             credential_env_names: BTreeSet::new(),
             shell_host: None,
             shell_pool: super::shell_pool::ShellPoolConfig::default(),
+            group_ledger: None,
         }
     }
 }
@@ -2127,12 +2131,39 @@ impl WorkspaceSupervisor {
         commitments: CommitmentPublisherHandle,
     ) -> Result<WorkspaceSupervisorHandle> {
         config.validate()?;
-        let artifacts = ArtifactStoreSink::open(
+        let mut artifacts = ArtifactStoreSink::open(
             config.workspace_root.clone(),
             &config.owned_repo_ids,
             &config.authority,
             config.artifacts.clone(),
         )?;
+        // This supervisor starts where no other serves, and its starter ended the process
+        // groups of whatever the last one still ran: those jobs are lost, and sealed as such
+        // before any new one is admitted.
+        let orphans = artifacts.store.seal_orphans().map_err(map_artifact_error)?;
+        if !orphans.is_empty() {
+            let mut publisher = commitments.clone();
+            let authority = config.authority.clone();
+            tokio::spawn(async move {
+                for (record, batch_sha256) in orphans {
+                    let _ = publisher
+                        .record(CommitmentDraft::Terminal {
+                            repo_id: authority.repo_id.clone(),
+                            workspace_incarnation: record.workspace_incarnation,
+                            job_id: record.job_id,
+                            state: record.state,
+                            grant_revision: record.grant_revision,
+                            stdout_bytes: record.stdout.bytes,
+                            stdout_sha256: record.stdout.sha256,
+                            stderr_bytes: record.stderr.bytes,
+                            stderr_sha256: record.stderr.sha256,
+                            batch_sha256,
+                            output_limit: None,
+                        })
+                        .await;
+                }
+            });
+        }
         let spawner = match config.shell_host.clone() {
             Some(program) => SystemSpawnSink::with_shell_host(program, config.shell_pool),
             None => SystemSpawnSink::default(),
@@ -2165,6 +2196,7 @@ impl WorkspaceSupervisor {
             default_cwd: config.default_cwd,
             sandbox: config.sandbox,
             credential_env_names: config.credential_env_names,
+            group_ledger: config.group_ledger,
             term_grace: config.term_grace,
             next_job_id,
             next_session_id: 1,
@@ -2377,6 +2409,7 @@ impl JobStateRecord {
 
 struct SupervisorActor {
     authority: WorkspaceAuthoritySnapshot,
+    group_ledger: Option<PathBuf>,
     workspace_root: PathBuf,
     default_cwd: Option<WorkspacePath>,
     sandbox: SandboxConfig,
@@ -2611,6 +2644,27 @@ impl SupervisorActor {
                     && self.jobs.values().all(JobStateRecord::terminal);
                 let _ = reply.send(Ok(idle));
             }
+        }
+    }
+
+    /// Replace the group ledger with the groups of the jobs still running.
+    fn record_groups(&self) {
+        let Some(path) = &self.group_ledger else {
+            return;
+        };
+        let groups: Vec<(u64, u32)> = self
+            .jobs
+            .iter()
+            .filter(|(_, job)| !job.terminal_committed)
+            .filter_map(|(job_id, job)| Some((job_id.get(), job.info.pid?)))
+            .collect();
+        if let Err(error) = super::job_groups::record(path, &groups) {
+            // The jobs run either way; what is lost is only the means to end them should
+            // this supervisor die, which is worth saying where the daemon log shows it.
+            eprintln!(
+                "cowshed: cannot record the job process groups at {}: {error}",
+                path.display()
+            );
         }
     }
 
@@ -3021,6 +3075,7 @@ impl SupervisorActor {
             Ok(process) => {
                 job.info.pid = process.pid();
                 job.process = Some(process);
+                let started = job.info.pid.is_some();
                 if background
                     && let Some(identity) = session_identity
                     && let Some(session) = self.sessions.get_mut(&identity)
@@ -3028,6 +3083,9 @@ impl SupervisorActor {
                     session.background_jobs.insert(job_id);
                 }
                 self.jobs.insert(job_id, job);
+                if started {
+                    self.record_groups();
+                }
                 launch_stdin_pump(
                     job_id,
                     stdin,
@@ -3322,6 +3380,7 @@ impl SupervisorActor {
             ProcessEvent::Started { job_id, pid } => {
                 if let Some(job) = self.jobs.get_mut(&job_id) {
                     job.info.pid = Some(pid);
+                    self.record_groups();
                 }
             }
             ProcessEvent::LaunchFailed { job_id, error } => {
@@ -3563,6 +3622,7 @@ impl SupervisorActor {
         }
         job.terminal_committed = true;
         job.info.state = state;
+        let ledger_changed = job.info.pid.is_some();
         job.info.duration_ms = Some(
             job.started_at
                 .elapsed()
@@ -3597,6 +3657,9 @@ impl SupervisorActor {
         // waiters so a follower that is mid-stream is served from the live deque first.
         job.stdout = VecDeque::new();
         job.stderr = VecDeque::new();
+        if ledger_changed {
+            self.record_groups();
+        }
     }
 
     fn finish_lifecycle_waiters(&mut self) {
@@ -4568,6 +4631,7 @@ mod lifecycle_commitment_tests {
             credential_env_names: defaults.credential_env_names,
             shell_host: None,
             shell_pool: defaults.shell_pool,
+            group_ledger: None,
         };
         // `list()`/`info()` answer from the actor's resident job set, which is this supervisor's
         // own lifetime and deliberately not the durable history: the artifact store holds every

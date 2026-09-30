@@ -136,7 +136,10 @@ pub enum ScriptValue {
     Word(String),                        // one word, or one piece of a word
     Words(Vec<String>),                  // one word per element as a whole bare word; else joined by spaces
 }
-pub enum JobFailure { ScriptSyntax }     // the script did not parse; nothing ran
+pub enum JobFailure {
+    ScriptSyntax,                        // the script did not parse; nothing ran
+    SupervisorLost,                      // its supervisor ended without seeing it end (11_shell.md)
+}
 
 pub struct OutputPublication {
     pub path: WorkspacePath,             // writable caller-visible destination, never artifact authority
@@ -607,14 +610,15 @@ reuse those DTOs. Serde uses `camelCase`, documented enum strings, and omission 
   `JobInfo = { repoId, workspaceIncarnation, jobId, state, pid?, grantRevision, argv | script, failure?, cwd, started, durationMs?, exit?, stdout, stderr, trace, outputLimit?, stdin }`.
   The command is flattened: exactly one of `argv` and `script` is present, and an `ExecRequest` carries the same field.
   `script = { parts: string[], values: ({word:string} | {words:string[]})[] }` obeys the `ScriptCommand` bounds above.
-  `failure` is present only as `"scriptSyntax"`, on a `failed` job whose script did not parse (exit
-  `{kind:"exited",code:2}`, diagnostic on stderr). Protected Arrow stores a script in the `argv` column as the two
-  arguments `\0script` and the script's JSON, a pair no argv can produce. Every element of `argv` is the exact tagged
-  `CommandArg` object `{encoding:"utf8",data:String} | {encoding:"base64",data:String}`. Serialization selects `utf8` if
-  and only if the Unix argument bytes are valid UTF-8; otherwise it emits canonical standard base64. Decoders deny
-  unknown fields and encodings and reject malformed or non-canonical base64, base64 used for valid UTF-8, decoded NUL,
-  arguments above 128 KiB, total argv above 1 MiB, an empty vector or `argv[0]`, and a byte representation the host
-  platform cannot reproduce exactly. Validation happens before RPC dispatch, process allocation/spawn, and
+  `failure` is present only on a `failed` job: `"scriptSyntax"` when its script did not parse (exit
+  `{kind:"exited",code:2}`, diagnostic on stderr), and `"supervisorLost"` in the terminal record the next supervisor
+  seals for a job its lost predecessor never saw end (11_shell.md). Protected Arrow stores a script in the `argv` column
+  as the two arguments `\0script` and the script's JSON, a pair no argv can produce. Every element of `argv` is the
+  exact tagged `CommandArg` object `{encoding:"utf8",data:String} | {encoding:"base64",data:String}`. Serialization
+  selects `utf8` if and only if the Unix argument bytes are valid UTF-8; otherwise it emits canonical standard base64.
+  Decoders deny unknown fields and encodings and reject malformed or non-canonical base64, base64 used for valid UTF-8,
+  decoded NUL, arguments above 128 KiB, total argv above 1 MiB, an empty vector or `argv[0]`, and a byte representation
+  the host platform cannot reproduce exactly. Validation happens before RPC dispatch, process allocation/spawn, and
   protected-artifact effects. Protected Arrow stores `argv` as a required `List<Binary>` and recovery revalidates each
   raw argument and both bounds. `started` is a full RFC3339 string: `Z` and numeric offsets are accepted. A `:60` value
   is normalized to UTC and accepted only when it denotes a published IERS leap instant (for example
@@ -821,7 +825,7 @@ export interface ScriptCommand {
   values: ScriptValue[];
 }
 export type JobCommand = { argv: CommandArg[]; script?: never } | { script: ScriptCommand; argv?: never };
-export type JobFailure = 'scriptSyntax';
+export type JobFailure = 'scriptSyntax' | 'supervisorLost';
 
 export type JobInfo = JobCommand & {
   repoId: string;

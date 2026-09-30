@@ -161,13 +161,34 @@ impl SupervisorManager {
             }
             match supervisor_socket::hello(&path).await {
                 Ok(hello) => watch_pid(hello.pid, path),
-                // A socket nothing answers is what a supervisor that died leaves; the next
-                // supervisor for that workspace replaces it.
-                Err(error) => eprintln!(
-                    "cowshed: workspace supervisor socket {} does not answer: {}",
-                    path.display(),
-                    error.message
-                ),
+                // A supervisor of another cowshed build: let it finish its jobs and retire, so
+                // the next command for its workspace gets one of this build.
+                Err(error) if error.code == ErrorCode::Conflict => {
+                    match supervisor_socket::drain(&path).await {
+                        Ok(pid) => {
+                            eprintln!(
+                                "cowshed: draining workspace supervisor {} (pid {pid}) of another cowshed build",
+                                path.display()
+                            );
+                            watch_pid(pid, path);
+                        }
+                        Err(error) => eprintln!(
+                            "cowshed: cannot drain workspace supervisor {}: {}",
+                            path.display(),
+                            error.message
+                        ),
+                    }
+                }
+                // A socket nothing answers is what a supervisor that died leaves: end the jobs
+                // it left running now; the next supervisor for the workspace seals them.
+                Err(error) => {
+                    eprintln!(
+                        "cowshed: workspace supervisor socket {} does not answer: {}",
+                        path.display(),
+                        error.message
+                    );
+                    end_lost_jobs(path, super::job_groups::Writer::Any).await;
+                }
             }
         }
     }
@@ -288,8 +309,14 @@ fn serving(
     ))
 }
 
-/// Report a started supervisor's end.
+/// How long a lost supervisor's jobs get between TERM and KILL.
+const LOST_JOB_GRACE: Duration = Duration::from_secs(2);
+
+/// When a started supervisor ends: report how, and end any job it left running.
 fn watch_child(mut child: tokio::process::Child, socket: PathBuf) {
+    let Some(pid) = child.id() else {
+        return;
+    };
     tokio::spawn(async move {
         match child.wait().await {
             Ok(status) if status.success() => {}
@@ -302,19 +329,49 @@ fn watch_child(mut child: tokio::process::Child, socket: PathBuf) {
                 socket.display()
             ),
         }
+        end_lost_jobs(socket, super::job_groups::Writer::Process(pid)).await;
     });
 }
 
-/// Report the end of a supervisor this manager did not start, which it cannot `wait` for.
+/// When a supervisor this manager did not start, and cannot `wait` for, ends: end any job it
+/// left running.
 fn watch_pid(pid: u32, socket: PathBuf) {
-    tokio::task::spawn_blocking(move || {
-        if let Err(error) = wait_for_exit(pid) {
-            eprintln!(
+    tokio::spawn(async move {
+        let watched = tokio::task::spawn_blocking(move || wait_for_exit(pid)).await;
+        match watched {
+            Ok(Ok(())) => end_lost_jobs(socket, super::job_groups::Writer::Process(pid)).await,
+            Ok(Err(error)) => eprintln!(
                 "cowshed: cannot watch workspace supervisor {} (pid {pid}): {error}",
                 socket.display()
-            );
+            ),
+            Err(error) => eprintln!(
+                "cowshed: watching workspace supervisor {} failed: {error}",
+                socket.display()
+            ),
         }
     });
+}
+
+/// End the process groups a supervisor that is gone left running. A supervisor that retired
+/// in order left none; the next supervisor of the workspace seals the jobs this ends.
+async fn end_lost_jobs(socket: PathBuf, writer: super::job_groups::Writer) {
+    let ledger = super::job_groups::ledger_path(&socket);
+    let ended = tokio::task::spawn_blocking(move || {
+        super::job_groups::end_recorded(&ledger, writer, LOST_JOB_GRACE)
+    })
+    .await;
+    match ended {
+        Ok(Ok(jobs)) if jobs.is_empty() => {}
+        Ok(Ok(jobs)) => eprintln!(
+            "cowshed: ended jobs {jobs:?}, left running by workspace supervisor {}",
+            socket.display()
+        ),
+        Ok(Err(error)) => eprintln!(
+            "cowshed: cannot end the jobs workspace supervisor {} left running: {error}",
+            socket.display()
+        ),
+        Err(error) => eprintln!("cowshed: ending lost jobs failed: {error}"),
+    }
 }
 
 /// Block until `pid`, which is not this process's child, exits.

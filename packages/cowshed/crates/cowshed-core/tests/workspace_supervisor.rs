@@ -376,6 +376,7 @@ fn config() -> WorkspaceSupervisorConfig {
         credential_env_names: std::collections::BTreeSet::new(),
         shell_host: None,
         shell_pool: Default::default(),
+        group_ledger: None,
     }
 }
 
@@ -1927,5 +1928,60 @@ async fn the_manager_moves_a_running_supervisor_to_a_newer_grant_revision() {
     remote
         .exec(None, request(StdinSource::Empty))
         .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn a_drained_supervisor_finishes_its_jobs_admits_none_and_stops_serving() {
+    use cowshed_core::runtime::supervisor_socket;
+    let mut h = harness(1, 1024, false, false);
+    let path = PathBuf::from("/tmp").join(format!(
+        "cowshed-sock-{}/s",
+        &uuid::Uuid::new_v4().simple().to_string()[..12]
+    ));
+    let listener = supervisor_socket::bind(&path).await.unwrap();
+    let server = tokio::spawn(supervisor_socket::serve(listener, h.handle.clone(), None));
+    let remote = supervisor_socket::connect(path.clone(), authority());
+    let job = remote
+        .exec(None, request(StdinSource::Empty))
+        .await
+        .unwrap();
+    let spawned = h.spawned.recv().await.unwrap();
+
+    assert_eq!(
+        supervisor_socket::drain(&path).await.unwrap(),
+        std::process::id(),
+        "drain answers at once with the serving pid"
+    );
+    let refused = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match remote.exec(None, request(StdinSource::Empty)).await {
+                Err(error) => return error,
+                // Admitted before the drain reached the actor: let it end and try again.
+                Ok(admitted) => {
+                    let spawned = h.spawned.recv().await.unwrap();
+                    complete(&spawned, b"", b"", ExitStatus::Exited { code: 0 }).await;
+                    remote.wait(admitted).await.unwrap();
+                }
+            }
+        }
+    })
+    .await
+    .expect("a draining supervisor refuses new work");
+    assert_eq!(refused.code, ErrorCode::Conflict);
+    assert!(!server.is_finished(), "the running job holds it serving");
+
+    // A wait already in flight is answered even as the supervisor stops serving.
+    let waiting = {
+        let remote = remote.clone();
+        tokio::spawn(async move { remote.wait(job).await })
+    };
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    complete(&spawned, b"done", b"", ExitStatus::Exited { code: 0 }).await;
+    assert_eq!(waiting.await.unwrap().unwrap().state, JobState::Exited);
+    tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .expect("it stops serving once its jobs ended")
+        .unwrap()
         .unwrap();
 }
