@@ -124,6 +124,13 @@ Shape:
 
 ### Trusted supervisor and child profiles
 
+Both profiles compile from one sandbox configuration per workspace, built by one function,
+`cowshed_core::sandbox::workspace_sandbox`, from the workspace's effective grants (its own and the project's), its
+mount, and the project, telemetry and host-mount roots. The function is public so an embedder inspects exactly the
+policy its children run under: a containment check that joins it (an embedder's test that its children cannot reach the
+embedder's own sockets is one) sees any socket, deny or grant cowshed admits later, where a hand-built copy would pass
+unseen.
+
 The revision-bound profile above is the **supervisor profile**. It grants the trusted supervisor write access to
 `<workspace mount>/.cowshed/job/**` so the supervisor can allocate job IDs, capture streams, and write protected job
 records and lazy spill files. That authority must never reach repository-controlled code. Before any anonymous shell,

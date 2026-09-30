@@ -388,6 +388,79 @@ impl SandboxConfig {
     }
 }
 
+/// One workspace as its sandbox sees it: the inputs of [`workspace_sandbox`].
+pub struct WorkspaceSandbox<'a> {
+    /// The host HOME; the sandbox HOME and the shared tool homes derive from it.
+    pub home: &'a Path,
+    /// The project's host mount root, which holds every workspace mount.
+    pub mount_root: &'a Path,
+    /// The project root, which no workspace process may read.
+    pub project_root: &'a Path,
+    /// The telemetry root, which no workspace process may read.
+    pub telemetry_root: &'a Path,
+    /// The workspace's effective grants: its own and the project's.
+    pub grants: &'a crate::metadata::GrantSet,
+    /// The `.git` of main's mount, for a git-worktree workspace only.
+    pub git_worktree_repository: Option<PathBuf>,
+    pub workspace_mount: PathBuf,
+}
+
+/// The sandbox a workspace's supervisor runs in and hands `plan_exec` for every child it
+/// executes — the one builder, so the policy a caller inspects is the policy that runs. A deny,
+/// socket or grant field added anywhere else would be a silent sandbox-policy fork.
+pub fn workspace_sandbox(workspace: WorkspaceSandbox<'_>) -> crate::Result<SandboxConfig> {
+    use crate::CowshedError;
+    let WorkspaceSandbox {
+        home,
+        mount_root,
+        project_root,
+        telemetry_root,
+        grants,
+        git_worktree_repository,
+        workspace_mount: mount,
+    } = workspace;
+    Ok(SandboxConfig {
+        home: home.to_path_buf(),
+        mount_root: mount_root.to_path_buf(),
+        // TMPDIR on the shed: copy-on-write with the clone, reclaimed with it, and inside the
+        // one tree the child profile grants writes to - no carve-back against the store.
+        exec_temp_dir: mount.join(".cowshed/tmp"),
+        shed_links: shed_links(&mount).map_err(|error| {
+            CowshedError::integrity(
+                format!("cannot read the shed beside {}: {error}", mount.display()),
+                "cowshed doctor --json",
+            )
+        })?,
+        workspace_mount: mount,
+        port_block: grants.port_block.ok_or_else(|| {
+            CowshedError::integrity("workspace has no port block", "cowshed doctor --json")
+        })?,
+        mode: RunSandboxMode::ReadWrite,
+        grants: SandboxGrants {
+            read: grants.read.clone(),
+            write: grants.write.clone(),
+            egress: grants
+                .egress
+                .iter()
+                .map(|rule| EgressGrant {
+                    host: rule.host.clone(),
+                    ports: rule.ports.clone(),
+                })
+                .collect(),
+        },
+        // The supervisor is the trusted tier of the same workspace; it gets the same daemon reach
+        // as the children it launches, or an in-workspace evaluation would depend on which tier ran
+        // it. The sccache server socket rides along for the same reason.
+        allowed_unix_sockets: nix_daemon_socket()
+            .into_iter()
+            .chain([sccache_server_socket()])
+            .collect(),
+        additional_denies: vec![project_root.to_path_buf(), telemetry_root.to_path_buf()],
+        git_worktree_repository,
+        shared_tool_homes: shared_tool_homes(home, Path::new(CACHES_ROOT)),
+    })
+}
+
 /// Read-only jobs keep writable process state within the existing exec-temp carve-back.
 pub fn sandbox_runtime_dir(sandbox: &SandboxConfig) -> PathBuf {
     match sandbox.mode {

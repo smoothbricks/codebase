@@ -10925,51 +10925,14 @@ fn supervisor_sandbox(
     mount: PathBuf,
     main_mount: PathBuf,
 ) -> Result<crate::sandbox::SandboxConfig> {
-    Ok(crate::sandbox::SandboxConfig {
-        home: home.to_path_buf(),
-        mount_root: layout.project().host_mount_root.clone(),
-        // TMPDIR on the shed: copy-on-write with the clone, reclaimed with it, and inside the
-        // one tree the child profile grants writes to - no carve-back against the store.
-        exec_temp_dir: mount.join(".cowshed/tmp"),
-        shed_links: crate::sandbox::shed_links(&mount).map_err(|error| {
-            CowshedError::integrity(
-                format!("cannot read the shed beside {}: {error}", mount.display()),
-                "cowshed doctor --json",
-            )
-        })?,
-        workspace_mount: mount,
-        port_block: grants.port_block.ok_or_else(|| {
-            CowshedError::integrity("workspace has no port block", "cowshed doctor --json")
-        })?,
-        mode: crate::sandbox::RunSandboxMode::ReadWrite,
-        grants: crate::sandbox::SandboxGrants {
-            read: grants.read.clone(),
-            write: grants.write.clone(),
-            egress: grants
-                .egress
-                .iter()
-                .map(|rule| crate::sandbox::EgressGrant {
-                    host: rule.host.clone(),
-                    ports: rule.ports.clone(),
-                })
-                .collect(),
-        },
-        // The supervisor is the trusted tier of the same workspace; it gets the same daemon reach
-        // as the children it launches, or an in-workspace evaluation would depend on which tier ran
-        // it. The sccache server socket rides along for the same reason.
-        allowed_unix_sockets: crate::sandbox::nix_daemon_socket()
-            .into_iter()
-            .chain([crate::sandbox::sccache_server_socket()])
-            .collect(),
-        additional_denies: vec![
-            layout.project().project_root.clone(),
-            telemetry_root.to_path_buf(),
-        ],
+    crate::sandbox::workspace_sandbox(crate::sandbox::WorkspaceSandbox {
+        home,
+        mount_root: &layout.project().host_mount_root,
+        project_root: &layout.project().project_root,
+        telemetry_root,
+        grants,
         git_worktree_repository: git_worktree_repository(&current.metadata, main_mount),
-        shared_tool_homes: crate::sandbox::shared_tool_homes(
-            home,
-            Path::new(crate::storage::bootstrap::CACHES_ROOT),
-        ),
+        workspace_mount: mount,
     })
 }
 
