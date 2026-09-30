@@ -835,6 +835,11 @@ where
         &self.host
     }
 
+    /// The host, for work that outlives the call that started it.
+    pub fn shared_host(&self) -> Arc<H> {
+        Arc::clone(&self.host)
+    }
+
     /// Detach main and atomically restore the exact checkout retained by adoption.
     pub async fn restore_adopted_checkout(
         &self,
@@ -2460,22 +2465,20 @@ fn prepare_clone_stage<H: ApfsExecutionHost>(
     // reclaiming a possibly mounted backing image would trade a diagnosable retry for data loss.
     let attachment =
         host.attach_and_mount_resumable(&canonical_image, format, &canonical_mount, &workspace)?;
-    let prepared = timed_apfs_step("canonical", "rename", || {
-        host.rename_volume(
+    // The clone keeps its source's volume label here. Relabelling goes through Disk Arbitration,
+    // which serializes every client on the host — 10–28 s behind a busy fleet, right where a
+    // workspace is being provisioned — and the label is human-facing only, so the workspace's
+    // supervisor relabels it once the clone is in use (`relabel_off_the_path` in the runtime).
+    let prepared = timed_apfs_step("canonical", "creds", || {
+        host.mint_workspace_credentials(
+            &workspace,
+            &canonical_image,
             &canonical_mount,
-            &volume_label(workspace.repo(), workspace.name()),
+            &canonical_mount,
+            &canonical_companion,
         )
     })
     .and_then(|()| {
-        timed_apfs_step("canonical", "creds", || {
-            host.mint_workspace_credentials(
-                &workspace,
-                &canonical_image,
-                &canonical_mount,
-                &canonical_mount,
-                &canonical_companion,
-            )
-        })?;
         timed_apfs_step("canonical", "marker", || {
             host.write_marker(
                 &canonical_mount,
@@ -2483,7 +2486,9 @@ fn prepare_clone_stage<H: ApfsExecutionHost>(
                 fork.then_some(source.name()),
                 &identity,
             )
-        })?;
+        })
+    })
+    .and_then(|()| {
         timed_apfs_step("canonical", "validate", || {
             host.validate_marker(
                 &canonical_mount,
@@ -3345,7 +3350,9 @@ pub fn volume_key(repo: &RepoId, workspace: &WorkspaceName) -> String {
 ///
 /// An identity change still relabels every volume — but because the label is not an authority, a
 /// relabel interrupted partway leaves nothing but a cosmetic disagreement, which is why recovery
-/// does not have to redo it. Uniform across main and sessions: every volume names its workspace.
+/// does not have to redo it. Uniform across main and sessions: every volume names its workspace,
+/// a fresh clone from the moment its supervisor first serves rather than from its publication —
+/// relabelling is a Disk Arbitration round trip that a busy host queues for tens of seconds.
 pub fn volume_label(repo: &RepoId, workspace: &WorkspaceName) -> String {
     format!(
         "[cowshed] {} · {} — {}",

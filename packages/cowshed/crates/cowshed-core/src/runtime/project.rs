@@ -4753,6 +4753,7 @@ impl NativeProjectRuntimeHost {
             ));
         }
         self.supervisors.remove(&name);
+        self.relabel_off_the_path(&name)?;
         let mut idle_since: Option<tokio::time::Instant> = None;
         let mut ticks = tokio::time::interval(std::time::Duration::from_secs(60));
         let ended = loop {
@@ -4793,6 +4794,44 @@ impl NativeProjectRuntimeHost {
         };
         self.forget_served(&name);
         ended
+    }
+
+    /// Name the workspace's volume after the workspace, off every command's path.
+    ///
+    /// A clone inherits its source's volume label. The label is human-facing only — Finder shows
+    /// it in place of the mount directory's name, and nothing parses it — while relabelling is a
+    /// Disk Arbitration round trip, which serializes every client on the host and was measured
+    /// at 10–28 s on a busy one. So provisioning leaves it, and the supervisor, once it serves,
+    /// relabels in the background when the file system's own name for the volume is not already
+    /// the workspace's. The outcome goes to this process's stderr, the daemon log.
+    fn relabel_off_the_path(&self, name: &WorkspaceName) -> Result<()> {
+        use crate::storage::apfs::ApfsExecutionHost;
+        let mount = self.workspace_mount_path(name)?;
+        let label = crate::storage::apfs::volume_label(&self.descriptor.repo_id, name);
+        let host = self.substrate.shared_host();
+        let name = name.clone();
+        drop(tokio::task::spawn_blocking(move || {
+            match crate::apfs::volume_name(&mount) {
+                Ok(current) if current == label.as_str() => return,
+                Ok(_) => {}
+                Err(error) => {
+                    eprintln!("cowshed: cannot read workspace {name}'s volume label: {error}");
+                    return;
+                }
+            }
+            let started = std::time::Instant::now();
+            match host.rename_volume(&mount, &label) {
+                Ok(()) => eprintln!(
+                    "cowshed: relabelled workspace {name}'s volume in {:?}",
+                    started.elapsed()
+                ),
+                Err(error) => eprintln!(
+                    "cowshed: could not relabel workspace {name}'s volume after {:?}: {error}",
+                    started.elapsed()
+                ),
+            }
+        }));
+        Ok(())
     }
 
     /// Serve the served supervisor of `name` under the workspace's grants as they are now.

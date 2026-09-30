@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use cowshed_core::apfs::{ApfsCaseSensitivity, SystemCommandRunner};
+use cowshed_core::apfs::{ApfsCaseSensitivity, SystemCommandRunner, volume_name};
 use cowshed_core::metadata::{
     GrantSet, ImageCapacity, ImageFormat, MACOS_PORT_MIN, NEW_PORT_BLOCK_SIZE, PortBlock,
     WorkspaceName,
@@ -19,7 +19,7 @@ use cowshed_core::storage::apfs::extents::{count_extents, rewrite_sibling};
 use cowshed_core::storage::apfs::native::MacOsApfsExecutionHost;
 use cowshed_core::storage::apfs::{
     ApfsStorageError, ApfsSubstrate, ApfsSubstrateConfig, CheckoutLayout, IncarnationSource,
-    TokioApfsBlockingLane,
+    TokioApfsBlockingLane, volume_label,
 };
 use cowshed_core::storage::lifecycle::{
     AdoptRequest, Destination, LifecyclePlanner, MountIntent, MountState, OperationIdentity, Pin,
@@ -340,6 +340,10 @@ fn run_format(format: ImageFormat) -> Result<String, Box<dyn Error>> {
         let mounted_root = fs::metadata(&checkout_path)?;
         assert_eq!(mounted_root.uid(), unsafe { libc::getuid() });
         assert_eq!(mounted_root.gid(), unsafe { libc::getgid() });
+        // The label adoption gave main's volume, read from the kernel rather than from Disk
+        // Arbitration's cache.
+        let main_label = volume_label(&repo, &WorkspaceName::new("main")?);
+        assert_eq!(volume_name(&canonical_mount)?, main_label.as_str());
 
         let payload = checkout_path.join("payload.txt");
         fs::write(&payload, b"checkpoint baseline\n")?;
@@ -392,6 +396,9 @@ fn run_format(format: ImageFormat) -> Result<String, Box<dyn Error>> {
             fs::metadata(fork_mount.join("stream.bin"))?.len(),
             u64::try_from(STREAM_MEBIBYTES * 1024 * 1024)?
         );
+        // Provisioning leaves the label the clone inherited: relabelling is a Disk Arbitration
+        // round trip the workspace's supervisor makes later, off the path that creates it.
+        assert_eq!(volume_name(&fork_mount)?, main_label.as_str());
 
         let checkpoint_plan = substrate.plan_checkpoint(
             &main,

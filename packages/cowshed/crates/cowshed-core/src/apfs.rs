@@ -2250,6 +2250,60 @@ fn is_valid_apfs_volume_name(name: &str) -> bool {
         && !name.as_bytes().contains(&0)
 }
 
+/// The name the file system itself reports for the volume containing `path`.
+///
+/// Read straight from the kernel (`getattrlist`), so asking costs no Disk Arbitration round trip:
+/// a relabel that is already right is skipped without touching the queue it would wait in.
+#[cfg(target_os = "macos")]
+pub fn volume_name(path: &Path) -> io::Result<OsString> {
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))?;
+    let mut request = libc::attrlist {
+        bitmapcount: libc::ATTR_BIT_MAP_COUNT,
+        reserved: 0,
+        commonattr: 0,
+        volattr: libc::ATTR_VOL_INFO | libc::ATTR_VOL_NAME,
+        dirattr: 0,
+        fileattr: 0,
+        forkattr: 0,
+    };
+    // The answer's total length (u32), one attrreference_t (i32 offset from itself, u32 length),
+    // then the name: at most 255 UTF-8 bytes and a NUL. Aligned the way the kernel packs it.
+    #[repr(C, align(4))]
+    struct Answer([u8; 12 + 256]);
+    let mut answer = Answer([0; 12 + 256]);
+    // SAFETY: `path` is NUL-terminated, `request` names one volume attribute, and `answer` is
+    // writable for its full length, which is what the kernel is told.
+    let status = unsafe {
+        libc::getattrlist(
+            path.as_ptr(),
+            (&raw mut request).cast(),
+            answer.0.as_mut_ptr().cast(),
+            answer.0.len(),
+            0,
+        )
+    };
+    if status != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let bytes = &answer.0;
+    let word = |at: usize| [bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]];
+    let malformed = || io::Error::new(io::ErrorKind::InvalidData, "malformed volume name answer");
+    let total = usize::try_from(u32::from_ne_bytes(word(0))).map_err(|_| malformed())?;
+    let offset = usize::try_from(i32::from_ne_bytes(word(4))).map_err(|_| malformed())?;
+    let length = usize::try_from(u32::from_ne_bytes(word(8))).map_err(|_| malformed())?;
+    // The reference sits right after the length word, and its offset counts from itself.
+    let start = 4 + offset;
+    let name = bytes
+        .get(start..start + length)
+        .filter(|_| start + length <= total)
+        .ok_or_else(malformed)?;
+    Ok(OsString::from_vec(
+        name.strip_suffix(b"\0").unwrap_or(name).to_vec(),
+    ))
+}
+
 fn is_kernel_device_path(device: &str) -> bool {
     device
         .strip_prefix("/dev/")
