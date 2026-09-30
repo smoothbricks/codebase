@@ -26,6 +26,7 @@ use crate::packed_header::{VocabularyId, pack_dynamic, pack_static};
 use crate::scope::{ScopeEntry, ScopeValue, SpanScope};
 use crate::tuning::{ARENA_RECLAIM_BYTES, MAX_CAPACITY, MAX_STRING_ARENA_BYTES, MIN_CAPACITY};
 use std::collections::HashMap;
+use std::hash::{BuildHasherDefault, Hasher};
 
 use crate::thread_kinds::{
     ATTRIBUTE_KIND_BOOLEAN, ATTRIBUTE_KIND_ENUM, ATTRIBUTE_KIND_NUMBER, ATTRIBUTE_KIND_TEXT,
@@ -329,6 +330,47 @@ impl std::fmt::Display for ThreadBufferError {
 }
 impl std::error::Error for ThreadBufferError {}
 
+/// Hashes a span id for the span and scope tables.
+///
+/// Every row write looks its span up, so the hash is on the row path: the
+/// default SipHash spends more on a `u32` key than the rest of the write. Span
+/// ids are the store's own dense counter, not attacker-chosen keys, so a
+/// multiplicative mix (FxHash, the arena's hasher too) spreads them with one
+/// multiply, and its output is the same on every run.
+#[derive(Default)]
+struct SpanIdHasher(u64);
+
+impl Hasher for SpanIdHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.write_u8(byte);
+        }
+    }
+
+    #[inline]
+    fn write_u8(&mut self, byte: u8) {
+        self.write_u64(u64::from(byte));
+    }
+
+    #[inline]
+    fn write_u32(&mut self, value: u32) {
+        self.write_u64(u64::from(value));
+    }
+
+    #[inline]
+    fn write_u64(&mut self, value: u64) {
+        self.0 = (self.0.rotate_left(5) ^ value).wrapping_mul(0x51_7c_c1_b7_27_22_0a_95);
+    }
+}
+
+type SpanIdMap<V> = HashMap<u32, V, BuildHasherDefault<SpanIdHasher>>;
+
 /// The one row store owned by a pinned thread.
 #[derive(Debug)]
 pub struct ThreadSpanBuffer {
@@ -342,8 +384,8 @@ pub struct ThreadSpanBuffer {
     active_blocks: usize,
     row_count: usize,
     next_span_id: u32,
-    spans: HashMap<u32, SpanRecord>,
-    scopes: HashMap<u32, Option<SpanScope>>,
+    spans: SpanIdMap<SpanRecord>,
+    scopes: SpanIdMap<Option<SpanScope>>,
     /// `retain_open`'s working list, kept so a flush allocates nothing.
     open_scratch: Vec<(u32, u32)>,
     /// Every dynamic string this thread has written, stored once, contiguous.
@@ -370,8 +412,11 @@ impl ThreadSpanBuffer {
             active_blocks: 1,
             row_count: 0,
             next_span_id: 1,
-            spans: HashMap::with_capacity(capacity / 2),
-            scopes: HashMap::with_capacity(capacity / 2),
+            spans: SpanIdMap::with_capacity_and_hasher(capacity / 2, BuildHasherDefault::default()),
+            scopes: SpanIdMap::with_capacity_and_hasher(
+                capacity / 2,
+                BuildHasherDefault::default(),
+            ),
             open_scratch: Vec::new(),
             arena: StringArena::new(MAX_STRING_ARENA_BYTES),
             text_epoch: 0,
