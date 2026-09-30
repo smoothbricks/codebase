@@ -16,16 +16,25 @@ use std::collections::BTreeSet;
 
 /// Built artifact, relative to this crate. `just wasm` and the nx `cargo-wasm`
 /// target both produce it at this path.
-const ARTIFACT: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../../../target/wasm32-unknown-unknown/wasm-release/columine_wasm.wasm"
-);
+/// This crate's directory joined with `relative`, read at run time: a workspace runs the test
+/// binary it inherited from the checkout that compiled it, and must read its own tree.
+fn manifest_path(relative: &str) -> String {
+    let manifest = std::env::var("CARGO_MANIFEST_DIR")
+        .expect("cargo sets CARGO_MANIFEST_DIR for the tests it runs");
+    format!("{manifest}{relative}")
+}
+
+fn artifact() -> String {
+    manifest_path("/../../../../target/wasm32-unknown-unknown/wasm-release/columine_wasm.wasm")
+}
 
 /// The TypeScript host, read as source. A generator would be a build-order
 /// edge from rust into the TS package for a list that changes when someone
 /// edits an export by hand; harvesting the declaration catches the same drift
 /// in both directions with no build step.
-const WASM_BACKEND_TS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../src/wasm-backend.ts");
+fn wasm_backend_ts() -> String {
+    manifest_path("/../../src/wasm-backend.ts")
+}
 
 fn table() -> BTreeSet<&'static str> {
     COLUMINE_VM_EXPORTS.iter().copied().collect()
@@ -50,8 +59,9 @@ fn ts_string_array(source: &str, declaration: &str) -> BTreeSet<String> {
 
 #[test]
 fn typescript_host_binds_exactly_the_export_table() {
-    let source = std::fs::read_to_string(WASM_BACKEND_TS)
-        .unwrap_or_else(|error| panic!("read {WASM_BACKEND_TS}: {error}"));
+    let path = wasm_backend_ts();
+    let source =
+        std::fs::read_to_string(&path).unwrap_or_else(|error| panic!("read {path}: {error}"));
     let bound = ts_string_array(&source, "const VM_EXPORT_NAMES");
     let expected: BTreeSet<String> = COLUMINE_VM_EXPORTS
         .iter()
@@ -70,8 +80,9 @@ fn typescript_host_binds_exactly_the_export_table() {
 /// looks for `name(`.
 #[test]
 fn typescript_vm_exports_type_covers_the_export_table() {
-    let source = std::fs::read_to_string(WASM_BACKEND_TS)
-        .unwrap_or_else(|error| panic!("read {WASM_BACKEND_TS}: {error}"));
+    let path = wasm_backend_ts();
+    let source =
+        std::fs::read_to_string(&path).unwrap_or_else(|error| panic!("read {path}: {error}"));
     let missing: Vec<&str> = COLUMINE_VM_EXPORTS
         .iter()
         .copied()
@@ -85,9 +96,10 @@ fn typescript_vm_exports_type_covers_the_export_table() {
 
 #[test]
 fn built_wasm_matches_the_export_table() {
-    let bytes = std::fs::read(ARTIFACT).unwrap_or_else(|error| {
+    let path = artifact();
+    let bytes = std::fs::read(&path).unwrap_or_else(|error| {
         panic!(
-            "read {ARTIFACT}: {error}\n\
+            "read {path}: {error}\n\
              This test audits the compiled artifact, so it cannot pass without \
              one. Build it with `just wasm` (or run this through \
              `nx run columine:cargo-test`, which depends on cargo-wasm)."

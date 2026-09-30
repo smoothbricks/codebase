@@ -19,7 +19,12 @@ use columine_types::audit_parser::{arm_names, enum_decls, norm, read_source};
 use columine_types::types::Opcode;
 use std::collections::{BTreeMap, BTreeSet};
 
-const MANIFEST: &str = env!("CARGO_MANIFEST_DIR");
+/// This crate's directory, read at run time: a workspace runs the test binary it inherited from
+/// the checkout that compiled it, and must read its own tree.
+fn manifest_dir() -> String {
+    std::env::var("CARGO_MANIFEST_DIR")
+        .expect("cargo sets CARGO_MANIFEST_DIR for the tests it runs")
+}
 
 /// Rust-covered bytes legitimately absent from the frozen dispatch, each with
 /// the reason it is allowed. Empty today — the sets are equal.
@@ -34,8 +39,8 @@ fn frozen_dispatched() -> BTreeSet<u8> {
 }
 
 fn rust_covered() -> BTreeSet<u8> {
-    let rust_vm = read_source(MANIFEST, "src/vm.rs");
-    let rust_types = read_source(MANIFEST, "../columine-types/src/types.rs");
+    let rust_vm = read_source(&manifest_dir(), "src/vm.rs");
+    let rust_types = read_source(&manifest_dir(), "../columine-types/src/types.rs");
     let rust_decls = enum_decls(&rust_types, "pub enum Opcode");
     assert!(
         rust_decls.len() >= 57,
@@ -157,8 +162,8 @@ fn flat_undo_op_registry_and_rollback_arms_match_fixture() {
         ("StateBytes", 15),
     ];
 
-    let rust_undo = read_source(MANIFEST, "src/undo_log.rs");
-    let rust_vm = read_source(MANIFEST, "src/vm.rs");
+    let rust_undo = read_source(&manifest_dir(), "src/undo_log.rs");
+    let rust_vm = read_source(&manifest_dir(), "src/vm.rs");
 
     let mut frozen: BTreeMap<String, u8> = FLAT_UNDO_OPS
         .iter()

@@ -24,8 +24,21 @@ use columine_types::types::{
 };
 use std::collections::BTreeMap;
 
-const TYPES_TS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../src/types.ts");
-const WASM_BACKEND_TS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../src/wasm-backend.ts");
+/// This crate's directory joined with `relative`, read at run time: a workspace runs the test
+/// binary it inherited from the checkout that compiled it, and must read its own tree.
+fn manifest_path(relative: &str) -> String {
+    let manifest = std::env::var("CARGO_MANIFEST_DIR")
+        .expect("cargo sets CARGO_MANIFEST_DIR for the tests it runs");
+    format!("{manifest}{relative}")
+}
+
+fn types_ts() -> String {
+    manifest_path("/../../src/types.ts")
+}
+
+fn wasm_backend_ts() -> String {
+    manifest_path("/../../src/wasm-backend.ts")
+}
 
 fn read(path: &str) -> String {
     std::fs::read_to_string(path).unwrap_or_else(|error| panic!("read {path}: {error}"))
@@ -76,7 +89,7 @@ fn ts_const(source: &str, name: &str) -> u64 {
 
 #[test]
 fn typescript_opcode_enum_matches_rust() {
-    let harvested = ts_enum(&read(TYPES_TS), "Opcode", 55);
+    let harvested = ts_enum(&read(&types_ts()), "Opcode", 55);
     assert_eq!(
         rust_u8_tags(Opcode::from_u8),
         harvested,
@@ -86,7 +99,7 @@ fn typescript_opcode_enum_matches_rust() {
 
 #[test]
 fn typescript_slot_type_enum_matches_rust() {
-    let harvested = ts_enum(&read(TYPES_TS), "SlotType", 10);
+    let harvested = ts_enum(&read(&types_ts()), "SlotType", 10);
     assert_eq!(
         rust_u8_tags(SlotType::from_u8),
         harvested,
@@ -96,7 +109,7 @@ fn typescript_slot_type_enum_matches_rust() {
 
 #[test]
 fn typescript_agg_type_enum_matches_rust() {
-    let harvested = ts_enum(&read(TYPES_TS), "AggType", 11);
+    let harvested = ts_enum(&read(&types_ts()), "AggType", 11);
     assert_eq!(
         rust_u8_tags(AggType::from_u8),
         harvested,
@@ -106,7 +119,7 @@ fn typescript_agg_type_enum_matches_rust() {
 
 #[test]
 fn typescript_struct_field_type_enum_matches_rust() {
-    let harvested = ts_enum(&read(TYPES_TS), "StructFieldType", 10);
+    let harvested = ts_enum(&read(&types_ts()), "StructFieldType", 10);
     assert_eq!(
         rust_u8_tags(StructFieldType::from_u8),
         harvested,
@@ -118,7 +131,7 @@ fn typescript_struct_field_type_enum_matches_rust() {
 /// variants.
 #[test]
 fn typescript_ttl_start_of_matches_rust_duration_unit() {
-    let harvested = ts_enum(&read(TYPES_TS), "TtlStartOf", 9);
+    let harvested = ts_enum(&read(&types_ts()), "TtlStartOf", 9);
     assert_eq!(
         rust_u8_tags(DurationUnit::from_u8),
         harvested,
@@ -129,7 +142,7 @@ fn typescript_ttl_start_of_matches_rust_duration_unit() {
 /// Host name is `ComparisonType`; the wire byte is [`CmpType`].
 #[test]
 fn typescript_comparison_type_matches_rust_cmp_type() {
-    let harvested = ts_enum(&read(TYPES_TS), "ComparisonType", 3);
+    let harvested = ts_enum(&read(&types_ts()), "ComparisonType", 3);
     assert_eq!(
         rust_u8_tags(CmpType::from_u8),
         harvested,
@@ -139,7 +152,7 @@ fn typescript_comparison_type_matches_rust_cmp_type() {
 
 #[test]
 fn typescript_error_code_enum_matches_rust() {
-    let harvested = ts_enum(&read(TYPES_TS), "ErrorCode", 10);
+    let harvested = ts_enum(&read(&types_ts()), "ErrorCode", 10);
     let rust: BTreeMap<String, u8> = (0..64_u32)
         .filter_map(|value| {
             ErrorCode::from_u32(value).map(|code| {
@@ -159,7 +172,7 @@ fn typescript_error_code_enum_matches_rust() {
 
 #[test]
 fn typescript_program_constants_match_rust() {
-    let source = read(TYPES_TS);
+    let source = read(&types_ts());
     assert_eq!(ts_const(&source, "PROGRAM_MAGIC"), u64::from(PROGRAM_MAGIC));
     assert_eq!(
         ts_const(&source, "HEADER_SIZE"),
@@ -176,7 +189,7 @@ fn typescript_program_constants_match_rust() {
 /// indexing expressions; naming them is what makes them auditable.
 #[test]
 fn typescript_state_layout_constants_match_rust() {
-    let source = read(WASM_BACKEND_TS);
+    let source = read(&wasm_backend_ts());
     assert_eq!(
         ts_const(&source, "STATE_HEADER_SIZE"),
         u64::from(STATE_HEADER_SIZE)

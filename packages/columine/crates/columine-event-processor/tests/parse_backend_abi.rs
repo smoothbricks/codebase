@@ -13,10 +13,16 @@ use columine_event_processor::{
     COMPACT_HEADER_SIZE, CreateFailure, RESULT_HEADER_SIZE, ResultCode, WASM_EVENT_CAPACITY,
 };
 
-const PARSE_BACKEND_TS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../src/parse-backend.ts");
+/// Read at run time: a workspace runs the test binary it inherited from the checkout that compiled
+/// it, and must read its own tree.
+fn parse_backend_ts() -> String {
+    let manifest = std::env::var("CARGO_MANIFEST_DIR")
+        .expect("cargo sets CARGO_MANIFEST_DIR for the tests it runs");
+    format!("{manifest}/../../src/parse-backend.ts")
+}
 
 fn read() -> String {
-    std::fs::read_to_string(PARSE_BACKEND_TS)
+    std::fs::read_to_string(parse_backend_ts())
         .unwrap_or_else(|error| panic!("read parse-backend.ts: {error}"))
 }
 

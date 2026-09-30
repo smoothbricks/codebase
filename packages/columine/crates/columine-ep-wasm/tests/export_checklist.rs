@@ -14,19 +14,29 @@
 use columine_types::wasm_abi::{COLUMINE_EP_EXPORTS, EXPORTED_MEMORY, parse_exports};
 use std::collections::BTreeSet;
 
-const ARTIFACT: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../../../target/wasm32-unknown-unknown/wasm-release/columine_ep_wasm.wasm"
-);
+/// This crate's directory joined with `relative`, read at run time: a workspace runs the test
+/// binary it inherited from the checkout that compiled it, and must read its own tree.
+fn manifest_path(relative: &str) -> String {
+    let manifest = std::env::var("CARGO_MANIFEST_DIR")
+        .expect("cargo sets CARGO_MANIFEST_DIR for the tests it runs");
+    format!("{manifest}{relative}")
+}
 
-const PARSE_BACKEND_TS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../src/parse-backend.ts");
+fn artifact() -> String {
+    manifest_path("/../../../../target/wasm32-unknown-unknown/wasm-release/columine_ep_wasm.wasm")
+}
+
+fn parse_backend_ts() -> String {
+    manifest_path("/../../src/parse-backend.ts")
+}
 
 /// The host declares these as members of `EventProcessorWasmExports` rather
 /// than as a name array, so the audit looks for each member declaration.
 #[test]
 fn typescript_host_declares_every_ep_export() {
-    let source = std::fs::read_to_string(PARSE_BACKEND_TS)
-        .unwrap_or_else(|error| panic!("read {PARSE_BACKEND_TS}: {error}"));
+    let path = parse_backend_ts();
+    let source =
+        std::fs::read_to_string(&path).unwrap_or_else(|error| panic!("read {path}: {error}"));
     let missing: Vec<&str> = COLUMINE_EP_EXPORTS
         .iter()
         .copied()
@@ -41,9 +51,10 @@ fn typescript_host_declares_every_ep_export() {
 
 #[test]
 fn built_wasm_matches_the_export_table() {
-    let bytes = std::fs::read(ARTIFACT).unwrap_or_else(|error| {
+    let path = artifact();
+    let bytes = std::fs::read(&path).unwrap_or_else(|error| {
         panic!(
-            "read {ARTIFACT}: {error}\n\
+            "read {path}: {error}\n\
              This test audits the compiled artifact, so it cannot pass without \
              one. Build it with `just wasm-ep` (or run this through \
              `nx run columine:cargo-test`, which depends on cargo-wasm)."

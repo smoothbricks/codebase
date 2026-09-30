@@ -17,7 +17,12 @@ use columine_types::types::{
 };
 use std::collections::BTreeMap;
 
-const MANIFEST: &str = env!("CARGO_MANIFEST_DIR");
+/// This crate's directory, read at run time: a workspace runs the test binary it inherited from
+/// the checkout that compiled it, and must read its own tree.
+fn manifest_dir() -> String {
+    std::env::var("CARGO_MANIFEST_DIR")
+        .expect("cargo sets CARGO_MANIFEST_DIR for the tests it runs")
+}
 
 fn decls(src: &str, header: &str, floor: usize, what: &str) -> BTreeMap<String, u8> {
     let map: BTreeMap<String, u8> = enum_decls(src, header)
@@ -38,7 +43,7 @@ fn fixture(pairs: &[(&str, u8)]) -> BTreeMap<String, u8> {
 
 #[test]
 fn types_rs_registry_matches_fixture() {
-    let rust = read_source(MANIFEST, "src/types.rs");
+    let rust = read_source(&manifest_dir(), "src/types.rs");
     let rust_decls = decls(&rust, "pub enum Opcode", 55, "types.rs Opcode");
     assert_eq!(
         fixture(TYPES_OPCODE_REGISTRY),
@@ -117,7 +122,7 @@ fn error_code_registry_matches_fixture() {
 /// the same silent-skip class as 0x81.
 #[test]
 fn types_rs_from_u8_matches_declarations() {
-    let rust = read_source(MANIFEST, "src/types.rs");
+    let rust = read_source(&manifest_dir(), "src/types.rs");
     let declared = decls(&rust, "pub enum Opcode", 55, "types.rs Opcode");
     let mut decoded = BTreeMap::new();
     for byte in 0..=255u8 {
