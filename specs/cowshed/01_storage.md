@@ -271,8 +271,13 @@ Three questions, three authorities, none of them the volume label:
 
 The marker is the discriminator because it is the one identity that is both authoritative and re-stampable. An APFS
 clone inherits its source volume's name **and its volume UUID**, so a volume UUID recorded at creation cannot tell a
-workspace from the fork made out of it; that is why cloning re-stamps the label and rewrites the marker inside the same
-staging fence, before the clone is ever published. Volume UUIDs are therefore not recorded and not used.
+workspace from the fork made out of it; that is why cloning rewrites the marker inside the staging fence, before the
+clone is ever published. Volume UUIDs are therefore not recorded and not used. The label is not rewritten there: a clone
+is published under the label it inherited, and the workspace's supervisor, once it serves, reads the file system's own
+name for the volume (`getattrlist`, no Disk Arbitration round trip) and relabels it in the background when it differs. A
+rename is a Disk Arbitration round trip, and Disk Arbitration serializes every client on the host — measured at 9.5 s
+and 27.8 s under load against 13–22 ms on a quiet queue — so it stays off the provisioning path. Replacement restores
+and identity changes still relabel synchronously.
 
 What follows: volume labels are free to be plain, and manual renaming is harmless rather than unsupported. Cowshed still
 derives an internal per-workspace key from `repo_id` and workspace name to pair a storage fact with a kernel mount fact
