@@ -213,8 +213,8 @@ impl Parent {
         if verify_after_materialize {
             verify_content(&temporary, &temporary_path, stream.bytes, stream.sha256)?;
         }
-        temporary
-            .sync_all()
+        super::JOB_RECORD_DURABILITY
+            .sync_file(&temporary)
             .map_err(|error| publication_error(&temporary_path, PublicationStage::Sync, error))?;
         drop(temporary);
         publish_relative(
@@ -225,9 +225,11 @@ impl Parent {
             &self.destination_path(),
         )?;
         self.temporary_exists = false;
-        self.directory.sync_all().map_err(|error| {
-            publication_error(&self.destination_path(), PublicationStage::Sync, error)
-        })?;
+        super::JOB_RECORD_DURABILITY
+            .sync_new_entry_at(&self.directory)
+            .map_err(|error| {
+                publication_error(&self.destination_path(), PublicationStage::Sync, error)
+            })?;
         let metadata = metadata_at(&self.directory, &self.destination_leaf).map_err(|error| {
             publication_error(&self.destination_path(), PublicationStage::Publish, error)
         })?;

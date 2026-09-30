@@ -292,7 +292,7 @@ pub(crate) fn sync_directory(path: &Path) -> io::Result<()> {
         use std::os::unix::fs::OpenOptionsExt;
         options.custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC);
     }
-    options.open(path)?.sync_all()
+    full_sync(&options.open(path)?)
 }
 
 /// Atomically rename one directory-relative entry without replacing an existing destination.
@@ -391,6 +391,8 @@ impl Durability {
         match self {
             Self::Process => Ok(()),
             Self::Device => {
+                #[cfg(test)]
+                count_sync(|syncs| syncs.fsync += 1);
                 // SAFETY: fsync on a descriptor the borrowed `File` keeps open.
                 if unsafe { libc::fsync(file.as_raw_fd()) } == 0 {
                     Ok(())
@@ -398,7 +400,7 @@ impl Durability {
                     Err(io::Error::last_os_error())
                 }
             }
-            Self::PowerLoss => file.sync_all(),
+            Self::PowerLoss => full_sync(file),
         }
     }
 
@@ -409,6 +411,52 @@ impl Durability {
             Self::PowerLoss => sync_directory(directory),
         }
     }
+
+    /// [`Self::sync_new_entry`] through a directory descriptor the writer already holds.
+    pub(crate) fn sync_new_entry_at(self, directory: &File) -> io::Result<()> {
+        match self {
+            Self::Process | Self::Device => Ok(()),
+            Self::PowerLoss => full_sync(directory),
+        }
+    }
+}
+
+/// `F_FULLFSYNC` on macOS (`fsync(2)` elsewhere), the only full-device flush a [`Durability`]
+/// issues.
+fn full_sync(file: &File) -> io::Result<()> {
+    #[cfg(test)]
+    count_sync(|syncs| syncs.full += 1);
+    file.sync_all()
+}
+
+/// The syncs this thread issued through [`Durability`] since the last [`take_syncs`], so a test
+/// can hold a path to the flush its state's tier allows.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct Syncs {
+    /// `fsync(2)`: [`Durability::Device`].
+    pub(crate) fsync: usize,
+    /// Full-device flushes: [`Durability::PowerLoss`] files and directories.
+    pub(crate) full: usize,
+}
+
+#[cfg(test)]
+thread_local! {
+    static SYNCS: std::cell::Cell<Syncs> = const { std::cell::Cell::new(Syncs { fsync: 0, full: 0 }) };
+}
+
+#[cfg(test)]
+fn count_sync(count: impl FnOnce(&mut Syncs)) {
+    SYNCS.with(|cell| {
+        let mut syncs = cell.get();
+        count(&mut syncs);
+        cell.set(syncs);
+    });
+}
+
+#[cfg(test)]
+pub(crate) fn take_syncs() -> Syncs {
+    SYNCS.with(std::cell::Cell::take)
 }
 
 /// Atomically publish a private regular file at `path`: write into a uniquely named temp sibling,

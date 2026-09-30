@@ -34,10 +34,11 @@ use crate::repository::{OwnedRepoIds, RepoId};
 mod publication;
 use crate::storage::verify_no_symlinks;
 
-/// How durable a job's own records and sealed streams are before the job is admitted or answered
-/// as ended: one `fsync(2)` per record batch. Power loss ends every job anyway, and a job whose
-/// record it took is sealed lost at the next supervisor start (11_shell.md "Job control").
-/// Checkpoint manifests and every lifecycle record stay at [`Durability::PowerLoss`].
+/// How durable a job's own state is before the job is admitted, backgrounded or answered as
+/// ended: one `fsync(2)` per record batch, per spilled stream and per published copy, and no sync
+/// of the directory entries they add. Power loss ends every job anyway, and a job whose record it
+/// took is sealed lost at the next supervisor start (11_shell.md "Job control"). Checkpoint
+/// manifests and every lifecycle record stay at [`Durability::PowerLoss`].
 const JOB_RECORD_DURABILITY: Durability = Durability::Device;
 
 const RECORD_MAGIC: &[u8; 8] = b"CSARROW1";
@@ -1638,7 +1639,9 @@ impl StreamWriterState {
         })?;
         file.flush().map_err(|error| io_error(&path, error))?;
         set_sealed_permissions(file, &path)?;
-        file.sync_all().map_err(|error| io_error(&path, error))?;
+        JOB_RECORD_DURABILITY
+            .sync_file(file)
+            .map_err(|error| io_error(&path, error))?;
         verify_private_file_mode(
             &path,
             &file.metadata().map_err(|error| io_error(&path, error))?,
@@ -1734,7 +1737,7 @@ fn create_protected_file(
     })?;
     let job_root = ensure_private_job_root(workspace_root)?;
     let parent = job_root.join(job_id.get().to_string());
-    ensure_private_directory(&parent)?;
+    ensure_private_directory(&parent, JOB_RECORD_DURABILITY)?;
     verify_no_symlinks(workspace_root, &path).map_err(|error| ArtifactError::Integrity {
         offset: 0,
         message: error.to_string(),
@@ -1758,7 +1761,9 @@ fn create_protected_file(
         &file.metadata().map_err(|error| io_error(&path, error))?,
         false,
     )?;
-    sync_parent_directory(&path)?;
+    JOB_RECORD_DURABILITY
+        .sync_new_entry(&parent)
+        .map_err(|error| io_error(&parent, error))?;
     Ok(file)
 }
 
@@ -2598,7 +2603,7 @@ fn verify_records_layout(path: &Path) -> Result<(), ArtifactError> {
     }
     Ok(())
 }
-fn ensure_private_directory(path: &Path) -> Result<(), ArtifactError> {
+fn ensure_private_directory(path: &Path, durability: Durability) -> Result<(), ArtifactError> {
     match fs::symlink_metadata(path) {
         Ok(metadata) => {
             if !metadata.is_dir() || metadata.file_type().is_symlink() {
@@ -2623,7 +2628,9 @@ fn ensure_private_directory(path: &Path) -> Result<(), ArtifactError> {
             }
             #[cfg(not(unix))]
             fs::create_dir(path).map_err(|error| io_error(path, error))?;
-            sync_directory(parent)?;
+            durability
+                .sync_new_entry(parent)
+                .map_err(|error| io_error(parent, error))?;
             Ok(())
         }
         Err(error) => Err(io_error(path, error)),
@@ -2633,7 +2640,7 @@ fn ensure_private_directory(path: &Path) -> Result<(), ArtifactError> {
 fn ensure_private_job_root(workspace_root: &Path) -> Result<PathBuf, ArtifactError> {
     let cowshed = workspace_root.join(".cowshed");
     if !cowshed.exists() {
-        ensure_private_directory(&cowshed)?;
+        ensure_private_directory(&cowshed, Durability::PowerLoss)?;
     } else {
         let metadata = fs::symlink_metadata(&cowshed).map_err(|error| io_error(&cowshed, error))?;
         if !metadata.is_dir() || metadata.file_type().is_symlink() {
@@ -2641,7 +2648,7 @@ fn ensure_private_job_root(workspace_root: &Path) -> Result<PathBuf, ArtifactErr
         }
     }
     let job = cowshed.join("job");
-    ensure_private_directory(&job)?;
+    ensure_private_directory(&job, Durability::PowerLoss)?;
     Ok(job)
 }
 
@@ -5566,6 +5573,54 @@ mod tests {
             recover_records(&path),
             Err(ArtifactError::Integrity { .. })
         ));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Every background or auto-backgrounded exec makes both captured streams durable, and every
+    /// `--stdout-copy` publishes a copy; both are the job's own state, so each pays `fsync(2)`
+    /// like its records and never a full-device flush (11_shell.md "Job control").
+    #[test]
+    fn backgrounding_and_publishing_a_job_pay_no_full_device_flush() {
+        let root = temp_root("job-durability");
+        fs::create_dir(root.join("published")).unwrap();
+        let mut store = store_at(&root, ArtifactConfig::default());
+        let job_id = JobId::new(1).unwrap();
+        let token = store
+            .begin_job(
+                job_id,
+                1,
+                &crate::api::dto::ExecCommand::Argv(vec!["true".into()]),
+                None,
+                OutputTargets::default(),
+            )
+            .unwrap();
+        store.append(&token, StreamKind::Stdout, b"built").unwrap();
+        crate::fsio::take_syncs();
+        store.prepare_background(&token).unwrap();
+        assert_eq!(
+            crate::fsio::take_syncs(),
+            crate::fsio::Syncs { fsync: 2, full: 0 },
+            "backgrounding syncs stdout and stderr"
+        );
+
+        store.finish(token, JobState::Exited).unwrap();
+        crate::fsio::take_syncs();
+        let publication = OutputPublication {
+            path: WorkspacePath::new("published/stdout.txt").unwrap(),
+            policy: crate::api::dto::PublicationPolicy::CreateNew,
+        };
+        store
+            .publish_output(job_id, StreamKind::Stdout, &publication)
+            .unwrap();
+        assert_eq!(
+            crate::fsio::take_syncs(),
+            crate::fsio::Syncs { fsync: 1, full: 0 },
+            "publication syncs its copy and not the directory it lands in"
+        );
+        assert_eq!(
+            fs::read(root.join("published/stdout.txt")).unwrap(),
+            b"built"
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
