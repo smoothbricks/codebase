@@ -4,6 +4,7 @@ mod shell_job;
 pub mod shell_pool;
 pub mod shell_watch;
 pub mod supervisor;
+pub mod supervisor_manager;
 pub mod supervisor_socket;
 
 pub use project::{

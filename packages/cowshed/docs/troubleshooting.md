@@ -261,6 +261,15 @@ the incarnation fence. A healthy restore always drains the old supervisor, stage
 the new incarnation then token, swaps and mounts, publishes metadata atomically, revokes the old token, and only then
 admits a supervisor or job. No state should accept both tokens; `cowshed doctor` reports a publication mismatch.
 
+## `cowshed exec` says the cowshed daemon is not reachable
+
+Workspace supervisors are processes the cowshed daemon starts and keeps, through its supervisor manager at
+`/private/cowshed/store/run/manager.sock`; a command that runs work in a workspace asks it for the workspace's
+supervisor. `cowshed gateway status` shows whether the daemon runs, and `cowshed gateway start` installs and starts it.
+A supervisor that could not start leaves its reason in `~/Library/Logs/cowshed/daemon-stderr.log`. A refusal naming a
+supervisor protocol version means the daemon and the `cowshed` you ran are different builds: run `cowshed gateway start`
+from the one you mean to use.
+
 ## When cowshed itself misbehaves
 
 `cowshed doctor --json` is the bounded bug-report payload: it includes versions, invariant results, continuity metadata,

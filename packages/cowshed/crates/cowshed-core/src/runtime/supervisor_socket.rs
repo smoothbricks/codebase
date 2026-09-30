@@ -77,6 +77,10 @@ pub fn socket_path(
 enum Request {
     /// The authority the supervisor serves, so a client can tell a stale socket from its own.
     Hello,
+    /// Re-read the workspace's grants and serve under their revision from now on; answered
+    /// with the authority served afterwards. Jobs already running keep the profile they
+    /// started under.
+    Advance,
     Call {
         authority: AuthorityWire,
         call: Call,
@@ -95,7 +99,7 @@ struct HelloWire {
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct AuthorityWire {
+pub(super) struct AuthorityWire {
     repo_id: crate::repository::RepoId,
     workspace: crate::metadata::WorkspaceName,
     workspace_incarnation: crate::metadata::WorkspaceIncarnation,
@@ -297,7 +301,7 @@ enum Response {
     Err(CowshedError),
 }
 
-fn protocol_error(message: impl Into<String>) -> CowshedError {
+pub(super) fn protocol_error(message: impl Into<String>) -> CowshedError {
     CowshedError::integrity(
         format!("workspace supervisor protocol: {}", message.into()),
         "cowshed doctor --json",
@@ -335,13 +339,13 @@ async fn read_frame(stream: &mut UnixStream, maximum: usize) -> Result<Vec<u8>> 
     .await
 }
 
-async fn write_json<T: Serialize>(stream: &mut UnixStream, value: &T) -> Result<()> {
+pub(super) async fn write_json<T: Serialize>(stream: &mut UnixStream, value: &T) -> Result<()> {
     let bytes = serde_json::to_vec(value)
         .map_err(|error| protocol_error(format!("encoding failed: {error}")))?;
     write_frame(stream, &bytes, MAX_JSON_FRAME).await
 }
 
-async fn read_json<T: for<'de> Deserialize<'de>>(stream: &mut UnixStream) -> Result<T> {
+pub(super) async fn read_json<T: for<'de> Deserialize<'de>>(stream: &mut UnixStream) -> Result<T> {
     let bytes = read_frame(stream, MAX_JSON_FRAME).await?;
     serde_json::from_slice(&bytes)
         .map_err(|error| protocol_error(format!("malformed frame: {error}")))
@@ -367,6 +371,10 @@ async fn read_bytes(stream: &mut UnixStream, length: usize) -> Result<Bytes> {
 
 /// Writers of the stdin streams jobs of this supervisor are still reading.
 type Streams = Arc<Mutex<BTreeMap<JobId, mpsc::Sender<io::Result<Bytes>>>>>;
+
+/// How a served supervisor's process takes an `advance` request: it alone can read the
+/// workspace's grants and compile the profile for them.
+pub type Advances = mpsc::Sender<oneshot::Sender<Result<WorkspaceAuthoritySnapshot>>>;
 
 /// Bind the supervisor's socket at `path`: mode `0600` in a directory only this user can enter.
 /// A socket file already at `path` is replaced only when nothing answers on it.
@@ -408,7 +416,11 @@ pub async fn bind(path: &Path) -> Result<UnixListener> {
 
 /// Serve `supervisor` on `listener`, one call per connection, until a `retire` call has
 /// retired it and been answered. The caller then unlinks the socket and exits.
-pub async fn serve(listener: UnixListener, supervisor: WorkspaceSupervisorHandle) -> Result<()> {
+pub async fn serve(
+    listener: UnixListener,
+    supervisor: WorkspaceSupervisorHandle,
+    advances: Option<Advances>,
+) -> Result<()> {
     let streams: Streams = Arc::default();
     let retired = Arc::new(tokio::sync::Notify::new());
     loop {
@@ -424,8 +436,11 @@ pub async fn serve(listener: UnixListener, supervisor: WorkspaceSupervisorHandle
         let supervisor = supervisor.clone();
         let streams = Arc::clone(&streams);
         let retired = Arc::clone(&retired);
+        let advances = advances.clone();
         tokio::spawn(async move {
-            if let Ok(Retirement::Retired) = serve_call(stream, &supervisor, &streams).await {
+            if let Ok(Retirement::Retired) =
+                serve_call(stream, &supervisor, &streams, advances.as_ref()).await
+            {
                 retired.notify_one();
             }
         });
@@ -442,6 +457,7 @@ async fn serve_call(
     mut stream: UnixStream,
     supervisor: &WorkspaceSupervisorHandle,
     streams: &Streams,
+    advances: Option<&Advances>,
 ) -> Result<Retirement> {
     verify_peer(&stream)?;
     let request: Request = read_json(&mut stream).await?;
@@ -454,6 +470,36 @@ async fn serve_call(
                 pid: std::process::id(),
             })?;
             write_json(&mut stream, &Response::Ok { value, bytes: 0 }).await?;
+            return Ok(Retirement::Serving);
+        }
+        Request::Advance => {
+            let advanced = match advances {
+                Some(advances) => {
+                    let (reply, answer) = oneshot::channel();
+                    match advances.send(reply).await {
+                        Ok(()) => answer.await.unwrap_or_else(|_| {
+                            Err(CowshedError::internal(
+                                "the supervisor process stopped before advancing",
+                            ))
+                        }),
+                        Err(_) => Err(CowshedError::internal(
+                            "the supervisor process no longer takes advances",
+                        )),
+                    }
+                }
+                None => Err(CowshedError::conflict(
+                    "this supervisor cannot re-read its grants",
+                    "retire it; the next command starts one under the current grants",
+                )),
+            };
+            let response = match advanced {
+                Ok(authority) => Response::Ok {
+                    value: to_value(&AuthorityWire::from(&authority))?,
+                    bytes: 0,
+                },
+                Err(error) => Response::Err(error),
+            };
+            write_json(&mut stream, &response).await?;
             return Ok(Retirement::Serving);
         }
         Request::Call {
@@ -494,7 +540,7 @@ async fn serve_call(
     answered.map(|()| Retirement::Serving)
 }
 
-fn verify_peer(stream: &UnixStream) -> Result<()> {
+pub(super) fn verify_peer(stream: &UnixStream) -> Result<()> {
     use std::os::fd::AsFd as _;
     let descriptor = stream
         .as_fd()
@@ -760,6 +806,14 @@ pub async fn hello(path: &Path) -> Result<Hello> {
     })
 }
 
+/// Ask the supervisor at `path` to serve under its workspace's current grants; the authority
+/// it serves afterwards.
+pub async fn advance(path: &Path) -> Result<WorkspaceAuthoritySnapshot> {
+    let (value, _) = exchange(path, &Request::Advance, Bytes::new()).await?;
+    let authority: AuthorityWire = decode(value)?;
+    Ok(authority.into())
+}
+
 /// A handle whose calls reach the supervisor serving `path` under `authority`.
 pub fn connect(path: PathBuf, authority: WorkspaceAuthoritySnapshot) -> WorkspaceSupervisorHandle {
     let (commands, mut receiver) = mpsc::channel(64);
@@ -993,6 +1047,12 @@ async fn forward(path: Arc<PathBuf>, command: Command) {
         }
         Command::CurrentAuthority { reply } => {
             let _ = reply.send(hello(path).await.map(|hello| hello.authority));
+        }
+        Command::Idle { reply } => {
+            // Only the process running a supervisor asks it whether it is idle.
+            let _ = reply.send(Err(CowshedError::internal(
+                "idleness is asked of an in-process supervisor only",
+            )));
         }
     }
 }

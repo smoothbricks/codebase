@@ -1586,7 +1586,7 @@ async fn served(handle: &WorkspaceSupervisorHandle) -> (WorkspaceSupervisorHandl
         &uuid::Uuid::new_v4().simple().to_string()[..12]
     ));
     let listener = supervisor_socket::bind(&path).await.expect("bind");
-    tokio::spawn(supervisor_socket::serve(listener, handle.clone()));
+    tokio::spawn(supervisor_socket::serve(listener, handle.clone(), None));
     let remote = supervisor_socket::connect(path.clone(), handle.snapshot().clone());
     (remote, path)
 }
@@ -1765,4 +1765,167 @@ async fn a_supervisor_that_speaks_another_protocol_is_refused_by_name() {
         "{}",
         refused.message
     );
+}
+
+/// Starts `supervisor` on the workspace socket in-process, standing in for the supervisor
+/// process, and hands the manager a real child to watch.
+struct InProcessSpawner {
+    store_root: PathBuf,
+    supervisor: Option<WorkspaceSupervisorHandle>,
+    child: &'static [&'static str],
+    spawned: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl cowshed_core::runtime::supervisor_manager::SupervisorSpawner for InProcessSpawner {
+    fn spawn(
+        &self,
+        _project_root: &std::path::Path,
+        workspace: &WorkspaceName,
+    ) -> std::io::Result<tokio::process::Child> {
+        use cowshed_core::runtime::supervisor_socket;
+        self.spawned
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if let Some(supervisor) = self.supervisor.clone() {
+            let path = supervisor_socket::socket_path(
+                &self.store_root,
+                &supervisor.snapshot().repo_id,
+                workspace,
+            );
+            tokio::spawn(async move {
+                // A real supervisor takes a moment to open its project before it serves.
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                let listener = supervisor_socket::bind(&path).await.expect("bind");
+                supervisor_socket::serve(listener, supervisor, None).await
+            });
+        }
+        tokio::process::Command::new(self.child[0])
+            .args(&self.child[1..])
+            .kill_on_drop(true)
+            .spawn()
+    }
+}
+
+fn manager_store() -> PathBuf {
+    PathBuf::from("/tmp").join(format!(
+        "cowshed-mgr-{}",
+        &uuid::Uuid::new_v4().simple().to_string()[..12]
+    ))
+}
+
+#[tokio::test]
+async fn the_manager_starts_one_supervisor_for_concurrent_ensures() {
+    use cowshed_core::runtime::supervisor_manager::SupervisorManager;
+    let h = harness(1, 1024, false, false);
+    let store = manager_store();
+    let spawned = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let manager = SupervisorManager::new(
+        &store,
+        Box::new(InProcessSpawner {
+            store_root: store.clone(),
+            supervisor: Some(h.handle.clone()),
+            child: &["sleep", "30"],
+            spawned: std::sync::Arc::clone(&spawned),
+        }),
+    );
+    let project = PathBuf::from("/nonexistent/project");
+    let needed = authority();
+    let (first, second) = tokio::join!(
+        manager.ensure(&project, &needed),
+        manager.ensure(&project, &needed)
+    );
+    let (first, second) = (first.unwrap(), second.unwrap());
+    assert_eq!(first.socket, second.socket);
+    assert_eq!(first.authority, authority());
+    assert_eq!(
+        spawned.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "two controllers asking at once share one supervisor"
+    );
+    let again = manager.ensure(&project, &authority()).await.unwrap();
+    assert_eq!(again.pid, first.pid);
+    assert_eq!(spawned.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn the_manager_reports_a_supervisor_that_exits_before_serving() {
+    use cowshed_core::runtime::supervisor_manager::SupervisorManager;
+    let store = manager_store();
+    let manager = SupervisorManager::new(
+        &store,
+        Box::new(InProcessSpawner {
+            store_root: store.clone(),
+            supervisor: None,
+            child: &["sh", "-c", "exit 3"],
+            spawned: std::sync::Arc::default(),
+        }),
+    );
+    let refused = manager
+        .ensure(&PathBuf::from("/nonexistent/project"), &authority())
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code, ErrorCode::EnvironmentMissing);
+    assert!(
+        refused.message.contains("exited") && refused.message.contains('3'),
+        "{}",
+        refused.message
+    );
+}
+
+#[tokio::test]
+async fn the_manager_moves_a_running_supervisor_to_a_newer_grant_revision() {
+    use cowshed_core::runtime::{supervisor_manager::SupervisorManager, supervisor_socket};
+    let h = harness(1, 1024, false, false);
+    let store = manager_store();
+    let path = supervisor_socket::socket_path(&store, &authority().repo_id, &authority().workspace);
+    let listener = supervisor_socket::bind(&path).await.unwrap();
+    let (advances, mut requests) = mpsc::channel(1);
+    tokio::spawn(supervisor_socket::serve(
+        listener,
+        h.handle.clone(),
+        Some(advances),
+    ));
+    let newer = WorkspaceAuthoritySnapshot {
+        grant_revision: authority().grant_revision + 1,
+        ..authority()
+    };
+    let actor = h.handle.clone();
+    let answering = tokio::spawn(async move {
+        let reply: tokio::sync::oneshot::Sender<Result<WorkspaceAuthoritySnapshot>> =
+            requests.recv().await.expect("an advance request");
+        let advanced = actor
+            .advance_authority(
+                authority().grant_revision + 1,
+                authority().lifecycle_revision,
+                config().sandbox,
+            )
+            .await
+            .map(|advanced| advanced.snapshot().clone());
+        reply.send(advanced).unwrap();
+    });
+    let spawned = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let manager = SupervisorManager::new(
+        &store,
+        Box::new(InProcessSpawner {
+            store_root: store.clone(),
+            supervisor: None,
+            child: &["sleep", "30"],
+            spawned: std::sync::Arc::clone(&spawned),
+        }),
+    );
+    let ensured = manager
+        .ensure(&PathBuf::from("/nonexistent/project"), &newer)
+        .await
+        .unwrap();
+    answering.await.unwrap();
+    assert_eq!(ensured.authority, newer);
+    assert_eq!(
+        spawned.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "no second supervisor"
+    );
+    let remote = supervisor_socket::connect(ensured.socket, ensured.authority);
+    remote
+        .exec(None, request(StdinSource::Empty))
+        .await
+        .unwrap();
 }

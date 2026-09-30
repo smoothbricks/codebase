@@ -614,10 +614,13 @@ async fn run_daemon() -> Result<()> {
     // checkout path would otherwise dangle until something touched it.
     heal_recorded_projects(&storage).await;
     heal_sccache_daemon().await;
+    let store_root = storage.store().to_path_buf();
     let inventory = NativeSessionInventory::new(storage);
     // The git credential helper is this same binary, which launchd started from the host-stable
     // path: a helper spawned by the daemon has to keep resolving for as long as the daemon runs.
+    // Workspace supervisors are this binary too, for the same reason.
     let executable = running_executable()?;
+    let supervisor_program = executable.clone();
     let config = GatewayConfig {
         executable_sha256: Some(executable_sha256(&executable)?),
         ..paths.config(effective_uid(), executable)
@@ -628,7 +631,12 @@ async fn run_daemon() -> Result<()> {
         .await
         .map_err(|error| CowshedError::internal(format!("could not start gateway: {error}")))?;
     let handle = OwnedGateway::new(gateway.handle());
-    if let Err(primary) = install_all_sessions(&inventory, &handle).await {
+    let started = async {
+        install_all_sessions(&inventory, &handle).await?;
+        start_supervisor_manager(&store_root, supervisor_program).await
+    }
+    .await;
+    if let Err(primary) = started {
         return match gateway.drain().await {
             Ok(()) => Err(primary),
             Err(error) => Err(CowshedError::internal(format!(
@@ -639,6 +647,31 @@ async fn run_daemon() -> Result<()> {
     }
 
     drain_after_shutdown(gateway, wait_for_shutdown_signal()).await
+}
+
+/// Own the host's workspace supervisors (11_shell.md "Supervisor"): find the ones still serving
+/// from before this daemon started, then take ensures on the manager socket.
+async fn start_supervisor_manager(store_root: &Path, program: PathBuf) -> Result<()> {
+    use cowshed_core::runtime::{supervisor_manager, supervisor_socket};
+    let manager = supervisor_manager::SupervisorManager::new(
+        store_root,
+        Box::new(supervisor_manager::ProgramSpawner::new(
+            program,
+            vec![crate::workspace_supervisor::VERB.into()],
+        )),
+    );
+    manager.adopt_running().await;
+    let listener =
+        supervisor_socket::bind(&supervisor_manager::manager_socket_path(store_root)).await?;
+    tokio::spawn(async move {
+        if let Err(error) = supervisor_manager::serve(listener, manager).await {
+            eprintln!(
+                "cowshed: workspace supervisors are unavailable: {}",
+                error.message
+            );
+        }
+    });
+    Ok(())
 }
 
 /// Heal every recorded project, mains before sessions, reporting rather than raising.

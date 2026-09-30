@@ -138,6 +138,7 @@ impl Workspace {
             credential_env_names: std::collections::BTreeSet::new(),
             shell_host: None,
             shell_pool: ShellPoolConfig::default(),
+            group_ledger: None,
         };
         let artifacts = ArtifactStoreSink::open(
             config.workspace_root.clone(),
@@ -776,4 +777,76 @@ async fn host_controller_killing_a_script_job_ends_every_process_it_started() {
         1,
         "the kill never reached the warm shell"
     );
+}
+
+#[tokio::test]
+#[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
+async fn host_controller_a_revoke_binds_every_later_command_and_no_running_one() {
+    let mut workspace = Workspace::new("shell-pool-revoke", 41_312);
+    workspace.envrc("");
+    let granted = workspace
+        .root
+        .parent()
+        .expect("scratch parent")
+        .join(format!("cowshed-granted-{}", uuid::Uuid::new_v4().simple()));
+    std::fs::create_dir_all(&granted).expect("granted directory");
+    let granted_path = granted.display().to_string();
+    workspace.sandbox.grants.write = vec![granted.clone()];
+    let handle = workspace.supervisor(true);
+    run(&handle, sh(&format!("printf n > {granted_path}/before")))
+        .await
+        .ok();
+    // Admitted under revision 1; it writes only once the revoke is installed.
+    let gate = workspace.mount().join("gate");
+    let running = handle
+        .exec(
+            None,
+            sh(&format!(
+                "while [ ! -e {} ]; do sleep 0.05; done; printf n > {granted_path}/during",
+                gate.display()
+            )),
+        )
+        .await
+        .expect("admit the running job");
+    // The spare built ahead of demand under revision 1 exists before the revoke.
+    let spare = tokio::time::timeout(Duration::from_secs(60), async {
+        while workspace.activations() < 2 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    assert!(spare.is_ok(), "a spare activates under revision 1");
+    let before = workspace.activations();
+
+    let mut revoked = workspace.sandbox.clone();
+    revoked.grants.write.clear();
+    let advanced = handle
+        .advance_authority(2, 1, revoked)
+        .await
+        .expect("install revision 2");
+    let denied = run(&advanced, sh(&format!("printf n > {granted_path}/after"))).await;
+    assert_eq!(denied.info.grant_revision, 2);
+    assert_ne!(
+        denied.info.exit,
+        Some(ExitStatus::Exited { code: 0 }),
+        "the first command after the revoke is refused the revoked path"
+    );
+    assert!(!granted.join("after").exists());
+    assert!(
+        workspace.activations() > before,
+        "no host built under revision 1, the spare included, serves revision 2"
+    );
+
+    std::fs::write(&gate, b"go").expect("release the running job");
+    let finished = tokio::time::timeout(Duration::from_secs(60), advanced.wait(running))
+        .await
+        .expect("the running job ends")
+        .expect("its outcome");
+    assert_eq!(finished.exit, Some(ExitStatus::Exited { code: 0 }));
+    assert_eq!(finished.grant_revision, 1);
+    assert!(
+        granted.join("during").exists(),
+        "a job admitted under revision 1 finishes under the profile it started with"
+    );
+    std::fs::remove_dir_all(&granted).ok();
 }

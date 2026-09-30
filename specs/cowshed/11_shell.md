@@ -91,15 +91,19 @@ replaying a supervisor-owned environment in place of its shell entry hooks.
 
 ## Supervisor
 
-One supervisor per attached workspace: the workspace's sole job allocator. It runs in the first controller process that
-needs it, or in a `cowshed __workspace-supervisor <project-root> <workspace>` process started for it, and that process
-serves it on the workspace's socket (Protocol, below). A controller process that finds the socket answering under the
-authority it needs sends its commands there instead of starting a second supervisor; one that finds it answering under
-another incarnation or grant revision refuses with `Conflict` naming the serving process. The supervisor itself never
-evaluates `.envrc`, sources shell startup, or runs repository hooks; it reads only the watch list an activation reports.
-It compiles the deterministic inner child profile first, then starts every exec host, one-shot command, and descendant
-beneath that restriction; each command runs in its job's own process group. The child profile denies writes beneath
-`.cowshed/job/**` and may further narrow for ReadOnly; it never adds authority (04_sandbox.md).
+One supervisor per attached workspace, the workspace's sole job allocator, running as a process of its own:
+`cowshed __workspace-supervisor <project-root> <workspace>`, which serves it on the workspace's socket (Protocol,
+below). The gateway daemon owns these processes through its supervisor manager, listening at `<store>/run/manager.sock`.
+A controller asks the manager to ensure the workspace's supervisor under the incarnation and grant revision it needs,
+and the manager answers with the socket once a supervisor serves it there. It starts one with the daemon's own binary,
+in a session of its own, when nothing answers; ensures of one workspace run one at a time, so two controllers never
+start two allocators. A supervisor therefore outlives the command that first needed it, and the daemon's restarts: the
+manager watches every supervisor it started and, when it starts, finds the ones still serving. A supervisor answering
+under another incarnation is refused with `Conflict` naming its pid. The supervisor itself never evaluates `.envrc`,
+sources shell startup, or runs repository hooks; it reads only the watch list an activation reports. It compiles the
+deterministic inner child profile first, then starts every exec host, one-shot command, and descendant beneath that
+restriction; each command runs in its job's own process group. The child profile denies writes beneath `.cowshed/job/**`
+and may further narrow for ReadOnly; it never adds authority (04_sandbox.md).
 
 - Holds the warm exec hosts above. Host startup and activation run inside the child sandbox; no repository-controlled
   startup runs in the supervisor.
@@ -120,7 +124,8 @@ parts and values are UTF-8 strings without NUL, bounded together at the same 1 M
 values. Validation precedes RPC, job/artifact effects, process allocation, and spawn. The supervisor consumes arguments
 into `OsString` for `plan_exec`; no `String`, lossy rendering, or alternate supervisor wire shape exists.
 
-- `cowshed detach`/`cowshed rm` retire it before the substrate changes (teardown below).
+- It retires itself after 30 minutes with no named session open and no job running, freeing its warm hosts; the next
+  command starts another. `cowshed detach`/`cowshed rm` retire it before the substrate changes (teardown below).
 
 ## Protocol
 
@@ -354,23 +359,25 @@ client recaptures output or derives authority from summary text.
 
 ## Grant-change propagation
 
-When a coordinator applies an effective filesystem `grant`/`revoke` (04_sandbox.md, 07_api.md), the immutable outer
-profile changes. The old supervisor cannot widen or revoke its inherited authority by nesting another profile, so it:
+When a coordinator applies an effective filesystem `grant`/`revoke` (04_sandbox.md, 07_api.md), the revision a command
+needs moves past the one its workspace's supervisor serves. The supervisor runs no workspace code, so it needs no
+process per revision: each exec host and one-shot command starts under the profile compiled for the revision the
+supervisor serves at that moment. So the next command's ensure finds the supervisor serving the older revision of the
+same incarnation and tells it to advance; it re-reads the workspace's and the project's grants, compiles the profile for
+them, and from then on:
 
-1. stops accepting new exec submissions; its exec hosts, keyed by the old revision, are never reused;
-2. drains jobs already admitted under the old revision, then ends its exec hosts and exits;
-3. is relaunched by the controller under a supervisor profile compiled from the new grant revision; new exec hosts
-   activate under that revision;
-4. reports the new enforced `grant_revision` on subsequent jobs.
+1. starts every new exec host and command under that profile; exec hosts, keyed by grant revision, are never reused
+   across revisions;
+2. reports the new enforced `grant_revision` on subsequent jobs;
+3. leaves running jobs under the profile they started with until they end or are killed. A coordinator needing a hard
+   cut kills them.
 
-Running jobs launched under the old profile continue under it until they end or are killed. A coordinator needing a hard
-cut kills those jobs before the drain completes. No-op mutations and egress-only or simulator-only mutations do not
-restart the supervisor because they do not alter its filesystem profile.
+No-op mutations and egress-only or simulator-only mutations leave the revision, and the supervisor, untouched.
 
 **Named sessions refuse to cross revisions.** A named session is pinned to the supervisor profile it was opened under.
 Once a filesystem grant/revoke advances the revision, a later `run` targeting that stale session is rejected with
 `Conflict` naming the enforced and current revisions; it is never silently migrated or resumed. The caller opens a new
-named session after relaunch. Exec hosts need no migration rule: a host is keyed by the grant revision it activated
+named session after the advance. Exec hosts need no migration rule: a host is keyed by the grant revision it activated
 under, so no host of the old revision serves a command of the new one.
 
 ## Teardown ordering

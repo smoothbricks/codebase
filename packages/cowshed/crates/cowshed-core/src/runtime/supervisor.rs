@@ -2088,6 +2088,12 @@ impl WorkspaceSupervisorHandle {
         self.call(|reply| Command::CurrentAuthority { reply }).await
     }
 
+    /// Whether the supervisor holds nothing a client could come back for: no named session is
+    /// open and no job is running.
+    pub(super) async fn idle(&self) -> Result<bool> {
+        self.call(|reply| Command::Idle { reply }).await
+    }
+
     pub async fn retire(&self) -> Result<()> {
         self.call(|reply| Command::Retire {
             authority: self.authority.clone(),
@@ -2264,6 +2270,10 @@ pub(super) enum Command {
     /// The authority the actor holds now; unfenced, because it is how a caller learns it.
     CurrentAuthority {
         reply: oneshot::Sender<Result<WorkspaceAuthoritySnapshot>>,
+    },
+    /// Whether no named session is open and no job is running.
+    Idle {
+        reply: oneshot::Sender<Result<bool>>,
     },
 }
 
@@ -2595,6 +2605,11 @@ impl SupervisorActor {
             }
             Command::CurrentAuthority { reply } => {
                 let _ = reply.send(Ok(self.authority.clone()));
+            }
+            Command::Idle { reply } => {
+                let idle = self.named_sessions.is_empty()
+                    && self.jobs.values().all(JobStateRecord::terminal);
+                let _ = reply.send(Ok(idle));
             }
         }
     }
