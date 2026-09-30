@@ -4,7 +4,7 @@ use super::dto::{
     GitOid, GrantDelta, GrantSet, JobId, JobInfo, LandOptions, LandReport, MirrorInfo,
     ProjectGrantDelta, ProjectGrants, PushOptions, PushReport, RebaseOptions, RemoveOptions,
     RemoveReport, ResizeResult, RevisionResult, RunSandboxMode, StdinSource, WorkspaceIncarnation,
-    WorkspaceInfo,
+    WorkspaceInfo, WorkspaceTarget,
 };
 use super::frame;
 use super::peer_credentials::PeerCredentialsError;
@@ -807,6 +807,15 @@ impl WorkspaceRef {
         (self.info, self.grants)
     }
 
+    /// This workspace as a land or rebase target, pinned to the incarnation this reference was
+    /// resolved at.
+    pub fn target(&self) -> WorkspaceTarget {
+        WorkspaceTarget::new(
+            self.info.workspace.clone(),
+            self.info.workspace_incarnation.clone(),
+        )
+    }
+
     /// Refreshes workspace information from the controller without changing this snapshot.
     pub async fn refresh_info(&self) -> Result<WorkspaceInfo> {
         call_typed(
@@ -1456,23 +1465,56 @@ impl Coordinator {
         .await
     }
 
-    pub async fn rebase(&self, workspace: &str, options: RebaseOptions) -> Result<GitOid> {
+    /// Rebase `workspace` onto what it lands into: `into`'s checked-out branch, or main's `main`
+    /// when `into` is `None`. `into` and `options.onto` are exclusive.
+    pub async fn rebase(
+        &self,
+        workspace: &str,
+        into: Option<&WorkspaceRef>,
+        options: RebaseOptions,
+    ) -> Result<GitOid> {
         let result: RevisionResult = call_typed(
             &self.runtime,
             "coordinator.rebase",
-            json!({ "repoId": self.project.repo_id, "workspace": workspace, "options": options }),
+            self.landing_params(workspace, into, json!(options)),
         )
         .await?;
         Ok(result.oid)
     }
 
-    pub async fn land(&self, workspace: &str, options: LandOptions) -> Result<LandReport> {
+    /// Land `workspace` into `into` — fast-forward the branch `into` has checked out and retire
+    /// the unit — or into main when `into` is `None`.
+    pub async fn land(
+        &self,
+        workspace: &str,
+        into: Option<&WorkspaceRef>,
+        options: LandOptions,
+    ) -> Result<LandReport> {
         call_typed(
             &self.runtime,
             "coordinator.land",
-            json!({ "repoId": self.project.repo_id, "workspace": workspace, "options": options }),
+            self.landing_params(workspace, into, json!(options)),
         )
         .await
+    }
+
+    /// `coordinator.land`/`coordinator.rebase` params. `into` is omitted for main, the default,
+    /// as the options omit theirs.
+    fn landing_params(
+        &self,
+        workspace: &str,
+        into: Option<&WorkspaceRef>,
+        options: Value,
+    ) -> Value {
+        let mut params = json!({
+            "repoId": self.project.repo_id,
+            "workspace": workspace,
+            "options": options,
+        });
+        if let Some(into) = into {
+            params["into"] = json!(into.target());
+        }
+        params
     }
 
     pub async fn restore(&self, workspace: &str, label: &str) -> Result<()> {

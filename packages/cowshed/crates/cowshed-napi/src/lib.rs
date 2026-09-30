@@ -425,18 +425,23 @@ impl Coordinator {
         })
     }
 
-    #[napi]
+    /// `into` is the workspace reference the unit lands into — a lane base — or absent for main.
+    /// It arrives as the reference itself, never as a name, so it carries the incarnation it was
+    /// resolved at; `strict` makes the addon refuse anything that is not one of its references.
+    #[napi(strict)]
     pub fn rebase(
         &self,
         env: Env,
         workspace: String,
         options_json: String,
+        into: Option<&WorkspaceRef>,
     ) -> napi::Result<JsObject> {
         let coordinator = Arc::clone(&self.inner);
+        let into = into.map(|reference| reference.inner.clone());
         spawn_promise(env, async move {
             let options = parse_json::<RebaseOptions>("rebase options", &options_json)?;
             Ok(coordinator
-                .rebase(&workspace, options)
+                .rebase(&workspace, into.as_ref(), options)
                 .await
                 .map_err(AddonFailure::from)?
                 .as_str()
@@ -444,18 +449,21 @@ impl Coordinator {
         })
     }
 
-    #[napi]
+    /// `into` as for [`Self::rebase`]: the lane base the unit lands into, or absent for main.
+    #[napi(strict)]
     pub fn land(
         &self,
         env: Env,
         workspace: String,
         options_json: String,
+        into: Option<&WorkspaceRef>,
     ) -> napi::Result<JsObject> {
         let coordinator = Arc::clone(&self.inner);
+        let into = into.map(|reference| reference.inner.clone());
         spawn_promise(env, async move {
             let options = parse_json::<LandOptions>("land options", &options_json)?;
             let report = coordinator
-                .land(&workspace, options)
+                .land(&workspace, into.as_ref(), options)
                 .await
                 .map_err(AddonFailure::from)?;
             canonical_json("land report", &report)

@@ -1,11 +1,13 @@
-//! Main's warm step: the project-declared build `land` starts in main after moving the target.
+//! The warm step: the project-declared build `land` starts in its target — main, or the lane
+//! base a unit landed into — after moving it.
 //!
-//! A clone starts warm because main's build outputs copy with it, so main has to be built at what
-//! landed. `land` hands main's supervisor the argv `.cowshed.toml` declares under `[land] warm`
-//! and never waits for it. The supervisor keeps the lane: at most one warm job runs, and at most
-//! one run waits behind it. A land that arrives while a warm job runs replaces the waiting run,
-//! keeping the waiting run's base and taking the new head, so the run that starts next covers every
-//! land since the running one began (02_workspaces.md, "Warm main").
+//! A clone starts warm because its source's build outputs copy with it, so the target has to be
+//! built at what landed. `land` hands the target's supervisor the argv its `.cowshed.toml`
+//! declares under `[land] warm` and never waits for it. The supervisor keeps the queue: at most
+//! one warm job runs, and at most one run waits behind it. A land that arrives while a warm job
+//! runs replaces the waiting run, keeping the waiting run's base and taking the new head, so the
+//! run that starts next covers every land since the running one began (02_workspaces.md, "Warm
+//! main").
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -32,8 +34,8 @@ pub(crate) struct WarmRun {
 }
 
 impl WarmRun {
-    /// The background job this run is: the argv, run from main's root with the landed heads in
-    /// its environment and nothing else of its own.
+    /// The background job this run is: the argv, run from the target's root with the landed heads
+    /// in its environment and nothing else of its own.
     pub(crate) fn request(&self) -> ExecRequest {
         let mut env = HashMap::with_capacity(2);
         if let Some(base) = &self.range.base {
@@ -56,7 +58,7 @@ impl WarmRun {
     }
 }
 
-/// The warm lane of one main workspace: the warm job running, and the one run waiting for it.
+/// The warm queue of one land target: the warm job running, and the one run waiting for it.
 #[derive(Debug, Default)]
 pub(crate) struct WarmLane {
     running: Option<JobId>,
@@ -107,42 +109,43 @@ impl WarmLane {
     }
 }
 
-/// Start main's warm step for a land that moved the target over `range`: read `[land] warm` from
-/// main's `.cowshed.toml` and hand it to main's supervisor, which `main_supervisor` produces only
-/// when main declares one. `None` when it does not; a land never waits for the build itself.
+/// Start the land target's warm step for a land that moved it over `range`: read `[land] warm`
+/// from the target's `.cowshed.toml` — main's, or a lane base's — and hand it to the target's
+/// supervisor, which `target_supervisor` produces only when the target declares one. `None` when
+/// it does not; a land never waits for the build itself.
 pub async fn warm_after_land<S, F>(
-    main_root: &Path,
+    target_root: &Path,
     range: WarmRange,
-    main_supervisor: S,
+    target_supervisor: S,
 ) -> Result<Option<WarmAdmission>>
 where
     S: FnOnce() -> F,
     F: Future<Output = Result<WorkspaceSupervisorHandle>>,
 {
-    let Some(argv) = declared_warm(main_root)? else {
+    let Some(argv) = declared_warm(target_root)? else {
         return Ok(None);
     };
-    let supervisor = main_supervisor().await?;
+    let supervisor = target_supervisor().await?;
     supervisor.warm(argv, range).await.map(Some)
 }
 
-/// The `[land] warm` argv main's `.cowshed.toml` declares, if it declares one.
-fn declared_warm(main_root: &Path) -> Result<Option<Vec<CommandArg>>> {
-    let path = main_root.join(COWSHED_CONFIG_FILE);
+/// The `[land] warm` argv the target's `.cowshed.toml` declares, if it declares one.
+fn declared_warm(target_root: &Path) -> Result<Option<Vec<CommandArg>>> {
+    let path = target_root.join(COWSHED_CONFIG_FILE);
     let input = match std::fs::read_to_string(&path) {
         Ok(input) => input,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => {
             return Err(CowshedError::environment_missing(
                 format!("cannot read {}: {error}", path.display()),
-                "make main's .cowshed.toml readable, then land again",
+                "make the land target's .cowshed.toml readable, then land again",
             ));
         }
     };
     let config = crate::storage::bootstrap::parse_cowshed_config(&input).map_err(|error| {
         CowshedError::usage(
             format!("invalid {}: {error}", path.display()),
-            "fix [land] warm in .cowshed.toml on main",
+            "fix [land] warm in the land target's .cowshed.toml",
         )
     })?;
     Ok(config.land().map(|land| {

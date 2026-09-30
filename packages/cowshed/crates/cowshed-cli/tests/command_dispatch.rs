@@ -40,6 +40,8 @@ struct FakeService {
     push_options: Option<PushOptions>,
     rebase_options: Option<RebaseOptions>,
     land_options: Option<LandOptions>,
+    /// What `rebase` and `land` were told the unit lands into, as the service received it.
+    into: Option<Option<String>>,
     /// What the fake land reports of main's warm step.
     land_warm: Option<WarmAdmission>,
     workspace_at_error: Option<CowshedError>,
@@ -76,6 +78,7 @@ impl Default for FakeService {
             push_options: None,
             rebase_options: None,
             land_options: None,
+            into: None,
             land_warm: None,
             workspace_at_error: None,
             gc_candidates: Vec::new(),
@@ -326,13 +329,25 @@ impl CliService for FakeService {
         })
     }
 
-    async fn rebase(&mut self, name: &str, options: RebaseOptions) -> Result<GitOid> {
+    async fn rebase(
+        &mut self,
+        name: &str,
+        into: Option<&str>,
+        options: RebaseOptions,
+    ) -> Result<GitOid> {
+        self.into = Some(into.map(str::to_owned));
         self.rebase_options = Some(options.clone());
         self.events.push(format!("rebase:{name}:{options:?}"));
         Ok(GitOid::new("3".repeat(40)).unwrap())
     }
 
-    async fn land(&mut self, name: &str, options: LandOptions) -> Result<LandReport> {
+    async fn land(
+        &mut self,
+        name: &str,
+        into: Option<&str>,
+        options: LandOptions,
+    ) -> Result<LandReport> {
+        self.into = Some(into.map(str::to_owned));
         #[cfg(target_os = "macos")]
         if let Some(fixture) = self.checked_landing.as_mut() {
             return fixture.land(options).await;
@@ -1422,6 +1437,38 @@ async fn lifecycle_conflicts_and_non_utf8_revisions_fail_without_partial_output(
     assert!(output.into_inner().0.is_empty());
 }
 
+/// A unit of a lane names its lane base with `--into`; the service is handed that name, and only
+/// that name, as what the unit lands into. `--into` and `--onto` are two destinations for one
+/// rebase, so the pair is refused before anything is called.
+#[tokio::test]
+async fn land_and_rebase_carry_the_workspace_a_unit_lands_into() {
+    let mut service = FakeService::default();
+    let (code, _, stderr) = run(&mut service, ["land", "unit", "--into", "lane"]).await;
+    assert_eq!(code, 0, "{}", String::from_utf8_lossy(&stderr));
+    assert_eq!(service.into, Some(Some("lane".to_owned())));
+
+    let (code, _, stderr) = run(&mut service, ["rebase", "unit", "--into", "lane"]).await;
+    assert_eq!(code, 0, "{}", String::from_utf8_lossy(&stderr));
+    assert_eq!(service.into, Some(Some("lane".to_owned())));
+    assert_eq!(
+        service
+            .rebase_options
+            .as_ref()
+            .and_then(|o| o.onto.as_ref()),
+        None
+    );
+
+    let (code, _, _) = run(&mut service, ["land", "unit"]).await;
+    assert_eq!(code, 0);
+    assert_eq!(service.into, Some(None), "no --into lands into main");
+
+    let error = parse_args(["rebase", "unit", "--into", "lane", "--onto", "main"])
+        .expect_err("two destinations for one rebase");
+    assert!(error.message.contains("--into"), "{}", error.message);
+    parse_args(["land", "unit", "--into", "not a name"])
+        .expect_err("--into takes a workspace name");
+}
+
 #[tokio::test]
 async fn exec_preserves_non_utf8_argv_and_maps_child_exit_and_signal() {
     let opaque = OsString::from_vec(vec![b'a', 0x80, b'z']);
@@ -1644,10 +1691,10 @@ impl CliService for SerializedCreateService {
     async fn push(&mut self, _: &str, _: PushOptions) -> Result<PushReport> {
         unreachable!()
     }
-    async fn rebase(&mut self, _: &str, _: RebaseOptions) -> Result<GitOid> {
+    async fn rebase(&mut self, _: &str, _: Option<&str>, _: RebaseOptions) -> Result<GitOid> {
         unreachable!()
     }
-    async fn land(&mut self, _: &str, _: LandOptions) -> Result<LandReport> {
+    async fn land(&mut self, _: &str, _: Option<&str>, _: LandOptions) -> Result<LandReport> {
         unreachable!()
     }
     async fn exec(

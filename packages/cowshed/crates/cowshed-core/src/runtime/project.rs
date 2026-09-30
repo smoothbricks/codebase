@@ -23,6 +23,7 @@ use crate::api::dto::{
     GrantSet, JobId, JobInfo, LandOptions, LandReport, MirrorInfo, ProjectGrantDelta,
     ProjectGrants, PushOptions, PushReport, RebaseOptions, RemoveOptions, RemoveReport,
     RevisionResult, RunSandboxMode, StdinSource, WorkspaceIncarnation, WorkspaceInfo,
+    WorkspaceTarget,
 };
 use crate::api::server::{
     ConnectionAuthority, RouterCommand, RouterHandle, RouterRequest, RouterResponse,
@@ -185,8 +186,21 @@ pub trait ProjectRuntimeHost: Send + 'static {
         workspace: WorkspaceName,
         quota: CheckpointQuota,
     ) -> Result<()>;
-    async fn rebase(&mut self, workspace: WorkspaceName, options: RebaseOptions) -> Result<GitOid>;
-    async fn land(&mut self, workspace: WorkspaceName, options: LandOptions) -> Result<LandReport>;
+    /// Rebase `workspace` onto what it lands into: `into`'s checked-out branch, or main's when
+    /// `into` is `None`.
+    async fn rebase(
+        &mut self,
+        workspace: WorkspaceName,
+        into: Option<WorkspaceTarget>,
+        options: RebaseOptions,
+    ) -> Result<GitOid>;
+    /// Land `workspace` into `into`, or into main when `into` is `None`.
+    async fn land(
+        &mut self,
+        workspace: WorkspaceName,
+        into: Option<WorkspaceTarget>,
+        options: LandOptions,
+    ) -> Result<LandReport>;
     async fn push(
         &mut self,
         workspace: WorkspaceName,
@@ -934,19 +948,23 @@ impl ProjectActor {
 
     async fn coordinator_rebase(&mut self, request: RouterRequest) -> Result<RouterResponse> {
         require_coordinator(request.authority())?;
-        let params: WorkspaceOptionsParams<RebaseOptions> =
-            decode_params(request.params(), request.method())?;
+        let params: IntoParams<RebaseOptions> = decode_params(request.params(), request.method())?;
         self.require_repo(&params.repo_id)?;
-        let oid = self.host.rebase(params.workspace, params.options).await?;
+        let oid = self
+            .host
+            .rebase(params.workspace, params.into, params.options)
+            .await?;
         json_response(RevisionResult { oid })
     }
 
     async fn coordinator_land(&mut self, request: RouterRequest) -> Result<RouterResponse> {
         require_coordinator(request.authority())?;
-        let params: WorkspaceOptionsParams<LandOptions> =
-            decode_params(request.params(), request.method())?;
+        let params: IntoParams<LandOptions> = decode_params(request.params(), request.method())?;
         self.require_repo(&params.repo_id)?;
-        let report = self.host.land(params.workspace, params.options).await?;
+        let report = self
+            .host
+            .land(params.workspace, params.into, params.options)
+            .await?;
         json_response(report)
     }
 
@@ -1418,6 +1436,17 @@ struct OptionsParams<T> {
 struct WorkspaceOptionsParams<T> {
     repo_id: RepoId,
     workspace: WorkspaceName,
+    options: T,
+}
+
+/// A unit's land or rebase: the unit, what it lands into (main when absent), and its options.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct IntoParams<T> {
+    repo_id: RepoId,
+    workspace: WorkspaceName,
+    #[serde(default)]
+    into: Option<WorkspaceTarget>,
     options: T,
 }
 
@@ -3756,6 +3785,7 @@ impl NativeProjectRuntimeHost {
         workspace: &WorkspaceName,
         options: RemoveOptions,
         fence: &NativeRemovalGitFence,
+        containment: &NativeContainment,
     ) -> Result<Option<NativeLandedState>> {
         if workspace.is_main() {
             // Main's removal has no landed gate: main *is* the branch a session has to reach, and
@@ -3768,7 +3798,7 @@ impl NativeProjectRuntimeHost {
         if !options.force {
             Self::require_session_state_clean(workspace, fence)?;
         }
-        self.require_session_landed(workspace, fence, options.abandon)
+        self.require_session_landed(workspace, fence, options.abandon, containment)
             .await
     }
 
@@ -3827,13 +3857,65 @@ impl NativeProjectRuntimeHost {
         Ok(())
     }
 
+    /// Main as the branch a session's work has to reach: what `rm` measures against.
+    fn main_containment(&self) -> Result<NativeContainment> {
+        Ok(NativeContainment {
+            mount: self.workspace_mount_path(&main_name())?,
+            branch: DEFAULT_LANDING_BRANCH.to_owned(),
+        })
+    }
+
+    /// Resolve what `unit` lands into, or rebases onto: main when `into` is `None`, otherwise the
+    /// named workspace, but only at the incarnation `into` was resolved at and never `unit`
+    /// itself. A detached target is attached, since delivering into it means running Git in it.
+    async fn landing_into(
+        &mut self,
+        unit: &WorkspaceName,
+        into: Option<WorkspaceTarget>,
+    ) -> Result<NativeLandingInto> {
+        let main = || -> Result<NativeLandingInto> {
+            Ok(NativeLandingInto {
+                name: main_name(),
+                root: self.descriptor.git_root.clone(),
+                mount: self.workspace_mount_path(&main_name())?,
+            })
+        };
+        let Some(into) = into else {
+            return main();
+        };
+        require_distinct_target(unit, into.workspace())?;
+        let current = self.current(into.workspace()).await?;
+        require_target_incarnation(
+            into.workspace(),
+            current.derived.workspace.incarnation(),
+            into.incarnation(),
+        )?;
+        if into.workspace().is_main() {
+            return main();
+        }
+        if matches!(
+            current.derived.mount_state,
+            crate::storage::lifecycle::MountState::Detached
+        ) {
+            self.attach(into.workspace().clone(), AttachOptions::default())
+                .await?;
+        }
+        let mount = self.workspace_mount_path(into.workspace())?;
+        Ok(NativeLandingInto {
+            name: into.workspace().clone(),
+            root: mount.clone(),
+            mount,
+        })
+    }
+
     /// Where a session's commits stand relative to the branch that has to hold them.
     ///
-    /// The target tip is read out of *main's own repository* — the object store that survives this
-    /// workspace — and never out of a `refs/remotes/*` cache inside the workspace, which is a
-    /// clone-time snapshot that has been observed hundreds of commits stale. The comparison then
-    /// runs inside the workspace with main's object store attached read-only, so main's commits are
-    /// visible without fetching and without writing anything anywhere.
+    /// The target tip is read out of *the target's own repository* — main's, or the lane base a
+    /// unit landed into: the object store that survives this workspace — and never out of a
+    /// `refs/remotes/*` cache inside the workspace, which is a clone-time snapshot that has been
+    /// observed hundreds of commits stale. The comparison then runs inside the workspace with the
+    /// target's object store attached read-only, so its commits are visible without fetching and
+    /// without writing anything anywhere.
     ///
     /// Containment is by patch identity, not only by ancestry. That is the correction this gate
     /// needed: a workspace whose work reached main by squash-merge or a history rewrite is not an
@@ -3843,17 +3925,17 @@ impl NativeProjectRuntimeHost {
         &self,
         workspace: &WorkspaceName,
         head: &GitOid,
+        containment: &NativeContainment,
     ) -> Result<NativeLandedState> {
-        let main_mount = self.workspace_mount_path(&main_name())?;
-        let target = crate::landing::resolve_target(&main_mount, DEFAULT_LANDING_BRANCH).await;
+        let target = crate::landing::resolve_target(&containment.mount, &containment.branch).await;
         let mount = self.workspace_mount_path(workspace)?;
         Ok(NativeLandedState {
-            branch: DEFAULT_LANDING_BRANCH.to_owned(),
+            branch: containment.branch.clone(),
             commits: crate::landing::measure_commits(&target, &mount, head.as_str()).await,
         })
     }
 
-    /// Refuse a session removal that would destroy commits `main` does not contain.
+    /// Refuse a session removal that would destroy commits the containment target does not hold.
     ///
     /// `--abandon` is the only authorization: `--force` covers transient state and deliberately
     /// stops there, so a script that carries `--force` to get past a stuck workspace cannot also
@@ -3864,8 +3946,11 @@ impl NativeProjectRuntimeHost {
         workspace: &WorkspaceName,
         fence: &NativeRemovalGitFence,
         abandon: bool,
+        containment: &NativeContainment,
     ) -> Result<Option<NativeLandedState>> {
-        let landed = self.landed_state(workspace, &fence.head).await?;
+        let landed = self
+            .landed_state(workspace, &fence.head, containment)
+            .await?;
         removal_landed_decision(workspace, &fence.head, landed, abandon)
     }
 
@@ -3881,17 +3966,17 @@ impl NativeProjectRuntimeHost {
         workspace: &WorkspaceName,
         fence: &NativeRemovalGitFence,
         landed: NativeLandedState,
+        containment: &NativeContainment,
     ) -> Result<AbandonedWork> {
         let mount = self.workspace_mount_path(workspace)?;
         let target_head = landed.commits.target_head().cloned();
         let git = crate::git::GitRepository::from_root(&mount);
         let git = match target_head.as_ref() {
             Some(_) => {
-                let main_mount = self.workspace_mount_path(&main_name())?;
-                let main_objects = crate::git::GitRepository::from_root(main_mount)
+                let target_objects = crate::git::GitRepository::from_root(&containment.mount)
                     .object_directory()
                     .await?;
-                git.with_alternate_objects(main_objects)?
+                git.with_alternate_objects(target_objects)?
             }
             None => git,
         };
@@ -3930,6 +4015,360 @@ impl NativeProjectRuntimeHost {
             unlanded_commits,
             bundle,
         })
+    }
+
+    /// Remove `workspace`, gating a session's destruction on `containment` holding its commits:
+    /// main for `rm`, the branch a unit just landed on for `land`'s retire.
+    async fn remove_contained_in(
+        &mut self,
+        workspace: WorkspaceName,
+        options: RemoveOptions,
+        containment: &NativeContainment,
+    ) -> Result<RemoveReport> {
+        use crate::storage::lifecycle::{MountIntent, MountState, Substrate};
+
+        if options.restore && options.force {
+            return Err(CowshedError::usage(
+                "--force and --restore select conflicting main removal modes",
+                "choose exactly one main removal mode",
+            ));
+        }
+        if options.restore && !workspace.is_main() {
+            return Err(CowshedError::usage(
+                "--restore is only valid for the adopted main workspace",
+                "remove a session without --restore",
+            ));
+        }
+        // `--abandon` authorizes destroying commits nothing else holds. On a session that is
+        // commits the project's main branch does not contain; main *is* that branch, so on main
+        // the flag authorizes only what a restore would otherwise refuse to lose, and without
+        // `--restore` it would let a script carry one spelling for both and lose main to a typo.
+        if options.abandon && workspace.is_main() && !options.restore {
+            return Err(CowshedError::usage(
+                "--abandon on main needs --restore: it keeps main's unpreserved commits in a \
+                 bundle inside the restored checkout",
+                "cowshed rm main --restore --abandon",
+            ));
+        }
+        if workspace.is_main() && !options.restore && !options.force {
+            return Err(main_removal_mode_refusal());
+        }
+        self.validate_binding().await?;
+        let intent = crate::storage::recovery::LifecycleIntent::Retire {
+            workspace: workspace.clone(),
+            options,
+            origin: None,
+        };
+        let was_pending = self
+            .lifecycle_intents
+            .get(&workspace)
+            .is_some_and(|record| record.operation == intent && record.completion.is_none());
+        if let Some(report) = self.completed_retire_intent(&intent).cloned()
+            && self
+                .current(&workspace)
+                .await
+                .is_err_and(|error| error.code == ErrorCode::NotFound)
+        {
+            return Ok(report);
+        }
+
+        let mut current = match self.current(&workspace).await {
+            Err(error) if error.code == ErrorCode::NotFound && !workspace.is_main() => {
+                if let Some((image, metadata)) = self
+                    .pending_metadata()
+                    .await?
+                    .into_iter()
+                    .find(|(_, metadata)| metadata.workspace == workspace)
+                {
+                    let unfinished = self
+                        .lifecycle_intents
+                        .get(&workspace)
+                        .filter(|record| record.completion.is_none())
+                        .map(|record| record.operation.clone());
+                    let origin = match unfinished {
+                        // No intent names this clone, so nothing will ever finish it; once no
+                        // process is still creating it, it is retired from its own metadata.
+                        None => {
+                            if !self.claim_intent_lease(&workspace)?
+                                || image_lifecycle_lock_is_held(&image)?
+                            {
+                                return Err(another_process_is_running(&workspace));
+                            }
+                            abandoned_clone_origin(&metadata)
+                        }
+                        Some(
+                            operation @ (crate::storage::recovery::LifecycleIntent::Create {
+                                ..
+                            }
+                            | crate::storage::recovery::LifecycleIntent::Fork { .. }),
+                        ) => operation,
+                        Some(crate::storage::recovery::LifecycleIntent::Retire {
+                            options: original,
+                            origin: Some(origin),
+                            ..
+                        }) if original == options => *origin,
+                        Some(_) => {
+                            return Err(CowshedError::integrity(
+                                format!(
+                                    "pending workspace {workspace} has no unfinished matching lifecycle intent"
+                                ),
+                                "cowshed doctor --json",
+                            ));
+                        }
+                    };
+                    let (report, retired) = self
+                        .retire_pending_workspace(&workspace, options, origin, metadata)
+                        .await?;
+                    let substrate = self.substrate.clone();
+                    std::mem::drop(tokio::spawn(async move {
+                        let _ = substrate.reclaim(retired).await;
+                    }));
+                    return Ok(report);
+                }
+                if was_pending {
+                    let report = RemoveReport::default();
+                    self.complete_lifecycle_intent(
+                        &workspace,
+                        crate::storage::recovery::LifecycleIntentCompletion::Retire(report.clone()),
+                    )
+                    .await?;
+                    return Ok(report);
+                }
+                return Err(error);
+            }
+            Ok(current) => current,
+            // A restore's retry reaches here once main is retired. It must finish the unbinding,
+            // so it is tried before the pending-intent completion below, which would answer the
+            // retry with success while the binding still stands.
+            Err(error) if options.restore && error.code == ErrorCode::NotFound => {
+                // The binding's absence is the restore's completion. Recovery at open replays a
+                // pending restore, so this very process may already have finished it and removed
+                // the project directory with the binding; there is nothing left to record or
+                // journal, and writing either would recreate that directory.
+                if !self.project_is_bound().await? {
+                    return Ok(RemoveReport::default());
+                }
+                let pre_cowshed = pre_cowshed_path(&self.descriptor.git_root)?;
+                let pre_cowshed_absent = match tokio::fs::symlink_metadata(&pre_cowshed).await {
+                    Ok(_) => false,
+                    Err(inspect) if inspect.kind() == std::io::ErrorKind::NotFound => true,
+                    Err(inspect) => {
+                        return Err(CowshedError::environment_missing(
+                            format!(
+                                "cannot inspect retained checkout {}: {inspect}",
+                                pre_cowshed.display()
+                            ),
+                            "check parent-directory permissions and retry",
+                        ));
+                    }
+                };
+                let restored = pre_cowshed_absent
+                    && self
+                        .verify_checkout_identity(
+                            &self.descriptor.git_root,
+                            "restored project checkout",
+                        )
+                        .await
+                        .is_ok();
+                if restored {
+                    // This open may have been the one that reclaimed main's retired image, and
+                    // with it the last image naming this checkout; a restore stranded before the
+                    // record existed gets it here, before anything else can fail.
+                    self.record_checkout_root().await?;
+                    if !was_pending {
+                        self.begin_lifecycle_intent(intent.clone()).await?;
+                    }
+                    self.mark_lifecycle_intent_mutating(&workspace).await?;
+                    self.unbind_restored_project().await?;
+                    return Ok(RemoveReport::default());
+                }
+                return Err(error);
+            }
+            Err(error) if error.code == ErrorCode::NotFound && was_pending => {
+                let report = RemoveReport::default();
+                self.complete_lifecycle_intent(
+                    &workspace,
+                    crate::storage::recovery::LifecycleIntentCompletion::Retire(report.clone()),
+                )
+                .await?;
+                return Ok(report);
+            }
+            Err(error) => return Err(error),
+        };
+        if workspace.is_main() {
+            self.record_checkout_root().await?;
+        }
+
+        if options.restore {
+            let pre_cowshed = pre_cowshed_path(&self.descriptor.git_root)?;
+            let project_root = self.layout.project().project_root.clone();
+            crate::storage::lifecycle::dispatch_blocking(move || {
+                require_terminal_storage(&project_root)
+            })
+            .await
+            .map_err(|error| {
+                CowshedError::internal(format!("terminal storage check failed: {error}"))
+            })??;
+            let initial_rollback_state = self.adopt_rollback_state(&current, &pre_cowshed).await?;
+            let mut abandoned = None;
+            if !options.force && initial_rollback_state != NativeAdoptRollbackState::Complete {
+                self.verify_checkout_identity(&pre_cowshed, "retained pre-cowshed checkout")
+                    .await?;
+                let initially_detached =
+                    matches!(current.derived.mount_state, MountState::Detached);
+                if initially_detached {
+                    self.substrate
+                        .ensure_mounted(&current.derived.workspace, MountIntent { browse: false })
+                        .await
+                        .map_err(native_storage_error)?;
+                    current = self.current(&workspace).await?;
+                }
+                let preserved = match self.main_restore_preservation(&current, &pre_cowshed).await {
+                    Ok(MainPreservation::Preserved) => Ok(()),
+                    Ok(MainPreservation::Unpreserved {
+                        head,
+                        retained_head,
+                    }) if options.abandon => self
+                        .bundle_abandoned_main(&current, &pre_cowshed, head, retained_head)
+                        .await
+                        .map(|work| abandoned = Some(work)),
+                    Ok(MainPreservation::Unpreserved { head, .. }) => Err(CowshedError::conflict(
+                        format!(
+                            "main head {head} is not preserved by the retained checkout or a \
+                                 remote ref"
+                        ),
+                        "push main to its remote so its commits survive, or keep them only \
+                             as a bundle in the restored checkout: cowshed rm main --restore \
+                             --abandon",
+                    )),
+                    Err(error) => Err(error),
+                };
+                if let Err(error) = preserved {
+                    if initially_detached {
+                        self.substrate
+                            .unmount(&current.derived.workspace)
+                            .await
+                            .map_err(native_storage_error)?;
+                    }
+                    return Err(error);
+                }
+            }
+            if !was_pending {
+                self.begin_lifecycle_intent(intent.clone()).await?;
+            }
+            self.mark_lifecycle_intent_mutating(&workspace).await?;
+            let incarnation = current.derived.workspace.incarnation().clone();
+            self.stop_supervisor(&workspace).await?;
+            let current = self.current(&workspace).await?;
+            Self::require_exact_incarnation(&current, &incarnation)?;
+            let rollback_state = self.adopt_rollback_state(&current, &pre_cowshed).await?;
+            if rollback_state != NativeAdoptRollbackState::Complete {
+                self.substrate
+                    .restore_adopted_checkout(&current.derived.workspace, &pre_cowshed)
+                    .await
+                    .map_err(native_storage_error)?;
+            }
+            let current = self.current(&workspace).await?;
+            Self::require_exact_incarnation(&current, &incarnation)?;
+            self.verify_checkout_identity(&self.descriptor.git_root, "restored project checkout")
+                .await?;
+            if tokio::fs::symlink_metadata(&pre_cowshed).await.is_ok() {
+                return Err(CowshedError::integrity(
+                    "pre-cowshed path remains after atomic checkout restoration",
+                    "retry adoption rollback before removing project state",
+                ));
+            }
+            self.retire_restored_main(current).await?;
+            self.unbind_restored_project().await?;
+            return Ok(RemoveReport { abandoned });
+        }
+
+        let initially_detached = matches!(current.derived.mount_state, MountState::Detached);
+        if initially_detached {
+            self.substrate
+                .ensure_mounted(&current.derived.workspace, MountIntent { browse: false })
+                .await
+                .map_err(native_storage_error)?;
+        }
+        // The landed proof lives in main's repository, so main has to be readable for the whole
+        // removal — including the revalidation after the supervisor stops. A project whose main is
+        // detached still gets the proof: main is mounted for the duration and put back as found,
+        // because the answer to "would this destroy work" must not depend on mount posture.
+        let main_initially_detached = !workspace.is_main() && {
+            let main = self.current(&main_name()).await?;
+            let detached = matches!(main.derived.mount_state, MountState::Detached);
+            if detached {
+                self.substrate
+                    .ensure_mounted(&main.derived.workspace, MountIntent { browse: false })
+                    .await
+                    .map_err(native_storage_error)?;
+            }
+            detached
+        };
+
+        let removal = async {
+            let current = self.current(&workspace).await?;
+            let initial_fence = self.removal_git_fence(&current).await?;
+            self.require_removal_safe(&workspace, options, &initial_fence, containment)
+                .await?;
+            let (current, final_fence) = self
+                .revalidated_removal_fence(&workspace, &initial_fence)
+                .await?;
+            let abandoning = self
+                .require_removal_safe(&workspace, options, &final_fence, containment)
+                .await?;
+            if !was_pending {
+                self.begin_lifecycle_intent(intent).await?;
+            }
+            self.mark_lifecycle_intent_mutating(&workspace).await?;
+            // Creation and an empty-repository fetch both finish before anything is destroyed: a
+            // preservation artifact that has not proved its own recoverability authorizes nothing.
+            let abandoned = match abandoning {
+                Some(landed) => Some(
+                    self.bundle_abandoned_work(&workspace, &final_fence, landed, containment)
+                        .await?,
+                ),
+                None => None,
+            };
+            self.finish_retirement(current).await?;
+            Ok(RemoveReport { abandoned })
+        }
+        .await;
+
+        if main_initially_detached {
+            let main = self.current(&main_name()).await?;
+            self.stop_supervisor(&main_name()).await?;
+            self.substrate
+                .unmount(&main.derived.workspace)
+                .await
+                .map_err(native_storage_error)?;
+        }
+        let report = match removal {
+            Ok(report) => report,
+            Err(primary) => {
+                let cleanup = match self.current(&workspace).await {
+                    Ok(current) if initially_detached => self
+                        .substrate
+                        .unmount(&current.derived.workspace)
+                        .await
+                        .map_err(native_storage_error),
+                    Ok(_) => self.ensure_supervisor(&workspace).await.map(|_| ()),
+                    Err(_) => Ok(()),
+                };
+                return match cleanup {
+                    Ok(()) => Err(primary),
+                    Err(cleanup) => Err(CowshedError::internal(format!(
+                        "workspace removal failed: {primary}; state restoration also failed: {cleanup}"
+                    ))),
+                };
+            }
+        };
+        self.complete_lifecycle_intent(
+            &workspace,
+            crate::storage::recovery::LifecycleIntentCompletion::Retire(report.clone()),
+        )
+        .await?;
+        Ok(report)
     }
 
     /// Whether main's head survives the restore: held by the retained checkout (a branch or a
@@ -5054,10 +5493,13 @@ impl NativeProjectRuntimeHost {
             .get(workspace)
             .is_some_and(|record| record.operation == retire_intent && record.completion.is_none());
         let substrate = self.substrate.clone();
+        // An unpublished clone never landed anywhere: main is what has to hold its work.
+        let containment = self.main_containment()?;
         let result = async {
             let (retired, abandoned) = substrate
                 .execute_pending_clone_retirement(plan, |stage| {
                     let this = &mut *self;
+                    let containment = &containment;
                     async move {
                         let first = this
                             .removal_git_fence_at(&stage.mount_point, stage.workspace.incarnation())
@@ -5065,8 +5507,13 @@ impl NativeProjectRuntimeHost {
                         if !options.force {
                             Self::require_session_state_clean(workspace, &first)?;
                         }
-                        this.require_session_landed(workspace, &first, options.abandon)
-                            .await?;
+                        this.require_session_landed(
+                            workspace,
+                            &first,
+                            options.abandon,
+                            containment,
+                        )
+                        .await?;
                         this.stop_supervisor(workspace).await?;
                         let last = this
                             .removal_git_fence_at(&stage.mount_point, stage.workspace.incarnation())
@@ -5082,16 +5529,17 @@ impl NativeProjectRuntimeHost {
                             Self::require_session_state_clean(workspace, &last)?;
                         }
                         let abandoning = this
-                            .require_session_landed(workspace, &last, options.abandon)
+                            .require_session_landed(workspace, &last, options.abandon, containment)
                             .await?;
                         if !previous {
                             this.begin_lifecycle_intent(retire_intent).await?;
                         }
                         this.mark_lifecycle_intent_mutating(workspace).await?;
                         let abandoned = match abandoning {
-                            Some(landed) => {
-                                Some(this.bundle_abandoned_work(workspace, &last, landed).await?)
-                            }
+                            Some(landed) => Some(
+                                this.bundle_abandoned_work(workspace, &last, landed, containment)
+                                    .await?,
+                            ),
                             None => None,
                         };
                         this.unregister_workspace_in_main(workspace, info.git_worktree)
@@ -5610,6 +6058,46 @@ struct NativeLandedState {
     commits: LandingCommits,
 }
 
+/// The branch a removal measures a session against, in the repository that holds it: main's
+/// `main` for `rm`; for `land`'s retire, the branch the unit just landed on.
+#[cfg(target_os = "macos")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct NativeContainment {
+    /// The target repository's canonical mount, whose object store the measurement borrows.
+    mount: PathBuf,
+    branch: String,
+}
+
+/// What a unit lands into or rebases onto: main, or a lane base.
+#[cfg(target_os = "macos")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct NativeLandingInto {
+    name: WorkspaceName,
+    /// Where Git runs to move the target: main's checkout, or the lane base's mount.
+    root: PathBuf,
+    /// The target's canonical mount, which the retire's containment check reads.
+    mount: PathBuf,
+}
+
+#[cfg(target_os = "macos")]
+impl NativeLandingInto {
+    /// The branch a land moves when the caller names none: `main` for main, and whatever branch
+    /// a lane base has checked out.
+    async fn checked_out_branch(&self) -> Result<String> {
+        if self.name.is_main() {
+            return Ok(DEFAULT_LANDING_BRANCH.to_owned());
+        }
+        target_checked_out_branch(&self.root, &self.name).await
+    }
+
+    fn containment(&self, branch: String) -> NativeContainment {
+        NativeContainment {
+            mount: self.mount.clone(),
+            branch,
+        }
+    }
+}
+
 #[cfg(target_os = "macos")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum NativeAdoptRollbackState {
@@ -5781,6 +6269,258 @@ mod rebase_recovery_tests {
         assert_eq!(git_oid(&root).await.expect("unmoved head"), source_head);
         assert!(git(&root, &["stash", "list"]).stdout.is_empty());
         std::fs::remove_dir_all(root).expect("remove fixture repository");
+    }
+
+    /// A lane: main, a lane base cloned from it on `cowshed/<lane>`, and unit clones of the lane
+    /// base on `cowshed/<unit>`, each its own repository exactly as cowshed's clones are.
+    struct Lane {
+        base: PathBuf,
+        main: PathBuf,
+        lane: PathBuf,
+    }
+
+    impl Lane {
+        fn new(label: &str) -> Self {
+            let base = std::env::temp_dir().join(format!(
+                "cowshed-lane-{label}-{}",
+                uuid::Uuid::new_v4().simple()
+            ));
+            let main = base.join("main");
+            std::fs::create_dir_all(&main).expect("create main");
+            run_git(&main, &["init", "--initial-branch=main"]);
+            Self::identify(&main);
+            commit_file(&main, "base\n", "base");
+            let lane = Self::clone_of(&base, &main, "lane");
+            Self { base, main, lane }
+        }
+
+        fn identify(root: &Path) {
+            run_git(root, &["config", "user.name", "Cowshed Test"]);
+            run_git(root, &["config", "user.email", "cowshed@example.invalid"]);
+        }
+
+        fn clone_of(base: &Path, source: &Path, name: &str) -> PathBuf {
+            let root = base.join(name);
+            let output = std::process::Command::new("git")
+                .args(["clone", "--quiet"])
+                .arg(source)
+                .arg(&root)
+                .output()
+                .expect("clone");
+            assert!(output.status.success(), "{output:?}");
+            Self::identify(&root);
+            run_git(&root, &["checkout", "-b", &format!("cowshed/{name}")]);
+            root
+        }
+
+        fn unit(&self, name: &str) -> PathBuf {
+            Self::clone_of(&self.base, &self.lane, name)
+        }
+
+        fn name(name: &str) -> WorkspaceName {
+            WorkspaceName::new(name).expect("workspace name")
+        }
+    }
+
+    impl Drop for Lane {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.base);
+        }
+    }
+
+    fn unit_commit(root: &Path, file: &str, message: &str) {
+        std::fs::write(root.join(file), format!("{message}\n")).expect("write unit file");
+        run_git(root, &["add", file]);
+        run_git(root, &["commit", "-m", message]);
+    }
+
+    async fn contained_in(
+        target: &Path,
+        branch: &str,
+        unit: &Path,
+    ) -> Result<Option<NativeLandedState>> {
+        let head = git_oid(unit).await.expect("unit head");
+        let resolved = crate::landing::resolve_target(target, branch).await;
+        let landed = NativeLandedState {
+            branch: branch.to_owned(),
+            commits: crate::landing::measure_commits(&resolved, unit, head.as_str()).await,
+        };
+        removal_landed_decision(&Lane::name("unit"), &head, landed, false)
+    }
+
+    #[tokio::test]
+    async fn a_unit_lands_into_its_lane_base_and_is_then_contained_there_not_in_main() {
+        let lane = Lane::new("land");
+        let unit = lane.unit("unit");
+        unit_commit(&unit, "unit.txt", "unit work");
+        let unit_head = git_oid(&unit).await.expect("unit head");
+        let main_before = git_oid(&lane.main).await.expect("main head");
+
+        deliver_into(
+            &Lane::name("lane"),
+            &lane.lane,
+            &unit,
+            &Lane::name("unit"),
+            "cowshed/unit",
+            &unit_head,
+            "cowshed/lane",
+        )
+        .await
+        .expect("land into the lane base");
+
+        assert_eq!(
+            git_oid(&lane.lane).await.expect("lane head"),
+            unit_head,
+            "the lane base's checked-out branch fast-forwarded to the unit"
+        );
+        assert_eq!(
+            git_oid(&lane.main).await.expect("main head"),
+            main_before,
+            "main is untouched until the lane itself lands"
+        );
+        // The retire gate, measured against the branch the unit landed on, lets it go…
+        assert!(
+            contained_in(&lane.lane, "cowshed/lane", &unit)
+                .await
+                .expect("contained in the lane base")
+                .is_none()
+        );
+        // …and the same gate measured against main would refuse it: that is why land passes the
+        // target it delivered into, and why a standalone `rm` still measures against main.
+        let refused = contained_in(&lane.main, "main", &unit)
+            .await
+            .expect_err("main does not hold the unit's commit");
+        assert_eq!(refused.code, crate::error::ErrorCode::Conflict);
+    }
+
+    #[tokio::test]
+    async fn a_land_into_a_lane_base_refuses_a_unit_that_moved_after_validation() {
+        let lane = Lane::new("moved");
+        let unit = lane.unit("unit");
+        unit_commit(&unit, "unit.txt", "validated");
+        let validated = git_oid(&unit).await.expect("validated head");
+        unit_commit(&unit, "unit.txt", "unvalidated");
+        let lane_before = git_oid(&lane.lane).await.expect("lane head");
+
+        let error = deliver_into(
+            &Lane::name("lane"),
+            &lane.lane,
+            &unit,
+            &Lane::name("unit"),
+            "cowshed/unit",
+            &validated,
+            "cowshed/lane",
+        )
+        .await
+        .expect_err("what arrived is not what was validated");
+        assert_eq!(error.code, crate::error::ErrorCode::Conflict);
+        assert_eq!(git_oid(&lane.lane).await.expect("lane head"), lane_before);
+    }
+
+    #[tokio::test]
+    async fn a_unit_behind_its_lane_base_is_told_to_rebase_into_it_and_then_lands() {
+        let lane = Lane::new("rebase");
+        let first = lane.unit("first");
+        let second = lane.unit("second");
+        unit_commit(&first, "first.txt", "first unit");
+        let first_head = git_oid(&first).await.expect("first head");
+        deliver_into(
+            &Lane::name("lane"),
+            &lane.lane,
+            &first,
+            &Lane::name("first"),
+            "cowshed/first",
+            &first_head,
+            "cowshed/lane",
+        )
+        .await
+        .expect("first unit lands");
+        unit_commit(&second, "second.txt", "second unit");
+        let second_head = git_oid(&second).await.expect("second head");
+        let lane_before = git_oid(&lane.lane).await.expect("lane head");
+
+        // The lane base moved past the second unit's base, so it cannot fast-forward; the next
+        // move named is the rebase onto the lane base, since a bare rebase would go onto main.
+        let behind = deliver_into(
+            &Lane::name("lane"),
+            &lane.lane,
+            &second,
+            &Lane::name("second"),
+            "cowshed/second",
+            &second_head,
+            "cowshed/lane",
+        )
+        .await
+        .expect_err("the second unit is not based on the lane base's tip");
+        assert_eq!(behind.code, crate::error::ErrorCode::Conflict);
+        assert!(
+            behind.hint.contains("cowshed rebase second --into lane"),
+            "{}",
+            behind.hint
+        );
+        assert_eq!(git_oid(&lane.lane).await.expect("lane head"), lane_before);
+
+        let onto = fetch_target_branch(&second, &lane.lane, &Lane::name("lane"))
+            .await
+            .expect("fetch the lane base's branch");
+        run_git_rebase_atomically(&second, &onto, &second_head)
+            .await
+            .expect("rebase into the lane");
+
+        let parent = git_revision_oid(&second, "HEAD^").await.expect("parent");
+        assert_eq!(parent, first_head, "the second unit now sits on the first");
+        assert!(second.join("first.txt").exists() && second.join("second.txt").exists());
+        // And it lands into the lane base as a fast-forward.
+        let rebased = git_oid(&second).await.expect("rebased head");
+        deliver_into(
+            &Lane::name("lane"),
+            &lane.lane,
+            &second,
+            &Lane::name("second"),
+            "cowshed/second",
+            &rebased,
+            "cowshed/lane",
+        )
+        .await
+        .expect("second unit lands");
+        assert_eq!(git_oid(&lane.lane).await.expect("lane head"), rebased);
+    }
+
+    #[test]
+    fn a_lane_base_recreated_under_its_name_is_refused() {
+        let resolved = WorkspaceIncarnation::new("0198f2c0b7e34dc795f17b238b331c80").unwrap();
+        let recreated = WorkspaceIncarnation::new("0198f2c0b7e34dc795f17b238b331c81").unwrap();
+        let lane = Lane::name("lane");
+        require_target_incarnation(&lane, &resolved, &resolved).expect("the same workspace");
+        let error = require_target_incarnation(&lane, &recreated, &resolved)
+            .expect_err("a recreated lane base is another workspace");
+        assert_eq!(error.code, crate::error::ErrorCode::Conflict);
+        assert!(
+            error.hint.contains("resolve workspace lane again"),
+            "{}",
+            error.hint
+        );
+    }
+
+    #[test]
+    fn a_unit_has_one_destination_and_it_is_not_itself() {
+        let lane = WorkspaceTarget::new(
+            Lane::name("lane"),
+            WorkspaceIncarnation::new("0198f2c0b7e34dc795f17b238b331c80").unwrap(),
+        );
+        let onto = crate::api::dto::RevisionTarget::Oid(
+            GitOid::new("1111111111111111111111111111111111111111").unwrap(),
+        );
+        let both = require_single_destination(Some(&onto), Some(&lane))
+            .expect_err("onto and into are exclusive");
+        assert_eq!(both.code, crate::error::ErrorCode::Usage);
+        require_single_destination(Some(&onto), None).expect("onto alone");
+        require_single_destination(None, Some(&lane)).expect("into alone");
+
+        let itself = require_distinct_target(&Lane::name("unit"), &Lane::name("unit"))
+            .expect_err("a unit does not land into itself");
+        assert_eq!(itself.code, crate::error::ErrorCode::Usage);
+        require_distinct_target(&Lane::name("unit"), &Lane::name("lane")).expect("its lane base");
     }
 }
 #[cfg(target_os = "macos")]
@@ -6951,350 +7691,9 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
         workspace: WorkspaceName,
         options: RemoveOptions,
     ) -> Result<RemoveReport> {
-        use crate::storage::lifecycle::{MountIntent, MountState, Substrate};
-
-        if options.restore && options.force {
-            return Err(CowshedError::usage(
-                "--force and --restore select conflicting main removal modes",
-                "choose exactly one main removal mode",
-            ));
-        }
-        if options.restore && !workspace.is_main() {
-            return Err(CowshedError::usage(
-                "--restore is only valid for the adopted main workspace",
-                "remove a session without --restore",
-            ));
-        }
-        // `--abandon` authorizes destroying commits nothing else holds. On a session that is
-        // commits the project's main branch does not contain; main *is* that branch, so on main
-        // the flag authorizes only what a restore would otherwise refuse to lose, and without
-        // `--restore` it would let a script carry one spelling for both and lose main to a typo.
-        if options.abandon && workspace.is_main() && !options.restore {
-            return Err(CowshedError::usage(
-                "--abandon on main needs --restore: it keeps main's unpreserved commits in a \
-                 bundle inside the restored checkout",
-                "cowshed rm main --restore --abandon",
-            ));
-        }
-        if workspace.is_main() && !options.restore && !options.force {
-            return Err(main_removal_mode_refusal());
-        }
-        self.validate_binding().await?;
-        let intent = crate::storage::recovery::LifecycleIntent::Retire {
-            workspace: workspace.clone(),
-            options,
-            origin: None,
-        };
-        let was_pending = self
-            .lifecycle_intents
-            .get(&workspace)
-            .is_some_and(|record| record.operation == intent && record.completion.is_none());
-        if let Some(report) = self.completed_retire_intent(&intent).cloned()
-            && self
-                .current(&workspace)
-                .await
-                .is_err_and(|error| error.code == ErrorCode::NotFound)
-        {
-            return Ok(report);
-        }
-
-        let mut current = match self.current(&workspace).await {
-            Err(error) if error.code == ErrorCode::NotFound && !workspace.is_main() => {
-                if let Some((image, metadata)) = self
-                    .pending_metadata()
-                    .await?
-                    .into_iter()
-                    .find(|(_, metadata)| metadata.workspace == workspace)
-                {
-                    let unfinished = self
-                        .lifecycle_intents
-                        .get(&workspace)
-                        .filter(|record| record.completion.is_none())
-                        .map(|record| record.operation.clone());
-                    let origin = match unfinished {
-                        // No intent names this clone, so nothing will ever finish it; once no
-                        // process is still creating it, it is retired from its own metadata.
-                        None => {
-                            if !self.claim_intent_lease(&workspace)?
-                                || image_lifecycle_lock_is_held(&image)?
-                            {
-                                return Err(another_process_is_running(&workspace));
-                            }
-                            abandoned_clone_origin(&metadata)
-                        }
-                        Some(
-                            operation @ (crate::storage::recovery::LifecycleIntent::Create {
-                                ..
-                            }
-                            | crate::storage::recovery::LifecycleIntent::Fork { .. }),
-                        ) => operation,
-                        Some(crate::storage::recovery::LifecycleIntent::Retire {
-                            options: original,
-                            origin: Some(origin),
-                            ..
-                        }) if original == options => *origin,
-                        Some(_) => {
-                            return Err(CowshedError::integrity(
-                                format!(
-                                    "pending workspace {workspace} has no unfinished matching lifecycle intent"
-                                ),
-                                "cowshed doctor --json",
-                            ));
-                        }
-                    };
-                    let (report, retired) = self
-                        .retire_pending_workspace(&workspace, options, origin, metadata)
-                        .await?;
-                    let substrate = self.substrate.clone();
-                    std::mem::drop(tokio::spawn(async move {
-                        let _ = substrate.reclaim(retired).await;
-                    }));
-                    return Ok(report);
-                }
-                if was_pending {
-                    let report = RemoveReport::default();
-                    self.complete_lifecycle_intent(
-                        &workspace,
-                        crate::storage::recovery::LifecycleIntentCompletion::Retire(report.clone()),
-                    )
-                    .await?;
-                    return Ok(report);
-                }
-                return Err(error);
-            }
-            Ok(current) => current,
-            // A restore's retry reaches here once main is retired. It must finish the unbinding,
-            // so it is tried before the pending-intent completion below, which would answer the
-            // retry with success while the binding still stands.
-            Err(error) if options.restore && error.code == ErrorCode::NotFound => {
-                // The binding's absence is the restore's completion. Recovery at open replays a
-                // pending restore, so this very process may already have finished it and removed
-                // the project directory with the binding; there is nothing left to record or
-                // journal, and writing either would recreate that directory.
-                if !self.project_is_bound().await? {
-                    return Ok(RemoveReport::default());
-                }
-                let pre_cowshed = pre_cowshed_path(&self.descriptor.git_root)?;
-                let pre_cowshed_absent = match tokio::fs::symlink_metadata(&pre_cowshed).await {
-                    Ok(_) => false,
-                    Err(inspect) if inspect.kind() == std::io::ErrorKind::NotFound => true,
-                    Err(inspect) => {
-                        return Err(CowshedError::environment_missing(
-                            format!(
-                                "cannot inspect retained checkout {}: {inspect}",
-                                pre_cowshed.display()
-                            ),
-                            "check parent-directory permissions and retry",
-                        ));
-                    }
-                };
-                let restored = pre_cowshed_absent
-                    && self
-                        .verify_checkout_identity(
-                            &self.descriptor.git_root,
-                            "restored project checkout",
-                        )
-                        .await
-                        .is_ok();
-                if restored {
-                    // This open may have been the one that reclaimed main's retired image, and
-                    // with it the last image naming this checkout; a restore stranded before the
-                    // record existed gets it here, before anything else can fail.
-                    self.record_checkout_root().await?;
-                    if !was_pending {
-                        self.begin_lifecycle_intent(intent.clone()).await?;
-                    }
-                    self.mark_lifecycle_intent_mutating(&workspace).await?;
-                    self.unbind_restored_project().await?;
-                    return Ok(RemoveReport::default());
-                }
-                return Err(error);
-            }
-            Err(error) if error.code == ErrorCode::NotFound && was_pending => {
-                let report = RemoveReport::default();
-                self.complete_lifecycle_intent(
-                    &workspace,
-                    crate::storage::recovery::LifecycleIntentCompletion::Retire(report.clone()),
-                )
-                .await?;
-                return Ok(report);
-            }
-            Err(error) => return Err(error),
-        };
-        if workspace.is_main() {
-            self.record_checkout_root().await?;
-        }
-
-        if options.restore {
-            let pre_cowshed = pre_cowshed_path(&self.descriptor.git_root)?;
-            let project_root = self.layout.project().project_root.clone();
-            crate::storage::lifecycle::dispatch_blocking(move || {
-                require_terminal_storage(&project_root)
-            })
+        let containment = self.main_containment()?;
+        self.remove_contained_in(workspace, options, &containment)
             .await
-            .map_err(|error| {
-                CowshedError::internal(format!("terminal storage check failed: {error}"))
-            })??;
-            let initial_rollback_state = self.adopt_rollback_state(&current, &pre_cowshed).await?;
-            let mut abandoned = None;
-            if !options.force && initial_rollback_state != NativeAdoptRollbackState::Complete {
-                self.verify_checkout_identity(&pre_cowshed, "retained pre-cowshed checkout")
-                    .await?;
-                let initially_detached =
-                    matches!(current.derived.mount_state, MountState::Detached);
-                if initially_detached {
-                    self.substrate
-                        .ensure_mounted(&current.derived.workspace, MountIntent { browse: false })
-                        .await
-                        .map_err(native_storage_error)?;
-                    current = self.current(&workspace).await?;
-                }
-                let preserved = match self.main_restore_preservation(&current, &pre_cowshed).await {
-                    Ok(MainPreservation::Preserved) => Ok(()),
-                    Ok(MainPreservation::Unpreserved {
-                        head,
-                        retained_head,
-                    }) if options.abandon => self
-                        .bundle_abandoned_main(&current, &pre_cowshed, head, retained_head)
-                        .await
-                        .map(|work| abandoned = Some(work)),
-                    Ok(MainPreservation::Unpreserved { head, .. }) => Err(CowshedError::conflict(
-                        format!(
-                            "main head {head} is not preserved by the retained checkout or a \
-                                 remote ref"
-                        ),
-                        "push main to its remote so its commits survive, or keep them only \
-                             as a bundle in the restored checkout: cowshed rm main --restore \
-                             --abandon",
-                    )),
-                    Err(error) => Err(error),
-                };
-                if let Err(error) = preserved {
-                    if initially_detached {
-                        self.substrate
-                            .unmount(&current.derived.workspace)
-                            .await
-                            .map_err(native_storage_error)?;
-                    }
-                    return Err(error);
-                }
-            }
-            if !was_pending {
-                self.begin_lifecycle_intent(intent.clone()).await?;
-            }
-            self.mark_lifecycle_intent_mutating(&workspace).await?;
-            let incarnation = current.derived.workspace.incarnation().clone();
-            self.stop_supervisor(&workspace).await?;
-            let current = self.current(&workspace).await?;
-            Self::require_exact_incarnation(&current, &incarnation)?;
-            let rollback_state = self.adopt_rollback_state(&current, &pre_cowshed).await?;
-            if rollback_state != NativeAdoptRollbackState::Complete {
-                self.substrate
-                    .restore_adopted_checkout(&current.derived.workspace, &pre_cowshed)
-                    .await
-                    .map_err(native_storage_error)?;
-            }
-            let current = self.current(&workspace).await?;
-            Self::require_exact_incarnation(&current, &incarnation)?;
-            self.verify_checkout_identity(&self.descriptor.git_root, "restored project checkout")
-                .await?;
-            if tokio::fs::symlink_metadata(&pre_cowshed).await.is_ok() {
-                return Err(CowshedError::integrity(
-                    "pre-cowshed path remains after atomic checkout restoration",
-                    "retry adoption rollback before removing project state",
-                ));
-            }
-            self.retire_restored_main(current).await?;
-            self.unbind_restored_project().await?;
-            return Ok(RemoveReport { abandoned });
-        }
-
-        let initially_detached = matches!(current.derived.mount_state, MountState::Detached);
-        if initially_detached {
-            self.substrate
-                .ensure_mounted(&current.derived.workspace, MountIntent { browse: false })
-                .await
-                .map_err(native_storage_error)?;
-        }
-        // The landed proof lives in main's repository, so main has to be readable for the whole
-        // removal — including the revalidation after the supervisor stops. A project whose main is
-        // detached still gets the proof: main is mounted for the duration and put back as found,
-        // because the answer to "would this destroy work" must not depend on mount posture.
-        let main_initially_detached = !workspace.is_main() && {
-            let main = self.current(&main_name()).await?;
-            let detached = matches!(main.derived.mount_state, MountState::Detached);
-            if detached {
-                self.substrate
-                    .ensure_mounted(&main.derived.workspace, MountIntent { browse: false })
-                    .await
-                    .map_err(native_storage_error)?;
-            }
-            detached
-        };
-
-        let removal = async {
-            let current = self.current(&workspace).await?;
-            let initial_fence = self.removal_git_fence(&current).await?;
-            self.require_removal_safe(&workspace, options, &initial_fence)
-                .await?;
-            let (current, final_fence) = self
-                .revalidated_removal_fence(&workspace, &initial_fence)
-                .await?;
-            let abandoning = self
-                .require_removal_safe(&workspace, options, &final_fence)
-                .await?;
-            if !was_pending {
-                self.begin_lifecycle_intent(intent).await?;
-            }
-            self.mark_lifecycle_intent_mutating(&workspace).await?;
-            // Creation and an empty-repository fetch both finish before anything is destroyed: a
-            // preservation artifact that has not proved its own recoverability authorizes nothing.
-            let abandoned = match abandoning {
-                Some(landed) => Some(
-                    self.bundle_abandoned_work(&workspace, &final_fence, landed)
-                        .await?,
-                ),
-                None => None,
-            };
-            self.finish_retirement(current).await?;
-            Ok(RemoveReport { abandoned })
-        }
-        .await;
-
-        if main_initially_detached {
-            let main = self.current(&main_name()).await?;
-            self.stop_supervisor(&main_name()).await?;
-            self.substrate
-                .unmount(&main.derived.workspace)
-                .await
-                .map_err(native_storage_error)?;
-        }
-        let report = match removal {
-            Ok(report) => report,
-            Err(primary) => {
-                let cleanup = match self.current(&workspace).await {
-                    Ok(current) if initially_detached => self
-                        .substrate
-                        .unmount(&current.derived.workspace)
-                        .await
-                        .map_err(native_storage_error),
-                    Ok(_) => self.ensure_supervisor(&workspace).await.map(|_| ()),
-                    Err(_) => Ok(()),
-                };
-                return match cleanup {
-                    Ok(()) => Err(primary),
-                    Err(cleanup) => Err(CowshedError::internal(format!(
-                        "workspace removal failed: {primary}; state restoration also failed: {cleanup}"
-                    ))),
-                };
-            }
-        };
-        self.complete_lifecycle_intent(
-            &workspace,
-            crate::storage::recovery::LifecycleIntentCompletion::Retire(report.clone()),
-        )
-        .await?;
-        Ok(report)
     }
 
     async fn gc(&mut self, options: GcOptions) -> Result<GcReport> {
@@ -7620,12 +8019,19 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
         .map_err(|error| CowshedError::internal(error.to_string()))?
     }
 
-    async fn rebase(&mut self, workspace: WorkspaceName, options: RebaseOptions) -> Result<GitOid> {
+    async fn rebase(
+        &mut self,
+        workspace: WorkspaceName,
+        into: Option<WorkspaceTarget>,
+        options: RebaseOptions,
+    ) -> Result<GitOid> {
+        require_single_destination(options.onto.as_ref(), into.as_ref())?;
         self.validate_binding().await?;
         let current = self.current(&workspace).await?;
         if let Some(expected) = options.expected_workspace_incarnation.as_ref() {
             Self::require_exact_incarnation(&current, expected)?;
         }
+        let into = self.landing_into(&workspace, into).await?;
         let root = current_snapshot_mount(self, &current)?;
         let source_head = git_oid(&root).await?;
         if options
@@ -7638,34 +8044,35 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                 "refresh the workspace revision and retry rebase",
             ));
         }
-        // The default destination follows the remote's name, which is `main` — and `cowshed-main`
-        // in a workspace where something else already held that name. A git-worktree workspace has
-        // no remote at all and needs none: main's `main` branch is already in its ref namespace,
-        // so the default destination is that branch itself.
-        let main_mount = self.workspace_mount_path(&main_name())?;
-        let mut fetch_remote = None;
-        let git_worktree = is_git_worktree(&current.metadata);
-        let default_onto = if git_worktree {
-            DEFAULT_LANDING_BRANCH.to_owned()
+        let onto = if !into.name.is_main() {
+            // A lane base is its own repository: its branch reaches the unit by a fetch from its
+            // mount into a cowshed-owned ref, which is also what keeps it current. `onto` was
+            // refused above, so this is the only destination.
+            fetch_target_branch(&root, &into.root, &into.name).await?
+        } else if is_git_worktree(&current.metadata) {
+            // A git-worktree workspace reads main's branches straight out of the shared ref
+            // namespace, so there is nothing to refresh and no remote to refresh it from.
+            options
+                .onto
+                .as_ref()
+                .map_or_else(|| DEFAULT_LANDING_BRANCH.to_owned(), revision_target)
         } else {
+            // The default destination follows the remote's name, which is `main` — and
+            // `cowshed-main` in a workspace where something else already held that name. The
+            // refresh runs for an explicit `onto` too, since that is how main's commits reach the
+            // workspace: rebasing onto `main/main` resolves a ref only a fetch creates, and a stale
+            // one silently replays onto yesterday's base.
+            let main_mount = self.workspace_mount_path(&main_name())?;
             let main_remote = crate::git::GitRepository::from_root(&root)
                 .configure_main_remote(&main_mount)
                 .await?;
-            fetch_remote = Some(main_remote.remote_name().to_owned());
-            format!("{}/{DEFAULT_LANDING_BRANCH}", main_remote.remote_name())
+            let remote = main_remote.remote_name();
+            run_git(&root, ["fetch", "--no-tags", remote]).await?;
+            options.onto.as_ref().map_or_else(
+                || format!("{remote}/{DEFAULT_LANDING_BRANCH}"),
+                revision_target,
+            )
         };
-        let onto = options
-            .onto
-            .as_ref()
-            .map(revision_target)
-            .unwrap_or(default_onto);
-        // Refresh the remote-tracking refs first: rebasing onto `main/main` resolves a ref that
-        // only a fetch creates, and a stale one silently replays onto yesterday's base. A
-        // git-worktree workspace reads main's branches directly out of the shared ref namespace,
-        // so there is nothing to refresh and no remote to refresh it from.
-        if let Some(remote) = fetch_remote {
-            run_git(&root, ["fetch", "--no-tags", remote.as_str()]).await?;
-        }
         let onto_head = git_revision_oid(&root, &onto).await?;
         if options
             .expected_onto_head
@@ -7681,12 +8088,20 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
         git_oid(&root).await
     }
 
-    async fn land(&mut self, workspace: WorkspaceName, options: LandOptions) -> Result<LandReport> {
+    async fn land(
+        &mut self,
+        workspace: WorkspaceName,
+        into: Option<WorkspaceTarget>,
+        options: LandOptions,
+    ) -> Result<LandReport> {
         self.validate_binding().await?;
         let current = self.current(&workspace).await?;
         if let Some(expected) = options.expected_workspace_incarnation.as_ref() {
             Self::require_exact_incarnation(&current, expected)?;
         }
+        // Resolved before any check runs: a lane base that was recreated under its name refuses
+        // here, not after minutes of checks.
+        let into = self.landing_into(&workspace, into).await?;
         let source_mount = current_snapshot_mount(self, &current)?;
         let source_repository = crate::git::GitRepository::from_root(&source_mount);
         let source_head = git_oid(&source_mount).await?;
@@ -7717,13 +8132,13 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                 ),
             ));
         }
-        let target_branch = options
-            .target_branch
-            .clone()
-            .unwrap_or_else(|| DEFAULT_LANDING_BRANCH.to_owned());
-        require_target_checked_out(&self.descriptor.git_root, &target_branch).await?;
+        let target_branch = match options.target_branch.clone() {
+            Some(branch) => branch,
+            None => into.checked_out_branch().await?,
+        };
+        require_target_checked_out(&into.root, &target_branch).await?;
         let target_ref = format!("refs/heads/{target_branch}");
-        let previous = git_optional_ref_oid(&self.descriptor.git_root, &target_ref).await?;
+        let previous = git_optional_ref_oid(&into.root, &target_ref).await?;
         require_expected_ref(
             options.expected_target_head.as_ref(),
             previous.as_ref(),
@@ -7770,13 +8185,7 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                 ));
             }
         }
-        // Bring the workspace's objects into the host before merging them. A workspace is a
-        // standalone repository — nothing has ever replicated its commits — so a bare `merge`
-        // against a validated source head resolves to an object the host has never seen and fails
-        // with git's own "not something we can merge". The fetch is the hand-back, and it is
-        // pull-based like every other direction cowshed moves work.
-        //
-        // Land has no branch-name contract with the workspace: it fetches whatever branch the
+        // Land has no branch-name contract with the workspace: it delivers whatever branch the
         // workspace has checked out, whether an agent named it `cowshed/<ws>`, `wt/<ws>`, or
         // anything else. Only the resolved head is load-bearing.
         let source_branch = source_repository.current_branch().await?.ok_or_else(|| {
@@ -7785,57 +8194,37 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                 "check out a branch in the workspace and retry land",
             )
         })?;
-        let preservation_ref = format!("refs/cowshed/{workspace}/heads/{source_branch}");
-        run_git(
-            &self.descriptor.git_root,
-            [
-                "fetch",
-                "--no-tags",
-                source_mount.to_str().ok_or_else(|| {
-                    CowshedError::internal("workspace mount path is not valid UTF-8")
-                })?,
-                &format!("+refs/heads/{source_branch}:{preservation_ref}"),
-            ],
+        deliver_into(
+            &into.name,
+            &into.root,
+            &source_mount,
+            &workspace,
+            &source_branch,
+            &source_head,
+            &target_branch,
         )
         .await?;
-        // The fetch is also the revalidation: if the workspace advanced between the check and now,
-        // what arrived is not what was validated, and landing it would land unchecked work.
-        let fetched = git_revision_oid(&self.descriptor.git_root, &preservation_ref).await?;
-        if fetched != source_head {
-            return Err(CowshedError::conflict(
-                format!(
-                    "workspace {workspace} advanced from {source_head} to {fetched} during land"
-                ),
-                "re-run the check against the new head and retry land",
-            ));
-        }
-        // Read again at the merge: the check can run for minutes, and main's checkout can be
-        // switched to another branch while it does.
-        require_target_checked_out(&self.descriptor.git_root, &target_branch).await?;
-        run_git(
-            &self.descriptor.git_root,
-            ["merge", "--ff-only", source_head.as_str()],
-        )
-        .await?;
-        // Main has moved, so build it at what landed: every later clone of main copies its build
-        // outputs and starts warm. Main's supervisor runs the declared step in the background and
-        // answers at once; a land that moved nothing has nothing to build.
+        // The target has moved, so build it at what landed: every later clone of it copies its
+        // build outputs and starts warm — a fork taken later in a lane starts with its lane-mates'
+        // work built. The target's supervisor runs the declared step in the background and answers
+        // at once; a land that moved nothing has nothing to build.
         let warm = if previous.as_ref() == Some(&source_head) {
             Ok(None)
         } else {
-            let main = main_name();
-            let main_root = self.descriptor.git_root.clone();
             let range = crate::api::dto::WarmRange {
                 base: previous.clone(),
                 head: source_head.clone(),
             };
-            super::land_warm::warm_after_land(&main_root, range, || self.ensure_supervisor(&main))
+            let target = into.name.clone();
+            super::land_warm::warm_after_land(&into.root, range, || self.ensure_supervisor(&target))
                 .await
         };
         if retire {
-            // Main has already moved, so a refused retire must not read as a refused land: the
-            // retry its hint names would land nothing.
-            self.remove(workspace.clone(), RemoveOptions::default())
+            // The target has already moved, so a refused retire must not read as a refused land:
+            // the retry its hint names would land nothing. Containment is measured against the
+            // branch the unit landed on, so a lane unit whose commits are in its lane base retires.
+            let containment = into.containment(target_branch.clone());
+            self.remove_contained_in(workspace.clone(), RemoveOptions::default(), &containment)
                 .await
                 .map_err(|kept| {
                     CowshedError::new(
@@ -7848,13 +8237,13 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                     )
                 })?;
         }
-        // The same reading as a refused retire: main moved, only its build did not start.
+        // The same reading as a refused retire: the target moved, only its build did not start.
         let warm = warm.map_err(|refused| {
             CowshedError::new(
                 refused.code,
                 format!(
-                    "landed {source_head} on {target_branch}, but main's warm step did not start: {}",
-                    refused.message
+                    "landed {source_head} on {target_branch}, but {}'s warm step did not start: {}",
+                    into.name, refused.message
                 ),
                 refused.hint,
             )
@@ -9913,10 +10302,10 @@ fn current_snapshot_mount(
     host.workspace_mount_path(workspace.derived.workspace.name())
 }
 
-/// Refuse a land whose target is not the branch main's checkout has checked out.
+/// Refuse a land whose target is not the branch the target's checkout has checked out.
 ///
-/// Land fast-forwards through main's checkout, and `merge` moves whichever branch that checkout
-/// is on, so any other target would be reported as landed while a different branch moved.
+/// Land fast-forwards through the target's checkout, and `merge` moves whichever branch that
+/// checkout is on, so any other target would be reported as landed while a different branch moved.
 /// Updating a branch that is not checked out is a separate path this runtime does not have.
 #[cfg(target_os = "macos")]
 async fn require_target_checked_out(git_root: &Path, target_branch: &str) -> Result<()> {
@@ -9931,10 +10320,175 @@ async fn require_target_checked_out(git_root: &Path, target_branch: &str) -> Res
         |branch| format!("branch {branch}"),
     );
     Err(CowshedError::conflict(
-        format!("main's checkout has {actual} checked out, not the land target {target_branch}"),
+        format!(
+            "the checkout at {} has {actual} checked out, not the land target {target_branch}",
+            git_root.display()
+        ),
         format!(
             "check out {target_branch} in {}, then retry land",
             git_root.display()
+        ),
+    ))
+}
+
+/// The branch a lane base has checked out: what its units land on and rebase onto.
+#[cfg(target_os = "macos")]
+async fn target_checked_out_branch(root: &Path, target: &WorkspaceName) -> Result<String> {
+    crate::git::GitRepository::from_root(root)
+        .current_branch()
+        .await?
+        .ok_or_else(|| {
+            CowshedError::conflict(
+                format!("workspace {target} has a detached HEAD, so it has no branch to land on"),
+                format!("check out a branch in workspace {target}, then retry"),
+            )
+        })
+}
+
+/// Hand a unit's validated head to the target and fast-forward the target's checked-out branch to
+/// it.
+///
+/// A workspace is a standalone repository — nothing has ever replicated its commits — so a bare
+/// `merge` against the validated head would resolve to an object the target has never seen. The
+/// fetch is the hand-back, pull-based like every other direction cowshed moves work, into the
+/// unit's preservation ref in the target's repository. It is also the revalidation: if the unit
+/// advanced since `source_head` was validated, what arrived is not what was checked.
+#[cfg(target_os = "macos")]
+async fn deliver_into(
+    target: &WorkspaceName,
+    target_root: &Path,
+    source_mount: &Path,
+    unit: &WorkspaceName,
+    source_branch: &str,
+    source_head: &GitOid,
+    target_branch: &str,
+) -> Result<()> {
+    let preservation_ref = format!("refs/cowshed/{unit}/heads/{source_branch}");
+    run_git(
+        target_root,
+        [
+            "fetch",
+            "--no-tags",
+            source_mount
+                .to_str()
+                .ok_or_else(|| CowshedError::internal("workspace mount path is not valid UTF-8"))?,
+            &format!("+refs/heads/{source_branch}:{preservation_ref}"),
+        ],
+    )
+    .await?;
+    let fetched = git_revision_oid(target_root, &preservation_ref).await?;
+    if &fetched != source_head {
+        return Err(CowshedError::conflict(
+            format!("workspace {unit} advanced from {source_head} to {fetched} during land"),
+            "re-run the check against the new head and retry land",
+        ));
+    }
+    // Read again at the merge: the check can run for minutes, and the target's checkout can be
+    // switched to another branch while it does.
+    require_target_checked_out(target_root, target_branch).await?;
+    // A target that moved past the unit's base cannot fast-forward. The next move is the unit's
+    // rebase onto that target, and for a lane unit a bare `cowshed rebase` would rebase onto main,
+    // so the hint names the destination.
+    let repository = crate::git::GitRepository::from_root(target_root);
+    if let Some(tip) = repository.branch_tip(target_branch).await?
+        && !repository
+            .commit_is_ancestor(tip.as_str(), source_head.as_str())
+            .await?
+    {
+        let into = if target.is_main() {
+            String::new()
+        } else {
+            format!(" --into {target}")
+        };
+        return Err(CowshedError::conflict(
+            format!(
+                "{target}'s {target_branch} is at {tip}, which workspace {unit} is not based on, so \
+                 it cannot fast-forward"
+            ),
+            format!("cowshed rebase {unit}{into}, re-run the check, then retry land"),
+        ));
+    }
+    run_git(target_root, ["merge", "--ff-only", source_head.as_str()]).await
+}
+
+/// Bring the branch a lane base has checked out into the unit at `unit_root`, as
+/// `refs/cowshed/targets/<target>/<branch>`, and answer that ref: what the unit rebases onto.
+///
+/// A lane base is a repository of its own, so its branch reaches a unit only by a fetch from its
+/// mount — the same pull the land uses in the other direction. Fetching on every rebase is what
+/// keeps the destination current as lane-mates land.
+#[cfg(target_os = "macos")]
+async fn fetch_target_branch(
+    unit_root: &Path,
+    target_root: &Path,
+    target: &WorkspaceName,
+) -> Result<String> {
+    let branch = target_checked_out_branch(target_root, target).await?;
+    let reference = format!("refs/cowshed/targets/{target}/{branch}");
+    run_git(
+        unit_root,
+        [
+            "fetch",
+            "--no-tags",
+            target_root
+                .to_str()
+                .ok_or_else(|| CowshedError::internal("workspace mount path is not valid UTF-8"))?,
+            &format!("+refs/heads/{branch}:{reference}"),
+        ],
+    )
+    .await?;
+    Ok(reference)
+}
+
+/// A rebase has one destination: what the unit lands into, or an explicit revision.
+#[cfg(target_os = "macos")]
+fn require_single_destination(
+    onto: Option<&crate::api::dto::RevisionTarget>,
+    into: Option<&WorkspaceTarget>,
+) -> Result<()> {
+    if onto.is_some() && into.is_some() {
+        return Err(CowshedError::usage(
+            "a rebase takes onto or into, not both: into rebases onto the branch its target has \
+             checked out",
+            "drop onto to rebase onto what the unit lands into, or drop into to rebase onto a \
+             revision",
+        ));
+    }
+    Ok(())
+}
+
+/// A unit never lands into, or rebases onto, itself.
+#[cfg(target_os = "macos")]
+fn require_distinct_target(unit: &WorkspaceName, target: &WorkspaceName) -> Result<()> {
+    if unit == target {
+        return Err(CowshedError::usage(
+            format!("workspace {unit} cannot land into itself"),
+            "name the lane base this unit was forked from, or main",
+        ));
+    }
+    Ok(())
+}
+
+/// Refuse a target that is no longer the workspace its reference was resolved to: a lane base
+/// removed and recreated under the same name is a different workspace, and delivering into it
+/// would put a unit's work where its coordinator never aimed it.
+#[cfg(target_os = "macos")]
+fn require_target_incarnation(
+    target: &WorkspaceName,
+    current: &WorkspaceIncarnation,
+    resolved: &WorkspaceIncarnation,
+) -> Result<()> {
+    if current == resolved {
+        return Ok(());
+    }
+    Err(CowshedError::conflict(
+        format!(
+            "workspace {target} is incarnation {current}, not the {resolved} this reference was \
+             resolved at: it was removed and recreated under the same name"
+        ),
+        format!(
+            "resolve workspace {target} again and retry, if its new incarnation is the one this \
+             unit belongs to"
         ),
     ))
 }

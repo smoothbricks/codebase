@@ -1580,7 +1580,7 @@ pub struct JobInfo {
     /// Set only for a job that failed before its command ran, for a reason its exit status
     /// cannot name.
     pub failure: Option<JobFailure>,
-    /// Set only for main's warm step: the landed commits this job builds.
+    /// Set only for a land target's warm step: the landed commits this job builds.
     pub warm: Option<WarmRange>,
 }
 
@@ -2401,6 +2401,37 @@ pub struct GcOptions {
     pub dry_run: bool,
 }
 
+/// The workspace a unit lands into, or rebases onto, with the incarnation it had when it was
+/// resolved: a lane base, or main.
+///
+/// Built only from a [`crate::WorkspaceRef`] ([`crate::WorkspaceRef::target`]), never from a name,
+/// so a caller cannot aim a land at a workspace it did not resolve. The incarnation is what makes
+/// that stick: a lane base removed and recreated under the same name is a different workspace,
+/// and land and rebase refuse it rather than deliver into it.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WorkspaceTarget {
+    workspace: WorkspaceName,
+    incarnation: WorkspaceIncarnation,
+}
+
+impl WorkspaceTarget {
+    pub(crate) fn new(workspace: WorkspaceName, incarnation: WorkspaceIncarnation) -> Self {
+        Self {
+            workspace,
+            incarnation,
+        }
+    }
+
+    pub fn workspace(&self) -> &WorkspaceName {
+        &self.workspace
+    }
+
+    pub fn incarnation(&self) -> &WorkspaceIncarnation {
+        &self.incarnation
+    }
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase", deny_unknown_fields)]
 pub struct RebaseOptions {
@@ -2513,7 +2544,7 @@ pub struct LandReport {
     pub warm: Option<WarmAdmission>,
 }
 
-/// The landed commits one run of main's warm step builds.
+/// The landed commits one run of a land target's warm step builds.
 ///
 /// `head` is the head the newest covered land landed. `base` is the target's head before the
 /// oldest covered land: runs that waited behind a running one coalesce, so one run can cover
@@ -2547,7 +2578,7 @@ impl fmt::Display for WarmRange {
     }
 }
 
-/// What `land` asked of main's warm step. Land never waits for the build itself.
+/// What `land` asked of the target's warm step. Land never waits for the build itself.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(
     tag = "state",

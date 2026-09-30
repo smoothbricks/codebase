@@ -13,7 +13,7 @@ use cowshed_core::api::dto::{
     ExecRequest, Finding, FindingSeverity, GcOptions, GcReport, GitOid, GrantDelta, GrantSet,
     JobId, JobInfo, JobState, LandOptions, LandReport, MirrorInfo, PortBlock, PushOptions,
     PushReport, RebaseOptions, RemoveOptions, RemoveReport, ResizeResult, RunSandboxMode,
-    StdinSource, WorkspaceInfo, WorkspaceState,
+    StdinSource, WorkspaceInfo, WorkspaceState, WorkspaceTarget,
 };
 use cowshed_core::api::server::{ConnectionAuthority, RouterHandle, serve_controller_connection};
 use cowshed_core::metadata::{
@@ -1003,7 +1003,12 @@ impl ProjectRuntimeHost for FakeHost {
         self.persist()
     }
 
-    async fn rebase(&mut self, workspace: WorkspaceName, options: RebaseOptions) -> Result<GitOid> {
+    async fn rebase(
+        &mut self,
+        workspace: WorkspaceName,
+        _into: Option<WorkspaceTarget>,
+        options: RebaseOptions,
+    ) -> Result<GitOid> {
         let current = self.workspace(&workspace)?;
         if options
             .expected_workspace_incarnation
@@ -1022,6 +1027,7 @@ impl ProjectRuntimeHost for FakeHost {
     async fn land(
         &mut self,
         workspace: WorkspaceName,
+        _into: Option<WorkspaceTarget>,
         _options: LandOptions,
     ) -> Result<LandReport> {
         self.workspace(&workspace)?;

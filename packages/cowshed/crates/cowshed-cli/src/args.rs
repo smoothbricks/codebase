@@ -445,6 +445,7 @@ pub struct PushArgs {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RebaseArgs {
     pub workspace: Option<String>,
+    pub into: Option<String>,
     pub onto: Option<OsString>,
     pub expected_workspace_incarnation: Option<OsString>,
     pub expected_source_head: Option<OsString>,
@@ -454,6 +455,7 @@ pub struct RebaseArgs {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LandArgs {
     pub workspace: String,
+    pub into: Option<String>,
     pub target: Option<OsString>,
     pub checks: Vec<OsString>,
     pub retire: bool,
@@ -782,12 +784,14 @@ fn cli_command() -> ClapCommand {
             value("expected-destination-head"),
         ]))
         .subcommand(leaf("rebase").arg(positional("workspace", 0..=1)).args([
+            value("into"),
             value("onto"),
             value("expected-workspace-incarnation"),
             value("expected-source-head"),
             value("expected-onto-head"),
         ]))
         .subcommand(leaf("land").arg(positional("workspace", 0..=1)).args([
+            value("into"),
             value("target"),
             append_value("check"),
             flag("no-retire"),
@@ -2518,11 +2522,16 @@ const REBASE: CommandSpec = CommandSpec {
     summary: "rebase a workspace",
     about: &[
         "Brings the workspace branch up to current main: fetches main's checkout into the workspace and rebases onto it. A dirty tree is refused before anything moves; commit or discard the uncommitted work first. A conflict aborts cleanly and names the conflicted paths, leaving the workspace as it was. Naming no workspace rebases the one you are standing in.",
+        "With `--into <lane>`, the destination is what the unit lands into instead: the branch the lane base <lane> has checked out, fetched from its mount, so a unit forked from a lane base catches up with what its lane-mates have landed there.",
     ],
     options: &[
         Opt {
+            spelling: "--into <ws>",
+            meaning: "rebase onto the branch this workspace has checked out — the lane base the unit lands into; conflicts with --onto",
+        },
+        Opt {
             spelling: "--onto <rev>",
-            meaning: "rebase onto this revision instead of main",
+            meaning: "rebase onto this revision instead of main; conflicts with --into",
         },
         EXPECTED_WORKSPACE_INCARNATION,
         EXPECTED_SOURCE_HEAD,
@@ -2535,9 +2544,15 @@ const REBASE: CommandSpec = CommandSpec {
 
 fn parse_rebase(matches: &ArgMatches) -> Result<Command, UsageError> {
     const USAGE: &CommandSpec = &REBASE;
+    let into = optional_workspace(matches, "into", false, USAGE)?;
+    let onto = os(matches, "onto");
+    if into.is_some() && onto.is_some() {
+        return Err(UsageError::new("--into conflicts with --onto", USAGE));
+    }
     Ok(Command::Rebase(RebaseArgs {
         workspace: optional_workspace(matches, "workspace", false, USAGE)?,
-        onto: os(matches, "onto"),
+        into,
+        onto,
         expected_workspace_incarnation: os(matches, "expected-workspace-incarnation"),
         expected_source_head: os(matches, "expected-source-head"),
         expected_onto_head: os(matches, "expected-onto-head"),
@@ -2555,11 +2570,16 @@ const LAND: CommandSpec = CommandSpec {
         "Before running any --check command, land synchronizes the gateway with current workspace grants. If synchronization fails, no check runs and the target branch is unchanged. Landing without --check does not require this preflight.",
         "After the fast-forward, land starts main's warm step when main's .cowshed.toml declares one (`[land] warm = [\"<argv>\", ...]`): main's workspace supervisor runs that argv in the background with COWSHED_LAND_BASE and COWSHED_LAND_HEAD set, one warm job at a time, later lands coalescing into the one run waiting behind it. Land never waits for the build; it names the job on stderr and in --json as `warm`.",
         "Landing is also what `rm` measures against: the ancestry gate a removal enforces is satisfied by the branch this command delivers to.",
+        "With `--into <lane>`, the unit lands into the lane base <lane> instead of main: the lane base's checked-out branch is fast-forwarded, its warm step runs, and the unit retires once the lane base holds its commits. The lane itself reaches main with `cowshed rebase <lane>` and `cowshed land <lane>`.",
     ],
     options: &[
         Opt {
+            spelling: "--into <ws>",
+            meaning: "land into this workspace — the lane base the unit was forked from — instead of main",
+        },
+        Opt {
             spelling: "--target <branch>",
-            meaning: "land onto this branch instead of main; main's checkout must have it checked out",
+            meaning: "land onto this branch instead of the one the target has checked out; the target's checkout must have it checked out",
         },
         Opt {
             spelling: "--check <cmd>",
@@ -2590,6 +2610,7 @@ fn parse_land(matches: &ArgMatches) -> Result<Command, UsageError> {
         .unwrap_or_default();
     Ok(Command::Land(LandArgs {
         workspace: require_workspace(matches, "workspace", false, USAGE, USAGE.missing)?,
+        into: optional_workspace(matches, "into", false, USAGE)?,
         target: os(matches, "target"),
         checks,
         retire: !flagged(matches, "no-retire"),

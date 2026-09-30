@@ -133,8 +133,20 @@ pub trait CliService: Send {
     async fn project_grants(&mut self) -> Result<ProjectGrants>;
     async fn grant_project(&mut self, delta: ProjectGrantDelta) -> Result<ProjectGrants>;
     async fn push(&mut self, workspace: &str, options: PushOptions) -> Result<PushReport>;
-    async fn rebase(&mut self, workspace: &str, options: RebaseOptions) -> Result<GitOid>;
-    async fn land(&mut self, workspace: &str, options: LandOptions) -> Result<LandReport>;
+    /// `into` names what the unit lands into (main when `None`); the service resolves it to a
+    /// workspace reference once, before the call.
+    async fn rebase(
+        &mut self,
+        workspace: &str,
+        into: Option<&str>,
+        options: RebaseOptions,
+    ) -> Result<GitOid>;
+    async fn land(
+        &mut self,
+        workspace: &str,
+        into: Option<&str>,
+        options: LandOptions,
+    ) -> Result<LandReport>;
     async fn exec(
         &mut self,
         command: ExecCommand,
@@ -641,12 +653,32 @@ impl CliService for ActorBridge {
             .await
     }
 
-    async fn rebase(&mut self, workspace: &str, options: RebaseOptions) -> Result<GitOid> {
-        self.coordinator()?.rebase(workspace, options).await
+    async fn rebase(
+        &mut self,
+        workspace: &str,
+        into: Option<&str>,
+        options: RebaseOptions,
+    ) -> Result<GitOid> {
+        let coordinator = self.coordinator()?;
+        let into = match into {
+            Some(name) => Some(coordinator.project().workspace(name).await?),
+            None => None,
+        };
+        coordinator.rebase(workspace, into.as_ref(), options).await
     }
 
-    async fn land(&mut self, workspace: &str, options: LandOptions) -> Result<LandReport> {
-        self.coordinator()?.land(workspace, options).await
+    async fn land(
+        &mut self,
+        workspace: &str,
+        into: Option<&str>,
+        options: LandOptions,
+    ) -> Result<LandReport> {
+        let coordinator = self.coordinator()?;
+        let into = match into {
+            Some(name) => Some(coordinator.project().workspace(name).await?),
+            None => None,
+        };
+        coordinator.land(workspace, into.as_ref(), options).await
     }
 
     async fn exec(
@@ -1377,7 +1409,9 @@ where
                 expected_source_head: args.expected_source_head.map(os_git_oid).transpose()?,
                 expected_onto_head: args.expected_onto_head.map(os_git_oid).transpose()?,
             };
-            let oid = service.rebase(&workspace, options).await?;
+            let oid = service
+                .rebase(&workspace, args.into.as_deref(), options)
+                .await?;
             if json {
                 output
                     .success(RevisionResult { oid: oid.clone() })
@@ -1410,14 +1444,16 @@ where
                 expected_source_head: args.expected_source_head.map(os_git_oid).transpose()?,
                 expected_target_head: args.expected_target_head.map(os_expected_ref).transpose()?,
             };
-            let report = service.land(&args.workspace, options).await?;
+            let report = service
+                .land(&args.workspace, args.into.as_deref(), options)
+                .await?;
             if reconcile_gateway {
                 service.reconcile_gateway().await?;
             }
             if json {
                 output.success(report.clone()).map_err(output_error)?;
             } else {
-                emit_land(output, &report)?;
+                emit_land(output, &report, args.into.as_deref().unwrap_or("main"))?;
             }
             Ok(success())
         }
@@ -2485,7 +2521,12 @@ fn emit_push<W: Write, E: Write>(output: &mut Output<W, E>, report: &PushReport)
         .map_err(output_error)
 }
 
-fn emit_land<W: Write, E: Write>(output: &mut Output<W, E>, report: &LandReport) -> Result<()> {
+/// `into` names the workspace landed into, whose warm step the guidance line reports.
+fn emit_land<W: Write, E: Write>(
+    output: &mut Output<W, E>,
+    report: &LandReport,
+    into: &str,
+) -> Result<()> {
     output
         .bare(report.target_branch.as_bytes())
         .and_then(|()| output.bare(b"\t"))
@@ -2502,11 +2543,11 @@ fn emit_land<W: Write, E: Write>(output: &mut Output<W, E>, report: &LandReport)
         .and_then(|()| match &report.warm {
             None => Ok(()),
             Some(WarmAdmission::Started { job_id, range }) => output.guidance(&format!(
-                "main's warm step builds {range} as job {}",
+                "{into}'s warm step builds {range} as job {}",
                 job_id.get()
             )),
             Some(WarmAdmission::Queued { behind, range }) => output.guidance(&format!(
-                "main's warm step builds {range} once job {} ends",
+                "{into}'s warm step builds {range} once job {} ends",
                 behind.get()
             )),
         })

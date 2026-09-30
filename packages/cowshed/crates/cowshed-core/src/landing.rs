@@ -7,14 +7,15 @@
 //!
 //! Two properties are load-bearing:
 //!
-//! * **The target is read live.** The tip comes from the project's own main workspace repository,
-//!   never from a `refs/remotes/*` cache inside the workspace. Those caches are clone-time
-//!   snapshots; workspaces have been observed frozen hundreds of commits behind, each at a
-//!   different commit, which produced confident and wrong verdicts in *both* directions.
+//! * **The target is read live.** The tip comes from the target workspace's own repository —
+//!   main's, or the lane base a unit landed into — never from a `refs/remotes/*` cache inside the
+//!   workspace. Those caches are clone-time snapshots; workspaces have been observed frozen
+//!   hundreds of commits behind, each at a different commit, which produced confident and wrong
+//!   verdicts in *both* directions.
 //! * **Failure is a value, and it is never "landed".** Every way this can come up short is a real
-//!   state of a real project — main detached, its mount no longer a repository, no such branch — so
-//!   each one becomes [`LandingCommits::Indeterminate`] carrying the reason. Consumers treat that
-//!   exactly as they treat unlanded work.
+//!   state of a real project — the target detached, its mount no longer a repository, no such
+//!   branch — so each one becomes [`LandingCommits::Indeterminate`] carrying the reason.
+//!   Consumers treat that exactly as they treat unlanded work.
 
 use std::path::{Path, PathBuf};
 
@@ -39,33 +40,45 @@ impl LandingTarget {
     }
 }
 
-/// Resolve `branch` from main's own repository, or say why it could not be resolved.
+/// Resolve `branch` from the target's own repository, or say why it could not be resolved.
 ///
-/// `main_mount` is main's *canonical mount*, which is where the project ledger says main's
-/// repository is. That is the whole point: it routes around the workspace-side `main` remote, whose
-/// URL is a clone-time artifact and has been observed pointing at a directory that is no longer a
+/// `target_mount` is the canonical mount of the workspace the work has to reach — main's, or the
+/// lane base a unit landed into — which is where the project ledger says that repository is. That
+/// is the whole point: it routes around the workspace-side `main` remote, whose URL is a
+/// clone-time artifact and has been observed pointing at a directory that is no longer a
 /// repository at all.
 ///
 /// The error is a sentence, not a code, because its only consumers are a human reading `ls` and a
 /// refusal message explaining why a removal will not proceed. Both need the reason, neither needs
 /// to branch on it.
 pub async fn resolve_target(
-    main_mount: &Path,
+    target_mount: &Path,
     branch: &str,
 ) -> std::result::Result<LandingTarget, String> {
-    let main = GitRepository::from_root(main_mount);
-    let objects = main.object_directory().await.map_err(|error| {
+    let target = GitRepository::from_root(target_mount);
+    let objects = target.object_directory().await.map_err(|error| {
         format!(
-            "main's repository at {} could not be read: {}",
-            main_mount.display(),
+            "the repository at {} could not be read: {}",
+            target_mount.display(),
             error.message
         )
     })?;
-    let tip = main
+    let tip = target
         .branch_tip(branch)
         .await
-        .map_err(|error| format!("main's {branch} could not be read: {}", error.message))?
-        .ok_or_else(|| format!("main's repository has no {branch} branch"))?;
+        .map_err(|error| {
+            format!(
+                "{branch} could not be read at {}: {}",
+                target_mount.display(),
+                error.message
+            )
+        })?
+        .ok_or_else(|| {
+            format!(
+                "the repository at {} has no {branch} branch",
+                target_mount.display()
+            )
+        })?;
     Ok(LandingTarget {
         branch: branch.to_owned(),
         tip,

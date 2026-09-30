@@ -190,12 +190,16 @@ function encodeGrantDelta(delta: GrantDelta): string {
   return encodeJson('grant delta', typia.assert<GrantDelta>(delta));
 }
 
-function encodeRebaseOptions(options: RebaseOptions | undefined): string {
-  return encodeJson('rebase options', typia.assert<RebaseOptions>(options ?? {}));
+/**
+ * The JSON half of rebase or land options: everything but `into`, which crosses to the addon as
+ * the reference itself so it cannot be named by a string.
+ */
+function encodeRebaseOptions(options: Omit<RebaseOptions, 'into'>): string {
+  return encodeJson('rebase options', typia.assert<Omit<RebaseOptions, 'into'>>(options));
 }
 
-function encodeLandOptions(options: LandOptions | undefined): string {
-  return encodeJson('land options', typia.assert<LandOptions>(options ?? {}));
+function encodeLandOptions(options: Omit<LandOptions, 'into'>): string {
+  return encodeJson('land options', typia.assert<Omit<LandOptions, 'into'>>(options));
 }
 
 function encodeRemoveOptions(options: RemoveOptions | undefined): string {
@@ -257,6 +261,21 @@ class WorkspaceRefImpl implements WorkspaceRef {
     this.#native = nativeWorkspace;
   }
 
+  /**
+   * The addon handle behind a reference this module handed out. A `WorkspaceRef` built anywhere
+   * else has no resolved incarnation behind it, so it is refused rather than trusted by name.
+   */
+  static handleOf(reference: WorkspaceRef): NativeWorkspaceRefHandle {
+    if (!(#native in reference)) {
+      throw new CowshedError(
+        'usage',
+        `workspace ${reference.name} is not a reference this project resolved`,
+        'resolve the workspace with project.workspace(name) and pass that reference',
+      );
+    }
+    return reference.#native;
+  }
+
   get name(): string {
     return this.#native.name;
   }
@@ -313,11 +332,16 @@ class CoordinatorImpl implements Coordinator {
   }
 
   async rebase(workspace: string, options?: RebaseOptions): Promise<string> {
-    return callNativeAsync(() => this.#native.rebase(workspace, encodeRebaseOptions(options)));
+    // `into` with `onto` is refused by the controller, the one place that decides a destination.
+    const { into, ...rest } = options ?? {};
+    const handle = into === undefined ? undefined : WorkspaceRefImpl.handleOf(into);
+    return callNativeAsync(() => this.#native.rebase(workspace, encodeRebaseOptions(rest), handle));
   }
 
   async land(workspace: string, options?: LandOptions): Promise<LandReport> {
-    return parseLandReport(await callNativeAsync(() => this.#native.land(workspace, encodeLandOptions(options))));
+    const { into, ...rest } = options ?? {};
+    const handle = into === undefined ? undefined : WorkspaceRefImpl.handleOf(into);
+    return parseLandReport(await callNativeAsync(() => this.#native.land(workspace, encodeLandOptions(rest), handle)));
   }
 
   async restore(workspace: string, label: string): Promise<void> {

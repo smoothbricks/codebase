@@ -2117,8 +2117,9 @@ impl WorkspaceSupervisorHandle {
         .await
     }
 
-    /// Hand main's warm step one land's range: it starts now, or waits behind the warm job
-    /// running, merged into the one run waiting there. Answered at once, never at the build's end.
+    /// Hand this workspace's warm step one land's range: it starts now, or waits behind the warm
+    /// job running, merged into the one run waiting there. Answered at once, never at the build's
+    /// end.
     pub async fn warm(&self, argv: Vec<CommandArg>, range: WarmRange) -> Result<WarmAdmission> {
         self.call(|reply| Command::Warm {
             authority: self.authority.clone(),
@@ -2978,7 +2979,7 @@ impl SupervisorActor {
         Ok(())
     }
 
-    /// Admit and spawn one job. `warm` marks it as main's warm step for that landed range.
+    /// Admit and spawn one job. `warm` marks it as a land target's warm step for that landed range.
     async fn admit_exec(
         &mut self,
         authority: WorkspaceAuthoritySnapshot,

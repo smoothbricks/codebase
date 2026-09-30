@@ -31,8 +31,8 @@ export interface NativeCoordinatorHandle {
   moveCheckout(destination: string): Promise<NativeWorkspaceRefHandle>;
   grant(workspace: string, deltaJson: string): Promise<string>;
   revoke(workspace: string, deltaJson: string): Promise<string>;
-  rebase(workspace: string, optionsJson: string): Promise<string>;
-  land(workspace: string, optionsJson: string): Promise<string>;
+  rebase(workspace: string, optionsJson: string, into?: NativeWorkspaceRefHandle): Promise<string>;
+  land(workspace: string, optionsJson: string, into?: NativeWorkspaceRefHandle): Promise<string>;
   restore(workspace: string, label: string): Promise<void>;
   detach(workspace: string): Promise<void>;
   resize(workspace: string, capacity: string): Promise<string>;
