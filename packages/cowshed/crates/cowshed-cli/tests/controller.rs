@@ -87,10 +87,14 @@ async fn host_controller_an_embedding_process_reaches_its_project_through_the_co
 }
 
 /// The checkout this test runs in: main's, or a workspace's, either of which names the project.
+/// The crate directory is read at run time, so a workspace that inherited main's compiled test
+/// asks git about its own tree, not main's.
 fn checkout_root() -> PathBuf {
+    let crate_dir = std::env::var_os("CARGO_MANIFEST_DIR")
+        .expect("cargo sets CARGO_MANIFEST_DIR for the test process");
     let output = Command::new("git")
         .args(["rev-parse", "--show-toplevel"])
-        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .current_dir(crate_dir)
         .output()
         .expect("git rev-parse");
     assert!(output.status.success(), "not inside a git checkout");
