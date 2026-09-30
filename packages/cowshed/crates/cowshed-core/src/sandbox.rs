@@ -669,22 +669,30 @@ pub fn seatbelt_profile(
         &mut profile,
         "(allow network-bind network-inbound (local tcp \"localhost:*\"))",
     );
-    // Unix sockets the workspace's own processes rendezvous over - devenv's under
-    // `devenv-<hash>/`, nx's plugin workers - live in the runtime dir and nowhere else. The
-    // child reaches it as the short `/tmp/cs-<port>` link; Seatbelt filters the path it is
-    // handed, so both the link and the resolved directory are named.
-    let runtime_dir = sandbox_runtime_dir(config);
+    // Unix sockets the workspace's own processes rendezvous over — devenv's and nx's in the
+    // runtime dir, a test's in its temp dir, a tool's under the checkout — are admitted in the
+    // workspace's own tree and nowhere else: the exec temp dir, and for a read-write job the
+    // whole mount, which holds its runtime dir. A read-only job's runtime dir is in the exec
+    // temp dir, and the mount's sockets stay closed to it: read-write jobs' daemons listen
+    // there, and reaching one would let a read-only job write through it. The child reaches
+    // its runtime dir as the short `/tmp/cs-<port>` link; Seatbelt filters the path it is
+    // handed, so both spellings of the link are named too. `path-prefix` is a string prefix,
+    // so each tree is named with its trailing `/`: without it, `<dir>` also admits a sibling
+    // `<dir>-other/`.
     let runtime_link = sandbox_runtime_link(config);
-    for dir in [
-        &runtime_dir,
-        &runtime_link,
-        &PathBuf::from("/private").join(runtime_link.strip_prefix("/").unwrap_or(&runtime_link)),
-    ] {
+    let private_runtime_link =
+        PathBuf::from("/private").join(runtime_link.strip_prefix("/").unwrap_or(&runtime_link));
+    let own_mount = (config.mode == RunSandboxMode::ReadWrite).then_some(&config.workspace_mount);
+    for tree in
+        own_mount
+            .into_iter()
+            .chain([&config.exec_temp_dir, &runtime_link, &private_runtime_link])
+    {
         push_line(
             &mut profile,
             &format!(
-                "(allow network-bind network-inbound network-outbound (local unix-socket (path-prefix \"{0}\")) (remote unix-socket (path-prefix \"{0}\")))",
-                sbpl_path(dir)?
+                "(allow network-bind network-inbound network-outbound (local unix-socket (path-prefix \"{0}/\")) (remote unix-socket (path-prefix \"{0}/\")))",
+                sbpl_path(tree)?
             ),
         );
     }

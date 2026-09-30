@@ -267,6 +267,126 @@ server.listen(path, () => {
     }
 }
 
+/// A socket path must fit `sun_path`; the scratch roots under TMPDIR do not leave room for one.
+fn short_scratch(label: &str) -> PathBuf {
+    let root = PathBuf::from(format!(
+        "/private/tmp/cowshed-{label}-{}",
+        &uuid::Uuid::new_v4().simple().to_string()[..8]
+    ));
+    std::fs::create_dir_all(&root).expect("short scratch root");
+    root
+}
+
+/// `roundtrip <path>` listens on a Unix socket and connects to it; `connect <path>` connects to an
+/// existing one. Either prints what happened, so a refusal is an answer rather than a crash.
+const UNIX_SOCKET_PROBE: &str = r#"
+const net = require('node:net');
+const [op, path] = process.argv.slice(1);
+if (op === 'roundtrip') {
+    const server = net.createServer(socket => socket.end('roundtrip'));
+    server.on('error', error => process.stdout.write(`bind:${error.code}`));
+    server.listen(path, () => {
+        const client = net.createConnection(path);
+        client.on('error', error => { process.stdout.write(`connect:${error.code}`); server.close(); });
+        client.on('data', data => process.stdout.write(data));
+        client.on('end', () => server.close());
+    });
+} else {
+    const client = net.createConnection(path);
+    client.on('connect', () => { process.stdout.write('connected'); client.destroy(); });
+    client.on('error', error => process.stdout.write(`connect:${error.code}`));
+}
+"#;
+
+async fn unix_socket_probe(sandbox: &SandboxConfig, op: &str, path: &Path) -> String {
+    let (exit, stdout, stderr) = run_in_sandbox(
+        sandbox,
+        &sandbox.workspace_mount,
+        vec![
+            "node".into(),
+            "-e".into(),
+            UNIX_SOCKET_PROBE.into(),
+            op.into(),
+            path.as_os_str().to_owned(),
+        ],
+    )
+    .await;
+    assert_eq!(
+        exit,
+        ExitStatus::Exited { code: 0 },
+        "{}",
+        String::from_utf8_lossy(&stderr)
+    );
+    String::from_utf8(stdout).expect("probe output is UTF-8")
+}
+
+/// A workspace's own processes rendezvous over Unix sockets anywhere in its own tree — a test's
+/// socket in its temp dir, a tool's under the checkout — but never reach a socket outside it, and
+/// a read-only job never reaches the sockets under the mount, where read-write jobs' daemons
+/// listen. A write grant is not a socket grant, and a directory whose name merely extends the
+/// temp dir's is outside the tree.
+#[tokio::test]
+#[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
+async fn host_controller_unix_sockets_are_admitted_in_the_workspace_tree_only() {
+    let root = short_scratch("sockets");
+    let outside = short_scratch("sockets-host");
+    let host_socket = outside.join("host.sock");
+    let _host_listener =
+        std::os::unix::net::UnixListener::bind(&host_socket).expect("host listener");
+    let mut sandbox = workspace(&root, 41_104);
+    sandbox.exec_temp_dir = outside.join("tmp");
+    let granted = outside.join("tmp-granted");
+    for directory in [&sandbox.exec_temp_dir, &granted] {
+        std::fs::create_dir(directory).expect("directory beside the workspace");
+    }
+    sandbox.grants.write.push(granted.clone());
+    install_real_tool(&sandbox, "node");
+    let writer_socket = sandbox.workspace_mount.join("writer.sock");
+    let _writer_listener =
+        std::os::unix::net::UnixListener::bind(&writer_socket).expect("read-write job's listener");
+
+    assert_eq!(
+        unix_socket_probe(
+            &sandbox,
+            "roundtrip",
+            &sandbox.workspace_mount.join("tool.sock")
+        )
+        .await,
+        "roundtrip",
+        "a read-write job's socket under the checkout"
+    );
+    let temp_socket = sandbox.exec_temp_dir.join("test.sock");
+    assert_eq!(
+        unix_socket_probe(&sandbox, "roundtrip", &temp_socket).await,
+        "roundtrip",
+        "a read-write job's socket in its temp dir"
+    );
+    assert_eq!(
+        unix_socket_probe(&sandbox, "connect", &host_socket).await,
+        "connect:EPERM",
+        "a socket outside the workspace tree"
+    );
+    assert_eq!(
+        unix_socket_probe(&sandbox, "roundtrip", &granted.join("granted.sock")).await,
+        "bind:EPERM",
+        "a socket in a write-granted directory beside the temp dir"
+    );
+
+    sandbox.mode = RunSandboxMode::ReadOnly;
+    assert_eq!(
+        unix_socket_probe(&sandbox, "roundtrip", &temp_socket).await,
+        "roundtrip",
+        "a read-only job's socket in its temp dir"
+    );
+    assert_eq!(
+        unix_socket_probe(&sandbox, "connect", &writer_socket).await,
+        "connect:EPERM",
+        "a read-only job reaching a read-write job's socket under the mount"
+    );
+    std::fs::remove_dir_all(root).expect("remove test workspace");
+    std::fs::remove_dir_all(outside).expect("remove host socket directory");
+}
+
 #[tokio::test]
 #[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
 async fn host_controller_private_environment_symlinks_cannot_redirect_host_preparation() {

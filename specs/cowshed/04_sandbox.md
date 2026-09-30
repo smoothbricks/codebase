@@ -47,6 +47,20 @@ Shape:
 (allow network-outbound (remote unix-socket (path-literal "<nix daemon socket>")))
 (allow network-outbound (remote unix-socket (path-literal "/private/cowshed/store/sccache.sock")))  ;; host sccache daemon
 (allow network-outbound (remote unix-socket (path-literal "<own supervisor socket>")))
+;; The workspace's own tree: its processes rendezvous over Unix sockets there
+;; (devenv and nx in the runtime dir, a test in its temp dir, a tool under the
+;; checkout) and nowhere else. A read-only job gets the exec temp dir (which holds
+;; its runtime dir) but not the mount, where read-write jobs' daemons listen.
+;; Every prefix ends in "/": path-prefix is a string prefix (measured: "<dir>"
+;; admits "<dir>-sibling/x.sock").
+(allow network-bind network-inbound network-outbound
+  (local unix-socket (path-prefix "<workspace mount>/"))   ;; read-write jobs only
+  (remote unix-socket (path-prefix "<workspace mount>/")))
+(allow network-bind network-inbound network-outbound
+  (local unix-socket (path-prefix "<exec temp dir>/"))
+  (remote unix-socket (path-prefix "<exec temp dir>/")))
+;; … and the same for both spellings of the short runtime link, /tmp/cs-<port>/
+;; and /private/tmp/cs-<port>/, through which the child reaches its runtime dir.
 
 ;; Loopback TCP — isolation rides ENTIRELY on outbound. Measured SBPL constraints
 ;; (see 08_testing.md): port RANGES do not parse ("invalid port in network
@@ -68,8 +82,9 @@ Shape:
 ;; Consequence of the non-enumerable ephemeral range: an in-sandbox client can
 ;; connect only to in-block ports and the allowed unix sockets — a tool that
 ;; spawns a helper server on a random port and connects back to it must be
-;; pointed at block ports (PORT/COWSHED_PORT_BASE). Untested edge, tracked in
-;; the kickoff experiments: which real tools this bites in practice.
+;; pointed at block ports (PORT/COWSHED_PORT_BASE) or at a Unix socket in the
+;; workspace tree (observed with miniflare: its workerd child calls back the
+;; Node process's ephemeral loopback server and is refused).
 
 ;; Writable roots outside the cowshed tree — the closed baseline.
 (allow file-write*
@@ -557,7 +572,10 @@ denies writes to the world-shared `/private/tmp`; shell activation does not requ
 Nx receives a real `nx` child directory below the short runtime alias through `NX_SOCKET_DIR`. Its `O_NOFOLLOW`
 admission rejects a symlink at the leaf, so the alias itself is not its socket directory. Nx does not use
 `XDG_RUNTIME_DIR`, and its default shared-temp directory is outside the sandbox. Its daemon and isolated plugin workers
-remain enabled; socket placement is a Cowshed runtime binding, not a per-project flag or filesystem grant.
+remain enabled; socket placement is a Cowshed runtime binding, not a per-project flag or filesystem grant. Beyond the
+runtime dir, a child may bind and connect Unix sockets anywhere in its workspace's own tree — the exec temp dir, and for
+a read-write job the whole mount — so a test's socket in `TMPDIR` works as it does on the host. A write grant is not a
+socket grant, and a read-only job cannot reach the sockets read-write jobs' daemons keep under the mount.
 
 On macOS, port collisions between workspaces are handled by the per-workspace port block, not left to the user:
 `devenv up` and dev servers bind ports derived from `COWSHED_PORT_BASE` (the block base), so two workspaces running the
@@ -644,7 +662,8 @@ under Seatbelt; the same cases run on Linux under Landlock, plus Linux-specific 
   sibling images, sibling mounts);
 - tamper with own grant file or marker via crafted paths;
 - connect to a sibling workspace's supervisor socket (must be refused by the scoped unix-socket allow — including via a
-  non-canonical `/tmp`-alias path);
+  non-canonical `/tmp`-alias path); bind or connect a Unix socket in a granted directory beside the workspace tree whose
+  path merely extends the tree's prefix; as a read-only job, connect to a read-write job's socket under the mount;
 - connect to a sibling's block ports and to a sibling's ephemeral-bound listener (both EPERM — isolation is
   outbound-enforced; sibling binds are not prevented);
 - assert profile behavior end-to-end: a secret-deny path stays denied despite broad read-data and ancestor allows;
