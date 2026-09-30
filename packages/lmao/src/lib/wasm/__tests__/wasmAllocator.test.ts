@@ -8,10 +8,13 @@ const TRACE_ROOT_BYTE_LENGTH = 16;
 
 describe('WasmAllocator exact slabs', () => {
   let allocator: WasmAllocator;
+  /** First byte the arena owns: everything below is the module's stack and statics. */
+  let heapStart: number;
 
   beforeEach(async () => {
     allocator = await createWasmAllocator({ capacity: CAPACITY });
     allocator.reset();
+    heapStart = allocator.getBumpPtr();
   });
 
   it('exposes stable canonical allocator views until memory grows', () => {
@@ -46,7 +49,7 @@ describe('WasmAllocator exact slabs', () => {
           for (const { byteLength, alignmentPower } of requests) {
             const alignment = 1 << alignmentPower;
             const offset = allocator.allocExact(byteLength, alignment);
-            expect(offset).toBeGreaterThanOrEqual(192);
+            expect(offset).toBeGreaterThanOrEqual(heapStart);
             expect(offset % alignment).toBe(0);
             for (const [otherOffset, otherLength] of live) {
               expect(offset + byteLength <= otherOffset || offset >= otherOffset + otherLength).toBe(true);
@@ -72,17 +75,17 @@ describe('WasmAllocator exact slabs', () => {
     expect(allocator.allocExact(257, 64)).not.toBe(recycled);
   });
 
-  it('reset invalidates allocation counters and reuses the exact header boundary', () => {
-    allocator.allocExact(17, 8);
+  it('reset invalidates allocation counters and reuses the first block address', () => {
+    const first = allocator.allocExact(17, 8);
     allocator.allocExact(65, 16);
     expect(allocator.getAllocCount()).toBe(2);
 
     allocator.reset();
 
-    expect(allocator.getBumpPtr()).toBe(192);
+    expect(allocator.getBumpPtr()).toBe(heapStart);
     expect(allocator.getAllocCount()).toBe(0);
     expect(allocator.getFreeCount()).toBe(0);
-    expect(allocator.allocExact(1, 1)).toBe(192);
+    expect(allocator.allocExact(17, 8)).toBe(first);
   });
 
   it('drives span lifecycle over an exact system slab', () => {
@@ -102,6 +105,37 @@ describe('WasmAllocator exact slabs', () => {
 
     allocator.spanEndOk(system, traceRoot, CAPACITY);
     expect(allocator.readEntryType(system, 1, CAPACITY)).toBe(2);
+  });
+
+  it('keeps span data out of the stack frames its own exports push', () => {
+    // wasm-ld puts the module's shadow stack below 1 MiB, growing down from
+    // there, and its static data right above. Fill everything the arena hands
+    // out up to 2 MiB with a known pattern, then allocate and drive a span:
+    // those exports spill to that stack, and every byte must still be the
+    // pattern.
+    const blockLength = 4096;
+    const pattern = 0xa5;
+    const blocks: number[] = [];
+    while (allocator.getBumpPtr() < 2 * 1024 * 1024) {
+      const block = allocator.allocExact(blockLength, 8);
+      expect(block).toBeGreaterThan(0);
+      blocks.push(block);
+    }
+    for (const block of blocks) allocator.u8.fill(pattern, block, block + blockLength);
+
+    const system = allocator.allocExact(SYSTEM_BYTE_LENGTH, 8);
+    const identity = allocator.allocIdentityChild();
+    const traceRoot = allocator.allocExact(TRACE_ROOT_BYTE_LENGTH, 8);
+    allocator.initTraceRoot(traceRoot);
+    allocator.spanStart(system, identity, traceRoot, CAPACITY);
+    allocator.writeLogEntry(system, identity, traceRoot, 5, CAPACITY);
+    allocator.spanEndOk(system, traceRoot, CAPACITY);
+
+    const u8 = allocator.u8;
+    const clobbered = blocks.flatMap((block) =>
+      Array.from({ length: blockLength }, (_, index) => block + index).filter((address) => u8[address] !== pattern),
+    );
+    expect(clobbered).toEqual([]);
   });
 
   it('preserves root identity ownership and exact trace bytes', () => {

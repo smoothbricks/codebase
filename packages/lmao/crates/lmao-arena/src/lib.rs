@@ -42,8 +42,8 @@ pub enum SizeClass {
     Col8B = 3,
 }
 
-/// Arena header at offset 0; field order and padding are ABI, verified by the
-/// const asserts below.
+/// Arena header at [`raw::Mem::header`]; field order and padding are ABI,
+/// verified by the const asserts below.
 #[repr(C)]
 #[derive(Debug)]
 pub struct Header {
@@ -148,16 +148,17 @@ pub fn block_size(sc: SizeClass, capacity: u32) -> u32 {
     }
 }
 
-/// Byte offset into the arena. 0 is the null sentinel (header lives at 0, so no
-/// valid block ever starts there).
+/// Byte offset into linear memory. 0 is the null sentinel: blocks start at
+/// [`raw::Mem::heap_start`], which is never 0.
 pub type Offset = u32;
 
 pub mod raw;
 pub use raw::Mem;
 
-/// `Vec<u8>`-backed [`raw::Mem`] — the native linear-memory backend. The
-/// constructor reserves the complete admitted region; allocations return the
-/// offset-0 OOM sentinel rather than reallocating the arena under load.
+/// `Vec<u8>`-backed [`raw::Mem`] — the native linear-memory backend: the
+/// header at 0 and blocks after it. The constructor reserves the complete
+/// admitted region; allocations return the offset-0 OOM sentinel rather than
+/// reallocating the arena under load.
 #[derive(Debug)]
 pub struct VecMem(Vec<u8>);
 
@@ -173,6 +174,14 @@ impl VecMem {
 }
 
 impl raw::Mem for VecMem {
+    #[inline]
+    fn header(&self) -> u32 {
+        0
+    }
+    #[inline]
+    fn heap_start(&self) -> u32 {
+        HEADER_SIZE as u32
+    }
     #[inline]
     fn size(&self) -> u32 {
         self.0.len() as u32

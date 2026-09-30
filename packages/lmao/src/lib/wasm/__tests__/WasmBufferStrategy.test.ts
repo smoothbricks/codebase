@@ -38,13 +38,12 @@ describe('WasmBufferStrategy', () => {
   // Mock tracer lifecycle hooks for WasmTraceRoot
   let strategy: WasmBufferStrategy<typeof testSchema>;
   let mockTracer: TracerLifecycleHooks<typeof testSchema>;
+  /** Bump pointer of the empty arena: where `reset()` must return it. */
+  let emptyBumpPtr: number;
 
   beforeAll(async () => {
-    strategy = await WasmBufferStrategy.create<typeof testSchema>({
-      capacity: 64,
-      initialPages: 16, // 1MB
-      maxPages: 16,
-    });
+    strategy = await WasmBufferStrategy.create<typeof testSchema>({ capacity: 64 });
+    emptyBumpPtr = strategy.getStats().bumpPtr;
 
     // Mock tracer lifecycle hooks for WasmTraceRoot
     // Must be created after strategy so we can reference it
@@ -382,10 +381,10 @@ describe('WasmBufferStrategy', () => {
       expect(traceRoot._topology.generation).toBe(topologyGeneration + 1);
       expect(traceRoot._topology.count).toBe(0);
       expect(traceRoot._topology.root).toBe(NO_NODE);
-      expect(strategy.getStats()).toEqual({ allocCount: 0, freeCount: 0, bumpPtr: 192, capacity: 64 });
+      expect(strategy.getStats()).toEqual({ allocCount: 0, freeCount: 0, bumpPtr: emptyBumpPtr, capacity: 64 });
 
       expect(() => strategy.releaseBuffer(root)).toThrow(/stale/);
-      expect(strategy.getStats()).toEqual({ allocCount: 0, freeCount: 0, bumpPtr: 192, capacity: 64 });
+      expect(strategy.getStats()).toEqual({ allocCount: 0, freeCount: 0, bumpPtr: emptyBumpPtr, capacity: 64 });
     });
   });
 

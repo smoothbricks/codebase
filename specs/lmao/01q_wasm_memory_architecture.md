@@ -97,11 +97,14 @@ allocator:
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│ Header (192 bytes, 3 cache lines)                                │
-│ - bump_ptr, span_id_counter, alloc/free counts                   │
-│ - 28 tiered freelists (7 tiers × 4 size classes)                 │
-│ - thread_id, freelist_identity                                   │
+│ Module shadow stack (grows down from __stack_pointer)            │
 ├─────────────────────────────────────────────────────────────────┤
+│ Module static data (.rodata, .data, .bss)                        │
+│ - arena Header (192 bytes, 3 cache lines) at header_ptr():       │
+│   bump_ptr, span_id_counter, alloc/free counts,                  │
+│   28 tiered freelists (7 tiers × 4 size classes),                │
+│   thread_id, freelist_identity                                   │
+├──────────────────────────────────────────────────── __heap_base ┤
 │ Allocated Blocks                                                 │
 │ ┌─────────────┬─────────────┬─────────────┬─────────────┐       │
 │ │ Span System │ Span System │ 8B Column   │ 4B Column   │ ...   │
@@ -113,10 +116,14 @@ allocator:
 └─────────────────────────────────────────────────────────────────┘
 ```
 
+Blocks start at `__heap_base`, the first byte wasm-ld leaves free above the module's own stack and statics, so no
+export's stack frame can land in span memory. The header is a static of the module; the host reads its address once from
+`header_ptr()`.
+
 ### Header Structure (192 bytes, 3 cache lines) <a id="smoo/lmao!n/wasm-mem.header-structure-192-bytes-3-cache-lines"></a>
 
 The header uses tiered freelists for buddy allocation. Each size class has 7 tiers corresponding to capacities 8, 16,
-32, 64, 128, 256, 512.
+32, 64, 128, 256, 512. Offsets are from `header_ptr()`.
 
 ```
 Offset  Size  Field

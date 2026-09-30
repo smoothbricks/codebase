@@ -109,6 +109,8 @@ export interface WasmAllocator {
   setThreadId(high: number, low: number): void;
   getThreadIdHigh(): number;
   getThreadIdLow(): number;
+  /** The header's thread id, read from linear memory without a WASM call. */
+  readThreadId(): bigint;
   isThreadIdSet(): number;
   getSpanIdCounter(): number;
 
@@ -185,6 +187,7 @@ interface WasmExports {
 
   init_trace_root(traceRootPtr: number): void;
 
+  header_ptr(): number;
   get_bump_ptr(): number;
   get_alloc_count(): number;
   get_free_count(): number;
@@ -224,6 +227,7 @@ function isWasmExports(value: unknown): value is WasmExports {
 
   return (
     typeof Reflect.get(value, 'init') === 'function' &&
+    typeof Reflect.get(value, 'header_ptr') === 'function' &&
     typeof Reflect.get(value, 'alloc_exact') === 'function' &&
     typeof Reflect.get(value, 'create_and_start_span') === 'function' &&
     typeof Reflect.get(value, 'create_overflow_span') === 'function' &&
@@ -238,6 +242,8 @@ function isWasmExports(value: unknown): value is WasmExports {
 const MIN_INITIAL_PAGES = 17; // ~1MB - matches WASM module minimum
 const DEFAULT_MAX_PAGES = 16384; // 1GB max (can grow up to this)
 const DEFAULT_CAPACITY = 64;
+/** Byte offset of the u64 `thread_id` in `lmao_arena::Header`. */
+const HEADER_THREAD_ID_OFFSET = 24;
 
 /**
  * Create typed views over WASM memory.
@@ -279,6 +285,9 @@ function wrapWasmInstance(instance: WebAssembly.Instance, memory: WebAssembly.Me
 
   // Initialize the allocator header
   exports.init();
+  // The header is a static of the module, so its address is fixed for the
+  // instance's lifetime; the thread id is two little-endian u32 words there.
+  const threadIdLowWord = (exports.header_ptr() + HEADER_THREAD_ID_OFFSET) >>> 2;
 
   return {
     memory,
@@ -379,6 +388,10 @@ function wrapWasmInstance(instance: WebAssembly.Instance, memory: WebAssembly.Me
     setThreadId: exports.set_thread_id,
     getThreadIdHigh: exports.get_thread_id_high,
     getThreadIdLow: exports.get_thread_id_low,
+    readThreadId() {
+      refreshViews();
+      return (BigInt(views.u32[threadIdLowWord + 1]) << 32n) | BigInt(views.u32[threadIdLowWord]);
+    },
     isThreadIdSet: exports.is_thread_id_set,
     getSpanIdCounter: exports.get_span_id_counter,
 

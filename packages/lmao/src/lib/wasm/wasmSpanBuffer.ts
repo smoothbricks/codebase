@@ -897,10 +897,8 @@ class WasmSpanBuffer {
       if (familyOffset !== 0) familyPtrs[family] = this._allocationPtr + familyOffset;
     }
     this._familyPtrs = Object.freeze(familyPtrs);
-    const allocatorWords = opts.allocator.u32;
-    this._threadId =
-      this._identitySource?.thread_id ?? ((BigInt(allocatorWords[7]) << 32n) | BigInt(allocatorWords[6]));
-    this._spanId = this._identitySource?.span_id ?? allocatorWords[(this._identityPtr + 4) >>> 2];
+    this._threadId = this._identitySource?.thread_id ?? opts.allocator.readThreadId();
+    this._spanId = this._identitySource?.span_id ?? opts.allocator.u32[(this._identityPtr + 4) >>> 2];
     this._viewVersion = 0;
     this._spanStartedAtAllocation = this._identityOwner;
 

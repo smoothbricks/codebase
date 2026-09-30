@@ -11,18 +11,25 @@
 use core::mem::{offset_of, size_of};
 
 use crate::{
-    FREE_BLOCK_SIZE, FreeBlock, HEADER_SIZE, Header, IDENTITY_SIZE, Identity, NUM_TIERS, SizeClass,
-    TraceRoot, block_size, capacity_addresses_rows, capacity_to_tier, null_bitmap_bytes,
-    tier_to_capacity,
+    FREE_BLOCK_SIZE, FreeBlock, Header, IDENTITY_SIZE, Identity, NUM_TIERS, SizeClass, TraceRoot,
+    block_size, capacity_addresses_rows, capacity_to_tier, null_bitmap_bytes, tier_to_capacity,
 };
 
-/// Linear memory backend. Offsets are absolute byte offsets; offset 0 holds the
-/// header, so 0 doubles as the null sentinel.
+/// Linear memory backend. Offsets are absolute byte offsets. The arena owns its
+/// [`Header`] at [`Mem::header`] and every byte from [`Mem::heap_start`] up,
+/// and nothing else: on wasm32 the memory below `heap_start` is the module's
+/// own shadow stack and static data. No block starts at 0, so 0 is the null
+/// sentinel.
 ///
 /// Growth is behind this trait: the native backend grows a `Vec`, the wasm
 /// backend calls `memory.grow`. `grow_to` returns false on OOM (alloc then
 /// returns the 0 sentinel).
 pub trait Mem {
+    /// Address of the arena [`Header`]: addressable before any growth, and
+    /// outside `[heap_start, size)`.
+    fn header(&self) -> u32;
+    /// First address a block may occupy; nonzero.
+    fn heap_start(&self) -> u32;
     fn size(&self) -> u32;
     /// Ensure at least `new_size` bytes are addressable. False = OOM.
     fn grow_to(&mut self, new_size: u32) -> bool;
@@ -116,23 +123,23 @@ pub struct SpanLayout {
 const BUMP_ALIGNMENT: u32 = 64;
 
 #[inline]
-fn freelist_off(sc: SizeClass, tier: usize) -> u32 {
-    H_FREELISTS + 4 * (sc as u32 * NUM_TIERS as u32 + tier as u32)
+fn freelist_off<M: Mem>(m: &M, sc: SizeClass, tier: usize) -> u32 {
+    m.header() + H_FREELISTS + 4 * (sc as u32 * NUM_TIERS as u32 + tier as u32)
 }
 
 #[inline]
 fn freelist_head<M: Mem>(m: &M, sc: SizeClass, tier: usize) -> u32 {
-    m.read_u32(freelist_off(sc, tier))
+    m.read_u32(freelist_off(m, sc, tier))
 }
 
 #[inline]
 fn set_freelist_head<M: Mem>(m: &mut M, sc: SizeClass, tier: usize, v: u32) {
-    m.write_u32(freelist_off(sc, tier), v);
+    m.write_u32(freelist_off(m, sc, tier), v);
 }
 
 /// `init()` — idempotent header initialization (first call only).
 pub fn init<M: Mem>(m: &mut M) {
-    if m.read_u32(H_BUMP_PTR) == 0 {
+    if m.read_u32(m.header() + H_BUMP_PTR) == 0 {
         reset(m);
     }
     // thread_id persists across init calls
@@ -140,15 +147,15 @@ pub fn init<M: Mem>(m: &mut M) {
 
 /// `reset()` — testing/benchmark reset; leaks all live blocks by design.
 pub fn reset<M: Mem>(m: &mut M) {
-    m.write_u32(H_BUMP_PTR, HEADER_SIZE as u32);
-    m.write_u32(H_ALLOC_COUNT, 0);
-    m.write_u32(H_FREE_COUNT, 0);
-    m.write_u32(H_SPAN_ID_COUNTER, 0);
+    m.write_u32(m.header() + H_BUMP_PTR, m.heap_start());
+    m.write_u32(m.header() + H_ALLOC_COUNT, 0);
+    m.write_u32(m.header() + H_FREE_COUNT, 0);
+    m.write_u32(m.header() + H_SPAN_ID_COUNTER, 0);
     for i in 0..crate::NUM_FREELISTS {
-        m.write_u32(H_FREELISTS + 4 * i as u32, 0);
+        m.write_u32(m.header() + H_FREELISTS + 4 * i as u32, 0);
     }
-    m.write_u32(H_FREELIST_IDENTITY, 0);
-    m.write_u32(H_FREELIST_EXACT, 0);
+    m.write_u32(m.header() + H_FREELIST_IDENTITY, 0);
+    m.write_u32(m.header() + H_FREELIST_EXACT, 0);
     // thread_id persists across reset calls
 }
 
@@ -194,7 +201,7 @@ fn alloc_at_tier<M: Mem>(m: &mut M, sc: SizeClass, tier: usize) -> u32 {
     // Bump allocate on a cache-line boundary.
     let size = block_size(sc, tier_to_capacity(tier));
     let Some(aligned) = m
-        .read_u32(H_BUMP_PTR)
+        .read_u32(m.header() + H_BUMP_PTR)
         .checked_add(BUMP_ALIGNMENT - 1)
         .map(|value| value & !(BUMP_ALIGNMENT - 1))
     else {
@@ -206,15 +213,17 @@ fn alloc_at_tier<M: Mem>(m: &mut M, sc: SizeClass, tier: usize) -> u32 {
     if new_bump > m.size() && !m.grow_to(new_bump) {
         return 0;
     }
-    m.write_u32(H_BUMP_PTR, new_bump);
+    m.write_u32(m.header() + H_BUMP_PTR, new_bump);
     bump_counter(m, H_ALLOC_COUNT);
     aligned
 }
 
+/// Increment one [`Header`] counter; `field` is its offset in the header.
 #[inline]
-fn bump_counter<M: Mem>(m: &mut M, off: u32) {
-    let v = m.read_u32(off);
-    m.write_u32(off, v + 1);
+fn bump_counter<M: Mem>(m: &mut M, field: u32) {
+    let at = m.header() + field;
+    let v = m.read_u32(at);
+    m.write_u32(at, v + 1);
 }
 
 /// Address-based neighbor merge (right, then left), else freelist push.
@@ -385,14 +394,14 @@ pub fn alloc_exact<M: Mem>(m: &mut M, byte_len: u32, alignment: u32) -> u32 {
     }
 
     let mut previous = 0;
-    let mut current = m.read_u32(H_FREELIST_EXACT);
+    let mut current = m.read_u32(m.header() + H_FREELIST_EXACT);
     while current != 0 {
         let next = m.read_u32(current + EFB_NEXT_PTR);
         if m.read_u32(current + EFB_BYTE_LEN) == byte_len
             && m.read_u32(current + EFB_ALIGNMENT) == alignment
         {
             if previous == 0 {
-                m.write_u32(H_FREELIST_EXACT, next);
+                m.write_u32(m.header() + H_FREELIST_EXACT, next);
             } else {
                 m.write_u32(previous + EFB_NEXT_PTR, next);
             }
@@ -407,7 +416,7 @@ pub fn alloc_exact<M: Mem>(m: &mut M, byte_len: u32, alignment: u32) -> u32 {
     let storage_len = byte_len.max(EXACT_FREE_BLOCK_SIZE);
     let storage_alignment = alignment.max(BUMP_ALIGNMENT);
     let Some(aligned) = m
-        .read_u32(H_BUMP_PTR)
+        .read_u32(m.header() + H_BUMP_PTR)
         .checked_add(storage_alignment - 1)
         .map(|value| value & !(storage_alignment - 1))
     else {
@@ -420,7 +429,7 @@ pub fn alloc_exact<M: Mem>(m: &mut M, byte_len: u32, alignment: u32) -> u32 {
         return 0;
     }
 
-    m.write_u32(H_BUMP_PTR, new_bump);
+    m.write_u32(m.header() + H_BUMP_PTR, new_bump);
     clear_bytes(m, aligned, byte_len);
     bump_counter(m, H_ALLOC_COUNT);
     aligned
@@ -430,7 +439,7 @@ pub fn alloc_exact<M: Mem>(m: &mut M, byte_len: u32, alignment: u32) -> u32 {
 /// null offsets, out-of-range blocks, and offsets already present in the list
 /// are ignored so malformed or repeated frees cannot corrupt the list.
 pub fn free_exact<M: Mem>(m: &mut M, offset: u32, byte_len: u32, alignment: u32) {
-    if offset < HEADER_SIZE as u32
+    if offset < m.heap_start()
         || alignment == 0
         || !alignment.is_power_of_two()
         || offset & (alignment.max(4) - 1) != 0
@@ -442,11 +451,11 @@ pub fn free_exact<M: Mem>(m: &mut M, offset: u32, byte_len: u32, alignment: u32)
     let Some(end) = offset.checked_add(storage_len) else {
         return;
     };
-    if end > m.size() || end > m.read_u32(H_BUMP_PTR) {
+    if end > m.size() || end > m.read_u32(m.header() + H_BUMP_PTR) {
         return;
     }
 
-    let mut current = m.read_u32(H_FREELIST_EXACT);
+    let mut current = m.read_u32(m.header() + H_FREELIST_EXACT);
     while current != 0 {
         if current == offset {
             return;
@@ -454,12 +463,12 @@ pub fn free_exact<M: Mem>(m: &mut M, offset: u32, byte_len: u32, alignment: u32)
         current = m.read_u32(current + EFB_NEXT_PTR);
     }
 
-    let head = m.read_u32(H_FREELIST_EXACT);
+    let head = m.read_u32(m.header() + H_FREELIST_EXACT);
     m.write_u32(offset + EFB_NEXT_PTR, head);
     m.write_u32(offset + EFB_BYTE_LEN, byte_len);
     m.write_u32(offset + EFB_ALIGNMENT, alignment);
     m.write_u32(offset + EFB_STORAGE_LEN, storage_len);
-    m.write_u32(H_FREELIST_EXACT, offset);
+    m.write_u32(m.header() + H_FREELIST_EXACT, offset);
     bump_counter(m, H_FREE_COUNT);
 }
 
@@ -467,10 +476,10 @@ pub fn free_exact<M: Mem>(m: &mut M, offset: u32, byte_len: u32, alignment: u32)
 
 /// Identity allocation pops the freelist or uses a cache-line-aligned bump.
 fn alloc_identity_block<M: Mem>(m: &mut M) -> u32 {
-    let head_offset = m.read_u32(H_FREELIST_IDENTITY);
+    let head_offset = m.read_u32(m.header() + H_FREELIST_IDENTITY);
     if head_offset != 0 {
         let next = m.read_u32(head_offset + FB_NEXT_PTR);
-        m.write_u32(H_FREELIST_IDENTITY, next);
+        m.write_u32(m.header() + H_FREELIST_IDENTITY, next);
         if next != 0 {
             let reuse = m.read_u32(next + FB_REUSE_COUNT);
             m.write_u32(next + FB_REUSE_COUNT, reuse + 1);
@@ -479,7 +488,7 @@ fn alloc_identity_block<M: Mem>(m: &mut M) -> u32 {
         return head_offset;
     }
     let Some(aligned) = m
-        .read_u32(H_BUMP_PTR)
+        .read_u32(m.header() + H_BUMP_PTR)
         .checked_add(BUMP_ALIGNMENT - 1)
         .map(|value| value & !(BUMP_ALIGNMENT - 1))
     else {
@@ -491,13 +500,13 @@ fn alloc_identity_block<M: Mem>(m: &mut M) -> u32 {
     if new_bump > m.size() && !m.grow_to(new_bump) {
         return 0;
     }
-    m.write_u32(H_BUMP_PTR, new_bump);
+    m.write_u32(m.header() + H_BUMP_PTR, new_bump);
     bump_counter(m, H_ALLOC_COUNT);
     aligned
 }
 
 fn identity_block_is_free<M: Mem>(m: &M, offset: u32) -> bool {
-    let mut current = m.read_u32(H_FREELIST_IDENTITY);
+    let mut current = m.read_u32(m.header() + H_FREELIST_IDENTITY);
     while current != 0 {
         if current == offset {
             return true;
@@ -512,7 +521,7 @@ pub fn free_identity<M: Mem>(m: &mut M, offset: u32) {
     if offset == 0 || identity_block_is_free(m, offset) {
         return;
     }
-    let old_head = m.read_u32(H_FREELIST_IDENTITY);
+    let old_head = m.read_u32(m.header() + H_FREELIST_IDENTITY);
     m.write_u32(offset + FB_NEXT_PTR, old_head);
     if old_head != 0 {
         let len = m.read_u32(old_head + FB_FREELIST_LEN);
@@ -529,13 +538,13 @@ pub fn free_identity<M: Mem>(m: &mut M, offset: u32) {
         m.write_u32(offset + FB_SPLIT_COUNT, 0);
         m.write_u32(offset + FB_MERGE_COUNT, 0);
     }
-    m.write_u32(H_FREELIST_IDENTITY, offset);
+    m.write_u32(m.header() + H_FREELIST_IDENTITY, offset);
     bump_counter(m, H_FREE_COUNT);
 }
 
 fn initialize_identity<M: Mem>(m: &mut M, offset: u32, trace_id_len: u32) {
-    let span_id = m.read_u32(H_SPAN_ID_COUNTER) + 1;
-    m.write_u32(H_SPAN_ID_COUNTER, span_id);
+    let span_id = m.read_u32(m.header() + H_SPAN_ID_COUNTER) + 1;
+    m.write_u32(m.header() + H_SPAN_ID_COUNTER, span_id);
     m.write_u32(offset + ID_SPAN_ID, span_id);
     m.write_u32(offset + ID_WRITE_INDEX, 0);
     m.write_u8(offset + ID_TRACE_ID_LEN, trace_id_len as u8);
@@ -589,32 +598,35 @@ pub fn read_write_index<M: Mem>(m: &M, identity_ptr: u32) -> u32 {
 // --- Thread id / stats ---
 
 pub fn set_thread_id<M: Mem>(m: &mut M, high: u32, low: u32) {
-    m.write_u64(H_THREAD_ID, (u64::from(high) << 32) | u64::from(low));
-    m.write_u8(H_THREAD_ID_SET, 1);
+    m.write_u64(
+        m.header() + H_THREAD_ID,
+        (u64::from(high) << 32) | u64::from(low),
+    );
+    m.write_u8(m.header() + H_THREAD_ID_SET, 1);
 }
 
 pub fn thread_id<M: Mem>(m: &M) -> u64 {
-    m.read_u64(H_THREAD_ID)
+    m.read_u64(m.header() + H_THREAD_ID)
 }
 
 pub fn is_thread_id_set<M: Mem>(m: &M) -> u8 {
-    m.read_u8(H_THREAD_ID_SET)
+    m.read_u8(m.header() + H_THREAD_ID_SET)
 }
 
 pub fn bump_ptr<M: Mem>(m: &M) -> u32 {
-    m.read_u32(H_BUMP_PTR)
+    m.read_u32(m.header() + H_BUMP_PTR)
 }
 
 pub fn alloc_count<M: Mem>(m: &M) -> u32 {
-    m.read_u32(H_ALLOC_COUNT)
+    m.read_u32(m.header() + H_ALLOC_COUNT)
 }
 
 pub fn free_count<M: Mem>(m: &M) -> u32 {
-    m.read_u32(H_FREE_COUNT)
+    m.read_u32(m.header() + H_FREE_COUNT)
 }
 
 pub fn span_id_counter<M: Mem>(m: &M) -> u32 {
-    m.read_u32(H_SPAN_ID_COUNTER)
+    m.read_u32(m.header() + H_SPAN_ID_COUNTER)
 }
 
 pub fn debug_freelist_head<M: Mem>(m: &M, sc: SizeClass, capacity: u32) -> u32 {

@@ -84,11 +84,7 @@ describe('WASM Integration Tests', () => {
   let tracer: TestTracer<typeof opContext>;
 
   beforeAll(async () => {
-    strategy = await WasmBufferStrategy.create({
-      capacity: 64,
-      initialPages: 16,
-      maxPages: 16,
-    });
+    strategy = await WasmBufferStrategy.create({ capacity: 64 });
 
     tracer = new TestTracer(opContext, {
       bufferStrategy: strategy,

@@ -20,9 +20,7 @@
 //! `cargo test --workspace` can exercise the ABI surface natively.
 
 use lmao_arena::SizeClass;
-#[cfg(target_arch = "wasm32")]
-use lmao_arena::raw::Mem;
-use lmao_arena::raw::{self};
+use lmao_arena::raw::{self, Mem};
 // Public on the rlib so the native build sees the adapter as reachable API;
 // the wasm artifact reaches it through its (wasm-only) unmangled exports.
 pub mod thread_span_buffer;
@@ -60,11 +58,29 @@ fn date_now() -> f64 {
 /// (memory starts at 0), with `memory.size`/`memory.grow` for growth. All accesses
 /// are unaligned-safe (`read_unaligned`/`write_unaligned`) because column values
 /// sit at arbitrary byte offsets after the null bitmap.
+///
+/// Blocks start at `__heap_base`, the first byte wasm-ld leaves free above the
+/// module's shadow stack and static data, so no export's stack frame or static
+/// can land in span memory. The header is a static rather than the first heap
+/// bytes, so it needs no growth before the first allocation.
 #[cfg(target_arch = "wasm32")]
 struct WasmMem;
 
-/// Absolute offset → pointer. Offset 0 alone is laundered so LLVM cannot treat
-/// the valid header address as Rust's null pointer and fold its accesses away.
+#[cfg(target_arch = "wasm32")]
+unsafe extern "C" {
+    /// Defined by wasm-ld: the end of the stack and static data, 16-aligned.
+    static __heap_base: u8;
+}
+
+/// The arena header's storage. Zeroed `.bss`, so the first `init` sees a zero
+/// bump pointer and resets; only ever reached through its address.
+#[cfg(target_arch = "wasm32")]
+static mut ARENA_HEADER: core::mem::MaybeUninit<lmao_arena::Header> =
+    core::mem::MaybeUninit::zeroed();
+
+/// Absolute offset → pointer. Offset 0 is the null sentinel and never an arena
+/// address, but the host can still pass it; laundering keeps that access an
+/// ordinary wasm load or store instead of Rust null-pointer UB LLVM may fold.
 #[cfg(target_arch = "wasm32")]
 #[inline(always)]
 fn linear_address(off: u32) -> *mut u8 {
@@ -80,6 +96,16 @@ fn linear_address(off: u32) -> *mut u8 {
 const WASM_PAGE_SIZE: u32 = 65_536;
 #[cfg(target_arch = "wasm32")]
 impl Mem for WasmMem {
+    #[inline]
+    fn header(&self) -> u32 {
+        // Exposed: `linear_address` turns this integer back into the pointer
+        // every header access goes through.
+        (&raw mut ARENA_HEADER).expose_provenance() as u32
+    }
+    #[inline]
+    fn heap_start(&self) -> u32 {
+        (&raw const __heap_base).addr() as u32
+    }
     #[inline]
     fn size(&self) -> u32 {
         (core::arch::wasm32::memory_size(0) as u32).saturating_mul(WASM_PAGE_SIZE)
@@ -168,6 +194,14 @@ pub extern "C" fn init() {
 #[unsafe(no_mangle)]
 pub extern "C" fn reset() {
     with_mem(raw::reset);
+}
+
+/// Linear-memory address of the arena [`Header`](lmao_arena::Header). The
+/// host reads header fields (the thread id) there without a call; the address
+/// is fixed for the instance's lifetime.
+#[unsafe(no_mangle)]
+pub extern "C" fn header_ptr() -> u32 {
+    with_mem(|m| m.header())
 }
 
 // =============================================================================
