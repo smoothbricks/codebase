@@ -580,7 +580,7 @@ impl CliService for ActorBridge {
                         "cowshed mount main --repo-id <owner/repo>",
                     )
                 })?
-                .mountpoint
+                .checkout_path
         } else {
             layout.workspace_mount(&name).map_err(|error| {
                 CowshedError::integrity(
@@ -2161,14 +2161,10 @@ async fn attach_project_sessions_from_store(
 ) -> Result<Vec<WorkspaceInfo>> {
     let layout = StorageLayout::new(storage.store(), &project.repo_id)
         .map_err(attach_store_storage_error)?;
-    let checkout_layout = layout
-        .checkout_layout()
-        .map_err(attach_store_storage_error)?;
     let config = ApfsSubstrateConfig::new(
         storage.store(),
         storage.caches(),
         &project.project_root,
-        checkout_layout,
         ApfsCaseSensitivity::Sensitive,
     );
     let host = MacOsApfsExecutionHost::new(SystemCommandRunner, config.clone())
@@ -2206,15 +2202,11 @@ fn store_workspace_info(
         .map_err(attach_store_storage_error)?;
     let metadata = DetachedWorkspaceMetadata::read_for_image(image.image())
         .map_err(attach_store_storage_error)?;
-    let snapshot = metadata.info_snapshot.as_ref();
-    let base_commit = snapshot
-        .map(|snapshot| GitOid::new(snapshot.base_commit.clone()))
-        .transpose()
-        .map_err(attach_store_storage_error)?;
-    let created_at = snapshot
-        .map(|snapshot| UtcTimestamp::new(snapshot.created_at.clone()))
-        .transpose()
-        .map_err(attach_store_storage_error)?;
+    let snapshot = &metadata.info_snapshot;
+    let base_commit =
+        Some(GitOid::new(snapshot.base_commit.clone()).map_err(attach_store_storage_error)?);
+    let created_at =
+        Some(UtcTimestamp::new(snapshot.created_at.clone()).map_err(attach_store_storage_error)?);
     Ok(WorkspaceInfo {
         repo_id: derived.workspace.repo().clone(),
         workspace: derived.workspace.name().clone(),
@@ -2225,7 +2217,7 @@ fn store_workspace_info(
             .workspace_mount(derived.workspace.name())
             .map_err(attach_store_storage_error)?,
         state: WorkspaceState::Detached,
-        branch: snapshot.and_then(|snapshot| snapshot.branch.clone()),
+        branch: snapshot.branch.clone(),
         base_commit,
         created_at,
         checkpoints: derived
@@ -2237,7 +2229,7 @@ fn store_workspace_info(
                 pinned: checkpoint.pin == Pin::Pinned,
             })
             .collect(),
-        snapshot_stale: snapshot.is_some_and(|snapshot| snapshot.stale),
+        snapshot_stale: snapshot.stale,
         landing: None,
     })
 }
@@ -2310,16 +2302,10 @@ async fn detach_project_sessions_from_store(
     storage: &ValidatedHostStorage,
     project: &AdoptedProject,
 ) -> Result<usize> {
-    let layout = StorageLayout::new(storage.store(), &project.repo_id)
-        .map_err(detach_store_storage_error)?;
-    let checkout_layout = layout
-        .checkout_layout()
-        .map_err(detach_store_storage_error)?;
     let config = ApfsSubstrateConfig::new(
         storage.store(),
         storage.caches(),
         &project.project_root,
-        checkout_layout,
         ApfsCaseSensitivity::Sensitive,
     );
     let host = MacOsApfsExecutionHost::new(SystemCommandRunner, config.clone())
@@ -2419,15 +2405,7 @@ pub(crate) fn resolve_session_project_root(store: &Path, workspace: &str) -> Res
                             "cowshed doctor",
                         )
                     })?;
-                let snapshot = metadata.require_info_snapshot().map_err(|error| {
-                    CowshedError::integrity(
-                        format!(
-                            "workspace {wanted} sidecar at {} has no project identity: {error}",
-                            image.path().display()
-                        ),
-                        "cowshed doctor",
-                    )
-                })?;
+                let snapshot = &metadata.info_snapshot;
                 found.push((metadata.repo_id.clone(), snapshot.project_root.clone()));
             }
         }

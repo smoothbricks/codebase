@@ -16,9 +16,9 @@ use cowshed_core::repository::RepoId;
 use cowshed_core::storage::CheckpointLabel;
 use cowshed_core::storage::apfs::{
     AdoptExecutionError, ApfsBlockingLane, ApfsExecutionHost, ApfsStorageError, ApfsSubstrate,
-    ApfsSubstrateConfig, CheckoutLayout, DEFAULT_IMAGE_CAPACITY, IncarnationSource, LockMode,
-    MarkerExpectation, MetadataPolicy, PublicationError, RestoreStage, ResumableClone,
-    ResumableStage, RetireExecutionError, volume_key,
+    ApfsSubstrateConfig, DEFAULT_IMAGE_CAPACITY, IncarnationSource, LockMode, MarkerExpectation,
+    MetadataPolicy, PublicationError, RestoreStage, ResumableClone, ResumableStage,
+    RetireExecutionError, volume_key,
 };
 use cowshed_core::storage::lifecycle::{
     AdoptRequest, CheckpointFact, DefragmentOutcome, Destination, ExtentCount, KernelMountFact,
@@ -536,40 +536,12 @@ impl ApfsExecutionHost for FakeHost {
         }
         Ok(())
     }
-    fn publish_adopt(
-        &self,
-        canonical_mount: &Path,
-        staged: &Path,
-        _: &Path,
-    ) -> Result<(), PublicationError> {
-        self.record("atomic-adopt-mountpoint+publish");
-        self.record_path(canonical_mount);
-        let mut state = self.state.lock().expect("fake state");
-        if let Some(fact) = state.staged.remove(staged) {
-            let key = (fact.workspace.repo().clone(), fact.workspace.name().clone());
-            state.formats.insert(key.clone(), fact.workspace.format());
-            state.published.insert(key, fact);
-        }
-        Ok(())
-    }
     fn vacate_adopted_checkout(
         &self,
         source_checkout: &Path,
         pre_cowshed_checkout: &Path,
     ) -> Result<(), PublicationError> {
         self.record("atomic-adopt-checkout-vacate");
-        self.record_path(source_checkout);
-        self.record_path(pre_cowshed_checkout);
-        Ok(())
-    }
-    fn link_adopted_checkout(
-        &self,
-        canonical_mount: &Path,
-        source_checkout: &Path,
-        pre_cowshed_checkout: &Path,
-    ) -> Result<(), PublicationError> {
-        self.record("atomic-adopt-checkout-swap");
-        self.record_path(canonical_mount);
         self.record_path(source_checkout);
         self.record_path(pre_cowshed_checkout);
         Ok(())
@@ -709,12 +681,15 @@ impl ApfsExecutionHost for FakeHost {
         Ok(cowshed_core::storage::apfs::PendingPublicationFact {
             workspace: workspace.clone(),
             image: canonical.to_owned(),
-            // Uniform mount namespace: main is not special.
-            mount_point: PathBuf::from(format!(
-                "/store/mnt/{}/{}",
-                workspace.repo(),
-                workspace.name()
-            )),
+            mount_point: if workspace.name().is_main() {
+                PathBuf::from("/project")
+            } else {
+                PathBuf::from(format!(
+                    "/store/mnt/{}/{}",
+                    workspace.repo(),
+                    workspace.name()
+                ))
+            },
             source_checkpoint: source_image
                 .file_stem()
                 .and_then(|stem| stem.to_str())
@@ -836,11 +811,15 @@ impl ApfsExecutionHost for FakeHost {
                 |(image, fact)| cowshed_core::storage::apfs::PendingPublicationFact {
                     workspace: fact.workspace.clone(),
                     image: image.clone(),
-                    mount_point: PathBuf::from(format!(
-                        "/store/mnt/{}/{}",
-                        fact.workspace.repo(),
-                        fact.workspace.name()
-                    )),
+                    mount_point: if fact.workspace.name().is_main() {
+                        PathBuf::from("/project")
+                    } else {
+                        PathBuf::from(format!(
+                            "/store/mnt/{}/{}",
+                            fact.workspace.repo(),
+                            fact.workspace.name()
+                        ))
+                    },
                     source_checkpoint: "checkpoint-source".to_owned(),
                     source_incarnation: WorkspaceIncarnation::new(
                         "ffffffffffffffffffffffffffffffff",
@@ -1032,20 +1011,11 @@ fn workspace(name: &str, format: ImageFormat, revision: u64) -> LifecycleWorkspa
 }
 
 fn substrate(host: FakeHost, lane: CountingLane) -> ApfsSubstrate<FakeHost, CountingLane> {
-    substrate_with_layout(host, lane, CheckoutLayout::Symlink)
-}
-
-fn substrate_with_layout(
-    host: FakeHost,
-    lane: CountingLane,
-    checkout_layout: CheckoutLayout,
-) -> ApfsSubstrate<FakeHost, CountingLane> {
     ApfsSubstrate::with_lane_and_incarnations(
         ApfsSubstrateConfig::new(
             "/store",
             "/store/caches",
             "/project",
-            checkout_layout,
             ApfsCaseSensitivity::Insensitive,
         ),
         host,
@@ -1113,7 +1083,7 @@ async fn adopt_uses_exact_format_and_verify_before_mount_order() {
             assert!(
                 !callback_host
                     .events()
-                    .contains(&"atomic-adopt-mountpoint+publish".to_owned())
+                    .contains(&"atomic-publish-image".to_owned())
             );
             callback_host.record("controller-initialize");
             Ok::<(), &'static str>(())
@@ -1148,14 +1118,14 @@ async fn adopt_uses_exact_format_and_verify_before_mount_order() {
             "validate-staged-companion",
             "validate-marker",
             "detach:Release",
-            // Durable state first, entirely outside the user's tree...
-            "atomic-adopt-mountpoint+publish",
+            // Durable state first: the image is published before the user's tree is touched...
+            "atomic-publish-image",
+            // ...then the swap plants the mountpoint at the checkout path, and main mounts there.
+            "atomic-adopt-checkout-vacate",
             "attach-no-mount+fsck:Sparse",
             "mount:Sparse",
             "validate-marker",
             "retain-mounted",
-            // ...and only once main is mounted and live does the checkout path change hands.
-            "atomic-adopt-checkout-swap",
         ]
     );
     assert_eq!(
@@ -1204,15 +1174,13 @@ async fn interrupted_adopt_clones_the_partial_stage_and_resumes_tree_copy() {
     );
 }
 
-/// The two layouts publish the same durable state and differ only in when the checkout path can
-/// change hands. Under the symlink layout the mountpoint is cowshed's own, so main is mounted
-/// before the symlink appears. Under direct mount the mountpoint *is* the checkout path and
-/// cannot exist until the swap creates it, so the swap comes first and the attach follows it.
+/// The mountpoint *is* the checkout path and cannot exist until the swap creates it, so the swap
+/// comes first and the attach follows it.
 #[tokio::test]
 async fn direct_mount_adopt_swaps_the_checkout_before_attaching_it() {
     let host = FakeHost::default();
     let lane = CountingLane::default();
-    let substrate = substrate_with_layout(host.clone(), lane.clone(), CheckoutLayout::DirectMount);
+    let substrate = substrate(host.clone(), lane.clone());
     let plan = substrate
         .plan_adopt(adopt_request(ImageFormat::Sparse))
         .expect("adopt plan");
@@ -1243,11 +1211,6 @@ async fn direct_mount_adopt_swaps_the_checkout_before_attaching_it() {
             "validate-marker",
             "retain-mounted",
         ]
-    );
-    assert!(
-        !events.contains(&"atomic-adopt-mountpoint+publish".to_owned())
-            && !events.contains(&"atomic-adopt-checkout-swap".to_owned()),
-        "direct mount must not build a mountpoint under the store or plant a symlink"
     );
 }
 
@@ -1290,7 +1253,7 @@ async fn initializer_failure_detaches_reclaims_and_never_publishes() {
     assert!(events.contains(&"controller-rejected".to_owned()));
     assert!(events.contains(&"detach:Release".to_owned()));
     assert!(events.contains(&"idempotent-reclaim".to_owned()));
-    assert!(!events.contains(&"atomic-adopt-mountpoint+publish".to_owned()));
+    assert!(!events.contains(&"atomic-publish-image".to_owned()));
     assert!(!events.contains(&"retain-mounted".to_owned()));
 }
 
@@ -1319,7 +1282,7 @@ async fn credential_mint_failure_reclaims_adopt_stage_before_publication() {
     assert!(events.contains(&"detach:Release".to_owned()));
     assert!(events.contains(&"idempotent-reclaim".to_owned()));
     assert!(!events.contains(&"write-marker".to_owned()));
-    assert!(!events.contains(&"atomic-adopt-mountpoint+publish".to_owned()));
+    assert!(!events.contains(&"atomic-publish-image".to_owned()));
     assert!(host.list(&repo()).expect("post-failure listing").is_empty());
 }
 
@@ -1348,11 +1311,7 @@ async fn initializer_and_cleanup_errors_are_both_preserved() {
         other => panic!("unexpected compound adopt error: {other:?}"),
     }
     assert!(host.mounted_paths_now().is_empty());
-    assert!(
-        !host
-            .events()
-            .contains(&"atomic-adopt-mountpoint+publish".to_owned())
-    );
+    assert!(!host.events().contains(&"atomic-publish-image".to_owned()));
 }
 
 #[tokio::test]
@@ -1368,7 +1327,6 @@ async fn adopt_rejects_each_source_identity_mismatch_before_mutation() {
                 "/store",
                 "/store/caches",
                 checkout_path,
-                CheckoutLayout::Symlink,
                 ApfsCaseSensitivity::Insensitive,
             ),
             host.clone(),
@@ -1418,7 +1376,7 @@ async fn ensure_mounted_is_idempotent_for_an_already_mounted_workspace() {
         .await
         .expect("already mounted");
 
-    assert_eq!(path, PathBuf::from("/store/mnt/acme/widget/main"));
+    assert_eq!(path, PathBuf::from("/project"));
     assert!(
         !host
             .events()
@@ -1976,7 +1934,7 @@ async fn aborting_adopt_callback_detaches_and_reclaims_the_stage() {
     let events = host.events();
     assert!(events.contains(&"detach:Release".to_owned()));
     assert!(events.contains(&"idempotent-reclaim".to_owned()));
-    assert!(!events.contains(&"atomic-adopt-mountpoint+publish".to_owned()));
+    assert!(!events.contains(&"atomic-publish-image".to_owned()));
 }
 
 #[tokio::test]

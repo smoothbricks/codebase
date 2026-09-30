@@ -11,7 +11,7 @@ use cowshed_core::apfs::{ApfsCaseSensitivity, CommandOutput, CommandRequest, Com
 use cowshed_core::metadata::WorkspaceName;
 use cowshed_core::repository::RepoId;
 use cowshed_core::storage::apfs::native::MacOsApfsExecutionHost;
-use cowshed_core::storage::apfs::{ApfsExecutionHost, ApfsSubstrateConfig, CheckoutLayout};
+use cowshed_core::storage::apfs::{ApfsExecutionHost, ApfsSubstrateConfig};
 use cowshed_core::storage::deletion_log::{
     CompanionAbsence, DELETION_LOG_FILE, classify_missing_companion,
 };
@@ -53,7 +53,6 @@ impl Fixture {
             &self.root,
             self.root.join("caches"),
             self.root.join("mount"),
-            CheckoutLayout::Symlink,
             ApfsCaseSensitivity::Insensitive,
         )
     }

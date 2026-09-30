@@ -100,17 +100,17 @@ mounts at `<mount-root>/<owner>/<repo>/<workspace>`, where the mount root is hos
 (empty when detached) and is plain per-user directories on Data; nothing is written inside any checkout, so no Git
 exclusion is required for them. Changing the root requires every workspace detached and is refused otherwise.
 
-**Direct mount** (default). `main` mounts at the checkout's original path. Publication renames the original tree to
+**Direct mount.** `main` mounts at the checkout's original path. Publication renames the original tree to
 `<root>.pre-cowshed`, recreates the emptied directory as the mountpoint with the stub `.envrc` inside it, and attaches
 there. The user's path is the real thing: `pwd -P` reports it, the gitdir physically lives under it, and Finder shows
 the volume label — which is why the label is the repository's name (01_storage.md) rather than an encoded identity. The
 cost is one mounted volume inside the user's source tree and a mountpoint that cannot be moved by `mv`.
 
-**A symlink checkout layout was rejected.** Mounting main inside the store and leaving a symlink at the original path
-keeps the tree movable, but Git resolves `gitdir:` conditions against the real path — the moment adopt completes, every
-path-conditional rule anchored at the original checkout stops applying, and the loss stays undetectable because the
-checkout's own resolved gitdir already lives inside the store. Identity must sit where the user's rules look for it;
-direct mount is the only faithful option.
+**Why not a symlink.** Mounting main inside the store and leaving a symlink at the original path would keep the tree
+movable, but Git resolves `gitdir:` conditions against the real path — the moment adopt completed, every
+path-conditional rule anchored at the original checkout would stop applying, and the loss would stay undetectable
+because the checkout's own resolved gitdir would already live inside the store. Identity must sit where the user's rules
+look for it; direct mount is the only faithful option.
 
 Git identity inheritance follows each `includeIf gitdir:` rule's anchor. Rules anchored at an ancestor shared by both
 the checkout and the mount root (for example `gitdir:~/Dev/` when checkouts live in `~/Dev` and the root is
@@ -172,9 +172,9 @@ names a workspace whose destination is a new workspace name. The source disambig
 validated, so a path is never rejected for failing the workspace-name charset and a workspace name is never resolved
 against the filesystem.
 
-The checkout path is written down in three places, and no two of them can be derived from the third: the in-image marker
-at main's mount root, the `infoSnapshot.projectRoot` in the sidecar beside main's canonical image, and the layout record
-that says whether the checkout _is_ the mountpoint. Every move carries all three.
+The checkout path is written down in two places, and neither can be derived from the other: the in-image marker at
+main's mount root and the `infoSnapshot.projectRoot` in the sidecar beside main's canonical image. Every move carries
+both.
 
 Moving an adopted checkout is always cowshed-mediated (`mv <ws> <new-path>`): the image is detached, published at the
 new path, and reattached — no unmount-and-remount gap at the user's path, no relink to maintain.
@@ -458,8 +458,7 @@ observation that a registered worktree's path is not mounted.
 
 The mode is recorded store-side, in the workspace's detached sidecar, for the same reason: every decision it drives —
 refusing checkpoint, requiring main mounted, pruning the registration at retirement — has to be made while the workspace
-is detached and its mount can say nothing. A sidecar written before the mode existed has no such field and describes a
-standalone workspace, which is the correct answer rather than a gap.
+is detached and its mount can say nothing. A standalone workspace's sidecar omits the field.
 
 `cowshed mv` repairs registrations. Moving main under direct mount moves the gitdir every git-worktree workspace points
 at, and moving a workspace moves the path main's registration records; both directions are repaired inside the same

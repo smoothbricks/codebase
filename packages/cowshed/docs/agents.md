@@ -199,8 +199,8 @@ This is cowshed's layered capability model: the trusted coordinator holds policy
 - No direct internet. The gateway's mirrors make registry traffic invisible to you; arbitrary hosts need an egress
   grant. Credentials are injected upstream by the gateway — there are no tokens inside the workspace to find, and no
   `.env` files.
-- No remote git. Your repo has exactly the local `host` remote (main) and whatever mirrors `cowshed repo clone` brought
-  in; pushing to origin/GitHub is the coordinator's job, host-side.
+- No remote git. Your repo has exactly the local `main` remote and whatever mirrors `cowshed repo clone` brought in;
+  pushing to origin/GitHub is the coordinator's job, host-side.
 - No reaching the human's simulator. iOS test loops run on **dev-side headless simulators** (`--preset simulator`;
   `simctl`, XCUITest, `simctl io` screenshots). The personal-session simulator is reachable only through `--sim` grants
   the coordinator gives you — `install` is human-gated per artifact by design ([ios.md](ios.md)); ship builds with

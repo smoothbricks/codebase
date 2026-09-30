@@ -239,16 +239,16 @@ mounts are restored. In order:
 
 1. Validate the host store — both dedicated volumes present, mounted, marked, and with canonical flags (01_storage.md).
    A store that fails validation stops here and reports; nothing below can be meaningful without it.
-2. Eagerly heal every recorded project's mounts, in inventory order: main and every workspace, attached and mounted at
-   the path its checkout layout prescribes (02_workspaces.md).
+2. Eagerly heal every recorded project's mounts, in inventory order: main attached and mounted at its checkout path,
+   every other workspace under the mount root (02_workspaces.md).
 3. Then serve.
 
 Eager, not heal-on-contact. Adoption's guarantee is that the checkout path is never absent and never dangling, and a
 reboot is the one window that guarantee has to survive as much as the publication transaction does. Without a startup
-pass the window is real and user-visible: under the symlink layout the checkout symlink dangles until something touches
-it, and under direct mount the checkout is an empty directory showing the self-healing stub — in the user's editor, in
-their shell, and in Finder — until first contact heals it. "First contact" is not a moment cowshed controls, and a user
-reaching a broken path and then watching it repair is not the same product as the path simply working.
+pass the window is real and user-visible: the checkout is an empty directory showing the self-healing stub — in the
+user's editor, in their shell, and in Finder — until first contact heals it. "First contact" is not a moment cowshed
+controls, and a user reaching a broken path and then watching it repair is not the same product as the path simply
+working.
 
 Heal-on-contact remains, as the fallback for everything that appears after startup: an image published while the gateway
 is already running, a gateway restart mid-session, a workspace detached and reattached by hand. The startup pass closes

@@ -509,10 +509,6 @@ pub const REPO_IDENTITY_INTENT_FILE: &str = ".cowshed-repo-id-intent.json";
 pub struct RepositoryIdentityIntent {
     pub old_repo_id: RepoId,
     pub new_repo_id: RepoId,
-    /// The project's checkout, needed only to repoint its symlink under `CheckoutLayout::Symlink`.
-    /// Recovery never gates on it: an unfinished identity change is store-wide damage, so it is
-    /// completed by whichever open notices it first, not only by the renamed project's own.
-    pub checkout_path: PathBuf,
     pub old_project_root: PathBuf,
     pub new_project_root: PathBuf,
     pub old_mount_root: PathBuf,
@@ -538,7 +534,6 @@ impl RepositoryIdentityIntent {
     /// cowshed does not own.
     pub fn validate(&self, store_root: &Path) -> CowshedResult<()> {
         let paths = [
-            ("checkout", &self.checkout_path, false),
             ("old project", &self.old_project_root, true),
             ("new project", &self.new_project_root, true),
             ("old mount", &self.old_mount_root, false),

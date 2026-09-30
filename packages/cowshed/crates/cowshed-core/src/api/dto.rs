@@ -504,13 +504,9 @@ impl WorkspaceInfo {
         mount: PathBuf,
         metadata: &DetachedWorkspaceMetadata,
     ) -> Result<Self, DtoError> {
-        let snapshot = metadata.info_snapshot.as_ref();
-        let base_commit = snapshot
-            .map(|info| GitOid::new(info.base_commit.clone()))
-            .transpose()?;
-        let created_at = snapshot
-            .map(|info| UtcTimestamp::new(info.created_at.clone()))
-            .transpose()?;
+        let snapshot = &metadata.info_snapshot;
+        let base_commit = Some(GitOid::new(snapshot.base_commit.clone())?);
+        let created_at = Some(UtcTimestamp::new(snapshot.created_at.clone())?);
         Ok(Self {
             repo_id: derived.workspace.repo().clone(),
             workspace: derived.workspace.name().clone(),
@@ -522,7 +518,7 @@ impl WorkspaceInfo {
                 MountState::Detached => WorkspaceState::Detached,
                 MountState::Mounted { .. } => WorkspaceState::Attached,
             },
-            branch: snapshot.and_then(|info| info.branch.clone()),
+            branch: snapshot.branch.clone(),
             base_commit,
             created_at,
             checkpoints: derived
@@ -534,7 +530,7 @@ impl WorkspaceInfo {
                     pinned: checkpoint.pin == LifecyclePin::Pinned,
                 })
                 .collect(),
-            snapshot_stale: snapshot.is_some_and(|info| info.stale),
+            snapshot_stale: snapshot.stale,
             landing: None,
         })
     }

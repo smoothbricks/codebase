@@ -341,9 +341,9 @@ whose local accounts trust each other; stronger isolation is a different product
 
 If either dedicated volume is absent, unencrypted, missing its System.keychain item, or the mountpoint holds anything
 other than a reclaimable stub, existing-only commands fail before mutation with `environment-missing` and an explanation
-of exactly which volumes are missing, detached, unencrypted, or mis-mounted. A volume mounted at a retired home path or
-at `/Volumes/<name>` is **mis-mounted**, not missing. `cowshed doctor` reports the observed and canonical paths and
-prescribes `cowshed setup`; setup announces the complete repair — including in-place encryption of an existing
+of exactly which volumes are missing, detached, unencrypted, or mis-mounted. A volume mounted anywhere but its canonical
+root — `/Volumes/<name>`, say — is **mis-mounted**, not missing. `cowshed doctor` reports the observed and canonical
+paths and prescribes `cowshed setup`; setup announces the complete repair — including in-place encryption of an existing
 unencrypted volume — opens one authorization session, and converges mounts, FileVault, keychain, fstab, and the boot
 daemon.
 
@@ -359,10 +359,10 @@ installed binaries, and both System.keychain items; it never deletes a volume.
 
 **Mount ordering and the unmounted-masking guard.** Store and caches are sibling mountpoints on Data; neither canonical
 root depends on the other, and each root's `.cowshed-volume.json` marker distinguishes a mounted cowshed volume from its
-bare mountpoint directory. The retired home layout nested `caches` beneath `store`, so its one-time migration unmounts
-the child caches volume before the parent store volume, then mounts both siblings at `/private/cowshed/{store,caches}`.
-launchd agents write pre-tracer stderr under `~/Library/Logs/cowshed/`, never under either mountpoint, so a reboot
-cannot recreate a masking stub. A leftover `telemetry/` stub from an older plist is deleted before remount.
+bare mountpoint directory. launchd agents write pre-tracer stderr under `~/Library/Logs/cowshed/`, never under either
+mountpoint, so a reboot cannot recreate a masking stub. What does land on a bare mountpoint before its volume is mounted
+— the sccache agent's socket and compile cache, the gateway heal's directory-only `mnt/` scaffolding, Finder's
+`.DS_Store`, empty directories — is reclaimed before remount; any other entry keeps the mountpoint masked.
 
 Why volumes and not paths on Data: Data takes hourly APFS local snapshots, and a snapshot pins every since-rewritten
 block of a multi-GB churning image — ghosts that path-level `tmutil addexclusion` does **not** prevent (exclusion stops

@@ -763,7 +763,7 @@ denial.
 
 ## Git
 
-Workspace git is **local-paths-only**: every workspace has the `host` remote (main's repository, a mounted path) and can
+Workspace git is **local-paths-only**: every workspace has the `main` remote (main's repository, a mounted path) and can
 clone from read-only mirrors under `/private/cowshed/caches/repo-mirrors` — nothing else. No remote URLs, no
 credentials, no credential helpers exist inside a workspace; pushing to real remotes (origin, GitHub) is coordinator
 work, done host-side with your normal git setup.

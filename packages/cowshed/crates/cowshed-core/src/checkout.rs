@@ -1,27 +1,24 @@
 //! The project checkout path: where it is recorded, and how it moves.
 //!
-//! A project's checkout path is written down in three independent places, none of which is
-//! derivable from the others:
+//! Main mounts at the project's checkout path itself, and that path is written down in two
+//! independent places, neither derivable from the other:
 //!
 //! - the **in-image marker** (`.cowshed/workspace.json` at main's mount root), which is what a
 //!   cold controller reads to answer "which repository is this directory";
 //! - the **detached sidecar** beside main's canonical image, whose `infoSnapshot.projectRoot` is
-//!   what the gateway inventory scans to answer the same question without mounting anything;
-//! - the **layout record** (`checkout-layout.json`), which says whether the checkout path *is*
-//!   main's mountpoint or merely a symlink to it.
+//!   what the gateway inventory scans to answer the same question without mounting anything.
 //!
-//! Every operation that changes where the checkout lives has to move all three together, so they
-//! are moved by the functions here rather than open-coded at each call site.
+//! Every operation that changes where the checkout lives has to move both together, so they are
+//! moved by the functions here rather than open-coded at each call site.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::metadata::{
-    CheckoutLayout, CheckoutLayoutRecord, DetachedWorkspaceMetadata, ImageFormat, MetadataError,
-    WorkspaceMarker, WorkspaceName, read_json, sidecar_path, write_json,
+    DetachedWorkspaceMetadata, MetadataError, WorkspaceMarker, sidecar_path, write_json,
 };
 use crate::repository::RepoId;
-use crate::storage::{StorageLayout, StorageLayoutError, WORKSPACE_MARKER_PATH};
+use crate::storage::WORKSPACE_MARKER_PATH;
 
 /// Where one project's recorded checkout path is durably held.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -53,19 +50,15 @@ impl CheckoutRecord {
         let mut marker = WorkspaceMarker::read_from(&marker_path)?;
         let sidecar = sidecar_path(&self.image);
         let mut metadata = DetachedWorkspaceMetadata::read_for_image(&self.image)?;
-        let snapshot_root = metadata
-            .info_snapshot
-            .as_ref()
-            .map(|info| info.project_root.clone());
-        if marker.project_root == project_root && snapshot_root.as_deref() == Some(project_root) {
+        if marker.project_root == project_root
+            && metadata.info_snapshot.project_root == project_root
+        {
             return Ok(false);
         }
         marker.project_root = project_root.to_owned();
         marker.validate()?;
         write_json(&marker_path, &marker)?;
-        if let Some(info) = metadata.info_snapshot.as_mut() {
-            info.project_root = project_root.to_owned();
-        }
+        metadata.info_snapshot.project_root = project_root.to_owned();
         metadata.validate(&self.image)?;
         write_json(&sidecar, &metadata)?;
         Ok(true)
@@ -123,10 +116,7 @@ impl CheckoutRecord {
         }
         let sidecar = sidecar_path(&self.image);
         let mut metadata = DetachedWorkspaceMetadata::read_for_image(&self.image)?;
-        let snapshot = metadata
-            .info_snapshot
-            .as_mut()
-            .ok_or(MetadataError::MissingInfoSnapshot)?;
+        let snapshot = &mut metadata.info_snapshot;
         if snapshot.project_root == project_root {
             return Ok(false);
         }
@@ -143,22 +133,11 @@ impl CheckoutRecord {
     }
 }
 
-/// Point `destination` at `target` before `source` stops pointing at it.
-///
-/// Under the symlink layout the checkout is a symlink and the mount never moves, so the move is
-/// nothing but this relink — and creating the new link before removing the old one makes it
-/// gapless for free: there is no instant at which neither path resolves to the tree. A crash
-/// between the two steps leaves both, which is a harmless extra alias rather than a lost checkout.
-pub fn relink_checkout(source: &Path, destination: &Path, target: &Path) -> std::io::Result<()> {
-    std::os::unix::fs::symlink(target, destination)?;
-    fs::remove_file(source)
-}
-
 /// Does `path` name the same directory as `mount_point`?
 ///
-/// Both sides are resolved, so a symlinked checkout matches the mount it points at. A path that
-/// cannot be resolved does not match: an unresolvable checkout is a repair case, never a silent
-/// equality.
+/// Both sides are resolved, so a checkout spelt differently — another case, a firmlinked parent —
+/// matches the mount it is. A path that cannot be resolved does not match: an unresolvable
+/// checkout is a repair case, never a silent equality.
 pub fn resolves_to(path: &Path, mount_point: &Path) -> bool {
     match (fs::canonicalize(path), fs::canonicalize(mount_point)) {
         (Ok(left), Ok(right)) => left == right,
@@ -168,65 +147,22 @@ pub fn resolves_to(path: &Path, mount_point: &Path) -> bool {
 
 /// The checkout path as the caller names it, found by walking up from `observed`.
 ///
-/// The deepest ancestor that resolves to main's mount is the answer: under the symlink layout that
-/// is the user's symlink, under direct mount it is the mountpoint itself. Walking from the bottom
-/// matters — a nested symlink chain can have several matching ancestors, and only the innermost
-/// one is the checkout root rather than something above it that happens to resolve there too.
+/// The deepest ancestor that resolves to main's mount and is not a symlink is the answer: main
+/// mounts at the checkout itself, so a symlink the user made to it elsewhere is an alias of the
+/// checkout, never the checkout, and recording one would move main's mountpoint onto a symlink.
+/// Walking from the bottom matters — only the innermost match is the checkout root rather than
+/// something above it that happens to resolve there too.
 pub fn observed_checkout(observed: &Path, mount_point: &Path) -> Option<PathBuf> {
     let mut candidate = Some(observed);
     while let Some(path) = candidate {
         if resolves_to(path, mount_point) {
-            return Some(path.to_owned());
+            return fs::symlink_metadata(path)
+                .is_ok_and(|metadata| !metadata.file_type().is_symlink())
+                .then(|| path.to_owned());
         }
         candidate = path.parent();
     }
     None
-}
-
-/// The layout an observed checkout path actually exhibits.
-///
-/// A symlink at the checkout path is the symlink layout by construction; anything else that
-/// resolves to the mount is the mount itself, which is direct mount. This is an observation, not a
-/// preference — it is what makes a hand-rearranged checkout converge onto a truthful record.
-pub fn observed_layout(checkout: &Path) -> CheckoutLayout {
-    match fs::symlink_metadata(checkout) {
-        Ok(metadata) if metadata.file_type().is_symlink() => CheckoutLayout::Symlink,
-        _ => CheckoutLayout::DirectMount,
-    }
-}
-/// Read an adopted project's layout, materializing only an inference backed by durable evidence.
-///
-/// A present record is authoritative and malformed data fails closed. Without a record, the main
-/// mountpoint proves the symlink layout; an existing main image without that mountpoint is
-/// ambiguous and refused; a project with neither is the pre-adoption direct-mount default.
-pub fn load_checkout_layout(layout: &StorageLayout) -> Result<CheckoutLayout, StorageLayoutError> {
-    let path = &layout.project().checkout_layout;
-    match read_json::<CheckoutLayoutRecord>(path) {
-        Ok(record) => return Ok(record.checkout_layout),
-        Err(MetadataError::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error.into()),
-    }
-
-    let main = WorkspaceName::new("main").expect("fixed main workspace");
-    let inferred = if layout.workspace_mount(&main)?.is_dir() {
-        CheckoutLayout::Symlink
-    } else {
-        for format in [ImageFormat::Asif, ImageFormat::Sparse] {
-            let image = layout.main_image(format)?.image().to_owned();
-            if image
-                .try_exists()
-                .map_err(|source| StorageLayoutError::Io {
-                    path: image.clone(),
-                    source,
-                })?
-            {
-                return Err(StorageLayoutError::UnrecordedCheckoutLayout);
-            }
-        }
-        CheckoutLayout::DirectMount
-    };
-    write_json(path, &CheckoutLayoutRecord::new(inferred))?;
-    Ok(inferred)
 }
 
 #[cfg(test)]
@@ -237,7 +173,6 @@ mod tests {
         WorkspaceIncarnation, WorkspaceInfoSnapshot, WorkspaceName, WorkspaceRole,
     };
     use crate::repository::RepoId;
-    use crate::storage::StorageLayout;
 
     struct TempDirectory(PathBuf);
 
@@ -264,17 +199,6 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
-    }
-
-    fn storage_layout(temp: &TempDirectory) -> StorageLayout {
-        let layout = StorageLayout::with_mount_root(
-            temp.path().join("store"),
-            temp.path().join("mnt"),
-            &RepoId::parse("acme/widget").expect("repo"),
-        )
-        .expect("layout");
-        fs::create_dir_all(&layout.project().project_root).expect("project root");
-        layout
     }
 
     fn incarnation() -> WorkspaceIncarnation {
@@ -322,7 +246,7 @@ mod tests {
                     crate::metadata::PortBlock::new(49_136, 16).expect("port block"),
                 ))
                 .expect("grants"),
-                info_snapshot: Some(WorkspaceInfoSnapshot {
+                info_snapshot: WorkspaceInfoSnapshot {
                     project_root: project_root.to_owned(),
                     role: WorkspaceRole::Main,
                     base_commit: "0123456789abcdef".to_owned(),
@@ -332,7 +256,7 @@ mod tests {
                     captured_at: "2026-07-13T00:00:00Z".to_owned(),
                     stale: false,
                     git_worktree: false,
-                }),
+                },
             },
         )
         .expect("write sidecar");
@@ -356,8 +280,7 @@ mod tests {
         assert_eq!(
             DetachedWorkspaceMetadata::read_for_image(&record.image)
                 .expect("sidecar")
-                .require_info_snapshot()
-                .expect("snapshot")
+                .info_snapshot
                 .project_root,
             Path::new("/new/checkout")
         );
@@ -385,8 +308,7 @@ mod tests {
         assert_eq!(
             DetachedWorkspaceMetadata::read_for_image(&record.image)
                 .expect("sidecar")
-                .require_info_snapshot()
-                .expect("snapshot")
+                .info_snapshot
                 .project_root,
             Path::new("/new/checkout")
         );
@@ -410,159 +332,23 @@ mod tests {
         );
     }
 
+    /// Main mounts at the checkout itself, so the checkout a caller stands in is the mount reached
+    /// through its own path — spelt however the caller spelt it — and never a symlink the user
+    /// made to it elsewhere: a symlink cannot be the mountpoint, and recording one would move
+    /// main's mountpoint onto it.
     #[test]
-    fn relinking_creates_the_destination_before_it_removes_the_source() {
-        let temp = TempDirectory::new("relink");
-        let target = temp.path().join("mount");
-        fs::create_dir(&target).expect("target");
-        let source = temp.path().join("old");
-        let destination = temp.path().join("new");
-        std::os::unix::fs::symlink(&target, &source).expect("source link");
-
-        relink_checkout(&source, &destination, &target).expect("relink");
-
-        assert!(!source.exists(), "the old alias is gone");
-        assert_eq!(
-            fs::read_link(&destination).expect("read link"),
-            target,
-            "the new alias points at the mount"
-        );
-    }
-
-    #[test]
-    fn relinking_onto_an_occupied_destination_leaves_the_source_alone() {
-        let temp = TempDirectory::new("relink-occupied");
-        let target = temp.path().join("mount");
-        fs::create_dir(&target).expect("target");
-        let source = temp.path().join("old");
-        let destination = temp.path().join("new");
-        std::os::unix::fs::symlink(&target, &source).expect("source link");
-        fs::create_dir(&destination).expect("occupant");
-
-        assert!(relink_checkout(&source, &destination, &target).is_err());
-        assert!(
-            fs::symlink_metadata(&source)
-                .expect("source survives")
-                .file_type()
-                .is_symlink()
-        );
-    }
-
-    #[test]
-    fn the_observed_checkout_is_the_deepest_ancestor_that_resolves_to_the_mount() {
+    fn the_observed_checkout_is_the_mount_itself_never_a_symlink_to_it() {
         let temp = TempDirectory::new("observed");
-        let mount = temp.path().join("mnt/acme/widget/main");
+        let mount = temp.path().join("checkout");
         fs::create_dir_all(mount.join("crates/core")).expect("tree");
-        let checkout = temp.path().join("checkout");
-        std::os::unix::fs::symlink(&mount, &checkout).expect("checkout link");
+        let alias = temp.path().join("alias");
+        std::os::unix::fs::symlink(&mount, &alias).expect("user symlink");
 
         assert_eq!(
-            observed_checkout(&checkout.join("crates/core"), &mount),
-            Some(checkout.clone())
+            observed_checkout(&mount.join("crates/core"), &mount),
+            Some(mount.clone())
         );
-        assert_eq!(observed_checkout(&mount, &mount), Some(mount.clone()));
+        assert_eq!(observed_checkout(&alias.join("crates/core"), &mount), None);
         assert_eq!(observed_checkout(temp.path(), &mount), None);
-        assert_eq!(observed_layout(&checkout), CheckoutLayout::Symlink);
-        assert_eq!(observed_layout(&mount), CheckoutLayout::DirectMount);
-    }
-    #[test]
-    fn an_absent_layout_materializes_version_one_direct_mount() {
-        let temp = TempDirectory::new("legacy-layout");
-        let layout = storage_layout(&temp);
-        let path = layout.project().checkout_layout.clone();
-
-        assert_eq!(
-            load_checkout_layout(&layout).expect("legacy layout"),
-            CheckoutLayout::DirectMount
-        );
-        let record = crate::metadata::read_json::<crate::metadata::CheckoutLayoutRecord>(&path)
-            .expect("materialized record");
-        record.validate().expect("version one record");
-        assert_eq!(record.checkout_layout, CheckoutLayout::DirectMount);
-    }
-
-    #[test]
-    fn an_absent_layout_infers_and_records_the_existing_symlink_mount() {
-        let temp = TempDirectory::new("legacy-symlink-layout");
-        let layout = storage_layout(&temp);
-        let main_mount = layout
-            .workspace_mount(&WorkspaceName::new("main").expect("main"))
-            .expect("main mount");
-        fs::create_dir_all(&main_mount).expect("symlink-layout main mount");
-
-        assert_eq!(
-            load_checkout_layout(&layout).expect("inferred layout"),
-            CheckoutLayout::Symlink
-        );
-        let record = crate::metadata::read_json::<crate::metadata::CheckoutLayoutRecord>(
-            &layout.project().checkout_layout,
-        )
-        .expect("materialized record");
-        assert_eq!(record.checkout_layout, CheckoutLayout::Symlink);
-    }
-
-    #[test]
-    fn a_malformed_present_layout_fails_closed() {
-        let temp = TempDirectory::new("malformed-layout");
-        let layout = storage_layout(&temp);
-        let path = layout.project().checkout_layout.clone();
-        fs::write(&path, b"{not json").expect("malformed record");
-
-        assert!(matches!(
-            load_checkout_layout(&layout),
-            Err(StorageLayoutError::Metadata(MetadataError::Json { .. }))
-        ));
-        assert_eq!(
-            fs::read(&path).expect("malformed record remains"),
-            b"{not json"
-        );
-    }
-
-    /// An adopted project — it holds a main image — with no record and no main mountpoint is
-    /// refused, because the two candidate answers put main in different directories.
-    ///
-    /// Legacy direct mount says main is at the checkout; a detached symlink-layout project whose
-    /// mountpoint `gc` removed says main is under `mnt/`. Nothing on disk distinguishes them once
-    /// the record is gone, and materializing a guess here is worse than refusing: the next reader
-    /// trusts the record as authoritative.
-    #[test]
-    fn an_adopted_project_with_no_record_and_no_mountpoint_is_refused() {
-        for format in [ImageFormat::Asif, ImageFormat::Sparse] {
-            let temp = TempDirectory::new("ambiguous-layout");
-            let layout = storage_layout(&temp);
-            let image = layout.main_image(format).expect("main image paths");
-            fs::create_dir_all(image.image().parent().expect("image parent")).expect("parent");
-            fs::write(image.image(), b"adopted main").expect("main image");
-
-            assert!(matches!(
-                load_checkout_layout(&layout),
-                Err(StorageLayoutError::UnrecordedCheckoutLayout)
-            ));
-            assert!(
-                !layout.project().checkout_layout.exists(),
-                "a refusal must not leave a guess behind for the next reader to trust"
-            );
-        }
-    }
-
-    #[test]
-    fn materializing_a_legacy_layout_is_idempotent() {
-        use std::os::unix::fs::MetadataExt as _;
-
-        let temp = TempDirectory::new("idempotent-layout");
-        let layout = storage_layout(&temp);
-        let path = layout.project().checkout_layout.clone();
-        load_checkout_layout(&layout).expect("first observation");
-        let inode = fs::metadata(&path).expect("first record").ino();
-
-        assert_eq!(
-            load_checkout_layout(&layout).expect("second observation"),
-            CheckoutLayout::DirectMount
-        );
-        assert_eq!(
-            fs::metadata(&path).expect("same record").ino(),
-            inode,
-            "a successful read must not replace the explicit record"
-        );
     }
 }

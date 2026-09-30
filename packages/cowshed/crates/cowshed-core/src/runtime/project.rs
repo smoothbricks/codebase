@@ -2050,8 +2050,8 @@ fn clean_terminal_project_storage(project_root: &Path, binding: &Path) -> Result
 }
 
 /// Everything the controller keeps for a project it is unbinding. Nothing reopens an unbound
-/// project, so its lifecycle journal, deletion log, checkout layout and slot bindings go, and with
-/// them its mount tree and each owner directory they leave empty; the store directory goes once
+/// project, so its lifecycle journal, deletion log and slot bindings go, and with them its mount
+/// tree and each owner directory they leave empty; the store directory goes once
 /// the binding and the checkout root record after it do. What the user put in the store —
 /// `policy.json`, `waivers.json`, `quarantine/` — stays, and keeps the store directory with it.
 #[cfg(target_os = "macos")]
@@ -2063,7 +2063,6 @@ fn remove_unbound_project_state(paths: &crate::repository::ProjectPaths) -> Resu
         paths
             .project_root
             .join(crate::storage::deletion_log::DELETION_LOG_FILE),
-        paths.checkout_layout.clone(),
         paths.slot_bindings.clone(),
     ] {
         remove_unbound_file(&file)?;
@@ -2390,14 +2389,10 @@ impl NativeProjectRuntimeHost {
                 )
             })?;
         }
-        // Every resolver that answers "where does main mount" reads this one value, so it is
-        // resolved once here, from durable project state, and never inferred per call site.
-        let checkout_layout = layout.checkout_layout().map_err(native_integrity_error)?;
         let config = crate::storage::apfs::ApfsSubstrateConfig::new(
             bootstrap.roots().store(),
             bootstrap.roots().caches(),
             &git_root,
-            checkout_layout,
             crate::apfs::ApfsCaseSensitivity::Sensitive,
         );
         let host = crate::storage::apfs::native::MacOsApfsExecutionHost::new(
@@ -3057,7 +3052,6 @@ impl NativeProjectRuntimeHost {
             .map_err(native_storage_error)?;
         let layout = self.layout.clone();
         let project_root = self.descriptor.git_root.clone();
-        let checkout_layout = self.substrate_config.checkout_layout;
         crate::storage::lifecycle::dispatch_blocking(move || {
             derived
                 .into_iter()
@@ -3083,7 +3077,6 @@ impl NativeProjectRuntimeHost {
                         &derived,
                         &metadata,
                         &project_root,
-                        checkout_layout,
                         root_validation,
                     )?;
                     Ok(NativeWorkspace {
@@ -3180,11 +3173,7 @@ impl NativeProjectRuntimeHost {
 
     fn workspace_mount_path(&self, workspace: &WorkspaceName) -> Result<PathBuf> {
         self.layout
-            .main_aware_workspace_mount(
-                self.substrate_config.checkout_layout,
-                &self.substrate_config.checkout_path,
-                workspace,
-            )
+            .main_aware_workspace_mount(&self.substrate_config.checkout_path, workspace)
             .map_err(native_integrity_error)
     }
 
@@ -3263,14 +3252,8 @@ impl NativeProjectRuntimeHost {
     /// The Git repository handle and the descriptor's project root move with it. They are the same
     /// fact spelled three ways, and leaving any one behind would send the next operation to the old
     /// path.
-    fn rebind_checkout(
-        &mut self,
-        checkout_path: &Path,
-        checkout_layout: crate::metadata::CheckoutLayout,
-    ) -> Result<()> {
-        let config = self
-            .substrate_config
-            .rebind_checkout(checkout_path, checkout_layout);
+    fn rebind_checkout(&mut self, checkout_path: &Path) -> Result<()> {
+        let config = self.substrate_config.rebind_checkout(checkout_path);
         self.rebind_substrate(config)?;
         self.descriptor.git_root = checkout_path.to_owned();
         self.git = crate::git::GitRepository::from_root(checkout_path);
@@ -3433,26 +3416,21 @@ impl NativeProjectRuntimeHost {
     /// Converge the recorded checkout path onto where the checkout is actually observed.
     ///
     /// `mv` is the sanctioned front door for moving a checkout; this is the safety net under it. A
-    /// user who moves a symlinked checkout by hand — or who reaches the project through a second
-    /// alias — has broken nothing, because both spellings still resolve to main's volume. The
-    /// record simply falls behind, and every later answer that quotes it (`doctor`, the gateway
-    /// inventory's project-root lookup, a cold open from the checkout directory) quotes a path the
-    /// user no longer uses.
+    /// user who reaches the project through another spelling of its path — another case on a
+    /// case-insensitive volume, a firmlinked parent — has broken nothing, because the spelling
+    /// still resolves to main's volume. The record simply differs from the path the user uses, and
+    /// every later answer that quotes it (`doctor`, the gateway inventory's project-root lookup, a
+    /// cold open from the checkout directory) quotes a path the user does not.
     ///
     /// Convergence fires only when all of these hold, which together mean "the same checkout, spelt
     /// differently" and nothing else:
     ///
     /// - `observed` sits inside main's mount, so the caller really is in this project;
-    /// - the checkout root above it resolves to main's mount, so it is a checkout and not some
-    ///   deeper directory;
-    /// - that root lies outside cowshed's own storage, so the mount path can never be mistaken for
-    ///   the user's checkout under the symlink layout;
+    /// - the checkout root above it resolves to main's mount and is not a symlink, so it is the
+    ///   mountpoint itself and not some deeper directory or an alias of it
+    ///   ([`crate::checkout::observed_checkout`]);
+    /// - that root lies outside cowshed's own storage;
     /// - it differs from the record, so an agreeing record is never rewritten.
-    ///
-    /// The observed layout is recorded alongside the path: a checkout that is a symlink is the
-    /// symlink layout by construction, and one that is the mountpoint is direct mount. Recording
-    /// the observation rather than the previous belief is what keeps `mount_point()` — which reads
-    /// the layout to decide whether main mounts at the checkout — answering truthfully afterwards.
     async fn converge_checkout_record(&mut self, observed: &Path) -> Result<()> {
         let main = main_name();
         let current = self.current(&main).await?;
@@ -3467,13 +3445,9 @@ impl NativeProjectRuntimeHost {
         let store_root = self.descriptor.store_root.clone();
         let observed = observed.to_owned();
         let probe_mount = mount_point.clone();
-        let Some((checkout, layout)) = crate::storage::lifecycle::dispatch_blocking(move || {
-            let checkout = crate::checkout::observed_checkout(&observed, &probe_mount)?;
-            if checkout.starts_with(&store_root) {
-                return None;
-            }
-            let layout = crate::checkout::observed_layout(&checkout);
-            Some((checkout, layout))
+        let Some(checkout) = crate::storage::lifecycle::dispatch_blocking(move || {
+            crate::checkout::observed_checkout(&observed, &probe_mount)
+                .filter(|checkout| !checkout.starts_with(&store_root))
         })
         .await
         .map_err(|error| {
@@ -3490,17 +3464,10 @@ impl NativeProjectRuntimeHost {
         .await
         .map_err(|error| CowshedError::internal(format!("checkout record task failed: {error}")))?
         .map_err(native_integrity_error)?;
-        if !changed && layout == self.substrate_config.checkout_layout {
+        if !changed {
             return Ok(());
         }
-        let layout_record = self.layout.clone();
-        crate::storage::lifecycle::dispatch_blocking(move || {
-            layout_record.record_checkout_layout(layout)
-        })
-        .await
-        .map_err(|error| CowshedError::internal(format!("layout record task failed: {error}")))?
-        .map_err(native_integrity_error)?;
-        self.rebind_checkout(&checkout, layout)?;
+        self.rebind_checkout(&checkout)?;
         // A hand-moved checkout invalidates every workspace's record of the project, not just
         // main's, so the convergence that repairs main's has to repair theirs in the same breath.
         // Reached only when the record actually changed: the guard above returns early otherwise,
@@ -3509,12 +3476,7 @@ impl NativeProjectRuntimeHost {
     }
 
     /// Refuse a checkout destination that cannot be moved onto, before anything is mutated.
-    async fn validate_move_destination(
-        &self,
-        source: &Path,
-        destination: &Path,
-        retired_main_targets: &[PathBuf],
-    ) -> Result<MoveDestination> {
+    async fn validate_move_destination(&self, source: &Path, destination: &Path) -> Result<()> {
         if !destination.is_absolute()
             || destination
                 .components()
@@ -3550,9 +3512,8 @@ impl NativeProjectRuntimeHost {
             ));
         }
         let destination = destination.to_owned();
-        let retired_main_targets = retired_main_targets.to_vec();
         crate::storage::lifecycle::dispatch_blocking(move || {
-            let state = classify_move_destination(&destination, &retired_main_targets)?;
+            require_vacant_move_destination(&destination)?;
             let parent = destination.parent().ok_or_else(|| {
                 CowshedError::usage(
                     format!("{} has no parent directory", destination.display()),
@@ -3565,7 +3526,7 @@ impl NativeProjectRuntimeHost {
                     "create the parent directory first",
                 ));
             }
-            Ok(state)
+            Ok(())
         })
         .await
         .map_err(|error| {
@@ -4995,7 +4956,7 @@ impl NativeProjectRuntimeHost {
                 );
                 continue;
             }
-            let origin = abandoned_clone_origin(&metadata)?;
+            let origin = abandoned_clone_origin(&metadata);
             let options = RemoveOptions {
                 force: true,
                 ..RemoveOptions::default()
@@ -5060,9 +5021,7 @@ impl NativeProjectRuntimeHost {
                 ));
             }
         };
-        let info = metadata
-            .require_info_snapshot()
-            .map_err(native_integrity_error)?;
+        let info = &metadata.info_snapshot;
         let source = self.current(&source_name).await?;
         let identity = self
             .operation_identity(
@@ -5298,19 +5257,23 @@ impl crate::storage::lifecycle::ImmutablePlan for PendingClonePlan {
     }
 }
 
+/// Refuse a checkout destination anything already occupies: a move never replaces what is there.
 #[cfg(target_os = "macos")]
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum MoveDestination {
-    Vacant,
-    ReplaceDanglingLegacySymlink { target: PathBuf },
-}
-
-#[cfg(target_os = "macos")]
-fn occupied_move_destination(destination: &Path) -> CowshedError {
-    CowshedError::conflict(
-        format!("{} already exists", destination.display()),
-        "remove the occupant or choose another destination",
-    )
+fn require_vacant_move_destination(destination: &Path) -> Result<()> {
+    match std::fs::symlink_metadata(destination) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(CowshedError::environment_missing(
+            format!(
+                "cannot inspect checkout destination {}: {error}",
+                destination.display()
+            ),
+            "check the destination parent permissions and retry",
+        )),
+        Ok(_) => Err(CowshedError::conflict(
+            format!("{} already exists", destination.display()),
+            "remove the occupant or choose another destination",
+        )),
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -5339,10 +5302,9 @@ async fn recover_repository_identity_intent(store_root: &Path) -> Result<()> {
 /// Apply the durable half of an identity change, from whatever state the store is in right now.
 ///
 /// Every step derives what to do from authoritative state — which directory exists, what the
-/// binding says, where the symlink points — and every step is a no-op once applied. The forward
-/// transaction and recovery therefore call this one function rather than keeping two
-/// implementations that can disagree, and the journal is asked only *whether* a change is owed,
-/// never how far it got.
+/// binding says — and every step is a no-op once applied. The forward transaction and recovery
+/// therefore call this one function rather than keeping two implementations that can disagree,
+/// and the journal is asked only *whether* a change is owed, never how far it got.
 ///
 /// In-image workspace markers are deliberately not touched. A detached image's marker is out of
 /// reach by definition, and reaching it would mean mounting images mid-transaction — which is what
@@ -5382,8 +5344,7 @@ fn apply_identity_change(
         &intent.new_project_root,
         &intent.old_repo_id,
         &intent.new_repo_id,
-    )?;
-    repoint_checkout_symlink(intent)
+    )
 }
 
 /// Rename one of the project's two namespaces, refusing every state that is not one-or-the-other.
@@ -5607,214 +5568,6 @@ fn project_sidecars(root: &Path) -> Result<Vec<PathBuf>> {
     Ok(sidecars)
 }
 
-/// Repoint a symlinked checkout at the moved mount root, if it still names the old one.
-///
-/// Under `CheckoutLayout::DirectMount` there is no symlink and nothing to do; under
-/// `CheckoutLayout::Symlink` a checkout already naming the new target is a completed step, and one
-/// naming neither belongs to the user rather than to this transaction.
-#[cfg(target_os = "macos")]
-fn repoint_checkout_symlink(
-    intent: &crate::storage::recovery::RepositoryIdentityIntent,
-) -> Result<()> {
-    let old_target = intent.old_mount_root.join(main_name().as_str());
-    let Ok(actual) = fs::read_link(&intent.checkout_path) else {
-        return Ok(());
-    };
-    if actual != old_target {
-        return Ok(());
-    }
-    replace_checkout_symlink(
-        &intent.checkout_path,
-        &old_target,
-        &intent.new_mount_root.join(main_name().as_str()),
-    )
-    .map_err(|error| {
-        CowshedError::environment_missing(
-            format!(
-                "cannot repoint checkout {} at the moved workspace mount: {error}",
-                intent.checkout_path.display()
-            ),
-            "repair the checkout symlink and reopen cowshed",
-        )
-    })
-}
-
-#[cfg(target_os = "macos")]
-fn replace_checkout_symlink(
-    checkout: &Path,
-    old_target: &Path,
-    new_target: &Path,
-) -> std::io::Result<()> {
-    let actual = std::fs::read_link(checkout)?;
-    if actual != old_target {
-        return Err(std::io::Error::other(format!(
-            "checkout {} points at {}, expected {}",
-            checkout.display(),
-            actual.display(),
-            old_target.display()
-        )));
-    }
-    let parent = checkout
-        .parent()
-        .ok_or_else(|| std::io::Error::other("checkout has no parent"))?;
-    let temporary = parent.join(format!(".cowshed-repo-id-link-{}", std::process::id()));
-    let _ = std::fs::remove_file(&temporary);
-    std::os::unix::fs::symlink(new_target, &temporary)?;
-    if let Err(error) = std::fs::rename(&temporary, checkout) {
-        let _ = std::fs::remove_file(&temporary);
-        return Err(error);
-    }
-    std::fs::File::open(parent)?.sync_all()
-}
-
-#[cfg(target_os = "macos")]
-/// Exact mount roots emitted by direct-main layouts that cowshed has retired.
-///
-/// These are derived from the validated primary binding, never from the link. Comparing only
-/// lexically normalized raw link text keeps an arbitrary filesystem alias or user-supplied path
-/// from acquiring migration authority.
-#[cfg(target_os = "macos")]
-fn known_retired_main_targets(
-    current_main_mount: &Path,
-    invoking_home: &Path,
-    binding: &RepositoryBinding,
-) -> Result<Vec<PathBuf>> {
-    let repo_id = &binding.primary().map_err(native_integrity_error)?.repo_id;
-    let retired_leaf = |root: PathBuf| {
-        root.join(repo_id.owner())
-            .join(repo_id.repo())
-            .join(main_name().as_str())
-    };
-    let candidates = [
-        current_main_mount.to_owned(),
-        retired_leaf(invoking_home.join(crate::storage::host_config::DEFAULT_MOUNT_RELATIVE)),
-        retired_leaf(
-            Path::new(crate::storage::bootstrap::STORE_ROOT)
-                .join(crate::storage::host_config::RETIRED_MOUNT_DIRECTORY),
-        ),
-    ];
-    let mut targets = Vec::with_capacity(candidates.len());
-    for candidate in candidates {
-        let normalized =
-            crate::sandbox::canonical_lexical_absolute(&candidate).ok_or_else(|| {
-                native_integrity_error(format!(
-                    "retired main target is not an absolute lexical path: {}",
-                    candidate.display()
-                ))
-            })?;
-        if !targets.contains(&normalized) {
-            targets.push(normalized);
-        }
-    }
-    Ok(targets)
-}
-
-#[cfg(target_os = "macos")]
-fn classify_move_destination(
-    destination: &Path,
-    retired_main_targets: &[PathBuf],
-) -> Result<MoveDestination> {
-    let metadata = match std::fs::symlink_metadata(destination) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(MoveDestination::Vacant);
-        }
-        Err(error) => {
-            return Err(CowshedError::environment_missing(
-                format!(
-                    "cannot inspect checkout destination {}: {error}",
-                    destination.display()
-                ),
-                "check the destination parent permissions and retry",
-            ));
-        }
-    };
-    if !metadata.file_type().is_symlink() {
-        return Err(occupied_move_destination(destination));
-    }
-    let target = std::fs::read_link(destination)
-        .ok()
-        .and_then(|target| crate::sandbox::canonical_lexical_absolute(&target))
-        .and_then(|target| retired_main_targets.contains(&target).then_some(target));
-    let is_dangling = std::fs::metadata(destination)
-        .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound);
-    let Some(target) = target.filter(|_| is_dangling) else {
-        return Err(occupied_move_destination(destination));
-    };
-    Ok(MoveDestination::ReplaceDanglingLegacySymlink { target })
-}
-
-#[cfg(target_os = "macos")]
-fn swap_checkout_paths(left: &Path, right: &Path) -> std::io::Result<()> {
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt;
-
-    let left = CString::new(left.as_os_str().as_bytes())
-        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
-    let right = CString::new(right.as_os_str().as_bytes())
-        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
-    /// `RENAME_SWAP` from `<sys/stdio.h>`: exchange the two directory entries atomically.
-    const RENAME_SWAP: u32 = 0x0000_0002;
-    // SAFETY: both paths are `CString`s built above, so they are NUL-terminated, live for the
-    // duration of the call, are not aliased by each other, and are never mutated by it --
-    // `renameatx_np` only reads the path bytes. `AT_FDCWD` resolves each relative to the calling
-    // process's cwd, which is this process's own. `RENAME_SWAP` either exchanges both entries or
-    // leaves both untouched, so a failure cannot leave one checkout half-moved.
-    let result = unsafe {
-        libc::renameatx_np(
-            libc::AT_FDCWD,
-            left.as_ptr(),
-            libc::AT_FDCWD,
-            right.as_ptr(),
-            RENAME_SWAP,
-        )
-    };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn replace_legacy_destination(
-    mountpoint: &Path,
-    destination: &Path,
-    retired_main_mount: &PathBuf,
-) -> Result<()> {
-    match classify_move_destination(destination, std::slice::from_ref(retired_main_mount))? {
-        MoveDestination::ReplaceDanglingLegacySymlink { .. } => {}
-        MoveDestination::Vacant => return Err(occupied_move_destination(destination)),
-    }
-    swap_checkout_paths(mountpoint, destination).map_err(|error| {
-        CowshedError::environment_missing(
-            format!(
-                "cannot replace the retired checkout link at {}: {error}",
-                destination.display()
-            ),
-            "choose a destination on the same writable filesystem",
-        )
-    })?;
-    if matches!(
-        classify_move_destination(mountpoint, std::slice::from_ref(retired_main_mount)),
-        Ok(MoveDestination::ReplaceDanglingLegacySymlink { .. })
-    ) {
-        return Ok(());
-    }
-    let rollback = swap_checkout_paths(mountpoint, destination);
-    Err(CowshedError::conflict(
-        format!(
-            "{} changed while the retired checkout link was being replaced{}",
-            destination.display(),
-            rollback
-                .err()
-                .map(|error| format!("; rollback failed: {error}"))
-                .unwrap_or_default()
-        ),
-        "inspect both checkout paths and retry",
-    ))
-}
-
 #[cfg(target_os = "macos")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ProjectRootValidation {
@@ -5827,24 +5580,20 @@ fn validate_workspace_controller_root(
     derived: &crate::storage::lifecycle::DerivedWorkspace,
     metadata: &crate::metadata::DetachedWorkspaceMetadata,
     project_root: &Path,
-    checkout_layout: crate::metadata::CheckoutLayout,
     validation: ProjectRootValidation,
 ) -> std::result::Result<(), crate::storage::apfs::ApfsStorageError> {
     if !derived.workspace.name().is_main() {
         return Ok(());
     }
-    let permits_retired_root = matches!(
+    let permits_relocated_root = matches!(
         validation,
         ProjectRootValidation::AllowDetachedMainRelocation
-    ) && checkout_layout.mounts_at_checkout()
-        && matches!(
-            derived.mount_state,
-            crate::storage::lifecycle::MountState::Detached
-        );
-    if !permits_retired_root
-        && let Some(info) = metadata.info_snapshot.as_ref()
-        && !names_one_root(&info.project_root, project_root)
-    {
+    ) && matches!(
+        derived.mount_state,
+        crate::storage::lifecycle::MountState::Detached
+    );
+    let info = &metadata.info_snapshot;
+    if !permits_relocated_root && !names_one_root(&info.project_root, project_root) {
         return Err(crate::storage::apfs::ApfsStorageError::MarkerMismatch(
             format!(
                 "persisted project root {} disagrees with controller root {}",
@@ -6070,14 +5819,13 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
             self.authoritative_allowing_detached_main_relocation(),
         )
         .await?;
-        let detached_direct_main = self.substrate_config.checkout_layout.mounts_at_checkout()
-            && authoritative.iter().any(|workspace| {
-                workspace.derived.workspace.name().is_main()
-                    && matches!(
-                        workspace.derived.mount_state,
-                        crate::storage::lifecycle::MountState::Detached
-                    )
-            });
+        let detached_direct_main = authoritative.iter().any(|workspace| {
+            workspace.derived.workspace.name().is_main()
+                && matches!(
+                    workspace.derived.mount_state,
+                    crate::storage::lifecycle::MountState::Detached
+                )
+        });
         if !detached_direct_main {
             crate::timing::spanned("recover", "binding", self.validate_binding()).await?;
         }
@@ -6171,12 +5919,6 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
             .map_err(native_integrity_error)?;
         let binding = self.descriptor.binding.clone();
         let binding_path = self.layout.project().repository_binding.clone();
-        // The layout is recorded in the same staged step as the binding, before publication takes
-        // the checkout path over. Every resolver reads it back from here; leaving it to be
-        // inferred later would mean inferring it from a tree publication is midway through
-        // rearranging.
-        let layout_record = self.layout.clone();
-        let checkout_layout = self.substrate_config.checkout_layout;
         let receipt = self
             .substrate
             .execute_adopt_staged(plan, move |stage| async move {
@@ -6185,7 +5927,6 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                     .ensure_workspace_environment_wiring()
                     .await?;
                 crate::storage::lifecycle::dispatch_blocking(move || {
-                    layout_record.record_checkout_layout(checkout_layout)?;
                     crate::metadata::write_json(&binding_path, &binding)
                 })
                 .await
@@ -6641,32 +6382,22 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
 
     /// Move the project's checkout to `destination`, the `main` half of `cowshed mv`.
     ///
-    /// The two layouts are genuinely different operations, not one operation with a branch:
+    /// The checkout path *is* main's mountpoint. A mounted main is detached, its stub directory is
+    /// renamed, the substrate is rebound, and the image is re-attached. A main that was already
+    /// detached is recovered from its image and detached sidecar instead: the old path need not
+    /// exist, and no Git command is sent there. In either case the destination fact is durable
+    /// before the final mount, so a crash can only leave a forward-recoverable detach.
     ///
-    /// **Symlink.** Main stays mounted at `mnt/<owner>/<repo>/main` throughout — the checkout path
-    /// is only a symlink into it, and nothing about the mount depends on where that symlink sits.
-    /// So there is no unmount, and gaplessness costs nothing: the destination link is created
-    /// before the source link is removed, and the tree is reachable by at least one name at every
-    /// instant.
-    ///
-    /// **Direct mount.** The checkout path *is* the mountpoint. A mounted main is detached, its
-    /// stub directory is renamed, the substrate is rebound, and the image is re-attached. A main
-    /// that was already detached is recovered from its image and detached sidecar instead: the old
-    /// path need not exist, and no Git command is sent there. In either case the destination fact
-    /// is durable before the final mount, so a crash can only leave a forward-recoverable detach.
-    ///
-    /// The durable record is rewritten **before** the tree moves, in both layouts. Under direct
-    /// mount the source path stops existing the instant the rename lands, so a record still naming
-    /// it would be unrecoverable — nothing left to resolve — whereas a record naming the
-    /// destination becomes true the moment the rename completes, and `attach` converges the rest.
-    /// Recording ahead of the move is what makes the crash window recoverable in the forward
-    /// direction instead of the dead one.
+    /// The durable record is rewritten **before** the tree moves: the source path stops existing
+    /// the instant the rename lands, so a record still naming it would be unrecoverable — nothing
+    /// left to resolve — whereas a record naming the destination becomes true the moment the
+    /// rename completes, and `attach` converges the rest. Recording ahead of the move is what makes
+    /// the crash window recoverable in the forward direction instead of the dead one.
     async fn move_checkout(&mut self, destination: PathBuf) -> Result<WorkspaceSnapshot> {
         use crate::storage::lifecycle::{MountIntent, Substrate};
 
         let main = main_name();
         let source = self.substrate_config.checkout_path.clone();
-        let layout = self.substrate_config.checkout_layout;
         let current = self
             .authoritative_allowing_detached_main_relocation()
             .await?
@@ -6678,32 +6409,21 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                     "list published workspaces and retry",
                 )
             })?;
-        let detached_direct = layout.mounts_at_checkout()
-            && matches!(
-                current.derived.mount_state,
-                crate::storage::lifecycle::MountState::Detached
-            );
-        // A detached direct mount has no repository at the recorded checkout path. Its persisted
-        // binding was validated while opening from the session marker; querying Git here would
-        // turn the exact recovery state into "cannot change to <old path>".
-        if !detached_direct {
+        let detached = matches!(
+            current.derived.mount_state,
+            crate::storage::lifecycle::MountState::Detached
+        );
+        // A detached main has no repository at the recorded checkout path. Its persisted binding
+        // was validated while opening from the session marker; querying Git here would turn the
+        // exact recovery state into "cannot change to <old path>".
+        if !detached {
             self.validate_binding().await?;
         }
-        let retired_main_targets = if detached_direct {
-            let current_main_mount = self
-                .layout
-                .workspace_mount(&main)
-                .map_err(native_integrity_error)?;
-            known_retired_main_targets(&current_main_mount, &self.home, &self.descriptor.binding)?
-        } else {
-            Vec::new()
-        };
-        let destination_state = self
-            .validate_move_destination(&source, &destination, &retired_main_targets)
+        self.validate_move_destination(&source, &destination)
             .await?;
 
         let mount_point = self.workspace_mount_path(&main)?;
-        if !detached_direct && !crate::checkout::resolves_to(&source, &mount_point) {
+        if !detached && !crate::checkout::resolves_to(&source, &mount_point) {
             return Err(CowshedError::conflict(
                 format!(
                     "the recorded checkout {} does not resolve to main's mount {}",
@@ -6715,20 +6435,15 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
         }
         let record = self.checkout_record(&current)?;
 
-        if detached_direct {
+        if detached {
             let prepare_record = record.clone();
-            let prepare_layout = self.layout.clone();
             let prepare_source = source.clone();
             let prepare_destination = destination.clone();
-            let prepare_destination_state = destination_state.clone();
             crate::storage::lifecycle::dispatch_blocking(move || {
                 prepare_detached_checkout_relocation(
                     &prepare_record,
-                    &prepare_layout,
-                    layout,
                     &prepare_source,
                     &prepare_destination,
-                    &prepare_destination_state,
                 )
             })
             .await
@@ -6736,7 +6451,7 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                 CowshedError::internal(format!("detached checkout move task failed: {error}"))
             })??;
 
-            self.rebind_checkout(&destination, layout)?;
+            self.rebind_checkout(&destination)?;
             let current = self.current(&main).await?;
             self.substrate
                 .ensure_mounted(&current.derived.workspace, MountIntent { browse: false })
@@ -6771,32 +6486,10 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
         .map_err(|error| CowshedError::internal(format!("checkout record task failed: {error}")))?
         .map_err(native_integrity_error)?;
 
-        let moved = if layout.mounts_at_checkout() {
-            self.move_direct_mount(&current, &source, &destination)
-                .await
-        } else {
-            let move_source = source.clone();
-            let move_destination = destination.clone();
-            let target = mount_point.clone();
-            crate::storage::lifecycle::dispatch_blocking(move || {
-                crate::checkout::relink_checkout(&move_source, &move_destination, &target).map_err(
-                    |error| {
-                        CowshedError::environment_missing(
-                            format!(
-                                "cannot link {} to main's mount: {error}",
-                                move_destination.display()
-                            ),
-                            "choose a destination on a writable filesystem",
-                        )
-                    },
-                )
-            })
+        if let Err(error) = self
+            .move_direct_mount(&current, &source, &destination)
             .await
-            .map_err(|error| {
-                CowshedError::internal(format!("checkout link task failed: {error}"))
-            })?
-        };
-        if let Err(error) = moved {
+        {
             // The tree never moved, so the only thing to undo is the record.
             let rollback = record.clone();
             let rollback_source = source.clone();
@@ -6807,18 +6500,16 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
             return Err(error);
         }
 
-        self.rebind_checkout(&destination, layout)?;
-        if layout.mounts_at_checkout() {
-            let current = self.current(&main).await?;
-            // Past the rename there is no way back worth taking: the record and the tree both name
-            // the destination, so a failure to re-attach here is a detached project at the right
-            // path, which `cowshed attach` mounts. Rolling back would move the tree a second time
-            // to reach a state that is strictly further from where the user asked to be.
-            self.substrate
-                .ensure_mounted(&current.derived.workspace, MountIntent { browse: false })
-                .await
-                .map_err(native_storage_error)?;
-        }
+        self.rebind_checkout(&destination)?;
+        let current = self.current(&main).await?;
+        // Past the rename there is no way back worth taking: the record and the tree both name the
+        // destination, so a failure to re-attach here is a detached project at the right path,
+        // which `cowshed attach` mounts. Rolling back would move the tree a second time to reach a
+        // state that is strictly further from where the user asked to be.
+        self.substrate
+            .ensure_mounted(&current.derived.workspace, MountIntent { browse: false })
+            .await
+            .map_err(native_storage_error)?;
         self.repair_workspace_records(&destination).await?;
         self.ensure_supervisor(&main).await?;
         self.snapshot_named(&main).await
@@ -6932,7 +6623,6 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
         let intent = RepositoryIdentityIntent {
             old_repo_id: old_repo_id.clone(),
             new_repo_id: new_repo_id.clone(),
-            checkout_path: self.substrate_config.checkout_path.clone(),
             old_project_root,
             new_project_root,
             old_mount_root,
@@ -7213,10 +6903,7 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                     "list workspace checkpoints and retry",
                 )
             })?;
-        let info = current
-            .metadata
-            .require_info_snapshot()
-            .map_err(native_integrity_error)?;
+        let info = &current.metadata.info_snapshot;
         let identity = self
             .operation_identity(
                 current.metadata.grants.clone(),
@@ -7351,7 +7038,7 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                             {
                                 return Err(another_process_is_running(&workspace));
                             }
-                            abandoned_clone_origin(&metadata)?
+                            abandoned_clone_origin(&metadata)
                         }
                         Some(
                             operation @ (crate::storage::recovery::LifecycleIntent::Create {
@@ -7703,7 +7390,7 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
             else {
                 continue;
             };
-            if metadata.info_snapshot.is_some_and(|info| info.git_worktree) {
+            if metadata.info_snapshot.git_worktree {
                 self.unregister_workspace_in_main(&metadata.workspace, true)
                     .await?;
             }
@@ -9067,33 +8754,20 @@ async fn read_workspace_marker(path: &Path) -> Result<Option<crate::metadata::Wo
 #[cfg(target_os = "macos")]
 fn prepare_detached_checkout_relocation(
     record: &crate::checkout::CheckoutRecord,
-    storage_layout: &crate::storage::StorageLayout,
-    checkout_layout: crate::metadata::CheckoutLayout,
     source: &Path,
     destination: &Path,
-    destination_state: &MoveDestination,
 ) -> Result<()> {
-    let replacement_target = match destination_state {
-        MoveDestination::Vacant => None,
-        MoveDestination::ReplaceDanglingLegacySymlink { target } => Some(target),
-    };
-    let mut displaced_legacy_link = None;
     let source_existed = match std::fs::symlink_metadata(source) {
         Ok(metadata) if metadata.file_type().is_dir() => {
-            if let Some(retired_main_mount) = replacement_target {
-                replace_legacy_destination(source, destination, retired_main_mount)?;
-                displaced_legacy_link = Some(source.to_owned());
-            } else {
-                std::fs::rename(source, destination).map_err(|error| {
-                    CowshedError::environment_missing(
-                        format!(
-                            "cannot move the detached checkout mountpoint to {}: {error}",
-                            destination.display()
-                        ),
-                        "choose a destination on the same writable filesystem",
-                    )
-                })?;
-            }
+            std::fs::rename(source, destination).map_err(|error| {
+                CowshedError::environment_missing(
+                    format!(
+                        "cannot move the detached checkout mountpoint to {}: {error}",
+                        destination.display()
+                    ),
+                    "choose a destination on the same writable filesystem",
+                )
+            })?;
             true
         }
         Ok(_) => {
@@ -9106,45 +8780,15 @@ fn prepare_detached_checkout_relocation(
             ));
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            if let Some(retired_main_mount) = replacement_target {
-                let parent = destination
-                    .parent()
-                    .expect("validated checkout destination has a parent");
-                let leaf = destination
-                    .file_name()
-                    .expect("validated checkout destination has a file name")
-                    .to_string_lossy();
-                let staging = parent.join(format!(
-                    ".{leaf}.cowshed-relocate-{}",
-                    uuid::Uuid::new_v4().simple()
-                ));
-                std::fs::create_dir(&staging).map_err(|error| {
-                    CowshedError::environment_missing(
-                        format!(
-                            "cannot stage checkout mountpoint beside {}: {error}",
-                            destination.display()
-                        ),
-                        "choose a destination in a writable directory",
-                    )
-                })?;
-                if let Err(error) =
-                    replace_legacy_destination(&staging, destination, retired_main_mount)
-                {
-                    let _ = std::fs::remove_dir(&staging);
-                    return Err(error);
-                }
-                displaced_legacy_link = Some(staging);
-            } else {
-                std::fs::create_dir(destination).map_err(|error| {
-                    CowshedError::environment_missing(
-                        format!(
-                            "cannot create checkout mountpoint {}: {error}",
-                            destination.display()
-                        ),
-                        "choose a destination in a writable directory",
-                    )
-                })?;
-            }
+            std::fs::create_dir(destination).map_err(|error| {
+                CowshedError::environment_missing(
+                    format!(
+                        "cannot create checkout mountpoint {}: {error}",
+                        destination.display()
+                    ),
+                    "choose a destination in a writable directory",
+                )
+            })?;
             false
         }
         Err(error) => {
@@ -9157,38 +8801,13 @@ fn prepare_detached_checkout_relocation(
             ));
         }
     };
-    let recorded = storage_layout
-        .record_checkout_layout(checkout_layout)
-        .map_err(native_integrity_error)
-        .and_then(|()| {
-            record
-                .rewrite_detached_project_root(destination)
-                .map_err(native_integrity_error)
-                .map(|_| ())
-        });
-    if let Err(error) = recorded {
-        if let Some(displaced) = displaced_legacy_link.as_ref() {
-            let _ = swap_checkout_paths(destination, displaced);
-            if !source_existed {
-                let _ = std::fs::remove_dir(displaced);
-            }
-        } else if source_existed {
+    if let Err(error) = record.rewrite_detached_project_root(destination) {
+        if source_existed {
             let _ = std::fs::rename(destination, source);
         } else {
             let _ = std::fs::remove_dir(destination);
         }
-        return Err(error);
-    }
-    if let Some(displaced) = displaced_legacy_link {
-        std::fs::remove_file(&displaced).map_err(|error| {
-            CowshedError::environment_missing(
-                format!(
-                    "cannot remove retired checkout link {}: {error}",
-                    displaced.display()
-                ),
-                "check the checkout parent permissions and retry",
-            )
-        })?;
+        return Err(native_integrity_error(error));
     }
     Ok(())
 }
@@ -11313,7 +10932,17 @@ mod retired_recovery_tests {
             publication_state: PublicationState::Active,
             updated_at: "2026-07-14T00:00:00Z".into(),
             grants,
-            info_snapshot: None,
+            info_snapshot: crate::metadata::WorkspaceInfoSnapshot {
+                project_root: std::path::PathBuf::from("/project"),
+                role: crate::metadata::WorkspaceRole::Workspace,
+                base_commit: "0123456789abcdef0123456789abcdef01234567".to_owned(),
+                branch: None,
+                created_at: "2026-07-14T00:00:00Z".to_owned(),
+                forked_from: None,
+                captured_at: "2026-07-14T00:00:00Z".to_owned(),
+                stale: false,
+                git_worktree: false,
+            },
         }
         .write_for_image(&image)
         .unwrap();
@@ -11357,7 +10986,17 @@ mod retired_recovery_tests {
             publication_state: PublicationState::PendingFence,
             updated_at: "2026-07-14T00:00:00Z".into(),
             grants,
-            info_snapshot: None,
+            info_snapshot: crate::metadata::WorkspaceInfoSnapshot {
+                project_root: std::path::PathBuf::from("/project"),
+                role: crate::metadata::WorkspaceRole::Workspace,
+                base_commit: "0123456789abcdef0123456789abcdef01234567".to_owned(),
+                branch: None,
+                created_at: "2026-07-14T00:00:00Z".to_owned(),
+                forked_from: None,
+                captured_at: "2026-07-14T00:00:00Z".to_owned(),
+                stale: false,
+                git_worktree: false,
+            },
         }
         .write_for_image(&image)
         .expect("retired sidecar");
@@ -11429,7 +11068,17 @@ mod retired_recovery_tests {
             publication_state: PublicationState::Active,
             updated_at: "2026-07-14T00:00:00Z".into(),
             grants,
-            info_snapshot: None,
+            info_snapshot: crate::metadata::WorkspaceInfoSnapshot {
+                project_root: std::path::PathBuf::from("/project"),
+                role: crate::metadata::WorkspaceRole::Main,
+                base_commit: "0123456789abcdef0123456789abcdef01234567".to_owned(),
+                branch: None,
+                created_at: "2026-07-14T00:00:00Z".to_owned(),
+                forked_from: None,
+                captured_at: "2026-07-14T00:00:00Z".to_owned(),
+                stale: false,
+                git_worktree: false,
+            },
         }
         .write_for_image(&image)
         .unwrap();
@@ -11817,14 +11466,10 @@ fn require_checkpointable(
 /// Whether this workspace is a registered linked worktree of main's repository.
 ///
 /// Read from the store-side sidecar, so it answers while the workspace is detached — which is
-/// exactly when retirement and `gc` need it. A sidecar too old to carry the field describes a
-/// workspace minted before the mode existed, and those are standalone.
+/// exactly when retirement and `gc` need it.
 #[cfg(target_os = "macos")]
 fn is_git_worktree(metadata: &crate::metadata::DetachedWorkspaceMetadata) -> bool {
-    metadata
-        .info_snapshot
-        .as_ref()
-        .is_some_and(|info| info.git_worktree)
+    metadata.info_snapshot.git_worktree
 }
 
 #[cfg(target_os = "macos")]
@@ -11842,11 +11487,8 @@ fn another_process_is_running(workspace: &WorkspaceName) -> CowshedError {
 #[cfg(target_os = "macos")]
 fn abandoned_clone_origin(
     metadata: &crate::metadata::DetachedWorkspaceMetadata,
-) -> Result<crate::storage::recovery::LifecycleIntent> {
-    let info = metadata
-        .require_info_snapshot()
-        .map_err(native_integrity_error)?;
-    Ok(match &info.forked_from {
+) -> crate::storage::recovery::LifecycleIntent {
+    match &metadata.info_snapshot.forked_from {
         Some(source) => crate::storage::recovery::LifecycleIntent::Fork {
             source: source.clone(),
             destination: metadata.workspace.clone(),
@@ -11854,11 +11496,11 @@ fn abandoned_clone_origin(
         None => crate::storage::recovery::LifecycleIntent::Create {
             workspace: metadata.workspace.clone(),
             options: CreateOptions {
-                git_worktree: info.git_worktree,
+                git_worktree: metadata.info_snapshot.git_worktree,
                 ..CreateOptions::default()
             },
         },
-    })
+    }
 }
 
 /// Whether a process holds `image`'s lifecycle lock right now — the lock a create, fork, restore
@@ -12742,8 +12384,8 @@ mod git_worktree_tests {
                 PortBlock::new(40_960, 16).expect("port block"),
             ))
             .expect("grants"),
-            info_snapshot: Some(WorkspaceInfoSnapshot {
-                project_root: PathBuf::from("/project"),
+            info_snapshot: WorkspaceInfoSnapshot {
+                project_root: std::path::PathBuf::from("/project"),
                 role: WorkspaceRole::Workspace,
                 base_commit: "0123456789abcdef".to_owned(),
                 branch: Some("cowshed/raven".to_owned()),
@@ -12752,7 +12394,7 @@ mod git_worktree_tests {
                 captured_at: "2026-07-13T00:00:00Z".to_owned(),
                 stale: false,
                 git_worktree,
-            }),
+            },
         }
     }
 
@@ -12933,7 +12575,7 @@ mod workspace_origin_tests {
                 PortBlock::new(49_136, 16).expect("port block"),
             ))
             .expect("grants"),
-            info_snapshot: Some(WorkspaceInfoSnapshot {
+            info_snapshot: WorkspaceInfoSnapshot {
                 project_root: project_root.to_owned(),
                 role: WorkspaceRole::Main,
                 base_commit: "0123456789abcdef".to_owned(),
@@ -12943,7 +12585,7 @@ mod workspace_origin_tests {
                 captured_at: "2026-07-13T00:00:00Z".to_owned(),
                 stale: false,
                 git_worktree: false,
-            }),
+            },
         }
     }
 
@@ -13110,16 +12752,11 @@ mod workspace_origin_tests {
         };
         let mut session_metadata = main_metadata(&persisted_old_root, session_incarnation);
         session_metadata.workspace = WorkspaceName::new("task").expect("task");
-        session_metadata
-            .info_snapshot
-            .as_mut()
-            .expect("snapshot")
-            .role = WorkspaceRole::Workspace;
+        session_metadata.info_snapshot.role = WorkspaceRole::Workspace;
         validate_workspace_controller_root(
             &session_workspace,
             &session_metadata,
             &retired_controller_root,
-            crate::metadata::CheckoutLayout::DirectMount,
             ProjectRootValidation::Strict,
         )
         .expect("session sidecars do not claim the controller checkout");
@@ -13135,7 +12772,6 @@ mod workspace_origin_tests {
             &main,
             &metadata,
             &retired_controller_root,
-            crate::metadata::CheckoutLayout::DirectMount,
             ProjectRootValidation::AllowDetachedMainRelocation,
         )
         .expect("explicit detached-main relocation accepts retired roots");
@@ -13151,26 +12787,9 @@ mod workspace_origin_tests {
             mount_point: retired_controller_root.clone(),
             image,
         };
-        let retired_main_mount = layout
-            .workspace_mount(&WorkspaceName::new("main").expect("main"))
-            .expect("retired main mount");
-        std::os::unix::fs::symlink(&retired_main_mount, &destination)
-            .expect("retired checkout link");
-        classify_move_destination(&destination, &[])
-            .expect_err("only detached direct-main relocation may replace the retired link");
-        let targets = known_retired_main_targets(&retired_main_mount, &temp, &binding)
-            .expect("known retired roots");
-        let destination_state = classify_move_destination(&destination, &targets)
-            .expect("exact dangling retired main link");
-        prepare_detached_checkout_relocation(
-            &record,
-            &layout,
-            crate::metadata::CheckoutLayout::DirectMount,
-            &retired_controller_root,
-            &destination,
-            &destination_state,
-        )
-        .expect("relocate detached main");
+        require_vacant_move_destination(&destination).expect("a vacant destination");
+        prepare_detached_checkout_relocation(&record, &retired_controller_root, &destination)
+            .expect("relocate detached main");
 
         assert!(
             destination.is_dir(),
@@ -13179,21 +12798,9 @@ mod workspace_origin_tests {
         assert_eq!(
             DetachedWorkspaceMetadata::read_for_image(&record.image)
                 .expect("updated sidecar")
-                .require_info_snapshot()
-                .expect("main snapshot")
+                .info_snapshot
                 .project_root,
             destination
-        );
-        assert_eq!(
-            layout.checkout_layout().expect("updated layout"),
-            crate::metadata::CheckoutLayout::DirectMount
-        );
-        assert!(
-            !std::fs::symlink_metadata(&destination)
-                .expect("destination metadata")
-                .file_type()
-                .is_symlink(),
-            "the retired symlink is replaced rather than followed"
         );
         assert!(
             !retired_controller_root.exists(),
@@ -13203,147 +12810,23 @@ mod workspace_origin_tests {
     }
 
     #[test]
-    fn detached_relocation_accepts_home_root_legacy_main_symlink() {
-        let temp = temp_directory("home-root-retired-link");
-        let source = temp.join("missing-retired-checkout");
-        let destination = temp.join("explicit-destination");
-        let store = temp.join("store");
-        let repo_id = RepoId::parse("example-org/example-app").expect("live repository identity");
-        let layout = crate::storage::StorageLayout::with_mount_root(
-            &store,
-            temp.join("current-mnt"),
-            &repo_id,
-        )
-        .expect("layout");
-        std::fs::create_dir_all(&layout.project().project_root).expect("project store");
-        let binding = RepositoryBinding::new(vec![crate::repository::BoundIdentity {
-            repo_id,
-            remote_name: Some("origin".to_owned()),
-            remote_url: Some("https://example.test/example-org/example-app.git".to_owned()),
-            primary: true,
-        }])
-        .expect("validated live binding");
-        let current_main_mount = layout
-            .workspace_mount(&WorkspaceName::new("main").expect("main"))
-            .expect("current main mount");
-        let invoking_home = Path::new("/Users/alice");
-        let historical_main_mount =
-            Path::new("/Users/alice/.cowshed/mnt/example-org/example-app/main");
-        let targets = known_retired_main_targets(&current_main_mount, invoking_home, &binding)
-            .expect("same-repository retired roots");
-        assert!(targets.contains(&historical_main_mount.to_owned()));
-        assert!(targets.contains(
-            &Path::new("/private/cowshed/store/mnt/example-org/example-app/main").to_owned()
-        ));
-        assert_eq!(
-            targets.len(),
-            3,
-            "all distinct historical forms are retained"
-        );
-        assert_eq!(
-            known_retired_main_targets(historical_main_mount, invoking_home, &binding)
-                .expect("duplicate home and current root"),
-            vec![
-                historical_main_mount.to_owned(),
-                Path::new("/private/cowshed/store/mnt/example-org/example-app/main").to_owned(),
-            ],
-            "an unchanged current home root is listed only once"
-        );
-
-        let image = layout
-            .main_image(ImageFormat::Asif)
-            .expect("main paths")
-            .image()
-            .to_owned();
-        std::fs::write(&image, b"main image").expect("image");
-        let mut metadata = main_metadata(&source, incarnation("00000000000000000000000000000004"));
-        metadata.repo_id = binding.primary().expect("primary binding").repo_id.clone();
-        metadata.write_for_image(&image).expect("sidecar");
-        let record = crate::checkout::CheckoutRecord {
-            mount_point: source.clone(),
-            image,
-        };
-        std::os::unix::fs::symlink(historical_main_mount, &destination)
-            .expect("exact live historical checkout link");
-        let destination_state = classify_move_destination(&destination, &targets)
-            .expect("same-repository home-root link");
-
-        prepare_detached_checkout_relocation(
-            &record,
-            &layout,
-            crate::metadata::CheckoutLayout::DirectMount,
-            &source,
-            &destination,
-            &destination_state,
-        )
-        .expect("explicit destination replaces the retired link");
-
-        assert!(destination.is_dir());
-        assert_eq!(
-            DetachedWorkspaceMetadata::read_for_image(&record.image)
-                .expect("updated sidecar")
-                .require_info_snapshot()
-                .expect("main snapshot")
-                .project_root,
-            destination
-        );
-        std::fs::remove_dir_all(&temp).ok();
-    }
-
-    #[test]
-    fn retired_link_targets_are_compared_by_canonical_lexical_spelling() {
-        let temp = temp_directory("retired-link-lexical");
+    fn detached_relocation_refuses_every_occupied_destination() {
+        let temp = temp_directory("occupied-destinations");
         let destination = temp.join("destination");
-        let retired_main_mount = temp.join("mnt/acme/widget/main");
-        let raw_target = temp.join("mnt/acme/../acme/widget/./main");
-
-        std::os::unix::fs::symlink(&raw_target, &destination).expect("lexical retired link");
-        assert_eq!(
-            classify_move_destination(&destination, std::slice::from_ref(&retired_main_mount))
-                .expect("lexically equivalent dangling target"),
-            MoveDestination::ReplaceDanglingLegacySymlink {
-                target: retired_main_mount,
-            }
-        );
-
-        std::fs::remove_dir_all(&temp).ok();
-    }
-
-    #[test]
-    fn detached_relocation_rejects_unrelated_or_live_symlinks() {
-        let temp = temp_directory("retired-link-conflicts");
-        let destination = temp.join("destination");
-        let retired_main_mount = temp.join("mnt/acme/widget/main");
-        let unrelated = temp.join("unrelated-missing");
-
-        std::os::unix::fs::symlink(&unrelated, &destination).expect("unrelated link");
-        classify_move_destination(&destination, std::slice::from_ref(&retired_main_mount))
-            .expect_err("an arbitrary dangling link remains an occupant");
-        std::fs::remove_file(&destination).expect("remove unrelated link");
-
-        std::fs::create_dir_all(&retired_main_mount).expect("live retired-layout mount");
-        std::os::unix::fs::symlink(&retired_main_mount, &destination)
-            .expect("link to live retired mount");
-        classify_move_destination(&destination, std::slice::from_ref(&retired_main_mount))
-            .expect_err("a link whose target exists remains an occupant");
-
-        std::fs::remove_dir_all(&temp).ok();
-    }
-
-    #[test]
-    fn detached_relocation_rejects_ordinary_occupied_destinations() {
-        let temp = temp_directory("retired-link-ordinary-occupants");
-        let destination = temp.join("destination");
-        let retired_main_mount = temp.join("mnt/acme/widget/main");
 
         std::fs::create_dir(&destination).expect("occupied directory");
-        classify_move_destination(&destination, std::slice::from_ref(&retired_main_mount))
+        require_vacant_move_destination(&destination)
             .expect_err("an ordinary directory remains an occupant");
         std::fs::remove_dir(&destination).expect("remove directory");
 
         std::fs::write(&destination, b"occupant").expect("occupied file");
-        classify_move_destination(&destination, std::slice::from_ref(&retired_main_mount))
+        require_vacant_move_destination(&destination)
             .expect_err("an ordinary file remains an occupant");
+        std::fs::remove_file(&destination).expect("remove file");
+
+        std::os::unix::fs::symlink(temp.join("missing"), &destination).expect("dangling link");
+        require_vacant_move_destination(&destination)
+            .expect_err("a dangling symlink remains an occupant");
 
         std::fs::remove_dir_all(&temp).ok();
     }
@@ -13362,7 +12845,6 @@ mod workspace_origin_tests {
             &main,
             &metadata,
             Path::new("/retired/controller/b"),
-            crate::metadata::CheckoutLayout::DirectMount,
             ProjectRootValidation::AllowDetachedMainRelocation,
         )
         .expect_err("mounted main retains strict root agreement");
@@ -14173,9 +13655,9 @@ mod port_reservation_tests {
     use super::{claim_port_block, reserve_port_grants};
     use crate::gateway_inventory::NativeGatewayInventory;
     use crate::metadata::{
-        CheckoutLayout, DetachedWorkspaceMetadata, GrantSet, ImageFormat, MACOS_PORT_MIN,
-        NEW_PORT_BLOCK_SIZE, Platform, PortBlock, PublicationState, SIDECAR_VERSION,
-        WorkspaceIncarnation, WorkspaceName,
+        DetachedWorkspaceMetadata, GrantSet, ImageFormat, MACOS_PORT_MIN, NEW_PORT_BLOCK_SIZE,
+        Platform, PortBlock, PublicationState, SIDECAR_VERSION, WorkspaceIncarnation,
+        WorkspaceName,
     };
     use crate::repository::{BoundIdentity, RepoId, RepositoryBinding};
     use crate::storage::StorageLayout;
@@ -14209,9 +13691,6 @@ mod port_reservation_tests {
         .expect("binding");
         crate::metadata::write_json(&layout.project().repository_binding, &binding)
             .expect("publish binding");
-        layout
-            .record_checkout_layout(CheckoutLayout::Symlink)
-            .expect("checkout layout");
         let storage = ValidatedHostStorage::new(root.join("home"), roots);
         (NativeGatewayInventory::new(storage), layout)
     }
@@ -14247,7 +13726,17 @@ mod port_reservation_tests {
             publication_state: PublicationState::Active,
             updated_at: "2026-07-14T00:00:00Z".to_owned(),
             grants: first.grants.clone(),
-            info_snapshot: None,
+            info_snapshot: crate::metadata::WorkspaceInfoSnapshot {
+                project_root: std::path::PathBuf::from("/project"),
+                role: crate::metadata::WorkspaceRole::Main,
+                base_commit: "0123456789abcdef0123456789abcdef01234567".to_owned(),
+                branch: None,
+                created_at: "2026-07-14T00:00:00Z".to_owned(),
+                forked_from: None,
+                captured_at: "2026-07-14T00:00:00Z".to_owned(),
+                stale: false,
+                git_worktree: false,
+            },
         }
         .write_for_image(image.image())
         .expect("publish allocation");
@@ -14313,7 +13802,17 @@ mod port_reservation_tests {
             publication_state: PublicationState::PendingFence,
             updated_at: "2026-07-14T00:00:00Z".to_owned(),
             grants: first.grants.clone(),
-            info_snapshot: None,
+            info_snapshot: crate::metadata::WorkspaceInfoSnapshot {
+                project_root: std::path::PathBuf::from("/project"),
+                role: crate::metadata::WorkspaceRole::Workspace,
+                base_commit: "0123456789abcdef0123456789abcdef01234567".to_owned(),
+                branch: None,
+                created_at: "2026-07-14T00:00:00Z".to_owned(),
+                forked_from: None,
+                captured_at: "2026-07-14T00:00:00Z".to_owned(),
+                stale: false,
+                git_worktree: false,
+            },
         }
         .write_for_image(image.image())
         .expect("pending metadata");
@@ -14350,6 +13849,7 @@ mod port_reservation_tests {
         let mut published =
             DetachedWorkspaceMetadata::read_for_image(image.image()).expect("pending sidecar");
         published.workspace = WorkspaceName::main();
+        published.info_snapshot.role = crate::metadata::WorkspaceRole::Main;
         published.publication_state = PublicationState::Active;
         published
             .write_for_image(main.image())
@@ -14365,6 +13865,7 @@ mod port_reservation_tests {
         std::fs::remove_file(crate::metadata::sidecar_path(main.image()))
             .expect("remove conflicting sidecar");
         published.workspace = WorkspaceName::session("foreign").expect("foreign name");
+        published.info_snapshot.role = crate::metadata::WorkspaceRole::Workspace;
         published.publication_state = PublicationState::PendingFence;
         published
             .write_for_image(image.image())
@@ -14417,6 +13918,7 @@ mod port_reservation_tests {
                        block: PortBlock| {
             std::fs::create_dir_all(image.parent().expect("image directory")).expect("directory");
             std::fs::write(image, b"detached image fixture").expect("image");
+            let role = crate::metadata::WorkspaceRole::for_name(&workspace);
             DetachedWorkspaceMetadata {
                 version: SIDECAR_VERSION,
                 repo_id: RepoId::parse("acme/widget").expect("repo"),
@@ -14430,7 +13932,17 @@ mod port_reservation_tests {
                 publication_state,
                 updated_at: "2026-07-14T00:00:00Z".to_owned(),
                 grants: GrantSet::closed_baseline(Some(block)).expect("grants"),
-                info_snapshot: None,
+                info_snapshot: crate::metadata::WorkspaceInfoSnapshot {
+                    project_root: std::path::PathBuf::from("/project"),
+                    role,
+                    base_commit: "0123456789abcdef0123456789abcdef01234567".to_owned(),
+                    branch: None,
+                    created_at: "2026-07-14T00:00:00Z".to_owned(),
+                    forked_from: None,
+                    captured_at: "2026-07-14T00:00:00Z".to_owned(),
+                    stale: false,
+                    git_worktree: false,
+                },
             }
             .write_for_image(image)
             .expect("publish block");
@@ -14586,7 +14098,6 @@ mod terminal_project_cleanup_tests {
         for file in [
             paths.project_root.join("lifecycle-intents.json"),
             paths.project_root.join("deletion-log.jsonl"),
-            paths.checkout_layout.clone(),
             paths.slot_bindings.clone(),
         ] {
             std::fs::write(file, b"controller state").expect("controller state");
@@ -14636,7 +14147,6 @@ mod terminal_project_cleanup_tests {
         for controller in [
             paths.project_root.join("lifecycle-intents.json"),
             paths.project_root.join("deletion-log.jsonl"),
-            paths.checkout_layout.clone(),
             paths.slot_bindings.clone(),
         ] {
             assert!(!controller.exists(), "{} remains", controller.display());

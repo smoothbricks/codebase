@@ -12,9 +12,8 @@ use crate::apfs::{ApfsCaseSensitivity, SystemCommandRunner};
 #[cfg(test)]
 use crate::api::dto::WorkspaceState;
 use crate::api::dto::{ProjectWorkspaces, WorkspaceInfo};
-use crate::checkout::load_checkout_layout;
 use crate::metadata::{
-    CheckoutLayout, DetachedWorkspaceMetadata, GrantSet, ImageFormat, PortBlock, PublicationState,
+    DetachedWorkspaceMetadata, GrantSet, ImageFormat, PortBlock, PublicationState,
     ReservedPortBlocks, WorkspaceIncarnation, WorkspaceName, sidecar_path,
 };
 use crate::repository::{OwnedRepoIds, RepoId, RepositoryBinding};
@@ -224,7 +223,7 @@ impl InventorySource for NativeInventorySource {
                 .join("gateway")
                 .join(UNRESOLVED_CHECKOUT_PATH)
         });
-        let config = project_substrate_config(storage, &layout, checkout_path)?;
+        let config = project_substrate_config(storage, checkout_path);
         let captured = SystemKernelMountSource.mounts()?;
         let host = MacOsApfsExecutionHost::with_mount_source(
             SystemCommandRunner,
@@ -247,30 +246,21 @@ impl InventorySource for NativeInventorySource {
     }
 }
 
-/// The substrate configuration for one project, read from the project's own records.
+/// The substrate configuration for one project checked out at `checkout_path`.
 ///
 /// One builder for both sides of the inventory: the read-only fact pass and eager heal have to
 /// agree about where every workspace of a project mounts, and a second copy of this derivation is
 /// how they would stop agreeing.
 fn project_substrate_config(
     storage: &ValidatedHostStorage,
-    layout: &StorageLayout,
     checkout_path: PathBuf,
-) -> Result<ApfsSubstrateConfig, GatewayInventoryError> {
-    let checkout_layout =
-        layout
-            .checkout_layout()
-            .map_err(|error| GatewayInventoryError::InvalidMetadata {
-                path: layout.project().project_root.clone(),
-                message: error.to_string(),
-            })?;
-    Ok(ApfsSubstrateConfig::new(
+) -> ApfsSubstrateConfig {
+    ApfsSubstrateConfig::new(
         storage.store(),
         storage.caches(),
         checkout_path,
-        checkout_layout,
         ApfsCaseSensitivity::Sensitive,
-    ))
+    )
 }
 
 /// One project's mount side, opened once and mounting nothing on its own.
@@ -323,7 +313,7 @@ impl HealSource for NativeHealSource {
                 message: "project records no adopted checkout path".to_owned(),
             }
         })?;
-        let config = project_substrate_config(storage, &layout, checkout_path)?;
+        let config = project_substrate_config(storage, checkout_path);
         let host = MacOsApfsExecutionHost::new(SystemCommandRunner, config.clone())?;
         Ok(Arc::new(NativeProjectMounts {
             repo: repo.clone(),
@@ -699,26 +689,10 @@ impl NativeGatewayInventory {
                 continue;
             };
             let main = WorkspaceName::new("main").expect("fixed main");
-            // A project that never recorded its checkout layout cannot say where its main belongs,
-            // and that unresolved record is itself the defect — not grounds to skip the project and
-            // report the host as healthy. The adopted checkout is the path named for it, because
-            // direct mount is what adopt writes and puts main exactly there.
-            let (mountpoint, unresolved_layout) = match layout.checkout_layout() {
-                Ok(checkout_layout) => (
-                    workspace_mountpoint(&layout, checkout_layout, &project.project_root, &main)?,
-                    None,
-                ),
-                Err(error) => (
-                    project.project_root.clone(),
-                    Some(format!("the project records no checkout layout: {error}")),
-                ),
-            };
-            let reason = match unresolved_layout {
-                Some(unresolved) => Some(unresolved),
-                None => match self.source.project_facts(&self.storage, &project.repo_id) {
-                    Ok(facts) => main_mount_defect(facts)?,
-                    Err(error) => Some(error.to_string()),
-                },
+            let mountpoint = workspace_mountpoint(&layout, &project.project_root, &main)?;
+            let reason = match self.source.project_facts(&self.storage, &project.repo_id) {
+                Ok(facts) => main_mount_defect(facts)?,
+                Err(error) => Some(error.to_string()),
             };
             if let Some(reason) = reason {
                 unreachable.push(UnreachableMain {
@@ -844,11 +818,8 @@ impl NativeGatewayInventory {
                                 .to_owned(),
                         });
                     }
-                    let matches = metadata
-                        .info_snapshot
-                        .as_ref()
-                        .and_then(|info| fs::canonicalize(&info.project_root).ok())
-                        .is_some_and(|root| root == expected);
+                    let matches = fs::canonicalize(&metadata.info_snapshot.project_root)
+                        .is_ok_and(|root| root == expected);
                     Ok::<_, GatewayInventoryError>(claimed || matches)
                 })?
             };
@@ -1144,18 +1115,10 @@ impl NativeGatewayInventory {
                 image_paths.image(),
                 &workspace.workspace,
             )?;
-            // Main with no recorded info snapshot never finished adoption: its checkout was never
-            // taken over, so nothing should be served from it. This is a deliberate exclusion, not
-            // a side effect of failing to resolve a path — the mount path itself is derivable from
-            // the layout for every workspace.
-            if workspace.workspace.name().is_main() && metadata.require_info_snapshot().is_err() {
-                continue;
-            }
-            // The mount path is not re-derived here. `mount_paths` is already the checkout-layout
-            // aware expectation (`expected_mount_paths`), and `ApfsExecutionHost::mounts` only
-            // reports a volume as mounted when the kernel has it at exactly that path. Deriving it
-            // a second time from the layout alone would ignore `CheckoutLayout::DirectMount`, where
-            // main mounts at the adopted checkout instead of `mnt/<owner>/<repo>/main`.
+            // The mount path is not re-derived here. `mount_paths` is already the expectation
+            // (`expected_mount_paths`) — main at the adopted checkout, every other workspace under
+            // `mnt/<owner>/<repo>/` — and `ApfsExecutionHost::mounts` only reports a volume as
+            // mounted when the kernel has it at exactly that path.
             let port_block = metadata.grants.port_block.ok_or_else(|| {
                 GatewayInventoryError::MissingPortBlock {
                     repo: repo_id.clone(),
@@ -1380,12 +1343,6 @@ fn load_binding_candidate(
             actual,
         });
     }
-    load_checkout_layout(&expected_layout).map_err(|error| {
-        GatewayInventoryError::InvalidMetadata {
-            path: expected_paths.checkout_layout.clone(),
-            message: error.to_string(),
-        }
-    })?;
     Ok(owned)
 }
 
@@ -1490,15 +1447,10 @@ pub(crate) fn authoritative_checkout_path(
             });
         }
         if metadata.publication_state == PublicationState::Active {
-            found = Some(
-                metadata
-                    .require_info_snapshot()
-                    .ok()
-                    .map(|snapshot| snapshot.project_root.clone()),
-            );
+            found = Some(metadata.info_snapshot.project_root);
         }
     }
-    Ok(found.flatten())
+    Ok(found)
 }
 
 fn expected_mount_paths(
@@ -1508,32 +1460,23 @@ fn expected_mount_paths(
 ) -> Result<BTreeMap<String, PathBuf>, GatewayInventoryError> {
     let mut paths = BTreeMap::new();
     for fact in storage {
-        let mount = workspace_mountpoint(
-            layout,
-            config.checkout_layout,
-            &config.checkout_path,
-            fact.workspace.name(),
-        )?;
+        let mount = workspace_mountpoint(layout, &config.checkout_path, fact.workspace.name())?;
         paths.insert(fact.volume_key.clone(), mount);
     }
     Ok(paths)
 }
 
-/// Where one workspace of one project mounts.
-///
-/// Main's path follows the project's checkout layout — the adopted checkout itself under direct
-/// mount, the uniform `mnt/` path under the symlink layout. Every other workspace mounts under
-/// `mnt/` either way. One rule, because the read-only fact pass and the always-mounted check both
-/// need it and a project whose two answers disagreed would be reported as broken by whichever
+/// Where one workspace of one project mounts: main at the adopted checkout, every other workspace
+/// under `mnt/`. One rule, because the read-only fact pass and the always-mounted check both need
+/// it and a project whose two answers disagreed would be reported as broken by whichever
 /// derivation ran second.
 fn workspace_mountpoint(
     layout: &StorageLayout,
-    checkout_layout: CheckoutLayout,
     checkout_path: &Path,
     workspace: &WorkspaceName,
 ) -> Result<PathBuf, GatewayInventoryError> {
     layout
-        .main_aware_workspace_mount(checkout_layout, checkout_path, workspace)
+        .main_aware_workspace_mount(checkout_path, workspace)
         .map_err(|error| GatewayInventoryError::InvalidMetadata {
             path: layout.project().mount_root.clone(),
             message: error.to_string(),
@@ -1741,8 +1684,8 @@ mod tests {
     use std::sync::Mutex;
 
     use crate::metadata::{
-        CheckoutLayout, MACOS_PORT_MIN, NEW_PORT_BLOCK_SIZE, Platform, SIDECAR_VERSION,
-        WorkspaceInfoSnapshot, WorkspaceRole, write_json,
+        MACOS_PORT_MIN, NEW_PORT_BLOCK_SIZE, Platform, SIDECAR_VERSION, WorkspaceInfoSnapshot,
+        WorkspaceRole, write_json,
     };
     use crate::repository::{BoundIdentity, RepositoryBinding};
     use crate::storage::CheckpointLabel;
@@ -1791,16 +1734,11 @@ mod tests {
     struct Fixture {
         root: PathBuf,
         storage: ValidatedHostStorage,
-        checkout_layout: CheckoutLayout,
         port_blocks: Cell<FixturePortBlocks>,
     }
 
     impl Fixture {
         fn new(label: &str) -> Self {
-            Self::with_checkout_layout(label, CheckoutLayout::Symlink)
-        }
-
-        fn with_checkout_layout(label: &str, checkout_layout: CheckoutLayout) -> Self {
             let root = std::env::temp_dir().join(format!(
                 "cowshed-gateway-inventory-{label}-{}",
                 uuid::Uuid::new_v4()
@@ -1814,7 +1752,6 @@ mod tests {
             Self {
                 root,
                 storage: ValidatedHostStorage::new(home, roots),
-                checkout_layout,
                 port_blocks: Cell::new(FixturePortBlocks::Grid(MACOS_PORT_MIN)),
             }
         }
@@ -1859,12 +1796,6 @@ mod tests {
             }])
             .expect("binding");
             write_json(&paths.repository_binding, &binding).expect("binding file");
-            // Adopt records the layout, so a fixture project that omitted it would be exercising a
-            // corrupted project rather than a healthy one.
-            StorageLayout::new(self.storage.store(), repo)
-                .expect("layout")
-                .record_checkout_layout(self.checkout_layout)
-                .expect("checkout layout record");
         }
 
         fn workspace(
@@ -1874,7 +1805,6 @@ mod tests {
             incarnation: &str,
             revision: u64,
             mounted: bool,
-            persist_main_root: bool,
         ) -> (StorageFact, Option<(KernelMountFact, PathBuf)>) {
             let layout = StorageLayout::new(self.storage.store(), repo).expect("layout");
             let role = if name.is_main() {
@@ -1897,12 +1827,12 @@ mod tests {
                 .expect("image parent");
             fs::write(image.image(), b"fixture").expect("image");
             let checkout = self.root.join(format!("checkout-{}", repo.repo()));
-            if name.is_main() && persist_main_root {
+            if name.is_main() {
                 fs::create_dir_all(&checkout).expect("adopted checkout");
             }
-            // Same derivation production uses in `expected_mount_paths`: main follows the project's
-            // checkout layout, every other workspace mounts under `mnt/` either way.
-            let mount = if name.is_main() && self.checkout_layout.mounts_at_checkout() {
+            // Same derivation production uses in `expected_mount_paths`: main mounts at the
+            // checkout, every other workspace under `mnt/`.
+            let mount = if name.is_main() {
                 checkout.clone()
             } else {
                 layout.workspace_mount(&name).expect("workspace mount")
@@ -1910,22 +1840,21 @@ mod tests {
             let port_block = self.take_port_block();
             let mut grants = GrantSet::closed_baseline(Some(port_block)).expect("grants");
             grants.revision = revision;
-            let info_snapshot =
-                (!name.is_main() || persist_main_root).then(|| WorkspaceInfoSnapshot {
-                    project_root: if name.is_main() {
-                        checkout.clone()
-                    } else {
-                        mount.clone()
-                    },
-                    role,
-                    base_commit: "0123456789abcdef0123456789abcdef01234567".to_owned(),
-                    branch: Some("main".to_owned()),
-                    created_at: "2026-07-14T00:00:00Z".to_owned(),
-                    forked_from: None,
-                    captured_at: "2026-07-14T00:00:00Z".to_owned(),
-                    stale: false,
-                    git_worktree: false,
-                });
+            let info_snapshot = WorkspaceInfoSnapshot {
+                project_root: if name.is_main() {
+                    checkout.clone()
+                } else {
+                    mount.clone()
+                },
+                role,
+                base_commit: "0123456789abcdef0123456789abcdef01234567".to_owned(),
+                branch: Some("main".to_owned()),
+                created_at: "2026-07-14T00:00:00Z".to_owned(),
+                forked_from: None,
+                captured_at: "2026-07-14T00:00:00Z".to_owned(),
+                stale: false,
+                git_worktree: false,
+            };
             DetachedWorkspaceMetadata {
                 version: SIDECAR_VERSION,
                 repo_id: repo.clone(),
@@ -2095,7 +2024,6 @@ mod tests {
                 WorkspaceName::new("main").expect("main"),
                 incarnation,
                 7,
-                true,
                 true,
             );
             let (mount, path) = mounted.expect("mounted fixture");
@@ -2282,7 +2210,7 @@ mod tests {
 
     #[tokio::test]
     async fn store_wide_listing_includes_a_project_whose_direct_mounted_main_path_is_gone() {
-        let fixture = Fixture::with_checkout_layout("list-stale-main", CheckoutLayout::DirectMount);
+        let fixture = Fixture::new("list-stale-main");
         let valid_repo = RepoId::parse("acme/valid").expect("valid repo");
         let stale_repo = RepoId::parse("acme/stale").expect("stale repo");
         fixture.bind(&valid_repo);
@@ -2294,7 +2222,6 @@ mod tests {
             "00000000000000000000000000000001",
             3,
             true,
-            true,
         );
         let (valid_mount, valid_path) = valid_mounted.expect("valid main mounted");
         let (stale_storage, stale_mounted) = fixture.workspace(
@@ -2303,7 +2230,6 @@ mod tests {
             "00000000000000000000000000000002",
             4,
             false,
-            true,
         );
         assert!(stale_mounted.is_none());
         let stale_path = fixture.root.join("checkout-stale");
@@ -2382,7 +2308,6 @@ mod tests {
             "00000000000000000000000000000001",
             4,
             true,
-            true,
         );
         let (mount, path) = mounted.expect("mounted fixture");
         let source = Arc::new(FixtureSource::default());
@@ -2440,7 +2365,7 @@ mod tests {
     /// whole point of writing it at adopt time.
     #[tokio::test]
     async fn a_direct_mount_project_serves_main_at_the_adopted_checkout() {
-        let fixture = Fixture::with_checkout_layout("direct-mount", CheckoutLayout::DirectMount);
+        let fixture = Fixture::new("direct-mount");
         let repo = RepoId::parse("example-org/example-app").expect("repo");
         fixture.bind(&repo);
         let (storage, mounted) = fixture.workspace(
@@ -2448,7 +2373,6 @@ mod tests {
             WorkspaceName::new("main").expect("main"),
             "00000000000000000000000000000001",
             3,
-            true,
             true,
         );
         let (mount, path) = mounted.expect("mounted fixture");
@@ -2479,88 +2403,6 @@ mod tests {
         assert_eq!(facts[0].mount_id, mount.mount_id);
     }
 
-    /// An adopted project holding a main image but no `checkout-layout.json` is refused, not
-    /// inferred.
-    ///
-    /// Only the symlink layout ever creates `mnt/<owner>/<repo>/main`, so its absence is either a
-    /// legacy direct-mount adoption or a detached symlink-layout project whose mountpoint `gc`
-    /// removed. Those two answers put main in different places, and guessing wrong points every
-    /// resolver — mount, credentials, gateway session — at a path the volume is not on. The record
-    /// is the only thing that distinguishes them, so its absence is the defect to report.
-    #[tokio::test]
-    async fn an_adopted_project_with_no_layout_record_is_refused_rather_than_inferred() {
-        let fixture =
-            Fixture::with_checkout_layout("unrecorded-layout", CheckoutLayout::DirectMount);
-        let repo = RepoId::parse("example-org/example-app").expect("repo");
-        fixture.bind(&repo);
-        let (storage, mounted) = fixture.workspace(
-            &repo,
-            WorkspaceName::new("main").expect("main"),
-            "00000000000000000000000000000001",
-            3,
-            true,
-            true,
-        );
-        let layout = StorageLayout::new(fixture.storage.store(), &repo).expect("layout");
-        fs::remove_file(&layout.project().checkout_layout).expect("simulate legacy adoption");
-        let (mount, path) = mounted.expect("mounted fixture");
-        let source = Arc::new(FixtureSource::default());
-        source.projects.lock().expect("source").insert(
-            repo.clone(),
-            ProjectInventoryFacts {
-                storage: vec![storage],
-                mounts: vec![mount.clone()],
-                checkpoints: Vec::new(),
-                mount_paths: BTreeMap::from([(mount.volume_key, path)]),
-            },
-        );
-        let inventory = NativeGatewayInventory::with_source(
-            fixture.storage.clone(),
-            source as Arc<dyn InventorySource>,
-        );
-
-        let error = inventory
-            .project_attached(&repo)
-            .await
-            .expect_err("an unrecorded layout is not a direct mount");
-        let message = error.to_string();
-        assert!(
-            message.contains("records no checkout layout"),
-            "the refusal must name the missing record: {message}"
-        );
-        // Nothing was materialized: a reader that cannot tell must not leave a guess behind for
-        // the next reader to trust.
-        assert!(!layout.project().checkout_layout.exists());
-    }
-
-    #[tokio::test]
-    async fn a_malformed_checkout_layout_never_gets_reinterpreted_as_direct_mount() {
-        let fixture =
-            Fixture::with_checkout_layout("malformed-layout", CheckoutLayout::DirectMount);
-        let repo = RepoId::parse("example-org/example-app").expect("repo");
-        fixture.bind(&repo);
-        let layout = StorageLayout::new(fixture.storage.store(), &repo).expect("layout");
-        fs::write(&layout.project().checkout_layout, b"{not json").expect("malformed layout");
-        let inventory = NativeGatewayInventory::with_source(
-            fixture.storage.clone(),
-            Arc::new(FixtureSource::default()),
-        );
-
-        let error = inventory
-            .project_attached(&repo)
-            .await
-            .expect_err("malformed present metadata fails closed");
-        assert!(matches!(
-            error,
-            GatewayInventoryError::InvalidMetadata { path, .. }
-                if path == layout.project().checkout_layout
-        ));
-        assert_eq!(
-            fs::read(&layout.project().checkout_layout).expect("malformed record remains"),
-            b"{not json"
-        );
-    }
-
     #[tokio::test]
     async fn retired_main_snapshot_recovers_its_exact_project_root_binding() {
         let fixture = Fixture::new("retired-root");
@@ -2572,7 +2414,6 @@ mod tests {
             "00000000000000000000000000000001",
             4,
             false,
-            true,
         );
         let layout = StorageLayout::new(fixture.storage.store(), &repo).expect("layout");
         let canonical =
@@ -2628,7 +2469,6 @@ mod tests {
             "00000000000000000000000000000001",
             4,
             false,
-            true,
         );
         let stale = fixture.root.join("checkout-before-move");
         fs::create_dir_all(&stale).expect("stale checkout");
@@ -2656,35 +2496,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn detached_and_legacy_main_facts_never_become_sessions() {
+    async fn detached_facts_never_become_sessions() {
         let fixture = Fixture::new("excluded");
         let repo = RepoId::parse("acme/widget").expect("repo");
         fixture.bind(&repo);
-        let (legacy, mounted) = fixture.workspace(
-            &repo,
-            WorkspaceName::new("main").expect("main"),
-            "00000000000000000000000000000001",
-            4,
-            true,
-            false,
-        );
         let (detached, _) = fixture.workspace(
             &repo,
             WorkspaceName::session("raven").expect("session"),
             "00000000000000000000000000000002",
             5,
             false,
-            true,
         );
-        let (mount, path) = mounted.expect("legacy main mount");
         let source = Arc::new(FixtureSource {
             projects: Mutex::new(BTreeMap::from([(
                 repo.clone(),
                 ProjectInventoryFacts {
-                    storage: vec![legacy, detached],
-                    mounts: vec![mount.clone()],
+                    storage: vec![detached],
+                    mounts: Vec::new(),
                     checkpoints: Vec::new(),
-                    mount_paths: BTreeMap::from([(mount.volume_key, path)]),
+                    mount_paths: BTreeMap::new(),
                 },
             )])),
         });
@@ -2712,7 +2542,6 @@ mod tests {
             WorkspaceName::new("main").expect("main"),
             "00000000000000000000000000000001",
             9,
-            true,
             true,
         );
         let (mount, path) = mounted.expect("mount");
@@ -3004,7 +2833,6 @@ mod tests {
             "00000000000000000000000000000001",
             3,
             false,
-            true,
         );
         let layout = StorageLayout::new(fixture.storage.store(), &repo).expect("layout");
         let duplicate = layout.main_image(ImageFormat::Asif).expect("asif paths");
@@ -3028,7 +2856,7 @@ mod tests {
     /// both the volume that should be mounted and the directory the user is looking at.
     #[tokio::test]
     async fn unmounted_mains_name_their_image_and_mountpoint() {
-        let fixture = Fixture::with_checkout_layout("unmounted-mains", CheckoutLayout::DirectMount);
+        let fixture = Fixture::new("unmounted-mains");
         let detached = RepoId::parse("acme/alpha").expect("repo alpha");
         let served = RepoId::parse("acme/beta").expect("repo beta");
         let source = Arc::new(FixtureSource::default());
@@ -3040,7 +2868,6 @@ mod tests {
                 "00000000000000000000000000000001",
                 3,
                 mounted,
-                true,
             );
             let (mounts, mount_paths) = match kernel {
                 Some((mount, path)) => (

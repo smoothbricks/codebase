@@ -24,8 +24,7 @@ use std::path::{Path, PathBuf};
 
 use crate::api::dto::GitOid;
 use crate::metadata::{
-    CheckoutLayoutRecord, DetachedWorkspaceMetadata, PublicationState, WorkspaceMarker,
-    WorkspaceName, sidecar_path,
+    DetachedWorkspaceMetadata, PublicationState, WorkspaceMarker, WorkspaceName, sidecar_path,
 };
 use crate::repository::RepoId;
 use crate::runtime::supervisor::{WorkspaceAuthoritySnapshot, WorkspaceSupervisorHandle};
@@ -227,10 +226,8 @@ pub async fn resolve(
     drop(journal_span);
 
     let workspace_span = crate::timing::span("resident", "workspace");
-    let checkout = crate::metadata::read_json::<CheckoutLayoutRecord>(&project.checkout_layout)
-        .map_err(|_| Decline::Records)?;
     let mount = layout
-        .main_aware_workspace_mount(checkout.checkout_layout, &origin.project_root, workspace)
+        .main_aware_workspace_mount(&origin.project_root, workspace)
         .map_err(|_| Decline::Records)?;
     if !probe.mounted_at(&mount) {
         return Err(Decline::NotMounted);
@@ -244,11 +241,7 @@ pub async fn resolve(
         return Err(Decline::StaleMount);
     }
     let metadata = current_metadata(store_root, &layout, &marker)?;
-    if metadata
-        .info_snapshot
-        .as_ref()
-        .is_some_and(|info| info.git_worktree)
-    {
+    if metadata.info_snapshot.git_worktree {
         return Err(Decline::GitWorktree);
     }
     // The invocation root must itself be a live workspace, as the controller's origin check
@@ -256,12 +249,9 @@ pub async fn resolve(
     if origin.workspace != *workspace {
         current_metadata(store_root, &layout, &origin)?;
     }
-    let base_commit = metadata
-        .info_snapshot
-        .as_ref()
-        .map(|info| GitOid::new(info.base_commit.clone()))
-        .transpose()
-        .map_err(|_| Decline::Records)?;
+    let base_commit = Some(
+        GitOid::new(metadata.info_snapshot.base_commit.clone()).map_err(|_| Decline::Records)?,
+    );
 
     // The revision a supervisor serves covers the project's standing grants too.
     let policy = crate::project_policy::ProjectPolicy::read(&project.policy)
@@ -343,9 +333,8 @@ fn current_metadata(
 mod tests {
     use super::*;
     use crate::metadata::{
-        CheckoutLayout, GrantSet, ImageFormat, MARKER_VERSION, NEW_PORT_BLOCK_SIZE, Platform,
-        PortBlock, SIDECAR_VERSION, WorkspaceIncarnation, WorkspaceInfoSnapshot, WorkspaceRole,
-        write_json,
+        GrantSet, ImageFormat, MARKER_VERSION, NEW_PORT_BLOCK_SIZE, Platform, PortBlock,
+        SIDECAR_VERSION, WorkspaceIncarnation, WorkspaceInfoSnapshot, WorkspaceRole, write_json,
     };
     use crate::storage::recovery::{
         LIFECYCLE_INTENTS_FILE, LifecycleIntent, LifecycleIntentJournal,
@@ -404,11 +393,6 @@ mod tests {
             let layout = StorageLayout::new(&store, &repo()).expect("layout");
             let project = layout.project().clone();
             std::fs::create_dir_all(&project.sessions).expect("sessions");
-            write_json(
-                &project.checkout_layout,
-                &CheckoutLayoutRecord::new(CheckoutLayout::DirectMount),
-            )
-            .expect("checkout layout");
             let raven_mount = layout.workspace_mount(&raven()).expect("mount path");
             let fixture = Self {
                 root,
@@ -461,7 +445,7 @@ mod tests {
                 publication_state: PublicationState::Active,
                 updated_at: "2026-07-14T00:00:00Z".to_owned(),
                 grants,
-                info_snapshot: Some(WorkspaceInfoSnapshot {
+                info_snapshot: WorkspaceInfoSnapshot {
                     project_root: self.checkout.clone(),
                     role: WorkspaceRole::for_name(name),
                     base_commit: "0123456789abcdef0123456789abcdef01234567".to_owned(),
@@ -471,7 +455,7 @@ mod tests {
                     captured_at: "2026-07-14T00:00:00Z".to_owned(),
                     stale: false,
                     git_worktree: false,
-                }),
+                },
             }
             .write_for_image(&image)
             .expect("sidecar");

@@ -697,19 +697,6 @@ fn volume_action(storage: &ExistingStorage) -> &'static str {
         } => "mounted",
     }
 }
-fn repair_mountpoint(storage: &ExistingStorage) -> Option<&Path> {
-    match storage {
-        ExistingStorage::MisMountedIncomplete {
-            current_mountpoint, ..
-        } => Some(current_mountpoint),
-        ExistingStorage::FoundElsewhere {
-            mounted_at: Some(mounted_at),
-            ..
-        } => Some(mounted_at),
-        _ => None,
-    }
-}
-
 fn build_host_actions(
     volumes: &[ClassifiedVolume],
     fstab: &PlannedFstab,
@@ -729,25 +716,8 @@ fn build_host_actions(
             paths: reclaimable_stubs,
         });
     }
-    // The retired layout mounted caches beneath store. Unmount descendants before ancestors so
-    // one authorization session can migrate both volumes without a nested mount blocking store.
-    let mut ordered_volumes = volumes.iter().collect::<Vec<_>>();
-    ordered_volumes.sort_by(|left, right| {
-        match (
-            repair_mountpoint(&left.storage),
-            repair_mountpoint(&right.storage),
-        ) {
-            (Some(left), Some(right)) if left != right && left.starts_with(right) => {
-                std::cmp::Ordering::Less
-            }
-            (Some(left), Some(right)) if left != right && right.starts_with(left) => {
-                std::cmp::Ordering::Greater
-            }
-            _ => std::cmp::Ordering::Equal,
-        }
-    });
     let mut encrypt_actions = Vec::new();
-    for volume in ordered_volumes {
+    for volume in volumes {
         let existing_identity = || {
             let uuid = volume.volume_uuid.clone().ok_or_else(|| {
                 NativeBootstrapError::MalformedPlist(format!(
@@ -3204,16 +3174,13 @@ fn inspect_system_mountpoint(path: &Path) -> Result<MountpointState, HostError> 
 /// disposable residue; `None` means something real lives there and the mountpoint
 /// stays fail-closed masked.
 ///
-/// Beyond launchd/telemetry stubs and empty scaffolding, two writers race the
-/// store mount and plant regenerable state on the bare Data volume: the
-/// `dev.cowshed.sccache` LaunchAgent binds its socket and creates its cache
-/// directory before the volumes are remounted, and the gateway's project heal
-/// creates `mnt/` mountpoint parents. Treating those as a mask wedges the host
-/// permanently — the gateway crash-loops on exit 5 and no verb can repair it —
-/// so an idle daemon socket, the sccache compile cache (disposable by
-/// contract), directory-only `mnt/` scaffolding, and a `caches/` mountpoint
-/// holding only such residue are reclaimable. One foreign entry anywhere keeps
-/// the masked verdict.
+/// Beyond empty scaffolding, two writers race the store mount and plant regenerable state on the
+/// bare Data volume: the `dev.cowshed.sccache` LaunchAgent binds its socket and creates its cache
+/// directory before the volumes are remounted, and the gateway's project heal creates `mnt/`
+/// mountpoint parents. Treating those as a mask wedges the host permanently — the gateway
+/// crash-loops on exit 5 and no verb can repair it — so an idle daemon socket, the sccache compile
+/// cache (disposable by contract) and directory-only `mnt/` scaffolding are reclaimable. One
+/// foreign entry anywhere keeps the masked verdict.
 fn reclaimable_stub_paths(path: &Path) -> Result<Option<Vec<PathBuf>>, HostError> {
     let mut paths = Vec::new();
     for entry in fs::read_dir(path)
@@ -3228,8 +3195,6 @@ fn reclaimable_stub_paths(path: &Path) -> Result<Option<Vec<PathBuf>>, HostError
             .map_err(|source| host_io_error("inspect mountpoint entry", &entry_path, source))?;
         let safe = if name == ".DS_Store" {
             file_type.is_file()
-        } else if name == "telemetry" && file_type.is_dir() {
-            is_reclaimable_telemetry_dir(&entry_path)?
         } else if name == "sccache.sock" {
             // The daemon rebinds on start; an existing socket file is never load-bearing.
             std::os::unix::fs::FileTypeExt::is_socket(&file_type)
@@ -3239,11 +3204,6 @@ fn reclaimable_stub_paths(path: &Path) -> Result<Option<Vec<PathBuf>>, HostError
         } else if name == "mnt" && file_type.is_dir() {
             // Workspace mountpoint scaffolding: directories all the way down, nothing else.
             is_directory_only_tree(&entry_path)?
-        } else if name == "caches" && file_type.is_dir() {
-            // The caches-volume mountpoint nests under the store root, so residue that
-            // masks the store usually masks it too; the same whitelist judges its
-            // contents, and an empty directory is trivially safe.
-            is_empty_directory(&entry_path)? || reclaimable_stub_paths(&entry_path)?.is_some()
         } else if file_type.is_dir() {
             is_empty_directory(&entry_path)?
         } else {
@@ -3282,26 +3242,6 @@ fn is_directory_only_tree(path: &Path) -> Result<bool, HostError> {
             .file_type()
             .map_err(|source| host_io_error("inspect scaffold entry", &entry.path(), source))?;
         if !file_type.is_dir() || !is_directory_only_tree(&entry.path())? {
-            return Ok(false);
-        }
-    }
-    Ok(true)
-}
-
-fn is_reclaimable_telemetry_dir(path: &Path) -> Result<bool, HostError> {
-    for entry in
-        fs::read_dir(path).map_err(|source| host_io_error("read telemetry stub", path, source))?
-    {
-        let entry =
-            entry.map_err(|source| host_io_error("read telemetry stub entry", path, source))?;
-        let name = entry.file_name();
-        if name != "daemon-stderr.log" && name != "sccache-stderr.log" {
-            return Ok(false);
-        }
-        let file_type = entry.file_type().map_err(|source| {
-            host_io_error("inspect telemetry stub entry", &entry.path(), source)
-        })?;
-        if !file_type.is_file() {
             return Ok(false);
         }
     }
@@ -3812,45 +3752,6 @@ mod tests {
                 ),
             },
         );
-        source
-    }
-
-    fn retired_home_source() -> FakeEvidenceSource {
-        let retired_store = PathBuf::from("/Users/alice/.cowshed");
-        let retired_caches = retired_store.join("caches");
-        let volumes = volume("Data", "disk3s5", Some("/System/Volumes/Data"))
-            + &volume(
-                APFS_STORE_VOLUME,
-                "disk3s8",
-                Some(retired_store.to_str().unwrap()),
-            )
-            + &volume(
-                APFS_CACHES_VOLUME,
-                "disk3s9",
-                Some(retired_caches.to_str().unwrap()),
-            );
-        let mut source = healthy_existing_source();
-        source.command_output = HostCommandOutput::success(plist(&container("disk3", &volumes)));
-        source
-            .mountpoints
-            .insert(PathBuf::from(STORE_ROOT), MountpointState::Missing);
-        source
-            .mountpoints
-            .insert(PathBuf::from(CACHES_ROOT), MountpointState::Missing);
-        source.mounted_volumes.remove(Path::new(STORE_ROOT));
-        source.mounted_volumes.remove(Path::new(CACHES_ROOT));
-        for (path, identifier) in [(retired_store, "disk3s8"), (retired_caches, "disk3s9")] {
-            source.mounted_volumes.insert(
-                path.clone(),
-                MountedVolumeEvidence {
-                    exact_identifier: identifier.to_owned(),
-                    mountpoint: path,
-                    nobrowse: true,
-                    uid: 501,
-                    gid: 20,
-                },
-            );
-        }
         source
     }
 
@@ -4445,7 +4346,7 @@ mod tests {
         source.mountpoints.insert(
             PathBuf::from("/private/cowshed/store"),
             MountpointState::ReclaimableStub {
-                paths: vec![PathBuf::from("/private/cowshed/store/telemetry")],
+                paths: vec![PathBuf::from("/private/cowshed/store/sccache.sock")],
             },
         );
         source.mounted_volumes.insert(
@@ -4520,7 +4421,7 @@ mod tests {
         source.mountpoints.insert(
             PathBuf::from("/private/cowshed/store"),
             MountpointState::ReclaimableStub {
-                paths: vec![PathBuf::from("/private/cowshed/store/telemetry")],
+                paths: vec![PathBuf::from("/private/cowshed/store/sccache.sock")],
             },
         );
         source.mounted_volumes.insert(
@@ -4564,7 +4465,7 @@ mod tests {
             MountpointState::ReclaimableStub {
                 paths: vec![
                     PathBuf::from("/private/cowshed/caches"),
-                    PathBuf::from("/private/cowshed/store/telemetry"),
+                    PathBuf::from("/private/cowshed/store/sccache.sock"),
                 ],
             },
         );
@@ -4576,7 +4477,7 @@ mod tests {
             Some(&HostAction::ReclaimStubs {
                 paths: vec![
                     PathBuf::from("/private/cowshed/caches"),
-                    PathBuf::from("/private/cowshed/store/telemetry"),
+                    PathBuf::from("/private/cowshed/store/sccache.sock"),
                 ],
             })
         );
@@ -5496,56 +5397,6 @@ mod tests {
         assert_eq!(host.mutation_calls.load(Ordering::SeqCst), 0);
         assert_eq!(lane.dispatches.load(Ordering::SeqCst), 0);
     }
-    #[test]
-    fn retired_home_mounts_are_remounted_child_first_and_repin_global_roots() {
-        let mut source = retired_home_source();
-        let snapshot = prepare_setup_snapshot(&mut source, Path::new("/Users/alice"), "")
-            .expect("retired home layout has one-session migration plan");
-
-        let repairs = snapshot
-            .actions
-            .iter()
-            .filter_map(|action| match action {
-                HostAction::RepairMounted {
-                    name,
-                    mounted_at,
-                    mount_at,
-                    ..
-                } => Some((name.as_str(), mounted_at.as_path(), mount_at.as_path())),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(
-            repairs,
-            [
-                (
-                    APFS_CACHES_VOLUME,
-                    Path::new("/Users/alice/.cowshed/caches"),
-                    Path::new(CACHES_ROOT),
-                ),
-                (
-                    APFS_STORE_VOLUME,
-                    Path::new("/Users/alice/.cowshed"),
-                    Path::new(STORE_ROOT),
-                ),
-            ]
-        );
-        assert!(matches!(
-            &snapshot.fstab,
-            PlannedFstab::NeedsPin(pins)
-                if pins.iter().any(|pin| pin.mountpoint == Path::new(STORE_ROOT))
-                    && pins.iter().any(|pin| pin.mountpoint == Path::new(CACHES_ROOT))
-        ));
-
-        let findings = read_only_validation_actions(&snapshot.plan).join("\n");
-        assert!(findings.contains(
-            "cowshed.store is mounted at /Users/alice/.cowshed instead of /private/cowshed/store"
-        ));
-        assert!(findings.contains(
-            "cowshed.caches is mounted at /Users/alice/.cowshed/caches instead of /private/cowshed/caches"
-        ));
-        assert!(findings.contains("cowshed setup will remount it and rewrite its /etc/fstab pin"));
-    }
 
     #[test]
     fn volume_absent_from_inventory_and_mountpoint_info_requires_provisioning() {
@@ -6030,23 +5881,17 @@ UUID=CACHES /private/cowshed/caches apfs rw # cowshed created volume labelled co
     }
 
     #[test]
-    fn reclaimable_stub_inventory_enumerates_only_known_logs_and_empty_directories() {
+    fn reclaimable_stub_inventory_enumerates_only_finder_metadata_and_empty_directories() {
         let directory =
             std::env::temp_dir().join(format!("cowshed-reclaimable-test-{}", Uuid::new_v4()));
-        let caches = directory.join("caches");
-        let telemetry = directory.join("telemetry");
-        fs::create_dir_all(&caches).unwrap();
-        fs::create_dir_all(&telemetry).unwrap();
-        fs::write(telemetry.join("daemon-stderr.log"), b"").unwrap();
+        let empty = directory.join("empty");
+        fs::create_dir_all(&empty).unwrap();
         fs::write(directory.join(".DS_Store"), b"metadata").unwrap();
 
         let paths = reclaimable_stub_paths(&directory)
             .expect("inspect safe stubs")
             .expect("safe stubs");
-        assert_eq!(
-            paths,
-            vec![directory.join(".DS_Store"), caches, telemetry.clone()]
-        );
+        assert_eq!(paths, vec![directory.join(".DS_Store"), empty]);
 
         fs::write(directory.join("user-data"), b"precious").unwrap();
         assert_eq!(
@@ -6071,25 +5916,28 @@ UUID=CACHES /private/cowshed/caches apfs rw # cowshed created volume labelled co
             .join(format!("cowshed-residue-{}", Uuid::new_v4().simple()));
         fs::create_dir(&root).unwrap();
 
-        // Daemon socket, workspace mountpoint scaffolding, compile cache, telemetry stub.
+        // Daemon socket, workspace mountpoint scaffolding, compile cache.
         std::os::unix::net::UnixListener::bind(root.join("sccache.sock")).unwrap();
         fs::create_dir_all(root.join("mnt/acme/widget/slot@1")).unwrap();
-        fs::create_dir_all(root.join("caches/sccache/0")).unwrap();
-        fs::write(root.join("caches/sccache/0/entry.bin"), b"cache").unwrap();
-        fs::create_dir(root.join("telemetry")).unwrap();
-        fs::write(root.join("telemetry/daemon-stderr.log"), b"").unwrap();
+        fs::create_dir_all(root.join("sccache/0")).unwrap();
+        fs::write(root.join("sccache/0/entry.bin"), b"cache").unwrap();
         let paths = reclaimable_stub_paths(&root)
             .expect("inspect residue")
             .expect("residue is reclaimable");
         assert_eq!(
             paths,
             vec![
-                root.join("caches"),
                 root.join("mnt"),
+                root.join("sccache"),
                 root.join("sccache.sock"),
-                root.join("telemetry"),
             ]
         );
+
+        // A directory the whitelist does not name is scaffolding only while empty.
+        fs::create_dir(root.join("telemetry")).unwrap();
+        fs::write(root.join("telemetry/daemon-stderr.log"), b"").unwrap();
+        assert_eq!(reclaimable_stub_paths(&root).expect("inspect data"), None);
+        fs::remove_dir_all(root.join("telemetry")).unwrap();
 
         // A regular file inside mnt/ is data, not scaffolding: fail closed.
         fs::write(root.join("mnt/acme/widget/notes.txt"), b"mine").unwrap();

@@ -15,9 +15,9 @@ use cowshed_cli::mount_main::{
 };
 use cowshed_cli::output::Output;
 use cowshed_core::metadata::{
-    CheckoutLayout, DetachedWorkspaceMetadata, GrantSet, ImageFormat, Platform, PublicationState,
-    SIDECAR_VERSION, WorkspaceIncarnation, WorkspaceInfoSnapshot, WorkspaceName, WorkspaceRole,
-    read_json, write_json,
+    DetachedWorkspaceMetadata, GrantSet, ImageFormat, Platform, PublicationState, SIDECAR_VERSION,
+    WorkspaceIncarnation, WorkspaceInfoSnapshot, WorkspaceName, WorkspaceRole, read_json,
+    write_json,
 };
 use cowshed_core::repository::{BoundIdentity, RepoId, RepositoryBinding};
 use cowshed_core::storage::StorageLayout;
@@ -60,11 +60,10 @@ impl Fixture {
         Self { root, store }
     }
 
-    /// An adopted project whose checkout is the given directory: binding,
-    /// layout record, and the main image sidecar carrying the checkout-path
-    /// record. The checkout directory itself is left exactly as the caller
+    /// An adopted project whose checkout is the given directory: binding and
+    /// the main image sidecar carrying the checkout-path record. The checkout directory itself is left exactly as the caller
     /// made it — usually an empty stub with no git repository.
-    fn bind_main(&self, repo: &RepoId, checkout: &Path, layout: CheckoutLayout) {
+    fn bind_main(&self, repo: &RepoId, checkout: &Path) {
         let paths = StorageLayout::new(&self.store, repo)
             .expect("project paths")
             .project()
@@ -78,10 +77,6 @@ impl Fixture {
         }])
         .expect("binding");
         write_json(&paths.repository_binding, &binding).expect("binding file");
-        StorageLayout::new(&self.store, repo)
-            .expect("layout")
-            .record_checkout_layout(layout)
-            .expect("checkout layout record");
         // The binding just written is the one resolution must read back.
         let round_trip: RepositoryBinding =
             read_json(&paths.repository_binding).expect("binding round trip");
@@ -109,7 +104,7 @@ impl Fixture {
             publication_state: PublicationState::Active,
             updated_at: "2026-07-14T00:00:00Z".to_owned(),
             grants: GrantSet::closed_baseline(None).expect("grants"),
-            info_snapshot: Some(WorkspaceInfoSnapshot {
+            info_snapshot: WorkspaceInfoSnapshot {
                 project_root: checkout.to_owned(),
                 role: WorkspaceRole::Main,
                 base_commit: "0123456789abcdef0123456789abcdef01234567".to_owned(),
@@ -119,13 +114,13 @@ impl Fixture {
                 captured_at: "2026-07-14T00:00:00Z".to_owned(),
                 stale: false,
                 git_worktree: false,
-            }),
+            },
         }
         .write_for_image(&image)
         .expect("sidecar");
     }
 
-    /// Bind the repository record and layout only: no main image, so no
+    /// Bind the repository record only: no main image, so no
     /// checkout-path record.
     fn bind_without_checkout_record(&self, repo: &RepoId) {
         let paths = StorageLayout::new(&self.store, repo)
@@ -141,10 +136,6 @@ impl Fixture {
         }])
         .expect("binding");
         write_json(&paths.repository_binding, &binding).expect("binding file");
-        StorageLayout::new(&self.store, repo)
-            .expect("layout")
-            .record_checkout_layout(CheckoutLayout::DirectMount)
-            .expect("checkout layout record");
     }
 }
 
@@ -193,7 +184,7 @@ impl MainMountBackend for FakeBackend {
         }
         calls.push(format!("browse:{}", intent.browse));
         calls.push(format!("mount:{}", resolved.repo_id));
-        Ok(resolved.mountpoint.clone())
+        Ok(resolved.checkout_path.clone())
     }
 }
 
@@ -265,7 +256,7 @@ async fn resolves_main_by_repo_id_from_empty_stub_without_git() {
         !stub.join(".git").exists(),
         "the stub must carry no git repository"
     );
-    fixture.bind_main(&repo(), &stub, CheckoutLayout::DirectMount);
+    fixture.bind_main(&repo(), &stub);
 
     // Run from inside the stub so any cwd- or git-dependent resolution fails.
     let restore = std::env::current_dir().expect("a current directory");
@@ -275,12 +266,7 @@ async fn resolves_main_by_repo_id_from_empty_stub_without_git() {
     let resolved = resolved.expect("resolution from the stub");
 
     assert_eq!(resolved.repo_id, repo());
-    assert_eq!(resolved.checkout_path, stub);
-    assert_eq!(
-        resolved.mountpoint, stub,
-        "a direct mount lives at its checkout"
-    );
-    assert_eq!(resolved.checkout_layout, CheckoutLayout::DirectMount);
+    assert_eq!(resolved.checkout_path, stub, "main mounts at its checkout");
     assert!(
         !resolved.images.is_empty(),
         "resolution reports the canonical main image it read"
@@ -357,28 +343,12 @@ fn foreign_binding_is_refused() {
     );
 }
 
-#[test]
-fn symlink_layout_mounts_under_mount_root() {
-    let fixture = Fixture::new("symlink");
-    let stub = fixture.root.join("checkout");
-    fs::create_dir_all(&stub).expect("stub checkout");
-    fixture.bind_main(&repo(), &stub, CheckoutLayout::Symlink);
-
-    let resolved = resolve_main_mount(&fixture.store, &repo()).expect("resolution");
-    assert_eq!(resolved.checkout_path, stub);
-    assert!(
-        resolved.mountpoint.ends_with(Path::new("acme/widget/main")),
-        "a symlink-layout main mounts under the mount root: {}",
-        resolved.mountpoint.display()
-    );
-}
-
 #[tokio::test]
 async fn dispatch_mounts_and_reports_mountpoint() {
     let fixture = Fixture::new("dispatch");
     let stub = fixture.root.join("checkout");
     fs::create_dir_all(&stub).expect("stub checkout");
-    fixture.bind_main(&repo(), &stub, CheckoutLayout::DirectMount);
+    fixture.bind_main(&repo(), &stub);
     let backend = FakeBackend::fresh(fixture.store.clone());
 
     let mut out = output();
@@ -406,7 +376,7 @@ async fn dispatch_attempts_mount_rather_than_refusing_stale_state() {
     let fixture = Fixture::new("stale");
     let stub = fixture.root.join("checkout");
     fs::create_dir_all(&stub).expect("stub checkout");
-    fixture.bind_main(&repo(), &stub, CheckoutLayout::DirectMount);
+    fixture.bind_main(&repo(), &stub);
     // A flags-mismatched volume is still present at the mountpoint. The verb
     // must proceed to the gateway mount path — which remounts — rather than
     // refusing the stale state.
@@ -435,7 +405,7 @@ async fn dispatch_json_reports_mount_result() {
     let fixture = Fixture::new("json");
     let stub = fixture.root.join("checkout");
     fs::create_dir_all(&stub).expect("stub checkout");
-    fixture.bind_main(&repo(), &stub, CheckoutLayout::DirectMount);
+    fixture.bind_main(&repo(), &stub);
     let backend = FakeBackend::fresh(fixture.store.clone());
 
     let mut out = output();

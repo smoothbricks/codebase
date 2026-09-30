@@ -83,7 +83,7 @@ Against the current `ci.yml`, cowshed mode removes:
 - **`cache-nx` / `actions/cache`** for `.nx` — the workspace carries warm Nx state from main.
 - **`cache-node-modules` / any `bun install`** — `node_modules` is materialized in the clone.
 - **Most `secrets.*`** — registry auth lives in the host gateway, injected per-request by workspace identity; git
-  credentials stay host-side entirely (workspace git is local-paths-only — the clone's `host` remote and gateway-fetched
+  credentials stay host-side entirely (workspace git is local-paths-only — the clone's `main` remote and gateway-fetched
   mirrors). Only `GITHUB_TOKEN` (for status/PR API) stays in the workflow.
 
 What remains is the actual work: `smoo github-ci nx-smart --target build|lint|test`, now running against warm inputs.

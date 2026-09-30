@@ -44,7 +44,7 @@ directly, Bun/Node applications use `cowshed-napi`, and shell-based agents use t
   workspace identity = in-image `.cowshed/workspace.json`; grants and repository binding metadata are controller-owned
   and outside the workspace. No image pooling. Per-workspace supervisors and the optional MCP server hold no
   authoritative lifecycle state.
-- **Local-only git and coordinator-owned mirrors**: workspace git touches only local paths: the `host` remote and
+- **Local-only git and coordinator-owned mirrors**: workspace git touches only local paths: the `main` remote and
   gateway-owned, sandbox-read-only bare mirrors on the cache volume. Mirror creation and refresh are
   coordinator/control- plane operations using host-held credentials; workspaces may read mirrors but can never
   configure, update, or write them. Publishing to a real origin is also coordinator work outside every sandbox. There is

@@ -76,7 +76,7 @@ fn sidecar(
         publication_state: PublicationState::Active,
         updated_at: "2026-07-14T00:00:00Z".to_owned(),
         grants,
-        info_snapshot: Some(WorkspaceInfoSnapshot {
+        info_snapshot: WorkspaceInfoSnapshot {
             project_root: checkout.to_owned(),
             role: WorkspaceRole::for_name(workspace),
             base_commit: "8f31c2d".to_owned(),
@@ -86,7 +86,7 @@ fn sidecar(
             captured_at: "2026-07-14T00:00:00Z".to_owned(),
             stale: false,
             git_worktree: false,
-        }),
+        },
     }
 }
 

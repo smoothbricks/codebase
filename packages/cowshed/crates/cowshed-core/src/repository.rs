@@ -11,7 +11,6 @@ const BINDING_VERSION: u32 = 1;
 /// The one file that makes a store directory an adopted project. Its presence is what discovery
 /// keys on, and retirement deletes it.
 pub const REPOSITORY_BINDING_FILE: &str = "repository.json";
-pub const CHECKOUT_LAYOUT_FILE: &str = "checkout-layout.json";
 pub const CHECKOUT_ROOT_FILE: &str = "checkout-root.json";
 pub const SLOT_BINDINGS_FILE: &str = "slot-bindings.json";
 pub const POLICY_FILE: &str = "policy.json";
@@ -647,7 +646,6 @@ pub struct ProjectPaths {
     pub host_mount_root: PathBuf,
     pub project_root: PathBuf,
     pub repository_binding: PathBuf,
-    pub checkout_layout: PathBuf,
     /// Where the checkout was when main was last removed; see [`crate::metadata::CheckoutRootRecord`].
     pub checkout_root: PathBuf,
     pub slot_bindings: PathBuf,
@@ -675,7 +673,6 @@ impl ProjectPaths {
 
         Ok(Self {
             repository_binding: checked_join(&project_root, [REPOSITORY_BINDING_FILE])?,
-            checkout_layout: checked_join(&project_root, [CHECKOUT_LAYOUT_FILE])?,
             checkout_root: checked_join(&project_root, [CHECKOUT_ROOT_FILE])?,
             slot_bindings: checked_join(&project_root, [SLOT_BINDINGS_FILE])?,
             policy: checked_join(&project_root, [POLICY_FILE])?,

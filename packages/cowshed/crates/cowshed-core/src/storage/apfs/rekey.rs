@@ -101,9 +101,6 @@ pub enum RekeyError {
     /// The quarantined revision is already at `u64::MAX` and cannot bump.
     #[error("quarantined revision {revision} for workspace '{workspace}' cannot bump")]
     RevisionOverflow { workspace: String, revision: u64 },
-    /// The sidecar carries no info snapshot, so no attachable record can be rebuilt.
-    #[error("quarantined sidecar for workspace '{workspace}' has no info snapshot")]
-    MissingInfoSnapshot { workspace: String },
     /// A store read or write failed.
     #[error("rekey I/O for workspace '{workspace}': {detail}")]
     Io { workspace: String, detail: String },
@@ -160,10 +157,6 @@ impl RekeyError {
                 revision,
             } => CowshedError::integrity(
                 format!("quarantined revision {revision} for workspace '{workspace}' cannot bump"),
-                format!("cowshed rekey {workspace}"),
-            ),
-            Self::MissingInfoSnapshot { workspace } => CowshedError::integrity(
-                format!("quarantined sidecar for workspace '{workspace}' has no info snapshot"),
                 format!("cowshed rekey {workspace}"),
             ),
             Self::Io { workspace, detail } => CowshedError::integrity(
@@ -261,13 +254,7 @@ pub fn rekey_workspace(
         SourceOrigin::Live => source.base.grants.revision,
     };
 
-    let snapshot =
-        source
-            .base
-            .require_info_snapshot()
-            .map_err(|_| RekeyError::MissingInfoSnapshot {
-                workspace: workspace.to_string(),
-            })?;
+    let snapshot = &source.base.info_snapshot;
     let role = WorkspaceRole::for_name(workspace);
     if snapshot.role != role {
         return Err(RekeyError::IdentityMismatch {

@@ -202,14 +202,12 @@ never errors).
 | `cowshed gc`                         | freed bytes                                      | Two-phase exact candidate plan (01); `--dry-run` lists typed candidates and sums bytes with zero mutation.                                                                                                                                                                                                                                                                                                                                                                                                                     |
 | `cowshed doctor`                     | `--json` findings                                | Invariant checks; each finding carries a `fix:` hint.                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
 
-### `cowshed ls` detached-row degradation
+### `cowshed ls` detached rows
 
 `ls` must never attach an image to read it (that would blow the ≤50 ms budget and mutate mount state), but the base
 commit, branch, and age live in the in-image marker. So for a **detached** workspace those fields come from the snapshot
-cowshed cached in the grants sidecar at detach time (01_storage.md). If that snapshot is absent (e.g. a workspace
-detached by an older cowshed, or a crash before the snapshot was written), the marker-derived columns are emitted
-**empty** rather than by attaching — `state` and `name` are always accurate because they derive from readdir +
-getmntinfo alone.
+every grants sidecar carries (01_storage.md); a sidecar without one is unreadable, not a row with empty columns. `state`
+and `name` are always accurate because they derive from readdir + getmntinfo alone.
 
 ### Checkpoint listing
 
@@ -310,12 +308,12 @@ detach targets. A bare `detach` with neither a name nor `--all` is usage.
 (11_shell.md) already serves its current authority, every fact they depend on is live. They are answered from that state
 without opening the project controller. The answer reads, fresh on every call, only the records that decide this
 workspace: the in-image marker at the invocation's Git root (which names the project), the named workspace's marker at
-its mount and its active sidecar, the project's policy (whose revision is part of the effective grant revision),
-checkout-layout and slot records (which place the mount), and the lifecycle-intent journal. It asks the host two things:
-whether a filesystem is mounted exactly at the mount path, and which authority the supervisor's socket reports. `exec`
-also asks the gateway whether the workspace's session is installed at that revision — exactly the case in which the
-controller's pre-exec reconcile would install nothing for it. The job then runs through the supervisor's socket, relayed
-as the controller path relays it.
+its mount and its active sidecar, the project's policy (whose revision is part of the effective grant revision), slot
+records (which place the mount), and the lifecycle-intent journal. It asks the host two things: whether a filesystem is
+mounted exactly at the mount path, and which authority the supervisor's socket reports. `exec` also asks the gateway
+whether the workspace's session is installed at that revision — exactly the case in which the controller's pre-exec
+reconcile would install nothing for it. The job then runs through the supervisor's socket, relayed as the controller
+path relays it.
 
 Any disagreement opens the controller exactly as before, which is what does the work: a workspace that is detached,
 unserved, served under an older grant or incarnation, a gateway session not yet at the served revision, a linked

@@ -18,8 +18,8 @@ use cowshed_core::repository::RepoId;
 use cowshed_core::storage::apfs::extents::{count_extents, rewrite_sibling};
 use cowshed_core::storage::apfs::native::MacOsApfsExecutionHost;
 use cowshed_core::storage::apfs::{
-    ApfsStorageError, ApfsSubstrate, ApfsSubstrateConfig, CheckoutLayout, IncarnationSource,
-    TokioApfsBlockingLane, volume_label,
+    ApfsStorageError, ApfsSubstrate, ApfsSubstrateConfig, IncarnationSource, TokioApfsBlockingLane,
+    volume_label,
 };
 use cowshed_core::storage::lifecycle::{
     AdoptRequest, Destination, LifecyclePlanner, MountIntent, MountState, OperationIdentity, Pin,
@@ -250,7 +250,6 @@ fn run_format(format: ImageFormat) -> Result<String, Box<dyn Error>> {
         &store,
         &caches,
         &checkout_path,
-        CheckoutLayout::Symlink,
         ApfsCaseSensitivity::Insensitive,
     )
     .with_capacity(ImageCapacity::from_gibibytes(1));
@@ -315,35 +314,26 @@ fn run_format(format: ImageFormat) -> Result<String, Box<dyn Error>> {
             ))
             .into());
         }
-        // Main mounts under the store's mount root like every other workspace, and the adopted
-        // checkout path is a symlink into it.
-        let canonical_mount =
-            StorageLayout::new(&store, &repo)?.workspace_mount(&WorkspaceName::new("main")?)?;
+        // Main mounts at the adopted checkout path itself, with the original tree retained beside
+        // it.
         assert_eq!(
             substrate
                 .ensure_mounted(&main, MountIntent { browse: false })
                 .await
                 .map_err(|error| std::io::Error::other(format!("ensure main: {error}")))?,
-            canonical_mount
-        );
-        assert_eq!(fs::read_link(&checkout_path)?, canonical_mount);
-        assert_eq!(
-            fs::canonicalize(&checkout_path)?,
-            fs::canonicalize(&canonical_mount)?,
-            "the familiar path resolves to the canonical mount"
+            checkout_path
         );
         assert!(
             PathBuf::from(format!("{}.pre-cowshed", checkout_path.display())).is_dir(),
             "the original tree is retained beside the checkout"
         );
-        // Everything below reaches the workspace through the symlink, exactly as the user does.
         let mounted_root = fs::metadata(&checkout_path)?;
         assert_eq!(mounted_root.uid(), unsafe { libc::getuid() });
         assert_eq!(mounted_root.gid(), unsafe { libc::getgid() });
         // The label adoption gave main's volume, read from the kernel rather than from Disk
         // Arbitration's cache.
         let main_label = volume_label(&repo, &WorkspaceName::new("main")?);
-        assert_eq!(volume_name(&canonical_mount)?, main_label.as_str());
+        assert_eq!(volume_name(&checkout_path)?, main_label.as_str());
 
         let payload = checkout_path.join("payload.txt");
         fs::write(&payload, b"checkpoint baseline\n")?;

@@ -21,8 +21,8 @@ use async_trait::async_trait;
 use cowshed_core::apfs::{ApfsCaseSensitivity, SystemCommandRunner};
 use cowshed_core::api::MountResult;
 use cowshed_core::metadata::{
-    CheckoutLayout, DetachedWorkspaceMetadata, ImageFormat, MetadataError, PublicationState,
-    WorkspaceName, read_json,
+    DetachedWorkspaceMetadata, ImageFormat, MetadataError, PublicationState, WorkspaceName,
+    read_json,
 };
 use cowshed_core::repository::{RepoId, RepositoryBinding};
 use cowshed_core::storage::StorageLayout;
@@ -41,13 +41,9 @@ use crate::runtime::DispatchExit;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResolvedMainMount {
     pub repo_id: RepoId,
-    /// The adopted checkout path from the sidecar record — possibly an empty
-    /// stub, never consulted for git state.
+    /// The adopted checkout path from the sidecar record, which is where main mounts — possibly
+    /// an empty stub, never consulted for git state.
     pub checkout_path: PathBuf,
-    pub checkout_layout: CheckoutLayout,
-    /// Where main mounts: the checkout itself under direct mount, the uniform
-    /// `mnt/<owner>/<repo>/main` under the symlink layout.
-    pub mountpoint: PathBuf,
     /// Canonical main images present in the store, in scan order.
     pub images: Vec<PathBuf>,
     /// The project's store directory, where every record above lives.
@@ -103,12 +99,9 @@ pub fn resolve_main_mount(store_root: &Path, repo_id: &RepoId) -> Result<Resolve
         )));
     }
 
-    let main = WorkspaceName::new("main").map_err(|error| {
-        CowshedError::internal(format!("the fixed main workspace name is invalid: {error}"))
-    })?;
     // Same derivation the gateway inventory uses: at most one canonical main
     // image, and the checkout path comes from its sidecar's Active snapshot.
-    let mut found: Option<Option<PathBuf>> = None;
+    let mut found: Option<PathBuf> = None;
     let mut images = Vec::new();
     for format in [ImageFormat::Asif, ImageFormat::Sparse] {
         let image = layout
@@ -137,43 +130,22 @@ pub fn resolve_main_mount(store_root: &Path, repo_id: &RepoId) -> Result<Resolve
             )));
         }
         if metadata.publication_state == PublicationState::Active {
-            found = Some(
-                metadata
-                    .require_info_snapshot()
-                    .ok()
-                    .map(|snapshot| snapshot.project_root.clone()),
-            );
+            found = Some(metadata.info_snapshot.project_root);
         }
         images.push(image);
     }
-    let checkout_path = found.flatten().ok_or_else(|| {
-        let expected = match layout.checkout_layout() {
-            Ok(CheckoutLayout::Symlink) => layout
-                .workspace_mount(&main)
-                .unwrap_or_else(|_| project.project_root.clone()),
-            _ => project.project_root.clone(),
-        };
+    let checkout_path = found.ok_or_else(|| {
         CowshedError::not_found(
             format!(
-                "project {repo_id} records no adopted checkout path; its store record is at {} and its main belongs at {}",
+                "project {repo_id} records no adopted checkout path; its store record is at {}",
                 project.project_root.display(),
-                expected.display()
             ),
             "cowshed doctor --json",
         )
     })?;
-
-    let checkout_layout = layout
-        .checkout_layout()
-        .map_err(|error| integrity(format!("invalid checkout layout for {repo_id}: {error}",)))?;
-    let mountpoint = layout
-        .main_aware_workspace_mount(checkout_layout, &checkout_path, &main)
-        .map_err(|error| integrity(format!("invalid mount layout for {repo_id}: {error}",)))?;
     Ok(ResolvedMainMount {
         repo_id: repo_id.clone(),
         checkout_path,
-        checkout_layout,
-        mountpoint,
         images,
         project_root: project.project_root.clone(),
     })
@@ -227,7 +199,6 @@ impl MainMountBackend for NativeMainMountBackend {
             self.storage.store(),
             self.storage.caches(),
             &resolved.checkout_path,
-            resolved.checkout_layout,
             ApfsCaseSensitivity::Sensitive,
         );
         let host = MacOsApfsExecutionHost::new(SystemCommandRunner, config.clone())
@@ -245,7 +216,7 @@ impl MainMountBackend for NativeMainMountBackend {
                     format!(
                         "project {} records no main workspace: expected its mount at {}",
                         resolved.repo_id,
-                        resolved.mountpoint.display()
+                        resolved.checkout_path.display()
                     ),
                     "cowshed doctor --json",
                 )

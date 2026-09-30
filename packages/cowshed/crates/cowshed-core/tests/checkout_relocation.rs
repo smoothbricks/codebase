@@ -181,7 +181,7 @@ impl Relocated {
                 PortBlock::new(40_960, 16).expect("port block"),
             ))
             .expect("grants"),
-            info_snapshot: Some(WorkspaceInfoSnapshot {
+            info_snapshot: WorkspaceInfoSnapshot {
                 project_root: project_root.to_owned(),
                 role: WorkspaceRole::Workspace,
                 base_commit: "0123456789abcdef0123456789abcdef01234567".to_owned(),
@@ -191,7 +191,7 @@ impl Relocated {
                 captured_at: "2026-08-01T00:00:00Z".to_owned(),
                 stale: false,
                 git_worktree: false,
-            }),
+            },
         }
     }
 
@@ -207,14 +207,7 @@ impl Relocated {
             .expect("marker reads");
         let sidecar =
             DetachedWorkspaceMetadata::read_for_image(&self.image).expect("sidecar reads");
-        (
-            marker.project_root,
-            sidecar
-                .info_snapshot
-                .expect("info snapshot")
-                .project_root
-                .clone(),
-        )
+        (marker.project_root, sidecar.info_snapshot.project_root)
     }
 
     fn driver(&self, name: &str) -> String {

@@ -10,8 +10,8 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
 
 use crate::metadata::{
-    CheckoutLayout, CheckoutLayoutRecord, CheckoutRootRecord, ImageFormat, MetadataError,
-    SlotBindings, SlotBindingsRecord, WorkspaceName, append_suffix, sidecar_path,
+    CheckoutRootRecord, ImageFormat, MetadataError, SlotBindings, SlotBindingsRecord,
+    WorkspaceName, append_suffix, sidecar_path,
 };
 use crate::repository::{PathLayoutError, ProjectPaths, RepoId};
 
@@ -248,20 +248,16 @@ impl StorageLayout {
         }
     }
 
-    /// Where one workspace of one project mounts, checkout layout included.
-    ///
-    /// Main's path follows the project's checkout layout — the adopted checkout itself under
-    /// direct mount, the uniform `mnt/` path under the symlink layout. Every other workspace
-    /// mounts under `mnt/` either way. One rule, because every fact pass, mount, and reverse
-    /// lookup goes through it, and a project whose two answers disagreed would be reported as
-    /// broken by whichever derivation ran second.
+    /// Where one workspace of one project mounts: main at the adopted checkout itself, every other
+    /// workspace under `mnt/`. One rule, because every fact pass, mount, and reverse lookup goes
+    /// through it, and a project whose two answers disagreed would be reported as broken by
+    /// whichever derivation ran second.
     pub fn main_aware_workspace_mount(
         &self,
-        checkout_layout: CheckoutLayout,
         checkout_path: &Path,
         workspace: &WorkspaceName,
     ) -> Result<PathBuf, StorageLayoutError> {
-        if workspace.is_main() && checkout_layout.mounts_at_checkout() {
+        if workspace.is_main() {
             return Ok(checkout_path.to_owned());
         }
         self.workspace_mount(workspace)
@@ -282,22 +278,6 @@ impl StorageLayout {
         crate::metadata::write_json(
             &self.project.slot_bindings,
             &SlotBindingsRecord::new(bindings),
-        )
-    }
-
-    /// Where this project's `main` mounts.
-    ///
-    /// One reader: [`crate::checkout::load_checkout_layout`]. A present record is
-    /// authoritative and malformed data fails closed. A missing record is inferred only
-    /// where the inference is conclusive, then written so a later reader cannot disagree.
-    pub fn checkout_layout(&self) -> Result<CheckoutLayout, StorageLayoutError> {
-        crate::checkout::load_checkout_layout(self)
-    }
-
-    pub fn record_checkout_layout(&self, layout: CheckoutLayout) -> Result<(), MetadataError> {
-        crate::metadata::write_json(
-            &self.project.checkout_layout,
-            &CheckoutLayoutRecord::new(layout),
         )
     }
 
@@ -546,10 +526,6 @@ pub enum StorageLayoutError {
     InvalidCheckpointLabel(String),
     #[error("workspace `main` is not a session")]
     MainIsNotSession,
-    #[error(
-        "the project is adopted but records no checkout layout, and its main mountpoint is absent"
-    )]
-    UnrecordedCheckoutLayout,
     #[error("unsafe storage path component {0:?}")]
     UnsafeComponent(String),
     #[error("derived storage path escapes its root")]
@@ -643,72 +619,6 @@ mod tests {
             StorageLayoutError::SymlinkComponent(path) if path == root.join("acme")
         ));
         assert!(!outside.join("widget").exists());
-    }
-
-    #[test]
-    fn recorded_checkout_layout_wins_over_every_inference() {
-        let root = temp_store("recorded");
-        let layout = layout_under(&root);
-        fs::create_dir_all(&layout.project().project_root).unwrap();
-        // Plant the shape that would otherwise be read as the symlink layout.
-        fs::create_dir_all(layout.workspace_mount(&WorkspaceName::main()).unwrap()).unwrap();
-        layout
-            .record_checkout_layout(CheckoutLayout::DirectMount)
-            .unwrap();
-        assert_eq!(
-            layout.checkout_layout().unwrap(),
-            CheckoutLayout::DirectMount
-        );
-    }
-
-    /// A record that cannot be parsed is evidence, not an absence.
-    ///
-    /// Inference exists for the project that never wrote a record; a truncated or corrupt record
-    /// says a writer was interrupted, and answering it with the inferred default would report a
-    /// direct-mount project as direct-mount by luck and a symlink project as direct-mount wrongly.
-    #[test]
-    fn malformed_checkout_layout_fails_closed() {
-        let root = temp_store("malformed-checkout-layout");
-        let layout = layout_under(&root);
-        fs::create_dir_all(&layout.project().project_root).unwrap();
-        fs::write(&layout.project().checkout_layout, b"{not json").unwrap();
-
-        assert!(matches!(
-            layout.checkout_layout(),
-            Err(StorageLayoutError::Metadata(MetadataError::Json { .. }))
-        ));
-    }
-
-    #[test]
-    fn an_unrecorded_layout_is_inferred_only_where_the_inference_is_conclusive() {
-        // Each case needs its own store: the single reader materializes a conclusive
-        // inference, and chaining cases against one record would assert the old
-        // swallow-and-infer reader this collapse deleted.
-        let root = temp_store("inferred-unadopted");
-        let layout = layout_under(&root);
-        fs::create_dir_all(&layout.project().project_root).unwrap();
-        assert_eq!(
-            layout.checkout_layout().unwrap(),
-            CheckoutLayout::default(),
-            "an unadopted project has no layout to get wrong"
-        );
-
-        let root = temp_store("inferred-adopted-no-mount");
-        let layout = layout_under(&root);
-        fs::create_dir_all(&layout.project().project_root).unwrap();
-        let image = layout.main_image(ImageFormat::Sparse).unwrap();
-        fs::create_dir_all(image.image().parent().unwrap()).unwrap();
-        fs::write(image.image(), b"image").unwrap();
-        assert!(matches!(
-            layout.checkout_layout(),
-            Err(StorageLayoutError::UnrecordedCheckoutLayout)
-        ));
-
-        let root = temp_store("inferred-symlink-mount");
-        let layout = layout_under(&root);
-        fs::create_dir_all(&layout.project().project_root).unwrap();
-        fs::create_dir_all(layout.workspace_mount(&WorkspaceName::main()).unwrap()).unwrap();
-        assert_eq!(layout.checkout_layout().unwrap(), CheckoutLayout::Symlink);
     }
 
     #[test]

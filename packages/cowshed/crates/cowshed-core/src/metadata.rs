@@ -13,7 +13,6 @@ use std::path::{Path, PathBuf};
 
 pub const MARKER_VERSION: u32 = 1;
 pub const SIDECAR_VERSION: u32 = 1;
-pub const CHECKOUT_LAYOUT_VERSION: u32 = 1;
 pub const CHECKOUT_ROOT_VERSION: u32 = 1;
 pub const SLOT_BINDINGS_VERSION: u32 = 1;
 /// The macOS port range and the size new blocks get are the gateway's grammar; core names the
@@ -42,7 +41,6 @@ pub enum MetadataError {
         workspace: String,
         role: WorkspaceRole,
     },
-    MissingInfoSnapshot,
     ImageFormatMismatch {
         path: PathBuf,
         format: ImageFormat,
@@ -103,9 +101,6 @@ impl fmt::Display for MetadataError {
                     "workspace {workspace:?} does not agree with role {role:?}"
                 )
             }
-            Self::MissingInfoSnapshot => {
-                f.write_str("detached workspace metadata has no persisted info snapshot")
-            }
             Self::ImageFormatMismatch {
                 path,
                 format,
@@ -142,7 +137,7 @@ impl fmt::Display for MetadataError {
                 write!(f, "workspace {workspace:?} is already bound to slot {slot}")
             }
             Self::MainIsNotSlottable => f.write_str(
-                "main cannot take a build slot: its mount is fixed by the project's checkout layout",
+                "main cannot take a build slot: it mounts at the project's checkout",
             ),
         }
     }
@@ -443,75 +438,6 @@ impl<'de> Deserialize<'de> for WorkspaceIncarnation {
     {
         let value = String::deserialize(deserializer)?;
         Self::new(value).map_err(serde::de::Error::custom)
-    }
-}
-
-/// Where a project's `main` workspace mounts. Per-project, chosen at adopt, and the one thing
-/// that decides what the user's checkout path holds afterwards.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum CheckoutLayout {
-    /// `main` mounts at the checkout path itself. The user's path stays physical, so Git's
-    /// path-conditional configuration (`includeIf "gitdir:…"`) keeps matching.
-    #[default]
-    DirectMount,
-    /// `main` mounts at `mnt/<owner>/<repo>/main` like every other workspace and the checkout
-    /// path holds a symlink to it. One uniform mount namespace, no mount inside the source tree.
-    Symlink,
-}
-
-impl CheckoutLayout {
-    pub const fn mounts_at_checkout(self) -> bool {
-        matches!(self, Self::DirectMount)
-    }
-}
-
-/// The project-level record of the chosen layout, written by adopt.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct CheckoutLayoutRecord {
-    pub version: u32,
-    pub checkout_layout: CheckoutLayout,
-}
-
-impl CheckoutLayoutRecord {
-    pub fn new(checkout_layout: CheckoutLayout) -> Self {
-        Self {
-            version: CHECKOUT_LAYOUT_VERSION,
-            checkout_layout,
-        }
-    }
-
-    pub fn validate(&self) -> Result<(), MetadataError> {
-        if self.version != CHECKOUT_LAYOUT_VERSION {
-            return Err(MetadataError::UnsupportedVersion {
-                kind: "checkout layout record",
-                version: self.version,
-            });
-        }
-        Ok(())
-    }
-}
-
-impl<'de> Deserialize<'de> for CheckoutLayoutRecord {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        #[derive(Deserialize)]
-        #[serde(rename_all = "camelCase", deny_unknown_fields)]
-        struct Wire {
-            version: u32,
-            checkout_layout: CheckoutLayout,
-        }
-
-        let wire = Wire::deserialize(deserializer)?;
-        let record = Self {
-            version: wire.version,
-            checkout_layout: wire.checkout_layout,
-        };
-        record.validate().map_err(serde::de::Error::custom)?;
-        Ok(record)
     }
 }
 
@@ -1166,10 +1092,6 @@ const fn is_false(value: &bool) -> bool {
     !*value
 }
 
-fn active_publication_state() -> PublicationState {
-    PublicationState::Active
-}
-
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DetachedWorkspaceMetadata {
@@ -1183,8 +1105,7 @@ pub struct DetachedWorkspaceMetadata {
     pub updated_at: String,
     #[serde(flatten)]
     pub grants: GrantSet,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub info_snapshot: Option<WorkspaceInfoSnapshot>,
+    pub info_snapshot: WorkspaceInfoSnapshot,
 }
 
 #[derive(Deserialize)]
@@ -1196,13 +1117,11 @@ struct DetachedWorkspaceMetadataWire {
     workspace_incarnation: WorkspaceIncarnation,
     image_format: ImageFormat,
     platform: Platform,
-    #[serde(default = "active_publication_state")]
     publication_state: PublicationState,
     updated_at: String,
     #[serde(flatten)]
     grants: GrantSet,
-    #[serde(default)]
-    info_snapshot: Option<WorkspaceInfoSnapshot>,
+    info_snapshot: WorkspaceInfoSnapshot,
 }
 
 impl<'de> Deserialize<'de> for DetachedWorkspaceMetadata {
@@ -1239,20 +1158,19 @@ impl DetachedWorkspaceMetadata {
             });
         }
         self.grants.validate(self.platform)?;
-        if let Some(info) = &self.info_snapshot {
-            if !info.project_root.is_absolute() {
-                return Err(MetadataError::InvalidPath {
-                    path: info.project_root.clone(),
-                    reason: "path is not absolute",
-                });
-            }
-            let expected_role = WorkspaceRole::for_name(&self.workspace);
-            if info.role != expected_role {
-                return Err(MetadataError::WorkspaceRoleMismatch {
-                    workspace: self.workspace.to_string(),
-                    role: info.role,
-                });
-            }
+        let info = &self.info_snapshot;
+        if !info.project_root.is_absolute() {
+            return Err(MetadataError::InvalidPath {
+                path: info.project_root.clone(),
+                reason: "path is not absolute",
+            });
+        }
+        let expected_role = WorkspaceRole::for_name(&self.workspace);
+        if info.role != expected_role {
+            return Err(MetadataError::WorkspaceRoleMismatch {
+                workspace: self.workspace.to_string(),
+                role: info.role,
+            });
         }
         Ok(())
     }
@@ -1272,14 +1190,6 @@ impl DetachedWorkspaceMetadata {
     pub fn write_for_image(&self, image_path: &Path) -> Result<(), MetadataError> {
         self.validate(image_path)?;
         write_json(&sidecar_path(image_path), self)
-    }
-
-    /// Return the persisted restart-safe workspace facts, refusing legacy sidecars that omitted
-    /// them rather than guessing a local path from markers or storage layout.
-    pub fn require_info_snapshot(&self) -> Result<&WorkspaceInfoSnapshot, MetadataError> {
-        self.info_snapshot
-            .as_ref()
-            .ok_or(MetadataError::MissingInfoSnapshot)
     }
 }
 
@@ -1359,34 +1269,6 @@ mod tests {
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    const LEGACY_V1_SIDECAR: &str = r#"{
-  "version": 1,
-  "repoId": "acme/widget",
-  "workspace": "raven",
-  "workspaceIncarnation": "0198f2c0b7e34dc795f17b238b331c80",
-  "imageFormat": "asif",
-  "platform": "macos",
-  "updatedAt": "2026-07-11T12:34:56Z",
-  "revision": 7,
-  "portBlock": { "base": 40976, "size": 16 },
-  "read": ["/project/shared-fixtures"],
-  "write": ["/project/artifacts/raven"],
-  "egress": [
-    { "host": "registry.npmjs.org" },
-    { "host": "pinned.example.com", "mode": "opaque" }
-  ],
-  "sim": ["openurl"],
-  "infoSnapshot": {
-    "projectRoot": "/project",
-    "role": "workspace",
-    "baseCommit": "8f31c2d",
-    "branch": "raven",
-    "createdAt": "2026-07-11T12:00:00Z",
-    "capturedAt": "2026-07-11T12:34:00Z",
-    "stale": true
-  }
-}"#;
-
     fn temp_directory(test: &str) -> PathBuf {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1455,19 +1337,21 @@ mod tests {
         assert_eq!(serde_json::to_value(&metadata).unwrap(), expected);
     }
 
+    /// This tool writes every sidecar whole, so one missing its publication state or its workspace
+    /// facts is damage, never an older writer's spelling to fill in.
     #[test]
-    fn legacy_v1_sidecar_without_publication_state_reopens_as_active() {
-        let directory = temp_directory("legacy-v1-sidecar");
-        let image = directory.join("raven.asif");
-        fs::write(sidecar_path(&image), LEGACY_V1_SIDECAR).unwrap();
-
-        let metadata = DetachedWorkspaceMetadata::read_for_image(&image).unwrap();
-        assert_eq!(metadata.publication_state, PublicationState::Active);
-
-        let mut expected: serde_json::Value = serde_json::from_str(LEGACY_V1_SIDECAR).unwrap();
-        expected["publicationState"] = json!("active");
-        assert_eq!(serde_json::to_value(metadata).unwrap(), expected);
-        fs::remove_dir_all(directory).unwrap();
+    fn a_sidecar_missing_its_publication_state_or_info_snapshot_is_refused() {
+        for field in ["publicationState", "infoSnapshot"] {
+            let mut partial = frozen_sidecar_json();
+            partial
+                .as_object_mut()
+                .expect("metadata object")
+                .remove(field);
+            assert!(
+                serde_json::from_value::<DetachedWorkspaceMetadata>(partial).is_err(),
+                "a sidecar without {field} decoded"
+            );
+        }
     }
 
     #[test]
@@ -1992,7 +1876,7 @@ mod tests {
     }
 
     #[test]
-    fn persisted_info_snapshot_round_trips_and_legacy_absence_fails_closed() {
+    fn persisted_info_snapshot_round_trips() {
         let metadata: DetachedWorkspaceMetadata =
             serde_json::from_value(frozen_sidecar_json()).expect("decode snapshot");
         let encoded = serde_json::to_value(&metadata).expect("encode snapshot");
@@ -2000,25 +1884,7 @@ mod tests {
             encoded["infoSnapshot"],
             frozen_sidecar_json()["infoSnapshot"]
         );
-        assert_eq!(
-            metadata
-                .require_info_snapshot()
-                .expect("persisted snapshot")
-                .project_root,
-            Path::new("/project")
-        );
-
-        let mut legacy = frozen_sidecar_json();
-        legacy
-            .as_object_mut()
-            .expect("metadata object")
-            .remove("infoSnapshot");
-        let legacy: DetachedWorkspaceMetadata =
-            serde_json::from_value(legacy).expect("legacy wire remains decodable");
-        assert!(matches!(
-            legacy.require_info_snapshot(),
-            Err(MetadataError::MissingInfoSnapshot)
-        ));
+        assert_eq!(metadata.info_snapshot.project_root, Path::new("/project"));
     }
 
     /// The git-worktree fact has to survive a sidecar round trip, because every decision it drives
@@ -2029,7 +1895,7 @@ mod tests {
     fn git_worktree_mode_round_trips_and_is_absent_on_a_standalone_workspace() {
         let standalone: DetachedWorkspaceMetadata =
             serde_json::from_value(frozen_sidecar_json()).expect("decode sidecar");
-        assert!(!standalone.require_info_snapshot().unwrap().git_worktree);
+        assert!(!standalone.info_snapshot.git_worktree);
         assert!(
             serde_json::to_value(&standalone).expect("encode sidecar")["infoSnapshot"]
                 .get("gitWorktree")
@@ -2040,7 +1906,7 @@ mod tests {
         wire["infoSnapshot"]["gitWorktree"] = serde_json::Value::Bool(true);
         let linked: DetachedWorkspaceMetadata =
             serde_json::from_value(wire.clone()).expect("decode git-worktree sidecar");
-        assert!(linked.require_info_snapshot().unwrap().git_worktree);
+        assert!(linked.info_snapshot.git_worktree);
         assert_eq!(
             serde_json::to_value(&linked).expect("encode sidecar")["infoSnapshot"],
             wire["infoSnapshot"]
@@ -2103,19 +1969,9 @@ mod tests {
     fn each_document_version_is_one_and_refuses_any_other() {
         assert_eq!(MARKER_VERSION, 1);
         assert_eq!(SIDECAR_VERSION, 1);
-        assert_eq!(CHECKOUT_LAYOUT_VERSION, 1);
         assert_eq!(SLOT_BINDINGS_VERSION, 1);
         marker_from_json().validate().unwrap();
         serde_json::from_value::<DetachedWorkspaceMetadata>(frozen_sidecar_json()).unwrap();
-        assert_eq!(
-            serde_json::from_value::<CheckoutLayoutRecord>(json!({
-                "version": 1,
-                "checkoutLayout": "direct-mount"
-            }))
-            .unwrap()
-            .checkout_layout,
-            CheckoutLayout::DirectMount
-        );
         assert!(
             serde_json::from_value::<SlotBindingsRecord>(json!({
                 "version": 1,
@@ -2127,17 +1983,6 @@ mod tests {
             .is_empty()
         );
 
-        assert!(matches!(
-            CheckoutLayoutRecord {
-                version: 2,
-                checkout_layout: CheckoutLayout::DirectMount,
-            }
-            .validate(),
-            Err(MetadataError::UnsupportedVersion {
-                kind: "checkout layout record",
-                version: 2
-            })
-        ));
         assert!(matches!(
             SlotBindingsRecord {
                 version: 2,

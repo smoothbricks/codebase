@@ -18,9 +18,7 @@ pub const RETIRED_LAYOUT_HINT: &str =
 const HOST_CONFIG_VERSION: u32 = 1;
 pub(crate) const RETIRED_MOUNT_DIRECTORY: &str = "mnt";
 
-/// Where a host presents workspace mounts when no configuration has been written. Stated once:
-/// the retired-layout migration in `runtime::project` has to recognise the same directory, and a
-/// literal there could not follow a change made here.
+/// Where a host presents workspace mounts when no configuration has been written.
 pub(crate) const DEFAULT_MOUNT_RELATIVE: &str = ".cowshed/mnt";
 
 /// One approved gateway-backed registry route, as host state rather than workspace state.
