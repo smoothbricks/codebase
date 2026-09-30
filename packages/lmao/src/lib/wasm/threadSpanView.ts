@@ -440,10 +440,13 @@ export class ThreadSpanView {
     this._stats = args.stats;
     this.thread_id = getThreadId();
     this._threadId = this.thread_id;
-    this._hasParent = args.parent !== undefined;
-    if (args.parent !== undefined) {
-      this.parent_span_id = args.parent.span_id;
-      this.parent_thread_id = args.parent.thread_id;
+    // A view with no local parent is its trace's root, which hangs from the trace's remote parent when the trace
+    // continues one; the store records whichever parent this names.
+    const parent = args.parent ?? args.traceRoot.remoteParent;
+    this._hasParent = parent !== undefined;
+    if (parent !== undefined) {
+      this.parent_span_id = parent.span_id;
+      this.parent_thread_id = parent.thread_id;
     }
     const layout = threadSpanLayoutFor(args.schema);
     this.layout = layout;
@@ -680,8 +683,11 @@ export class ThreadSpanView {
   }
 
   copyParentThreadIdTo(dest: Uint8Array, offset: number): void {
-    if (this._parent) this._parent.copyThreadIdTo(dest, offset);
-    else dest.fill(0, offset, offset + 8);
+    let bits = this.parent_thread_id;
+    for (let i = 0; i < 8; i++) {
+      dest[offset + i] = Number(bits & 0xffn);
+      bits >>= 8n;
+    }
   }
 
   isParentOf(other: AnySpanBuffer): boolean {

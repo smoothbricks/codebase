@@ -548,14 +548,16 @@ function createSpanBufferClosureMethods(
       }
       return null;
     });
+    // A buffer with no local parent is its trace's root (or the root's overflow): it hangs from the trace's remote
+    // parent when the trace continues one.
     defineGetter('_hasParent', function () {
-      return this._parent !== undefined;
+      return this._parent !== undefined || this._traceRoot.remoteParent !== undefined;
     });
     defineGetter('parent_span_id', function () {
-      return this._parent?.span_id ?? 0;
+      return this._parent?.span_id ?? this._traceRoot.remoteParent?.span_id ?? 0;
     });
     defineGetter('parent_thread_id', function () {
-      return this._parent?.thread_id ?? 0n;
+      return this._parent?.thread_id ?? this._traceRoot.remoteParent?.thread_id ?? 0n;
     });
     defineMethod('isParentOf', function (this: ClosureSelf, other: AnySpanBuffer) {
       return this === other._parent;
@@ -579,7 +581,13 @@ function createSpanBufferClosureMethods(
       }
     });
     defineMethod('copyParentThreadIdTo', function (this: ClosureSelf, dest: Uint8Array, offset: number) {
-      if (this._parent) this._parent.copyThreadIdTo(dest, offset);
+      if (this._parent) {
+        this._parent.copyThreadIdTo(dest, offset);
+        return;
+      }
+      const remote = this._traceRoot.remoteParent;
+      if (remote)
+        new DataView(dest.buffer, dest.byteOffset, dest.byteLength).setBigUint64(offset, remote.thread_id, true);
       else dest.fill(0, offset, offset + 8);
     });
     defineGetter('_logSchema', function () {
@@ -892,9 +900,9 @@ export function getSpanBufferClass<T extends LogSchema>(
       }
       return null;
     }
-    get _hasParent() { return this._parent !== undefined; }
-    get parent_span_id() { return this._parent?.span_id ?? 0; }
-    get parent_thread_id() { return this._parent?.thread_id ?? 0n; }
+    get _hasParent() { return this._parent !== undefined || this._traceRoot.remoteParent !== undefined; }
+    get parent_span_id() { return this._parent?.span_id ?? this._traceRoot.remoteParent?.span_id ?? 0; }
+    get parent_thread_id() { return this._parent?.thread_id ?? this._traceRoot.remoteParent?.thread_id ?? 0n; }
     isParentOf(other) { return this === other._parent; }
     isChildOf(other) { return this._parent === other; }
     copyThreadIdTo(dest, offset) {
@@ -913,7 +921,12 @@ export function getSpanBufferClass<T extends LogSchema>(
       }
     }
     copyParentThreadIdTo(dest, offset) {
-      if (this._parent) this._parent.copyThreadIdTo(dest, offset);
+      if (this._parent) {
+        this._parent.copyThreadIdTo(dest, offset);
+        return;
+      }
+      const remote = this._traceRoot.remoteParent;
+      if (remote) new DataView(dest.buffer, dest.byteOffset, dest.byteLength).setBigUint64(offset, remote.thread_id, true);
       else dest.fill(0, offset, offset + 8);
     }
     get _logSchema() { return this.constructor.schema; }

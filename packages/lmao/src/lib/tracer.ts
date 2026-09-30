@@ -82,7 +82,7 @@ import {
   writeSpanEnd,
 } from './spanContext.js';
 import { generateTraceId, isValidTraceId, type TraceId } from './traceId.js';
-import type { TraceRootFactory, TracerLifecycleHooks } from './traceRoot.js';
+import { isRemoteParent, type RemoteParent, type TraceRootFactory, type TracerLifecycleHooks } from './traceRoot.js';
 import type { SpanBuffer } from './types.js';
 
 // =============================================================================
@@ -135,13 +135,15 @@ function isPromiseResult<R>(value: R | Promise<R>): value is Promise<R> {
 }
 
 /**
- * Trace overrides - userCtx values plus optional trace_id.
+ * Trace overrides - userCtx values plus optional trace_id and remote parent.
  *
  * Like span() overrides, but with optional trace_id for distributed tracing.
  * The trace_id must be a branded TraceId (use createTraceId() to validate).
+ * `parent` names the span in another tracer that the root span continues: the root's rows carry it as
+ * `parent_thread_id` / `parent_span_id` (`01b4_span_identity.md`, Remote Parent of a Root Span).
  *
- * When UserCtx is empty (Record<string, never>), only trace_id is available.
- * Otherwise, allows partial userCtx values plus trace_id.
+ * When UserCtx is empty (Record<string, never>), only trace_id and parent are available.
+ * Otherwise, allows partial userCtx values plus trace_id and parent.
  *
  * We use a conditional type to avoid issues with Partial<Record<string, never>>
  * which creates an index signature where all values must be undefined.
@@ -149,8 +151,8 @@ function isPromiseResult<R>(value: R | Promise<R>): value is Promise<R> {
  * @typeParam UserCtx - User context type from OpContext
  */
 export type TraceOverrides<UserCtx> = [UserCtx] extends [Record<string, never>]
-  ? { trace_id?: TraceId }
-  : Partial<UserCtx> & { trace_id?: TraceId };
+  ? { trace_id?: TraceId; parent?: RemoteParent }
+  : Partial<UserCtx> & { trace_id?: TraceId; parent?: RemoteParent };
 
 // =============================================================================
 // TraceFn Type - Overloaded trace function signatures
@@ -716,8 +718,15 @@ export abstract class Tracer<B extends OpContextBinding = OpContextBinding>
     // Validate required null-sentinel fields before allocating the trace root or buffer.
     this._validateRequiredUserContext(overrides);
 
+    // A remote parent is identity only; one that is not a span identity is refused rather than dropped, because a
+    // root that silently loses its parent is a tree that looks whole and is not.
+    const parent = overrides.parent;
+    if (parent !== undefined && !isRemoteParent(parent)) {
+      throw new TypeError('trace parent must be { thread_id: nonzero u64 bigint, span_id: nonzero u32 number }');
+    }
+
     // Create TraceRoot via platform-specific factory
-    const traceRoot = this.createTraceRoot(traceId, this);
+    const traceRoot = this.createTraceRoot(traceId, this, parent);
 
     // Create root SpanBuffer with pre-built TraceRoot via strategy
     const buffer = this.bufferStrategy.createSpanBuffer(

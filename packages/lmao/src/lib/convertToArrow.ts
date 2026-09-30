@@ -536,7 +536,7 @@ function buildNonDictIdentityColumns(
   let parentThreadIdNullCount = 0;
   offset = 0;
   for (const buf of buffers) {
-    if (buf._parent) {
+    if (buf._hasParent) {
       parentThreadIds.fill(buf.parent_thread_id, offset, offset + buf._writeIndex);
     } else {
       clearBitRange(parentThreadIdNulls, offset, buf._writeIndex);

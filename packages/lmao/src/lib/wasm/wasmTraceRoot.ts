@@ -16,6 +16,7 @@ import { createTraceId, type TraceId } from '../traceId.js';
 import {
   consumeSpanStartedAtAllocation,
   type ITraceRoot,
+  type RemoteParent,
   type SpanEndPrimitive,
   type SpanStartPrimitive,
   type TimestampAppendPrimitive,
@@ -162,6 +163,7 @@ export class WasmTraceRoot<T extends LogSchema = LogSchema> implements ITraceRoo
   /** Trace ID string */
   readonly trace_id: TraceId;
   readonly _traceIdBytes: Uint8Array;
+  readonly remoteParent: RemoteParent | undefined;
 
   /** Tracer reference for lifecycle hooks */
   readonly tracer: TracerLifecycleHooks<T>;
@@ -177,9 +179,15 @@ export class WasmTraceRoot<T extends LogSchema = LogSchema> implements ITraceRoo
    */
   readonly _system: ArrayBuffer;
 
-  constructor(allocator: WasmAllocator, trace_id: TraceId, tracer: TracerLifecycleHooks<T>) {
+  constructor(
+    allocator: WasmAllocator,
+    trace_id: TraceId,
+    tracer: TracerLifecycleHooks<T>,
+    remoteParent?: RemoteParent,
+  ) {
     this.allocator = allocator;
     this.trace_id = trace_id;
+    this.remoteParent = remoteParent;
     this._traceIdBytes = traceIdEncoder.encode(trace_id);
     this.tracer = tracer;
     this._topology = new TraceTopology();
@@ -375,7 +383,7 @@ export function createWasmTraceRoot<T extends LogSchema = LogSchema>(
 export function createWasmTraceRootFactory<T extends LogSchema = LogSchema>(
   allocator: WasmAllocator,
 ): TraceRootFactory<T> {
-  return (trace_id: string, tracer: TracerLifecycleHooks<T>): WasmTraceRoot<T> =>
-    new WasmTraceRoot<T>(allocator, createTraceId(trace_id), tracer);
+  return (trace_id: string, tracer: TracerLifecycleHooks<T>, parent?: RemoteParent): WasmTraceRoot<T> =>
+    new WasmTraceRoot<T>(allocator, createTraceId(trace_id), tracer, parent);
 }
 //#endregion smoo/lmao!n/wasm-mem.trace-root

@@ -84,14 +84,49 @@ export const TRACE_ROOT_TRACE_ID_OFFSET = 17;
  * - Node.js: process.hrtime.bigint() (pure JS; a NAPI addon was benchmarked slower than WASM and removed)
  */
 /**
+ * A span recorded by another tracer — in another process, on another host — that a trace's root span hangs from.
+ *
+ * Only its identity crosses: `thread_id` and `span_id` are the columns its own rows carry (`01b4_span_identity.md`).
+ * The root span's rows name it in `parent_thread_id` / `parent_span_id`; every other span keeps its local parent.
+ */
+export interface RemoteParent {
+  readonly thread_id: bigint;
+  readonly span_id: number;
+}
+
+const U64_LIMIT = 1n << 64n;
+const U32_MAX = 0xffff_ffff;
+
+/**
+ * Whether `value` is a span identity a root can hang from: a nonzero u64 `thread_id` and a nonzero u32 `span_id`,
+ * the two columns a span's rows carry. Zero is no span in either column.
+ */
+export function isRemoteParent(value: unknown): value is RemoteParent {
+  if (typeof value !== 'object' || value === null) return false;
+  const thread = Reflect.get(value, 'thread_id');
+  const span = Reflect.get(value, 'span_id');
+  return (
+    typeof thread === 'bigint' &&
+    thread > 0n &&
+    thread < U64_LIMIT &&
+    typeof span === 'number' &&
+    Number.isInteger(span) &&
+    span > 0 &&
+    span <= U32_MAX
+  );
+}
+
+/**
  * Factory function type for creating platform-specific TraceRoot instances.
  * Passed to Tracer constructor to enable tree-shaking of unused platform code.
  *
- * The factory creates anchor timestamps internally using platform-specific APIs.
+ * The factory creates anchor timestamps internally using platform-specific APIs. `parent` is the remote span the
+ * trace's root hangs from, when the trace continues one.
  */
 export type TraceRootFactory<T extends LogSchema = LogSchema> = (
   trace_id: string,
   tracer: TracerLifecycleHooks<T>,
+  parent?: RemoteParent,
 ) => ITraceRoot<T>;
 
 /** Platform-fixed primitives copied into the physical plan/generated writer hot path. */
@@ -121,6 +156,9 @@ export interface ITraceRoot<T extends LogSchema = LogSchema> {
    * Trace ID for this trace.
    */
   readonly trace_id: string;
+
+  /** The remote span this trace's root span hangs from, when the trace continues one. */
+  readonly remoteParent: RemoteParent | undefined;
 
   /**
    * Epoch time in nanoseconds when trace was created.

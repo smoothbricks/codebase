@@ -382,24 +382,24 @@ function wasmGetSpanId(this: WasmSpanBufferInstance): number {
 }
 
 /**
- * Get parent_thread_id.
+ * Get parent_thread_id: the local parent's, else the trace's remote parent's for the root.
  */
 function wasmGetParentThreadId(this: WasmSpanBufferInstance): bigint {
-  return this._parent ? this._parent.thread_id : 0n;
+  return this._parent ? this._parent.thread_id : (this._traceRoot.remoteParent?.thread_id ?? 0n);
 }
 
 /**
- * Get parent_span_id.
+ * Get parent_span_id: the local parent's, else the trace's remote parent's for the root.
  */
 function wasmGetParentSpanId(this: WasmSpanBufferInstance): number {
-  return this._parent ? this._parent.span_id : 0;
+  return this._parent ? this._parent.span_id : (this._traceRoot.remoteParent?.span_id ?? 0);
 }
 
 /**
- * Check if buffer has parent.
+ * Check if buffer has parent, local or remote.
  */
 function wasmGetHasParent(this: WasmSpanBufferInstance): boolean {
-  return this._parent !== null;
+  return this._parent !== null || this._traceRoot.remoteParent !== undefined;
 }
 
 function wasmRawMessage(this: WasmRawMessageBuffer, idx: number, value: string): WasmRawMessageBuffer {

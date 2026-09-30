@@ -19,6 +19,7 @@ import {
   ENTRY_TYPE_SPAN_START,
 } from '../schema/systemSchema.js';
 import { createSpanBuffer } from '../spanBuffer.js';
+import { createTraceId } from '../traceId.js';
 import { TestTracer } from '../tracers/TestTracer.js';
 import { iterateSpanChildren } from '../traceTopology.js';
 import type { AnySpanBuffer, SpanBuffer } from '../types.js';
@@ -456,6 +457,46 @@ describe('Child Span Lifecycle', () => {
 
     // Both should have same trace_id
     expect(rootSpanStart?.trace_id).toBe(childSpanStart?.trace_id);
+  });
+
+  it('roots a trace under a remote parent span, and keeps its children under the root', async () => {
+    // The caller's span lives in another process: only its identity crossed. A thread id under 2^53 reads back
+    // through the Arrow column as a plain number; this tracer's own thread ids do not, so they are read from buffers.
+    const remote = { thread_id: 0x1a2b3c4d5en, span_id: 42 };
+    let rootBuffer: AnySpanBuffer | undefined;
+
+    const { trace } = new TestTracer(ctx, { ...createTestTracerOptions() });
+
+    await trace('remote-root', { trace_id: createTraceId('remote-parent-trace'), parent: remote }, async (ctx) => {
+      rootBuffer = ctx.buffer;
+      await ctx.span('local-child', async (childCtx) => childCtx.ok('child-done'));
+      return ctx.ok('root-done');
+    });
+
+    if (!rootBuffer) {
+      throw new Error('rootBuffer is undefined');
+    }
+    const table = convertSpanTreeToArrowTable(rootBuffer);
+    const rows = Array.from({ length: table.numRows }, (_, rowIndex) => ({
+      rowIndex,
+      entry_type: getNullableStringColumnValue(table, 'entry_type', rowIndex),
+      message: getNullableStringColumnValue(table, 'message', rowIndex),
+      span_id: getNullableBigintColumnValue(table, 'span_id', rowIndex),
+      parent_span_id: getNullableBigintColumnValue(table, 'parent_span_id', rowIndex),
+    }));
+    const root = rows.find((r) => r.entry_type === 'span-start' && r.message === 'remote-root');
+    const child = rows.find((r) => r.entry_type === 'span-start' && r.message === 'local-child');
+    if (!root || !child) {
+      throw new Error('a span-start row is missing');
+    }
+
+    // The root's rows name the remote span; the child keeps its local parent, the root.
+    expect(root.parent_span_id).toBe(remote.span_id);
+    expect(getNullableBigintColumnValue(table, 'parent_thread_id', root.rowIndex)).toBe(Number(remote.thread_id));
+    expect(child.parent_span_id).toBe(root.span_id);
+    expect(rootBuffer._hasParent).toBe(true);
+    expect(rootBuffer.parent_thread_id).toBe(remote.thread_id);
+    expect(rootBuffer._parent).toBeUndefined();
   });
 
   it('should inherit parent schema when op() called from parent span', async () => {

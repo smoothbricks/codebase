@@ -198,7 +198,13 @@ export {
 // TraceRoot (Platform-specific)
 // =============================================================================
 
-export type { ITraceRoot, TraceRootFactory, TracerLifecycleHooks } from './lib/traceRoot.js';
+export {
+  type ITraceRoot,
+  isRemoteParent,
+  type RemoteParent,
+  type TraceRootFactory,
+  type TracerLifecycleHooks,
+} from './lib/traceRoot.js';
 
 // =============================================================================
 // UTF-8 Cache (for Arrow conversion)

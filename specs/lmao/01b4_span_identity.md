@@ -173,15 +173,16 @@ During cold path conversion to Arrow, span IDs become separate columns:
 // Arrow columns (separate, not a Struct)
 thread_id: Uint64; // buffer.thread_id (BigInt → Uint64)
 span_id: Uint32; // buffer.span_id (number → Uint32)
-parent_thread_id: Uint64; // buffer.parent?.thread_id (nullable)
-parent_span_id: Uint32; // buffer.parent?.span_id (nullable)
+parent_thread_id: Uint64; // buffer.parent?.thread_id, else the trace's remote parent (nullable)
+parent_span_id: Uint32; // buffer.parent?.span_id, else the trace's remote parent (nullable)
 ```
 
 **Conversion efficiency**:
 
 - `thread_id` BigInt conversion happens once per buffer (not per row)
 - `span_id` uses Uint32Array directly (no conversion needed)
-- Parent IDs derived from tree structure (no separate storage)
+- Parent IDs derived from tree structure (no separate storage); a root's remote parent is stored once, on its
+  `TraceRoot`
 
 ### Cross-Thread Parent References
 
@@ -206,6 +207,35 @@ const childBuffer = {
 // Arrow output (separate columns):
 // child: thread_id=0x9876543210fedcba, span_id=1, parent_thread_id=0x1a2b3c4d5e6f7890, parent_span_id=42
 ```
+
+### Remote Parent of a Root Span <a id="smoo/lmao!n/span-identity.remote-parent"></a>
+
+A trace that continues work begun elsewhere — a request another process sent, a job another host queued — roots its
+first span under the caller's span. Only the caller's identity crosses: the `thread_id` and `span_id` its own rows
+carry. There is no buffer to point at, so the parent is stored once, on the trace's `TraceRoot`:
+
+```typescript
+interface RemoteParent {
+  readonly thread_id: bigint; // nonzero u64
+  readonly span_id: number; // nonzero u32
+}
+
+await tracer.trace('handle-request', { trace_id, parent: { thread_id, span_id } }, async (ctx) => {
+  // ...
+});
+```
+
+- The root span — the one buffer of the trace with no local `parent`, and its overflow chain — reports the remote
+  parent: `_hasParent` is `true` and `parent_thread_id` / `parent_span_id` are the remote span's. Its Arrow rows carry
+  them in the parent columns. Every other span keeps its local parent.
+- `trace_id` is not implied by the parent. A caller that continues a trace passes both, and the reader joins the root to
+  its parent on `(trace_id, parent_thread_id, parent_span_id)` exactly as for a local parent.
+- A `parent` that is not a nonzero u64 `thread_id` and a nonzero u32 `span_id` is refused with a `TypeError` when the
+  trace opens. A root that silently lost its parent would be a tree that looks whole and is not.
+- A thread row store opens the root with the remote ids as its parent
+  (`openSpan(trace_id, parent_thread_id, parent_span_id, …)`), the same call a local parent makes.
+- The Rust tracer has the same shape: `TraceContext::identity(parent)` takes the parent `SpanIdentity` of any span, root
+  included, so a root opened under an adopted remote identity records it in the same two columns.
 
 ### Query Examples
 

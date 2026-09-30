@@ -16,6 +16,7 @@ import { ENTRY_TYPE_SPAN_EXCEPTION, ENTRY_TYPE_SPAN_START } from './schema/syste
 import { createTraceId, type TraceId } from './traceId.js';
 import {
   type ITraceRoot,
+  type RemoteParent,
   type SpanEndPrimitive,
   type SpanStartPrimitive,
   type TimestampAppendPrimitive,
@@ -115,6 +116,7 @@ export class TraceRoot<T extends LogSchema = LogSchema> implements ITraceRoot<T>
   readonly _system: ArrayBuffer;
   readonly _traceIdBytes: Uint8Array;
   readonly trace_id: TraceId;
+  readonly remoteParent: RemoteParent | undefined;
 
   /**
    * Tracer reference for lifecycle hooks and event callbacks.
@@ -145,12 +147,14 @@ export class TraceRoot<T extends LogSchema = LogSchema> implements ITraceRoot<T>
     anchorPerfNow: number,
     anchorHrtimeBigInt: bigint,
     tracer: TracerLifecycleHooks<T>,
+    remoteParent?: RemoteParent,
   ) {
     // Allocate buffer: 17 bytes header + trace_id length
     // trace_id is validated to be ASCII (1 byte per char) so length === byte length
     this._system = new ArrayBuffer(TRACE_ROOT_TRACE_ID_OFFSET + trace_id.length);
     this._traceIdBytes = new Uint8Array(this._system, TRACE_ROOT_TRACE_ID_OFFSET, trace_id.length);
     this.trace_id = trace_id;
+    this.remoteParent = remoteParent;
     this.tracer = tracer;
     this._topology = new TraceTopology();
 
@@ -221,11 +225,15 @@ export class TraceRoot<T extends LogSchema = LogSchema> implements ITraceRoot<T>
  * Factory function for creating Node.js TraceRoot instances.
  * Pass this to Tracer constructor for Node.js environments.
  */
-export function createTraceRoot<T extends LogSchema>(trace_id: string, tracer: TracerLifecycleHooks<T>): TraceRoot<T> {
+export function createTraceRoot<T extends LogSchema>(
+  trace_id: string,
+  tracer: TracerLifecycleHooks<T>,
+  parent?: RemoteParent,
+): TraceRoot<T> {
   const anchorEpochNanos = BigInt(Date.now()) * 1_000_000n;
   const anchorHrtimeBigInt = process.hrtime.bigint();
   // Also store as f64 in the shared _system layout (WASM reads it without BigInt extraction)
   const anchorPerfNow = Number(anchorHrtimeBigInt);
-  return new TraceRoot(createTraceId(trace_id), anchorEpochNanos, anchorPerfNow, anchorHrtimeBigInt, tracer);
+  return new TraceRoot(createTraceId(trace_id), anchorEpochNanos, anchorPerfNow, anchorHrtimeBigInt, tracer, parent);
 }
 //#endregion smoo/lmao!n/trace-root-timestamps
