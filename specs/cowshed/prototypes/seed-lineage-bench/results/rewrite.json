@@ -1,0 +1,101 @@
+{
+  "load_start": [20.87109375, 27.55859375, 26.21826171875],
+  "sizes": [
+    {
+      "label": "seed",
+      "allocated_gib": 7.378196716308594,
+      "extents_before": 24545,
+      "first_write_before": {
+        "clone": 0.00342550000641495,
+        "write": 0.16174566699191928,
+        "delete": 0.15026133396895602
+      },
+      "plain_copy": {
+        "elapsed": 2.6186590830329806,
+        "extents_after": 380,
+        "allocated_gib": 7.388671875,
+        "first_write_after": {
+          "clone": 0.0034282919950783253,
+          "write": 0.004105833009816706,
+          "delete": 0.0017572499928064644
+        },
+        "attach_fsck": 0.007103541982360184
+      },
+      "image_create_from": {
+        "elapsed": 2.0709465830004774,
+        "extents_after": 113,
+        "allocated_gib": 5.94140625,
+        "first_write_after": {
+          "clone": 0.0034178339992649853,
+          "write": 0.0011552079813554883,
+          "delete": 0.00043254095362499356
+        },
+        "attach_fsck": 0.007726792013272643
+      }
+    },
+    {
+      "label": "pad20",
+      "allocated_gib": 20.929271697998047,
+      "extents_before": 25338,
+      "first_write_before": {
+        "clone": 0.006680457969196141,
+        "write": 0.15324600000167266,
+        "delete": 0.16057270800229162
+      },
+      "plain_copy": {
+        "elapsed": 8.261505375034176,
+        "extents_after": 880,
+        "allocated_gib": 20.942562103271484,
+        "first_write_after": {
+          "clone": 0.003907917009200901,
+          "write": 0.009548541973344982,
+          "delete": 0.02575045800767839
+        },
+        "attach_fsck": 0.007859707984607667
+      },
+      "image_create_from": {
+        "elapsed": 7.216498791007325,
+        "extents_after": 648,
+        "allocated_gib": 20.115234375,
+        "first_write_after": {
+          "clone": 0.010753541020676494,
+          "write": 0.005827750021126121,
+          "delete": 0.002730709034949541
+        },
+        "attach_fsck": 0.011908374959602952
+      }
+    },
+    {
+      "label": "pad60",
+      "allocated_gib": 60.96247482299805,
+      "extents_before": 27121,
+      "first_write_before": {
+        "clone": 0.003864541999064386,
+        "write": 0.17898020904976875,
+        "delete": 0.18201495800167322
+      },
+      "plain_copy": {
+        "elapsed": 21.35218058299506,
+        "extents_after": 3438,
+        "allocated_gib": 60.97480392456055,
+        "first_write_after": {
+          "clone": 0.0029316250002011657,
+          "write": 0.06216258299537003,
+          "delete": 0.041324042016640306
+        },
+        "attach_fsck": 0.008399665995966643
+      },
+      "image_create_from": {
+        "elapsed": 20.02671158296289,
+        "extents_after": 3301,
+        "allocated_gib": 60.1103515625,
+        "first_write_after": {
+          "clone": 0.0035909159923903644,
+          "write": 0.05658641702029854,
+          "delete": 0.0411498750327155
+        },
+        "attach_fsck": 0.00631733302725479
+      }
+    }
+  ]
+}
