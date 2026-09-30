@@ -134,6 +134,22 @@ const binary = isAbsolute(command[0]) ? command[0] : resolve(process.cwd(), comm
 if (process.execve === undefined) {
   throw new Error('smoo-nx-exec needs process.execve, which requires a POSIX host on Node 24+ or Bun');
 }
+// Node puts a stdio pipe into O_NONBLOCK on macOS, and that flag belongs to the
+// open file description, so it outlives execve. A binary that writes as if its
+// stdout blocked would then lose everything past the first full pipe buffer
+// (EAGAIN) whenever its reader falls behind: a `<cli> list | jq` read
+// exactly 65536 bytes. Hand the binary the blocking stdio every program expects.
+for (const stream of [process.stdin, process.stdout, process.stderr]) {
+  const handle: unknown = Reflect.get(stream, '_handle');
+  if (
+    typeof handle === 'object' &&
+    handle !== null &&
+    'setBlocking' in handle &&
+    typeof handle.setBlocking === 'function'
+  ) {
+    handle.setBlocking(true);
+  }
+}
 // `execve`, not spawn-and-wait: the built binary replaces this process, so it
 // owns the terminal, the signals and the exit status directly, with no wrapper
 // left behind to forward them.

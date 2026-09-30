@@ -447,6 +447,26 @@ describe('smoo-nx-exec', () => {
     expect(run.stdout.split('\n')[0]).toBe(MARKER);
   });
 
+  it("hands the exec'd binary blocking stdio, so a pipe its output fills is never cut", async () => {
+    // Node leaves a pipe O_NONBLOCK on macOS, and the flag belongs to the open file description, so
+    // it survives execve: the binary's writes then fail with EAGAIN once the pipe holds 64 KiB and
+    // nobody is reading. A reader that starts late is what makes the pipe fill.
+    const flood = join(workspace, 'flood');
+    await writeFile(flood, '#!/bin/sh\nhead -c 300000 /dev/zero\n');
+    await chmod(flood, 0o755);
+    try {
+      const piped = Bun.spawn(
+        ['sh', '-c', `"$0" "$1" app:build -- ./flood | { sleep 1; tr -cd '\\000' | wc -c; }`, 'node', builtBinEntry],
+        { cwd: workspace, env: fixtureNxEnvironment(), stdout: 'pipe', stderr: 'pipe' },
+      );
+      const received = (await new Response(piped.stdout).text()).trim();
+      expect(await piped.exited).toBe(0);
+      expect(received).toBe('300000');
+    } finally {
+      await rm(flood, { force: true });
+    }
+  });
+
   it('leaves the exec\u0027d binary the caller\u0027s cwd and none of Nx\u0027s environment', async () => {
     // Invoked from a subdirectory, with the binary named relative to it: the
     // resolution the wrapper's users actually perform.
