@@ -544,6 +544,35 @@ describe('smoo-nx-exec', () => {
     expect(settled.stdout.split('\n')[0]).toBe(MARKER);
   });
 
+  it('without a binary, stays silent and exits 0 when nothing is stale', async () => {
+    const run = await runBin(workspace, ['app:build']);
+    expect(run.code, run.stdout + run.stderr).toBe(0);
+    expect(run.stdout).toBe('');
+    expect(run.stderr).toBe('');
+  });
+
+  it('without a binary, runs what is stale, shows that run and exits 0', async () => {
+    const before = await readFile(builds(), 'utf-8');
+    await writeFile(join(workspace, 'packages', 'lib', 'source1.txt'), 'lib checked\n');
+    const run = await runBin(workspace, ['app:build']);
+    expect(run.code, run.stdout + run.stderr).toBe(0);
+    expect(run.stdout).toContain('nx run lib:build');
+    expect(run.stdout).not.toContain(MARKER);
+    expect(await readFile(marker(), 'utf-8')).toBe('built\nlib checked\n');
+    expect(await readFile(builds(), 'utf-8')).toBe(`${before}lib checked\n`);
+
+    const settled = await runBin(workspace, ['app:build']);
+    expect(settled.code, settled.stdout + settled.stderr).toBe(0);
+    expect(settled.stdout).toBe('');
+    expect(settled.stderr).toBe('');
+  });
+
+  it('without a binary, exits with a failing target\u0027s code', async () => {
+    const run = await runBin(workspace, ['app:broken']);
+    expect(run.code).toBe(1);
+    expect(run.stdout).toContain('nx run app:broken');
+  });
+
   it('forwards a failing target\u0027s exit code and never execs', async () => {
     const run = await runBin(workspace, ['app:broken', '--', './report']);
     expect(run.code).toBe(1);
@@ -597,9 +626,9 @@ describe('smoo-nx-exec', () => {
   });
 
   it('rejects a malformed invocation with a usage error', async () => {
-    const missingSeparator = await runBin(workspace, ['app:build']);
-    expect(missingSeparator.code).toBe(2);
-    expect(missingSeparator.stderr).toContain('missing `--`');
+    const emptyCommand = await runBin(workspace, ['app:build', '--']);
+    expect(emptyCommand.code).toBe(2);
+    expect(emptyCommand.stderr).toContain('no binary given');
 
     const badTarget = await runBin(workspace, ['build', '--', './report']);
     expect(badTarget.code).toBe(2);

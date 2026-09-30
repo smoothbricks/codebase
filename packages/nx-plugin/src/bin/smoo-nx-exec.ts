@@ -5,7 +5,7 @@ import { inspect } from 'node:util';
 
 import { describeMiss, ensureBuilt, parseTargetSelector } from '../ensure-built.js';
 
-const USAGE = 'usage: smoo-nx-exec <project:target[:configuration]> [--workspace-root <dir>] -- <binary> [args...]';
+const USAGE = 'usage: smoo-nx-exec <project:target[:configuration]> [--workspace-root <dir>] [-- <binary> [args...]]';
 
 /** Argument and environment problems all exit 2, the shell's "usage" code. */
 function usageError(message: string): never {
@@ -58,17 +58,17 @@ function findWorkspaceRoot(from: string): string {
 
 const argv = process.argv.slice(2);
 const separator = argv.indexOf('--');
-if (separator === -1) {
-  usageError('missing `--` before the binary to exec');
-}
-const command = argv.slice(separator + 1);
-if (command.length === 0) {
+// Without `--` there is nothing to exec: build what is stale and exit, so a
+// caller that only needs the target current pays the probe, not an Nx CLI
+// start that replays every cached task's log.
+const command = separator === -1 ? [] : argv.slice(separator + 1);
+if (separator !== -1 && command.length === 0) {
   usageError('no binary given after `--`');
 }
 
 let target: string | undefined;
 let workspaceRootArg: string | undefined;
-const tokens = tokenize(argv.slice(0, separator));
+const tokens = tokenize(separator === -1 ? argv : argv.slice(0, separator));
 for (let index = 0; index < tokens.length; index += 1) {
   const token = tokens[index];
   if (token === '--workspace-root') {
@@ -91,12 +91,9 @@ if (parseTargetSelector(target) === null) {
 
 // `execve` does no PATH lookup, so a bare name would fail as a missing file in
 // the current directory. Say which mistake was made instead.
-if (!command[0].includes('/')) {
+if (command.length > 0 && !command[0].includes('/')) {
   usageError(`'${command[0]}' must be a path to the binary, not a name to look up on PATH`);
 }
-// Resolved against the directory the user is standing in, not the workspace
-// root: this is their command line, and the exec'd process inherits their cwd.
-const binary = isAbsolute(command[0]) ? command[0] : resolve(process.cwd(), command[0]);
 
 const workspaceRoot =
   workspaceRootArg === undefined ? findWorkspaceRoot(process.cwd()) : resolve(process.cwd(), workspaceRootArg);
@@ -109,6 +106,15 @@ const result = await ensureBuilt({ target, cwd: workspaceRoot }).catch((error: u
 if (result.disposition !== 'hit' && process.env.NX_VERBOSE_LOGGING === 'true') {
   process.stderr.write(`smoo-nx-exec: ran ${target} because ${describeMiss(result.reason)}\n`);
 }
+if (result.disposition === 'failed' || command.length === 0) {
+  // This process ends here rather than becoming the binary, and `process.exit`
+  // drops whatever a pipe has not taken yet: stdio pipes are asynchronous on
+  // macOS, and the tail of a build log is the part that explains it. Under
+  // Node an empty write completes once everything queued before it has.
+  await Promise.all(
+    [process.stdout, process.stderr].map((stream) => new Promise<void>((settle) => stream.write('', () => settle()))),
+  );
+}
 if (result.disposition === 'failed') {
   if (result.signal !== null) {
     // Re-raise rather than translate, so a build killed by SIGINT leaves this
@@ -117,6 +123,13 @@ if (result.disposition === 'failed') {
   }
   process.exit(result.exitCode);
 }
+if (command.length === 0) {
+  process.exit(0);
+}
+
+// Resolved against the directory the user is standing in, not the workspace
+// root: this is their command line, and the exec'd process inherits their cwd.
+const binary = isAbsolute(command[0]) ? command[0] : resolve(process.cwd(), command[0]);
 
 if (process.execve === undefined) {
   throw new Error('smoo-nx-exec needs process.execve, which requires a POSIX host on Node 24+ or Bun');

@@ -418,6 +418,14 @@ It is deliberately not `nx run <target> && exec`:
 Pass `--workspace-root <dir>` before `--` when invoking the wrapper outside the workspace. The binary path resolves
 against the caller's current directory.
 
+Without `--` and a binary, the wrapper only makes the target current and exits 0, or with the failed run's status:
+
+```bash
+smoo-nx-exec my-cli:build --workspace-root "$root"
+```
+
+A hit prints nothing, where `nx run` would replay every task's cached log. A miss prints Nx's run of the target.
+
 ## Bun Test Tracing Generator
 
 Configure a package for the Bun test tracing + no-emit test typechecking pattern used in this repo.
