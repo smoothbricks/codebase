@@ -19,7 +19,7 @@ import { createRequire } from 'node:module';
 import path from 'node:path';
 import { parseArgs } from 'node:util';
 import { $ } from 'bun';
-import { keepDeveloperLinks } from './developer-links.ts';
+import { keepDeveloperLinks, reportDeveloperLinks } from './developer-links.ts';
 import {
   type DeferredSecret,
   dependentGroups,
@@ -188,7 +188,11 @@ try {
     const uv = uvInstaller(uvInputs, { locked: false });
     const bun = bunInstaller(bunInputs);
     const installError = await withInstallLock(async () => {
-      const error = await installLocalDependencies(uv === null ? [bun] : [bun, uv]);
+      const pending = (uv === null ? [bun] : [bun, uv]).filter((installer) => !installer.isCurrent());
+      const error = await installLocalDependencies(pending);
+      if (!pending.includes(bun)) {
+        reportDeveloperLinks(projectRoot);
+      }
       if (error === undefined) {
         // Pin unscoped typescript → API 6 for root and Bun's shared .bun hoist (Nx).
         ensureTypeScriptApiPackage(projectRoot);
@@ -234,11 +238,10 @@ async function resolveSecrets(): Promise<void> {
 /**
  * Runs every installer whose inputs changed since its last successful run.
  * Returned, not thrown: the caller still keeps the git config, then reports a
- * degraded shell. Called under the install lock, so an installer another
- * shell entry just ran is already current here.
+ * degraded shell. The caller selects them under the install lock, so an
+ * installer another shell entry just ran is already current there.
  */
-async function installLocalDependencies(installers: readonly Installer[]): Promise<unknown> {
-  const pending = installers.filter((installer) => !installer.isCurrent());
+async function installLocalDependencies(pending: readonly Installer[]): Promise<unknown> {
   if (pending.length === 0) {
     return undefined;
   }

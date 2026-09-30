@@ -418,9 +418,12 @@ ln -sfn ~/src/smoothbricks/packages/cowshed packages/app/node_modules/@smoothbri
 Every install smoo runs keeps such a link: shell entry's install, a CI runner's frozen-lockfile install and
 `smoo monorepo update`. A developer link is any symlink directly in the root's or a workspace member's `node_modules`
 (scoped names included) whose target lies outside the repository. The install records these links first, then puts
-exactly those back afterwards and prints one line naming them (`developer links kept: …`). A link whose target no longer
-exists is removed with a warning, and that install puts the lockfile's version in its place. To unlink, remove the link:
-the next install puts the lockfile's version there.
+exactly those back afterwards. A link whose target no longer exists is removed with a warning, and that install puts the
+lockfile's version in its place. To unlink, remove the link: the next install puts the lockfile's version there.
+
+While such links exist, every shell entry and every install smoo runs prints one line naming them, such as
+`linked to local checkouts: @smoothbricks/lmao -> ~/src/smoothbricks/packages/lmao (12 links)`. Entries that install
+nothing print it too, because devenv's direnv integration hides the output of the run that installs.
 
 A plain `bun install`, `bun add` or `bun remove` re-points every declared dependency at its lockfile version, links
 included. Bun does this before the root `preinstall` script runs, so no lifecycle script can keep a link. smoo has no

@@ -62,9 +62,8 @@ interface DeveloperLinks {
 /**
  * Runs `install` with every developer link under `root` kept. The links in
  * place when it starts are exactly the links in place when it settles,
- * whether it resolved or rejected, less those that already dangled. One
- * stderr line names each kept link and where it points, so a developer sees
- * which packages are running from a local build.
+ * whether it resolved or rejected, less those that already dangled. It then
+ * names them as `reportDeveloperLinks` does.
  */
 export async function keepDeveloperLinks<T>(root: string, install: () => Promise<T>): Promise<T> {
   const { live, dangling } = findDeveloperLinks(root);
@@ -78,12 +77,35 @@ export async function keepDeveloperLinks<T>(root: string, install: () => Promise
     for (const link of live) {
       restoreLink(root, link);
     }
-    if (live.length > 0) {
-      console.error(
-        `developer links kept: ${live.map((link) => `${link.path} -> ${resolvedTarget(root, link)}`).join(', ')}`,
-      );
-    }
+    describeDeveloperLinks(root, live);
   }
+}
+
+/**
+ * One stderr line naming each linked package and the checkout it points at,
+ * so a shell running a local build says so. Shell entry prints it on every
+ * entry that installs nothing. The entry that installs gets the same line
+ * from `keepDeveloperLinks`, but devenv's direnv integration runs that entry
+ * where its output is not shown. A dangling link is left for the next
+ * install to remove.
+ */
+export function reportDeveloperLinks(root: string): void {
+  describeDeveloperLinks(root, findDeveloperLinks(root).live);
+}
+
+/** A package linked from many members is named once, with its count. */
+function describeDeveloperLinks(root: string, links: readonly DeveloperLink[]): void {
+  if (links.length === 0) {
+    return;
+  }
+  const counts = new Map<string, number>();
+  for (const link of links) {
+    const name = link.path.slice(link.path.lastIndexOf('node_modules/') + 'node_modules/'.length);
+    const named = `${name} -> ${resolvedTarget(root, link)}`;
+    counts.set(named, (counts.get(named) ?? 0) + 1);
+  }
+  const entries = [...counts].map(([named, count]) => (count === 1 ? named : `${named} (${count} links)`));
+  console.error(`linked to local checkouts: ${entries.join(', ')}`);
 }
 
 function findDeveloperLinks(root: string): DeveloperLinks {

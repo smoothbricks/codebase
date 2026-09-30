@@ -451,7 +451,7 @@ describe('what shell entry keeps linked', () => {
   const touchManifest = (root: string) =>
     edit(join(root, 'packages/util/package.json'), JSON.stringify({ name: 'util', version: '0.0.1' }));
 
-  it('puts a link to a local checkout back after the install it runs, and leaves every other link as bun wrote it', async () => {
+  it('names a link to a local checkout on every entry, and puts it back after the install it runs', async () => {
     await withManagedRepository(WORKSPACE, async ({ root, enterShell: enter, count }) => {
       expect(await enter()).toEqual(HEALTHY);
       expect(readlinkSync(join(root, LINKED))).toBe('../../../lib');
@@ -462,9 +462,13 @@ describe('what shell entry keeps linked', () => {
       await writeFile(join(local, 'package.json'), JSON.stringify({ name: '@fixture/lib', version: '9.9.9' }));
       await rm(join(root, LINKED));
       symlinkSync(local, join(root, LINKED));
+      const linked = { exitCode: 0, stderr: `linked to local checkouts: @fixture/lib -> ${local}\n` };
+
+      expect(await enter()).toEqual(linked);
+      expect(count('install')).toBe(1);
 
       await touchManifest(root);
-      expect(await enter()).toEqual({ exitCode: 0, stderr: `developer links kept: ${LINKED} -> ${local}\n` });
+      expect(await enter()).toEqual(linked);
       expect(count('install')).toBe(2);
       expect(readlinkSync(join(root, LINKED))).toBe(local);
       expect(readlinkSync(join(root, UNLINKED))).toBe('../../util');
