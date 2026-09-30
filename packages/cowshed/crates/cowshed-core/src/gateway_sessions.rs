@@ -8,7 +8,10 @@
 //! deleted project left holding a port block this project now owns is evicted once no live
 //! workspace claims it, a live collision is an integrity refusal naming both, and installs are
 //! independent so one refusal does not abandon the rest. Every controller that needs the gateway
-//! runs it first — the CLI before a gateway-requiring verb, a supervising runtime before an exec.
+//! runs it first — the CLI before a gateway-requiring verb, a supervising runtime before an exec —
+//! so reconciles of one project run concurrently: each reads gateway status before its inventory
+//! snapshot, and a write the gateway refuses because a newer reconcile overtook it is superseded,
+//! not failed.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -47,6 +50,9 @@ pub fn control_socket_path() -> PathBuf {
 pub struct ReconcileReport {
     pub installed: usize,
     pub removed: usize,
+    /// Writes the gateway refused because a concurrent reconcile had already acted on a newer
+    /// snapshot of that workspace: its decision stands, and this reconcile's older one is dropped.
+    pub superseded: usize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -55,22 +61,42 @@ pub enum GatewayStatusError {
     Control(String),
 }
 
+/// Why the gateway refused a reconcile write.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ControlRefusal {
+    /// The gateway already holds a decision about this workspace newer than the reconciling
+    /// snapshot: the install's revision does not exceed one the workspace has held, or the session
+    /// a removal names has since been replaced or removed. Another reconcile that read a newer
+    /// snapshot made it, and it stands.
+    Superseded(String),
+    Failed(String),
+}
+
+impl std::fmt::Display for ControlRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Superseded(reason) | Self::Failed(reason) => formatter.write_str(reason),
+        }
+    }
+}
+
 /// The running daemon, as reconciliation needs to see it.
 ///
 /// Everything below is a pure function of inventory and this trait's three answers, so the
 /// controller never links the daemon: `cowshed-cli` implements it over the real control client,
 /// and the tests implement it over a fake. `GatewayStatusError::Absent` is a distinct answer
 /// rather than an error string because "no gateway is running" is a normal state with its own
-/// operator remedy, not a control-plane fault.
+/// operator remedy, not a control-plane fault; `ControlRefusal::Superseded` likewise separates a
+/// write another reconcile already overtook from a write that failed.
 #[async_trait]
 pub trait GatewayControl: Send + Sync {
     async fn status(&self) -> std::result::Result<GatewayStatus, GatewayStatusError>;
-    async fn install(&self, session: &WorkspaceSession) -> std::result::Result<(), String>;
+    async fn install(&self, session: &WorkspaceSession) -> std::result::Result<(), ControlRefusal>;
     async fn remove(
         &self,
         workspace_id: &str,
         expected_revision: u64,
-    ) -> std::result::Result<(), String>;
+    ) -> std::result::Result<(), ControlRefusal>;
 }
 
 #[async_trait]
@@ -258,11 +284,18 @@ pub fn sessions_from_facts(
     facts.into_iter().map(session_from_fact).collect()
 }
 
+/// Reconcile one project: gateway status first, then the project's inventory snapshot.
+///
+/// The order is the linearization. Every session status reports was installed from a snapshot its
+/// reconcile read before installing, so before this status read; a snapshot read after it is at
+/// least as new as every one of them, and removing on its strength never revokes a newer decision.
+/// Read the other way round, a snapshot from before an attach revokes the session the attach's
+/// reconcile installed, and the tombstone that removal leaves refuses the attached workspace's
+/// own revision on every later reconcile until it is detached and attached again.
 pub async fn reconcile_project<C, I>(
     control: &C,
-    host: &I,
-    project_prefix: &str,
-    desired: Vec<WorkspaceSession>,
+    inventory: &I,
+    repo_id: &RepoId,
     uid: u32,
 ) -> Result<ReconcileReport>
 where
@@ -275,7 +308,15 @@ where
             CowshedError::internal(format!("gateway status failed: {message}"))
         }
     })?;
-    reconcile_against_status(control, host, project_prefix, desired, status).await
+    let desired = inventory.project_sessions(repo_id).await?;
+    reconcile_against_status(
+        control,
+        inventory,
+        &project_session_prefix(repo_id),
+        desired,
+        status,
+    )
+    .await
 }
 
 /// Bring the gateway's sessions for one project in line with that project's inventory.
@@ -288,7 +329,9 @@ where
 /// only once `host` confirms no live workspace anywhere still claims that identity, so a genuine
 /// two-projects-one-block inventory fault is reported instead of papered over. The host lookup
 /// runs only when such a conflict exists. Installs are independent, so one workspace that cannot
-/// be installed does not abandon the rest: every failure is reported together.
+/// be installed does not abandon the rest: every failure is reported together. A write the
+/// gateway refuses as superseded lost a race to a reconcile that read a newer snapshot; the newer
+/// decision stands and the write is counted in `superseded`, not failed.
 pub async fn reconcile_against_status<C, I>(
     control: &C,
     host: &I,
@@ -331,16 +374,19 @@ where
         .filter(|session| session.workspace_id.starts_with(project_prefix))
     {
         if !desired_ids.contains(installed.workspace_id.as_str()) {
-            control
+            match control
                 .remove(&installed.workspace_id, installed.revision)
                 .await
-                .map_err(|error| {
-                    CowshedError::internal(format!(
+            {
+                Ok(()) => report.removed += 1,
+                Err(ControlRefusal::Superseded(_)) => report.superseded += 1,
+                Err(ControlRefusal::Failed(error)) => {
+                    return Err(CowshedError::internal(format!(
                         "could not remove stale gateway session {}: {error}",
                         installed.workspace_id
-                    ))
-                })?;
-            report.removed += 1;
+                    )));
+                }
+            }
         }
     }
     let desired_endpoints: BTreeMap<String, &str> = desired_by_id
@@ -374,16 +420,16 @@ where
                     "cowshed doctor --json",
                 ));
             }
-            control
-                .remove(&owner.workspace_id, owner.revision)
-                .await
-                .map_err(|error| {
-                    CowshedError::internal(format!(
+            match control.remove(&owner.workspace_id, owner.revision).await {
+                Ok(()) => report.removed += 1,
+                Err(ControlRefusal::Superseded(_)) => report.superseded += 1,
+                Err(ControlRefusal::Failed(error)) => {
+                    return Err(CowshedError::internal(format!(
                         "could not remove stale gateway session {} holding endpoint {}: {error}",
                         owner.workspace_id, owner.endpoint
-                    ))
-                })?;
-            report.removed += 1;
+                    )));
+                }
+            }
         }
     }
     let mut failures = Vec::new();
@@ -396,7 +442,8 @@ where
         }
         match control.install(session).await {
             Ok(()) => report.installed += 1,
-            Err(error) => failures.push(format!(
+            Err(ControlRefusal::Superseded(_)) => report.superseded += 1,
+            Err(ControlRefusal::Failed(error)) => failures.push(format!(
                 "could not install gateway session {identity}: {error}"
             )),
         }
@@ -406,26 +453,6 @@ where
     } else {
         Err(CowshedError::internal(failures.join("; ")))
     }
-}
-
-pub async fn reconcile_inventory_project<I, C>(
-    inventory: &I,
-    control: &C,
-    repo_id: &RepoId,
-    uid: u32,
-) -> Result<ReconcileReport>
-where
-    I: SessionInventory,
-    C: GatewayControl + ?Sized,
-{
-    reconcile_project(
-        control,
-        inventory,
-        &project_session_prefix(repo_id),
-        inventory.project_sessions(repo_id).await?,
-        uid,
-    )
-    .await
 }
 
 pub fn canonical_home() -> Result<PathBuf> {

@@ -1,8 +1,6 @@
 use super::*;
 use cowshed_cli::gateway_service::{ControlSocket, reconcile_project};
-use cowshed_core::gateway_sessions::{
-    SessionInventory, policy_from_grants, project_session_prefix, stable_workspace_id,
-};
+use cowshed_core::gateway_sessions::{SessionInventory, policy_from_grants, stable_workspace_id};
 use cowshed_core::workspace_environment::PORT_BASE_ENV;
 use cowshed_gateway::{
     ArrowAuditConfig, ArrowAuditSink, AuthorizedTarget, CanonicalTarget, ConnectError,
@@ -221,15 +219,9 @@ impl Fixture {
 
     pub(super) async fn reconcile(&mut self, grants: &GrantSet) -> Result<()> {
         self.grants = grants.clone();
-        reconcile_project(
-            &self.control,
-            self,
-            &project_session_prefix(&self.repo),
-            vec![self.session()],
-            unsafe { libc::geteuid() },
-        )
-        .await
-        .map(|_| ())
+        reconcile_project(&self.control, self, &self.repo, unsafe { libc::geteuid() })
+            .await
+            .map(|_| ())
     }
 
     pub(super) async fn land(&mut self, options: LandOptions) -> Result<LandReport> {

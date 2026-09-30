@@ -15,8 +15,8 @@ use cowshed_core::{
     validate_existing_host_storage,
 };
 use cowshed_gateway::{
-    ArrowAuditConfig, ControlError, Gateway, GatewayConfig, GatewayControlClient, GatewayHandle,
-    GatewayStatus, MirrorCacheConfig, WorkspaceSession,
+    ArrowAuditConfig, ControlError, ControlFailureCode, Gateway, GatewayConfig,
+    GatewayControlClient, GatewayHandle, GatewayStatus, MirrorCacheConfig, WorkspaceSession,
 };
 use sha2::{Digest as _, Sha256};
 use std::fs;
@@ -26,11 +26,11 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 pub use cowshed_core::gateway_sessions::{
-    GATEWAY_START_HINT, GatewayControl, GatewayInstaller, GatewayStatusError,
+    ControlRefusal, GATEWAY_START_HINT, GatewayControl, GatewayInstaller, GatewayStatusError,
     NativeSessionInventory, ReconcileReport, SessionInventory, canonical_home, control_error,
     control_socket_path, effective_uid, gateway_absent, install_all_sessions, policy_from_grants,
-    project_session_prefix, reconcile_against_status, reconcile_inventory_project,
-    reconcile_project, session_from_fact, sessions_from_facts, stable_workspace_id,
+    project_session_prefix, reconcile_against_status, reconcile_project, session_from_fact,
+    sessions_from_facts, stable_workspace_id,
 };
 
 /// A running daemon reached over its control socket.
@@ -63,22 +63,32 @@ impl GatewayControl for ControlSocket {
         })
     }
 
-    async fn install(&self, session: &WorkspaceSession) -> std::result::Result<(), String> {
-        self.0
-            .install(session)
-            .await
-            .map_err(|error| error.to_string())
+    async fn install(&self, session: &WorkspaceSession) -> std::result::Result<(), ControlRefusal> {
+        self.0.install(session).await.map_err(control_refusal)
     }
 
     async fn remove(
         &self,
         workspace_id: &str,
         expected_revision: u64,
-    ) -> std::result::Result<(), String> {
+    ) -> std::result::Result<(), ControlRefusal> {
         self.0
             .remove(workspace_id, expected_revision)
             .await
-            .map_err(|error| error.to_string())
+            .map_err(control_refusal)
+    }
+}
+
+/// The fence's two refusals are another reconcile's newer decision: an install whose revision the
+/// workspace has already held or passed, a removal whose session was replaced (`RevisionFence`) or
+/// already removed (`NotInstalled`). Everything else is this write failing.
+fn control_refusal(error: ControlError) -> ControlRefusal {
+    match error {
+        ControlError::Rejected {
+            code: ControlFailureCode::RevisionFence | ControlFailureCode::NotInstalled,
+            ..
+        } => ControlRefusal::Superseded(error.to_string()),
+        error => ControlRefusal::Failed(error.to_string()),
     }
 }
 
@@ -106,7 +116,7 @@ pub async fn reconcile_native_project(repo_id: &RepoId) -> Result<ReconcileRepor
     let storage = validate_existing_host_storage(&home).await?;
     let inventory = NativeSessionInventory::new(storage);
     let control = ControlSocket::at(control_socket_path())?;
-    reconcile_inventory_project(&inventory, &control, repo_id, effective_uid()).await
+    reconcile_project(&control, &inventory, repo_id, effective_uid()).await
 }
 
 /// How long `gateway start` waits for the daemon's control socket.

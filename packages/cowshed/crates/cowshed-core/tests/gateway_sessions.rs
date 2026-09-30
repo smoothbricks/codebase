@@ -5,9 +5,9 @@
 
 use async_trait::async_trait;
 use cowshed_core::gateway_sessions::{
-    GatewayControl, GatewayInstaller, GatewayStatusError, SessionInventory, install_all_sessions,
-    policy_from_grants, project_session_prefix, reconcile_against_status, reconcile_project,
-    stable_workspace_id,
+    ControlRefusal, GatewayControl, GatewayInstaller, GatewayStatusError, SessionInventory,
+    install_all_sessions, policy_from_grants, project_session_prefix, reconcile_against_status,
+    reconcile_project, stable_workspace_id,
 };
 use cowshed_core::metadata::{EgressMode, EgressRule, GrantSet, WorkspaceIncarnation};
 use cowshed_core::repository::RepoId;
@@ -16,8 +16,10 @@ use cowshed_gateway_types::{
     GatewayStatus, SessionStatus, WorkspaceCa, WorkspaceEndpoint, WorkspacePolicy,
     WorkspaceSession, WorkspaceToken,
 };
+use std::collections::BTreeMap;
 use std::net::{Ipv4Addr, SocketAddr};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 fn workspace_id(repo: &RepoId, workspace: &str, incarnation: u8) -> String {
     let incarnation =
@@ -107,14 +109,16 @@ impl GatewayControl for FakeControl {
             })
     }
 
-    async fn install(&self, session: &WorkspaceSession) -> std::result::Result<(), String> {
+    async fn install(&self, session: &WorkspaceSession) -> std::result::Result<(), ControlRefusal> {
         if self
             .refuse_installs
             .lock()
             .expect("refusal lock")
             .contains(&session.workspace_id)
         {
-            return Err("gateway control rejected operation (EndpointConflict)".to_owned());
+            return Err(ControlRefusal::Failed(
+                "gateway control rejected operation (EndpointConflict)".to_owned(),
+            ));
         }
         self.installs
             .lock()
@@ -127,7 +131,7 @@ impl GatewayControl for FakeControl {
         &self,
         workspace_id: &str,
         expected_revision: u64,
-    ) -> std::result::Result<(), String> {
+    ) -> std::result::Result<(), ControlRefusal> {
         self.removes
             .lock()
             .expect("remove lock")
@@ -223,15 +227,9 @@ async fn absent_gateway_is_exit_five_and_guides_the_install() {
         status: Mutex::new(Some(Err(GatewayStatusError::Absent))),
         ..FakeControl::default()
     };
-    let error = reconcile_project(
-        &control,
-        &untouched_host(),
-        &project_session_prefix(&repo),
-        Vec::new(),
-        501,
-    )
-    .await
-    .expect_err("gateway absence fails");
+    let error = reconcile_project(&control, &untouched_host(), &repo, 501)
+        .await
+        .expect_err("gateway absence fails");
     assert_eq!(error.exit_code(), 5);
     // `cowshed gateway start` installs the launch agent as well as starting it,
     // so it is correct on a host where the agent was never installed — which is
@@ -250,15 +248,9 @@ async fn status_protocol_failures_are_not_reported_as_gateway_absence() {
         ..FakeControl::default()
     };
 
-    let error = reconcile_project(
-        &control,
-        &untouched_host(),
-        &project_session_prefix(&repo),
-        Vec::new(),
-        501,
-    )
-    .await
-    .expect_err("a malformed response must remain distinguishable from an absent socket");
+    let error = reconcile_project(&control, &untouched_host(), &repo, 501)
+        .await
+        .expect_err("a malformed response must remain distinguishable from an absent socket");
 
     assert_eq!(error.exit_code(), 1);
     assert!(
@@ -391,6 +383,199 @@ async fn one_refused_install_does_not_abandon_the_other_workspaces() {
     let mut expected = vec![first, last];
     expected.sort();
     assert_eq!(installed, expected);
+}
+
+/// The daemon's session table and revision fence as it enforces them: an install must exceed every
+/// revision the workspace has ever held (a removal leaves that revision as a tombstone), and a
+/// removal must name the installed revision. `concurrent` is another reconciler's install that
+/// lands after this reconcile read status and before its first write.
+#[derive(Default)]
+struct FencedGateway {
+    live: Mutex<BTreeMap<String, u64>>,
+    high_water: Mutex<BTreeMap<String, u64>>,
+    status_read: Arc<AtomicBool>,
+    concurrent: Mutex<Option<(String, u64)>>,
+}
+
+impl FencedGateway {
+    fn holding(identity: &str, revision: u64) -> Self {
+        let gateway = Self::default();
+        gateway
+            .admit(identity, revision)
+            .expect("seed installed session");
+        gateway
+    }
+
+    fn admit(&self, identity: &str, revision: u64) -> std::result::Result<(), ControlRefusal> {
+        let mut high_water = self.high_water.lock().expect("fence lock");
+        if high_water
+            .get(identity)
+            .is_some_and(|fence| revision <= *fence)
+        {
+            return Err(ControlRefusal::Superseded(
+                "gateway control rejected operation (RevisionFence): workspace session revision did not advance"
+                    .to_owned(),
+            ));
+        }
+        high_water.insert(identity.to_owned(), revision);
+        self.live
+            .lock()
+            .expect("table lock")
+            .insert(identity.to_owned(), revision);
+        Ok(())
+    }
+
+    fn land_concurrent_write(&self) {
+        if let Some((identity, revision)) = self.concurrent.lock().expect("script lock").take() {
+            self.admit(&identity, revision)
+                .expect("the concurrent reconciler's install is newer");
+        }
+    }
+
+    fn live(&self) -> BTreeMap<String, u64> {
+        self.live.lock().expect("table lock").clone()
+    }
+}
+
+#[async_trait]
+impl GatewayControl for FencedGateway {
+    async fn status(&self) -> std::result::Result<GatewayStatus, GatewayStatusError> {
+        self.status_read.store(true, Ordering::SeqCst);
+        Ok(status(
+            self.live()
+                .into_iter()
+                .map(|(identity, revision)| installed(&identity, revision))
+                .collect(),
+        ))
+    }
+
+    async fn install(&self, session: &WorkspaceSession) -> std::result::Result<(), ControlRefusal> {
+        self.land_concurrent_write();
+        self.admit(&session.workspace_id, session.revision)
+    }
+
+    async fn remove(
+        &self,
+        workspace_id: &str,
+        expected_revision: u64,
+    ) -> std::result::Result<(), ControlRefusal> {
+        self.land_concurrent_write();
+        let mut live = self.live.lock().expect("table lock");
+        match live.get(workspace_id) {
+            Some(&revision) if revision == expected_revision => {
+                live.remove(workspace_id);
+                Ok(())
+            }
+            Some(&revision) => Err(ControlRefusal::Superseded(format!(
+                "gateway control rejected operation (RevisionFence): workspace session revision mismatch: expected {expected_revision}, got {revision}"
+            ))),
+            None => Err(ControlRefusal::Superseded(
+                "gateway control rejected operation (NotInstalled): workspace is not installed"
+                    .to_owned(),
+            )),
+        }
+    }
+}
+
+/// Answers from the host store as it stands when asked: `raven` is detached until the moment the
+/// reconcile reads gateway status, and attached at revision 6 from then on — the attach, and the
+/// install of revision 6 by the reconcile that followed it, happened in between.
+struct AttachingInventory {
+    status_read: Arc<AtomicBool>,
+    attached: String,
+}
+
+#[async_trait]
+impl SessionInventory for AttachingInventory {
+    async fn all_sessions(&self) -> Result<Vec<WorkspaceSession>> {
+        Err(CowshedError::internal("host inventory not expected"))
+    }
+
+    async fn project_sessions(&self, _repo_id: &RepoId) -> Result<Vec<WorkspaceSession>> {
+        Ok(if self.status_read.load(Ordering::SeqCst) {
+            vec![session(&self.attached, 6, 1)]
+        } else {
+            Vec::new()
+        })
+    }
+}
+
+/// Every session a reconcile sees in gateway status was installed from an inventory snapshot older
+/// than its own, so it may remove a session only on the strength of a snapshot taken after that
+/// status. Reading the snapshot first lets a view from before an attach revoke the session the
+/// attach installed, and the tombstone that removal leaves then refuses the attached workspace's
+/// own revision on every later reconcile: `RevisionFence` on a healthy gateway until the workspace
+/// is detached and attached again.
+#[tokio::test]
+async fn a_reconcile_never_revokes_a_session_installed_after_its_inventory_snapshot() {
+    let repo = RepoId::parse("acme/widget").expect("repo");
+    let raven = workspace_id(&repo, "raven", 1);
+    let gateway = FencedGateway::holding(&raven, 6);
+    let inventory = AttachingInventory {
+        status_read: Arc::clone(&gateway.status_read),
+        attached: raven.clone(),
+    };
+
+    reconcile_project(&gateway, &inventory, &repo, 501)
+        .await
+        .expect("first reconcile");
+    reconcile_project(&gateway, &inventory, &repo, 501)
+        .await
+        .expect("the attached workspace's own revision stays installable");
+
+    assert_eq!(gateway.live(), BTreeMap::from([(raven, 6)]));
+}
+
+/// A reconcile's writes race every other reconcile of the project: one that read a newer snapshot
+/// can install a newer revision after this one read status. The gateway refusing the older
+/// revision is that newer decision standing, not a failure of the command that happened to lose
+/// the race — `land --check`'s preflight must not fail on another workspace's attach.
+#[tokio::test]
+async fn an_install_superseded_by_a_newer_reconcile_is_reported_not_failed() {
+    let repo = RepoId::parse("acme/widget").expect("repo");
+    let raven = workspace_id(&repo, "raven", 1);
+    let gateway = FencedGateway {
+        concurrent: Mutex::new(Some((raven.clone(), 7))),
+        ..FencedGateway::default()
+    };
+
+    let report = reconcile_against_status(
+        &gateway,
+        &untouched_host(),
+        &project_session_prefix(&repo),
+        vec![session(&raven, 6, 1)],
+        status(Vec::new()),
+    )
+    .await
+    .expect("a superseded install is not a reconcile failure");
+
+    assert_eq!(report.installed, 0);
+    assert_eq!(report.superseded, 1);
+    assert_eq!(gateway.live(), BTreeMap::from([(raven, 7)]));
+}
+
+#[tokio::test]
+async fn a_removal_superseded_by_a_newer_reconcile_is_reported_not_failed() {
+    let repo = RepoId::parse("acme/widget").expect("repo");
+    let raven = workspace_id(&repo, "raven", 1);
+    let gateway = FencedGateway {
+        concurrent: Mutex::new(Some((raven.clone(), 7))),
+        ..FencedGateway::holding(&raven, 6)
+    };
+
+    let report = reconcile_against_status(
+        &gateway,
+        &untouched_host(),
+        &project_session_prefix(&repo),
+        Vec::new(),
+        status(vec![installed(&raven, 6)]),
+    )
+    .await
+    .expect("a superseded removal is not a reconcile failure");
+
+    assert_eq!(report.removed, 0);
+    assert_eq!(report.superseded, 1);
+    assert_eq!(gateway.live(), BTreeMap::from([(raven, 7)]));
 }
 
 struct FakeInventory {

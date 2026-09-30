@@ -362,6 +362,8 @@ pub enum ControlFailureCode {
     Unauthorized,
     InvalidSession,
     RevisionFence,
+    /// The operation names a workspace with no installed session.
+    NotInstalled,
     EndpointConflict,
     NotAdmitted,
     BrokerRejected,
@@ -978,6 +980,7 @@ fn rejected(error: GatewayError) -> ControlResponse {
             ControlFailureCode::RevisionFence
         }
         GatewayError::EndpointInUse => ControlFailureCode::EndpointConflict,
+        GatewayError::UnknownWorkspace => ControlFailureCode::NotInstalled,
         GatewayError::Config(_) | GatewayError::Tls(_) => ControlFailureCode::InvalidSession,
         _ => ControlFailureCode::Rejected,
     };

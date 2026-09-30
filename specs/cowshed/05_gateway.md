@@ -198,6 +198,19 @@ The control plane provides status and audit to host tools and a project-bound re
 Peer credentials on the Unix socket (and equivalent local authentication on TCP) must identify an authorized host
 process; the data-plane token is never accepted on the control plane.
 
+Workspace sessions are installed and removed over the control plane, and the gateway's session table is a cache of host
+inventory, never an authority. Each session carries its workspace's effective grant revision, which every grant change
+and every attach advances. An install must exceed every revision that workspace identity has held — a removal leaves its
+revision behind as a tombstone — and a removal must name the installed revision; either refusal is `revision-fence`, and
+a removal of a session that is already gone is `not-installed`.
+
+Every controller that needs the gateway reconciles its project first, so reconciles of one project run concurrently.
+Each reads gateway status before its inventory snapshot: every installed session came from an older snapshot, so a
+removal never revokes a newer decision, which would leave a tombstone refusing the workspace's own revision until its
+next attach. A write refused with `revision-fence` or `not-installed` lost a race to a reconcile that read a newer
+snapshot; that decision stands, and the write counts as superseded rather than failing the command that ran the
+reconcile.
+
 ## Credentials
 
 - Secrets use macOS Keychain generic passwords under service `dev.cowshed.gateway`; Linux runner credentials use the
