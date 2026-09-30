@@ -183,6 +183,10 @@ unit that rebuilt:
 - **`PathToSourceChanged`** — a dependency was built under another `$CARGO_HOME`; see the shared cargo caches above.
 - **`the rerun-if-changed instructions changed`** — a build script watches a path outside its package by absolute path;
   print it relative to the package instead, which is how cargo resolves it.
+- **`StaleItem(MissingFile { .. })`**, on every build — a build script watches a path that does not exist, such as a
+  `.git/packed-refs` a fresh clone or a cargo git checkout never wrote. Cargo counts a missing watched path as changed,
+  so the script reruns and everything above its crate recompiles each time, in main as much as in a workspace. Watch
+  only paths that exist, plus the nearest existing directory where one may later appear.
 - **Incremental on one side only** — the host shell exports `CI`, which turns incremental off for workspace crates
   whatever the profile says, while a sandbox child never inherits it; build through `cowshed exec`.
 
