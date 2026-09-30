@@ -24,7 +24,12 @@ export const BUILD_OUTPUT_DEPENDENCIES = [
   '*-wasm',
 ] as const;
 
-export { LINUX_PLATFORM_TARGET_GLOBS, MACOS_PLATFORM_TARGET_GLOBS, PLATFORM_TARGET_GLOBS } from './platform-targets.js';
+export {
+  LINUX_PLATFORM_TARGET_GLOBS,
+  MACOS_PLATFORM_TARGET_GLOBS,
+  PLATFORM_TARGET_GLOBS,
+  RELEASE_CONFIGURATION,
+} from './platform-targets.js';
 
 const buildOutputTargetSuffixes = BUILD_OUTPUT_DEPENDENCIES.map((glob) => glob.slice(1));
 
