@@ -946,12 +946,36 @@ fn lesser_capabilities_fail_to_compile_with_coordinator_authority() {
     // If a stale-artifact failure ever reappears here, this is what it looks like: a poisoned rlib
     // left in the legacy `deps` directory, written by sccache with 0640 permissions on a cache hit,
     // compiled by a rustc that is no longer the one on PATH.
+    //
+    // Every case is its own crate, so each is checked in a rustc session of its own: rustc skips
+    // its privacy pass once type checking failed, so cases sharing a crate would hide each other's
+    // later-phase errors. The crates are members of ONE probe workspace checked by ONE cargo with
+    // `--keep-going`. A cargo per case paid resolution and the fingerprint walk of cowshed-core's
+    // whole tree once per case, which on a cold CI runner pushed this test past its bounded
+    // window. The outer lockfile pins the probe to the versions the outer build compiled, so
+    // resolution is a lookup and the build scripts and proc macros it already compiled are the
+    // probe's too.
     let target = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .parent()
         .expect("cargo target directory")
         .to_path_buf();
-    let work = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("capability-deny");
-    fs::create_dir_all(&work).expect("deny snippet directory");
+    let probe = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("capability-probe");
+    // Cases that no longer exist must not linger as members of the probe.
+    match fs::remove_dir_all(&probe) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => panic!("clear the probe workspace: {error}"),
+    }
+    fs::create_dir_all(&probe).expect("probe workspace directory");
+    let manifest_dir = PathBuf::from(
+        std::env::var("CARGO_MANIFEST_DIR")
+            .expect("cargo sets CARGO_MANIFEST_DIR for the tests it runs"),
+    );
+    let lockfile = manifest_dir
+        .ancestors()
+        .map(|directory| directory.join("Cargo.lock"))
+        .find(|lockfile| lockfile.is_file())
+        .expect("the workspace lockfile");
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
     let cases: [(&str, &str, &[&str]); 6] = [
         (
@@ -1002,46 +1026,66 @@ fn lesser_capabilities_fail_to_compile_with_coordinator_authority() {
             &["success", "Sealed"],
         ),
     ];
-    for (name, source, expected) in cases {
-        let probe = work.join(name);
-        fs::create_dir_all(probe.join("src")).expect("probe crate directory");
-        // `[workspace]` detaches the probe from the outer workspace, whose members it must not join
-        // and whose lints and profiles it must not inherit — the snippet is meant to fail on
-        // visibility, and nothing else. `serde` is here because one snippet names a serde trait to
-        // prove a sealed token does not implement it; without it that snippet would fail on an
-        // unresolved crate and prove nothing.
+    // The probe's own `[workspace]` detaches it from the outer workspace, whose members it must
+    // not join and whose lints and profiles it must not inherit — each snippet is meant to fail on
+    // visibility, and nothing else. `serde` is here because one snippet names a serde trait to
+    // prove a sealed token does not implement it; without it that snippet would fail on an
+    // unresolved crate and prove nothing.
+    let members: Vec<String> = cases.iter().map(|(name, ..)| format!("{name:?}")).collect();
+    fs::write(
+        probe.join("Cargo.toml"),
+        format!(
+            "[workspace]\nresolver = \"3\"\nmembers = [{}]\n",
+            members.join(", ")
+        ),
+    )
+    .expect("probe workspace manifest");
+    fs::copy(&lockfile, probe.join("Cargo.lock")).expect("probe lockfile");
+    for (name, source, _) in &cases {
+        let crate_dir = probe.join(name);
+        fs::create_dir_all(crate_dir.join("src")).expect("probe crate directory");
         fs::write(
-            probe.join("Cargo.toml"),
+            crate_dir.join("Cargo.toml"),
             format!(
                 "[package]\nname = \"{name}\"\nversion = \"0.0.0\"\nedition = \"2024\"\n\
                  publish = false\n\n[lib]\npath = \"src/lib.rs\"\n\n\
-                 [dependencies]\ncowshed-core = {{ path = {:?} }}\n\
-                 serde = {{ version = \"1\", features = [\"derive\"] }}\n\n[workspace]\n",
-                std::env::var("CARGO_MANIFEST_DIR")
-                    .expect("cargo sets CARGO_MANIFEST_DIR for the tests it runs")
+                 [dependencies]\ncowshed-core = {{ path = {manifest_dir:?} }}\n\
+                 serde = {{ version = \"1\", features = [\"derive\"] }}\n"
             ),
         )
         .expect("probe manifest");
-        fs::write(probe.join("src/lib.rs"), source).expect("deny snippet");
-        let output = Command::new(&cargo)
-            .arg("check")
-            .arg("--offline")
-            .arg("--message-format=short")
-            .arg("--target-dir")
-            .arg(&target)
-            .current_dir(&probe)
-            .output()
-            .unwrap_or_else(|error| panic!("cargo check {name}: {error}"));
-        assert!(
-            !output.status.success(),
-            "{name} unexpectedly compiled:\n{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let diagnostic = String::from_utf8_lossy(&output.stderr);
+        fs::write(crate_dir.join("src/lib.rs"), source).expect("deny snippet");
+    }
+    let output = Command::new(&cargo)
+        .arg("check")
+        .arg("--workspace")
+        .arg("--keep-going")
+        .arg("--offline")
+        .arg("--message-format=short")
+        .arg("--target-dir")
+        .arg(&target)
+        .current_dir(&probe)
+        .output()
+        .unwrap_or_else(|error| panic!("cargo check: {error}"));
+    let diagnostic = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "every capability probe unexpectedly compiled:\n{diagnostic}"
+    );
+    for (name, _, expected) in cases {
+        // `--message-format=short` puts each diagnostic on one line headed by its file, relative
+        // to the probe workspace.
+        let file = format!("{name}/src/lib.rs:");
+        let errors: Vec<&str> = diagnostic
+            .lines()
+            .filter(|line| line.starts_with(&file) && line.contains(": error"))
+            .collect();
+        assert!(!errors.is_empty(), "{name} compiled:\n{diagnostic}");
+        let errors = errors.join("\n");
         for expected in expected {
             assert!(
-                diagnostic.contains(expected),
-                "{name} did not fail on {expected}:\n{diagnostic}"
+                errors.contains(expected),
+                "{name} did not fail on {expected}:\n{errors}"
             );
         }
     }
