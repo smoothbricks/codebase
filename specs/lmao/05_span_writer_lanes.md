@@ -55,6 +55,17 @@ bit pattern a view can store is a panic.
 Blocks are recycled, never freed while the store lives, so a view's address stays valid across `reset` and
 `retain_open`, and a flushed store writes its next window without allocating.
 
+**Text is reclaimed by epoch.** Every dynamic string — a span name, a log or completion message, a text attribute —
+lives once in the store's arena, and an intern ordinal names it. A long-lived store writes unbounded distinct text, so
+the arena cannot be append-only forever: once it passes half its ceiling (`ARENA_RECLAIM_BYTES`), the next `reset` or
+`retain_open` rebuilds it from the text the kept rows still name — nothing after a reset, the open spans after a retain
+— renumbers those rows' message and text-attribute cells in place, and moves the store's text epoch
+(`thread_span_buffer_text_epoch` on both ABIs). An ordinal is valid within the epoch that issued it. A binding that
+caches ordinals reads the epoch after each reset and drops its cache when it moved; below the threshold the epoch never
+moves, so a warm cache survives every window. **Rejected:** a per-string refcount (the arena exists to avoid per-string
+bookkeeping); dropping the cache on every reset (one crossing per distinct string per window, for a renumbering that
+happens only when the arena is large).
+
 **Rejected:** a per-lane bespoke writer interface (every provider shares the store's semantics; a second interface would
 fork `ThreadBufferStrategy` per provider); a batched JS-side row queue (a JS-owned row index plus double-buffering, for
 nothing the per-call floor does not already buy); and attribute values as per-call ABI writes (the 10.8 ns proxy trap or

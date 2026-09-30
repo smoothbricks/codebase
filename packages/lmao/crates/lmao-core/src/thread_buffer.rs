@@ -24,7 +24,7 @@ use crate::entry_type::EntryType;
 use crate::identity::{SpanIdentity, TraceId};
 use crate::packed_header::{VocabularyId, pack_dynamic, pack_static};
 use crate::scope::{ScopeEntry, ScopeValue, SpanScope};
-use crate::tuning::{MAX_CAPACITY, MAX_STRING_ARENA_BYTES, MIN_CAPACITY};
+use crate::tuning::{ARENA_RECLAIM_BYTES, MAX_CAPACITY, MAX_STRING_ARENA_BYTES, MIN_CAPACITY};
 use std::collections::HashMap;
 
 use crate::thread_kinds::{
@@ -351,6 +351,9 @@ pub struct ThreadSpanBuffer {
     /// structures that between them allocated an `Arc` per distinct value and
     /// needed an owned key to answer a lookup.
     arena: StringArena,
+    /// Bumped each time [`Self::reclaim_text`] renumbers the arena. An ordinal
+    /// is valid within the epoch that issued it.
+    text_epoch: u32,
 }
 
 impl ThreadSpanBuffer {
@@ -371,21 +374,23 @@ impl ThreadSpanBuffer {
             scopes: HashMap::with_capacity(capacity / 2),
             open_scratch: Vec::new(),
             arena: StringArena::new(MAX_STRING_ARENA_BYTES),
+            text_epoch: 0,
         };
         buffer
             .blocks
             .push(ThreadSpanBlock::new(capacity, fields.len()));
         buffer
     }
-    /// Release every row and span, keeping the interned vocabulary and every
-    /// block's allocation.
+    /// Release every row and span, keeping every block's allocation and, until
+    /// the arena passes [`ARENA_RECLAIM_BYTES`], the interned vocabulary.
     ///
     /// The buffer is per-thread and long-lived: without this, a process that
-    /// traces forever grows the row store forever. Vocabulary ids survive on
-    /// purpose — they are handed out to callers that cache them, and
-    /// `intern` guarantees a stable id for the buffer's lifetime. Blocks
-    /// survive so the next window writes without allocating and so a foreign
-    /// writer's views of their attribute cells stay valid.
+    /// traces forever grows the row store forever. Vocabulary ids survive while
+    /// they can — callers cache them, so re-interning after every window would
+    /// cost a lookup per distinct string per window — and are reclaimed once
+    /// the arena is large ([`Self::reclaim_text`]). Blocks survive so the next
+    /// window writes without allocating and so a foreign writer's views of
+    /// their attribute cells stay valid.
     pub fn reset(&mut self) {
         for block in &mut self.blocks[..self.active_blocks] {
             block.truncate(0);
@@ -395,6 +400,68 @@ impl ThreadSpanBuffer {
         self.next_span_id = 1;
         self.spans.clear();
         self.scopes.clear();
+        self.reclaim_text();
+    }
+
+    /// The arena's current epoch. An ordinal from [`Self::intern`] names the
+    /// same bytes until this changes; a binding that caches ordinals compares
+    /// it after every [`Self::reset`] and [`Self::retain_open`] and drops its
+    /// cache when it moved.
+    #[inline]
+    #[must_use]
+    pub const fn text_epoch(&self) -> u32 {
+        self.text_epoch
+    }
+
+    /// Rebuild the arena from the text the remaining rows still name, once it
+    /// has passed [`ARENA_RECLAIM_BYTES`].
+    ///
+    /// A long-lived store writes unbounded distinct text — completion
+    /// messages, causes, paths — and an append-only arena would fill and refuse
+    /// every later dynamic write. The rows a window keeps (none after a reset,
+    /// the open spans after a retain) are re-interned into a fresh arena; their
+    /// message cells and text attribute cells are renumbered in place, and the
+    /// epoch moves so ordinal caches know to forget. Below the threshold this
+    /// is one comparison, and ordinals stay put.
+    fn reclaim_text(&mut self) {
+        if self.arena.len() < ARENA_RECLAIM_BYTES {
+            return;
+        }
+        let mut fresh = StringArena::new(MAX_STRING_ARENA_BYTES);
+        let old = &self.arena;
+        let capacity = self.capacity;
+        for row in 0..self.row_count {
+            let block = &mut self.blocks[row / capacity];
+            let local = row % capacity;
+            if let Some(SharedStr::Arena(handle)) = block.messages[local] {
+                block.messages[local] = Some(SharedStr::Arena(
+                    fresh
+                        .intern_str(old.resolve(handle))
+                        .expect("the kept text is a subset of an arena within the same budget"),
+                ));
+            }
+            for (field, meta) in self.fields.iter().enumerate() {
+                if !matches!(meta.strategy, FieldStrategy::Category | FieldStrategy::Text) {
+                    continue;
+                }
+                let Some(cell) = block.attributes.get(field, local) else {
+                    continue;
+                };
+                // A foreign writer may have stored an ordinal the arena never
+                // issued; it decodes as absent, and stays absent.
+                if let Some(text) = u32::try_from(cell)
+                    .ok()
+                    .and_then(|ordinal| old.get(ordinal))
+                {
+                    let ordinal = fresh
+                        .intern(text)
+                        .expect("the kept text is a subset of an arena within the same budget");
+                    block.attributes.set(field, local, u64::from(ordinal));
+                }
+            }
+        }
+        self.arena = fresh;
+        self.text_epoch = self.text_epoch.wrapping_add(1);
     }
     #[inline]
     pub const fn thread_id(&self) -> u64 {
@@ -413,10 +480,10 @@ impl ThreadSpanBuffer {
         self.fields
     }
 
-    /// Intern a dynamic string once. The returned ordinal is stable for this
-    /// buffer's entire life, survives overflow blocks, and is never reused: the
-    /// arena is append-only and is never compacted, so a consumer may cache on
-    /// it. Reclaiming arena bytes is a whole-buffer reset, never a renumbering.
+    /// Intern a dynamic string once. The returned ordinal is stable within the
+    /// current [`Self::text_epoch`] and survives overflow blocks: the arena is
+    /// append-only between reclaims, so a consumer may cache on it until the
+    /// epoch moves. Only [`Self::reset`] and [`Self::retain_open`] reclaim.
     ///
     /// A repeat costs one hash of the incoming bytes plus one slice comparison
     /// and allocates nothing. This used to be a linear scan bounded by a
@@ -999,7 +1066,9 @@ impl ThreadSpanBuffer {
     /// their scopes — is released. Blocks keep their allocations.
     ///
     /// Two rows move per open span. Nothing else is copied, and nothing is
-    /// allocated once the working list has grown to the open-span count.
+    /// allocated once the working list has grown to the open-span count —
+    /// unless the arena has passed its reclaim threshold, when the kept rows'
+    /// text moves to a fresh arena ([`Self::reclaim_text`]).
     pub fn retain_open(&mut self) {
         let mut open = std::mem::take(&mut self.open_scratch);
         open.clear();
@@ -1055,6 +1124,7 @@ impl ThreadSpanBuffer {
         self.active_blocks = kept_blocks;
         self.row_count = next;
         self.open_scratch = open;
+        self.reclaim_text();
     }
     /// Blocks currently holding rows. Row `r` lives in block `r / capacity`.
     #[inline]

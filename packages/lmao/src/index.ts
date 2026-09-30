@@ -134,6 +134,8 @@ export { ThreadBufferStrategy, type ThreadSpanBufferProvider } from './lib/Threa
 export { encodeSchemaBlob } from './lib/wasm/schemaBlob.js';
 export {
   attributeCellStride,
+  type InternCache,
+  internCache,
   THREAD_SPAN_BUFFER_OK,
   type ThreadAttributeKind,
   type ThreadSpanBufferBinding,

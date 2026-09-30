@@ -177,4 +177,26 @@ describe('ThreadBufferStrategy', () => {
     expect(table.getChild('count')?.at(root.startRow)).toBe(7);
     expect(table.getChild('user')?.at(logRow)).toBe('ada');
   });
+
+  it('re-interns a name after a reset reclaims the arena, so it never writes a stale ordinal', async () => {
+    const reclaiming: ThreadBufferStrategy<typeof schema, ThreadSpanBufferRuntime> = await ThreadBufferStrategy.create({
+      capacity: 8,
+    });
+    const tracer = new TestTracer(opContext, { bufferStrategy: reclaiming, createTraceRoot });
+    tracer.trace_fn(0, 'kept-name', {}, (ctx) => ctx.ok(1));
+    // Distinct names until the arena passes its reclaim threshold (8 MiB).
+    const filler = 'x'.repeat(4096);
+    for (let name = 0; name < 2100; name += 1) {
+      tracer.trace_fn(0, `${name}-${filler}`, {}, (ctx) => ctx.ok(1));
+    }
+    reclaiming.reset();
+    // The fresh arena hands out low ordinals again; a binding still holding
+    // 'kept-name' -> its old ordinal would now name this text instead.
+    tracer.trace_fn(0, 'other-name', {}, (ctx) => ctx.ok(1));
+    tracer.trace_fn(0, 'kept-name', {}, (ctx) => ctx.ok(1));
+
+    const root = tracer.rootBuffers[tracer.rootBuffers.length - 1];
+    if (!isThreadSpanView(root)) throw new Error('expected a thread-lane span');
+    expect(reclaiming.provider.readMessage(root.binding, root.startRow)).toBe('kept-name');
+  });
 });

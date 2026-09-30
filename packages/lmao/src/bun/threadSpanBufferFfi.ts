@@ -17,6 +17,7 @@ import type { LogSchema } from '../lib/schema/LogSchema.js';
 import { encodeSchemaBlob, schemaAttributeOrdinals } from '../lib/wasm/schemaBlob.js';
 import {
   attributeCellStride,
+  internCache,
   type ThreadAttributeKind,
   type ThreadSpanBufferBinding,
   type ThreadSpanBufferHandle,
@@ -57,6 +58,10 @@ const nativeSymbols = {
   thread_span_buffer_reset: {
     args: [FFIType.ptr],
     returns: FFIType.u8,
+  },
+  thread_span_buffer_text_epoch: {
+    args: [FFIType.ptr],
+    returns: FFIType.u32,
   },
   thread_span_buffer_intern: {
     args: [FFIType.ptr, FFIType.ptr, FFIType.u64],
@@ -135,21 +140,21 @@ function bindNative(handle: Pointer, capacity: number, fieldCount: number): Nati
   const cellBytes = fieldCount * attributeCellStride(capacity) * 8;
   const cellLength = new BigUint64Array(1);
   const cellLengthAddress = ptr(cellLength);
-  /** Ordinals are stable for the store's life, so a JS-side cache is exact. */
-  const interned = new Map<string, number>();
+  const interned = internCache(
+    (text) => withUtf8(text, (address, length) => symbols.thread_span_buffer_intern(handle, address, length)),
+    () => symbols.thread_span_buffer_text_epoch(handle),
+  );
   return {
     handle,
     capacity,
     dylibPath: THREAD_SPAN_BUFFER_FFI_DYLIB_PATH,
     free: () => symbols.thread_span_buffer_free(handle),
-    reset: () => symbols.thread_span_buffer_reset(handle),
-    intern: (text) => {
-      const cached = interned.get(text);
-      if (cached !== undefined) return cached;
-      const id = withUtf8(text, (address, length) => symbols.thread_span_buffer_intern(handle, address, length));
-      if (id !== 0) interned.set(text, id);
-      return id;
+    reset: () => {
+      const status = symbols.thread_span_buffer_reset(handle);
+      interned.revalidate();
+      return status;
     },
+    intern: interned.intern,
     openSpan: (traceId, parentThreadId, parentSpanId, nameOrdinal, timestamp, line) =>
       withUtf8(traceId, (address, length) =>
         symbols.thread_span_buffer_open_span(

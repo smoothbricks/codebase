@@ -1,7 +1,10 @@
 use arrow_array::cast::AsArray;
 use arrow_array::{Array, RecordBatch, StringArray};
 use lmao_arrow::{StableVocabularyCatalog, convert_thread_buffer, convert_thread_span_rows};
-use lmao_core::{ColumnValue, EntryType, FieldMeta, FieldStrategy, ThreadSpanBuffer, TraceId};
+use lmao_core::tuning::ARENA_RECLAIM_BYTES;
+use lmao_core::{
+    ColumnValue, EntryType, FieldMeta, FieldStrategy, TextInput, ThreadSpanBuffer, TraceId,
+};
 
 static FIELDS: &[FieldMeta] = &[
     FieldMeta::new("answer", FieldStrategy::Number),
@@ -112,6 +115,79 @@ fn output_has_system_prefix_then_schema_columns() {
         .downcast_ref::<StringArray>()
         .unwrap();
     assert!((0..dict.len()).any(|index| dict.value(index) == "name"));
+}
+
+/// Row `row` of the dictionary-encoded string column `name`.
+fn text_at(batch: &RecordBatch, name: &str, row: usize) -> Option<String> {
+    let column = batch.column_by_name(name).expect("column");
+    let dictionary = column.as_any_dictionary();
+    let values = dictionary.values().as_string::<i32>();
+    let keys = dictionary.normalized_keys();
+    column
+        .is_valid(row)
+        .then(|| values.value(keys[row]).to_owned())
+}
+
+/// A long-lived store reclaims the text its retired rows named. Past the
+/// threshold, a retain rebuilds the arena from what the open spans still name,
+/// renumbers their cells and moves the epoch — so churn never walks the store
+/// into its ceiling, and the span it kept still converts with its own name and
+/// label.
+#[test]
+fn a_retain_past_the_threshold_reclaims_text_and_keeps_what_open_spans_name() {
+    let mut buffer = ThreadSpanBuffer::new(7, 8, FIELDS);
+    let kept = buffer
+        .open_span(trace(), 0, 0, TextInput::Dynamic("kept-span"), 10, 1)
+        .unwrap();
+    let sku = buffer.intern("sku-kept").unwrap();
+    buffer.write_tag(kept, 13, ColumnValue::Text(sku)).unwrap();
+    let epoch = buffer.text_epoch();
+
+    let filler = "x".repeat(1024);
+    let mut count = 0u32;
+    while buffer.arena().len() < ARENA_RECLAIM_BYTES {
+        let name = format!("{count}-{filler}");
+        let span = buffer
+            .open_span(trace(), 0, 0, TextInput::Dynamic(&name), 11, 2)
+            .unwrap();
+        buffer.end_ok(span, 12).unwrap();
+        count += 1;
+    }
+    let mut rows = Vec::new();
+    buffer.flush_rows(&mut rows).unwrap();
+    buffer.retain_open();
+
+    assert_ne!(
+        buffer.text_epoch(),
+        epoch,
+        "a reclaim renumbers, so the epoch moves"
+    );
+    assert_eq!(
+        buffer.arena().len(),
+        "kept-span".len() + "sku-kept".len(),
+        "only what the open span names survives"
+    );
+    let fresh = buffer.intern("after-reclaim").unwrap();
+    buffer
+        .append_log(
+            kept,
+            EntryType::Info,
+            Some(TextInput::Dynamic("after-reclaim")),
+            3,
+            13,
+        )
+        .unwrap();
+    buffer.end_ok(kept, 20).unwrap();
+    buffer.flush_rows(&mut rows).unwrap();
+    let batch = convert_thread_span_rows(&buffer, &empty_catalog(), &rows).unwrap();
+    assert_eq!(batch.num_rows(), 3, "start, completion, the log row");
+    assert_eq!(text_at(&batch, "message", 0).as_deref(), Some("kept-span"));
+    assert_eq!(text_at(&batch, "label", 0).as_deref(), Some("sku-kept"));
+    assert_eq!(
+        text_at(&batch, "message", 2).as_deref(),
+        Some("after-reclaim")
+    );
+    assert_eq!(buffer.interned(fresh), Some("after-reclaim"));
 }
 
 #[test]

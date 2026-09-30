@@ -45,6 +45,39 @@ export function attributeCellStride(capacity: number): number {
  * in a packed header means "dynamic". A provider whose store holds no copy of
  * this process's vocabulary resolves the id here and interns the text instead.
  */
+/**
+ * A binding's text-ordinal cache, exact within the store's text epoch.
+ *
+ * `intern` answers a warm string from the cache and crosses nothing; a miss
+ * pays one crossing, once per distinct string per epoch. `revalidate` — called
+ * after every reset or retain, the only calls that can reclaim — reads the
+ * store's epoch and drops every cached ordinal when the arena was renumbered.
+ */
+export interface InternCache {
+  intern(text: string): number;
+  revalidate(): void;
+}
+
+export function internCache(internText: (text: string) => number, textEpoch: () => number): InternCache {
+  const ordinals = new Map<string, number>();
+  let epoch = textEpoch();
+  return {
+    intern(text) {
+      const cached = ordinals.get(text);
+      if (cached !== undefined) return cached;
+      const ordinal = internText(text);
+      if (ordinal !== 0) ordinals.set(text, ordinal);
+      return ordinal;
+    },
+    revalidate() {
+      const next = textEpoch();
+      if (next === epoch) return;
+      ordinals.clear();
+      epoch = next;
+    },
+  };
+}
+
 export function threadVocabularyText(vocabularyId: number): string {
   return decodeVocabularyMessage(getVocabularyGeneration(), vocabularyId - 1);
 }
@@ -67,11 +100,14 @@ export interface ThreadSpanBufferBinding {
   /** Rows per block. */
   readonly capacity: number;
   free(): void;
-  /** Release every row and span, keeping the interned vocabulary and every block's memory. */
+  /**
+   * Release every row and span, keeping every block's memory and — until the
+   * store reclaims its text — the interned vocabulary.
+   */
   reset(): number;
   /**
-   * Intern `text`; the ordinal is stable for the store's life, and `0` means
-   * refused. A warm string costs one lookup and crosses nothing.
+   * Intern `text`; the ordinal is stable within the store's text epoch, and
+   * `0` means refused. A warm string costs one lookup and crosses nothing.
    */
   intern(text: string): number;
   openSpan(
@@ -117,6 +153,7 @@ export interface ThreadSpanBufferWasmExports {
   ): ThreadSpanBufferHandle;
   thread_span_buffer_free(handle: ThreadSpanBufferHandle): void;
   thread_span_buffer_reset(handle: ThreadSpanBufferHandle): number;
+  thread_span_buffer_text_epoch(handle: ThreadSpanBufferHandle): number;
   thread_span_buffer_intern(handle: ThreadSpanBufferHandle, ptr: number, len: number): number;
   thread_span_buffer_open_span(
     handle: ThreadSpanBufferHandle,
@@ -201,6 +238,7 @@ export function isThreadSpanBufferWasmExports(value: unknown): value is ThreadSp
     typeof Reflect.get(value, 'thread_span_buffer_new') === 'function' &&
     typeof Reflect.get(value, 'thread_span_buffer_new_with_schema') === 'function' &&
     typeof Reflect.get(value, 'thread_span_buffer_reset') === 'function' &&
+    typeof Reflect.get(value, 'thread_span_buffer_text_epoch') === 'function' &&
     typeof Reflect.get(value, 'thread_span_buffer_intern') === 'function' &&
     typeof Reflect.get(value, 'thread_span_buffer_open_span') === 'function' &&
     typeof Reflect.get(value, 'thread_span_buffer_open_span_static') === 'function' &&
@@ -240,26 +278,23 @@ export function bindThreadSpanBuffer(
 ): WasmThreadSpanBufferBinding | undefined {
   if (!isThreadSpanBufferWasmExports(value) || handle === 0) return undefined;
   const cellBytes = fieldCount * attributeCellStride(capacity) * 8;
-  /**
-   * Vocabulary ids are stable for a slot's lifetime — the store returns the
-   * existing id for a value it has already seen — so caching the mapping here
-   * is exact, not an approximation. A hit crosses nothing; a miss pays one
-   * encode plus one crossing, once per distinct string.
-   */
-  const interned = new Map<string, number>();
+  const interned = internCache(
+    (text) => {
+      const payload = scratch.writeUtf8(text);
+      return value.thread_span_buffer_intern(handle, payload.ptr, payload.len);
+    },
+    () => value.thread_span_buffer_text_epoch(handle),
+  );
   return {
     handle,
     capacity,
     free: () => value.thread_span_buffer_free(handle),
-    reset: () => value.thread_span_buffer_reset(handle),
-    intern: (text) => {
-      const cached = interned.get(text);
-      if (cached !== undefined) return cached;
-      const payload = scratch.writeUtf8(text);
-      const id = value.thread_span_buffer_intern(handle, payload.ptr, payload.len);
-      if (id !== 0) interned.set(text, id);
-      return id;
+    reset: () => {
+      const status = value.thread_span_buffer_reset(handle);
+      interned.revalidate();
+      return status;
     },
+    intern: interned.intern,
     openSpan: (traceId, parentThreadId, parentSpanId, nameOrdinal, timestamp, line) => {
       const trace = scratch.writeUtf8(traceId);
       return value.thread_span_buffer_open_span(

@@ -151,7 +151,8 @@ pub unsafe extern "C" fn thread_span_buffer_free(handle: *mut ThreadSpanBufferHa
 }
 
 /// Intern one dynamic UTF-8 value. The ordinal is stable across overflow
-/// blocks and valid until the handle is freed; zero denotes failure.
+/// blocks and valid until a reset moves the text epoch
+/// ([`thread_span_buffer_text_epoch`]); zero denotes failure.
 /// # Safety
 /// `handle` must be a live uniquely owned handle. When `len > 0`, `ptr` must
 /// point to readable storage for `len` bytes for the duration of this call.
@@ -452,7 +453,8 @@ pub unsafe extern "C" fn thread_span_buffer_attribute_cells(
     cells.as_ptr()
 }
 
-/// Release every row and span on a handle, keeping its interned vocabulary.
+/// Release every row and span on a handle, keeping its interned vocabulary
+/// until the arena passes its reclaim threshold.
 ///
 /// Returns zero on success and nonzero when the handle is null.
 ///
@@ -466,6 +468,19 @@ pub unsafe extern "C" fn thread_span_buffer_reset(handle: *mut ThreadSpanBufferH
     };
     buffer.reset();
     0
+}
+
+/// The handle's text epoch. An ordinal from `thread_span_buffer_intern` names
+/// the same text until this changes, and only a reset changes it; a caller that
+/// caches ordinals reads it after each reset and forgets them when it moved.
+/// Zero for a null handle, which has no ordinals to cache.
+///
+/// # Safety
+/// `handle` must be null or a live handle returned by a constructor and not
+/// previously freed.
+#[cfg_attr(not(target_family = "wasm"), unsafe(no_mangle))]
+pub unsafe extern "C" fn thread_span_buffer_text_epoch(handle: *mut ThreadSpanBufferHandle) -> u32 {
+    as_buffer(handle).map_or(0, |buffer| buffer.text_epoch())
 }
 
 /// Complete a span with the caller's entry type.

@@ -31,13 +31,15 @@
 //! extra indirection. It trades an amortized cost paid O(log n) times per buffer
 //! lifetime for a cost paid on every flush.
 //!
-//! # Ordinals are stable
+//! # Ordinals are stable for an arena's life
 //!
 //! [`StringArena::intern`] returns a 1-based ordinal that is monotonic and never
-//! reused. The arena is append-only and is never compacted, so an ordinal handed
-//! out at any point still names the same bytes for the store's whole life.
-//! Consumers cache on that (`lmao-wasm`'s JS-side intern memo does), and
-//! reclaiming arena bytes is therefore a whole-store reset, never a renumbering.
+//! reused. An arena is append-only and is never compacted in place, so an
+//! ordinal names the same bytes for as long as the arena lives. A row store
+//! reclaims text by replacing its arena with a fresh one holding only what its
+//! kept rows name, renumbering those rows as it goes, and moves its text epoch
+//! (`ThreadSpanBuffer::text_epoch`) so a consumer that caches ordinals — the
+//! bindings' JS-side intern memos do — knows to forget them.
 
 use std::borrow::Cow;
 

@@ -28,6 +28,14 @@ pub const DEFAULT_CAPACITY: usize = 64;
 /// allocating per row is exactly the failure mode the arena replaces.
 pub const MAX_STRING_ARENA_BYTES: usize = 16 << 20;
 
+/// Arena size past which a reset or retain reclaims its text.
+///
+/// Half the ceiling: a store that crosses it rebuilds from the text its kept
+/// rows name — nothing after a reset, the open spans after a retain — so it
+/// never reaches the ceiling through churn alone, and one that never crosses it
+/// never renumbers an ordinal a binding cached.
+pub const ARENA_RECLAIM_BYTES: usize = MAX_STRING_ARENA_BYTES / 2;
+
 /// Per-schema capacity ratchet. One instance lives on each generated buffer class.
 #[derive(Debug)]
 pub struct CapacityRatchet {

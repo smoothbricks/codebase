@@ -135,7 +135,8 @@ pub extern "C" fn thread_span_buffer_free(handle: u32) {
     });
 }
 
-/// Release every row and span on a handle, keeping its interned vocabulary.
+/// Release every row and span on a handle, keeping its interned vocabulary
+/// until the arena passes its reclaim threshold.
 /// Returns 0 on success and a non-zero status for an unknown handle.
 #[cfg_attr(target_family = "wasm", unsafe(no_mangle))]
 pub extern "C" fn thread_span_buffer_reset(handle: u32) -> i32 {
@@ -146,6 +147,13 @@ pub extern "C" fn thread_span_buffer_reset(handle: u32) -> i32 {
         Ok(()) => 0,
         Err(_) => -1,
     }
+}
+
+/// The handle's text epoch: an interned ordinal names the same text until this
+/// changes, and only a reset changes it. Zero for an unknown handle.
+#[cfg_attr(target_family = "wasm", unsafe(no_mangle))]
+pub extern "C" fn thread_span_buffer_text_epoch(handle: u32) -> u32 {
+    with_handle(handle, |buffer| Ok(buffer.text_epoch())).unwrap_or(0)
 }
 
 /// # Safety
