@@ -266,6 +266,14 @@ directly and `nx run lmao:cargo-wasm` only lifts it out of `target/` into `dist/
 (`src/lib/schema/systemSchema.ts`, `src/lib/capacityTuning.ts`). Those files are in the same package, and both ship,
 which is what makes the published tree buildable.
 
+The same script maps every crate source to the commit that last touched it, which `span!` records as `git_sha`. That map
+changes only when a commit moves HEAD, so the script watches just the git files deciding what HEAD names — HEAD and the
+loose branch ref, or `packed-refs` plus the directory the next loose ref lands in, or a reftable's table list — and
+never a source file: an uncommitted edit reruns nothing. Every watched path exists and is spelled relative to the crate,
+because cargo reruns a build script whose watched path is missing, and recompiles everything above `lmao-core` each time
+it does. In a tree whose enclosing repository does not track these sources (the npm tarball under a consumer's
+`node_modules`), the map is empty and nothing git-side is watched.
+
 ### Crate map
 
 | Crate         | Responsibility                                                                                                                                                                                                                                                                             | Primary specs                                      |
