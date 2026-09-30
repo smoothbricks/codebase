@@ -12,6 +12,7 @@ fn main() {
     if let Err(error) = cowshed_shell::dispatch() {
         eprintln!("cowshed: cannot locate this executable for warm workspace shells: {error}");
     }
+    cowshed_core::timing::start_clock();
     let arguments: Vec<OsString> = std::env::args_os().skip(1).collect();
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()

@@ -632,6 +632,7 @@ impl ProjectActor {
 
     async fn route(&mut self, request: RouterRequest) -> Result<RouterResponse> {
         self.validate_connection_authority(request.authority())?;
+        let _span = crate::timing::span_named("route", || request.method().to_owned());
         match request.method() {
             "project.open" => self.project_open(request).await,
             "project.workspace" => self.project_workspace(request).await,
@@ -2166,9 +2167,14 @@ impl NativeProjectRuntimeHost {
     ) -> Result<Self> {
         use crate::storage::apfs::ApfsExecutionHost;
         use crate::storage::lifecycle::Substrate;
+        use crate::timing::spanned;
 
-        let git = crate::git::GitRepository::discover(project_root).await?;
-        git.ensure_adoptable().await?;
+        let git = spanned("open", "git-discover", async {
+            let git = crate::git::GitRepository::discover(project_root).await?;
+            git.ensure_adoptable().await?;
+            Ok::<_, CowshedError>(git)
+        })
+        .await?;
         let git_root = git.root().to_path_buf();
         let home = std::env::var_os("HOME")
             .map(PathBuf::from)
@@ -2179,10 +2185,14 @@ impl NativeProjectRuntimeHost {
                     "launch the controller with a canonical HOME",
                 )
             })?;
-        let bootstrap = crate::storage::bootstrap::native::bootstrap_system_storage(
-            &git_root,
-            &home,
-            bootstrap_mode,
+        let bootstrap = spanned(
+            "open",
+            "bootstrap",
+            crate::storage::bootstrap::native::bootstrap_system_storage(
+                &git_root,
+                &home,
+                bootstrap_mode,
+            ),
         )
         .await
         .map_err(native_environment_error)?;
@@ -2199,7 +2209,13 @@ impl NativeProjectRuntimeHost {
             &bootstrap_mode,
             crate::storage::bootstrap::native::NativeBootstrapMode::ExistingOnly
         );
-        recover_repository_identity_intent(bootstrap.roots().store()).await?;
+        spanned(
+            "open",
+            "identity-intent",
+            recover_repository_identity_intent(bootstrap.roots().store()),
+        )
+        .await?;
+        let origin_span = crate::timing::span("open", "origin");
         let origin = if existing_only {
             workspace_origin_from_marker(&git_root).await?
         } else {
@@ -2218,6 +2234,7 @@ impl NativeProjectRuntimeHost {
         } else {
             None
         };
+        drop(origin_span);
         let mut binding_repo_id = if existing_only {
             origin.as_ref().map(|origin| origin.repo_id.clone())
         } else {
@@ -2243,11 +2260,16 @@ impl NativeProjectRuntimeHost {
                 bootstrap.home().to_owned(),
                 bootstrap.roots().clone(),
             );
-            binding_repo_id = crate::gateway_inventory::NativeGatewayInventory::new(storage)
-                .repository_for_project_root(&git_root)
-                .await
-                .map_err(native_integrity_error)?;
+            binding_repo_id = spanned(
+                "open",
+                "repository-for-root",
+                crate::gateway_inventory::NativeGatewayInventory::new(storage)
+                    .repository_for_project_root(&git_root),
+            )
+            .await
+            .map_err(native_integrity_error)?;
         }
+        let binding_span = crate::timing::span("open", "binding");
         let (repo_id, layout, binding) = if let Some(resolved) = session_project {
             resolved
         } else {
@@ -2302,6 +2324,7 @@ impl NativeProjectRuntimeHost {
                 }
             }
         };
+        drop(binding_span);
         if !existing_only {
             let provision_layout = layout.clone();
             let project_root = layout.project().project_root.clone();
@@ -2345,6 +2368,7 @@ impl NativeProjectRuntimeHost {
         let recovery_intents_path = lifecycle_intents_path.clone();
         let recovery_config = config.clone();
         let recovery_repo = repo_id.clone();
+        let recovery_span = crate::timing::span("open", "inventory");
         let (host, facts, pending, lifecycle_intents) =
             crate::storage::lifecycle::dispatch_blocking(move || {
                 let lifecycle_intents =
@@ -2361,11 +2385,16 @@ impl NativeProjectRuntimeHost {
             .map_err(|error| {
                 CowshedError::internal(format!("APFS recovery task failed: {error}"))
             })??;
+        drop(recovery_span);
         let retired_project_root = layout.project().project_root.clone();
         let retired_repo = repo_id.clone();
-        let retired = crate::storage::lifecycle::dispatch_blocking(move || {
-            native_retired_refs(&retired_project_root, &retired_repo)
-        })
+        let retired = spanned(
+            "open",
+            "retired",
+            crate::storage::lifecycle::dispatch_blocking(move || {
+                native_retired_refs(&retired_project_root, &retired_repo)
+            }),
+        )
         .await
         .map_err(|error| {
             CowshedError::internal(format!("retired workspace recovery task failed: {error}"))
@@ -2406,11 +2435,14 @@ impl NativeProjectRuntimeHost {
             continuity,
             crate::storage::audit::ContinuityAudit::External(_)
         );
-        let mut commitments = super::supervisor::CommitmentPublisher::open(
-            &telemetry_root,
-            continuity,
-            ROUTER_CAPACITY,
-        )?;
+        let mut commitments = {
+            let _span = crate::timing::span("open", "commitments");
+            super::supervisor::CommitmentPublisher::open(
+                &telemetry_root,
+                continuity,
+                ROUTER_CAPACITY,
+            )?
+        };
         for publication in &pending {
             use super::supervisor::{CommitmentDraft, CommitmentSink};
 
@@ -2427,9 +2459,13 @@ impl NativeProjectRuntimeHost {
                 .map_err(native_storage_error)?;
         }
         let substrate = crate::storage::apfs::ApfsSubstrate::new(config.clone(), host);
-        for retirement in retired {
-            // Trash reclamation is best effort; the retirement is already a fact of the inventory.
-            let _ = substrate.reclaim(retirement).await;
+        {
+            let _span = crate::timing::span("open", "reclaim");
+            for retirement in retired {
+                // Trash reclamation is best effort; the retirement is already a fact of the
+                // inventory.
+                let _ = substrate.reclaim(retirement).await;
+            }
         }
         let descriptor = ProjectDescriptor {
             repo_id,
@@ -4350,8 +4386,8 @@ impl NativeProjectRuntimeHost {
         &mut self,
         name: &WorkspaceName,
     ) -> Result<super::supervisor::WorkspaceSupervisorHandle> {
-        self.validate_binding().await?;
-        let current = self.current(name).await?;
+        crate::timing::spanned("supervisor", "binding", self.validate_binding()).await?;
+        let current = crate::timing::spanned("supervisor", "inventory", self.current(name)).await?;
         self.ensure_supervisor_for(current).await
     }
 
@@ -4376,11 +4412,14 @@ impl NativeProjectRuntimeHost {
             current.derived.mount_state,
             crate::storage::lifecycle::MountState::Detached
         );
-        let mount = self
-            .substrate
-            .ensure_mounted(&current.derived.workspace, MountIntent { browse: false })
-            .await
-            .map_err(native_storage_error)?;
+        let mount = crate::timing::spanned(
+            "supervisor",
+            "ensure-mounted",
+            self.substrate
+                .ensure_mounted(&current.derived.workspace, MountIntent { browse: false }),
+        )
+        .await
+        .map_err(native_storage_error)?;
         if was_detached {
             self.advance_gateway_revision(&current).await?;
             current = self.current(name).await?;
@@ -4416,9 +4455,12 @@ impl NativeProjectRuntimeHost {
             }
             self.sessions.retain(|(workspace, _), _| workspace != name);
         }
-        crate::git::GitRepository::from_root(&mount)
-            .ensure_cowshed_excludes()
-            .await?;
+        crate::timing::spanned(
+            "supervisor",
+            "excludes",
+            crate::git::GitRepository::from_root(&mount).ensure_cowshed_excludes(),
+        )
+        .await?;
         let needed = super::supervisor::WorkspaceAuthoritySnapshot {
             repo_id: self.descriptor.repo_id.clone(),
             workspace: name.clone(),
@@ -4427,10 +4469,14 @@ impl NativeProjectRuntimeHost {
             lifecycle_revision: current.derived.workspace.revision().get(),
         };
         if self.supervisors_run_in == SupervisorHome::Daemon {
-            let ensured = super::supervisor_manager::ensure(
-                &self.descriptor.store_root,
-                &self.descriptor.git_root,
-                &needed,
+            let ensured = crate::timing::spanned(
+                "supervisor",
+                "manager-ensure",
+                super::supervisor_manager::ensure(
+                    &self.descriptor.store_root,
+                    &self.descriptor.git_root,
+                    &needed,
+                ),
             )
             .await?;
             self.forward_commitments(&ensured.socket);
@@ -5979,9 +6025,12 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
         // repository at its recorded checkout by definition; its session marker and persisted
         // binding were validated during open, so querying remotes there would prevent the move
         // operation that repairs it. Every other state retains the ordinary live-Git check.
-        let authoritative = self
-            .authoritative_allowing_detached_main_relocation()
-            .await?;
+        let authoritative = crate::timing::spanned(
+            "recover",
+            "inventory",
+            self.authoritative_allowing_detached_main_relocation(),
+        )
+        .await?;
         let detached_direct_main = self.substrate_config.checkout_layout.mounts_at_checkout()
             && authoritative.iter().any(|workspace| {
                 workspace.derived.workspace.name().is_main()
@@ -5991,12 +6040,12 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                     )
             });
         if !detached_direct_main {
-            self.validate_binding().await?;
+            crate::timing::spanned("recover", "binding", self.validate_binding()).await?;
         }
         // Intent recovery finishes interrupted create/fork/remove work by creating and destroying
         // images. Workspace supervisors are the daemon's, started by the first command a workspace
         // gets: opening a project starts none, and waits on none.
-        self.recover_lifecycle_intents().await?;
+        crate::timing::spanned("recover", "intents", self.recover_lifecycle_intents()).await?;
         Ok(())
     }
 

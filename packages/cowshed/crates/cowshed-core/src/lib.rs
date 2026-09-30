@@ -24,7 +24,7 @@ pub mod sandbox;
 pub mod script;
 pub mod secrets;
 pub mod storage;
-mod timing;
+pub mod timing;
 pub mod vnodes;
 pub mod workspace_clients;
 pub mod workspace_credentials;

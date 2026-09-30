@@ -320,6 +320,13 @@ Two layers, so cowshed ships no bespoke log reader:
 **NDJSON survives only as a stream/export encoding** — the `--ndjson` flags above, and 06_cli.md's stderr progress
 events for long `--json` operations, are wire formats on a pipe to a live consumer. Nothing writes NDJSON to disk.
 
+**Latency spans.** Until lifecycle spans flush as Arrow, the CLI's own steps print on stderr: lifecycle verbs
+unconditionally (`cowshed: <step> start` / `done elapsed=…`), and every other step — project discovery, host storage
+validation, the controller's inventory, binding and recovery passes, each controller route, the gateway reconcile, job
+submission and relay — only under `COWSHED_TIMING=1`, one `cowshed: timing +<since start> <scope> <step> <elapsed>` line
+per finished step. `path` and `exec` never print them otherwise: their stdout answers a script and their stderr is the
+child's.
+
 ## Querying
 
 - **Capability-scoped**, mirroring the coordinator/worker split (07_api.md, 12_mcp.md): a coordinator queries controller

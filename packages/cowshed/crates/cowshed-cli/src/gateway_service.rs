@@ -113,10 +113,20 @@ impl GatewayInstaller for OwnedGateway {
 
 pub async fn reconcile_native_project(repo_id: &RepoId) -> Result<ReconcileReport> {
     let home = canonical_home()?;
-    let storage = validate_existing_host_storage(&home).await?;
+    let storage = cowshed_core::timing::spanned(
+        "reconcile",
+        "host-storage",
+        validate_existing_host_storage(&home),
+    )
+    .await?;
     let inventory = NativeSessionInventory::new(storage);
     let control = ControlSocket::at(control_socket_path())?;
-    reconcile_project(&control, &inventory, repo_id, effective_uid()).await
+    cowshed_core::timing::spanned(
+        "reconcile",
+        "sessions",
+        reconcile_project(&control, &inventory, repo_id, effective_uid()),
+    )
+    .await
 }
 
 /// How long `gateway start` waits for the daemon's control socket.

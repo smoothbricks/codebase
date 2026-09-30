@@ -643,7 +643,13 @@ impl CliService for ActorBridge {
         stdout: &mut (dyn Write + Send),
         stderr: &mut (dyn Write + Send),
     ) -> Result<ExecResult> {
-        let worker = self.coordinator()?.worker(&command.workspace).await?;
+        let worker = cowshed_core::timing::spanned(
+            "exec",
+            "worker",
+            self.coordinator()?.worker(&command.workspace),
+        )
+        .await?;
+        let submit = cowshed_core::timing::span("exec", "submit");
         let job = if let Some(session_name) = command.session.as_deref() {
             worker
                 .shell(Some(session_name))
@@ -653,6 +659,7 @@ impl CliService for ActorBridge {
         } else {
             worker.exec(command.request).await?
         };
+        drop(submit);
 
         if command.background {
             let info = job.status().await?;
@@ -677,8 +684,11 @@ impl CliService for ActorBridge {
                 }
             }
             ExecPresentation::Raw => {
+                let logs = cowshed_core::timing::span("exec", "logs-open");
                 let stdout_stream = job.logs(JobStream::Stdout, true).await?;
                 let stderr_stream = job.logs(JobStream::Stderr, true).await?;
+                drop(logs);
+                let _relay = cowshed_core::timing::span("exec", "relay");
                 let foreground = async {
                     let (info, stdout_result, stderr_result) = tokio::join!(
                         job.wait(),
@@ -1004,7 +1014,12 @@ where
             };
             let info = service.path(&workspace, args.no_attach).await?;
             if !args.no_attach {
-                service.reconcile_gateway().await?;
+                cowshed_core::timing::spanned(
+                    "path",
+                    "reconcile-gateway",
+                    service.reconcile_gateway(),
+                )
+                .await?;
             }
             if args.no_attach && info.state == WorkspaceState::Detached {
                 output
@@ -3750,8 +3765,15 @@ where
     W: Write + Send,
     E: Write + Send,
 {
-    let primary = dispatch(&mut service, cli, stdin, output).await;
-    let teardown = service.shutdown().await.err();
+    let primary = cowshed_core::timing::spanned(
+        "cli",
+        "dispatch",
+        dispatch(&mut service, cli, stdin, output),
+    )
+    .await;
+    let teardown = cowshed_core::timing::spanned("cli", "shutdown", service.shutdown())
+        .await
+        .err();
     match primary {
         Ok(exit) => match teardown {
             None => Ok(exit),
@@ -3786,7 +3808,13 @@ where
     if discovery == ProjectDiscovery::NotUsed {
         return dispatch_host_command(cli, output, false).await;
     }
-    let root = match resolve_project_root(&cli).await {
+    let root = match cowshed_core::timing::spanned(
+        "cli",
+        "resolve-root",
+        resolve_project_root(&cli),
+    )
+    .await
+    {
         Ok(root) => root,
         Err(_) if discovery == ProjectDiscovery::Optional => {
             return dispatch_host_command(cli, output, true).await;
@@ -3799,6 +3827,7 @@ where
         let mut setup = NativeAdoptHostSetup::for_canonical_home()?;
         let _ = prepare_adopt_host_storage(&mut setup, output).await?;
     }
+    let open_span = cowshed_core::timing::span("cli", "open");
     let bridge = match mode {
         RuntimeOpenMode::Provision => ActorBridge::open_for_adopt(&root, requested_repo_id).await,
         RuntimeOpenMode::ExistingOnly => {
@@ -3808,6 +3837,7 @@ where
             ActorBridge::open_existing_for_identity_change(&root).await
         }
     };
+    drop(open_span);
     let bridge = match bridge {
         Ok(bridge) => bridge,
         Err(error)
