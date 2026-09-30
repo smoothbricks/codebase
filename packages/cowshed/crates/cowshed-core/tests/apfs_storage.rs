@@ -9,7 +9,7 @@ use cowshed_core::apfs::{
     MountAccess,
 };
 use cowshed_core::metadata::{
-    GrantSet, ImageCapacity, ImageFormat, MACOS_PORT_BLOCK_MIN, PORT_BLOCK_SIZE, PortBlock,
+    GrantSet, ImageCapacity, ImageFormat, MACOS_PORT_MIN, NEW_PORT_BLOCK_SIZE, PortBlock,
     WorkspaceIncarnation, WorkspaceName, WorkspaceRole,
 };
 use cowshed_core::repository::RepoId;
@@ -994,7 +994,7 @@ fn identity() -> OperationIdentity {
         created_trace: "apfs-storage".to_owned(),
         git_worktree: false,
         grants: GrantSet::closed_baseline(Some(
-            PortBlock::new(MACOS_PORT_BLOCK_MIN, PORT_BLOCK_SIZE).expect("port block"),
+            PortBlock::new(MACOS_PORT_MIN, NEW_PORT_BLOCK_SIZE).expect("port block"),
         ))
         .expect("grants"),
     }

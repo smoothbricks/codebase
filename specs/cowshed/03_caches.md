@@ -233,11 +233,12 @@ them there; they contain the endpoint URL, whose userinfo is the workspace token
     the editor's direnv integration. Verification item (kickoff): coverage across go invocations including gopls, and
     whether any file-based mechanism exists that kills the export.
   - On macOS, `cowshed ensure --envrc` additionally emits **port conventions for dev servers** —
-    `COWSHED_PORT_BASE=<portBlock.base>` and `PORT=<base+1>` — so devenv/dev servers bind inside the workspace's own
-    block (04_sandbox.md, cooperative-sandboxing caveat). Linux emits neither value: services use private loopback and
-    package/proxy wiring uses fixed `GATEWAY_HTTP=http://127.0.0.1:7644`. Both platforms may emit **optional prompt
-    conveniences — explicitly non-load-bearing** — `COWSHED_WORKSPACE` / `COWSHED_REPO_ID` / `COWSHED_LAYER` /
-    `COWSHED_MOUNT`. Anything that needs identity derives it from cwd via `.cowshed/workspace.json` or asks the CLI.
+    `COWSHED_PORT_BASE=<portBlock.base>`, `COWSHED_PORT_BLOCK_SIZE=<portBlock.size>` and `PORT=<base+1>` — so devenv/dev
+    servers bind inside the workspace's own block (04_sandbox.md, cooperative-sandboxing caveat). Linux emits neither
+    value: services use private loopback and package/proxy wiring uses fixed `GATEWAY_HTTP=http://127.0.0.1:7644`. Both
+    platforms may emit **optional prompt conveniences — explicitly non-load-bearing** — `COWSHED_WORKSPACE` /
+    `COWSHED_REPO_ID` / `COWSHED_LAYER` / `COWSHED_MOUNT`. Anything that needs identity derives it from cwd via
+    `.cowshed/workspace.json` or asks the CLI.
   - `SCCACHE_SERVER_UDS=/private/cowshed/store/sccache.sock` (expanded) is the third: the host sccache daemon's socket
     (below). It is host-level rather than per-workspace — supervisor-spawned processes get it injected,
     `cowshed ensure --envrc` exports it for IDE terminals, and the cargo `[env]` guidance above mirrors it for processes

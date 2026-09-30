@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use cowshed_core::apfs::{ApfsCaseSensitivity, SystemCommandRunner};
 use cowshed_core::metadata::{
-    GrantSet, ImageCapacity, ImageFormat, MACOS_PORT_BLOCK_MIN, PORT_BLOCK_SIZE, PortBlock,
+    GrantSet, ImageCapacity, ImageFormat, MACOS_PORT_MIN, NEW_PORT_BLOCK_SIZE, PortBlock,
     WorkspaceName,
 };
 use cowshed_core::repository::RepoId;
@@ -253,8 +253,8 @@ fn run_format(format: ImageFormat) -> Result<String, Box<dyn Error>> {
             created_trace: format!("apfs-integration-{}", format.extension()),
             git_worktree: false,
             grants: GrantSet::closed_baseline(Some(PortBlock::new(
-                MACOS_PORT_BLOCK_MIN,
-                PORT_BLOCK_SIZE,
+                MACOS_PORT_MIN,
+                NEW_PORT_BLOCK_SIZE,
             )?))?,
         })
     };

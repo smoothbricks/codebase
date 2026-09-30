@@ -18,9 +18,10 @@ use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 
 use cowshed_core::metadata::{
-    DetachedWorkspaceMetadata, GrantSet, ImageFormat, MACOS_PORT_BLOCK_MIN, MARKER_VERSION,
-    PORT_BLOCK_SIZE, Platform, PortBlock, PublicationState, SIDECAR_VERSION, WorkspaceIncarnation,
-    WorkspaceInfoSnapshot, WorkspaceMarker, WorkspaceName, WorkspaceRole, sidecar_path, write_json,
+    DetachedWorkspaceMetadata, GrantSet, ImageFormat, MACOS_PORT_MIN, MARKER_VERSION,
+    NEW_PORT_BLOCK_SIZE, Platform, PortBlock, PublicationState, SIDECAR_VERSION,
+    WorkspaceIncarnation, WorkspaceInfoSnapshot, WorkspaceMarker, WorkspaceName, WorkspaceRole,
+    sidecar_path, write_json,
 };
 use cowshed_core::repository::RepoId;
 use cowshed_core::storage::StorageLayout;
@@ -62,7 +63,7 @@ fn sidecar(
     revision: u64,
     checkout: &Path,
 ) -> DetachedWorkspaceMetadata {
-    let block = PortBlock::new(MACOS_PORT_BLOCK_MIN, PORT_BLOCK_SIZE).expect("port block");
+    let block = PortBlock::new(MACOS_PORT_MIN, NEW_PORT_BLOCK_SIZE).expect("port block");
     let mut grants = GrantSet::closed_baseline(Some(block)).expect("closed baseline grants");
     grants.revision = revision;
     DetachedWorkspaceMetadata {
@@ -266,7 +267,7 @@ fn rekey_preserves_revision_when_the_sidecar_never_left() {
 fn rekey_refuses_a_workspace_that_is_already_keyed() {
     let (root, fixture) = base_fixture("keyed", "raven");
     let repo = RepoId::parse("acme/widget").expect("repo");
-    let block = PortBlock::new(MACOS_PORT_BLOCK_MIN, PORT_BLOCK_SIZE).expect("port block");
+    let block = PortBlock::new(MACOS_PORT_MIN, NEW_PORT_BLOCK_SIZE).expect("port block");
     sidecar(
         &repo,
         &fixture.workspace,

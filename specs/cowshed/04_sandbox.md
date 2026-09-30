@@ -64,8 +64,8 @@ Shape:
 
 ;; Loopback TCP — isolation rides ENTIRELY on outbound. Measured SBPL constraints
 ;; (see 08_testing.md): port RANGES do not parse ("invalid port in network
-;; address") and hosts must be `localhost` or `*` — so the block is emitted as 16
-;; literal single-port outbound allows, and the 16384-port ephemeral range cannot
+;; address") and hosts must be `localhost` or `*` — so the block is emitted as one
+;; literal single-port outbound allow per block port, and the 16384-port ephemeral range cannot
 ;; be enumerated at all. Restricting network-bind would therefore break bind(0)
 ;; (measured: EPERM; the kernel does not pick a within-policy port), so bind and
 ;; inbound stay PERMISSIVE — dev servers, bind(0) listeners, and host-browser →
@@ -75,7 +75,7 @@ Shape:
 (allow network-bind network-inbound (local tcp "localhost:*"))
 (allow network-outbound (remote tcp "localhost:<base>"))    ;; own gateway listener
 (allow network-outbound (remote tcp "localhost:<base+1>"))  ;; own service ports…
-;; … one rule per port through <base+15> — 16 single-port rules, never a range.
+;; … one rule per port through <base+size-1> — `size` single-port rules, never a range.
 ;; Everything else on loopback — 7644 (control plane), every sibling's block and
 ;; ephemeral listeners — falls through to (deny default) for CONNECT: a sibling
 ;; may bind anything, but this workspace cannot reach it (measured: EPERM).
@@ -202,18 +202,20 @@ Notes:
   `GOPATH`/`GOBIN` in-image. A go invocation that missed the wiring (unwrapped spawn, editor without direnv) would
   otherwise silently regrow a gigabyte-scale `~/go` on the Data volume; the deny turns that into a loud EPERM, and
   `cowshed doctor` translates it into the `GOENV` fix hint.
-- Each workspace serves on its own block ports (`base+1 … base+15`), so dev servers that honor the port convention never
-  collide — the port block _is_ the collision fix. Because bind stays permissive (macOS has no per-process network
+- Each workspace serves on its own block ports (`base+1 … base+size-1`), so dev servers that honor the port convention
+  never collide — the port block _is_ the collision fix. Because bind stays permissive (macOS has no per-process network
   namespace), a sibling may still _bind_ any loopback port, including a hardcoded default; isolation holds anyway
-  because **connect is the boundary**: a workspace's outbound set is its own 16 ports plus its scoped unix sockets, so
-  it cannot reach a sibling's listeners — block or ephemeral — at all (measured: EPERM). Linux workspaces get a private
+  because **connect is the boundary**: a workspace's outbound set is its own block plus its scoped unix sockets, so it
+  cannot reach a sibling's listeners — block or ephemeral — at all (measured: EPERM). Linux workspaces get a private
   loopback via netns (below), so nothing is shared and the block scheme is unnecessary there; ordinary tools reach a
   trusted per-workspace connector on private `127.0.0.1:7644`, which alone reaches the mounted Unix gateway socket.
 - **macOS cooperative sandboxing caveat.** The block only helps tools that take port configuration. On macOS,
-  `cowshed ensure --envrc` exports `COWSHED_PORT_BASE=<base>` and `PORT=<base+1>` as the conventions dev servers should
-  honor; a tool that hardcodes a fixed default port must be pointed at a block port (devenv port offsets derive from
-  `COWSHED_PORT_BASE`). Tools that ignore the convention bind outside their block and are denied. Linux exports neither
-  value: its services use private loopback directly and its package/proxy endpoint is fixed at `127.0.0.1:7644`.
+  `cowshed ensure --envrc` exports `COWSHED_PORT_BASE=<base>`, `COWSHED_PORT_BLOCK_SIZE=<size>` and `PORT=<base+1>` as
+  the conventions dev servers should honor; a tool that hardcodes a fixed default port must be pointed at a block port
+  (devenv port offsets derive from `COWSHED_PORT_BASE`). A tool that spreads listeners across the block reads its size
+  from `COWSHED_PORT_BLOCK_SIZE` and never assumes one: blocks of different sizes are live at once. Tools that ignore
+  the convention bind outside their block and are denied. Linux exports neither value: its services use private loopback
+  directly and its package/proxy endpoint is fixed at `127.0.0.1:7644`.
 - `RunSandboxMode::ReadOnly` drops the workspace mount from the write set — for inspector-style commands that must
   observe without mutating.
 - **Read grants have one narrow meaning.** Built-in system/toolchain roots remain readable so processes can start. A
@@ -296,11 +298,18 @@ Controller-owned, host-readable while the image is detached, outside the workspa
   are not grant verbs and are never exposed to a sandbox; device discovery and boot remain dev-side controller actions.
   Dev-side headless simulators need no `sim` grant at all — they are reached directly via the "simulator" profile preset
   below. macOS desktop apps add no grant axis, and no sandbox verb launches one as the personal user.
-- `portBlock` is **macOS-only and platform-optional**. When present it is the workspace's contiguous 16-port block from
-  the reserved range (default 40960–49151; 05_gateway.md): `base` is the gateway data-plane listener and
-  `base+1 … base+15` are workspace service ports. It is allocated at new/fork (adopt, for main), preserved across
-  restore, never inherited by a fork, and omitted on Linux. Linux records no synthetic port alias; its per-workspace
-  Unix gateway socket and private loopback namespace are runtime topology, not grant authority.
+- `portBlock` is **macOS-only and platform-optional**. When present it is the workspace's contiguous block
+  `{base, size}` from the reserved range (default 40960–49151; 05_gateway.md): `base` is the gateway data-plane listener
+  and `base+1 … base+size-1` are workspace service ports. A block's size is persisted data, not a global assumption:
+  `size` is a power of two of at least 2, `base` is aligned to its own `size`, and every reader — sidecar parsing, grant
+  validation, the gateway's session check, the Seatbelt profile — validates a block against its own recorded
+  `{base, size}`. A new workspace gets `NEW_PORT_BLOCK_SIZE` (64) ports at the lowest aligned base whose block shares no
+  port with any live block of any size; a live workspace keeps the size it was allocated with until it is removed, so
+  16-port blocks from before the size was raised stay valid beside new 64-port ones. Alignment makes blocks nest or stay
+  disjoint, never straddle, and the store-wide readers refuse any two live blocks that share a port. It is allocated at
+  new/fork (adopt, for main), preserved across restore, never inherited by a fork, and omitted on Linux. Linux records
+  no synthetic port alias; its per-workspace Unix gateway socket and private loopback namespace are runtime topology,
+  not grant authority.
 
 ### Project-standing grants
 
@@ -578,13 +587,14 @@ a read-write job the whole mount — so a test's socket in `TMPDIR` works as it 
 socket grant, and a read-only job cannot reach the sockets read-write jobs' daemons keep under the mount.
 
 On macOS, port collisions between workspaces are handled by the per-workspace port block, not left to the user:
-`devenv up` and dev servers bind ports derived from `COWSHED_PORT_BASE` (the block base), so two workspaces running the
-same service set land on different ports and both are reachable from the host browser. The residuals are the
-cooperative-sandboxing caveat above (a tool that hardcodes a port can still bind it — bind is permissive — but collides
-with a sibling doing the same and is unreachable from its own workspace's clients), and the in-block-only rule for
-in-sandbox clients: a workspace process can connect only to its own block ports, so service-to-service traffic inside a
-workspace must also ride block ports. On Linux the netns makes both moot: each workspace's loopback is private, no
-`COWSHED_PORT_BASE` exists, and package traffic uses the fixed connector address instead.
+`devenv up` and dev servers bind ports derived from `COWSHED_PORT_BASE` (the block base) within
+`COWSHED_PORT_BLOCK_SIZE`, so two workspaces running the same service set land on different ports and both are reachable
+from the host browser. The residuals are the cooperative-sandboxing caveat above (a tool that hardcodes a port can still
+bind it — bind is permissive — but collides with a sibling doing the same and is unreachable from its own workspace's
+clients), and the in-block-only rule for in-sandbox clients: a workspace process can connect only to its own block
+ports, so service-to-service traffic inside a workspace must also ride block ports. On Linux the netns makes both moot:
+each workspace's loopback is private, no `COWSHED_PORT_BASE` exists, and package traffic uses the fixed connector
+address instead.
 
 ## The sccache daemon as trusted mediator
 

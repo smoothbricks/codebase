@@ -1,6 +1,8 @@
 use crate::repository::RepoId;
+use cowshed_gateway_types::{is_macos_port_block, is_port_block};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use std::collections::BTreeMap;
 use std::error::Error;
 use std::ffi::{OsStr, OsString};
 use std::fmt;
@@ -14,10 +16,9 @@ pub const SIDECAR_VERSION: u32 = 1;
 pub const CHECKOUT_LAYOUT_VERSION: u32 = 1;
 pub const CHECKOUT_ROOT_VERSION: u32 = 1;
 pub const SLOT_BINDINGS_VERSION: u32 = 1;
-pub const PORT_BLOCK_SIZE: u16 = 16;
-pub const MACOS_PORT_BLOCK_MIN: u16 = 40_960;
-pub const MACOS_PORT_BLOCK_MAX: u16 = 49_151;
-pub const MACOS_PORT_BLOCK_LAST_BASE: u16 = MACOS_PORT_BLOCK_MAX - PORT_BLOCK_SIZE + 1;
+/// The macOS port range and the size new blocks get are the gateway's grammar; core names the
+/// same items rather than restating them.
+pub use cowshed_gateway_types::{MACOS_PORT_MAX, MACOS_PORT_MIN, NEW_PORT_BLOCK_SIZE};
 
 #[derive(Debug)]
 pub enum MetadataError {
@@ -594,14 +595,14 @@ impl<'de> Deserialize<'de> for CheckoutRootRecord {
 /// tooling that persists paths across tenant generations.
 ///
 /// Slot numbering is shared with `coordinator.assignSlot`'s port blocks, hence the same upper
-/// bound: a slot has to be expressible as a `PORT_BLOCK_SIZE`-aligned base inside the 16-bit
+/// bound: a slot has to be expressible as a `NEW_PORT_BLOCK_SIZE`-aligned base inside the 16-bit
 /// port space.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct SlotId(u32);
 
 impl SlotId {
-    pub const MAX: u32 = (u16::MAX / PORT_BLOCK_SIZE) as u32;
+    pub const MAX: u32 = (u16::MAX / NEW_PORT_BLOCK_SIZE) as u32;
 
     /// The mount directory leaf for this slot. `@` is outside the `WorkspaceName` grammar, so a
     /// slot mountpoint can never collide with a name-derived sibling under the same mount root.
@@ -928,12 +929,24 @@ pub struct PortBlock {
 }
 
 impl PortBlock {
+    /// A block is valid against its own size: a power of two of at least two ports, with `base`
+    /// aligned to it. Live blocks keep the size they were allocated with.
     pub fn new(base: u16, size: u16) -> Result<Self, MetadataError> {
-        if size == PORT_BLOCK_SIZE && base.checked_add(size - 1).is_some() {
+        if is_port_block(base, size) {
             Ok(Self { base, size })
         } else {
             Err(MetadataError::InvalidPortBlock { base, size })
         }
+    }
+
+    /// Every new-size block of the macOS range, lowest first.
+    pub fn macos_candidates() -> impl Iterator<Item = Self> {
+        (MACOS_PORT_MIN..=MACOS_PORT_MAX - (NEW_PORT_BLOCK_SIZE - 1))
+            .step_by(usize::from(NEW_PORT_BLOCK_SIZE))
+            .map(|base| Self {
+                base,
+                size: NEW_PORT_BLOCK_SIZE,
+            })
     }
 
     pub const fn base(self) -> u16 {
@@ -950,7 +963,58 @@ impl PortBlock {
 
     pub fn ports(self) -> Result<RangeInclusive<u16>, MetadataError> {
         self.validate()?;
-        Ok(self.base..=self.base + (self.size - 1))
+        Ok(self.base..=self.last())
+    }
+
+    const fn last(self) -> u16 {
+        self.base + (self.size - 1)
+    }
+
+    /// Whether the two blocks share a port.
+    pub const fn overlaps(self, other: Self) -> bool {
+        self.base <= other.last() && other.base <= self.last()
+    }
+}
+
+impl fmt::Display for PortBlock {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}-{}", self.base, self.last())
+    }
+}
+
+/// The port blocks live workspaces hold, each at the size it was allocated with. A block that
+/// shares a port with a held one is refused, so the set is disjoint by construction.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ReservedPortBlocks(BTreeMap<u16, PortBlock>);
+
+impl ReservedPortBlocks {
+    /// The held block sharing a port with `block`. Held blocks are disjoint, so the last one
+    /// starting at or before `block`'s last port is the only one that can reach into it.
+    pub fn overlapping(&self, block: PortBlock) -> Option<PortBlock> {
+        self.0
+            .range(..=block.last())
+            .next_back()
+            .map(|(_, held)| *held)
+            .filter(|held| held.overlaps(block))
+    }
+
+    /// Holds `block`, or names the held block it would share a port with.
+    pub fn insert(&mut self, block: PortBlock) -> Result<(), PortBlock> {
+        match self.overlapping(block) {
+            Some(held) => Err(held),
+            None => {
+                self.0.insert(block.base, block);
+                Ok(())
+            }
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn blocks(&self) -> impl Iterator<Item = PortBlock> + '_ {
+        self.0.values().copied()
     }
 }
 
@@ -1050,12 +1114,7 @@ impl GrantSet {
 
     pub fn validate(&self, platform: Platform) -> Result<(), MetadataError> {
         match (platform, self.port_block) {
-            (Platform::Macos, Some(block))
-                if (MACOS_PORT_BLOCK_MIN..=MACOS_PORT_BLOCK_LAST_BASE).contains(&block.base)
-                    && block.base.is_multiple_of(PORT_BLOCK_SIZE) =>
-            {
-                block.validate()
-            }
+            (Platform::Macos, Some(block)) if is_macos_port_block(block.base, block.size) => Ok(()),
             (Platform::Macos, Some(block)) => Err(MetadataError::InvalidPortBlock {
                 base: block.base,
                 size: block.size,
@@ -1554,21 +1613,25 @@ mod tests {
             prop_assert_eq!(serde_json::to_value(marker).unwrap(), expected);
         }
 
-        /// A macOS sidecar's `portBlock.base` is drawn as a block index rather than a raw `u16`,
-        /// because the durable grammar is "an aligned block inside 40960-49151" — a raw base is
-        /// not a valid sidecar and belongs to the refusal proptest below.
+        /// A macOS sidecar's `portBlock` is drawn as a size and a block index rather than raw
+        /// `u16`s, because the durable grammar is "a power-of-two block aligned to its own size
+        /// inside 40960-49151" — a block keeps the size it was allocated with, so every size the
+        /// grammar admits round-trips, not only the one new workspaces get.
         #[test]
         fn valid_sidecar_schemas_round_trip_across_platforms(
             macos in any::<bool>(),
             sparse in any::<bool>(),
-            block in 0_u16..=(MACOS_PORT_BLOCK_LAST_BASE - MACOS_PORT_BLOCK_MIN) / PORT_BLOCK_SIZE,
+            size_log2 in 1_u32..=13,
+            block in any::<u16>(),
         ) {
             let mut expected = frozen_sidecar_json();
             expected["imageFormat"] = json!(if sparse { "sparse" } else { "asif" });
             if macos {
-                let base = MACOS_PORT_BLOCK_MIN + block * PORT_BLOCK_SIZE;
+                let size = 1_u16 << size_log2;
+                let blocks = (MACOS_PORT_MAX - MACOS_PORT_MIN + 1) / size;
+                let base = MACOS_PORT_MIN + (block % blocks) * size;
                 expected["platform"] = json!("macos");
-                expected["portBlock"] = json!({ "base": base, "size": PORT_BLOCK_SIZE });
+                expected["portBlock"] = json!({ "base": base, "size": size });
             } else {
                 expected["platform"] = json!("linux");
                 expected.as_object_mut().unwrap().remove("portBlock");
@@ -1579,23 +1642,28 @@ mod tests {
             prop_assert_eq!(serde_json::to_value(metadata).unwrap(), expected);
         }
 
-        /// Every base outside the aligned macOS block grid is refused at the parse edge, so no
-        /// reader downstream has to re-derive the range. This is the pair to the round-trip above:
-        /// together they say the grammar is exactly the grid and nothing else.
+        /// Every block off the grammar — a size that is not a power of two, a base not aligned to
+        /// its own size, a block reaching outside the range — is refused at the parse edge, so
+        /// no reader downstream has to re-derive it. This is the pair to the round-trip above:
+        /// together they say the grammar is exactly the aligned blocks and nothing else.
         #[test]
-        fn macos_sidecars_reject_every_unaligned_or_out_of_range_port_base(
-            base in any::<u16>().prop_filter("aligned in-range bases are valid", |base| {
-                !((MACOS_PORT_BLOCK_MIN..=MACOS_PORT_BLOCK_LAST_BASE).contains(base)
-                    && base.is_multiple_of(PORT_BLOCK_SIZE))
-            }),
+        fn macos_sidecars_reject_every_block_off_the_grammar(
+            (base, size) in (
+                any::<u16>(),
+                prop_oneof![Just(16_u16), Just(NEW_PORT_BLOCK_SIZE), any::<u16>()],
+            )
+                .prop_filter("blocks on the grammar are valid", |(base, size)| {
+                    !cowshed_gateway_types::is_macos_port_block(*base, *size)
+                }),
         ) {
             let mut sidecar = frozen_sidecar_json();
             sidecar["platform"] = json!("macos");
-            sidecar["portBlock"] = json!({ "base": base, "size": PORT_BLOCK_SIZE });
+            sidecar["portBlock"] = json!({ "base": base, "size": size });
             prop_assert!(
                 serde_json::from_value::<DetachedWorkspaceMetadata>(sidecar).is_err(),
-                "macOS base {} is off the block grid and must not parse",
-                base
+                "macOS block {{ base: {}, size: {} }} is off the grammar and must not parse",
+                base,
+                size
             );
         }
 
@@ -1813,19 +1881,23 @@ mod tests {
 
     #[test]
     fn port_blocks_and_platform_grants_enforce_boundaries() {
-        let lowest = PortBlock::new(0, PORT_BLOCK_SIZE).unwrap();
-        let highest = PortBlock::new(u16::MAX - PORT_BLOCK_SIZE + 1, PORT_BLOCK_SIZE).unwrap();
+        let lowest = PortBlock::new(0, 16).unwrap();
+        let highest =
+            PortBlock::new(u16::MAX - NEW_PORT_BLOCK_SIZE + 1, NEW_PORT_BLOCK_SIZE).unwrap();
         assert_eq!(lowest.ports().unwrap(), 0..=15);
-        assert_eq!(highest.ports().unwrap(), (u16::MAX - 15)..=u16::MAX);
+        assert_eq!(highest.ports().unwrap(), (u16::MAX - 63)..=u16::MAX);
         for invalid in [
             PortBlock { base: 80, size: 0 },
+            PortBlock { base: 80, size: 15 },
+            PortBlock { base: 64, size: 48 },
+            // Aligned to 16 but not to its own size.
             PortBlock {
-                base: 80,
-                size: PORT_BLOCK_SIZE - 1,
+                base: MACOS_PORT_MIN + 16,
+                size: NEW_PORT_BLOCK_SIZE,
             },
             PortBlock {
                 base: u16::MAX - 14,
-                size: PORT_BLOCK_SIZE,
+                size: 16,
             },
         ] {
             assert!(matches!(
@@ -1835,30 +1907,36 @@ mod tests {
             ));
         }
 
-        let macos_block = PortBlock::new(MACOS_PORT_BLOCK_MIN, PORT_BLOCK_SIZE).unwrap();
-        let macos = GrantSet::closed_baseline(Some(macos_block)).unwrap();
-        assert_eq!(macos.port_block, Some(macos_block));
-        assert_eq!(macos.revision, 0);
-        assert!(macos.read.is_empty() && macos.write.is_empty() && macos.egress.is_empty());
-        macos.validate(Platform::Macos).unwrap();
-        assert!(
-            GrantSet::closed_baseline(Some(lowest))
-                .unwrap()
-                .validate(Platform::Macos)
-                .is_err()
-        );
-        assert!(
-            GrantSet::closed_baseline(Some(
-                PortBlock::new(MACOS_PORT_BLOCK_MIN + 1, PORT_BLOCK_SIZE).unwrap()
-            ))
-            .unwrap()
-            .validate(Platform::Macos)
-            .is_err()
-        );
+        // A live workspace's 16-port block and a new workspace's block both validate, each
+        // against its own recorded size.
+        let live = PortBlock::new(MACOS_PORT_MIN + 16, 16).unwrap();
+        let fresh = PortBlock::new(MACOS_PORT_MIN, NEW_PORT_BLOCK_SIZE).unwrap();
+        for block in [live, fresh] {
+            let grants = GrantSet::closed_baseline(Some(block)).unwrap();
+            assert_eq!(grants.port_block, Some(block));
+            assert_eq!(grants.revision, 0);
+            assert!(grants.read.is_empty() && grants.write.is_empty() && grants.egress.is_empty());
+            grants.validate(Platform::Macos).unwrap();
+        }
+        let macos = GrantSet::closed_baseline(Some(fresh)).unwrap();
+        for outside in [
+            lowest,
+            PortBlock::new(MACOS_PORT_MIN - NEW_PORT_BLOCK_SIZE, NEW_PORT_BLOCK_SIZE).unwrap(),
+            PortBlock::new(MACOS_PORT_MAX + 1, NEW_PORT_BLOCK_SIZE).unwrap(),
+        ] {
+            assert!(
+                GrantSet::closed_baseline(Some(outside))
+                    .unwrap()
+                    .validate(Platform::Macos)
+                    .is_err(),
+                "{outside}"
+            );
+        }
+        assert!(PortBlock::new(MACOS_PORT_MIN + 1, 16).is_err());
         assert!(
             GrantSet::closed_baseline(Some(PortBlock {
                 base: u16::MAX,
-                size: PORT_BLOCK_SIZE,
+                size: 16,
             }))
             .is_err()
         );
@@ -1872,10 +1950,45 @@ mod tests {
         assert!(matches!(
             macos.validate(Platform::Linux),
             Err(MetadataError::InvalidPortBlock {
-                base: MACOS_PORT_BLOCK_MIN,
-                size: PORT_BLOCK_SIZE
+                base: MACOS_PORT_MIN,
+                size: NEW_PORT_BLOCK_SIZE
             })
         ));
+    }
+
+    /// Live blocks of several sizes share the store; the reserved set holds any of them and
+    /// refuses exactly the blocks that share a port with a held one, naming that one.
+    #[test]
+    fn reserved_blocks_of_mixed_sizes_never_overlap() {
+        let block = |base: u16, size: u16| PortBlock::new(base, size).unwrap();
+        let mut reserved = ReservedPortBlocks::default();
+        let live = block(MACOS_PORT_MIN + 16, 16);
+        reserved.insert(live).unwrap();
+        reserved.insert(block(MACOS_PORT_MIN + 128, 16)).unwrap();
+        assert_eq!(
+            reserved.insert(block(MACOS_PORT_MIN, NEW_PORT_BLOCK_SIZE)),
+            Err(live)
+        );
+        assert_eq!(reserved.insert(block(MACOS_PORT_MIN + 16, 16)), Err(live));
+        reserved.insert(block(MACOS_PORT_MIN, 16)).unwrap();
+        reserved
+            .insert(block(MACOS_PORT_MIN + 64, NEW_PORT_BLOCK_SIZE))
+            .unwrap();
+        assert_eq!(
+            reserved.insert(block(MACOS_PORT_MIN + 64 + 48, 16)),
+            Err(block(MACOS_PORT_MIN + 64, NEW_PORT_BLOCK_SIZE))
+        );
+        assert_eq!(
+            PortBlock::macos_candidates()
+                .find(|candidate| reserved.overlapping(*candidate).is_none()),
+            Some(block(MACOS_PORT_MIN + 192, NEW_PORT_BLOCK_SIZE))
+        );
+        let held = reserved.blocks().collect::<Vec<_>>();
+        for (index, first) in held.iter().enumerate() {
+            for second in &held[index + 1..] {
+                assert!(!first.overlaps(*second), "{first} and {second} overlap");
+            }
+        }
     }
 
     #[test]

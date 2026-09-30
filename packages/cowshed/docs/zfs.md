@@ -14,17 +14,17 @@ chooses one.
 
 ## What lives where
 
-| What                                                     | Where                                                                                           |
-| -------------------------------------------------------- | ----------------------------------------------------------------------------------------------- |
-| Main workspace                                           | dataset `<pool>/cowshed/projects/<owner>/<repo>/main`, mounted at the original path             |
+| What                                                     | Where                                                                                               |
+| -------------------------------------------------------- | --------------------------------------------------------------------------------------------------- |
+| Main workspace                                           | dataset `<pool>/cowshed/projects/<owner>/<repo>/main`, mounted at the original path                 |
 | Session workspaces                                       | `<pool>/cowshed/projects/<owner>/<repo>/ws/<name>`, mounted at `<mount-root>/<owner>/<repo>/<name>` |
-| Checkpoints                                              | `zfs snapshot`s on the workspace dataset                                                        |
-| Shared caches (Cargo, sccache, zig, Gradle, Go, Nix)     | `<pool>/cowshed/caches`, mounted at `/private/cowshed/caches`                                |
-| Gateway registry/repository mirrors                      | `mirror/` and `repo-mirrors/` on caches; gateway-owned, sandbox-read-only                    |
-| Bindings, trusted policy, grants, waivers, gateway state | `<pool>/cowshed/store` at `/private/cowshed/store`; policy is `<owner>/<repo>/policy.json`   |
-| Telemetry + gateway audit (Arrow segments)               | `/private/cowshed/store/telemetry/` (`cowshed logs`/`audit`/`trace`) — same as macOS         |
-| Linux gateway data plane                                 | per-incarnation Unix socket plus private-netns connector at `127.0.0.1:7644`; no `portBlock`    |
-| Secrets                                                  | secret-service (GNOME Keyring/KWallet), service `dev.cowshed.gateway`                           |
+| Checkpoints                                              | `zfs snapshot`s on the workspace dataset                                                            |
+| Shared caches (Cargo, sccache, zig, Gradle, Go, Nix)     | `<pool>/cowshed/caches`, mounted at `/private/cowshed/caches`                                       |
+| Gateway registry/repository mirrors                      | `mirror/` and `repo-mirrors/` on caches; gateway-owned, sandbox-read-only                           |
+| Bindings, trusted policy, grants, waivers, gateway state | `<pool>/cowshed/store` at `/private/cowshed/store`; policy is `<owner>/<repo>/policy.json`          |
+| Telemetry + gateway audit (Arrow segments)               | `/private/cowshed/store/telemetry/` (`cowshed logs`/`audit`/`trace`) — same as macOS                |
+| Linux gateway data plane                                 | per-incarnation Unix socket plus private-netns connector at `127.0.0.1:7644`; no `portBlock`        |
+| Secrets                                                  | secret-service (GNOME Keyring/KWallet), service `dev.cowshed.gateway`                               |
 
 Mountpoints are ZFS properties and normally return at pool import. cowshed still writes the same underlying stub
 `.envrc` as APFS because an unimported pool also makes a mount disappear; `cowshed attach` verifies the mount, identity,
@@ -101,10 +101,10 @@ next: cowshed shell raven
 - **Dev servers bind their default ports.** Every exec joins a private-loopback network namespace, so
   vite/metro/`devenv up` listen on their usual ports with no cross-workspace collisions — the macOS port-block scheme
   isn't needed for isolation here. Linux sidecars omit `portBlock`; there is no synthetic base and no
-  `COWSHED_PORT_BASE`. Ordinary package and proxy clients use the namespace-local trusted connector at
-  `http://127.0.0.1:7644`; it binds only that loopback address and forwards unchanged bytes only to the workspace's
-  mounted per-incarnation Unix gateway socket. The socket inode plus netns remains identity, and detach/restore drain
-  and remove the connector before releasing the old attachment.
+  `COWSHED_PORT_BASE` or `COWSHED_PORT_BLOCK_SIZE`. Ordinary package and proxy clients use the namespace-local trusted
+  connector at `http://127.0.0.1:7644`; it binds only that loopback address and forwards unchanged bytes only to the
+  workspace's mounted per-incarnation Unix gateway socket. The socket inode plus netns remains identity, and
+  detach/restore drain and remove the connector before releasing the old attachment.
 
 ## The origin-snapshot lifecycle
 

@@ -474,7 +474,8 @@ async fn host_controller_proxy_aware_client_reaches_an_allocated_loopback_servic
         .await
         .expect("local HTTP listener");
     let port = listener.local_addr().expect("listener address").port();
-    let sandbox = workspace(&root, port.checked_sub(15).expect("ephemeral port"));
+    // The block containing the listener's port: blocks are aligned to their own size.
+    let sandbox = workspace(&root, port - port % 16);
     let origin = tokio::spawn(async move {
         let (mut socket, _) = listener.accept().await.expect("local HTTP connection");
         let mut request = [0u8; 1024];
@@ -529,7 +530,7 @@ async fn host_controller_proxy_bypass_does_not_admit_unallocated_loopback_ports(
         .expect("nonblocking listener");
     let port = listener.local_addr().expect("listener address").port();
     let base = if (40_000..40_016).contains(&port) {
-        41_000
+        41_024
     } else {
         40_000
     };

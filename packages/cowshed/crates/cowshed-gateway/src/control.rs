@@ -434,15 +434,25 @@ impl SessionWire {
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
 enum EndpointWire {
-    Tcp { address: String },
-    Unix { path: PathBuf },
+    Tcp {
+        address: String,
+        #[serde(rename = "blockSize")]
+        block_size: u16,
+    },
+    Unix {
+        path: PathBuf,
+    },
 }
 
 impl From<&WorkspaceEndpoint> for EndpointWire {
     fn from(endpoint: &WorkspaceEndpoint) -> Self {
         match endpoint {
-            WorkspaceEndpoint::Tcp(address) => Self::Tcp {
+            WorkspaceEndpoint::Tcp {
+                address,
+                block_size,
+            } => Self::Tcp {
                 address: address.to_string(),
+                block_size: *block_size,
             },
             WorkspaceEndpoint::Unix(path) => Self::Unix { path: path.clone() },
         }
@@ -452,9 +462,15 @@ impl From<&WorkspaceEndpoint> for EndpointWire {
 impl EndpointWire {
     fn to_endpoint(&self) -> Result<WorkspaceEndpoint, ControlError> {
         match self {
-            Self::Tcp { address } => address
+            Self::Tcp {
+                address,
+                block_size,
+            } => address
                 .parse::<SocketAddr>()
-                .map(WorkspaceEndpoint::Tcp)
+                .map(|address| WorkspaceEndpoint::Tcp {
+                    address,
+                    block_size: *block_size,
+                })
                 .map_err(|_| ControlError::InvalidSession("invalid TCP endpoint".to_owned())),
             Self::Unix { path } => Ok(WorkspaceEndpoint::Unix(path.clone())),
         }

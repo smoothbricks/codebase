@@ -15,9 +15,9 @@ use cowshed_core::apfs::{
     CreateImageRequest, DetachIntent, ImageFormatSelection, MountAccess,
 };
 use cowshed_core::metadata::{
-    DetachedWorkspaceMetadata, GrantSet, ImageCapacity, ImageFormat, MACOS_PORT_BLOCK_MIN,
-    PORT_BLOCK_SIZE, Platform, PortBlock, PublicationState, SIDECAR_VERSION, WorkspaceIncarnation,
-    WorkspaceInfoSnapshot, WorkspaceName, WorkspaceRole, sidecar_path,
+    DetachedWorkspaceMetadata, GrantSet, ImageCapacity, ImageFormat, MACOS_PORT_MIN,
+    NEW_PORT_BLOCK_SIZE, Platform, PortBlock, PublicationState, SIDECAR_VERSION,
+    WorkspaceIncarnation, WorkspaceInfoSnapshot, WorkspaceName, WorkspaceRole, sidecar_path,
 };
 use cowshed_core::repository::{OwnedRepoIds, RepoId};
 use cowshed_core::storage::apfs::native::{
@@ -337,7 +337,7 @@ fn metadata(format: ImageFormat) -> DetachedWorkspaceMetadata {
         publication_state: PublicationState::Active,
         updated_at: "2026-07-13T00:00:00Z".to_owned(),
         grants: GrantSet::closed_baseline(Some(
-            PortBlock::new(MACOS_PORT_BLOCK_MIN, PORT_BLOCK_SIZE).expect("port block"),
+            PortBlock::new(MACOS_PORT_MIN, NEW_PORT_BLOCK_SIZE).expect("port block"),
         ))
         .expect("grants"),
         info_snapshot: Some(WorkspaceInfoSnapshot {
@@ -477,7 +477,7 @@ fn identity(fixture: &Fixture) -> OperationIdentity {
         created_trace: "trace-apfs-boundary".to_owned(),
         git_worktree: false,
         grants: GrantSet::closed_baseline(Some(
-            PortBlock::new(MACOS_PORT_BLOCK_MIN, PORT_BLOCK_SIZE).expect("port block"),
+            PortBlock::new(MACOS_PORT_MIN, NEW_PORT_BLOCK_SIZE).expect("port block"),
         ))
         .expect("grants"),
     }

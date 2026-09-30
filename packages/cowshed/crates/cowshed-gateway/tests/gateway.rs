@@ -422,10 +422,13 @@ fn validation_rejects_ambiguous_policy_and_platform_endpoints() {
     assert!(cowshed_gateway::normalize_path("/a/%2f/b").is_err());
     assert!(cowshed_gateway::normalize_path("/a/../b").is_err());
     assert!(
-        WorkspaceEndpoint::Tcp(SocketAddr::new(
-            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
-            cowshed_gateway::MACOS_PORT_MIN,
-        ))
+        WorkspaceEndpoint::Tcp {
+            address: SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
+                cowshed_gateway::MACOS_PORT_MIN,
+            ),
+            block_size: cowshed_gateway::NEW_PORT_BLOCK_SIZE,
+        }
         .validate()
         .is_err()
     );
@@ -436,21 +439,55 @@ fn validation_rejects_ambiguous_policy_and_platform_endpoints() {
                 .validate_for_current_platform()
                 .is_err()
         );
-        assert!(
-            WorkspaceEndpoint::Tcp(SocketAddr::new(
-                IpAddr::V4(Ipv4Addr::LOCALHOST),
-                cowshed_gateway::MACOS_PORT_MIN + 1,
-            ))
+        let loopback = |port| SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
+        // Each block validates against its own recorded size: a live 16-port block off the
+        // 64-port grid, and a new block on it.
+        for (port, block_size) in [
+            (cowshed_gateway::MACOS_PORT_MIN + 16, 16),
+            (
+                cowshed_gateway::MACOS_PORT_MIN,
+                cowshed_gateway::NEW_PORT_BLOCK_SIZE,
+            ),
+        ] {
+            WorkspaceEndpoint::Tcp {
+                address: loopback(port),
+                block_size,
+            }
             .validate_for_current_platform()
-            .is_err()
-        );
+            .expect("block aligned to its own size");
+        }
+        for (port, block_size) in [
+            (cowshed_gateway::MACOS_PORT_MIN + 1, 16),
+            (
+                cowshed_gateway::MACOS_PORT_MIN + 16,
+                cowshed_gateway::NEW_PORT_BLOCK_SIZE,
+            ),
+            (cowshed_gateway::MACOS_PORT_MIN, 48),
+            (
+                cowshed_gateway::MACOS_PORT_MAX - 15,
+                cowshed_gateway::NEW_PORT_BLOCK_SIZE,
+            ),
+        ] {
+            assert!(
+                WorkspaceEndpoint::Tcp {
+                    address: loopback(port),
+                    block_size,
+                }
+                .validate_for_current_platform()
+                .is_err(),
+                "{port}/{block_size}"
+            );
+        }
     }
     #[cfg(target_os = "linux")]
     assert!(
-        WorkspaceEndpoint::Tcp(SocketAddr::new(
-            IpAddr::V4(Ipv4Addr::LOCALHOST),
-            cowshed_gateway::MACOS_PORT_MIN,
-        ))
+        WorkspaceEndpoint::Tcp {
+            address: SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                cowshed_gateway::MACOS_PORT_MIN
+            ),
+            block_size: cowshed_gateway::NEW_PORT_BLOCK_SIZE,
+        }
         .validate_for_current_platform()
         .is_err()
     );

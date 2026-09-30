@@ -52,11 +52,12 @@ directly, Bun/Node applications use `cowshed-napi`, and shell-based agents use t
 - **Push/autosave direction is host-side**: `cowshed push` and the autosave net are the _host_ fetching from the
   workspace mount (`git fetch <mount> +cowshed/<ws>:…`), never the sandbox running `git push` against agent-controlled
   `.git` config/hooks. Autosave ref namespace: `refs/cowshed/<ws>/wip`.
-- **Platform network isolation**: macOS uses one 16-port block per workspace; Seatbelt emits 16 literal outbound allows,
-  leaves bind/inbound permissive, and relies on outbound confinement. The host control plane at 7644 never appears in
-  workspace configuration. Linux instead has a per-workspace gateway Unix data socket and no TCP egress. A fresh network
-  namespace remains solely for private loopback/dev-server isolation; there is no veth, DNAT, or routing plumbing, and
-  macOS port blocks do not apply on Linux.
+- **Platform network isolation**: macOS uses one port block per workspace (its size recorded with it, 64 for new ones);
+  Seatbelt emits one literal outbound allow per block port, leaves bind/inbound permissive, and relies on outbound
+  confinement. The host control plane at 7644 never appears in workspace configuration. Linux instead has a
+  per-workspace gateway Unix data socket and no TCP egress. A fresh network namespace remains solely for private
+  loopback/dev-server isolation; there is no veth, DNAT, or routing plumbing, and macOS port blocks do not apply on
+  Linux.
 - **Denial evidence, never string-sniffing**: exit/typed 6 is emitted only on authoritative evidence: pre-spawn
   validation, profile-application failure, gateway policy denial, or a verified kernel signal. Child output and bounded
   summaries never establish a denial or synthesize a grant.

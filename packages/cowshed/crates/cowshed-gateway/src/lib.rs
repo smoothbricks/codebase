@@ -33,10 +33,10 @@ pub use control::{ControlError, ControlFailureCode, GatewayControlClient};
 /// and friends name the same items whether a caller links the daemon or only the types crate.
 pub use cowshed_gateway_types::{
     CanonicalHost, CanonicalTarget, ConfigError, EgressGrant, EgressMode, GatewayStatus,
-    HostPattern, InvalidRepoId, MACOS_PORT_BLOCK_SIZE, MACOS_PORT_MAX, MACOS_PORT_MIN,
-    MirrorProtocol, MirrorRoute, PolicyError, ResolvedMirrorRoute, SessionStatus, TOKEN_BYTES,
+    HostPattern, InvalidRepoId, MACOS_PORT_MAX, MACOS_PORT_MIN, MirrorProtocol, MirrorRoute,
+    NEW_PORT_BLOCK_SIZE, PolicyError, ResolvedMirrorRoute, SessionStatus, TOKEN_BYTES,
     TargetScheme, WorkspaceCa, WorkspaceEndpoint, WorkspacePolicy, WorkspaceSession,
-    WorkspaceToken, normalize_path, validate_repo_id,
+    WorkspaceToken, is_macos_port_block, normalize_path, validate_repo_id,
 };
 pub use interfaces::{
     AuditError, AuditEvent, AuditKind, AuditSink, AuditStatus, AuthorizedTarget, BoxIo,

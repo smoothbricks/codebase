@@ -14,7 +14,9 @@ use cowshed_core::api::dto::{
     RebaseOptions, RemoveOptions, RemoveReport, ResizeResult, WorkspaceInfo, WorkspaceState,
 };
 use cowshed_core::api::server::{ConnectionAuthority, RouterHandle};
-use cowshed_core::metadata::{WorkspaceIncarnation, WorkspaceName, WorkspaceRole};
+use cowshed_core::metadata::{
+    NEW_PORT_BLOCK_SIZE, WorkspaceIncarnation, WorkspaceName, WorkspaceRole,
+};
 use cowshed_core::repository::{BoundIdentity, RepoId, RepositoryBinding};
 use cowshed_core::runtime::{
     ProjectDescriptor, ProjectRuntime, ProjectRuntimeHost, RuntimeJobStream, RuntimeLogChunk,
@@ -892,12 +894,15 @@ impl ProjectRuntimeHost for FakeHost {
 
     async fn assign_slot(&mut self, workspace: WorkspaceName, slot: u32) -> Result<()> {
         let current = self.workspace_mut(&workspace)?;
-        let base = u16::try_from(slot.checked_mul(16).ok_or_else(|| {
-            CowshedError::usage("slot overflows port space", "choose a smaller slot")
-        })?)
+        let base = u16::try_from(
+            slot.checked_mul(u32::from(NEW_PORT_BLOCK_SIZE))
+                .ok_or_else(|| {
+                    CowshedError::usage("slot overflows port space", "choose a smaller slot")
+                })?,
+        )
         .map_err(|_| CowshedError::usage("slot overflows port space", "choose a smaller slot"))?;
         current.grants.port_block = Some(
-            PortBlock::new(base, 16)
+            PortBlock::new(base, NEW_PORT_BLOCK_SIZE)
                 .map_err(|error| CowshedError::usage(error.to_string(), "choose another slot"))?,
         );
         current.grants.revision += 1;

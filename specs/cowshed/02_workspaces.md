@@ -234,12 +234,13 @@ Budget: ≤ 1 s cold. No pool, no pre-warming.
 5. Rewrite `.cowshed/workspace.json` (`role: "workspace"`, `baseCommit` = main's HEAD), mint a fresh `.cowshed/token`,
    mint a fresh per-workspace CA (private key controller-side next to the grant file; CA cert placed in-image as a trust
    anchor with the tool anchors wired — 04_sandbox.md/05_gateway.md), and complete platform wiring. On macOS, use the
-   sidecar's allocated contiguous 16-port `portBlock` from the reserved range (default `40960–49151`): the gateway binds
-   `base`, and `base+1 … base+15` are workspace service ports. On Linux, omit `portBlock`; after the dataset is mounted,
-   create and bind-mount the per-incarnation Unix gateway socket and launch the trusted connector inside the workspace's
-   private netns on `127.0.0.1:7644` (04_sandbox.md/05_gateway.md). Mark `<mount>/.envrc` direnv-trusted. In-image Bun,
-   Cargo, Go, and proxy wiring uses the platform endpoint, and tool shims are placed at `.cowshed/bin/`; there is no git
-   network wiring — workspace git is local-only (see "Remote code ingress").
+   sidecar's allocated contiguous `portBlock` from the reserved range (default `40960–49151`; its size is recorded with
+   it, 04_sandbox.md): the gateway binds `base`, and `base+1 … base+size-1` are workspace service ports. On Linux, omit
+   `portBlock`; after the dataset is mounted, create and bind-mount the per-incarnation Unix gateway socket and launch
+   the trusted connector inside the workspace's private netns on `127.0.0.1:7644` (04_sandbox.md/05_gateway.md). Mark
+   `<mount>/.envrc` direnv-trusted. In-image Bun, Cargo, Go, and proxy wiring uses the platform endpoint, and tool shims
+   are placed at `.cowshed/bin/`; there is no git network wiring — workspace git is local-only (see "Remote code
+   ingress").
 6. Re-resolve inherited escaping symlinks. A relative symlink whose target climbs above the tree root (the entry
    `bun install` writes for a `link:` dependency, say) was computed against main's depth and lands somewhere else at the
    workspace's mount depth, so it is rewritten to the absolute path it named in main; one whose target does not exist in
@@ -799,10 +800,12 @@ at login by a launchd agent; Linux uses its platform service/controller lifecycl
 
 Every workspace image carries its environment in the in-image private namespace as a plain `source`-able file:
 `.cowshed/env` exports `GOENV` (pointing at the workspace's `.cowshed/cache/go/env`), `COWSHED_WORKSPACE_TOKEN`
-(controller-minted, read from `.cowshed/token`), and on macOS `COWSHED_PORT_BASE` from detached metadata's exact
-`portBlock`. Linux has no port block and omits the line. Cowshed rewrites this file whenever it rewrites the token — at
-create/fork/restore — so values are always current; nothing is derived from cwd, guessed from a slot, or trusted from a
-marker alone.
+(controller-minted, read from `.cowshed/token`), and on macOS `COWSHED_PORT_BASE` and `COWSHED_PORT_BLOCK_SIZE` from
+detached metadata's exact `portBlock`. Linux has no port block and omits both lines. One function derives the file from
+the image's published token and the workspace's recorded platform and block, and it is the file's only writer: create,
+fork and restore publish it as they mint, and every supervisor start publishes it again, so values are always current —
+a workspace minted before a variable existed gains it on its next start. Nothing is derived from cwd, guessed from a
+slot, or trusted from a marker alone.
 
 The repo-visible wiring is one line. When a checkout has no `.envrc`, cowshed writes:
 

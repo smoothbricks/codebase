@@ -5,7 +5,7 @@ use cowshed_core::workspace_environment::PORT_BASE_ENV;
 use cowshed_gateway::{
     ArrowAuditConfig, ArrowAuditSink, AuthorizedTarget, CanonicalTarget, ConnectError,
     CredentialError, CredentialProvider, CredentialQuery, CredentialRecord, Gateway, GatewayConfig,
-    GatewayError, MACOS_PORT_BLOCK_SIZE, MACOS_PORT_MAX, MACOS_PORT_MIN, MirrorCacheConfig,
+    GatewayError, MACOS_PORT_MAX, MACOS_PORT_MIN, MirrorCacheConfig, NEW_PORT_BLOCK_SIZE,
     NegotiatedTransport, UpstreamConnection, UpstreamConnector, UpstreamHealth, UpstreamPurpose,
     WorkspaceCa, WorkspaceEndpoint, WorkspaceSession, WorkspaceToken,
 };
@@ -74,6 +74,7 @@ pub(super) struct Fixture {
     repo: RepoId,
     identity: String,
     endpoint: SocketAddr,
+    block_size: u16,
     token: WorkspaceToken,
     ca: WorkspaceCa,
     grants: GrantSet,
@@ -174,6 +175,13 @@ impl Fixture {
                 },
                 gateway_port.unwrap_or(MACOS_PORT_MIN),
             ),
+            // Inside a sandbox the fixture's gateway owns only the enclosing block's base, so its
+            // session claims the smallest block holding it; on the host it claims a new block.
+            block_size: if gateway_port.is_some() {
+                2
+            } else {
+                NEW_PORT_BLOCK_SIZE
+            },
             token: WorkspaceToken::from_bytes([19; 32]),
             ca: WorkspaceCa::new(certificate.pem(), key.serialize_pem()).unwrap(),
             grants: GrantSet::default(),
@@ -183,7 +191,7 @@ impl Fixture {
         // or the host gateway may already own any candidate block.
         let first = gateway_port.unwrap_or(MACOS_PORT_MIN);
         let end = gateway_port.map_or(MACOS_PORT_MAX, |port| port + 1);
-        for port in (first..end).step_by(usize::from(MACOS_PORT_BLOCK_SIZE)) {
+        for port in (first..end).step_by(usize::from(NEW_PORT_BLOCK_SIZE)) {
             fixture.endpoint.set_port(port);
             match fixture
                 .gateway
@@ -206,7 +214,10 @@ impl Fixture {
             workspace_id: self.identity.clone(),
             repo_id: self.repo.as_str().to_owned(),
             revision: self.grants.revision,
-            endpoint: WorkspaceEndpoint::Tcp(self.endpoint),
+            endpoint: WorkspaceEndpoint::Tcp {
+                address: self.endpoint,
+                block_size: self.block_size,
+            },
             token: self.token.clone(),
             ca: WorkspaceCa::new(
                 self.ca.certificate_pem.clone(),

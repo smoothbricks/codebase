@@ -30,10 +30,11 @@ No mounts, no root, no network — pure functions with table-driven cases:
   taxonomy/shape change explicitly breaking.
 - **Env wiring**: exec env allowlist filtering (no `*_TOKEN`/`*_SECRET`/`AWS_*` pass-through), cache exports match
   03_caches.md exactly.
-- **Port-block rule generation**: the generated SBPL emits the block as **16 literal single-port `network-outbound`
-  allows** (measured: SBPL rejects port ranges — `invalid port in network address` — and hosts other than
-  `localhost`/`*`), leaves `network-bind`/`network-inbound` permissive on localhost, and contains no range syntax
-  anywhere (a generation-text golden; kernel enforcement is proved by the escape tier).
+- **Port-block rule generation**: the generated SBPL emits the block as **one literal single-port `network-outbound`
+  allow per port of its recorded size** — 16 for a live pre-64 block, 64 for a new one (measured: SBPL rejects port
+  ranges — `invalid port in network address` — and hosts other than `localhost`/`*`), leaves
+  `network-bind`/`network-inbound` permissive on localhost, and contains no range syntax anywhere (a generation-text
+  golden; kernel enforcement is proved by the escape tier).
 - **Runner launch planning**: a workflow fixture whose first step is repository-controlled, followed by shell and
   supported action-generated commands, produces only `cowshed exec` launch plans in original order. The direct process
   launcher is a fail-on-call spy. An action type for which every process cannot be intercepted is rejected with the

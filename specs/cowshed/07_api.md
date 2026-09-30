@@ -86,7 +86,8 @@ pub struct EnsureReport {
 ````
 
 The report carries typed source facts rather than shell text. `--envrc` emits exactly `GOENV`,
-`COWSHED_WORKSPACE_TOKEN`, and macOS-only `COWSHED_PORT_BASE`; it does not infer any value from CLI path parsing.
+`COWSHED_WORKSPACE_TOKEN`, and macOS-only `COWSHED_PORT_BASE` and `COWSHED_PORT_BLOCK_SIZE`; it does not infer any value
+from CLI path parsing.
 
 /// Read-only view of one workspace: an immutable information/grant snapshot plus safe ensure/attach. /// Carries no
 execution, detach, lifecycle, maintenance, repository-mirror, or grant mutation authority. pub struct WorkspaceRef { /*

@@ -29,7 +29,6 @@ use cowshed_core::{
         StreamInfo, TraceContext, TraceId, UtcTimestamp, WorkspaceIncarnation, WorkspaceInfo,
         WorkspaceLanding, WorkspaceName, WorkspacePath, WorkspaceRole, WorkspaceState,
     },
-    metadata::PORT_BLOCK_SIZE,
     repository::RepoId,
 };
 use serde::Serialize;
@@ -442,9 +441,7 @@ fn grant_sets() -> BTreeMap<&'static str, Value> {
 
     let open = GrantSet {
         revision: 12,
-        port_block: Some(
-            PortBlock::new(51_200, PORT_BLOCK_SIZE).expect("fixture port block is aligned"),
-        ),
+        port_block: Some(PortBlock::new(51_200, 16).expect("fixture port block is aligned")),
         read: vec![PathBuf::from("/Users/fixture/.cargo/registry")],
         write: vec![PathBuf::from("/Users/fixture/Library/Caches/sccache")],
         egress: vec![

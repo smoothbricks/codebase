@@ -261,7 +261,10 @@ pub fn session_from_fact(fact: GatewaySessionFact) -> Result<WorkspaceSession> {
         ),
         repo_id: fact.repo_id.as_str().to_owned(),
         revision: fact.revision,
-        endpoint: WorkspaceEndpoint::Tcp(endpoint),
+        endpoint: WorkspaceEndpoint::Tcp {
+            address: endpoint,
+            block_size: fact.port_block.size(),
+        },
         token,
         ca,
         policy: policy_from_grants(&fact.grants)?,

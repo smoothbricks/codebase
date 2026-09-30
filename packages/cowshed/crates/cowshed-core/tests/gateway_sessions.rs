@@ -36,7 +36,10 @@ fn session_at(identity: &str, revision: u64, token_byte: u8, port: u16) -> Works
         workspace_id: identity.to_owned(),
         repo_id: "project".to_owned(),
         revision,
-        endpoint: WorkspaceEndpoint::Tcp(SocketAddr::from((Ipv4Addr::LOCALHOST, port))),
+        endpoint: WorkspaceEndpoint::Tcp {
+            address: SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
+            block_size: 16,
+        },
         token: WorkspaceToken::from_bytes([token_byte; 32]),
         ca: WorkspaceCa::new(
             "-----BEGIN CERTIFICATE-----\npublic\n-----END CERTIFICATE-----".to_owned(),

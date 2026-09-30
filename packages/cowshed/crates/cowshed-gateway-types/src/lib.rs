@@ -27,7 +27,8 @@ pub use policy::{
 };
 pub use repo_id::{InvalidRepoId, validate_repo_id};
 pub use session::{
-    ConfigError, MACOS_PORT_BLOCK_SIZE, MACOS_PORT_MAX, MACOS_PORT_MIN, TOKEN_BYTES, WorkspaceCa,
-    WorkspaceEndpoint, WorkspaceSession, WorkspaceToken, validate_identifier,
+    ConfigError, MACOS_PORT_MAX, MACOS_PORT_MIN, NEW_PORT_BLOCK_SIZE, TOKEN_BYTES, WorkspaceCa,
+    WorkspaceEndpoint, WorkspaceSession, WorkspaceToken, is_macos_port_block, is_port_block,
+    validate_identifier,
 };
 pub use status::{GatewayStatus, SessionStatus};

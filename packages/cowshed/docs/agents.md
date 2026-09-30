@@ -152,8 +152,8 @@ Every workspace starts closed: writes limited to its own volume, designated cach
 your own gateway listener (whose registry mirrors — npm, crates.io — are baseline policy, warm and credentialed, so
 builds and installs work out of the box with zero grants). Third-party repositories arrive through
 `cowshed repo clone <url>`, which the gateway mirrors on your behalf. Need a dev server? Bind it to `$PORT` — each
-workspace owns a block of ports above its gateway base (`$COWSHED_PORT_BASE`), reachable from the host browser
-container-style and guaranteed not to collide with sibling workspaces.
+workspace owns a block of `$COWSHED_PORT_BLOCK_SIZE` ports from its gateway base (`$COWSHED_PORT_BASE`), reachable from
+the host browser container-style and guaranteed not to collide with sibling workspaces.
 
 **Exit code 6 is not an error to retry — it is a request to negotiate.** When cowshed reports 6 it has authoritative
 evidence of the denial (egress denials always — the gateway logged the decision; filesystem denials when the kernel
@@ -188,8 +188,8 @@ This is cowshed's layered capability model: the trusted coordinator holds policy
 - Workspace enumeration and attachment state derive from disk; the persistent supervisor owns only live process/job
   control and recovers from durable job ids plus controller telemetry. If a harness crashes, `cowshed ls` still tells
   the truth, clients reconnect to running jobs, and `cowshed rm` cleans up completely.
-- Run `cowshed attach` at task start if your harness may outlive reboots; it is a no-op when the
-  workspace is already mounted and repairs attachment state when not.
+- Run `cowshed attach` at task start if your harness may outlive reboots; it is a no-op when the workspace is already
+  mounted and repairs attachment state when not.
 - `cowshed gc` is safe to run between tasks; it never touches live workspaces.
 
 ## What agents must not expect

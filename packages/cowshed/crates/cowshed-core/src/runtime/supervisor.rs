@@ -32,7 +32,9 @@ use crate::sandbox::{
     SandboxConfig, SandboxProfileRole, sandbox_runtime_dir, sandbox_runtime_link, seatbelt_profile,
 };
 use crate::storage::audit::AuditSinkError;
-use crate::workspace_environment::{GO_ENV, NODE_CA_ENV, PORT_BASE_ENV, WORKSPACE_TOKEN_ENV};
+use crate::workspace_environment::{
+    GO_ENV, NODE_CA_ENV, PORT_BASE_ENV, PORT_BLOCK_SIZE_ENV, WORKSPACE_TOKEN_ENV,
+};
 use cowshed_gateway_types::WorkspaceToken;
 
 use crate::storage::job_artifact::{
@@ -1340,6 +1342,10 @@ pub(super) async fn sandbox_environment(
         crate::sandbox::sccache_cache_directory().as_os_str(),
     );
     own(PORT_BASE_ENV, OsStr::new(&port_base));
+    own(
+        PORT_BLOCK_SIZE_ENV,
+        OsStr::new(&sandbox.port_block.size().to_string()),
+    );
     own(WORKSPACE_TOKEN_ENV, OsStr::new(&encoded_token));
     for name in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"] {
         own(name, OsStr::new(&gateway_http));
@@ -2207,6 +2213,20 @@ impl WorkspaceSupervisor {
         C: CommitmentSink + Send + 'static,
     {
         config.validate()?;
+        // A supervisor serves exactly the block its sandbox records, so this is where the
+        // workspace's `.cowshed/env` is brought up to date with its metadata.
+        crate::workspace_credentials::publish_workspace_environment(
+            &config.sandbox.workspace_mount,
+            &config.sandbox.workspace_mount,
+            crate::metadata::Platform::Macos,
+            Some(config.sandbox.port_block),
+        )
+        .map_err(|error| {
+            CowshedError::integrity(
+                format!("cannot publish the workspace environment: {error}"),
+                "reattach the workspace to mint fresh credentials",
+            )
+        })?;
         let artifacts = ArtifactStoreSink::open(
             config.workspace_root.clone(),
             &config.owned_repo_ids,
@@ -4631,8 +4651,21 @@ mod lifecycle_commitment_tests {
         let telemetry = root.join("telemetry");
         let workspace_root = root.join("workspace");
         let unintroduced_root = root.join("unintroduced");
-        std::fs::create_dir_all(&workspace_root).unwrap();
+        std::fs::create_dir_all(workspace_root.join(".cowshed")).unwrap();
         std::fs::create_dir_all(&unintroduced_root).unwrap();
+        // A supervisor start publishes `.cowshed/env` from the image's token.
+        {
+            use std::io::Write as _;
+            use std::os::unix::fs::OpenOptionsExt as _;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(workspace_root.join(crate::workspace_credentials::WORKSPACE_TOKEN_PATH))
+                .unwrap()
+                .write_all("A".repeat(43).as_bytes())
+                .unwrap();
+        }
         let repo_id = RepoId::parse("acme/widget").unwrap();
         let foreign_repo = RepoId::parse("other/repository").unwrap();
         let source = WorkspaceIncarnation::new("0198f2c0b7e34dc795f17b238b331c80").unwrap();

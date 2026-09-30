@@ -493,7 +493,7 @@ impl fmt::Display for SandboxError {
         match self {
             Self::InvalidPortBlock { base, size } => write!(
                 formatter,
-                "invalid macOS port block at {base} with size {size}; exactly 16 ports are required"
+                "invalid macOS port block at {base} with size {size}; a block is a power-of-two number of ports, at least 2, with its base aligned to its size"
             ),
             Self::InvalidPath { path, reason } => {
                 write!(
@@ -1098,7 +1098,7 @@ mod tests {
         };
         assert_eq!(
             invalid_port.to_string(),
-            "invalid macOS port block at 65520 with size 8; exactly 16 ports are required"
+            "invalid macOS port block at 65520 with size 8; a block is a power-of-two number of ports, at least 2, with its base aligned to its size"
         );
 
         let invalid_path = SandboxError::InvalidPath {
@@ -1276,24 +1276,31 @@ mod tests {
         fs::remove_dir_all(&root).unwrap();
     }
 
+    /// A live workspace's 16-port block and a new workspace's block each get one literal rule
+    /// per port of their own recorded size.
     #[test]
-    fn profile_is_deterministic_and_has_exactly_sixteen_literal_ports() {
-        let config = config(RunSandboxMode::ReadWrite);
-        let first = seatbelt_profile(&config, SandboxProfileRole::ExecutedChild).unwrap();
-        let second = seatbelt_profile(&config, SandboxProfileRole::ExecutedChild).unwrap();
-        assert_eq!(first, second);
-        assert_eq!(
-            first
-                .lines()
-                .filter(|line| line.contains("remote tcp \"localhost:"))
-                .count(),
-            16
-        );
-        for port in 40_960..=40_975 {
-            assert!(first.contains(&format!("remote tcp \"localhost:{port}\"")));
+    fn profile_is_deterministic_and_has_one_literal_rule_per_block_port() {
+        for size in [16, crate::metadata::NEW_PORT_BLOCK_SIZE] {
+            let mut config = config(RunSandboxMode::ReadWrite);
+            config.port_block = PortBlock::new(40_960, size).unwrap();
+            let first = seatbelt_profile(&config, SandboxProfileRole::ExecutedChild).unwrap();
+            let second = seatbelt_profile(&config, SandboxProfileRole::ExecutedChild).unwrap();
+            assert_eq!(first, second);
+            assert_eq!(
+                first
+                    .lines()
+                    .filter(|line| line.contains("remote tcp \"localhost:"))
+                    .count(),
+                usize::from(size)
+            );
+            let last = 40_960 + (size - 1);
+            for port in 40_960..=last {
+                assert!(first.contains(&format!("remote tcp \"localhost:{port}\"")));
+            }
+            assert!(!first.contains(&format!("localhost:{}", last + 1)));
+            assert!(!first.contains(&format!("localhost:40960-{last}")));
+            assert!(!first.contains("example.com"));
         }
-        assert!(!first.contains("localhost:40960-40975"));
-        assert!(!first.contains("example.com"));
     }
 
     /// The git-worktree hole, stated as what the profile actually says: narrowed to `.git`, and
@@ -1742,10 +1749,16 @@ mod tests {
     fn port_block_is_exact_and_cannot_overflow() {
         assert!(PortBlock::new(40_960, 15).is_err());
         assert!(PortBlock::new(u16::MAX - 14, 16).is_err());
-        assert_eq!(
-            PortBlock::new(40_960, 16).unwrap().ports().unwrap().count(),
-            16
-        );
+        for size in [16, crate::metadata::NEW_PORT_BLOCK_SIZE] {
+            assert_eq!(
+                PortBlock::new(40_960, size)
+                    .unwrap()
+                    .ports()
+                    .unwrap()
+                    .count(),
+                usize::from(size)
+            );
+        }
     }
     #[test]
     fn the_daemon_socket_is_admitted_only_by_resolving_to_a_real_socket() {

@@ -206,7 +206,7 @@ impl AuditSink for ChannelAudit {
 /// process exits, so a crashed or killed test cannot strand a block the way a lockfile would.
 fn free_endpoint() -> SocketAddr {
     const BLOCKS: u16 = (cowshed_gateway::MACOS_PORT_MAX - cowshed_gateway::MACOS_PORT_MIN)
-        / cowshed_gateway::MACOS_PORT_BLOCK_SIZE;
+        / cowshed_gateway::NEW_PORT_BLOCK_SIZE;
     static NEXT_BLOCK: AtomicU16 = AtomicU16::new(0);
     let seed = (std::process::id() % u32::from(BLOCKS)) as u16;
     for _ in 0..BLOCKS {
@@ -215,7 +215,7 @@ fn free_endpoint() -> SocketAddr {
         if !claim_port_block(index) {
             continue;
         }
-        let port = cowshed_gateway::MACOS_PORT_MIN + index * cowshed_gateway::MACOS_PORT_BLOCK_SIZE;
+        let port = cowshed_gateway::MACOS_PORT_MIN + index * cowshed_gateway::NEW_PORT_BLOCK_SIZE;
         let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
         if std::net::TcpListener::bind(address).is_ok() {
             return address;
@@ -228,6 +228,14 @@ fn free_endpoint() -> SocketAddr {
 ///
 /// The descriptor is deliberately leaked: the claim must outlive this call and last until the test
 /// process exits, which is precisely what dropping the probe listener failed to do.
+/// The session endpoint for a block [`free_endpoint`] claimed.
+fn block_endpoint(address: SocketAddr) -> WorkspaceEndpoint {
+    WorkspaceEndpoint::Tcp {
+        address,
+        block_size: cowshed_gateway::NEW_PORT_BLOCK_SIZE,
+    }
+}
+
 fn claim_port_block(index: u16) -> bool {
     let path = std::env::temp_dir().join(format!("cowshed-gateway-port-block-{index}.lock"));
     let Ok(file) = std::fs::OpenOptions::new()
@@ -622,7 +630,7 @@ async fn allow_deny_malformed_token_and_audit_fields() {
     let (session, token, _) = session(
         "raven",
         "owner/repo-one",
-        WorkspaceEndpoint::Tcp(endpoint),
+        block_endpoint(endpoint),
         7,
         1,
         policy,
@@ -764,7 +772,7 @@ async fn connect_accepts_basic_proxy_credentials_and_challenges_without_them() {
     let (session, token, _) = session(
         "raven",
         "owner/repo-basic",
-        WorkspaceEndpoint::Tcp(endpoint),
+        block_endpoint(endpoint),
         11,
         1,
         policy,
@@ -849,7 +857,7 @@ async fn curl_tunnels_with_proxy_userinfo_and_fails_fast_without_it() {
     let (session, token, _) = session(
         "raven",
         "owner/repo-curl",
-        WorkspaceEndpoint::Tcp(endpoint),
+        block_endpoint(endpoint),
         13,
         1,
         policy,
@@ -931,7 +939,7 @@ async fn endpoint_identity_precedes_token_authentication() {
     let (session_a, token_a, _) = session(
         "alpha",
         "owner/repo-a",
-        WorkspaceEndpoint::Tcp(endpoint_a),
+        block_endpoint(endpoint_a),
         1,
         1,
         policy_a,
@@ -939,7 +947,7 @@ async fn endpoint_identity_precedes_token_authentication() {
     let (session_b, token_b, _) = session(
         "bravo",
         "owner/repo-b",
-        WorkspaceEndpoint::Tcp(endpoint_b),
+        block_endpoint(endpoint_b),
         2,
         1,
         policy_b,
@@ -1015,7 +1023,7 @@ async fn local_mirror_route_rewrites_only_the_admitted_scope() {
     let (session, token, _) = session(
         "mirror",
         "owner/repo-mirror",
-        WorkspaceEndpoint::Tcp(endpoint),
+        block_endpoint(endpoint),
         9,
         1,
         policy,
@@ -1090,7 +1098,7 @@ async fn a_registry_clients_authorization_header_authenticates_only_the_mirror_r
     let (session, token, _) = session(
         "registry-client",
         "owner/repo-registry",
-        WorkspaceEndpoint::Tcp(endpoint),
+        block_endpoint(endpoint),
         11,
         1,
         policy,
@@ -1184,7 +1192,7 @@ async fn opaque_connect_preserves_bytes_exactly() {
     let (session, token, _) = session(
         "opaque",
         "owner/repo-opaque",
-        WorkspaceEndpoint::Tcp(endpoint),
+        block_endpoint(endpoint),
         3,
         1,
         policy,
@@ -1258,7 +1266,7 @@ async fn intercept_injects_only_gateway_headers_and_validates_sni() {
     let (session, token, ca_certificate) = session(
         "secure",
         "owner/repo-secure",
-        WorkspaceEndpoint::Tcp(endpoint),
+        block_endpoint(endpoint),
         4,
         1,
         policy,
@@ -1339,7 +1347,7 @@ async fn a_scoped_packument_carries_the_held_credential_and_forwards_its_bytes_u
     let (session, token, _ca) = session(
         "registry",
         "owner/repo-registry",
-        WorkspaceEndpoint::Tcp(endpoint),
+        block_endpoint(endpoint),
         9,
         1,
         WorkspacePolicy {
@@ -1401,7 +1409,7 @@ async fn a_request_outside_the_credential_scope_is_refused_and_carries_no_creden
     let (session, token, _ca) = session(
         "scope",
         "owner/repo-scope",
-        WorkspaceEndpoint::Tcp(endpoint),
+        block_endpoint(endpoint),
         10,
         1,
         WorkspacePolicy {
@@ -1472,7 +1480,7 @@ async fn impersonation_suppresses_credentials_and_trace_headers() {
     let (session, token, _) = session(
         "plain",
         "owner/repo-plain",
-        WorkspaceEndpoint::Tcp(endpoint),
+        block_endpoint(endpoint),
         5,
         1,
         WorkspacePolicy {
@@ -1517,7 +1525,7 @@ async fn dead_upstream_fails_fast_without_connecting() {
     let (session, token, _) = session(
         "offline",
         "owner/repo-offline",
-        WorkspaceEndpoint::Tcp(endpoint),
+        block_endpoint(endpoint),
         6,
         1,
         WorkspacePolicy {
@@ -1571,7 +1579,7 @@ async fn active_queue_and_overflow_limits_are_enforced() {
     let (session, token, _) = session(
         "limited",
         "owner/repo-limited",
-        WorkspaceEndpoint::Tcp(endpoint),
+        block_endpoint(endpoint),
         8,
         1,
         WorkspacePolicy {
@@ -1665,7 +1673,7 @@ async fn queued_request_timeout_cancels_without_leaking_a_slot() {
     let (session, token, _) = session(
         "queue-timeout",
         "owner/repo-queue-timeout",
-        WorkspaceEndpoint::Tcp(endpoint),
+        block_endpoint(endpoint),
         10,
         1,
         WorkspacePolicy {
@@ -1847,7 +1855,7 @@ async fn control_socket_is_local_authenticated_and_reports_status() {
     let (session, _token, _) = session(
         "controlled",
         "owner/repo-controlled",
-        WorkspaceEndpoint::Tcp(endpoint),
+        block_endpoint(endpoint),
         42,
         1,
         WorkspacePolicy::default(),
@@ -1905,7 +1913,7 @@ async fn revision_tombstone_and_rotation_preserve_authority() {
         session(
             "revision",
             "owner/repo-revision",
-            WorkspaceEndpoint::Tcp(endpoint),
+            block_endpoint(endpoint),
             revision as u8,
             revision,
             WorkspacePolicy::default(),
@@ -2000,7 +2008,7 @@ async fn audit_failure_is_fail_closed_drains_and_stops_the_gateway() {
     let (installed, token, _) = session(
         "audit-failure",
         "owner/repo-audit-failure",
-        WorkspaceEndpoint::Tcp(endpoint),
+        block_endpoint(endpoint),
         21,
         1,
         WorkspacePolicy {
@@ -2042,7 +2050,7 @@ async fn audit_failure_is_fail_closed_drains_and_stops_the_gateway() {
     let replacement = session(
         "audit-failure",
         "owner/repo-audit-failure",
-        WorkspaceEndpoint::Tcp(endpoint),
+        block_endpoint(endpoint),
         22,
         2,
         WorkspacePolicy::default(),
@@ -2071,7 +2079,7 @@ async fn opaque_rejects_non_tls_missing_and_mismatched_sni_without_connector_cal
     let (installed, token, _) = session(
         "opaque-validation",
         "owner/repo-opaque-validation",
-        WorkspaceEndpoint::Tcp(endpoint),
+        block_endpoint(endpoint),
         23,
         1,
         WorkspacePolicy {
@@ -2164,7 +2172,7 @@ async fn active_error_and_disconnect_paths_reclaim_single_permit() {
         let (installed, token, _) = session(
             "connect-failure",
             "owner/repo-connect-failure",
-            WorkspaceEndpoint::Tcp(endpoint),
+            block_endpoint(endpoint),
             24,
             1,
             WorkspacePolicy {
@@ -2217,7 +2225,7 @@ async fn active_error_and_disconnect_paths_reclaim_single_permit() {
         let (installed, token, _) = session(
             "credential-failure",
             "owner/repo-credential-failure",
-            WorkspaceEndpoint::Tcp(endpoint),
+            block_endpoint(endpoint),
             25,
             1,
             WorkspacePolicy {
@@ -2267,7 +2275,7 @@ async fn active_error_and_disconnect_paths_reclaim_single_permit() {
         let (installed, token, _) = session(
             "header-failure",
             "owner/repo-header-failure",
-            WorkspaceEndpoint::Tcp(endpoint),
+            block_endpoint(endpoint),
             26,
             1,
             WorkspacePolicy {
@@ -2310,7 +2318,7 @@ async fn active_error_and_disconnect_paths_reclaim_single_permit() {
         let (installed, token, _) = session(
             "disconnect",
             "owner/repo-disconnect",
-            WorkspaceEndpoint::Tcp(endpoint),
+            block_endpoint(endpoint),
             27,
             1,
             WorkspacePolicy {
@@ -2376,7 +2384,7 @@ async fn queued_disconnect_and_drain_reclaim_all_capacity() {
     let (installed, token, _) = session(
         "queue-cancel",
         "owner/repo-queue-cancel",
-        WorkspaceEndpoint::Tcp(endpoint),
+        block_endpoint(endpoint),
         28,
         1,
         WorkspacePolicy {
@@ -2478,7 +2486,7 @@ async fn client_tls_failures_reclaim_permits_and_pre_admission_denials_are_audit
     let (installed, token, _) = session(
         "client-tls",
         "owner/repo-client-tls",
-        WorkspaceEndpoint::Tcp(endpoint),
+        block_endpoint(endpoint),
         29,
         1,
         WorkspacePolicy {
@@ -2550,7 +2558,7 @@ async fn h2_intercept_and_upstream_preserve_streaming_trailers_and_authority() {
     let (installed, token, ca_certificate) = session(
         "h2-streaming",
         "owner/repo-h2-streaming",
-        WorkspaceEndpoint::Tcp(endpoint),
+        block_endpoint(endpoint),
         31,
         1,
         WorkspacePolicy {
@@ -2664,7 +2672,7 @@ async fn upstream_tls_alpn_selects_h1_fallback_without_downgrading_h2() {
     let (installed, token, ca_certificate) = session(
         "h2-h1-fallback",
         "owner/repo-h2-h1-fallback",
-        WorkspaceEndpoint::Tcp(endpoint),
+        block_endpoint(endpoint),
         32,
         1,
         WorkspacePolicy {
@@ -2737,7 +2745,7 @@ async fn missing_upstream_alpn_fails_without_sending_http1_bytes() {
     let (installed, token, ca_certificate) = session(
         "no-upstream-alpn",
         "owner/repo-no-upstream-alpn",
-        WorkspaceEndpoint::Tcp(endpoint),
+        block_endpoint(endpoint),
         33,
         1,
         WorkspacePolicy {
@@ -2800,7 +2808,7 @@ async fn missing_downstream_alpn_is_not_silently_treated_as_http1() {
     let (installed, token, ca_certificate) = session(
         "no-downstream-alpn",
         "owner/repo-no-downstream-alpn",
-        WorkspaceEndpoint::Tcp(endpoint),
+        block_endpoint(endpoint),
         34,
         1,
         WorkspacePolicy {
@@ -2892,7 +2900,7 @@ async fn h2_session_cancellation_closes_stream_and_is_audited() {
     let (installed, token, ca_certificate) = session(
         "cancel-h2",
         "owner/repo-cancel-h2",
-        WorkspaceEndpoint::Tcp(endpoint),
+        block_endpoint(endpoint),
         35,
         1,
         WorkspacePolicy {
@@ -2984,7 +2992,7 @@ async fn h2_audit_failure_hard_stops_the_negotiated_connection() {
     let (installed, token, ca_certificate) = session(
         "h2-audit-stop",
         "owner/repo-h2-audit-stop",
-        WorkspaceEndpoint::Tcp(endpoint),
+        block_endpoint(endpoint),
         36,
         1,
         WorkspacePolicy {
@@ -3045,7 +3053,7 @@ async fn direct_https_proxy_uses_negotiated_upstream_h2() {
     let (installed, token, _) = session(
         "direct-h2",
         "owner/repo-direct-h2",
-        WorkspaceEndpoint::Tcp(endpoint),
+        block_endpoint(endpoint),
         37,
         1,
         WorkspacePolicy {

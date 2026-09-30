@@ -1875,7 +1875,7 @@ pub(crate) enum BoundListener {
 
 async fn bind_endpoint(endpoint: &WorkspaceEndpoint) -> Result<BoundListener, GatewayError> {
     match endpoint {
-        WorkspaceEndpoint::Tcp(address) => {
+        WorkspaceEndpoint::Tcp { address, .. } => {
             Ok(BoundListener::Tcp(TcpListener::bind(address).await?))
         }
         WorkspaceEndpoint::Unix(path) => {

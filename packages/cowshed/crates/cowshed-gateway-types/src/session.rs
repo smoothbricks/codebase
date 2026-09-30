@@ -16,12 +16,36 @@ use crate::{policy::WorkspacePolicy, repo_id::validate_repo_id};
 pub const TOKEN_BYTES: usize = 32;
 pub const MACOS_PORT_MIN: u16 = 40_960;
 pub const MACOS_PORT_MAX: u16 = 49_151;
-pub const MACOS_PORT_BLOCK_SIZE: u16 = 16;
+/// The size a newly allocated macOS workspace port block gets. A block's size is data recorded
+/// with it when it is allocated, so raising this changes only what new workspaces get: every
+/// check validates a live block against its own recorded size, never against this constant.
+pub const NEW_PORT_BLOCK_SIZE: u16 = 64;
+
+/// A port block is `size` contiguous ports from `base`, where `size` is a power of two of at
+/// least two (the gateway listener plus one service port) and `base` is aligned to it. The
+/// alignment is what makes blocks of different sizes nest instead of straddle: two aligned
+/// power-of-two blocks either are disjoint or one contains the other.
+pub const fn is_port_block(base: u16, size: u16) -> bool {
+    size >= 2
+        && size.is_power_of_two()
+        && base.is_multiple_of(size)
+        && base.checked_add(size - 1).is_some()
+}
+
+/// A macOS workspace port block additionally lies inside the reserved range.
+pub const fn is_macos_port_block(base: u16, size: u16) -> bool {
+    is_port_block(base, size) && base >= MACOS_PORT_MIN && base + (size - 1) <= MACOS_PORT_MAX
+}
 
 /// Host-side endpoint that selects a workspace before bearer authentication.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum WorkspaceEndpoint {
-    Tcp(SocketAddr),
+    /// macOS: the gateway listens on the base of the workspace's port block, whose recorded size
+    /// travels with it so the block is validated as allocated.
+    Tcp {
+        address: SocketAddr,
+        block_size: u16,
+    },
     Unix(PathBuf),
 }
 
@@ -30,7 +54,7 @@ pub enum WorkspaceEndpoint {
 impl fmt::Display for WorkspaceEndpoint {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Tcp(address) => write!(formatter, "{address}"),
+            Self::Tcp { address, .. } => write!(formatter, "{address}"),
             Self::Unix(path) => write!(formatter, "{}", path.display()),
         }
     }
@@ -39,11 +63,11 @@ impl fmt::Display for WorkspaceEndpoint {
 impl WorkspaceEndpoint {
     pub fn validate(&self) -> Result<(), ConfigError> {
         match self {
-            Self::Tcp(address) if !address.ip().is_loopback() => {
+            Self::Tcp { address, .. } if !address.ip().is_loopback() => {
                 Err(ConfigError::NonLoopbackEndpoint)
             }
-            Self::Tcp(address) if address.port() == 0 => Err(ConfigError::ZeroPort),
-            Self::Tcp(_) => Ok(()),
+            Self::Tcp { address, .. } if address.port() == 0 => Err(ConfigError::ZeroPort),
+            Self::Tcp { .. } => Ok(()),
             Self::Unix(path) if !path.is_absolute() => Err(ConfigError::RelativeSocketPath),
             Self::Unix(path) if path.as_os_str().is_empty() => Err(ConfigError::RelativeSocketPath),
             Self::Unix(_) => Ok(()),
@@ -60,7 +84,7 @@ impl WorkspaceEndpoint {
             self.validate()?;
             match self {
                 Self::Unix(_) => Ok(()),
-                Self::Tcp(_) => Err(ConfigError::ExpectedUnixEndpoint),
+                Self::Tcp { .. } => Err(ConfigError::ExpectedUnixEndpoint),
             }
         }
         #[cfg(not(any(target_os = "macos", target_os = "linux")))]
@@ -69,20 +93,18 @@ impl WorkspaceEndpoint {
         }
     }
 
-    /// Enforces the frozen macOS 16-port allocation range for production sessions.
+    /// Enforces the macOS port-block grammar for production sessions against the block's own
+    /// recorded size.
     pub fn validate_macos_port_block(&self) -> Result<(), ConfigError> {
         self.validate()?;
-        let Self::Tcp(address) = self else {
+        let Self::Tcp {
+            address,
+            block_size,
+        } = self
+        else {
             return Err(ConfigError::ExpectedTcpEndpoint);
         };
-        let last = address
-            .port()
-            .checked_add(MACOS_PORT_BLOCK_SIZE - 1)
-            .ok_or(ConfigError::InvalidMacosPortBlock)?;
-        if address.port() < MACOS_PORT_MIN
-            || last > MACOS_PORT_MAX
-            || !(address.port() - MACOS_PORT_MIN).is_multiple_of(MACOS_PORT_BLOCK_SIZE)
-        {
+        if !is_macos_port_block(address.port(), *block_size) {
             return Err(ConfigError::InvalidMacosPortBlock);
         }
         Ok(())
@@ -253,7 +275,9 @@ pub enum ConfigError {
     InvalidDataSocketName,
     #[error("gateway endpoints are unsupported on this host platform")]
     UnsupportedHostPlatform,
-    #[error("macOS gateway base must reserve 16 ports within 40960-49151")]
+    #[error(
+        "macOS gateway endpoint must be the base of a power-of-two port block aligned to its size within 40960-49151"
+    )]
     InvalidMacosPortBlock,
     #[error("workspace token must be exactly 32 bytes of unpadded base64url")]
     MalformedToken,
@@ -299,7 +323,10 @@ mod tests {
 
     use serde::Serialize;
 
-    use super::{TOKEN_BYTES, WorkspaceCa, WorkspaceToken};
+    use super::{
+        MACOS_PORT_MAX, MACOS_PORT_MIN, NEW_PORT_BLOCK_SIZE, TOKEN_BYTES, WorkspaceCa,
+        WorkspaceToken, is_macos_port_block, is_port_block,
+    };
     use crate::policy::EgressMode;
     use crate::repo_id::validate_repo_id;
 
@@ -407,5 +434,36 @@ mod tests {
         assert!(!token.matches_encoded(&format!("{encoded}=")));
         assert!(!token.matches_encoded(""));
         assert!(!token.matches_encoded("not base64!"));
+    }
+
+    /// A block is valid by its own recorded size: the 16-port blocks live workspaces were
+    /// allocated with and the 64-port blocks new ones get both validate, each against its own
+    /// alignment. Anything that is not an aligned power of two of at least two ports is refused.
+    #[test]
+    fn port_blocks_validate_against_their_own_size() {
+        for size in [16, NEW_PORT_BLOCK_SIZE] {
+            assert!(is_macos_port_block(MACOS_PORT_MIN, size), "{size}");
+            assert!(
+                is_macos_port_block(MACOS_PORT_MAX - size + 1, size),
+                "{size}"
+            );
+            assert!(!is_macos_port_block(MACOS_PORT_MIN - size, size), "{size}");
+            assert!(
+                !is_macos_port_block(MACOS_PORT_MAX - size + 2, size),
+                "{size}"
+            );
+            assert!(
+                !is_macos_port_block(MACOS_PORT_MIN + size / 2, size),
+                "{size}"
+            );
+        }
+        assert!(is_macos_port_block(MACOS_PORT_MIN + 16, 16));
+        assert!(!is_macos_port_block(MACOS_PORT_MIN + 16, 64));
+        for size in [0, 1, 3, 15, 48, 65] {
+            assert!(!is_port_block(0, size), "{size}");
+        }
+        assert!(is_port_block(0, 2));
+        assert!(is_port_block(u16::MAX - 63, 64));
+        assert!(!is_port_block(u16::MAX - 63, 128));
     }
 }

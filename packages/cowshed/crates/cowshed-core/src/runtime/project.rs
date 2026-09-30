@@ -1770,24 +1770,21 @@ fn claim_port_block(staging: &Path, base: u16) -> std::io::Result<Option<PathBuf
     Ok(None)
 }
 
+/// Claims the lowest new-size block that shares no port with a live block of any size. Every
+/// allocator claims new-size blocks on one aligned grid, so a claim marker keyed by base is
+/// enough to exclude a concurrent allocator; live blocks of other sizes are excluded by overlap.
 #[cfg(target_os = "macos")]
 async fn reserve_port_grants(
     inventory: &crate::gateway_inventory::NativeGatewayInventory,
     reservation_root: &Path,
-    mut used: std::collections::BTreeSet<u16>,
+    mut used: crate::metadata::ReservedPortBlocks,
 ) -> Result<PortGrantReservation> {
-    for base in (crate::metadata::MACOS_PORT_BLOCK_MIN
-        ..=crate::metadata::MACOS_PORT_BLOCK_LAST_BASE)
-        .step_by(usize::from(crate::metadata::PORT_BLOCK_SIZE))
-    {
-        if used.contains(&base) {
+    for block in crate::metadata::PortBlock::macos_candidates() {
+        if used.overlapping(block).is_some() {
             continue;
         }
-        let grants = GrantSet::closed_baseline(Some(
-            crate::metadata::PortBlock::new(base, crate::metadata::PORT_BLOCK_SIZE)
-                .map_err(native_integrity_error)?,
-        ))
-        .map_err(native_integrity_error)?;
+        let base = block.base();
+        let grants = GrantSet::closed_baseline(Some(block)).map_err(native_integrity_error)?;
         let Some(marker) = claim_port_block(reservation_root, base).map_err(|error| {
             CowshedError::internal(format!(
                 "claim macOS port block {base} at {}: {error}",
@@ -1802,10 +1799,10 @@ async fn reserve_port_grants(
         // Owning it excludes another claimant while we re-read publication; retaining the
         // guard across this await also releases the marker on error or cancellation.
         used = inventory
-            .all_reserved_port_bases()
+            .all_reserved_port_blocks()
             .await
             .map_err(native_integrity_error)?;
-        if !used.contains(&base) {
+        if used.overlapping(block).is_none() {
             return Ok(reservation);
         }
     }
@@ -2685,29 +2682,32 @@ impl NativeProjectRuntimeHost {
                 crate::storage::bootstrap::CanonicalRoots::global(),
             );
             match crate::gateway_inventory::NativeGatewayInventory::new(storage)
-                .all_reserved_port_bases()
+                .all_reserved_port_blocks()
                 .await
             {
                 Ok(_) => false,
-                Err(crate::gateway_inventory::GatewayInventoryError::DuplicatePortBlock(base)) => {
-                    let active_base = match self.current(target).await {
-                        Ok(current) => current.metadata.grants.port_block.map(|block| block.base()),
+                Err(crate::gateway_inventory::GatewayInventoryError::OverlappingPortBlocks {
+                    held,
+                    claimed,
+                }) => {
+                    let colliding =
+                        |block: crate::metadata::PortBlock| block == held || block == claimed;
+                    let active_block = match self.current(target).await {
+                        Ok(current) => current.metadata.grants.port_block,
                         Err(error) if error.code == ErrorCode::NotFound => None,
                         Err(error) => return Err(error),
                     };
-                    let target_owns_base = active_base == Some(base)
+                    let target_owns_block = active_block.is_some_and(colliding)
                         || self.pending_metadata().await?.iter().any(|(_, metadata)| {
                             &metadata.workspace == target
-                                && metadata
-                                    .grants
-                                    .port_block
-                                    .is_some_and(|block| block.base() == base)
+                                && metadata.grants.port_block.is_some_and(colliding)
                         });
-                    if !target_owns_base {
+                    if !target_owns_block {
                         return Err(native_integrity_error(
-                            crate::gateway_inventory::GatewayInventoryError::DuplicatePortBlock(
-                                base,
-                            ),
+                            crate::gateway_inventory::GatewayInventoryError::OverlappingPortBlocks {
+                                held,
+                                claimed,
+                            },
                         ));
                     }
                     // Every pending replay is deferred: even unrelated fresh creations need
@@ -4280,7 +4280,7 @@ impl NativeProjectRuntimeHost {
         let reservation_root = storage.store().join(".staging");
         let inventory = crate::gateway_inventory::NativeGatewayInventory::new(storage);
         let used = inventory
-            .all_reserved_port_bases()
+            .all_reserved_port_blocks()
             .await
             .map_err(native_integrity_error)?;
         reserve_port_grants(&inventory, &reservation_root, used).await
@@ -4305,7 +4305,7 @@ impl NativeProjectRuntimeHost {
             let storage =
                 crate::storage::bootstrap::ValidatedHostStorage::new(self.home.clone(), roots);
             crate::gateway_inventory::NativeGatewayInventory::new(storage)
-                .all_reserved_port_bases()
+                .all_reserved_port_blocks()
                 .await
                 .map_err(native_integrity_error)?;
             return Ok((metadata.grants, None));
@@ -7782,7 +7782,7 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
         self.validate_binding().await?;
         let current = self.current(&workspace).await?;
         let base = u16::try_from(
-            slot.checked_mul(u32::from(crate::metadata::PORT_BLOCK_SIZE))
+            slot.checked_mul(u32::from(crate::metadata::NEW_PORT_BLOCK_SIZE))
                 .ok_or_else(|| {
                     CowshedError::usage("slot overflows port space", "choose a smaller slot")
                 })?,
@@ -7790,7 +7790,7 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
         .map_err(|_| CowshedError::usage("slot overflows port space", "choose a smaller slot"))?;
         let mut metadata = current.metadata;
         metadata.grants.port_block = Some(
-            crate::metadata::PortBlock::new(base, crate::metadata::PORT_BLOCK_SIZE)
+            crate::metadata::PortBlock::new(base, crate::metadata::NEW_PORT_BLOCK_SIZE)
                 .map_err(|error| CowshedError::usage(error.to_string(), "choose another slot"))?,
         );
         metadata.grants.revision = metadata
@@ -11260,7 +11260,7 @@ mod retired_recovery_tests {
         let image = trash.join(format!("main-{}.sparseimage", incarnation.as_str()));
         std::fs::write(&image, b"retired main image").unwrap();
         let mut grants = GrantSet::closed_baseline(Some(
-            PortBlock::new(crate::metadata::MACOS_PORT_BLOCK_LAST_BASE, 16).unwrap(),
+            PortBlock::new(crate::metadata::MACOS_PORT_MAX - 15, 16).unwrap(),
         ))
         .unwrap();
         grants.revision = 8;
@@ -14018,9 +14018,9 @@ mod port_reservation_tests {
     use super::{claim_port_block, reserve_port_grants};
     use crate::gateway_inventory::NativeGatewayInventory;
     use crate::metadata::{
-        CheckoutLayout, DetachedWorkspaceMetadata, ImageFormat, MACOS_PORT_BLOCK_MIN,
-        PORT_BLOCK_SIZE, Platform, PublicationState, SIDECAR_VERSION, WorkspaceIncarnation,
-        WorkspaceName,
+        CheckoutLayout, DetachedWorkspaceMetadata, GrantSet, ImageFormat, MACOS_PORT_MIN,
+        NEW_PORT_BLOCK_SIZE, Platform, PortBlock, PublicationState, SIDECAR_VERSION,
+        WorkspaceIncarnation, WorkspaceName,
     };
     use crate::repository::{BoundIdentity, RepoId, RepositoryBinding};
     use crate::storage::StorageLayout;
@@ -14066,7 +14066,10 @@ mod port_reservation_tests {
         let root = root("publication");
         let (inventory, layout) = inventory(&root);
         let staging = root.join("store/.staging");
-        let stale = inventory.all_reserved_port_bases().await.expect("snapshot");
+        let stale = inventory
+            .all_reserved_port_blocks()
+            .await
+            .expect("snapshot");
         assert!(stale.is_empty());
 
         // Pause the second allocator at its snapshot boundary. The first completes the
@@ -14075,7 +14078,7 @@ mod port_reservation_tests {
             .await
             .expect("first allocation");
         let first_base = first.grants.port_block.expect("first block").base();
-        assert_eq!(first_base, MACOS_PORT_BLOCK_MIN);
+        assert_eq!(first_base, MACOS_PORT_MIN);
         let image = layout.main_image(ImageFormat::Sparse).expect("main image");
         std::fs::write(image.image(), b"detached image fixture").expect("image");
         DetachedWorkspaceMetadata {
@@ -14096,10 +14099,13 @@ mod port_reservation_tests {
         drop(first);
         assert_eq!(
             inventory
-                .all_reserved_port_bases()
+                .all_reserved_port_blocks()
                 .await
-                .expect("publication"),
-            std::collections::BTreeSet::from([first_base])
+                .expect("publication")
+                .blocks()
+                .map(|block| block.base())
+                .collect::<Vec<_>>(),
+            [first_base]
         );
 
         // The marker is gone, so live-claim exclusion alone cannot protect this stale read.
@@ -14107,7 +14113,7 @@ mod port_reservation_tests {
             .await
             .expect("allocation after publication");
         let second_base = second.grants.port_block.expect("second block").base();
-        assert_eq!(second_base, first_base + PORT_BLOCK_SIZE);
+        assert_eq!(second_base, first_base + NEW_PORT_BLOCK_SIZE);
         assert!(
             claim_port_block(&staging, second_base)
                 .expect("competing claim")
@@ -14168,17 +14174,20 @@ mod port_reservation_tests {
         );
         assert_eq!(
             inventory
-                .all_reserved_port_bases()
+                .all_reserved_port_blocks()
                 .await
-                .expect("reserved inventory"),
-            std::collections::BTreeSet::from([first_base])
+                .expect("reserved inventory")
+                .blocks()
+                .map(|block| block.base())
+                .collect::<Vec<_>>(),
+            [first_base]
         );
         let second = reserve_port_grants(&inventory, &staging, Default::default())
             .await
             .expect("allocation after creator death");
         assert_eq!(
             second.grants.port_block.expect("second block").base(),
-            first_base + PORT_BLOCK_SIZE
+            first_base + NEW_PORT_BLOCK_SIZE
         );
         drop(second);
         let main = layout.main_image(ImageFormat::Sparse).expect("main image");
@@ -14191,9 +14200,11 @@ mod port_reservation_tests {
             .write_for_image(main.image())
             .expect("conflicting published grant");
         assert!(matches!(
-            inventory.all_reserved_port_bases().await,
-            Err(crate::gateway_inventory::GatewayInventoryError::DuplicatePortBlock(base))
-                if base == first_base
+            inventory.all_reserved_port_blocks().await,
+            Err(crate::gateway_inventory::GatewayInventoryError::OverlappingPortBlocks {
+                held,
+                claimed,
+            }) if held.base() == first_base && claimed.base() == first_base
         ));
         std::fs::remove_file(main.image()).expect("remove conflicting payload");
         std::fs::remove_file(crate::metadata::sidecar_path(main.image()))
@@ -14204,7 +14215,7 @@ mod port_reservation_tests {
             .write_for_image(image.image())
             .expect("mismatched pending identity");
         assert!(matches!(
-            inventory.all_reserved_port_bases().await,
+            inventory.all_reserved_port_blocks().await,
             Err(crate::gateway_inventory::GatewayInventoryError::Apfs(
                 crate::storage::apfs::ApfsStorageError::Host(_)
             ))
@@ -14217,7 +14228,10 @@ mod port_reservation_tests {
         let root = root("inventory-error");
         let (inventory, layout) = inventory(&root);
         let staging = root.join("store/.staging");
-        let stale = inventory.all_reserved_port_bases().await.expect("snapshot");
+        let stale = inventory
+            .all_reserved_port_blocks()
+            .await
+            .expect("snapshot");
         std::fs::write(&layout.project().repository_binding, b"{broken")
             .expect("corrupt publication");
 
@@ -14226,10 +14240,94 @@ mod port_reservation_tests {
             Err(error) => error,
         };
         assert_eq!(error.code.as_str(), "integrity");
-        let marker = claim_port_block(&staging, MACOS_PORT_BLOCK_MIN)
+        let marker = claim_port_block(&staging, MACOS_PORT_MIN)
             .expect("claim after inventory error")
             .expect("failed allocation must release its marker");
         std::fs::remove_file(marker).expect("release probe");
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// A workspace keeps the block size it was allocated with, so the store holds blocks of
+    /// several sizes at once. Live 16-port blocks sit inside the first two 64-port candidates —
+    /// one published, one fenced into a pending clone — and a new workspace gets a 64-port block
+    /// that overlaps neither, then the next one after it.
+    #[tokio::test]
+    async fn a_new_block_takes_the_new_size_around_live_blocks_of_any_size() {
+        let root = root("mixed-sizes");
+        let (inventory, layout) = inventory(&root);
+        let staging = root.join("store/.staging");
+        let publish = |image: &std::path::Path,
+                       workspace: WorkspaceName,
+                       publication_state: PublicationState,
+                       block: PortBlock| {
+            std::fs::create_dir_all(image.parent().expect("image directory")).expect("directory");
+            std::fs::write(image, b"detached image fixture").expect("image");
+            DetachedWorkspaceMetadata {
+                version: SIDECAR_VERSION,
+                repo_id: RepoId::parse("acme/widget").expect("repo"),
+                workspace,
+                workspace_incarnation: WorkspaceIncarnation::new(
+                    "0198f2c0b7e34dc795f17b238b331c80",
+                )
+                .expect("incarnation"),
+                image_format: ImageFormat::Sparse,
+                platform: Platform::Macos,
+                publication_state,
+                updated_at: "2026-07-14T00:00:00Z".to_owned(),
+                grants: GrantSet::closed_baseline(Some(block)).expect("grants"),
+                info_snapshot: None,
+            }
+            .write_for_image(image)
+            .expect("publish block");
+        };
+        let published = PortBlock::new(MACOS_PORT_MIN + 16, 16).expect("live 16-port block");
+        let main = layout.main_image(ImageFormat::Sparse).expect("main image");
+        publish(
+            main.image(),
+            WorkspaceName::main(),
+            PublicationState::Active,
+            published,
+        );
+        let pending_name = WorkspaceName::session("unfinished").expect("session");
+        let pending_block =
+            PortBlock::new(MACOS_PORT_MIN + 64 + 48, 16).expect("pending 16-port block");
+        let pending = layout
+            .session_image(&pending_name, ImageFormat::Sparse)
+            .expect("session image");
+        publish(
+            pending.image(),
+            pending_name,
+            PublicationState::PendingFence,
+            pending_block,
+        );
+
+        let first = reserve_port_grants(&inventory, &staging, Default::default())
+            .await
+            .expect("allocation around live blocks");
+        let first_block = first.grants.port_block.expect("first block");
+        assert_eq!(
+            first_block,
+            PortBlock::new(MACOS_PORT_MIN + 128, NEW_PORT_BLOCK_SIZE).expect("expected block")
+        );
+        let second_name = WorkspaceName::session("second").expect("session");
+        let second_image = layout
+            .session_image(&second_name, ImageFormat::Sparse)
+            .expect("session image");
+        publish(
+            second_image.image(),
+            second_name,
+            PublicationState::PendingFence,
+            first_block,
+        );
+        drop(first);
+        let second = reserve_port_grants(&inventory, &staging, Default::default())
+            .await
+            .expect("allocation after the first new block");
+        assert_eq!(
+            second.grants.port_block.expect("second block"),
+            PortBlock::new(MACOS_PORT_MIN + 192, NEW_PORT_BLOCK_SIZE).expect("expected block")
+        );
+        drop(second);
         std::fs::remove_dir_all(root).expect("cleanup");
     }
 

@@ -9,6 +9,9 @@ use crate::metadata::{MetadataError, Platform, PortBlock, write_atomic_bytes};
 pub const WORKSPACE_ENVIRONMENT_PATH: &str = ".cowshed/env";
 pub const WORKSPACE_TOKEN_ENV: &str = "COWSHED_WORKSPACE_TOKEN";
 pub const PORT_BASE_ENV: &str = "COWSHED_PORT_BASE";
+/// The workspace's port block size: `base+1 … base+size-1` are its service ports. A block keeps
+/// the size it was allocated with, so tools read it here rather than assuming one.
+pub const PORT_BLOCK_SIZE_ENV: &str = "COWSHED_PORT_BLOCK_SIZE";
 pub const GO_ENV: &str = "GOENV";
 /// Node's and Bun's additive TLS trust anchor. The workspace CA is wired here and nowhere else:
 /// `SSL_CERT_FILE` belongs to nix and devenv, which supply the toolchain's own bundle.
@@ -28,8 +31,10 @@ pub enum WorkspaceEnvironmentError {
     Publication(#[from] MetadataError),
 }
 
-/// Atomically publish the source-able, workspace-local build environment inside an image.
-pub fn write_workspace_environment(
+/// Atomically publish the source-able, workspace-local build environment inside an image. Its
+/// one caller is `workspace_credentials::publish_workspace_environment`, which reads the token
+/// the image publishes.
+pub(crate) fn write_workspace_environment(
     image_root: &Path,
     workspace_mount: &Path,
     token: &Zeroizing<String>,
@@ -67,8 +72,9 @@ pub fn write_workspace_environment(
     // Token alphabet is unpadded base64url (`A-Za-z0-9_-`), already shell-safe.
     // `shell_word` would `to_owned()`/`format!` it into a plain String that is
     // never zeroized; push the borrowed token into a Zeroizing buffer instead.
-    // Capacity is sized so the buffer cannot reallocate after the token is copied.
-    let mut contents = Zeroizing::new(String::with_capacity(96 + go_env_word.len() + token.len()));
+    // Capacity is sized so the buffer cannot reallocate after the token is copied: the fixed
+    // text is 46 bytes around the two words plus at most 68 for the two port lines.
+    let mut contents = Zeroizing::new(String::with_capacity(128 + go_env_word.len() + token.len()));
     contents.push_str("export ");
     contents.push_str(GO_ENV);
     contents.push('=');
@@ -79,11 +85,13 @@ pub fn write_workspace_environment(
     contents.push_str(token);
     contents.push('\n');
     if let Some(block) = port_block {
-        contents.push_str("export ");
-        contents.push_str(PORT_BASE_ENV);
-        contents.push('=');
-        writeln!(&mut *contents, "{}", block.base())
-            .expect("writing to a preallocated String cannot fail");
+        writeln!(
+            &mut *contents,
+            "export {PORT_BASE_ENV}={}\nexport {PORT_BLOCK_SIZE_ENV}={}",
+            block.base(),
+            block.size()
+        )
+        .expect("writing to a String cannot fail");
     }
 
     write_atomic_bytes(
@@ -122,5 +130,6 @@ mod tests {
         assert_eq!(GO_ENV, "GOENV");
         assert_eq!(WORKSPACE_TOKEN_ENV, "COWSHED_WORKSPACE_TOKEN");
         assert_eq!(PORT_BASE_ENV, "COWSHED_PORT_BASE");
+        assert_eq!(PORT_BLOCK_SIZE_ENV, "COWSHED_PORT_BLOCK_SIZE");
     }
 }

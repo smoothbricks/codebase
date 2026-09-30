@@ -536,17 +536,20 @@ outside the granted set fail with EPERM.
 
 ### Dev servers inside workspaces
 
-On macOS, each workspace owns a **16-port block** allocated at creation; the gateway data plane sits on the base port,
-and base+1 through base+15 are workspace service ports. Linux allocates no port block: every workspace instead gets
-private loopback in its own network namespace, so fixed service ports do not collide with siblings. Ordinary package
-tools still use `http://127.0.0.1:7644/…`: exactly one controller-owned, non-signalable connector in that namespace
-binds that address and forwards bytes only to the workspace's mounted `/run/cowshed/gateway.sock`. It holds no policy or
-credentials and is not a general TCP/Unix-socket forwarder; the socket inode, namespace, and opaque token retain the
-authority boundary. Detach or restore drains and kills it. Tools must use cowshed's platform-specific configuration
-rather than assuming host-wide loopback.
+On macOS, each workspace owns a **port block** allocated at creation — 64 ports for a new workspace; a workspace keeps
+the size it was allocated with — and the gateway data plane sits on the base port, with base+1 through base+size-1 as
+workspace service ports. Linux allocates no port block: every workspace instead gets private loopback in its own network
+namespace, so fixed service ports do not collide with siblings. Ordinary package tools still use
+`http://127.0.0.1:7644/…`: exactly one controller-owned, non-signalable connector in that namespace binds that address
+and forwards bytes only to the workspace's mounted `/run/cowshed/gateway.sock`. It holds no policy or credentials and is
+not a general TCP/Unix-socket forwarder; the socket inode, namespace, and opaque token retain the authority boundary.
+Detach or restore drains and kills it. Tools must use cowshed's platform-specific configuration rather than assuming
+host-wide loopback.
 
-On macOS, `.cowshed/env` exports `PORT` (base+1) and `COWSHED_PORT_BASE` for tools that need several ports; devenv
-offsets can derive from the block. Linux configuration contains no block or sentinel values.
+On macOS, `.cowshed/env` exports `PORT` (base+1), `COWSHED_PORT_BASE` and `COWSHED_PORT_BLOCK_SIZE` for tools that need
+several ports: the block is `base … base+size-1`, and its size is the one the workspace was allocated with (64 for new
+workspaces), so read it rather than assume it. devenv offsets can derive from the block. Linux configuration contains no
+block or sentinel values.
 
 ```
 $ cowshed shell raven

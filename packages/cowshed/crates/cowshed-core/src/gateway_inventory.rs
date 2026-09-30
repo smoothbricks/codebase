@@ -15,7 +15,7 @@ use crate::api::dto::{ProjectWorkspaces, WorkspaceInfo};
 use crate::checkout::load_checkout_layout;
 use crate::metadata::{
     CheckoutLayout, DetachedWorkspaceMetadata, GrantSet, ImageFormat, PortBlock, PublicationState,
-    WorkspaceIncarnation, WorkspaceName, sidecar_path,
+    ReservedPortBlocks, WorkspaceIncarnation, WorkspaceName, sidecar_path,
 };
 use crate::repository::{OwnedRepoIds, RepoId, RepositoryBinding};
 use crate::storage::apfs::native::{
@@ -138,8 +138,8 @@ pub enum GatewayInventoryError {
         first: RepoId,
         second: RepoId,
     },
-    #[error("macOS port block base {0} is assigned to more than one workspace")]
-    DuplicatePortBlock(u16),
+    #[error("macOS port block {claimed} shares ports with {held}, assigned to another workspace")]
+    OverlappingPortBlocks { held: PortBlock, claimed: PortBlock },
     #[error("project root {0} is claimed by more than one repository binding")]
     AmbiguousProjectRoot(PathBuf),
     #[error("gateway inventory has duplicate or ambiguous mount fact for {0}")]
@@ -392,6 +392,20 @@ impl fmt::Debug for NativeGatewayInventory {
             .field("storage", &self.storage)
             .finish_non_exhaustive()
     }
+}
+
+/// Holds `block` among the store's reserved blocks, refusing one that shares a port with a block
+/// another workspace holds: blocks of different sizes are compared by the ports they cover.
+fn reserve_port_block(
+    blocks: &mut ReservedPortBlocks,
+    block: PortBlock,
+) -> Result<(), GatewayInventoryError> {
+    blocks
+        .insert(block)
+        .map_err(|held| GatewayInventoryError::OverlappingPortBlocks {
+            held,
+            claimed: block,
+        })
 }
 
 impl NativeGatewayInventory {
@@ -718,10 +732,12 @@ impl NativeGatewayInventory {
         Ok(unreachable)
     }
 
-    pub async fn all_reserved_port_bases(&self) -> Result<BTreeSet<u16>, GatewayInventoryError> {
+    pub async fn all_reserved_port_blocks(
+        &self,
+    ) -> Result<ReservedPortBlocks, GatewayInventoryError> {
         let inventory = self.clone();
         crate::storage::lifecycle::dispatch_blocking(move || {
-            inventory.all_reserved_port_bases_blocking()
+            inventory.all_reserved_port_blocks_blocking()
         })
         .await
         .map_err(|error| GatewayInventoryError::Blocking(error.to_string()))?
@@ -845,9 +861,11 @@ impl NativeGatewayInventory {
         Ok(matched)
     }
 
-    fn all_reserved_port_bases_blocking(&self) -> Result<BTreeSet<u16>, GatewayInventoryError> {
+    fn all_reserved_port_blocks_blocking(
+        &self,
+    ) -> Result<ReservedPortBlocks, GatewayInventoryError> {
         let repositories = discover_repositories(self.storage.store())?;
-        let mut bases = BTreeSet::new();
+        let mut blocks = ReservedPortBlocks::default();
         for repo in repositories {
             let authoritative = self.source.project_facts(&self.storage, &repo)?;
             let layout = StorageLayout::new(self.storage.store(), &repo).map_err(|error| {
@@ -865,17 +883,13 @@ impl NativeGatewayInventory {
                 let image = canonical_image_paths(&layout, &fact.workspace)?;
                 let metadata =
                     read_current_metadata(self.storage.store(), image.image(), &fact.workspace)?;
-                let base = metadata
-                    .grants
-                    .port_block
-                    .ok_or_else(|| GatewayInventoryError::MissingPortBlock {
+                let block = metadata.grants.port_block.ok_or_else(|| {
+                    GatewayInventoryError::MissingPortBlock {
                         repo: repo.clone(),
                         workspace: fact.workspace.name().clone(),
-                    })?
-                    .base();
-                if !bases.insert(base) {
-                    return Err(GatewayInventoryError::DuplicatePortBlock(base));
-                }
+                    }
+                })?;
+                reserve_port_block(&mut blocks, block)?;
             }
             // Incomplete clones cannot be served, but a canonical pending payload owns its
             // stored grant even after its creator exits. Sidecar-only fences are reclaimed
@@ -883,12 +897,12 @@ impl NativeGatewayInventory {
             if !active_names.contains(&WorkspaceName::main())
                 && let Some(image) = existing_main_image(&layout)?
             {
-                Self::reserve_pending_port_base(
+                Self::reserve_pending_port_block(
                     self.storage.store(),
                     &repo,
                     &WorkspaceName::main(),
                     &image,
-                    &mut bases,
+                    &mut blocks,
                 )?;
             }
             let sessions = &layout.project().sessions;
@@ -914,25 +928,25 @@ impl NativeGatewayInventory {
                 // Published images were already validated above. Only pending sidecars
                 // need reading after the canonical directory enumeration.
                 if !active_names.contains(image.workspace()) {
-                    Self::reserve_pending_port_base(
+                    Self::reserve_pending_port_block(
                         self.storage.store(),
                         &repo,
                         image.workspace(),
                         image.path(),
-                        &mut bases,
+                        &mut blocks,
                     )?;
                 }
             }
         }
-        Ok(bases)
+        Ok(blocks)
     }
 
-    fn reserve_pending_port_base(
+    fn reserve_pending_port_block(
         store_root: &Path,
         repo: &RepoId,
         workspace: &WorkspaceName,
         image: &Path,
-        bases: &mut BTreeSet<u16>,
+        blocks: &mut ReservedPortBlocks,
     ) -> Result<(), GatewayInventoryError> {
         verify_no_symlinks(store_root, image).map_err(|error| {
             GatewayInventoryError::InvalidMetadata {
@@ -965,33 +979,26 @@ impl NativeGatewayInventory {
                 message: "canonical image was not present in the published inventory".to_owned(),
             });
         }
-        let base = metadata
-            .grants
-            .port_block
-            .ok_or_else(|| GatewayInventoryError::MissingPortBlock {
-                repo: repo.clone(),
-                workspace: workspace.clone(),
-            })?
-            .base();
-        if !bases.insert(base) {
-            return Err(GatewayInventoryError::DuplicatePortBlock(base));
-        }
-        Ok(())
+        let block =
+            metadata
+                .grants
+                .port_block
+                .ok_or_else(|| GatewayInventoryError::MissingPortBlock {
+                    repo: repo.clone(),
+                    workspace: workspace.clone(),
+                })?;
+        reserve_port_block(blocks, block)
     }
 
     fn all_attached_blocking(&self) -> Result<Vec<GatewaySessionFact>, GatewayInventoryError> {
         let repositories = discover_repositories(self.storage.store())?;
         let mut facts = Vec::new();
-        let mut port_bases = BTreeSet::new();
+        let mut port_blocks = ReservedPortBlocks::default();
         for repo in repositories {
             match self.load_project(&repo) {
                 Ok(project) => {
                     for fact in &project {
-                        if !port_bases.insert(fact.port_block.base()) {
-                            return Err(GatewayInventoryError::DuplicatePortBlock(
-                                fact.port_block.base(),
-                            ));
-                        }
+                        reserve_port_block(&mut port_blocks, fact.port_block)?;
                     }
                     facts.extend(project);
                 }
@@ -1002,7 +1009,7 @@ impl NativeGatewayInventory {
                     if matches!(
                         error,
                         GatewayInventoryError::DuplicateRepository(_)
-                            | GatewayInventoryError::DuplicatePortBlock(_)
+                            | GatewayInventoryError::OverlappingPortBlocks { .. }
                             | GatewayInventoryError::AmbiguousProjectRoot(_)
                             | GatewayInventoryError::ForeignBinding { .. }
                     ) {
@@ -1734,7 +1741,7 @@ mod tests {
     use std::sync::Mutex;
 
     use crate::metadata::{
-        CheckoutLayout, MACOS_PORT_BLOCK_MIN, PORT_BLOCK_SIZE, Platform, SIDECAR_VERSION,
+        CheckoutLayout, MACOS_PORT_MIN, NEW_PORT_BLOCK_SIZE, Platform, SIDECAR_VERSION,
         WorkspaceInfoSnapshot, WorkspaceRole, write_json,
     };
     use crate::repository::{BoundIdentity, RepositoryBinding};
@@ -1770,21 +1777,22 @@ mod tests {
 
     /// How the fixture assigns macOS port blocks.
     ///
-    /// A fixture that gave every workspace base 40960 made the store-wide uniqueness invariant
+    /// A fixture that gave every workspace base 40960 made the store-wide disjointness invariant
     /// unobservable: the second workspace in any store was already a collision, so no test could
     /// tell a healthy multi-project store from a broken one. `Grid` is the healthy host, walking
-    /// the same aligned grid the allocator walks; `Collide` plants the fault on purpose.
+    /// the new-size grid the allocator walks; `Planted` hands the next workspace a chosen block
+    /// and then resumes the grid, the fault on purpose.
     #[derive(Clone, Copy)]
-    enum FixturePortBases {
+    enum FixturePortBlocks {
         Grid(u16),
-        Collide(u16),
+        Planted { block: PortBlock, then: u16 },
     }
 
     struct Fixture {
         root: PathBuf,
         storage: ValidatedHostStorage,
         checkout_layout: CheckoutLayout,
-        port_bases: Cell<FixturePortBases>,
+        port_blocks: Cell<FixturePortBlocks>,
     }
 
     impl Fixture {
@@ -1807,25 +1815,34 @@ mod tests {
                 root,
                 storage: ValidatedHostStorage::new(home, roots),
                 checkout_layout,
-                port_bases: Cell::new(FixturePortBases::Grid(MACOS_PORT_BLOCK_MIN)),
+                port_blocks: Cell::new(FixturePortBlocks::Grid(MACOS_PORT_MIN)),
             }
         }
 
         /// This workspace's port block.
-        fn take_port_base(&self) -> u16 {
-            match self.port_bases.get() {
-                FixturePortBases::Grid(base) => {
-                    self.port_bases
-                        .set(FixturePortBases::Grid(base + PORT_BLOCK_SIZE));
-                    base
+        fn take_port_block(&self) -> PortBlock {
+            match self.port_blocks.get() {
+                FixturePortBlocks::Grid(base) => {
+                    self.port_blocks
+                        .set(FixturePortBlocks::Grid(base + NEW_PORT_BLOCK_SIZE));
+                    PortBlock::new(base, NEW_PORT_BLOCK_SIZE).expect("port block")
                 }
-                FixturePortBases::Collide(base) => base,
+                FixturePortBlocks::Planted { block, then } => {
+                    self.port_blocks.set(FixturePortBlocks::Grid(then));
+                    block
+                }
             }
         }
 
-        /// Give every workspace from here on the same block, which is the store-wide collision.
-        fn collide_port_bases(&self, base: u16) {
-            self.port_bases.set(FixturePortBases::Collide(base));
+        /// Give the next workspace `block`; the ones after it resume the grid.
+        fn plant_port_block(&self, block: PortBlock) {
+            let then = match self.port_blocks.get() {
+                FixturePortBlocks::Grid(base) | FixturePortBlocks::Planted { then: base, .. } => {
+                    base
+                }
+            };
+            self.port_blocks
+                .set(FixturePortBlocks::Planted { block, then });
         }
 
         fn bind(&self, repo: &RepoId) {
@@ -1890,8 +1907,7 @@ mod tests {
             } else {
                 layout.workspace_mount(&name).expect("workspace mount")
             };
-            let port_block =
-                PortBlock::new(self.take_port_base(), PORT_BLOCK_SIZE).expect("port block");
+            let port_block = self.take_port_block();
             let mut grants = GrantSet::closed_baseline(Some(port_block)).expect("grants");
             grants.revision = revision;
             let info_snapshot =
@@ -2134,13 +2150,19 @@ mod tests {
             Some(repo_a.clone())
         );
         // A healthy store reserves one block per workspace, so the scan reports both rather than
-        // reporting a collision. This is the positive half of the uniqueness invariant.
+        // reporting a collision. This is the positive half of the disjointness invariant.
         assert_eq!(
             inventory
-                .all_reserved_port_bases()
+                .all_reserved_port_blocks()
                 .await
-                .expect("reserved port bases"),
-            BTreeSet::from([MACOS_PORT_BLOCK_MIN, MACOS_PORT_BLOCK_MIN + PORT_BLOCK_SIZE])
+                .expect("reserved port blocks")
+                .blocks()
+                .collect::<Vec<_>>(),
+            [
+                PortBlock::new(MACOS_PORT_MIN, NEW_PORT_BLOCK_SIZE).expect("first block"),
+                PortBlock::new(MACOS_PORT_MIN + NEW_PORT_BLOCK_SIZE, NEW_PORT_BLOCK_SIZE)
+                    .expect("second block"),
+            ]
         );
     }
 
@@ -2216,35 +2238,45 @@ mod tests {
         assert_eq!(facts.len(), 1);
     }
 
-    /// One macOS port block belongs to at most one workspace host-wide: the block is the
-    /// workspace's gateway endpoint, so two claimants means two workspaces answering on one port.
-    /// Both readers of the store refuse — the allocator's scan, and the session listing the
-    /// `RunAtLoad` gateway builds — because installing the second session is the harm.
+    /// A macOS port belongs to at most one workspace host-wide: a block's base is the workspace's
+    /// gateway endpoint and its other ports are the workspace's own, so two workspaces whose
+    /// blocks share a port — the same block, or a live 16-port block inside another's 64 —
+    /// answer on one port. Both readers of the store refuse — the allocator's scan, and the
+    /// session listing the `RunAtLoad` gateway builds — because installing the second session is
+    /// the harm.
     #[tokio::test]
-    async fn one_port_block_claimed_twice_is_refused_by_every_store_wide_reader() {
+    async fn one_port_claimed_twice_is_refused_by_every_store_wide_reader() {
         let fixture = Fixture::new("duplicate-port");
-        fixture.collide_port_bases(MACOS_PORT_BLOCK_MIN);
+        let live = PortBlock::new(MACOS_PORT_MIN + 16, 16).expect("live 16-port block");
+        fixture.plant_port_block(live);
         let (_repo_a, _repo_b, source) = two_project_store(&fixture);
         let inventory = NativeGatewayInventory::with_source(
             fixture.storage.clone(),
             source as Arc<dyn InventorySource>,
         );
 
-        // The fixture hands out one block per workspace, so the collision has to be planted: both
-        // mains are reissued the first base.
-        assert!(matches!(
+        // The fixture hands out disjoint blocks, so the collision has to be planted: one main
+        // holds a live 16-port block inside the 64-port block the other main is issued.
+        let fresh = PortBlock::new(MACOS_PORT_MIN, NEW_PORT_BLOCK_SIZE).expect("new block");
+        let collision = |error: GatewayInventoryError| match error {
+            GatewayInventoryError::OverlappingPortBlocks { held, claimed } => {
+                let mut pair = [held, claimed];
+                pair.sort_by_key(|block| block.size());
+                pair == [live, fresh]
+            }
+            _ => false,
+        };
+        assert!(collision(
             inventory
-                .all_reserved_port_bases()
+                .all_reserved_port_blocks()
                 .await
-                .expect_err("duplicate global port assignment"),
-            GatewayInventoryError::DuplicatePortBlock(MACOS_PORT_BLOCK_MIN)
+                .expect_err("overlapping global port assignment"),
         ));
-        assert!(matches!(
+        assert!(collision(
             inventory
                 .all_attached()
                 .await
                 .expect_err("a colliding endpoint must not be installed"),
-            GatewayInventoryError::DuplicatePortBlock(MACOS_PORT_BLOCK_MIN)
         ));
     }
 
