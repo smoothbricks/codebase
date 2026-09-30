@@ -325,7 +325,9 @@ unconditionally (`cowshed: <step> start` / `done elapsed=…`), and every other 
 validation, the controller's inventory, binding and recovery passes, each controller route, the gateway reconcile, a
 resident answer's resolution and why it declined (06_cli.md), job submission and relay — only under `COWSHED_TIMING=1`,
 one `cowshed: timing +<since start> <scope> <step> <elapsed>` line per finished step. `path` and `exec` never print them
-otherwise: their stdout answers a script and their stderr is the child's.
+otherwise: their stdout answers a script and their stderr is the child's. A workspace supervisor prints the same lines
+for the steps of each job it runs — admission record and commitment, sandbox environment, spawn, and the terminal record
+and commitment — on its own stderr, which is the daemon's log, when it runs with `COWSHED_TIMING=1`.
 
 ## Querying
 

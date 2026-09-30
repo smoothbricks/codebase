@@ -15,11 +15,11 @@ use cowshed_core::api::{ExitStatus, JobId};
 use cowshed_core::metadata::{PortBlock, WorkspaceIncarnation, WorkspaceName};
 use cowshed_core::repository::RepoId;
 use cowshed_core::runtime::supervisor::{
-    ProcessEvent, ProcessSpawnRequest, SpawnSink, SystemSpawnSink, WorkspaceAuthoritySnapshot,
+    ProcessEvent, ProcessSpawnRequest, SandboxPolicy, SpawnSink, SystemSpawnSink,
+    WorkspaceAuthoritySnapshot,
 };
 use cowshed_core::sandbox::{
-    RunSandboxMode, SandboxConfig, SandboxGrants, SandboxProfileRole, sandbox_runtime_dir,
-    sandbox_runtime_link, seatbelt_profile,
+    RunSandboxMode, SandboxConfig, SandboxGrants, sandbox_runtime_dir, sandbox_runtime_link,
 };
 use cowshed_core::storage::job_artifact::StreamKind;
 use cowshed_core::workspace_credentials::WORKSPACE_TOKEN_PATH;
@@ -572,14 +572,7 @@ fn spawn_request(sandbox: &SandboxConfig, cwd: &Path, argv: Vec<OsString>) -> Pr
         cwd: cwd.to_path_buf(),
         env: BTreeMap::new(),
         devenv_dir: None,
-        trusted_supervisor_profile: seatbelt_profile(
-            sandbox,
-            SandboxProfileRole::TrustedSupervisor,
-        )
-        .expect("supervisor profile"),
-        executed_child_profile: seatbelt_profile(sandbox, SandboxProfileRole::ExecutedChild)
-            .expect("child profile"),
-        sandbox: sandbox.clone(),
+        policy: SandboxPolicy::render(sandbox.clone()).expect("sandbox policy"),
         mode: cowshed_core::api::RunSandboxMode::ReadWrite,
     }
 }

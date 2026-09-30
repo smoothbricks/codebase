@@ -22,7 +22,7 @@ use crate::api::dto::{
 };
 use crate::error::{CowshedError, Result};
 use crate::exec::{
-    ExecError, SandboxExecRequest, SpawnPlan, classify_spawn_error, plan_exec,
+    ExecError, SandboxExecRequest, SpawnPlan, classify_spawn_error, plan_exec_under,
     prepare_child_descriptors,
 };
 use crate::fsio::AnchoredDirectory;
@@ -110,12 +110,9 @@ impl WorkspaceSupervisorConfig {
                 "reattach the authoritative workspace mount",
             ));
         }
-        self.artifacts.validate().map_err(map_artifact_error)?;
-        seatbelt_profile(&self.sandbox, SandboxProfileRole::TrustedSupervisor)
-            .map_err(map_sandbox_error)?;
-        seatbelt_profile(&self.sandbox, SandboxProfileRole::ExecutedChild)
-            .map_err(map_sandbox_error)?;
-        Ok(())
+        // The sandbox's profiles are rendered by `SandboxPolicy::render` at start, which refuses
+        // a sandbox that cannot compile.
+        self.artifacts.validate().map_err(map_artifact_error)
     }
 }
 
@@ -232,6 +229,60 @@ pub enum SpawnCommand {
     Script(crate::script::RenderedScript),
 }
 
+/// A workspace's sandbox and the Seatbelt profiles it compiles to, rendered together once — when
+/// a supervisor takes an authority, at start and at each grant advance — and shared by every job
+/// admitted under that authority. A spawn carries this value, so no job renders a profile, and
+/// no spawn can pair a sandbox with a profile rendered from another one.
+#[derive(Clone, Debug)]
+pub struct SandboxPolicy(std::sync::Arc<RenderedPolicy>);
+
+#[derive(Debug)]
+struct RenderedPolicy {
+    /// The sandbox the supervisor holds; a job may narrow it, never widen it.
+    ceiling: SandboxConfig,
+    read_only: SandboxConfig,
+    ceiling_child: String,
+    read_only_child: String,
+}
+
+impl SandboxPolicy {
+    pub fn render(ceiling: SandboxConfig) -> Result<Self> {
+        let mut read_only = ceiling.clone();
+        read_only.mode = crate::sandbox::RunSandboxMode::ReadOnly;
+        let render = |sandbox: &SandboxConfig, role| {
+            seatbelt_profile(sandbox, role).map_err(map_sandbox_error)
+        };
+        // The trusted-supervisor role runs nothing, but a sandbox that cannot compile in it is
+        // not one this supervisor may hold.
+        render(&ceiling, SandboxProfileRole::TrustedSupervisor)?;
+        Ok(Self(std::sync::Arc::new(RenderedPolicy {
+            ceiling_child: render(&ceiling, SandboxProfileRole::ExecutedChild)?,
+            read_only_child: render(&read_only, SandboxProfileRole::ExecutedChild)?,
+            ceiling,
+            read_only,
+        })))
+    }
+
+    pub fn ceiling(&self) -> &SandboxConfig {
+        &self.0.ceiling
+    }
+
+    /// The sandbox and executed-child profile of a job that asked for `mode`.
+    pub fn child(&self, mode: crate::api::dto::RunSandboxMode) -> (&SandboxConfig, &str) {
+        match mode {
+            crate::api::dto::RunSandboxMode::ReadOnly => {
+                (&self.0.read_only, &self.0.read_only_child)
+            }
+            crate::api::dto::RunSandboxMode::ReadWrite => (&self.0.ceiling, &self.0.ceiling_child),
+        }
+    }
+
+    /// Whether both are the one rendering admission hands every job under one authority.
+    pub fn is_same_rendering(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ProcessSpawnRequest {
     pub authority: WorkspaceAuthoritySnapshot,
@@ -240,11 +291,9 @@ pub struct ProcessSpawnRequest {
     pub cwd: PathBuf,
     pub env: BTreeMap<String, String>,
     pub devenv_dir: Option<PathBuf>,
-    pub sandbox: SandboxConfig,
-    /// Requested narrowing of `sandbox`, which retains the supervisor's ceiling.
+    pub policy: SandboxPolicy,
+    /// Requested narrowing of the policy's ceiling.
     pub mode: crate::api::dto::RunSandboxMode,
-    pub trusted_supervisor_profile: String,
-    pub executed_child_profile: String,
 }
 
 #[derive(Debug)]
@@ -1578,37 +1627,17 @@ impl SystemSpawnSink {
 impl SpawnSink for SystemSpawnSink {
     async fn spawn(
         &mut self,
-        mut request: ProcessSpawnRequest,
+        request: ProcessSpawnRequest,
         events: mpsc::Sender<ProcessEvent>,
     ) -> Result<Box<dyn RunningProcess>> {
-        if request.trusted_supervisor_profile
-            != seatbelt_profile(&request.sandbox, SandboxProfileRole::TrustedSupervisor)
-                .map_err(map_sandbox_error)?
-        {
-            return Err(CowshedError::integrity(
-                "trusted-supervisor Seatbelt profile changed between admission and spawn",
-                "cowshed doctor --json",
-            ));
-        }
-        if request.mode == crate::api::dto::RunSandboxMode::ReadOnly {
-            request.sandbox.mode = crate::sandbox::RunSandboxMode::ReadOnly;
-        }
-        let cwd = crate::exec::contained_cwd(&request.sandbox.workspace_mount, &request.cwd)
+        let (sandbox, profile) = request.policy.child(request.mode);
+        let cwd = crate::exec::contained_cwd(&sandbox.workspace_mount, &request.cwd)
             .map_err(map_exec_error)?;
-        if seatbelt_profile(&request.sandbox, SandboxProfileRole::ExecutedChild)
-            .map_err(map_sandbox_error)?
-            != request.executed_child_profile
-        {
-            return Err(CowshedError::integrity(
-                "executed-child Seatbelt profile changed between admission and spawn",
-                "cowshed doctor --json",
-            ));
-        }
-        let selection = select_shell(&request.sandbox, &cwd, request.devenv_dir.as_deref())?;
-        let environment = sandbox_environment(
-            &request.sandbox,
-            selection.devenv_dir.as_deref(),
-            &request.env,
+        let selection = select_shell(sandbox, &cwd, request.devenv_dir.as_deref())?;
+        let environment = crate::timing::spanned(
+            "spawn",
+            "environment",
+            sandbox_environment(sandbox, selection.devenv_dir.as_deref(), &request.env),
         )
         .await?;
         let activation = match &selection.entry {
@@ -1620,9 +1649,9 @@ impl SpawnSink for SystemSpawnSink {
             job_id: request.job_id,
             command,
             cwd: cwd.clone(),
-            profile: request.executed_child_profile.clone(),
-            read_only: request.sandbox.mode == crate::sandbox::RunSandboxMode::ReadOnly,
-            workspace_mount: request.sandbox.workspace_mount.clone(),
+            profile,
+            read_only: sandbox.mode == crate::sandbox::RunSandboxMode::ReadOnly,
+            workspace_mount: sandbox.workspace_mount.clone(),
             envrc_directory: activation.clone().flatten(),
             environment,
             caller: &request.env,
@@ -1653,7 +1682,7 @@ impl SpawnSink for SystemSpawnSink {
                 events,
             );
         }
-        let mut plan = plan_exec(SandboxExecRequest { argv, cwd }, &request.sandbox)
+        let mut plan = plan_exec_under(SandboxExecRequest { argv, cwd }, sandbox, profile)
             .map_err(map_exec_error)?;
         wrap_one_shot(&mut plan, &selection.entry);
         let mut command = sandboxed_command(&plan, &environment.child(&request.env));
@@ -2283,6 +2312,7 @@ impl WorkspaceSupervisor {
         commitments: Box<dyn CommitmentSink>,
     ) -> Result<WorkspaceSupervisorHandle> {
         config.validate()?;
+        let policy = SandboxPolicy::render(config.sandbox)?;
         let next_job_id = artifacts.next_job_id()?;
         let (commands, receiver) = mpsc::channel(config.actor_capacity);
         let (events, event_receiver) = mpsc::channel(config.event_capacity);
@@ -2294,7 +2324,7 @@ impl WorkspaceSupervisor {
             authority: config.authority,
             workspace_root: config.workspace_root,
             default_cwd: config.default_cwd,
-            sandbox: config.sandbox,
+            policy,
             credential_env_names: config.credential_env_names,
             group_ledger: config.group_ledger,
             term_grace: config.term_grace,
@@ -2520,7 +2550,8 @@ struct SupervisorActor {
     group_ledger: Option<PathBuf>,
     workspace_root: PathBuf,
     default_cwd: Option<WorkspacePath>,
-    sandbox: SandboxConfig,
+    /// The sandbox of the authority served, rendered once when it was taken.
+    policy: SandboxPolicy,
     /// Names withheld from every child; see [`WorkspaceSupervisorConfig::credential_env_names`].
     credential_env_names: BTreeSet<String>,
     term_grace: Duration,
@@ -2826,11 +2857,10 @@ impl SupervisorActor {
                 "reattach the authoritative workspace mount",
             ));
         }
-        seatbelt_profile(&sandbox, SandboxProfileRole::TrustedSupervisor)
-            .map_err(map_sandbox_error)?;
-        seatbelt_profile(&sandbox, SandboxProfileRole::ExecutedChild).map_err(map_sandbox_error)?;
+        // Rendered here, once for the new authority; every job admitted under it shares it.
+        let policy = SandboxPolicy::render(sandbox)?;
         self.authority = authority;
-        self.sandbox = sandbox;
+        self.policy = policy;
         Ok(())
     }
 
@@ -3030,22 +3060,27 @@ impl SupervisorActor {
             .and_then(|value| {
                 JobId::new(value).map_err(|error| CowshedError::internal(error.to_string()))
             })?;
-        self.artifacts.admit(
-            job_id,
-            self.authority.grant_revision,
-            &command,
-            warm.as_ref(),
-        )?;
+        {
+            let _span = crate::timing::span("admit", "record");
+            self.artifacts.admit(
+                job_id,
+                self.authority.grant_revision,
+                &command,
+                warm.as_ref(),
+            )?;
+        }
         self.next_job_id = expected_next;
-        let admission = self
-            .commitments
-            .record(CommitmentDraft::Admission {
+        let admission = crate::timing::spanned(
+            "admit",
+            "commitment",
+            self.commitments.record(CommitmentDraft::Admission {
                 repo_id: self.authority.repo_id.clone(),
                 workspace_incarnation: self.authority.workspace_incarnation.clone(),
                 job_id,
                 grant_revision: self.authority.grant_revision,
-            })
-            .await;
+            }),
+        )
+        .await;
         if let Err(error) = admission {
             let _ = self
                 .artifacts
@@ -3093,44 +3128,7 @@ impl SupervisorActor {
             failure: None,
             warm,
         };
-        let trusted_supervisor_profile =
-            match seatbelt_profile(&self.sandbox, SandboxProfileRole::TrustedSupervisor)
-                .map_err(map_sandbox_error)
-            {
-                Ok(profile) => profile,
-                Err(error) => {
-                    let _ = self.artifacts.seal(
-                        job_id,
-                        JobState::Failed.into(),
-                        stdout_copy,
-                        stderr_copy,
-                    );
-                    return Err(error);
-                }
-            };
-        // The request may narrow the configured ceiling, never widen it. Keep this
-        // per job so a read-only invocation does not alter later jobs or the
-        // supervisor's authority to seal their protected artifacts.
-        let mut child_sandbox = self.sandbox.clone();
-        if mode == crate::api::dto::RunSandboxMode::ReadOnly {
-            child_sandbox.mode = crate::sandbox::RunSandboxMode::ReadOnly;
-        }
-        let executed_child_profile =
-            match seatbelt_profile(&child_sandbox, SandboxProfileRole::ExecutedChild)
-                .map_err(map_sandbox_error)
-            {
-                Ok(profile) => profile,
-                Err(error) => {
-                    let _ = self.artifacts.seal(
-                        job_id,
-                        JobState::Failed.into(),
-                        stdout_copy,
-                        stderr_copy,
-                    );
-                    return Err(error);
-                }
-            };
-        child_sandbox.mode = self.sandbox.mode;
+        let spawn_span = crate::timing::span("admit", "spawn");
         let spawn = self
             .spawner
             .spawn(
@@ -3145,14 +3143,15 @@ impl SupervisorActor {
                         .unwrap_or_default(),
                     env: merged_env,
                     devenv_dir: None,
-                    sandbox: child_sandbox,
+                    // Rendered when this authority was taken. The request may narrow the
+                    // ceiling, never widen it, and narrowing one job alters no other job.
+                    policy: self.policy.clone(),
                     mode,
-                    trusted_supervisor_profile,
-                    executed_child_profile,
                 },
                 self.events.clone(),
             )
             .await;
+        drop(spawn_span);
         let mut job = JobStateRecord {
             info,
             started_at: Instant::now(),
@@ -3766,12 +3765,15 @@ impl SupervisorActor {
             exit: job.exit.clone(),
             duration_ms: Some(duration_ms),
         };
-        let seal = match self.artifacts.seal(
+        let seal_span = crate::timing::span("seal", "record");
+        let sealed = self.artifacts.seal(
             job_id,
             ending,
             job.stdout_copy.take(),
             job.stderr_copy.take(),
-        ) {
+        );
+        drop(seal_span);
+        let seal = match sealed {
             Ok(seal) => seal,
             Err(error) => {
                 for waiter in job.waiters.drain(..) {
@@ -3783,9 +3785,10 @@ impl SupervisorActor {
                 return;
             }
         };
-        let commitment = self
-            .commitments
-            .record(CommitmentDraft::Terminal {
+        let commitment = crate::timing::spanned(
+            "seal",
+            "commitment",
+            self.commitments.record(CommitmentDraft::Terminal {
                 repo_id: self.authority.repo_id.clone(),
                 workspace_incarnation: self.authority.workspace_incarnation.clone(),
                 job_id,
@@ -3797,8 +3800,9 @@ impl SupervisorActor {
                 stderr_sha256: seal.stderr.sha256,
                 batch_sha256: seal.terminal_batch_sha256,
                 output_limit: seal.output_limit.clone(),
-            })
-            .await;
+            }),
+        )
+        .await;
         if let Err(error) = commitment {
             for waiter in job.waiters.drain(..) {
                 let _ = waiter.send(Err(error.clone()));

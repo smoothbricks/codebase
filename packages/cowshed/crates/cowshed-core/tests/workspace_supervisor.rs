@@ -855,6 +855,52 @@ async fn exact_authority_and_session_identity_are_fenced() {
     assert!(h.spawned.try_recv().is_err());
 }
 
+/// The regression guard for per-exec profile rendering: every job admitted under one authority
+/// is handed the one sandbox rendering taken with that authority — never a fresh one — and a
+/// grant advance renders exactly one new one, which the next jobs share. A read-only job narrows
+/// that rendering's ceiling without rendering anything.
+#[tokio::test]
+async fn jobs_under_one_authority_share_the_policy_rendered_when_it_was_taken() {
+    let mut h = harness(1, 1024, false, false);
+    let mut read_only = request(StdinSource::Empty);
+    read_only.mode = RunSandboxMode::ReadOnly;
+    let mut policies = Vec::new();
+    for submitted in [
+        request(StdinSource::Empty),
+        read_only,
+        request(StdinSource::Empty),
+    ] {
+        h.handle.exec(None, submitted).await.unwrap();
+        policies.push(h.spawned.recv().await.unwrap().request);
+    }
+    for later in &policies[1..] {
+        assert!(policies[0].policy.is_same_rendering(&later.policy));
+    }
+    let (read_write, _) = policies[0].policy.child(RunSandboxMode::ReadWrite);
+    let (narrowed, _) = policies[1].policy.child(policies[1].mode);
+    assert_eq!(
+        narrowed.mode,
+        cowshed_core::sandbox::RunSandboxMode::ReadOnly
+    );
+    assert_ne!(read_write.mode, narrowed.mode);
+
+    let advanced = h
+        .handle
+        .advance_authority(8, 12, config().sandbox)
+        .await
+        .unwrap();
+    let mut after = Vec::new();
+    for _ in 0..2 {
+        advanced
+            .exec(None, request(StdinSource::Empty))
+            .await
+            .unwrap();
+        after.push(h.spawned.recv().await.unwrap().request.policy);
+    }
+    assert!(!after[0].is_same_rendering(&policies[0].policy));
+    assert!(after[0].is_same_rendering(&after[1]));
+}
+
 #[tokio::test]
 async fn disconnect_does_not_cancel_background_process() {
     let mut h = harness(1, 1024, false, false);

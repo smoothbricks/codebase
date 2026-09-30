@@ -86,10 +86,20 @@ pub fn plan_exec(
     request: SandboxExecRequest,
     sandbox: &SandboxConfig,
 ) -> Result<SpawnPlan, ExecError> {
-    validate_argv(&request.argv)?;
-    let cwd = contained_cwd(&sandbox.workspace_mount, &request.cwd)?;
     let profile =
         seatbelt_profile(sandbox, SandboxProfileRole::ExecutedChild).map_err(map_sandbox_error)?;
+    plan_exec_under(request, sandbox, &profile)
+}
+
+/// [`plan_exec`] under an executed-child `profile` already rendered from `sandbox`: a workspace
+/// supervisor renders it once for its authority rather than once per job.
+pub fn plan_exec_under(
+    request: SandboxExecRequest,
+    sandbox: &SandboxConfig,
+    profile: &str,
+) -> Result<SpawnPlan, ExecError> {
+    validate_argv(&request.argv)?;
+    let cwd = contained_cwd(&sandbox.workspace_mount, &request.cwd)?;
 
     let mut args = Vec::with_capacity(request.argv.len() + 3);
     args.push(OsString::from("-p"));

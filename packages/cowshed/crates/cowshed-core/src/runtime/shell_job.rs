@@ -95,7 +95,8 @@ pub(super) struct PooledSpawn<'a> {
     pub job_id: JobId,
     pub command: HostCommand,
     pub cwd: PathBuf,
-    pub profile: String,
+    /// The executed-child profile the supervisor rendered once for its authority.
+    pub profile: &'a str,
     pub read_only: bool,
     pub workspace_mount: PathBuf,
     /// The `.envrc` a host activates, or `None` for a workspace with no shell configuration.
@@ -121,7 +122,7 @@ impl WorkspaceShells {
     ) -> Result<Box<dyn RunningProcess>> {
         let base = spawn.environment.base();
         let key = pool_key(
-            &spawn.profile,
+            spawn.profile,
             &base,
             spawn.envrc_directory.as_deref(),
             spawn.grant_revision,
@@ -135,7 +136,7 @@ impl WorkspaceShells {
                     Arc::new(HostActivator {
                         program: self.program.clone(),
                         workspace_mount: spawn.workspace_mount.clone(),
-                        profile: spawn.profile.clone(),
+                        profile: spawn.profile.to_owned(),
                         environment: base,
                         envrc_directory: spawn.envrc_directory.clone(),
                     }),
