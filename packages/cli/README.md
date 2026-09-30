@@ -393,13 +393,14 @@ nothing when nothing changed:
   (`../tooling/workspace.gitconfig` in `.git/config`), so a copied checkout reads its own copy. An absolute include
   would name the checkout that wrote it, and git refuses to run when an include exists but cannot be read — the original
   checkout, from inside a sandboxed clone. Shell entry rewrites every such include without reading through git first.
-- Starting the shell and Nx contacts no network when the checkout is installed. The managed `.envrc` records the public
-  signing key of devenv's `devenv` binary cache in devenv's home (`cachix_trusted_keys.json`) when that file is absent,
-  so devenv never asks the Cachix API for it; a sandbox's private home starts without one, and its TLS client cannot
-  reach the API through the workspace gateway. The shell exports `NX_USE_LOCAL=true`, so an Nx daemon starting (and
+- Starting the shell contacts no network when the checkout is installed. The managed `.envrc` records the public signing
+  key of devenv's `devenv` binary cache in devenv's home (`cachix_trusted_keys.json`) when that file is absent, so
+  devenv never asks the Cachix API for it; a sandbox's private home starts without one, and its TLS client cannot reach
+  the API through the workspace gateway. The shell exports `NX_USE_LOCAL=true`, so an Nx daemon starting (and
   `nx configure-ai-agents`, `nx init`) answers from the installed `nx` instead of installing `nx@latest` from the
   registry; `nx migrate` then also runs with the installed CLI, and `NX_USE_LOCAL=false` restores the newest one for
-  that command.
+  that command. A daemon still asks GitHub for `nrwl/nx-ai-agents-config` when an agent has both rules and Nx's MCP
+  configured, to tell whether that configuration is outdated; a cowshed sandbox runs Nx without a daemon.
 
 ## Formatting And Git Hooks
 

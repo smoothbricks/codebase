@@ -46,10 +46,12 @@ in {
       # into a temporary directory to ask the newest release whether to prompt
       # for Nx Console and whether AI agent configuration is outdated, and
       # `nx configure-ai-agents` and `nx init` do the same. NX_USE_LOCAL answers
-      # from the installed nx, so starting Nx contacts no registry: a gate runs
-      # on what the checkout holds. It also makes `nx migrate` run with the
-      # installed CLI instead of the newest one; `NX_USE_LOCAL=false nx migrate`
-      # restores that for the one command.
+      # from the installed nx, so starting Nx installs nothing from the registry.
+      # (A daemon still runs `git ls-remote` against GitHub's
+      # nrwl/nx-ai-agents-config when an agent has both rules and Nx's MCP
+      # configured; a cowshed sandbox runs Nx without a daemon.) It also makes
+      # `nx migrate` run with the installed CLI instead of the newest one;
+      # `NX_USE_LOCAL=false nx migrate` restores that for the one command.
       NX_USE_LOCAL = "true";
       TTSC_TYPESCRIPT_GO_DIR = "${typescriptGo}";
     }
