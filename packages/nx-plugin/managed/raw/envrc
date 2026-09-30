@@ -11,6 +11,21 @@ esac
 
 watch_file tooling/direnv/envrc.sh
 
+# devenv asks the Cachix API for the signing key of each binary cache it pulls
+# from (`cachix.pull`, `devenv` by default) unless cachix_trusted_keys.json in
+# its home already records it. A cowshed sandbox gives every workspace a private
+# data home and no route to that API (devenv's TLS client rejects the gateway's
+# certificate), so each activation there asked again and was refused. The key is
+# public and fixed, so it is recorded before devenv starts; an existing file is
+# devenv's and stays as it is.
+devenv_keys="${DEVENV_HOME:-${XDG_DATA_HOME:-$HOME/.local/share}/devenv}/cachix_trusted_keys.json"
+if [ ! -e "$devenv_keys" ]; then
+  mkdir -p "$(dirname "$devenv_keys")"
+  printf '{\n  "devenv": "devenv.cachix.org-1:w1cLUi8dv3hnoSPGAuibQv+f9TZLr6cv/Hm9XgU50cw="\n}\n' >"$devenv_keys.$$"
+  mv -f "$devenv_keys.$$" "$devenv_keys"
+fi
+unset devenv_keys
+
 # Load local extensions and overrides from the project root (the gitignored
 # .envrc-local); capture it before we cd into tooling/direnv, since envrc.sh
 # leaves us there and a bare relative path would resolve under tooling/direnv.

@@ -42,6 +42,15 @@ in {
       # Nx otherwise defaults to three workers. Scale to the cores available in each
       # developer shell or CI runner; explicit --parallel flags still take precedence.
       NX_PARALLEL = "100%";
+      # Every Nx daemon, when it starts, installs nx@latest from the registry
+      # into a temporary directory to ask the newest release whether to prompt
+      # for Nx Console and whether AI agent configuration is outdated, and
+      # `nx configure-ai-agents` and `nx init` do the same. NX_USE_LOCAL answers
+      # from the installed nx, so starting Nx contacts no registry: a gate runs
+      # on what the checkout holds. It also makes `nx migrate` run with the
+      # installed CLI instead of the newest one; `NX_USE_LOCAL=false nx migrate`
+      # restores that for the one command.
+      NX_USE_LOCAL = "true";
       TTSC_TYPESCRIPT_GO_DIR = "${typescriptGo}";
     }
     # Playwright's downloaded Ubuntu browser has no runtime closure on NixOS
