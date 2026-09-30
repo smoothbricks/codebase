@@ -280,6 +280,14 @@ A supervisor that could not start leaves its reason in `~/Library/Logs/cowshed/d
 cowshed builds means the daemon and the `cowshed` you ran are different binaries: run `cowshed gateway start` from the
 one you mean to use.
 
+## `cowshed exec` says a workspace supervisor is another cowshed build
+
+After an install, a workspace's supervisor may still be the previous build's: the daemon asks it to drain, and it keeps
+serving until its running jobs end. Until then a command of the new build cannot use it. `cowshed detach <ws>` (and
+`rm`) stops it: the supervisor is signalled, the jobs it left running are ended, and its socket is removed. The next
+`cowshed exec` starts a supervisor of the new build. Detaching ends that supervisor's jobs, so let a job you still need
+finish first.
+
 ## A cargo build inside a workspace does not use sccache
 
 A workspace's cargo is wrapped with the sccache `cowshed setup --sccache` pinned, named by its store path. A host that

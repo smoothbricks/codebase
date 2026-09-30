@@ -5172,10 +5172,15 @@ impl NativeProjectRuntimeHost {
                 );
                 match super::supervisor_socket::hello(&socket).await {
                     Ok(hello) => Some(super::supervisor_socket::connect(socket, hello.authority)),
-                    // Another build's supervisor: it cannot be retired through this protocol,
-                    // and the substrate must not change under it.
+                    // Another build's supervisor cannot be retired through this build's
+                    // protocol, and the substrate must not change under it: it is stopped by
+                    // signal, and what its retirement would have ended is ended for it.
                     Err(error) if error.code == crate::error::ErrorCode::Conflict => {
-                        return Err(error);
+                        let pid = super::supervisor_manager::stop_other_build(&socket).await?;
+                        eprintln!(
+                            "cowshed: stopped workspace {name}'s supervisor (pid {pid}) of another cowshed build"
+                        );
+                        None
                     }
                     Err(_) => None,
                 }

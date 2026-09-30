@@ -481,15 +481,30 @@ async fn end_lost_jobs(socket: PathBuf, writer: super::job_groups::Writer) {
 }
 
 /// Block until `pid`, which is not this process's child, exits.
-#[cfg(target_os = "macos")]
 fn wait_for_exit(pid: u32) -> io::Result<()> {
+    exits_within(pid, None).map(|_| ())
+}
+
+/// Block until `pid`, which is not this process's child, exits, or `within` passes; whether it
+/// exited. A process already gone has exited.
+#[cfg(target_os = "macos")]
+fn exits_within(pid: u32, within: Option<Duration>) -> io::Result<bool> {
     let ident = usize::try_from(pid).map_err(io::Error::other)?;
+    let timeout = within
+        .map(|within| {
+            Ok::<_, io::Error>(libc::timespec {
+                tv_sec: libc::time_t::try_from(within.as_secs()).map_err(io::Error::other)?,
+                tv_nsec: libc::c_long::from(within.subsec_nanos()),
+            })
+        })
+        .transpose()?;
     // SAFETY: kqueue returns a new descriptor this function owns and closes.
     let queue = unsafe { libc::kqueue() };
     if queue < 0 {
         return Err(io::Error::last_os_error());
     }
-    // SAFETY: the kevent structs are plain data; `queue` is live until the close below.
+    // SAFETY: the kevent structs and the timeout are plain data that outlive the call; `queue`
+    // is live until the close below.
     let result = unsafe {
         let change = libc::kevent {
             ident,
@@ -500,32 +515,48 @@ fn wait_for_exit(pid: u32) -> io::Result<()> {
             udata: std::ptr::null_mut(),
         };
         let mut event = std::mem::zeroed::<libc::kevent>();
-        let registered = libc::kevent(queue, &change, 1, &mut event, 1, std::ptr::null());
-        let outcome = if registered < 0 {
-            Err(io::Error::last_os_error())
-        } else {
-            Ok(())
+        let returned = libc::kevent(
+            queue,
+            &change,
+            1,
+            &mut event,
+            1,
+            timeout
+                .as_ref()
+                .map_or(std::ptr::null(), std::ptr::from_ref),
+        );
+        let outcome = match returned {
+            ..0 => Err(io::Error::last_os_error()),
+            0 => Ok(false),
+            // A registration that failed comes back as an event carrying the error.
+            _ if event.flags & libc::EV_ERROR != 0 => Err(i32::try_from(event.data)
+                .map_or_else(io::Error::other, io::Error::from_raw_os_error)),
+            _ => Ok(true),
         };
         libc::close(queue);
         outcome
     };
     // ESRCH: it already exited.
     match result {
-        Err(error) if error.raw_os_error() == Some(libc::ESRCH) => Ok(()),
+        Err(error) if error.raw_os_error() == Some(libc::ESRCH) => Ok(true),
         other => other,
     }
 }
 
-/// Block until `pid`, which is not this process's child, exits.
+/// Block until `pid`, which is not this process's child, exits, or `within` passes; whether it
+/// exited. A process already gone has exited.
 #[cfg(target_os = "linux")]
-fn wait_for_exit(pid: u32) -> io::Result<()> {
+fn exits_within(pid: u32, within: Option<Duration>) -> io::Result<bool> {
     let pid = libc::pid_t::try_from(pid).map_err(io::Error::other)?;
+    let timeout = within.map_or(-1, |within| {
+        i32::try_from(within.as_millis()).unwrap_or(i32::MAX)
+    });
     // SAFETY: pidfd_open returns a new descriptor this function owns and closes.
     let descriptor = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
     if descriptor < 0 {
         let error = io::Error::last_os_error();
         return if error.raw_os_error() == Some(libc::ESRCH) {
-            Ok(())
+            Ok(true)
         } else {
             Err(error)
         };
@@ -537,13 +568,107 @@ fn wait_for_exit(pid: u32) -> io::Result<()> {
         revents: 0,
     };
     // SAFETY: `poll` describes one live descriptor this function owns.
-    let waited = unsafe { libc::poll(&mut poll, 1, -1) };
+    let waited = unsafe { libc::poll(&mut poll, 1, timeout) };
     // SAFETY: closing the descriptor opened above.
     unsafe { libc::close(descriptor) };
     if waited < 0 {
         return Err(io::Error::last_os_error());
     }
-    Ok(())
+    Ok(waited > 0)
+}
+
+/// How long a supervisor of another build gets after each signal a lifecycle verb sends it.
+const OTHER_BUILD_GRACE: Duration = Duration::from_secs(5);
+
+/// TERM `pid`, then KILL it once `grace` passes without it exiting; blocks until it is gone.
+fn terminate(pid: u32, grace: Duration) -> io::Result<()> {
+    let target = libc::pid_t::try_from(pid).map_err(io::Error::other)?;
+    for signal in [libc::SIGTERM, libc::SIGKILL] {
+        // SAFETY: kill with a positive pid signals exactly that process and touches no memory.
+        if unsafe { libc::kill(target, signal) } != 0 {
+            let error = io::Error::last_os_error();
+            return if error.raw_os_error() == Some(libc::ESRCH) {
+                Ok(())
+            } else {
+                Err(error)
+            };
+        }
+        if exits_within(pid, Some(grace))? {
+            return Ok(());
+        }
+    }
+    Err(io::Error::other(format!(
+        "it is still running {}s after KILL",
+        grace.as_secs()
+    )))
+}
+
+/// Stop the supervisor of another cowshed build that serves `socket`, for a lifecycle verb about
+/// to change its workspace's substrate (`detach`, `rm`, `restore`, `resize`, `mv`); the pid it
+/// ran as.
+///
+/// This build speaks no request of that supervisor's protocol but `drain`, the one whose shape
+/// never changes, and `drain` alone only waits for its jobs. So `drain` names the process serving
+/// the socket and stops it admitting work, and the process is then signalled: TERM, and KILL
+/// once the grace has passed. What its own retirement would have done is done for it once it is
+/// gone: the jobs it left running are ended from the group ledger it kept beside the socket, the
+/// ledger removed, and the socket unlinked unless something serves it again. The jobs' records
+/// stay running until the workspace's next supervisor seals them, as after any lost supervisor.
+pub async fn stop_other_build(socket: &Path) -> Result<u32> {
+    let pid = supervisor_socket::drain(socket).await?;
+    if pid <= 1 || pid == std::process::id() {
+        return Err(CowshedError::integrity(
+            format!(
+                "the workspace supervisor at {} names pid {pid}, which no supervisor can be",
+                socket.display()
+            ),
+            "stop the supervisor process yourself, then retry",
+        ));
+    }
+    tokio::task::spawn_blocking(move || terminate(pid, OTHER_BUILD_GRACE))
+        .await
+        .map_err(|error| CowshedError::internal(format!("stopping pid {pid}: {error}")))?
+        .map_err(|error| {
+            CowshedError::environment_missing(
+                format!(
+                    "cannot stop the workspace supervisor at {} (pid {pid}) of another cowshed build: {error}",
+                    socket.display()
+                ),
+                format!("stop pid {pid} yourself, then retry"),
+            )
+        })?;
+    let ledger = super::job_groups::ledger_path(socket);
+    let taken = ledger.clone();
+    tokio::task::spawn_blocking(move || super::job_groups::take_lost(&taken, LOST_JOB_GRACE))
+        .await
+        .map_err(|error| CowshedError::internal(format!("ending lost jobs: {error}")))?
+        .map_err(|error| {
+            CowshedError::environment_missing(
+                format!(
+                    "cannot end the jobs pid {pid} left running, recorded in {}: {error}",
+                    ledger.display()
+                ),
+                "end the jobs' process groups yourself, remove that file, then retry",
+            )
+        })?;
+    match UnixStream::connect(socket).await {
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(_) => match std::fs::remove_file(socket) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(CowshedError::environment_missing(
+                    format!(
+                        "cannot remove the socket {} pid {pid} served: {error}",
+                        socket.display()
+                    ),
+                    "remove it yourself, then retry",
+                ));
+            }
+        },
+    }
+    Ok(pid)
 }
 
 /// Serve ensures on `listener` for as long as the daemon runs.
@@ -773,6 +898,91 @@ mod tests {
             ["\"hello\""],
             "a supervisor of this build keeps serving"
         );
+        std::fs::remove_dir_all(store).expect("cleanup");
+    }
+
+    /// Names the socket [`serves_as_a_supervisor_of_another_build`] serves.
+    const OTHER_BUILD_SOCKET: &str = "COWSHED_TEST_OTHER_BUILD_SOCKET";
+
+    /// Not a test: the separate process a supervisor of another build runs as, for
+    /// [`a_verb_stops_a_supervisor_of_another_build_and_the_jobs_it_left`]. It answers every
+    /// request as `drain` does, with its own pid, and serves until it is killed.
+    #[test]
+    #[ignore = "helper process of a_verb_stops_a_supervisor_of_another_build_and_the_jobs_it_left"]
+    fn serves_as_a_supervisor_of_another_build() {
+        let Some(socket) = std::env::var_os(OTHER_BUILD_SOCKET) else {
+            return;
+        };
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime")
+            .block_on(async move {
+                let listener = UnixListener::bind(socket).expect("bind");
+                loop {
+                    let (mut stream, _) = listener.accept().await.expect("accept");
+                    // A readiness probe connects and sends nothing.
+                    let Ok(serde_json::Value::String(_)) = read_json(&mut stream).await else {
+                        continue;
+                    };
+                    let answer =
+                        serde_json::json!({"ok": {"value": std::process::id(), "bytes": 0}});
+                    write_json(&mut stream, &answer).await.expect("answer");
+                }
+            });
+    }
+
+    /// A lifecycle verb about to change a workspace's substrate stops the supervisor of another
+    /// build that serves it, although that supervisor answers none of this build's requests but
+    /// `drain`: its process is signalled, the jobs its ledger names are ended, and the ledger and
+    /// the socket it can no longer unlink are gone.
+    #[tokio::test]
+    async fn a_verb_stops_a_supervisor_of_another_build_and_the_jobs_it_left() {
+        use std::os::unix::process::{CommandExt as _, ExitStatusExt as _};
+        // Unix socket paths are short; the per-user temporary directory is not.
+        let store = PathBuf::from("/tmp").join(format!(
+            "cowshed-stop-{}",
+            &uuid::Uuid::new_v4().simple().to_string()[..12]
+        ));
+        std::fs::create_dir_all(store.join("run")).expect("run directory");
+        let socket = store.join("run/other.sock");
+        let mut supervisor =
+            std::process::Command::new(std::env::current_exe().expect("test binary"))
+                .args([
+                    "--exact",
+                    "runtime::supervisor_manager::tests::serves_as_a_supervisor_of_another_build",
+                    "--ignored",
+                ])
+                .env(OTHER_BUILD_SOCKET, &socket)
+                .stdout(std::process::Stdio::null())
+                .spawn()
+                .expect("start the supervisor of another build");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while UnixStream::connect(&socket).await.is_err() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the helper never served"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let mut job = std::process::Command::new("/bin/sleep")
+            .arg("60")
+            .process_group(0)
+            .spawn()
+            .expect("a job leading its own group");
+        let ledger = super::super::job_groups::ledger_path(&socket);
+        super::super::job_groups::record(&ledger, &[(7, job.id())]).expect("ledger");
+
+        let stopped = stop_other_build(&socket).await.expect("stopped");
+
+        assert_eq!(stopped, supervisor.id());
+        assert_eq!(
+            supervisor.wait().expect("supervisor").signal(),
+            Some(libc::SIGTERM)
+        );
+        assert_eq!(job.wait().expect("job").signal(), Some(libc::SIGTERM));
+        assert!(!ledger.exists(), "the ledger is taken");
+        assert!(!socket.exists(), "the socket nothing serves is gone");
         std::fs::remove_dir_all(store).expect("cleanup");
     }
 }

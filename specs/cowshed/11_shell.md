@@ -470,6 +470,17 @@ retires, and the next command for its workspace gets a supervisor of the new bui
 shape never changes across builds, so any later daemon can retire any earlier supervisor. A supervisor of the daemon's
 own build keeps serving across a daemon restart and retires on its own when idle.
 
+Until a draining supervisor retires, a command of the new build that reaches it is refused by name: `exec` and every
+other verb that would run work there, because they cannot speak its protocol. A lifecycle verb that must change the
+workspace's substrate — `detach`, `rm`, `restore`, `resize`, `mv` — does not wait for it, since a drain lasts as long as
+its longest job. It stops the supervisor itself, doing what that supervisor's own retirement would have done: `drain`
+names the process serving the socket and stops its admissions, the process gets SIGTERM and, after a grace, SIGKILL, and
+once it has exited the verb ends the jobs its group ledger names (as the group ledger above prescribes for any lost
+supervisor), removes the ledger, and unlinks the socket unless something serves it again. The jobs' records stay
+`running` until the workspace's next supervisor seals them. `exec` does not do this on its own: replacing a supervisor
+ends its jobs, which an ordinary command must not do as a side effect, so its refusal names `cowshed detach` as the step
+that does.
+
 ## Teardown ordering
 
 `cowshed rm` / `cowshed detach` must stop the supervisor **before** unmounting or destroying the substrate, because live
