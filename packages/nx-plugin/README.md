@@ -129,23 +129,52 @@ both the Nx and Cargo workspaces are left to the plugin's inferred file inputs. 
 require maintaining a second list of source roots. The command refuses missing dependencies or an unavailable locked
 dependency cache instead of emitting a partial digest.
 
-Custom Cargo targets that replace inferred inputs need the in-workspace source closure too. Use
-`smoo-nx-cargo-hash --include-workspace --closure <directory> [Cargo.toml]` to hash the locked, offline resolve closure
-of the local packages under `<directory>`: those packages and every mutable local package they reach through normal,
-build or dev dependencies, inside or outside the Nx workspace. An edit to a workspace member outside that closure leaves
-the digest unchanged. Nx does not substitute `{projectRoot}` into runtime inputs, so each project that owns custom Cargo
-targets declares its own `cargoSources` and names its directory. For a repository-root Cargo workspace, `nx.json`
-declares:
+### Cargo closure input
+
+Custom Cargo targets that replace inferred inputs need the source closure of the crates they build. The plugin infers it
+as the `cargoClosure` named input of every `package.json` project with a member of a Cargo workspace under its root,
+where that Cargo workspace's root is itself a project (the root `package.json`, for a repository-root workspace). Name
+it in each custom Cargo target's `inputs`, alongside `cargoToolchain`, the target's own scripts and non-Rust inputs:
 
 ```json
 {
-  "namedInputs": {
-    "externalRustCrates": [{ "runtime": "smoo-nx-cargo-hash" }]
+  "nx": {
+    "targets": {
+      "build": {
+        "inputs": ["{projectRoot}/scripts/build.sh", "cargoToolchain", "cargoClosure"]
+      }
+    }
   }
 }
 ```
 
-and `packages/example/project.json` (or the `nx` key of its `package.json`) declares:
+Cargo decides the closure. Once per project-graph computation, `cargo metadata --locked --offline` resolves the local
+packages under the project's root and every mutable local package they reach through normal, build or dev dependencies;
+an edit to a workspace member outside that closure leaves the key alone. The members Nx's file index holds become
+filesets: each package's `.rs` files, `Cargo.toml` files and `.cargo/config[.toml]` below its directory (skipping
+`target/` and the other directories the hash command skips), target sources outside it, its governing workspace
+manifest, the `Cargo.toml` and `.cargo/config[.toml]` of every directory from the package up to the Nx root, and the
+workspace's `Cargo.lock`. Nx hashes those from the file hashes it already keeps, so hashing a task over an unchanged
+tree starts no process; the graph computation pays one `cargo metadata` instead.
+
+Members the file index cannot hold, outside the Nx workspace or under `node_modules`, are hashed by one runtime
+`smoo-nx-cargo-hash --closure <projectRoot> <Cargo.toml>` entry, present only while such members exist. It resolves the
+closure again when it runs, so a member that only an edit outside the workspace brings in is still covered.
+
+When the closure cannot be expressed that way, `cargoClosure` is the complete runtime hash,
+`smoo-nx-cargo-hash --include-workspace --closure <projectRoot> <Cargo.toml>`, and the plugin says why on stderr: Cargo
+could not resolve the workspace during graph computation (no `cargo` on PATH, a stale `Cargo.lock`, an unfetched
+dependency), or a member inside the workspace is missing from the file index (an ignored directory). The command reports
+the same Cargo failure wherever a task needs it.
+
+In-workspace members follow Nx's file semantics, which differ from the command's own walk in two places: a symlinked
+directory inside a package is not followed, and manifests and Cargo configuration above the Nx root (a
+`~/.cargo/config.toml` above a checkout in the home directory) are machine-local and not hashed, as for every other
+cargo input the plugin infers.
+
+A project the plugin does not infer (a `project.json` without a `package.json`), or one in a Cargo workspace whose root
+is not a project, names the command directly. Nx does not substitute `{projectRoot}` into runtime inputs, so each such
+project declares its own named input and names its directory:
 
 ```json
 {
@@ -160,11 +189,10 @@ and `packages/example/project.json` (or the `nx` key of its `package.json`) decl
 }
 ```
 
-Name `cargoSources` in each custom Cargo target's `inputs`, alongside its own scripts and non-Rust build inputs. Keep
-`externalRustCrates` for the plugin's external-source inference contract; unrelated TypeScript targets do not need
-`cargoSources`. Without `--closure`, `--include-workspace` hashes every mutable local package in the Cargo workspace.
-For a package-root workspace, pass its manifest last and name that workspace's `Cargo.lock`. An Nx `^production` input
-only follows existing project graph edges; it cannot replace a missing Cargo dependency closure.
+Without `--closure`, `--include-workspace` hashes every mutable local package in the Cargo workspace. For a package-root
+workspace, pass its manifest last and name that workspace's `Cargo.lock`. Keep `externalRustCrates` for the plugin's
+external-source inference contract; unrelated TypeScript targets need neither input. An Nx `^production` input only
+follows existing project graph edges; it cannot replace a missing Cargo dependency closure.
 
 Files git ignores beneath a package directory are not hashed, matching Nx's own file inputs. A generated source is its
 producer's output: the consuming target depends on the producer and hashes the source through

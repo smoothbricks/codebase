@@ -4,8 +4,8 @@ import { realpathSync, statSync } from 'node:fs';
 import { lstat, readdir, readFile, readlink, realpath } from 'node:fs/promises';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { promisify } from 'node:util';
-import typia from 'typia';
 
+/** The fields of `cargo metadata --format-version 1` this module reads. */
 interface CargoMetadata {
   packages: {
     id: string;
@@ -18,8 +18,53 @@ interface CargoMetadata {
   workspace_root: string;
 }
 
+/**
+ * Narrowed field by field, not by typia: graph inference imports this module,
+ * and a workspace that loads the plugin from its sources runs them without
+ * typia's compile-time transform.
+ */
+function parseCargoMetadata(json: string): CargoMetadata {
+  const member = (value: unknown, key: string): unknown =>
+    typeof value === 'object' && value !== null && key in value ? Reflect.get(value, key) : undefined;
+  const text = (value: unknown, field: string): string => {
+    if (typeof value !== 'string') throw new Error(`cargo metadata reported no valid ${field}`);
+    return value;
+  };
+  const list = (value: unknown, field: string): unknown[] => {
+    if (!Array.isArray(value)) throw new Error(`cargo metadata reported no valid ${field}`);
+    return value;
+  };
+  const document: unknown = JSON.parse(json);
+  const resolveGraph = member(document, 'resolve');
+  return {
+    packages: list(member(document, 'packages'), 'packages').map((pkg) => ({
+      id: text(member(pkg, 'id'), 'package id'),
+      source: member(pkg, 'source') === null ? null : text(member(pkg, 'source'), 'package source'),
+      manifest_path: text(member(pkg, 'manifest_path'), 'package manifest_path'),
+      targets: list(member(pkg, 'targets'), 'package targets').map((target) => ({
+        src_path: text(member(target, 'src_path'), 'target src_path'),
+      })),
+    })),
+    resolve:
+      resolveGraph === null
+        ? null
+        : {
+            nodes: list(member(resolveGraph, 'nodes'), 'resolve').map((node) => ({
+              id: text(member(node, 'id'), 'resolve node id'),
+              deps: list(member(node, 'deps'), 'resolve node deps').map((dependency) => ({
+                pkg: text(member(dependency, 'pkg'), 'resolve edge'),
+              })),
+            })),
+          },
+    workspace_members: list(member(document, 'workspace_members'), 'workspace_members').map((id) =>
+      text(id, 'workspace member'),
+    ),
+    workspace_root: text(member(document, 'workspace_root'), 'workspace_root'),
+  };
+}
+
 /** A mutable (path) package in Cargo's locked resolve. Every path is canonical. */
-interface LocalCargoPackage {
+export interface LocalCargoPackage {
   readonly id: string;
   readonly directory: string;
   readonly manifest: string;
@@ -28,7 +73,7 @@ interface LocalCargoPackage {
 }
 
 /** What locked, offline `cargo metadata` reports about one Cargo workspace's mutable packages. */
-interface CargoResolve {
+export interface CargoResolve {
   /** The canonical Cargo workspace root. */
   readonly root: string;
   /** The workspace's own members: `root`'s manifest governs each of them. */
@@ -48,9 +93,9 @@ export interface CargoPathInputsOptions {
   closure?: string;
 }
 
-const parseMetadata = typia.json.createAssertParse<CargoMetadata>();
 const execFileAsync = promisify(execFile);
-const ignoredDirectories = new Set([
+/** Directories the hash never descends into: build output, VCS and volume metadata, installed packages. */
+export const HASH_SKIPPED_DIRECTORIES = [
   'target',
   '.git',
   'node_modules',
@@ -61,8 +106,9 @@ const ignoredDirectories = new Set([
   '.Trashes',
   '.Spotlight-V100',
   '.DocumentRevisions-V100',
-]);
-const ancestorInputs = ['Cargo.toml', '.cargo/config', '.cargo/config.toml'];
+] as const;
+/** Files in every ancestor of a package directory that Cargo reads while building it. */
+export const CARGO_ANCESTOR_INPUTS = ['Cargo.toml', '.cargo/config', '.cargo/config.toml'] as const;
 
 /**
  * Cargo owns resolution, including workspace inheritance, target dependencies,
@@ -92,13 +138,13 @@ const ancestorInputs = ['Cargo.toml', '.cargo/config', '.cargo/config.toml'];
 const CHILD_STDIO: ['ignore', 'pipe', 'pipe'] = ['ignore', 'pipe', 'pipe'];
 
 /** Locked, offline `cargo metadata` for the workspace `manifestPath` names, run from `cwd`. */
-async function readCargoResolve(manifestPath: string, cwd: string): Promise<CargoResolve> {
+export async function readCargoResolve(manifestPath: string, cwd: string): Promise<CargoResolve> {
   const { stdout } = await execFileAsync(
     'cargo',
     ['metadata', '--format-version', '1', '--locked', '--offline', '--manifest-path', resolve(manifestPath)],
     { cwd, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 },
   );
-  const metadata = parseMetadata(stdout);
+  const metadata = parseCargoMetadata(stdout);
   const local = await Promise.all(
     metadata.packages
       .filter((pkg) => pkg.source === null)
@@ -125,7 +171,7 @@ async function readCargoResolve(manifestPath: string, cwd: string): Promise<Carg
  * the answer for its own members. Any other path package asks Cargo, which
  * resolves an explicit `package.workspace` as well as the ancestor search.
  */
-async function governingManifest(cargo: CargoResolve, pkg: LocalCargoPackage, cwd: string): Promise<string> {
+export async function governingManifest(cargo: CargoResolve, pkg: LocalCargoPackage, cwd: string): Promise<string> {
   if (cargo.members.has(pkg.id)) return realpath(join(cargo.root, 'Cargo.toml'));
   const { stdout } = await execFileAsync(
     'cargo',
@@ -175,7 +221,7 @@ export async function hashCargoPathInputs(
     // are not descendants of the source roots returned by Cargo metadata.
     for (let ancestor = dirname(directory); !ancestors.has(ancestor); ancestor = dirname(ancestor)) {
       ancestors.add(ancestor);
-      for (const name of ancestorInputs) {
+      for (const name of CARGO_ANCESTOR_INPUTS) {
         const file = join(ancestor, name);
         if (statSync(file, { throwIfNoEntry: false })?.isFile()) files.add(await realpath(file));
       }
@@ -184,6 +230,7 @@ export async function hashCargoPathInputs(
 
   const ignored = gitIgnoredBeneath([...directories]);
   for (const source of packageSources) if (!ignored(source)) files.add(source);
+  const skipped: ReadonlySet<string> = new Set(HASH_SKIPPED_DIRECTORIES);
   // Overlapping packages (a facade root plus its child crates) share one walk.
   const visited = new Set<string>();
   async function walk(directory: string): Promise<void> {
@@ -191,7 +238,7 @@ export async function hashCargoPathInputs(
     if (visited.has(canonical)) return;
     visited.add(canonical);
     for (const entry of await readdir(canonical, { withFileTypes: true })) {
-      if (ignoredDirectories.has(entry.name)) continue;
+      if (skipped.has(entry.name)) continue;
       const path = join(canonical, entry.name);
       if (ignored(path)) continue;
       if (entry.isSymbolicLink()) links.set(path, await readlink(path));
@@ -235,7 +282,7 @@ export async function hashCargoPathInputs(
  * `directory`, over every dependency kind: a target may build, test or run
  * build scripts, and any of those compiles the edge's source.
  */
-async function dependencyClosure(cargo: CargoResolve, directory: string): Promise<ReadonlySet<string>> {
+export async function dependencyClosure(cargo: CargoResolve, directory: string): Promise<ReadonlySet<string>> {
   const base = await realpath(directory);
   const pending = cargo.local
     .filter((pkg) => pkg.directory === base || pkg.directory.startsWith(`${base}${sep}`))

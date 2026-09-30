@@ -15,6 +15,13 @@ import { AggregateCreateNodesError } from 'nx/src/project-graph/error-types.js';
 import { parse as parseToml } from 'smol-toml';
 
 import { BOUNDED_TEST_KILL_AFTER_MS, BOUNDED_TEST_TIMEOUT_MS } from './bounded-test-policy.js';
+import {
+  CARGO_CLOSURE_INPUT,
+  type CargoClosureSource,
+  cargoClosureInputs,
+  indexedCargoManifests,
+  resolveCargoClosureSource,
+} from './cargo-closure-input.js';
 import { CARGO_TOOLCHAIN_NAMED_INPUT, CARGO_TOOLCHAIN_PIN_INPUTS } from './cargo-toolchain-policy.js';
 import {
   type AttributedCargoWorkspacePackage,
@@ -881,6 +888,9 @@ function createNodesHandler(hostPlatform: NapiPlatform | null): CreateNodesHandl
         }
       }),
     );
+    // A project that failed before reaching its closure never awaited Cargo;
+    // no process this call started may outlive it.
+    await Promise.all(cargoWorkspaces.map((workspace) => workspace.closureSource));
 
     if (errors.length > 0) {
       throw new AggregateCreateNodesError(errors, results);
@@ -1787,6 +1797,23 @@ async function createProjectTargets(
       ? { [CARGO_TOOLCHAIN_NAMED_INPUT]: [...CARGO_TOOLCHAIN_PIN_INPUTS] }
       : {}),
   };
+  // A custom Cargo target names this instead of a hand-kept crate list or a
+  // per-project runtime command: Cargo decides the closure once per graph
+  // computation and Nx hashes its files from its own index. Defined for a
+  // project with a workspace crate under its root — the same projects the
+  // `--closure <projectRoot>` command could describe.
+  const closureSources = cargoWorkspaces.filter((workspace) =>
+    workspace.packages.some(({ package: pkg }) => {
+      const crate = posix.join(workspace.projectRoot, pkg.dir);
+      return projectRoot === '.' || crate === projectRoot || crate.startsWith(`${projectRoot}/`);
+    }),
+  );
+  if (closureSources.length > 0) {
+    namedInputs[CARGO_CLOSURE_INPUT] = await cargoClosureInputs(
+      projectRoot,
+      await Promise.all(closureSources.map((workspace) => workspace.closureSource)),
+    );
+  }
   return {
     projects: {
       [projectRoot]: {
@@ -2265,6 +2292,12 @@ interface CargoWorkspace {
   projectRoot: string;
   /** One derivation memo for the whole graph computation (see cargoPackageTestInputs). */
   inputsCache: CargoInputsCache;
+  /**
+   * Cargo's own resolve, started once per graph computation and awaited only
+   * where a project's `cargoClosure` is built, so the `cargo metadata` process
+   * overlaps the rest of inference.
+   */
+  closureSource: Promise<CargoClosureSource>;
 }
 
 type CargoTargetDependency = NonNullable<TargetConfiguration['dependsOn']>[number];
@@ -2294,7 +2327,7 @@ async function resolveCargoWorkspaces(
       // createProjectTargets records the path-specific parse failure below.
     }
   }
-  const workspaces: CargoWorkspace[] = [];
+  const found: Omit<CargoWorkspace, 'closureSource'>[] = [];
   for (const rootProject of projects) {
     const absoluteRoot = join(workspaceRoot, rootProject.root);
     const manifest = join(absoluteRoot, 'Cargo.toml');
@@ -2333,14 +2366,25 @@ async function resolveCargoWorkspaces(
       }
       packages.push({ package: pkg, pieces });
     }
-    workspaces.push({
+    found.push({
       packages,
       rootProjectName: rootProject.name,
       projectRoot: rootProject.root,
       inputsCache: createCargoInputsCache(),
     });
   }
-  return workspaces;
+  if (found.length === 0) return [];
+  // Started only once every workspace listed cleanly, so a listing that throws
+  // leaves no Cargo process behind.
+  const indexedManifests = indexedCargoManifests(workspaceRoot);
+  return found.map((workspace) => ({
+    ...workspace,
+    closureSource: resolveCargoClosureSource(
+      posix.join(workspace.projectRoot, 'Cargo.toml'),
+      workspaceRoot,
+      indexedManifests,
+    ),
+  }));
 }
 
 /**
