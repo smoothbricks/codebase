@@ -31,14 +31,15 @@ use super::supervisor::{
 };
 use crate::api::dto::{
     CommandArg, ExecCommand, ExecRequest, JobId, OutputPublication, RunSandboxMode, ScriptCommand,
-    Sha256Digest, StdinSource, TraceContext, WorkspacePath,
+    Sha256Digest, StdinSource, TraceContext, WarmAdmission, WarmRange, WorkspacePath,
 };
 use crate::error::{CowshedError, Result};
 use crate::storage::job_artifact::StreamKind;
 
 /// The protocol this build speaks. A supervisor started by another cowshed build may speak
-/// another; `hello` refuses it by name rather than letting a call fail mid-way.
-pub const PROTOCOL_VERSION: u32 = 1;
+/// another; `hello` refuses it by name rather than letting a call fail mid-way. Version 2 added
+/// the `warm` call and `JobInfo.warm`, neither of which a version-1 peer can decode.
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// How long a commitments read waits for one to arrive before answering empty.
 const COMMITMENT_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
@@ -162,6 +163,11 @@ enum Call {
         session: Option<SessionWire>,
         background: bool,
         request: Box<ExecWire>,
+    },
+    /// Main's warm step for one land (`WorkspaceSupervisorHandle::warm`).
+    Warm {
+        argv: Vec<CommandArg>,
+        range: WarmRange,
     },
     #[serde(rename_all = "camelCase")]
     StdinWrite {
@@ -740,6 +746,10 @@ async fn answer(
             }
             (unit()?, Bytes::new())
         }
+        Call::Warm { argv, range } => (
+            to_value(&supervisor.warm(argv, range).await?)?,
+            Bytes::new(),
+        ),
         Call::Info { job_id } => (to_value(&supervisor.info(job_id).await?)?, Bytes::new()),
         Call::List => (to_value(&supervisor.list().await?)?, Bytes::new()),
         Call::Kill { job_id } => {
@@ -1050,6 +1060,17 @@ async fn forward(path: Arc<PathBuf>, command: Command) {
             background,
             reply,
         } => forward_exec(path, authority, session, request, background, reply).await,
+        Command::Warm {
+            authority,
+            argv,
+            range,
+            reply,
+        } => {
+            let _ = reply.send(
+                call::<WarmAdmission>(path, &authority, Call::Warm { argv, range }, Bytes::new())
+                    .await,
+            );
+        }
         Command::StdinWrite {
             authority,
             job_id,

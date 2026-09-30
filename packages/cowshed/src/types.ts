@@ -251,7 +251,23 @@ export interface LandReport {
   readonly previousTargetHead?: string;
   readonly targetWasCheckedOut: boolean;
   readonly retired: boolean;
+  /** Main's warm step for this land; absent when the project declares no `[land] warm`. */
+  readonly warm?: WarmAdmission;
 }
+
+/**
+ * The landed commits one run of main's warm step builds: `head` is the head the newest covered
+ * land landed, `base` the target's head before the oldest, absent when that target was unborn.
+ */
+export interface WarmRange {
+  readonly base?: string;
+  readonly head: string;
+}
+
+/** What `land` asked of main's warm step, which it never waits for. */
+export type WarmAdmission =
+  | { readonly state: 'started'; readonly jobId: number; readonly range: WarmRange }
+  | { readonly state: 'queued'; readonly behind: number; readonly range: WarmRange };
 
 export interface GcCandidate {
   readonly identity: string;
@@ -392,6 +408,8 @@ export interface JobInfoFields {
   readonly stdin: StdinInfo;
   /** Present only for a failed job that failed before its command ran. */
   readonly failure?: JobFailure;
+  /** Present only for main's warm step: the landed commits the job builds. */
+  readonly warm?: WarmRange;
 }
 
 /** Why a job failed when no command's own status explains it. */

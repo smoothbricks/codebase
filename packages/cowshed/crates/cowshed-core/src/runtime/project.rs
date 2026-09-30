@@ -8024,6 +8024,21 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
             ["merge", "--ff-only", source_head.as_str()],
         )
         .await?;
+        // Main has moved, so build it at what landed: every later clone of main copies its build
+        // outputs and starts warm. Main's supervisor runs the declared step in the background and
+        // answers at once; a land that moved nothing has nothing to build.
+        let warm = if previous.as_ref() == Some(&source_head) {
+            Ok(None)
+        } else {
+            let main = main_name();
+            let main_root = self.descriptor.git_root.clone();
+            let range = crate::api::dto::WarmRange {
+                base: previous.clone(),
+                head: source_head.clone(),
+            };
+            super::land_warm::warm_after_land(&main_root, range, || self.ensure_supervisor(&main))
+                .await
+        };
         if retire {
             // Main has already moved, so a refused retire must not read as a refused land: the
             // retry its hint names would land nothing.
@@ -8040,12 +8055,24 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                     )
                 })?;
         }
+        // The same reading as a refused retire: main moved, only its build did not start.
+        let warm = warm.map_err(|refused| {
+            CowshedError::new(
+                refused.code,
+                format!(
+                    "landed {source_head} on {target_branch}, but main's warm step did not start: {}",
+                    refused.message
+                ),
+                refused.hint,
+            )
+        })?;
         Ok(LandReport {
             landed_head: source_head,
             target_branch,
             previous_target_head: previous,
             target_was_checked_out: true,
             retired: retire,
+            warm,
         })
     }
 

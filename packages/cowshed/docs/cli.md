@@ -806,14 +806,38 @@ paths.
 
 ### `cowshed land <name> [--check <cmd>]`
 
-The full close-out in one primitive: validate (`--check`, or `.cowshed.toml` `[land] check`) inside the sandbox,
-fast-forward main's checkout to the workspace's branch, retire the workspace. A dirty tree, read the way `rm` reads it,
-is refused before the check runs: the check sees the working tree but only the commit lands. Land does not rebase; when
-main has moved past the workspace's base the fast-forward is refused, and `cowshed rebase <name>` is the next step. Any
-failing step before the fast-forward exits 4 with the workspace intact. A retire refused after the fast-forward keeps
-the workspace and exits with that refusal, whose message starts with what landed, so the retry is `cowshed rm`, not
-another land. The target (`--target`, default `main`) must be the branch main's checkout has checked out. `--no-retire`
-keeps the workspace; `--push-only` stops after validation for review-gated flows.
+The full close-out in one primitive: validate (`--check`) inside the sandbox, fast-forward main's checkout to the
+workspace's branch, start main's warm step, retire the workspace. A dirty tree, read the way `rm` reads it, is refused
+before the check runs: the check sees the working tree but only the commit lands. Land does not rebase; when main has
+moved past the workspace's base the fast-forward is refused, and `cowshed rebase <name>` is the next step. Any failing
+step before the fast-forward exits 4 with the workspace intact. A retire refused after the fast-forward keeps the
+workspace and exits with that refusal, whose message starts with what landed, so the retry is `cowshed rm`, not another
+land. The target (`--target`, default `main`) must be the branch main's checkout has checked out. `--no-retire` keeps
+the workspace; `--push-only` stops after validation for review-gated flows.
+
+**Main's warm step.** A clone starts warm because main's build outputs copy with it, so after the fast-forward land
+builds main at what landed, with the argv main's `.cowshed.toml` declares:
+
+```toml
+[land]
+warm = ["tooling/warm-main"]   # one argv, never a shell string
+```
+
+It runs as a background job of main's workspace supervisor, from main's root, with `COWSHED_LAND_BASE` (main's head
+before the land) and `COWSHED_LAND_HEAD` (the landed head) in its environment. Land does not wait for it: it prints the
+job on stderr and returns. At most one warm job runs per project; lands that arrive while one runs coalesce into the one
+run waiting behind it, from the oldest waiting base to the newest head, which starts when the running job ends.
+
+```
+$ cowshed land raven
+main	<landed head>	true
+cowshed: main's warm step builds <main's previous head>..<landed head> as job 12
+```
+
+`--json` carries it as `warm`: `{ "state": "started", "jobId", "range": { "base", "head" } }`, or `"queued"` with
+`behind` naming the running warm job. The job's record (`JobInfo.warm`, and the protected records' `warm_base`,
+`warm_head`, `exit_code` and `duration_ms` columns) says which landed commits it built, how it exited and how long it
+took. No `[land] warm` starts nothing.
 
 ## Time travel
 

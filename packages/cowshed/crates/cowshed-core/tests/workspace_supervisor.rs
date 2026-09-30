@@ -8,15 +8,16 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use cowshed_core::api::{
     CONTROLLER_COMMITMENT_VERSION, CommandArg, ControllerCommitment, ExecCommand, ExecRequest,
-    ExitStatus, JobId, JobState, MAX_COMMAND_ARG_BYTES, OutputLimitInfo, OutputPublication,
+    ExitStatus, GitOid, JobId, JobState, MAX_COMMAND_ARG_BYTES, OutputLimitInfo, OutputPublication,
     OutputStorage, OutputSummary, ProtectedOutput, RunSandboxMode, Sha256Digest, StdinSource,
-    StreamInfo, WorkspacePath,
+    StreamInfo, WarmAdmission, WarmRange, WorkspacePath,
 };
 use cowshed_core::error::{CowshedError, ErrorCode, Result};
 use cowshed_core::metadata::{PortBlock, WorkspaceIncarnation, WorkspaceName};
 use cowshed_core::repository::{OwnedRepoIds, RepoId};
+use cowshed_core::runtime::land_warm::warm_after_land;
 use cowshed_core::sandbox::{SandboxConfig, SandboxGrants};
-use cowshed_core::storage::job_artifact::{ArtifactConfig, StreamKind};
+use cowshed_core::storage::job_artifact::{ArtifactConfig, JobEnding, StreamKind};
 use tokio::sync::mpsc;
 
 use cowshed_core::runtime::supervisor::{
@@ -159,6 +160,7 @@ impl ArtifactSink for FakeArtifactSink {
         expected_job_id: JobId,
         _grant_revision: u64,
         command: &cowshed_core::api::ExecCommand,
+        _warm: Option<&WarmRange>,
     ) -> Result<()> {
         assert!(command.validate().is_ok());
         assert_eq!(expected_job_id, self.next);
@@ -202,14 +204,14 @@ impl ArtifactSink for FakeArtifactSink {
     fn seal(
         &mut self,
         job_id: JobId,
-        state: JobState,
+        ending: JobEnding,
         _stdout_copy: Option<OutputPublication>,
         _stderr_copy: Option<OutputPublication>,
     ) -> Result<ArtifactSeal> {
         self.jobs
             .remove(&job_id)
             .expect("live fake artifact job")
-            .seal(state)
+            .seal(ending.state)
     }
 
     fn checkpoint(&mut self) -> Result<CheckpointBarrier> {
@@ -2101,4 +2103,280 @@ async fn a_controller_reads_a_served_supervisor_s_commitments_by_cursor_until_it
         .map(|entry| entry.cursor)
         .collect();
     assert_eq!(cursors, vec![3, 4], "acknowledged commitments are gone");
+}
+
+fn oid(digit: char) -> GitOid {
+    GitOid::new(digit.to_string().repeat(40)).unwrap()
+}
+
+fn range(base: char, head: char) -> WarmRange {
+    WarmRange {
+        base: Some(oid(base)),
+        head: oid(head),
+    }
+}
+
+/// The land heads a spawned warm job was handed, as `(COWSHED_LAND_BASE, COWSHED_LAND_HEAD)`.
+fn land_heads(spawned: &Spawned) -> (Option<&str>, Option<&str>) {
+    (
+        spawned
+            .request
+            .env
+            .get("COWSHED_LAND_BASE")
+            .map(String::as_str),
+        spawned
+            .request
+            .env
+            .get("COWSHED_LAND_HEAD")
+            .map(String::as_str),
+    )
+}
+
+#[tokio::test]
+async fn a_land_starts_main_s_declared_warm_step_in_the_background_at_the_landed_heads() {
+    let (supervisor_config, root) = isolated_config("land-warm");
+    let main = supervisor_config.workspace_root.clone();
+    std::fs::write(
+        main.join(".cowshed.toml"),
+        "[land]\nwarm = [\"tooling/warm-main\", \"--affected\"]\n",
+    )
+    .unwrap();
+    let mut h = harness_with_config(supervisor_config, 1, 1024, false, false);
+    let landed = range('a', 'b');
+    let handle = h.handle.clone();
+    let admission = warm_after_land(&main, landed.clone(), || async move { Ok(handle) })
+        .await
+        .unwrap();
+    let job_id = JobId::new(1).unwrap();
+    assert_eq!(
+        admission,
+        Some(WarmAdmission::Started {
+            job_id,
+            range: landed.clone(),
+        })
+    );
+
+    let spawned = h.spawned.recv().await.unwrap();
+    let SpawnCommand::Argv(argv) = &spawned.request.command else {
+        panic!("the declared warm step is an argv");
+    };
+    assert_eq!(
+        argv,
+        &[
+            OsString::from("tooling/warm-main"),
+            OsString::from("--affected")
+        ]
+    );
+    let (base, head) = (oid('a'), oid('b'));
+    assert_eq!(
+        land_heads(&spawned),
+        (Some(base.as_str()), Some(head.as_str()))
+    );
+    // Land has its answer while the build still runs: it never waits for the warm step.
+    let info = h.handle.info(job_id).await.unwrap();
+    assert_eq!(info.state, JobState::Running);
+    assert_eq!(info.warm, Some(landed));
+
+    complete(&spawned, b"", b"", ExitStatus::Exited { code: 0 }).await;
+    h.handle.wait(job_id).await.unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn a_main_that_declares_no_warm_step_never_asks_its_supervisor() {
+    let (supervisor_config, root) = isolated_config("land-no-warm");
+    let main = supervisor_config.workspace_root;
+    for config in [None, Some("[devenv]\ndir = \"tooling/devenv\"\n")] {
+        if let Some(config) = config {
+            std::fs::write(main.join(".cowshed.toml"), config).unwrap();
+        }
+        let admission = warm_after_land(&main, range('a', 'b'), || async {
+            Err::<WorkspaceSupervisorHandle, _>(CowshedError::internal(
+                "main's supervisor was asked for a warm step main does not declare",
+            ))
+        })
+        .await
+        .unwrap();
+        assert_eq!(admission, None, "{config:?}");
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn an_unbuilt_base_is_left_out_of_the_warm_environment() {
+    let mut h = harness(1, 1024, false, false);
+    let unborn = WarmRange {
+        base: None,
+        head: oid('b'),
+    };
+    h.handle
+        .warm(vec![CommandArg::from("warm")], unborn)
+        .await
+        .unwrap();
+    let spawned = h.spawned.recv().await.unwrap();
+    let head = oid('b');
+    assert_eq!(land_heads(&spawned), (None, Some(head.as_str())));
+}
+
+#[tokio::test]
+async fn lands_during_a_warm_run_coalesce_into_the_one_run_waiting_behind_it() {
+    let mut h = harness(1, 1024, false, false);
+    let argv = vec![CommandArg::from("warm")];
+    let job = |id| JobId::new(id).unwrap();
+    assert_eq!(
+        h.handle.warm(argv.clone(), range('a', 'b')).await.unwrap(),
+        WarmAdmission::Started {
+            job_id: job(1),
+            range: range('a', 'b'),
+        }
+    );
+    let first = h.spawned.recv().await.unwrap();
+    assert_eq!(
+        h.handle.warm(argv.clone(), range('b', 'c')).await.unwrap(),
+        WarmAdmission::Queued {
+            behind: job(1),
+            range: range('b', 'c'),
+        }
+    );
+    // A newer land replaces the waiting run, keeping its base and taking the newer head.
+    assert_eq!(
+        h.handle.warm(argv.clone(), range('c', 'd')).await.unwrap(),
+        WarmAdmission::Queued {
+            behind: job(1),
+            range: range('b', 'd'),
+        }
+    );
+    assert!(
+        h.spawned.try_recv().is_err(),
+        "at most one warm job runs at a time"
+    );
+
+    complete(&first, b"", b"", ExitStatus::Exited { code: 1 }).await;
+    let second = h.spawned.recv().await.unwrap();
+    assert_eq!(second.request.job_id, job(2));
+    let (base, head) = (oid('b'), oid('d'));
+    assert_eq!(
+        land_heads(&second),
+        (Some(base.as_str()), Some(head.as_str()))
+    );
+    assert_eq!(
+        h.handle.info(job(2)).await.unwrap().warm,
+        Some(range('b', 'd'))
+    );
+
+    // The waiting run was taken when it started: the next land waits alone.
+    assert_eq!(
+        h.handle.warm(argv.clone(), range('d', 'e')).await.unwrap(),
+        WarmAdmission::Queued {
+            behind: job(2),
+            range: range('d', 'e'),
+        }
+    );
+    complete(&second, b"", b"", ExitStatus::Exited { code: 0 }).await;
+    let third = h.spawned.recv().await.unwrap();
+    assert_eq!(third.request.job_id, job(3));
+    let (base, head) = (oid('d'), oid('e'));
+    assert_eq!(
+        land_heads(&third),
+        (Some(base.as_str()), Some(head.as_str()))
+    );
+    complete(&third, b"", b"", ExitStatus::Exited { code: 0 }).await;
+    h.handle.wait(job(3)).await.unwrap();
+
+    // Nothing waits any more: the next land starts at once.
+    assert_eq!(
+        h.handle.warm(argv, range('e', 'f')).await.unwrap(),
+        WarmAdmission::Started {
+            job_id: job(4),
+            range: range('e', 'f'),
+        }
+    );
+}
+
+#[tokio::test]
+async fn a_warm_job_s_durable_record_keeps_its_heads_exit_and_duration() {
+    let (supervisor_config, root) = isolated_config("warm-record");
+    let records = supervisor_config
+        .workspace_root
+        .join(".cowshed/job/records.arrow");
+    let mut h = real_store_harness(supervisor_config);
+    let WarmAdmission::Started { job_id, .. } = h
+        .handle
+        .warm(vec![CommandArg::from("warm")], range('a', 'b'))
+        .await
+        .unwrap()
+    else {
+        panic!("nothing runs, so the warm step starts");
+    };
+    let spawned = h.spawned.recv().await.unwrap();
+    complete(&spawned, b"built\n", b"", ExitStatus::Exited { code: 0 }).await;
+    let info = h.handle.wait(job_id).await.unwrap();
+
+    let terminal = cowshed_core::storage::job_artifact::recover_records(&records)
+        .unwrap()
+        .frames
+        .into_iter()
+        .find_map(|frame| match frame.record {
+            cowshed_core::storage::job_artifact::ProtectedRecord::Job(record)
+                if record.job_id == job_id && record.state == JobState::Exited =>
+            {
+                Some(record)
+            }
+            _ => None,
+        })
+        .expect("the warm job's terminal record");
+    assert_eq!(terminal.warm, Some(range('a', 'b')));
+    assert_eq!(terminal.exit, Some(ExitStatus::Exited { code: 0 }));
+    assert_eq!(terminal.duration_ms, info.duration_ms);
+    assert!(terminal.duration_ms.is_some());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn a_served_supervisor_takes_a_warm_step_across_its_socket() {
+    use cowshed_core::runtime::supervisor_socket;
+    let mut h = harness(1, 1024, false, false);
+    let path = PathBuf::from("/tmp").join(format!(
+        "cowshed-sock-{}/s",
+        &uuid::Uuid::new_v4().simple().to_string()[..12]
+    ));
+    let listener = supervisor_socket::bind(&path).await.unwrap();
+    tokio::spawn(supervisor_socket::serve(
+        listener,
+        h.handle.clone(),
+        None,
+        None,
+    ));
+    let remote = supervisor_socket::connect(path, authority());
+    let job_id = JobId::new(1).unwrap();
+    assert_eq!(
+        remote
+            .warm(vec![CommandArg::from("warm")], range('a', 'b'))
+            .await
+            .unwrap(),
+        WarmAdmission::Started {
+            job_id,
+            range: range('a', 'b'),
+        }
+    );
+    let spawned = h.spawned.recv().await.unwrap();
+    let (base, head) = (oid('a'), oid('b'));
+    assert_eq!(
+        land_heads(&spawned),
+        (Some(base.as_str()), Some(head.as_str()))
+    );
+    assert_eq!(
+        remote
+            .warm(vec![CommandArg::from("warm")], range('b', 'c'))
+            .await
+            .unwrap(),
+        WarmAdmission::Queued {
+            behind: job_id,
+            range: range('b', 'c'),
+        }
+    );
+    assert_eq!(
+        remote.info(job_id).await.unwrap().warm,
+        Some(range('a', 'b'))
+    );
 }

@@ -9,8 +9,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock};
 
 use arrow_array::{
-    Array, ArrayRef, BinaryArray, BooleanArray, ListArray, RecordBatch, StringArray, StructArray,
-    UInt64Array, new_null_array,
+    Array, ArrayRef, BinaryArray, BooleanArray, Int32Array, ListArray, RecordBatch, StringArray,
+    StructArray, UInt64Array, new_null_array,
 };
 use arrow_buffer::{OffsetBuffer, ScalarBuffer};
 use arrow_ipc::reader::StreamReader;
@@ -22,11 +22,11 @@ use thiserror::Error;
 
 use crate::api::dto::{
     AdmissionCommitment, BinaryData, CheckpointCommitment, CommandArg, ControllerCommitment,
-    DtoError, ExecCommand, ForkCommitment, JobId, JobState, MAX_ARGV_BYTES, MAX_COMMAND_ARG_BYTES,
-    MAX_INLINE_OUTPUT_BYTES, OutputLimitInfo, OutputPublication, OutputStorage, OutputSummary,
-    ProtectedOutput, RestoreCommitment, Sha256Digest, StreamInfo, TerminalCommitment,
-    WorkspaceIntroducedCommitment, WorkspacePath, WorkspaceRetiredCommitment,
-    validate_command_argv,
+    DtoError, ExecCommand, ExitStatus, ForkCommitment, GitOid, JobId, JobState, MAX_ARGV_BYTES,
+    MAX_COMMAND_ARG_BYTES, MAX_INLINE_OUTPUT_BYTES, OutputLimitInfo, OutputPublication,
+    OutputStorage, OutputSummary, ProtectedOutput, RestoreCommitment, Sha256Digest, StreamInfo,
+    TerminalCommitment, WarmRange, WorkspaceIntroducedCommitment, WorkspacePath,
+    WorkspaceRetiredCommitment, validate_command_argv,
 };
 use crate::metadata::WorkspaceIncarnation;
 use crate::repository::{OwnedRepoIds, RepoId};
@@ -49,10 +49,13 @@ const RECORD_SEQUENCE_BYTES: usize = 24;
 const CHECKPOINT_BARRIER_FILE_PREFIX: &str = "records.barrier.";
 const CHECKPOINT_BARRIER_MAGIC: &[u8; 8] = b"CSBAR001";
 const CHECKPOINT_BARRIER_BYTES: usize = 24;
-/// The layout every new record is written in: version 3 adds the nullable `failure` column.
-const RECORD_SCHEMA_VERSION: u64 = 3;
-/// The layout records written before version 3 keep; read, never written.
-const PREVIOUS_RECORD_SCHEMA_VERSION: u64 = 2;
+/// The layout every new record is written in: version 4 adds main's warm range and the job's
+/// exit status and duration.
+const RECORD_SCHEMA_VERSION: u64 = 4;
+/// The layouts earlier cowshed builds wrote, newest first, as the version and how many trailing
+/// columns of the current layout each lacks: version 3 has no warm, exit or duration columns,
+/// and version 2 no `failure` either. Read, never written.
+const EARLIER_RECORD_LAYOUTS: [(u64, usize); 2] = [(3, 6), (2, 7)];
 #[cfg(unix)]
 const SECURE_DIRECTORY_OPEN_FLAGS: libc::c_int =
     libc::O_DIRECTORY + libc::O_NOFOLLOW + libc::O_CLOEXEC;
@@ -237,6 +240,13 @@ pub struct JobArtifactRecord {
     pub stderr: StreamInfo,
     /// Why a failed job failed when no status of its own says so.
     pub failure: Option<crate::api::dto::JobFailure>,
+    /// Main's warm step only: the landed commits the job builds.
+    pub warm: Option<WarmRange>,
+    /// A terminal job's status as `wait(2)` reported it; absent while the job runs and for a job
+    /// whose end nothing observed.
+    pub exit: Option<ExitStatus>,
+    /// How long a terminal job ran; absent while it runs and for a job whose end nothing observed.
+    pub duration_ms: Option<u64>,
 }
 
 impl JobArtifactRecord {
@@ -244,6 +254,14 @@ impl JobArtifactRecord {
         self.command.validate()?;
         if self.failure.is_some() && self.state != JobState::Failed {
             return Err(integrity(0, "only a failed job record names a failure"));
+        }
+        if matches!(self.state, JobState::Queued | JobState::Running)
+            && (self.exit.is_some() || self.duration_ms.is_some())
+        {
+            return Err(integrity(
+                0,
+                "only a terminal job record names an exit status or a duration",
+            ));
         }
         if self.sequence == 0 {
             return Err(ArtifactError::Integrity {
@@ -272,6 +290,25 @@ impl JobArtifactRecord {
         validate_protected_path(self.job_id, StreamKind::Stdout, &self.stdout)?;
         validate_protected_path(self.job_id, StreamKind::Stderr, &self.stderr)?;
         Ok(())
+    }
+}
+
+/// How a job ended, as its supervisor observed it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct JobEnding {
+    pub state: JobState,
+    pub exit: Option<ExitStatus>,
+    pub duration_ms: Option<u64>,
+}
+
+/// An ending of which nothing is known beyond its state: a job refused before its command ran.
+impl From<JobState> for JobEnding {
+    fn from(state: JobState) -> Self {
+        Self {
+            state,
+            exit: None,
+            duration_ms: None,
+        }
     }
 }
 
@@ -425,9 +462,10 @@ pub struct CheckpointManifestRecord {
 
 impl CheckpointManifestRecord {
     pub fn validate(&self) -> Result<(), ArtifactError> {
-        let known = [RECORD_SCHEMA_VERSION, PREVIOUS_RECORD_SCHEMA_VERSION]
-            .iter()
-            .any(|version| u64::from(self.version) == *version);
+        let known = u64::from(self.version) == RECORD_SCHEMA_VERSION
+            || EARLIER_RECORD_LAYOUTS
+                .iter()
+                .any(|&(version, _)| u64::from(self.version) == version);
         if !known || self.barrier_id == 0 {
             return Err(ArtifactError::Integrity {
                 offset: 0,
@@ -668,6 +706,7 @@ impl ArtifactStore {
         job_id: JobId,
         grant_revision: u64,
         command: &ExecCommand,
+        warm: Option<&WarmRange>,
         mut targets: OutputTargets,
     ) -> Result<JobArtifactToken, ArtifactError> {
         command.validate()?;
@@ -701,6 +740,9 @@ impl ArtifactStore {
             stdout: empty_stream(&targets.stdout)?,
             stderr: empty_stream(&targets.stderr)?,
             failure: None,
+            warm: warm.cloned(),
+            exit: None,
+            duration_ms: None,
         };
         self.append_record(admission)?;
         let replaced = self.live_jobs.insert(
@@ -708,6 +750,7 @@ impl ArtifactStore {
             LiveJobState {
                 grant_revision,
                 command: command.clone(),
+                warm: warm.cloned(),
                 stdout: StreamWriterState::new(StreamKind::Stdout, targets.stdout),
                 stderr: StreamWriterState::new(StreamKind::Stderr, targets.stderr),
                 quota: QuotaLedger {
@@ -1058,6 +1101,7 @@ struct QuotaAdmission {
 struct LiveJobState {
     grant_revision: u64,
     command: ExecCommand,
+    warm: Option<WarmRange>,
     stdout: StreamWriterState,
     stderr: StreamWriterState,
     quota: QuotaLedger,
@@ -1234,8 +1278,13 @@ impl ArtifactStore {
     pub fn finish(
         &mut self,
         token: JobArtifactToken,
-        state: JobState,
+        ending: impl Into<JobEnding>,
     ) -> Result<SealedJobArtifacts, ArtifactError> {
+        let JobEnding {
+            state,
+            exit,
+            duration_ms,
+        } = ending.into();
         self.validate_token(&token)?;
         let mut live =
             self.live_jobs
@@ -1280,6 +1329,9 @@ impl ArtifactStore {
                 stdout,
                 stderr,
                 failure: None,
+                warm: live.warm.clone(),
+                exit,
+                duration_ms,
             };
             let (record, terminal_batch_sha256) = self.append_record(record)?;
             Ok(SealedJobArtifacts {
@@ -1311,11 +1363,11 @@ impl ArtifactStore {
     pub fn finish_and_publish(
         &mut self,
         token: JobArtifactToken,
-        state: JobState,
+        ending: impl Into<JobEnding>,
         stdout: Option<OutputPublication>,
         stderr: Option<OutputPublication>,
     ) -> Result<CompletedJobArtifacts, ArtifactError> {
-        let sealed = self.finish(token, state)?;
+        let sealed = self.finish(token, ending)?;
         let job_id = sealed.record.job_id;
         let stdout_publication = stdout
             .as_ref()
@@ -3051,29 +3103,41 @@ fn build_protected_record_schema() -> Arc<Schema> {
             true,
         ),
         field("failure", DataType::Utf8, true),
+        field("warm_base", DataType::Utf8, true),
+        field("warm_head", DataType::Utf8, true),
+        field("exit_code", DataType::Int32, true),
+        field("exit_signal", DataType::Int32, true),
+        field("exit_core_dumped", DataType::Boolean, true),
+        field("duration_ms", DataType::UInt64, true),
     ]))
 }
 
-/// The layout of version-2 records: version 3 without the trailing `failure` column.
-fn previous_protected_record_schema() -> Arc<Schema> {
-    static SCHEMA: LazyLock<Arc<Schema>> = LazyLock::new(|| {
+/// Every layout a record may be read in, newest first: the current one, then each of
+/// [`EARLIER_RECORD_LAYOUTS`] as the current layout without its trailing columns.
+fn record_layouts() -> &'static [(u64, Arc<Schema>)] {
+    static LAYOUTS: LazyLock<Vec<(u64, Arc<Schema>)>> = LazyLock::new(|| {
         let current = protected_record_schema();
         let fields = current.fields();
-        Arc::new(Schema::new(fields[..fields.len() - 1].to_vec()))
+        let earlier = EARLIER_RECORD_LAYOUTS.iter().map(|&(version, missing)| {
+            (
+                version,
+                Arc::new(Schema::new(fields[..fields.len() - missing].to_vec())),
+            )
+        });
+        std::iter::once((RECORD_SCHEMA_VERSION, Arc::clone(&current)))
+            .chain(earlier)
+            .collect()
     });
-    Arc::clone(&SCHEMA)
+    &LAYOUTS
 }
 
 /// The record version a batch's layout belongs to.
 fn batch_layout_version(batch: &RecordBatch) -> Option<u64> {
     let schema = batch.schema();
-    if schema == protected_record_schema() {
-        Some(RECORD_SCHEMA_VERSION)
-    } else if schema == previous_protected_record_schema() {
-        Some(PREVIOUS_RECORD_SCHEMA_VERSION)
-    } else {
-        None
-    }
+    record_layouts()
+        .iter()
+        .find(|(_, layout)| *layout == schema)
+        .map(|&(version, _)| version)
 }
 
 fn failure_name(failure: crate::api::dto::JobFailure) -> &'static str {
@@ -3209,6 +3273,7 @@ fn command_argv_array(command: &ExecCommand) -> Result<ListArray, ArtifactError>
 fn job_record_to_batch(record: &JobArtifactRecord) -> Result<RecordBatch, ArtifactError> {
     let stdout = flatten_storage(&record.stdout.storage);
     let stderr = flatten_storage(&record.stderr.storage);
+    let (exit_code, exit_signal, exit_core_dumped) = exit_columns(record.exit.as_ref());
     let columns: Vec<ArrayRef> = vec![
         Arc::new(StringArray::from(vec!["job"])),
         Arc::new(UInt64Array::from(vec![RECORD_SCHEMA_VERSION])),
@@ -3269,9 +3334,74 @@ fn job_record_to_batch(record: &JobArtifactRecord) -> Result<RecordBatch, Artifa
         ])),
         Arc::new(command_argv_array(&record.command)?),
         Arc::new(StringArray::from(vec![record.failure.map(failure_name)])),
+        Arc::new(StringArray::from(vec![
+            record
+                .warm
+                .as_ref()
+                .and_then(|warm| warm.base.as_ref())
+                .map(GitOid::as_str),
+        ])),
+        Arc::new(StringArray::from(vec![
+            record.warm.as_ref().map(|warm| warm.head.as_str()),
+        ])),
+        Arc::new(Int32Array::from(vec![exit_code])),
+        Arc::new(Int32Array::from(vec![exit_signal])),
+        Arc::new(BooleanArray::from(vec![exit_core_dumped])),
+        Arc::new(UInt64Array::from(vec![record.duration_ms])),
     ];
     RecordBatch::try_new(protected_record_schema(), columns)
         .map_err(|error| ArtifactError::Arrow(error.to_string()))
+}
+
+/// An exit status as its three columns: a code, or a signal and whether it dumped core.
+fn exit_columns(exit: Option<&ExitStatus>) -> (Option<i32>, Option<i32>, Option<bool>) {
+    match exit {
+        None => (None, None, None),
+        Some(ExitStatus::Exited { code }) => (Some(*code), None, None),
+        Some(ExitStatus::Signaled {
+            signal,
+            core_dumped,
+        }) => (None, Some(*signal), Some(*core_dumped)),
+    }
+}
+
+fn decode_exit(batch: &RecordBatch) -> Result<Option<ExitStatus>, ArtifactError> {
+    let code = (!batch.column(36).is_null(0))
+        .then(|| int32(batch, 36).map(|column| column.value(0)))
+        .transpose()?;
+    let signal = (!batch.column(37).is_null(0))
+        .then(|| int32(batch, 37).map(|column| column.value(0)))
+        .transpose()?;
+    let core_dumped = (!batch.column(38).is_null(0))
+        .then(|| boolean(batch, 38).map(|column| column.value(0)))
+        .transpose()?;
+    match (code, signal, core_dumped) {
+        (None, None, None) => Ok(None),
+        (Some(code), None, None) => Ok(Some(ExitStatus::Exited { code })),
+        (None, Some(signal), Some(core_dumped)) => Ok(Some(ExitStatus::Signaled {
+            signal,
+            core_dumped,
+        })),
+        _ => Err(ArtifactError::Arrow(
+            "exit columns must name one exit code, or one signal and its core dump".into(),
+        )),
+    }
+}
+
+fn decode_warm(batch: &RecordBatch) -> Result<Option<WarmRange>, ArtifactError> {
+    let oid = |index| -> Result<Option<GitOid>, ArtifactError> {
+        if batch.column(index).is_null(0) {
+            return Ok(None);
+        }
+        Ok(Some(GitOid::new(string(batch, index)?.value(0))?))
+    };
+    match (oid(34)?, oid(35)?) {
+        (None, None) => Ok(None),
+        (base, Some(head)) => Ok(Some(WarmRange { base, head })),
+        (Some(_), None) => Err(ArtifactError::Arrow(
+            "a warm base column needs its warm head".into(),
+        )),
+    }
 }
 
 fn batch_to_job_record(batch: &RecordBatch) -> Result<JobArtifactRecord, ArtifactError> {
@@ -3313,10 +3443,19 @@ fn batch_to_job_record(batch: &RecordBatch) -> Result<JobArtifactRecord, Artifac
         }
     };
     let command = decode_command(batch, 32)?;
-    let failure = if version == RECORD_SCHEMA_VERSION && !batch.column(33).is_null(0) {
+    // Each layout holds the columns of every version up to its own.
+    let failure = if version >= 3 && !batch.column(33).is_null(0) {
         Some(parse_failure(string(batch, 33)?.value(0))?)
     } else {
         None
+    };
+    let (warm, exit, duration_ms) = if version >= 4 {
+        let duration_ms = (!batch.column(39).is_null(0))
+            .then(|| uint64(batch, 39).map(|column| column.value(0)))
+            .transpose()?;
+        (decode_warm(batch)?, decode_exit(batch)?, duration_ms)
+    } else {
+        (None, None, None)
     };
     Ok(JobArtifactRecord {
         repo_id,
@@ -3330,6 +3469,9 @@ fn batch_to_job_record(batch: &RecordBatch) -> Result<JobArtifactRecord, Artifac
         stdout,
         stderr,
         failure,
+        warm,
+        exit,
+        duration_ms,
     })
 }
 
@@ -3454,10 +3596,9 @@ fn checkpoint_manifest_to_batch(
     columns.push(Arc::new(BinaryArray::from(vec![Some(
         record.records_sha256.as_bytes().as_slice(),
     )])));
-    columns.push(new_null_array(schema.field(30).data_type(), 1));
-    columns.push(new_null_array(schema.field(31).data_type(), 1));
-    columns.push(new_null_array(schema.field(32).data_type(), 1));
-    columns.push(new_null_array(schema.field(33).data_type(), 1));
+    for index in 30..schema.fields().len() {
+        columns.push(new_null_array(schema.field(index).data_type(), 1));
+    }
     RecordBatch::try_new(schema, columns).map_err(|error| ArtifactError::Arrow(error.to_string()))
 }
 
@@ -3671,6 +3812,13 @@ fn downcast<'a, T: 'static>(array: &'a dyn Array, name: &str) -> Result<&'a T, A
 }
 
 fn uint64(batch: &RecordBatch, index: usize) -> Result<&UInt64Array, ArtifactError> {
+    downcast(
+        batch.column(index).as_ref(),
+        batch.schema().field(index).name(),
+    )
+}
+
+fn int32(batch: &RecordBatch, index: usize) -> Result<&Int32Array, ArtifactError> {
     downcast(
         batch.column(index).as_ref(),
         batch.schema().field(index).name(),
@@ -4358,51 +4506,93 @@ mod tests {
     }
 
     #[test]
-    fn a_version_2_record_reads_with_no_failure_and_version_3_keeps_it() {
+    fn earlier_layouts_read_without_their_later_columns() {
         // A workspace's records.arrow outlives the cowshed that wrote it: version-2 batches,
-        // without the failure column, read as they always did.
+        // without `failure`, and version-3 batches, without the warm, exit and duration columns,
+        // read as they always did.
         let record = valid_job_record(4);
         let current = job_record_to_batch(&record).unwrap();
-        let previous = RecordBatch::try_new(
-            previous_protected_record_schema(),
-            current.columns()[..current.num_columns() - 1]
+        for &(version, missing) in &EARLIER_RECORD_LAYOUTS {
+            let layout = record_layouts()
                 .iter()
-                .enumerate()
-                .map(|(index, column)| {
-                    if index == 1 {
-                        Arc::new(UInt64Array::from(vec![PREVIOUS_RECORD_SCHEMA_VERSION]))
-                            as ArrayRef
-                    } else {
-                        Arc::clone(column)
-                    }
-                })
-                .collect(),
-        )
-        .unwrap();
-        let ProtectedRecord::Job(read) = batch_to_protected_record(&previous).unwrap() else {
-            panic!("a job record");
-        };
-        assert_eq!(read, record);
+                .find(|(layout_version, _)| *layout_version == version)
+                .map(|(_, layout)| Arc::clone(layout))
+                .unwrap();
+            let columns = &current.columns()[..current.num_columns() - missing];
+            let earlier = RecordBatch::try_new(
+                Arc::clone(&layout),
+                columns
+                    .iter()
+                    .enumerate()
+                    .map(|(index, column)| {
+                        if index == 1 {
+                            Arc::new(UInt64Array::from(vec![version])) as ArrayRef
+                        } else {
+                            Arc::clone(column)
+                        }
+                    })
+                    .collect(),
+            )
+            .unwrap();
+            let ProtectedRecord::Job(read) = batch_to_protected_record(&earlier).unwrap() else {
+                panic!("a job record");
+            };
+            assert_eq!(read, record, "version {version}");
 
+            // An earlier layout claiming the current version is neither.
+            let mislabeled = RecordBatch::try_new(layout, columns.to_vec()).unwrap();
+            assert!(batch_to_protected_record(&mislabeled).is_err());
+        }
+    }
+
+    #[test]
+    fn the_current_layout_keeps_failure_warm_range_exit_and_duration() {
+        let oid = |digit: char| GitOid::new(digit.to_string().repeat(40)).unwrap();
         let lost = JobArtifactRecord {
             state: JobState::Failed,
             failure: Some(crate::api::dto::JobFailure::SupervisorLost),
             ..valid_job_record(5)
         };
-        let ProtectedRecord::Job(read) =
-            batch_to_protected_record(&job_record_to_batch(&lost).unwrap()).unwrap()
-        else {
-            panic!("a job record");
+        let warmed = JobArtifactRecord {
+            warm: Some(WarmRange {
+                base: Some(oid('a')),
+                head: oid('b'),
+            }),
+            exit: Some(ExitStatus::Exited { code: 0 }),
+            duration_ms: Some(1234),
+            ..valid_job_record(6)
         };
-        assert_eq!(read.failure, lost.failure);
+        let signaled = JobArtifactRecord {
+            state: JobState::Signaled,
+            warm: Some(WarmRange {
+                base: None,
+                head: oid('c'),
+            }),
+            exit: Some(ExitStatus::Signaled {
+                signal: 9,
+                core_dumped: true,
+            }),
+            duration_ms: Some(5),
+            ..valid_job_record(7)
+        };
+        for record in [lost, warmed, signaled] {
+            let ProtectedRecord::Job(read) =
+                batch_to_protected_record(&job_record_to_batch(&record).unwrap()).unwrap()
+            else {
+                panic!("a job record");
+            };
+            assert_eq!(read, record);
+        }
 
-        // A version-2 layout claiming version 3 is neither.
-        let mislabeled = RecordBatch::try_new(
-            previous_protected_record_schema(),
-            current.columns()[..current.num_columns() - 1].to_vec(),
-        )
-        .unwrap();
-        assert!(batch_to_protected_record(&mislabeled).is_err());
+        let running = JobArtifactRecord {
+            state: JobState::Running,
+            duration_ms: Some(1),
+            ..valid_job_record(8)
+        };
+        assert!(
+            running.validate().is_err(),
+            "a running job has no duration yet"
+        );
     }
 
     fn valid_job_record(job_id: u64) -> JobArtifactRecord {
@@ -4418,6 +4608,9 @@ mod tests {
             stdout: inline_stream(b""),
             stderr: inline_stream(b""),
             failure: None,
+            warm: None,
+            exit: None,
+            duration_ms: None,
         }
     }
 
@@ -4585,6 +4778,7 @@ mod tests {
                 job_id,
                 1,
                 &crate::api::dto::ExecCommand::Argv(vec!["true".into()]),
+                None,
                 OutputTargets::default(),
             )
             .unwrap();
@@ -4614,6 +4808,7 @@ mod tests {
                 foreign_job_id,
                 1,
                 &crate::api::dto::ExecCommand::Argv(vec!["true".into()]),
+                None,
                 OutputTargets::default(),
             )
             .unwrap();
@@ -4758,6 +4953,7 @@ mod tests {
                     next,
                     1,
                     &crate::api::dto::ExecCommand::Argv(vec!["true".into()]),
+                    None,
                     OutputTargets::default(),
                 )
                 .unwrap();
@@ -5021,6 +5217,7 @@ mod tests {
                 JobId::new(1).unwrap(),
                 1,
                 &crate::api::dto::ExecCommand::Argv(vec!["true".into()]),
+                None,
                 OutputTargets::default(),
             )
             .unwrap();
@@ -5080,6 +5277,7 @@ mod tests {
                 JobId::new(1).unwrap(),
                 1,
                 &crate::api::dto::ExecCommand::Argv(vec!["true".into()]),
+                None,
                 OutputTargets::default(),
             )
             .unwrap();
@@ -5115,6 +5313,7 @@ mod tests {
                 JobId::new(1).unwrap(),
                 1,
                 &crate::api::dto::ExecCommand::Argv(vec!["true".into()]),
+                None,
                 OutputTargets::default(),
             )
             .unwrap();
@@ -5149,6 +5348,7 @@ mod tests {
                 JobId::new(1).unwrap(),
                 1,
                 &crate::api::dto::ExecCommand::Argv(vec!["true".into()]),
+                None,
                 OutputTargets::default(),
             )
             .unwrap();
@@ -5247,6 +5447,7 @@ mod tests {
                 JobId::new(1).unwrap(),
                 1,
                 &crate::api::dto::ExecCommand::Argv(vec!["true".into()]),
+                None,
                 OutputTargets {
                     stdout: StreamTarget::Redirect { source, descriptor },
                     stderr: StreamTarget::Captured,

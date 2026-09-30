@@ -18,7 +18,7 @@ use crate::api::dto::{
     BinaryData, CommandArg, ExecCommand, ExecRequest, ExitStatus, JobFailure, JobId, JobInfo,
     JobState, OutputLimitInfo, OutputPublication, OutputStorage, OutputSummary, ProtectedOutput,
     Sha256Digest, StdinInfo, StdinKind, StdinSource, StreamInfo, TraceContext, TraceId,
-    UtcTimestamp, WorkspacePath,
+    UtcTimestamp, WarmAdmission, WarmRange, WorkspacePath,
 };
 use crate::error::{CowshedError, Result};
 use crate::exec::{
@@ -37,8 +37,9 @@ use crate::workspace_environment::{
 };
 use cowshed_gateway_types::WorkspaceToken;
 
+use crate::runtime::land_warm::{WarmLane, WarmRun, WarmTurn};
 use crate::storage::job_artifact::{
-    ArtifactConfig, ArtifactError, ArtifactStore, CompletedJobArtifacts, OutputTargets,
+    ArtifactConfig, ArtifactError, ArtifactStore, CompletedJobArtifacts, JobEnding, OutputTargets,
     SealedCheckpointManifest, StreamKind,
 };
 
@@ -341,13 +342,19 @@ pub struct ArtifactSeal {
 
 pub trait ArtifactSink: Send {
     fn next_job_id(&self) -> Result<JobId>;
-    fn admit(&mut self, job_id: JobId, grant_revision: u64, command: &ExecCommand) -> Result<()>;
+    fn admit(
+        &mut self,
+        job_id: JobId,
+        grant_revision: u64,
+        command: &ExecCommand,
+        warm: Option<&WarmRange>,
+    ) -> Result<()>;
     fn prepare_background(&mut self, job_id: JobId) -> Result<()>;
     fn write(&mut self, job_id: JobId, stream: StreamKind, bytes: &[u8]) -> Result<ArtifactWrite>;
     fn seal(
         &mut self,
         job_id: JobId,
-        state: JobState,
+        ending: JobEnding,
         stdout_copy: Option<OutputPublication>,
         stderr_copy: Option<OutputPublication>,
     ) -> Result<ArtifactSeal>;
@@ -398,10 +405,22 @@ impl ArtifactSink for ArtifactStoreSink {
         self.store.next_job_id().map_err(map_artifact_error)
     }
 
-    fn admit(&mut self, job_id: JobId, grant_revision: u64, command: &ExecCommand) -> Result<()> {
+    fn admit(
+        &mut self,
+        job_id: JobId,
+        grant_revision: u64,
+        command: &ExecCommand,
+        warm: Option<&WarmRange>,
+    ) -> Result<()> {
         let token = self
             .store
-            .begin_job(job_id, grant_revision, command, OutputTargets::default())
+            .begin_job(
+                job_id,
+                grant_revision,
+                command,
+                warm,
+                OutputTargets::default(),
+            )
             .map_err(map_artifact_error)?;
         if token.job_id() != job_id || self.tokens.insert(job_id, token).is_some() {
             return Err(CowshedError::integrity(
@@ -437,7 +456,7 @@ impl ArtifactSink for ArtifactStoreSink {
     fn seal(
         &mut self,
         job_id: JobId,
-        state: JobState,
+        ending: JobEnding,
         stdout_copy: Option<OutputPublication>,
         stderr_copy: Option<OutputPublication>,
     ) -> Result<ArtifactSeal> {
@@ -453,7 +472,7 @@ impl ArtifactSink for ArtifactStoreSink {
             stderr_publication,
         } = self
             .store
-            .finish_and_publish(token, state, stdout_copy, stderr_copy)
+            .finish_and_publish(token, ending, stdout_copy, stderr_copy)
             .map_err(map_artifact_error)?;
         if let Some(Err(error)) = stdout_publication {
             return Err(map_artifact_error(error));
@@ -2059,6 +2078,18 @@ impl WorkspaceSupervisorHandle {
         .await
     }
 
+    /// Hand main's warm step one land's range: it starts now, or waits behind the warm job
+    /// running, merged into the one run waiting there. Answered at once, never at the build's end.
+    pub async fn warm(&self, argv: Vec<CommandArg>, range: WarmRange) -> Result<WarmAdmission> {
+        self.call(|reply| Command::Warm {
+            authority: self.authority.clone(),
+            argv,
+            range,
+            reply,
+        })
+        .await
+    }
+
     pub async fn stdin_write(&self, job_id: JobId, bytes: Bytes) -> Result<()> {
         if bytes.len() > PROCESS_IO_CHUNK {
             return Err(CowshedError::usage(
@@ -2282,6 +2313,7 @@ impl WorkspaceSupervisor {
             quiesce_waiters: Vec::new(),
             retire_waiters: Vec::new(),
             command_lane_closed: false,
+            warm: WarmLane::default(),
         };
         tokio::spawn(actor.run());
         Ok(handle)
@@ -2316,6 +2348,12 @@ pub(super) enum Command {
         request: ExecRequest,
         background: bool,
         reply: oneshot::Sender<Result<JobId>>,
+    },
+    Warm {
+        authority: WorkspaceAuthoritySnapshot,
+        argv: Vec<CommandArg>,
+        range: WarmRange,
+        reply: oneshot::Sender<Result<WarmAdmission>>,
     },
     StdinWrite {
         authority: WorkspaceAuthoritySnapshot,
@@ -2501,6 +2539,8 @@ struct SupervisorActor {
     quiesce_waiters: Vec<oneshot::Sender<Result<()>>>,
     retire_waiters: Vec<oneshot::Sender<Result<()>>>,
     command_lane_closed: bool,
+    /// Main's warm step: the one warm job running and the one run waiting behind it.
+    warm: WarmLane,
 }
 
 /// The actor's run loop ends only once every job is terminal, so an actor dropped with a job still
@@ -2571,6 +2611,7 @@ impl SupervisorActor {
                 }
             }
             self.finish_ready_jobs().await;
+            self.advance_warm_lane().await;
             self.finish_lifecycle_waiters();
         }
     }
@@ -2617,8 +2658,19 @@ impl SupervisorActor {
                 background,
                 reply,
             } => {
-                self.admit_exec(authority, session, request, background, reply)
+                let result = self
+                    .admit_exec(authority, session, request, background, None)
                     .await;
+                let _ = reply.send(result);
+            }
+            Command::Warm {
+                authority,
+                argv,
+                range,
+                reply,
+            } => {
+                let result = self.warm(&authority, WarmRun { argv, range }).await;
+                let _ = reply.send(result);
             }
             Command::StdinWrite {
                 authority,
@@ -2886,16 +2938,16 @@ impl SupervisorActor {
         Ok(())
     }
 
+    /// Admit and spawn one job. `warm` marks it as main's warm step for that landed range.
     async fn admit_exec(
         &mut self,
         authority: WorkspaceAuthoritySnapshot,
         session: Option<SessionToken>,
         request: ExecRequest,
         background: bool,
-        reply: oneshot::Sender<Result<JobId>>,
-    ) {
-        let result = self
-            .validate_authority(&authority)
+        warm: Option<WarmRange>,
+    ) -> Result<JobId> {
+        self.validate_authority(&authority)
             .and_then(|()| {
                 if self.lifecycle == ActorLifecycle::Running {
                     Ok(())
@@ -2909,11 +2961,7 @@ impl SupervisorActor {
                 } else {
                     Ok(())
                 }
-            });
-        if let Err(error) = result {
-            let _ = reply.send(Err(error));
-            return;
-        }
+            })?;
 
         let ExecRequest {
             command,
@@ -2925,13 +2973,9 @@ impl SupervisorActor {
             stdout_copy,
             stderr_copy,
         } = request;
-        if let Err(error) = command.validate() {
-            let _ = reply.send(Err(CowshedError::usage(
-                error.to_string(),
-                "provide a valid bounded command",
-            )));
-            return;
-        }
+        command.validate().map_err(|error| {
+            CowshedError::usage(error.to_string(), "provide a valid bounded command")
+        })?;
         // A script is rendered before anything is admitted, so a value that stands where no
         // substitution can mean it is refused like any other malformed request.
         let spawn_command = match &command {
@@ -2944,11 +2988,10 @@ impl SupervisorActor {
             ExecCommand::Script(script) => match crate::script::render(script) {
                 Ok(rendered) => SpawnCommand::Script(rendered),
                 Err(error) => {
-                    let _ = reply.send(Err(CowshedError::usage(
+                    return Err(CowshedError::usage(
                         error.to_string(),
                         "put script values only where a word or a quoted string stands",
-                    )));
-                    return;
+                    ));
                 }
             },
         };
@@ -2980,26 +3023,19 @@ impl SupervisorActor {
         // of it, so it is dropped here — at the one place every job's environment is settled.
         merged_env.retain(|name, _| !self.credential_env_names.contains(name));
         let job_id = self.next_job_id;
-        let expected_next = match job_id
+        let expected_next = job_id
             .get()
             .checked_add(1)
             .ok_or_else(|| CowshedError::internal("job id allocation exhausted"))
             .and_then(|value| {
                 JobId::new(value).map_err(|error| CowshedError::internal(error.to_string()))
-            }) {
-            Ok(next) => next,
-            Err(error) => {
-                let _ = reply.send(Err(error));
-                return;
-            }
-        };
-        if let Err(error) = self
-            .artifacts
-            .admit(job_id, self.authority.grant_revision, &command)
-        {
-            let _ = reply.send(Err(error));
-            return;
-        }
+            })?;
+        self.artifacts.admit(
+            job_id,
+            self.authority.grant_revision,
+            &command,
+            warm.as_ref(),
+        )?;
         self.next_job_id = expected_next;
         let admission = self
             .commitments
@@ -3013,16 +3049,14 @@ impl SupervisorActor {
         if let Err(error) = admission {
             let _ = self
                 .artifacts
-                .seal(job_id, JobState::Failed, stdout_copy, stderr_copy);
-            let _ = reply.send(Err(error));
-            return;
+                .seal(job_id, JobState::Failed.into(), stdout_copy, stderr_copy);
+            return Err(error);
         }
         if background && let Err(error) = self.artifacts.prepare_background(job_id) {
             let _ = self
                 .artifacts
-                .seal(job_id, JobState::Failed, stdout_copy, stderr_copy);
-            let _ = reply.send(Err(error));
-            return;
+                .seal(job_id, JobState::Failed.into(), stdout_copy, stderr_copy);
+            return Err(error);
         }
 
         let stdin_info = stdin_info(&stdin);
@@ -3032,11 +3066,10 @@ impl SupervisorActor {
         let started = match utc_now() {
             Ok(started) => started,
             Err(error) => {
-                let _ = self
-                    .artifacts
-                    .seal(job_id, JobState::Failed, stdout_copy, stderr_copy);
-                let _ = reply.send(Err(error));
-                return;
+                let _ =
+                    self.artifacts
+                        .seal(job_id, JobState::Failed.into(), stdout_copy, stderr_copy);
+                return Err(error);
             }
         };
         let trace = trace.unwrap_or_else(new_trace_context);
@@ -3058,6 +3091,7 @@ impl SupervisorActor {
             output_limit: None,
             stdin: stdin_info,
             failure: None,
+            warm,
         };
         let trusted_supervisor_profile =
             match seatbelt_profile(&self.sandbox, SandboxProfileRole::TrustedSupervisor)
@@ -3065,11 +3099,13 @@ impl SupervisorActor {
             {
                 Ok(profile) => profile,
                 Err(error) => {
-                    let _ = self
-                        .artifacts
-                        .seal(job_id, JobState::Failed, stdout_copy, stderr_copy);
-                    let _ = reply.send(Err(error));
-                    return;
+                    let _ = self.artifacts.seal(
+                        job_id,
+                        JobState::Failed.into(),
+                        stdout_copy,
+                        stderr_copy,
+                    );
+                    return Err(error);
                 }
             };
         // The request may narrow the configured ceiling, never widen it. Keep this
@@ -3085,11 +3121,13 @@ impl SupervisorActor {
             {
                 Ok(profile) => profile,
                 Err(error) => {
-                    let _ = self
-                        .artifacts
-                        .seal(job_id, JobState::Failed, stdout_copy, stderr_copy);
-                    let _ = reply.send(Err(error));
-                    return;
+                    let _ = self.artifacts.seal(
+                        job_id,
+                        JobState::Failed.into(),
+                        stdout_copy,
+                        stderr_copy,
+                    );
+                    return Err(error);
                 }
             };
         child_sandbox.mode = self.sandbox.mode;
@@ -3163,7 +3201,7 @@ impl SupervisorActor {
                     self.workspace_root.clone(),
                     self.events.clone(),
                 );
-                let _ = reply.send(Ok(job_id));
+                Ok(job_id)
             }
             Err(error) => {
                 job.stdout_eof = true;
@@ -3174,8 +3212,76 @@ impl SupervisorActor {
                 job.kill_reason = Some(KillReason::SpawnFailure);
                 self.jobs.insert(job_id, job);
                 self.finalize_job(job_id, Some(JobState::Failed)).await;
-                let _ = reply.send(Err(error));
+                Err(error)
             }
+        }
+    }
+
+    /// One land's warm run: start it when no warm job runs, else fold it into the run waiting
+    /// behind the one that does.
+    async fn warm(
+        &mut self,
+        authority: &WorkspaceAuthoritySnapshot,
+        run: WarmRun,
+    ) -> Result<WarmAdmission> {
+        self.validate_authority(authority)?;
+        if self.lifecycle != ActorLifecycle::Running {
+            return Err(retiring_error());
+        }
+        match self.warm.admit(run) {
+            WarmTurn::Wait(admission) => Ok(admission),
+            WarmTurn::Start(run) => {
+                let job_id = self.start_warm(&run).await?;
+                Ok(WarmAdmission::Started {
+                    job_id,
+                    range: run.range,
+                })
+            }
+        }
+    }
+
+    async fn start_warm(&mut self, run: &WarmRun) -> Result<JobId> {
+        let authority = self.authority.clone();
+        let job_id = self
+            .admit_exec(
+                authority,
+                None,
+                run.request(),
+                true,
+                Some(run.range.clone()),
+            )
+            .await?;
+        self.warm.started(job_id);
+        Ok(job_id)
+    }
+
+    /// Once the running warm job has ended, start the run that waited behind it. Nobody waits for
+    /// that answer — the lands it covers returned long ago — so a run that cannot start is said
+    /// where the supervisor's own failures go.
+    async fn advance_warm_lane(&mut self) {
+        let Some(running) = self.warm.running() else {
+            return;
+        };
+        if self.jobs.get(&running).is_some_and(|job| !job.terminal()) {
+            return;
+        }
+        let Some(run) = self.warm.ended() else {
+            return;
+        };
+        if self.lifecycle != ActorLifecycle::Running {
+            eprintln!(
+                "cowshed: main's supervisor is retiring, so the warm run for {} that waited \
+                 behind job {} does not start",
+                run.range,
+                running.get()
+            );
+            return;
+        }
+        if let Err(error) = self.start_warm(&run).await {
+            eprintln!(
+                "cowshed: main's warm run for {} did not start: {}",
+                run.range, error.message
+            );
         }
     }
 
@@ -3649,9 +3755,20 @@ impl SupervisorActor {
             return;
         }
         job.artifact_live = false;
+        let duration_ms = job
+            .started_at
+            .elapsed()
+            .as_millis()
+            .try_into()
+            .unwrap_or(u64::MAX);
+        let ending = JobEnding {
+            state,
+            exit: job.exit.clone(),
+            duration_ms: Some(duration_ms),
+        };
         let seal = match self.artifacts.seal(
             job_id,
-            state,
+            ending,
             job.stdout_copy.take(),
             job.stderr_copy.take(),
         ) {
@@ -3694,13 +3811,7 @@ impl SupervisorActor {
         job.terminal_committed = true;
         job.info.state = state;
         let ledger_changed = job.info.pid.is_some();
-        job.info.duration_ms = Some(
-            job.started_at
-                .elapsed()
-                .as_millis()
-                .try_into()
-                .unwrap_or(u64::MAX),
-        );
+        job.info.duration_ms = Some(duration_ms);
         job.info.exit = job.exit.clone();
         job.info.stdout = seal.stdout;
         job.info.stderr = seal.stderr;
@@ -4697,6 +4808,7 @@ mod lifecycle_commitment_tests {
                 JobId::new(1).unwrap(),
                 7,
                 &crate::api::dto::ExecCommand::Argv(vec!["true".into()]),
+                None,
                 OutputTargets::default(),
             )
             .unwrap();
@@ -4719,6 +4831,7 @@ mod lifecycle_commitment_tests {
                 JobId::new(2).unwrap(),
                 8,
                 &crate::api::dto::ExecCommand::Argv(vec!["true".into()]),
+                None,
                 OutputTargets::default(),
             )
             .unwrap();
@@ -4836,6 +4949,7 @@ mod lifecycle_commitment_tests {
                 JobId::new(1).unwrap(),
                 1,
                 &crate::api::dto::ExecCommand::Argv(vec!["true".into()]),
+                None,
                 OutputTargets::default(),
             )
             .unwrap();

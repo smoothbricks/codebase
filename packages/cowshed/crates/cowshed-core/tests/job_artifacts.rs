@@ -91,6 +91,7 @@ fn begin_with_argv(
             job_id,
             grant_revision,
             &cowshed_core::api::ExecCommand::Argv(argv.to_vec()),
+            None,
             targets,
         )
         .unwrap()
@@ -279,6 +280,7 @@ fn stale_and_foreign_tokens_are_typed_conflicts() {
             stale_id,
             1,
             &ExecCommand::Argv(vec!["true".into()]),
+            None,
             OutputTargets::default(),
         )
         .unwrap();
@@ -288,6 +290,7 @@ fn stale_and_foreign_tokens_are_typed_conflicts() {
             stale_id,
             1,
             &ExecCommand::Argv(vec!["true".into()]),
+            None,
             OutputTargets::default()
         ),
         Err(ArtifactError::TokenConflict { .. })
@@ -398,6 +401,7 @@ fn unsafe_argv_rejects_before_artifact_creation_or_id_advance() {
             job_id,
             1,
             &ExecCommand::Argv(nul.to_vec()),
+            None,
             OutputTargets::default()
         ),
         Err(ArtifactError::Dto(DtoError::CommandArgumentContainsNul))
@@ -415,6 +419,7 @@ fn unsafe_argv_rejects_before_artifact_creation_or_id_advance() {
             job_id,
             1,
             &ExecCommand::Argv(oversize.to_vec()),
+            None,
             OutputTargets::default(),
         ),
         Err(ArtifactError::Dto(DtoError::CommandArgumentTooLarge))

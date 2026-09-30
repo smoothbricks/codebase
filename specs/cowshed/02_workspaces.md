@@ -3,9 +3,10 @@
 The central convention: **main is the base**. There are no templates, no refresh pipelines, and no registration steps.
 The **main workspace** is the adopted image-backed workspace and its standalone Git repository/object store. It is not
 the checked-out Git `main` branch, and it is not shorthand for that branch's working tree or index. The main workspace
-is always warm because the user works in its currently checked-out working tree and merges land there; every new
-workspace is a copy-on-write clone of the main workspace's live image. Operations that update only a non-checked-out ref
-in its repository do not change its checked-out branch, index, or working tree.
+is warm because the user works in its currently checked-out working tree, merges land there, and each land builds it at
+what landed through the project's declared warm step ("Warm main" below); every new workspace is a copy-on-write clone
+of the main workspace's live image. Operations that update only a non-checked-out ref in its repository do not change
+its checked-out branch, index, or working tree.
 
 Every use of `main` in this specification is project-scoped. A host may adopt any number of repositories, each with its
 own warm `main`, sessions, checkpoints, grants, gateway identity, and standalone Git object store under its primary
@@ -697,14 +698,13 @@ step.
    hidden, not ignored by main's current rules, and not held by main's checkout with the same content). The check runs
    in the working tree but only the commit lands, so uncommitted work would be validated without landing, and would then
    refuse the retire after main had already moved.
-2. **Validate**: run the check _inside the sandbox_ — `--check <cmd>` if given, else `.cowshed.toml` `[land] check`,
-   else no validation with one honest `cowshed:` stderr line saying so. Non-zero check → exit 4, workspace intact,
-   output captured as a job (11_shell.md) for diagnosis. The check is an ordinary sandboxed exec and gets exactly the
-   environment one gets (04_sandbox.md): a curated `PATH` that admits the immutable store-backed roots — `/nix/store`,
-   `/run/current-system`, and the per-user profile roots `/etc/profiles` and `/etc/static/profiles` — plus a private
-   `HOME`. A verify command that needs more than that needs it wired into the workspace, not leaked from the caller's
-   shell; the check runs where the work was done, and a check that only passes in the coordinator's environment has not
-   validated the workspace.
+2. **Validate**: run the check _inside the sandbox_ — `--check <cmd>` if given, else no validation with one honest
+   `cowshed:` stderr line saying so. Non-zero check → exit 4, workspace intact, output captured as a job (11_shell.md)
+   for diagnosis. The check is an ordinary sandboxed exec and gets exactly the environment one gets (04_sandbox.md): a
+   curated `PATH` that admits the immutable store-backed roots — `/nix/store`, `/run/current-system`, and the per-user
+   profile roots `/etc/profiles` and `/etc/static/profiles` — plus a private `HOME`. A verify command that needs more
+   than that needs it wired into the workspace, not leaked from the caller's shell; the check runs where the work was
+   done, and a check that only passes in the coordinator's environment has not validated the workspace.
 
    Write checks as **bare commands** — `just verify`, `cargo test --workspace`. The sandbox `PATH` already _is_ the
    project's pinned toolchain, resolved to store paths, so wrapping a check in `devenv shell --` or a direnv
@@ -735,7 +735,36 @@ step.
    the moved value. Cowshed never retries against a new base internally; the coordinator decides whether to rebase and
    re-run checks.
 
-4. **Retire**: only after the target branch and its visible working state resolve to the validated source head, destroy
+4. **Warm main**: build main at what landed, so every later clone of main starts warm. Main's `.cowshed.toml` declares
+   the build as one argv, read from main's checkout at the landed head:
+
+   ```toml
+   [land]
+   warm = ["tooling/warm-main"]
+   ```
+
+   Land hands it to **main's workspace supervisor** as a background job of main's sandbox — an ordinary read-write exec
+   from main's root with `COWSHED_LAND_BASE` (the target's head before the land; unset when the target was unborn) and
+   `COWSHED_LAND_HEAD` (the landed head) in its environment — and **never waits for it**: the report carries the
+   admission (`warm`: `started` with the job id, or `queued` behind the warm job running), the CLI names that job on
+   stderr, and the build's outcome is the job's. The argv is never a shell string; a build that needs the heads
+   interpolated runs a tracked script that reads them.
+
+   **One warm job per project, one run waiting.** Main's supervisor keeps the lane: a land that arrives while a warm job
+   runs does not start another; it becomes the one run waiting behind it, and a later land replaces that waiting run,
+   keeping its `COWSHED_LAND_BASE` and taking the newer `COWSHED_LAND_HEAD` (and the newer argv). When the running job
+   ends, whatever its exit, the waiting run starts, so the run that follows a burst of lands builds everything they
+   landed once. The lane lives in the supervisor: a supervisor that retires with a run waiting drops it, saying so on
+   its stderr, and the next land's run covers only its own range.
+
+   The warm job is recorded like every job, with its range: `JobInfo.warm` and the protected record's
+   `warm_base`/`warm_head` columns name the landed commits it builds beside its exit status and duration
+   (13_telemetry.md), so "did main's warm step run at the landed head" is a query over main's job records. No
+   `[land] warm`, or a land that moved nothing, starts no job and asks main's supervisor nothing. A warm step that
+   cannot start (an invalid `.cowshed.toml`, a supervisor that refuses) fails the land after the fact the way a refused
+   retire does: the message starts with the landed head and target, because main has moved.
+
+5. **Retire**: only after the target branch and its visible working state resolve to the validated source head, destroy
    the workspace (supervisor tree first — 11_shell.md) and prune its `refs/cowshed/<ws>/*` preservation refs on the
    host. A retire refused at this point (the check left work behind, say) keeps the workspace and exits with the
    refusal, but its message starts with the landed head and target: main has moved, so the next step is `cowshed rm`,

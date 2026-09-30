@@ -73,6 +73,9 @@ direnv users need nothing extra.
 5. A successful `land` retires by default. If it was run with `--no-retire`, if you used `push`, or if land's error says
    it landed but kept the workspace, run `cowshed rm <ws>` after main contains the workspace `HEAD` (never land again:
    main already moved). Do not use `--abandon` unless destroying unlanded commits is intentional.
+6. If main's `.cowshed.toml` declares `[land] warm`, land starts that build in main as a background job and names the
+   job on stderr (`main's warm step builds <base>..<head> as job N`). Do not wait for it or run it yourself: the next
+   workspace cloned from main inherits whatever it has built.
 
 ## Keep builds shareable
 

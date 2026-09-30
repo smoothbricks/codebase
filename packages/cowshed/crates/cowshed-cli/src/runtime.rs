@@ -20,8 +20,8 @@ use cowshed_core::api::{
     LandingCommits, MountResult, OutputPublication, ProjectGrantDelta, ProjectGrants,
     PublicationPolicy, PushOptions, PushReport, RebaseOptions, RemoveOptions, RemoveReport,
     ResizeResult, RevisionResult, RevisionTarget, RunSandboxMode, SccacheStatus,
-    StdinSource as CoreStdinSource, UtcTimestamp, WorkspaceInfo, WorkspaceLanding, WorkspacePath,
-    WorkspaceState, validate_command_argv,
+    StdinSource as CoreStdinSource, UtcTimestamp, WarmAdmission, WorkspaceInfo, WorkspaceLanding,
+    WorkspacePath, WorkspaceState, validate_command_argv,
 };
 use cowshed_core::git::GitRepository;
 use cowshed_core::host_caches::{self, HostCacheState};
@@ -2475,6 +2475,17 @@ fn emit_land<W: Write, E: Write>(output: &mut Output<W, E>, report: &LandReport)
             })
         })
         .and_then(|()| output.bare(b"\n"))
+        .and_then(|()| match &report.warm {
+            None => Ok(()),
+            Some(WarmAdmission::Started { job_id, range }) => output.guidance(&format!(
+                "main's warm step builds {range} as job {}",
+                job_id.get()
+            )),
+            Some(WarmAdmission::Queued { behind, range }) => output.guidance(&format!(
+                "main's warm step builds {range} once job {} ends",
+                behind.get()
+            )),
+        })
         .map_err(output_error)
 }
 

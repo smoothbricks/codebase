@@ -2534,6 +2534,7 @@ const LAND: CommandSpec = CommandSpec {
     about: &[
         "The whole close-out as one primitive: run the checks inside the sandbox, fast-forward main's checkout to the workspace's branch, retire the workspace. The target must be the branch main's checkout has checked out, and a dirty tree is refused before the checks run, since they see the working tree but only the commit lands. Land does not rebase: when main has moved past the workspace's base, the fast-forward is refused and `cowshed rebase <ws>` is the next step. Any step that fails before the fast-forward leaves the workspace intact; a retire refused after it says what landed, and the next step is `cowshed rm`.",
         "Before running any --check command, land synchronizes the gateway with current workspace grants. If synchronization fails, no check runs and the target branch is unchanged. Landing without --check does not require this preflight.",
+        "After the fast-forward, land starts main's warm step when main's .cowshed.toml declares one (`[land] warm = [\"<argv>\", ...]`): main's workspace supervisor runs that argv in the background with COWSHED_LAND_BASE and COWSHED_LAND_HEAD set, one warm job at a time, later lands coalescing into the one run waiting behind it. Land never waits for the build; it names the job on stderr and in --json as `warm`.",
         "Landing is also what `rm` measures against: the ancestry gate a removal enforces is satisfied by the branch this command delivers to.",
     ],
     options: &[

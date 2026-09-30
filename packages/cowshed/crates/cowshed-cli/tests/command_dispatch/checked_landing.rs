@@ -271,6 +271,7 @@ impl Fixture {
             previous_target_head: Some(GitOid::new(previous).unwrap()),
             target_was_checked_out: true,
             retired: false,
+            warm: None,
         })
     }
 

@@ -40,6 +40,8 @@ struct FakeService {
     push_options: Option<PushOptions>,
     rebase_options: Option<RebaseOptions>,
     land_options: Option<LandOptions>,
+    /// What the fake land reports of main's warm step.
+    land_warm: Option<WarmAdmission>,
     workspace_at_error: Option<CowshedError>,
     /// What `workspace_at` reports for the invocation cwd: `None` means the command was not run
     /// inside any mounted workspace, which is what makes the refusal path testable.
@@ -74,6 +76,7 @@ impl Default for FakeService {
             push_options: None,
             rebase_options: None,
             land_options: None,
+            land_warm: None,
             workspace_at_error: None,
             gc_candidates: Vec::new(),
             grants: GrantSet::default(),
@@ -342,6 +345,7 @@ impl CliService for FakeService {
             previous_target_head: Some(GitOid::new("1".repeat(40)).unwrap()),
             target_was_checked_out: true,
             retired: options.retire,
+            warm: self.land_warm.clone(),
         })
     }
     async fn exec(
@@ -477,6 +481,7 @@ fn job_info(argv: Vec<CommandArg>, exit: ExitStatus) -> JobInfo {
             complete: true,
         },
         failure: None,
+        warm: None,
     }
 }
 
@@ -1067,6 +1072,44 @@ async fn lifecycle_commands_delegate_exact_options_and_keep_stdout_machine_only(
             .iter()
             .any(|event| event == "rm:main:false:true:false")
     );
+}
+
+/// Land never waits for main's warm step, so the job it started, or the one it waits behind, is
+/// the only handle a caller has on it: it is named on stderr, and stdout keeps its machine shape.
+#[tokio::test]
+async fn land_names_main_s_warm_job_beside_its_machine_output() {
+    let range = WarmRange {
+        base: Some(GitOid::new("1".repeat(40)).unwrap()),
+        head: GitOid::new("4".repeat(40)).unwrap(),
+    };
+    for (warm, guidance) in [
+        (None, String::new()),
+        (
+            Some(WarmAdmission::Started {
+                job_id: JobId::new(42).unwrap(),
+                range: range.clone(),
+            }),
+            format!("cowshed: main's warm step builds {range} as job 42\n"),
+        ),
+        (
+            Some(WarmAdmission::Queued {
+                behind: JobId::new(41).unwrap(),
+                range: range.clone(),
+            }),
+            format!("cowshed: main's warm step builds {range} once job 41 ends\n"),
+        ),
+    ] {
+        let mut service = FakeService {
+            land_warm: warm,
+            ..FakeService::default()
+        };
+        let (_, stdout, stderr) = run(&mut service, ["land", "raven", "--no-retire"]).await;
+        assert_eq!(
+            stdout,
+            format!("main\t{}\ttrue\n", "4".repeat(40)).as_bytes()
+        );
+        assert_eq!(String::from_utf8(stderr).unwrap(), guidance);
+    }
 }
 
 /// An authorized abandonment is not a silent one: passing the flag buys the deletion, not silence.
