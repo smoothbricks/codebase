@@ -66,15 +66,15 @@ declarative remediation hint, never an imperative fallback derived from a checko
 
 **What stays imperative always**, on every host: volume creation (`diskutil apfs addVolume` — stateful, hardware-
 adjacent) and every per-project/per-workspace artifact (images, grants, tokens, CA keys). Native volume creation is
-capability-fenced further: only an explicit, foreground `cowshed adopt` uses provisioning mode and may cause the
-one-time macOS administrator authorization prompt that creates `cowshed.store` and `cowshed.caches`. All other commands
-and every launchd/background service use existing-only mode. They may validate filesystem, `diskutil`, mount, and marker
-evidence, reclaim a launchd StandardErrorPath stub, and remount an already-created cowshed volume at its canonical
-`-nobrowse` path. A plan that would create a volume, write a marker, or otherwise require authorization is rejected
-before executor dispatch with `environment-missing` and `next: cowshed adopt`. Per-project/per-workspace artifacts live
-inside cowshed's volumes, not `$HOME`; there is nothing for a dotfile generation to own. Trusted repository bindings and
-policy are the exception: despite living under the cowshed volume, they remain host-bootstrap-owned and outside
-workspace authority.
+capability-fenced further: only an explicit, foreground `cowshed setup` or `cowshed adopt` (which runs the same host
+setup first) uses provisioning mode and may cause the one-time macOS administrator authorization prompt that creates
+`cowshed.store` and `cowshed.caches`. All other commands and every launchd/background service use existing-only mode.
+They may validate filesystem, `diskutil`, mount, and marker evidence, reclaim a launchd StandardErrorPath stub, and
+remount an already-created cowshed volume at its canonical `-nobrowse` path. A plan that would create a volume, write a
+marker, or otherwise require authorization is rejected before executor dispatch with `environment-missing` and
+`next: cowshed setup`. Per-project/per-workspace artifacts live inside cowshed's volumes, not `$HOME`; there is nothing
+for a dotfile generation to own. Trusted repository bindings and policy are the exception: despite living under the
+cowshed volume, they remain host-bootstrap-owned and outside workspace authority.
 
 ## Deployment postures
 

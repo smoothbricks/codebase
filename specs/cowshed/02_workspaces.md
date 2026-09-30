@@ -67,9 +67,9 @@ not a best-effort script:
    `/private/cowshed/store/<owner>/<repo>/policy.json`. Also require that `<root>.pre-cowshed` does **not** already
    exist (exit 4 — a previous adopt left state behind; resolve it first). Ensure host setup is present — declaratively
    validated when home-manager/nix-darwin owns it (`programs.cowshed`/`services.cowshed`, 14_nix.md), imperatively
-   applied otherwise — and both dedicated volumes exist: lazily create and mount `cowshed.store` (at
-   `/private/cowshed/store`) then `cowshed.caches` (nested; ordering and the volume marker in 01_storage.md) before any
-   image is created.
+   applied otherwise — and both dedicated volumes exist: run the same host setup `cowshed setup` runs, which creates and
+   mounts the sibling volumes `cowshed.store` (at `/private/cowshed/store`) and `cowshed.caches` (at
+   `/private/cowshed/caches`; the volume marker in 01_storage.md) before any image is created.
 2. Create the image (case-sensitive APFS in ASIF, 01_storage.md) under a staged, non-enumerated name:
    `<owner>/<repo>/.staging/main-<incarnation>.asif`. Both components come from the validated primary `repo_id` and are
    encoded independently as specified in 01_storage.md. Create its complete sibling host sidecar before the first
