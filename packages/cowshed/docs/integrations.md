@@ -171,8 +171,10 @@ error and does not rewrite the already-established process exit or output-limit 
 A Rust host that embeds `cowshed-core` directly — a supervising runtime rather than the CLI — opens a project with
 `ProjectRuntime::open_existing_with_audit(root, ContinuityAudit::External(Box::new(sink)))`, where `sink` implements
 `cowshed_core::storage::audit::AuditSink` (`record(CommitmentDraft) -> Result<(), AuditSinkError>` plus a short
-`name()`); the same typed records the Arrow sink would seal then go wherever the host keeps its durable log. The host
-never needs the Arrow files. Before installing workspace sessions it calls
+`name()`); the same typed records the Arrow sink would seal then go wherever the host keeps its durable log. Job records
+are among them although the workspace supervisors that make them are processes of their own: the controller reads each
+supervisor's records by cursor over its socket, records them into the host's sink, and acknowledges them. The host never
+needs the Arrow files. Before installing workspace sessions it calls
 `cowshed_core::gateway_sessions::reconcile_native_project(&repo_id)` (or `reconcile_project` over its own
 `GatewayControl`/`SessionInventory`) so a stale session of a deleted project cannot hold the endpoint; authority for
 every decision is the image inventory, the grants files, and the controller lock — no log is replayed.

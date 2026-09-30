@@ -40,6 +40,9 @@ use crate::storage::job_artifact::StreamKind;
 /// another; `hello` refuses it by name rather than letting a call fail mid-way.
 pub const PROTOCOL_VERSION: u32 = 1;
 
+/// How long a commitments read waits for one to arrive before answering empty.
+const COMMITMENT_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// How long a supervisor may take to answer hello.
 const HELLO_BOUND: std::time::Duration = std::time::Duration::from_secs(10);
 
@@ -85,6 +88,13 @@ enum Request {
     /// the serving pid. Its shape never changes across protocol versions: it is how a daemon
     /// of a newer build retires a supervisor it cannot otherwise talk to.
     Drain,
+    /// The commitments recorded after cursor `after`, waiting a while for one when there is
+    /// none (`commitment_feed`).
+    #[serde(rename_all = "camelCase")]
+    Commitments { after: u64 },
+    /// Forget every commitment up to and including cursor `through`: it is forwarded.
+    #[serde(rename_all = "camelCase")]
+    AcknowledgeCommitments { through: u64 },
     Call {
         authority: AuthorityWire,
         call: Box<Call>,
@@ -424,6 +434,7 @@ pub async fn serve(
     listener: UnixListener,
     supervisor: WorkspaceSupervisorHandle,
     advances: Option<Advances>,
+    feed: Option<super::commitment_feed::CommitmentFeed>,
 ) -> Result<()> {
     let streams: Streams = Arc::default();
     let retired = Arc::new(tokio::sync::Notify::new());
@@ -441,8 +452,17 @@ pub async fn serve(
         let streams = Arc::clone(&streams);
         let retired = Arc::clone(&retired);
         let advances = advances.clone();
+        let feed = feed.clone();
         tokio::spawn(async move {
-            match serve_call(stream, &supervisor, &streams, advances.as_ref()).await {
+            match serve_call(
+                stream,
+                &supervisor,
+                &streams,
+                advances.as_ref(),
+                feed.as_ref(),
+            )
+            .await
+            {
                 Ok(Retirement::Retired) => retired.notify_one(),
                 Ok(Retirement::Draining) => {
                     // Under the authority it holds now, which an advance may have moved.
@@ -472,6 +492,7 @@ async fn serve_call(
     supervisor: &WorkspaceSupervisorHandle,
     streams: &Streams,
     advances: Option<&Advances>,
+    feed: Option<&super::commitment_feed::CommitmentFeed>,
 ) -> Result<Retirement> {
     verify_peer(&stream)?;
     let request: Request = read_json(&mut stream).await?;
@@ -496,6 +517,34 @@ async fn serve_call(
             )
             .await?;
             return Ok(Retirement::Draining);
+        }
+        Request::Commitments { after } => {
+            let response = match feed {
+                Some(feed) => Response::Ok {
+                    value: to_value(&feed.since(after, COMMITMENT_WAIT).await)?,
+                    bytes: 0,
+                },
+                None => Response::Err(CowshedError::conflict(
+                    "this supervisor keeps no commitments for forwarding",
+                    "read the host's own audit segments",
+                )),
+            };
+            write_json(&mut stream, &response).await?;
+            return Ok(Retirement::Serving);
+        }
+        Request::AcknowledgeCommitments { through } => {
+            if let Some(feed) = feed {
+                feed.acknowledge(through);
+            }
+            write_json(
+                &mut stream,
+                &Response::Ok {
+                    value: serde_json::Value::Null,
+                    bytes: 0,
+                },
+            )
+            .await?;
+            return Ok(Retirement::Serving);
         }
         Request::Advance => {
             let advanced = match advances {
@@ -830,6 +879,24 @@ pub async fn hello(path: &Path) -> Result<Hello> {
         authority: hello.authority.into(),
         pid: hello.pid,
     })
+}
+
+/// The commitments the supervisor at `path` recorded after cursor `after`; waits a while for
+/// one when there is none, then answers empty.
+pub async fn commitments(path: &Path, after: u64) -> Result<super::commitment_feed::FeedPage> {
+    let (value, _) = exchange(path, &Request::Commitments { after }, Bytes::new()).await?;
+    decode(value)
+}
+
+/// Tell the supervisor at `path` that every commitment through cursor `through` is forwarded.
+pub async fn acknowledge_commitments(path: &Path, through: u64) -> Result<()> {
+    exchange(
+        path,
+        &Request::AcknowledgeCommitments { through },
+        Bytes::new(),
+    )
+    .await
+    .map(|_| ())
 }
 
 /// Ask the supervisor at `path` to admit nothing more and retire once its running jobs end,

@@ -40,8 +40,15 @@ use crate::fsio::rename_noreplace;
 
 const SEGMENT_PREFIX: &str = "commitment-";
 
-/// One controller act, before the sink assigns it a writer-local order.
-#[derive(Clone, Debug, Eq, PartialEq)]
+/// One controller act, before the sink assigns it a writer-local order. It crosses a supervisor
+/// socket as JSON when a controller forwards a supervisor's commitments into its own sink.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
 pub enum CommitmentDraft {
     WorkspaceIntroduced {
         repo_id: RepoId,

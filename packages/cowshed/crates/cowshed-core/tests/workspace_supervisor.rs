@@ -1587,7 +1587,12 @@ async fn served(handle: &WorkspaceSupervisorHandle) -> (WorkspaceSupervisorHandl
         &uuid::Uuid::new_v4().simple().to_string()[..12]
     ));
     let listener = supervisor_socket::bind(&path).await.expect("bind");
-    tokio::spawn(supervisor_socket::serve(listener, handle.clone(), None));
+    tokio::spawn(supervisor_socket::serve(
+        listener,
+        handle.clone(),
+        None,
+        None,
+    ));
     let remote = supervisor_socket::connect(path.clone(), handle.snapshot().clone());
     (remote, path)
 }
@@ -1796,7 +1801,7 @@ impl cowshed_core::runtime::supervisor_manager::SupervisorSpawner for InProcessS
                 // A real supervisor takes a moment to open its project before it serves.
                 tokio::time::sleep(Duration::from_millis(200)).await;
                 let listener = supervisor_socket::bind(&path).await.expect("bind");
-                supervisor_socket::serve(listener, supervisor, None).await
+                supervisor_socket::serve(listener, supervisor, None, None).await
             });
         }
         tokio::process::Command::new(self.child[0])
@@ -1884,6 +1889,7 @@ async fn the_manager_moves_a_running_supervisor_to_a_newer_grant_revision() {
         listener,
         h.handle.clone(),
         Some(advances),
+        None,
     ));
     let newer = WorkspaceAuthoritySnapshot {
         grant_revision: authority().grant_revision + 1,
@@ -1940,7 +1946,12 @@ async fn a_drained_supervisor_finishes_its_jobs_admits_none_and_stops_serving() 
         &uuid::Uuid::new_v4().simple().to_string()[..12]
     ));
     let listener = supervisor_socket::bind(&path).await.unwrap();
-    let server = tokio::spawn(supervisor_socket::serve(listener, h.handle.clone(), None));
+    let server = tokio::spawn(supervisor_socket::serve(
+        listener,
+        h.handle.clone(),
+        None,
+        None,
+    ));
     let remote = supervisor_socket::connect(path.clone(), authority());
     let job = remote
         .exec(None, request(StdinSource::Empty))
@@ -1984,4 +1995,110 @@ async fn a_drained_supervisor_finishes_its_jobs_admits_none_and_stops_serving() 
         .expect("it stops serving once its jobs ended")
         .unwrap()
         .unwrap();
+}
+
+#[tokio::test]
+async fn a_controller_reads_a_served_supervisor_s_commitments_by_cursor_until_it_acknowledges() {
+    use cowshed_core::runtime::commitment_feed::{CommitmentFeed, FeedingSink};
+    use cowshed_core::runtime::supervisor_socket;
+    let (spawn_tx, mut spawned) = mpsc::unbounded_channel();
+    let (process_tx, _process) = mpsc::unbounded_channel();
+    let (artifact_tx, _artifacts) = mpsc::unbounded_channel();
+    let (commitment_tx, _commitments) = mpsc::unbounded_channel();
+    let (order_tx, _order) = mpsc::unbounded_channel();
+    let feed = CommitmentFeed::default();
+    let handle = WorkspaceSupervisor::start_with_sinks(
+        config(),
+        Box::new(FakeSpawner {
+            spawned: spawn_tx,
+            process_observations: process_tx,
+            fail_next: false,
+            backpressure: false,
+            order: order_tx.clone(),
+        }),
+        Box::new(FakeArtifactSink {
+            sealed_stdout: None,
+            next: JobId::new(1).unwrap(),
+            next_barrier: 1,
+            quota: 1024,
+            jobs: BTreeMap::new(),
+            observations: artifact_tx,
+            order: order_tx.clone(),
+        }),
+        Box::new(FeedingSink {
+            inner: FakeCommitments {
+                next_order: 1,
+                observations: commitment_tx,
+                order: order_tx,
+            },
+            feed: feed.clone(),
+        }),
+    )
+    .unwrap();
+    let path = PathBuf::from("/tmp").join(format!(
+        "cowshed-sock-{}/s",
+        &uuid::Uuid::new_v4().simple().to_string()[..12]
+    ));
+    let listener = supervisor_socket::bind(&path).await.unwrap();
+    tokio::spawn(supervisor_socket::serve(
+        listener,
+        handle.clone(),
+        None,
+        Some(feed),
+    ));
+
+    let first = handle
+        .exec(None, request(StdinSource::Empty))
+        .await
+        .unwrap();
+    complete(
+        &spawned.recv().await.unwrap(),
+        b"",
+        b"",
+        ExitStatus::Exited { code: 0 },
+    )
+    .await;
+    handle.wait(first).await.unwrap();
+
+    let page = supervisor_socket::commitments(&path, 0).await.unwrap();
+    let kinds: Vec<(u64, &'static str)> = page
+        .entries
+        .iter()
+        .map(|entry| {
+            (
+                entry.cursor,
+                match entry.draft {
+                    CommitmentDraft::Admission { .. } => "admission",
+                    CommitmentDraft::Terminal { .. } => "terminal",
+                    _ => "other",
+                },
+            )
+        })
+        .collect();
+    assert_eq!(kinds, vec![(1, "admission"), (2, "terminal")]);
+    assert_eq!(page.lost_through, None);
+
+    supervisor_socket::acknowledge_commitments(&path, 2)
+        .await
+        .unwrap();
+    let second = handle
+        .exec(None, request(StdinSource::Empty))
+        .await
+        .unwrap();
+    complete(
+        &spawned.recv().await.unwrap(),
+        b"",
+        b"",
+        ExitStatus::Exited { code: 0 },
+    )
+    .await;
+    handle.wait(second).await.unwrap();
+    let cursors: Vec<u64> = supervisor_socket::commitments(&path, 0)
+        .await
+        .unwrap()
+        .entries
+        .iter()
+        .map(|entry| entry.cursor)
+        .collect();
+    assert_eq!(cursors, vec![3, 4], "acknowledged commitments are gone");
 }

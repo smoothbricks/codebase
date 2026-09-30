@@ -1659,6 +1659,9 @@ struct NativeProjectRuntimeHost {
     served: std::collections::BTreeMap<WorkspaceName, ServedSupervisor>,
     /// Who runs the workspace supervisors this host's commands reach.
     supervisors_run_in: SupervisorHome,
+    /// With a sink of the host's own: per supervisor socket, the task forwarding that
+    /// supervisor's commitments into it. `None` when the host's default sink already has them.
+    forwarders: Option<std::collections::BTreeMap<PathBuf, tokio::task::JoinHandle<()>>>,
     sessions: std::collections::BTreeMap<
         (WorkspaceName, Option<String>),
         super::supervisor::SessionToken,
@@ -2421,6 +2424,12 @@ impl NativeProjectRuntimeHost {
             }
         }
         let telemetry_root = bootstrap.roots().store().join("telemetry");
+        // A sink of the host's own takes the workspaces' commitments too: the supervisors that
+        // record them are processes of their own, so this controller forwards them.
+        let forwards_commitments = matches!(
+            continuity,
+            crate::storage::audit::ContinuityAudit::External(_)
+        );
         let mut commitments = super::supervisor::CommitmentPublisher::open(
             &telemetry_root,
             continuity,
@@ -2462,6 +2471,11 @@ impl NativeProjectRuntimeHost {
             supervisors: std::collections::BTreeMap::new(),
             served: std::collections::BTreeMap::new(),
             supervisors_run_in: SupervisorHome::Daemon,
+            forwarders: if forwards_commitments {
+                Some(std::collections::BTreeMap::new())
+            } else {
+                None
+            },
             sessions: std::collections::BTreeMap::new(),
             home,
             telemetry_root,
@@ -4440,6 +4454,7 @@ impl NativeProjectRuntimeHost {
                 &needed,
             )
             .await?;
+            self.forward_commitments(&ensured.socket);
             let handle = super::supervisor_socket::connect(ensured.socket, ensured.authority);
             self.supervisors.insert(name.clone(), handle.clone());
             return Ok(handle);
@@ -4542,13 +4557,22 @@ impl NativeProjectRuntimeHost {
                 "cowshed: ended the process groups of jobs {ended:?} of workspace {name}, left by a supervisor that ended without them"
             );
         }
-        let actor =
-            super::supervisor::WorkspaceSupervisor::start(config, self.commitments.clone())?;
+        // Every commitment goes to this process's own sink, the host's default, and is kept for
+        // controllers that forward the workspace's commitments into sinks of their own.
+        let feed = super::commitment_feed::CommitmentFeed::default();
+        let actor = super::supervisor::WorkspaceSupervisor::start(
+            config,
+            super::commitment_feed::FeedingSink {
+                inner: self.commitments.clone(),
+                feed: feed.clone(),
+            },
+        )?;
         let (advances, advance_requests) = tokio::sync::mpsc::channel(1);
         let server = tokio::spawn(super::supervisor_socket::serve(
             listener,
             actor.clone(),
             Some(advances),
+            Some(feed),
         ));
         let handle = super::supervisor_socket::connect(socket.clone(), authority);
         self.served.insert(
@@ -4562,6 +4586,58 @@ impl NativeProjectRuntimeHost {
         );
         self.supervisors.insert(name.clone(), handle.clone());
         Ok(handle)
+    }
+
+    /// Forward the commitments the supervisor at `socket` records into this host's own sink,
+    /// once per supervisor process: from the first it has not acknowledged, until it is gone.
+    fn forward_commitments(&mut self, socket: &Path) {
+        let Some(forwarders) = self.forwarders.as_mut() else {
+            return;
+        };
+        if forwarders
+            .get(socket)
+            .is_some_and(|forwarder| !forwarder.is_finished())
+        {
+            return;
+        }
+        let socket = socket.to_path_buf();
+        let mut publisher = self.commitments.clone();
+        let task = tokio::spawn({
+            let socket = socket.clone();
+            async move {
+                use super::supervisor::CommitmentSink as _;
+                let mut after = 0;
+                loop {
+                    let page = match super::supervisor_socket::commitments(&socket, after).await {
+                        Ok(page) => page,
+                        // The supervisor is gone; the next ensure starts a forwarder for its
+                        // successor, which has sealed and recorded what this one lost.
+                        Err(_) => return,
+                    };
+                    if let Some(lost) = page.lost_through {
+                        eprintln!(
+                            "cowshed: commitments through {lost} of workspace supervisor {} were dropped before they were forwarded",
+                            socket.display()
+                        );
+                        after = after.max(lost);
+                    }
+                    for entry in page.entries {
+                        if publisher.record(entry.draft).await.is_err() {
+                            // The project is detaching; nothing takes records any more.
+                            return;
+                        }
+                        after = entry.cursor;
+                    }
+                    if super::supervisor_socket::acknowledge_commitments(&socket, after)
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+            }
+        });
+        forwarders.insert(socket, task);
     }
 
     async fn stop_supervisor(&mut self, name: &WorkspaceName) -> Result<()> {

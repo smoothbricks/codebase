@@ -117,7 +117,10 @@ Cowshed uses Arrow IPC for both, but placement and authority differ:
   `arrow` (default for the standalone CLI) writes sealed per-writer segments under `/private/cowshed/store/telemetry/`,
   `off` discards, and a supervising runtime injects its own sink through `ProjectRuntime::open_existing_with_audit`
   (Containium routes the same records into PTMCART). A sink that refuses a record is a `doctor` finding (`audit-sink`),
-  never a reason to fail the act it describes.
+  never a reason to fail the act it describes. Job admission, terminal and checkpoint records come from the workspace
+  supervisors, which are processes of their own (11_shell.md): each records to the host's default sink, and a controller
+  with a sink of its own reads each supervisor's records after the last cursor it forwarded, records them, and
+  acknowledges them by cursor.
 - **Arrow audit segments** — one Arrow IPC batch containing one row per segment at
   `<host-telemetry-root>/<yyyy-mm-dd>/commitment-<order:020>-<writer_uuid>.arrow`, where the UTC partition is an exact
   calendar date, `writer_uuid` is the lowercase hyphenated UUID of the controller process that wrote it, and `order` is

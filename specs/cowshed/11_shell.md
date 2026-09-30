@@ -150,6 +150,11 @@ multiplexed, and a client that disconnects abandons only its own call, never a j
   (Grant-change propagation, below); answered with the authority it serves afterwards.
 - **drain** — the supervisor admits nothing more, lets its running jobs finish, then retires; answered at once with its
   pid. This one request keeps its shape across protocol versions (Supervisor recovery, below).
+- **commitments** — the controller commitments the supervisor recorded after a cursor, waiting up to 30 seconds for one
+  when there is none; **acknowledgeCommitments** forgets every one through a cursor. Every commitment goes to the
+  supervisor process's own sink, the host's default; a controller whose sink is its own reads them here, records them
+  into it, and acknowledges them. The supervisor keeps up to 65,536 unacknowledged commitments and then drops the
+  oldest, which the next read reports.
 - **calls** — `openSession`, `sessionSnapshot`, `closeSession`, `exec`, `stdinWrite`, `stdinClose`, `streamChunk`,
   `streamEnd`, `info`, `list`, `kill`, `wait`, `logRead`, `checkpoint`, `quiesce`, `retire`: one per supervisor
   operation, each naming the authority the caller holds. The supervisor fences every call by it exactly as it fences an

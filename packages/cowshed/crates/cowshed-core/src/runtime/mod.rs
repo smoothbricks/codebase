@@ -1,3 +1,4 @@
+pub mod commitment_feed;
 pub mod job_groups;
 pub mod project;
 pub mod shell_host;

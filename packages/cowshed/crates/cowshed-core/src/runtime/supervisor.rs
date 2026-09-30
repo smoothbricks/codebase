@@ -2126,10 +2126,13 @@ impl WorkspaceSupervisorHandle {
 pub struct WorkspaceSupervisor;
 
 impl WorkspaceSupervisor {
-    pub fn start(
+    pub fn start<C>(
         config: WorkspaceSupervisorConfig,
-        commitments: CommitmentPublisherHandle,
-    ) -> Result<WorkspaceSupervisorHandle> {
+        commitments: C,
+    ) -> Result<WorkspaceSupervisorHandle>
+    where
+        C: CommitmentSink + Clone + Send + 'static,
+    {
         config.validate()?;
         let mut artifacts = ArtifactStoreSink::open(
             config.workspace_root.clone(),
