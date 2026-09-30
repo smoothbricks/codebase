@@ -1043,12 +1043,19 @@ where
             let workspace = match args.target {
                 GrantTarget::Workspace(workspace) => workspace,
                 GrantTarget::Project => {
-                    return grant_project(service, output, json, args.read, args.egress).await;
+                    return grant_project(
+                        service,
+                        output,
+                        json,
+                        args.read,
+                        egress_rules(&args.egress, args.egress_mode),
+                    )
+                    .await;
                 }
             };
             let requested: Vec<PathBuf> =
                 args.read.iter().chain(args.write.iter()).cloned().collect();
-            let egress = egress_rules(&args.egress);
+            let egress = egress_rules(&args.egress, args.egress_mode);
             let grants = if changed {
                 service
                     .grant(
@@ -1727,22 +1734,16 @@ fn emit_mount<W: Write, E: Write>(
     }
 }
 
-/// Every grant this workspace holds, one per line: what it may read, write, and reach.
-///
-/// Network reach is listed beside filesystem reach because it is a grant like any other — a
-/// host an operator admitted and can be asked to justify. Leaving it out of the listing was how
-/// `cowshed grant <ws>` could answer "nothing here" for a workspace that could reach a
-/// registry. The ports are the effective ones, so the line says what is admitted rather than
-/// what happened to be typed.
-/// Egress rules for hosts named on the command line: the ports an intercept grant defaults to. The
-/// mode and the per-port narrowing belong to trusted policy, not to a flag on this verb.
-fn egress_rules(hosts: &[String]) -> Vec<EgressRule> {
+/// Egress rules for hosts named on the command line: the ports a grant defaults to, in the mode
+/// the invocation names (`--opaque`, or intercepted). A host holds one rule, so the controller
+/// replaces any rule the host already has with this one.
+fn egress_rules(hosts: &[String], mode: EgressMode) -> Vec<EgressRule> {
     hosts
         .iter()
         .map(|host| EgressRule {
             host: host.clone(),
             ports: Vec::new(),
-            mode: EgressMode::default(),
+            mode,
             impersonate: None,
         })
         .collect()
@@ -1754,14 +1755,14 @@ async fn grant_project<S: CliService, W: Write, E: Write>(
     output: &mut Output<W, E>,
     json: bool,
     read: Vec<PathBuf>,
-    egress: Vec<String>,
+    egress: Vec<EgressRule>,
 ) -> Result<DispatchExit> {
     let changed = !read.is_empty() || !egress.is_empty();
     let grants = if changed {
         service
             .grant_project(ProjectGrantDelta {
                 read,
-                egress: egress_rules(&egress),
+                egress,
                 expected_revision: None,
             })
             .await?
@@ -1801,6 +1802,13 @@ async fn grant_project<S: CliService, W: Write, E: Write>(
     Ok(success())
 }
 
+/// Every grant this workspace holds, one per line: what it may read, write, and reach.
+///
+/// Network reach is listed beside filesystem reach because it is a grant like any other — a
+/// host an operator admitted and can be asked to justify. Leaving it out of the listing was how
+/// `cowshed grant <ws>` could answer "nothing here" for a workspace that could reach a
+/// registry. The ports are the effective ones, so the line says what is admitted rather than
+/// what happened to be typed.
 fn emit_grants<W: Write, E: Write>(output: &mut Output<W, E>, grants: &GrantSet) -> Result<()> {
     for (kind, paths) in [
         (b"read".as_slice(), &grants.read),

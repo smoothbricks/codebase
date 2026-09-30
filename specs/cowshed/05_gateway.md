@@ -74,18 +74,21 @@ Three tiers, never mixed:
 - **Granted hosts.** `cowshed grant <ws> --egress <host>` defaults to `mode: "intercept"`, which admits `GET` and `HEAD`
   on the whole origin plus `POST` to a path ending in `/git-upload-pack` — git's smart-HTTP fetch, a read git can only
   express as a POST (protocol v2 posts even the ref listing); `git-receive-pack` and every other write are refused.
-  `--opaque` selects a byte tunnel with host-only audit and no injection. `--impersonate <profile>` affects the outbound
-  intercepted leg only and suppresses all injected headers. A project's standing egress grants
-  (`cowshed grant --project-wide --egress <host>`, 04_sandbox.md) join every workspace's own. Unmatched destinations are
-  denied.
+  `cowshed grant <ws> --egress <host> --opaque` grants the hosts of that invocation as a byte tunnel with host-only
+  audit and no injection; a host holds one rule, so granting it again restates its mode. A rule's `impersonate` profile
+  (settable through the coordinator API's `EgressRule`, not a CLI flag) affects the outbound intercepted leg only and
+  suppresses all injected headers. A project's standing egress grants
+  (`cowshed grant --project-wide --egress <host> [--opaque]`, 04_sandbox.md) join every workspace's own. Unmatched
+  destinations are denied.
 
 ## Endpoints (data plane, per-workspace endpoint)
 
 The HTTP URL base is `http://127.0.0.1:<portBlock.base>` on macOS and exactly `http://127.0.0.1:7644` on Linux. Thus
-Bun/npm uses `<base>/npm`, Cargo uses `sparse+<base>/cargo/`, Go uses `<base>/go`, and generic
-`HTTP_PROXY`/`HTTPS_PROXY` (and lowercase equivalents) use `<base>`. On Linux the trusted connector carries these byte
-streams to the mounted Unix socket; clients never speak HTTP over Unix sockets. Endpoint selection and the token still
-authenticate every request.
+Bun/npm uses `<base>/npm`, a client configured for it uses `sparse+<base>/cargo/` (workspace cargo reaches crates.io
+through intercepted egress, 03_caches.md), and generic `HTTP_PROXY`/`HTTPS_PROXY` (and lowercase equivalents) use
+`<base>`. Go uses none of them: it fetches from `proxy.golang.org` through an opaque tunnel (03_caches.md), because it
+sends no credential to plain HTTP. On Linux the trusted connector carries these byte streams to the mounted Unix socket;
+clients never speak HTTP over Unix sockets. Endpoint selection and the token still authenticate every request.
 
 ### `/npm/*` — npm registry mirror
 

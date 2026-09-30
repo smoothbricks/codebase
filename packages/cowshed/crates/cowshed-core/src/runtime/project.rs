@@ -7740,7 +7740,7 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
             }
             let previous = policy.grants.clone();
             update_ordered_set(&mut policy.grants.read, delta.read, revoke);
-            update_set(&mut policy.grants.egress, delta.egress, revoke);
+            update_egress(&mut policy.grants.egress, delta.egress, revoke);
             if policy.grants == previous {
                 return Ok(previous);
             }
@@ -10658,7 +10658,7 @@ fn resolve_missing_grant_path(path: &Path) -> Result<PathBuf> {
 fn apply_grant_delta(grants: &mut GrantSet, delta: GrantDelta, revoke: bool) {
     update_ordered_set(&mut grants.read, delta.read, revoke);
     update_ordered_set(&mut grants.write, delta.write, revoke);
-    update_set(&mut grants.egress, delta.egress, revoke);
+    update_egress(&mut grants.egress, delta.egress, revoke);
     update_ordered_set(&mut grants.repos, delta.repos, revoke);
     update_ordered_set(&mut grants.sim, delta.sim, revoke);
 }
@@ -10679,6 +10679,31 @@ fn update_set<T: PartialEq>(current: &mut Vec<T>, delta: Vec<T>, revoke: bool) {
             if !current.contains(&value) {
                 current.push(value);
             }
+        }
+    }
+}
+
+/// A host holds one egress rule: its mode, ports and impersonation are that rule. Granting a host
+/// restates its rule in place, or appends it for a host not yet granted; revoking a host removes
+/// its rule whatever it holds. Comparing whole rules instead left an intercepted and an opaque rule
+/// side by side for one host, so no grant could ever change a host's mode.
+#[cfg(target_os = "macos")]
+fn update_egress(
+    current: &mut Vec<crate::metadata::EgressRule>,
+    delta: Vec<crate::metadata::EgressRule>,
+    revoke: bool,
+) {
+    for rule in delta {
+        match (
+            current.iter().position(|held| held.host == rule.host),
+            revoke,
+        ) {
+            (Some(index), true) => {
+                current.remove(index);
+            }
+            (Some(index), false) => current[index] = rule,
+            (None, false) => current.push(rule),
+            (None, true) => {}
         }
     }
 }
@@ -10763,6 +10788,56 @@ mod grant_unit_tests {
         assert_eq!(grants.read, [a, z]);
         assert_eq!(grants.write, [output.clone(), output.join("reports")]);
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A host has one egress rule: its mode, ports and impersonation are that rule. Granting a
+    /// host again states its rule anew — that is how an operator turns an intercepted host opaque
+    /// — and revoking a host removes its rule whatever mode it holds.
+    #[test]
+    fn an_egress_grant_restates_its_hosts_rule_and_a_revoke_removes_it_whatever_its_mode() {
+        use crate::metadata::EgressMode;
+        let rule = |host: &str, mode| crate::metadata::EgressRule {
+            host: host.to_owned(),
+            ports: Vec::new(),
+            mode,
+            impersonate: None,
+        };
+        let mut grants = GrantSet {
+            egress: vec![
+                rule("proxy.golang.org", EgressMode::Intercept),
+                rule("registry.example.test", EgressMode::Intercept),
+            ],
+            ..GrantSet::default()
+        };
+
+        apply_grant_delta(
+            &mut grants,
+            GrantDelta {
+                egress: vec![rule("proxy.golang.org", EgressMode::Opaque)],
+                ..GrantDelta::default()
+            },
+            false,
+        );
+        assert_eq!(
+            grants.egress,
+            [
+                rule("proxy.golang.org", EgressMode::Opaque),
+                rule("registry.example.test", EgressMode::Intercept),
+            ]
+        );
+
+        apply_grant_delta(
+            &mut grants,
+            GrantDelta {
+                egress: vec![rule("proxy.golang.org", EgressMode::Intercept)],
+                ..GrantDelta::default()
+            },
+            true,
+        );
+        assert_eq!(
+            grants.egress,
+            [rule("registry.example.test", EgressMode::Intercept)]
+        );
     }
 
     #[test]

@@ -1,6 +1,6 @@
 use clap::error::{ContextKind, ContextValue, ErrorKind};
 use clap::{Arg, ArgAction, ArgMatches, Command as ClapCommand, value_parser};
-use cowshed_core::metadata::{MetadataError, WorkspaceName};
+use cowshed_core::metadata::{EgressMode, MetadataError, WorkspaceName};
 use cowshed_core::repository::RepoId;
 use std::ffi::{OsStr, OsString};
 use std::fmt;
@@ -360,6 +360,9 @@ pub struct GrantArgs {
     /// Hosts this workspace may reach through the gateway. Network reach is a separate decision
     /// from filesystem reach, and separately auditable: the gateway logs every admission.
     pub egress: Vec<String>,
+    /// The mode every `egress` host is granted in: intercepted by default, or `--opaque` for a
+    /// client that cannot trust the workspace CA (a pinned client, or Go on macOS).
+    pub egress_mode: EgressMode,
 }
 
 /// `rm <ws>` — retire one workspace.
@@ -737,7 +740,8 @@ fn cli_command() -> ClapCommand {
                 .arg(positional("workspace", 0..=1))
                 .arg(flag("project-wide"))
                 .args([path_values("read"), path_values("write")])
-                .arg(append_value("egress")),
+                .arg(append_value("egress"))
+                .arg(flag("opaque")),
         )
         .subcommand(leaf("rm").arg(positional("workspace", 0..=1)).args([
             flag("force"),
@@ -2102,17 +2106,18 @@ const GRANT: CommandSpec = CommandSpec {
     missing: "grant requires a workspace",
     args: "<ws>",
     trailing: "",
-    summary: "grant filesystem and network access",
+    summary: "grant paths and network access",
     about: &[
         "Adds read-only or writable host paths to one workspace's sandbox grant snapshot. Paths are normalized, deduplicated, sorted, and recorded outside the workspace image; they apply from the next exec or shell. With no flags, prints the current filesystem grants.",
         "A grant cannot cover the workspace mount, another cowshed mount, controller state, project policy roots, or credential-bearing paths.",
         "A path is recorded under its resolved spelling. A symlink planted beside the workspace so `../<name>` resolves (for example `<shed>/<org>/<project>/<name>` pointing at a sibling repository) is readable through the link exactly when its target is granted; grant the target, not the link.",
         "`--project-wide` changes the project's standing grants instead: read paths and egress hosts every workspace of the project — main, new, and forks — runs under in addition to its own, from its next exec or shell. They live in the trusted project policy; a fork never copies another workspace's own grants. A write grant stays per workspace. With no other flags, prints the project's standing grants.",
+        "An egress host is intercepted by default: the gateway terminates its TLS under the workspace CA, audits each request, and can attach a credential the host holds. `--opaque` grants the hosts named in the same invocation as opaque tunnels instead, for a client that verifies the real certificate — a pinned client, or Go on macOS, whose platform verifier never trusts the workspace CA. A host holds one rule, so granting it again restates its mode.",
     ],
     options: &[
         Opt {
             spelling: "--project-wide",
-            meaning: "change or print the project's standing grants instead of one workspace's; takes --read and --egress",
+            meaning: "change or print the project's standing grants instead of one workspace's; takes --read, --egress and --opaque",
         },
         Opt {
             spelling: "--read <path...>",
@@ -2125,6 +2130,10 @@ const GRANT: CommandSpec = CommandSpec {
         Opt {
             spelling: "--egress <host>",
             meaning: "allow this workspace to reach one host through the gateway; repeat the flag to add more",
+        },
+        Opt {
+            spelling: "--opaque",
+            meaning: "grant this invocation's --egress hosts as opaque tunnels instead of intercepted ones",
         },
     ],
 };
@@ -2154,6 +2163,18 @@ fn parse_grant(matches: &ArgMatches) -> Result<Command, UsageError> {
             USAGE.missing,
         )?)
     };
+    let egress = appended_values(matches, "egress", USAGE)?;
+    let egress_mode = if flagged(matches, "opaque") {
+        if egress.is_empty() {
+            return Err(UsageError::new(
+                "--opaque sets the mode of the hosts --egress grants; name at least one --egress <host>",
+                USAGE,
+            ));
+        }
+        EgressMode::Opaque
+    } else {
+        EgressMode::Intercept
+    };
     Ok(Command::Grant(GrantArgs {
         target,
         read: matches
@@ -2164,7 +2185,8 @@ fn parse_grant(matches: &ArgMatches) -> Result<Command, UsageError> {
             .get_many::<PathBuf>("write")
             .map(|paths| paths.cloned().collect())
             .unwrap_or_default(),
-        egress: appended_values(matches, "egress", USAGE)?,
+        egress,
+        egress_mode,
     }))
 }
 
@@ -2715,6 +2737,61 @@ mod tests {
         // Without a target the verb still asks for the workspace, as before.
         let missing = parse_args(["grant", "--read", "/opt/shared"]).expect_err("no target");
         assert!(missing.message.contains("grant requires a workspace"));
+    }
+
+    /// `--opaque` is the mode of the hosts the same invocation grants, for the workspace or the
+    /// whole project alike; without a host to apply to it names nothing and is refused.
+    #[test]
+    fn opaque_grants_the_invocations_egress_hosts_as_tunnels() {
+        for (argv, target) in [
+            (
+                vec!["grant", "raven", "--egress", "proxy.golang.org", "--opaque"],
+                GrantTarget::Workspace("raven".to_owned()),
+            ),
+            (
+                vec![
+                    "grant",
+                    "--project-wide",
+                    "--opaque",
+                    "--egress",
+                    "proxy.golang.org",
+                    "--egress",
+                    "sum.golang.org",
+                ],
+                GrantTarget::Project,
+            ),
+        ] {
+            let Command::Grant(grant) = parse_args(argv.clone()).expect("parses").command else {
+                panic!("expected grant")
+            };
+            assert_eq!(grant.target, target, "{argv:?}");
+            assert_eq!(grant.egress_mode, EgressMode::Opaque, "{argv:?}");
+        }
+        let Command::Grant(intercepted) = parse_args(["grant", "raven", "--egress", "github.com"])
+            .expect("parses")
+            .command
+        else {
+            panic!("expected grant")
+        };
+        assert_eq!(intercepted.egress_mode, EgressMode::Intercept);
+
+        for refused in [
+            vec!["grant", "raven", "--opaque"],
+            vec![
+                "grant",
+                "--project-wide",
+                "--opaque",
+                "--read",
+                "/opt/shared",
+            ],
+        ] {
+            let error = parse_args(refused.clone()).expect_err("refused");
+            assert!(
+                error.message.contains("--egress"),
+                "{refused:?}: {}",
+                error.message
+            );
+        }
     }
 
     /// The pre-parse walk answers about output shape exactly as the parser would, and it does not

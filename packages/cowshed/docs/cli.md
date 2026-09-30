@@ -690,7 +690,7 @@ walkthrough, Expo included, is [ios.md](ios.md).
 
 ## Sandbox grants
 
-### `cowshed grant <name> [--read <path...>] [--write <path...>] [--egress <host>]`
+### `cowshed grant <name> [--read <path...>] [--write <path...>] [--egress <host>] [--opaque]`
 
 Workspaces start **closed**: write access to their own volume, `/private/cowshed/caches`, and temp; read access to the
 toolchains and system; egress to the localhost gateway only. Widen filesystem and network access per workspace:
@@ -718,6 +718,11 @@ next: cowshed exec raven -- <retry your command>
   80). Network reach is a separate decision from filesystem reach and a separately auditable one: the gateway logs every
   admission (`cowshed audit`). Holding a credential for a registry does not grant reach to it, and granting reach does
   not hand the workspace a credential — see [`cowshed credential`](#cowshed-credential-addlsstatusrm).
+- `--opaque` grants the invocation's `--egress` hosts as opaque tunnels instead: the gateway forwards encrypted bytes
+  with host-only audit and no injection, and the client verifies the real certificate. It is for clients that cannot
+  trust the workspace CA — certificate-pinning clients, and Go on macOS
+  (`cowshed grant --project-wide --egress proxy.golang.org --egress sum.golang.org --opaque`). A host holds one rule, so
+  granting it again restates its mode: `--egress <host>` alone turns it back to intercepted.
 - Egress grants apply immediately: the gateway reads the current policy per request, with no re-exec.
 - `cowshed grant <name>` with no flags prints the current grant set (TSV; `--json` for the envelope):
 
