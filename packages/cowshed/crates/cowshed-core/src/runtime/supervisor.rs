@@ -1118,35 +1118,45 @@ fn private_environment_error(error: io::Error) -> CowshedError {
     }
 }
 
-/// Points [`sandbox_runtime_link`] at the runtime dir and sweeps every `/tmp/cs-*` link whose
-/// target is gone - a retired workspace takes its mount with it and leaves the link dangling.
-/// Host-side, before the child spawns; idempotent.
+/// Points [`sandbox_runtime_link`] at the runtime dir. Host-side, before the child spawns;
+/// idempotent.
 async fn link_runtime_dir(sandbox: &SandboxConfig, runtime_dir: &Path) -> Result<()> {
-    let link = sandbox_runtime_link(sandbox);
+    point_runtime_link(&sandbox_runtime_link(sandbox), runtime_dir).await
+}
+
+/// Points `link` at `runtime_dir`. A link that already points there is the whole answer: every
+/// spawn of a live workspace takes that path, so it reads one link and nothing else. Creating or
+/// retargeting the link also sweeps every `cs-*` link beside it whose target is gone - a retired
+/// workspace takes its mount with it and leaves the link dangling - so the scan of the shared
+/// directory is paid once per link a workspace takes, never once per command.
+async fn point_runtime_link(link: &Path, runtime_dir: &Path) -> Result<()> {
     let io = |what: &str, path: &Path, error: std::io::Error| {
         CowshedError::environment_missing(
             format!("cannot {what} {}: {error}", path.display()),
             "reattach the workspace and retry",
         )
     };
-    match tokio::fs::read_link(&link).await {
-        Ok(target) if target == runtime_dir => {}
+    match tokio::fs::read_link(link).await {
+        Ok(target) if target == runtime_dir => return Ok(()),
         Ok(_) => {
-            tokio::fs::remove_file(&link)
+            tokio::fs::remove_file(link)
                 .await
-                .map_err(|error| io("replace runtime link", &link, error))?;
-            tokio::fs::symlink(runtime_dir, &link)
+                .map_err(|error| io("replace runtime link", link, error))?;
+            tokio::fs::symlink(runtime_dir, link)
                 .await
-                .map_err(|error| io("create runtime link", &link, error))?;
+                .map_err(|error| io("create runtime link", link, error))?;
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            tokio::fs::symlink(runtime_dir, &link)
+            tokio::fs::symlink(runtime_dir, link)
                 .await
-                .map_err(|error| io("create runtime link", &link, error))?;
+                .map_err(|error| io("create runtime link", link, error))?;
         }
-        Err(error) => return Err(io("inspect runtime link", &link, error)),
+        Err(error) => return Err(io("inspect runtime link", link, error)),
     }
-    let mut entries = match tokio::fs::read_dir("/tmp").await {
+    let Some(directory) = link.parent() else {
+        return Ok(());
+    };
+    let mut entries = match tokio::fs::read_dir(directory).await {
         Ok(entries) => entries,
         Err(_) => return Ok(()),
     };
@@ -4429,6 +4439,42 @@ mod workspace_toolchain_tests {
         assert!(
             !private.join("home/.netrc").exists(),
             "the netrc a previous wiring left, token and all, is gone"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Every spawn of a live workspace finds its link already in place, so it must not scan the
+    /// directory the links share (on a busy host `/tmp` holds thousands of entries); only taking
+    /// a link sweeps the dangling ones a retired workspace left beside it.
+    #[tokio::test]
+    async fn only_taking_a_runtime_link_sweeps_the_dangling_links_beside_it() {
+        let root = scratch("runtime-link");
+        let runtime = root.join("run");
+        let links = root.join("links");
+        std::fs::create_dir_all(&runtime).expect("runtime dir");
+        std::fs::create_dir_all(&links).expect("link directory");
+        let dangling = links.join("cs-retired");
+        std::os::unix::fs::symlink(root.join("retired/run"), &dangling).expect("dangling link");
+        let live = links.join("cs-live");
+        std::os::unix::fs::symlink(&runtime, &live).expect("live link");
+
+        point_runtime_link(&live, &runtime)
+            .await
+            .expect("current link");
+        assert!(
+            dangling.symlink_metadata().is_ok(),
+            "a link already in place reads only itself"
+        );
+
+        let taken = links.join("cs-taken");
+        point_runtime_link(&taken, &runtime)
+            .await
+            .expect("taken link");
+        assert_eq!(std::fs::read_link(&taken).expect("taken link"), runtime);
+        assert_eq!(std::fs::read_link(&live).expect("live link"), runtime);
+        assert!(
+            dangling.symlink_metadata().is_err(),
+            "taking a link sweeps the dangling one"
         );
         std::fs::remove_dir_all(&root).ok();
     }
