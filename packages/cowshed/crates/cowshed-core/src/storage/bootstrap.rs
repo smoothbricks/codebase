@@ -70,6 +70,7 @@ const MARKER_VERSION: u32 = 1;
 pub struct CowshedConfig {
     substrate: Option<SubstrateConfig>,
     devenv: Option<DevenvConfig>,
+    land: Option<LandConfig>,
 }
 
 impl CowshedConfig {
@@ -79,6 +80,10 @@ impl CowshedConfig {
 
     pub fn devenv(&self) -> Option<&DevenvConfig> {
         self.devenv.as_ref()
+    }
+
+    pub fn land(&self) -> Option<&LandConfig> {
+        self.land.as_ref()
     }
 }
 
@@ -104,10 +109,25 @@ impl DevenvConfig {
     }
 }
 
+/// What `land` does after it moves the target: `[land] warm`, the argv main's workspace runs so
+/// every later clone of main starts warm.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LandConfig {
+    /// Never empty, and no element is empty: the parser refuses both.
+    warm: Vec<String>,
+}
+
+impl LandConfig {
+    pub fn warm(&self) -> &[String] {
+        &self.warm
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ConfigSection {
     Substrate,
     Devenv,
+    Land,
 }
 
 impl ConfigSection {
@@ -115,21 +135,25 @@ impl ConfigSection {
         match self {
             Self::Substrate => "substrate",
             Self::Devenv => "devenv",
+            Self::Land => "land",
         }
     }
 }
 
 /// Parse the complete repository-owned cowshed configuration.
 ///
-/// Only `[substrate]` and `[devenv]` are accepted. Keeping this parser narrow means a typo never
-/// silently disables either storage selection or workspace toolchain evaluation.
+/// Only `[substrate]`, `[devenv]` and `[land]` are accepted. Keeping this parser narrow means a
+/// typo never silently disables storage selection, workspace toolchain evaluation, or main's warm
+/// step.
 pub fn parse_cowshed_config(input: &str) -> Result<CowshedConfig, ConfigError> {
     let mut current = None;
     let mut saw_substrate = false;
     let mut saw_devenv = false;
+    let mut saw_land = false;
     let mut kind = None;
     let mut pool = None;
     let mut devenv_dir = None;
+    let mut warm = None;
 
     for (index, original) in input.lines().enumerate() {
         let line_number = index + 1;
@@ -146,11 +170,13 @@ pub fn parse_cowshed_config(input: &str) -> Result<CowshedConfig, ConfigError> {
             let section = match section {
                 "substrate" => ConfigSection::Substrate,
                 "devenv" => ConfigSection::Devenv,
+                "land" => ConfigSection::Land,
                 other => return Err(ConfigError::UnknownSection(other.to_owned())),
             };
             let seen = match section {
                 ConfigSection::Substrate => &mut saw_substrate,
                 ConfigSection::Devenv => &mut saw_devenv,
+                ConfigSection::Land => &mut saw_land,
             };
             if *seen {
                 return Err(ConfigError::DuplicateSection(section.name()));
@@ -164,32 +190,28 @@ pub fn parse_cowshed_config(input: &str) -> Result<CowshedConfig, ConfigError> {
         let (key, value) = line
             .split_once('=')
             .ok_or(ConfigError::MalformedLine { line: line_number })?;
-        let key = key.trim();
-        let value = parse_toml_string(value.trim(), section, line_number)?;
-        match (section, key) {
-            (ConfigSection::Substrate, "kind") => {
-                if kind.replace(value).is_some() {
-                    return Err(ConfigError::DuplicateKey {
-                        section: section.name(),
-                        key: "kind",
-                    });
-                }
-            }
-            (ConfigSection::Substrate, "pool") => {
-                if pool.replace(value).is_some() {
-                    return Err(ConfigError::DuplicateKey {
-                        section: section.name(),
-                        key: "pool",
-                    });
-                }
-            }
-            (ConfigSection::Devenv, "dir") => {
-                if devenv_dir.replace(value).is_some() {
-                    return Err(ConfigError::DuplicateKey {
-                        section: section.name(),
-                        key: "dir",
-                    });
-                }
+        let value = value.trim();
+        match (section, key.trim()) {
+            (ConfigSection::Substrate, "kind") => set_once(
+                &mut kind,
+                parse_toml_string(value, section, line_number)?,
+                section,
+                "kind",
+            )?,
+            (ConfigSection::Substrate, "pool") => set_once(
+                &mut pool,
+                parse_toml_string(value, section, line_number)?,
+                section,
+                "pool",
+            )?,
+            (ConfigSection::Devenv, "dir") => set_once(
+                &mut devenv_dir,
+                parse_toml_string(value, section, line_number)?,
+                section,
+                "dir",
+            )?,
+            (ConfigSection::Land, "warm") => {
+                set_once(&mut warm, parse_argv(value, line_number)?, section, "warm")?;
             }
             (_, other) => {
                 return Err(ConfigError::UnknownKey {
@@ -228,7 +250,44 @@ pub fn parse_cowshed_config(input: &str) -> Result<CowshedConfig, ConfigError> {
     } else {
         None
     };
-    Ok(CowshedConfig { substrate, devenv })
+    let land = if saw_land {
+        Some(LandConfig {
+            warm: warm.ok_or(ConfigError::MissingKey {
+                section: "land",
+                key: "warm",
+            })?,
+        })
+    } else {
+        None
+    };
+    Ok(CowshedConfig {
+        substrate,
+        devenv,
+        land,
+    })
+}
+
+fn set_once<T>(
+    slot: &mut Option<T>,
+    value: T,
+    section: ConfigSection,
+    key: &'static str,
+) -> Result<(), ConfigError> {
+    if slot.replace(value).is_some() {
+        return Err(ConfigError::DuplicateKey {
+            section: section.name(),
+            key,
+        });
+    }
+    Ok(())
+}
+
+/// An argv, written as a TOML array of basic strings on one line: exactly JSON's array syntax.
+fn parse_argv(value: &str, line: usize) -> Result<Vec<String>, ConfigError> {
+    match serde_json::from_str::<Vec<String>>(value) {
+        Ok(argv) if !argv.is_empty() && argv.iter().all(|arg| !arg.is_empty()) => Ok(argv),
+        _ => Err(ConfigError::ExpectedArgv { line }),
+    }
 }
 
 fn validate_devenv_dir(value: &str) -> Result<PathBuf, ConfigError> {
@@ -293,6 +352,8 @@ pub enum ConfigError {
     UnsupportedKind(String),
     #[error("[{section}] value at line {line} must be a quoted string")]
     ExpectedQuotedString { section: &'static str, line: usize },
+    #[error("[land] warm at line {line} must be a non-empty array of non-empty strings")]
+    ExpectedArgv { line: usize },
     #[error("invalid ZFS pool: {0}")]
     InvalidPool(PoolNameError),
     #[error("[devenv] dir must be a non-empty relative path without `..`: {0:?}")]

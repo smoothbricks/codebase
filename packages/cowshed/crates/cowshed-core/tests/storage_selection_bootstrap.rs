@@ -221,6 +221,53 @@ fn devenv_dir_rejects_absolute_parent_and_empty_paths() {
 }
 
 #[test]
+fn land_warm_is_one_non_empty_argv() {
+    let config =
+        parse_cowshed_config("[land]\nwarm = [\"tooling/warm-main\", \"--all\"] # after land\n")
+            .unwrap();
+    assert_eq!(
+        config.land().unwrap().warm(),
+        ["tooling/warm-main", "--all"]
+    );
+    assert_eq!(
+        parse_cowshed_config("[devenv]\ndir = \"x\"\n")
+            .unwrap()
+            .land(),
+        None
+    );
+
+    let invalid = [
+        ("[land]\n", "missing [land] key \"warm\""),
+        (
+            "[land]\nwarm = []\n",
+            "non-empty array of non-empty strings",
+        ),
+        (
+            "[land]\nwarm = [\"\"]\n",
+            "non-empty array of non-empty strings",
+        ),
+        (
+            "[land]\nwarm = \"tooling/warm-main\"\n",
+            "non-empty array of non-empty strings",
+        ),
+        (
+            "[land]\nwarm = [\"a\", 1]\n",
+            "non-empty array of non-empty strings",
+        ),
+        ("[land]\nwarm = [\"a\"]\nwarm = [\"b\"]\n", "duplicated"),
+        ("[land]\ncheck = \"cargo test\"\n", "unknown [land] key"),
+        (
+            "[land]\nwarm = [\"a\"]\n[land]\nwarm = [\"a\"]\n",
+            "duplicated",
+        ),
+    ];
+    for (source, message) in invalid {
+        let error = parse_cowshed_config(source).unwrap_err();
+        assert!(error.to_string().contains(message), "{source:?}: {error}");
+    }
+}
+
+#[test]
 fn selection_matrix_uses_evidence_without_guessing() {
     let apfs = select_substrate(apfs_evidence(), None).unwrap();
     assert!(matches!(
