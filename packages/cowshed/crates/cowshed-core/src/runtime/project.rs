@@ -2,6 +2,7 @@
 use std::fs;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -239,24 +240,28 @@ pub trait ProjectRuntimeHost: Send + 'static {
         incarnation: WorkspaceIncarnation,
         job: JobId,
     ) -> Result<JobInfo>;
+    /// The job's terminal record, once it has one.
     async fn wait_job(
         &mut self,
         workspace: WorkspaceName,
         incarnation: WorkspaceIncarnation,
         job: JobId,
-    ) -> Result<JobInfo>;
+    ) -> Result<JobAnswer<JobInfo>>;
+    /// Stop the job; answered once it has ended.
     async fn kill_job(
         &mut self,
         workspace: WorkspaceName,
         incarnation: WorkspaceIncarnation,
         job: JobId,
-    ) -> Result<()>;
+    ) -> Result<JobAnswer<()>>;
     async fn detach_job(
         &mut self,
         workspace: WorkspaceName,
         incarnation: WorkspaceIncarnation,
         job: JobId,
     ) -> Result<()>;
+    /// Bytes of one stream from `offset`; a follow read is answered once there are some or
+    /// the stream has ended.
     async fn read_log(
         &mut self,
         workspace: WorkspaceName,
@@ -265,8 +270,16 @@ pub trait ProjectRuntimeHost: Send + 'static {
         stream: RuntimeJobStream,
         offset: u64,
         follow: bool,
-    ) -> Result<RuntimeLogChunk>;
+    ) -> Result<JobAnswer<RuntimeLogChunk>>;
 }
+
+/// An answer a job gives when it reaches a point — its end, its next output — and so may take
+/// as long as the job runs.
+///
+/// The host resolves the job under the router's `&mut self` and hands this back; the router
+/// awaits it on a task of its own. A router that awaited it in place would hold every other
+/// request, of every client, until the job reached that point.
+pub type JobAnswer<T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'static>>;
 
 /// Cloneable ingress plus ownership of the single Tokio actor task.
 pub struct ProjectRuntime {
@@ -611,6 +624,12 @@ fn startup_conflict_exhausted(conflict: &crate::storage::lifecycle::Conflict) ->
     )
 }
 
+/// The router's answer to one request: ready now, or when the job it waits on gets there.
+enum Routed {
+    Now(RouterResponse),
+    Later(JobAnswer<RouterResponse>),
+}
+
 struct ProjectActor {
     host: Box<dyn ProjectRuntimeHost>,
     receiver: mpsc::Receiver<RouterCommand>,
@@ -624,15 +643,36 @@ impl ProjectActor {
     async fn run(mut self) {
         while let Some(command) = self.receiver.recv().await {
             let (request, reply) = command.into_parts();
-            let response = self.route(request).await;
+            let routed = self.route(request).await;
             self.host.release_intent_leases();
-            let _ = reply.send(response);
+            match routed {
+                Ok(Routed::Now(response)) => {
+                    let _ = reply.send(Ok(response));
+                }
+                Ok(Routed::Later(answer)) => {
+                    tokio::spawn(async move {
+                        let _ = reply.send(answer.await);
+                    });
+                }
+                Err(error) => {
+                    let _ = reply.send(Err(error));
+                }
+            }
         }
     }
 
-    async fn route(&mut self, request: RouterRequest) -> Result<RouterResponse> {
+    async fn route(&mut self, request: RouterRequest) -> Result<Routed> {
         self.validate_connection_authority(request.authority())?;
         let _span = crate::timing::span_named("route", || request.method().to_owned());
+        match request.method() {
+            "job.logs" => self.job_logs(request).await.map(Routed::Later),
+            "job.wait" => self.job_wait(request).await.map(Routed::Later),
+            "job.kill" => self.job_kill(request).await.map(Routed::Later),
+            _ => self.route_now(request).await.map(Routed::Now),
+        }
+    }
+
+    async fn route_now(&mut self, request: RouterRequest) -> Result<RouterResponse> {
         match request.method() {
             "project.open" => self.project_open(request).await,
             "project.workspace" => self.project_workspace(request).await,
@@ -674,10 +714,7 @@ impl ProjectActor {
             "worker.job" | "job.status" => self.worker_job_info(request).await,
             "worker.checkpoint" => self.worker_checkpoint(request).await,
             "worker.push" => self.worker_push(request).await,
-            "job.logs" => self.job_logs(request).await,
             "job.detach" => self.job_detach(request).await,
-            "job.wait" => self.job_wait(request).await,
-            "job.kill" => self.job_kill(request).await,
             "session.close" => self.session_close(request).await,
             method => Err(CowshedError::usage(
                 format!("unknown controller method {method}"),
@@ -1137,7 +1174,7 @@ impl ProjectActor {
         )
     }
 
-    async fn job_logs(&mut self, request: RouterRequest) -> Result<RouterResponse> {
+    async fn job_logs(&mut self, request: RouterRequest) -> Result<JobAnswer<RouterResponse>> {
         let params: LogsParams = decode_params(request.params(), request.method())?;
         self.require_scoped_workspace(request.authority(), &params.repo_id, &params.workspace)
             .await?;
@@ -1152,15 +1189,18 @@ impl ProjectActor {
                 params.follow,
             )
             .await?;
-        if chunk.bytes.len() > MAX_LOG_CHUNK_BYTES {
-            return Err(CowshedError::internal(
-                "supervisor returned a log chunk larger than the transport frame",
-            ));
-        }
-        RouterResponse::binary(
-            json!({ "eof": chunk.eof, "nextOffset": chunk.next_offset }),
-            chunk.bytes,
-        )
+        Ok(Box::pin(async move {
+            let chunk = chunk.await?;
+            if chunk.bytes.len() > MAX_LOG_CHUNK_BYTES {
+                return Err(CowshedError::internal(
+                    "supervisor returned a log chunk larger than the transport frame",
+                ));
+            }
+            RouterResponse::binary(
+                json!({ "eof": chunk.eof, "nextOffset": chunk.next_offset }),
+                chunk.bytes,
+            )
+        }))
     }
 
     async fn job_detach(&mut self, request: RouterRequest) -> Result<RouterResponse> {
@@ -1177,33 +1217,37 @@ impl ProjectActor {
         json_response(EmptyResult {})
     }
 
-    async fn job_wait(&mut self, request: RouterRequest) -> Result<RouterResponse> {
+    async fn job_wait(&mut self, request: RouterRequest) -> Result<JobAnswer<RouterResponse>> {
         let params: JobParams = decode_params(request.params(), request.method())?;
         self.require_scoped_workspace(request.authority(), &params.repo_id, &params.workspace)
             .await?;
-        json_response(
-            self.host
-                .wait_job(
-                    params.workspace,
-                    params.workspace_incarnation,
-                    params.job_id,
-                )
-                .await?,
-        )
+        let info = self
+            .host
+            .wait_job(
+                params.workspace,
+                params.workspace_incarnation,
+                params.job_id,
+            )
+            .await?;
+        Ok(Box::pin(async move { json_response(info.await?) }))
     }
 
-    async fn job_kill(&mut self, request: RouterRequest) -> Result<RouterResponse> {
+    async fn job_kill(&mut self, request: RouterRequest) -> Result<JobAnswer<RouterResponse>> {
         let params: JobParams = decode_params(request.params(), request.method())?;
         self.require_scoped_workspace(request.authority(), &params.repo_id, &params.workspace)
             .await?;
-        self.host
+        let ended = self
+            .host
             .kill_job(
                 params.workspace,
                 params.workspace_incarnation,
                 params.job_id,
             )
             .await?;
-        json_response(EmptyResult {})
+        Ok(Box::pin(async move {
+            ended.await?;
+            json_response(EmptyResult {})
+        }))
     }
 
     async fn session_close(&mut self, request: RouterRequest) -> Result<RouterResponse> {
@@ -8771,10 +8815,11 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
         workspace: WorkspaceName,
         incarnation: WorkspaceIncarnation,
         job: JobId,
-    ) -> Result<JobInfo> {
+    ) -> Result<JobAnswer<JobInfo>> {
         let current = self.current(&workspace).await?;
         Self::require_exact_incarnation(&current, &incarnation)?;
-        self.ensure_supervisor(&workspace).await?.wait(job).await
+        let supervisor = self.ensure_supervisor(&workspace).await?;
+        Ok(Box::pin(async move { supervisor.wait(job).await }))
     }
 
     async fn kill_job(
@@ -8782,10 +8827,11 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
         workspace: WorkspaceName,
         incarnation: WorkspaceIncarnation,
         job: JobId,
-    ) -> Result<()> {
+    ) -> Result<JobAnswer<()>> {
         let current = self.current(&workspace).await?;
         Self::require_exact_incarnation(&current, &incarnation)?;
-        self.ensure_supervisor(&workspace).await?.kill(job).await
+        let supervisor = self.ensure_supervisor(&workspace).await?;
+        Ok(Box::pin(async move { supervisor.kill(job).await }))
     }
 
     async fn detach_job(
@@ -8808,20 +8854,19 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
         stream: RuntimeJobStream,
         offset: u64,
         follow: bool,
-    ) -> Result<RuntimeLogChunk> {
+    ) -> Result<JobAnswer<RuntimeLogChunk>> {
         let current = self.current(&workspace).await?;
         Self::require_exact_incarnation(&current, &incarnation)?;
         let stream = crate::storage::job_artifact::StreamKind::from(stream);
-        let chunk = self
-            .ensure_supervisor(&workspace)
-            .await?
-            .log_read(job, stream, offset, follow)
-            .await?;
-        Ok(RuntimeLogChunk {
-            bytes: chunk.bytes,
-            next_offset: chunk.next_offset,
-            eof: chunk.eof,
-        })
+        let supervisor = self.ensure_supervisor(&workspace).await?;
+        Ok(Box::pin(async move {
+            let chunk = supervisor.log_read(job, stream, offset, follow).await?;
+            Ok(RuntimeLogChunk {
+                bytes: chunk.bytes,
+                next_offset: chunk.next_offset,
+                eof: chunk.eof,
+            })
+        }))
     }
 }
 

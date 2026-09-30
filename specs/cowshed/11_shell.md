@@ -267,8 +267,10 @@ produced them, and the new allocator starts above the inherited maximum. Thus th
 `(repoId, workspaceIncarnation, jobId)`: `jobId` is the familiar workspace-local handle, while the full tuple remains
 unique across checkpoint copies and recycled workspace names.
 
-- **Soft timeout → auto-background.** A foreground command still running at its soft timeout (`--timeout`, default
-  `[shell] soft_timeout` = 120 s) is detached. Before acknowledging detachment, the supervisor promotes each
+- **Soft timeout → auto-background.** A foreground command's output streams to the caller while it runs. At its soft
+  timeout (`--timeout`, default `[shell] soft_timeout` = 120 s) the client reads the job's status: a job still running
+  is detached, and a job that ended meanwhile is not — its output is drained to EOF and its exit is the command's,
+  because a finished job has nothing to reattach to. Before acknowledging detachment, the supervisor promotes each
   memory-resident stream prefix to its protected file; the files then keep growing and `job-backgrounded` fires. The
   client already has the job id and can poll or reattach. A later checkpoint uses the barrier/manifest protocol below.
 - **`--background`** forces the same detachment and promotion immediately.

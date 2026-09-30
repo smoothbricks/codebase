@@ -7,7 +7,8 @@ use bytes::Bytes;
 use serde_json::Value;
 use std::num::NonZeroUsize;
 use std::os::fd::OwnedFd;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use std::sync::Arc;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
 
 pub const HANDSHAKE_VERSION: u32 = 1;
@@ -640,7 +641,15 @@ impl RouterHandle {
 }
 
 /// Serves one inherited stream descriptor until a clean disconnect or a fatal protocol failure.
-/// Dropping this future owns only connection state; routed jobs remain owned by the router actor.
+///
+/// Requests arrive in id order and are answered as each completes, not in arrival order: a
+/// request that waits on a job (its end, its next output) must not hold the answers to the
+/// requests behind it. Each answer, with its binary frame, is written whole under the writer
+/// lock. At most [`MAX_IN_FLIGHT_REQUESTS`] are open at once; past that the connection reads no
+/// further request until one completes.
+///
+/// Dropping this future owns only connection state: its unanswered requests are abandoned, and
+/// routed jobs remain owned by the router actor.
 pub async fn serve_controller_connection(
     descriptor: OwnedFd,
     authority: ConnectionAuthority,
@@ -681,116 +690,148 @@ pub async fn serve_controller_connection(
     )
     .await?;
 
+    let (reader, writer) = stream.into_split();
+    let writer = Arc::new(tokio::sync::Mutex::new(writer));
+    let mut answers = tokio::task::JoinSet::new();
+    let mut incoming = std::pin::pin!(next_request(reader));
+    // Set once a request ends the connection: no further request is read, and the loop ends
+    // with the answer that reports it.
+    let mut closing = false;
     let mut next_id = 1_u64;
     loop {
-        let Some(frame) =
-            read_optional_frame(&mut stream, MAX_JSON_FRAME_BYTES, "controller RPC request")
-                .await?
-        else {
-            return Ok(());
-        };
-        let request = codec::decode_rpc_request(&frame).map_err(|error| {
-            protocol_error(format!("controller RPC request is invalid: {error}"))
-        })?;
-        if request.id() != next_id {
-            let error =
-                protocol_error("controller RPC request id was replayed or arrived out of order");
-            write_rpc_error(&mut stream, request.id(), &error).await?;
-            return Err(error);
+        tokio::select! {
+            (reader, request) = incoming.as_mut(),
+                if !closing && answers.len() < MAX_IN_FLIGHT_REQUESTS =>
+            {
+                let Some((request, upload)) = request? else {
+                    return Ok(());
+                };
+                incoming.set(next_request(reader));
+                if request.id() != next_id {
+                    closing = true;
+                    let error = protocol_error(
+                        "controller RPC request id was replayed or arrived out of order",
+                    );
+                    answers.spawn(refuse(Arc::clone(&writer), request.id(), error, true));
+                    continue;
+                }
+                next_id = next_id
+                    .checked_add(1)
+                    .ok_or_else(|| protocol_error("controller RPC request id overflowed"))?;
+                if let Err(error) = validate_request(&authority, &request) {
+                    let fatal = error.code == ErrorCode::Integrity;
+                    closing |= fatal;
+                    answers.spawn(refuse(Arc::clone(&writer), request.id(), error, fatal));
+                    continue;
+                }
+                answers.spawn(answer(
+                    Arc::clone(&writer),
+                    router.clone(),
+                    authority.clone(),
+                    request,
+                    upload,
+                ));
+            }
+            Some(outcome) = answers.join_next() => {
+                outcome.map_err(|error| {
+                    CowshedError::internal(format!("controller RPC answer task failed: {error}"))
+                })??;
+            }
+            // Reading stops only while an answer is open, so one is always pending here.
+            else => {
+                return Err(CowshedError::internal(
+                    "controller connection has no request to read and none to answer",
+                ));
+            }
         }
-        next_id = next_id
-            .checked_add(1)
-            .ok_or_else(|| protocol_error("controller RPC request id overflowed"))?;
+    }
+}
 
-        if let Err(error) = validate_request(&authority, &request) {
-            write_rpc_error(&mut stream, request.id(), &error).await?;
-            if error.code == ErrorCode::Integrity {
+/// Requests one connection may have open at once.
+const MAX_IN_FLIGHT_REQUESTS: usize = 64;
+
+type ConnectionWriter = Arc<tokio::sync::Mutex<tokio::net::unix::OwnedWriteHalf>>;
+
+type IncomingRequest = Option<(codec::DecodedRpcRequest, Option<Bytes>)>;
+
+/// The next request and its upload frame, or `None` at a clean disconnect. The reader comes
+/// back with it, so the connection can ask for the one after.
+async fn next_request(
+    mut reader: tokio::net::unix::OwnedReadHalf,
+) -> (tokio::net::unix::OwnedReadHalf, Result<IncomingRequest>) {
+    let request = read_request(&mut reader).await;
+    (reader, request)
+}
+
+async fn read_request(reader: &mut tokio::net::unix::OwnedReadHalf) -> Result<IncomingRequest> {
+    let Some(frame) =
+        read_optional_frame(reader, MAX_JSON_FRAME_BYTES, "controller RPC request").await?
+    else {
+        return Ok(None);
+    };
+    let request = codec::decode_rpc_request(&frame)
+        .map_err(|error| protocol_error(format!("controller RPC request is invalid: {error}")))?;
+    // The upload frame is read with its request, so a request refused below never leaves it
+    // to be misread as the next one. A declared length beyond any frame is left unread:
+    // validation refuses it, and that ends the connection.
+    let upload = match request.binary_length().map(usize::try_from) {
+        Some(Ok(length)) if length <= MAX_BINARY_FRAME_BYTES => {
+            Some(read_binary_frame(reader, length).await?)
+        }
+        Some(_) | None => None,
+    };
+    Ok(Some((request, upload)))
+}
+
+/// Answer one request with an error; `Err` ends the connection when the error is `fatal`.
+async fn refuse(writer: ConnectionWriter, id: u64, error: CowshedError, fatal: bool) -> Result<()> {
+    write_rpc_error(&mut *writer.lock().await, id, &error).await?;
+    if fatal { Err(error) } else { Ok(()) }
+}
+
+/// Route one request and write its answer; `Err` ends the connection.
+async fn answer(
+    writer: ConnectionWriter,
+    router: RouterHandle,
+    authority: ConnectionAuthority,
+    request: codec::DecodedRpcRequest,
+    upload: Option<Bytes>,
+) -> Result<()> {
+    let download_offset = request
+        .params()
+        .get("offset")
+        .and_then(Value::as_u64)
+        .filter(|_| request.method() == "job.logs");
+    let (request_id, request_method, request_params, _) = request.into_parts();
+    let response = router
+        .route(authority, request_method, request_params, upload)
+        .await;
+    let mut writer = writer.lock().await;
+    let writer = &mut *writer;
+    match response {
+        Ok(response) => {
+            let (result, binary) = response.into_parts();
+            let lane = match (download_offset, binary.as_ref()) {
+                (Some(offset), Some(bytes)) => validate_raw_response(&result, offset, bytes.len()),
+                (Some(_), None) => Err(protocol_error(
+                    "controller router omitted the requested raw-byte lane",
+                )),
+                (None, Some(_)) => Err(protocol_error(
+                    "controller router attempted a second or unsolicited raw-byte lane",
+                )),
+                (None, None) => Ok(()),
+            };
+            if let Err(error) = lane {
+                write_rpc_error(writer, request_id, &error).await?;
                 return Err(error);
             }
-            continue;
-        }
-
-        let download_offset = request
-            .params()
-            .get("offset")
-            .and_then(Value::as_u64)
-            .filter(|_| request.method() == "job.logs");
-        let (request_id, request_method, request_params, binary_length) = request.into_parts();
-
-        let upload = match binary_length {
-            Some(length) => Some(
-                read_binary_frame(
-                    &mut stream,
-                    usize::try_from(length).map_err(|_| {
-                        protocol_error("controller RPC binary length does not fit this platform")
-                    })?,
-                )
-                .await?,
-            ),
-            None => None,
-        };
-
-        let response = router.route(authority.clone(), request_method, request_params, upload);
-        tokio::pin!(response);
-        let response = loop {
-            tokio::select! {
-                response = &mut response => break response,
-                readiness = stream.readable() => {
-                    readiness.map_err(|error| {
-                        connection_error(format!(
-                            "controller RPC disconnect check failed: {error}"
-                        ))
-                    })?;
-                    let mut probe = [0_u8; 1];
-                    match stream.try_read(&mut probe) {
-                        Ok(0) => return Ok(()),
-                        Ok(_) => {
-                            return Err(protocol_error(
-                                "controller RPC requests must not be pipelined",
-                            ));
-                        }
-                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
-                        Err(error) => {
-                            return Err(connection_error(format!(
-                                "controller RPC disconnect check failed: {error}"
-                            )));
-                        }
-                    }
-                }
+            write_rpc_success(writer, request_id, &result, binary.as_ref()).await?;
+            if let Some(binary) = binary {
+                write_binary_frame(writer, &binary).await?;
             }
-        };
-        match response {
-            Ok(response) => {
-                let (result, binary) = response.into_parts();
-                match (download_offset, binary.as_ref()) {
-                    (Some(offset), Some(bytes)) => {
-                        if let Err(error) = validate_raw_response(&result, offset, bytes.len()) {
-                            write_rpc_error(&mut stream, request_id, &error).await?;
-                            return Err(error);
-                        }
-                    }
-                    (Some(_), None) => {
-                        let error =
-                            protocol_error("controller router omitted the requested raw-byte lane");
-                        write_rpc_error(&mut stream, request_id, &error).await?;
-                        return Err(error);
-                    }
-                    (None, Some(_)) => {
-                        let error = protocol_error(
-                            "controller router attempted a second or unsolicited raw-byte lane",
-                        );
-                        write_rpc_error(&mut stream, request_id, &error).await?;
-                        return Err(error);
-                    }
-                    (None, None) => {}
-                }
-                write_rpc_success(&mut stream, request_id, &result, binary.as_ref()).await?;
-                if let Some(binary) = binary {
-                    write_binary_frame(&mut stream, &binary).await?;
-                }
-            }
-            Err(error) => write_rpc_error(&mut stream, request_id, &error).await?,
+            Ok(())
         }
+        Err(error) => write_rpc_error(writer, request_id, &error).await,
     }
 }
 
@@ -914,7 +955,7 @@ fn require_string(
 }
 
 async fn read_required_frame(
-    stream: &mut tokio::net::UnixStream,
+    stream: &mut (impl AsyncRead + Unpin),
     maximum: usize,
     description: &'static str,
 ) -> Result<Vec<u8>> {
@@ -924,7 +965,7 @@ async fn read_required_frame(
 }
 
 async fn read_optional_frame(
-    stream: &mut tokio::net::UnixStream,
+    stream: &mut (impl AsyncRead + Unpin),
     maximum: usize,
     description: &'static str,
 ) -> Result<Option<Vec<u8>>> {
@@ -956,7 +997,7 @@ async fn read_optional_frame(
 }
 
 async fn write_frame(
-    stream: &mut tokio::net::UnixStream,
+    stream: &mut (impl AsyncWrite + Unpin),
     bytes: &[u8],
     maximum: usize,
     description: &'static str,
@@ -972,7 +1013,7 @@ async fn write_frame(
 }
 
 async fn read_binary_frame(
-    stream: &mut tokio::net::UnixStream,
+    stream: &mut (impl AsyncRead + Unpin),
     expected_length: usize,
 ) -> Result<Bytes> {
     if expected_length > MAX_BINARY_FRAME_BYTES {
@@ -1006,7 +1047,7 @@ async fn read_binary_frame(
     Ok(Bytes::from(bytes))
 }
 
-async fn write_binary_frame(stream: &mut tokio::net::UnixStream, bytes: &[u8]) -> Result<()> {
+async fn write_binary_frame(stream: &mut (impl AsyncWrite + Unpin), bytes: &[u8]) -> Result<()> {
     if bytes.len() > MAX_BINARY_FRAME_BYTES {
         return Err(protocol_error(
             "controller RPC binary response exceeds the 64 KiB frame limit",
@@ -1028,7 +1069,7 @@ async fn write_binary_frame(stream: &mut tokio::net::UnixStream, bytes: &[u8]) -
 }
 
 async fn write_rpc_success(
-    stream: &mut tokio::net::UnixStream,
+    stream: &mut (impl AsyncWrite + Unpin),
     id: u64,
     result: &Value,
     binary: Option<&Bytes>,
@@ -1057,7 +1098,7 @@ async fn write_rpc_success(
 }
 
 async fn write_rpc_error(
-    stream: &mut tokio::net::UnixStream,
+    stream: &mut (impl AsyncWrite + Unpin),
     id: u64,
     error: &CowshedError,
 ) -> Result<()> {

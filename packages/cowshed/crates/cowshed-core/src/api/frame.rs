@@ -1,12 +1,11 @@
 use super::peer_credentials::{self, PeerCredentialsError};
 use crate::error::Result;
 use std::os::fd::OwnedFd;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::UnixStream;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Length-prefixed unix-socket frame. Client handshake and server RPC share this codec.
 pub(crate) async fn write_frame(
-    stream: &mut UnixStream,
+    stream: &mut (impl AsyncWrite + Unpin),
     bytes: &[u8],
     maximum: usize,
     map_invalid: impl Fn() -> crate::error::CowshedError,
@@ -24,7 +23,7 @@ pub(crate) async fn write_frame(
 }
 
 pub(crate) async fn read_frame(
-    stream: &mut UnixStream,
+    stream: &mut (impl AsyncRead + Unpin),
     maximum: usize,
     map_invalid: impl Fn() -> crate::error::CowshedError,
     map_io: impl Fn(std::io::Error) -> crate::error::CowshedError,

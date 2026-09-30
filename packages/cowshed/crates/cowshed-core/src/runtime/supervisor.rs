@@ -2533,7 +2533,7 @@ struct JobStateRecord {
 
 impl JobStateRecord {
     fn terminal(&self) -> bool {
-        !matches!(self.info.state, JobState::Queued | JobState::Running)
+        self.info.state.is_terminal()
     }
 
     /// The answer to "how did this job end", for every caller that asked to be told.

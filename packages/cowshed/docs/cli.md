@@ -560,10 +560,12 @@ raven$ bun run dev          # vite reads $PORT; open http://localhost:40961 in y
 
 ### Background work
 
-Long commands auto-background at the soft timeout (default 120 s; `--timeout <dur>` tunes it, `--background` forces it
-immediately) and keep running under the workspace supervisor. `cowshed exec` accepts `--session <name>` for a named
-session whose cwd, variables, and jobs carry across calls. There is no `cowshed job` verb; reattach with
-`cowshed exec --session` or print the numeric job id from `--background`.
+A foreground `cowshed exec` shows the command's output as it is written. A command still running at the soft timeout
+(default 120 s; `--timeout <dur>` tunes it, `--background` forces it immediately) auto-backgrounds: `cowshed exec`
+prints its numeric job id and exits 0 while the command keeps running under the workspace supervisor. A command that
+finishes just as the timeout fires is not backgrounded; `cowshed exec` prints the rest of its output and exits with its
+code. `cowshed exec` accepts `--session <name>` for a named session whose cwd, variables, and jobs carry across calls.
+There is no `cowshed job` verb; reattach with `cowshed exec --session` or print the numeric job id from `--background`.
 
 Commands under the workspace `.envrc` run in a warm shell: the supervisor activates the `.envrc` once and starts each
 command from that activated environment, so only the first command after the workspace shell's inputs change pays for

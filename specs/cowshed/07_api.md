@@ -958,8 +958,16 @@ One boundary answer, no ambiguity:
   at 64 KiB. Inline/stream stdin and attachment writes upload frames. `job.logs` downloads return control metadata
   `{eof,nextOffset}` and one frame; the actor requires `nextOffset == requestedOffset + binaryLength` with checked
   arithmetic. JSON-only methods reject binary metadata; binary methods reject missing, oversized, unsolicited, or
-  mismatched frames. The actor serializes frames per connection, and bounded channels preserve cancellation and
-  backpressure without JSON arrays or base64.
+  mismatched frames; each answer's frame is checked against its declaration before its bytes are read.
+- **One connection carries concurrent calls.** A client holds one controller connection for every handle it opens, and a
+  call can wait as long as a job: `job.wait` until the job ends, a follow read of `job.logs` until the next bytes,
+  `job.kill` until the job has stopped. So calls are multiplexed by id: the client sends each call under the next id in
+  order, and the controller answers each as it completes, not in arrival order, writing an answer and its frame whole.
+  The controller's router resolves such a call's job under its own lock and awaits the job on a task of its own; it
+  never holds another request, of any client, while a job gets there. A connection holds at most 64 open calls and reads
+  no further request past that. A job's output therefore reaches a client while the client waits for the job's end, and
+  a status read is answered while a wait is open on the same connection. A frame that breaks the protocol ends the
+  connection and fails every call still open on it with that error.
 - **Post-terminal publication is independent.** `ExecOptions.stdoutCopy` / `stderrCopy` project
   `OutputPublication {path,policy}`. They clone/reflink/copy the sealed protected artifact after terminal state, never
   hardlink, never change `StreamInfo.storage`, and report publication failure separately from process state.

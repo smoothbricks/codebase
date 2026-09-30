@@ -204,7 +204,9 @@ attachment, execution, and lifecycle calls are IO-bound and remain Promise-based
 
 The first binding surface is intentionally read-only and endpoint-backed. A trusted spawner supplies a connected
 controller descriptor out of band; `coordinatorEndpoint` takes ownership, marks it close-on-exec, and permits exactly
-one handshake attempt. `openProject` discards coordinator authority before exposing `Project` and `WorkspaceRef`.
+one handshake attempt. `openProject` discards coordinator authority before exposing `Project` and `WorkspaceRef`. Every
+handle opened from one endpoint shares its one connection, and calls on it run concurrently: a pending `job.wait()` or
+following log read never holds another call.
 
 ```ts
 import { coordinatorEndpoint, openProject } from '@smoothbricks/cowshed';

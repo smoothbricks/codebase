@@ -11,14 +11,15 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use cowshed_core::api::{ExecRequest, JobId, JobInfo, JobState};
+use async_trait::async_trait;
+use cowshed_core::api::{ExecRequest, JobId, JobInfo};
 use cowshed_core::metadata::WorkspaceName;
 use cowshed_core::resident::{Decline, HostProbe, Resident, resolve};
 use cowshed_core::runtime::supervisor::WorkspaceSupervisorHandle;
 use cowshed_core::storage::bootstrap::STORE_ROOT;
 use cowshed_core::storage::job_artifact::StreamKind;
 use cowshed_core::timing::{event, span, spanned};
-use cowshed_core::{CowshedError, ErrorCode, Result};
+use cowshed_core::{CowshedError, ErrorCode, JobStream, Result};
 use tokio::io::AsyncRead;
 
 use crate::args::{Cli, Command};
@@ -27,8 +28,8 @@ use crate::gateway_service::{
 };
 use crate::output::Output;
 use crate::runtime::{
-    DispatchExit, ExecPresentation, ExecResult, emit_mount_path, exec_command, exec_presentation,
-    output_error, report_exec, success,
+    DispatchExit, ExecPresentation, ExecResult, ForegroundJob, emit_mount_path, exec_command,
+    exec_presentation, output_error, relay_foreground, report_exec, success,
 };
 
 /// Whether the resident path answered, and if not, what the controller path still needs.
@@ -182,39 +183,45 @@ async fn run(
         });
     }
     let _relay = span("resident", "relay");
-    let finished = async {
-        match presentation {
-            ExecPresentation::Control => link.clone().wait(job).await,
-            ExecPresentation::Raw => {
-                let (info, stdout_result, stderr_result) = tokio::join!(
-                    link.clone().wait(job),
-                    link.clone().pump(job, StreamKind::Stdout, stdout),
-                    link.clone().pump(job, StreamKind::Stderr, stderr),
-                );
-                stdout_result?;
-                stderr_result?;
-                info
-            }
-        }
-    };
-    tokio::pin!(finished);
-    tokio::select! {
-        info = &mut finished => Ok(ExecResult { info: info?, backgrounded: false }),
-        () = tokio::time::sleep(timeout) => {
-            // A job that ended as the soft timeout fired keeps its output and exit status: the
-            // relay runs to the end of both streams. Only a job still running is left running.
-            let info = link.clone().info(job).await?;
-            if is_terminal(info.state) {
-                Ok(ExecResult { info: finished.await?, backgrounded: false })
-            } else {
-                Ok(ExecResult { info, backgrounded: true })
-            }
-        }
-    }
+    relay_foreground(
+        &ResidentJob { link, job },
+        timeout,
+        presentation,
+        stdout,
+        stderr,
+    )
+    .await
 }
 
-fn is_terminal(state: JobState) -> bool {
-    !matches!(state, JobState::Queued | JobState::Running)
+/// A job of the resident workspace, reached through its supervisor's socket.
+struct ResidentJob {
+    link: JobLink,
+    job: JobId,
+}
+
+#[async_trait]
+impl ForegroundJob for ResidentJob {
+    async fn wait(&self) -> Result<JobInfo> {
+        self.link.clone().wait(self.job).await
+    }
+
+    async fn status(&self) -> Result<JobInfo> {
+        self.link.clone().info(self.job).await
+    }
+
+    /// The supervisor keeps a job running whether or not anyone is attached, so there is
+    /// nothing to tell it.
+    async fn detach(&self) -> Result<()> {
+        Ok(())
+    }
+
+    async fn relay(&self, stream: JobStream, writer: &mut (dyn Write + Send)) -> Result<()> {
+        let stream = match stream {
+            JobStream::Stdout => StreamKind::Stdout,
+            JobStream::Stderr => StreamKind::Stderr,
+        };
+        self.link.clone().pump(self.job, stream, writer).await
+    }
 }
 
 /// One lane to the job's supervisor. A grant change while the job runs advances the supervisor

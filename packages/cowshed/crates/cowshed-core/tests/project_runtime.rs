@@ -3,27 +3,29 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use cowshed_core::api::dto::{
     AbandonedWork, AdoptOptions, AttachOptions, CheckpointInfo, CheckpointOptions, CheckpointQuota,
-    CheckpointResult, CommandArg, CreateOptions, DefragmentResult, DoctorReport, Finding,
-    FindingSeverity, GcOptions, GcReport, GitOid, GrantDelta, GrantSet, ImageFormat, JobId,
-    JobInfo, LandOptions, LandReport, MirrorInfo, PortBlock, PushOptions, PushReport,
-    RebaseOptions, RemoveOptions, RemoveReport, ResizeResult, WorkspaceInfo, WorkspaceState,
+    CheckpointResult, CommandArg, CreateOptions, DefragmentResult, DoctorReport, ExecCommand,
+    ExecRequest, Finding, FindingSeverity, GcOptions, GcReport, GitOid, GrantDelta, GrantSet,
+    ImageFormat, JobId, JobInfo, JobState, LandOptions, LandReport, MirrorInfo, PortBlock,
+    PushOptions, PushReport, RebaseOptions, RemoveOptions, RemoveReport, ResizeResult,
+    RunSandboxMode, StdinSource, WorkspaceInfo, WorkspaceState,
 };
-use cowshed_core::api::server::{ConnectionAuthority, RouterHandle};
+use cowshed_core::api::server::{ConnectionAuthority, RouterHandle, serve_controller_connection};
 use cowshed_core::metadata::{
     NEW_PORT_BLOCK_SIZE, WorkspaceIncarnation, WorkspaceName, WorkspaceRole,
 };
 use cowshed_core::repository::{BoundIdentity, RepoId, RepositoryBinding};
 use cowshed_core::runtime::{
-    ProjectDescriptor, ProjectRuntime, ProjectRuntimeHost, RuntimeJobStream, RuntimeLogChunk,
-    WorkspaceSnapshot,
+    JobAnswer, ProjectDescriptor, ProjectRuntime, ProjectRuntimeHost, RuntimeJobStream,
+    RuntimeLogChunk, WorkspaceSnapshot,
 };
 use cowshed_core::storage::lifecycle::{Conflict, LifecycleFact, Revision};
-use cowshed_core::{CowshedError, ErrorCode, Result};
+use cowshed_core::{Cowshed, CowshedError, ErrorCode, JobStream, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::{Notify, mpsc};
@@ -125,6 +127,85 @@ enum RecoveryBehavior {
     ImmediateFailure(Arc<AtomicUsize>),
 }
 
+/// One running job whose end the test decides. Its stdout holds `first\n` from the start;
+/// its end, both streams' EOF and its terminal status all wait for [`HeldJob::end`].
+struct HeldJob {
+    incarnation: WorkspaceIncarnation,
+    ended: tokio::sync::watch::Sender<bool>,
+}
+
+impl HeldJob {
+    const FIRST: &'static [u8] = b"first\n";
+
+    fn new(incarnation: WorkspaceIncarnation) -> Arc<Self> {
+        Arc::new(Self {
+            incarnation,
+            ended: tokio::sync::watch::channel(false).0,
+        })
+    }
+
+    fn end(&self) {
+        self.ended.send_replace(true);
+    }
+
+    async fn until_ended(&self) {
+        let mut ended = self.ended.subscribe();
+        ended
+            .wait_for(|ended| *ended)
+            .await
+            .expect("the job's sender outlives its waits");
+    }
+
+    fn info(&self) -> JobInfo {
+        let ended = *self.ended.borrow();
+        let mut value = json!({
+            "repoId": "acme/widget",
+            "workspaceIncarnation": self.incarnation,
+            "jobId": 1,
+            "state": if ended { "exited" } else { "running" },
+            "grantRevision": 1,
+            "argv": [{"encoding": "utf8", "data": "build"}],
+            "cwd": null,
+            "started": "2026-07-13T00:00:00Z",
+            "stdout": {
+                "storage": {"kind": "captured", "artifact": {"kind": "inline", "data": {"encoding": "utf8", "data": "first\n"}}},
+                "bytes": 6,
+                "sha256": "b640e840b19d378660b32fb51ae18d67dccb4a8596a29e7bd72c1b2ae5928f41",
+                "summary": {"version": 1, "text": "", "truncated": false}
+            },
+            "stderr": {
+                "storage": {"kind": "captured", "artifact": {"kind": "inline", "data": {"encoding": "utf8", "data": ""}}},
+                "bytes": 0,
+                "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                "summary": {"version": 1, "text": "", "truncated": false}
+            },
+            "trace": {"traceId": "4bf92f3577b34da6a3ce929d0e0e4736", "spanId": "00f067aa0ba902b7"},
+            "stdin": {"kind": "empty", "bytes": 0, "complete": true}
+        });
+        if ended {
+            value["durationMs"] = json!(1);
+            value["exit"] = json!({"kind": "exited", "code": 0});
+        }
+        serde_json::from_value(value).expect("a job record the wire accepts")
+    }
+
+    /// What a read at `offset` of `stream` returns now, or `None` when a follow read waits.
+    fn chunk(&self, stream: RuntimeJobStream, offset: u64) -> Option<RuntimeLogChunk> {
+        let bytes: &[u8] = match stream {
+            RuntimeJobStream::Stdout => Self::FIRST,
+            RuntimeJobStream::Stderr => b"",
+        };
+        let start = usize::try_from(offset).expect("a test offset");
+        let rest = &bytes[start.min(bytes.len())..];
+        let ended = *self.ended.borrow();
+        (!rest.is_empty() || ended).then(|| RuntimeLogChunk {
+            bytes: Bytes::copy_from_slice(rest),
+            next_offset: offset + rest.len() as u64,
+            eof: ended,
+        })
+    }
+}
+
 struct FakeHost {
     descriptor: ProjectDescriptor,
     state_path: PathBuf,
@@ -136,6 +217,7 @@ struct FakeHost {
     reclaim_gate: Option<Arc<Notify>>,
     removal: FakeRemoval,
     recovery_behavior: RecoveryBehavior,
+    held_job: Option<Arc<HeldJob>>,
 }
 
 impl FakeHost {
@@ -172,6 +254,7 @@ impl FakeHost {
             reclaim_gate: None,
             removal: FakeRemoval::default(),
             recovery_behavior: RecoveryBehavior::None,
+            held_job: None,
         }
     }
 
@@ -1066,7 +1149,10 @@ impl ProjectRuntimeHost for FakeHost {
         _job: JobId,
     ) -> Result<JobInfo> {
         self.require_incarnation(&workspace, &incarnation)?;
-        Err(Self::worker_unavailable())
+        match &self.held_job {
+            Some(held) => Ok(held.info()),
+            None => Err(Self::worker_unavailable()),
+        }
     }
 
     async fn wait_job(
@@ -1074,9 +1160,15 @@ impl ProjectRuntimeHost for FakeHost {
         workspace: WorkspaceName,
         incarnation: WorkspaceIncarnation,
         _job: JobId,
-    ) -> Result<JobInfo> {
+    ) -> Result<JobAnswer<JobInfo>> {
         self.require_incarnation(&workspace, &incarnation)?;
-        Err(Self::worker_unavailable())
+        let Some(held) = self.held_job.clone() else {
+            return Err(Self::worker_unavailable());
+        };
+        Ok(Box::pin(async move {
+            held.until_ended().await;
+            Ok(held.info())
+        }))
     }
 
     async fn kill_job(
@@ -1084,7 +1176,7 @@ impl ProjectRuntimeHost for FakeHost {
         workspace: WorkspaceName,
         incarnation: WorkspaceIncarnation,
         _job: JobId,
-    ) -> Result<()> {
+    ) -> Result<JobAnswer<()>> {
         self.require_incarnation(&workspace, &incarnation)?;
         Err(Self::worker_unavailable())
     }
@@ -1103,16 +1195,35 @@ impl ProjectRuntimeHost for FakeHost {
         workspace: WorkspaceName,
         incarnation: WorkspaceIncarnation,
         _job: JobId,
-        _stream: RuntimeJobStream,
+        stream: RuntimeJobStream,
         offset: u64,
-        _follow: bool,
-    ) -> Result<RuntimeLogChunk> {
+        follow: bool,
+    ) -> Result<JobAnswer<RuntimeLogChunk>> {
         self.require_incarnation(&workspace, &incarnation)?;
-        Ok(RuntimeLogChunk {
-            bytes: Bytes::new(),
-            next_offset: offset,
-            eof: true,
-        })
+        let held = self.held_job.clone();
+        Ok(Box::pin(async move {
+            let Some(held) = held else {
+                return Ok(RuntimeLogChunk {
+                    bytes: Bytes::new(),
+                    next_offset: offset,
+                    eof: true,
+                });
+            };
+            if let Some(chunk) = held.chunk(stream, offset) {
+                return Ok(chunk);
+            }
+            if !follow {
+                return Ok(RuntimeLogChunk {
+                    bytes: Bytes::new(),
+                    next_offset: offset,
+                    eof: false,
+                });
+            }
+            held.until_ended().await;
+            Ok(held
+                .chunk(stream, offset)
+                .expect("an ended job's streams are at EOF"))
+        }))
     }
 }
 
@@ -1327,6 +1438,80 @@ async fn log_binary_metadata_carries_the_exact_next_offset() {
     let (metadata, bytes) = response.into_parts();
     assert_eq!(metadata, json!({ "eof": true, "nextOffset": 7 }));
     assert_eq!(bytes, Some(Bytes::new()));
+}
+
+/// A client holds one connection, and a job's wait lasts as long as the job. Over that one
+/// connection, while the wait is pending, the job's output and its status must still arrive:
+/// the router never holds a job's end, and the connection answers each call as it completes.
+/// This is the client the CLI and the Node addon share.
+#[tokio::test]
+async fn one_connection_answers_output_and_status_while_a_wait_is_pending() {
+    let root = test_root();
+    let (events, _events) = mpsc::unbounded_channel();
+    let held = HeldJob::new(incarnation(1));
+    let mut host = FakeHost::new(&root, events, false, false, Vec::new());
+    host.held_job = Some(Arc::clone(&held));
+    let repo = host.descriptor.repo_id.clone();
+    let runtime = ProjectRuntime::start(host).await.expect("start runtime");
+    let router = runtime.router();
+    let adopted = adopt(&router, &repo).await;
+    assert_eq!(
+        adopted["info"]["workspaceIncarnation"],
+        json!(held.incarnation)
+    );
+    let (client, server) = std::os::unix::net::UnixStream::pair().expect("socket pair");
+    let _connection = tokio::spawn(serve_controller_connection(
+        server.into(),
+        coordinator(repo.clone()),
+        router.clone(),
+    ));
+    let (cowshed, token) = Cowshed::connect(client.into()).await.expect("handshake");
+    let project = cowshed.open(root.join("checkout")).await.expect("open");
+    let coordinator = cowshed.coordinator(&project, token).expect("coordinator");
+    let worker = coordinator.worker("main").await.expect("worker");
+    let job = worker
+        .exec(ExecRequest {
+            command: ExecCommand::Argv(vec![CommandArg::from("build")]),
+            cwd: None,
+            mode: RunSandboxMode::ReadWrite,
+            env: std::collections::HashMap::new(),
+            trace: None,
+            stdin: StdinSource::Empty,
+            stdout_copy: None,
+            stderr_copy: None,
+        })
+        .await
+        .expect("exec");
+
+    // The wait is sent first; everything after it must not queue behind it.
+    let wait = job.wait();
+    tokio::pin!(wait);
+    let observed = async {
+        let mut stdout = job.logs(JobStream::Stdout, true).await?;
+        let first = stdout
+            .next()
+            .await
+            .expect("stdout yields before the job ends")?;
+        let status = job.status().await?;
+        Ok::<_, CowshedError>((first, status.state))
+    };
+    let observed = tokio::select! {
+        biased;
+        ended = &mut wait => panic!("the wait answered before the job ended: {ended:?}"),
+        observed = tokio::time::timeout(Duration::from_secs(5), observed) => observed,
+    };
+    let (first, state) = observed
+        .expect("output and status arrive while the wait is pending")
+        .expect("the calls succeed");
+    assert_eq!(&first[..], HeldJob::FIRST);
+    assert_eq!(state, JobState::Running);
+
+    held.end();
+    let ended = tokio::time::timeout(Duration::from_secs(5), wait)
+        .await
+        .expect("the wait answers once the job ends")
+        .expect("wait");
+    assert_eq!(ended.state, JobState::Exited);
 }
 
 #[tokio::test]

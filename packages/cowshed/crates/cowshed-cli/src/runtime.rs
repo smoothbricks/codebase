@@ -44,8 +44,8 @@ use cowshed_core::storage::job_artifact::{ArtifactConfig, repair_workspace_recor
 use cowshed_core::storage::lifecycle::{DerivedWorkspace, MountIntent, MountState, Pin, Substrate};
 use cowshed_core::storage::{StorageLayout, discover_session_images};
 use cowshed_core::{
-    AdoptedProject, CowshedError, ErrorCode, NativeGatewayInventory, Result, UnreachableMain,
-    validate_existing_host_storage,
+    AdoptedProject, CowshedError, ErrorCode, JobHandle, NativeGatewayInventory, Result,
+    UnreachableMain, validate_existing_host_storage,
 };
 use std::collections::HashMap;
 use std::fs;
@@ -669,47 +669,8 @@ impl CliService for ActorBridge {
                 backgrounded: true,
             });
         }
-
-        match presentation {
-            ExecPresentation::Control => {
-                let wait = job.wait();
-                tokio::pin!(wait);
-                tokio::select! {
-                    info = &mut wait => Ok(ExecResult { info: info?, backgrounded: false }),
-                    () = tokio::time::sleep(command.timeout) => {
-                        let info = job.status().await?;
-                        job.detach().await?;
-                        Ok(ExecResult { info, backgrounded: true })
-                    }
-                }
-            }
-            ExecPresentation::Raw => {
-                let logs = cowshed_core::timing::span("exec", "logs-open");
-                let stdout_stream = job.logs(JobStream::Stdout, true).await?;
-                let stderr_stream = job.logs(JobStream::Stderr, true).await?;
-                drop(logs);
-                let _relay = cowshed_core::timing::span("exec", "relay");
-                let foreground = async {
-                    let (info, stdout_result, stderr_result) = tokio::join!(
-                        job.wait(),
-                        pump_stream(stdout_stream, stdout),
-                        pump_stream(stderr_stream, stderr),
-                    );
-                    stdout_result?;
-                    stderr_result?;
-                    info
-                };
-                tokio::pin!(foreground);
-                tokio::select! {
-                    info = &mut foreground => Ok(ExecResult { info: info?, backgrounded: false }),
-                    () = tokio::time::sleep(command.timeout) => {
-                        let info = job.status().await?;
-                        job.detach().await?;
-                        Ok(ExecResult { info, backgrounded: true })
-                    }
-                }
-            }
-        }
+        let _relay = cowshed_core::timing::span("exec", "relay");
+        relay_foreground(&job, command.timeout, presentation, stdout, stderr).await
     }
 
     async fn reconcile_gateway(&mut self) -> Result<()> {
@@ -723,14 +684,87 @@ impl CliService for ActorBridge {
     }
 }
 
-async fn pump_stream(
-    mut stream: cowshed_core::RawByteStream,
-    writer: &mut (dyn Write + Send),
-) -> Result<()> {
-    while let Some(chunk) = stream.next().await {
-        writer.write_all(&chunk?).map_err(output_error)?;
+/// A job one `cowshed exec` relays in the foreground, reached through the controller
+/// ([`JobHandle`]) or straight through a resident workspace's supervisor.
+#[async_trait]
+pub(crate) trait ForegroundJob: Sync {
+    /// The job's terminal record, once it has one.
+    async fn wait(&self) -> Result<JobInfo>;
+    async fn status(&self) -> Result<JobInfo>;
+    /// Leave the job running with no client attached.
+    async fn detach(&self) -> Result<()>;
+    /// Copy one of the job's streams to `writer` as it is produced, to its end.
+    async fn relay(&self, stream: JobStream, writer: &mut (dyn Write + Send)) -> Result<()>;
+}
+
+#[async_trait]
+impl ForegroundJob for JobHandle {
+    async fn wait(&self) -> Result<JobInfo> {
+        JobHandle::wait(self).await
     }
-    writer.flush().map_err(output_error)
+
+    async fn status(&self) -> Result<JobInfo> {
+        JobHandle::status(self).await
+    }
+
+    async fn detach(&self) -> Result<()> {
+        JobHandle::detach(self).await
+    }
+
+    async fn relay(&self, stream: JobStream, writer: &mut (dyn Write + Send)) -> Result<()> {
+        let mut stream = self.logs(stream, true).await?;
+        while let Some(chunk) = stream.next().await {
+            writer.write_all(&chunk?).map_err(output_error)?;
+        }
+        writer.flush().map_err(output_error)
+    }
+}
+
+/// Relay one foreground job to this process until it ends or its soft timeout passes.
+///
+/// The job's output streams to `stdout` and `stderr` the whole time. At the soft timeout its
+/// status decides: a job still running is detached and reported backgrounded; a job that ended
+/// meanwhile has nothing to reattach to, so its output is drained to EOF and its end is the
+/// command's.
+pub(crate) async fn relay_foreground(
+    job: &impl ForegroundJob,
+    timeout: Duration,
+    presentation: ExecPresentation,
+    stdout: &mut (dyn Write + Send),
+    stderr: &mut (dyn Write + Send),
+) -> Result<ExecResult> {
+    let finished = async {
+        match presentation {
+            ExecPresentation::Control => job.wait().await,
+            ExecPresentation::Raw => {
+                let (info, stdout_result, stderr_result) = tokio::join!(
+                    job.wait(),
+                    job.relay(JobStream::Stdout, stdout),
+                    job.relay(JobStream::Stderr, stderr),
+                );
+                stdout_result?;
+                stderr_result?;
+                info
+            }
+        }
+    };
+    tokio::pin!(finished);
+    tokio::select! {
+        info = &mut finished => return Ok(ExecResult { info: info?, backgrounded: false }),
+        () = tokio::time::sleep(timeout) => {}
+    }
+    let info = job.status().await?;
+    if info.state.is_terminal() {
+        return Ok(ExecResult {
+            info: finished.await?,
+            backgrounded: false,
+        });
+    }
+    job.detach().await?;
+    Ok(ExecResult {
+        info,
+        backgrounded: true,
+    })
 }
 
 pub(crate) fn output_error(error: io::Error) -> CowshedError {
@@ -3964,6 +3998,325 @@ mod tests {
     use cowshed_core::storage::bootstrap::VolumeOutcome;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
+
+    /// `cowshed exec`'s foreground relay against a real controller connection, whose router
+    /// answers for one scripted job.
+    mod foreground_relay {
+        use super::*;
+        use bytes::Bytes;
+        use cowshed_core::api::dto::{
+            CommandArg, ExecCommand as JobCommand, ExitStatus, GrantSet, ImageFormat,
+            RunSandboxMode, StdinSource, WorkspaceState,
+        };
+        use cowshed_core::api::server::{RouterHandle, RouterResponse};
+        use cowshed_core::metadata::{WorkspaceIncarnation, WorkspaceName, WorkspaceRole};
+        use cowshed_core::repository::{BoundIdentity, RepositoryBinding};
+        use serde_json::{Value, json};
+        use std::num::NonZeroUsize;
+
+        const INCARNATION: &str = "0198f2c0b7e34dc795f17b238b331c80";
+        const FIRST: &[u8] = b"first\n";
+
+        /// One job behind the router. Its stdout holds `first\n` from the start; it ends when
+        /// the test calls [`ScriptedJob::end`] or, when `ends_on_status`, as a status read
+        /// arrives: the job finishing just as the soft timeout fires. Every call is answered
+        /// on a task of its own, as the project router answers job calls.
+        struct ScriptedJob {
+            ended: tokio::sync::watch::Sender<bool>,
+            ends_on_status: bool,
+            exit_code: i32,
+            detached: AtomicBool,
+        }
+
+        impl ScriptedJob {
+            fn new(ends_on_status: bool, exit_code: i32) -> Arc<Self> {
+                Arc::new(Self {
+                    ended: tokio::sync::watch::channel(false).0,
+                    ends_on_status,
+                    exit_code,
+                    detached: AtomicBool::new(false),
+                })
+            }
+
+            fn end(&self) {
+                self.ended.send_replace(true);
+            }
+
+            fn is_ended(&self) -> bool {
+                *self.ended.borrow()
+            }
+
+            async fn until_ended(&self) {
+                let mut ended = self.ended.subscribe();
+                ended
+                    .wait_for(|ended| *ended)
+                    .await
+                    .expect("the job outlives its calls");
+            }
+
+            fn info(&self) -> Value {
+                let ended = self.is_ended();
+                let stream = |data: &str, bytes: usize, sha256: &str| {
+                    json!({
+                        "storage": {"kind": "captured", "artifact": {"kind": "inline", "data": {"encoding": "utf8", "data": data}}},
+                        "bytes": bytes,
+                        "sha256": sha256,
+                        "summary": {"version": 1, "text": "", "truncated": false}
+                    })
+                };
+                let mut info = json!({
+                    "repoId": "acme/widget",
+                    "workspaceIncarnation": INCARNATION,
+                    "jobId": 1,
+                    "state": if ended { "exited" } else { "running" },
+                    "grantRevision": 1,
+                    "argv": [{"encoding": "utf8", "data": "build"}],
+                    "cwd": null,
+                    "started": "2026-07-13T00:00:00Z",
+                    "stdout": stream("first\n", 6, "b640e840b19d378660b32fb51ae18d67dccb4a8596a29e7bd72c1b2ae5928f41"),
+                    "stderr": stream("", 0, "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"),
+                    "trace": {"traceId": "4bf92f3577b34da6a3ce929d0e0e4736", "spanId": "00f067aa0ba902b7"},
+                    "stdin": {"kind": "empty", "bytes": 0, "complete": true}
+                });
+                if ended {
+                    info["durationMs"] = json!(1);
+                    info["exit"] = json!({"kind": "exited", "code": self.exit_code});
+                }
+                info
+            }
+
+            /// A read of `params`' stream at its offset now, or `None` when a follow read waits.
+            fn chunk(&self, params: &Value) -> Result<Option<RouterResponse>> {
+                let bytes: &[u8] = match params["stream"].as_str() {
+                    Some("stdout") => FIRST,
+                    _ => b"",
+                };
+                let offset = params["offset"].as_u64().expect("a log offset");
+                let start = usize::try_from(offset).expect("a test offset");
+                let rest = &bytes[start.min(bytes.len())..];
+                let ended = self.is_ended();
+                if rest.is_empty() && !ended && params["follow"] == json!(true) {
+                    return Ok(None);
+                }
+                RouterResponse::binary(
+                    json!({"eof": ended, "nextOffset": offset + rest.len() as u64}),
+                    Bytes::copy_from_slice(rest),
+                )
+                .map(Some)
+            }
+
+            async fn answer(
+                self: Arc<Self>,
+                method: String,
+                params: Value,
+            ) -> Result<RouterResponse> {
+                let repo_id = RepoId::parse("acme/widget").expect("repo");
+                match method.as_str() {
+                    "project.open" => Ok(RouterResponse::json(json!({
+                        "repoId": repo_id,
+                        "binding": RepositoryBinding::new(vec![BoundIdentity {
+                            repo_id: repo_id.clone(),
+                            remote_name: None,
+                            remote_url: None,
+                            primary: true,
+                        }])
+                        .expect("binding"),
+                        "gitRoot": "/w/widget",
+                        "storeRoot": "/w/store",
+                    }))),
+                    "coordinator.worker" => Ok(RouterResponse::json(json!({
+                        "info": WorkspaceInfo {
+                            repo_id,
+                            workspace: WorkspaceName::new("main").expect("name"),
+                            workspace_incarnation: WorkspaceIncarnation::new(INCARNATION)
+                                .expect("incarnation"),
+                            role: WorkspaceRole::Main,
+                            image_format: ImageFormat::Asif,
+                            mount: PathBuf::from("/w/widget"),
+                            state: WorkspaceState::Attached,
+                            branch: None,
+                            base_commit: None,
+                            created_at: None,
+                            checkpoints: Vec::new(),
+                            snapshot_stale: false,
+                            landing: None,
+                        },
+                        "grants": GrantSet::default(),
+                    }))),
+                    "worker.exec" => Ok(RouterResponse::json(json!(1))),
+                    "job.status" => {
+                        if self.ends_on_status {
+                            self.end();
+                        }
+                        Ok(RouterResponse::json(self.info()))
+                    }
+                    "job.wait" => {
+                        self.until_ended().await;
+                        Ok(RouterResponse::json(self.info()))
+                    }
+                    "job.detach" => {
+                        self.detached.store(true, Ordering::SeqCst);
+                        Ok(RouterResponse::json(json!({})))
+                    }
+                    "job.logs" => match self.chunk(&params)? {
+                        Some(chunk) => Ok(chunk),
+                        None => {
+                            self.until_ended().await;
+                            Ok(self.chunk(&params)?.expect("an ended job's reads answer"))
+                        }
+                    },
+                    other => Err(CowshedError::internal(format!("unscripted call {other}"))),
+                }
+            }
+        }
+
+        async fn connect(job: &Arc<ScriptedJob>) -> JobHandle {
+            let repo_id = RepoId::parse("acme/widget").expect("repo");
+            let (router, mut commands) =
+                RouterHandle::channel(NonZeroUsize::new(16).expect("capacity"));
+            let script = Arc::clone(job);
+            tokio::spawn(async move {
+                while let Some(command) = commands.recv().await {
+                    let (request, reply) = command.into_parts();
+                    let (_, method, params, _) = request.into_parts();
+                    let script = Arc::clone(&script);
+                    tokio::spawn(async move {
+                        let _ = reply.send(script.answer(method, params).await);
+                    });
+                }
+            });
+            let (client, server) = std::os::unix::net::UnixStream::pair().expect("socket pair");
+            tokio::spawn(serve_controller_connection(
+                server.into(),
+                ConnectionAuthority::Coordinator { repo_id },
+                router,
+            ));
+            let (cowshed, token) = cowshed_core::Cowshed::connect(client.into())
+                .await
+                .expect("handshake");
+            let project = cowshed.open("/w/widget").await.expect("open");
+            let coordinator = cowshed.coordinator(&project, token).expect("coordinator");
+            let worker = coordinator.worker("main").await.expect("worker");
+            worker
+                .exec(ExecRequest {
+                    command: JobCommand::Argv(vec![CommandArg::from("build")]),
+                    cwd: None,
+                    mode: RunSandboxMode::ReadWrite,
+                    env: HashMap::new(),
+                    trace: None,
+                    stdin: StdinSource::Empty,
+                    stdout_copy: None,
+                    stderr_copy: None,
+                })
+                .await
+                .expect("exec")
+        }
+
+        #[derive(Clone, Default)]
+        struct Terminal(Arc<Mutex<Vec<u8>>>);
+
+        impl Terminal {
+            fn contents(&self) -> Vec<u8> {
+                self.0.lock().expect("terminal").clone()
+            }
+        }
+
+        impl Write for Terminal {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.0.lock().expect("terminal").extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        #[tokio::test]
+        async fn a_foreground_jobs_output_reaches_the_terminal_while_it_runs() {
+            let job = ScriptedJob::new(false, 0);
+            let handle = connect(&job).await;
+            let terminal = Terminal::default();
+            let (mut stdout, mut stderr) = (terminal.clone(), Terminal::default());
+            let relay = relay_foreground(
+                &handle,
+                Duration::from_secs(60),
+                ExecPresentation::Raw,
+                &mut stdout,
+                &mut stderr,
+            );
+            tokio::pin!(relay);
+            let first_line = async {
+                while terminal.contents() != FIRST {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            };
+            tokio::select! {
+                _ = &mut relay => panic!("the relay returned while the job still ran"),
+                shown = tokio::time::timeout(Duration::from_secs(5), first_line) => {
+                    shown.expect("the first line reaches the terminal while the job runs");
+                }
+            }
+            job.end();
+            let result = tokio::time::timeout(Duration::from_secs(5), relay)
+                .await
+                .expect("the relay returns once the job ends")
+                .expect("relay");
+            assert!(!result.backgrounded);
+            assert_eq!(result.info.exit, Some(ExitStatus::Exited { code: 0 }));
+            assert_eq!(terminal.contents(), FIRST);
+        }
+
+        /// The soft timeout fires, and by the time its status read is answered the job has
+        /// ended: there is nothing to background. Its output and exit code are the command's.
+        #[tokio::test]
+        async fn a_job_that_ends_as_the_soft_timeout_fires_keeps_its_output_and_exit_code() {
+            let job = ScriptedJob::new(true, 3);
+            let handle = connect(&job).await;
+            let terminal = Terminal::default();
+            let (mut stdout, mut stderr) = (terminal.clone(), Terminal::default());
+            let result = tokio::time::timeout(
+                Duration::from_secs(5),
+                relay_foreground(
+                    &handle,
+                    Duration::from_millis(50),
+                    ExecPresentation::Raw,
+                    &mut stdout,
+                    &mut stderr,
+                ),
+            )
+            .await
+            .expect("the relay returns")
+            .expect("relay");
+            assert!(!result.backgrounded, "a finished job is not backgrounded");
+            assert_eq!(result.info.exit, Some(ExitStatus::Exited { code: 3 }));
+            assert_eq!(terminal.contents(), FIRST);
+            assert!(!job.detached.load(Ordering::SeqCst));
+        }
+
+        #[tokio::test]
+        async fn a_job_still_running_at_the_soft_timeout_is_detached() {
+            let job = ScriptedJob::new(false, 0);
+            let handle = connect(&job).await;
+            let (mut stdout, mut stderr) = (Terminal::default(), Terminal::default());
+            let result = tokio::time::timeout(
+                Duration::from_secs(5),
+                relay_foreground(
+                    &handle,
+                    Duration::from_millis(50),
+                    ExecPresentation::Raw,
+                    &mut stdout,
+                    &mut stderr,
+                ),
+            )
+            .await
+            .expect("the relay returns at the soft timeout")
+            .expect("relay");
+            assert!(result.backgrounded);
+            assert!(result.info.exit.is_none());
+            assert!(job.detached.load(Ordering::SeqCst));
+        }
+    }
 
     fn planned_volume(name: &str, role: VolumeRole, state_before: VolumeState) -> VolumeOutcome {
         VolumeOutcome {

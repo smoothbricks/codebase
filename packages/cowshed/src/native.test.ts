@@ -97,4 +97,144 @@ describe('Cowshed Node-API bindings', () => {
     expect(stderr).toBe('');
     expect(exitCode).toBe(0);
   });
+
+  /**
+   * One `Cowshed` holds one controller connection for every handle, and `job.wait()` lasts as
+   * long as the job. A second call on that connection must complete while the wait is pending.
+   *
+   * A Node controller serves the wire on one end of a socket pair and hands the other end to a
+   * Node client as fd 3, the way a trusted spawner hands an endpoint over. The controller keeps
+   * the wait open until it has answered the job's status: a client that holds its other calls
+   * behind the wait deadlocks with it, and the spawn's deadline ends the pair.
+   */
+  it('answers a second call on one connection while job.wait() is pending', async () => {
+    const moduleUrl = pathToFileURL(join(import.meta.dir, '..', 'dist', 'ts', 'index.js')).href;
+    const client = `
+      import { connectCoordinator, coordinatorEndpoint } from ${JSON.stringify(moduleUrl)};
+      const coordinator = await connectCoordinator(coordinatorEndpoint(3), '/w/widget');
+      const worker = await coordinator.worker('main');
+      const job = await worker.exec({ argv: ['build'] });
+      const ended = job.wait();
+      const status = await job.status();
+      console.log(JSON.stringify({ status: status.state, ended: (await ended).state }));
+      process.exit(0);
+    `;
+    const controller = `
+      import { spawn } from 'node:child_process';
+      const incarnation = '0198f2c0b7e34dc795f17b238b331c80';
+      const emptyStream = {
+        storage: { kind: 'captured', artifact: { kind: 'inline', data: { encoding: 'utf8', data: '' } } },
+        bytes: 0,
+        sha256: 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855',
+        summary: { version: 1, text: '', truncated: false },
+      };
+      const job = (ended) => ({
+        repoId: 'acme/widget',
+        workspaceIncarnation: incarnation,
+        jobId: 1,
+        state: ended ? 'exited' : 'running',
+        grantRevision: 1,
+        argv: [{ encoding: 'utf8', data: 'build' }],
+        cwd: null,
+        started: '2026-07-13T00:00:00Z',
+        ...(ended ? { durationMs: 1, exit: { kind: 'exited', code: 0 } } : {}),
+        stdout: emptyStream,
+        stderr: emptyStream,
+        trace: { traceId: '4bf92f3577b34da6a3ce929d0e0e4736', spanId: '00f067aa0ba902b7' },
+        stdin: { kind: 'empty', bytes: 0, complete: true },
+      });
+      const results = {
+        'project.open': {
+          repoId: 'acme/widget',
+          binding: {
+            version: 1,
+            identities: [{ repoId: 'acme/widget', remoteName: null, remoteUrl: null, primary: true }],
+          },
+          gitRoot: '/w/widget',
+          storeRoot: '/w/store',
+        },
+        'coordinator.worker': {
+          info: {
+            repoId: 'acme/widget',
+            workspace: 'main',
+            workspaceIncarnation: incarnation,
+            role: 'main',
+            imageFormat: 'asif',
+            mount: '/w/widget',
+            state: 'attached',
+            checkpoints: [],
+            snapshotStale: false,
+          },
+          grants: { egress: [], read: [], revision: 0, sim: [], write: [] },
+        },
+        'worker.exec': 1,
+      };
+      const node = spawn(process.execPath, ['--input-type=module', '--eval', ${JSON.stringify(client)}], {
+        stdio: ['ignore', 'inherit', 'inherit', 'pipe'],
+      });
+      const socket = node.stdio[3];
+      const send = (value) => {
+        const body = Buffer.from(JSON.stringify(value));
+        const head = Buffer.alloc(4);
+        head.writeUInt32BE(body.length);
+        socket.write(Buffer.concat([head, body]));
+      };
+      const answer = (id, result) => send({ id, ok: true, result, error: null, binaryLength: null });
+      let greeted = false;
+      let statusAnswered = false;
+      const waits = [];
+      const handle = (message) => {
+        if (!greeted) {
+          greeted = true;
+          send({ version: message.version, nonce: message.nonce, repoId: 'acme/widget' });
+        } else if (message.method in results) {
+          answer(message.id, results[message.method]);
+        } else if (message.method === 'job.status') {
+          statusAnswered = true;
+          answer(message.id, job(false));
+          for (const id of waits.splice(0)) answer(id, job(true));
+        } else if (message.method === 'job.wait' && !statusAnswered) {
+          waits.push(message.id);
+        } else if (message.method === 'job.wait') {
+          answer(message.id, job(true));
+        } else {
+          const error = { code: 'internal', message: 'unscripted ' + message.method, hint: 'script it' };
+          send({ id: message.id, ok: false, result: null, error, binaryLength: null });
+        }
+      };
+      let buffered = Buffer.alloc(0);
+      socket.on('data', (chunk) => {
+        buffered = Buffer.concat([buffered, chunk]);
+        while (buffered.length >= 4 && buffered.length >= 4 + buffered.readUInt32BE(0)) {
+          const length = buffered.readUInt32BE(0);
+          handle(JSON.parse(buffered.subarray(4, 4 + length).toString()));
+          buffered = buffered.subarray(4 + length);
+        }
+      });
+      node.on('exit', (code) => {
+        process.exitCode = code ?? 1;
+        socket.destroy();
+      });
+    `;
+    const node = Bun.spawn(['node', '--input-type=module', '--eval', controller], {
+      cwd: join(import.meta.dir, '..'),
+      stdin: 'ignore',
+      stdout: 'pipe',
+      stderr: 'pipe',
+      // Bounds only a deadlocked pair; a working client ends in milliseconds. Killing the
+      // controller closes the client's endpoint, which ends the client too.
+      timeout: 20_000,
+    });
+    const [exitCode, stdout, stderr] = await Promise.all([
+      node.exited,
+      new Response(node.stdout).text(),
+      new Response(node.stderr).text(),
+    ]);
+
+    expect({ exitCode, stdout: stdout.trim(), stderr }).toEqual({
+      exitCode: 0,
+      stdout: JSON.stringify({ status: 'running', ended: 'exited' }),
+      stderr: '',
+    });
+  }, 30_000);
 });

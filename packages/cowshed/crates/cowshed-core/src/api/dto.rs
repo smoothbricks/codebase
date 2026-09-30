@@ -736,6 +736,13 @@ pub enum JobState {
     Failed,
 }
 
+impl JobState {
+    /// Whether the job has ended: every state but `Queued` and `Running` is final.
+    pub fn is_terminal(self) -> bool {
+        !matches!(self, Self::Queued | Self::Running)
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct OutputSummary {

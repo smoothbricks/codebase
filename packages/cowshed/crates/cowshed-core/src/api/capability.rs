@@ -1,7 +1,7 @@
 use super::dto::{
     AdoptOptions, AttachOptions, CheckpointOptions, CheckpointQuota, CheckpointResult,
     CreateOptions, DefragmentResult, DoctorReport, EmptyResult, ExecRequest, GcOptions, GcReport,
-    GitOid, GrantDelta, GrantSet, JobId, JobInfo, JobState, LandOptions, LandReport, MirrorInfo,
+    GitOid, GrantDelta, GrantSet, JobId, JobInfo, LandOptions, LandReport, MirrorInfo,
     ProjectGrantDelta, ProjectGrants, PushOptions, PushReport, RebaseOptions, RemoveOptions,
     RemoveReport, ResizeResult, RevisionResult, RunSandboxMode, StdinSource, WorkspaceIncarnation,
     WorkspaceInfo,
@@ -27,7 +27,7 @@ use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 #[cfg(unix)]
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 #[cfg(unix)]
 use tokio::sync::{mpsc, oneshot};
 use url::Url;
@@ -113,12 +113,6 @@ enum ActorLane {
     Json,
     Upload(Bytes),
     Download(u64),
-}
-
-#[cfg(unix)]
-enum ActorFailure {
-    Recoverable(CowshedError),
-    Fatal(CowshedError),
 }
 
 #[cfg(unix)]
@@ -457,7 +451,7 @@ fn poll_job_stream(
                     }),
                 };
                 match status {
-                    Ok(info) if is_terminal_job_state(info.state) => break,
+                    Ok(info) if info.state.is_terminal() => break,
                     Ok(_) => {}
                     Err(error) => {
                         tokio::select! {
@@ -477,10 +471,6 @@ fn poll_job_stream(
         }
     });
     RawByteStream { receiver }
-}
-
-fn is_terminal_job_state(state: JobState) -> bool {
-    !matches!(state, JobState::Queued | JobState::Running)
 }
 
 async fn call_typed<T: DeserializeOwned>(
@@ -915,7 +905,7 @@ fn fresh_nonce() -> String {
 }
 
 #[cfg(unix)]
-async fn write_frame(stream: &mut tokio::net::UnixStream, bytes: &[u8]) -> Result<()> {
+async fn write_frame(stream: &mut (impl AsyncWrite + Unpin), bytes: &[u8]) -> Result<()> {
     frame::write_frame(
         stream,
         bytes,
@@ -927,7 +917,7 @@ async fn write_frame(stream: &mut tokio::net::UnixStream, bytes: &[u8]) -> Resul
 }
 
 #[cfg(unix)]
-async fn read_frame(stream: &mut tokio::net::UnixStream) -> Result<Vec<u8>> {
+async fn read_frame(stream: &mut (impl AsyncRead + Unpin)) -> Result<Vec<u8>> {
     frame::read_frame(
         stream,
         MAX_HANDSHAKE_BYTES,
@@ -946,7 +936,7 @@ struct RpcBinaryResult {
 }
 
 #[cfg(unix)]
-async fn write_rpc_frame(stream: &mut tokio::net::UnixStream, bytes: &[u8]) -> Result<()> {
+async fn write_rpc_frame(stream: &mut (impl AsyncWrite + Unpin), bytes: &[u8]) -> Result<()> {
     if bytes.len() > MAX_RPC_BYTES {
         return Err(CowshedError::internal(
             "controller RPC request is too large",
@@ -972,7 +962,7 @@ async fn write_rpc_frame(stream: &mut tokio::net::UnixStream, bytes: &[u8]) -> R
 }
 
 #[cfg(unix)]
-async fn read_rpc_frame(stream: &mut tokio::net::UnixStream) -> Result<Vec<u8>> {
+async fn read_rpc_frame(stream: &mut (impl AsyncRead + Unpin)) -> Result<Vec<u8>> {
     let length = stream.read_u32().await.map_err(|error| {
         CowshedError::new(
             ErrorCode::EnvironmentMissing,
@@ -997,7 +987,7 @@ async fn read_rpc_frame(stream: &mut tokio::net::UnixStream) -> Result<Vec<u8>> 
 }
 
 #[cfg(unix)]
-async fn write_binary_frame(stream: &mut tokio::net::UnixStream, bytes: &[u8]) -> Result<()> {
+async fn write_binary_frame(stream: &mut (impl AsyncWrite + Unpin), bytes: &[u8]) -> Result<()> {
     if bytes.len() > MAX_BINARY_FRAME_BYTES {
         return Err(CowshedError::internal(
             "controller RPC binary request exceeds the 64 KiB frame limit",
@@ -1024,7 +1014,7 @@ async fn write_binary_frame(stream: &mut tokio::net::UnixStream, bytes: &[u8]) -
 
 #[cfg(unix)]
 async fn read_binary_frame(
-    stream: &mut tokio::net::UnixStream,
+    stream: &mut (impl AsyncRead + Unpin),
     expected_length: usize,
 ) -> Result<Vec<u8>> {
     if expected_length > MAX_BINARY_FRAME_BYTES {
@@ -1060,164 +1050,229 @@ async fn read_binary_frame(
     Ok(bytes)
 }
 
+/// One controller connection shared by every call a client makes.
+///
+/// Calls are sent in order, each under the next id, and answered as the controller completes
+/// them, so a call that waits on a job (`job.wait`, a follow read) never holds the calls behind
+/// it. A reader task takes each answer off the socket whole, reading a binary frame only for a
+/// call that expects one; the actor matches the answer to its call by id. A failure that leaves
+/// the connection unusable fails every call still waiting, and the calls after it find the
+/// actor gone.
 #[cfg(unix)]
-fn spawn_controller_actor(mut stream: tokio::net::UnixStream) -> Arc<dyn ControllerRuntime> {
-    let (sender, mut receiver) = mpsc::channel::<ActorMessage>(32);
-    tokio::spawn(async move {
-        let mut next_id = 1_u64;
-        while let Some(message) = receiver.recv().await {
-            let id = next_id;
-            next_id = next_id.saturating_add(1);
-            let (method, params, lane, reply) = match message {
-                ActorMessage::Json {
-                    method,
-                    params,
-                    reply,
-                } => (method, params, ActorLane::Json, reply),
-                ActorMessage::Upload {
-                    method,
-                    params,
-                    bytes,
-                    reply,
-                } => (method, params, ActorLane::Upload(bytes), reply),
-                ActorMessage::Download {
-                    method,
-                    params,
-                    expected_offset,
-                    reply,
-                } => (method, params, ActorLane::Download(expected_offset), reply),
-            };
-            let exchange = async {
-                let binary_length = match &lane {
-                    ActorLane::Upload(bytes) => Some(u32::try_from(bytes.len()).map_err(|_| {
-                        ActorFailure::Fatal(CowshedError::internal(
-                            "controller RPC binary request exceeds the 64 KiB frame limit",
-                        ))
-                    })?),
-                    ActorLane::Json | ActorLane::Download(_) => None,
-                };
-                let request = codec::encode_rpc_request(id, method, &params, binary_length)
-                    .map_err(|error| {
-                        if error.is_too_large() {
-                            ActorFailure::Fatal(CowshedError::internal(
-                                "controller RPC request is too large",
-                            ))
-                        } else {
-                            ActorFailure::Fatal(CowshedError::internal(format!(
-                                "controller RPC request encoding failed: {error}"
-                            )))
-                        }
-                    })?;
-                write_rpc_frame(&mut stream, &request)
-                    .await
-                    .map_err(ActorFailure::Fatal)?;
-                if let ActorLane::Upload(bytes) = &lane {
-                    write_binary_frame(&mut stream, bytes)
-                        .await
-                        .map_err(ActorFailure::Fatal)?;
-                }
-                let response = read_rpc_frame(&mut stream)
-                    .await
-                    .map_err(ActorFailure::Fatal)?;
-                let response = codec::decode_rpc_response(&response).map_err(|error| {
-                    ActorFailure::Fatal(CowshedError::internal(format!(
-                        "controller RPC response decoding failed: {error}"
-                    )))
-                })?;
-                let (response_id, response_ok, response_result, response_error, binary_length) =
-                    response.into_parts();
-                if response_id != id {
-                    return Err(ActorFailure::Fatal(CowshedError::internal(
-                        "controller RPC response id did not match request",
-                    )));
-                }
-                let result = match (response_ok, response_result, response_error) {
-                    (true, Some(result), None) => result,
-                    (false, None, Some(error)) => {
-                        if binary_length.is_some() {
-                            return Err(ActorFailure::Fatal(CowshedError::internal(
-                                "controller RPC error response declared unsolicited binary data",
-                            )));
-                        }
-                        return Err(ActorFailure::Recoverable(error));
-                    }
-                    _ => {
-                        return Err(ActorFailure::Fatal(CowshedError::internal(
-                            "controller RPC response has an invalid envelope",
-                        )));
-                    }
-                };
-                match lane {
-                    ActorLane::Json | ActorLane::Upload(_) => {
-                        if binary_length.is_some() {
-                            return Err(ActorFailure::Fatal(CowshedError::internal(
-                                "controller RPC response declared unsolicited binary data",
-                            )));
-                        }
-                        Ok(ActorResponse::Json(result))
-                    }
-                    ActorLane::Download(expected_offset) => {
-                        let binary_length = binary_length.ok_or_else(|| {
-                            ActorFailure::Fatal(CowshedError::internal(
-                                "controller RPC download response omitted binaryLength",
-                            ))
-                        })?;
-                        let binary_length = usize::try_from(binary_length).map_err(|_| {
-                            ActorFailure::Fatal(CowshedError::internal(
-                                "controller RPC binary response length does not fit this platform",
-                            ))
-                        })?;
-                        if binary_length > MAX_BINARY_FRAME_BYTES {
-                            return Err(ActorFailure::Fatal(CowshedError::internal(
-                                "controller RPC binary response exceeds the 64 KiB frame limit",
-                            )));
-                        }
-                        let metadata: RpcBinaryResult =
-                            serde_json::from_value(result).map_err(|error| {
-                                ActorFailure::Fatal(CowshedError::internal(format!(
-                                    "controller RPC download metadata is invalid: {error}"
-                                )))
-                            })?;
-                        let binary_length_u64 = u64::try_from(binary_length).map_err(|_| {
-                            ActorFailure::Fatal(CowshedError::internal(
-                                "controller RPC download offset overflowed",
-                            ))
-                        })?;
-                        let expected_next = expected_offset
-                            .checked_add(binary_length_u64)
-                            .ok_or_else(|| {
-                                ActorFailure::Fatal(CowshedError::internal(
-                                    "controller RPC download offset overflowed",
-                                ))
-                            })?;
-                        if metadata.next_offset != expected_next {
-                            return Err(ActorFailure::Fatal(CowshedError::internal(
-                                "controller RPC download nextOffset was not exact",
-                            )));
-                        }
-                        let bytes = read_binary_frame(&mut stream, binary_length)
-                            .await
-                            .map_err(ActorFailure::Fatal)?;
-                        Ok(ActorResponse::Download(BinaryDownload {
-                            bytes,
-                            eof: metadata.eof,
-                        }))
-                    }
-                }
+fn spawn_controller_actor(stream: tokio::net::UnixStream) -> Arc<dyn ControllerRuntime> {
+    let (sender, receiver) = mpsc::channel::<ActorMessage>(32);
+    let (reader, writer) = stream.into_split();
+    let (answers, answer_receiver) = mpsc::unbounded_channel();
+    let downloads = Downloads::default();
+    tokio::spawn(read_answers(reader, Arc::clone(&downloads), answers));
+    tokio::spawn(run_controller_actor(
+        receiver,
+        writer,
+        downloads,
+        answer_receiver,
+    ));
+    Arc::new(ActorRuntime { sender })
+}
+
+/// The stream offset each sent download call continues from, by call id. The actor adds an
+/// entry before it sends the call; the reader takes it out with the answer, and only an answer
+/// that had one may carry a binary frame.
+#[cfg(unix)]
+type Downloads = Arc<std::sync::Mutex<std::collections::HashMap<u64, u64>>>;
+
+/// One answer, validated and taken off the connection whole.
+#[cfg(unix)]
+struct Answer {
+    id: u64,
+    /// What the call gets: its response, or the controller's recoverable error.
+    outcome: Result<ActorResponse>,
+}
+
+#[cfg(unix)]
+async fn read_answers(
+    mut reader: tokio::net::unix::OwnedReadHalf,
+    downloads: Downloads,
+    answers: mpsc::UnboundedSender<Result<Answer>>,
+) {
+    loop {
+        let answer = read_answer(&mut reader, &downloads).await;
+        let failed = answer.is_err();
+        if answers.send(answer).is_err() || failed {
+            return;
+        }
+    }
+}
+
+/// Read and check one answer. `Err` means the connection cannot be read past it; every frame
+/// is checked against its declaration before its bytes are read.
+#[cfg(unix)]
+async fn read_answer(
+    reader: &mut tokio::net::unix::OwnedReadHalf,
+    downloads: &Downloads,
+) -> Result<Answer> {
+    let frame = read_rpc_frame(reader).await?;
+    let response = codec::decode_rpc_response(&frame).map_err(|error| {
+        CowshedError::internal(format!("controller RPC response decoding failed: {error}"))
+    })?;
+    let (id, ok, result, error, binary_length) = response.into_parts();
+    let download = downloads
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(&id);
+    let result = match (ok, result, error) {
+        (true, Some(result), None) => result,
+        (false, None, Some(error)) => {
+            if binary_length.is_some() {
+                return Err(CowshedError::internal(
+                    "controller RPC error response declared unsolicited binary data",
+                ));
             }
-            .await;
-            let (result, stop) = match exchange {
-                Ok(response) => (Ok(response), false),
-                Err(ActorFailure::Recoverable(error)) => (Err(error), false),
-                Err(ActorFailure::Fatal(error)) => (Err(error), true),
-            };
-            let _ = reply.send(result);
-            if stop {
-                break;
+            return Ok(Answer {
+                id,
+                outcome: Err(error),
+            });
+        }
+        _ => {
+            return Err(CowshedError::internal(
+                "controller RPC response has an invalid envelope",
+            ));
+        }
+    };
+    let Some(expected_offset) = download else {
+        if binary_length.is_some() {
+            return Err(CowshedError::internal(
+                "controller RPC response declared unsolicited binary data",
+            ));
+        }
+        return Ok(Answer {
+            id,
+            outcome: Ok(ActorResponse::Json(result)),
+        });
+    };
+    let length = binary_length.ok_or_else(|| {
+        CowshedError::internal("controller RPC download response omitted binaryLength")
+    })?;
+    let length = usize::try_from(length).map_err(|_| {
+        CowshedError::internal("controller RPC binary response length does not fit this platform")
+    })?;
+    if length > MAX_BINARY_FRAME_BYTES {
+        return Err(CowshedError::internal(
+            "controller RPC binary response exceeds the 64 KiB frame limit",
+        ));
+    }
+    let metadata: RpcBinaryResult = serde_json::from_value(result).map_err(|error| {
+        CowshedError::internal(format!(
+            "controller RPC download metadata is invalid: {error}"
+        ))
+    })?;
+    let expected_next = u64::try_from(length)
+        .ok()
+        .and_then(|length| expected_offset.checked_add(length))
+        .ok_or_else(|| CowshedError::internal("controller RPC download offset overflowed"))?;
+    if metadata.next_offset != expected_next {
+        return Err(CowshedError::internal(
+            "controller RPC download nextOffset was not exact",
+        ));
+    }
+    let bytes = read_binary_frame(reader, length).await?;
+    Ok(Answer {
+        id,
+        outcome: Ok(ActorResponse::Download(BinaryDownload {
+            bytes,
+            eof: metadata.eof,
+        })),
+    })
+}
+
+#[cfg(unix)]
+async fn run_controller_actor(
+    mut messages: mpsc::Receiver<ActorMessage>,
+    mut writer: tokio::net::unix::OwnedWriteHalf,
+    downloads: Downloads,
+    mut answers: mpsc::UnboundedReceiver<Result<Answer>>,
+) {
+    let mut pending =
+        std::collections::HashMap::<u64, oneshot::Sender<Result<ActorResponse>>>::new();
+    let mut next_id = 1_u64;
+    let failure = loop {
+        tokio::select! {
+            message = messages.recv() => {
+                // Every handle is gone, and with it every caller that could wait on an answer.
+                let Some(message) = message else { return };
+                let id = next_id;
+                next_id = next_id.saturating_add(1);
+                let (method, params, lane, reply) = match message {
+                    ActorMessage::Json { method, params, reply } => {
+                        (method, params, ActorLane::Json, reply)
+                    }
+                    ActorMessage::Upload { method, params, bytes, reply } => {
+                        (method, params, ActorLane::Upload(bytes), reply)
+                    }
+                    ActorMessage::Download { method, params, expected_offset, reply } => {
+                        (method, params, ActorLane::Download(expected_offset), reply)
+                    }
+                };
+                if let ActorLane::Download(offset) = lane {
+                    downloads
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .insert(id, offset);
+                }
+                if let Err(error) = send_call(&mut writer, id, method, &params, &lane).await {
+                    let _ = reply.send(Err(error.clone()));
+                    break error;
+                }
+                pending.insert(id, reply);
+            }
+            answer = answers.recv() => {
+                let answer = match answer {
+                    Some(Ok(answer)) => answer,
+                    Some(Err(error)) => break error,
+                    None => break actor_reply_error(),
+                };
+                let Some(reply) = pending.remove(&answer.id) else {
+                    break CowshedError::internal(
+                        "controller RPC response id did not match a pending request",
+                    );
+                };
+                let _ = reply.send(answer.outcome);
             }
         }
-    });
-    Arc::new(ActorRuntime { sender })
+    };
+    for (_, reply) in pending.drain() {
+        let _ = reply.send(Err(failure.clone()));
+    }
+}
+
+/// Write one call, and its upload frame, under `id`. Any failure leaves the connection
+/// unusable: the stream may hold part of a frame.
+#[cfg(unix)]
+async fn send_call(
+    writer: &mut tokio::net::unix::OwnedWriteHalf,
+    id: u64,
+    method: &str,
+    params: &Value,
+    lane: &ActorLane,
+) -> Result<()> {
+    let binary_length = match lane {
+        ActorLane::Upload(bytes) => Some(u32::try_from(bytes.len()).map_err(|_| {
+            CowshedError::internal("controller RPC binary request exceeds the 64 KiB frame limit")
+        })?),
+        ActorLane::Json | ActorLane::Download(_) => None,
+    };
+    let request =
+        codec::encode_rpc_request(id, method, params, binary_length).map_err(|error| {
+            if error.is_too_large() {
+                CowshedError::internal("controller RPC request is too large")
+            } else {
+                CowshedError::internal(format!("controller RPC request encoding failed: {error}"))
+            }
+        })?;
+    write_rpc_frame(writer, &request).await?;
+    if let ActorLane::Upload(bytes) = lane {
+        write_binary_frame(writer, bytes).await?;
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
