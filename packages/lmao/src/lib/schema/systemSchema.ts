@@ -338,13 +338,13 @@ export const ENTRY_TYPE_BUFFER_CAPACITY = 24;
  * A signal was admitted and became an engine event - row on the `execute-loop`
  * span, one per admitted signal, with the signal type in the message column.
  */
-export const ENTRY_TYPE_AXE_SIGNAL_ADMITTED = 25;
+export const ENTRY_TYPE_SIGNAL_ADMITTED = 25;
 
 /**
  * A decision became an outbound signal - row on the `route-signals` span, one
  * per routed signal, with the signal type in the message column.
  */
-export const ENTRY_TYPE_AXE_SIGNAL_ROUTED = 26;
+export const ENTRY_TYPE_SIGNAL_ROUTED = 26;
 
 /**
  * Human-readable names for entry types, indexed by entry type code.
@@ -393,7 +393,7 @@ export const ENTRY_TYPE_NAMES = [
   // outbound signal. The signal TYPE rides the message column, following the
   // `ff-access`/`ff-usage` precedent — a 1-byte discriminant plus a name, not a
   // discriminant per name.
-  'axe-signal-admitted', // 25 (row on execute-loop, one per admitted signal)
-  'axe-signal-routed', // 26 (row on route-signals, one per routed signal)
+  'signal-admitted', // 25 (row on execute-loop, one per admitted signal)
+  'signal-routed', // 26 (row on route-signals, one per routed signal)
 ] as const;
 //#endregion smoo/lmao!n/lmao-entry-entry-type-definitions
