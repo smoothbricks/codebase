@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'bun:test';
-import { existsSync, readFileSync, realpathSync } from 'node:fs';
+import { existsSync, readFileSync, readlinkSync, realpathSync, symlinkSync } from 'node:fs';
 import { chmod, copyFile, cp, mkdir, mkdtemp, rm, utimes, writeFile } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
@@ -84,7 +84,7 @@ async function withManagedRepository(
     await mkdir(join(root, 'tooling', 'git-hooks'), { recursive: true });
     await mkdir(ledgers);
     await mkdir(bin);
-    for (const name of ['setup-environment.ts', 'secret-references.ts']) {
+    for (const name of ['setup-environment.ts', 'developer-links.ts', 'secret-references.ts']) {
       await copyFile(join(MANAGED, 'tooling', 'direnv', name), join(root, 'tooling', 'direnv', name));
     }
     await copyFile(join(MANAGED, 'envrc'), join(root, '.envrc'));
@@ -422,6 +422,69 @@ describe('what shell entry installs', () => {
         );
       },
     );
+  });
+});
+
+describe('what shell entry keeps linked', () => {
+  // Three workspace members, so the install links two of them into the third's
+  // node_modules with no registry involved: `@fixture/lib` under a scope,
+  // `util` without one. Bun relinks both on every install, as it does a
+  // registry package.
+  const APP = 'packages/app';
+  const LINKED = `${APP}/node_modules/@fixture/lib`;
+  const UNLINKED = `${APP}/node_modules/util`;
+  const WORKSPACE = {
+    workspaces: ['packages/*'],
+    files: {
+      'bunfig.toml': '[install]\nlinker = "isolated"\n',
+      [`${APP}/package.json`]: JSON.stringify({
+        name: 'app',
+        version: '0.0.0',
+        dependencies: { '@fixture/lib': 'workspace:*', util: 'workspace:*' },
+      }),
+      'packages/lib/package.json': JSON.stringify({ name: '@fixture/lib', version: '0.0.0' }),
+      'packages/util/package.json': JSON.stringify({ name: 'util', version: '0.0.0' }),
+    },
+  };
+
+  /** Moves the install digest, so the next entry installs. */
+  const touchManifest = (root: string) =>
+    edit(join(root, 'packages/util/package.json'), JSON.stringify({ name: 'util', version: '0.0.1' }));
+
+  it('puts a link to a local checkout back after the install it runs, and leaves every other link as bun wrote it', async () => {
+    await withManagedRepository(WORKSPACE, async ({ root, enterShell: enter, count }) => {
+      expect(await enter()).toEqual(HEALTHY);
+      expect(readlinkSync(join(root, LINKED))).toBe('../../../lib');
+      // A local build of @fixture/lib beside the checkout, linked the way `bun
+      // link` or `ln -s` does.
+      const local = join(dirname(root), 'local-lib');
+      await mkdir(local);
+      await writeFile(join(local, 'package.json'), JSON.stringify({ name: '@fixture/lib', version: '9.9.9' }));
+      await rm(join(root, LINKED));
+      symlinkSync(local, join(root, LINKED));
+
+      await touchManifest(root);
+      expect(await enter()).toEqual({ exitCode: 0, stderr: `developer links kept: ${LINKED} -> ${local}\n` });
+      expect(count('install')).toBe(2);
+      expect(readlinkSync(join(root, LINKED))).toBe(local);
+      expect(readlinkSync(join(root, UNLINKED))).toBe('../../util');
+    });
+  });
+
+  it('removes a link whose local checkout is gone, says so, and lets the install put the lockfile version there', async () => {
+    await withManagedRepository(WORKSPACE, async ({ root, enterShell: enter }) => {
+      expect(await enter()).toEqual(HEALTHY);
+      const gone = join(dirname(root), 'deleted-lib');
+      await rm(join(root, LINKED));
+      symlinkSync(gone, join(root, LINKED));
+
+      await touchManifest(root);
+      expect(await enter()).toEqual({
+        exitCode: 0,
+        stderr: `! removed developer link ${LINKED}: its target ${gone} no longer exists\n`,
+      });
+      expect(readlinkSync(join(root, LINKED))).toBe('../../../lib');
+    });
   });
 });
 

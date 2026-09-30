@@ -19,6 +19,7 @@ import { createRequire } from 'node:module';
 import path from 'node:path';
 import { parseArgs } from 'node:util';
 import { $ } from 'bun';
+import { keepDeveloperLinks } from './developer-links.ts';
 import {
   type DeferredSecret,
   dependentGroups,
@@ -142,18 +143,20 @@ try {
     await withInstallLock(async () => {
       let frozenError: unknown;
       let fallbackError: unknown;
-      try {
-        await runSetupCommand('bun install --frozen-lockfile', $`bun install --frozen-lockfile`, { quiet: false });
-      } catch (error) {
-        frozenError = error;
-        console.error('! Failed to install dependencies with frozen lockfile');
-        replayCapturedOutput(error);
+      await keepDeveloperLinks(projectRoot, async () => {
         try {
-          await runSetupCommand('bun install', $`bun install`, { quiet: false });
-        } catch (fallback) {
-          fallbackError = fallback;
+          await runSetupCommand('bun install --frozen-lockfile', $`bun install --frozen-lockfile`, { quiet: false });
+        } catch (error) {
+          frozenError = error;
+          console.error('! Failed to install dependencies with frozen lockfile');
+          replayCapturedOutput(error);
+          try {
+            await runSetupCommand('bun install', $`bun install`, { quiet: false });
+          } catch (fallback) {
+            fallbackError = fallback;
+          }
         }
-      }
+      });
       if (fallbackError !== undefined) {
         reportSetupFailure(fallbackError);
       }
@@ -329,7 +332,9 @@ function bunInstaller(inputs: readonly string[]): Installer {
       readInstallStamp(stampPath)?.inputs === inputsDigest(identity, inputs) &&
       findInstalledTypeScriptApiPackage(projectRoot) !== null,
     install: async ({ quiet }) => {
-      await runSetupCommand('bun install --no-summary', $`bun install --no-summary`, { quiet });
+      await keepDeveloperLinks(projectRoot, () =>
+        runSetupCommand('bun install --no-summary', $`bun install --no-summary`, { quiet }),
+      );
       writeInstallStamp(stampPath, { inputs: inputsDigest(identity, inputs) });
     },
   };

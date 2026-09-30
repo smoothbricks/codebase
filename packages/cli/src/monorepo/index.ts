@@ -13,6 +13,7 @@ import {
   validateBreakingDisclosure,
   validateCommitMessage,
 } from './commit-msg.js';
+import { keepDeveloperLinks } from './developer-links.js';
 import { applyWorkspaceGitConfig } from './git-config.js';
 import { syncBunLockfileVersions } from './lockfile.js';
 import {
@@ -131,7 +132,7 @@ export async function updateManagedFiles(root: string): Promise<void> {
   await syncRootRuntimeVersions(root);
   syncBunLockfileVersions(root, { mode: 'install' });
   console.log('installing     workspace dependencies (bun install)');
-  await run('bun', ['install', '--no-summary'], root);
+  await keepDeveloperLinks(root, () => run('bun', ['install', '--no-summary'], root));
 }
 
 /**

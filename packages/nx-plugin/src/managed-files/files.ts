@@ -111,6 +111,11 @@ const managedFiles: ManagedFileDescriptor[] = [
   },
   {
     kind: 'raw',
+    source: 'tooling/direnv/developer-links.ts',
+    target: 'tooling/direnv/developer-links.ts',
+  },
+  {
+    kind: 'raw',
     source: 'tooling/direnv/secret-references.ts',
     target: 'tooling/direnv/secret-references.ts',
   },

@@ -402,6 +402,30 @@ nothing when nothing changed:
   that command. A daemon still asks GitHub for `nrwl/nx-ai-agents-config` when an agent has both rules and Nx's MCP
   configured, to tell whether that configuration is outdated; a cowshed sandbox runs Nx without a daemon.
 
+### Linking Local Packages
+
+To run a repository against a local build of a package it depends on, point that package's `node_modules` entry at the
+local checkout. Register the checkout once with `bun link`, run from inside it. Then link the entry: from the repository
+root, `bun link <name>` links the root's `node_modules/<name>`. In a workspace member, `bun link <name>` fails with
+`<sibling>@workspace:* failed to resolve`, because it installs the member as its own root and finds none of its
+`workspace:*` siblings ([oven-sh/bun#24190][bun-link-workspace]). There, link the entry by hand:
+
+```bash
+(cd ~/src/smoothbricks/packages/cowshed && bun link)
+ln -sfn ~/src/smoothbricks/packages/cowshed packages/app/node_modules/@smoothbricks/cowshed
+```
+
+Every install smoo runs keeps such a link: shell entry's install, a CI runner's frozen-lockfile install and
+`smoo monorepo update`. A developer link is any symlink directly in the root's or a workspace member's `node_modules`
+(scoped names included) whose target lies outside the repository. The install records these links first, then puts
+exactly those back afterwards and prints one line naming them (`developer links kept: …`). A link whose target no longer
+exists is removed with a warning, and that install puts the lockfile's version in its place. To unlink, remove the link:
+the next install puts the lockfile's version there.
+
+A plain `bun install`, `bun add` or `bun remove` re-points every declared dependency at its lockfile version, links
+included. Bun does this before the root `preinstall` script runs, so no lifecycle script can keep a link. smoo has no
+command that brings a link back once it has been replaced, so after a plain install you have to link again.
+
 ## Formatting And Git Hooks
 
 The root `lint:fix` script runs [`git-format-staged`][git-format-staged] with
@@ -1106,6 +1130,7 @@ smoo monorepo validate
 
 [are-the-types-wrong]: https://github.com/arethetypeswrong/arethetypeswrong.github.io/tree/main/packages/cli
 [Bun]: https://bun.sh/
+[bun-link-workspace]: https://github.com/oven-sh/bun/issues/24190
 [Cachix]: https://www.cachix.org/
 [CommonJS]: https://nodejs.org/api/modules.html
 [Conventional Commits]: https://www.conventionalcommits.org/
