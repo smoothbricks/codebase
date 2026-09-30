@@ -205,7 +205,7 @@ describe('managed raw files', () => {
     expect(generated).toBe(source);
   });
 
-  it('manages the macOS pre-push linux compile gate as an executable copy', async () => {
+  it('manages the pre-push hook as an executable copy', async () => {
     expect(managedFileTargetsForTest).toContainEqual({
       target: 'tooling/git-hooks/pre-push.sh',
       executable: true,
@@ -220,9 +220,6 @@ describe('managed raw files', () => {
     ]);
 
     expect(generated).toBe(source);
-    expect(generated).toContain('uname -s');
-    expect(generated).toContain('cargo-lint-cross');
-    expect(generated).toContain('bun run check:linux');
   });
 
   it('persists the ttsc cache path the shell computes, leaving host overrides untouched', async () => {

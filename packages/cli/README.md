@@ -425,11 +425,27 @@ This keeps hook behavior consistent with CI and avoids duplicating commit messag
 wraps prose body paragraphs through `fmt -w 72` while preserving fenced code blocks, quoted markdown, indented blocks,
 bullets, trailers, URLs, and comment lines.
 
-The generated pre-push hook runs only on macOS. Linux `nx lint` already compiles the Linux `cfg(target_os)` arm; Darwin
-does not. The hook is a probe: it runs `env -u CC_x86_64_unknown_linux_gnu nx run-many -t cargo-lint-cross` and nothing
-else. Nx caches that target on the Cargo inputs, so a hit is a prior real Linux clippy and the push proceeds. A miss
-refuses the push and names `bun run check:linux` — the hook never enters linux-cross and never starts a compile, so what
-it costs is one Nx graph construction rather than an unbounded clippy. `bun run check:linux` is
+The generated pre-push hook runs two gates. The first runs on every OS and guards a public repository against naming
+what is private to the people working on it:
+
+```bash
+smoo monorepo check-public-denylist <pushed-sha...>
+```
+
+It judges the tree of every commit the push publishes (never the working tree; a ref deletion publishes nothing) against
+patterns kept outside the repository, so the guard never publishes what it guards: each value of this clone's local
+`smoothbricks.publicDenylist` git config, plus each line of `SMOOTHBRICKS_PUBLIC_DENYLIST`. Every pattern is a
+Perl-compatible regex matched case-insensitively by `git grep -I -i -P` over text files; binary files are not read. Any
+match refuses the push and prints each offending `<sha>:<path>:<line>:<text>`. A pattern git cannot compile refuses the
+push too, so a typo cannot silently disable the guard. With no pattern configured the check passes silently, which is
+what CI and every clone that never set one see. Add a pattern with
+`git config --add smoothbricks.publicDenylist '<regex>'`; run the command bare to judge `HEAD` before pushing.
+
+The second gate runs only on macOS. Linux `nx lint` already compiles the Linux `cfg(target_os)` arm; Darwin does not.
+This gate is a probe: it runs `env -u CC_x86_64_unknown_linux_gnu nx run-many -t cargo-lint-cross` and nothing else. Nx
+caches that target on the Cargo inputs, so a hit is a prior real Linux clippy and the push proceeds. A miss refuses the
+push and names `bun run check:linux` — the hook never enters linux-cross and never starts a compile, so what it costs is
+one Nx graph construction rather than an unbounded clippy. `bun run check:linux` is
 `tooling/devenv -P linux-cross shell --` around that same Nx target; it is the only place the gate actually runs, so it
 is deliberately not quiet. `git push --no-verify` skips the hook.
 

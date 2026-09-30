@@ -1,5 +1,13 @@
 #!/usr/bin/env bash
-# macOS-only Linux cross-compile gate. This hook is a cache PROBE and nothing
+# Two gates, in order.
+#
+# 1. On every OS, the public-tree denylist: every commit this push publishes
+# is refused if its tree matches a pattern from this clone's local
+# `smoothbricks.publicDenylist` git config (or SMOOTHBRICKS_PUBLIC_DENYLIST).
+# The patterns live outside the repository so the guard never publishes what
+# it guards; with none configured the check passes silently.
+#
+# 2. The macOS-only Linux cross-compile gate. It is a cache PROBE and nothing
 # else: it reads the nx cache and never compiles. A hit means a real
 # `cargo clippy --target x86_64-unknown-linux-gnu` already passed for exactly
 # this tree, so the push is safe with no toolchain present. Anything else
@@ -30,6 +38,19 @@ export PATH="$("$TOOLING/direnv/repo-path")"
 # JavaScript compiler a package's `typescript` dependency names and refuse to run.
 if [ -z "${TTSC_TSGO_BINARY:-}" ] && [ -x "$PWD/node_modules/@typescript/native/bin/tsc" ]; then
   export TTSC_TSGO_BINARY="$PWD/node_modules/@typescript/native/bin/tsc"
+fi
+
+# git hands a pre-push hook one `<local ref> <local sha> <remote ref> <remote sha>`
+# line per ref it updates; an all-zero local sha is a deletion, which publishes
+# no tree.
+pushed=()
+while read -r _local_ref local_sha _remote_ref _remote_sha; do
+  case "$local_sha" in
+    *[!0]*) pushed+=("$local_sha") ;;
+  esac
+done
+if [ "${#pushed[@]}" -gt 0 ]; then
+  smoo monorepo check-public-denylist "${pushed[@]}" || exit 1
 fi
 
 case "$(uname -s)" in
