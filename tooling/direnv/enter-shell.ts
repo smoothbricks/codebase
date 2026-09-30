@@ -15,9 +15,11 @@ await rebuildNxPluginIfStale();
 
 await syncRuntimePinsIfDrifted();
 
-/** Shell entry tracks runtime pins: cheap local `--version` probes, sync on drift, best-effort (offline failure warns, validate is the gate, CI never rewrites). */
+/** Shell entry tracks runtime pins: cheap local `--version` probes, sync on drift, best-effort (offline failure warns, validate is the gate, a CI runner never rewrites). */
 async function syncRuntimePinsIfDrifted(): Promise<void> {
-  if (process.env.CI) {
+  // A CI runner never rewrites pins. GITHUB_ACTIONS, not CI: agent harnesses set
+  // CI=true on every command, and keying on it left the pins drifting locally.
+  if (process.env.GITHUB_ACTIONS === 'true') {
     return;
   }
   const manifest = await Bun.file(path.join(projectRoot, 'package.json'))
