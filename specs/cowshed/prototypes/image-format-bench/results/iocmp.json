@@ -1,0 +1,245 @@
+{
+  "A": {
+    "fill_s": 25.9,
+    "git_status_ms": 314.9,
+    "create_ops": 13811.0,
+    "symlink_ops": 26684.0,
+    "unlink_ops": 31149.0,
+    "seq_write_MBps": 3201.0,
+    "seq_read_MBps": 15022.0,
+    "samples": [
+      {
+        "git_status_ms": 279.2,
+        "create_ops": 20571.0,
+        "symlink_ops": 36893.0,
+        "unlink_ops": 45762.0,
+        "seq_write_MBps": 3284.0,
+        "seq_read_MBps": 19519.0,
+        "bytes": 1073741824.0,
+        "load1": 12.6
+      },
+      {
+        "git_status_ms": 316.0,
+        "create_ops": 14959.0,
+        "symlink_ops": 26684.0,
+        "unlink_ops": 31149.0,
+        "seq_write_MBps": 2740.0,
+        "seq_read_MBps": 15537.0,
+        "bytes": 1073741824.0,
+        "load1": 15.8
+      },
+      {
+        "git_status_ms": 441.3,
+        "create_ops": 8226.0,
+        "symlink_ops": 18942.0,
+        "unlink_ops": 21206.0,
+        "seq_write_MBps": 2740.0,
+        "seq_read_MBps": 14369.0,
+        "bytes": 1073741824.0,
+        "load1": 22.0
+      },
+      {
+        "git_status_ms": 314.9,
+        "create_ops": 14853.0,
+        "symlink_ops": 27868.0,
+        "unlink_ops": 32063.0,
+        "seq_write_MBps": 3264.0,
+        "seq_read_MBps": 12076.0,
+        "bytes": 1073741824.0,
+        "load1": 22.7
+      },
+      {
+        "git_status_ms": 512.2,
+        "create_ops": 9092.0,
+        "symlink_ops": 12644.0,
+        "unlink_ops": 23920.0,
+        "seq_write_MBps": 3110.0,
+        "seq_read_MBps": 13799.0,
+        "bytes": 1073741824.0,
+        "load1": 32.3
+      },
+      {
+        "git_status_ms": 300.4,
+        "create_ops": 12914.0,
+        "symlink_ops": 24841.0,
+        "unlink_ops": 29817.0,
+        "seq_write_MBps": 3201.0,
+        "seq_read_MBps": 15022.0,
+        "bytes": 1073741824.0,
+        "load1": 25.8
+      },
+      {
+        "git_status_ms": 310.4,
+        "create_ops": 13811.0,
+        "symlink_ops": 33317.0,
+        "unlink_ops": 32729.0,
+        "seq_write_MBps": 3279.0,
+        "seq_read_MBps": 15560.0,
+        "bytes": 1073741824.0,
+        "load1": 23.9
+      }
+    ]
+  },
+  "B": {
+    "fill_s": 21.0,
+    "git_status_ms": 343.7,
+    "create_ops": 14516.0,
+    "symlink_ops": 25955.0,
+    "unlink_ops": 28200.0,
+    "seq_write_MBps": 3202.0,
+    "seq_read_MBps": 15258.0,
+    "samples": [
+      {
+        "git_status_ms": 274.4,
+        "create_ops": 22276.0,
+        "symlink_ops": 40356.0,
+        "unlink_ops": 44660.0,
+        "seq_write_MBps": 2969.0,
+        "seq_read_MBps": 17539.0,
+        "bytes": 1073741824.0,
+        "load1": 12.6
+      },
+      {
+        "git_status_ms": 327.6,
+        "create_ops": 14516.0,
+        "symlink_ops": 27939.0,
+        "unlink_ops": 29131.0,
+        "seq_write_MBps": 2852.0,
+        "seq_read_MBps": 15325.0,
+        "bytes": 1073741824.0,
+        "load1": 15.5
+      },
+      {
+        "git_status_ms": 343.7,
+        "create_ops": 11360.0,
+        "symlink_ops": 26731.0,
+        "unlink_ops": 26508.0,
+        "seq_write_MBps": 2726.0,
+        "seq_read_MBps": 15507.0,
+        "bytes": 1073741824.0,
+        "load1": 22.5
+      },
+      {
+        "git_status_ms": 348.1,
+        "create_ops": 15114.0,
+        "symlink_ops": 25955.0,
+        "unlink_ops": 28200.0,
+        "seq_write_MBps": 3202.0,
+        "seq_read_MBps": 14085.0,
+        "bytes": 1073741824.0,
+        "load1": 22.6
+      },
+      {
+        "git_status_ms": 316.0,
+        "create_ops": 15567.0,
+        "symlink_ops": 25385.0,
+        "unlink_ops": 27724.0,
+        "seq_write_MBps": 3257.0,
+        "seq_read_MBps": 15020.0,
+        "bytes": 1073741824.0,
+        "load1": 21.2
+      },
+      {
+        "git_status_ms": 359.5,
+        "create_ops": 13599.0,
+        "symlink_ops": 25127.0,
+        "unlink_ops": 28744.0,
+        "seq_write_MBps": 3691.0,
+        "seq_read_MBps": 15258.0,
+        "bytes": 1073741824.0,
+        "load1": 25.0
+      },
+      {
+        "git_status_ms": 374.2,
+        "create_ops": 12830.0,
+        "symlink_ops": 22643.0,
+        "unlink_ops": 25722.0,
+        "seq_write_MBps": 3382.0,
+        "seq_read_MBps": 13589.0,
+        "bytes": 1073741824.0,
+        "load1": 23.7
+      }
+    ]
+  },
+  "C": {
+    "fill_s": 59.4,
+    "git_status_ms": 318.9,
+    "create_ops": 1331.0,
+    "symlink_ops": 1690.0,
+    "unlink_ops": 4382.0,
+    "seq_write_MBps": 751.0,
+    "seq_read_MBps": 2012.0,
+    "samples": [
+      {
+        "git_status_ms": 262.2,
+        "create_ops": 2101.0,
+        "symlink_ops": 3450.0,
+        "unlink_ops": 4382.0,
+        "seq_write_MBps": 868.0,
+        "seq_read_MBps": 2304.0,
+        "bytes": 1073741824.0,
+        "load1": 15.3
+      },
+      {
+        "git_status_ms": 290.3,
+        "create_ops": 1531.0,
+        "symlink_ops": 1828.0,
+        "unlink_ops": 3211.0,
+        "seq_write_MBps": 728.0,
+        "seq_read_MBps": 1776.0,
+        "bytes": 1073741824.0,
+        "load1": 15.2
+      },
+      {
+        "git_status_ms": 292.1,
+        "create_ops": 1207.0,
+        "symlink_ops": 1495.0,
+        "unlink_ops": 4062.0,
+        "seq_write_MBps": 751.0,
+        "seq_read_MBps": 1887.0,
+        "bytes": 1073741824.0,
+        "load1": 20.3
+      },
+      {
+        "git_status_ms": 331.4,
+        "create_ops": 1234.0,
+        "symlink_ops": 1281.0,
+        "unlink_ops": 5088.0,
+        "seq_write_MBps": 1066.0,
+        "seq_read_MBps": 2891.0,
+        "bytes": 1073741824.0,
+        "load1": 19.8
+      },
+      {
+        "git_status_ms": 335.3,
+        "create_ops": 1134.0,
+        "symlink_ops": 1062.0,
+        "unlink_ops": 3517.0,
+        "seq_write_MBps": 616.0,
+        "seq_read_MBps": 2140.0,
+        "bytes": 1073741824.0,
+        "load1": 28.9
+      },
+      {
+        "git_status_ms": 318.9,
+        "create_ops": 1417.0,
+        "symlink_ops": 1690.0,
+        "unlink_ops": 4505.0,
+        "seq_write_MBps": 572.0,
+        "seq_read_MBps": 2012.0,
+        "bytes": 1073741824.0,
+        "load1": 25.8
+      },
+      {
+        "git_status_ms": 384.0,
+        "create_ops": 1331.0,
+        "symlink_ops": 1877.0,
+        "unlink_ops": 6471.0,
+        "seq_write_MBps": 1045.0,
+        "seq_read_MBps": 1600.0,
+        "bytes": 1073741824.0,
+        "load1": 19.7
+      }
+    ]
+  }
+}

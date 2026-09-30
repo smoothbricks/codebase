@@ -1,0 +1,168 @@
+{
+  "fmt": "A",
+  "variant": "inclone",
+  "phases": [
+    {
+      "stage": "create",
+      "create_ms": 1782.4,
+      "blank_ms": 1378.3,
+      "attach_ms": 161.0,
+      "newfs_ms": 176.5,
+      "eject_ms": 66.6,
+      "load1": 4.6
+    },
+    {
+      "stage": "lifecycle-empty",
+      "detach_ms": 289.7,
+      "attach_ms": 181.1,
+      "fsck_ms": 9.3,
+      "mount_ms": 9.2,
+      "attach_total_ms": 199.9,
+      "load1": 5.0
+    },
+    {
+      "stage": "fill",
+      "fill_ms": 110651.8,
+      "detach_ms": 11321.8,
+      "attach_ms": 235.2,
+      "fsck_ms": 9.0,
+      "mount_ms": 26.8,
+      "attach_total_ms": 271.0,
+      "load1": 15.3
+    },
+    {
+      "stage": "filled",
+      "extents": 356,
+      "regions": 10,
+      "alloc_gib": 5.91,
+      "data_gib": 5.91,
+      "count_ms": 0.4,
+      "clonefile_ms_median": 0.08,
+      "firstwrite_ms": 7.5,
+      "firstwrite_fsync_ms": 0.1,
+      "delete_written_clone_ms": 1.9,
+      "load1": 15.3
+    },
+    {
+      "stage": "shed-clone",
+      "clonefile_ms": 0.09,
+      "load1": 15.3
+    },
+    {
+      "stage": "churn1",
+      "rewrite_gib": 2.0,
+      "rewrite_ms": 3239,
+      "relinked": 46575,
+      "relink_ms": 6956,
+      "detach_ms": 598.5,
+      "attach_ms": 188.4,
+      "fsck_ms": 5.6,
+      "mount_ms": 72.8,
+      "attach_total_ms": 266.8,
+      "load1": 15.8
+    },
+    {
+      "stage": "after-churn1",
+      "extents": 356,
+      "regions": 10,
+      "alloc_gib": 5.91,
+      "data_gib": 5.91,
+      "count_ms": 0.8,
+      "clonefile_ms_median": 0.15,
+      "firstwrite_ms": 16.3,
+      "firstwrite_fsync_ms": 0.1,
+      "delete_written_clone_ms": 1.2,
+      "load1": 15.8
+    },
+    {
+      "stage": "shed-after-churn1",
+      "shed_extents": 472,
+      "shed_alloc_gib": 7.925,
+      "load1": 15.8
+    },
+    {
+      "stage": "churn2",
+      "rewrite_gib": 2.0,
+      "rewrite_ms": 3702,
+      "relinked": 46575,
+      "relink_ms": 4624,
+      "detach_ms": 421.7,
+      "attach_ms": 337.3,
+      "fsck_ms": 18.4,
+      "mount_ms": 20.8,
+      "attach_total_ms": 376.5,
+      "load1": 15.3
+    },
+    {
+      "stage": "after-churn2",
+      "extents": 356,
+      "regions": 10,
+      "alloc_gib": 5.91,
+      "data_gib": 5.91,
+      "count_ms": 0.6,
+      "clonefile_ms_median": 0.14,
+      "firstwrite_ms": 4.5,
+      "firstwrite_fsync_ms": 2.5,
+      "delete_written_clone_ms": 3.5,
+      "load1": 15.3
+    },
+    {
+      "stage": "shed-after-churn2",
+      "shed_extents": 5003,
+      "shed_alloc_gib": 8.864,
+      "load1": 15.3
+    },
+    {
+      "stage": "churn3",
+      "rewrite_gib": 2.0,
+      "rewrite_ms": 3648,
+      "relinked": 46575,
+      "relink_ms": 4273,
+      "detach_ms": 413.4,
+      "attach_ms": 203.4,
+      "fsck_ms": 9.8,
+      "mount_ms": 50.2,
+      "attach_total_ms": 263.4,
+      "load1": 16.8
+    },
+    {
+      "stage": "after-churn3",
+      "extents": 356,
+      "regions": 10,
+      "alloc_gib": 5.91,
+      "data_gib": 5.91,
+      "count_ms": 0.2,
+      "clonefile_ms_median": 0.12,
+      "firstwrite_ms": 3.4,
+      "firstwrite_fsync_ms": 0.1,
+      "delete_written_clone_ms": 1.6,
+      "load1": 16.8
+    },
+    {
+      "stage": "shed-after-churn3",
+      "shed_extents": 8699,
+      "shed_alloc_gib": 8.866,
+      "load1": 16.8
+    },
+    {
+      "stage": "defrag",
+      "copy_ms": 1943.0,
+      "copy_MBps": 3266.0,
+      "copied_gib": 5.91,
+      "extents_after": 572,
+      "firstwrite_after_ms": 3.0,
+      "verify_attach_ok": true,
+      "detach_ms": 296.2,
+      "attach_ms": 200.4,
+      "fsck_ms": 9.6,
+      "mount_ms": 78.4,
+      "attach_total_ms": 288.4,
+      "load1": 16.8
+    },
+    {
+      "stage": "cleanup-held",
+      "rm_ms": 85,
+      "load1": 16.8
+    }
+  ]
+}

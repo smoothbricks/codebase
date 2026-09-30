@@ -1,0 +1,42 @@
+{
+  "fmt": "B",
+  "create_ms": [455.6, 432.1, 477.9, 388.4, 448.3],
+  "attach_total_ms": [230.2, 199.0, 195.9, 203.5, 234.3],
+  "detach_ms": [326.2, 261.8, 276.6, 276.8, 264.3],
+  "median": {
+    "create_ms": 448.3,
+    "attach_total_ms": 203.5,
+    "detach_ms": 276.6
+  },
+  "literal_fs_APFS_create_ms": [495.2, 499.2, 482.9, 489.5, 468.6],
+  "io_median": {
+    "create_ops": 16354.0,
+    "symlink_ops": 32534.0,
+    "unlink_ops": 33916.0,
+    "seq_write_MBps": 3423.0,
+    "seq_read_MBps": 18055.0
+  },
+  "reclaim": {
+    "alloc_after_write_mib": 3374.4,
+    "alloc_after_delete_mib": 2068.5,
+    "alloc_after_remount_mib": 2068.5,
+    "regions_after_write": 3.0,
+    "regions_after_delete": 2.0,
+    "regions_after_remount": 2.0,
+    "length_mib": 2070.0,
+    "diskutil_create_from_ms": 125.9,
+    "alloc_after_create_from_mib": 15.0
+  },
+  "resize_attached": [1, "Error: \nThe operation couldn\u2019t be completed. Resource busy"],
+  "attached_file_locks": {
+    "shlock": "Resource temporarily unavailable",
+    "exlock": "Resource temporarily unavailable"
+  },
+  "convert_while_attached": [
+    1,
+    "[99% completed] Error: Failed to create disk image: The operation couldn\u2019t be completed. Resource temporarily unavailable"
+  ],
+  "resize_detached_ms": 539.2,
+  "capacity_after_resize_gib": 186.3,
+  "clone_case_sensitive": 0
+}

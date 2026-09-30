@@ -1,0 +1,54 @@
+{
+  "fmt": "A",
+  "store_bytes": 7998498930688,
+  "100GiB": {
+    "capacity_bytes": 107374182400,
+    "file_length_gib": 0.0,
+    "alloc_after_create_mib": 14.1,
+    "host_free_delta_mib": 396.9,
+    "create_ms": [830.8, 701.5, 710.3],
+    "df_size_gib": 100.0,
+    "df_avail_gib": 99.9,
+    "attach_total_ms": [262.9, 287.9, 305.2],
+    "fsck_ms": [9.6, 11.3, 13.1],
+    "detach_ms": [336.3, 385.3, 317.4],
+    "fill_ms": 23156.8,
+    "filled_alloc_gib": 5.919,
+    "filled_extents": 374,
+    "churned_alloc_gib": 7.933,
+    "churned_extents": 455
+  },
+  "store-size": {
+    "capacity_bytes": 7998498930688,
+    "file_length_gib": 0.0,
+    "alloc_after_create_mib": 17.1,
+    "host_free_delta_mib": 31.5,
+    "create_ms": [455.9, 463.5, 462.8],
+    "df_size_gib": 7449.2,
+    "df_avail_gib": 2685.6,
+    "attach_total_ms": [249.0, 240.4, 240.8],
+    "fsck_ms": [9.6, 9.9, 10.4],
+    "detach_ms": [307.1, 287.4, 284.4],
+    "fill_ms": 18795.5,
+    "filled_alloc_gib": 5.919,
+    "filled_extents": 677,
+    "churned_alloc_gib": 7.933,
+    "churned_extents": 932
+  },
+  "grow_100GiB_to_store_size": {
+    "resize_ms": 542.3,
+    "attach_total_ms": 215.2,
+    "df_before_grow": {
+      "df_size_gib": 7449.2,
+      "df_avail_gib": 2677.9
+    },
+    "grow_ms": 47.7,
+    "grow_rc": 1,
+    "grow_tail": "d in your partition map which is missing or too small, which is often caused by an attempt to grow a partition beyond the beginning of another partition or beyond the end of partition map usable space",
+    "df_after_grow": {
+      "df_size_gib": 7449.2,
+      "df_avail_gib": 2677.9
+    },
+    "alloc_after_grow_gib": 7.938
+  }
+}

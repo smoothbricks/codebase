@@ -1,0 +1,41 @@
+{
+  "fmt": "A",
+  "create_ms": [441.2, 460.6, 398.5, 397.8, 496.4],
+  "attach_total_ms": [194.7, 233.0, 196.6, 228.0, 229.5],
+  "detach_ms": [238.8, 265.0, 386.6, 2192.3, 337.3],
+  "median": {
+    "create_ms": 441.2,
+    "attach_total_ms": 228.0,
+    "detach_ms": 337.3
+  },
+  "io_median": {
+    "create_ops": 9528.0,
+    "symlink_ops": 18913.0,
+    "unlink_ops": 21963.0,
+    "seq_write_MBps": 2873.0,
+    "seq_read_MBps": 14955.0
+  },
+  "reclaim": {
+    "alloc_after_write_mib": 3377.4,
+    "alloc_after_delete_mib": 2066.5,
+    "alloc_after_remount_mib": 2066.5,
+    "regions_after_write": 3.0,
+    "regions_after_delete": 2.0,
+    "regions_after_remount": 2.0,
+    "length_mib": 2068.0,
+    "diskutil_create_from_ms": 181.1,
+    "alloc_after_create_from_mib": 15.0
+  },
+  "resize_attached": [1, "Error: \nThe operation couldn\u2019t be completed. Resource busy"],
+  "attached_file_locks": {
+    "shlock": "Resource temporarily unavailable",
+    "exlock": "Resource temporarily unavailable"
+  },
+  "convert_while_attached": [
+    1,
+    "[99% completed] Error: Failed to create disk image: The operation couldn\u2019t be completed. Resource temporarily unavailable"
+  ],
+  "resize_detached_ms": 460.2,
+  "capacity_after_resize_gib": 186.3,
+  "clone_case_sensitive": 1
+}

@@ -1,0 +1,38 @@
+{
+  "fmt": "C",
+  "create_ms": [1046.5, 1084.7, 1114.2, 1027.1, 1035.2],
+  "attach_total_ms": [317.4, 273.8, 332.2, 308.1, 218.4],
+  "detach_ms": [360.0, 489.8, 379.6, 225.4, 210.4],
+  "median": {
+    "create_ms": 1046.5,
+    "attach_total_ms": 308.1,
+    "detach_ms": 360.0
+  },
+  "io_median": {
+    "create_ops": 2678.0,
+    "symlink_ops": 2094.0,
+    "unlink_ops": 5584.0,
+    "seq_write_MBps": 1222.0,
+    "seq_read_MBps": 2179.0
+  },
+  "reclaim": {
+    "alloc_after_write_mib": 3354.0,
+    "alloc_after_delete_mib": 3354.0,
+    "alloc_after_remount_mib": 3354.0,
+    "regions_after_write": 1.0,
+    "regions_after_delete": 1.0,
+    "regions_after_remount": 1.0,
+    "length_mib": 3354.0,
+    "hdiutil_compact_ms": 738.3,
+    "alloc_after_compact_mib": 3297.0
+  },
+  "resize_attached": [35, "hdiutil: resize: failed. Resource temporarily unavailable (35)"],
+  "attached_file_locks": {
+    "shlock": "Resource temporarily unavailable",
+    "exlock": "Resource temporarily unavailable"
+  },
+  "convert_while_attached": [1, "hdiutil: convert failed - Resource temporarily unavailable"],
+  "resize_detached_ms": 497.5,
+  "capacity_after_resize_gib": 200.0,
+  "clone_case_sensitive": 1
+}

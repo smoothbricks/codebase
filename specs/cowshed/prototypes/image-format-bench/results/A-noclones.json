@@ -1,0 +1,163 @@
+{
+  "fmt": "A",
+  "variant": "noclones",
+  "phases": [
+    {
+      "stage": "create",
+      "create_ms": 412.1,
+      "blank_ms": 57.0,
+      "attach_ms": 165.2,
+      "newfs_ms": 100.5,
+      "eject_ms": 89.4,
+      "load1": 10.3
+    },
+    {
+      "stage": "lifecycle-empty",
+      "detach_ms": 256.4,
+      "attach_ms": 184.7,
+      "fsck_ms": 8.8,
+      "mount_ms": 8.4,
+      "attach_total_ms": 200.3,
+      "load1": 10.3
+    },
+    {
+      "stage": "fill",
+      "fill_ms": 16534.0,
+      "detach_ms": 1730.8,
+      "attach_ms": 210.2,
+      "fsck_ms": 9.1,
+      "mount_ms": 13.6,
+      "attach_total_ms": 232.9,
+      "load1": 11.4
+    },
+    {
+      "stage": "filled",
+      "extents": 468,
+      "regions": 9,
+      "alloc_gib": 5.922,
+      "data_gib": 5.922,
+      "count_ms": 0.3,
+      "clonefile_ms_median": 0.06,
+      "firstwrite_ms": 2.9,
+      "firstwrite_fsync_ms": 0.1,
+      "delete_written_clone_ms": 2.6,
+      "load1": 11.4
+    },
+    {
+      "stage": "churn1",
+      "rewrite_gib": 2.0,
+      "rewrite_ms": 3069,
+      "relinked": 46575,
+      "relink_ms": 3730,
+      "detach_ms": 418.9,
+      "attach_ms": 188.1,
+      "fsck_ms": 6.8,
+      "mount_ms": 56.0,
+      "attach_total_ms": 250.9,
+      "load1": 10.9
+    },
+    {
+      "stage": "after-churn1",
+      "extents": 576,
+      "regions": 9,
+      "alloc_gib": 7.93,
+      "data_gib": 7.93,
+      "count_ms": 0.3,
+      "clonefile_ms_median": 0.08,
+      "firstwrite_ms": 2.7,
+      "firstwrite_fsync_ms": 0.1,
+      "delete_written_clone_ms": 2.1,
+      "load1": 10.9
+    },
+    {
+      "stage": "churn2",
+      "rewrite_gib": 2.0,
+      "rewrite_ms": 3738,
+      "relinked": 46575,
+      "relink_ms": 4750,
+      "detach_ms": 400.2,
+      "attach_ms": 198.0,
+      "fsck_ms": 9.1,
+      "mount_ms": 39.2,
+      "attach_total_ms": 246.3,
+      "load1": 13.0
+    },
+    {
+      "stage": "after-churn2",
+      "extents": 629,
+      "regions": 9,
+      "alloc_gib": 8.808,
+      "data_gib": 8.808,
+      "count_ms": 0.4,
+      "clonefile_ms_median": 0.06,
+      "firstwrite_ms": 4.6,
+      "firstwrite_fsync_ms": 0.1,
+      "delete_written_clone_ms": 2.7,
+      "load1": 13.0
+    },
+    {
+      "stage": "churn3",
+      "rewrite_gib": 2.0,
+      "rewrite_ms": 7323,
+      "relinked": 46575,
+      "relink_ms": 3555,
+      "detach_ms": 331.1,
+      "attach_ms": 292.3,
+      "fsck_ms": 9.5,
+      "mount_ms": 57.4,
+      "attach_total_ms": 359.2,
+      "load1": 19.5
+    },
+    {
+      "stage": "after-churn3",
+      "extents": 655,
+      "regions": 9,
+      "alloc_gib": 8.871,
+      "data_gib": 8.871,
+      "count_ms": 0.6,
+      "clonefile_ms_median": 0.07,
+      "firstwrite_ms": 3.7,
+      "firstwrite_fsync_ms": 0.1,
+      "delete_written_clone_ms": 4.1,
+      "load1": 19.5
+    },
+    {
+      "stage": "defrag",
+      "copy_ms": 2167.0,
+      "copy_MBps": 4396.0,
+      "copied_gib": 8.871,
+      "extents_after": 774,
+      "firstwrite_after_ms": 8.4,
+      "verify_attach_ok": true,
+      "detach_ms": 245.3,
+      "attach_ms": 216.3,
+      "fsck_ms": 8.1,
+      "mount_ms": 101.2,
+      "attach_total_ms": 325.6,
+      "load1": 19.5
+    },
+    {
+      "stage": "io",
+      "case_sensitive": 1,
+      "git_status_ms_median": 239.8,
+      "git_status_ms": [239.8, 221.5, 234.5, 283.3, 250.3],
+      "detach_ms": 480.8,
+      "seq_write_MBps": 2998.0,
+      "seq_read_MBps": 15537.0,
+      "bytes": 2147483648.0,
+      "create_ops": 15226.0,
+      "symlink_ops": 29840.0,
+      "unlink_ops": 32162.0,
+      "attach_ms": 179.6,
+      "fsck_ms": 8.2,
+      "mount_ms": 44.0,
+      "attach_total_ms": 231.8,
+      "load1": 19.9
+    },
+    {
+      "stage": "cleanup-held",
+      "rm_ms": 0,
+      "load1": 19.9
+    }
+  ]
+}

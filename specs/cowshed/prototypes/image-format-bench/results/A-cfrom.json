@@ -1,0 +1,26 @@
+{
+  "source_extents": 8890,
+  "source_alloc_gib": 8.821,
+  "source": {
+    "attach_total_ms": 281.8,
+    "case_sensitive": 1,
+    "root_owned_by_user": true,
+    "digest": "8e258d5dd7448052848065e9a9faca8695c70ac194216453a64b2ae44fb53c58"
+  },
+  "plain_copy": {
+    "ms": 2363.0,
+    "extents": 792,
+    "alloc_gib": 8.826
+  },
+  "create_from": {
+    "ms": 2800.8,
+    "extents": 217,
+    "alloc_gib": 7.946,
+    "attach_total_ms": 274.0,
+    "case_sensitive": 1,
+    "root_owned_by_user": true,
+    "digest": "8e258d5dd7448052848065e9a9faca8695c70ac194216453a64b2ae44fb53c58",
+    "firstwrite_ms": 1.3
+  },
+  "same_content": true
+}

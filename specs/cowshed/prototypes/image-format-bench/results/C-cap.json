@@ -1,0 +1,57 @@
+{
+  "fmt": "C",
+  "store_bytes": 7998498930688,
+  "100GiB": {
+    "capacity_bytes": 107374182400,
+    "file_length_gib": 0.0,
+    "alloc_after_create_mib": 15.0,
+    "host_free_delta_mib": 342.8,
+    "create_ms": [1046.4, 1051.0, 1049.8],
+    "df_size_gib": 99.8,
+    "df_avail_gib": 99.7,
+    "detach_refusals": [],
+    "attach_total_ms": [310.9, 287.2, 253.7],
+    "fsck_ms": [17.7, 21.0, 14.5],
+    "detach_ms": [380.0, 156.4, 223.5],
+    "fill_ms": 20836.7,
+    "filled_alloc_gib": 5.917,
+    "filled_extents": 592,
+    "churned_alloc_gib": 7.924,
+    "churned_extents": 785
+  },
+  "store-size": {
+    "capacity_bytes": 7998498930688,
+    "file_length_gib": 0.0,
+    "alloc_after_create_mib": 17.0,
+    "host_free_delta_mib": 633.7,
+    "create_ms": [1032.2, 1032.1, 1034.0],
+    "df_size_gib": 7449.0,
+    "df_avail_gib": 2673.9,
+    "detach_refusals": [],
+    "attach_total_ms": [461.9, 531.7, 525.2],
+    "fsck_ms": [37.1, 59.5, 37.5],
+    "detach_ms": [164.8, 163.0, 203.4],
+    "fill_ms": 40457.2,
+    "filled_alloc_gib": 5.919,
+    "filled_extents": 588,
+    "churned_alloc_gib": 7.927,
+    "churned_extents": 777
+  },
+  "grow_100GiB_to_store_size": {
+    "resize_ms": 1170.6,
+    "attach_total_ms": 317.3,
+    "df_before_grow": {
+      "df_size_gib": 7449.2,
+      "df_avail_gib": 2663.6
+    },
+    "grow_ms": 186.4,
+    "grow_rc": 1,
+    "grow_tail": "Started APFS operation\nError: -69743: The new size must be different than the existing size",
+    "df_after_grow": {
+      "df_size_gib": 7449.2,
+      "df_avail_gib": 2663.6
+    },
+    "alloc_after_grow_gib": 7.931
+  },
+  "other_detach_refusals": []
+}
