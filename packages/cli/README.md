@@ -373,9 +373,11 @@ nothing when nothing changed:
 - A repository whose `devenv.nix` enables `languages.python.uv` gets its uv workspace synced the same way
   (`uv sync --all-packages --all-groups`, `--locked` on a CI runner) into devenv's `UV_PROJECT_ENVIRONMENT`, with the
   interpreter devenv provides, and activated after the sync. Its inputs are the root `pyproject.toml`, `uv.lock` and
-  every workspace member's `pyproject.toml`. The environment is bound to its path, so one copied from another checkout
-  (a copy-on-write clone) is rebuilt from the uv cache on first entry. devenv's own `languages.python.venv` and
-  `uv.sync` must stay off; the module refuses them.
+  every workspace member's `pyproject.toml`. The environment names no path of its checkout, so a copy-on-write clone of
+  an installed checkout enters installed: uv creates it relocatable, each workspace member's editable `.pth` line is
+  rewritten relative to site-packages after every sync, and the managed module clears `languages.python.libraries`,
+  whose default would put the checkout's `.devenv/profile` into the interpreter's store path. devenv's own
+  `languages.python.venv` and `uv.sync` must stay off; the module refuses them.
 - Shell entries in one checkout install one at a time: the install runs under a flock(2) on
   `node_modules/.smoo-install.lock`, so a second shell loading at the same moment waits (and says so), then finds the
   first entry's stamps current. The kernel releases the lock when its holder exits, so a killed shell entry leaves

@@ -127,14 +127,32 @@ async function withManagedRepository(
     );
     await writeFile(join(api, 'index.js'), "module.exports = { version: '6.0.3', readConfigFile: () => ({}) };\n");
     // uv as a Python shell provides it, reduced to what setup-environment.ts
-    // can observe: it records its argv and leaves an environment behind.
+    // can observe: it records its argv, and leaves an environment behind as
+    // uv does. `venv` records whether it was asked for a relocatable one;
+    // `sync` creates a plain environment where there is none, and installs
+    // every workspace member editable, as the absolute path of its sources.
     await writeFile(
       join(bin, 'uv'),
       [
         '#!/usr/bin/env bash',
         `printf '%s\\n' "$*" >> ${JSON.stringify(join(ledgers, 'uv'))}`,
+        'if [ "$1" = venv ]; then',
+        '  environment="${@: -1}"',
+        '  mkdir -p "$environment/bin"',
+        '  relocatable=false',
+        '  for arg in "$@"; do [ "$arg" = --relocatable ] && relocatable=true; done',
+        '  printf "home = /nix/store/python/bin\\nrelocatable = %s\\n" "$relocatable" > "$environment/pyvenv.cfg"',
+        '  exit 0',
+        'fi',
         'mkdir -p "$UV_PROJECT_ENVIRONMENT/bin"',
-        'printf "home = /nix/store/python/bin\\n" > "$UV_PROJECT_ENVIRONMENT/pyvenv.cfg"',
+        '[ -f "$UV_PROJECT_ENVIRONMENT/pyvenv.cfg" ] || printf "home = /nix/store/python/bin\\n" > "$UV_PROJECT_ENVIRONMENT/pyvenv.cfg"',
+        'site="$UV_PROJECT_ENVIRONMENT/lib/python3.14/site-packages"',
+        'mkdir -p "$site"',
+        'printf "import _virtualenv\\n" > "$site/_virtualenv.pth"',
+        'for member in "$PWD"/python/*/src; do',
+        '  [ -d "$member" ] && printf "%s\\n" "$member" > "$site/$(basename "$(dirname "$member")").pth"',
+        'done',
+        'exit 0',
         '',
       ].join('\n'),
     );
@@ -412,22 +430,25 @@ describe('what shell entry syncs for a uv project', () => {
   const UV_PROJECT = {
     'pyproject.toml': '[project]\nname = "workspace"\n\n[tool.uv.workspace]\nmembers = ["python/*"]\n',
     'python/tool/pyproject.toml': '[project]\nname = "tool"\n',
+    'python/tool/src/tool/__init__.py': '',
     'uv.lock': 'version = 1\n',
   };
 
-  it('syncs the environment devenv names with the interpreter it passes, once per input change', async () => {
+  it('creates a relocatable environment where devenv names it and syncs it once per input change', async () => {
     await withManagedRepository({ files: UV_PROJECT }, async ({ root, state, enterShell: enter, uvRuns }) => {
-      const uv = { uvProjectEnvironment: join(state, 'venv'), python: PYTHON };
+      const venv = join(state, 'venv');
+      const uv = { uvProjectEnvironment: venv, python: PYTHON };
       expect(await enter(uv)).toEqual(HEALTHY);
       expect(await enter(uv)).toEqual(HEALTHY);
-      expect(uvRuns()).toEqual([['sync', '--python', PYTHON, '--all-packages', '--all-groups']]);
+      const sync = ['sync', '--python', PYTHON, '--all-packages', '--all-groups'];
+      expect(uvRuns()).toEqual([['venv', '--relocatable', '--python', PYTHON, venv], sync]);
 
       await edit(join(root, 'python/tool/pyproject.toml'), '[project]\nname = "tool"\ndependencies = ["attrs"]\n');
       expect(await enter(uv)).toEqual(HEALTHY);
       await edit(join(root, 'uv.lock'), 'version = 1\nrevision = 2\n');
       expect(await enter(uv)).toEqual(HEALTHY);
       expect(await enter(uv)).toEqual(HEALTHY);
-      expect(uvRuns()).toHaveLength(3);
+      expect(uvRuns().slice(2)).toEqual([sync, sync]);
     });
   });
 
@@ -440,34 +461,40 @@ describe('what shell entry syncs for a uv project', () => {
     });
   });
 
-  it('rebuilds a copied checkout’s uv environment and keeps its installed JavaScript dependencies', async () => {
+  it('enters a copied checkout installed, its workspace members importing from the copy', async () => {
     await withManagedRepository({ files: UV_PROJECT }, async (original) => {
       expect(await original.enterShell({ uvProjectEnvironment: join(original.state, 'venv'), python: PYTHON })).toEqual(
         HEALTHY,
       );
       expect(original.count('install')).toBe(1);
+      expect(original.uvRuns()).toHaveLength(2);
 
       // A copy-on-write clone: every byte, ignored state included, at another path.
       const clone = join(dirname(original.root), 'clone');
       await cp(original.root, clone, { recursive: true, verbatimSymlinks: true });
       const venv = join(clone, 'tooling', 'direnv', '.devenv', 'state', 'venv');
-      await writeFile(join(venv, 'built-for-the-original'), '');
       const copied = repository(clone, join(dirname(original.root), 'ledgers'), join(dirname(original.root), 'bin'));
-
-      // Said out loud, once: the rebuild is why this entry took seconds.
-      const originalVenv = join(original.state, 'venv');
-      expect(await copied.enterShell({ uvProjectEnvironment: venv, python: PYTHON })).toEqual({
-        exitCode: 0,
-        stderr: `setup-environment: rebuilding ${venv}: it was built for ${originalVenv}\n`,
-      });
-      expect(existsSync(join(venv, 'built-for-the-original'))).toBe(false);
-      expect(copied.uvRuns()).toHaveLength(2);
-      // node_modules resolves through the shared install cache and relative
-      // workspace links, so the clone's copy is already correct.
-      expect(copied.count('install')).toBe(1);
 
       expect(await copied.enterShell({ uvProjectEnvironment: venv, python: PYTHON })).toEqual(HEALTHY);
       expect(copied.uvRuns()).toHaveLength(2);
+      expect(copied.count('install')).toBe(1);
+      // Python's site resolves a relative .pth line against site-packages.
+      const site = join(venv, 'lib', 'python3.14', 'site-packages');
+      expect(resolve(site, readFileSync(join(site, 'tool.pth'), 'utf8').trim())).toBe(join(clone, 'python/tool/src'));
+      expect(readFileSync(join(site, '_virtualenv.pth'), 'utf8')).toBe('import _virtualenv\n');
+    });
+  });
+
+  it('replaces an environment that is not relocatable', async () => {
+    await withManagedRepository({ files: UV_PROJECT }, async ({ state, enterShell: enter, uvRuns }) => {
+      const venv = join(state, 'venv');
+      await mkdir(venv, { recursive: true });
+      await writeFile(join(venv, 'pyvenv.cfg'), 'home = /nix/store/python/bin\n');
+      await writeFile(join(venv, 'built-by-an-older-shell'), '');
+      expect(await enter({ uvProjectEnvironment: venv, python: PYTHON })).toEqual(HEALTHY);
+      expect(existsSync(join(venv, 'built-by-an-older-shell'))).toBe(false);
+      expect(readFileSync(join(venv, 'pyvenv.cfg'), 'utf8')).toContain('relocatable = true');
+      expect(uvRuns().map(([verb]) => verb)).toEqual(['venv', 'sync']);
     });
   });
 });

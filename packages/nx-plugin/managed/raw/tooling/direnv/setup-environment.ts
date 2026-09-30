@@ -310,8 +310,6 @@ interface Installer {
 interface InstallStamp {
   /** sha256 over the installer's identity and the bytes of every input file. */
   readonly inputs: string;
-  /** The absolute path the installed tree is bound to; null when it is not bound to one. */
-  readonly environment: string | null;
 }
 
 /**
@@ -332,7 +330,7 @@ function bunInstaller(inputs: readonly string[]): Installer {
       findInstalledTypeScriptApiPackage(projectRoot) !== null,
     install: async ({ quiet }) => {
       await runSetupCommand('bun install --no-summary', $`bun install --no-summary`, { quiet });
-      writeInstallStamp(stampPath, { inputs: inputsDigest(identity, inputs), environment: null });
+      writeInstallStamp(stampPath, { inputs: inputsDigest(identity, inputs) });
     },
   };
 }
@@ -350,12 +348,27 @@ function bunInstaller(inputs: readonly string[]): Installer {
  * shell carries the whole workspace. CI adds `--locked`, the counterpart of
  * `--frozen-lockfile`.
  *
- * Unlike node_modules, the environment is bound to its path: uv writes it
- * into entry-point shebangs, activation scripts and editable installs. A
- * clone copies the environment along with the stamp that says it is current,
- * so the stamp also records the path it was built for, and an environment
- * built anywhere else is removed and rebuilt — from the uv cache, which is
- * where every wheel it held already is.
+ * Like node_modules, the environment is location-independent, so a copy of
+ * this checkout at another path — a copy-on-write clone — is installed exactly
+ * when this one is, and its shell entry syncs nothing. uv would otherwise
+ * write a path into three places:
+ *
+ * - Entry-point and activation scripts name the environment. An environment
+ *   created with `uv venv --relocatable` finds itself relative to each script
+ *   instead, and `uv sync` keeps an existing environment relocatable, so one
+ *   that is not — built before this, or by hand — is replaced.
+ * - The editable install of each workspace member is a `.pth` file holding the
+ *   member's absolute source directory. Python resolves a relative `.pth` line
+ *   against site-packages, so after every sync each line naming a directory in
+ *   this checkout is rewritten relative to it.
+ * - The interpreter is a store path, which names this checkout's devenv profile
+ *   unless devenv.smoo.nix clears languages.python.libraries (it does).
+ *
+ * The installed members' direct_url.json keeps the absolute URL each was
+ * installed from. Only uv reads it, when a changed input makes it sync, and it
+ * then reinstalls those members from this checkout. Where the environment sits
+ * in the checkout is part of the identity: the relative `.pth` lines hold only
+ * there.
  */
 function uvInstaller(inputs: readonly string[], options: { locked: boolean }): Installer | null {
   const python = flags.python;
@@ -371,29 +384,65 @@ function uvInstaller(inputs: readonly string[], options: { locked: boolean }): I
   }
   const stampPath = path.join(environment, '.smoo-sync');
   const argv = ['sync', '--python', python, '--all-packages', '--all-groups', ...(options.locked ? ['--locked'] : [])];
+  const create = ['venv', '--relocatable', '--python', python, environment];
   const uv = Bun.which('uv');
-  const identity = ['uv', ...argv, environment, uv === null ? 'uv not on PATH' : realpathSync(uv)];
+  const identity = [
+    'uv',
+    ...argv,
+    path.relative(projectRoot, environment),
+    uv === null ? 'uv not on PATH' : realpathSync(uv),
+  ];
   return {
-    isCurrent: () => {
-      const stamp = readInstallStamp(stampPath);
-      return stamp?.environment === environment && stamp.inputs === inputsDigest(identity, inputs);
-    },
+    isCurrent: () => readInstallStamp(stampPath)?.inputs === inputsDigest(identity, inputs),
     install: async ({ quiet }) => {
-      const builtFor = readInstallStamp(stampPath)?.environment ?? null;
-      if (builtFor !== environment && existsSync(environment)) {
-        console.error(
-          `setup-environment: rebuilding ${environment}: ` +
-            (builtFor === null ? 'nothing records where it was built' : `it was built for ${builtFor}`),
-        );
-        rmSync(environment, { recursive: true, force: true });
-      }
       // An inherited VIRTUAL_ENV names some other environment; uv would warn
       // that it does not match the project environment and ignore it.
       const env = Object.fromEntries(Object.entries(process.env).filter(([name]) => name !== 'VIRTUAL_ENV'));
+      // pyvenv.cfg records `relocatable = true` for an environment uv created
+      // with --relocatable. uv venv refuses a directory that already holds one.
+      const config = readFileIfPresent(path.join(environment, 'pyvenv.cfg'));
+      if (config === null || !/^relocatable\s*=\s*true\s*$/m.test(config.toString('utf8'))) {
+        rmSync(environment, { recursive: true, force: true });
+        await runSetupCommand(`uv ${create.join(' ')}`, $`uv ${create}`.env(env), { quiet });
+      }
       await runSetupCommand(`uv ${argv.join(' ')}`, $`uv ${argv}`.env(env), { quiet });
-      writeInstallStamp(stampPath, { inputs: inputsDigest(identity, inputs), environment });
+      relativizeCheckoutPaths(environment);
+      writeInstallStamp(stampPath, { inputs: inputsDigest(identity, inputs) });
     },
   };
+}
+
+/**
+ * Rewrite every `.pth` line in the environment's site-packages that names a
+ * directory inside this checkout as a path relative to that site-packages,
+ * which is how Python's `site` resolves a relative line. Every other line — an
+ * `import` line, a path outside the checkout, a directory that does not exist
+ * — stays as uv wrote it.
+ */
+function relativizeCheckoutPaths(environment: string): void {
+  const root = `${realpathSync(projectRoot)}${path.sep}`;
+  const lib = path.join(environment, 'lib');
+  for (const python of existsSync(lib) ? readdirSync(lib) : []) {
+    const sitePackages = path.join(lib, python, 'site-packages');
+    if (!python.startsWith('python') || !existsSync(sitePackages)) {
+      continue;
+    }
+    const site = realpathSync(sitePackages);
+    for (const name of readdirSync(site).filter((entry) => entry.endsWith('.pth'))) {
+      const file = path.join(site, name);
+      const content = readFileSync(file, 'utf8');
+      const rewritten = content
+        .split('\n')
+        .map((line) => {
+          const target = path.isAbsolute(line) && existsSync(line) ? realpathSync(line) : null;
+          return target?.startsWith(root) ? path.relative(site, target) : line;
+        })
+        .join('\n');
+      if (rewritten !== content) {
+        writeFileSync(file, rewritten);
+      }
+    }
+  }
 }
 
 /**
@@ -475,8 +524,8 @@ function stringList(value: unknown): string[] {
 
 /**
  * Inputs enter the digest by their path relative to the project root, so the
- * same bytes at another checkout path digest the same; an installer whose
- * result is bound to a path carries that path in its identity instead.
+ * same bytes at another checkout path digest the same; so does every part of
+ * an installer's identity.
  */
 function inputsDigest(identity: readonly string[], inputs: readonly string[]): string {
   const hasher = new Bun.CryptoHasher('sha256');
@@ -500,12 +549,11 @@ function readInstallStamp(file: string): InstallStamp | null {
   }
   // A torn or foreign stamp proves nothing was installed, which is what an
   // absent one says too: the installer runs and writes a fresh one.
-  const stamp = parseOrUndefined(() => JSON.parse(bytes.toString('utf8')));
-  const inputs = field(stamp, 'inputs');
-  const environment = field(stamp, 'environment');
-  return typeof inputs === 'string' && (typeof environment === 'string' || environment === null)
-    ? { inputs, environment }
-    : null;
+  const inputs = field(
+    parseOrUndefined(() => JSON.parse(bytes.toString('utf8'))),
+    'inputs',
+  );
+  return typeof inputs === 'string' ? { inputs } : null;
 }
 
 function writeInstallStamp(file: string, stamp: InstallStamp): void {

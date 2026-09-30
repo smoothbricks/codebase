@@ -262,6 +262,16 @@ in {
     ]
     ++ lib.optionals pkgs.stdenv.hostPlatform.isLinux [pkgs.chromium];
 
+  # devenv wraps the Python interpreter to find native libraries in
+  # `languages.python.libraries`, whose default is this checkout's
+  # `.devenv/profile`. That path then lands in the interpreter's store path, the
+  # profile that holds it and the uv environment built with it, so every clone
+  # evaluates and builds its own interpreter and profile on first entry, and its
+  # copied uv environment names another checkout's interpreter. Cleared, the
+  # interpreter is one store path in every checkout. devenv still adds the C++
+  # runtime; a wheel that needs another library names that library here.
+  languages.python.libraries = lib.mkIf uvProject (lib.mkDefault []);
+
   enterShell = lib.mkMerge [
     # Prologue, in order:
     #
@@ -282,11 +292,11 @@ in {
     #
     #    The uv project environment is devenv's UV_PROJECT_ENVIRONMENT, synced
     #    with the interpreter devenv would use and activated here after the
-    #    sync. It lives under this checkout and is bound to that path: uv writes
-    #    absolute paths into its scripts, activation files and editable
-    #    installs. A copy-on-write clone copies it along with everything else,
-    #    so setup-environment.ts records the path each environment was built
-    #    for and rebuilds one that was built somewhere else, from the uv cache.
+    #    sync. It lives under this checkout and names no path of it: uv creates
+    #    it relocatable, setup-environment.ts rewrites the editable installs of
+    #    workspace members relative to it, and the interpreter is the same
+    #    store path everywhere (languages.python.libraries above). A
+    #    copy-on-write clone copies it along with everything else, installed.
     #    devenv's own virtualenv and uv sync tasks are refused below: they
     #    activate the environment from its own activation script — which in a
     #    clone names the original checkout — before this prologue runs, and key
