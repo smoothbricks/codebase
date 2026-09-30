@@ -101,6 +101,31 @@ pub fn sccache_cache_directory() -> PathBuf {
     Path::new(CACHES_ROOT).join("sccache")
 }
 
+/// The nix GC root `cowshed setup --sccache` registers for the sccache it builds:
+/// `~/Library/Application Support/dev.cowshed/nix/sccache`, an out-link to the store path.
+///
+/// Under the same support directory as the plists and the host-stable binaries. Whatever launchd
+/// can read an agent definition from, `nix store gc` can read a root from — and keeping cowshed's
+/// only nix root in cowshed's own directory is what makes `setup --uninstall` able to release it.
+pub fn sccache_gc_root(home: &Path) -> PathBuf {
+    home.join("Library/Application Support/dev.cowshed/nix/sccache")
+}
+
+/// The sccache client a sandboxed build wraps rustc with: `bin/sccache` inside the store path
+/// [`sccache_gc_root`] pins, the program the host's `dev.cowshed.sccache` LaunchAgent runs as the
+/// server. `None` when the host pins none — sccache is opt-in — or the pinned path was collected.
+///
+/// It is read through the link on every call, as the LaunchAgent's own plist is derived: the
+/// root is the host's only record of which build is installed. The result is a store path, which
+/// every sandbox can read and execute, and it names the program itself rather than a name for
+/// `PATH` to resolve: a workspace's shell activation owns `PATH`, and a repository shell that
+/// does not ship sccache would leave a bare `sccache` unresolvable.
+pub fn sccache_client(home: &Path) -> Option<PathBuf> {
+    let store_path = std::fs::read_link(sccache_gc_root(home)).ok()?;
+    let program = store_path.join("bin/sccache");
+    (program.is_absolute() && program.is_file()).then_some(program)
+}
+
 /// One host cache path and the directory on the caches volume it belongs in.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HostCache {

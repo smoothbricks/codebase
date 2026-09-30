@@ -10732,18 +10732,13 @@ fn land_check_request(check: &str) -> ExecRequest {
 
 #[cfg(all(test, target_os = "macos"))]
 mod land_check_tests {
-    use std::collections::BTreeMap;
-
     use super::land_check_request;
-    use crate::runtime::supervisor::build_environment;
 
+    /// A check's child gets what every child gets and nothing of its own: a check that forced
+    /// `CARGO_INCREMENTAL=0` made every workspace member a second unit, recompiled on each land.
     #[test]
     fn a_land_check_leaves_incremental_to_the_profile() {
-        let caller = land_check_request("cargo test").env.into_iter().collect();
-        assert_eq!(
-            build_environment(&caller).collect::<BTreeMap<_, _>>(),
-            BTreeMap::from([("RUSTC_WRAPPER", "sccache"), ("SCCACHE_BASEDIR_CWD", "1")])
-        );
+        assert!(land_check_request("cargo test").env.is_empty());
     }
 }
 

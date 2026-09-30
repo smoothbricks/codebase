@@ -33,11 +33,9 @@
 //! not a crash and not a silent success.
 
 use crate::gateway_service::launchd_error;
-use crate::launchd::{
-    APPLICATION_SUPPORT, LIBRARY_DIRECTORY, SCCACHE_BINARY_NAME, STABLE_BINARY_DIRECTORY,
-    STABLE_SUPPORT_DIRECTORY, StoreBackedProgram,
-};
+use crate::launchd::{SCCACHE_BINARY_NAME, STABLE_BINARY_DIRECTORY, StoreBackedProgram};
 use cowshed_core::api::{Finding, FindingSeverity};
+use cowshed_core::sandbox::sccache_gc_root;
 use cowshed_core::{CowshedError, Result};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -51,13 +49,6 @@ const FLAKE_MANIFEST: &str = "flake.nix";
 /// The flake output `setup` installs. Named rather than defaulted so the error a typo produces
 /// names the attribute nix could not find.
 const FLAKE_ATTRIBUTE: &str = "sccache";
-
-/// Where the GC root lives: `~/Library/Application Support/dev.cowshed/nix/sccache`.
-///
-/// Under the same support directory as the plists and the host-stable binaries. Whatever launchd
-/// can read an agent definition from, `nix store gc` can read a root from — and keeping cowshed's
-/// only nix root in cowshed's own directory is what makes `setup --uninstall` able to release it.
-const GC_ROOT_DIRECTORY: &str = "nix";
 
 /// The `nix` this host would run. Resolved through `PATH` on purpose: nix's own installer puts
 /// `/nix/var/nix/profiles/default/bin` on it, and a host that has nix elsewhere is a host whose
@@ -104,14 +95,6 @@ fn host_system() -> &'static str {
 /// The doctor finding code for an installed agent whose program is no longer pinned or no longer
 /// there.
 const UNPINNED_CODE: &str = "sccache-unpinned";
-
-pub fn gc_root(home: &Path) -> PathBuf {
-    home.join(LIBRARY_DIRECTORY)
-        .join(APPLICATION_SUPPORT)
-        .join(STABLE_SUPPORT_DIRECTORY)
-        .join(GC_ROOT_DIRECTORY)
-        .join(SCCACHE_BINARY_NAME)
-}
 
 /// What building and pinning the flake did, as a value.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -236,7 +219,7 @@ pub fn build(home: &Path, flake: &Path) -> Result<BuildOutcome> {
             system,
         }));
     }
-    let root = gc_root(home);
+    let root = sccache_gc_root(home);
     let parent = root
         .parent()
         .expect("the gc root is always derived with a parent");
@@ -354,7 +337,7 @@ pub fn pinning_findings(home: &Path, plist: &Path) -> Vec<Finding> {
     if !plist.is_file() {
         return Vec::new();
     }
-    let root = gc_root(home);
+    let root = sccache_gc_root(home);
     let unpinned = |message: String, hint: &str| {
         vec![Finding {
             code: UNPINNED_CODE.into(),
@@ -503,7 +486,7 @@ mod tests {
         // A root pointing at a collected store path is the same class of problem, said with the
         // path that went missing.
         let collected = home.join("collected-store-path");
-        let root = gc_root(&home);
+        let root = sccache_gc_root(&home);
         std::fs::create_dir_all(root.parent().expect("root parent")).expect("root parent");
         std::os::unix::fs::symlink(&collected, &root).expect("symlink the gc root");
         let findings = pinning_findings(&home, &plist);

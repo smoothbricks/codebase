@@ -423,11 +423,13 @@ path to benefit** — that is where a slot-bound workspace is mounted, so `cd $(
 both land there, but a build reached through some other route to the same files (a symlink you made, a `--manifest-path`
 into one) is a different compilation.
 
-Every workspace child cowshed launches — `cowshed exec` and every supervisor-run command alike — gets
-`RUSTC_WRAPPER=sccache`, `SCCACHE_BASEDIR_CWD=1` and the cache endpoints (`SCCACHE_SERVER_UDS`, `SCCACHE_DIR`). Name
-mounts are not excluded: the bundled sccache normalizes the residual path-bearing key inputs against the request cwd, so
-sibling paths share entries with each other. A slot buys the one input normalization cannot reach — cargo's
-`-C metadata`, a hash sccache never sees.
+Every workspace child cowshed launches — `cowshed exec` and every supervisor-run command alike — gets `RUSTC_WRAPPER`
+naming the sccache that `cowshed setup --sccache` pinned (the program the host daemon runs, by its store path, so a
+repository shell that ships no sccache still builds), `SCCACHE_BASEDIR_CWD=1` and the cache endpoints
+(`SCCACHE_SERVER_UDS`, `SCCACHE_DIR`). A host without a pinned sccache gets no wrapper. Name mounts are not excluded:
+the bundled sccache normalizes the residual path-bearing key inputs against the request cwd, so sibling paths share
+entries with each other. A slot buys the one input normalization cannot reach — cargo's `-C metadata`, a hash sccache
+never sees.
 
 `CARGO_INCREMENTAL` is not set, at any mount and for any command, `cowshed land --check` included. Cargo decides it per
 profile, which serves both halves of a build: workspace crates in `dev` and `test` stay incremental and local (a

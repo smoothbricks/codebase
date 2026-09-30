@@ -280,6 +280,12 @@ A supervisor that could not start leaves its reason in `~/Library/Logs/cowshed/d
 cowshed builds means the daemon and the `cowshed` you ran are different binaries: run `cowshed gateway start` from the
 one you mean to use.
 
+## A cargo build inside a workspace does not use sccache
+
+A workspace's cargo is wrapped with the sccache `cowshed setup --sccache` pinned, named by its store path. A host that
+never ran it, or whose pinned store path was collected (`cowshed doctor` reports `sccache-unpinned`), builds without a
+wrapper. Run `cowshed setup --sccache`; the next command in the workspace uses it.
+
 ## `cowshed exec` fails with `cannot run direnv from PATH …`
 
 The workspace supervisor looks for `direnv` (and `devenv`) in the workspace's own devenv profile and in the host's Nix

@@ -240,6 +240,12 @@ them there; they contain the endpoint URL, whose userinfo is the workspace token
     - the `.cowshed/env` set again (`GOENV`, the token, the port pair), `SCCACHE_SERVER_UDS` and `SCCACHE_DIR` (the host
       sccache daemon, below), and `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` in both cases, carrying the token as proxy
       userinfo;
+    - the build wiring: `SCCACHE_BASEDIR_CWD=1`, and `RUSTC_WRAPPER` naming `bin/sccache` inside the store path the
+      host's sccache GC root pins, the program the daemon itself runs (below). It is read through the root before every
+      spawn and names the program rather than a `PATH` entry: shell activation owns `PATH`, and a repository shell that
+      ships no sccache left a bare `sccache` unresolvable, failing every cargo at its version probe. A host that pinned
+      none — sccache is opt-in — or whose pinned store path was collected gets no wrapper at all; neither value is the
+      caller's;
     - trust anchors as defaults a caller may override: `NODE_EXTRA_CA_CERTS`, `GIT_SSL_CAINFO`, `CARGO_HTTP_CAINFO`,
       `NIX_SSL_CERT_FILE`, `SSL_CERT_FILE`, `UV_SYSTEM_CERTS=true`, and an `ssl-cert-file` line appended to `NIX_CONFIG`
       (04_sandbox.md);

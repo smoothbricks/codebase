@@ -235,7 +235,7 @@ fn record_previous_program(home: &Path, previous_plist: &[u8]) {
     let Some(program) = plist_program(previous_plist) else {
         return;
     };
-    let directory = sccache_nix::gc_root(home)
+    let directory = cowshed_core::sandbox::sccache_gc_root(home)
         .parent()
         .expect("the gc root is always derived with a parent")
         .to_path_buf();
@@ -451,7 +451,7 @@ pub(crate) fn control_target(home: &Path) -> Result<LaunchAgentTarget> {
 pub(crate) fn sccache_launch_agent(home: &Path) -> Result<(LaunchAgentTarget, PathBuf, PathBuf)> {
     Ok((
         control_target(home)?,
-        sccache_nix::gc_root(home),
+        cowshed_core::sandbox::sccache_gc_root(home),
         sccache_server_socket(),
     ))
 }
@@ -464,7 +464,7 @@ pub(crate) fn sccache_launch_agent(home: &Path) -> Result<(LaunchAgentTarget, Pa
 /// other profile ended up serving a patched client, and a recorded path is a mutable pointer where
 /// a store path is an identity.
 pub(crate) fn installed_program(home: &Path) -> Result<StoreBackedProgram> {
-    sccache_nix::rooted_program(home, &sccache_nix::gc_root(home))
+    sccache_nix::rooted_program(home, &cowshed_core::sandbox::sccache_gc_root(home))
 }
 
 async fn socket_answers(socket: &Path) -> bool {
@@ -518,7 +518,7 @@ mod tests {
         fs::create_dir_all(binary.parent().expect("bin")).expect("store bin");
         fs::write(&binary, b"#!/bin/sh\nexit 0\n").expect("store binary");
         fs::set_permissions(&binary, fs::Permissions::from_mode(0o555)).expect("store mode");
-        let root = sccache_nix::gc_root(home);
+        let root = cowshed_core::sandbox::sccache_gc_root(home);
         fs::create_dir_all(root.parent().expect("root parent")).expect("root parent");
         std::os::unix::fs::symlink(&store, &root).expect("gc root symlink");
         store
@@ -534,7 +534,10 @@ mod tests {
 
         let program = installed_program(&home).expect("the rooted sccache resolves");
         assert_eq!(program.program(), store.join("bin").join("sccache"));
-        assert_eq!(program.gc_root(), sccache_nix::gc_root(&home));
+        assert_eq!(
+            program.gc_root(),
+            cowshed_core::sandbox::sccache_gc_root(&home)
+        );
         assert!(
             program.program().starts_with(&store),
             "the program must live inside the store path the root pins; got {}",
@@ -570,9 +573,11 @@ mod tests {
         let error = installed_program(&home).expect_err("no root means no installed sccache");
         assert_eq!(error.code.as_str(), "environment-missing");
         assert!(
-            error
-                .message
-                .contains(&sccache_nix::gc_root(&home).display().to_string()),
+            error.message.contains(
+                &cowshed_core::sandbox::sccache_gc_root(&home)
+                    .display()
+                    .to_string()
+            ),
             "the error must name the root it looked for; got {}",
             error.message
         );
@@ -615,7 +620,7 @@ mod tests {
 
         // The provenance note names the store path that was replaced.
         record_previous_program(&home, previous);
-        let record = sccache_nix::gc_root(&home)
+        let record = cowshed_core::sandbox::sccache_gc_root(&home)
             .parent()
             .expect("parent")
             .join(SCCACHE_PREVIOUS_PROGRAM_RECORD);
@@ -649,7 +654,7 @@ mod tests {
         // the store path be collected.
         let (agent, root, socket) = sccache_launch_agent(&home).expect("teardown artifacts");
         assert_eq!(agent.label(), SCCACHE_LABEL);
-        assert_eq!(root, sccache_nix::gc_root(&home));
+        assert_eq!(root, cowshed_core::sandbox::sccache_gc_root(&home));
         assert_eq!(socket, sccache_server_socket());
 
         let _ = fs::remove_dir_all(&home);

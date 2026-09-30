@@ -1177,43 +1177,21 @@ async fn point_runtime_link(link: &Path, runtime_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Build-tool wiring the sandbox owns, imposed over whatever the caller named.
-///
-/// Rust routes through sccache in EVERY workspace. Cargo's `-C metadata` is path-independent for
-/// workspace members (cargo >= 1.97, measured), and the bundled sccache normalizes the residual
-/// path-bearing key inputs (cwd, blanket `CARGO_*` env, argument bytes) against the request cwd
-/// when the client sets `SCCACHE_BASEDIR_CWD=1` — so name-mounted workspaces share entries with
-/// each other, not just successive slot tenants. env-dep values stay unnormalized in the key, so
-/// a crate that compiles `env!("CARGO_MANIFEST_DIR")` into its output still fail-closes across
-/// paths. These two are not the caller's to change: the Seatbelt profile admits exactly the
-/// host daemon's socket and denies binding it, so a workspace that pointed the wrapper elsewhere
-/// would be reaching outside its boundary.
-const BUILD_POLICY: [(&str, &str); 2] =
-    [("RUSTC_WRAPPER", "sccache"), ("SCCACHE_BASEDIR_CWD", "1")];
-
-/// The caller's environment with [`BUILD_POLICY`] merged over it.
-///
-/// `CARGO_INCREMENTAL` is deliberately not in the policy, so whatever the caller names arrives
-/// verbatim and an unnamed one stays unset. Cargo then decides per profile, which is the right
-/// decision for both halves of a build at once: workspace crates stay incremental and local,
-/// while dependencies are always non-incremental and so reach sccache without anyone forcing
-/// anything. Forcing 0 here bought the shared cache nothing it did not already have and cost
-/// every interactive build a full recompile — measured on a one-line edit to a mid-size crate,
-/// ~1.7s incremental against ~20-32s with `CARGO_INCREMENTAL=0`.
-pub(super) fn build_environment(
+/// The caller's variables a child may take: all but the Git configuration channels the managed
+/// fetch include must not be bypassed through. What the sandbox owns or withholds is laid over
+/// this by [`SandboxEnvironment`].
+pub(super) fn caller_environment(
     caller: &BTreeMap<String, String>,
 ) -> impl Iterator<Item = (&str, &str)> {
     caller
         .iter()
         .map(|(name, value)| (name.as_str(), value.as_str()))
-        .filter(|(name, _)| !BUILD_POLICY.iter().any(|(owned, _)| owned == name))
         .filter(|(name, _)| crate::workspace_git_fetch::caller_git_environment_allowed(name))
-        .chain(BUILD_POLICY)
 }
 
 /// The environment every child of this workspace starts from, split by who may change what.
 ///
-/// A one-shot child receives the caller's variables through [`build_environment`] with these
+/// A one-shot child receives the caller's variables through [`caller_environment`] with these
 /// merged over them; a warm exec host starts from exactly [`SandboxEnvironment::base`] and
 /// receives the caller's variables per command as [`SandboxEnvironment::overlay`]. Either way a
 /// name the sandbox owns or withholds never takes the caller's value.
@@ -1244,7 +1222,7 @@ impl SandboxEnvironment {
 
     /// The complete environment of a one-shot child, before shell activation.
     fn child(&self, caller: &BTreeMap<String, String>) -> BTreeMap<OsString, OsString> {
-        let mut environment: BTreeMap<OsString, OsString> = build_environment(caller)
+        let mut environment: BTreeMap<OsString, OsString> = caller_environment(caller)
             .map(|(name, value)| (name.into(), value.into()))
             .collect();
         for name in &self.withheld {
@@ -1276,7 +1254,7 @@ impl SandboxEnvironment {
     /// The caller's variables one command adds over its host's activated environment; applied
     /// over [`Self::base`] they give exactly what [`Self::child`] gives a one-shot child.
     pub(super) fn overlay(&self, caller: &BTreeMap<String, String>) -> Vec<(OsString, OsString)> {
-        build_environment(caller)
+        caller_environment(caller)
             .filter(|(name, _)| !self.reserved(name))
             .map(|(name, value)| {
                 let merged = match self.appended.get(OsStr::new(name)) {
@@ -1371,10 +1349,7 @@ pub(super) async fn sandbox_environment(
     // them through the external gateway incorrectly requires an egress grant.
     // The sandbox still rejects loopback ports outside this workspace's block.
     let loopback_no_proxy = "localhost,127.0.0.1,::1";
-    let mut owned: BTreeMap<OsString, OsString> = BUILD_POLICY
-        .iter()
-        .map(|(name, value)| ((*name).into(), (*value).into()))
-        .collect();
+    let mut owned: BTreeMap<OsString, OsString> = BTreeMap::new();
     let mut withheld: Vec<&'static str> = Vec::new();
     let mut own = |name: &str, value: &OsStr| {
         owned.insert(name.into(), value.to_owned());
@@ -1417,10 +1392,35 @@ pub(super) async fn sandbox_environment(
     // its timestamps) rather than left in place.
     own("NX_DAEMON", OsStr::new("false"));
     own(GO_ENV, private_cache.join("go/env").as_os_str());
-    // rustc-wrapper clients speak to the host-owned sccache daemon; the
-    // Seatbelt profile admits exactly this socket and denies binding it,
-    // so a client whose daemon is down fails fast instead of spawning a
+    // Rust routes through sccache in every workspace of a host that pinned one. Cargo's
+    // `-C metadata` is path-independent for workspace members (cargo >= 1.97, measured), and the
+    // pinned sccache normalizes the residual path-bearing key inputs (cwd, blanket `CARGO_*` env,
+    // argument bytes) against the request cwd when the client sets `SCCACHE_BASEDIR_CWD=1` — so
+    // name-mounted workspaces share entries with each other, not just successive slot tenants.
+    // env-dep values stay unnormalized in the key, so a crate that compiles
+    // `env!("CARGO_MANIFEST_DIR")` into its output still fail-closes across paths.
+    //
+    // The wrapper is the pinned program itself, read through the GC root before every spawn, not
+    // a name for `PATH` to resolve: shell activation owns `PATH`, and a repository shell without
+    // sccache left a bare `sccache` unresolvable, failing every cargo command at its version
+    // probe. A host that pinned none builds without a wrapper — sccache is opt-in — rather than
+    // against a daemon that is not there. Neither variable is the caller's: the Seatbelt profile
+    // admits exactly the host daemon's socket and denies binding it, so a caller that pointed the
+    // wrapper elsewhere would be reaching outside the boundary. rustc-wrapper clients speak to
+    // that host-owned daemon, and a client whose daemon is down fails fast instead of spawning a
     // wrong-boundary server inside the sandbox.
+    //
+    // `CARGO_INCREMENTAL` is deliberately not the sandbox's, so whatever the caller names arrives
+    // verbatim and an unnamed one stays unset. Cargo then decides per profile, which is the right
+    // decision for both halves of a build at once: workspace crates stay incremental and local,
+    // while dependencies are always non-incremental and so reach sccache without anyone forcing
+    // anything. Forcing 0 cost every interactive build a full recompile — measured on a one-line
+    // edit to a mid-size crate, ~1.7s incremental against ~20-32s with `CARGO_INCREMENTAL=0`.
+    match crate::sandbox::sccache_client(&sandbox.home) {
+        Some(client) => own("RUSTC_WRAPPER", client.as_os_str()),
+        None => withheld.push("RUSTC_WRAPPER"),
+    }
+    own("SCCACHE_BASEDIR_CWD", OsStr::new("1"));
     own(
         "SCCACHE_SERVER_UDS",
         crate::sandbox::sccache_server_socket().as_os_str(),
@@ -4462,6 +4462,65 @@ mod workspace_toolchain_tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    /// Every cargo a workspace runs wraps rustc with the sccache the host pinned: the program
+    /// itself, not a name the repository shell's `PATH` may not resolve. A host that pinned none,
+    /// or whose pinned store path was collected, builds without a wrapper rather than failing
+    /// every cargo at its version probe. Neither the wrapper nor its cwd normalization is the
+    /// caller's, in a one-shot child or a warm shell's command, and `CARGO_INCREMENTAL` stays
+    /// cargo's to decide.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn cargo_wraps_rustc_with_the_pinned_sccache_or_with_nothing() {
+        let root = scratch("sccache-client");
+        let mount = root.join("workspace");
+        std::fs::create_dir_all(mount.join(".cowshed")).expect("private root");
+        std::fs::write(mount.join(".cowshed/token"), "A".repeat(43)).expect("token");
+        let mut sandbox = sandbox_at(&mount);
+        sandbox.port_block = crate::metadata::PortBlock::new(49_072, 16).expect("port block");
+        std::fs::create_dir_all(&sandbox.home).expect("home");
+        let caller = BTreeMap::from([
+            ("RUSTC_WRAPPER".to_owned(), "/bin/false".to_owned()),
+            ("SCCACHE_BASEDIR_CWD".to_owned(), "0".to_owned()),
+        ]);
+        let wiring = async || {
+            let environment = sandbox_environment(&sandbox, None, &caller)
+                .await
+                .expect("environment");
+            let child = environment.child(&caller);
+            let mut pooled = environment.base();
+            pooled.extend(environment.overlay(&caller));
+            assert_eq!(
+                pooled, child,
+                "pooled and one-shot children see one environment"
+            );
+            ["RUSTC_WRAPPER", "SCCACHE_BASEDIR_CWD", "CARGO_INCREMENTAL"]
+                .map(|name| child.get(OsStr::new(name)).cloned())
+        };
+        let unwrapped = [None, Some(OsString::from("1")), None];
+        assert_eq!(wiring().await, unwrapped, "no sccache pinned");
+
+        let store_path = root.join("store/0000-sccache-cowshed");
+        std::fs::create_dir_all(store_path.join("bin")).expect("store path");
+        std::fs::write(store_path.join("bin/sccache"), b"").expect("program");
+        let gc_root = crate::sandbox::sccache_gc_root(&sandbox.home);
+        std::fs::create_dir_all(gc_root.parent().expect("parent")).expect("support directory");
+        std::os::unix::fs::symlink(&store_path, &gc_root).expect("gc root");
+        assert_eq!(
+            wiring().await,
+            [
+                Some(store_path.join("bin/sccache").into_os_string()),
+                Some(OsString::from("1")),
+                None,
+            ],
+            "the pinned program"
+        );
+
+        std::fs::remove_dir_all(&store_path).expect("collect the store path");
+        assert_eq!(wiring().await, unwrapped, "a collected store path");
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_file(sandbox_runtime_link(&sandbox)).ok();
+    }
+
     /// Every spawn of a live workspace finds its link already in place, so it must not scan the
     /// directory the links share (on a busy host `/tmp` holds thousands of entries); only taking
     /// a link sweeps the dangling ones a retired workspace left beside it.
@@ -5113,25 +5172,9 @@ mod sandbox_environment_tests {
             .iter()
             .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
             .collect();
-        build_environment(&caller)
+        caller_environment(&caller)
             .map(|(name, value)| (name.to_owned(), value.to_owned()))
             .collect()
-    }
-
-    /// Nothing in cowshed decides `CARGO_INCREMENTAL` for an ordinary child: cargo does, per
-    /// profile. An absent variable is the whole point — `0` and unset are both "not 1", and only
-    /// one of them lets `dev` stay incremental.
-    #[test]
-    fn an_ordinary_child_gets_sccache_and_no_incremental_policy() {
-        let built = built(&[]);
-        assert_eq!(
-            built,
-            BTreeMap::from([
-                ("RUSTC_WRAPPER".to_owned(), "sccache".to_owned()),
-                ("SCCACHE_BASEDIR_CWD".to_owned(), "1".to_owned()),
-            ])
-        );
-        assert!(!built.contains_key("CARGO_INCREMENTAL"));
     }
 
     /// Whatever the caller names arrives verbatim, including the value nothing in cowshed would
@@ -5145,24 +5188,6 @@ mod sandbox_environment_tests {
                 "the child must see exactly the CARGO_INCREMENTAL its caller named"
             );
         }
-    }
-
-    /// The sccache wiring is not the caller's. The Seatbelt profile admits exactly the host
-    /// daemon's socket and denies binding it, so a caller that could redirect the wrapper would
-    /// be reaching outside the boundary — and the merge, not the order of `Command::env` calls,
-    /// is what refuses it.
-    #[test]
-    fn a_caller_cannot_override_the_sandbox_owned_sccache_wiring() {
-        assert_eq!(
-            built(&[
-                ("RUSTC_WRAPPER", "/bin/false"),
-                ("SCCACHE_BASEDIR_CWD", "0"),
-            ]),
-            BTreeMap::from([
-                ("RUSTC_WRAPPER".to_owned(), "sccache".to_owned()),
-                ("SCCACHE_BASEDIR_CWD".to_owned(), "1".to_owned()),
-            ])
-        );
     }
 
     #[test]
