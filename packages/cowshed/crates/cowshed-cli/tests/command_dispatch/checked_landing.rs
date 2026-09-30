@@ -14,7 +14,7 @@ use std::fs;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::io::AsyncWriteExt;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::process::Command;
@@ -83,10 +83,10 @@ pub(super) struct Fixture {
 
 impl Fixture {
     async fn new(gateway_port: Option<u16>) -> Self {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
+        // A per-process sequence, not the clock: the fixtures of one run start concurrently, and
+        // two of them read the same nanosecond often enough to collide on this directory.
+        static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
+        let nonce = NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed);
         let socket_root = std::env::var_os("XDG_RUNTIME_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("/tmp"))
