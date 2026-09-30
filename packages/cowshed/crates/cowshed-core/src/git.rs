@@ -886,6 +886,19 @@ impl GitRepository {
         }
     }
 
+    /// Record that this repository's working tree lives on a case-sensitive volume.
+    ///
+    /// Git probes the filesystem for `core.ignorecase` once, at `git init`, and trusts the
+    /// recorded value from then on. A repository copied off a case-insensitive volume carries
+    /// `true` onto the image's case-sensitive one, where git would then fold names the filesystem
+    /// keeps apart; `false` is what `git init` would have recorded there.
+    pub async fn record_case_sensitive_filesystem(&self) -> Result<()> {
+        let output = self
+            .run(["config", "--local", "core.ignorecase", "false"])
+            .await?;
+        ensure_git_success("record the case-sensitive filesystem", output)
+    }
+
     /// Add the one repository-visible hook that loads cowshed's in-image environment.
     ///
     /// A tracked hook is immutable workspace input. When it exposes the repository's ignored local
@@ -3890,6 +3903,26 @@ mod tests {
             .status()
             .expect("run git");
         assert!(status.success(), "git {args:?}");
+    }
+
+    #[tokio::test]
+    async fn a_repository_copied_off_a_case_insensitive_volume_reads_case_sensitive_once_recorded()
+    {
+        let root = repository();
+        git(&root, &["config", "core.ignorecase", "true"]);
+        GitRepository::from_root(&root)
+            .record_case_sensitive_filesystem()
+            .await
+            .expect("record case sensitivity");
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(["config", "--local", "--get", "core.ignorecase"])
+            .output()
+            .expect("read core.ignorecase");
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"false\n");
+        fs::remove_dir_all(root).expect("remove fixture");
     }
 
     #[tokio::test]

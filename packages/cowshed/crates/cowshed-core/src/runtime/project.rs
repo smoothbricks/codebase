@@ -5905,9 +5905,10 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
             .substrate
             .execute_adopt_staged(plan, move |stage| async move {
                 crate::inherited_daemons::macos::discard_in(&stage.mount_point).await?;
-                crate::git::GitRepository::from_root(&stage.mount_point)
-                    .ensure_workspace_environment_wiring()
-                    .await?;
+                let repository = crate::git::GitRepository::from_root(&stage.mount_point);
+                // The image's volume is case-sensitive; the tree it was copied from may not be.
+                repository.record_case_sensitive_filesystem().await?;
+                repository.ensure_workspace_environment_wiring().await?;
                 crate::storage::lifecycle::dispatch_blocking(move || {
                     crate::metadata::write_json(&binding_path, &binding)
                 })
