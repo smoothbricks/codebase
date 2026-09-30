@@ -195,17 +195,21 @@ impl Drop for ChurnGuard {
 
 /// One `#[test]` per image format, deliberately not a loop over both.
 ///
-/// Each format drives a complete, independent substrate lifecycle — adopt, mount, 128 MiB
-/// write, clone under writer churn, checkpoint, restore, stats, defragment (a busy refusal, then
-/// the rewrite of main's image fragmented under a clone), retire, reclaim, GC, detach — and each
-/// is bounded by the harness's PER-TEST deadline. The defragment phase lives here, not in a test
-/// of its own, because its own test pays adopt's attaches again: one did, and under host
-/// contention stalled past the 30s default inside adopt. Running both inside one test spent
-/// 27.4s of a 30s budget on an idle host (Sparse 14.8s + Asif 10.6s), leaving 8.6% headroom, so
-/// ordinary host variance read as a test failure. Split, each scenario answers for its own wall
+/// Each format drives a complete, independent substrate lifecycle — adopt, mount, a stream
+/// write, clone under writer churn, checkpoint, restore, stats, defragment (a
+/// busy refusal, then the rewrite of main's image fragmented under a clone), retire, reclaim, GC,
+/// detach — and each is bounded by the harness's PER-TEST deadline. The defragment phase lives
+/// here, not in a test of its own, because its own test pays adopt's attaches again: one did, and
+/// under host contention stalled past the 30s default inside adopt. Running both inside one test
+/// spent 27.4s of a 30s budget on an idle host (Sparse 14.8s + Asif 10.6s), leaving 8.6% headroom,
+/// so ordinary host variance read as a test failure. Split, each scenario answers for its own wall
 /// time against the whole budget, and a format that regresses names itself instead of being one
-/// of two suspects behind a single timeout. The defragment phase adds about 4s to either format
-/// (4.1s for Asif at load ~40), which the 60s deadline's 3× margin over the slower format holds.
+/// of two suspects behind a single timeout.
+///
+/// The data work is sized to what the assertions need, not to the image: on a hosted CI runner
+/// the disk is the slow part. There the Asif lifecycle's APFS phases took 20s of a run that passed
+/// 60s, the rest spent writing a 128 MiB stream and moving every other page of the whole image.
+/// The stream is [`STREAM_MEBIBYTES`] MiB, and [`FRAGMENTED_PAGES`] pages move.
 ///
 /// These two share the host's APFS driver and Disk Arbitration, so they are serialized against
 /// each other by the `real-apfs` nextest test group rather than by living in one test body.
@@ -219,6 +223,13 @@ fn real_apfs_sparse_substrate_lifecycle() {
 fn real_apfs_asif_substrate_lifecycle() {
     run_lifecycle(ImageFormat::Asif);
 }
+
+/// The stream written before the clone: data the clone shares and the defragment rewrite moves.
+const STREAM_MEBIBYTES: usize = 32;
+
+/// Pages [`fragment_under_clone`] moves. Each moved page, and each page left between two moved
+/// ones, is an extent, so this leaves about twice the 1000 extents the lifecycle asserts.
+const FRAGMENTED_PAGES: u64 = 1_200;
 
 fn run_lifecycle(format: ImageFormat) {
     match run_format(format) {
@@ -333,7 +344,7 @@ fn run_format(format: ImageFormat) -> Result<String, Box<dyn Error>> {
         let payload = checkout_path.join("payload.txt");
         fs::write(&payload, b"checkpoint baseline\n")?;
         let stream = checkout_path.join("stream.bin");
-        write_stream(&stream, 128)?;
+        write_stream(&stream, STREAM_MEBIBYTES)?;
         let churn_stop = Arc::new(AtomicBool::new(false));
         let churn = ChurnGuard {
             handle: Some(spawn_churn(
@@ -379,7 +390,7 @@ fn run_format(format: ImageFormat) -> Result<String, Box<dyn Error>> {
         );
         assert_eq!(
             fs::metadata(fork_mount.join("stream.bin"))?.len(),
-            128 * 1024 * 1024
+            u64::try_from(STREAM_MEBIBYTES * 1024 * 1024)?
         );
 
         let checkpoint_plan = substrate.plan_checkpoint(
@@ -489,7 +500,7 @@ fn run_format(format: ImageFormat) -> Result<String, Box<dyn Error>> {
         ));
         assert_eq!(fs::read(&payload)?, b"checkpoint baseline\n");
         let streamed = fs::read(&stream)?;
-        assert_eq!(streamed.len(), 128 * 1024 * 1024);
+        assert_eq!(streamed.len(), STREAM_MEBIBYTES * 1024 * 1024);
         assert!(streamed.iter().all(|byte| *byte == 0x5a));
         let marker = cowshed_core::metadata::WorkspaceMarker::read_from(
             &checkout_path.join(WORKSPACE_MARKER_PATH),
@@ -566,9 +577,10 @@ fn spawn_churn(
     })
 }
 
-/// Fragment `image` the way a main fragments: rewrite every other 16 KiB page, contents
-/// unchanged, while a clone shares its blocks, so each rewritten page moves and splits the map.
-/// 16 KiB is the Apple silicon VM page; a smaller write would dirty, and move, a whole page anyway.
+/// Fragment `image` the way a main fragments: rewrite every other 16 KiB page from the start,
+/// [`FRAGMENTED_PAGES`] of them, contents unchanged, while a clone shares its blocks, so each
+/// rewritten page moves and splits the map. 16 KiB is the Apple silicon VM page; a smaller write
+/// would dirty, and move, a whole page anyway.
 fn fragment_under_clone(image: &Path) -> Result<u64, Box<dyn Error>> {
     use std::os::unix::fs::FileExt;
 
@@ -587,7 +599,7 @@ fn fragment_under_clone(image: &Path) -> Result<u64, Box<dyn Error>> {
     let page_bytes = u64::try_from(page.len())?;
     let mut rewritten = 0;
     let mut offset = 0;
-    while offset + page_bytes <= length {
+    while rewritten < FRAGMENTED_PAGES && offset + page_bytes <= length {
         file.read_exact_at(&mut page, offset)?;
         file.write_all_at(&page, offset)?;
         rewritten += 1;
