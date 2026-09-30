@@ -218,9 +218,7 @@ Covered flows:
   unchanged (01_storage.md, "Clone cost follows extents, not size");
 - attach healing matrix: detached image, wrong-flag mount, missing/wrong-flag `cowshed.store` and `cowshed.caches`
   volumes (lazy recreate + canonical-flag remount, 01_storage.md), stub `.envrc`;
-- lazy volume creation at adopt: both dedicated volumes created idempotently before the first image; **Time Machine
-  default-inclusion check** (verification item, 01_storage.md): whether TM includes additional internal volumes by
-  default, and that adopt's volume-level exclusion is applied when it does;
+- lazy volume creation at adopt: both dedicated volumes created idempotently before the first image;
 - rm-while-busy (open file handle → grace → force detach);
 - gc: trash drain, checkpoint pruning, orphan mountpoint removal;
 - gateway: mirror hit/miss against a local fixture registry, token→policy mapping, 403 hint body, audit records, CONNECT

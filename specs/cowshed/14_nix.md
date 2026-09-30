@@ -20,8 +20,6 @@ programs.cowshed = {
   linuxConnector = true;       # Linux only: trusted per-attached-workspace netns connector runtime/identity
   goEnvDefaults = true;        # host-side go hygiene that is NOT per-workspace (GOTOOLCHAIN=local guidance; the
                                #   per-workspace GOENV file stays cowshed-written, in-image — 03_caches.md)
-  tmutilExclusions = true;     # volume-level TM exclusions for cowshed.store/cowshed.caches (activation script;
-                               #   pending the TM default-inclusion verification, kickoff)
 };
 ```
 
@@ -48,7 +46,6 @@ not configured: HM-created symlinks resolve into `/nix/store` (verification item
 | Cache-subtree symlinks  | validate targets; `doctor` → `next: enable programs.cowshed.relocations` | `adopt` writes them (03_caches.md) |
 | launchd agents          | validate loaded; `doctor` → `next:` the HM option                        | `adopt` installs plists            |
 | Linux connector runtime | validate launcher identity/cgroup; `doctor` → `next:` the module option  | `adopt` refuses until installed    |
-| TM exclusions           | validate; hint the HM option                                             | `adopt` runs `tmutil`              |
 
 `doctor` findings in declarative mode always name the nix option, never a mutating command — the self-driving contract
 (06_cli.md) pointed at configuration instead of side effects.

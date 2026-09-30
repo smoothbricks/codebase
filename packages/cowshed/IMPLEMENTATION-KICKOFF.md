@@ -255,9 +255,6 @@ Open experiments (fold into Phase 1 as tests, don't block on them):
 - **Unified-log denial visibility** — confirm Seatbelt violations reach the unified log with pid+operation _from an
   unsandboxed controller context_ (the log store is permission-gated from sandboxed sessions, so this could not be
   tested). Gates the log-correlation enhancement only; the errno signal (EPERM vs ECONNREFUSED, measured) stands alone.
-- **Time Machine default-inclusion of additional internal volumes** — decides whether adopt must volume-exclude
-  `cowshed.store`/`cowshed.caches` (01_storage.md). The `/private/tmp` probe was inconclusive (that tree is TM-excluded
-  by default); test against the real volumes.
 - **In-block-only self-connects in practice** — under the outbound-only model an in-sandbox client can reach only its
   own block ports; survey which real tools break by spawning a helper server on a random port and connecting back (test
   runners, HMR side-channels), and whether the PORT convention covers them (04_sandbox.md).

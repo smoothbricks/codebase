@@ -164,9 +164,10 @@ every clone automatically). Main and sessions use identical wiring; only the san
 - **Spotlight**: nothing to set. `diskutil image create` has no `-nospotlight`, `mdutil -i off` needs root, and a
   `nobrowse` mount is not indexed (measured: no `.Spotlight-V100` store appears after writes, and `mdutil -s` reports no
   indexing state). A `--browse` mount is an ordinary visible volume to Spotlight.
-- **Time Machine**: backup policy is one per-volume decision, not path exclusions. If Time Machine includes additional
-  internal volumes by default (verification item, 08_testing.md), adopt excludes `cowshed.store` and `cowshed.caches`
-  once, volume-level, at creation. Durability is git (`cowshed push`), never backup.
+- **Time Machine**: nothing to set. Backup policy is one per-volume decision, not path exclusions, and Time Machine
+  already leaves both volumes out: measured on macOS 26.6,
+  `tmutil isexcluded /private/cowshed/store /private/cowshed/caches` reports both `[Excluded]` though cowshed applies no
+  exclusion (it runs no `tmutil`). Durability is git (`cowshed push`), never backup.
 
 ### Format measurements
 
