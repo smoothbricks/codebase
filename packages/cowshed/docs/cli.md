@@ -1011,8 +1011,9 @@ Two more variables are in that plist because sccache reads them once, at server 
 
 The agent is launchd `ProcessType` **Standard**, not Background. Background is Darwin background QoS: sccache hashes
 every miss and runs rustc as its own child, both at the agent's priority, while every wrapped `sccache rustc` client
-stays interactive. That turns the shared daemon into a niced compile queue. The gateway agent stays Background; it is
-not on the compile path.
+stays interactive. That turns the shared daemon into a niced compile queue. The gateway agent is Standard for the same
+reason: its supervisor manager starts every workspace supervisor, and so every shell host and `cowshed exec` job, and a
+descendant cannot leave its agent's QoS band.
 
 `status` reports launchd and socket health without starting anything, and surfaces the daemon's own `--show-stats`
 whenever it answers:

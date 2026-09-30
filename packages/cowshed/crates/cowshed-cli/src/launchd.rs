@@ -200,25 +200,20 @@ pub enum ServiceLifecycle {
     RunAtLoad,
 }
 
-/// launchd `ProcessType` — the QoS band the agent and every child inherit.
+/// launchd `ProcessType` of every cowshed agent: Standard.
 ///
-/// Background is App Nap / Darwin background QoS. That is correct for the gateway
-/// healer. It is wrong for sccache: the daemon hashes every miss and then runs
-/// rustc as its own child, and both of those run at the agent's priority.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ProcessType {
-    Background,
-    Standard,
-}
-
-impl ProcessType {
-    fn as_plist(self) -> &'static str {
-        match self {
-            Self::Background => "Background",
-            Self::Standard => "Standard",
-        }
-    }
-}
+/// The type is the QoS band the agent *and every descendant* runs in, and a descendant cannot
+/// leave it: launchd applies Background as the process's apptype, so `setpriority(
+/// PRIO_DARWIN_PROCESS, 0, 0)` in a child reports success and changes nothing (probed on macOS 26
+/// with a Background agent: PRI 4 before and after, in the agent and in its children).
+///
+/// Neither agent may be Background. sccache hashes every miss and runs rustc as its own child;
+/// the gateway's supervisor manager starts every workspace supervisor, which starts every shell
+/// host and every `cowshed exec` job. Under Background all of them ran at PRI 4 with throttled
+/// IO while the host's interactive processes ran at PRI 31: on a host at load 80 a shell loop
+/// that takes 0.7 s took 1–30 s, a fresh workspace's supervisor took 115 s to answer, and its
+/// first `cowshed exec` spent 537 s inside `direnv export json`.
+const PROCESS_TYPE: &str = "Standard";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LaunchAgentSpec {
@@ -227,21 +222,19 @@ pub struct LaunchAgentSpec {
     arguments: Vec<String>,
     environment: Vec<(String, String)>,
     lifecycle: ServiceLifecycle,
-    process_type: ProcessType,
     standard_error_path: PathBuf,
 }
 
 /// Everything that varies between one agent definition and another.
 ///
-/// A value rather than a positional argument list: the two constructors below differ in six of
-/// these fields at once, and six adjacent positional parameters of overlapping types is how a
-/// definition ends up with the wrong log file or the wrong QoS band.
+/// A value rather than a positional argument list: the two constructors below differ in five of
+/// these fields at once, and five adjacent positional parameters of overlapping types is how a
+/// definition ends up with the wrong log file.
 struct AgentDefinition {
     label: String,
     arguments: Vec<String>,
     environment: Vec<(String, String)>,
     lifecycle: ServiceLifecycle,
-    process_type: ProcessType,
     standard_error_file: &'static str,
 }
 
@@ -261,7 +254,6 @@ impl LaunchAgentSpec {
                 arguments,
                 environment: Vec::new(),
                 lifecycle,
-                process_type: ProcessType::Background,
                 standard_error_file: "daemon-stderr.log",
             },
         )
@@ -281,7 +273,6 @@ impl LaunchAgentSpec {
             arguments,
             environment,
             lifecycle,
-            process_type,
             standard_error_file,
         } = definition;
         validate_environment(&environment)?;
@@ -300,7 +291,6 @@ impl LaunchAgentSpec {
             arguments,
             environment,
             lifecycle,
-            process_type,
             standard_error_path,
         })
     }
@@ -336,13 +326,11 @@ impl LaunchAgentSpec {
     /// `-C metadata` is a hash it never sees — the stable slot mount is what does that. It is set
     /// to the store root so every path the daemon does relativize is store-relative.
     ///
-    /// `ProcessType` is Standard. Background would put the daemon *and* every rustc it
-    /// spawns into Darwin background QoS. sccache 0.17 does not use cargo's jobserver; it
-    /// creates its own (`Client::new()` → `num_cpus()` tokens) and `acquire()`s one per
-    /// miss. Under Background the hasher and those rustc children run at PRI 4 while every
-    /// wrapped `sccache rustc` client stays at PRI 31, so the host's compile fleet waits
-    /// on a niced queue instead of hitting a cache. Gateway stays Background — it is not
-    /// on the compile path.
+    /// Standard QoS (`PROCESS_TYPE`) is load-bearing here too. sccache 0.17 does not use cargo's
+    /// jobserver; it creates its own (`Client::new()` → `num_cpus()` tokens) and `acquire()`s one
+    /// per miss, so under Background the hasher and those rustc children would run at PRI 4 while
+    /// every wrapped `sccache rustc` client stays at PRI 31, and the host's compile fleet would
+    /// wait on a niced queue instead of hitting a cache.
     ///
     /// All source-verified against sccache 0.17.
     pub fn sccache(
@@ -374,7 +362,6 @@ impl LaunchAgentSpec {
                 arguments: Vec::new(),
                 environment,
                 lifecycle: ServiceLifecycle::KeepAlive,
-                process_type: ProcessType::Standard,
                 standard_error_file: "sccache-stderr.log",
             },
         )
@@ -403,10 +390,6 @@ impl LaunchAgentSpec {
 
     pub fn lifecycle(&self) -> ServiceLifecycle {
         self.lifecycle
-    }
-
-    pub fn process_type(&self) -> ProcessType {
-        self.process_type
     }
 
     pub fn plist_path(&self) -> &Path {
@@ -452,7 +435,7 @@ impl LaunchAgentSpec {
             ServiceLifecycle::RunAtLoad => plist.push_str("  <false/>\n"),
         }
         plist.push_str("  <key>ProcessType</key>\n  <string>");
-        plist.push_str(self.process_type.as_plist());
+        plist.push_str(PROCESS_TYPE);
         plist.push_str("</string>\n  <key>StandardErrorPath</key>\n  ");
         push_xml_string(
             &mut plist,
