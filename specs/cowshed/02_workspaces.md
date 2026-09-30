@@ -613,8 +613,19 @@ images are excluded from backup by design (01_storage.md).
 ## Remote code ingress: `cowshed repo`
 
 Sandboxed git speaks only local paths. A workspace's remotes are the `main` remote (main's canonical mount) and
-read-only bare mirrors on the caches volume — never a network URL. There is no git endpoint on the gateway data plane,
-no credential helper, and no `insteadOf` rewriting inside any workspace.
+read-only bare mirrors on the caches volume — never a network URL. There is no git endpoint on the gateway data plane
+and no credential helper inside any workspace.
+
+Dependency fetches by URL (Cargo git dependencies, uv git sources, `git ls-remote`) resolve through **fetch routes**: a
+controller-generated, ignored `.cowshed/git-fetch.inc` that every child includes, rewriting each bound identity URL of
+an adopted project onto that project's local object store when the workspace can read it. Routes come only from
+repository bindings, never from a checkout's remotes, because a workspace can write its own `.git/config` and a remote
+it added must not redirect another repository's URL. A URL routes to exactly one clone; git matches rewrites as literal
+prefixes, so an SSH URL routes both as recorded (with its login) and without the login. Routing is not a grant — the
+fetch still runs under the workspace's own read boundary. A binding starts with the adopted remote;
+`cowshed identity add <remote>` (06_cli.md) binds another remote main's checkout configures, refused when another
+adopted project binds that URL. Every bound remote stays under its recorded name: an open refuses a binding whose remote
+was removed or now names another repository, and follows one that moved servers.
 
 - **`cowshed repo mirror <url>`** — a control-plane RPC, not workspace git. The gateway checks the workspace's repo
   grants (`cowshed grant <ws> --repo github.com/org/*` — repo-scoped, finer than host egress), executes the fetch itself

@@ -39,6 +39,7 @@ pub static COMMANDS: &[&CommandSpec] = &[
     &DOCTOR,
     &GATEWAY,
     &CREDENTIAL,
+    &IDENTITY,
     &SCCACHE,
     &SKILL,
 ];
@@ -85,6 +86,7 @@ pub enum Command {
     Doctor(DoctorArgs),
     Gateway(GatewayCommand),
     Credential(CredentialCommand),
+    Identity(IdentityCommand),
     Sccache(SccacheCommand),
     Skill(SkillArgs),
     /// `--version` or `-V`: the npm package version.
@@ -124,7 +126,8 @@ impl Command {
             | Self::Push(_)
             | Self::Rebase(_)
             | Self::Land(_)
-            | Self::Credential(_) => ProjectDiscovery::Required,
+            | Self::Credential(_)
+            | Self::Identity(_) => ProjectDiscovery::Required,
             Self::List(args) if !args.all => ProjectDiscovery::Optional,
             Self::Doctor(_) => ProjectDiscovery::Optional,
             Self::List(_)
@@ -170,6 +173,13 @@ pub enum CredentialCommand {
     Add(CredentialAddArgs),
     Status,
     Remove { origin: String },
+}
+
+/// The binding's identities are controller authority: an operator binds a remote the project's
+/// main checkout already configures, and nothing a workspace can write ever adds one.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum IdentityCommand {
+    Add { remote: String },
 }
 
 /// The secret is named, never written on the command line: `--secret-env` names a variable in
@@ -803,6 +813,11 @@ fn cli_command() -> ClapCommand {
                 .subcommand(leaf("rm").arg(value("origin"))),
         )
         .subcommand(
+            leaf("identity")
+                .subcommand_required(true)
+                .subcommand(leaf("add").arg(positional("remote", 1..=1))),
+        )
+        .subcommand(
             leaf("sccache")
                 .subcommand_required(true)
                 .subcommand(leaf("start").arg(value("capacity")))
@@ -918,6 +933,7 @@ fn cli_from_matches(matches: ArgMatches) -> Result<Cli, UsageError> {
         "doctor" => parse_doctor(leaf)?,
         "gateway" => parse_gateway(leaf, &global)?,
         "credential" => parse_credential(leaf)?,
+        "identity" => parse_identity(leaf)?,
         "sccache" => parse_sccache(leaf, &global)?,
         "skill" => parse_skill(leaf, &global)?,
         other => return Err(unknown_command(other)),
@@ -1393,6 +1409,43 @@ fn parse_credential(matches: &ArgMatches) -> Result<Command, UsageError> {
         }
     };
     Ok(Command::Credential(command))
+}
+
+const IDENTITY: CommandSpec = CommandSpec {
+    name: "identity",
+    missing: "identity action is required",
+    args: "add <remote>",
+    trailing: "",
+    summary: "bind another remote of this project's checkout as a repository identity",
+    about: &[
+        "A dependency can name this repository by more than one URL — a forge it is pushed to as well as the host it was adopted from. `add` records the named remote of the project's main checkout as an additional, non-primary identity of this project, and from the next exec every workspace with read access to the checkout fetches that URL (and its SSH form without the login) from the local clone instead of the network.",
+        "Identities are controller-owned: only this command adds one, and a workspace's own Git configuration never creates a route. A URL another adopted project already binds is refused, because a fetch URL has exactly one local clone. The remote must stay configured under the same name, as the adopted one must; a remote that is already bound reports the binding unchanged.",
+    ],
+    options: &[],
+};
+
+fn parse_identity(matches: &ArgMatches) -> Result<Command, UsageError> {
+    const USAGE: &CommandSpec = &IDENTITY;
+    let (action, child) = matches
+        .subcommand()
+        .ok_or_else(|| UsageError::new(USAGE.missing, USAGE))?;
+    let command = match action {
+        "add" => IdentityCommand::Add {
+            remote: os(child, "remote")
+                .ok_or_else(|| {
+                    UsageError::new("name the remote to bind: identity add <remote>", USAGE)
+                })?
+                .into_string()
+                .map_err(|_| UsageError::new("the remote name must be valid UTF-8", USAGE))?,
+        },
+        other => {
+            return Err(UsageError::new(
+                format!("unknown identity action `{other}`"),
+                USAGE,
+            ));
+        }
+    };
+    Ok(Command::Identity(command))
 }
 
 /// The helper is an argv ARRAY, not a shell string: a command line assembled by a shell is a
@@ -3379,6 +3432,22 @@ mod tests {
             Some(std::path::Path::new("/tmp/checkout"))
         );
         assert_eq!(cli.command.project_discovery(), ProjectDiscovery::Required);
+    }
+
+    #[test]
+    fn identity_add_names_exactly_one_remote_of_a_discovered_project() {
+        let cli = parse_args(["identity", "add", "forge", "--project", "/tmp/checkout"]).unwrap();
+        assert_eq!(
+            cli.command,
+            Command::Identity(IdentityCommand::Add {
+                remote: "forge".to_owned()
+            })
+        );
+        assert_eq!(cli.command.project_discovery(), ProjectDiscovery::Required);
+        assert!(parse_args(["identity", "add"]).is_err());
+        assert!(parse_args(["identity", "add", "forge", "origin"]).is_err());
+        assert!(parse_args(["identity"]).is_err());
+        assert!(parse_args(["identity", "rm", "forge"]).is_err());
     }
 
     #[test]

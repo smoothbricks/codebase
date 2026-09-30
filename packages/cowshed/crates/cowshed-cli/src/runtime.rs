@@ -177,6 +177,7 @@ fn runtime_open_mode(command: &Command) -> RuntimeOpenMode {
         | Command::Setup(_)
         | Command::Gateway(_)
         | Command::Credential(_)
+        | Command::Identity(_)
         | Command::Sccache(_)
         | Command::Skill(_)
         | Command::Version
@@ -241,6 +242,7 @@ fn runtime_recovery_scope(command: &Command) -> Result<RecoveryScope> {
         | Command::List(_)
         | Command::Doctor(_)
         | Command::Credential(_)
+        | Command::Identity(_)
         | Command::Mount(_)
         | Command::Setup(_)
         | Command::Gateway(_)
@@ -1395,6 +1397,9 @@ where
         )),
         Command::Credential(_) => Err(CowshedError::internal(
             "credential commands must be dispatched by the host service entrypoint",
+        )),
+        Command::Identity(_) => Err(CowshedError::internal(
+            "identity commands must be dispatched by the host service entrypoint",
         )),
         Command::Setup(_) => Err(CowshedError::internal(
             "setup must be dispatched by the host service entrypoint",

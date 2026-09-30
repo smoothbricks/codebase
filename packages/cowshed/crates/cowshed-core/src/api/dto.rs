@@ -4,7 +4,7 @@ pub use crate::metadata::{
     EgressMode, EgressRule, GrantSet, ImageFormat, Platform, PortBlock, RepoRule, SimVerb,
     WorkspaceIncarnation, WorkspaceName, WorkspaceRole,
 };
-use crate::repository::RepoId;
+use crate::repository::{BoundIdentity, RepoId};
 use crate::storage::bootstrap::{HostSetupReport, UninstallReport};
 use crate::storage::lifecycle::{DerivedWorkspace, MountState, Pin as LifecyclePin};
 use base64::Engine;
@@ -2516,6 +2516,18 @@ pub struct CredentialReport {
     pub routes: Vec<CredentialRoute>,
 }
 
+/// A project's repository identities after `cowshed identity add`: the project, whether the named
+/// remote was newly bound, the identity it names, and every identity the binding now holds — each
+/// one a URL workspaces fetch from the local clone.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct IdentityReport {
+    pub repo_id: RepoId,
+    pub added: bool,
+    pub identity: BoundIdentity,
+    pub identities: Vec<BoundIdentity>,
+}
+
 mod result_body_seal {
     pub trait Sealed {}
 }
@@ -2561,6 +2573,7 @@ result_bodies!(
     AuditEvent,
     SkillInstallReport,
     CredentialReport,
+    IdentityReport,
     HostSetupReport,
     UninstallReport,
     Vec<WorkspaceInfo>,

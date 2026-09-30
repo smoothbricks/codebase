@@ -2188,7 +2188,7 @@ impl NativeProjectRuntimeHost {
                         git.root(),
                     )? {
                         Some(updated) => {
-                            persist_reconciled_binding(&layout, &updated).await?;
+                            persist_binding(&layout, &updated).await?;
                             updated
                         }
                         None => binding,
@@ -2838,7 +2838,7 @@ impl NativeProjectRuntimeHost {
             BindingRemoteValidation::Strict,
             self.git.root(),
         )? {
-            persist_reconciled_binding(&self.layout, &updated).await?;
+            persist_binding(&self.layout, &updated).await?;
             self.descriptor.binding = updated;
         }
         Ok(())
@@ -8792,9 +8792,184 @@ fn reconcile_binding_with_remotes(
     Ok(Some(updated))
 }
 
-/// Persists a binding a transport-move heal updated, atomically, off the async runtime.
+/// Binds `remote_name`, a remote of the project's main checkout, as a non-primary identity.
+///
+/// Returns the identity the remote names and the binding to persist, or `None` when the remote is
+/// already bound as recorded — the open-time reconcile has already paired every bound remote with
+/// the checkout, so an existing entry is this remote's. A remote that names no owner/repo (a local
+/// path, a backup clone), an identity this binding already holds or once held, and a URL any other
+/// adopted project binds are refused: a fetch URL routes to exactly one clone
+/// (`workspace_git_fetch`), so no two bindings may share a route.
+#[cfg(any(target_os = "macos", test))]
+fn bind_remote(
+    binding: &RepositoryBinding,
+    remotes: &[crate::git::RemoteUrl],
+    remote_name: &str,
+    others: &[(RepoId, RepositoryBinding)],
+) -> Result<(crate::repository::BoundIdentity, Option<RepositoryBinding>)> {
+    let remote = remotes
+        .iter()
+        .find(|remote| remote.name == remote_name)
+        .ok_or_else(|| {
+            CowshedError::usage(
+                format!("the main checkout has no remote named {remote_name}"),
+                format!(
+                    "bind one of its remotes: cowshed identity add <{}>",
+                    remotes
+                        .iter()
+                        .map(|remote| remote.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join("|")
+                ),
+            )
+        })?;
+    let url = remote.url.to_str().ok_or_else(|| {
+        CowshedError::usage(
+            format!("the URL of remote {remote_name} is not UTF-8"),
+            "bind a remote whose URL names a hosted repository",
+        )
+    })?;
+    let repo_id = crate::repository::normalize_remote_url(url).map_err(|error| {
+        CowshedError::usage(
+            format!("remote {remote_name} ({url}) names no owner/repo identity: {error}"),
+            "bind a remote whose URL names a hosted repository",
+        )
+    })?;
+    let recorded = persistable_remote_url(&remote.url)
+        .ok_or_else(|| CowshedError::internal("normalized repository URL cannot be persisted"))?;
+    if let Some(bound) = binding
+        .identities
+        .iter()
+        .find(|bound| bound.remote_name.as_deref() == Some(remote_name))
+    {
+        return Ok((bound.clone(), None));
+    }
+    let routes: std::collections::BTreeSet<_> =
+        crate::workspace_git_fetch::fetch_route_keys(&recorded).collect();
+    for (other, other_binding) in others {
+        if let Some(taken) = other_binding
+            .identities
+            .iter()
+            .filter_map(|identity| identity.remote_url.as_deref())
+            .find(|url| {
+                crate::workspace_git_fetch::fetch_route_keys(url).any(|key| routes.contains(&key))
+            })
+        {
+            return Err(CowshedError::conflict(
+                format!(
+                    "{taken} is already bound by {other}, and a fetch URL routes to exactly one clone"
+                ),
+                format!("bind a remote {other} does not already bind (git remote -v lists them)"),
+            ));
+        }
+    }
+    let identity = crate::repository::BoundIdentity {
+        repo_id,
+        remote_name: Some(remote_name.to_owned()),
+        remote_url: Some(recorded),
+        primary: false,
+    };
+    let mut identities = binding.identities.clone();
+    identities.push(identity.clone());
+    let updated = RepositoryBinding {
+        version: binding.version,
+        identities,
+        former_identities: binding.former_identities.clone(),
+    };
+    updated.validate().map_err(|error| {
+        CowshedError::conflict(
+            format!("remote {remote_name} cannot be bound: {error}"),
+            "bind a remote naming a repository this project does not already hold",
+        )
+    })?;
+    Ok((identity, Some(updated)))
+}
+
+/// `cowshed identity add`: binds a configured remote of the project's main checkout as a
+/// non-primary identity and persists the binding.
+///
+/// The binding is read back from the store rather than taken from `descriptor`, so an identity
+/// recorded since this project opened is kept, and every other adopted project's binding is read
+/// to refuse a URL that already routes to another clone.
+pub async fn bind_remote_identity(
+    descriptor: &ProjectDescriptor,
+    remote_name: &str,
+) -> Result<crate::api::IdentityReport> {
+    #[cfg(target_os = "macos")]
+    {
+        let layout =
+            crate::storage::StorageLayout::new(&descriptor.store_root, &descriptor.repo_id)
+                .map_err(native_integrity_error)?;
+        let binding = read_persisted_binding(&layout).await?.ok_or_else(|| {
+            CowshedError::integrity(
+                format!("project {} has no repository binding", descriptor.repo_id),
+                "cowshed doctor --json",
+            )
+        })?;
+        let remotes = crate::git::GitRepository::from_root(&descriptor.git_root)
+            .remotes()
+            .await?;
+        let store = descriptor.store_root.clone();
+        let project = descriptor.repo_id.clone();
+        let others =
+            crate::storage::lifecycle::dispatch_blocking(move || other_bindings(&store, &project))
+                .await
+                .map_err(|error| CowshedError::internal(error.to_string()))??;
+        let (identity, updated) = bind_remote(&binding, &remotes, remote_name, &others)?;
+        let added = updated.is_some();
+        let binding = match updated {
+            Some(updated) => {
+                persist_binding(&layout, &updated).await?;
+                updated
+            }
+            None => binding,
+        };
+        Ok(crate::api::IdentityReport {
+            repo_id: descriptor.repo_id.clone(),
+            added,
+            identity,
+            identities: binding.identities,
+        })
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (descriptor, remote_name);
+        Err(CowshedError::environment_missing(
+            "the native cowshed project runtime requires macOS APFS",
+            "run the controller on macOS",
+        ))
+    }
+}
+
+/// Every adopted project's binding but `project`'s, read as the fetch-route refresh reads them.
 #[cfg(target_os = "macos")]
-async fn persist_reconciled_binding(
+fn other_bindings(store: &Path, project: &RepoId) -> Result<Vec<(RepoId, RepositoryBinding)>> {
+    crate::gateway_inventory::discover_repositories(store)
+        .map_err(native_integrity_error)?
+        .into_iter()
+        .filter(|repo| repo != project)
+        .map(|repo| {
+            let layout =
+                crate::storage::StorageLayout::new(store, &repo).map_err(native_integrity_error)?;
+            let binding = crate::gateway_inventory::read_typed_json_nofollow(
+                &layout.project().repository_binding,
+                crate::gateway_inventory::MAX_BINDING_BYTES,
+            )
+            .map_err(|error| {
+                CowshedError::integrity(
+                    format!("the repository binding of {repo} cannot be read: {error}"),
+                    "cowshed doctor --json",
+                )
+            })?;
+            Ok((repo, binding))
+        })
+        .collect()
+}
+
+/// Persists a binding atomically, off the async runtime: a transport-move heal and
+/// `cowshed identity add` both write through here.
+#[cfg(target_os = "macos")]
+async fn persist_binding(
     layout: &crate::storage::StorageLayout,
     binding: &RepositoryBinding,
 ) -> Result<()> {
@@ -8988,7 +9163,7 @@ async fn load_or_validate_binding(
         git.root(),
     )? {
         Some(updated) => {
-            persist_reconciled_binding(layout, &updated).await?;
+            persist_binding(layout, &updated).await?;
             Ok(updated)
         }
         None => Ok(binding),
@@ -12731,7 +12906,7 @@ mod binding_heal_persistence_tests {
         )
         .expect("transport move reconciles")
         .expect("recorded transport follows the move");
-        persist_reconciled_binding(&layout, &healed)
+        persist_binding(&layout, &healed)
             .await
             .expect("persist healed binding");
 
@@ -12841,6 +13016,110 @@ mod binding_tests {
                 "{remote}"
             );
         }
+    }
+
+    fn adopted_widget() -> RepositoryBinding {
+        RepositoryBinding::new(vec![crate::repository::BoundIdentity {
+            repo_id: repo_id("acme/widget"),
+            remote_name: Some("origin".to_owned()),
+            remote_url: Some("https://github.com/acme/widget.git".to_owned()),
+            primary: true,
+        }])
+        .expect("binding")
+    }
+
+    fn widget_remotes() -> [crate::git::RemoteUrl; 3] {
+        [
+            remote("origin", "https://github.com/acme/widget.git"),
+            remote(
+                "forge",
+                "ssh://git@forge.example.test:2223/forge/widget.git",
+            ),
+            remote("backup", "/Volumes/Backup/widget.git"),
+        ]
+    }
+
+    #[test]
+    fn identity_add_binds_a_configured_remote_as_a_non_primary_identity_once() {
+        let remotes = widget_remotes();
+        let (identity, updated) =
+            bind_remote(&adopted_widget(), &remotes, "forge", &[]).expect("forge binds");
+        let updated = updated.expect("the forge remote is newly bound");
+        assert_eq!(
+            identity,
+            crate::repository::BoundIdentity {
+                repo_id: repo_id("forge/widget"),
+                remote_name: Some("forge".to_owned()),
+                remote_url: Some("ssh://git@forge.example.test:2223/forge/widget.git".to_owned()),
+                primary: false,
+            }
+        );
+        assert_eq!(
+            updated.identities,
+            [adopted_widget().identities[0].clone(), identity.clone()]
+        );
+
+        // Binding it again, or the adopted remote, changes nothing; and the next open's reconcile
+        // pairs the new identity with the checkout without touching it.
+        let (again, unchanged) = bind_remote(&updated, &remotes, "forge", &[]).expect("rebind");
+        assert_eq!((again, unchanged), (identity, None));
+        let (primary, unchanged) = bind_remote(&updated, &remotes, "origin", &[]).expect("primary");
+        assert!(primary.primary && unchanged.is_none());
+        assert!(
+            reconcile_binding_with_remotes(
+                &updated,
+                &remotes,
+                BindingRemoteValidation::Strict,
+                Path::new("/checkout"),
+            )
+            .expect("the bound remote is configured")
+            .is_none()
+        );
+    }
+
+    /// A fetch URL routes to exactly one clone, in each of its SSH spellings.
+    #[test]
+    fn identity_add_refuses_a_url_another_project_already_binds() {
+        let other = RepositoryBinding::new(vec![crate::repository::BoundIdentity {
+            repo_id: repo_id("forge/widget"),
+            remote_name: Some("origin".to_owned()),
+            remote_url: Some("ssh://forge.example.test:2223/forge/widget.git".to_owned()),
+            primary: true,
+        }])
+        .expect("other binding");
+        let error = bind_remote(
+            &adopted_widget(),
+            &widget_remotes(),
+            "forge",
+            &[(repo_id("forge/widget"), other)],
+        )
+        .expect_err("the URL already routes to forge/widget's clone");
+        assert_eq!(error.code, ErrorCode::Conflict);
+        assert!(error.message.contains("forge/widget"), "{}", error.message);
+    }
+
+    #[test]
+    fn identity_add_refuses_a_remote_that_names_no_new_repository() {
+        let missing = bind_remote(&adopted_widget(), &widget_remotes(), "upstream", &[])
+            .expect_err("no such remote");
+        assert_eq!(missing.code, ErrorCode::Usage);
+        assert!(
+            missing.hint.contains("origin|forge|backup"),
+            "{}",
+            missing.hint
+        );
+
+        let local = bind_remote(&adopted_widget(), &widget_remotes(), "backup", &[])
+            .expect_err("a local path names no owner/repo");
+        assert_eq!(local.code, ErrorCode::Usage);
+
+        let mirror = [remote(
+            "mirror",
+            "https://gitlab.example.test/acme/widget.git",
+        )];
+        let same = bind_remote(&adopted_widget(), &mirror, "mirror", &[])
+            .expect_err("acme/widget is already this project's identity");
+        assert_eq!(same.code, ErrorCode::Conflict);
     }
 
     #[test]

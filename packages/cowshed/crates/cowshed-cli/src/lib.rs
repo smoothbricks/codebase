@@ -2,6 +2,7 @@ pub mod args;
 pub mod credential_service;
 pub mod gateway_service;
 pub mod help;
+pub mod identity_service;
 pub mod launchd;
 pub mod mount_main;
 pub mod output;

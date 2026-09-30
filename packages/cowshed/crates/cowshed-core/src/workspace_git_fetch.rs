@@ -82,6 +82,14 @@ fn stripped_ssh_url(url: &str) -> Option<String> {
     Some(format!("ssh://{host}/{path}"))
 }
 
+/// Every URL a bound identity's recorded URL routes: the URL itself, and for an SSH URL carrying a
+/// login the same URL without it, which is how uv spells it. Git matches `insteadOf` values as
+/// literal prefixes and derives neither spelling from the other.
+pub(crate) fn fetch_route_keys(url: &str) -> impl Iterator<Item = std::borrow::Cow<'_, str>> {
+    std::iter::once(std::borrow::Cow::Borrowed(url))
+        .chain(stripped_ssh_url(url).map(std::borrow::Cow::Owned))
+}
+
 /// A URL (including uv's userinfo-stripped alias) must have exactly one target. Git's
 /// equal-length insteadOf tie breaking is not repository selection policy.
 fn render_git_fetch_config(mappings: &[GitFetchMapping]) -> Result<String> {
@@ -90,9 +98,7 @@ fn render_git_fetch_config(mappings: &[GitFetchMapping]) -> Result<String> {
         if !safe_url(&mapping.portable_url) || !safe_path(&mapping.local_path) {
             return Err(failure("unsafe local Git fetch URL or path"));
         }
-        for url in std::iter::once(std::borrow::Cow::Borrowed(mapping.portable_url.as_str()))
-            .chain(stripped_ssh_url(&mapping.portable_url).map(std::borrow::Cow::Owned))
-        {
+        for url in fetch_route_keys(&mapping.portable_url) {
             match routes.entry(url) {
                 std::collections::btree_map::Entry::Vacant(entry) => {
                     entry.insert(&mapping.local_path);

@@ -14,8 +14,8 @@ use cowshed_core::CowshedError;
 use cowshed_gateway::{GATEWAY_GIT_FETCH_HELPER_ARG, run_gateway_git_fetch_helper};
 
 use crate::{
-    args, credential_service, gateway_service, help, output, runtime, sccache_service,
-    setup_service, skill,
+    args, credential_service, gateway_service, help, identity_service, output, runtime,
+    sccache_service, setup_service, skill,
 };
 
 /// How one invocation ends.
@@ -160,6 +160,17 @@ async fn run_command(parsed: args::Cli, interrupts: InterruptPolicy) -> Result<i
         let outcome = match runtime::resolve_project_root(&parsed).await {
             Ok(root) => {
                 credential_service::dispatch(action, &root, parsed.global.json, &mut output).await
+            }
+            Err(error) => Err(error),
+        };
+        return Ok(finish(outcome, &mut output, json));
+    }
+    // Binding an identity is the same shape: a project subject, the binding record, and the main
+    // checkout's remotes — nothing the project bridge adds.
+    if let args::Command::Identity(action) = parsed.command.clone() {
+        let outcome = match runtime::resolve_project_root(&parsed).await {
+            Ok(root) => {
+                identity_service::dispatch(action, &root, parsed.global.json, &mut output).await
             }
             Err(error) => Err(error),
         };

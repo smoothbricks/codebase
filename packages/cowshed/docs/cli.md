@@ -908,6 +908,34 @@ cowshed: withheld from every child: REGISTRY_READ_TOKEN
   `$CREDENTIALS_DIRECTORY` — so `add`/`rm`/`status` say that, with the mechanism named, instead of reporting a success
   that wrote nothing.
 
+### `cowshed identity add <remote>`
+
+A dependency can name a repository by more than one URL — the forge it is pushed to as well as the host it was adopted
+from. Workspaces fetch every URL their project bindings name from the local clone instead of the network (the generated,
+ignored `.cowshed/git-fetch.inc` every child includes), and this verb is how a binding gains another URL: it binds a
+remote the project's main checkout already configures as an additional, non-primary identity.
+
+```
+$ cd ~/src/widget && git remote -v | grep forge
+forge  ssh://git@forge.example.test:2223/acme/widget.git (fetch)
+$ cowshed identity add forge
+cowshed: bound remote forge (ssh://git@forge.example.test:2223/acme/widget.git) as acme/widget of acme/widget
+acme/widget  primary  origin  https://github.com/acme/widget.git
+acme/widget  bound  forge  ssh://git@forge.example.test:2223/acme/widget.git
+cowshed: workspaces that can read this checkout fetch these URLs from it from their next exec
+```
+
+- Routes come only from bindings, never from a checkout's remotes: a workspace can write its own `.git/config`, and a
+  remote it adds must not redirect another repository's URL. A URL another adopted project already binds is refused,
+  because a fetch URL routes to exactly one clone.
+- An SSH URL is recorded with its login name and routes both with and without it (Cargo pins
+  `ssh://git@forge.example.test:2223/…`, uv drops the login); an HTTPS username or password is never recorded.
+- The workspace still needs read access to the checkout (`cowshed grant --project-wide --read <checkout>`); routing
+  grants nothing.
+- The remote must stay configured under the same name, like the adopted one: opening the project refuses a bound remote
+  that was removed or now names another repository, and follows one that moved servers. Binding a remote that is already
+  bound reports the binding unchanged; `--json` returns `{ repoId, added, identity, identities }`.
+
 ### `cowshed sccache start [--capacity <size>]` / `stop` / `status`
 
 The gateway daemon starts this agent itself, so a healthy host already has it: `run_daemon` repairs/reattaches every
