@@ -309,6 +309,32 @@ session resolved from the store readdir (`<owner>/<repo>/sessions/<ws>.image` pl
 or git discovery; `--project` still selects the project; `--all` every attached session store-wide. Mains are never
 detach targets. A bare `detach` with neither a name nor `--all` is usage.
 
+### Resident workspaces
+
+`path <ws>` and `exec <ws> -- …` name one workspace, and when that workspace is mounted and its daemon-owned supervisor
+(11_shell.md) already serves its current authority, every fact they depend on is live. They are answered from that state
+without opening the project controller. The answer reads, fresh on every call, only the records that decide this
+workspace: the in-image marker at the invocation's Git root (which names the project), the named workspace's marker at
+its mount and its active sidecar, the project's policy (whose revision is part of the effective grant revision),
+checkout-layout and slot records (which place the mount), and the lifecycle-intent journal. It asks the host two things:
+whether a filesystem is mounted exactly at the mount path, and which authority the supervisor's socket reports. `exec`
+also asks the gateway whether the workspace's session is installed at that revision — exactly the case in which the
+controller's pre-exec reconcile would install nothing for it. The job then runs through the supervisor's socket, relayed
+as the controller path relays it.
+
+Any disagreement opens the controller exactly as before, which is what does the work: a workspace that is detached,
+unserved, served under an older grant or incarnation, a gateway session not yet at the served revision, a linked
+worktree, or unfinished lifecycle work on the workspace, on `main`, or on the project identity. Git discovery steered by
+`GIT_DIR`, `GIT_WORK_TREE`, `GIT_COMMON_DIR`, `GIT_CEILING_DIRECTORIES` or `GIT_DISCOVERY_ACROSS_FILESYSTEM`, an omitted
+`<ws>`, `path --slot`, and `exec --session` always go through the controller. No directory is listed: a project with a
+thousand retired sessions answers as fast as one with a single workspace. Once the supervisor admits the job, every
+later failure is that job's and is reported, never retried through the controller.
+
+What a resident answer does not re-check is what the serving supervisor proved when it opened: the project binding
+against Git's remotes. The recorded binding changes only through cowshed verbs, which change the records read above; a
+remote edited by hand is reconciled by the next verb that opens the controller. `COWSHED_TIMING=1` prints each step of
+either path, including why a resident answer declined, on stderr (13_telemetry.md).
+
 ## Configuration
 
 None required. `cowshed adopt` through daily use works with zero files. Optional `.cowshed.toml` at the repo root, all

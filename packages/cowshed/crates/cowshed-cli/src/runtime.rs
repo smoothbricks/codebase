@@ -733,7 +733,7 @@ async fn pump_stream(
     writer.flush().map_err(output_error)
 }
 
-fn output_error(error: io::Error) -> CowshedError {
+pub(crate) fn output_error(error: io::Error) -> CowshedError {
     CowshedError::environment_missing(
         format!("could not write child output: {error}"),
         "check that the output consumer is still connected",
@@ -1031,26 +1031,11 @@ where
         }
         Command::Exec(args) => {
             let command = exec_command(args, stdin)?;
-            let presentation = if json {
-                ExecPresentation::Control
-            } else {
-                ExecPresentation::Raw
-            };
             let (stdout, stderr) = output.writers_mut();
-            let result = service.exec(command, presentation, stdout, stderr).await?;
-            if json {
-                output.success(result.info).map_err(output_error)?;
-                Ok(success())
-            } else if result.backgrounded {
-                output
-                    .bare_line(result.info.job_id.get().to_string().as_bytes())
-                    .map_err(output_error)?;
-                Ok(success())
-            } else {
-                Ok(DispatchExit {
-                    code: child_exit_code(&result.info)?,
-                })
-            }
+            let result = service
+                .exec(command, exec_presentation(json), stdout, stderr)
+                .await?;
+            report_exec(output, json, result)
         }
         Command::Grant(args) => {
             let changed =
@@ -1454,7 +1439,7 @@ fn requires_gateway_before_dispatch(command: &Command) -> bool {
     }
 }
 
-fn success() -> DispatchExit {
+pub(crate) fn success() -> DispatchExit {
     DispatchExit { code: 0 }
 }
 
@@ -1615,7 +1600,10 @@ fn os_utf8(value: std::ffi::OsString) -> Result<String> {
     })
 }
 
-fn exec_command<R: AsyncRead + Send + 'static>(args: ExecArgs, stdin: R) -> Result<ExecCommand> {
+pub(crate) fn exec_command<R: AsyncRead + Send + 'static>(
+    args: ExecArgs,
+    stdin: R,
+) -> Result<ExecCommand> {
     let argv: Vec<CommandArg> = args.argv.into_iter().map(CommandArg::from).collect();
     validate_command_argv(&argv).map_err(|error| {
         usage(
@@ -1729,23 +1717,71 @@ fn parse_duration(value: std::ffi::OsString) -> Result<Duration> {
     Ok(Duration::from_millis(millis))
 }
 
-fn emit_mount<W: Write, E: Write>(
+pub(crate) fn emit_mount<W: Write, E: Write>(
     output: &mut Output<W, E>,
     json: bool,
     info: &WorkspaceInfo,
 ) -> Result<()> {
+    emit_mount_path(
+        output,
+        json,
+        &info.workspace,
+        &info.mount,
+        info.base_commit.as_ref(),
+    )
+}
+
+/// What `path` and every verb that makes a workspace answer with: its mount.
+pub(crate) fn emit_mount_path<W: Write, E: Write>(
+    output: &mut Output<W, E>,
+    json: bool,
+    workspace: &WorkspaceName,
+    mount: &Path,
+    base_commit: Option<&GitOid>,
+) -> Result<()> {
     if json {
         output
             .success(MountResult {
-                workspace: info.workspace.clone(),
-                mount: info.mount.clone(),
-                base_commit: info.base_commit.clone(),
+                workspace: workspace.clone(),
+                mount: mount.to_path_buf(),
+                base_commit: base_commit.cloned(),
             })
             .map_err(output_error)
     } else {
         output
-            .bare_line(info.mount.as_os_str().as_bytes())
+            .bare_line(mount.as_os_str().as_bytes())
             .map_err(output_error)
+    }
+}
+
+/// JSON callers get the job's record when it settles; everyone else gets its bytes as they come.
+pub(crate) fn exec_presentation(json: bool) -> ExecPresentation {
+    if json {
+        ExecPresentation::Control
+    } else {
+        ExecPresentation::Raw
+    }
+}
+
+/// How an exec ends: the job record for JSON, the job id for a job left running, and otherwise
+/// the child's own exit status as this process's.
+pub(crate) fn report_exec<W: Write, E: Write>(
+    output: &mut Output<W, E>,
+    json: bool,
+    result: ExecResult,
+) -> Result<DispatchExit> {
+    if json {
+        output.success(result.info).map_err(output_error)?;
+        Ok(success())
+    } else if result.backgrounded {
+        output
+            .bare_line(result.info.job_id.get().to_string().as_bytes())
+            .map_err(output_error)?;
+        Ok(success())
+    } else {
+        Ok(DispatchExit {
+            code: child_exit_code(&result.info)?,
+        })
     }
 }
 
@@ -3804,6 +3840,10 @@ where
             ActorBridge::open_existing(&root, runtime_recovery_scope(&cli.command)?).await?;
         return dispatch_and_shutdown(bridge, cli, stdin, output).await;
     }
+    let stdin = match crate::resident::answer(&cli, stdin, output).await? {
+        crate::resident::Answer::Answered(exit) => return Ok(exit),
+        crate::resident::Answer::Declined(stdin) => stdin,
+    };
     let discovery = cli.command.project_discovery();
     if discovery == ProjectDiscovery::NotUsed {
         return dispatch_host_command(cli, output, false).await;

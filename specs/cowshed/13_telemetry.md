@@ -322,10 +322,10 @@ events for long `--json` operations, are wire formats on a pipe to a live consum
 
 **Latency spans.** Until lifecycle spans flush as Arrow, the CLI's own steps print on stderr: lifecycle verbs
 unconditionally (`cowshed: <step> start` / `done elapsed=…`), and every other step — project discovery, host storage
-validation, the controller's inventory, binding and recovery passes, each controller route, the gateway reconcile, job
-submission and relay — only under `COWSHED_TIMING=1`, one `cowshed: timing +<since start> <scope> <step> <elapsed>` line
-per finished step. `path` and `exec` never print them otherwise: their stdout answers a script and their stderr is the
-child's.
+validation, the controller's inventory, binding and recovery passes, each controller route, the gateway reconcile, a
+resident answer's resolution and why it declined (06_cli.md), job submission and relay — only under `COWSHED_TIMING=1`,
+one `cowshed: timing +<since start> <scope> <step> <elapsed>` line per finished step. `path` and `exec` never print them
+otherwise: their stdout answers a script and their stderr is the child's.
 
 ## Querying
 

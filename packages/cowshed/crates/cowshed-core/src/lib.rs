@@ -19,6 +19,7 @@ pub mod metadata;
 mod process;
 pub mod project_policy;
 pub mod repository;
+pub mod resident;
 pub mod runtime;
 pub mod sandbox;
 pub mod script;

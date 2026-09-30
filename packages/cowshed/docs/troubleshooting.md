@@ -348,6 +348,17 @@ vnode another process holds, and a mount that takes a second can outlast the dea
 host the refusal names it (`kern.num_vnodes … of kern.maxvnodes …`) and its hint is the limit to set; `cowshed doctor`
 reports it as `vnode-table-saturated`. Raising the limit is the operator's call: `sudo sysctl kern.maxvnodes=<n>`.
 
+## `cowshed path` or `cowshed exec` is slow
+
+`COWSHED_TIMING=1 cowshed exec <ws> -- true` prints one `cowshed: timing +<since start> <scope> <step> <elapsed>` line
+per step on stderr. A named workspace that is mounted and served answers from live state: expect only
+`resident resolve`, `resident gateway`, `resident submit` and `resident relay` lines, all in milliseconds. Otherwise a
+`resident declined: <reason>` line says why the project controller opened instead — `the workspace is not mounted`,
+`the supervisor serves another authority` after a grant change, `lifecycle work is unfinished` — and the `open`,
+`recover`, `route` and `reconcile` lines that follow name the step that spent the time. The command that follows a
+decline leaves the workspace resident again (attached, supervisor current, gateway reconciled), so only the first one
+after a change pays for it.
+
 ## "cowshed volumes owned by another user"
 
 The cowshed volumes belong to exactly one uid. If `doctor` reports a foreign-uid volume, you are running cowshed as the

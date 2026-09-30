@@ -8,6 +8,7 @@ pub mod mount_main;
 pub mod output;
 pub mod probe;
 pub mod rekey;
+pub mod resident;
 pub mod run;
 pub mod runtime;
 pub mod sccache_client_config;
