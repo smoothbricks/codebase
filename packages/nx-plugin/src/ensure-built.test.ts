@@ -4,6 +4,7 @@ import { chmod, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } fro
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { stripVTControlCharacters } from 'node:util';
 
 import type { Task } from 'nx/src/config/task-graph';
 
@@ -556,7 +557,9 @@ describe('smoo-nx-exec', () => {
     await writeFile(join(workspace, 'packages', 'lib', 'source1.txt'), 'lib checked\n');
     const run = await runBin(workspace, ['app:build']);
     expect(run.code, run.stdout + run.stderr).toBe(0);
-    expect(run.stdout).toContain('nx run lib:build');
+    // An outer `nx run nx-plugin:test` exports FORCE_COLOR, so the fixture's
+    // Nx styles its task lines; what the test pins is the line, not its colour.
+    expect(stripVTControlCharacters(run.stdout)).toContain('nx run lib:build');
     expect(run.stdout).not.toContain(MARKER);
     expect(await readFile(marker(), 'utf-8')).toBe('built\nlib checked\n');
     expect(await readFile(builds(), 'utf-8')).toBe(`${before}lib checked\n`);
@@ -570,7 +573,7 @@ describe('smoo-nx-exec', () => {
   it('without a binary, exits with a failing target\u0027s code', async () => {
     const run = await runBin(workspace, ['app:broken']);
     expect(run.code).toBe(1);
-    expect(run.stdout).toContain('nx run app:broken');
+    expect(stripVTControlCharacters(run.stdout)).toContain('nx run app:broken');
   });
 
   it('forwards a failing target\u0027s exit code and never execs', async () => {
