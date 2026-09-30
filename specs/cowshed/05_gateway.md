@@ -287,12 +287,12 @@ rendered:
 
 ```
 $ cowshed audit --ws raven --ndjson | head -5
-{"ts":"2026-07-11T12:34:56.789Z","ws":"raven","port":40976,"rev":7,"kind":"npm","name":"react","status":200,"bytes":31245,"cache":"hit","traceId":"4bf92f…"}
-{"ts":"…","ws":"raven","port":40976,"rev":7,"kind":"intercept","host":"api.example.com","method":"POST","path":"/v1/run","status":200,"bytes":8123,"traceId":"4bf92f…"}
-{"ts":"…","ws":"raven","port":40976,"rev":7,"kind":"opaque","host":"pinned.example.com:443","status":200,"bytes":51200}
-{"ts":"…","ws":"raven","port":40976,"rev":7,"kind":"connect","host":"api.example.net:443","status":"denied"}
-{"ts":"…","ws":"raven","port":40976,"rev":7,"kind":"repo-mirror","url":"https://github.com/tinylibs/tinybench","status":200,"bytes":184201}
-{"ts":"…","ws":"raven","port":40976,"rev":7,"kind":"sim","verb":"openurl","target":"booted","status":"ok","traceId":"4bf92f…"}
+{"ts":"2026-07-11T12:34:56.789Z","ws":"raven","port":40960,"rev":7,"kind":"npm","name":"react","status":200,"bytes":31245,"cache":"hit","traceId":"4bf92f…"}
+{"ts":"…","ws":"raven","port":40960,"rev":7,"kind":"intercept","host":"api.example.com","method":"POST","path":"/v1/run","status":200,"bytes":8123,"traceId":"4bf92f…"}
+{"ts":"…","ws":"raven","port":40960,"rev":7,"kind":"opaque","host":"pinned.example.com:443","status":200,"bytes":51200}
+{"ts":"…","ws":"raven","port":40960,"rev":7,"kind":"connect","host":"api.example.net:443","status":"denied"}
+{"ts":"…","ws":"raven","port":40960,"rev":7,"kind":"repo-mirror","url":"https://github.com/tinylibs/tinybench","status":200,"bytes":184201}
+{"ts":"…","ws":"raven","port":40960,"rev":7,"kind":"sim","verb":"openurl","target":"booted","status":"ok","traceId":"4bf92f…"}
 ```
 
 Intercepted requests carry request-granular fields (`method`, `path`); an `--opaque` tunnel is host-only by

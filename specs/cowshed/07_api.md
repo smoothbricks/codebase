@@ -359,7 +359,7 @@ pub struct GrantSet {
     pub sim: Vec<SimVerb>,               // personal-session simulator broker verbs (04/05/14_nix.md)
 }
 pub enum SimVerb { OpenUrl, Install }    // closed enum; unknown verbs are usage errors
-pub struct PortBlock { base: u16, size: u16 } // private; `new` and custom JSON decode enforce size 16 + checked end
+pub struct PortBlock { base: u16, size: u16 } // private; `new` and custom JSON decode enforce a power-of-two size ≥ 2, a base aligned to it, and a checked end; new blocks are 64
 pub struct EgressRule {                 // 04_sandbox.md / 05_gateway.md
     pub host: String, pub ports: Vec<u16>,
     pub mode: EgressMode,                // default Intercept (per-workspace CA); Opaque = pass-through CONNECT

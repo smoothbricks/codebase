@@ -266,7 +266,7 @@ Controller-owned, host-readable while the image is detached, outside the workspa
   "workspaceIncarnation": "0198f2c0b7e34dc795f17b238b331c80",
   "revision": 7,
   "platform": "macos",
-  "portBlock": { "base": 40976, "size": 16 },
+  "portBlock": { "base": 40960, "size": 64 },
   "updatedAt": "2026-07-11T12:34:56Z",
   "read": ["<project-root>/shared-fixtures"],
   "write": ["<project-root>/artifacts/raven"],
