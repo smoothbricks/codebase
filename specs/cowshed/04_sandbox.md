@@ -91,6 +91,12 @@ Shape:
   (subpath "<exec temp dir>")
   (literal "/dev/null") (literal "/dev/stdout") (literal "/dev/stderr")
   … granted write paths …)
+;; A child's stdio is often the null device, opened write-only by its parent (a
+;; shell's `>/dev/null`, a detached job's streams), and runtimes fstat their
+;; stdio before running a line — Node aborts in process setup, with no message,
+;; when that fails. fstat on a write-only descriptor is file-read-metadata, which
+;; neither the write grant nor file-read-data on `/` includes:
+(allow file-read-metadata (literal "/dev/null"))
 
 ;; The cowshed tree: deny the volume, carve back the workspace's share.
 ;; `/private/cowshed/store` IS the store volume (01_storage.md) and everything cowshed mounts

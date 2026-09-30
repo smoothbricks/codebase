@@ -845,6 +845,16 @@ pub fn seatbelt_profile(
             sbpl_path(&config.exec_temp_dir)?
         ),
     );
+    // A child writes the null device through a descriptor its parent opened write-only (a
+    // shell's `>/dev/null`, a detached job's stdio), and runtimes fstat their stdio before
+    // running a line: Node aborts in its process setup, with no message, when that fstat
+    // fails. fstat on a write-only descriptor is file-read-metadata, which neither the
+    // write grant above nor file-read-data on `/` includes.
+    push_literal_rule(
+        &mut profile,
+        "allow file-read-metadata",
+        Path::new("/dev/null"),
+    )?;
     push_readable_ancestors(&mut profile, &config.exec_temp_dir)?;
     // Short runtime links resolve to the workspace or the exec temp directory
     // above. Only metadata on their exact names is allowed, never a /tmp listing.
@@ -1896,5 +1906,49 @@ mod tests {
         assert!(!child_write.success());
         assert!(ordinary_write.success());
         assert!(!hardlink_attempt.success());
+    }
+
+    /// A child whose stdout is the null device can fstat it. Runtimes classify their stdio
+    /// before running a line — Node aborts in its process setup, with no message, when fstat on
+    /// fd 0-2 fails with anything but EBADF — so a denied fstat makes every `>/dev/null` and
+    /// every detached job's null stdout kill the runtime before it starts.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
+    fn host_controller_a_child_can_fstat_the_null_device_its_stdio_points_at() {
+        let sequence = NEXT_SANDBOX_DIR.fetch_add(1, Ordering::Relaxed);
+        let root_alias = std::env::temp_dir().join(format!(
+            "cowshed-null-device-test-{}-{sequence}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root_alias).unwrap();
+        let root = fs::canonicalize(&root_alias).unwrap();
+        let mut config = config(RunSandboxMode::ReadWrite);
+        config.home = root.join("home");
+        config.workspace_mount = root.join("workspace");
+        config.exec_temp_dir = root.join("tmp");
+        config.allowed_unix_sockets.clear();
+        for directory in [&config.home, &config.workspace_mount, &config.exec_temp_dir] {
+            fs::create_dir_all(directory).unwrap();
+        }
+        let child = seatbelt_profile(&config, SandboxProfileRole::ExecutedChild).unwrap();
+
+        // `Stdio::null()` opens the device write-only for stdout, as a shell's `>/dev/null`
+        // does; BSD stat with no operand fstats its stdin, here that same descriptor.
+        let fstat = std::process::Command::new("/usr/bin/sandbox-exec")
+            .args(["-p", &child, "--", "/bin/sh", "-c"])
+            .arg("exec /usr/bin/stat -f %HT <&1")
+            .current_dir(&config.workspace_mount)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .output()
+            .unwrap();
+
+        fs::remove_dir_all(&root).unwrap();
+        assert!(
+            fstat.status.success(),
+            "fstat on a write-only /dev/null stdout: {}",
+            String::from_utf8_lossy(&fstat.stderr)
+        );
     }
 }
