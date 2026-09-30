@@ -18,6 +18,7 @@
 
 use crate::arena::{ArenaFull, StringArena, TextInput};
 use crate::attribute_cells::AttributeCells;
+use crate::buffer::SourceMetadata;
 use crate::columns::{FieldMeta, FieldStrategy, SharedStr};
 use crate::entry_type::EntryType;
 use crate::identity::{SpanIdentity, TraceId};
@@ -263,6 +264,9 @@ struct SpanRecord {
     start_row: u32,
     completion_row: u32,
     ended: bool,
+    /// Where the span's code lives, stamped once per span and emitted on every
+    /// one of its rows. `None` when the writer never attributed it.
+    source: Option<SourceMetadata>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -614,6 +618,7 @@ impl ThreadSpanBuffer {
                 start_row,
                 completion_row,
                 ended: false,
+                source: None,
             },
         );
         self.scopes.insert(input.span_id, inherited_scope);
@@ -844,6 +849,24 @@ impl ThreadSpanBuffer {
     pub fn scope(&self, span_id: u32) -> Result<Option<&SpanScope>, ThreadBufferError> {
         self.record(span_id)?;
         Ok(self.scopes.get(&span_id).and_then(Option::as_ref))
+    }
+    /// Attribute a span to the code that opened it. Every row of the span
+    /// carries this provenance when converted.
+    pub fn set_source(
+        &mut self,
+        span_id: u32,
+        source: SourceMetadata,
+    ) -> Result<(), ThreadBufferError> {
+        self.spans
+            .get_mut(&span_id)
+            .ok_or(ThreadBufferError::UnknownSpan(span_id))?
+            .source = Some(source);
+        Ok(())
+    }
+    /// The provenance [`Self::set_source`] recorded for a span still held.
+    #[inline]
+    pub fn source_of(&self, span_id: u32) -> Option<SourceMetadata> {
+        self.spans.get(&span_id).and_then(|record| record.source)
     }
     /// [`Self::set_scope`] from the scalar ABI form every binding speaks: an
     /// attribute kind and its encoded value, or kind `0` to clear the field

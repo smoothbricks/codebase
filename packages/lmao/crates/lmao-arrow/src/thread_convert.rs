@@ -135,6 +135,9 @@ fn convert_selected(
     let mut entry_keys = Vec::with_capacity(total_rows);
     let mut lines = Vec::with_capacity(total_rows);
     let mut message_values = Vec::with_capacity(total_rows);
+    let mut package_names = Vec::with_capacity(total_rows);
+    let mut package_files = Vec::with_capacity(total_rows);
+    let mut git_shas = Vec::with_capacity(total_rows);
     let mut attrs: Vec<Vec<Option<ColumnValueRef<'_>>>> = buffer
         .schema_fields()
         .iter()
@@ -225,6 +228,10 @@ fn convert_selected(
         entry_keys.push(entry_type.as_u8());
         lines.push(buffer.line_at(row).unwrap_or(0));
         message_values.push(message);
+        let source = buffer.source_of(span_id);
+        package_names.push(source.map(|source| source.package_name));
+        package_files.push(source.map(|source| source.package_file));
+        git_shas.push(source.and_then(|source| source.git_sha));
         for (index, values) in attrs.iter_mut().enumerate() {
             values.push(buffer.attribute_at(
                 row,
@@ -314,9 +321,9 @@ fn convert_selected(
         )),
         Arc::new(UInt32Array::new(parent_span_ids.into(), Some(parent_nulls))),
         Arc::new(entry_col),
-        null_dictionary(total_rows),
-        null_dictionary(total_rows),
-        null_dictionary(total_rows),
+        text_dictionary(&package_names)?,
+        text_dictionary(&package_files)?,
+        text_dictionary(&git_shas)?,
         Arc::new(message_col),
         Arc::new(UInt32Array::from(lines)),
     ];
@@ -346,18 +353,13 @@ pub fn convert_thread_buffer(
     convert_thread_span_buffer(buffer, vocabulary, window)
 }
 
-fn null_dictionary(rows: usize) -> ArrayRef {
-    let mut valid = BooleanBufferBuilder::new(rows);
-    for _ in 0..rows {
-        valid.append(false);
-    }
-    Arc::new(
-        DictionaryArray::try_new(
-            UInt32Array::new(vec![0; rows].into(), Some(NullBuffer::new(valid.finish()))),
-            Arc::new(StringArray::from(Vec::<&str>::new())),
-        )
-        .expect("empty nullable dictionary is valid"),
-    )
+/// A nullable `Dictionary<UInt32, Utf8>` column over borrowed row values.
+fn text_dictionary(values: &[Option<&str>]) -> Result<ArrayRef, ConvertError> {
+    let (keys, valid, dictionary) = string_dictionary(values);
+    Ok(Arc::new(DictionaryArray::try_new(
+        UInt32Array::new(keys.into(), Some(valid)),
+        Arc::new(dictionary) as ArrayRef,
+    )?))
 }
 
 fn convert_attribute(
