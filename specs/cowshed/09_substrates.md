@@ -184,12 +184,11 @@ hierarchy below. `cowshed doctor` prints the selected substrate, pool, and evide
 
 ## APFS image substrate (reference)
 
-As specified in 01_storage.md and 02_workspaces.md: one format-specific image per workspace — `.asif` for ASIF or
-`.sparseimage` for SPARSE — with clonefile ≈ 2 ms and attach ≈ 235–400 ms. The host-readable sibling metadata carries
-`imageFormat`; enumeration recognizes both extensions, and cowshed refuses an extension/metadata mismatch before attach.
-Dispatch is `diskutil image attach` for ASIF and `hdiutil attach` for SPARSE, followed by verification before the first
-mount (attach without mounting, `fsck_apfs -q`, then mount). Deletion unlinks one file. Clones preserve their source
-format and extension and are fully independent of their source — no GC coupling.
+As specified in 01_storage.md and 02_workspaces.md: one ASIF image (`.asif`) per workspace holding a case-sensitive APFS
+volume, with clonefile ≈ 2 ms and attach ≈ 235–400 ms. Attach is `diskutil image attach --noMount` followed by
+verification before the first mount (`fsck_apfs -q`, then mount). Deletion unlinks one file. Clones are fully
+independent of their source — no GC coupling — but inherit its extent map, so a fragmented main makes every clone's
+first write slow until `cowshed defrag main` (01_storage.md, "Clone cost follows extents, not size").
 
 ## ZFS substrate
 
@@ -200,7 +199,7 @@ format and extension and are fully independent of their source — no GC couplin
 | project                           | `<pool>/cowshed/projects/<owner>/<repo>` (primary `repo_id`; component-safe container dataset)                                                                                                               |
 | main workspace                    | `<pool>/cowshed/projects/<owner>/<repo>/main`, `mountpoint=` original checkout path                                                                                                                          |
 | session workspace                 | `<pool>/cowshed/projects/<owner>/<repo>/ws/<name>`                                                                                                                                                           |
-| workspace mounts                  | `mountpoint` inheritance on `…/ws` → `/private/cowshed/store/mnt/<owner>/<repo>/<name>`                                                                                                                                  |
+| workspace mounts                  | `mountpoint` inheritance on `…/ws` → `/private/cowshed/store/mnt/<owner>/<repo>/<name>`                                                                                                                      |
 | crash-consistent snapshot of main | `zfs snapshot main@cowshed:<name>` (transactionally atomic)                                                                                                                                                  |
 | `cowshed new`                     | snapshot + `zfs clone` — tens of ms, mounts itself, **no attach step, no fsck step**                                                                                                                         |
 | `cowshed checkpoint <ws> <label>` | `zfs snapshot ws@<label>` — instant, zero-copy                                                                                                                                                               |
@@ -208,7 +207,7 @@ format and extension and are fully independent of their source — no GC couplin
 | `cowshed fork <src> <dst>`        | `zfs snapshot src@cowshed:fork-<dst>` + clone                                                                                                                                                                |
 | `cowshed rm`                      | retire: `zfs rename` into `…/.trash`; reclaim: `zfs destroy` the clone **then** its origin snapshot — an idempotent logical transaction (physically two commands; `cowshed gc` completes interrupted halves) |
 | capacity cap                      | `refquota` per workspace dataset (replaces sparse-image capacity)                                                                                                                                            |
-| shared caches (layers 1 and 3)    | `<pool>/cowshed/caches` dataset mounted at `/private/cowshed/caches`                                                                                                                                               |
+| shared caches (layers 1 and 3)    | `<pool>/cowshed/caches` dataset mounted at `/private/cowshed/caches`                                                                                                                                         |
 | Linux gateway attachment          | no persistent port block; per-incarnation Unix socket + private netns + trusted `127.0.0.1:7644` connector, created and destroyed with attachment                                                            |
 | compaction                        | not needed — freed blocks return to the pool                                                                                                                                                                 |
 
@@ -263,14 +262,14 @@ unprivileged.
 ### Linux host paths
 
 State paths are identical across platforms — the store volume/dataset at `/private/cowshed/store`, caches nested at
-`/private/cowshed/caches` — only the volume technology behind each mountpoint differs. ZFS additionally keeps workspace data
-in the sibling `projects` dataset tree:
+`/private/cowshed/caches` — only the volume technology behind each mountpoint differs. ZFS additionally keeps workspace
+data in the sibling `projects` dataset tree:
 
-| macOS                                                                                              | Linux                                                                 |
-| -------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------- |
-| `cowshed.store` APFS volume at `/private/cowshed/store` (images, grants, quarantine, gateway state, telemetry) | `<pool>/cowshed/store` dataset at `/private/cowshed/store`                        |
-| `cowshed.caches` APFS volume at `/private/cowshed/caches`                                                | `<pool>/cowshed/caches` dataset at `/private/cowshed/caches`                |
-| project images are files on `cowshed.store`                                                        | `<pool>/cowshed/projects/<owner>/<repo>` workspace dataset containers |
+| macOS                                                                                                          | Linux                                                                 |
+| -------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------- |
+| `cowshed.store` APFS volume at `/private/cowshed/store` (images, grants, quarantine, gateway state, telemetry) | `<pool>/cowshed/store` dataset at `/private/cowshed/store`            |
+| `cowshed.caches` APFS volume at `/private/cowshed/caches`                                                      | `<pool>/cowshed/caches` dataset at `/private/cowshed/caches`          |
+| project images are files on `cowshed.store`                                                                    | `<pool>/cowshed/projects/<owner>/<repo>` workspace dataset containers |
 
 ### Fixed dataset hierarchy
 

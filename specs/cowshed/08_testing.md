@@ -40,10 +40,6 @@ No mounts, no root, no network — pure functions with table-driven cases:
   launcher is a fail-on-call spy. An action type for which every process cannot be intercepted is rejected with the
   documented configuration error before its payload or any child process starts; cwd relocation and completion of the
   composite action never count as wrapping.
-- **Image-format dispatch**: detached host metadata carries `imageFormat`; the complete table is `ASIF` → `.asif` and
-  `SPARSE` → `.sparseimage`. Matching metadata/extension selects the corresponding attach path, while either crossed
-  pair, an unknown format, or a wrong extension is rejected before an attach command is constructed. There is no
-  extension alias or inference fallback.
 - **Job-control encoding, storage unions, and summaries**: numeric job IDs round-trip exactly; stdout/stderr codecs
   remain separate. Goldens cover every `OutputStorage`/`ProtectedOutput` discriminant, exact counts/SHA-256, bounded
   tagged inline JSON, flattened Arrow validity, and deterministic bounded redacted summaries. Protected Arrow may carry
@@ -215,19 +211,19 @@ Covered flows:
   mounted, per 02) — asserts the sequence and that a structurally-bad clone is caught before mount, not after;
 - **fork mid-write clone validity**: clone an image while a writer churns the volume, then verify the clone mounts and
   fsck-passes. (Measured baseline to hold: 10/10 clonefiles taken under a continuous file-writer plus a streaming 128
-  MiB dd passed both `fsck_apfs -q` and a full `-n` check, mountable and readable, on both SPARSE and ASIF; a non-synced
-  clone may miss the last writes — freshness, not consistency. This tier keeps that regression-pinned.)
+  MiB dd passed both `fsck_apfs -q` and a full `-n` check, mountable and readable, on ASIF; a non-synced clone may miss
+  the last writes — freshness, not consistency. This tier keeps that regression-pinned.)
 - checkpoint/restore round-trip (restore undo image `pre-restore-…` present);
-- defrag, per format: main fragmented by rewriting pages while a clone shares them refuses the rewrite while a file is
-  open on its volume (image untouched), then, idle, comes back in at most a tenth of its extents with its data, marker,
-  and mount unchanged (01_storage.md, "Clone cost follows extents, not size");
+- defrag: main fragmented by rewriting pages while a clone shares them refuses the rewrite while a file is open on its
+  volume (image untouched), then, idle, comes back in at most a tenth of its extents with its data, marker, and mount
+  unchanged (01_storage.md, "Clone cost follows extents, not size");
 - ensure healing matrix: detached image, wrong-flag mount, missing/wrong-flag `cowshed.store` and `cowshed.caches`
   volumes (lazy recreate + canonical-flag remount, 01_storage.md), stub `.envrc`;
 - lazy volume creation at adopt: both dedicated volumes created idempotently before the first image; **Time Machine
   default-inclusion check** (verification item, 01_storage.md): whether TM includes additional internal volumes by
   default, and that adopt's volume-level exclusion is applied when it does;
 - rm-while-busy (open file handle → grace → force detach);
-- gc: trash drain, checkpoint pruning, orphan mountpoint removal, compaction (SPARSE fallback);
+- gc: trash drain, checkpoint pruning, orphan mountpoint removal;
 - gateway: mirror hit/miss against a local fixture registry, token→policy mapping, 403 hint body, audit records, CONNECT
   allow/deny, `repo mirror` fetch into a read-only bare mirror;
 - **Linux connector end to end**: for an attached workspace, assert exactly one connector exists in its private netns,
@@ -245,10 +241,9 @@ Covered flows:
   upstream fast with a classifiable error (not a per-request timeout) — asserting the gateway-absent / upstream-offline
   / denied trichotomy; **socket teardown**: no leaked listeners or half-closed sockets after a churn of many distinct
   intercepted hosts (the JS original's fd-leak bug class), and oversized request headers are tolerated;
-- ASIF/SPARSE format/extension enforcement: attach detached fixtures whose host metadata says `ASIF` with `.asif` and
-  `SPARSE` with `.sparseimage`, and assert dispatch reaches the corresponding real substrate path. Swap the extensions
-  and assert a format/extension mismatch is reported before attach; fallback from unavailable ASIF creates and records
-  SPARSE with `.sparseimage`, never ASIF metadata on a SPARSE file.
+- image creation, unprivileged: a created image mounts as case-sensitive APFS whose root the invoking user owns
+  (`pathconf(_PC_CASE_SENSITIVE)` is 1 and `Foo` and `foo` coexist), no step runs as root, a clone of it mounts
+  case-sensitive too, and an adopted repository's `core.ignorecase` reads `false`.
 - **persistent multi-client supervisor socket**: runtime directory is `0700`, socket is `0600`, wrong-peer credentials
   fail before framing, and simultaneous clients submit/query independent jobs. Disconnect and reconnect by job id and
   stream offset before/after lazy promotion; assert no job stops, no byte repeats/disappears, and the socket remains
@@ -378,15 +373,17 @@ cannot fix a stable tail. Note the p99 correction: the ~590 ms figure sometimes 
 create+attach**, not clone attach — clone _attach-only_ p99 in that run was ~273 ms and clonefile+attach ~271 ms. Do not
 cite ~590 ms as a clone-attach percentile.
 
-The format experiment (`results/2026-07-11-substrate-experiments.json`, single-run medians, 4 GiB / 2000 files) adds:
-**ASIF vs SPARSE — create 479 vs 1017 ms (2.1×), direct read 3.2 vs 17.9 ms (5.6×), direct write 15.7 vs 39.6 ms (2.5×),
-metadata ~102 vs ~234 ms (2.3×), clonefile equal (~1.8–2.0 ms), attach ~416 vs ~342 ms (ASIF ~75 ms slower)** — the
-basis for the ASIF default (01_storage.md); budgets absorb the ~75 ms attach delta within the 1 s median. **Attach floor
-verdict: not flag-reducible** — `-noverify` saves ~15 ms (noise), `-noautofsck` nothing, `diskutil image attach` exposes
-no equivalent knobs; the ~235–400 ms is inherent to DiskImages + APFS mount + DiskArbitration. Halving it would need a
-different attach path (DiskImages2 / diskarbitrationd private API) — a research note, and budgets must not assume it.
-The bench harness is the reference methodology for any future substrate change (it validated ASIF before it became the
-default; it establishes the ZFS baseline below).
+The image-format prototype (`specs/cowshed/prototypes/image-format-bench/`, harness and results; 100 GB images holding a
+6.3 GB tree; 01_storage.md, "Format measurements") is the basis for the one format, case-sensitive ASIF: create 441 vs
+1,046 ms for SPARSE, attach + fsck + mount 228 vs 308 ms, clonefile equal (under 0.1 ms at these sizes), small files
+created, symlinked, and unlinked 10×, 16×, and 7× faster and 1 GiB written and read 4.3× and 7.5× faster (interleaved
+medians), a 6.3 GB tree filled 1.6–3.5× faster; case-insensitive ASIF measures the same as case-sensitive within noise.
+The earlier 4 GiB experiment (`apfs-workspace-bench/results/2026-07-11-substrate-experiments.json`) points the same way.
+**Attach floor verdict: not flag-reducible** — `-noverify` saves ~15 ms (noise), `-noautofsck` nothing,
+`diskutil image attach` exposes no equivalent knobs; the ~200–400 ms is inherent to DiskImages attach plus the APFS
+mount. Halving it would need a different attach path (DiskImages2 private API) — a research note, and budgets must not
+assume it. The two harnesses are the reference methodology for any future substrate change (they validated ASIF;
+apfs-workspace-bench establishes the ZFS baseline below).
 
 ### ZFS / Landlock (Linux) — separate baseline
 

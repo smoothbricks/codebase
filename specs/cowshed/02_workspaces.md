@@ -70,12 +70,10 @@ not a best-effort script:
    applied otherwise — and both dedicated volumes exist: lazily create and mount `cowshed.store` (at
    `/private/cowshed/store`) then `cowshed.caches` (nested; ordering and the volume marker in 01_storage.md) before any
    image is created.
-2. Select the supported format, then create the image under a staged, non-enumerated, format-specific name:
-   `<owner>/<repo>/.staging/main-<incarnation>.asif` for ASIF or
-   `<owner>/<repo>/.staging/main-<incarnation>.sparseimage` for SPARSE. Both components come from the validated primary
-   `repo_id` and are encoded independently as specified in 01_storage.md. Create its complete sibling host sidecar with
-   the matching `imageFormat` before the first attach; the readdir registry never sees staged objects. Attach at a
-   staging mountpoint, refusing any extension/metadata mismatch as specified in 01_storage.md.
+2. Create the image (case-sensitive APFS in ASIF, 01_storage.md) under a staged, non-enumerated name:
+   `<owner>/<repo>/.staging/main-<incarnation>.asif`. Both components come from the validated primary `repo_id` and are
+   encoded independently as specified in 01_storage.md. Create its complete sibling host sidecar before the first
+   attach; the readdir registry never sees staged objects. Attach at a staging mountpoint.
 3. Copy the full tree (including `.git`), preserving metadata, in delta passes until quiescent. A bounded worker pool
    sized to available cores processes independent leaves. Each leaf first requests an APFS metadata clone and falls back
    only that leaf to `copyfile` data copy on `EXDEV`/`ENOTSUP`, so one cross-volume subtree never aborts completed
@@ -84,13 +82,15 @@ not a best-effort script:
 4. Write `.cowshed/workspace.json` (`role: "main"`), mint `.cowshed/token`, mint main's per-workspace CA (private key
    controller-side next to the grant file; CA cert placed in-image as a trust anchor with the tool anchors wired —
    04_sandbox.md/05_gateway.md), create in-image cache roots, and write platform endpoint plus shared-cache wiring into
-   tool config files (03_caches.md). The main sidecar contains `portBlock` only on macOS; Linux omits it and creates its
-   per-incarnation socket/netns connector when the published workspace is attached. Verify the copied tree against the
-   source before publication.
+   tool config files (03_caches.md). Set the copied repository's `core.ignorecase` to `false` — the value `git init`
+   probes on the image's case-sensitive volume; a checkout that lived on a case-insensitive volume carries `true`, and
+   git relies on it matching the filesystem. The main sidecar contains `portBlock` only on macOS; Linux omits it and
+   creates its per-incarnation socket/netns connector when the published workspace is attached. Verify the copied tree
+   against the source before publication.
 5. Publish, building every durable artifact before the user's tree is touched: create the mountpoint with the
-   self-healing stub `.envrc` inside it, rename the staged image and each sibling sidecar into place without changing
-   the format extension, `fsync` the parent directories around each rename, and attach. Only then does the checkout path
-   change hands, in the way the chosen layout prescribes.
+   self-healing stub `.envrc` inside it, rename the staged image and each sibling sidecar into place, `fsync` the parent
+   directories around each rename, and attach. Only then does the checkout path change hands, in the way the chosen
+   layout prescribes.
 
 ## Checkout layouts
 
@@ -218,19 +218,17 @@ Budget: ≤ 1 s cold. No pool, no pre-warming.
 1. `flock` main's image lock; `fsync`/`sync` the main volume. Measured: the sync is for **freshness, not consistency** —
    a live clone is always crash-consistent, but without a sync it can miss the last writes (a just-written file was
    absent from a non-synced clone).
-2. Preserve the source format and extension: `clonefile(main.<ext>, sessions/<name>.<ext>)`, where `<ext>` is `asif` or
-   `sparseimage` according to main's validated detached `imageFormat` — ~2 ms regardless of content size. Create the
-   complete closed-baseline sibling sidecar before attach; allocate `portBlock` only on macOS and omit it on Linux.
-3. Attach without mounting, run `fsck_apfs -q` against the clone's APFS volume device, then mount at
-   `<mount-root>/<owner>/<repo>/<name>` — extension and detached `imageFormat` must agree, then attach dispatches to
-   `diskutil image attach --noMount` for ASIF or `hdiutil attach -nomount` for SPARSE (flags per 01_storage.md) —
-   ~235–400 ms typical for a freshly written image. The first write into the clone, in attach or mount, also copies the
-   source image's extent map (01_storage.md, "Clone cost follows extents, not size"), which on a long-used main is tens
-   of seconds until `cowshed defrag main` rewrites main contiguously. Verification precedes the first mount; a clone
-   never mounts unchecked.
+2. `clonefile(main.asif, sessions/<name>.asif)` — ~2 ms regardless of content size. Create the complete closed-baseline
+   sibling sidecar before attach; allocate `portBlock` only on macOS and omit it on Linux.
+3. Attach without mounting (`diskutil image attach --noMount`, flags per 01_storage.md), run `fsck_apfs -q` against the
+   clone's APFS volume device, then mount at `<mount-root>/<owner>/<repo>/<name>` — ~235–400 ms typical for a freshly
+   written image. The first write into the clone, in attach or mount, also copies the source image's extent map
+   (01_storage.md, "Clone cost follows extents, not size"), which on a long-used main is tens of seconds until
+   `cowshed defrag main` rewrites main contiguously. Verification precedes the first mount; a clone never mounts
+   unchecked.
 4. On fsck failure, delete the clone and retry once from a fresh sync. (Measured: 10/10 clonefiles taken under a
    continuous writer plus a streaming 128 MiB dd passed both `fsck_apfs -q` and a full `-n` check, mountable and
-   readable, on both formats — this path is a safety net that is expected to essentially never fire; the fork-mid-write
+   readable, on ASIF — this path is a safety net that is expected to essentially never fire; the fork-mid-write
    integration test pins it, 08_testing.md.)
 5. Rewrite `.cowshed/workspace.json` (`role: "workspace"`, `baseCommit` = main's HEAD), mint a fresh `.cowshed/token`,
    mint a fresh per-workspace CA (private key controller-side next to the grant file; CA cert placed in-image as a trust
@@ -292,7 +290,7 @@ A `PendingFence` clone that no unfinished intent names, and that no process is c
 image's lifecycle lock are both free), is abandoned: nothing will finish it, and because it was never published nothing
 ever ran in it. `gc` and `doctor --repair` retire it as the create or fork its own metadata records, under the ordinary
 pending-clone retirement checks, and `rm <name>` accepts it the same way. A retirement those checks refuse leaves the
-clone in place and names the refusal. `gc` never compacts or deletes a `PendingFence` image directly.
+clone in place and names the refusal. `gc` never deletes a `PendingFence` image directly.
 
 | Kill window                                                      | Durable state                                                  | Recovery action and guard                                                                                                                                                                                   |
 | ---------------------------------------------------------------- | -------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -494,10 +492,9 @@ deliberate trade of isolation for immediacy, taken per workspace, and never by d
 
 ## `cowshed fork <src> <dst>`
 
-Clones a _session_ mid-flight with the same barrier/fencing as `cowshed new`, preserving the source image's validated
-format and extension (`sessions/<src>.asif` → `sessions/<dst>.asif`, or `.sparseimage` → `.sparseimage`). The marker
-records `forkedFrom` and `lineage` (the source incarnation, then the source's own ancestors), and the controller records
-the audit
+Clones a _session_ mid-flight with the same barrier/fencing as `cowshed new` (`sessions/<src>.asif` →
+`sessions/<dst>.asif`). The marker records `forkedFrom` and `lineage` (the source incarnation, then the source's own
+ancestors), and the controller records the audit
 `ControllerCommitment::Fork(ForkCommitment { version, order, repo_id, source_incarnation, destination_incarnation })`.
 Grants do **not** carry over: the fork starts closed, with a fresh CA and platform endpoint identity. macOS allocates a
 new `portBlock`; Linux leaves it absent and creates a new per-incarnation socket/netns/ connector. Neither inherits the
@@ -788,12 +785,11 @@ step.
    remote if one was registered, and its worktree registration if it is a git-worktree workspace (remove, then prune).
    This is the one piece of teardown that lives where the user can see it — a remote or a registration naming a trashed
    mount is a broken fetch and a broken `git worktree list` in the user's own checkout.
-4. Logically retire: preserve the image extension while atomically renaming the image and its detached grants/CA
-   companions to `sessions/.trash/<ws>-<incarnation>.asif` for ASIF or `sessions/.trash/<ws>-<incarnation>.sparseimage`
-   for SPARSE. The canonical image disappears from enumeration and the command returns here (typically well under a
-   second; a stubborn process tree delays it by at most the kill grace). Valid checkpoint facts left behind during this
-   asynchronous phase neither republish the workspace nor authorize deletion by themselves; malformed, foreign, and
-   duplicate facts remain integrity errors.
+4. Logically retire: atomically rename the image and its detached grants/CA companions to
+   `sessions/.trash/<ws>-<incarnation>.asif`. The canonical image disappears from enumeration and the command returns
+   here (typically well under a second; a stubborn process tree delays it by at most the kill grace). Valid checkpoint
+   facts left behind during this asynchronous phase neither republish the workspace nor authorize deletion by
+   themselves; malformed, foreign, and duplicate facts remain integrity errors.
 5. Background (spawned detached): detach the mount (escalating to `-force` after a 10 s grace), unlink the trashed image
    and companions, every checkpoint (including pinned checkpoints), every pre-restore undo image and companion/fact,
    then the empty checkpoint and mountpoint directories. Interrupted cleanup is resumed idempotently by `cowshed gc`
@@ -875,4 +871,4 @@ fetch-from-workspace (`cowshed push`), and no credential or remote URL ever exis
 
 **hdiutil shadow files rejected.** Shadows share only a frozen base (identical to what clonefile already provides),
 measure 2.3× slower on synchronous writes, and pin their base image against deletion. Clones have no runtime dependency
-on their source — main's image can be replaced or compacted freely.
+on their source — main's image can be replaced or rewritten (`defrag`) freely.

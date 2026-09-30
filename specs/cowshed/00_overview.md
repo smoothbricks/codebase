@@ -8,10 +8,10 @@ closed and widen only through explicit, controller-owned grants.
 
 ## Platforms
 
-| Platform | Substrate                              | Sandbox                      | Secrets                        |
-| -------- | -------------------------------------- | ---------------------------- | ------------------------------ |
-| macOS    | APFS images (`.asif` / `.sparseimage`) | Seatbelt (`sandbox-exec`)    | Keychain                       |
-| Linux    | ZFS datasets (snapshot + clone)        | Landlock + network namespace | secret-service / systemd-creds |
+| Platform | Substrate                           | Sandbox                      | Secrets                        |
+| -------- | ----------------------------------- | ---------------------------- | ------------------------------ |
+| macOS    | APFS images in ASIF files (`.asif`) | Seatbelt (`sandbox-exec`)    | Keychain                       |
+| Linux    | ZFS datasets (snapshot + clone)     | Landlock + network namespace | secret-service / systemd-creds |
 
 The substrate and enforcement layers sit behind traits (09_substrates.md, 04_sandbox.md); every concept above them —
 grants, gateway, cache taxonomy, CLI contract, marker files — is identical across platforms.
@@ -66,20 +66,20 @@ Agent-driven development multiplies workspaces. Three failure modes follow:
                     ┌────────────────────┘          └──────────────────┐
                     ▼                                                  ▼
         /private/cowshed/store/  (= the cowshed.store volume)                  cowshed-gateway (localhost)
-        <owner>/<repo>/main{.asif|.sparseimage} ─ clonefile ─►    npm/cargo mirror · per-workspace CA interception
-        <owner>/<repo>/sessions/<ws>{.asif|.sparseimage}          repo-mirror verb · Arrow audit (13)
-        <owner>/<repo>/sessions/<ws>{.asif|.sparseimage}.grants.json    │
+        <owner>/<repo>/main.asif ─ clonefile ─►                   npm/cargo mirror · per-workspace CA interception
+        <owner>/<repo>/sessions/<ws>.asif                         repo-mirror verb · Arrow audit (13)
+        <owner>/<repo>/sessions/<ws>.asif.grants.json                   │
                     │                                                ▼
-                    ▼ format-selected attach                 cowshed.caches APFS volume
+                    ▼ diskutil image attach                  cowshed.caches APFS volume
         /private/cowshed/store/mnt/<owner>/<repo>/<ws>/          ◄─ sccache/zig/gradle ─  /private/cowshed/caches/
         (workspace: src + .git + node_modules + target)
 ```
 
-The diagram shows the macOS/APFS substrate: ASIF images use `.asif` and `diskutil image attach`, while SPARSE fallback
-images use `.sparseimage` and `hdiutil attach`; detached metadata selects the tool and must agree with the extension
-(01_storage.md). On Linux the same logical shape holds with ZFS datasets in place of image files and the store mounted
-directly at `/private/cowshed/store` with the caches dataset nested at `/private/cowshed/caches` (09_substrates.md).
-Both volumes are dedicated: the Data volume carries no cowshed bytes (01_storage.md).
+The diagram shows the macOS/APFS substrate: every image is a case-sensitive APFS volume in one ASIF file (`.asif`),
+attached with `diskutil image attach` (01_storage.md). On Linux the same logical shape holds with ZFS datasets in place
+of image files and the store mounted directly at `/private/cowshed/store` with the caches dataset nested at
+`/private/cowshed/caches` (09_substrates.md). Both volumes are dedicated: the Data volume carries no cowshed bytes
+(01_storage.md).
 
 Gateway reachability is deliberately platform-specific. macOS package clients use the workspace's `portBlock.base`.
 Linux allocates no `portBlock`: each attached workspace has a private loopback/netns and a controller-launched trusted

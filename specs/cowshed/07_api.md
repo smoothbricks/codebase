@@ -613,7 +613,7 @@ Public request/result and controller-commitment definitions live in `cowshed_cor
 `JobArtifactRecord`/manifest/record envelope and Arrow projections live in `cowshed_core::storage::job_artifact` and
 reuse those DTOs. Serde uses `camelCase`, documented enum strings, and omission rather than `null`.
 
-- `WorkspaceInfo = { repoId, workspace, workspaceIncarnation, role, imageFormat, mount, state, branch?, baseCommit?, createdAt?, checkpoints, snapshotStale }`;
+- `WorkspaceInfo = { repoId, workspace, workspaceIncarnation, role, mount, state, branch?, baseCommit?, createdAt?, checkpoints, snapshotStale }`;
   `state` is `"attached" | "detached"`. `checkpoints` is always an array of
   `CheckpointInfo = { label, revision, pinned }` facts derived from canonical storage. Detached rows without a cached
   marker snapshot omit all three marker-derived optionals but still report checkpoint facts.
@@ -626,9 +626,9 @@ reuse those DTOs. Serde uses `camelCase`, documented enum strings, and omission 
   retirement.
 - `DoctorReport = { healthy, findings }`; `Finding = { code, severity, message, hint, path? }`, and severity is
   `"info" | "warning" | "error"`. `GcCandidate = { identity: Sha256Digest, path, bytes, reason }`, where reason is the
-  closed `retiredWorkspace | orphanStagingImage | orphanStagingMetadata | expiredCheckpoint | detachedImageCompaction`
-  enum. `GcReport = { examined, reclaimed, retainedPinned, freedBytes, dryRun, candidates }`. Dry-run candidates are the
-  exact immutable substrate plan and never mutable handles; execution revalidates the plan before the first effect.
+  closed `retiredWorkspace | orphanStagingImage | orphanStagingMetadata | expiredCheckpoint` enum.
+  `GcReport = { examined, reclaimed, retainedPinned, freedBytes, dryRun, candidates }`. Dry-run candidates are the exact
+  immutable substrate plan and never mutable handles; execution revalidates the plan before the first effect.
 - `JobId` is a positive integer no greater than `2^53-1`.
   `JobInfo = { repoId, workspaceIncarnation, jobId, state, pid?, grantRevision, argv | script, failure?, cwd, started, durationMs?, exit?, stdout, stderr, trace, outputLimit?, stdin }`.
   The command is flattened: exactly one of `argv` and `script` is present, and an `ExecRequest` carries the same field.
@@ -674,10 +674,10 @@ reuse those DTOs. Serde uses `camelCase`, documented enum strings, and omission 
   validated `GitRef`, and otherwise as a validated `BranchName`. Invalid values return `DtoError`; git rev expressions
   such as `HEAD~1` never fall back to another resolver. `ExpectedRefHead` projects as `{missing:true}` or `{oid}`. Oids
   are validated lowercase 40- or 64-hex strings.
-- `AdoptOptions = { path?, capacity?, quarantine, imageFormat? }`;
-  `CreateOptions = { revision?, fromWorkspace?, browse, slot? }`; `AttachOptions = { browse }`;
-  `RemoveOptions = { force }`; `GcOptions = { dryRun }`; `RebaseOptions`, `LandOptions`, and `PushOptions` use the
-  expectation fields shown above. All booleans are explicit in JSON; absence never silently means authority was granted.
+- `AdoptOptions = { path?, capacity?, quarantine }`; `CreateOptions = { revision?, fromWorkspace?, browse, slot? }`;
+  `AttachOptions = { browse }`; `RemoveOptions = { force }`; `GcOptions = { dryRun }`; `RebaseOptions`, `LandOptions`,
+  and `PushOptions` use the expectation fields shown above. All booleans are explicit in JSON; absence never silently
+  means authority was granted.
 - `GrantSet`, `GrantDelta`, `PortBlock`, `EgressRule`, `RepoRule`, and `SimVerb` reuse the metadata definitions.
   `GrantSet.portBlock` is present on macOS and omitted on Linux; `GrantDelta.expectedRevision` is optional. `PortBlock`
   fields are private; `new`, `base()`, and `size()` are the public surface, and custom deserialization invokes the same

@@ -48,15 +48,15 @@ layout root:
     policy.json                      # trusted project policy (checkpoint quotas, standing grants); controller-owned, 0600
     lifecycle-intents.json             # bounded persist-before-mutate create/fork/remove recovery journal, mode 0600
     lifecycle-intents.json.lock        # flock held for each read-modify-write of the journal
-    main{.asif|.sparseimage}          # adopted main image; exactly one format-specific extension exists
-    main{.asif|.sparseimage}.grants.json  # controller-owned grants + detached metadata
+    main.asif                        # adopted main image
+    main.asif.grants.json            # controller-owned grants + detached metadata
     sessions/
-      <workspace>{.asif|.sparseimage}     # one image per workspace
-      <workspace>{.asif|.sparseimage}.grants.json  # grants + detached metadata (see 04_sandbox.md)
-      <workspace>{.asif|.sparseimage}.lock         # flock target for lifecycle operations
+      <workspace>.asif               # one image per workspace
+      <workspace>.asif.grants.json   # grants + detached metadata (see 04_sandbox.md)
+      <workspace>.asif.lock          # flock target for lifecycle operations
       <workspace>.intent.lock                      # flock the process executing <workspace>'s lifecycle intent holds
     checkpoints/
-      <workspace>/<label>{.asif|.sparseimage}      # clonefile snapshot; extension is preserved
+      <workspace>/<label>.asif       # clonefile snapshot
     quarantine/                      # secrets relocated by `cowshed adopt --quarantine` (02_workspaces.md)
     waivers.json                     # reasoned secret-scan waivers (02_workspaces.md)
   gateway/
@@ -90,8 +90,7 @@ Workspace names match `[a-z0-9][a-z0-9-]{0,63}`; `main` is reserved. Repository 
 components are validated and encoded independently; the slash between them is structural and percent-decoding is never
 performed during path lookup.
 
-After this layout, `{.asif|.sparseimage}` denotes exactly one format-selected extension: `.asif` for ASIF or
-`.sparseimage` for SPARSE. Sidecar suffixes append to the complete image filename. `portBlock` in detached sidecar
+Sidecar suffixes append to the complete image filename (`<workspace>.asif.grants.json`). `portBlock` in detached sidecar
 metadata is optional and platform-specific: it is present only for macOS workspaces and is omitted on Linux; Linux does
 not synthesize a base port in persistent metadata.
 
@@ -111,65 +110,135 @@ every clone automatically). Main and sessions use identical wiring; only the san
 
 ## Images
 
-- **Format and extension**: ASIF via `diskutil image create blank --format ASIF`, the default on macOS 26+ (near-native
-  I/O, sparse, single file), uses `.asif`. Measured, not assumed (single-run medians, substrate bench in
-  `specs/cowshed/prototypes/apfs-workspace-bench/`): vs SPARSE, ASIF creates 2.1× faster, direct-writes 2.5× faster,
-  direct-reads 5.6× faster, and runs metadata workloads 2.3× faster; clonefile is equal (~2 ms) and attach is ~75 ms
-  slower — the one metric SPARSE wins, decisively outweighed. Sparse growth is near-identical. On hosts without ASIF
-  support cowshed falls back to `hdiutil create -type SPARSE` transparently and uses `.sparseimage`. The sibling
-  detached metadata records `imageFormat: "asif" | "sparse"`; its value and the filename extension MUST agree, or
-  cowshed refuses before dispatching an attach tool. After mounting, the in-image marker MUST also agree; a mismatch
-  fails the attach and cowshed detaches immediately. One ASIF-specific step: `diskutil` creates the inner volume root
-  owned by root, so cowshed chowns the volume root to the user immediately after creation.
+- **Format**: one — an ASIF image (`.asif`) holding one case-sensitive APFS volume. There is no second format, no
+  fallback, and no format field in any metadata: `.asif` is the only image extension anything enumerates, and macOS 26,
+  which introduced ASIF (`diskutil` documents it as the replacement for the legacy `.sparseimage`), is the floor.
+  Creation is four unprivileged steps, 441 ms at the median:
+  `diskutil image create blank --format ASIF --size <capacity-bytes> --volumeName <label> --fs None <image>`,
+  `diskutil image attach --nobrowse --noMount --plist <image>`,
+  `newfs_apfs -U <uid> -G <gid> -e -v <label> <whole-device>`, and `diskutil eject <whole-device>`. The attaching user
+  owns the image's device nodes, so formatting needs no privilege, and `-U`/`-G` make the volume root the invoking
+  user's from the start. `diskutil`'s own `--fs APFS` is not used: it cannot ask for case sensitivity, and it leaves a
+  root-owned volume root that an `owners` mount cannot write and only root can hand over.
+- **Case-sensitive, always**: `-e` is the entire cost — one flag at creation. Clones copy the volume as it is, so `new`,
+  `fork`, `checkpoint`, and `restore` never repeat it, and case-sensitive ASIF measures the same as case-insensitive
+  ASIF on every axis below within noise. A case-sensitive volume holds every path a repository can contain, including
+  paths that differ only in case, which a case-insensitive volume merges. The checkout's own volume does not matter:
+  adopt copies from it and sets the copied repository's `core.ignorecase` to `false` (02_workspaces.md).
 - **Capacity**: 100 GiB sparse. Capacity is a cap, not an allocation; images occupy only written blocks. Override per
   project via `.cowshed.toml` `capacity`.
 - **Clone cost follows extents, not size**: `clonefile` of an image returns in milliseconds because the clone shares the
-  source file's extent map, and the first write to either file copies that map, at about 12 µs per extent on the store
-  volume. A main image fragments with every write it takes while clones share its blocks, so a long-used main is slow to
+  source file's extent map, and the first write to either file copies that map: about 3.5 µs per extent for maps of
+  thousands of extents, rising to about 12 µs for maps of millions, on the store volume. A long-used main is slow to
   clone even though the clone call is instant: a one-byte write into a plain `cp -c` clone of a 2.1M-extent image took
-  25.7 s with no image attached, a 473k-extent image 4.4 s, and a freshly written 256-extent file 5 ms. `new` and `fork`
-  pay it inside attach or mount, whichever writes first; deleting a written clone pays about half as much per extent.
-  `doctor` counts main's extents with one `F_LOG2PHYS_EXT` query per contiguous run (2.1M extents read in 2.6 s) and
-  reports them as `main-extents`, a warning naming `cowshed defrag main` once the predicted first-write cost reaches the
-  1 s cold-`new` budget (08_testing.md). `defrag` is the one remedy: it detaches the workspace exactly as `resize` does
-  — a busy volume refuses before the image is touched — copies the image's data regions with plain `pread`/`pwrite` into
+  25.7 s with no image attached, a 473k-extent image 4.4 s, an 8,871-extent image 31 ms, and a freshly written
+  256-extent file 5 ms. `new` and `fork` pay it inside attach or mount, whichever writes first; deleting a written clone
+  costs half to all of that again (half at 2.1M extents, about the same at 9k). Fragmentation comes from clones, not
+  from the format: an image takes rewrites in place until a clone or checkpoint shares its blocks, after which every
+  block it rewrites moves to a new run. Under the fixed churn of "Format measurements" below, three rounds moved a fresh
+  image from 468 to 655 extents with no clone held and from 385 to 8,871 with four clones held — about 4,000 extents a
+  round once the volume reuses space earlier rounds freed — and SPARSE fragments the same way (583 → 888 and 593 →
+  9,441). The same three rounds run inside a clone left the source at its 356 extents, untouched (the clone itself went
+  to 8,699). What keeps `new` fast is therefore where writes land: every write into main while anything shares its
+  blocks is paid again by every later clone, and a write inside a workspace costs main nothing. `doctor` counts main's
+  extents with one `F_LOG2PHYS_EXT` query per contiguous run (2.1M extents read in 2.6 s) and reports them as
+  `main-extents`, a warning naming `cowshed defrag main` once the predicted first-write cost reaches the 1 s cold-`new`
+  budget (08_testing.md). `defrag` is the one remedy: it detaches the workspace exactly as `resize` does — a busy volume
+  refuses before the image is touched — copies the image's data regions with plain `pread`/`pwrite` into
   `<image>.defrag` beside it (never `clonefile`, `copyfile(3)`, or `std::fs::copy`, all of which clone on APFS and would
   share the old map), punches the source's holes back into the copy, `F_FULLFSYNC`s it, renames it over the image, syncs
-  the directory, and verifies the result by attaching it before restoring the mount state it found. The copy needs, and
-  keeps, free space equal to the image's allocated bytes while earlier clones and checkpoints still share the old
-  blocks; the verb refuses before detaching when the store volume lacks it. Nothing enumerates `<image>.defrag` as an
-  image or sidecar; the next `defrag` replaces one an interrupted run left, and `doctor` names it until then. Mains are
-  never detached implicitly (the gateway keeps them mounted), so no path rewrites main on its own.
-- **Filesystem**: APFS, case sensitivity matching the volume that holds the adopted repository (queried via
-  `pathconf(_PC_CASE_SENSITIVE)` at adopt time) so git behavior is identical inside and outside.
+  the directory, and verifies the result by attaching it before restoring the mount state it found. The copy runs at
+  3.1–5.4 GB/s on the store volume (8.9 GiB in 1.8–3.1 s, an 8,871-extent image back to 579). Nothing rewrites an
+  attached image: the attachment holds an exclusive lock on the file (another `O_SHLOCK` or `O_EXLOCK` open fails with
+  `EAGAIN`), and `diskutil image resize` and `diskutil image create from` refuse it as well. The copy needs, and keeps,
+  free space equal to the image's allocated bytes while earlier clones and checkpoints still share the old blocks; the
+  verb refuses before detaching when the store volume lacks it. Nothing enumerates `<image>.defrag` as an image or
+  sidecar; the next `defrag` replaces one an interrupted run left, and `doctor` names it until then. Mains are never
+  detached implicitly (the gateway keeps them mounted), so no path rewrites main on its own.
 - **Volume name**: the repository name for `main`, `<repo> — <workspace>` for every other workspace. The volume name is
   a label and nothing else: Finder shows it in place of the directory name for a mounted volume's directory, so it is
   written for the person looking at it. Nothing parses it, nothing classifies a volume by it, and nothing derives
   identity from it — renaming a volume by hand (`diskutil rename`) changes the label and nothing else. Identity comes
   from where the backing image lives and from the in-image marker; see "Ownership, identity, and the volume label"
   below.
-- **Spotlight**: created with indexing disabled (`-nospotlight` / `mdutil -i off` post-attach).
+- **Spotlight**: nothing to set. `diskutil image create` has no `-nospotlight`, `mdutil -i off` needs root, and a
+  `nobrowse` mount is not indexed (measured: no `.Spotlight-V100` store appears after writes, and `mdutil -s` reports no
+  indexing state). A `--browse` mount is an ordinary visible volume to Spotlight.
 - **Time Machine**: backup policy is one per-volume decision, not path exclusions. If Time Machine includes additional
   internal volumes by default (verification item, 08_testing.md), adopt excludes `cowshed.store` and `cowshed.caches`
   once, volume-level, at creation. Durability is git (`cowshed push`), never backup.
 
+### Format measurements
+
+The image-format prototype (`specs/cowshed/prototypes/image-format-bench/`: harness, `results/`) compared three
+candidates on the store's APFS container, all created and mounted without root: case-sensitive ASIF (the format),
+case-insensitive ASIF (`newfs_apfs -i`, otherwise identical), and case-sensitive SPARSE
+(`hdiutil create -type SPARSE -fs "Case-sensitive APFS"`, attached with `hdiutil attach -owners on -nomount`). The data
+set is one real Bun `node_modules` (3.6 GB, 34k files, 6.5k symlinks), 40,000 further symlinks, 2 GiB of
+cargo-target-like files (24 × 64 MiB, 512 × 1 MiB), and a git repository tracking all but the target files (80,744 index
+entries, 0.75 GB of loose objects): 6.3 GB, 55,821 files, 46,575 symlinks. One churn round rewrites every target file
+(write a new file, rename it over the old) and relinks every symlink — 2 GiB and 46,575 relinks. Extents are counted as
+`doctor` counts them; the first write is one byte rewritten in place in a fresh `clonefile` of the image. The host ran a
+fleet throughout (load average 10–35), so single timings carry about ±20 %; the I/O rows interleave the three candidates
+round by round.
+
+| Metric                                                                   | ASIF, case-sensitive (chosen)                                                     | ASIF, case-insensitive                                                   | SPARSE, case-sensitive                                           |
+| ------------------------------------------------------------------------ | --------------------------------------------------------------------------------- | ------------------------------------------------------------------------ | ---------------------------------------------------------------- |
+| Create, unprivileged (median of 5)                                       | 441 ms                                                                            | 448 ms                                                                   | 1,046 ms                                                         |
+| Attach + `fsck_apfs -q` + mount (median of 5)                            | 228 ms                                                                            | 204 ms                                                                   | 308 ms                                                           |
+| Detach (median of 5)                                                     | 337 ms                                                                            | 277 ms                                                                   | 360 ms                                                           |
+| Fill with the 6.3 GB data set (`ditto`, two runs)                        | 21.7 s / 16.5 s                                                                   | 17.2 s / 20.8 s                                                          | 34.7 s / 57.5 s                                                  |
+| Source extents, filled → 3 churn rounds, 4 clones held                   | 385 → 511 → 5,137 → 8,871                                                         | 425 → 550 → 5,323 → 8,952                                                | 593 → 2,244 → 5,822 → 9,441                                      |
+| First write into a fresh clone at those counts                           | 2.7 / 3 / 18.4 / 30.7 ms                                                          | 2.5 / 2.4 / 17.3 / 29.3 ms                                               | 2.8 / 9.4 / 20.6 / 36 ms                                         |
+| Source extents, same churn, no clone held                                | 468 → 576 → 629 → 655                                                             | 445 → 586 → 621 → 624                                                    | 583 → 778 → 884 → 888                                            |
+| Source extents, same churn inside a clone of it                          | 356 → 356 → 356 → 356 (shed: 472 → 5,003 → 8,699)                                 | —                                                                        | —                                                                |
+| Allocated after 3 rounds (5.9 GiB data)                                  | 8.87 GiB                                                                          | 8.87 GiB                                                                 | 9.06 GiB                                                         |
+| Defrag copy of the 4-clone image (8.9 GiB)                               | 2.0 s, 4.7 GB/s → 579 extents                                                     | 1.8 s, 5.4 GB/s → 576 extents                                            | 3.1 s, 3.1 GB/s → 598 extents                                    |
+| `git status`, 80,744 entries (interleaved median of 7)                   | 315 ms                                                                            | 344 ms                                                                   | 319 ms                                                           |
+| 20k small files: create / symlink / unlink ops/s                         | 13,811 / 26,684 / 31,149                                                          | 14,516 / 25,955 / 28,200                                                 | 1,331 / 1,690 / 4,382                                            |
+| 1 GiB sequential write (`F_FULLFSYNC`) / read (`F_NOCACHE`)              | 3,201 / 15,022 MB/s                                                               | 3,202 / 15,258 MB/s                                                      | 751 / 2,012 MB/s                                                 |
+| Space returned after 3.3 GiB written then deleted                        | 1.3 GiB on its own; `diskutil image create from` copy is 15 MiB (0.18 s)          | 1.3 GiB on its own; `diskutil image create from` copy is 15 MiB (0.13 s) | none on its own; `hdiutil compact` 0.7 s returned 57 MiB         |
+| Capacity 100 GiB vs 7.3 TiB (the store volume): create                   | 710 vs 463 ms                                                                     | —                                                                        | 1,050 vs 1,032 ms                                                |
+| … attach + fsck + mount                                                  | 288 vs 241 ms                                                                     | —                                                                        | 287 vs 525 ms                                                    |
+| … image allocated when empty                                             | 14 vs 17 MiB                                                                      | —                                                                        | 15 vs 17 MiB                                                     |
+| … `df` inside the volume (size / available)                              | 100 / 100 vs 7,449 / 2,686 GiB                                                    | —                                                                        | 100 / 100 vs 7,449 / 2,674 GiB                                   |
+| … filled, then one churn round: allocated, extents                       | 7.93 GiB, 455 vs 7.93 GiB, 932                                                    | —                                                                        | 7.92 GiB, 785 vs 7.93 GiB, 777                                   |
+| … grow 100 GiB → 7.3 TiB, detached                                       | 542 ms                                                                            | —                                                                        | 1,171 ms                                                         |
+| Rewrite of the 4-clone image: plain copy vs `diskutil image create from` | 2.4 s → 792 extents, 8.83 GiB vs 2.8 s → 217 extents, 7.95 GiB, same content: yes | —                                                                        | —                                                                |
+| Rewrite, resize, or convert while attached                               | refused: file held under exclusive lock (`EAGAIN`)                                | refused: file held under exclusive lock (`EAGAIN`)                       | refused: file held under exclusive lock (`EAGAIN`)               |
+| Grow 100 → 200 GB, detached                                              | 460 ms; volume grows with it                                                      | 539 ms; volume grows with it                                             | 498 ms; volume grows with it                                     |
+| Volume and its clone case-sensitive                                      | yes / yes                                                                         | no / no                                                                  | yes / yes                                                        |
+| Work per `new` for case sensitivity                                      | none                                                                              | none                                                                     | none                                                             |
+| Largest capacity (documented / reverse-engineered)                       | just under 4 PiB                                                                  | just under 4 PiB                                                         | 128 PB (`man hdiutil`)                                           |
+| Host dies mid-write (docs)                                               | allocation directory is versioned and switched atomically                         | allocation directory is versioned and switched atomically                | power loss during `compact` can damage the image (`man hdiutil`) |
+
+ASIF's 1 MiB chunks, its capacity limit, and its versioned allocation directory come from reverse engineering
+(<https://schamper.dev/dissecting-apples-sparse-image-format-asif/>), not from Apple; SPARSE's limits and its compaction
+warning come from `man hdiutil`. Both hold a crash-consistent APFS, and cowshed runs `fsck_apfs -q` before every mount
+either way. ASIF's chunk table can mark a chunk unmapped, which fits it returning part of deleted space on its own;
+SPARSE returns nothing until `hdiutil compact`, and little then. `diskutil image create from` rewrites a detached ASIF
+image from its allocated chunks only: on the churned four-clone image it took 2.8 s against the plain copy's 2.4 s and
+left 217 extents and 7.95 GiB against 792 and 8.83 GiB, with the same content, case sensitivity, and owner. An ASIF
+capacity as large as the store volume measured no cost against 100 GiB: creation, attach, empty allocation, and the
+allocation after a fill and a churn round match within noise, the churned image held 932 extents against 455 (about 1.5
+ms more first write), and `df` inside the volume reports the store's own free space as available. SPARSE at that
+capacity attached slower (525 against 287 ms) and once refused its first detach with `EBUSY`.
+
+Case-sensitive ASIF therefore costs nothing that case-insensitive ASIF does not: the flag is set once at creation, no
+step recurs per `new`, and every measured difference between the two sits inside the noise. SPARSE loses on creation,
+attach, fill, small-file and sequential I/O, ties on `git status`, fragments under clones exactly as ASIF does, and
+gives back less space.
+
 ## Mounts
 
-Attach resolves the format without mounting: workspace enumeration accepts only `.asif` and `.sparseimage` image names
-and treats both extensions for the same workspace stem as a conflict, then reads `imageFormat` from the sibling
-host-side metadata. The extension and metadata must map to the same format or attach refuses with a conflict; this
-avoids depending on the inaccessible in-image marker to choose an attach tool. After mounting, cowshed also requires the
-in-image marker's `imageFormat` to match. The two formats have disjoint attach tools (measured: `hdiutil attach` refuses
-ASIF outright with _"use 'diskutil image attach'"_):
-
-- **ASIF (`.asif`)**: `diskutil image attach --nobrowse --noMount --plist <image>`.
-- **SPARSE (`.sparseimage`, fallback)**: `hdiutil attach -nobrowse -owners on -nomount -plist <image>`.
-
-Both commands return machine-readable attachment data from which cowshed selects the APFS volume device. Before the
-first mount, cowshed runs `fsck_apfs -q <device>`; any non-zero result detaches the image and fails without exposing a
-workspace mount. It then mounts explicitly with `diskutil mount nobrowse -mountPoint <path> <device>` (`--browse` omits
-`nobrowse`). ASIF and SPARSE therefore share the same verify-before-mount safety boundary even though their image
-attachment tools remain disjoint. Ownership is also guaranteed by the ASIF chown-at-create step above.
+Attach is `diskutil image attach --nobrowse --noMount --plist <image>` (`hdiutil attach` refuses ASIF outright with
+_"use 'diskutil image attach'"_), whose machine-readable output names the APFS volume device. Before the first mount,
+cowshed runs `fsck_apfs -q <device>`; any non-zero result detaches the image and fails without exposing a workspace
+mount. It then mounts with the kernel helper as the invoking user, `mount_apfs -o nobrowse,owners <device> <path>`
+(`--browse` omits `nobrowse`), not `diskutil mount`: Disk Arbitration serialises every mount on the host, and under a
+loaded fleet a mount `mount_apfs` completes in about a second queued there for 68 s at the median. Detach is
+`diskutil eject <whole-device>`. The read-only `hdiutil info -plist` inventory is the one host view that maps an
+attached image's path to its devices (`diskutil image info` reports none), so it stays the attachment inventory.
 
 For every mounted attachment:
 
@@ -317,17 +386,16 @@ policy is deliberately blunt: any user may retire any shed, because `noowners` a
 | Question                | Source of truth                                                                                             |
 | ----------------------- | ----------------------------------------------------------------------------------------------------------- |
 | Which workspaces exist? | For the selected primary `repo_id`, `readdir` its `sessions/` images plus that project's exactly one `main` |
-| Image format            | Sibling metadata `imageFormat`, validated against the image extension                                       |
 | What is attached where? | Kernel mount table (`getmntinfo`), matched by mount point, identity confirmed by the in-image marker        |
 | Workspace identity      | In-image marker `.cowshed/workspace.json`                                                                   |
 | Grants                  | Sibling file `<image>.grants.json`                                                                          |
 | Concurrency             | `flock` on `<image>.lock` per lifecycle operation                                                           |
 
 The detached metadata required for discovery and attach lives in `<image>.grants.json`; at minimum it contains the
-workspace identity and `imageFormat`, in addition to the grant schema in 04_sandbox.md. Thus `cowshed ls` and attach do
-not need to mount an image to discover its format. Marker-derived fields that exist only _inside_ the image remain
-unreadable while detached. `cowshed ls` reports name, format, image mtime, and mount state from host data, and fills
-`baseCommit`-class fields from a cached info snapshot in the same sidecar — stale-marked, refreshed on the next attach.
+workspace identity, in addition to the grant schema in 04_sandbox.md, so `cowshed ls` and attach never mount an image to
+learn what it is. Marker-derived fields that exist only _inside_ the image remain unreadable while detached.
+`cowshed ls` reports name, image mtime, and mount state from host data, and fills `baseCommit`-class fields from a
+cached info snapshot in the same sidecar — stale-marked, refreshed on the next attach.
 
 ### In-image marker: `.cowshed/workspace.json`
 
@@ -341,7 +409,6 @@ Written at adopt/new/fork/restore, at the volume root; travels with every clone:
   "workspace": "raven",
   "workspaceIncarnation": "0198f2c0b7e34dc795f17b238b331c80", // fresh controller-minted 128-bit id on create/fork/restore
   "role": "workspace", // "main" | "workspace"
-  "imageFormat": "asif", // "asif" | "sparse"
   "baseCommit": "8f31c2d…", // main's HEAD at creation
   "createdAt": "2026-07-11T12:00:00Z",
   "forkedFrom": null, // workspace name when created by `cowshed fork`
@@ -381,12 +448,12 @@ optional sink that nothing reads for a decision (07_api.md/13_telemetry.md).
 `<image>.grants.json` sits next to the image on the host filesystem, owned by the invoking user, mode 0600. It is
 **never** granted into any sandbox — a sandboxed process that could edit its own grant file could escalate itself. Only
 cowshed-core (running unsandboxed as the controller) reads and writes it. Besides grants it carries the workspace's
-identity, `workspaceIncarnation`, and `imageFormat` needed while detached, the optional macOS-only `portBlock` binding
-(`{base, size}`; base = the gateway's per-workspace data-plane listener, base+1..15 = the workspace's own bindable
-dev-server ports), and the detach-time info snapshot described above. Linux sidecars omit `portBlock`. The workspace's
-CA **private key** sits alongside it (`<image>.ca.key`, 0600, same controller-only, sandbox-denied treatment) — the
-gateway signs per-host interception leaves with it; only the public CA cert ever enters the image
-(04_sandbox.md/05_gateway.md). Schema in 04_sandbox.md.
+identity and `workspaceIncarnation` needed while detached, the optional macOS-only `portBlock` binding (`{base, size}`;
+base = the gateway's per-workspace data-plane listener, base+1..15 = the workspace's own bindable dev-server ports), and
+the detach-time info snapshot described above. Linux sidecars omit `portBlock`. The workspace's CA **private key** sits
+alongside it (`<image>.ca.key`, 0600, same controller-only, sandbox-denied treatment) — the gateway signs per-host
+interception leaves with it; only the public CA cert ever enters the image (04_sandbox.md/05_gateway.md). Schema in
+04_sandbox.md.
 
 During macOS restore, `<canonical-image>.restore.json` is the sole recovery fact for an interrupted image/metadata
 publication. Its exact v2, unknown-field-denying schema is
@@ -426,14 +493,15 @@ _conventions_, enforced by `cowshed gc`, never by a background daemon deleting w
   candidates with stable SHA-256 identity, host path, allocated bytes, and closed reason. Pinned checkpoints are
   retained and never become candidates. `execute_gc(plan)` acquires all plan locks without waiting, re-enumerates at the
   plan's observation time, and rejects a pin/incarnation/path/byte/concurrency change as stale before any mutation. Only
-  an unchanged plan drains trash/orphan staging objects, prunes expired checkpoints, and compacts detached sparse
-  images; execution reports actual freed bytes.
+  an unchanged plan drains trash/orphan staging objects and prunes expired checkpoints; execution reports actual freed
+  bytes. Nothing compacts an image: ASIF gives back only part of what its volume frees on its own (1.3 GiB of 3.3 GiB
+  written and then deleted, measured), so an image's allocation tracks its high-water mark.
 - Explicit workspace retirement is the sole exception to live checkpoint retention: its exact trash metadata authorizes
   one workspace-scoped cleanup plan that includes pinned checkpoints and pre-restore undo generations as well as the
-  trash image and empty mountpoint. Preview and execution validate the repository, workspace, incarnation, format,
-  checkpoint facts, and every associated artifact under the workspace lock; any change makes the plan stale before
-  mutation. Cleanup deletes the retirement trash metadata last so an interrupted pass retains authority for the next
-  idempotent GC pass. A missing canonical image or orphan checkpoint fact alone never authorizes deletion.
+  trash image and empty mountpoint. Preview and execution validate the repository, workspace, incarnation, checkpoint
+  facts, and every associated artifact under the workspace lock; any change makes the plan stale before mutation.
+  Cleanup deletes the retirement trash metadata last so an interrupted pass retains authority for the next idempotent GC
+  pass. A missing canonical image or orphan checkpoint fact alone never authorizes deletion.
 - `cowshed du` reports **written vs referenced** bytes per workspace and per checkpoint (the number that matters for CoW
   substrates — referenced is shared with the base, written is the true cost). `--json` for fleet dashboards. This is how
   a coordinator decides which long-lived workspaces to `cowshed rebase --fresh` (02_workspaces.md) to shed accumulated
@@ -446,10 +514,14 @@ that drifts on reboot and Finder ejects, and drift demands reconciliation machin
 believes" and "what is on disk" the same thing by construction; `cowshed doctor` shrinks to invariant checks. The cost —
 a few `readdir`/`getmntinfo` calls per command — is microseconds.
 
-**Sparseimage/sparsebundle rejected.** Sparsebundle band files reintroduce thousands of host inodes per workspace for no
-benefit (network-volume support is irrelevant here). Legacy `SPARSE` single files remain only as the pre-ASIF fallback:
-ASIF measures decisively better on I/O and metadata (2–5.6×) at the cost of ~75 ms on attach and a second attach code
-path (`diskutil image attach`).
+**SPARSE and sparsebundle rejected; one format, no fallback.** Sparsebundle band files reintroduce thousands of host
+inodes per workspace for no benefit (network-volume support is irrelevant here). SPARSE (`.sparseimage`) is the legacy
+format ASIF replaces, and it loses or ties every row of "Format measurements": 2.4× slower to create, 7–16× slower on
+small-file operations, 4–7× slower on sequential I/O, 1.6–3.5× slower to fill, and no better under clones. Keeping it as
+a fallback would cost a second creation path, a second attach and detach tool, a format field in every sidecar and
+marker, and an extension/metadata agreement check on every attach — for hosts older than macOS 26, which cowshed does
+not support. Case-insensitive ASIF was rejected because case sensitivity costs one flag at creation and nothing
+afterwards.
 
 **`/Volumes` mount root rejected.** DiskArbitration-managed mountpoints save a mkdir/rmdir pair but put cowshed paths in
 a shared namespace where Finder surfaces them and name collisions get renamed (`widget 1`). The configured mount root

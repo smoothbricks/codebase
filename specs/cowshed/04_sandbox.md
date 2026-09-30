@@ -251,8 +251,7 @@ Notes:
 ### Grant file: `<image>.grants.json`
 
 Controller-owned, host-readable while the image is detached, outside the workspace volume, mode 0600, on the
-`cowshed.store` volume (itself denied to every sandbox). Never readable or writable from inside a sandbox. Its
-`imageFormat` is attachment bootstrap metadata and must agree with `.asif`/`.sparseimage` as specified in 01_storage.md.
+`cowshed.store` volume (itself denied to every sandbox). Never readable or writable from inside a sandbox.
 
 ```json
 {
@@ -260,7 +259,6 @@ Controller-owned, host-readable while the image is detached, outside the workspa
   "repoId": "acme/widget",
   "workspace": "raven",
   "workspaceIncarnation": "0198f2c0b7e34dc795f17b238b331c80",
-  "imageFormat": "asif",
   "revision": 7,
   "platform": "macos",
   "portBlock": { "base": 40976, "size": 16 },
@@ -285,8 +283,7 @@ Controller-owned, host-readable while the image is detached, outside the workspa
   specified in 01/02; job records retain the incarnation that produced them so numeric job IDs remain unambiguous across
   copied or discarded timelines.
 - `revision` increments on every grant change; the supervisor launch, execs, and the gateway log the revision they
-  enforced, making audit trails reconstructible. `imageFormat` is not grant authority: lifecycle operations preserve it
-  and refuse any mismatch with the image extension or mounted marker.
+  enforced, making audit trails reconstructible.
 - Egress hosts are exact names or single-level `*.` wildcards, optional port list (default 443/80), optional
   `mode: "intercept" | "opaque"` (default `intercept` — the gateway terminates TLS under the workspace CA and injects
   credentials + trace; `opaque` is a pass-through CONNECT tunnel for pinned clients — 05_gateway.md), and optional
