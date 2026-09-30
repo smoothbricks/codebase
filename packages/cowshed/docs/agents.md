@@ -151,9 +151,10 @@ terminal state after process-group termination and pipe drain, never silent trun
 Every workspace starts closed: writes limited to its own volume, designated cache subtrees, and temp; network limited to
 your own gateway listener (whose registry mirrors — npm, crates.io — are baseline policy, warm and credentialed, so
 builds and installs work out of the box with zero grants). Third-party repositories arrive through
-`cowshed repo clone <url>`, which the gateway mirrors on your behalf. Need a dev server? Bind it to `$PORT` — each
-workspace owns a block of `$COWSHED_PORT_BLOCK_SIZE` ports from its gateway base (`$COWSHED_PORT_BASE`), reachable from
-the host browser container-style and guaranteed not to collide with sibling workspaces.
+`cowshed repo clone <url>`, which the gateway mirrors on your behalf. Need a dev server? Bind it to a port from
+`$COWSHED_PORT_BASE + 1` up — each workspace owns a block of `$COWSHED_PORT_BLOCK_SIZE` ports from its gateway base
+(`$COWSHED_PORT_BASE`), reachable from the host browser container-style and guaranteed not to collide with sibling
+workspaces.
 
 **Exit code 6 is not an error to retry — it is a request to negotiate.** When cowshed reports 6 it has authoritative
 evidence of the denial (egress denials always — the gateway logged the decision; filesystem denials when the kernel

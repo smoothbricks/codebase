@@ -212,8 +212,8 @@ them there; they contain the endpoint URL, whose userinfo is the workspace token
   emitting write grants (the `/var` → `/private/var` handling generalizes).
 
   On home-manager/NixOS/nix-darwin hosts this relocation is **declarative and mandatory**: the module creates the exact
-  links/bindings above as generation-managed artifacts, including the two Nix subdirectories, and `setup`/`ensure` only
-  validate. They never mutate module-owned paths: a host path that links into `/nix/store` anywhere but its target is a
+  links/bindings above as generation-managed artifacts, including the two Nix subdirectories, and `setup` only
+  validates. They never mutate module-owned paths: a host path that links into `/nix/store` anywhere but its target is a
   conflict naming the module. The sole exception is an explicitly imperative, non-declarative host: when no supported
   declarative manager owns the paths, `cowshed setup --imperative-host-setup` creates the same links; the flag is the
   confirmation, and a default `setup` never moves anything out of the user's home. There is no automatic fallback from
@@ -232,16 +232,15 @@ them there; they contain the endpoint URL, whose userinfo is the workspace token
     `cowshed exec`'s fail-closed shell activation (04_sandbox.md) carries it, and IDE-spawned tools (gopls) get it via
     the editor's direnv integration. Verification item (kickoff): coverage across go invocations including gopls, and
     whether any file-based mechanism exists that kills the export.
-  - On macOS, `cowshed ensure --envrc` additionally emits **port conventions for dev servers** —
-    `COWSHED_PORT_BASE=<portBlock.base>`, `COWSHED_PORT_BLOCK_SIZE=<portBlock.size>` and `PORT=<base+1>` — so devenv/dev
-    servers bind inside the workspace's own block (04_sandbox.md, cooperative-sandboxing caveat). Linux emits neither
-    value: services use private loopback and package/proxy wiring uses fixed `GATEWAY_HTTP=http://127.0.0.1:7644`. Both
-    platforms may emit **optional prompt conveniences — explicitly non-load-bearing** — `COWSHED_WORKSPACE` /
-    `COWSHED_REPO_ID` / `COWSHED_LAYER` / `COWSHED_MOUNT`. Anything that needs identity derives it from cwd via
-    `.cowshed/workspace.json` or asks the CLI.
+  - On macOS the in-image `.cowshed/env` additionally exports the **port conventions for dev servers** —
+    `COWSHED_PORT_BASE=<portBlock.base>` and `COWSHED_PORT_BLOCK_SIZE=<portBlock.size>` — and the supervisor injects the
+    same two into every job, so devenv/dev servers bind inside the workspace's own block (04_sandbox.md,
+    cooperative-sandboxing caveat). Linux exports neither: services use private loopback and package/proxy wiring uses
+    the fixed `http://127.0.0.1:7644`. No workspace-identity variable is exported; anything that needs identity derives
+    it from cwd via `.cowshed/workspace.json` or asks the CLI.
   - `SCCACHE_SERVER_UDS=/private/cowshed/store/sccache.sock` (expanded) is the third: the host sccache daemon's socket
-    (below). It is host-level rather than per-workspace — supervisor-spawned processes get it injected,
-    `cowshed ensure --envrc` exports it for IDE terminals, and the cargo `[env]` guidance above mirrors it for processes
+    (below). It is host-level rather than per-workspace — supervisor-spawned processes get it injected, and the cargo
+    `[env]` guidance above mirrors it for cargo builds cowshed never spawned; nothing exports it to any other process
     cowshed never spawned.
 
 ### The sccache daemon

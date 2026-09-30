@@ -215,13 +215,13 @@ Notes:
   cannot reach a sibling's listeners — block or ephemeral — at all (measured: EPERM). Linux workspaces get a private
   loopback via netns (below), so nothing is shared and the block scheme is unnecessary there; ordinary tools reach a
   trusted per-workspace connector on private `127.0.0.1:7644`, which alone reaches the mounted Unix gateway socket.
-- **macOS cooperative sandboxing caveat.** The block only helps tools that take port configuration. On macOS,
-  `cowshed ensure --envrc` exports `COWSHED_PORT_BASE=<base>`, `COWSHED_PORT_BLOCK_SIZE=<size>` and `PORT=<base+1>` as
-  the conventions dev servers should honor; a tool that hardcodes a fixed default port must be pointed at a block port
-  (devenv port offsets derive from `COWSHED_PORT_BASE`). A tool that spreads listeners across the block reads its size
-  from `COWSHED_PORT_BLOCK_SIZE` and never assumes one: blocks of different sizes are live at once. Tools that ignore
-  the convention bind outside their block and are denied. Linux exports neither value: its services use private loopback
-  directly and its package/proxy endpoint is fixed at `127.0.0.1:7644`.
+- **macOS cooperative sandboxing caveat.** The block only helps tools that take port configuration. On macOS, the
+  in-image `.cowshed/env` and the supervisor's job environment both carry `COWSHED_PORT_BASE=<base>` and
+  `COWSHED_PORT_BLOCK_SIZE=<size>` as the conventions dev servers should honor; a tool that hardcodes a fixed default
+  port must be pointed at a block port (devenv port offsets derive from `COWSHED_PORT_BASE`). A tool that spreads
+  listeners across the block reads its size from `COWSHED_PORT_BLOCK_SIZE` and never assumes one: blocks of different
+  sizes are live at once. Tools that ignore the convention bind outside their block and are denied. Linux exports
+  neither value: its services use private loopback directly and its package/proxy endpoint is fixed at `127.0.0.1:7644`.
 - `RunSandboxMode::ReadOnly` drops the workspace mount from the write set — for inspector-style commands that must
   observe without mutating.
 - **Read grants have one narrow meaning.** Built-in system/toolchain roots remain readable so processes can start. A
@@ -451,7 +451,7 @@ These anchors are trust configuration, not secrets, so they are exported/written
 
 `cowshed exec <ws> [--ro] -- cmd…` / `WorkspaceHandle::exec(ExecRequest)` (07_api.md):
 
-1. Resolve workspace (marker), verify mounted (heal via ensure logic if not).
+1. Resolve workspace (marker), verify mounted (attach if not).
 2. Snapshot grants; validate cwd against policy; refuse commands whose cwd escapes the mount in rw mode. If the active
    supervisor's launch revision differs after an effective filesystem mutation, drain it as specified above and relaunch
    from this snapshot before admitting the exec; reject a targeted named session that belongs to the stale revision.

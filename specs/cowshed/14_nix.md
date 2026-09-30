@@ -39,7 +39,7 @@ drain, and remove each ephemeral connector instance. This is not a system-wide l
 
 ## Ownership detection: validate, never mutate
 
-When home-manager owns the host setup, `adopt` and `ensure` **validate and refuse to mutate**. Detection is structural,
+When home-manager owns the host setup, `adopt` and `setup` **validate and refuse to mutate**. Detection is structural,
 not configured: HM-created symlinks resolve into `/nix/store` (verification item: confirm across HM's symlink strategies
 — `home.file` vs `mkOutOfStoreSymlink`). Per artifact:
 
@@ -60,7 +60,7 @@ one. Multiple bindings may exist with exactly one primary, while a local-only re
 Trusted policy lives at `/private/cowshed/store/<owner>/<repo>/policy.json`, with `owner` and `repo` encoded as
 separate, path-safe components. It holds the project's checkpoint quotas and standing grants (04_sandbox.md).
 Home-manager, the trusted host bootstrap, and the operator's controller verbs (`cowshed grant --project-wide`,
-checkpoint-quota policy) write it; `adopt`, `ensure`, workspaces, agents, and repository content may validate it but
+checkpoint-quota policy) write it; `adopt`, `setup`, workspaces, agents, and repository content may validate it but
 never create or rewrite it. Missing policy is the empty policy; an inconsistent binding is a bootstrap error with a
 declarative remediation hint, never an imperative fallback derived from a checkout path.
 

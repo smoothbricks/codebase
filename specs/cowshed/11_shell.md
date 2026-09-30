@@ -483,12 +483,12 @@ the whole descendant tree regardless of what those processes are. Order:
 The supervisor tracks its descendants (process group) precisely so this is deterministic — another reason the shell
 layer is not optional glue but core to correct lifecycle.
 
-## ensure / doctor awareness
+## doctor awareness
 
-- `cowshed ensure` (workspace attached) checks supervisor liveness and restarts it if the socket is dead; it never
-  starts one proactively on the ≤25 ms fast path unless a stale socket is found.
-- `cowshed doctor` reports orphaned sockets (no live supervisor), stuck jobs (running past hard timeout with a dead
-  supervisor), and job directories exceeding budget, each with a `fix:` hint.
+`cowshed doctor` reports a detached workspace that still has a supervisor (`mount-supervisor`), with the detach and
+attach that clear it. It has no finding for a supervisor socket or a job: a socket nothing answers is what a dead
+supervisor leaves, and the daemon's manager ends the jobs it left running the next time it starts (Supervisor recovery,
+above).
 
 ## Tradeoffs
 

@@ -45,14 +45,13 @@ No mounts, no root, no network — pure functions with table-driven cases:
   tagged inline JSON, flattened Arrow validity, and deterministic bounded redacted summaries. Protected Arrow may carry
   bounded inline Binary; controller audit Arrow must contain counts/hashes/batch digests but no payload/path fields.
   `job_id` joins standard trace identity and never substitutes for `span_id`.
-- **API capability goldens**: `Project` exposes discovery only; `WorkspaceRef` exposes inspection plus safe
-  `ensure`/`attach`; `WorkspaceHandle` exposes exactly one workspace's exec/shell/jobs/quota-bound checkpoint/push/grant
-  reads; only `Coordinator` exposes grant/revoke/restore/destroy/rebase/land/gc/repo-mirror and quota policy.
-  Compile-fail fixtures prove forbidden methods and cross-workspace construction are unavailable.
+- **API capability goldens**: `Project` exposes discovery only; `WorkspaceRef` exposes inspection plus safe `attach`;
+  `WorkspaceHandle` exposes exactly one workspace's exec/shell/jobs/quota-bound checkpoint/push/grant reads; only
+  `Coordinator` exposes grant/revoke/restore/destroy/rebase/land/gc/repo-mirror and quota policy. Compile-fail fixtures
+  prove forbidden methods and cross-workspace construction are unavailable.
 - **Authoritative cwd resolution and env wiring**: fake-host/router tables cover deeply nested cwd success, detached and
-  cross-project refusal, malicious marker-only refusal, overlapping active-mount ambiguity, and exact `EnsureReport`
-  paths plus macOS/Linux `PortBlock` presence. Capability-wire tests freeze `project.workspaceAt` and reject local CLI
-  inference.
+  cross-project refusal, malicious marker-only refusal, and overlapping active-mount ambiguity, plus macOS/Linux
+  `PortBlock` presence. Capability-wire tests freeze `project.workspaceAt` and reject local CLI inference.
 - **Per-workspace aggregate checkpoint quota**: substrate stats fixtures freeze active allocated bytes, total checkpoint
   bytes/count, and the pinned-byte subset across mixed pinned/automatic images. Runtime state machines prove
   `existing checkpoints + one active-image charge`, exact-boundary admission, one-byte/count overflow refusal with zero
@@ -217,7 +216,7 @@ Covered flows:
 - defrag: main fragmented by rewriting pages while a clone shares them refuses the rewrite while a file is open on its
   volume (image untouched), then, idle, comes back in at most a tenth of its extents with its data, marker, and mount
   unchanged (01_storage.md, "Clone cost follows extents, not size");
-- ensure healing matrix: detached image, wrong-flag mount, missing/wrong-flag `cowshed.store` and `cowshed.caches`
+- attach healing matrix: detached image, wrong-flag mount, missing/wrong-flag `cowshed.store` and `cowshed.caches`
   volumes (lazy recreate + canonical-flag remount, 01_storage.md), stub `.envrc`;
 - lazy volume creation at adopt: both dedicated volumes created idempotently before the first image; **Time Machine
   default-inclusion check** (verification item, 01_storage.md): whether TM includes additional internal volumes by
@@ -358,7 +357,6 @@ runner noise, local `cowshed doctor --bench` reports raw numbers.
 | Operation                     | Budget (median, local)  | Basis                                                        |
 | ----------------------------- | ----------------------- | ------------------------------------------------------------ |
 | `cowshed new` cold            | ≤ 1 s                   | clonefile ~2 ms + attach ~235 ms + branch/marker work        |
-| `cowshed ensure` healthy      | ≤ 25 ms                 | one statfs + one marker read, compiled binary                |
 | `cowshed rm` (perceived)      | ≤ 100 ms to return      | rename + grant-file unlink; detach is background             |
 | `cowshed fork` / `checkpoint` | ≤ 1 s                   | same physics as new                                          |
 | `cowshed path` / `ls`         | ≤ 50 ms                 | readdir + getmntinfo only — proves the no-state-store design |
@@ -394,7 +392,6 @@ established before the Linux leg gates.
 | Operation                | Budget (median, local)  | Basis                                                                |
 | ------------------------ | ----------------------- | -------------------------------------------------------------------- |
 | `cowshed new` cold       | ≤ 250 ms (to establish) | `zfs snapshot` + `zfs clone` + mount, tens of ms; no attach, no fsck |
-| `cowshed ensure` healthy | ≤ 25 ms                 | same pure fast path as macOS                                         |
 | `cowshed rm` (perceived) | ≤ 100 ms to return      | logical retire; `zfs destroy` clone+origin is background             |
 | `cowshed path` / `ls`    | ≤ 50 ms                 | `zfs list` + mount table                                             |
 | exec sandbox overhead    | ≤ 50 ms over bare spawn | Landlock ruleset apply + netns join                                  |

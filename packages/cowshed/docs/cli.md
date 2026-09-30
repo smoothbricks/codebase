@@ -547,16 +547,16 @@ not a general TCP/Unix-socket forwarder; the socket inode, namespace, and opaque
 Detach or restore drains and kills it. Tools must use cowshed's platform-specific configuration rather than assuming
 host-wide loopback.
 
-On macOS, `.cowshed/env` exports `PORT` (base+1), `COWSHED_PORT_BASE` and `COWSHED_PORT_BLOCK_SIZE` for tools that need
-several ports: the block is `base … base+size-1`, and its size is the one the workspace was allocated with (64 for new
-workspaces), so read it rather than assume it. devenv offsets can derive from the block. Linux configuration contains no
-block or sentinel values.
+On macOS, `.cowshed/env` and every job's environment carry `COWSHED_PORT_BASE` and `COWSHED_PORT_BLOCK_SIZE`: the block
+is `base … base+size-1`, and its size is the one the workspace was allocated with (64 for new workspaces), so read it
+rather than assume it. devenv offsets can derive from the block. Linux configuration contains no block or sentinel
+values.
 
 ```
-$ cowshed shell raven
-raven$ echo $PORT
+$ cowshed exec raven -- sh -c 'echo $((COWSHED_PORT_BASE + 1))'
 40961
-raven$ bun run dev          # vite reads $PORT; open http://localhost:40961 in your browser
+$ cowshed exec raven -- sh -c 'exec bun run dev --port $((COWSHED_PORT_BASE + 1))'
+                            # open http://localhost:40961 in your browser
 ```
 
 ### Background work

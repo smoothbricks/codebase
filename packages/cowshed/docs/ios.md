@@ -29,7 +29,7 @@ The flow:
 
 ```sh
 # dev side (remote editor terminal connected to the dedicated development account)
-$ cowshed exec raven -- npx expo start --port $PORT      # Metro binds inside the workspace's port block
+$ cowshed exec raven -- sh -c 'exec npx expo start --port $((COWSHED_PORT_BASE + 1))'   # inside the port block
 
 # your side, once per dev-client build — explicitly approve and install the staged artifact:
 $ xcrun simctl install booted <drop-dir>/<owner>/<repo>/MyApp.app

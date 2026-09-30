@@ -218,14 +218,12 @@ const workspaces = await project.listWorkspaces();
 const main = await project.main();
 
 const current = await main.info();
-const ensured = await main.ensure();
 await main.attach({ browse: false });
 const grants = await main.grants();
 ```
 
 Both runtimes receive the same typed `CowshedError` with stable kebab-case `code`, exact `message`, and actionable
-`hint`. Workspace, ensure, and grant DTOs are serialized directly from cowshed-core and Typia-validated by the
-TypeScript facade.
+`hint`. Workspace and grant DTOs are serialized directly from cowshed-core and Typia-validated by the TypeScript facade.
 
 Coordinator mutation, one-use worker descriptors, jobs, raw-byte streams with backpressure, and `AbortSignal`
 cancellation remain the next binding slice. They must preserve the existing core authority boundaries; the addon does

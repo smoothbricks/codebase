@@ -12,7 +12,7 @@ workspace.** Authority is attached to explicit capabilities, never inferred from
 - **`Project`** — discovery only. Resolves trusted repository identity and enumerates names into read-only
   `WorkspaceRef` values. It has no attach, exec, lifecycle, maintenance, repository-mirror, or policy mutation methods.
 - **`WorkspaceRef`** — inspection plus safe attachment for one workspace. It exposes identity, mount path, state,
-  grants, `ensure`, and `attach`; it cannot detach, exec, open a shell, mutate lifecycle, or mint a worker capability.
+  grants, and `attach`; it cannot detach, exec, open a shell, mutate lifecycle, or mint a worker capability.
 - **`WorkspaceHandle`** — a worker's non-escalating capability over exactly one workspace: exec, shell, job control,
   checkpoint subject to controller-configured checkpoint quotas, push, and read-only grant inspection. It has no
   grant/revoke, restore/destroy/rebase/land/gc, repo-mirror, or cross-workspace access.
@@ -45,7 +45,7 @@ incarnation and the controller rejects it as stale before effects.
 Design rules: async (tokio), no global state, no interior config lookup — everything reachable from an explicit handle;
 all filesystem/mount state derived per call (01_storage.md).
 
-````rust
+```rust
 /// Explicit client for one authenticated, single-owner controller actor.
 pub struct Cowshed { /* sealed actor sender */ }
 impl Cowshed {
@@ -68,39 +68,30 @@ impl Project {
     /// Resolve only through authoritative metadata plus an exact active-mount containment match.
     pub async fn workspace_at(&self, path: impl AsRef<Path>) -> Result<WorkspaceRef, CowshedError>;
 }
+```
 
 `Project::workspace_at` is a coordinator-channel RPC and a host seam, not local marker discovery. Each call re-reads
 storage, exact detached metadata, and kernel mount facts, canonicalizes the input, and succeeds only when exactly one
-active mount owned by this project contains it. Nested cwd paths resolve; unmounted, detached, ambiguous,
-cross-project, inaccessible, and marker-only paths return a typed error without granting a workspace capability.
+active mount owned by this project contains it. Nested cwd paths resolve; unmounted, detached, ambiguous, cross-project,
+inaccessible, and marker-only paths return a typed error without granting a workspace capability.
 
 ```rust
-pub struct EnsureReport {
-    pub workspace: WorkspaceName,
-    pub mount: PathBuf,
-    pub action: EnsureAction,
-    pub go_env: PathBuf,                 // mounted .cowshed/cache/go/env
-    pub workspace_token: PathBuf,        // mounted controller-minted token; caller reads its value
-    pub port_block: Option<PortBlock>,   // Some only when authoritative platform metadata is macOS
+/// Read-only view of one workspace: an immutable information/grant snapshot plus safe attach.
+/// Carries no execution, detach, lifecycle, maintenance, repository-mirror, or grant mutation authority.
+pub struct WorkspaceRef { /* detached WorkspaceInfo + GrantSet snapshot and sealed actor sender */ }
+impl WorkspaceRef {
+    pub fn name(&self) -> &WorkspaceName;
+    pub fn mount_path(&self) -> &Path;                // canonical, whether or not attached
+    pub fn info(&self) -> &WorkspaceInfo;             // captured snapshot; no RPC or copy
+    pub fn grants(&self) -> &GrantSet;                // captured snapshot; no RPC or copy
+    pub fn snapshot(&self) -> (&WorkspaceInfo, &GrantSet);
+    pub fn into_info(self) -> WorkspaceInfo;          // consuming, copy-free list projection
+    pub fn into_snapshot(self) -> (WorkspaceInfo, GrantSet);
+    pub async fn refresh_info(&self) -> Result<WorkspaceInfo, CowshedError>;
+    pub async fn refresh_grants(&self) -> Result<GrantSet, CowshedError>;
+    pub async fn attach(&self, opts: AttachOptions) -> Result<(), CowshedError>;
 }
-````
-
-The report carries typed source facts rather than shell text. `--envrc` emits exactly `GOENV`,
-`COWSHED_WORKSPACE_TOKEN`, and macOS-only `COWSHED_PORT_BASE` and `COWSHED_PORT_BLOCK_SIZE`; it does not infer any value
-from CLI path parsing.
-
-/// Read-only view of one workspace: an immutable information/grant snapshot plus safe ensure/attach. /// Carries no
-execution, detach, lifecycle, maintenance, repository-mirror, or grant mutation authority. pub struct WorkspaceRef { /*
-detached WorkspaceInfo + GrantSet snapshot and sealed actor sender */ } impl WorkspaceRef { pub fn name(&self) ->
-&WorkspaceName; pub fn mount_path(&self) -> &Path; // canonical, whether or not attached pub fn info(&self) ->
-&WorkspaceInfo; // captured snapshot; no RPC or copy pub fn grants(&self) -> &GrantSet; // captured snapshot; no RPC or
-copy pub fn snapshot(&self) -> (&WorkspaceInfo, &GrantSet); pub fn into_info(self) -> WorkspaceInfo; // consuming,
-copy-free list projection pub fn into_snapshot(self) -> (WorkspaceInfo, GrantSet); pub async fn refresh_info(&self) ->
-Result<WorkspaceInfo, CowshedError>; pub async fn refresh_grants(&self) -> Result<GrantSet, CowshedError>; pub async fn
-ensure(&self) -> Result<EnsureReport, CowshedError>; pub async fn attach(&self, opts: AttachOptions) -> Result<(),
-CowshedError>; }
-
-````
+```
 
 ### Exec and grants
 
@@ -386,7 +377,7 @@ pub struct SandboxSpec {
     pub fn seatbelt_profile(&self) -> &str;
     pub fn wrap(&self, argv: &[String]) -> Vec<String>;  // sandbox-exec -f … /usr/bin/env …
 }
-````
+```
 
 `GrantDelta::expected_revision` is the compare-and-swap hook: when set, `grant`/`revoke` refuse
 (`CowshedError::Conflict`) if the grant file has moved on since the caller last read it, so two coordinators cannot
@@ -582,7 +573,7 @@ subagent holding one cannot grant itself anything.
 
 Externally projected types are defined **once** in `cowshed-core` and reused verbatim by the CLI (`--json` bodies),
 NAPI, and MCP — no adapter redefines a field, and contract goldens (08_testing.md) pin their shapes: `WorkspaceInfo`,
-`CheckpointInfo`, `EnsureReport`, `GcReport`, `Finding`, `JobId`, `JobState`, `JobInfo`, `StreamInfo`, `OutputStorage`,
+`CheckpointInfo`, `GcReport`, `Finding`, `JobId`, `JobState`, `JobInfo`, `StreamInfo`, `OutputStorage`,
 `ProtectedOutput`, `BinaryData`, `OutputSummary`, `OutputPublication`, `PublicationPolicy`, `ControllerCommitment` and
 its five event structs, `PushReport`, `LandReport`, `RevisionTarget`, `GrantSet`/`GrantDelta`/`PortBlock`/`EgressRule`/
 `RepoRule`/`SimVerb`, `GatewayStatus`, `AuditEvent`, and every `*Options` type (`AdoptOptions`, `CreateOptions`,
@@ -616,7 +607,6 @@ reuse those DTOs. Serde uses `camelCase`, documented enum strings, and omission 
   `state` is `"attached" | "detached"`. `checkpoints` is always an array of
   `CheckpointInfo = { label, revision, pinned }` facts derived from canonical storage. Detached rows without a cached
   marker snapshot omit all three marker-derived optionals but still report checkpoint facts.
-- `EnsureReport = { workspace, mount, action }`, where action is `"alreadyMounted" | "attached" | "healed"`.
   `MountResult = { workspace, mount, baseCommit? }`; lifecycle creation/restoration fills `baseCommit`, while
   attachment/query results may omit it. `EmptyResult` serializes as exactly `{}`.
 - `AdoptOptions.repoId` is optional only because a trusted remote binding can supply it; local-only adoption requires
@@ -793,7 +783,6 @@ export interface WorkspaceRef {
   readonly name: string;
   readonly mountPath: string;
   info(): Promise<WorkspaceInfo>;
-  ensure(): Promise<EnsureReport>;
   attach(opts?: AttachOptions): Promise<void>;
   grants(): Promise<GrantSet>; // read-only
 }

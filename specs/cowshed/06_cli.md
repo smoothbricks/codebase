@@ -84,9 +84,9 @@ Every command uses a named `cowshed-core` DTO as its `result`; adapters never as
 detach/kill, and successful policy mutations with no additional observation return the literal empty object `{}` through
 `EmptyResult` (never `null`, `true`, or a message string). `doctor` returns `DoctorReport { healthy, findings }`; each
 `Finding` has `code`, `severity`, `message`, `hint`, and optional `path`. `ls` returns `WorkspaceInfo[]`; `attach`
-returns `EnsureReport`; `gc` returns `GcReport`; `identity add` returns
-`IdentityReport { repoId, added, identity, identities }`. Exec and job commands return the frozen job DTOs in 07_api.md.
-Commands whose normal stdout is a scalar use a named one-field body (`CheckpointResult { label }`,
+returns `MountResult` for one workspace and `WorkspaceInfo[]` for several; `gc` returns `GcReport`; `identity add`
+returns `IdentityReport { repoId, added, identity, identities }`. Exec and job commands return the frozen job DTOs in
+07_api.md. Commands whose normal stdout is a scalar use a named one-field body (`CheckpointResult { label }`,
 `RevisionResult { oid }`, `SlotResult { slot }`) so JSON never changes shape when another field is added.
 
 The controller commitment transport never carries output payload or artifact paths. Ordinary `JobInfo` JSON describes

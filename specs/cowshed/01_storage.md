@@ -536,7 +536,7 @@ plists that must live there.
 `/private/cowshed/store` as a real Data-volume directory holding one wrapper level that meant nothing to users ("store
 with nested telemetry"). Mounting the volume at `/private/cowshed/store` itself makes the dotdir a door, not a room: one
 empty mountpoint inode on Data, every other path one level shorter, and "cowshed stuff lives in the cowshed" is
-literally true. The costs — mount ordering and the bare-directory guard above — are machinery `ensure` already had for
+literally true. The costs — mount ordering and the bare-directory guard above — are machinery `attach` already had for
 the workspaces.
 
 **Images on the caches volume rejected.** Co-locating images with caches unlocks no additional sharing: container

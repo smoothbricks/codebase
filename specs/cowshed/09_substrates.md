@@ -214,7 +214,7 @@ first write slow until `cowshed defrag main` (01_storage.md, "Clone cost follows
 Adopt on ZFS: create `…/projects/<owner>/<repo>/main`, copy the tree once (rsync-fidelity, preserving metadata), set
 `mountpoint=` the original path. The original tree moves aside as `<root>.pre-cowshed` exactly as on macOS. The
 self-healing stub `.envrc` is still written beneath the mountpoint — ZFS mounts also disappear when a pool isn't
-imported, and healing parity keeps `cowshed ensure` identical across substrates.
+imported, and healing parity keeps its `cowshed attach` identical across substrates.
 
 Markers, tokens, grant semantics, secrets gates, and the cache taxonomy are unchanged. Detached metadata uses the same
 schema but `portBlock` is optional and omitted for ZFS/Linux. When a dataset is attached, the controller creates its
