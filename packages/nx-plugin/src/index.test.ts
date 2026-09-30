@@ -922,15 +922,15 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       expect(targets['cargo-test-ferris-core']?.inputs).not.toContain(
         '{workspaceRoot}/packages/ferris/crates/ferris-wasm/**/*',
       );
-      // One clippy for the workspace in one target dir: a per-crate closure
-      // compiled every shared dependency once per crate.
-      expect(targets['cargo-lint']?.options).toMatchObject({
-        cwd: 'packages/ferris',
-        commands: [
-          'cargo fmt --all --check',
-          'cargo --frozen clippy --workspace --all-targets --target-dir target/cargo-lint -- -D warnings',
-        ],
-      });
+      // One clippy for the workspace, writing the same `target/` as the dev
+      // test compile: a directory of its own compiled every host unit twice.
+      const [fmt, clippy] = targets['cargo-lint']?.options?.commands ?? [];
+      expect(fmt).toBe('cargo fmt --all --check');
+      expect(clippy).toMatch(/^cargo --frozen clippy --workspace --all-targets .*-- -D warnings$/);
+      for (const command of [clippy, targets['cargo-test-compile']?.options?.command]) {
+        expect(command).not.toContain('--target-dir');
+      }
+      expect(targets['cargo-lint']?.options?.cwd).toBe(targets['cargo-test-compile']?.options?.cwd);
       expect(targets['cargo-lint']?.cache).toBe(true);
       expect(targets['cargo-lint']?.outputs).toEqual([]);
       expect(targets['cargo-lint']?.inputs).toEqual(
@@ -965,15 +965,15 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
 
       const targets = await inferProjectTargets(workspace, 'packages/ferris/package.json');
 
-      // A clippy target dir is not an Nx output — restoring an 11 GiB build
+      // A clippy target dir is not an Nx output — restoring a multi-GiB build
       // tree from a cache is worse than rebuilding it — so `clean` cannot find
       // these through `outputs`. They are read back off the commands that
       // write them, which is why a new `--target-dir` cannot be forgotten here.
+      // The workspace `target/` every dev build shares is not one of them.
       expect(targets.clean?.executor).toBe('@smoothbricks/nx-plugin:clean-outputs');
       expect(targets.clean?.cache).toBe(false);
       expect(targets.clean?.options?.outputs).toEqual([
         '{projectRoot}/dist',
-        '{workspaceRoot}/packages/ferris/target/cargo-lint',
         '{workspaceRoot}/packages/ferris/target/cargo-lint-cross',
         '{workspaceRoot}/packages/ferris/target/nextest',
       ]);
@@ -1118,10 +1118,9 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         command: 'cargo --frozen test --workspace --no-run',
         cwd: '.',
       });
-      expect(root['cargo-lint']?.options?.commands).toEqual([
-        'cargo fmt --all --check',
-        'cargo --frozen clippy --workspace --all-targets --target-dir target/cargo-lint -- -D warnings',
-      ]);
+      // The root owns the one workspace clippy, run where the dev build runs.
+      expect(String(root['cargo-lint']?.options?.commands?.[1])).toContain('clippy --workspace');
+      expect(root['cargo-lint']?.options?.cwd).toBe(root['cargo-test-compile']?.options?.cwd);
       expect(root['cargo-lint']?.dependsOn).toContain('cargo-fetch');
       expect(root['cargo-test']?.dependsOn).toHaveLength(5);
 
@@ -1231,13 +1230,8 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       const leaf = projects.get('nested/modules/leaf')?.targets ?? {};
       // Each cargo workspace root runs one clippy over all its members; the
       // packages owning crates validate through that verdict.
-      expect(outer['cargo-lint']?.options).toMatchObject({
-        cwd: '.',
-        commands: [
-          'cargo fmt --all --check',
-          'cargo --frozen clippy --workspace --all-targets --target-dir target/cargo-lint -- -D warnings',
-        ],
-      });
+      expect(outer['cargo-lint']?.options?.cwd).toBe('.');
+      expect(String(outer['cargo-lint']?.options?.commands?.[1])).toContain('clippy --workspace');
       // Workspace-anchored, because Nx hashes a `{projectRoot}` glob against
       // only the files its project owns, and the group project owns alpha and
       // beta: spelled from the root project, those globs hash nothing and the

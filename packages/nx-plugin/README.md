@@ -50,10 +50,14 @@ The plugin discovers Cargo workspaces beside Nx project manifests at any depth:
   Projects can own multiple crates. A nested independent workspace has its own prerequisites and does not inherit those
   of an outer workspace.
 - **Commands:** validation runs from the governing Cargo workspace directory. One `cargo fmt --all --check` and one
-  `cargo --frozen clippy --workspace --all-targets --target-dir target/cargo-lint -- -D warnings` cover every member.
-  Clippy of a crate is a check build of its whole closure, so a target directory per crate rebuilt every shared
-  dependency once per crate — 49 closures and 11 GiB on one repository — and no per-crate cache hit repaid it. Cargo's
-  own lock serializes the invocations that share the directory.
+  `cargo --frozen clippy --workspace --all-targets -- -D warnings` cover every member. Clippy of a crate is a check
+  build of its whole closure, so a target directory per crate rebuilt every shared dependency once per crate — 49
+  closures and 11 GiB on one repository — and no per-crate cache hit repaid it. Clippy writes the workspace's own
+  `target/`, like every dev build: its check units carry their mode in the unit hash and never collide with build units,
+  and the host units a dev build compiled (build scripts and their host-only dependencies) are reused instead of
+  compiled a second time. Cargo's own lock serializes the invocations that share the directory. `cargo-lint-cross` keeps
+  `target/cargo-lint-cross`: a foreign triple's units are distinct anyway, and its own lock keeps the cross check from
+  queueing behind host builds.
 - **Overrides:** normal Nx merging applies. Explicit `nx.targets` fields replace inferred fields, while omitted fields
   retain their inferred base. Use `"dependsOn": ["...", "extra"]` to preserve inferred prerequisites when adding an
   edge; replacing the array makes its author responsible for fetching before frozen Cargo commands.

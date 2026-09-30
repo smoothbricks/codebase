@@ -116,14 +116,26 @@ export const CARGO_FETCH_COMMAND = 'cargo fetch --locked';
  * or replaying it through --config changes path resolution or precedence.
  * Cargo may serialize registry access on its package-cache lock; these checks
  * are unbounded, and correctness takes priority over overlapping that access.
+ *
+ * `target/cargo-lint-cross` stays its own directory: a foreign triple's units
+ * are distinct anyway, and its own lock keeps the cross check from queueing
+ * behind host builds.
  */
 export const CARGO_CROSS_LINT_COMMAND = `${CARGO_CROSS_LINT_GUARD}; ${cargoFrozen(
   `clippy --workspace --all-targets --target ${CARGO_LINUX_TRIPLE} --target-dir target/cargo-lint-cross -- -D warnings`,
 )}`;
 
-export const CARGO_LINT_CLIPPY_COMMAND = cargoFrozen(
-  'clippy --workspace --all-targets --target-dir target/cargo-lint -- -D warnings',
-);
+/**
+ * No `--target-dir`: clippy writes the workspace's own `target/`, beside every
+ * dev build. Check units carry their mode in the unit hash, so they never
+ * collide with build units, and the host units a dev build already compiled —
+ * build scripts and their host-only dependencies — are reused rather than
+ * compiled a second time in a directory of their own. A dependency that both
+ * a proc-macro and ordinary code use stays a distinct unit: a dev build
+ * compiles it once at the target profile, while a check build needs a separate
+ * host copy. Distinct hashes coexist, so neither command dirties the other.
+ */
+export const CARGO_LINT_CLIPPY_COMMAND = cargoFrozen('clippy --workspace --all-targets -- -D warnings');
 
 /** Root `package.json` script name, in the repo's `verb:qualifier` style. */
 export const CROSS_CHECK_SCRIPT_NAME = 'check:linux';

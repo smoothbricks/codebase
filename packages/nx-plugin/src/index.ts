@@ -553,13 +553,13 @@ function createCargoWasmTarget(
  * timeout. Inference serializes writers that share the default target dir
  * (`napi-debug` after compile).
  *
- * Clippy writes ONE shared `--target-dir target/cargo-lint` rather than a
- * directory per crate. Per-crate dirs were never about overlap: clippy of a
- * crate is a check build of its whole closure, so 49 crates meant 49 closure
- * rebuilds and 11 GiB of target directories on one repository, and no
- * per-crate cache hit ever repaid that. Sharing the directory costs nothing:
- * cargo's own lock serializes the invocations that use it and each dependency
- * artifact is then compiled once for all of them.
+ * Clippy runs ONCE over the whole workspace, in that same `target/`, rather
+ * than once per crate. Clippy of a crate is a check build of its whole
+ * closure, so 49 crates meant 49 closure rebuilds and 11 GiB of target
+ * directories on one repository, and no per-crate cache hit ever repaid that.
+ * Sharing the build's directory costs nothing: cargo's own lock serializes
+ * the invocations that use it, and the host units a dev build compiled are
+ * reused instead of compiled again.
  */
 function createCargoTestCompileTarget(projectRoot: string): TargetConfiguration {
   return {
@@ -1245,12 +1245,13 @@ async function createProjectTargets(
       aggregateDependencies.length > 0
         ? { executor: 'nx:noop', cache: true, outputs: [], dependsOn: aggregateDependencies }
         : createCargoTestTarget(cargoWorkspaceRoot);
-    // One clippy over the whole workspace, in one target dir. Clippy of a crate
-    // is a check build of its closure; a target dir per crate compiled every
-    // shared dependency once per crate (49 closures, 11 GiB on one repository)
-    // and no per-crate cache hit ever repaid that. The workspace inputs are
-    // exactly the union of every crate's, so the verdict caches on the same
-    // key set the compile does. Non-root packages depend on this target.
+    // One clippy over the whole workspace, in the build's target dir. Clippy
+    // of a crate is a check build of its closure; a target dir per crate
+    // compiled every shared dependency once per crate (49 closures, 11 GiB on
+    // one repository) and no per-crate cache hit ever repaid that. The
+    // workspace inputs are exactly the union of every crate's, so the verdict
+    // caches on the same key set the compile does. Non-root packages depend on
+    // this target.
     targets['cargo-lint'] = {
       executor: 'nx:run-commands',
       cache: true,
@@ -1664,11 +1665,11 @@ async function createProjectTargets(
   }
   // Every cargo build directory this project's own commands write. `clean`
   // cannot learn them from `outputs`: a clippy or nextest target dir is a
-  // multi-GB build tree that must never enter the Nx cache (`target/cargo-lint`
-  // alone was 11 GiB when each of 49 crates had its own), so the targets
+  // multi-GB build tree that must never enter the Nx cache, so the targets
   // deliberately declare `outputs: []`. Reading `--target-dir` back off the
   // commands means the list cannot drift from what actually gets written, and a
   // directory is named relative to the command's own cwd, not the project root.
+  // The workspace's default `target/` is not listed: every dev build shares it.
   const cargoBuildDirs = [
     ...new Set(
       Object.entries(targets).flatMap(([name, target]) => {
