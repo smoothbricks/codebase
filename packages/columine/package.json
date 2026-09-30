@@ -66,6 +66,7 @@
         ]
       },
       "cargo-wasm": {
+        "//": "Every workspace member's Cargo.toml is an input, not only columine's and bitmosaic's: .cargo/config.toml resolves features workspace-wide, so a host-only crate's manifest decides which features the wasm32 build compiles. Moving cowshed-shell's brush edge out of wasm32 changed event_processor.wasm's imports without touching any path this target used to hash.",
         "executor": "nx:run-commands",
         "cache": true,
         "dependsOn": [
@@ -73,9 +74,8 @@
         ],
         "inputs": [
           "{projectRoot}/crates/**/*.rs",
-          "{projectRoot}/crates/**/Cargo.toml",
           "{workspaceRoot}/packages/bitmosaic/crates/**/*.rs",
-          "{workspaceRoot}/packages/bitmosaic/crates/**/Cargo.toml",
+          "{workspaceRoot}/packages/*/crates/**/Cargo.toml",
           "{workspaceRoot}/Cargo.toml",
           "{workspaceRoot}/Cargo.lock",
           "{workspaceRoot}/.cargo/config.toml",
