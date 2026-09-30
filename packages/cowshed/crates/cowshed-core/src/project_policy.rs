@@ -68,7 +68,7 @@ impl ProjectPolicy {
 ///
 /// Reads are the sorted union. Egress is the workspace's rules plus every project rule for a host
 /// the workspace does not name itself: a workspace rule for the same host is the narrower,
-/// deliberate decision (its ports, mode, impersonation) and is kept as written. The revision is
+/// deliberate decision (its ports and mode) and is kept as written. The revision is
 /// the sum of both revisions — each only ever grows, so the sum grows whenever either does.
 pub fn effective_grants(
     workspace: &GrantSet,
@@ -104,7 +104,6 @@ mod tests {
             host: host.to_owned(),
             ports: ports.to_vec(),
             mode: EgressMode::Intercept,
-            impersonate: None,
         }
     }
 

@@ -1875,7 +1875,6 @@ fn egress_rules(hosts: &[String], mode: EgressMode) -> Vec<EgressRule> {
             host: host.clone(),
             ports: Vec::new(),
             mode,
-            impersonate: None,
         })
         .collect()
 }

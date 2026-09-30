@@ -10457,7 +10457,7 @@ fn update_set<T: PartialEq>(current: &mut Vec<T>, delta: Vec<T>, revoke: bool) {
     }
 }
 
-/// A host holds one egress rule: its mode, ports and impersonation are that rule. Granting a host
+/// A host holds one egress rule: its mode and ports are that rule. Granting a host
 /// restates its rule in place, or appends it for a host not yet granted; revoking a host removes
 /// its rule whatever it holds. Comparing whole rules instead left an intercepted and an opaque rule
 /// side by side for one host, so no grant could ever change a host's mode.
@@ -10564,7 +10564,7 @@ mod grant_unit_tests {
         std::fs::remove_dir_all(&root).unwrap();
     }
 
-    /// A host has one egress rule: its mode, ports and impersonation are that rule. Granting a
+    /// A host has one egress rule: its mode and ports are that rule. Granting a
     /// host again states its rule anew — that is how an operator turns an intercepted host opaque
     /// — and revoking a host removes its rule whatever mode it holds.
     #[test]
@@ -10574,7 +10574,6 @@ mod grant_unit_tests {
             host: host.to_owned(),
             ports: Vec::new(),
             mode,
-            impersonate: None,
         };
         let mut grants = GrantSet {
             egress: vec![

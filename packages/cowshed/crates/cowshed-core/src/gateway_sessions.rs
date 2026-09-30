@@ -189,7 +189,7 @@ pub fn policy_from_grants(grants: &GrantSet) -> Result<WorkspacePolicy> {
     };
     for rule in &grants.egress {
         for &port in rule.effective_ports() {
-            let mut grant = match rule.mode {
+            let grant = match rule.mode {
                 CoreEgressMode::Intercept => EgressGrant::intercept(&rule.host, port),
                 CoreEgressMode::Opaque => EgressGrant::opaque(&rule.host, port),
             }
@@ -199,7 +199,6 @@ pub fn policy_from_grants(grants: &GrantSet) -> Result<WorkspacePolicy> {
                     "cowshed doctor --json",
                 )
             })?;
-            grant.impersonate = rule.impersonate.is_some();
             policy.grants.push(grant);
         }
     }

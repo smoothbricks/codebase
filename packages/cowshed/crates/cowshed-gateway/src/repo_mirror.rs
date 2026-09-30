@@ -1518,7 +1518,6 @@ mod tests {
                 mode: EgressMode::Intercept,
                 methods: BTreeSet::from(["GET".to_owned(), "HEAD".to_owned()]),
                 path_prefixes: vec![prefix.to_owned()],
-                impersonate: false,
             }],
             mirrors: Vec::new(),
         };

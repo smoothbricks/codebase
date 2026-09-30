@@ -363,7 +363,7 @@ pub struct GrantSet {
                                          // never a zero-sized or otherwise sentinel block
     pub read: Vec<PathBuf>,
     pub write: Vec<PathBuf>,
-    pub egress: Vec<EgressRule>,         // { host, ports, mode, impersonate }
+    pub egress: Vec<EgressRule>,         // { host, ports, mode }
     pub repos: Vec<RepoRule>,            // repo-scoped mirror grants (05_gateway.md)
     pub sim: Vec<SimVerb>,               // personal-session simulator broker verbs (04/05/14_nix.md)
 }
@@ -372,7 +372,6 @@ pub struct PortBlock { base: u16, size: u16 } // private; `new` and custom JSON 
 pub struct EgressRule {                 // 04_sandbox.md / 05_gateway.md
     pub host: String, pub ports: Vec<u16>,
     pub mode: EgressMode,                // default Intercept (per-workspace CA); Opaque = pass-through CONNECT
-    pub impersonate: Option<String>,     // outbound TLS fingerprint; suppresses header injection
 }
 pub enum EgressMode { Intercept, Opaque }
 pub struct GrantDelta {

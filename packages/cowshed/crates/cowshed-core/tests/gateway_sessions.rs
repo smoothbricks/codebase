@@ -13,8 +13,8 @@ use cowshed_core::metadata::{EgressMode, EgressRule, GrantSet, WorkspaceIncarnat
 use cowshed_core::repository::RepoId;
 use cowshed_core::{CowshedError, Result};
 use cowshed_gateway_types::{
-    GatewayStatus, SessionStatus, WorkspaceCa, WorkspaceEndpoint, WorkspacePolicy,
-    WorkspaceSession, WorkspaceToken,
+    EgressMode as GatewayEgressMode, GatewayStatus, SessionStatus, WorkspaceCa, WorkspaceEndpoint,
+    WorkspacePolicy, WorkspaceSession, WorkspaceToken,
 };
 use std::collections::BTreeMap;
 use std::net::{Ipv4Addr, SocketAddr};
@@ -639,20 +639,18 @@ async fn daemon_restart_restores_every_project_inventory_session() {
 }
 
 #[test]
-fn grant_policy_maps_default_ports_modes_and_credential_suppression() {
+fn grant_policy_maps_default_ports_and_modes() {
     let grants = GrantSet {
         egress: vec![
             EgressRule {
                 host: "*.example.com".to_owned(),
                 ports: Vec::new(),
                 mode: EgressMode::Intercept,
-                impersonate: Some("chrome".to_owned()),
             },
             EgressRule {
                 host: "pinned.example.com".to_owned(),
                 ports: vec![8443],
                 mode: EgressMode::Opaque,
-                impersonate: None,
             },
         ],
         ..GrantSet::default()
@@ -667,7 +665,17 @@ fn grant_policy_maps_default_ports_modes_and_credential_suppression() {
             .collect::<Vec<_>>(),
         vec![443, 80, 8443]
     );
-    assert!(policy.grants[0].impersonate && policy.grants[1].impersonate);
-    assert!(!policy.grants[2].impersonate);
+    assert_eq!(
+        policy
+            .grants
+            .iter()
+            .map(|grant| grant.mode)
+            .collect::<Vec<_>>(),
+        vec![
+            GatewayEgressMode::Intercept,
+            GatewayEgressMode::Intercept,
+            GatewayEgressMode::Opaque
+        ]
+    );
     assert_eq!(policy.mirrors.len(), 3);
 }

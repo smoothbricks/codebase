@@ -2114,7 +2114,6 @@ mod tests {
                     host: "registry.example.test".to_owned(),
                     ports: Vec::new(),
                     mode: crate::metadata::EgressMode::Intercept,
-                    impersonate: None,
                 }],
             },
             ..crate::project_policy::ProjectPolicy::default()

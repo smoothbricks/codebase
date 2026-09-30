@@ -78,11 +78,9 @@ Three tiers, never mixed:
   on the whole origin plus `POST` to a path ending in `/git-upload-pack` — git's smart-HTTP fetch, a read git can only
   express as a POST (protocol v2 posts even the ref listing); `git-receive-pack` and every other write are refused.
   `cowshed grant <ws> --egress <host> --opaque` grants the hosts of that invocation as a byte tunnel with host-only
-  audit and no injection; a host holds one rule, so granting it again restates its mode. A rule's `impersonate` profile
-  (settable through the coordinator API's `EgressRule`, not a CLI flag) affects the outbound intercepted leg only and
-  suppresses all injected headers. A project's standing egress grants
-  (`cowshed grant --project-wide --egress <host> [--opaque]`, 04_sandbox.md) join every workspace's own. Unmatched
-  destinations are denied.
+  audit and no injection; a host holds one rule, so granting it again restates its mode. A project's standing egress
+  grants (`cowshed grant --project-wide --egress <host> [--opaque]`, 04_sandbox.md) join every workspace's own.
+  Unmatched destinations are denied.
 
 ## Endpoints (data plane, per-workspace endpoint)
 

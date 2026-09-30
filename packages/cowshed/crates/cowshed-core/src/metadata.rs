@@ -983,8 +983,6 @@ pub struct EgressRule {
     pub ports: Vec<u16>,
     #[serde(default, skip_serializing_if = "is_intercept")]
     pub mode: EgressMode,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub impersonate: Option<String>,
 }
 
 impl EgressRule {
@@ -1761,6 +1759,20 @@ mod tests {
             marker.validate(),
             Err(MetadataError::WorkspaceRoleMismatch { .. })
         ));
+    }
+
+    /// An egress rule is a host, its ports and its mode: what the gateway enforces. A grant naming
+    /// a TLS-fingerprint profile asks for something no gateway does, so it is refused rather than
+    /// read as some other posture.
+    #[test]
+    fn an_egress_rule_naming_a_fingerprint_profile_is_refused() {
+        let decoded = serde_json::from_str::<EgressRule>(
+            r#"{"host":"scrape.example.com","mode":"intercept","impersonate":"chrome"}"#,
+        );
+        assert!(
+            decoded.is_err(),
+            "an egress rule naming a fingerprint profile decoded: {decoded:?}"
+        );
     }
 
     #[test]

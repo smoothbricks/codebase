@@ -192,7 +192,6 @@ pub struct EgressGrant {
     pub mode: EgressMode,
     pub methods: BTreeSet<String>,
     pub path_prefixes: Vec<String>,
-    pub impersonate: bool,
 }
 
 impl EgressGrant {
@@ -203,7 +202,6 @@ impl EgressGrant {
             mode: EgressMode::Intercept,
             methods: ["GET", "HEAD"].into_iter().map(String::from).collect(),
             path_prefixes: vec!["/".to_owned()],
-            impersonate: false,
         })
     }
 
@@ -214,7 +212,6 @@ impl EgressGrant {
             mode: EgressMode::Opaque,
             methods: BTreeSet::new(),
             path_prefixes: Vec::new(),
-            impersonate: false,
         })
     }
 
@@ -235,7 +232,7 @@ impl EgressGrant {
             return Err(PolicyError::InvalidPort);
         }
         if self.mode == EgressMode::Opaque {
-            if !self.methods.is_empty() || !self.path_prefixes.is_empty() || self.impersonate {
+            if !self.methods.is_empty() || !self.path_prefixes.is_empty() {
                 return Err(PolicyError::OpaqueCannotInspect);
             }
             return Ok(());
@@ -726,7 +723,7 @@ pub enum PolicyError {
     UnsupportedScheme,
     #[error("port must be non-zero")]
     InvalidPort,
-    #[error("opaque grants cannot contain request policy or impersonation")]
+    #[error("opaque grants cannot contain request policy")]
     OpaqueCannotInspect,
     #[error("intercept grants require methods and path prefixes")]
     EmptyAdmission,

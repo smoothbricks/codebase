@@ -221,9 +221,9 @@ written/referenced bytes).
 the Keychain credential + trace context (05_gateway.md). `--opaque` grants every `--egress` host of the same invocation
 as an opaque CONNECT tunnel instead (pinned clients, Go on macOS; no injection), and is a usage error without one. A
 host holds one rule, so granting a host again restates its mode — `--egress <host>` alone turns an opaque host back to
-intercepted. Per-port narrowing and an `impersonate` profile are further fields of that rule, set through the
-coordinator API's `EgressRule`; the CLI takes no flag for them. A bare `cowshed grant <ws>` (no flags) prints the
-current set with a `mode` column on the egress rows.
+intercepted. Per-port narrowing is a further field of that rule, set through the coordinator API's `EgressRule`; the CLI
+takes no flag for it. A bare `cowshed grant <ws>` (no flags) prints the current set with a `mode` column on the egress
+rows.
 
 `cowshed grant --project-wide` addresses the project's standing grants instead of one workspace's: the read paths and
 egress hosts every workspace of the project runs under in addition to its own, held in the trusted project policy

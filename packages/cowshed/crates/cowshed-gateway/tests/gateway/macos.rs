@@ -1457,59 +1457,6 @@ async fn a_request_outside_the_credential_scope_is_refused_and_carries_no_creden
 }
 
 #[tokio::test]
-async fn impersonation_suppresses_credentials_and_trace_headers() {
-    let (upstream_port, mut captured, _upstream) = http_fixture(1, None).await;
-    let endpoint = free_endpoint();
-    let origin = format!("http://plain.test:{upstream_port}");
-    let gateway = gateway(
-        test_config(),
-        Arc::new(FixedCredential {
-            repo_id: "owner/repo-plain".to_owned(),
-            origin,
-            value: "Bearer must-not-appear".to_owned(),
-        }),
-        Arc::new(LocalConnector {
-            health: UpstreamHealth::Healthy,
-            observed: None,
-        }),
-        Arc::new(DiscardAudit),
-    )
-    .await;
-    let mut impersonated = grant("plain.test", upstream_port);
-    impersonated.impersonate = true;
-    let (session, token, _) = session(
-        "plain",
-        "owner/repo-plain",
-        block_endpoint(endpoint),
-        5,
-        1,
-        WorkspacePolicy {
-            grants: vec![impersonated],
-            mirrors: Vec::new(),
-        },
-    );
-    gateway
-        .handle()
-        .install(session)
-        .await
-        .expect("install session");
-    let response = proxy_request(
-        endpoint,
-        absolute_request("plain.test", upstream_port, &token, "/allowed"),
-    )
-    .await;
-    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
-    let forwarded = captured
-        .recv()
-        .await
-        .expect("captured request")
-        .to_ascii_lowercase();
-    assert!(!forwarded.contains("authorization:"));
-    assert!(!forwarded.contains("traceparent:"));
-    gateway.drain().await.expect("drain gateway");
-}
-
-#[tokio::test]
 async fn dead_upstream_fails_fast_without_connecting() {
     let endpoint = free_endpoint();
     let gateway = gateway(

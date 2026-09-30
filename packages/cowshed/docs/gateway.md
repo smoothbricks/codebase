@@ -192,8 +192,7 @@ Network decisions are checked in order:
 
 1. Anonymous public registry baseline.
 2. Trusted project admission for private/scoped/credentialed registry routes and coordinator-only repo mirrors.
-3. Workspace egress grants for all other destinations; intercepted by default, with explicit opaque or impersonated
-   mode.
+3. Workspace egress grants for all other destinations; intercepted by default, or opaque when granted so.
 
 ## Gateway safety limits
 

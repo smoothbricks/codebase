@@ -170,14 +170,12 @@ directly, Bun/Node applications use `cowshed-napi`, and shell-based agents use t
   default** — per-workspace CA (private key gateway-side next to the grant file, public cert an in-image trust anchor;
   minted at new/fork, preserved on restore, destroyed with the workspace), TLS terminated, Keychain credential +
   traceparent injected, audited per-request; `--opaque` reverts a host to a pass-through CONNECT tunnel (pinned
-  clients), `--impersonate <profile>` gives a browser TLS fingerprint (and suppresses header injection). This
-  **supersedes the old "no TLS MITM" line** and the per-authenticated-service endpoint roadmap (/github, /anthropic): a
-  granted host needs no bespoke endpoint. Engine = `hyper` + `rustls` + `rcgen` + `tokio`, single-listener dynamic SNI
-  (`ResolvesServerCert`), h1+h2 on both legs (SSE/streaming), LRU **leaf** cache, upstream-health gate at the one
-  outbound choke point — the Bun/Hero MITM production lessons ported as **normative tests, not code** (05_gateway.md).
-  Outbound is an `OutboundConnector` trait: default hyper/rustls, optional `impersonate` cargo feature linking
-  libcurl-impersonate (runtime-detected, truly optional; wreq/rquest possible behind the same trait). Per-workspace port
-  block + token → egress/repo policy; 7644 = control plane only.
+  clients). This **supersedes the old "no TLS MITM" line** and the per-authenticated-service endpoint roadmap (/github,
+  /anthropic): a granted host needs no bespoke endpoint. Engine = `hyper` + `rustls` + `rcgen` + `tokio`,
+  single-listener dynamic SNI (`ResolvesServerCert`), h1+h2 on both legs (SSE/streaming), LRU **leaf** cache,
+  upstream-health gate at the one outbound choke point — the Bun/Hero MITM production lessons ported as **normative
+  tests, not code** (05_gateway.md). Outbound is one `UpstreamConnector` over hyper/rustls. Per-workspace port block +
+  token → egress/repo policy; 7644 = control plane only.
 - **Telemetry and tiered authority = lmao Arrow**: protected Arrow is exact
   `ProtectedRecord::{Job(JobArtifactRecord),CheckpointManifest(CheckpointManifestRecord)}`. Complete batches/sealed
   files are content authority within the origin boundary. Controller continuity is exact
@@ -309,11 +307,6 @@ Interception + telemetry verification (05_gateway.md, 13_telemetry.md — fold i
   over an intercepted host? If not, Bun is a documented interception gap (04_sandbox.md trust-anchor table).
 - **macOS-native-TLS tool inventory** — enumerate the Security.framework-backed tools (Swift/Xcode, some system
   utilities) that ignore env anchors and therefore need `--opaque` for an intercepted host (04_sandbox.md gaps).
-- **curl-impersonate linking** — feasibility of the optional `impersonate` cargo feature: runtime detection of
-  `libcurl-impersonate`, build/link on macOS + Linux, profile coverage (05_gateway.md OutboundConnector).
-- **Fingerprint vs traceparent injection** — confirm that injecting a header defeats a JA4-family fingerprint, i.e. the
-  per-connector suppression on `--impersonate` connections is actually necessary (05_gateway.md trace-context
-  carve-out).
 - **`BUN_CONFIG_REGISTRY` per-job trace URL** — env-vs-bunfig precedence, subcommand coverage (bun#617), and the
   npmrc-overrides-bunfig bug (bun#20593): decides whether tier-2 exact `bun install` attribution is reliable
   (13_telemetry.md).

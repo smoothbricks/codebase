@@ -105,10 +105,9 @@ continuity commitments, while captured bytes resolve from protected in-volume ar
 
 `restore` requires a label — there is no "restore the latest" default. Worker `checkpoint` accepts an optional label.
 `grant`/`revoke` carry `expectedRevision` for compare-and-swap (07_api.md/04_sandbox.md) and a `repo[]` selector for
-repo-scoped mirror grants (05_gateway.md). Each `egress[]` entry is
-`{ host, ports?, mode?: "intercept" | "opaque", impersonate?: "<profile>" }`, mirroring the grant-file schema
-(04_sandbox.md): a coordinator sets a host's interception mode and fingerprint at grant time, `mode` defaulting to
-`intercept`. `sim[]` carries personal-session simulator broker verbs (`"openurl"` / `"install"` —
+repo-scoped mirror grants (05_gateway.md). Each `egress[]` entry is `{ host, ports?, mode?: "intercept" | "opaque" }`,
+mirroring the grant-file schema (04_sandbox.md): a coordinator sets a host's interception mode at grant time, `mode`
+defaulting to `intercept`. `sim[]` carries personal-session simulator broker verbs (`"openurl"` / `"install"` —
 04_sandbox.md/05_gateway.md); `install` remains bound to drop-dir artifacts and the human-gating rule regardless of the
 grant (14_nix.md). There are no SSH/Docker grant axes.
 

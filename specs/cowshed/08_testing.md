@@ -237,10 +237,10 @@ Covered flows:
   old connector/socket/token unusable before publishing the new incarnation.
 - gateway interception (05_gateway.md): an intercepted host serves a workspace-CA leaf the in-image anchor trusts,
   injects the Keychain credential, and records a **request-granular** audit line; an `--opaque` host tunnels without
-  injection; an `--impersonate` connection suppresses header injection; the **upstream-health gate** fails a dead
-  upstream fast with a classifiable error (not a per-request timeout) — asserting the gateway-absent / upstream-offline
-  / denied trichotomy; **socket teardown**: no leaked listeners or half-closed sockets after a churn of many distinct
-  intercepted hosts (the JS original's fd-leak bug class), and oversized request headers are tolerated;
+  injection; the **upstream-health gate** fails a dead upstream fast with a classifiable error (not a per-request
+  timeout) — asserting the gateway-absent / upstream-offline / denied trichotomy; **socket teardown**: no leaked
+  listeners or half-closed sockets after a churn of many distinct intercepted hosts (the JS original's fd-leak bug
+  class), and oversized request headers are tolerated;
 - image creation, unprivileged: a created image mounts as case-sensitive APFS whose root the invoking user owns
   (`pathconf(_PC_CASE_SENSITIVE)` is 1 and `Foo` and `foo` coexist), no step runs as root, a clone of it mounts
   case-sensitive too, and an adopted repository's `core.ignorecase` reads `false`.

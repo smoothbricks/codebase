@@ -518,7 +518,6 @@ struct GrantWire {
     mode: EgressMode,
     methods: Vec<String>,
     path_prefixes: Vec<String>,
-    impersonate: bool,
 }
 
 impl From<&EgressGrant> for GrantWire {
@@ -534,7 +533,6 @@ impl From<&EgressGrant> for GrantWire {
             mode: grant.mode,
             methods: grant.methods.iter().cloned().collect(),
             path_prefixes: grant.path_prefixes.clone(),
-            impersonate: grant.impersonate,
         }
     }
 }
@@ -548,7 +546,6 @@ impl GrantWire {
             mode: self.mode,
             methods: self.methods.iter().cloned().collect::<BTreeSet<_>>(),
             path_prefixes: self.path_prefixes.clone(),
-            impersonate: self.impersonate,
         })
     }
 }

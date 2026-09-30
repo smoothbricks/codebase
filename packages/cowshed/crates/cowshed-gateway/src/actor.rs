@@ -480,7 +480,6 @@ pub(crate) struct Admission {
     pub generation: u64,
     pub target: CanonicalTarget,
     pub mode: EgressMode,
-    pub impersonate: bool,
     pub protocol: Option<MirrorProtocol>,
     pub credential_allowed: bool,
     pub private_network_authorized: bool,
@@ -507,7 +506,6 @@ struct AdmissionSeed {
     generation: u64,
     target: CanonicalTarget,
     mode: EgressMode,
-    impersonate: bool,
     protocol: Option<MirrorProtocol>,
     credential_allowed: bool,
     private_network_authorized: bool,
@@ -529,7 +527,6 @@ impl AdmissionSeed {
             generation: self.generation,
             target: self.target,
             mode: self.mode,
-            impersonate: self.impersonate,
             protocol: self.protocol,
             credential_allowed: self.credential_allowed,
             private_network_authorized: self.private_network_authorized,
@@ -1668,98 +1665,89 @@ fn build_seed(
     session: &SessionState,
     intent: &RequestIntent,
 ) -> Result<AdmissionSeed, (&'static str, Option<String>)> {
-    let (
-        target,
-        mode,
-        impersonate,
-        protocol,
-        credential_allowed,
-        private_network_authorized,
-        upstream_path,
-    ) = match &intent.target {
-        RequestTarget::LocalMirror => {
-            let resolved = session.policy.resolve_mirror(&intent.path).ok_or((
-                "mirror route is not admitted",
-                Some("trusted project policy must admit this registry scope".to_owned()),
-            ))?;
-            (
-                resolved.target,
-                EgressMode::Intercept,
-                false,
-                Some(resolved.protocol),
-                resolved.credentialed,
-                false,
-                resolved.path,
-            )
-        }
-        RequestTarget::MirrorRedirect {
-            protocol,
-            target,
-            upstream_path,
-        } => {
-            let resolved = session.policy.resolve_mirror(&intent.path).ok_or((
-                "mirror redirect is no longer admitted",
-                Some("trusted project policy changed during redirect".to_owned()),
-            ))?;
-            let normalized = normalize_path(
-                upstream_path
-                    .split_once('?')
-                    .map_or(upstream_path.as_str(), |(path, _)| path),
-            )
-            .map_err(|_| ("mirror redirect path is ambiguous", None))?;
-            if resolved.protocol != *protocol
-                || resolved.target != *target
-                || !mirror_scope_matches(&normalized, &resolved.admitted_prefix)
-            {
-                return Err(("mirror redirect escaped its admitted origin or scope", None));
+    let (target, mode, protocol, credential_allowed, private_network_authorized, upstream_path) =
+        match &intent.target {
+            RequestTarget::LocalMirror => {
+                let resolved = session.policy.resolve_mirror(&intent.path).ok_or((
+                    "mirror route is not admitted",
+                    Some("trusted project policy must admit this registry scope".to_owned()),
+                ))?;
+                (
+                    resolved.target,
+                    EgressMode::Intercept,
+                    Some(resolved.protocol),
+                    resolved.credentialed,
+                    false,
+                    resolved.path,
+                )
             }
-            (
-                target.clone(),
-                EgressMode::Intercept,
-                false,
-                Some(*protocol),
-                resolved.credentialed,
-                false,
-                upstream_path.clone(),
-            )
-        }
-        RequestTarget::Generic(target) => {
-            let grant = session
-                .policy
-                .authorize(target, &intent.method, &intent.path)
-                .map_err(|denial| match denial {
-                    PolicyDenial::InvalidPath => ("request path is ambiguous", None),
-                    PolicyDenial::NotGranted { hint } => ("destination is not granted", Some(hint)),
-                })?;
-            (
-                target.clone(),
-                grant.mode,
-                grant.impersonate,
-                None,
-                grant.mode == EgressMode::Intercept && !grant.impersonate,
-                grant.host.is_exact(),
-                intent.path.clone(),
-            )
-        }
-        RequestTarget::LocalSim => {
-            if intent.method != Method::POST || intent.path != "/sim" {
-                return Err(("simulator broker accepts only POST /sim", None));
+            RequestTarget::MirrorRedirect {
+                protocol,
+                target,
+                upstream_path,
+            } => {
+                let resolved = session.policy.resolve_mirror(&intent.path).ok_or((
+                    "mirror redirect is no longer admitted",
+                    Some("trusted project policy changed during redirect".to_owned()),
+                ))?;
+                let normalized = normalize_path(
+                    upstream_path
+                        .split_once('?')
+                        .map_or(upstream_path.as_str(), |(path, _)| path),
+                )
+                .map_err(|_| ("mirror redirect path is ambiguous", None))?;
+                if resolved.protocol != *protocol
+                    || resolved.target != *target
+                    || !mirror_scope_matches(&normalized, &resolved.admitted_prefix)
+                {
+                    return Err(("mirror redirect escaped its admitted origin or scope", None));
+                }
+                (
+                    target.clone(),
+                    EgressMode::Intercept,
+                    Some(*protocol),
+                    resolved.credentialed,
+                    false,
+                    upstream_path.clone(),
+                )
             }
-            (
-                CanonicalTarget {
-                    scheme: TargetScheme::Http,
-                    host: CanonicalHost::Dns("simulator.local".to_owned()),
-                    port: 80,
-                },
-                EgressMode::Intercept,
-                false,
-                None,
-                false,
-                false,
-                intent.path.clone(),
-            )
-        }
-    };
+            RequestTarget::Generic(target) => {
+                let grant = session
+                    .policy
+                    .authorize(target, &intent.method, &intent.path)
+                    .map_err(|denial| match denial {
+                        PolicyDenial::InvalidPath => ("request path is ambiguous", None),
+                        PolicyDenial::NotGranted { hint } => {
+                            ("destination is not granted", Some(hint))
+                        }
+                    })?;
+                (
+                    target.clone(),
+                    grant.mode,
+                    None,
+                    grant.mode == EgressMode::Intercept,
+                    grant.host.is_exact(),
+                    intent.path.clone(),
+                )
+            }
+            RequestTarget::LocalSim => {
+                if intent.method != Method::POST || intent.path != "/sim" {
+                    return Err(("simulator broker accepts only POST /sim", None));
+                }
+                (
+                    CanonicalTarget {
+                        scheme: TargetScheme::Http,
+                        host: CanonicalHost::Dns("simulator.local".to_owned()),
+                        port: 80,
+                    },
+                    EgressMode::Intercept,
+                    None,
+                    false,
+                    false,
+                    intent.path.clone(),
+                )
+            }
+        };
     Ok(AdmissionSeed {
         workspace_id: workspace_id.to_owned(),
         repo_id: session.repo_id.clone(),
@@ -1768,7 +1756,6 @@ fn build_seed(
         generation: session.generation,
         target,
         mode,
-        impersonate,
         protocol,
         credential_allowed,
         private_network_authorized,

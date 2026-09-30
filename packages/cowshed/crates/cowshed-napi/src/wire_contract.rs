@@ -476,13 +476,11 @@ fn grant_sets() -> BTreeMap<&'static str, Value> {
                 host: "crates.io".to_owned(),
                 ports: Vec::new(),
                 mode: EgressMode::Intercept,
-                impersonate: None,
             },
             EgressRule {
                 host: "github.com".to_owned(),
                 ports: vec![22, 443],
                 mode: EgressMode::Opaque,
-                impersonate: Some("fixture-bot".to_owned()),
             },
         ],
         repos: vec![RepoRule("smoothbricks/*".to_owned())],

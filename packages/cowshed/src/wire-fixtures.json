@@ -107,7 +107,6 @@
         },
         {
           "host": "github.com",
-          "impersonate": "fixture-bot",
           "mode": "opaque",
           "ports": [22, 443]
         }

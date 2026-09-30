@@ -82,7 +82,6 @@ export interface EgressRule {
   readonly host: string;
   readonly ports?: readonly number[];
   readonly mode?: EgressMode;
-  readonly impersonate?: string;
 }
 
 export interface GrantSet {

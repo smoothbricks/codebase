@@ -850,7 +850,6 @@ async fn handle_mirror_request(
             workspace_id: &admission.workspace_id,
             repo_id: &admission.repo_id,
             credential_allowed: admission.credential_allowed,
-            impersonate: admission.impersonate,
             private_network_authorized: admission.private_network_authorized,
             trace_id: admission.trace_id.as_deref(),
             upstream_span_id: admission.upstream_span_id,
@@ -1012,7 +1011,6 @@ struct ProxyMirrorUpstream<'a> {
     workspace_id: &'a str,
     repo_id: &'a str,
     credential_allowed: bool,
-    impersonate: bool,
     private_network_authorized: bool,
     trace_id: Option<&'a str>,
     upstream_span_id: Option<u64>,
@@ -1055,19 +1053,15 @@ impl MirrorUpstream for ProxyMirrorUpstream<'_> {
             )
             .map_err(|error| -> CacheBodyError { Box::new(error) })?;
         *outbound.headers_mut() = request.headers;
-        let trace = if self.impersonate {
-            None
-        } else {
-            Some(UpstreamTrace {
-                trace_id: self
-                    .trace_id
-                    .ok_or_else(|| -> CacheBodyError { "mirror trace id is missing".into() })?,
-                span_id: self.upstream_span_id.ok_or_else(|| -> CacheBodyError {
-                    "mirror upstream span id is missing".into()
-                })?,
-                flags: self.trace_flags,
-                tracestate: self.tracestate,
-            })
+        let trace = UpstreamTrace {
+            trace_id: self
+                .trace_id
+                .ok_or_else(|| -> CacheBodyError { "mirror trace id is missing".into() })?,
+            span_id: self
+                .upstream_span_id
+                .ok_or_else(|| -> CacheBodyError { "mirror upstream span id is missing".into() })?,
+            flags: self.trace_flags,
+            tracestate: self.tracestate,
         };
         write_upstream_headers(outbound.headers_mut(), &request.target, trace)
             .map_err(|error| -> CacheBodyError { Box::new(error) })?;
@@ -1860,22 +1854,20 @@ struct UpstreamTrace<'a> {
 fn write_upstream_headers(
     headers: &mut HeaderMap,
     target: &CanonicalTarget,
-    trace: Option<UpstreamTrace<'_>>,
+    trace: UpstreamTrace<'_>,
 ) -> Result<(), http::header::InvalidHeaderValue> {
     strip_upstream_request_headers(headers);
     headers.insert(header::HOST, HeaderValue::from_str(&target.authority())?);
-    if let Some(trace) = trace {
-        let traceparent = serialize_traceparent(trace.trace_id, trace.span_id, trace.flags);
+    let traceparent = serialize_traceparent(trace.trace_id, trace.span_id, trace.flags);
+    headers.insert(
+        HeaderName::from_static("traceparent"),
+        HeaderValue::from_str(&traceparent)?,
+    );
+    if let Some(tracestate) = trace.tracestate {
         headers.insert(
-            HeaderName::from_static("traceparent"),
-            HeaderValue::from_str(&traceparent)?,
+            HeaderName::from_static("tracestate"),
+            HeaderValue::from_str(tracestate)?,
         );
-        if let Some(tracestate) = trace.tracestate {
-            headers.insert(
-                HeaderName::from_static("tracestate"),
-                HeaderValue::from_str(tracestate)?,
-            );
-        }
     }
     Ok(())
 }
@@ -1925,20 +1917,16 @@ async fn prepare_upstream_request(
     StatusCode,
 > {
     let (mut parts, body) = request.into_parts();
-    let trace = if admission.impersonate {
-        None
-    } else {
-        Some(UpstreamTrace {
-            trace_id: admission
-                .trace_id
-                .as_deref()
-                .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?,
-            span_id: admission
-                .upstream_span_id
-                .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?,
-            flags: admission.trace_flags,
-            tracestate: admission.tracestate.as_deref(),
-        })
+    let trace = UpstreamTrace {
+        trace_id: admission
+            .trace_id
+            .as_deref()
+            .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?,
+        span_id: admission
+            .upstream_span_id
+            .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?,
+        flags: admission.trace_flags,
+        tracestate: admission.tracestate.as_deref(),
     };
     write_upstream_headers(&mut parts.headers, &admission.target, trace)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -3146,12 +3134,12 @@ mod tests {
         write_upstream_headers(
             &mut headers,
             &target,
-            Some(UpstreamTrace {
+            UpstreamTrace {
                 trace_id: "4bf92f3577b34da6a3ce929d0e0e4736",
                 span_id: 0x00f0_67aa_0ba9_02b7,
                 flags: 1,
                 tracestate: Some("vendor=value"),
-            }),
+            },
         )
         .expect("valid upstream headers");
         assert!(!headers.contains_key(header::AUTHORIZATION));

@@ -274,7 +274,6 @@ Controller-owned, host-readable while the image is detached, outside the workspa
     { "host": "registry.npmjs.org" },
     { "host": "api.example.com", "mode": "intercept" },
     { "host": "pinned.example.com", "mode": "opaque" },
-    { "host": "scrape.example.com", "mode": "intercept", "impersonate": "chrome" },
     { "host": "*.github.com", "ports": [443] }
   ],
   "sim": ["openurl"]
@@ -289,10 +288,9 @@ Controller-owned, host-readable while the image is detached, outside the workspa
   copied or discarded timelines.
 - `revision` increments on every grant change; the supervisor launch, execs, and the gateway log the revision they
   enforced, making audit trails reconstructible.
-- Egress hosts are exact names or single-level `*.` wildcards, optional port list (default 443/80), optional
+- Egress hosts are exact names or single-level `*.` wildcards, optional port list (default 443/80), and optional
   `mode: "intercept" | "opaque"` (default `intercept` — the gateway terminates TLS under the workspace CA and injects
-  credentials + trace; `opaque` is a pass-through CONNECT tunnel for pinned clients — 05_gateway.md), and optional
-  `impersonate: "<profile>"` (outbound TLS-fingerprint impersonation, which suppresses header injection —
+  credentials + trace; `opaque` is a pass-through CONNECT tunnel for pinned clients that injects nothing —
   05_gateway.md). There are no SSH or Docker grant axes.
 - `sim` is the **personal-session simulator** axis (posture B — 14_nix.md), and its closed enum contains only `openurl`
   and `install`. `openurl` drives an already-installed app and is restricted to project-registered URL schemes;
@@ -333,8 +331,8 @@ workspaces, and forks — in addition to its own. They live in the trusted proje
   outside its image; a write grant stays a per-workspace decision.
 - **Composition.** A workspace's grant snapshot is its own grant file plus the standing grants: reads are the sorted
   union, and egress is the workspace's rules plus every standing rule for a host the workspace does not name — a
-  workspace rule for the same host (its ports, mode, impersonation) is kept as written. Standing grants add; they never
-  subtract. A fork never copies another workspace's own grants, and holds the standing ones like every workspace does.
+  workspace rule for the same host (its ports and mode) is kept as written. Standing grants add; they never subtract. A
+  fork never copies another workspace's own grants, and holds the standing ones like every workspace does.
 - **Effective revision.** The standing grants carry their own `revision`, advanced by every effective change and never
   reset. The revision a workspace's supervisor launches under, its jobs record, and its gateway session is installed at
   is the workspace's own revision plus the project's: each only grows, so the sum grows whenever either does, and a
@@ -355,10 +353,10 @@ Grant files are small, but they are the authority record — mutations are speci
 - **Canonical set semantics.** Paths are canonicalized before comparison (symlinks resolved; the `/var` → `/private/var`
   handling generalizes); read/write/egress/sim vectors are sorted and deduplicated (`sim` verbs are a closed enum —
   unknown verbs are usage errors, exit 2); egress hosts are lowercased, wildcards normalized to one leading `*.` label,
-  omitted ports normalized to the 443/80 default. An egress entry's `mode` and `impersonate` are attributes **of the
-  host**, not separate rows: a second grant on an existing host updates them in place (last write wins on the
-  attribute), and an omitted `mode` normalizes to `intercept`. Applying a delta computes a complete new snapshot — there
-  is no in-place patching.
+  omitted ports normalized to the 443/80 default. An egress entry's ports and `mode` are attributes **of the host**, not
+  separate rows: a second grant on an existing host updates them in place (last write wins on the attribute), and an
+  omitted `mode` normalizes to `intercept`. Applying a delta computes a complete new snapshot — there is no in-place
+  patching.
 - **Locking and CAS.** Every mutation holds an exclusive `flock` on the workspace's `.lock` file (01_storage.md).
   Callers may pass an `expected_revision`; a mismatch is a conflict (exit 4 / `CowshedError::Conflict`) and the
   coordinator retries against the fresh snapshot — concurrent coordinators serialize instead of clobbering.
