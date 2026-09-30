@@ -350,18 +350,6 @@ impl RecoveryScope {
         }
     }
 
-    /// Whether a mounted workspace's supervisor failing to start fails this opening: it does for
-    /// the workspaces the opening owns, except a removal's target. A removal retires its target
-    /// rather than serving it, so a workspace whose supervisor cannot start stays removable.
-    fn needs_supervisor(&self, workspace: &WorkspaceName) -> bool {
-        match self {
-            Self::Removal(target) if target == workspace => false,
-            Self::Store | Self::Workspaces(_) | Self::Removal(_) => {
-                self.replay(workspace) == IntentReplay::Own
-            }
-        }
-    }
-
     fn removal_target(&self) -> Option<&WorkspaceName> {
         match self {
             Self::Removal(target) => Some(target),
@@ -391,9 +379,6 @@ mod recovery_scope_tests {
         let unnamed = RecoveryScope::Workspaces(Default::default());
         assert_eq!(unnamed.replay(&name("main")), IntentReplay::Own);
         assert_eq!(unnamed.replay(&name("b")), IntentReplay::Leave);
-        // A mounted workspace whose supervisor cannot start fails exactly these verbs.
-        assert!(scope.needs_supervisor(&name("a")) && scope.needs_supervisor(&name("main")));
-        assert!(!scope.needs_supervisor(&name("b")));
     }
 
     #[test]
@@ -408,10 +393,6 @@ mod recovery_scope_tests {
             None
         );
         assert_eq!(RecoveryScope::Store.removal_target(), None);
-        // Retiring a workspace never waits on its supervisor, which may be what is broken.
-        assert!(!scope.needs_supervisor(&name("gone")));
-        assert!(scope.needs_supervisor(&name("main")));
-        assert!(!scope.needs_supervisor(&name("other")));
     }
 
     /// `gc` finishes residue everywhere, but only `main`'s failure is its own.
@@ -425,8 +406,6 @@ mod recovery_scope_tests {
             RecoveryScope::Store.replay(&name("b")),
             IntentReplay::Residue
         );
-        assert!(RecoveryScope::Store.needs_supervisor(&name("main")));
-        assert!(!RecoveryScope::Store.needs_supervisor(&name("b")));
     }
 }
 
@@ -4540,23 +4519,7 @@ impl NativeProjectRuntimeHost {
         // The socket first: holding it is what makes this the workspace's one supervisor, so
         // what the last one left running is this one's to end and seal.
         let listener = super::supervisor_socket::bind(&socket).await?;
-        let ledger = super::job_groups::ledger_path(&socket);
-        let ended = tokio::task::spawn_blocking(move || {
-            super::job_groups::end_recorded(&ledger, super::job_groups::Writer::Any, LOST_JOB_GRACE)
-        })
-        .await
-        .map_err(|error| CowshedError::internal(format!("ending lost jobs failed: {error}")))?
-        .map_err(|error| {
-            CowshedError::environment_missing(
-                format!("cannot end the jobs a lost supervisor left running: {error}"),
-                "cowshed doctor --json",
-            )
-        })?;
-        if !ended.is_empty() {
-            eprintln!(
-                "cowshed: ended the process groups of jobs {ended:?} of workspace {name}, left by a supervisor that ended without them"
-            );
-        }
+        self.seal_lost_jobs(&socket, &config).await?;
         // Every commitment goes to this process's own sink, the host's default, and is kept for
         // controllers that forward the workspace's commitments into sinks of their own.
         let feed = super::commitment_feed::CommitmentFeed::default();
@@ -4640,8 +4603,110 @@ impl NativeProjectRuntimeHost {
         forwarders.insert(socket, task);
     }
 
+    /// Before a supervisor starts on the socket it now holds: end what its lost predecessor's
+    /// ledger still names and seal those jobs `failed` with `supervisorLost`, recording their
+    /// terminal commitments. Jobs no ledger names are never touched.
+    async fn seal_lost_jobs(
+        &mut self,
+        socket: &Path,
+        config: &super::supervisor::WorkspaceSupervisorConfig,
+    ) -> Result<()> {
+        use super::supervisor::{CommitmentDraft, CommitmentSink as _};
+
+        let ledger = super::job_groups::ledger_path(socket);
+        let lost = tokio::task::spawn_blocking(move || {
+            super::job_groups::take_lost(&ledger, LOST_JOB_GRACE)
+        })
+        .await
+        .map_err(|error| CowshedError::internal(format!("ending lost jobs failed: {error}")))?
+        .map_err(|error| {
+            CowshedError::environment_missing(
+                format!("cannot end the jobs a lost supervisor left running: {error}"),
+                "cowshed doctor --json",
+            )
+        })?;
+        if lost.is_empty() {
+            return Ok(());
+        }
+        let lost = lost
+            .into_iter()
+            .map(JobId::new)
+            .collect::<std::result::Result<std::collections::BTreeSet<_>, _>>()
+            .map_err(|error| {
+                CowshedError::integrity(
+                    format!("a job group ledger names an invalid job: {error}"),
+                    "cowshed doctor --json",
+                )
+            })?;
+        let (root, owned, incarnation, artifacts) = (
+            config.workspace_root.clone(),
+            config.owned_repo_ids.clone(),
+            config.authority.workspace_incarnation.clone(),
+            config.artifacts.clone(),
+        );
+        let sealed = tokio::task::spawn_blocking(move || {
+            crate::storage::job_artifact::ArtifactStore::open(root, owned, incarnation, artifacts)?
+                .seal_lost(&lost)
+        })
+        .await
+        .map_err(|error| CowshedError::internal(format!("sealing lost jobs failed: {error}")))?
+        .map_err(|error| {
+            CowshedError::integrity(
+                format!("cannot seal the jobs a lost supervisor ran: {error}"),
+                "cowshed doctor --json",
+            )
+        })?;
+        eprintln!(
+            "cowshed: sealed jobs {:?} of workspace {} as lost with the supervisor that ran them",
+            sealed
+                .iter()
+                .map(|(record, _)| record.job_id.get())
+                .collect::<Vec<_>>(),
+            config.authority.workspace
+        );
+        for (record, batch_sha256) in sealed {
+            self.commitments
+                .record(CommitmentDraft::Terminal {
+                    repo_id: config.authority.repo_id.clone(),
+                    workspace_incarnation: record.workspace_incarnation,
+                    job_id: record.job_id,
+                    state: record.state,
+                    grant_revision: record.grant_revision,
+                    stdout_bytes: record.stdout.bytes,
+                    stdout_sha256: record.stdout.sha256,
+                    stderr_bytes: record.stderr.bytes,
+                    stderr_sha256: record.stderr.sha256,
+                    batch_sha256,
+                    output_limit: None,
+                })
+                .await?;
+        }
+        Ok(())
+    }
+
     async fn stop_supervisor(&mut self, name: &WorkspaceName) -> Result<()> {
-        if let Some(handle) = self.supervisors.remove(name) {
+        // The workspace's supervisor may be serving without this controller ever having used
+        // it: whatever answers its socket is the one to retire before the substrate changes.
+        let handle = match self.supervisors.remove(name) {
+            Some(handle) => Some(handle),
+            None => {
+                let socket = super::supervisor_socket::socket_path(
+                    &self.descriptor.store_root,
+                    &self.descriptor.repo_id,
+                    name,
+                );
+                match super::supervisor_socket::hello(&socket).await {
+                    Ok(hello) => Some(super::supervisor_socket::connect(socket, hello.authority)),
+                    // Another build's supervisor: it cannot be retired through this protocol,
+                    // and the substrate must not change under it.
+                    Err(error) if error.code == crate::error::ErrorCode::Conflict => {
+                        return Err(error);
+                    }
+                    Err(_) => None,
+                }
+            }
+        };
+        if let Some(handle) = handle {
             let stopped = async {
                 handle.quiesce().await?;
                 handle.retire().await
@@ -5890,33 +5955,9 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
             self.validate_binding().await?;
         }
         // Intent recovery finishes interrupted create/fork/remove work by creating and destroying
-        // images, so the read above describes the host from before those mutations. Re-read only
-        // when recovery actually acted: with no pending intent — every start that did not follow a
-        // crash — the first read still describes the host, so open stays linear in workspace count.
-        let authoritative = if self.recover_lifecycle_intents().await? {
-            self.authoritative_allowing_detached_main_relocation()
-                .await?
-        } else {
-            authoritative
-        };
-        for workspace in authoritative.into_iter().filter(|workspace| {
-            matches!(
-                workspace.derived.mount_state,
-                crate::storage::lifecycle::MountState::Mounted { .. }
-            )
-        }) {
-            let name = workspace.derived.workspace.name().clone();
-            if let Err(error) = self.ensure_supervisor_for(workspace).await {
-                if self.recovery_scope.needs_supervisor(&name) {
-                    return Err(error);
-                }
-                eprintln!(
-                    "cowshed: workspace {name} is mounted but its supervisor could not start ({}: {}); only a verb that names it waits on it",
-                    error.code.as_str(),
-                    error.message
-                );
-            }
-        }
+        // images. Workspace supervisors are the daemon's, started by the first command a workspace
+        // gets: opening a project starts none, and waits on none.
+        self.recover_lifecycle_intents().await?;
         Ok(())
     }
 

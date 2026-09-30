@@ -726,13 +726,16 @@ impl ArtifactStore {
         })
     }
 
-    /// Seal every job of this incarnation that was admitted and never sealed: the jobs of a
-    /// supervisor that ended without seeing them end. Only a supervisor starting where no other
-    /// serves may call this, after ending their process groups. Each gets a `failed` terminal
-    /// record naming `supervisorLost` and carrying whatever its protected spill files hold; an
-    /// output still only in the lost supervisor's memory is gone and recorded as empty.
-    pub fn seal_orphans(
+    /// Seal the jobs among `lost` that this incarnation admitted and never sealed: the jobs a
+    /// supervisor ran when it ended without seeing them end, named by its group ledger. Only the
+    /// supervisor that now holds the workspace's socket may call this, after ending their
+    /// process groups. Each gets a `failed` terminal record naming `supervisorLost` and carrying
+    /// whatever its protected spill files hold; output that was only in the lost supervisor's
+    /// memory is gone and recorded as empty. A job no ledger names is never touched: it may be
+    /// live under a supervisor of another cowshed build.
+    pub fn seal_lost(
         &mut self,
+        lost: &BTreeSet<JobId>,
     ) -> Result<Vec<(JobArtifactRecord, Sha256Digest)>, ArtifactError> {
         let admitted: BTreeMap<JobId, JobArtifactRecord> = self
             .recovery
@@ -740,7 +743,8 @@ impl ArtifactStore {
             .iter()
             .filter_map(|frame| match &frame.record {
                 ProtectedRecord::Job(record)
-                    if record.workspace_incarnation == self.workspace_incarnation
+                    if lost.contains(&record.job_id)
+                        && record.workspace_incarnation == self.workspace_incarnation
                         && matches!(record.state, JobState::Queued | JobState::Running)
                         && !self.committed_jobs.contains_key(&record.job_id)
                         && !self.live_jobs.contains_key(&record.job_id) =>

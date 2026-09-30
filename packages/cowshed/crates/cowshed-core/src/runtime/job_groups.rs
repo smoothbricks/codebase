@@ -24,6 +24,9 @@ struct Ledger {
     /// The supervisor process that wrote it.
     supervisor: u32,
     groups: Vec<Group>,
+    /// Its groups were ended after the supervisor was lost; the jobs still await sealing.
+    #[serde(default)]
+    ended: bool,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
@@ -39,6 +42,7 @@ struct Group {
 pub fn record(path: &Path, groups: &[(u64, u32)]) -> io::Result<()> {
     let ledger = Ledger {
         supervisor: std::process::id(),
+        ended: false,
         groups: groups
             .iter()
             .filter_map(|&(job_id, pgid)| {
@@ -51,7 +55,11 @@ pub fn record(path: &Path, groups: &[(u64, u32)]) -> io::Result<()> {
             })
             .collect(),
     };
-    let bytes = serde_json::to_vec(&ledger).map_err(io::Error::other)?;
+    replace(path, &ledger)
+}
+
+fn replace(path: &Path, ledger: &Ledger) -> io::Result<()> {
+    let bytes = serde_json::to_vec(ledger).map_err(io::Error::other)?;
     let temporary = path.with_extension(format!("groups.{}", std::process::id()));
     std::fs::write(&temporary, bytes)?;
     std::fs::rename(&temporary, path)
@@ -68,23 +76,56 @@ pub enum Writer {
     Any,
 }
 
-/// End every group the ledger at `path` names — TERM, `grace`, then KILL — and remove it,
-/// when `writer` wrote it. Returns the job ids whose groups were signalled.
+/// End every group the ledger at `path` names — TERM, `grace`, then KILL — when `writer` wrote
+/// it, and mark it ended; the jobs it names stay in it until the next supervisor of the
+/// workspace seals them ([`take_lost`]). Returns the job ids whose groups were signalled.
 pub fn end_recorded(path: &Path, writer: Writer, grace: Duration) -> io::Result<Vec<u64>> {
-    let bytes = match std::fs::read(path) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(error) => return Err(error),
+    let Some(mut ledger) = read(path)? else {
+        return Ok(Vec::new());
     };
-    let ledger: Ledger = serde_json::from_slice(&bytes).map_err(io::Error::other)?;
     if let Writer::Process(pid) = writer
         && pid != ledger.supervisor
     {
         return Ok(Vec::new());
     }
-    let ours: Vec<Group> = ledger
-        .groups
-        .into_iter()
+    if ledger.ended {
+        return Ok(Vec::new());
+    }
+    let signalled = end_groups(&ledger.groups, grace);
+    ledger.ended = true;
+    replace(path, &ledger)?;
+    Ok(signalled)
+}
+
+/// For the supervisor now holding the workspace's socket: end whatever its lost predecessor's
+/// ledger still names, remove the ledger, and return every job it names — the jobs to seal as
+/// lost. Jobs no ledger names (another cowshed build's) are never touched.
+pub fn take_lost(path: &Path, grace: Duration) -> io::Result<Vec<u64>> {
+    let Some(ledger) = read(path)? else {
+        return Ok(Vec::new());
+    };
+    if !ledger.ended {
+        end_groups(&ledger.groups, grace);
+    }
+    std::fs::remove_file(path)?;
+    Ok(ledger.groups.iter().map(|group| group.job_id).collect())
+}
+
+fn read(path: &Path) -> io::Result<Option<Ledger>> {
+    match std::fs::read(path) {
+        Ok(bytes) => serde_json::from_slice(&bytes)
+            .map(Some)
+            .map_err(io::Error::other),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+/// TERM the groups that are the jobs', wait `grace`, KILL them; the job ids signalled.
+fn end_groups(groups: &[Group], grace: Duration) -> Vec<u64> {
+    let ours: Vec<Group> = groups
+        .iter()
+        .copied()
         .filter(|group| match (group.leader_start, start_time(group.pgid)) {
             // The leader lives on under the recorded start: the job's own group.
             (Some(recorded), Some(now)) => recorded == now,
@@ -105,8 +146,7 @@ pub fn end_recorded(path: &Path, writer: Writer, grace: Duration) -> io::Result<
             signal_group(group.pgid, libc::SIGKILL);
         }
     }
-    std::fs::remove_file(path)?;
-    Ok(signalled)
+    signalled
 }
 
 /// Whether `signal` reached a group that exists.
@@ -155,7 +195,7 @@ mod tests {
     use std::process::{Command, Stdio};
     use std::time::Duration;
 
-    use super::{Writer, end_recorded, ledger_path, record};
+    use super::{Writer, end_recorded, ledger_path, record, take_lost};
 
     /// A job-shaped process tree: a group leader with a child, both sleeping.
     fn job_group() -> std::process::Child {
@@ -192,6 +232,17 @@ mod tests {
         let _ = job.wait();
         std::thread::sleep(Duration::from_millis(100));
         assert!(!group_alive(pgid), "the leader's child died with it");
+        assert!(
+            end_recorded(&ledger, Writer::Any, Duration::ZERO)
+                .unwrap()
+                .is_empty(),
+            "an ended ledger ends nothing twice"
+        );
+        assert_eq!(
+            take_lost(&ledger, Duration::ZERO).unwrap(),
+            vec![7],
+            "the next supervisor still learns which jobs to seal"
+        );
         assert!(!ledger.exists());
     }
 

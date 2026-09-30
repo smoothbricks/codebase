@@ -2131,42 +2131,15 @@ impl WorkspaceSupervisor {
         commitments: C,
     ) -> Result<WorkspaceSupervisorHandle>
     where
-        C: CommitmentSink + Clone + Send + 'static,
+        C: CommitmentSink + Send + 'static,
     {
         config.validate()?;
-        let mut artifacts = ArtifactStoreSink::open(
+        let artifacts = ArtifactStoreSink::open(
             config.workspace_root.clone(),
             &config.owned_repo_ids,
             &config.authority,
             config.artifacts.clone(),
         )?;
-        // This supervisor starts where no other serves, and its starter ended the process
-        // groups of whatever the last one still ran: those jobs are lost, and sealed as such
-        // before any new one is admitted.
-        let orphans = artifacts.store.seal_orphans().map_err(map_artifact_error)?;
-        if !orphans.is_empty() {
-            let mut publisher = commitments.clone();
-            let authority = config.authority.clone();
-            tokio::spawn(async move {
-                for (record, batch_sha256) in orphans {
-                    let _ = publisher
-                        .record(CommitmentDraft::Terminal {
-                            repo_id: authority.repo_id.clone(),
-                            workspace_incarnation: record.workspace_incarnation,
-                            job_id: record.job_id,
-                            state: record.state,
-                            grant_revision: record.grant_revision,
-                            stdout_bytes: record.stdout.bytes,
-                            stdout_sha256: record.stdout.sha256,
-                            stderr_bytes: record.stderr.bytes,
-                            stderr_sha256: record.stderr.sha256,
-                            batch_sha256,
-                            output_limit: None,
-                        })
-                        .await;
-                }
-            });
-        }
         let spawner = match config.shell_host.clone() {
             Some(program) => SystemSpawnSink::with_shell_host(program, config.shell_pool),
             None => SystemSpawnSink::default(),

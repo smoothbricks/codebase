@@ -1443,7 +1443,7 @@ proptest! {
 }
 
 #[test]
-fn jobs_a_lost_supervisor_admitted_are_sealed_failed_once_with_what_they_spilled() {
+fn jobs_a_lost_supervisor_ran_are_sealed_failed_once_with_what_they_spilled() {
     let root = TempRoot::new("orphans");
     let config = ArtifactConfig {
         inline_cap_bytes: 4,
@@ -1451,6 +1451,7 @@ fn jobs_a_lost_supervisor_admitted_are_sealed_failed_once_with_what_they_spilled
     };
     let mut lost = store(root.path(), config.clone());
     let finished = begin(&mut lost, 3, OutputTargets::default());
+    let finished_id = finished.job_id();
     lost.finish(finished, JobState::Exited).unwrap();
     let orphan = begin(&mut lost, 3, OutputTargets::default());
     lost.append(&orphan, StreamKind::Stdout, b"spilled bytes")
@@ -1459,8 +1460,15 @@ fn jobs_a_lost_supervisor_admitted_are_sealed_failed_once_with_what_they_spilled
     drop(lost);
 
     let mut next = store(root.path(), config.clone());
-    let sealed = next.seal_orphans().unwrap();
-    assert_eq!(sealed.len(), 1, "only the unsealed job is an orphan");
+    let named = [
+        finished_id,
+        orphan.job_id(),
+        cowshed_core::api::JobId::new(99).unwrap(),
+    ]
+    .into_iter()
+    .collect();
+    let sealed = next.seal_lost(&named).unwrap();
+    assert_eq!(sealed.len(), 1, "only the admitted, unsealed job is lost");
     let (record, _) = &sealed[0];
     assert_eq!(record.job_id, orphan.job_id());
     assert_eq!(record.state, JobState::Failed);
@@ -1478,7 +1486,7 @@ fn jobs_a_lost_supervisor_admitted_are_sealed_failed_once_with_what_they_spilled
     drop(next);
 
     let mut after = store(root.path(), config);
-    assert!(after.seal_orphans().unwrap().is_empty(), "sealed once");
+    assert!(after.seal_lost(&named).unwrap().is_empty(), "sealed once");
     let recovered = recover_records(&root.path().join(".cowshed/job/records.arrow")).unwrap();
     assert!(recovered.frames.iter().any(|frame| matches!(
         &frame.record,
