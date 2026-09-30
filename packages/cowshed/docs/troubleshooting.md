@@ -1,9 +1,8 @@
 # Troubleshooting
 
 First move for anything weird: `cowshed doctor`. It checks every invariant (images ↔ markers ↔ mounts ↔ grants, caches
-volume, gateway, autosave freshness) and prints one `cowshed:` line per problem with a `next:` fix. Because cowshed has
-no database, doctor isn't reconciling state — it's _deriving_ it from disk and the mount table, so what it reports is
-the truth.
+volume, gateway) and prints one `cowshed:` line per problem with a `next:` fix. Because cowshed has no database, doctor
+isn't reconciling state — it's _deriving_ it from disk and the mount table, so what it reports is the truth.
 
 ## Mounts
 
@@ -42,8 +41,7 @@ never reuses a stale snapshot. Existing long-running processes keep their launch
 **`cowshed adopt` or `cowshed push` refused with exit 4 naming files.** The secrets gate found credential-shaped content
 (`.env*`, key files, known token prefixes, `.envrc` secret exports). For adopt: move each value into the gateway
 Keychain (see gateway.md) and delete the file, or `cowshed adopt --quarantine` to relocate findings outside the image so
-dependent tooling fails loudly. For push: the offending hunks are named — remove the secret and push again; autosave
-meanwhile skips (never propagates findings) and warns.
+dependent tooling fails loudly. For push: the offending hunks are named — remove the secret and push again.
 
 False positive on adopt? The refusal itself prints the exact controller-owned `waivers.json` path and a valid entry
 example. Entries form a JSON array whose `path` matches the finding's repository-relative path exactly and whose
@@ -82,7 +80,8 @@ Seatbelt log around the failure:
 log show --last 2m --predicate 'sender == "Sandbox"' | grep deny
 ```
 
-and the gateway audit events for egress (`cowshed audit --denied | tail`). Common cases:
+and the gateway audit events for egress (Arrow segments under `/private/cowshed/store/telemetry/gateway/`,
+[telemetry.md](telemetry.md)). Common cases:
 
 - **A lifecycle verb (`new`, `rm`, …) exits 6 with "the process running cowshed is sandboxed away from cowshed's
   store"**: the shell that ran cowshed — an agent harness shell, or a `cowshed exec` child calling cowshed again — is
@@ -90,7 +89,7 @@ and the gateway audit events for egress (`cowshed audit --denied | tail`). Commo
   lock files open but refuses the temp file every durable write starts with). The store is intact and no grant helps:
   rerun the verb from a shell whose sandbox allows writing the store.
 - **Tool writes to `$HOME` dotfiles** (some CLIs insist on `~/.toolrc`): grant narrowly (`--write ~/.toolrc`, not
-  `--write ~`), or set the tool's env override to a path inside the workspace — `cowshed shell` and fix its config once;
+  `--write ~`), or set the tool's env override to a path inside the workspace — fix its config once with `cowshed exec`;
   it's in the image and every fork inherits it.
 - **Egress to an unmirrored host**: `cowshed grant <ws> --egress <host>` — applies immediately, no re-exec.
 - **Linux package/proxy client gets connection refused at `127.0.0.1:7644`**: do not point it at the Unix socket or a
@@ -132,8 +131,9 @@ not override a pin. Unpin explicitly before expecting GC to remove it.
 
 ## Disk usage
 
-Images are sparse files that grow with churn; deleting files inside a volume does not shrink the image file. `cowshed gc`
-reclaims retired images, removes orphans, and prunes expired checkpoints (`--dry-run` lists each candidate first):
+Images are sparse files that grow with churn; deleting files inside a volume does not shrink the image file.
+`cowshed gc` reclaims retired images, removes orphans, and prunes expired checkpoints (`--dry-run` lists each candidate
+first):
 
 ```
 $ cowshed gc --dry-run
@@ -248,14 +248,14 @@ backup.
 
 - Committed + pushed (`cowshed push`, or merged in main): it's in main's repo — and main's off-machine durability is its
   **origin remote**, exactly as before adoption. Keep pushing main to origin as usual; the store volume is not a backup.
-- Committed, unpushed: the autosave agent (host-side, like `push`) fetches every workspace into `refs/cowshed/<ws>/wip`
-  every 10 minutes.
-- **Uncommitted work is at risk between autosaves.** `cowshed doctor` warns when any workspace's autosave is stale.
+- Committed, unpushed: `cowshed push <ws>` preserves the branch in main's repo under `refs/cowshed/<ws>/…`; until then
+  the commits exist only in the workspace image.
+- **Uncommitted work exists only in the workspace image.** Nothing saves it in the background.
 
 Restoring a machine: clone main's repo from its origin remote, `cowshed adopt` again; workspaces are recreated from
-their saved branches (`cowshed new x --ref refs/cowshed/x/wip`). Checkpoints and images are not backup artifacts — never
-treat them as one. Export any terminal job stream you need to retain independently; cowshed materializes a clone,
-reflink, or copy, never a hardlink to protected content.
+their pushed branches (`cowshed new x --ref refs/cowshed/x/heads/<branch>`). Checkpoints and images are not backup
+artifacts — never treat them as one. Export any terminal job stream you need to retain independently; cowshed
+materializes a clone, reflink, or copy, never a hardlink to protected content.
 
 ## ZFS pool and hierarchy
 
@@ -291,11 +291,10 @@ again. The message names the PATH that was searched.
 ## When cowshed itself misbehaves
 
 `cowshed doctor --json` is the bounded bug-report payload: it includes versions, invariant results, continuity metadata,
-hashes, and the last few operations from the telemetry store (`cowshed logs --since 1h` shows the same thing), never raw
-job stdout/stderr. Workspace lifecycle can be re-derived after detach, but protected job content exists only in its
-origin incarnation/checkpoint or an independent export. To reset attachment state, detach each workspace with
-`cowshed detach`; subsequent commands re-derive mounts and controller wiring. There is no cache to clear and no database
-to reset.
+hashes, and the last few operations from the telemetry store, never raw job stdout/stderr. Workspace lifecycle can be
+re-derived after detach, but protected job content exists only in its origin incarnation/checkpoint or an independent
+export. To reset attachment state, detach each workspace with `cowshed detach`; subsequent commands re-derive mounts and
+controller wiring. There is no cache to clear and no database to reset.
 
 For cache-volume corruption specifically there is a bigger, equally safe hammer: nothing unique lives on
 `cowshed.caches`, so `diskutil apfs deleteVolume` and letting cowshed lazily recreate it is always an option — the
@@ -382,7 +381,7 @@ than a command to run.
 - **A tool only lists dev-local simulators, never the personal-session device.** It spawned `/usr/bin/xcrun` by absolute
   path, bypassing the in-image wrapper (`.cowshed/bin/xcrun`). That degradation is the safe default — the personal
   session is unreachable except through the wrapper → gateway → broker path. Fix the tool's PATH resolution, or hand the
-  artifact over manually (`cowshed sim export` + your side's `simctl install`).
+  artifact over manually (copy the `.app` to the drop dir, then your side's `simctl install`).
 - **`cowshed: sim broker unreachable` (exit 5).** The session broker is a launchd agent in the _personal_ GUI session —
   it isn't running if nobody is logged in or the agent isn't loaded; the `next:` hint names the `launchctl` kickstart.
   Exit 5 (environment) is deliberately distinct from exit 6 (a denial: missing `--sim` grant, non-drop-dir install,
@@ -394,8 +393,8 @@ than a command to run.
 
 - **"I want the app running as dev but visible in my session."** macOS can't show one uid's window in another's session
   (Screen Sharing streams a whole session, it doesn't relocate a window). Pick a lane: test/debug as dev (view via
-  Screen Sharing into dev's session), or `cowshed app promote` and run it as yourself.
-- **Gatekeeper blocks a promoted app.** It's ad-hoc-signed and `promote` needed `--force`. Sign with Developer-ID on the
-  dev side (dev holds the signing identity) so it installs and launches cleanly; or right-click-open once.
+  Screen Sharing into dev's session), or install a copy for yourself and run it as you (desktop.md).
+- **Gatekeeper blocks a copied app.** It's ad-hoc-signed. Sign with Developer-ID on the dev side (dev holds the signing
+  identity) so it launches cleanly; or right-click-open once.
 - **An agent can't launch a desktop app in my session.** Correct — there is no agent verb for it (unlike `--sim`, there
-  is deliberately no `--app open`). Agents test desktop apps as dev in dev's session; only the human `promote`s.
+  is deliberately no `--app open`). Agents test desktop apps as dev in dev's session; only the human installs a copy.

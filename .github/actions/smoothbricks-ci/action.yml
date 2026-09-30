@@ -42,7 +42,7 @@ runs:
         if [ "$resolved" = cowshed ] && ! command -v cowshed >/dev/null 2>&1; then
           echo "smoothbricks-ci: mode=cowshed but 'cowshed' is not on PATH." >&2
           echo "smoothbricks-ci: route this job to a [self-hosted, cowshed, zfs] runner, or use mode=auto/github." >&2
-          echo "smoothbricks-ci: see packages/cowshed/docs/ci.md#runner-host-setup" >&2
+          echo "smoothbricks-ci: see packages/cowshed/docs/ci.md" >&2
           exit 5
         fi
         echo "mode=$resolved" >>"$GITHUB_OUTPUT"

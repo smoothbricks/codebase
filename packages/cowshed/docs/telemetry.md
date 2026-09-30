@@ -2,34 +2,28 @@
 
 cowshed's observability is **distributed tracing into Arrow columns**, not a pile of text logs. Every lifecycle
 operation, every job, and every gateway request is a span; spans carry a W3C trace id across cowshed's boundaries; and
-they flush as Arrow segments you query with `cowshed logs` / `cowshed audit` / `cowshed trace`. There is one storage
-substrate ([lmao](https://github.com/smoothbricks)), no NDJSON files on disk, and no telemetry daemon. (Spec:
-`specs/cowshed/13_telemetry.md`.)
+they flush as Arrow segments under `/private/cowshed/store/telemetry/`. There is one storage format (lmao's Arrow trace
+schema), no NDJSON files on disk, and no telemetry daemon. (Spec: `specs/cowshed/13_telemetry.md`.)
 
 ## Why not a logfile
 
 Text logs record _that_ things happened. Columns make cowshed's behavior a **dataset** — the same artifact answers
-debugging (span waterfalls), security (audit joins), testing (trace assertions), and fleet ops. Concretely:
+debugging (span waterfalls), security (audit joins), and fleet ops. "What did this workspace try to reach, and what was
+denied?" is one query over the gateway's audit columns, not a grep across rotated files, and columnar audit is an order
+of magnitude smaller than the equivalent NDJSON.
 
-- `cowshed doctor --bench` reports real p50/p99 for `attach`/`clonefile`/`fsck` from every run ever recorded, not a
-  benchmark guess.
-- "What did this workspace try to reach, and what was denied?" is `cowshed audit --ws X` — one query, not a grep across
-  rotated files.
-- Retention is `cowshed gc` dropping whole day-segment files; columnar audit is an order of magnitude smaller than the
-  equivalent NDJSON.
+## Reading it
 
-## The three verbs
+cowshed has no reader verb for it: each segment is an Arrow IPC stream, readable with any Arrow library. The layout:
 
-```sh
-cowshed logs  [--ws X] [--kind lifecycle|job|grant|gc|…] [--since 1h] [--follow]   # controller telemetry
-cowshed audit [--ws X] [--denied] [--host H] [--follow]                            # gateway egress decisions
-cowshed trace <trace-id>                                                           # terminal span waterfall
+```
+/private/cowshed/store/telemetry/
+  <yyyy-mm-dd>/commitment-*.arrow   # controller commitments: lifecycle and job continuity records
+  gateway/<yyyy-mm-dd>/gateway-*.arrow   # gateway egress decisions, one event per decision
+  daemon-stderr.log, sccache-stderr.log  # launchd stderr of the two agents, for crashes before tracing starts
 ```
 
-Human tables by default; `--json` (one envelope) or `--ndjson` (one event per line) to pipe into `jq`. **NDJSON only
-ever exists on the pipe** — nothing writes it to disk. Under the hood these wrap the generic `lmao-inspect` reader over
-controller-owned Arrow segments in `/private/cowshed/store/telemetry/`. Those segments are compact continuity records,
-not a second copy of job stdout/stderr.
+Those segments are compact continuity records, not a second copy of job stdout/stderr.
 
 ## Tiered job authority and writers
 
@@ -96,7 +90,7 @@ cowshed uses W3C `traceparent`. Every entry point **mints or adopts** a trace:
   link back — from a gateway denial you can walk to which task cloned this workspace from which state of main.
 
 The payoff you'll feel most: **the grant-escalation loop is one trace.** A denial (exit 6), the worker asking its
-coordinator, the `grant`, and the retry are four events under one trace id — `cowshed trace <id>` shows the whole
+coordinator, the `grant`, and the retry are four events under one trace id — one filter on that id gives the whole
 negotiation instead of four disconnected log lines.
 
 ## Gateway attribution

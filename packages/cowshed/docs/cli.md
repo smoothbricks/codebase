@@ -530,11 +530,6 @@ $ echo $?
 Without such evidence, the child's ordinary exit code passes through untouched — cowshed never guesses a denial from
 output text. Failures of the exec wrapper itself use exit codes 100–106.
 
-### `cowshed shell <name>`
-
-Interactive shell inside the sandbox, same wiring as `exec`. Your prompt, direnv, and toolchains work normally; writes
-outside the granted set fail with EPERM.
-
 ### Dev servers inside workspaces
 
 On macOS, each workspace owns a **port block** allocated at creation — 64 ports for a new workspace; a workspace keeps
@@ -688,14 +683,6 @@ cowshed: workspace raven rekeyed at revision 8; quarantine entry <project>/quara
 next: cowshed attach raven
 ```
 
-### Simulators (iOS) — `cowshed sim export <name> [artifact]`
-
-Copies a built `.app` to the one-way drop dir (`<shared-drop-root>/<owner>/<repo>/`, using the separately validated
-components of the primary `repo_id`; stdout = the drop path) so the personal session can install it into the human's
-native Simulator.app — the artifact handoff for posture B. The in-image `xcrun` wrapper handles the rest of the
-simulator story (dev-local headless simulators by default; personal-session devices via `--sim` grants). The full
-walkthrough, Expo included, is [ios.md](ios.md).
-
 ## Sandbox grants
 
 ### `cowshed grant <name> [--read <path...>] [--write <path...>] [--egress <host>] [--opaque]`
@@ -720,12 +707,13 @@ next: cowshed exec raven -- <retry your command>
   planted beside the workspace mount so `../<name>` resolves (`<shed>/<org>/<project>/<name>` pointing at a sibling
   repository) sits inside the mount-root deny, and the profile carves the link back as a readable literal exactly when
   its target is granted — grant the target, and the workspace reaches it through the link.
-- Filesystem grants take effect at the next `exec`/`shell`: Seatbelt profiles are fixed at process launch, and every
-  launch carries the current persisted grant snapshot.
+- Filesystem grants take effect at the next `exec`: Seatbelt profiles are fixed at process launch, and every launch
+  carries the current persisted grant snapshot.
 - `--egress <host>` is repeatable and admits one host through the gateway, intercepted, on the default ports (443 and
-  80). Network reach is a separate decision from filesystem reach and a separately auditable one: the gateway logs every
-  admission (`cowshed audit`). Holding a credential for a registry does not grant reach to it, and granting reach does
-  not hand the workspace a credential — see [`cowshed credential`](#cowshed-credential-addlsstatusrm).
+  80). Network reach is a separate decision from filesystem reach and a separately auditable one: the gateway records
+  every admission in its Arrow audit telemetry ([telemetry.md](telemetry.md)). Holding a credential for a registry does
+  not grant reach to it, and granting reach does not hand the workspace a credential — see
+  [`cowshed credential`](#cowshed-credential-addlsstatusrm).
 - `--opaque` grants the invocation's `--egress` hosts as opaque tunnels instead: the gateway forwards encrypted bytes
   with host-only audit and no injection, and the client verifies the real certificate. It is for clients that cannot
   trust the workspace CA — certificate-pinning clients, and Go on macOS
@@ -777,28 +765,11 @@ Never touches main's checked-out branch.
 
 ```
 $ cowshed push raven
-cowshed: pushed cowshed/raven -> host (9 commits, 6f3a2c1..9b2e77d)
-next: merge in main when ready; new workspaces are warm from whatever main has built
-cowshed/raven
+refs/cowshed/raven/heads/cowshed/raven	9b2e77d4c1…
 ```
 
-A background autosave (a per-project launchd agent, host-side like `push`) fetches every workspace into
-`refs/cowshed/<name>/wip` every 10 minutes — uncommitted work is the only thing at risk between autosaves, because the
+Stdout is the preserved ref and the commit it names. Nothing preserves a workspace's work but `push` and `land`: the
 store volume that holds the images is excluded from backup (durability = git).
-
-### `cowshed repo mirror <url>` / `cowshed repo clone <url> [dir]`
-
-How third-party code gets into a workspace — the `gh repo clone` of the sandbox. `mirror` asks the gateway to fetch the
-repository (with its Keychain credentials, subject to the workspace's repo grants, one audit line) into a shared bare
-mirror on the caches volume, and prints the mirror path. `clone` is the sugar: mirror, then a local `git clone` from
-that path into the workspace. Mirrors are fetch-only, deduplicated fleet-wide, and read-only for sandboxes; re-run
-`mirror` to refresh.
-
-```
-$ cowshed exec raven -- cowshed repo clone https://github.com/tinylibs/tinybench
-cowshed: mirror /private/cowshed/caches/repo-mirrors/github.com/tinylibs/tinybench.git (fetched via gateway)
-tinybench
-```
 
 ### `cowshed rebase [<name>] [--onto <rev> | --into <lane>]`
 
@@ -869,7 +840,7 @@ Restore swaps the current image for the checkpoint (detach → clone → reattac
 incarnation. Protected content remains authoritative for the restored snapshot's origin boundary; the restored marker
 records the lineage, and the controller's audit record of the restore carries the hashes. Restore refuses over unsaved
 work (exit 4); the displaced image is kept as a `pre-restore-<timestamp>` checkpoint, so a restore is itself undoable.
-List checkpoints with `cowshed ls --json` or `cowshed du`.
+List checkpoints with `cowshed ls --json`.
 
 ```
 $ cowshed checkpoint raven pre-refactor
@@ -1063,32 +1034,6 @@ file, which `setup` writes and owns (see [`cowshed setup`](#cowshed-setup---unin
 check that the file took effect: `Cache location` must read `Local disk: "/private/cowshed/caches/sccache"`. It reports
 the resolved configuration without starting a server, so it is safe to run against a live host.
 
-### `cowshed du`
-
-Copy-on-write-aware usage: written vs referenced bytes per workspace and per checkpoint — "written" is the true cost,
-"referenced" is shared with main. `--json` for dashboards and automation.
-
-### `cowshed logs` / `cowshed audit` / `cowshed trace`
-
-cowshed's telemetry is distributed tracing into Arrow columns, not a text logfile (see [telemetry.md](telemetry.md)) —
-these three verbs read it, human tables by default, `--json`/`--ndjson` to pipe:
-
-```
-$ cowshed logs --ws raven --kind lifecycle --since 1h   # lifecycle/op spans for one workspace
-$ cowshed audit --denied --follow                       # live egress denials across the fleet
-$ cowshed trace 4bf92f35a3…                             # terminal waterfall of one op/exec/land
-```
-
-There is no `.ndjson` or `.log` file to `tail`; `--ndjson` is an export encoding on the pipe. Under the hood these wrap
-the generic `lmao-inspect` reader over the Arrow segments in `/private/cowshed/store/telemetry/`.
-
-### `cowshed mcp serve`
-
-Runs the MCP server (stdio, or a shared Unix socket) exposing workspaces as tools for agent harnesses. Coordinator
-authority arrives only through a dedicated inherited FD/socketpair and is never printed on stderr or placed in argv or
-environment. Worker connections redeem short-lived one-use descriptors and can run or observe only their bound
-workspace.
-
 ### `cowshed controller`
 
 Serves one coordinator controller connection, for the project selected by the cwd or `--project`, to the embedding
@@ -1107,10 +1052,10 @@ Safe to run anytime; `rm`, `land`, and `restore` also run it opportunistically.
 ### `cowshed doctor`
 
 Invariant checks: every image has a marker, every mount matches an image, grants files parse, caches volume and gateway
-reachable, autosave fresh, and git identity at the workspace mount root matches the checkout (`includeIf gitdir:` files
-that would not apply under the mount root). Exit 0 when healthy; otherwise the code of the most severe finding (3/4/5).
-Stdout is `healthy` or `unhealthy`. Stderr is every finding, then the distinct `next:` commands those findings carry —
-findings first, hints after, never interleaved.
+reachable, and git identity at the workspace mount root matches the checkout (`includeIf gitdir:` files that would not
+apply under the mount root). Exit 0 when healthy; otherwise the code of the most severe finding (3/4/5). Stdout is
+`healthy` or `unhealthy`. Stderr is every finding, then the distinct `next:` commands those findings carry — findings
+first, hints after, never interleaved.
 
 If a selected project's checks cannot run, doctor records an error finding named `project-checks-skipped`; it never
 turns missing evidence into `healthy: true`.

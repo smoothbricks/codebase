@@ -22,7 +22,7 @@ chooses one.
 | Shared caches (Cargo, sccache, zig, Gradle, Go, Nix)     | `<pool>/cowshed/caches`, mounted at `/private/cowshed/caches`                                       |
 | Gateway registry/repository mirrors                      | `mirror/` and `repo-mirrors/` on caches; gateway-owned, sandbox-read-only                           |
 | Bindings, trusted policy, grants, waivers, gateway state | `<pool>/cowshed/store` at `/private/cowshed/store`; policy is `<owner>/<repo>/policy.json`          |
-| Telemetry + gateway audit (Arrow segments)               | `/private/cowshed/store/telemetry/` (`cowshed logs`/`audit`/`trace`) — same as macOS                |
+| Telemetry + gateway audit (Arrow segments)               | `/private/cowshed/store/telemetry/` — same as macOS                                                 |
 | Linux gateway data plane                                 | per-incarnation Unix socket plus private-netns connector at `127.0.0.1:7644`; no `portBlock`        |
 | Secrets                                                  | secret-service (GNOME Keyring/KWallet), service `dev.cowshed.gateway`                               |
 
@@ -76,7 +76,7 @@ $ cowshed new raven
 cowshed: snapshot rpool/cowshed/projects/acme/widget/main@cowshed:raven
 cowshed: cloned to ws/raven (copy-on-write)
 cowshed: branch cowshed/raven created from main @ 6f3a2c1
-next: cowshed shell raven
+next: cowshed exec raven -- <cmd>
 <mount-root>/acme/widget/raven
 ```
 

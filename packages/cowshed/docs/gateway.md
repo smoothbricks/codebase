@@ -60,7 +60,8 @@ Five jobs:
    `install` (drop-directory artifact, human-gated). Personal-device `list` and `boot` remain dev-side controller
    actions; dev-side headless simulators never use the gateway.
 
-Every decision is auditable in Arrow telemetry under `/private/cowshed/store/telemetry/`; read it with `cowshed audit`.
+Every decision is auditable in Arrow telemetry under `/private/cowshed/store/telemetry/gateway/`
+([telemetry.md](telemetry.md)).
 
 ## Start at login (launchd)
 
@@ -221,26 +222,14 @@ trust wiring, opaque fallback for pinned clients, and gateway visibility into in
 
 ## Reading the audit events
 
-One event per decision. `cowshed audit` renders human tables; `--ndjson` gives you lines to pipe (the storage itself is
-Arrow — NDJSON only ever exists on the pipe):
+One event per decision, written as Arrow segments under `/private/cowshed/store/telemetry/gateway/<yyyy-mm-dd>/`.
+cowshed has no reader verb for it: each segment is an Arrow IPC stream, readable with any Arrow library, for example:
 
 ```sh
-$ cowshed audit --ws raven --ndjson | head -2
-{"ts":"2026-07-11T14:22:09Z","ws":"raven","rev":7,"kind":"npm",
- "name":"react-native","status":200,"cache":"hit","bytes":812443}
-{"ts":"2026-07-11T14:23:41Z","ws":"raven","rev":7,"kind":"connect",
- "host":"fixtures.internal.example:443","status":"denied","reason":"no egress grant"}
-```
-
-Useful one-liners:
-
-```sh
-# what did agents talk to today, and how often?
-cowshed audit --ndjson --since 1d | jq -r 'select(.status!="denied") | .host // .name' | sort | uniq -c | sort -rn
-# recent denials with the workspace that triggered them
-cowshed audit --denied --ndjson | jq -rc '[.ts,.ws,.host] | @tsv' | tail
-# live tail while an agent works
-cowshed audit --follow
+python3 -c 'import glob, pyarrow as pa, pyarrow.ipc as ipc
+day = sorted(glob.glob("/private/cowshed/store/telemetry/gateway/2026-09-30/*.arrow"))
+t = pa.concat_tables(ipc.open_stream(f).read_all() for f in day)
+print(t.slice(max(t.num_rows - 5, 0)))'
 ```
 
 ## Offline behavior

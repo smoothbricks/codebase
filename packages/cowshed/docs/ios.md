@@ -57,8 +57,9 @@ agent cannot approve or automate it. An optional path watcher may notify the hum
 MUST NOT call `simctl install`, invoke broker `install`, launch, or relaunch an app.
 
 **Native rebuilds** (new native module, config-plugin change) are the only recurring handoff:
-`cowshed exec raven -- npx expo run:ios` builds the new dev client dev-side and `cowshed sim export raven` stages it.
-The personal-side human then reviews and installs it; a watcher may only notify or stage.
+`cowshed exec raven -- npx expo run:ios` builds the new dev client dev-side; copy the built `.app` into the drop dir to
+stage it (no cowshed verb stages it). The personal-side human then reviews and installs it; a watcher may only notify or
+stage.
 
 Bare React Native and Flutter get the same loop through the same wrapper — they all drive simulators via `xcrun`.
 
@@ -78,13 +79,13 @@ Bare React Native and Flutter get the same loop through the same wrapper — the
 - Native debugging: lldb runs dev-side against a dev-side headless simulator; `simctl io` screenshots/recordings and idb
   streaming give agents (and you, in a pinch) eyes on it.
 - App logs from _your_ simulator: `log stream` on your side, or app instrumentation streaming traces to a dev-side
-  collector over loopback (`cowshed logs` shows them — telemetry.md).
+  collector over loopback.
 
 ## When it fights you
 
 - A tool only sees dev-local simulators → it spawned `/usr/bin/xcrun` directly, bypassing the wrapper. That's the safe
-  default (your session is unreachable that way); use `cowshed sim export` + your side's `simctl`, or fix the tool's
-  PATH.
+  default (your session is unreachable that way); copy the `.app` to the drop dir and use your side's `simctl`, or fix
+  the tool's PATH.
 - `cowshed: sim broker unreachable` (exit 5) → you're not logged in, or the broker launch agent isn't loaded — `next:`
   names the `launchctl` kickstart.
 - Xcode-heavy day (Interface Builder, Instruments all afternoon)? Just work in the dev session (posture B1) — the

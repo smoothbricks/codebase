@@ -150,8 +150,8 @@ terminal state after process-group termination and pipe drain, never silent trun
 
 Every workspace starts closed: writes limited to its own volume, designated cache subtrees, and temp; network limited to
 your own gateway listener (whose registry mirrors — npm, crates.io — are baseline policy, warm and credentialed, so
-builds and installs work out of the box with zero grants). Third-party repositories arrive through
-`cowshed repo clone <url>`, which the gateway mirrors on your behalf. Need a dev server? Bind it to a port from
+builds and installs work out of the box with zero grants). Third-party repositories arrive by `git clone` over an
+intercepted egress grant for their host, which admits fetch and refuses push. Need a dev server? Bind it to a port from
 `$COWSHED_PORT_BASE + 1` up — each workspace owns a block of `$COWSHED_PORT_BLOCK_SIZE` ports from its gateway base
 (`$COWSHED_PORT_BASE`), reachable from the host browser container-style and guaranteed not to collide with sibling
 workspaces.
@@ -172,8 +172,8 @@ The correct agent behavior on exit 6:
 1. Do **not** silently self-grant if you hold the authority to; surface the `next:` line to the operator or the
    coordinating agent as a permission request.
 2. Once granted, retry the _original_ command (filesystem grants apply from the next exec).
-3. Treat grants as scoped to the task: they die with the workspace, and `cowshed revoke <ws> --all` returns to closed if
-   you widened temporarily.
+3. Treat grants as scoped to the task: they die with the workspace. The CLI has no revoke, so widen only as far as the
+   task needs.
 
 Not every denial is diagnosable: a deep child process blocked by the sandbox may surface only as its own nonzero exit,
 passed through unchanged. If a command fails writing outside your volume or reaching the network and there was no exit
@@ -200,15 +200,15 @@ This is cowshed's layered capability model: the trusted coordinator holds policy
 - No direct internet. The gateway's mirrors make registry traffic invisible to you; arbitrary hosts need an egress
   grant. Credentials are injected upstream by the gateway — there are no tokens inside the workspace to find, and no
   `.env` files.
-- No remote git. Your repo has exactly the local `main` remote and whatever mirrors `cowshed repo clone` brought in;
-  pushing to origin/GitHub is the coordinator's job, host-side.
+- No pushing. Your repo's own remote is the local `main`; git can fetch from a host you hold an egress grant for, but
+  the gateway refuses every push, and pushing to origin/GitHub is the coordinator's job, host-side.
 - No reaching the human's simulator. iOS test loops run on **dev-side headless simulators** (`--preset simulator`;
   `simctl`, XCUITest, `simctl io` screenshots). The personal-session simulator is reachable only through `--sim` grants
-  the coordinator gives you — `install` is human-gated per artifact by design ([ios.md](ios.md)); ship builds with
-  `cowshed sim export` and let the human pull them in.
+  the coordinator gives you — `install` is human-gated per artifact by design ([ios.md](ios.md)); the human installs
+  your builds from their side.
 - Desktop apps: test them **in dev's own session** — run the built `.app` and drive it via accessibility APIs /
-  AppleScript (no grant, same uid). You cannot launch an app in the human's session; there is no verb for it. Ship a
-  build with `cowshed app export` — the human runs `cowshed app promote` to use it ([desktop.md](desktop.md)).
+  AppleScript (no grant, same uid). You cannot launch an app in the human's session; there is no verb for it, and no
+  cowshed verb hands a build over either ([desktop.md](desktop.md)).
 - No mutating cowshed's own state files: markers are informational, grants live outside your volume.
 
 ## Coordinator and worker connections

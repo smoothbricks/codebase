@@ -133,22 +133,22 @@ retry without duplicating or wedging the operation.
 
 ## The cache model in one paragraph
 
-Downloads happen once, ever: the gateway mirrors npm, cargo, and Go module registries (and, via `cowshed repo`, git
-repositories) and caches artifacts in `/private/cowshed/caches`. On macOS each workspace's clients use its own localhost
-`portBlock.base`; on Linux, where no port block exists, ordinary Bun/Cargo/Go and proxy-aware clients use
-`http://127.0.0.1:7644` inside their private netns. A trusted per-workspace connector forwards those bytes only to the
-mounted per-workspace Unix gateway socket, which remains the primary endpoint identity. Shared caches live under
-`/private/cowshed/caches`: Cargo uses distinct writable `cargo/{registry,git}` directories; Bun's global install cache
-is `bun/install/cache`; uv's is `uv`; Go uses `go/{mod,build}` and ttsc `ttsc`; Nix uses `nix/{cache,state}`; sccache,
-zig, and Gradle have named roots. `cowshed setup --imperative-host-setup` moves the host's own caches there and links
-them back, and from then on every sandbox uses the host's own paths — `CARGO_HOME=~/.cargo`,
-`BUN_INSTALL_CACHE_DIR=~/.bun/install/cache`, `UV_CACHE_DIR=~/.cache/uv`. One literal path is what makes sharing work:
-cargo fingerprints a dependency by the absolute path of its source under `$CARGO_HOME`, so a clone's copied `target/`
-stays fresh only against the same path, and Bun's isolated linker writes its cache path into every `node_modules/.bun`
-link, so main's `node_modules` and every clone's resolve only against the same cache. A crate or package anything on the
-host has already downloaded installs offline in every workspace. Gateway artifacts are not tool caches: registry objects
-live under `mirror/` and bare repository mirrors under `repo-mirrors/`, both gateway-owned and read-only to workspaces.
-On declarative hosts, the system/home-manager module owns all relocations, including `~/.cache/nix → nix/cache` and
+Downloads happen once, ever: the gateway mirrors npm, cargo, and Go module registries and caches artifacts in
+`/private/cowshed/caches`. On macOS each workspace's clients use its own localhost `portBlock.base`; on Linux, where no
+port block exists, ordinary Bun/Cargo/Go and proxy-aware clients use `http://127.0.0.1:7644` inside their private netns.
+A trusted per-workspace connector forwards those bytes only to the mounted per-workspace Unix gateway socket, which
+remains the primary endpoint identity. Shared caches live under `/private/cowshed/caches`: Cargo uses distinct writable
+`cargo/{registry,git}` directories; Bun's global install cache is `bun/install/cache`; uv's is `uv`; Go uses
+`go/{mod,build}` and ttsc `ttsc`; Nix uses `nix/{cache,state}`; sccache, zig, and Gradle have named roots.
+`cowshed setup --imperative-host-setup` moves the host's own caches there and links them back, and from then on every
+sandbox uses the host's own paths — `CARGO_HOME=~/.cargo`, `BUN_INSTALL_CACHE_DIR=~/.bun/install/cache`,
+`UV_CACHE_DIR=~/.cache/uv`. One literal path is what makes sharing work: cargo fingerprints a dependency by the absolute
+path of its source under `$CARGO_HOME`, so a clone's copied `target/` stays fresh only against the same path, and Bun's
+isolated linker writes its cache path into every `node_modules/.bun` link, so main's `node_modules` and every clone's
+resolve only against the same cache. A crate or package anything on the host has already downloaded installs offline in
+every workspace. Gateway artifacts are not tool caches: registry objects live under `mirror/` and bare repository
+mirrors under `repo-mirrors/`, both gateway-owned and read-only to workspaces. On declarative hosts, the
+system/home-manager module owns all relocations, including `~/.cache/nix → nix/cache` and
 `~/.local/state/nix → nix/state`; cowshed only validates them. `cowshed setup --imperative-host-setup` is an explicit
 exception for non-declarative hosts, never an automatic fallback after declarative validation fails.
 
