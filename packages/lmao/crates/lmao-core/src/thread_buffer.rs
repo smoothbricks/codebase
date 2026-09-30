@@ -4,18 +4,26 @@
 //! Every span on the thread appends into the same fixed-capacity column blocks;
 //! parentage is carried as `(parent_thread_id, parent_span_id)` values, so a
 //! child remains linkable after its parent has completed or after a flush.
+//!
+//! Schema attributes live in [`AttributeCells`]: one stable allocation per
+//! block that a foreign writer may view and store into directly. The row
+//! lifecycle — opening, appending, completing, stamping, identity — stays on
+//! this type's methods, so a foreign writer can name a value but never a row's
+//! identity or entry type.
+//!
+//! Blocks are recycled, never freed while the store lives: [`Self::reset`] and
+//! [`Self::retain_open`] keep every block's allocations, so the addresses a
+//! foreign writer viewed stay valid and a flushed store writes again without
+//! allocating.
 
 use crate::arena::{ArenaFull, StringArena, TextInput};
-use crate::columns::{
-    BoolColumn, EnumColumn, F64Column, FieldMeta, FieldStrategy, NumColumn, SharedStr, StrColumn,
-    U64Column,
-};
+use crate::attribute_cells::AttributeCells;
+use crate::columns::{FieldMeta, FieldStrategy, SharedStr};
 use crate::entry_type::EntryType;
 use crate::identity::{SpanIdentity, TraceId};
 use crate::packed_header::{VocabularyId, pack_dynamic, pack_static};
 use crate::scope::{ScopeEntry, ScopeValue, SpanScope};
 use crate::tuning::{MAX_CAPACITY, MAX_STRING_ARENA_BYTES, MIN_CAPACITY};
-use std::borrow::Cow;
 use std::collections::HashMap;
 
 use crate::thread_kinds::{
@@ -30,7 +38,7 @@ use crate::thread_schema::SYSTEM_COLUMN_COUNT;
 /// [`ThreadSpanBuffer::intern`] issued, not a string, so handing a value to the
 /// row store neither allocates nor touches a refcount. Callers holding bytes
 /// intern once and then write integers, which is the shape the ABI already
-/// takes — `intern` then `writeAttr`.
+/// takes — `intern`, then a cell store.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ColumnValue {
     Number(f64),
@@ -70,129 +78,88 @@ pub enum ColumnValueRef<'a> {
     Enum(u16),
 }
 
-#[derive(Debug)]
-enum AttributeColumn {
-    Number(F64Column),
-    Uint64(U64Column),
-    Boolean(BoolColumn),
-    Text(StrColumn),
-    Enum(EnumColumn),
-}
-
-impl AttributeColumn {
-    fn from_strategy(strategy: FieldStrategy) -> Self {
-        match strategy {
-            FieldStrategy::Number => Self::Number(NumColumn::new()),
-            FieldStrategy::Uint64 => Self::Uint64(NumColumn::new()),
-            FieldStrategy::Boolean => Self::Boolean(NumColumn::new()),
-            FieldStrategy::Category | FieldStrategy::Text => Self::Text(StrColumn::new()),
-            FieldStrategy::Enum(_) => Self::Enum(NumColumn::new()),
-        }
-    }
-
-    fn set(
-        &mut self,
-        row: usize,
-        capacity: usize,
-        value: ColumnCell,
-        ordinal: u16,
-        strategy: FieldStrategy,
-    ) -> Result<(), ThreadBufferError> {
-        match (self, value) {
-            (Self::Number(column), ColumnCell::Number(value)) => column.set(row, capacity, value),
-            (Self::Uint64(column), ColumnCell::Uint64(value)) => column.set(row, capacity, value),
-            (Self::Boolean(column), ColumnCell::Boolean(value)) => column.set(row, capacity, value),
-            (Self::Text(column), ColumnCell::Text(value)) => column.set(row, capacity, value),
-            (Self::Enum(column), ColumnCell::Enum(value)) => {
-                if let FieldStrategy::Enum(values) = strategy
-                    && usize::from(value) >= values.len()
-                {
-                    return Err(ThreadBufferError::EnumOutOfRange {
-                        ordinal,
-                        index: value,
-                        variants: values.len(),
-                    });
-                }
-                column.set(row, capacity, value)
-            }
-            (_, value) => {
-                return Err(ThreadBufferError::AttributeTypeMismatch {
+/// Encode a caller value as the cell `strategy` stores, or refuse a value of
+/// the wrong kind. Text must be an ordinal this store's arena issued.
+fn encode_cell(
+    strategy: FieldStrategy,
+    value: ColumnValue,
+    ordinal: u16,
+    arena: &StringArena,
+) -> Result<u64, ThreadBufferError> {
+    match (strategy, value) {
+        (FieldStrategy::Number, ColumnValue::Number(value)) => Ok(value.to_bits()),
+        (FieldStrategy::Uint64, ColumnValue::Uint64(value)) => Ok(value),
+        (FieldStrategy::Boolean, ColumnValue::Boolean(value)) => Ok(u64::from(value)),
+        (FieldStrategy::Category | FieldStrategy::Text, ColumnValue::Text(id)) => arena
+            .get(id)
+            .map(|_| u64::from(id))
+            .ok_or(ThreadBufferError::InvalidColumnOrdinal(ordinal)),
+        (FieldStrategy::Enum(variants), ColumnValue::Enum(index)) => {
+            if usize::from(index) < variants.len() {
+                Ok(u64::from(index))
+            } else {
+                Err(ThreadBufferError::EnumOutOfRange {
                     ordinal,
-                    expected: strategy.kind(),
-                    actual: value.kind(),
-                });
+                    index,
+                    variants: variants.len(),
+                })
             }
         }
-        Ok(())
-    }
-
-    fn get<'a>(&self, row: usize, arena: &'a StringArena) -> Option<ColumnValueRef<'a>> {
-        match self {
-            Self::Number(column) => column.get(row).map(ColumnValueRef::Number),
-            Self::Uint64(column) => column.get(row).map(ColumnValueRef::Uint64),
-            Self::Boolean(column) => column.get(row).map(ColumnValueRef::Boolean),
-            Self::Text(column) => column.get(row, arena).map(ColumnValueRef::Text),
-            Self::Enum(column) => column.get(row).map(ColumnValueRef::Enum),
-        }
-    }
-
-    /// Fill unset slots in `start..end`. Scope materialization is the only
-    /// caller, and it has already resolved its text into this store's arena, so
-    /// this shares [`Self::set`]'s cell type rather than matching `ScopeValue`
-    /// a second time.
-    fn fill_range(
-        &mut self,
-        start: usize,
-        end: usize,
-        capacity: usize,
-        value: ColumnCell,
-    ) -> Result<usize, ()> {
-        match (self, value) {
-            (Self::Number(column), ColumnCell::Number(value)) => {
-                Ok(column.fill_unset_range(start, end, capacity, value))
-            }
-            (Self::Uint64(column), ColumnCell::Uint64(value)) => {
-                Ok(column.fill_unset_range(start, end, capacity, value))
-            }
-            (Self::Boolean(column), ColumnCell::Boolean(value)) => {
-                Ok(column.fill_unset_range(start, end, capacity, value))
-            }
-            (Self::Text(column), ColumnCell::Text(value)) => {
-                Ok(column.fill_unset_range(start, end, capacity, value))
-            }
-            (Self::Enum(column), ColumnCell::Enum(value)) => {
-                Ok(column.fill_unset_range(start, end, capacity, value))
-            }
-            _ => Err(()),
-        }
+        (strategy, value) => Err(ThreadBufferError::AttributeTypeMismatch {
+            ordinal,
+            expected: strategy.kind(),
+            actual: value.kind(),
+        }),
     }
 }
 
-/// A [`ColumnValue`] whose text has been resolved to the cell the column stores.
-///
-/// The split is the input/storage split: a caller names text by intern ordinal
-/// or by `&str`, the store names it by [`SharedStr`]. Resolution happens once,
-/// at the buffer boundary, where the arena is in scope.
-#[derive(Debug, Clone, Copy)]
-enum ColumnCell {
-    Number(f64),
-    Uint64(u64),
-    Boolean(bool),
-    Text(SharedStr),
-    Enum(u16),
+/// Decode a stored cell. Total on purpose: a foreign writer may have stored any
+/// bit pattern, so a text ordinal the arena never issued, or an enum index
+/// outside the variants, reads as absent rather than as a value — and never
+/// as a panic.
+fn decode_cell(
+    strategy: FieldStrategy,
+    cell: u64,
+    arena: &StringArena,
+) -> Option<ColumnValueRef<'_>> {
+    match strategy {
+        FieldStrategy::Number => Some(ColumnValueRef::Number(f64::from_bits(cell))),
+        FieldStrategy::Uint64 => Some(ColumnValueRef::Uint64(cell)),
+        FieldStrategy::Boolean => Some(ColumnValueRef::Boolean(cell != 0)),
+        FieldStrategy::Category | FieldStrategy::Text => u32::try_from(cell)
+            .ok()
+            .and_then(|id| arena.get(id))
+            .map(ColumnValueRef::Text),
+        FieldStrategy::Enum(variants) => u16::try_from(cell)
+            .ok()
+            .filter(|index| usize::from(*index) < variants.len())
+            .map(ColumnValueRef::Enum),
+    }
 }
 
-impl ColumnCell {
-    #[inline]
-    const fn kind(self) -> ColumnValueKind {
-        match self {
-            Self::Number(_) => ColumnValueKind::Number,
-            Self::Uint64(_) => ColumnValueKind::Uint64,
-            Self::Boolean(_) => ColumnValueKind::Boolean,
-            Self::Text(_) => ColumnValueKind::Text,
-            Self::Enum(_) => ColumnValueKind::Enum,
+/// The cell a scope value fills, interning text into this store's arena once
+/// per fill. `Ok(None)` is a scope value whose kind does not match the column.
+fn scope_cell(
+    strategy: FieldStrategy,
+    value: &ScopeValue,
+    arena: &mut StringArena,
+) -> Result<Option<u64>, ThreadBufferError> {
+    Ok(match (strategy, value) {
+        (FieldStrategy::Number, ScopeValue::Number(value)) => Some(value.to_bits()),
+        (FieldStrategy::Uint64, ScopeValue::Uint64(value)) => Some(*value),
+        (FieldStrategy::Boolean, ScopeValue::Boolean(value)) => Some(u64::from(*value)),
+        (FieldStrategy::Enum(variants), ScopeValue::EnumIndex(index))
+            if usize::from(*index) < variants.len() =>
+        {
+            Some(u64::from(*index))
         }
-    }
+        (FieldStrategy::Category | FieldStrategy::Text, ScopeValue::Text(text)) => Some(u64::from(
+            arena
+                .intern(text.as_ref())
+                .map_err(ThreadBufferError::StringArenaFull)?,
+        )),
+        _ => None,
+    })
 }
 struct RowInput {
     timestamp: i64,
@@ -227,12 +194,12 @@ struct ThreadSpanBlock {
     parent_thread_ids: Vec<u64>,
     parent_span_ids: Vec<u32>,
     lines: Vec<u32>,
-    messages: StrColumn,
-    attributes: Vec<AttributeColumn>,
+    messages: Vec<Option<SharedStr>>,
+    attributes: AttributeCells,
 }
 
 impl ThreadSpanBlock {
-    fn new(capacity: usize, fields: &'static [FieldMeta]) -> Self {
+    fn new(capacity: usize, field_count: usize) -> Self {
         Self {
             capacity,
             rows: 0,
@@ -243,11 +210,8 @@ impl ThreadSpanBlock {
             parent_thread_ids: vec![0; capacity],
             parent_span_ids: vec![0; capacity],
             lines: vec![0; capacity],
-            messages: StrColumn::new(),
-            attributes: fields
-                .iter()
-                .map(|field| AttributeColumn::from_strategy(field.strategy))
-                .collect(),
+            messages: vec![None; capacity],
+            attributes: AttributeCells::new(field_count, capacity),
         }
     }
     #[inline]
@@ -263,11 +227,34 @@ impl ThreadSpanBlock {
         self.parent_thread_ids[row] = input.parent_thread_id;
         self.parent_span_ids[row] = input.parent_span_id;
         self.lines[row] = input.line;
-        if let Some(message) = input.message {
-            self.messages.set(row, self.capacity, message);
-        }
+        // Always stored, `None` included: a recycled block still holds the
+        // previous window's cells, and a row without a message must not read
+        // one of theirs.
+        self.messages[row] = input.message;
         self.rows += 1;
         row
+    }
+    /// The system cells of `row`, for moving the row elsewhere.
+    fn row_input(&self, row: usize) -> RowInput {
+        RowInput {
+            timestamp: self.timestamps[row],
+            trace_id: self.trace_ids[row]
+                .clone()
+                .expect("a written row carries its trace id"),
+            header: self.headers[row],
+            span_id: self.span_ids[row],
+            parent_thread_id: self.parent_thread_ids[row],
+            parent_span_id: self.parent_span_ids[row],
+            message: self.messages[row],
+            line: self.lines[row],
+        }
+    }
+    /// Forget rows `start..` while keeping every allocation.
+    fn truncate(&mut self, start: usize) {
+        self.rows = self.rows.min(start);
+        self.trace_ids[start..].fill(None);
+        self.messages[start..].fill(None);
+        self.attributes.clear_from(start);
     }
 }
 
@@ -344,7 +331,11 @@ pub struct ThreadSpanBuffer {
     thread_id: u64,
     capacity: usize,
     fields: &'static [FieldMeta],
+    /// Every block this store has allocated. Blocks `..active_blocks` hold
+    /// rows; the rest are recycled and empty, kept so their attribute cells
+    /// keep the addresses a foreign writer viewed.
     blocks: Vec<ThreadSpanBlock>,
+    active_blocks: usize,
     row_count: usize,
     next_span_id: u32,
     spans: HashMap<u32, SpanRecord>,
@@ -367,25 +358,32 @@ impl ThreadSpanBuffer {
             capacity,
             fields,
             blocks: Vec::new(),
+            active_blocks: 1,
             row_count: 0,
             next_span_id: 1,
             spans: HashMap::with_capacity(capacity / 2),
             scopes: HashMap::with_capacity(capacity / 2),
             arena: StringArena::new(MAX_STRING_ARENA_BYTES),
         };
-        buffer.blocks.push(ThreadSpanBlock::new(capacity, fields));
+        buffer
+            .blocks
+            .push(ThreadSpanBlock::new(capacity, fields.len()));
         buffer
     }
-    /// Release every row and span, keeping the interned vocabulary.
+    /// Release every row and span, keeping the interned vocabulary and every
+    /// block's allocation.
     ///
     /// The buffer is per-thread and long-lived: without this, a process that
     /// traces forever grows the row store forever. Vocabulary ids survive on
     /// purpose — they are handed out to callers that cache them, and
-    /// `intern` guarantees a stable id for the buffer's lifetime.
+    /// `intern` guarantees a stable id for the buffer's lifetime. Blocks
+    /// survive so the next window writes without allocating and so a foreign
+    /// writer's views of their attribute cells stay valid.
     pub fn reset(&mut self) {
-        self.blocks.clear();
-        self.blocks
-            .push(ThreadSpanBlock::new(self.capacity, self.fields));
+        for block in &mut self.blocks[..self.active_blocks] {
+            block.truncate(0);
+        }
+        self.active_blocks = 1;
         self.row_count = 0;
         self.next_span_id = 1;
         self.spans.clear();
@@ -472,13 +470,12 @@ impl ThreadSpanBuffer {
         }
     }
     fn ensure_rows(&mut self, count: usize) {
-        if self
-            .blocks
-            .last()
-            .is_none_or(|block| block.remaining() < count)
-        {
-            self.blocks
-                .push(ThreadSpanBlock::new(self.capacity, self.fields));
+        if self.blocks[self.active_blocks - 1].remaining() < count {
+            if self.active_blocks == self.blocks.len() {
+                self.blocks
+                    .push(ThreadSpanBlock::new(self.capacity, self.fields.len()));
+            }
+            self.active_blocks += 1;
         }
     }
     fn allocate_span_id(&mut self) -> u32 {
@@ -495,14 +492,10 @@ impl ThreadSpanBuffer {
     }
     fn append_row(&mut self, input: RowInput) -> u32 {
         self.ensure_rows(1);
-        let block = self
-            .blocks
-            .last_mut()
-            .expect("thread buffer always has a block");
-        let row = block.write_row(input);
+        let block_index = self.active_blocks - 1;
+        let row = self.blocks[block_index].write_row(input);
         self.row_count += 1;
-        u32::try_from((self.blocks.len() - 1) * self.capacity + row)
-            .expect("thread buffer rows fit u32")
+        u32::try_from(block_index * self.capacity + row).expect("thread buffer rows fit u32")
     }
 
     /// Open a dynamic-name span. The completion row is reserved immediately, matching the legacy row-0/row-1 shape; end methods overwrite it later.
@@ -696,10 +689,9 @@ impl ThreadSpanBuffer {
         message: TextInput<'_>,
     ) -> Result<(), ThreadBufferError> {
         let message = self.cell(message)?;
-        let capacity = self.capacity;
         let record = self.record(span_id)?;
         let (block, row) = self.block_at_mut(record.completion_row as usize)?;
-        block.messages.set(row, capacity, message);
+        block.messages[row] = Some(message);
         Ok(())
     }
     pub fn append_log(
@@ -819,31 +811,10 @@ impl ThreadSpanBuffer {
             .get(index)
             .ok_or(ThreadBufferError::InvalidColumnOrdinal(ordinal))?
             .strategy;
-        // Resolve the caller's intern ordinal into a cell BEFORE borrowing the
-        // block: the arena and the blocks are disjoint fields, but only the
-        // sequencing makes that visible to the borrow checker.
-        let value = self.column_cell(value, ordinal)?;
-        let capacity = self.capacity;
-        let (block, local) = self.block_at_mut(row as usize)?;
-        block.attributes[index].set(local, capacity, value, ordinal, strategy)
-    }
-    /// Turn a caller-supplied [`ColumnValue`] into the cell a column stores.
-    #[inline]
-    fn column_cell(
-        &self,
-        value: ColumnValue,
-        ordinal: u16,
-    ) -> Result<ColumnCell, ThreadBufferError> {
-        Ok(match value {
-            ColumnValue::Number(value) => ColumnCell::Number(value),
-            ColumnValue::Uint64(value) => ColumnCell::Uint64(value),
-            ColumnValue::Boolean(value) => ColumnCell::Boolean(value),
-            ColumnValue::Enum(value) => ColumnCell::Enum(value),
-            ColumnValue::Text(intern_ordinal) => ColumnCell::Text(
-                self.interned_cell(intern_ordinal)
-                    .ok_or(ThreadBufferError::InvalidColumnOrdinal(ordinal))?,
-            ),
-        })
+        let cell = encode_cell(strategy, value, ordinal, &self.arena)?;
+        let (block, local) = self.block_at(row as usize)?;
+        block.attributes.set(index, local, cell);
+        Ok(())
     }
     /// Row-0 convenience matching `tag`: the row is looked up by span ID.
     pub fn write_tag(
@@ -903,37 +874,19 @@ impl ThreadSpanBuffer {
                 } else {
                     run_end % capacity
                 };
-                // Split the borrow: a scope's text has to be interned into this
-                // store's arena before it can become a cell, and the fill needs
-                // the block. They are disjoint fields; naming them makes that
-                // visible to the borrow checker.
-                let Self { blocks, arena, .. } = self;
-                let block = &mut blocks[block_index];
                 for (name, value) in scope.iter() {
                     let Some(index) = fields.iter().position(|field| field.name == name) else {
                         continue;
                     };
                     // Interned ONCE per fill, not once per row: a scope value
                     // covers a run of rows and they all share the cell.
-                    let cell = match value {
-                        ScopeValue::Number(value) => ColumnCell::Number(*value),
-                        ScopeValue::Uint64(value) => ColumnCell::Uint64(*value),
-                        ScopeValue::Boolean(value) => ColumnCell::Boolean(*value),
-                        ScopeValue::EnumIndex(value) => ColumnCell::Enum(*value),
-                        // A `'static` scope value never enters the arena, so
-                        // vocabulary scope stays as free here as it is at write.
-                        ScopeValue::Text(Cow::Borrowed(text)) => {
-                            ColumnCell::Text(SharedStr::Static(text))
+                    match scope_cell(fields[index].strategy, value, &mut self.arena)? {
+                        Some(cell) => {
+                            filled += self.blocks[block_index]
+                                .attributes
+                                .fill_unset(index, local, local_end, cell);
                         }
-                        ScopeValue::Text(Cow::Owned(text)) => ColumnCell::Text(SharedStr::Arena(
-                            arena
-                                .intern_str(text)
-                                .map_err(ThreadBufferError::StringArenaFull)?,
-                        )),
-                    };
-                    match block.attributes[index].fill_range(local, local_end, capacity, cell) {
-                        Ok(count) => filled += count,
-                        Err(()) => crate::scope::report_scope_mismatch(
+                        None => crate::scope::report_scope_mismatch(
                             name,
                             "matching schema column type",
                             value,
@@ -958,6 +911,95 @@ impl ThreadSpanBuffer {
             row_count,
             timestamp,
         })
+    }
+    /// Select the rows one streaming flush emits: every written row except the
+    /// reserved completion row of a span that is still open. An open span's
+    /// start row IS emitted — it is how a reader sees a span that has not ended
+    /// — and is emitted again by every later flush while the span stays open,
+    /// the last copy carrying the final attribute values. Scope is materialized
+    /// over the emitted rows first.
+    pub fn flush_rows(&mut self, rows: &mut Vec<usize>) -> Result<(), ThreadBufferError> {
+        self.materialize_scope_window(0, self.row_count)?;
+        rows.clear();
+        rows.extend((0..self.row_count).filter(|&row| {
+            let span_id = self.blocks[row / self.capacity].span_ids[row % self.capacity];
+            self.spans
+                .get(&span_id)
+                .is_none_or(|record| record.ended || record.completion_row as usize != row)
+        }));
+        Ok(())
+    }
+    /// Drop every flushed row while keeping the spans still open, so a
+    /// long-lived store can flush without losing a span that outlives the
+    /// window. Each open span's start row and reserved completion row move to
+    /// the front, in open order; everything else — completed spans, log rows,
+    /// their scopes — is released. Blocks keep their allocations.
+    ///
+    /// Two rows move per open span. Nothing else is copied.
+    pub fn retain_open(&mut self) {
+        let mut open: Vec<(u32, u32)> = self
+            .spans
+            .iter()
+            .filter(|(_, record)| !record.ended)
+            .map(|(&id, record)| (record.start_row, id))
+            .collect();
+        open.sort_unstable();
+        self.spans.retain(|_, record| !record.ended);
+        let spans = &self.spans;
+        self.scopes.retain(|id, _| spans.contains_key(id));
+
+        let capacity = self.capacity;
+        let mut next = 0usize;
+        for &(start_row, span_id) in &open {
+            // A span's rows are consecutive and open spans are visited in row
+            // order, so the destination never passes the source: moving forward
+            // in place overwrites only rows already moved or released.
+            for source in [start_row as usize, start_row as usize + 1] {
+                if source != next {
+                    let input = self.blocks[source / capacity].row_input(source % capacity);
+                    let (to_block, to) = (next / capacity, next % capacity);
+                    let block = &mut self.blocks[to_block];
+                    block.timestamps[to] = input.timestamp;
+                    block.trace_ids[to] = Some(input.trace_id);
+                    block.headers[to] = input.header;
+                    block.span_ids[to] = input.span_id;
+                    block.parent_thread_ids[to] = input.parent_thread_id;
+                    block.parent_span_ids[to] = input.parent_span_id;
+                    block.lines[to] = input.line;
+                    block.messages[to] = input.message;
+                    let from = &self.blocks[source / capacity].attributes;
+                    self.blocks[to_block]
+                        .attributes
+                        .copy_row(to, from, source % capacity);
+                }
+                next += 1;
+            }
+            let record = self
+                .spans
+                .get_mut(&span_id)
+                .expect("open span retained above");
+            record.start_row = u32::try_from(next - 2).expect("thread buffer rows fit u32");
+            record.completion_row = u32::try_from(next - 1).expect("thread buffer rows fit u32");
+        }
+        let kept_blocks = next.div_ceil(capacity).max(1);
+        for (index, block) in self.blocks[..self.active_blocks].iter_mut().enumerate() {
+            let keep = next.saturating_sub(index * capacity).min(capacity);
+            block.truncate(keep);
+        }
+        self.active_blocks = kept_blocks;
+        self.row_count = next;
+    }
+    /// Blocks currently holding rows. Row `r` lives in block `r / capacity`.
+    #[inline]
+    pub fn block_count(&self) -> usize {
+        self.active_blocks
+    }
+    /// The attribute cells of `block`, for a foreign writer's view. A block
+    /// that exists keeps this allocation for the store's whole life, recycled
+    /// or not; `None` names a block not yet allocated.
+    #[inline]
+    pub fn attribute_cells(&self, block: usize) -> Option<&AttributeCells> {
+        self.blocks.get(block).map(|block| &block.attributes)
     }
     #[inline]
     pub fn timestamp_at(&self, row: usize) -> Option<i64> {
@@ -1005,13 +1047,14 @@ impl ThreadSpanBuffer {
     #[inline]
     pub fn dynamic_message_at(&self, row: usize) -> Option<&str> {
         let (block, local) = self.block_at(row).ok()?;
-        block.messages.get(local, &self.arena)
+        Some(block.messages[local].as_ref()?.resolve(&self.arena))
     }
     #[inline]
     pub fn attribute_at(&self, row: usize, ordinal: u16) -> Option<ColumnValueRef<'_>> {
         let index = usize::from(ordinal).checked_sub(SYSTEM_COLUMN_COUNT)?;
+        let strategy = self.fields.get(index)?.strategy;
         let (block, local) = self.block_at(row).ok()?;
-        block.attributes.get(index)?.get(local, &self.arena)
+        decode_cell(strategy, block.attributes.get(index, local)?, &self.arena)
     }
     #[inline]
     pub fn is_span_open(&self, span_id: u32) -> bool {
@@ -1100,6 +1143,104 @@ mod tests {
             Some(parent)
         );
         assert_eq!(buffer.span_id_at(log as usize), Some(child));
+    }
+    #[test]
+    fn a_flush_keeps_open_spans_and_emits_each_finished_row_once() {
+        let mut buffer = ThreadSpanBuffer::new(7, 8, FIELDS);
+        let pending = buffer
+            .open_span(trace(), 0, 0, "pending".into(), 1, 1)
+            .unwrap();
+        let done = buffer
+            .open_span(trace(), 7, pending, "done".into(), 2, 2)
+            .unwrap();
+        buffer
+            .append_log(pending, EntryType::Info, Some("early".into()), 3, 3)
+            .unwrap();
+        buffer.end_ok(done, 4).unwrap();
+
+        let mut rows = Vec::new();
+        buffer.flush_rows(&mut rows).unwrap();
+        // pending's reserved completion row (1) stays out; everything else goes.
+        assert_eq!(rows, vec![0, 2, 3, 4]);
+        buffer.retain_open();
+        assert_eq!(buffer.row_count(), 2);
+        assert_eq!(buffer.start_row(pending), Some(0));
+        assert!(buffer.start_row(done).is_none());
+
+        // The retained span still takes rows and completes, and its tag lands
+        // on the start row the next flush re-emits.
+        buffer
+            .write_tag(pending, 12, ColumnValue::Number(5.0))
+            .unwrap();
+        buffer
+            .append_log(pending, EntryType::Info, Some("late".into()), 5, 5)
+            .unwrap();
+        buffer.end_ok(pending, 6).unwrap();
+        buffer.flush_rows(&mut rows).unwrap();
+        assert_eq!(rows, vec![0, 1, 2]);
+        assert_eq!(buffer.timestamp_at(1), Some(6));
+        assert_eq!(buffer.dynamic_message_at(0), Some("pending"));
+        assert_eq!(buffer.dynamic_message_at(2), Some("late"));
+        assert_eq!(
+            buffer.attribute_at(0, 12),
+            Some(ColumnValueRef::Number(5.0))
+        );
+        buffer.retain_open();
+        assert_eq!(buffer.row_count(), 0);
+    }
+    #[test]
+    fn recycled_blocks_keep_their_addresses_and_forget_their_rows() {
+        let mut buffer = ThreadSpanBuffer::new(7, 8, FIELDS);
+        let span = buffer.open_span(trace(), 0, 0, "a".into(), 1, 1).unwrap();
+        for _ in 0..10 {
+            buffer
+                .append_log(span, EntryType::Info, Some("row".into()), 2, 2)
+                .unwrap();
+        }
+        let first = buffer.attribute_cells(0).unwrap().as_ptr();
+        let second = buffer.attribute_cells(1).unwrap().as_ptr();
+        buffer.write_attr(9, 12, ColumnValue::Number(1.0)).unwrap();
+        buffer.reset();
+        let span = buffer.open_span(trace(), 0, 0, "b".into(), 3, 3).unwrap();
+        for _ in 0..10 {
+            buffer
+                .append_log_static(span, EntryType::Info, VocabularyId::new(1).unwrap(), 4, 4)
+                .unwrap();
+        }
+        assert_eq!(buffer.attribute_cells(0).unwrap().as_ptr(), first);
+        assert_eq!(buffer.attribute_cells(1).unwrap().as_ptr(), second);
+        assert_eq!(buffer.attribute_at(9, 12), None);
+        assert_eq!(buffer.dynamic_message_at(9), None);
+    }
+    #[test]
+    fn a_foreign_store_into_the_cells_reads_back_through_the_schema() {
+        let mut buffer = ThreadSpanBuffer::new(7, 8, FIELDS);
+        let span = buffer.open_span(trace(), 0, 0, "s".into(), 1, 1).unwrap();
+        let label = buffer.intern("sku-1").unwrap();
+        let row = buffer.start_row(span).unwrap();
+        let cells = buffer.attribute_cells(0).unwrap();
+        let words = cells.as_ptr();
+        let stride = crate::attribute_cells::stride(8);
+        // What a TypedArray writer does: a Float64 store into field 0, a
+        // Uint32 store into field 1's low half, and a validity bit per field.
+        // SAFETY: every offset is inside the block's allocation.
+        unsafe {
+            *words.cast::<f64>().add(row) = 2.5;
+            *words.cast::<u8>().add(8 * 8 + (row >> 3)) |= 1 << (row & 7);
+            *words.cast::<u32>().add((stride + row) * 2) = label;
+            *words.cast::<u8>().add((stride + 8) * 8 + (row >> 3)) |= 1 << (row & 7);
+        }
+        assert_eq!(
+            buffer.attribute_at(row, 12),
+            Some(ColumnValueRef::Number(2.5))
+        );
+        assert_eq!(
+            buffer.attribute_at(row, 13),
+            Some(ColumnValueRef::Text("sku-1"))
+        );
+        // A stored ordinal the arena never issued reads as absent, not a panic.
+        unsafe { *words.cast::<u32>().add((stride + row) * 2) = 999 };
+        assert_eq!(buffer.attribute_at(row, 13), None);
     }
     #[test]
     fn direct_attribute_writes_survive_scope_materialization() {

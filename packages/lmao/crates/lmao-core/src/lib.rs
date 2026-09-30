@@ -10,6 +10,7 @@
 //! `(build, seed, config)` must produce bit-identical trace bytes; zero heap allocations per event after warmup.
 
 pub mod arena;
+pub mod attribute_cells;
 pub mod buffer;
 pub mod clock;
 pub mod columns;
@@ -32,6 +33,7 @@ pub mod tuning;
 include!(concat!(env!("OUT_DIR"), "/source_git.rs"));
 
 pub use arena::{ArenaFull, ArenaStr, ScopeText, StringArena, TextInput};
+pub use attribute_cells::AttributeCells;
 pub use buffer::{SourceMetadata, SpanBuffer};
 pub use clock::{Clock, CoarseClock, SystemClock, TraceAnchor};
 pub use columns::{
