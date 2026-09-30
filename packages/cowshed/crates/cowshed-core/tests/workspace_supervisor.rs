@@ -1835,6 +1835,7 @@ impl cowshed_core::runtime::supervisor_manager::SupervisorSpawner for InProcessS
         &self,
         _project_root: &std::path::Path,
         workspace: &WorkspaceName,
+        _report: std::io::PipeWriter,
     ) -> std::io::Result<tokio::process::Child> {
         use cowshed_core::runtime::supervisor_socket;
         self.spawned
@@ -1923,6 +1924,42 @@ async fn the_manager_reports_a_supervisor_that_exits_before_serving() {
         "{}",
         refused.message
     );
+}
+
+/// A supervisor that cannot start says why on the report pipe the manager handed it, and the
+/// command that asked for the workspace fails with that reason and its code, not a pointer to
+/// the daemon's log.
+#[tokio::test]
+async fn a_supervisor_that_cannot_start_fails_the_ensure_with_its_own_reason() {
+    use cowshed_core::runtime::supervisor_manager::{
+        ProgramSpawner, START_REPORT_FD_ENV, SupervisorManager,
+    };
+    let reason = CowshedError::conflict(
+        "the record at byte 123080 is in a newer record layout",
+        "run the cowshed that wrote these records",
+    );
+    let json = serde_json::to_string(&reason).unwrap();
+    assert!(!json.contains('\''));
+    let script = format!("printf '%s' '{json}' >&\"${START_REPORT_FD_ENV}\"; exit 4");
+    let store = manager_store();
+    let manager = SupervisorManager::new(
+        &store,
+        Box::new(ProgramSpawner::new(
+            "/bin/sh",
+            vec!["-c".into(), script.into(), "sh".into()],
+        )),
+    );
+    let refused = manager
+        .ensure(&PathBuf::from("/nonexistent/project"), &authority())
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code, ErrorCode::Conflict, "{}", refused.message);
+    assert!(
+        refused.message.contains("could not start") && refused.message.ends_with(&reason.message),
+        "{}",
+        refused.message
+    );
+    assert_eq!(refused.hint, reason.hint);
 }
 
 #[tokio::test]

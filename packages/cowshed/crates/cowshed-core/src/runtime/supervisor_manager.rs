@@ -12,12 +12,14 @@
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
-use std::io;
+use std::io::{self, Write as _};
+use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+use tokio::io::AsyncReadExt as _;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Mutex;
 
@@ -32,6 +34,14 @@ use crate::metadata::WorkspaceName;
 const START_BOUND: Duration = Duration::from_secs(180);
 /// How often a starting supervisor is asked whether it serves yet.
 const START_POLL: Duration = Duration::from_millis(50);
+/// Names the descriptor on which a supervisor the manager started says why it exits before it
+/// serves ([`StartReport`]). A supervisor started by hand has none.
+pub const START_REPORT_FD_ENV: &str = "COWSHED_SUPERVISOR_REPORT_FD";
+/// The most a start report may hold; anything longer is not one.
+const START_REPORT_LIMIT: u64 = 64 * 1024;
+/// How long an exited supervisor's report may take to reach end of file. Its only writer is
+/// gone, so only a descriptor leaked to a process it started could hold the pipe open.
+const START_REPORT_BOUND: Duration = Duration::from_secs(2);
 
 /// Where the host's manager listens.
 pub fn manager_socket_path(store_root: &Path) -> PathBuf {
@@ -40,15 +50,20 @@ pub fn manager_socket_path(store_root: &Path) -> PathBuf {
 
 /// What starts a workspace's supervisor process.
 pub trait SupervisorSpawner: Send + Sync + 'static {
+    /// Start the supervisor of `workspace`, handing it `report`: the write end of the pipe on
+    /// which it says why it exits, if it does, before it serves ([`StartReport`]). The spawner
+    /// keeps no copy of it, so the manager reads the report to its end once the child exits.
     fn spawn(
         &self,
         project_root: &Path,
         workspace: &WorkspaceName,
+        report: io::PipeWriter,
     ) -> io::Result<tokio::process::Child>;
 }
 
-/// Production: this same binary's hidden verb, in a new session, stdin closed, stdout discarded
-/// and stderr to the daemon's own log.
+/// Production: this same binary's hidden verb, in a new session, stdin closed, stdout discarded,
+/// stderr to the daemon's own log, and the start report on the descriptor
+/// [`START_REPORT_FD_ENV`] names.
 #[derive(Clone, Debug)]
 pub struct ProgramSpawner {
     executable: PathBuf,
@@ -69,28 +84,105 @@ impl SupervisorSpawner for ProgramSpawner {
         &self,
         project_root: &Path,
         workspace: &WorkspaceName,
+        report: io::PipeWriter,
     ) -> io::Result<tokio::process::Child> {
+        let report = OwnedFd::from(report);
+        let report_fd = report.as_raw_fd();
         let mut command = tokio::process::Command::new(&self.executable);
         command
             .args(&self.arguments)
             .arg(project_root)
             .arg(workspace.as_str())
+            .env(START_REPORT_FD_ENV, report_fd.to_string())
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .kill_on_drop(false);
-        // SAFETY: `setsid` between fork and exec is async-signal-safe and touches only this
-        // child. A session of its own takes the supervisor out of the daemon's process group,
-        // which a service manager ends with the daemon.
+        // SAFETY: `setsid` and `fcntl` between fork and exec are async-signal-safe and touch only
+        // this child. A session of its own takes the supervisor out of the daemon's process
+        // group, which a service manager ends with the daemon. The report pipe is close-on-exec
+        // in the daemon; clearing the flag on the child's copy of that same descriptor number is
+        // what lets the supervisor alone inherit it.
         unsafe {
-            command.pre_exec(|| {
+            command.pre_exec(move || {
                 if libc::setsid() == -1 {
+                    return Err(io::Error::last_os_error());
+                }
+                if libc::fcntl(report_fd, libc::F_SETFD, 0) == -1 {
                     return Err(io::Error::last_os_error());
                 }
                 Ok(())
             });
         }
-        command.spawn()
+        let child = command.spawn();
+        // The child holds its own copy now; the manager's would keep the report from ending.
+        drop(report);
+        child
     }
+}
+
+/// The start report of a supervisor the manager started: the write end of its report pipe, or
+/// nothing for a supervisor started by hand.
+pub struct StartReport(Option<std::fs::File>);
+
+impl StartReport {
+    /// The report descriptor the manager handed this process, made close-on-exec so no process
+    /// this one starts inherits it. Call before starting any.
+    pub fn inherited() -> Self {
+        Self::named(std::env::var(START_REPORT_FD_ENV).ok().as_deref())
+    }
+
+    /// The report pipe `value` names: an open pipe, never standard input, output or error.
+    fn named(value: Option<&str>) -> Self {
+        let Some(fd) = value
+            .and_then(|value| value.parse::<RawFd>().ok())
+            .filter(|&fd| fd > libc::STDERR_FILENO)
+        else {
+            return Self(None);
+        };
+        // SAFETY: `fstat` on a descriptor number is sound whether or not it is open; it fails
+        // with EBADF when it is not, and `stat` is plain data it only writes.
+        let is_pipe = unsafe {
+            let mut stat = std::mem::zeroed::<libc::stat>();
+            libc::fstat(fd, &mut stat) == 0 && stat.st_mode & libc::S_IFMT == libc::S_IFIFO
+        };
+        if !is_pipe {
+            return Self(None);
+        }
+        // SAFETY: F_SETFD on an open descriptor changes only its own close-on-exec flag.
+        if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } == -1 {
+            return Self(None);
+        }
+        // SAFETY: the manager opened this pipe for this process alone and named it in the
+        // environment, and it is open (checked above); nothing else in this process owns it.
+        Self(Some(std::fs::File::from(unsafe {
+            OwnedFd::from_raw_fd(fd)
+        })))
+    }
+
+    /// Tell the manager why this supervisor ends before serving. A manager that stopped reading
+    /// (the supervisor served, or the daemon restarted) answers `BrokenPipe`.
+    pub fn send(self, error: &CowshedError) -> io::Result<()> {
+        let Some(mut report) = self.0 else {
+            return Ok(());
+        };
+        let bytes = serde_json::to_vec(error).map_err(io::Error::other)?;
+        report.write_all(&bytes)
+    }
+}
+
+/// Why the supervisor that wrote `report` ended before serving, read to its end; `None` when it
+/// said nothing this build can decode.
+async fn read_start_report(report: io::PipeReader) -> Option<CowshedError> {
+    let receiver = tokio::net::unix::pipe::Receiver::from_owned_fd(OwnedFd::from(report)).ok()?;
+    let mut bytes = Vec::new();
+    tokio::time::timeout(
+        START_REPORT_BOUND,
+        receiver.take(START_REPORT_LIMIT).read_to_end(&mut bytes),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    serde_json::from_slice(&bytes).ok()
 }
 
 #[derive(Serialize, Deserialize)]
@@ -233,30 +325,44 @@ impl SupervisorManager {
             Err(error) if error.code == ErrorCode::Conflict => return Err(error),
             Err(_) => {}
         }
+        let cannot_start = |error: io::Error| {
+            CowshedError::environment_missing(
+                format!(
+                    "cannot start the supervisor of workspace {}: {error}",
+                    authority.workspace
+                ),
+                "reinstall cowshed with `cowshed gateway start`",
+            )
+        };
+        let (report, report_writer) = io::pipe().map_err(cannot_start)?;
         let mut child = self
             .spawner
-            .spawn(project_root, &authority.workspace)
-            .map_err(|error| {
-                CowshedError::environment_missing(
-                    format!(
-                        "cannot start the supervisor of workspace {}: {error}",
-                        authority.workspace
-                    ),
-                    "reinstall cowshed with `cowshed gateway start`",
-                )
-            })?;
+            .spawn(project_root, &authority.workspace, report_writer)
+            .map_err(cannot_start)?;
         let deadline = tokio::time::Instant::now() + START_BOUND;
         loop {
             if let Some(status) = child.try_wait().map_err(|error| {
                 CowshedError::internal(format!("cannot wait for a supervisor: {error}"))
             })? {
-                return Err(CowshedError::environment_missing(
-                    format!(
-                        "the supervisor of workspace {} exited ({status}) before serving",
-                        authority.workspace
+                return Err(match read_start_report(report).await {
+                    // The supervisor's own error keeps its code: a caller that asked for this
+                    // workspace fails exactly as the supervisor did.
+                    Some(reason) => CowshedError::new(
+                        reason.code,
+                        format!(
+                            "the supervisor of workspace {} could not start: {}",
+                            authority.workspace, reason.message
+                        ),
+                        reason.hint,
                     ),
-                    "its reason is in the cowshed daemon log: ~/Library/Logs/cowshed/daemon-stderr.log",
-                ));
+                    None => CowshedError::environment_missing(
+                        format!(
+                            "the supervisor of workspace {} exited ({status}) before serving",
+                            authority.workspace
+                        ),
+                        "its reason is in the cowshed daemon log: ~/Library/Logs/cowshed/daemon-stderr.log",
+                    ),
+                });
             }
             if let Ok(hello) = supervisor_socket::hello(&socket).await {
                 let answer = serving(&socket, &hello, authority);
@@ -528,5 +634,51 @@ pub async fn ensure(
             authority: authority.into(),
         }),
         EnsureResponse::Refused(error) => Err(error),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Read as _;
+    use std::os::fd::IntoRawFd as _;
+
+    use super::*;
+
+    /// The supervisor takes the report pipe the manager named, keeps it from every process it
+    /// starts, and its error arrives whole; it never takes a descriptor that is not a pipe.
+    #[test]
+    fn a_supervisor_reports_on_the_named_pipe_and_takes_nothing_else() {
+        let (mut reader, writer) = io::pipe().expect("pipe");
+        let fd = OwnedFd::from(writer).into_raw_fd();
+        let report = StartReport::named(Some(&fd.to_string()));
+        let taken = report
+            .0
+            .as_ref()
+            .expect("the named pipe is taken")
+            .as_raw_fd();
+        // SAFETY: F_GETFD on a descriptor this test holds open.
+        let flags = unsafe { libc::fcntl(taken, libc::F_GETFD) };
+        assert_eq!(flags & libc::FD_CLOEXEC, libc::FD_CLOEXEC);
+        let error = CowshedError::conflict("a newer cowshed wrote these records", "upgrade");
+        report.send(&error).expect("send");
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes).expect("the report ends");
+        assert_eq!(
+            serde_json::from_slice::<CowshedError>(&bytes).unwrap(),
+            error
+        );
+
+        let file = std::fs::File::open("/dev/null").expect("/dev/null");
+        assert!(
+            StartReport::named(Some(&file.as_raw_fd().to_string()))
+                .0
+                .is_none()
+        );
+        assert!(StartReport::named(Some("2")).0.is_none());
+        assert!(StartReport::named(Some("report")).0.is_none());
+        assert!(StartReport::named(None).0.is_none());
+        StartReport::named(None)
+            .send(&error)
+            .expect("a supervisor started by hand has nobody to tell");
     }
 }

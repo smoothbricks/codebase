@@ -111,11 +111,14 @@ and the manager answers with the socket once a supervisor serves it there. It st
 in a session of its own, when nothing answers; ensures of one workspace run one at a time, so two controllers never
 start two allocators. A supervisor therefore outlives the command that first needed it, and the daemon's restarts: the
 manager watches every supervisor it started and, when it starts, finds the ones still serving. A supervisor answering
-under another incarnation is refused with `Conflict` naming its pid. The supervisor itself never evaluates `.envrc`,
-sources shell startup, or runs repository hooks; it reads only the watch list an activation reports. It compiles the
-deterministic inner child profile first, then starts every exec host, one-shot command, and descendant beneath that
-restriction; each command runs in its job's own process group. The child profile denies writes beneath `.cowshed/job/**`
-and may further narrow for ReadOnly; it never adds authority (04_sandbox.md).
+under another incarnation is refused with `Conflict` naming its pid. A supervisor that ends before it serves says why on
+a report pipe the manager hands it (named by `COWSHED_SUPERVISOR_REPORT_FD`, close-on-exec in the supervisor so no job
+inherits it), and the ensure — so the command that needed the workspace — fails with that error and its code, not with a
+pointer to the daemon's log. The supervisor itself never evaluates `.envrc`, sources shell startup, or runs repository
+hooks; it reads only the watch list an activation reports. It compiles the deterministic inner child profile first, then
+starts every exec host, one-shot command, and descendant beneath that restriction; each command runs in its job's own
+process group. The child profile denies writes beneath `.cowshed/job/**` and may further narrow for ReadOnly; it never
+adds authority (04_sandbox.md).
 
 - Holds the warm exec hosts above. Host startup and activation run inside the child sandbox; no repository-controlled
   startup runs in the supervisor.

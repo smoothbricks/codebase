@@ -9,19 +9,30 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 
 use cowshed_core::metadata::WorkspaceName;
+use cowshed_core::runtime::supervisor_manager::StartReport;
 use cowshed_core::runtime::{ProjectRuntime, RecoveryScope};
 use cowshed_core::{CowshedError, Result};
 
 /// The argument that selects this verb.
 pub const VERB: &str = "__workspace-supervisor";
 
-/// Serve the workspace `arguments` name; the process's exit code.
+/// Serve the workspace `arguments` name; the process's exit code. An error also goes to the
+/// manager that started this process, which answers the command that asked for the workspace
+/// with it.
 pub async fn run(arguments: &[OsString]) -> i32 {
+    let report = StartReport::inherited();
     match serve(arguments).await {
         Ok(()) => 0,
         Err(error) => {
             eprintln!("cowshed: {}", error.message);
             eprintln!("hint: {}", error.hint);
+            match report.send(&error) {
+                // Nobody reads a report once the supervisor has served: the log has it.
+                Err(sent) if sent.kind() != std::io::ErrorKind::BrokenPipe => {
+                    eprintln!("cowshed: could not report this to the cowshed daemon: {sent}");
+                }
+                _ => {}
+            }
             i32::from(error.code.exit_code())
         }
     }
