@@ -12917,7 +12917,7 @@ mod binding_heal_persistence_tests {
         assert_eq!(reread, healed);
         assert_eq!(
             reread.primary().expect("primary").remote_url.as_deref(),
-            Some("ssh://forge.example.test:2223/acme/widget.git"),
+            Some("ssh://git@forge.example.test:2223/acme/widget.git"),
         );
 
         std::fs::remove_dir_all(&store).ok();
