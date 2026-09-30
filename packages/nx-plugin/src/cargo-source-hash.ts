@@ -1,8 +1,9 @@
-import { execFileSync, spawnSync } from 'node:child_process';
+import { execFile, execFileSync, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { realpathSync, statSync } from 'node:fs';
 import { lstat, readdir, readFile, readlink, realpath } from 'node:fs/promises';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
+import { promisify } from 'node:util';
 import typia from 'typia';
 
 interface CargoMetadata {
@@ -13,7 +14,28 @@ interface CargoMetadata {
     targets: { src_path: string }[];
   }[];
   resolve: { nodes: { id: string; deps: { pkg: string }[] }[] } | null;
+  workspace_members: string[];
   workspace_root: string;
+}
+
+/** A mutable (path) package in Cargo's locked resolve. Every path is canonical. */
+interface LocalCargoPackage {
+  readonly id: string;
+  readonly directory: string;
+  readonly manifest: string;
+  /** Every target's source file: library, binaries, tests, build script. A target may live outside `directory`. */
+  readonly sources: readonly string[];
+}
+
+/** What locked, offline `cargo metadata` reports about one Cargo workspace's mutable packages. */
+interface CargoResolve {
+  /** The canonical Cargo workspace root. */
+  readonly root: string;
+  /** The workspace's own members: `root`'s manifest governs each of them. */
+  readonly members: ReadonlySet<string>;
+  readonly local: readonly LocalCargoPackage[];
+  /** Every dependency edge by package id, or null when Cargo reported no resolution. */
+  readonly edges: ReadonlyMap<string, readonly string[]> | null;
 }
 
 export interface CargoPathInputsOptions {
@@ -27,6 +49,7 @@ export interface CargoPathInputsOptions {
 }
 
 const parseMetadata = typia.json.createAssertParse<CargoMetadata>();
+const execFileAsync = promisify(execFile);
 const ignoredDirectories = new Set([
   'target',
   '.git',
@@ -64,9 +87,53 @@ const ancestorInputs = ['Cargo.toml', '.cargo/config', '.cargo/config.toml'];
 // on stderr ("Blocking waiting for file lock on package cache") a
 // timing-dependent number of times when Nx hashes many tasks at once, which
 // made one unchanged tree produce four different task hashes per run. Cargo's
-// stderr is kept for the failure path only, where execFileSync attaches it to
-// the thrown error. Git runs under the same rule.
+// stderr is kept for the failure path only, where execFile attaches it to the
+// rejected error. Git runs under the same rule.
 const CHILD_STDIO: ['ignore', 'pipe', 'pipe'] = ['ignore', 'pipe', 'pipe'];
+
+/** Locked, offline `cargo metadata` for the workspace `manifestPath` names, run from `cwd`. */
+async function readCargoResolve(manifestPath: string, cwd: string): Promise<CargoResolve> {
+  const { stdout } = await execFileAsync(
+    'cargo',
+    ['metadata', '--format-version', '1', '--locked', '--offline', '--manifest-path', resolve(manifestPath)],
+    { cwd, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 },
+  );
+  const metadata = parseMetadata(stdout);
+  const local = await Promise.all(
+    metadata.packages
+      .filter((pkg) => pkg.source === null)
+      .map(async (pkg): Promise<LocalCargoPackage> => {
+        const manifest = await realpath(pkg.manifest_path);
+        const sources = await Promise.all(pkg.targets.map((target) => realpath(target.src_path)));
+        return { id: pkg.id, directory: dirname(manifest), manifest, sources };
+      }),
+  );
+  return {
+    root: await realpath(metadata.workspace_root),
+    members: new Set(metadata.workspace_members),
+    local,
+    edges:
+      metadata.resolve === null
+        ? null
+        : new Map(metadata.resolve.nodes.map((node) => [node.id, node.deps.map((dependency) => dependency.pkg)])),
+  };
+}
+
+/**
+ * The canonical root manifest of the Cargo workspace that governs `pkg`.
+ * Metadata's `workspace_root` describes only the invoking workspace, which is
+ * the answer for its own members. Any other path package asks Cargo, which
+ * resolves an explicit `package.workspace` as well as the ancestor search.
+ */
+async function governingManifest(cargo: CargoResolve, pkg: LocalCargoPackage, cwd: string): Promise<string> {
+  if (cargo.members.has(pkg.id)) return realpath(join(cargo.root, 'Cargo.toml'));
+  const { stdout } = await execFileAsync(
+    'cargo',
+    ['locate-project', '--workspace', '--manifest-path', pkg.manifest, '--message-format', 'plain'],
+    { cwd, encoding: 'utf8' },
+  );
+  return realpath(stdout.trim());
+}
 
 export async function hashCargoPathInputs(
   manifestPath: string,
@@ -74,36 +141,20 @@ export async function hashCargoPathInputs(
   options?: CargoPathInputsOptions,
 ): Promise<string> {
   const root = await realpath(workspaceRoot);
-  const metadata = parseMetadata(
-    execFileSync(
-      'cargo',
-      ['metadata', '--format-version', '1', '--locked', '--offline', '--manifest-path', resolve(manifestPath)],
-      { cwd: root, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, stdio: CHILD_STDIO },
-    ),
-  );
-  const cargoRoot = await realpath(metadata.workspace_root);
-  const local: { id: string; directory: string; manifest: string; sources: string[] }[] = [];
-  for (const pkg of metadata.packages) {
-    if (pkg.source !== null) continue;
-    const manifest = await realpath(pkg.manifest_path);
-    const sources: string[] = [];
-    for (const target of pkg.targets) sources.push(await realpath(target.src_path));
-    local.push({ id: pkg.id, directory: dirname(manifest), manifest, sources });
-  }
-  const members =
-    options?.closure === undefined ? undefined : await dependencyClosure(metadata, local, resolve(options.closure));
+  const cargo = await readCargoResolve(manifestPath, root);
+  const members = options?.closure === undefined ? undefined : await dependencyClosure(cargo, resolve(options.closure));
 
   const directories = new Set<string>();
   const files = new Set<string>();
   const ancestors = new Set<string>();
   const links = new Map<string, string>();
   const packageSources: string[] = [];
-  for (const pkg of local) {
+  for (const pkg of cargo.local) {
     if (members !== undefined && !members.has(pkg.id)) continue;
     const directory = pkg.directory;
     if (!options?.includeWorkspace) {
       const fromRoot = relative(root, directory);
-      const fromCargo = relative(cargoRoot, directory);
+      const fromCargo = relative(cargo.root, directory);
       if (
         fromRoot !== '..' &&
         !fromRoot.startsWith(`..${sep}`) &&
@@ -117,14 +168,7 @@ export async function hashCargoPathInputs(
     }
     directories.add(directory);
     files.add(pkg.manifest);
-    // Cargo resolves explicit package.workspace ownership as well as ancestor
-    // workspaces. Metadata's workspace_root describes only the invoking root.
-    const governingManifest = execFileSync(
-      'cargo',
-      ['locate-project', '--workspace', '--manifest-path', pkg.manifest, '--message-format', 'plain'],
-      { cwd: root, encoding: 'utf8', stdio: CHILD_STDIO },
-    ).trim();
-    files.add(await realpath(governingManifest));
+    files.add(await governingManifest(cargo, pkg, root));
     packageSources.push(...pkg.sources);
     // A member can inherit edition, lint policy, dependencies and
     // profiles from a workspace above its package directory. Those manifests
@@ -191,23 +235,18 @@ export async function hashCargoPathInputs(
  * `directory`, over every dependency kind: a target may build, test or run
  * build scripts, and any of those compiles the edge's source.
  */
-async function dependencyClosure(
-  metadata: CargoMetadata,
-  local: readonly { id: string; directory: string }[],
-  directory: string,
-): Promise<ReadonlySet<string>> {
+async function dependencyClosure(cargo: CargoResolve, directory: string): Promise<ReadonlySet<string>> {
   const base = await realpath(directory);
-  const pending = local
+  const pending = cargo.local
     .filter((pkg) => pkg.directory === base || pkg.directory.startsWith(`${base}${sep}`))
     .map((pkg) => pkg.id);
   if (pending.length === 0) throw new Error(`no local Cargo package lies under ${directory}`);
-  if (metadata.resolve === null) throw new Error('cargo metadata reported no dependency resolution');
-  const edges = new Map(metadata.resolve.nodes.map((node) => [node.id, node.deps]));
+  if (cargo.edges === null) throw new Error('cargo metadata reported no dependency resolution');
   const reached = new Set<string>();
   for (let id = pending.pop(); id !== undefined; id = pending.pop()) {
     if (reached.has(id)) continue;
     reached.add(id);
-    for (const dependency of edges.get(id) ?? []) pending.push(dependency.pkg);
+    for (const dependency of cargo.edges.get(id) ?? []) pending.push(dependency);
   }
   return reached;
 }
