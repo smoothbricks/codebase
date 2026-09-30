@@ -1,0 +1,1067 @@
+//! A workspace supervisor served over its Unix socket, and the handle that reaches one
+//! (11_shell.md "Protocol").
+//!
+//! Every call is one connection. The client writes one JSON request frame, then the raw bytes
+//! the call carries (stdin) as one more frame; the server answers with one JSON response frame,
+//! then the raw bytes the answer carries (a log chunk), and both sides close. A long call — a
+//! `wait`, a following log read — therefore holds only its own connection: nothing queues
+//! behind it and nothing needs multiplexing. The server fences every call by the authority the
+//! client names, exactly as the in-process actor does, so a client that still holds an older
+//! grant revision or incarnation is refused rather than served under the wrong profile.
+//!
+//! The server accepts only peers with its own uid; the socket is created mode `0600` inside a
+//! `0700` directory by the process that serves it.
+
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::io;
+use std::path::{Path, PathBuf};
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
+
+use bytes::Bytes;
+use serde::{Deserialize, Serialize};
+use tokio::io::{AsyncRead, AsyncReadExt as _, ReadBuf};
+use tokio::net::{UnixListener, UnixStream};
+use tokio::sync::{mpsc, oneshot};
+
+use super::supervisor::{
+    CheckpointBarrier, Command, LogChunk, SessionSnapshot, SessionToken,
+    WorkspaceAuthoritySnapshot, WorkspaceSupervisorHandle,
+};
+use crate::api::dto::{
+    CommandArg, ExecCommand, ExecRequest, JobId, OutputPublication, RunSandboxMode, ScriptCommand,
+    Sha256Digest, StdinSource, TraceContext, WorkspacePath,
+};
+use crate::error::{CowshedError, Result};
+use crate::storage::job_artifact::StreamKind;
+
+/// The protocol this build speaks. A supervisor started by another cowshed build may speak
+/// another; `hello` refuses it by name rather than letting a call fail mid-way.
+pub const PROTOCOL_VERSION: u32 = 1;
+
+/// How long a supervisor may take to answer hello.
+const HELLO_BOUND: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Bound on one JSON frame: an exec request carries at most a 1 MiB command plus its
+/// environment; a job list is bounded by the jobs one supervisor keeps resident.
+const MAX_JSON_FRAME: usize = 16 * 1024 * 1024;
+/// Bound on one raw frame: inline stdin rides here whole.
+const MAX_BYTES_FRAME: usize = 64 * 1024 * 1024;
+/// Chunk size a stream stdin is forwarded in; the supervisor's own write bound.
+const STREAM_CHUNK: usize = 64 * 1024;
+/// Bounded queue between a forwarded stdin stream and the job that reads it.
+const STREAM_DEPTH: usize = 4;
+
+/// Where the supervisor of `workspace` in `repo_id` listens: the store's `run` directory, under
+/// a digest of the pair. Owner, repository and workspace names together can exceed the 104
+/// bytes a Unix socket path may hold on macOS; the digest keeps every path at 64.
+pub fn socket_path(
+    store_root: &Path,
+    repo_id: &crate::repository::RepoId,
+    workspace: &crate::metadata::WorkspaceName,
+) -> PathBuf {
+    let mut identity = Vec::with_capacity(repo_id.as_str().len() + workspace.as_str().len() + 1);
+    identity.extend_from_slice(repo_id.as_str().as_bytes());
+    // NUL is in neither name, so no two pairs share an identity.
+    identity.push(0);
+    identity.extend_from_slice(workspace.as_str().as_bytes());
+    let digest = Sha256Digest::compute(&identity).to_hex();
+    store_root
+        .join("run")
+        .join(format!("{}.sock", &digest[..32]))
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+enum Request {
+    /// The authority the supervisor serves, so a client can tell a stale socket from its own.
+    Hello,
+    Call {
+        authority: AuthorityWire,
+        call: Call,
+        /// Length of the raw frame that follows, if any.
+        bytes: usize,
+    },
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct HelloWire {
+    protocol: u32,
+    authority: AuthorityWire,
+    pid: u32,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AuthorityWire {
+    repo_id: crate::repository::RepoId,
+    workspace: crate::metadata::WorkspaceName,
+    workspace_incarnation: crate::metadata::WorkspaceIncarnation,
+    grant_revision: u64,
+    lifecycle_revision: u64,
+}
+
+impl From<&WorkspaceAuthoritySnapshot> for AuthorityWire {
+    fn from(authority: &WorkspaceAuthoritySnapshot) -> Self {
+        Self {
+            repo_id: authority.repo_id.clone(),
+            workspace: authority.workspace.clone(),
+            workspace_incarnation: authority.workspace_incarnation.clone(),
+            grant_revision: authority.grant_revision,
+            lifecycle_revision: authority.lifecycle_revision,
+        }
+    }
+}
+
+impl From<AuthorityWire> for WorkspaceAuthoritySnapshot {
+    fn from(wire: AuthorityWire) -> Self {
+        Self {
+            repo_id: wire.repo_id,
+            workspace: wire.workspace,
+            workspace_incarnation: wire.workspace_incarnation,
+            grant_revision: wire.grant_revision,
+            lifecycle_revision: wire.lifecycle_revision,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "call", rename_all = "camelCase", deny_unknown_fields)]
+enum Call {
+    OpenSession {
+        name: Option<String>,
+    },
+    SessionSnapshot {
+        session: SessionWire,
+    },
+    CloseSession {
+        session: SessionWire,
+    },
+    #[serde(rename_all = "camelCase")]
+    Exec {
+        session: Option<SessionWire>,
+        background: bool,
+        request: ExecWire,
+    },
+    #[serde(rename_all = "camelCase")]
+    StdinWrite {
+        job_id: JobId,
+    },
+    #[serde(rename_all = "camelCase")]
+    StdinClose {
+        job_id: JobId,
+    },
+    /// The next chunk of a job admitted with a streamed stdin.
+    #[serde(rename_all = "camelCase")]
+    StreamChunk {
+        job_id: JobId,
+    },
+    /// The end of a streamed stdin: clean when `error` is absent.
+    #[serde(rename_all = "camelCase")]
+    StreamEnd {
+        job_id: JobId,
+        error: Option<String>,
+    },
+    #[serde(rename_all = "camelCase")]
+    Info {
+        job_id: JobId,
+    },
+    List,
+    #[serde(rename_all = "camelCase")]
+    Kill {
+        job_id: JobId,
+    },
+    #[serde(rename_all = "camelCase")]
+    Wait {
+        job_id: JobId,
+    },
+    #[serde(rename_all = "camelCase")]
+    LogRead {
+        job_id: JobId,
+        stream: StreamWire,
+        offset: u64,
+        follow: bool,
+    },
+    #[serde(rename_all = "camelCase")]
+    Checkpoint {
+        checkpoint_id: String,
+    },
+    Quiesce,
+    Retire,
+}
+
+#[derive(Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+enum StreamWire {
+    Stdout,
+    Stderr,
+}
+
+impl From<StreamKind> for StreamWire {
+    fn from(stream: StreamKind) -> Self {
+        match stream {
+            StreamKind::Stdout => Self::Stdout,
+            StreamKind::Stderr => Self::Stderr,
+        }
+    }
+}
+
+impl From<StreamWire> for StreamKind {
+    fn from(stream: StreamWire) -> Self {
+        match stream {
+            StreamWire::Stdout => Self::Stdout,
+            StreamWire::Stderr => Self::Stderr,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SessionWire {
+    identity: u64,
+    name: Option<String>,
+}
+
+impl From<&SessionToken> for SessionWire {
+    fn from(session: &SessionToken) -> Self {
+        Self {
+            identity: session.identity(),
+            name: session.name().map(str::to_owned),
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ExecWire {
+    argv: Option<Vec<CommandArg>>,
+    script: Option<ScriptCommand>,
+    cwd: Option<WorkspacePath>,
+    mode: RunSandboxMode,
+    env: HashMap<String, String>,
+    trace: Option<TraceContext>,
+    stdin: StdinWire,
+    stdout_copy: Option<OutputPublication>,
+    stderr_copy: Option<OutputPublication>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
+enum StdinWire {
+    Empty,
+    /// The bytes are the request's raw frame.
+    Inline,
+    /// The bytes follow as `StreamChunk` calls and end with `StreamEnd`.
+    Stream,
+    #[serde(rename_all = "camelCase")]
+    WorkspaceFile {
+        workspace_path: WorkspacePath,
+    },
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SessionSnapshotWire {
+    identity: u64,
+    name: Option<String>,
+    cwd: Option<WorkspacePath>,
+    env: BTreeMap<String, String>,
+    background_jobs: BTreeSet<JobId>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct LogChunkWire {
+    next_offset: u64,
+    eof: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CheckpointWire {
+    checkpoint_id: String,
+    barrier_id: u64,
+    manifest_batch_sha256: Sha256Digest,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+enum Response {
+    Ok {
+        value: serde_json::Value,
+        /// Length of the raw frame that follows, if any.
+        bytes: usize,
+    },
+    Err(CowshedError),
+}
+
+fn protocol_error(message: impl Into<String>) -> CowshedError {
+    CowshedError::integrity(
+        format!("workspace supervisor protocol: {}", message.into()),
+        "cowshed doctor --json",
+    )
+}
+
+fn unavailable(path: &Path, error: &io::Error) -> CowshedError {
+    CowshedError::environment_missing(
+        format!(
+            "the workspace supervisor at {} is not reachable: {error}",
+            path.display()
+        ),
+        "retry; cowshed restarts the workspace supervisor",
+    )
+}
+
+async fn write_frame(stream: &mut UnixStream, bytes: &[u8], maximum: usize) -> Result<()> {
+    crate::api::frame::write_frame(
+        stream,
+        bytes,
+        maximum,
+        || protocol_error("frame exceeds its bound"),
+        |error| protocol_error(format!("write failed: {error}")),
+    )
+    .await
+}
+
+async fn read_frame(stream: &mut UnixStream, maximum: usize) -> Result<Vec<u8>> {
+    crate::api::frame::read_frame(
+        stream,
+        maximum,
+        || protocol_error("frame exceeds its bound"),
+        |error| protocol_error(format!("read failed: {error}")),
+    )
+    .await
+}
+
+async fn write_json<T: Serialize>(stream: &mut UnixStream, value: &T) -> Result<()> {
+    let bytes = serde_json::to_vec(value)
+        .map_err(|error| protocol_error(format!("encoding failed: {error}")))?;
+    write_frame(stream, &bytes, MAX_JSON_FRAME).await
+}
+
+async fn read_json<T: for<'de> Deserialize<'de>>(stream: &mut UnixStream) -> Result<T> {
+    let bytes = read_frame(stream, MAX_JSON_FRAME).await?;
+    serde_json::from_slice(&bytes)
+        .map_err(|error| protocol_error(format!("malformed frame: {error}")))
+}
+
+async fn read_bytes(stream: &mut UnixStream, length: usize) -> Result<Bytes> {
+    if length == 0 {
+        return Ok(Bytes::new());
+    }
+    let bytes = read_frame(stream, MAX_BYTES_FRAME).await?;
+    if bytes.len() != length {
+        return Err(protocol_error(format!(
+            "raw frame is {} bytes, announced {length}",
+            bytes.len()
+        )));
+    }
+    Ok(Bytes::from(bytes))
+}
+
+// ---------------------------------------------------------------------------------------------
+// Server
+// ---------------------------------------------------------------------------------------------
+
+/// Writers of the stdin streams jobs of this supervisor are still reading.
+type Streams = Arc<Mutex<BTreeMap<JobId, mpsc::Sender<io::Result<Bytes>>>>>;
+
+/// Bind the supervisor's socket at `path`: mode `0600` in a directory only this user can enter.
+/// A socket file already at `path` is replaced only when nothing answers on it.
+pub async fn bind(path: &Path) -> Result<UnixListener> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let directory = path.parent().ok_or_else(|| {
+        CowshedError::internal(format!(
+            "supervisor socket {} has no parent",
+            path.display()
+        ))
+    })?;
+    let io = |what: &str, error: io::Error| {
+        CowshedError::environment_missing(
+            format!("cannot {what} {}: {error}", path.display()),
+            "check the cowshed runtime directory",
+        )
+    };
+    std::fs::create_dir_all(directory).map_err(|error| io("create the directory of", error))?;
+    std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))
+        .map_err(|error| io("restrict the directory of", error))?;
+    match UnixStream::connect(path).await {
+        Ok(_) => {
+            return Err(CowshedError::conflict(
+                format!("a workspace supervisor already serves {}", path.display()),
+                "stop that supervisor first",
+            ));
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(_) => std::fs::remove_file(path).map_err(|error| io("remove the stale", error))?,
+    }
+    let listener = UnixListener::bind(path).map_err(|error| io("bind", error))?;
+    // The directory already admits only this user; the socket's own mode says the same. The
+    // process umask is not narrowed around the bind: it is process-wide, and another thread's
+    // files created meanwhile would get it.
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+        .map_err(|error| io("restrict", error))?;
+    Ok(listener)
+}
+
+/// Serve `supervisor` on `listener`, one call per connection, until a `retire` call has
+/// retired it and been answered. The caller then unlinks the socket and exits.
+pub async fn serve(listener: UnixListener, supervisor: WorkspaceSupervisorHandle) -> Result<()> {
+    let streams: Streams = Arc::default();
+    let retired = Arc::new(tokio::sync::Notify::new());
+    loop {
+        let (stream, _) = tokio::select! {
+            accepted = listener.accept() => accepted.map_err(|error| {
+                CowshedError::environment_missing(
+                    format!("workspace supervisor socket stopped accepting: {error}"),
+                    "retry; cowshed restarts the workspace supervisor",
+                )
+            })?,
+            () = retired.notified() => return Ok(()),
+        };
+        let supervisor = supervisor.clone();
+        let streams = Arc::clone(&streams);
+        let retired = Arc::clone(&retired);
+        tokio::spawn(async move {
+            if let Ok(Retirement::Retired) = serve_call(stream, &supervisor, &streams).await {
+                retired.notify_one();
+            }
+        });
+    }
+}
+
+/// Whether a call left the supervisor retired.
+enum Retirement {
+    Serving,
+    Retired,
+}
+
+async fn serve_call(
+    mut stream: UnixStream,
+    supervisor: &WorkspaceSupervisorHandle,
+    streams: &Streams,
+) -> Result<Retirement> {
+    verify_peer(&stream)?;
+    let request: Request = read_json(&mut stream).await?;
+    let (authority, call, length) = match request {
+        Request::Hello => {
+            let authority = supervisor.current_authority().await?;
+            let value = to_value(&HelloWire {
+                protocol: PROTOCOL_VERSION,
+                authority: (&authority).into(),
+                pid: std::process::id(),
+            })?;
+            write_json(&mut stream, &Response::Ok { value, bytes: 0 }).await?;
+            return Ok(Retirement::Serving);
+        }
+        Request::Call {
+            authority,
+            call,
+            bytes,
+        } => (authority, call, bytes),
+    };
+    let payload = read_bytes(&mut stream, length).await?;
+    let caller = supervisor.with_authority(authority.into());
+    let retiring = matches!(call, Call::Retire);
+    let (value, bytes) = match answer(&caller, streams, call, payload).await {
+        Ok(answer) => answer,
+        Err(error) => {
+            write_json(&mut stream, &Response::Err(error)).await?;
+            return Ok(Retirement::Serving);
+        }
+    };
+    let answered = async {
+        write_json(
+            &mut stream,
+            &Response::Ok {
+                value,
+                bytes: bytes.len(),
+            },
+        )
+        .await?;
+        if !bytes.is_empty() {
+            write_frame(&mut stream, &bytes, MAX_BYTES_FRAME).await?;
+        }
+        Ok::<(), CowshedError>(())
+    }
+    .await;
+    if retiring {
+        // Retired is retired whether or not the caller stayed to hear it.
+        return Ok(Retirement::Retired);
+    }
+    answered.map(|()| Retirement::Serving)
+}
+
+fn verify_peer(stream: &UnixStream) -> Result<()> {
+    use std::os::fd::AsFd as _;
+    let descriptor = stream
+        .as_fd()
+        .try_clone_to_owned()
+        .map_err(|error| protocol_error(format!("cannot inspect the peer: {error}")))?;
+    crate::api::frame::verify_peer(&descriptor, |error| {
+        CowshedError::sandbox_denied(
+            format!("workspace supervisor refused a peer: {error:?}"),
+            "connect as the user that owns the workspace",
+        )
+    })
+}
+
+fn to_value<T: Serialize>(value: &T) -> Result<serde_json::Value> {
+    serde_json::to_value(value).map_err(|error| protocol_error(format!("encoding failed: {error}")))
+}
+
+async fn answer(
+    supervisor: &WorkspaceSupervisorHandle,
+    streams: &Streams,
+    call: Call,
+    payload: Bytes,
+) -> Result<(serde_json::Value, Bytes)> {
+    let session =
+        |wire: SessionWire| SessionToken::remote(supervisor.snapshot(), wire.identity, wire.name);
+    let unit = || to_value(&());
+    Ok(match call {
+        Call::OpenSession { name } => {
+            let token = supervisor.open_session(name).await?;
+            (to_value(&SessionWire::from(&token))?, Bytes::new())
+        }
+        Call::SessionSnapshot { session: wire } => {
+            let snapshot = supervisor.session_snapshot(&session(wire)).await?;
+            (
+                to_value(&SessionSnapshotWire {
+                    identity: snapshot.identity,
+                    name: snapshot.name,
+                    cwd: snapshot.cwd,
+                    env: snapshot.env,
+                    background_jobs: snapshot.background_jobs,
+                })?,
+                Bytes::new(),
+            )
+        }
+        Call::CloseSession { session: wire } => {
+            supervisor.close_session(session(wire)).await?;
+            (unit()?, Bytes::new())
+        }
+        Call::Exec {
+            session: wire,
+            background,
+            request,
+        } => {
+            let command =
+                ExecCommand::from_fields(request.argv, request.script).map_err(|error| {
+                    CowshedError::usage(error.to_string(), "provide a valid bounded command")
+                })?;
+            let mut writer = None;
+            let stdin = match request.stdin {
+                StdinWire::Empty => StdinSource::Empty,
+                StdinWire::Inline => StdinSource::Inline(payload),
+                StdinWire::WorkspaceFile { workspace_path } => {
+                    StdinSource::WorkspaceFile(workspace_path)
+                }
+                StdinWire::Stream => {
+                    let (sender, receiver) = mpsc::channel(STREAM_DEPTH);
+                    writer = Some(sender);
+                    StdinSource::Stream(Box::pin(ChannelReader::new(receiver)))
+                }
+            };
+            let exec = ExecRequest {
+                command,
+                cwd: request.cwd,
+                mode: request.mode,
+                env: request.env,
+                trace: request.trace,
+                stdin,
+                stdout_copy: request.stdout_copy,
+                stderr_copy: request.stderr_copy,
+            };
+            let session = wire.map(session);
+            let job_id = if background {
+                supervisor.exec_background(session.as_ref(), exec).await?
+            } else {
+                supervisor.exec(session.as_ref(), exec).await?
+            };
+            if let Some(writer) = writer {
+                lock(streams).insert(job_id, writer);
+            }
+            (to_value(&job_id)?, Bytes::new())
+        }
+        Call::StdinWrite { job_id } => {
+            supervisor.stdin_write(job_id, payload).await?;
+            (unit()?, Bytes::new())
+        }
+        Call::StdinClose { job_id } => {
+            supervisor.stdin_close(job_id).await?;
+            (unit()?, Bytes::new())
+        }
+        Call::StreamChunk { job_id } => {
+            let writer = lock(streams).get(&job_id).cloned().ok_or_else(|| {
+                CowshedError::conflict(
+                    format!("job {} has no open stdin stream", job_id.get()),
+                    "inspect the job status",
+                )
+            })?;
+            // The job's reader applies backpressure through the bounded channel; a job that
+            // stopped reading closed its receiver, which ends the stream here.
+            writer.send(Ok(payload)).await.map_err(|_| {
+                lock(streams).remove(&job_id);
+                CowshedError::conflict(
+                    format!("job {} stopped reading its stdin", job_id.get()),
+                    "inspect the job status",
+                )
+            })?;
+            (unit()?, Bytes::new())
+        }
+        Call::StreamEnd { job_id, error } => {
+            let writer = lock(streams).remove(&job_id);
+            if let (Some(writer), Some(error)) = (writer, error) {
+                let _ = writer.send(Err(io::Error::other(error))).await;
+            }
+            (unit()?, Bytes::new())
+        }
+        Call::Info { job_id } => (to_value(&supervisor.info(job_id).await?)?, Bytes::new()),
+        Call::List => (to_value(&supervisor.list().await?)?, Bytes::new()),
+        Call::Kill { job_id } => {
+            supervisor.kill(job_id).await?;
+            (unit()?, Bytes::new())
+        }
+        Call::Wait { job_id } => (to_value(&supervisor.wait(job_id).await?)?, Bytes::new()),
+        Call::LogRead {
+            job_id,
+            stream,
+            offset,
+            follow,
+        } => {
+            let chunk = supervisor
+                .log_read(job_id, stream.into(), offset, follow)
+                .await?;
+            (
+                to_value(&LogChunkWire {
+                    next_offset: chunk.next_offset,
+                    eof: chunk.eof,
+                })?,
+                chunk.bytes,
+            )
+        }
+        Call::Checkpoint { checkpoint_id } => {
+            let barrier = supervisor.checkpoint_barrier(checkpoint_id).await?;
+            (
+                to_value(&CheckpointWire {
+                    checkpoint_id: barrier.checkpoint_id,
+                    barrier_id: barrier.barrier_id,
+                    manifest_batch_sha256: barrier.manifest_batch_sha256,
+                })?,
+                Bytes::new(),
+            )
+        }
+        Call::Quiesce => {
+            supervisor.quiesce().await?;
+            (unit()?, Bytes::new())
+        }
+        Call::Retire => {
+            supervisor.retire().await?;
+            (unit()?, Bytes::new())
+        }
+    })
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    // A poisoned map only means another call panicked mid-insert; the map itself is whole.
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// The job side of a forwarded stdin stream: bytes as the client sends them, an error when the
+/// client's source failed, and end of file when it ended cleanly.
+struct ChannelReader {
+    receiver: mpsc::Receiver<io::Result<Bytes>>,
+    pending: Bytes,
+}
+
+impl ChannelReader {
+    fn new(receiver: mpsc::Receiver<io::Result<Bytes>>) -> Self {
+        Self {
+            receiver,
+            pending: Bytes::new(),
+        }
+    }
+}
+
+impl AsyncRead for ChannelReader {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        while self.pending.is_empty() {
+            match self.receiver.poll_recv(context) {
+                Poll::Ready(Some(Ok(bytes))) => self.pending = bytes,
+                Poll::Ready(Some(Err(error))) => return Poll::Ready(Err(error)),
+                Poll::Ready(None) => return Poll::Ready(Ok(())),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+        let count = self.pending.len().min(buffer.remaining());
+        let chunk = self.pending.split_to(count);
+        buffer.put_slice(&chunk);
+        Poll::Ready(Ok(()))
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Client
+// ---------------------------------------------------------------------------------------------
+
+/// What a supervisor reports about itself when a client first reaches it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Hello {
+    pub authority: WorkspaceAuthoritySnapshot,
+    /// The process serving the socket.
+    pub pid: u32,
+}
+
+/// Who serves `path`, or why it cannot be used: unreachable, or speaking another protocol.
+pub async fn hello(path: &Path) -> Result<Hello> {
+    // A supervisor answers hello from its actor at once; one that cannot within the bound is
+    // wedged, and waiting on it would wedge the caller too.
+    let (value, _) =
+        tokio::time::timeout(HELLO_BOUND, exchange(path, &Request::Hello, Bytes::new()))
+            .await
+            .map_err(|_| {
+                CowshedError::environment_missing(
+                    format!(
+                        "the workspace supervisor at {} did not answer within {} seconds",
+                        path.display(),
+                        HELLO_BOUND.as_secs()
+                    ),
+                    "cowshed doctor --json",
+                )
+            })??;
+    // Read the version before the rest: a newer peer's hello may carry fields this build
+    // cannot decode, and the version is what says why.
+    let protocol = value
+        .get("protocol")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| protocol_error("hello names no protocol version"))?;
+    if protocol != u64::from(PROTOCOL_VERSION) {
+        return Err(CowshedError::conflict(
+            format!(
+                "the workspace supervisor at {} speaks protocol {protocol}; this cowshed speaks {PROTOCOL_VERSION}",
+                path.display()
+            ),
+            "let the supervisor drain, or stop it with `cowshed detach`, so this cowshed starts its own",
+        ));
+    }
+    let hello: HelloWire = decode(value)?;
+    Ok(Hello {
+        authority: hello.authority.into(),
+        pid: hello.pid,
+    })
+}
+
+/// A handle whose calls reach the supervisor serving `path` under `authority`.
+pub fn connect(path: PathBuf, authority: WorkspaceAuthoritySnapshot) -> WorkspaceSupervisorHandle {
+    let (commands, mut receiver) = mpsc::channel(64);
+    let path = Arc::new(path);
+    tokio::spawn(async move {
+        while let Some(command) = receiver.recv().await {
+            tokio::spawn(forward(Arc::clone(&path), command));
+        }
+    });
+    WorkspaceSupervisorHandle::from_parts(authority, commands)
+}
+
+async fn round_trip(
+    path: &Path,
+    authority: AuthorityWire,
+    call: Call,
+    payload: Bytes,
+) -> Result<(serde_json::Value, Bytes)> {
+    let request = Request::Call {
+        authority,
+        call,
+        bytes: payload.len(),
+    };
+    exchange(path, &request, payload).await
+}
+
+async fn exchange(
+    path: &Path,
+    request: &Request,
+    payload: Bytes,
+) -> Result<(serde_json::Value, Bytes)> {
+    let mut stream = UnixStream::connect(path)
+        .await
+        .map_err(|error| unavailable(path, &error))?;
+    write_json(&mut stream, request).await?;
+    if !payload.is_empty() {
+        write_frame(&mut stream, &payload, MAX_BYTES_FRAME).await?;
+    }
+    match read_json::<Response>(&mut stream).await {
+        Ok(Response::Ok { value, bytes }) => Ok((value, read_bytes(&mut stream, bytes).await?)),
+        Ok(Response::Err(error)) => Err(error),
+        // The supervisor went away mid-call: the call's outcome is unknown, which is what
+        // "unavailable" says; the caller re-reads job state rather than assuming either way.
+        Err(_) => Err(unavailable(
+            path,
+            &io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "the supervisor closed the call",
+            ),
+        )),
+    }
+}
+
+fn decode<T: for<'de> Deserialize<'de>>(value: serde_json::Value) -> Result<T> {
+    serde_json::from_value(value)
+        .map_err(|error| protocol_error(format!("malformed answer: {error}")))
+}
+
+async fn call<T: for<'de> Deserialize<'de>>(
+    path: &Path,
+    authority: &WorkspaceAuthoritySnapshot,
+    call: Call,
+    payload: Bytes,
+) -> Result<T> {
+    let (value, _) = round_trip(path, authority.into(), call, payload).await?;
+    decode(value)
+}
+
+async fn forward(path: Arc<PathBuf>, command: Command) {
+    let path = path.as_path();
+    match command {
+        Command::AdvanceAuthority { reply, .. } => {
+            // A served supervisor runs under the profile it was launched with and cannot widen
+            // it; a grant change drains it and launches another (11_shell.md).
+            let _ = reply.send(Err(CowshedError::conflict(
+                "a workspace supervisor process cannot change its grant revision in place",
+                "drain the supervisor; the next command starts one under the new revision",
+            )));
+        }
+        Command::OpenSession {
+            authority,
+            name,
+            reply,
+        } => {
+            let result =
+                call::<SessionWire>(path, &authority, Call::OpenSession { name }, Bytes::new())
+                    .await
+                    .map(|wire| SessionToken::remote(&authority, wire.identity, wire.name));
+            let _ = reply.send(result);
+        }
+        Command::SessionSnapshot {
+            authority,
+            session,
+            reply,
+        } => {
+            let result = call::<SessionSnapshotWire>(
+                path,
+                &authority,
+                Call::SessionSnapshot {
+                    session: SessionWire::from(&session),
+                },
+                Bytes::new(),
+            )
+            .await
+            .map(|wire| SessionSnapshot {
+                identity: wire.identity,
+                name: wire.name,
+                cwd: wire.cwd,
+                env: wire.env,
+                background_jobs: wire.background_jobs,
+            });
+            let _ = reply.send(result);
+        }
+        Command::CloseSession {
+            authority,
+            session,
+            reply,
+        } => {
+            let result = call::<()>(
+                path,
+                &authority,
+                Call::CloseSession {
+                    session: SessionWire::from(&session),
+                },
+                Bytes::new(),
+            )
+            .await;
+            let _ = reply.send(result);
+        }
+        Command::Exec {
+            authority,
+            session,
+            request,
+            background,
+            reply,
+        } => forward_exec(path, authority, session, request, background, reply).await,
+        Command::StdinWrite {
+            authority,
+            job_id,
+            bytes,
+            reply,
+        } => {
+            let _ = reply.send(call(path, &authority, Call::StdinWrite { job_id }, bytes).await);
+        }
+        Command::StdinClose {
+            authority,
+            job_id,
+            reply,
+        } => {
+            let _ =
+                reply.send(call(path, &authority, Call::StdinClose { job_id }, Bytes::new()).await);
+        }
+        Command::Info {
+            authority,
+            job_id,
+            reply,
+        } => {
+            let _ = reply.send(call(path, &authority, Call::Info { job_id }, Bytes::new()).await);
+        }
+        Command::List { authority, reply } => {
+            let _ = reply.send(call(path, &authority, Call::List, Bytes::new()).await);
+        }
+        Command::Kill {
+            authority,
+            job_id,
+            reply,
+        } => {
+            let _ = reply.send(call(path, &authority, Call::Kill { job_id }, Bytes::new()).await);
+        }
+        Command::Wait {
+            authority,
+            job_id,
+            reply,
+        } => {
+            let _ = reply.send(call(path, &authority, Call::Wait { job_id }, Bytes::new()).await);
+        }
+        Command::LogRead {
+            authority,
+            job_id,
+            stream,
+            offset,
+            follow,
+            reply,
+        } => {
+            let result = round_trip(
+                path,
+                (&authority).into(),
+                Call::LogRead {
+                    job_id,
+                    stream: stream.into(),
+                    offset,
+                    follow,
+                },
+                Bytes::new(),
+            )
+            .await
+            .and_then(|(value, bytes)| {
+                let wire: LogChunkWire = decode(value)?;
+                Ok(LogChunk {
+                    bytes,
+                    next_offset: wire.next_offset,
+                    eof: wire.eof,
+                })
+            });
+            let _ = reply.send(result);
+        }
+        Command::Checkpoint {
+            authority,
+            checkpoint_id,
+            reply,
+        } => {
+            let result = call::<CheckpointWire>(
+                path,
+                &authority,
+                Call::Checkpoint { checkpoint_id },
+                Bytes::new(),
+            )
+            .await
+            .map(|wire| CheckpointBarrier {
+                checkpoint_id: wire.checkpoint_id,
+                barrier_id: wire.barrier_id,
+                manifest_batch_sha256: wire.manifest_batch_sha256,
+            });
+            let _ = reply.send(result);
+        }
+        Command::Quiesce { authority, reply } => {
+            let _ = reply.send(call(path, &authority, Call::Quiesce, Bytes::new()).await);
+        }
+        Command::Retire { authority, reply } => {
+            let _ = reply.send(call(path, &authority, Call::Retire, Bytes::new()).await);
+        }
+        Command::CurrentAuthority { reply } => {
+            let _ = reply.send(hello(path).await.map(|hello| hello.authority));
+        }
+    }
+}
+
+async fn forward_exec(
+    path: &Path,
+    authority: WorkspaceAuthoritySnapshot,
+    session: Option<SessionToken>,
+    request: ExecRequest,
+    background: bool,
+    reply: oneshot::Sender<Result<JobId>>,
+) {
+    let (stdin, payload, stream) = match request.stdin {
+        StdinSource::Empty => (StdinWire::Empty, Bytes::new(), None),
+        StdinSource::Inline(bytes) => (StdinWire::Inline, bytes, None),
+        StdinSource::WorkspaceFile(workspace_path) => (
+            StdinWire::WorkspaceFile { workspace_path },
+            Bytes::new(),
+            None,
+        ),
+        StdinSource::Stream(reader) => (StdinWire::Stream, Bytes::new(), Some(reader)),
+    };
+    let (argv, script) = match request.command {
+        ExecCommand::Argv(argv) => (Some(argv), None),
+        ExecCommand::Script(script) => (None, Some(script)),
+    };
+    let call_request = Call::Exec {
+        session: session.as_ref().map(SessionWire::from),
+        background,
+        request: ExecWire {
+            argv,
+            script,
+            cwd: request.cwd,
+            mode: request.mode,
+            env: request.env,
+            trace: request.trace,
+            stdin,
+            stdout_copy: request.stdout_copy,
+            stderr_copy: request.stderr_copy,
+        },
+    };
+    let admitted = call::<JobId>(path, &authority, call_request, payload).await;
+    let job_id = admitted.as_ref().ok().copied();
+    let _ = reply.send(admitted);
+    if let (Some(job_id), Some(mut reader)) = (job_id, stream) {
+        let mut buffer = vec![0_u8; STREAM_CHUNK];
+        let error = loop {
+            match reader.read(&mut buffer).await {
+                Ok(0) => break None,
+                Ok(count) => {
+                    let chunk = Bytes::copy_from_slice(&buffer[..count]);
+                    if call::<()>(path, &authority, Call::StreamChunk { job_id }, chunk)
+                        .await
+                        .is_err()
+                    {
+                        // The job stopped reading or the supervisor went away; either way the
+                        // job's own state says what happened, and there is no one to send to.
+                        return;
+                    }
+                }
+                Err(error) => break Some(error.to_string()),
+            }
+        };
+        let _ = call::<()>(
+            path,
+            &authority,
+            Call::StreamEnd { job_id, error },
+            Bytes::new(),
+        )
+        .await;
+    }
+}

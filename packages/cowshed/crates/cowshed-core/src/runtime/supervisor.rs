@@ -166,6 +166,19 @@ pub struct SessionToken {
 }
 
 impl SessionToken {
+    /// A token a supervisor served over its socket issued: identity and name as it reported.
+    pub(super) fn remote(
+        authority: &WorkspaceAuthoritySnapshot,
+        identity: u64,
+        name: Option<String>,
+    ) -> Self {
+        Self {
+            authority: authority.clone(),
+            identity,
+            name,
+        }
+    }
+
     pub fn name(&self) -> Option<&str> {
         self.name.as_deref()
     }
@@ -1858,6 +1871,24 @@ impl std::fmt::Debug for WorkspaceSupervisorHandle {
 }
 
 impl WorkspaceSupervisorHandle {
+    pub(super) fn from_parts(
+        authority: WorkspaceAuthoritySnapshot,
+        commands: mpsc::Sender<Command>,
+    ) -> Self {
+        Self {
+            authority,
+            commands,
+        }
+    }
+
+    /// The same supervisor, called under `authority`: the actor fences every call by it.
+    pub(super) fn with_authority(&self, authority: WorkspaceAuthoritySnapshot) -> Self {
+        Self {
+            authority,
+            commands: self.commands.clone(),
+        }
+    }
+
     pub fn snapshot(&self) -> &WorkspaceAuthoritySnapshot {
         &self.authority
     }
@@ -2051,6 +2082,12 @@ impl WorkspaceSupervisorHandle {
         .await
     }
 
+    /// The authority the supervisor holds now, which a grant advance may have moved past the
+    /// one this handle was made with.
+    pub async fn current_authority(&self) -> Result<WorkspaceAuthoritySnapshot> {
+        self.call(|reply| Command::CurrentAuthority { reply }).await
+    }
+
     pub async fn retire(&self) -> Result<()> {
         self.call(|reply| Command::Retire {
             authority: self.authority.clone(),
@@ -2144,7 +2181,7 @@ impl WorkspaceSupervisor {
     }
 }
 
-enum Command {
+pub(super) enum Command {
     AdvanceAuthority {
         expected: WorkspaceAuthoritySnapshot,
         authority: WorkspaceAuthoritySnapshot,
@@ -2223,6 +2260,10 @@ enum Command {
     Retire {
         authority: WorkspaceAuthoritySnapshot,
         reply: oneshot::Sender<Result<()>>,
+    },
+    /// The authority the actor holds now; unfenced, because it is how a caller learns it.
+    CurrentAuthority {
+        reply: oneshot::Sender<Result<WorkspaceAuthoritySnapshot>>,
     },
 }
 
@@ -2551,6 +2592,9 @@ impl SupervisorActor {
                         let _ = self.begin_kill(job_id, KillReason::Retire);
                     }
                 }
+            }
+            Command::CurrentAuthority { reply } => {
+                let _ = reply.send(Ok(self.authority.clone()));
             }
         }
     }

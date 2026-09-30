@@ -1575,3 +1575,194 @@ fn a_dropped_supervisor_ends_the_jobs_it_still_runs() {
     );
     drop(spawned);
 }
+
+/// `handle`'s supervisor served on a fresh socket, and a handle that reaches it only through
+/// that socket.
+async fn served(handle: &WorkspaceSupervisorHandle) -> (WorkspaceSupervisorHandle, PathBuf) {
+    use cowshed_core::runtime::supervisor_socket;
+    // Short: a Unix socket path is bounded at 104 bytes on macOS.
+    let path = PathBuf::from("/tmp").join(format!(
+        "cowshed-sock-{}/s",
+        &uuid::Uuid::new_v4().simple().to_string()[..12]
+    ));
+    let listener = supervisor_socket::bind(&path).await.expect("bind");
+    tokio::spawn(supervisor_socket::serve(listener, handle.clone()));
+    let remote = supervisor_socket::connect(path.clone(), handle.snapshot().clone());
+    (remote, path)
+}
+
+#[tokio::test]
+async fn a_served_supervisor_runs_a_job_exactly_as_the_in_process_one_does() {
+    let mut h = harness(1, 1024, false, false);
+    let (remote, path) = served(&h.handle).await;
+    assert_eq!(
+        cowshed_core::runtime::supervisor_socket::hello(&path)
+            .await
+            .unwrap()
+            .authority,
+        authority(),
+        "the socket names the authority it serves"
+    );
+    let session = remote.open_session(Some("build".into())).await.unwrap();
+    let stdin = Bytes::from_static(&[0xfe, 0x00, b'i', 0x80]);
+    let job = remote
+        .exec(Some(&session), request(StdinSource::Inline(stdin.clone())))
+        .await
+        .unwrap();
+    let spawned = h.spawned.recv().await.unwrap();
+    assert_eq!(spawned.request.job_id, job);
+    assert_eq!(
+        h.process.recv().await.unwrap(),
+        ProcessObservation::Stdin(job, stdin)
+    );
+    let opaque = [0xff, 0x00, 0x80, b'x'];
+    complete(
+        &spawned,
+        &opaque,
+        b"err",
+        ExitStatus::Signaled {
+            signal: 9,
+            core_dumped: true,
+        },
+    )
+    .await;
+    let info = remote.wait(job).await.unwrap();
+    assert_eq!(
+        info.exit,
+        Some(ExitStatus::Signaled {
+            signal: 9,
+            core_dumped: true
+        })
+    );
+    assert_eq!(info, h.handle.info(job).await.unwrap());
+    let log = remote
+        .log_read(job, StreamKind::Stdout, 0, false)
+        .await
+        .unwrap();
+    assert_eq!((log.bytes.as_ref(), log.eof), (&opaque[..], true));
+    assert_eq!(remote.list().await.unwrap(), vec![info]);
+    assert_eq!(
+        remote.session_snapshot(&session).await.unwrap(),
+        h.handle.session_snapshot(&session).await.unwrap()
+    );
+}
+
+#[tokio::test]
+async fn a_streamed_stdin_reaches_a_served_job_whole_and_in_order() {
+    use tokio::io::AsyncWriteExt as _;
+    let mut h = harness(1, 1024, false, false);
+    let (remote, _path) = served(&h.handle).await;
+    let (mut writer, reader) = tokio::io::duplex(1024);
+    let job = remote
+        .exec(None, request(StdinSource::Stream(Box::pin(reader))))
+        .await
+        .unwrap();
+    let spawned = h.spawned.recv().await.unwrap();
+    let sent: Vec<u8> = (0..200_000_u32).map(|index| (index % 251) as u8).collect();
+    let payload = sent.clone();
+    tokio::spawn(async move {
+        writer.write_all(&payload).await.unwrap();
+    });
+    let mut received = Vec::new();
+    loop {
+        match h.process.recv().await.unwrap() {
+            ProcessObservation::Stdin(id, bytes) => {
+                assert_eq!(id, job);
+                received.extend_from_slice(&bytes);
+            }
+            ProcessObservation::StdinClosed(id) => {
+                assert_eq!(id, job);
+                break;
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+    assert_eq!(received, sent);
+    complete(&spawned, b"", b"", ExitStatus::Exited { code: 0 }).await;
+    assert_eq!(remote.wait(job).await.unwrap().state, JobState::Exited);
+}
+
+#[tokio::test]
+async fn a_served_supervisor_refuses_a_caller_that_holds_another_authority() {
+    let mut h = harness(1, 1024, false, false);
+    let (_remote, path) = served(&h.handle).await;
+    let stale = cowshed_core::runtime::supervisor_socket::connect(
+        path,
+        WorkspaceAuthoritySnapshot {
+            grant_revision: authority().grant_revision + 1,
+            ..authority()
+        },
+    );
+    let refused = stale
+        .exec(None, request(StdinSource::Empty))
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code, ErrorCode::Conflict);
+    assert!(
+        h.spawned.try_recv().is_err(),
+        "nothing ran for the stale caller"
+    );
+}
+
+#[tokio::test]
+async fn a_pending_wait_holds_up_no_other_call_to_a_served_supervisor() {
+    let mut h = harness(1, 1024, false, false);
+    let (remote, _path) = served(&h.handle).await;
+    let job = remote
+        .exec(None, request(StdinSource::Empty))
+        .await
+        .unwrap();
+    let spawned = h.spawned.recv().await.unwrap();
+    let waiting = {
+        let remote = remote.clone();
+        tokio::spawn(async move { remote.wait(job).await })
+    };
+    let follow = {
+        let remote = remote.clone();
+        tokio::spawn(async move { remote.log_read(job, StreamKind::Stdout, 0, true).await })
+    };
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        remote.info(job).await.unwrap().state,
+        JobState::Running,
+        "a call made while a wait and a follow are pending is answered"
+    );
+    assert!(!waiting.is_finished() && !follow.is_finished());
+    complete(&spawned, b"late", b"", ExitStatus::Exited { code: 0 }).await;
+    assert_eq!(follow.await.unwrap().unwrap().bytes.as_ref(), b"late");
+    assert_eq!(waiting.await.unwrap().unwrap().state, JobState::Exited);
+}
+
+#[tokio::test]
+async fn a_supervisor_that_speaks_another_protocol_is_refused_by_name() {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    let path = PathBuf::from("/tmp").join(format!(
+        "cowshed-sock-{}",
+        &uuid::Uuid::new_v4().simple().to_string()[..12]
+    ));
+    let listener = tokio::net::UnixListener::bind(&path).unwrap();
+    tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut length = [0_u8; 4];
+        stream.read_exact(&mut length).await.unwrap();
+        let mut request = vec![0_u8; u32::from_be_bytes(length) as usize];
+        stream.read_exact(&mut request).await.unwrap();
+        // A future supervisor: another version and a hello shape this build cannot decode.
+        let answer = br#"{"ok":{"value":{"protocol":99,"shape":"future"},"bytes":0}}"#;
+        stream
+            .write_all(&u32::try_from(answer.len()).unwrap().to_be_bytes())
+            .await
+            .unwrap();
+        stream.write_all(answer).await.unwrap();
+    });
+    let refused = cowshed_core::runtime::supervisor_socket::hello(&path)
+        .await
+        .unwrap_err();
+    std::fs::remove_file(&path).ok();
+    assert_eq!(refused.code, ErrorCode::Conflict);
+    assert!(
+        refused.message.contains("protocol 99"),
+        "{}",
+        refused.message
+    );
+}

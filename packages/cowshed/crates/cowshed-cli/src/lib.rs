@@ -15,3 +15,4 @@ pub mod sccache_nix;
 pub mod sccache_service;
 pub mod setup_service;
 pub mod skill;
+pub mod workspace_supervisor;

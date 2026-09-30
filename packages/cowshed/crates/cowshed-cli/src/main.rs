@@ -23,6 +23,13 @@ fn main() {
             std::process::exit(1);
         }
     };
+    if arguments
+        .first()
+        .is_some_and(|verb| verb == cowshed_cli::workspace_supervisor::VERB)
+    {
+        let code = runtime.block_on(cowshed_cli::workspace_supervisor::run(&arguments[1..]));
+        std::process::exit(code);
+    }
     let ending = runtime.block_on(run_interruptible(arguments));
     if let Ending::Interrupted { signal } = ending {
         // Shutting the runtime down drops every task it still holds. A workspace supervisor is

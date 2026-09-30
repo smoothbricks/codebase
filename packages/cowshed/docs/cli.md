@@ -567,8 +567,10 @@ command from that activated environment, so only the first command after the wor
 direnv/devenv evaluation. Those inputs are exactly what direnv itself watches — the `.envrc`, `devenv.nix`,
 `devenv.lock`, anything named with `watch_file`. Edit one and the next command re-activates, showing direnv's output on
 its stderr; every other command starts warm with only its own output. A `cd` or `export` inside one command never
-reaches the next. The warm shells live as long as the `cowshed` process that runs the workspace supervisor, so separate
-`cowshed exec` invocations each activate once.
+reaches the next. The warm shells live as long as the process that runs the workspace supervisor. That is the first
+`cowshed` process that needs the workspace, and every other `cowshed` process sends its commands to that supervisor over
+the workspace's socket while it lives. A `cowshed exec` issued after that process has exited starts a supervisor of its
+own and activates once.
 
 Interrupting `cowshed` itself — Ctrl-C, a closed terminal, SIGTERM — while it still runs a command ends that command and
 every job it started and still runs: SIGTERM, then SIGKILL after a short grace. `cowshed` then dies by the same signal,

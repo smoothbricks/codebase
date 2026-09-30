@@ -91,14 +91,15 @@ replaying a supervisor-owned environment in place of its shell entry hooks.
 
 ## Supervisor
 
-One supervisor process per attached workspace, spawned on first exec (or by `cowshed ensure` for warmed workspaces).
-Each instance is launched once per effective filesystem grant revision under that revision's workspace sandbox profile.
-That outer profile is the authority ceiling and gives the trusted supervisor protected-artifact write access. The
-supervisor itself never evaluates `.envrc`, sources shell startup, or runs repository hooks; it reads only the watch
-list an activation reports. It compiles the deterministic inner child profile first, then starts every exec host,
-one-shot command, and descendant beneath that restriction; each command runs in its job's own process group. The child
-profile denies writes beneath `.cowshed/job/**` and may further narrow for ReadOnly; it never adds authority
-(04_sandbox.md).
+One supervisor per attached workspace: the workspace's sole job allocator. It runs in the first controller process that
+needs it, or in a `cowshed __workspace-supervisor <project-root> <workspace>` process started for it, and that process
+serves it on the workspace's socket (Protocol, below). A controller process that finds the socket answering under the
+authority it needs sends its commands there instead of starting a second supervisor; one that finds it answering under
+another incarnation or grant revision refuses with `Conflict` naming the serving process. The supervisor itself never
+evaluates `.envrc`, sources shell startup, or runs repository hooks; it reads only the watch list an activation reports.
+It compiles the deterministic inner child profile first, then starts every exec host, one-shot command, and descendant
+beneath that restriction; each command runs in its job's own process group. The child profile denies writes beneath
+`.cowshed/job/**` and may further narrow for ReadOnly; it never adds authority (04_sandbox.md).
 
 - Holds the warm exec hosts above. Host startup and activation run inside the child sandbox; no repository-controlled
   startup runs in the supervisor.
@@ -119,52 +120,47 @@ parts and values are UTF-8 strings without NUL, bounded together at the same 1 M
 values. Validation precedes RPC, job/artifact effects, process allocation, and spawn. The supervisor consumes arguments
 into `OsString` for `plan_exec`; no `String`, lossy rendering, or alternate supervisor wire shape exists.
 
-- Idle timeout: the supervisor exits after `[shell] idle` (default 30 min) with no sessions and no running jobs, freeing
-  memory; the next exec respawns it. `cowshed detach`/`cowshed rm` stop it immediately (teardown below).
+- `cowshed detach`/`cowshed rm` retire it before the substrate changes (teardown below).
 
 ## Protocol
 
-A persistent Unix socket per supervisor lives at `<runtime dir>/<owner>/<repo>/<workspace>.sock`. The controller derives
-`owner` and `repo` from the primary `repo_id`, validates and encodes each as one component, then joins them; it never
-places an unsplit identifier into a path. The controller creates the per-user runtime directory mode `0700`; the
-supervisor binds the socket mode `0600` and verifies the connecting peer's uid (and platform peer credentials where
-available) before accepting any frame. The socket remains bound for the supervisor's lifetime and accepts multiple
-concurrent clients. Disconnecting one client detaches only that client's views: it neither stops jobs nor unlinks the
-socket. Clients may reconnect, authenticate as the same one-workspace capability, query the durable job id, and resume
-status/log/attach operations. The supervisor unlinks the socket only on orderly exit; startup may unlink a stale socket
-only after proving that no live supervisor owns it. It never applies the short-lived pattern of unlinking after the
-first client.
+Each supervisor listens on a Unix socket at `<store>/run/<digest>.sock`, where `digest` is the first 32 hex digits of
+the SHA-256 of `repo_id`, a NUL, and the workspace name. Owner, repository and workspace names together can exceed the
+104 bytes a socket path may hold on macOS; the digest keeps every path at 64 and no two workspaces share one. The
+serving process creates `<store>/run` mode `0700`, so no other user reaches a socket in it, binds the socket there and
+sets it `0600`, and verifies each connecting peer's uid before reading a byte. Binding replaces a socket file only when
+nothing answers on it; a live supervisor is never displaced. The serving process unlinks the socket when the supervisor
+is retired.
 
-Framing is deliberately minimal and binary so the NAPI and MCP clients need no parser beyond a length read:
+Every call is one connection: the client writes one JSON request frame, then the raw bytes the call carries (inline
+stdin, a stdin chunk) as one more frame; the supervisor answers with one JSON response frame, then the raw bytes the
+answer carries (a log chunk), and both sides close. A frame is a big-endian `u32` length and that many bytes. A long
+call — `wait`, a following log read — therefore holds only its own connection: no call queues behind another, nothing is
+multiplexed, and a client that disconnects abandons only its own call, never a job.
 
-```
-frame = channel:u8  length:u32-le  payload:[u8; length]
-channel = 0 control(JSON)  1 stdin  2 stdout  3 stderr  4 events(JSON)
-```
+- **hello** — the supervisor answers with its protocol version, the authority it serves (repository, workspace,
+  incarnation, grant and lifecycle revisions) and its pid. A client reads the version first and refuses another one by
+  name (`Conflict`), so two cowshed builds never exchange a call either cannot decode.
+- **calls** — `openSession`, `sessionSnapshot`, `closeSession`, `exec`, `stdinWrite`, `stdinClose`, `streamChunk`,
+  `streamEnd`, `info`, `list`, `kill`, `wait`, `logRead`, `checkpoint`, `quiesce`, `retire`: one per supervisor
+  operation, each naming the authority the caller holds. The supervisor fences every call by it exactly as it fences an
+  in-process one, so a caller holding a stale incarnation or grant revision is refused, not served under the wrong
+  profile. An accepted `exec` answers with the numeric `jobId`, allocated before process creation; a spawn failure is
+  therefore a terminal job, not a response with no identity.
+- **stdin** — empty, inline bytes (the request's raw frame), a workspace-relative regular file the supervisor opens
+  inside the sandbox boundary, or a stream: the client forwards its source as `streamChunk` calls in order, each
+  answered only once the job's bounded queue took it, and ends it with `streamEnd`, naming the source's error if it
+  failed. Bytes are never interpolated into shell text.
+- **stdout/stderr** — `logRead` returns the bytes of one stream from an offset, following (waiting for the next bytes)
+  when asked. Capture begins in a bounded in-memory buffer while SHA-256 and the combined quota advance over the exact
+  admitted bytes; a stream promotes lazily to a protected file when it exceeds the inline bound or when backgrounding,
+  checkpointing, or replay requires filesystem-resident bytes. A slow or absent reader never blocks capture, and a
+  reader resumes from the representation-transparent offset whether the protected artifact is terminal inline Arrow
+  Binary or a file.
 
-- **control** — request/response JSON: `open-session`, `run`, `signal`, `resize`, `close`. An accepted `run` response
-  always includes the numeric `jobId`, allocated before process creation; a spawn failure is therefore a terminal job,
-  not a response with no identity.
-- **stdin** — a structured binary source selected by the exec request: empty, inline bytes, a backpressured client
-  stream, or a workspace-relative regular file. Inline/stream bytes arrive on channel 1; the workspace-file request
-  carries only the normalized relative path and the supervisor opens it inside the sandbox boundary. Bounded queues
-  propagate child-pipe backpressure to the source; bytes are never interpolated into shell text.
-- **stdout/stderr** — raw bytes, backpressured per client and always separate. Capture begins in a bounded in-memory
-  buffer while SHA-256 and the combined quota advance over the exact admitted bytes. A stream promotes lazily to a
-  protected file when it exceeds the inline bound or when backgrounding, checkpointing, or replay requires
-  filesystem-resident bytes; promotion writes the complete buffered prefix before appending. A slow or disconnected
-  client never blocks capture. Reconnect resumes from the representation-transparent stream offset whether the protected
-  artifact is terminal inline Arrow Binary or a file.
-- **events** — asynchronous JSON notifications: `job-started`, `job-backgrounded`, `job-exited`, `session-closed`. Every
-  job event carries the durable `(repoId, workspaceIncarnation, jobId)` key and standard lmao
-  `traceId`/`threadId`/`spanId` plus nullable `parentThreadId`/`parentSpanId`. `job-backgrounded` forces any memory-only
-  prefix to a protected file before acknowledging detachment. Terminal events carry separate `stdout` and `stderr`
-  `StreamInfo` values with storage, byte count, SHA-256, and bounded summary. A client that only wants completion can
-  ignore the byte channels and watch events.
-
-The protocol is transport for both the CLI (which renders it to the stdout/stderr contract, 06_cli.md) and the MCP
-server (which renders it to tool results, 12_mcp.md). JSON is bounded control/result transport: it may carry a tagged,
-bounded inline artifact, but never an unbounded stdout/stderr stream. Controller commitments never carry output payload.
+The protocol is transport for every client — the controller behind the CLI (06_cli.md), NAPI, and the MCP server
+(12_mcp.md). JSON is bounded control/result transport: it may carry a tagged, bounded inline artifact, but never an
+unbounded stdout/stderr stream. Controller commitments never carry output payload.
 
 ## Job control
 

@@ -133,6 +133,12 @@ pub trait ProjectRuntimeHost: Send + 'static {
             "repository identity changes are unavailable for this runtime host",
         ))
     }
+    /// Serve `workspace`'s supervisor from this process on its socket until it is retired.
+    async fn serve_supervisor(&mut self, _workspace: WorkspaceName) -> Result<()> {
+        Err(CowshedError::internal(
+            "serving a workspace supervisor is unavailable for this runtime host",
+        ))
+    }
     async fn attach(&mut self, workspace: WorkspaceName, options: AttachOptions) -> Result<()>;
     async fn detach(&mut self, workspace: WorkspaceName) -> Result<()>;
     async fn resize(
@@ -578,6 +584,26 @@ impl ProjectRuntime {
         self.router.clone()
     }
 
+    /// Serve `workspace`'s supervisor from this process on its socket until a client retires
+    /// it. The runtime serves nothing else meanwhile: this is the whole of the
+    /// `cowshed __workspace-supervisor` process.
+    pub async fn serve_supervisor(&self, workspace: &WorkspaceName) -> Result<()> {
+        self.router
+            .route(
+                ConnectionAuthority::Coordinator {
+                    repo_id: self.descriptor.repo_id.clone(),
+                },
+                "coordinator.serveSupervisor".to_owned(),
+                json!({
+                    "repoId": self.descriptor.repo_id,
+                    "workspace": workspace,
+                }),
+                None,
+            )
+            .await
+            .map(|_| ())
+    }
+
     pub async fn shutdown(self) -> Result<()> {
         drop(self.router);
         self.actor
@@ -652,6 +678,7 @@ impl ProjectActor {
             "coordinator.resize" => self.coordinator_resize(request).await,
             "coordinator.defragment" => self.coordinator_defragment(request).await,
             "coordinator.detach" => self.coordinator_detach(request).await,
+            "coordinator.serveSupervisor" => self.coordinator_serve_supervisor(request).await,
             "coordinator.assignSlot" => self.coordinator_assign_slot(request).await,
             "coordinator.destroy" => self.coordinator_destroy(request).await,
             "coordinator.gc" => self.coordinator_gc(request).await,
@@ -919,6 +946,17 @@ impl ProjectActor {
         let params: WorkspaceParams = decode_params(request.params(), request.method())?;
         self.require_repo(&params.repo_id)?;
         self.host.detach(params.workspace).await?;
+        json_response(EmptyResult {})
+    }
+
+    async fn coordinator_serve_supervisor(
+        &mut self,
+        request: RouterRequest,
+    ) -> Result<RouterResponse> {
+        require_coordinator(request.authority())?;
+        let params: WorkspaceParams = decode_params(request.params(), request.method())?;
+        self.require_repo(&params.repo_id)?;
+        self.host.serve_supervisor(params.workspace).await?;
         json_response(EmptyResult {})
     }
 
@@ -1613,8 +1651,12 @@ struct NativeProjectRuntimeHost {
     substrate_config: crate::storage::apfs::ApfsSubstrateConfig,
     substrate: NativeSubstrate,
     commitments: super::supervisor::CommitmentPublisherHandle,
+    /// The handle each workspace's commands go through: to the supervisor serving the
+    /// workspace's socket, whichever process serves it.
     supervisors:
         std::collections::BTreeMap<WorkspaceName, super::supervisor::WorkspaceSupervisorHandle>,
+    /// The supervisors this process serves.
+    served: std::collections::BTreeMap<WorkspaceName, ServedSupervisor>,
     sessions: std::collections::BTreeMap<
         (WorkspaceName, Option<String>),
         super::supervisor::SessionToken,
@@ -1633,6 +1675,26 @@ struct NativeProjectRuntimeHost {
     binding_remote_validation: BindingRemoteValidation,
     /// Which unfinished lifecycle intents this opening replays; see [`RecoveryScope`].
     recovery_scope: RecoveryScope,
+}
+
+/// A supervisor this process runs and serves on the workspace's socket.
+#[cfg(target_os = "macos")]
+struct ServedSupervisor {
+    /// The actor itself, for what only its owner may do: advance its grant revision in place.
+    actor: super::supervisor::WorkspaceSupervisorHandle,
+    socket: PathBuf,
+    /// Ends once a `retire` call retired the actor and was answered.
+    server: tokio::task::JoinHandle<Result<()>>,
+}
+
+/// A controller that stops serving a supervisor ends it, as dropping an in-process supervisor
+/// always did: the server lets go of its handle, and the actor ends the jobs it still runs.
+#[cfg(target_os = "macos")]
+impl Drop for ServedSupervisor {
+    fn drop(&mut self) {
+        self.server.abort();
+        let _ = std::fs::remove_file(&self.socket);
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -2362,6 +2424,7 @@ impl NativeProjectRuntimeHost {
             substrate,
             commitments,
             supervisors: std::collections::BTreeMap::new(),
+            served: std::collections::BTreeMap::new(),
             sessions: std::collections::BTreeMap::new(),
             home,
             telemetry_root,
@@ -4295,15 +4358,32 @@ impl NativeProjectRuntimeHost {
         // The effective revision covers the project's standing grants too, so a project grant
         // change relaunches the supervisor exactly as a workspace grant change does.
         let grants = effective_workspace_grants(&self.layout, &current.metadata.grants)?;
+        let socket = super::supervisor_socket::socket_path(
+            &self.descriptor.store_root,
+            &self.descriptor.repo_id,
+            name,
+        );
         if let Some(handle) = self.supervisors.get(name)
             && handle.snapshot().workspace_incarnation == *current.derived.workspace.incarnation()
             && handle.snapshot().grant_revision == grants.revision
         {
-            return Ok(handle.clone());
+            // A supervisor another process serves may have gone with that process.
+            let live = self.served.contains_key(name)
+                || super::supervisor_socket::hello(&socket)
+                    .await
+                    .is_ok_and(|hello| &hello.authority == handle.snapshot());
+            if live {
+                return Ok(handle.clone());
+            }
         }
         if let Some(old) = self.supervisors.remove(name) {
-            old.quiesce().await?;
-            old.retire().await?;
+            // Only a supervisor this process serves is retired here; another process's is its
+            // own to retire, and the hello below says whose it is.
+            if self.served.contains_key(name) {
+                old.quiesce().await?;
+                old.retire().await?;
+                self.forget_served(name);
+            }
             self.sessions.retain(|(workspace, _), _| workspace != name);
         }
         crate::git::GitRepository::from_root(&mount)
@@ -4366,19 +4446,103 @@ impl NativeProjectRuntimeHost {
                 ..super::shell_pool::ShellPoolConfig::default()
             },
         };
-        let handle =
+        // A workspace has one supervisor, its one job allocator: when another controller
+        // process already serves it under this authority, its commands go there.
+        match super::supervisor_socket::hello(&socket).await {
+            Ok(hello) if hello.authority == config.authority => {
+                let handle = super::supervisor_socket::connect(socket, config.authority);
+                self.supervisors.insert(name.clone(), handle.clone());
+                return Ok(handle);
+            }
+            Ok(hello) => {
+                return Err(CowshedError::conflict(
+                    format!(
+                        "process {} serves workspace {name}'s supervisor under incarnation {} \
+                         and grant revision {}; this command needs incarnation {} and grant \
+                         revision {}",
+                        hello.pid,
+                        hello.authority.workspace_incarnation,
+                        hello.authority.grant_revision,
+                        config.authority.workspace_incarnation,
+                        config.authority.grant_revision,
+                    ),
+                    format!("let that command finish, or run `cowshed detach {name}`, then retry"),
+                ));
+            }
+            // A supervisor of another cowshed build: refused by name.
+            Err(error) if error.code == crate::error::ErrorCode::Conflict => return Err(error),
+            // Nobody serves it; this process does.
+            Err(_) => {}
+        }
+        let authority = config.authority.clone();
+        let actor =
             super::supervisor::WorkspaceSupervisor::start(config, self.commitments.clone())?;
+        let listener = super::supervisor_socket::bind(&socket).await?;
+        let server = tokio::spawn(super::supervisor_socket::serve(listener, actor.clone()));
+        let handle = super::supervisor_socket::connect(socket.clone(), authority);
+        self.served.insert(
+            name.clone(),
+            ServedSupervisor {
+                actor,
+                socket,
+                server,
+            },
+        );
         self.supervisors.insert(name.clone(), handle.clone());
         Ok(handle)
     }
 
     async fn stop_supervisor(&mut self, name: &WorkspaceName) -> Result<()> {
         if let Some(handle) = self.supervisors.remove(name) {
-            handle.quiesce().await?;
-            handle.retire().await?;
+            let stopped = async {
+                handle.quiesce().await?;
+                handle.retire().await
+            }
+            .await;
+            match stopped {
+                Ok(()) => {}
+                // Another process's supervisor that no longer answers went with its process.
+                Err(error)
+                    if !self.served.contains_key(name)
+                        && error.code == crate::error::ErrorCode::EnvironmentMissing => {}
+                Err(error) => return Err(error),
+            }
         }
+        self.forget_served(name);
         self.sessions.retain(|(workspace, _), _| workspace != name);
         Ok(())
+    }
+
+    /// After its retirement: stop serving `name`'s supervisor and remove its socket.
+    fn forget_served(&mut self, name: &WorkspaceName) {
+        drop(self.served.remove(name));
+    }
+
+    /// Serve `name`'s supervisor from this process until a `retire` call retires it: the
+    /// `cowshed __workspace-supervisor` verb.
+    async fn serve_supervisor_until_retired(&mut self, name: WorkspaceName) -> Result<()> {
+        self.validate_binding().await?;
+        let current = self.current(&name).await?;
+        self.ensure_supervisor_for(current).await?;
+        let Some(served) = self.served.remove(&name) else {
+            let socket = super::supervisor_socket::socket_path(
+                &self.descriptor.store_root,
+                &self.descriptor.repo_id,
+                &name,
+            );
+            let pid = super::supervisor_socket::hello(&socket).await?.pid;
+            return Err(CowshedError::conflict(
+                format!("process {pid} already serves workspace {name}'s supervisor"),
+                "stop that process first",
+            ));
+        };
+        self.supervisors.remove(&name);
+        let mut served = served;
+        let served_until = (&mut served.server).await.map_err(|error| {
+            CowshedError::internal(format!("workspace supervisor server failed: {error}"))
+        });
+        drop(served);
+        served_until?
     }
 
     /// Unpublished clones nothing will ever finish: no unfinished lifecycle intent names them (a
@@ -7257,12 +7421,22 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
             .map_err(native_storage_error)??;
 
         if let Some((config, effective_revision)) = replacement_config
-            && let Some(handle) = self.supervisors.remove(&workspace)
+            && self.supervisors.remove(&workspace).is_some()
         {
-            let replacement = handle
-                .advance_authority(effective_revision, topology_revision, config)
-                .await?;
-            self.supervisors.insert(workspace, replacement);
+            // Only the process running the actor can advance it. A supervisor another process
+            // serves keeps its revision; the next command here finds it stale and says so.
+            if let Some(served) = self.served.get_mut(&workspace) {
+                let advanced = served
+                    .actor
+                    .advance_authority(effective_revision, topology_revision, config)
+                    .await?;
+                let handle = super::supervisor_socket::connect(
+                    served.socket.clone(),
+                    advanced.snapshot().clone(),
+                );
+                served.actor = advanced;
+                self.supervisors.insert(workspace, handle);
+            }
         }
         Ok(published)
     }
@@ -7694,6 +7868,10 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
             url: url.to_string(),
             mirror: root,
         })
+    }
+
+    async fn serve_supervisor(&mut self, workspace: WorkspaceName) -> Result<()> {
+        self.serve_supervisor_until_retired(workspace).await
     }
 
     async fn doctor(&mut self) -> Result<DoctorReport> {
