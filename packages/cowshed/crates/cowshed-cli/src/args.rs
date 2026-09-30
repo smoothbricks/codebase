@@ -1416,7 +1416,7 @@ const IDENTITY: CommandSpec = CommandSpec {
     missing: "identity action is required",
     args: "add <remote>",
     trailing: "",
-    summary: "bind another remote of this project's checkout as a repository identity",
+    summary: "bind another checkout remote as an identity",
     about: &[
         "A dependency can name this repository by more than one URL — a forge it is pushed to as well as the host it was adopted from. `add` records the named remote of the project's main checkout as an additional, non-primary identity of this project, and from the next exec every workspace with read access to the checkout fetches that URL (and its SSH form without the login) from the local clone instead of the network.",
         "Identities are controller-owned: only this command adds one, and a workspace's own Git configuration never creates a route. A URL another adopted project already binds is refused, because a fetch URL has exactly one local clone. The remote must stay configured under the same name, as the adopted one must; a remote that is already bound reports the binding unchanged.",
