@@ -4245,8 +4245,16 @@ fn missing_artifact_token(job_id: JobId) -> CowshedError {
     )
 }
 
-fn map_artifact_error(error: ArtifactError) -> CowshedError {
-    CowshedError::integrity(error.to_string(), "cowshed doctor --json")
+/// A store refusal as the caller reports it: records a newer cowshed wrote are a version
+/// conflict this build must not touch; anything else is damage to the store.
+pub(super) fn map_artifact_error(error: ArtifactError) -> CowshedError {
+    match error {
+        ArtifactError::NewerLayout { .. } => CowshedError::conflict(
+            error.to_string(),
+            "run the cowshed that wrote these records; this build is older",
+        ),
+        error => CowshedError::integrity(error.to_string(), "cowshed doctor --json"),
+    }
 }
 
 fn map_audit_error(error: AuditSinkError) -> CowshedError {

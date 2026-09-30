@@ -90,6 +90,17 @@ pub enum ArtifactError {
     Arrow(String),
     #[error("artifact integrity failure at byte {offset}: {message}")]
     Integrity { offset: u64, message: String },
+    /// A complete, intact record in a layout newer than this build reads. A newer cowshed wrote
+    /// it: it is neither damage nor this build's to interpret, truncate or seal.
+    #[error(
+        "the record at byte {offset} is in {layout}, newer than record layout {newest} ({newest_columns} columns), the newest this cowshed reads: a newer cowshed wrote it"
+    )]
+    NewerLayout {
+        offset: u64,
+        layout: UnknownLayout,
+        newest: u64,
+        newest_columns: usize,
+    },
     #[error(
         "artifact ordering failure at byte {offset}: duplicate or regressed record sequence {current} follows {previous}; a concurrent or stale-recovery append reused an allocation; run `cowshed doctor --repair`"
     )]
@@ -136,6 +147,27 @@ pub enum ArtifactError {
     },
     #[error(transparent)]
     Dto(#[from] DtoError),
+}
+
+/// What this build can tell of a record layout newer than any it reads: its width, and for a job
+/// record the layout version the record declares.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UnknownLayout {
+    pub columns: usize,
+    pub version: Option<u64>,
+}
+
+impl std::fmt::Display for UnknownLayout {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.version {
+            Some(version) => write!(
+                formatter,
+                "record layout {version} ({} columns)",
+                self.columns
+            ),
+            None => write!(formatter, "a record layout of {} columns", self.columns),
+        }
+    }
 }
 
 fn io_error(path: &Path, source: io::Error) -> ArtifactError {
@@ -2988,6 +3020,14 @@ fn recover_records_with_budget_under_lock(
         }
         let batch = decode_single_batch(&payload)
             .map_err(|error| integrity(frame_start, &format!("invalid Arrow IPC: {error}")))?;
+        if let Some(layout) = newer_layout(&batch) {
+            return Err(ArtifactError::NewerLayout {
+                offset: frame_start as u64,
+                layout,
+                newest: RECORD_SCHEMA_VERSION,
+                newest_columns: protected_record_schema().fields().len(),
+            });
+        }
         let record = batch_to_protected_record(&batch)
             .map_err(|error| integrity(frame_start, &error.to_string()))?;
         record
@@ -3258,6 +3298,35 @@ fn batch_layout_version(batch: &RecordBatch) -> Option<u64> {
         .iter()
         .find(|(_, layout)| *layout == schema)
         .map(|&(version, _)| version)
+}
+
+/// The layout of a batch a newer cowshed wrote, when it is one. Layouts grow by trailing
+/// columns ([`EARLIER_RECORD_LAYOUTS`]), so a newer one begins with every column of the current
+/// layout and has more; a job record in it declares a version above [`RECORD_SCHEMA_VERSION`].
+/// Anything else this build cannot read is damage, not a newer writer.
+fn newer_layout(batch: &RecordBatch) -> Option<UnknownLayout> {
+    let current = protected_record_schema();
+    let known = current.fields().len();
+    let schema = batch.schema();
+    let fields = schema.fields();
+    if fields.len() <= known || fields[..known] != current.fields()[..] {
+        return None;
+    }
+    let is_job = batch.num_rows() == 1
+        && string(batch, 0).is_ok_and(|kind| kind.is_valid(0) && kind.value(0) == "job");
+    let version = if is_job {
+        let version = uint64(batch, 1).ok()?;
+        if !version.is_valid(0) || version.value(0) <= RECORD_SCHEMA_VERSION {
+            return None;
+        }
+        Some(version.value(0))
+    } else {
+        None
+    };
+    Some(UnknownLayout {
+        columns: fields.len(),
+        version,
+    })
 }
 
 fn failure_name(failure: crate::api::dto::JobFailure) -> &'static str {
@@ -3731,10 +3800,17 @@ fn protected_record_to_batch(record: &ProtectedRecord) -> Result<RecordBatch, Ar
 }
 
 fn batch_to_protected_record(batch: &RecordBatch) -> Result<ProtectedRecord, ArtifactError> {
-    if batch.num_rows() != 1 || batch_layout_version(batch).is_none() {
-        return Err(ArtifactError::Arrow(
-            "protected batch must contain one row with a canonical schema".into(),
-        ));
+    if batch.num_rows() != 1 {
+        return Err(ArtifactError::Arrow(format!(
+            "a protected batch holds exactly one record, this one {} rows",
+            batch.num_rows()
+        )));
+    }
+    if batch_layout_version(batch).is_none() {
+        return Err(ArtifactError::Arrow(format!(
+            "a protected batch of {} columns is in no record layout",
+            batch.num_columns()
+        )));
     }
     match string(batch, 0)?.value(0) {
         "job" => Ok(ProtectedRecord::Job(batch_to_job_record(batch)?)),
@@ -4780,6 +4856,76 @@ mod tests {
         );
         fs::remove_dir_all(&root).unwrap();
     }
+
+    fn append_batch(root: &Path, batch: &RecordBatch) {
+        let payload = encode_batch(batch).unwrap();
+        append_framed_batch(
+            &records_path(root),
+            &payload,
+            Sha256Digest::compute(&payload),
+        )
+        .unwrap();
+    }
+
+    /// A newer cowshed's record is intact: recovery names it as newer, with both layouts, and
+    /// leaves every byte of it in place. A batch that is no record at all stays an integrity
+    /// failure, and says which way it is not one.
+    #[test]
+    fn a_record_a_newer_cowshed_wrote_is_refused_by_layout_and_left_intact() {
+        let root = temp_root("newer-layout");
+        let store = store_at(&root, ArtifactConfig::default());
+        drop(store);
+        append_protected_record(&root, ProtectedRecord::Job(valid_job_record(1)));
+        let newer_offset = fs::metadata(records_path(&root)).unwrap().len();
+        let current = job_record_to_batch(&valid_job_record(2)).unwrap();
+        let mut fields = current.schema().fields().to_vec();
+        fields.push(Arc::new(field("from_the_future", DataType::Utf8, true)));
+        let mut columns = current.columns().to_vec();
+        columns[1] = Arc::new(UInt64Array::from(vec![RECORD_SCHEMA_VERSION + 1]));
+        columns.push(Arc::new(StringArray::from(vec![Some("later")])));
+        let newer = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap();
+        append_batch(&root, &newer);
+        let length = fs::metadata(records_path(&root)).unwrap().len();
+
+        let refused = recover_records(&records_path(&root)).unwrap_err();
+        assert_eq!(
+            refused,
+            ArtifactError::NewerLayout {
+                offset: newer_offset,
+                layout: UnknownLayout {
+                    columns: current.num_columns() + 1,
+                    version: Some(RECORD_SCHEMA_VERSION + 1),
+                },
+                newest: RECORD_SCHEMA_VERSION,
+                newest_columns: current.num_columns(),
+            }
+        );
+        assert_eq!(
+            fs::metadata(records_path(&root)).unwrap().len(),
+            length,
+            "a newer writer's record is never truncated"
+        );
+        assert!(matches!(
+            ArtifactStore::open(
+                &root,
+                OwnedRepoIds::sole(repo()),
+                incarnation(),
+                ArtifactConfig::default()
+            ),
+            Err(ArtifactError::NewerLayout { .. })
+        ));
+        fs::remove_dir_all(&root).unwrap();
+
+        let root = temp_root("empty-batch");
+        drop(store_at(&root, ArtifactConfig::default()));
+        append_batch(&root, &current.slice(0, 0));
+        assert!(matches!(
+            recover_records(&records_path(&root)),
+            Err(ArtifactError::Integrity { message, .. }) if message.contains("0 rows")
+        ));
+        fs::remove_dir_all(&root).unwrap();
+    }
+
     #[test]
     fn record_and_manifest_validation_reject_every_invalid_boundary() {
         let valid = valid_job_record(1);

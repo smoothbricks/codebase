@@ -4684,9 +4684,14 @@ impl NativeProjectRuntimeHost {
         .await
         .map_err(|error| CowshedError::internal(format!("sealing lost jobs failed: {error}")))?
         .map_err(|error| {
-            CowshedError::integrity(
-                format!("cannot seal the jobs a lost supervisor ran: {error}"),
-                "cowshed doctor --json",
+            let error = super::supervisor::map_artifact_error(error);
+            CowshedError::new(
+                error.code,
+                format!(
+                    "cannot seal the jobs a lost supervisor ran: {}",
+                    error.message
+                ),
+                error.hint,
             )
         })?;
         if sealed.is_empty() {

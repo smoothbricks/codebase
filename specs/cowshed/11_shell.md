@@ -252,6 +252,12 @@ non-empty first element, no NUL, and the same per-element and aggregate byte bou
 and a script needs its JSON to decode to a valid script. This preserves non-UTF-8 Unix argv across crash recovery and
 rejects malformed complete batches as `Integrity`; protected storage never downgrades argv to Arrow Utf8.
 
+Record layouts grow only by trailing columns, and each build reads its own layout and every earlier one. A complete,
+intact batch that begins with every column of this build's layout and has more — a job record in it declares a version
+above this build's — was written by a newer cowshed: recovery refuses it as `Conflict`, naming the record's layout and
+the newest this build reads, and never truncates, rewrites or seals it. Only a batch in no layout at all, or holding
+other than one row, is `Integrity`.
+
 A controller-minted immutable `workspaceIncarnation` disambiguates histories copied by fork/checkpoint/restore. Each
 create, fork destination, and restore result receives a fresh incarnation; inherited records retain the incarnation that
 produced them, and the new allocator starts above the inherited maximum. Thus the durable job key is
