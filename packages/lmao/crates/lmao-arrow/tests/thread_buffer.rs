@@ -190,6 +190,71 @@ fn a_retain_past_the_threshold_reclaims_text_and_keeps_what_open_spans_name() {
     assert_eq!(buffer.interned(fresh), Some("after-reclaim"));
 }
 
+/// A row names its trace through the store's trace table, which a retain
+/// rebuilds from the rows it keeps: a span left open across a flush keeps its
+/// own trace — for its kept rows and for the rows it writes after — while the
+/// traces of released spans leave the table.
+#[test]
+fn a_span_open_across_a_retain_keeps_its_trace_among_others() {
+    let mut buffer = ThreadSpanBuffer::new(7, 8, FIELDS);
+    let done = buffer
+        .open_span(TraceId::new("trace-a").unwrap(), 0, 0, "done".into(), 10, 1)
+        .unwrap();
+    let pending = buffer
+        .open_span(
+            TraceId::new("trace-b").unwrap(),
+            0,
+            0,
+            "pending".into(),
+            11,
+            2,
+        )
+        .unwrap();
+    buffer.end_ok(done, 12).unwrap();
+    let mut rows = Vec::new();
+    buffer.flush_rows(&mut rows).unwrap();
+    buffer.retain_open();
+
+    let start = buffer.start_row(pending).unwrap();
+    assert_eq!(buffer.trace_id_at(start), Some("trace-b"));
+    assert_eq!(
+        buffer.span_trace_id(done),
+        None,
+        "a released span leaves no trace"
+    );
+    let log = buffer
+        .append_log(
+            pending,
+            EntryType::Info,
+            Some(TextInput::Static("later")),
+            3,
+            13,
+        )
+        .unwrap();
+    assert_eq!(buffer.trace_id_at(log as usize), Some("trace-b"));
+    let other = buffer
+        .open_span(
+            TraceId::new("trace-a").unwrap(),
+            0,
+            0,
+            "again".into(),
+            14,
+            4,
+        )
+        .unwrap();
+    buffer.end_ok(pending, 15).unwrap();
+    buffer.end_ok(other, 16).unwrap();
+    buffer.flush_rows(&mut rows).unwrap();
+    let batch = convert_thread_span_rows(&buffer, &empty_catalog(), &rows).unwrap();
+    let traces: Vec<String> = (0..batch.num_rows())
+        .map(|row| text_at(&batch, "trace_id", row).expect("every row has a trace"))
+        .collect();
+    assert_eq!(
+        traces,
+        ["trace-b", "trace-b", "trace-b", "trace-a", "trace-a"]
+    );
+}
+
 #[test]
 fn a_streaming_flush_leaves_an_open_span_open_and_emits_its_completion_later() {
     let mut buffer = ThreadSpanBuffer::new(7, 8, FIELDS);

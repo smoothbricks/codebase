@@ -242,9 +242,13 @@ fn convert_selected(
 
     let mut trace_dictionary = BTreeMap::<&str, u32>::new();
     for value in &trace_values {
-        let next =
-            u32::try_from(trace_dictionary.len()).map_err(|_| ConvertError::DictionaryOverflow)?;
-        trace_dictionary.entry(value).or_insert(next);
+        trace_dictionary.entry(value).or_insert(0);
+    }
+    // The values array below is the map's keys in lexical order, so a row's
+    // key is its trace's position in that order, not the order it was first
+    // seen: two traces seen out of lexical order would otherwise swap names.
+    for (index, key) in trace_dictionary.values_mut().enumerate() {
+        *key = u32::try_from(index).map_err(|_| ConvertError::DictionaryOverflow)?;
     }
     let trace_keys = trace_values
         .iter()
