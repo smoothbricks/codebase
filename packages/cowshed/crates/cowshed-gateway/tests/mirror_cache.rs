@@ -139,6 +139,18 @@ fn declared_digest_response(bytes: &[u8]) -> Response<MirrorBody> {
         .expect("fixture response")
 }
 
+/// A packument as registry.npmjs.org answers it: `Vary: accept`, so the mirror serves it as
+/// published, neither cached nor rewritten.
+fn registry_packument_response(bytes: &[u8]) -> Response<MirrorBody> {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/vnd.npm.install-v1+json")
+        .header(header::VARY, "accept-encoding, accept")
+        .header(header::CONTENT_LENGTH, bytes.len())
+        .body(body(Bytes::copy_from_slice(bytes)))
+        .expect("registry packument response")
+}
+
 fn metadata_response(bytes: &[u8], etag: &str) -> Response<MirrorBody> {
     Response::builder()
         .status(StatusCode::OK)
@@ -343,7 +355,20 @@ async fn synthetic_digest_header_cannot_supply_protocol_integrity() {
         false,
         None,
     );
-    let upstream = QueueUpstream::new([declared_digest_response(artifact)]);
+    // The packument publishes the version with only a SHA-1 `shasum`, so the only digest on
+    // offer is the tarball's own header — which never stands in for protocol integrity.
+    let packument = serde_json::to_vec(&serde_json::json!({
+        "name": "declared",
+        "versions": { "1.0.0": { "dist": {
+            "tarball": "https://registry.npmjs.org/declared/-/declared-1.0.0.tgz",
+            "shasum": "0000000000000000000000000000000000000000"
+        }}}
+    }))
+    .expect("encode packument");
+    let upstream = QueueUpstream::new([
+        registry_packument_response(&packument),
+        declared_digest_response(artifact),
+    ]);
     assert!(matches!(
         service
             .execute(request, UpstreamHealth::Healthy, &upstream)
@@ -1091,6 +1116,146 @@ async fn npm_packument_rewrites_sha512_content_address_and_verifies_tarball() {
         response.response.into_body().collect().await.is_err(),
         "sha512 mismatch must abort before publication"
     );
+}
+
+/// A lockfile install never reads the packument: bun builds `/@scope/name/-/name-ver.tgz` itself
+/// and asks for it with no `cowshed-integrity`. The mirror takes the integrity the registry
+/// publishes for exactly that tarball from the package's packument — fetched through the same
+/// cached metadata path — and verifies the fill against it, so the answer is the verified bytes
+/// rather than a refusal, and bytes that do not match are still never served.
+#[tokio::test]
+async fn a_lockfile_tarball_is_verified_against_the_integrity_its_packument_publishes() {
+    let root = TestRoot::new();
+    let service = open_service(&root).await;
+    let tarball = b"lockfile-driven npm tarball bytes";
+    let integrity = format!("sha512-{}", STANDARD.encode(Sha512::digest(tarball)));
+    let packument = serde_json::to_vec(&serde_json::json!({
+        "name": "@scope/pkg",
+        "versions": {
+            "1.2.3": { "dist": {
+                "tarball": "https://registry.npmjs.org/@scope/pkg/-/pkg-1.2.3.tgz",
+                "integrity": integrity,
+                "size": tarball.len()
+            }},
+            "1.2.4": { "dist": {
+                "tarball": "https://registry.npmjs.org/@scope/pkg/-/pkg-1.2.4.tgz",
+                "integrity": integrity,
+                "size": tarball.len()
+            }}
+        }
+    }))
+    .expect("encode packument");
+    let upstream = QueueUpstream::new([json_response(&packument), ok_response(tarball)]);
+    let (status, bytes) = collect(
+        service
+            .execute(
+                request(
+                    MirrorProtocol::Npm,
+                    target("registry.npmjs.org"),
+                    "/@scope/pkg/-/pkg-1.2.3.tgz",
+                    MirrorCacheScope::Anonymous,
+                    false,
+                    None,
+                ),
+                UpstreamHealth::Healthy,
+                &upstream,
+            )
+            .await
+            .expect("a lockfile tarball is served"),
+    )
+    .await;
+    assert_eq!(status, MirrorCacheStatus::Filled);
+    assert_eq!(bytes.as_ref(), tarball);
+    assert_eq!(
+        upstream
+            .requests()
+            .iter()
+            .map(|request| request.path.as_str())
+            .collect::<Vec<_>>(),
+        ["/@scope%2fpkg", "/@scope/pkg/-/pkg-1.2.3.tgz"]
+    );
+
+    // Bytes that do not match the published integrity abort before publication.
+    let mut tampered = tarball.to_vec();
+    tampered[0] ^= 1;
+    let mismatch = QueueUpstream::new([ok_response(&tampered)]);
+    let MirrorOutcome::Response(response) = service
+        .execute(
+            request(
+                MirrorProtocol::Npm,
+                target("registry.npmjs.org"),
+                "/@scope/pkg/-/pkg-1.2.4.tgz",
+                MirrorCacheScope::Anonymous,
+                false,
+                None,
+            ),
+            UpstreamHealth::Healthy,
+            &mismatch,
+        )
+        .await
+        .expect("the cached packument supplies the expectation")
+    else {
+        panic!("expected streaming mismatch response");
+    };
+    assert!(
+        response.response.into_body().collect().await.is_err(),
+        "a tarball that does not match its packument integrity must never be served"
+    );
+    assert_eq!(
+        mismatch.call_count(),
+        1,
+        "the packument comes from the metadata cache, only the tarball is fetched"
+    );
+
+    // A version the packument does not publish has no integrity to verify against.
+    let unknown = QueueUpstream::new([]);
+    assert!(matches!(
+        service
+            .execute(
+                request(
+                    MirrorProtocol::Npm,
+                    target("registry.npmjs.org"),
+                    "/@scope/pkg/-/pkg-9.9.9.tgz",
+                    MirrorCacheScope::Anonymous,
+                    false,
+                    None,
+                ),
+                UpstreamHealth::Healthy,
+                &unknown,
+            )
+            .await,
+        Err(MirrorError::MissingIntegrity)
+    ));
+    assert_eq!(unknown.call_count(), 0);
+
+    // The registry's own packument (`Vary: accept`) is served as published, neither cached nor
+    // rewritten: the integrity comes from its absolute `dist.tarball` entry.
+    let registry_root = TestRoot::new();
+    let registry_service = open_service(&registry_root).await;
+    let registry = QueueUpstream::new([
+        registry_packument_response(&packument),
+        ok_response(tarball),
+    ]);
+    let (status, bytes) = collect(
+        registry_service
+            .execute(
+                request(
+                    MirrorProtocol::Npm,
+                    target("registry.npmjs.org"),
+                    "/@scope/pkg/-/pkg-1.2.3.tgz",
+                    MirrorCacheScope::Anonymous,
+                    false,
+                    None,
+                ),
+                UpstreamHealth::Healthy,
+                &registry,
+            )
+            .await
+            .expect("a lockfile tarball is served against the published packument"),
+    )
+    .await;
+    assert_eq!(status, MirrorCacheStatus::Filled);
+    assert_eq!(bytes.as_ref(), tarball);
 }
 
 #[tokio::test]

@@ -24,6 +24,9 @@ const MAX_REDIRECTS: u8 = 5;
 const MAX_LOCATION_BYTES: usize = 8 * 1024;
 const MAX_OBJECT_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const MAX_METADATA_BYTES: u64 = 8 * 1024 * 1024;
+/// What npm clients send for a packument; the mirror asks for the same representation.
+const NPM_PACKUMENT_ACCEPT: &str =
+    "application/vnd.npm.install-v1+json; q=1.0, application/json; q=0.8, */*";
 const HEALTH_COMMAND_CAPACITY: usize = 64;
 
 pub type MirrorBody = BoxBody<Bytes, CacheBodyError>;
@@ -253,6 +256,76 @@ impl MirrorService {
         if request.redirects_remaining > MAX_REDIRECTS {
             return Err(MirrorError::TooManyRedirects);
         }
+        if request.protocol == MirrorProtocol::Npm
+            && request.metadata.kind == MirrorResourceKind::Immutable
+            && request.metadata.expected.is_none()
+        {
+            request.metadata.expected = Some(
+                self.published_npm_expectation(&request, health, upstream)
+                    .await?,
+            );
+        }
+        self.execute_expected(request, health, upstream).await
+    }
+
+    /// A tarball URL a client builds from its lockfile carries no `cowshed-integrity`. The
+    /// expectation is the `dist.integrity` (and `dist.size`) the registry publishes for the
+    /// version whose `dist.tarball` is exactly this path, read from the package's packument
+    /// through the same cached metadata path clients use. No such version means there is nothing
+    /// to verify the bytes against, so the tarball stays refused.
+    async fn published_npm_expectation<U>(
+        &self,
+        tarball: &MirrorRequest,
+        health: UpstreamHealth,
+        upstream: &U,
+    ) -> Result<ObjectExpectation, MirrorError>
+    where
+        U: MirrorUpstream + ?Sized,
+    {
+        let mut headers = tarball.headers.clone();
+        headers.insert(
+            header::ACCEPT,
+            HeaderValue::from_static(NPM_PACKUMENT_ACCEPT),
+        );
+        let packument = MirrorRequest::new(
+            MirrorProtocol::Npm,
+            tarball.target.clone(),
+            Method::GET,
+            npm_packument_path(&tarball.metadata.identity),
+            headers,
+            tarball.cache_scope.clone(),
+            tarball.credentialed,
+            None,
+        )?;
+        let MirrorOutcome::Response(response) =
+            self.execute_expected(packument, health, upstream).await?
+        else {
+            return Err(MirrorError::MissingIntegrity);
+        };
+        if response.response.status() != StatusCode::OK {
+            return Err(MirrorError::MissingIntegrity);
+        }
+        let bytes = collect_metadata(response.response.into_body()).await?;
+        let path = tarball
+            .upstream_path
+            .split_once('?')
+            .map_or(tarball.upstream_path.as_str(), |(path, _)| path);
+        let expected = published_tarball_expectation(&tarball.target, path, &bytes)?;
+        if expected.length > MAX_OBJECT_BYTES {
+            return Err(MirrorError::ObjectTooLarge);
+        }
+        Ok(expected)
+    }
+
+    async fn execute_expected<U>(
+        &self,
+        mut request: MirrorRequest,
+        health: UpstreamHealth,
+        upstream: &U,
+    ) -> Result<MirrorOutcome, MirrorError>
+    where
+        U: MirrorUpstream + ?Sized,
+    {
         let key = request.cache_key()?;
         loop {
             match self
@@ -483,6 +556,74 @@ fn response_from_hit(
             .map_err(|_| MirrorError::InvalidCachedResponse)
     }
 }
+
+async fn collect_metadata(mut body: MirrorBody) -> Result<Vec<u8>, MirrorError> {
+    let mut bytes = Vec::new();
+    while let Some(frame) = body.frame().await {
+        let frame = frame.map_err(MirrorError::Upstream)?;
+        if let Ok(data) = frame.into_data() {
+            if bytes
+                .len()
+                .checked_add(data.len())
+                .is_none_or(|length| length > MAX_METADATA_BYTES as usize)
+            {
+                return Err(MirrorError::MetadataTooLarge);
+            }
+            bytes.extend_from_slice(&data);
+        }
+    }
+    Ok(bytes)
+}
+
+/// The path npm clients request a package's packument at: `/@scope%2fname` or `/name`.
+fn npm_packument_path(identity: &str) -> String {
+    format!("/{}", identity.replacen('/', "%2f", 1))
+}
+
+/// The expectation of the version whose `dist.tarball` is `path` on `target`, in either form the
+/// mirror serves a packument: as the registry publishes it (an absolute URL) or as
+/// `rewrite_npm_packument` rewrites it (`/npm{path}?…`, which keeps `dist.integrity`).
+fn published_tarball_expectation(
+    target: &CanonicalTarget,
+    path: &str,
+    packument: &[u8],
+) -> Result<ObjectExpectation, MirrorError> {
+    let document: Value =
+        serde_json::from_slice(packument).map_err(|_| MirrorError::InvalidMetadata)?;
+    let versions = document
+        .get("versions")
+        .and_then(Value::as_object)
+        .ok_or(MirrorError::InvalidMetadata)?;
+    let dist = versions
+        .values()
+        .filter_map(|version| version.get("dist"))
+        .find(|dist| {
+            dist.get("tarball")
+                .and_then(Value::as_str)
+                .is_some_and(|tarball| match Url::parse(tarball) {
+                    Ok(url) => {
+                        url.path() == path
+                            && CanonicalTarget::from_url(&url).is_ok_and(|origin| origin == *target)
+                    }
+                    Err(_) => {
+                        tarball
+                            .strip_prefix("/npm")
+                            .map(|local| local.split_once('?').map_or(local, |(local, _)| local))
+                            == Some(path)
+                    }
+                })
+        })
+        .ok_or(MirrorError::MissingIntegrity)?;
+    let digest = dist
+        .get("integrity")
+        .and_then(Value::as_str)
+        .and_then(parse_sri)
+        .ok_or(MirrorError::MissingIntegrity)?;
+    Ok(ObjectExpectation {
+        length: dist.get("size").and_then(Value::as_u64).unwrap_or(0),
+        digest,
+    })
+}
 async fn rewrite_metadata_response(
     request: &MirrorRequest,
     response: Response<MirrorBody>,
@@ -501,21 +642,8 @@ async fn rewrite_metadata_response(
     {
         return Err(MirrorError::MetadataTooLarge);
     }
-    let (mut parts, mut body) = response.into_parts();
-    let mut bytes = Vec::new();
-    while let Some(frame) = body.frame().await {
-        let frame = frame.map_err(MirrorError::Upstream)?;
-        if let Ok(data) = frame.into_data() {
-            if bytes
-                .len()
-                .checked_add(data.len())
-                .is_none_or(|length| length > MAX_METADATA_BYTES as usize)
-            {
-                return Err(MirrorError::MetadataTooLarge);
-            }
-            bytes.extend_from_slice(&data);
-        }
-    }
+    let (mut parts, body) = response.into_parts();
+    let bytes = collect_metadata(body).await?;
     let rewritten = match request.protocol {
         MirrorProtocol::Npm => rewrite_npm_packument(request, &bytes)?,
         MirrorProtocol::Cargo if request.upstream_path == "/config.json" => {

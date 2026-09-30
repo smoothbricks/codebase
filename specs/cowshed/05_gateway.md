@@ -90,7 +90,11 @@ authenticate every request.
 Speaks packument and tarball protocols. Anonymous `registry.npmjs.org` is baseline. Scoped or private origins require a
 trusted project-policy admission binding an exact origin to allowed package scopes; only then may the gateway select the
 matching credential. Metadata TTL is 5 minutes. Tarballs are content-addressed by their declared integrity digest,
-verified while filling and again on every cache read, and committed by atomic rename.
+verified while filling and again on every cache read, and committed by atomic rename. The declared digest is the
+`cowshed-integrity` a rewritten packument puts on the tarball URL; a tarball URL without one (a lockfile install builds
+it without reading the packument) takes the `dist.integrity` and `dist.size` the package's packument publishes for the
+version whose `dist.tarball` is that exact path, fetched through the same metadata path. A version the packument does
+not publish with a SHA-512 or SHA-256 integrity is refused, never served unverified.
 
 ### `/cargo/` — cargo sparse registry mirror
 
