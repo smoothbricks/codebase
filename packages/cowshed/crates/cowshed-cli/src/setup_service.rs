@@ -23,6 +23,7 @@ use crate::gateway_service::{
 };
 use crate::launchd::RemovalOutcome;
 use crate::output::Output;
+use crate::probe::{GitIdentityGap, probe_project};
 use crate::sccache_client_config::{self, ConfigChange, ConfigOutcome, ConfigReport, SharedStore};
 use crate::sccache_nix::{self, BuildOutcome, BuildRefusal};
 use crate::sccache_service::{
@@ -32,6 +33,7 @@ use async_trait::async_trait;
 use cowshed_core::api::EmptyResult;
 use cowshed_core::host_caches::{self, HostCacheRelocation, Relocation};
 use cowshed_core::metadata::ImageFormat;
+use cowshed_core::repository::RepoId;
 use cowshed_core::sandbox::sccache_cache_directory;
 use cowshed_core::storage::bootstrap::{
     CACHES_ROOT, FstabOutcome, HostAction, HostActionOutcome, HostActionResult, HostSetupPlan,
@@ -107,6 +109,29 @@ pub enum MainMounts {
     Unknown {
         reason: String,
     },
+}
+
+/// What setup could observe about the git identity each adopted checkout's workspaces inherit.
+///
+/// Mirrors [`MainMounts`], including its second case: "nobody could check" must never render as
+/// "no gaps". Observed here because the answer depends only on the host's git configuration and
+/// the mount root this verb configures (02_workspaces.md); `doctor` reports the same finding.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum GitIdentity {
+    /// Every adopted project was probed.
+    Checked(Vec<ProjectIdentity>),
+    Unknown {
+        reason: String,
+    },
+}
+
+/// One adopted project's probe: the config files its checkout includes that a workspace under
+/// `mount_root` would not see, or why the probe could not run.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProjectIdentity {
+    pub repo_id: RepoId,
+    pub mount_root: PathBuf,
+    pub gaps: std::result::Result<Vec<GitIdentityGap>, String>,
 }
 
 /// One host artifact teardown touched, in the order it was touched.
@@ -231,6 +256,8 @@ pub trait HostSetup: Send {
     async fn census(&mut self) -> Result<WorkspaceCensus>;
     /// Which adopted projects have no mounted main, for the readiness sentence.
     async fn unmounted_mains(&mut self) -> Result<MainMounts>;
+    /// Probe every adopted checkout's git identity at the workspace mount root.
+    async fn git_identity(&mut self) -> Result<GitIdentity>;
     /// Deactivate and delete the host services and the binaries they ran.
     async fn remove_host_services(&mut self) -> Result<Vec<HostArtifactRemoval>>;
     /// Point an sccache client that inherited no cowshed environment at the shared cache.
@@ -370,6 +397,50 @@ impl HostSetup for NativeHostSetup {
                 reason: format!("could not check main workspace mounts: {error}"),
             }),
         }
+    }
+
+    /// Probe each adopted checkout, or say why nobody could. Never an error, like the mains: a
+    /// checkout whose probe fails is named with its reason and the others are still reported.
+    async fn git_identity(&mut self) -> Result<GitIdentity> {
+        let storage = match validate_existing_host_storage(&self.home).await {
+            Ok(storage) => storage,
+            Err(error) => {
+                return Ok(GitIdentity::Unknown {
+                    reason: error.message,
+                });
+            }
+        };
+        let projects = match NativeGatewayInventory::new(storage.clone())
+            .adopted_projects()
+            .await
+        {
+            Ok(projects) => projects,
+            Err(error) => {
+                return Ok(GitIdentity::Unknown {
+                    reason: format!("could not enumerate adopted projects: {error}"),
+                });
+            }
+        };
+        let mut observed = Vec::with_capacity(projects.len());
+        for project in projects {
+            let layout = match StorageLayout::new(storage.store(), &project.repo_id) {
+                Ok(layout) => layout,
+                Err(error) => {
+                    return Ok(GitIdentity::Unknown {
+                        reason: format!(
+                            "could not resolve the layout of {}: {error}",
+                            project.repo_id
+                        ),
+                    });
+                }
+            };
+            observed.push(ProjectIdentity {
+                gaps: probe_project(&project.project_root, &layout).map_err(|error| error.message),
+                mount_root: layout.project().host_mount_root.clone(),
+                repo_id: project.repo_id,
+            });
+        }
+        Ok(GitIdentity::Checked(observed))
     }
 
     /// Remove both agents, then the cowshed binary copy and sccache's nix GC root.
@@ -647,6 +718,9 @@ where
     output
         .guidance(&format!("workspace mount root is {}", path.display()))
         .map_err(output_error)?;
+    // The root is half of what git identity at a workspace depends on, so a new root is checked at
+    // once rather than at the next workspace that silently loses an identity.
+    emit_git_identity(&setup.git_identity().await?, output)?;
     Ok(0)
 }
 
@@ -697,6 +771,13 @@ where
     let mains = match &failure {
         Some(_) => None,
         None => Some(setup.unmounted_mains().await?),
+    };
+    // Observed only on a run that finished, like the mains: git identity at the mount root depends
+    // on the host's git configuration and that root alone, so the host's repair is where to check
+    // it, not every `new`.
+    let identity = match &failure {
+        Some(_) => None,
+        None => Some(setup.git_identity().await?),
     };
     // Same reason, one step further: a run that never mounted the caches volume has no shared
     // cache to point a client at, and writing a config naming one would be the false claim.
@@ -756,6 +837,9 @@ where
         )?;
     }
     emit_host_caches(&relocations, output)?;
+    if let Some(identity) = &identity {
+        emit_git_identity(identity, output)?;
+    }
     if let Some(failure) = failure {
         return Err(partial_setup_failure(failure));
     }
@@ -788,6 +872,46 @@ where
         ));
     }
     Ok(0)
+}
+
+/// One line per checkout config file a workspace would not inherit, naming the `includeIf`
+/// pattern that would cover the mount root, or why a checkout could not be probed.
+fn emit_git_identity<W: Write, E: Write>(
+    identity: &GitIdentity,
+    output: &mut Output<W, E>,
+) -> Result<()> {
+    let projects = match identity {
+        GitIdentity::Checked(projects) => projects,
+        GitIdentity::Unknown { reason } => {
+            return output
+                .guidance(&format!(
+                    "git identity at the workspace mount root not checked: {reason}"
+                ))
+                .map_err(output_error);
+        }
+    };
+    for project in projects {
+        match &project.gaps {
+            Ok(gaps) => {
+                for gap in gaps {
+                    output
+                        .guidance(&format!(
+                            "{}: {}",
+                            project.repo_id,
+                            gap.message(&project.mount_root)
+                        ))
+                        .map_err(output_error)?;
+                }
+            }
+            Err(reason) => output
+                .guidance(&format!(
+                    "{}: git identity at the workspace mount root not checked: {reason}",
+                    project.repo_id
+                ))
+                .map_err(output_error)?,
+        }
+    }
+    Ok(())
 }
 
 /// One line per host cache: where it now resolves, or why it was left alone.

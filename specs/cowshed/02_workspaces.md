@@ -116,9 +116,11 @@ Git identity inheritance follows each `includeIf gitdir:` rule's anchor. Rules a
 the checkout and the mount root (for example `gitdir:~/Dev/` when checkouts live in `~/Dev` and the root is
 `~/Dev/.cowshed`) match workspaces with zero additional configuration — the expected setup. Rules anchored exactly at a
 project root do not reach into the mount root; cowshed surfaces that divergence instead of letting identities silently
-drift: `cowshed new` runs `git config --list --show-origin` in the checkout and in a throwaway probe repository at the
-candidate workspace path, and any config file included only in the checkout is reported by name with the pattern that
-would restore it. `doctor` reports the same finding for existing projects.
+drift: `cowshed setup` (every adopted checkout, after a repair and after `--mount-root`) and `cowshed doctor` (the
+current project) run `git config --list --show-origin` in the checkout and in a throwaway probe repository under the
+mount root, and any config file included only in the checkout is reported by name with the pattern that would restore
+it. The answer depends only on the host's git configuration and the mount root, never on a workspace, so `new` does not
+repeat it.
 
 Cowshed does not compensate beyond reporting. Capturing the effective identity at adopt time and stamping it as
 repo-local config would snapshot one moment of a configuration the user keeps editing, and would then silently diverge

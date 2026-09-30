@@ -6,6 +6,9 @@
 //! the same listing inside a throwaway repository at the candidate path, then names every
 //! origin file that appeared only in the checkout together with the `includeIf` condition
 //! whose `.path` value pointed at it.
+//!
+//! The answer depends on the host's git configuration and the mount root, never on a workspace,
+//! so `setup` and `doctor` run it and `new` does not.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
@@ -14,6 +17,8 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use cowshed_core::api::{Finding, FindingSeverity};
+use cowshed_core::metadata::WorkspaceName;
+use cowshed_core::storage::StorageLayout;
 use cowshed_core::{CowshedError, Result};
 
 const HINT: &str = "add an includeIf gitdir: pattern covering the workspace mount root; cowshed setup --mount-root does not rewrite git identity";
@@ -53,9 +58,16 @@ impl GitIdentityGap {
     }
 }
 
-/// Diff checkout vs candidate git identity. Always removes the throwaway probe repository.
-pub fn probe_git_identity(checkout: &Path, candidate: &Path) -> Result<Vec<GitIdentityGap>> {
-    probe_git_identity_with_env(checkout, candidate, &[])
+/// Probe one adopted project: its checkout against a throwaway repository where its workspaces
+/// mount, which is always removed again. The gaps name `layout.project().host_mount_root` in
+/// their remedy.
+pub fn probe_project(checkout: &Path, layout: &StorageLayout) -> Result<Vec<GitIdentityGap>> {
+    let workspace = WorkspaceName::session("identity-probe")
+        .map_err(|error| CowshedError::internal(error.to_string()))?;
+    let candidate = layout.workspace_mount(&workspace).map_err(|error| {
+        CowshedError::environment_missing(error.to_string(), "cowshed setup --mount-root <dir>")
+    })?;
+    probe_git_identity_with_env(checkout, &candidate, &[])
 }
 
 fn probe_git_identity_with_env(

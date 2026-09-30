@@ -2463,76 +2463,13 @@ fn dirent_is_plain_dir(entry: &fs::DirEntry) -> bool {
     entry.file_type().is_ok_and(|kind| kind.is_dir())
 }
 
-fn report_new_git_identity<W: Write, E: Write>(
-    bridge: &ActorBridge,
-    name: &str,
-    output: &mut Output<W, E>,
-) -> Result<()> {
-    let (candidate, mount_root) = identity_probe_target(bridge, Some(name))?;
-    let gaps = probe::probe_git_identity(bridge.git_root()?, &candidate)?;
-    for gap in &gaps {
-        output
-            .guidance(&gap.message(&mount_root))
-            .map_err(output_error)?;
-    }
-    if !gaps.is_empty() {
-        output
-            .hint("cowshed setup --mount-root <dir>")
-            .map_err(output_error)?;
-    }
-    Ok(())
-}
-
 fn git_identity_findings(bridge: &ActorBridge) -> Result<Vec<Finding>> {
-    let (candidate, mount_root) = identity_probe_target(bridge, None)?;
-    let gaps = probe::probe_git_identity(bridge.git_root()?, &candidate)?;
-    Ok(gaps.iter().map(|gap| gap.finding(&mount_root)).collect())
-}
-
-fn identity_probe_target(
-    bridge: &ActorBridge,
-    workspace: Option<&str>,
-) -> Result<(PathBuf, PathBuf)> {
     let layout = StorageLayout::new(bridge.store_root()?, bridge.repo_id()?).map_err(|error| {
         CowshedError::environment_missing(error.to_string(), "cowshed setup --mount-root <dir>")
     })?;
-    let mount_root = layout.project().host_mount_root.clone();
-    let candidate = match workspace {
-        Some(name) => {
-            let workspace = WorkspaceName::session(name)
-                .map_err(|error| usage(error.to_string(), "use a valid workspace name"))?;
-            layout.workspace_mount(&workspace).map_err(|error| {
-                CowshedError::environment_missing(
-                    error.to_string(),
-                    "cowshed setup --mount-root <dir>",
-                )
-            })?
-        }
-        None => unused_identity_candidate(&layout)?,
-    };
-    Ok((candidate, mount_root))
-}
-
-fn unused_identity_candidate(layout: &StorageLayout) -> Result<PathBuf> {
-    for index in 0..8 {
-        let name = if index == 0 {
-            "identity-probe".to_owned()
-        } else {
-            format!("identity-probe-{index}")
-        };
-        let workspace = WorkspaceName::session(name)
-            .map_err(|error| CowshedError::internal(error.to_string()))?;
-        let path = layout.workspace_mount(&workspace).map_err(|error| {
-            CowshedError::environment_missing(error.to_string(), "cowshed setup --mount-root <dir>")
-        })?;
-        if !path.exists() {
-            return Ok(path);
-        }
-    }
-    Err(CowshedError::environment_missing(
-        "could not allocate a throwaway path for the git-identity probe",
-        "cowshed setup --mount-root <dir>",
-    ))
+    let gaps = probe::probe_project(bridge.git_root()?, &layout)?;
+    let mount_root = &layout.project().host_mount_root;
+    Ok(gaps.iter().map(|gap| gap.finding(mount_root)).collect())
 }
 
 async fn resolve_detach_root(cli: &Cli) -> Result<PathBuf> {
@@ -3969,13 +3906,6 @@ where
         }
         Err(error) => return Err(error),
     };
-    if let Command::New(args) = &cli.command
-        && let Err(error) = report_new_git_identity(&bridge, &args.name, output)
-    {
-        output
-            .guidance(&format!("git identity probe skipped: {}", error.message))
-            .map_err(output_error)?;
-    }
     dispatch_and_shutdown(bridge, cli, stdin, output).await
 }
 

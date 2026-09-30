@@ -90,6 +90,13 @@ storage error in the CLI points here — a host with no volumes has no checkout 
 `<mount-root>/<owner>/<repo>/<ws>`. The path must be absolute. The root can change only while every workspace is
 detached; otherwise setup names the attached workspaces and refuses. Stdout is the configured root.
 
+After a repair, and after `--mount-root`, setup probes git identity for every adopted checkout: it runs
+`git config --list --show-origin` in the checkout and in a throwaway repository under the mount root
+(`<mount-root>/<owner>/<repo>/`), then diffs the observed origins. A config file included only in the checkout is
+reported on stderr, prefixed with its project, by name with the `includeIf` condition that pulled it in, plus the
+remedy: add a pattern covering the mount root. `cowshed doctor` reports the same finding for the current project. `new`
+does not probe: the answer depends only on your git configuration and the mount root.
+
 Anything that can escalate happens inside one authorization session, and **the exact intent for every volume is printed
 before the dialog appears** — name, UUID, size, and where it is going. When the plan creates and deletes nothing, that
 is stated outright, because the macOS dialog gives you no way to tell a mount from a reformat. A run with nothing to
@@ -342,12 +349,6 @@ new Git branch at another revision and is mutually exclusive with `--from`. The 
 `--slot <n>` binds the workspace to a build slot, so it mounts at that slot's stable path instead of one named after it
 — see [`cowshed path --slot`](#cowshed-path---slot-n--build-slots-and-compiler-cache-reuse). A slot already held by
 another workspace is a conflict (exit 4).
-
-Before the clone, cowshed probes git identity: it runs `git config --list --show-origin` in the checkout and in a
-throwaway repository at the candidate workspace path (`<mount-root>/<owner>/<repo>/<name>`), then diffs the observed
-origins. A config file included only in the checkout is reported by name with the `includeIf` condition that pulled it
-in, plus the remedy: add a pattern covering the mount root, or `cowshed setup --mount-root`. Creation continues; the
-same finding appears in `cowshed doctor`.
 
 ### `cowshed ls [--all]`
 

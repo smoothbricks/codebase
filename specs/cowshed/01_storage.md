@@ -75,10 +75,10 @@ Workspace mountpoints live under one host-configured **mount root** (default `~/
 on Data: no volume mounts there, so the masked-mountpoint failure class cannot exist. Git identity inheritance follows
 the anchor of each `includeIf gitdir:` rule — rules anchored at an ancestor of the mount root (for example
 `gitdir:~/Dev/`) match workspaces with no additional configuration; rules anchored exactly at a project root do not, and
-`cowshed new`/`doctor` detect that divergence empirically by diffing `git config --show-origin` between the checkout and
-a probe repository at the candidate workspace path. Changing the root requires every workspace detached; `setup` refuses
-while any are attached because absolute paths are baked into detached metadata and sandbox profiles. This directory is
-distinct from the in-image `.cowshed/` namespace inside every clone.
+`cowshed setup`/`doctor` detect that divergence empirically by diffing `git config --show-origin` between each adopted
+checkout and a probe repository under the mount root. Changing the root requires every workspace detached; `setup`
+refuses while any are attached because absolute paths are baked into detached metadata and sandbox profiles. This
+directory is distinct from the in-image `.cowshed/` namespace inside every clone.
 
 <!-- prettier-ignore -->
 ```

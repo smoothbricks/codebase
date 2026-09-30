@@ -11,13 +11,14 @@ use cowshed_cli::gateway_service::ServiceBinaryRefresh;
 use cowshed_cli::help;
 use cowshed_cli::launchd::RemovalOutcome;
 use cowshed_cli::output::Output;
+use cowshed_cli::probe::GitIdentityGap;
 use cowshed_cli::sccache_client_config::{
     ConfigChange, ConfigConflict, ConfigOutcome, ConfigReport,
 };
 use cowshed_cli::sccache_nix::BuildRefusal;
 use cowshed_cli::setup_service::{
-    HostArtifactRemoval, HostSetup, MainMounts, SccacheInstall, WorkspaceCensus,
-    dispatch as setup_dispatch,
+    GitIdentity, HostArtifactRemoval, HostSetup, MainMounts, ProjectIdentity, SccacheInstall,
+    WorkspaceCensus, dispatch as setup_dispatch,
 };
 use cowshed_core::host_caches::{HostCacheRelocation, Relocation};
 use cowshed_core::repository::RepoId;
@@ -41,6 +42,9 @@ struct FakeHost {
     removals: Vec<HostArtifactRemoval>,
     /// Which projects have no mounted main, for the readiness sentence.
     mains: MainMounts,
+    /// What probing each adopted checkout's git identity found, so the gap lines are provable
+    /// without git or a real checkout.
+    identity: GitIdentity,
     /// What `setup` did to sccache's own config file, so the sentence it prints is provable
     /// without a real home directory or a real store.
     sccache: ConfigReport,
@@ -118,6 +122,7 @@ impl Default for FakeHost {
             census: empty_census(),
             removals: Vec::new(),
             mains: MainMounts::Checked(Vec::new()),
+            identity: GitIdentity::Checked(Vec::new()),
             sccache: ConfigReport {
                 path: PathBuf::from(
                     "/Users/dev/Library/Application Support/Mozilla.sccache/config",
@@ -175,6 +180,11 @@ impl HostSetup for FakeHost {
     async fn unmounted_mains(&mut self) -> Result<MainMounts> {
         self.events.push(String::from("unmounted-mains"));
         Ok(self.mains.clone())
+    }
+
+    async fn git_identity(&mut self) -> Result<GitIdentity> {
+        self.events.push(String::from("git-identity"));
+        Ok(self.identity.clone())
     }
 
     async fn remove_host_services(&mut self) -> Result<Vec<HostArtifactRemoval>> {
@@ -554,6 +564,7 @@ async fn a_healthy_host_is_told_it_is_already_set_up() {
             "plan",
             "execute",
             "unmounted-mains",
+            "git-identity",
             "configure-sccache-client",
             "refresh-services",
             "census"
@@ -788,6 +799,7 @@ async fn an_escalating_run_announces_the_prompt_before_executing() {
             "plan",
             "execute",
             "unmounted-mains",
+            "git-identity",
             "configure-sccache-client",
             "refresh-services",
             "census"
@@ -1576,7 +1588,10 @@ async fn setup_mount_root_prints_the_configured_path() {
     );
     assert_eq!(
         host.events,
-        ["configure-mount-root:/Users/dev/.cowshed/mnt"]
+        [
+            "configure-mount-root:/Users/dev/.cowshed/mnt",
+            "git-identity"
+        ]
     );
 }
 
@@ -1619,6 +1634,79 @@ async fn setup_mount_root_refuses_while_workspaces_are_attached() {
     assert_eq!(
         host.events,
         ["configure-mount-root:/Users/dev/.cowshed/mnt"]
+    );
+}
+
+/// Git identity at a workspace depends on the host's git configuration and the mount root, not on
+/// the workspace, so setup — which configures the root — is where each adopted checkout is probed
+/// (`new` never is). Every gap names its project and the pattern that would cover the root; a
+/// checkout that could not be probed says so instead of passing for one without gaps.
+#[tokio::test]
+async fn setup_names_every_checkout_config_file_a_workspace_would_not_inherit() {
+    let identity = || {
+        GitIdentity::Checked(vec![
+            ProjectIdentity {
+                repo_id: RepoId::parse("acme/api").expect("repo"),
+                mount_root: PathBuf::from("/Users/dev/.cowshed/mnt"),
+                gaps: Ok(vec![GitIdentityGap {
+                    config_file: PathBuf::from("/Users/dev/src/api/work.gitconfig"),
+                    include_if_condition: Some(String::from("gitdir:/Users/dev/src/api/")),
+                }]),
+            },
+            ProjectIdentity {
+                repo_id: RepoId::parse("acme/web").expect("repo"),
+                mount_root: PathBuf::from("/Users/dev/.cowshed/mnt"),
+                gaps: Err(String::from("git is not on PATH")),
+            },
+        ])
+    };
+    let gap = "cowshed: acme/api: config file /Users/dev/src/api/work.gitconfig is included only \
+               in the checkout via includeIf gitdir:/Users/dev/src/api/; add an includeIf gitdir: \
+               pattern covering /Users/dev/.cowshed/mnt\n";
+    let unprobed = "cowshed: acme/web: git identity at the workspace mount root not checked: git \
+                    is not on PATH\n";
+
+    let mut repaired = FakeHost {
+        identity: identity(),
+        census: occupied_census(),
+        ..FakeHost::default()
+    };
+    let streams = run(&mut repaired, REPAIR, false, false).await;
+    assert_eq!(streams.exit, 0);
+    assert!(streams.stderr.contains(gap), "{}", streams.stderr);
+    assert!(streams.stderr.contains(unprobed), "{}", streams.stderr);
+
+    let mut moved = FakeHost {
+        identity: identity(),
+        ..FakeHost::default()
+    };
+    let args = SetupArgs {
+        mount_root: Some(PathBuf::from("/Users/dev/.cowshed/mnt")),
+        ..REPAIR
+    };
+    let streams = run(&mut moved, args, false, false).await;
+    assert_eq!(streams.exit, 0);
+    assert!(
+        streams.stderr.ends_with(&format!("{gap}{unprobed}")),
+        "{}",
+        streams.stderr
+    );
+
+    let mut unknown = FakeHost {
+        identity: GitIdentity::Unknown {
+            reason: String::from("the store volume is not mounted"),
+        },
+        census: occupied_census(),
+        ..FakeHost::default()
+    };
+    let streams = run(&mut unknown, REPAIR, false, false).await;
+    assert!(
+        streams.stderr.contains(
+            "cowshed: git identity at the workspace mount root not checked: the store volume is \
+             not mounted\n"
+        ),
+        "{}",
+        streams.stderr
     );
 }
 
@@ -1786,6 +1874,7 @@ async fn mount_service_install_is_disclosed_before_authorization() {
             "plan",
             "execute",
             "unmounted-mains",
+            "git-identity",
             "configure-sccache-client",
             "refresh-services",
             "census"
