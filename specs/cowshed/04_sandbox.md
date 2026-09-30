@@ -411,8 +411,9 @@ they verify an intercepted host only when their own configuration trusts the bun
 - **macOS-native TLS** (Security.framework — Swift/Xcode tooling, some system utilities, **and Go-built binaries**: Go's
   `crypto/x509` honors `SSL_CERT_FILE` only on Unix roots, while its darwin path defers to the platform verifier —
   verification item) ignores the env anchors above. Such a client either fails against an intercepted host or must be
-  granted `--opaque` for it (05_gateway.md). This is moot for Go **module** traffic, which rides the plain-HTTP loopback
-  `/go` mirror (05_gateway.md) and never sees TLS. The exact inventory of affected tools is a kickoff verification item.
+  granted `--opaque` for it (05_gateway.md). Go module traffic is such a client: it reaches `proxy.golang.org` and
+  `sum.golang.org` through opaque tunnels (03_caches.md). The exact inventory of affected tools is a kickoff
+  verification item.
 - **Cert-pinning clients** reject the leaf regardless of trust store; `--opaque` is their path.
 
 These anchors are trust configuration, not secrets, so they are exported/written like any other cache wiring

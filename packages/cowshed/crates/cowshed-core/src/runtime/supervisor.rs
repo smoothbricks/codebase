@@ -4118,6 +4118,13 @@ mod workspace_toolchain_tests {
             b"-----BEGIN CERTIFICATE-----\nWORKSPACE\n-----END CERTIFICATE-----\n",
         )
         .expect("workspace CA");
+        // The wiring before this one left a token-bearing netrc in the private HOME.
+        std::fs::create_dir_all(mount.join(".cowshed/home")).expect("private home");
+        std::fs::write(
+            mount.join(".cowshed/home/.netrc"),
+            "machine 127.0.0.1\nlogin cowshed\npassword stale\n",
+        )
+        .expect("stale netrc");
         let mut sandbox = sandbox_at(&mount);
         sandbox.port_block = crate::metadata::PortBlock::new(49_104, 16).expect("port block");
         let mut env = BTreeMap::new();
@@ -4190,16 +4197,21 @@ mod workspace_toolchain_tests {
             vars.get("XDG_CONFIG_HOME").map(PathBuf::from),
             Some(private.join("config"))
         );
+        // Go sends credentials only over HTTPS, so it cannot authenticate to the loopback mirror:
+        // it fetches from the public proxy through an opaque tunnel, and no token file exists.
         let go_env = std::fs::read_to_string(private.join("cache/go/env")).expect("go env");
-        assert!(go_env.contains("GOPROXY=http://127.0.0.1:49104/go\n"));
+        assert!(
+            go_env.contains("GOPROXY=https://proxy.golang.org\n"),
+            "{go_env}"
+        );
+        assert!(!go_env.contains("127.0.0.1"), "{go_env}");
         assert_eq!(
             vars.get("GOENV").map(PathBuf::from),
             Some(private.join("cache/go/env"))
         );
         assert!(
-            std::fs::read_to_string(private.join("home/.netrc"))
-                .expect("netrc")
-                .contains(&format!("password {token}"))
+            !private.join("home/.netrc").exists(),
+            "the netrc a previous wiring left, token and all, is gone"
         );
         std::fs::remove_dir_all(&root).ok();
     }

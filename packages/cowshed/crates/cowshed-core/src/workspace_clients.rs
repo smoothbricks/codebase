@@ -1,15 +1,15 @@
 //! Client wiring for a workspace's package managers and TLS clients, written into the
 //! workspace's private environment (`.cowshed/{home,config,cache}`, never a tracked file).
 //!
-//! Every sandboxed process reaches the network through the workspace gateway: registry clients
-//! through its mirror routes (`<GATEWAY_HTTP>/npm`, `/go`), everything else through the proxy,
-//! where a granted host's TLS is terminated with a leaf the workspace CA signed. Two things make
-//! that work for tools cowshed does not configure by argument:
+//! Every sandboxed process reaches the network through the workspace gateway: bun through its npm
+//! mirror route (`<GATEWAY_HTTP>/npm`), everything else through the proxy, where a granted host's
+//! TLS is terminated with a leaf the workspace CA signed. Two things make that work for tools
+//! cowshed does not configure by argument:
 //!
-//! - **Mirror clients** find their registry and the workspace token in the files their tool
-//!   reads from the private environment: bun's global bunfig, Go's `GOENV` file, and the netrc
-//!   Go's module fetcher authenticates with. The token travels in the registry client's own
-//!   `Authorization` header, never in a URL.
+//! - **The mirror client** — bun — finds its registry and the workspace token in its global
+//!   bunfig in the private environment, and sends the token in its own `Authorization` header,
+//!   never in a URL. Go is not a mirror client: `cmd/go` sends credentials only over HTTPS, so
+//!   its `GOENV` file points it at the public module proxy, reached through an opaque tunnel.
 //! - **TLS clients** that read one CA file — git, cargo, nix — get a combined trust bundle: the
 //!   platform's roots (for opaque tunnels, which present the real upstream certificate) followed
 //!   by the workspace CA (for intercepted hosts).
@@ -65,10 +65,15 @@ pub fn bunfig(gateway_http: &str, token: &str) -> String {
 }
 
 /// Go's env file (`go env -w` format), reached through `GOENV` (03_caches.md).
-pub fn go_env(gateway_http: &str, environment: &Path) -> String {
+///
+/// The public module proxy, not the gateway's loopback mirror: `cmd/go` attaches credentials —
+/// netrc, `GOAUTH`, URL userinfo — only to HTTPS URLs, so no Go client can present the workspace
+/// token to a plain-HTTP route. It names no endpoint and carries no token, so a host process that
+/// loads the workspace's `.envrc` reads the same file and fetches directly.
+pub fn go_env(environment: &Path) -> String {
     let go = environment.join("cache/go");
     format!(
-        "GOPROXY={gateway_http}/go\n\
+        "GOPROXY=https://proxy.golang.org\n\
          GOSUMDB=sum.golang.org\n\
          GOMODCACHE={caches}/go/mod\n\
          GOCACHE={caches}/go/build\n\
@@ -79,12 +84,6 @@ pub fn go_env(gateway_http: &str, environment: &Path) -> String {
         path = go.join("path").display(),
         bin = go.join("bin").display(),
     )
-}
-
-/// The netrc Go's module fetcher reads (`GOAUTH=netrc`, the default): Basic authentication to the
-/// gateway's loopback endpoint, whose password is the workspace token.
-pub fn netrc(token: &str) -> String {
-    format!("machine 127.0.0.1\nlogin cowshed\npassword {token}\n")
 }
 
 /// The platform roots followed by the workspace CA.
@@ -119,12 +118,12 @@ pub(crate) fn publish_client_wiring(
         c".bunfig.toml",
         bunfig(wiring.gateway_http, wiring.token).as_bytes(),
     )?;
-    root.child(c"cache")?.child(c"go")?.publish_file(
-        c"env",
-        go_env(wiring.gateway_http, wiring.environment).as_bytes(),
-    )?;
-    root.child(c"home")?
-        .publish_file(c".netrc", netrc(wiring.token).as_bytes())?;
+    root.child(c"cache")?
+        .child(c"go")?
+        .publish_file(c"env", go_env(wiring.environment).as_bytes())?;
+    // The netrc an earlier wiring published for Go carried the workspace token, and no Go client
+    // ever sent it; nothing else reads it but clients that would hand it to any loopback server.
+    root.child(c"home")?.remove_file(c".netrc")?;
     match wiring.workspace_ca {
         Some(workspace_ca) => root.publish_file(
             TRUST_BUNDLE_NAME,
@@ -144,24 +143,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn mirror_clients_name_the_gateway_route_and_carry_the_token_outside_any_url() {
+    fn bun_carries_the_token_outside_any_url_and_go_names_the_public_proxy() {
         let gateway = "http://127.0.0.1:40960";
         assert_eq!(
             bunfig(gateway, "tok"),
             "[install]\nregistry = { url = \"http://127.0.0.1:40960/npm/\", token = \"tok\" }\n"
         );
-        let go = go_env(gateway, Path::new("/w/.cowshed"));
-        assert!(go.contains("GOPROXY=http://127.0.0.1:40960/go\n"));
-        assert!(!go.contains("tok"));
+        let go = go_env(Path::new("/w/.cowshed"));
+        assert!(go.contains("GOPROXY=https://proxy.golang.org\n"));
         assert!(!go.contains("direct"));
+        assert!(!go.contains("127.0.0.1"));
         assert!(go.contains("GOMODCACHE=/private/cowshed/caches/go/mod\n"));
         assert!(go.contains("GOPATH=/w/.cowshed/cache/go/path\n"));
         assert!(go.contains("GOBIN=/w/.cowshed/cache/go/bin\n"));
         assert!(go.contains("GOTOOLCHAIN=local\n"));
-        assert_eq!(
-            netrc("tok"),
-            "machine 127.0.0.1\nlogin cowshed\npassword tok\n"
-        );
         assert_eq!(
             gateway_http(Platform::Macos, Some(PortBlock::new(40_960, 16).unwrap())).as_deref(),
             Some(gateway)
@@ -196,12 +191,12 @@ mod tests {
         publish_client_wiring(&anchored, &wiring).unwrap();
         let read = |path: &str| std::fs::read_to_string(root.join(path)).unwrap();
         assert!(read("config/.bunfig.toml").contains("/npm/"));
-        assert!(read("cache/go/env").contains("GOPROXY="));
-        assert!(read("home/.netrc").contains("password tok"));
+        assert!(read("cache/go/env").contains("GOPROXY=https://proxy.golang.org\n"));
+        assert!(!root.join("home/.netrc").exists());
         assert_eq!(read("ca-bundle.pem"), "ROOTS\nCA\n");
         {
             use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(root.join("home/.netrc"))
+            let mode = std::fs::metadata(root.join("config/.bunfig.toml"))
                 .unwrap()
                 .permissions()
                 .mode();
@@ -213,9 +208,9 @@ mod tests {
             use std::os::unix::fs::MetadataExt;
             std::fs::metadata(root.join(path)).unwrap().ino()
         };
-        let before = inode("home/.netrc");
+        let before = inode("config/.bunfig.toml");
         publish_client_wiring(&anchored, &wiring).unwrap();
-        assert_eq!(inode("home/.netrc"), before);
+        assert_eq!(inode("config/.bunfig.toml"), before);
         publish_client_wiring(
             &anchored,
             &ClientWiring {
@@ -224,22 +219,28 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(read("home/.netrc").contains("password rotated"));
         assert!(read("config/.bunfig.toml").contains("token = \"rotated\""));
 
         // A child that planted a link where a file belongs cannot redirect the host's write.
         let outside = root.join("outside");
         std::fs::write(&outside, b"untouched").unwrap();
-        std::fs::remove_file(root.join("home/.netrc")).unwrap();
-        std::os::unix::fs::symlink(&outside, root.join("home/.netrc")).unwrap();
+        std::fs::remove_file(root.join("config/.bunfig.toml")).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("config/.bunfig.toml")).unwrap();
         publish_client_wiring(&anchored, &wiring).unwrap();
         assert_eq!(std::fs::read(&outside).unwrap(), b"untouched");
         assert!(
-            !std::fs::symlink_metadata(root.join("home/.netrc"))
+            !std::fs::symlink_metadata(root.join("config/.bunfig.toml"))
                 .unwrap()
                 .file_type()
                 .is_symlink()
         );
+
+        // A netrc a previous wiring left, or a link planted in its place, is removed — the link
+        // itself, never what it points at.
+        std::os::unix::fs::symlink(&outside, root.join("home/.netrc")).unwrap();
+        publish_client_wiring(&anchored, &wiring).unwrap();
+        assert!(std::fs::symlink_metadata(root.join("home/.netrc")).is_err());
+        assert_eq!(std::fs::read(&outside).unwrap(), b"untouched");
         std::fs::remove_dir_all(&root).unwrap();
     }
 }

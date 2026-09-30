@@ -196,6 +196,23 @@ impl AnchoredDirectory {
         published
     }
 
+    /// Remove the entry `name` beneath this directory, whatever it is but a directory: a file a
+    /// previous wiring published, or a link a child planted there — never the link's target. An
+    /// absent entry is already the state this asks for.
+    pub(crate) fn remove_file(&self, name: &CStr) -> io::Result<()> {
+        validate_directory_leaf(name)?;
+        // SAFETY: unlinkat removes this directory's own entry, not a link target.
+        if unsafe { libc::unlinkat(self.0.as_raw_fd(), name.as_ptr(), 0) } == 0 {
+            return self.0.sync_all();
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() == io::ErrorKind::NotFound {
+            Ok(())
+        } else {
+            Err(error)
+        }
+    }
+
     /// The bytes of `name` when it is a regular file; `None` when it is absent or anything else
     /// (a link, a directory, a FIFO), which publication then replaces.
     fn read_regular_file(&self, name: &CStr) -> io::Result<Option<Vec<u8>>> {

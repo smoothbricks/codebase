@@ -110,21 +110,23 @@ them there; they contain the endpoint URL, whose userinfo is the workspace token
   - **Go env file** at `$XDG_CACHE_HOME/go/env` (the `go env -w` format), reached via a `GOENV` export (below). Go is
     the one toolchain with **no project-level config file** — settings live in a single user-global env file
     (`os.UserConfigDir()/go/env`, measured default `~/Library/Application Support/go/env`) overridable only by `GOENV` —
-    and `GOPROXY` is per-workspace. The file pins: `GOPROXY=<GATEWAY_HTTP>/go` (no `,direct` fallback — misses fail at
-    the gateway with the offline/denied distinction, 05_gateway.md), `GOSUMDB=sum.golang.org` (verification rides the
-    proxy's sumdb passthrough), `GOMODCACHE=/private/cowshed/caches/go/mod` and
-    `GOCACHE=/private/cowshed/caches/go/build` (shared, layer 3), `GOPATH=<mount>/.cowshed/cache/go/path` and
-    `GOBIN=<mount>/.cowshed/cache/go/bin` (in-image, workspace-keyed — `go install` binaries are the `~/.cargo/bin`
-    persistence-escape hazard and must never land on the shared volume). Net effect: **`~/go` is never created**
-    (measured on this host: the devenv-provided go 1.26.3 had already grown a 1.1 GB `~/go/pkg/mod` under the defaults);
-    04_sandbox.md turns any regression into a loud tripwire. cowshed also writes **`GOTOOLCHAIN=local`**: the toolchain
-    is nix/devenv-provided and pinned, and `auto` silently downloading Go toolchains contradicts the declarative
-    environment — a project that deliberately overrides to `auto` gets its downloads in `GOMODCACHE`, i.e. on the caches
-    volume, never in `$HOME`. A host-global `go env -w` file instead of `GOENV` is rejected: `GOPROXY` is per-workspace
-    identity, and a global file could select another workspace's endpoint. Go authenticates to the mirror through the
-    netrc its module fetcher reads (`GOAUTH=netrc`, the default): `$HOME/.netrc` in the private environment names
-    `machine 127.0.0.1` with the workspace token as its password, which Go sends as `Authorization: Basic` — the URL
-    never carries it.
+    and its settings are per-workspace. The file pins: `GOPROXY=https://proxy.golang.org` (no `,direct` fallback — a
+    miss fails rather than cloning a VCS repository) and `GOSUMDB=sum.golang.org`, both reached through the proxy
+    variables (below) as **opaque** tunnels — Go on macOS verifies TLS with the platform verifier and never trusts the
+    workspace CA, so both hosts are project-standing `--opaque` egress grants. Go does not use the loopback mirror:
+    `cmd/go` attaches credentials (netrc, `GOAUTH`, URL userinfo) only to HTTPS URLs, and the mirror is plain HTTP, so
+    no Go client can present the workspace token to it. It also pins `GOMODCACHE=/private/cowshed/caches/go/mod` and
+    `GOCACHE=/private/cowshed/caches/go/build` (shared, layer 3 — a module downloads once per host),
+    `GOPATH=<mount>/.cowshed/cache/go/path` and `GOBIN=<mount>/.cowshed/cache/go/bin` (in-image, workspace-keyed —
+    `go install` binaries are the `~/.cargo/bin` persistence-escape hazard and must never land on the shared volume).
+    Net effect: **`~/go` is never created** (measured on this host: the devenv-provided go 1.26.3 had already grown a
+    1.1 GB `~/go/pkg/mod` under the defaults); 04_sandbox.md turns any regression into a loud tripwire. cowshed also
+    writes **`GOTOOLCHAIN=local`**: the toolchain is nix/devenv-provided and pinned, and `auto` silently downloading Go
+    toolchains contradicts the declarative environment — a project that deliberately overrides to `auto` gets its
+    downloads in `GOMODCACHE`, i.e. on the caches volume, never in `$HOME`. A host-global `go env -w` file instead of
+    `GOENV` is rejected: `GOPATH` and `GOBIN` are per-workspace, and a global file would share one workspace's with
+    every other. The same file serves a host process that loads the workspace's `.envrc`: it names no endpoint and
+    carries no token, so it works outside the sandbox too.
 - **Generic proxy variables.** Workspace env wiring sets `HTTP_PROXY`, `HTTPS_PROXY`, `http_proxy`, and `https_proxy` to
   `<GATEWAY_HTTP>` with the workspace token as its userinfo (`http://cowshed:<token>@…`), and configures
   `NO_PROXY`/`no_proxy` only for the workspace's own local services. On Linux these variables therefore resolve to
@@ -222,9 +224,9 @@ them there; they contain the endpoint URL, whose userinfo is the workspace token
   - The shared tool home variables (`CARGO_HOME`, `BUN_INSTALL_CACHE_DIR`, `UV_CACHE_DIR`, above) are not wiring in this
     sense: supervisor-spawned children get them only to undo their private `HOME`, each names the host's own default
     path, and every process cowshed never spawned resolves that same path unconfigured.
-  - The workspace token needs no registry export: bun takes it from the private bunfig's registry `token`, Go from the
-    private netrc, and the gateway reads it from their own `Authorization` header on the mirror routes (05_gateway.md).
-    Generic proxy clients carry it as proxy userinfo (below). (There is no git credential helper to consider.)
+  - The workspace token needs no registry export: bun takes it from the private bunfig's registry `token`, and the
+    gateway reads it from bun's own `Authorization` header on the mirror routes (05_gateway.md). Generic proxy clients —
+    Go among them — carry it as proxy userinfo (below). (There is no git credential helper to consider.)
   - `GOENV=<mount>/.cowshed/cache/go/env` is the other: Go has no directory-scoped config, so the in-image env file is
     reachable only through this export. It rides the in-image `.envrc`/direnv like the rest of the wiring —
     `cowshed exec`'s fail-closed shell activation (04_sandbox.md) carries it, and IDE-spawned tools (gopls) get it via

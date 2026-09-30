@@ -38,12 +38,14 @@ random bytes encoded as unpadded base64url, lives at `.cowshed/token` mode 0600,
 workspace selector: the already-selected macOS listener or Linux socket chooses the workspace before comparison. A proxy
 client may present it as `Proxy-Authorization: Basic` with the token as password (what curl, libcurl, reqwest and Go
 send for proxy-URL userinfo). One alternate header exists: on the local mirror routes — origin-form `/npm/`, `/cargo/`
-and `/go/` requests to the workspace's own endpoint — a registry client's own `Authorization` (`Bearer <token>` from
-bun's registry token, `Basic` from Go's netrc) carries the same token, because a registry client cannot be told to send
-`Proxy-Authorization` to its registry; an absolute-form or tunnelled request's `Authorization` is the client's own and
-authenticates nothing. The gateway accepts no cookie, query parameter, URL userinfo, or path token; it strips
-`Proxy-Authorization` and `Authorization` before any upstream request. It decodes the presented value to bytes, rejects
-malformed or wrong-length values, and compares all 32 bytes in constant time. Missing or mismatched token is 401.
+and `/go/` requests to the workspace's own endpoint — a registry client's own `Authorization` (`Bearer <token>`, which
+bun sends as its registry token, or `Basic` with the token as password) carries the same token, because a registry
+client cannot be told to send `Proxy-Authorization` to its registry. Go's module fetcher sends credentials only over
+HTTPS and so never reaches `/go/` (03_caches.md). An absolute-form or tunnelled request's `Authorization` is the
+client's own and authenticates nothing. The gateway accepts no cookie, query parameter, URL userinfo, or path token; it
+strips `Proxy-Authorization` and `Authorization` before any upstream request. It decodes the presented value to bytes,
+rejects malformed or wrong-length values, and compares all 32 bytes in constant time. Missing or mismatched token
+is 401.
 
 Create and fork mint a token. Restore stops admissions, drains the Linux connector and gateway connections, kills the
 connector cgroup, rotates the token, unlinks/recreates the Linux socket and namespace-local connector when applicable,
