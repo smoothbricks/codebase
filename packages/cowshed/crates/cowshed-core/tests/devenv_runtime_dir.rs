@@ -759,10 +759,13 @@ async fn host_controller_native_file_watching_observes_allowed_updates_without_p
     let root = scratch("native-file-watching");
     let mut sandbox = workspace(&root, 41_072);
     install_real_tool(&sandbox, "node");
-    let modules = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../../../node_modules")
-        .canonicalize()
-        .expect("Nx test dependencies");
+    let modules = std::path::PathBuf::from(
+        std::env::var_os("CARGO_MANIFEST_DIR")
+            .expect("cargo sets CARGO_MANIFEST_DIR for the tests it runs"),
+    )
+    .join("../../../../node_modules")
+    .canonicalize()
+    .expect("Nx test dependencies");
     sandbox.grants.read.push(modules.clone());
     // Bun may link this declared platform dependency into its host cache.
     // Grant its resolved package, not the whole host cache or user home.

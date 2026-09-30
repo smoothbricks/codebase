@@ -1014,7 +1014,8 @@ fn lesser_capabilities_fail_to_compile_with_coordinator_authority() {
                  publish = false\n\n[lib]\npath = \"src/lib.rs\"\n\n\
                  [dependencies]\ncowshed-core = {{ path = {:?} }}\n\
                  serde = {{ version = \"1\", features = [\"derive\"] }}\n\n[workspace]\n",
-                env!("CARGO_MANIFEST_DIR")
+                std::env::var("CARGO_MANIFEST_DIR")
+                    .expect("cargo sets CARGO_MANIFEST_DIR for the tests it runs")
             ),
         )
         .expect("probe manifest");
