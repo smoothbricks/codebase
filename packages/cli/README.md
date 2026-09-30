@@ -54,7 +54,7 @@ smoo secrets sync [-R <owner/name|remote>] [--env <environment>]
 smoo secrets run <group> <command...>
 
 smoo github-ci nx-smart --target <target> [--name <check-name>] [--step <number>] [--mode <auto|affected|run-many>] [--stage <stage>]
-smoo github-ci nx-run-many --targets <targets> [--projects <projects>] [--collect-outputs <directory>]
+smoo github-ci nx-run-many --targets <targets> [--projects <projects>] [--configuration <configuration>] [--collect-outputs <directory>]
 smoo github-ci nx-deploy [--stage <stage>] [--mode <auto|affected|run-many>] [--select-tag <tag>] [--verify]
 smoo github-ci apply-outputs <directories...> --source-sha <sha>
 smoo github-ci dispatch-workflow --workflow <workflow> --ref <ref>
@@ -551,6 +551,10 @@ that runs after Validate and the e2e job succeed on a push to the staging push b
 (`smoo github-ci nx-deploy --stage production --select-tag production-push-deploy-target`). The project must also carry
 `stage-deploy-target`, otherwise `--select-tag` finds nothing and the job logs
 `No run-many deploy projects; skipping production.`
+
+A production deploy ships what it builds, so `smoo github-ci nx-deploy --stage production` runs its build and deploy
+with `--configuration production` (cargo's release profile); lint and test, and every staging and preview deploy, keep
+the default dev configuration.
 
 #### Ordering one deploy after another
 

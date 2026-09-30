@@ -128,15 +128,15 @@ jobs:
       - name: 🔨 Build (${{ steps.version.outputs.mode }})
         if: steps.version.outputs.mode != 'none'
         run:
-          smoo github-ci nx-run-many --targets build --projects "${{ steps.version.outputs.projects }}"
-          --collect-outputs "${{ runner.temp }}/release-build-outputs"
+          smoo github-ci nx-run-many --targets build --projects "${{ steps.version.outputs.projects }}" --configuration
+          production --collect-outputs "${{ runner.temp }}/release-build-outputs"
 
       # Step 13
       - name: 🐧 Build supplemental Linux targets
         if: steps.version.outputs.mode != 'none'
         run:
           smoo github-ci nx-run-many --targets "*-linux" --projects "${{ steps.version.outputs.projects }}"
-          --collect-outputs "${{ runner.temp }}/linux-platform-outputs"
+          --configuration production --collect-outputs "${{ runner.temp }}/linux-platform-outputs"
 
       # Step 14
       - name: 📎 Upload trace DBs

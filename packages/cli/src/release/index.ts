@@ -49,7 +49,7 @@ export {
   withPrivateNpmUserconfig,
 } from './private-npm.js';
 
-import { PLATFORM_TARGET_GLOBS } from '@smoothbricks/nx-plugin/workspace-config-policy';
+import { PLATFORM_TARGET_GLOBS, RELEASE_CONFIGURATION } from '@smoothbricks/nx-plugin/workspace-config-policy';
 import { ciApiContext } from '../github-ci/api.js';
 import { readProjectTargets } from '../nx/index.js';
 import {
@@ -355,6 +355,7 @@ export async function releaseCollectPlatformOutputs(
   const currentRuns = await githubCiNxRunMany(root, {
     targets: options.targets,
     projects: releasePackageProjects(currentPackages),
+    configuration: RELEASE_CONFIGURATION,
     collectOutputs: join(outputRoot, 'current'),
     collectOutputsSourceSha: currentSourceSha,
     allowEmptyProjects: true,
@@ -1197,6 +1198,7 @@ function releaseRepairShell(root: string, platformOutputs: readonly string[]): R
         await githubCiNxRunMany(root, {
           targets: PLATFORM_TARGET_GLOBS.join(','),
           projects: releasePackageProjects(packages),
+          configuration: RELEASE_CONFIGURATION,
           allowEmptyProjects: true,
         });
         return;
@@ -1218,6 +1220,7 @@ function releaseRepairOutputsShell(
       await githubCiNxRunMany(root, {
         targets: targetGlobs,
         projects: releasePackageProjects(target.npmPackages),
+        configuration: RELEASE_CONFIGURATION,
         collectOutputs: join(outputRoot, target.sha),
       });
     },
@@ -1357,8 +1360,19 @@ async function gitReleaseTagsByCreatorDate(root: string): Promise<GitReleaseTagI
     });
 }
 
+/** Every release command builds what ships, so it always runs the release configuration. */
 async function buildReleaseCandidate(root: string, packages: ReleasePackage[]): Promise<void> {
-  await run('nx', ['run-many', '-t', 'build', `--projects=${releasePackageProjects(packages)}`], root);
+  await run(
+    'nx',
+    [
+      'run-many',
+      '-t',
+      'build',
+      `--projects=${releasePackageProjects(packages)}`,
+      `--configuration=${RELEASE_CONFIGURATION}`,
+    ],
+    root,
+  );
 }
 
 async function listMissingGithubReleasePackages(root: string, packages: ReleasePackage[]): Promise<ReleasePackage[]> {

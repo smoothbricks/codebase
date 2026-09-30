@@ -65,6 +65,16 @@ The plugin discovers Cargo workspaces beside Nx project manifests at any depth:
 Member and exclude patterns may use `*` and `?` in any path segment (for example, `packages/*/crates/*`). Unsupported
 patterns and member patterns that match no directory fail graph construction instead of silently omitting crates.
 
+### Cargo profiles
+
+The default configuration of every cargo target compiles cargo's `dev` profile: every local build and test, gates, CI
+validation and `nx build` share one `target/` and one set of units, so cargo recompiles only what changed. The
+`production` configuration adds `--release` to the targets that build shipped artifacts (`cargo-napi`,
+`napi-<arch>-<os>`, `cargo-wasm`) and is selected only where an artifact ships: the generated publish workflow's build
+and platform-leg steps, the `smoo release` commands it runs, and the build and deploy runs of a production
+`smoo github-ci nx-deploy`. Test targets have no `production` configuration, so a release build never compiles release
+test binaries.
+
 ### Cargo cache boundaries
 
 `cargo-fetch` is uncached because the registry lives outside Nx outputs. `cargo-test-compile` is also uncached: it warms
@@ -77,8 +87,7 @@ declared toolchain pin, and the toolchain's own reported versions. The pin is `d
 input at both `{workspaceRoot}/devenv.lock` and `{workspaceRoot}/tooling/direnv/devenv.lock` — devenv resolves it into
 the rustc, cargo, linker, C toolchain and SDK every cargo command inherits, so bumping it invalidates every cached cargo
 target. Workspace test runners additionally hash all workspace member manifests because those affect unified features,
-and the nextest executable/configuration. Production test configurations use release compilation and release runners
-together.
+and the nextest executable/configuration.
 
 Nothing machine-local takes part. The ambient cargo environment and the global `$CARGO_HOME/config.toml` are
 deliberately not hashed: their values carry absolute store paths and per-checkout state directories, which would make

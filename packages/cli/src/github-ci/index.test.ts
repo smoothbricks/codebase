@@ -1241,6 +1241,8 @@ describe('event-aware stage deployment', () => {
       '--projects=app-backend,website',
     ]);
     expect(nxCalls[0]).toContain('--stage=staging');
+    // Only a production deploy ships; staging deploys the dev build.
+    expect(nxCalls[0]?.some((arg) => arg.startsWith('--configuration='))).toBe(false);
   });
 
   it('publishes nothing when the deploy fails', async () => {
@@ -1303,6 +1305,14 @@ describe('event-aware stage deployment', () => {
       'lint --projects=app-backend,website',
       'test --projects=app-backend,website',
       'deploy --projects=app-backend,website',
+    ]);
+    // Production ships what it builds: build and deploy run the release
+    // configuration, while lint and test check the dev build.
+    expect(nxCalls.map((args) => args.find((arg) => arg.startsWith('--configuration=')) ?? null)).toEqual([
+      '--configuration=production',
+      null,
+      null,
+      '--configuration=production',
     ]);
   });
 });

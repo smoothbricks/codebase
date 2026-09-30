@@ -1,6 +1,10 @@
 /* biome-ignore-all lint/suspicious/noTemplateCurlyInString: GitHub Actions expressions are emitted literally. */
 
-import { LINUX_PLATFORM_TARGET_GLOBS, MACOS_PLATFORM_TARGET_GLOBS } from '../platform-targets.js';
+import {
+  LINUX_PLATFORM_TARGET_GLOBS,
+  MACOS_PLATFORM_TARGET_GLOBS,
+  RELEASE_CONFIGURATION,
+} from '../platform-targets.js';
 import type {
   PackageCargoCredentialsConfig,
   PackagePrivateNpmConfig,
@@ -20,6 +24,13 @@ import {
   sourceCheckoutsStepLines,
 } from './ci-workflow.js';
 import { GITHUB_HOSTED_LINUX_RUNNER, renderRunsOnLine, type WorkflowRunsOn } from './github-runs-on.js';
+
+/**
+ * Carried by every step that builds what ships: the build aggregate and each
+ * platform leg. Lint and unit tests keep the default configuration, cargo's
+ * dev profile, like every local and CI run.
+ */
+const RELEASE_BUILD_ARGUMENT = `--configuration ${RELEASE_CONFIGURATION}`;
 
 export type PublishWorkflowBump = 'auto' | 'patch' | 'minor' | 'major' | 'prerelease';
 export type PublishWorkflowCondition =
@@ -610,7 +621,7 @@ function yamlLinesForStep(step: PublishWorkflowStep, options: PublishWorkflowDef
     case PublishWorkflowStepKind.Build:
       return conditionalRunStep(
         step,
-        `smoo github-ci nx-run-many --targets build --projects "${githubExpression('steps.version.outputs.projects')}"`,
+        `smoo github-ci nx-run-many --targets build --projects "${githubExpression('steps.version.outputs.projects')}" ${RELEASE_BUILD_ARGUMENT}`,
       );
     case PublishWorkflowStepKind.Lint:
       return conditionalRunStep(
@@ -800,7 +811,7 @@ function renderSingleJobPublishWorkflowSteps(
         "        if: steps.version.outputs.mode != 'none'",
         `        run: smoo github-ci nx-run-many --targets "${LINUX_PLATFORM_TARGET_GLOBS.join(',')}" --projects "${githubExpression(
           'steps.version.outputs.projects',
-        )}"`,
+        )}" ${RELEASE_BUILD_ARGUMENT}`,
         '',
       );
       if (crossOnThisRunner) {
@@ -809,7 +820,7 @@ function renderSingleJobPublishWorkflowSteps(
           "        if: steps.version.outputs.mode != 'none'",
           `        run: smoo github-ci nx-run-many --targets "${macosPlatformFamilies(options).join(',')}" --projects "${githubExpression(
             'steps.version.outputs.projects',
-          )}"`,
+          )}" ${RELEASE_BUILD_ARGUMENT}`,
           '',
         );
       }
@@ -947,7 +958,7 @@ function renderLinuxReleaseCandidateSteps(
         '        run:',
         `          smoo github-ci nx-run-many --targets build --projects "${githubExpression(
           'steps.version.outputs.projects',
-        )}" --collect-outputs "${githubExpression('runner.temp')}/release-build-outputs"`,
+        )}" ${RELEASE_BUILD_ARGUMENT} --collect-outputs "${githubExpression('runner.temp')}/release-build-outputs"`,
       );
     } else {
       lines.push(...yamlLinesForStep(step, options));
@@ -974,7 +985,7 @@ function renderLinuxReleaseCandidateSteps(
           ',',
         )}" --projects "${githubExpression(
           'steps.version.outputs.projects',
-        )}" --collect-outputs "${githubExpression('runner.temp')}/linux-platform-outputs"`,
+        )}" ${RELEASE_BUILD_ARGUMENT} --collect-outputs "${githubExpression('runner.temp')}/linux-platform-outputs"`,
       );
       stepNumber += 1;
     }

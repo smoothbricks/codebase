@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import { copyFile, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { basename, isAbsolute, join, posix, resolve } from 'node:path';
+import { RELEASE_CONFIGURATION } from '@smoothbricks/nx-plugin/workspace-config-policy';
 import { publint } from 'publint';
 import { formatMessage } from 'publint/utils';
 import typia from 'typia';
@@ -349,7 +350,17 @@ export async function releasePack(root: string, options: ReleasePackOptions): Pr
   if (existing.length > 0) {
     throw new Error(`Refusing to pack into nonempty output directory ${outputDir}; use an empty directory.`);
   }
-  await run('nx', ['run-many', '-t', 'build', `--projects=${closure.map((pkg) => pkg.projectName).join(',')}`], root);
+  await run(
+    'nx',
+    [
+      'run-many',
+      '-t',
+      'build',
+      `--projects=${closure.map((pkg) => pkg.projectName).join(',')}`,
+      `--configuration=${RELEASE_CONFIGURATION}`,
+    ],
+    root,
+  );
   const entries: ReleasePackPackageEntry[] = [];
   for (const pkg of closure) {
     const { tarball, cleanup } = await packReleaseTarball(root, pkg);

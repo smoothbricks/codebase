@@ -110,6 +110,48 @@ describe('publish workflow definition', () => {
     expect(rendered).toContain("default: ''");
   });
 
+  it('builds what ships with the release configuration and checks the dev build', () => {
+    const shapes = [
+      renderPublishWorkflowYaml({ repoName: '@smoothbricks/codebase' }),
+      renderPublishWorkflowYaml({
+        repoName: '@smoothbricks/codebase',
+        platformTargetGlobs: LINUX_PLATFORM_TARGET_GLOBS,
+      }),
+      renderPublishWorkflowYaml(codebaseWorkflowOptions),
+      // One job that also cross-builds the Apple legs on its own runner.
+      renderPublishWorkflowYaml({
+        repoName: 'acme/app',
+        actionsProvider: 'forgejo',
+        runsOn: ['nixos-latest-x64', 'self-hosted'],
+        platformTargetGlobs: ['*-macos', '*-linux'],
+        macosPlatformArchitectures: ['arm64'],
+        platformProducer: { kind: 'linux-cross', preflight: 'sh prepare.sh' },
+        privateNpm: { scope: '@acme', readTokenEnv: 'READ_ENV', publishTokenEnv: 'PUBLISH_ENV' },
+      }),
+    ];
+    for (const rendered of shapes) {
+      const workflow = typia.assert<{ jobs: Record<string, { steps: Array<{ run?: string }> }> }>(
+        Bun.YAML.parse(rendered),
+      );
+      const runs = Object.values(workflow.jobs)
+        .flatMap((job) => job.steps)
+        .flatMap((step) => (step.run?.includes('smoo github-ci nx-run-many') ? [step.run] : []));
+      const isCheck = (run: string): boolean => /--targets (lint|test) /.test(run);
+      const builds = runs.filter((run) => !isCheck(run));
+      const checks = runs.filter(isCheck);
+      expect(builds.length).toBeGreaterThan(0);
+      expect(checks.length).toBeGreaterThan(0);
+      // The build aggregate and every platform leg ship; lint and unit tests
+      // check the same dev build every local and CI run uses.
+      for (const run of builds) {
+        expect(run).toContain('--configuration production');
+      }
+      for (const run of checks) {
+        expect(run).not.toContain('--configuration');
+      }
+    }
+  });
+
   it('a private forge release with cross-built Apple targets publishes from one job', () => {
     const rendered = renderPublishWorkflowYaml({
       repoName: 'acme/app',

@@ -2,7 +2,7 @@ import { spawn } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { appendFile } from 'node:fs/promises';
 import { PERMANENT_DEPLOY_TAG, STAGING_DEPLOY_TAG, stageDeploysProject } from '@smoothbricks/nx-plugin/deploy-policy';
-import { PLATFORM_TARGET_GLOBS } from '@smoothbricks/nx-plugin/workspace-config-policy';
+import { PLATFORM_TARGET_GLOBS, RELEASE_CONFIGURATION } from '@smoothbricks/nx-plugin/workspace-config-policy';
 import typia from 'typia';
 import {
   ciPushBranches,
@@ -394,6 +394,11 @@ export async function githubCiNxDeploy(
       `--exclude=${deployExclusions(stage)}`,
       `--parallel=${NX_PARALLEL}`,
     ];
+    // A production deploy ships what it builds, so its build and deploy runs, and every dependency Nx forwards the
+    // configuration to, compile the release configuration. Lint and test check the dev build like every other run.
+    if (stage === 'production' && (target === 'build' || target === 'deploy')) {
+      nxArgs.push(`--configuration=${RELEASE_CONFIGURATION}`);
+    }
     // Deploy ordering is a `dependsOn` edge in the project graph, not a second round here: one run-many
     // already sequences any depth of `a:deploy -> b:deploy -> c:deploy`.
     if (target === 'deploy') {
