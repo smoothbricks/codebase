@@ -98,6 +98,10 @@ direnv users need nothing extra.
   `std::env::var_os("CARGO_MANIFEST_DIR")`, which cargo and nextest set for every test.
 - After a lockfile or toolchain bump, re-warm main's image with `cowshed exec main -- <canonical build>` so new clones
   inherit the dependency graph.
+- Nx inside a workspace sandbox keeps its own daemon, task database and cache under `.cowshed/.nx`; a host shell's Nx in
+  the same checkout uses `.nx`, and neither daemon serves the other. Clones inherit main's sandboxed Nx state, so warm
+  main through `cowshed exec main --` (or its `[land] warm` step), not from a host shell. Pin `NX_CACHE_DIRECTORY` and
+  `NX_WORKSPACE_DATA_DIRECTORY` in a repository shell only as `${VAR:-…}` defaults.
 - The compile cache is a host daemon. Start it deliberately with `cowshed sccache start --capacity <size>`; a client
   that spawns its own daemon silently gets sccache's 10 GiB default cap. If hits are absent, run
   `cowshed sccache status` first.

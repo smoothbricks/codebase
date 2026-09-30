@@ -28,7 +28,9 @@ use crate::metadata::{
     WorkspaceInfoSnapshot, WorkspaceMarker, WorkspaceName, WorkspaceRole, is_image_path,
     sidecar_path,
 };
-use crate::repository::{CHECKPOINTS_DIRECTORY, OwnedRepoIds, RepoId, SESSIONS_DIRECTORY};
+use crate::repository::{
+    CHECKPOINTS_DIRECTORY, EXEC_TEMP_DIRECTORY, OwnedRepoIds, RepoId, SESSIONS_DIRECTORY,
+};
 use crate::workspace_credentials::{
     mint_workspace_credentials, validate_private_key, validate_public_workspace_assets,
 };
@@ -2021,6 +2023,37 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
                         &checkpoint_directory,
                         error,
                     ));
+                }
+            }
+            // The workspace's TMPDIR, named like its checkpoints, so the name's owner reclaims it.
+            // A sandboxed process may have replaced it with a link: that is unlinked, never
+            // followed.
+            let exec_temp = project
+                .join(EXEC_TEMP_DIRECTORY)
+                .join(authority.workspace().name().as_str());
+            match fs::symlink_metadata(&exec_temp) {
+                Ok(metadata) => {
+                    let removed = if metadata.is_dir() {
+                        fs::remove_dir_all(&exec_temp)
+                    } else {
+                        fs::remove_file(&exec_temp)
+                    };
+                    removed.map_err(|error| {
+                        io_error("remove retired exec temp dir", &exec_temp, error)
+                    })?;
+                    deletion_log::log_deletion(
+                        project,
+                        DeletionOp::ReclaimRetiredArtifact,
+                        DeletionKind::Other,
+                        authority.workspace().name().as_str(),
+                        Some(trash_image),
+                        &exec_temp,
+                    );
+                    sync_parent_path(&exec_temp)?
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(io_error("inspect retired exec temp dir", &exec_temp, error));
                 }
             }
         }

@@ -1507,10 +1507,11 @@ fn retired_pending_clone_reclaims_without_touching_reused_name() {
     assert_eq!(current.workspace_incarnation.as_str(), LIVE);
 }
 
-/// Trash entries are keyed `<name>-<incarnation>`, but `checkpoints/<name>` and the mountpoint are
-/// keyed on the name alone. Re-minting a retired name hands the new lifetime those same two paths,
-/// so a live workspace has to withhold them from a stranded retirement of its name without
-/// withholding that retirement's own per-incarnation artifacts — which are garbage either way.
+/// Trash entries are keyed `<name>-<incarnation>`, but `checkpoints/<name>`, the temp dir and the
+/// mountpoint are keyed on the name alone. Re-minting a retired name hands the new lifetime those
+/// same paths, so a live workspace has to withhold them from a stranded retirement of its name
+/// without withholding that retirement's own per-incarnation artifacts — which are garbage either
+/// way.
 #[test]
 fn gc_collects_each_stranded_retirement_while_a_live_workspace_reuses_the_name() {
     const FIRST: &str = "1836ace7b0cd4b41b3ca31a9eb1d131a";
@@ -1540,6 +1541,9 @@ fn gc_collects_each_stranded_retirement_while_a_live_workspace_reuses_the_name()
         .expect("pinned checkpoint fact");
     let mountpoint = layout.workspace_mount(&name).expect("workspace mountpoint");
     std::fs::create_dir_all(&mountpoint).expect("live mountpoint");
+    let exec_temp = layout.exec_temp_dir(&name).expect("temp dir");
+    std::fs::create_dir_all(&exec_temp).expect("live temp dir");
+    std::fs::write(exec_temp.join("scratch"), b"live").expect("live scratch");
 
     let stranded = [FIRST, SECOND].map(|incarnation| {
         let path = layout
@@ -1594,6 +1598,10 @@ fn gc_collects_each_stranded_retirement_while_a_live_workspace_reuses_the_name()
         mountpoint.exists(),
         "live workspace mountpoint was collected"
     );
+    assert_eq!(
+        std::fs::read(exec_temp.join("scratch")).expect("live temp dir kept"),
+        b"live"
+    );
 }
 
 /// Retiring one name twice leaves two independently collectable entries. The paths keyed on the
@@ -1624,6 +1632,9 @@ fn gc_collects_every_stranded_retirement_of_one_name_and_its_shared_paths_once()
     let checkpoint_directory = layout.project().checkpoints.join("lockfree-doctrine");
     let mountpoint = layout.workspace_mount(&name).expect("workspace mountpoint");
     std::fs::create_dir_all(&mountpoint).expect("empty mountpoint");
+    let exec_temp = layout.exec_temp_dir(&name).expect("temp dir");
+    std::fs::create_dir_all(exec_temp.join("nested")).expect("temp dir");
+    std::fs::write(exec_temp.join("nested/scratch"), b"left behind").expect("scratch");
 
     let stranded = [FIRST, SECOND].map(|incarnation| {
         let path = layout
@@ -1661,6 +1672,7 @@ fn gc_collects_every_stranded_retirement_of_one_name_and_its_shared_paths_once()
         "shared checkpoint directory remains"
     );
     assert!(!mountpoint.exists(), "shared mountpoint remains");
+    assert!(!exec_temp.exists(), "shared temp dir remains");
 }
 
 #[test]

@@ -226,6 +226,15 @@ impl StorageLayout {
         self.image_below(&workspace_directory, label.as_str())
     }
 
+    /// The `TMPDIR` of every process the workspace's sandbox runs: in the project's store
+    /// directory, so no workspace reaches another's (the store is denied to every sandbox and
+    /// this directory is the one carve-back), and outside every checkout, so a tool that must put
+    /// scratch files outside the project it builds finds a writable place. Keyed by name like the
+    /// workspace's checkpoints, and reclaimed with its retired image.
+    pub fn exec_temp_dir(&self, workspace: &WorkspaceName) -> Result<PathBuf, StorageLayoutError> {
+        checked_child(&self.project.exec_temp, workspace.as_str())
+    }
+
     /// Where this workspace mounts.
     ///
     /// A workspace bound to a build slot mounts at that slot's stable path instead of its own

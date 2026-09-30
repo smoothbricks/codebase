@@ -1980,23 +1980,27 @@ fn remove_terminal_storage_tree(path: &Path) -> Result<()> {
 /// The project store trees an unbinding deletes once main is retired; they may hold nothing but
 /// empty directories and zero-length locks by then.
 #[cfg(target_os = "macos")]
-const TERMINAL_STORAGE_TREES: [&str; 3] = [
+const TERMINAL_STORAGE_TREES: [&str; 4] = [
     crate::storage::recovery::STAGING_NAMESPACE,
     crate::repository::CHECKPOINTS_DIRECTORY,
+    crate::repository::EXEC_TEMP_DIRECTORY,
     crate::repository::SESSIONS_DIRECTORY,
 ];
 
 /// Refuses a main restore whose terminal storage the unbinding could not delete: a live
-/// workspace's image or grants, an unreclaimed retired image, a staged image, another workspace's
-/// checkpoint, or an `rm --abandon` bundle kept for its owner. Main's own checkpoints are exempt:
-/// main's retirement reclaims them with its image. The restore checks this before it retires main,
-/// because the same refusal after it leaves a binding no command can remove.
+/// workspace's image, grants or temp dir, an unreclaimed retired image, a staged image, another
+/// workspace's checkpoint, or an `rm --abandon` bundle kept for its owner. Main's own checkpoints
+/// and temp dir are exempt: main's retirement reclaims them with its image. The restore checks
+/// this before it retires main, because the same refusal after it leaves a binding no command can
+/// remove.
 #[cfg(target_os = "macos")]
 fn require_terminal_storage(project_root: &Path) -> Result<()> {
     let mut plan = Vec::new();
     let planned = TERMINAL_STORAGE_TREES.into_iter().try_for_each(|name| {
         let tree = project_root.join(name);
-        if name != crate::repository::CHECKPOINTS_DIRECTORY {
+        if name != crate::repository::CHECKPOINTS_DIRECTORY
+            && name != crate::repository::EXEC_TEMP_DIRECTORY
+        {
             return plan_terminal_storage_tree(&tree, &mut plan);
         }
         let entries = match std::fs::read_dir(&tree) {
@@ -11325,6 +11329,9 @@ fn supervisor_sandbox(
         grants,
         git_worktree_repository: git_worktree_repository(&current.metadata, main_mount),
         workspace_mount: mount,
+        exec_temp_dir: layout
+            .exec_temp_dir(&current.metadata.workspace)
+            .map_err(native_integrity_error)?,
     })
 }
 
@@ -14710,6 +14717,7 @@ mod terminal_project_cleanup_tests {
             ("session", "sessions/raven.asif.grants.json"),
             ("staged", ".staging/raven-4567.asif"),
             ("checkpoint", "checkpoints/raven/before.asif"),
+            ("temp", "tmp/raven/scratch"),
         ] {
             let (root, paths) = project(label);
             let lock = paths.sessions.join("raven.asif.lock");
@@ -14744,18 +14752,20 @@ mod terminal_project_cleanup_tests {
     }
 
     #[test]
-    fn mains_own_checkpoints_do_not_refuse_its_restore() {
+    fn mains_own_checkpoints_and_temp_dir_do_not_refuse_its_restore() {
         let (root, paths) = project("main-checkpoint");
         let checkpoint = paths.checkpoints.join("main/before.asif");
-        std::fs::create_dir_all(checkpoint.parent().expect("parent")).expect("parent");
-        std::fs::write(&checkpoint, b"main checkpoint").expect("checkpoint");
+        let scratch = paths.exec_temp.join("main/scratch");
+        for owned in [&checkpoint, &scratch] {
+            std::fs::create_dir_all(owned.parent().expect("parent")).expect("parent");
+            std::fs::write(owned, b"main's own").expect("owned artifact");
+        }
 
         require_terminal_storage(&paths.project_root)
-            .expect("main's retirement reclaims its own checkpoints");
-        assert_eq!(
-            std::fs::read(&checkpoint).expect("checkpoint kept"),
-            b"main checkpoint"
-        );
+            .expect("main's retirement reclaims its own checkpoints and temp dir");
+        for owned in [&checkpoint, &scratch] {
+            assert_eq!(std::fs::read(owned).expect("kept"), b"main's own");
+        }
         std::fs::remove_dir_all(root).expect("cleanup");
     }
 }

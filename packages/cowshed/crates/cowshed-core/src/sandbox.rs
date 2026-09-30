@@ -403,6 +403,8 @@ pub struct WorkspaceSandbox<'a> {
     /// The `.git` of main's mount, for a git-worktree workspace only.
     pub git_worktree_repository: Option<PathBuf>,
     pub workspace_mount: PathBuf,
+    /// The workspace's `TMPDIR`: [`crate::storage::StorageLayout::exec_temp_dir`].
+    pub exec_temp_dir: PathBuf,
 }
 
 /// The sandbox a workspace's supervisor runs in and hands `plan_exec` for every child it
@@ -418,13 +420,12 @@ pub fn workspace_sandbox(workspace: WorkspaceSandbox<'_>) -> crate::Result<Sandb
         grants,
         git_worktree_repository,
         workspace_mount: mount,
+        exec_temp_dir,
     } = workspace;
     Ok(SandboxConfig {
         home: home.to_path_buf(),
         mount_root: mount_root.to_path_buf(),
-        // TMPDIR on the shed: copy-on-write with the clone, reclaimed with it, and inside the
-        // one tree the child profile grants writes to - no carve-back against the store.
-        exec_temp_dir: mount.join(".cowshed/tmp"),
+        exec_temp_dir,
         shed_links: shed_links(&mount).map_err(|error| {
             CowshedError::integrity(
                 format!("cannot read the shed beside {}: {error}", mount.display()),
@@ -832,7 +833,7 @@ pub fn seatbelt_profile(
         push_exact_and_subpath_rule(&mut profile, "allow file-read* file-write*", repository)?;
     }
 
-    // The exec temp dir is exported as TMPDIR and lives under the store's quarantine, so its
+    // The exec temp dir is exported as TMPDIR and lives in the project's store directory, so its
     // grant must follow every deny that covers it - the store-wide one and the project root
     // above - or last-match-wins re-denies it: every `mktemp` in a child then fails on a path
     // the child never chose. Read and write both - a child reads back what it wrote there, and

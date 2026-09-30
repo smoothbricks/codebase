@@ -88,7 +88,6 @@ Shape:
 
 ;; Writable roots outside the cowshed tree — the closed baseline.
 (allow file-write*
-  (subpath "<exec temp dir>")
   (literal "/dev/null") (literal "/dev/stdout") (literal "/dev/stderr")
   … granted write paths …)
 ;; A child's stdio is often the null device, opened write-only by its parent (a
@@ -126,6 +125,13 @@ Shape:
 ;; (plus cargo's registry/git links and read-write literals for cargo's root
 ;; state files) — never a subpath of a host tool home.
 (allow file-read* file-read-data file-write* (subpath "<workspace mount>")) ;; own mount ONLY
+;; TMPDIR: the workspace's own directory in its project's store directory,
+;; <store>/<owner>/<repo>/tmp/<workspace> (01_storage.md). Outside every checkout,
+;; so a tool that must keep scratch files outside the project it builds finds a
+;; writable place; inside the store, so the deny above keeps every sibling's out of
+;; reach. Emitted after the project-root policy deny too, or last-match-wins
+;; re-denies it and every `mktemp` fails on a path the child never chose.
+(allow file-read* file-read-data file-write* (subpath "<exec temp dir>"))
 
 ;; Secrets: denied after the scoped allows. The explicit file-read-data deny
 ;; is essential: a wildcard file-read* deny does not defeat the broad,
@@ -187,10 +193,11 @@ Notes:
   match before emission order can protect a boundary; "last match wins" alone is not the rule. Scoped read allows also
   name `file-read-data` explicitly so they can carve back their authorized subtrees. Profiles retain four ordered
   **layers** — broad allows → the `/private/cowshed/store` volume-wide deny → scoped carve-backs (caches read,
-  designated cache-subtree writes, own mount) → secret denies — and a unit test (08_testing.md) asserts the layer order
-  plus probe paths (grant file, CA key, sibling image, sibling mount unreadable; own mount and designated caches
-  writable). The single subtree deny on `/private/cowshed/store` is _structurally_ stronger than the old enumerated
-  list: sibling workspace mounts and projects adopted after profile generation are covered without being named.
+  designated cache-subtree writes, own mount, own temp dir) → secret denies — and a unit test (08_testing.md) asserts
+  the layer order plus probe paths (grant file, CA key, sibling image, sibling mount unreadable; own mount and
+  designated caches writable). The single subtree deny on `/private/cowshed/store` is _structurally_ stronger than the
+  old enumerated list: sibling workspace mounts and projects adopted after profile generation are covered without being
+  named.
 - The caches volume's **mirror** and **git** (bare-mirror) subtrees are readable but never writable from a sandbox (only
   the gateway writes layer-1 artifacts — 03_caches.md, 05_gateway.md).
 - `~/.cargo` and `~/.gradle` are deliberately _not_ relocated wholesale to the cache volume — only their cache subtrees
@@ -575,16 +582,44 @@ contract (02_workspaces.md) remains unchanged: `just verify` runs through this a
 wrapper.
 
 Devenv resolves runtime state beneath `XDG_RUNTIME_DIR`, independently of `TMPDIR`. Cowshed provides a short
-workspace-owned runtime path for Unix socket length limits, while `TMPDIR` names the writable per-exec temporary
-directory. Both are prepared before activation. The child may write these scoped directories, but the baseline still
-denies writes to the world-shared `/private/tmp`; shell activation does not require a blanket temporary-directory grant.
+workspace-owned runtime path for Unix socket length limits, while `TMPDIR` names the workspace's writable temporary
+directory, `<store>/<owner>/<repo>/tmp/<workspace>` (01_storage.md). Both are prepared before activation, for every job
+the supervisor starts — an `exec`, a named session's command, a land check, a warm step. The temporary directory lies
+outside every checkout, because a tool may need scratch space outside the project it builds (a transform whose scratch
+directory must not sit under the project root), and outside the image, so a clone starts with an empty one and never
+copies another workspace's scratch. It is keyed by the workspace's name like its checkpoints, survives a restore, and
+goes when the retired image is reclaimed (`rm`, or `gc` for a retirement a crash stranded). The child may write these
+scoped directories, but the baseline still denies writes to the world-shared `/private/tmp` and to the host user's own
+temporary directory under `/private/var/folders`; shell activation does not require a blanket temporary-directory grant.
+A process that reaches a temporary directory by any other route than `TMPDIR` finds none it can write: `xcrun`, for one,
+then fails to create its cache, prints its `mkstemp` path, and resolves every lookup the slow way.
+
 Nx receives a real `nx` child directory below the short runtime alias through `NX_SOCKET_DIR`. Its `O_NOFOLLOW`
 admission rejects a symlink at the leaf, so the alias itself is not its socket directory. Nx does not use
 `XDG_RUNTIME_DIR`, and its default shared-temp directory is outside the sandbox. Its daemon and isolated plugin workers
-remain enabled; socket placement is a Cowshed runtime binding, not a per-project flag or filesystem grant. Beyond the
-runtime dir, a child may bind and connect Unix sockets anywhere in its workspace's own tree — the exec temp dir, and for
-a read-write job the whole mount — so a test's socket in `TMPDIR` works as it does on the host. A write grant is not a
-socket grant, and a read-only job cannot reach the sockets read-write jobs' daemons keep under the mount.
+remain enabled; socket placement is a Cowshed runtime binding, not a per-project flag or filesystem grant.
+
+The socket directory does not decide which daemon a client uses. An Nx daemon records its pid and socket path in
+`server-process.json` under its workspace-data directory, and every client connects to the socket that record names. A
+sandboxed Nx sharing that directory with host clients — in main, or in any workspace a host shell also enters — would
+record its daemon where they look and serve them: their project graph computed and their runtime inputs run inside this
+sandbox, with the host client's environment, `TMPDIR` included, which the sandbox cannot write. Every job's Nx therefore
+keeps Nx's own layout under the job's private environment root (`.cowshed` for a read-write job, the exec temp dir for a
+read-only one): `NX_WORKSPACE_DATA_DIRECTORY=<root>/.nx/workspace-data` and `NX_CACHE_DIRECTORY=<root>/.nx/cache`. The
+two move together. The workspace-data directory holds the task database, whose rows index the cache directory: a
+database beside another boundary's cache takes hits on artifacts it never wrote, and each side's eviction deletes what
+the other's rows name. So the sandboxed daemon, project graph, task history and cache never cross the boundary in either
+direction, and each boundary keeps a daemon of its own alive, which is what lets a cache hit whose outputs are already
+on disk leave them in place rather than restore them. Both paths end in names Nx ignores at any depth
+(`**/.nx/workspace-data`, `**/.nx/cache`), so neither is hashed into the project graph, and the private root is in the
+image, so a clone starts with main's sandboxed Nx state as warm as its `target/`. The variables are the sandbox's; a
+caller's values never reach the child. A repository shell's own export still replaces them, like any export, so a
+repository that pins Nx's directories pins them as defaults (`${NX_CACHE_DIRECTORY:-.nx/cache}`) or hands the host's
+daemon back to the sandbox.
+
+Beyond the runtime dir, a child may bind and connect Unix sockets anywhere in its workspace's own tree — the exec temp
+dir, and for a read-write job the whole mount — so a test's socket in `TMPDIR` works as it does on the host. A write
+grant is not a socket grant, and a read-only job cannot reach the sockets read-write jobs' daemons keep under the mount.
 
 On macOS, port collisions between workspaces are handled by the per-workspace port block, not left to the user:
 `devenv up` and dev servers bind ports derived from `COWSHED_PORT_BASE` (the block base) within

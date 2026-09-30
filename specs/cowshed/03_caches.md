@@ -231,8 +231,10 @@ them there; they contain the endpoint URL, whose userinfo is the workspace token
     exported; anything that needs identity derives it from cwd via `.cowshed/workspace.json` or asks the CLI.
   - The supervisor sets, for every job it spawns (`runtime/supervisor.rs` `sandbox_environment`):
     - the private environment: `HOME`, `XDG_{CONFIG,CACHE,DATA,STATE}_HOME`, `DIRENV_CONFIG`, `TMPDIR`,
-      `XDG_RUNTIME_DIR`, `NX_SOCKET_DIR`, and the shared tool homes (`CARGO_HOME`, `BUN_INSTALL_CACHE_DIR`,
-      `UV_CACHE_DIR`, above), which name the host's own default paths only to undo the private `HOME`;
+      `XDG_RUNTIME_DIR`, `NX_SOCKET_DIR`, `NX_WORKSPACE_DATA_DIRECTORY` and `NX_CACHE_DIRECTORY` (the sandboxed Nx's own
+      daemon record, task database and cache under the private root, 04_sandbox.md), and the shared tool homes
+      (`CARGO_HOME`, `BUN_INSTALL_CACHE_DIR`, `UV_CACHE_DIR`, above), which name the host's own default paths only to
+      undo the private `HOME`;
     - git isolation: `GIT_CONFIG_GLOBAL`, `GIT_CONFIG_NOSYSTEM`, `GIT_ATTR_NOSYSTEM`, the fetch-route include as
       `GIT_CONFIG_COUNT`/`KEY`/`VALUE` (02_workspaces.md), and `CARGO_NET_GIT_FETCH_WITH_CLI`;
     - the `.cowshed/env` set again (`GOENV`, the token, the port pair), `SCCACHE_SERVER_UDS` and `SCCACHE_DIR` (the host

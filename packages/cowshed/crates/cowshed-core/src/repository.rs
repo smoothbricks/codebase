@@ -17,6 +17,8 @@ pub const POLICY_FILE: &str = "policy.json";
 pub const SESSIONS_DIRECTORY: &str = "sessions";
 pub const CHECKPOINTS_DIRECTORY: &str = "checkpoints";
 pub const QUARANTINE_DIRECTORY: &str = "quarantine";
+/// One directory per workspace name: the `TMPDIR` of every process its sandbox runs.
+pub const EXEC_TEMP_DIRECTORY: &str = "tmp";
 pub const WAIVERS_FILE: &str = "waivers.json";
 const RESERVED_LAYOUT_OWNERS: &[&str] = &[
     "gateway",
@@ -653,6 +655,8 @@ pub struct ProjectPaths {
     pub sessions: PathBuf,
     pub checkpoints: PathBuf,
     pub quarantine: PathBuf,
+    /// Per-workspace temporary directories, outside every mount; see [`EXEC_TEMP_DIRECTORY`].
+    pub exec_temp: PathBuf,
     pub waivers: PathBuf,
     /// This project's encoded subtree beneath [`Self::host_mount_root`].
     pub mount_root: PathBuf,
@@ -679,6 +683,7 @@ impl ProjectPaths {
             sessions: checked_join(&project_root, [SESSIONS_DIRECTORY])?,
             checkpoints: checked_join(&project_root, [CHECKPOINTS_DIRECTORY])?,
             quarantine: checked_join(&project_root, [QUARANTINE_DIRECTORY])?,
+            exec_temp: checked_join(&project_root, [EXEC_TEMP_DIRECTORY])?,
             waivers: checked_join(&project_root, [WAIVERS_FILE])?,
             store_root,
             host_mount_root,
