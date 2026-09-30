@@ -202,7 +202,7 @@ export function defineCiWorkflow(options: CiWorkflowDefinitionOptions): CiWorkfl
     steps.push({ kind: CiWorkflowStepKind.BrowserTests, name: '🌐 Browser Tests' });
   }
   steps.push(
-    { kind: CiWorkflowStepKind.ManagedFilesCheck, name: '🩺 Check managed-file drift' },
+    { kind: CiWorkflowStepKind.ManagedFilesCheck, name: '🩺 Check monorepo policies and managed-file drift' },
     { kind: CiWorkflowStepKind.ManagedFilesDispatch, name: '🔁 Dispatch managed-file drift healing' },
     { kind: CiWorkflowStepKind.SaveNxCache, name: '💾 Save Nx cache' },
     { kind: CiWorkflowStepKind.UploadTraceDbs, name: '📎 Upload trace DBs' },
@@ -477,24 +477,21 @@ function yamlLinesForStep(step: CiWorkflowStep, options: CiWorkflowDefinitionOpt
         `        run: smoo github-ci nx-run-many --targets "${darwinCrossTestTargetNames(options).join(',')}"`,
       ];
     case CiWorkflowStepKind.ManagedFilesCheck:
-      // The authoritative drift check is nearly free here (devenv is already
-      // up). --warn never fails the job and publishes the step output
-      // `drifted=<count>` for the dispatch step below.
-      return [
-        `      - name: ${step.name}`,
-        '        id: managed-drift',
-        '        if:',
-        "          ${{ github.event_name == 'push' && github.ref == format('refs/heads/{0}',",
-        '          github.event.repository.default_branch) }}',
-        '        run: smoo monorepo check --warn',
-      ];
+      // Runs on every event, pull requests included: the package policies fail the job, since
+      // nothing heals them, while --warn keeps managed-file drift non-blocking and publishes the
+      // step output `drifted=<count>` for the dispatch step below. The check is nearly free here
+      // (devenv is already up).
+      return [`      - name: ${step.name}`, '        id: managed-drift', '        run: smoo monorepo check --warn'];
     case CiWorkflowStepKind.ManagedFilesDispatch:
       // Dispatches the managed-files workflow, which maintains the persistent
-      // review PR. workflow_dispatch is exempt from GitHub's GITHUB_TOKEN
-      // recursion guard, so the default token suffices.
+      // review PR, from the default branch only. workflow_dispatch is exempt from
+      // GitHub's GITHUB_TOKEN recursion guard, so the default token suffices.
       return [
         `      - name: ${step.name}`,
-        "        if: steps.managed-drift.outputs.drifted != '' && steps.managed-drift.outputs.drifted != '0'",
+        '        if: >-',
+        "          ${{ github.event_name == 'push' && github.ref == format('refs/heads/{0}',",
+        "          github.event.repository.default_branch) && steps.managed-drift.outputs.drifted != '' &&",
+        "          steps.managed-drift.outputs.drifted != '0' }}",
         '        run: smoo github-ci dispatch-workflow --workflow managed-files.yml --ref "$GITHUB_REF_NAME"',
       ];
     case CiWorkflowStepKind.Deploy:

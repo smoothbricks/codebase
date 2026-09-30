@@ -42,6 +42,19 @@ async function generate(tree: Tree, graph: WorkspaceProjects = projects): Promis
   assertNoManagedConflicts(await generateManagedFiles(tree, graph, new Map()));
 }
 
+/** Every step of every job in a workflow, as its fields. */
+function workflowSteps(yaml: string): Array<Map<string, unknown>> {
+  const workflow: unknown = Bun.YAML.parse(yaml);
+  if (typeof workflow !== 'object' || workflow === null || !('jobs' in workflow)) return [];
+  const jobs = workflow.jobs;
+  if (typeof jobs !== 'object' || jobs === null) return [];
+  return Object.values(jobs).flatMap((job: unknown) =>
+    typeof job === 'object' && job !== null && 'steps' in job && Array.isArray(job.steps)
+      ? job.steps.map((step: unknown) => new Map(typeof step === 'object' && step !== null ? Object.entries(step) : []))
+      : [],
+  );
+}
+
 describe('managed-files generator', () => {
   it('generates workflows and packaged bootstrap assets in a virtual workspace', async () => {
     const tree = workspace();
@@ -63,6 +76,22 @@ describe('managed-files generator', () => {
     expect(ci).toContain('      - trunk');
     expect(ci).toContain('    runs-on: ubuntu-24.04');
     expect(ci).not.toContain('nixos-latest');
+  });
+
+  // The package policies fail `smoo monorepo check --warn`, so the step must run where a change is
+  // judged — pull requests included — while drift healing stays a default-branch concern.
+  it('runs the policy check on every CI event and heals drift only from the default branch', async () => {
+    const tree = workspace();
+    await generate(tree);
+    const steps = workflowSteps(tree.read('.github/workflows/ci.yml', 'utf8') ?? '');
+    const check = steps.find((step) => step.get('id') === 'managed-drift');
+    expect(check?.get('run')).toBe('smoo monorepo check --warn');
+    expect(check?.has('if')).toBe(false);
+    const dispatch = steps.find((step) => String(step.get('run')).includes('--workflow managed-files.yml'));
+    const condition = String(dispatch?.get('if'));
+    expect(condition).toContain("github.event_name == 'push'");
+    expect(condition).toContain('github.event.repository.default_branch');
+    expect(condition).toContain('steps.managed-drift.outputs.drifted');
   });
 
   it('discovers publication from workspace packages and does not publish another repository', async () => {
