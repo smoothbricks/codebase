@@ -28,6 +28,7 @@ pub mod result;
 pub mod scope;
 pub mod thread_buffer;
 pub mod thread_ffi;
+pub mod thread_store;
 pub mod tuning;
 
 include!(concat!(env!("OUT_DIR"), "/source_git.rs"));
@@ -60,4 +61,5 @@ pub use thread_kinds::{
     ATTRIBUTE_KIND_UINT64, AttributeKind,
 };
 pub use thread_schema::{SYSTEM_COLUMN_COUNT, SYSTEM_COLUMNS, SystemColumnKind, SystemColumnMeta};
+pub use thread_store::ThreadStore;
 pub use tuning::{CapacityRatchet, DEFAULT_CAPACITY, MAX_CAPACITY, MIN_CAPACITY};

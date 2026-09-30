@@ -8,191 +8,18 @@
 //! frozen numeric ABI.
 
 use std::cell::RefCell;
-use std::mem::ManuallyDrop;
-use std::{collections::HashSet, str};
 
 use lmao_core::{
     ATTRIBUTE_KIND_BOOLEAN, ATTRIBUTE_KIND_ENUM, ATTRIBUTE_KIND_NUMBER, ATTRIBUTE_KIND_TEXT,
-    ATTRIBUTE_KIND_UINT64, ColumnValue, ColumnValueRef, EntryType, FieldMeta, FieldStrategy,
-    ScopeValue, TextInput, ThreadBufferError, ThreadSpanBuffer, TraceId, VocabularyId,
+    ATTRIBUTE_KIND_UINT64, ColumnValueRef, EntryType, TextInput, ThreadBufferError,
+    ThreadSpanBuffer, ThreadStore, TraceId, VocabularyId,
 };
 
 const STATUS_OK: u8 = 0;
 const STATUS_ERROR: u8 = 1;
-const SYSTEM_COLUMN_COUNT: usize = lmao_core::SYSTEM_COLUMN_COUNT;
 
 thread_local! {
-    static HANDLES: RefCell<Vec<Option<ThreadBufferSlot>>> = const { RefCell::new(Vec::new()) };
-}
-
-#[derive(Debug)]
-enum ParsedFieldStrategy {
-    Number,
-    Uint64,
-    Boolean,
-    Text,
-    Enum(Vec<String>),
-}
-
-#[derive(Debug)]
-struct ParsedField {
-    name: String,
-    strategy: ParsedFieldStrategy,
-}
-
-#[derive(Debug)]
-struct SchemaStorage {
-    fields: Box<[FieldMeta]>,
-    _names: Vec<Box<str>>,
-    _enum_variants: Vec<Vec<Box<str>>>,
-    _enum_values: Vec<Box<[&'static str]>>,
-}
-
-impl SchemaStorage {
-    fn from_fields(fields: Vec<ParsedField>) -> Self {
-        let mut names = Vec::with_capacity(fields.len());
-        let mut enum_variants = Vec::new();
-        let mut enum_values = Vec::new();
-        let mut metadata = Vec::with_capacity(fields.len());
-        for field in fields {
-            names.push(field.name.into_boxed_str());
-            let name_ptr = names.last().expect("just-pushed schema name").as_ref() as *const str;
-            // SAFETY: `names` owns this allocation for the lifetime of this
-            // storage, and `SchemaStorage` is dropped only after its buffer.
-            let name: &'static str = unsafe { &*name_ptr };
-            let strategy = match field.strategy {
-                ParsedFieldStrategy::Number => FieldStrategy::Number,
-                ParsedFieldStrategy::Uint64 => FieldStrategy::Uint64,
-                ParsedFieldStrategy::Boolean => FieldStrategy::Boolean,
-                ParsedFieldStrategy::Text => FieldStrategy::Text,
-                ParsedFieldStrategy::Enum(values) => {
-                    let owned_values = values
-                        .into_iter()
-                        .map(String::into_boxed_str)
-                        .collect::<Vec<_>>();
-                    let values = owned_values
-                        .iter()
-                        .map(|value| {
-                            let value_ptr = value.as_ref() as *const str;
-                            // SAFETY: the boxed strings are retained by
-                            // `_enum_variants` for the schema lifetime.
-                            unsafe { &*value_ptr }
-                        })
-                        .collect::<Vec<_>>()
-                        .into_boxed_slice();
-                    let values_ptr = values.as_ref() as *const [&'static str];
-                    // SAFETY: the boxed slice is retained by `_enum_values`.
-                    let values_ref: &'static [&'static str] = unsafe { &*values_ptr };
-                    enum_variants.push(owned_values);
-                    enum_values.push(values);
-                    FieldStrategy::Enum(values_ref)
-                }
-            };
-            metadata.push(FieldMeta::new(name, strategy));
-        }
-        Self {
-            fields: metadata.into_boxed_slice(),
-            _names: names,
-            _enum_variants: enum_variants,
-            _enum_values: enum_values,
-        }
-    }
-
-    fn fields(&self) -> &'static [FieldMeta] {
-        let fields_ptr = self.fields.as_ref() as *const [FieldMeta];
-        // SAFETY: `ThreadBufferSlot` drops its buffer before this storage, and
-        // the buffer is the only consumer of these metadata references.
-        unsafe { &*fields_ptr }
-    }
-}
-
-#[derive(Debug)]
-struct ThreadBufferSlot {
-    buffer: ManuallyDrop<ThreadSpanBuffer>,
-    _schema: SchemaStorage,
-}
-
-impl ThreadBufferSlot {
-    fn new(thread_id: u64, capacity: usize, fields: Vec<ParsedField>) -> Self {
-        let schema = SchemaStorage::from_fields(fields);
-        let buffer = ThreadSpanBuffer::new(thread_id, capacity, schema.fields());
-        Self {
-            buffer: ManuallyDrop::new(buffer),
-            _schema: schema,
-        }
-    }
-}
-
-impl Drop for ThreadBufferSlot {
-    fn drop(&mut self) {
-        // SAFETY: the metadata owner remains alive until this explicit buffer
-        // drop completes.
-        unsafe { ManuallyDrop::drop(&mut self.buffer) };
-    }
-}
-
-fn parse_schema(ptr: *const u8, len: usize) -> Option<Vec<ParsedField>> {
-    let bytes = unsafe { bytes(ptr, len) }?;
-    let mut cursor = 0;
-    let mut names = HashSet::new();
-    let mut fields = Vec::new();
-
-    while cursor < bytes.len() {
-        let kind = *bytes.get(cursor)?;
-        cursor += 1;
-        let name_len = usize::from(*bytes.get(cursor)?);
-        cursor += 1;
-        let name_end = cursor.checked_add(name_len)?;
-        let name_bytes = bytes.get(cursor..name_end)?;
-        cursor = name_end;
-        let name = str::from_utf8(name_bytes).ok()?;
-        if name.is_empty() || !names.insert(name) {
-            return None;
-        }
-
-        let strategy = match kind {
-            ATTRIBUTE_KIND_NUMBER => ParsedFieldStrategy::Number,
-            ATTRIBUTE_KIND_UINT64 => ParsedFieldStrategy::Uint64,
-            ATTRIBUTE_KIND_BOOLEAN => ParsedFieldStrategy::Boolean,
-            ATTRIBUTE_KIND_TEXT => ParsedFieldStrategy::Text,
-            ATTRIBUTE_KIND_ENUM => {
-                let count_end = cursor.checked_add(2)?;
-                let count_bytes = bytes.get(cursor..count_end)?;
-                cursor = count_end;
-                let count = u16::from_le_bytes([count_bytes[0], count_bytes[1]]);
-                if count == 0 {
-                    return None;
-                }
-                let mut variants = Vec::with_capacity(usize::from(count));
-                let mut variant_names = HashSet::with_capacity(usize::from(count));
-                for _ in 0..count {
-                    let variant_len = usize::from(*bytes.get(cursor)?);
-                    cursor += 1;
-                    let variant_end = cursor.checked_add(variant_len)?;
-                    let variant_bytes = bytes.get(cursor..variant_end)?;
-                    cursor = variant_end;
-                    let variant = str::from_utf8(variant_bytes).ok()?;
-                    if variant.is_empty() || !variant_names.insert(variant) {
-                        return None;
-                    }
-                    variants.push(variant.to_owned());
-                }
-                ParsedFieldStrategy::Enum(variants)
-            }
-            _ => return None,
-        };
-        fields.push(ParsedField {
-            name: name.to_owned(),
-            strategy,
-        });
-    }
-
-    let highest_ordinal = fields
-        .len()
-        .checked_add(SYSTEM_COLUMN_COUNT)?
-        .checked_sub(1)?;
-    u16::try_from(highest_ordinal).ok()?;
-    Some(fields)
+    static HANDLES: RefCell<Vec<Option<ThreadStore>>> = const { RefCell::new(Vec::new()) };
 }
 
 fn valid_capacity(capacity: u32) -> Option<usize> {
@@ -216,12 +43,11 @@ fn with_handle<R>(
             .get_mut(handle as usize - 1)
             .and_then(Option::as_mut)
             .ok_or(ThreadBufferError::UnknownSpan(0))
-            .and_then(|slot| f(&mut slot.buffer))
+            .and_then(|store| f(store))
     })
 }
 
-fn allocate_handle(thread_id: u64, capacity: usize, fields: Vec<ParsedField>) -> u32 {
-    let slot = ThreadBufferSlot::new(thread_id, capacity, fields);
+fn allocate_handle(slot: ThreadStore) -> u32 {
     HANDLES.with(|handles| {
         let mut handles = handles.borrow_mut();
         if let Some(index) = handles.iter().position(Option::is_none) {
@@ -265,22 +91,12 @@ fn dynamic_text<'a>(ptr: *const u8, len: usize) -> Option<TextInput<'a>> {
     std::str::from_utf8(bytes).ok().map(TextInput::Dynamic)
 }
 
-fn write_value(buffer: &mut ThreadSpanBuffer, row: u32, ordinal: u16, kind: u8, value: u64) -> u8 {
-    let Some(value) = buffer.decode_abi_value(kind, value) else {
-        return STATUS_ERROR;
-    };
-    buffer
-        .write_attr(row, ordinal, value)
-        .map(|()| STATUS_OK)
-        .unwrap_or(STATUS_ERROR)
-}
-
 #[cfg_attr(target_family = "wasm", unsafe(no_mangle))]
 pub extern "C" fn thread_span_buffer_new(thread_id: u64, capacity: u32) -> u32 {
     let Some(capacity) = valid_capacity(capacity) else {
         return 0;
     };
-    allocate_handle(thread_id, capacity, Vec::new())
+    allocate_handle(ThreadStore::with_fields(thread_id, capacity, &[]))
 }
 
 /// Construct a schema-bearing buffer from the compact generated-schema blob.
@@ -301,10 +117,10 @@ pub unsafe extern "C" fn thread_span_buffer_new_with_schema(
     let Some(capacity) = valid_capacity(capacity) else {
         return 0;
     };
-    let Some(fields) = parse_schema(fields_ptr, fields_len) else {
+    let Some(blob) = (unsafe { bytes(fields_ptr, fields_len) }) else {
         return 0;
     };
-    allocate_handle(thread_id, capacity, fields)
+    ThreadStore::from_schema_blob(thread_id, capacity, blob).map_or(0, allocate_handle)
 }
 
 #[cfg_attr(target_family = "wasm", unsafe(no_mangle))]
@@ -566,38 +382,6 @@ pub unsafe extern "C" fn thread_span_buffer_set_completion_message(
 }
 
 #[cfg_attr(target_family = "wasm", unsafe(no_mangle))]
-pub extern "C" fn thread_span_buffer_write_attr(
-    handle: u32,
-    row: u32,
-    ordinal: u16,
-    kind: u8,
-    value: u64,
-) -> u8 {
-    with_handle(handle, |buffer| {
-        Ok(write_value(buffer, row, ordinal, kind, value))
-    })
-    .unwrap_or(STATUS_ERROR)
-}
-
-#[cfg_attr(target_family = "wasm", unsafe(no_mangle))]
-pub extern "C" fn thread_span_buffer_write_tag(
-    handle: u32,
-    span_id: u32,
-    ordinal: u16,
-    kind: u8,
-    value: u64,
-) -> u8 {
-    with_handle(handle, |buffer| {
-        let row = buffer
-            .start_row(span_id)
-            .and_then(|row| u32::try_from(row).ok())
-            .ok_or(ThreadBufferError::UnknownSpan(span_id))?;
-        Ok(write_value(buffer, row, ordinal, kind, value))
-    })
-    .unwrap_or(STATUS_ERROR)
-}
-
-#[cfg_attr(target_family = "wasm", unsafe(no_mangle))]
 pub extern "C" fn thread_span_buffer_set_scope(
     handle: u32,
     span_id: u32,
@@ -606,43 +390,25 @@ pub extern "C" fn thread_span_buffer_set_scope(
     value: u64,
 ) -> u8 {
     with_handle(handle, |buffer| {
-        let index = usize::from(ordinal)
-            .checked_sub(SYSTEM_COLUMN_COUNT)
-            .ok_or(ThreadBufferError::InvalidColumnOrdinal(ordinal))?;
-        let field = buffer
-            .schema_fields()
-            .get(index)
-            .ok_or(ThreadBufferError::InvalidColumnOrdinal(ordinal))?;
-        // Kind 0 is the clear sentinel: 01i `setScope({ field: null })` deletes the
-        // field. Decode would refuse kind 0, so the clear path never goes through it.
-        if kind == 0 {
-            let update = [(field.name, None)];
-            return buffer.set_scope(span_id, &update);
-        }
-        let value = buffer
-            .decode_abi_value(kind, value)
-            .ok_or(ThreadBufferError::InvalidColumnOrdinal(ordinal))?;
-        let scope_value = match value {
-            ColumnValue::Number(value) => ScopeValue::Number(value),
-            ColumnValue::Uint64(value) => ScopeValue::Uint64(value),
-            ColumnValue::Boolean(value) => ScopeValue::Boolean(value),
-            // A scope value outlives the arena's next clear, so the ordinal is
-            // resolved and owned here; set_scope is a per-span boundary, not a
-            // per-row path.
-            ColumnValue::Text(value) => ScopeValue::Text(
-                buffer
-                    .interned(value)
-                    .ok_or(ThreadBufferError::InvalidColumnOrdinal(ordinal))?
-                    .to_owned()
-                    .into(),
-            ),
-            ColumnValue::Enum(value) => ScopeValue::EnumIndex(value),
-        };
-        let update = [(field.name, Some(scope_value))];
-        buffer.set_scope(span_id, &update)
+        buffer.set_scope_encoded(span_id, ordinal, kind, value)
     })
     .map(|()| STATUS_OK)
     .unwrap_or(STATUS_ERROR)
+}
+
+/// Linear-memory offset of `block`'s attribute cells, for a TypedArray view
+/// (`lmao_core::AttributeCells` documents the layout). Zero when the block does
+/// not exist yet or the schema has no attributes. The offset is stable for the
+/// handle's life; a `memory.grow` only detaches views, it never moves cells.
+#[cfg_attr(target_family = "wasm", unsafe(no_mangle))]
+pub extern "C" fn thread_span_buffer_attribute_cells(handle: u32, block: u32) -> usize {
+    with_handle(handle, |buffer| {
+        Ok(buffer
+            .attribute_cells(block as usize)
+            .filter(|cells| !cells.is_empty())
+            .map_or(0, |cells| cells.as_ptr() as usize))
+    })
+    .unwrap_or(0)
 }
 
 fn copy_out(dst: *mut u8, dst_len: usize, src: &[u8]) -> u32 {
@@ -856,6 +622,7 @@ pub unsafe extern "C" fn thread_span_buffer_read_interned(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lmao_core::SYSTEM_COLUMN_COUNT;
 
     fn bytes(value: &str) -> (*const u8, usize) {
         (value.as_ptr(), value.len())
@@ -950,66 +717,49 @@ mod tests {
     }
 
     #[test]
-    fn kind_zero_is_invalid_and_schema_ordinals_are_real() {
+    fn a_cell_stored_through_the_exported_address_reads_back_through_the_schema() {
         HANDLES.with(|handles| handles.borrow_mut().clear());
-        let blob = number_field_blob();
+        let blob = [number_field_blob(), enum_field_blob()].concat();
         let handle = unsafe { thread_span_buffer_new_with_schema(7, 8, blob.as_ptr(), blob.len()) };
         assert_ne!(handle, 0);
-        let (span_id, row) = open_named(handle, "root");
+        let (_span_id, row) = open_named(handle, "root");
+        let cells = thread_span_buffer_attribute_cells(handle, 0) as *mut u64;
+        assert!(!cells.is_null());
+        assert_eq!(
+            thread_span_buffer_attribute_cells(handle, 1),
+            0,
+            "no second block yet"
+        );
+        let stride = lmao_core::attribute_cells::stride(8);
+        let local = row as usize;
+        // What the TypedArray lane does: a Float64 store for field 0, a Uint32
+        // store for field 1, and a validity bit for each.
+        unsafe {
+            *cells.cast::<f64>().add(local) = 1.5;
+            *cells.cast::<u8>().add(8 * 8 + (local >> 3)) |= 1 << (local & 7);
+            *cells.cast::<u32>().add((stride + local) * 2) = 7;
+            *cells.cast::<u8>().add((stride + 8) * 8 + (local >> 3)) |= 1 << (local & 7);
+        }
         let ordinal = u16::try_from(SYSTEM_COLUMN_COUNT).expect("system prefix fits u16");
-        let bits = 1.5f64.to_bits();
+        let (mut kind, mut value) = (0u8, 0u64);
         assert_eq!(
-            thread_span_buffer_write_attr(handle, row, ordinal, 0, bits),
-            STATUS_ERROR
-        );
-        assert_eq!(
-            thread_span_buffer_write_attr(handle, row, ordinal, ATTRIBUTE_KIND_NUMBER, bits),
+            unsafe { thread_span_buffer_read_attr(handle, row, ordinal, &mut kind, &mut value) },
             STATUS_OK
         );
+        assert_eq!((kind, f64::from_bits(value)), (ATTRIBUTE_KIND_NUMBER, 1.5));
+        // Variant 7 of a two-variant enum is a foreign writer's garbage: it
+        // reads as absent rather than as a value.
         assert_eq!(
-            thread_span_buffer_write_attr(handle, row, ordinal - 1, ATTRIBUTE_KIND_NUMBER, bits),
+            unsafe {
+                thread_span_buffer_read_attr(handle, row, ordinal + 1, &mut kind, &mut value)
+            },
             STATUS_ERROR
-        );
-        assert_eq!(
-            thread_span_buffer_write_attr(handle, row, ordinal + 1, ATTRIBUTE_KIND_NUMBER, bits),
-            STATUS_ERROR
-        );
-        assert_eq!(
-            thread_span_buffer_write_tag(handle, span_id, ordinal, 0, bits),
-            STATUS_ERROR
-        );
-        assert_eq!(
-            thread_span_buffer_set_scope(handle, span_id, ordinal, 0, bits),
-            STATUS_OK
-        );
-        assert_eq!(
-            thread_span_buffer_set_scope(handle, span_id, ordinal, ATTRIBUTE_KIND_NUMBER, bits),
-            STATUS_OK
         );
         thread_span_buffer_free(handle);
-    }
 
-    #[test]
-    fn enum_schema_blob_accepts_in_range_and_rejects_kind_zero() {
-        HANDLES.with(|handles| handles.borrow_mut().clear());
-        let blob = enum_field_blob();
-        let handle = unsafe { thread_span_buffer_new_with_schema(7, 8, blob.as_ptr(), blob.len()) };
-        assert_ne!(handle, 0);
-        let (span_id, row) = open_named(handle, "root");
-        let ordinal = u16::try_from(SYSTEM_COLUMN_COUNT).expect("system prefix fits u16");
-        assert_eq!(
-            thread_span_buffer_write_attr(handle, row, ordinal, 0, 0),
-            STATUS_ERROR
-        );
-        assert_eq!(
-            thread_span_buffer_write_attr(handle, row, ordinal, ATTRIBUTE_KIND_ENUM, 1),
-            STATUS_OK
-        );
-        assert_eq!(
-            thread_span_buffer_write_tag(handle, span_id, ordinal, ATTRIBUTE_KIND_ENUM, 2),
-            STATUS_ERROR
-        );
-        thread_span_buffer_free(handle);
+        let schemaless = thread_span_buffer_new(7, 8);
+        assert_eq!(thread_span_buffer_attribute_cells(schemaless, 0), 0);
+        thread_span_buffer_free(schemaless);
     }
 
     #[test]

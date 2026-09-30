@@ -340,6 +340,8 @@ pub struct ThreadSpanBuffer {
     next_span_id: u32,
     spans: HashMap<u32, SpanRecord>,
     scopes: HashMap<u32, Option<SpanScope>>,
+    /// `retain_open`'s working list, kept so a flush allocates nothing.
+    open_scratch: Vec<(u32, u32)>,
     /// Every dynamic string this thread has written, stored once, contiguous.
     /// Replaces a `Vec<Arc<str>>` plus a `HashMap<Arc<str>, u32>` — two
     /// structures that between them allocated an `Arc` per distinct value and
@@ -363,6 +365,7 @@ impl ThreadSpanBuffer {
             next_span_id: 1,
             spans: HashMap::with_capacity(capacity / 2),
             scopes: HashMap::with_capacity(capacity / 2),
+            open_scratch: Vec::new(),
             arena: StringArena::new(MAX_STRING_ARENA_BYTES),
         };
         buffer
@@ -842,6 +845,43 @@ impl ThreadSpanBuffer {
         self.record(span_id)?;
         Ok(self.scopes.get(&span_id).and_then(Option::as_ref))
     }
+    /// [`Self::set_scope`] from the scalar ABI form every binding speaks: an
+    /// attribute kind and its encoded value, or kind `0` to clear the field
+    /// (01i `setScope({ field: null })`). Text arrives as an intern ordinal and
+    /// is copied out once, because a scope is shared by refcount between spans
+    /// and cannot carry this store's arena handle.
+    pub fn set_scope_encoded(
+        &mut self,
+        span_id: u32,
+        ordinal: u16,
+        kind: u8,
+        value: u64,
+    ) -> Result<(), ThreadBufferError> {
+        let field = usize::from(ordinal)
+            .checked_sub(SYSTEM_COLUMN_COUNT)
+            .and_then(|index| self.fields.get(index))
+            .ok_or(ThreadBufferError::InvalidColumnOrdinal(ordinal))?;
+        let name = field.name;
+        if kind == 0 {
+            return self.set_scope(span_id, &[(name, None)]);
+        }
+        let value = self
+            .decode_abi_value(kind, value)
+            .ok_or(ThreadBufferError::InvalidColumnOrdinal(ordinal))?;
+        let value = match value {
+            ColumnValue::Number(value) => ScopeValue::Number(value),
+            ColumnValue::Uint64(value) => ScopeValue::Uint64(value),
+            ColumnValue::Boolean(value) => ScopeValue::Boolean(value),
+            ColumnValue::Enum(value) => ScopeValue::EnumIndex(value),
+            ColumnValue::Text(id) => ScopeValue::Text(
+                self.interned(id)
+                    .ok_or(ThreadBufferError::InvalidColumnOrdinal(ordinal))?
+                    .to_owned()
+                    .into(),
+            ),
+        };
+        self.set_scope(span_id, &[(name, Some(value))])
+    }
     /// Materialize scope values for one row window. This is intentionally a flush-time operation and uses validity-aware range fills; direct row writes remain authoritative.
     pub fn materialize_scope_window(
         &mut self,
@@ -935,14 +975,17 @@ impl ThreadSpanBuffer {
     /// the front, in open order; everything else — completed spans, log rows,
     /// their scopes — is released. Blocks keep their allocations.
     ///
-    /// Two rows move per open span. Nothing else is copied.
+    /// Two rows move per open span. Nothing else is copied, and nothing is
+    /// allocated once the working list has grown to the open-span count.
     pub fn retain_open(&mut self) {
-        let mut open: Vec<(u32, u32)> = self
-            .spans
-            .iter()
-            .filter(|(_, record)| !record.ended)
-            .map(|(&id, record)| (record.start_row, id))
-            .collect();
+        let mut open = std::mem::take(&mut self.open_scratch);
+        open.clear();
+        open.extend(
+            self.spans
+                .iter()
+                .filter(|(_, record)| !record.ended)
+                .map(|(&id, record)| (record.start_row, id)),
+        );
         open.sort_unstable();
         self.spans.retain(|_, record| !record.ended);
         let spans = &self.spans;
@@ -988,6 +1031,7 @@ impl ThreadSpanBuffer {
         }
         self.active_blocks = kept_blocks;
         self.row_count = next;
+        self.open_scratch = open;
     }
     /// Blocks currently holding rows. Row `r` lives in block `r / capacity`.
     #[inline]

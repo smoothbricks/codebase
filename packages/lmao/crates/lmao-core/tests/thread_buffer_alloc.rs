@@ -89,3 +89,42 @@ fn open_end_log_tag_are_alloc_free_after_warmup() {
         "post-warmup allocations (open, tag, log, end) must all be zero"
     );
 }
+
+/// A long-lived store flushes, keeps its open spans, and writes the next window
+/// into the blocks it already owns: after one warm flush cycle a whole
+/// write–flush–retain cycle, overflow block included, allocates nothing.
+#[test]
+fn a_flush_cycle_after_warmup_writes_into_recycled_blocks() {
+    let mut buffer = ThreadSpanBuffer::new(7, 8, FIELDS);
+    let id = trace();
+    let pending = buffer
+        .open_span(id.clone(), 0, 0, TextInput::Static("pending"), 1, 0)
+        .unwrap();
+    let mut rows = Vec::with_capacity(64);
+    let mut cycle = |buffer: &mut ThreadSpanBuffer| {
+        let span = buffer
+            .open_span(id.clone(), 7, pending, TextInput::Static("child"), 2, 0)
+            .unwrap();
+        for _ in 0..12 {
+            buffer
+                .append_log(span, EntryType::Info, Some(TextInput::Static("row")), 1, 3)
+                .unwrap();
+            buffer
+                .write_tag(span, 12, ColumnValue::Number(1.0))
+                .unwrap();
+        }
+        buffer.end_ok(span, 4).unwrap();
+        buffer.flush_rows(&mut rows).unwrap();
+        buffer.retain_open();
+    };
+    cycle(&mut buffer);
+    cycle(&mut buffer);
+    let before = allocations();
+    cycle(&mut buffer);
+    assert_eq!(
+        allocations() - before,
+        0,
+        "a warm flush cycle must not allocate"
+    );
+    assert_eq!(buffer.start_row(pending), Some(0));
+}
