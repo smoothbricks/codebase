@@ -54,3 +54,17 @@ tokio = { version = "1", features = [
 [profile.release]
 lto = true
 codegen-units = 1
+
+# The shipped columine wasm, and nothing else, builds with this profile: it
+# compiles only wasm32 units, so it duplicates no dev or release unit. Size
+# wins everywhere except the VM and parser hot paths.
+[profile.wasm-release]
+inherits = "release"
+opt-level = "z"
+panic = "abort"
+
+[profile.wasm-release.package.columine-vm]
+opt-level = 3
+
+[profile.wasm-release.package.columine-parsing]
+opt-level = 3

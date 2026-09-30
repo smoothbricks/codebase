@@ -17,9 +17,9 @@ check:
     cargo check -p 'columine-*' --all-targets
     cargo clippy -p 'columine-*' --all-targets -- -D warnings
 
-# `profile` is a cargo profile: `dev` for every local build and test, `release`
-# for the artifact that ships (the nx `cargo-wasm` production configuration).
-# Cargo writes the dev profile under `debug/`.
+# `profile` is a cargo profile: `dev` for every local build and test,
+# `wasm-release` for the artifact that ships (the nx `cargo-wasm` production
+# configuration). Cargo writes the dev profile under `debug/`.
 
 # columine.wasm — the standalone VM artifact (Parse/Reduce/Compact/Undo, no
 # RETE). Nightly immediate-abort strips the fmt/panic machinery stable

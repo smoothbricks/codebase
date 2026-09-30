@@ -74,7 +74,9 @@ validation and `nx build` share one `target/` and one set of units, so cargo rec
 and platform-leg steps, the `smoo release` commands it runs, and the build and deploy runs of a production
 `smoo github-ci nx-deploy`. Test targets have no `production` configuration, so a release build never compiles release
 test binaries. A package-local target that builds a shipped artifact follows the same rule: its default options compile
-`dev` and its `production` configuration compiles `release`. A workspace has exactly these two cargo profiles.
+`dev` and its `production` configuration compiles a shipping profile. A shipping profile other than `release` is only
+for an artifact family no other build compiles, such as a size-optimised wasm32 lane; a profile that compiles the same
+crates for the same target as `dev` or `release` compiles every dependency a second time.
 
 ### Cargo cache boundaries
 

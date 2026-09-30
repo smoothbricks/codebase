@@ -91,7 +91,7 @@
         },
         "configurations": {
           "production": {
-            "command": "just wasm release && just wasm-ep release"
+            "command": "just wasm wasm-release && just wasm-ep wasm-release"
           }
         }
       }
