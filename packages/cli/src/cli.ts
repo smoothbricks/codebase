@@ -4,6 +4,7 @@ import { variants } from './generate/index.js';
 import { dispatchCiWorkflow, ensureCiPullRequest } from './github-ci/api.js';
 import { cliPackageVersion } from './lib/cli-package.js';
 import { decode, findRepoRoot, printCommandOutput } from './lib/run.js';
+import { checkPublicDenylist } from './monorepo/public-denylist.js';
 import { ensureChromium, runWithChromium } from './playwright/index.js';
 import { resolvePrConflicts } from './pr/index.js';
 import { secretsSet, secretsStatus, secretsSync } from './secrets/commands.js';
@@ -147,6 +148,14 @@ function buildProgram(): Command {
     .action(async (commitMsgFile: string, options: { fix?: boolean }) => {
       const { validateCommitMessageFile } = await import('./monorepo/index.js');
       validateCommitMessageFile(commitMsgFile, options, await findRepoRoot());
+    });
+  monorepo
+    .command('check-public-denylist [revisions...]')
+    .description(
+      'refuse revisions (default HEAD) whose tree matches the local smoothbricks.publicDenylist git config or SMOOTHBRICKS_PUBLIC_DENYLIST; silent when neither is set',
+    )
+    .action(async (revisions: string[]) => {
+      await checkPublicDenylist(await findRepoRoot(), revisions.length > 0 ? revisions : ['HEAD']);
     });
   monorepo
     .command('sync-bun-lockfile-versions')

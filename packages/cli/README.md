@@ -34,6 +34,7 @@ smoo monorepo update
 smoo monorepo check
 smoo monorepo diff
 smoo monorepo validate-commit-msg <commit-msg-file>
+smoo monorepo check-public-denylist [revisions...]
 smoo monorepo sync-bun-lockfile-versions
 smoo monorepo list-release-packages [--fail-empty] [--github-output <path>]
 smoo monorepo validate-public-tags
