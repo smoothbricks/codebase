@@ -120,18 +120,33 @@ impl CowshedError {
     /// here, which is what makes the errno authoritative enough for exit 6. The store is intact
     /// then, so "repair storage" would send the caller after a defect that does not exist: the
     /// move is to run the verb where the store is writable.
+    ///
+    /// A disk child that hung or failed (`mount_apfs`, `hdiutil`, `diskutil`), or a call that
+    /// answered `ENFILE`, while the kernel vnode table is saturated is not a storage fault either:
+    /// the report names the table and the limit to raise instead of "repair storage".
     pub fn storage_failure(
         message: impl Into<String>,
         source: &(dyn std::error::Error + 'static),
         hint: impl Into<String>,
     ) -> Self {
+        Self::storage_failure_under(message, source, hint, crate::vnodes::VnodeTable::saturation)
+    }
+
+    /// [`Self::storage_failure`] with the vnode table read by `saturation`, which runs only when
+    /// the chain holds a disk-child or `ENFILE` failure.
+    fn storage_failure_under(
+        message: impl Into<String>,
+        source: &(dyn std::error::Error + 'static),
+        hint: impl Into<String>,
+        saturation: impl FnOnce() -> Option<crate::vnodes::VnodeTable>,
+    ) -> Self {
+        let mut starved = false;
         let mut cause = Some(source);
         while let Some(error) = cause {
-            if error
+            let errno = error
                 .downcast_ref::<std::io::Error>()
-                .and_then(std::io::Error::raw_os_error)
-                == Some(libc::EPERM)
-            {
+                .and_then(std::io::Error::raw_os_error);
+            if errno == Some(libc::EPERM) {
                 return Self::sandbox_denied(
                     format!(
                         "{}: the process running cowshed is sandboxed away from cowshed's store",
@@ -140,7 +155,26 @@ impl CowshedError {
                     "rerun the command from a shell whose sandbox allows writing the cowshed store",
                 );
             }
+            starved |= errno == Some(libc::ENFILE)
+                || error.is::<crate::apfs::CommandRunError>()
+                || matches!(
+                    error.downcast_ref::<crate::apfs::ApfsError>(),
+                    Some(crate::apfs::ApfsError::CommandFailed { .. })
+                );
             cause = error.source();
+        }
+        if starved && let Some(table) = saturation() {
+            // The saturation is the likely cause, not a proven one: the child's own failure stays
+            // in the message, and the storage repair stays the next step if raising the limit
+            // does not clear it.
+            return Self::environment_missing(
+                format!("{}; {table}", message.into()),
+                format!(
+                    "{}; if it recurs after that: {}",
+                    table.remedy(),
+                    hint.into()
+                ),
+            );
         }
         Self::environment_missing(message, hint)
     }
@@ -275,6 +309,57 @@ mod tests {
             assert_eq!(error.message, "cannot persist journal");
             assert_eq!(error.hint, "repair storage");
         }
+    }
+
+    #[test]
+    fn a_disk_child_starved_by_a_saturated_vnode_table_names_the_limit() {
+        use crate::apfs::{ApfsError, CommandRequest, CommandRunError, CommandRunFailure};
+        use crate::vnodes::VnodeTable;
+        let saturated = || {
+            Some(VnodeTable {
+                in_use: 272_631,
+                limit: 263_168,
+            })
+        };
+        let hung = || {
+            ApfsError::from(CommandRunError {
+                request: CommandRequest::new("/sbin/mount_apfs", ["-o", "nobrowse,owners"]),
+                failure: CommandRunFailure::Deadline(std::time::Duration::from_secs(120)),
+            })
+        };
+
+        let error =
+            CowshedError::storage_failure_under("creating workspace", &hung(), "repair", saturated);
+        assert_eq!(error.code, ErrorCode::EnvironmentMissing);
+        assert!(
+            error.message.starts_with("creating workspace; "),
+            "{error:?}"
+        );
+        assert!(
+            error.message.contains("kern.num_vnodes 272631"),
+            "{error:?}"
+        );
+        assert!(error.hint.contains("kern.maxvnodes=545262"), "{error:?}");
+
+        // ENFILE is how a full table answers a call directly.
+        let enfile = std::io::Error::from_raw_os_error(libc::ENFILE);
+        let error = CowshedError::storage_failure_under("mount", &enfile, "repair", saturated);
+        assert!(error.hint.contains("kern.maxvnodes"), "{error:?}");
+
+        // The same hang on a host with room left is not blamed on the table.
+        let error =
+            CowshedError::storage_failure_under("creating workspace", &hung(), "repair", || None);
+        assert_eq!(
+            (error.message.as_str(), error.hint.as_str()),
+            ("creating workspace", "repair")
+        );
+
+        // A saturated table does not claim failures no disk child or ENFILE produced.
+        let full = std::io::Error::from_raw_os_error(libc::ENOSPC);
+        let error = CowshedError::storage_failure_under("persist", &full, "repair", || {
+            panic!("the table is read only for disk-child and ENFILE failures")
+        });
+        assert_eq!(error.hint, "repair");
     }
 
     #[test]

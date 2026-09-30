@@ -3423,6 +3423,34 @@ fn host_cache_findings(home: &Path) -> Vec<Finding> {
         .collect()
 }
 
+/// A saturated kernel vnode table, which stalls every mount, attach and workspace command on
+/// the host until a vnode can be recycled — the cause behind a disk child that hangs past its
+/// deadline on an image that is fine.
+fn vnode_table_finding(
+    table: std::io::Result<cowshed_core::vnodes::VnodeTable>,
+) -> Option<Finding> {
+    match table {
+        Ok(table) if table.saturated() => Some(Finding {
+            code: "vnode-table-saturated".into(),
+            severity: FindingSeverity::Warning,
+            message: format!(
+                "{table}; mounts, attaches and workspace commands stall behind vnode recycling"
+            ),
+            hint: table.remedy(),
+            path: None,
+        }),
+        Ok(_) => None,
+        Err(error) if error.kind() == std::io::ErrorKind::Unsupported => None,
+        Err(error) => Some(Finding {
+            code: "vnode-table".into(),
+            severity: FindingSeverity::Warning,
+            message: format!("could not read kern.num_vnodes and kern.maxvnodes: {error}"),
+            hint: "sysctl kern.num_vnodes kern.maxvnodes".into(),
+            path: None,
+        }),
+    }
+}
+
 struct HostDiagnosis {
     storage_ready: bool,
     findings: Vec<Finding>,
@@ -3463,6 +3491,9 @@ async fn diagnose_host() -> Result<HostDiagnosis> {
             path: None,
         }),
     }
+    diagnosis
+        .findings
+        .extend(vnode_table_finding(cowshed_core::vnodes::VnodeTable::read()));
     match crate::sccache_service::service_status().await {
         Ok(status) => diagnosis.findings.push(sccache_finding(&status)),
         Err(error) => diagnosis.findings.push(Finding {
@@ -3871,6 +3902,27 @@ mod tests {
             state_before,
             action: "planned".to_owned(),
         }
+    }
+
+    #[test]
+    fn doctor_names_a_saturated_vnode_table_and_the_limit_to_raise() {
+        use cowshed_core::vnodes::VnodeTable;
+        let finding = vnode_table_finding(Ok(VnodeTable {
+            in_use: 272_631,
+            limit: 263_168,
+        }))
+        .expect("a saturated table is a finding");
+        assert_eq!(finding.code, "vnode-table-saturated");
+        assert_eq!(finding.severity, FindingSeverity::Warning);
+        assert!(finding.hint.contains("kern.maxvnodes="), "{finding:?}");
+
+        let room = VnodeTable {
+            in_use: 263_167,
+            limit: 263_168,
+        };
+        assert!(vnode_table_finding(Ok(room)).is_none());
+        let linux = std::io::Error::new(std::io::ErrorKind::Unsupported, "no vnode table");
+        assert!(vnode_table_finding(Err(linux)).is_none());
     }
 
     /// Compile-visible seam over core's `StdinSource`: every variant must name the CLI flag that

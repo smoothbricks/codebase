@@ -5,7 +5,7 @@
 
 use crate::metadata::{ImageCapacity, ImageFormat};
 pub use crate::process::{CommandOutput, ProcessStatus};
-use crate::process::{fmt_command_failure, fmt_command_spawn};
+use crate::process::{fmt_command, fmt_command_failure, fmt_command_spawn};
 use std::collections::BTreeSet;
 use std::ffi::{OsStr, OsString};
 use std::fmt;
@@ -74,26 +74,53 @@ pub enum MountAccess {
     ReadOnly,
 }
 
+/// Why a disk child produced no output to judge.
+#[derive(Debug)]
+pub enum CommandRunFailure {
+    /// The executable could not be started.
+    Spawn(io::Error),
+    /// The child started, but its exit could not be observed.
+    Wait(io::Error),
+    /// The child was still running at this deadline and was killed. It *ran*: a hung child is
+    /// never reported as one that could not be started.
+    Deadline(Duration),
+}
+
 #[derive(Debug)]
 pub struct CommandRunError {
     pub request: CommandRequest,
-    pub source: io::Error,
+    pub failure: CommandRunFailure,
 }
 
 impl fmt::Display for CommandRunError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt_command_spawn(
-            f,
-            self.request.program.as_os_str(),
-            &self.request.args,
-            &self.source,
-        )
+        let program = self.request.program.as_os_str();
+        let args = &self.request.args;
+        match &self.failure {
+            CommandRunFailure::Spawn(source) => fmt_command_spawn(f, program, args, source),
+            CommandRunFailure::Wait(source) => {
+                f.write_str("could not wait for ")?;
+                fmt_command(f, program, args)?;
+                write!(f, ": {source}")
+            }
+            CommandRunFailure::Deadline(deadline) => {
+                fmt_command(f, program, args)?;
+                write!(
+                    f,
+                    " did not finish within {deadline:?}; the child was killed and its item \
+                     deferred for the next pass"
+                )
+            }
+        }
     }
 }
 
 impl std::error::Error for CommandRunError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(&self.source)
+        match &self.failure {
+            CommandRunFailure::Spawn(source) | CommandRunFailure::Wait(source) => Some(source),
+            CommandRunFailure::Deadline(_) => None,
+        }
     }
 }
 
@@ -130,7 +157,7 @@ impl SystemCommandRunner {
         use std::io::Read;
         let mut child = spawn_disk_child(request).map_err(|source| CommandRunError {
             request: request.clone(),
-            source,
+            failure: CommandRunFailure::Spawn(source),
         })?;
         // Drain both pipes on dedicated threads while the deadline poll runs, exactly as
         // `Command::output` drains while it waits: a verbose child (fsck) must never wedge
@@ -160,7 +187,7 @@ impl SystemCommandRunner {
         loop {
             match child.try_wait().map_err(|source| CommandRunError {
                 request: request.clone(),
-                source,
+                failure: CommandRunFailure::Wait(source),
             })? {
                 Some(status) => {
                     let output = std::process::Output {
@@ -181,13 +208,7 @@ impl SystemCommandRunner {
                         }
                         return Err(CommandRunError {
                             request: request.clone(),
-                            source: io::Error::new(
-                                io::ErrorKind::TimedOut,
-                                format!(
-                                    "disk child produced no result within {deadline:?}; \
-                                     child killed, item deferred for the next pass"
-                                ),
-                            ),
+                            failure: CommandRunFailure::Deadline(deadline),
                         });
                     }
                     std::thread::sleep(Duration::from_millis(25));
@@ -670,7 +691,7 @@ pub enum ApfsError {
         operation: &'static str,
         format: ImageFormat,
     },
-    CommandSpawn(CommandRunError),
+    CommandRun(CommandRunError),
     CommandFailed {
         operation: &'static str,
         request: CommandRequest,
@@ -747,7 +768,7 @@ impl fmt::Display for ApfsError {
             Self::UnsupportedOperation { operation, format } => {
                 write!(f, "{operation} is not supported for {format:?} images")
             }
-            Self::CommandSpawn(error) => error.fmt(f),
+            Self::CommandRun(error) => error.fmt(f),
             Self::CommandFailed {
                 operation,
                 request,
@@ -844,7 +865,7 @@ impl fmt::Display for ApfsError {
 impl std::error::Error for ApfsError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::CommandSpawn(error) => Some(error),
+            Self::CommandRun(error) => Some(error),
             Self::FileOperation { source, .. } => Some(source),
             Self::Clone(error) => Some(error),
             Self::VerificationAndDetachFailed { detach, .. } => Some(detach),
@@ -858,7 +879,7 @@ impl std::error::Error for ApfsError {
 
 impl From<CommandRunError> for ApfsError {
     fn from(value: CommandRunError) -> Self {
-        Self::CommandSpawn(value)
+        Self::CommandRun(value)
     }
 }
 
@@ -3204,8 +3225,15 @@ mod tests {
             "hung child held the store for {:?}; the deadline never fired",
             started.elapsed()
         );
-        assert_eq!(error.source.kind(), io::ErrorKind::TimedOut);
-        assert!(error.to_string().contains("deferred"));
+        assert!(
+            matches!(error.failure, CommandRunFailure::Deadline(deadline) if deadline == Duration::from_millis(250)),
+            "{error:?}"
+        );
+        // The child ran; the report must say it hung, never that it could not be started.
+        let report = error.to_string();
+        assert!(!report.contains("could not run"), "{report}");
+        assert!(report.contains("did not finish within 250ms"), "{report}");
+        assert!(report.contains("deferred"), "{report}");
         // The queue continues: a fast child right after the kill still runs.
         let output = SystemCommandRunner
             .run(&CommandRequest::new("/bin/sh", ["-c", "printf 'next\\n'"]))
@@ -3335,9 +3363,9 @@ mod tests {
             "clone denied"
         );
 
-        let spawn = ApfsError::CommandSpawn(CommandRunError {
+        let spawn = ApfsError::CommandRun(CommandRunError {
             request: CommandRequest::new("/missing", ["--flag"]),
-            source: io::Error::new(io::ErrorKind::NotFound, "missing"),
+            failure: CommandRunFailure::Spawn(io::Error::new(io::ErrorKind::NotFound, "missing")),
         });
         assert!(spawn.to_string().contains("/missing"));
         assert!(std::error::Error::source(&spawn).is_some());

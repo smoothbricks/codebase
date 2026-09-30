@@ -339,6 +339,15 @@ step, so the slow step is named on stderr. On a large repository two steps carry
 - **`new links`**, the walk over the whole tree for symlinks that point outside it, which costs about 5 s over a million
   entries.
 
+## A disk child `did not finish within 120s`
+
+Every `hdiutil`, `diskutil` and `mount_apfs` child cowshed starts is killed at a two-minute deadline, and the refusal
+says the child ran and hung — distinct from `could not run executable`, which means it never started. One host cause
+cowshed can see is a saturated kernel vnode table: past `kern.maxvnodes` every lookup, open and mount first recycles a
+vnode another process holds, and a mount that takes a second can outlast the deadline. When that is the state of the
+host the refusal names it (`kern.num_vnodes … of kern.maxvnodes …`) and its hint is the limit to set; `cowshed doctor`
+reports it as `vnode-table-saturated`. Raising the limit is the operator's call: `sudo sysctl kern.maxvnodes=<n>`.
+
 ## "cowshed volumes owned by another user"
 
 The cowshed volumes belong to exactly one uid. If `doctor` reports a foreign-uid volume, you are running cowshed as the

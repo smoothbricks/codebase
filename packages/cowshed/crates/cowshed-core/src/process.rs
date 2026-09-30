@@ -106,11 +106,11 @@ pub(crate) fn fmt_command_failure<A: AsRef<OsStr>>(
     args: &[A],
     output: &CommandOutput,
 ) -> fmt::Result {
-    write!(f, "{operation} failed: executable {program:?}, argv [")?;
-    fmt_argv(f, args)?;
+    write!(f, "{operation} failed: ")?;
+    fmt_command(f, program, args)?;
     write!(
         f,
-        "], {}; stdout: {}; stderr: {}",
+        ", {}; stdout: {}; stderr: {}",
         output.status,
         DiagnosticBytes(&output.stdout),
         DiagnosticBytes(&output.stderr)
@@ -123,9 +123,20 @@ pub(crate) fn fmt_command_spawn<A: AsRef<OsStr>>(
     args: &[A],
     source: &std::io::Error,
 ) -> fmt::Result {
-    write!(f, "could not run executable {program:?}, argv [")?;
+    f.write_str("could not run ")?;
+    fmt_command(f, program, args)?;
+    write!(f, ": {source}")
+}
+
+/// `executable "<program>", argv [<args>]`: the command as every diagnostic names it.
+pub(crate) fn fmt_command<A: AsRef<OsStr>>(
+    f: &mut fmt::Formatter<'_>,
+    program: &OsStr,
+    args: &[A],
+) -> fmt::Result {
+    write!(f, "executable {program:?}, argv [")?;
     fmt_argv(f, args)?;
-    write!(f, "]: {source}")
+    f.write_str("]")
 }
 
 fn fmt_argv<A: AsRef<OsStr>>(f: &mut fmt::Formatter<'_>, args: &[A]) -> fmt::Result {
