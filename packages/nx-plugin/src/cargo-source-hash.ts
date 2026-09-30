@@ -3,7 +3,6 @@ import { createHash } from 'node:crypto';
 import { realpathSync, statSync } from 'node:fs';
 import { lstat, readdir, readFile, readlink, realpath } from 'node:fs/promises';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
-import { promisify } from 'node:util';
 
 /** The fields of `cargo metadata --format-version 1` this module reads. */
 interface CargoMetadata {
@@ -93,7 +92,23 @@ export interface CargoPathInputsOptions {
   closure?: string;
 }
 
-const execFileAsync = promisify(execFile);
+/**
+ * Cargo's stdout, or its failure with Cargo's stderr in the message. Not
+ * `promisify` from `node:util`: importing that module makes Node probe color
+ * support at startup, and with FORCE_COLOR and NO_COLOR both set (an Nx
+ * inside an Nx task, in a shell that exports NO_COLOR) it warns on stderr
+ * under its own pid, which a runtime input would hash as a new digest on
+ * every run.
+ */
+function runCargo(args: readonly string[], cwd: string): Promise<string> {
+  // The executor form: the workspace compiles against es2022, which has no `Promise.withResolvers`.
+  return new Promise((settle, reject) => {
+    execFile('cargo', args, { cwd, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 }, (error, stdout) =>
+      error === null ? settle(stdout) : reject(error),
+    );
+  });
+}
+
 /** Directories the hash never descends into: build output, VCS and volume metadata, installed packages. */
 export const HASH_SKIPPED_DIRECTORIES = [
   'target',
@@ -139,10 +154,9 @@ const CHILD_STDIO: ['ignore', 'pipe', 'pipe'] = ['ignore', 'pipe', 'pipe'];
 
 /** Locked, offline `cargo metadata` for the workspace `manifestPath` names, run from `cwd`. */
 export async function readCargoResolve(manifestPath: string, cwd: string): Promise<CargoResolve> {
-  const { stdout } = await execFileAsync(
-    'cargo',
+  const stdout = await runCargo(
     ['metadata', '--format-version', '1', '--locked', '--offline', '--manifest-path', resolve(manifestPath)],
-    { cwd, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 },
+    cwd,
   );
   const metadata = parseCargoMetadata(stdout);
   const local = await Promise.all(
@@ -173,10 +187,9 @@ export async function readCargoResolve(manifestPath: string, cwd: string): Promi
  */
 export async function governingManifest(cargo: CargoResolve, pkg: LocalCargoPackage, cwd: string): Promise<string> {
   if (cargo.members.has(pkg.id)) return realpath(join(cargo.root, 'Cargo.toml'));
-  const { stdout } = await execFileAsync(
-    'cargo',
+  const stdout = await runCargo(
     ['locate-project', '--workspace', '--manifest-path', pkg.manifest, '--message-format', 'plain'],
-    { cwd, encoding: 'utf8' },
+    cwd,
   );
   return realpath(stdout.trim());
 }

@@ -80,8 +80,13 @@ await appendFile(${JSON.stringify(executions)}, result);
   async function compile(): Promise<void> {
     const child = Bun.spawn(['bun', join(repositoryRoot, 'node_modules/.bin/nx'), 'run', 'app:compile'], {
       cwd: workspace,
+      // The runtime inputs this Nx runs inherit its environment as is. Inside
+      // an outer Nx task FORCE_COLOR is set, and a shell may export NO_COLOR:
+      // both at once must not reach a runtime input's output.
       env: {
         ...process.env,
+        FORCE_COLOR: 'true',
+        NO_COLOR: '1',
         NX_WORKSPACE_ROOT_PATH: workspace,
         NX_DAEMON: 'false',
         NX_ISOLATE_PLUGINS: 'false',
