@@ -130,7 +130,10 @@ try {
   const bunInputs = bunInstallInputs();
   const uvInputs = uvSyncInputs();
   recordInstallInputs([...bunInputs, ...uvInputs]);
-  if (process.env.CI) {
+  // A CI runner is GitHub Actions or Forgejo Actions, which mirrors every FORGEJO_*
+  // variable as GITHUB_*. Not `CI`: agent harnesses set CI=true on every command
+  // they run, and this branch installs unconditionally.
+  if (process.env.GITHUB_ACTIONS === 'true') {
     const uv = uvInstaller(uvInputs, { locked: true });
     await resolveSecrets();
     // Failures are captured and reported below. Exiting in the catch would

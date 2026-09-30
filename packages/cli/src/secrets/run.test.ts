@@ -59,11 +59,16 @@ async function withRepo(
   const ledger = join(vault, 'provider-ledger');
   const recordPath = join(root, 'child-record.json');
   // The context under test is a developer machine, the only one that runs a
-  // provider command at all. CI and a cowshed workspace are their own tests
-  // below, and the suite's own environment — bun test runs under CI=true —
-  // must not decide which of the three this is.
-  const ambient = { CI: process.env.CI, COWSHED_WORKSPACE_TOKEN: process.env.COWSHED_WORKSPACE_TOKEN };
+  // provider command at all. A CI runner and a cowshed workspace are their own
+  // tests below, and the suite's own environment — a runner sets GITHUB_ACTIONS,
+  // an agent harness sets CI — must not decide which of the three this is.
+  const ambient = {
+    CI: process.env.CI,
+    GITHUB_ACTIONS: process.env.GITHUB_ACTIONS,
+    COWSHED_WORKSPACE_TOKEN: process.env.COWSHED_WORKSPACE_TOKEN,
+  };
   delete process.env.CI;
+  delete process.env.GITHUB_ACTIONS;
   delete process.env.COWSHED_WORKSPACE_TOKEN;
   try {
     await writeFile(join(vault, 'REGISTRY_TOKEN'), 'registry-value');
@@ -287,9 +292,9 @@ describe('smoo secrets run', () => {
     );
   });
 
-  it('in CI, refuses with injected-secret guidance and runs no provider command', async () => {
+  it('on a CI runner, refuses with injected-secret guidance and runs no provider command', async () => {
     await withRepo(async ({ root, invocations }) => {
-      process.env.CI = 'true';
+      process.env.GITHUB_ACTIONS = 'true';
 
       const { code, output } = await capture(async () => secretsRun(root, 'registry', recorder(root)));
 
@@ -300,6 +305,19 @@ describe('smoo secrets run', () => {
       // not offered as one.
       expect(output).not.toContain('smoo secrets run');
       expect(invocations()).toBe(0);
+    });
+  });
+
+  it('with CI=true but no runner, is a developer machine and runs the provider', async () => {
+    await withRepo(async ({ root, invocations }) => {
+      // Agent harnesses export CI=true on every command they run. That says
+      // "unattended", not "a runner that injects its secrets".
+      process.env.CI = 'true';
+
+      const { code } = await capture(async () => secretsRun(root, 'registry', recorder(root)));
+
+      expect(code).toBe(0);
+      expect(invocations()).toBe(1);
     });
   });
 

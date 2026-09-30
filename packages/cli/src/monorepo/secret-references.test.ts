@@ -411,12 +411,21 @@ describe('resolveSecretEnvironment', () => {
     });
   });
 
-  it('missing variables in CI refuse with injected-secret guidance and run nothing', async () => {
+  it('missing variables on a CI runner refuse with injected-secret guidance and run nothing', async () => {
     await withFixture({ secrets: { SMOO_MISSING: { command: emit('NEVER-RAN-VALUE') } } }, async (root) => {
-      const outcome = await resolveInBootstrap({ root, env: { CI: 'true' } });
+      const outcome = await resolveInBootstrap({ root, env: { GITHUB_ACTIONS: 'true' } });
       expect(outcome.error).toContain('SMOO_MISSING');
       expect(outcome.error).toContain('inject');
       expect(outcome.error).not.toContain('NEVER-RAN-VALUE');
+    });
+  });
+
+  it('CI=true without a runner still runs the provider: agent harnesses set CI on every command', async () => {
+    await withFixture({ secrets: { SMOO_TOKEN: { command: emit('tok-from-provider') } } }, async (root) => {
+      expect(await resolveInBootstrap({ root, env: { CI: 'true' } })).toEqual({
+        resolved: { SMOO_TOKEN: 'tok-from-provider' },
+        deferred: [],
+      });
     });
   });
 
@@ -441,7 +450,7 @@ describe('resolveSecretEnvironment', () => {
             { name: 'NX_REMOTE_CACHE_TOKEN', group: 'nx-cache', guidance: expect.stringContaining('nx-cache') },
           ],
         });
-        const withoutCacheDeclaration = await resolveInBootstrap({ root, env: { CI: 'true' } });
+        const withoutCacheDeclaration = await resolveInBootstrap({ root, env: { GITHUB_ACTIONS: 'true' } });
         expect(withoutCacheDeclaration.error).toContain('SMOO_TOKEN');
         // CI refuses what shell entry needs, and the cache token is not that:
         // nothing shell entry runs reads `smoo.remoteCache`.
@@ -515,7 +524,7 @@ describe('resolveSecretEnvironment', () => {
     });
   });
 
-  it('a present variable is not reported while another refuses in CI', async () => {
+  it('a present variable is not reported while another refuses on a CI runner', async () => {
     await withFixture(
       {
         secrets: {
@@ -524,7 +533,7 @@ describe('resolveSecretEnvironment', () => {
         },
       },
       async (root) => {
-        const outcome = await resolveInBootstrap({ root, env: { CI: 'true', SMOO_PRESENT: 'injected' } });
+        const outcome = await resolveInBootstrap({ root, env: { GITHUB_ACTIONS: 'true', SMOO_PRESENT: 'injected' } });
         expect(outcome.error).toContain('SMOO_MISSING');
         expect(outcome.error).not.toContain('SMOO_PRESENT');
       },
@@ -674,7 +683,7 @@ describe('resolveSecretEnvironment', () => {
     });
   });
 
-  it('CI refuses a missing registry credential instead of deferring it', async () => {
+  it('a CI runner refuses a missing registry credential instead of deferring it', async () => {
     await withProviderLedger(async (ledger) => {
       await withFixture(
         { npmrc: REGISTRY_NPMRC, secrets: { SMOO_NPM_TOKEN: { command: emitAndRecord('x', ledger.path) } } },
@@ -682,7 +691,7 @@ describe('resolveSecretEnvironment', () => {
           // CI outranks the registry rule and is unchanged by it: a job that
           // needs the credential says so at setup rather than discovering it
           // at the first fetch, and there is no wrapper to run there.
-          const outcome = await resolveInBootstrap({ root, env: { CI: 'true' }, group: 'shell' });
+          const outcome = await resolveInBootstrap({ root, env: { GITHUB_ACTIONS: 'true' }, group: 'shell' });
 
           expect(outcome.error).toContain('SMOO_NPM_TOKEN');
           expect(outcome.error).toContain('inject');
@@ -766,7 +775,7 @@ describe('resolveSecretEnvironment', () => {
         },
       },
       async (root) => {
-        const outcome = await resolveInBootstrap({ root, env: { CI: 'true' } });
+        const outcome = await resolveInBootstrap({ root, env: { GITHUB_ACTIONS: 'true' } });
         expect(outcome.error).toContain('SMOO_ONE');
         expect(outcome.error).toContain('SMOO_TWO');
       },

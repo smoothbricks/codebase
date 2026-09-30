@@ -367,13 +367,15 @@ nothing when nothing changed:
 - `setup-environment.ts` runs `bun install` only when its inputs changed since the last successful install: the root and
   every workspace member `package.json`, `bun.lock`, `bunfig.toml`, the patch files `patchedDependencies` names, and the
   Bun version. The record lives in `node_modules/.smoo-install`, so deleting `node_modules` reinstalls; a failed install
-  records nothing and is retried on the next entry. CI always installs with `--frozen-lockfile`.
+  records nothing and is retried on the next entry. A CI runner always installs with `--frozen-lockfile`. A CI runner is
+  one that sets `GITHUB_ACTIONS=true` (GitHub Actions, and Forgejo Actions, which mirrors its variables as `GITHUB_*`),
+  never `CI` alone: agent harnesses export `CI=true` on every command they run.
 - A repository whose `devenv.nix` enables `languages.python.uv` gets its uv workspace synced the same way
-  (`uv sync --all-packages --all-groups`, `--locked` in CI) into devenv's `UV_PROJECT_ENVIRONMENT`, with the interpreter
-  devenv provides, and activated after the sync. Its inputs are the root `pyproject.toml`, `uv.lock` and every workspace
-  member's `pyproject.toml`. The environment is bound to its path, so one copied from another checkout (a copy-on-write
-  clone) is rebuilt from the uv cache on first entry. devenv's own `languages.python.venv` and `uv.sync` must stay off;
-  the module refuses them.
+  (`uv sync --all-packages --all-groups`, `--locked` on a CI runner) into devenv's `UV_PROJECT_ENVIRONMENT`, with the
+  interpreter devenv provides, and activated after the sync. Its inputs are the root `pyproject.toml`, `uv.lock` and
+  every workspace member's `pyproject.toml`. The environment is bound to its path, so one copied from another checkout
+  (a copy-on-write clone) is rebuilt from the uv cache on first entry. devenv's own `languages.python.venv` and
+  `uv.sync` must stay off; the module refuses them.
 - Shell entries in one checkout install one at a time: the install runs under a flock(2) on
   `node_modules/.smoo-install.lock`, so a second shell loading at the same moment waits (and says so), then finds the
   first entry's stamps current. The kernel releases the lock when its holder exits, so a killed shell entry leaves
@@ -735,8 +737,9 @@ and never on stdout. Everything after the group reaches the child verbatim, flag
 is reproduced, including death by signal as 128+signum.
 
 Both contexts that cannot run a provider command refuse by name instead of promising a command that would not work
-there: CI says to inject the variable from the secret store, and a cowshed workspace says to enroll registry credentials
-through the gateway.
+there: a CI runner (`GITHUB_ACTIONS=true`) says to inject the variable from the secret store, and a cowshed workspace
+says to enroll registry credentials through the gateway. `CI=true` alone is a developer machine: agent harnesses set it
+on every command.
 
 ## Releases
 
