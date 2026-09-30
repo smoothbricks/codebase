@@ -1101,21 +1101,26 @@ async fn a_registry_clients_authorization_header_authenticates_only_the_mirror_r
         .await
         .expect("install session");
 
-    for authorization in [
-        format!("Bearer {token}"),
-        basic_credential("cowshed", &token),
+    // Each credential form fetches its own package: the mirror caches a packument it filled, so a
+    // repeated path would be served without reaching the upstream this asserts on.
+    for (authorization, package) in [
+        (format!("Bearer {token}"), "left-pad"),
+        (basic_credential("cowshed", &token), "right-pad"),
     ] {
         let request = format!(
-            "GET /npm/left-pad HTTP/1.1\r\nHost: {endpoint}\r\nAuthorization: {authorization}\r\nConnection: close\r\n\r\n"
+            "GET /npm/{package} HTTP/1.1\r\nHost: {endpoint}\r\nAuthorization: {authorization}\r\nConnection: close\r\n\r\n"
         );
         let response = proxy_request(endpoint, request).await;
         assert!(
             response.starts_with("HTTP/1.1 200"),
             "{authorization}: {response}"
         );
-        let forwarded = captured.recv().await.expect("captured mirror request");
+        let forwarded = timeout(Duration::from_secs(10), captured.recv())
+            .await
+            .expect("the mirror fill reaches the upstream")
+            .expect("captured mirror request");
         assert!(
-            forwarded.starts_with("GET /left-pad HTTP/1.1"),
+            forwarded.starts_with(&format!("GET /{package} HTTP/1.1")),
             "{forwarded}"
         );
         assert!(

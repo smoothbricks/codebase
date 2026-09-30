@@ -320,6 +320,7 @@ impl Cache {
         let mut writer = file;
         writer.seek(SeekFrom::Start(HEADER_REGION)).await?;
         Ok(CacheFillBody {
+            declared: source.size_hint().exact(),
             source,
             writer: Some(writer),
             pending: None,
@@ -531,8 +532,15 @@ impl Body for CacheReadBody {
     }
 }
 
+/// A fill streams the upstream body to the client while writing it to a temporary object, then
+/// verifies and publishes it. Publication starts as soon as the body is complete — its declared
+/// length written, or the upstream finished — and runs as its own task: an HTTP client reads a
+/// response to its `Content-Length` and closes without polling for the end, and a publication
+/// that waited for that poll would be dropped with the body, so every fetch would refill.
 pub struct CacheFillBody<B> {
     source: B,
+    /// The upstream body's exact length, when it declares one (`Content-Length`).
+    declared: Option<u64>,
     writer: Option<File>,
     pending: Option<Bytes>,
     pending_offset: usize,
@@ -548,8 +556,33 @@ pub struct CacheFillBody<B> {
 
 enum FillState {
     Streaming,
-    Finalizing(Pin<Box<dyn Future<Output = Result<(), CacheError>> + Send + Sync>>),
+    /// Publication, spawned so it completes whether or not the client is still reading; a client
+    /// that is gets its verdict as the end of the body.
+    Finalizing(tokio::task::JoinHandle<Result<(), CacheError>>),
     Done,
+}
+
+impl<B> CacheFillBody<B> {
+    fn begin_finalizing(&mut self) {
+        let writer = self.writer.take().expect("writer exists while streaming");
+        let permit = self.permit.take().expect("permit exists while streaming");
+        let mut response = self
+            .response
+            .take()
+            .expect("response exists while streaming");
+        let temp_path = self.temp_path.take().expect("temporary path exists");
+        response.content_length = self.bytes;
+        response.content_sha256 = self.digest.clone().finalize().into();
+        let content_sha512 = self
+            .expected_sha512
+            .take()
+            .map(|digest| <[u8; 64]>::from(digest.finalize()));
+        let cleanup = TempCleanup(temp_path.clone());
+        self.state = FillState::Finalizing(tokio::spawn(async move {
+            let _cleanup = cleanup;
+            finalize_fill(writer, temp_path, response, content_sha512, permit).await
+        }));
+    }
 }
 
 impl<B> Unpin for CacheFillBody<B> where B: Unpin {}
@@ -568,11 +601,15 @@ where
         loop {
             match &mut self.state {
                 FillState::Done => return Poll::Ready(None),
-                FillState::Finalizing(future) => match future.as_mut().poll(cx) {
+                FillState::Finalizing(publication) => match Pin::new(publication).poll(cx) {
                     Poll::Pending => return Poll::Pending,
-                    Poll::Ready(Ok(())) => {
+                    Poll::Ready(Ok(Ok(()))) => {
                         self.state = FillState::Done;
                         return Poll::Ready(None);
+                    }
+                    Poll::Ready(Ok(Err(error))) => {
+                        self.state = FillState::Done;
+                        return Poll::Ready(Some(Err(Box::new(error))));
                     }
                     Poll::Ready(Err(error)) => {
                         self.state = FillState::Done;
@@ -621,6 +658,9 @@ where
                             digest.update(&pending);
                         }
                         self.bytes = self.bytes.saturating_add(pending.len() as u64);
+                        if self.declared == Some(self.bytes) {
+                            self.begin_finalizing();
+                        }
                         return Poll::Ready(Some(Ok(Frame::data(pending))));
                     }
                 }
@@ -639,27 +679,7 @@ where
                     }
                     Err(frame) => return Poll::Ready(Some(Ok(frame))),
                 },
-                Poll::Ready(None) => {
-                    let writer = self.writer.take().expect("writer exists while streaming");
-                    let permit = self.permit.take().expect("permit exists while streaming");
-                    let mut response = self
-                        .response
-                        .take()
-                        .expect("response exists while streaming");
-                    let temp_path = self.temp_path.take().expect("temporary path exists");
-                    response.content_length = self.bytes;
-                    response.content_sha256 = self.digest.clone().finalize().into();
-                    let content_sha512 = self
-                        .expected_sha512
-                        .take()
-                        .map(|digest| <[u8; 64]>::from(digest.finalize()));
-                    let cleanup = TempCleanup(temp_path.clone());
-                    let future = Box::pin(async move {
-                        let _cleanup = cleanup;
-                        finalize_fill(writer, temp_path, response, content_sha512, permit).await
-                    });
-                    self.state = FillState::Finalizing(future);
-                }
+                Poll::Ready(None) => self.begin_finalizing(),
             }
         }
     }

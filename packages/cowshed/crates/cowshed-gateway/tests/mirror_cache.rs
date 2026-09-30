@@ -304,6 +304,57 @@ async fn immutable_fill_hit_offline_and_corruption_refusal() {
     assert!(!object.exists(), "corruption must delete the cache entry");
 }
 
+/// An HTTP client reads a response to its declared `Content-Length` and closes; it never polls
+/// for the end of a body it has already received. The fill must publish on the strength of the
+/// declared length, not on a final poll the client never makes, or every fetch refills.
+#[tokio::test]
+async fn a_fill_read_to_its_declared_length_publishes_though_the_client_stops_there() {
+    let root = TestRoot::new();
+    let service = open_service(&root).await;
+    let artifact = b"tarball a client reads to its content length";
+    let request = request(
+        MirrorProtocol::Npm,
+        target("registry.npmjs.org"),
+        "/thing/-/thing-2.0.0.tgz",
+        MirrorCacheScope::Anonymous,
+        false,
+        Some(expectation(artifact)),
+    );
+    let upstream = QueueUpstream::new([ok_response(artifact)]);
+    let MirrorOutcome::Response(response) = service
+        .execute(request.clone(), UpstreamHealth::Healthy, &upstream)
+        .await
+        .expect("fill immutable object")
+    else {
+        panic!("expected a streamed fill");
+    };
+    assert_eq!(response.cache_status, MirrorCacheStatus::Filled);
+    let mut body = response.response.into_body();
+    let mut received = Vec::new();
+    while received.len() < artifact.len() {
+        let frame = body
+            .frame()
+            .await
+            .expect("the declared bytes arrive")
+            .expect("the fill streams the upstream bytes");
+        received.extend_from_slice(&frame.into_data().expect("data frame"));
+    }
+    assert_eq!(received, artifact);
+    drop(body);
+
+    let untouched = QueueUpstream::new([]);
+    let (status, cached) = collect(
+        service
+            .execute(request, UpstreamHealth::Healthy, &untouched)
+            .await
+            .expect("the second fetch is served from the published fill"),
+    )
+    .await;
+    assert_eq!(status, MirrorCacheStatus::Hit);
+    assert_eq!(cached.as_ref(), artifact);
+    assert_eq!(untouched.call_count(), 0);
+}
+
 #[tokio::test]
 async fn immutable_digest_mismatch_never_publishes() {
     let root = TestRoot::new();
