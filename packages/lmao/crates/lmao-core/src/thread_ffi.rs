@@ -50,7 +50,7 @@ fn parse_trace(ptr: *const u8, len: usize) -> Option<TraceId> {
 /// The borrow is unbounded, which is sound only because every caller hands the
 /// result straight to a row store that copies it into its arena before
 /// returning. The bytes belong to the caller and are not retained: that is the
-/// same discipline the reverse ABI runs in `containium-realm-spans`.
+/// same discipline an embedding host applies to strings it forwards.
 ///
 /// # Safety
 /// `ptr..ptr + len` must be readable until the returned borrow is dropped.

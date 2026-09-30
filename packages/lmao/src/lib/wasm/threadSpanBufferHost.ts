@@ -1,19 +1,25 @@
 /**
- * Instantiates allocator.wasm and binds the shared per-thread span buffer ABI.
+ * The Wasm provider of the thread lane: instantiates allocator.wasm and binds
+ * its shared per-thread span buffer slots.
  *
  * Scratch pages are grown from the imported memory so intern/open payloads live
  * at offsets the WASM module can read without colliding with the Rust heap.
  */
 
 import { isRecord } from '@smoothbricks/validation';
+import type { Table } from '@uwdata/flechette';
 import type { LogSchema } from '../schema/LogSchema.js';
-import { encodeSchemaBlob } from './schemaBlob.js';
+import type { ThreadSpanBufferProvider } from '../ThreadBufferStrategy.js';
+import { convertThreadViewToArrowTable } from './convertThreadBuffer.js';
+import { encodeSchemaBlob, schemaAttributeOrdinals } from './schemaBlob.js';
 import {
   bindThreadSpanBuffer,
   isThreadSpanBufferWasmExports,
   type ThreadSpanBufferBinding,
   type ThreadSpanBufferWasmExports,
+  type WasmThreadSpanBufferBinding,
 } from './threadSpanBuffer.js';
+import type { ThreadSpanView } from './threadSpanView.js';
 import { getWasmModule } from './wasmAllocator.js';
 
 const WASM_PAGE = 65_536;
@@ -37,15 +43,8 @@ export interface ThreadSpanBufferReadExports {
 
 export type ThreadSpanBufferModuleExports = ThreadSpanBufferWasmExports & ThreadSpanBufferReadExports;
 
-export interface ThreadSpanBufferRuntime {
-  readonly memory: WebAssembly.Memory;
-  readonly exports: ThreadSpanBufferModuleExports;
-  writeUtf8(text: string): { ptr: number; len: number };
-  intern(binding: ThreadSpanBufferBinding, text: string): number;
-  /** Live intern-cache counters: a hit crosses nothing and encodes nothing. */
-  readonly internStats: { readonly hits: number; readonly misses: number };
-  createBinding(threadId: bigint, capacity: number, schema: LogSchema): ThreadSpanBufferBinding;
-  readUtf8(ptr: number, len: number): string;
+/** Reads a Wasm slot back into JavaScript, for the JS-side Arrow conversion. */
+export interface ThreadSpanBufferReader {
   rowCount(binding: ThreadSpanBufferBinding): number;
   readTimestamp(binding: ThreadSpanBufferBinding, row: number): bigint;
   readSpanId(binding: ThreadSpanBufferBinding, row: number): number;
@@ -57,6 +56,12 @@ export interface ThreadSpanBufferRuntime {
   materializeScope(binding: ThreadSpanBufferBinding, startRow: number, rowCount: number): void;
   readAttr(binding: ThreadSpanBufferBinding, row: number, ordinal: number): { kind: number; value: bigint } | undefined;
   readInterned(binding: ThreadSpanBufferBinding, ordinal: number): string;
+}
+
+export interface ThreadSpanBufferRuntime extends ThreadSpanBufferProvider, ThreadSpanBufferReader {
+  readonly memory: WebAssembly.Memory;
+  readonly exports: ThreadSpanBufferModuleExports;
+  createBinding(threadId: bigint, capacity: number, schema: LogSchema): WasmThreadSpanBufferBinding;
 }
 
 function isThreadSpanBufferModuleExports(value: unknown): value is ThreadSpanBufferModuleExports {
@@ -122,50 +127,31 @@ export async function createThreadSpanBufferRuntime(options?: {
     scratchView = new Uint8Array(memory.buffer, scratchPtr, scratchLen);
   };
 
-  const writeUtf8 = (text: string): { ptr: number; len: number } => {
-    // Worst case for UTF-8 is 3 bytes per UTF-16 code unit; surrogate pairs
-    // are 2 units producing 4 bytes, so the bound holds. Encoding straight
-    // into linear memory avoids the intermediate array `encode()` returns.
-    ensureScratch(text.length * 3);
-    const written = utf8.encodeInto(text, scratchView).written;
-    return { ptr: scratchPtr, len: written };
+  const scratch = {
+    memory,
+    writeUtf8: (text: string): { ptr: number; len: number } => {
+      // Worst case for UTF-8 is 3 bytes per UTF-16 code unit; surrogate pairs
+      // are 2 units producing 4 bytes, so the bound holds. Encoding straight
+      // into linear memory avoids the intermediate array `encode()` returns.
+      ensureScratch(text.length * 3);
+      const written = utf8.encodeInto(text, scratchView).written;
+      return { ptr: scratchPtr, len: written };
+    },
   };
 
-  const readUtf8 = (ptr: number, len: number): string => {
-    if (len === 0) return '';
-    return utf8Decoder.decode(new Uint8Array(memory.buffer, ptr, len));
+  const readUtf8 = (ptr: number, len: number): string =>
+    len === 0 ? '' : utf8Decoder.decode(new Uint8Array(memory.buffer, ptr, len));
+
+  /** Every slot this runtime bound, so a reader can name the slot behind a binding. */
+  const handles = new WeakMap<ThreadSpanBufferBinding, number>();
+  const handleOf = (binding: ThreadSpanBufferBinding): number => {
+    const handle = handles.get(binding);
+    // invariant throw: a binding from another provider reached this reader.
+    if (handle === undefined) throw new Error('binding was not created by this thread span buffer runtime');
+    return handle;
   };
 
-  /**
-   * Vocabulary ids are stable for a handle's lifetime — `ThreadSpanBuffer::intern`
-   * returns the existing id for a value it has already seen — so caching the
-   * mapping JS-side is exact, not an approximation. A hit costs one Map lookup
-   * and crosses nothing; a miss pays one encode plus one crossing, once per
-   * distinct string rather than once per row.
-   */
-  const internCaches = new WeakMap<ThreadSpanBufferBinding, Map<string, number>>();
-  const internStats = { hits: 0, misses: 0 };
-
-  const intern = (binding: ThreadSpanBufferBinding, text: string): number => {
-    let cache = internCaches.get(binding);
-    if (cache === undefined) {
-      cache = new Map<string, number>();
-      internCaches.set(binding, cache);
-    }
-    const cached = cache.get(text);
-    if (cached !== undefined) {
-      internStats.hits += 1;
-      return cached;
-    }
-    internStats.misses += 1;
-    const payload = writeUtf8(text);
-    const id = binding.intern(payload.ptr, payload.len);
-    if (id === 0) throw new Error('thread span buffer intern failed');
-    cache.set(text, id);
-    return id;
-  };
-
-  const createBinding = (threadId: bigint, capacity: number, schema: LogSchema): ThreadSpanBufferBinding => {
+  const createBinding = (threadId: bigint, capacity: number, schema: LogSchema): WasmThreadSpanBufferBinding => {
     const blob = encodeSchemaBlob(schema);
     let handle: number;
     if (blob.length === 0) {
@@ -176,8 +162,9 @@ export async function createThreadSpanBufferRuntime(options?: {
       handle = exports.thread_span_buffer_new_with_schema(threadId, capacity, scratchPtr, blob.length);
     }
     if (handle === 0) throw new Error('thread_span_buffer_new rejected capacity or schema');
-    const binding = bindThreadSpanBuffer(exports, handle);
+    const binding = bindThreadSpanBuffer(exports, handle, capacity, schemaAttributeOrdinals(schema).size, scratch);
     if (binding === undefined) throw new Error('failed to bind ThreadSpanBuffer handle');
+    handles.set(binding, handle);
     return binding;
   };
 
@@ -186,33 +173,31 @@ export async function createThreadSpanBufferRuntime(options?: {
     binding: ThreadSpanBufferBinding,
     row: number,
   ): string => {
-    const needed = reader(binding.handle, row, scratchPtr, scratchLen);
+    const handle = handleOf(binding);
+    const needed = reader(handle, row, scratchPtr, scratchLen);
     if (needed === 0) return '';
     if (needed > scratchLen) {
       ensureScratch(needed);
-      reader(binding.handle, row, scratchPtr, scratchLen);
+      reader(handle, row, scratchPtr, scratchLen);
     }
     return readUtf8(scratchPtr, needed);
   };
 
-  return {
+  const runtime: ThreadSpanBufferRuntime = {
     memory,
     exports,
-    writeUtf8,
-    intern,
-    internStats,
     createBinding,
-    readUtf8,
-    rowCount: (binding) => exports.thread_span_buffer_row_count(binding.handle),
-    readTimestamp: (binding, row) => exports.thread_span_buffer_read_timestamp(binding.handle, row),
-    readSpanId: (binding, row) => exports.thread_span_buffer_read_span_id(binding.handle, row),
-    readHeader: (binding, row) => exports.thread_span_buffer_read_header(binding.handle, row),
-    readParentSpanId: (binding, row) => exports.thread_span_buffer_read_parent_span_id(binding.handle, row),
-    readLine: (binding, row) => exports.thread_span_buffer_read_line(binding.handle, row),
+    toArrowTable: (view: ThreadSpanView): Table => convertThreadViewToArrowTable(runtime, view),
+    rowCount: (binding) => exports.thread_span_buffer_row_count(handleOf(binding)),
+    readTimestamp: (binding, row) => exports.thread_span_buffer_read_timestamp(handleOf(binding), row),
+    readSpanId: (binding, row) => exports.thread_span_buffer_read_span_id(handleOf(binding), row),
+    readHeader: (binding, row) => exports.thread_span_buffer_read_header(handleOf(binding), row),
+    readParentSpanId: (binding, row) => exports.thread_span_buffer_read_parent_span_id(handleOf(binding), row),
+    readLine: (binding, row) => exports.thread_span_buffer_read_line(handleOf(binding), row),
     readTraceId: (binding, row) => copyString(exports.thread_span_buffer_read_trace_id, binding, row),
     readMessage: (binding, row) => copyString(exports.thread_span_buffer_read_message, binding, row),
     materializeScope: (binding, startRow, rowCount) => {
-      if (exports.thread_span_buffer_materialize_scope(binding.handle, startRow, rowCount) !== 0) {
+      if (exports.thread_span_buffer_materialize_scope(handleOf(binding), startRow, rowCount) !== 0) {
         throw new Error('thread_span_buffer_materialize_scope failed');
       }
     },
@@ -220,19 +205,21 @@ export async function createThreadSpanBufferRuntime(options?: {
       ensureScratch(16);
       const kindPtr = scratchPtr;
       const valuePtr = (scratchPtr + 8) & ~7;
-      const status = exports.thread_span_buffer_read_attr(binding.handle, row, ordinal, kindPtr, valuePtr);
+      const status = exports.thread_span_buffer_read_attr(handleOf(binding), row, ordinal, kindPtr, valuePtr);
       if (status !== 0) return undefined;
       const view = new DataView(memory.buffer);
       return { kind: view.getUint8(kindPtr), value: view.getBigUint64(valuePtr, true) };
     },
     readInterned: (binding, ordinal) => {
-      const needed = exports.thread_span_buffer_read_interned(binding.handle, ordinal, scratchPtr, scratchLen);
+      const handle = handleOf(binding);
+      const needed = exports.thread_span_buffer_read_interned(handle, ordinal, scratchPtr, scratchLen);
       if (needed === 0) return '';
       if (needed > scratchLen) {
         ensureScratch(needed);
-        exports.thread_span_buffer_read_interned(binding.handle, ordinal, scratchPtr, scratchLen);
+        exports.thread_span_buffer_read_interned(handle, ordinal, scratchPtr, scratchLen);
       }
       return readUtf8(scratchPtr, needed);
     },
   };
+  return runtime;
 }

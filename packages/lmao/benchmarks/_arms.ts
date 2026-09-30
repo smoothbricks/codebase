@@ -74,9 +74,3 @@ for (const logs of sweep) {
       `thread ${(threadNs / 1000).toFixed(2)} us   ratio ${(threadNs / jsNs).toFixed(2)}x  ${verdictOf(jsNs, threadNs)}`,
   );
 }
-const stats = thread.runtime.internStats;
-const total = stats.hits + stats.misses;
-console.log(
-  `intern cache: ${stats.hits} hits / ${stats.misses} misses = ` +
-    `${((stats.hits / total) * 100).toFixed(2)}% hit rate`,
-);

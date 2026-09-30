@@ -18,6 +18,7 @@ import { makeArrowColumn } from '../arrow/flechette.js';
 import { ENTRY_TYPE_NAMES, THREAD_ATTRIBUTE_KINDS } from '../schema/systemSchema.js';
 import { getEnumValues } from '../schema/typeGuards.js';
 import { schemaAttributeOrdinals } from './schemaBlob.js';
+import type { ThreadSpanBufferReader } from './threadSpanBufferHost.js';
 import type { ThreadSpanView } from './threadSpanView.js';
 
 const KIND_NUMBER = THREAD_ATTRIBUTE_KINDS[0].discriminant;
@@ -33,8 +34,8 @@ function bitsToF64(value: bigint): number {
   return bits.getFloat64(0, true);
 }
 
-export function convertThreadViewToArrowTable(view: ThreadSpanView): Table {
-  const { runtime, binding } = view;
+export function convertThreadViewToArrowTable(runtime: ThreadSpanBufferReader, view: ThreadSpanView): Table {
+  const { binding } = view;
   const rowCount = runtime.rowCount(binding);
   if (rowCount === 0) return tableFromColumns({});
   runtime.materializeScope(binding, 0, rowCount);

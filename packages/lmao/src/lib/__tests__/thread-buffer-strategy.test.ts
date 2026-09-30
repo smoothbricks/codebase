@@ -3,10 +3,16 @@ import { defineOpContext } from '../defineOpContext.js';
 import { Ok } from '../result.js';
 import { S } from '../schema/builder.js';
 import { defineLogSchema } from '../schema/defineLogSchema.js';
-import { ENTRY_TYPE_INFO, ENTRY_TYPE_SPAN_OK, ENTRY_TYPE_SPAN_START } from '../schema/systemSchema.js';
+import {
+  ENTRY_TYPE_INFO,
+  ENTRY_TYPE_SPAN_OK,
+  ENTRY_TYPE_SPAN_START,
+  THREAD_ATTRIBUTE_KINDS,
+} from '../schema/systemSchema.js';
 import { ThreadBufferStrategy } from '../ThreadBufferStrategy.js';
 import { createTraceRoot } from '../traceRoot.node.js';
 import { TestTracer } from '../tracers/TestTracer.js';
+import type { ThreadSpanBufferRuntime } from '../wasm/threadSpanBufferHost.js';
 import { isThreadSpanView } from '../wasm/threadSpanView.js';
 
 const schema = defineLogSchema({
@@ -17,7 +23,7 @@ const schema = defineLogSchema({
 const opContext = defineOpContext({ logSchema: schema });
 
 describe('ThreadBufferStrategy', () => {
-  let strategy: ThreadBufferStrategy<typeof schema>;
+  let strategy: ThreadBufferStrategy<typeof schema, ThreadSpanBufferRuntime>;
 
   beforeAll(async () => {
     strategy = await ThreadBufferStrategy.create({ capacity: 8 });
@@ -44,17 +50,17 @@ describe('ThreadBufferStrategy', () => {
     expect(isThreadSpanView(root)).toBe(true);
     if (!isThreadSpanView(root)) return;
 
-    expect(strategy.runtime.rowCount(root.binding)).toBeGreaterThanOrEqual(4);
-    expect(strategy.runtime.readHeader(root.binding, root.startRow) & 0xff).toBe(ENTRY_TYPE_SPAN_START);
-    expect(strategy.runtime.readSpanId(root.binding, root.startRow)).toBe(root.spanId);
-    expect(strategy.runtime.readMessage(root.binding, root.startRow)).toBe('root');
+    expect(strategy.provider.rowCount(root.binding)).toBeGreaterThanOrEqual(4);
+    expect(strategy.provider.readHeader(root.binding, root.startRow) & 0xff).toBe(ENTRY_TYPE_SPAN_START);
+    expect(strategy.provider.readSpanId(root.binding, root.startRow)).toBe(root.spanId);
+    expect(strategy.provider.readMessage(root.binding, root.startRow)).toBe('root');
 
     const logRow = [...root.fakeToReal.values()][0];
     expect(logRow).toBeDefined();
     if (logRow === undefined) return;
-    expect(strategy.runtime.readHeader(root.binding, logRow) & 0xff).toBe(ENTRY_TYPE_INFO);
-    expect(strategy.runtime.readMessage(root.binding, logRow)).toBe('hello');
-    expect(strategy.runtime.readTimestamp(root.binding, root.startRow)).not.toBe(0n);
+    expect(strategy.provider.readHeader(root.binding, logRow) & 0xff).toBe(ENTRY_TYPE_INFO);
+    expect(strategy.provider.readMessage(root.binding, logRow)).toBe('hello');
+    expect(strategy.provider.readTimestamp(root.binding, root.startRow)).not.toBe(0n);
   });
 
   it('opens a span and ends ok without the generated per-span TypedArray store', () => {
@@ -67,7 +73,7 @@ describe('ThreadBufferStrategy', () => {
     const root = tracer.rootBuffers[0];
     expect(isThreadSpanView(root)).toBe(true);
     if (!isThreadSpanView(root)) return;
-    expect(strategy.runtime.readHeader(root.binding, root.completionRow) & 0xff).toBe(ENTRY_TYPE_SPAN_OK);
+    expect(strategy.provider.readHeader(root.binding, root.completionRow) & 0xff).toBe(ENTRY_TYPE_SPAN_OK);
   });
 
   it('applies latest setScope across an overflow chain at materialize', () => {
@@ -83,16 +89,16 @@ describe('ThreadBufferStrategy', () => {
     const root = tracer.rootBuffers[0];
     expect(isThreadSpanView(root)).toBe(true);
     if (!isThreadSpanView(root)) return;
-    const rows = strategy.runtime.rowCount(root.binding);
+    const rows = strategy.provider.rowCount(root.binding);
     expect(rows).toBeGreaterThan(8);
-    strategy.runtime.materializeScope(root.binding, 0, rows);
+    strategy.provider.materializeScope(root.binding, 0, rows);
     const userOrdinal = root.ordinals.get('user');
     expect(userOrdinal).toBeDefined();
     if (userOrdinal === undefined) return;
-    const cell = strategy.runtime.readAttr(root.binding, rows - 1, userOrdinal);
+    const cell = strategy.provider.readAttr(root.binding, rows - 1, userOrdinal);
     expect(cell).toBeDefined();
     if (cell === undefined) return;
-    expect(strategy.runtime.readInterned(root.binding, Number(cell.value))).toBe('late');
+    expect(strategy.provider.readInterned(root.binding, Number(cell.value))).toBe('late');
   });
 
   it('coarsens log-row stamps but never a span duration', () => {
@@ -111,13 +117,13 @@ describe('ThreadBufferStrategy', () => {
     expect(isThreadSpanView(root)).toBe(true);
     if (!isThreadSpanView(root)) return;
 
-    const start = strategy.runtime.readTimestamp(root.binding, root.startRow);
-    const completion = strategy.runtime.readTimestamp(root.binding, root.completionRow);
+    const start = strategy.provider.readTimestamp(root.binding, root.startRow);
+    const completion = strategy.provider.readTimestamp(root.binding, root.completionRow);
     // Boundaries always read fresh: a duration derived from these two never
     // collapses, however many rows shared a cached stamp in between.
     expect(completion).toBeGreaterThan(start);
 
-    const stamps = [...root.fakeToReal.values()].map((row) => strategy.runtime.readTimestamp(root.binding, row));
+    const stamps = [...root.fakeToReal.values()].map((row) => strategy.provider.readTimestamp(root.binding, row));
     expect(stamps).toHaveLength(rowCount);
     for (const stamp of stamps) {
       expect(stamp).toBeGreaterThanOrEqual(start);
@@ -132,5 +138,43 @@ describe('ThreadBufferStrategy', () => {
     // refresh windows, so the cache must have been re-read.
     expect(new Set(stamps).size).toBeGreaterThan(1);
     expect(new Set(stamps).size).toBeLessThan(rowCount);
+  });
+
+  it("stores an attribute into the row store's own cells, with no call and no copy", () => {
+    const tracer = new TestTracer(opContext, {
+      bufferStrategy: strategy,
+      createTraceRoot,
+    });
+    tracer.trace_fn(0, 'cells', {}, (ctx) => {
+      ctx.tag.count(7);
+      ctx.log.info('row').user('ada');
+      return ctx.ok(1);
+    });
+    const root = tracer.rootBuffers[0];
+    if (!isThreadSpanView(root)) throw new Error('expected a thread-lane span');
+    const count = root.fields.get('count');
+    const user = root.fields.get('user');
+    const logRow = [...root.fakeToReal.values()][0];
+    if (count === undefined || user === undefined || logRow === undefined) throw new Error('missing schema fields');
+
+    // The TypedArrays the writes used are views of linear memory itself, at the
+    // offset the store exported for the block — not a JS copy of it.
+    const views = root.cells.views(root.startRow);
+    const exported = root.binding.attributeCells(Math.floor(root.startRow / strategy.capacity));
+    if (exported === undefined) throw new Error('the span start block has no attribute cells');
+    expect(views.f64.buffer).toBe(strategy.provider.memory.buffer);
+    expect(views.f64.byteOffset).toBe(exported.byteOffset);
+
+    // The store reads exactly what the stores wrote.
+    const tag = strategy.provider.readAttr(root.binding, root.startRow, count.ordinal);
+    expect(tag?.kind).toBe(THREAD_ATTRIBUTE_KINDS[0].discriminant);
+    expect(new Float64Array(new BigUint64Array([tag?.value ?? 0n]).buffer)[0]).toBe(7);
+    const text = strategy.provider.readAttr(root.binding, logRow, user.ordinal);
+    expect(strategy.provider.readInterned(root.binding, Number(text?.value))).toBe('ada');
+
+    // And the batch the lane converts carries them as columns.
+    const table = strategy.toArrowTable(root);
+    expect(table.getChild('count')?.at(root.startRow)).toBe(7);
+    expect(table.getChild('user')?.at(logRow)).toBe('ada');
   });
 });

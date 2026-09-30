@@ -118,7 +118,6 @@ const coldOp = context.defineOp('phase2-cold', (ctx) => nestedCold(ctx) ?? ctx.o
 async function makeTracers(): Promise<{
   js: TestTracer<Binding>;
   thread: TestTracer<Binding>;
-  threadStrategy: ThreadBufferStrategy<Binding['logBinding']['logSchema']>;
 }> {
   const js = new JsBufferStrategy<Binding['logBinding']['logSchema']>();
   const threadStrategy = await ThreadBufferStrategy.create<Binding['logBinding']['logSchema']>({
@@ -127,61 +126,11 @@ async function makeTracers(): Promise<{
   return {
     js: new TestTracer(context, { bufferStrategy: js, createTraceRoot }),
     thread: new TestTracer(context, { bufferStrategy: threadStrategy, createTraceRoot }),
-    threadStrategy,
   };
 }
 
-function wrapCounts(strategy: ThreadBufferStrategy<Binding['logBinding']['logSchema']>): Record<string, number> {
-  const hits = { appendLog: 0, appendLogStatic: 0, appendLogDynamic: 0, intern: 0, writeAttr: 0 };
-  const runtime = strategy.runtime as unknown as {
-    createBinding: (...args: never[]) => {
-      appendLog: (...a: never[]) => unknown;
-      appendLogStatic: (...a: never[]) => unknown;
-      appendLogDynamic: (...a: never[]) => unknown;
-      intern: (...a: never[]) => unknown;
-      writeAttr: (...a: never[]) => unknown;
-    };
-  };
-  const original = runtime.createBinding.bind(runtime);
-  runtime.createBinding = ((...args: never[]) => {
-    const binding = original(...args);
-    const wrap = (key: keyof typeof hits, fn: (...a: never[]) => unknown) =>
-      ((...a: never[]) => {
-        hits[key] += 1;
-        return fn(...a);
-      }) as typeof fn;
-    binding.appendLog = wrap('appendLog', binding.appendLog.bind(binding));
-    binding.appendLogStatic = wrap('appendLogStatic', binding.appendLogStatic.bind(binding));
-    binding.appendLogDynamic = wrap('appendLogDynamic', binding.appendLogDynamic.bind(binding));
-    binding.intern = wrap('intern', binding.intern.bind(binding));
-    binding.writeAttr = wrap('writeAttr', binding.writeAttr.bind(binding));
-    return binding;
-  }) as typeof runtime.createBinding;
-  return hits;
-}
-
-const { js: jsWarm, thread: threadWarm, threadStrategy } = await makeTracers();
+const { js: jsWarm, thread: threadWarm } = await makeTracers();
 const { js: jsCold, thread: threadCold } = await makeTracers();
-const hits = wrapCounts(threadStrategy);
-
-{
-  const before = { ...threadStrategy.runtime.internStats };
-  threadWarm.clear();
-  threadWarm.trace_op(0, 'phase2-warm', {}, warmOp);
-  const afterFirst = { ...threadStrategy.runtime.internStats };
-  threadWarm.clear();
-  threadWarm.trace_op(0, 'phase2-warm', {}, warmOp);
-  const afterSecond = { ...threadStrategy.runtime.internStats };
-  console.log('phase2 ABI counts after 1 warm tree', hits);
-  console.log('internStats first tree', {
-    hits: afterFirst.hits - before.hits,
-    misses: afterFirst.misses - before.misses,
-  });
-  console.log('internStats second tree', {
-    hits: afterSecond.hits - afterFirst.hits,
-    misses: afterSecond.misses - afterFirst.misses,
-  });
-}
 
 group('phase2-warm nested-reuse js-heap vs thread-buffer', () => {
   bench('js-heap', () => {

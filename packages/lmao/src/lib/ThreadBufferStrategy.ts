@@ -1,8 +1,11 @@
 /**
- * BufferStrategy backed by the shared per-thread ThreadSpanBuffer ABI.
+ * BufferStrategy backed by the shared per-thread ThreadSpanBuffer.
  *
- * One WASM runtime per strategy instance (one logical thread). Each schema gets
- * its own handle so the blob ordinals match the writers.
+ * One provider per strategy instance (one logical thread). Each schema gets its
+ * own row store, so the schema's attribute order is the store's column order.
+ * The provider is how the lane reaches the store — allocator.wasm, Bun FFI, or
+ * a host runtime that embeds the store natively — and is chosen once, when the
+ * strategy is built, never per call.
  */
 
 import type { Table } from '@uwdata/flechette';
@@ -15,10 +18,26 @@ import type { SpanBufferStats } from './spanBufferStats.js';
 import { getThreadId } from './threadId.js';
 import type { ITraceRoot } from './traceRoot.js';
 import type { AnySpanBuffer, SpanBuffer } from './types.js';
-import { convertThreadViewToArrowTable } from './wasm/convertThreadBuffer.js';
 import { THREAD_SPAN_BUFFER_OK, type ThreadSpanBufferBinding } from './wasm/threadSpanBuffer.js';
 import { createThreadSpanBufferRuntime, type ThreadSpanBufferRuntime } from './wasm/threadSpanBufferHost.js';
-import { createThreadSpanView, isThreadSpanView, requireThreadSpanView } from './wasm/threadSpanView.js';
+import {
+  createThreadSpanView,
+  isThreadSpanView,
+  requireThreadSpanView,
+  ThreadSpanCells,
+  type ThreadSpanView,
+} from './wasm/threadSpanView.js';
+
+/** How a thread lane reaches its row stores. */
+export interface ThreadSpanBufferProvider {
+  /** A new row store for one schema, bound for writing. */
+  createBinding(threadId: bigint, capacity: number, schema: LogSchema): ThreadSpanBufferBinding;
+  /**
+   * The JavaScript Arrow conversion of a view's store. A provider whose host
+   * converts rows natively refuses: its rows are never read back into JS.
+   */
+  toArrowTable(view: ThreadSpanView): Table;
+}
 
 const statsBySchema = new WeakMap<LogSchema, SpanBufferStats>();
 
@@ -30,25 +49,30 @@ function statsFor(schema: LogSchema, capacity: number): SpanBufferStats {
   return created;
 }
 
-export class ThreadBufferStrategy<T extends LogSchema = LogSchema> implements BufferStrategy<T> {
-  readonly runtime: ThreadSpanBufferRuntime;
+export class ThreadBufferStrategy<
+  T extends LogSchema = LogSchema,
+  P extends ThreadSpanBufferProvider = ThreadSpanBufferProvider,
+> implements BufferStrategy<T>
+{
+  readonly provider: P;
   readonly capacity: number;
   readonly threadId: bigint;
-  private readonly bindings = new WeakMap<LogSchema, ThreadSpanBufferBinding>();
+  private readonly cells = new WeakMap<LogSchema, ThreadSpanCells>();
   /**
    * Bindings reachable for `reset`. The WeakMap above is the lookup; this is
    * the iteration order, and it is what makes the row store releasable — a
-   * handle outlives every span written through it, so without an explicit
+   * store outlives every span written through it, so without an explicit
    * reset a long-lived thread grows its row store without bound.
    */
   private readonly liveBindings: ThreadSpanBufferBinding[] = [];
 
-  private constructor(runtime: ThreadSpanBufferRuntime, capacity: number, threadId: bigint) {
-    this.runtime = runtime;
+  private constructor(provider: P, capacity: number, threadId: bigint) {
+    this.provider = provider;
     this.capacity = capacity;
     this.threadId = threadId;
   }
 
+  /** A strategy over allocator.wasm's row stores. */
   static async create<TSchema extends LogSchema>(options?: {
     capacity?: number;
     threadId?: bigint;
@@ -56,21 +80,35 @@ export class ThreadBufferStrategy<T extends LogSchema = LogSchema> implements Bu
     maxPages?: number;
     /** Pre-compiled allocator.wasm for bundled environments; see createThreadSpanBufferRuntime. */
     module?: WebAssembly.Module;
-  }): Promise<ThreadBufferStrategy<TSchema>> {
+  }): Promise<ThreadBufferStrategy<TSchema, ThreadSpanBufferRuntime>> {
     const runtime = await createThreadSpanBufferRuntime({
       initialPages: options?.initialPages,
       maxPages: options?.maxPages,
       module: options?.module,
     });
-    return new ThreadBufferStrategy<TSchema>(runtime, options?.capacity ?? 64, options?.threadId ?? getThreadId());
+    return ThreadBufferStrategy.fromProvider<TSchema, ThreadSpanBufferRuntime>(runtime, options);
   }
 
-  bindingFor(schema: LogSchema): ThreadSpanBufferBinding {
-    const existing = this.bindings.get(schema);
+  /** A strategy over any provider's row stores. */
+  static fromProvider<TSchema extends LogSchema, TProvider extends ThreadSpanBufferProvider>(
+    provider: TProvider,
+    options?: { capacity?: number; threadId?: bigint },
+  ): ThreadBufferStrategy<TSchema, TProvider> {
+    return new ThreadBufferStrategy<TSchema, TProvider>(
+      provider,
+      options?.capacity ?? 64,
+      options?.threadId ?? getThreadId(),
+    );
+  }
+
+  /** The cell writer of `schema`'s row store, creating the store on first use. */
+  cellsFor(schema: LogSchema): ThreadSpanCells {
+    const existing = this.cells.get(schema);
     if (existing) return existing;
-    const created = this.runtime.createBinding(this.threadId, this.capacity, schema);
-    this.bindings.set(schema, created);
-    this.liveBindings.push(created);
+    const binding = this.provider.createBinding(this.threadId, this.capacity, schema);
+    const created = new ThreadSpanCells(binding);
+    this.cells.set(schema, created);
+    this.liveBindings.push(binding);
     return created;
   }
 
@@ -82,8 +120,7 @@ export class ThreadBufferStrategy<T extends LogSchema = LogSchema> implements Bu
     _plannedClass?: SpanBufferConstructor<T>,
   ): SpanBuffer<T> {
     const buffer = createThreadSpanView({
-      runtime: this.runtime,
-      binding: this.bindingFor(schema),
+      cells: this.cellsFor(schema),
       schema,
       traceRoot,
       opMetadata,
@@ -104,8 +141,7 @@ export class ThreadBufferStrategy<T extends LogSchema = LogSchema> implements Bu
   ): SpanBuffer<T> {
     const childSchema = schema ?? parentBuffer._logSchema;
     const child = createThreadSpanView({
-      runtime: this.runtime,
-      binding: this.bindingFor(childSchema),
+      cells: this.cellsFor(childSchema),
       schema: childSchema,
       traceRoot: parentBuffer._traceRoot,
       opMetadata,
@@ -126,7 +162,7 @@ export class ThreadBufferStrategy<T extends LogSchema = LogSchema> implements Bu
   }
 
   toArrowTable(buffer: AnySpanBuffer): Table {
-    if (isThreadSpanView(buffer)) return convertThreadViewToArrowTable(buffer);
+    if (isThreadSpanView(buffer)) return this.provider.toArrowTable(buffer);
     return convertSpanTreeToArrowTable(buffer);
   }
 

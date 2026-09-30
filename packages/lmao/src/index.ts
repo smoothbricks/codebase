@@ -130,7 +130,14 @@ export * from './lib/flushScheduler.js';
 
 export type { BufferStrategy } from './lib/bufferStrategy.js';
 export { JsBufferStrategy } from './lib/JsBufferStrategy.js';
-export { ThreadBufferStrategy } from './lib/ThreadBufferStrategy.js';
+export { ThreadBufferStrategy, type ThreadSpanBufferProvider } from './lib/ThreadBufferStrategy.js';
+export {
+  attributeCellStride,
+  THREAD_SPAN_BUFFER_OK,
+  type ThreadAttributeKind,
+  type ThreadSpanBufferBinding,
+} from './lib/wasm/threadSpanBuffer.js';
+export type { ThreadSpanView } from './lib/wasm/threadSpanView.js';
 // =============================================================================
 // Tracer
 // =============================================================================
