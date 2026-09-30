@@ -165,7 +165,8 @@ fn scope_cell(
 }
 struct RowInput {
     timestamp: i64,
-    trace_id: TraceId,
+    /// Index into the store's trace table.
+    trace: u32,
     header: u32,
     span_id: u32,
     parent_thread_id: u64,
@@ -190,7 +191,9 @@ struct ThreadSpanBlock {
     capacity: usize,
     rows: usize,
     timestamps: Vec<i64>,
-    trace_ids: Vec<Option<TraceId>>,
+    /// Each row's index into the store's trace table: a span's rows share one
+    /// trace, so a row carries four bytes, not a refcounted id.
+    traces: Vec<u32>,
     headers: Vec<u32>,
     span_ids: Vec<u32>,
     parent_thread_ids: Vec<u64>,
@@ -206,7 +209,7 @@ impl ThreadSpanBlock {
             capacity,
             rows: 0,
             timestamps: vec![0; capacity],
-            trace_ids: vec![None; capacity],
+            traces: vec![0; capacity],
             headers: vec![0; capacity],
             span_ids: vec![0; capacity],
             parent_thread_ids: vec![0; capacity],
@@ -223,7 +226,7 @@ impl ThreadSpanBlock {
     fn write_row(&mut self, input: RowInput) -> usize {
         let row = self.rows;
         self.timestamps[row] = input.timestamp;
-        self.trace_ids[row] = Some(input.trace_id);
+        self.traces[row] = input.trace;
         self.headers[row] = input.header;
         self.span_ids[row] = input.span_id;
         self.parent_thread_ids[row] = input.parent_thread_id;
@@ -240,9 +243,7 @@ impl ThreadSpanBlock {
     fn row_input(&self, row: usize) -> RowInput {
         RowInput {
             timestamp: self.timestamps[row],
-            trace_id: self.trace_ids[row]
-                .clone()
-                .expect("a written row carries its trace id"),
+            trace: self.traces[row],
             header: self.headers[row],
             span_id: self.span_ids[row],
             parent_thread_id: self.parent_thread_ids[row],
@@ -254,7 +255,6 @@ impl ThreadSpanBlock {
     /// Forget rows `start..` while keeping every allocation.
     fn truncate(&mut self, start: usize) {
         self.rows = self.rows.min(start);
-        self.trace_ids[start..].fill(None);
         self.messages[start..].fill(None);
         self.attributes.clear_from(start);
     }
@@ -330,13 +330,14 @@ impl std::fmt::Display for ThreadBufferError {
 }
 impl std::error::Error for ThreadBufferError {}
 
-/// Hashes a span id for the span and scope tables.
+/// Hashes the keys of a row store's tables: span ids and trace ids.
 ///
 /// Every row write looks its span up, so the hash is on the row path: the
 /// default SipHash spends more on a `u32` key than the rest of the write. Span
-/// ids are the store's own dense counter, not attacker-chosen keys, so a
-/// multiplicative mix (FxHash, the arena's hasher too) spreads them with one
-/// multiply, and its output is the same on every run.
+/// ids are the store's own dense counter and trace ids come from the writer, not
+/// from an adversary choosing collisions, so a multiplicative mix (FxHash, the
+/// arena's hasher too) spreads them with one multiply per word, and its output
+/// is the same on every run.
 #[derive(Default)]
 struct SpanIdHasher(u64);
 
@@ -348,8 +349,14 @@ impl Hasher for SpanIdHasher {
 
     #[inline]
     fn write(&mut self, bytes: &[u8]) {
-        for &byte in bytes {
-            self.write_u8(byte);
+        let (words, tail) = bytes.as_chunks::<8>();
+        for word in words {
+            self.write_u64(u64::from_ne_bytes(*word));
+        }
+        if !tail.is_empty() {
+            let mut word = [0u8; 8];
+            word[..tail.len()].copy_from_slice(tail);
+            self.write_u64(u64::from_ne_bytes(word));
         }
     }
 
@@ -370,6 +377,7 @@ impl Hasher for SpanIdHasher {
 }
 
 type SpanIdMap<V> = HashMap<u32, V, BuildHasherDefault<SpanIdHasher>>;
+type TraceMap = HashMap<TraceId, u32, BuildHasherDefault<SpanIdHasher>>;
 
 /// The one row store owned by a pinned thread.
 #[derive(Debug)]
@@ -396,6 +404,13 @@ pub struct ThreadSpanBuffer {
     /// Bumped each time [`Self::reclaim_text`] renumbers the arena. An ordinal
     /// is valid within the epoch that issued it.
     text_epoch: u32,
+    /// Every trace a written row names, once; rows hold an index into it. Kept
+    /// to the traces of live rows: a reset clears it and a retain rebuilds it.
+    traces: Vec<TraceId>,
+    trace_slots: TraceMap,
+    /// A retain's working copies, kept so a flush allocates nothing.
+    traces_scratch: Vec<TraceId>,
+    trace_remap: Vec<u32>,
 }
 
 impl ThreadSpanBuffer {
@@ -420,6 +435,10 @@ impl ThreadSpanBuffer {
             open_scratch: Vec::new(),
             arena: StringArena::new(MAX_STRING_ARENA_BYTES),
             text_epoch: 0,
+            traces: Vec::new(),
+            trace_slots: TraceMap::default(),
+            traces_scratch: Vec::new(),
+            trace_remap: Vec::new(),
         };
         buffer
             .blocks
@@ -445,7 +464,48 @@ impl ThreadSpanBuffer {
         self.next_span_id = 1;
         self.spans.clear();
         self.scopes.clear();
+        self.traces.clear();
+        self.trace_slots.clear();
         self.reclaim_text();
+    }
+
+    /// The trace table's index for `trace`, adding it on first sight. Once per
+    /// span open; a log row copies its span's index.
+    fn trace_slot(&mut self, trace: TraceId) -> u32 {
+        if let Some(&slot) = self.trace_slots.get(&trace) {
+            return slot;
+        }
+        let slot = u32::try_from(self.traces.len()).expect("a row store's live traces fit u32");
+        self.traces.push(trace.clone());
+        self.trace_slots.insert(trace, slot);
+        slot
+    }
+
+    /// Rebuild the trace table from the rows a retain kept, renumbering them,
+    /// so it holds the traces of live rows only.
+    fn retain_traces(&mut self) {
+        let mut kept = std::mem::take(&mut self.traces_scratch);
+        kept.clear();
+        self.trace_slots.clear();
+        self.trace_remap.clear();
+        self.trace_remap.resize(self.traces.len(), u32::MAX);
+        let capacity = self.capacity;
+        for row in 0..self.row_count {
+            let block = &mut self.blocks[row / capacity];
+            let local = row % capacity;
+            let old = block.traces[local] as usize;
+            let mut slot = self.trace_remap[old];
+            if slot == u32::MAX {
+                slot = u32::try_from(kept.len()).expect("a row store's live traces fit u32");
+                kept.push(self.traces[old].clone());
+                self.trace_slots.insert(self.traces[old].clone(), slot);
+                self.trace_remap[old] = slot;
+            }
+            block.traces[local] = slot;
+        }
+        std::mem::swap(&mut self.traces, &mut kept);
+        kept.clear();
+        self.traces_scratch = kept;
     }
 
     /// The arena's current epoch. An ordinal from [`Self::intern`] names the
@@ -704,9 +764,10 @@ impl ThreadSpanBuffer {
         } else {
             None
         };
+        let trace = self.trace_slot(input.trace_id);
         let start_row = self.append_row(RowInput {
             timestamp: input.timestamp,
-            trace_id: input.trace_id.clone(),
+            trace,
             header: input.start_header,
             span_id: input.span_id,
             parent_thread_id,
@@ -716,7 +777,7 @@ impl ThreadSpanBuffer {
         });
         let completion_row = self.append_row(RowInput {
             timestamp: input.timestamp,
-            trace_id: input.trace_id,
+            trace,
             header: pack_dynamic(EntryType::SpanException),
             span_id: input.span_id,
             parent_thread_id,
@@ -826,15 +887,12 @@ impl ThreadSpanBuffer {
         let record = self.record(span_id)?;
         let start_row = record.start_row as usize;
         let (block, local) = self.block_at(start_row)?;
-        let trace_id = block.trace_ids[local]
-            .as_ref()
-            .expect("span start always carries trace id")
-            .clone();
+        let trace = block.traces[local];
         let parent_thread_id = block.parent_thread_ids[local];
         let parent_span_id = block.parent_span_ids[local];
         Ok(self.append_row(RowInput {
             timestamp,
-            trace_id,
+            trace,
             header: pack_dynamic(entry_type),
             span_id,
             parent_thread_id,
@@ -871,15 +929,12 @@ impl ThreadSpanBuffer {
         let record = self.record(span_id)?;
         let start_row = record.start_row as usize;
         let (block, local) = self.block_at(start_row)?;
-        let trace_id = block.trace_ids[local]
-            .as_ref()
-            .expect("span start always carries trace id")
-            .clone();
+        let trace = block.traces[local];
         let parent_thread_id = block.parent_thread_ids[local];
         let parent_span_id = block.parent_span_ids[local];
         Ok(self.append_row(RowInput {
             timestamp,
-            trace_id,
+            trace,
             header: pack_dynamic(entry_type),
             span_id,
             parent_thread_id,
@@ -898,15 +953,12 @@ impl ThreadSpanBuffer {
     ) -> Result<u32, ThreadBufferError> {
         let record = self.record(span_id)?;
         let (block, local) = self.block_at(record.start_row as usize)?;
-        let trace_id = block.trace_ids[local]
-            .as_ref()
-            .expect("span start always carries trace id")
-            .clone();
+        let trace = block.traces[local];
         let parent_thread_id = block.parent_thread_ids[local];
         let parent_span_id = block.parent_span_ids[local];
         Ok(self.append_row(RowInput {
             timestamp,
-            trace_id,
+            trace,
             header: pack_static(entry_type, message)
                 .map_err(|_| ThreadBufferError::InvalidColumnOrdinal(u16::MAX))?,
             span_id,
@@ -1140,7 +1192,7 @@ impl ThreadSpanBuffer {
                     let (to_block, to) = (next / capacity, next % capacity);
                     let block = &mut self.blocks[to_block];
                     block.timestamps[to] = input.timestamp;
-                    block.trace_ids[to] = Some(input.trace_id);
+                    block.traces[to] = input.trace;
                     block.headers[to] = input.header;
                     block.span_ids[to] = input.span_id;
                     block.parent_thread_ids[to] = input.parent_thread_id;
@@ -1169,6 +1221,7 @@ impl ThreadSpanBuffer {
         self.active_blocks = kept_blocks;
         self.row_count = next;
         self.open_scratch = open;
+        self.retain_traces();
         self.reclaim_text();
     }
     /// Blocks currently holding rows. Row `r` lives in block `r / capacity`.
@@ -1196,13 +1249,13 @@ impl ThreadSpanBuffer {
     pub fn span_trace_id(&self, span_id: u32) -> Option<&TraceId> {
         let row = self.spans.get(&span_id)?.start_row as usize;
         let (block, local) = self.block_at(row).ok()?;
-        block.trace_ids[local].as_ref()
+        self.traces.get(block.traces[local] as usize)
     }
     #[inline]
     pub fn trace_id_at(&self, row: usize) -> Option<&str> {
         self.block_at(row)
             .ok()
-            .and_then(|(block, local)| block.trace_ids[local].as_ref())
+            .and_then(|(block, local)| self.traces.get(block.traces[local] as usize))
             .map(TraceId::as_str)
     }
     #[inline]
