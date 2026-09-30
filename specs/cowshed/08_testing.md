@@ -382,9 +382,11 @@ baseline is an explicit deliverable, not an inherited APFS number.
 
 ## CI
 
-- Unit tier: every PR, all platforms.
-- Integration + escape tiers: macOS runners **and** a Linux+ZFS runner on PRs touching `packages/cowshed`, and nightly.
-  The Linux leg is the natural dogfood target — a cowshed CI runner (10_ci.md) running cowshed's own suite.
-- Escape suite green on both OSes is a release gate; a red escape test cannot be waived.
-- `cargo clippy --workspace -D warnings` and `cargo fmt --check` gate merges (repo rule: fix everything you see — no
-  pre-existing-failure waivers).
+- One job, `Validate` (`.github/workflows/ci.yml`), on every push to `main` and every pull request: Build, Lint, Unit
+  Tests and Browser Tests through `smoo github-ci nx-smart`, on Linux only — the self-hosted `nixos-latest-x64` runner
+  for the repository's own branches, `ubuntu-latest` for pull requests from forks. There are no macOS runners, no
+  Linux+ZFS runner, and no nightly run, so every macOS-only test (APFS, Seatbelt, launchd, the escape tests) runs only
+  where a developer runs the gate: `bun nx run-many -t lint test build -p cowshed` on a Mac, with `bun run check:linux`
+  cross-linting the Linux target.
+- Lint is `cargo fmt --all --check` and `cargo clippy --workspace --all-targets -- -D warnings` (repo rule: fix
+  everything you see — no pre-existing-failure waivers).
