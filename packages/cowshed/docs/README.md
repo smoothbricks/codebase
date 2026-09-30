@@ -193,8 +193,8 @@ Two things that look like fixes but are not: `trim-paths` and `--remap-path-pref
 they change the cache key too, so the reuse you were buying disappears. Use `debug = 0` on non-incremental profiles
 instead.
 
-`smoo monorepo check` enforces the debuginfo, `CARGO_INCREMENTAL` and config rules above, and the managed devenv module
-supplies the environment they assume.
+`smoo monorepo check` enforces the debuginfo, `CARGO_INCREMENTAL`, compiled-in checkout path and config rules above, and
+the managed devenv module supplies the environment they assume.
 
 ### The same rules for other toolchains
 

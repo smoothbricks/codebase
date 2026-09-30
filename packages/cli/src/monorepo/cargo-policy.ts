@@ -140,7 +140,7 @@ const SKIPPED_DIRECTORY_NAMES = new Set([
 
 const ABSOLUTE_PATH = /\/(?:[A-Za-z0-9._~+@%,-]+(?:\/[A-Za-z0-9._~+@%,-]*)*)/g;
 const CARGO_INCREMENTAL_ASSIGNMENT = /\bCARGO_INCREMENTAL\s*(?:=|:=|:)/;
-const MANIFEST_DIRECTORY_MACRO = /env!\(\s*"CARGO_MANIFEST_DIR"\s*\)/g;
+const MANIFEST_DIRECTORY_MACRO = /(?<![\w])(?:option_)?env!\(\s*"CARGO_MANIFEST_DIR"\s*\)/g;
 const CARGO_POLICY_IGNORE_MARKER = '# smoo-cargo-policy: ignore';
 const BUILTIN_PROFILES: Record<string, EffectiveProfile> = {
   dev: { incremental: true, debug: 2 },
@@ -683,15 +683,16 @@ function cargoIncrementalPolicy(
   return failures;
 }
 
-/// Blank out comments while preserving every newline, so a match's line number is unchanged.
+/// Blank out comments and raw-string literals while preserving every newline, so a match's line
+/// number is unchanged.
 ///
-/// The advisory exists to find the macro COMPILED into a crate, because rustc records those as
-/// `# env-dep:` and the patched sccache never normalises them. An occurrence inside a comment
-/// compiles to nothing, and this repository documents the sccache behaviour by naming the macro
-/// in prose — so a raw text scan reports the documentation as the defect it describes.
+/// The rule exists to find the macro COMPILED into a crate. An occurrence inside a comment or a
+/// raw string compiles to nothing, and this repository explains the rule by naming the macro in
+/// prose — so a raw text scan reports the documentation as the defect it describes.
 ///
 /// String and raw-string states are tracked because a literal may legitimately contain `//`
 /// or `/*`; mistaking one for a comment would blank real code and silently lose a finding.
+/// Ordinary strings are kept: the macro's own argument is one.
 function stripRustComments(text: string): string {
   const out = Array.from(text);
   let index = 0;
@@ -720,7 +721,9 @@ function stripRustComments(text: string): string {
       if (text[index + 1 + hashes] === '"') {
         const terminator = `"${'#'.repeat(hashes)}`;
         const end = text.indexOf(terminator, index + 2 + hashes);
-        index = end === -1 ? text.length : end + terminator.length;
+        const stop = end === -1 ? text.length : end + terminator.length;
+        blank(index, stop);
+        index = stop;
         continue;
       }
     }
@@ -754,17 +757,16 @@ function stripRustComments(text: string): string {
   return out.join('');
 }
 
-function reportManifestDirectoryAdvisories(repositoryRoot: string, ignoredDirectories: string[]): void {
-  const advisories: Array<{ path: string; line: number }> = [];
+/// Cargo does not fingerprint where the checkout lives, so a cowshed workspace runs the units it
+/// inherited from main as they are: a crate that compiled `CARGO_MANIFEST_DIR` in reads main's
+/// files from inside the workspace. Tests are the usual offenders (fixtures, sources, corpora),
+/// so they are not exempt.
+function compiledManifestDirectoryPolicy(repositoryRoot: string, ignoredDirectories: string[]): number {
+  let failures = 0;
   for (const path of filterIgnoredPaths(
     discoverFiles(repositoryRoot, (name) => name.endsWith('.rs')),
     ignoredDirectories,
   )) {
-    const relativePath = relative(repositoryRoot, path).split(sep);
-    const fileName = basename(path);
-    if (relativePath.includes('tests') || /(?:_test|_tests)\.rs$/.test(fileName)) {
-      continue;
-    }
     let text: string;
     try {
       text = readFileSync(path, 'utf8');
@@ -774,18 +776,13 @@ function reportManifestDirectoryAdvisories(repositoryRoot: string, ignoredDirect
     const code = stripRustComments(text);
     for (const match of code.matchAll(MANIFEST_DIRECTORY_MACRO)) {
       const line = text.slice(0, match.index ?? 0).split('\n').length;
-      advisories.push({ path, line });
+      failures += report(
+        `${path}:${line}`,
+        'compiles CARGO_MANIFEST_DIR in, and cargo does not fingerprint the checkout path, so a cowshed workspace runs the unit it inherited from main and reads the files of the checkout that compiled it. Fix it by reading the variable at run time — std::env::var_os("CARGO_MANIFEST_DIR"), which cargo and nextest set for every test — and by naming compiled-in files relative to their source, e.g. include_str!("../fixture.txt").',
+      );
     }
   }
-  if (advisories.length === 0) {
-    return;
-  }
-  console.error('Cargo cache policy advisories (informational only; these do not fail the check):');
-  for (const advisory of advisories) {
-    console.error(
-      `${advisory.path}:${advisory.line}: env!("CARGO_MANIFEST_DIR") is not path-stable; the patched sccache never normalises env-dep values, so this crate and everything downstream misses on every workspace at a new mount path. Fix it by removing the macro from production code or replacing it with a path-stable value.`,
-    );
-  }
+  return failures;
 }
 
 export interface CargoPolicyOptions {
@@ -847,7 +844,7 @@ export function validateCargoCachePolicy(root: string, options: CargoPolicyOptio
   for (const config of configs) {
     failures += configPolicy(config, repositoryRoot);
   }
-  reportManifestDirectoryAdvisories(repositoryRoot, ignoredDirectories);
+  failures += compiledManifestDirectoryPolicy(repositoryRoot, ignoredDirectories);
   return failures;
 }
 

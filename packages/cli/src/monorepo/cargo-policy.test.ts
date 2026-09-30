@@ -166,21 +166,24 @@ describe('Cargo cache policy', () => {
     expect(result.messages[0]).toContain('repository-relative linker');
   });
 
-  it('reports CARGO_MANIFEST_DIR as informational without failing', async () => {
+  // Cargo does not fingerprint the checkout path, so a cowshed workspace runs the test binaries it
+  // inherited from main; a test that compiled the path in reads main's files. Tests are the usual
+  // offenders, so they are not exempt.
+  it('refuses a compiled CARGO_MANIFEST_DIR in any Rust source, tests included', async () => {
     const result = await check({
       'src/lib.rs': 'const ROOT: &str = env!("CARGO_MANIFEST_DIR");\n',
-      'src/lib_test.rs': 'const TEST_ROOT: &str = env!("CARGO_MANIFEST_DIR");\n',
-      'tests/integration.rs': 'const TEST_ROOT: &str = env!("CARGO_MANIFEST_DIR");\n',
+      'src/lib_test.rs': 'fn test_root() -> Option<&\'static str> { option_env!("CARGO_MANIFEST_DIR") }\n',
+      'tests/integration.rs': 'const TEST_ROOT: &str = concat!(env!( "CARGO_MANIFEST_DIR" ), "/fixture");\n',
     });
-    expect(result.failures).toBe(0);
-    expect(result.messages.join('\n')).toContain('Cargo cache policy advisories (informational only');
-    expect(result.messages.join('\n')).toContain('src/lib.rs:1');
-    expect(result.messages.join('\n')).toContain('patched sccache never normalises env-dep values');
-    expect(result.messages.join('\n')).not.toContain('src/lib_test.rs');
-    expect(result.messages.join('\n')).not.toContain('tests/integration.rs');
+    expect(result.failures).toBe(3);
+    const messages = result.messages.join('\n');
+    expect(messages).toContain('src/lib.rs:1');
+    expect(messages).toContain('src/lib_test.rs:1');
+    expect(messages).toContain('tests/integration.rs:1');
+    expect(messages).toContain('reads the files of the checkout that compiled it');
   });
 
-  it('ignores the macro named in a comment but still reports it in code', async () => {
+  it('ignores the macro named in a comment but refuses it in code', async () => {
     const result = await check({
       'src/documented.rs': [
         '/// A crate compiling env!("CARGO_MANIFEST_DIR") fails closed across paths.',
@@ -192,12 +195,20 @@ describe('Cargo cache policy', () => {
         '',
       ].join('\n'),
     });
-    expect(result.failures).toBe(0);
+    expect(result.failures).toBe(1);
     const messages = result.messages.join('\n');
     expect(messages).toContain('src/documented.rs:6');
     expect(messages).not.toContain('src/documented.rs:1');
     expect(messages).not.toContain('src/documented.rs:2');
     expect(messages).not.toContain('src/documented.rs:3');
+  });
+
+  it('lets a test read CARGO_MANIFEST_DIR at run time', async () => {
+    const result = await check({
+      'tests/integration.rs': 'fn root() -> String { std::env::var("CARGO_MANIFEST_DIR").unwrap() }\n',
+    });
+    expect(result.failures).toBe(0);
+    expect(result.messages).toEqual([]);
   });
 
   it('honours an explicit ignore marker for a non-hidden subtree', async () => {
