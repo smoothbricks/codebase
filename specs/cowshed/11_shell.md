@@ -40,13 +40,15 @@ expression, so a value placed there can assign shell variables. Clients refuse t
 host parses the text with an upstream `brush` parser, so a script that does not parse fails before anything runs: the
 job ends `failed` with `failure: scriptSyntax`, status 2 as bash gives, and the parser's diagnostic on its stderr. A
 script that parses runs in a child the host forks without exec, the way bash runs a subshell: the child leads the job's
-process group (the host sets it too, so the supervisor never signals a group not yet made), resets every signal the host
-handles to its default as an exec would, holds the job's descriptors as 0, 1 and 2, builds a brush interpreter from the
-already-activated environment (no activation, no rc files) with job control off, runs the program and exits with its
-status. Every external command and descendant the script starts is in the job's group, so a kill reaches all of them and
-never the host; a killed script dies by the signal and reports it exactly; `cd`, `umask`, `ulimit`, `trap` and `exec`
-end with the child. The interpreter lives only in the host binary (the `cowshed-shell` crate), not in the supervisor
-library or its Node addon.
+process group and is the only process that creates it (two creations of one group race, and macOS refuses the loser with
+`EPERM`), and it reports once the group exists, so the host gives the supervisor the pid only then and the supervisor
+never signals a group not yet made. A child that cannot lead its group says why on the job's stderr and exits 126. The
+child resets every signal the host handles to its default as an exec would, holds the job's descriptors as 0, 1 and 2,
+builds a brush interpreter from the already-activated environment (no activation, no rc files) with job control off,
+runs the program and exits with its status. Every external command and descendant the script starts is in the job's
+group, so a kill reaches all of them and never the host; a killed script dies by the signal and reports it exactly;
+`cd`, `umask`, `ulimit`, `trap` and `exec` end with the child. The interpreter lives only in the host binary (the
+`cowshed-shell` crate), not in the supervisor library or its Node addon.
 
 **Freshness is direnv's own.** direnv records every input an evaluation depended on — the `.envrc`, its approval files,
 each `source_up`, `use devenv` and `watch_file` target — as `DIRENV_WATCHES` (base64url of zlib-deflated JSON

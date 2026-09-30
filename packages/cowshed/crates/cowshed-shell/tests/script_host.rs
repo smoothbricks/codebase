@@ -142,6 +142,10 @@ fn run_on(
                 assert_eq!(tag, REPLY_EXITED);
                 (Some(pid), Some(fields.i32().unwrap()))
             }
+            REPLY_HOST_FAILED => panic!(
+                "the host failed: {}",
+                String::from_utf8_lossy(fields.bytes().unwrap())
+            ),
             other => panic!("unexpected reply {other}"),
         };
         let [stdout, stderr] = readers.map(|reader| reader.join().expect("stream reader"));
@@ -287,6 +291,45 @@ fn killing_a_script_job_group_reaches_its_grandchildren_and_spares_the_host() {
         "the host is not in the job's group"
     );
     assert_eq!(host.run(&text("printf again")).stdout, "again");
+}
+
+/// Scripts forked at once each run whole. Two creations of one process group race, and macOS
+/// refuses the loser with `EPERM`: were the host to create the child's group too, a refused
+/// child would end its script with 126 before it ran and a refused host would end itself.
+/// Several hosts forking back to back make the race likely.
+#[test]
+fn scripts_forked_at_once_each_run_whole() {
+    // Every host starts before any job pipe exists, so no host inherits another's pipe end.
+    let hosts: Vec<Host> = (0..8)
+        .map(|index| Host::start(&format!("burst-{index}")))
+        .collect();
+    let workers: Vec<_> = hosts
+        .into_iter()
+        .map(|mut host| {
+            std::thread::spawn(move || {
+                (0..100)
+                    .map(|_| host.run(&text("printf x")))
+                    .filter(|ran| ran.stdout != "x" || exited(ran.status) != Some(0))
+                    .map(|ran| {
+                        format!(
+                            "stdout {:?}, status {:?}, stderr {:?}",
+                            ran.stdout, ran.status, ran.stderr
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+        })
+        .collect();
+    let failures: Vec<String> = workers
+        .into_iter()
+        .flat_map(|worker| worker.join().expect("the host replied to every script"))
+        .collect();
+    assert!(
+        failures.is_empty(),
+        "{} of 800 scripts did not run:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
 }
 
 #[test]

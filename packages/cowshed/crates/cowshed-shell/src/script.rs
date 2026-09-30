@@ -5,7 +5,9 @@
 //!
 //! - leads a new process group, the job's: brush runs with job control off, so every external
 //!   command and every descendant joins that group, and the supervisor's TERM → grace → KILL
-//!   reaches all of them while the host, in a group of its own, is untouched;
+//!   reaches all of them while the host, in a group of its own, is untouched. The child alone
+//!   creates the group, and the host gives the supervisor the pid only once the child reports
+//!   that it exists;
 //! - holds the job's stdin, stdout and stderr as its own 0, 1 and 2, and nothing else the host
 //!   had open;
 //! - builds a brush shell from the host's already-activated environment — no activation, no rc
@@ -19,7 +21,7 @@
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::io::{self, Write as _};
-use std::os::fd::{AsRawFd as _, OwnedFd};
+use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 
@@ -83,6 +85,8 @@ pub(crate) fn run(
         }))
         .collect();
     let job_descriptors = [stdin.as_raw_fd(), stdout.as_raw_fd(), stderr.as_raw_fd()];
+    let (ready_read, ready_write) = close_on_exec_pipe()?;
+    let ready = [ready_read.as_raw_fd(), ready_write.as_raw_fd()];
 
     // SAFETY: the host is single-threaded here (no activation guard thread exists outside an
     // activation), so the child starts with a consistent heap and no lock held by another
@@ -92,24 +96,30 @@ pub(crate) fn run(
         return Err(io::Error::last_os_error());
     }
     if pid == 0 {
-        child(job_descriptors, cwd, variables, program);
+        child(job_descriptors, ready, cwd, variables, program);
     }
-    drop((stdin, stdout, stderr));
-    // Both sides set the group, as a job-control shell does: the child may not have run yet, and
-    // the supervisor signals the group the moment it learns the pid.
-    // SAFETY: `pid` is this host's own child, which never execs.
-    if unsafe { libc::setpgid(pid, pid) } != 0 {
-        let error = io::Error::last_os_error();
-        // ESRCH: the child already exited, in the group it set itself.
-        if error.raw_os_error() != Some(libc::ESRCH) {
-            // SAFETY: killing and reaping this host's own child, which nothing else waits for.
-            unsafe {
-                libc::kill(pid, libc::SIGKILL);
-                libc::waitpid(pid, std::ptr::null_mut(), 0);
+    drop((stdin, stdout, stderr, ready_write));
+    // The supervisor signals the job's group the moment it learns the pid, so the group must
+    // exist first. Only the child creates it: two creations of one group race, and macOS
+    // refuses the loser with EPERM. The child reports once its group exists; an end of file
+    // means it ended before it could.
+    let mut ready = std::fs::File::from(ready_read);
+    loop {
+        match io::Read::read(&mut ready, &mut [0_u8]) {
+            Ok(_) => break,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => {
+                // SAFETY: killing and reaping this host's own child, which nothing else waits
+                // for.
+                unsafe {
+                    libc::kill(pid, libc::SIGKILL);
+                    libc::waitpid(pid, std::ptr::null_mut(), 0);
+                }
+                return Err(error);
             }
-            return Err(error);
         }
     }
+    drop(ready);
     let pid_u32 = u32::try_from(pid).map_err(io::Error::other)?;
     reply(socket, FrameWriter::new(REPLY_STARTED).u32(pid_u32))?;
     let mut status = 0;
@@ -127,9 +137,41 @@ pub(crate) fn run(
     reply(socket, FrameWriter::new(REPLY_EXITED).i32(status))
 }
 
+/// A pipe whose ends close in any program the job execs.
+fn close_on_exec_pipe() -> io::Result<(OwnedFd, OwnedFd)> {
+    let mut ends = [0; 2];
+    // SAFETY: room for the two descriptors pipe(2) writes; each is owned from here on.
+    let (read, write) = unsafe {
+        if libc::pipe(ends.as_mut_ptr()) != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        (OwnedFd::from_raw_fd(ends[0]), OwnedFd::from_raw_fd(ends[1]))
+    };
+    for end in [&read, &write] {
+        // SAFETY: plain fcntl on a descriptor this function owns.
+        if unsafe { libc::fcntl(end.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok((read, write))
+}
+
+/// Tell the job, on its stderr, why its script cannot run, and end the child with the status
+/// a shell gives a command it cannot execute.
+fn refuse(stderr: i32, what: &str, error: io::Error) -> ! {
+    // SAFETY: `stderr` is the job's stderr, open in this child; `ManuallyDrop` leaves it open,
+    // and `_exit` ends the child without the host's destructors.
+    unsafe {
+        let file = std::mem::ManuallyDrop::new(std::fs::File::from_raw_fd(stderr));
+        let _ = writeln!(&*file, "cowshed: the script {what}: {error}");
+        libc::_exit(126)
+    }
+}
+
 /// The forked child: never returns.
 fn child(
     [stdin, stdout, stderr]: [i32; 3],
+    [ready_read, ready_write]: [i32; 2],
     cwd: &Path,
     variables: Vec<(String, brush_core::ShellVariable)>,
     program: brush_parser::ast::Program,
@@ -140,12 +182,25 @@ fn child(
     // `sigaction` query writes one zeroed `sigaction` it is handed.
     unsafe {
         libc::close(CONTROL_DESCRIPTOR);
+        libc::close(ready_read);
         if libc::setpgid(0, 0) != 0 {
-            libc::_exit(126);
+            refuse(
+                stderr,
+                "cannot lead a process group of its own",
+                io::Error::last_os_error(),
+            );
         }
+        // The group exists: the host may give the supervisor this pid. A host that stopped
+        // reading has nothing to learn, so a failed write changes nothing here.
+        libc::write(ready_write, [1_u8].as_ptr().cast(), 1);
+        libc::close(ready_write);
         for (target, source) in [(0, stdin), (1, stdout), (2, stderr)] {
             if libc::dup2(source, target) < 0 {
-                libc::_exit(126);
+                refuse(
+                    stderr,
+                    "cannot take the job's streams",
+                    io::Error::last_os_error(),
+                );
             }
         }
         for source in [stdin, stdout, stderr] {
