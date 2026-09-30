@@ -660,12 +660,13 @@ impl<A: Activator> PoolActor<A> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::shell_watch::WatchEntry;
+    use crate::runtime::shell_watch::{FsInstant, WatchEntry};
     use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::{Duration, SystemTime};
+    use std::time::Duration;
 
     /// Hosts are numbers; each activation records the fixture's input files.
     struct Fixture {
+        root: PathBuf,
         inputs: Vec<PathBuf>,
         activations: AtomicU64,
         /// While set, activations touch the first input mid-evaluation.
@@ -680,7 +681,7 @@ mod tests {
         async fn activate(&self, predicted: Vec<PathBuf>, _output: Option<()>) -> Activation<u64> {
             let host = self.activations.fetch_add(1, Ordering::SeqCst) + 1;
             let before = Snapshot::take(predicted.iter().map(PathBuf::as_path));
-            let started = SystemTime::now();
+            let started = FsInstant::separating(&self.root).unwrap();
             if self.disturb.load(Ordering::SeqCst) {
                 std::fs::write(&self.inputs[0], host.to_string()).unwrap();
             }
@@ -698,7 +699,7 @@ mod tests {
                 evidence: Ok(ActivationEvidence {
                     entries,
                     before,
-                    started,
+                    started: Some(started),
                     after,
                 }),
             }
@@ -716,10 +717,9 @@ mod tests {
         for input in &inputs {
             std::fs::write(input, b"initial").unwrap();
         }
-        // Inputs written now must predate the first activation's start by ctime.
-        std::thread::sleep(Duration::from_millis(5));
         (
             Arc::new(Fixture {
+                root: root.clone(),
                 inputs,
                 activations: AtomicU64::new(0),
                 disturb: std::sync::atomic::AtomicBool::new(false),

@@ -52,16 +52,22 @@ library or its Node addon.
 each `source_up`, `use devenv` and `watch_file` target — as `DIRENV_WATCHES` (base64url of zlib-deflated JSON
 `[{path, modtime, exists}]`) and reloads when any of them changes. The supervisor decodes that list from each
 activation, subscribes the listed paths with the kernel (kqueue `EVFILT_VNODE` on macOS, inotify on Linux; the nearest
-existing ancestor for an input recorded as absent), and keeps the exact identity — device, inode, size, and nanosecond
-mtime and ctime — each had when the activation finished. direnv's whole-second `modtime` is never compared. A kernel
-event only sets the pool's dirty flag, however many inputs changed. The next command acts on it, never the event: if the
-flag is set, or an in-process stat of the listed paths finds an identity changed (the backstop for coalesced events),
-every idle host and the spare are retired and a fresh host activates for that command; a host still executing finishes
-its command and is dropped instead of returned. An activation whose own inputs moved while it ran — an input the
-previous generation listed changed identity across the evaluation, or a newly listed input's ctime is later than the
-evaluation's start — serves the command that paid for it and is never reused. A change to a path not on the list costs
-nothing. The repository decides what else counts as shell input with `watch_file`: lockfiles and devenv inputs whose
-change must rerun shell entry.
+existing ancestor for an input recorded as absent), and keeps the exact identity — device, inode, size, mtime and ctime
+at the filesystem's timestamp resolution — each had when the activation finished. direnv's whole-second `modtime` is
+never compared. Where timestamps are coarse (a scheduler tick on Linux without multigrain timestamps, a second on HFS+)
+two same-size writes inside one tick share an identity, and the kernel subscription is what reports them. A kernel event
+only sets the pool's dirty flag, however many inputs changed. The next command acts on it, never the event: if the flag
+is set, or an in-process stat of the listed paths finds an identity changed (the backstop for coalesced events), every
+idle host and the spare are retired and a fresh host activates for that command; a host still executing finishes its
+command and is dropped instead of returned. An activation whose own inputs moved while it ran — an input the previous
+generation listed changed identity across the evaluation, or a newly listed input's ctime is not earlier than the
+evaluation's start — serves the command that paid for it and is never reused. The start is read off the workspace
+filesystem's own clock, never the process clock, which runs up to a tick ahead of the stamps a coarse clock gives: the
+supervisor stamps a file of its own in the protected host directory, and stamps again until the clock has moved past the
+first, so every change before the start, the approval's included, stamps earlier and every change after it stamps no
+earlier. An input on another filesystem, which may stamp in whole seconds, must predate the start's second. A change to
+a path not on the list costs nothing. The repository decides what else counts as shell input with `watch_file`:
+lockfiles and devenv inputs whose change must rerun shell entry.
 
 **One spare and a SIEVE cache.** Hosts are pooled per shell identity: effective sandbox mode, `.envrc` directory, grant
 revision, the exact sandbox environment, and the host program. A read-only command never runs in a read-write host, and

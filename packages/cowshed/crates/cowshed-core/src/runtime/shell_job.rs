@@ -17,7 +17,6 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
-use std::time::SystemTime;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -32,7 +31,7 @@ use super::shell_host::{
     send_with_descriptors,
 };
 use super::shell_pool::{Acquired, Activation, Activator, ShellPool, ShellPoolConfig};
-use super::shell_watch::{ActivationEvidence, Snapshot, decode_direnv_watches};
+use super::shell_watch::{ActivationEvidence, FsInstant, Snapshot, decode_direnv_watches};
 use super::supervisor::{
     ProcessEvent, ProcessSignal, RunningProcess, SandboxEnvironment, StdinLane, kill_process_group,
     process_termination_from_wait, run_system_output, run_system_stdin,
@@ -767,11 +766,10 @@ impl HostActivator {
     ) -> HostActivation {
         let Some(envrc_directory) = &self.envrc_directory else {
             // Nothing to evaluate and nothing to watch: the generation never goes stale.
-            let now = SystemTime::now();
             return HostActivation::Ready(Ok(ActivationEvidence {
                 entries: Vec::new(),
                 before: Snapshot::default(),
-                started: now,
+                started: None,
                 after: Snapshot::default(),
             }));
         };
@@ -799,9 +797,19 @@ impl HostActivator {
             Ok(status) => return HostActivation::Failed { status },
             Err(error) => return HostActivation::Broken(error),
         }
-        // Taken after approval, which rewrites direnv's allow file, and before evaluation.
+        // Taken after approval, which rewrites direnv's allow file, and before evaluation. The
+        // start is read off the workspace filesystem's clock, which stamps the inputs; waiting
+        // for it to move past the approval costs at most one stamping tick.
         let before = Snapshot::take(predicted.iter().map(PathBuf::as_path));
-        let started = SystemTime::now();
+        let clock = self.workspace_mount.join(SHELL_HOST_DIRECTORY);
+        let started = match tokio::task::spawn_blocking(move || FsInstant::separating(&clock)).await
+        {
+            Ok(Ok(started)) => Ok(started),
+            Ok(Err(error)) => Err(format!(
+                "cannot read the workspace filesystem's clock: {error}"
+            )),
+            Err(error) => Err(format!("the filesystem clock task failed: {error}")),
+        };
         let request = FrameWriter::new(REQUEST_ACTIVATE)
             .bytes(envrc_directory.as_os_str().as_bytes())
             .and_then(FrameWriter::finish);
@@ -852,21 +860,20 @@ impl HostActivator {
             Ok(ActivateReply::Activated(None)) => {
                 HostActivation::Ready(Err("the activation recorded no DIRENV_WATCHES".into()))
             }
-            Ok(ActivateReply::Activated(Some(watches))) => {
-                HostActivation::Ready(match decode_direnv_watches(&watches) {
-                    Ok(entries) => {
+            Ok(ActivateReply::Activated(Some(watches))) => HostActivation::Ready(
+                decode_direnv_watches(&watches)
+                    .map_err(|error| error.to_string())
+                    .and_then(|entries| {
                         let after =
                             Snapshot::take(entries.iter().map(|entry| entry.path.as_path()));
                         Ok(ActivationEvidence {
                             entries,
                             before,
-                            started,
+                            started: Some(started?),
                             after,
                         })
-                    }
-                    Err(error) => Err(error.to_string()),
-                })
-            }
+                    }),
+            ),
         }
     }
 }

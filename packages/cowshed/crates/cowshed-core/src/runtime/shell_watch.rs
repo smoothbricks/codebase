@@ -9,12 +9,19 @@
 //!
 //! direnv's own `modtime` is whole seconds, so two writes inside one second are invisible to
 //! it. It is never compared here; only its `exists` bit, which is exact, is.
+//!
+//! A file's timestamps come from the kernel's stamping clock at its filesystem's granularity,
+//! not from the process clock: Linux without multigrain timestamps stamps from a clock up to a
+//! scheduler tick behind `SystemTime::now()`, and HFS+ keeps whole seconds. So a file written
+//! after a `now()` reading can carry an earlier ctime, and nothing here compares a timestamp
+//! with the process clock. When an activation starts is read off the filesystem's own clock
+//! ([`FsInstant`]).
 
 use std::collections::BTreeMap;
 use std::io;
 use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::time::Duration;
 
 use base64::Engine as _;
 
@@ -92,9 +99,10 @@ pub fn decode_direnv_watches(encoded: &str) -> Result<Vec<WatchEntry>, WatchList
 
 /// The exact identity of one watched path, following symlinks as direnv does.
 ///
-/// `(dev, ino, size, mtime, ctime)` at nanosecond resolution: a rewrite inside the same second
-/// changes mtime or ctime, an atomic replace changes the inode, and ctime cannot be set by any
-/// user tool, so a content change that restores mtime still shows.
+/// `(dev, ino, size, mtime, ctime)` at the filesystem's timestamp resolution: an atomic replace
+/// changes the inode, and ctime cannot be set by any user tool, so a content change that
+/// restores mtime still shows. Two same-size writes inside one timestamp tick (a coarse Linux
+/// clock tick, an HFS+ second) share an identity; the kernel subscription reports those.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FileState {
     Missing,
@@ -140,10 +148,77 @@ fn nanoseconds(seconds: i64, nanoseconds: i64) -> i128 {
     i128::from(seconds) * 1_000_000_000 + i128::from(nanoseconds)
 }
 
-fn system_time_ns(time: SystemTime) -> i128 {
-    match time.duration_since(SystemTime::UNIX_EPOCH) {
-        Ok(after) => i128::try_from(after.as_nanos()).unwrap_or(i128::MAX),
-        Err(before) => -i128::try_from(before.duration().as_nanos()).unwrap_or(i128::MAX),
+/// Longest wait for a filesystem's clock to move past a reading: a stamping tick where
+/// timestamps are fine or tick-grained, one second where they are whole seconds.
+const CLOCK_ADVANCE_BOUND: Duration = Duration::from_secs(3);
+
+const NANOS_PER_SECOND: i128 = 1_000_000_000;
+
+/// A reading of one filesystem's own timestamp clock: the ctime a file the reader created
+/// there was stamped with.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FsInstant {
+    dev: u64,
+    ctime_ns: i128,
+}
+
+impl FsInstant {
+    /// A reading in `directory` that separates every change completed there before the call,
+    /// which stamps strictly earlier, from every change after it, which stamps no earlier.
+    ///
+    /// A first stamp is no earlier than any change before it; stamping again until the clock
+    /// moves past that one yields the reading. Blocks for at most one stamping tick of the
+    /// filesystem: none where timestamps are fine-grained.
+    pub fn separating(directory: &Path) -> io::Result<Self> {
+        let floor = Self::stamp(directory)?;
+        let deadline = std::time::Instant::now() + CLOCK_ADVANCE_BOUND;
+        loop {
+            let reading = Self::stamp(directory)?;
+            if reading.ctime_ns > floor.ctime_ns {
+                return Ok(reading);
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!(
+                        "the filesystem clock under {} did not advance in {CLOCK_ADVANCE_BOUND:?}",
+                        directory.display()
+                    ),
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// Create a file in `directory`, keep the ctime it was stamped with, and remove it.
+    fn stamp(directory: &Path) -> io::Result<Self> {
+        let path = directory.join(format!(".clock-{}", uuid::Uuid::new_v4().simple()));
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)?;
+        let metadata = file.metadata();
+        let removed = std::fs::remove_file(&path);
+        let metadata = metadata?;
+        removed?;
+        Ok(Self {
+            dev: metadata.dev(),
+            ctime_ns: nanoseconds(metadata.ctime(), metadata.ctime_nsec()),
+        })
+    }
+
+    /// Whether a file on `dev` whose ctime is `ctime_ns` last changed before this reading.
+    ///
+    /// On the reading's own filesystem the comparison is exact. Another filesystem may stamp
+    /// more coarsely, down to whole seconds, which truncates a later change to before the
+    /// reading within its second; there only a ctime before the reading's second is earlier.
+    fn precedes(self, dev: u64, ctime_ns: i128) -> bool {
+        let bound = if dev == self.dev {
+            self.ctime_ns
+        } else {
+            self.ctime_ns - self.ctime_ns.rem_euclid(NANOS_PER_SECOND)
+        };
+        ctime_ns < bound
     }
 }
 
@@ -184,8 +259,9 @@ pub struct ActivationEvidence {
     pub entries: Vec<WatchEntry>,
     /// Identities of the previous generation's inputs, taken just before evaluation began.
     pub before: Snapshot,
-    /// When evaluation began, after approval and before `direnv export` ran.
-    pub started: SystemTime,
+    /// Read off the workspace filesystem's clock after approval and before `direnv export`
+    /// ran; `None` when no evaluation ran.
+    pub started: Option<FsInstant>,
     /// Identities of `entries` taken as soon as evaluation finished.
     pub after: Snapshot,
 }
@@ -194,11 +270,11 @@ impl ActivationEvidence {
     /// Whether every input the activation read stayed put while it ran.
     ///
     /// An input the previous generation also watched must be identical before and after. An
-    /// input first seen by this activation has no earlier identity, so its ctime must predate
-    /// the start: ctime moves on every content, rename or metadata change and no tool can set
-    /// it back. direnv's existence bit, which is exact, must agree with what is there now.
+    /// input first seen by this activation has no earlier identity, so it must have last
+    /// changed before the start: ctime moves on every content, rename or metadata change and no
+    /// tool can set it back. direnv's existence bit, which is exact, must agree with what is
+    /// there now.
     pub fn stable(&self) -> bool {
-        let started = system_time_ns(self.started);
         self.entries.iter().all(|entry| {
             let Some(now) = self.after.get(&entry.path) else {
                 return false;
@@ -206,7 +282,9 @@ impl ActivationEvidence {
             let unchanged = match self.before.get(&entry.path) {
                 Some(before) => before == now,
                 None => match now {
-                    FileState::Present { ctime_ns, .. } => ctime_ns < started,
+                    FileState::Present { dev, ctime_ns, .. } => self
+                        .started
+                        .is_some_and(|started| started.precedes(dev, ctime_ns)),
                     FileState::Missing | FileState::Unreadable(_) => true,
                 },
             };
@@ -547,15 +625,62 @@ mod tests {
     }
 
     #[test]
-    fn two_writes_inside_one_second_are_two_identities() {
-        let root = scratch("same-second");
+    fn a_same_size_rewrite_once_the_clock_moved_is_a_new_identity() {
+        let root = scratch("same-size");
         let file = root.join("watched.lock");
         std::fs::write(&file, b"one").unwrap();
         let first = Snapshot::take([file.as_path()]);
-        // Same size, same second: only nanosecond mtime/ctime tell these apart.
+        FsInstant::separating(&root).unwrap();
+        // Same size, same inode: only the stamps tell these apart.
         std::fs::write(&file, b"two").unwrap();
         assert!(first.changed_since());
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_reading_separates_the_changes_before_it_from_those_after() {
+        let root = scratch("separating");
+        let earlier = root.join("earlier");
+        let later = root.join("later");
+        for _ in 0..5 {
+            std::fs::write(&earlier, b"e").unwrap();
+            let reading = FsInstant::separating(&root).unwrap();
+            std::fs::write(&later, b"l").unwrap();
+            let stamp = |path: &Path| match FileState::of(path) {
+                FileState::Present { dev, ctime_ns, .. } => (dev, ctime_ns),
+                other => panic!("{} is {other:?}", path.display()),
+            };
+            let (dev, ctime_ns) = stamp(&earlier);
+            assert!(
+                reading.precedes(dev, ctime_ns),
+                "a change before the reading"
+            );
+            let (dev, ctime_ns) = stamp(&later);
+            assert!(
+                !reading.precedes(dev, ctime_ns),
+                "a change after the reading"
+            );
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn another_filesystems_input_must_predate_the_readings_second() {
+        let second = NANOS_PER_SECOND;
+        let reading = FsInstant {
+            dev: 1,
+            ctime_ns: 10 * second + 500,
+        };
+        assert!(reading.precedes(1, 10 * second + 499));
+        assert!(
+            !reading.precedes(1, 10 * second + 500),
+            "a tie is not earlier"
+        );
+        assert!(
+            !reading.precedes(2, 10 * second),
+            "a whole-second stamp inside the reading's second may be a later change"
+        );
+        assert!(reading.precedes(2, 10 * second - 1));
     }
 
     #[test]
@@ -587,7 +712,7 @@ mod tests {
             },
         ];
         let before = Snapshot::take([known.as_path()]);
-        let started = SystemTime::now();
+        let started = Some(FsInstant::separating(&root).unwrap());
         let after = Snapshot::take([known.as_path(), new.as_path()]);
         let evidence = ActivationEvidence {
             entries: entries.clone(),
@@ -617,19 +742,20 @@ mod tests {
         let evidence = ActivationEvidence {
             entries: vec![entries[0].clone()],
             before,
-            started: SystemTime::now(),
+            started,
             after: Snapshot::take([known.as_path()]),
         };
         assert!(!evidence.stable(), "a known input rewritten mid-evaluation");
 
-        // direnv recorded the input as absent but it exists by the end.
+        // direnv recorded the input as absent but it exists by the end, and did so before the
+        // activation started.
         let evidence = ActivationEvidence {
             entries: vec![WatchEntry {
                 path: known.clone(),
                 exists: false,
             }],
             before: Snapshot::default(),
-            started: SystemTime::now(),
+            started: Some(FsInstant::separating(&root).unwrap()),
             after: Snapshot::take([known.as_path()]),
         };
         assert!(
