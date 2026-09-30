@@ -240,8 +240,8 @@ Budget: ≤ 1 s cold. No pool, no pre-warming.
    `portBlock`; after the dataset is mounted, create and bind-mount the per-incarnation Unix gateway socket and launch
    the trusted connector inside the workspace's private netns on `127.0.0.1:7644` (04_sandbox.md/05_gateway.md). Mark
    `<mount>/.envrc` direnv-trusted. In-image Bun, Cargo, Go, and proxy wiring uses the platform endpoint, and tool shims
-   are placed at `.cowshed/bin/`; there is no git network wiring — workspace git is local-only (see "Remote code
-   ingress").
+   are placed at `.cowshed/bin/`; git reaches the network only through the gateway, like every other client (see "Remote
+   code ingress").
 6. Re-resolve inherited escaping symlinks. A relative symlink whose target climbs above the tree root (the entry
    `bun install` writes for a `link:` dependency, say) was computed against main's depth and lands somewhere else at the
    workspace's mount depth, so it is rewritten to the absolute path it named in main; one whose target does not exist in
@@ -612,9 +612,10 @@ images are excluded from backup by design (01_storage.md).
 
 ## Remote code ingress: `cowshed repo`
 
-Sandboxed git speaks only local paths. A workspace's remotes are the `main` remote (main's canonical mount) and
-read-only bare mirrors on the caches volume — never a network URL. There is no git endpoint on the gateway data plane
-and no credential helper inside any workspace.
+A workspace's own remote is the `main` remote (main's canonical mount). Git reaches the network only as every other
+client does — through the gateway, to a host the workspace holds an intercepted egress grant for — and only to fetch: an
+intercept grant admits git's smart-HTTP `git-upload-pack` and refuses `git-receive-pack` (05_gateway.md "Egress modes").
+There is no git endpoint on the gateway data plane and no credential helper inside any workspace.
 
 Dependency fetches by URL (Cargo git dependencies, uv git sources, `git ls-remote`) resolve through **fetch routes**: a
 controller-generated, ignored `.cowshed/git-fetch.inc` that every child includes, rewriting each bound identity URL of
@@ -862,13 +863,14 @@ detached. A standalone `.git` arrives via CoW at zero marginal cost and the pull
 shared-state semantics with an explicit, auditable hand-back — so clone is what `cowshed new` does. `--git-worktree`
 takes the trade deliberately, per workspace, and gives up checkpoint and restore for it (see "Git-worktree workspaces").
 
-**Gatewaying git rejected — workspace git is local-only.** A smart-HTTP credential broker on the gateway would let
-sandboxed git reach real remotes, reintroducing in-sandbox push, a git wire protocol to proxy faithfully, and
+**A git credential broker rejected — sandboxed git fetches, never pushes.** A smart-HTTP credential broker on the
+gateway would let sandboxed git reach real remotes with push, a git wire protocol to proxy faithfully, and
 host-granularity policy that git defeats: Anthropic's sandbox-runtime README warns that allowlisting github.com lets a
 process push to any repository (https://github.com/anthropic-experimental/sandbox-runtime), and yolo-cage had to build
-an entire git-command classifier to police in-sandbox remote git (https://github.com/borenstein/yolo-cage). Local-only
-git removes the class: ingress is a gateway-executed mirror fetch (`cowshed repo`), egress is a controller
-fetch-from-workspace (`cowshed push`), and no credential or remote URL ever exists inside a sandbox.
+an entire git-command classifier to police in-sandbox remote git (https://github.com/borenstein/yolo-cage). Admitting
+exactly `git-upload-pack` on an intercepted grant keeps fetch and removes the class: a push is `git-receive-pack`, which
+no grant admits; work leaves a workspace as a controller fetch-from-workspace (`cowshed push`); and no credential exists
+inside a sandbox.
 
 **hdiutil shadow files rejected.** Shadows share only a frozen base (identical to what clonefile already provides),
 measure 2.3× slower on synchronous writes, and pin their base image against deletion. Clones have no runtime dependency

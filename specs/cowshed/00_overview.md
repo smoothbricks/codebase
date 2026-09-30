@@ -87,14 +87,6 @@ connector at `127.0.0.1:7644`; that connector relays only to the workspace's bin
 socket. Thus ordinary Bun, Cargo, Go, and proxy-aware clients keep standard localhost HTTP URLs while the socket inode
 plus network namespace remains the primary Linux workspace identity (04_sandbox.md/05_gateway.md).
 
-**Git never crosses the network from inside a workspace.** A workspace's git speaks only to local paths: the `main`
-remote (main's mount, fetch-only for rebase) and read-only bare mirrors on the cache volume. Pulling a new upstream repo
-is a gateway _control-plane_ verb (`cowshed repo mirror`, 06_cli.md/05_gateway.md), never in-sandbox git-over-HTTPS;
-publishing to a real origin is coordinator work, host-side, outside any sandbox (02_workspaces.md). The gateway box
-therefore carries npm/cargo mirrors, **per-workspace-CA TLS interception** as the default for granted egress hosts (with
-an `--opaque` CONNECT fallback for pinned clients — 05_gateway.md), and the repo-mirror verb — no git credential broker.
-The workspace holds only public trust anchors; the CA private key stays with the gateway.
-
 The `<owner>/<repo>` pair is the primary project `repo_id`: lowercase `owner/repo` normalized from an explicitly
 selected remote URL, stable across machines and checkout moves. The controller records that repository binding,
 validates it on every open, permits multiple bound identities with exactly one primary, and requires an explicit

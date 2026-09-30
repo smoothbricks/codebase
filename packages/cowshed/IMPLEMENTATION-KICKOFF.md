@@ -44,11 +44,10 @@ directly, Bun/Node applications use `cowshed-napi`, and shell-based agents use t
   workspace identity = in-image `.cowshed/workspace.json`; grants and repository binding metadata are controller-owned
   and outside the workspace. No image pooling. Per-workspace supervisors and the optional MCP server hold no
   authoritative lifecycle state.
-- **Local-only git and coordinator-owned mirrors**: workspace git touches only local paths: the `main` remote and
-  gateway-owned, sandbox-read-only bare mirrors on the cache volume. Mirror creation and refresh are
-  coordinator/control- plane operations using host-held credentials; workspaces may read mirrors but can never
-  configure, update, or write them. Publishing to a real origin is also coordinator work outside every sandbox. There is
-  no in-sandbox Git-over-HTTPS, credential helper, `insteadOf` rewrite, SSH proxy, or data-plane Git protocol.
+- **Fetch-only git**: workspace git fetches from the `main` remote, from the local clones the controller-generated
+  `.cowshed/git-fetch.inc` rewrites bound repository URLs to, and over HTTPS only through an intercepted egress grant,
+  which admits `git-upload-pack` and refuses `git-receive-pack`. Publishing to a real origin is coordinator work outside
+  every sandbox. There is no in-sandbox credential helper, SSH proxy, or data-plane git protocol.
 - **Push/autosave direction is host-side**: `cowshed push` and the autosave net are the _host_ fetching from the
   workspace mount (`git fetch <mount> +cowshed/<ws>:…`), never the sandbox running `git push` against agent-controlled
   `.git` config/hooks. Autosave ref namespace: `refs/cowshed/<ws>/wip`.
@@ -99,9 +98,9 @@ directly, Bun/Node applications use `cowshed-napi`, and shell-based agents use t
   caches volume). Wired by an in-image `GOENV` file at `.cowshed/cache/go/env` carrying the per-workspace
   `GOPROXY=http://127.0.0.1:<base>/go` (no `,direct`), reached via the `GOENV` export riding `.envrc`/direnv — Go has no
   directory-scoped config, so this is a second load-bearing export beside the token candidate. New gateway endpoint:
-  `/go` GOPROXY mirror with sumdb passthrough and private-module credential injection (workspace git is local-only, so
-  the proxy IS the private-module path). `~/go` is deny-listed as a misconfiguration tripwire (04_sandbox.md). Specs:
-  03_caches.md, 04_sandbox.md, 05_gateway.md.
+  `/go` GOPROXY mirror with sumdb passthrough and private-module credential injection (workspace git reaches a forge
+  only through a grant, fetch-only, so the proxy IS the private-module path). `~/go` is deny-listed as a
+  misconfiguration tripwire (04_sandbox.md). Specs: 03_caches.md, 04_sandbox.md, 05_gateway.md.
 - **iOS/Xcode topology (posture B)**: Xcode has no remote mode and Simulator.app cannot attach cross-uid, so the
   **personal-session simulator is an artifact host** (human inspection, fed by the one-way drop dir
   `<shared-drop-root>/<owner>/<repo>/`, using the separately validated components of the primary `repo_id`, via

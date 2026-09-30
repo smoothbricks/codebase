@@ -45,10 +45,10 @@ Five jobs:
    only when trusted policy for the current `repo_id` admits their exact origin and package/module prefix. Repository
    config may request or further restrict a route, but cannot admit itself. Artifacts are digest-checked and cached
    once.
-2. **Repo mirrors.** Git is local-paths-only inside workspaces. Mirror fetch is a coordinator-only control-plane action,
-   bound to the current project and its trusted repository admission. A sandbox token cannot invoke it; admission or a
-   mirror for one project grants nothing to another. Fetches use gateway-owned config and credentials, and resulting
-   bare mirrors are sandbox-readable but never sandbox-writable. Pushes remain host-side coordinator work.
+2. **Repo mirrors.** Mirror fetch is a coordinator-only control-plane action, bound to the current project and its
+   trusted repository admission. A sandbox token cannot invoke it; admission or a mirror for one project grants nothing
+   to another. Fetches use gateway-owned config and credentials, and resulting bare mirrors are sandbox-readable but
+   never sandbox-writable. Pushes remain host-side coordinator work.
 3. **Intercepted egress.** `cowshed grant <ws> --egress <host>` defaults to interception. CONNECT authority, port, TLS
    SNI, and HTTP authority must agree before the gateway opens an upstream connection. The gateway verifies upstream
    TLS, strips client authorization, injects only a credential whose exact origin, project, method, and normalized path

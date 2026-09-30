@@ -763,10 +763,11 @@ denial.
 
 ## Git
 
-Workspace git is **local-paths-only**: every workspace has the `main` remote (main's repository, a mounted path) and can
-clone from read-only mirrors under `/private/cowshed/caches/repo-mirrors` — nothing else. No remote URLs, no
-credentials, no credential helpers exist inside a workspace; pushing to real remotes (origin, GitHub) is coordinator
-work, done host-side with your normal git setup.
+Workspace git fetches from the `main` remote (main's repository, a mounted path), from the local clone an adopted
+repository's URLs are rewritten to, and over HTTPS from a host the workspace holds an intercepted egress grant for —
+fetch only: the gateway admits `git-upload-pack` and refuses `git-receive-pack`. No credentials or credential helpers
+exist inside a workspace; pushing to real remotes (origin, GitHub) is coordinator work, done host-side with your normal
+git setup.
 
 ### `cowshed push <name> [--branch <b>]`
 

@@ -32,9 +32,8 @@ The coordinator is the sole mutating authority for create, fork, grant, revoke, 
 `WorkspaceHandle` is non-escalating and scoped to one workspace: it can run and observe jobs, checkpoint, and push, but
 cannot modify grants, destroy workspaces, refresh mirrors, or reach siblings.
 
-Workspace Git uses local paths only: the main mount and coordinator-created, gateway-owned bare mirrors. Mirrors are
-sandbox-read-only and use host-held credentials on the control plane. A workspace may read a mirror but can never
-configure, update, or write it. Remote publication is coordinator work outside the sandbox.
+Workspace Git fetches from the main mount, and from the network only through an intercepted egress grant, which admits
+fetch and refuses push. Remote publication is coordinator work outside the sandbox.
 
 ```rust
 use cowshed_core::{Cowshed, CreateOptions, ExecRequest};

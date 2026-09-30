@@ -104,9 +104,9 @@ them there; they contain the endpoint URL, whose userinfo is the workspace token
     bundle through `CARGO_HTTP_CAINFO` (04_sandbox.md); `index.crates.io` and `static.crates.io` are project-standing
     egress grants. Downloads land once per host in the shared registry. Git dependencies resolve through the fetch
     mappings to local clones when their checkouts are granted, and otherwise through intercepted `github.com`.
-  - No git remote/proxy config is written: workspace git speaks only local filesystem remotes (the `main` remote and
-    gateway-owned bare mirrors — 05_gateway.md), so there is nothing to route through the gateway and no credential
-    helper inside the image.
+  - No git remote config or credential helper is written into the image: git reaches the network through the proxy
+    variables like every other client, fetch-only (05_gateway.md "Egress modes"), and the fetch routes rewrite a bound
+    repository's URLs onto its local clone (02_workspaces.md "Remote code ingress").
   - **Go env file** at `$XDG_CACHE_HOME/go/env` (the `go env -w` format), reached via a `GOENV` export (below). Go is
     the one toolchain with **no project-level config file** — settings live in a single user-global env file
     (`os.UserConfigDir()/go/env`, measured default `~/Library/Application Support/go/env`) overridable only by `GOENV` —

@@ -5,9 +5,8 @@ terminates client TLS with a leaf signed by the workspace CA, then establishes a
 connection so it can inject narrowly scoped credentials and trace context. Protocol-aware mirrors cache registry
 traffic; cert-pinning or explicitly incompatible clients may use an **opaque** allowlisted CONNECT tunnel. Secrets exist
 only in the gateway's platform credential store, never in a workspace. The workspace receives only a public CA
-certificate that trusts the gateway-as-server; it receives no client identity and no upstream credential. Git never
-crosses the data plane as a protocol: workspace git uses local filesystem remotes, while project-scoped mirror fetches
-are coordinator-only.
+certificate that trusts the gateway-as-server; it receives no client identity and no upstream credential. Git crosses
+the data plane only as an intercepted fetch (Egress modes, below).
 
 ## Placement and identity
 
