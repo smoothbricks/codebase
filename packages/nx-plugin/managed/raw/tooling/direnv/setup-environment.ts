@@ -190,9 +190,11 @@ try {
         // Pin unscoped typescript → API 6 for root and Bun's shared .bun hoist (Nx).
         ensureTypeScriptApiPackage(projectRoot);
       }
+      // Under the same lock: the repository config and hooks are one more thing two shell
+      // entries would otherwise write at once.
+      await applyWorkspaceGitConfig(projectRoot);
       return error;
     });
-    await applyWorkspaceGitConfig(projectRoot);
     if (installError !== undefined) {
       reportDegradedSetup(installError);
     }
@@ -228,7 +230,7 @@ async function resolveSecrets(): Promise<void> {
 
 /**
  * Runs every installer whose inputs changed since its last successful run.
- * Returned, not thrown: the caller still wires git config, then reports a
+ * Returned, not thrown: the caller still keeps the git config, then reports a
  * degraded shell. Called under the install lock, so an installer another
  * shell entry just ran is already current here.
  */
@@ -258,6 +260,8 @@ async function installLocalDependencies(installers: readonly Installer[]): Promi
  * terminals, an editor beside a terminal — and two installs into one
  * node_modules collide on its links (`EEXIST … symlink`). The second entry
  * waits, then finds the first entry's stamps current and installs nothing.
+ * The repository's git config and hooks are kept under the same lock, for the
+ * same reason.
  *
  * flock(2), not a lock directory or file the script creates and removes: the
  * kernel releases it when the holder exits however it exits, so a killed
@@ -654,10 +658,10 @@ function assertTypescriptApiAt(typescriptRoot: string, expectedTarget: string): 
 /**
  * Keep git hook wiring local to bootstrap. Runtime pin sync
  * (`syncRootRuntimeVersions`) belongs to explicit monorepo tooling after the
- * package graph exists — not the installer.
+ * package graph exists — not the installer. Called under the install lock.
  */
 async function applyWorkspaceGitConfig(root: string): Promise<void> {
-  await includeWorkspaceGitConfig(root);
+  await keepRepositoryConfig(root);
 
   const gitDirResult = await $`git rev-parse --git-dir`.cwd(root).quiet().nothrow();
   if (gitDirResult.exitCode !== 0) {
@@ -671,21 +675,6 @@ async function applyWorkspaceGitConfig(root: string): Promise<void> {
 
   const gitDir = path.resolve(root, new TextDecoder().decode(gitDirResult.stdout).trim());
   const tooling = path.join(root, 'tooling');
-
-  // Keep the newer runtime version pins on any merge (nvfetcher overlay +
-  // devenv.lock) so a mirror sync's `git am --3way` never stalls on a version
-  // conflict. Mapped by the managed .gitattributes (merge=smoo-newer-pins);
-  // implemented in tooling/direnv/merge-newer-pins.sh.
-  await runSetupCommand(
-    'git config --local merge.smoo-newer-pins.name keep the newer devenv/nvfetcher runtime pins',
-    $`git config --local merge.smoo-newer-pins.name ${'keep the newer devenv/nvfetcher runtime pins'}`,
-    { quiet: false },
-  );
-  await runSetupCommand(
-    'git config --local merge.smoo-newer-pins.driver bash tooling/direnv/merge-newer-pins.sh %O %A %B %P',
-    $`git config --local merge.smoo-newer-pins.driver ${'bash tooling/direnv/merge-newer-pins.sh %O %A %B %P'}`,
-    { quiet: false },
-  );
   linkHook(gitDir, tooling, 'pre-commit');
   installPostCommitHook(gitDir, tooling);
   linkHook(gitDir, tooling, 'commit-msg');
@@ -776,29 +765,90 @@ async function runSetupCommand(
 }
 
 /**
- * Include tooling/workspace.gitconfig from the repository's config by a path
- * relative to that config file, so the include names this checkout wherever
- * the checkout is. An absolute path names the checkout that first wrote it: a
- * copy-on-write clone copies .git/config verbatim, and git refuses to run at
- * all — `fatal: unable to access` — when an include exists but cannot be
- * read, which is exactly what the original checkout is from inside a
- * sandboxed clone.
- *
- * The write therefore reads nothing through git's repository discovery: the
- * config file is located on disk and edited with `--file` from outside the
- * repository, which loads no local config and so follows no stale include.
- * Every include of a workspace.gitconfig is replaced; any other include the
- * user added stays.
+ * One value the repository's own config holds. `replaces` is a pattern over the
+ * key's existing values: the values it matches are this one's to replace, and
+ * every other value of the key stays. Without it the value replaces them all.
  */
-async function includeWorkspaceGitConfig(root: string): Promise<void> {
+interface RepositorySetting {
+  readonly key: string;
+  readonly value: string;
+  readonly replaces?: string;
+}
+
+/**
+ * The repository config shell entry keeps, read first and written only where
+ * it differs.
+ *
+ * Shell entry runs on every direnv reload, and git writes a config by taking
+ * `config.lock` exclusively: of two shell entries writing at once — a shell
+ * pool warming a spare beside a command's own activation — one fails with
+ * `could not lock config file`. The caller holds the install lock, so no two
+ * entries write together, and an entry that finds the config already correct
+ * starts no writer at all.
+ *
+ * tooling/workspace.gitconfig is included by a path relative to the config
+ * file, so the include names this checkout wherever the checkout is. An
+ * absolute path names the checkout that first wrote it: a copy-on-write clone
+ * copies .git/config verbatim, and git refuses to run at all — `fatal: unable
+ * to access` — when an include exists but cannot be read, which is exactly
+ * what the original checkout is from inside a sandboxed clone. Every include
+ * of a workspace.gitconfig is replaced; any other include the user added
+ * stays.
+ *
+ * Reads and writes therefore go through nothing of git's repository
+ * discovery: the config file is located on disk and read and edited with
+ * `--file` from outside the repository, which loads no local config and so
+ * follows no stale include.
+ */
+async function keepRepositoryConfig(root: string): Promise<void> {
   const configFile = repositoryConfigFile(root);
-  const include = path.relative(path.dirname(configFile), path.join(root, 'tooling', 'workspace.gitconfig'));
-  const pattern = '(^|/)tooling/workspace\\.gitconfig$';
-  await runSetupCommand(
-    `git config --file ${configFile} --replace-all include.path ${include} '${pattern}'`,
-    $`git config --file ${configFile} --replace-all include.path ${include} ${pattern}`,
-    { quiet: false, cwd: path.parse(configFile).root },
-  );
+  const outside = path.parse(configFile).root;
+  const settings: RepositorySetting[] = [
+    {
+      key: 'include.path',
+      value: path.relative(path.dirname(configFile), path.join(root, 'tooling', 'workspace.gitconfig')),
+      replaces: '(^|/)tooling/workspace\\.gitconfig$',
+    },
+    // Keep the newer runtime version pins on any merge (nvfetcher overlay +
+    // devenv.lock) so a mirror sync's `git am --3way` never stalls on a
+    // version conflict. Mapped by the managed .gitattributes
+    // (merge=smoo-newer-pins); implemented in tooling/direnv/merge-newer-pins.sh.
+    { key: 'merge.smoo-newer-pins.name', value: 'keep the newer devenv/nvfetcher runtime pins' },
+    { key: 'merge.smoo-newer-pins.driver', value: 'bash tooling/direnv/merge-newer-pins.sh %O %A %B %P' },
+  ];
+  const keys = `^(${settings.map((setting) => setting.key.replaceAll('.', '\\.')).join('|')})$`;
+  const read = await $`git config --file ${configFile} --get-regexp ${keys}`.cwd(outside).quiet().nothrow();
+  // Exit 1 is git's "no such key": nothing is set yet.
+  if (read.exitCode !== 0 && read.exitCode !== 1) {
+    throw new CapturedCommandError(
+      `git config --file ${configFile} --get-regexp '${keys}'`,
+      read.exitCode,
+      read.stdout,
+      read.stderr,
+    );
+  }
+  const current = new Map<string, string[]>();
+  for (const line of read.stdout.toString().split('\n')) {
+    if (line === '') {
+      continue;
+    }
+    const space = line.indexOf(' ');
+    const key = space === -1 ? line : line.slice(0, space);
+    current.set(key, [...(current.get(key) ?? []), space === -1 ? '' : line.slice(space + 1)]);
+  }
+  for (const setting of settings) {
+    const replaced = setting.replaces === undefined ? null : new RegExp(setting.replaces);
+    const owned = (current.get(setting.key) ?? []).filter((value) => replaced?.test(value) ?? true);
+    if (owned.length === 1 && owned[0] === setting.value) {
+      continue;
+    }
+    const pattern = setting.replaces === undefined ? [] : [setting.replaces];
+    await runSetupCommand(
+      `git config --file ${configFile} --replace-all ${setting.key} ${setting.value}${pattern.map((value) => ` '${value}'`).join('')}`,
+      $`git config --file ${configFile} --replace-all ${setting.key} ${setting.value} ${pattern}`,
+      { quiet: false, cwd: outside },
+    );
+  }
 }
 
 /**

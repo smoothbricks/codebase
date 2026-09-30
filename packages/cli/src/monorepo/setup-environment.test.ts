@@ -48,6 +48,11 @@ interface Repository {
   readonly count: (name: string) => number;
   /** The argument vectors the recording `uv` received, one per run. */
   readonly uvRuns: () => string[][];
+  /**
+   * Each `git config` invocation that writes, as a `begin <pid>` and an `end <pid>` line
+   * around the write, in the order they happened across every shell entry.
+   */
+  readonly gitConfigWrites: () => string[];
 }
 
 interface RepositoryOptions {
@@ -55,6 +60,8 @@ interface RepositoryOptions {
   readonly workspaces?: readonly string[];
   /** Extra files, relative to the repository root. */
   readonly files?: Readonly<Record<string, string>>;
+  /** How long each `git config` write lingers before it runs, to widen a race between entries. */
+  readonly gitWriteSeconds?: number;
 }
 
 /**
@@ -132,6 +139,31 @@ async function withManagedRepository(
       ].join('\n'),
     );
     await chmod(join(bin, 'uv'), 0o755);
+    // git as found on PATH, recording each `git config` that writes around the real run. A
+    // write is any `git config` without a read option.
+    const realGit = Bun.which('git');
+    if (realGit === null) throw new Error('git must be on PATH');
+    const writes = JSON.stringify(join(ledgers, 'git-config-writes'));
+    await writeFile(
+      join(bin, 'git'),
+      [
+        '#!/usr/bin/env bash',
+        'write=',
+        'if [ "$1" = config ]; then',
+        '  write=1',
+        '  for arg in "$@"; do',
+        '    case "$arg" in --get | --get-all | --get-regexp | --get-urlmatch | --list | -l) write= ;; esac',
+        '  done',
+        'fi',
+        `if [ -n "$write" ]; then printf 'begin %s\\n' "$$" >> ${writes}; sleep ${options.gitWriteSeconds ?? 0}; fi`,
+        `${JSON.stringify(realGit)} "$@"`,
+        'status=$?',
+        `if [ -n "$write" ]; then printf 'end %s\\n' "$$" >> ${writes}; fi`,
+        'exit $status',
+        '',
+      ].join('\n'),
+    );
+    await chmod(join(bin, 'git'), 0o755);
     await git(root, ['init', '--quiet']);
     await run(repository(root, ledgers, bin));
   } finally {
@@ -156,6 +188,7 @@ function repository(root: string, ledgers: string, bin: string): Repository {
     startShell: () => startShell(root, state, bin, {}),
     count: (name) => lines(name).length,
     uvRuns: () => lines('uv').map((line) => line.split(' ')),
+    gitConfigWrites: () => lines('git-config-writes'),
   };
 }
 
@@ -468,6 +501,36 @@ describe('the workspace git config', () => {
       } finally {
         await chmod(originalConfig, 0o644);
       }
+    });
+  });
+
+  it('is written by one shell entry at a time when two start on a clean config', async () => {
+    // Two shells entering one checkout at once — a pool warming a spare beside a command's own
+    // activation — must not both write .git/config: git takes config.lock with O_EXCL, and
+    // the entry that loses fails with "could not lock config file". Each write lingers so
+    // the entries overlap; the race is between processes, so there is no clock to fake.
+    await withManagedRepository({ gitWriteSeconds: 0.3 }, async ({ root, startShell, gitConfigWrites }) => {
+      const entries = await Promise.all([finished(startShell()), finished(startShell())]);
+      expect(entries.map((entry) => entry.exitCode)).toEqual([0, 0]);
+      const writes = gitConfigWrites();
+      expect(writes.length).toBeGreaterThan(0);
+      for (const [index, line] of writes.entries()) {
+        expect(line.startsWith(index % 2 === 0 ? 'begin ' : 'end ')).toBe(true);
+      }
+      expect(await git(root, ['config', 'merge.smoo-newer-pins.driver'])).toBe(
+        'bash tooling/direnv/merge-newer-pins.sh %O %A %B %P\n',
+      );
+      expect(await git(root, ['config', '--get-all', 'include.path'])).toBe('../tooling/workspace.gitconfig\n');
+    });
+  });
+
+  it('is not written by a shell entry that finds it already correct', async () => {
+    await withManagedRepository({}, async ({ enterShell: enter, gitConfigWrites }) => {
+      expect(await enter()).toEqual(HEALTHY);
+      const first = gitConfigWrites().length;
+      expect(first).toBeGreaterThan(0);
+      expect(await enter()).toEqual(HEALTHY);
+      expect(gitConfigWrites()).toHaveLength(first);
     });
   });
 });
