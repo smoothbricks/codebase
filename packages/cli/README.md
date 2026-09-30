@@ -376,6 +376,10 @@ nothing when nothing changed:
   `/private/cowshed/caches/{ttsc,go/build,go/mod}` whenever that directory exists, so every checkout on the machine,
   sandboxed or not, shares one warm cache. Without it, ttsc caches in the checkout's `.cache/ttsc` and Go keeps its
   defaults. A value the caller already exported wins.
+- The repository's local git config includes `tooling/workspace.gitconfig` by a path relative to the config file
+  (`../tooling/workspace.gitconfig` in `.git/config`), so a copied checkout reads its own copy. An absolute include
+  would name the checkout that wrote it, and git refuses to run when an include exists but cannot be read — the original
+  checkout, from inside a sandboxed clone. Shell entry rewrites every such include without reading through git first.
 
 ## Formatting And Git Hooks
 

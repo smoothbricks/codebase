@@ -8,6 +8,7 @@ import {
   readlinkSync,
   realpathSync,
   rmSync,
+  statSync,
   symlinkSync,
   writeFileSync,
 } from 'node:fs';
@@ -610,6 +611,8 @@ function assertTypescriptApiAt(typescriptRoot: string, expectedTarget: string): 
  * package graph exists — not the installer.
  */
 async function applyWorkspaceGitConfig(root: string): Promise<void> {
+  await includeWorkspaceGitConfig(root);
+
   const gitDirResult = await $`git rev-parse --git-dir`.cwd(root).quiet().nothrow();
   if (gitDirResult.exitCode !== 0) {
     throw new CapturedCommandError(
@@ -622,12 +625,6 @@ async function applyWorkspaceGitConfig(root: string): Promise<void> {
 
   const gitDir = path.resolve(root, new TextDecoder().decode(gitDirResult.stdout).trim());
   const tooling = path.join(root, 'tooling');
-
-  await runSetupCommand(
-    `git config --local include.path ${path.join(tooling, 'workspace.gitconfig')}`,
-    $`git config --local include.path ${path.join(tooling, 'workspace.gitconfig')}`,
-    { quiet: false },
-  );
 
   // Keep the newer runtime version pins on any merge (nvfetcher overlay +
   // devenv.lock) so a mirror sync's `git am --3way` never stalls on a version
@@ -721,15 +718,60 @@ function readLinkOrNull(hookPath: string): string | null {
 async function runSetupCommand(
   command: string,
   shell: ReturnType<typeof $>,
-  options: { quiet?: boolean } = {},
+  options: { quiet?: boolean; cwd?: string } = {},
 ): Promise<void> {
   const result = await shell
     .quiet(options.quiet ?? true)
     .nothrow()
-    .cwd(projectRoot);
+    .cwd(options.cwd ?? projectRoot);
   if (result.exitCode !== 0) {
     throw new CapturedCommandError(command, result.exitCode, result.stdout, result.stderr);
   }
+}
+
+/**
+ * Include tooling/workspace.gitconfig from the repository's config by a path
+ * relative to that config file, so the include names this checkout wherever
+ * the checkout is. An absolute path names the checkout that first wrote it: a
+ * copy-on-write clone copies .git/config verbatim, and git refuses to run at
+ * all — `fatal: unable to access` — when an include exists but cannot be
+ * read, which is exactly what the original checkout is from inside a
+ * sandboxed clone.
+ *
+ * The write therefore reads nothing through git's repository discovery: the
+ * config file is located on disk and edited with `--file` from outside the
+ * repository, which loads no local config and so follows no stale include.
+ * Every include of a workspace.gitconfig is replaced; any other include the
+ * user added stays.
+ */
+async function includeWorkspaceGitConfig(root: string): Promise<void> {
+  const configFile = repositoryConfigFile(root);
+  const include = path.relative(path.dirname(configFile), path.join(root, 'tooling', 'workspace.gitconfig'));
+  const pattern = '(^|/)tooling/workspace\\.gitconfig$';
+  await runSetupCommand(
+    `git config --file ${configFile} --replace-all include.path ${include} '${pattern}'`,
+    $`git config --file ${configFile} --replace-all include.path ${include} ${pattern}`,
+    { quiet: false, cwd: path.parse(configFile).root },
+  );
+}
+
+/**
+ * The config file git reads as this checkout's local config: `.git/config`,
+ * or, when `.git` is a worktree's `gitdir:` pointer, the config in that
+ * worktree's common directory.
+ */
+function repositoryConfigFile(root: string): string {
+  const dotGit = path.join(root, '.git');
+  if (statSync(dotGit).isDirectory()) {
+    return path.join(dotGit, 'config');
+  }
+  const pointer = /^gitdir: (.+)$/m.exec(readFileSync(dotGit, 'utf8'));
+  if (pointer?.[1] === undefined) {
+    throw new Error(`${dotGit} is neither a git directory nor a gitdir pointer`);
+  }
+  const gitDir = path.resolve(root, pointer[1].trim());
+  const commonDir = readFileIfPresent(path.join(gitDir, 'commondir'));
+  return path.join(commonDir === null ? gitDir : path.resolve(gitDir, commonDir.toString('utf8').trim()), 'config');
 }
 
 function reportSetupFailure(error: unknown): never {

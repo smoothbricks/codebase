@@ -79,6 +79,7 @@ async function withManagedRepository(
     for (const hook of ['pre-commit', 'post-commit', 'commit-msg', 'pre-push']) {
       await writeFile(join(root, 'tooling', 'git-hooks', `${hook}.sh`), '#!/usr/bin/env bash\nexit 0\n');
     }
+    await writeFile(join(root, 'tooling', 'workspace.gitconfig'), '[smoo]\n\tcheckout = original\n');
     const record = (name: string) => `printf 'x\\n' >> ${JSON.stringify(join(ledgers, name))}`;
     await writeFile(
       join(root, 'package.json'),
@@ -162,10 +163,15 @@ function counter(name: string, ledgers: string): [string, ...string[]] {
   ];
 }
 
-async function git(cwd: string, args: readonly string[]): Promise<void> {
-  const proc = Bun.spawn({ cmd: ['git', ...args], cwd, stdout: 'ignore', stderr: 'pipe', stdin: 'ignore' });
-  const [stderr, exitCode] = await Promise.all([new Response(proc.stderr).text(), proc.exited]);
+async function git(cwd: string, args: readonly string[]): Promise<string> {
+  const proc = Bun.spawn({ cmd: ['git', ...args], cwd, stdout: 'pipe', stderr: 'pipe', stdin: 'ignore' });
+  const [stdout, stderr, exitCode] = await Promise.all([
+    new Response(proc.stdout).text(),
+    new Response(proc.stderr).text(),
+    proc.exited,
+  ]);
   if (exitCode !== 0) throw new Error(`git ${args.join(' ')} failed: ${stderr}`);
+  return stdout;
 }
 
 /**
@@ -374,6 +380,39 @@ describe('what shell entry syncs for a uv project', () => {
 
       expect(await copied.enterShell({ uvProjectEnvironment: venv, python: PYTHON })).toEqual(HEALTHY);
       expect(copied.uvRuns()).toHaveLength(2);
+    });
+  });
+});
+
+describe('the workspace git config', () => {
+  it('resolves in a copy of the checkout at another path that cannot read the original', async () => {
+    await withManagedRepository({}, async (original) => {
+      expect(await original.enterShell()).toEqual(HEALTHY);
+
+      // A copy-on-write clone carries .git/config verbatim. In a sandbox the
+      // checkout it was copied from is unreadable, and git refuses to run at
+      // all when an include it names exists but cannot be read.
+      const scratch = dirname(original.root);
+      const clone = join(scratch, 'clone');
+      await cp(original.root, clone, { recursive: true, verbatimSymlinks: true });
+      await writeFile(join(clone, 'tooling', 'workspace.gitconfig'), '[smoo]\n\tcheckout = clone\n');
+      const originalConfig = join(original.root, 'tooling', 'workspace.gitconfig');
+      await chmod(originalConfig, 0o000);
+      try {
+        const copied = repository(clone, join(scratch, 'ledgers'), join(scratch, 'bin'));
+        expect(await copied.enterShell()).toEqual(HEALTHY);
+        // Each checkout reads its own workspace config through the one include.
+        for (const [root, checkout] of [
+          [clone, 'clone'],
+          [original.root, 'original'],
+        ]) {
+          await chmod(originalConfig, 0o644);
+          expect(await git(root, ['config', '--get-all', 'include.path'])).toBe('../tooling/workspace.gitconfig\n');
+          expect(await git(root, ['config', 'smoo.checkout'])).toBe(`${checkout}\n`);
+        }
+      } finally {
+        await chmod(originalConfig, 0o644);
+      }
     });
   });
 });
