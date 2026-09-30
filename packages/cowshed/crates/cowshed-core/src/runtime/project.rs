@@ -8397,6 +8397,10 @@ fn binding_from_remotes(
     .map_err(binding_integrity_error)
 }
 
+/// The remote URL as a binding records it: without query or fragment, and without userinfo except
+/// an SSH login name. The recorded URL keys a fetch route (`workspace_git_fetch`), and Git rewrites
+/// a URL only when it starts with the recorded one, so the login that addresses the server's
+/// account stays. An HTTPS username can itself be a token, and a password always is one.
 #[cfg(any(target_os = "macos", test))]
 fn persistable_remote_url(value: &Path) -> Option<String> {
     let value = value.to_str()?;
@@ -8404,19 +8408,21 @@ fn persistable_remote_url(value: &Path) -> Option<String> {
         .char_indices()
         .find_map(|(index, character)| matches!(character, '?' | '#').then_some(index));
     let without_suffix = suffix.map_or(value, |index| &value[..index]);
-    if let Some((scheme, remainder)) = without_suffix.split_once("://") {
-        let (authority, path) = remainder.split_once('/')?;
-        let authority = authority
-            .rsplit_once('@')
-            .map_or(authority, |(_, host)| host);
-        Some(format!("{scheme}://{authority}/{path}"))
-    } else {
-        let (authority, path) = without_suffix.split_once(':')?;
-        let authority = authority
-            .rsplit_once('@')
-            .map_or(authority, |(_, host)| host);
-        Some(format!("{authority}:{path}"))
-    }
+    let Some((scheme, remainder)) = without_suffix.split_once("://") else {
+        // SCP-like `login@host:path` is SSH, and its userinfo cannot carry a password: `:` is
+        // where the path begins.
+        without_suffix.split_once(':')?;
+        return Some(without_suffix.to_owned());
+    };
+    let (authority, path) = remainder.split_once('/')?;
+    let authority = match authority.rsplit_once('@') {
+        Some((login, _)) if scheme == "ssh" && !login.is_empty() && !login.contains(':') => {
+            authority
+        }
+        Some((_, host)) => host,
+        None => authority,
+    };
+    Some(format!("{scheme}://{authority}/{path}"))
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -12767,7 +12773,7 @@ mod binding_tests {
             primary: true,
         }])
         .expect("binding");
-        // Same owner/repo, entirely new server and transport (with userinfo to strip).
+        // Same owner/repo, entirely new server and transport.
         let remotes = [remote(
             "origin",
             "ssh://git@forge.example.test:2223/acme/widget.git",
@@ -12782,7 +12788,7 @@ mod binding_tests {
         .expect("recorded transport follows the move");
         assert_eq!(
             updated.primary().expect("primary").remote_url.as_deref(),
-            Some("ssh://forge.example.test:2223/acme/widget.git"),
+            Some("ssh://git@forge.example.test:2223/acme/widget.git"),
         );
         assert_eq!(
             updated.primary().expect("primary").repo_id,
@@ -12800,6 +12806,41 @@ mod binding_tests {
             .expect("healed binding matches")
             .is_none()
         );
+    }
+
+    /// The recorded URL is the fetch route's key: Git rewrites a dependency URL only when it
+    /// starts with the recorded one, so an SSH login name — which addresses the server's account —
+    /// is kept. An HTTPS username (and any password) can be a token and is never recorded.
+    #[test]
+    fn a_recorded_remote_keeps_its_ssh_login_and_drops_https_userinfo() {
+        for (remote, recorded) in [
+            (
+                "ssh://forgejo@forge.example.test:2223/acme/widget.git",
+                "ssh://forgejo@forge.example.test:2223/acme/widget.git",
+            ),
+            (
+                "git@github.com:acme/widget.git",
+                "git@github.com:acme/widget.git",
+            ),
+            (
+                "ssh://git:secret@forge.example.test/acme/widget.git",
+                "ssh://forge.example.test/acme/widget.git",
+            ),
+            (
+                "https://x-access-token:ghp_secret@github.com/acme/widget.git",
+                "https://github.com/acme/widget.git",
+            ),
+            (
+                "https://ghp_secret@github.com/acme/widget.git?ref=main#readme",
+                "https://github.com/acme/widget.git",
+            ),
+        ] {
+            assert_eq!(
+                persistable_remote_url(Path::new(remote)).as_deref(),
+                Some(recorded),
+                "{remote}"
+            );
+        }
     }
 
     #[test]
