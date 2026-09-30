@@ -76,7 +76,11 @@ its own stdout and stderr, and until its command starts that host's process grou
 activation, and a failed activation fails the job with the activation's status and discards the host. A warm command's
 streams carry only its own output. A spare's activation output is discarded; its failure only means there is no spare.
 An activation whose supervisor goes away — dropped the host, or its process exited — ends with its whole process group,
-since nothing can use its result.
+since nothing can use its result. A host that cannot serve a request — it cannot run `direnv`, say — answers with the
+reason and exits; any host that breaks its protocol fails the job waiting on it as a launch that failed, with the reason
+on the job's stderr, since its command never ran. The one exception is a host that died by a signal while it activated
+for the job: a kill of the job reaches its activation, and a crash is the job's to see, so that death is the job's
+status (the reason still goes to its stderr).
 
 The layer's other roles:
 

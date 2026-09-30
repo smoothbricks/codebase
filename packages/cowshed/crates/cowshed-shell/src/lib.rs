@@ -34,8 +34,8 @@ use std::process::{Command, Stdio};
 use cowshed_core::runtime::shell_host::{
     BINDING_ARRAY, BINDING_SCALAR, CONTROL_DESCRIPTOR, FrameReader, FrameWriter, REPLY_ACTIVATED,
     REPLY_ACTIVATION_EXITED, REPLY_ACTIVATION_UNUSABLE, REPLY_APPROVED, REPLY_EXITED,
-    REPLY_STARTED, REQUEST_ACTIVATE, REQUEST_APPROVE, REQUEST_RUN, REQUEST_SCRIPT, RawWaitStatus,
-    SHELL_HOST_ARGUMENT, ShellHostProgram, read_frame,
+    REPLY_HOST_FAILED, REPLY_STARTED, REQUEST_ACTIVATE, REQUEST_APPROVE, REQUEST_RUN,
+    REQUEST_SCRIPT, RawWaitStatus, SHELL_HOST_ARGUMENT, ShellHostProgram, read_frame,
 };
 use cowshed_core::script::Binding;
 
@@ -93,9 +93,11 @@ pub fn serve() -> i32 {
         match read_frame(&socket) {
             Ok(Some((payload, descriptors))) => {
                 if let Err(error) = host.handle(&socket, &payload, descriptors) {
-                    // The host's own stderr is /dev/null; the supervisor observes the closed
-                    // socket and the exit status.
-                    let _ = error;
+                    // The host's own stderr is /dev/null: the reason goes to the supervisor,
+                    // which gives it to the job that was waiting on this request.
+                    let _ = FrameWriter::new(REPLY_HOST_FAILED)
+                        .bytes(error.to_string().as_bytes())
+                        .and_then(|frame| reply(&socket, frame));
                     return 70;
                 }
             }
@@ -206,6 +208,19 @@ impl Host {
         }
     }
 
+    /// Why `direnv` could not be started, naming the PATH it was looked up on.
+    fn tool_error(&self, error: io::Error) -> io::Error {
+        let path = self
+            .environment
+            .get(OsStr::new("PATH"))
+            .map(|path| path.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        io::Error::new(
+            error.kind(),
+            format!("cannot run direnv from PATH {path}: {error}"),
+        )
+    }
+
     fn tool(&self, directory: &Path) -> Command {
         let mut command = Command::new("direnv");
         command
@@ -241,7 +256,8 @@ impl Host {
             .stdin(Stdio::null())
             .stdout(Stdio::from(stdout))
             .stderr(Stdio::from(stderr))
-            .status()?;
+            .status()
+            .map_err(|error| self.tool_error(error))?;
         Ok(status.into_raw())
     }
 
@@ -262,7 +278,8 @@ impl Host {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::from(stderr))
-            .spawn()?;
+            .spawn()
+            .map_err(|error| self.tool_error(error))?;
         let mut exported = Vec::new();
         let read = child
             .stdout

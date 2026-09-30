@@ -270,6 +270,14 @@ A supervisor that could not start leaves its reason in `~/Library/Logs/cowshed/d
 supervisor protocol version means the daemon and the `cowshed` you ran are different builds: run `cowshed gateway start`
 from the one you mean to use.
 
+## `cowshed exec` fails with `cannot run direnv from PATH …`
+
+The workspace supervisor looks for `direnv` (and `devenv`) in the workspace's own devenv profile and in the host's Nix
+profiles — `~/.nix-profile`, `~/.local/state/nix/profile`, `/etc/profiles/per-user/<you>`, `/run/current-system/sw` and
+the default profile — never on your shell's PATH, because the daemon starts supervisors with launchd's. Install `direnv`
+into one of those profiles (`nix profile install nixpkgs#direnv`, or home-manager/nix-darwin), then run the command
+again. The message names the PATH that was searched.
+
 ## When cowshed itself misbehaves
 
 `cowshed doctor --json` is the bounded bug-report payload: it includes versions, invariant results, continuity metadata,

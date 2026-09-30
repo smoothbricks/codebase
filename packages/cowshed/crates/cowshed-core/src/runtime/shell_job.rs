@@ -27,8 +27,9 @@ use tokio::sync::mpsc;
 use super::shell_host::{
     BINDING_ARRAY, BINDING_SCALAR, FrameReader, FrameWriter, MAX_FRAME_BYTES, REPLY_ACTIVATED,
     REPLY_ACTIVATION_EXITED, REPLY_ACTIVATION_UNUSABLE, REPLY_APPROVED, REPLY_EXITED,
-    REPLY_SCRIPT_SYNTAX, REPLY_STARTED, REQUEST_ACTIVATE, REQUEST_APPROVE, REQUEST_RUN,
-    REQUEST_SCRIPT, RawWaitStatus, SHELL_HOST_DIRECTORY, ShellHostProgram, send_with_descriptors,
+    REPLY_HOST_FAILED, REPLY_SCRIPT_SYNTAX, REPLY_STARTED, REQUEST_ACTIVATE, REQUEST_APPROVE,
+    REQUEST_RUN, REQUEST_SCRIPT, RawWaitStatus, SHELL_HOST_DIRECTORY, ShellHostProgram,
+    send_with_descriptors,
 };
 use super::shell_pool::{Acquired, Activation, Activator, ShellPool, ShellPoolConfig};
 use super::shell_watch::{ActivationEvidence, Snapshot, decode_direnv_watches};
@@ -365,6 +366,16 @@ async fn drive(
     let _ = events.send(event).await;
 }
 
+/// Tell the job, on its own stderr, why its command did not run.
+fn note(stderr: &Option<OwnedFd>, error: &CowshedError) {
+    use std::io::Write as _;
+    if let Some(stderr) = stderr
+        && let Ok(stderr) = stderr.try_clone()
+    {
+        let _ = writeln!(std::fs::File::from(stderr), "cowshed: {}", error.message);
+    }
+}
+
 async fn run_pooled(
     pool: ShellPool<HostActivator>,
     io: JobIo,
@@ -373,6 +384,7 @@ async fn run_pooled(
     job_id: JobId,
     events: &mpsc::Sender<ProcessEvent>,
 ) -> Outcome {
+    let diagnostics = io.stderr.try_clone().ok();
     let acquired = match pool.acquire().await {
         Ok(acquired) => acquired,
         Err(error) => return Outcome::NotLaunched(error),
@@ -399,11 +411,17 @@ async fn run_pooled(
                 HostActivation::Ready(evidence) => ticket.activated(host, evidence).await,
                 HostActivation::Failed { status } => return decode(status),
                 HostActivation::Broken(error) => {
-                    // A killed or crashed host was this job's process while it activated, so its
-                    // own wait status is the job's.
-                    return match host.exit_status().await {
-                        Some(status) => decode(status),
-                        None => Outcome::NotLaunched(error),
+                    // The command never ran, and the job says why. The one death that is the
+                    // job's own is a signal the host took by itself while it activated for this
+                    // job: a kill of the job reaches its activation, and a crash is the job's to
+                    // see. A host that ended with a code, or that was still running and ended
+                    // here, is a launch that failed.
+                    return match host.end().await {
+                        HostEnd::Own(status) if libc::WIFSIGNALED(status) => {
+                            note(&diagnostics, &error);
+                            decode(status)
+                        }
+                        HostEnd::Own(_) | HostEnd::Killed => Outcome::NotLaunched(error),
                     };
                 }
             }
@@ -449,6 +467,8 @@ pub(super) struct ExecHost {
     /// Set once the host's own exit status was collected: its pid, and so its group id, may
     /// then belong to another process, which no signal of ours may reach.
     reaped: bool,
+    /// Set once the host closed its end of the control socket, or announced that it exits.
+    closed: bool,
 }
 
 /// A dropped host takes its activation with it: the host leads its own process group, which
@@ -496,6 +516,23 @@ fn protocol_error(what: &str, error: impl std::fmt::Display) -> CowshedError {
     CowshedError::internal(format!("workspace exec host {what}: {error}"))
 }
 
+/// Whether an I/O error on the control socket means the host has closed its end: it is
+/// exiting, and its own wait status says how.
+fn host_closed(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::UnexpectedEof | io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset
+    )
+}
+
+/// How a host that broke its protocol ended.
+enum HostEnd {
+    /// It ended by itself, with this wait status.
+    Own(RawWaitStatus),
+    /// It was still running and was killed here.
+    Killed,
+}
+
 impl ExecHost {
     async fn send(&mut self, frame: Vec<u8>, descriptors: &[RawFd]) -> Result<()> {
         let socket = self.control.as_raw_fd();
@@ -504,29 +541,44 @@ impl ExecHost {
             .async_io(Interest::WRITABLE, || {
                 send_with_descriptors(socket, &frame, descriptors)
             })
-            .await
-            .map_err(|error| protocol_error("send", error))?;
-        self.control
-            .write_all(&frame[sent..])
-            .await
-            .map_err(|error| protocol_error("send", error))
+            .await;
+        let written = match sent {
+            Ok(sent) => self.control.write_all(&frame[sent..]).await,
+            Err(error) => Err(error),
+        };
+        written.map_err(|error| {
+            self.closed |= host_closed(&error);
+            protocol_error("send", error)
+        })
     }
 
     async fn receive(&mut self) -> Result<Vec<u8>> {
         let mut header = [0_u8; 4];
-        self.control
-            .read_exact(&mut header)
-            .await
-            .map_err(|error| protocol_error("reply", error))?;
+        if let Err(error) = self.control.read_exact(&mut header).await {
+            self.closed |= host_closed(&error);
+            return Err(protocol_error("reply", error));
+        }
         let length = usize::try_from(u32::from_le_bytes(header)).unwrap_or(usize::MAX);
         if length > MAX_FRAME_BYTES {
             return Err(protocol_error("reply", "frame exceeds its bound"));
         }
         let mut payload = vec![0_u8; length];
-        self.control
-            .read_exact(&mut payload)
-            .await
-            .map_err(|error| protocol_error("reply", error))?;
+        if let Err(error) = self.control.read_exact(&mut payload).await {
+            self.closed |= host_closed(&error);
+            return Err(protocol_error("reply", error));
+        }
+        // The host names why it could not serve the request, then exits.
+        if let Ok((REPLY_HOST_FAILED, mut fields)) = FrameReader::new(&payload) {
+            self.closed = true;
+            let reason = fields
+                .bytes()
+                .map(|reason| String::from_utf8_lossy(reason).into_owned())
+                .unwrap_or_else(|error| format!("an unreadable reason ({error})"));
+            return Err(CowshedError::environment_missing(
+                format!("the workspace shell host failed: {reason}"),
+                "cowshed doctor --json",
+            ));
+        }
         Ok(payload)
     }
 
@@ -594,16 +646,23 @@ impl ExecHost {
         Ok(status)
     }
 
-    /// The host process's own wait status once it has ended, killed if it has not.
-    async fn exit_status(&mut self) -> Option<RawWaitStatus> {
-        if let Ok(Some(status)) = self.child.try_wait() {
+    /// End a host that broke its protocol. One that closed its end is exiting and is waited
+    /// for; one still running is killed, and its death is this call's, not the job's.
+    async fn end(&mut self) -> HostEnd {
+        if !self.closed && !matches!(self.child.try_wait(), Ok(Some(_))) {
+            let _ = kill_process_group(self.pid, libc::SIGKILL);
+            let _ = self.child.wait().await;
             self.reaped = true;
-            return Some(status.into_raw());
+            return HostEnd::Killed;
         }
-        let _ = kill_process_group(self.pid, libc::SIGKILL);
-        let status = self.child.wait().await.ok()?;
-        self.reaped = true;
-        Some(status.into_raw())
+        match self.child.wait().await {
+            Ok(status) => {
+                self.reaped = true;
+                HostEnd::Own(status.into_raw())
+            }
+            // Not reaped: dropping the host still ends its group.
+            Err(_) => HostEnd::Killed,
+        }
     }
 }
 
@@ -695,6 +754,7 @@ impl HostActivator {
             pid,
             control,
             reaped: false,
+            closed: false,
         })
     }
 

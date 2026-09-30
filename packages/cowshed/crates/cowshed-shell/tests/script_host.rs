@@ -14,7 +14,8 @@ use std::time::Duration;
 use cowshed_core::api::{ScriptCommand, ScriptValue};
 use cowshed_core::runtime::shell_host::{
     BINDING_ARRAY, BINDING_SCALAR, CONTROL_DESCRIPTOR, FrameReader, FrameWriter, REPLY_EXITED,
-    REPLY_SCRIPT_SYNTAX, REPLY_STARTED, REQUEST_SCRIPT, read_frame, send_with_descriptors,
+    REPLY_HOST_FAILED, REPLY_SCRIPT_SYNTAX, REPLY_STARTED, REQUEST_APPROVE, REQUEST_SCRIPT,
+    read_frame, send_with_descriptors,
 };
 use cowshed_core::script::{Binding, RenderedScript, render};
 
@@ -25,7 +26,12 @@ struct Host {
 }
 
 impl Host {
+    /// A host with this test's own PATH, as a supervisor gives it the tools it found.
     fn start(label: &str) -> Self {
+        Self::start_with_path(label, &std::env::var_os("PATH").expect("PATH"))
+    }
+
+    fn start_with_path(label: &str, path: &std::ffi::OsStr) -> Self {
         let directory = std::env::temp_dir().join(format!(
             "cowshed-script-host-{label}-{}",
             uuid::Uuid::new_v4().simple()
@@ -37,7 +43,7 @@ impl Host {
         let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_cowshed-shell-host"));
         command
             .env_clear()
-            .env("PATH", "/usr/bin:/bin")
+            .env("PATH", path)
             .env("HOME", &directory)
             .current_dir(&directory)
             .stdin(Stdio::null())
@@ -390,4 +396,38 @@ fn the_shared_corpus_parses_and_prints_what_bash_does() {
         }
     }
     assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+}
+
+/// A host that cannot serve a request says why before it exits, instead of leaving the
+/// supervisor a closed socket and nothing else.
+#[test]
+fn a_host_that_cannot_run_direnv_says_so() {
+    let host = Host::start_with_path("no-direnv", std::ffi::OsStr::new("/nonexistent/bin"));
+    let envrc = host.directory.join(".envrc");
+    std::fs::write(&envrc, b"").expect("envrc");
+    let (_stdout_read, stdout_write) = pipe();
+    let (_stderr_read, stderr_write) = pipe();
+    let frame = FrameWriter::new(REQUEST_APPROVE)
+        .bytes(envrc.as_os_str().as_encoded_bytes())
+        .unwrap()
+        .finish()
+        .unwrap();
+    let sent = send_with_descriptors(
+        host.control.as_raw_fd(),
+        &frame,
+        &[stdout_write.as_raw_fd(), stderr_write.as_raw_fd()],
+    )
+    .expect("send the request");
+    std::io::Write::write_all(&mut &host.control, &frame[sent..]).expect("send the rest");
+    drop((stdout_write, stderr_write));
+    let (reply, _) = read_frame(&host.control)
+        .expect("a readable reply")
+        .expect("a reply, not a closed socket");
+    let (tag, mut fields) = FrameReader::new(&reply).unwrap();
+    assert_eq!(tag, REPLY_HOST_FAILED);
+    let reason = String::from_utf8_lossy(fields.bytes().unwrap()).into_owned();
+    assert!(
+        reason.contains("direnv") && reason.contains("/nonexistent/bin"),
+        "the reason names the tool and where it was looked for: {reason}"
+    );
 }

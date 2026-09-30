@@ -56,6 +56,9 @@ pub const REPLY_EXITED: u8 = 6;
 /// A script request's text did not parse; nothing ran. `[diagnostic]`, also written to the
 /// job's stderr.
 pub const REPLY_SCRIPT_SYNTAX: u8 = 7;
+/// The host could not serve the request it was handling: `[reason]`. The host exits after
+/// sending it, so the supervisor learns why instead of seeing only a closed socket.
+pub const REPLY_HOST_FAILED: u8 = 8;
 
 /// A script binding's value kind on the wire.
 pub const BINDING_SCALAR: u8 = 0;

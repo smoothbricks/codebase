@@ -125,6 +125,17 @@ impl Workspace {
     }
 
     fn supervisor(&self, prewarm: bool) -> WorkspaceSupervisorHandle {
+        self.supervisor_hosted_by(
+            ShellHostProgram::dedicated(env!("CARGO_BIN_EXE_cowshed-shell-host")),
+            prewarm,
+        )
+    }
+
+    fn supervisor_hosted_by(
+        &self,
+        program: ShellHostProgram,
+        prewarm: bool,
+    ) -> WorkspaceSupervisorHandle {
         let config = WorkspaceSupervisorConfig {
             authority: authority(1),
             owned_repo_ids: OwnedRepoIds::sole(authority(1).repo_id),
@@ -150,7 +161,7 @@ impl Workspace {
         WorkspaceSupervisor::start_with_sinks(
             config,
             Box::new(SystemSpawnSink::with_shell_host(
-                ShellHostProgram::dedicated(env!("CARGO_BIN_EXE_cowshed-shell-host")),
+                program,
                 ShellPoolConfig {
                     prewarm,
                     ..ShellPoolConfig::default()
@@ -849,4 +860,31 @@ async fn host_controller_a_revoke_binds_every_later_command_and_no_running_one()
         "a job admitted under revision 1 finishes under the profile it started with"
     );
     std::fs::remove_dir_all(&granted).ok();
+}
+
+#[tokio::test]
+#[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
+async fn host_controller_a_host_that_breaks_while_activating_fails_the_job_with_the_reason() {
+    let workspace = Workspace::new("shell-pool-broken-host", 41_328);
+    workspace.envrc("");
+    // A "host" that exits with a code of its own before answering anything: the supervisor
+    // sees its control socket close in the middle of approving the `.envrc`.
+    let broken = workspace.root.join("broken-host");
+    std::fs::write(&broken, "#!/bin/sh\nexit 3\n").expect("broken host");
+    std::fs::set_permissions(&broken, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+        .expect("executable");
+    let handle = workspace.supervisor_hosted_by(ShellHostProgram::dedicated(&broken), false);
+    let ran = run(&handle, sh("printf never")).await;
+    assert_eq!(
+        ran.info.state,
+        JobState::Failed,
+        "the command never ran, so the job is a failed launch, not the host's own status: {:?}",
+        ran.info.exit
+    );
+    assert!(
+        ran.stderr.contains("exec host"),
+        "the job says why it did not run: {:?}",
+        ran.stderr
+    );
+    assert!(ran.stdout.is_empty());
 }

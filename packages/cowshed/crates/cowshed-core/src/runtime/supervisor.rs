@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::{CStr, OsStr, OsString};
 use std::fs;
 use std::io;
-use std::os::unix::ffi::OsStrExt;
+use std::os::unix::ffi::{OsStrExt, OsStringExt as _};
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -815,7 +815,68 @@ fn workspace_profile_bin(workspace_mount: &Path, devenv_dir: &Path) -> Option<Pa
     })
 }
 
+/// The Nix profiles that belong to the host's user and the host itself rather than to any
+/// shell: where `nix profile`, home-manager, nix-darwin and NixOS install tools. The daemon
+/// starts workspace supervisors with launchd's (or systemd's) PATH, which names none of them,
+/// so `direnv` and `devenv` are looked up here instead of on whatever PATH started the
+/// supervisor. Nearest the user first.
+fn host_profile_bins(home: &Path, user: Option<&OsStr>) -> Vec<PathBuf> {
+    let mut profiles = vec![
+        home.join(".nix-profile/bin"),
+        home.join(".local/state/nix/profile/bin"),
+    ];
+    if let Some(user) = user {
+        profiles.push(Path::new("/etc/profiles/per-user").join(user).join("bin"));
+        profiles.push(
+            Path::new("/nix/var/nix/profiles/per-user")
+                .join(user)
+                .join("profile/bin"),
+        );
+    }
+    profiles.push(PathBuf::from("/run/current-system/sw/bin"));
+    profiles.push(PathBuf::from("/nix/var/nix/profiles/default/bin"));
+    profiles
+}
+
+/// The effective user's login name, from the password database rather than the environment.
+fn effective_user_name() -> Option<OsString> {
+    let mut entry = std::mem::MaybeUninit::<libc::passwd>::zeroed();
+    let mut buffer = vec![0_u8; 4096];
+    let mut found = std::ptr::null_mut();
+    // SAFETY: `entry` and `buffer` are writable for their declared sizes and outlive the call;
+    // on success `found` points into them.
+    let status = unsafe {
+        libc::getpwuid_r(
+            libc::geteuid(),
+            entry.as_mut_ptr(),
+            buffer.as_mut_ptr().cast(),
+            buffer.len(),
+            &mut found,
+        )
+    };
+    if status != 0 || found.is_null() {
+        return None;
+    }
+    // SAFETY: getpwuid_r succeeded, so `pw_name` is a NUL-terminated string inside `buffer`.
+    let name = unsafe { std::ffi::CStr::from_ptr((*found).pw_name) };
+    Some(OsString::from_vec(name.to_bytes().to_vec()))
+}
+
 fn bootstrap_path(sandbox: &SandboxConfig, devenv_dir: Option<&Path>) -> Result<OsString> {
+    bootstrap_path_from(
+        sandbox,
+        devenv_dir,
+        &host_profile_bins(&sandbox.home, effective_user_name().as_deref()),
+        std::env::var_os("PATH").as_deref(),
+    )
+}
+
+fn bootstrap_path_from(
+    sandbox: &SandboxConfig,
+    devenv_dir: Option<&Path>,
+    host_profiles: &[PathBuf],
+    inherited: Option<&OsStr>,
+) -> Result<OsString> {
     let mut paths = vec![sandbox.workspace_mount.join(".cowshed/bin")];
     if let Some(profile) = workspace_profile_bin(
         &sandbox.workspace_mount,
@@ -823,13 +884,14 @@ fn bootstrap_path(sandbox: &SandboxConfig, devenv_dir: Option<&Path>) -> Result<
     ) {
         paths.push(profile);
     }
-    // launchd may start the gateway without a Nix profile on PATH. The system profile is
-    // bootstrap authority only when it resolves to immutable store content.
-    if let Ok(profile) = fs::canonicalize("/nix/var/nix/profiles/default/bin")
-        && profile.starts_with("/nix/store")
-        && !paths.contains(&profile)
-    {
-        paths.push(profile);
+    // A host profile is bootstrap authority only when it resolves to immutable store content.
+    for profile in host_profiles {
+        if let Ok(profile) = fs::canonicalize(profile)
+            && profile.starts_with("/nix/store")
+            && !paths.contains(&profile)
+        {
+            paths.push(profile);
+        }
     }
     let mut seen = paths.iter().cloned().collect::<BTreeSet<_>>();
     if let Some(path) = developer_directory().map(|directory| directory.join("usr/bin"))
@@ -842,8 +904,8 @@ fn bootstrap_path(sandbox: &SandboxConfig, devenv_dir: Option<&Path>) -> Result<
         seen.insert(path.clone());
         paths.push(path);
     }
-    if let Some(inherited) = std::env::var_os("PATH") {
-        for path in std::env::split_paths(&inherited) {
+    if let Some(inherited) = inherited {
+        for path in std::env::split_paths(inherited) {
             let admitted = path.is_absolute()
                 && [
                     Path::new("/nix/store"),
@@ -4302,6 +4364,56 @@ mod workspace_toolchain_tests {
             crate::error::ErrorCode::EnvironmentMissing
         );
 
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A supervisor the daemon starts inherits launchd's PATH, which names no Nix profile. The
+    /// user's own profile still puts its tools — `direnv` above all, which every activation
+    /// runs — on the bootstrap PATH, where the old controller found them only because it
+    /// inherited an interactive shell's PATH.
+    #[test]
+    fn a_supervisor_started_with_launchds_path_still_finds_the_users_profile_tools() {
+        // Any store `bin` on this test's PATH stands in for the user's profile generation.
+        // Absence fails: cowshed requires Nix, and this repository's own shell is devenv.
+        let store_bin = std::env::split_paths(&std::env::var_os("PATH").expect("PATH"))
+            .filter_map(|entry| std::fs::canonicalize(entry).ok())
+            .find(|entry| entry.starts_with("/nix/store") && entry.ends_with("bin"))
+            .expect("a /nix/store bin directory on PATH; cowshed requires Nix");
+        let root = scratch("launchd-path");
+        let home = root.join("home");
+        std::fs::create_dir_all(&home).expect("home");
+        std::os::unix::fs::symlink(
+            store_bin.parent().expect("a store path"),
+            home.join(".nix-profile"),
+        )
+        .expect("profile link");
+        let sandbox = SandboxConfig {
+            home: home.clone(),
+            mount_root: root.clone(),
+            workspace_mount: root.join("workspace"),
+            exec_temp_dir: root.join("tmp"),
+            port_block: crate::metadata::PortBlock::new(40_960, 16).expect("port block"),
+            mode: crate::sandbox::RunSandboxMode::ReadWrite,
+            grants: crate::sandbox::SandboxGrants::default(),
+            allowed_unix_sockets: Vec::new(),
+            additional_denies: Vec::new(),
+            shed_links: Vec::new(),
+            git_worktree_repository: None,
+            shared_tool_homes: Vec::new(),
+        };
+
+        let path = bootstrap_path_from(
+            &sandbox,
+            None,
+            &host_profile_bins(&home, Some(OsStr::new("nobody-in-particular"))),
+            Some(OsStr::new("/usr/bin:/bin:/usr/sbin:/sbin")),
+        )
+        .expect("bootstrap PATH");
+        let entries: Vec<PathBuf> = std::env::split_paths(&path).collect();
+        assert!(
+            entries.contains(&store_bin),
+            "the user's profile is on the bootstrap PATH: {entries:?}"
+        );
         std::fs::remove_dir_all(&root).ok();
     }
 
