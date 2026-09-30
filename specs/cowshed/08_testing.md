@@ -34,7 +34,7 @@ No mounts, no root, no network — pure functions with table-driven cases:
   allow per port of its recorded size** — 16 for a live pre-64 block, 64 for a new one (measured: SBPL rejects port
   ranges — `invalid port in network address` — and hosts other than `localhost`/`*`), leaves
   `network-bind`/`network-inbound` permissive on localhost, and contains no range syntax anywhere (a generation-text
-  golden; kernel enforcement is proved by the escape tier).
+  golden; kernel enforcement is the escape tests' to prove).
 - **Runner launch planning**: a workflow fixture whose first step is repository-controlled, followed by shell and
   supported action-generated commands, produces only `cowshed exec` launch plans in original order. The direct process
   launcher is a fail-on-call spy. An action type for which every process cannot be intercepted is rejected with the
@@ -299,11 +299,12 @@ Covered flows:
   socket binding, and non-disclosure through telemetry. A worker invoking every coordinator-only tool receives `-32005`
   before dispatch; `SandboxDenied` remains reserved for authoritative sandbox evidence.
 
-## Escape tests (cowshed-escape-tests, one corpus, both OSes, release gate)
+## Escape tests
 
-One shared adversarial corpus (04_sandbox.md), run through the real exec pipeline: **Seatbelt on macOS, Landlock +
-loopback netns on Linux**, green on **both** as a release gate (a red escape test cannot be waived). Structure uses one
-shared corpus: each case is a shell payload plus an assertion that the operation was denied and the artifact untouched.
+One adversarial corpus (04_sandbox.md "Escape tests"), each case a payload run under the generated profile plus an
+assertion that the operation was denied and the artifact untouched. The cases that exist run under Seatbelt on macOS, in
+`cowshed-core`'s sandbox tests and its host-controller probes; there is no separate crate, no Linux leg yet, and no
+release gate. The categories below are the corpus to cover; a category with no case is a gap.
 
 Shared categories: path escapes (traversal, symlink, hardlink), secret reads, cowshed-state tampering, cross-workspace
 access, egress bypass (direct, helper-process, DNS), revocation binding, ReadOnly enforcement, **workspace-CA

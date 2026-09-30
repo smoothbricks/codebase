@@ -124,13 +124,14 @@ or ordinary on-disk text log.
 
 ## Crate map
 
-| Crate                  | Kind          | Responsibility                                                                                         |
-| ---------------------- | ------------- | ------------------------------------------------------------------------------------------------------ |
-| `cowshed-core`         | lib           | Image/volume lifecycle, clonefile, marker & grant files, Seatbelt profile generation, env wiring, exec |
-| `cowshed-cli`          | bin `cowshed` | Self-driving CLI over cowshed-core; stdout machine-readable, stderr guidance                           |
-| `cowshed-gateway`      | bin + lib     | Localhost registry mirror, repo-mirror verb, CONNECT tunnel, audit                                     |
-| `cowshed-napi`         | cdylib        | napi-rs bindings exposing cowshed-core to Bun/Node                                                     |
-| `cowshed-escape-tests` | lib (tests)   | Sandbox escape regression harness                                                                      |
+| Crate                   | Kind                         | Responsibility                                                                                                      |
+| ----------------------- | ---------------------------- | ------------------------------------------------------------------------------------------------------------------- |
+| `cowshed-core`          | lib (+ bin `apfs-benchmark`) | Image/volume lifecycle, clonefile, marker & grant files, Seatbelt profile generation, env wiring, supervisors, exec |
+| `cowshed-cli`           | bin `cowshed`                | Self-driving CLI over cowshed-core, and the host daemon it runs; stdout machine-readable, stderr guidance           |
+| `cowshed-gateway`       | lib                          | Actor-owned, host-only egress gateway: registry and repository mirrors, TLS interception, CONNECT tunnel, audit     |
+| `cowshed-gateway-types` | lib                          | The gateway's control-plane data model (sessions, endpoints, tokens, CA material, egress policy), with no daemon    |
+| `cowshed-napi`          | cdylib                       | napi-rs bindings exposing cowshed-core to Bun/Node                                                                  |
+| `cowshed-shell`         | bin `cowshed-shell-host`     | The warm exec host: holds an activated workspace shell and runs each command from it (11_shell.md)                  |
 
 ## Consumers
 

@@ -403,7 +403,7 @@ XPC/unix sockets the baseline's scoped IPC rules deny. The **"simulator" preset*
 (`cowshed grant <ws> --preset simulator`) that relaxes exactly that surface — the CoreSimulator service lookups and
 sockets, nothing else. It is a documented preset, not an escape hatch: the secret denies still terminate the profile,
 the `/private/cowshed/store` deny still stands, and egress is untouched. The precise mach-lookup/socket inventory is an
-implementation-time verification item (kickoff); the escape suite pins that the preset does not widen filesystem or
+implementation-time verification item (kickoff); an escape test is to pin that the preset does not widen filesystem or
 network authority. Note the preset concerns the **dev uid's own** simulators only — the personal-session simulator is
 never reached through Seatbelt at all, only through the gateway `/sim/` broker and its grant axis above.
 
@@ -662,10 +662,15 @@ intersects the deny set.
 - **direnv/devenv, secrets scanner, marker/token handling**: unchanged — they are substrate- and OS-independent pure
   logic plus the daemon-socket Nix access described above.
 
-## cowshed-escape-tests
+## Escape tests
 
-A regression harness runs adversarial commands through the real exec pipeline and asserts denial. The macOS suite runs
-under Seatbelt; the same cases run on Linux under Landlock, plus Linux-specific escapes:
+Escape tests run the generated profile under the kernel and assert denial; there is no separate escape crate. Today they
+live beside the code they pin, and run on macOS only: `cowshed-core`'s Seatbelt tests execute supervisor and child
+profiles under `/usr/bin/sandbox-exec` (protected job artifacts refuse writes, hardlinks and parent replacement), and
+the host-controller probes in `cowshed-core/tests/devenv_runtime_dir.rs` exercise Unix sockets outside the workspace
+tree, a proxy bypass to unallocated loopback ports, and private-environment symlinks that try to redirect host
+preparation. The list below is the corpus they are to cover, on Seatbelt and, once the Linux leg exists, on Landlock; a
+case with no test yet is an open gap, not a guarantee:
 
 - write outside granted roots (absolute, relative, `..`-traversal, symlink pivot, hardlink);
 - read `~/.ssh`, `~/.aws`, Keychains, any `/private/cowshed/store` path outside the carve-backs (grant files, CA keys,
@@ -703,8 +708,7 @@ reach-arounds, `unshare`/`setns` attempts to leave or join another netns, abstra
 reaching a non-gateway listener, access to a sibling's gateway socket, and `connect(2)` to any non-loopback TCP/UDP
 address. Connector cases attempt to bind or impersonate `127.0.0.1:7644`, signal/ptrace/join the trusted connector's
 identity or cgroup, reach a sibling connector from either netns, and feed non-loopback traffic; all must fail without a
-byte reaching the gateway. Each escape found in production becomes a permanent case here. The suite is a release gate on
-both OSes.
+byte reaching the gateway. Each escape found in production becomes a permanent case here.
 
 ## Tradeoffs
 
