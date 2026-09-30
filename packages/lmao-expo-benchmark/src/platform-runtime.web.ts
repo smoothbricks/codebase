@@ -1,6 +1,10 @@
-import { ThreadBufferStrategy } from '@smoothbricks/lmao';
 import { createTraceRoot } from '@smoothbricks/lmao/es';
-import { createWasmAllocator, createWasmAllocatorSync, type WasmAllocator } from '@smoothbricks/lmao/wasm';
+import {
+  createThreadBufferStrategy,
+  createWasmAllocator,
+  createWasmAllocatorSync,
+  type WasmAllocator,
+} from '@smoothbricks/lmao/wasm';
 
 import type { ScenarioRuntime, ScenarioSchema } from '../../lmao/benchmarks/plugin-scenario/scenario';
 import { runSuperblockBenchmark, type SuperblockBenchmarkResult } from './superblock-benchmark';
@@ -38,7 +42,7 @@ export async function createPlatformRuntime(): Promise<ScenarioRuntime> {
   benchmarkAllocator = module
     ? createWasmAllocatorSync(module, { capacity: WASM_CAPACITY })
     : await createWasmAllocator({ capacity: WASM_CAPACITY });
-  const bufferStrategy = await ThreadBufferStrategy.create<ScenarioSchema>({ module });
+  const bufferStrategy = await createThreadBufferStrategy<ScenarioSchema>({ module });
   return {
     backend: 'wasm',
     bufferStrategy,

@@ -17,9 +17,9 @@ import {
 } from '../src/lib/runtimeHint.js';
 import { S } from '../src/lib/schema/builder.js';
 import { defineLogSchema } from '../src/lib/schema/defineLogSchema.js';
-import { ThreadBufferStrategy } from '../src/lib/ThreadBufferStrategy.js';
 import { createTraceRoot } from '../src/lib/traceRoot.node.js';
 import { TestTracer } from '../src/lib/tracers/TestTracer.js';
+import { createThreadBufferStrategy } from '../src/lib/wasm/threadSpanBufferHost.js';
 import { registerBenchmarkVocabulary } from './vocabularyFixture.js';
 
 const schema = defineLogSchema({ n: S.number() });
@@ -120,7 +120,7 @@ async function makeTracers(): Promise<{
   thread: TestTracer<Binding>;
 }> {
   const js = new JsBufferStrategy<Binding['logBinding']['logSchema']>();
-  const threadStrategy = await ThreadBufferStrategy.create<Binding['logBinding']['logSchema']>({
+  const threadStrategy = await createThreadBufferStrategy<Binding['logBinding']['logSchema']>({
     capacity: CAPACITY,
   });
   return {

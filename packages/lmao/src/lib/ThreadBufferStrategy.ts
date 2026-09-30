@@ -19,7 +19,6 @@ import { getThreadId } from './threadId.js';
 import type { ITraceRoot } from './traceRoot.js';
 import type { AnySpanBuffer, SpanBuffer } from './types.js';
 import { THREAD_SPAN_BUFFER_OK, type ThreadSpanBufferBinding } from './wasm/threadSpanBuffer.js';
-import { createThreadSpanBufferRuntime, type ThreadSpanBufferRuntime } from './wasm/threadSpanBufferHost.js';
 import {
   createThreadSpanView,
   isThreadSpanView,
@@ -70,23 +69,6 @@ export class ThreadBufferStrategy<
     this.provider = provider;
     this.capacity = capacity;
     this.threadId = threadId;
-  }
-
-  /** A strategy over allocator.wasm's row stores. */
-  static async create<TSchema extends LogSchema>(options?: {
-    capacity?: number;
-    threadId?: bigint;
-    initialPages?: number;
-    maxPages?: number;
-    /** Pre-compiled allocator.wasm for bundled environments; see createThreadSpanBufferRuntime. */
-    module?: WebAssembly.Module;
-  }): Promise<ThreadBufferStrategy<TSchema, ThreadSpanBufferRuntime>> {
-    const runtime = await createThreadSpanBufferRuntime({
-      initialPages: options?.initialPages,
-      maxPages: options?.maxPages,
-      module: options?.module,
-    });
-    return ThreadBufferStrategy.fromProvider<TSchema, ThreadSpanBufferRuntime>(runtime, options);
   }
 
   /** A strategy over any provider's row stores. */

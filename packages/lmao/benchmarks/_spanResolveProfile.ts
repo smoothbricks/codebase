@@ -22,9 +22,9 @@ import { defineOpContext } from '../src/lib/defineOpContext.js';
 import { JsBufferStrategy } from '../src/lib/JsBufferStrategy.js';
 import { S } from '../src/lib/schema/builder.js';
 import { defineLogSchema } from '../src/lib/schema/defineLogSchema.js';
-import { ThreadBufferStrategy } from '../src/lib/ThreadBufferStrategy.js';
 import { createTraceRoot } from '../src/lib/traceRoot.node.js';
 import { TestTracer } from '../src/lib/tracers/TestTracer.js';
+import { createThreadBufferStrategy } from '../src/lib/wasm/threadSpanBufferHost.js';
 
 const schema = defineLogSchema({ n: S.number() });
 const context = defineOpContext({ logSchema: schema });
@@ -34,7 +34,7 @@ const childOp = context.defineOp('leaf', (ctx) => ctx.ok(1));
 const rootOp = context.defineOp('root', (ctx) => ctx.ok(1));
 
 const js = new JsBufferStrategy<Binding['logBinding']['logSchema']>();
-const thread = await ThreadBufferStrategy.create<Binding['logBinding']['logSchema']>({ capacity: 64 });
+const thread = await createThreadBufferStrategy<Binding['logBinding']['logSchema']>({ capacity: 64 });
 const jsTracer = new TestTracer(context, { bufferStrategy: js, createTraceRoot });
 const threadTracer = new TestTracer(context, { bufferStrategy: thread, createTraceRoot });
 

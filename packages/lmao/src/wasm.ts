@@ -10,6 +10,7 @@ export {
   type WasmThreadSpanBufferBinding,
   type WasmThreadSpanBufferMemory,
 } from './lib/wasm/threadSpanBuffer.js';
+export { createThreadBufferStrategy, type ThreadSpanBufferRuntime } from './lib/wasm/threadSpanBufferHost.js';
 // Thread-lane buffer discriminator: platform runtimes assert which lane a
 // captured buffer came from without reaching into lib internals.
 export { isThreadSpanView } from './lib/wasm/threadSpanView.js';

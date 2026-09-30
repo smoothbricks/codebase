@@ -11,9 +11,9 @@ import { defineOpContext } from '../src/lib/defineOpContext.js';
 import { JsBufferStrategy } from '../src/lib/JsBufferStrategy.js';
 import { S } from '../src/lib/schema/builder.js';
 import { defineLogSchema } from '../src/lib/schema/defineLogSchema.js';
-import { ThreadBufferStrategy } from '../src/lib/ThreadBufferStrategy.js';
 import { createTraceRoot } from '../src/lib/traceRoot.node.js';
 import { TestTracer } from '../src/lib/tracers/TestTracer.js';
+import { createThreadBufferStrategy } from '../src/lib/wasm/threadSpanBufferHost.js';
 
 const which = Bun.argv[2] ?? 'thread';
 const schema = defineLogSchema({ n: S.number() });
@@ -23,7 +23,7 @@ type Binding = typeof context;
 const strategy =
   which === 'js'
     ? new JsBufferStrategy<Binding['logBinding']['logSchema']>()
-    : await ThreadBufferStrategy.create<Binding['logBinding']['logSchema']>({ capacity: 64 });
+    : await createThreadBufferStrategy<Binding['logBinding']['logSchema']>({ capacity: 64 });
 const tracer = new TestTracer(context, { bufferStrategy: strategy, createTraceRoot });
 
 const LOGS = 128;

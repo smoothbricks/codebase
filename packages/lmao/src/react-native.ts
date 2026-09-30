@@ -14,14 +14,10 @@
  *
  * - **No WASM core.** Hermes exposes no `WebAssembly` global, so the wasm
  *   allocator and the wasm-backed thread span buffer cannot run there at all.
- *   Spans go to `JsBufferStrategy`. Those modules are still *reachable* from
- *   `./index.js` through `ThreadBufferStrategy`, and `wasmAllocator.ts` loads
- *   the artifact through `await import('node:fs/promises' | 'node:url' |
- *   'node:path')` behind a `process.versions.node` guard. The guard is never
- *   true on Hermes, but Metro resolves dynamic imports at bundle time and has
- *   no `node:` protocol handling, so a React Native app maps those three
- *   specifiers to an empty module via `resolver.resolveRequest`. Nothing on
- *   this lane evaluates them at runtime.
+ *   Spans go to `JsBufferStrategy`. Neither module is reachable from this
+ *   entry point: `ThreadBufferStrategy` reaches allocator.wasm only through
+ *   `./wasm`'s `createThreadBufferStrategy`, so the loader's `node:` imports are
+ *   never named in a bundle Metro resolves.
  * - **No `node:crypto`, no Bun preloads.** Neither module system exists on
  *   Hermes; `./node` and `./bun/preload` are not importable here.
  *

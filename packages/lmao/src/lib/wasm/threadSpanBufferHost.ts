@@ -4,12 +4,17 @@
  *
  * Scratch pages are grown from the imported memory so intern/open payloads live
  * at offsets the WASM module can read without colliding with the Rust heap.
+ *
+ * This module is the only way from the thread lane to the allocator.wasm
+ * loader, and `ThreadBufferStrategy` does not import it: a bundle that uses the
+ * strategy over another provider must not evaluate, or even name, the loader's
+ * `node:` imports.
  */
 
 import { isRecord } from '@smoothbricks/validation';
 import type { Table } from '@uwdata/flechette';
 import type { LogSchema } from '../schema/LogSchema.js';
-import type { ThreadSpanBufferProvider } from '../ThreadBufferStrategy.js';
+import { ThreadBufferStrategy, type ThreadSpanBufferProvider } from '../ThreadBufferStrategy.js';
 import { convertThreadViewToArrowTable } from './convertThreadBuffer.js';
 import { encodeSchemaBlob, schemaAttributeOrdinals } from './schemaBlob.js';
 import {
@@ -222,4 +227,21 @@ export async function createThreadSpanBufferRuntime(options?: {
     },
   };
   return runtime;
+}
+
+/** A thread-lane strategy over allocator.wasm's row stores. */
+export async function createThreadBufferStrategy<TSchema extends LogSchema>(options?: {
+  capacity?: number;
+  threadId?: bigint;
+  initialPages?: number;
+  maxPages?: number;
+  /** Pre-compiled allocator.wasm for bundled environments; see createThreadSpanBufferRuntime. */
+  module?: WebAssembly.Module;
+}): Promise<ThreadBufferStrategy<TSchema, ThreadSpanBufferRuntime>> {
+  const runtime = await createThreadSpanBufferRuntime({
+    initialPages: options?.initialPages,
+    maxPages: options?.maxPages,
+    module: options?.module,
+  });
+  return ThreadBufferStrategy.fromProvider<TSchema, ThreadSpanBufferRuntime>(runtime, options);
 }

@@ -9,11 +9,12 @@ import {
   ENTRY_TYPE_SPAN_START,
   THREAD_ATTRIBUTE_KINDS,
 } from '../schema/systemSchema.js';
-import { ThreadBufferStrategy } from '../ThreadBufferStrategy.js';
+import type { ThreadBufferStrategy } from '../ThreadBufferStrategy.js';
 import { createTraceRoot } from '../traceRoot.node.js';
 import { TestTracer } from '../tracers/TestTracer.js';
-import type { ThreadSpanBufferRuntime } from '../wasm/threadSpanBufferHost.js';
+import { createThreadBufferStrategy, type ThreadSpanBufferRuntime } from '../wasm/threadSpanBufferHost.js';
 import { isThreadSpanView } from '../wasm/threadSpanView.js';
+import { runtimeModuleGraph } from './moduleGraph.js';
 
 const schema = defineLogSchema({
   count: S.number(),
@@ -26,7 +27,18 @@ describe('ThreadBufferStrategy', () => {
   let strategy: ThreadBufferStrategy<typeof schema, ThreadSpanBufferRuntime>;
 
   beforeAll(async () => {
-    strategy = await ThreadBufferStrategy.create({ capacity: 8 });
+    strategy = await createThreadBufferStrategy({ capacity: 8 });
+  });
+
+  it('reaches no allocator.wasm loader, so a bundle over another provider names no node: module', async () => {
+    const graph = await runtimeModuleGraph('lib/ThreadBufferStrategy.ts');
+
+    expect(
+      [...graph.modules].filter(
+        (module) => module === 'lib/wasm/wasmAllocator.ts' || module === 'lib/wasm/threadSpanBufferHost.ts',
+      ),
+    ).toEqual([]);
+    expect([...graph.bare.keys()].filter((specifier) => specifier.startsWith('node:'))).toEqual([]);
   });
 
   it('writes root and child spans through the ThreadSpanBuffer binding', () => {
@@ -179,7 +191,7 @@ describe('ThreadBufferStrategy', () => {
   });
 
   it('re-interns a name after a reset reclaims the arena, so it never writes a stale ordinal', async () => {
-    const reclaiming: ThreadBufferStrategy<typeof schema, ThreadSpanBufferRuntime> = await ThreadBufferStrategy.create({
+    const reclaiming: ThreadBufferStrategy<typeof schema, ThreadSpanBufferRuntime> = await createThreadBufferStrategy({
       capacity: 8,
     });
     const tracer = new TestTracer(opContext, { bufferStrategy: reclaiming, createTraceRoot });

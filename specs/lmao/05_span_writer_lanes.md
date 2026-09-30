@@ -173,9 +173,11 @@ a provider before importing lmao; a silent `Math.random` fallback stays rejected
 
 ## 8. Providers
 
-**One lane (the native thread row store), several providers, chosen at construction — `ThreadBufferStrategy.create()`
-for Wasm, `ThreadBufferStrategy.fromProvider(provider)` for any other.** A `ThreadSpanBufferProvider` creates a binding
-per schema and owns the lane's JavaScript Arrow conversion; the strategy never asks which provider it holds.
+**One lane (the native thread row store), several providers, chosen at construction — `createThreadBufferStrategy()`
+(`@smoothbricks/lmao/wasm`) for Wasm, `ThreadBufferStrategy.fromProvider(provider)` for any other.** A
+`ThreadSpanBufferProvider` creates a binding per schema and owns the lane's JavaScript Arrow conversion; the strategy
+never asks which provider it holds, and never imports one: the allocator.wasm loader names `node:` modules, so a bundle
+built over another provider must not reach it through the strategy.
 
 - **Wasm** (`createThreadSpanBufferRuntime`): `allocator.wasm` slots, strings encoded into a scratch page, cells viewed
   in linear memory at the offset `thread_span_buffer_attribute_cells` exports. A `memory.grow` detaches views but never
