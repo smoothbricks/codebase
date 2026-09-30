@@ -187,6 +187,7 @@ fn runtime_open_mode(command: &Command) -> RuntimeOpenMode {
         | Command::Mount(_)
         | Command::Setup(_)
         | Command::Gateway(_)
+        | Command::Controller
         | Command::Credential(_)
         | Command::Identity(_)
         | Command::Sccache(_)
@@ -257,6 +258,7 @@ fn runtime_recovery_scope(command: &Command) -> Result<RecoveryScope> {
         | Command::Mount(_)
         | Command::Setup(_)
         | Command::Gateway(_)
+        | Command::Controller
         | Command::Sccache(_)
         | Command::Skill(_)
         | Command::Version
@@ -1444,6 +1446,9 @@ where
         }
         Command::Gateway(_) => Err(CowshedError::internal(
             "gateway commands must be dispatched by the host service entrypoint",
+        )),
+        Command::Controller => Err(CowshedError::internal(
+            "the controller verb serves its own connection and is dispatched before the runtime bridge",
         )),
         Command::Credential(_) => Err(CowshedError::internal(
             "credential commands must be dispatched by the host service entrypoint",

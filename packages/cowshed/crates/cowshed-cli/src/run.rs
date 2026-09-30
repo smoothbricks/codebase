@@ -14,8 +14,8 @@ use cowshed_core::CowshedError;
 use cowshed_gateway::{GATEWAY_GIT_FETCH_HELPER_ARG, run_gateway_git_fetch_helper};
 
 use crate::{
-    args, credential_service, gateway_service, help, identity_service, output, runtime,
-    sccache_service, setup_service, skill,
+    args, controller_service, credential_service, gateway_service, help, identity_service, output,
+    runtime, sccache_service, setup_service, skill,
 };
 
 /// How one invocation ends.
@@ -152,6 +152,20 @@ async fn run_command(parsed: args::Cli, interrupts: InterruptPolicy) -> Result<i
     }
     if let args::Command::Gateway(action) = &parsed.command {
         let outcome = gateway_service::dispatch(*action, parsed.global.json, &mut output).await;
+        return Ok(finish(outcome, &mut output, json));
+    }
+    // An embedding process's controller: a service over the socket it was handed that lasts as long
+    // as that process keeps its end open, so like the host services above it sits outside the
+    // interruptible section below. The socket is taken first, so a terminal on stdin is refused
+    // before the project is resolved or opened.
+    if matches!(parsed.command, args::Command::Controller) {
+        let outcome = async {
+            let socket = controller_service::take_inherited_socket()?;
+            let root = runtime::resolve_project_root(&parsed).await?;
+            controller_service::serve(&root, socket).await
+        }
+        .await
+        .map(|()| 0);
         return Ok(finish(outcome, &mut output, json));
     }
     // Enrolment is a host operation with a project subject: it needs the repository identity a

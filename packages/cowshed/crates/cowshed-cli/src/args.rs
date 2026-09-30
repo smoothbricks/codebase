@@ -38,6 +38,7 @@ pub static COMMANDS: &[&CommandSpec] = &[
     &LAND,
     &DOCTOR,
     &GATEWAY,
+    &CONTROLLER,
     &CREDENTIAL,
     &IDENTITY,
     &SCCACHE,
@@ -85,6 +86,8 @@ pub enum Command {
     Land(LandArgs),
     Doctor(DoctorArgs),
     Gateway(GatewayCommand),
+    /// One coordinator controller connection, served on standard input for an embedding process.
+    Controller,
     Credential(CredentialCommand),
     Identity(IdentityCommand),
     Sccache(SccacheCommand),
@@ -127,6 +130,7 @@ impl Command {
             | Self::Rebase(_)
             | Self::Land(_)
             | Self::Credential(_)
+            | Self::Controller
             | Self::Identity(_) => ProjectDiscovery::Required,
             Self::List(args) if !args.all => ProjectDiscovery::Optional,
             Self::Doctor(_) => ProjectDiscovery::Optional,
@@ -801,6 +805,7 @@ fn cli_command() -> ClapCommand {
                 .subcommand(leaf("status"))
                 .subcommand(leaf("run")),
         )
+        .subcommand(leaf("controller"))
         .subcommand(
             leaf("credential")
                 .subcommand_required(true)
@@ -935,6 +940,7 @@ fn cli_from_matches(matches: ArgMatches) -> Result<Cli, UsageError> {
         "rebase" => parse_rebase(leaf)?,
         "land" => parse_land(leaf)?,
         "doctor" => parse_doctor(leaf)?,
+        "controller" => Command::Controller,
         "gateway" => parse_gateway(leaf, &global)?,
         "credential" => parse_credential(leaf)?,
         "identity" => parse_identity(leaf)?,
@@ -1246,6 +1252,19 @@ fn reject_project(
     }
     Ok(())
 }
+
+const CONTROLLER: CommandSpec = CommandSpec {
+    name: "controller",
+    missing: "controller requires an argument",
+    args: "",
+    trailing: "",
+    summary: "serve a controller to an embedding process",
+    about: &[
+        "Serves one coordinator controller connection for the project selected by the cwd or `--project`, on standard input, which must be a Unix socket: an embedding process makes a socketpair, starts this command with one end as its standard input, and speaks the controller protocol on the other end (`Cowshed::connect` in Rust, `coordinatorEndpoint` in N-API). Nothing is written to stdout; the command exits 0 when the embedding process closes its end.",
+        "A program that links cowshed as a library is another cowshed build, and the daemon starts workspace supervisors only for its own build, so such a program runs its controller as this command of the host's `cowshed` instead of opening the project in-process. The project opens here exactly as for any other verb, and the project's gateway sessions are reconciled before each exec, shell and checked land, as `cowshed exec` and `cowshed land --check` reconcile them.",
+    ],
+    options: &[],
+};
 
 const GATEWAY: CommandSpec = CommandSpec {
     name: "gateway",
@@ -3845,6 +3864,7 @@ mod tests {
             (&["land", "raven"], Required),
             (&["doctor"], Optional),
             (&["gateway", "status"], NotUsed),
+            (&["controller"], Required),
             (&["sccache", "status"], NotUsed),
             (&["skill", "install"], NotUsed),
             (&["help"], NotUsed),

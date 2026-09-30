@@ -167,22 +167,20 @@ error and does not rewrite the already-established process exit or output-limit 
 
 ## Embedding the controller
 
-A Rust host that embeds `cowshed-core` directly — a supervising runtime rather than the CLI — opens a project with
-`ProjectRuntime::open_existing_with_audit(root, ContinuityAudit::External(Box::new(sink)))`, where `sink` implements
-`cowshed_core::storage::audit::AuditSink` (`record(CommitmentDraft) -> Result<(), AuditSinkError>` plus a short
-`name()`); the same typed records the Arrow sink would seal then go wherever the host keeps its durable log. Job records
-are among them although the workspace supervisors that make them are processes of their own: the controller reads each
-supervisor's records by cursor over its socket, records them into the host's sink, and acknowledges them. The host never
-needs the Arrow files. Before installing workspace sessions it calls
-`cowshed_core::gateway_sessions::reconcile_native_project(&repo_id)` (or `reconcile_project` over its own
-`GatewayControl`/`SessionInventory`) so a stale session of a deleted project cannot hold the endpoint; authority for
-every decision is the image inventory, the grants files, and the controller lock — no log is replayed.
+A program that links `cowshed-core` — a supervising runtime rather than the CLI — does not open a project in-process.
+The daemon's manager starts workspace supervisors only for its own build, the `LC_UUID` the linker derived from the
+`cowshed` binary, and a program linking cowshed is always another build: an in-process controller has every exec,
+session and sandboxed Git step refused with `Conflict` ("the cowshed daemon is build …; this cowshed is build …").
 
-Warm exec hosts and script jobs need a program to start as each workspace's host. A Rust host gets them by depending on
-`cowshed-shell` and calling `cowshed_shell::dispatch()` first in `main`, before any thread starts: the call returns at
-once in the host's own process, registers the running executable as the exec host program, and never returns in a
-process started as an exec host. Without it every argv job enters its shell once per command and every script job is
-refused as `environment-missing`.
+The program runs its controller as the host's own `cowshed` instead. It makes a socketpair, starts
+`cowshed --project <root> controller` with one end as its standard input, and connects on the other end:
+`Cowshed::connect(descriptor)` yields the same `Cowshed` and `CoordinatorToken` an in-process controller would, and
+every call it makes runs in the child. Dropping every handle closes the socket, and the child shuts the project down and
+exits 0. The child reconciles the project's gateway sessions before each exec, shell and checked land, as `cowshed exec`
+and `cowshed land --check` do, and records controller commitments into the host's default sink
+(`COWSHED_CONTINUITY_AUDIT`, [telemetry](telemetry.md)); the embedder keeps neither. A child that cannot open the
+project exits with the typed error on its stderr and closes the socket, so the embedder's handshake fails instead of
+waiting.
 
 ## MCP authority delivery
 

@@ -1032,7 +1032,10 @@ mod parity_tests {
             Command::Rebase(_) => Some("Coordinator.rebase"),
             Command::Land(_) => Some("Coordinator.land"),
             Command::Doctor(_) => Some("Coordinator.doctor"),
-            Command::Gateway(_)
+            // The verb serves the endpoint `coordinatorEndpoint` wraps; the addon is its peer, not a
+            // second copy of it.
+            Command::Controller
+            | Command::Gateway(_)
             | Command::Credential(_)
             | Command::Identity(_)
             | Command::Sccache(_)
@@ -1082,6 +1085,7 @@ mod parity_tests {
         (&["land", "parity"], Some("Coordinator.land")),
         (&["doctor"], Some("Coordinator.doctor")),
         (&["gateway", "status"], None),
+        (&["controller"], None),
         (&["credential", "status"], None),
         (&["identity", "add", "forge"], None),
         (&["sccache", "status"], None),

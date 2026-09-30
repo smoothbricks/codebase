@@ -792,7 +792,10 @@ The capability split is preserved across the boundary by _how a caller connects,
 string_. `coordinatorEndpoint` wraps only an already inherited controller socket; it does not mint authority. The
 read-only `openProject` consumes that endpoint, completes the peer/nonce handshake, opens the explicit project path,
 then discards `CoordinatorToken` before returning `Project`. Reuse fails, and dropping an unused endpoint closes its
-descriptor.
+descriptor. An embedding process gets such a socket by making a socketpair and starting the host's `cowshed controller`
+with one end as its standard input (06_cli.md); the other end is what `coordinatorEndpoint` and `Cowshed::connect` take.
+That child is the controller: it is the host's own build, so the daemon starts workspace supervisors for it, which it
+would refuse to do for a controller running inside the embedding process (11_shell.md, Protocol).
 
 The mutation surface accepts a fresh endpoint plus project path because the handshake identifies the repository while
 `Cowshed::open` still requires the checkout path. `connectWorkspace(workerDescriptor)` consumes a distinct 256-bit,

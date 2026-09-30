@@ -1,4 +1,5 @@
 pub mod args;
+pub mod controller_service;
 pub mod credential_service;
 pub mod gateway_service;
 pub mod help;

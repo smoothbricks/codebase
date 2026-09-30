@@ -1082,9 +1082,20 @@ authority arrives only through a dedicated inherited FD/socketpair and is never 
 environment. Worker connections redeem short-lived one-use descriptors and can run or observe only their bound
 workspace.
 
+### `cowshed controller`
+
+Serves one coordinator controller connection, for the project selected by the cwd or `--project`, to the embedding
+process that started it with one end of a Unix socketpair as its standard input. A program that links cowshed is another
+cowshed build, and the daemon starts workspace supervisors only for its own, so such a program runs its controller as
+this command of the host's `cowshed` and speaks the controller protocol on its end of the socket
+([integrations](integrations.md#embedding-the-controller)). Nothing is written to stdout; the command exits 0 when the
+embedding process closes its end. A terminal or a pipe on standard input is refused with exit 2 before the project is
+resolved. The project's gateway sessions are reconciled before each exec, shell and checked land.
+
 ### `cowshed gc`
 
-Deletes retired and orphaned images and stale mountpoint dirs, prunes expired checkpoints, and reports what it freed. Safe to run anytime; `rm`, `land`, and `restore` also run it opportunistically.
+Deletes retired and orphaned images and stale mountpoint dirs, prunes expired checkpoints, and reports what it freed.
+Safe to run anytime; `rm`, `land`, and `restore` also run it opportunistically.
 
 ### `cowshed doctor`
 
