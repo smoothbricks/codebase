@@ -3,6 +3,7 @@ import { execFileSync } from 'node:child_process';
 import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
+import { fixtureNxEnv } from './__tests__/fixture-nx-env.js';
 import { hashCargoPathInputs } from './cargo-source-hash.js';
 
 it.each(['app', '.'])('invalidates transitive and inherited Cargo inputs with Nx rooted at %s', async (nxDirectory) => {
@@ -344,14 +345,7 @@ await appendFile(${JSON.stringify(executions)}, result);
       const run = async () => {
         const child = Bun.spawn(['bun', join(repositoryRoot, 'node_modules/.bin/nx'), 'run', 'app:build'], {
           cwd: workspace,
-          env: {
-            ...process.env,
-            NX_WORKSPACE_ROOT_PATH: workspace,
-            NX_DAEMON: 'false',
-            NX_ISOLATE_PLUGINS: 'false',
-            NX_WORKSPACE_DATA_DIRECTORY: join(workspace, '.nx/workspace-data'),
-            NX_CACHE_DIRECTORY: join(workspace, '.nx/cache'),
-          },
+          env: fixtureNxEnv(workspace),
           stdout: 'pipe',
           stderr: 'pipe',
         });
