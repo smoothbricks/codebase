@@ -94,8 +94,8 @@ export function parseReleaseProjectSelection(
  * the named projects themselves. A named release still closes over the
  * workspace dependencies that carry unreleased changes: the named package is
  * built against its dependency's HEAD source, so pinning that dependency at
- * its last published version ships a build nobody tested (an `@axe.sc/axe`
- * released against an `axe-client-ts` whose stale publish still advertised a
+ * its last published version ships a build nobody tested (a downstream CLI
+ * released against a client library whose stale publish still advertised a
  * `development` export pointing at unshipped source).
  */
 export async function releaseCandidatePackages<Package extends ReleasePackageInfo>(

@@ -12,7 +12,7 @@
 //! Three sinks: [`ArrowAuditSink`] writes one sealed Arrow IPC segment per record under the
 //! telemetry root — private file, fsync, `rename(2)` without replace, directory sync — the
 //! standalone CLI's default; [`NullAuditSink`] discards; and any external implementation of the
-//! trait a host injects (Containium routes the records to PTMCART from its side). Segment names
+//! trait a host injects (an embedding runtime routes the records into its own durable log). Segment names
 //! are `commitment-<order>-<writer>.arrow` with a writer-local, monotone `order` and a fresh
 //! writer id per process, so concurrent controllers never contend and no lock is needed.
 
@@ -221,7 +221,7 @@ pub enum ContinuityAudit {
     Arrow,
     /// No audit trail.
     Off,
-    /// A host-provided sink; Containium injects a PTMCART-backed one here.
+    /// A host-provided sink, e.g. one that writes into the embedding runtime's durable log.
     External(Box<dyn AuditSink>),
 }
 

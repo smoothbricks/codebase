@@ -21,8 +21,8 @@ bench-internals = []
 # module stays scalar and only the kernel vectorises; simd128 has been
 # universal in shipping wasm engines since 2021, so the default is on. Set
 # this only when targeting an engine that predates the SIMD proposal — the
-# module would otherwise fail validation there. Same contract as ptmcart's
-# feature of the same name, which forwards here.
+# module would otherwise fail validation there. A downstream crate that
+# exposes a feature of the same name forwards it here, under the same contract.
 wasm-scalar-portable = []
 
 [dev-dependencies]

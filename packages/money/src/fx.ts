@@ -22,8 +22,8 @@ import { type Amount, Basis, type Basis as BasisValue } from './types.js';
  * and never silently absorb the residual. `convertFx` returns the settled Amount,
  * the explicit `remainder`, and the rate/mode audit. The richer settlement tuple
  * the spec lists (`source_amount`/`settled_amount`/`rate_source`/`rate_as_of_date`/
- * `fx_delta_classification`) is assembled by billing's FX Op around this primitive
- * (`audit-multi-currency.fx-rate-ops`); this is the pure math foundation.
+ * `fx_delta_classification`) is assembled around this primitive by the consuming
+ * system's FX Op; this is the pure math foundation.
  */
 export interface FxAudit<From extends string, To extends string> {
   readonly fromAmount: Amount<From>;

@@ -782,8 +782,8 @@ pub fn words_and_count<const N: usize>(windows: [&[u8]; N]) -> usize {
 /// artifact carries the blanket `-C target-feature=+simd128`). wasm target
 /// features are safe to call from safe code: the engine validates the whole
 /// module up front, so there is no undetected-feature UB. The opt-out for
-/// pre-2021 engines is the build-time `wasm-scalar-portable` feature, same
-/// contract as ptmcart's.
+/// pre-2021 engines is the build-time `wasm-scalar-portable` feature, which
+/// downstream crates forward under the same name.
 #[cfg(all(target_arch = "wasm32", not(feature = "wasm-scalar-portable")))]
 mod wasm_simd128 {
     use core::arch::wasm32::{

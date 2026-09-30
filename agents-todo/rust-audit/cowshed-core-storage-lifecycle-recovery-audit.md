@@ -396,7 +396,7 @@ the `expect("fixed main")` sites in this slice. Cost/Risk: none.
   duplicate that. Keep.
 - **arrow-\* in `audit.rs`.** One sealed Arrow IPC segment per record is the declared telemetry format (`job_artifact`
   owns the schema so a second Arrow version cannot fork). In-process, typed, and the CLI default. Not replaceable by
-  `serde_json` without breaking Containium/PTMCART. Feature flags are not over-wide for this use.
+  `serde_json` without breaking hosts that ingest the segments. Feature flags are not over-wide for this use.
 - **Copies / alloc regime.** `clone()` on `RepoId`/`WorkspaceName` in `PurePlanner` and `derive_workspaces` is
   once-per-lifecycle-plan / once-per-enumerate, not a probe loop. `ArrowAuditSink::seal` allocates a batch, two
   `CString`s, and a v4 uuid per record — once per controller act. Do not file these as copies findings (PH §4.1: name

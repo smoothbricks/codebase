@@ -628,7 +628,7 @@ export function validateWorkspaceDependencies(root: string, options: PackageTarg
         }
         // A shipped package's runtime dependency must ship through the same
         // release, or every publish pins whatever someone once pushed by hand:
-        // @axe.sc/axe released against an untagged axe-client-ts for months.
+        // a downstream CLI released against an untagged client library for months.
         if (
           field !== 'devDependencies' &&
           publishableNames.has(pkg.name) &&

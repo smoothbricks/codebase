@@ -48,7 +48,7 @@ impl EfLayout {
             return None;
         }
         // floor(log2(span / n)) by bit-length difference, corrected by one
-        // shifted compare - the same derivation ptmcart's monotone plane
+        // shifted compare - the same derivation a downstream monotone plane
         // uses, and for the same reason: a divide here would be the only
         // divide in the encoder.
         let mut low_bits = if span <= n {

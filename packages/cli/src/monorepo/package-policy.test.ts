@@ -691,7 +691,7 @@ describe('workspace package script policy', () => {
   });
 
   /**
-   * The AxE regression: `containium` declares its build aggregate because
+   * The downstream regression: a runtime host declares its build aggregate because
    * inference cannot reach the producers it needs — its own `build-cli`, and
    * sibling targets that are not named `build`, so `^build` never visits them,
    * and are outside the `*-js|*-web|…` output family, so the inferred aggregate
@@ -706,29 +706,29 @@ describe('workspace package script policy', () => {
     const declaredBuild = {
       executor: 'nx:noop',
       cache: true,
-      dependsOn: ['build-cli', 'containium-bun:runtime', 'tsc-js'],
+      dependsOn: ['build-cli', 'runtime-bun:runtime', 'tsc-js'],
     };
     const root = await createWorkspace({
       rootName: '@smoothbricks/codebase',
       packages: [
-        { dir: 'containium-bun', name: '@axe.sc/containium-bun', nx: { name: 'containium-bun' } },
+        { dir: 'runtime-bun', name: '@example/runtime-bun', nx: { name: 'runtime-bun' } },
         {
-          dir: 'containium',
-          name: '@axe.sc/containium',
-          nx: { name: 'containium', targets: { build: declaredBuild } },
+          dir: 'runtime-host',
+          name: '@example/runtime-host',
+          nx: { name: 'runtime-host', targets: { build: declaredBuild } },
         },
       ],
     });
     try {
       const resolvedTargetsByProject = new Map([
-        ['containium-bun', { targets: new Set(['build', 'runtime', 'tsc-js']) }],
-        ['containium', { targets: new Set(['build', 'build-cli', 'tsc-js']) }],
+        ['runtime-bun', { targets: new Set(['build', 'runtime', 'tsc-js']) }],
+        ['runtime-host', { targets: new Set(['build', 'build-cli', 'tsc-js']) }],
       ]);
 
       applyWorkspaceDependencyDefaults(root, { resolvedTargetsByProject });
 
-      const containium = await readJson(join(root, 'packages/containium/package.json'));
-      expect(containium.nx).toEqual({ name: 'containium', targets: { build: declaredBuild } });
+      const host = await readJson(join(root, 'packages/runtime-host/package.json'));
+      expect(host.nx).toEqual({ name: 'runtime-host', targets: { build: declaredBuild } });
       expect(validateWorkspaceDependencies(root, { resolvedTargetsByProject })).toBe(0);
     } finally {
       await rm(root, { recursive: true, force: true });

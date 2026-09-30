@@ -3396,7 +3396,7 @@ impl Range for Bitmosaic64ViewRange<'_> {
     }
 
     /// The inherent [`Bitmosaic64ViewRange::seek`] — a high-32 directory walk
-    /// into one forest's own seek. This is the cursor `ptmcart`'s FTS
+    /// into one forest's own seek. This is the cursor a downstream FTS index's
     /// postings intersect through, so it is the one whose absence from the
     /// protocol made the two-token AND emit path step `|A| + |B|` times.
     #[inline(always)]

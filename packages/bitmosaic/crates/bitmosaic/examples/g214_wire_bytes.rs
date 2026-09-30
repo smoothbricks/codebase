@@ -9,9 +9,9 @@
 //!
 //! **Instrument check, run first and printed above the table.** The owned
 //! `heap_bytes` column and the two baseline closed forms are re-derived here
-//! rather than imported, and each is checked against the figure
-//! `ptmcart/examples/g200_bitmosaic_crossover.rs` published from real encoder
-//! output. A baseline that cannot reproduce a known point cannot price an
+//! rather than imported, and each is checked against the figure a
+//! downstream FTS index's `g200_bitmosaic_crossover` harness published from
+//! real encoder output. A baseline that cannot reproduce a known point cannot price an
 //! unknown one, and a ratio whose denominator is unvalidated is a number
 //! with no subject.
 //!
@@ -56,15 +56,14 @@ fn progression(step: u32, n: usize) -> Vec<u32> {
 
 // ── baselines ────────────────────────────────────────────────────────────
 
-/// `ptmcart`'s FTS span-tight bitmap container: a 28-byte record plus one
-/// `ptmcart`'s FTS bitmap container (`encode_bitmap_container`, 24-byte
+/// The downstream FTS index's bitmap container (`encode_bitmap_container`, 24-byte
 /// header): word-aligned, not bit-tight — `base_word = first >> 6` and
 /// `word_count = (last >> 6) - base_word + 1`.
 fn span_tight_bitmap(values: &[u32]) -> usize {
     let (first, last) = (values[0] >> 6, values[values.len() - 1] >> 6);
     24 + ((last - first) as usize + 1) * 8
 }
-/// `ptmcart`'s FTS Elias-Fano container: a 32-byte record, `n * low_bits`
+/// The downstream FTS index's Elias-Fano container: a 32-byte record, `n * low_bits`
 /// packed low bits, and a `(span >> low_bits) + n` bit high plane.
 fn fts_elias_fano(values: &[u32]) -> usize {
     let n = values.len() as u64;

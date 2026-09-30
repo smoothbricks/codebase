@@ -4,10 +4,10 @@
 //! `bitmosaic/README.md` recorded `Bitmosaic::iter()` as select-driven — one
 //! `Container::select` per element — and measured **18.0 ns/element** on
 //! `u20k/n8000`, a single `Words` chunk, against **0.06** for a flat
-//! `Vec<u32>`. That is the defect `ptmcart::planes::MonotoneIter` had
-//! (`10b73772`): `select` on a directory-guided container re-enters the
-//! group seek and rescans from a group boundary for every element, so an
-//! O(n) sequence costs O(n · groupwidth) to produce.
+//! `Vec<u32>`. That is the defect a downstream `MonotoneIter` plane had:
+//! `select` on a directory-guided container re-enters the group seek and
+//! rescans from a group boundary for every element, so an O(n) sequence
+//! costs O(n · groupwidth) to produce.
 //!
 //! The four arms raced here are the four ways to read the same values:
 //!

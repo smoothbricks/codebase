@@ -327,7 +327,7 @@ function isRedundantBuildDeclaration(build: Record<string, unknown>, resolvedTar
  * Deliberately NOT decided against the resolved project graph. Nx replaces a
  * named property of an inferred target with the declared one, so the resolved
  * `build.dependsOn` IS the declaration: comparing them answered "redundant"
- * for every noop aggregate anyone ever wrote. AxE's `containium` lost seven
+ * for every noop aggregate anyone ever wrote. A downstream runtime host lost seven
  * edges that way — four of them targets no inference can reach — and a clean
  * checkout then built it without its producers. The question this has to
  * answer is what inference yields WITHOUT the declaration, so the test is

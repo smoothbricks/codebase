@@ -1,7 +1,7 @@
 //! G215: does reading from the wire cost what reading from the heap costs,
 //! and is the Elias-Fano root in the probe class this crate contracts for?
 //!
-//! `bitmosaic/README.md` measured `ptmcart::planes::MonotoneView` at **201.6 ns**
+//! `bitmosaic/README.md` measured a downstream `MonotoneView` plane at **201.6 ns**
 //! `contains` and **180.2 ns** `rank` against the owned forest's 0.4 / 2.7,
 //! and concluded an Elias-Fano arm "needs a select structure, not a
 //! `MonotoneView` wrapper". The wire format publishes an EF root wherever it

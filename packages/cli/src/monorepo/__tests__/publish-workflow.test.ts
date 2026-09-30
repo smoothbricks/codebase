@@ -117,7 +117,7 @@ describe('publish workflow definition', () => {
       runsOn: ['nixos-latest-x64', 'self-hosted'],
       platformTargetGlobs: ['*-macos', '*-linux'],
       macosPlatformArchitectures: ['arm64'],
-      platformProducer: { kind: 'linux-cross', preflight: 'sh scripts/prepare-macos-sdk.sh', env: { AXE_CROSS: '1' } },
+      platformProducer: { kind: 'linux-cross', preflight: 'sh scripts/prepare-macos-sdk.sh', env: { APP_CROSS: '1' } },
       privateNpm: { scope: '@acme', readTokenEnv: 'READ_ENV', publishTokenEnv: 'PUBLISH_ENV' },
     });
 
@@ -133,7 +133,7 @@ describe('publish workflow definition', () => {
     // It still builds the Apple targets, with the producer's toolchain env and
     // its preflight ahead of setup.
     expect(rendered).toContain('--targets "*-macos"');
-    expect(rendered).toMatch(/^ {6}AXE_CROSS: ['"]1['"]$/m);
+    expect(rendered).toMatch(/^ {6}APP_CROSS: ['"]1['"]$/m);
     expect(rendered).toContain('Check cross-platform toolchain prerequisites');
     expect(rendered.indexOf('Check cross-platform toolchain prerequisites')).toBeLessThan(
       rendered.indexOf('Setup Nix/devenv'),

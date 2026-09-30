@@ -2764,7 +2764,7 @@ mod tests {
         <dict><key>dev-entry</key><string>/dev/disk90s1</string><key>content-hint</key><string>C12A7328-F81F-11D2-BA4B-00A0C93EC93B</string></dict>
         <dict><key>dev-entry</key><string>/dev/disk90s2</string><key>content-hint</key><string>7C3457EF-0000-11AA-AA11-00306543ECAC</string></dict>
         <dict><key>dev-entry</key><string>/dev/disk91</string><key>content-hint</key><string>EF57347C-0000-11AA-AA11-00306543ECAC</string></dict>
-        <dict><key>dev-entry</key><string>/dev/disk91s1</string><key>content-hint</key><string>41504653-0000-11AA-AA11-00306543ECAC</string><key>mount-point</key><string>/Users/danny/Dev/.cowshed/axe-scale/minigraf/wasmsurf</string></dict>
+        <dict><key>dev-entry</key><string>/dev/disk91s1</string><key>content-hint</key><string>41504653-0000-11AA-AA11-00306543ECAC</string><key>mount-point</key><string>/Users/danny/Dev/.cowshed/example-org/minigraf/wasmsurf</string></dict>
       </array>
     </dict></array></dict></plist>"#;
 

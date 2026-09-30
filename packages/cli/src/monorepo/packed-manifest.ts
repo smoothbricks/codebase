@@ -110,7 +110,7 @@ function walkExportConditions(
  * set is pinned at a published version, and that publish must be the source at
  * HEAD: when the dependency carries releasable changes since the pin's tag, or
  * the pin names a version no release ever tagged, the release ships a build
- * nobody tested (`@axe.sc/axe` 0.0.8 pinned an untagged `axe-client-ts` 0.1.0
+ * nobody tested (a downstream CLI's 0.0.8 pinned an untagged client library at 0.1.0
  * whose stale publish still advertised a `development` export). The fix is to
  * release the dependency too, never to ship the pin. Prerelease pins are
  * workspace-internal (`-next`) and never what ships, so they are not judged.

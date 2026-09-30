@@ -2128,12 +2128,12 @@ impl<'path> RecordsLock<'path> {
             .and_then(Path::parent)
             .ok_or_else(|| integrity(0, "records path has no workspace root"))?;
         let job_root = ensure_private_job_root(workspace_root)?;
-        // WHY lock: packages/containium-bun/clippy.toml:8 / Containium 90 §1 prefers one
-        // actor writer. Here independent CLI and embedding processes have no shared always-live
-        // owner; choosing an actor would invent a daemon availability boundary. Sequence allocation
-        // and the framed byte append must be one atomic operation across processes. The guard also
-        // spans recovery, terminal duplicate validation, the whole append and rollback; narrowing
-        // it recreates the duplicate-allocation or torn-recovery race.
+        // WHY lock: one actor writer is the preferred shape, but independent CLI and embedding
+        // processes have no shared always-live owner; choosing an actor would invent a daemon
+        // availability boundary. Sequence allocation and the framed byte append must be one
+        // atomic operation across processes. The guard also spans recovery, terminal duplicate
+        // validation, the whole append and rollback; narrowing it recreates the duplicate-allocation
+        // or torn-recovery race.
         let path = job_root.join("records.lock");
         let mut options = OpenOptions::new();
         options.create(true).read(true).write(true);

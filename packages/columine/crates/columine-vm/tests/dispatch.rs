@@ -2604,7 +2604,7 @@ fn empty_batch_with_no_column_pointers_is_ok() {
 
 /// A non-empty batch whose program references columns the batch does not
 /// carry (or carries short) is a malformed batch: every batch-driven op
-/// refuses with COLUMN_UNDERRUN. Found live by the containium runtime gate —
+/// refuses with COLUMN_UNDERRUN. Found live by an embedding host's runtime gate —
 /// a scenario batch with `batch_len == 1` and zero columns drove FOR_EACH's
 /// AGG_COUNT off an empty type column, and the panic aborted the host process
 /// through its extern "C" entry. Same program as
