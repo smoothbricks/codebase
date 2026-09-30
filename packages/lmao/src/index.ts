@@ -131,6 +131,7 @@ export * from './lib/flushScheduler.js';
 export type { BufferStrategy } from './lib/bufferStrategy.js';
 export { JsBufferStrategy } from './lib/JsBufferStrategy.js';
 export { ThreadBufferStrategy, type ThreadSpanBufferProvider } from './lib/ThreadBufferStrategy.js';
+export { encodeSchemaBlob } from './lib/wasm/schemaBlob.js';
 export {
   attributeCellStride,
   THREAD_SPAN_BUFFER_OK,

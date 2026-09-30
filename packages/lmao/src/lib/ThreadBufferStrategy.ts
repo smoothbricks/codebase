@@ -120,6 +120,7 @@ export class ThreadBufferStrategy<
     _plannedClass?: SpanBufferConstructor<T>,
   ): SpanBuffer<T> {
     const buffer = createThreadSpanView({
+      provider: this.provider,
       cells: this.cellsFor(schema),
       schema,
       traceRoot,
@@ -141,6 +142,7 @@ export class ThreadBufferStrategy<
   ): SpanBuffer<T> {
     const childSchema = schema ?? parentBuffer._logSchema;
     const child = createThreadSpanView({
+      provider: this.provider,
       cells: this.cellsFor(childSchema),
       schema: childSchema,
       traceRoot: parentBuffer._traceRoot,
@@ -162,7 +164,6 @@ export class ThreadBufferStrategy<
   }
 
   toArrowTable(buffer: AnySpanBuffer): Table {
-    if (isThreadSpanView(buffer)) return this.provider.toArrowTable(buffer);
     return convertSpanTreeToArrowTable(buffer);
   }
 

@@ -1364,10 +1364,10 @@ export function convertSpanTreeToArrowTable(
 ): Table {
   // A thread-lane view stores rows in the native row store, not in JS-heap
   // columns; walking it as a JS tree reads empty lanes. Only the provider that
-  // reaches the store can read it back, so the conversion is the strategy's.
+  // reaches the store can read it back, and the whole logical tree shares one
+  // store, so the root view hands its provider the complete input.
   if (isThreadSpanView(rootBuffer)) {
-    // invariant throw: a thread-lane span reached the JS-heap converter.
-    throw new TypeError('a thread-lane span converts through its ThreadBufferStrategy.toArrowTable');
+    return rootBuffer.provider.toArrowTable(rootBuffer);
   }
   // ═══════════════════════════════════════════════════════════════════════════
   // PASS 0: Collect ALL unique schema fields from ALL buffers in the tree

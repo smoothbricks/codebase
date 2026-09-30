@@ -1074,6 +1074,15 @@ impl ThreadSpanBuffer {
             .ok()
             .map(|(block, local)| block.timestamps[local])
     }
+    /// The trace a span belongs to, as the store holds it: a child opened
+    /// later — after the context that opened its parent is gone — joins the
+    /// same trace by cloning this, not by re-parsing a string.
+    #[inline]
+    pub fn span_trace_id(&self, span_id: u32) -> Option<&TraceId> {
+        let row = self.spans.get(&span_id)?.start_row as usize;
+        let (block, local) = self.block_at(row).ok()?;
+        block.trace_ids[local].as_ref()
+    }
     #[inline]
     pub fn trace_id_at(&self, row: usize) -> Option<&str> {
         self.block_at(row)
@@ -1233,6 +1242,12 @@ mod tests {
         assert_eq!(buffer.row_count(), 2);
         assert_eq!(buffer.start_row(pending), Some(0));
         assert!(buffer.start_row(done).is_none());
+        // A child opened after the flush joins the retained span's trace.
+        assert_eq!(
+            buffer.span_trace_id(pending).map(TraceId::as_str),
+            Some("trace")
+        );
+        assert!(buffer.span_trace_id(done).is_none());
 
         // The retained span still takes rows and completes, and its tag lands
         // on the start row the next flush re-emits.

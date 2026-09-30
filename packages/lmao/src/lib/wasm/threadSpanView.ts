@@ -15,6 +15,7 @@ import type { LogSchema } from '../schema/LogSchema.js';
 import { THREAD_ATTRIBUTE_KINDS } from '../schema/systemSchema.js';
 import { getEnumValues, getSchemaType } from '../schema/typeGuards.js';
 import type { SpanBufferStats } from '../spanBufferStats.js';
+import type { ThreadSpanBufferProvider } from '../ThreadBufferStrategy.js';
 import { getThreadId } from '../threadId.js';
 import { createTraceId, type TraceId } from '../traceId.js';
 import type { ITraceRoot, TimestampAppendPrimitive } from '../traceRoot.js';
@@ -229,6 +230,8 @@ function laneProxy<A extends object>(target: A, write: (index: number, value: un
 }
 
 export interface ThreadSpanViewArgs<T extends LogSchema = LogSchema> {
+  /** How the lane reaches this span's store: the view converts through it. */
+  provider: ThreadSpanBufferProvider;
   cells: ThreadSpanCells;
   schema: T;
   traceRoot: ITraceRoot;
@@ -240,6 +243,7 @@ export interface ThreadSpanViewArgs<T extends LogSchema = LogSchema> {
 
 export class ThreadSpanView {
   readonly [THREAD_SPAN_VIEW] = true;
+  readonly provider: ThreadSpanBufferProvider;
   readonly cells: ThreadSpanCells;
   readonly binding: ThreadSpanBufferBinding;
   readonly layout: ThreadSpanLayout;
@@ -424,6 +428,7 @@ export class ThreadSpanView {
   }
 
   constructor(args: ThreadSpanViewArgs) {
+    this.provider = args.provider;
     this.cells = args.cells;
     this.binding = args.cells.binding;
     this._logSchema = args.schema;
