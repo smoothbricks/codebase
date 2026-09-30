@@ -67,11 +67,14 @@ async function named(path: string, name: string, mode = 0o755): Promise<void> {
   await binary(path, `printf '%s' '${name}'; for argument in "$@"; do printf ' [%s]' "$argument"; done; exit 17`, mode);
 }
 
+/**
+ * Run a fixture launcher with only HOME and PATH set. PATH is this test's own, behind `path` when
+ * given: the launcher reaches `uname`, `readlink` and `chmod` through it, and a host keeps those
+ * where it keeps them. NixOS keeps nothing but `sh` and `env` in /bin and /usr/bin.
+ */
 function launch(launcher: string, argv: readonly string[], env: { home: string; path?: string }) {
-  const result = spawnSync(launcher, [...argv], {
-    encoding: 'utf8',
-    env: { HOME: env.home, PATH: env.path === undefined ? '/usr/bin:/bin' : `${env.path}:/usr/bin:/bin` },
-  });
+  const path = [env.path, process.env.PATH].filter((entry) => entry !== undefined).join(':');
+  const result = spawnSync(launcher, [...argv], { encoding: 'utf8', env: { HOME: env.home, PATH: path } });
   return { status: result.status, stdout: result.stdout, stderr: result.stderr };
 }
 
