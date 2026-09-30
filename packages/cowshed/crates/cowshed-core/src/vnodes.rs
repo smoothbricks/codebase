@@ -1,13 +1,16 @@
 //! The kernel vnode table, read where a stalled or failed disk operation needs its cause named.
 //!
-//! macOS keeps one vnode for every file-system object recently touched, up to `kern.maxvnodes`.
-//! Past that limit every lookup, open, mount and unlink first has to recycle a vnode another
-//! process holds; when too many are busy to recycle, the table overflows the limit and each
-//! allocation waits, or fails with `ENFILE` ("Too many open files in system"). A `mount_apfs`
-//! that finishes in a second on a healthy host was measured past a two-minute deadline on one
-//! whose table stood at 272631 of 263168. The caller sees a hung or failed disk child; the
-//! cause is a host limit only the operator can raise, so cowshed reads the table where such a
-//! failure is reported and names the limit instead of blaming the executable or the image.
+//! macOS keeps one vnode for every file-system object recently touched and caches them up to
+//! `kern.maxvnodes`: on a busy host `kern.num_vnodes` sits at the limit as a matter of course,
+//! with most of them on the free list (`kern.free_vnodes`), ready to be recycled for the next
+//! lookup. That full cache is healthy. The table is saturated only when the vnodes in use — the
+//! allocated ones that are not free — reach the limit: then nothing can be recycled, the kernel
+//! allocates past the limit, and every lookup, open, mount and unlink waits, or fails with
+//! `ENFILE` ("Too many open files in system"). A `mount_apfs` that finishes in a second on a
+//! healthy host was measured past a two-minute deadline on one whose table had overshot to 272631
+//! of 263168. The caller sees a hung or failed disk child; the cause is a host limit only the
+//! operator can raise, so cowshed reads the table where such a failure is reported and names the
+//! limit instead of blaming the executable or the image.
 
 use std::fmt;
 use std::io;
@@ -15,8 +18,10 @@ use std::io;
 /// The table's occupancy as the kernel reports it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct VnodeTable {
-    /// `kern.num_vnodes`.
-    pub in_use: u64,
+    /// `kern.num_vnodes`: every vnode allocated, in use or cached free.
+    pub allocated: u64,
+    /// `kern.free_vnodes`: allocated vnodes on the free list, recyclable at once.
+    pub free: u64,
     /// `kern.maxvnodes`.
     pub limit: u64,
 }
@@ -33,17 +38,23 @@ impl VnodeTable {
         Self::read().ok().filter(|table| table.saturated())
     }
 
-    /// Every vnode the limit allows is in use, so each new one waits for a recycle.
-    pub fn saturated(self) -> bool {
-        self.in_use >= self.limit
+    /// The vnodes held open rather than cached free.
+    pub fn in_use(self) -> u64 {
+        self.allocated.saturating_sub(self.free)
     }
 
-    /// The operator's remedy: twice the larger of the limit and the current occupancy, which
-    /// clears the overflow with the same headroom the limit had.
+    /// Every vnode the limit allows is in use, so each new one waits for a recycle that has
+    /// nothing to take. A cache full of free vnodes is not this.
+    pub fn saturated(self) -> bool {
+        self.in_use() >= self.limit
+    }
+
+    /// The operator's remedy: twice the larger of the limit and the vnodes in use, which clears
+    /// the overflow with the same headroom the limit had.
     pub fn remedy(self) -> String {
         format!(
             "raise the kernel vnode limit (sudo sysctl kern.maxvnodes={}), then retry",
-            self.limit.max(self.in_use).saturating_mul(2)
+            self.limit.max(self.in_use()).saturating_mul(2)
         )
     }
 }
@@ -52,9 +63,13 @@ impl fmt::Display for VnodeTable {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "the kernel vnode table is saturated (kern.num_vnodes {} of kern.maxvnodes {}), so every \
-             file-system call waits to recycle a vnode",
-            self.in_use, self.limit
+            "the kernel vnode table is saturated ({} vnodes in use of kern.maxvnodes {}; \
+             kern.num_vnodes {}, kern.free_vnodes {}), so every file-system call waits to \
+             recycle a vnode",
+            self.in_use(),
+            self.limit,
+            self.allocated,
+            self.free
         )
     }
 }
@@ -62,7 +77,8 @@ impl fmt::Display for VnodeTable {
 #[cfg(target_os = "macos")]
 fn read_table() -> io::Result<VnodeTable> {
     Ok(VnodeTable {
-        in_use: sysctl_integer(c"kern.num_vnodes")?,
+        allocated: sysctl_integer(c"kern.num_vnodes")?,
+        free: sysctl_integer(c"kern.free_vnodes")?,
         limit: sysctl_integer(c"kern.maxvnodes")?,
     })
 }
@@ -110,42 +126,41 @@ fn sysctl_integer(name: &std::ffi::CStr) -> io::Result<u64> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn saturation_starts_at_the_limit() {
-        let below = VnodeTable {
-            in_use: 263_167,
+    fn table(allocated: u64, free: u64) -> VnodeTable {
+        VnodeTable {
+            allocated,
+            free,
             limit: 263_168,
-        };
-        assert!(!below.saturated());
-        for in_use in [263_168, 272_631] {
-            assert!(
-                VnodeTable {
-                    in_use,
-                    limit: 263_168
-                }
-                .saturated()
-            );
         }
     }
 
     #[test]
+    fn a_full_cache_of_free_vnodes_is_not_saturation() {
+        // The steady state of a busy host: the cache sits at (or just past) the limit, and
+        // most of it is free to recycle.
+        assert!(!table(263_229, 180_000).saturated());
+        assert!(!table(263_168, 1).saturated());
+    }
+
+    #[test]
+    fn saturation_is_every_allowed_vnode_in_use() {
+        assert!(table(263_168, 0).saturated());
+        // Overshooting the limit is what the kernel does when nothing is free to recycle.
+        assert!(table(272_631, 0).saturated());
+        assert!(table(272_631, 9_463).saturated());
+        assert!(!table(272_631, 9_464).saturated());
+    }
+
+    #[test]
     fn the_remedy_clears_an_overflow_with_the_limit_headroom() {
-        let overflowing = VnodeTable {
-            in_use: 272_631,
-            limit: 263_168,
-        };
-        assert!(overflowing.remedy().contains("kern.maxvnodes=545262"));
-        let at_limit = VnodeTable {
-            in_use: 100,
-            limit: 100,
-        };
-        assert!(at_limit.remedy().contains("kern.maxvnodes=200"));
+        assert!(table(272_631, 0).remedy().contains("kern.maxvnodes=545262"));
+        assert!(table(263_168, 0).remedy().contains("kern.maxvnodes=526336"));
     }
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn the_live_table_is_readable_and_nonempty() {
-        let table = VnodeTable::read().expect("kern.num_vnodes and kern.maxvnodes");
-        assert!(table.in_use > 0 && table.limit > 0, "{table:?}");
+    fn the_live_table_is_readable() {
+        let table = VnodeTable::read().expect("kern.num_vnodes, kern.free_vnodes, kern.maxvnodes");
+        assert!(table.allocated > 0 && table.limit > 0, "{table:?}");
     }
 }

@@ -317,7 +317,8 @@ mod tests {
         use crate::vnodes::VnodeTable;
         let saturated = || {
             Some(VnodeTable {
-                in_use: 272_631,
+                allocated: 272_631,
+                free: 0,
                 limit: 263_168,
             })
         };
@@ -335,10 +336,7 @@ mod tests {
             error.message.starts_with("creating workspace; "),
             "{error:?}"
         );
-        assert!(
-            error.message.contains("kern.num_vnodes 272631"),
-            "{error:?}"
-        );
+        assert!(error.message.contains("272631 vnodes in use"), "{error:?}");
         assert!(error.hint.contains("kern.maxvnodes=545262"), "{error:?}");
 
         // ENFILE is how a full table answers a call directly.

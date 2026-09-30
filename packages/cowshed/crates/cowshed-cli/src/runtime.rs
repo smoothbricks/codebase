@@ -3529,8 +3529,10 @@ fn vnode_table_finding(
         Err(error) => Some(Finding {
             code: "vnode-table".into(),
             severity: FindingSeverity::Warning,
-            message: format!("could not read kern.num_vnodes and kern.maxvnodes: {error}"),
-            hint: "sysctl kern.num_vnodes kern.maxvnodes".into(),
+            message: format!(
+                "could not read kern.num_vnodes, kern.free_vnodes and kern.maxvnodes: {error}"
+            ),
+            hint: "sysctl kern.num_vnodes kern.free_vnodes kern.maxvnodes".into(),
             path: None,
         }),
     }
@@ -4331,7 +4333,8 @@ mod tests {
     fn doctor_names_a_saturated_vnode_table_and_the_limit_to_raise() {
         use cowshed_core::vnodes::VnodeTable;
         let finding = vnode_table_finding(Ok(VnodeTable {
-            in_use: 272_631,
+            allocated: 272_631,
+            free: 0,
             limit: 263_168,
         }))
         .expect("a saturated table is a finding");
@@ -4339,11 +4342,13 @@ mod tests {
         assert_eq!(finding.severity, FindingSeverity::Warning);
         assert!(finding.hint.contains("kern.maxvnodes="), "{finding:?}");
 
-        let room = VnodeTable {
-            in_use: 263_167,
-            limit: 263_168,
+        // This host's steady state when it was reported saturated: a full cache, mostly free.
+        let full_cache = VnodeTable {
+            allocated: 1_048_649,
+            free: 893_580,
+            limit: 1_048_576,
         };
-        assert!(vnode_table_finding(Ok(room)).is_none());
+        assert!(vnode_table_finding(Ok(full_cache)).is_none());
         let linux = std::io::Error::new(std::io::ErrorKind::Unsupported, "no vnode table");
         assert!(vnode_table_finding(Err(linux)).is_none());
     }
