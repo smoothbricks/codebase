@@ -73,7 +73,8 @@ validation and `nx build` share one `target/` and one set of units, so cargo rec
 `napi-<arch>-<os>`, `cargo-wasm`) and is selected only where an artifact ships: the generated publish workflow's build
 and platform-leg steps, the `smoo release` commands it runs, and the build and deploy runs of a production
 `smoo github-ci nx-deploy`. Test targets have no `production` configuration, so a release build never compiles release
-test binaries.
+test binaries. A package-local target that builds a shipped artifact follows the same rule: its default options compile
+`dev` and its `production` configuration compiles `release`. A workspace has exactly these two cargo profiles.
 
 ### Cargo cache boundaries
 

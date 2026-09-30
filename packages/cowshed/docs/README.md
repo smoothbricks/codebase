@@ -51,9 +51,10 @@ bunx @smoothbricks/cowshed doctor      # one-off
 bun add --global @smoothbricks/cowshed # `cowshed` on PATH
 ```
 
-From a checkout of this repository, run `cargo build --release -p cowshed-cli` and `nx build cowshed`, then `bun link`
-the package. The linked `cowshed` trampoline uses `target/release/cowshed`, while `nx build cowshed` prepares the
-TypeScript library and host Node-API addon.
+From a checkout of this repository, run `nx build cowshed -c production`, then `bun link` the package. The production
+configuration builds the host's release CLI into `dist/bin/<platform>/cowshed`, which the linked `cowshed` trampoline
+runs; the default configuration builds cargo's dev profile, which is for tests and local iteration, not for the binary
+on `PATH`. The same build prepares the TypeScript library and host Node-API addon.
 
 ### The agent skill
 

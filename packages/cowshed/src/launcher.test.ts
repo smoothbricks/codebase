@@ -134,7 +134,7 @@ describe('cowshed launcher', () => {
     expect(run.stdout).toBe('');
     expect(run.stderr).toContain(`dist/bin/${host}/cowshed`);
     expect(run.stderr).toContain('target/release/cowshed');
-    expect(run.stderr).toContain('next: build this platform with `nx build cowshed`');
+    expect(run.stderr).toContain('next: build this platform with `nx build cowshed -c production`');
   });
 
   it('names the host it ships no binary for without looking in dist', async () => {

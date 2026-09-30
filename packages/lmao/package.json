@@ -347,6 +347,11 @@
         "options": {
           "command": "just wasm",
           "cwd": "{projectRoot}"
+        },
+        "configurations": {
+          "production": {
+            "command": "just wasm release"
+          }
         }
       },
       "cargo-thread-ffi": {
@@ -366,12 +371,12 @@
           "cargoToolchain"
         ],
         "outputs": [
-          "{workspaceRoot}/target/release/liblmao_ffi_dylib.dylib",
-          "{workspaceRoot}/target/release/liblmao_ffi_dylib.so",
-          "{workspaceRoot}/target/release/lmao_ffi_dylib.dll"
+          "{workspaceRoot}/target/debug/liblmao_ffi_dylib.dylib",
+          "{workspaceRoot}/target/debug/liblmao_ffi_dylib.so",
+          "{workspaceRoot}/target/debug/lmao_ffi_dylib.dll"
         ],
         "options": {
-          "command": "cargo build -p lmao-ffi-dylib --release",
+          "command": "cargo build -p lmao-ffi-dylib",
           "cwd": "{projectRoot}"
         }
       }

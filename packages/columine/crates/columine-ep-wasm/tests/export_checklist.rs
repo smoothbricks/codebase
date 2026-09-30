@@ -9,7 +9,7 @@
 //! `built_wasm_matches_the_export_table` needs the compiled artifact and says
 //! so out loud when it is missing rather than reporting success: the nx
 //! `cargo-test` target builds it first (`dependsOn: cargo-wasm`), and `just
-//! wasm-ep` runs this file directly after linking.
+//! wasm-ep` runs this file after deploying it.
 
 use columine_types::wasm_abi::{COLUMINE_EP_EXPORTS, EXPORTED_MEMORY, parse_exports};
 use std::collections::BTreeSet;
@@ -22,8 +22,11 @@ fn manifest_path(relative: &str) -> String {
     format!("{manifest}{relative}")
 }
 
+/// The deployed artifact, `dist/event_processor.wasm`: the file that ships,
+/// whichever cargo profile `just wasm-ep` and the nx `cargo-wasm` target
+/// compiled it with.
 fn artifact() -> String {
-    manifest_path("/../../../../target/wasm32-unknown-unknown/wasm-release/columine_ep_wasm.wasm")
+    manifest_path("/../../dist/event_processor.wasm")
 }
 
 fn parse_backend_ts() -> String {

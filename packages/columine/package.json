@@ -83,13 +83,16 @@
         ],
         "outputs": [
           "{projectRoot}/dist/columine.wasm",
-          "{projectRoot}/dist/event_processor.wasm",
-          "{workspaceRoot}/target/wasm32-unknown-unknown/wasm-release/columine_wasm.wasm",
-          "{workspaceRoot}/target/wasm32-unknown-unknown/wasm-release/columine_ep_wasm.wasm"
+          "{projectRoot}/dist/event_processor.wasm"
         ],
         "options": {
           "command": "just wasm && just wasm-ep",
           "cwd": "{projectRoot}"
+        },
+        "configurations": {
+          "production": {
+            "command": "just wasm release && just wasm-ep release"
+          }
         }
       }
     },

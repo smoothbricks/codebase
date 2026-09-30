@@ -77,5 +77,5 @@ if [ -n "$platform" ]; then
 else
   echo "cowshed: cowshed ships no CLI binary for $(uname -sm); looked in $searched" >&2
 fi
-echo "next: build this platform with \`nx build cowshed\`, or install a published @smoothbricks/cowshed" >&2
+echo "next: build this platform with \`nx build cowshed -c production\`, or install a published @smoothbricks/cowshed" >&2
 exit 5

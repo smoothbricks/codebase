@@ -78,7 +78,12 @@
         ],
         "options": {
           "cwd": "packages/cowshed",
-          "command": "napi build --release --bin cowshed --target aarch64-apple-darwin --manifest-path crates/cowshed-cli/Cargo.toml --package cowshed-cli --output-dir dist/bin/darwin-arm64"
+          "command": "napi build --bin cowshed --target aarch64-apple-darwin --manifest-path crates/cowshed-cli/Cargo.toml --package cowshed-cli --output-dir dist/bin/darwin-arm64"
+        },
+        "configurations": {
+          "production": {
+            "command": "napi build --release --bin cowshed --target aarch64-apple-darwin --manifest-path crates/cowshed-cli/Cargo.toml --package cowshed-cli --output-dir dist/bin/darwin-arm64"
+          }
         }
       },
       "cli-x64-macos": {
@@ -102,7 +107,12 @@
         ],
         "options": {
           "cwd": "packages/cowshed",
-          "command": "napi build --release --bin cowshed --target x86_64-apple-darwin --manifest-path crates/cowshed-cli/Cargo.toml --package cowshed-cli --output-dir dist/bin/darwin-x64"
+          "command": "napi build --bin cowshed --target x86_64-apple-darwin --manifest-path crates/cowshed-cli/Cargo.toml --package cowshed-cli --output-dir dist/bin/darwin-x64"
+        },
+        "configurations": {
+          "production": {
+            "command": "napi build --release --bin cowshed --target x86_64-apple-darwin --manifest-path crates/cowshed-cli/Cargo.toml --package cowshed-cli --output-dir dist/bin/darwin-x64"
+          }
         }
       },
       "cli-arm64-linux": {
@@ -128,9 +138,14 @@
         ],
         "options": {
           "cwd": "packages/cowshed",
-          "command": "napi build --release --bin cowshed --target aarch64-unknown-linux-gnu --use-napi-cross --manifest-path crates/cowshed-cli/Cargo.toml --package cowshed-cli --output-dir dist/bin/linux-arm64-gnu",
+          "command": "napi build --bin cowshed --target aarch64-unknown-linux-gnu --use-napi-cross --manifest-path crates/cowshed-cli/Cargo.toml --package cowshed-cli --output-dir dist/bin/linux-arm64-gnu",
           "env": {
             "CFLAGS_aarch64_unknown_linux_gnu": "-D__ARM_ARCH=8"
+          }
+        },
+        "configurations": {
+          "production": {
+            "command": "napi build --release --bin cowshed --target aarch64-unknown-linux-gnu --use-napi-cross --manifest-path crates/cowshed-cli/Cargo.toml --package cowshed-cli --output-dir dist/bin/linux-arm64-gnu"
           }
         }
       },
@@ -157,12 +172,17 @@
         ],
         "options": {
           "cwd": "packages/cowshed",
-          "command": "napi build --release --bin cowshed --target x86_64-unknown-linux-gnu --use-napi-cross --manifest-path crates/cowshed-cli/Cargo.toml --package cowshed-cli --output-dir dist/bin/linux-x64-gnu",
+          "command": "napi build --bin cowshed --target x86_64-unknown-linux-gnu --use-napi-cross --manifest-path crates/cowshed-cli/Cargo.toml --package cowshed-cli --output-dir dist/bin/linux-x64-gnu",
           "env": {
             "AR_x86_64_unknown_linux_gnu": "x86_64-unknown-linux-gnu-ar",
             "CC_x86_64_unknown_linux_gnu": "x86_64-unknown-linux-gnu-gcc",
             "CXX_x86_64_unknown_linux_gnu": "x86_64-unknown-linux-gnu-g++",
             "RANLIB_x86_64_unknown_linux_gnu": "x86_64-unknown-linux-gnu-ranlib"
+          }
+        },
+        "configurations": {
+          "production": {
+            "command": "napi build --release --bin cowshed --target x86_64-unknown-linux-gnu --use-napi-cross --manifest-path crates/cowshed-cli/Cargo.toml --package cowshed-cli --output-dir dist/bin/linux-x64-gnu"
           }
         }
       },
@@ -216,7 +236,7 @@
         "executor": "@smoothbricks/nx-plugin:bounded-exec",
         "cache": false,
         "options": {
-          "comment": "Build prerequisite for wire-test, not a test: the first load of each project through the compiler preload compiles the typia native plugin, which takes minutes on a cold Go cache and would blow wire-test's 120s bound. The 600s budget here is a build budget, not a test timeout increase: it bounds the compilation while staying inside the workflow's overall bound, and fails loudly instead of hanging release. cache:false is load-bearing \u2014 the ttsc plugin cache lives outside Nx outputs, so a cached skip on a fresh runner would run the test cold and hang it again. Uses the same compiler preload specifier as bunfig.toml; the trace preload is absent on purpose (its setup calls afterAll(), which throws outside `bun test`) and adds no plugin key (measured: harness import alone builds the full runtime key set).",
+          "comment": "Build prerequisite for wire-test, not a test: the first load of each project through the compiler preload compiles the typia native plugin, which takes minutes on a cold Go cache and would blow wire-test's 120s bound. The 600s budget here is a build budget, not a test timeout increase: it bounds the compilation while staying inside the workflow's overall bound, and fails loudly instead of hanging release. cache:false is load-bearing — the ttsc plugin cache lives outside Nx outputs, so a cached skip on a fresh runner would run the test cold and hang it again. Uses the same compiler preload specifier as bunfig.toml; the trace preload is absent on purpose (its setup calls afterAll(), which throws outside `bun test`) and adds no plugin key (measured: harness import alone builds the full runtime key set).",
           "command": "bun --preload @smoothbricks/lmao/bun/preload scripts/warm-ttsc-plugins.mjs",
           "cwd": "packages/cowshed",
           "timeoutMs": 600000,

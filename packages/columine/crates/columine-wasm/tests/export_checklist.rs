@@ -9,13 +9,11 @@
 //! `built_wasm_matches_the_export_table` needs the compiled artifact and says
 //! so out loud when it is missing rather than reporting success: the nx
 //! `cargo-test` target builds it first (`dependsOn: cargo-wasm`), and `just
-//! wasm` runs this file directly after linking.
+//! wasm` runs this file after deploying it.
 
 use columine_types::wasm_abi::{COLUMINE_VM_EXPORTS, EXPORTED_MEMORY, parse_exports};
 use std::collections::BTreeSet;
 
-/// Built artifact, relative to this crate. `just wasm` and the nx `cargo-wasm`
-/// target both produce it at this path.
 /// This crate's directory joined with `relative`, read at run time: a workspace runs the test
 /// binary it inherited from the checkout that compiled it, and must read its own tree.
 fn manifest_path(relative: &str) -> String {
@@ -24,8 +22,10 @@ fn manifest_path(relative: &str) -> String {
     format!("{manifest}{relative}")
 }
 
+/// The deployed artifact, `dist/columine.wasm`: the file that ships, whichever
+/// cargo profile `just wasm` and the nx `cargo-wasm` target compiled it with.
 fn artifact() -> String {
-    manifest_path("/../../../../target/wasm32-unknown-unknown/wasm-release/columine_wasm.wasm")
+    manifest_path("/../../dist/columine.wasm")
 }
 
 /// The TypeScript host, read as source. A generator would be a build-order
