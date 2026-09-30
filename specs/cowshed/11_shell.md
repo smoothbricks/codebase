@@ -165,13 +165,15 @@ answer carries (a log chunk), and both sides close. A frame is a big-endian `u32
 call — `wait`, a following log read — therefore holds only its own connection: no call queues behind another, nothing is
 multiplexed, and a client that disconnects abandons only its own call, never a job.
 
-- **hello** — the supervisor answers with its protocol version, the authority it serves (repository, workspace,
-  incarnation, grant and lifecycle revisions) and its pid. A client reads the version first and refuses another one by
-  name (`Conflict`), so two cowshed builds never exchange a call either cannot decode.
+- **hello** — the supervisor answers with its build, the authority it serves (repository, workspace, incarnation, grant
+  and lifecycle revisions) and its pid. A client reads the build first and refuses any other by name (`Conflict`), so
+  two cowshed builds never exchange a call either cannot decode. A build is the Mach-O `LC_UUID` the linker derives from
+  the binary's contents (the SHA-256 of the executable on Linux): no number anybody has to remember to bump, so a change
+  nobody announced still counts. The manager refuses an ensure from another build the same way.
 - **advance** — the supervisor re-reads its workspace's grants and serves under their revision from then on
   (Grant-change propagation, below); answered with the authority it serves afterwards.
 - **drain** — the supervisor admits nothing more, lets its running jobs finish, then retires; answered at once with its
-  pid. This one request keeps its shape across protocol versions (Supervisor recovery, below).
+  pid. This one request keeps its shape across builds (Supervisor recovery, below).
 - **commitments** — the controller commitments the supervisor recorded after a cursor, waiting up to 30 seconds for one
   when there is none; **acknowledgeCommitments** forgets every one through a cursor. Every commitment goes to the
   supervisor process's own sink, the host's default; a controller whose sink is its own reads them here, records them
@@ -459,11 +461,11 @@ admitted but never sealed. Two things put that right:
   ledger names is never sealed: it may be running under a supervisor of an older cowshed build that kept its supervisor
   in the controller's own process.
 
-**Draining a supervisor of another build.** The manager of a newly started daemon asks every supervisor it cannot talk
-to — one speaking another protocol version — to drain: it admits nothing more, lets its running jobs finish, and
+**Draining a supervisor of another build.** The manager of a newly started daemon asks every supervisor of another build
+— including one that names no build at all — to drain: it admits nothing more, lets its running jobs finish, and
 retires, and the next command for its workspace gets a supervisor of the new build. `drain` is the one request whose
-shape never changes across versions, so any later daemon can retire any earlier supervisor. A supervisor of the same
-protocol keeps serving across a daemon upgrade and retires on its own when idle.
+shape never changes across builds, so any later daemon can retire any earlier supervisor. A supervisor of the daemon's
+own build keeps serving across a daemon restart and retires on its own when idle.
 
 ## Teardown ordering
 

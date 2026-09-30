@@ -36,10 +36,94 @@ use crate::api::dto::{
 use crate::error::{CowshedError, Result};
 use crate::storage::job_artifact::StreamKind;
 
-/// The protocol this build speaks. A supervisor started by another cowshed build may speak
-/// another; `hello` refuses it by name rather than letting a call fail mid-way. Version 2 added
-/// the `warm` call and `JobInfo.warm`, neither of which a version-1 peer can decode.
-pub const PROTOCOL_VERSION: u32 = 2;
+/// The identity of a cowshed build: the Mach-O `LC_UUID` the linker derives from the image's
+/// contents on macOS, the SHA-256 of the executable elsewhere. Two binaries share one only when
+/// they are the same build, so a supervisor started by another build — whatever changed, and
+/// whether or not anybody remembered to say so — is refused by name at `hello` and drained by the
+/// manager of a newly started daemon (11_shell.md "Draining a supervisor of another build").
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct BuildId(String);
+
+impl BuildId {
+    /// This process's build: read once, from the image this code was linked into.
+    pub fn current() -> Result<&'static Self> {
+        static CURRENT: std::sync::LazyLock<std::result::Result<BuildId, String>> =
+            std::sync::LazyLock::new(|| image_build_id().map(BuildId));
+        CURRENT.as_ref().map_err(|reason| {
+            CowshedError::internal(format!("cannot identify this cowshed build: {reason}"))
+        })
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for BuildId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+/// The `LC_UUID` of the Mach-O image holding this function, as 32 lowercase hex digits.
+#[cfg(target_os = "macos")]
+fn image_build_id() -> std::result::Result<String, String> {
+    const MH_MAGIC_64: u32 = 0xfeed_facf;
+    const LC_UUID: u32 = 0x1b;
+    /// `mach_header_64`: magic, cputype, cpusubtype, filetype, ncmds, sizeofcmds, flags, reserved.
+    const HEADER_BYTES: usize = 32;
+    const NCMDS_OFFSET: usize = 16;
+    let mut info = std::mem::MaybeUninit::<libc::Dl_info>::uninit();
+    // SAFETY: `dladdr` fills `info` for an address inside a loaded image, and a function of this
+    // image is one; it returns 0 and leaves `info` unwritten otherwise.
+    if unsafe { libc::dladdr(image_build_id as *const libc::c_void, info.as_mut_ptr()) } == 0 {
+        return Err("dladdr found no image holding this code".to_owned());
+    }
+    // SAFETY: `dladdr` returned non-zero, so it initialized `info`.
+    let base = unsafe { info.assume_init() }
+        .dli_fbase
+        .cast::<u8>()
+        .cast_const();
+    if base.is_null() {
+        return Err("dladdr named no image header".to_owned());
+    }
+    let word = |offset: usize| {
+        // SAFETY: every offset read lies inside the image's header or its load commands, which
+        // dyld maps with the image for its whole lifetime; `read_unaligned` needs no alignment.
+        unsafe { base.add(offset).cast::<u32>().read_unaligned() }
+    };
+    if word(0) != MH_MAGIC_64 {
+        return Err(format!(
+            "the image header is not 64-bit Mach-O (magic {:#x})",
+            word(0)
+        ));
+    }
+    let mut offset = HEADER_BYTES;
+    for _ in 0..word(NCMDS_OFFSET) {
+        let (command, size) = (word(offset), word(offset + 4));
+        if command == LC_UUID {
+            // SAFETY: `uuid_command` is its 8-byte header, then the 16-byte UUID.
+            let uuid = unsafe { std::slice::from_raw_parts(base.add(offset + 8), 16) };
+            return Ok(uuid.iter().map(|byte| format!("{byte:02x}")).collect());
+        }
+        offset += size as usize;
+    }
+    Err("the image carries no LC_UUID".to_owned())
+}
+
+/// The SHA-256 of the executable, read through `/proc/self/exe`, which names the executed file
+/// even after its path is replaced. Read once per process.
+#[cfg(not(target_os = "macos"))]
+fn image_build_id() -> std::result::Result<String, String> {
+    use sha2::Digest as _;
+    let mut image = std::fs::File::open("/proc/self/exe")
+        .map_err(|error| format!("cannot open /proc/self/exe: {error}"))?;
+    let mut hasher = sha2::Sha256::new();
+    io::copy(&mut image, &mut hasher)
+        .map_err(|error| format!("cannot read /proc/self/exe: {error}"))?;
+    Ok(Sha256Digest::from_bytes(hasher.finalize().into()).to_hex())
+}
 
 /// How long a commitments read waits for one to arrive before answering empty.
 const COMMITMENT_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
@@ -86,8 +170,8 @@ enum Request {
     /// started under.
     Advance,
     /// Admit nothing more, let every running job finish, then retire; answered at once with
-    /// the serving pid. Its shape never changes across protocol versions: it is how a daemon
-    /// of a newer build retires a supervisor it cannot otherwise talk to.
+    /// the serving pid. Its shape never changes across builds: it is how a daemon of a newer
+    /// build retires a supervisor it cannot otherwise talk to.
     Drain,
     /// The commitments recorded after cursor `after`, waiting a while for one when there is
     /// none (`commitment_feed`).
@@ -107,7 +191,7 @@ enum Request {
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct HelloWire {
-    protocol: u32,
+    build: BuildId,
     authority: AuthorityWire,
     pid: u32,
 }
@@ -506,7 +590,7 @@ async fn serve_call(
         Request::Hello => {
             let authority = supervisor.current_authority().await?;
             let value = to_value(&HelloWire {
-                protocol: PROTOCOL_VERSION,
+                build: BuildId::current()?.clone(),
                 authority: (&authority).into(),
                 pid: std::process::id(),
             })?;
@@ -852,7 +936,7 @@ pub struct Hello {
     pub pid: u32,
 }
 
-/// Who serves `path`, or why it cannot be used: unreachable, or speaking another protocol.
+/// Who serves `path`, or why it cannot be used: unreachable, or of another cowshed build.
 pub async fn hello(path: &Path) -> Result<Hello> {
     // A supervisor answers hello from its actor at once; one that cannot within the bound is
     // wedged, and waiting on it would wedge the caller too.
@@ -869,17 +953,16 @@ pub async fn hello(path: &Path) -> Result<Hello> {
                     "cowshed doctor --json",
                 )
             })??;
-    // Read the version before the rest: a newer peer's hello may carry fields this build
-    // cannot decode, and the version is what says why.
-    let protocol = value
-        .get("protocol")
-        .and_then(serde_json::Value::as_u64)
-        .ok_or_else(|| protocol_error("hello names no protocol version"))?;
-    if protocol != u64::from(PROTOCOL_VERSION) {
+    // Read the build before the rest: another build's hello may carry fields this one cannot
+    // decode, and the build is what says why. A hello naming no build is another build's too.
+    let ours = BuildId::current()?;
+    let theirs = value.get("build").and_then(serde_json::Value::as_str);
+    if theirs != Some(ours.as_str()) {
         return Err(CowshedError::conflict(
             format!(
-                "the workspace supervisor at {} speaks protocol {protocol}; this cowshed speaks {PROTOCOL_VERSION}",
-                path.display()
+                "the workspace supervisor at {} is cowshed build {}; this cowshed is build {ours}",
+                path.display(),
+                theirs.unwrap_or("(unnamed)")
             ),
             "let the supervisor drain, or stop it with `cowshed detach`, so this cowshed starts its own",
         ));

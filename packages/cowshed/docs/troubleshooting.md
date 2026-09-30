@@ -270,9 +270,9 @@ admits a supervisor or job. No state should accept both tokens; `cowshed doctor`
 Workspace supervisors are processes the cowshed daemon starts and keeps, through its supervisor manager at
 `/private/cowshed/store/run/manager.sock`; a command that runs work in a workspace asks it for the workspace's
 supervisor. `cowshed gateway status` shows whether the daemon runs, and `cowshed gateway start` installs and starts it.
-A supervisor that could not start leaves its reason in `~/Library/Logs/cowshed/daemon-stderr.log`. A refusal naming a
-supervisor protocol version means the daemon and the `cowshed` you ran are different builds: run `cowshed gateway start`
-from the one you mean to use.
+A supervisor that could not start leaves its reason in `~/Library/Logs/cowshed/daemon-stderr.log`. A refusal naming two
+cowshed builds means the daemon and the `cowshed` you ran are different binaries: run `cowshed gateway start` from the
+one you mean to use.
 
 ## `cowshed exec` fails with `cannot run direnv from PATH …`
 

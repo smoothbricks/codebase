@@ -25,7 +25,7 @@ use tokio::sync::Mutex;
 
 use super::supervisor::WorkspaceAuthoritySnapshot;
 use super::supervisor_socket::{
-    self, AuthorityWire, PROTOCOL_VERSION, protocol_error, read_json, verify_peer, write_json,
+    self, AuthorityWire, BuildId, protocol_error, read_json, verify_peer, write_json,
 };
 use crate::error::{CowshedError, ErrorCode, Result};
 use crate::metadata::WorkspaceName;
@@ -188,7 +188,7 @@ async fn read_start_report(report: io::PipeReader) -> Option<CowshedError> {
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct EnsureRequest {
-    protocol: u32,
+    build: BuildId,
     project_root: PathBuf,
     authority: AuthorityWire,
 }
@@ -564,32 +564,41 @@ pub async fn serve(listener: UnixListener, manager: Arc<SupervisorManager>) -> R
 
 async fn serve_ensure(mut stream: UnixStream, manager: &SupervisorManager) -> Result<()> {
     verify_peer(&stream)?;
-    let request: EnsureRequest = read_json(&mut stream).await?;
-    let response = if request.protocol == PROTOCOL_VERSION {
-        match manager
+    let request: serde_json::Value = read_json(&mut stream).await?;
+    let ensured = async {
+        same_build(&request)?;
+        let request: EnsureRequest = serde_json::from_value(request)
+            .map_err(|error| protocol_error(format!("malformed ensure: {error}")))?;
+        manager
             .ensure(&request.project_root, &request.authority.into())
             .await
-        {
-            Ok(ensured) => EnsureResponse::Serving {
-                socket: ensured.socket,
-                pid: ensured.pid,
-                authority: (&ensured.authority).into(),
-            },
-            Err(error) => EnsureResponse::Refused(error),
-        }
-    } else {
-        EnsureResponse::Refused(version_conflict(request.protocol))
+    };
+    let response = match ensured.await {
+        Ok(ensured) => EnsureResponse::Serving {
+            socket: ensured.socket,
+            pid: ensured.pid,
+            authority: (&ensured.authority).into(),
+        },
+        Err(error) => EnsureResponse::Refused(error),
     };
     write_json(&mut stream, &response).await
 }
 
-fn version_conflict(theirs: u32) -> CowshedError {
-    CowshedError::conflict(
+/// Refuse an ensure from another cowshed build by name. Read before the rest of the request:
+/// another build's may carry fields this one cannot decode, and the build is what says why.
+fn same_build(request: &serde_json::Value) -> Result<()> {
+    let ours = BuildId::current()?;
+    let theirs = request.get("build").and_then(serde_json::Value::as_str);
+    if theirs == Some(ours.as_str()) {
+        return Ok(());
+    }
+    Err(CowshedError::conflict(
         format!(
-            "the cowshed daemon speaks supervisor protocol {PROTOCOL_VERSION}; this cowshed speaks {theirs}"
+            "the cowshed daemon is build {ours}; this cowshed is build {}",
+            theirs.unwrap_or("(unnamed)")
         ),
         "run `cowshed gateway start` from the cowshed you mean to use",
-    )
+    ))
 }
 
 /// Ask the host's manager for the supervisor serving `authority`'s workspace.
@@ -611,7 +620,7 @@ pub async fn ensure(
     write_json(
         &mut stream,
         &EnsureRequest {
-            protocol: PROTOCOL_VERSION,
+            build: BuildId::current()?.clone(),
             project_root: project_root.to_path_buf(),
             authority: authority.into(),
         },
@@ -680,5 +689,90 @@ mod tests {
         StartReport::named(None)
             .send(&error)
             .expect("a supervisor started by hand has nobody to tell");
+    }
+
+    struct NoSpawner;
+
+    impl SupervisorSpawner for NoSpawner {
+        fn spawn(
+            &self,
+            _: &Path,
+            _: &WorkspaceName,
+            _: io::PipeWriter,
+        ) -> io::Result<tokio::process::Child> {
+            Err(io::Error::other("this manager starts no supervisor"))
+        }
+    }
+
+    /// A supervisor socket that answers `hello` as a supervisor of `build` would, and records
+    /// every request it is sent.
+    fn fake_supervisor(socket: PathBuf, build: String) -> Arc<std::sync::Mutex<Vec<String>>> {
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = Arc::clone(&requests);
+        let listener = UnixListener::bind(&socket).expect("bind the fake supervisor");
+        // No such process: whatever watches it finds it already gone.
+        let pid = i32::MAX;
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let request: serde_json::Value = read_json(&mut stream).await.expect("request");
+                let value = match request.as_str() {
+                    Some("hello") => serde_json::json!({
+                        "build": build,
+                        "authority": {
+                            "repoId": "acme/widget",
+                            "workspace": "raven",
+                            "workspaceIncarnation": "0198f2c0b7e34dc795f17b238b331c80",
+                            "grantRevision": 1,
+                            "lifecycleRevision": 1,
+                        },
+                        "pid": pid,
+                    }),
+                    _ => serde_json::json!(pid),
+                };
+                seen.lock().expect("requests").push(request.to_string());
+                write_json(
+                    &mut stream,
+                    &serde_json::json!({"ok": {"value": value, "bytes": 0}}),
+                )
+                .await
+                .expect("answer");
+            }
+        });
+        requests
+    }
+
+    /// A daemon upgrade drains every supervisor another build started — whatever it changed,
+    /// named or not — and keeps serving through the ones its own build started (11_shell.md
+    /// "Draining a supervisor of another build").
+    #[tokio::test]
+    async fn a_new_manager_drains_every_supervisor_of_another_build_and_keeps_its_own() {
+        // Unix socket paths are short; the per-user temporary directory is not.
+        let store = PathBuf::from("/tmp").join(format!(
+            "cowshed-drain-{}",
+            &uuid::Uuid::new_v4().simple().to_string()[..12]
+        ));
+        std::fs::create_dir_all(store.join("run")).expect("run directory");
+        let other = fake_supervisor(store.join("run/other.sock"), "another build".to_owned());
+        let own = BuildId::current().expect("this build").as_str().to_owned();
+        let same = fake_supervisor(store.join("run/same.sock"), own);
+
+        SupervisorManager::new(&store, Box::new(NoSpawner))
+            .adopt_running()
+            .await;
+
+        assert_eq!(
+            *other.lock().expect("requests"),
+            ["\"hello\"", "\"drain\""],
+            "the supervisor of another build is asked to drain"
+        );
+        assert_eq!(
+            *same.lock().expect("requests"),
+            ["\"hello\""],
+            "a supervisor of this build keeps serving"
+        );
+        std::fs::remove_dir_all(store).expect("cleanup");
     }
 }

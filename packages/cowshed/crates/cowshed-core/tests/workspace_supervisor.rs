@@ -1787,38 +1787,45 @@ async fn a_pending_wait_holds_up_no_other_call_to_a_served_supervisor() {
     assert_eq!(waiting.await.unwrap().unwrap().state, JobState::Exited);
 }
 
+/// A supervisor of another build is refused by name, whether it names that build or, having
+/// been built before builds were named, none.
 #[tokio::test]
-async fn a_supervisor_that_speaks_another_protocol_is_refused_by_name() {
+async fn a_supervisor_of_another_build_is_refused_by_name() {
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-    let path = PathBuf::from("/tmp").join(format!(
-        "cowshed-sock-{}",
-        &uuid::Uuid::new_v4().simple().to_string()[..12]
-    ));
-    let listener = tokio::net::UnixListener::bind(&path).unwrap();
-    tokio::spawn(async move {
-        let (mut stream, _) = listener.accept().await.unwrap();
-        let mut length = [0_u8; 4];
-        stream.read_exact(&mut length).await.unwrap();
-        let mut request = vec![0_u8; u32::from_be_bytes(length) as usize];
-        stream.read_exact(&mut request).await.unwrap();
-        // A future supervisor: another version and a hello shape this build cannot decode.
-        let answer = br#"{"ok":{"value":{"protocol":99,"shape":"future"},"bytes":0}}"#;
-        stream
-            .write_all(&u32::try_from(answer.len()).unwrap().to_be_bytes())
+    for (answer, named) in [
+        (
+            &br#"{"ok":{"value":{"build":"another build","shape":"future"},"bytes":0}}"#[..],
+            "is cowshed build another build",
+        ),
+        (
+            &br#"{"ok":{"value":{"protocol":2,"pid":1},"bytes":0}}"#[..],
+            "is cowshed build (unnamed)",
+        ),
+    ] {
+        let path = PathBuf::from("/tmp").join(format!(
+            "cowshed-sock-{}",
+            &uuid::Uuid::new_v4().simple().to_string()[..12]
+        ));
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut length = [0_u8; 4];
+            stream.read_exact(&mut length).await.unwrap();
+            let mut request = vec![0_u8; u32::from_be_bytes(length) as usize];
+            stream.read_exact(&mut request).await.unwrap();
+            stream
+                .write_all(&u32::try_from(answer.len()).unwrap().to_be_bytes())
+                .await
+                .unwrap();
+            stream.write_all(answer).await.unwrap();
+        });
+        let refused = cowshed_core::runtime::supervisor_socket::hello(&path)
             .await
-            .unwrap();
-        stream.write_all(answer).await.unwrap();
-    });
-    let refused = cowshed_core::runtime::supervisor_socket::hello(&path)
-        .await
-        .unwrap_err();
-    std::fs::remove_file(&path).ok();
-    assert_eq!(refused.code, ErrorCode::Conflict);
-    assert!(
-        refused.message.contains("protocol 99"),
-        "{}",
-        refused.message
-    );
+            .unwrap_err();
+        std::fs::remove_file(&path).ok();
+        assert_eq!(refused.code, ErrorCode::Conflict);
+        assert!(refused.message.contains(named), "{}", refused.message);
+    }
 }
 
 /// Starts `supervisor` on the workspace socket in-process, standing in for the supervisor
