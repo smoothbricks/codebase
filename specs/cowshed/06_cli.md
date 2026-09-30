@@ -50,7 +50,7 @@ canonical path, stubs listed by name, service status) and `cowshed setup` fixes 
 
 ```
 $ cowshed new raven
-/private/cowshed/store/mnt/acme/widget/raven        ← stdout (bare mount path)
+/Users/you/.cowshed/mnt/acme/widget/raven           ← stdout (bare mount path)
 cowshed: created workspace raven from main @ 8f31c2d (612ms)     ← stderr
 next: cd "$(cowshed path raven)"                                 ← stderr
 next: cowshed exec raven -- bun install                          ← stderr
@@ -256,12 +256,12 @@ sharing its object store and refs, instead of the default standalone clone. Requ
 gets no `main` remote (nothing to fetch from); and refuses `cowshed checkpoint` and `cowshed restore`, because its
 history lives outside its image. Each refusal names the command that resolves it (02).
 
-`--slot <n>` (on `cowshed new`) mounts the workspace at a stable, recycled path
-(`/private/cowshed/store/mnt/<owner>/<repo>/slot-<n>`) instead of a name-derived one. `owner` and `repo` are the
-separately validated and encoded components of the primary `repo_id`, never an unsplit path value. Successive workspaces
-in the same slot inherit each other's **path-keyed** cache warmth (Xcode DerivedData, and whatever a build records by
-absolute path; cargo's own fingerprints are package-relative and need no slot) — opt-in, because it trades
-workspace-path uniqueness for warmth and only one workspace may hold a slot at a time (exit 4 if occupied).
+`--slot <n>` (on `cowshed new`) mounts the workspace at a stable, recycled path (`<mount-root>/<owner>/<repo>/slot@<n>`,
+default mount root `~/.cowshed/mnt`) instead of a name-derived one. `owner` and `repo` are the separately validated and
+encoded components of the primary `repo_id`, never an unsplit path value. Successive workspaces in the same slot inherit
+each other's **path-keyed** cache warmth (Xcode DerivedData, and whatever a build records by absolute path; cargo's own
+fingerprints are package-relative and need no slot) — opt-in, because it trades workspace-path uniqueness for warmth and
+only one workspace may hold a slot at a time (exit 4 if occupied).
 
 ## Self-driving conventions
 

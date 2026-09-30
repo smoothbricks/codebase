@@ -70,8 +70,8 @@ Agent-driven development multiplies workspaces. Three failure modes follow:
         <owner>/<repo>/sessions/<ws>.asif                         repo-mirror verb · Arrow audit (13)
         <owner>/<repo>/sessions/<ws>.asif.grants.json                   │
                     │                                                ▼
-                    ▼ diskutil image attach                  cowshed.caches APFS volume
-        /private/cowshed/store/mnt/<owner>/<repo>/<ws>/          ◄─ sccache/zig/gradle ─  /private/cowshed/caches/
+                    ▼ diskutil image attach, mount_apfs      cowshed.caches APFS volume
+        <mount-root>/<owner>/<repo>/<ws>/                        ◄─ sccache/zig/gradle ─  /private/cowshed/caches/
         (workspace: src + .git + node_modules + target)
 ```
 
