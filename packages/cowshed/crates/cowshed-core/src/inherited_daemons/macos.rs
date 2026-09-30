@@ -30,11 +30,8 @@ use crate::error::{CowshedError, Result};
 ///
 /// One entry per daemon that rendezvouses through a file in the tree. Anything a fresh daemon
 /// regenerates from the tree belongs here; anything that would have to be recomputed from
-/// sources does not. Nx appears once per place in the image it keeps a daemon: the checkout's
-/// own `.nx/workspace-data`, and the workspace-data directory the supervisor gives a read-write
-/// job's sandboxed Nx under the private root (a read-only job's lives in the exec temp dir, which
-/// is outside the image).
-const INHERITED_DAEMON_STATE: &[&str] = &[".nx/workspace-data/d", ".cowshed/.nx/workspace-data/d"];
+/// sources does not.
+const INHERITED_DAEMON_STATE: &[&str] = &[".nx/workspace-data/d"];
 
 /// Discard every inherited daemon rendezvous directory in `tree_root`.
 ///

@@ -1406,20 +1406,16 @@ pub(super) async fn sandbox_environment(
     // directory or a private HOME path longer than Unix sockets permit.
     // Its O_NOFOLLOW admission requires a real leaf below the short alias.
     own("NX_SOCKET_DIR", runtime_link.join("nx").as_os_str());
-    // A client finds Nx's daemon through the record the daemon writes into its workspace-data
-    // directory, which names the daemon's socket; the socket directory decides nothing. In a
-    // checkout the host runs Nx in too, a daemon started here would serve the host's clients,
-    // hashing their inputs and running their runtime inputs inside this sandbox with the host
-    // client's environment. So the sandbox's Nx keeps Nx's own layout under the private root:
-    // its daemon record, graph and task database in one directory, and the cache that database
-    // indexes beside it, since a database without its own cache takes hits on artifacts it never
-    // wrote. Nx ignores both names at any depth.
-    let nx = environment_root.join(".nx");
-    own(
-        "NX_WORKSPACE_DATA_DIRECTORY",
-        nx.join("workspace-data").as_os_str(),
-    );
-    own("NX_CACHE_DIRECTORY", nx.join("cache").as_os_str());
+    // A sandboxed Nx runs without a daemon. A client finds the daemon through the record the
+    // daemon writes into the checkout's workspace-data directory, which names its socket (the
+    // socket directory decides nothing), and host shells use the same checkout: a daemon started
+    // here would become their daemon, computing their project graph and running their runtime
+    // inputs inside this sandbox with the host client's environment. Moving the record means
+    // moving the workspace-data directory, which holds the task database that indexes the
+    // checkout's Nx cache, and a sandbox with a database of its own never hits what the host or
+    // main cached. Without a daemon both boundaries share one cache; a hit is copied back (with
+    // its timestamps) rather than left in place.
+    own("NX_DAEMON", OsStr::new("false"));
     own(GO_ENV, private_cache.join("go/env").as_os_str());
     // rustc-wrapper clients speak to the host-owned sccache daemon; the
     // Seatbelt profile admits exactly this socket and denies binding it,

@@ -596,26 +596,25 @@ then fails to create its cache, prints its `mkstemp` path, and resolves every lo
 
 Nx receives a real `nx` child directory below the short runtime alias through `NX_SOCKET_DIR`. Its `O_NOFOLLOW`
 admission rejects a symlink at the leaf, so the alias itself is not its socket directory. Nx does not use
-`XDG_RUNTIME_DIR`, and its default shared-temp directory is outside the sandbox. Its daemon and isolated plugin workers
-remain enabled; socket placement is a Cowshed runtime binding, not a per-project flag or filesystem grant.
+`XDG_RUNTIME_DIR`, and its default shared-temp directory is outside the sandbox. Its isolated plugin workers remain
+enabled; socket placement is a Cowshed runtime binding, not a per-project flag or filesystem grant.
 
+A sandboxed Nx runs without a daemon: every job gets `NX_DAEMON=false`, and a caller's value never reaches the child.
 The socket directory does not decide which daemon a client uses. An Nx daemon records its pid and socket path in
-`server-process.json` under its workspace-data directory, and every client connects to the socket that record names. A
-sandboxed Nx sharing that directory with host clients — in main, or in any workspace a host shell also enters — would
-record its daemon where they look and serve them: their project graph computed and their runtime inputs run inside this
-sandbox, with the host client's environment, `TMPDIR` included, which the sandbox cannot write. Every job's Nx therefore
-keeps Nx's own layout under the job's private environment root (`.cowshed` for a read-write job, the exec temp dir for a
-read-only one): `NX_WORKSPACE_DATA_DIRECTORY=<root>/.nx/workspace-data` and `NX_CACHE_DIRECTORY=<root>/.nx/cache`. The
-two move together. The workspace-data directory holds the task database, whose rows index the cache directory: a
-database beside another boundary's cache takes hits on artifacts it never wrote, and each side's eviction deletes what
-the other's rows name. So the sandboxed daemon, project graph, task history and cache never cross the boundary in either
-direction, and each boundary keeps a daemon of its own alive, which is what lets a cache hit whose outputs are already
-on disk leave them in place rather than restore them. Both paths end in names Nx ignores at any depth
-(`**/.nx/workspace-data`, `**/.nx/cache`), so neither is hashed into the project graph, and the private root is in the
-image, so a clone starts with main's sandboxed Nx state as warm as its `target/`. The variables are the sandbox's; a
-caller's values never reach the child. A repository shell's own export still replaces them, like any export, so a
-repository that pins Nx's directories pins them as defaults (`${NX_CACHE_DIRECTORY:-.nx/cache}`) or hands the host's
-daemon back to the sandbox.
+`server-process.json` under the checkout's workspace-data directory, and every client connects to the socket that record
+names. Host shells use the same checkout — main, and any workspace a host shell enters — so a daemon started in the
+sandbox would record itself where they look and serve them: their project graph computed and their runtime inputs run
+inside this sandbox, with the host client's environment, `TMPDIR` included, which the sandbox cannot write. The record
+cannot move on its own. It lives in the workspace-data directory, which also holds the task database whose rows index
+the Nx cache, and the two must stay together: a database beside another boundary's cache takes hits on artifacts it
+never wrote, and either side's eviction deletes what the other's rows name. A sandbox with a workspace-data directory of
+its own would therefore need a cache of its own too, and would never hit what main or a host shell cached. Without a
+daemon, host and sandbox share the checkout's one Nx cache and database. A host-built entry is a sandbox hit and a
+sandbox-built one a host hit, and a clone inherits main's entries with its image. The cost is the daemon's output
+tracking: a sandboxed hit is restored from the cache (`[local cache]`) rather than left in place ("existing outputs
+match"), keeping the files' contents and timestamps under new inodes. A repository shell's own `NX_DAEMON` export still
+replaces the sandbox's, like any export, and brings back a sandboxed daemon the host's clients would use; a repository
+leaves it unset.
 
 Beyond the runtime dir, a child may bind and connect Unix sockets anywhere in its workspace's own tree — the exec temp
 dir, and for a read-write job the whole mount — so a test's socket in `TMPDIR` works as it does on the host. A write
