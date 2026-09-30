@@ -10,6 +10,13 @@ the data plane only as an intercepted fetch (Egress modes, below).
 
 ## Placement and identity
 
+On macOS the gateway runs as the `dev.cowshed.gateway` LaunchAgent at launchd `ProcessType` **Standard**, never
+Background. The type is the QoS band of the agent and every descendant, and a descendant cannot leave it; the daemon's
+supervisor manager starts every workspace supervisor, which starts every shell host and job. Under Background all of
+them ran at priority 4 with throttled I/O: on a host at load 80 a fresh workspace's supervisor took 115 s to answer and
+its first `cowshed exec` spent 537 s inside `direnv export json`. The sccache LaunchAgent is Standard for the same
+reason (launchd.rs `PROCESS_TYPE`).
+
 The host-only control plane is host-netns `127.0.0.1:7644` (override `COWSHED_GATEWAY_PORT`) plus
 `/private/cowshed/store/gateway.sock` for status, audit tail, and coordinator verbs. Neither host endpoint is reachable
 from a workspace, and the sandbox baseline denies both. Linux separately reuses the numeric address `127.0.0.1:7644`
