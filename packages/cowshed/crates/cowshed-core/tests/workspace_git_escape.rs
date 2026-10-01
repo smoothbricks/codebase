@@ -238,7 +238,8 @@ fn controller_git_refuses_a_symlinked_workspace_identity() {
     let result = std::panic::catch_unwind(|| {
         git(&workspace, &["init", "-q", "-b", "main"]);
         let identity = workspace.join(".cowshed/git-identity.inc");
-        fs::create_dir_all(identity.parent().expect("identity directory")).expect("identity directory");
+        fs::create_dir_all(identity.parent().expect("identity directory"))
+            .expect("identity directory");
         let foreign = temp.join("foreign-identity.inc");
         fs::write(&foreign, b"[user]\n\tname = foreign\n").expect("foreign identity");
         std::os::unix::fs::symlink(&foreign, &identity).expect("symlinked identity");
