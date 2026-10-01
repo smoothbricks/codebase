@@ -119,7 +119,10 @@ project root do not reach into the mount root; cowshed surfaces that divergence 
 drift: `cowshed setup` (every adopted checkout, after a repair and after `--mount-root`) and `cowshed doctor` (the
 current project) run `git config --list --show-origin` in the checkout and in a throwaway probe repository under the
 mount root, and any config file included only in the checkout is reported by name with the pattern that would restore
-it. The answer depends only on the host's git configuration and the mount root, never on a workspace, so `new` does not
+it. The repository's own config travels with every clone, so a file it includes by a relative path inside the repository
+(`include.path = ../tooling/workspace.gitconfig`, which Git lists as `.git/../tooling/workspace.gitconfig`) resolves in
+each clone and is never reported; a relative include that climbs out of the repository lands elsewhere for a mount and
+is. The answer depends only on the host's git configuration and the mount root, never on a workspace, so `new` does not
 repeat it.
 
 Cowshed does not compensate beyond reporting. Capturing the effective identity at adopt time and stamping it as

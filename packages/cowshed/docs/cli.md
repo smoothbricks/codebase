@@ -94,8 +94,10 @@ After a repair, and after `--mount-root`, setup probes git identity for every ad
 `git config --list --show-origin` in the checkout and in a throwaway repository under the mount root
 (`<mount-root>/<owner>/<repo>/`), then diffs the observed origins. A config file included only in the checkout is
 reported on stderr, prefixed with its project, by name with the `includeIf` condition that pulled it in, plus the
-remedy: add a pattern covering the mount root. `cowshed doctor` reports the same finding for the current project. `new`
-does not probe: the answer depends only on your git configuration and the mount root.
+remedy: add a pattern covering the mount root. A file the repository's own config includes by a relative path inside the
+repository (`include.path = ../tooling/workspace.gitconfig`) travels with every clone and is not reported.
+`cowshed doctor` reports the same finding for the current project. `new` does not probe: the answer depends only on your
+git configuration and the mount root.
 
 Anything that can escalate happens inside one authorization session, and **the exact intent for every volume is printed
 before the dialog appears** — name, UUID, size, and where it is going. When the plan creates and deletes nothing, that

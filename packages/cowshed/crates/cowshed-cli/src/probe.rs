@@ -5,7 +5,9 @@
 //! evaluate those patterns: it diffs `git config --list --show-origin` in the checkout against
 //! the same listing inside a throwaway repository at the candidate path, then names every
 //! origin file that appeared only in the checkout together with the `includeIf` condition
-//! whose `.path` value pointed at it.
+//! whose `.path` value pointed at it. The repository's own config files, and anything they
+//! include by a relative path that stays inside the repository, travel with every clone and are
+//! never a gap.
 //!
 //! The answer depends on the host's git configuration and the mount root, never on a workspace,
 //! so `setup` and `doctor` run it and `new` does not.
@@ -13,7 +15,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use cowshed_core::api::{Finding, FindingSeverity};
@@ -92,8 +94,8 @@ fn diff_identity(
     checkout_list: &str,
     probe_list: &str,
 ) -> Vec<GitIdentityGap> {
-    let checkout_cfg = parse_show_origin(checkout_list);
-    let probe_cfg = parse_show_origin(probe_list);
+    let checkout_cfg = parse_show_origin(checkout_list, checkout);
+    let probe_cfg = parse_show_origin(probe_list, probe);
     let checkout_origins = origins_outside(checkout, &checkout_cfg.origins);
     let probe_origins = origins_outside(probe, &probe_cfg.origins);
     checkout_origins
@@ -121,14 +123,19 @@ impl ParsedConfig {
     }
 }
 
-fn parse_show_origin(listing: &str) -> ParsedConfig {
+/// `root` is the repository the listing was taken in. Git names the repository's own config
+/// files relative to it (`.git/config`, and `.git/../tooling/workspace.gitconfig` for a relative
+/// include there), so every origin is resolved against it: a relative include inside the
+/// repository is then the repository's own file in every clone, not a host file only the
+/// checkout loads.
+fn parse_show_origin(listing: &str, root: &Path) -> ParsedConfig {
     let mut origins = BTreeSet::new();
     let mut include_if = BTreeMap::new();
     for line in listing.lines() {
         let Some((origin, rest)) = line.split_once('\t') else {
             continue;
         };
-        let Some(file) = origin_file(origin) else {
+        let Some(file) = origin_file(origin, root) else {
             continue;
         };
         origins.insert(file.clone());
@@ -168,11 +175,11 @@ fn include_if_condition(key: &str) -> Option<String> {
     }
 }
 
-fn origin_file(origin: &str) -> Option<PathBuf> {
+fn origin_file(origin: &str, root: &Path) -> Option<PathBuf> {
     origin
         .strip_prefix("file:")
-        .map(PathBuf::from)
-        .filter(|path| !path.as_os_str().is_empty())
+        .filter(|path| !path.is_empty())
+        .map(|path| lexically_normal(&root.join(path)))
 }
 
 fn resolve_include_path(including_file: &Path, value: &str) -> PathBuf {
@@ -182,9 +189,30 @@ fn resolve_include_path(including_file: &Path, value: &str) -> PathBuf {
     } else {
         including_file
             .parent()
-            .map(|parent| parent.join(path))
+            .map(|parent| lexically_normal(&parent.join(path)))
             .unwrap_or_else(|| PathBuf::from(value))
     }
+}
+
+/// `path` with `.` dropped and each `..` taking back the component before it. An include that
+/// climbs out of the repository is then seen where it lands, outside it. Lexical, so a symlinked
+/// component is not followed; both listings are resolved the same way.
+fn lexically_normal(path: &Path) -> PathBuf {
+    let mut normal = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !normal.pop() {
+                    normal.push(component);
+                }
+            }
+            Component::Prefix(_) | Component::RootDir | Component::Normal(_) => {
+                normal.push(component);
+            }
+        }
+    }
+    normal
 }
 
 fn origins_outside(repo: &Path, origins: &BTreeSet<PathBuf>) -> BTreeSet<PathBuf> {
@@ -389,6 +417,58 @@ mod tests {
         ];
         let gaps = probe_git_identity_with_env(&checkout, &candidate, &env).unwrap();
         assert!(gaps.is_empty(), "{gaps:?}");
+        assert!(!candidate.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// A repository's own config is copied with every clone, so an include it names by a relative
+    /// path resolves inside each clone: no identity gap, however Git spells its origin
+    /// (`.git/../tooling/workspace.gitconfig`). A relative include that climbs out of the
+    /// repository lands somewhere else for a clone mounted elsewhere, and still is one.
+    #[test]
+    fn a_relative_include_inside_the_repository_is_not_a_gap_and_one_outside_it_is() {
+        let root = fs::canonicalize(temp_dir("git-identity-relative-include")).unwrap();
+        let checkout = root.join("checkout");
+        let candidate = root.join("mnt/acme/widget/raven");
+        let global = root.join("global.gitconfig");
+        let shared = root.join("shared.gitconfig");
+        fs::create_dir_all(checkout.join("tooling")).unwrap();
+        fs::write(
+            checkout.join("tooling/workspace.gitconfig"),
+            "[merge \"smoo-newer-pins\"]\n    name = keep the newer pins\n",
+        )
+        .unwrap();
+        fs::write(&shared, "[user]\n    name = Shared\n").unwrap();
+        fs::write(&global, "").unwrap();
+        git_at(&checkout, &[], ["init", "--quiet"]).unwrap();
+        let env = [
+            ("GIT_CONFIG_GLOBAL", global.as_os_str()),
+            ("GIT_CONFIG_NOSYSTEM", OsStr::new("1")),
+            ("GIT_CONFIG_SYSTEM", OsStr::new("/dev/null")),
+        ];
+        git_at(
+            &checkout,
+            &env,
+            ["config", "include.path", "../tooling/workspace.gitconfig"],
+        )
+        .unwrap();
+        let gaps = probe_git_identity_with_env(&checkout, &candidate, &env).unwrap();
+        assert!(gaps.is_empty(), "{gaps:?}");
+
+        git_at(
+            &checkout,
+            &env,
+            ["config", "--add", "include.path", "../../shared.gitconfig"],
+        )
+        .unwrap();
+        let gaps = probe_git_identity_with_env(&checkout, &candidate, &env).unwrap();
+        assert_eq!(
+            gaps,
+            vec![GitIdentityGap {
+                config_file: shared,
+                include_if_condition: None,
+            }]
+        );
         assert!(!candidate.exists());
         let _ = fs::remove_dir_all(root);
     }
