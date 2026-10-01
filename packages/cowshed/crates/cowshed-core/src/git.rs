@@ -457,6 +457,10 @@ impl GitRepository {
                 command.args(["config", "--includes", "--null", "--get", key]);
                 if let Some(inherited) = &inherited {
                     command.env("GIT_CONFIG_GLOBAL", inherited);
+                } else {
+                    // The adopted checkout inherits the operator's Git identity once;
+                    // ordinary controller Git must not load the operator's config.
+                    command.env_remove("GIT_CONFIG_GLOBAL");
                 }
                 let output = command.output().map_err(|error| git_spawn_error(&error))?;
                 if output.status.code() == Some(1) {
@@ -1175,7 +1179,7 @@ impl GitRepository {
             args.push(OsString::from(target));
         }
         let written = async {
-            let output = self.run(args).await?;
+            let output = run_git_bundle_at(&self.root, self.alternate_objects.as_deref(), args).await?;
             ensure_git_success("write commit bundle", output)?;
             self.verify_bundle(&staged, &expected_head, target, commit_count)
                 .await?;
@@ -1251,28 +1255,34 @@ impl GitRepository {
                 ));
             }
             let recovery = Self::from_root(&scratch);
-            let output = recovery
-                .run([
+            let output = run_git_bundle_at(
+                &scratch,
+                None,
+                [
                     OsStr::new("bundle"),
                     OsStr::new("verify"),
                     bundle.as_os_str(),
-                ])
-                .await?;
+                ],
+            )
+            .await?;
             if !output.status.success() {
                 return Err(bundle_artifact_error(
                     "verify abandonment bundle",
                     &output,
                 ));
             }
-            let output = recovery
-                .run([
+            let output = run_git_bundle_at(
+                &scratch,
+                None,
+                [
                     OsStr::new("fetch"),
                     OsStr::new("--quiet"),
                     OsStr::new("--no-tags"),
                     bundle.as_os_str(),
                     OsStr::new("HEAD"),
-                ])
-                .await?;
+                ],
+            )
+            .await?;
             if !output.status.success() {
                 return Err(bundle_artifact_error(
                     "fetch abandonment bundle into an empty repository",
@@ -2168,16 +2178,20 @@ impl GitRepository {
                     staging.display()
                 ))
             })?;
-            let output = main
-                .run([
+            let output = run_git_at_with_objects(
+                &main.root,
+                main.alternate_objects.as_deref(),
+                Some(&staging),
+                [
                     OsStr::new("worktree"),
                     OsStr::new("add"),
                     OsStr::new("--no-checkout"),
                     OsStr::new("--detach"),
                     staged.as_os_str(),
                     OsStr::new(head.as_str()),
-                ])
-                .await?;
+                ],
+            )
+            .await?;
             ensure_git_success("register linked worktree", output)?;
         }
         if !admin.is_dir() {
@@ -2249,13 +2263,17 @@ impl GitRepository {
     /// The primitive git provides for exactly this two-way pointer fixup, and the one `cowshed mv`
     /// runs after moving either end.
     pub async fn repair_linked_worktree(&self, mount: &Path) -> Result<()> {
-        let output = self
-            .run([
+        let output = run_git_at_with_objects(
+            &self.root,
+            self.alternate_objects.as_deref(),
+            Some(mount),
+            [
                 OsStr::new("worktree"),
                 OsStr::new("repair"),
                 mount.as_os_str(),
-            ])
-            .await?;
+            ],
+        )
+        .await?;
         ensure_git_success("repair linked worktree registration", output)
     }
 
@@ -2356,7 +2374,7 @@ impl GitRepository {
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
-        run_git_at_with_objects(&self.root, self.alternate_objects.as_deref(), args).await
+        run_git_at_with_objects(&self.root, self.alternate_objects.as_deref(), None, args).await
     }
 }
 
@@ -2365,7 +2383,28 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    run_git_at_with_objects(root, None, args).await
+    run_git_at_with_objects(root, None, None, args).await
+}
+
+/// Bundle object transport is the narrow exception to sandboxed Git: the
+/// controller writes and verifies bundles in its denied store, which no
+/// workspace profile can read. These object-only verbs do not check out files,
+/// run merge/filter drivers, use configured remotes, or invoke hooks (disabled here).
+async fn run_git_bundle_at<I, S>(
+    root: &Path,
+    alternate_objects: Option<&Path>,
+    args: I,
+) -> Result<Output>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let mut command = Command::from(git_command_at(root));
+    command.args(args);
+    if let Some(objects) = alternate_objects {
+        command.env("GIT_ALTERNATE_OBJECT_DIRECTORIES", objects);
+    }
+    command.output().await.map_err(|error| git_spawn_error(&error))
 }
 
 /// Does `path` currently hold a git repository?
@@ -2394,13 +2433,190 @@ async fn is_git_repository(path: &Path) -> Result<bool> {
         .success())
 }
 
-/// The one way to point a `git` invocation at a checkout: `-C <root>` plus a disabled terminal
-/// prompt, as a `std::process::Command` so both the async runners here and the CLI's blocking
-/// probe build on the same argv and environment.
+/// Point git at a checkout without allowing repository metadata to run hooks or
+/// filesystem monitors in the controller's process. Other executable config
+/// (merge drivers, filters and transports) is confined by the controller's
+/// workspace Git sandbox when it runs a workspace operation.
 pub fn git_command_at(root: &Path) -> std::process::Command {
     let mut command = std::process::Command::new("git");
-    command.arg("-C").arg(root).env("GIT_TERMINAL_PROMPT", "0");
     command
+        .arg("-C")
+        .arg(root)
+        .args(["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false",
+            "-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false",
+            "-c", "core.pager=cat", "-c", "core.editor=false",
+            "-c", "sequence.editor=false", "-c", "diff.external=false"])
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_ATTR_NOSYSTEM", "1")
+        .env("GIT_CONFIG_COUNT", "0")
+        .env_remove("GIT_CONFIG_PARAMETERS")
+        .env_remove("GIT_SSH_COMMAND")
+        .env_remove("GIT_EXTERNAL_DIFF")
+        .env_remove("GIT_SEQUENCE_EDITOR")
+        .env_remove("GIT_EDITOR");
+    command
+}
+
+/// A job can rewrite a linked worktree's `.git` pointer. Its claimed common
+/// repository gains write authority only when that repository's own worktree
+/// registration points back to this exact checkout.
+#[cfg(target_os = "macos")]
+fn registered_worktree_git_dir(root: &Path) -> Result<Option<PathBuf>> {
+    let pointer = root.join(".git");
+    let metadata = match fs::symlink_metadata(&pointer) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(CowshedError::integrity(
+            format!("cannot inspect Git worktree pointer {}: {error}", pointer.display()),
+            "repair the Git worktree",
+        )),
+    };
+    if !metadata.file_type().is_file() {
+        return Ok(None);
+    }
+    let content = fs::read_to_string(&pointer).map_err(|error| CowshedError::integrity(
+        format!("cannot read Git worktree pointer {}: {error}", pointer.display()),
+        "repair the Git worktree",
+    ))?;
+    let admin = content.trim_end().strip_prefix("gitdir: ")
+        .ok_or_else(|| CowshedError::integrity("invalid Git worktree pointer", "repair the Git worktree"))?;
+    let admin = fs::canonicalize(admin).map_err(|error| CowshedError::integrity(
+        format!("cannot resolve Git worktree administration: {error}"),
+        "repair the Git worktree",
+    ))?;
+    let worktrees = admin.parent().ok_or_else(|| CowshedError::integrity(
+        "Git worktree administration has no parent", "repair the Git worktree",
+    ))?;
+    if worktrees.file_name() != Some(OsStr::new("worktrees")) {
+        return Err(CowshedError::integrity("Git worktree administration is not under worktrees", "repair the Git worktree"));
+    }
+    let common = worktrees.parent().ok_or_else(|| CowshedError::integrity(
+        "Git worktree has no common repository", "repair the Git worktree",
+    ))?;
+    let reverse = fs::read_to_string(admin.join("gitdir")).map_err(|error| CowshedError::integrity(
+        format!("cannot read reverse Git worktree registration: {error}"),
+        "repair the Git worktree",
+    ))?;
+    if fs::canonicalize(reverse.trim_end()).ok().as_deref() != Some(pointer.as_path()) {
+        return Err(CowshedError::integrity(
+            "Git worktree registration does not point back to this workspace",
+            "repair the Git worktree",
+        ));
+    }
+    Ok(Some(common.to_owned()))
+}
+
+/// Controller Git can consume repository-selected filters, merge drivers and
+/// transports. Run it with the GitDiscovery policy: writable only in this
+/// checkout; other trees require controller-supplied, explicit roots.
+#[cfg(target_os = "macos")]
+pub fn sandboxed_git_command_at(root: &Path) -> Result<std::process::Command> {
+    sandboxed_git_command_with_paths(root, None, None)
+}
+
+/// The controller passes main's resolved mount explicitly for a workspace
+/// fetch; the repository's own remote URL must never authorize a host read.
+#[cfg(target_os = "macos")]
+pub(crate) fn sandboxed_git_command_with_read(
+    root: &Path,
+    readable: &Path,
+) -> Result<std::process::Command> {
+    sandboxed_git_command_with_paths(root, Some(readable), None)
+}
+
+#[cfg(target_os = "macos")]
+fn sandboxed_git_command_with_paths(
+    root: &Path,
+    readable: Option<&Path>,
+    writable: Option<&Path>,
+) -> Result<std::process::Command> {
+    use crate::sandbox::{
+        RunSandboxMode, SandboxConfig, SandboxGrants, SandboxProfileRole, seatbelt_profile,
+    };
+    let parent = root.parent().ok_or_else(|| CowshedError::internal("git checkout has no parent"))?;
+    // Seatbelt filters the resolved spelling. Temporary checkouts often arrive
+    // through /var -> /private/var; granting only their lexical name denies cwd.
+    let canonical = match fs::canonicalize(root) {
+        Ok(canonical) => canonical,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            fs::canonicalize(parent)
+                .map_err(|error| CowshedError::integrity(
+                    format!("cannot resolve git checkout parent {}: {error}", parent.display()),
+                    "repair the checkout path",
+                ))?
+                .join(root.file_name().ok_or_else(|| CowshedError::internal("git checkout has no name"))?)
+        }
+        Err(error) => return Err(CowshedError::integrity(
+            format!("cannot resolve git checkout {}: {error}", root.display()),
+            "repair the checkout path",
+        )),
+    };
+    let parent = canonical.parent().ok_or_else(|| CowshedError::internal("git checkout has no parent"))?;
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| CowshedError::environment_missing(
+            "HOME is unset",
+            "set HOME to the operator's home directory",
+        ))?;
+    let mut read = Vec::new();
+    if let Some(path) = readable {
+        read.push(fs::canonicalize(path).map_err(|error| CowshedError::integrity(
+            format!("cannot resolve Git read path {}: {error}", path.display()),
+            "repair the Git source checkout",
+        ))?);
+    }
+    let config = SandboxConfig {
+        home,
+        mount_root: PathBuf::from(crate::storage::bootstrap::STORE_ROOT),
+        workspace_mount: canonical.clone(),
+        shed_links: Vec::new(),
+        exec_temp_dir: canonical.clone(),
+        port_block: crate::metadata::PortBlock::new(40_960, 16)
+            .expect("static macOS port block"),
+        mode: RunSandboxMode::ReadWrite,
+        grants: SandboxGrants {
+            read,
+            write: writable
+                .map(|path| fs::canonicalize(path).map_err(|error| CowshedError::integrity(
+                    format!("cannot resolve Git worktree staging {}: {error}", path.display()),
+                    "repair the linked worktree staging directory",
+                )))
+                .transpose()?
+                .into_iter()
+                .chain(registered_worktree_git_dir(&canonical)?)
+                .collect(),
+            ..SandboxGrants::default()
+        },
+        allowed_unix_sockets: Vec::new(),
+        additional_denies: Vec::new(),
+        git_worktree_repository: None,
+        shared_tool_homes: Vec::new(),
+    };
+    let profile = seatbelt_profile(&config, SandboxProfileRole::GitDiscovery)
+        .map_err(|error| CowshedError::integrity(
+            format!("cannot sandbox controller git in {}: {error}", root.display()),
+            "repair the workspace Git path",
+        ))?;
+    let git = git_command_at(&canonical);
+    let mut command = std::process::Command::new(crate::exec::SANDBOX_EXEC);
+    command.args(["-p", &profile, "--", "/var/select/developer_dir/usr/bin/git"]);
+    command.args(git.get_args());
+    for (name, value) in git.get_envs() {
+        match value {
+            Some(value) => { command.env(name, value); }
+            None => { command.env_remove(name); }
+        }
+    }
+    command
+        .current_dir(if canonical.is_dir() { &canonical } else { parent })
+        .env("HOME", canonical.join(".cowshed/home"));
+    let identity = canonical.join(WORKSPACE_GIT_IDENTITY_CONFIG_PATH);
+    if identity.is_file() {
+        command.env("GIT_CONFIG_GLOBAL", identity);
+    }
+    Ok(command)
 }
 
 /// The one spelling of "git itself could not run", so the same failure never carries two
@@ -2415,13 +2631,18 @@ pub fn git_spawn_error(error: &std::io::Error) -> CowshedError {
 async fn run_git_at_with_objects<I, S>(
     root: &Path,
     alternate_objects: Option<&Path>,
+    writable: Option<&Path>,
     args: I,
 ) -> Result<Output>
 where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    let mut command = Command::from(git_command_at(root));
+    #[cfg(target_os = "macos")]
+    let git = sandboxed_git_command_with_paths(root, alternate_objects, writable)?;
+    #[cfg(not(target_os = "macos"))]
+    let git = git_command_at(root);
+    let mut command = Command::from(git);
     command.args(args);
     if let Some(objects) = alternate_objects {
         command.env("GIT_ALTERNATE_OBJECT_DIRECTORIES", objects);
@@ -2448,9 +2669,7 @@ fn ensure_git_success(operation: &str, output: Output) -> Result<()> {
 /// entry in that tree would be. Returns the ignored paths in git's order.
 pub async fn ignored_by(checkout: &Path, relative: &[&[u8]]) -> Vec<Vec<u8>> {
     use tokio::io::AsyncWriteExt;
-    let mut child = match Command::new("git")
-        .arg("-C")
-        .arg(checkout)
+    let mut child = match Command::from(git_command_at(checkout))
         .args(CHECK_IGNORE_BATCH)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -2550,9 +2769,7 @@ const CHECK_IGNORE_BATCH: &[&str] = &["check-ignore", "--stdin", "-z", "--no-ind
 /// deadlocks as soon as the answers fill the stdout pipe: git blocks writing its stdout, the
 /// caller blocks writing git's stdin, and neither returns.
 fn git_batch_blocking(checkout: &Path, args: &[&str], input: Vec<u8>) -> Vec<u8> {
-    let mut child = match std::process::Command::new("git")
-        .arg("-C")
-        .arg(checkout)
+    let mut child = match git_command_at(checkout)
         .args(args)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -2748,6 +2965,62 @@ mod tests {
         ignored_by_blocking, is_git_repository, parse_lines, workspace_remote_name,
     };
     static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_worktree_pointer_cannot_grant_a_foreign_repository_write_access() {
+        let main = repository();
+        let workspace = main.with_extension("candidate");
+        fs::create_dir_all(&workspace).expect("workspace");
+        let admin = main.join(".git/worktrees/candidate");
+        fs::create_dir_all(&admin).expect("registration");
+        fs::write(workspace.join(".git"), format!("gitdir: {}\n", admin.display()))
+            .expect("writable pointer");
+        fs::write(admin.join("gitdir"), main.join(".git").display().to_string())
+            .expect("foreign registration");
+        let workspace = workspace.canonicalize().expect("canonical workspace");
+        assert!(super::registered_worktree_git_dir(&workspace).is_err());
+        fs::write(admin.join("gitdir"), workspace.join(".git").display().to_string())
+            .expect("real registration");
+        assert_eq!(
+            super::registered_worktree_git_dir(&workspace).expect("registered"),
+            Some(main.join(".git").canonicalize().expect("common Git directory")),
+        );
+        fs::remove_dir_all(&workspace).expect("remove workspace");
+        fs::remove_dir_all(main).expect("remove main");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn fetching_main_outside_the_workspace_tree_needs_an_explicit_read_root() {
+        let main = repository();
+        let parent = main.join("units");
+        fs::create_dir_all(&parent).expect("units");
+        let workspace = parent.join("raven");
+        let cloned = Command::new("git")
+            .args(["clone", "-q"])
+            .arg(&main)
+            .arg(&workspace)
+            .status()
+            .expect("clone workspace");
+        assert!(cloned.success());
+        let main = main.canonicalize().expect("canonical main");
+        let workspace = workspace.canonicalize().expect("canonical workspace");
+        let source = main.to_str().expect("UTF-8 fixture");
+        let denied = super::sandboxed_git_command_at(&workspace)
+            .expect("narrow Git")
+            .args(["fetch", "--no-tags", source])
+            .output()
+            .expect("sandboxed fetch");
+        assert!(!denied.status.success(), "a repository URL cannot grant its own read");
+        let admitted = super::sandboxed_git_command_with_read(&workspace, &main)
+            .expect("trusted read grant")
+            .args(["fetch", "--no-tags", source])
+            .output()
+            .expect("sandboxed fetch");
+        assert!(admitted.status.success(), "trusted source fetch: {}", String::from_utf8_lossy(&admitted.stderr));
+        fs::remove_dir_all(main).expect("remove fixture");
+    }
 
     fn repository() -> PathBuf {
         let suffix = SystemTime::now()

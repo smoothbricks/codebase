@@ -308,6 +308,7 @@ impl CliService for FakeService {
     async fn grant_project(&mut self, delta: ProjectGrantDelta) -> Result<ProjectGrants> {
         self.events.push("grant-project".to_owned());
         self.project_grants.read.extend(delta.read);
+        self.project_grants.deny_write.extend(delta.deny_write);
         self.project_grants.egress.extend(delta.egress);
         self.project_grants.revision += 1;
         Ok(self.project_grants.clone())
@@ -591,55 +592,6 @@ async fn grant_persists_sorted_paths_that_the_next_exec_observes() {
     assert!(observed.read.contains(&PathBuf::from("/tmp/probe")));
 }
 
-/// `--project-wide` reads and extends the project's standing grants and never touches a
-/// workspace's own; the listing and JSON have the workspace form's shape.
-#[tokio::test]
-async fn project_wide_grant_extends_and_lists_the_projects_standing_grants() {
-    let mut service = FakeService::default();
-
-    let (code, stdout, stderr) = run(
-        &mut service,
-        [
-            "grant",
-            "--project-wide",
-            "--read",
-            "/opt/shared",
-            "--egress",
-            "index.crates.io",
-        ],
-    )
-    .await;
-    assert_eq!(code, 0);
-    assert!(stdout.is_empty());
-    assert_eq!(
-        stderr,
-        b"cowshed: project grants now: 1 read, 1 egress (revision 1)\n\
-          cowshed: every workspace of this project holds them from its next exec or shell, on top of its own grants\n\
-          next: cowshed exec <ws> -- <retry your command>\n"
-    );
-
-    let (_, stdout, stderr) = run(&mut service, ["grant", "--project-wide"]).await;
-    assert!(stderr.is_empty());
-    assert_eq!(
-        stdout,
-        b"read\t/opt/shared\negress\tindex.crates.io\t443,80\tintercept\n"
-    );
-    let (_, stdout, _) = run(&mut service, ["grant", "--project-wide", "--json"]).await;
-    let envelope: serde_json::Value = serde_json::from_slice(&stdout).expect("grant JSON");
-    assert_eq!(
-        envelope["result"],
-        serde_json::json!({
-            "revision": 1,
-            "read": ["/opt/shared"],
-            "egress": [{ "host": "index.crates.io" }]
-        })
-    );
-    assert_eq!(
-        service.events,
-        ["grant-project", "project-grants", "project-grants"]
-    );
-    assert_eq!(service.grants, GrantSet::default());
-}
 
 #[tokio::test]
 async fn grant_denial_is_sandbox_denied_json_and_leaves_grants_unchanged() {

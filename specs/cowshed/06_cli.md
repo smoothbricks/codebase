@@ -228,13 +228,13 @@ intercepted. Per-port narrowing is a further field of that rule, set through the
 takes no flag for it. A bare `cowshed grant <ws>` (no flags) prints the current set with a `mode` column on the egress
 rows.
 
-`cowshed grant --project-wide` addresses the project's standing grants instead of one workspace's: the read paths and
-egress hosts every workspace of the project runs under in addition to its own, held in the trusted project policy
-(04_sandbox.md, "Project-standing grants"). The project comes from ordinary discovery — the cwd, or
-`--project <git-root>`. It takes `--read`, `--egress` and `--opaque`; `--write` and a `<ws>` alongside it are usage
-errors, because a write grant is a per-workspace decision. A bare `cowshed grant --project-wide` prints the standing set
-in the same columns, and `--json` returns `{ revision, read, egress }`. A gateway denial names both remedies, the
-standing grant first.
+`cowshed grant --project-wide` addresses the project's standing policy: read paths, egress hosts,
+and workspace-relative `--deny-write` paths every workspace (including main) runs under. The
+policy lives outside the workspaces (04_sandbox.md, "Project-standing grants"), so a workspace
+grant cannot remove a project deny. The project comes from ordinary discovery — the cwd, or
+`--project <git-root>`. `--write` and a `<ws>` alongside `--project-wide` are usage errors;
+a write allow remains a per-workspace decision. A bare `cowshed grant --project-wide` prints
+the standing set, and `--json` includes `{ revision, read, denyWrite, egress }`.
 
 `--sim <verb>` grants personal-session simulator broker verbs (`openurl`, `install` — 04/05/14); dev-side headless
 simulators need the `--preset simulator` profile class instead (CoreSimulator IPC), not a `--sim` grant. `install` is

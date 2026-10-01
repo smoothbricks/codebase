@@ -361,6 +361,7 @@ pub struct GrantArgs {
     pub target: GrantTarget,
     pub read: Vec<PathBuf>,
     pub write: Vec<PathBuf>,
+    pub deny_write: Vec<PathBuf>,
     /// Hosts this workspace may reach through the gateway. Network reach is a separate decision
     /// from filesystem reach, and separately auditable: the gateway logs every admission.
     pub egress: Vec<String>,
@@ -745,7 +746,7 @@ fn cli_command() -> ClapCommand {
             leaf("grant")
                 .arg(positional("workspace", 0..=1))
                 .arg(flag("project-wide"))
-                .args([path_values("read"), path_values("write")])
+                .args([path_values("read"), path_values("write"), path_values("deny-write")])
                 .arg(append_value("egress"))
                 .arg(flag("opaque")),
         )
@@ -2134,13 +2135,13 @@ const GRANT: CommandSpec = CommandSpec {
         "Adds read-only or writable host paths to one workspace's sandbox grant snapshot. Paths are normalized, deduplicated, sorted, and recorded outside the workspace image; they apply from the next exec or shell. With no flags, prints the current filesystem grants.",
         "A grant cannot cover the workspace mount, another cowshed mount, controller state, project policy roots, or credential-bearing paths.",
         "A path is recorded under its resolved spelling. A symlink planted beside the workspace so `../<name>` resolves (for example `<shed>/<org>/<project>/<name>` pointing at a sibling repository) is readable through the link exactly when its target is granted; grant the target, not the link.",
-        "`--project-wide` changes the project's standing grants instead: read paths and egress hosts every workspace of the project — main, new, and forks — runs under in addition to its own, from its next exec or shell. They live in the trusted project policy; a fork never copies another workspace's own grants. A write grant stays per workspace. With no other flags, prints the project's standing grants.",
+        "`--project-wide` changes the project's standing policy instead: read paths, egress hosts and workspace-relative write denies every workspace — main, new, and forks — runs under. A workspace grant cannot remove a project deny. A write allow stays per workspace. With no other flags, prints the project's standing policy.",
         "An egress host is intercepted by default: the gateway terminates its TLS under the workspace CA, audits each request, and can attach a credential the host holds. `--opaque` grants the hosts named in the same invocation as opaque tunnels instead, for a client that verifies the real certificate — a pinned client, or Go on macOS, whose platform verifier never trusts the workspace CA. A host holds one rule, so granting it again restates its mode.",
     ],
     options: &[
         Opt {
             spelling: "--project-wide",
-            meaning: "change or print the project's standing grants instead of one workspace's; takes --read, --egress and --opaque",
+            meaning: "change or print the project's standing policy; takes --read, --deny-write, --egress and --opaque",
         },
         Opt {
             spelling: "--read <path...>",
@@ -2149,6 +2150,10 @@ const GRANT: CommandSpec = CommandSpec {
         Opt {
             spelling: "--write <path...>",
             meaning: "allow reads and writes beneath one or more absolute host paths; repeat the flag to add more",
+        },
+        Opt {
+            spelling: "--deny-write <relative-path...>",
+            meaning: "deny writes at workspace-relative paths and beneath directories; project-wide policy applies to main and all workspaces",
         },
         Opt {
             spelling: "--egress <host>",
@@ -2206,6 +2211,10 @@ fn parse_grant(matches: &ArgMatches) -> Result<Command, UsageError> {
             .unwrap_or_default(),
         write: matches
             .get_many::<PathBuf>("write")
+            .map(|paths| paths.cloned().collect())
+            .unwrap_or_default(),
+        deny_write: matches
+            .get_many::<PathBuf>("deny-write")
             .map(|paths| paths.cloned().collect())
             .unwrap_or_default(),
         egress,

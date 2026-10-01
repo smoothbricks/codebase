@@ -224,6 +224,7 @@ async fn probe_git(root: &Path, args: &[&str], sandbox: &SandboxConfig) -> Resul
             "-C",
         ])
         .arg(root)
+        .args(["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false"])
         .args(args)
         .current_dir(&sandbox.workspace_mount)
         .env_clear()
@@ -654,6 +655,7 @@ mod tests {
             grants: crate::sandbox::SandboxGrants {
                 read: vec![checkout.to_owned()],
                 write: Vec::new(),
+                deny_write: Vec::new(),
                 egress: Vec::new(),
             },
             allowed_unix_sockets: Vec::new(),

@@ -2068,6 +2068,7 @@ mod tests {
             grants: crate::project_policy::ProjectGrants {
                 revision: 2,
                 read: vec![PathBuf::from("/opt/shared")],
+                deny_write: Vec::new(),
                 egress: vec![crate::metadata::EgressRule {
                     host: "registry.example.test".to_owned(),
                     ports: Vec::new(),

@@ -22,6 +22,7 @@ pub struct EgressGrant {
 pub struct SandboxGrants {
     pub read: Vec<PathBuf>,
     pub write: Vec<PathBuf>,
+    pub deny_write: Vec<PathBuf>,
     pub egress: Vec<EgressGrant>,
 }
 
@@ -465,6 +466,7 @@ pub fn workspace_sandbox(workspace: WorkspaceSandbox<'_>) -> crate::Result<Sandb
         grants: SandboxGrants {
             read: grants.read.clone(),
             write: grants.write.clone(),
+            deny_write: grants.deny_write.clone(),
             egress: grants
                 .egress
                 .iter()
@@ -577,6 +579,19 @@ fn validated_sandbox_paths(
     let read_grants = normalized_paths(&config.grants.read)?;
     let write_grants = normalized_paths(&config.grants.write)?;
     let sockets = normalized_paths(&config.allowed_unix_sockets)?;
+    for relative in &config.grants.deny_write {
+        if relative.as_os_str().is_empty()
+            || relative
+                .components()
+                .any(|component| !matches!(component, std::path::Component::Normal(_)))
+            || relative.components().collect::<PathBuf>().as_os_str() != relative.as_os_str()
+        {
+            return Err(SandboxError::InvalidPath {
+                path: relative.clone(),
+                reason: "workspace deny must be relative without traversal",
+            });
+        }
+    }
     for link in &config.shed_links {
         validate_path(&link.link)?;
         validate_path(&link.target)?;
@@ -829,6 +844,25 @@ pub fn seatbelt_profile(
     push_subpath_rule(&mut profile, "allow file-read*", &config.workspace_mount)?;
     if config.mode == RunSandboxMode::ReadWrite {
         push_subpath_rule(&mut profile, "allow file-write*", &config.workspace_mount)?;
+    }
+    // Last-match-wins: a workspace-relative deny must follow every mount and grant allow.
+    // Deny rename/unlink on ancestors too, or renaming `.git` would move the protected
+    // children out of the denied spelling before rewriting them.
+    for relative in &config.grants.deny_write {
+        let mut parent = config.workspace_mount.clone();
+        for component in relative.components() {
+            parent.push(component);
+            push_literal_rule(
+                &mut profile,
+                "deny file-write-unlink",
+                &parent,
+            )?;
+        }
+        push_exact_and_subpath_rule(
+            &mut profile,
+            "deny file-write*",
+            &config.workspace_mount.join(relative),
+        )?;
     }
     let workspace_metadata = config.workspace_mount.join(".cowshed");
     let job_artifacts = workspace_metadata.join("job");
@@ -1114,6 +1148,7 @@ mod tests {
             grants: SandboxGrants {
                 read: vec![PathBuf::from("/opt/shared"), PathBuf::from("/opt/shared")],
                 write: vec![PathBuf::from("/opt/output")],
+                deny_write: Vec::new(),
                 egress: vec![EgressGrant {
                     host: "example.com".into(),
                     ports: vec![443],

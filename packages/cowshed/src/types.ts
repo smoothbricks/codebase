@@ -87,6 +87,7 @@ export interface GrantSet {
   readonly portBlock?: PortBlock;
   readonly read: readonly string[];
   readonly write: readonly string[];
+  readonly denyWrite?: readonly string[];
   readonly egress: readonly EgressRule[];
   readonly repos?: readonly string[];
   readonly sim: readonly SimVerb[];
@@ -119,6 +120,7 @@ export interface CreateOptions {
 export interface GrantDelta {
   readonly read?: readonly string[];
   readonly write?: readonly string[];
+  readonly denyWrite?: readonly string[];
   readonly egress?: readonly EgressRule[];
   readonly repos?: readonly string[];
   readonly sim?: readonly SimVerb[];

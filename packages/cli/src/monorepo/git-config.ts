@@ -30,6 +30,9 @@ const POST_COMMIT_BLOCK = [
 ].join('\n');
 
 export async function applyWorkspaceGitConfig(root: string): Promise<void> {
+  // Workspace Git metadata belongs to the host setup, not a sandboxed job. Its hooks
+  // are installed in the warm checkout already; a job must never rewrite them.
+  if (process.env.COWSHED_WORKSPACE_TOKEN) return;
   const gitDirResult = await $`git rev-parse --git-dir`.cwd(root).quiet().nothrow();
   if (gitDirResult.exitCode !== 0) {
     throw new Error(`git rev-parse --git-dir failed with exit code ${gitDirResult.exitCode}: not in a git repository`);

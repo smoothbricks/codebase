@@ -1,9 +1,9 @@
 //! The trusted project policy: `/private/cowshed/store/<owner>/<repo>/policy.json`.
 //!
 //! Controller-owned, mode 0600, on the store volume every sandbox is denied. It holds what the
-//! operator decided for the whole project rather than for one workspace: checkpoint quotas, and
-//! the project's standing grants — the read paths and egress hosts every workspace of the project
-//! starts with. A workspace's own grants (`<image>.grants.json`) add on top; they never subtract.
+//! operator decided for the whole project rather than for one workspace: checkpoint quotas,
+//! standing read/egress grants and workspace-relative write denies. A workspace's own grants
+//! add on top; a workspace grant delta cannot remove a project deny.
 //!
 //! A missing file is the empty policy. A file that does not parse as exactly this shape fails
 //! closed: an unknown field is refused rather than ignored, because a policy the controller cannot
@@ -26,11 +26,10 @@ pub struct ProjectPolicy {
     pub grants: ProjectGrants,
 }
 
-/// Grants every workspace of the project holds from its first supervisor launch.
+/// Policy every workspace of the project holds from its first supervisor launch.
 ///
-/// Only reads and egress: a standing write grant would hand every workspace, forks included, a
-/// shared writable tree outside its image, which is exactly the per-workspace decision a write
-/// grant exists to force.
+/// Reads, egress and write denies are standing decisions. A standing write allow would hand
+/// every workspace a shared writable tree outside its image; that stays per-workspace.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ProjectGrants {
@@ -43,6 +42,9 @@ pub struct ProjectGrants {
     pub read: Vec<PathBuf>,
     #[serde(default)]
     pub egress: Vec<EgressRule>,
+    /// Workspace-relative paths forbidden to every job, including main's.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deny_write: Vec<PathBuf>,
 }
 
 impl ProjectPolicy {
@@ -82,6 +84,9 @@ pub fn effective_grants(
     effective.read.extend(project.read.iter().cloned());
     effective.read.sort();
     effective.read.dedup();
+    effective.deny_write.extend(project.deny_write.iter().cloned());
+    effective.deny_write.sort();
+    effective.deny_write.dedup();
     for rule in &project.egress {
         if !workspace.egress.iter().any(|own| own.host == rule.host) {
             effective.egress.push(rule.clone());
@@ -122,6 +127,7 @@ mod tests {
                 rule("git.example.test", &[]),
                 rule("registry.example.test", &[]),
             ],
+            deny_write: Vec::new(),
         };
 
         let effective = effective_grants(&workspace, &project).expect("revisions fit");
@@ -208,6 +214,7 @@ mod tests {
             revision: 1,
             read: vec![PathBuf::from("/opt/shared")],
             egress: vec![rule("registry.example.test", &[])],
+            deny_write: Vec::new(),
         };
         policy.write(&path).unwrap();
         assert_eq!(ProjectPolicy::read(&path).unwrap(), policy);

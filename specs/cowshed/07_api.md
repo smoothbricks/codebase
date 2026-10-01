@@ -355,6 +355,7 @@ pub struct GrantSet {
                                          // never a zero-sized or otherwise sentinel block
     pub read: Vec<PathBuf>,
     pub write: Vec<PathBuf>,
+    pub deny_write: Vec<PathBuf>,       // paths relative to this workspace, terminal file-write* denies
     pub egress: Vec<EgressRule>,         // { host, ports, mode }
     pub repos: Vec<RepoRule>,            // repo-scoped mirror grants (05_gateway.md)
     pub sim: Vec<SimVerb>,               // personal-session simulator broker verbs (04/05/14_nix.md)
@@ -367,7 +368,7 @@ pub struct EgressRule {                 // 04_sandbox.md / 05_gateway.md
 }
 pub enum EgressMode { Intercept, Opaque }
 pub struct GrantDelta {
-    pub read: Vec<PathBuf>, pub write: Vec<PathBuf>,
+    pub read: Vec<PathBuf>, pub write: Vec<PathBuf>, pub deny_write: Vec<PathBuf>,
     pub egress: Vec<EgressRule>, pub repos: Vec<RepoRule>, pub sim: Vec<SimVerb>,
     pub expected_revision: Option<u64>,  // CAS: reject with Conflict if the on-disk revision differs
 }

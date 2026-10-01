@@ -717,6 +717,9 @@ function assertTypescriptApiAt(typescriptRoot: string, expectedTarget: string): 
  * package graph exists — not the installer. Called under the install lock.
  */
 async function applyWorkspaceGitConfig(root: string): Promise<void> {
+  // A workspace job inherits the installed hooks, but cannot mutate .git/config
+  // or .git/hooks. Git wiring belongs to setup outside the job's sandbox.
+  if (process.env.COWSHED_WORKSPACE_TOKEN) return;
   await keepRepositoryConfig(root);
 
   const gitDirResult = await $`git rev-parse --git-dir`.cwd(root).quiet().nothrow();

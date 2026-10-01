@@ -244,14 +244,24 @@ Notes:
   must match the deny's specificity. It is not expressible as a read/write grant for exactly that reason: a grant
   intersecting an effective deny is refused. It is controller-owned, carried by the workspaces that asked for the mode,
   and never implied by the baseline — main's working tree is no more reachable than any other workspace's.
+- **Controller Git is separately confined.** Host-side checkout Git disables hooks, fsmonitor and commit
+  signing regardless of repository config. Rebase, land and fetch use the GitDiscovery profile: the
+  target checkout is writable, and any source checkout it must read is supplied by the controller,
+  not a URL found in `.git/config`. Linked-worktree Git can write the shared `.git` only when its
+  reverse registration points back to this workspace. Repository filters and merge drivers therefore
+  run within this narrower write boundary, never with the controller's host reach.
+  The object-only bundle create/verify/fetch verbs access controller-owned bundle files in the
+  denied store; they run host-side with hooks and fsmonitor disabled, without checkout, configured
+  remotes or merge/filter execution. The store is not made readable to a workspace Git sandbox.
 - **Effective denies are monotonic.** `repo_id` is the machine-independent lowercase `owner/repo` normalized from a
   chosen remote URL. The binding records that remote and validates the identifier against it; multiple bound identities
   may exist but exactly one is primary. A local-only repository requires an explicit `repo_id`, and discovery may
   propose an identity but never silently mint one. For that identity cowshed computes the canonical-path union of (1)
   built-in secret and control-plane denies and (2) additional denies declared by the repository. Repository-controlled
   config may add denies but cannot remove, replace, mask, or carve back the built-in layer. The trusted project policy
-  `/private/cowshed/store/<owner>/<repo>/policy.json` carries no denies: it holds the project's checkpoint quotas and
-  its standing grants ([Project-standing grants](#project-standing-grants)). Its path is constructed as
+  `/private/cowshed/store/<owner>/<repo>/policy.json` carries no host-path denies: it holds the
+  project's checkpoint quotas, standing read/egress grants and workspace-relative write denies
+  ([Project-standing grants](#project-standing-grants)). Its path is constructed as
   `/private/cowshed/store/<owner>/<repo>/policy.json`: `owner` and `repo` are separately lowercased and validated as
   non-empty `[a-z0-9._-]+` segments; `.`, `..`, separators, percent-encoded separators, and decoded aliases are rejected
   before any join. The policy is read by the controller, never through a repository-relative path. Missing policy is the
@@ -277,6 +287,7 @@ Controller-owned, host-readable while the image is detached, outside the workspa
   "updatedAt": "2026-07-11T12:34:56Z",
   "read": ["<project-root>/shared-fixtures"],
   "write": ["<project-root>/artifacts/raven"],
+  "denyWrite": [".git/hooks", ".git/config"],
   "egress": [
     { "host": "registry.npmjs.org" },
     { "host": "api.example.com", "mode": "intercept" },
@@ -290,6 +301,9 @@ Controller-owned, host-readable while the image is detached, outside the workspa
 - Paths are canonicalized on write. A read or write grant that intersects the effective deny union is refused (exit 6 /
   `CowshedError::SandboxDenied`); this check is repeated when loading a grant snapshot so a newly added trusted or
   repository deny narrows old grants without rewriting them.
+- `denyWrite` is workspace-relative. It is kept in the controller-owned grant snapshot,
+  and a project policy can add denies to every workspace without giving workspace jobs
+  authority over that policy.
 - `workspaceIncarnation` is public detached identity, not authority or a credential. Create/fork/restore mint it as
   specified in 01/02; job records retain the incarnation that produced them so numeric job IDs remain unambiguous across
   copied or discarded timelines.
@@ -320,8 +334,9 @@ Controller-owned, host-readable while the image is detached, outside the workspa
 
 ### Project-standing grants
 
-A project's standing grants are the read paths and egress hosts every workspace of the project runs under — main, new
-workspaces, and forks — in addition to its own. They live in the trusted project policy, beside its checkpoint quotas:
+A project's standing policy combines read paths, egress hosts and workspace-relative write denies
+for every workspace — main, new workspaces and forks. It lives in the trusted project policy,
+beside its checkpoint quotas; a workspace grant delta cannot remove a project deny.
 
 ```json
 {
@@ -329,17 +344,22 @@ workspaces, and forks — in addition to its own. They live in the trusted proje
   "grants": {
     "revision": 3,
     "read": ["/Users/alice/Dev/acme/shared-fixtures"],
-    "egress": [{ "host": "index.crates.io" }, { "host": "github.com" }]
+    "egress": [{ "host": "index.crates.io" }, { "host": "github.com" }],
+    "denyWrite": [".git/hooks", ".git/config"]
   }
 }
 ```
 
-- **Reads and egress only.** A standing write grant would hand every workspace, forks included, one shared writable tree
-  outside its image; a write grant stays a per-workspace decision.
-- **Composition.** A workspace's grant snapshot is its own grant file plus the standing grants: reads are the sorted
-  union, and egress is the workspace's rules plus every standing rule for a host the workspace does not name — a
-  workspace rule for the same host (its ports and mode) is kept as written. Standing grants add; they never subtract. A
-  fork never copies another workspace's own grants, and holds the standing ones like every workspace does.
+- **Reads, egress and write denies only.** A standing write allow would hand every workspace, forks included,
+  one shared writable tree outside its image; a write allow stays per workspace.
+- **Workspace-relative denies.** `denyWrite` paths are checked for traversal and emitted after the
+  workspace write allow as exact-name and descendant `file-write*` denies. Link creation remains
+  denied; attempts to rename protected ancestors are denied by the parent's unlink operation.
+  Existing workspaces use the same effective project policy as new ones.
+- **Composition.** Reads and write denies are sorted unions of workspace and project policy; egress is
+  workspace rules plus every standing rule for a host the workspace does not name. Project denies
+  cannot be removed by a workspace `grant` or `revoke` delta. A fork receives the standing policy,
+  never another workspace's own grants.
 - **Effective revision.** The standing grants carry their own `revision`, advanced by every effective change and never
   reset. The revision a workspace's supervisor launches under, its jobs record, and its gateway session is installed at
   is the workspace's own revision plus the project's: each only grows, so the sum grows whenever either does, and a
@@ -381,9 +401,8 @@ Grant files are small, but they are the authority record — mutations are speci
 ### Widening and narrowing
 
 ```
-cowshed grant  <ws> [--read <path>]… [--write <path>]… [--egress <host[:port]>]… [--sim <verb>]…
-cowshed grant  --project-wide [--read <path>]… [--egress <host[:port]>]…
-cowshed revoke <ws> [--read <path>]… [--write <path>]… [--egress <host>]… [--sim <verb>]… [--all]
+cowshed grant  <ws> [--read <path>]… [--write <path>]… [--deny-write <relative-path>]… [--egress <host>]…
+cowshed grant  --project-wide [--read <path>]… [--deny-write <relative-path>]… [--egress <host>]…
 ```
 
 Rust API: `Workspace::grant(delta)` / `Workspace::revoke(delta)`. The coordinator starts workers closed and opens paths

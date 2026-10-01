@@ -7957,6 +7957,7 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
     ) -> Result<crate::project_policy::ProjectGrants> {
         self.validate_binding().await?;
         normalize_grant_paths(&mut delta.read)?;
+        normalize_relative_denies(&mut delta.deny_write)?;
         // Every workspace runs under the project's grants, so the candidate is validated as the
         // one workspace every project has runs: main, with its own grants plus the candidate. The
         // denies that differ between workspaces are their own mounts, which the mount-root deny
@@ -7980,6 +7981,7 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
             }
             let previous = policy.grants.clone();
             update_ordered_set(&mut policy.grants.read, delta.read, revoke);
+            update_ordered_set(&mut policy.grants.deny_write, delta.deny_write, revoke);
             update_egress(&mut policy.grants.egress, delta.egress, revoke);
             if policy.grants == previous {
                 return Ok(previous);
@@ -8115,7 +8117,7 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                 .configure_main_remote(&main_mount)
                 .await?;
             let remote = main_remote.remote_name();
-            run_git(&root, ["fetch", "--no-tags", remote]).await?;
+            run_git_with_read(&root, &main_mount, ["fetch", "--no-tags", remote]).await?;
             options.onto.as_ref().map_or_else(
                 || format!("{remote}/{DEFAULT_LANDING_BRANCH}"),
                 revision_target,
@@ -10423,8 +10425,9 @@ async fn deliver_into(
     target_branch: &str,
 ) -> Result<()> {
     let preservation_ref = format!("refs/cowshed/{unit}/heads/{source_branch}");
-    run_git(
+    run_git_with_read(
         target_root,
+        source_mount,
         [
             "fetch",
             "--no-tags",
@@ -10484,8 +10487,9 @@ async fn fetch_target_branch(
 ) -> Result<String> {
     let branch = target_checked_out_branch(target_root, target).await?;
     let reference = format!("refs/cowshed/targets/{target}/{branch}");
-    run_git(
+    run_git_with_read(
         unit_root,
+        target_root,
         [
             "fetch",
             "--no-tags",
@@ -10558,14 +10562,24 @@ async fn run_git<const N: usize>(root: &Path, args: [&str; N]) -> Result<()> {
     require_git_success("git operation", &output)
 }
 
-/// The runtime's one git spawner, built on [`crate::git::git_command_at`] so every invocation
-/// carries the same `-C` targeting and disabled terminal prompt — a runtime git call that blocks
-/// on a credential prompt would hang the controller.
+#[cfg(target_os = "macos")]
+async fn run_git_with_read<const N: usize>(root: &Path, read: &Path, args: [&str; N]) -> Result<()> {
+    let mut command = tokio::process::Command::from(
+        crate::git::sandboxed_git_command_with_read(root, read)?,
+    );
+    let output = command.args(args).output().await.map_err(|error| {
+        CowshedError::environment_missing(error.to_string(), "restore /usr/bin/git and sandbox-exec")
+    })?;
+    require_git_success("git operation", &output)
+}
+
+/// Repository-selected Git commands (including merge drivers and filters) run
+/// with a write boundary around the checkout, not with controller host reach.
 #[cfg(target_os = "macos")]
 async fn invoke_git(root: &Path, args: &[&str]) -> Result<std::process::Output> {
-    let mut command = tokio::process::Command::from(crate::git::git_command_at(root));
+    let mut command = tokio::process::Command::from(crate::git::sandboxed_git_command_at(root)?);
     command.args(args).output().await.map_err(|error| {
-        CowshedError::environment_missing(error.to_string(), "restore /usr/bin/git")
+        CowshedError::environment_missing(error.to_string(), "restore /usr/bin/git and sandbox-exec")
     })
 }
 
@@ -10893,7 +10907,28 @@ fn sandbox_denial_in(stderr: &str) -> Option<String> {
 #[cfg(target_os = "macos")]
 fn normalize_grant_delta(delta: &mut GrantDelta) -> Result<()> {
     normalize_grant_paths(&mut delta.read)?;
-    normalize_grant_paths(&mut delta.write)
+    normalize_grant_paths(&mut delta.write)?;
+    normalize_relative_denies(&mut delta.deny_write)
+}
+
+#[cfg(target_os = "macos")]
+fn normalize_relative_denies(paths: &mut Vec<PathBuf>) -> Result<()> {
+    for path in paths.iter_mut() {
+        if path.as_os_str().is_empty()
+            || path
+                .components()
+                .any(|component| !matches!(component, std::path::Component::Normal(_)))
+        {
+            return Err(CowshedError::usage(
+                format!("workspace deny {} must be a relative path without traversal", path.display()),
+                "name a path beneath the workspace without . or ..",
+            ));
+        }
+        *path = path.components().collect();
+    }
+    paths.sort();
+    paths.dedup();
+    Ok(())
 }
 
 #[cfg(target_os = "macos")]
@@ -11019,6 +11054,7 @@ fn resolve_missing_grant_path(path: &Path) -> Result<PathBuf> {
 fn apply_grant_delta(grants: &mut GrantSet, delta: GrantDelta, revoke: bool) {
     update_ordered_set(&mut grants.read, delta.read, revoke);
     update_ordered_set(&mut grants.write, delta.write, revoke);
+    update_ordered_set(&mut grants.deny_write, delta.deny_write, revoke);
     update_egress(&mut grants.egress, delta.egress, revoke);
     update_ordered_set(&mut grants.repos, delta.repos, revoke);
     update_ordered_set(&mut grants.sim, delta.sim, revoke);
@@ -11149,6 +11185,41 @@ mod grant_unit_tests {
         assert_eq!(grants.read, [a, z]);
         assert_eq!(grants.write, [output.clone(), output.join("reports")]);
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn workspace_delta_cannot_remove_project_write_denies() {
+        let project = crate::project_policy::ProjectGrants {
+            deny_write: vec![PathBuf::from(".git/hooks")],
+            ..crate::project_policy::ProjectGrants::default()
+        };
+        let mut workspace = GrantSet {
+            deny_write: vec![PathBuf::from(".workspace-policy")],
+            ..GrantSet::default()
+        };
+        apply_grant_delta(
+            &mut workspace,
+            GrantDelta {
+                deny_write: vec![PathBuf::from(".git/hooks"), PathBuf::from(".workspace-policy")],
+                ..GrantDelta::default()
+            },
+            true,
+        );
+        let effective = crate::project_policy::effective_grants(&workspace, &project)
+            .expect("revisions fit");
+        assert_eq!(effective.deny_write, [PathBuf::from(".git/hooks")]);
+    }
+
+    #[test]
+    fn workspace_denies_refuse_absolute_and_traversing_paths() {
+        for path in ["/tmp/elsewhere", "../.git/config", "."] {
+            let mut paths = vec![PathBuf::from(path)];
+            let error = normalize_relative_denies(&mut paths).expect_err("not workspace-relative");
+            assert_eq!(error.code.as_str(), "usage", "{path}");
+        }
+        let mut paths = vec![PathBuf::from(".git/hooks/"), PathBuf::from(".git/hooks")];
+        normalize_relative_denies(&mut paths).expect("valid workspace deny");
+        assert_eq!(paths, [PathBuf::from(".git/hooks")]);
     }
 
     /// A host has one egress rule: its mode and ports are that rule. Granting a

@@ -687,7 +687,7 @@ next: cowshed attach raven
 
 ## Sandbox grants
 
-### `cowshed grant <name> [--read <path...>] [--write <path...>] [--egress <host>] [--opaque]`
+### `cowshed grant <name> [--read <path...>] [--write <path...>] [--deny-write <relative-path...>] [--egress <host>] [--opaque]`
 
 Workspaces start **closed**: write access to their own volume, `/private/cowshed/caches`, and temp; read access to the
 toolchains and system; egress to the localhost gateway only. Widen filesystem and network access per workspace:
@@ -711,6 +711,11 @@ next: cowshed exec raven -- <retry your command>
   its target is granted — grant the target, and the workspace reaches it through the link.
 - Filesystem grants take effect at the next `exec`: Seatbelt profiles are fixed at process launch, and every launch
   carries the current persisted grant snapshot.
+- `--deny-write` protects a path relative to the workspace root and everything below it. The
+  final Seatbelt rule overrides the workspace's broad write allow; link creation and parent
+  renames cannot bypass it. `cowshed grant --project-wide --deny-write .git/hooks .git/config`
+  puts the same restriction on main and every current and future workspace. Workspace grants
+  cannot remove a project deny. Set this from the trusted host, not an in-workspace job.
 - `--egress <host>` is repeatable and admits one host through the gateway, intercepted, on the default ports (443 and
   80). Network reach is a separate decision from filesystem reach and a separately auditable one: the gateway records
   every admission in its Arrow audit telemetry ([telemetry.md](telemetry.md)). Holding a credential for a registry does
