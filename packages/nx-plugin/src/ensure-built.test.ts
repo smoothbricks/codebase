@@ -529,7 +529,7 @@ describe('smoo-nx-exec', () => {
     expect(await readFile(builds(), 'utf-8')).toBe(before);
   });
 
-  it('runs again when a dependency\u0027s own inputs change', async () => {
+  it('runs again when a dependency\u0027s own inputs change, keeping stdout for the binary alone', async () => {
     const before = await readFile(builds(), 'utf-8');
     await writeFile(join(workspace, 'packages', 'lib', 'source1.txt'), 'lib changed\n');
     const changed = await runBin(workspace, ['app:build', '--', './report']);
@@ -537,6 +537,13 @@ describe('smoo-nx-exec', () => {
     expect(await readFile(join(workspace, 'packages', 'lib', 'dist', 'lib.txt'), 'utf-8')).toBe('lib changed\n');
     expect(await readFile(marker(), 'utf-8')).toBe('built\nlib changed\n');
     expect(await readFile(builds(), 'utf-8')).toBe(`${before}lib changed\n`);
+    // The run's log is on stderr. Stdout is the exec'd binary's and holds
+    // nothing else, or `wrapper | jq` reads Nx's banner as data.
+    expect(stripVTControlCharacters(changed.stderr)).toContain('nx run lib:build');
+    expect(changed.stdout.split('\n')[0], changed.stdout).toBe(MARKER);
+    for (const line of changed.stdout.split('\n').filter((line) => line !== '')) {
+      expect(line === MARKER || line.startsWith('cwd=') || /^NX_[A-Z_]+=/.test(line), line).toBe(true);
+    }
 
     // And the graph settles back to silence, which is only reachable if the
     // dependent-outputs task was hashed too.
@@ -579,8 +586,8 @@ describe('smoo-nx-exec', () => {
     expect(run.code, run.stdout + run.stderr).toBe(0);
     // An outer `nx run nx-plugin:test` exports FORCE_COLOR, so the fixture's
     // Nx styles its task lines; what the test pins is the line, not its colour.
-    expect(stripVTControlCharacters(run.stdout)).toContain('nx run lib:build');
-    expect(run.stdout).not.toContain(MARKER);
+    expect(stripVTControlCharacters(run.stderr)).toContain('nx run lib:build');
+    expect(run.stdout).toBe('');
     expect(await readFile(marker(), 'utf-8')).toBe('built\nlib checked\n');
     expect(await readFile(builds(), 'utf-8')).toBe(`${before}lib checked\n`);
 
@@ -593,7 +600,8 @@ describe('smoo-nx-exec', () => {
   it('without a binary, exits with a failing target\u0027s code', async () => {
     const run = await runBin(workspace, ['app:broken']);
     expect(run.code).toBe(1);
-    expect(stripVTControlCharacters(run.stdout)).toContain('nx run app:broken');
+    expect(stripVTControlCharacters(run.stderr)).toContain('nx run app:broken');
+    expect(run.stdout).toBe('');
   });
 
   it('forwards a failing target\u0027s exit code and never execs', async () => {
@@ -609,7 +617,7 @@ describe('smoo-nx-exec', () => {
     });
     expect(run.code).toBe(0);
     expect(run.stderr).toContain('daemon is disabled');
-    expect(run.stdout).toContain(MARKER);
+    expect(run.stdout.split('\n')[0], run.stdout).toBe(MARKER);
   });
 
   it('prints the message from a plain-object Nx rejection', async () => {

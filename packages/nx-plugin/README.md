@@ -414,6 +414,9 @@ It is deliberately not `nx run <target> && exec`:
   print.
 - It execs the binary, preserving its argv, exit status, and signals. `nx run` has no notion of handing the process over
   to another binary.
+- A miss runs the target through the workspace's `nx` CLI with the child's stdout on stderr, so stdout carries only the
+  binary's output (`wrapper | jq` works). Nx's pseudo-terminal writes task output straight to file descriptor 1, which
+  only a child process can redirect.
 
 Pass `--workspace-root <dir>` before `--` when invoking the wrapper outside the workspace. The binary path resolves
 against the caller's current directory.
@@ -424,7 +427,8 @@ Without `--` and a binary, the wrapper only makes the target current and exits 0
 smoo-nx-exec my-cli:build --workspace-root "$root"
 ```
 
-A hit prints nothing, where `nx run` would replay every task's cached log. A miss prints Nx's run of the target.
+A hit prints nothing, where `nx run` would replay every task's cached log. A miss prints Nx's run of the target on
+stderr.
 
 ## Bun Test Tracing Generator
 

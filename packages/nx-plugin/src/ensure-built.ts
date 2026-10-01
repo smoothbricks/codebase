@@ -14,7 +14,6 @@ import type * as NxHashTask from 'nx/src/hasher/hash-task';
 import type * as NxTaskHasher from 'nx/src/hasher/task-hasher';
 import type * as NxNative from 'nx/src/native';
 import type * as NxExecutionHooks from 'nx/src/project-graph/plugins/tasks-execution-hooks';
-import type * as NxProjectGraph from 'nx/src/project-graph/project-graph';
 import type * as NxCache from 'nx/src/tasks-runner/cache';
 import type * as NxCreateTaskGraph from 'nx/src/tasks-runner/create-task-graph';
 import type { TaskResults } from 'nx/src/tasks-runner/life-cycle';
@@ -24,7 +23,6 @@ import type * as NxTasksRunnerUtils from 'nx/src/tasks-runner/utils';
 import type * as NxCacheDirectory from 'nx/src/utils/cache-directory';
 import type * as NxCommandLineUtils from 'nx/src/utils/command-line-utils';
 import type { NxArgs } from 'nx/src/utils/command-line-utils';
-import type * as NxExitCodes from 'nx/src/utils/exit-codes';
 import type * as NxPerfLogging from 'nx/src/utils/perf-logging';
 import type * as NxWorkspaceRoot from 'nx/src/utils/workspace-root';
 
@@ -35,7 +33,6 @@ interface NxRuntimeModules {
   readonly 'nx/src/hasher/task-hasher': typeof NxTaskHasher;
   readonly 'nx/src/native': typeof NxNative;
   readonly 'nx/src/project-graph/plugins/tasks-execution-hooks': typeof NxExecutionHooks;
-  readonly 'nx/src/project-graph/project-graph': typeof NxProjectGraph;
   readonly 'nx/src/tasks-runner/cache': typeof NxCache;
   readonly 'nx/src/tasks-runner/create-task-graph': typeof NxCreateTaskGraph;
   readonly 'nx/src/tasks-runner/run-command': typeof NxRunCommand;
@@ -43,7 +40,6 @@ interface NxRuntimeModules {
   readonly 'nx/src/tasks-runner/utils': typeof NxTasksRunnerUtils;
   readonly 'nx/src/utils/cache-directory': typeof NxCacheDirectory;
   readonly 'nx/src/utils/command-line-utils': typeof NxCommandLineUtils;
-  readonly 'nx/src/utils/exit-codes': typeof NxExitCodes;
   readonly 'nx/src/utils/perf-logging': typeof NxPerfLogging;
   readonly 'nx/src/utils/workspace-root': typeof NxWorkspaceRoot;
 }
@@ -99,7 +95,8 @@ export type MissReason =
  * `built` means the work was handed to Nx — which may have restored outputs
  * from the local cache rather than recompiled anything. The line `hit` draws is
  * "did this process have to do work", which is what a CLI wrapper needs in
- * order to decide whether to stay quiet.
+ * order to decide whether to stay quiet. A run writes only to stderr: stdout
+ * belongs to whatever the caller goes on to run.
  *
  * `failed` is an operational outcome, not an exception: the target ran and did
  * not succeed. A caller re-raises `signal` when there is one and exits with
@@ -225,7 +222,7 @@ export function unvouched<Entry>(entries: readonly Entry[], verdicts: readonly b
  * on every invocation. So it never spawns the `nx` CLI: a native filesystem
  * snapshot refreshes the daemon's inputs, the task hashes and on-disk output
  * verification are daemon round-trips, and the cache lookup is a local SQLite
- * read. Nx's task runner is only invoked once something needs running.
+ * read. Only a miss starts the workspace's `nx` CLI, to run the target.
  *
  * With the daemon disabled there is no probe to make — hashing would have to
  * build the project graph in this process, and no service holds the recorded
@@ -278,7 +275,7 @@ async function ensureBuiltInWorkspace(
   // this explicit fallback path, which also lets a deliberately minimal
   // checkout-local CLI stand in for Nx.
   if (process.env.NX_DAEMON === 'false') {
-    return runViaCli(workspaceRoot, selector);
+    return runViaCli(workspaceRoot, selector, { kind: 'no-daemon', taskId: selectorTaskId(selector) });
   }
   // Nx rejects daemon access when the client package's version differs from
   // the workspace's running daemon. Resolve every runtime module from the
@@ -288,7 +285,7 @@ async function ensureBuiltInWorkspace(
   bindWorkspaceRoot(workspaceRoot, requireNx);
   const { daemonClient } = requireNx('nx/src/daemon/client/client');
   if (!daemonClient.enabled()) {
-    return runViaCli(workspaceRoot, selector);
+    return runViaCli(workspaceRoot, selector, { kind: 'no-daemon', taskId: selectorTaskId(selector) });
   }
 
   // An outer Nx task exports its own cache-bypass setting to the process it
@@ -356,32 +353,33 @@ async function ensureBuiltInWorkspace(
 
   performance.mark('ensureBuilt:probe:start');
   let reason: MissReason | null;
-  const selectorTaskId =
-    selector.configuration === undefined
-      ? `${selector.project}:${selector.target}`
-      : `${selector.project}:${selector.target}:${selector.configuration}`;
   if (process.env.NX_SKIP_NX_CACHE === 'true' || process.env.NX_DISABLE_NX_CACHE === 'true') {
-    reason = { kind: 'cache-disabled', taskId: selectorTaskId };
+    reason = { kind: 'cache-disabled', taskId: selectorTaskId(selector) };
   } else if (inputsChanged) {
-    reason = { kind: 'stale-inputs', taskId: selectorTaskId };
+    reason = { kind: 'stale-inputs', taskId: selectorTaskId(selector) };
   } else {
     reason = await probe(workspaceRoot, nxJson, nxArgs, projectGraph, taskGraph, tasks, requireNx);
   }
   performance.measure('ensureBuilt:probe', 'ensureBuilt:probe:start');
-  const outcome =
-    reason === null
-      ? { result: HIT, taskResults: NO_TASK_RESULTS }
-      : await runTarget(nxJson, nxArgs, overrides, selector, reason, requireNx);
+  // The CLI runs the hooks around its own run, under its own id. This process
+  // ran none of the tasks, so it reports none for the id it opened.
+  const result = reason === null ? HIT : await runViaCli(workspaceRoot, selector, reason);
   await hooks.runPostTasksExecution({
     id: runId,
-    taskResults: outcome.taskResults,
+    taskResults: NO_TASK_RESULTS,
     workspaceRoot,
     nxJsonConfiguration: nxJson,
     argv: process.argv,
     startTime,
     endTime: Date.now(),
   });
-  return outcome.result;
+  return result;
+}
+
+function selectorTaskId(selector: TargetSelector): string {
+  return selector.configuration === undefined
+    ? `${selector.project}:${selector.target}`
+    : `${selector.project}:${selector.target}:${selector.configuration}`;
 }
 
 /**
@@ -797,78 +795,35 @@ function isSystemError(error: unknown): boolean {
   return error instanceof Error && 'code' in error && typeof error.code === 'string';
 }
 
-interface CompletedRun {
-  readonly result: EnsureBuiltResult;
-  readonly taskResults: TaskResults;
-}
-
-async function runTarget(
-  nxJson: NxJsonConfiguration,
-  nxArgs: NxArgs,
-  overrides: Record<string, unknown>,
-  selector: TargetSelector,
-  reason: MissReason,
-  requireNx: WorkspaceNxRequire,
-): Promise<CompletedRun> {
-  const { runCommandForTasks } = requireNx('nx/src/tasks-runner/run-command');
-  const { createProjectGraphAsync } = requireNx('nx/src/project-graph/project-graph');
-  const { signalToCode } = requireNx('nx/src/utils/exit-codes');
-  // `runCommandForTasks` derives its own task graph and hashes, so the probe's
-  // work is not reusable. That duplication is one daemon round-trip on a path
-  // that is about to run a build.
-  const projectGraph = await createProjectGraphAsync();
-  const { taskResults, completed } = await runCommandForTasks(
-    [requireProject(projectGraph, selector.project)],
-    projectGraph,
-    { nxJson },
-    nxArgs,
-    overrides,
-    selector.project,
-    {},
-    { excludeTaskDependencies: false, loadDotEnvFiles: process.env.NX_LOAD_DOT_ENV_FILES !== 'false' },
-  );
-  if (!completed) {
-    // Nx's own encoding of an interrupted run: `runCommand` reports
-    // `signalToCode('SIGINT')` here. The runner does not surface which signal
-    // actually arrived, so there is none to forward — only the code Nx's CLI
-    // would have exited with.
-    return {
-      result: { disposition: 'failed', reason, exitCode: signalToCode('SIGINT'), signal: null },
-      taskResults,
-    };
-  }
-  for (const taskResult of Object.values(taskResults)) {
-    if (taskResult.status === 'failure' || taskResult.status === 'skipped') {
-      return { result: { disposition: 'failed', reason, exitCode: 1, signal: null }, taskResults };
-    }
-  }
-  return { result: { disposition: 'built', reason }, taskResults };
-}
-
 /**
- * The daemon-disabled path: hand the target to the workspace's own `nx`, with
- * stdio inherited.
+ * Run the target through the workspace's own `nx`, the invocation whose hashes
+ * the probe reproduces, with the child's stdout on this process's stderr.
  *
- * Inheriting rather than piping is the point. The wrapper this facility
+ * A child, because Nx does not only write through `process.stdout`: its Rust
+ * pseudo-terminal and the forked executors it starts with inherited stdio
+ * write task output straight to file descriptor 1, and Node cannot point that
+ * descriptor elsewhere in its own process. In a child it is simply stderr, so
+ * the stdout of a wrapper that goes on to exec a binary carries nothing but
+ * that binary's output (`<cli> list | jq` reads only data).
+ *
+ * Inheriting rather than piping is the other half. The wrapper this facility
  * replaces piped Nx's output so it could read a cache marker out of the log and
  * stay silent on a hit — a text heuristic over ANSI-coloured, format-unstable
- * output. Without a daemon there is nothing to be silent about: no cheap probe
- * exists, so the run is unconditional, the output is the run's own, and the
- * child's exit status is forwarded verbatim.
+ * output. The probe already decided this is no hit, so the output is the run's
+ * own, and the child's exit status is forwarded verbatim.
  */
-async function runViaCli(workspaceRoot: string, selector: TargetSelector): Promise<EnsureBuiltResult> {
+async function runViaCli(
+  workspaceRoot: string,
+  selector: TargetSelector,
+  reason: MissReason,
+): Promise<EnsureBuiltResult> {
   const nxCli = join(workspaceRoot, 'node_modules', '.bin', 'nx');
   if (!existsSync(nxCli)) {
-    throw new Error(`ensureBuilt: the Nx daemon is disabled and ${nxCli} does not exist`);
+    throw new Error(`ensureBuilt: ${describeMiss(reason)}, and ${nxCli} does not exist`);
   }
-  const reason: MissReason = { kind: 'no-daemon', taskId: `${selector.project}:${selector.target}` };
-  const targetSpec = selector.configuration
-    ? `${selector.project}:${selector.target}:${selector.configuration}`
-    : `${selector.project}:${selector.target}`;
-  const signalToCode = nxSignalToCode;
-  const child = spawn(nxCli, ['run', targetSpec, '--outputStyle=stream'], {
+  const child = spawn(nxCli, ['run', selectorTaskId(selector), '--outputStyle=stream'], {
     cwd: workspaceRoot,
-    stdio: 'inherit',
+    stdio: ['inherit', 2, 'inherit'],
   });
   // `Promise.withResolvers` would read better but needs lib es2024; this
   // package inherits lib es2022 from tsconfig.base.json.
@@ -876,7 +831,7 @@ async function runViaCli(workspaceRoot: string, selector: TargetSelector): Promi
     child.once('error', reject);
     child.once('exit', (code, signal) => settle({ code, signal }));
   });
-  return cliExitOutcome(reason, exit, signalToCode);
+  return cliExitOutcome(reason, exit, nxSignalToCode);
 }
 
 function nxSignalToCode(signal: NodeJS.Signals | null): number {
