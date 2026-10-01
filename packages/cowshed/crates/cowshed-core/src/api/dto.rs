@@ -720,6 +720,7 @@ pub enum GcReason {
     OrphanStagingImage,
     OrphanStagingMetadata,
     OrphanStagingMount,
+    OrphanSessionImage,
     OrphanMountpoint,
     ExpiredCheckpoint,
 }
@@ -733,6 +734,14 @@ pub struct GcCandidate {
     pub reason: GcReason,
 }
 
+/// One candidate left for a later sweep, with the exact reason this run could not reclaim it.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct GcDeferred {
+    pub path: PathBuf,
+    pub diagnostic: String,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct GcReport {
@@ -744,6 +753,7 @@ pub struct GcReport {
     pub freed_bytes: u64,
     pub dry_run: bool,
     pub candidates: Vec<GcCandidate>,
+    pub deferred: Vec<GcDeferred>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]

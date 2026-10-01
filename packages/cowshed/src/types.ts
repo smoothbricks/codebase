@@ -287,10 +287,16 @@ export interface GcCandidate {
   readonly reason:
     | 'retiredWorkspace'
     | 'orphanStagingImage'
+    | 'orphanSessionImage'
     | 'orphanStagingMetadata'
     | 'orphanStagingMount'
     | 'orphanMountpoint'
     | 'expiredCheckpoint';
+}
+
+export interface GcDeferred {
+  readonly path: string;
+  readonly diagnostic: string;
 }
 
 export interface GcReport {
@@ -302,6 +308,7 @@ export interface GcReport {
   readonly freedBytes: number;
   readonly dryRun: boolean;
   readonly candidates: readonly GcCandidate[];
+  readonly deferred: readonly GcDeferred[];
 }
 
 export interface PushReport {

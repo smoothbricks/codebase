@@ -62,9 +62,14 @@ pub trait Substrate: LifecyclePlanner {
         &self,
         workspace: &LifecycleWorkspace,
     ) -> Result<SubstrateStats, Self::Error>;
-    async fn gc(&self) -> Result<StorageGcReport, Self::Error>;
+    async fn preview_gc(&self, repo: &RepoId) -> Result<StorageGcPlan, Self::Error>;
+    async fn execute_gc(&self, plan: StorageGcPlan) -> Result<StorageGcReport, Self::Error>;
 }
 ```
+
+`preview_gc` collects immutable, exact candidates and `execute_gc` revalidates the plan before mutation. An execution
+failure local to one candidate is returned in `StorageGcReport.deferred: Vec<StorageGcDeferred { path, diagnostic }>`;
+later candidates still run. Only a stale plan or unsafe ownership/integrity proof refuses the sweep.
 
 Adopt, create, fork, checkpoint, and restore are intentionally absent from `Substrate`'s execution methods. The
 implemented APFS controller boundary is staged so that controller-owned state can be initialized or fenced while the

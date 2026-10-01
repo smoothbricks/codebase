@@ -3843,8 +3843,9 @@ impl NativeProjectRuntimeHost {
         &mut self,
         workspace: &WorkspaceName,
         initial: &NativeRemovalGitFence,
+        force: bool,
     ) -> Result<(NativeWorkspace, NativeRemovalGitFence)> {
-        self.stop_supervisor(workspace).await?;
+        self.stop_supervisor_for_removal(workspace, force).await?;
         let current = self.current(workspace).await?;
         Self::require_exact_incarnation(&current, &initial.incarnation)?;
         let fence = self.removal_git_fence(&current).await?;
@@ -4344,7 +4345,7 @@ impl NativeProjectRuntimeHost {
             self.require_removal_safe(&workspace, options, &initial_fence, containment)
                 .await?;
             let (current, final_fence) = self
-                .revalidated_removal_fence(&workspace, &initial_fence)
+                .revalidated_removal_fence(&workspace, &initial_fence, options.force)
                 .await?;
             let abandoning = self
                 .require_removal_safe(&workspace, options, &final_fence, containment)
@@ -5188,6 +5189,36 @@ impl NativeProjectRuntimeHost {
     }
 
     async fn stop_supervisor(&mut self, name: &WorkspaceName) -> Result<()> {
+        self.stop_supervisor_with_mode(name, false).await
+    }
+
+    /// Force removal cannot quiesce first: quiescing waits for running jobs to finish naturally.
+    /// Retiring first closes admission and asks each job to terminate with TERM then KILL.
+    async fn stop_supervisor_for_removal(
+        &mut self,
+        name: &WorkspaceName,
+        force: bool,
+    ) -> Result<()> {
+        self.stop_supervisor_with_mode(name, force).await
+    }
+
+    async fn stop_supervisor_handle(
+        handle: &super::supervisor::WorkspaceSupervisorHandle,
+        terminate_jobs: bool,
+    ) -> Result<()> {
+        if terminate_jobs {
+            handle.retire().await
+        } else {
+            handle.quiesce().await?;
+            handle.retire().await
+        }
+    }
+
+    async fn stop_supervisor_with_mode(
+        &mut self,
+        name: &WorkspaceName,
+        terminate_jobs: bool,
+    ) -> Result<()> {
         // The workspace's supervisor may be serving without this controller ever having used
         // it: whatever answers its socket is the one to retire before the substrate changes.
         let handle = match self.supervisors.remove(name) {
@@ -5215,11 +5246,7 @@ impl NativeProjectRuntimeHost {
             }
         };
         if let Some(handle) = handle {
-            let stopped = async {
-                handle.quiesce().await?;
-                handle.retire().await
-            }
-            .await;
+            let stopped = Self::stop_supervisor_handle(&handle, terminate_jobs).await;
             match stopped {
                 Ok(()) => {}
                 // Another process's supervisor that no longer answers went with its process.
@@ -5551,7 +5578,8 @@ impl NativeProjectRuntimeHost {
                             containment,
                         )
                         .await?;
-                        this.stop_supervisor(workspace).await?;
+                        this.stop_supervisor_for_removal(workspace, options.force)
+                            .await?;
                         let last = this
                             .removal_git_fence_at(&stage.mount_point, stage.workspace.incarnation())
                             .await?;
@@ -7138,7 +7166,9 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
         // instead of laundering that through a removal override: the fork is the preservation, and
         // the fence above is what makes the retirement safe.
         let retirement = async {
-            let (retiring, _) = self.revalidated_removal_fence(&source, &fence).await?;
+            let (retiring, _) = self
+                .revalidated_removal_fence(&source, &fence, false)
+                .await?;
             self.finish_retirement(retiring).await
         }
         .await;
@@ -7778,6 +7808,9 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                     StorageGcReason::OrphanMountpoint => {
                         crate::api::dto::GcReason::OrphanMountpoint
                     }
+                    StorageGcReason::OrphanSessionImage => {
+                        crate::api::dto::GcReason::OrphanSessionImage
+                    }
                     StorageGcReason::ExpiredCheckpoint => {
                         crate::api::dto::GcReason::ExpiredCheckpoint
                     }
@@ -7799,6 +7832,7 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                     .map_err(|_| CowshedError::internal("GC count overflow"))?,
                 freed_bytes,
                 dry_run: true,
+                deferred: Vec::new(),
                 candidates,
             });
         }
@@ -7838,6 +7872,14 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
             freed_bytes: report.freed_bytes,
             dry_run: false,
             candidates,
+            deferred: report
+                .deferred
+                .into_iter()
+                .map(|deferred| crate::api::dto::GcDeferred {
+                    path: deferred.path,
+                    diagnostic: deferred.diagnostic,
+                })
+                .collect(),
         })
     }
 
@@ -8681,6 +8723,7 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                         path: Some(first.path().to_owned()),
                     });
                 }
+                findings.extend(orphan_session_image_findings(plan.candidates()));
                 if plan.retained_active() > 0 {
                     findings.push(crate::api::dto::Finding {
                         code: "staging-active".into(),
@@ -10343,6 +10386,267 @@ mod removal_refusal_tests {
                 .is_err(),
             "dirt is exactly what the transient gate is for"
         );
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod removal_supervisor_tests {
+    use std::{
+        collections::HashMap,
+        sync::{Arc, Mutex},
+        time::Duration,
+    };
+
+    use super::NativeProjectRuntimeHost;
+    use crate::{
+        api::dto::{
+            BinaryData, CommandArg, ExecCommand, ExecRequest, ExitStatus, JobId, OutputPublication,
+            OutputStorage, OutputSummary, ProtectedOutput, RunSandboxMode, SealedJob, Sha256Digest,
+            StdinSource, StreamInfo,
+        },
+        error::{CowshedError, Result},
+        runtime::supervisor::{
+            ArtifactSeal, ArtifactSink, ArtifactWrite, CheckpointBarrier, CommitmentDraft,
+            CommitmentSink, ProcessEvent, ProcessSignal, ProcessSpawnRequest, RunningProcess,
+            SpawnSink, WorkspaceSupervisor, WorkspaceSupervisorConfig,
+        },
+        storage::job_artifact::{JobEnding, StreamKind},
+    };
+
+    fn empty_stream() -> StreamInfo {
+        let data = BinaryData::new(Vec::<u8>::new()).expect("empty output");
+        StreamInfo {
+            storage: OutputStorage::Captured {
+                artifact: ProtectedOutput::Inline { data },
+            },
+            bytes: 0,
+            sha256: Sha256Digest::compute(&[]),
+            summary: OutputSummary {
+                version: 1,
+                text: String::new(),
+                truncated: false,
+            },
+        }
+    }
+
+    struct TestArtifacts;
+
+    impl ArtifactSink for TestArtifacts {
+        fn next_job_id(&self) -> Result<JobId> {
+            Ok(JobId::new(1).expect("test job id"))
+        }
+
+        fn admit(
+            &mut self,
+            _job_id: JobId,
+            _grant_revision: u64,
+            _command: &ExecCommand,
+            _warm: Option<&crate::api::dto::WarmRange>,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        fn prepare_background(&mut self, _job_id: JobId) -> Result<()> {
+            Ok(())
+        }
+
+        fn write(
+            &mut self,
+            _job_id: JobId,
+            _stream: StreamKind,
+            bytes: &[u8],
+        ) -> Result<ArtifactWrite> {
+            Ok(ArtifactWrite {
+                accepted_bytes: bytes.len(),
+                output_limit: None,
+            })
+        }
+
+        fn seal(
+            &mut self,
+            _job_id: JobId,
+            _ending: JobEnding,
+            _stdout_copy: Option<crate::api::dto::OutputPublication>,
+            _stderr_copy: Option<crate::api::dto::OutputPublication>,
+        ) -> Result<ArtifactSeal> {
+            Ok(ArtifactSeal {
+                stdout: empty_stream(),
+                stderr: empty_stream(),
+                terminal_batch_sha256: Sha256Digest::compute(&[]),
+                output_limit: None,
+            })
+        }
+
+        fn checkpoint(&mut self) -> Result<CheckpointBarrier> {
+            Ok(CheckpointBarrier {
+                checkpoint_id: "test".into(),
+                barrier_id: 0,
+                manifest_batch_sha256: Sha256Digest::compute(&[]),
+            })
+        }
+
+        fn sealed(&self, _job_id: JobId) -> Option<SealedJob> {
+            None
+        }
+    }
+
+    struct TestCommitments;
+
+    #[async_trait::async_trait]
+    impl CommitmentSink for TestCommitments {
+        async fn record(&mut self, _draft: CommitmentDraft) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    struct TestSpawner(Arc<Mutex<Vec<ProcessSignal>>>);
+
+    #[async_trait::async_trait]
+    impl SpawnSink for TestSpawner {
+        async fn spawn(
+            &mut self,
+            request: ProcessSpawnRequest,
+            events: tokio::sync::mpsc::Sender<ProcessEvent>,
+        ) -> Result<Box<dyn RunningProcess>> {
+            events
+                .send(ProcessEvent::Started {
+                    job_id: request.job_id,
+                    pid: 42,
+                })
+                .await
+                .map_err(|_| CowshedError::internal("test process event channel closed"))?;
+            Ok(Box::new(TestProcess {
+                job_id: request.job_id,
+                events,
+                signals: self.0.clone(),
+            }))
+        }
+    }
+
+    struct TestProcess {
+        job_id: JobId,
+        events: tokio::sync::mpsc::Sender<ProcessEvent>,
+        signals: Arc<Mutex<Vec<ProcessSignal>>>,
+    }
+
+    impl TestProcess {
+        fn send(&self, event: ProcessEvent) -> Result<()> {
+            self.events
+                .try_send(event)
+                .map_err(|_| CowshedError::internal("test process event channel closed"))
+        }
+    }
+
+    impl RunningProcess for TestProcess {
+        fn pid(&self) -> Option<u32> {
+            Some(42)
+        }
+
+        fn try_write_stdin(&mut self, _bytes: bytes::Bytes) -> Result<bool> {
+            Ok(true)
+        }
+
+        fn close_stdin(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        fn signal_process_tree(&mut self, signal: ProcessSignal) -> Result<()> {
+            self.signals.lock().expect("signal log").push(signal);
+            if signal == ProcessSignal::Kill {
+                self.send(ProcessEvent::Exited {
+                    job_id: self.job_id,
+                    exit: ExitStatus::Signaled {
+                        signal: libc::SIGKILL,
+                        core_dumped: false,
+                    },
+                })?;
+                self.send(ProcessEvent::OutputEof {
+                    job_id: self.job_id,
+                    stream: StreamKind::Stdout,
+                })?;
+                self.send(ProcessEvent::OutputEof {
+                    job_id: self.job_id,
+                    stream: StreamKind::Stderr,
+                })?;
+            }
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn forced_removal_terminates_running_jobs_with_term_then_kill() {
+        let root = std::env::temp_dir().join(format!(
+            "cowshed-rm-force-jobs-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir(&root).expect("create workspace");
+        let mut config = WorkspaceSupervisorConfig::default();
+        config.workspace_root = root.clone();
+        config.sandbox.workspace_mount = root.clone();
+        config.default_cwd = None;
+        config.term_grace = Duration::from_millis(10);
+        config.group_ledger = None;
+        let signals = Arc::new(Mutex::new(Vec::new()));
+        let supervisor = WorkspaceSupervisor::start_with_sinks(
+            config,
+            Box::new(TestSpawner(signals.clone())),
+            Box::new(TestArtifacts),
+            Box::new(TestCommitments),
+        )
+        .expect("start supervisor");
+        let job = supervisor
+            .exec_background(
+                None,
+                ExecRequest {
+                    command: ExecCommand::Argv(vec![CommandArg::new("waiting-child")]),
+                    cwd: None,
+                    mode: RunSandboxMode::ReadWrite,
+                    env: HashMap::new(),
+                    trace: None,
+                    stdin: StdinSource::Empty,
+                    stdout_copy: None,
+                    stderr_copy: None,
+                },
+            )
+            .await
+            .expect("start job");
+        let started = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if supervisor.info(job).await.expect("job info").pid == Some(42) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        if started.is_err() {
+            supervisor
+                .retire()
+                .await
+                .expect("clean up test supervisor after start timeout");
+        }
+        started.expect("test job started");
+
+        let stopped = tokio::time::timeout(
+            Duration::from_secs(10),
+            NativeProjectRuntimeHost::stop_supervisor_handle(&supervisor, true),
+        )
+        .await;
+        if !matches!(&stopped, Ok(Ok(()))) {
+            supervisor
+                .retire()
+                .await
+                .expect("clean up test supervisor after force-stop failure");
+        }
+        stopped
+            .expect("force retirement completed")
+            .expect("retire supervisor");
+
+        assert_eq!(
+            signals.lock().expect("signal log").as_slice(),
+            &[ProcessSignal::Term, ProcessSignal::Kill]
+        );
+        std::fs::remove_dir_all(root).expect("remove workspace");
     }
 }
 
@@ -12414,6 +12718,27 @@ fn native_finding(
     }
 }
 
+#[cfg(target_os = "macos")]
+fn orphan_session_image_findings(
+    candidates: &[crate::storage::lifecycle::StorageGcCandidate],
+) -> impl Iterator<Item = crate::api::dto::Finding> + '_ {
+    candidates
+        .iter()
+        .filter(|candidate| {
+            candidate.reason() == crate::storage::lifecycle::StorageGcReason::OrphanSessionImage
+        })
+        .map(|candidate| crate::api::dto::Finding {
+            code: "session-orphan".into(),
+            severity: crate::api::dto::FindingSeverity::Warning,
+            message: format!(
+                "session image {} has no grants metadata",
+                candidate.path().display()
+            ),
+            hint: "cowshed gc".into(),
+            path: Some(candidate.path().to_owned()),
+        })
+}
+
 /// Blocking quarantine-and-companion scan for `doctor`: quarantine tombstones first,
 /// then live images whose sidecar survived without their CA companion.
 ///
@@ -12707,6 +13032,51 @@ mod doctor_hint_tests {
             )
             .is_none()
         );
+    }
+
+    #[test]
+    fn every_orphan_session_image_gets_its_own_named_doctor_finding() {
+        use crate::storage::lifecycle::{StorageGcCandidate, StorageGcReason};
+
+        let first = PathBuf::from("/store/acme/widget/sessions/ghost.asif");
+        let second = PathBuf::from("/store/acme/widget/sessions/scratch.sparseimage");
+        let candidates = [
+            StorageGcCandidate::new(
+                [1; 32],
+                first.clone(),
+                17,
+                StorageGcReason::OrphanSessionImage,
+            ),
+            StorageGcCandidate::new(
+                [2; 32],
+                PathBuf::from("/store/acme/widget/.staging/orphan.asif"),
+                100,
+                StorageGcReason::OrphanStagingImage,
+            ),
+            StorageGcCandidate::new(
+                [3; 32],
+                second.clone(),
+                23,
+                StorageGcReason::OrphanSessionImage,
+            ),
+        ];
+        let findings = orphan_session_image_findings(&candidates).collect::<Vec<_>>();
+        assert_eq!(
+            findings
+                .iter()
+                .map(|finding| finding.path.clone())
+                .collect::<Vec<_>>(),
+            [Some(first.clone()), Some(second.clone())]
+        );
+        assert!(findings.iter().all(|finding| {
+            finding.code == "session-orphan"
+                && finding.severity == crate::api::dto::FindingSeverity::Warning
+                && finding.hint == "cowshed gc"
+                && finding
+                    .path
+                    .as_ref()
+                    .is_some_and(|path| finding.message.contains(&path.display().to_string()))
+        }));
     }
 
     #[test]

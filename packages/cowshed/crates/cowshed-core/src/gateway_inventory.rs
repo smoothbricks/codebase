@@ -427,20 +427,24 @@ impl NativeGatewayInventory {
             .map_err(|error| GatewayInventoryError::Blocking(error.to_string()))?
     }
 
-    /// Adopted projects, unmounted mains, and bound projects with no adopted checkout path.
-    ///
-    /// The third leg is what keeps a checkout-less project visible: the adopted list omits it
-    /// (there is nowhere to mount its main), and `doctor` reports each entry as an info
-    /// finding instead of the traversal printing a skip on stderr.
+    /// Adopted projects, unmounted mains, bound projects without a checkout, and individual
+    /// unreadable projects. One bad project's identity never hides another project's diagnosis.
     pub async fn doctor_projects(
         &self,
-    ) -> Result<(Vec<AdoptedProject>, Vec<UnreachableMain>, Vec<RepoId>), GatewayInventoryError>
-    {
+    ) -> Result<
+        (
+            Vec<AdoptedProject>,
+            Vec<UnreachableMain>,
+            Vec<RepoId>,
+            Vec<(RepoId, GatewayInventoryError)>,
+        ),
+        GatewayInventoryError,
+    > {
         let inventory = self.clone();
         crate::storage::lifecycle::dispatch_blocking(move || {
-            let (projects, checkoutless) = inventory.adopted_and_checkoutless_blocking()?;
+            let (projects, checkoutless, issues) = inventory.adopted_and_checkoutless_blocking()?;
             let unreachable = inventory.unmounted_mains_for(&projects)?;
-            Ok((projects, unreachable, checkoutless))
+            Ok((projects, unreachable, checkoutless, issues))
         })
         .await
         .map_err(|error| GatewayInventoryError::Blocking(error.to_string()))?
@@ -464,15 +468,31 @@ impl NativeGatewayInventory {
         let repositories = discover_repositories(self.storage.store())?;
         let mut projects = Vec::with_capacity(repositories.len());
         for repo_id in repositories {
-            projects.push(self.load_project_workspaces(&repo_id)?);
+            match self.load_project_workspaces(&repo_id) {
+                Ok(project) => projects.push(project),
+                Err(
+                    error @ (GatewayInventoryError::DuplicateRepository(_)
+                    | GatewayInventoryError::OverlappingPortBlocks { .. }
+                    | GatewayInventoryError::AmbiguousProjectRoot(_)
+                    | GatewayInventoryError::ForeignBinding { .. }),
+                ) => return Err(error),
+                Err(error) => {
+                    eprintln!(
+                        "cowshed: skipping {repo_id}: its workspace records could not be read: {error}"
+                    );
+                }
+            }
         }
         projects.sort_by(|left, right| left.repo_id.cmp(&right.repo_id));
         Ok(projects)
     }
 
     fn adopted_projects_blocking(&self) -> Result<Vec<AdoptedProject>, GatewayInventoryError> {
-        self.adopted_and_checkoutless_blocking()
-            .map(|(projects, _)| projects)
+        let (projects, _, issues) = self.adopted_and_checkoutless_blocking()?;
+        for (repo_id, error) in issues {
+            eprintln!("cowshed: skipping project {repo_id}: {error}");
+        }
+        Ok(projects)
     }
 
     /// One registry traversal for both the adopted list and the checkout-less remainder.
@@ -482,16 +502,28 @@ impl NativeGatewayInventory {
     /// error, never two of those at once.
     fn adopted_and_checkoutless_blocking(
         &self,
-    ) -> Result<(Vec<AdoptedProject>, Vec<RepoId>), GatewayInventoryError> {
+    ) -> Result<
+        (
+            Vec<AdoptedProject>,
+            Vec<RepoId>,
+            Vec<(RepoId, GatewayInventoryError)>,
+        ),
+        GatewayInventoryError,
+    > {
         let mut projects = Vec::new();
         let mut checkoutless = Vec::new();
+        let mut issues = Vec::new();
         for repo_id in discover_repositories(self.storage.store())? {
             let layout = match StorageLayout::new(self.storage.store(), &repo_id) {
                 Ok(layout) => layout,
                 Err(error) => {
-                    eprintln!(
-                        "cowshed: skipping {repo_id}: its store layout could not be read: {error}"
-                    );
+                    issues.push((
+                        repo_id,
+                        GatewayInventoryError::InvalidMetadata {
+                            path: self.storage.store().to_owned(),
+                            message: error.to_string(),
+                        },
+                    ));
                     continue;
                 }
             };
@@ -504,10 +536,10 @@ impl NativeGatewayInventory {
                 // real: the entry is reported for `doctor` rather than printed on stderr from
                 // a library traversal, where it polluted command output.
                 Ok(None) => checkoutless.push(repo_id),
-                Err(error) => return Err(error),
+                Err(error) => issues.push((repo_id, error)),
             }
         }
-        Ok((projects, checkoutless))
+        Ok((projects, checkoutless, issues))
     }
 
     pub async fn all_attached(&self) -> Result<Vec<GatewaySessionFact>, GatewayInventoryError> {
@@ -919,6 +951,18 @@ impl NativeGatewayInventory {
                 message: error.to_string(),
             }
         })?;
+        if !workspace.is_main()
+            && !sidecar
+                .try_exists()
+                .map_err(|source| io_error("inspect session metadata", &sidecar, source))?
+        {
+            eprintln!(
+                "cowshed: skipping orphan session image {}: missing {}",
+                image.display(),
+                sidecar.display()
+            );
+            return Ok(());
+        }
         let metadata = DetachedWorkspaceMetadata::read_for_image(image).map_err(|error| {
             GatewayInventoryError::InvalidMetadata {
                 path: sidecar.clone(),
@@ -2052,6 +2096,92 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn orphan_session_image_does_not_block_store_wide_port_reservations() {
+        let fixture = Fixture::new("orphan-ports");
+        let (repo_a, _repo_b, source) = two_project_store(&fixture);
+        let sessions = StorageLayout::new(fixture.storage.store(), &repo_a)
+            .expect("layout")
+            .project()
+            .sessions
+            .clone();
+        fs::create_dir_all(&sessions).expect("sessions directory");
+        fs::write(sessions.join("scratch.asif"), b"unpublished image").expect("orphan image");
+        let inventory = NativeGatewayInventory::with_source(
+            fixture.storage.clone(),
+            source as Arc<dyn InventorySource>,
+        );
+        assert_eq!(
+            inventory
+                .all_reserved_port_blocks()
+                .await
+                .expect("one orphan must not hide healthy projects")
+                .blocks()
+                .count(),
+            2
+        );
+        fs::write(
+            sidecar_path(&sessions.join("scratch.asif")),
+            b"{\"invalid\": true}",
+        )
+        .expect("malformed sidecar");
+        assert!(
+            inventory.all_reserved_port_blocks().await.is_err(),
+            "present but unreadable grants cannot silently free a reserved port block"
+        );
+    }
+
+    #[tokio::test]
+    async fn one_unreadable_project_does_not_hide_others_in_store_wide_listing() {
+        let fixture = Fixture::new("unreadable-list");
+        let (repo_a, repo_b, source) = two_project_store(&fixture);
+        let main = StorageLayout::new(fixture.storage.store(), &repo_a)
+            .expect("layout")
+            .main_image()
+            .expect("main paths");
+        fs::write(main.sidecar(), b"{\"invalid\": true}").expect("unreadable main metadata");
+        let inventory = NativeGatewayInventory::with_source(
+            fixture.storage.clone(),
+            source as Arc<dyn InventorySource>,
+        );
+        let listed = inventory
+            .all_projects()
+            .await
+            .expect("healthy project remains listable");
+        assert_eq!(
+            listed
+                .iter()
+                .map(|project| &project.repo_id)
+                .collect::<Vec<_>>(),
+            [&repo_b]
+        );
+        let adopted = inventory
+            .adopted_projects()
+            .await
+            .expect("healthy project remains attachable");
+        assert_eq!(
+            adopted
+                .iter()
+                .map(|project| &project.repo_id)
+                .collect::<Vec<_>>(),
+            [&repo_b]
+        );
+        let (diagnosed, _, _, issues) = inventory
+            .doctor_projects()
+            .await
+            .expect("doctor continues past a corrupt project");
+        assert_eq!(
+            diagnosed
+                .iter()
+                .map(|project| &project.repo_id)
+                .collect::<Vec<_>>(),
+            [&repo_b]
+        );
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].0, repo_a);
+        assert!(issues[0].1.to_string().contains("main.asif.grants.json"));
+    }
+
     /// A project's standing grants reach every workspace's gateway session, on top of its own,
     /// and advance the session revision the gateway requires to grow; a sibling project's
     /// sessions are untouched.
@@ -2779,34 +2909,6 @@ mod tests {
         assert!(outcomes[0].sessions[0].mount.is_ok());
     }
 
-    #[tokio::test]
-    async fn adopted_projects_propagates_corrupt_checkout_evidence() {
-        let fixture = Fixture::new("adopted-corrupt-checkout");
-        let repo = RepoId::parse("acme/widget").expect("repo");
-        fixture.bind(&repo);
-        let _ = fixture.workspace(
-            &repo,
-            WorkspaceName::new("main").expect("main"),
-            "00000000000000000000000000000001",
-            3,
-            false,
-        );
-        let layout = StorageLayout::new(fixture.storage.store(), &repo).expect("layout");
-        let main = layout.main_image().expect("main paths");
-        fs::write(main.sidecar(), b"{\"version\": 1, \"corrupt\"").expect("corrupt sidecar");
-        let inventory = NativeGatewayInventory::new(fixture.storage.clone());
-
-        let error = inventory
-            .adopted_projects()
-            .await
-            .expect_err("corrupt checkout evidence must not become an absent checkout");
-
-        assert!(matches!(
-            error,
-            GatewayInventoryError::InvalidMetadata { .. }
-        ));
-    }
-
     /// The always-mounted check names main's image and its mountpoint, so a finding can point at
     /// both the volume that should be mounted and the directory the user is looking at.
     #[tokio::test]
@@ -2890,9 +2992,10 @@ mod tests {
             "no checkout path means no adopted project"
         );
 
-        let (projects, _, checkoutless) =
+        let (projects, _, checkoutless, issues) =
             inventory.doctor_projects().await.expect("doctor projects");
         assert!(projects.is_empty());
         assert_eq!(checkoutless, vec![repo]);
+        assert!(issues.is_empty());
     }
 }

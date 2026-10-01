@@ -205,6 +205,15 @@ never errors).
 | `cowshed gc`                                  | freed bytes                                      | Two-phase exact candidate plan (01); `--dry-run` lists typed candidates and sums bytes with zero mutation.                                                                                                                                                                                                                                                                                                                                                                                                                     |
 | `cowshed doctor`                              | `--json` findings                                | Invariant checks; each finding carries a `fix:` hint.                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
 
+`gc` never lets a candidate-local failure prevent later candidates from being tried; it reports each deferred path and
+diagnostic on stderr and in the structured result, alongside actual bytes freed. `doctor` diagnoses sidecarless session
+images by name rather than treating them as live workspaces or failing the inventory. Store-wide `ls --all` and
+attach/detach skip an unreadable project with a named warning and still process other projects; identity collisions
+remain errors. `doctor` retains a finding for each unreadable project while inspecting the others.
+
+Store-wide attach and detach likewise try the other workspaces after one target or project fails and name each skipped
+target; successful mount changes still reconcile with the gateway.
+
 ### `cowshed ls` detached rows
 
 `ls` must never attach an image to read it (that would blow the ≤50 ms budget and mutate mount state), but the base
@@ -228,13 +237,12 @@ intercepted. Per-port narrowing is a further field of that rule, set through the
 takes no flag for it. A bare `cowshed grant <ws>` (no flags) prints the current set with a `mode` column on the egress
 rows.
 
-`cowshed grant --project-wide` addresses the project's standing policy: read paths, egress hosts,
-and workspace-relative `--deny-write` paths every workspace (including main) runs under. The
-policy lives outside the workspaces (04_sandbox.md, "Project-standing grants"), so a workspace
-grant cannot remove a project deny. The project comes from ordinary discovery — the cwd, or
-`--project <git-root>`. `--write` and a `<ws>` alongside `--project-wide` are usage errors;
-a write allow remains a per-workspace decision. A bare `cowshed grant --project-wide` prints
-the standing set, and `--json` includes `{ revision, read, denyWrite, egress }`.
+`cowshed grant --project-wide` addresses the project's standing policy: read paths, egress hosts, and workspace-relative
+`--deny-write` paths every workspace (including main) runs under. The policy lives outside the workspaces
+(04_sandbox.md, "Project-standing grants"), so a workspace grant cannot remove a project deny. The project comes from
+ordinary discovery — the cwd, or `--project <git-root>`. `--write` and a `<ws>` alongside `--project-wide` are usage
+errors; a write allow remains a per-workspace decision. A bare `cowshed grant --project-wide` prints the standing set,
+and `--json` includes `{ revision, read, denyWrite, egress }`.
 
 `--sim <verb>` grants personal-session simulator broker verbs (`openurl`, `install` — 04/05/14); dev-side headless
 simulators need the `--preset simulator` profile class instead (CoreSimulator IPC), not a `--sim` grant. `install` is

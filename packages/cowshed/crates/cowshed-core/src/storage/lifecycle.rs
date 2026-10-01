@@ -542,6 +542,9 @@ pub enum StorageGcReason {
     /// A staging mountpoint under the mount root whose image is gone or never published:
     /// an empty directory, or a volume still attached from an interrupted operation.
     OrphanStagingMount,
+    /// A session-directory image whose grants sidecar is absent. The image is not a published
+    /// workspace; GC may reclaim it after rechecking its owner lock and mountpoint.
+    OrphanSessionImage,
     /// A directory directly under the mount root that is no workspace's mount: nothing is
     /// mounted at it and no session image or retired record names it. What it holds is what
     /// late writers left after a volume was retired - junk by the project's own rules, or a
@@ -578,6 +581,10 @@ impl StorageGcCandidate {
     }
 
     pub fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+
+    pub(crate) fn path_buf(&self) -> &PathBuf {
         &self.path
     }
 
@@ -675,6 +682,15 @@ impl StorageGcPlan {
     }
 }
 
+/// A GC candidate left untouched after an item-local failure.
+///
+/// `path` identifies the candidate and `diagnostic` preserves why this sweep deferred it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StorageGcDeferred {
+    pub path: PathBuf,
+    pub diagnostic: String,
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct StorageGcReport {
     pub examined: usize,
@@ -683,6 +699,8 @@ pub struct StorageGcReport {
     pub retained_recent: usize,
     pub retained_active: usize,
     pub freed_bytes: u64,
+    /// Candidate-local failures; the sweep continues with the remaining candidates.
+    pub deferred: Vec<StorageGcDeferred>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]

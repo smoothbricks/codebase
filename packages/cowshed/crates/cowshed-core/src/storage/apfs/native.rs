@@ -42,7 +42,8 @@ use super::super::deletion_log::{self, DeletionKind, DeletionOp};
 use super::super::lifecycle::{
     CheckpointFact, DefragmentOutcome, KernelMountFact, LifecycleFact, LifecycleWorkspace,
     OperationIdentity, Pin, ResizeOutcome, RetiredRef, Revision, StorageFact, StorageGcCandidate,
-    StorageGcPlan, StorageGcReason, StorageGcReport, StorageGcRetained, SubstrateStats,
+    StorageGcDeferred, StorageGcPlan, StorageGcReason, StorageGcReport, StorageGcRetained,
+    SubstrateStats,
 };
 use super::super::{
     CheckpointLabel, WORKSPACE_MARKER_PATH, discover_session_images, verify_no_symlinks,
@@ -392,14 +393,141 @@ fn allocated_file_bytes(metadata: &fs::Metadata) -> u64 {
     }
 }
 
+fn session_image_workspace(path: &Path) -> Option<(WorkspaceName, bool)> {
+    let name = path.file_name()?.to_str()?;
+    let (stem, sparseimage) = name
+        .strip_suffix(".sparseimage")
+        .map(|stem| (stem, true))
+        .or_else(|| name.strip_suffix(".asif").map(|stem| (stem, false)))?;
+    Some((WorkspaceName::session(stem).ok()?, sparseimage))
+}
+/// No-follow metadata that fences an orphan image against replacement after preview.
+
+fn orphan_session_image_identity(image: &Path) -> Result<[u8; 56], ApfsStorageError> {
+    let metadata = fs::symlink_metadata(image)
+        .map_err(|error| io_error("inspect orphan session image identity", image, error))?;
+    if !metadata.file_type().is_file() {
+        return Err(ApfsStorageError::Host(format!(
+            "orphan session image is not a regular image: {}",
+            image.display()
+        )));
+    }
+    let mut identity = [0_u8; 56];
+    #[cfg(unix)]
+    {
+        let fields = [
+            metadata.dev(),
+            metadata.ino(),
+            metadata.len(),
+            metadata.mtime() as u64,
+            metadata.mtime_nsec() as u64,
+            metadata.ctime() as u64,
+            metadata.ctime_nsec() as u64,
+        ];
+        for (chunk, value) in identity.chunks_exact_mut(8).zip(fields) {
+            chunk.copy_from_slice(&value.to_le_bytes());
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let modified = metadata
+            .modified()
+            .map_err(|error| io_error("read orphan session image timestamp", image, error))?
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        let fields = [
+            metadata.len(),
+            modified.as_secs(),
+            u64::from(modified.subsec_nanos()),
+        ];
+        for (chunk, value) in identity.chunks_exact_mut(8).take(fields.len()).zip(fields) {
+            chunk.copy_from_slice(&value.to_le_bytes());
+        }
+    }
+    Ok(identity)
+}
+
+fn grants_sidecar_missing(image: &Path) -> Result<bool, ApfsStorageError> {
+    let sidecar = sidecar_path(image);
+    match fs::symlink_metadata(&sidecar) {
+        Ok(_) => Ok(false),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(true),
+        Err(error) => Err(io_error("inspect grants sidecar", &sidecar, error)),
+    }
+}
+
+fn warn_session_image_issue(image: &Path, issue: impl std::fmt::Display) {
+    let name = image
+        .file_name()
+        .map(|name| name.to_string_lossy())
+        .unwrap_or_else(|| std::borrow::Cow::Borrowed("<unknown>"));
+    eprintln!("cowshed: warning: skipping session image {name}: {issue}");
+}
+
+fn warn_missing_session_sidecar(image: &Path) {
+    warn_session_image_issue(image, "grants sidecar is missing");
+}
+
+fn warn_sidecarless_sparseimages(entries: &[PathBuf]) {
+    for image in entries {
+        if !matches!(session_image_workspace(image), Some((_, true))) {
+            continue;
+        }
+        match fs::symlink_metadata(image) {
+            Ok(metadata) if metadata.file_type().is_file() => {}
+            Ok(_) => {
+                warn_session_image_issue(image, "legacy sparseimage is not a regular image");
+                continue;
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                warn_session_image_issue(image, format!("cannot inspect image: {error}"));
+                continue;
+            }
+        }
+        match grants_sidecar_missing(image) {
+            Ok(true) => warn_missing_session_sidecar(image),
+            Ok(false) => {}
+            Err(error) => {
+                warn_session_image_issue(image, format!("cannot inspect grants sidecar: {error}"))
+            }
+        }
+    }
+}
+
 fn gc_reason_tag(reason: StorageGcReason) -> &'static [u8] {
     match reason {
         StorageGcReason::RetiredWorkspace => b"retired-workspace",
         StorageGcReason::OrphanStagingImage => b"orphan-staging-image",
         StorageGcReason::OrphanStagingMetadata => b"orphan-staging-metadata",
         StorageGcReason::OrphanStagingMount => b"orphan-staging-mount",
+        StorageGcReason::OrphanSessionImage => b"orphan-session-image",
         StorageGcReason::OrphanMountpoint => b"orphan-mountpoint",
         StorageGcReason::ExpiredCheckpoint => b"expired-checkpoint",
+    }
+}
+fn gc_candidate_failure_is_fatal(error: &ApfsStorageError) -> bool {
+    match error {
+        ApfsStorageError::Cleanup {
+            primary, cleanup, ..
+        } => gc_candidate_failure_is_fatal(primary) || gc_candidate_failure_is_fatal(cleanup),
+        ApfsStorageError::Apfs(_)
+        | ApfsStorageError::Io { .. }
+        | ApfsStorageError::Host(_)
+        | ApfsStorageError::Quarantined { .. } => false,
+        ApfsStorageError::CapacityNotGrowing { .. }
+        | ApfsStorageError::BlockingTask(_)
+        | ApfsStorageError::Conflict(_)
+        | ApfsStorageError::Derivation(_)
+        | ApfsStorageError::GcPlanStale
+        | ApfsStorageError::InsufficientSpace { .. }
+        | ApfsStorageError::InvalidPlan(_)
+        | ApfsStorageError::Layout(_)
+        | ApfsStorageError::MarkerMismatch(_)
+        | ApfsStorageError::MissingCaCompanion { .. }
+        | ApfsStorageError::PendingPublication(_)
+        | ApfsStorageError::ResizeNotObserved { .. }
+        | ApfsStorageError::UnexpectedResult => true,
     }
 }
 
@@ -802,8 +930,12 @@ fn regular_file_children(directory: &Path) -> Result<Vec<PathBuf>, ApfsStorageEr
 /// paths that enumerated successfully, so a failure here is a genuine I/O fault.
 fn dir_is_empty(directory: &Path) -> Result<bool, ApfsStorageError> {
     let mut entries = fs::read_dir(directory)
-        .map_err(|error| io_error("inspect staging mountpoint", directory, error))?;
-    Ok(entries.next().is_none())
+        .map_err(|error| io_error("inspect mountpoint", directory, error))?;
+    match entries.next().transpose() {
+        Ok(None) => Ok(true),
+        Ok(Some(_)) => Ok(false),
+        Err(error) => Err(io_error("inspect mountpoint", directory, error)),
+    }
 }
 
 /// True when a volume is mounted at this directory: its device differs from its parent's.
@@ -1538,7 +1670,22 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
             });
         }
         let entries = read_dir_paths(&layout.project().sessions, "enumerate session images")?;
+        warn_sidecarless_sparseimages(&entries);
         for discovered in discover_session_images(entries) {
+            match grants_sidecar_missing(discovered.path()) {
+                Ok(false) => {}
+                Ok(true) => {
+                    warn_missing_session_sidecar(discovered.path());
+                    continue;
+                }
+                Err(error) => {
+                    warn_session_image_issue(
+                        discovered.path(),
+                        format!("cannot inspect grants sidecar: {error}"),
+                    );
+                    continue;
+                }
+            }
             let metadata = DetachedWorkspaceMetadata::read_for_image(discovered.path())
                 .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
             if metadata.repo_id != *repo || metadata.workspace != *discovered.workspace() {
@@ -2254,6 +2401,95 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
                 &[],
             )?);
         }
+        for image in &session_entries {
+            let Some((workspace, sparseimage)) = session_image_workspace(image) else {
+                continue;
+            };
+            if sparseimage {
+                named_mountpoints.insert(workspace.as_str().to_owned());
+            }
+            match fs::symlink_metadata(image) {
+                Ok(metadata) if metadata.file_type().is_file() => {}
+                Ok(_) => {
+                    warn_session_image_issue(image, "session image is not a regular image");
+                    continue;
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    warn_session_image_issue(image, format!("cannot inspect image: {error}"));
+                    continue;
+                }
+            }
+            match grants_sidecar_missing(image) {
+                Ok(true) => warn_missing_session_sidecar(image),
+                Ok(false) => continue,
+                Err(error) => {
+                    warn_session_image_issue(
+                        image,
+                        format!("cannot inspect grants sidecar: {error}"),
+                    );
+                    continue;
+                }
+            }
+            examined = examined
+                .checked_add(1)
+                .ok_or(ApfsStorageError::InvalidPlan("GC examined count overflow"))?;
+            let lock = super::workspace_lock_path(&self.config, repo, &workspace)?;
+            let lock_is_free = match self.lock_is_free(&lock, held_locks) {
+                Ok(is_free) => is_free,
+                Err(error) => {
+                    warn_session_image_issue(
+                        image,
+                        format!("cannot inspect workspace lock: {error}"),
+                    );
+                    continue;
+                }
+            };
+            if !lock_is_free {
+                retained_active = retained_active
+                    .checked_add(1)
+                    .ok_or(ApfsStorageError::InvalidPlan("GC retained count overflow"))?;
+                continue;
+            }
+            let extra_identity = match orphan_session_image_identity(image) {
+                Ok(identity) => identity,
+                Err(error) => {
+                    warn_session_image_issue(
+                        image,
+                        format!("cannot inspect image identity: {error}"),
+                    );
+                    continue;
+                }
+            };
+            let candidate_result = if sparseimage {
+                gc_candidate(
+                    StorageGcReason::OrphanSessionImage,
+                    image,
+                    std::slice::from_ref(image),
+                    &extra_identity,
+                )
+            } else {
+                gc_candidate(
+                    StorageGcReason::OrphanSessionImage,
+                    image,
+                    &image_gc_paths(image),
+                    &extra_identity,
+                )
+            };
+            let candidate = match candidate_result {
+                Ok(candidate) => candidate,
+                Err(error) if gc_candidate_failure_is_fatal(&error) => return Err(error),
+                Err(error) => {
+                    warn_session_image_issue(
+                        image,
+                        format!("cannot plan image reclamation: {error}"),
+                    );
+                    continue;
+                }
+            };
+            lock_paths.push(lock);
+            candidates.push(candidate);
+        }
 
         // Staging is the half-written half of a lifecycle transaction — create, fork, restore —
         // and the signs that one still owns an entry are its workspace lifecycle lock (running)
@@ -2528,6 +2764,55 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
             },
         ))
     }
+    fn orphan_session_image_mount_blocker(
+        &self,
+        repo: &RepoId,
+        workspace: &WorkspaceName,
+    ) -> Result<Option<&'static str>, ApfsStorageError> {
+        let mount_point = layout(&self.config, repo)?.workspace_mount(workspace)?;
+        if self
+            .mount_source
+            .mounts()?
+            .iter()
+            .any(|mount| mount.mount_point == mount_point)
+        {
+            return Ok(Some("a filesystem is mounted at the workspace mountpoint"));
+        }
+        match fs::symlink_metadata(&mount_point) {
+            Ok(metadata) if !metadata.file_type().is_dir() => {
+                return Ok(Some("the workspace mountpoint is not a directory"));
+            }
+            Ok(metadata) => {
+                let parent = mount_point.parent().ok_or_else(|| {
+                    ApfsStorageError::InvalidPlan("session mountpoint has no parent")
+                })?;
+                let parent_metadata = fs::symlink_metadata(parent).map_err(|error| {
+                    io_error("inspect session mountpoint parent", parent, error)
+                })?;
+                if metadata.dev() != parent_metadata.dev() {
+                    return Ok(Some("a filesystem is mounted at the workspace mountpoint"));
+                }
+                if !dir_is_empty(&mount_point)? {
+                    return Ok(Some("the workspace mountpoint still contains files"));
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(io_error(
+                    "inspect orphan session mountpoint",
+                    &mount_point,
+                    error,
+                ));
+            }
+        }
+        Ok(None)
+    }
+    fn session_image_is_attached(&self, image: &Path) -> Result<bool, ApfsStorageError> {
+        self.backend
+            .attached_whole_devices(image)
+            .map(|devices| !devices.is_empty())
+            .map_err(ApfsStorageError::from)
+    }
 
     fn execute_gc_plan(
         &self,
@@ -2553,176 +2838,324 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
             ..StorageGcReport::default()
         };
         for candidate in plan.candidates() {
-            match candidate.reason() {
-                StorageGcReason::RetiredWorkspace => {
-                    self.reclaim_retired_authority(project, plan.repo(), candidate.path(), None)?;
-                    report.freed_bytes = report.freed_bytes.checked_add(candidate.bytes()).ok_or(
-                        ApfsStorageError::InvalidPlan("GC freed byte accounting overflow"),
-                    )?;
-                }
-                StorageGcReason::OrphanStagingImage => {
-                    // The volume first: an image deleted under a live attachment keeps its
-                    // blocks until the kernel lets go, and the mountpoint would outlive it.
-                    if let Some(stem) = candidate.path().file_stem().and_then(|stem| stem.to_str())
-                    {
-                        let mount_point = self.staging_mount_point(plan.repo(), stem)?;
-                        if self.retire_staging_mount(&mount_point)? {
-                            let workspace = staged_stem_workspace(stem)
-                                .map(|name| name.as_str().to_owned())
-                                .unwrap_or_default();
-                            deletion_log::log_deletion(
-                                project,
-                                DeletionOp::RemoveStagingMount,
-                                DeletionKind::Other,
-                                &workspace,
-                                None,
-                                &mount_point,
-                            );
+            let result = (|| -> Result<(), ApfsStorageError> {
+                match candidate.reason() {
+                    StorageGcReason::RetiredWorkspace => {
+                        self.reclaim_retired_authority(
+                            project,
+                            plan.repo(),
+                            candidate.path(),
+                            None,
+                        )?;
+                        report.freed_bytes =
+                            report.freed_bytes.checked_add(candidate.bytes()).ok_or(
+                                ApfsStorageError::InvalidPlan("GC freed byte accounting overflow"),
+                            )?;
+                    }
+                    StorageGcReason::OrphanStagingImage => {
+                        // The volume first: an image deleted under a live attachment keeps its
+                        // blocks until the kernel lets go, and the mountpoint would outlive it.
+                        if let Some(stem) =
+                            candidate.path().file_stem().and_then(|stem| stem.to_str())
+                        {
+                            let mount_point = self.staging_mount_point(plan.repo(), stem)?;
+                            if self.retire_staging_mount(&mount_point)? {
+                                let workspace = staged_stem_workspace(stem)
+                                    .map(|name| name.as_str().to_owned())
+                                    .unwrap_or_default();
+                                deletion_log::log_deletion(
+                                    project,
+                                    DeletionOp::RemoveStagingMount,
+                                    DeletionKind::Other,
+                                    &workspace,
+                                    None,
+                                    &mount_point,
+                                );
+                            }
+                        }
+                        self.reclaim_image(candidate.path())?;
+                        report.freed_bytes =
+                            report.freed_bytes.checked_add(candidate.bytes()).ok_or(
+                                ApfsStorageError::InvalidPlan("GC freed byte accounting overflow"),
+                            )?;
+                    }
+                    StorageGcReason::OrphanStagingMount => {
+                        let parses = candidate
+                            .path()
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .and_then(staged_stem_workspace)
+                            .is_some();
+                        if parses {
+                            if self.retire_staging_mount(candidate.path())? {
+                                let workspace = candidate
+                                    .path()
+                                    .file_name()
+                                    .and_then(|name| name.to_str())
+                                    .and_then(staged_stem_workspace)
+                                    .map(|name| name.as_str().to_owned())
+                                    .unwrap_or_default();
+                                deletion_log::log_deletion(
+                                    project,
+                                    DeletionOp::RemoveStagingMount,
+                                    DeletionKind::Other,
+                                    &workspace,
+                                    None,
+                                    candidate.path(),
+                                );
+                            }
+                        } else {
+                            // Stems staging never produces are never live controller mounts and
+                            // are never detached: a foreign volume mounted here is not ours to
+                            // unmount. Remove only a still-empty, still-unmounted directory;
+                            // anything that arrived since preview waits for a later sweep
+                            // instead of failing this one.
+                            if dir_is_empty(candidate.path())? && !dir_is_mounted(candidate.path())?
+                            {
+                                match fs::remove_dir(candidate.path()) {
+                                    Ok(()) => {
+                                        let workspace = candidate
+                                            .path()
+                                            .file_name()
+                                            .and_then(|name| name.to_str())
+                                            .unwrap_or_default();
+                                        deletion_log::log_deletion(
+                                            project,
+                                            DeletionOp::RemoveStagingMount,
+                                            DeletionKind::Other,
+                                            workspace,
+                                            None,
+                                            candidate.path(),
+                                        );
+                                        sync_parent_path(candidate.path())?;
+                                    }
+                                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                                    Err(error) => {
+                                        return Err(io_error(
+                                            "remove stale staging mountpoint",
+                                            candidate.path(),
+                                            error,
+                                        ));
+                                    }
+                                }
+                            } else {
+                                return Err(ApfsStorageError::Host(
+                                    "orphan staging mountpoint is no longer empty or is mounted"
+                                        .to_owned(),
+                                ));
+                            }
                         }
                     }
-                    self.reclaim_image(candidate.path())?;
-                    report.freed_bytes = report.freed_bytes.checked_add(candidate.bytes()).ok_or(
-                        ApfsStorageError::InvalidPlan("GC freed byte accounting overflow"),
-                    )?;
-                }
-                StorageGcReason::OrphanStagingMount => {
-                    let parses = candidate
-                        .path()
-                        .file_name()
-                        .and_then(|name| name.to_str())
-                        .and_then(staged_stem_workspace)
-                        .is_some();
-                    if parses {
-                        if self.retire_staging_mount(candidate.path())? {
-                            let workspace = candidate
-                                .path()
-                                .file_name()
-                                .and_then(|name| name.to_str())
-                                .and_then(staged_stem_workspace)
-                                .map(|name| name.as_str().to_owned())
-                                .unwrap_or_default();
-                            deletion_log::log_deletion(
-                                project,
-                                DeletionOp::RemoveStagingMount,
-                                DeletionKind::Other,
-                                &workspace,
-                                None,
-                                candidate.path(),
-                            );
+                    StorageGcReason::OrphanSessionImage => {
+                        let Some((workspace, sparseimage)) =
+                            session_image_workspace(candidate.path())
+                        else {
+                            return Err(ApfsStorageError::InvalidPlan(
+                                "orphan session image name is invalid",
+                            ));
+                        };
+                        self.verify_controller_path(candidate.path())?;
+                        if !grants_sidecar_missing(candidate.path())? {
+                            return Err(ApfsStorageError::Host(
+                                "grants sidecar appeared after GC planning".to_owned(),
+                            ));
                         }
-                    } else {
-                        // Stems staging never produces are never live controller mounts and
-                        // are never detached: a foreign volume mounted here is not ours to
-                        // unmount. Remove only a still-empty, still-unmounted directory;
-                        // anything that arrived since preview waits for a later sweep
-                        // instead of failing this one.
-                        if dir_is_empty(candidate.path())? && !dir_is_mounted(candidate.path())? {
-                            match fs::remove_dir(candidate.path()) {
-                                Ok(()) => {
-                                    let workspace = candidate
-                                        .path()
-                                        .file_name()
-                                        .and_then(|name| name.to_str())
-                                        .unwrap_or_default();
-                                    deletion_log::log_deletion(
-                                        project,
-                                        DeletionOp::RemoveStagingMount,
-                                        DeletionKind::Other,
-                                        workspace,
-                                        None,
-                                        candidate.path(),
-                                    );
-                                    sync_parent_path(candidate.path())?;
+                        match fs::symlink_metadata(candidate.path()) {
+                            Ok(metadata) if metadata.file_type().is_file() => {}
+                            Ok(_) => {
+                                return Err(ApfsStorageError::Host(
+                                    "orphan session image is no longer a regular file".to_owned(),
+                                ));
+                            }
+                            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+                            Err(error) => {
+                                return Err(io_error(
+                                    "inspect orphan session image",
+                                    candidate.path(),
+                                    error,
+                                ));
+                            }
+                        }
+                        let extra_identity = orphan_session_image_identity(candidate.path())?;
+                        let current = if sparseimage {
+                            gc_candidate(
+                                StorageGcReason::OrphanSessionImage,
+                                candidate.path(),
+                                std::slice::from_ref(candidate.path_buf()),
+                                &extra_identity,
+                            )?
+                        } else {
+                            gc_candidate(
+                                StorageGcReason::OrphanSessionImage,
+                                candidate.path(),
+                                &image_gc_paths(candidate.path()),
+                                &extra_identity,
+                            )?
+                        };
+                        if &current != candidate {
+                            return Err(ApfsStorageError::Host(
+                                "orphan session image changed after GC planning".to_owned(),
+                            ));
+                        }
+                        if let Some(reason) =
+                            self.orphan_session_image_mount_blocker(plan.repo(), &workspace)?
+                        {
+                            return Err(ApfsStorageError::Host(reason.to_owned()));
+                        }
+                        if self.session_image_is_attached(candidate.path())? {
+                            return Err(ApfsStorageError::Host(
+                                "session image is still attached".to_owned(),
+                            ));
+                        }
+                        if sparseimage {
+                            match fs::remove_file(candidate.path()) {
+                                Ok(()) => {}
+                                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                                    return Ok(());
                                 }
-                                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
                                 Err(error) => {
                                     return Err(io_error(
-                                        "remove stale staging mountpoint",
+                                        "remove orphan session image",
                                         candidate.path(),
                                         error,
                                     ));
                                 }
                             }
-                        }
-                    }
-                }
-                StorageGcReason::OrphanMountpoint => {
-                    let kept = remove_stray_junk(candidate.path(), &self.config.checkout_path)?;
-                    if !kept.is_empty() {
-                        return Err(ApfsStorageError::Host(format!(
-                            "orphan mountpoint {} holds files that are neither hidden nor ignored \
-                             by the project: {}; move or delete them",
-                            candidate.path().display(),
-                            kept.iter()
-                                .map(|path| path.display().to_string())
-                                .collect::<Vec<_>>()
-                                .join(", ")
-                        )));
-                    }
-                    match fs::remove_dir(candidate.path()) {
-                        Ok(()) => {
-                            let workspace = candidate
-                                .path()
-                                .file_name()
-                                .and_then(|name| name.to_str())
-                                .unwrap_or_default();
                             deletion_log::log_deletion(
                                 project,
-                                DeletionOp::RemoveOrphanMountpoint,
-                                DeletionKind::Other,
-                                workspace,
+                                DeletionOp::ReclaimImage,
+                                DeletionKind::Image,
+                                workspace.as_str(),
                                 None,
                                 candidate.path(),
                             );
-                            sync_parent_path(candidate.path())?
+                            sync_parent_path(candidate.path())?;
+                        } else {
+                            self.reclaim_image(candidate.path())?;
                         }
-                        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                        Err(error) => {
-                            return Err(io_error(
-                                "remove orphan mountpoint",
-                                candidate.path(),
-                                error,
+                        report.freed_bytes =
+                            report.freed_bytes.checked_add(candidate.bytes()).ok_or(
+                                ApfsStorageError::InvalidPlan("GC freed byte accounting overflow"),
+                            )?;
+                    }
+                    StorageGcReason::OrphanMountpoint => {
+                        self.verify_controller_path(candidate.path())?;
+                        match fs::symlink_metadata(candidate.path()) {
+                            Ok(metadata) if metadata.file_type().is_dir() => {}
+                            Ok(_) => {
+                                return Err(ApfsStorageError::Host(
+                                    "orphan mountpoint is no longer a directory".to_owned(),
+                                ));
+                            }
+                            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+                            Err(error) => {
+                                return Err(io_error(
+                                    "inspect orphan mountpoint",
+                                    candidate.path(),
+                                    error,
+                                ));
+                            }
+                        }
+                        if self
+                            .mount_source
+                            .mounts()?
+                            .iter()
+                            .any(|mount| mount.mount_point == candidate.path())
+                            || dir_is_mounted(candidate.path())?
+                        {
+                            return Err(ApfsStorageError::Host(
+                                "orphan mountpoint became mounted after GC planning".to_owned(),
                             ));
                         }
+                        let kept = remove_stray_junk(candidate.path(), &self.config.checkout_path)?;
+                        if !kept.is_empty() {
+                            return Err(ApfsStorageError::Host(format!(
+                                "orphan mountpoint {} holds files that are neither hidden nor ignored \
+                             by the project: {}; move or delete them",
+                                candidate.path().display(),
+                                kept.iter()
+                                    .map(|path| path.display().to_string())
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            )));
+                        }
+                        match fs::remove_dir(candidate.path()) {
+                            Ok(()) => {
+                                let workspace = candidate
+                                    .path()
+                                    .file_name()
+                                    .and_then(|name| name.to_str())
+                                    .unwrap_or_default();
+                                deletion_log::log_deletion(
+                                    project,
+                                    DeletionOp::RemoveOrphanMountpoint,
+                                    DeletionKind::Other,
+                                    workspace,
+                                    None,
+                                    candidate.path(),
+                                );
+                                sync_parent_path(candidate.path())?
+                            }
+                            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                            Err(error) => {
+                                return Err(io_error(
+                                    "remove orphan mountpoint",
+                                    candidate.path(),
+                                    error,
+                                ));
+                            }
+                        }
+                    }
+                    StorageGcReason::ExpiredCheckpoint => {
+                        self.reclaim_image(candidate.path())?;
+                        report.freed_bytes =
+                            report.freed_bytes.checked_add(candidate.bytes()).ok_or(
+                                ApfsStorageError::InvalidPlan("GC freed byte accounting overflow"),
+                            )?;
+                    }
+                    StorageGcReason::OrphanStagingMetadata => {
+                        fs::remove_file(candidate.path()).map_err(|error| {
+                            io_error("remove orphan staging metadata", candidate.path(), error)
+                        })?;
+                        if let Ok(image) = image_from_sidecar(candidate.path()) {
+                            deletion_log::log_deletion_for_image(
+                                &image,
+                                DeletionOp::RemoveOrphanStagingMetadata,
+                                DeletionKind::Sidecar,
+                                candidate.path(),
+                            );
+                        } else {
+                            deletion_log::log_deletion(
+                                project,
+                                DeletionOp::RemoveOrphanStagingMetadata,
+                                DeletionKind::Sidecar,
+                                "",
+                                None,
+                                candidate.path(),
+                            );
+                        }
+                        sync_parent_path(candidate.path())?;
+                        report.freed_bytes =
+                            report.freed_bytes.checked_add(candidate.bytes()).ok_or(
+                                ApfsStorageError::InvalidPlan("GC freed byte accounting overflow"),
+                            )?;
                     }
                 }
-                StorageGcReason::ExpiredCheckpoint => {
-                    self.reclaim_image(candidate.path())?;
-                    report.freed_bytes = report.freed_bytes.checked_add(candidate.bytes()).ok_or(
-                        ApfsStorageError::InvalidPlan("GC freed byte accounting overflow"),
-                    )?;
+                Ok(())
+            })();
+            match result {
+                Ok(()) => {
+                    report.reclaimed = report
+                        .reclaimed
+                        .checked_add(1)
+                        .ok_or(ApfsStorageError::InvalidPlan("GC reclaimed count overflow"))?;
                 }
-                StorageGcReason::OrphanStagingMetadata => {
-                    fs::remove_file(candidate.path()).map_err(|error| {
-                        io_error("remove orphan staging metadata", candidate.path(), error)
-                    })?;
-                    if let Ok(image) = image_from_sidecar(candidate.path()) {
-                        deletion_log::log_deletion_for_image(
-                            &image,
-                            DeletionOp::RemoveOrphanStagingMetadata,
-                            DeletionKind::Sidecar,
-                            candidate.path(),
-                        );
-                    } else {
-                        deletion_log::log_deletion(
-                            project,
-                            DeletionOp::RemoveOrphanStagingMetadata,
-                            DeletionKind::Sidecar,
-                            "",
-                            None,
-                            candidate.path(),
-                        );
-                    }
-                    sync_parent_path(candidate.path())?;
-                    report.freed_bytes = report.freed_bytes.checked_add(candidate.bytes()).ok_or(
-                        ApfsStorageError::InvalidPlan("GC freed byte accounting overflow"),
-                    )?;
-                }
+                Err(error) if gc_candidate_failure_is_fatal(&error) => return Err(error),
+                Err(error) => report.deferred.push(StorageGcDeferred {
+                    path: candidate.path().to_owned(),
+                    diagnostic: error.to_string(),
+                }),
             }
-            report.reclaimed = report
-                .reclaimed
-                .checked_add(1)
-                .ok_or(ApfsStorageError::InvalidPlan("GC reclaimed count overflow"))?;
         }
         Ok(report)
     }
@@ -4394,7 +4827,22 @@ where
             &storage.project().sessions,
             "enumerate pending session images",
         )?;
+        warn_sidecarless_sparseimages(&entries);
         for discovered in discover_session_images(entries) {
+            match grants_sidecar_missing(discovered.path()) {
+                Ok(false) => {}
+                Ok(true) => {
+                    warn_missing_session_sidecar(discovered.path());
+                    continue;
+                }
+                Err(error) => {
+                    warn_session_image_issue(
+                        discovered.path(),
+                        format!("cannot inspect grants sidecar: {error}"),
+                    );
+                    continue;
+                }
+            }
             let metadata = DetachedWorkspaceMetadata::read_for_image(discovered.path())
                 .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
             if !restore_recovery_fact_path(discovered.path()).exists() {

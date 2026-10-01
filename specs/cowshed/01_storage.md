@@ -285,6 +285,19 @@ Three questions, three authorities, none of them the volume label:
   after a controller restart, joining a kernel mount into enumeration — reads the marker at the mount point and refuses
   when it does not name the expected workspace. A marker that cannot be read is not ours.
 
+An image with no sidecar is not a discoverable workspace: inventory and the store-wide port allocator skip a named
+`<workspace>.asif` with a warning rather than failing every project. Sidecarless legacy `<workspace>.sparseimage`
+entries are also skipped with a named warning and never opened as workspaces. `doctor` names sidecarless `.asif` and
+`.sparseimage` files directly under `sessions/`; `gc` may reclaim them only after checking the exact path, locks, and
+mount ownership. A legacy image never becomes a live workspace just because its filename resembles one.
+
+The orphan plan fingerprints the image's inode, device, length, and modification/change times; a same-sized replacement
+invalidates the plan before any deletion. For a legacy disk image, `gc` also checks the image-path attachment inventory,
+not merely the expected mountpoint: an image attached somewhere else remains in place and is reported as deferred.
+
+A sidecar that exists but is malformed or mismatched is not an orphan; its uncertain grants and identity still require
+an integrity finding instead of a guessed admission or deletion.
+
 The marker is the discriminator because it is the one identity that is both authoritative and re-stampable. An APFS
 clone inherits its source volume's name **and its volume UUID**, so a volume UUID recorded at creation cannot tell a
 workspace from the fork made out of it; that is why cloning rewrites the marker inside the staging fence, before the
@@ -514,9 +527,12 @@ _conventions_, enforced by `cowshed gc`, never by a background daemon deleting w
   candidates with stable SHA-256 identity, host path, allocated bytes, and closed reason. Pinned checkpoints are
   retained and never become candidates. `execute_gc(plan)` acquires all plan locks without waiting, re-enumerates at the
   plan's observation time, and rejects a pin/incarnation/path/byte/concurrency change as stale before any mutation. Only
-  an unchanged plan drains trash/orphan staging objects and prunes expired checkpoints; execution reports actual freed
-  bytes. Nothing compacts an image: ASIF gives back only part of what its volume frees on its own (1.3 GiB of 3.3 GiB
-  written and then deleted, measured), so an image's allocation tracks its high-water mark.
+  an unchanged plan drains trash, orphan staging/session images and mountpoints, and prunes expired checkpoints;
+  execution reports actual freed bytes. Nothing compacts an image: ASIF gives back only part of what its volume frees on
+  its own (1.3 GiB of 3.3 GiB written and then deleted, measured), so an image's allocation tracks its high-water mark.
+  A candidate whose own cleanup cannot finish is deferred by path and diagnostic while the sweep attempts the others.
+  Uncertain ownership, invalid identity, or a stale whole plan still refuse: proceeding through those could delete data
+  that does not belong to the candidate.
 - Explicit workspace retirement is the sole exception to live checkpoint retention: its exact trash metadata authorizes
   one workspace-scoped cleanup plan that includes pinned checkpoints and pre-restore undo generations as well as the
   trash image and empty mountpoint. Preview and execution validate the repository, workspace, incarnation, checkpoint

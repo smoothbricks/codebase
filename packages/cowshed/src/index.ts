@@ -64,6 +64,7 @@ export {
   type Finding,
   type FindingSeverity,
   type GcCandidate,
+  type GcDeferred,
   type GcOptions,
   type GcReport,
   type GrantDelta,

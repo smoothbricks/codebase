@@ -868,6 +868,7 @@ impl ApfsExecutionHost for FakeHost {
             retained_active: 0,
             retained_recent: 0,
             freed_bytes: 1024,
+            deferred: Vec::new(),
         })
     }
 }

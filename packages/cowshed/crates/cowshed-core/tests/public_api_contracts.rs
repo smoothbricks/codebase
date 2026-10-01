@@ -382,6 +382,7 @@ fn doctor_gc_and_empty_results_have_exact_shapes() {
             bytes: 4096,
             reason: GcReason::ExpiredCheckpoint,
         }],
+        deferred: Vec::new(),
     };
     assert_eq!(
         serde_json::to_value(gc).expect("gc JSON"),
@@ -397,7 +398,8 @@ fn doctor_gc_and_empty_results_have_exact_shapes() {
                 "path":"/store/checkpoints/raven/old.asif",
                 "bytes":4096,
                 "reason":"expiredCheckpoint"
-            }]
+            }],
+            "deferred": []
         })
     );
     assert_eq!(serde_json::to_value(EmptyResult {}).unwrap(), json!({}));

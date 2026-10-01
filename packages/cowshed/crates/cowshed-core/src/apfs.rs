@@ -821,7 +821,12 @@ impl<R, S> MacOsApfsBackend<R, S> {
 }
 
 impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
-    fn attached_whole_devices(&self, image: &Path) -> Result<BTreeSet<String>, ApfsError> {
+    /// Read the attachment inventory for this exact path without constraining its image format.
+    /// Mutation entry points still validate the format before changing an image.
+    pub(crate) fn attached_whole_devices(
+        &self,
+        image: &Path,
+    ) -> Result<BTreeSet<String>, ApfsError> {
         let image = attachment_inventory_path(image)?;
         // Tahoe's `diskutil image info --plist` does not expose attachment devices. The
         // read-only hdiutil inventory is the observed authoritative image-path -> system-entities

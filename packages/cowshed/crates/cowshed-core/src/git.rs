@@ -354,6 +354,62 @@ fn append_environment_hook(root: &Path, path: &Path, source: &[u8]) -> Result<()
         })
 }
 
+/// A temporary bare repository belongs to the verification future, including when its caller
+/// drops that future. Async cleanup alone cannot run after cancellation.
+struct BundleVerificationScratch {
+    path: PathBuf,
+    removed: bool,
+}
+
+impl BundleVerificationScratch {
+    fn create(parent: &Path) -> Result<Self> {
+        let path = parent.join(format!(".bundle-verify-{}", uuid::Uuid::new_v4().simple()));
+        fs::create_dir(&path).map_err(|error| {
+            CowshedError::environment_missing(
+                format!(
+                    "cannot create abandonment bundle verification repository {}: {error}",
+                    path.display()
+                ),
+                "repair the cowshed store and retry removal",
+            )
+        })?;
+        Ok(Self {
+            path,
+            removed: false,
+        })
+    }
+
+    async fn cleanup(mut self) -> Result<()> {
+        tokio::fs::remove_dir_all(&self.path)
+            .await
+            .map_err(|error| {
+                CowshedError::environment_missing(
+                    format!(
+                        "cannot remove abandonment bundle verification repository {}: {error}",
+                        self.path.display()
+                    ),
+                    "repair the cowshed store and retry removal",
+                )
+            })?;
+        self.removed = true;
+        Ok(())
+    }
+}
+
+impl Drop for BundleVerificationScratch {
+    fn drop(&mut self) {
+        if !self.removed
+            && let Err(error) = fs::remove_dir_all(&self.path)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            eprintln!(
+                "cowshed: could not remove interrupted bundle verification repository {}: {error}",
+                self.path.display()
+            );
+        }
+    }
+}
+
 impl GitRepository {
     /// Resolve the standalone repository containing `path`.
     pub async fn discover(path: impl AsRef<Path>) -> Result<Self> {
@@ -1239,28 +1295,19 @@ impl GitRepository {
                 "repair the cowshed store and retry removal",
             )
         })?;
-        let scratch = parent.join(format!(".bundle-verify-{}", uuid::Uuid::new_v4().simple()));
-        tokio::fs::create_dir(&scratch).await.map_err(|error| {
-            CowshedError::environment_missing(
-                format!(
-                    "cannot create abandonment bundle verification repository {}: {error}",
-                    scratch.display()
-                ),
-                "repair the cowshed store and retry removal",
-            )
-        })?;
+        let scratch = BundleVerificationScratch::create(parent)?;
 
         let verification = async {
-            let output = run_git_at(&scratch, ["init", "--bare", "."]).await?;
+            let output = run_git_at(&scratch.path, ["init", "--bare", "."]).await?;
             if !output.status.success() {
                 return Err(bundle_artifact_error(
                     "initialize abandonment bundle verification repository",
                     &output,
                 ));
             }
-            let recovery = Self::from_root(&scratch);
+            let recovery = Self::from_root(&scratch.path);
             let output = run_git_bundle_at(
-                &scratch,
+                &scratch.path,
                 None,
                 [
                     OsStr::new("bundle"),
@@ -1276,7 +1323,7 @@ impl GitRepository {
                 ));
             }
             let output = run_git_bundle_at(
-                &scratch,
+                &scratch.path,
                 None,
                 [
                     OsStr::new("fetch"),
@@ -1336,15 +1383,7 @@ impl GitRepository {
         }
         .await;
 
-        let cleanup = tokio::fs::remove_dir_all(&scratch).await.map_err(|error| {
-            CowshedError::environment_missing(
-                format!(
-                    "cannot remove abandonment bundle verification repository {}: {error}",
-                    scratch.display()
-                ),
-                "repair the cowshed store and retry removal",
-            )
-        });
+        let cleanup = scratch.cleanup().await;
         match (verification, cleanup) {
             (Ok(()), Ok(())) => Ok(()),
             (Err(primary), Ok(())) => Err(primary),
@@ -2424,6 +2463,7 @@ where
     if let Some(objects) = alternate_objects {
         command.env("GIT_ALTERNATE_OBJECT_DIRECTORIES", objects);
     }
+    command.kill_on_drop(true);
     command
         .output()
         .await
@@ -2744,6 +2784,7 @@ where
     if let Some(objects) = alternate_objects {
         command.env("GIT_ALTERNATE_OBJECT_DIRECTORIES", objects);
     }
+    command.kill_on_drop(true);
     command
         .output()
         .await
@@ -3057,9 +3098,10 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        CowshedUpstream, FALLBACK_MAIN_REMOTE, GitRepository, MAIN_REMOTE, MainRemote, RemoteUrl,
-        ensure_git_success, git_message, held_by_repository_blocking, ignored_by,
-        ignored_by_blocking, is_git_repository, parse_lines, workspace_remote_name,
+        BundleVerificationScratch, CowshedUpstream, FALLBACK_MAIN_REMOTE, GitRepository,
+        MAIN_REMOTE, MainRemote, RemoteUrl, ensure_git_success, git_message,
+        held_by_repository_blocking, ignored_by, ignored_by_blocking, is_git_repository,
+        parse_lines, workspace_remote_name,
     };
     static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -4243,6 +4285,59 @@ mod tests {
                 .expect("read operation state")
                 .as_deref(),
             Some("MERGE_HEAD")
+        );
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    #[tokio::test]
+    async fn stale_auto_merge_is_not_an_in_progress_operation() {
+        let root = repository();
+        fs::write(root.join(".git/AUTO_MERGE"), "deadbeef\n").expect("write stale merge tree");
+        let git = GitRepository::from_root(&root);
+        assert_eq!(
+            git.in_progress_operation()
+                .await
+                .expect("read operation state"),
+            None
+        );
+        assert!(!git.is_dirty_by(None).await.expect("read repository status"));
+        git.ensure_adoptable()
+            .await
+            .expect("a leftover merge tree is not a running operation");
+        fs::write(root.join(".git/CHERRY_PICK_HEAD"), "deadbeef\n")
+            .expect("mark an active cherry-pick");
+        assert_eq!(
+            git.in_progress_operation()
+                .await
+                .expect("read operation state"),
+            Some("CHERRY_PICK_HEAD".to_owned())
+        );
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    #[tokio::test]
+    async fn cancelled_bundle_verification_removes_its_bare_repository() {
+        let root = repository();
+        let scratch = BundleVerificationScratch::create(&root).expect("verification repository");
+        let path = scratch.path.clone();
+        let work = tokio::spawn(async move {
+            let _scratch = scratch;
+            std::future::pending::<()>().await;
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            path.is_dir(),
+            "verification scratch exists before cancellation"
+        );
+        work.abort();
+        assert!(
+            work.await
+                .expect_err("cancelled verification")
+                .is_cancelled()
+        );
+        assert!(
+            !path.exists(),
+            "dropping the cancelled future must remove its scratch"
         );
         fs::remove_dir_all(root).expect("remove fixture");
     }

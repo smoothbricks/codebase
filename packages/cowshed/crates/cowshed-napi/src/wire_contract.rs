@@ -22,13 +22,13 @@ use std::{collections::BTreeMap, ffi::OsString, os::unix::ffi::OsStringExt, path
 use cowshed_core::{
     api::{
         AbandonedWork, BinaryData, CheckpointInfo, CommandArg, DoctorReport, EgressMode,
-        EgressRule, ExitStatus, Finding, FindingSeverity, GcCandidate, GcReason, GcReport, GitOid,
-        GrantSet, JobId, JobInfo, JobState, LandReport, LandingCommits, OutputLimitInfo,
-        OutputStorage, OutputSummary, PortBlock, ProtectedOutput, PushReport, RemoveReport,
-        RepoRule, ResizeResult, Sha256Digest, SimVerb, SpanId, StdinInfo, StdinKind, StreamInfo,
-        TraceContext, TraceId, UtcTimestamp, WarmAdmission, WarmRange, WorkspaceIncarnation,
-        WorkspaceInfo, WorkspaceLanding, WorkspaceName, WorkspacePath, WorkspaceRole,
-        WorkspaceState,
+        EgressRule, ExitStatus, Finding, FindingSeverity, GcCandidate, GcDeferred, GcReason,
+        GcReport, GitOid, GrantSet, JobId, JobInfo, JobState, LandReport, LandingCommits,
+        OutputLimitInfo, OutputStorage, OutputSummary, PortBlock, ProtectedOutput, PushReport,
+        RemoveReport, RepoRule, ResizeResult, Sha256Digest, SimVerb, SpanId, StdinInfo, StdinKind,
+        StreamInfo, TraceContext, TraceId, UtcTimestamp, WarmAdmission, WarmRange,
+        WorkspaceIncarnation, WorkspaceInfo, WorkspaceLanding, WorkspaceName, WorkspacePath,
+        WorkspaceRole, WorkspaceState,
     },
     repository::RepoId,
 };
@@ -542,7 +542,7 @@ fn reports() -> BTreeMap<&'static str, BTreeMap<&'static str, Value>> {
     // One candidate per `GcReason`: a reason absent here is a reason the TypeScript union is not
     // checked against.
     let gc_dry_run = GcReport {
-        examined: 6,
+        examined: 7,
         reclaimed: 0,
         retained_pinned: 1,
         retained_active: 1,
@@ -555,6 +555,7 @@ fn reports() -> BTreeMap<&'static str, BTreeMap<&'static str, Value>> {
             GcReason::OrphanStagingMount,
             GcReason::OrphanMountpoint,
             GcReason::ExpiredCheckpoint,
+            GcReason::OrphanSessionImage,
         ]
         .into_iter()
         .enumerate()
@@ -565,15 +566,20 @@ fn reports() -> BTreeMap<&'static str, BTreeMap<&'static str, Value>> {
             reason,
         })
         .collect(),
+        deferred: Vec::new(),
     };
     let gc_swept = GcReport {
-        examined: 6,
+        examined: 7,
         reclaimed: 5,
         retained_pinned: 1,
-        retained_active: 1,
+        retained_active: 0,
         freed_bytes: 21_504,
         dry_run: false,
         candidates: Vec::new(),
+        deferred: vec![GcDeferred {
+            path: PathBuf::from("/Users/fixture/Dev/.cowshed/gc/6"),
+            diagnostic: "the image could not be detached before the deadline".to_owned(),
+        }],
     };
 
     let doctor_healthy = DoctorReport {

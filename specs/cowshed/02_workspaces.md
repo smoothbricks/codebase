@@ -816,9 +816,10 @@ clone of a snapshot of the lane base on ZFS as it is a clone of its image on APF
    bundle, `sessions/.trash/<ws>-<head>.bundle`, before retiring unlanded work. It is written beside that name and
    renamed into place once verified; a retried removal that finds a bundle verifying for the same range keeps it instead
    of writing another.
-2. Stop the supervisor: TERM → grace → KILL across the whole descendant tree (11_shell.md). Teardown precedes retirement
-   — live children would otherwise hold the mount busy and keep enforcing stale launch-time authority after the grants
-   disappear.
+2. Stop the supervisor. Ordinary removal quiesces, letting running jobs finish before retirement. `--force` retires
+   directly: TERM → grace → KILL across the workspace's descendant process trees (11_shell.md), without waiting for a
+   job to complete. Teardown precedes image retirement — live children would otherwise hold the mount busy and keep
+   enforcing stale launch-time authority after the grants disappear.
 3. Remove the host-side state this workspace put in main's repository, before the image goes anywhere: its reverse
    remote if one was registered, and its worktree registration if it is a git-worktree workspace (remove, then prune).
    This is the one piece of teardown that lives where the user can see it — a remote or a registration naming a trashed
@@ -832,6 +833,13 @@ clone of a snapshot of the lane base on ZFS as it is a clone of its image on APF
    and companions, every checkpoint (including pinned checkpoints), every pre-restore undo image and companion/fact,
    then the empty checkpoint and mountpoint directories. Interrupted cleanup is resumed idempotently by `cowshed gc`
    only from exact, revalidated retirement trash metadata; a missing canonical image alone is never cleanup authority.
+
+The in-progress Git gate follows operation state (`MERGE_HEAD`, `CHERRY_PICK_HEAD`, `REVERT_HEAD`, `rebase-merge`, or
+`rebase-apply`), not a leftover `.git/AUTO_MERGE` tree: Git can retain that tree after an operation finishes. A stale
+tree alone never blocks removal.
+
+The verified bundle's temporary bare repository belongs to the removal attempt, not the next `gc`: cancellation or an
+interrupted verification removes it before leaving the operation.
 
 Removal persists its exact options before the authorized retirement mutation. If a process dies after canonical
 retirement but before acknowledging the call, startup observes the workspace absent and records completion without

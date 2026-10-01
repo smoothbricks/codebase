@@ -68,10 +68,17 @@
           "identity": "e77b9a9ae9e30b0dbdb6f510a264ef9de781501d7b6b92ae89eb059c5ab743db",
           "path": "/Users/fixture/Dev/.cowshed/gc/5",
           "reason": "expiredCheckpoint"
+        },
+        {
+          "bytes": 7168,
+          "identity": "67586e98fad27da0b9968bc039a1ef34c939b9b8e523a8bef89d478608c5ecf6",
+          "path": "/Users/fixture/Dev/.cowshed/gc/6",
+          "reason": "orphanSessionImage"
         }
       ],
+      "deferred": [],
       "dryRun": true,
-      "examined": 6,
+      "examined": 7,
       "freedBytes": 0,
       "reclaimed": 0,
       "retainedActive": 1,
@@ -79,11 +86,17 @@
     },
     "swept": {
       "candidates": [],
+      "deferred": [
+        {
+          "diagnostic": "the image could not be detached before the deadline",
+          "path": "/Users/fixture/Dev/.cowshed/gc/6"
+        }
+      ],
       "dryRun": false,
-      "examined": 6,
+      "examined": 7,
       "freedBytes": 21504,
       "reclaimed": 5,
-      "retainedActive": 1,
+      "retainedActive": 0,
       "retainedPinned": 1
     }
   },

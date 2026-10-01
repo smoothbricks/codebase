@@ -44,8 +44,8 @@ use cowshed_core::storage::job_artifact::{ArtifactConfig, repair_workspace_recor
 use cowshed_core::storage::lifecycle::{DerivedWorkspace, MountIntent, MountState, Pin, Substrate};
 use cowshed_core::storage::{StorageLayout, discover_session_images};
 use cowshed_core::{
-    AdoptedProject, CowshedError, ErrorCode, JobHandle, NativeGatewayInventory, Result,
-    UnreachableMain, validate_existing_host_storage,
+    AdoptedProject, CowshedError, ErrorCode, GatewayInventoryError, JobHandle,
+    NativeGatewayInventory, Result, UnreachableMain, validate_existing_host_storage,
 };
 use std::collections::HashMap;
 use std::fs;
@@ -425,7 +425,12 @@ async fn adopted_projects() -> Result<Vec<AdoptedProject>> {
         .map_err(project_inventory_error)
 }
 
-async fn doctor_projects() -> Result<(Vec<AdoptedProject>, Vec<UnreachableMain>, Vec<RepoId>)> {
+async fn doctor_projects() -> Result<(
+    Vec<AdoptedProject>,
+    Vec<UnreachableMain>,
+    Vec<RepoId>,
+    Vec<(RepoId, GatewayInventoryError)>,
+)> {
     host_inventory()
         .await?
         .doctor_projects()
@@ -1354,6 +1359,15 @@ where
                     dry_run: args.dry_run,
                 })
                 .await?;
+            for deferred in &report.deferred {
+                output
+                    .guidance(&format!(
+                        "deferred {}: {}",
+                        deferred.path.display(),
+                        deferred.diagnostic
+                    ))
+                    .map_err(output_error)?;
+            }
             if json {
                 output.success(report.clone()).map_err(output_error)?;
             } else {
@@ -2126,12 +2140,26 @@ async fn attach_scoped_sessions(
         return Err(no_detached_sessions());
     }
     let mut attached = Vec::with_capacity(targets.len());
+    let mut first_error = None;
     for target in targets {
-        attached.push(
-            service
-                .attach(target.workspace.as_str(), options.clone())
-                .await?,
-        );
+        match service
+            .attach(target.workspace.as_str(), options.clone())
+            .await
+        {
+            Ok(info) => attached.push(info),
+            Err(error) => {
+                eprintln!(
+                    "cowshed: skipping workspace {}/{} during attach: {error}",
+                    target.repo_id, target.workspace
+                );
+                first_error.get_or_insert(error);
+            }
+        }
+    }
+    if attached.is_empty()
+        && let Some(error) = first_error
+    {
+        return Err(error);
     }
     Ok(attached)
 }
@@ -2166,8 +2194,19 @@ async fn attach_store_wide(browse: bool) -> Result<StoreWideMounts<Vec<Workspace
         .map_err(project_inventory_error)?;
     let mut attached = Vec::new();
     let mut stale = Vec::new();
+    let mut first_error = None;
     for project in &projects {
-        let mounted = attach_project_sessions_from_store(&storage, project, browse).await?;
+        let mounted = match attach_project_sessions_from_store(&storage, project, browse).await {
+            Ok(mounted) => mounted,
+            Err(error) => {
+                eprintln!(
+                    "cowshed: skipping project {} during attach --all: {error}",
+                    project.repo_id
+                );
+                first_error.get_or_insert(error);
+                continue;
+            }
+        };
         if mounted.is_empty() {
             continue;
         }
@@ -2177,6 +2216,9 @@ async fn attach_store_wide(browse: bool) -> Result<StoreWideMounts<Vec<Workspace
         }
     }
     if attached.is_empty() {
+        if let Some(error) = first_error {
+            return Err(error);
+        }
         let unmounted = NativeGatewayInventory::new(storage.clone())
             .unmounted_mains()
             .await
@@ -2217,14 +2259,34 @@ async fn attach_project_sessions_from_store(
         })
         .collect::<Vec<_>>();
     let mut attached = Vec::with_capacity(targets.len());
+    let mut first_error = None;
     for target in targets {
-        let mut info = store_workspace_info(&layout, &target)?;
-        info.mount = substrate
-            .ensure_mounted(&target.workspace, MountIntent { browse })
-            .await
-            .map_err(attach_store_storage_error)?;
-        info.state = WorkspaceState::Attached;
-        attached.push(info);
+        let name = target.workspace.name();
+        let result = async {
+            let mut info = store_workspace_info(&layout, &target)?;
+            info.mount = substrate
+                .ensure_mounted(&target.workspace, MountIntent { browse })
+                .await
+                .map_err(attach_store_storage_error)?;
+            info.state = WorkspaceState::Attached;
+            Ok::<_, CowshedError>(info)
+        }
+        .await;
+        match result {
+            Ok(info) => attached.push(info),
+            Err(error) => {
+                eprintln!(
+                    "cowshed: skipping workspace {}/{name} during attach --all: {error}",
+                    project.repo_id
+                );
+                first_error.get_or_insert(error);
+            }
+        }
+    }
+    if attached.is_empty()
+        && let Some(error) = first_error
+    {
+        return Err(error);
     }
     Ok(attached)
 }
@@ -2298,8 +2360,22 @@ async fn detach_scoped_sessions(service: &mut dyn CliService) -> Result<()> {
     if targets.is_empty() {
         return Err(no_attached_sessions());
     }
+    let mut detached = false;
+    let mut first_error = None;
     for target in targets {
-        service.detach(target.workspace.as_str()).await?;
+        match service.detach(target.workspace.as_str()).await {
+            Ok(()) => detached = true,
+            Err(error) => {
+                eprintln!(
+                    "cowshed: skipping workspace {}/{} during detach: {error}",
+                    target.repo_id, target.workspace
+                );
+                first_error.get_or_insert(error);
+            }
+        }
+    }
+    if !detached && let Some(error) = first_error {
+        return Err(error);
     }
     Ok(())
 }
@@ -2312,8 +2388,19 @@ async fn detach_store_wide() -> Result<StoreWideMounts<()>> {
         .map_err(project_inventory_error)?;
     let mut detached = 0usize;
     let mut stale = Vec::new();
+    let mut first_error = None;
     for project in &projects {
-        let unmounted = detach_project_sessions_from_store(&storage, project).await?;
+        let unmounted = match detach_project_sessions_from_store(&storage, project).await {
+            Ok(unmounted) => unmounted,
+            Err(error) => {
+                eprintln!(
+                    "cowshed: skipping project {} during detach --all: {error}",
+                    project.repo_id
+                );
+                first_error.get_or_insert(error);
+                continue;
+            }
+        };
         if unmounted == 0 {
             continue;
         }
@@ -2323,6 +2410,9 @@ async fn detach_store_wide() -> Result<StoreWideMounts<()>> {
         }
     }
     if detached == 0 {
+        if let Some(error) = first_error {
+            return Err(error);
+        }
         return Err(no_attached_sessions());
     }
     Ok(StoreWideMounts { result: (), stale })
@@ -2352,13 +2442,31 @@ async fn detach_project_sessions_from_store(
         })
         .map(|derived| derived.workspace)
         .collect::<Vec<_>>();
+    let mut detached = 0;
+    let mut first_error = None;
     for target in &targets {
-        substrate
+        match substrate
             .unmount(target)
             .await
-            .map_err(detach_store_storage_error)?;
+            .map_err(detach_store_storage_error)
+        {
+            Ok(()) => detached += 1,
+            Err(error) => {
+                eprintln!(
+                    "cowshed: skipping workspace {}/{} during detach --all: {error}",
+                    project.repo_id,
+                    target.name()
+                );
+                first_error.get_or_insert(error);
+            }
+        }
     }
-    Ok(targets.len())
+    if detached == 0
+        && let Some(error) = first_error
+    {
+        return Err(error);
+    }
+    Ok(detached)
 }
 
 fn detach_store_storage_error(error: impl std::fmt::Display) -> CowshedError {
@@ -2516,6 +2624,7 @@ const fn gc_reason(reason: GcReason) -> &'static str {
         GcReason::OrphanStagingImage => "orphaned staging image",
         GcReason::OrphanStagingMetadata => "orphaned staging metadata",
         GcReason::OrphanStagingMount => "orphaned staging mountpoint",
+        GcReason::OrphanSessionImage => "orphaned session image without metadata",
         GcReason::OrphanMountpoint => "orphaned mountpoint",
         GcReason::ExpiredCheckpoint => "expired checkpoint",
     }
@@ -3603,12 +3712,16 @@ async fn diagnose_host() -> Result<HostDiagnosis> {
         // this guarantees one diagnostic per skipped registry entry rather than one per
         // derived view.
         match doctor_projects().await {
-            Ok((projects, mains, checkoutless)) => {
+            Ok((projects, mains, checkoutless, unreadable)) => {
                 diagnosis.findings.push(Finding {
                     code: "workspace-inventory".into(),
                     severity: FindingSeverity::Info,
-                    message: format!("{} adopted project(s) recorded", projects.len()),
-                    hint: if projects.is_empty() {
+                    message: format!(
+                        "{} readable adopted project(s) recorded; {} unreadable project(s)",
+                        projects.len(),
+                        unreadable.len()
+                    ),
+                    hint: if projects.is_empty() && unreadable.is_empty() {
                         "cowshed adopt <git-root>".into()
                     } else {
                         String::new()
@@ -3625,6 +3738,16 @@ async fn diagnose_host() -> Result<HostDiagnosis> {
                         .iter()
                         .map(|repo| no_adopted_checkout_finding(repo, store)),
                 );
+                diagnosis
+                    .findings
+                    .extend(unreadable.into_iter().map(|(repo, error)| Finding {
+                        code: "workspace-inventory".into(),
+                        severity: FindingSeverity::Error,
+                        message: format!("project {repo}: {error}"),
+                        hint:
+                            "repair this project's store records, then retry cowshed doctor".into(),
+                        path: Some(store.join(repo.as_str())),
+                    }));
             }
             Err(error) => diagnosis.findings.push(Finding {
                 code: "workspace-inventory".into(),

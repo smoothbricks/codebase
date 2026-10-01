@@ -454,6 +454,10 @@ The two overrides authorize different losses and neither substitutes for the oth
 | `--force`   | transient state: a dirty tree, an in-progress merge, a busy mount | the landed-ancestry gate |
 | `--abandon` | the landed-ancestry gate — commits `main` does not contain        | transient state          |
 
+`--force` stops that workspace's running jobs (TERM, then KILL after the grace period) before detaching; without it,
+removal lets the supervisor finish its active jobs. A leftover `.git/AUTO_MERGE` alone is not an in-progress operation
+and does not require `--force`.
+
 A dirty tree is a tracked change, or an untracked file that is not hidden, not ignored by main's current gitignore
 rules, and not held by main's checkout with the same content at the same path: an untracked file left in main arrives in
 every clone and is not the workspace's work.
@@ -478,6 +482,9 @@ Recover an abandoned bundle from main's repository, which holds its one prerequi
 ```sh
 git fetch <bundle> HEAD:refs/heads/recovered-raven
 ```
+
+Bundle verification uses a temporary bare repository. Interrupting `rm --abandon` removes that repository before the
+command exits; a retry revalidates any bundle already published.
 
 `cowshed rm main --restore` is the reverse of `adopt`: it puts the pre-adoption checkout back and unbinds the project.
 Plain `cowshed rm main` throws the warm main image away instead, and needs `--force`.
@@ -617,6 +624,9 @@ file. `attach` and `path` bring them back. `<ws>` detaches one session, resolved
 discovery. `--project` still selects the project. `--all` detaches every attached session workspace store-wide. Mains
 are always mounted and are never detach targets.
 
+The all-session forms continue after one workspace or project cannot mount or unmount, naming the skipped target on
+stderr; successful changes to other workspaces remain effective.
+
 ### `cowshed mount main --repo-id <owner/repo>`
 
 Mount main for the named project and print its mount path. Resolution reads store records — the repository binding and
@@ -711,11 +721,11 @@ next: cowshed exec raven -- <retry your command>
   its target is granted — grant the target, and the workspace reaches it through the link.
 - Filesystem grants take effect at the next `exec`: Seatbelt profiles are fixed at process launch, and every launch
   carries the current persisted grant snapshot.
-- `--deny-write` protects a path relative to the workspace root and everything below it. The
-  final Seatbelt rule overrides the workspace's broad write allow; link creation and parent
-  renames cannot bypass it. `cowshed grant --project-wide --deny-write .git/hooks .git/config`
-  puts the same restriction on main and every current and future workspace. Workspace grants
-  cannot remove a project deny. Set this from the trusted host, not an in-workspace job.
+- `--deny-write` protects a path relative to the workspace root and everything below it. The final Seatbelt rule
+  overrides the workspace's broad write allow; link creation and parent renames cannot bypass it.
+  `cowshed grant --project-wide --deny-write .git/hooks .git/config` puts the same restriction on main and every current
+  and future workspace. Workspace grants cannot remove a project deny. Set this from the trusted host, not an
+  in-workspace job.
 - `--egress <host>` is repeatable and admits one host through the gateway, intercepted, on the default ports (443 and
   80). Network reach is a separate decision from filesystem reach and a separately auditable one: the gateway records
   every admission in its Arrow audit telemetry ([telemetry.md](telemetry.md)). Holding a credential for a registry does
@@ -1056,6 +1066,11 @@ resolved. The project's gateway sessions are reconciled before each exec, shell 
 Deletes retired and orphaned images and stale mountpoint dirs, prunes expired checkpoints, and reports what it freed.
 Safe to run anytime; `rm`, `land`, and `restore` also run it opportunistically.
 
+An image under `sessions/` without its grants sidecar is skipped by other commands with a named warning; `doctor`
+reports it, and `gc` can reclaim it as an orphan after mount and lock checks. `gc` keeps going when an individual
+candidate cannot be reclaimed, names it as deferred on stderr and in the `deferred` JSON array, and reports only space
+actually freed by successful candidates.
+
 ### `cowshed doctor`
 
 Invariant checks: every image has a marker, every mount matches an image, grants files parse, caches volume and gateway
@@ -1063,6 +1078,9 @@ reachable, and git identity at the workspace mount root matches the checkout (`i
 apply under the mount root). Exit 0 when healthy; otherwise the code of the most severe finding (3/4/5). Stdout is
 `healthy` or `unhealthy`. Stderr is every finding, then the distinct `next:` commands those findings carry — findings
 first, hints after, never interleaved.
+
+Store-wide listing and diagnosis continue past an unreadable project's records: listing warns with the project name, and
+doctor records a finding for it while checking other projects.
 
 If a selected project's checks cannot run, doctor records an error finding named `project-checks-skipped`; it never
 turns missing evidence into `healthy: true`.

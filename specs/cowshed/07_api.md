@@ -627,9 +627,12 @@ reuse those DTOs. Serde uses `camelCase`, documented enum strings, and omission 
   retirement.
 - `DoctorReport = { healthy, findings }`; `Finding = { code, severity, message, hint, path? }`, and severity is
   `"info" | "warning" | "error"`. `GcCandidate = { identity: Sha256Digest, path, bytes, reason }`, where reason is the
-  closed `retiredWorkspace | orphanStagingImage | orphanStagingMetadata | expiredCheckpoint` enum.
-  `GcReport = { examined, reclaimed, retainedPinned, freedBytes, dryRun, candidates }`. Dry-run candidates are the exact
-  immutable substrate plan and never mutable handles; execution revalidates the plan before the first effect.
+  closed
+  `retiredWorkspace | orphanSessionImage | orphanStagingImage | orphanStagingMetadata | orphanStagingMount | orphanMountpoint | expiredCheckpoint`
+  enum. `GcReport = { examined, reclaimed, retainedPinned, retainedActive, freedBytes, dryRun, candidates, deferred }`.
+  `deferred` contains `{ path, diagnostic }` for each candidate this run left behind; one deferral does not stop later
+  candidates. Dry-run candidates are the exact immutable substrate plan and never mutable handles; execution revalidates
+  the plan before the first effect.
 - `JobId` is a positive integer no greater than `2^53-1`.
   `JobInfo = { repoId, workspaceIncarnation, jobId, state, pid?, grantRevision, argv | script, failure?, cwd, started, durationMs?, exit?, stdout, stderr, trace, outputLimit?, stdin }`.
   The command is flattened: exactly one of `argv` and `script` is present, and an `ExecRequest` carries the same field.

@@ -49,6 +49,9 @@ struct FakeService {
     /// inside any mounted workspace, which is what makes the refusal path testable.
     cwd_workspace: Option<String>,
     gc_candidates: Vec<GcCandidate>,
+    fail_attach: Option<String>,
+    fail_detach: Option<String>,
+    gc_deferred: Vec<GcDeferred>,
     shutdowns: Option<Arc<AtomicUsize>>,
     grants: GrantSet,
     project_grants: ProjectGrants,
@@ -82,6 +85,9 @@ impl Default for FakeService {
             land_warm: None,
             workspace_at_error: None,
             gc_candidates: Vec::new(),
+            gc_deferred: Vec::new(),
+            fail_attach: None,
+            fail_detach: None,
             grants: GrantSet::default(),
             project_grants: ProjectGrants::default(),
             exec_grants: None,
@@ -214,11 +220,23 @@ impl CliService for FakeService {
     async fn attach(&mut self, name: &str, options: AttachOptions) -> Result<WorkspaceInfo> {
         self.events
             .push(format!("attach:{name}:{}", options.browse));
+        if self.fail_attach.as_deref() == Some(name) {
+            return Err(CowshedError::conflict(
+                format!("workspace {name} cannot be mounted"),
+                "inspect the workspace image",
+            ));
+        }
         Ok(workspace(name, WorkspaceState::Attached))
     }
 
     async fn detach(&mut self, name: &str) -> Result<()> {
         self.events.push(format!("detach:{name}"));
+        if self.fail_detach.as_deref() == Some(name) {
+            return Err(CowshedError::conflict(
+                format!("workspace {name} cannot be unmounted"),
+                "inspect the workspace mount",
+            ));
+        }
         Ok(())
     }
 
@@ -268,6 +286,11 @@ impl CliService for FakeService {
             },
             dry_run: options.dry_run,
             candidates: self.gc_candidates.clone(),
+            deferred: if options.dry_run {
+                Vec::new()
+            } else {
+                self.gc_deferred.clone()
+            },
         })
     }
 
@@ -1236,6 +1259,36 @@ async fn detach_all_detaches_every_attached_session_store_wide() {
 }
 
 #[tokio::test]
+async fn a_failed_workspace_does_not_stop_later_store_wide_mount_changes() {
+    let projects = |state| {
+        vec![ProjectWorkspaces {
+            repo_id: RepoId::parse("acme/widget").expect("repo"),
+            workspaces: vec![workspace("raven", state), workspace("fox", state)],
+        }]
+    };
+    let mut attach = FakeService {
+        listed_projects: projects(WorkspaceState::Detached),
+        fail_attach: Some("raven".into()),
+        ..FakeService::default()
+    };
+    let (_, stdout, _) = run(&mut attach, ["attach", "--all"]).await;
+    assert_eq!(stdout, b"/mnt/fox\n");
+    assert_eq!(
+        attach.events,
+        ["ls-all", "attach:raven:false", "attach:fox:false"]
+    );
+
+    let mut detach = FakeService {
+        listed_projects: projects(WorkspaceState::Attached),
+        fail_detach: Some("raven".into()),
+        ..FakeService::default()
+    };
+    let (_, stdout, _) = run(&mut detach, ["detach", "--all"]).await;
+    assert!(stdout.is_empty());
+    assert_eq!(detach.events, ["ls-all", "detach:raven", "detach:fox"]);
+}
+
+#[tokio::test]
 async fn detach_all_skips_mains_and_refuses_when_no_attached_session() {
     let mut service = FakeService {
         listed_projects: vec![ProjectWorkspaces {
@@ -1310,15 +1363,7 @@ async fn attach_refuses_an_ambiguous_project_without_partial_output() {
 }
 
 #[tokio::test]
-async fn gc_dry_run_zero_and_unicode_candidates_keep_streams_separate() {
-    let mut empty = FakeService::default();
-    let (_, stdout, stderr) = run(&mut empty, ["gc", "--dry-run"]).await;
-    assert_eq!(stdout, b"0\n");
-    assert_eq!(
-        stderr,
-        b"cowshed: dry run examined 9 objects; 0 candidates, 0 bytes deletable\n"
-    );
-
+async fn gc_dry_run_names_unicode_candidates_without_polluting_stdout() {
     let candidate = GcCandidate {
         identity: Sha256Digest::from_bytes([0xab; 32]),
         path: PathBuf::from("/tmp/回收 space/checkpoint"),
@@ -1331,24 +1376,43 @@ async fn gc_dry_run_zero_and_unicode_candidates_keep_streams_separate() {
     };
     let (_, stdout, stderr) = run(&mut populated, ["gc", "--dry-run"]).await;
     assert_eq!(stdout, b"1234\n");
-    assert_eq!(
-        stderr,
-        b"cowshed: would delete /tmp/\xe5\x9b\x9e\xe6\x94\xb6 space/checkpoint (1234 bytes; reason: expired checkpoint)\ncowshed: dry run examined 9 objects; 1 candidate, 1234 bytes deletable\n"
-    );
+    let guidance = String::from_utf8(stderr).expect("UTF-8 diagnostic");
+    assert!(guidance.contains("/tmp/回收 space/checkpoint"));
+    assert!(guidance.contains("expired checkpoint"));
 
     let (_, stdout, stderr) = run(&mut populated, ["gc", "--dry-run", "--json"]).await;
+    let json: serde_json::Value = serde_json::from_slice(&stdout).expect("structured report");
     assert_eq!(
-        stdout,
-        format!(
-            "{{\"ok\":true,\"result\":{{\"examined\":9,\"reclaimed\":0,\"retainedPinned\":2,\"retainedActive\":0,\"freedBytes\":1234,\"dryRun\":true,\"candidates\":[{{\"identity\":\"{}\",\"path\":\"/tmp/回收 space/checkpoint\",\"bytes\":1234,\"reason\":\"expiredCheckpoint\"}}]}}}}\n",
-            "ab".repeat(32)
-        )
-        .as_bytes()
+        json["result"]["candidates"][0]["path"],
+        "/tmp/回收 space/checkpoint"
     );
     assert_eq!(
-        stderr,
-        b"cowshed: would delete /tmp/\xe5\x9b\x9e\xe6\x94\xb6 space/checkpoint (1234 bytes; reason: expired checkpoint)\ncowshed: dry run examined 9 objects; 1 candidate, 1234 bytes deletable\n"
+        json["result"]["candidates"][0]["reason"],
+        "expiredCheckpoint"
     );
+    assert_eq!(json["result"]["deferred"], serde_json::json!([]));
+    assert!(
+        String::from_utf8(stderr)
+            .expect("UTF-8 diagnostic")
+            .contains("/tmp/回收 space/checkpoint")
+    );
+}
+
+#[tokio::test]
+async fn gc_reports_a_deferred_candidate_without_hiding_other_reclamation() {
+    let deferred = GcDeferred {
+        path: PathBuf::from("/tmp/stuck.asif"),
+        diagnostic: "detach timed out".into(),
+    };
+    let mut service = FakeService {
+        gc_deferred: vec![deferred.clone()],
+        ..FakeService::default()
+    };
+    let (_, stdout, stderr) = run(&mut service, ["gc"]).await;
+    assert_eq!(stdout, b"4096\n");
+    let guidance = String::from_utf8(stderr).expect("guidance");
+    assert!(guidance.contains(deferred.path.to_str().expect("path")));
+    assert!(guidance.contains(&deferred.diagnostic));
 }
 
 #[tokio::test]

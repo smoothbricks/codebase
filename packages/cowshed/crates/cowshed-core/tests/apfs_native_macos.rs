@@ -11,8 +11,8 @@ use std::time::{Duration, Instant, SystemTime};
 use rcgen::{KeyPair, PKCS_ECDSA_P256_SHA256};
 
 use cowshed_core::apfs::{
-    CommandOutput, CommandRequest, CommandRunError, CommandRunner, CreateImageRequest,
-    DetachIntent, MountAccess,
+    CommandOutput, CommandRequest, CommandRunError, CommandRunFailure, CommandRunner,
+    CreateImageRequest, DetachIntent, MountAccess,
 };
 use cowshed_core::metadata::{
     DetachedWorkspaceMetadata, GrantSet, ImageCapacity, MACOS_PORT_MIN, NEW_PORT_BLOCK_SIZE,
@@ -160,6 +160,27 @@ impl CommandRunner for RecordingRunner {
         } else {
             Ok(self.inventory.respond(request))
         }
+    }
+}
+#[derive(Default)]
+struct DeadlineFirstInventoryRunner(AtomicUsize);
+
+impl CommandRunner for DeadlineFirstInventoryRunner {
+    fn run(&self, request: &CommandRequest) -> Result<CommandOutput, CommandRunError> {
+        let inventory = request.program == Path::new("/usr/bin/hdiutil")
+            && request.args.len() == 2
+            && request.args[0] == "info"
+            && request.args[1] == "-plist";
+        if !inventory {
+            return Ok(CommandOutput::success([]));
+        }
+        if self.0.fetch_add(1, Ordering::SeqCst) == 0 {
+            return Err(CommandRunError {
+                request: request.clone(),
+                failure: CommandRunFailure::Deadline(Duration::from_secs(120)),
+            });
+        }
+        Ok(CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY))
     }
 }
 
@@ -864,6 +885,311 @@ fn sparse_images_and_their_sidecars_are_invisible_to_recovery_listing_and_gc() {
         );
     }
     assert_eq!(runner.calls(), 0, "nothing is attached to look at them");
+}
+
+#[test]
+fn listing_skips_sidecarless_session_images_that_gc_names_and_reclaims() {
+    let fixture = Fixture::new("orphan-session-images");
+    let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
+    std::fs::create_dir_all(&layout.project().sessions).expect("sessions directory");
+    let main = layout.main_image().expect("main");
+    create_image(main.image());
+
+    let orphan_asif = layout.project().sessions.join("orphan-asif.asif");
+    std::fs::write(&orphan_asif, b"fixture").expect("sidecarless ASIF image");
+    let orphan_sparseimage = layout
+        .project()
+        .sessions
+        .join("orphan-sparseimage.sparseimage");
+    std::fs::write(&orphan_sparseimage, b"legacy image").expect("legacy sparseimage");
+
+    let published_name = WorkspaceName::session("published").expect("workspace");
+    let published = layout
+        .session_image(&published_name)
+        .expect("published image");
+    create_image(published.image());
+    let mut published_metadata = metadata();
+    set_metadata_workspace(&mut published_metadata, published_name);
+    published_metadata
+        .write_for_image(published.image())
+        .expect("published sidecar");
+
+    let host = native_host(&fixture, RecordingRunner::default());
+    let config = fixture.config();
+    let listed = host.list(&repo()).expect("sidecarless images are skipped");
+    assert_eq!(listed.len(), 2);
+    assert!(listed.iter().any(|fact| fact.workspace.name().is_main()));
+    assert!(
+        listed
+            .iter()
+            .any(|fact| fact.workspace.name().as_str() == "published")
+    );
+
+    let plan = host.preview_gc(&config, &repo()).expect("orphan plan");
+    for orphan in [&orphan_asif, &orphan_sparseimage] {
+        assert!(
+            plan.candidates().iter().any(|candidate| {
+                candidate.path() == orphan.as_path()
+                    && candidate.reason() == StorageGcReason::OrphanSessionImage
+            }),
+            "doctor-facing GC candidates name sidecarless images: {}",
+            orphan.display()
+        );
+    }
+
+    let report = host
+        .execute_gc(&config, plan)
+        .expect("reclaim sidecarless images");
+    assert_eq!(report.reclaimed, 2);
+    assert!(report.deferred.is_empty());
+    assert!(!orphan_asif.exists());
+    assert!(!orphan_sparseimage.exists());
+    assert!(published.image().exists());
+    assert!(sidecar_path(published.image()).exists());
+}
+
+#[test]
+fn malformed_session_sidecar_is_not_treated_as_a_missing_sidecar_orphan() {
+    let fixture = Fixture::new("malformed-session-sidecar");
+    let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
+    let image = layout.project().sessions.join("corrupt.asif");
+    create_image(&image);
+    std::fs::write(sidecar_path(&image), b"{ malformed").expect("malformed sidecar");
+    let host = native_host(&fixture, RecordingRunner::default());
+
+    assert!(
+        host.list(&repo()).is_err(),
+        "a present malformed grants sidecar keeps its integrity refusal"
+    );
+    let plan = host
+        .preview_gc(&fixture.config(), &repo())
+        .expect("the malformed image is not an orphan candidate");
+    assert!(
+        !plan
+            .candidates()
+            .iter()
+            .any(|candidate| candidate.path() == image.as_path())
+    );
+    assert!(image.exists());
+    assert!(sidecar_path(&image).exists());
+}
+
+#[test]
+fn gc_reports_item_local_deferrals_and_reclaims_later_session_images() {
+    use std::os::fd::AsRawFd;
+    let fixture = Fixture::new("gc-session-deferrals");
+    let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
+    std::fs::create_dir_all(&layout.project().sessions).expect("sessions directory");
+    let mounted_image = layout.project().sessions.join("a-mounted.sparseimage");
+    std::fs::write(&mounted_image, b"still mounted").expect("mounted sparseimage");
+    let later_image = layout.project().sessions.join("z-reclaim.asif");
+    std::fs::write(&later_image, b"fixture").expect("sidecarless later image");
+
+    let locked_name = WorkspaceName::session("b-locked").expect("workspace");
+    let locked_paths = layout
+        .session_image(&locked_name)
+        .expect("locked image paths");
+    std::fs::write(locked_paths.image(), b"fixture").expect("sidecarless locked image");
+    let lock_file = OpenOptions::new()
+        .create_new(true)
+        .read(true)
+        .write(true)
+        .open(locked_paths.lock())
+        .expect("workspace lifecycle lock");
+    assert_eq!(
+        unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0,
+        "hold the workspace lifecycle lock"
+    );
+
+    use std::os::unix::fs::symlink;
+    let symlink_image = layout.project().sessions.join("y-symlink.sparseimage");
+    let symlink_target = fixture.root.join("external.sparseimage");
+    std::fs::write(&symlink_target, b"outside image").expect("external image");
+    symlink(&symlink_target, &symlink_image).expect("legacy image symlink");
+    let attached_image = layout.project().sessions.join("c-attached.sparseimage");
+    std::fs::write(&attached_image, b"attached image").expect("attached sparseimage");
+
+    let mount_point = layout.project().mount_root.join("a-mounted");
+    std::fs::create_dir_all(&mount_point).expect("mounted workspace path");
+    let kernel = FakeKernelMountSource::default();
+    kernel.set(vec![KernelMountSnapshot::new(
+        1,
+        mount_point.clone(),
+        "/dev/disk9",
+        true,
+        true,
+    )]);
+    let runner = RecordingRunner::default();
+    runner
+        .inventory
+        .0
+        .lock()
+        .expect("fake inventory")
+        .push(attached_image.to_string_lossy().into_owned());
+
+    let orphan_mountpoint = layout.project().mount_root.join("stray");
+    std::fs::create_dir_all(&orphan_mountpoint).expect("orphan mountpoint");
+    let kept_work = orphan_mountpoint.join("unsaved.rs");
+    std::fs::write(&kept_work, b"unsaved work").expect("visible user work");
+
+    let config = fixture.config();
+    let host = MacOsApfsExecutionHost::with_mount_source(runner, config.clone(), kernel)
+        .expect("native APFS host");
+    let plan = host.preview_gc(&config, &repo()).expect("GC plan");
+    assert!(plan.candidates().iter().any(|candidate| {
+        candidate.path() == mounted_image.as_path()
+            && candidate.reason() == StorageGcReason::OrphanSessionImage
+    }));
+    assert!(plan.candidates().iter().any(|candidate| {
+        candidate.path() == later_image.as_path()
+            && candidate.reason() == StorageGcReason::OrphanSessionImage
+    }));
+    assert!(plan.candidates().iter().any(|candidate| {
+        candidate.path() == attached_image.as_path()
+            && candidate.reason() == StorageGcReason::OrphanSessionImage
+    }));
+    assert!(
+        !plan
+            .candidates()
+            .iter()
+            .any(|candidate| candidate.path() == locked_paths.image()),
+        "an orphan image under its workspace lock is not a candidate"
+    );
+    assert!(
+        !plan
+            .candidates()
+            .iter()
+            .any(|candidate| candidate.path() == symlink_image.as_path()),
+        "a symlink is never an orphan image candidate"
+    );
+
+    let report = host.execute_gc(&config, plan).expect("deferred GC sweep");
+    assert_eq!(report.reclaimed, 1);
+    assert_eq!(report.deferred.len(), 3);
+    assert_eq!(report.retained_active, 1);
+    assert!(report.deferred.iter().any(|candidate| {
+        candidate.path == mounted_image && candidate.diagnostic.contains("mounted")
+    }));
+    assert!(report.deferred.iter().any(|candidate| {
+        candidate.path == attached_image && candidate.diagnostic.contains("attached")
+    }));
+    assert!(report.deferred.iter().any(|candidate| {
+        candidate.path == orphan_mountpoint && candidate.diagnostic.contains("unsaved.rs")
+    }));
+    assert!(mounted_image.exists(), "mounted image is never deleted");
+    assert!(
+        !later_image.exists(),
+        "a deferred item does not stop later reclamation"
+    );
+    assert!(kept_work.exists(), "visible mountpoint work is preserved");
+    assert!(
+        attached_image.exists(),
+        "an attached image is never deleted"
+    );
+    assert!(
+        locked_paths.image().exists(),
+        "an active lock protects its image"
+    );
+    assert!(
+        std::fs::symlink_metadata(&symlink_image)
+            .expect("symlink remains")
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(
+        std::fs::read(&symlink_target).expect("external image remains"),
+        b"outside image"
+    );
+}
+
+#[test]
+fn gc_defers_an_inventory_deadline_and_reclaims_later_candidates() {
+    let fixture = Fixture::new("gc-inventory-deadline");
+    let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
+    std::fs::create_dir_all(&layout.project().sessions).expect("sessions directory");
+    let deferred_image = layout.project().sessions.join("a-deferred.sparseimage");
+    std::fs::write(&deferred_image, b"inventory timed out").expect("deferred image");
+    let later_image = layout.project().sessions.join("z-reclaim.sparseimage");
+    std::fs::write(&later_image, b"later candidate").expect("later image");
+    let config = fixture.config();
+    let host = MacOsApfsExecutionHost::with_mount_source(
+        DeadlineFirstInventoryRunner::default(),
+        config.clone(),
+        FakeKernelMountSource::default(),
+    )
+    .expect("native APFS host");
+    let plan = host.preview_gc(&config, &repo()).expect("GC plan");
+
+    let report = host.execute_gc(&config, plan).expect("item-local deadline");
+    assert_eq!(report.reclaimed, 1);
+    assert_eq!(report.deferred.len(), 1);
+    assert_eq!(report.deferred[0].path, deferred_image);
+    assert!(
+        report.deferred[0]
+            .diagnostic
+            .contains("did not finish within 120s"),
+        "{}",
+        report.deferred[0].diagnostic
+    );
+    assert!(deferred_image.exists());
+    assert!(!later_image.exists());
+}
+
+#[test]
+fn gc_stale_orphan_image_identity_preserves_same_size_replacement() {
+    let fixture = Fixture::new("gc-orphan-identity");
+    let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
+    std::fs::create_dir_all(&layout.project().sessions).expect("sessions directory");
+    let image = layout.project().sessions.join("orphan.asif");
+    let later = layout.project().sessions.join("later.asif");
+    std::fs::write(&image, b"fixture").expect("sidecarless orphan image");
+    std::fs::write(&later, b"fixture").expect("later orphan image");
+    let config = fixture.config();
+    let host = native_host(&fixture, RecordingRunner::default());
+    let plan = host.preview_gc(&config, &repo()).expect("GC plan");
+    let original = std::fs::metadata(&image).expect("original metadata");
+
+    let replacement = layout.project().sessions.join(".replacement");
+    std::fs::write(&replacement, b"replace").expect("same-sized replacement");
+    let replacement_metadata = {
+        let file = OpenOptions::new()
+            .write(true)
+            .open(&replacement)
+            .expect("replacement file");
+        file.set_times(
+            FileTimes::new().set_modified(original.modified().expect("original timestamp")),
+        )
+        .expect("preserve replacement timestamp");
+        std::fs::metadata(&replacement).expect("replacement metadata")
+    };
+    assert_eq!(replacement_metadata.len(), original.len());
+    assert_eq!(replacement_metadata.blocks(), original.blocks());
+    assert_eq!(
+        replacement_metadata.modified().unwrap(),
+        original.modified().unwrap()
+    );
+    assert_ne!(replacement_metadata.ino(), original.ino());
+    std::fs::rename(&replacement, &image).expect("replace orphan image");
+
+    let error = host
+        .execute_gc(&config, plan)
+        .expect_err("a same-path replacement makes the GC plan stale");
+    assert!(matches!(error, ApfsStorageError::GcPlanStale));
+    assert_eq!(
+        std::fs::metadata(&image)
+            .expect("replacement remains")
+            .ino(),
+        replacement_metadata.ino()
+    );
+    assert_eq!(
+        std::fs::read(&image).expect("replacement bytes"),
+        b"replace"
+    );
+    assert!(
+        later.exists(),
+        "a stale identity is rejected before mutation"
+    );
 }
 
 #[test]
