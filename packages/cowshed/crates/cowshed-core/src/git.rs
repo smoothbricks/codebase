@@ -2729,8 +2729,7 @@ pub fn git_spawn_error(error: &std::io::Error) -> CowshedError {
 async fn run_git_at_with_objects<I, S>(
     root: &Path,
     alternate_objects: Option<&Path>,
-    #[cfg(target_os = "macos")]
-    writable: Option<&Path>,
+    #[cfg(target_os = "macos")] writable: Option<&Path>,
     args: I,
 ) -> Result<Output>
 where
