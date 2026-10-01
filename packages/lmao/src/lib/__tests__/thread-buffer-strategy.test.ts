@@ -9,10 +9,15 @@ import {
   ENTRY_TYPE_SPAN_START,
   THREAD_ATTRIBUTE_KINDS,
 } from '../schema/systemSchema.js';
-import type { ThreadBufferStrategy } from '../ThreadBufferStrategy.js';
+import { ThreadBufferStrategy, type ThreadSpanBufferProvider } from '../ThreadBufferStrategy.js';
 import { createTraceRoot } from '../traceRoot.node.js';
 import { TestTracer } from '../tracers/TestTracer.js';
-import { createThreadBufferStrategy, type ThreadSpanBufferRuntime } from '../wasm/threadSpanBufferHost.js';
+import type { ThreadSpanBufferBinding } from '../wasm/threadSpanBuffer.js';
+import {
+  createThreadBufferStrategy,
+  createThreadSpanBufferRuntime,
+  type ThreadSpanBufferRuntime,
+} from '../wasm/threadSpanBufferHost.js';
 import { isThreadSpanView } from '../wasm/threadSpanView.js';
 import { runtimeModuleGraph } from './moduleGraph.js';
 
@@ -22,6 +27,69 @@ const schema = defineLogSchema({
 });
 
 const opContext = defineOpContext({ logSchema: schema });
+
+/**
+ * allocator.wasm's row stores behind a backend that refuses to open any span
+ * named in `refused`, the way a host store refuses a span it cannot place.
+ * Every lifecycle call that reaches a store is recorded by the span it names,
+ * so a test can say exactly what a refused span sent.
+ */
+function refusingBackend(runtime: ThreadSpanBufferRuntime, refused: ReadonlySet<string>) {
+  const calls: string[] = [];
+  const stores: ThreadSpanBufferBinding[] = [];
+  const provider: ThreadSpanBufferProvider = {
+    createBinding(threadId, capacity, schema) {
+      const store = runtime.createBinding(threadId, capacity, schema);
+      stores.push(store);
+      const names = new Map<number, string>();
+      return {
+        capacity: store.capacity,
+        free: () => store.free(),
+        reset: () => store.reset(),
+        intern(text) {
+          const ordinal = store.intern(text);
+          names.set(ordinal, text);
+          return ordinal;
+        },
+        openSpan(traceId, parentThreadId, parentSpanId, nameOrdinal, timestamp, line) {
+          const name = names.get(nameOrdinal) ?? '';
+          calls.push(`open ${name}`);
+          if (refused.has(name)) return 0n;
+          return store.openSpan(traceId, parentThreadId, parentSpanId, nameOrdinal, timestamp, line);
+        },
+        openSpanStatic(traceId, parentThreadId, parentSpanId, nameId, timestamp, line) {
+          calls.push(`open static ${nameId}`);
+          return store.openSpanStatic(traceId, parentThreadId, parentSpanId, nameId, timestamp, line);
+        },
+        end(spanId, entryType, timestamp) {
+          calls.push(`end ${spanId}`);
+          return store.end(spanId, entryType, timestamp);
+        },
+        appendLog(spanId, entryType, messageOrdinal, timestamp, line) {
+          calls.push(`log ${spanId}`);
+          return store.appendLog(spanId, entryType, messageOrdinal, timestamp, line);
+        },
+        appendLogStatic(spanId, entryType, messageId, timestamp, line) {
+          calls.push(`log ${spanId}`);
+          return store.appendLogStatic(spanId, entryType, messageId, timestamp, line);
+        },
+        setScope(spanId, ordinal, kind, value) {
+          calls.push(`scope ${spanId}`);
+          return store.setScope(spanId, ordinal, kind, value);
+        },
+        setCompletionMessage(spanId, message) {
+          calls.push(`complete ${spanId}`);
+          return store.setCompletionMessage(spanId, message);
+        },
+        attributeCells: (block) => store.attributeCells(block),
+      };
+    },
+    toArrowTable() {
+      throw new Error('these tests read the stores, never a conversion');
+    },
+  };
+  return { provider, calls, stores };
+}
 
 describe('ThreadBufferStrategy', () => {
   let strategy: ThreadBufferStrategy<typeof schema, ThreadSpanBufferRuntime>;
@@ -210,5 +278,117 @@ describe('ThreadBufferStrategy', () => {
     const root = tracer.rootBuffers[tracer.rootBuffers.length - 1];
     if (!isThreadSpanView(root)) throw new Error('expected a thread-lane span');
     expect(reclaiming.provider.readMessage(root.binding, root.startRow)).toBe('kept-name');
+  });
+});
+
+describe('a span the row store refuses to open', () => {
+  let runtime: ThreadSpanBufferRuntime;
+
+  beforeAll(async () => {
+    runtime = await createThreadSpanBufferRuntime();
+  });
+
+  it('runs its body, answers the body its own result, and leaves the store as it was', () => {
+    const backend = refusingBackend(runtime, new Set(['refused']));
+    const strategy = ThreadBufferStrategy.fromProvider<typeof schema, ThreadSpanBufferProvider>(backend.provider, {
+      capacity: 8,
+    });
+    const tracer = new TestTracer(opContext, { bufferStrategy: strategy, createTraceRoot });
+    // A span the store did open, holding rows 0 and 1: the rows a span with no
+    // rows of its own would land on if it wrote anyway.
+    tracer.trace_fn(0, 'kept', {}, (ctx) => {
+      ctx.tag.count(7);
+      return ctx.ok(1);
+    });
+    const kept = tracer.rootBuffers[0];
+    const store = backend.stores[0];
+    if (!isThreadSpanView(kept) || store === undefined) throw new Error('expected a thread-lane span in one store');
+    const count = kept.ordinals.get('count');
+    if (count === undefined) throw new Error('missing schema field count');
+    const rows = runtime.rowCount(store);
+    backend.calls.length = 0;
+
+    const result = tracer.trace_fn(0, 'refused', {}, (ctx) => {
+      ctx.tag.count(99);
+      ctx.log.info('dropped').count(5).user('ada');
+      ctx.setScope({ user: 'scoped' });
+      ctx.span('child', (child) => {
+        child.tag.count(98);
+        child.log.info('nested');
+        return child.ok(2);
+      });
+      return ctx.ok('own');
+    });
+
+    expect(result).toBeInstanceOf(Ok);
+    expect(result.value).toBe('own');
+    // The one refused open is all that crossed: no row, end, scope or
+    // completion for a span the store holds no record of, and its child was
+    // never offered as a root of its own.
+    expect(backend.calls).toEqual(['open refused']);
+    expect(runtime.rowCount(store)).toBe(rows);
+    const tag = runtime.readAttr(store, kept.startRow, count);
+    expect(new Float64Array(new BigUint64Array([tag?.value ?? 0n]).buffer)[0]).toBe(7);
+    expect(strategy.refusedSpans).toBe(1);
+
+    // The store is not wedged: the next root opens and ends as any other.
+    backend.calls.length = 0;
+    tracer.trace_fn(0, 'after', {}, (ctx) => ctx.ok(3));
+    const after = tracer.rootBuffers[tracer.rootBuffers.length - 1];
+    if (!isThreadSpanView(after)) throw new Error('expected a thread-lane span');
+    expect(backend.calls).toEqual(['open after', `end ${after.spanId}`]);
+    expect(strategy.refusedSpans).toBe(1);
+  });
+
+  it("answers an async body's result, and lets the body's own throw through unchanged", async () => {
+    const backend = refusingBackend(runtime, new Set(['refused']));
+    const strategy = ThreadBufferStrategy.fromProvider<typeof schema, ThreadSpanBufferProvider>(backend.provider, {
+      capacity: 8,
+    });
+    const tracer = new TestTracer(opContext, { bufferStrategy: strategy, createTraceRoot });
+
+    const result = await tracer.trace('refused', async (ctx) => {
+      await Promise.resolve();
+      ctx.log.info('after the await').count(1);
+      return ctx.ok('own');
+    });
+    expect(result.value).toBe('own');
+
+    expect(() =>
+      tracer.trace_fn(0, 'refused', {}, () => {
+        throw new Error('the body failed');
+      }),
+    ).toThrow('the body failed');
+    expect(backend.calls).toEqual(['open refused', 'open refused']);
+    expect(strategy.refusedSpans).toBe(2);
+  });
+
+  it('drops the refused child and everything under it, and its parent writes on', async () => {
+    const backend = refusingBackend(runtime, new Set(['refused-child']));
+    const strategy = ThreadBufferStrategy.fromProvider<typeof schema, ThreadSpanBufferProvider>(backend.provider, {
+      capacity: 8,
+    });
+    const tracer = new TestTracer(opContext, { bufferStrategy: strategy, createTraceRoot });
+
+    const result = await tracer.trace('parent', async (ctx) => {
+      const child = await ctx.span('refused-child', async (refused) => {
+        await refused.span('grandchild', (grandchild) => grandchild.ok(1));
+        return refused.ok('child-own');
+      });
+      ctx.log.info('parent goes on');
+      if (!(child instanceof Ok)) throw new Error('the refused child answered no Ok');
+      return ctx.ok(child.value);
+    });
+
+    expect(result.value).toBe('child-own');
+    const parent = tracer.rootBuffers[0];
+    if (!isThreadSpanView(parent)) throw new Error('expected a thread-lane span');
+    expect(backend.calls).toEqual([
+      'open parent',
+      'open refused-child',
+      `log ${parent.spanId}`,
+      `end ${parent.spanId}`,
+    ]);
+    expect(strategy.refusedSpans).toBe(1);
   });
 });

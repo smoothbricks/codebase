@@ -58,12 +58,12 @@ export class ThreadBufferStrategy<
   readonly threadId: bigint;
   private readonly cells = new WeakMap<LogSchema, ThreadSpanCells>();
   /**
-   * Bindings reachable for `reset`. The WeakMap above is the lookup; this is
-   * the iteration order, and it is what makes the row store releasable — a
-   * store outlives every span written through it, so without an explicit
-   * reset a long-lived thread grows its row store without bound.
+   * Stores reachable for `reset` and `refusedSpans`. The WeakMap above is the
+   * lookup; this is the iteration order, and it is what makes the row store
+   * releasable — a store outlives every span written through it, so without an
+   * explicit reset a long-lived thread grows its row store without bound.
    */
-  private readonly liveBindings: ThreadSpanBufferBinding[] = [];
+  private readonly stores: ThreadSpanCells[] = [];
 
   private constructor(provider: P, capacity: number, threadId: bigint) {
     this.provider = provider;
@@ -90,8 +90,19 @@ export class ThreadBufferStrategy<
     const binding = this.provider.createBinding(this.threadId, this.capacity, schema);
     const created = new ThreadSpanCells(binding);
     this.cells.set(schema, created);
-    this.liveBindings.push(binding);
+    this.stores.push(created);
     return created;
+  }
+
+  /**
+   * Spans this strategy's row stores refused to open. A refused span still
+   * runs its body and answers its result; it writes nothing, and nothing under
+   * it reaches a store, so a host reads here how many subtrees its trace lacks.
+   */
+  get refusedSpans(): number {
+    let refused = 0;
+    for (const store of this.stores) refused += store.refusedSpans;
+    return refused;
   }
 
   createSpanBuffer(
@@ -155,7 +166,7 @@ export class ThreadBufferStrategy<
 
   /** Release every row and span on this thread, keeping interned vocabularies. */
   reset(): void {
-    for (const binding of this.liveBindings) {
+    for (const { binding } of this.stores) {
       if (binding.reset() !== THREAD_SPAN_BUFFER_OK) {
         throw new Error('thread_span_buffer_reset failed');
       }

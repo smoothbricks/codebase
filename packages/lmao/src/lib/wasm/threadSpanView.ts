@@ -81,6 +81,27 @@ const NULL_SINK = new Uint8Array(NULL_LANE_BYTES);
  */
 const LOG_STAMP_REFRESH = 16;
 
+/**
+ * The row a span that holds none writes to: no store issues it, and
+ * {@link ThreadSpanView.storeCell} lands nothing there. A view's rows are this
+ * until its store opens the span, and stay this if the store refuses it.
+ */
+const NO_ROW = -1;
+
+/** The store has not been asked yet: a span opens on its first write. */
+const SPAN_UNOPENED = 0;
+/** The store opened the span; its rows and its span id are the store's. */
+const SPAN_OPEN = 1;
+/**
+ * The store refused the span, or refused the span it would hang from. It holds
+ * no rows and no span id, so it writes nothing for the rest of its life: no
+ * cell, and no lifecycle call that would name a span the store has no record of.
+ */
+const SPAN_REFUSED = 2;
+
+/** Where a view's span stands with its row store. */
+export type ThreadSpanState = typeof SPAN_UNOPENED | typeof SPAN_OPEN | typeof SPAN_REFUSED;
+
 const bits = new DataView(new ArrayBuffer(8));
 
 function f64Bits(value: number): bigint {
@@ -104,9 +125,18 @@ interface CellViews {
  * value words followed by the validity bitmap. A value store plus one validity
  * bit is the whole write — no call into the store, no second copy of the value.
  * The store reads the same words when it converts to Arrow.
+ *
+ * It is every view's handle on that one store, so it also keeps the store's
+ * one count a view writes: the spans the store refused to open.
  */
 export class ThreadSpanCells {
   readonly binding: ThreadSpanBufferBinding;
+  /**
+   * Spans this store refused to open. Each wrote nothing, and nothing under it
+   * was offered to the store, so one count is one subtree missing from it.
+   * A host reads the sum through `ThreadBufferStrategy.refusedSpans`.
+   */
+  refusedSpans = 0;
   private readonly capacity: number;
   private readonly stride: number;
   private readonly blocks: (CellViews | undefined)[] = [];
@@ -251,12 +281,12 @@ export class ThreadSpanView {
   readonly fields: ReadonlyMap<string, ThreadAttributeField>;
 
   spanId = 0;
-  startRow = 0;
-  completionRow = 1;
-  lastRow = 0;
+  startRow = NO_ROW;
+  completionRow = NO_ROW;
+  lastRow = NO_ROW;
   pendingLine = 0;
   pendingEntryType: number | undefined;
-  opened = false;
+  state: ThreadSpanState = SPAN_UNOPENED;
   readonly fakeToReal = new Map<number, number>();
 
   /**
@@ -379,7 +409,7 @@ export class ThreadSpanView {
 
   private commitStaticLog(fakeIndex: number, vocabularyId: number): void {
     if (this.fakeToReal.get(fakeIndex) !== undefined) return;
-    if (!this.opened) this.openSpan(this._spanName ?? 'span');
+    if (!this.writable()) return;
     const entryType = this.pendingEntryType ?? 8;
     this.pendingEntryType = undefined;
     const timestamp = this.logTimestamp();
@@ -496,15 +526,35 @@ export class ThreadSpanView {
   }
 
   beginLog(entryType: number): number {
-    if (!this.opened) this.openSpan(this._spanName ?? 'span');
+    if (this.state === SPAN_UNOPENED) this.openSpan(this._spanName ?? 'span');
     this.pendingEntryType = entryType;
     const fake = this._writeIndex;
     this._writeIndex = fake + 1;
     return fake;
   }
 
+  /**
+   * Open the span if nothing has yet, and answer whether it holds rows to
+   * write: false once its store refused it.
+   */
+  writable(): boolean {
+    if (this.state === SPAN_UNOPENED) this.openSpan(this._spanName ?? 'span');
+    return this.state === SPAN_OPEN;
+  }
+
   openSpan(name: string | number): void {
-    if (this.opened) return;
+    if (this.state !== SPAN_UNOPENED) return;
+    // Writer indices 0 and 1 are the lifecycle pair whether or not the store
+    // opens the span, so a refused span's log rows never alias them.
+    this._writeIndex = 2;
+    // A child of a refused span has no span to hang from. Offered with parent
+    // 0 it would open as a root, which a host store parents on whatever it
+    // roots unattributed spans on — so it is not offered at all.
+    const parent = this._parent;
+    if (parent !== undefined && requireThreadSpanView(parent).state === SPAN_REFUSED) {
+      this.state = SPAN_REFUSED;
+      return;
+    }
     const timestamp = this.boundaryTimestamp();
     const label = typeof name === 'string' ? name : String(name);
     const nameId = this.binding.intern(label);
@@ -516,22 +566,30 @@ export class ThreadSpanView {
       timestamp,
       this.pendingLine,
     );
-    if (packed === 0n) throw new Error('thread_span_buffer_open_span failed');
+    if (packed === 0n) {
+      // A refused open is the store's operational answer — a host that cannot
+      // place the span, a store that is full — not a bug in the code being
+      // traced, and a trace must not fail what it traces. So the span writes
+      // nothing, the body runs on, and the store's refusal is counted where a
+      // host reads it.
+      this.state = SPAN_REFUSED;
+      this.cells.refusedSpans += 1;
+      return;
+    }
     this.spanId = Number(packed >> 32n);
     this.startRow = Number(packed & 0xffffffffn);
     this.completionRow = this.startRow + 1;
     this.lastRow = this.startRow;
-    this._writeIndex = 2;
     this.timestamp[0] = timestamp;
     this.entry_type[0] = 1;
     this.line_values[0] = this.pendingLine;
     this._spanName = name;
-    this.opened = true;
+    this.state = SPAN_OPEN;
     this._stats.spansCreated += 1;
   }
 
   end(entryType: number): void {
-    if (!this.opened) this.openSpan(this._spanName ?? 'span');
+    if (!this.writable()) return;
     const timestamp = this.boundaryTimestamp();
     // The tracer's entry type goes through verbatim. Folding EXCEPTION onto
     // the error path recorded a thrown bug as a handled failure, which is the
@@ -555,7 +613,7 @@ export class ThreadSpanView {
     // A tag can be the span's first write (ctx.tag before any log). The row
     // store has no start row for a span it has not opened, so opening here
     // mirrors commitLog's lazy open rather than making order significant.
-    if (!this.opened) this.openSpan(this._spanName ?? 'span');
+    if (!this.writable()) return this;
     this.storeCell(field, this.startRow, value);
     return this;
   }
@@ -563,9 +621,10 @@ export class ThreadSpanView {
   /**
    * Store one attribute value into the row store's cell for `row`: a TypedArray
    * store and a validity bit, nothing crossing the binding except a warm-miss
-   * intern of a text value.
+   * intern of a text value. A span that holds no rows stores nothing.
    */
   storeCell(field: ThreadAttributeField, row: number, value: unknown): void {
+    if (row === NO_ROW) return;
     switch (field.kind) {
       case KIND_NUMBER:
         if (typeof value !== 'number') throw new TypeError(`${field.name} expects number`);
@@ -586,12 +645,14 @@ export class ThreadSpanView {
 
   syncScope(attributes: object): void {
     const next: Record<string, unknown> = { ...this._scopeValues };
+    // Only a span the store opened has a scope there to set.
+    const scoped = this.state === SPAN_OPEN;
     for (const key of Object.keys(attributes)) {
       const value = Reflect.get(attributes, key);
       if (value === null) delete next[key];
       else if (value !== undefined) next[key] = value;
       const field = this.fields.get(key);
-      if (field === undefined || value === undefined) continue;
+      if (!scoped || field === undefined || value === undefined) continue;
       if (value === null) {
         this.binding.setScope(this.spanId, field.ordinal, 0, 0n);
         continue;
@@ -602,23 +663,18 @@ export class ThreadSpanView {
   }
 
   line(pos: number, val: number): this {
-    if (!this.opened) this.pendingLine = val;
+    if (this.state === SPAN_UNOPENED) this.pendingLine = val;
     if (pos === 0) this.line_values[0] = val;
     return this;
   }
 
   message(pos: number, val: string): this {
-    if (pos === 0 && !this.opened) {
+    if (pos === 0 && this.state === SPAN_UNOPENED) {
       this._spanName = val;
       return this;
     }
     if (pos === 1) {
-      // Terminal result/error text lands on the reserved completion row, the
-      // same contract as the js-heap lane's row 1 — never as an appended row,
-      // or the two lanes disagree on row count for the same trace.
-      if (!this.opened) this.openSpan(this._spanName ?? 'span');
-      const status = this.binding.setCompletionMessage(this.spanId, val);
-      if (status !== THREAD_SPAN_BUFFER_OK) throw new Error('thread_span_buffer_set_completion_message failed');
+      this.complete(val);
       return this;
     }
     this.message_values[pos] = val;
@@ -704,31 +760,40 @@ export class ThreadSpanView {
     if (index === 0) return this.startRow;
     if (index === 1) return this.completionRow;
     const row = this.fakeToReal.get(index);
+    if (row !== undefined) return row;
+    // A refused span appended no rows, so it mapped none: what its writers
+    // store for one lands on NO_ROW, which stores nothing.
+    if (this.state === SPAN_REFUSED) return NO_ROW;
     // invariant throw: generated writers store a row's message before its
     // attributes, so an unmapped index is a writer bug — and guessing a row
     // would write another span's cell.
-    if (row === undefined) throw new Error(`log row ${index} has no row in the thread store yet`);
-    return row;
+    throw new Error(`log row ${index} has no row in the thread store yet`);
+  }
+
+  /**
+   * The span's terminal result or error text. It lands on the reserved
+   * completion row — the js-heap lane's row-1 contract — never as an appended
+   * row, or the two lanes disagree on row count for the same trace.
+   */
+  private complete(text: string): void {
+    if (!this.writable()) return;
+    const status = this.binding.setCompletionMessage(this.spanId, text);
+    if (status !== THREAD_SPAN_BUFFER_OK) throw new Error('thread_span_buffer_set_completion_message failed');
   }
 
   private commitLog(fakeIndex: number, message: string): void {
     if (fakeIndex === 1) {
-      // Terminal result/error text lands on the reserved completion row — the
-      // js-heap lane's row-1 contract — never as an appended row, or the two
-      // lanes disagree on row count for the same trace.
-      if (!this.opened) this.openSpan(this._spanName ?? 'span');
-      const status = this.binding.setCompletionMessage(this.spanId, message);
-      if (status !== THREAD_SPAN_BUFFER_OK) throw new Error('thread_span_buffer_set_completion_message failed');
+      this.complete(message);
       return;
     }
     if (fakeIndex === 0) {
       // Row 0's message is the span name, written at open.
-      if (!this.opened) this._spanName = message;
+      if (this.state === SPAN_UNOPENED) this._spanName = message;
       return;
     }
     const existing = this.fakeToReal.get(fakeIndex);
     if (existing !== undefined) return;
-    if (!this.opened) this.openSpan(this._spanName ?? 'span');
+    if (!this.writable()) return;
     const entryType = this.pendingEntryType ?? 8;
     this.pendingEntryType = undefined;
     const timestamp = this.logTimestamp();
@@ -878,8 +943,8 @@ function buildLayout(schema: LogSchema): ThreadSpanLayout {
       value: function attributeWriter(this: ThreadSpanView, pos: number, val: unknown): ThreadSpanView {
         if (val === null || val === undefined) return this;
         // Any attribute can be a span's first write; its rows exist only once
-        // the store opened it.
-        if (!this.opened) this.openSpan(this._spanName ?? 'span');
+        // the store opened it, and never if the store refused it.
+        if (!this.writable()) return this;
         this.storeCell(field, this.physicalRow(pos), val);
         return this;
       },

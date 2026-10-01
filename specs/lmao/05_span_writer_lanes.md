@@ -108,6 +108,13 @@ output is the generated `span_id` getter (`packages/lmao-ttsc/plugin/driver/span
   `ThreadSpanBuffer::open_span` reserves the completion row immediately). The allocation-time handshake generalizes: the
   allocator pre-arms the lifecycle rows, and the binding's open _is_ the allocation.
 
+**A refused open fails nothing.** A store answers bare `0` to an open it cannot place — a host store that cannot
+attribute the span, a full store. The thread-lane view (`src/lib/wasm/threadSpanView.ts`) then holds no rows and no span
+id: the traced body runs and answers its own result, the span writes no cell and makes no lifecycle call, and its
+descendants are never offered to the store, because offered with parent `0` they would open as roots a host parents
+elsewhere. A trace must not fail what it traces. Each store counts the opens it refused; a host reads the sum as
+`ThreadBufferStrategy.refusedSpans`.
+
 ## 4. Views are not pointers
 
 **Every thread-lane provider hands JavaScript views of the store's attribute cells; none hands it a pointer, a row
