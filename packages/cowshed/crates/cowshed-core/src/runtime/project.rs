@@ -605,6 +605,7 @@ impl ProjectRuntime {
                     "workspace": workspace,
                 }),
                 None,
+                None,
             )
             .await
             .map(|_| ())
@@ -657,7 +658,10 @@ impl ProjectActor {
     async fn run(mut self) {
         while let Some(command) = self.receiver.recv().await {
             let (request, reply) = command.into_parts();
-            let routed = self.route(request).await;
+            let routed = match request.steps().cloned() {
+                Some(steps) => crate::timing::reporting(steps, self.route(request)).await,
+                None => self.route(request).await,
+            };
             self.host.release_intent_leases();
             match routed {
                 Ok(Routed::Now(response)) => {

@@ -620,7 +620,7 @@ impl ApfsBlockingLane for TokioApfsBlockingLane {
         T: Send + 'static,
         F: FnOnce() -> Result<T, ApfsStorageError> + Send + 'static,
     {
-        tokio::task::spawn_blocking(job)
+        tokio::task::spawn_blocking(crate::timing::carried(job))
             .await
             .map_err(|error| ApfsStorageError::BlockingTask(error.to_string()))?
     }
@@ -913,7 +913,7 @@ where
     where
         F: FnOnce(CreateStage) -> Fut + Send,
         Fut: Future<Output = Result<(), E>> + Send,
-        E: Send,
+        E: Send + std::fmt::Display,
     {
         self.execute_clone_staged(plan, CloneKind::Create, initialize)
             .await
@@ -927,7 +927,7 @@ where
     where
         F: FnOnce(ForkStage) -> Fut + Send,
         Fut: Future<Output = Result<(), E>> + Send,
-        E: Send,
+        E: Send + std::fmt::Display,
     {
         self.execute_clone_staged(plan, CloneKind::Fork, initialize)
             .await
@@ -943,7 +943,7 @@ where
         P: ImmutablePlan,
         F: FnOnce(WorkspaceStage) -> Fut + Send,
         Fut: Future<Output = Result<(), E>> + Send,
-        E: Send,
+        E: Send + std::fmt::Display,
     {
         let backend = CheckedApfsBackend {
             host: Arc::clone(&self.host),

@@ -13,7 +13,7 @@ use cowshed_core::api::dto::{
     ExecRequest, Finding, FindingSeverity, GcOptions, GcReport, GitOid, GrantDelta, GrantSet,
     JobId, JobInfo, JobState, LandOptions, LandReport, MirrorInfo, PortBlock, PushOptions,
     PushReport, RebaseOptions, RemoveOptions, RemoveReport, ResizeResult, RunSandboxMode,
-    StdinSource, WorkspaceInfo, WorkspaceState, WorkspaceTarget,
+    StdinSource, StepReport, WorkspaceInfo, WorkspaceState, WorkspaceTarget,
 };
 use cowshed_core::api::server::{ConnectionAuthority, RouterHandle, serve_controller_connection};
 use cowshed_core::metadata::{
@@ -25,6 +25,7 @@ use cowshed_core::runtime::{
     RuntimeLogChunk, WorkspaceSnapshot,
 };
 use cowshed_core::storage::lifecycle::{Conflict, LifecycleFact, Revision};
+use cowshed_core::timing::{timed, timed_async};
 use cowshed_core::{Cowshed, CowshedError, ErrorCode, JobStream, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -218,6 +219,8 @@ struct FakeHost {
     removal: FakeRemoval,
     recovery_behavior: RecoveryBehavior,
     held_job: Option<Arc<HeldJob>>,
+    /// When set, a create holds inside its clone step until this is notified.
+    create_gate: Option<Arc<Notify>>,
 }
 
 impl FakeHost {
@@ -255,6 +258,7 @@ impl FakeHost {
             removal: FakeRemoval::default(),
             recovery_behavior: RecoveryBehavior::None,
             held_job: None,
+            create_gate: None,
         }
     }
 
@@ -579,13 +583,32 @@ impl ProjectRuntimeHost for FakeHost {
                 "choose another name",
             ));
         }
+        // The real host's steps, in the shape it reports them: a clone step holding the first
+        // write into the clone, then the initializer.
+        let gate = self.create_gate.clone();
+        timed_async("new", "clone", async {
+            timed("apfs", format_args!("canonical/first-write"), || {
+                Ok::<_, CowshedError>(())
+            })?;
+            if let Some(gate) = gate {
+                gate.notified().await;
+            }
+            Ok::<_, CowshedError>(())
+        })
+        .await?;
         let prepared = self.next_workspace(workspace.clone());
         self.events.send(Event::Initialize(workspace.clone())).ok();
-        if std::mem::take(&mut self.fail_create_initializer) {
-            return Err(CowshedError::internal(
-                "injected create initializer failure",
-            ));
-        }
+        let fail = std::mem::take(&mut self.fail_create_initializer);
+        timed_async("new", "initialize", async {
+            if fail {
+                Err(CowshedError::internal(
+                    "injected create initializer failure",
+                ))
+            } else {
+                Ok(())
+            }
+        })
+        .await?;
         self.state.workspaces.push(prepared.clone());
         self.persist()?;
         self.events.send(Event::Publish(workspace)).ok();
@@ -1262,7 +1285,7 @@ async fn route(
     params: Value,
 ) -> Result<Value> {
     let response = router
-        .route(authority, method.to_owned(), params, None)
+        .route(authority, method.to_owned(), params, None, None)
         .await?;
     let (value, binary) = response.into_parts();
     assert!(binary.is_none());
@@ -1437,6 +1460,7 @@ async fn log_binary_metadata_carries_the_exact_next_offset() {
                 "offset": 7
             }),
             None,
+            None,
         )
         .await
         .expect("log route");
@@ -1517,6 +1541,84 @@ async fn one_connection_answers_output_and_status_while_a_wait_is_pending() {
         .expect("the wait answers once the job ends")
         .expect("wait");
     assert_eq!(ended.state, JobState::Exited);
+}
+
+/// A create that asks for its steps hears each one as it happens, over the controller connection
+/// the embedder holds: while the create is still held inside its clone step, the clone and the
+/// first write inside it have already arrived, nested; the rest arrive before the answer, and the
+/// stream ends with the call. A hung create therefore names the step it hangs in.
+#[tokio::test]
+async fn a_reported_create_hears_its_steps_while_it_runs() {
+    let root = test_root();
+    let (events, _events) = mpsc::unbounded_channel();
+    let gate = Arc::new(Notify::new());
+    let mut host = FakeHost::new(&root, events, false, false, Vec::new());
+    host.create_gate = Some(Arc::clone(&gate));
+    let repo = host.descriptor.repo_id.clone();
+    let runtime = ProjectRuntime::start(host).await.expect("start runtime");
+    let router = runtime.router();
+    adopt(&router, &repo).await;
+    let (client, server) = std::os::unix::net::UnixStream::pair().expect("socket pair");
+    let _connection = tokio::spawn(serve_controller_connection(
+        server.into(),
+        coordinator(repo.clone()),
+        router.clone(),
+    ));
+    let (cowshed, token) = Cowshed::connect(client.into()).await.expect("handshake");
+    let project = cowshed.open(root.join("checkout")).await.expect("open");
+    let coordinator = cowshed.coordinator(&project, token).expect("coordinator");
+
+    let started = |step, parent, scope: &str, name: &str| StepReport::Started {
+        step,
+        parent,
+        scope: scope.to_owned(),
+        name: name.to_owned(),
+    };
+    let ended = |step| StepReport::Ended { step, error: None };
+    let (steps, mut reports) = mpsc::unbounded_channel();
+    let create = coordinator.create_reporting("feature", CreateOptions::default(), steps);
+    tokio::pin!(create);
+    let heard_while_held = async {
+        let mut heard = Vec::new();
+        while heard.len() < 3 {
+            heard.push(
+                reports
+                    .recv()
+                    .await
+                    .expect("a step while the create is held"),
+            );
+        }
+        heard
+    };
+    let heard_while_held = tokio::select! {
+        biased;
+        created = &mut create => panic!("the create answered while held: {created:?}"),
+        heard = tokio::time::timeout(Duration::from_secs(5), heard_while_held) => heard,
+    }
+    .expect("the steps so far arrive while the create is held");
+    assert_eq!(
+        heard_while_held,
+        [
+            started(0, None, "new", "clone"),
+            started(1, Some(0), "apfs", "canonical/first-write"),
+            ended(1),
+        ]
+    );
+
+    gate.notify_one();
+    let created = tokio::time::timeout(Duration::from_secs(5), create)
+        .await
+        .expect("the create answers once released")
+        .expect("create");
+    assert_eq!(created.info().workspace.as_str(), "feature");
+    let mut rest = Vec::new();
+    while let Some(report) = reports.recv().await {
+        rest.push(report);
+    }
+    assert_eq!(
+        rest,
+        [ended(0), started(2, None, "new", "initialize"), ended(2)]
+    );
 }
 
 #[tokio::test]

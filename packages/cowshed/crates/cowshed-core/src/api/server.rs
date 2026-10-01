@@ -1,8 +1,10 @@
+use super::dto::StepReport;
 use super::frame;
 use super::peer_credentials::PeerCredentialsError;
 use crate::error::{CowshedError, ErrorCode, Result};
 use crate::metadata::{WorkspaceIncarnation, WorkspaceName};
 use crate::repository::RepoId;
+use crate::timing::StepSink;
 use bytes::Bytes;
 use serde_json::Value;
 use std::num::NonZeroUsize;
@@ -20,6 +22,7 @@ pub(crate) mod codec {
     use super::{
         CowshedError, HANDSHAKE_VERSION, MAX_HANDSHAKE_BYTES, MAX_JSON_FRAME_BYTES, RepoId, Value,
     };
+    use crate::api::dto::StepReport;
     use serde::de::DeserializeOwned;
     use serde::{Deserialize, Serialize};
     use std::borrow::Cow;
@@ -49,6 +52,9 @@ pub(crate) mod codec {
         params: Cow<'a, Value>,
         #[serde(skip_serializing_if = "Option::is_none")]
         binary_length: Option<u32>,
+        /// The caller asks to hear the call's lifecycle steps as step frames ahead of its answer.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        steps: bool,
     }
 
     #[derive(Debug, Serialize, Deserialize)]
@@ -59,6 +65,15 @@ pub(crate) mod codec {
         result: Option<Cow<'a, Value>>,
         error: Option<Cow<'a, CowshedError>>,
         binary_length: Option<u32>,
+    }
+
+    /// One step of a call that asked for its steps, sent before the call's answer. Only a request
+    /// that set `steps` ever gets one, so a client that never asks never reads this shape.
+    #[derive(Debug, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    struct RpcStepFields<'a> {
+        id: u64,
+        step: Cow<'a, StepReport>,
     }
 
     #[derive(Debug)]
@@ -196,6 +211,11 @@ pub(crate) mod codec {
             self.0.binary_length
         }
 
+        /// Whether the caller asked to hear the call's lifecycle steps.
+        pub(crate) const fn steps(&self) -> bool {
+            self.0.steps
+        }
+
         pub(crate) fn into_parts(self) -> (u64, String, Value, Option<u32>) {
             (
                 self.0.id,
@@ -221,6 +241,14 @@ pub(crate) mod codec {
                 self.0.binary_length,
             )
         }
+    }
+
+    /// What a client reads off the connection: one step of a call that asked for its steps, or a
+    /// call's answer.
+    #[derive(Debug)]
+    pub(crate) enum DecodedServerFrame {
+        Step { id: u64, report: StepReport },
+        Response(DecodedRpcResponse),
     }
 
     pub(crate) fn encode_client_hello(nonce: &str) -> Result<Vec<u8>, WireCodecError> {
@@ -260,6 +288,7 @@ pub(crate) mod codec {
         method: &str,
         params: &Value,
         binary_length: Option<u32>,
+        steps: bool,
     ) -> Result<Vec<u8>, WireCodecError> {
         encode(
             &RpcRequestFields {
@@ -267,6 +296,7 @@ pub(crate) mod codec {
                 method: Cow::Borrowed(method),
                 params: Cow::Borrowed(params),
                 binary_length,
+                steps,
             },
             MAX_JSON_FRAME_BYTES,
         )
@@ -274,6 +304,16 @@ pub(crate) mod codec {
 
     pub(crate) fn decode_rpc_request(bytes: &[u8]) -> Result<DecodedRpcRequest, WireCodecError> {
         decode::<RpcRequestFields<'static>>(bytes, MAX_JSON_FRAME_BYTES).map(DecodedRpcRequest)
+    }
+
+    pub(crate) fn encode_rpc_step(id: u64, report: &StepReport) -> Result<Vec<u8>, WireCodecError> {
+        encode(
+            &RpcStepFields {
+                id,
+                step: Cow::Borrowed(report),
+            },
+            MAX_JSON_FRAME_BYTES,
+        )
     }
 
     pub(crate) fn encode_rpc_success(
@@ -309,8 +349,19 @@ pub(crate) mod codec {
         )
     }
 
-    pub(crate) fn decode_rpc_response(bytes: &[u8]) -> Result<DecodedRpcResponse, WireCodecError> {
-        decode::<RpcResponseFields<'static>>(bytes, MAX_JSON_FRAME_BYTES).map(DecodedRpcResponse)
+    /// An answer decodes as one; only a frame that is not one is read as a step. Neither shape
+    /// accepts the other's fields, so no frame is both, and a frame that is neither reports why it
+    /// is not an answer.
+    pub(crate) fn decode_server_frame(bytes: &[u8]) -> Result<DecodedServerFrame, WireCodecError> {
+        match decode::<RpcResponseFields<'static>>(bytes, MAX_JSON_FRAME_BYTES) {
+            Ok(response) => Ok(DecodedServerFrame::Response(DecodedRpcResponse(response))),
+            Err(not_an_answer) => decode::<RpcStepFields<'static>>(bytes, MAX_JSON_FRAME_BYTES)
+                .map(|fields| DecodedServerFrame::Step {
+                    id: fields.id,
+                    report: fields.step.into_owned(),
+                })
+                .map_err(|_| not_an_answer),
+        }
     }
 
     #[cfg(test)]
@@ -342,37 +393,70 @@ pub(crate) mod codec {
             );
         }
 
+        fn response(frame: &[u8]) -> (u64, bool, Option<Value>, Option<CowshedError>, Option<u32>) {
+            match decode_server_frame(frame).expect("decode server frame") {
+                DecodedServerFrame::Response(response) => response.into_parts(),
+                DecodedServerFrame::Step { id, report } => {
+                    panic!("call {id}'s answer decoded as step {report:?}")
+                }
+            }
+        }
+
         #[test]
         fn directional_rpc_codecs_share_one_strict_schema() {
             let params = json!({"repoId": "acme/widget"});
-            let request =
-                encode_rpc_request(7, "project.list", &params, None).expect("encode request");
+            let request = encode_rpc_request(7, "project.list", &params, None, false)
+                .expect("encode request");
             let request_value: Value = serde_json::from_slice(&request).expect("request JSON");
             assert!(request_value.get("binaryLength").is_none());
+            assert!(
+                request_value.get("steps").is_none(),
+                "a call that does not ask for its steps sends what a controller without them reads"
+            );
+            let decoded = decode_rpc_request(&request).expect("decode request");
+            assert!(!decoded.steps());
             assert_eq!(
-                decode_rpc_request(&request)
-                    .expect("decode request")
-                    .into_parts(),
+                decoded.into_parts(),
                 (7, "project.list".into(), params, None)
             );
 
             let result = json!({"healthy": true});
             let success = encode_rpc_success(7, &result, Some(4)).expect("encode success");
-            assert_eq!(
-                decode_rpc_response(&success)
-                    .expect("decode success")
-                    .into_parts(),
-                (7, true, Some(result), None, Some(4))
-            );
+            assert_eq!(response(&success), (7, true, Some(result), None, Some(4)));
 
             let error = CowshedError::new(ErrorCode::Conflict, "stale", "retry");
             let failure = encode_rpc_error(8, &error).expect("encode failure");
-            assert_eq!(
-                decode_rpc_response(&failure)
-                    .expect("decode failure")
-                    .into_parts(),
-                (8, false, None, Some(error), None)
+            assert_eq!(response(&failure), (8, false, None, Some(error), None));
+        }
+
+        #[test]
+        fn a_call_that_asks_for_its_steps_reads_them_as_step_frames() {
+            let request = encode_rpc_request(9, "coordinator.create", &json!({}), None, true)
+                .expect("encode request");
+            assert!(
+                decode_rpc_request(&request)
+                    .expect("decode request")
+                    .steps()
             );
+
+            let report = StepReport::Started {
+                step: 3,
+                parent: Some(1),
+                scope: "apfs".into(),
+                name: "canonical/mount".into(),
+            };
+            let frame = encode_rpc_step(9, &report).expect("encode step");
+            match decode_server_frame(&frame).expect("decode step") {
+                DecodedServerFrame::Step {
+                    id,
+                    report: decoded,
+                } => {
+                    assert_eq!((id, decoded), (9, report));
+                }
+                DecodedServerFrame::Response(response) => {
+                    panic!("a step decoded as an answer: {:?}", response.into_parts())
+                }
+            }
         }
 
         #[test]
@@ -389,10 +473,21 @@ pub(crate) mod codec {
                     .is_err()
             );
             assert!(
-                decode_rpc_response(
+                decode_server_frame(
                     br#"{"id":1,"ok":true,"result":{},"error":null,"binaryLength":null,"extra":true}"#
                 )
                 .is_err()
+            );
+            assert!(
+                decode_server_frame(br#"{"id":1,"step":{"event":"ended","step":0,"extra":true}}"#)
+                    .is_err()
+            );
+            assert!(
+                decode_server_frame(
+                    br#"{"id":1,"ok":true,"result":{},"error":null,"binaryLength":null,"step":{"event":"ended","step":0}}"#
+                )
+                .is_err(),
+                "a frame is an answer or a step, never both"
             );
         }
 
@@ -517,6 +612,7 @@ pub struct RouterRequest {
     method: String,
     params: Value,
     upload: Option<Bytes>,
+    steps: Option<StepSink>,
 }
 
 impl RouterRequest {
@@ -536,8 +632,27 @@ impl RouterRequest {
         self.upload.as_ref()
     }
 
-    pub fn into_parts(self) -> (ConnectionAuthority, String, Value, Option<Bytes>) {
-        (self.authority, self.method, self.params, self.upload)
+    /// Where the call's lifecycle steps are reported, when its caller asked to hear them.
+    pub fn steps(&self) -> Option<&StepSink> {
+        self.steps.as_ref()
+    }
+
+    pub fn into_parts(
+        self,
+    ) -> (
+        ConnectionAuthority,
+        String,
+        Value,
+        Option<Bytes>,
+        Option<StepSink>,
+    ) {
+        (
+            self.authority,
+            self.method,
+            self.params,
+            self.upload,
+            self.steps,
+        )
     }
 }
 
@@ -614,12 +729,14 @@ impl RouterHandle {
         (Self { sender }, receiver)
     }
 
+    /// Route one call; `steps`, when present, hears its lifecycle steps as they run.
     pub async fn route(
         &self,
         authority: ConnectionAuthority,
         method: String,
         params: Value,
         upload: Option<Bytes>,
+        steps: Option<StepSink>,
     ) -> Result<RouterResponse> {
         let (reply, response) = oneshot::channel();
         self.sender
@@ -629,6 +746,7 @@ impl RouterHandle {
                     method,
                     params,
                     upload,
+                    steps,
                 },
                 reply: RouterReply(reply),
             })
@@ -802,10 +920,24 @@ async fn answer(
         .get("offset")
         .and_then(Value::as_u64)
         .filter(|_| request.method() == "job.logs");
+    let steps = request.steps();
     let (request_id, request_method, request_params, _) = request.into_parts();
-    let response = router
-        .route(authority, request_method, request_params, upload)
-        .await;
+    let response = if steps {
+        route_reporting_steps(
+            &writer,
+            &router,
+            authority,
+            request_id,
+            request_method,
+            request_params,
+            upload,
+        )
+        .await?
+    } else {
+        router
+            .route(authority, request_method, request_params, upload, None)
+            .await
+    };
     let mut writer = writer.lock().await;
     let writer = &mut *writer;
     match response {
@@ -832,6 +964,44 @@ async fn answer(
             Ok(())
         }
         Err(error) => write_rpc_error(writer, request_id, &error).await,
+    }
+}
+
+/// Route a call that asked for its steps, writing each step as it is reported, so the steps reach
+/// the caller while the call runs and all of them precede its answer. `Err` is a failed write,
+/// which ends the connection.
+async fn route_reporting_steps(
+    writer: &ConnectionWriter,
+    router: &RouterHandle,
+    authority: ConnectionAuthority,
+    request_id: u64,
+    method: String,
+    params: Value,
+    upload: Option<Bytes>,
+) -> Result<Result<RouterResponse>> {
+    let (sender, mut reports) = mpsc::unbounded_channel();
+    let routed = router.route(
+        authority,
+        method,
+        params,
+        upload,
+        Some(StepSink::new(sender)),
+    );
+    let mut routed = std::pin::pin!(routed);
+    loop {
+        tokio::select! {
+            biased;
+            Some(report) = reports.recv() => {
+                write_rpc_step(&mut *writer.lock().await, request_id, &report).await?;
+            }
+            response = &mut routed => {
+                // Every step the call reported before it answered is already queued.
+                while let Ok(report) = reports.try_recv() {
+                    write_rpc_step(&mut *writer.lock().await, request_id, &report).await?;
+                }
+                return Ok(response);
+            }
+        }
     }
 }
 
@@ -1118,6 +1288,16 @@ async fn write_rpc_error(
         "controller RPC response",
     )
     .await
+}
+
+async fn write_rpc_step(
+    stream: &mut (impl AsyncWrite + Unpin),
+    id: u64,
+    report: &StepReport,
+) -> Result<()> {
+    let frame = codec::encode_rpc_step(id, report)
+        .map_err(|error| protocol_error(format!("controller RPC step encoding failed: {error}")))?;
+    write_frame(stream, &frame, MAX_JSON_FRAME_BYTES, "controller RPC step").await
 }
 
 fn verify_peer(descriptor: &OwnedFd) -> Result<()> {

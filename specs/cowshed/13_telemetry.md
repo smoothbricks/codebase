@@ -327,7 +327,10 @@ resident answer's resolution and why it declined (06_cli.md), job submission and
 one `cowshed: timing +<since start> <scope> <step> <elapsed>` line per finished step. `path` and `exec` never print them
 otherwise: their stdout answers a script and their stderr is the child's. A workspace supervisor prints the same lines
 for the steps of each job it runs — admission record and commitment, sandbox environment, spawn, and the terminal record
-and commitment — on its own stderr, which is the daemon's log, when it runs with `COWSHED_TIMING=1`.
+and commitment — on its own stderr, which is the daemon's log, when it runs with `COWSHED_TIMING=1`. A controller call
+that asks for its steps (07_api.md) also hears each lifecycle step start and end as a step frame, nested under the step
+it runs inside, on whichever thread the step runs: an embedder that does not share the controller's stderr records them
+as its own spans.
 
 ## Querying
 

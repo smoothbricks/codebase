@@ -413,12 +413,12 @@ impl Default for DetachSettleGrace {
 
 /// One backend step inside a [`crate::timing`] span labelled `apfs <leg>/<step>`, so a slow
 /// lifecycle verb names the storage step that spent the time.
-pub(crate) fn timed_apfs_step<T, E>(
+pub(crate) fn timed_apfs_step<T, E: std::fmt::Display>(
     leg: &str,
     step: &'static str,
     operation: impl FnOnce() -> Result<T, E>,
 ) -> Result<T, E> {
-    crate::timing::timed(format_args!("apfs {leg}/{step}"), operation)
+    crate::timing::timed("apfs", format_args!("{leg}/{step}"), operation)
 }
 
 /// The leg a backend step serves, derived from the image path it touches: staging state lives

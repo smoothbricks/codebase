@@ -4152,7 +4152,7 @@ mod tests {
             tokio::spawn(async move {
                 while let Some(command) = commands.recv().await {
                     let (request, reply) = command.into_parts();
-                    let (_, method, params, _) = request.into_parts();
+                    let (_, method, params, _, _) = request.into_parts();
                     let script = Arc::clone(&script);
                     tokio::spawn(async move {
                         let _ = reply.send(script.answer(method, params).await);

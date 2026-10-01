@@ -3526,7 +3526,8 @@ where
         }
 
         let bytes = match timed(
-            format_args!("apfs defragment/rewrite {}", image.display()),
+            "apfs",
+            format_args!("defragment/rewrite {}", image.display()),
             || extents::rewrite_contiguously(image),
         ) {
             Ok(bytes) => bytes,

@@ -236,7 +236,7 @@ fn recording_router() -> (
     let actor = tokio::spawn(async move {
         while let Some(command) = commands.recv().await {
             let (request, reply) = command.into_parts();
-            let (authority, method, params, upload) = request.into_parts();
+            let (authority, method, params, upload, _steps) = request.into_parts();
             let response = if method == "job.logs" {
                 let offset = params
                     .get("offset")

@@ -963,6 +963,14 @@ One boundary answer, no ambiguity:
   no further request past that. A job's output therefore reaches a client while the client waits for the job's end, and
   a status read is answered while a wait is open on the same connection. A frame that breaks the protocol ends the
   connection and fails every call still open on it with that error.
+- **A call may ask to hear its lifecycle steps.** A request that sets top-level `steps: true` gets, ahead of its answer,
+  one `{id, step}` frame per step start and end its router call reports — the same steps a lifecycle verb prints on
+  stderr (13_telemetry.md): `{event: "started", step, parent?, scope, name}` and `{event: "ended", step, error?}`. Step
+  ids are unique within the call, a step's `parent` is the step it runs inside and is always reported started first, and
+  a step ends before its parent. Frames are written as the steps happen, so a caller can name the step a slow call is in
+  while it is still in it; all of a call's step frames precede its answer. A request without `steps` never gets a step
+  frame, so a client that never asks reads only answers. The Rust client exposes this as
+  `Coordinator::create_reporting`, which sends each step to a channel the caller reads while the create runs.
 - **Post-terminal publication is independent.** `ExecOptions.stdoutCopy` / `stderrCopy` project
   `OutputPublication {path,policy}`. They clone/reflink/copy the sealed protected artifact after terminal state, never
   hardlink, never change `StreamInfo.storage`, and report publication failure separately from process state.

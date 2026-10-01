@@ -3,8 +3,8 @@ use super::dto::{
     CreateOptions, DefragmentResult, DoctorReport, EmptyResult, ExecRequest, GcOptions, GcReport,
     GitOid, GrantDelta, GrantSet, JobId, JobInfo, LandOptions, LandReport, MirrorInfo,
     ProjectGrantDelta, ProjectGrants, PushOptions, PushReport, RebaseOptions, RemoveOptions,
-    RemoveReport, ResizeResult, RevisionResult, RunSandboxMode, StdinSource, WorkspaceIncarnation,
-    WorkspaceInfo, WorkspaceTarget,
+    RemoveReport, ResizeResult, RevisionResult, RunSandboxMode, StdinSource, StepReport,
+    WorkspaceIncarnation, WorkspaceInfo, WorkspaceTarget,
 };
 use super::frame;
 use super::peer_credentials::PeerCredentialsError;
@@ -57,6 +57,14 @@ impl WorkspaceAuthority {
 #[async_trait]
 pub(crate) trait ControllerRuntime: Send + Sync {
     async fn call(&self, method: &'static str, params: Value) -> Result<Value>;
+    /// A call whose lifecycle steps are sent to `steps` as the controller reports them, all of
+    /// them before the call returns.
+    async fn call_reporting(
+        &self,
+        method: &'static str,
+        params: Value,
+        steps: tokio::sync::mpsc::UnboundedSender<StepReport>,
+    ) -> Result<Value>;
     async fn upload(&self, method: &'static str, params: Value, bytes: Bytes) -> Result<Value>;
     async fn download(
         &self,
@@ -86,6 +94,8 @@ enum ActorMessage {
     Json {
         method: &'static str,
         params: Value,
+        /// Where the call's step frames go; `None` asks for none.
+        steps: Option<mpsc::UnboundedSender<StepReport>>,
         reply: oneshot::Sender<Result<ActorResponse>>,
     },
     Upload {
@@ -122,14 +132,19 @@ struct ActorRuntime {
 }
 
 #[cfg(unix)]
-#[async_trait]
-impl ControllerRuntime for ActorRuntime {
-    async fn call(&self, method: &'static str, params: Value) -> Result<Value> {
+impl ActorRuntime {
+    async fn json(
+        &self,
+        method: &'static str,
+        params: Value,
+        steps: Option<mpsc::UnboundedSender<StepReport>>,
+    ) -> Result<Value> {
         let (reply, response) = oneshot::channel();
         self.sender
             .send(ActorMessage::Json {
                 method,
                 params,
+                steps,
                 reply,
             })
             .await
@@ -140,6 +155,23 @@ impl ControllerRuntime for ActorRuntime {
                 "controller actor returned binary data to a JSON-only call",
             )),
         }
+    }
+}
+
+#[cfg(unix)]
+#[async_trait]
+impl ControllerRuntime for ActorRuntime {
+    async fn call(&self, method: &'static str, params: Value) -> Result<Value> {
+        self.json(method, params, None).await
+    }
+
+    async fn call_reporting(
+        &self,
+        method: &'static str,
+        params: Value,
+        steps: mpsc::UnboundedSender<StepReport>,
+    ) -> Result<Value> {
+        self.json(method, params, Some(steps)).await
     }
 
     async fn upload(&self, method: &'static str, params: Value, bytes: Bytes) -> Result<Value> {
@@ -478,7 +510,10 @@ async fn call_typed<T: DeserializeOwned>(
     method: &'static str,
     params: Value,
 ) -> Result<T> {
-    let value = runtime.call(method, params).await?;
+    decode_typed(method, runtime.call(method, params).await?)
+}
+
+fn decode_typed<T: DeserializeOwned>(method: &'static str, value: Value) -> Result<T> {
     serde_json::from_value(value).map_err(|error| {
         CowshedError::new(
             ErrorCode::Internal,
@@ -1097,32 +1132,54 @@ struct Answer {
     outcome: Result<ActorResponse>,
 }
 
+/// What the reader takes off the connection for the actor: one step of a call that asked for
+/// its steps, or a call's answer.
+#[cfg(unix)]
+enum Inbound {
+    Step { id: u64, report: StepReport },
+    Answer(Answer),
+}
+
 #[cfg(unix)]
 async fn read_answers(
     mut reader: tokio::net::unix::OwnedReadHalf,
     downloads: Downloads,
-    answers: mpsc::UnboundedSender<Result<Answer>>,
+    answers: mpsc::UnboundedSender<Result<Inbound>>,
 ) {
     loop {
-        let answer = read_answer(&mut reader, &downloads).await;
-        let failed = answer.is_err();
-        if answers.send(answer).is_err() || failed {
+        let inbound = read_inbound(&mut reader, &downloads).await;
+        let failed = inbound.is_err();
+        if answers.send(inbound).is_err() || failed {
             return;
         }
     }
 }
 
-/// Read and check one answer. `Err` means the connection cannot be read past it; every frame
-/// is checked against its declaration before its bytes are read.
+/// Read and check one frame. `Err` means the connection cannot be read past it.
+#[cfg(unix)]
+async fn read_inbound(
+    reader: &mut tokio::net::unix::OwnedReadHalf,
+    downloads: &Downloads,
+) -> Result<Inbound> {
+    let frame = read_rpc_frame(reader).await?;
+    match codec::decode_server_frame(&frame).map_err(|error| {
+        CowshedError::internal(format!("controller RPC response decoding failed: {error}"))
+    })? {
+        codec::DecodedServerFrame::Step { id, report } => Ok(Inbound::Step { id, report }),
+        codec::DecodedServerFrame::Response(response) => read_answer(reader, downloads, response)
+            .await
+            .map(Inbound::Answer),
+    }
+}
+
+/// Check one answer. `Err` means the connection cannot be read past it; every frame is checked
+/// against its declaration before its bytes are read.
 #[cfg(unix)]
 async fn read_answer(
     reader: &mut tokio::net::unix::OwnedReadHalf,
     downloads: &Downloads,
+    response: codec::DecodedRpcResponse,
 ) -> Result<Answer> {
-    let frame = read_rpc_frame(reader).await?;
-    let response = codec::decode_rpc_response(&frame).map_err(|error| {
-        CowshedError::internal(format!("controller RPC response decoding failed: {error}"))
-    })?;
     let (id, ok, result, error, binary_length) = response.into_parts();
     let download = downloads
         .lock()
@@ -1198,10 +1255,13 @@ async fn run_controller_actor(
     mut messages: mpsc::Receiver<ActorMessage>,
     mut writer: tokio::net::unix::OwnedWriteHalf,
     downloads: Downloads,
-    mut answers: mpsc::UnboundedReceiver<Result<Answer>>,
+    mut answers: mpsc::UnboundedReceiver<Result<Inbound>>,
 ) {
     let mut pending =
         std::collections::HashMap::<u64, oneshot::Sender<Result<ActorResponse>>>::new();
+    // The step listeners of the pending calls that asked for steps; a listener is dropped with
+    // its call's answer, so the caller's step stream ends exactly when the call does.
+    let mut listeners = std::collections::HashMap::<u64, mpsc::UnboundedSender<StepReport>>::new();
     let mut next_id = 1_u64;
     let failure = loop {
         tokio::select! {
@@ -1210,15 +1270,15 @@ async fn run_controller_actor(
                 let Some(message) = message else { return };
                 let id = next_id;
                 next_id = next_id.saturating_add(1);
-                let (method, params, lane, reply) = match message {
-                    ActorMessage::Json { method, params, reply } => {
-                        (method, params, ActorLane::Json, reply)
+                let (method, params, lane, steps, reply) = match message {
+                    ActorMessage::Json { method, params, steps, reply } => {
+                        (method, params, ActorLane::Json, steps, reply)
                     }
                     ActorMessage::Upload { method, params, bytes, reply } => {
-                        (method, params, ActorLane::Upload(bytes), reply)
+                        (method, params, ActorLane::Upload(bytes), None, reply)
                     }
                     ActorMessage::Download { method, params, expected_offset, reply } => {
-                        (method, params, ActorLane::Download(expected_offset), reply)
+                        (method, params, ActorLane::Download(expected_offset), None, reply)
                     }
                 };
                 if let ActorLane::Download(offset) = lane {
@@ -1227,18 +1287,33 @@ async fn run_controller_actor(
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .insert(id, offset);
                 }
-                if let Err(error) = send_call(&mut writer, id, method, &params, &lane).await {
+                let call = send_call(&mut writer, id, method, &params, &lane, steps.is_some());
+                if let Err(error) = call.await {
                     let _ = reply.send(Err(error.clone()));
                     break error;
                 }
                 pending.insert(id, reply);
+                if let Some(steps) = steps {
+                    listeners.insert(id, steps);
+                }
             }
-            answer = answers.recv() => {
-                let answer = match answer {
-                    Some(Ok(answer)) => answer,
+            inbound = answers.recv() => {
+                let answer = match inbound {
+                    Some(Ok(Inbound::Answer(answer))) => answer,
+                    Some(Ok(Inbound::Step { id, report })) => {
+                        let Some(listener) = listeners.get(&id) else {
+                            break CowshedError::internal(
+                                "controller RPC step did not match a pending call that asked for steps",
+                            );
+                        };
+                        // A caller that stopped listening still gets its answer.
+                        let _ = listener.send(report);
+                        continue;
+                    }
                     Some(Err(error)) => break error,
                     None => break actor_reply_error(),
                 };
+                listeners.remove(&answer.id);
                 let Some(reply) = pending.remove(&answer.id) else {
                     break CowshedError::internal(
                         "controller RPC response id did not match a pending request",
@@ -1262,6 +1337,7 @@ async fn send_call(
     method: &str,
     params: &Value,
     lane: &ActorLane,
+    steps: bool,
 ) -> Result<()> {
     let binary_length = match lane {
         ActorLane::Upload(bytes) => Some(u32::try_from(bytes.len()).map_err(|_| {
@@ -1270,7 +1346,7 @@ async fn send_call(
         ActorLane::Json | ActorLane::Download(_) => None,
     };
     let request =
-        codec::encode_rpc_request(id, method, params, binary_length).map_err(|error| {
+        codec::encode_rpc_request(id, method, params, binary_length, steps).map_err(|error| {
             if error.is_too_large() {
                 CowshedError::internal("controller RPC request is too large")
             } else {
@@ -1348,14 +1424,40 @@ impl Coordinator {
     }
 
     pub async fn create(&self, name: &str, options: CreateOptions) -> Result<WorkspaceRef> {
+        self.create_call(name, options, None).await
+    }
+
+    /// [`Self::create`], with each of its lifecycle steps sent to `steps` as the controller
+    /// reports it — the clone, the first write into it, its mount, the checkout and the rest —
+    /// nested under the step it runs inside. Every step is sent before this returns, and the
+    /// stream ends with it.
+    pub async fn create_reporting(
+        &self,
+        name: &str,
+        options: CreateOptions,
+        steps: tokio::sync::mpsc::UnboundedSender<StepReport>,
+    ) -> Result<WorkspaceRef> {
+        self.create_call(name, options, Some(steps)).await
+    }
+
+    async fn create_call(
+        &self,
+        name: &str,
+        options: CreateOptions,
+        steps: Option<tokio::sync::mpsc::UnboundedSender<StepReport>>,
+    ) -> Result<WorkspaceRef> {
+        const METHOD: &str = "coordinator.create";
         let name = WorkspaceName::session(name).map_err(|error| {
             CowshedError::usage(error.to_string(), "use a valid non-main workspace name")
         })?;
-        self.workspace_result(
-            "coordinator.create",
-            json!({ "repoId": self.project.repo_id, "workspace": name, "options": options }),
-        )
-        .await
+        let params =
+            json!({ "repoId": self.project.repo_id, "workspace": name, "options": options });
+        let value = match steps {
+            Some(steps) => self.runtime.call_reporting(METHOD, params, steps).await?,
+            None => self.runtime.call(METHOD, params).await?,
+        };
+        let wire: WorkspaceWire = decode_typed(METHOD, value)?;
+        Ok(WorkspaceRef::from_wire(wire, Arc::clone(&self.runtime)))
     }
 
     pub async fn rename(&self, source: &str, destination: &str) -> Result<WorkspaceRef> {
@@ -1958,6 +2060,15 @@ mod tests {
                 }
                 _ => Ok(json!({})),
             }
+        }
+
+        async fn call_reporting(
+            &self,
+            method: &'static str,
+            _params: Value,
+            _steps: tokio::sync::mpsc::UnboundedSender<StepReport>,
+        ) -> Result<Value> {
+            unreachable!("the job-stream tests make no reported call, and {method} is one")
         }
 
         async fn upload(

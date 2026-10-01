@@ -859,13 +859,14 @@ pub enum DerivationError {
     },
 }
 
-/// Dispatch a blocking command or filesystem operation away from async runtime workers.
+/// Dispatch a blocking command or filesystem operation away from async runtime workers, inside
+/// the lifecycle step it was dispatched from.
 pub async fn dispatch_blocking<F, T>(task: F) -> Result<T, tokio::task::JoinError>
 where
     F: FnOnce() -> T + Send + 'static,
     T: Send + 'static,
 {
-    tokio::task::spawn_blocking(task).await
+    tokio::task::spawn_blocking(crate::timing::carried(task)).await
 }
 
 /// Platform mutation boundary. `acquire` must return only after the lifecycle lock is held.

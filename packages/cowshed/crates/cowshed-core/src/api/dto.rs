@@ -455,6 +455,35 @@ pub struct TraceContext {
     pub span_id: SpanId,
 }
 
+/// One lifecycle step of a controller call that asked for its steps, reported when the step starts
+/// and again when it ends (`crate::timing`). Step ids are unique within the call. A step's
+/// `parent` is the step it runs inside, absent at the call's top level, and is always reported
+/// started before any step inside it; a step ends before its parent does.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(
+    tag = "event",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+pub enum StepReport {
+    Started {
+        step: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent: Option<u32>,
+        /// The verb or layer the step belongs to: `new`, `apfs`.
+        scope: String,
+        /// The step within its scope: `links`, `canonical/mount`.
+        name: String,
+    },
+    Ended {
+        step: u32,
+        /// Why the step failed; absent when it succeeded.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum WorkspaceState {

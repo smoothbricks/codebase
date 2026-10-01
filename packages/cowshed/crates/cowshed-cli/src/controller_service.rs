@@ -144,8 +144,8 @@ async fn answer(call: RouterCommand, router: RouterHandle, repo_id: RepoId) {
         if needs_gateway(request.method(), request.params()) {
             gateway_service::reconcile_native_project(&repo_id).await?;
         }
-        let (authority, method, params, upload) = request.into_parts();
-        router.route(authority, method, params, upload).await
+        let (authority, method, params, upload, steps) = request.into_parts();
+        router.route(authority, method, params, upload, steps).await
     }
     .await;
     // A peer that has gone away no longer wants the answer; its connection already dropped it.
