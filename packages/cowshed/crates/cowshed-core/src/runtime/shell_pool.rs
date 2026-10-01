@@ -660,7 +660,7 @@ impl<A: Activator> PoolActor<A> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::shell_watch::{FsInstant, WatchEntry};
+    use crate::runtime::shell_watch::{EvaluationClock, FsInstant, WatchEntry};
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
 
@@ -694,12 +694,13 @@ mod tests {
                 })
                 .collect();
             let after = Snapshot::take(self.inputs.iter().map(PathBuf::as_path));
+            let finished = FsInstant::read(&self.root).unwrap();
             Activation::Ready {
                 host,
                 evidence: Ok(ActivationEvidence {
                     entries,
                     before,
-                    started: Some(started),
+                    clock: Some(EvaluationClock { started, finished }),
                     after,
                 }),
             }

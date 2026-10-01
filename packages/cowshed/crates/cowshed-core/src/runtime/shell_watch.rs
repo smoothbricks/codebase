@@ -170,10 +170,10 @@ impl FsInstant {
     /// moves past that one yields the reading. Blocks for at most one stamping tick of the
     /// filesystem: none where timestamps are fine-grained.
     pub fn separating(directory: &Path) -> io::Result<Self> {
-        let floor = Self::stamp(directory)?;
+        let floor = Self::read(directory)?;
         let deadline = std::time::Instant::now() + CLOCK_ADVANCE_BOUND;
         loop {
-            let reading = Self::stamp(directory)?;
+            let reading = Self::read(directory)?;
             if reading.ctime_ns > floor.ctime_ns {
                 return Ok(reading);
             }
@@ -190,8 +190,9 @@ impl FsInstant {
         }
     }
 
-    /// Create a file in `directory`, keep the ctime it was stamped with, and remove it.
-    fn stamp(directory: &Path) -> io::Result<Self> {
+    /// The clock in `directory` now: create a file there, keep the ctime it was stamped with,
+    /// and remove it. No later change can stamp earlier unless the clock is stepped back.
+    pub fn read(directory: &Path) -> io::Result<Self> {
         let path = directory.join(format!(".clock-{}", uuid::Uuid::new_v4().simple()));
         let file = std::fs::OpenOptions::new()
             .write(true)
@@ -219,6 +220,41 @@ impl FsInstant {
             self.ctime_ns - self.ctime_ns.rem_euclid(NANOS_PER_SECOND)
         };
         ctime_ns < bound
+    }
+}
+
+/// The workspace filesystem's clock, read on both sides of one evaluation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EvaluationClock {
+    /// A [`FsInstant::separating`] reading taken after approval and before `direnv export` ran.
+    pub started: FsInstant,
+    /// A [`FsInstant::read`] taken once the evaluation's inputs were snapshotted.
+    pub finished: FsInstant,
+}
+
+impl EvaluationClock {
+    /// Whether a file on `dev` whose ctime is `ctime_ns` last changed before the evaluation
+    /// began.
+    ///
+    /// Ordering a ctime against the start assumes the clock that stamped it did not run
+    /// backwards meanwhile. A wall clock can be stepped back — a VM's time sync, an NTP step —
+    /// and then a change made during the evaluation stamps earlier than the start. A clock that
+    /// reads earlier at the end than at the start was stepped back by more than the evaluation
+    /// lasted, so nothing first seen in it is provably older than it: every such input counts
+    /// as changed, which costs one more activation.
+    ///
+    /// A smaller step is not seen. Stamps are the only clock a filesystem offers, and a step
+    /// back by `d` that leaves the end reading after the start reads exactly like a clock that
+    /// ran forward, was slewed, or stamps coarsely; a monotonic reading beside it cannot tell
+    /// them apart either, because slewing alone moves the wall clock against it. So an input
+    /// first listed by this activation and written within `d` after the start can still be
+    /// judged older, and its shell reused until that input changes again.
+    fn precedes_start(self, dev: u64, ctime_ns: i128) -> bool {
+        self.ran_forward() && self.started.precedes(dev, ctime_ns)
+    }
+
+    fn ran_forward(self) -> bool {
+        self.started.dev == self.finished.dev && self.started.ctime_ns <= self.finished.ctime_ns
     }
 }
 
@@ -259,9 +295,9 @@ pub struct ActivationEvidence {
     pub entries: Vec<WatchEntry>,
     /// Identities of the previous generation's inputs, taken just before evaluation began.
     pub before: Snapshot,
-    /// Read off the workspace filesystem's clock after approval and before `direnv export`
-    /// ran; `None` when no evaluation ran.
-    pub started: Option<FsInstant>,
+    /// The workspace filesystem's clock read around the evaluation; `None` when no evaluation
+    /// ran.
+    pub clock: Option<EvaluationClock>,
     /// Identities of `entries` taken as soon as evaluation finished.
     pub after: Snapshot,
 }
@@ -272,8 +308,9 @@ impl ActivationEvidence {
     /// An input the previous generation also watched must be identical before and after. An
     /// input first seen by this activation has no earlier identity, so it must have last
     /// changed before the start: ctime moves on every content, rename or metadata change and no
-    /// tool can set it back. direnv's existence bit, which is exact, must agree with what is
-    /// there now.
+    /// tool can set it back — only a clock stepped backwards can, which is why the clock must
+    /// also have run forward across the evaluation ([`EvaluationClock`]). direnv's existence
+    /// bit, which is exact, must agree with what is there now.
     pub fn stable(&self) -> bool {
         self.entries.iter().all(|entry| {
             let Some(now) = self.after.get(&entry.path) else {
@@ -283,8 +320,8 @@ impl ActivationEvidence {
                 Some(before) => before == now,
                 None => match now {
                     FileState::Present { dev, ctime_ns, .. } => self
-                        .started
-                        .is_some_and(|started| started.precedes(dev, ctime_ns)),
+                        .clock
+                        .is_some_and(|clock| clock.precedes_start(dev, ctime_ns)),
                     FileState::Missing | FileState::Unreadable(_) => true,
                 },
             };
@@ -712,12 +749,17 @@ mod tests {
             },
         ];
         let before = Snapshot::take([known.as_path()]);
-        let started = Some(FsInstant::separating(&root).unwrap());
-        let after = Snapshot::take([known.as_path(), new.as_path()]);
+        let started = FsInstant::separating(&root).unwrap();
+        // The end reading follows the snapshot it closes, as an activation takes it.
+        let around = |after: Snapshot| {
+            let finished = FsInstant::read(&root).unwrap();
+            (after, Some(EvaluationClock { started, finished }))
+        };
+        let (after, clock) = around(Snapshot::take([known.as_path(), new.as_path()]));
         let evidence = ActivationEvidence {
             entries: entries.clone(),
             before: before.clone(),
-            started,
+            clock,
             after,
         };
         assert!(evidence.stable(), "nothing moved during evaluation");
@@ -729,40 +771,93 @@ mod tests {
             .unwrap()
             .write_all(b"!")
             .unwrap();
+        let (after, clock) = around(Snapshot::take([known.as_path(), new.as_path()]));
         let evidence = ActivationEvidence {
             entries: entries.clone(),
             before: before.clone(),
-            started,
-            after: Snapshot::take([known.as_path(), new.as_path()]),
+            clock,
+            after,
         };
         assert!(!evidence.stable(), "a new input written mid-evaluation");
 
         // A known input that changed between the earlier snapshot and the end.
         std::fs::write(&known, b"K").unwrap();
+        let (after, clock) = around(Snapshot::take([known.as_path()]));
         let evidence = ActivationEvidence {
             entries: vec![entries[0].clone()],
             before,
-            started,
-            after: Snapshot::take([known.as_path()]),
+            clock,
+            after,
         };
         assert!(!evidence.stable(), "a known input rewritten mid-evaluation");
 
         // direnv recorded the input as absent but it exists by the end, and did so before the
         // activation started.
+        let started = FsInstant::separating(&root).unwrap();
+        let after = Snapshot::take([known.as_path()]);
         let evidence = ActivationEvidence {
             entries: vec![WatchEntry {
                 path: known.clone(),
                 exists: false,
             }],
             before: Snapshot::default(),
-            started: Some(FsInstant::separating(&root).unwrap()),
-            after: Snapshot::take([known.as_path()]),
+            clock: Some(EvaluationClock {
+                started,
+                finished: FsInstant::read(&root).unwrap(),
+            }),
+            after,
         };
         assert!(
             !evidence.stable(),
             "existence disagrees with direnv's record"
         );
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A wall clock stepped back while the evaluation ran — a VM's time sync, an NTP step —
+    /// stamps an input written mid-evaluation earlier than the start. The end reading, earlier
+    /// than the start, is what shows the clock went backwards.
+    #[test]
+    fn a_clock_stepped_back_mid_evaluation_proves_no_new_input_older() {
+        let second = NANOS_PER_SECOND;
+        let new = PathBuf::from("/workspace/bun.lock");
+        let evidence = |input_ctime_ns: i128, finished_ns: i128| ActivationEvidence {
+            entries: vec![WatchEntry {
+                path: new.clone(),
+                exists: true,
+            }],
+            before: Snapshot::default(),
+            clock: Some(EvaluationClock {
+                started: FsInstant {
+                    dev: 1,
+                    ctime_ns: 10 * second + second / 2,
+                },
+                finished: FsInstant {
+                    dev: 1,
+                    ctime_ns: finished_ns,
+                },
+            }),
+            after: Snapshot(BTreeMap::from([(
+                new.clone(),
+                FileState::Present {
+                    dev: 1,
+                    ino: 7,
+                    size: 3,
+                    mtime_ns: input_ctime_ns,
+                    ctime_ns: input_ctime_ns,
+                },
+            )])),
+        };
+        // Started at 10.5s, stepped back a second: the mid-evaluation write stamps 9.7s and the
+        // clock reads 9.8s at the end.
+        assert!(
+            !evidence(9 * second + 700_000_000, 9 * second + 800_000_000).stable(),
+            "a clock that ran backwards orders nothing against the start"
+        );
+        // The same input stamp under a clock that ran forward is an input older than the start.
+        assert!(evidence(9 * second + 700_000_000, 10 * second + 600_000_000).stable());
+        // A clock that did not move at all across the evaluation still ran forward.
+        assert!(evidence(9 * second + 700_000_000, 10 * second + second / 2).stable());
     }
 
     #[test]

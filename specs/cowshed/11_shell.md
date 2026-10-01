@@ -67,9 +67,17 @@ evaluation's start — serves the command that paid for it and is never reused. 
 filesystem's own clock, never the process clock, which runs up to a tick ahead of the stamps a coarse clock gives: the
 supervisor stamps a file of its own in the protected host directory, and stamps again until the clock has moved past the
 first, so every change before the start, the approval's included, stamps earlier and every change after it stamps no
-earlier. An input on another filesystem, which may stamp in whole seconds, must predate the start's second. A change to
-a path not on the list costs nothing. The repository decides what else counts as shell input with `watch_file`:
-lockfiles and devenv inputs whose change must rerun shell entry.
+earlier — as long as the clock runs forward. A wall clock stepped back while the evaluation runs (a VM's time sync, an
+NTP step) stamps a change made during it earlier than the start, so the supervisor reads the clock again once the
+evaluation's inputs are snapshotted: when that reading is earlier than the start, no newly listed input counts as older
+than the evaluation, and the activation is never reused. That catches a step back larger than the evaluation took, and
+only that: a smaller step leaves the end reading after the start, which is what a clock that ran forward, was slewed or
+stamps coarsely also shows, and the filesystem's stamps are the only clock there is to read (a monotonic clock beside
+them drifts from the wall clock by slewing alone). A newly listed input written within such a step after the start can
+still count as older, and the shell serves until that input changes again. An input on another filesystem, which may
+stamp in whole seconds, must predate the start's second. A change to a path not on the list costs nothing. The
+repository decides what else counts as shell input with `watch_file`: lockfiles and devenv inputs whose change must
+rerun shell entry.
 
 **One spare and a SIEVE cache.** Hosts are pooled per shell identity: effective sandbox mode, `.envrc` directory, grant
 revision, the exact sandbox environment, and the host program. A read-only command never runs in a read-write host, and

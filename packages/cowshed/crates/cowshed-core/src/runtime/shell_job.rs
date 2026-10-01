@@ -31,7 +31,9 @@ use super::shell_host::{
     send_with_descriptors,
 };
 use super::shell_pool::{Acquired, Activation, Activator, ShellPool, ShellPoolConfig};
-use super::shell_watch::{ActivationEvidence, FsInstant, Snapshot, decode_direnv_watches};
+use super::shell_watch::{
+    ActivationEvidence, EvaluationClock, FsInstant, Snapshot, decode_direnv_watches,
+};
 use super::supervisor::{
     ProcessEvent, ProcessSignal, RunningProcess, SandboxEnvironment, StdinLane, kill_process_group,
     process_termination_from_wait, run_system_output, run_system_stdin,
@@ -770,7 +772,7 @@ impl HostActivator {
             return HostActivation::Ready(Ok(ActivationEvidence {
                 entries: Vec::new(),
                 before: Snapshot::default(),
-                started: None,
+                clock: None,
                 after: Snapshot::default(),
             }));
         };
@@ -803,14 +805,15 @@ impl HostActivator {
         // for it to move past the approval costs at most one stamping tick.
         let before = Snapshot::take(predicted.iter().map(PathBuf::as_path));
         let clock = self.workspace_mount.join(SHELL_HOST_DIRECTORY);
-        let started = match tokio::task::spawn_blocking(move || FsInstant::separating(&clock)).await
-        {
-            Ok(Ok(started)) => Ok(started),
-            Ok(Err(error)) => Err(format!(
-                "cannot read the workspace filesystem's clock: {error}"
-            )),
-            Err(error) => Err(format!("the filesystem clock task failed: {error}")),
-        };
+        let start_clock = clock.clone();
+        let started =
+            match tokio::task::spawn_blocking(move || FsInstant::separating(&start_clock)).await {
+                Ok(Ok(started)) => Ok(started),
+                Ok(Err(error)) => Err(format!(
+                    "cannot read the workspace filesystem's clock: {error}"
+                )),
+                Err(error) => Err(format!("the filesystem clock task failed: {error}")),
+            };
         let request = FrameWriter::new(REQUEST_ACTIVATE)
             .bytes(envrc_directory.as_os_str().as_bytes())
             .and_then(FrameWriter::finish);
@@ -867,10 +870,18 @@ impl HostActivator {
                     .and_then(|entries| {
                         let after =
                             Snapshot::take(entries.iter().map(|entry| entry.path.as_path()));
+                        // Read again once the inputs are snapshotted: a clock that ran backwards
+                        // across the evaluation orders no input against its start.
+                        let finished = FsInstant::read(&clock).map_err(|error| {
+                            format!("cannot read the workspace filesystem's clock: {error}")
+                        })?;
                         Ok(ActivationEvidence {
                             entries,
                             before,
-                            started: Some(started?),
+                            clock: Some(EvaluationClock {
+                                started: started?,
+                                finished,
+                            }),
                             after,
                         })
                     }),
