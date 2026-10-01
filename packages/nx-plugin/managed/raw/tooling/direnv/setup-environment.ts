@@ -35,6 +35,12 @@ import {
 // above the repository and failing with "could not find a package.json".
 const devenvRoot = process.env.DEVENV_ROOT;
 
+/** What a setup command printed, as captured. */
+interface CapturedOutput {
+  readonly stdout: Uint8Array;
+  readonly stderr: Uint8Array;
+}
+
 class CapturedCommandError extends Error {
   constructor(
     public readonly command: string,
@@ -163,12 +169,14 @@ try {
       if (frozenError !== undefined) {
         console.error('git diff after install:');
         try {
-          await runSetupCommand('git diff', $`git diff`, { quiet: false });
+          // Captured and written to stderr, the one stream devenv shows for a failed entry.
+          await writeCapturedOutput(await runSetupCommand('git diff', $`git diff`));
         } catch (diffError) {
           // This diff is diagnostics for the install failure we are already
           // reporting, so it must never become the failure: say it broke and keep
           // the original exit path. Plain `git diff` exits 0 even when the
-          // lockfile drifted, so a non-zero here means git itself failed.
+          // lockfile drifted, so a failure here is git itself failing or stderr
+          // closing under the write.
           console.error(`! git diff failed: ${diffError instanceof Error ? diffError.message : String(diffError)}`);
         }
         process.exit(1);
@@ -810,7 +818,7 @@ async function runSetupCommand(
   command: string,
   shell: ReturnType<typeof $>,
   options: { quiet?: boolean; cwd?: string } = {},
-): Promise<void> {
+): Promise<CapturedOutput> {
   const result = await shell
     .quiet(options.quiet ?? true)
     .nothrow()
@@ -818,6 +826,7 @@ async function runSetupCommand(
   if (result.exitCode !== 0) {
     throw new CapturedCommandError(command, result.exitCode, result.stdout, result.stderr);
   }
+  return result;
 }
 
 /**
@@ -997,5 +1006,27 @@ function replayCapturedOutput(error: unknown): void {
   }
   if (stderr.length > 0) {
     process.stderr.write(stderr);
+  }
+}
+
+/**
+ * Writes what a setup command printed to stderr and returns once the bytes have
+ * left this process. Stderr, not stdout, because devenv reports a failed shell
+ * entry as "Shell environment capture failed:" plus the shell's stderr and
+ * discards the stdout it captured. Awaited, because a pipe write still queued
+ * when `process.exit` runs is cut short (Bun 1.4.2: 5 MB written to a slow
+ * reader arrived as 1.3 MB), and a diagnostic that ends mid-hunk is not one.
+ * Redacts what a replay redacts: the values this script resolved itself. A CI
+ * runner resolves none, so the secrets its store injects are the platform's to
+ * mask in the job log, as for every other line of it.
+ */
+async function writeCapturedOutput(output: CapturedOutput): Promise<void> {
+  for (const stream of [output.stdout, output.stderr]) {
+    const masked = maskSecretValues(stream, resolvedSecretValues);
+    if (masked.length > 0) {
+      await new Promise<void>((resolve, reject) =>
+        process.stderr.write(masked, (error) => (error ? reject(error) : resolve())),
+      );
+    }
   }
 }
