@@ -3937,15 +3937,19 @@ impl Vm {
             }};
         }
 
+        // `validate_body` proved every instruction whole once per batch, so a
+        // row walks the body by decoding each instruction once: an executed
+        // one advances past what it read, and only a skipped aggregate pays
+        // for measuring its length.
         let mut bpc = 0usize;
         while bpc < body.len() {
             let Some(op) = Opcode::from_u8(body[bpc]) else {
                 return INVALID_PROGRAM;
             };
-            let Some(op_len) = body_op_len(body, bpc) else {
-                return INVALID_PROGRAM;
-            };
             if is_aggregate_op(op) {
+                let Some(op_len) = body_op_len(body, bpc) else {
+                    return INVALID_PROGRAM;
+                };
                 bpc += op_len;
                 continue;
             }
