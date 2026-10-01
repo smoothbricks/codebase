@@ -174,10 +174,21 @@ fn copy_data(
         copied += end - start;
         offset = end;
     }
-    // Extending the length past the last data region leaves the tail a hole.
+    // Sizing an APFS file can materialize zero-filled blocks after its last data run. The
+    // interior holes were punched after the following write; the trailing one has no following
+    // write, so punch it after the final size is set.
     destination
         .set_len(length)
         .map_err(|error| io_error("size the rewrite copy", sibling, error))?;
+    if offset < length {
+        punch_hole(destination, offset, length - offset).map_err(|error| {
+            io_error(
+                "keep the image's trailing hole in the rewrite copy",
+                sibling,
+                error,
+            )
+        })?;
+    }
     Ok(copied)
 }
 

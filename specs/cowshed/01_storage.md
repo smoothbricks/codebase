@@ -161,15 +161,16 @@ every clone automatically). Main and sessions use identical wiring; only the san
   budget (08_testing.md). `defrag` is the one remedy: it detaches the workspace exactly as `resize` does — a busy volume
   refuses before the image is touched — copies the image's data regions with plain `pread`/`pwrite` into
   `<image>.defrag` beside it (never `clonefile`, `copyfile(3)`, or `std::fs::copy`, all of which clone on APFS and would
-  share the old map), punches the source's holes back into the copy, `F_FULLFSYNC`s it, renames it over the image, syncs
-  the directory, and verifies the result by attaching it before restoring the mount state it found. The copy runs at
-  3.1–5.4 GB/s on the store volume (8.9 GiB in 1.8–3.1 s, an 8,871-extent image back to 579). Nothing rewrites an
-  attached image: the attachment holds an exclusive lock on the file (another `O_SHLOCK` or `O_EXLOCK` open fails with
-  `EAGAIN`), and `diskutil image resize` and `diskutil image create from` refuse it as well. The copy needs, and keeps,
-  free space equal to the image's allocated bytes while earlier clones and checkpoints still share the old blocks; the
-  verb refuses before detaching when the store volume lacks it. Nothing enumerates `<image>.defrag` as an image or
-  sidecar; the next `defrag` replaces one an interrupted run left, and `doctor` names it until then. Mains are never
-  detached implicitly (the gateway keeps them mounted), so no path rewrites main on its own.
+  share the old map), punches interior holes after each following write and the trailing hole after sizing the copy
+  (APFS may allocate zero blocks when extending it), `F_FULLFSYNC`s it, renames it over the image, syncs the directory,
+  and verifies the result by attaching it before restoring the mount state it found. The copy runs at 3.1–5.4 GB/s on
+  the store volume (8.9 GiB in 1.8–3.1 s, an 8,871-extent image back to 579). Nothing rewrites an attached image: the
+  attachment holds an exclusive lock on the file (another `O_SHLOCK` or `O_EXLOCK` open fails with `EAGAIN`), and
+  `diskutil image resize` and `diskutil image create from` refuse it as well. The copy needs, and keeps, free space
+  equal to the image's allocated bytes while earlier clones and checkpoints still share the old blocks; the verb refuses
+  before detaching when the store volume lacks it. Nothing enumerates `<image>.defrag` as an image or sidecar; the next
+  `defrag` replaces one an interrupted run left, and `doctor` names it until then. Mains are never detached implicitly
+  (the gateway keeps them mounted), so no path rewrites main on its own.
 - **Volume name**: the repository name for `main`, `<repo> — <workspace>` for every other workspace. The volume name is
   a label and nothing else: Finder shows it in place of the directory name for a mounted volume's directory, so it is
   written for the person looking at it. Nothing parses it, nothing classifies a volume by it, and nothing derives
