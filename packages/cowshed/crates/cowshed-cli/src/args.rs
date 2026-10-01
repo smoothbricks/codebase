@@ -746,7 +746,11 @@ fn cli_command() -> ClapCommand {
             leaf("grant")
                 .arg(positional("workspace", 0..=1))
                 .arg(flag("project-wide"))
-                .args([path_values("read"), path_values("write"), path_values("deny-write")])
+                .args([
+                    path_values("read"),
+                    path_values("write"),
+                    path_values("deny-write"),
+                ])
                 .arg(append_value("egress"))
                 .arg(flag("opaque")),
         )

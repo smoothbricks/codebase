@@ -469,6 +469,7 @@ fn grant_sets() -> BTreeMap<&'static str, Value> {
         port_block: Some(PortBlock::new(51_200, 16).expect("fixture port block is aligned")),
         read: vec![PathBuf::from("/Users/fixture/.cargo/registry")],
         write: vec![PathBuf::from("/Users/fixture/Library/Caches/sccache")],
+        deny_write: vec![PathBuf::from(".git/hooks"), PathBuf::from(".git/config")],
         egress: vec![
             EgressRule {
                 host: "crates.io".to_owned(),

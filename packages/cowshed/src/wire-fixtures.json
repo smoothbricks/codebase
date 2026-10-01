@@ -96,6 +96,7 @@
       "write": []
     },
     "open": {
+      "denyWrite": [".git/hooks", ".git/config"],
       "egress": [
         {
           "host": "crates.io"

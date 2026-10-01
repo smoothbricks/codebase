@@ -68,9 +68,8 @@ impl ProjectPolicy {
 
 /// The grant snapshot a workspace runs under: its own grants plus the project's standing ones.
 ///
-/// Reads are the sorted union. Egress is the workspace's rules plus every project rule for a host
-/// the workspace does not name itself: a workspace rule for the same host is the narrower,
-/// deliberate decision (its ports and mode) and is kept as written. The revision is
+/// Reads and workspace-relative write denies are sorted unions. Egress keeps a workspace
+/// rule over the project's rule for the same host (its ports and mode). The revision is
 /// the sum of both revisions — each only ever grows, so the sum grows whenever either does.
 pub fn effective_grants(
     workspace: &GrantSet,
@@ -84,7 +83,9 @@ pub fn effective_grants(
     effective.read.extend(project.read.iter().cloned());
     effective.read.sort();
     effective.read.dedup();
-    effective.deny_write.extend(project.deny_write.iter().cloned());
+    effective
+        .deny_write
+        .extend(project.deny_write.iter().cloned());
     effective.deny_write.sort();
     effective.deny_write.dedup();
     for rule in &project.egress {

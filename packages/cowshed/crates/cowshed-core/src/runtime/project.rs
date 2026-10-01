@@ -10563,12 +10563,18 @@ async fn run_git<const N: usize>(root: &Path, args: [&str; N]) -> Result<()> {
 }
 
 #[cfg(target_os = "macos")]
-async fn run_git_with_read<const N: usize>(root: &Path, read: &Path, args: [&str; N]) -> Result<()> {
-    let mut command = tokio::process::Command::from(
-        crate::git::sandboxed_git_command_with_read(root, read)?,
-    );
+async fn run_git_with_read<const N: usize>(
+    root: &Path,
+    read: &Path,
+    args: [&str; N],
+) -> Result<()> {
+    let mut command =
+        tokio::process::Command::from(crate::git::sandboxed_git_command_with_read(root, read)?);
     let output = command.args(args).output().await.map_err(|error| {
-        CowshedError::environment_missing(error.to_string(), "restore /usr/bin/git and sandbox-exec")
+        CowshedError::environment_missing(
+            error.to_string(),
+            "restore /usr/bin/git and sandbox-exec",
+        )
     })?;
     require_git_success("git operation", &output)
 }
@@ -10579,7 +10585,10 @@ async fn run_git_with_read<const N: usize>(root: &Path, read: &Path, args: [&str
 async fn invoke_git(root: &Path, args: &[&str]) -> Result<std::process::Output> {
     let mut command = tokio::process::Command::from(crate::git::sandboxed_git_command_at(root)?);
     command.args(args).output().await.map_err(|error| {
-        CowshedError::environment_missing(error.to_string(), "restore /usr/bin/git and sandbox-exec")
+        CowshedError::environment_missing(
+            error.to_string(),
+            "restore /usr/bin/git and sandbox-exec",
+        )
     })
 }
 
@@ -10920,7 +10929,10 @@ fn normalize_relative_denies(paths: &mut Vec<PathBuf>) -> Result<()> {
                 .any(|component| !matches!(component, std::path::Component::Normal(_)))
         {
             return Err(CowshedError::usage(
-                format!("workspace deny {} must be a relative path without traversal", path.display()),
+                format!(
+                    "workspace deny {} must be a relative path without traversal",
+                    path.display()
+                ),
                 "name a path beneath the workspace without . or ..",
             ));
         }
@@ -11200,13 +11212,16 @@ mod grant_unit_tests {
         apply_grant_delta(
             &mut workspace,
             GrantDelta {
-                deny_write: vec![PathBuf::from(".git/hooks"), PathBuf::from(".workspace-policy")],
+                deny_write: vec![
+                    PathBuf::from(".git/hooks"),
+                    PathBuf::from(".workspace-policy"),
+                ],
                 ..GrantDelta::default()
             },
             true,
         );
-        let effective = crate::project_policy::effective_grants(&workspace, &project)
-            .expect("revisions fit");
+        let effective =
+            crate::project_policy::effective_grants(&workspace, &project).expect("revisions fit");
         assert_eq!(effective.deny_write, [PathBuf::from(".git/hooks")]);
     }
 

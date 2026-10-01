@@ -224,7 +224,12 @@ async fn probe_git(root: &Path, args: &[&str], sandbox: &SandboxConfig) -> Resul
             "-C",
         ])
         .arg(root)
-        .args(["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false"])
+        .args([
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "core.fsmonitor=false",
+        ])
         .args(args)
         .current_dir(&sandbox.workspace_mount)
         .env_clear()

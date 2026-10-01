@@ -852,11 +852,7 @@ pub fn seatbelt_profile(
         let mut parent = config.workspace_mount.clone();
         for component in relative.components() {
             parent.push(component);
-            push_literal_rule(
-                &mut profile,
-                "deny file-write-unlink",
-                &parent,
-            )?;
+            push_literal_rule(&mut profile, "deny file-write-unlink", &parent)?;
         }
         push_exact_and_subpath_rule(
             &mut profile,

@@ -592,7 +592,6 @@ async fn grant_persists_sorted_paths_that_the_next_exec_observes() {
     assert!(observed.read.contains(&PathBuf::from("/tmp/probe")));
 }
 
-
 #[tokio::test]
 async fn grant_denial_is_sandbox_denied_json_and_leaves_grants_unchanged() {
     let mut service = FakeService {

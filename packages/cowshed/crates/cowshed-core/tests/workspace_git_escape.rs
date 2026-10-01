@@ -19,7 +19,11 @@ fn git(root: &Path, args: &[&str]) {
         .env("GIT_COMMITTER_EMAIL", "fixture@example.invalid")
         .output()
         .expect("run git");
-    assert!(output.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 fn sandbox(workspace: &Path, temp: &Path) -> SandboxConfig {
@@ -56,7 +60,7 @@ fn job(config: &SandboxConfig, script: &str) -> std::process::Output {
 }
 
 #[test]
-fn workspace_hook_cannot_run_as_controller_on_rebase() {
+fn workspace_hooks_cannot_run_as_controller_on_rebase() {
     let temp = std::env::temp_dir().join(format!("cowshed-git-escape-{}", uuid::Uuid::new_v4()));
     let workspace = temp.join("workspace");
     let marker = temp.join("outside-workspace-marker");
@@ -77,13 +81,25 @@ fn workspace_hook_cannot_run_as_controller_on_rebase() {
         fs::write(workspace.join("change"), "change\n").expect("change");
         git(&workspace, &["add", "change"]);
         git(&workspace, &["commit", "-qm", "change"]);
-        let hook = workspace.join(".git/hooks/pre-rebase");
-        let install = job(&config, &format!(
-            "printf '#!/bin/sh\nprintf escaped >> \"{}\"\n' > .git/hooks/pre-rebase; chmod +x .git/hooks/pre-rebase",
-            marker.display(),
-        ));
-        assert!(install.status.success(), "job could not write hook: {}", String::from_utf8_lossy(&install.stderr));
-        assert!(hook.exists(), "job wrote its hook inside the checkout");
+        let hooks = workspace.join(".git/hooks");
+        let install = job(
+            &config,
+            &format!(
+                "for hook in pre-rebase reference-transaction; do printf '#!/bin/sh\nprintf escaped >> \"{}\"\n' > \".git/hooks/$hook\"; chmod +x \".git/hooks/$hook\"; done",
+                marker.display(),
+            ),
+        );
+        assert!(
+            install.status.success(),
+            "job could not write hook: {}",
+            String::from_utf8_lossy(&install.stderr)
+        );
+        for name in ["pre-rebase", "reference-transaction"] {
+            assert!(
+                hooks.join(name).is_file(),
+                "job wrote {name} inside the checkout"
+            );
+        }
         let rebase = sandboxed_git_command_at(&workspace)
             .expect("controller Git sandbox")
             .args(["rebase", "target"])
@@ -93,11 +109,20 @@ fn workspace_hook_cannot_run_as_controller_on_rebase() {
             .env("GIT_COMMITTER_EMAIL", "fixture@example.invalid")
             .output()
             .expect("controller rebase");
-        assert!(rebase.status.success(), "rebase: {}", String::from_utf8_lossy(&rebase.stderr));
-        assert!(!marker.exists(), "workspace hook ran on the controller's host");
+        assert!(
+            rebase.status.success(),
+            "rebase: {}",
+            String::from_utf8_lossy(&rebase.stderr)
+        );
+        assert!(
+            !marker.exists(),
+            "workspace hook ran on the controller's host"
+        );
     });
     fs::remove_dir_all(temp).expect("remove fixture");
-    if let Err(error) = result { std::panic::resume_unwind(error); }
+    if let Err(error) = result {
+        std::panic::resume_unwind(error);
+    }
 }
 
 #[test]
@@ -128,14 +153,30 @@ fn denied_workspace_paths_resist_write_rename_link_and_symlink() {
             assert!(!output.status.success(), "denied job succeeded: {script}");
         }
         let output = job(&config, "printf fine > ordinary");
-        assert!(output.status.success(), "ordinary workspace write failed: {}", String::from_utf8_lossy(&output.stderr));
-        let commit = job(&config, "/var/select/developer_dir/usr/bin/git -c core.hooksPath=/dev/null add ordinary && /var/select/developer_dir/usr/bin/git -c core.hooksPath=/dev/null -c user.name=Fixture -c user.email=fixture@example.invalid commit -qm allowed");
-        assert!(commit.status.success(), "ordinary Git commit failed: {}", String::from_utf8_lossy(&commit.stderr));
-        assert_eq!(fs::read(workspace.join(".git/config")).expect("config"), original_config);
+        assert!(
+            output.status.success(),
+            "ordinary workspace write failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let commit = job(
+            &config,
+            "/var/select/developer_dir/usr/bin/git -c core.hooksPath=/dev/null add ordinary && /var/select/developer_dir/usr/bin/git -c core.hooksPath=/dev/null -c user.name=Fixture -c user.email=fixture@example.invalid commit -qm allowed",
+        );
+        assert!(
+            commit.status.success(),
+            "ordinary Git commit failed: {}",
+            String::from_utf8_lossy(&commit.stderr)
+        );
+        assert_eq!(
+            fs::read(workspace.join(".git/config")).expect("config"),
+            original_config
+        );
         assert!(!workspace.join(".git/hooks/pre-rebase").exists());
     });
     fs::remove_dir_all(temp).expect("remove fixture");
-    if let Err(error) = result { std::panic::resume_unwind(error); }
+    if let Err(error) = result {
+        std::panic::resume_unwind(error);
+    }
 }
 
 #[test]
@@ -151,10 +192,20 @@ fn repository_filter_cannot_write_to_controller_home() {
         fs::write(checkout.join("data"), "data\n").expect("data");
         git(&checkout, &["add", ".gitattributes", "data"]);
         git(&checkout, &["commit", "-qm", "tracked data"]);
-        git(&checkout, &["config", "filter.escape.smudge", &format!("sh -c 'echo escaped >> \"{}\"; cat'", marker.display())]);
+        git(
+            &checkout,
+            &[
+                "config",
+                "filter.escape.smudge",
+                &format!("sh -c 'echo escaped >> \"{}\"; cat'", marker.display()),
+            ],
+        );
         fs::remove_file(checkout.join("data")).expect("force checkout");
         git(&checkout, &["checkout", "--", "data"]);
-        assert!(marker.exists(), "host write from configured filter must reproduce");
+        assert!(
+            marker.exists(),
+            "host write from configured filter must reproduce"
+        );
         fs::remove_file(&marker).expect("reset marker");
         fs::remove_file(checkout.join("data")).expect("force sandboxed checkout");
         let output = sandboxed_git_command_at(&checkout)
@@ -162,9 +213,18 @@ fn repository_filter_cannot_write_to_controller_home() {
             .args(["checkout", "--", "data"])
             .output()
             .expect("sandboxed checkout");
-        assert!(output.status.success(), "checkout: {}", String::from_utf8_lossy(&output.stderr));
-        assert!(!marker.exists(), "filter escaped the controller Git sandbox");
+        assert!(
+            output.status.success(),
+            "checkout: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            !marker.exists(),
+            "filter escaped the controller Git sandbox"
+        );
     });
     fs::remove_dir_all(temp).expect("remove fixture");
-    if let Err(error) = result { std::panic::resume_unwind(error); }
+    if let Err(error) = result {
+        std::panic::resume_unwind(error);
+    }
 }

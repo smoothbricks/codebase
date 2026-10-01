@@ -1115,8 +1115,10 @@ where
             report_exec(output, json, &workspace, result)
         }
         Command::Grant(args) => {
-            let changed =
-                !args.read.is_empty() || !args.write.is_empty() || !args.deny_write.is_empty() || !args.egress.is_empty();
+            let changed = !args.read.is_empty()
+                || !args.write.is_empty()
+                || !args.deny_write.is_empty()
+                || !args.egress.is_empty();
             let workspace = match args.target {
                 GrantTarget::Workspace(workspace) => workspace,
                 GrantTarget::Project => {
