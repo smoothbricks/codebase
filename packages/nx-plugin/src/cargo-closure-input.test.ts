@@ -1,6 +1,6 @@
 import { expect, it } from 'bun:test';
 import { execFileSync } from 'node:child_process';
-import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, realpath, rm, stat, symlink, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 
@@ -92,7 +92,20 @@ await appendFile(${JSON.stringify(executions)}, result);
     ]);
     expect(exitCode, stdout + stderr).toBe(0);
   }
-  const edit = (path: string, text: string) => writeFile(join(root, path), text);
+  /**
+   * Rewrite a fixture file as an edit Nx can see. Nx keeps each file's hash
+   * beside its mtime in whole seconds and reuses the hash until that second
+   * changes, so a rewrite inside the second the file was last hashed in is
+   * invisible to every fileset input. A fast host runs this whole fixture in
+   * about a second; the edit is dated at least a second past the old mtime.
+   */
+  async function edit(path: string, text: string): Promise<void> {
+    const file = join(root, path);
+    const { mtimeMs } = await stat(file);
+    await writeFile(file, text);
+    const edited = new Date(Math.max(Date.now(), mtimeMs + 1000));
+    await utimes(file, edited, edited);
+  }
   const log = () => readFile(executions, 'utf8');
   return { workspace, compile, edit, log };
 }
