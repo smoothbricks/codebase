@@ -27,7 +27,7 @@ use super::supervisor::WorkspaceAuthoritySnapshot;
 use super::supervisor_socket::{
     self, AuthorityWire, BuildId, protocol_error, read_json, verify_peer, write_json,
 };
-use crate::error::{CowshedError, ErrorCode, Result};
+use crate::error::{CowshedError, ErrorCode, OtherBuild, Result};
 use crate::metadata::WorkspaceName;
 
 /// How long a started supervisor may take to open its project, mount its workspace and answer.
@@ -709,21 +709,20 @@ async fn serve_ensure(mut stream: UnixStream, manager: &SupervisorManager) -> Re
     write_json(&mut stream, &response).await
 }
 
-/// Refuse an ensure from another cowshed build by name. Read before the rest of the request:
-/// another build's may carry fields this one cannot decode, and the build is what says why.
+/// Refuse an ensure from another cowshed build by name, and with both builds as data
+/// ([`OtherBuild`]): the controller that asked can run nothing here, and whoever holds it replaces
+/// it without reading the sentence. Read before the rest of the request: another build's may carry
+/// fields this one cannot decode, and the build is what says why.
 fn same_build(request: &serde_json::Value) -> Result<()> {
     let ours = BuildId::current()?;
     let theirs = request.get("build").and_then(serde_json::Value::as_str);
     if theirs == Some(ours.as_str()) {
         return Ok(());
     }
-    Err(CowshedError::conflict(
-        format!(
-            "the cowshed daemon is build {ours}; this cowshed is build {}",
-            theirs.unwrap_or("(unnamed)")
-        ),
-        "run `cowshed gateway start` from the cowshed you mean to use",
-    ))
+    Err(CowshedError::other_build(OtherBuild {
+        daemon: ours.clone(),
+        caller: theirs.map(BuildId::named),
+    }))
 }
 
 /// Ask the host's manager for the supervisor serving `authority`'s workspace.
@@ -867,6 +866,58 @@ mod tests {
             }
         });
         requests
+    }
+
+    /// The daemon refuses an ensure from another build with both builds as data, so a controller
+    /// of the refused build is recognised — and replaced — by whoever holds it, without anybody
+    /// reading the sentence (11_shell.md "hello").
+    #[tokio::test]
+    async fn an_ensure_from_another_build_is_refused_naming_both_builds() {
+        // Unix socket paths are short; the per-user temporary directory is not.
+        let store = PathBuf::from("/tmp").join(format!(
+            "cowshed-other-{}",
+            &uuid::Uuid::new_v4().simple().to_string()[..12]
+        ));
+        std::fs::create_dir_all(store.join("run")).expect("run directory");
+        let socket = manager_socket_path(&store);
+        let listener = UnixListener::bind(&socket).expect("bind the manager");
+        let served = tokio::spawn(serve(
+            listener,
+            SupervisorManager::new(&store, Box::new(NoSpawner)),
+        ));
+        let mut stream = UnixStream::connect(&socket)
+            .await
+            .expect("reach the manager");
+        write_json(
+            &mut stream,
+            &serde_json::json!({
+                "build": "another build",
+                "projectRoot": "/repo",
+                "authority": {
+                    "repoId": "acme/widget",
+                    "workspace": "raven",
+                    "workspaceIncarnation": "0198f2c0b7e34dc795f17b238b331c80",
+                    "grantRevision": 1,
+                    "lifecycleRevision": 1,
+                },
+            }),
+        )
+        .await
+        .expect("ask");
+        let response: EnsureResponse = read_json(&mut stream).await.expect("answer");
+        let EnsureResponse::Refused(error) = response else {
+            panic!("an ensure from another build must be refused");
+        };
+        assert_eq!(error.code, ErrorCode::Conflict);
+        assert_eq!(
+            error.other_build_source(),
+            Some(&OtherBuild {
+                daemon: BuildId::current().expect("this build").clone(),
+                caller: Some(serde_json::from_value(serde_json::json!("another build")).unwrap()),
+            })
+        );
+        served.abort();
+        std::fs::remove_dir_all(store).expect("cleanup");
     }
 
     /// A daemon upgrade drains every supervisor another build started — whatever it changed,

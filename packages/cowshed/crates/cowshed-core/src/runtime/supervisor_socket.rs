@@ -55,6 +55,11 @@ impl BuildId {
         })
     }
 
+    /// The build another process named on the wire.
+    pub(crate) fn named(build: &str) -> Self {
+        Self(build.to_owned())
+    }
+
     pub fn as_str(&self) -> &str {
         &self.0
     }

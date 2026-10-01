@@ -169,10 +169,14 @@ multiplexed, and a client that disconnects abandons only its own call, never a j
   and lifecycle revisions) and its pid. A client reads the build first and refuses any other by name (`Conflict`), so
   two cowshed builds never exchange a call either cannot decode. A build is the Mach-O `LC_UUID` the linker derives from
   the binary's contents (the SHA-256 of the executable on Linux): no number anybody has to remember to bump, so a change
-  nobody announced still counts. The manager refuses an ensure from another build the same way. A program that links
-  cowshed as a library is another build whatever revision it links, so it opens no project in-process: it runs its
-  controller as `cowshed controller` (06_cli.md), a process of the host's own build, and speaks the controller protocol
-  to it over the socket it hands that process.
+  nobody announced still counts. The manager refuses an ensure from another build the same way, and its refusal carries
+  both builds as data — `otherBuild: { daemon, caller }` on the `Conflict` — so a client tells a controller the daemon
+  will no longer serve from every other conflict without reading the sentence. The controller client notes the first
+  such answer on its connection (`Coordinator::other_build`, 07_api.md); a supervisor of the controller's own build that
+  still drains its jobs keeps answering the calls that reach it. A program that links cowshed as a library is another
+  build whatever revision it links, so it opens no project in-process: it runs its controller as `cowshed controller`
+  (06_cli.md), a process of the host's own build, and speaks the controller protocol to it over the socket it hands that
+  process; after an install has started the daemon of a new build, it starts that verb again for its new work.
 - **advance** — the supervisor re-reads its workspace's grants and serves under their revision from then on
   (Grant-change propagation, below); answered with the authority it serves afterwards.
 - **drain** — the supervisor admits nothing more, lets its running jobs finish, then retires; answered at once with its

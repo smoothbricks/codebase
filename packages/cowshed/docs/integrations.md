@@ -182,6 +182,16 @@ and `cowshed land --check` do, and records controller commitments into the host'
 project exits with the typed error on its stderr and closes the socket, so the embedder's handshake fails instead of
 waiting.
 
+An install that starts the daemon of a new build leaves a running controller on the old one. The new daemon drains the
+old build's supervisors — each finishes its running jobs and retires — and refuses every ensure the old controller sends
+with `Conflict` carrying `otherBuild: { daemon, caller }`, the two builds as data. The client notes the first such
+answer on its connection, `Coordinator::other_build()`, so the embedder learns its controller can start nothing more
+without reading the sentence. It starts `cowshed controller` again — the host's `cowshed` is the new build once the
+install has run — and sends its new work there. A job the old controller started stays reachable through it while the
+draining supervisor still serves; once a call of it meets the refusal, the new controller reaches the job by its number
+(`WorkspaceHandle::job`) and reads its output on from the bytes already held
+(`JobHandle::logs(stream, offset, follow)`). The old controller exits 0 when its last handle is dropped.
+
 ## MCP authority delivery
 
 Coordinator authority is supplied by the trusted spawner over an inherited dedicated file descriptor or socketpair. The

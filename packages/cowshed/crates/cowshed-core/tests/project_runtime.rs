@@ -1516,7 +1516,7 @@ async fn one_connection_answers_output_and_status_while_a_wait_is_pending() {
     let wait = job.wait();
     tokio::pin!(wait);
     let observed = async {
-        let mut stdout = job.logs(JobStream::Stdout, true).await?;
+        let mut stdout = job.logs(JobStream::Stdout, 0, true).await?;
         let first = stdout
             .next()
             .await

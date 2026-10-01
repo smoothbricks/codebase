@@ -13,7 +13,7 @@ use super::server::MAX_BINARY_FRAME_BYTES;
 use super::server::{
     HANDSHAKE_VERSION, MAX_HANDSHAKE_BYTES, MAX_JSON_FRAME_BYTES as MAX_RPC_BYTES, codec,
 };
-use crate::error::{CowshedError, ErrorCode, Result};
+use crate::error::{CowshedError, ErrorCode, OtherBuild, Result};
 use crate::metadata::WorkspaceName;
 use crate::repository::{ProjectPaths, RepoId, RepositoryBinding};
 use async_trait::async_trait;
@@ -28,6 +28,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 #[cfg(unix)]
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::sync::watch;
 #[cfg(unix)]
 use tokio::sync::{mpsc, oneshot};
 use url::Url;
@@ -83,6 +84,7 @@ pub(crate) trait ControllerRuntime: Send + Sync {
         authority: Arc<WorkspaceAuthority>,
         id: JobId,
         stream: JobStream,
+        offset: u64,
         follow: bool,
     ) -> Result<RawByteStream>;
     async fn attach(&self, authority: Arc<WorkspaceAuthority>, id: JobId) -> Result<JobAttachment>;
@@ -334,6 +336,7 @@ impl ControllerRuntime for ActorRuntime {
         authority: Arc<WorkspaceAuthority>,
         id: JobId,
         stream: JobStream,
+        offset: u64,
         follow: bool,
     ) -> Result<RawByteStream> {
         Ok(poll_job_stream(
@@ -341,16 +344,17 @@ impl ControllerRuntime for ActorRuntime {
             authority,
             id,
             stream,
+            offset,
             follow,
         ))
     }
 
     async fn attach(&self, authority: Arc<WorkspaceAuthority>, id: JobId) -> Result<JobAttachment> {
         let stdout = self
-            .logs(Arc::clone(&authority), id, JobStream::Stdout, true)
+            .logs(Arc::clone(&authority), id, JobStream::Stdout, 0, true)
             .await?;
         let stderr = self
-            .logs(Arc::clone(&authority), id, JobStream::Stderr, true)
+            .logs(Arc::clone(&authority), id, JobStream::Stderr, 0, true)
             .await?;
         let runtime: Arc<dyn ControllerRuntime> = Arc::new(self.clone());
         Ok(JobAttachment {
@@ -400,16 +404,18 @@ fn actor_reply_error() -> CowshedError {
     )
 }
 
+/// The bytes of one stream from `offset` on, page by page; following asks again past end of file
+/// until the job is terminal.
 fn poll_job_stream(
     runtime: Arc<dyn ControllerRuntime>,
     authority: Arc<WorkspaceAuthority>,
     id: JobId,
     stream: JobStream,
+    mut offset: u64,
     follow: bool,
 ) -> RawByteStream {
     let (sender, receiver) = mpsc::channel(8);
     tokio::spawn(async move {
-        let mut offset = 0_u64;
         loop {
             let chunk = tokio::select! {
                 _ = sender.closed() => break,
@@ -654,6 +660,7 @@ struct WorkspaceWire {
 /// Explicit cowshed client. Its sealed runtime delegates to a single-owner controller actor.
 pub struct Cowshed {
     runtime: Arc<dyn ControllerRuntime>,
+    other_build: watch::Receiver<Option<OtherBuild>>,
 }
 
 impl Cowshed {
@@ -703,6 +710,7 @@ impl Cowshed {
         Ok(Coordinator {
             project: project.clone(),
             runtime: Arc::clone(&self.runtime),
+            other_build: self.other_build.clone(),
             _channel: token.channel,
         })
     }
@@ -1102,20 +1110,35 @@ async fn read_binary_frame(
 /// call that expects one; the actor matches the answer to its call by id. A failure that leaves
 /// the connection unusable fails every call still waiting, and the calls after it find the
 /// actor gone.
+///
+/// The reader also notes the daemon's refusal of the controller's build ([`OtherBuild`]) the
+/// first time an answer carries it, before that answer reaches its call: it says the controller
+/// behind this connection can start nothing in a workspace, whichever call met it.
 #[cfg(unix)]
-fn spawn_controller_actor(stream: tokio::net::UnixStream) -> Arc<dyn ControllerRuntime> {
+fn spawn_controller_actor(
+    stream: tokio::net::UnixStream,
+) -> (
+    Arc<dyn ControllerRuntime>,
+    watch::Receiver<Option<OtherBuild>>,
+) {
     let (sender, receiver) = mpsc::channel::<ActorMessage>(32);
     let (reader, writer) = stream.into_split();
     let (answers, answer_receiver) = mpsc::unbounded_channel();
+    let (other_build, refused) = watch::channel(None);
     let downloads = Downloads::default();
-    tokio::spawn(read_answers(reader, Arc::clone(&downloads), answers));
+    tokio::spawn(read_answers(
+        reader,
+        Arc::clone(&downloads),
+        answers,
+        other_build,
+    ));
     tokio::spawn(run_controller_actor(
         receiver,
         writer,
         downloads,
         answer_receiver,
     ));
-    Arc::new(ActorRuntime { sender })
+    (Arc::new(ActorRuntime { sender }), refused)
 }
 
 /// The stream offset each sent download call continues from, by call id. The actor adds an
@@ -1145,9 +1168,24 @@ async fn read_answers(
     mut reader: tokio::net::unix::OwnedReadHalf,
     downloads: Downloads,
     answers: mpsc::UnboundedSender<Result<Inbound>>,
+    other_build: watch::Sender<Option<OtherBuild>>,
 ) {
     loop {
         let inbound = read_inbound(&mut reader, &downloads).await;
+        if let Ok(Inbound::Answer(Answer {
+            outcome: Err(error),
+            ..
+        })) = &inbound
+            && let Some(refused) = error.other_build_source()
+        {
+            other_build.send_if_modified(|noted| {
+                let first = noted.is_none();
+                if first {
+                    *noted = Some(refused.clone());
+                }
+                first
+            });
+        }
         let failed = inbound.is_err();
         if answers.send(inbound).is_err() || failed {
             return;
@@ -1387,26 +1425,42 @@ async fn acquire_coordinator_token(descriptor: OwnedFd) -> Result<(Cowshed, Coor
             "coordinator handshake nonce or protocol version did not match",
         ));
     }
-    let runtime = spawn_controller_actor(stream);
+    let (runtime, other_build) = spawn_controller_actor(stream);
     let token = CoordinatorToken {
         repo_id,
         channel: AuthenticatedControllerChannel {
             runtime: Arc::clone(&runtime),
         },
     };
-    Ok((Cowshed { runtime }, token))
+    Ok((
+        Cowshed {
+            runtime,
+            other_build,
+        },
+        token,
+    ))
 }
 
 /// Sole project mutation and cross-workspace authority.
 pub struct Coordinator {
     project: Project,
     runtime: Arc<dyn ControllerRuntime>,
+    other_build: watch::Receiver<Option<OtherBuild>>,
     _channel: AuthenticatedControllerChannel,
 }
 
 impl Coordinator {
     pub fn project(&self) -> &Project {
         &self.project
+    }
+
+    /// The daemon's refusal of this controller's build, once any call on this connection has met
+    /// it. From then on the daemon refuses every call of this controller that needs a workspace
+    /// supervisor, while a supervisor of the controller's own build still serving — one draining
+    /// its jobs — keeps answering the calls that reach it. A controller of the daemon's build is
+    /// the remedy: after an install, the host's `cowshed controller` started again.
+    pub fn other_build(&self) -> watch::Receiver<Option<OtherBuild>> {
+        self.other_build.clone()
     }
 
     async fn workspace_result(&self, method: &'static str, params: Value) -> Result<WorkspaceRef> {
@@ -1914,9 +1968,16 @@ impl JobHandle {
         .await
     }
 
-    pub async fn logs(&self, stream: JobStream, follow: bool) -> Result<RawByteStream> {
+    /// One stream's bytes from `offset` on: a reader that holds the first `offset` bytes already
+    /// continues from there. `follow` keeps reading past end of file until the job is terminal.
+    pub async fn logs(
+        &self,
+        stream: JobStream,
+        offset: u64,
+        follow: bool,
+    ) -> Result<RawByteStream> {
         self.runtime
-            .logs(Arc::clone(&self.authority), self.id, stream, follow)
+            .logs(Arc::clone(&self.authority), self.id, stream, offset, follow)
             .await
     }
 
@@ -2144,6 +2205,7 @@ mod tests {
             _authority: Arc<WorkspaceAuthority>,
             _id: JobId,
             _stream: JobStream,
+            _offset: u64,
             _follow: bool,
         ) -> Result<RawByteStream> {
             Err(CowshedError::internal("unexpected test logs"))
@@ -2237,7 +2299,8 @@ mod tests {
     #[cfg(unix)]
     fn actor_pair() -> (Arc<dyn ControllerRuntime>, tokio::net::UnixStream) {
         let (client, server) = tokio::net::UnixStream::pair().unwrap();
-        (spawn_controller_actor(client), server)
+        let (runtime, _) = spawn_controller_actor(client);
+        (runtime, server)
     }
 
     #[cfg(unix)]
@@ -2318,6 +2381,14 @@ mod tests {
     }
     #[cfg(unix)]
     fn coordinator(runtime: Arc<dyn ControllerRuntime>) -> Coordinator {
+        coordinator_over(runtime, watch::channel(None).1)
+    }
+
+    #[cfg(unix)]
+    fn coordinator_over(
+        runtime: Arc<dyn ControllerRuntime>,
+        other_build: watch::Receiver<Option<OtherBuild>>,
+    ) -> Coordinator {
         let repo_id = RepoId::parse("acme/widget").unwrap();
         let binding = RepositoryBinding::new(vec![crate::repository::BoundIdentity {
             repo_id: repo_id.clone(),
@@ -2341,6 +2412,7 @@ mod tests {
         Coordinator {
             project,
             runtime: Arc::clone(&runtime),
+            other_build,
             _channel: AuthenticatedControllerChannel { runtime },
         }
     }
@@ -2520,6 +2592,7 @@ mod tests {
         let (sender, _receiver) = mpsc::channel(1);
         let cowshed = Cowshed {
             runtime: Arc::new(ActorRuntime { sender }),
+            other_build: watch::channel(None).1,
         };
         let path = PathBuf::from(std::ffi::OsString::from_vec(vec![b'/', 0xff]));
         let error = cowshed.open(path).await.unwrap_err();
@@ -2824,9 +2897,10 @@ mod tests {
             Arc::clone(&authority),
             id,
             JobStream::Stdout,
+            0,
             false,
         );
-        let mut stderr = poll_job_stream(runtime, authority, id, JobStream::Stderr, false);
+        let mut stderr = poll_job_stream(runtime, authority, id, JobStream::Stderr, 0, false);
         let server_task = tokio::spawn(async move {
             for _ in 0..2 {
                 let (_, request) = read_rpc_request(&mut server).await;
@@ -2872,6 +2946,78 @@ mod tests {
         );
         assert!(stdout.next().await.is_none());
         assert!(stderr.next().await.is_none());
+        server_task.await.unwrap();
+    }
+
+    /// A read that names an offset asks the controller for the bytes from there, so a reader that
+    /// already holds some continues where it stopped instead of reading them again.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_log_read_continues_from_the_offset_it_names() {
+        let (runtime, mut server) = actor_pair();
+        let job = JobHandle {
+            authority: test_authority(),
+            id: JobId::new(7).unwrap(),
+            runtime,
+        };
+        let server_task = tokio::spawn(async move {
+            let (_, request) = read_rpc_request(&mut server).await;
+            assert_eq!(request["method"], "job.logs");
+            assert_eq!(request["params"]["offset"], 6);
+            write_rpc_success(
+                &mut server,
+                request["id"].as_u64().unwrap(),
+                json!({"eof": true, "nextOffset": 12}),
+                Some(6),
+            )
+            .await;
+            write_raw_frame(&mut server, b"world\n").await;
+        });
+
+        let mut stream = job.logs(JobStream::Stdout, 6, false).await.unwrap();
+        let mut bytes = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            bytes.extend_from_slice(&chunk.unwrap());
+        }
+
+        assert_eq!(bytes, b"world\n");
+        server_task.await.unwrap();
+    }
+
+    /// The daemon's refusal of the controller's build marks the whole connection, so whoever
+    /// holds it learns the controller can run nothing new from data, not from the sentence; any
+    /// other refusal leaves the connection unmarked.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_refusal_of_the_controllers_build_marks_its_connection() {
+        let (client, mut server) = tokio::net::UnixStream::pair().unwrap();
+        let (runtime, other_build) = spawn_controller_actor(client);
+        let coordinator = coordinator_over(runtime, other_build);
+        let refused = OtherBuild {
+            daemon: crate::runtime::supervisor_socket::BuildId::current()
+                .unwrap()
+                .clone(),
+            caller: None,
+        };
+        let answered = refused.clone();
+        let server_task = tokio::spawn(async move {
+            for error in [
+                CowshedError::conflict("workspace raven is busy", "retry"),
+                CowshedError::other_build(answered),
+            ] {
+                let (_, request) = read_rpc_request(&mut server).await;
+                let response =
+                    codec::encode_rpc_error(request["id"].as_u64().unwrap(), &error).unwrap();
+                write_rpc_frame(&mut server, &response).await.unwrap();
+            }
+        });
+        let marked = coordinator.other_build();
+
+        coordinator.doctor().await.expect_err("busy");
+        assert_eq!(*marked.borrow(), None, "another refusal leaves it unmarked");
+        let error = coordinator.doctor().await.expect_err("refused");
+        assert_eq!(error.other_build_source(), Some(&refused));
+        assert_eq!(*marked.borrow(), Some(refused));
         server_task.await.unwrap();
     }
 
@@ -3092,6 +3238,7 @@ mod tests {
             test_authority(),
             JobId::new(7).unwrap(),
             JobStream::Stdout,
+            0,
             true,
         );
 
@@ -3110,6 +3257,7 @@ mod tests {
             test_authority(),
             JobId::new(7).unwrap(),
             JobStream::Stdout,
+            0,
             true,
         );
 
@@ -3132,6 +3280,7 @@ mod tests {
             test_authority(),
             JobId::new(7).unwrap(),
             JobStream::Stdout,
+            0,
             false,
         );
         let mut bytes = Vec::new();
@@ -3154,6 +3303,7 @@ mod tests {
             test_authority(),
             JobId::new(7).unwrap(),
             JobStream::Stdout,
+            0,
             false,
         );
         tokio::time::timeout(std::time::Duration::from_secs(1), async {
@@ -3177,6 +3327,7 @@ mod tests {
             test_authority(),
             JobId::new(7).unwrap(),
             JobStream::Stdout,
+            0,
             true,
         );
         while runtime.active_calls.load(Ordering::SeqCst) == 0 {

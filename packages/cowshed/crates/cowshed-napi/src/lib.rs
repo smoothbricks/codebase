@@ -735,7 +735,12 @@ impl JobHandle {
                     ));
                 }
             };
-            read_all_logs(job.logs(stream, follow).await.map_err(AddonFailure::from)?).await
+            read_all_logs(
+                job.logs(stream, 0, follow)
+                    .await
+                    .map_err(AddonFailure::from)?,
+            )
+            .await
         })
     }
 

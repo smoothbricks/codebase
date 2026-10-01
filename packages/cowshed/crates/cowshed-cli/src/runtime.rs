@@ -757,7 +757,7 @@ impl ForegroundJob for JobHandle {
     }
 
     async fn relay(&self, stream: JobStream, writer: &mut (dyn Write + Send)) -> Result<()> {
-        let mut stream = self.logs(stream, true).await?;
+        let mut stream = self.logs(stream, 0, true).await?;
         while let Some(chunk) = stream.next().await {
             writer.write_all(&chunk?).map_err(output_error)?;
         }

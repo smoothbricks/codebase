@@ -59,8 +59,32 @@ pub struct CowshedError {
     pub code: ErrorCode,
     pub message: String,
     pub hint: String,
+    /// Present only on the daemon's refusal of another build's request. Absent from the wire
+    /// otherwise, and ignored by a build that predates it, so every other error reads as it did.
+    /// Boxed: every `Result` in cowshed carries this type, and the cause is rare.
+    #[serde(
+        rename = "otherBuild",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    other_build: Option<Box<OtherBuild>>,
     #[serde(skip)]
     lifecycle_conflict: Option<crate::storage::lifecycle::Conflict>,
+}
+
+/// The daemon serves only its own build, and refused a request from another (11_shell.md
+/// "hello"). A controller of the refused build can start nothing in a workspace from then on; a
+/// controller of the daemon's build — the host's current `cowshed` once an install has started
+/// its daemon — can. Unknown fields are ignored, so a later build may say more here without an
+/// earlier one losing the error.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OtherBuild {
+    /// The build the daemon runs.
+    pub daemon: crate::runtime::supervisor_socket::BuildId,
+    /// The build the request named; `None` for a request that named none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caller: Option<crate::runtime::supervisor_socket::BuildId>,
 }
 
 impl CowshedError {
@@ -69,6 +93,7 @@ impl CowshedError {
             code,
             message: message.into(),
             hint: hint.into(),
+            other_build: None,
             lifecycle_conflict: None,
         }
     }
@@ -91,7 +116,28 @@ impl CowshedError {
             code: ErrorCode::Conflict,
             message: conflict.to_string(),
             hint: "refresh workspace state and retry".to_owned(),
+            other_build: None,
             lifecycle_conflict: Some(conflict),
+        }
+    }
+
+    /// The daemon's refusal of another build's request: a `Conflict` that names both builds in its
+    /// sentence and carries them as [`OtherBuild`].
+    pub fn other_build(other: OtherBuild) -> Self {
+        let message = format!(
+            "the cowshed daemon is build {}; this cowshed is build {}",
+            other.daemon,
+            other.caller.as_ref().map_or(
+                "(unnamed)",
+                crate::runtime::supervisor_socket::BuildId::as_str
+            )
+        );
+        Self {
+            code: ErrorCode::Conflict,
+            message,
+            hint: "run `cowshed gateway start` from the cowshed you mean to use".to_owned(),
+            other_build: Some(Box::new(other)),
+            lifecycle_conflict: None,
         }
     }
 
@@ -186,6 +232,11 @@ impl CowshedError {
     /// The exact stale lifecycle fact, when this error came from `execute_checked`.
     pub fn lifecycle_conflict_source(&self) -> Option<&crate::storage::lifecycle::Conflict> {
         self.lifecycle_conflict.as_ref()
+    }
+
+    /// The two builds, when this is the daemon's refusal of another build's request.
+    pub fn other_build_source(&self) -> Option<&OtherBuild> {
+        self.other_build.as_deref()
     }
 
     pub const fn exit_code(&self) -> u8 {

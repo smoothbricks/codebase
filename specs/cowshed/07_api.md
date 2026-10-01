@@ -322,7 +322,8 @@ pub struct JobHandle { /* immutable repo/workspace/incarnation fence + JobId + a
 impl JobHandle {
     pub fn id(&self) -> JobId;
     pub async fn status(&self) -> Result<JobInfo, CowshedError>;
-    pub async fn logs(&self, stream: JobStream, follow: bool)
+    // From `offset` on: a reader holding the first `offset` bytes continues where it stopped.
+    pub async fn logs(&self, stream: JobStream, offset: u64, follow: bool)
         -> Result<RawByteStream, CowshedError>; // representation-transparent; always resolves storage.artifact
     pub async fn attach(&self) -> Result<JobAttachment, CowshedError>;
     pub async fn detach(&self) -> Result<(), CowshedError>;          // job continues
@@ -450,6 +451,9 @@ pub enum WarmAdmission {
 /// mirror repositories, set checkpoint quotas, or assign slots.
 pub struct Coordinator { /* Project + authenticated controller identity */ }
 impl Coordinator {
+    // The daemon's refusal of this controller's build (`OtherBuild`), once any call on this
+    // connection met it; the remedy is a controller of the daemon's build (11_shell.md "hello").
+    pub fn other_build(&self) -> watch::Receiver<Option<OtherBuild>>;
     pub async fn adopt(&self, opts: AdoptOptions) -> Result<WorkspaceRef, CowshedError>;
     pub async fn create(&self, name: &str, opts: CreateOptions) -> Result<WorkspaceRef, CowshedError>;
     pub async fn fork(&self, src: &str, dst: &str) -> Result<WorkspaceRef, CowshedError>;
