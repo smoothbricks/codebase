@@ -908,50 +908,104 @@ fn json_envelope_has_exact_discriminated_success_and_failure_shapes() {
     }
 }
 
-#[test]
-fn lesser_capabilities_fail_to_compile_with_coordinator_authority() {
-    // Compiled by cargo, not by a hand-assembled rustc command line.
-    //
-    // This test used to run rustc itself against the newest `libcowshed_core-*.rlib` in
-    // `<target>/debug/deps`, to avoid a path-dependency `cargo check` rebuilding cowshed-core. Two
-    // toolchain changes made that technique impossible rather than merely fragile:
-    //
-    // * cargo no longer writes package rlibs into `<target>/<profile>/deps`. They live in
-    //   `<target>/<profile>/build/<pkg>/<hash>/out/`, and dependencies are found through one
-    //   `-L dependency=` per package rather than a single shared directory.
-    // * rustc now emits rlibs carrying only a metadata *stub*, with the full metadata in a sibling
-    //   `.rmeta`. `--extern name=<rlib>` fails with "only metadata stub found", and reproducing
-    //   cargo's rlib/rmeta pairing by hand does not resolve either.
-    //
-    // Reconstructing cargo's dependency search path here would have to be redone at every layout
-    // change, and while it was broken this gate passed nothing and proved nothing. Asking cargo
-    // cannot go stale.
-    //
-    // The check shares the OUTER target directory. A probe-private one costs a full cold
-    // dependency check of cowshed-core's whole tree — measured at 48s on an idle M5 Max, ~110s of
-    // CPU, and 927MB of duplicated artifacts — and that lands inside this test's bounded window on
-    // every cold CI runner, where a multi-crate check runs ~5x slower than here. Sharing reuses
-    // what `cargo test --workspace --no-run` already built in its own unbounded target: 13.7s on
-    // first check, 0.4s after, and a fifth of the CPU.
-    //
-    // The outer cargo owning this directory is not a conflict. nextest builds through cargo and
-    // then runs the test binaries itself, releasing the build lock before execution, so a `cargo
-    // check` against the shared directory while this suite is running does not block — measured at
-    // 0.401s mid-run. Fingerprints keep the probe's artifacts distinct from the outer build's
-    // rather than evicting them, so neither invalidates the other.
-    //
-    // If a stale-artifact failure ever reappears here, this is what it looks like: a poisoned rlib
-    // left in the legacy `deps` directory, written by sccache with 0640 permissions on a cache hit,
-    // compiled by a rustc that is no longer the one on PATH.
-    //
-    // Every case is its own crate, so each is checked in a rustc session of its own: rustc skips
-    // its privacy pass once type checking failed, so cases sharing a crate would hide each other's
-    // later-phase errors. The crates are members of ONE probe workspace checked by ONE cargo with
-    // `--keep-going`. A cargo per case paid resolution and the fingerprint walk of cowshed-core's
-    // whole tree once per case, which on a cold CI runner pushed this test past its bounded
-    // window. The outer lockfile pins the probe to the versions the outer build compiled, so
-    // resolution is a lookup and the build scripts and proc macros it already compiled are the
-    // probe's too.
+/// Each capability probe case: a crate name, a snippet that must not compile, and what its errors
+/// must name.
+const CAPABILITY_CASES: [(&str, &str, &[&str]); 6] = [
+    (
+        "project_authority",
+        "use cowshed_core::Project;\nfn deny(value: &Project) { value.attach(); value.exec(); value.grant(); value.gc(); }\n",
+        &["attach", "exec", "grant", "gc"],
+    ),
+    (
+        "worker_authority",
+        "use cowshed_core::WorkspaceHandle;\nfn deny(value: &WorkspaceHandle) { value.grant(); value.revoke(); value.restore(); value.destroy(); value.rebase(); value.land(); value.gc(); value.repo_mirror(); value.detach(); value.workspace(\"other\"); }\n",
+        &[
+            "grant",
+            "revoke",
+            "restore",
+            "destroy",
+            "rebase",
+            "land",
+            "gc",
+            "repo_mirror",
+            "detach",
+            "workspace",
+        ],
+    ),
+    (
+        "token_traits",
+        "use cowshed_core::CoordinatorToken;\nfn must_clone<T: Clone>() {} fn must_serialize<T: serde::Serialize>() {}\nfn deny() { must_clone::<CoordinatorToken>(); must_serialize::<CoordinatorToken>(); }\n",
+        &["Clone", "Serialize"],
+    ),
+    (
+        "private_construction",
+        "use cowshed_core::{CoordinatorToken,Cowshed,Project,WorkspaceHandle};\nfn deny() { let _ = Cowshed {}; let _ = Project {}; let _ = WorkspaceHandle {}; let _ = CoordinatorToken {}; }\n",
+        &[
+            "Cowshed",
+            "Project",
+            "WorkspaceHandle",
+            "CoordinatorToken",
+            "private",
+        ],
+    ),
+    (
+        "port_block_construction",
+        "use cowshed_core::api::PortBlock;\nfn deny() { let _ = PortBlock { base: 40960, size: 16 }; }\n",
+        &["PortBlock", "private"],
+    ),
+    (
+        "null_success",
+        "use cowshed_core::api::JsonEnvelope;\nfn deny() { let _ = JsonEnvelope::success(()); }\n",
+        &["success", "Sealed"],
+    ),
+];
+
+/// Writes the capability probe workspace, one crate per case holding `source(name)`, and checks it
+/// with cargo in the OUTER target directory.
+///
+/// Compiled by cargo, not by a hand-assembled rustc command line.
+///
+/// This test used to run rustc itself against the newest `libcowshed_core-*.rlib` in
+/// `<target>/debug/deps`, to avoid a path-dependency `cargo check` rebuilding cowshed-core. Two
+/// toolchain changes made that technique impossible rather than merely fragile:
+///
+/// * cargo no longer writes package rlibs into `<target>/<profile>/deps`. They live in
+///   `<target>/<profile>/build/<pkg>/<hash>/out/`, and dependencies are found through one
+///   `-L dependency=` per package rather than a single shared directory.
+/// * rustc now emits rlibs carrying only a metadata *stub*, with the full metadata in a sibling
+///   `.rmeta`. `--extern name=<rlib>` fails with "only metadata stub found", and reproducing
+///   cargo's rlib/rmeta pairing by hand does not resolve either.
+///
+/// Reconstructing cargo's dependency search path here would have to be redone at every layout
+/// change, and while it was broken this gate passed nothing and proved nothing. Asking cargo
+/// cannot go stale.
+///
+/// The check shares the OUTER target directory. A probe-private one costs a full cold dependency
+/// check of cowshed-core's whole tree — measured at 48s on an idle M5 Max, ~110s of CPU, and 927MB
+/// of duplicated artifacts. Sharing reuses the build scripts and proc macros `cargo test
+/// --workspace --no-run` already built, and keeps what one probe check compiled for the next.
+///
+/// The outer cargo owning this directory is not a conflict. nextest builds through cargo and then
+/// runs the test binaries itself, releasing the build lock before execution, so a `cargo check`
+/// against the shared directory while this suite is running does not block — measured at 0.401s
+/// mid-run. Fingerprints keep the probe's artifacts distinct from the outer build's rather than
+/// evicting them, so neither invalidates the other.
+///
+/// If a stale-artifact failure ever reappears here, this is what it looks like: a poisoned rlib
+/// left in the legacy `deps` directory, written by sccache with 0640 permissions on a cache hit,
+/// compiled by a rustc that is no longer the one on PATH.
+///
+/// Every case is its own crate, so each is checked in a rustc session of its own: rustc skips its
+/// privacy pass once type checking failed, so cases sharing a crate would hide each other's
+/// later-phase errors. The crates are members of ONE probe workspace checked by ONE cargo with
+/// `--keep-going`; a cargo per case paid resolution and the fingerprint walk of cowshed-core's
+/// whole tree once per case. The outer lockfile pins the probe to the versions the outer build
+/// compiled, so resolution is a lookup.
+///
+/// The probe's path, manifests and lockfile are the same whatever `source` returns, so its
+/// dependencies resolve, and their artifacts fingerprint, the same for the warm-up and for the
+/// test: only the case crates themselves differ.
+fn check_capability_probe(source: impl Fn(&str) -> &'static str) -> std::process::Output {
     let target = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .parent()
         .expect("cargo target directory")
@@ -974,61 +1028,15 @@ fn lesser_capabilities_fail_to_compile_with_coordinator_authority() {
         .find(|lockfile| lockfile.is_file())
         .expect("the workspace lockfile");
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
-    let cases: [(&str, &str, &[&str]); 6] = [
-        (
-            "project_authority",
-            "use cowshed_core::Project;\nfn deny(value: &Project) { value.attach(); value.exec(); value.grant(); value.gc(); }\n",
-            &["attach", "exec", "grant", "gc"],
-        ),
-        (
-            "worker_authority",
-            "use cowshed_core::WorkspaceHandle;\nfn deny(value: &WorkspaceHandle) { value.grant(); value.revoke(); value.restore(); value.destroy(); value.rebase(); value.land(); value.gc(); value.repo_mirror(); value.detach(); value.workspace(\"other\"); }\n",
-            &[
-                "grant",
-                "revoke",
-                "restore",
-                "destroy",
-                "rebase",
-                "land",
-                "gc",
-                "repo_mirror",
-                "detach",
-                "workspace",
-            ],
-        ),
-        (
-            "token_traits",
-            "use cowshed_core::CoordinatorToken;\nfn must_clone<T: Clone>() {} fn must_serialize<T: serde::Serialize>() {}\nfn deny() { must_clone::<CoordinatorToken>(); must_serialize::<CoordinatorToken>(); }\n",
-            &["Clone", "Serialize"],
-        ),
-        (
-            "private_construction",
-            "use cowshed_core::{CoordinatorToken,Cowshed,Project,WorkspaceHandle};\nfn deny() { let _ = Cowshed {}; let _ = Project {}; let _ = WorkspaceHandle {}; let _ = CoordinatorToken {}; }\n",
-            &[
-                "Cowshed",
-                "Project",
-                "WorkspaceHandle",
-                "CoordinatorToken",
-                "private",
-            ],
-        ),
-        (
-            "port_block_construction",
-            "use cowshed_core::api::PortBlock;\nfn deny() { let _ = PortBlock { base: 40960, size: 16 }; }\n",
-            &["PortBlock", "private"],
-        ),
-        (
-            "null_success",
-            "use cowshed_core::api::JsonEnvelope;\nfn deny() { let _ = JsonEnvelope::success(()); }\n",
-            &["success", "Sealed"],
-        ),
-    ];
     // The probe's own `[workspace]` detaches it from the outer workspace, whose members it must
     // not join and whose lints and profiles it must not inherit — each snippet is meant to fail on
     // visibility, and nothing else. `serde` is here because one snippet names a serde trait to
     // prove a sealed token does not implement it; without it that snippet would fail on an
     // unresolved crate and prove nothing.
-    let members: Vec<String> = cases.iter().map(|(name, ..)| format!("{name:?}")).collect();
+    let members: Vec<String> = CAPABILITY_CASES
+        .iter()
+        .map(|(name, ..)| format!("{name:?}"))
+        .collect();
     fs::write(
         probe.join("Cargo.toml"),
         format!(
@@ -1038,7 +1046,7 @@ fn lesser_capabilities_fail_to_compile_with_coordinator_authority() {
     )
     .expect("probe workspace manifest");
     fs::copy(&lockfile, probe.join("Cargo.lock")).expect("probe lockfile");
-    for (name, source, _) in &cases {
+    for (name, ..) in CAPABILITY_CASES {
         let crate_dir = probe.join(name);
         fs::create_dir_all(crate_dir.join("src")).expect("probe crate directory");
         fs::write(
@@ -1051,9 +1059,9 @@ fn lesser_capabilities_fail_to_compile_with_coordinator_authority() {
             ),
         )
         .expect("probe manifest");
-        fs::write(crate_dir.join("src/lib.rs"), source).expect("deny snippet");
+        fs::write(crate_dir.join("src/lib.rs"), source(name)).expect("probe source");
     }
-    let output = Command::new(&cargo)
+    Command::new(&cargo)
         .arg("check")
         .arg("--workspace")
         .arg("--keep-going")
@@ -1063,13 +1071,42 @@ fn lesser_capabilities_fail_to_compile_with_coordinator_authority() {
         .arg(&target)
         .current_dir(&probe)
         .output()
-        .unwrap_or_else(|error| panic!("cargo check: {error}"));
+        .unwrap_or_else(|error| panic!("cargo check: {error}"))
+}
+
+/// The capability probe's build step: everything the probe checks except its snippets, which is
+/// cowshed-core's whole dependency tree as the probe resolves it. On a cold CI runner that check
+/// takes longer than the bounded window of the test below (measured over 100s on a hosted arm64
+/// macOS runner, where it timed the release candidate out), and none of it is under test. So
+/// `cowshed:capability-probe-warmup` runs this ahead of `cargo-test-cowshed-core-exceptions`, in
+/// a build budget, and the test's window covers the six case crates alone. Ignored, because it
+/// proves nothing a test should: every crate is empty and must check.
+#[test]
+#[ignore = "build step for the capability probe; cowshed:capability-probe-warmup runs it"]
+fn capability_probe_dependencies_check() {
+    let output = check_capability_probe(|_| "");
+    assert!(
+        output.status.success(),
+        "the capability probe's dependencies did not check:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn lesser_capabilities_fail_to_compile_with_coordinator_authority() {
+    let output = check_capability_probe(|name| {
+        CAPABILITY_CASES
+            .iter()
+            .find(|(case, ..)| *case == name)
+            .map(|(_, source, _)| *source)
+            .expect("a capability case")
+    });
     let diagnostic = String::from_utf8_lossy(&output.stderr);
     assert!(
         !output.status.success(),
         "every capability probe unexpectedly compiled:\n{diagnostic}"
     );
-    for (name, _, expected) in cases {
+    for (name, _, expected) in CAPABILITY_CASES {
         // `--message-format=short` puts each diagnostic on one line headed by its file, relative
         // to the probe workspace.
         let file = format!("{name}/src/lib.rs:");

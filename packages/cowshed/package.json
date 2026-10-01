@@ -232,6 +232,31 @@
           "cwd": "packages/cowshed"
         }
       },
+      "capability-probe-warmup": {
+        "executor": "@smoothbricks/nx-plugin:bounded-exec",
+        "cache": false,
+        "dependsOn": [
+          {
+            "target": "cargo-test-archive",
+            "projects": [
+              "@smoothbricks/codebase"
+            ]
+          }
+        ],
+        "options": {
+          "comment": "Build prerequisite for cargo-test-cowshed-core-exceptions, not a test. public_api_contracts' capability probe cargo-checks six crates against cowshed-core, and the dependency half of that check (cowshed-core's whole tree as the probe resolves it) took the exceptions shard past its 120s bound on a cold hosted arm64 macOS runner. This runs the ignored capability_probe_dependencies_check from the same archive, which writes the identical probe with empty crates and checks it into the shared target/, so the shard's window spends its time on the six case crates. The 600s budget is a build budget, as in wire-warmup. cache:false is load-bearing: the warmed artifacts live in target/, outside Nx outputs, so a cached skip on a fresh runner would leave the shard cold.",
+          "command": "cargo --frozen nextest run --archive-file target/nextest/archive.tar.zst --workspace-remap . -E 'package(cowshed-core) and test(=capability_probe_dependencies_check)' --run-ignored only --no-tests=fail --user-config-file none",
+          "cwd": ".",
+          "timeoutMs": 600000,
+          "killAfterMs": 10000
+        }
+      },
+      "cargo-test-cowshed-core-exceptions": {
+        "dependsOn": [
+          "...",
+          "capability-probe-warmup"
+        ]
+      },
       "wire-warmup": {
         "executor": "@smoothbricks/nx-plugin:bounded-exec",
         "cache": false,
