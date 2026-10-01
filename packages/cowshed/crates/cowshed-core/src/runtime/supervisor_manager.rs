@@ -938,7 +938,7 @@ mod tests {
     /// the socket it can no longer unlink are gone.
     #[tokio::test]
     async fn a_verb_stops_a_supervisor_of_another_build_and_the_jobs_it_left() {
-        use std::os::unix::process::{CommandExt as _, ExitStatusExt as _};
+        use std::os::unix::process::ExitStatusExt as _;
         // Unix socket paths are short; the per-user temporary directory is not.
         let store = PathBuf::from("/tmp").join(format!(
             "cowshed-stop-{}",
@@ -946,8 +946,9 @@ mod tests {
         ));
         std::fs::create_dir_all(store.join("run")).expect("run directory");
         let socket = store.join("run/other.sock");
+        // Killed should the test fail before it is stopped: the helper serves until it is killed.
         let mut supervisor =
-            std::process::Command::new(std::env::current_exe().expect("test binary"))
+            tokio::process::Command::new(std::env::current_exe().expect("test binary"))
                 .args([
                     "--exact",
                     "runtime::supervisor_manager::tests::serves_as_a_supervisor_of_another_build",
@@ -955,6 +956,7 @@ mod tests {
                 ])
                 .env(OTHER_BUILD_SOCKET, &socket)
                 .stdout(std::process::Stdio::null())
+                .kill_on_drop(true)
                 .spawn()
                 .expect("start the supervisor of another build");
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
@@ -965,22 +967,25 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        let mut job = std::process::Command::new("/bin/sleep")
+        // `sleep` from PATH: NixOS keeps nothing but `sh` and `env` in /bin and /usr/bin.
+        let mut job = tokio::process::Command::new("sleep")
             .arg("60")
             .process_group(0)
+            .kill_on_drop(true)
             .spawn()
             .expect("a job leading its own group");
+        let group = job.id().expect("the job runs");
         let ledger = super::super::job_groups::ledger_path(&socket);
-        super::super::job_groups::record(&ledger, &[(7, job.id())]).expect("ledger");
+        super::super::job_groups::record(&ledger, &[(7, group)]).expect("ledger");
 
         let stopped = stop_other_build(&socket).await.expect("stopped");
 
-        assert_eq!(stopped, supervisor.id());
+        assert_eq!(Some(stopped), supervisor.id());
         assert_eq!(
-            supervisor.wait().expect("supervisor").signal(),
+            supervisor.wait().await.expect("supervisor").signal(),
             Some(libc::SIGTERM)
         );
-        assert_eq!(job.wait().expect("job").signal(), Some(libc::SIGTERM));
+        assert_eq!(job.wait().await.expect("job").signal(), Some(libc::SIGTERM));
         assert!(!ledger.exists(), "the ledger is taken");
         assert!(!socket.exists(), "the socket nothing serves is gone");
         std::fs::remove_dir_all(store).expect("cleanup");
