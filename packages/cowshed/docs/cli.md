@@ -1086,6 +1086,13 @@ doctor records a finding for it while checking other projects.
 If a selected project's checks cannot run, doctor records an error finding named `project-checks-skipped`; it never
 turns missing evidence into `healthy: true`.
 
+Opening the project for its checks finishes nothing, unlike every other command's open: no unfinished lifecycle
+operation is replayed (`main`'s included), no interrupted publication or restore is completed, no retired image is
+reclaimed, no repository identity change is finished and no moved remote URL is written to the binding. Doctor reports
+each instead — `unfinished-intent`, `interrupted-publication`, `pending-publication`, `retired-trash`,
+`identity-change-unfinished` and `binding-moved` — and the next command that opens the project finishes them.
+`cowshed doctor --repair` opens the project the way every other command does.
+
 `cowshed doctor --repair` handles one narrow, mechanically provable failure: valid artifact frames whose job sequence
 numbers are not strictly increasing because concurrent writers raced. It first validates every frame header, length
 complement, SHA-256 digest, trailer, Arrow payload, record invariant, and checkpoint prefix. If anything except sequence

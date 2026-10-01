@@ -130,11 +130,13 @@ from it; honoring the path condition by telling the user exactly which rule to e
 
 Every step is idempotent to re-run. Intent is fsynced before image mutation. If adoption dies during the tree copy, the
 next open clone-copies the partial staged image under a fresh incarnation and the delta copier skips every completed
-leaf before resuming; it does not start the repository copy over. At later crash points `cowshed doctor`/`cowshed gc`
-resume or roll back from the image, companion, and checkout-swap facts. Because the durable half completes first, the
-post-copy resumable state is _mount and image published, checkout still the original directory, swap pending_ — recovery
-needs nothing from the user's tree to finish it, and `<root>.pre-cowshed` does not exist yet. `<root>.pre-cowshed` is
-retained until the user deletes it; cowshed never auto-deletes it.
+leaf before resuming; it does not start the repository copy over. At later crash points the next command that opens the
+project — `cowshed gc`, `cowshed doctor --repair`, any verb — resumes or rolls back from the image, companion, and
+checkout-swap facts; plain `cowshed doctor` reports the unfinished adoption (`unfinished-intent`) and changes nothing.
+Because the durable half completes first, the post-copy resumable state is _mount and image published, checkout still
+the original directory, swap pending_ — recovery needs nothing from the user's tree to finish it, and
+`<root>.pre-cowshed` does not exist yet. `<root>.pre-cowshed` is retained until the user deletes it; cowshed never
+auto-deletes it.
 
 Adopting is reversible, and reverses the same way: `cowshed rm main --restore` detaches, swaps the retained
 `<root>.pre-cowshed` tree back against whatever publication left at the checkout path — the emptied mountpoint directory
@@ -291,7 +293,8 @@ under an exclusive lock on `lifecycle-intents.json.lock`, so no process writes b
 process's intent. The process executing a workspace's lifecycle operation holds that workspace's intent lease
 (`sessions/<name>.intent.lock`) until the verb returns; the kernel releases it when the process exits, however it exits.
 Startup recovery acts only on unfinished intents whose lease it can take. An intent whose lease another process holds is
-that process's running operation, not crash residue, and is never run a second time beside it.
+that process's running operation, not crash residue, and is never run a second time beside it. `cowshed doctor` runs no
+startup recovery at all: it reports every unfinished intent and leaves it journaled.
 
 A `PendingFence` clone that no unfinished intent names, and that no process is creating (its intent lease and its
 image's lifecycle lock are both free), is abandoned: nothing will finish it, and because it was never published nothing

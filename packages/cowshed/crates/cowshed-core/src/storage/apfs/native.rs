@@ -1032,6 +1032,35 @@ fn collect_restore_sidecars(
     Ok(())
 }
 
+/// The canonical grants sidecars of `project` whose image does not exist and that no restore
+/// owns: a publication a crash interrupted before its image was renamed in, or a retirement that
+/// moved the image to the trash and died before its metadata went. Store recovery
+/// (`recover_pending`) publishes the first from staging and removes the second; this only reads,
+/// so an inspection that recovers nothing can name what recovery would settle.
+pub fn interrupted_publications(project: &Path) -> Result<Vec<PathBuf>, ApfsStorageError> {
+    let sessions = project.join(SESSIONS_DIRECTORY);
+    let mut interrupted = Vec::new();
+    for directory in [project, sessions.as_path()] {
+        for sidecar in regular_file_children(directory)? {
+            if !sidecar
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with(GRANTS_SIDECAR_SUFFIX))
+            {
+                continue;
+            }
+            let image = image_from_sidecar(&sidecar)?;
+            if is_image_path(&image)
+                && !image.exists()
+                && !restore_recovery_fact_path(&image).exists()
+            {
+                interrupted.push(sidecar);
+            }
+        }
+    }
+    Ok(interrupted)
+}
+
 fn image_from_sidecar(sidecar: &Path) -> Result<PathBuf, ApfsStorageError> {
     crate::metadata::image_from_sidecar_path(sidecar).ok_or_else(|| {
         ApfsStorageError::Host(format!(

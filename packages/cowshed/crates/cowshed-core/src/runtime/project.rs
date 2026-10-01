@@ -356,6 +356,12 @@ pub enum RecoveryScope {
     /// clone intent unreplayed while that clone's grants collide, so the retirement can repair
     /// the duplicate endpoint.
     Removal(WorkspaceName),
+    /// Inspection (`doctor` without `--repair`): the opening finishes nothing. No lifecycle intent
+    /// is replayed, `main`'s included; no interrupted publication or restore is completed; no
+    /// retired image is reclaimed; no identity change is finished; no healed binding is written.
+    /// The opening reads the store as it is, and doctor reports what any other opening would
+    /// finish as findings.
+    Inspect,
 }
 
 /// What recovery does with one unfinished intent under a [`RecoveryScope`]. Only the native
@@ -374,10 +380,9 @@ enum IntentReplay {
 #[cfg(target_os = "macos")]
 impl RecoveryScope {
     fn replay(&self, workspace: &WorkspaceName) -> IntentReplay {
-        if workspace.is_main() {
-            return IntentReplay::Own;
-        }
         match self {
+            Self::Inspect => IntentReplay::Leave,
+            _ if workspace.is_main() => IntentReplay::Own,
             Self::Store => IntentReplay::Residue,
             Self::Workspaces(named) if named.contains(workspace) => IntentReplay::Own,
             Self::Removal(target) if target == workspace => IntentReplay::Own,
@@ -388,7 +393,15 @@ impl RecoveryScope {
     fn removal_target(&self) -> Option<&WorkspaceName> {
         match self {
             Self::Removal(target) => Some(target),
-            Self::Store | Self::Workspaces(_) => None,
+            Self::Store | Self::Workspaces(_) | Self::Inspect => None,
+        }
+    }
+
+    /// Whether the opening may finish what interrupted work left behind.
+    fn repairs(&self) -> bool {
+        match self {
+            Self::Store | Self::Workspaces(_) | Self::Removal(_) => true,
+            Self::Inspect => false,
         }
     }
 }
@@ -441,6 +454,22 @@ mod recovery_scope_tests {
             RecoveryScope::Store.replay(&name("b")),
             IntentReplay::Residue
         );
+    }
+
+    /// `doctor` reads the store as it is: not even `main`'s unfinished work is replayed.
+    #[test]
+    fn inspection_replays_nothing_and_repairs_nothing() {
+        assert_eq!(
+            RecoveryScope::Inspect.replay(&name("main")),
+            IntentReplay::Leave
+        );
+        assert_eq!(
+            RecoveryScope::Inspect.replay(&name("b")),
+            IntentReplay::Leave
+        );
+        assert_eq!(RecoveryScope::Inspect.removal_target(), None);
+        assert!(!RecoveryScope::Inspect.repairs());
+        assert!(RecoveryScope::Workspaces(Default::default()).repairs());
     }
 }
 
@@ -533,15 +562,15 @@ impl ProjectRuntime {
     ) -> Result<Self> {
         #[cfg(target_os = "macos")]
         {
-            let mut host = NativeProjectRuntimeHost::open(
+            let host = NativeProjectRuntimeHost::open(
                 project_root,
                 mode,
                 requested_repo_id.as_ref(),
                 continuity,
                 validation,
+                recovery_scope,
             )
             .await?;
-            host.recovery_scope = recovery_scope;
             Self::start(host).await
         }
         #[cfg(not(target_os = "macos"))]
@@ -2268,9 +2297,9 @@ impl NativeProjectRuntimeHost {
         requested_repo_id: Option<&RepoId>,
         continuity: crate::storage::audit::ContinuityAudit,
         validation: BindingRemoteValidation,
+        recovery_scope: RecoveryScope,
     ) -> Result<Self> {
         use crate::storage::apfs::ApfsExecutionHost;
-        use crate::storage::lifecycle::Substrate;
         use crate::timing::spanned;
 
         let git = spanned("open", "git-discover", async {
@@ -2313,12 +2342,16 @@ impl NativeProjectRuntimeHost {
             &bootstrap_mode,
             crate::storage::bootstrap::native::NativeBootstrapMode::ExistingOnly
         );
-        spanned(
-            "open",
-            "identity-intent",
-            recover_repository_identity_intent(bootstrap.roots().store()),
-        )
-        .await?;
+        // An inspecting open reads the store as it stands: doctor names an unfinished identity
+        // change rather than finishing it.
+        if recovery_scope.repairs() {
+            spanned(
+                "open",
+                "identity-intent",
+                recover_repository_identity_intent(bootstrap.roots().store()),
+            )
+            .await?;
+        }
         let origin_span = crate::timing::span("open", "origin");
         let origin = if existing_only {
             workspace_origin_from_marker(&git_root).await?
@@ -2397,17 +2430,18 @@ impl NativeProjectRuntimeHost {
                     // everything downstream — the descriptor, the gateway inventory — reads the
                     // URL Git actually uses. An identity move refuses with the rebind verb, and
                     // that verb reaches this arm under `ForIdentityChange` without tripping it.
+                    // An inspecting open keeps the recorded binding, and doctor reports the move.
                     let binding = match reconcile_binding_with_remotes(
                         &binding,
                         &remotes,
                         validation,
                         git.root(),
                     )? {
-                        Some(updated) => {
+                        Some(updated) if recovery_scope.repairs() => {
                             persist_binding(&layout, &updated).await?;
                             updated
                         }
-                        None => binding,
+                        Some(_) | None => binding,
                     };
                     (repo_id, layout, binding)
                 }
@@ -2468,12 +2502,17 @@ impl NativeProjectRuntimeHost {
         let recovery_config = config.clone();
         let recovery_repo = repo_id.clone();
         let recovery_span = crate::timing::span("open", "inventory");
+        let repairs = recovery_scope.repairs();
         let (host, facts, pending, lifecycle_intents) =
             crate::storage::lifecycle::dispatch_blocking(move || {
                 let lifecycle_intents =
                     crate::storage::recovery::LifecycleIntentJournal::load(&recovery_intents_path)?;
-                host.recover_pending(&recovery_config, &[])
-                    .map_err(native_storage_error)?;
+                // Store-wide completion of interrupted publications; an inspecting open reads the
+                // store as it stands, and doctor names what this would have completed.
+                if repairs {
+                    host.recover_pending(&recovery_config, &[])
+                        .map_err(native_storage_error)?;
+                }
                 let facts = host.list(&recovery_repo).map_err(native_storage_error)?;
                 let pending = host
                     .pending_publications(&recovery_repo)
@@ -2542,30 +2581,16 @@ impl NativeProjectRuntimeHost {
                 ROUTER_CAPACITY,
             )?
         };
-        for publication in &pending {
-            use super::supervisor::{CommitmentDraft, CommitmentSink};
-
-            commitments
-                .record(CommitmentDraft::Restore {
-                    repo_id: repo_id.clone(),
-                    source_checkpoint: publication.source_checkpoint.clone(),
-                    source_incarnation: publication.source_incarnation.clone(),
-                    replaced_incarnation: publication.replaced_incarnation.clone(),
-                    destination_incarnation: publication.destination_incarnation.clone(),
-                })
-                .await?;
-            host.activate_restored_metadata(&publication.image)
-                .map_err(native_storage_error)?;
-        }
-        let substrate = crate::storage::apfs::ApfsSubstrate::new(config.clone(), host);
-        {
-            let _span = crate::timing::span("open", "reclaim");
-            for retirement in retired {
-                // Trash reclamation is best effort; the retirement is already a fact of the
-                // inventory.
-                let _ = substrate.reclaim(retirement).await;
-            }
-        }
+        let substrate = finish_store_residue(
+            host,
+            config.clone(),
+            &repo_id,
+            &pending,
+            retired,
+            &mut commitments,
+            &recovery_scope,
+        )
+        .await?;
         let descriptor = ProjectDescriptor {
             repo_id,
             binding,
@@ -2594,7 +2619,7 @@ impl NativeProjectRuntimeHost {
             lifecycle_intents,
             intent_leases: std::collections::BTreeMap::new(),
             binding_remote_validation: validation,
-            recovery_scope: RecoveryScope::Workspaces(std::collections::BTreeSet::new()),
+            recovery_scope,
         })
     }
     /// Apply `change` to the journal on disk under its lock and adopt the result, which also
@@ -3067,21 +3092,36 @@ impl NativeProjectRuntimeHost {
     /// fresh open does — healed, persisted, and reflected in its own descriptor — instead of
     /// refusing every verb until a reopen. A host opened for the identity change skips the remote
     /// pairing entirely: recovery runs before the verb dispatches, and the pairing it would
-    /// enforce is exactly the one `mv … --repo-id` exists to supersede.
+    /// enforce is exactly the one `mv … --repo-id` exists to supersede. An inspecting host checks
+    /// the pairing and writes nothing; doctor reports the move.
     async fn validate_binding(&mut self) -> Result<()> {
         if self.binding_remote_validation == BindingRemoteValidation::ForIdentityChange {
             return Ok(());
         }
+        if let Some(moved) = self.binding_move().await?
+            && self.recovery_scope.repairs()
+        {
+            self.record_binding(moved).await?;
+        }
+        Ok(())
+    }
+
+    /// The binding Git's remotes now call for when a transport move left the recorded one
+    /// behind; `None` when they agree. An identity move is an error naming the rebind verb.
+    async fn binding_move(&self) -> Result<Option<RepositoryBinding>> {
         let remotes = self.git.remotes().await?;
-        if let Some(updated) = reconcile_binding_with_remotes(
+        reconcile_binding_with_remotes(
             &self.descriptor.binding,
             &remotes,
             BindingRemoteValidation::Strict,
             self.git.root(),
-        )? {
-            persist_binding(&self.layout, &updated).await?;
-            self.descriptor.binding = updated;
-        }
+        )
+    }
+
+    /// Persist a transport move and serve under it from now on.
+    async fn record_binding(&mut self, moved: RepositoryBinding) -> Result<()> {
+        persist_binding(&self.layout, &moved).await?;
+        self.descriptor.binding = moved;
         Ok(())
     }
 
@@ -5786,6 +5826,50 @@ fn require_vacant_move_destination(destination: &Path) -> Result<()> {
     }
 }
 
+/// Finishes what interrupted work left in the project's store that the open found, before the
+/// controller serves: restores whose image was published but whose metadata was never activated,
+/// and retired images still in the trash. Returns the substrate over `host`.
+///
+/// An inspecting open finishes neither: doctor reports both from the store itself, as
+/// `pending-publication` and `retired-trash` findings.
+#[cfg(target_os = "macos")]
+async fn finish_store_residue<H: crate::storage::apfs::ApfsExecutionHost>(
+    host: H,
+    config: crate::storage::apfs::ApfsSubstrateConfig,
+    repo_id: &RepoId,
+    restored: &[crate::storage::apfs::PendingPublicationFact],
+    retired: Vec<crate::storage::lifecycle::RetiredRef>,
+    commitments: &mut super::supervisor::CommitmentPublisherHandle,
+    scope: &RecoveryScope,
+) -> Result<crate::storage::apfs::ApfsSubstrate<H>> {
+    use super::supervisor::{CommitmentDraft, CommitmentSink};
+    use crate::storage::lifecycle::Substrate;
+
+    if !scope.repairs() {
+        return Ok(crate::storage::apfs::ApfsSubstrate::new(config, host));
+    }
+    for publication in restored {
+        commitments
+            .record(CommitmentDraft::Restore {
+                repo_id: repo_id.clone(),
+                source_checkpoint: publication.source_checkpoint.clone(),
+                source_incarnation: publication.source_incarnation.clone(),
+                replaced_incarnation: publication.replaced_incarnation.clone(),
+                destination_incarnation: publication.destination_incarnation.clone(),
+            })
+            .await?;
+        host.activate_restored_metadata(&publication.image)
+            .map_err(native_storage_error)?;
+    }
+    let substrate = crate::storage::apfs::ApfsSubstrate::new(config, host);
+    let _span = crate::timing::span("open", "reclaim");
+    for retirement in retired {
+        // Trash reclamation is best effort; the retirement is already a fact of the inventory.
+        let _ = substrate.reclaim(retirement).await;
+    }
+    Ok(substrate)
+}
+
 #[cfg(target_os = "macos")]
 async fn recover_repository_identity_intent(store_root: &Path) -> Result<()> {
     let store_root = store_root.to_owned();
@@ -6633,8 +6717,11 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
         }
         // Intent recovery finishes interrupted create/fork/remove work by creating and destroying
         // images. Workspace supervisors are the daemon's, started by the first command a workspace
-        // gets: opening a project starts none, and waits on none.
-        crate::timing::spanned("recover", "intents", self.recover_lifecycle_intents()).await?;
+        // gets: opening a project starts none, and waits on none. An inspecting host replays
+        // nothing; doctor reports each unfinished intent instead.
+        if self.recovery_scope.repairs() {
+            crate::timing::spanned("recover", "intents", self.recover_lifecycle_intents()).await?;
+        }
         Ok(())
     }
 
@@ -8450,12 +8537,94 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
         use crate::storage::lifecycle::{StorageGcReason, Substrate};
 
         let mut findings = Vec::new();
-        if let Err(error) = self.validate_binding().await {
-            findings.push(native_finding(
+        match self.binding_move().await {
+            Ok(None) => {}
+            Ok(Some(moved)) if self.recovery_scope.repairs() => {
+                if let Err(error) = self.record_binding(moved).await {
+                    findings.push(native_finding(
+                        "binding",
+                        crate::api::dto::FindingSeverity::Error,
+                        error,
+                    ));
+                }
+            }
+            Ok(Some(moved)) => findings.push(binding_move_finding(
+                &self.descriptor.binding,
+                &moved,
+                self.layout.project().repository_binding.clone(),
+            )),
+            Err(error) => findings.push(native_finding(
                 "binding",
                 crate::api::dto::FindingSeverity::Error,
                 error,
-            ));
+            )),
+        }
+        // What any other opening would have finished first, read where it is recorded: an
+        // inspecting open (doctor without --repair) finishes none of it.
+        let identity_intent =
+            crate::storage::recovery::RepositoryIdentityIntent::path(&self.descriptor.store_root);
+        if identity_intent.symlink_metadata().is_ok() {
+            findings.push(crate::api::dto::Finding {
+                code: "identity-change-unfinished".into(),
+                severity: crate::api::dto::FindingSeverity::Warning,
+                message: format!(
+                    "a repository identity change is journaled in {} and not finished",
+                    identity_intent.display()
+                ),
+                hint: "any cowshed command other than doctor finishes it as it opens".into(),
+                path: Some(identity_intent),
+            });
+        }
+        match self.reload_lifecycle_intents().await {
+            Ok(()) => findings.extend(
+                self.lifecycle_intents
+                    .records()
+                    .filter(|(_, record)| record.completion.is_none())
+                    .map(|(workspace, record)| {
+                        unfinished_intent_finding(
+                            workspace,
+                            record.operation.verb(),
+                            self.lifecycle_intents_path.clone(),
+                        )
+                    }),
+            ),
+            Err(error) => findings.push(native_finding(
+                "lifecycle-intents",
+                crate::api::dto::FindingSeverity::Error,
+                error,
+            )),
+        }
+        let project_root = self.layout.project().project_root.clone();
+        match crate::storage::lifecycle::dispatch_blocking(move || {
+            crate::storage::apfs::native::interrupted_publications(&project_root)
+        })
+        .await
+        {
+            Ok(Ok(sidecars)) => findings.extend(sidecars.into_iter().map(|sidecar| {
+                crate::api::dto::Finding {
+                    code: "interrupted-publication".into(),
+                    severity: crate::api::dto::FindingSeverity::Warning,
+                    message: format!(
+                        "{} names an image that does not exist: a publication or a retirement \
+                         a crash interrupted",
+                        sidecar.display()
+                    ),
+                    hint: "any cowshed command other than doctor publishes the image from \
+                           staging or removes the orphaned metadata as it opens"
+                        .into(),
+                    path: Some(sidecar),
+                }
+            })),
+            Ok(Err(error)) => findings.push(native_finding(
+                "interrupted-publication",
+                crate::api::dto::FindingSeverity::Error,
+                native_storage_error(error),
+            )),
+            Err(error) => findings.push(native_finding(
+                "interrupted-publication",
+                crate::api::dto::FindingSeverity::Error,
+                CowshedError::internal(format!("publication scan task failed: {error}")),
+            )),
         }
         // Gateway reachability is host-scoped, not project-scoped, and is diagnosed once by the
         // CLI's host diagnosis with a launchd-aware message and hint. A second `gateway-down`
@@ -12095,6 +12264,102 @@ mod retired_recovery_tests {
         );
         std::fs::remove_dir_all(root).unwrap();
     }
+
+    /// Reclaiming a detached retired image runs no disk command; one that does is a test bug.
+    struct NoDiskCommands;
+
+    impl crate::apfs::CommandRunner for NoDiskCommands {
+        fn run(
+            &self,
+            request: &crate::apfs::CommandRequest,
+        ) -> std::result::Result<crate::apfs::CommandOutput, crate::apfs::CommandRunError> {
+            panic!("reclaiming a detached retired image ran a disk command: {request:?}");
+        }
+    }
+
+    /// `doctor` opens the project to inspect it. Its open must leave a retired image where it is
+    /// for doctor to report; every other open reclaims it.
+    #[tokio::test]
+    async fn an_inspecting_open_leaves_retired_trash_that_a_repairing_open_reclaims() {
+        let root = std::env::temp_dir().join(format!(
+            "cowshed-open-residue-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let repo_id = RepoId::parse("acme/widget").unwrap();
+        let layout = crate::storage::StorageLayout::new(&root, &repo_id).unwrap();
+        let project_root = layout.project().project_root.clone();
+        let trash = project_root.join("sessions/.trash");
+        std::fs::create_dir_all(&trash).unwrap();
+        let incarnation = WorkspaceIncarnation::new("0198f2c0b7e34dc795f17b238b331c80").unwrap();
+        let image = trash.join(format!("raven-{}.asif", incarnation.as_str()));
+        std::fs::write(&image, b"retired image").unwrap();
+        DetachedWorkspaceMetadata {
+            version: SIDECAR_VERSION,
+            repo_id: repo_id.clone(),
+            workspace: WorkspaceName::new("raven").unwrap(),
+            workspace_incarnation: incarnation,
+            platform: Platform::Macos,
+            publication_state: PublicationState::Active,
+            updated_at: "2026-07-14T00:00:00Z".into(),
+            grants: GrantSet::closed_baseline(Some(PortBlock::new(49_136, 16).unwrap())).unwrap(),
+            info_snapshot: crate::metadata::WorkspaceInfoSnapshot {
+                project_root: PathBuf::from("/project"),
+                role: crate::metadata::WorkspaceRole::Workspace,
+                base_commit: "0123456789abcdef0123456789abcdef01234567".to_owned(),
+                branch: None,
+                created_at: "2026-07-14T00:00:00Z".to_owned(),
+                forked_from: None,
+                captured_at: "2026-07-14T00:00:00Z".to_owned(),
+                stale: false,
+                git_worktree: false,
+            },
+        }
+        .write_for_image(&image)
+        .unwrap();
+        let config = crate::storage::apfs::ApfsSubstrateConfig::new(
+            &root,
+            root.join("caches"),
+            root.join("checkout"),
+        );
+        let mut commitments = super::super::supervisor::CommitmentPublisher::open(
+            root.join("telemetry"),
+            crate::storage::audit::ContinuityAudit::Off,
+            ROUTER_CAPACITY,
+        )
+        .unwrap();
+        let mut open = async |scope: RecoveryScope| {
+            let host = crate::storage::apfs::native::MacOsApfsExecutionHost::new(
+                NoDiskCommands,
+                config.clone(),
+            )
+            .unwrap();
+            let retired = native_retired_refs(&project_root, &repo_id).unwrap();
+            assert_eq!(retired.len(), 1, "the retired image is found");
+            finish_store_residue(
+                host,
+                config.clone(),
+                &repo_id,
+                &[],
+                retired,
+                &mut commitments,
+                &scope,
+            )
+            .await
+            .unwrap();
+        };
+
+        open(RecoveryScope::Inspect).await;
+        assert!(
+            image.exists(),
+            "an inspecting open reclaimed {}",
+            image.display()
+        );
+        assert!(crate::metadata::sidecar_path(&image).exists());
+
+        open(RecoveryScope::Workspaces(Default::default())).await;
+        assert!(!image.exists(), "a repairing open left {}", image.display());
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -12743,6 +13008,63 @@ fn native_finding(
         message: error.message,
         hint: error.hint,
         path: None,
+    }
+}
+
+/// The transport move an inspecting open left unrecorded: each remote whose recorded URL Git no
+/// longer uses, and the URL it uses now.
+#[cfg(target_os = "macos")]
+fn binding_move_finding(
+    recorded: &RepositoryBinding,
+    moved: &RepositoryBinding,
+    binding: PathBuf,
+) -> crate::api::dto::Finding {
+    let moves = recorded
+        .identities
+        .iter()
+        .zip(&moved.identities)
+        .filter_map(|(before, after)| {
+            match (&before.remote_name, &before.remote_url, &after.remote_url) {
+                (Some(name), Some(from), Some(to)) if from != to => {
+                    Some(format!("{name}: {from} -> {to}"))
+                }
+                _ => None,
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    crate::api::dto::Finding {
+        code: "binding-moved".into(),
+        severity: crate::api::dto::FindingSeverity::Info,
+        message: format!("the project binding records remote URLs Git no longer uses ({moves})"),
+        hint: "any cowshed command other than doctor records the URLs Git uses as it opens".into(),
+        path: Some(binding),
+    }
+}
+
+/// A lifecycle operation journaled and not completed: either its process is still running it,
+/// or it died and the next opening that may finish it does.
+#[cfg(target_os = "macos")]
+fn unfinished_intent_finding(
+    workspace: &WorkspaceName,
+    verb: &str,
+    journal: PathBuf,
+) -> crate::api::dto::Finding {
+    crate::api::dto::Finding {
+        code: "unfinished-intent".into(),
+        severity: crate::api::dto::FindingSeverity::Warning,
+        message: format!(
+            "{verb} of {workspace} is journaled and not finished: its process is still running it, \
+             or it died"
+        ),
+        hint: if workspace.is_main() {
+            "any cowshed command other than doctor finishes it as it opens".to_owned()
+        } else {
+            format!(
+                "the next cowshed command naming {workspace} finishes it, and so does cowshed gc"
+            )
+        },
+        path: Some(journal),
     }
 }
 

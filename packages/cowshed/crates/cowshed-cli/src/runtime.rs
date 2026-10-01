@@ -220,7 +220,9 @@ fn runtime_open_repo_id(command: &Command) -> Result<Option<RepoId>> {
 /// The workspaces whose unfinished lifecycle work this verb's open may finish (see
 /// [`RecoveryScope`]): the ones it names. A name the verb itself will reject cannot name a
 /// journaled intent, so it adds nothing; a removal alone refuses one before opening, because
-/// its scope is the name. `gc` is store maintenance and finishes residue everywhere.
+/// its scope is the name. `gc` is store maintenance and finishes residue everywhere. `doctor`
+/// never mutates: its open finishes nothing and it reports what another open would finish; only
+/// `doctor --repair` opens the way every other verb does.
 fn runtime_recovery_scope(command: &Command) -> Result<RecoveryScope> {
     fn named<'a>(names: impl IntoIterator<Item = Option<&'a str>>) -> RecoveryScope {
         RecoveryScope::Workspaces(
@@ -236,6 +238,7 @@ fn runtime_recovery_scope(command: &Command) -> Result<RecoveryScope> {
             .map(RecoveryScope::Removal)
             .map_err(|error| usage(error.to_string(), "use a valid workspace name"))?,
         Command::Gc(_) => RecoveryScope::Store,
+        Command::Doctor(args) if !args.repair => RecoveryScope::Inspect,
         Command::New(args) => named([Some(args.name.as_str()), args.from.as_deref()]),
         Command::Fork(args) => named([Some(args.source.as_str()), Some(args.destination.as_str())]),
         Command::Move(args) => match &args.destination {
@@ -5423,6 +5426,10 @@ mod tests {
         assert_eq!(scope(&["mv", "a", "b"]).unwrap(), names(&["a", "b"]));
         assert_eq!(scope(&["ls"]).unwrap(), names(&[]));
         assert_eq!(scope(&["gc"]).unwrap(), RecoveryScope::Store);
+        // doctor inspects: its open finishes nothing, not even main's unfinished work, and
+        // reclaims nothing. Only an explicit repair opens the way every other verb does.
+        assert_eq!(scope(&["doctor"]).unwrap(), RecoveryScope::Inspect);
+        assert_eq!(scope(&["doctor", "--repair"]).unwrap(), names(&[]));
         assert_eq!(
             scope(&["rm", "gone"]).unwrap(),
             RecoveryScope::Removal(WorkspaceName::new("gone").expect("workspace name"))

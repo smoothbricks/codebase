@@ -37,7 +37,9 @@ Two verbs own the host story, both runnable from any directory:
 
 - **`doctor`** is the universal diagnostician: version and install source, per-volume state (present/absent, current
   versus canonical mountpoint, marker validity), service status, workspace inventory summary, project checks when an
-  adopted checkout resolves. It never mutates.
+  adopted checkout resolves. It never mutates: its project open finishes no unfinished lifecycle operation, interrupted
+  publication or restore, retired-image reclamation, identity change or binding heal, and reports each as a finding for
+  the next opening command to finish. `doctor --repair` opens the way every other verb does.
 - **`setup`** is idempotent host repair: provision absent volumes, repair detached or mis-mounted ones,
   FileVault-encrypt unencrypted ones in place and store passphrases in System.keychain, validate markers precisely, pin
   `/etc/fstab`, and install the `dev.cowshed.storage` system LaunchDaemon that unlocks and mounts before login
