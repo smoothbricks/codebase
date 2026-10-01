@@ -782,6 +782,10 @@ pub struct Vm {
     pub undo: UndoState,
     pub bitmap_env: BitmapEnv,
     accepted_program_magics: &'static [u32],
+    /// A FOR_EACH body decodes its instructions once per element; a struct-map
+    /// upsert decodes into this one value instead of building (zeroing and
+    /// copying) its fixed operand arrays per row.
+    element_struct_map: StructMapUpsertOperands,
 }
 
 impl Vm {
@@ -794,6 +798,7 @@ impl Vm {
             undo: UndoState::default(),
             bitmap_env: BitmapEnv::default(),
             accepted_program_magics,
+            element_struct_map: StructMapUpsertOperands::EMPTY,
         }
     }
 }
@@ -1718,7 +1723,7 @@ const MAX_STRUCT_ARRAY_OPERANDS: usize = 16;
 /// A struct-map instruction's `(val_col:index, field_idx:u8)` pairs, decoded
 /// into fixed arrays. The array width is part of the accepted-program
 /// contract: a program declaring more pairs is refused at decode.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub(crate) struct ScalarOperands {
     cols: [u32; MAX_STRUCT_SCALAR_OPERANDS],
     fields: [u8; MAX_STRUCT_SCALAR_OPERANDS],
@@ -1726,21 +1731,36 @@ pub(crate) struct ScalarOperands {
 }
 
 impl ScalarOperands {
+    const EMPTY: Self = Self {
+        cols: [0; MAX_STRUCT_SCALAR_OPERANDS],
+        fields: [0; MAX_STRUCT_SCALAR_OPERANDS],
+        len: 0,
+    };
+
     /// Read `len` pairs; room for `reserve` more is kept for the caller.
     fn decode(operands: &mut Operands<'_>, len: usize, reserve: usize) -> Option<Self> {
+        let mut pairs = Self::EMPTY;
+        pairs.decode_into(operands, len, reserve)?;
+        Some(pairs)
+    }
+
+    /// Read `len` pairs over this value, writing only those pairs.
+    fn decode_into(
+        &mut self,
+        operands: &mut Operands<'_>,
+        len: usize,
+        reserve: usize,
+    ) -> Option<()> {
         if len + reserve > MAX_STRUCT_SCALAR_OPERANDS {
             return None;
         }
-        let mut pairs = Self {
-            cols: [0; MAX_STRUCT_SCALAR_OPERANDS],
-            fields: [0; MAX_STRUCT_SCALAR_OPERANDS],
-            len,
-        };
+        self.len = 0;
         for i in 0..len {
-            pairs.cols[i] = operands.index()?;
-            pairs.fields[i] = operands.byte()?;
+            self.cols[i] = operands.index()?;
+            self.fields[i] = operands.byte()?;
         }
-        Some(pairs)
+        self.len = len;
+        Some(())
     }
 
     pub(crate) fn cols(&self) -> &[u32] {
@@ -1761,14 +1781,14 @@ impl ScalarOperands {
 
 /// One CSR array field of a struct-map upsert: the offsets and values
 /// columns that carry the element arrays, and the field they fill.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct ArrayField {
     pub(crate) offsets_col: u32,
     pub(crate) values_col: u32,
     pub(crate) field_idx: u8,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub(crate) struct StructMapUpsertOperands {
     pub(crate) slot: u32,
     pub(crate) key_col: u32,
@@ -1780,8 +1800,51 @@ pub(crate) struct StructMapUpsertOperands {
 }
 
 impl StructMapUpsertOperands {
+    const EMPTY: Self = Self {
+        slot: 0,
+        key_col: 0,
+        vals: ScalarOperands::EMPTY,
+        arrays: [ArrayField {
+            offsets_col: 0,
+            values_col: 0,
+            field_idx: 0,
+        }; MAX_STRUCT_ARRAY_OPERANDS],
+        num_arrays: 0,
+        comparison_field_idx: None,
+        end: 0,
+    };
+
     pub(crate) fn array_fields(&self) -> &[ArrayField] {
         &self.arrays[..self.num_arrays]
+    }
+
+    /// Decode over this value, writing only what the instruction carries.
+    fn decode_into(&mut self, code: &[u8], start: usize, has_comparison: bool) -> Option<()> {
+        let mut operands = Operands::at(code, start);
+        self.num_arrays = 0;
+        self.slot = operands.index()?;
+        self.key_col = operands.index()?;
+        let num_vals = usize::from(operands.byte()?);
+        self.vals.decode_into(&mut operands, num_vals, 0)?;
+        let num_arrays = usize::from(operands.byte()?);
+        if num_arrays > MAX_STRUCT_ARRAY_OPERANDS {
+            return None;
+        }
+        for array in &mut self.arrays[..num_arrays] {
+            *array = ArrayField {
+                offsets_col: operands.index()?,
+                values_col: operands.index()?,
+                field_idx: operands.byte()?,
+            };
+        }
+        self.num_arrays = num_arrays;
+        self.comparison_field_idx = if has_comparison {
+            Some(operands.byte()?)
+        } else {
+            None
+        };
+        self.end = operands.pos();
+        Some(())
     }
 }
 
@@ -1796,37 +1859,9 @@ pub(crate) fn decode_struct_map_upsert_operands(
     start: usize,
     has_comparison: bool,
 ) -> Option<StructMapUpsertOperands> {
-    let mut operands = Operands::at(code, start);
-    let slot = operands.index()?;
-    let key_col = operands.index()?;
-    let num_vals = usize::from(operands.byte()?);
-    let vals = ScalarOperands::decode(&mut operands, num_vals, 0)?;
-    let num_arrays = usize::from(operands.byte()?);
-    if num_arrays > MAX_STRUCT_ARRAY_OPERANDS {
-        return None;
-    }
-    let mut arrays = [ArrayField::default(); MAX_STRUCT_ARRAY_OPERANDS];
-    for array in &mut arrays[..num_arrays] {
-        *array = ArrayField {
-            offsets_col: operands.index()?,
-            values_col: operands.index()?,
-            field_idx: operands.byte()?,
-        };
-    }
-    let comparison_field_idx = if has_comparison {
-        Some(operands.byte()?)
-    } else {
-        None
-    };
-    Some(StructMapUpsertOperands {
-        slot,
-        key_col,
-        vals,
-        arrays,
-        num_arrays,
-        comparison_field_idx,
-        end: operands.pos(),
-    })
+    let mut operands = StructMapUpsertOperands::EMPTY;
+    operands.decode_into(code, start, has_comparison)?;
+    Some(operands)
 }
 
 #[derive(Clone, Copy)]
@@ -4394,13 +4429,13 @@ impl Vm {
                 Opcode::BatchStructMapUpsertLast
                 | Opcode::BatchStructMapUpsertFirst
                 | Opcode::BatchStructMapUpsertMax => {
-                    let Some(operands) = decode_struct_map_upsert_operands(
-                        body,
-                        bpc + 1,
-                        op == Opcode::BatchStructMapUpsertMax,
-                    ) else {
+                    let operands = &mut self.element_struct_map;
+                    if operands
+                        .decode_into(body, bpc + 1, op == Opcode::BatchStructMapUpsertMax)
+                        .is_none()
+                    {
                         return INVALID_PROGRAM;
-                    };
+                    }
                     bpc = operands.end;
 
                     let smap = StructMapSlot::bind(state, operands.slot);
