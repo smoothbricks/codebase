@@ -14,6 +14,7 @@ pub mod aggregates;
 pub mod bitmap_ops;
 pub mod bytes;
 pub mod column_uses;
+mod element_body;
 pub mod hash_table;
 pub mod hashmap_ops;
 pub mod hashset_ops;

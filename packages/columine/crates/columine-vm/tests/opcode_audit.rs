@@ -39,7 +39,10 @@ fn frozen_dispatched() -> BTreeSet<u8> {
 }
 
 fn rust_covered() -> BTreeSet<u8> {
-    let rust_vm = read_source(&manifest_dir(), "src/vm.rs");
+    // The length table lives with the instruction walk (`element_body.rs`),
+    // the dispatch arms in `vm.rs`: an opcode is covered by both together.
+    let rust_vm = read_source(&manifest_dir(), "src/vm.rs")
+        + &read_source(&manifest_dir(), "src/element_body.rs");
     let rust_types = read_source(&manifest_dir(), "../columine-types/src/types.rs");
     let rust_decls = enum_decls(&rust_types, "pub enum Opcode");
     assert!(

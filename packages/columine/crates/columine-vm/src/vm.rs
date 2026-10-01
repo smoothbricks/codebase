@@ -34,6 +34,8 @@ use crate::undo_log::{
 };
 use columine_types::DEFAULT_ACCEPTED_PROGRAM_MAGICS;
 use columine_types::operand::{Operands, read_index};
+
+use crate::element_body::{OperandRead, Skip, WideOperands, walk_operands, widen_element_body};
 use columine_types::types::{
     AggType, ChangeFlag, DERIVED_FACT_TOMBSTONE_IDENTITY, EMPTY_KEY, ErrorCode,
     MAX_GUARD_COMPONENTS, MAX_SCATTER_ROUTES, NO_PARENT_TS_COL, Opcode, ProgramHeader,
@@ -782,10 +784,16 @@ pub struct Vm {
     pub undo: UndoState,
     pub bitmap_env: BitmapEnv,
     accepted_program_magics: &'static [u32],
-    /// A FOR_EACH body decodes its instructions once per element; a struct-map
-    /// upsert decodes into this one value instead of building (zeroing and
-    /// copying) its fixed operand arrays per row.
+    /// The FOR_EACH body being run per element, widened once per batch
+    /// (`element_body`); kept so a batch reuses its allocation.
+    element_body: Vec<u8>,
+    /// Decode targets of the per-element instructions that carry fixed
+    /// operand arrays: an element decodes into these instead of building
+    /// (zeroing and copying) the arrays per row.
     element_struct_map: StructMapUpsertOperands,
+    element_struct_map2: StructMap2UpsertOperands,
+    element_struct_map2_max: StructMap2MaxI64x2Operands,
+    element_list_vals: ScalarOperands,
 }
 
 impl Vm {
@@ -798,7 +806,11 @@ impl Vm {
             undo: UndoState::default(),
             bitmap_env: BitmapEnv::default(),
             accepted_program_magics,
+            element_body: Vec::new(),
             element_struct_map: StructMapUpsertOperands::EMPTY,
+            element_struct_map2: StructMap2UpsertOperands::EMPTY,
+            element_struct_map2_max: StructMap2MaxI64x2Operands::EMPTY,
+            element_list_vals: ScalarOperands::EMPTY,
         }
     }
 }
@@ -1577,7 +1589,7 @@ impl GuardTuple {
     /// Read `len` `(guard_col:index, guard_field_idx:u8)` pairs.
     /// `None` for a width the compare array cannot hold, and for a width of
     /// zero: an unguarded scatter is `0x3e`, not a degenerate `0x3f`.
-    fn decode(operands: &mut Operands<'_>, len: usize) -> Option<Self> {
+    fn decode<'a, R: OperandRead<'a>>(operands: &mut R, len: usize) -> Option<Self> {
         if len == 0 || len > MAX_GUARD_COMPONENTS {
             return None;
         }
@@ -1717,8 +1729,8 @@ struct StructUpsertResult {
     pos: u32,
 }
 
-const MAX_STRUCT_SCALAR_OPERANDS: usize = 32;
-const MAX_STRUCT_ARRAY_OPERANDS: usize = 16;
+pub(crate) const MAX_STRUCT_SCALAR_OPERANDS: usize = 32;
+pub(crate) const MAX_STRUCT_ARRAY_OPERANDS: usize = 16;
 
 /// A struct-map instruction's `(val_col:index, field_idx:u8)` pairs, decoded
 /// into fixed arrays. The array width is part of the accepted-program
@@ -1737,17 +1749,11 @@ impl ScalarOperands {
         len: 0,
     };
 
-    /// Read `len` pairs; room for `reserve` more is kept for the caller.
-    fn decode(operands: &mut Operands<'_>, len: usize, reserve: usize) -> Option<Self> {
-        let mut pairs = Self::EMPTY;
-        pairs.decode_into(operands, len, reserve)?;
-        Some(pairs)
-    }
-
-    /// Read `len` pairs over this value, writing only those pairs.
-    fn decode_into(
+    /// Read `len` pairs over this value, writing only those pairs; room for
+    /// `reserve` more is kept for the caller.
+    fn decode_into<'a, R: OperandRead<'a>>(
         &mut self,
-        operands: &mut Operands<'_>,
+        operands: &mut R,
         len: usize,
         reserve: usize,
     ) -> Option<()> {
@@ -1819,13 +1825,16 @@ impl StructMapUpsertOperands {
     }
 
     /// Decode over this value, writing only what the instruction carries.
-    fn decode_into(&mut self, code: &[u8], start: usize, has_comparison: bool) -> Option<()> {
-        let mut operands = Operands::at(code, start);
+    fn decode_from<'a, R: OperandRead<'a>>(
+        &mut self,
+        operands: &mut R,
+        has_comparison: bool,
+    ) -> Option<()> {
         self.num_arrays = 0;
         self.slot = operands.index()?;
         self.key_col = operands.index()?;
         let num_vals = usize::from(operands.byte()?);
-        self.vals.decode_into(&mut operands, num_vals, 0)?;
+        self.vals.decode_into(operands, num_vals, 0)?;
         let num_arrays = usize::from(operands.byte()?);
         if num_arrays > MAX_STRUCT_ARRAY_OPERANDS {
             return None;
@@ -1860,11 +1869,11 @@ pub(crate) fn decode_struct_map_upsert_operands(
     has_comparison: bool,
 ) -> Option<StructMapUpsertOperands> {
     let mut operands = StructMapUpsertOperands::EMPTY;
-    operands.decode_into(code, start, has_comparison)?;
+    operands.decode_from(&mut Operands::at(code, start), has_comparison)?;
     Some(operands)
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub(crate) struct StructMap2UpsertOperands {
     pub(crate) slot: u32,
     pub(crate) key1_col: u32,
@@ -1880,18 +1889,34 @@ fn decode_struct_map2_row(
     operands: &mut Operands<'_>,
     reserve: usize,
 ) -> Option<StructMap2UpsertOperands> {
-    let slot = operands.index()?;
-    let key1_col = operands.index()?;
-    let key2_col = operands.index()?;
-    let num_vals = usize::from(operands.byte()?);
-    let vals = ScalarOperands::decode(operands, num_vals, reserve)?;
-    Some(StructMap2UpsertOperands {
-        slot,
-        key1_col,
-        key2_col,
-        vals,
-        end: operands.pos(),
-    })
+    let mut row = StructMap2UpsertOperands::EMPTY;
+    row.decode_from(operands, reserve)?;
+    Some(row)
+}
+
+impl StructMap2UpsertOperands {
+    const EMPTY: Self = Self {
+        slot: 0,
+        key1_col: 0,
+        key2_col: 0,
+        vals: ScalarOperands::EMPTY,
+        end: 0,
+    };
+
+    /// Decode over this value, writing only what the instruction carries.
+    fn decode_from<'a, R: OperandRead<'a>>(
+        &mut self,
+        operands: &mut R,
+        reserve: usize,
+    ) -> Option<()> {
+        self.slot = operands.index()?;
+        self.key1_col = operands.index()?;
+        self.key2_col = operands.index()?;
+        let num_vals = usize::from(operands.byte()?);
+        self.vals.decode_into(operands, num_vals, reserve)?;
+        self.end = operands.pos();
+        Some(())
+    }
 }
 
 pub(crate) fn decode_struct_map2_upsert_operands(
@@ -1901,7 +1926,7 @@ pub(crate) fn decode_struct_map2_upsert_operands(
     decode_struct_map2_row(&mut Operands::at(code, start), 0)
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub(crate) struct StructMap2MaxI64x2Operands {
     pub(crate) row: StructMap2UpsertOperands,
     pub(crate) cmp1_col: u32,
@@ -1918,20 +1943,31 @@ pub(crate) fn decode_struct_map2_max_i64x2_operands(
     code: &[u8],
     start: usize,
 ) -> Option<StructMap2MaxI64x2Operands> {
-    let mut operands = Operands::at(code, start);
-    let row = decode_struct_map2_row(&mut operands, 2)?;
-    let cmp1_col = operands.index()?;
-    let cmp1_field = operands.byte()?;
-    let cmp2_col = operands.index()?;
-    let cmp2_field = operands.byte()?;
-    Some(StructMap2MaxI64x2Operands {
-        row,
-        cmp1_col,
-        cmp1_field,
-        cmp2_col,
-        cmp2_field,
-        end: operands.pos(),
-    })
+    let mut operands = StructMap2MaxI64x2Operands::EMPTY;
+    operands.decode_from(&mut Operands::at(code, start))?;
+    Some(operands)
+}
+
+impl StructMap2MaxI64x2Operands {
+    const EMPTY: Self = Self {
+        row: StructMap2UpsertOperands::EMPTY,
+        cmp1_col: 0,
+        cmp1_field: 0,
+        cmp2_col: 0,
+        cmp2_field: 0,
+        end: 0,
+    };
+
+    /// Decode over this value, writing only what the instruction carries.
+    fn decode_from<'a, R: OperandRead<'a>>(&mut self, operands: &mut R) -> Option<()> {
+        self.row.decode_from(operands, 2)?;
+        self.cmp1_col = operands.index()?;
+        self.cmp1_field = operands.byte()?;
+        self.cmp2_col = operands.index()?;
+        self.cmp2_field = operands.byte()?;
+        self.end = operands.pos();
+        Some(())
+    }
 }
 
 fn validate_struct_map2_max_i64x2(
@@ -2765,7 +2801,7 @@ fn exec_scalar_latest(
 // Block-based execution tables
 // =============================================================================
 
-const fn is_aggregate_op(op: Opcode) -> bool {
+pub(crate) const fn is_aggregate_op(op: Opcode) -> bool {
     matches!(
         op,
         Opcode::BatchAggSum
@@ -2783,189 +2819,13 @@ const fn is_aggregate_op(op: Opcode) -> bool {
     )
 }
 
-/// One fixed-shape operand of [`body_op_len`]'s layout table.
-#[derive(Clone, Copy)]
-enum Shape {
-    /// A column, slot or count index ([`Operands::index`]).
-    I,
-    /// A fixed-width byte.
-    B,
-}
-
-/// Return the length (including opcode) of a body operation: its operand
-/// layout, walked without executing it. A malformed index or a truncated
-/// instruction answers `None`, so every executor that measures first reads
-/// operands that are known to decode.
+/// Length of the body instruction at `pc` (opcode included). `None` for an
+/// opcode with no body layout, or operands short of their layout.
 pub(crate) fn body_op_len(code: &[u8], pc: usize) -> Option<usize> {
-    use Shape::{B, I};
     let op = Opcode::from_u8(*code.get(pc)?)?;
     let mut operands = Operands::at(code, pc.checked_add(1)?);
-    let fixed: &[Shape] = match op {
-        Opcode::Halt => &[],
-        Opcode::BatchMapUpsertLatest | Opcode::BatchMapUpsertLatestTtl => &[I, I, I, I, B],
-        Opcode::BatchMapUpsertFirst | Opcode::BatchMapUpsertLast => &[I, I, I],
-        Opcode::BatchMapRemove => &[I, I],
-        Opcode::BatchMapUpsertLastTtl => &[I, I, I, I],
-        Opcode::BatchMapUpsertMax | Opcode::BatchMapUpsertMin => &[I, I, I, I, B],
-        Opcode::BatchMapUpsertLatestIf => &[I, I, I, I, B, I],
-        Opcode::BatchMapUpsertFirstIf | Opcode::BatchMapUpsertLastIf => &[I, I, I, I],
-        Opcode::BatchMapRemoveIf => &[I, I, I],
-        Opcode::BatchMapUpsertMaxIf | Opcode::BatchMapUpsertMinIf => &[I, I, I, I, B, I],
-        //#region reduce-typed-state.probe-len
-        Opcode::BatchStructMapProbe => {
-            // probe_slot, key_col, miss_mode, out_slot, num_fields,
-            // (probe_field, out_field) × num_fields, out_key_col.
-            operands.index()?;
-            operands.index()?;
-            operands.byte()?;
-            operands.index()?;
-            let num_fields = usize::from(operands.byte()?);
-            operands.bytes(num_fields.checked_mul(2)?)?;
-            operands.index()?;
-            &[]
-        }
-        //#region reduce-typed-state.scatter-len
-        Opcode::BatchStructMapProbeScatter => {
-            // probe_slot, key_col, miss_mode, route_field, op_field,
-            // num_routes, (kind, dest_slot, dest_field, out_key_field,
-            // v_src_field) × num_routes.
-            operands.index()?;
-            operands.index()?;
-            operands.bytes(3)?;
-            let num_routes = operands.byte()?;
-            for _ in 0..num_routes {
-                operands.byte()?;
-                operands.index()?;
-                operands.bytes(3)?;
-            }
-            &[]
-        }
-        //#region reduce-typed-state.scatter-element-len
-        Opcode::BatchStructMapScatter => {
-            // route_col, op_col, key_col, num_routes,
-            // (kind, dest_slot, dest_field, v_col) × num_routes.
-            for _ in 0..3 {
-                operands.index()?;
-            }
-            skip_scatter_routes(&mut operands)?;
-            &[]
-        }
-        //#endregion struct-map scatter-element length
-        //#region reduce-typed-state.scatter-element-guarded-len
-        // The guard pairs sit between the fixed prefix and `num_routes`, so
-        // the route count is found through the guard count, never at a fixed
-        // offset. A width the compare array cannot hold is refused at
-        // execution, not here: this answers only how long the instruction is.
-        Opcode::BatchStructMapScatterGuarded => {
-            for _ in 0..4 {
-                operands.index()?;
-            }
-            let num_guards = operands.byte()?;
-            for _ in 0..num_guards {
-                operands.index()?;
-                operands.byte()?;
-            }
-            skip_scatter_routes(&mut operands)?;
-            &[]
-        }
-        //#endregion struct-map guarded scatter-element length
-        Opcode::BatchSetInsert
-        | Opcode::BatchSetRemove
-        | Opcode::BatchBitmapAdd
-        | Opcode::BatchBitmapRemove
-        | Opcode::BatchBitmapAnd
-        | Opcode::BatchBitmapOr
-        | Opcode::BatchBitmapAndNot
-        | Opcode::BatchBitmapXor => &[I, I],
-        Opcode::BatchBitmapAndScratch
-        | Opcode::BatchBitmapOrScratch
-        | Opcode::BatchBitmapAndNotScratch
-        | Opcode::BatchBitmapXorScratch => &[I],
-        Opcode::BatchSetInsertTtl | Opcode::BatchSetInsertIf => &[I, I, I],
-        Opcode::BatchAggSum | Opcode::BatchAggMin | Opcode::BatchAggMax => &[I, I],
-        Opcode::BatchAggCount => &[I],
-        Opcode::BatchAggSumIf => &[I, I, I],
-        Opcode::BatchAggCountIf => &[I, I],
-        Opcode::BatchAggMinIf | Opcode::BatchAggMaxIf | Opcode::BatchScalarLatest => &[I, I, I],
-        Opcode::BatchAggSumI64 | Opcode::BatchAggMinI64 | Opcode::BatchAggMaxI64 => &[I, I],
-        Opcode::BatchStructMapUpsertLast
-        | Opcode::BatchStructMapUpsertFirst
-        | Opcode::BatchStructMapUpsertMax => {
-            let decoded = decode_struct_map_upsert_operands(
-                code,
-                operands.pos(),
-                op == Opcode::BatchStructMapUpsertMax,
-            )?;
-            return decoded.end.checked_sub(pc);
-        }
-        Opcode::BatchStructMap2UpsertLast => {
-            return decode_struct_map2_upsert_operands(code, operands.pos())?
-                .end
-                .checked_sub(pc);
-        }
-        Opcode::BatchStructMap2UpsertMaxI64x2 => {
-            return decode_struct_map2_max_i64x2_operands(code, operands.pos())?
-                .end
-                .checked_sub(pc);
-        }
-        Opcode::ListAppend => &[I, I],
-        Opcode::BatchStructMap2Remove => &[I, I, I],
-        Opcode::ListAppendStruct => {
-            operands.index()?;
-            let num_vals = operands.byte()?;
-            for _ in 0..num_vals {
-                operands.index()?;
-                operands.byte()?;
-            }
-            &[]
-        }
-        Opcode::FlatMap => {
-            // offsets_col, parent_ts_col, inner_body_len:u16, inner body.
-            operands.index()?;
-            operands.index()?;
-            let inner_len = usize::from(operands.u16()?);
-            operands.bytes(inner_len)?;
-            &[]
-        }
-        Opcode::NestedSetInsert => &[I, I, I],
-        Opcode::NestedMapUpsertLast => &[I, I, I, I],
-        Opcode::NestedAggUpdate => &[I, I, I],
-        Opcode::ForEach => {
-            // type_col, match_count, match_ids:u32 × match_count,
-            // body_len:u16, body.
-            operands.index()?;
-            let match_count = usize::try_from(operands.index()?).ok()?;
-            operands.bytes(match_count.checked_mul(4)?)?;
-            let body_len = usize::from(operands.u16()?);
-            operands.bytes(body_len)?;
-            &[]
-        }
-        _ => return None,
-    };
-    for shape in fixed {
-        match shape {
-            I => {
-                operands.index()?;
-            }
-            B => {
-                operands.byte()?;
-            }
-        }
-    }
+    walk_operands(op, &mut operands, &mut Skip)?;
     operands.pos().checked_sub(pc)
-}
-
-/// `num_routes:u8, (kind:u8, dest_slot:index, dest_field:u8, v_col:index) ×
-/// num_routes` — the route table both probe-free scatters share.
-fn skip_scatter_routes(operands: &mut Operands<'_>) -> Option<()> {
-    let num_routes = operands.byte()?;
-    for _ in 0..num_routes {
-        operands.byte()?;
-        operands.index()?;
-        operands.byte()?;
-        operands.index()?;
-    }
-    Some(())
 }
 
 fn validate_body(state: &[u8], body: &[u8]) -> bool {
@@ -3754,27 +3614,43 @@ impl Vm {
                         }
                     }
 
-                    // Pass 2: per-element scalar operations.
-                    for ei in 0..batch_len {
-                        let val = type_data[ei as usize];
-                        let matched = (0..match_count)
-                            .any(|mj| val == bytes::read_u32(match_ids, (mj * 4) as u32));
-                        if !matched {
-                            continue;
+                    // Pass 2: per-element operations, over the body widened
+                    // once for the batch. A body of aggregates alone widens
+                    // to nothing and visits no element.
+                    let mut wide = core::mem::take(&mut self.element_body);
+                    wide.clear();
+                    let result = if widen_element_body(body, &mut wide).is_none() {
+                        INVALID_PROGRAM
+                    } else if wide.is_empty() {
+                        OK
+                    } else {
+                        let mut result = OK;
+                        for ei in 0..batch_len {
+                            let val = type_data[ei as usize];
+                            let matched = (0..match_count)
+                                .any(|mj| val == bytes::read_u32(match_ids, (mj * 4) as u32));
+                            if !matched {
+                                continue;
+                            }
+                            result = self.execute_element_opcodes(
+                                delta_mode,
+                                state,
+                                &wide,
+                                cols,
+                                ei,
+                                ei,
+                                NO_PARENT_TS_COL,
+                                live.as_deref_mut(),
+                            );
+                            if result != OK {
+                                break;
+                            }
                         }
-                        let elem_result = self.execute_element_opcodes(
-                            delta_mode,
-                            state,
-                            body,
-                            cols,
-                            ei,
-                            ei,
-                            NO_PARENT_TS_COL,
-                            live.as_deref_mut(),
-                        );
-                        if elem_result != OK {
-                            return elem_result;
-                        }
+                        result
+                    };
+                    self.element_body = wide;
+                    if result != OK {
+                        return result;
                     }
                 }
 
@@ -3972,23 +3848,15 @@ impl Vm {
             }};
         }
 
-        // `validate_body` proved every instruction whole once per batch, so a
-        // row walks the body by decoding each instruction once: an executed
-        // one advances past what it read, and only a skipped aggregate pays
-        // for measuring its length.
+        // `body` is a widened body (`element_body`): no aggregates, every
+        // index a `u32`, so each instruction is read once and advances past
+        // what it read.
         let mut bpc = 0usize;
         while bpc < body.len() {
             let Some(op) = Opcode::from_u8(body[bpc]) else {
                 return INVALID_PROGRAM;
             };
-            if is_aggregate_op(op) {
-                let Some(op_len) = body_op_len(body, bpc) else {
-                    return INVALID_PROGRAM;
-                };
-                bpc += op_len;
-                continue;
-            }
-            let mut r = Operands::at(body, bpc + 1);
+            let mut r = WideOperands::at(body, bpc + 1);
 
             match op {
                 Opcode::BatchMapUpsertLatest | Opcode::BatchMapUpsertLatestTtl => {
@@ -4431,7 +4299,7 @@ impl Vm {
                 | Opcode::BatchStructMapUpsertMax => {
                     let operands = &mut self.element_struct_map;
                     if operands
-                        .decode_into(body, bpc + 1, op == Opcode::BatchStructMapUpsertMax)
+                        .decode_from(&mut r, op == Opcode::BatchStructMapUpsertMax)
                         .is_none()
                     {
                         return INVALID_PROGRAM;
@@ -4488,9 +4356,10 @@ impl Vm {
 
                 // Exact two-lane struct map upsert/remove.
                 Opcode::BatchStructMap2UpsertLast => {
-                    let Some(operands) = decode_struct_map2_upsert_operands(body, bpc + 1) else {
+                    let operands = &mut self.element_struct_map2;
+                    if operands.decode_from(&mut r, 0).is_none() {
                         return INVALID_PROGRAM;
-                    };
+                    }
                     bpc = operands.end;
                     let result = single_struct_map2_upsert_last(
                         &mut self.undo,
@@ -4512,20 +4381,20 @@ impl Vm {
                     }
                 }
                 Opcode::BatchStructMap2UpsertMaxI64x2 => {
-                    let Some(operands) = decode_struct_map2_max_i64x2_operands(body, bpc + 1)
-                    else {
+                    let operands = &mut self.element_struct_map2_max;
+                    if operands.decode_from(&mut r).is_none() {
                         return INVALID_PROGRAM;
-                    };
+                    }
                     bpc = operands.end;
                     let smap = StructMap2Slot::bind(state, operands.row.slot);
-                    if !validate_struct_map2_max_i64x2(state, &smap, &operands) {
+                    if !validate_struct_map2_max_i64x2(state, &smap, operands) {
                         return INVALID_PROGRAM;
                     }
                     let result = single_struct_map2_upsert_max_i64x2(
                         &mut self.undo,
                         delta_mode,
                         state,
-                        &operands,
+                        operands,
                         cell_u32(cols, operands.row.key1_col, child_idx),
                         cell_u32(cols, operands.row.key2_col, child_idx),
                         cols,
@@ -5317,9 +5186,10 @@ impl Vm {
                 Opcode::ListAppendStruct => {
                     let slot = operand!(r.index());
                     let num_vals = usize::from(operand!(r.byte()));
-                    let Some(vals) = ScalarOperands::decode(&mut r, num_vals, 0) else {
+                    let vals = &mut self.element_list_vals;
+                    if vals.decode_into(&mut r, num_vals, 0).is_none() {
                         return INVALID_PROGRAM;
-                    };
+                    }
                     bpc = r.pos();
                     let (vc, fi) = (vals.cols(), vals.fields());
 
@@ -5430,7 +5300,11 @@ impl Vm {
                 Opcode::FlatMap => {
                     let offsets_col = operand!(r.index());
                     let inner_parent_ts_col = operand!(r.index());
-                    let inner_body_len = usize::from(operand!(r.u16()));
+                    // A widened FLAT_MAP carries its widened inner body
+                    // behind a u32 length.
+                    let Ok(inner_body_len) = usize::try_from(operand!(r.u32())) else {
+                        return INVALID_PROGRAM;
+                    };
                     let inner_body = operand!(r.bytes(inner_body_len));
                     bpc = r.pos();
 
