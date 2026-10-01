@@ -244,12 +244,13 @@ Notes:
   must match the deny's specificity. It is not expressible as a read/write grant for exactly that reason: a grant
   intersecting an effective deny is refused. It is controller-owned, carried by the workspaces that asked for the mode,
   and never implied by the baseline — main's working tree is no more reachable than any other workspace's.
-- **Controller Git is separately confined.** Host-side checkout Git disables hooks, fsmonitor and commit
-  signing regardless of repository config. Rebase, land and fetch use the GitDiscovery profile: the
-  target checkout is writable, and any source checkout it must read is supplied by the controller,
-  not a URL found in `.git/config`. Linked-worktree Git can write the shared `.git` only when its
-  reverse registration points back to this workspace. Repository filters and merge drivers therefore
-  run within this narrower write boundary, never with the controller's host reach.
+- **Controller Git is separately confined on macOS.** Host-side checkout Git disables hooks,
+  fsmonitor and commit signing regardless of repository config on every platform. On macOS,
+  rebase, land and fetch use the GitDiscovery profile: the target checkout is writable, and any
+  source checkout it must read is supplied by the controller, not a URL found in `.git/config`.
+  Linked-worktree Git can write the shared `.git` only when its reverse registration points back
+  to this workspace. Repository filters and merge drivers run within this narrower write
+  boundary on macOS; Linux currently has the hardened Git flags but no controller Git sandbox.
   The object-only bundle create/verify/fetch verbs access controller-owned bundle files in the
   denied store; they run host-side with hooks and fsmonitor disabled, without checkout, configured
   remotes or merge/filter execution. The store is not made readable to a workspace Git sandbox.
