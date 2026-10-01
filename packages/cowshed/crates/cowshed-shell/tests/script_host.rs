@@ -19,6 +19,18 @@ use cowshed_core::runtime::shell_host::{
 };
 use cowshed_core::script::{Binding, RenderedScript, render};
 
+/// The exec host binary under test, read when the test runs. `env!` would bake in the path of
+/// the checkout that compiled this test, but the test runs from a cached nextest archive that
+/// is relocated into every checkout, and nextest re-points `CARGO_BIN_EXE_cowshed-shell-host`
+/// at the extracted binary only at runtime.
+fn shell_host() -> PathBuf {
+    PathBuf::from(
+        std::env::var_os("CARGO_BIN_EXE_cowshed-shell-host").expect(
+            "cargo and nextest set CARGO_BIN_EXE_cowshed-shell-host for an integration test",
+        ),
+    )
+}
+
 struct Host {
     child: std::process::Child,
     control: std::os::unix::net::UnixStream,
@@ -40,7 +52,7 @@ impl Host {
         let directory = std::fs::canonicalize(directory).expect("canonical scratch");
         let (ours, theirs) = std::os::unix::net::UnixStream::pair().expect("socket pair");
         let theirs_raw = theirs.as_raw_fd();
-        let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_cowshed-shell-host"));
+        let mut command = std::process::Command::new(shell_host());
         command
             .env_clear()
             .env("PATH", path)

@@ -7,6 +7,17 @@ use serde_json::json;
 use std::path::PathBuf;
 use std::process::Command;
 
+/// The `cowshed` binary under test, read when the test runs. `env!` would bake in the path of
+/// the checkout that compiled this test, but the test runs from a cached nextest archive
+/// that is relocated into every checkout, and nextest re-points `CARGO_BIN_EXE_cowshed` at the
+/// extracted binary only at runtime.
+fn cowshed() -> PathBuf {
+    PathBuf::from(
+        std::env::var_os("CARGO_BIN_EXE_cowshed")
+            .expect("cargo and nextest set CARGO_BIN_EXE_cowshed for an integration test"),
+    )
+}
+
 #[test]
 fn success_and_failure_are_exact_core_envelopes() {
     let mut success = Vec::new();
@@ -71,7 +82,7 @@ fn bare_streams_and_records_preserve_machine_bytes() {
 
 #[test]
 fn binary_entrypoint_returns_typed_json_usage_error() {
-    let output = Command::new(env!("CARGO_BIN_EXE_cowshed"))
+    let output = Command::new(cowshed())
         .args(["--json", "exec", "raven", "--unknown"])
         .output()
         .unwrap();
@@ -85,9 +96,7 @@ fn binary_entrypoint_returns_typed_json_usage_error() {
 
 #[test]
 fn binary_entrypoint_returns_usage_and_command_map() {
-    let output = Command::new(env!("CARGO_BIN_EXE_cowshed"))
-        .output()
-        .unwrap();
+    let output = Command::new(cowshed()).output().unwrap();
 
     assert_eq!(output.status.code(), Some(2));
     assert!(output.stdout.is_empty());
@@ -100,7 +109,7 @@ fn binary_entrypoint_returns_usage_and_command_map() {
 
 #[test]
 fn child_argv_cannot_enable_cli_json_mode() {
-    let output = Command::new(env!("CARGO_BIN_EXE_cowshed"))
+    let output = Command::new(cowshed())
         .args([
             "exec",
             "raven",
@@ -137,7 +146,7 @@ fn scratch_home(label: &str) -> PathBuf {
 fn skill_install_splits_tsv_stdout_from_guidance_and_hints_exactly_once() {
     let home = scratch_home("streams");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_cowshed"))
+    let output = Command::new(cowshed())
         .args(["skill", "install"])
         .env("HOME", &home)
         .output()
@@ -174,12 +183,12 @@ fn skill_install_splits_tsv_stdout_from_guidance_and_hints_exactly_once() {
 fn skill_install_is_idempotent_and_reports_unchanged() {
     let home = scratch_home("idempotent");
 
-    let first = Command::new(env!("CARGO_BIN_EXE_cowshed"))
+    let first = Command::new(cowshed())
         .args(["skill", "install"])
         .env("HOME", &home)
         .output()
         .unwrap();
-    let second = Command::new(env!("CARGO_BIN_EXE_cowshed"))
+    let second = Command::new(cowshed())
         .args(["--json", "skill", "install"])
         .env("HOME", &home)
         .output()
@@ -214,7 +223,7 @@ fn skill_install_is_idempotent_and_reports_unchanged() {
 fn skill_install_rejects_an_unknown_harness_before_writing_anything() {
     let home = scratch_home("unknown-harness");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_cowshed"))
+    let output = Command::new(cowshed())
         .args(["skill", "install", "--harness", "nonesuch"])
         .env("HOME", &home)
         .output()

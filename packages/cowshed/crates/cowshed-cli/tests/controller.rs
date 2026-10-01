@@ -10,11 +10,22 @@ use std::time::Duration;
 use cowshed_core::Cowshed;
 use cowshed_core::metadata::WorkspaceRole;
 
+/// The `cowshed` binary under test, read when the test runs. `env!` would bake in the path of
+/// the checkout that compiled this test, but the test runs from a cached nextest archive
+/// that is relocated into every checkout, and nextest re-points `CARGO_BIN_EXE_cowshed` at the
+/// extracted binary only at runtime.
+fn cowshed() -> PathBuf {
+    PathBuf::from(
+        std::env::var_os("CARGO_BIN_EXE_cowshed")
+            .expect("cargo and nextest set CARGO_BIN_EXE_cowshed for an integration test"),
+    )
+}
+
 /// A terminal or a pipe on standard input is refused as a usage error before anything else: the
 /// project named here does not exist, and the refusal is still about standard input.
 #[test]
 fn a_standard_input_that_is_not_a_socket_is_refused_before_the_project_is_resolved() {
-    let output = Command::new(env!("CARGO_BIN_EXE_cowshed"))
+    let output = Command::new(cowshed())
         .args([
             "--json",
             "--project",
@@ -52,7 +63,7 @@ fn a_standard_input_that_is_not_a_socket_is_refused_before_the_project_is_resolv
 async fn host_controller_an_embedding_process_reaches_its_project_through_the_controller_verb() {
     let root = checkout_root();
     let (ours, theirs) = UnixStream::pair().expect("socketpair");
-    let child = tokio::process::Command::new(env!("CARGO_BIN_EXE_cowshed"))
+    let child = tokio::process::Command::new(cowshed())
         .arg("--project")
         .arg(&root)
         .arg("controller")

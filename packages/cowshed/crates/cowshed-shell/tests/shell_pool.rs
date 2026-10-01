@@ -35,6 +35,18 @@ use cowshed_gateway_types::WorkspaceToken;
 
 const COUNT: &str = "printf 'activation\\n' >> \"$TMPDIR/activations\"\n";
 
+/// The exec host binary under test, read when the test runs. `env!` would bake in the path of
+/// the checkout that compiled this test, but the test runs from a cached nextest archive that
+/// is relocated into every checkout, and nextest re-points `CARGO_BIN_EXE_cowshed-shell-host`
+/// at the extracted binary only at runtime.
+fn shell_host() -> PathBuf {
+    PathBuf::from(
+        std::env::var_os("CARGO_BIN_EXE_cowshed-shell-host").expect(
+            "cargo and nextest set CARGO_BIN_EXE_cowshed-shell-host for an integration test",
+        ),
+    )
+}
+
 struct DiscardedCommitments;
 
 #[async_trait]
@@ -125,10 +137,7 @@ impl Workspace {
     }
 
     fn supervisor(&self, prewarm: bool) -> WorkspaceSupervisorHandle {
-        self.supervisor_hosted_by(
-            ShellHostProgram::dedicated(env!("CARGO_BIN_EXE_cowshed-shell-host")),
-            prewarm,
-        )
+        self.supervisor_hosted_by(ShellHostProgram::dedicated(shell_host()), prewarm)
     }
 
     fn supervisor_hosted_by(
