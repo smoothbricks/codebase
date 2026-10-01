@@ -10,8 +10,8 @@ use columine_types::types::{
 };
 
 /// Return the metadata record base for `slot`.
-pub const fn slot_meta_base(slot: u8) -> u32 {
-    STATE_HEADER_SIZE + slot as u32 * SLOT_META_SIZE
+pub const fn slot_meta_base(slot: u32) -> u32 {
+    STATE_HEADER_SIZE + slot * SLOT_META_SIZE
 }
 
 /// Transient view of one slot's metadata, carrying values and writable-field
@@ -31,7 +31,7 @@ pub struct SlotMetaView {
 impl SlotMetaView {
     /// Bind to `slot`'s metadata. An invalid slot-type byte indicates a
     /// corrupted or hand-rolled state buffer and panics.
-    pub fn read(state: &[u8], slot: u8) -> Self {
+    pub fn read(state: &[u8], slot: u32) -> Self {
         let meta_base = slot_meta_base(slot);
         let type_flags =
             SlotTypeFlags::from_byte(state[(meta_base + SlotMetaOffset::TYPE_FLAGS) as usize]);
@@ -96,10 +96,10 @@ impl SlotMetaView {
         state[(self.meta_base + SlotMetaOffset::AGG_TYPE) as usize]
     }
 
-    /// Slot-meta byte 15 — the input column carrying this slot's timestamps.
+    /// The input column carrying this TTL slot's timestamps.
     #[inline(always)]
-    pub fn timestamp_field_idx(&self, state: &[u8]) -> u8 {
-        state[(self.meta_base + SlotMetaOffset::TIMESTAMP_FIELD_IDX) as usize]
+    pub fn timestamp_col(&self, state: &[u8]) -> u32 {
+        bytes::read_u32(state, self.meta_base + SlotMetaOffset::TIMESTAMP_COL)
     }
 
     /// Compute `now - ttl_seconds - grace_seconds` (both f32 values).

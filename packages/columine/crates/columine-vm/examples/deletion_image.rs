@@ -14,9 +14,11 @@ fn program(remove: bool) -> Vec<u8> {
     };
     let mut out = vec![0; 32];
     out.extend(PROGRAM_MAGIC.to_le_bytes());
-    out.extend([1, 0, 1, 2, 0, 0]);
-    out.extend((init.len() as u16).to_le_bytes());
-    out.extend((reduce.len() as u16).to_le_bytes());
+    out.extend([2, 0, 0, 0]); // version 2, no callbacks, no flags
+    out.extend(1u32.to_le_bytes());
+    out.extend(2u32.to_le_bytes());
+    out.extend((init.len() as u32).to_le_bytes());
+    out.extend((reduce.len() as u32).to_le_bytes());
     out.extend(init);
     out.extend(reduce);
     out

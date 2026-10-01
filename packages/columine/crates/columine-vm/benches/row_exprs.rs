@@ -69,9 +69,11 @@ fn program(capacity: u32, trailer: &[u8]) -> Vec<u8> {
     reduce.push(0);
     let mut prog = vec![0u8; 32];
     prog.extend(PROGRAM_MAGIC.to_le_bytes());
-    prog.extend([1, 0, 1, NUM_COLS, 0, 0]);
-    prog.extend((init.len() as u16).to_le_bytes());
-    prog.extend((reduce.len() as u16).to_le_bytes());
+    prog.extend([2, 0, 0, 0]); // version 2, no callbacks, no flags
+    prog.extend(1u32.to_le_bytes());
+    prog.extend(u32::from(NUM_COLS).to_le_bytes());
+    prog.extend((init.len() as u32).to_le_bytes());
+    prog.extend((reduce.len() as u32).to_le_bytes());
     prog.extend(init);
     prog.extend(&reduce);
     prog.extend_from_slice(trailer);
@@ -111,14 +113,15 @@ impl RowExpression for Exprs {
 
     fn eval(&mut self, expr: &[u8], batch: &BatchView<'_>, row: u32) -> Result<u32, ErrorCode> {
         if expr[0] == 0 {
-            let cells = col_u32_exact(batch.column(expr[1]), batch.batch_len).expect("covered");
+            let cells =
+                col_u32_exact(batch.column(u32::from(expr[1])), batch.batch_len).expect("covered");
             let threshold = u32::from_le_bytes([expr[2], expr[3], expr[4], expr[5]]);
             return Ok(u32::from(cells[row as usize] > threshold));
         }
-        let key =
-            col_u32_exact(batch.column(expr[1]), batch.batch_len).expect("covered")[row as usize];
-        let val =
-            col_u32_exact(batch.column(expr[2]), batch.batch_len).expect("covered")[row as usize];
+        let key = col_u32_exact(batch.column(u32::from(expr[1])), batch.batch_len)
+            .expect("covered")[row as usize];
+        let val = col_u32_exact(batch.column(u32::from(expr[2])), batch.batch_len)
+            .expect("covered")[row as usize];
         let meta = SlotMetaView::read(batch.state, 0);
         let stored = vm_map_get(batch.state, meta.offset, meta.capacity, key);
         Ok(u32::from(stored == EMPTY_KEY || val > stored))

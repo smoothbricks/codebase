@@ -34,12 +34,14 @@ fn meta_u32(state: &[u8], slot: u8, field_off: u32) -> u32 {
 fn test_program() -> Vec<u8> {
     let mut prog = vec![0u8; 32];
     prog.extend(PROGRAM_MAGIC.to_le_bytes());
-    prog.extend([1, 0, 2, 2, 0, 0]);
+    prog.extend([2, 0, 0, 0]); // version 2, no callbacks, no flags
+    prog.extend(2u32.to_le_bytes()); // slots
+    prog.extend(2u32.to_le_bytes()); // inputs
     let mut init: Vec<u8> = [[0x10, 0, 0x00, 16, 0], [0x10, 1, 0x02, 2, 0]].concat();
     init.push(0);
     let reduce = [0x22u8, 0, 0, 1, 0x41, 1];
-    prog.extend((init.len() as u16).to_le_bytes());
-    prog.extend((reduce.len() as u16).to_le_bytes());
+    prog.extend((init.len() as u32).to_le_bytes());
+    prog.extend((reduce.len() as u32).to_le_bytes());
     prog.extend_from_slice(&init);
     prog.extend_from_slice(&reduce);
     prog

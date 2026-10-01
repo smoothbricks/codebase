@@ -1,8 +1,10 @@
+import { readIndex } from './operand.js';
 import type { ReducerProgram, SlotDef, SlotTtlMetadata, StructFieldType } from './types.js';
 import {
   AggType,
   HEADER_SIZE,
   Opcode,
+  PROGRAM_FORMAT_VERSION,
   PROGRAM_HASH_PREFIX,
   PROGRAM_MAGIC,
   SlotType,
@@ -103,6 +105,32 @@ function parseTtlStartOf(value: number): TtlStartOf {
   }
 }
 
+/** The fields of a program's content header (`HEADER_SIZE` bytes after the hash prefix). */
+export interface ProgramHeaderFields {
+  readonly magic: number;
+  readonly numCallbacks?: number;
+  readonly flags?: number;
+  readonly numSlots: number;
+  readonly numInputs: number;
+  readonly initCodeLength: number;
+  readonly reduceCodeLength: number;
+}
+
+/** Encode a version `PROGRAM_FORMAT_VERSION` content header. */
+export function encodeProgramHeader(fields: ProgramHeaderFields): Uint8Array {
+  const header = new Uint8Array(HEADER_SIZE);
+  const view = new DataView(header.buffer);
+  view.setUint32(0, fields.magic, true);
+  view.setUint16(4, PROGRAM_FORMAT_VERSION, true);
+  view.setUint8(6, fields.numCallbacks ?? 0);
+  view.setUint8(7, fields.flags ?? 0);
+  view.setUint32(8, fields.numSlots, true);
+  view.setUint32(12, fields.numInputs, true);
+  view.setUint32(16, fields.initCodeLength, true);
+  view.setUint32(20, fields.reduceCodeLength, true);
+  return header;
+}
+
 export function parseReducerProgram(
   bytecode: Uint8Array,
   defaultCapacity = 1024,
@@ -119,13 +147,14 @@ export function parseReducerProgram(
     throw new Error('Invalid program: bad magic');
   }
 
-  if (content[4] !== 1 || content[5] !== 0) {
+  const header = new DataView(content.buffer, content.byteOffset, HEADER_SIZE);
+  if (header.getUint16(4, true) !== PROGRAM_FORMAT_VERSION) {
     throw new Error('Invalid program: unsupported version');
   }
 
-  const numSlots = content[6];
-  const numInputs = content[7];
-  const initLen = content[10] | (content[11] << 8);
+  const numSlots = header.getUint32(8, true);
+  const numInputs = header.getUint32(12, true);
+  const initLen = header.getUint32(16, true);
 
   if (PROGRAM_HASH_PREFIX + HEADER_SIZE + initLen > bytecode.length) {
     throw new Error('Invalid program: init section overflow');
@@ -138,22 +167,33 @@ export function parseReducerProgram(
 }
 
 export function parseReducerSlotDefs(initCode: Uint8Array, expectedSlots: number, defaultCapacity: number): SlotDef[] {
+  // Every slot is defined by an init instruction of at least five bytes.
+  if (expectedSlots > initCode.length) {
+    throw new Error(`Invalid program: ${expectedSlots} slots exceed the init section`);
+  }
   const slotDefs: Array<SlotDef | undefined> = new Array(expectedSlots);
   let halted = false;
 
   let pc = 0;
   while (pc < initCode.length) {
     const op = initCode[pc++];
-
+    if (op === Opcode.HALT) {
+      if (pc !== initCode.length) {
+        throw new Error('Invalid program: bytes after init HALT');
+      }
+      halted = true;
+      break;
+    }
     switch (op) {
       case Opcode.SLOT_DEF: {
-        requireInitBytes(initCode, pc, 4, 'SLOT_DEF operands');
-        const slot = initCode[pc];
-        const typeFlags = initCode[pc + 1];
+        const { value: slot, next } = readIndex(initCode, pc);
+        pc = next;
+        requireInitBytes(initCode, pc, 3, 'SLOT_DEF operands');
+        const typeFlags = initCode[pc];
         const slotType = typeFlags & SLOT_TYPE_MASK;
-        const capLo = initCode[pc + 2];
-        const capHi = initCode[pc + 3];
-        pc += 4;
+        const capLo = initCode[pc + 1];
+        const capHi = initCode[pc + 2];
+        pc += 3;
 
         const ttlParsed = parseTtlIfPresent(initCode, pc, typeFlags);
         if (ttlParsed) {
@@ -197,13 +237,14 @@ export function parseReducerSlotDefs(initCode: Uint8Array, expectedSlots: number
 
       case Opcode.SLOT_STRUCT_MAP:
       case Opcode.SLOT_STRUCT_MAP2: {
-        requireInitBytes(initCode, pc, 5, 'struct-map slot operands');
-        const slot = initCode[pc];
-        const typeFlags = initCode[pc + 1];
-        const capLo = initCode[pc + 2];
-        const capHi = initCode[pc + 3];
-        const numFields = initCode[pc + 4];
-        pc += 5;
+        const { value: slot, next } = readIndex(initCode, pc);
+        pc = next;
+        requireInitBytes(initCode, pc, 4, 'struct-map slot operands');
+        const typeFlags = initCode[pc];
+        const capLo = initCode[pc + 1];
+        const capHi = initCode[pc + 2];
+        const numFields = initCode[pc + 3];
+        pc += 4;
         requireInitBytes(initCode, pc, numFields, 'struct-map field metadata');
 
         const fieldTypes: StructFieldType[] = [];
@@ -237,12 +278,13 @@ export function parseReducerSlotDefs(initCode: Uint8Array, expectedSlots: number
       }
 
       case Opcode.SLOT_ORDERED_LIST: {
-        requireInitBytes(initCode, pc, 5, 'SLOT_ORDERED_LIST operands');
-        const slot = initCode[pc];
-        const capLo = initCode[pc + 2];
-        const capHi = initCode[pc + 3];
-        const elemTypeByte = initCode[pc + 4];
-        pc += 5;
+        const { value: slot, next } = readIndex(initCode, pc);
+        pc = next;
+        requireInitBytes(initCode, pc, 4, 'SLOT_ORDERED_LIST operands');
+        const capLo = initCode[pc + 1];
+        const capHi = initCode[pc + 2];
+        const elemTypeByte = initCode[pc + 3];
+        pc += 4;
 
         const capacity = (capHi << 8) | capLo || defaultCapacity;
         let slotDef: SlotDef;
@@ -262,19 +304,8 @@ export function parseReducerSlotDefs(initCode: Uint8Array, expectedSlots: number
         break;
       }
 
-      case Opcode.HALT:
-        if (pc !== initCode.length) {
-          throw new Error('Invalid program: bytes after init HALT');
-        }
-        halted = true;
-        break;
-
       default:
         throw new Error(`Invalid program: unknown init opcode ${op}`);
-    }
-
-    if (halted) {
-      break;
     }
   }
 
@@ -296,19 +327,19 @@ function parseTtlIfPresent(initCode: Uint8Array, pc: number, typeFlags: number):
     return undefined;
   }
 
-  if (pc + 10 > initCode.length) {
-    throw new Error('Invalid program: TTL metadata overflow');
-  }
-
-  const view = new DataView(initCode.buffer, initCode.byteOffset + pc, 10);
+  // ttl:f32, grace:f32, timestamp column:index, start_of:u8.
+  requireInitBytes(initCode, pc, 8, 'TTL metadata');
+  const view = new DataView(initCode.buffer, initCode.byteOffset + pc, 8);
+  const timestampColumn = readIndex(initCode, pc + 8);
+  requireInitBytes(initCode, timestampColumn.next, 1, 'TTL metadata');
   return {
     ttl: {
       ttlSeconds: view.getFloat32(0, true),
       graceSeconds: view.getFloat32(4, true),
-      timestampFieldIndex: view.getUint8(8),
-      startOf: parseTtlStartOf(view.getUint8(9)),
+      timestampFieldIndex: timestampColumn.value,
+      startOf: parseTtlStartOf(initCode[timestampColumn.next]),
       hasEvictTrigger: (typeFlags & HAS_EVICT_TRIGGER_FLAG) !== 0,
     },
-    nextPc: pc + 10,
+    nextPc: timestampColumn.next + 1,
   };
 }

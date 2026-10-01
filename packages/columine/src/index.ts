@@ -10,6 +10,9 @@
  *   const stages = createPipeline({ backend, parseBackend });
  */
 // Parse/Compact backend (event_processor WASM bridge)
+
+// Index operands (column, slot and match-count encoding)
+export { appendIndex, MAX_INDEX_LEN, readIndex } from './operand.js';
 export type {
   CompactDiagnostic,
   CompactEncodingErrorCode,
@@ -40,7 +43,12 @@ export type {
 } from './pipeline.js';
 export { createPipeline } from './pipeline.js';
 // Canonical reducer bytecode parser
-export { parseReducerProgram, parseReducerSlotDefs } from './reducer-bytecode.js';
+export {
+  encodeProgramHeader,
+  type ProgramHeaderFields,
+  parseReducerProgram,
+  parseReducerSlotDefs,
+} from './reducer-bytecode.js';
 // Types and interfaces
 export type {
   ColumineBackend,
@@ -59,7 +67,9 @@ export {
   ComparisonType,
   ErrorCode,
   HEADER_SIZE,
+  NO_PARENT_TS_COL,
   Opcode,
+  PROGRAM_FORMAT_VERSION,
   PROGRAM_HASH_PREFIX,
   PROGRAM_MAGIC,
   SlotType,

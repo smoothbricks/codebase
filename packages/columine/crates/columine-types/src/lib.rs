@@ -30,6 +30,7 @@ pub mod abort;
 #[cfg(feature = "audit")]
 #[doc(hidden)]
 pub mod audit_parser;
+pub mod operand;
 pub mod types;
 pub mod wasm_abi;
 

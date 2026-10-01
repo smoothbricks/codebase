@@ -33,9 +33,11 @@ fn program(trailer: &[u8]) -> Vec<u8> {
     reduce.push(0); // HALT
     let mut prog = vec![0u8; 32];
     prog.extend(PROGRAM_MAGIC.to_le_bytes());
-    prog.extend([1, 0, 1, 4, 0, 0]);
-    prog.extend((init.len() as u16).to_le_bytes());
-    prog.extend((reduce.len() as u16).to_le_bytes());
+    prog.extend([2, 0, 0, 0]); // version 2, no callbacks, no flags
+    prog.extend(1u32.to_le_bytes());
+    prog.extend(4u32.to_le_bytes());
+    prog.extend((init.len() as u32).to_le_bytes());
+    prog.extend((reduce.len() as u32).to_le_bytes());
     prog.extend(init);
     prog.extend(&reduce);
     prog.extend_from_slice(trailer);
@@ -87,15 +89,15 @@ impl RowExpression for Threshold {
         if usize::from(expr[0]) >= batch.num_cols() {
             return Err(ErrorCode::InvalidProgram);
         }
-        col_u32_exact(batch.column(expr[0]), batch.batch_len)
+        col_u32_exact(batch.column(u32::from(expr[0])), batch.batch_len)
             .map(|_| Binding::Bound)
             .ok_or(ErrorCode::ColumnUnderrun)
     }
 
     fn eval(&mut self, expr: &[u8], batch: &BatchView<'_>, row: u32) -> Result<u32, ErrorCode> {
         self.evaluated += 1;
-        let cells =
-            col_u32_exact(batch.column(expr[0]), batch.batch_len).expect("admit proved coverage");
+        let cells = col_u32_exact(batch.column(u32::from(expr[0])), batch.batch_len)
+            .expect("admit proved coverage");
         let threshold = u32::from_le_bytes([expr[1], expr[2], expr[3], expr[4]]);
         Ok(u32::from(cells[row as usize] > threshold))
     }
@@ -328,9 +330,11 @@ fn a_later_entry_reads_an_earlier_entry_s_derived_column() {
     );
     let mut prog = vec![0u8; 32];
     prog.extend(PROGRAM_MAGIC.to_le_bytes());
-    prog.extend([1, 0, 1, 5, 0, 0]);
-    prog.extend((init_code.len() as u16).to_le_bytes());
-    prog.extend((reduce.len() as u16).to_le_bytes());
+    prog.extend([2, 0, 0, 0]); // version 2, no callbacks, no flags
+    prog.extend(1u32.to_le_bytes());
+    prog.extend(5u32.to_le_bytes());
+    prog.extend((init_code.len() as u32).to_le_bytes());
+    prog.extend((reduce.len() as u32).to_le_bytes());
     prog.extend(init_code);
     prog.extend(reduce);
     prog.extend_from_slice(&trailer);
@@ -362,9 +366,11 @@ fn two_entries_bind_their_own_targets_over_the_host_batch() {
     );
     let mut prog = vec![0u8; 32];
     prog.extend(PROGRAM_MAGIC.to_le_bytes());
-    prog.extend([1, 0, 1, 5, 0, 0]);
-    prog.extend((init_code.len() as u16).to_le_bytes());
-    prog.extend((reduce.len() as u16).to_le_bytes());
+    prog.extend([2, 0, 0, 0]); // version 2, no callbacks, no flags
+    prog.extend(1u32.to_le_bytes());
+    prog.extend(5u32.to_le_bytes());
+    prog.extend((init_code.len() as u32).to_le_bytes());
+    prog.extend((reduce.len() as u32).to_le_bytes());
     prog.extend(init_code);
     prog.extend(reduce);
     prog.extend_from_slice(&trailer);
@@ -399,10 +405,10 @@ impl RowExpression for Competes {
 
     fn eval(&mut self, expr: &[u8], batch: &BatchView<'_>, row: u32) -> Result<u32, ErrorCode> {
         self.evaluated += 1;
-        let key = col_u32_exact(batch.column(expr[0]), batch.batch_len).expect("key column")
-            [row as usize];
-        let val = col_u32_exact(batch.column(expr[1]), batch.batch_len).expect("value column")
-            [row as usize];
+        let key = col_u32_exact(batch.column(u32::from(expr[0])), batch.batch_len)
+            .expect("key column")[row as usize];
+        let val = col_u32_exact(batch.column(u32::from(expr[1])), batch.batch_len)
+            .expect("value column")[row as usize];
         let stored = map_value(batch.state, key);
         Ok(u32::from(stored == EMPTY_KEY || val > stored))
     }
@@ -574,9 +580,11 @@ fn program_with_body(body: &[u8], trailer: &[u8]) -> Vec<u8> {
     reduce.push(0); // HALT
     let mut prog = vec![0u8; 32];
     prog.extend(PROGRAM_MAGIC.to_le_bytes());
-    prog.extend([1, 0, 1, 4, 0, 0]);
-    prog.extend((init.len() as u16).to_le_bytes());
-    prog.extend((reduce.len() as u16).to_le_bytes());
+    prog.extend([2, 0, 0, 0]); // version 2, no callbacks, no flags
+    prog.extend(1u32.to_le_bytes());
+    prog.extend(4u32.to_le_bytes());
+    prog.extend((init.len() as u32).to_le_bytes());
+    prog.extend((reduce.len() as u32).to_le_bytes());
     prog.extend(init);
     prog.extend(&reduce);
     prog.extend_from_slice(trailer);
@@ -680,9 +688,11 @@ fn a_for_each_over_a_live_type_column_is_refused_at_bind() {
     reduce.push(0);
     let mut prog = vec![0u8; 32];
     prog.extend(PROGRAM_MAGIC.to_le_bytes());
-    prog.extend([1, 0, 1, 4, 0, 0]);
-    prog.extend((init_code.len() as u16).to_le_bytes());
-    prog.extend((reduce.len() as u16).to_le_bytes());
+    prog.extend([2, 0, 0, 0]); // version 2, no callbacks, no flags
+    prog.extend(1u32.to_le_bytes());
+    prog.extend(4u32.to_le_bytes());
+    prog.extend((init_code.len() as u32).to_le_bytes());
+    prog.extend((reduce.len() as u32).to_le_bytes());
     prog.extend(init_code);
     prog.extend(&reduce);
     prog.extend(table(
@@ -715,9 +725,11 @@ fn a_table_whose_type_column_is_live_is_refused_at_bind() {
     );
     let mut prog = vec![0u8; 32];
     prog.extend(PROGRAM_MAGIC.to_le_bytes());
-    prog.extend([1, 0, 1, 4, 0, 0]);
-    prog.extend((init_code.len() as u16).to_le_bytes());
-    prog.extend((reduce.len() as u16).to_le_bytes());
+    prog.extend([2, 0, 0, 0]); // version 2, no callbacks, no flags
+    prog.extend(1u32.to_le_bytes());
+    prog.extend(4u32.to_le_bytes());
+    prog.extend((init_code.len() as u32).to_le_bytes());
+    prog.extend((reduce.len() as u32).to_le_bytes());
     prog.extend(init_code);
     prog.extend(reduce);
     prog.extend_from_slice(&trailer);
@@ -776,9 +788,11 @@ fn a_live_entry_bound_after_a_bound_entry_on_reused_storage_reads_its_own_column
     reduce.push(0);
     let mut live_on_4 = vec![0u8; 32];
     live_on_4.extend(PROGRAM_MAGIC.to_le_bytes());
-    live_on_4.extend([1, 0, 1, 5, 0, 0]);
-    live_on_4.extend((init_code.len() as u16).to_le_bytes());
-    live_on_4.extend((reduce.len() as u16).to_le_bytes());
+    live_on_4.extend([2, 0, 0, 0]); // version 2, no callbacks, no flags
+    live_on_4.extend(1u32.to_le_bytes());
+    live_on_4.extend(5u32.to_le_bytes());
+    live_on_4.extend((init_code.len() as u32).to_le_bytes());
+    live_on_4.extend((reduce.len() as u32).to_le_bytes());
     live_on_4.extend(init_code);
     live_on_4.extend(&reduce);
     live_on_4.extend(table(
@@ -889,9 +903,11 @@ fn guarded_scatter_program(trailer: &[u8]) -> Vec<u8> {
     reduce.push(0); // HALT
     let mut prog = vec![0u8; 32];
     prog.extend(PROGRAM_MAGIC.to_le_bytes());
-    prog.extend([1, 0, 1, 6, 0, 0]);
-    prog.extend((init.len() as u16).to_le_bytes());
-    prog.extend((reduce.len() as u16).to_le_bytes());
+    prog.extend([2, 0, 0, 0]); // version 2, no callbacks, no flags
+    prog.extend(1u32.to_le_bytes());
+    prog.extend(6u32.to_le_bytes());
+    prog.extend((init.len() as u32).to_le_bytes());
+    prog.extend((reduce.len() as u32).to_le_bytes());
     prog.extend(init);
     prog.extend(&reduce);
     prog.extend_from_slice(trailer);
@@ -910,14 +926,14 @@ impl RowExpression for Copy {
         if expr.len() != 1 || usize::from(expr[0]) >= batch.num_cols() {
             return Err(ErrorCode::InvalidProgram);
         }
-        col_u32_exact(batch.column(expr[0]), batch.batch_len)
+        col_u32_exact(batch.column(u32::from(expr[0])), batch.batch_len)
             .map(|_| self.binding)
             .ok_or(ErrorCode::ColumnUnderrun)
     }
 
     fn eval(&mut self, expr: &[u8], batch: &BatchView<'_>, row: u32) -> Result<u32, ErrorCode> {
-        let cells =
-            col_u32_exact(batch.column(expr[0]), batch.batch_len).expect("admit proved coverage");
+        let cells = col_u32_exact(batch.column(u32::from(expr[0])), batch.batch_len)
+            .expect("admit proved coverage");
         Ok(cells[row as usize])
     }
 }
@@ -1042,9 +1058,11 @@ fn guarded_scatter_with_live_predicate_program(trailer: &[u8]) -> Vec<u8> {
     reduce.push(0); // HALT
     let mut prog = vec![0u8; 32];
     prog.extend(PROGRAM_MAGIC.to_le_bytes());
-    prog.extend([1, 0, 2, 8, 0, 0]);
-    prog.extend((init.len() as u16).to_le_bytes());
-    prog.extend((reduce.len() as u16).to_le_bytes());
+    prog.extend([2, 0, 0, 0]); // version 2, no callbacks, no flags
+    prog.extend(2u32.to_le_bytes());
+    prog.extend(8u32.to_le_bytes());
+    prog.extend((init.len() as u32).to_le_bytes());
+    prog.extend((reduce.len() as u32).to_le_bytes());
     prog.extend(init);
     prog.extend(&reduce);
     prog.extend_from_slice(trailer);

@@ -4,8 +4,9 @@
 use columine_types::PROGRAM_MAGIC;
 use columine_types::types::{
     AggType, DERIVED_FACT_EMPTY_IDENTITY, DERIVED_FACT_TOMBSTONE_IDENTITY, EMPTY_KEY, ErrorCode,
-    Opcode, PROGRAM_HASH_PREFIX, SLOT_META_SIZE, STATE_HEADER_SIZE, STATE_MAGIC, SlotType,
-    StateHeaderOffset, StructFieldType, align8, hash_key, next_power_of_2,
+    Opcode, PROGRAM_FORMAT_VERSION, PROGRAM_HASH_PREFIX, ProgramHeader, SLOT_META_SIZE,
+    STATE_HEADER_SIZE, STATE_MAGIC, SlotMetaOffset, SlotType, StateHeaderOffset, StructFieldType,
+    align8, hash_key, next_power_of_2,
 };
 use columine_vm::meta::SlotMetaView;
 use columine_vm::nested::nested_slot_data_size;
@@ -20,26 +21,30 @@ use proptest::prelude::*;
 
 const HASH_PREFIX: usize = PROGRAM_HASH_PREFIX as usize;
 
-///  `buildSingleSlotProgram` — one SLOT_DEF + HALT.
-fn build_single_slot_program(type_flags_byte: u8, cap_lo: u8, cap_hi: u8) -> [u8; 64] {
-    let mut prog = [0u8; 64];
-    let content = &mut prog[HASH_PREFIX..];
-    // Magic "CLM1" little-endian.
-    content[..4].copy_from_slice(&PROGRAM_MAGIC.to_le_bytes());
-    content[4] = 1; // version lo
-    content[5] = 0; // version hi
-    content[6] = 1; // num_slots
-    let init_len: u16 = 6;
-    content[10] = init_len as u8;
-    content[11] = (init_len >> 8) as u8;
-    // Init section at content[14].
-    content[14] = 0x10; // SLOT_DEF
-    content[15] = 0; // slot index
-    content[16] = type_flags_byte;
-    content[17] = cap_lo;
-    content[18] = cap_hi;
-    content[19] = 0x00; // HALT
+/// A program of `num_slots` slots whose init section is `init` and whose
+/// reduce section is empty.
+fn build_init_program(num_slots: u32, init: &[u8]) -> Vec<u8> {
+    let mut prog = vec![0u8; HASH_PREFIX];
+    prog.extend(
+        ProgramHeader {
+            magic: PROGRAM_MAGIC,
+            version: PROGRAM_FORMAT_VERSION,
+            num_callbacks: 0,
+            flags: 0,
+            num_slots,
+            num_inputs: 0,
+            init_code_len: init.len() as u32,
+            reduce_code_len: 0,
+        }
+        .to_wire_bytes(),
+    );
+    prog.extend_from_slice(init);
     prog
+}
+
+///  `buildSingleSlotProgram` — one SLOT_DEF + HALT.
+fn build_single_slot_program(type_flags_byte: u8, cap_lo: u8, cap_hi: u8) -> Vec<u8> {
+    build_init_program(1, &[0x10, 0, type_flags_byte, cap_lo, cap_hi, 0x00])
 }
 
 fn build_nested_slot_program(
@@ -47,22 +52,14 @@ fn build_nested_slot_program(
     inner_type: SlotType,
     inner_capacity: u16,
     inner_agg: AggType,
-) -> [u8; 64] {
-    let mut program = [0u8; 64];
-    let content = &mut program[HASH_PREFIX..];
-    content[..4].copy_from_slice(&PROGRAM_MAGIC.to_le_bytes());
-    content[4] = 1;
-    content[6] = 1;
-    content[10..12].copy_from_slice(&10u16.to_le_bytes());
-    content[14] = Opcode::SlotNested as u8;
-    content[15] = 0;
-    content[16] = SlotType::Nested as u8;
-    content[17..19].copy_from_slice(&outer_capacity.to_le_bytes());
-    content[19] = inner_type as u8;
-    content[20..22].copy_from_slice(&inner_capacity.to_le_bytes());
-    content[22] = inner_agg as u8;
-    content[23] = Opcode::Halt as u8;
-    program
+) -> Vec<u8> {
+    let mut init = vec![Opcode::SlotNested as u8, 0, SlotType::Nested as u8];
+    init.extend(outer_capacity.to_le_bytes());
+    init.push(inner_type as u8);
+    init.extend(inner_capacity.to_le_bytes());
+    init.push(inner_agg as u8);
+    init.push(Opcode::Halt as u8);
+    build_init_program(1, &init)
 }
 
 /// A single-slot program with TTL params (flags must have 0x10 set).
@@ -73,86 +70,34 @@ fn build_single_slot_ttl_program(
     ttl: f32,
     grace: f32,
     has_evict_trigger: bool,
-) -> [u8; 64] {
-    let mut prog = [0u8; 64];
+) -> Vec<u8> {
     let flags = type_flags_byte | 0x10 | if has_evict_trigger { 0x20 } else { 0 };
-    let content = &mut prog[HASH_PREFIX..];
-    content[..4].copy_from_slice(&PROGRAM_MAGIC.to_le_bytes());
-    content[4] = 1;
-    content[6] = 1;
-    let init_len: u16 = 16; // SLOT_DEF(1) + base(4) + ttl params(10) + HALT(1)
-    content[10] = init_len as u8;
-    content[11] = (init_len >> 8) as u8;
-    content[14] = 0x10; // SLOT_DEF
-    content[15] = 0;
-    content[16] = flags;
-    content[17] = cap_lo;
-    content[18] = cap_hi;
-    content[19..23].copy_from_slice(&ttl.to_le_bytes());
-    content[23..27].copy_from_slice(&grace.to_le_bytes());
-    content[27] = 1; // timestamp_field_idx
-    content[28] = 0; // start_of NONE
-    content[29] = 0x00; // HALT
-    prog
+    let mut init = vec![0x10, 0, flags, cap_lo, cap_hi];
+    init.extend(ttl.to_le_bytes());
+    init.extend(grace.to_le_bytes());
+    init.push(1); // timestamp column
+    init.push(0); // start_of NONE
+    init.push(0x00); // HALT
+    build_init_program(1, &init)
 }
 
 /// A single-slot SLOT_STRUCT_MAP program.
 fn build_struct_map_program(cap_lo: u8, cap_hi: u8, field_types: &[u8]) -> Vec<u8> {
-    let mut prog = vec![0u8; 96];
-    let nf = field_types.len() as u8;
-    let init_len = (1 + 5 + field_types.len() + 1) as u16;
-    let content = &mut prog[HASH_PREFIX..];
-    content[..4].copy_from_slice(&PROGRAM_MAGIC.to_le_bytes());
-    content[4] = 1;
-    content[6] = 1;
-    content[10] = init_len as u8;
-    content[11] = (init_len >> 8) as u8;
-    content[14] = 0x18; // SLOT_STRUCT_MAP
-    content[15] = 0; // slot
-    content[16] = 0x06; // type_flags: STRUCT_MAP
-    content[17] = cap_lo;
-    content[18] = cap_hi;
-    content[19] = nf;
-    content[20..20 + field_types.len()].copy_from_slice(field_types);
-    content[20 + field_types.len()] = 0x00; // HALT
-    prog
+    // SLOT_STRUCT_MAP, slot, type_flags STRUCT_MAP, capacity, field count.
+    let mut init = vec![0x18, 0, 0x06, cap_lo, cap_hi, field_types.len() as u8];
+    init.extend_from_slice(field_types);
+    init.push(0x00); // HALT
+    build_init_program(1, &init)
 }
 
 /// A hash-map slot before a condition-tree/derived-facts slot, so growing the
 /// first slot proves the 16-byte derived table relocates without lane drift.
-fn build_hashmap_and_condition_tree_program(derived_capacity: u16) -> [u8; 64] {
-    let mut prog = [0u8; 64];
-    let content = &mut prog[HASH_PREFIX..];
-    content[0..4].copy_from_slice(&PROGRAM_MAGIC.to_le_bytes());
-    content[4] = 1;
-    content[6] = 2;
-    content[10..12].copy_from_slice(&11u16.to_le_bytes());
-    content[14..19].copy_from_slice(&[0x10, 0, 0x00, 8, 0]);
-    content[19..24].copy_from_slice(&[
-        0x10,
-        1,
-        0x04,
-        derived_capacity as u8,
-        (derived_capacity >> 8) as u8,
-    ]);
-    content[24] = 0;
-    prog
+fn build_hashmap_and_condition_tree_program(derived_capacity: u16) -> Vec<u8> {
+    let [lo, hi] = derived_capacity.to_le_bytes();
+    build_init_program(2, &[0x10, 0, 0x00, 8, 0, 0x10, 1, 0x04, lo, hi, 0])
 }
 
-fn build_init_program(num_slots: u8, init: &[u8]) -> Vec<u8> {
-    let mut prog = vec![0u8; HASH_PREFIX + 14];
-    {
-        let content = &mut prog[HASH_PREFIX..];
-        content[0..4].copy_from_slice(&PROGRAM_MAGIC.to_le_bytes());
-        content[4] = 1;
-        content[6] = num_slots;
-        content[10..12].copy_from_slice(&(init.len() as u16).to_le_bytes());
-    }
-    prog.extend_from_slice(init);
-    prog
-}
-
-fn assert_invalid_init_without_mutation(num_slots: u8, init: &[u8]) {
+fn assert_invalid_init_without_mutation(num_slots: u32, init: &[u8]) {
     let prog = build_init_program(num_slots, init);
     assert_eq!(
         calculate_state_size(
@@ -188,7 +133,7 @@ fn assert_invalid_init_without_mutation(num_slots: u8, init: &[u8]) {
 fn program_magic_acceptance_uses_embedder_set() {
     let base = build_single_slot_program(0x00, 8, 0);
     let foreign_magic = 0x7A6B_5C4Du32;
-    let mut foreign = base;
+    let mut foreign = base.clone();
     foreign[HASH_PREFIX..HASH_PREFIX + 4].copy_from_slice(&foreign_magic.to_le_bytes());
 
     assert!(
@@ -787,7 +732,10 @@ fn init_state_ttl_hashset_writes_eviction_metadata() {
     assert!(eviction_index_offset > 0);
     assert_eq!(eviction_index_capacity, cap);
     assert!(evicted_buffer_offset > eviction_index_offset);
-    assert_eq!(state[(meta + 15) as usize], 1); // timestamp_field_idx
+    assert_eq!(
+        bytes::read_u32(&state, meta + SlotMetaOffset::TIMESTAMP_COL),
+        1
+    );
 }
 
 // Growth end-to-end: manual insertion stands in for the batch executor while

@@ -16,6 +16,7 @@ import {
   type ColumnInput,
   createPipeline,
   ErrorCode,
+  encodeProgramHeader,
   HEADER_SIZE,
   Opcode,
   type ParseCompactBackend,
@@ -76,31 +77,16 @@ function buildProgram(opts: {
   // [32..] content header + init + reduce
 
   const base = PROGRAM_HASH_PREFIX;
-  // Program magic is encoded as little-endian bytes.
-  program[base + 0] = PROGRAM_MAGIC & 0xff;
-  program[base + 1] = (PROGRAM_MAGIC >> 8) & 0xff;
-  program[base + 2] = (PROGRAM_MAGIC >> 16) & 0xff;
-  program[base + 3] = (PROGRAM_MAGIC >> 24) & 0xff;
-
-  // Version 1.0
-  program[base + 4] = 1;
-  program[base + 5] = 0;
-
-  // num_slots, num_cols
-  program[base + 6] = opts.slots.length;
-  program[base + 7] = opts.numInputs;
-
-  // Reserved
-  program[base + 8] = 0;
-  program[base + 9] = 0;
-
-  // init_len (u16 LE)
-  program[base + 10] = initCode.length & 0xff;
-  program[base + 11] = (initCode.length >> 8) & 0xff;
-
-  // reduce_len (u16 LE)
-  program[base + 12] = reduceCode.length & 0xff;
-  program[base + 13] = (reduceCode.length >> 8) & 0xff;
+  program.set(
+    encodeProgramHeader({
+      magic: PROGRAM_MAGIC,
+      numSlots: opts.slots.length,
+      numInputs: opts.numInputs,
+      initCodeLength: initCode.length,
+      reduceCodeLength: reduceCode.length,
+    }),
+    base,
+  );
 
   // Init section
   program.set(initCode, base + HEADER_SIZE);

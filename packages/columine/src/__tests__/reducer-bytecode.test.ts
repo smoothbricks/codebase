@@ -1,8 +1,10 @@
 import { describe, expect, it } from 'bun:test';
 
-import { parseReducerProgram } from '../reducer-bytecode.js';
+import { appendIndex, readIndex } from '../operand.js';
+import { encodeProgramHeader, parseReducerProgram } from '../reducer-bytecode.js';
 import {
   AggType,
+  HEADER_SIZE,
   Opcode,
   PROGRAM_HASH_PREFIX,
   PROGRAM_MAGIC,
@@ -13,39 +15,62 @@ import {
 } from '../types.js';
 
 function buildProgram(initCode: number[], numSlots: number, magic = PROGRAM_MAGIC): Uint8Array {
-  const headerSize = 14;
   const reduceCode = [0x00];
-  const totalLen = PROGRAM_HASH_PREFIX + headerSize + initCode.length + reduceCode.length;
+  const totalLen = PROGRAM_HASH_PREFIX + HEADER_SIZE + initCode.length + reduceCode.length;
   const out = new Uint8Array(totalLen);
   const base = PROGRAM_HASH_PREFIX;
-
-  out[base + 0] = magic & 0xff;
-  out[base + 1] = (magic >> 8) & 0xff;
-  out[base + 2] = (magic >> 16) & 0xff;
-  out[base + 3] = (magic >> 24) & 0xff;
-  out[base + 4] = 1;
-  out[base + 5] = 0;
-  out[base + 6] = numSlots;
-  out[base + 7] = 0;
-  out[base + 10] = initCode.length & 0xff;
-  out[base + 11] = (initCode.length >> 8) & 0xff;
-  out[base + 12] = reduceCode.length & 0xff;
-  out[base + 13] = 0;
-
-  out.set(initCode, base + headerSize);
-  out.set(reduceCode, base + headerSize + initCode.length);
+  out.set(
+    encodeProgramHeader({
+      magic,
+      numSlots,
+      numInputs: 0,
+      initCodeLength: initCode.length,
+      reduceCodeLength: reduceCode.length,
+    }),
+    base,
+  );
+  out.set(initCode, base + HEADER_SIZE);
+  out.set(reduceCode, base + HEADER_SIZE + initCode.length);
   return out;
 }
 
-function ttlBytes(ttlSeconds: number, graceSeconds: number, tsField: number, startOf: TtlStartOf): number[] {
-  const bytes = new Uint8Array(10);
+function ttlBytes(ttlSeconds: number, graceSeconds: number, tsColumn: number, startOf: TtlStartOf): number[] {
+  const bytes = new Uint8Array(8);
   const view = new DataView(bytes.buffer);
   view.setFloat32(0, ttlSeconds, true);
   view.setFloat32(4, graceSeconds, true);
-  view.setUint8(8, tsField);
-  view.setUint8(9, startOf);
-  return [...bytes];
+  const out = [...bytes];
+  appendIndex(out, tsColumn);
+  out.push(startOf);
+  return out;
 }
+
+describe('index operands', () => {
+  it('round-trips every length boundary at its encoded length', () => {
+    for (const [value, length] of [
+      [0, 1],
+      [0x7f, 1],
+      [0x80, 2],
+      [0x3fff, 2],
+      [0x4000, 3],
+      [0x0fff_ffff, 4],
+      [0x1000_0000, 5],
+      [0xffff_ffff, 5],
+    ]) {
+      const out: number[] = [];
+      appendIndex(out, value);
+      expect(out).toHaveLength(length);
+      expect(readIndex(Uint8Array.from(out), 0)).toEqual({ value, next: length });
+    }
+  });
+
+  it('refuses truncated, overlong and out-of-range encodings', () => {
+    expect(() => readIndex(Uint8Array.of(0x80), 0)).toThrow('truncated');
+    expect(() => readIndex(Uint8Array.of(0x81, 0x00), 0)).toThrow('overlong');
+    expect(() => readIndex(Uint8Array.of(0xff, 0xff, 0xff, 0xff, 0x1f), 0)).toThrow('exceeds u32');
+    expect(() => appendIndex([], 2 ** 32)).toThrow(RangeError);
+  });
+});
 
 describe('parseReducerProgram', () => {
   it('rejects foreign magics by default and admits them when explicitly accepted', () => {
@@ -100,6 +125,31 @@ describe('parseReducerProgram', () => {
       startOf: TtlStartOf.HOUR,
       hasEvictTrigger: false,
     });
+  });
+
+  it('reads slot and timestamp-column indexes past one byte', () => {
+    const numSlots = 300;
+    const initCode: number[] = [];
+    for (let slot = 0; slot < numSlots - 1; slot++) {
+      initCode.push(Opcode.SLOT_DEF);
+      appendIndex(initCode, slot);
+      initCode.push(SlotType.HASHSET, 4, 0);
+    }
+    initCode.push(Opcode.SLOT_DEF);
+    appendIndex(initCode, numSlots - 1);
+    initCode.push(SlotType.HASHSET | SlotTypeFlag.HAS_TTL, 4, 0, ...ttlBytes(60, 0, 280, TtlStartOf.NONE), 0x00);
+
+    const program = parseReducerProgram(buildProgram(initCode, numSlots));
+    expect(program.numSlots).toBe(numSlots);
+    expect(program.slotDefs[200]).toEqual({ type: SlotType.HASHSET, capacity: 4, ttl: undefined });
+    const last = program.slotDefs[numSlots - 1];
+    expect('ttl' in last && last.ttl?.timestampFieldIndex).toBe(280);
+  });
+
+  it('refuses a program of another format version', () => {
+    const bytecode = buildProgram([0x10, 0x00, SlotType.HASHSET, 0x10, 0x00, 0x00], 1);
+    bytecode[PROGRAM_HASH_PREFIX + 4] = 1;
+    expect(() => parseReducerProgram(bytecode)).toThrow('Invalid program: unsupported version');
   });
 
   it('keeps non-TTL slot decoding unchanged', () => {

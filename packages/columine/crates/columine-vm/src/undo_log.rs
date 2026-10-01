@@ -85,8 +85,8 @@ pub const SMF_ROW_ABSENT: u8 = 0x02;
 /// `0x02` deliberately, so rollback can share the same removal test.
 pub const SMR_ROW_ABSENT: u8 = 0x02;
 
-/// One serialized undo/redo entry. Layout: op@0, slot@1, `_pad1`@2,
-/// `_pad2`@3, key@4, prev_value@8, four padding bytes, aux@16; size 24.
+/// One serialized undo/redo entry. Layout: op@0, a zero byte@1, `_pad1`@2,
+/// `_pad2`@3, key@4, prev_value@8, slot@12 (`u32`), aux@16; size 24.
 /// `_pad1`/`_pad2` carry field index and flags for struct-map entries.
 /// Following crate convention the struct is plain Rust; the byte contract
 /// lives in [`FlatUndoEntry::write_to`] / [`FlatUndoEntry::read_from`], pinned
@@ -94,8 +94,8 @@ pub const SMR_ROW_ABSENT: u8 = 0x02;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FlatUndoEntry {
     pub op: FlatUndoOp,
-    /// Slot index (0xFF = derived fact); ignored by STATE_BYTES.
-    pub slot: u8,
+    /// Slot index ([`DERIVED_FACT_SLOT`] = derived fact); ignored by STATE_BYTES.
+    pub slot: u32,
     /// STRUCT_MAP_FIELD: field_idx. FACT_*: fact_idx low. STATE_BYTES: length.
     pub pad1: u8,
     /// STRUCT_MAP_*: SMF/SMR flags. FACT_*: fact_idx high byte.
@@ -112,6 +112,9 @@ pub struct FlatUndoEntry {
 /// Serialized size of one undo entry.
 pub const FLAT_UNDO_ENTRY_SIZE: u32 = 24;
 
+/// The `slot` of an entry that journals a derived fact rather than a slot.
+pub const DERIVED_FACT_SLOT: u32 = u32::MAX;
+
 /// One undo/redo pair occupying 48 serialized bytes.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FlatDeltaEntry {
@@ -123,16 +126,16 @@ pub struct FlatDeltaEntry {
 pub const FLAT_DELTA_ENTRY_SIZE: u32 = 48;
 
 impl FlatUndoEntry {
-    /// Serialize with the extern-struct layout (see type doc). The four
-    /// padding bytes at 12..16 are written as zero.
+    /// Serialize with the extern-struct layout (see type doc). Byte 1 is
+    /// written as zero.
     pub fn write_to(&self, out: &mut [u8; FLAT_UNDO_ENTRY_SIZE as usize]) {
         out.fill(0);
         out[0] = self.op as u8;
-        out[1] = self.slot;
         out[2] = self.pad1;
         out[3] = self.pad2;
         out[4..8].copy_from_slice(&self.key.to_le_bytes());
         out[8..12].copy_from_slice(&self.prev_value.to_le_bytes());
+        out[12..16].copy_from_slice(&self.slot.to_le_bytes());
         out[16..24].copy_from_slice(&self.aux.to_le_bytes());
     }
 
@@ -143,7 +146,7 @@ impl FlatUndoEntry {
         let op = FlatUndoOp::from_u8(buf[0])?;
         Some(Self {
             op,
-            slot: buf[1],
+            slot: u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]),
             pad1: buf[2],
             pad2: buf[3],
             key: u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]),
@@ -297,13 +300,13 @@ pub fn rollback_set_delete(state: &mut [u8], meta: &SlotMetaView, elem: u32) -> 
 mod tests {
     use super::*;
 
-    /// The serialized layout is the contract: op@0, slot@1, `_pad1`@2,
-    /// `_pad2`@3, key@4 LE, prev_value@8 LE, zero padding 12..16, aux@16 LE.
+    /// The serialized layout is the contract: op@0, zero@1, `_pad1`@2,
+    /// `_pad2`@3, key@4 LE, prev_value@8 LE, slot@12 LE, aux@16 LE.
     #[test]
     fn flat_undo_entry_serialized_layout_is_pinned() {
         let entry = FlatUndoEntry {
             op: FlatUndoOp::StructMapField,
-            slot: 7,
+            slot: 0x0102_0304,
             pad1: 3,
             pad2: SMF_BIT_SET,
             key: 0x11223344,
@@ -313,12 +316,12 @@ mod tests {
         let mut buf = [0xa5u8; 24];
         entry.write_to(&mut buf);
         assert_eq!(buf[0], 12); // StructMapField discriminant
-        assert_eq!(buf[1], 7);
+        assert_eq!(buf[1], 0);
         assert_eq!(buf[2], 3);
         assert_eq!(buf[3], 0x01);
         assert_eq!(&buf[4..8], &0x11223344u32.to_le_bytes());
         assert_eq!(&buf[8..12], &0x55667788u32.to_le_bytes());
-        assert_eq!(&buf[12..16], &[0, 0, 0, 0]); // alignment padding zeroed
+        assert_eq!(&buf[12..16], &0x0102_0304u32.to_le_bytes());
         assert_eq!(&buf[16..24], &0x99aabbccddeeff00u64.to_le_bytes());
         assert_eq!(FlatUndoEntry::read_from(&buf), Some(entry));
         assert_eq!(FLAT_UNDO_ENTRY_SIZE, 24);

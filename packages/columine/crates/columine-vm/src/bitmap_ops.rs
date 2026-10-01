@@ -196,7 +196,7 @@ fn commit_bitmap_mutations(
     delta_mode: bool,
     state: &mut [u8],
     meta: &SlotMetaView,
-    slot_idx: u8,
+    slot_idx: u32,
 ) -> ErrorCode {
     for idx in 0..env.pending_mutations.len() {
         match env.pending_mutations[idx] {
@@ -319,7 +319,7 @@ pub fn batch_bitmap_add(
     delta_mode: bool,
     state: &mut [u8],
     meta: &SlotMetaView,
-    slot_idx: u8,
+    slot_idx: u32,
     elem_col: &[u32],
     ts_col: Option<&[f64]>,
 ) -> ErrorCode {
@@ -475,7 +475,7 @@ pub fn batch_bitmap_remove(
     delta_mode: bool,
     state: &mut [u8],
     meta: &SlotMetaView,
-    slot_idx: u8,
+    slot_idx: u32,
     elem_col: &[u32],
 ) -> ErrorCode {
     env.last_error = 0;

@@ -1,5 +1,6 @@
 import { beforeAll, describe, expect, it } from 'bun:test';
 import { readFileSync } from 'node:fs';
+import { encodeProgramHeader } from '../reducer-bytecode.js';
 import {
   type ColumineBackend,
   type ColumnInput,
@@ -29,15 +30,16 @@ function reducer(
   const code = [...reduce, Opcode.HALT];
   const bytecode = new Uint8Array(PROGRAM_HASH_PREFIX + HEADER_SIZE + init.length + code.length);
   const base = PROGRAM_HASH_PREFIX;
-  bytecode[base] = PROGRAM_MAGIC & 0xff;
-  bytecode[base + 1] = (PROGRAM_MAGIC >>> 8) & 0xff;
-  bytecode[base + 2] = (PROGRAM_MAGIC >>> 16) & 0xff;
-  bytecode[base + 3] = (PROGRAM_MAGIC >>> 24) & 0xff;
-  bytecode[base + 4] = 1;
-  bytecode[base + 6] = 1;
-  bytecode[base + 7] = numInputs;
-  bytecode[base + 10] = init.length;
-  bytecode[base + 12] = code.length;
+  bytecode.set(
+    encodeProgramHeader({
+      magic: PROGRAM_MAGIC,
+      numSlots: 1,
+      numInputs,
+      initCodeLength: init.length,
+      reduceCodeLength: code.length,
+    }),
+    base,
+  );
   bytecode.set(init, base + HEADER_SIZE);
   bytecode.set(code, base + HEADER_SIZE + init.length);
   return bytecode;

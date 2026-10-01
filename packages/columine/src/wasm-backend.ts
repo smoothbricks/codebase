@@ -373,7 +373,8 @@ export async function createColumineWasmBackend(wasmBytes: BufferSource, memoryP
     failedAttemptCheckpoint: number,
   ): number => {
     wasmInstance.exports.vm_undo_rollback(statePtr, failedAttemptCheckpoint);
-    const grownSlot = wasmInstance.exports.vm_get_needs_growth_slot();
+    // A u32 across the wasm ABI: no pending growth is u32::MAX, which no slot has.
+    const grownSlot = wasmInstance.exports.vm_get_needs_growth_slot() >>> 0;
     if (grownSlot >= program.numSlots) return ErrorCode.INVALID_SLOT;
 
     ensureMemory(statePtr + state.size);

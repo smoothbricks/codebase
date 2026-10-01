@@ -24,23 +24,29 @@ use crate::meta::SlotMetaView;
 use crate::{aggregates, bitmap_ops, bytes, hash_table, nested, slot_growth};
 use bitmosaic::{EMPTY_U32_IMAGE, KeyWidth, image_header};
 pub use columine_types::DEFAULT_ACCEPTED_PROGRAM_MAGICS;
+use columine_types::operand::{Operands, read_index};
 use columine_types::types::{
     AggType, CONDITION_TREE_STATE_BYTES, DERIVED_FACT_EMPTY_IDENTITY, EMPTY_KEY, ErrorCode,
-    EvictionEntry, Opcode, PROGRAM_HASH_PREFIX, PROGRAM_HEADER_SIZE, ProgramHeader, SLOT_META_SIZE,
+    EvictionEntry, Opcode, PROGRAM_HASH_PREFIX, ProgramHeader, SLOT_META_SIZE,
     STATE_FORMAT_VERSION, STATE_HEADER_SIZE, STATE_MAGIC, SlotMetaOffset, SlotType, SlotTypeFlags,
     StateFlags, StateHeaderOffset, StructFieldType, TOMBSTONE, align8, arena_elem_size,
-    has_array_fields, is_array_field_type, next_power_of_2,
+    has_array_fields, is_array_field_type, next_power_of_2, state_num_slots,
 };
 use core::mem::size_of;
-use core::sync::atomic::{AtomicU8, Ordering};
+use core::sync::atomic::{AtomicU32, Ordering};
 
-/// Slot that triggered `NEEDS_GROWTH`, or `0xFF` when none is pending.
-/// Relaxed atomics preserve the single-threaded wasm global without `static mut`.
-pub static NEEDS_GROWTH_SLOT: AtomicU8 = AtomicU8::new(0xff);
+/// [`needs_growth_slot`] when no growth is pending: no slot has this index.
+pub const NO_GROWTH_SLOT: u32 = u32::MAX;
 
-/// `vm_get_needs_growth_slot` — the slot that triggered NEEDS_GROWTH, or 0xFF.
+/// Slot that triggered `NEEDS_GROWTH`, or [`NO_GROWTH_SLOT`] when none is
+/// pending. Relaxed atomics preserve the single-threaded wasm global without
+/// `static mut`.
+pub static NEEDS_GROWTH_SLOT: AtomicU32 = AtomicU32::new(NO_GROWTH_SLOT);
+
+/// `vm_get_needs_growth_slot` — the slot that triggered NEEDS_GROWTH, or
+/// [`NO_GROWTH_SLOT`].
 pub fn needs_growth_slot() -> u32 {
-    u32::from(NEEDS_GROWTH_SLOT.load(Ordering::Relaxed))
+    NEEDS_GROWTH_SLOT.load(Ordering::Relaxed)
 }
 
 pub const EVICTION_ENTRY_SIZE: u32 = size_of::<EvictionEntry>() as u32;
@@ -51,7 +57,7 @@ pub const ARENA_HEADER_SIZE: u32 = nested::ARENA_HDR_SIZE;
 
 /// Struct-map / ordered-list overlays of the TTL/grace metadata fields.
 const STRUCT_NUM_FIELDS: u32 = SlotMetaOffset::AGG_TYPE;
-const STRUCT_BITSET_BYTES: u32 = SlotMetaOffset::TIMESTAMP_FIELD_IDX;
+const STRUCT_BITSET_BYTES: u32 = SlotMetaOffset::STRUCT_BITSET_BYTES;
 const STRUCT_ROW_SIZE: u32 = SlotMetaOffset::TTL_SECONDS;
 const STRUCT_KIND_BYTE: u32 = SlotMetaOffset::TTL_SECONDS + 2;
 const STRUCT_ARENA_HDR: u32 = SlotMetaOffset::GRACE_SECONDS;
@@ -181,17 +187,8 @@ pub const fn ttl_side_buffer_size(has_ttl: bool, has_evict_trigger: bool, capaci
 // =============================================================================
 
 struct ProgramView<'a> {
-    num_slots: u8,
+    num_slots: u32,
     init_code: &'a [u8],
-}
-
-/// Return whether a program header magic is admitted by the embedder.
-///
-/// Keeping membership in this helper makes every bytecode walker use the same
-/// acceptance rule while retaining a borrowed, allocation-free cold-path set.
-#[inline]
-pub(crate) fn accepts_program_magic(magic: u32, accepted_program_magics: &[u32]) -> bool {
-    accepted_program_magics.contains(&magic)
 }
 
 /// Parse the shared program header and return `None` for an invalid program.
@@ -199,26 +196,44 @@ fn parse_program<'a>(
     program: &'a [u8],
     accepted_program_magics: &[u32],
 ) -> Option<ProgramView<'a>> {
-    if (program.len() as u32) < PROGRAM_HEADER_SIZE {
-        return None;
-    }
-    let content = &program[PROGRAM_HASH_PREFIX as usize..];
-    let header_bytes: [u8; ProgramHeader::WIRE_SIZE] =
-        content.get(..ProgramHeader::WIRE_SIZE)?.try_into().ok()?;
-    let header = ProgramHeader::from_wire_bytes(header_bytes);
-    if !accepts_program_magic(header.magic, accepted_program_magics) {
-        return None;
-    }
-    let init_len = usize::from(header.init_code_len);
-    if PROGRAM_HASH_PREFIX + ProgramHeader::WIRE_SIZE as u32 + u32::from(header.init_code_len)
-        > program.len() as u32
-    {
+    let sections = ProgramHeader::sections(program)?;
+    if !accepted_program_magics.contains(&sections.header.magic) {
         return None;
     }
     Some(ProgramView {
-        num_slots: header.num_slots,
-        init_code: content.get(ProgramHeader::WIRE_SIZE..ProgramHeader::WIRE_SIZE + init_len)?,
+        num_slots: sections.header.num_slots,
+        init_code: sections.init_code,
     })
+}
+
+/// The TTL parameters a `SLOT_DEF` with `has_ttl` carries after its
+/// capacity: `ttl:f32, grace:f32, ts_col:index, start_of:u8`.
+#[derive(Clone, Copy)]
+struct TtlParams {
+    ttl_seconds: f32,
+    grace_seconds: f32,
+    timestamp_col: u32,
+    start_of: u8,
+}
+
+impl TtlParams {
+    const NONE: Self = Self {
+        ttl_seconds: 0.0,
+        grace_seconds: 0.0,
+        timestamp_col: 0,
+        start_of: 0, // DurationUnit::None
+    };
+
+    fn read(code: &[u8], pc: usize) -> Option<(Self, usize)> {
+        let mut operands = Operands::at(code, pc);
+        let params = Self {
+            ttl_seconds: operands.f32()?,
+            grace_seconds: operands.f32()?,
+            timestamp_col: operands.index()?,
+            start_of: operands.byte()?,
+        };
+        Some((params, operands.pos()))
+    }
 }
 
 /// SLOT_DEF capacity normalization shared by the size and init walkers.
@@ -239,13 +254,16 @@ fn slot_def_capacity(type_flags: SlotTypeFlags, cap_lo: u8, cap_hi: u8) -> Optio
     Some((slot_type, capacity))
 }
 
-fn valid_slot_index(seen: &mut [bool; 256], num_slots: u8, slot: u8) -> bool {
-    let index = usize::from(slot);
-    if slot >= num_slots || seen[index] {
-        return false;
+/// Read the slot index that opens every init instruction and claim it:
+/// `None` when the index is malformed, out of range or already defined.
+fn claim_slot(code: &[u8], pc: usize, seen: &mut [bool]) -> Option<(u32, usize)> {
+    let (slot, next) = read_index(code, pc)?;
+    let defined = seen.get_mut(usize::try_from(slot).ok()?)?;
+    if *defined {
+        return None;
     }
-    seen[index] = true;
-    true
+    *defined = true;
+    Some((slot, next))
 }
 
 fn valid_aggregate_subtype(byte: u8) -> bool {
@@ -274,7 +292,16 @@ fn valid_scalar_subtype(byte: u8) -> bool {
 
 fn validate_init_code(view: &ProgramView<'_>) -> bool {
     let code = view.init_code;
-    let mut seen = [false; 256];
+    // Every slot is defined exactly once, by an init instruction of at least
+    // five bytes, so a header counting more slots than the init section has
+    // bytes is refused before the bookkeeping for it is allocated.
+    let Ok(num_slots) = usize::try_from(view.num_slots) else {
+        return false;
+    };
+    if num_slots > code.len() {
+        return false;
+    }
+    let mut seen = vec![false; num_slots];
     let mut pc = 0usize;
 
     while pc < code.len() {
@@ -282,27 +309,24 @@ fn validate_init_code(view: &ProgramView<'_>) -> bool {
             return false;
         };
         pc += 1;
+        if op == Opcode::Halt {
+            return pc == code.len() && seen.iter().all(|defined| *defined);
+        }
+        let Some((_, after_slot)) = claim_slot(code, pc, &mut seen) else {
+            return false;
+        };
+        pc = after_slot;
 
         match op {
-            Opcode::Halt => {
-                return pc == code.len()
-                    && seen[..usize::from(view.num_slots)]
-                        .iter()
-                        .all(|defined| *defined);
-            }
             Opcode::SlotDef => {
-                let Some(operands) = code.get(pc..pc.saturating_add(4)) else {
+                let Some(operands) = code.get(pc..pc.saturating_add(3)) else {
                     return false;
                 };
-                let slot = operands[0];
-                let type_flags = SlotTypeFlags::from_byte(operands[1]);
-                let cap_lo = operands[2];
+                let type_flags = SlotTypeFlags::from_byte(operands[0]);
+                let cap_lo = operands[1];
                 let Some(slot_type) = type_flags.slot_type() else {
                     return false;
                 };
-                if !valid_slot_index(&mut seen, view.num_slots, slot) {
-                    return false;
-                }
                 if matches!(
                     slot_type,
                     SlotType::StructMap
@@ -324,39 +348,33 @@ fn validate_init_code(view: &ProgramView<'_>) -> bool {
                 {
                     return false;
                 }
-                pc += 4;
+                pc += 3;
                 if type_flags.has_ttl() {
-                    let Some(ttl) = code.get(pc..pc.saturating_add(10)) else {
+                    let Some((ttl, after)) = TtlParams::read(code, pc) else {
                         return false;
                     };
-                    if ttl[9] > 8 {
+                    if ttl.start_of > 8 {
                         return false;
                     }
-                    pc += 10;
+                    pc = after;
                 }
             }
             Opcode::SlotArray => {
+                if code.get(pc..pc.saturating_add(3)).is_none() {
+                    return false;
+                }
+                pc += 3;
+            }
+            Opcode::SlotStructMap | Opcode::SlotStructMap2 => {
                 let Some(operands) = code.get(pc..pc.saturating_add(4)) else {
                     return false;
                 };
-                if !valid_slot_index(&mut seen, view.num_slots, operands[0]) {
-                    return false;
-                }
-                pc += 4;
-            }
-            Opcode::SlotStructMap | Opcode::SlotStructMap2 => {
-                let Some(operands) = code.get(pc..pc.saturating_add(5)) else {
-                    return false;
-                };
-                if !valid_slot_index(&mut seen, view.num_slots, operands[0]) {
-                    return false;
-                }
-                let type_flags = SlotTypeFlags::from_byte(operands[1]);
+                let type_flags = SlotTypeFlags::from_byte(operands[0]);
                 if type_flags.has_ttl() {
                     return false;
                 }
-                let num_fields = usize::from(operands[4]);
-                pc += 5;
+                let num_fields = usize::from(operands[3]);
+                pc += 4;
                 let Some(field_types) = code.get(pc..pc.saturating_add(num_fields)) else {
                     return false;
                 };
@@ -369,14 +387,11 @@ fn validate_init_code(view: &ProgramView<'_>) -> bool {
                 pc += num_fields;
             }
             Opcode::SlotOrderedList => {
-                let Some(operands) = code.get(pc..pc.saturating_add(5)) else {
+                let Some(operands) = code.get(pc..pc.saturating_add(4)) else {
                     return false;
                 };
-                if !valid_slot_index(&mut seen, view.num_slots, operands[0]) {
-                    return false;
-                }
-                let elem_type = operands[4];
-                pc += 5;
+                let elem_type = operands[3];
+                pc += 4;
                 if elem_type == 0xff {
                     let Some(&num_fields) = code.get(pc) else {
                         return false;
@@ -399,19 +414,16 @@ fn validate_init_code(view: &ProgramView<'_>) -> bool {
                 }
             }
             Opcode::SlotNested => {
-                let Some(operands) = code.get(pc..pc.saturating_add(8)) else {
+                let Some(operands) = code.get(pc..pc.saturating_add(7)) else {
                     return false;
                 };
-                if !valid_slot_index(&mut seen, view.num_slots, operands[0]) {
-                    return false;
-                }
-                let Some(inner_type) = SlotType::from_u8(operands[4] & 0x0f) else {
+                let Some(inner_type) = SlotType::from_u8(operands[3] & 0x0f) else {
                     return false;
                 };
-                if inner_type == SlotType::Aggregate && !valid_aggregate_subtype(operands[7]) {
+                if inner_type == SlotType::Aggregate && !valid_aggregate_subtype(operands[6]) {
                     return false;
                 }
-                pc += 8;
+                pc += 7;
             }
             _ => return false,
         }
@@ -440,23 +452,32 @@ pub fn calculate_state_size(program: &[u8], accepted_program_magics: &[u32]) -> 
     let init_code = view.init_code;
 
     // Header + slot metadata (48 bytes per slot).
-    let mut size = align8(STATE_HEADER_SIZE + u32::from(view.num_slots) * SLOT_META_SIZE);
+    let mut size = align8(STATE_HEADER_SIZE + view.num_slots * SLOT_META_SIZE);
 
     let mut pc = 0usize;
     while pc < init_code.len() {
         let op = init_code[pc];
         pc += 1;
+        if op == Opcode::Halt as u8 {
+            break;
+        }
+        // Every init instruction opens with its slot index; validation has
+        // already claimed it, so only its length matters here.
+        let Some((_, after_slot)) = read_index(init_code, pc) else {
+            return 0;
+        };
+        pc = after_slot;
 
         if op == Opcode::SlotDef as u8 {
-            // slot:u8, type_flags:u8, cap_lo:u8, cap_hi:u8 [, ttl params]
-            let type_flags = SlotTypeFlags::from_byte(init_code[pc + 1]);
-            let cap_lo = init_code[pc + 2];
-            let cap_hi = init_code[pc + 3];
+            // type_flags:u8, cap_lo:u8, cap_hi:u8 [, ttl params]
+            let type_flags = SlotTypeFlags::from_byte(init_code[pc]);
+            let cap_lo = init_code[pc + 1];
+            let cap_hi = init_code[pc + 2];
             // Invalid slot-type nibbles make the program invalid.
             let Some((slot_type, capacity)) = slot_def_capacity(type_flags, cap_lo, cap_hi) else {
                 return 0;
             };
-            pc += 4;
+            pc += 3;
 
             if slot_type == SlotType::HashMap
                 && type_flags.has_ttl()
@@ -465,9 +486,11 @@ pub fn calculate_state_size(program: &[u8], accepted_program_magics: &[u32]) -> 
                 return 0;
             }
 
-            // Skip TTL params if present (f32 ttl + f32 grace + u8 ts_field + u8 start_of).
             if type_flags.has_ttl() {
-                pc += 10;
+                let Some((_, after_ttl)) = TtlParams::read(init_code, pc) else {
+                    return 0;
+                };
+                pc = after_ttl;
             }
 
             let agg_type_byte =
@@ -489,23 +512,23 @@ pub fn calculate_state_size(program: &[u8], accepted_program_magics: &[u32]) -> 
                 capacity,
             );
         } else if op == Opcode::SlotArray as u8 {
-            let cap_lo = init_code[pc + 1];
-            let cap_hi = init_code[pc + 2];
+            let cap_lo = init_code[pc];
+            let cap_hi = init_code[pc + 1];
             let mut capacity = (u32::from(cap_hi) << 8) | u32::from(cap_lo);
             if capacity == 0 {
                 capacity = 1024;
             }
             capacity = next_power_of_2(capacity * 2);
-            pc += 4;
+            pc += 3;
 
             size += capacity * 4 + capacity * 8;
             size = align8(size);
         } else if op == Opcode::SlotStructMap as u8 || op == Opcode::SlotStructMap2 as u8 {
-            let type_flags = SlotTypeFlags::from_byte(init_code[pc + 1]);
-            let cap_lo = init_code[pc + 2];
-            let cap_hi = init_code[pc + 3];
-            let num_fields = init_code[pc + 4];
-            pc += 5;
+            let type_flags = SlotTypeFlags::from_byte(init_code[pc]);
+            let cap_lo = init_code[pc + 1];
+            let cap_hi = init_code[pc + 2];
+            let num_fields = init_code[pc + 3];
+            pc += 4;
 
             let mut capacity = (u32::from(cap_hi) << 8) | u32::from(cap_lo);
             if capacity == 0 {
@@ -533,10 +556,10 @@ pub fn calculate_state_size(program: &[u8], accepted_program_magics: &[u32]) -> 
                 capacity,
             );
         } else if op == Opcode::SlotOrderedList as u8 {
-            let cap_lo = init_code[pc + 2];
-            let cap_hi = init_code[pc + 3];
-            let elem_type = init_code[pc + 4];
-            pc += 5;
+            let cap_lo = init_code[pc + 1];
+            let cap_hi = init_code[pc + 2];
+            let elem_type = init_code[pc + 3];
+            pc += 4;
 
             let mut capacity = (u32::from(cap_hi) << 8) | u32::from(cap_lo);
             if capacity == 0 {
@@ -561,13 +584,13 @@ pub fn calculate_state_size(program: &[u8], accepted_program_magics: &[u32]) -> 
             }
             size = align8(size);
         } else if op == Opcode::SlotNested as u8 {
-            let outer_cap_lo = init_code[pc + 2];
-            let outer_cap_hi = init_code[pc + 3];
-            let inner_type_byte = init_code[pc + 4];
-            let inner_cap_lo = init_code[pc + 5];
-            let inner_cap_hi = init_code[pc + 6];
-            let inner_agg_type_byte = init_code[pc + 7];
-            pc += 8;
+            let outer_cap_lo = init_code[pc + 1];
+            let outer_cap_hi = init_code[pc + 2];
+            let inner_type_byte = init_code[pc + 3];
+            let inner_cap_lo = init_code[pc + 4];
+            let inner_cap_hi = init_code[pc + 5];
+            let inner_agg_type_byte = init_code[pc + 6];
+            pc += 7;
 
             let mut outer_cap = (u32::from(outer_cap_hi) << 8) | u32::from(outer_cap_lo);
             if outer_cap == 0 {
@@ -598,8 +621,6 @@ pub fn calculate_state_size(program: &[u8], accepted_program_magics: &[u32]) -> 
                 inner_agg,
             );
             size = align8(size);
-        } else if op == Opcode::Halt as u8 {
-            break;
         } else {
             return 0;
         }
@@ -616,20 +637,17 @@ pub fn calculate_state_size(program: &[u8], accepted_program_magics: &[u32]) -> 
 #[allow(clippy::too_many_arguments)]
 fn write_slot_meta(
     state: &mut [u8],
-    slot: u8,
+    slot: u32,
     data_offset: u32,
     capacity: u32,
     type_flags: SlotTypeFlags,
     agg_type_byte: u8,
-    ttl_seconds: f32,
-    grace_seconds: f32,
-    timestamp_field_idx: u8,
-    start_of: u8,
+    ttl: TtlParams,
     eviction_index_offset: u32,
     eviction_index_capacity: u32,
     evicted_buffer_offset: u32,
 ) {
-    let meta = STATE_HEADER_SIZE + u32::from(slot) * SLOT_META_SIZE;
+    let meta = STATE_HEADER_SIZE + slot * SLOT_META_SIZE;
 
     bytes::write_u32(state, meta + SlotMetaOffset::OFFSET, data_offset);
     bytes::write_u32(state, meta + SlotMetaOffset::CAPACITY, capacity);
@@ -638,10 +656,14 @@ fn write_slot_meta(
     state[(meta + SlotMetaOffset::TYPE_FLAGS) as usize] = type_flags.to_byte();
     state[(meta + SlotMetaOffset::AGG_TYPE) as usize] = agg_type_byte;
     state[(meta + SlotMetaOffset::CHANGE_FLAGS) as usize] = 0;
-    state[(meta + SlotMetaOffset::TIMESTAMP_FIELD_IDX) as usize] = timestamp_field_idx;
+    state[(meta + SlotMetaOffset::START_OF) as usize] = ttl.start_of;
 
-    bytes::write_f32(state, meta + SlotMetaOffset::TTL_SECONDS, ttl_seconds);
-    bytes::write_f32(state, meta + SlotMetaOffset::GRACE_SECONDS, grace_seconds);
+    bytes::write_f32(state, meta + SlotMetaOffset::TTL_SECONDS, ttl.ttl_seconds);
+    bytes::write_f32(
+        state,
+        meta + SlotMetaOffset::GRACE_SECONDS,
+        ttl.grace_seconds,
+    );
 
     bytes::write_u32(
         state,
@@ -660,10 +682,11 @@ fn write_slot_meta(
         evicted_buffer_offset,
     );
     bytes::write_u32(state, meta + SlotMetaOffset::EVICTED_COUNT, 0);
-
-    state[(meta + SlotMetaOffset::START_OF) as usize] = start_of;
-    state[(meta + SlotMetaOffset::START_OF + 1) as usize..meta as usize + SLOT_META_SIZE as usize]
-        .fill(0);
+    bytes::write_u32(
+        state,
+        meta + SlotMetaOffset::TIMESTAMP_COL,
+        ttl.timestamp_col,
+    );
 }
 
 /// Initialize a state buffer. `state` must be at least
@@ -682,39 +705,40 @@ pub fn init_state(
     let init_code = view.init_code;
 
     // State header: magic(4) + format_version(1) + program_version(2)
-    // + ruleset_version(2) + num_slots(1) + num_vars(1) + num_bitvecs(1) + flags(1)
-    // + reserved(19).
+    // + ruleset_version(2) + reserved(1) + num_vars(1) + num_bitvecs(1)
+    // + flags(1) + derived facts(8) + reserved(3) + num_slots(4) + reserved(4).
+    state[..STATE_HEADER_SIZE as usize].fill(0);
     bytes::write_u32(state, 0, STATE_MAGIC);
     state[StateHeaderOffset::FORMAT_VERSION as usize] = STATE_FORMAT_VERSION;
     state[StateHeaderOffset::PROGRAM_VERSION as usize] = content[4];
     state[StateHeaderOffset::PROGRAM_VERSION as usize + 1] = content[5];
-    state[StateHeaderOffset::RULESET_VERSION as usize] = 0;
-    state[StateHeaderOffset::RULESET_VERSION as usize + 1] = 0;
-    state[StateHeaderOffset::NUM_SLOTS as usize] = num_slots;
-    state[StateHeaderOffset::NUM_VARS as usize] = 0;
-    state[StateHeaderOffset::NUM_BITVECS as usize] = 0;
-    state[StateHeaderOffset::FLAGS as usize] = 0;
-    state[13..32].fill(0);
+    bytes::write_u32(state, StateHeaderOffset::NUM_SLOTS, num_slots);
 
-    let mut data_offset = align8(STATE_HEADER_SIZE + u32::from(num_slots) * SLOT_META_SIZE);
+    let mut data_offset = align8(STATE_HEADER_SIZE + num_slots * SLOT_META_SIZE);
 
     let mut pc = 0usize;
     while pc < init_code.len() {
         let op = init_code[pc];
         pc += 1;
+        if op == Opcode::Halt as u8 {
+            break;
+        }
+        let Some((slot, after_slot)) = read_index(init_code, pc) else {
+            return Err(ErrorCode::InvalidProgram);
+        };
+        pc = after_slot;
 
         if op == Opcode::SlotDef as u8 {
-            let slot = init_code[pc];
-            let type_flags = SlotTypeFlags::from_byte(init_code[pc + 1]);
-            let cap_lo = init_code[pc + 2];
-            let cap_hi = init_code[pc + 3];
+            let type_flags = SlotTypeFlags::from_byte(init_code[pc]);
+            let cap_lo = init_code[pc + 1];
+            let cap_hi = init_code[pc + 2];
             let Some((slot_type, capacity)) = slot_def_capacity(type_flags, cap_lo, cap_hi) else {
                 return Err(ErrorCode::InvalidProgram);
             };
             // For AGGREGATE/SCALAR: cap_lo encodes the AggType subtype (raw byte).
             let is_subtyped = matches!(slot_type, SlotType::Aggregate | SlotType::Scalar);
             let agg_type_byte = if is_subtyped && cap_lo > 0 { cap_lo } else { 1 };
-            pc += 4;
+            pc += 3;
 
             if slot_type == SlotType::HashMap
                 && type_flags.has_ttl()
@@ -728,25 +752,15 @@ pub fn init_state(
                 return Err(ErrorCode::InvalidProgram);
             }
 
-            let mut ttl_seconds = 0.0f32;
-            let mut grace_seconds = 0.0f32;
-            let mut timestamp_field_idx = 0u8;
-            let mut start_of = 0u8; // DurationUnit::None
-            if type_flags.has_ttl() {
-                ttl_seconds = f32::from_le_bytes(
-                    init_code[pc..pc + 4]
-                        .try_into()
-                        .unwrap_or_else(|_| columine_types::die!("f32")),
-                );
-                grace_seconds = f32::from_le_bytes(
-                    init_code[pc + 4..pc + 8]
-                        .try_into()
-                        .unwrap_or_else(|_| columine_types::die!("f32")),
-                );
-                timestamp_field_idx = init_code[pc + 8];
-                start_of = init_code[pc + 9];
-                pc += 10;
-            }
+            let ttl = if type_flags.has_ttl() {
+                let Some((ttl, after_ttl)) = TtlParams::read(init_code, pc) else {
+                    return Err(ErrorCode::InvalidProgram);
+                };
+                pc = after_ttl;
+                ttl
+            } else {
+                TtlParams::NONE
+            };
 
             let primary_data_offset = data_offset;
 
@@ -862,24 +876,20 @@ pub fn init_state(
                 capacity,
                 type_flags,
                 agg_type_byte,
-                ttl_seconds,
-                grace_seconds,
-                timestamp_field_idx,
-                start_of,
+                ttl,
                 eviction_index_offset,
                 eviction_index_capacity,
                 evicted_buffer_offset,
             );
         } else if op == Opcode::SlotArray as u8 {
-            let slot = init_code[pc];
-            let cap_lo = init_code[pc + 1];
-            let cap_hi = init_code[pc + 2];
+            let cap_lo = init_code[pc];
+            let cap_hi = init_code[pc + 1];
             let mut capacity = (u32::from(cap_hi) << 8) | u32::from(cap_lo);
             if capacity == 0 {
                 capacity = 1024;
             }
             capacity = next_power_of_2(capacity * 2);
-            pc += 4;
+            pc += 3;
 
             let type_flags = SlotTypeFlags::new(SlotType::Array, false, false, false, false);
 
@@ -901,21 +911,17 @@ pub fn init_state(
                 capacity,
                 type_flags,
                 1, // SUM
-                0.0,
-                0.0,
-                0,
-                0, // DurationUnit::None
+                TtlParams::NONE,
                 0,
                 0,
                 0,
             );
         } else if op == Opcode::SlotStructMap as u8 || op == Opcode::SlotStructMap2 as u8 {
-            let slot = init_code[pc];
-            let type_flags = SlotTypeFlags::from_byte(init_code[pc + 1]);
-            let cap_lo = init_code[pc + 2];
-            let cap_hi = init_code[pc + 3];
-            let num_fields = init_code[pc + 4];
-            pc += 5;
+            let type_flags = SlotTypeFlags::from_byte(init_code[pc]);
+            let cap_lo = init_code[pc + 1];
+            let cap_hi = init_code[pc + 2];
+            let num_fields = init_code[pc + 3];
+            pc += 4;
 
             let mut capacity = (u32::from(cap_hi) << 8) | u32::from(cap_lo);
             if capacity == 0 {
@@ -927,7 +933,7 @@ pub fn init_state(
             pc += usize::from(num_fields);
 
             let layout = compute_struct_row_layout_padded(num_fields, &field_types);
-            let meta_base = STATE_HEADER_SIZE + u32::from(slot) * SLOT_META_SIZE;
+            let meta_base = STATE_HEADER_SIZE + slot * SLOT_META_SIZE;
 
             write_overlay_meta(
                 state,
@@ -973,12 +979,11 @@ pub fn init_state(
             }
             data_offset = align8(data_offset);
         } else if op == Opcode::SlotOrderedList as u8 {
-            let slot = init_code[pc];
-            let type_flags_byte = init_code[pc + 1];
-            let cap_lo = init_code[pc + 2];
-            let cap_hi = init_code[pc + 3];
-            let elem_type = init_code[pc + 4];
-            pc += 5;
+            let type_flags_byte = init_code[pc];
+            let cap_lo = init_code[pc + 1];
+            let cap_hi = init_code[pc + 2];
+            let elem_type = init_code[pc + 3];
+            pc += 4;
 
             let mut capacity = (u32::from(cap_hi) << 8) | u32::from(cap_lo);
             if capacity == 0 {
@@ -986,7 +991,7 @@ pub fn init_state(
             }
             capacity = next_power_of_2(capacity);
 
-            let meta_base = STATE_HEADER_SIZE + u32::from(slot) * SLOT_META_SIZE;
+            let meta_base = STATE_HEADER_SIZE + slot * SLOT_META_SIZE;
 
             if elem_type == 0xff {
                 // Struct list.
@@ -1042,15 +1047,14 @@ pub fn init_state(
             }
             data_offset = align8(data_offset);
         } else if op == Opcode::SlotNested as u8 {
-            let slot_idx = init_code[pc];
-            let outer_type_flags_byte = init_code[pc + 1];
-            let outer_cap_lo = init_code[pc + 2];
-            let outer_cap_hi = init_code[pc + 3];
-            let inner_type_byte = init_code[pc + 4];
-            let inner_cap_lo = init_code[pc + 5];
-            let inner_cap_hi = init_code[pc + 6];
-            let inner_agg_type_byte = init_code[pc + 7];
-            pc += 8;
+            let outer_type_flags_byte = init_code[pc];
+            let outer_cap_lo = init_code[pc + 1];
+            let outer_cap_hi = init_code[pc + 2];
+            let inner_type_byte = init_code[pc + 3];
+            let inner_cap_lo = init_code[pc + 4];
+            let inner_cap_hi = init_code[pc + 5];
+            let inner_agg_type_byte = init_code[pc + 6];
+            pc += 7;
 
             let mut outer_cap = (u32::from(outer_cap_hi) << 8) | u32::from(outer_cap_lo);
             if outer_cap == 0 {
@@ -1072,15 +1076,14 @@ pub fn init_state(
                 1 // SUM
             };
 
-            let meta_base = STATE_HEADER_SIZE + u32::from(slot_idx) * SLOT_META_SIZE;
+            let meta_base = STATE_HEADER_SIZE + slot * SLOT_META_SIZE;
             bytes::write_u32(state, meta_base + SlotMetaOffset::OFFSET, data_offset);
             bytes::write_u32(state, meta_base + SlotMetaOffset::CAPACITY, outer_cap);
             bytes::write_u32(state, meta_base + SlotMetaOffset::SIZE, 0);
             state[(meta_base + SlotMetaOffset::TYPE_FLAGS) as usize] = outer_type_flags_byte;
             state[(meta_base + SlotMetaOffset::AGG_TYPE) as usize] = inner_agg;
             state[(meta_base + SlotMetaOffset::CHANGE_FLAGS) as usize] = 0;
-            // Metadata bytes 15–47 remain zero from the initialized buffer,
-            // matching the layout's untouched reserved region.
+            // Metadata bytes 15–47 remain zero from the initialized buffer.
 
             nested::write_nested_prefix(
                 state,
@@ -1105,8 +1108,6 @@ pub fn init_state(
             nested::write_arena_header(state, arena_hdr, arena_cap);
 
             data_offset = align8(data_offset + slot_data_size);
-        } else if op == Opcode::Halt as u8 {
-            break;
         } else {
             return Err(ErrorCode::InvalidProgram);
         }
@@ -1150,9 +1151,7 @@ struct OldSlotMeta {
     agg_type_byte: u8,
 }
 
-fn read_old_slot_meta(old_state: &[u8], slot_i: u32) -> OldSlotMeta {
-    let slot = u8::try_from(slot_i)
-        .unwrap_or_else(|_| columine_types::die!("invariant: grown-state slot index exceeds u8"));
+fn read_old_slot_meta(old_state: &[u8], slot: u32) -> OldSlotMeta {
     let view = SlotMetaView::read(old_state, slot);
     OldSlotMeta {
         offset: view.offset,
@@ -1212,7 +1211,7 @@ fn nested_primary_size_from_prefix(old_state: &[u8], slot_offset: u32, outer_cap
 /// the slot metadata from the old state so already-grown states grow again
 /// correctly.
 pub fn calculate_grown_state_size(old_state: &[u8], grown_slot_idx: u32) -> u32 {
-    let num_slots = u32::from(old_state[StateHeaderOffset::NUM_SLOTS as usize]);
+    let num_slots = state_num_slots(old_state);
     let mut total_size = align8(STATE_HEADER_SIZE + num_slots * SLOT_META_SIZE);
 
     for slot_i in 0..num_slots {
@@ -1267,7 +1266,7 @@ pub fn grow_state(
     new_state: &mut [u8],
     grown_slot_idx: u32,
 ) -> Result<(), ErrorCode> {
-    let num_slots = u32::from(old_state[StateHeaderOffset::NUM_SLOTS as usize]);
+    let num_slots = state_num_slots(old_state);
 
     // Copy header verbatim.
     bytes::copy(new_state, 0, old_state, 0, STATE_HEADER_SIZE);

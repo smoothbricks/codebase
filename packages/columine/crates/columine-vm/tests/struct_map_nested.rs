@@ -56,7 +56,7 @@ fn mk_struct_map_state(
     state[meta + 4..meta + 8].copy_from_slice(&cap.to_le_bytes());
     state[meta + SlotMetaOffset::TYPE_FLAGS as usize] = SlotType::StructMap as u8;
     state[meta + SlotMetaOffset::AGG_TYPE as usize] = field_types.len() as u8; // num_fields
-    state[meta + SlotMetaOffset::TIMESTAMP_FIELD_IDX as usize] = bitset_bytes;
+    state[meta + SlotMetaOffset::STRUCT_BITSET_BYTES as usize] = bitset_bytes;
     state[meta + SlotMetaOffset::TTL_SECONDS as usize
         ..meta + SlotMetaOffset::TTL_SECONDS as usize + 2]
         .copy_from_slice(&row_size.to_le_bytes());
@@ -81,7 +81,7 @@ fn mk_struct_map2_state(state_len: usize, cap: u32) -> Vec<u8> {
     state[meta + 4..meta + 8].copy_from_slice(&cap.to_le_bytes());
     state[meta + SlotMetaOffset::TYPE_FLAGS as usize] = SlotType::StructMap2 as u8;
     state[meta + SlotMetaOffset::AGG_TYPE as usize] = 1;
-    state[meta + SlotMetaOffset::TIMESTAMP_FIELD_IDX as usize] = 1;
+    state[meta + SlotMetaOffset::STRUCT_BITSET_BYTES as usize] = 1;
     state[meta + SlotMetaOffset::TTL_SECONDS as usize
         ..meta + SlotMetaOffset::TTL_SECONDS as usize + 2]
         .copy_from_slice(&5u16.to_le_bytes());
@@ -600,7 +600,7 @@ proptest! {
             }).collect();
             let cols: Vec<&[u8]> = cells.iter().map(Vec::as_slice).collect();
             for f in 0..num_fields {
-                smap.write_scalar_field(&mut state, up.pos, f, &cols, f, 0);
+                smap.write_scalar_field(&mut state, up.pos, f, &cols, u32::from(f), 0);
             }
         }
 

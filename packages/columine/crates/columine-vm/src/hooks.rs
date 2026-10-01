@@ -17,7 +17,7 @@ use columine_types::types::ErrorCode;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MutationRecord {
     pub op: FlatUndoOp,
-    pub slot: u8,
+    pub slot: u32,
     pub key: u32,
     pub prev_value: u32,
     /// 8-byte auxiliary lane: comparison or timestamp bits.
@@ -25,7 +25,7 @@ pub struct MutationRecord {
 }
 
 impl MutationRecord {
-    pub const fn set_insert(slot: u8, key: u32) -> Self {
+    pub const fn set_insert(slot: u32, key: u32) -> Self {
         Self {
             op: FlatUndoOp::SetInsert,
             slot,
@@ -35,7 +35,7 @@ impl MutationRecord {
         }
     }
 
-    pub const fn set_delete(slot: u8, key: u32, prev_ts_bits: u64) -> Self {
+    pub const fn set_delete(slot: u32, key: u32, prev_ts_bits: u64) -> Self {
         Self {
             op: FlatUndoOp::SetDelete,
             slot,

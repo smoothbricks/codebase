@@ -238,7 +238,19 @@ export enum ErrorCode {
 // =============================================================================
 
 export const PROGRAM_MAGIC = 0x314d_4c43;
-export const HEADER_SIZE = 14;
+/**
+ * Program wire format version (`columine_types::PROGRAM_FORMAT_VERSION`).
+ * Version 2 encodes column, slot and match-count operands as indexes
+ * (`./operand.ts`) and counts slots, inputs and section lengths in u32.
+ */
+export const PROGRAM_FORMAT_VERSION = 2;
+/**
+ * Content header after the hash prefix: magic u32, version u16, num_callbacks u8,
+ * flags u8, num_slots u32, num_inputs u32, init_code_len u32, reduce_code_len u32.
+ */
+export const HEADER_SIZE = 24;
+/** FLAT_MAP's parent timestamp column when its body has none (`columine_types::NO_PARENT_TS_COL`). */
+export const NO_PARENT_TS_COL = 0xffff_ffff;
 /** Reserved bytes at program start for SHA-256 hash (content starts at offset 32) */
 export const PROGRAM_HASH_PREFIX = 32;
 

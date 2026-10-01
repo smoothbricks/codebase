@@ -1,9 +1,12 @@
 //! Dispatch tests cover batch execution, undo/rollback, TTL eviction, and
 //! growth signaling. Scenarios and expected values are pinned as ABI behavior.
 
+use columine_types::NO_PARENT_TS_COL;
 use columine_types::PROGRAM_MAGIC;
+use columine_types::operand::encode_index;
 use columine_types::types::{
-    ChangeFlag, EMPTY_KEY, ErrorCode, SLOT_META_SIZE, STATE_HEADER_SIZE, SlotMetaOffset,
+    ChangeFlag, EMPTY_KEY, ErrorCode, Opcode, SLOT_META_SIZE, STATE_HEADER_SIZE, SlotMetaOffset,
+    SlotType,
 };
 use columine_vm::bytes;
 use columine_vm::meta::SlotMetaView;
@@ -24,18 +27,20 @@ const NEEDS_GROWTH: u32 = ErrorCode::NeedsGrowth as u32;
 // 2450-2530 equivalents)
 // =============================================================================
 
-/// Assemble a full program: 32-byte hash prefix + 14-byte content header +
+/// Assemble a full program: 32-byte hash prefix + 24-byte content header +
 /// init + reduce.
-fn program(num_slots: u8, num_inputs: u8, init: &[u8], reduce: &[u8]) -> Vec<u8> {
+fn program(num_slots: u32, num_inputs: u32, init: &[u8], reduce: &[u8]) -> Vec<u8> {
     let mut init = init.to_vec();
     init.push(0);
     let mut reduce = reduce.to_vec();
     reduce.push(0);
     let mut prog = vec![0u8; 32];
     prog.extend(PROGRAM_MAGIC.to_le_bytes());
-    prog.extend([1, 0, num_slots, num_inputs, 0, 0]);
-    prog.extend((init.len() as u16).to_le_bytes());
-    prog.extend((reduce.len() as u16).to_le_bytes());
+    prog.extend([2, 0, 0, 0]); // version 2, no callbacks, no flags
+    prog.extend(num_slots.to_le_bytes());
+    prog.extend(num_inputs.to_le_bytes());
+    prog.extend((init.len() as u32).to_le_bytes());
+    prog.extend((reduce.len() as u32).to_le_bytes());
     prog.extend(init);
     prog.extend(reduce);
     prog
@@ -127,7 +132,8 @@ fn build_block_struct_map_program(type_id: u32) -> Vec<u8> {
 fn build_flat_map_program(type_id: u32) -> Vec<u8> {
     let init = slot_struct_map(0, 0x05, 4, &[0, 4]);
     let inner_body = [0x80u8, 0, 2, 2, 3, 0, 4, 1, 0];
-    let mut flat_map = vec![0xE1, 1, 0xFF];
+    let mut flat_map = vec![0xE1, 1];
+    flat_map.extend(encode_index(NO_PARENT_TS_COL).as_bytes());
     flat_map.extend((inner_body.len() as u16).to_le_bytes());
     flat_map.extend(inner_body);
     let mut reduce = vec![0xE0, 0, 1];
@@ -167,7 +173,8 @@ fn build_probe_scatter_program(type_id: u32) -> Vec<u8> {
         1, 3, 0, 2, 5, // route 3: kind1 → nodeTouch, v_src=v_set
         0, 1, 2, 2, 4, // route 4: kind0 → nodes.boost, v_src=v_num
     ];
-    let mut flat_map = vec![0xE1, 1, 0xFF];
+    let mut flat_map = vec![0xE1, 1];
+    flat_map.extend(encode_index(NO_PARENT_TS_COL).as_bytes());
     flat_map.extend((scatter.len() as u16).to_le_bytes());
     flat_map.extend(scatter);
     let mut reduce = vec![0xE0, 0, 1];
@@ -1056,7 +1063,8 @@ fn build_struct_map_scatter_program(type_id: u32) -> Vec<u8> {
         1, 2, 0, 7, // route 3: kind1 -> nodeTouch, v=v_set
         0, 0, 2, 6, // route 4: kind0 -> nodes.boost, v=v_num
     ];
-    let mut flat_map = vec![0xE1, 1, 0xFF];
+    let mut flat_map = vec![0xE1, 1];
+    flat_map.extend(encode_index(NO_PARENT_TS_COL).as_bytes());
     flat_map.extend((scatter.len() as u16).to_le_bytes());
     flat_map.extend(scatter);
     let mut reduce = vec![0xE0, 0, 1];
@@ -1534,7 +1542,8 @@ fn struct_scatter_array_destination_is_invalid_program() {
     // Slot 0: nodes [title:STR, tags:ARRAY_U32]
     init_code.extend(slot_struct_map(0, 6, 4, &[4, 5]));
     let scatter: [u8; 9] = [0x3e, 2, 3, 4, 1, 0, 0, 1, 5];
-    let mut flat_map = vec![0xE1, 1, 0xFF];
+    let mut flat_map = vec![0xE1, 1];
+    flat_map.extend(encode_index(NO_PARENT_TS_COL).as_bytes());
     flat_map.extend((scatter.len() as u16).to_le_bytes());
     flat_map.extend(scatter);
     let mut reduce = vec![0xE0, 0, 1];
@@ -1577,7 +1586,8 @@ fn struct_scatter_over_capacity_route_table_is_invalid_program() {
     for _ in 0..33 {
         scatter.extend_from_slice(&route);
     }
-    let mut flat_map = vec![0xE1, 1, 0xFF];
+    let mut flat_map = vec![0xE1, 1];
+    flat_map.extend(encode_index(NO_PARENT_TS_COL).as_bytes());
     flat_map.extend((scatter.len() as u16).to_le_bytes());
     flat_map.extend(scatter);
     let mut reduce = vec![0xE0, 0, 1];
@@ -1661,7 +1671,8 @@ fn guarded_scatter_body() -> Vec<u8> {
 }
 
 fn guarded_flat_map(body: &[u8]) -> Vec<u8> {
-    let mut flat_map = vec![0xE1, 1, 0xFF];
+    let mut flat_map = vec![0xE1, 1];
+    flat_map.extend(encode_index(NO_PARENT_TS_COL).as_bytes());
     flat_map.extend((body.len() as u16).to_le_bytes());
     flat_map.extend_from_slice(body);
     flat_map
@@ -2144,7 +2155,8 @@ fn probe_scatter_over_capacity_route_table_is_invalid_program() {
     for _ in 0..33 {
         scatter.extend_from_slice(&route);
     }
-    let mut flat_map = vec![0xE1, 1, 0xFF];
+    let mut flat_map = vec![0xE1, 1];
+    flat_map.extend(encode_index(NO_PARENT_TS_COL).as_bytes());
     flat_map.extend((scatter.len() as u16).to_le_bytes());
     flat_map.extend(scatter);
     let mut reduce = vec![0xE0, 0, 1];
@@ -2573,7 +2585,7 @@ fn undo_overflow_inside_container_op_snapshots_and_rolls_back() {
 /// `count()` reducer capture.
 #[test]
 fn empty_batch_with_no_column_pointers_is_ok() {
-    let hex = "0000000000000000000000000000000000000000000000000000000000000000434c4d3101000100000006000c00100002020000e00101010000000200410000";
+    let hex = "0000000000000000000000000000000000000000000000000000000000000000434c4d31020000000100000000000000060000000c000000100002020000e00101010000000200410000";
     let prog: Vec<u8> = (0..hex.len())
         .step_by(2)
         .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
@@ -2612,7 +2624,7 @@ fn empty_batch_with_no_column_pointers_is_ok() {
 /// difference between "clean no-op" and "named refusal".
 #[test]
 fn nonempty_batch_with_missing_columns_is_column_underrun() {
-    let hex = "0000000000000000000000000000000000000000000000000000000000000000434c4d3101000100000006000c00100002020000e00101010000000200410000";
+    let hex = "0000000000000000000000000000000000000000000000000000000000000000434c4d31020000000100000000000000060000000c000000100002020000e00101010000000200410000";
     let prog: Vec<u8> = (0..hex.len())
         .step_by(2)
         .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
@@ -2656,7 +2668,7 @@ fn nonempty_batch_with_missing_columns_is_column_underrun() {
 /// id=1) around `48 00 03 02` (slot 0, val_col 3, cmp_col 2).
 #[test]
 fn ts_scalar_latest_program_writes_value_and_cmp() {
-    let hex = "0000000000000000000000000000000000000000000000000000000000000000434c4d3101000100000006000e00100005090000e001010100000004004800030200";
+    let hex = "0000000000000000000000000000000000000000000000000000000000000000434c4d31020000000100000000000000060000000e000000100005090000e001010100000004004800030200";
     let prog: Vec<u8> = (0..hex.len())
         .step_by(2)
         .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
@@ -2715,4 +2727,77 @@ fn incompatible_state_format_is_refused_without_mutating_the_image() {
         Err(ErrorCode::InvalidState)
     );
     assert_eq!(state, before);
+}
+
+// =============================================================================
+// Index operands past one byte
+// =============================================================================
+
+/// `count` HASHSET slots of requested capacity 16, slot `s` defined by an
+/// index operand, and one `BATCH_SET_INSERT` per `(slot, column)` pair.
+fn wide_set_program(count: u32, inserts: &[(u32, u32)]) -> Vec<u8> {
+    let mut init = Vec::new();
+    for slot in 0..count {
+        init.push(Opcode::SlotDef as u8);
+        init.extend(encode_index(slot).as_bytes());
+        init.extend([SlotType::HashSet as u8, 16, 0]);
+    }
+    let mut reduce = Vec::new();
+    for &(slot, col) in inserts {
+        reduce.push(Opcode::BatchSetInsert as u8);
+        reduce.extend(encode_index(slot).as_bytes());
+        reduce.extend(encode_index(col).as_bytes());
+    }
+    program(count, count, &init, &reduce)
+}
+
+/// Slot and column operands are indexes, so a program reaches slot 299 and
+/// column 299 exactly as it reaches slot 0: on either side of the one- and
+/// two-byte boundaries (127/128, 255/256) every insert lands in its own slot
+/// and reads its own column.
+#[test]
+fn slots_and_columns_past_one_byte_are_addressed_exactly() {
+    const SLOTS: u32 = 300;
+    let addressed = [0, 127, 128, 255, 256, 299];
+    let prog = wide_set_program(SLOTS, &addressed.map(|slot| (slot, SLOTS - 1 - slot)));
+    let mut state = init(&prog);
+    let cells: Vec<[u32; 1]> = (0..SLOTS).map(|col| [10_000 + col]).collect();
+    let cols: Vec<&[u8]> = cells.iter().map(|cell| u32s_as_bytes(cell)).collect();
+    assert_eq!(OK, Vm::default().execute_batch(&mut state, &prog, &cols, 1));
+
+    for slot in 0..SLOTS {
+        let meta = SlotMetaView::read(&state, slot);
+        let read_col = SLOTS - 1 - slot;
+        assert_eq!(
+            vm_set_contains(&state, meta.offset, meta.capacity, 10_000 + read_col),
+            addressed.contains(&slot),
+            "slot {slot}"
+        );
+    }
+}
+
+/// The growth signal names a slot past one byte, and growing that slot is
+/// what lets the batch through.
+#[test]
+fn growth_reports_and_grows_a_slot_past_one_byte() {
+    const SLOTS: u32 = 300;
+    let prog = wide_set_program(SLOTS, &[(299, 0)]);
+    let mut state = init(&prog);
+    let elems: Vec<u32> = (1..=40).collect();
+    let cols: Vec<&[u8]> = vec![u32s_as_bytes(&elems)];
+    let mut vm = Vm::default();
+    assert_eq!(NEEDS_GROWTH, vm.execute_batch(&mut state, &prog, &cols, 40));
+    assert_eq!(needs_growth_slot(), 299);
+
+    while vm.execute_batch(&mut state, &prog, &cols, 40) == NEEDS_GROWTH {
+        let mut grown = vec![0u8; calculate_grown_state_size(&state, 299) as usize];
+        grow_state(&state, &mut grown, 299).expect("grow_state");
+        state = grown;
+    }
+    let meta = SlotMetaView::read(&state, 299);
+    assert!(
+        elems
+            .iter()
+            .all(|&e| vm_set_contains(&state, meta.offset, meta.capacity, e))
+    );
 }

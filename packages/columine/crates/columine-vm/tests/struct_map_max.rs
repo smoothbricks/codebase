@@ -1,4 +1,6 @@
+use columine_types::NO_PARENT_TS_COL;
 use columine_types::PROGRAM_MAGIC;
+use columine_types::operand::encode_index;
 use columine_types::types::{ChangeFlag, ErrorCode, STATE_HEADER_SIZE, SlotMetaOffset};
 use columine_vm::bytes;
 use columine_vm::state_init::{calculate_state_size, init_state};
@@ -23,15 +25,17 @@ fn program(num_inputs: u8, field_types: &[u8], reduce: &[u8]) -> Vec<u8> {
 
     let mut program = vec![0u8; 32];
     program.extend(PROGRAM_MAGIC.to_le_bytes());
-    program.extend([1, 0, 1, num_inputs, 0, 0]);
+    program.extend([2, 0, 0, 0]); // version 2, no callbacks, no flags
+    program.extend(1u32.to_le_bytes());
+    program.extend(u32::from(num_inputs).to_le_bytes());
     program.extend(
-        u16::try_from(init.len())
-            .expect("init length fits u16")
+        u32::try_from(init.len())
+            .expect("init length fits u32")
             .to_le_bytes(),
     );
     program.extend(
-        u16::try_from(reduce.len())
-            .expect("reduce length fits u16")
+        u32::try_from(reduce.len())
+            .expect("reduce length fits u32")
             .to_le_bytes(),
     );
     program.extend(init);
@@ -82,7 +86,8 @@ fn for_each(body: &[u8]) -> Vec<u8> {
 }
 
 fn flat_map(body: &[u8]) -> Vec<u8> {
-    let mut flat = vec![0xE1, 1, 0xFF];
+    let mut flat = vec![0xE1, 1];
+    flat.extend(encode_index(NO_PARENT_TS_COL).as_bytes());
     flat.extend(
         u16::try_from(body.len())
             .expect("inner body length fits u16")

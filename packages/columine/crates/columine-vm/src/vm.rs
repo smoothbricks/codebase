@@ -33,14 +33,25 @@ use crate::undo_log::{
     SMR_ROW_ABSENT,
 };
 use columine_types::DEFAULT_ACCEPTED_PROGRAM_MAGICS;
+use columine_types::operand::{Operands, read_index};
 use columine_types::types::{
     AggType, ChangeFlag, DERIVED_FACT_TOMBSTONE_IDENTITY, EMPTY_KEY, ErrorCode,
-    MAX_GUARD_COMPONENTS, MAX_SCATTER_ROUTES, Opcode, PROGRAM_HASH_PREFIX, PROGRAM_HEADER_SIZE,
-    ProgramHeader, SLOT_META_SIZE, STATE_FORMAT_VERSION, STATE_HEADER_SIZE, STATE_MAGIC,
-    SlotMetaOffset, SlotType, StateHeaderOffset, StructFieldType, TOMBSTONE, align8,
-    struct_field_size,
+    MAX_GUARD_COMPONENTS, MAX_SCATTER_ROUTES, NO_PARENT_TS_COL, Opcode, ProgramHeader,
+    SLOT_META_SIZE, STATE_FORMAT_VERSION, STATE_MAGIC, SlotMetaOffset, SlotType, StateHeaderOffset,
+    StructFieldType, TOMBSTONE, align8, state_num_slots, struct_field_size,
 };
 use core::sync::atomic::Ordering;
+
+/// Read one operand of an instruction [`body_op_len`] has already measured,
+/// or refuse the program: a `None` here is a malformed operand.
+macro_rules! operand {
+    ($read:expr) => {
+        match $read {
+            Some(value) => value,
+            None => return INVALID_PROGRAM,
+        }
+    };
+}
 
 // =============================================================================
 // Input columns — bounded typed views
@@ -407,7 +418,7 @@ pub fn evict_expired(
     env: &mut BitmapEnv,
     state: &mut [u8],
     meta: &SlotMetaView,
-    slot_idx: u8,
+    slot_idx: u32,
     now: f64,
 ) -> u32 {
     if !meta.has_ttl() {
@@ -556,7 +567,7 @@ pub fn write_derived_facts_header(
 pub const UNDO_CAPACITY: u32 = 16384;
 
 /// Owned undo/delta state for one VM instance.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct UndoState {
     /// `g_undo_entries[0..g_undo_count]`.
     entries: Vec<FlatUndoEntry>,
@@ -574,37 +585,15 @@ pub struct UndoState {
     overflow_entry: Option<(FlatUndoEntry, FlatUndoEntry)>,
     /// `g_undo_state_size` — size registered at `vm_undo_enable`.
     pub state_size: u32,
-    /// `g_saved_change_flags` (+count).
-    saved_change_flags: [u8; 257],
-    saved_change_flags_count: u32,
+    /// Each slot's change flags, then the derived-facts flag, saved for
+    /// restoration after rollback; empty when nothing is saved.
+    saved_change_flags: Vec<u8>,
     /// `g_delta_export_*`.
     export_start: u32,
     export_count: u32,
     export_overflow: bool,
     /// Reused pre-mutation bytes for post-mutation paired diff journaling.
     capture_scratch: Vec<u8>,
-}
-
-impl Default for UndoState {
-    fn default() -> Self {
-        Self {
-            entries: Vec::new(),
-            redo: Vec::new(),
-            delta_count: 0,
-            overflow: false,
-            enabled: false,
-            shadow: None,
-            shadow_active: false,
-            overflow_entry: None,
-            state_size: 0,
-            saved_change_flags: [0; 257],
-            saved_change_flags_count: 0,
-            export_start: 0,
-            export_count: 0,
-            export_overflow: false,
-            capture_scratch: Vec::new(),
-        }
-    }
 }
 
 const ZERO_ENTRY: FlatUndoEntry = FlatUndoEntry {
@@ -750,30 +739,24 @@ impl UndoState {
 
     /// Save change flags for restoration after rollback.
     fn save_change_flags(&mut self, state: &[u8]) {
-        let num_slots = state[StateHeaderOffset::NUM_SLOTS as usize] as u32;
-        for i in 0..num_slots {
-            let meta_offset = STATE_HEADER_SIZE + i * SLOT_META_SIZE;
-            self.saved_change_flags[i as usize] =
-                state[(meta_offset + SlotMetaOffset::CHANGE_FLAGS) as usize];
-        }
-        self.saved_change_flags[num_slots as usize] =
-            state[StateHeaderOffset::DERIVED_FACTS_CHANGE_FLAG as usize];
-        self.saved_change_flags_count = num_slots + 1;
+        self.saved_change_flags.clear();
+        self.saved_change_flags.extend(
+            (0..state_num_slots(state))
+                .map(|slot| state[(slot_meta_base(slot) + SlotMetaOffset::CHANGE_FLAGS) as usize]),
+        );
+        self.saved_change_flags
+            .push(state[StateHeaderOffset::DERIVED_FACTS_CHANGE_FLAG as usize]);
     }
 
     /// Restore change flags saved before rollback.
     fn restore_change_flags(&self, state: &mut [u8]) {
-        if self.saved_change_flags_count == 0 {
+        let Some((&derived, slots)) = self.saved_change_flags.split_last() else {
             return;
+        };
+        for (slot, &flags) in (0u32..).zip(slots) {
+            state[(slot_meta_base(slot) + SlotMetaOffset::CHANGE_FLAGS) as usize] = flags;
         }
-        let num_slots = self.saved_change_flags_count - 1;
-        for i in 0..num_slots {
-            let meta_offset = STATE_HEADER_SIZE + i * SLOT_META_SIZE;
-            state[(meta_offset + SlotMetaOffset::CHANGE_FLAGS) as usize] =
-                self.saved_change_flags[i as usize];
-        }
-        state[StateHeaderOffset::DERIVED_FACTS_CHANGE_FLAG as usize] =
-            self.saved_change_flags[num_slots as usize];
+        state[StateHeaderOffset::DERIVED_FACTS_CHANGE_FLAG as usize] = derived;
     }
 }
 
@@ -843,7 +826,7 @@ impl Vm {
         delta_mode: bool,
         state: &mut [u8],
         meta: &SlotMetaView,
-        slot_idx: u8,
+        slot_idx: u32,
         elems: &[u32],
         ts_col: Option<&[f64]>,
     ) -> ErrorCode {
@@ -879,7 +862,7 @@ impl Vm {
         delta_mode: bool,
         state: &mut [u8],
         meta: &SlotMetaView,
-        slot_idx: u8,
+        slot_idx: u32,
         elems: &[u32],
     ) -> ErrorCode {
         if meta.slot_type() == SlotType::Bitmap {
@@ -1308,7 +1291,7 @@ fn emit_struct_map_row_journal(
     delta_mode: bool,
     state: &[u8],
     smap: &StructMapSlot,
-    slot_idx: u8,
+    slot_idx: u32,
     key: u32,
     pos: u32,
     was_new: bool,
@@ -1414,7 +1397,7 @@ fn emit_struct_map2_upsert_journal(
     delta_mode: bool,
     state: &[u8],
     smap: &StructMap2Slot,
-    slot: u8,
+    slot: u32,
     key1: u32,
     key2: u32,
     pos: u32,
@@ -1491,7 +1474,7 @@ fn emit_struct_map2_remove_journal(
     delta_mode: bool,
     state: &[u8],
     smap: &StructMap2Slot,
-    slot: u8,
+    slot: u32,
     key1: u32,
     key2: u32,
     prior: &RowPrior,
@@ -1576,7 +1559,7 @@ fn nested_journal_ranges(state: &[u8], meta: &SlotMetaView) -> [(u32, u32); 2] {
 /// stored field, so the two sides cannot drift into different orders.
 #[derive(Clone, Copy)]
 struct GuardTuple {
-    cols: [u8; MAX_GUARD_COMPONENTS],
+    cols: [u32; MAX_GUARD_COMPONENTS],
     fields: [u8; MAX_GUARD_COMPONENTS],
     len: usize,
 }
@@ -1586,10 +1569,10 @@ struct GuardTuple {
 type GuardKey = [u64; MAX_GUARD_COMPONENTS];
 
 impl GuardTuple {
-    /// Read `len` `(guard_col, guard_field_idx)` pairs starting at `at`.
+    /// Read `len` `(guard_col:index, guard_field_idx:u8)` pairs.
     /// `None` for a width the compare array cannot hold, and for a width of
     /// zero: an unguarded scatter is `0x3e`, not a degenerate `0x3f`.
-    fn decode(body: &[u8], at: usize, len: usize) -> Option<Self> {
+    fn decode(operands: &mut Operands<'_>, len: usize) -> Option<Self> {
         if len == 0 || len > MAX_GUARD_COMPONENTS {
             return None;
         }
@@ -1599,8 +1582,8 @@ impl GuardTuple {
             len,
         };
         for gi in 0..len {
-            tuple.cols[gi] = body[at + gi * 2];
-            tuple.fields[gi] = body[at + gi * 2 + 1];
+            tuple.cols[gi] = operands.index()?;
+            tuple.fields[gi] = operands.byte()?;
         }
         Some(tuple)
     }
@@ -1618,8 +1601,7 @@ impl GuardTuple {
         let mut key = [0u64; MAX_GUARD_COMPONENTS];
         for gi in 0..self.len {
             let ft = smap.field_type(state, self.fields[gi]);
-            key[gi] =
-                scalar_cell_order_key(ft, col_at(cols, usize::from(self.cols[gi])), element_idx)?;
+            key[gi] = scalar_cell_order_key(ft, col_at(cols, self.cols[gi] as usize), element_idx)?;
         }
         Some(key)
     }
@@ -1666,7 +1648,7 @@ impl GuardTuple {
         delta_mode: bool,
         state: &mut [u8],
         smap: &StructMapSlot,
-        slot: u8,
+        slot: u32,
         key: u32,
         pos: u32,
         cols: &[&[u8]],
@@ -1678,7 +1660,7 @@ impl GuardTuple {
             let fi = self.fields[gi];
             let ft = smap.field_type(state, fi);
             let Some((cell, cell_size)) =
-                scalar_cell_encoded(ft, col_at(cols, usize::from(self.cols[gi])), element_idx)
+                scalar_cell_encoded(ft, col_at(cols, self.cols[gi] as usize), element_idx)
             else {
                 return ErrorCode::InvalidProgram;
             };
@@ -1733,130 +1715,194 @@ struct StructUpsertResult {
 const MAX_STRUCT_SCALAR_OPERANDS: usize = 32;
 const MAX_STRUCT_ARRAY_OPERANDS: usize = 16;
 
+/// A struct-map instruction's `(val_col:index, field_idx:u8)` pairs, decoded
+/// into fixed arrays. The array width is part of the accepted-program
+/// contract: a program declaring more pairs is refused at decode.
+#[derive(Clone, Copy)]
+pub(crate) struct ScalarOperands {
+    cols: [u32; MAX_STRUCT_SCALAR_OPERANDS],
+    fields: [u8; MAX_STRUCT_SCALAR_OPERANDS],
+    len: usize,
+}
+
+impl ScalarOperands {
+    /// Read `len` pairs; room for `reserve` more is kept for the caller.
+    fn decode(operands: &mut Operands<'_>, len: usize, reserve: usize) -> Option<Self> {
+        if len + reserve > MAX_STRUCT_SCALAR_OPERANDS {
+            return None;
+        }
+        let mut pairs = Self {
+            cols: [0; MAX_STRUCT_SCALAR_OPERANDS],
+            fields: [0; MAX_STRUCT_SCALAR_OPERANDS],
+            len,
+        };
+        for i in 0..len {
+            pairs.cols[i] = operands.index()?;
+            pairs.fields[i] = operands.byte()?;
+        }
+        Some(pairs)
+    }
+
+    pub(crate) fn cols(&self) -> &[u32] {
+        &self.cols[..self.len]
+    }
+
+    pub(crate) fn fields(&self) -> &[u8] {
+        &self.fields[..self.len]
+    }
+
+    /// Append one pair past the decoded ones (room was reserved at decode).
+    fn push(&mut self, col: u32, field: u8) {
+        self.cols[self.len] = col;
+        self.fields[self.len] = field;
+        self.len += 1;
+    }
+}
+
+/// One CSR array field of a struct-map upsert: the offsets and values
+/// columns that carry the element arrays, and the field they fill.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct ArrayField {
+    pub(crate) offsets_col: u32,
+    pub(crate) values_col: u32,
+    pub(crate) field_idx: u8,
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct StructMapUpsertOperands {
-    pub(crate) slot: u8,
-    pub(crate) key_col: u8,
-    pub(crate) num_vals: usize,
-    pub(crate) scalar_pairs_start: usize,
-    pub(crate) num_array_vals: usize,
-    pub(crate) array_triples_start: usize,
+    pub(crate) slot: u32,
+    pub(crate) key_col: u32,
+    pub(crate) vals: ScalarOperands,
+    arrays: [ArrayField; MAX_STRUCT_ARRAY_OPERANDS],
+    num_arrays: usize,
     pub(crate) comparison_field_idx: Option<u8>,
     pub(crate) end: usize,
 }
 
+impl StructMapUpsertOperands {
+    pub(crate) fn array_fields(&self) -> &[ArrayField] {
+        &self.arrays[..self.num_arrays]
+    }
+}
+
 /// Decode the shared 0x80/0x81 row operands and 0x82's trailing comparison
-/// ordinal without mutating state. Fixed operand arrays in both dispatch paths
-/// make their encoded maxima part of the accepted-program contract.
+/// ordinal without mutating state: `slot:index, key_col:index, num_vals:u8,
+/// (val_col:index, field_idx:u8) × num_vals, num_arrays:u8, (offsets_col:index,
+/// values_col:index, field_idx:u8) × num_arrays [, comparison_field_idx:u8]`.
+/// Fixed operand arrays in both dispatch paths make their encoded maxima part
+/// of the accepted-program contract.
 pub(crate) fn decode_struct_map_upsert_operands(
     code: &[u8],
     start: usize,
     has_comparison: bool,
 ) -> Option<StructMapUpsertOperands> {
-    let header_end = start.checked_add(3)?;
-    let header = code.get(start..header_end)?;
-    let num_vals = usize::from(header[2]);
-    if num_vals > MAX_STRUCT_SCALAR_OPERANDS {
+    let mut operands = Operands::at(code, start);
+    let slot = operands.index()?;
+    let key_col = operands.index()?;
+    let num_vals = usize::from(operands.byte()?);
+    let vals = ScalarOperands::decode(&mut operands, num_vals, 0)?;
+    let num_arrays = usize::from(operands.byte()?);
+    if num_arrays > MAX_STRUCT_ARRAY_OPERANDS {
         return None;
     }
-
-    let scalar_pairs_start = header_end;
-    let array_count_at = scalar_pairs_start.checked_add(num_vals.checked_mul(2)?)?;
-    let num_array_vals = usize::from(*code.get(array_count_at)?);
-    if num_array_vals > MAX_STRUCT_ARRAY_OPERANDS {
-        return None;
+    let mut arrays = [ArrayField::default(); MAX_STRUCT_ARRAY_OPERANDS];
+    for array in &mut arrays[..num_arrays] {
+        *array = ArrayField {
+            offsets_col: operands.index()?,
+            values_col: operands.index()?,
+            field_idx: operands.byte()?,
+        };
     }
-
-    let array_triples_start = array_count_at.checked_add(1)?;
-    let comparison_at = array_triples_start.checked_add(num_array_vals.checked_mul(3)?)?;
-    let (comparison_field_idx, end) = if has_comparison {
-        (
-            Some(*code.get(comparison_at)?),
-            comparison_at.checked_add(1)?,
-        )
+    let comparison_field_idx = if has_comparison {
+        Some(operands.byte()?)
     } else {
-        (None, comparison_at)
+        None
     };
-
     Some(StructMapUpsertOperands {
-        slot: header[0],
-        key_col: header[1],
-        num_vals,
-        scalar_pairs_start,
-        num_array_vals,
-        array_triples_start,
+        slot,
+        key_col,
+        vals,
+        arrays,
+        num_arrays,
         comparison_field_idx,
-        end,
+        end: operands.pos(),
     })
 }
 
 #[derive(Clone, Copy)]
 pub(crate) struct StructMap2UpsertOperands {
-    pub(crate) slot: u8,
-    pub(crate) key1_col: u8,
-    pub(crate) key2_col: u8,
-    pub(crate) num_vals: usize,
-    pub(crate) scalar_pairs_start: usize,
+    pub(crate) slot: u32,
+    pub(crate) key1_col: u32,
+    pub(crate) key2_col: u32,
+    pub(crate) vals: ScalarOperands,
     pub(crate) end: usize,
+}
+
+/// `slot:index, key1_col:index, key2_col:index, num_vals:u8,
+/// (val_col:index, field_idx:u8) × num_vals`; `reserve` pairs of room stay
+/// free for operands an extension appends.
+fn decode_struct_map2_row(
+    operands: &mut Operands<'_>,
+    reserve: usize,
+) -> Option<StructMap2UpsertOperands> {
+    let slot = operands.index()?;
+    let key1_col = operands.index()?;
+    let key2_col = operands.index()?;
+    let num_vals = usize::from(operands.byte()?);
+    let vals = ScalarOperands::decode(operands, num_vals, reserve)?;
+    Some(StructMap2UpsertOperands {
+        slot,
+        key1_col,
+        key2_col,
+        vals,
+        end: operands.pos(),
+    })
 }
 
 pub(crate) fn decode_struct_map2_upsert_operands(
     code: &[u8],
     start: usize,
 ) -> Option<StructMap2UpsertOperands> {
-    let header_end = start.checked_add(4)?;
-    let header = code.get(start..header_end)?;
-    let num_vals = usize::from(header[3]);
-    if num_vals > MAX_STRUCT_SCALAR_OPERANDS {
-        return None;
-    }
-    let end = header_end.checked_add(num_vals.checked_mul(2)?)?;
-    code.get(header_end..end)?;
-    Some(StructMap2UpsertOperands {
-        slot: header[0],
-        key1_col: header[1],
-        key2_col: header[2],
-        num_vals,
-        scalar_pairs_start: header_end,
-        end,
-    })
+    decode_struct_map2_row(&mut Operands::at(code, start), 0)
 }
 
 #[derive(Clone, Copy)]
 pub(crate) struct StructMap2MaxI64x2Operands {
     pub(crate) row: StructMap2UpsertOperands,
-    pub(crate) cmp1_col: u8,
+    pub(crate) cmp1_col: u32,
     pub(crate) cmp1_field: u8,
-    pub(crate) cmp2_col: u8,
+    pub(crate) cmp2_col: u32,
     pub(crate) cmp2_field: u8,
     pub(crate) end: usize,
 }
 
+/// 0x83's row operands followed by `cmp1_col:index, cmp1_field:u8,
+/// cmp2_col:index, cmp2_field:u8`. The two comparison lanes are written with
+/// the row, so they take two of its pair slots.
 pub(crate) fn decode_struct_map2_max_i64x2_operands(
     code: &[u8],
     start: usize,
 ) -> Option<StructMap2MaxI64x2Operands> {
-    let row = decode_struct_map2_upsert_operands(code, start)?;
-    if row.num_vals > MAX_STRUCT_SCALAR_OPERANDS - 2 {
-        return None;
-    }
-    let end = row.end.checked_add(4)?;
-    let comparison = code.get(row.end..end)?;
+    let mut operands = Operands::at(code, start);
+    let row = decode_struct_map2_row(&mut operands, 2)?;
+    let cmp1_col = operands.index()?;
+    let cmp1_field = operands.byte()?;
+    let cmp2_col = operands.index()?;
+    let cmp2_field = operands.byte()?;
     Some(StructMap2MaxI64x2Operands {
         row,
-        cmp1_col: comparison[0],
-        cmp1_field: comparison[1],
-        cmp2_col: comparison[2],
-        cmp2_field: comparison[3],
-        end,
+        cmp1_col,
+        cmp1_field,
+        cmp2_col,
+        cmp2_field,
+        end: operands.pos(),
     })
 }
 
 fn validate_struct_map2_max_i64x2(
     state: &[u8],
     smap: &StructMap2Slot,
-    code: &[u8],
-    operands: StructMap2MaxI64x2Operands,
+    operands: &StructMap2MaxI64x2Operands,
 ) -> bool {
     if operands.cmp1_field == operands.cmp2_field
         || operands.cmp1_field >= smap.num_fields
@@ -1866,16 +1912,9 @@ fn validate_struct_map2_max_i64x2(
     {
         return false;
     }
-    let pairs_end = operands.row.scalar_pairs_start + operands.row.num_vals * 2;
-    code[operands.row.scalar_pairs_start..pairs_end]
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .all(|pair| {
-            pair[1] < smap.num_fields
-                && pair[1] != operands.cmp1_field
-                && pair[1] != operands.cmp2_field
-        })
+    operands.row.vals.fields().iter().all(|&field| {
+        field < smap.num_fields && field != operands.cmp1_field && field != operands.cmp2_field
+    })
 }
 
 fn should_upsert_struct_map2_max_i64x2(
@@ -1883,7 +1922,7 @@ fn should_upsert_struct_map2_max_i64x2(
     smap: &StructMap2Slot,
     key1: u32,
     key2: u32,
-    operands: StructMap2MaxI64x2Operands,
+    operands: &StructMap2MaxI64x2Operands,
     cols: &[&[u8]],
     element_idx: u32,
 ) -> bool {
@@ -1902,14 +1941,8 @@ fn should_upsert_struct_map2_max_i64x2(
     );
     let comparison_offset = element_idx * 8;
     let candidate = (
-        bytes::read_i64(
-            col_at(cols, usize::from(operands.cmp1_col)),
-            comparison_offset,
-        ),
-        bytes::read_i64(
-            col_at(cols, usize::from(operands.cmp2_col)),
-            comparison_offset,
-        ),
+        bytes::read_i64(col_at(cols, operands.cmp1_col as usize), comparison_offset),
+        bytes::read_i64(col_at(cols, operands.cmp2_col as usize), comparison_offset),
     );
     candidate > existing
 }
@@ -1917,7 +1950,7 @@ fn should_upsert_struct_map2_max_i64x2(
 #[derive(Clone, Copy)]
 struct StructMapMaxComparison {
     field_idx: u8,
-    col: u8,
+    col: u32,
     field_type: StructFieldType,
     cmp_type: CmpType,
 }
@@ -1927,7 +1960,7 @@ struct StructMapMaxComparison {
 fn resolve_struct_map_max_comparison(
     state: &[u8],
     smap: &StructMapSlot,
-    scalar_pairs: &[u8],
+    vals: &ScalarOperands,
     comparison_field_idx: u8,
 ) -> Option<StructMapMaxComparison> {
     if comparison_field_idx >= smap.num_fields {
@@ -1944,11 +1977,11 @@ fn resolve_struct_map_max_comparison(
         | StructFieldType::ArrayString
         | StructFieldType::ArrayBool => return None,
     };
-    let col = scalar_pairs
-        .as_chunks::<2>()
-        .0
+    let col = vals
+        .fields()
         .iter()
-        .find_map(|pair| (pair[1] == comparison_field_idx).then_some(pair[0]))?;
+        .position(|&field| field == comparison_field_idx)
+        .map(|at| vals.cols()[at])?;
     Some(StructMapMaxComparison {
         field_idx: comparison_field_idx,
         col,
@@ -1990,7 +2023,7 @@ fn should_upsert_struct_map_max(
         | StructFieldType::ArrayBool => unreachable!("comparison kind validated as scalar"),
     };
     let incoming = hashmap_ops::read_cmp_value(
-        col_at(cols, usize::from(comparison.col)),
+        col_at(cols, comparison.col as usize),
         element_idx,
         comparison.cmp_type,
     );
@@ -2003,9 +2036,9 @@ fn single_struct_map_upsert_last(
     undo: &mut UndoState,
     delta_mode: bool,
     state: &mut [u8],
-    slot_idx: u8,
+    slot_idx: u32,
     key: u32,
-    val_cols: &[u8],
+    val_cols: &[u32],
     field_idxs: &[u8],
     cols: &[&[u8]],
     element_idx: u32,
@@ -2084,10 +2117,10 @@ fn single_struct_map2_upsert_last(
     undo: &mut UndoState,
     delta_mode: bool,
     state: &mut [u8],
-    slot: u8,
+    slot: u32,
     key1: u32,
     key2: u32,
-    val_cols: &[u8],
+    val_cols: &[u32],
     field_idxs: &[u8],
     cols: &[&[u8]],
     element_idx: u32,
@@ -2159,8 +2192,7 @@ fn single_struct_map2_upsert_max_i64x2(
     undo: &mut UndoState,
     delta_mode: bool,
     state: &mut [u8],
-    code: &[u8],
-    operands: StructMap2MaxI64x2Operands,
+    operands: &StructMap2MaxI64x2Operands,
     key1: u32,
     key2: u32,
     cols: &[&[u8]],
@@ -2180,17 +2212,10 @@ fn single_struct_map2_upsert_max_i64x2(
         };
     }
 
-    let mut val_cols = [0_u8; MAX_STRUCT_SCALAR_OPERANDS];
-    let mut field_idxs = [0_u8; MAX_STRUCT_SCALAR_OPERANDS];
-    for i in 0..operands.row.num_vals {
-        val_cols[i] = code[operands.row.scalar_pairs_start + i * 2];
-        field_idxs[i] = code[operands.row.scalar_pairs_start + i * 2 + 1];
-    }
-    let count = operands.row.num_vals;
-    val_cols[count] = operands.cmp1_col;
-    field_idxs[count] = operands.cmp1_field;
-    val_cols[count + 1] = operands.cmp2_col;
-    field_idxs[count + 1] = operands.cmp2_field;
+    // Room for the two comparison lanes was reserved at decode.
+    let mut vals = operands.row.vals;
+    vals.push(operands.cmp1_col, operands.cmp1_field);
+    vals.push(operands.cmp2_col, operands.cmp2_field);
     single_struct_map2_upsert_last(
         undo,
         delta_mode,
@@ -2198,8 +2223,8 @@ fn single_struct_map2_upsert_max_i64x2(
         operands.row.slot,
         key1,
         key2,
-        &val_cols[..count + 2],
-        &field_idxs[..count + 2],
+        vals.cols(),
+        vals.fields(),
         cols,
         element_idx,
     )
@@ -2209,7 +2234,7 @@ fn single_struct_map2_remove(
     undo: &mut UndoState,
     delta_mode: bool,
     state: &mut [u8],
-    slot: u8,
+    slot: u32,
     key1: u32,
     key2: u32,
 ) -> ErrorCode {
@@ -2242,7 +2267,7 @@ fn single_struct_map_upsert_from_probe(
     undo: &mut UndoState,
     delta_mode: bool,
     state: &mut [u8],
-    out_slot: u8,
+    out_slot: u32,
     out_key: u32,
     probe: &StructMapSlot,
     probe_row: u32,
@@ -2319,9 +2344,9 @@ fn single_struct_map_upsert_from_probe(
 #[allow(clippy::too_many_arguments)]
 fn write_struct_map_array_fields(
     state: &mut [u8],
-    slot_idx: u8,
+    slot_idx: u32,
     row_pos: u32,
-    array_fields: &[[u8; 3]],
+    array_fields: &[ArrayField],
     cols: &[&[u8]],
     child_idx: u32,
 ) -> ErrorCode {
@@ -2352,7 +2377,12 @@ fn write_struct_map_array_fields(
     let mut arena_used = bytes::read_u32(state, arena_header_off + 4);
     let arena_data_base = arena_header_off + ARENA_HEADER_SIZE;
 
-    for &[offsets_col, values_col, field_idx] in array_fields {
+    for &ArrayField {
+        offsets_col,
+        values_col,
+        field_idx,
+    } in array_fields
+    {
         let field_type_byte = state[(slot_offset + u32::from(field_idx)) as usize];
         let f_offset = {
             let descriptor =
@@ -2365,7 +2395,7 @@ fn write_struct_map_array_fields(
             }),
         );
 
-        let offsets = col_u32(cols[usize::from(offsets_col)], child_idx + 2);
+        let offsets = col_u32(cols[offsets_col as usize], child_idx + 2);
         let arr_start = offsets[child_idx as usize];
         let arr_end = offsets[child_idx as usize + 1];
         let arr_len = arr_end - arr_start;
@@ -2382,7 +2412,7 @@ fn write_struct_map_array_fields(
         bytes::write_u32(state, row_off + f_offset + 4, arr_len);
 
         if byte_len > 0 {
-            let src = cols[usize::from(values_col)];
+            let src = cols[values_col as usize];
             let src_off = (arr_start * elem_size) as usize;
             let dst_off = (arena_data_base + arena_used) as usize;
             state[dst_off..dst_off + byte_len as usize]
@@ -2403,11 +2433,11 @@ fn upsert_struct_map_row(
     delta_mode: bool,
     state: &mut [u8],
     smap: &StructMapSlot,
-    slot_idx: u8,
+    slot_idx: u32,
     key: u32,
-    val_cols: &[u8],
+    val_cols: &[u32],
     field_idxs: &[u8],
-    array_fields: &[[u8; 3]],
+    array_fields: &[ArrayField],
     cols: &[&[u8]],
     element_idx: u32,
 ) -> u32 {
@@ -2467,7 +2497,7 @@ fn exec_agg_f64(
     undo: &mut UndoState,
     delta_mode: bool,
     state: &mut [u8],
-    slot: u8,
+    slot: u32,
     kind: AggKind,
     vals: &[f64],
     type_mask: Option<TypeMask<'_>>,
@@ -2514,7 +2544,7 @@ fn exec_agg_i64(
     undo: &mut UndoState,
     delta_mode: bool,
     state: &mut [u8],
-    slot: u8,
+    slot: u32,
     kind: AggKind,
     vals: &[i64],
     type_mask: Option<TypeMask<'_>>,
@@ -2558,7 +2588,7 @@ fn exec_agg_count(
     undo: &mut UndoState,
     delta_mode: bool,
     state: &mut [u8],
-    slot: u8,
+    slot: u32,
     matched: u64,
 ) {
     let meta = SlotMetaView::read(state, slot);
@@ -2591,7 +2621,7 @@ fn exec_scalar_latest(
     undo: &mut UndoState,
     delta_mode: bool,
     state: &mut [u8],
-    slot: u8,
+    slot: u32,
     val_col: &[u8],
     cmp_vals: &[f64],
     batch_len: u32,
@@ -2718,36 +2748,72 @@ const fn is_aggregate_op(op: Opcode) -> bool {
     )
 }
 
-/// Return the length (including opcode) of a non-aggregate body operation.
+/// One fixed-shape operand of [`body_op_len`]'s layout table.
+#[derive(Clone, Copy)]
+enum Shape {
+    /// A column, slot or count index ([`Operands::index`]).
+    I,
+    /// A fixed-width byte.
+    B,
+}
+
+/// Return the length (including opcode) of a body operation: its operand
+/// layout, walked without executing it. A malformed index or a truncated
+/// instruction answers `None`, so every executor that measures first reads
+/// operands that are known to decode.
 pub(crate) fn body_op_len(code: &[u8], pc: usize) -> Option<usize> {
+    use Shape::{B, I};
     let op = Opcode::from_u8(*code.get(pc)?)?;
-    let len = match op {
-        Opcode::Halt => 1,
-        Opcode::BatchMapUpsertLatest | Opcode::BatchMapUpsertLatestTtl => 6,
-        Opcode::BatchMapUpsertFirst | Opcode::BatchMapUpsertLast => 4,
-        Opcode::BatchMapRemove => 3,
-        Opcode::BatchMapUpsertLastTtl => 5,
-        Opcode::BatchMapUpsertMax | Opcode::BatchMapUpsertMin => 6,
-        Opcode::BatchMapUpsertLatestIf => 7,
-        Opcode::BatchMapUpsertFirstIf | Opcode::BatchMapUpsertLastIf => 5,
-        Opcode::BatchMapRemoveIf => 4,
-        Opcode::BatchMapUpsertMaxIf | Opcode::BatchMapUpsertMinIf => 7,
+    let mut operands = Operands::at(code, pc.checked_add(1)?);
+    let fixed: &[Shape] = match op {
+        Opcode::Halt => &[],
+        Opcode::BatchMapUpsertLatest | Opcode::BatchMapUpsertLatestTtl => &[I, I, I, I, B],
+        Opcode::BatchMapUpsertFirst | Opcode::BatchMapUpsertLast => &[I, I, I],
+        Opcode::BatchMapRemove => &[I, I],
+        Opcode::BatchMapUpsertLastTtl => &[I, I, I, I],
+        Opcode::BatchMapUpsertMax | Opcode::BatchMapUpsertMin => &[I, I, I, I, B],
+        Opcode::BatchMapUpsertLatestIf => &[I, I, I, I, B, I],
+        Opcode::BatchMapUpsertFirstIf | Opcode::BatchMapUpsertLastIf => &[I, I, I, I],
+        Opcode::BatchMapRemoveIf => &[I, I, I],
+        Opcode::BatchMapUpsertMaxIf | Opcode::BatchMapUpsertMinIf => &[I, I, I, I, B, I],
         //#region reduce-typed-state.probe-len
         Opcode::BatchStructMapProbe => {
-            let num_fields = usize::from(*code.get(pc.checked_add(5)?)?);
-            6usize
-                .checked_add(num_fields.checked_mul(2)?)?
-                .checked_add(1)?
+            // probe_slot, key_col, miss_mode, out_slot, num_fields,
+            // (probe_field, out_field) × num_fields, out_key_col.
+            operands.index()?;
+            operands.index()?;
+            operands.byte()?;
+            operands.index()?;
+            let num_fields = usize::from(operands.byte()?);
+            operands.bytes(num_fields.checked_mul(2)?)?;
+            operands.index()?;
+            &[]
         }
         //#region reduce-typed-state.scatter-len
         Opcode::BatchStructMapProbeScatter => {
-            let num_routes = usize::from(*code.get(pc.checked_add(6)?)?);
-            7usize.checked_add(num_routes.checked_mul(5)?)?
+            // probe_slot, key_col, miss_mode, route_field, op_field,
+            // num_routes, (kind, dest_slot, dest_field, out_key_field,
+            // v_src_field) × num_routes.
+            operands.index()?;
+            operands.index()?;
+            operands.bytes(3)?;
+            let num_routes = operands.byte()?;
+            for _ in 0..num_routes {
+                operands.byte()?;
+                operands.index()?;
+                operands.bytes(3)?;
+            }
+            &[]
         }
         //#region reduce-typed-state.scatter-element-len
         Opcode::BatchStructMapScatter => {
-            let num_routes = usize::from(*code.get(pc.checked_add(4)?)?);
-            5usize.checked_add(num_routes.checked_mul(4)?)?
+            // route_col, op_col, key_col, num_routes,
+            // (kind, dest_slot, dest_field, v_col) × num_routes.
+            for _ in 0..3 {
+                operands.index()?;
+            }
+            skip_scatter_routes(&mut operands)?;
+            &[]
         }
         //#endregion struct-map scatter-element length
         //#region reduce-typed-state.scatter-element-guarded-len
@@ -2756,12 +2822,16 @@ pub(crate) fn body_op_len(code: &[u8], pc: usize) -> Option<usize> {
         // offset. A width the compare array cannot hold is refused at
         // execution, not here: this answers only how long the instruction is.
         Opcode::BatchStructMapScatterGuarded => {
-            let num_guards = usize::from(*code.get(pc.checked_add(5)?)?);
-            let routes_at = 6usize.checked_add(num_guards.checked_mul(2)?)?;
-            let num_routes = usize::from(*code.get(pc.checked_add(routes_at)?)?);
-            routes_at
-                .checked_add(1)?
-                .checked_add(num_routes.checked_mul(4)?)?
+            for _ in 0..4 {
+                operands.index()?;
+            }
+            let num_guards = operands.byte()?;
+            for _ in 0..num_guards {
+                operands.index()?;
+                operands.byte()?;
+            }
+            skip_scatter_routes(&mut operands)?;
+            &[]
         }
         //#endregion struct-map guarded scatter-element length
         Opcode::BatchSetInsert
@@ -2771,65 +2841,96 @@ pub(crate) fn body_op_len(code: &[u8], pc: usize) -> Option<usize> {
         | Opcode::BatchBitmapAnd
         | Opcode::BatchBitmapOr
         | Opcode::BatchBitmapAndNot
-        | Opcode::BatchBitmapXor => 3,
+        | Opcode::BatchBitmapXor => &[I, I],
         Opcode::BatchBitmapAndScratch
         | Opcode::BatchBitmapOrScratch
         | Opcode::BatchBitmapAndNotScratch
-        | Opcode::BatchBitmapXorScratch => 2,
-        Opcode::BatchSetInsertTtl | Opcode::BatchSetInsertIf => 4,
-        Opcode::BatchAggSum | Opcode::BatchAggMin | Opcode::BatchAggMax => 3,
-        Opcode::BatchAggCount => 2,
-        Opcode::BatchAggSumIf => 4,
-        Opcode::BatchAggCountIf => 3,
-        Opcode::BatchAggMinIf | Opcode::BatchAggMaxIf | Opcode::BatchScalarLatest => 4,
-        Opcode::BatchAggSumI64 | Opcode::BatchAggMinI64 | Opcode::BatchAggMaxI64 => 3,
+        | Opcode::BatchBitmapXorScratch => &[I],
+        Opcode::BatchSetInsertTtl | Opcode::BatchSetInsertIf => &[I, I, I],
+        Opcode::BatchAggSum | Opcode::BatchAggMin | Opcode::BatchAggMax => &[I, I],
+        Opcode::BatchAggCount => &[I],
+        Opcode::BatchAggSumIf => &[I, I, I],
+        Opcode::BatchAggCountIf => &[I, I],
+        Opcode::BatchAggMinIf | Opcode::BatchAggMaxIf | Opcode::BatchScalarLatest => &[I, I, I],
+        Opcode::BatchAggSumI64 | Opcode::BatchAggMinI64 | Opcode::BatchAggMaxI64 => &[I, I],
         Opcode::BatchStructMapUpsertLast
         | Opcode::BatchStructMapUpsertFirst
         | Opcode::BatchStructMapUpsertMax => {
-            let operands = decode_struct_map_upsert_operands(
+            let decoded = decode_struct_map_upsert_operands(
                 code,
-                pc.checked_add(1)?,
+                operands.pos(),
                 op == Opcode::BatchStructMapUpsertMax,
             )?;
-            operands.end.checked_sub(pc)?
+            return decoded.end.checked_sub(pc);
         }
         Opcode::BatchStructMap2UpsertLast => {
-            let operands = decode_struct_map2_upsert_operands(code, pc.checked_add(1)?)?;
-            operands.end.checked_sub(pc)?
+            return decode_struct_map2_upsert_operands(code, operands.pos())?
+                .end
+                .checked_sub(pc);
         }
         Opcode::BatchStructMap2UpsertMaxI64x2 => {
-            let operands = decode_struct_map2_max_i64x2_operands(code, pc.checked_add(1)?)?;
-            operands.end.checked_sub(pc)?
+            return decode_struct_map2_max_i64x2_operands(code, operands.pos())?
+                .end
+                .checked_sub(pc);
         }
-        Opcode::ListAppend => 3,
-        Opcode::BatchStructMap2Remove => 4,
+        Opcode::ListAppend => &[I, I],
+        Opcode::BatchStructMap2Remove => &[I, I, I],
         Opcode::ListAppendStruct => {
-            let num_vals = usize::from(*code.get(pc.checked_add(2)?)?);
-            3usize.checked_add(num_vals.checked_mul(2)?)?
+            operands.index()?;
+            let num_vals = operands.byte()?;
+            for _ in 0..num_vals {
+                operands.index()?;
+                operands.byte()?;
+            }
+            &[]
         }
         Opcode::FlatMap => {
-            let low = usize::from(*code.get(pc.checked_add(3)?)?);
-            let high = usize::from(*code.get(pc.checked_add(4)?)?);
-            5usize.checked_add(low | (high << 8))?
+            // offsets_col, parent_ts_col, inner_body_len:u16, inner body.
+            operands.index()?;
+            operands.index()?;
+            let inner_len = usize::from(operands.u16()?);
+            operands.bytes(inner_len)?;
+            &[]
         }
-        Opcode::NestedSetInsert => 4,
-        Opcode::NestedMapUpsertLast => 5,
-        Opcode::NestedAggUpdate => 4,
+        Opcode::NestedSetInsert => &[I, I, I],
+        Opcode::NestedMapUpsertLast => &[I, I, I, I],
+        Opcode::NestedAggUpdate => &[I, I, I],
         Opcode::ForEach => {
-            let match_count = usize::from(*code.get(pc.checked_add(2)?)?);
-            let ids_len = match_count.checked_mul(4)?;
-            let body_len_offset = pc.checked_add(3)?.checked_add(ids_len)?;
-            let body_len_bytes = code.get(body_len_offset..body_len_offset.checked_add(2)?)?;
-            let body_len = usize::from(body_len_bytes[0]) | (usize::from(body_len_bytes[1]) << 8);
-            body_len_offset
-                .checked_add(2)?
-                .checked_add(body_len)?
-                .checked_sub(pc)?
+            // type_col, match_count, match_ids:u32 × match_count,
+            // body_len:u16, body.
+            operands.index()?;
+            let match_count = usize::try_from(operands.index()?).ok()?;
+            operands.bytes(match_count.checked_mul(4)?)?;
+            let body_len = usize::from(operands.u16()?);
+            operands.bytes(body_len)?;
+            &[]
         }
         _ => return None,
     };
-    let end = pc.checked_add(len)?;
-    (end <= code.len()).then_some(len)
+    for shape in fixed {
+        match shape {
+            I => {
+                operands.index()?;
+            }
+            B => {
+                operands.byte()?;
+            }
+        }
+    }
+    operands.pos().checked_sub(pc)
+}
+
+/// `num_routes:u8, (kind:u8, dest_slot:index, dest_field:u8, v_col:index) ×
+/// num_routes` — the route table both probe-free scatters share.
+fn skip_scatter_routes(operands: &mut Operands<'_>) -> Option<()> {
+    let num_routes = operands.byte()?;
+    for _ in 0..num_routes {
+        operands.byte()?;
+        operands.index()?;
+        operands.byte()?;
+        operands.index()?;
+    }
+    Some(())
 }
 
 fn validate_body(state: &[u8], body: &[u8]) -> bool {
@@ -2843,11 +2944,10 @@ fn validate_body(state: &[u8], body: &[u8]) -> bool {
         };
 
         if op == Opcode::BatchScalarLatest {
-            let Some(&slot) = body.get(pc + 1) else {
+            let Some((slot, _)) = read_index(body, pc + 1) else {
                 return false;
             };
-            let num_slots = state[StateHeaderOffset::NUM_SLOTS as usize];
-            if slot >= num_slots {
+            if slot >= state_num_slots(state) {
                 return false;
             }
             let meta = SlotMetaView::read(state, slot);
@@ -2865,24 +2965,26 @@ fn validate_body(state: &[u8], body: &[u8]) -> bool {
             }
         }
 
-        if op == Opcode::FlatMap {
-            let Some(inner_start) = pc.checked_add(5) else {
-                return false;
-            };
-            let Some(inner_len) = len.checked_sub(5) else {
-                return false;
-            };
-            let Some(inner_end) = inner_start.checked_add(inner_len) else {
-                return false;
-            };
-            if !validate_body(state, &body[inner_start..inner_end]) {
-                return false;
-            }
+        if op == Opcode::FlatMap
+            && let Some(inner) = flat_map_inner_body(body, pc)
+            && !validate_body(state, inner)
+        {
+            return false;
         }
 
         pc += len;
     }
     true
+}
+
+/// The inner body of the `FLAT_MAP` at `pc`: what follows its offsets
+/// column, parent timestamp column and `u16` length.
+fn flat_map_inner_body(body: &[u8], pc: usize) -> Option<&[u8]> {
+    let mut operands = Operands::at(body, pc + 1);
+    operands.index()?;
+    operands.index()?;
+    let inner_len = usize::from(operands.u16()?);
+    operands.bytes(inner_len)
 }
 
 // =============================================================================
@@ -2895,7 +2997,7 @@ const INVALID_PROGRAM: u32 = ErrorCode::InvalidProgram as u32;
 const NEEDS_GROWTH: u32 = ErrorCode::NeedsGrowth as u32;
 
 /// Map a capacity failure to NEEDS_GROWTH and record its slot.
-fn signal_growth(slot_idx: u8, result: ErrorCode) -> u32 {
+fn signal_growth(slot_idx: u32, result: ErrorCode) -> u32 {
     if result == ErrorCode::CapacityExceeded {
         NEEDS_GROWTH_SLOT.store(slot_idx, Ordering::Relaxed);
         return NEEDS_GROWTH;
@@ -2961,7 +3063,7 @@ impl Vm {
         {
             return Err(ErrorCode::InvalidState);
         }
-        let num_slots = state[StateHeaderOffset::NUM_SLOTS as usize];
+        let num_slots = state_num_slots(state);
         let mut total = 0u32;
         for i in 0..num_slots {
             let meta = SlotMetaView::read(state, i);
@@ -2988,51 +3090,42 @@ impl Vm {
         {
             return INVALID_STATE;
         }
-        if (program.len() as u32) < PROGRAM_HEADER_SIZE {
-            return INVALID_PROGRAM;
-        }
-        let content = &program[PROGRAM_HASH_PREFIX as usize..];
-        let Some(header_bytes) = content
-            .get(..ProgramHeader::WIRE_SIZE)
-            .and_then(|bytes| <[u8; ProgramHeader::WIRE_SIZE]>::try_from(bytes).ok())
-        else {
+        let Some(sections) = ProgramHeader::sections(program) else {
             return INVALID_PROGRAM;
         };
-        let header = ProgramHeader::from_wire_bytes(header_bytes);
-        if !state_init::accepts_program_magic(header.magic, self.accepted_program_magics) {
-            return INVALID_PROGRAM;
-        }
-        let init_len = u32::from(header.init_code_len);
-        let reduce_len = u32::from(header.reduce_code_len);
-        if PROGRAM_HASH_PREFIX + ProgramHeader::WIRE_SIZE as u32 + init_len + reduce_len
-            > program.len() as u32
+        if !self
+            .accepted_program_magics
+            .contains(&sections.header.magic)
         {
             return INVALID_PROGRAM;
         }
-        let code_start = ProgramHeader::WIRE_SIZE + init_len as usize;
-        let code = &content[code_start..code_start + reduce_len as usize];
+        let code = sections.reduce_code;
 
         let mut pc = 0usize;
         while pc < code.len() {
             let Some(_) = body_op_len(code, pc) else {
                 return INVALID_PROGRAM;
             };
-            let op_byte = code[pc];
-            pc += 1;
-            let Some(op) = Opcode::from_u8(op_byte) else {
+            let Some(op) = Opcode::from_u8(code[pc]) else {
                 return INVALID_PROGRAM;
             };
+            pc += 1;
+            let mut r = Operands::at(code, pc);
 
             match op {
                 Opcode::Halt => break,
 
                 Opcode::BatchMapUpsertLatest | Opcode::BatchMapUpsertLatestTtl => {
-                    let (slot, key_col, val_col, ts_col) =
-                        (code[pc], code[pc + 1], code[pc + 2], code[pc + 3]);
-                    let Some(cmp_type) = CmpType::from_u8(code[pc + 4]) else {
+                    let (slot, key_col, val_col, ts_col) = (
+                        operand!(r.index()),
+                        operand!(r.index()),
+                        operand!(r.index()),
+                        operand!(r.index()),
+                    );
+                    let Some(cmp_type) = CmpType::from_u8(operand!(r.byte())) else {
                         return INVALID_PROGRAM;
                     };
-                    pc += 5;
+                    pc = r.pos();
                     let meta = SlotMetaView::read(state, slot);
                     let result = hashmap_ops::batch_map_upsert(
                         Strategy::Latest,
@@ -3056,8 +3149,12 @@ impl Vm {
                 }
 
                 Opcode::BatchMapUpsertFirst => {
-                    let (slot, key_col, val_col) = (code[pc], code[pc + 1], code[pc + 2]);
-                    pc += 3;
+                    let (slot, key_col, val_col) = (
+                        operand!(r.index()),
+                        operand!(r.index()),
+                        operand!(r.index()),
+                    );
+                    pc = r.pos();
                     let meta = SlotMetaView::read(state, slot);
                     let result = hashmap_ops::batch_map_upsert(
                         Strategy::First,
@@ -3077,12 +3174,16 @@ impl Vm {
                 }
 
                 Opcode::BatchMapUpsertLast => {
-                    let (slot, key_col, val_col) = (code[pc], code[pc + 1], code[pc + 2]);
-                    pc += 3;
+                    let (slot, key_col, val_col) = (
+                        operand!(r.index()),
+                        operand!(r.index()),
+                        operand!(r.index()),
+                    );
+                    pc = r.pos();
                     let meta = SlotMetaView::read(state, slot);
                     let ts = if meta.has_ttl() {
                         Some(batch_col!(cmp_col_exact(
-                            col_at(cols, meta.timestamp_field_idx(state) as usize),
+                            col_at(cols, meta.timestamp_col(state) as usize),
                             batch_len,
                             CmpType::F64
                         )))
@@ -3107,9 +3208,13 @@ impl Vm {
                 }
 
                 Opcode::BatchMapUpsertLastTtl => {
-                    let (slot, key_col, val_col, ts_col) =
-                        (code[pc], code[pc + 1], code[pc + 2], code[pc + 3]);
-                    pc += 4;
+                    let (slot, key_col, val_col, ts_col) = (
+                        operand!(r.index()),
+                        operand!(r.index()),
+                        operand!(r.index()),
+                        operand!(r.index()),
+                    );
+                    pc = r.pos();
                     let meta = SlotMetaView::read(state, slot);
                     let result = hashmap_ops::batch_map_upsert(
                         Strategy::Last,
@@ -3133,8 +3238,8 @@ impl Vm {
                 }
 
                 Opcode::BatchMapRemove => {
-                    let (slot, key_col) = (code[pc], code[pc + 1]);
-                    pc += 2;
+                    let (slot, key_col) = (operand!(r.index()), operand!(r.index()));
+                    pc = r.pos();
                     let meta = SlotMetaView::read(state, slot);
                     hashmap_ops::batch_map_remove(
                         delta_mode,
@@ -3147,12 +3252,16 @@ impl Vm {
                 }
 
                 Opcode::BatchMapUpsertMax | Opcode::BatchMapUpsertMin => {
-                    let (slot, key_col, val_col, cmp_col) =
-                        (code[pc], code[pc + 1], code[pc + 2], code[pc + 3]);
-                    let Some(cmp_type) = CmpType::from_u8(code[pc + 4]) else {
+                    let (slot, key_col, val_col, cmp_col) = (
+                        operand!(r.index()),
+                        operand!(r.index()),
+                        operand!(r.index()),
+                        operand!(r.index()),
+                    );
+                    let Some(cmp_type) = CmpType::from_u8(operand!(r.byte())) else {
                         return INVALID_PROGRAM;
                     };
-                    pc += 5;
+                    pc = r.pos();
                     let strategy = if op == Opcode::BatchMapUpsertMax {
                         Strategy::Max
                     } else {
@@ -3181,12 +3290,12 @@ impl Vm {
                 }
 
                 Opcode::BatchSetInsert => {
-                    let (slot, elem_col) = (code[pc], code[pc + 1]);
-                    pc += 2;
+                    let (slot, elem_col) = (operand!(r.index()), operand!(r.index()));
+                    pc = r.pos();
                     let meta = SlotMetaView::read(state, slot);
                     let ts = if meta.has_ttl() {
                         Some(batch_col!(col_f64_exact(
-                            col_at(cols, meta.timestamp_field_idx(state) as usize),
+                            col_at(cols, meta.timestamp_col(state) as usize),
                             batch_len
                         )))
                     } else {
@@ -3206,8 +3315,12 @@ impl Vm {
                 }
 
                 Opcode::BatchSetInsertTtl => {
-                    let (slot, elem_col, ts_col) = (code[pc], code[pc + 1], code[pc + 2]);
-                    pc += 3;
+                    let (slot, elem_col, ts_col) = (
+                        operand!(r.index()),
+                        operand!(r.index()),
+                        operand!(r.index()),
+                    );
+                    pc = r.pos();
                     let meta = SlotMetaView::read(state, slot);
                     let result = self.set_insert(
                         delta_mode,
@@ -3226,8 +3339,8 @@ impl Vm {
                 }
 
                 Opcode::BatchSetRemove => {
-                    let (slot, elem_col) = (code[pc], code[pc + 1]);
-                    pc += 2;
+                    let (slot, elem_col) = (operand!(r.index()), operand!(r.index()));
+                    pc = r.pos();
                     let meta = SlotMetaView::read(state, slot);
                     let result = self.set_remove(
                         delta_mode,
@@ -3242,12 +3355,12 @@ impl Vm {
                 }
 
                 Opcode::BatchBitmapAdd => {
-                    let (slot, elem_col) = (code[pc], code[pc + 1]);
-                    pc += 2;
+                    let (slot, elem_col) = (operand!(r.index()), operand!(r.index()));
+                    pc = r.pos();
                     let meta = SlotMetaView::read(state, slot);
                     let ts = if meta.has_ttl() {
                         Some(batch_col!(col_f64_exact(
-                            col_at(cols, meta.timestamp_field_idx(state) as usize),
+                            col_at(cols, meta.timestamp_col(state) as usize),
                             batch_len
                         )))
                     } else {
@@ -3267,8 +3380,8 @@ impl Vm {
                 }
 
                 Opcode::BatchBitmapRemove => {
-                    let (slot, elem_col) = (code[pc], code[pc + 1]);
-                    pc += 2;
+                    let (slot, elem_col) = (operand!(r.index()), operand!(r.index()));
+                    pc = r.pos();
                     let meta = SlotMetaView::read(state, slot);
                     let result = self.set_remove(
                         delta_mode,
@@ -3286,8 +3399,8 @@ impl Vm {
                 | Opcode::BatchBitmapOr
                 | Opcode::BatchBitmapAndNot
                 | Opcode::BatchBitmapXor => {
-                    let (target_slot, source_slot) = (code[pc], code[pc + 1]);
-                    pc += 2;
+                    let (target_slot, source_slot) = (operand!(r.index()), operand!(r.index()));
+                    pc = r.pos();
                     let target_meta = SlotMetaView::read(state, target_slot);
                     let source_meta = SlotMetaView::read(state, source_slot);
                     let alg_op = match op {
@@ -3314,8 +3427,8 @@ impl Vm {
                 | Opcode::BatchBitmapOrScratch
                 | Opcode::BatchBitmapAndNotScratch
                 | Opcode::BatchBitmapXorScratch => {
-                    let target_slot = code[pc];
-                    pc += 1;
+                    let target_slot = operand!(r.index());
+                    pc = r.pos();
                     let target_meta = SlotMetaView::read(state, target_slot);
                     let alg_op = match op {
                         Opcode::BatchBitmapAndScratch => BitmapAlgebraOp::And,
@@ -3334,8 +3447,8 @@ impl Vm {
                 }
 
                 Opcode::BatchAggSum | Opcode::BatchAggMin | Opcode::BatchAggMax => {
-                    let (slot, val_col) = (code[pc], code[pc + 1]);
-                    pc += 2;
+                    let (slot, val_col) = (operand!(r.index()), operand!(r.index()));
+                    pc = r.pos();
                     let kind = match op {
                         Opcode::BatchAggSum => AggKind::Sum,
                         Opcode::BatchAggMin => AggKind::Min,
@@ -3354,8 +3467,8 @@ impl Vm {
                 }
 
                 Opcode::BatchAggCount => {
-                    let slot = code[pc];
-                    pc += 1;
+                    let slot = operand!(r.index());
+                    pc = r.pos();
                     exec_agg_count(
                         &mut self.undo,
                         delta_mode,
@@ -3366,8 +3479,8 @@ impl Vm {
                 }
 
                 Opcode::BatchAggSumI64 | Opcode::BatchAggMinI64 | Opcode::BatchAggMaxI64 => {
-                    let (slot, val_col) = (code[pc], code[pc + 1]);
-                    pc += 2;
+                    let (slot, val_col) = (operand!(r.index()), operand!(r.index()));
+                    pc = r.pos();
                     let kind = match op {
                         Opcode::BatchAggSumI64 => AggKind::Sum,
                         Opcode::BatchAggMinI64 => AggKind::Min,
@@ -3386,8 +3499,12 @@ impl Vm {
                 }
 
                 Opcode::BatchScalarLatest => {
-                    let (slot, val_col, cmp_col) = (code[pc], code[pc + 1], code[pc + 2]);
-                    pc += 3;
+                    let (slot, val_col, cmp_col) = (
+                        operand!(r.index()),
+                        operand!(r.index()),
+                        operand!(r.index()),
+                    );
+                    pc = r.pos();
                     let cmp_vals =
                         batch_col!(col_f64_exact(col_at(cols, cmp_col as usize), batch_len));
                     let result = exec_scalar_latest(
@@ -3416,26 +3533,13 @@ impl Vm {
                     };
                     pc = operands.end;
 
-                    let scalar_pairs_end = operands.scalar_pairs_start + operands.num_vals * 2;
-                    let scalar_pairs = &code[operands.scalar_pairs_start..scalar_pairs_end];
-                    let mut val_cols = [0u8; MAX_STRUCT_SCALAR_OPERANDS];
-                    let mut field_idxs = [0u8; MAX_STRUCT_SCALAR_OPERANDS];
-                    for (vi, pair) in scalar_pairs.as_chunks::<2>().0.iter().enumerate() {
-                        val_cols[vi] = pair[0];
-                        field_idxs[vi] = pair[1];
-                    }
-
                     let smap = StructMapSlot::bind(state, operands.slot);
-                    let array_end = operands.array_triples_start + operands.num_array_vals * 3;
-                    let array_fields = code[operands.array_triples_start..array_end]
-                        .as_chunks::<3>()
-                        .0;
                     let comparison = match operands.comparison_field_idx {
                         Some(field_idx) => {
                             let Some(comparison) = resolve_struct_map_max_comparison(
                                 state,
                                 &smap,
-                                scalar_pairs,
+                                &operands.vals,
                                 field_idx,
                             ) else {
                                 return INVALID_PROGRAM;
@@ -3446,7 +3550,7 @@ impl Vm {
                     };
 
                     let keys = batch_col!(col_u32_exact(
-                        col_at(cols, usize::from(operands.key_col)),
+                        col_at(cols, operands.key_col as usize),
                         batch_len
                     ));
                     for i in 0..batch_len {
@@ -3472,9 +3576,9 @@ impl Vm {
                             &smap,
                             operands.slot,
                             key,
-                            &val_cols[..operands.num_vals],
-                            &field_idxs[..operands.num_vals],
-                            array_fields,
+                            operands.vals.cols(),
+                            operands.vals.fields(),
+                            operands.array_fields(),
                             cols,
                             i,
                         );
@@ -3489,24 +3593,12 @@ impl Vm {
                         return INVALID_PROGRAM;
                     };
                     pc = operands.end;
-                    let pairs_end = operands.scalar_pairs_start + operands.num_vals * 2;
-                    let mut val_cols = [0u8; MAX_STRUCT_SCALAR_OPERANDS];
-                    let mut field_idxs = [0u8; MAX_STRUCT_SCALAR_OPERANDS];
-                    for (index, pair) in code[operands.scalar_pairs_start..pairs_end]
-                        .as_chunks::<2>()
-                        .0
-                        .iter()
-                        .enumerate()
-                    {
-                        val_cols[index] = pair[0];
-                        field_idxs[index] = pair[1];
-                    }
                     let keys1 = batch_col!(col_u32_exact(
-                        col_at(cols, usize::from(operands.key1_col)),
+                        col_at(cols, operands.key1_col as usize),
                         batch_len
                     ));
                     let keys2 = batch_col!(col_u32_exact(
-                        col_at(cols, usize::from(operands.key2_col)),
+                        col_at(cols, operands.key2_col as usize),
                         batch_len
                     ));
                     for i in 0..batch_len {
@@ -3518,8 +3610,8 @@ impl Vm {
                             operands.slot,
                             keys1[index],
                             keys2[index],
-                            &val_cols[..operands.num_vals],
-                            &field_idxs[..operands.num_vals],
+                            operands.vals.cols(),
+                            operands.vals.fields(),
                             cols,
                             i,
                         );
@@ -3538,15 +3630,15 @@ impl Vm {
                     };
                     pc = operands.end;
                     let smap = StructMap2Slot::bind(state, operands.row.slot);
-                    if !validate_struct_map2_max_i64x2(state, &smap, code, operands) {
+                    if !validate_struct_map2_max_i64x2(state, &smap, &operands) {
                         return INVALID_PROGRAM;
                     }
                     let keys1 = batch_col!(col_u32_exact(
-                        col_at(cols, usize::from(operands.row.key1_col)),
+                        col_at(cols, operands.row.key1_col as usize),
                         batch_len
                     ));
                     let keys2 = batch_col!(col_u32_exact(
-                        col_at(cols, usize::from(operands.row.key2_col)),
+                        col_at(cols, operands.row.key2_col as usize),
                         batch_len
                     ));
                     for i in 0..batch_len {
@@ -3555,8 +3647,7 @@ impl Vm {
                             &mut self.undo,
                             delta_mode,
                             state,
-                            code,
-                            operands,
+                            &operands,
                             keys1[index],
                             keys2[index],
                             cols,
@@ -3572,16 +3663,16 @@ impl Vm {
                 }
 
                 Opcode::BatchStructMap2Remove => {
-                    let (slot, key1_col, key2_col) = (code[pc], code[pc + 1], code[pc + 2]);
-                    pc += 3;
-                    let keys1 = batch_col!(col_u32_exact(
-                        col_at(cols, usize::from(key1_col)),
-                        batch_len
-                    ));
-                    let keys2 = batch_col!(col_u32_exact(
-                        col_at(cols, usize::from(key2_col)),
-                        batch_len
-                    ));
+                    let (slot, key1_col, key2_col) = (
+                        operand!(r.index()),
+                        operand!(r.index()),
+                        operand!(r.index()),
+                    );
+                    pc = r.pos();
+                    let keys1 =
+                        batch_col!(col_u32_exact(col_at(cols, key1_col as usize), batch_len));
+                    let keys2 =
+                        batch_col!(col_u32_exact(col_at(cols, key2_col as usize), batch_len));
                     for index in 0..batch_len as usize {
                         let result = single_struct_map2_remove(
                             &mut self.undo,
@@ -3598,37 +3689,19 @@ impl Vm {
                 }
 
                 Opcode::ForEach => {
-                    // Header: col:u8, match_count:u8, match_ids:u32le[N], body_len:u16le.
-                    let Some(header) = code.get(pc..pc.saturating_add(2)) else {
+                    // type_col:index, match_count:index, match_ids:u32le[N],
+                    // body_len:u16le, body.
+                    let col_idx = operand!(r.index());
+                    let Ok(match_count) = usize::try_from(operand!(r.index())) else {
                         return INVALID_PROGRAM;
                     };
-                    let col_idx = header[0];
-                    let match_count = usize::from(header[1]);
-                    let match_ids_start = pc + 2;
-                    let Some(match_ids_len) = match_count.checked_mul(4) else {
-                        return INVALID_PROGRAM;
-                    };
-                    let Some(body_len_offset) = match_ids_start.checked_add(match_ids_len) else {
-                        return INVALID_PROGRAM;
-                    };
-                    let Some(body_len_bytes) =
-                        code.get(body_len_offset..body_len_offset.saturating_add(2))
-                    else {
-                        return INVALID_PROGRAM;
-                    };
-                    let body_len =
-                        usize::from(body_len_bytes[0]) | (usize::from(body_len_bytes[1]) << 8);
-                    let body_start = body_len_offset + 2;
-                    let Some(body_end) = body_start.checked_add(body_len) else {
-                        return INVALID_PROGRAM;
-                    };
-                    let Some(body) = code.get(body_start..body_end) else {
-                        return INVALID_PROGRAM;
-                    };
+                    let match_ids = operand!(r.bytes(match_count * 4));
+                    let body_len = usize::from(operand!(r.u16()));
+                    let body = operand!(r.bytes(body_len));
                     if !validate_body(state, body) {
                         return INVALID_PROGRAM;
                     }
-                    pc = body_end;
+                    pc = r.pos();
 
                     let type_col = col_at(cols, col_idx as usize);
                     // Both passes index the type column with row indices up
@@ -3637,8 +3710,7 @@ impl Vm {
 
                     // Pass 1: batch aggregates, once per match id.
                     for mi in 0..match_count {
-                        let id_off = match_ids_start + mi * 4;
-                        let match_id = bytes::read_u32(code, id_off as u32);
+                        let match_id = bytes::read_u32(match_ids, (mi * 4) as u32);
                         let agg_result = self.execute_batch_aggregates(
                             delta_mode, state, body, cols, batch_len, type_col, match_id,
                         );
@@ -3650,14 +3722,8 @@ impl Vm {
                     // Pass 2: per-element scalar operations.
                     for ei in 0..batch_len {
                         let val = type_data[ei as usize];
-                        let mut matched = false;
-                        for mj in 0..match_count {
-                            let id_off = match_ids_start + mj * 4;
-                            if val == bytes::read_u32(code, id_off as u32) {
-                                matched = true;
-                                break;
-                            }
-                        }
+                        let matched = (0..match_count)
+                            .any(|mj| val == bytes::read_u32(match_ids, (mj * 4) as u32));
                         if !matched {
                             continue;
                         }
@@ -3668,7 +3734,7 @@ impl Vm {
                             cols,
                             ei,
                             ei,
-                            0xFF,
+                            NO_PARENT_TS_COL,
                             live.as_deref_mut(),
                         );
                         if elem_result != OK {
@@ -3710,10 +3776,11 @@ impl Vm {
                 bpc += op_len;
                 continue;
             }
+            let mut r = Operands::at(body, bpc + 1);
             match op {
                 Opcode::BatchAggSum | Opcode::BatchAggMin | Opcode::BatchAggMax => {
-                    let (slot, val_col) = (body[bpc + 1], body[bpc + 2]);
-                    bpc += 3;
+                    let (slot, val_col) = (operand!(r.index()), operand!(r.index()));
+                    bpc = r.pos();
                     let kind = match op {
                         Opcode::BatchAggSum => AggKind::Sum,
                         Opcode::BatchAggMin => AggKind::Min,
@@ -3734,14 +3801,18 @@ impl Vm {
                     );
                 }
                 Opcode::BatchAggCount => {
-                    let slot = body[bpc + 1];
-                    bpc += 2;
+                    let slot = operand!(r.index());
+                    bpc = r.pos();
                     let matched = aggregates::masked_agg_count(type_data, type_id);
                     exec_agg_count(&mut self.undo, delta_mode, state, slot, u64::from(matched));
                 }
                 Opcode::BatchAggSumIf | Opcode::BatchAggMinIf | Opcode::BatchAggMaxIf => {
-                    let (slot, val_col, pred_col) = (body[bpc + 1], body[bpc + 2], body[bpc + 3]);
-                    bpc += 4;
+                    let (slot, val_col, pred_col) = (
+                        operand!(r.index()),
+                        operand!(r.index()),
+                        operand!(r.index()),
+                    );
+                    bpc = r.pos();
                     let kind = match op {
                         Opcode::BatchAggSumIf => AggKind::Sum,
                         Opcode::BatchAggMinIf => AggKind::Min,
@@ -3765,8 +3836,8 @@ impl Vm {
                     );
                 }
                 Opcode::BatchAggCountIf => {
-                    let (slot, pred_col) = (body[bpc + 1], body[bpc + 2]);
-                    bpc += 3;
+                    let (slot, pred_col) = (operand!(r.index()), operand!(r.index()));
+                    bpc = r.pos();
                     let preds =
                         batch_col!(col_u32_exact(col_at(cols, pred_col as usize), batch_len));
                     let mut matched = 0u64;
@@ -3778,8 +3849,12 @@ impl Vm {
                     exec_agg_count(&mut self.undo, delta_mode, state, slot, matched);
                 }
                 Opcode::BatchScalarLatest => {
-                    let (slot, val_col, cmp_col) = (body[bpc + 1], body[bpc + 2], body[bpc + 3]);
-                    bpc += 4;
+                    let (slot, val_col, cmp_col) = (
+                        operand!(r.index()),
+                        operand!(r.index()),
+                        operand!(r.index()),
+                    );
+                    bpc = r.pos();
                     let cmp_vals =
                         batch_col!(col_f64_exact(col_at(cols, cmp_col as usize), batch_len));
                     let result = exec_scalar_latest(
@@ -3797,8 +3872,8 @@ impl Vm {
                     }
                 }
                 Opcode::BatchAggSumI64 | Opcode::BatchAggMinI64 | Opcode::BatchAggMaxI64 => {
-                    let (slot, val_col) = (body[bpc + 1], body[bpc + 2]);
-                    bpc += 3;
+                    let (slot, val_col) = (operand!(r.index()), operand!(r.index()));
+                    bpc = r.pos();
                     let kind = match op {
                         Opcode::BatchAggSumI64 => AggKind::Sum,
                         Opcode::BatchAggMinI64 => AggKind::Min,
@@ -3834,15 +3909,15 @@ impl Vm {
         cols: &[&[u8]],
         child_idx: u32,
         parent_idx: u32,
-        parent_ts_col: u8,
+        parent_ts_col: u32,
         mut live: Option<&mut LiveColumns<'_, '_>>,
     ) -> u32 {
         // Column cell reads at an element index. Bounds are the column's own
         // length (child columns can be longer than batch_len under FLAT_MAP).
         let cell_u32 =
-            |cols: &[&[u8]], idx: u8, i: u32| bytes::read_u32(col_at(cols, idx as usize), i * 4);
+            |cols: &[&[u8]], idx: u32, i: u32| bytes::read_u32(col_at(cols, idx as usize), i * 4);
         let cell_f64 =
-            |cols: &[&[u8]], idx: u8, i: u32| bytes::read_f64(col_at(cols, idx as usize), i * 8);
+            |cols: &[&[u8]], idx: u32, i: u32| bytes::read_f64(col_at(cols, idx as usize), i * 8);
         // A conditional opcode's predicate cell: a live derived column is
         // evaluated here, against the state the rows before this one left,
         // so the answer does not depend on where the host cut the batch.
@@ -3874,17 +3949,22 @@ impl Vm {
                 bpc += op_len;
                 continue;
             }
+            let mut r = Operands::at(body, bpc + 1);
 
             match op {
                 Opcode::BatchMapUpsertLatest | Opcode::BatchMapUpsertLatestTtl => {
-                    let (slot, key_col, val_col, ts_col) =
-                        (body[bpc + 1], body[bpc + 2], body[bpc + 3], body[bpc + 4]);
-                    let Some(cmp_type) = CmpType::from_u8(body[bpc + 5]) else {
+                    let (slot, key_col, val_col, ts_col) = (
+                        operand!(r.index()),
+                        operand!(r.index()),
+                        operand!(r.index()),
+                        operand!(r.index()),
+                    );
+                    let Some(cmp_type) = CmpType::from_u8(operand!(r.byte())) else {
                         return INVALID_PROGRAM;
                     };
-                    bpc += 6;
+                    bpc = r.pos();
 
-                    let (cmp_raw, cmp_idx) = if parent_ts_col != 0xFF {
+                    let (cmp_raw, cmp_idx) = if parent_ts_col != NO_PARENT_TS_COL {
                         (col_at(cols, parent_ts_col as usize), parent_idx)
                     } else {
                         (col_at(cols, ts_col as usize), child_idx)
@@ -3912,8 +3992,12 @@ impl Vm {
 
                 // MAP_UPSERT_FIRST (0x21)
                 Opcode::BatchMapUpsertFirst => {
-                    let (slot, key_col, val_col) = (body[bpc + 1], body[bpc + 2], body[bpc + 3]);
-                    bpc += 4;
+                    let (slot, key_col, val_col) = (
+                        operand!(r.index()),
+                        operand!(r.index()),
+                        operand!(r.index()),
+                    );
+                    bpc = r.pos();
                     let meta = SlotMetaView::read(state, slot);
                     let result = hashmap_ops::single_map_upsert(
                         Strategy::First,
@@ -3935,11 +4019,15 @@ impl Vm {
 
                 // MAP_UPSERT_LAST (0x22)
                 Opcode::BatchMapUpsertLast => {
-                    let (slot, key_col, val_col) = (body[bpc + 1], body[bpc + 2], body[bpc + 3]);
-                    bpc += 4;
+                    let (slot, key_col, val_col) = (
+                        operand!(r.index()),
+                        operand!(r.index()),
+                        operand!(r.index()),
+                    );
+                    bpc = r.pos();
                     let meta = SlotMetaView::read(state, slot);
                     let ttl_cmp = if meta.has_ttl() {
-                        cell_f64(cols, meta.timestamp_field_idx(state), child_idx).to_bits()
+                        cell_f64(cols, meta.timestamp_col(state), child_idx).to_bits()
                     } else {
                         0
                     };
@@ -3963,10 +4051,14 @@ impl Vm {
 
                 // MAP_UPSERT_LAST_TTL (0x25)
                 Opcode::BatchMapUpsertLastTtl => {
-                    let (slot, key_col, val_col, ts_col) =
-                        (body[bpc + 1], body[bpc + 2], body[bpc + 3], body[bpc + 4]);
-                    bpc += 5;
-                    let (ts_raw, ts_idx) = if parent_ts_col != 0xFF {
+                    let (slot, key_col, val_col, ts_col) = (
+                        operand!(r.index()),
+                        operand!(r.index()),
+                        operand!(r.index()),
+                        operand!(r.index()),
+                    );
+                    bpc = r.pos();
+                    let (ts_raw, ts_idx) = if parent_ts_col != NO_PARENT_TS_COL {
                         (col_at(cols, parent_ts_col as usize), parent_idx)
                     } else {
                         (col_at(cols, ts_col as usize), child_idx)
@@ -3994,8 +4086,8 @@ impl Vm {
 
                 // MAP_REMOVE (0x23)
                 Opcode::BatchMapRemove => {
-                    let (slot, key_col) = (body[bpc + 1], body[bpc + 2]);
-                    bpc += 3;
+                    let (slot, key_col) = (operand!(r.index()), operand!(r.index()));
+                    bpc = r.pos();
                     let meta = SlotMetaView::read(state, slot);
                     hashmap_ops::single_map_remove(
                         delta_mode,
@@ -4009,12 +4101,16 @@ impl Vm {
 
                 // MAP_UPSERT_MAX (0x26) / MIN (0x27)
                 Opcode::BatchMapUpsertMax | Opcode::BatchMapUpsertMin => {
-                    let (slot, key_col, val_col, cmp_col) =
-                        (body[bpc + 1], body[bpc + 2], body[bpc + 3], body[bpc + 4]);
-                    let Some(cmp_type) = CmpType::from_u8(body[bpc + 5]) else {
+                    let (slot, key_col, val_col, cmp_col) = (
+                        operand!(r.index()),
+                        operand!(r.index()),
+                        operand!(r.index()),
+                        operand!(r.index()),
+                    );
+                    let Some(cmp_type) = CmpType::from_u8(operand!(r.byte())) else {
                         return INVALID_PROGRAM;
                     };
-                    bpc += 6;
+                    bpc = r.pos();
                     let strategy = if op == Opcode::BatchMapUpsertMax {
                         Strategy::Max
                     } else {
@@ -4046,17 +4142,21 @@ impl Vm {
 
                 // MAP_UPSERT_LATEST_IF (0x28)
                 Opcode::BatchMapUpsertLatestIf => {
-                    let (slot, key_col, val_col, ts_col) =
-                        (body[bpc + 1], body[bpc + 2], body[bpc + 3], body[bpc + 4]);
-                    let Some(cmp_type) = CmpType::from_u8(body[bpc + 5]) else {
+                    let (slot, key_col, val_col, ts_col) = (
+                        operand!(r.index()),
+                        operand!(r.index()),
+                        operand!(r.index()),
+                        operand!(r.index()),
+                    );
+                    let Some(cmp_type) = CmpType::from_u8(operand!(r.byte())) else {
                         return INVALID_PROGRAM;
                     };
-                    let pred_col = body[bpc + 6];
-                    bpc += 7;
+                    let pred_col = operand!(r.index());
+                    bpc = r.pos();
 
                     predicate!(pred_col);
 
-                    let (cmp_raw, cmp_idx) = if parent_ts_col != 0xFF {
+                    let (cmp_raw, cmp_idx) = if parent_ts_col != NO_PARENT_TS_COL {
                         (col_at(cols, parent_ts_col as usize), parent_idx)
                     } else {
                         (col_at(cols, ts_col as usize), child_idx)
@@ -4084,9 +4184,13 @@ impl Vm {
 
                 // MAP_UPSERT_FIRST_IF (0x29) / LAST_IF (0x2A)
                 Opcode::BatchMapUpsertFirstIf | Opcode::BatchMapUpsertLastIf => {
-                    let (slot, key_col, val_col, pred_col) =
-                        (body[bpc + 1], body[bpc + 2], body[bpc + 3], body[bpc + 4]);
-                    bpc += 5;
+                    let (slot, key_col, val_col, pred_col) = (
+                        operand!(r.index()),
+                        operand!(r.index()),
+                        operand!(r.index()),
+                        operand!(r.index()),
+                    );
+                    bpc = r.pos();
 
                     predicate!(pred_col);
 
@@ -4095,7 +4199,7 @@ impl Vm {
                         (Strategy::First, 0u64)
                     } else {
                         let ttl_cmp = if meta.has_ttl() {
-                            cell_f64(cols, meta.timestamp_field_idx(state), child_idx).to_bits()
+                            cell_f64(cols, meta.timestamp_col(state), child_idx).to_bits()
                         } else {
                             0
                         };
@@ -4121,8 +4225,12 @@ impl Vm {
 
                 // MAP_REMOVE_IF (0x2B)
                 Opcode::BatchMapRemoveIf => {
-                    let (slot, key_col, pred_col) = (body[bpc + 1], body[bpc + 2], body[bpc + 3]);
-                    bpc += 4;
+                    let (slot, key_col, pred_col) = (
+                        operand!(r.index()),
+                        operand!(r.index()),
+                        operand!(r.index()),
+                    );
+                    bpc = r.pos();
                     predicate!(pred_col);
                     let meta = SlotMetaView::read(state, slot);
                     hashmap_ops::single_map_remove(
@@ -4137,13 +4245,17 @@ impl Vm {
 
                 // MAP_UPSERT_MAX_IF (0x2C) / MIN_IF (0x2D)
                 Opcode::BatchMapUpsertMaxIf | Opcode::BatchMapUpsertMinIf => {
-                    let (slot, key_col, val_col, cmp_col) =
-                        (body[bpc + 1], body[bpc + 2], body[bpc + 3], body[bpc + 4]);
-                    let Some(cmp_type) = CmpType::from_u8(body[bpc + 5]) else {
+                    let (slot, key_col, val_col, cmp_col) = (
+                        operand!(r.index()),
+                        operand!(r.index()),
+                        operand!(r.index()),
+                        operand!(r.index()),
+                    );
+                    let Some(cmp_type) = CmpType::from_u8(operand!(r.byte())) else {
                         return INVALID_PROGRAM;
                     };
-                    let pred_col = body[bpc + 6];
-                    bpc += 7;
+                    let pred_col = operand!(r.index());
+                    bpc = r.pos();
 
                     predicate!(pred_col);
 
@@ -4178,11 +4290,11 @@ impl Vm {
 
                 // SET_INSERT and BITMAP_ADD share the single-element set path.
                 Opcode::BatchSetInsert | Opcode::BatchBitmapAdd => {
-                    let (slot, elem_col) = (body[bpc + 1], body[bpc + 2]);
-                    bpc += 3;
+                    let (slot, elem_col) = (operand!(r.index()), operand!(r.index()));
+                    bpc = r.pos();
                     let meta = SlotMetaView::read(state, slot);
                     let ts = if meta.has_ttl() {
-                        cell_f64(cols, meta.timestamp_field_idx(state), child_idx)
+                        cell_f64(cols, meta.timestamp_col(state), child_idx)
                     } else {
                         0.0
                     };
@@ -4202,9 +4314,13 @@ impl Vm {
 
                 // SET_INSERT_TTL (0x32)
                 Opcode::BatchSetInsertTtl => {
-                    let (slot, elem_col, ts_col) = (body[bpc + 1], body[bpc + 2], body[bpc + 3]);
-                    bpc += 4;
-                    let ts = if parent_ts_col != 0xFF {
+                    let (slot, elem_col, ts_col) = (
+                        operand!(r.index()),
+                        operand!(r.index()),
+                        operand!(r.index()),
+                    );
+                    bpc = r.pos();
+                    let ts = if parent_ts_col != NO_PARENT_TS_COL {
                         cell_f64(cols, parent_ts_col, parent_idx)
                     } else {
                         cell_f64(cols, ts_col, child_idx)
@@ -4226,12 +4342,16 @@ impl Vm {
 
                 // SET_INSERT_IF (0x33)
                 Opcode::BatchSetInsertIf => {
-                    let (slot, elem_col, pred_col) = (body[bpc + 1], body[bpc + 2], body[bpc + 3]);
-                    bpc += 4;
+                    let (slot, elem_col, pred_col) = (
+                        operand!(r.index()),
+                        operand!(r.index()),
+                        operand!(r.index()),
+                    );
+                    bpc = r.pos();
                     predicate!(pred_col);
                     let meta = SlotMetaView::read(state, slot);
                     let ts = if meta.has_ttl() {
-                        cell_f64(cols, meta.timestamp_field_idx(state), child_idx)
+                        cell_f64(cols, meta.timestamp_col(state), child_idx)
                     } else {
                         0.0
                     };
@@ -4251,8 +4371,8 @@ impl Vm {
 
                 // SET_REMOVE (0x31) / BITMAP_REMOVE (0x35)
                 Opcode::BatchSetRemove | Opcode::BatchBitmapRemove => {
-                    let (slot, elem_col) = (body[bpc + 1], body[bpc + 2]);
-                    bpc += 3;
+                    let (slot, elem_col) = (operand!(r.index()), operand!(r.index()));
+                    bpc = r.pos();
                     let meta = SlotMetaView::read(state, slot);
                     let result = self.set_remove(
                         delta_mode,
@@ -4279,27 +4399,13 @@ impl Vm {
                     };
                     bpc = operands.end;
 
-                    let scalar_pairs_end = operands.scalar_pairs_start + operands.num_vals * 2;
-                    let scalar_pairs = &body[operands.scalar_pairs_start..scalar_pairs_end];
-                    let mut vc = [0u8; MAX_STRUCT_SCALAR_OPERANDS];
-                    let mut fi = [0u8; MAX_STRUCT_SCALAR_OPERANDS];
-                    for (vi, pair) in scalar_pairs.as_chunks::<2>().0.iter().enumerate() {
-                        vc[vi] = pair[0];
-                        fi[vi] = pair[1];
-                    }
-
-                    let array_end = operands.array_triples_start + operands.num_array_vals * 3;
-                    let array_fields = body[operands.array_triples_start..array_end]
-                        .as_chunks::<3>()
-                        .0;
-
                     let smap = StructMapSlot::bind(state, operands.slot);
                     let comparison = match operands.comparison_field_idx {
                         Some(field_idx) => {
                             let Some(comparison) = resolve_struct_map_max_comparison(
                                 state,
                                 &smap,
-                                scalar_pairs,
+                                &operands.vals,
                                 field_idx,
                             ) else {
                                 return INVALID_PROGRAM;
@@ -4329,9 +4435,9 @@ impl Vm {
                             &smap,
                             operands.slot,
                             key,
-                            &vc[..operands.num_vals],
-                            &fi[..operands.num_vals],
-                            array_fields,
+                            operands.vals.cols(),
+                            operands.vals.fields(),
+                            operands.array_fields(),
                             cols,
                             child_idx,
                         );
@@ -4347,18 +4453,6 @@ impl Vm {
                         return INVALID_PROGRAM;
                     };
                     bpc = operands.end;
-                    let pairs_end = operands.scalar_pairs_start + operands.num_vals * 2;
-                    let mut val_cols = [0u8; MAX_STRUCT_SCALAR_OPERANDS];
-                    let mut field_idxs = [0u8; MAX_STRUCT_SCALAR_OPERANDS];
-                    for (index, pair) in body[operands.scalar_pairs_start..pairs_end]
-                        .as_chunks::<2>()
-                        .0
-                        .iter()
-                        .enumerate()
-                    {
-                        val_cols[index] = pair[0];
-                        field_idxs[index] = pair[1];
-                    }
                     let result = single_struct_map2_upsert_last(
                         &mut self.undo,
                         delta_mode,
@@ -4366,8 +4460,8 @@ impl Vm {
                         operands.slot,
                         cell_u32(cols, operands.key1_col, child_idx),
                         cell_u32(cols, operands.key2_col, child_idx),
-                        &val_cols[..operands.num_vals],
-                        &field_idxs[..operands.num_vals],
+                        operands.vals.cols(),
+                        operands.vals.fields(),
                         cols,
                         child_idx,
                     );
@@ -4385,15 +4479,14 @@ impl Vm {
                     };
                     bpc = operands.end;
                     let smap = StructMap2Slot::bind(state, operands.row.slot);
-                    if !validate_struct_map2_max_i64x2(state, &smap, body, operands) {
+                    if !validate_struct_map2_max_i64x2(state, &smap, &operands) {
                         return INVALID_PROGRAM;
                     }
                     let result = single_struct_map2_upsert_max_i64x2(
                         &mut self.undo,
                         delta_mode,
                         state,
-                        body,
-                        operands,
+                        &operands,
                         cell_u32(cols, operands.row.key1_col, child_idx),
                         cell_u32(cols, operands.row.key2_col, child_idx),
                         cols,
@@ -4407,8 +4500,12 @@ impl Vm {
                     }
                 }
                 Opcode::BatchStructMap2Remove => {
-                    let (slot, key1_col, key2_col) = (body[bpc + 1], body[bpc + 2], body[bpc + 3]);
-                    bpc += 4;
+                    let (slot, key1_col, key2_col) = (
+                        operand!(r.index()),
+                        operand!(r.index()),
+                        operand!(r.index()),
+                    );
+                    bpc = r.pos();
                     let result = single_struct_map2_remove(
                         &mut self.undo,
                         delta_mode,
@@ -4425,24 +4522,23 @@ impl Vm {
                 //#region reduce-typed-state.probe-exec
                 // STRUCT_MAP_PROBE (0x2e)
                 Opcode::BatchStructMapProbe => {
-                    let (probe_slot, key_col, _miss_mode, out_slot, num_fields) = (
-                        body[bpc + 1],
-                        body[bpc + 2],
-                        body[bpc + 3],
-                        body[bpc + 4],
-                        body[bpc + 5] as usize,
-                    );
-                    bpc += 6;
+                    let probe_slot = operand!(r.index());
+                    let key_col = operand!(r.index());
+                    let _miss_mode = operand!(r.byte());
+                    let out_slot = operand!(r.index());
+                    let num_fields = usize::from(operand!(r.byte()));
+                    if num_fields > 32 {
+                        return INVALID_PROGRAM;
+                    }
 
                     let mut probe_fis = [0u8; 32];
                     let mut out_fis = [0u8; 32];
                     for f in 0..num_fields {
-                        probe_fis[f] = body[bpc];
-                        out_fis[f] = body[bpc + 1];
-                        bpc += 2;
+                        probe_fis[f] = operand!(r.byte());
+                        out_fis[f] = operand!(r.byte());
                     }
-                    let out_key_col = body[bpc];
-                    bpc += 1;
+                    let out_key_col = operand!(r.index());
+                    bpc = r.pos();
 
                     let key = cell_u32(cols, key_col, child_idx);
                     let probe = StructMapSlot::bind(state, probe_slot);
@@ -4475,39 +4571,29 @@ impl Vm {
                 //#region reduce-typed-state.scatter-exec
                 // STRUCT_MAP_PROBE_SCATTER (0x2f)
                 Opcode::BatchStructMapProbeScatter => {
-                    let (
-                        probe_slot,
-                        key_col,
-                        _miss_mode,
-                        route_field_idx,
-                        op_field_idx,
-                        num_routes,
-                    ) = (
-                        body[bpc + 1],
-                        body[bpc + 2],
-                        body[bpc + 3],
-                        body[bpc + 4],
-                        body[bpc + 5],
-                        body[bpc + 6] as usize,
-                    );
+                    let probe_slot = operand!(r.index());
+                    let key_col = operand!(r.index());
+                    let _miss_mode = operand!(r.byte());
+                    let route_field_idx = operand!(r.byte());
+                    let op_field_idx = operand!(r.byte());
+                    let num_routes = usize::from(operand!(r.byte()));
                     if num_routes > MAX_SCATTER_ROUTES {
                         return INVALID_PROGRAM;
                     }
-                    bpc += 7;
 
-                    let mut route_kinds = [0u8; 32];
-                    let mut route_dest_slots = [0u8; 32];
-                    let mut route_dest_fields = [0u8; 32];
-                    let mut route_out_key_fields = [0u8; 32];
-                    let mut route_v_src_fields = [0u8; 32];
+                    let mut route_kinds = [0u8; MAX_SCATTER_ROUTES];
+                    let mut route_dest_slots = [0u32; MAX_SCATTER_ROUTES];
+                    let mut route_dest_fields = [0u8; MAX_SCATTER_ROUTES];
+                    let mut route_out_key_fields = [0u8; MAX_SCATTER_ROUTES];
+                    let mut route_v_src_fields = [0u8; MAX_SCATTER_ROUTES];
                     for ri in 0..num_routes {
-                        route_kinds[ri] = body[bpc];
-                        route_dest_slots[ri] = body[bpc + 1];
-                        route_dest_fields[ri] = body[bpc + 2];
-                        route_out_key_fields[ri] = body[bpc + 3];
-                        route_v_src_fields[ri] = body[bpc + 4];
-                        bpc += 5;
+                        route_kinds[ri] = operand!(r.byte());
+                        route_dest_slots[ri] = operand!(r.index());
+                        route_dest_fields[ri] = operand!(r.byte());
+                        route_out_key_fields[ri] = operand!(r.byte());
+                        route_v_src_fields[ri] = operand!(r.byte());
                     }
+                    bpc = r.pos();
 
                     let key = cell_u32(cols, key_col, child_idx);
                     let probe = StructMapSlot::bind(state, probe_slot);
@@ -4680,28 +4766,25 @@ impl Vm {
                 // arms, the identical-assert no-op, and the retract-iff-current
                 // rule are byte-identical to 0x2f minus the probe.
                 Opcode::BatchStructMapScatter => {
-                    let (route_col, op_col, key_col, num_routes) = (
-                        body[bpc + 1],
-                        body[bpc + 2],
-                        body[bpc + 3],
-                        body[bpc + 4] as usize,
-                    );
+                    let route_col = operand!(r.index());
+                    let op_col = operand!(r.index());
+                    let key_col = operand!(r.index());
+                    let num_routes = usize::from(operand!(r.byte()));
                     if num_routes > MAX_SCATTER_ROUTES {
                         return INVALID_PROGRAM;
                     }
-                    bpc += 5;
 
-                    let mut route_kinds = [0u8; 32];
-                    let mut route_dest_slots = [0u8; 32];
-                    let mut route_dest_fields = [0u8; 32];
-                    let mut route_v_cols = [0u8; 32];
+                    let mut route_kinds = [0u8; MAX_SCATTER_ROUTES];
+                    let mut route_dest_slots = [0u32; MAX_SCATTER_ROUTES];
+                    let mut route_dest_fields = [0u8; MAX_SCATTER_ROUTES];
+                    let mut route_v_cols = [0u32; MAX_SCATTER_ROUTES];
                     for ri in 0..num_routes {
-                        route_kinds[ri] = body[bpc];
-                        route_dest_slots[ri] = body[bpc + 1];
-                        route_dest_fields[ri] = body[bpc + 2];
-                        route_v_cols[ri] = body[bpc + 3];
-                        bpc += 4;
+                        route_kinds[ri] = operand!(r.byte());
+                        route_dest_slots[ri] = operand!(r.index());
+                        route_dest_fields[ri] = operand!(r.byte());
+                        route_v_cols[ri] = operand!(r.index());
                     }
+                    bpc = r.pos();
 
                     let key = cell_u32(cols, key_col, child_idx);
                     if key == EMPTY_KEY || key == TOMBSTONE {
@@ -4884,34 +4967,29 @@ impl Vm {
                 // behind the transaction that just won would let a
                 // transaction between the two write over it afterwards.
                 Opcode::BatchStructMapScatterGuarded => {
-                    let (route_col, op_col, key_col, guard_slot, num_guards) = (
-                        body[bpc + 1],
-                        body[bpc + 2],
-                        body[bpc + 3],
-                        body[bpc + 4],
-                        body[bpc + 5] as usize,
-                    );
-                    let Some(guard) = GuardTuple::decode(body, bpc + 6, num_guards) else {
+                    let route_col = operand!(r.index());
+                    let op_col = operand!(r.index());
+                    let key_col = operand!(r.index());
+                    let guard_slot = operand!(r.index());
+                    let num_guards = usize::from(operand!(r.byte()));
+                    let Some(guard) = GuardTuple::decode(&mut r, num_guards) else {
                         return INVALID_PROGRAM;
                     };
-                    bpc += 6 + num_guards * 2;
 
-                    let num_routes = body[bpc] as usize;
+                    let num_routes = usize::from(operand!(r.byte()));
                     if num_routes > MAX_SCATTER_ROUTES {
                         return INVALID_PROGRAM;
                     }
-                    bpc += 1;
 
                     let mut route_kinds = [0u8; MAX_SCATTER_ROUTES];
-                    let mut route_dest_slots = [0u8; MAX_SCATTER_ROUTES];
+                    let mut route_dest_slots = [0u32; MAX_SCATTER_ROUTES];
                     let mut route_dest_fields = [0u8; MAX_SCATTER_ROUTES];
-                    let mut route_v_cols = [0u8; MAX_SCATTER_ROUTES];
+                    let mut route_v_cols = [0u32; MAX_SCATTER_ROUTES];
                     for ri in 0..num_routes {
-                        route_kinds[ri] = body[bpc];
-                        route_dest_slots[ri] = body[bpc + 1];
-                        route_dest_fields[ri] = body[bpc + 2];
-                        route_v_cols[ri] = body[bpc + 3];
-                        bpc += 4;
+                        route_kinds[ri] = operand!(r.byte());
+                        route_dest_slots[ri] = operand!(r.index());
+                        route_dest_fields[ri] = operand!(r.byte());
+                        route_v_cols[ri] = operand!(r.index());
                         // The guarded row IS the destination row. A kind-0
                         // route pointing elsewhere would be a card-one write
                         // gated by a guard no row of its own slot keeps —
@@ -4921,6 +4999,7 @@ impl Vm {
                             return INVALID_PROGRAM;
                         }
                     }
+                    bpc = r.pos();
 
                     let key = cell_u32(cols, key_col, child_idx);
                     if key == EMPTY_KEY || key == TOMBSTONE {
@@ -5132,8 +5211,8 @@ impl Vm {
 
                 // LIST_APPEND (0x84)
                 Opcode::ListAppend => {
-                    let (slot, val_col) = (body[bpc + 1], body[bpc + 2]);
-                    bpc += 3;
+                    let (slot, val_col) = (operand!(r.index()), operand!(r.index()));
+                    bpc = r.pos();
 
                     // Read the repurposed ORDERED_LIST metadata fields directly.
                     let meta_base = slot_meta_base(slot);
@@ -5197,16 +5276,13 @@ impl Vm {
 
                 // LIST_APPEND_STRUCT (0x85)
                 Opcode::ListAppendStruct => {
-                    let (slot, num_vals) = (body[bpc + 1], body[bpc + 2] as usize);
-                    bpc += 3;
-
-                    let mut vc = [0u8; 32];
-                    let mut fi = [0u8; 32];
-                    for vi in 0..num_vals {
-                        vc[vi] = body[bpc];
-                        fi[vi] = body[bpc + 1];
-                        bpc += 2;
-                    }
+                    let slot = operand!(r.index());
+                    let num_vals = usize::from(operand!(r.byte()));
+                    let Some(vals) = ScalarOperands::decode(&mut r, num_vals, 0) else {
+                        return INVALID_PROGRAM;
+                    };
+                    bpc = r.pos();
+                    let (vc, fi) = (vals.cols(), vals.fields());
 
                     let meta_base = slot_meta_base(slot);
                     let slot_offset = bytes::read_u32(state, meta_base + SlotMetaOffset::OFFSET);
@@ -5214,7 +5290,7 @@ impl Vm {
                     let mut count = bytes::read_u32(state, meta_base + SlotMetaOffset::SIZE);
                     let num_fields = state[(meta_base + SlotMetaOffset::AGG_TYPE) as usize];
                     let bitset_bytes = u32::from(
-                        state[(meta_base + SlotMetaOffset::TIMESTAMP_FIELD_IDX) as usize],
+                        state[(meta_base + SlotMetaOffset::STRUCT_BITSET_BYTES) as usize],
                     );
                     let row_size = u32::from(bytes::read_u16(
                         state,
@@ -5313,14 +5389,11 @@ impl Vm {
 
                 // FLAT_MAP (0xE1)
                 Opcode::FlatMap => {
-                    let offsets_col = body[bpc + 1];
-                    let inner_parent_ts_col = body[bpc + 2];
-                    let inner_body_len =
-                        usize::from(body[bpc + 3]) | (usize::from(body[bpc + 4]) << 8);
-                    bpc += 5;
-
-                    let inner_body = &body[bpc..bpc + inner_body_len];
-                    bpc += inner_body_len;
+                    let offsets_col = operand!(r.index());
+                    let inner_parent_ts_col = operand!(r.index());
+                    let inner_body_len = usize::from(operand!(r.u16()));
+                    let inner_body = operand!(r.bytes(inner_body_len));
+                    bpc = r.pos();
 
                     let start = cell_u32(cols, offsets_col, child_idx);
                     let end = cell_u32(cols, offsets_col, child_idx + 1);
@@ -5344,9 +5417,12 @@ impl Vm {
 
                 // NESTED_SET_INSERT (0x90)
                 Opcode::NestedSetInsert => {
-                    let (slot, outer_key_col, elem_col) =
-                        (body[bpc + 1], body[bpc + 2], body[bpc + 3]);
-                    bpc += 4;
+                    let (slot, outer_key_col, elem_col) = (
+                        operand!(r.index()),
+                        operand!(r.index()),
+                        operand!(r.index()),
+                    );
+                    bpc = r.pos();
                     let meta = SlotMetaView::read(state, slot);
                     let journal_ranges = nested_journal_ranges(state, &meta);
                     let captured = self.undo.begin_state_capture(state, &journal_ranges, 0);
@@ -5368,9 +5444,13 @@ impl Vm {
 
                 // NESTED_MAP_UPSERT_LAST (0x92)
                 Opcode::NestedMapUpsertLast => {
-                    let (slot, outer_key_col, inner_key_col, val_col) =
-                        (body[bpc + 1], body[bpc + 2], body[bpc + 3], body[bpc + 4]);
-                    bpc += 5;
+                    let (slot, outer_key_col, inner_key_col, val_col) = (
+                        operand!(r.index()),
+                        operand!(r.index()),
+                        operand!(r.index()),
+                        operand!(r.index()),
+                    );
+                    bpc = r.pos();
                     let meta = SlotMetaView::read(state, slot);
                     let journal_ranges = nested_journal_ranges(state, &meta);
                     let captured = self.undo.begin_state_capture(state, &journal_ranges, 0);
@@ -5393,9 +5473,12 @@ impl Vm {
 
                 // NESTED_AGG_UPDATE (0x95)
                 Opcode::NestedAggUpdate => {
-                    let (slot, outer_key_col, val_col) =
-                        (body[bpc + 1], body[bpc + 2], body[bpc + 3]);
-                    bpc += 4;
+                    let (slot, outer_key_col, val_col) = (
+                        operand!(r.index()),
+                        operand!(r.index()),
+                        operand!(r.index()),
+                    );
+                    bpc = r.pos();
                     let meta = SlotMetaView::read(state, slot);
                     let journal_ranges = nested_journal_ranges(state, &meta);
                     let captured = self.undo.begin_state_capture(state, &journal_ranges, 0);
@@ -5691,8 +5774,7 @@ pub fn vm_set_iter_get(state: &[u8], slot_offset: u32, pos: u32) -> u32 {
 
 /// Find slot metadata by its data offset.
 pub fn find_slot_meta_by_offset(state: &[u8], slot_offset: u32) -> Option<SlotMetaView> {
-    let num_slots = state[StateHeaderOffset::NUM_SLOTS as usize];
-    (0..num_slots)
+    (0..state_num_slots(state))
         .map(|slot| SlotMetaView::read(state, slot))
         .find(|meta| meta.offset == slot_offset)
 }

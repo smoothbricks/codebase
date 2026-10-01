@@ -18,9 +18,9 @@
 
 use columine_types::audit_parser::{enum_decls, norm};
 use columine_types::types::{
-    AggType, CmpType, DurationUnit, EVICTION_ENTRY_SIZE, ErrorCode, Opcode, PROGRAM_HASH_PREFIX,
-    PROGRAM_MAGIC, ProgramHeader, SLOT_META_SIZE, STATE_HEADER_SIZE, SlotMetaOffset, SlotType,
-    StructFieldType,
+    AggType, CmpType, DurationUnit, EVICTION_ENTRY_SIZE, ErrorCode, NO_PARENT_TS_COL, Opcode,
+    PROGRAM_FORMAT_VERSION, PROGRAM_HASH_PREFIX, PROGRAM_MAGIC, ProgramHeader, SLOT_META_SIZE,
+    STATE_HEADER_SIZE, SlotMetaOffset, SlotType, StructFieldType,
 };
 use std::collections::BTreeMap;
 
@@ -174,6 +174,14 @@ fn typescript_error_code_enum_matches_rust() {
 fn typescript_program_constants_match_rust() {
     let source = read(&types_ts());
     assert_eq!(ts_const(&source, "PROGRAM_MAGIC"), u64::from(PROGRAM_MAGIC));
+    assert_eq!(
+        ts_const(&source, "PROGRAM_FORMAT_VERSION"),
+        u64::from(PROGRAM_FORMAT_VERSION)
+    );
+    assert_eq!(
+        ts_const(&source, "NO_PARENT_TS_COL"),
+        u64::from(NO_PARENT_TS_COL)
+    );
     assert_eq!(
         ts_const(&source, "HEADER_SIZE"),
         ProgramHeader::WIRE_SIZE as u64

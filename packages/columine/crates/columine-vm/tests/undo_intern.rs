@@ -15,9 +15,9 @@ use columine_vm::hashset_ops::batch_set_remove;
 use columine_vm::hooks::NoVm;
 use columine_vm::meta::SlotMetaView;
 use columine_vm::undo_log::{
-    FLAT_UNDO_ENTRY_SIZE, FlatUndoEntry, FlatUndoOp, rollback_agg_update, rollback_count_update,
-    rollback_map_delete, rollback_map_insert, rollback_map_update, rollback_set_delete,
-    rollback_set_insert,
+    DERIVED_FACT_SLOT, FLAT_UNDO_ENTRY_SIZE, FlatUndoEntry, FlatUndoOp, rollback_agg_update,
+    rollback_count_update, rollback_map_delete, rollback_map_insert, rollback_map_update,
+    rollback_set_delete, rollback_set_insert,
 };
 use columine_vm::vm::{Vm, rollback_entry, write_derived_facts_header};
 use proptest::prelude::*;
@@ -409,7 +409,7 @@ proptest! {
     #[test]
     fn flat_undo_entry_wire_round_trip(
         op_byte in 1u8..=15,
-        slot in prop::num::u8::ANY,
+        slot in prop::num::u32::ANY,
         pad1 in prop::num::u8::ANY,
         pad2 in prop::num::u8::ANY,
         key in prop::num::u32::ANY,
@@ -492,7 +492,7 @@ fn fact_entry(
     let [pad1, pad2] = fact_idx.to_le_bytes();
     FlatUndoEntry {
         op,
-        slot: u8::MAX,
+        slot: DERIVED_FACT_SLOT,
         pad1,
         pad2,
         key,

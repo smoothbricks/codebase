@@ -22,7 +22,8 @@
 //!
 //! [`LiveColumns`]: crate::row_exprs::LiveColumns
 
-use columine_types::types::{ErrorCode, Opcode, PROGRAM_HASH_PREFIX, ProgramHeader};
+use columine_types::operand::Operands;
+use columine_types::types::{ErrorCode, NO_PARENT_TS_COL, Opcode, ProgramHeader};
 
 use crate::meta::SlotMetaView;
 use crate::vm::{
@@ -40,9 +41,6 @@ pub enum ColumnUse {
     ElementPredicate,
 }
 
-/// Unset parent timestamp column of a `FLAT_MAP` body.
-const NO_PARENT_TS_COL: u8 = 0xFF;
-
 /// Visit every column operand of `program`'s reduce section. `state` is the
 /// initialised state the program runs against: a `BatchMapUpsertLast` on a
 /// TTL slot reads the slot's timestamp column, which only the state names.
@@ -50,21 +48,10 @@ const NO_PARENT_TS_COL: u8 = 0xFF;
 pub fn reduce_column_uses(
     program: &[u8],
     state: &[u8],
-    visit: &mut dyn FnMut(u8, ColumnUse),
+    visit: &mut dyn FnMut(u32, ColumnUse),
 ) -> Result<(), ErrorCode> {
-    let content = program
-        .get(PROGRAM_HASH_PREFIX as usize..)
-        .ok_or(ErrorCode::InvalidProgram)?;
-    let header_bytes = content
-        .get(..ProgramHeader::WIRE_SIZE)
-        .and_then(|bytes| <[u8; ProgramHeader::WIRE_SIZE]>::try_from(bytes).ok())
-        .ok_or(ErrorCode::InvalidProgram)?;
-    let header = ProgramHeader::from_wire_bytes(header_bytes);
-    let code_start = ProgramHeader::WIRE_SIZE + usize::from(header.init_code_len);
-    let code = content
-        .get(code_start..code_start + usize::from(header.reduce_code_len))
-        .ok_or(ErrorCode::InvalidProgram)?;
-    walk(code, state, false, visit)
+    let sections = ProgramHeader::sections(program).ok_or(ErrorCode::InvalidProgram)?;
+    walk(sections.reduce_code, state, false, visit)
 }
 
 /// Walk one instruction sequence: the top level (`element == false`, where
@@ -74,7 +61,7 @@ fn walk(
     code: &[u8],
     state: &[u8],
     element: bool,
-    visit: &mut dyn FnMut(u8, ColumnUse),
+    visit: &mut dyn FnMut(u32, ColumnUse),
 ) -> Result<(), ErrorCode> {
     let predicate = if element {
         ColumnUse::ElementPredicate
@@ -85,202 +72,245 @@ fn walk(
     while pc < code.len() {
         let op = Opcode::from_u8(code[pc]).ok_or(ErrorCode::InvalidProgram)?;
         let len = body_op_len(code, pc).ok_or(ErrorCode::InvalidProgram)?;
-        // `body_op_len` proved `code[pc..pc + len]` is in bounds.
-        let ops = &code[pc + 1..pc + len];
-        match op {
-            Opcode::Halt => break,
-            Opcode::BatchMapUpsertLatest | Opcode::BatchMapUpsertLatestTtl => {
-                read(visit, &ops[1..4]);
-            }
-            Opcode::BatchMapUpsertFirst => read(visit, &ops[1..3]),
-            Opcode::BatchMapUpsertLast => {
-                read(visit, &ops[1..3]);
-                // The TTL slot's timestamp column is named by the slot, not
-                // the instruction.
-                let meta = SlotMetaView::read(state, ops[0]);
-                if meta.has_ttl() {
-                    visit(meta.timestamp_field_idx(state), ColumnUse::Read);
-                }
-            }
-            Opcode::BatchMapRemove => read(visit, &ops[1..2]),
-            Opcode::BatchMapUpsertLastTtl => read(visit, &ops[1..4]),
-            Opcode::BatchMapUpsertMax | Opcode::BatchMapUpsertMin => read(visit, &ops[1..4]),
-            Opcode::BatchMapUpsertLatestIf => {
-                read(visit, &ops[1..4]);
-                visit(ops[5], predicate);
-            }
-            Opcode::BatchMapUpsertFirstIf | Opcode::BatchMapUpsertLastIf => {
-                read(visit, &ops[1..3]);
-                visit(ops[3], predicate);
-            }
-            Opcode::BatchMapRemoveIf => {
-                read(visit, &ops[1..2]);
-                visit(ops[2], predicate);
-            }
-            Opcode::BatchMapUpsertMaxIf | Opcode::BatchMapUpsertMinIf => {
-                read(visit, &ops[1..4]);
-                visit(ops[5], predicate);
-            }
-            Opcode::BatchStructMapProbe => {
-                // probe_slot, key, miss_mode, out_slot, num_fields,
-                // (probe_field, out_field) × num_fields, out_key.
-                visit(ops[1], ColumnUse::Read);
-                let num_fields = usize::from(ops[4]);
-                visit(ops[5 + num_fields * 2], ColumnUse::Read);
-            }
-            Opcode::BatchStructMapProbeScatter => visit(ops[1], ColumnUse::Read),
-            Opcode::BatchStructMapScatter => {
-                // ops[0]=route_col, ops[1]=op_col, ops[2]=key_col,
-                // ops[3]=num_routes, then [kind, dest_slot, dest_field, v_col]
-                // × num_routes — the route table's v columns are reads too.
-                read(visit, &ops[0..3]);
-                let num_routes = usize::from(ops[3]);
-                for ri in 0..num_routes {
-                    visit(ops[4 + ri * 4 + 3], ColumnUse::Read);
-                }
-            }
-            Opcode::BatchStructMapScatterGuarded => {
-                // ops[0]=route_col, ops[1]=op_col, ops[2]=key_col,
-                // ops[3]=guard_slot, ops[4]=num_guards, then
-                // [guard_col, guard_field] × num_guards, num_routes, then
-                // [kind, dest_slot, dest_field, v_col] × num_routes.
-                //
-                // A guard column is READ and never written, and it is read
-                // by the dispatch straight out of the batch's bytes. Leave
-                // it out and a derived guard column deferred to the reduce
-                // section binds as live, where the batch carries zeros for
-                // it — the guard would then order every element against
-                // zero and silently let stale transactions through. Naming
-                // it here is what turns that into a refusal.
-                read(visit, &ops[0..3]);
-                let num_guards = usize::from(ops[4]);
-                for gi in 0..num_guards {
-                    visit(ops[5 + gi * 2], ColumnUse::Read);
-                }
-                let routes_at = 5 + num_guards * 2;
-                let num_routes = usize::from(ops[routes_at]);
-                for ri in 0..num_routes {
-                    visit(ops[routes_at + 1 + ri * 4 + 3], ColumnUse::Read);
-                }
-            }
-            Opcode::BatchSetInsert
-            | Opcode::BatchSetRemove
-            | Opcode::BatchBitmapAdd
-            | Opcode::BatchBitmapRemove => visit(ops[1], ColumnUse::Read),
-            Opcode::BatchBitmapAnd
-            | Opcode::BatchBitmapOr
-            | Opcode::BatchBitmapAndNot
-            | Opcode::BatchBitmapXor
-            | Opcode::BatchBitmapAndScratch
-            | Opcode::BatchBitmapOrScratch
-            | Opcode::BatchBitmapAndNotScratch
-            | Opcode::BatchBitmapXorScratch
-            | Opcode::BatchAggCount => {}
-            Opcode::BatchSetInsertTtl => read(visit, &ops[1..3]),
-            Opcode::BatchSetInsertIf => {
-                visit(ops[1], ColumnUse::Read);
-                visit(ops[2], predicate);
-            }
-            Opcode::BatchAggSum
-            | Opcode::BatchAggMin
-            | Opcode::BatchAggMax
-            | Opcode::BatchAggSumI64
-            | Opcode::BatchAggMinI64
-            | Opcode::BatchAggMaxI64
-            | Opcode::ListAppend => visit(ops[1], ColumnUse::Read),
-            // The aggregate pass reads its predicate from the batch's bytes,
-            // never through the live handle.
-            Opcode::BatchAggSumIf
-            | Opcode::BatchAggMinIf
-            | Opcode::BatchAggMaxIf
-            | Opcode::BatchScalarLatest => read(visit, &ops[1..3]),
-            Opcode::BatchAggCountIf => visit(ops[1], ColumnUse::Read),
-            Opcode::BatchStructMapUpsertLast
-            | Opcode::BatchStructMapUpsertFirst
-            | Opcode::BatchStructMapUpsertMax => {
-                let operands = decode_struct_map_upsert_operands(
-                    code,
-                    pc + 1,
-                    op == Opcode::BatchStructMapUpsertMax,
-                )
-                .ok_or(ErrorCode::InvalidProgram)?;
-                visit(operands.key_col, ColumnUse::Read);
-                let pairs_end = operands.scalar_pairs_start + operands.num_vals * 2;
-                for pair in code[operands.scalar_pairs_start..pairs_end]
-                    .as_chunks::<2>()
-                    .0
-                {
-                    visit(pair[0], ColumnUse::Read);
-                }
-                let triples_end = operands.array_triples_start + operands.num_array_vals * 3;
-                for triple in code[operands.array_triples_start..triples_end]
-                    .as_chunks::<3>()
-                    .0
-                {
-                    visit(triple[0], ColumnUse::Read);
-                    visit(triple[1], ColumnUse::Read);
-                }
-            }
-            Opcode::BatchStructMap2UpsertLast => {
-                let operands = decode_struct_map2_upsert_operands(code, pc + 1)
-                    .ok_or(ErrorCode::InvalidProgram)?;
-                struct_map2_reads(code, operands, visit);
-            }
-            Opcode::BatchStructMap2UpsertMaxI64x2 => {
-                let operands = decode_struct_map2_max_i64x2_operands(code, pc + 1)
-                    .ok_or(ErrorCode::InvalidProgram)?;
-                struct_map2_reads(code, operands.row, visit);
-                visit(operands.cmp1_col, ColumnUse::Read);
-                visit(operands.cmp2_col, ColumnUse::Read);
-            }
-            Opcode::BatchStructMap2Remove => read(visit, &ops[1..3]),
-            Opcode::ListAppendStruct => {
-                // slot, num_vals, (col, field) × num_vals.
-                for pair in ops[2..].as_chunks::<2>().0 {
-                    visit(pair[0], ColumnUse::Read);
-                }
-            }
-            Opcode::NestedSetInsert | Opcode::NestedAggUpdate => read(visit, &ops[1..3]),
-            Opcode::NestedMapUpsertLast => read(visit, &ops[1..4]),
-            Opcode::FlatMap => {
-                // offsets, parent_ts, body_len u16, body.
-                visit(ops[0], ColumnUse::Read);
-                if ops[1] != NO_PARENT_TS_COL {
-                    visit(ops[1], ColumnUse::Read);
-                }
-                walk(&ops[4..], state, true, visit)?;
-            }
-            Opcode::ForEach => {
-                // col, match_count, ids u32 × match_count, body_len u16, body.
-                visit(ops[0], ColumnUse::Read);
-                let body_start = 2 + usize::from(ops[1]) * 4 + 2;
-                walk(&ops[body_start..], state, true, visit)?;
-            }
-            _ => return Err(ErrorCode::InvalidProgram),
+        // `body_op_len` proved every operand of `code[pc..pc + len]` decodes.
+        let mut ops = Operands::at(code, pc + 1);
+        walk_op(op, &mut ops, code, pc, state, predicate, visit)
+            .ok_or(ErrorCode::InvalidProgram)??;
+        if op == Opcode::Halt {
+            break;
         }
         pc += len;
     }
     Ok(())
 }
 
-fn read(visit: &mut dyn FnMut(u8, ColumnUse), cols: &[u8]) {
-    for &col in cols {
-        visit(col, ColumnUse::Read);
+/// Visit the column operands of the instruction at `pc` (opcode `op`, its
+/// operands read through `ops`). `None` is a malformed operand.
+fn walk_op(
+    op: Opcode,
+    ops: &mut Operands<'_>,
+    code: &[u8],
+    pc: usize,
+    state: &[u8],
+    predicate: ColumnUse,
+    visit: &mut dyn FnMut(u32, ColumnUse),
+) -> Option<Result<(), ErrorCode>> {
+    // Read `n` index operands as plain column reads.
+    let reads = |ops: &mut Operands<'_>, n: usize, visit: &mut dyn FnMut(u32, ColumnUse)| {
+        for _ in 0..n {
+            visit(ops.index()?, ColumnUse::Read);
+        }
+        Some(())
+    };
+    match op {
+        Opcode::Halt => {}
+        Opcode::BatchMapUpsertLatest | Opcode::BatchMapUpsertLatestTtl => {
+            ops.index()?;
+            reads(ops, 3, visit)?;
+        }
+        Opcode::BatchMapUpsertFirst => {
+            ops.index()?;
+            reads(ops, 2, visit)?;
+        }
+        Opcode::BatchMapUpsertLast => {
+            let slot = ops.index()?;
+            reads(ops, 2, visit)?;
+            // The TTL slot's timestamp column is named by the slot, not the
+            // instruction.
+            let meta = SlotMetaView::read(state, slot);
+            if meta.has_ttl() {
+                visit(meta.timestamp_col(state), ColumnUse::Read);
+            }
+        }
+        Opcode::BatchMapRemove => {
+            ops.index()?;
+            reads(ops, 1, visit)?;
+        }
+        Opcode::BatchMapUpsertLastTtl | Opcode::BatchMapUpsertMax | Opcode::BatchMapUpsertMin => {
+            ops.index()?;
+            reads(ops, 3, visit)?;
+        }
+        Opcode::BatchMapUpsertLatestIf | Opcode::BatchMapUpsertMaxIf | Opcode::BatchMapUpsertMinIf => {
+            ops.index()?;
+            reads(ops, 3, visit)?;
+            ops.byte()?;
+            visit(ops.index()?, predicate);
+        }
+        Opcode::BatchMapUpsertFirstIf | Opcode::BatchMapUpsertLastIf => {
+            ops.index()?;
+            reads(ops, 2, visit)?;
+            visit(ops.index()?, predicate);
+        }
+        Opcode::BatchMapRemoveIf => {
+            ops.index()?;
+            reads(ops, 1, visit)?;
+            visit(ops.index()?, predicate);
+        }
+        Opcode::BatchStructMapProbe => {
+            // probe_slot, key, miss_mode, out_slot, num_fields,
+            // (probe_field, out_field) × num_fields, out_key.
+            ops.index()?;
+            reads(ops, 1, visit)?;
+            ops.byte()?;
+            ops.index()?;
+            let num_fields = usize::from(ops.byte()?);
+            ops.bytes(num_fields * 2)?;
+            reads(ops, 1, visit)?;
+        }
+        Opcode::BatchStructMapProbeScatter => {
+            // probe_slot, key; the rest are fields of the probed row.
+            ops.index()?;
+            reads(ops, 1, visit)?;
+        }
+        Opcode::BatchStructMapScatter => {
+            // route_col, op_col, key_col, num_routes, then
+            // [kind, dest_slot, dest_field, v_col] × num_routes — the route
+            // table's v columns are reads too.
+            reads(ops, 3, visit)?;
+            route_value_reads(ops, visit)?;
+        }
+        Opcode::BatchStructMapScatterGuarded => {
+            // route_col, op_col, key_col, guard_slot, num_guards, then
+            // [guard_col, guard_field] × num_guards, num_routes, then
+            // [kind, dest_slot, dest_field, v_col] × num_routes.
+            //
+            // A guard column is READ and never written, and it is read by the
+            // dispatch straight out of the batch's bytes. Leave it out and a
+            // derived guard column deferred to the reduce section binds as
+            // live, where the batch carries zeros for it — the guard would
+            // then order every element against zero and silently let stale
+            // transactions through. Naming it here is what turns that into a
+            // refusal.
+            reads(ops, 3, visit)?;
+            ops.index()?;
+            let num_guards = ops.byte()?;
+            for _ in 0..num_guards {
+                reads(ops, 1, visit)?;
+                ops.byte()?;
+            }
+            route_value_reads(ops, visit)?;
+        }
+        Opcode::BatchSetInsert
+        | Opcode::BatchSetRemove
+        | Opcode::BatchBitmapAdd
+        | Opcode::BatchBitmapRemove
+        | Opcode::BatchAggSum
+        | Opcode::BatchAggMin
+        | Opcode::BatchAggMax
+        | Opcode::BatchAggSumI64
+        | Opcode::BatchAggMinI64
+        | Opcode::BatchAggMaxI64
+        | Opcode::ListAppend
+        // The aggregate pass reads its predicate from the batch's bytes,
+        // never through the live handle.
+        | Opcode::BatchAggCountIf => {
+            ops.index()?;
+            reads(ops, 1, visit)?;
+        }
+        Opcode::BatchBitmapAnd
+        | Opcode::BatchBitmapOr
+        | Opcode::BatchBitmapAndNot
+        | Opcode::BatchBitmapXor
+        | Opcode::BatchBitmapAndScratch
+        | Opcode::BatchBitmapOrScratch
+        | Opcode::BatchBitmapAndNotScratch
+        | Opcode::BatchBitmapXorScratch
+        | Opcode::BatchAggCount => {}
+        Opcode::BatchSetInsertTtl
+        | Opcode::BatchAggSumIf
+        | Opcode::BatchAggMinIf
+        | Opcode::BatchAggMaxIf
+        | Opcode::BatchScalarLatest
+        | Opcode::BatchStructMap2Remove
+        | Opcode::NestedSetInsert
+        | Opcode::NestedAggUpdate => {
+            ops.index()?;
+            reads(ops, 2, visit)?;
+        }
+        Opcode::BatchSetInsertIf => {
+            ops.index()?;
+            reads(ops, 1, visit)?;
+            visit(ops.index()?, predicate);
+        }
+        Opcode::NestedMapUpsertLast => {
+            ops.index()?;
+            reads(ops, 3, visit)?;
+        }
+        Opcode::BatchStructMapUpsertLast
+        | Opcode::BatchStructMapUpsertFirst
+        | Opcode::BatchStructMapUpsertMax => {
+            let operands =
+                decode_struct_map_upsert_operands(code, pc + 1, op == Opcode::BatchStructMapUpsertMax)?;
+            visit(operands.key_col, ColumnUse::Read);
+            for &col in operands.vals.cols() {
+                visit(col, ColumnUse::Read);
+            }
+            for array in operands.array_fields() {
+                visit(array.offsets_col, ColumnUse::Read);
+                visit(array.values_col, ColumnUse::Read);
+            }
+        }
+        Opcode::BatchStructMap2UpsertLast => {
+            struct_map2_reads(&decode_struct_map2_upsert_operands(code, pc + 1)?, visit);
+        }
+        Opcode::BatchStructMap2UpsertMaxI64x2 => {
+            let operands = decode_struct_map2_max_i64x2_operands(code, pc + 1)?;
+            struct_map2_reads(&operands.row, visit);
+            visit(operands.cmp1_col, ColumnUse::Read);
+            visit(operands.cmp2_col, ColumnUse::Read);
+        }
+        Opcode::ListAppendStruct => {
+            // slot, num_vals, (col, field) × num_vals.
+            ops.index()?;
+            let num_vals = ops.byte()?;
+            for _ in 0..num_vals {
+                reads(ops, 1, visit)?;
+                ops.byte()?;
+            }
+        }
+        Opcode::FlatMap => {
+            // offsets, parent_ts, body_len u16, body.
+            reads(ops, 1, visit)?;
+            let parent_ts = ops.index()?;
+            if parent_ts != NO_PARENT_TS_COL {
+                visit(parent_ts, ColumnUse::Read);
+            }
+            let body_len = usize::from(ops.u16()?);
+            return Some(walk(ops.bytes(body_len)?, state, true, visit));
+        }
+        Opcode::ForEach => {
+            // col, match_count, ids u32 × match_count, body_len u16, body.
+            reads(ops, 1, visit)?;
+            let match_count = usize::try_from(ops.index()?).ok()?;
+            ops.bytes(match_count * 4)?;
+            let body_len = usize::from(ops.u16()?);
+            return Some(walk(ops.bytes(body_len)?, state, true, visit));
+        }
+        _ => return Some(Err(ErrorCode::InvalidProgram)),
     }
+    Some(Ok(()))
+}
+
+/// `num_routes:u8, (kind, dest_slot, dest_field, v_col) × num_routes`: the
+/// value column of every route is a read.
+fn route_value_reads(ops: &mut Operands<'_>, visit: &mut dyn FnMut(u32, ColumnUse)) -> Option<()> {
+    let num_routes = ops.byte()?;
+    for _ in 0..num_routes {
+        ops.byte()?;
+        ops.index()?;
+        ops.byte()?;
+        visit(ops.index()?, ColumnUse::Read);
+    }
+    Some(())
 }
 
 fn struct_map2_reads(
-    code: &[u8],
-    operands: crate::vm::StructMap2UpsertOperands,
-    visit: &mut dyn FnMut(u8, ColumnUse),
+    operands: &crate::vm::StructMap2UpsertOperands,
+    visit: &mut dyn FnMut(u32, ColumnUse),
 ) {
     visit(operands.key1_col, ColumnUse::Read);
     visit(operands.key2_col, ColumnUse::Read);
-    let pairs_end = operands.scalar_pairs_start + operands.num_vals * 2;
-    for pair in code[operands.scalar_pairs_start..pairs_end]
-        .as_chunks::<2>()
-        .0
-    {
-        visit(pair[0], ColumnUse::Read);
+    for &col in operands.vals.cols() {
+        visit(col, ColumnUse::Read);
     }
 }

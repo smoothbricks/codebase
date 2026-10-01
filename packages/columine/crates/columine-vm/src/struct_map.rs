@@ -166,13 +166,13 @@ impl StructMapSlot {
     /// Bind to an existing struct-map slot via its metadata record. Metadata
     /// byte reuse: byte 13 = num_fields, byte 15 = bitset_bytes, bytes 16–17
     /// = row_size.
-    pub fn bind(state: &[u8], slot_idx: u8) -> Self {
+    pub fn bind(state: &[u8], slot_idx: u32) -> Self {
         let meta_base = slot_meta_base(slot_idx);
         let slot_offset = bytes::read_u32(state, meta_base + SlotMetaOffset::OFFSET);
         let capacity = bytes::read_u32(state, meta_base + SlotMetaOffset::CAPACITY);
         let num_fields = state[(meta_base + SlotMetaOffset::AGG_TYPE) as usize];
         let bitset_bytes =
-            u32::from(state[(meta_base + SlotMetaOffset::TIMESTAMP_FIELD_IDX) as usize]);
+            u32::from(state[(meta_base + SlotMetaOffset::STRUCT_BITSET_BYTES) as usize]);
         let row_size = u32::from(bytes::read_u16(
             state,
             meta_base + SlotMetaOffset::TTL_SECONDS,
@@ -337,7 +337,7 @@ impl StructMapSlot {
         pos: u32,
         field_idx: u8,
         cols: &[&[u8]],
-        val_col: u8,
+        val_col: u32,
         element_idx: u32,
     ) {
         let row = self.row_off(pos);
@@ -389,13 +389,13 @@ pub struct StructMap2Slot {
 }
 
 impl StructMap2Slot {
-    pub fn bind(state: &[u8], slot_idx: u8) -> Self {
+    pub fn bind(state: &[u8], slot_idx: u32) -> Self {
         let meta_base = slot_meta_base(slot_idx);
         let slot_offset = bytes::read_u32(state, meta_base + SlotMetaOffset::OFFSET);
         let capacity = bytes::read_u32(state, meta_base + SlotMetaOffset::CAPACITY);
         let num_fields = state[(meta_base + SlotMetaOffset::AGG_TYPE) as usize];
         let bitset_bytes =
-            u32::from(state[(meta_base + SlotMetaOffset::TIMESTAMP_FIELD_IDX) as usize]);
+            u32::from(state[(meta_base + SlotMetaOffset::STRUCT_BITSET_BYTES) as usize]);
         let row_size = u32::from(bytes::read_u16(
             state,
             meta_base + SlotMetaOffset::TTL_SECONDS,
@@ -541,7 +541,7 @@ impl StructMap2Slot {
         pos: u32,
         field_idx: u8,
         cols: &[&[u8]],
-        val_col: u8,
+        val_col: u32,
         element_idx: u32,
     ) {
         let row = self.row_off(pos);

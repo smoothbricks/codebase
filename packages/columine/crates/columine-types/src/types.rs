@@ -9,59 +9,83 @@ pub const STATE_MAGIC: u32 = 0x5354_4154;
 pub const RETE_MAGIC: u32 = 0x4554_4552;
 pub const STATE_HEADER_SIZE: u32 = 32;
 pub const PROGRAM_HASH_PREFIX: u32 = 32;
-pub const PROGRAM_HEADER_SIZE: u32 = 46;
+pub const PROGRAM_HEADER_SIZE: u32 = PROGRAM_HASH_PREFIX + ProgramHeader::WIRE_SIZE as u32;
 pub const RETE_HEADER_SIZE: u32 = 16;
 /// The state layout version written into every state header. There is one
 /// layout; the byte is a guard, not a migration key: an image whose byte
 /// differs was not laid out by this VM and is refused before it is read. A
 /// layout change bumps it and consumers rebuild their state from their own
 /// source of truth (a log replay), never by translating the old image.
-pub const STATE_FORMAT_VERSION: u8 = 1;
+///
+/// Version 2 counts slots in a `u32` and keeps a TTL slot's timestamp column
+/// as a `u32` (see [`StateHeaderOffset::NUM_SLOTS`] and
+/// [`SlotMetaOffset::TIMESTAMP_COL`]).
+pub const STATE_FORMAT_VERSION: u8 = 2;
 /// Program-format magic in little-endian wire order: ASCII bytes `C L M 1`.
 pub const PROGRAM_MAGIC: u32 = 0x314D_4C43;
 /// The default program-magic acceptance set for public embedders.
 pub const DEFAULT_ACCEPTED_PROGRAM_MAGICS: &[u32] = &[PROGRAM_MAGIC];
+/// The program wire format the header's `version` names. Like the state
+/// format byte it is a guard, not a migration key: a program of another
+/// version is refused, never decoded. Version 2 encodes every column, slot
+/// and match-count operand as an index ([`crate::operand`]) and counts slots,
+/// inputs and section lengths in `u32`.
+pub const PROGRAM_FORMAT_VERSION: u16 = 2;
 
 /// The byte-content header immediately after the 32-byte hash prefix.
 ///
-/// The in-memory representation is 16 bytes and 16-byte aligned, while only
-/// the first 14 bytes ([`Self::WIRE_SIZE`]) are program wire content.
-#[repr(C, align(16))]
+/// Wire layout (little-endian, [`Self::WIRE_SIZE`] bytes): `magic:u32`,
+/// `version:u16`, `num_callbacks:u8`, `flags:u8`, `num_slots:u32`,
+/// `num_inputs:u32`, `init_code_len:u32`, `reduce_code_len:u32`. The counts
+/// and lengths are `u32` so the header bounds a program by memory, not by
+/// a field width.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ProgramHeader {
     pub magic: u32,
     pub version: u16,
-    pub num_slots: u8,
-    pub num_inputs: u8,
     pub num_callbacks: u8,
     pub flags: u8,
-    pub init_code_len: u16,
-    pub reduce_code_len: u16,
+    pub num_slots: u32,
+    pub num_inputs: u32,
+    pub init_code_len: u32,
+    pub reduce_code_len: u32,
+}
+
+/// A program's header and its sections, bounds-checked against the bytes.
+#[derive(Clone, Copy, Debug)]
+pub struct ProgramSections<'a> {
+    pub header: ProgramHeader,
+    pub init_code: &'a [u8],
+    pub reduce_code: &'a [u8],
+    /// Content after the reduce section (an embedder's extension tables).
+    pub tail: &'a [u8],
 }
 
 impl ProgramHeader {
-    pub const WIRE_SIZE: usize = 14;
+    pub const WIRE_SIZE: usize = 24;
 
-    /// Decodes the packed 14-byte little-endian program content header.
+    /// Decodes the packed little-endian program content header.
     pub const fn from_wire_bytes(bytes: [u8; Self::WIRE_SIZE]) -> Self {
         Self {
             magic: u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
             version: u16::from_le_bytes([bytes[4], bytes[5]]),
-            num_slots: bytes[6],
-            num_inputs: bytes[7],
-            num_callbacks: bytes[8],
-            flags: bytes[9],
-            init_code_len: u16::from_le_bytes([bytes[10], bytes[11]]),
-            reduce_code_len: u16::from_le_bytes([bytes[12], bytes[13]]),
+            num_callbacks: bytes[6],
+            flags: bytes[7],
+            num_slots: u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]),
+            num_inputs: u32::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]),
+            init_code_len: u32::from_le_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]),
+            reduce_code_len: u32::from_le_bytes([bytes[20], bytes[21], bytes[22], bytes[23]]),
         }
     }
 
-    /// Encodes the packed 14-byte little-endian program content header.
+    /// Encodes the packed little-endian program content header.
     pub const fn to_wire_bytes(self) -> [u8; Self::WIRE_SIZE] {
         let magic = self.magic.to_le_bytes();
         let version = self.version.to_le_bytes();
-        let init_code_len = self.init_code_len.to_le_bytes();
-        let reduce_code_len = self.reduce_code_len.to_le_bytes();
+        let num_slots = self.num_slots.to_le_bytes();
+        let num_inputs = self.num_inputs.to_le_bytes();
+        let init = self.init_code_len.to_le_bytes();
+        let reduce = self.reduce_code_len.to_le_bytes();
         [
             magic[0],
             magic[1],
@@ -69,15 +93,45 @@ impl ProgramHeader {
             magic[3],
             version[0],
             version[1],
-            self.num_slots,
-            self.num_inputs,
             self.num_callbacks,
             self.flags,
-            init_code_len[0],
-            init_code_len[1],
-            reduce_code_len[0],
-            reduce_code_len[1],
+            num_slots[0],
+            num_slots[1],
+            num_slots[2],
+            num_slots[3],
+            num_inputs[0],
+            num_inputs[1],
+            num_inputs[2],
+            num_inputs[3],
+            init[0],
+            init[1],
+            init[2],
+            init[3],
+            reduce[0],
+            reduce[1],
+            reduce[2],
+            reduce[3],
         ]
+    }
+
+    /// Split `program` (hash prefix included) into its header and sections.
+    /// `None` when the bytes are too short for the header or the sections it
+    /// declares, or when the version is not [`PROGRAM_FORMAT_VERSION`].
+    /// Admitting the magic is the embedder's decision, made by the caller.
+    pub fn sections(program: &[u8]) -> Option<ProgramSections<'_>> {
+        let content = program.get(PROGRAM_HASH_PREFIX as usize..)?;
+        let header = Self::from_wire_bytes(content.get(..Self::WIRE_SIZE)?.try_into().ok()?);
+        if header.version != PROGRAM_FORMAT_VERSION {
+            return None;
+        }
+        let init_end = Self::WIRE_SIZE.checked_add(usize::try_from(header.init_code_len).ok()?)?;
+        let reduce_end = init_end.checked_add(usize::try_from(header.reduce_code_len).ok()?)?;
+        Some(ProgramSections {
+            header,
+            init_code: content.get(Self::WIRE_SIZE..init_end)?,
+            reduce_code: content.get(init_end..reduce_end)?,
+            tail: content.get(reduce_end..)?,
+        })
     }
 }
 
@@ -89,6 +143,10 @@ pub const TOMBSTONE: u32 = u32::MAX - 1;
 /// of indexing past the decode arrays at execution. A program emitter enforces
 /// the same bound from this number; both sides name it once.
 pub const MAX_SCATTER_ROUTES: usize = 32;
+/// `FLAT_MAP`'s parent timestamp column when its body has none: an index no
+/// column has, so a `FOR_EACH` element and a flat-mapped element without a
+/// parent timestamp read their own.
+pub const NO_PARENT_TS_COL: u32 = u32::MAX;
 /// Guard-tuple width of the guarded struct-map scatter (`0x3f`). The VM
 /// compares guards out of a fixed `[u64; 4]`, so a program declaring a wider
 /// tuple refuses `INVALID_PROGRAM` at decode. A tuple of zero components
@@ -119,7 +177,6 @@ impl StateHeaderOffset {
     pub const FORMAT_VERSION: u32 = 4;
     pub const PROGRAM_VERSION: u32 = 5;
     pub const RULESET_VERSION: u32 = 7;
-    pub const NUM_SLOTS: u32 = 9;
     pub const NUM_VARS: u32 = 10;
     pub const NUM_BITVECS: u32 = 11;
     pub const FLAGS: u32 = 12;
@@ -127,6 +184,14 @@ impl StateHeaderOffset {
     pub const DERIVED_FACTS_CAPACITY: u32 = 17;
     pub const NUM_DERIVED_FACT_SCHEMAS: u32 = 19;
     pub const DERIVED_FACTS_CHANGE_FLAG: u32 = 20;
+    /// Slot count, `u32` little-endian: the program header's `num_slots`.
+    pub const NUM_SLOTS: u32 = 24;
+}
+
+/// Slot count of an initialised state ([`StateHeaderOffset::NUM_SLOTS`]).
+pub fn state_num_slots(state: &[u8]) -> u32 {
+    let at = StateHeaderOffset::NUM_SLOTS as usize;
+    u32::from_le_bytes([state[at], state[at + 1], state[at + 2], state[at + 3]])
 }
 
 pub struct StateFlags;
@@ -146,7 +211,11 @@ impl SlotMetaOffset {
     pub const TYPE_FLAGS: u32 = 12;
     pub const AGG_TYPE: u32 = 13;
     pub const CHANGE_FLAGS: u32 = 14;
-    pub const TIMESTAMP_FIELD_IDX: u32 = 15;
+    /// A TTL slot's calendar alignment ([`DurationUnit`] byte).
+    pub const START_OF: u32 = 15;
+    /// Struct-map and ordered-list slots carry no TTL and overlay byte 15
+    /// with their row bitset width.
+    pub const STRUCT_BITSET_BYTES: u32 = 15;
     pub const TTL_SECONDS: u32 = 16;
     pub const GRACE_SECONDS: u32 = 20;
     pub const EVICTION_INDEX_OFFSET: u32 = 24;
@@ -154,7 +223,8 @@ impl SlotMetaOffset {
     pub const EVICTION_INDEX_SIZE: u32 = 32;
     pub const EVICTED_BUFFER_OFFSET: u32 = 36;
     pub const EVICTED_COUNT: u32 = 40;
-    pub const START_OF: u32 = 44;
+    /// A TTL slot's timestamp input column, `u32` little-endian.
+    pub const TIMESTAMP_COL: u32 = 44;
 }
 
 /// Bytecode encoding for duration units from the Ax expression language. The
@@ -452,52 +522,57 @@ impl CmpType {
 
 /// Bytecode opcode registry. Operand encodings are part of the wire ABI.
 ///
-/// Map upserts that compare values carry a trailing [`CmpType`] byte.
+/// An `index` operand — a slot, a column or a count of matched event types —
+/// is an unsigned LEB128 `u32` ([`crate::operand`]); every other operand has
+/// the fixed width written beside it. Map upserts that compare values carry a
+/// trailing [`CmpType`] byte.
 #[repr(u8)]
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Opcode {
     Halt = 0x00,
-    /// slot:u8, type_flags:u8, cap_lo:u8, cap_hi:u8 \[, ttl:f32, grace:f32, ts_field:u8, start_of:u8\]
+    /// slot:index, type_flags:u8, cap_lo:u8, cap_hi:u8 \[, ttl:f32, grace:f32, ts_col:index, start_of:u8\]
     /// For AGGREGATE: cap_lo=aggType, cap_hi=0.
     SlotDef = 0x10,
     /// For `.within()` without keyBy — stores array of events.
     SlotArray = 0x14,
-    /// slot:u8, key_col:u8, val_col:u8, ts_col:u8, cmp_type:u8
+    /// slot:index, key_col:index, val_col:index, ts_col:index, cmp_type:u8
     BatchMapUpsertLatest = 0x20,
-    /// slot:u8, key_col:u8, val_col:u8
+    /// slot:index, key_col:index, val_col:index
     BatchMapUpsertFirst = 0x21,
-    /// slot:u8, key_col:u8, val_col:u8
+    /// slot:index, key_col:index, val_col:index
     BatchMapUpsertLast = 0x22,
-    /// slot:u8, key_col:u8
+    /// slot:index, key_col:index
     BatchMapRemove = 0x23,
-    /// slot:u8, key_col:u8, val_col:u8, ts_col:u8, cmp_type:u8 (tracks insertion in eviction index)
+    /// slot:index, key_col:index, val_col:index, ts_col:index, cmp_type:u8 (tracks insertion in eviction index)
     BatchMapUpsertLatestTtl = 0x24,
-    /// slot:u8, key_col:u8, val_col:u8, ts_col:u8 (tracks insertion in eviction index)
+    /// slot:index, key_col:index, val_col:index, ts_col:index (tracks insertion in eviction index)
     BatchMapUpsertLastTtl = 0x25,
-    /// slot:u8, key_col:u8, val_col:u8, cmp_col:u8, cmp_type:u8 (keep row with highest cmp value)
+    /// slot:index, key_col:index, val_col:index, cmp_col:index, cmp_type:u8 (keep row with highest cmp value)
     BatchMapUpsertMax = 0x26,
-    /// slot:u8, key_col:u8, val_col:u8, cmp_col:u8, cmp_type:u8 (keep row with lowest cmp value)
+    /// slot:index, key_col:index, val_col:index, cmp_col:index, cmp_type:u8 (keep row with lowest cmp value)
     BatchMapUpsertMin = 0x27,
-    /// slot:u8, key_col:u8, val_col:u8, ts_col:u8, cmp_type:u8, pred_col:u8
+    /// slot:index, key_col:index, val_col:index, ts_col:index, cmp_type:u8, pred_col:index
     BatchMapUpsertLatestIf = 0x28,
-    /// slot:u8, key_col:u8, val_col:u8, pred_col:u8
+    /// slot:index, key_col:index, val_col:index, pred_col:index
     BatchMapUpsertFirstIf = 0x29,
-    /// slot:u8, key_col:u8, val_col:u8, pred_col:u8
+    /// slot:index, key_col:index, val_col:index, pred_col:index
     BatchMapUpsertLastIf = 0x2a,
-    /// slot:u8, key_col:u8, pred_col:u8
+    /// slot:index, key_col:index, pred_col:index
     BatchMapRemoveIf = 0x2b,
-    /// slot:u8, key_col:u8, val_col:u8, cmp_col:u8, cmp_type:u8, pred_col:u8
+    /// slot:index, key_col:index, val_col:index, cmp_col:index, cmp_type:u8, pred_col:index
     BatchMapUpsertMaxIf = 0x2c,
-    /// slot:u8, key_col:u8, val_col:u8, cmp_col:u8, cmp_type:u8, pred_col:u8
+    /// slot:index, key_col:index, val_col:index, cmp_col:index, cmp_type:u8, pred_col:index
     BatchMapUpsertMinIf = 0x2d,
     /// Keyed struct-map probe (body opcode, per FLAT_MAP element).
-    /// probe_slot:u8, key_col:u8, miss_mode:u8(0=skip,1=null), out_slot:u8, num_fields:u8,
-    /// \[probe_field_idx:u8, out_field_idx:u8\] × num_fields, out_key_col:u8
+    /// probe_slot:index, key_col:index, miss_mode:u8(0=skip,1=null), out_slot:index, num_fields:u8,
+    /// \[probe_field_idx:u8, out_field_idx:u8\] × num_fields, out_key_col:index
     BatchStructMapProbe = 0x2e,
     /// Fused probe+dispatch (body opcode, per FLAT_MAP element).
-    /// probe_slot:u8, key_col:u8, miss_mode:u8(0=skip,1=null), route_col:u8, op_col:u8,
-    /// num_routes:u8, \[kind:u8, dest_slot:u8, dest_field_idx:u8, out_key_col:u8, v_src_field_idx:u8\] × num_routes
+    /// probe_slot:index, key_col:index, miss_mode:u8(0=skip,1=null), route_field_idx:u8,
+    /// op_field_idx:u8, num_routes:u8, \[kind:u8, dest_slot:index, dest_field_idx:u8,
+    /// out_key_field_idx:u8, v_src_field_idx:u8\] × num_routes — the route, op, key and value
+    /// are fields of the probed row, not columns.
     BatchStructMapProbeScatter = 0x2f,
     /// Route-column dispatch, probe-free (body opcode, per FLAT_MAP
     /// element). The element already carries the resolved route, op, key and
@@ -517,8 +592,8 @@ pub enum Opcode {
     /// that must keep the winner by a value the element CARRIES rather than
     /// by arrival order takes [`Self::BatchStructMapScatterGuarded`], which
     /// puts a guard in front of these same two arms.
-    /// route_col:u8, op_col:u8, key_col:u8, num_routes:u8,
-    /// \[kind:u8, dest_slot:u8, dest_field_idx:u8, v_col:u8\] × num_routes
+    /// route_col:index, op_col:index, key_col:index, num_routes:u8,
+    /// \[kind:u8, dest_slot:index, dest_field_idx:u8, v_col:index\] × num_routes
     BatchStructMapScatter = 0x3e,
     /// Guarded route-column dispatch, probe-free (body opcode, per FLAT_MAP
     /// element). Routing, kinds, and the assert/retract semantics are
@@ -587,101 +662,103 @@ pub enum Opcode {
     /// `INVALID_PROGRAM` rather than a silently unguarded write. kind-1
     /// routes name their own set slot; those writes are gated by the guard
     /// but the set carries no guard of its own.
-    /// route_col:u8, op_col:u8, key_col:u8, guard_slot:u8, num_guards:u8,
-    /// \[guard_col:u8, guard_field_idx:u8\] × num_guards, num_routes:u8,
-    /// \[kind:u8, dest_slot:u8, dest_field_idx:u8, v_col:u8\] × num_routes
+    /// route_col:index, op_col:index, key_col:index, guard_slot:index, num_guards:u8,
+    /// \[guard_col:index, guard_field_idx:u8\] × num_guards, num_routes:u8,
+    /// \[kind:u8, dest_slot:index, dest_field_idx:u8, v_col:index\] × num_routes
     BatchStructMapScatterGuarded = 0x3f,
-    /// slot:u8, elem_col:u8
+    /// slot:index, elem_col:index
     BatchSetInsert = 0x30,
-    /// slot:u8, elem_col:u8
+    /// slot:index, elem_col:index
     BatchSetRemove = 0x31,
-    /// slot:u8, elem_col:u8, ts_col:u8
+    /// slot:index, elem_col:index, ts_col:index
     BatchSetInsertTtl = 0x32,
-    /// slot:u8, elem_col:u8, pred_col:u8
+    /// slot:index, elem_col:index, pred_col:index
     BatchSetInsertIf = 0x33,
-    /// slot:u8, elem_col:u8
+    /// slot:index, elem_col:index
     BatchBitmapAdd = 0x34,
-    /// slot:u8, elem_col:u8
+    /// slot:index, elem_col:index
     BatchBitmapRemove = 0x35,
-    /// target_slot:u8, source_slot:u8 (in-place slot × slot algebra)
+    /// target_slot:index, source_slot:index (in-place slot × slot algebra)
     BatchBitmapAnd = 0x36,
-    /// target_slot:u8, source_slot:u8
+    /// target_slot:index, source_slot:index
     BatchBitmapOr = 0x37,
-    /// target_slot:u8, source_slot:u8
+    /// target_slot:index, source_slot:index
     BatchBitmapAndNot = 0x38,
-    /// target_slot:u8, source_slot:u8
+    /// target_slot:index, source_slot:index
     BatchBitmapXor = 0x39,
-    /// target_slot:u8 (slot × scratch result)
+    /// target_slot:index (slot × scratch result)
     BatchBitmapAndScratch = 0x3a,
-    /// target_slot:u8
+    /// target_slot:index
     BatchBitmapOrScratch = 0x3b,
-    /// target_slot:u8
+    /// target_slot:index
     BatchBitmapAndNotScratch = 0x3c,
-    /// target_slot:u8
+    /// target_slot:index
     BatchBitmapXorScratch = 0x3d,
-    /// slot:u8, val_col:u8 (SIMD accelerated)
+    /// slot:index, val_col:index (SIMD accelerated)
     BatchAggSum = 0x40,
-    /// slot:u8
+    /// slot:index
     BatchAggCount = 0x41,
-    /// slot:u8, val_col:u8
+    /// slot:index, val_col:index
     BatchAggMin = 0x42,
-    /// slot:u8, val_col:u8
+    /// slot:index, val_col:index
     BatchAggMax = 0x43,
-    /// slot:u8, val_col:u8, pred_col:u8
+    /// slot:index, val_col:index, pred_col:index
     BatchAggSumIf = 0x44,
-    /// slot:u8, pred_col:u8
+    /// slot:index, pred_col:index
     BatchAggCountIf = 0x45,
-    /// slot:u8, val_col:u8, pred_col:u8
+    /// slot:index, val_col:index, pred_col:index
     BatchAggMinIf = 0x46,
-    /// slot:u8, val_col:u8, pred_col:u8
+    /// slot:index, val_col:index, pred_col:index
     BatchAggMaxIf = 0x47,
-    /// slot:u8, val_col:u8, cmp_col:u8 (AggType subtype lives in slot metadata)
+    /// slot:index, val_col:index, cmp_col:index (AggType subtype lives in slot metadata)
     BatchScalarLatest = 0x48,
-    /// slot:u8, val_col:u8 (lossless i64 accumulation)
+    /// slot:index, val_col:index (lossless i64 accumulation)
     BatchAggSumI64 = 0x49,
-    /// slot:u8, val_col:u8
+    /// slot:index, val_col:index
     BatchAggMinI64 = 0x4a,
-    /// slot:u8, val_col:u8
+    /// slot:index, val_col:index
     BatchAggMaxI64 = 0x4b,
-    /// slot:u8, type_flags:u8, cap_lo:u8, cap_hi:u8, num_fields:u8, \[field_type:u8 × num_fields\]
+    /// slot:index, type_flags:u8, cap_lo:u8, cap_hi:u8, num_fields:u8, \[field_type:u8 × num_fields\]
     SlotStructMap = 0x18,
-    /// slot:u8, key_col:u8, num_vals:u8, \[val_col:u8, field_idx:u8\] × num_vals
+    /// slot:index, key_col:index, num_vals:u8, \[val_col:index, field_idx:u8\] × num_vals,
+    /// num_arrays:u8, \[offsets_col:index, values_col:index, field_idx:u8\] × num_arrays
     BatchStructMapUpsertLast = 0x80,
     /// Same encoding as 0x80; first-wins — writes only when the key is absent.
     BatchStructMapUpsertFirst = 0x81,
     /// Same row operands as 0x80 followed by comparison_field_idx:u8; replaces
     /// only when the incoming scalar comparison is strictly greater.
     BatchStructMapUpsertMax = 0x82,
-    /// slot:u8, key1_col:u8, key2_col:u8, num_vals:u8,
-    /// [val_col:u8, field_idx:u8] × num_vals
+    /// slot:index, key1_col:index, key2_col:index, num_vals:u8,
+    /// [val_col:index, field_idx:u8] × num_vals
     BatchStructMap2UpsertLast = 0x83,
-    /// slot:u8, key1_col:u8, key2_col:u8
+    /// slot:index, key1_col:index, key2_col:index
     BatchStructMap2Remove = 0x86,
     /// Conditional exact-pair row replacement with signed-i64 lexicographic
     /// comparison. Encoding extends 0x83 with
     /// cmp1_col,cmp1_field,cmp2_col,cmp2_field.
     BatchStructMap2UpsertMaxI64x2 = 0x87,
-    /// slot:u8, val_col:u8 (body opcode inside FOR_EACH/FLAT_MAP blocks)
+    /// slot:index, val_col:index (body opcode inside FOR_EACH/FLAT_MAP blocks)
     ListAppend = 0x84,
-    /// slot:u8, num_vals:u8, \[(val_col:u8, field_idx:u8) × N\]
+    /// slot:index, num_vals:u8, \[(val_col:index, field_idx:u8) × N\]
     ListAppendStruct = 0x85,
-    /// slot:u8, type_flags:u8, cap_lo:u8, cap_hi:u8 \[, num_fields:u8, field_type:u8 × num_fields\]
+    /// slot:index, type_flags:u8, cap_lo:u8, cap_hi:u8 \[, num_fields:u8, field_type:u8 × num_fields\]
     SlotOrderedList = 0x19,
-    /// slot:u8, outer_type_flags:u8, outer_cap_lo:u8, outer_cap_hi:u8, inner_type:u8,
+    /// slot:index, outer_type_flags:u8, outer_cap_lo:u8, outer_cap_hi:u8, inner_type:u8,
     /// inner_cap_lo:u8, inner_cap_hi:u8, inner_agg_type:u8
     SlotNested = 0x1a,
-    /// slot:u8, type_flags:u8, cap_lo:u8, cap_hi:u8, num_fields:u8,
+    /// slot:index, type_flags:u8, cap_lo:u8, cap_hi:u8, num_fields:u8,
     /// [field_type:u8 × num_fields]
     SlotStructMap2 = 0x1b,
-    /// slot:u8, outer_key_col:u8, elem_col:u8 (body opcode inside FOR_EACH blocks)
+    /// slot:index, outer_key_col:index, elem_col:index (body opcode inside FOR_EACH blocks)
     NestedSetInsert = 0x90,
-    /// slot:u8, outer_key_col:u8, inner_key_col:u8, val_col:u8 (body opcode)
+    /// slot:index, outer_key_col:index, inner_key_col:index, val_col:index (body opcode)
     NestedMapUpsertLast = 0x92,
-    /// slot:u8, outer_key_col:u8, val_col:u8 (body opcode)
+    /// slot:index, outer_key_col:index, val_col:index (body opcode)
     NestedAggUpdate = 0x95,
-    /// col:u8, match_count:u8, match_ids:u32le\[match_count\], body_len:u16le
+    /// col:index, match_count:index, match_ids:u32le\[match_count\], body_len:u16le
     ForEach = 0xe0,
-    /// offsets_col:u8, parent_ts_col:u8, inner_body_len_lo:u8, inner_body_len_hi:u8
+    /// offsets_col:index, parent_ts_col:index (`u32::MAX` when the body has no parent
+    /// timestamp), inner_body_len:u16le
     FlatMap = 0xe1,
 }
 

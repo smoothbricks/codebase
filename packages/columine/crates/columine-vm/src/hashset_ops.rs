@@ -24,7 +24,7 @@ pub fn batch_set_insert(
     delta_mode: bool,
     state: &mut [u8],
     meta: &SlotMetaView,
-    slot_idx: u8,
+    slot_idx: u32,
     elems: &[u32],
     ts_col: Option<&[f64]>,
     hooks: &mut impl VmHooks,
@@ -112,7 +112,7 @@ pub fn batch_set_remove(
     delta_mode: bool,
     state: &mut [u8],
     meta: &SlotMetaView,
-    slot_idx: u8,
+    slot_idx: u32,
     elems: &[u32],
     hooks: &mut impl VmHooks,
 ) -> ErrorCode {

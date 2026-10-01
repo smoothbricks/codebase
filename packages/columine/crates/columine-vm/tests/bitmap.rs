@@ -134,7 +134,7 @@ fn init_ttl_bitmap_slot_state(state: &mut [u8], capacity: u32) -> SlotMetaView {
 /// `SlotTypeFlags::HAS_TTL_MASK`, which is private to `columine-types`.
 const TTL_FLAG: u8 = 0x10;
 
-/// Assemble a program: 32-byte hash prefix + 14-byte content header + init and
+/// Assemble a program: 32-byte hash prefix + 24-byte content header + init and
 /// reduce sections, each NUL-terminated.
 fn program(num_slots: u8, num_inputs: u8, init: &[u8], reduce: &[u8]) -> Vec<u8> {
     let mut init = init.to_vec();
@@ -143,9 +143,11 @@ fn program(num_slots: u8, num_inputs: u8, init: &[u8], reduce: &[u8]) -> Vec<u8>
     reduce.push(Opcode::Halt as u8);
     let mut prog = vec![0u8; 32];
     prog.extend(PROGRAM_MAGIC.to_le_bytes());
-    prog.extend([1, 0, num_slots, num_inputs, 0, 0]);
-    prog.extend((init.len() as u16).to_le_bytes());
-    prog.extend((reduce.len() as u16).to_le_bytes());
+    prog.extend([2, 0, 0, 0]); // version 2, no callbacks, no flags
+    prog.extend(u32::from(num_slots).to_le_bytes());
+    prog.extend(u32::from(num_inputs).to_le_bytes());
+    prog.extend((init.len() as u32).to_le_bytes());
+    prog.extend((reduce.len() as u32).to_le_bytes());
     prog.extend(init);
     prog.extend(reduce);
     prog

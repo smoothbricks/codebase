@@ -2,7 +2,9 @@
 //! timestamp inheritance, ORDERED_LIST, struct-map iteration/growth, and array
 //! fields. Scenarios pin the corresponding ABI behavior.
 
+use columine_types::NO_PARENT_TS_COL;
 use columine_types::PROGRAM_MAGIC;
+use columine_types::operand::encode_index;
 use columine_types::types::{
     AggType, ErrorCode, Opcode, SLOT_META_SIZE, STATE_HEADER_SIZE, SlotMetaOffset, SlotType, align8,
 };
@@ -25,9 +27,11 @@ fn program(num_slots: u8, num_inputs: u8, init: &[u8], reduce: &[u8]) -> Vec<u8>
     let init_len = init.len() + 1;
     let mut prog = vec![0u8; 32];
     prog.extend(PROGRAM_MAGIC.to_le_bytes());
-    prog.extend([1, 0, num_slots, num_inputs, 0, 0]);
-    prog.extend((init_len as u16).to_le_bytes());
-    prog.extend((reduce.len() as u16).to_le_bytes());
+    prog.extend([2, 0, 0, 0]); // version 2, no callbacks, no flags
+    prog.extend(u32::from(num_slots).to_le_bytes());
+    prog.extend(u32::from(num_inputs).to_le_bytes());
+    prog.extend((init_len as u32).to_le_bytes());
+    prog.extend((reduce.len() as u32).to_le_bytes());
     prog.extend_from_slice(init);
     prog.push(Opcode::Halt as u8);
     prog.extend_from_slice(reduce);
@@ -42,8 +46,9 @@ fn for_each(type_id: u32, body: &[u8]) -> Vec<u8> {
     reduce
 }
 
-fn flat_map(offsets_col: u8, parent_ts_col: u8, inner: &[u8]) -> Vec<u8> {
-    let mut fm = vec![0xE1, offsets_col, parent_ts_col];
+fn flat_map(offsets_col: u8, parent_ts_col: u32, inner: &[u8]) -> Vec<u8> {
+    let mut fm = vec![0xE1, offsets_col];
+    fm.extend(encode_index(parent_ts_col).as_bytes());
     fm.extend((inner.len() as u16).to_le_bytes());
     fm.extend_from_slice(inner);
     fm
@@ -233,7 +238,7 @@ fn flat_map_plus_event_level_agg_sum_in_same_for_each_block() {
 
     let inner = [0x80u8, 0, 3, 2, 4, 0, 5, 1, 0];
     let mut body = vec![0x40, 1, 2]; // AGG_SUM slot=1 val_col=2
-    body.extend(flat_map(1, 0xFF, &inner));
+    body.extend(flat_map(1, NO_PARENT_TS_COL, &inner));
     let prog = program(2, 6, &init_sec, &for_each(TYPE_A, &body));
 
     let mut state = init(&prog);
@@ -269,8 +274,8 @@ fn flat_map_plus_event_level_agg_sum_in_same_for_each_block() {
 fn nested_flat_map_depth_2_groups_items_struct_map() {
     let init_sec = [0x18u8, 0, 0x05, 4, 0, 2, 0, 4];
     let leaf = [0x80u8, 0, 3, 2, 4, 0, 5, 1, 0];
-    let inner_fm = flat_map(2, 0xFF, &leaf);
-    let outer_fm = flat_map(1, 0xFF, &inner_fm);
+    let inner_fm = flat_map(2, NO_PARENT_TS_COL, &leaf);
+    let outer_fm = flat_map(1, NO_PARENT_TS_COL, &inner_fm);
     let prog = program(1, 6, &init_sec, &for_each(TYPE_A, &outer_fm));
 
     let mut state = init(&prog);
@@ -510,7 +515,7 @@ fn ordered_list_struct_payload_delta_roundtrip() {
 fn ordered_list_inside_flat_map() {
     let init_sec = [0x19u8, 0, 7, 8, 0, 0]; // scalar UINT32 ordered list
     let inner = [0x84u8, 0, 2];
-    let fm = flat_map(1, 0xFF, &inner);
+    let fm = flat_map(1, NO_PARENT_TS_COL, &inner);
     let prog = program(1, 3, &init_sec, &for_each(TYPE_A, &fm));
 
     let mut state = init(&prog);
@@ -1149,8 +1154,8 @@ fn hashmap_no_timestamp_rejects_latest_max_min_opcodes() {
 #[test]
 fn ts_struct_map_upsert_first_keeps_first_row_and_rolls_back() {
     let hex = "0000000000000000000000000000000000000000000000000000000000000000\
-               434c4d310100010000000a001a0018000600040304040000e001010100000010\
-               00e103ff0b00810004030400050106020000";
+               434c4d310200000001000000000000000a0000001e0000001800060004030404\
+               0000e00101010000001400e103ffffffff0f0b00810004030400050106020000";
     let hex: String = hex.chars().filter(|c| !c.is_whitespace()).collect();
     let prog: Vec<u8> = (0..hex.len())
         .step_by(2)

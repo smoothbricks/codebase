@@ -17,9 +17,11 @@ const OK: u32 = ErrorCode::Ok as u32;
 fn program(init: &[u8], num_inputs: u8, reduce: &[u8]) -> Vec<u8> {
     let mut out = vec![0u8; 32];
     out.extend(PROGRAM_MAGIC.to_le_bytes());
-    out.extend([1, 0, 1, num_inputs, 0, 0]);
-    out.extend(u16::try_from(init.len()).unwrap().to_le_bytes());
-    out.extend(u16::try_from(reduce.len()).unwrap().to_le_bytes());
+    out.extend([2, 0, 0, 0]); // version 2, no callbacks, no flags
+    out.extend(1u32.to_le_bytes());
+    out.extend(u32::from(num_inputs).to_le_bytes());
+    out.extend(u32::try_from(init.len()).unwrap().to_le_bytes());
+    out.extend(u32::try_from(reduce.len()).unwrap().to_le_bytes());
     out.extend_from_slice(init);
     out.extend_from_slice(reduce);
     out
