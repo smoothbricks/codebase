@@ -369,7 +369,10 @@ nothing when nothing changed:
   Bun version. The record lives in `node_modules/.smoo-install`, so deleting `node_modules` reinstalls; a failed install
   records nothing and is retried on the next entry. A CI runner always installs with `--frozen-lockfile`. A CI runner is
   one that sets `GITHUB_ACTIONS=true` (GitHub Actions, and Forgejo Actions, which mirrors its variables as `GITHUB_*`),
-  never `CI` alone: agent harnesses export `CI=true` on every command they run.
+  never `CI` alone: agent harnesses export `CI=true` on every command they run. When that frozen install misses, the
+  entry installs again without the flag, prints the `git diff` of what the install changed (the `bun.lock` the pull
+  request should have committed) and fails. The diff goes to stderr, whole: devenv reports a failed shell entry as its
+  stderr alone, so anything written to stdout would be lost.
 - A repository whose `devenv.nix` enables `languages.python.uv` gets its uv workspace synced the same way
   (`uv sync --all-packages --all-groups`, `--locked` on a CI runner) into devenv's `UV_PROJECT_ENVIRONMENT`, with the
   interpreter devenv provides, and activated after the sync. Its inputs are the root `pyproject.toml`, `uv.lock` and

@@ -31,6 +31,11 @@ interface EntryOptions {
   readonly uvProjectEnvironment?: string;
   /** The interpreter the managed module passes for a uv project. */
   readonly python?: string;
+  /**
+   * Runs as a GitHub Actions job whose secret store injects these variables: the strict CI
+   * install, which runs no provider command and so needs every declared secret supplied.
+   */
+  readonly ciSecrets?: Readonly<Record<string, string>>;
 }
 
 /** A shell entry still running, with its output piped for `finished`. */
@@ -43,7 +48,7 @@ interface Repository {
   /** Runs the real setup-environment.ts exactly as the managed devenv shell does. */
   readonly enterShell: (options?: EntryOptions) => Promise<ShellEntry>;
   /** The same entry, returned while it runs, for a test that races or kills it. */
-  readonly startShell: () => ShellProcess;
+  readonly startShell: (options?: EntryOptions) => ShellProcess;
   /** Times something recorded in the ledger: a provider command's variable, `install`, or `uv`. */
   readonly count: (name: string) => number;
   /** The argument vectors the recording `uv` received, one per run. */
@@ -203,7 +208,7 @@ function repository(root: string, ledgers: string, bin: string): Repository {
     root,
     state,
     enterShell: async (options = {}) => finished(startShell(root, state, bin, options)),
-    startShell: () => startShell(root, state, bin, {}),
+    startShell: (options = {}) => startShell(root, state, bin, options),
     count: (name) => lines(name).length,
     uvRuns: () => lines('uv').map((line) => line.split(' ')),
     gitConfigWrites: () => lines('git-config-writes'),
@@ -235,7 +240,7 @@ async function git(cwd: string, args: readonly string[]): Promise<string> {
  * One shell entry: `bun "$DEVENV_ROOT/setup-environment.ts"`, which is
  * verbatim what the managed devenv `enterShell` runs. The environment carries
  * only what a developer machine has, so neither the CI branch nor the cowshed
- * branch can decide this run.
+ * branch can decide this run, except the CI branch when `ciSecrets` is set.
  */
 function startShell(root: string, state: string, bin: string, options: EntryOptions): ShellProcess {
   return Bun.spawn({
@@ -251,6 +256,7 @@ function startShell(root: string, state: string, bin: string, options: EntryOpti
       DEVENV_ROOT: join(root, 'tooling', 'direnv'),
       DEVENV_STATE: state,
       ...(options.uvProjectEnvironment === undefined ? {} : { UV_PROJECT_ENVIRONMENT: options.uvProjectEnvironment }),
+      ...(options.ciSecrets === undefined ? {} : { GITHUB_ACTIONS: 'true', ...options.ciSecrets }),
     },
     stdout: 'pipe',
     stderr: 'pipe',
@@ -422,6 +428,112 @@ describe('what shell entry installs', () => {
         );
       },
     );
+  });
+});
+
+describe('what a CI install that finds a stale lockfile reports', () => {
+  const MEMBER = 'packages/member/package.json';
+  // A CI runner runs no provider command: the job's secret store injects every declared secret.
+  const CI_SECRETS = { SMOO_NPM_TOKEN: 'registry-value', SMOO_TOKEN: 'shell-value' };
+  const member = (...dependencies: string[]) =>
+    JSON.stringify({
+      name: 'member',
+      version: '0.0.0',
+      dependencies: Object.fromEntries(dependencies.map((name) => [name, `file:../../vendor/${name}`])),
+    });
+  const vendored = (name: string) => JSON.stringify({ name, version: '1.0.0' });
+  // Two dependencies that live in the checkout, so locking, the frozen miss and the
+  // fallback install all run without a registry.
+  const FILES = {
+    '.gitignore': 'node_modules\ntooling/direnv/.devenv\n',
+    'vendor/dep/package.json': vendored('dep'),
+    'vendor/dep2/package.json': vendored('dep2'),
+    [MEMBER]: member('dep'),
+  };
+
+  /** Locks the checkout with a real `bun install` and stages that state, as a pull request commits it. */
+  async function stageLockedCheckout(root: string): Promise<void> {
+    const install = Bun.spawn({
+      cmd: ['bun', 'install'],
+      cwd: root,
+      // Not the CI entry's secrets: a developer who exports them must not change what gets staged.
+      env: Object.fromEntries(Object.entries(process.env).filter(([name]) => !name.startsWith('SMOO_'))),
+      stdout: 'ignore',
+      stderr: 'pipe',
+      stdin: 'ignore',
+    });
+    const [stderr, exitCode] = await Promise.all([new Response(install.stderr).text(), install.exited]);
+    if (exitCode !== 0) throw new Error(`bun install failed: ${stderr}`);
+    await git(root, ['add', '-A']);
+  }
+
+  /**
+   * Then stages a member manifest that asks for one more dependency than the
+   * lockfile records: the pull request that changed a manifest and not bun.lock.
+   * The install that follows rewrites bun.lock in the working tree, which is what
+   * `git diff` shows against the staged state.
+   */
+  async function stageStaleLock(root: string): Promise<void> {
+    await stageLockedCheckout(root);
+    await writeFile(join(root, MEMBER), member('dep', 'dep2'));
+    await git(root, ['add', MEMBER]);
+  }
+
+  // devenv reports a failed shell entry as "Shell environment capture failed:"
+  // followed by the shell's stderr and nothing else; the stdout it captured is
+  // discarded. `finished` mirrors that, so these read exactly what devenv would show.
+  it('prints the lockfile diff on stderr and still fails the entry', async () => {
+    await withManagedRepository({ workspaces: ['packages/*'], files: FILES }, async ({ root, enterShell: enter }) => {
+      await stageStaleLock(root);
+      const { exitCode, stderr } = await enter({ ciSecrets: CI_SECRETS });
+
+      expect(exitCode).toBe(1);
+      expect(stderr).toContain('git diff after install:');
+      expect(stderr).toContain('+        "dep2": "file:../../vendor/dep2",');
+    });
+  });
+
+  it('prints the whole diff when it is larger than a pipe holds and the reader is slow to drain it', async () => {
+    // The entry exits straight after printing, and a write still queued then is cut short:
+    // a diff that ends mid-hunk cannot be applied or checked. Four megabytes is well past
+    // what a pipe buffers, so the reader's pause decides whether the tail survives.
+    const bytes = 4_000_000;
+    await withManagedRepository(
+      {
+        workspaces: ['packages/*'],
+        files: { ...FILES, 'tracked.txt': '' },
+        // Only the entry under test writes: it alone has the injected secret in its environment.
+        prepare: `if [ -n "$SMOO_TOKEN" ]; then head -c ${bytes} /dev/zero | tr '\\0' x > tracked.txt; printf '\\nEND\\n' >> tracked.txt; fi`,
+      },
+      async ({ root, startShell }) => {
+        await stageStaleLock(root);
+        const entry = startShell({ ciSecrets: CI_SECRETS });
+        // The install's prepare script writes the file, so once it is whole the entry is about to
+        // print its diff. Leave the output unread for a while from there: the write cannot finish
+        // into a full pipe.
+        const tracked = join(root, 'tracked.txt');
+        for (let waited = 0; !existsSync(tracked) || !readFileSync(tracked, 'utf8').endsWith('END\n'); waited += 50) {
+          expect(waited).toBeLessThan(20_000);
+          await Bun.sleep(50);
+        }
+        await Bun.sleep(1_000);
+        const { exitCode, stderr } = await finished(entry);
+
+        expect(exitCode).toBe(1);
+        expect(stderr).toContain('+END\n');
+        expect(stderr.length).toBeGreaterThan(bytes);
+      },
+    );
+  });
+
+  it('prints no diff when the frozen install succeeds', async () => {
+    await withManagedRepository({ workspaces: ['packages/*'], files: FILES }, async ({ root, enterShell: enter }) => {
+      await stageLockedCheckout(root);
+      const { exitCode, stderr } = await enter({ ciSecrets: CI_SECRETS });
+
+      expect(exitCode).toBe(0);
+      expect(stderr).not.toContain('git diff after install:');
+    });
   });
 });
 
