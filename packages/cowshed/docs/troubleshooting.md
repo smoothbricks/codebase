@@ -335,10 +335,11 @@ the error names every failed identity.
 
 Per-command cost does not grow with history or with the number of warm workspaces: no command reads the audit segments
 under `/private/cowshed/store/telemetry/` (they are write-only telemetry; authority is the image inventory); the host
-APFS inventory is queried only for the cowshed container, and attaching an image lists only that image's container; one
-project open validates the repository binding and reads the inventory once for every workspace it recovers. When a
-command is still slow on a wait in a host process, `ps -o pid,ppid,etime,args -ax | grep -E 'diskutil|hdiutil|git'`
-names it while it runs.
+APFS inventory is queried only for the cowshed container, and attaching an image takes its volume from the attach's own
+report, asking Disk Arbitration nothing after it (`diskutil info` and `diskutil apfs list` queue behind every
+arbitration client on the host); one project open validates the repository binding and reads the inventory once for
+every workspace it recovers. When a command is still slow on a wait in a host process,
+`ps -o pid,ppid,etime,args -ax | grep -E 'diskutil|hdiutil|git'` names it while it runs.
 
 `cowshed new` prints a `cowshed: apfs canonical/<step>` or `cowshed: new <step>` span with its elapsed time for every
 step, so the slow step is named on stderr. On a large repository two steps carry nearly all of the time:

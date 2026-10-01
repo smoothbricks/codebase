@@ -353,41 +353,10 @@ impl Sleeper for ThreadSleeper {
     }
 }
 
-/// The wait a freshly attached image's APFS inventory is given to become visible.
-///
-/// `diskutil apfs list -plist <container>` exits ZERO and reports no containers at all while
-/// Disk Arbitration is mid-transaction on an attach: the container exists — `diskutil info`
-/// named it microseconds earlier — but the inventory has not caught up. Observed as
-/// `missing Containers array` on a host where other processes were attaching and detaching
-/// images, failing `execute_create_staged`'s live clone outright. Trusting exit 0 to mean the
-/// answer is complete is the unsound assumption; the volume is not absent, it is not yet
-/// announced.
-///
-/// Five seconds against a 250ms poll. Settling is sub-second on a quiet host, so this is
-/// normally never entered; the bound stays well inside the enclosing per-operation budget even
-/// if several resolutions in one operation each pay it. This buys correctness under contention
-/// rather than time for slow work — no deadline is relaxed, and nothing here waits on progress
-/// the host is making.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct VolumeVisibilityGrace {
-    pub total: Duration,
-    pub poll: Duration,
-}
-
-impl Default for VolumeVisibilityGrace {
-    fn default() -> Self {
-        Self {
-            total: Duration::from_secs(5),
-            poll: Duration::from_millis(250),
-        }
-    }
-}
-
 /// The wait a just-detached whole device is given to leave the attachment inventory.
 ///
 /// `diskutil eject` returning zero means the kernel let go; Disk Arbitration
-/// announcing the departure is a second, lagging step — the same announce-lag class
-/// [`VolumeVisibilityGrace`] covers on the attach side. A verb that detaches an image and then
+/// announcing the departure is a second, lagging step. A verb that detaches an image and then
 /// attaches it again, as `resize` does, should not start the attach while the old device is
 /// still listed.
 ///
@@ -554,63 +523,6 @@ impl std::error::Error for CloneFileError {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum VolumeResolutionFailure {
-    Missing,
-    Ambiguous(Vec<String>),
-    InvalidPlist(String),
-    /// The candidate handed to resolution is not a volume device path at all — cowshed's own
-    /// argv, not something the host said. Separate from `InvalidPlist` because the two differ
-    /// in whether waiting could ever change the answer.
-    InvalidCandidate(String),
-}
-
-impl VolumeResolutionFailure {
-    /// Whether this answer could differ once Disk Arbitration finishes announcing an attach.
-    ///
-    /// Two failures say "not yet", and both were observed with exit status ZERO on a host where
-    /// other processes were attaching images. `InvalidPlist` covers the container that is not in
-    /// the inventory at all — the reported `missing Containers array`, and equally a torn body,
-    /// which is indistinguishable from it and produced by the same contention. `Missing` is the
-    /// same phenomenon one step later: the container is announced, its volumes are not yet. In
-    /// both cases `diskutil info` had already named the container, so the volume is not absent.
-    ///
-    /// Retrying a genuine schema break costs only a bounded grace before reporting the same
-    /// error, while failing a transient one is a spurious hard failure. That asymmetry is why
-    /// the doubtful `InvalidPlist` cases wait rather than fail.
-    ///
-    /// Two failures do NOT say "not yet", and are deliberately reported at once:
-    /// - `Ambiguous` is "announced TWICE", not "not yet announced". Nothing observed suggests it
-    ///   settles, and an ambiguity that persists is a hazard worth surfacing promptly rather than
-    ///   after a grace.
-    /// - `InvalidCandidate` is cowshed's own argv: deterministic, and waiting cannot change it.
-    fn is_inventory_lag(&self) -> bool {
-        match self {
-            Self::Missing | Self::InvalidPlist(_) => true,
-            Self::Ambiguous(_) | Self::InvalidCandidate(_) => false,
-        }
-    }
-}
-
-impl fmt::Display for VolumeResolutionFailure {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Missing => f.write_str("no APFS volume device was reported"),
-            Self::Ambiguous(devices) => {
-                write!(
-                    f,
-                    "multiple APFS volume devices were reported: {}",
-                    devices.join(", ")
-                )
-            }
-            Self::InvalidPlist(message) => write!(f, "invalid APFS list plist: {message}"),
-            Self::InvalidCandidate(candidate) => {
-                write!(f, "invalid APFS device candidate {candidate:?}")
-            }
-        }
-    }
-}
-
 #[derive(Debug)]
 pub struct AttachmentDetachFailure {
     pub device: String,
@@ -667,15 +579,6 @@ pub enum ApfsError {
         image: PathBuf,
         primary: Box<ApfsError>,
         cleanup: AttachmentCleanupFailure,
-    },
-    VolumeResolutionFailed {
-        candidate: String,
-        reason: VolumeResolutionFailure,
-    },
-    VolumeResolutionAndDetachFailed {
-        whole_device: String,
-        resolution: Box<ApfsError>,
-        detach: Box<ApfsError>,
     },
     VerificationFailed {
         request: CommandRequest,
@@ -752,17 +655,6 @@ impl fmt::Display for ApfsError {
                 "attachment failed for {}, and cleaning up newly attached devices also failed: primary={primary}; cleanup={cleanup}",
                 image.display()
             ),
-            Self::VolumeResolutionFailed { candidate, reason } => {
-                write!(f, "could not resolve APFS volume for {candidate}: {reason}")
-            }
-            Self::VolumeResolutionAndDetachFailed {
-                whole_device,
-                resolution,
-                detach,
-            } => write!(
-                f,
-                "resolving the APFS volume attached from {whole_device} failed: {resolution}; detaching it failed: {detach}"
-            ),
             Self::VerificationFailed { request, output } => fmt_command_failure(
                 f,
                 "verify APFS volume",
@@ -823,7 +715,6 @@ impl std::error::Error for ApfsError {
             Self::FileOperation { source, .. } => Some(source),
             Self::Clone(error) => Some(error),
             Self::VerificationAndDetachFailed { detach, .. } => Some(detach),
-            Self::VolumeResolutionAndDetachFailed { detach, .. } => Some(detach),
             Self::AsifCreationAndCleanupFailed { primary, .. } => Some(primary),
             Self::AttachmentCleanupFailed { primary, .. } => Some(primary),
             _ => None,
@@ -894,7 +785,6 @@ pub struct MacOsApfsBackend<R, S = ThreadSleeper> {
     runner: R,
     sleeper: S,
     grace: DetachGrace,
-    visibility: VolumeVisibilityGrace,
     settle: DetachSettleGrace,
 }
 
@@ -904,32 +794,23 @@ impl<R> MacOsApfsBackend<R> {
             runner,
             sleeper: ThreadSleeper,
             grace: DetachGrace::default(),
-            visibility: VolumeVisibilityGrace::default(),
             settle: DetachSettleGrace::default(),
         }
     }
 }
 
 impl<R, S> MacOsApfsBackend<R, S> {
-    /// Both graces are named types rather than a pair of `Duration`s so a caller cannot
-    /// silently transpose them.
-    pub fn with_grace(
-        runner: R,
-        sleeper: S,
-        grace: DetachGrace,
-        visibility: VolumeVisibilityGrace,
-    ) -> Self {
+    /// The grace is a named type rather than a pair of `Duration`s so a caller cannot silently
+    /// transpose its bound and its poll.
+    pub fn with_grace(runner: R, sleeper: S, grace: DetachGrace) -> Self {
         Self {
             runner,
             sleeper,
             grace,
-            visibility,
             settle: DetachSettleGrace::default(),
         }
     }
-    /// The detach-settle bound, chained after [`MacOsApfsBackend::with_grace`]. A named-type
-    /// builder rather than a fifth positional argument, so the existing call sites keep reading
-    /// as they did.
+    /// The detach-settle bound, chained after [`MacOsApfsBackend::with_grace`].
     pub fn with_detach_settle(mut self, settle: DetachSettleGrace) -> Self {
         self.settle = settle;
         self
@@ -1153,68 +1034,6 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
         }
     }
 
-    /// Resolve the APFS volume device behind a freshly attached image's physical store.
-    ///
-    /// Asks `diskutil info` which container the candidate belongs to and lists only that
-    /// container: the unscoped `diskutil apfs list` walks every container on the host, and since
-    /// every attached workspace image is one, that walk costs seconds per attach on a host with
-    /// dozens of warm workspaces. The scoped listing is then verified exactly as before.
-    ///
-    /// Retried while the inventory disagrees with an attach that has already happened. Scoping
-    /// made the listing cheap but not truthful: under concurrent attach/detach activity the
-    /// scoped list exits ZERO and reports no containers, so a live clone failed with
-    /// `missing Containers array` for a container `diskutil info` had just named. The volume was
-    /// never absent — Disk Arbitration had not finished announcing it. A single answer is
-    /// therefore not evidence; an answer that stops changing is.
-    fn resolve_apfs_volume(&self, candidate: &str) -> Result<String, ApfsError> {
-        let mut waited = Duration::ZERO;
-        loop {
-            let error = match self.resolve_apfs_volume_once(candidate) {
-                Ok(device) => return Ok(device),
-                Err(error) => error,
-            };
-            let retry = matches!(
-                &error,
-                ApfsError::VolumeResolutionFailed { reason, .. } if reason.is_inventory_lag()
-            );
-            if !retry || waited >= self.visibility.total {
-                return Err(error);
-            }
-            self.sleeper.sleep(self.visibility.poll);
-            waited += self.visibility.poll;
-        }
-    }
-
-    /// One `diskutil info` + scoped `diskutil apfs list` round. Separated so the retry above
-    /// reads as a policy over a total operation rather than as control flow woven through it.
-    fn resolve_apfs_volume_once(&self, candidate: &str) -> Result<String, ApfsError> {
-        let info = self.run_checked(
-            "inspect APFS device",
-            CommandRequest::new(
-                DISKUTIL,
-                [
-                    OsString::from("info"),
-                    OsString::from("-plist"),
-                    OsString::from(candidate),
-                ],
-            ),
-        )?;
-        let container = parse_container_reference_plist(candidate, &info.stdout)?;
-        let output = self.run_checked(
-            "resolve APFS volume",
-            CommandRequest::new(
-                DISKUTIL,
-                [
-                    OsString::from("apfs"),
-                    OsString::from("list"),
-                    OsString::from("-plist"),
-                    OsString::from(container),
-                ],
-            ),
-        )?;
-        parse_volume_list_plist(candidate, &output.stdout)
-    }
-
     /// Recover the one attachment a killed process may have left for `image`.
     ///
     /// This never attaches a second device. An absent mapping returns `None`; more than one
@@ -1230,18 +1049,17 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
             "inventory attached disk images",
             CommandRequest::new(HDIUTIL, ["info", "-plist"]),
         )?;
-        let Some((whole_device, candidate)) = parse_existing_attachment(&image, &output.stdout)?
-        else {
-            return Ok(None);
-        };
-        let volume_device = self.resolve_apfs_volume(&candidate)?;
-        Ok(Some(AttachedImage {
-            image,
-            whole_device,
-            volume_device,
-        }))
+        Ok(parse_existing_attachment(&image, &output.stdout)?.map(
+            |(whole_device, volume_device)| AttachedImage {
+                image,
+                whole_device,
+                volume_device,
+            },
+        ))
     }
 
+    /// Attach `image` without mounting it, answering the volume and container the attach itself
+    /// reports ([`attached_apfs_volume`]). No Disk Arbitration query follows the attach.
     fn attach_without_mounting(&self, image: &Path) -> Result<AttachedImage, ApfsError> {
         validate_image_path(image)?;
         let attached_before = self.attached_whole_devices(image)?;
@@ -1262,7 +1080,7 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
                 return Err(self.failed_attachment(image, &attached_before, primary));
             }
         };
-        let (whole_device, candidate) = match parse_attachment_plist(&output.stdout) {
+        let (whole_device, volume_device) = match parse_attachment_plist(&output.stdout) {
             Ok(attachment) => attachment,
             Err(primary) => {
                 return Err(self.failed_attachment(image, &attached_before, primary));
@@ -1277,19 +1095,6 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
                 ),
             ));
         }
-        let volume_device = match self.resolve_apfs_volume(&candidate) {
-            Ok(volume_device) => volume_device,
-            Err(resolution) => {
-                return match self.detach_image_device(image, &whole_device, DetachIntent::Release) {
-                    Ok(()) => Err(resolution),
-                    Err(detach) => Err(ApfsError::VolumeResolutionAndDetachFailed {
-                        whole_device,
-                        resolution: Box::new(resolution),
-                        detach: Box::new(detach),
-                    }),
-                };
-            }
-        };
         Ok(AttachedImage {
             image: image.to_owned(),
             whole_device,
@@ -1882,8 +1687,9 @@ fn parse_existing_attachment(
                     "matching image has no system-entities array".into(),
                 )
             })?;
-        let candidate = parse_inventory_attachment_entities(entities)?;
-        if attachment.replace(candidate).is_some() {
+        let found = attached_apfs_volume(&collect_attachment_entities(entities)?)
+            .map_err(ApfsError::InvalidAttachmentInventory)?;
+        if attachment.replace(found).is_some() {
             return Err(ApfsError::InvalidAttachmentInventory(
                 "matching image has multiple inventory entries".into(),
             ));
@@ -2123,64 +1929,66 @@ fn parse_attachment_plist(bytes: &[u8]) -> Result<(String, String), ApfsError> {
         .and_then(|root| root.get("system-entities"))
         .and_then(plist::Value::as_array)
         .ok_or_else(|| ApfsError::InvalidAttachmentPlist("missing system-entities array".into()))?;
-    parse_attachment_entities(system_entities)
+    attached_apfs_volume(&collect_attachment_entities(system_entities)?)
+        .map_err(ApfsError::InvalidAttachmentPlist)
 }
 
-/// Selector for the system-entities `hdiutil info -plist` reports for a matching image — the
-/// schema `existing_attachment` reads.
-///
-/// `hdiutil info` does not share the attach stdout's schema: on macOS 26 it labels every
-/// entity with a partition-type GUID `content-hint` (`41504653-…` is ASCII "APFS", Apple's
-/// APFS volume type) and reports no `volume-kind` at all, so the string-hint attach selector
-/// matches nothing and would report a bogus "no APFS device candidate". The GUID classes are
-/// therefore tried first, most specific APFS role first; entities in the attach stdout schema
-/// (string hints, `volume-kind`) fall through to that selector unchanged, which also keeps the
-/// answer working on hosts whose info output still carries string hints.
-fn parse_inventory_attachment_entities(
-    system_entities: &[plist::Value],
-) -> Result<(String, String), ApfsError> {
-    let entities = collect_attachment_entities(system_entities)?;
-    if let Some(candidate) = select_guid_attachment_candidate(&entities) {
-        let reported_whole = reported_attachment_whole(&entities)?;
-        let whole = attachment_whole_device(reported_whole, &candidate)?;
-        return Ok((whole, candidate));
-    }
-    parse_attachment_entities(system_entities)
-}
-
-/// Apple's fixed APFS partition-type GUID prefixes, in the order the candidate selector
-/// prefers them: the volume device itself, the synthesized physical-store device it hangs
-/// from, then the container partition slice inside the image's partition scheme.
-const APFS_VOLUME_TYPE_GUID_PREFIX: &str = "41504653-";
+/// Apple's fixed APFS partition-type GUID prefixes, as `hdiutil info -plist` labels an attached
+/// image's entities: the synthesized container (its physical store), then the volume.
 const APFS_STORE_TYPE_GUID_PREFIX: &str = "EF57347C-";
-const APFS_CONTAINER_TYPE_GUID_PREFIX: &str = "7C3457EF-";
+const APFS_VOLUME_TYPE_GUID_PREFIX: &str = "41504653-";
 
 fn hint_has_type_guid(hint: &str, prefix: &str) -> bool {
     hint.get(..prefix.len())
         .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
 }
 
-fn select_guid_attachment_candidate(entities: &[(String, String, String)]) -> Option<String> {
-    const GUID_PREFIXES: [&str; 3] = [
-        APFS_VOLUME_TYPE_GUID_PREFIX,
-        APFS_STORE_TYPE_GUID_PREFIX,
-        APFS_CONTAINER_TYPE_GUID_PREFIX,
-    ];
-    for prefix in GUID_PREFIXES {
-        if let Some(selected) = entities
-            .iter()
-            .filter(|(_, hint, _)| hint_has_type_guid(hint, prefix))
-            .max_by_key(|(device, _, _)| device_depth(device))
-        {
-            return Some(selected.0.clone());
-        }
-    }
-    None
+fn is_apfs_volume_hint(hint: &str) -> bool {
+    hint.eq_ignore_ascii_case("Apple_APFS_Volume")
+        || hint_has_type_guid(hint, APFS_VOLUME_TYPE_GUID_PREFIX)
 }
 
+fn is_apfs_container_hint(hint: &str) -> bool {
+    hint.eq_ignore_ascii_case("Apple_APFS_Container")
+        || hint_has_type_guid(hint, APFS_STORE_TYPE_GUID_PREFIX)
+}
+
+/// The APFS volume an attached image exposes, and the synthesized container it hangs from — the
+/// whole device whose detach releases the image — read from the image's own system entities.
+///
+/// Every image holds one volume in one container, and both reports of an attachment name the
+/// two: `diskutil image attach --plist` with string hints (`Apple_APFS_Container`,
+/// `Apple_APFS_Volume`), `hdiutil info -plist` with Apple's partition-type GUIDs. The answer
+/// therefore needs no Disk Arbitration query: `diskutil info` and `diskutil apfs list` queue
+/// behind every arbitration client on the host, and under contention answered before Disk
+/// Arbitration had announced the attach at all. Anything but exactly one volume inside a
+/// reported container is refused, naming what was reported.
+fn attached_apfs_volume(entities: &[(String, String)]) -> Result<(String, String), String> {
+    let volumes: Vec<&str> = entities
+        .iter()
+        .filter(|(_, hint)| is_apfs_volume_hint(hint))
+        .map(|(device, _)| device.as_str())
+        .collect();
+    let [volume] = volumes.as_slice() else {
+        return Err(format!("expected one APFS volume, reported {volumes:?}"));
+    };
+    let container = whole_device_from(volume)
+        .ok_or_else(|| format!("APFS volume {volume} is not a slice of a container"))?;
+    if !entities
+        .iter()
+        .any(|(device, hint)| *device == container && is_apfs_container_hint(hint))
+    {
+        return Err(format!(
+            "APFS volume {volume} was reported without its container {container}"
+        ));
+    }
+    Ok((container, (*volume).to_owned()))
+}
+
+/// Each reported entity's device, as a `/dev/` path, and its content hint.
 fn collect_attachment_entities(
     system_entities: &[plist::Value],
-) -> Result<Vec<(String, String, String)>, ApfsError> {
+) -> Result<Vec<(String, String)>, ApfsError> {
     let mut entities = Vec::new();
     for entity in system_entities {
         let dictionary = entity.as_dictionary().ok_or_else(|| {
@@ -2198,218 +2006,15 @@ fn collect_attachment_entities(
             .and_then(plist::Value::as_string)
             .unwrap_or_default()
             .to_owned();
-        let kind = dictionary
-            .get("volume-kind")
-            .or_else(|| dictionary.get("filesystem-type"))
-            .and_then(plist::Value::as_string)
-            .unwrap_or_default()
-            .to_owned();
-        entities.push((device, hint, kind));
-    }
-    if entities.is_empty() {
-        return Err(ApfsError::InvalidAttachmentPlist(
-            "no dev-entry values".into(),
-        ));
+        entities.push((device, hint));
     }
     Ok(entities)
-}
-
-/// The single `GUID_partition_scheme` entity at slice depth zero, or `None` when the plist
-/// reports none; more than one is an invalid attachment. The whole device is a candidate
-/// anchor for the attach stdout selector, not a source of truth on its own — a synthesized
-/// physical store (`diskN+1`) is intentionally not a path descendant of the whole.
-fn reported_attachment_whole(
-    entities: &[(String, String, String)],
-) -> Result<Option<String>, ApfsError> {
-    let mut reported_whole_devices = entities.iter().filter(|(device, hint, _)| {
-        device_depth(device) == 0 && hint.eq_ignore_ascii_case("GUID_partition_scheme")
-    });
-    let reported_whole = reported_whole_devices.next();
-    if reported_whole_devices.next().is_some() {
-        return Err(ApfsError::InvalidAttachmentPlist(
-            "multiple whole image devices".into(),
-        ));
-    }
-    Ok(reported_whole.map(|(device, _, _)| device.clone()))
-}
-
-fn attachment_whole_device(
-    reported_whole: Option<String>,
-    candidate: &str,
-) -> Result<String, ApfsError> {
-    match reported_whole {
-        Some(whole) => Ok(whole),
-        None => whole_device_from(candidate)
-            .ok_or_else(|| ApfsError::InvalidAttachmentPlist("invalid APFS device".into())),
-    }
-}
-
-fn parse_attachment_entities(
-    system_entities: &[plist::Value],
-) -> Result<(String, String), ApfsError> {
-    let entities = collect_attachment_entities(system_entities)?;
-    let reported_whole = reported_attachment_whole(&entities)?;
-    let physical_store = reported_whole.as_ref().and_then(|whole| {
-        entities
-            .iter()
-            .filter(|(device, hint, kind)| {
-                let hint = hint.to_ascii_lowercase();
-                device_is_descendant_of(device, whole)
-                    && hint.contains("apfs")
-                    && !hint.contains("apfs_volume")
-                    && !kind.eq_ignore_ascii_case("apfs")
-            })
-            .max_by_key(|(device, _, _)| device_depth(device))
-    });
-    let candidate = physical_store
-        .or_else(|| {
-            entities
-                .iter()
-                .filter(|(_, hint, kind)| {
-                    let hint = hint.to_ascii_lowercase();
-                    hint.contains("apfs_volume") || kind.eq_ignore_ascii_case("apfs")
-                })
-                .max_by_key(|(device, _, _)| device_depth(device))
-        })
-        .or_else(|| {
-            entities
-                .iter()
-                .filter(|(_, hint, _)| hint.to_ascii_lowercase().contains("apfs"))
-                .max_by_key(|(device, _, _)| device_depth(device))
-        })
-        .map(|(device, _, _)| device.clone())
-        .ok_or_else(|| ApfsError::InvalidAttachmentPlist("no APFS device candidate".into()))?;
-    let whole = attachment_whole_device(reported_whole, &candidate)?;
-    Ok((whole, candidate))
-}
-
-/// The `APFSContainerReference` that `diskutil info -plist` reports for an APFS physical store or
-/// volume. A device outside any container has no such key, which is the same "no volume" answer
-/// the full inventory would give for it.
-fn parse_container_reference_plist(candidate: &str, bytes: &[u8]) -> Result<String, ApfsError> {
-    let invalid = |message| ApfsError::VolumeResolutionFailed {
-        candidate: candidate.to_owned(),
-        reason: VolumeResolutionFailure::InvalidPlist(message),
-    };
-    let value = plist::Value::from_reader(std::io::Cursor::new(bytes))
-        .map_err(|error| invalid(error.to_string()))?;
-    let dictionary = value
-        .as_dictionary()
-        .ok_or_else(|| invalid("device info is not a dictionary".into()))?;
-    let Some(reference) = dictionary.get("APFSContainerReference") else {
-        return Err(ApfsError::VolumeResolutionFailed {
-            candidate: candidate.to_owned(),
-            reason: VolumeResolutionFailure::Missing,
-        });
-    };
-    let reference = reference
-        .as_string()
-        .ok_or_else(|| invalid("APFSContainerReference is not a string".into()))?;
-    // A container reference is a whole synthesized disk (`diskN`), never a slice.
-    let device = device_path(reference)
-        .filter(|device| device_depth(device) == 0)
-        .ok_or_else(|| invalid(format!("invalid APFSContainerReference {reference:?}")))?;
-    Ok(device.trim_start_matches("/dev/").to_owned())
-}
-
-fn parse_volume_list_plist(candidate: &str, bytes: &[u8]) -> Result<String, ApfsError> {
-    let invalid = |message| ApfsError::VolumeResolutionFailed {
-        candidate: candidate.to_owned(),
-        reason: VolumeResolutionFailure::InvalidPlist(message),
-    };
-    // Not `invalid`: a candidate that is not a volume device path is cowshed's own argv, so it
-    // must not be retried as though the host might change its mind.
-    let candidate_path =
-        volume_device_path(candidate).ok_or_else(|| ApfsError::VolumeResolutionFailed {
-            candidate: candidate.to_owned(),
-            reason: VolumeResolutionFailure::InvalidCandidate(candidate.to_owned()),
-        })?;
-    let value = plist::Value::from_reader(std::io::Cursor::new(bytes))
-        .map_err(|error| invalid(error.to_string()))?;
-    let containers = value
-        .as_dictionary()
-        .and_then(|root| root.get("Containers"))
-        .and_then(plist::Value::as_array)
-        .ok_or_else(|| invalid("missing Containers array".into()))?;
-    let mut matching_containers: usize = 0;
-    let mut devices = Vec::new();
-    for container in containers {
-        let dictionary = container
-            .as_dictionary()
-            .ok_or_else(|| invalid("container is not a dictionary".into()))?;
-        let mut container_volumes = Vec::new();
-        if let Some(volumes) = dictionary.get("Volumes") {
-            let volumes = volumes
-                .as_array()
-                .ok_or_else(|| invalid("Volumes is not an array".into()))?;
-            for volume in volumes {
-                let identifier = volume
-                    .as_dictionary()
-                    .and_then(|dictionary| dictionary.get("DeviceIdentifier"))
-                    .and_then(plist::Value::as_string)
-                    .ok_or_else(|| invalid("volume has no DeviceIdentifier string".into()))?;
-                let device = volume_device_path(identifier).ok_or_else(|| {
-                    invalid(format!("invalid volume DeviceIdentifier {identifier:?}"))
-                })?;
-                container_volumes.push(device);
-            }
-        }
-
-        let volume_matches = container_volumes
-            .iter()
-            .any(|device| device == &candidate_path);
-        let mut physical_store_matches = false;
-        if let Some(physical_stores) = dictionary.get("PhysicalStores") {
-            let physical_stores = physical_stores
-                .as_array()
-                .ok_or_else(|| invalid("PhysicalStores is not an array".into()))?;
-            for physical_store in physical_stores {
-                let identifier = physical_store
-                    .as_dictionary()
-                    .and_then(|dictionary| dictionary.get("DeviceIdentifier"))
-                    .and_then(plist::Value::as_string)
-                    .ok_or_else(|| {
-                        invalid("physical store has no DeviceIdentifier string".into())
-                    })?;
-                let device = device_path(identifier).ok_or_else(|| {
-                    invalid(format!(
-                        "invalid physical store DeviceIdentifier {identifier:?}"
-                    ))
-                })?;
-                physical_store_matches |= device == candidate_path;
-            }
-        }
-
-        if volume_matches || physical_store_matches {
-            matching_containers += 1;
-            devices.extend(container_volumes);
-        }
-    }
-
-    if matching_containers == 0 || devices.is_empty() {
-        return Err(ApfsError::VolumeResolutionFailed {
-            candidate: candidate.to_owned(),
-            reason: VolumeResolutionFailure::Missing,
-        });
-    }
-    if matching_containers != 1 || devices.len() != 1 {
-        return Err(ApfsError::VolumeResolutionFailed {
-            candidate: candidate.to_owned(),
-            reason: VolumeResolutionFailure::Ambiguous(devices),
-        });
-    }
-    Ok(devices.pop().expect("one device was counted"))
 }
 
 fn device_path(identifier: &str) -> Option<String> {
     let relative = identifier.strip_prefix("/dev/").unwrap_or(identifier);
     identifier_depth(relative)?;
     Some(format!("/dev/{relative}"))
-}
-
-fn volume_device_path(identifier: &str) -> Option<String> {
-    let device = device_path(identifier)?;
-    (device_depth(&device) > 0).then_some(device)
 }
 
 /// Slice depth of a `/dev/` device path; a string that is not a valid device path reads as depth
@@ -2419,12 +2024,6 @@ fn device_depth(device: &str) -> usize {
         .strip_prefix("/dev/")
         .and_then(identifier_depth)
         .unwrap_or(0)
-}
-
-fn device_is_descendant_of(device: &str, whole: &str) -> bool {
-    device
-        .strip_prefix(whole)
-        .is_some_and(|suffix| suffix.starts_with('s'))
 }
 
 fn whole_device_from(device: &str) -> Option<String> {
@@ -2518,12 +2117,6 @@ mod tests {
     use std::cell::{Ref, RefCell};
     use std::collections::{BTreeMap, VecDeque};
 
-    const PLIST: &str = r#"<?xml version="1.0"?><plist><dict><key>system-entities</key><array>
-      <dict><key>dev-entry</key><string>disk10</string><key>content-hint</key><string>GUID_partition_scheme</string></dict>
-      <dict><key>dev-entry</key><string>disk9s2</string><key>content-hint</key><string>Apple_APFS</string></dict>
-      <dict><key>dev-entry</key><string>disk10s1</string><key>content-hint</key><string>Apple_APFS_Volume</string><key>volume-kind</key><string>apfs</string></dict>
-    </array></dict></plist>"#;
-
     const EMPTY_ATTACHMENT_INVENTORY: &str =
         r#"<?xml version="1.0"?><plist><dict><key>images</key><array/></dict></plist>"#;
     const BLANK_ASIF_PLIST: &str = r#"<?xml version="1.0"?><plist><dict><key>system-entities</key><array>
@@ -2532,51 +2125,19 @@ mod tests {
 
     /// `diskutil image attach --nobrowse --noMount --plist` for a formatted image, captured live on
     /// macOS 26.6: the image's whole device carries no content hint, and the synthesized container
-    /// and its one case-sensitive volume follow it. The attach selector answers with the volume and
-    /// the whole disk it hangs from, the synthesized container.
+    /// and its one case-sensitive volume follow it. The attach answers with the volume and the
+    /// whole disk it hangs from, the synthesized container.
     const ATTACH_PLIST: &str = r#"<?xml version="1.0"?><plist><dict><key>system-entities</key><array>
       <dict><key>content-hint</key><string></string><key>dev-entry</key><string>disk4</string></dict>
       <dict><key>content-hint</key><string>Apple_APFS_Container</string><key>dev-entry</key><string>disk5</string></dict>
       <dict><key>content-hint</key><string>Apple_APFS_Volume</string><key>dev-entry</key><string>disk5s1</string><key>filesystem-name</key><string>Case-sensitive APFS</string><key>filesystem-type</key><string>apfs</string></dict>
     </array></dict></plist>"#;
 
-    /// `diskutil info -plist` for the volume [`ATTACH_PLIST`] reports.
-    const ATTACHED_DEVICE_INFO_PLIST: &str = r#"<?xml version="1.0"?><plist version="1.0"><dict>
-      <key>APFSContainerReference</key><string>disk5</string>
-      <key>FilesystemName</key><string>Case-sensitive APFS</string>
-    </dict></plist>"#;
-
-    /// `diskutil apfs list -plist disk5` for the container [`ATTACH_PLIST`] reports.
-    const ATTACHED_VOLUME_LIST_PLIST: &str = r#"<?xml version="1.0"?><plist version="1.0"><dict>
-      <key>Containers</key><array><dict>
-        <key>ContainerReference</key><string>disk5</string>
-        <key>PhysicalStores</key><array>
-          <dict><key>DeviceIdentifier</key><string>disk4</string></dict>
-        </array>
-        <key>Volumes</key><array>
-          <dict><key>DeviceIdentifier</key><string>disk5s1</string></dict>
-        </array>
-      </dict></array>
-    </dict></plist>"#;
-
-    /// [`ATTACHED_VOLUME_LIST_PLIST`] with a second volume in the container: no single answer.
-    const ATTACHED_AMBIGUOUS_VOLUME_LIST_PLIST: &str = r#"<?xml version="1.0"?><plist version="1.0"><dict>
-      <key>Containers</key><array><dict>
-        <key>PhysicalStores</key><array>
-          <dict><key>DeviceIdentifier</key><string>disk4</string></dict>
-        </array>
-        <key>Volumes</key><array>
-          <dict><key>DeviceIdentifier</key><string>disk5s1</string></dict>
-          <dict><key>DeviceIdentifier</key><string>/dev/disk5s3</string></dict>
-        </array>
-      </dict></array>
-    </dict></plist>"#;
-
     /// `hdiutil info -plist` for one attached ASIF image, captured live on macOS 26.6 and trimmed to
     /// the keys cowshed reads. This is the schema `existing_attachment` reads: partition-type GUID
-    /// `content-hint`s and no `volume-kind` — unlike attach stdout, whose string hints the attach
-    /// selector was written against. The GUID prefixes are Apple's fixed APFS types (the
-    /// synthesized store, then the volume); the device numbers are the live capture's.
+    /// `content-hint`s rather than attach stdout's string hints. The GUID prefixes are Apple's
+    /// fixed APFS types (the synthesized store, then the volume); the device numbers are the live
+    /// capture's.
     const INFO_INVENTORY_PLIST: &str = r#"<?xml version="1.0"?><plist><dict><key>images</key><array><dict>
       <key>image-path</key><string>/tmp/cowshed-target.asif</string>
       <key>blockcount</key><integer>125000</integer>
@@ -2587,92 +2148,6 @@ mod tests {
         <dict><key>content-hint</key><string>41504653-0000-11AA-AA11-00306543ECAC</string><key>dev-entry</key><string>/dev/disk15s1</string></dict>
       </array>
     </dict></array></dict></plist>"#;
-
-    /// Downstream fakes consistent with [`INFO_INVENTORY_PLIST`]: the volume GUID candidate
-    /// `disk15s1` resolves through its container `disk15` back to itself.
-    const INFO_DEVICE_INFO_PLIST: &str = r#"<?xml version="1.0"?><plist version="1.0"><dict>
-      <key>APFSContainerReference</key><string>disk15</string>
-    </dict></plist>"#;
-
-    const INFO_VOLUME_LIST_PLIST: &str = r#"<?xml version="1.0"?><plist version="1.0"><dict>
-      <key>Containers</key><array><dict>
-        <key>PhysicalStores</key><array>
-          <dict><key>DeviceIdentifier</key><string>disk14</string></dict>
-        </array>
-        <key>Volumes</key><array>
-          <dict><key>DeviceIdentifier</key><string>disk15s1</string></dict>
-        </array>
-      </dict></array>
-    </dict></plist>"#;
-
-    /// An attach whose APFS container sits in a partition slice of a GUID scheme rather than on
-    /// the whole device: the parser resolves the slice as the physical store and keeps the
-    /// partitioned whole device as the image's.
-    const PARTITIONED_ATTACH_PLIST: &str = r#"<?xml version="1.0"?><plist><dict><key>system-entities</key><array>
-      <dict><key>dev-entry</key><string>/dev/disk4</string><key>content-hint</key><string>GUID_partition_scheme</string></dict>
-      <dict><key>dev-entry</key><string>/dev/disk4s1</string><key>content-hint</key><string>Apple_APFS</string></dict>
-      <dict><key>dev-entry</key><string>/dev/disk5</string><key>content-hint</key><string>EF57347C-0000-11AA-AA11-00306543ECAC</string></dict>
-      <dict><key>dev-entry</key><string>/dev/disk5s1</string><key>content-hint</key><string>41504653-0000-11AA-AA11-00306543ECAC</string><key>volume-kind</key><string>apfs</string></dict>
-    </array></dict></plist>"#;
-
-    /// `diskutil info -plist` for the partition-slice physical store `disk4s1`.
-    const PARTITIONED_DEVICE_INFO_PLIST: &str = r#"<?xml version="1.0"?><plist version="1.0"><dict>
-      <key>APFSContainerReference</key><string>disk5</string>
-      <key>Content</key><string>Apple_APFS</string>
-    </dict></plist>"#;
-
-    const PARTITIONED_VOLUME_LIST_PLIST: &str = r#"<?xml version="1.0"?><plist version="1.0"><dict>
-      <key>Containers</key><array><dict>
-        <key>PhysicalStores</key><array>
-          <dict><key>DeviceIdentifier</key><string>disk4s1</string></dict>
-        </array>
-        <key>Volumes</key><array>
-          <dict><key>DeviceIdentifier</key><string>disk5s2</string></dict>
-        </array>
-      </dict></array>
-    </dict></plist>"#;
-
-    const EMPTY_VOLUME_LIST_PLIST: &str = r#"<?xml version="1.0"?><plist version="1.0"><dict>
-      <key>Containers</key><array><dict>
-        <key>PhysicalStores</key><array>
-          <dict><key>DeviceIdentifier</key><string>disk4s1</string></dict>
-        </array>
-        <key>Volumes</key><array/>
-      </dict></array>
-    </dict></plist>"#;
-
-    const AMBIGUOUS_VOLUME_LIST_PLIST: &str = r#"<?xml version="1.0"?><plist version="1.0"><dict>
-      <key>Containers</key><array><dict>
-        <key>PhysicalStores</key><array>
-          <dict><key>DeviceIdentifier</key><string>disk4s1</string></dict>
-        </array>
-        <key>Volumes</key><array>
-          <dict><key>DeviceIdentifier</key><string>disk5s2</string></dict>
-          <dict><key>DeviceIdentifier</key><string>/dev/disk5s3</string></dict>
-        </array>
-      </dict></array>
-    </dict></plist>"#;
-
-    const DUPLICATE_CONTAINER_MATCH_PLIST: &str = r#"<?xml version="1.0"?><plist version="1.0"><dict>
-      <key>Containers</key><array>
-        <dict>
-          <key>PhysicalStores</key><array>
-            <dict><key>DeviceIdentifier</key><string>disk4s1</string></dict>
-          </array>
-          <key>Volumes</key><array>
-            <dict><key>DeviceIdentifier</key><string>disk5s2</string></dict>
-          </array>
-        </dict>
-        <dict>
-          <key>PhysicalStores</key><array>
-            <dict><key>DeviceIdentifier</key><string>disk4s1</string></dict>
-          </array>
-          <key>Volumes</key><array>
-            <dict><key>DeviceIdentifier</key><string>disk6s2</string></dict>
-          </array>
-        </dict>
-      </array>
-    </dict></plist>"#;
 
     #[derive(Default)]
     struct RecordingRunner {
@@ -2719,7 +2194,7 @@ mod tests {
         }
     }
 
-    /// A backend whose graces each admit exactly two retries before giving up. The sleeper only
+    /// A backend whose detach graces each admit exactly two retries before giving up. The sleeper only
     /// records, so both bounds are reached in zero wall-clock time.
     fn graced_backend(
         outputs: impl IntoIterator<Item = CommandOutput>,
@@ -2728,10 +2203,6 @@ mod tests {
             RecordingRunner::with_outputs(outputs),
             RecordingSleeper::default(),
             DetachGrace {
-                total: Duration::from_millis(20),
-                poll: Duration::from_millis(10),
-            },
-            VolumeVisibilityGrace {
                 total: Duration::from_millis(20),
                 poll: Duration::from_millis(10),
             },
@@ -3219,13 +2690,14 @@ mod tests {
         assert!(backend.runner().requests().is_empty());
     }
 
+    /// The attach plist names the volume and its container, so the attach asks Disk Arbitration
+    /// nothing more: `diskutil info` and `diskutil apfs list` queue behind every arbitration
+    /// client on the host, and only re-read what the attach already said.
     #[test]
-    fn asif_attach_uses_read_only_inventory_then_diskutil_attach_and_fsck() {
+    fn asif_attach_takes_its_volume_from_the_attach_plist_without_disk_arbitration() {
         let backend = MacOsApfsBackend::new(RecordingRunner::with_outputs([
             CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY),
             CommandOutput::success(ATTACH_PLIST),
-            CommandOutput::success(ATTACHED_DEVICE_INFO_PLIST),
-            CommandOutput::success(ATTACHED_VOLUME_LIST_PLIST),
             CommandOutput::success([]),
             CommandOutput::success([]),
         ]));
@@ -3248,8 +2720,6 @@ mod tests {
             [
                 Path::new(HDIUTIL),
                 Path::new(DISKUTIL),
-                Path::new(DISKUTIL),
-                Path::new(DISKUTIL),
                 Path::new(FSCK_APFS),
                 Path::new(MOUNT_APFS),
             ]
@@ -3259,13 +2729,9 @@ mod tests {
             argv(&requests[1])[..5],
             ["image", "attach", "--nobrowse", "--noMount", "--plist"]
         );
-        // The attach reports the volume itself as the candidate; `diskutil info` names its
-        // container, and only that container is listed.
-        assert_eq!(argv(&requests[2]), ["info", "-plist", "/dev/disk5s1"]);
-        assert_eq!(argv(&requests[3]), ["apfs", "list", "-plist", "disk5"]);
-        assert_eq!(argv(&requests[4]), ["-q", "/dev/rdisk5s1"]);
+        assert_eq!(argv(&requests[2]), ["-q", "/dev/rdisk5s1"]);
         assert_eq!(
-            argv(&requests[5]),
+            argv(&requests[3]),
             [
                 "-o".to_owned(),
                 "nobrowse,owners".to_owned(),
@@ -3318,8 +2784,6 @@ mod tests {
         let backend = MacOsApfsBackend::new(RecordingRunner::with_outputs([
             CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY),
             CommandOutput::success(ATTACH_PLIST),
-            CommandOutput::success(ATTACHED_DEVICE_INFO_PLIST),
-            CommandOutput::success(ATTACHED_VOLUME_LIST_PLIST),
             CommandOutput::failure(8, "not clean"),
             holding("session.asif", "/dev/disk5"),
             CommandOutput::success([]),
@@ -3340,12 +2804,12 @@ mod tests {
                 && argv(&request) == ["-q", "/dev/rdisk5s1"]
         ));
         let requests = backend.runner().requests();
-        assert_eq!(requests.len(), 8);
-        assert_eq!(requests[4].program, Path::new(FSCK_APFS));
-        assert_eq!(argv(&requests[4]), ["-q", "/dev/rdisk5s1"]);
-        assert_eq!(argv(&requests[5]), ["info", "-plist"]);
-        assert_eq!(requests[6].program, Path::new(DISKUTIL));
-        assert_eq!(argv(&requests[6]), ["eject", "/dev/disk5"]);
+        assert_eq!(requests.len(), 6);
+        assert_eq!(requests[2].program, Path::new(FSCK_APFS));
+        assert_eq!(argv(&requests[2]), ["-q", "/dev/rdisk5s1"]);
+        assert_eq!(argv(&requests[3]), ["info", "-plist"]);
+        assert_eq!(requests[4].program, Path::new(DISKUTIL));
+        assert_eq!(argv(&requests[4]), ["eject", "/dev/disk5"]);
         assert!(
             !requests
                 .iter()
@@ -3354,223 +2818,13 @@ mod tests {
     }
 
     #[test]
-    fn missing_volume_resolution_detaches_the_whole_image_before_failing() {
-        // `graced_backend` rather than `new`: a `Missing` volume is now waited out as inventory
-        // lag, so the real 5s grace would be spent here for nothing. The contract under test is
-        // unchanged — a resolution that never succeeds still detaches the image it attached —
-        // but reaching it now takes every round of the grace.
-        let backend = graced_backend([
-            CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY),
-            CommandOutput::success(ATTACH_PLIST),
-            CommandOutput::success(ATTACHED_DEVICE_INFO_PLIST),
-            CommandOutput::success(EMPTY_VOLUME_LIST_PLIST),
-            CommandOutput::success(ATTACHED_DEVICE_INFO_PLIST),
-            CommandOutput::success(EMPTY_VOLUME_LIST_PLIST),
-            CommandOutput::success(ATTACHED_DEVICE_INFO_PLIST),
-            CommandOutput::success(EMPTY_VOLUME_LIST_PLIST),
-            holding("session.asif", "/dev/disk5"),
-            CommandOutput::success([]),
-            CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY),
-        ]);
-        let error = backend
-            .attach_verified(Path::new("session.asif"))
-            .unwrap_err();
-
-        assert!(matches!(
-            error,
-            ApfsError::VolumeResolutionFailed {
-                candidate,
-                reason: VolumeResolutionFailure::Missing,
-            } if candidate == "/dev/disk5s1"
-        ));
-        let requests = backend.runner().requests();
-        assert_eq!(requests.len(), 11);
-        for round in 0..3 {
-            assert_eq!(
-                argv(&requests[2 + round * 2]),
-                ["info", "-plist", "/dev/disk5s1"]
-            );
-            assert_eq!(
-                argv(&requests[3 + round * 2]),
-                ["apfs", "list", "-plist", "disk5"]
-            );
-        }
-        assert_eq!(argv(&requests[8]), ["info", "-plist"]);
-        assert_eq!(requests[9].program, Path::new(DISKUTIL));
-        assert_eq!(argv(&requests[9]), ["eject", "/dev/disk5"]);
-        assert_eq!(
-            backend.sleeper.waits().len(),
-            2,
-            "two polls, then a verdict"
-        );
-    }
-
-    #[test]
-    fn ambiguous_volume_and_detach_failures_preserve_both_typed_errors() {
-        let backend = graced_backend([
-            CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY),
-            CommandOutput::success(ATTACH_PLIST),
-            CommandOutput::success(ATTACHED_DEVICE_INFO_PLIST),
-            CommandOutput::success(ATTACHED_AMBIGUOUS_VOLUME_LIST_PLIST),
-            holding("session.asif", "/dev/disk5"),
-            dissent(),
-            dissent(),
-            dissent(),
-            dissent(),
-        ]);
-        let error = backend
-            .attach_verified(Path::new("session.asif"))
-            .unwrap_err();
-
-        assert!(std::error::Error::source(&error).is_some());
-        match error {
-            ApfsError::VolumeResolutionAndDetachFailed {
-                whole_device,
-                resolution,
-                detach,
-            } => {
-                assert_eq!(whole_device, "/dev/disk5");
-                assert!(matches!(
-                    *resolution,
-                    ApfsError::VolumeResolutionFailed {
-                        candidate,
-                        reason: VolumeResolutionFailure::Ambiguous(devices),
-                    } if candidate == "/dev/disk5s1"
-                        && devices == ["/dev/disk5s1", "/dev/disk5s3"]
-                ));
-                assert!(matches!(
-                    *detach,
-                    ApfsError::CommandFailed {
-                        operation: "detach image",
-                        output: CommandOutput {
-                            status: ProcessStatus::Exit(1),
-                            ..
-                        },
-                        ..
-                    }
-                ));
-            }
-            other => panic!("unexpected error: {other}"),
-        }
-        // The cleanup detach is a Release: it holds the volume to the full grace and then forces,
-        // and only a dissent that outlasts even that is reported beside the resolution failure.
-        let requests = backend.runner().requests();
-        assert_eq!(requests.len(), 9);
-        assert_eq!(argv(&requests[5]), ["eject", "/dev/disk5"]);
-        assert_eq!(argv(&requests[8]), ["eject", "force", "/dev/disk5"]);
-    }
-
-    #[test]
-    fn failed_volume_resolution_command_detaches_and_preserves_command_error() {
-        let backend = MacOsApfsBackend::new(RecordingRunner::with_outputs([
-            CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY),
-            CommandOutput::success(ATTACH_PLIST),
-            CommandOutput::success(ATTACHED_DEVICE_INFO_PLIST),
-            CommandOutput::failure(3, "list failed"),
-            holding("session.asif", "/dev/disk5"),
-            CommandOutput::success([]),
-            CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY),
-        ]));
-        let error = backend
-            .attach_verified(Path::new("session.asif"))
-            .unwrap_err();
-
-        assert!(matches!(
-            error,
-            ApfsError::CommandFailed {
-                operation: "resolve APFS volume",
-                output: CommandOutput {
-                    status: ProcessStatus::Exit(3),
-                    ..
-                },
-                ..
-            }
-        ));
-        let requests = backend.runner().requests();
-        assert_eq!(requests.len(), 7);
-        assert_eq!(argv(&requests[5]), ["eject", "/dev/disk5"]);
-    }
-
-    #[test]
-    fn failed_device_inspection_detaches_and_preserves_command_error() {
-        let backend = MacOsApfsBackend::new(RecordingRunner::with_outputs([
-            CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY),
-            CommandOutput::success(ATTACH_PLIST),
-            CommandOutput::failure(1, "Could not find disk"),
-            holding("session.asif", "/dev/disk5"),
-            CommandOutput::success([]),
-            CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY),
-        ]));
-        let error = backend
-            .attach_verified(Path::new("session.asif"))
-            .unwrap_err();
-
-        assert!(matches!(
-            error,
-            ApfsError::CommandFailed {
-                operation: "inspect APFS device",
-                output: CommandOutput {
-                    status: ProcessStatus::Exit(1),
-                    ..
-                },
-                ..
-            }
-        ));
-        let requests = backend.runner().requests();
-        assert_eq!(requests.len(), 6);
-        assert_eq!(argv(&requests[4]), ["eject", "/dev/disk5"]);
-    }
-
-    #[test]
-    fn a_device_outside_any_container_is_a_missing_volume_not_a_host_walk() {
-        let info_without_container = || {
-            CommandOutput::success(
-                r#"<?xml version="1.0"?><plist version="1.0"><dict><key>Content</key><string>Apple_HFS</string></dict></plist>"#,
-            )
-        };
-        // `graced_backend`: a device that names no container reads as inventory lag one step
-        // earlier than a missing volume — the reference is not populated yet — so it is waited
-        // out too. The contract this test defends is unchanged: the answer is `Missing`, and the
-        // unscoped host walk is never reached no matter how many rounds it takes.
-        let backend = graced_backend([
-            CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY),
-            CommandOutput::success(ATTACH_PLIST),
-            info_without_container(),
-            info_without_container(),
-            info_without_container(),
-            holding("session.asif", "/dev/disk5"),
-            CommandOutput::success([]),
-            CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY),
-        ]);
-        let error = backend
-            .attach_verified(Path::new("session.asif"))
-            .unwrap_err();
-        assert!(matches!(
-            error,
-            ApfsError::VolumeResolutionFailed {
-                candidate,
-                reason: VolumeResolutionFailure::Missing,
-            } if candidate == "/dev/disk5s1"
-        ));
-        let requests = backend.runner().requests();
-        assert_eq!(requests.len(), 8);
-        assert!(
-            !requests
-                .iter()
-                .any(|request| argv(request).first().is_some_and(|arg| arg == "apfs")),
-            "no container inventory is walked when the device is not in a container"
-        );
-        assert_eq!(argv(&requests[6]), ["eject", "/dev/disk5"]);
-    }
-
-    #[test]
     fn parsed_attach_never_detaches_a_preexisting_same_image_device() {
         let image = Path::new("/tmp/cowshed-preexisting.asif");
         let inventory =
-            attachment_inventory(&[("/tmp/cowshed-preexisting.asif", &["/dev/disk10"][..])]);
+            attachment_inventory(&[("/tmp/cowshed-preexisting.asif", &["/dev/disk5"][..])]);
         let backend = MacOsApfsBackend::new(RecordingRunner::with_outputs([
             CommandOutput::success(inventory.as_bytes()),
-            CommandOutput::success(PLIST),
+            CommandOutput::success(ATTACH_PLIST),
             CommandOutput::success(inventory.as_bytes()),
             CommandOutput::success(inventory.as_bytes()),
         ]));
@@ -4714,11 +3968,10 @@ mod tests {
 
     #[test]
     fn existing_attachment_reuses_one_inventory_mapping_without_attaching_again() {
-        let backend = MacOsApfsBackend::new(RecordingRunner::with_outputs([
-            CommandOutput::success(INFO_INVENTORY_PLIST),
-            CommandOutput::success(INFO_DEVICE_INFO_PLIST),
-            CommandOutput::success(INFO_VOLUME_LIST_PLIST),
-        ]));
+        let backend =
+            MacOsApfsBackend::new(RecordingRunner::with_outputs([CommandOutput::success(
+                INFO_INVENTORY_PLIST,
+            )]));
 
         let attachment = backend
             .existing_attachment(Path::new("/tmp/cowshed-target.asif"))
@@ -4727,7 +3980,11 @@ mod tests {
         assert_eq!(attachment.whole_device(), "/dev/disk15");
         assert_eq!(attachment.volume_device(), "/dev/disk15s1");
         let requests = backend.runner().requests();
-        assert_eq!(requests.len(), 3);
+        assert_eq!(
+            requests.len(),
+            1,
+            "the inventory names the volume; nothing else is asked"
+        );
         assert_eq!(argv(&requests[0]), ["info", "-plist"]);
         assert!(
             requests
@@ -4754,11 +4011,71 @@ mod tests {
             .and_then(plist::Value::as_array)
             .unwrap()
             .as_slice();
-        let (whole, candidate) = parse_inventory_attachment_entities(entities).unwrap();
+        let (whole, volume) =
+            attached_apfs_volume(&collect_attachment_entities(entities).unwrap()).unwrap();
         // The synthesized APFS volume, not the image's own device or the synthesized store, and
         // the whole disk that volume hangs from.
-        assert_eq!(candidate, "/dev/disk15s1");
+        assert_eq!(volume, "/dev/disk15s1");
         assert_eq!(whole, "/dev/disk15");
+    }
+
+    /// An attach that does not report exactly one APFS volume inside a container it also reports
+    /// is refused with what it reported: an image holds one volume in one container, so two
+    /// volumes, none, or a volume whose container is missing are not an image's attachment.
+    #[test]
+    fn an_attach_plist_without_exactly_one_contained_volume_is_refused() {
+        let plist = |entities: &[(&str, &str)]| {
+            let rows: String = entities
+                .iter()
+                .map(|(device, hint)| {
+                    format!(
+                        "<dict><key>content-hint</key><string>{hint}</string><key>dev-entry</key><string>{device}</string></dict>"
+                    )
+                })
+                .collect();
+            format!(
+                r#"<?xml version="1.0"?><plist><dict><key>system-entities</key><array>{rows}</array></dict></plist>"#
+            )
+        };
+        assert_eq!(
+            parse_attachment_plist(ATTACH_PLIST.as_bytes()).unwrap(),
+            ("/dev/disk5".into(), "/dev/disk5s1".into())
+        );
+        for (entities, refusal) in [
+            (
+                &[
+                    ("disk4", ""),
+                    ("disk5", "Apple_APFS_Container"),
+                    ("disk5s1", "Apple_APFS_Volume"),
+                    ("disk5s2", "Apple_APFS_Volume"),
+                ][..],
+                r#"expected one APFS volume, reported ["/dev/disk5s1", "/dev/disk5s2"]"#,
+            ),
+            (
+                &[("disk4", ""), ("disk5", "Apple_APFS_Container")][..],
+                "expected one APFS volume, reported []",
+            ),
+            (
+                &[("disk4", ""), ("disk5s1", "Apple_APFS_Volume")][..],
+                "APFS volume /dev/disk5s1 was reported without its container /dev/disk5",
+            ),
+            (
+                &[
+                    ("disk4", ""),
+                    ("disk6", "Apple_APFS_Container"),
+                    ("disk5s1", "Apple_APFS_Volume"),
+                ][..],
+                "APFS volume /dev/disk5s1 was reported without its container /dev/disk5",
+            ),
+        ] {
+            assert!(
+                matches!(
+                    parse_attachment_plist(plist(entities).as_bytes()),
+                    Err(ApfsError::InvalidAttachmentPlist(message)) if message == refusal
+                ),
+                "{entities:?}"
+            );
+        }
     }
 
     #[test]
@@ -4803,178 +4120,6 @@ mod tests {
                 .unwrap(),
             parsed.capacity.unwrap()
         );
-    }
-
-    #[test]
-    fn plist_selects_apfs_volume_and_whole_image_device() {
-        assert_eq!(
-            parse_attachment_plist(PLIST.as_bytes()).unwrap(),
-            ("/dev/disk10".into(), "/dev/disk10s1".into())
-        );
-    }
-
-    #[test]
-    fn partitioned_attachment_plist_preserves_image_whole_device_over_container_device() {
-        assert_eq!(
-            parse_attachment_plist(PARTITIONED_ATTACH_PLIST.as_bytes()).unwrap(),
-            ("/dev/disk4".into(), "/dev/disk4s1".into())
-        );
-    }
-
-    #[test]
-    fn attachment_candidate_filter_rejects_unrelated_and_non_apfs_devices() {
-        let plist = br#"<plist><dict><key>system-entities</key><array>
-          <dict><key>dev-entry</key><string>disk1</string>
-            <key>content-hint</key><string>GUID_partition_scheme</string></dict>
-          <dict><key>dev-entry</key><string>disk9s1</string>
-            <key>content-hint</key><string>Apple_APFS</string></dict>
-          <dict><key>dev-entry</key><string>disk1s2s9</string>
-            <key>content-hint</key><string>Apple_HFS</string></dict>
-          <dict><key>dev-entry</key><string>disk1s1</string>
-            <key>content-hint</key><string>Apple_APFS_Volume</string>
-            <key>volume-kind</key><string>apfs</string></dict>
-        </array></dict></plist>"#;
-        assert_eq!(
-            parse_attachment_plist(plist).unwrap(),
-            ("/dev/disk1".into(), "/dev/disk1s1".into())
-        );
-    }
-
-    #[test]
-    fn volume_list_plist_selects_one_volume_and_rejects_zero_or_many() {
-        assert_eq!(
-            parse_volume_list_plist("/dev/disk4s1", PARTITIONED_VOLUME_LIST_PLIST.as_bytes())
-                .unwrap(),
-            "/dev/disk5s2"
-        );
-        assert!(matches!(
-            parse_volume_list_plist("/dev/disk4s1", EMPTY_VOLUME_LIST_PLIST.as_bytes()),
-            Err(ApfsError::VolumeResolutionFailed {
-                candidate,
-                reason: VolumeResolutionFailure::Missing,
-            }) if candidate == "/dev/disk4s1"
-        ));
-        assert!(matches!(
-            parse_volume_list_plist("/dev/disk4s1", AMBIGUOUS_VOLUME_LIST_PLIST.as_bytes()),
-            Err(ApfsError::VolumeResolutionFailed {
-                candidate,
-                reason: VolumeResolutionFailure::Ambiguous(devices),
-            }) if candidate == "/dev/disk4s1"
-                && devices == ["/dev/disk5s2", "/dev/disk5s3"]
-        ));
-    }
-
-    #[test]
-    fn duplicate_container_matches_are_ambiguous_even_with_one_volume_each() {
-        assert!(matches!(
-            parse_volume_list_plist("/dev/disk4s1", DUPLICATE_CONTAINER_MATCH_PLIST.as_bytes()),
-            Err(ApfsError::VolumeResolutionFailed {
-                candidate,
-                reason: VolumeResolutionFailure::Ambiguous(devices),
-            }) if candidate == "/dev/disk4s1"
-                && devices == ["/dev/disk5s2", "/dev/disk6s2"]
-        ));
-    }
-
-    /// What the scoped `diskutil apfs list -plist <container>` actually returns, with exit status
-    /// ZERO, while Disk Arbitration is still announcing a just-attached image: a well-formed
-    /// plist that mentions no container at all.
-    const UNANNOUNCED_VOLUME_LIST_PLIST: &str =
-        r#"<?xml version="1.0"?><plist version="1.0"><dict></dict></plist>"#;
-
-    #[test]
-    fn volume_resolution_waits_for_an_inventory_that_has_not_announced_the_container_yet() {
-        let backend = graced_backend([
-            CommandOutput::success(PARTITIONED_DEVICE_INFO_PLIST.as_bytes().to_vec()),
-            CommandOutput::success(UNANNOUNCED_VOLUME_LIST_PLIST.as_bytes().to_vec()),
-            CommandOutput::success(PARTITIONED_DEVICE_INFO_PLIST.as_bytes().to_vec()),
-            CommandOutput::success(EMPTY_VOLUME_LIST_PLIST.as_bytes().to_vec()),
-            CommandOutput::success(PARTITIONED_DEVICE_INFO_PLIST.as_bytes().to_vec()),
-            CommandOutput::success(PARTITIONED_VOLUME_LIST_PLIST.as_bytes().to_vec()),
-        ]);
-        // A missing `Containers` array, then a container that does not list the volume yet, then
-        // the truth. Both intermediate answers carried exit status zero.
-        assert_eq!(
-            backend.resolve_apfs_volume("/dev/disk4s1").unwrap(),
-            "/dev/disk5s2"
-        );
-        assert_eq!(
-            *backend.sleeper.waits(),
-            [Duration::from_millis(10), Duration::from_millis(10)]
-        );
-    }
-
-    #[test]
-    fn volume_resolution_reports_an_ambiguous_inventory_at_once() {
-        let backend = graced_backend([
-            CommandOutput::success(PARTITIONED_DEVICE_INFO_PLIST.as_bytes().to_vec()),
-            CommandOutput::success(AMBIGUOUS_VOLUME_LIST_PLIST.as_bytes().to_vec()),
-        ]);
-        // Two containers claiming one physical store is "announced twice", not "not yet
-        // announced". Nothing observed suggests it settles, and a persistent ambiguity is a
-        // hazard worth surfacing now rather than after the grace.
-        assert!(matches!(
-            backend.resolve_apfs_volume("/dev/disk4s1"),
-            Err(ApfsError::VolumeResolutionFailed {
-                reason: VolumeResolutionFailure::Ambiguous(devices),
-                ..
-            }) if devices == ["/dev/disk5s2", "/dev/disk5s3"]
-        ));
-        assert!(backend.sleeper.waits().is_empty());
-    }
-
-    #[test]
-    fn volume_resolution_gives_up_when_the_inventory_never_announces_the_container() {
-        let torn = || {
-            [
-                CommandOutput::success(PARTITIONED_DEVICE_INFO_PLIST.as_bytes().to_vec()),
-                CommandOutput::success(UNANNOUNCED_VOLUME_LIST_PLIST.as_bytes().to_vec()),
-            ]
-        };
-        let backend = graced_backend(
-            torn()
-                .into_iter()
-                .chain(torn())
-                .chain(torn())
-                .collect::<Vec<_>>(),
-        );
-        // The grace is bounded: a host that never settles must still produce a verdict, and the
-        // verdict must be the host's own last answer rather than a synthesized one.
-        assert!(matches!(
-            backend.resolve_apfs_volume("/dev/disk4s1"),
-            Err(ApfsError::VolumeResolutionFailed {
-                candidate,
-                reason: VolumeResolutionFailure::InvalidPlist(message),
-            }) if candidate == "/dev/disk4s1" && message == "missing Containers array"
-        ));
-        assert_eq!(
-            backend.sleeper.waits().len(),
-            2,
-            "two polls, then a verdict"
-        );
-        assert_eq!(
-            backend.runner().requests().len(),
-            6,
-            "three rounds of info + scoped list"
-        );
-    }
-
-    #[test]
-    fn volume_resolution_rejects_cowsheds_own_malformed_candidate_without_waiting() {
-        let backend = graced_backend([
-            CommandOutput::success(PARTITIONED_DEVICE_INFO_PLIST.as_bytes().to_vec()),
-            CommandOutput::success(PARTITIONED_VOLUME_LIST_PLIST.as_bytes().to_vec()),
-        ]);
-        // A whole device is not a volume device. That is cowshed's argv, not the host's answer,
-        // so no amount of settling could change it and the grace must not be spent on it.
-        assert!(matches!(
-            backend.resolve_apfs_volume("/dev/disk4"),
-            Err(ApfsError::VolumeResolutionFailed {
-                reason: VolumeResolutionFailure::InvalidCandidate(candidate),
-                ..
-            }) if candidate == "/dev/disk4"
-        ));
-        assert!(backend.sleeper.waits().is_empty());
     }
 
     const ASIF_RESIZE_LIMITS_PLIST: &str = r#"<?xml version="1.0"?><plist version="1.0"><dict>
@@ -5047,8 +4192,6 @@ mod tests {
             let backend = MacOsApfsBackend::new(RecordingRunner::with_outputs([
                 CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY),
                 CommandOutput::success(ATTACH_PLIST),
-                CommandOutput::success(ATTACHED_DEVICE_INFO_PLIST),
-                CommandOutput::success(ATTACHED_VOLUME_LIST_PLIST),
                 CommandOutput::success([]),
                 CommandOutput::failure(1, refusal),
             ]));
@@ -5064,8 +4207,6 @@ mod tests {
         let backend = MacOsApfsBackend::new(RecordingRunner::with_outputs([
             CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY),
             CommandOutput::success(ATTACH_PLIST),
-            CommandOutput::success(ATTACHED_DEVICE_INFO_PLIST),
-            CommandOutput::success(ATTACHED_VOLUME_LIST_PLIST),
             CommandOutput::success([]),
             CommandOutput::failure(1, "Error: -69620: The given file system is not supported"),
         ]));
@@ -5098,36 +4239,9 @@ mod tests {
     }
 
     #[test]
-    fn volume_list_plist_rejects_malformed_shapes_and_device_identifiers() {
-        for plist in [
-            b"not a plist".as_slice(),
-            br#"<?xml version="1.0"?><plist><dict></dict></plist>"#.as_slice(),
-            br#"<?xml version="1.0"?><plist><dict><key>Containers</key><array>
-                <dict><key>Volumes</key><array><dict><key>DeviceIdentifier</key>
-                <string>not-a-device</string></dict></array></dict>
-                </array></dict></plist>"#
-                .as_slice(),
-        ] {
-            assert!(matches!(
-                parse_volume_list_plist("/dev/disk5s1", plist),
-                Err(ApfsError::VolumeResolutionFailed {
-                    candidate,
-                    reason: VolumeResolutionFailure::InvalidPlist(_),
-                }) if candidate == "/dev/disk5s1"
-            ));
-        }
-    }
-
-    #[test]
     fn device_identifier_helpers_preserve_block_and_raw_volume_identity() {
         assert_eq!(device_path("disk12"), Some("/dev/disk12".into()));
         assert_eq!(device_path("disk12s3"), Some("/dev/disk12s3".into()));
-        assert_eq!(volume_device_path("disk12s3"), Some("/dev/disk12s3".into()));
-        assert_eq!(
-            volume_device_path("/dev/disk12s3s1"),
-            Some("/dev/disk12s3s1".into())
-        );
-        assert_eq!(volume_device_path("disk12"), None);
         // Leading zeros never appear in kernel device names; a second spelling of the same
         // device would defeat the textual identity comparisons, so it is rejected here exactly
         // as it always was in `is_kernel_device_path`.
@@ -5140,43 +4254,8 @@ mod tests {
             "disk12s03",
         ] {
             assert_eq!(device_path(invalid), None);
-            assert_eq!(volume_device_path(invalid), None);
         }
         assert_eq!(raw_device_from("/dev/disk12s3"), "/dev/rdisk12s3");
-    }
-
-    #[test]
-    fn plist_accepts_each_apfs_volume_marker_and_prefers_deepest_volume() {
-        let hint_only = br#"<plist><dict><key>system-entities</key><array>
-            <dict><key>dev-entry</key><string>/dev/disk4</string></dict>
-            <dict><key>dev-entry</key><string>/dev/disk4s1</string>
-            <key>content-hint</key><string>Apple_APFS_Volume</string></dict>
-            </array></dict></plist>"#;
-        assert_eq!(
-            parse_attachment_plist(hint_only).unwrap(),
-            ("/dev/disk4".into(), "/dev/disk4s1".into())
-        );
-
-        let kind_only = br#"<plist><dict><key>system-entities</key><array>
-            <dict><key>dev-entry</key><string>/dev/disk5</string></dict>
-            <dict><key>dev-entry</key><string>/dev/disk5s2</string>
-            <key>volume-kind</key><string>APFS</string></dict>
-            </array></dict></plist>"#;
-        assert_eq!(
-            parse_attachment_plist(kind_only).unwrap(),
-            ("/dev/disk5".into(), "/dev/disk5s2".into())
-        );
-
-        let nested = br#"<plist><dict><key>system-entities</key><array>
-            <dict><key>dev-entry</key><string>/dev/disk7s1</string>
-            <key>content-hint</key><string>Apple_APFS</string></dict>
-            <dict><key>dev-entry</key><string>/dev/disk7s1s2</string>
-            <key>content-hint</key><string>Apple_APFS</string></dict>
-            </array></dict></plist>"#;
-        assert_eq!(
-            parse_attachment_plist(nested).unwrap(),
-            ("/dev/disk7".into(), "/dev/disk7s1s2".into())
-        );
     }
 
     #[test]
@@ -5194,16 +4273,6 @@ mod tests {
         // must not be truncated into a plausible container.
         assert_eq!(whole_device_from("/dev/disk12sx"), None);
         assert_eq!(whole_device_from("/dev/disk01s1"), None);
-
-        let invalid = br#"<plist><dict><key>system-entities</key><array>
-            <dict><key>dev-entry</key><string>/dev/not-a-disk</string>
-            <key>volume-kind</key><string>apfs</string></dict>
-            </array></dict></plist>"#;
-        assert!(matches!(
-            parse_attachment_plist(invalid),
-            Err(ApfsError::InvalidAttachmentPlist(message))
-                if message == "invalid APFS device"
-        ));
     }
 
     #[test]

@@ -43,17 +43,11 @@ const ATTACH_PLIST: &str = r#"<?xml version="1.0"?><plist><dict><key>system-enti
 <dict><key>content-hint</key><string>Apple_APFS_Volume</string><key>dev-entry</key><string>/dev/disk10s1</string><key>filesystem-type</key><string>apfs</string></dict>
 </array></dict></plist>"#;
 
-const APFS_LIST_PLIST: &str = r#"<?xml version="1.0"?><plist><dict><key>Containers</key><array><dict>
-<key>ContainerReference</key><string>disk10</string>
-<key>PhysicalStores</key><array><dict><key>DeviceIdentifier</key><string>disk9</string></dict></array>
-<key>Volumes</key><array><dict><key>DeviceIdentifier</key><string>disk10s1</string></dict></array>
-</dict></array></dict></plist>"#;
-
 const EMPTY_ATTACHMENT_INVENTORY: &str =
     r#"<?xml version="1.0"?><plist><dict><key>images</key><array/></dict></plist>"#;
 
 /// `diskutil info -plist <device>` for a device in the fixture's single container: names the
-/// volume (for rename checks) and the container (for attach-time volume resolution).
+/// volume, for rename checks.
 fn device_info_plist(device: &str, volume_name: &str) -> Vec<u8> {
     format!(
         "<?xml version=\"1.0\"?><plist><dict><key>DeviceIdentifier</key><string>{device}</string><key>VolumeName</key><string>{volume_name}</string><key>APFSContainerReference</key><string>disk10</string></dict></plist>"
@@ -81,8 +75,6 @@ impl FakeInventory {
         } else if args.starts_with(&["image".into(), "attach".into()]) {
             attached.push(args.last().expect("attached image").clone());
             ATTACH_PLIST.as_bytes().to_vec()
-        } else if args.starts_with(&["apfs".into(), "list".into()]) {
-            APFS_LIST_PLIST.as_bytes().to_vec()
         } else {
             if args.first().is_some_and(|argument| argument == "eject") {
                 // Every fixture attachment holds the same devices, so a detach releases all.
@@ -904,8 +896,8 @@ fn mount_registry_actor_owns_attachment_state() {
         .expect("detach retained image");
     assert_eq!(
         runner.calls(),
-        9,
-        "inventory, attach, device inspection, volume resolution, fsck, mount, the detach's identity read, detach, and detach-settle cross the command boundary"
+        7,
+        "inventory, attach, fsck, mount, the detach's identity read, detach, and detach-settle cross the command boundary"
     );
 }
 
@@ -1855,8 +1847,8 @@ fn reverse_teardown_drains_actor_state_and_detaches_every_attachment() {
 
     assert_eq!(
         runner.calls(),
-        8,
-        "inventory, attach, inspect, resolve, fsck, the detach's identity read, detach, and detach-settle"
+        6,
+        "inventory, attach, fsck, the detach's identity read, detach, and detach-settle"
     );
 }
 
@@ -1920,8 +1912,8 @@ fn direct_detach_crosses_the_backend_boundary() {
 
     assert_eq!(
         runner.calls(),
-        8,
-        "inventory, attach, inspect, resolve, fsck, the detach's identity read, detach, and detach-settle"
+        6,
+        "inventory, attach, fsck, the detach's identity read, detach, and detach-settle"
     );
 }
 
@@ -4483,12 +4475,7 @@ impl CommandRunner for ResizeRunner {
             .map(|argument| argument.to_string_lossy().into_owned())
             .collect();
         let head: Vec<&str> = args.iter().take(3).map(String::as_str).collect();
-        let is_diskutil = request.program == Path::new("/usr/sbin/diskutil");
         Ok(match head.as_slice() {
-            ["info", "-plist", ..] if is_diskutil => CommandOutput::success(device_info_plist(
-                args[2].trim_start_matches("/dev/"),
-                "cowshed.acme--widget.main",
-            )),
             ["info", "-plist", ..] => CommandOutput::success(self.inventory()),
             ["image", "resize", "--plist"] => CommandOutput::success(self.limits()),
             ["image", "resize", "--size"] => {
@@ -4516,7 +4503,6 @@ impl CommandRunner for ResizeRunner {
                     CommandOutput::success([])
                 }
             }
-            ["apfs", "list", ..] => CommandOutput::success(APFS_LIST_PLIST.as_bytes().to_vec()),
             _ => CommandOutput::success([]),
         })
     }
@@ -4594,19 +4580,6 @@ fn resizing_a_detached_workspace_grows_the_image_then_the_container_and_verifies
                 "--noMount".into(),
                 "--plist".into(),
                 image_path,
-            ],
-            vec![
-                "/usr/sbin/diskutil".to_owned(),
-                "info".into(),
-                "-plist".into(),
-                "/dev/disk10s1".into(),
-            ],
-            vec![
-                "/usr/sbin/diskutil".to_owned(),
-                "apfs".into(),
-                "list".into(),
-                "-plist".into(),
-                "disk10".into(),
             ],
             vec![
                 "/sbin/fsck_apfs".to_owned(),
