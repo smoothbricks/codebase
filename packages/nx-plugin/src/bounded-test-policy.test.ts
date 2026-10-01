@@ -564,7 +564,10 @@ describe('cargo-test reachability policy', () => {
             'cargo-test-rusty-core',
             {
               command:
-                "cargo --frozen nextest run --archive-file target/nextest/archive.tar.zst --workspace-remap . -E 'package(rusty-core)'",
+                'extracted="$(node ../../node_modules/@smoothbricks/nx-plugin/dist/bin/smoo-nx-nextest-extract.js target/nextest/archive.tar.zst)" && ' +
+                'cargo --frozen nextest run --binaries-metadata "$extracted/target/nextest/binaries-metadata.json" ' +
+                '--cargo-metadata "$extracted/target/nextest/cargo-metadata.json" --target-dir-remap "$extracted/target" ' +
+                "--workspace-remap . -E 'package(rusty-core)'",
             },
           ],
         ]),

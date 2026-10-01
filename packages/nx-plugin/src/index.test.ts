@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'bun:test';
-import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readdir, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -904,13 +904,15 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       }
       expect(targets['cargo-test-ferris-core']?.dependsOn).toEqual(['cargo-fetch', 'cargo-test-archive']);
       expect(targets['cargo-test-ferris-wasm']?.dependsOn).toEqual(['cargo-fetch', 'cargo-test-archive']);
-      // The runner executes the archive's binaries and remaps the workspace
-      // root: without `--workspace-remap`, a restored archive hands tests the
-      // PRODUCING tree's absolute CARGO_MANIFEST_DIR (measured on a moved tree).
-      // `--workspace` is not merely redundant here, nextest rejects it with
-      // `--archive-file`.
+      // The runner executes the archive's binaries, unpacked once for every
+      // runner by the plugin's helper (through the root `node_modules` link,
+      // so the hashed command names no machine path), and remaps the
+      // workspace root: without `--workspace-remap`, a restored archive hands
+      // tests the PRODUCING tree's absolute CARGO_MANIFEST_DIR (measured on a
+      // moved tree). `--workspace` is not merely redundant here, nextest
+      // rejects it beside a reused build.
       expect(targets['cargo-test-ferris-core']?.options?.command).toMatch(
-        /^cargo --frozen nextest run --archive-file target\/nextest\/archive\.tar\.zst --workspace-remap \. -E 'package\(ferris-core\)' --no-tests=pass --user-config-file none --tool-config-file "smoo:\$PWD\/.*nextest\.toml"$/,
+        /^extracted="\$\(node \.\.\/\.\.\/node_modules\/@smoothbricks\/nx-plugin\/dist\/bin\/smoo-nx-nextest-extract\.js target\/nextest\/archive\.tar\.zst\)" && cargo --frozen nextest run --binaries-metadata "\$extracted\/target\/nextest\/binaries-metadata\.json" --cargo-metadata "\$extracted\/target\/nextest\/cargo-metadata\.json" --target-dir-remap "\$extracted\/target" --workspace-remap \. -E 'package\(ferris-core\)' --no-tests=pass --user-config-file none --tool-config-file "smoo:\$PWD\/.*nextest\.toml"$/,
       );
       expect(targets['cargo-test-ferris-core']?.inputs).toContain(
         '{workspaceRoot}/packages/ferris/.config/nextest.toml',
@@ -1134,8 +1136,12 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       expect(runtime['cargo-test-runtime-core-shard2']?.dependsOn).toEqual([rootFetch, rootArchive]);
       expect(runtime['cargo-test-runtime-core-exceptions']?.dependsOn).toEqual([rootFetch, rootArchive]);
       expect(runtime['cargo-test-runtime-core-shard1']?.options).toMatchObject({ cwd: '.' });
+      // At the root the helper is the root's own `node_modules` link, no `../`.
+      expect(runtime['cargo-test-runtime-core-shard1']?.options?.command).toStartWith(
+        'extracted="$(node node_modules/@smoothbricks/nx-plugin/dist/bin/smoo-nx-nextest-extract.js target/nextest/archive.tar.zst)" && ',
+      );
       expect(runtime['cargo-test-runtime-core-shard1']?.options?.command).toContain(
-        "nextest run --archive-file target/nextest/archive.tar.zst --workspace-remap . -E 'package(runtime-core)",
+        `--target-dir-remap "$extracted/target" --workspace-remap . -E 'package(runtime-core)`,
       );
       expect(native['cargo-test-native-napi']?.options?.command).toContain('--no-tests=pass');
       expect(runtime['cargo-test']?.dependsOn).toEqual([
@@ -1377,18 +1383,118 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       // Scoped by filterset over one archived workspace build: exactly one
       // crate runs, and no `-p` re-resolves its features.
       expect(cargoPackageSelection(String(targets['cargo-test-ferris-core']?.options?.command ?? ''))).toEqual({
-        archiveRun: true,
+        prebuiltRun: true,
         packageFlags: [],
         filtered: ['ferris-core'],
       });
       expect(cargoPackageSelection(String(targets['cargo-test-ferris-wasm']?.options?.command ?? ''))).toEqual({
-        archiveRun: true,
+        prebuiltRun: true,
         packageFlags: [],
         filtered: ['ferris-wasm'],
       });
       expect(targets['cargo-test-ferris-core']?.dependsOn).toEqual(['cargo-fetch', 'cargo-test-archive']);
       expect(targets['cargo-test-ferris-wasm']?.dependsOn).toEqual(['cargo-fetch', 'cargo-test-archive']);
       expect(targets['cargo-test']?.dependsOn).toEqual(['cargo-test-ferris-core', 'cargo-test-ferris-wasm']);
+    } finally {
+      await workspace.cleanup();
+    }
+  });
+
+  it('extracts the test archive once for all per-crate runners, and again only when its bytes change', async () => {
+    const workspace = await createWorkspace();
+    const root = workspace.context.workspaceRoot;
+    const crates = ['ferris-a', 'ferris-b', 'ferris-c'];
+    try {
+      await workspace.write('packages/ferris/package.json', '{"name":"ferris"}\n');
+      await workspace.write('packages/ferris/Cargo.toml', '[workspace]\nmembers = ["crates/*"]\n');
+      for (const crate of crates) {
+        await workspace.write(`packages/ferris/crates/${crate}/Cargo.toml`, `[package]\nname = "${crate}"\n`);
+      }
+      const targets = await inferProjectTargets(workspace, 'packages/ferris/package.json');
+      // Installed the way a consumer has it, so each command finds the helper it names.
+      await mkdir(join(root, 'node_modules/@smoothbricks'), { recursive: true });
+      await symlink(fileURLToPath(new URL('..', import.meta.url)), join(root, 'node_modules/@smoothbricks/nx-plugin'));
+      // A cargo that does what nextest does with an archive, and says so: an
+      // `--archive-file` unpacks it (into `--extract-to`, or a private temp
+      // dir when a run is given the archive itself), and a run reports which
+      // archive's binaries it executed.
+      const log = join(root, 'nextest.log');
+      await workspace.write(
+        'bin/cargo',
+        [
+          '#!/bin/sh',
+          'archive= dest= binaries=',
+          'while [ $# -gt 0 ]; do',
+          '  case "$1" in',
+          '    --archive-file) archive=$2; shift ;;',
+          '    --extract-to) dest=$2; shift ;;',
+          '    --binaries-metadata) binaries=$2; shift ;;',
+          '  esac',
+          '  shift',
+          'done',
+          'if [ -n "$archive" ]; then',
+          '  echo "extract $(cat "$archive")" >> "$FAKE_NEXTEST_LOG"',
+          '  if [ -z "$dest" ]; then echo "run $(cat "$archive")" >> "$FAKE_NEXTEST_LOG"; exit 0; fi',
+          '  mkdir -p "$dest/target/nextest"',
+          '  cat "$archive" > "$dest/target/nextest/binaries-metadata.json"',
+          '  cat "$archive" > "$dest/target/nextest/cargo-metadata.json"',
+          '  exit 0',
+          'fi',
+          'echo "run $(cat "$binaries")" >> "$FAKE_NEXTEST_LOG"',
+          '',
+        ].join('\n'),
+      );
+      await chmod(join(root, 'bin/cargo'), 0o755);
+      // Every runner at once, through `sh -c` exactly as bounded-exec spawns it.
+      const runAll = () =>
+        Promise.all(
+          crates.map(async (crate) => {
+            const options = targets[`cargo-test-${crate}`]?.options;
+            const child = Bun.spawn(['sh', '-c', String(options?.command)], {
+              cwd: join(root, String(options?.cwd)),
+              env: { ...process.env, PATH: `${join(root, 'bin')}:${process.env.PATH}`, FAKE_NEXTEST_LOG: log },
+              stdout: 'pipe',
+              stderr: 'pipe',
+            });
+            const [exitCode, stderr] = await Promise.all([child.exited, new Response(child.stderr).text()]);
+            return { crate, exitCode, stderr };
+          }),
+        );
+
+      await workspace.write('packages/ferris/target/nextest/archive.tar.zst', 'first archive');
+      for (const run of await runAll()) {
+        expect(run).toMatchObject({ exitCode: 0 });
+      }
+      expect((await readFile(log, 'utf8')).trim().split('\n').sort()).toEqual([
+        'extract first archive',
+        'run first archive',
+        'run first archive',
+        'run first archive',
+      ]);
+
+      // A rebuilt archive is new bytes at the same path: the runners must not
+      // execute what the old one unpacked, and the old unpacking is garbage.
+      await workspace.write('packages/ferris/target/nextest/archive.tar.zst', 'second archive');
+      for (const run of await runAll()) {
+        expect(run).toMatchObject({ exitCode: 0 });
+      }
+      expect((await readFile(log, 'utf8')).trim().split('\n').sort()).toEqual([
+        'extract first archive',
+        'extract second archive',
+        'run first archive',
+        'run first archive',
+        'run first archive',
+        'run second archive',
+        'run second archive',
+        'run second archive',
+      ]);
+      const target = join(root, 'packages/ferris/target');
+      const unpacked = (await readdir(target, { recursive: true })).filter((path) =>
+        path.endsWith('binaries-metadata.json'),
+      );
+      expect(await Promise.all(unpacked.map((path) => readFile(join(target, path), 'utf8')))).toEqual([
+        'second archive',
+      ]);
     } finally {
       await workspace.cleanup();
     }
@@ -1702,7 +1808,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         'napi-debug',
       ]);
       expect(targets['cargo-test-cowshed-napi']?.options?.command).toMatch(
-        /^cargo --frozen nextest run --archive-file target\/nextest\/archive\.tar\.zst --workspace-remap \. -E 'package\(cowshed-napi\)' --no-tests=pass --user-config-file none --tool-config-file "smoo:\$PWD\/.*nextest\.toml"$/,
+        /^extracted="\$\(node \.\.\/\.\.\/node_modules\/@smoothbricks\/nx-plugin\/dist\/bin\/smoo-nx-nextest-extract\.js target\/nextest\/archive\.tar\.zst\)" && cargo --frozen nextest run --binaries-metadata "\$extracted\/target\/nextest\/binaries-metadata\.json" --cargo-metadata "\$extracted\/target\/nextest\/cargo-metadata\.json" --target-dir-remap "\$extracted\/target" --workspace-remap \. -E 'package\(cowshed-napi\)' --no-tests=pass --user-config-file none --tool-config-file "smoo:\$PWD\/.*nextest\.toml"$/,
       );
       expect(targets['napi-test']).toMatchObject({
         executor: '@smoothbricks/nx-plugin:bounded-exec',
@@ -1804,7 +1910,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       // An unsharded crate keeps the bare name and takes no --partition, so
       // declaring nothing is exactly the old single-target behaviour.
       expect(targets['cargo-test-small']?.options?.command).toMatch(
-        /nextest run --archive-file target\/nextest\/archive\.tar\.zst --workspace-remap \. -E 'package\(small\)' --no-tests=pass --user-config-file none/,
+        /--workspace-remap \. -E 'package\(small\)' --no-tests=pass --user-config-file none/,
       );
       // The shards partition the crate MINUS the classes nextest.toml singles
       // out, i of N. Those are lifted out because a test-group only holds
@@ -2491,17 +2597,17 @@ function resolveDeclaredOverInferred(
  * How a cargo test command is scoped to one crate, split into the three facts
  * that can independently go wrong.
  *
- * `--archive-file` must be present: the runner executes binaries one workspace
- * `cargo nextest archive --workspace` already built, so a per-crate run cannot
- * compile anything. Narrowing comes from the nextest filterset, which selects
- * what RUNS. `--package` narrows too, but it re-resolves that crate's features,
- * which is a build — 57.9s of a 120s bounded budget on a hosted 3-core macOS
- * runner when the runners still built — so its presence is a regression even
- * though it selects the same tests. nextest rejects it outright beside
- * `--archive-file`, and this assertion says so before cargo does.
+ * `--binaries-metadata` must be present: the runner executes binaries one
+ * workspace `cargo nextest archive --workspace` already built, so a per-crate
+ * run cannot compile anything. Narrowing comes from the nextest filterset,
+ * which selects what RUNS. `--package` narrows too, but it re-resolves that
+ * crate's features, which is a build — 57.9s of a 120s bounded budget on a
+ * hosted 3-core macOS runner when the runners still built — so its presence is
+ * a regression even though it selects the same tests. nextest rejects it
+ * outright beside a reused build, and this assertion says so before cargo does.
  */
 function cargoPackageSelection(command: string): {
-  archiveRun: boolean;
+  prebuiltRun: boolean;
   packageFlags: string[];
   filtered: string[];
 } {
@@ -2516,7 +2622,7 @@ function cargoPackageSelection(command: string): {
     }
   }
   return {
-    archiveRun: tokens.includes('--archive-file'),
+    prebuiltRun: tokens.includes('--binaries-metadata'),
     packageFlags,
     filtered: [...command.matchAll(/\bpackage\(([^)]+)\)/g)].flatMap((match) =>
       match[1] === undefined ? [] : [match[1]],

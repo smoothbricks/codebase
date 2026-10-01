@@ -55,6 +55,12 @@ import {
   cargoFrozen,
 } from './cross-check-policy.js';
 import { hashVersionlessCrateManifests } from './manifest-hash.js';
+import {
+  EXTRACTED_BINARIES_METADATA,
+  EXTRACTED_CARGO_METADATA,
+  EXTRACTED_TARGET_DIR,
+  NEXTEST_EXTRACT_BIN,
+} from './nextest-extraction.js';
 import { isNonSourceDirectory } from './source-directories.js';
 import {
   isBuildOutputTargetName,
@@ -633,8 +639,8 @@ function createCargoTestCompileTarget(projectRoot: string): TargetConfiguration 
  * build with a filter: 32 such tasks on one repository each re-entered cargo,
  * re-resolved features and chained behind one another so the flocked `target/`
  * had a single writer. Reading from an archive removes the build from the run
- * entirely — the runner extracts binaries into its own temporary directory and
- * touches no shared state — which is what lets the runners fan out.
+ * entirely — the runners execute one extraction of it and never write cargo's
+ * `target/` build tree — which is what lets the runners fan out.
  *
  * Cached, unlike `cargo-test-compile`, because it produces a VALUE: one file,
  * not a mutable build tree Nx would have to restore. `--workspace` matches the
@@ -2391,16 +2397,34 @@ async function resolveCargoWorkspaces(
  * One bounded target per crate; a crate that declares `smoothbricks.test.shards`
  * gets one per shard plus one for the tests nextest.toml singles out.
  *
- * Every piece EXECUTES, it never builds: `--archive-file` runs the binaries
- * `cargo-test-archive` compiled once for the whole workspace, extracted into
- * the runner's own temporary directory. That is what removed the two costs the
- * old shape could not avoid. `nextest run --workspace -E 'package(X)'` re-entered
- * cargo once per crate, and the `-p X` form re-resolved that crate's features so
- * cargo rebuilt the divergent half inside the bounded window — measured at 57.9s
- * of a 120s budget on a hosted 3-core macOS runner, killing the run with 264
- * tests still to go. Neither form is reachable from an archive: nextest rejects
- * `--workspace` and `-p` beside `--archive-file`, so the filterset is the only
- * selector left, and it selects the same tests it always did.
+ * Every piece EXECUTES, it never builds: it runs the binaries
+ * `cargo-test-archive` compiled once for the whole workspace. That is what
+ * removed the two costs the old shape could not avoid. `nextest run --workspace
+ * -E 'package(X)'` re-entered cargo once per crate, and the `-p X` form
+ * re-resolved that crate's features so cargo rebuilt the divergent half inside
+ * the bounded window — measured at 57.9s of a 120s budget on a hosted 3-core
+ * macOS runner, killing the run with 264 tests still to go. Neither form is
+ * reachable from a reused build: nextest rejects `--workspace` and `-p` beside
+ * it, so the filterset is the only selector left, and it selects the same tests
+ * it always did.
+ *
+ * The archive is unpacked ONCE per content, not once per piece. `nextest run
+ * --archive-file` extracts the whole archive into a temporary directory of its
+ * own on every run, so N pieces paid N extractions of every binary in the
+ * workspace to run 1/N of the tests each: on a workspace with ~200 test
+ * binaries, ~25 runners extracting side by side on a loaded host all hit the
+ * 120s bound still "Extracting". `smoo-nx-nextest-extract` hashes the archive,
+ * unpacks it under that hash unless a previous runner already did — one
+ * extracts while the rest wait — and prints the directory; the run then reuses
+ * it through nextest's own reuse-build flags, which is what `--archive-file`
+ * does after unpacking. Keyed by the archive's bytes, so a rebuilt or restored
+ * archive can never run an older extraction's binaries. The one difference
+ * from `--archive-file` is the Rust standard library directory: nextest has no
+ * flag to remap it, so a run uses the producing toolchain's own sysroot rather
+ * than the archived copy of it — the same toolchain, because the archive's hash
+ * covers the toolchain pin. The extraction lives under `target/nextest`, never
+ * in an Nx output: it is a multi-GB tree for a cached verdict that has no
+ * outputs.
  *
  * `--workspace-remap .` is not cosmetic. An archive records the ABSOLUTE paths
  * of the tree that produced it; without the remap, a restored archive hands
@@ -2433,8 +2457,8 @@ async function resolveCargoWorkspaces(
  * making valid empty crates and shards fail execution.
  *
  * Pieces fan out rather than chain. The chain existed because every runner was
- * a cargo writer on one flocked `target/`; an archive run writes nothing there,
- * so the only serialization left is the one the machine's own scheduler does.
+ * a cargo writer on one flocked `target/`; a reused-build run writes nothing
+ * there, so the only serialization left is the one extraction per archive.
  */
 async function addCargoTestTargets(
   targets: Record<string, TargetConfiguration>,
@@ -2445,6 +2469,12 @@ async function addCargoTestTargets(
 ): Promise<string[]> {
   const targetNames: string[] = [];
   const toolConfig = nextestToolConfigArg(workspaceRoot, workspace.projectRoot, PLUGIN_NEXTEST_CONFIG);
+  // Relative to the runner's cwd, so the hashed command is the same in every checkout.
+  const extractBin = posix.join(posix.relative(workspace.projectRoot, '.'), NEXTEST_EXTRACT_BIN);
+  const reuseExtraction =
+    `--binaries-metadata "$extracted/${EXTRACTED_BINARIES_METADATA}" ` +
+    `--cargo-metadata "$extracted/${EXTRACTED_CARGO_METADATA}" ` +
+    `--target-dir-remap "$extracted/${EXTRACTED_TARGET_DIR}"`;
   for (const plan of workspace.packages) {
     if (plan.package.projectRoot !== projectRoot) {
       continue;
@@ -2487,9 +2517,11 @@ async function addCargoTestTargets(
         inputs,
         dependsOn: [archive],
         options: {
-          command: cargoFrozen(
-            `nextest run --archive-file ${CARGO_TEST_ARCHIVE_FILE} --workspace-remap . -E '${piece.selector}'${piece.extra} --no-tests=pass --user-config-file none ${toolConfig}`,
-          ),
+          command:
+            `extracted="$(node ${extractBin} ${CARGO_TEST_ARCHIVE_FILE})" && ` +
+            cargoFrozen(
+              `nextest run ${reuseExtraction} --workspace-remap . -E '${piece.selector}'${piece.extra} --no-tests=pass --user-config-file none ${toolConfig}`,
+            ),
           cwd: workspace.projectRoot,
           timeoutMs: BOUNDED_TEST_TIMEOUT_MS,
           killAfterMs: BOUNDED_TEST_KILL_AFTER_MS,
