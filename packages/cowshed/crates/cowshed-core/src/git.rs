@@ -2710,8 +2710,7 @@ fn sandboxed_git_command_with_paths(
             parent
         })
         .env("HOME", canonical.join(".cowshed/home"));
-    let identity = canonical.join(WORKSPACE_GIT_IDENTITY_CONFIG_PATH);
-    if identity.is_file() {
+    if let Some(identity) = workspace_git_identity_config(&canonical)? {
         command.env("GIT_CONFIG_GLOBAL", identity);
     }
     Ok(command)

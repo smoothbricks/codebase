@@ -228,3 +228,28 @@ fn repository_filter_cannot_write_to_controller_home() {
         std::panic::resume_unwind(error);
     }
 }
+
+#[test]
+fn controller_git_refuses_a_symlinked_workspace_identity() {
+    let temp = std::env::temp_dir().join(format!("cowshed-git-identity-{}", uuid::Uuid::new_v4()));
+    let workspace = temp.join("workspace");
+    fs::create_dir_all(&workspace).expect("workspace directory");
+    let workspace = fs::canonicalize(workspace).expect("canonical workspace");
+    let result = std::panic::catch_unwind(|| {
+        git(&workspace, &["init", "-q", "-b", "main"]);
+        let identity = workspace.join(".cowshed/git-identity.inc");
+        fs::create_dir_all(identity.parent().expect("identity directory")).expect("identity directory");
+        let foreign = temp.join("foreign-identity.inc");
+        fs::write(&foreign, b"[user]\n\tname = foreign\n").expect("foreign identity");
+        std::os::unix::fs::symlink(&foreign, &identity).expect("symlinked identity");
+        let error = match sandboxed_git_command_at(&workspace) {
+            Ok(_) => panic!("controller accepted a symlinked Git identity"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code.as_str(), "integrity");
+    });
+    fs::remove_dir_all(temp).expect("remove fixture");
+    if let Err(error) = result {
+        std::panic::resume_unwind(error);
+    }
+}
