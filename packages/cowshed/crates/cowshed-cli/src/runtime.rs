@@ -1185,10 +1185,11 @@ where
                 }
                 output
                     .guidance(&format!(
-                        "grants for {} now: {} read, {} write, {} egress",
+                        "grants for {} now: {} read, {} write, {} denied writes, {} egress",
                         workspace,
                         grants.read.len(),
                         grants.write.len(),
+                        grants.deny_write.len(),
                         grants.egress.len()
                     ))
                     .map_err(output_error)?;

@@ -310,6 +310,9 @@ impl CliService for FakeService {
         self.grants.write.extend(delta.write);
         self.grants.write.sort();
         self.grants.write.dedup();
+        self.grants.deny_write.extend(delta.deny_write);
+        self.grants.deny_write.sort();
+        self.grants.deny_write.dedup();
         // One rule per host, latest spelling wins: the same shape the real grant store keeps,
         // so what this fake returns is what the CLI would have to render.
         for rule in delta.egress {
@@ -562,7 +565,7 @@ async fn grant_persists_sorted_paths_that_the_next_exec_observes() {
     assert!(stdout.is_empty());
     assert_eq!(
         stderr,
-        b"cowshed: grants for raven now: 2 read, 1 write, 0 egress\n\
+        b"cowshed: grants for raven now: 2 read, 1 write, 0 denied writes, 0 egress\n\
           cowshed: grants apply from the next exec or shell\n\
           next: cowshed exec raven -- <retry your command>\n"
     );
@@ -583,7 +586,7 @@ async fn grant_persists_sorted_paths_that_the_next_exec_observes() {
     .await;
     assert_eq!(
         stderr,
-        b"cowshed: grants for raven now: 2 read, 1 write, 1 egress\n\
+        b"cowshed: grants for raven now: 2 read, 1 write, 0 denied writes, 1 egress\n\
           cowshed: grants apply from the next exec or shell\n\
           next: cowshed exec raven -- <retry your command>\n"
     );
@@ -591,6 +594,20 @@ async fn grant_persists_sorted_paths_that_the_next_exec_observes() {
     assert_eq!(
         stdout,
         b"read\t/tmp/probe\nread\t/tmp/z\nwrite\t/tmp/output\negress\tregistry.test\t443,80\tintercept\n"
+    );
+
+    // A deny is a grant change too, and the summary counts it: "0 read, 0 write, 0 egress" after
+    // `--deny-write` read as though nothing had been recorded.
+    let (_, _, stderr) = run(
+        &mut service,
+        ["grant", "raven", "--deny-write", ".git/hooks"],
+    )
+    .await;
+    assert_eq!(
+        stderr,
+        b"cowshed: grants for raven now: 2 read, 1 write, 1 denied writes, 1 egress\n\
+          cowshed: grants apply from the next exec or shell\n\
+          next: cowshed exec raven -- <retry your command>\n"
     );
 
     let (_, stdout, stderr) = run(&mut service, ["grant", "raven", "--json"]).await;

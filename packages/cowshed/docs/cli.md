@@ -706,7 +706,7 @@ toolchains and system; egress to the localhost gateway only. Widen filesystem an
 ```
 $ cowshed grant raven --read <project-root>/reference-corpus
 $ cowshed grant raven --write <project-root>/shared-assets
-cowshed: grants for raven now: 1 read, 1 write, 0 egress
+cowshed: grants for raven now: 1 read, 1 write, 0 denied writes, 0 egress
 cowshed: grants apply from the next exec or shell
 next: cowshed exec raven -- <retry your command>
 ```
