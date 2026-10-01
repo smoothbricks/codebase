@@ -343,18 +343,20 @@ names it while it runs.
 `cowshed new` prints a `cowshed: apfs canonical/<step>` or `cowshed: new <step>` span with its elapsed time for every
 step, so the slow step is named on stderr. On a large repository two steps carry nearly all of the time:
 
-- **The first write into the fresh clone**, inside `apfs canonical/attach` or `apfs canonical/mount`, whichever writes
-  first. The clone call shares main's image extent map and returns in milliseconds; the first write to either file makes
-  APFS copy that map, at about 12 µs per extent. Main's image fragments with every write it takes while clones share its
-  blocks, so the cost grows with how long main has been in use: an image with 2.1 million extents costs 25 s on a quiet
-  host and 45–70 s on a busy one, one with 470 thousand costs 4 s, and a freshly written 4 GiB file with 256 extents
-  costs 5 ms. A one-byte write into a plain `cp -c` clone of the image file reproduces the cost with no disk image
-  attached, so it is not the mount itself and does not depend on how many images are attached. Deleting a written clone
-  (`cowshed rm`, `cowshed gc`) pays about half as much per extent. `new --from <ws>` pays the same cost for the source
-  workspace's image. `cowshed doctor` reports main's extent count and the cost it predicts as `main-extents`, and warns
-  once that cost reaches a second. Only rewriting main's image file contiguously lowers it: `cowshed defrag main`, run
-  while the checkout is idle, since main has to leave the kernel for the copy and a busy volume refuses. It needs as
-  much free space as main's image has allocated and keeps it while older clones still share the old blocks.
+- **The first write into the fresh clone**, `apfs canonical/first-write`. The clone call shares main's image extent map
+  and returns in milliseconds; the first write to either file makes APFS copy that map, at about 12 µs per extent.
+  cowshed makes that write itself, rewriting the clone's first block right after the clone and before anything attaches
+  it, so the cost is a step of its own; left to the mount, the kernel's recovery write into a clone of a mounted image
+  paid it inside `mount_apfs`. Main's image fragments with every write it takes while clones share its blocks, so the
+  cost grows with how long main has been in use: an image with 2.1 million extents costs 25 s on a quiet host and 45–70
+  s on a busy one, one with 470 thousand costs 4 s, and a freshly written 4 GiB file with 256 extents costs 5 ms. A
+  one-byte write into a plain `cp -c` clone of the image file reproduces the cost with no disk image attached, so it is
+  not the mount itself and does not depend on how many images are attached. Deleting a written clone (`cowshed rm`,
+  `cowshed gc`) pays about half as much per extent. `new --from <ws>` pays the same cost for the source workspace's
+  image. `cowshed doctor` reports main's extent count and the cost it predicts as `main-extents`, and warns once that
+  cost reaches a second. Only rewriting main's image file contiguously lowers it: `cowshed defrag main`, run while the
+  checkout is idle, since main has to leave the kernel for the copy and a busy volume refuses. It needs as much free
+  space as main's image has allocated and keeps it while older clones still share the old blocks.
 - **`new links`**, the walk over the whole tree for symlinks that point outside it, which costs about 5 s over a million
   entries.
 

@@ -377,6 +377,12 @@ pub trait ApfsExecutionHost: Send + Sync + 'static {
         source_mount: Option<&Path>,
         destination: &Path,
     ) -> Result<(), ApfsStorageError>;
+    /// Take a fresh clone's own copy of the extent map it shares with its source, before
+    /// anything attaches it. The first write into a clone copies that map, at a cost that grows
+    /// with the source's extent count — seconds for a fragmented main — and whatever writes
+    /// first pays it: for a clone of a mounted image, the kernel's recovery write inside the
+    /// mount. Paid here, it is a step of its own instead of a slow mount.
+    fn write_first(&self, image: &Path) -> Result<(), ApfsStorageError>;
     fn resumable_clone(
         &self,
         config: &ApfsSubstrateConfig,
@@ -2271,8 +2277,16 @@ fn prepare_clone_stage<H: ApfsExecutionHost>(
             )
         })?;
         let source_mount = mount_point(config, &source)?;
-        if let Err(primary) = host.clone_image(&source_image, Some(&source_mount), &canonical_image)
-        {
+        // The first write happens only on a clone nothing has attached yet: rewriting a block
+        // under an attached image's driver could put back bytes it had just changed.
+        let cloned = host
+            .clone_image(&source_image, Some(&source_mount), &canonical_image)
+            .and_then(|()| {
+                timed_apfs_step("canonical", "first-write", || {
+                    host.write_first(&canonical_image)
+                })
+            });
+        if let Err(primary) = cloned {
             return combine_cleanup(
                 "clone canonical payload",
                 primary,

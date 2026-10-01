@@ -254,6 +254,15 @@ impl ApfsExecutionHost for FakeHost {
         self.record("clone");
         Ok(())
     }
+    fn write_first(&self, image: &Path) -> Result<(), ApfsStorageError> {
+        if !is_image_path(image) {
+            return Err(ApfsStorageError::Host(
+                "first write into a path that is not an image".to_owned(),
+            ));
+        }
+        self.record("first-write");
+        Ok(())
+    }
     fn resumable_staged_adopt(
         &self,
         _: &ApfsSubstrateConfig,
@@ -1623,6 +1632,81 @@ async fn lifecycle_receipts_preserve_exact_revisions_topology_and_checkpoint_pin
         .await
         .expect("unmount");
     assert_eq!(host.events(), ["lock:1", "detach-mounted:WhenIdle"]);
+}
+
+/// A new workspace's clone takes its own extent map as a step of its own, between the clone and
+/// the attach: never on an attached image, whose driver could have just written the block being
+/// rewritten. A checkpoint is never written, so its clone keeps sharing the map.
+#[tokio::test]
+async fn a_new_workspace_is_first_written_after_its_clone_and_before_its_attach() {
+    let host = FakeHost::default();
+    let source = workspace("main", 5);
+    host.seed(&source);
+    let substrate = substrate(host.clone(), CountingLane::default());
+    let destination = |name: &str, topology| Destination {
+        repo: repo(),
+        name: WorkspaceName::session(name).expect("name"),
+        topology_revision: Revision::new(topology),
+        identity: identity(),
+    };
+    let around_the_clone = |events: Vec<String>| -> Vec<String> {
+        events
+            .into_iter()
+            .skip_while(|event| event != "clone")
+            .take(3)
+            .collect()
+    };
+
+    host.clear_events();
+    substrate
+        .execute_create_staged(
+            substrate
+                .plan_create(&source, destination("created", 8))
+                .expect("create plan"),
+            |_| async { Ok::<(), &'static str>(()) },
+        )
+        .await
+        .expect("create");
+    assert_eq!(
+        around_the_clone(host.events()),
+        ["clone", "first-write", "attach-no-mount+fsck"]
+    );
+
+    host.clear_events();
+    substrate
+        .execute_fork_staged(
+            substrate
+                .plan_fork(&source, destination("forked", 10))
+                .expect("fork plan"),
+            |_| async { Ok::<(), &'static str>(()) },
+        )
+        .await
+        .expect("fork");
+    assert_eq!(
+        around_the_clone(host.events()),
+        ["clone", "first-write", "attach-no-mount+fsck"]
+    );
+
+    host.clear_events();
+    substrate
+        .execute_checkpoint_staged(
+            substrate
+                .plan_checkpoint(
+                    &source,
+                    CheckpointLabel::new("kept").expect("label"),
+                    Pin::Pinned,
+                )
+                .expect("checkpoint plan"),
+            |_| async { Ok::<(), &'static str>(()) },
+        )
+        .await
+        .expect("checkpoint");
+    let events = host.events();
+    assert!(events.iter().any(|event| event == "clone"), "{events:?}");
+    assert!(
+        !events.iter().any(|event| event == "first-write"),
+        "{events:?}"
+    );
 }
 
 #[tokio::test]

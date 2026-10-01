@@ -2930,6 +2930,29 @@ where
             .map_err(Into::into)
     }
 
+    /// Rewrite the image's first block with the bytes it holds: content-neutral, and the write
+    /// that makes APFS copy the extent map the clone shares with its source.
+    fn write_first(&self, image: &Path) -> Result<(), ApfsStorageError> {
+        use std::os::unix::fs::FileExt;
+        self.verify_controller_path(image)?;
+        crate::metadata::validate_image_path(image)
+            .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
+        let io = |error| ApfsStorageError::Io {
+            operation: "rewrite the first block of a cloned image",
+            path: image.to_owned(),
+            source: error,
+        };
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(image)
+            .map_err(io)?;
+        // One APFS block: the unit a copy-on-write write replaces.
+        let mut block = [0_u8; 4096];
+        file.read_exact_at(&mut block, 0).map_err(io)?;
+        file.write_all_at(&block, 0).map_err(io)
+    }
+
     fn resumable_clone(
         &self,
         config: &ApfsSubstrateConfig,
