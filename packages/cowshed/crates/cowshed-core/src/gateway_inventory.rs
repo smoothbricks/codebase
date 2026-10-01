@@ -56,6 +56,13 @@ pub struct AdoptedProject {
     pub project_root: PathBuf,
 }
 
+/// One registry traversal classifies each project as adopted, checkout-less, or unreadable.
+struct ProjectRegistryScan {
+    projects: Vec<AdoptedProject>,
+    checkoutless: Vec<RepoId>,
+    issues: Vec<(RepoId, GatewayInventoryError)>,
+}
+
 /// A project whose main workspace is not mounted where its checkout layout puts it.
 ///
 /// Mains are always-mounted (02_workspaces.md): the gateway mounts every one across every adopted
@@ -442,9 +449,9 @@ impl NativeGatewayInventory {
     > {
         let inventory = self.clone();
         crate::storage::lifecycle::dispatch_blocking(move || {
-            let (projects, checkoutless, issues) = inventory.adopted_and_checkoutless_blocking()?;
-            let unreachable = inventory.unmounted_mains_for(&projects)?;
-            Ok((projects, unreachable, checkoutless, issues))
+            let scan = inventory.adopted_and_checkoutless_blocking()?;
+            let unreachable = inventory.unmounted_mains_for(&scan.projects)?;
+            Ok((scan.projects, unreachable, scan.checkoutless, scan.issues))
         })
         .await
         .map_err(|error| GatewayInventoryError::Blocking(error.to_string()))?
@@ -488,11 +495,11 @@ impl NativeGatewayInventory {
     }
 
     fn adopted_projects_blocking(&self) -> Result<Vec<AdoptedProject>, GatewayInventoryError> {
-        let (projects, _, issues) = self.adopted_and_checkoutless_blocking()?;
-        for (repo_id, error) in issues {
+        let scan = self.adopted_and_checkoutless_blocking()?;
+        for (repo_id, error) in scan.issues {
             eprintln!("cowshed: skipping project {repo_id}: {error}");
         }
-        Ok(projects)
+        Ok(scan.projects)
     }
 
     /// One registry traversal for both the adopted list and the checkout-less remainder.
@@ -502,22 +509,17 @@ impl NativeGatewayInventory {
     /// error, never two of those at once.
     fn adopted_and_checkoutless_blocking(
         &self,
-    ) -> Result<
-        (
-            Vec<AdoptedProject>,
-            Vec<RepoId>,
-            Vec<(RepoId, GatewayInventoryError)>,
-        ),
-        GatewayInventoryError,
-    > {
-        let mut projects = Vec::new();
-        let mut checkoutless = Vec::new();
-        let mut issues = Vec::new();
+    ) -> Result<ProjectRegistryScan, GatewayInventoryError> {
+        let mut scan = ProjectRegistryScan {
+            projects: Vec::new(),
+            checkoutless: Vec::new(),
+            issues: Vec::new(),
+        };
         for repo_id in discover_repositories(self.storage.store())? {
             let layout = match StorageLayout::new(self.storage.store(), &repo_id) {
                 Ok(layout) => layout,
                 Err(error) => {
-                    issues.push((
+                    scan.issues.push((
                         repo_id,
                         GatewayInventoryError::InvalidMetadata {
                             path: self.storage.store().to_owned(),
@@ -528,18 +530,18 @@ impl NativeGatewayInventory {
                 }
             };
             match authoritative_checkout_path(&layout, &repo_id) {
-                Ok(Some(project_root)) => projects.push(AdoptedProject {
+                Ok(Some(project_root)) => scan.projects.push(AdoptedProject {
                     repo_id,
                     project_root,
                 }),
                 // No adopted checkout path means no adopted project, but the binding is still
                 // real: the entry is reported for `doctor` rather than printed on stderr from
                 // a library traversal, where it polluted command output.
-                Ok(None) => checkoutless.push(repo_id),
-                Err(error) => issues.push((repo_id, error)),
+                Ok(None) => scan.checkoutless.push(repo_id),
+                Err(error) => scan.issues.push((repo_id, error)),
             }
         }
-        Ok((projects, checkoutless, issues))
+        Ok(scan)
     }
 
     pub async fn all_attached(&self) -> Result<Vec<GatewaySessionFact>, GatewayInventoryError> {

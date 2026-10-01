@@ -401,8 +401,8 @@ fn session_image_workspace(path: &Path) -> Option<(WorkspaceName, bool)> {
         .or_else(|| name.strip_suffix(".asif").map(|stem| (stem, false)))?;
     Some((WorkspaceName::session(stem).ok()?, sparseimage))
 }
-/// No-follow metadata that fences an orphan image against replacement after preview.
 
+/// No-follow metadata that fences an orphan image against replacement after preview.
 fn orphan_session_image_identity(image: &Path) -> Result<[u8; 56], ApfsStorageError> {
     let metadata = fs::symlink_metadata(image)
         .map_err(|error| io_error("inspect orphan session image identity", image, error))?;
@@ -424,7 +424,7 @@ fn orphan_session_image_identity(image: &Path) -> Result<[u8; 56], ApfsStorageEr
             metadata.ctime() as u64,
             metadata.ctime_nsec() as u64,
         ];
-        for (chunk, value) in identity.chunks_exact_mut(8).zip(fields) {
+        for (chunk, value) in identity.as_chunks_mut::<8>().0.iter_mut().zip(fields) {
             chunk.copy_from_slice(&value.to_le_bytes());
         }
     }
@@ -440,7 +440,13 @@ fn orphan_session_image_identity(image: &Path) -> Result<[u8; 56], ApfsStorageEr
             modified.as_secs(),
             u64::from(modified.subsec_nanos()),
         ];
-        for (chunk, value) in identity.chunks_exact_mut(8).take(fields.len()).zip(fields) {
+        for (chunk, value) in identity
+            .as_chunks_mut::<8>()
+            .0
+            .iter_mut()
+            .take(fields.len())
+            .zip(fields)
+        {
             chunk.copy_from_slice(&value.to_le_bytes());
         }
     }
@@ -2783,9 +2789,9 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
                 return Ok(Some("the workspace mountpoint is not a directory"));
             }
             Ok(metadata) => {
-                let parent = mount_point.parent().ok_or_else(|| {
-                    ApfsStorageError::InvalidPlan("session mountpoint has no parent")
-                })?;
+                let parent = mount_point.parent().ok_or(ApfsStorageError::InvalidPlan(
+                    "session mountpoint has no parent",
+                ))?;
                 let parent_metadata = fs::symlink_metadata(parent).map_err(|error| {
                     io_error("inspect session mountpoint parent", parent, error)
                 })?;

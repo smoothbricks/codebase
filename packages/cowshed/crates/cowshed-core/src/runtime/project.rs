@@ -10400,9 +10400,9 @@ mod removal_supervisor_tests {
     use super::NativeProjectRuntimeHost;
     use crate::{
         api::dto::{
-            BinaryData, CommandArg, ExecCommand, ExecRequest, ExitStatus, JobId, OutputPublication,
-            OutputStorage, OutputSummary, ProtectedOutput, RunSandboxMode, SealedJob, Sha256Digest,
-            StdinSource, StreamInfo,
+            BinaryData, CommandArg, ExecCommand, ExecRequest, ExitStatus, JobId, OutputStorage,
+            OutputSummary, ProtectedOutput, RunSandboxMode, SealedJob, Sha256Digest, StdinSource,
+            StreamInfo,
         },
         error::{CowshedError, Result},
         runtime::supervisor::{
@@ -10580,12 +10580,17 @@ mod removal_supervisor_tests {
             uuid::Uuid::new_v4().simple()
         ));
         std::fs::create_dir(&root).expect("create workspace");
-        let mut config = WorkspaceSupervisorConfig::default();
-        config.workspace_root = root.clone();
-        config.sandbox.workspace_mount = root.clone();
-        config.default_cwd = None;
-        config.term_grace = Duration::from_millis(10);
-        config.group_ledger = None;
+        let defaults = WorkspaceSupervisorConfig::default();
+        let config = WorkspaceSupervisorConfig {
+            workspace_root: root.clone(),
+            default_cwd: None,
+            sandbox: crate::sandbox::SandboxConfig {
+                workspace_mount: root.clone(),
+                ..defaults.sandbox
+            },
+            term_grace: Duration::from_millis(10),
+            ..defaults
+        };
         let signals = Arc::new(Mutex::new(Vec::new()));
         let supervisor = WorkspaceSupervisor::start_with_sinks(
             config,
