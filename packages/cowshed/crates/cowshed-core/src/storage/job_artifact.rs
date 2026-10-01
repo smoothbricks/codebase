@@ -768,6 +768,12 @@ impl ArtifactStore {
         JobId::new(self.next_job_id).map_err(ArtifactError::from)
     }
 
+    /// The terminal record of a job of this incarnation, whichever supervisor sealed it: read from
+    /// the records at open, and kept current as this store seals jobs.
+    pub fn sealed(&self, job_id: JobId) -> Option<&JobArtifactRecord> {
+        self.committed_jobs.get(&job_id)
+    }
+
     pub fn buffered_bytes(&self) -> usize {
         self.budget.used
     }

@@ -3,7 +3,7 @@ use super::dto::{
     CreateOptions, DefragmentResult, DoctorReport, EmptyResult, ExecRequest, GcOptions, GcReport,
     GitOid, GrantDelta, GrantSet, JobId, JobInfo, LandOptions, LandReport, MirrorInfo,
     ProjectGrantDelta, ProjectGrants, PushOptions, PushReport, RebaseOptions, RemoveOptions,
-    RemoveReport, ResizeResult, RevisionResult, RunSandboxMode, StdinSource, StepReport,
+    RemoveReport, ResizeResult, RevisionResult, RunSandboxMode, SealedJob, StdinSource, StepReport,
     WorkspaceIncarnation, WorkspaceInfo, WorkspaceTarget,
 };
 use super::frame;
@@ -1875,6 +1875,31 @@ impl WorkspaceHandle {
             id,
             runtime: Arc::clone(&self.runtime),
         })
+    }
+
+    /// A job's terminal record from the workspace's durable records, and a handle whose
+    /// [`JobHandle::logs`] reads its sealed output from any offset. Answered for any job of this
+    /// incarnation that has ended — including one an earlier supervisor ran and sealed, which
+    /// [`Self::job`] and [`JobHandle::status`] answer only while that supervisor serves: a drained
+    /// supervisor of another build retires the moment its last job ends.
+    pub async fn sealed(&self, id: JobId) -> Result<(SealedJob, JobHandle)> {
+        let sealed: SealedJob = call_typed(
+            &self.runtime,
+            "job.sealed",
+            json!({
+                "repoId": self.authority.repo_id,
+                "workspace": self.authority.workspace,
+                "workspaceIncarnation": self.authority.workspace_incarnation,
+                "jobId": id,
+            }),
+        )
+        .await?;
+        let handle = JobHandle {
+            authority: Arc::clone(&self.authority),
+            id,
+            runtime: Arc::clone(&self.runtime),
+        };
+        Ok((sealed, handle))
     }
 
     pub async fn checkpoint(&self, options: CheckpointOptions) -> Result<String> {

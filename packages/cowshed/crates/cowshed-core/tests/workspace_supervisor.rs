@@ -229,6 +229,13 @@ impl ArtifactSink for FakeArtifactSink {
             manifest_batch_sha256: Sha256Digest::compute(&barrier_id.to_be_bytes()),
         })
     }
+
+    /// This sink keeps no terminal records: it hands each seal back and forgets the job. The
+    /// record a fresh supervisor answers from is the production store's
+    /// ([`a_fresh_supervisor_answers_for_a_job_its_predecessor_sealed`]).
+    fn sealed(&self, _job_id: JobId) -> Option<cowshed_core::api::SealedJob> {
+        None
+    }
 }
 
 struct FakeArtifactJob {
@@ -1212,6 +1219,73 @@ async fn a_fresh_supervisor_continues_the_durable_barrier_sequence() {
         .await
         .expect("a fresh supervisor must continue the durable barrier sequence");
     assert_eq!(second.barrier_id, 2);
+}
+
+/// A job an earlier supervisor of the workspace incarnation ran and sealed is answered by the next
+/// one from the durable records — its terminal facts, and its output from any offset — although
+/// only the supervisor that ran a job answers its status. A client whose supervisor retired (a
+/// drained supervisor of another build retires the moment its last job ends) still reaches the job
+/// by its number, and reads on from the bytes it already holds.
+#[tokio::test]
+async fn a_fresh_supervisor_answers_for_a_job_its_predecessor_sealed() {
+    let (supervisor_config, _root) = isolated_config("sealed-predecessor");
+    let mut first = real_store_harness(supervisor_config.clone());
+    let job = first
+        .handle
+        .exec(None, request(StdinSource::Empty))
+        .await
+        .unwrap();
+    let spawned = first.spawned.recv().await.unwrap();
+    complete(
+        &spawned,
+        b"hello world\n",
+        b"oops",
+        ExitStatus::Exited { code: 3 },
+    )
+    .await;
+    first.handle.wait(job).await.unwrap();
+    first.handle.quiesce().await.unwrap();
+    first.handle.retire().await.unwrap();
+    drop(first);
+
+    let second = real_store_harness(supervisor_config);
+    let (remote, _path) = served(&second.handle).await;
+    assert_eq!(
+        remote.info(job).await.unwrap_err().code,
+        ErrorCode::NotFound,
+        "status answers only the supervisor's own jobs"
+    );
+    let sealed = remote.sealed(job).await.unwrap();
+    assert_eq!(
+        (
+            sealed.job_id,
+            sealed.state,
+            sealed.exit,
+            sealed.stdout.bytes,
+            sealed.stderr.bytes
+        ),
+        (
+            job,
+            JobState::Exited,
+            Some(ExitStatus::Exited { code: 3 }),
+            12,
+            4
+        )
+    );
+    let tail = remote
+        .log_read(job, StreamKind::Stdout, 6, false)
+        .await
+        .unwrap();
+    assert_eq!(
+        (tail.bytes.as_ref(), tail.next_offset, tail.eof),
+        (&b"world\n"[..], 12, true)
+    );
+    let unknown = JobId::new(job.get() + 1).unwrap();
+    assert_eq!(
+        remote.sealed(unknown).await.unwrap_err().code,
+        ErrorCode::NotFound,
+        "a job nothing sealed has no terminal record to answer from"
+    );
 }
 
 #[tokio::test]

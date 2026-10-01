@@ -1786,6 +1786,23 @@ impl<'de> Deserialize<'de> for JobInfo {
     }
 }
 
+/// A job's terminal record as the workspace's durable records hold it: what any supervisor of the
+/// workspace incarnation answers for a job, including one an earlier supervisor ran and sealed —
+/// which [`JobInfo`], whose start, cwd, trace and stdin only the running supervisor knew, cannot
+/// describe once that supervisor is gone.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SealedJob {
+    pub job_id: JobId,
+    pub state: JobState,
+    pub exit: Option<ExitStatus>,
+    pub failure: Option<JobFailure>,
+    pub duration_ms: Option<u64>,
+    pub output_limit: Option<OutputLimitInfo>,
+    pub stdout: StreamInfo,
+    pub stderr: StreamInfo,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExecRecord {
     pub repo_id: RepoId,

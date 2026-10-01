@@ -574,6 +574,7 @@ capability_methods! {
     worker "worker.checkpoint"
     worker "worker.push"
     worker "job.status"
+    worker "job.sealed"
     worker "job.logs"
     worker "job.attachWrite"
     worker "job.detach"

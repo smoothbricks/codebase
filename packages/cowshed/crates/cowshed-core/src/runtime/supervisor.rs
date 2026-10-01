@@ -17,7 +17,7 @@ use uuid::Uuid;
 use crate::api::dto::{
     BinaryData, CommandArg, ExecCommand, ExecRequest, ExitStatus, JobFailure, JobId, JobInfo,
     JobState, OutputLimitInfo, OutputPublication, OutputStorage, OutputSummary, ProtectedOutput,
-    Sha256Digest, StdinInfo, StdinKind, StdinSource, StreamInfo, TraceContext, TraceId,
+    SealedJob, Sha256Digest, StdinInfo, StdinKind, StdinSource, StreamInfo, TraceContext, TraceId,
     UtcTimestamp, WarmAdmission, WarmRange, WorkspacePath,
 };
 use crate::error::{CowshedError, Result};
@@ -408,6 +408,9 @@ pub trait ArtifactSink: Send {
         stderr_copy: Option<OutputPublication>,
     ) -> Result<ArtifactSeal>;
     fn checkpoint(&mut self) -> Result<CheckpointBarrier>;
+    /// The terminal record of a job of this workspace incarnation, whichever supervisor sealed
+    /// it; `None` for a job without one.
+    fn sealed(&self, job_id: JobId) -> Option<SealedJob>;
 }
 
 pub use crate::process::ProcessStatus;
@@ -452,6 +455,19 @@ impl ArtifactStoreSink {
 impl ArtifactSink for ArtifactStoreSink {
     fn next_job_id(&self) -> Result<JobId> {
         self.store.next_job_id().map_err(map_artifact_error)
+    }
+
+    fn sealed(&self, job_id: JobId) -> Option<SealedJob> {
+        self.store.sealed(job_id).map(|record| SealedJob {
+            job_id: record.job_id,
+            state: record.state,
+            exit: record.exit.clone(),
+            failure: record.failure,
+            duration_ms: record.duration_ms,
+            output_limit: record.output_limit.clone(),
+            stdout: record.stdout.clone(),
+            stderr: record.stderr.clone(),
+        })
     }
 
     fn admit(
@@ -2174,6 +2190,18 @@ impl WorkspaceSupervisorHandle {
         .await
     }
 
+    /// The job's terminal record, for any job of this workspace incarnation that has one —
+    /// including a job an earlier supervisor ran and sealed, which [`Self::info`] answers only
+    /// while that supervisor serves.
+    pub async fn sealed(&self, job_id: JobId) -> Result<SealedJob> {
+        self.call(|reply| Command::Sealed {
+            authority: self.authority.clone(),
+            job_id,
+            reply,
+        })
+        .await
+    }
+
     pub async fn list(&self) -> Result<Vec<JobInfo>> {
         self.call(|reply| Command::List {
             authority: self.authority.clone(),
@@ -2421,6 +2449,11 @@ pub(super) enum Command {
         authority: WorkspaceAuthoritySnapshot,
         job_id: JobId,
         reply: oneshot::Sender<Result<JobInfo>>,
+    },
+    Sealed {
+        authority: WorkspaceAuthoritySnapshot,
+        job_id: JobId,
+        reply: oneshot::Sender<Result<SealedJob>>,
     },
     List {
         authority: WorkspaceAuthoritySnapshot,
@@ -2743,6 +2776,18 @@ impl SupervisorActor {
                 let result = self
                     .validate_authority(&authority)
                     .and_then(|()| self.job(job_id).map(|job| job.info.clone()));
+                let _ = reply.send(result);
+            }
+            Command::Sealed {
+                authority,
+                job_id,
+                reply,
+            } => {
+                let result = self.validate_authority(&authority).and_then(|()| {
+                    self.artifacts
+                        .sealed(job_id)
+                        .ok_or_else(|| unsealed_job(job_id))
+                });
                 let _ = reply.send(result);
             }
             Command::List { authority, reply } => {
@@ -3451,7 +3496,20 @@ impl SupervisorActor {
             return;
         }
         let Ok(job) = self.job_mut(job_id) else {
-            let _ = reply.send(Err(not_found_job(job_id)));
+            // A job an earlier supervisor of this incarnation ran and sealed: its sealed artifact
+            // answers exactly as this supervisor's own terminal jobs do.
+            let Some(sealed) = self.artifacts.sealed(job_id) else {
+                let _ = reply.send(Err(not_found_job(job_id)));
+                return;
+            };
+            let stream = match stream {
+                StreamKind::Stdout => sealed.stdout,
+                StreamKind::Stderr => sealed.stderr,
+            };
+            let workspace_root = self.workspace_root.clone();
+            tokio::task::spawn_blocking(move || {
+                let _ = reply.send(read_sealed_chunk(&workspace_root, &stream, offset));
+            });
             return;
         };
         if job.terminal_committed {
@@ -4287,6 +4345,16 @@ fn not_found_job(job_id: JobId) -> CowshedError {
             job_id.get()
         ),
         "list jobs on the current workspace",
+    )
+}
+
+fn unsealed_job(job_id: JobId) -> CowshedError {
+    CowshedError::not_found(
+        format!(
+            "job {} has no terminal record in this workspace incarnation",
+            job_id.get()
+        ),
+        "a running job is answered by its status; list jobs on the current workspace",
     )
 }
 

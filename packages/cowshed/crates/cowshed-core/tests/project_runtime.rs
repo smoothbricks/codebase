@@ -1183,6 +1183,16 @@ impl ProjectRuntimeHost for FakeHost {
         }
     }
 
+    async fn sealed_job(
+        &mut self,
+        workspace: WorkspaceName,
+        incarnation: WorkspaceIncarnation,
+        _job: JobId,
+    ) -> Result<cowshed_core::api::SealedJob> {
+        self.require_incarnation(&workspace, &incarnation)?;
+        Err(Self::worker_unavailable())
+    }
+
     async fn wait_job(
         &mut self,
         workspace: WorkspaceName,

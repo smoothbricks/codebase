@@ -187,11 +187,15 @@ multiplexed, and a client that disconnects abandons only its own call, never a j
   into it, and acknowledges them. The supervisor keeps up to 65,536 unacknowledged commitments and then drops the
   oldest, which the next read reports.
 - **calls** — `openSession`, `sessionSnapshot`, `closeSession`, `exec`, `warm`, `stdinWrite`, `stdinClose`,
-  `streamChunk`, `streamEnd`, `info`, `list`, `kill`, `wait`, `logRead`, `checkpoint`, `quiesce`, `retire`: one per
-  supervisor operation, each naming the authority the caller holds. The supervisor fences every call by it exactly as it
-  fences an in-process one, so a caller holding a stale incarnation or grant revision is refused, not served under the
-  wrong profile. An accepted `exec` answers with the numeric `jobId`, allocated before process creation; a spawn failure
-  is therefore a terminal job, not a response with no identity. `warm` answers with the `WarmAdmission` above.
+  `streamChunk`, `streamEnd`, `info`, `sealed`, `list`, `kill`, `wait`, `logRead`, `checkpoint`, `quiesce`, `retire`:
+  one per supervisor operation, each naming the authority the caller holds. The supervisor fences every call by it
+  exactly as it fences an in-process one, so a caller holding a stale incarnation or grant revision is refused, not
+  served under the wrong profile. An accepted `exec` answers with the numeric `jobId`, allocated before process
+  creation; a spawn failure is therefore a terminal job, not a response with no identity. `warm` answers with the
+  `WarmAdmission` above. `info`, `list`, `kill` and `wait` answer the supervisor's own jobs; `sealed` answers a job's
+  terminal record from the workspace's records — state, exit, failure, duration, output limit and both streams — for any
+  job of the incarnation that has one, including a job an earlier supervisor ran and sealed, and `logRead` reads such a
+  job's sealed streams from any offset as it reads its own terminal jobs'.
 - **stdin** — empty, inline bytes (the request's raw frame), a workspace-relative regular file the supervisor opens
   inside the sandbox boundary, or a stream: the client forwards its source as `streamChunk` calls in order, each
   answered only once the job's bounded queue took it, and ends it with `streamEnd`, naming the source's error if it
@@ -472,7 +476,9 @@ admitted but never sealed. Two things put that right:
 — including one that names no build at all — to drain: it admits nothing more, lets its running jobs finish, and
 retires, and the next command for its workspace gets a supervisor of the new build. `drain` is the one request whose
 shape never changes across builds, so any later daemon can retire any earlier supervisor. A supervisor of the daemon's
-own build keeps serving across a daemon restart and retires on its own when idle.
+own build keeps serving across a daemon restart and retires on its own when idle. A draining supervisor retires the
+moment its last job ends, usually before its client has read the end: the client reaches that job from the workspace's
+next supervisor by its number, through `sealed` and `logRead`, and reads on from the bytes it already holds.
 
 Until a draining supervisor retires, a command of the new build that reaches it is refused by name: `exec` and every
 other verb that would run work there, because they cannot speak its protocol. A lifecycle verb that must change the

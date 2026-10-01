@@ -22,7 +22,7 @@ use crate::api::dto::{
     CreateOptions, DoctorReport, EmptyResult, ExecRequest, GcOptions, GcReport, GitOid, GrantDelta,
     GrantSet, JobId, JobInfo, LandOptions, LandReport, MirrorInfo, ProjectGrantDelta,
     ProjectGrants, PushOptions, PushReport, RebaseOptions, RemoveOptions, RemoveReport,
-    RevisionResult, RunSandboxMode, StdinSource, WorkspaceIncarnation, WorkspaceInfo,
+    RevisionResult, RunSandboxMode, SealedJob, StdinSource, WorkspaceIncarnation, WorkspaceInfo,
     WorkspaceTarget,
 };
 use crate::api::server::{
@@ -254,6 +254,14 @@ pub trait ProjectRuntimeHost: Send + 'static {
         incarnation: WorkspaceIncarnation,
         job: JobId,
     ) -> Result<JobInfo>;
+    /// The job's terminal record from the workspace's durable records — answered for a job an
+    /// earlier supervisor of the incarnation ran and sealed, which `job_info` is not.
+    async fn sealed_job(
+        &mut self,
+        workspace: WorkspaceName,
+        incarnation: WorkspaceIncarnation,
+        job: JobId,
+    ) -> Result<SealedJob>;
     /// The job's terminal record, once it has one.
     async fn wait_job(
         &mut self,
@@ -730,6 +738,7 @@ impl ProjectActor {
             "worker.shell" => self.worker_shell(request).await,
             "worker.listJobs" => self.worker_list_jobs(request).await,
             "worker.job" | "job.status" => self.worker_job_info(request).await,
+            "job.sealed" => self.job_sealed(request).await,
             "worker.checkpoint" => self.worker_checkpoint(request).await,
             "worker.push" => self.worker_push(request).await,
             "job.detach" => self.job_detach(request).await,
@@ -1158,6 +1167,21 @@ impl ProjectActor {
         json_response(
             self.host
                 .job_info(
+                    params.workspace,
+                    params.workspace_incarnation,
+                    params.job_id,
+                )
+                .await?,
+        )
+    }
+
+    async fn job_sealed(&mut self, request: RouterRequest) -> Result<RouterResponse> {
+        let params: JobParams = decode_params(request.params(), request.method())?;
+        self.require_scoped_workspace(request.authority(), &params.repo_id, &params.workspace)
+            .await?;
+        json_response(
+            self.host
+                .sealed_job(
                     params.workspace,
                     params.workspace_incarnation,
                     params.job_id,
@@ -8887,6 +8911,17 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
         let current = self.current(&workspace).await?;
         Self::require_exact_incarnation(&current, &incarnation)?;
         self.ensure_supervisor(&workspace).await?.info(job).await
+    }
+
+    async fn sealed_job(
+        &mut self,
+        workspace: WorkspaceName,
+        incarnation: WorkspaceIncarnation,
+        job: JobId,
+    ) -> Result<SealedJob> {
+        let current = self.current(&workspace).await?;
+        Self::require_exact_incarnation(&current, &incarnation)?;
+        self.ensure_supervisor(&workspace).await?.sealed(job).await
     }
 
     async fn wait_job(

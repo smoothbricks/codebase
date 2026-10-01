@@ -188,9 +188,10 @@ with `Conflict` carrying `otherBuild: { daemon, caller }`, the two builds as dat
 answer on its connection, `Coordinator::other_build()`, so the embedder learns its controller can start nothing more
 without reading the sentence. It starts `cowshed controller` again — the host's `cowshed` is the new build once the
 install has run — and sends its new work there. A job the old controller started stays reachable through it while the
-draining supervisor still serves; once a call of it meets the refusal, the new controller reaches the job by its number
-(`WorkspaceHandle::job`) and reads its output on from the bytes already held
-(`JobHandle::logs(stream, offset, follow)`). The old controller exits 0 when its last handle is dropped.
+draining supervisor still serves. That supervisor retires the moment the job ends, usually before the old controller has
+read the end; once a call of the job meets the refusal, the new controller reaches it by its number from the workspace's
+next supervisor — `WorkspaceHandle::sealed` answers its terminal record — and reads its output on from the bytes already
+held (`JobHandle::logs(stream, offset, follow)`). The old controller exits 0 when its last handle is dropped.
 
 ## MCP authority delivery
 

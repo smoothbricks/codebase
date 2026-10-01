@@ -504,6 +504,9 @@ impl WorkspaceHandle {
     pub async fn shell(&self, session: Option<&str>) -> Result<Session, CowshedError>;
     pub async fn list_jobs(&self) -> Result<Vec<JobInfo>, CowshedError>;
     pub async fn job(&self, id: JobId) -> Result<JobHandle, CowshedError>;
+    // An ended job's terminal record and a handle reading its sealed output, also for a job an
+    // earlier supervisor of the incarnation ran (11_shell.md "Draining a supervisor of another build").
+    pub async fn sealed(&self, id: JobId) -> Result<(SealedJob, JobHandle), CowshedError>;
     pub async fn checkpoint(&self, opts: CheckpointOptions) -> Result<String, CowshedError>; // quota-enforced atomically
     pub async fn push(&self, opts: PushOptions) -> Result<PushReport, CowshedError>;
     pub async fn grants(&self) -> Result<GrantSet, CowshedError>;   // read-only: observe, never mutate

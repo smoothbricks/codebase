@@ -281,6 +281,10 @@ enum Call {
     Info {
         job_id: JobId,
     },
+    #[serde(rename_all = "camelCase")]
+    Sealed {
+        job_id: JobId,
+    },
     List,
     #[serde(rename_all = "camelCase")]
     Kill {
@@ -840,6 +844,7 @@ async fn answer(
             Bytes::new(),
         ),
         Call::Info { job_id } => (to_value(&supervisor.info(job_id).await?)?, Bytes::new()),
+        Call::Sealed { job_id } => (to_value(&supervisor.sealed(job_id).await?)?, Bytes::new()),
         Call::List => (to_value(&supervisor.list().await?)?, Bytes::new()),
         Call::Kill { job_id } => {
             supervisor.kill(job_id).await?;
@@ -1181,6 +1186,13 @@ async fn forward(path: Arc<PathBuf>, command: Command) {
             reply,
         } => {
             let _ = reply.send(call(path, &authority, Call::Info { job_id }, Bytes::new()).await);
+        }
+        Command::Sealed {
+            authority,
+            job_id,
+            reply,
+        } => {
+            let _ = reply.send(call(path, &authority, Call::Sealed { job_id }, Bytes::new()).await);
         }
         Command::List { authority, reply } => {
             let _ = reply.send(call(path, &authority, Call::List, Bytes::new()).await);
