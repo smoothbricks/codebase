@@ -29,13 +29,31 @@ const POST_COMMIT_BLOCK = [
   POST_COMMIT_END,
 ].join('\n');
 
+/**
+ * Wires the repository config and git hooks of the checkout at `root`. Shell entries managed
+ * before the direnv setup stopped importing workspace packages call this as their last
+ * bootstrap step, so a refused write — a sandbox that denies `.git/hooks`, a read-only checkout —
+ * takes their shell down no more than an install does: it is reported, with the path and errno
+ * it hit, and this returns.
+ */
 export async function applyWorkspaceGitConfig(root: string): Promise<void> {
   // Workspace Git metadata belongs to the host setup, not a sandboxed job. Its hooks
   // are installed in the warm checkout already; a job must never rewrite them.
   if (process.env.COWSHED_WORKSPACE_TOKEN) return;
+  try {
+    await wireWorkspaceGit(root);
+  } catch (error) {
+    console.error(`--- WARNING: applying the workspace git config in ${root} failed: ${error}`);
+    console.error('Git hooks and repository config were not applied; the shell is loaded without them.\n---');
+  }
+}
+
+async function wireWorkspaceGit(root: string): Promise<void> {
   const gitDirResult = await $`git rev-parse --git-dir`.cwd(root).quiet().nothrow();
   if (gitDirResult.exitCode !== 0) {
-    throw new Error(`git rev-parse --git-dir failed with exit code ${gitDirResult.exitCode}: not in a git repository`);
+    throw new Error(
+      `git rev-parse --git-dir in ${root} failed with exit code ${gitDirResult.exitCode}: ${decode(gitDirResult.stderr).trim()}`,
+    );
   }
 
   const gitDir = resolve(root, decode(gitDirResult.stdout).trim());

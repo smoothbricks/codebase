@@ -739,6 +739,29 @@ describe('the workspace git config', () => {
       expect(gitConfigWrites()).toHaveLength(first);
     });
   });
+
+  it('loads the shell when its hooks cannot be written, naming the path and errno, and links them once they can', async () => {
+    // A sandboxed job may not write .git/hooks: a cowshed workspace denies it. A hooks
+    // directory without write permission is the same refusal outside a sandbox.
+    await withManagedRepository({}, async ({ root, enterShell: enter }) => {
+      const hooks = join(root, '.git', 'hooks');
+      await chmod(hooks, 0o555);
+      try {
+        const refused = await enter();
+        expect(refused.exitCode).toBe(0);
+        expect(refused.stderr).toContain('--- WARNING: setup-environment.ts failed:');
+        expect(refused.stderr).toContain('EACCES');
+        expect(refused.stderr).toContain(join(hooks, 'pre-commit'));
+        expect(refused.stderr).toContain(
+          'Git hooks and repository config were not applied; the shell is loaded without them.',
+        );
+      } finally {
+        await chmod(hooks, 0o755);
+      }
+      expect(await enter()).toEqual(HEALTHY);
+      expect(readlinkSync(join(hooks, 'pre-commit'))).toBe(join(root, 'tooling', 'git-hooks', 'pre-commit.sh'));
+    });
+  });
 });
 
 describe('a shell direnv keeps loaded', () => {

@@ -206,8 +206,13 @@ try {
         ensureTypeScriptApiPackage(projectRoot);
       }
       // Under the same lock: the repository config and hooks are one more thing two shell
-      // entries would otherwise write at once.
-      await applyWorkspaceGitConfig(projectRoot);
+      // entries would otherwise write at once. Hooks this shell may not write — a cowshed
+      // job's sandbox refuses `.git/hooks` — take the shell down no more than an install
+      // does: say so and load it.
+      await applyWorkspaceGitConfig(projectRoot).catch((configError: unknown) => {
+        describeFailure('WARNING', configError);
+        console.error('Git hooks and repository config were not applied; the shell is loaded without them.\n---');
+      });
       return error;
     });
     if (installError !== undefined) {
