@@ -33,9 +33,11 @@ use crate::undo_log::{
     SMR_ROW_ABSENT,
 };
 use columine_types::DEFAULT_ACCEPTED_PROGRAM_MAGICS;
-use columine_types::operand::{Operands, read_index};
+use columine_types::operand::Operands;
 
-use crate::element_body::{OperandRead, Skip, WideOperands, walk_operands, widen_element_body};
+use crate::element_body::{
+    BodyPlan, OperandRead, Skip, WideOperands, plan_element_body, walk_operands, widen_element_body,
+};
 use columine_types::types::{
     AggType, ChangeFlag, DERIVED_FACT_TOMBSTONE_IDENTITY, EMPTY_KEY, ErrorCode,
     MAX_GUARD_COMPONENTS, MAX_SCATTER_ROUTES, NO_PARENT_TS_COL, Opcode, ProgramHeader,
@@ -784,9 +786,9 @@ pub struct Vm {
     pub undo: UndoState,
     pub bitmap_env: BitmapEnv,
     accepted_program_magics: &'static [u32],
-    /// The FOR_EACH body being run per element, widened once per batch
-    /// (`element_body`); kept so a batch reuses its allocation.
-    element_body: Vec<u8>,
+    /// The plan of the FOR_EACH body being run (`element_body`), made once
+    /// per batch; kept so a batch reuses its allocations.
+    element_plan: BodyPlan,
     /// Decode targets of the per-element instructions that carry fixed
     /// operand arrays: an element decodes into these instead of building
     /// (zeroing and copying) the arrays per row.
@@ -806,7 +808,7 @@ impl Vm {
             undo: UndoState::default(),
             bitmap_env: BitmapEnv::default(),
             accepted_program_magics,
-            element_body: Vec::new(),
+            element_plan: BodyPlan::default(),
             element_struct_map: StructMapUpsertOperands::EMPTY,
             element_struct_map2: StructMap2UpsertOperands::EMPTY,
             element_struct_map2_max: StructMap2MaxI64x2Operands::EMPTY,
@@ -2828,58 +2830,18 @@ pub(crate) fn body_op_len(code: &[u8], pc: usize) -> Option<usize> {
     operands.pos().checked_sub(pc)
 }
 
-fn validate_body(state: &[u8], body: &[u8]) -> bool {
-    let mut pc = 0usize;
-    while pc < body.len() {
-        let Some(op) = Opcode::from_u8(body[pc]) else {
-            return false;
-        };
-        let Some(len) = body_op_len(body, pc) else {
-            return false;
-        };
-
-        if op == Opcode::BatchScalarLatest {
-            let Some((slot, _)) = read_index(body, pc + 1) else {
-                return false;
-            };
-            if slot >= state_num_slots(state) {
-                return false;
-            }
-            let meta = SlotMetaView::read(state, slot);
-            let scalar_type = meta.agg_type_byte(state);
-            let Some(kind) = AggType::from_u8(scalar_type) else {
-                return false;
-            };
-            if meta.slot_type() != SlotType::Scalar
-                || !matches!(
-                    kind,
-                    AggType::ScalarU32 | AggType::ScalarF64 | AggType::ScalarI64
-                )
-            {
-                return false;
-            }
-        }
-
-        if op == Opcode::FlatMap
-            && let Some(inner) = flat_map_inner_body(body, pc)
-            && !validate_body(state, inner)
-        {
-            return false;
-        }
-
-        pc += len;
+/// Whether `slot` is a scalar a `BATCH_SCALAR_LATEST` can fold into: the
+/// state check a FOR_EACH body plan leaves to its caller.
+fn is_scalar_latest_slot(state: &[u8], slot: u32) -> bool {
+    if slot >= state_num_slots(state) {
+        return false;
     }
-    true
-}
-
-/// The inner body of the `FLAT_MAP` at `pc`: what follows its offsets
-/// column, parent timestamp column and `u16` length.
-fn flat_map_inner_body(body: &[u8], pc: usize) -> Option<&[u8]> {
-    let mut operands = Operands::at(body, pc + 1);
-    operands.index()?;
-    operands.index()?;
-    let inner_len = usize::from(operands.u16()?);
-    operands.bytes(inner_len)
+    let meta = SlotMetaView::read(state, slot);
+    meta.slot_type() == SlotType::Scalar
+        && matches!(
+            AggType::from_u8(meta.agg_type_byte(state)),
+            Some(AggType::ScalarU32 | AggType::ScalarF64 | AggType::ScalarI64)
+        )
 }
 
 // =============================================================================
@@ -3593,62 +3555,33 @@ impl Vm {
                     let match_ids = operand!(r.bytes(match_count * 4));
                     let body_len = usize::from(operand!(r.u16()));
                     let body = operand!(r.bytes(body_len));
-                    if !validate_body(state, body) {
-                        return INVALID_PROGRAM;
-                    }
                     pc = r.pos();
 
-                    let type_col = col_at(cols, col_idx as usize);
-                    // Both passes index the type column with row indices up
-                    // to batch_len; a short column is a malformed batch.
-                    let type_data = batch_col!(col_u32_exact(type_col, batch_len));
-
-                    // Pass 1: batch aggregates, once per match id.
-                    for mi in 0..match_count {
-                        let match_id = bytes::read_u32(match_ids, (mi * 4) as u32);
-                        let agg_result = self.execute_batch_aggregates(
-                            delta_mode, state, body, cols, batch_len, type_col, match_id,
-                        );
-                        if agg_result != OK {
-                            return agg_result;
-                        }
-                    }
-
-                    // Pass 2: per-element operations, over the body widened
-                    // once for the batch. A body of aggregates alone widens
-                    // to nothing and visits no element.
-                    let mut wide = core::mem::take(&mut self.element_body);
-                    wide.clear();
-                    let result = if widen_element_body(body, &mut wide).is_none() {
+                    // One scan plans the body for the batch and validates it
+                    // before either pass mutates anything: every instruction
+                    // decodes and every BATCH_SCALAR_LATEST names a scalar.
+                    let mut plan = core::mem::take(&mut self.element_plan);
+                    let result = if plan_element_body(body, &mut plan).is_none()
+                        || !plan
+                            .scalar_latest_slots
+                            .iter()
+                            .all(|&slot| is_scalar_latest_slot(state, slot))
+                    {
                         INVALID_PROGRAM
-                    } else if wide.is_empty() {
-                        OK
                     } else {
-                        let mut result = OK;
-                        for ei in 0..batch_len {
-                            let val = type_data[ei as usize];
-                            let matched = (0..match_count)
-                                .any(|mj| val == bytes::read_u32(match_ids, (mj * 4) as u32));
-                            if !matched {
-                                continue;
-                            }
-                            result = self.execute_element_opcodes(
-                                delta_mode,
-                                state,
-                                &wide,
-                                cols,
-                                ei,
-                                ei,
-                                NO_PARENT_TS_COL,
-                                live.as_deref_mut(),
-                            );
-                            if result != OK {
-                                break;
-                            }
-                        }
-                        result
+                        self.run_for_each(
+                            delta_mode,
+                            state,
+                            body,
+                            &mut plan,
+                            cols,
+                            batch_len,
+                            col_at(cols, col_idx as usize),
+                            match_ids,
+                            live.as_deref_mut(),
+                        )
                     };
-                    self.element_body = wide;
+                    self.element_plan = plan;
                     if result != OK {
                         return result;
                     }
@@ -3662,36 +3595,99 @@ impl Vm {
         OK
     }
 
-    /// Execute pass one of FOR_EACH: batch aggregates once per match id.
+    /// Run one planned FOR_EACH. Pass one folds the body's aggregates once
+    /// per match id; pass two widens the body at the first row whose type
+    /// matches and runs that form over every such row. A body with no
+    /// aggregates skips pass one, and one with nothing but aggregates widens
+    /// to nothing and runs no row.
+    #[allow(clippy::too_many_arguments)]
+    fn run_for_each(
+        &mut self,
+        delta_mode: bool,
+        state: &mut [u8],
+        body: &[u8],
+        plan: &mut BodyPlan,
+        cols: &[&[u8]],
+        batch_len: u32,
+        type_col: &[u8],
+        match_ids: &[u8],
+        mut live: Option<&mut LiveColumns<'_, '_>>,
+    ) -> u32 {
+        // Both passes index the type column with row indices up to
+        // batch_len; a short column is a malformed batch.
+        let type_data = batch_col!(col_u32_exact(type_col, batch_len));
+        let match_ids = match_ids.as_chunks::<4>().0;
+        if !plan.aggregates.is_empty() {
+            for id in match_ids {
+                let result = self.execute_batch_aggregates(
+                    delta_mode,
+                    state,
+                    body,
+                    &plan.aggregates,
+                    cols,
+                    batch_len,
+                    type_data,
+                    u32::from_le_bytes(*id),
+                );
+                if result != OK {
+                    return result;
+                }
+            }
+        }
+        let mut widened = false;
+        for (ei, &val) in (0..batch_len).zip(type_data) {
+            if !match_ids.iter().any(|id| val == u32::from_le_bytes(*id)) {
+                continue;
+            }
+            if !widened {
+                widened = true;
+                // The scan accepted every instruction this decodes.
+                if widen_element_body(body, plan).is_none() {
+                    return INVALID_PROGRAM;
+                }
+            }
+            if plan.wide.is_empty() {
+                return OK;
+            }
+            let result = self.execute_element_opcodes(
+                delta_mode,
+                state,
+                &plan.wide,
+                cols,
+                ei,
+                ei,
+                NO_PARENT_TS_COL,
+                live.as_deref_mut(),
+            );
+            if result != OK {
+                return result;
+            }
+        }
+        OK
+    }
+
+    /// Execute pass one of FOR_EACH for one match id: the aggregates at
+    /// `aggregates` (offsets into `body`), in order.
     #[allow(clippy::too_many_arguments)]
     fn execute_batch_aggregates(
         &mut self,
         delta_mode: bool,
         state: &mut [u8],
         body: &[u8],
+        aggregates: &[usize],
         cols: &[&[u8]],
         batch_len: u32,
-        type_col: &[u8],
+        type_data: &[u32],
         type_id: u32,
     ) -> u32 {
-        let type_data = batch_col!(col_u32_exact(type_col, batch_len));
-        let mut bpc = 0usize;
-        while bpc < body.len() {
-            let Some(op) = Opcode::from_u8(body[bpc]) else {
+        for &at in aggregates {
+            let Some(op) = body.get(at).copied().and_then(Opcode::from_u8) else {
                 return INVALID_PROGRAM;
             };
-            if !is_aggregate_op(op) {
-                let Some(op_len) = body_op_len(body, bpc) else {
-                    return INVALID_PROGRAM;
-                };
-                bpc += op_len;
-                continue;
-            }
-            let mut r = Operands::at(body, bpc + 1);
+            let mut r = Operands::at(body, at + 1);
             match op {
                 Opcode::BatchAggSum | Opcode::BatchAggMin | Opcode::BatchAggMax => {
                     let (slot, val_col) = (operand!(r.index()), operand!(r.index()));
-                    bpc = r.pos();
                     let kind = match op {
                         Opcode::BatchAggSum => AggKind::Sum,
                         Opcode::BatchAggMin => AggKind::Min,
@@ -3713,7 +3709,6 @@ impl Vm {
                 }
                 Opcode::BatchAggCount => {
                     let slot = operand!(r.index());
-                    bpc = r.pos();
                     let matched = aggregates::masked_agg_count(type_data, type_id);
                     exec_agg_count(&mut self.undo, delta_mode, state, slot, u64::from(matched));
                 }
@@ -3723,7 +3718,6 @@ impl Vm {
                         operand!(r.index()),
                         operand!(r.index()),
                     );
-                    bpc = r.pos();
                     let kind = match op {
                         Opcode::BatchAggSumIf => AggKind::Sum,
                         Opcode::BatchAggMinIf => AggKind::Min,
@@ -3748,7 +3742,6 @@ impl Vm {
                 }
                 Opcode::BatchAggCountIf => {
                     let (slot, pred_col) = (operand!(r.index()), operand!(r.index()));
-                    bpc = r.pos();
                     let preds =
                         batch_col!(col_u32_exact(col_at(cols, pred_col as usize), batch_len));
                     let mut matched = 0u64;
@@ -3765,7 +3758,6 @@ impl Vm {
                         operand!(r.index()),
                         operand!(r.index()),
                     );
-                    bpc = r.pos();
                     let cmp_vals =
                         batch_col!(col_f64_exact(col_at(cols, cmp_col as usize), batch_len));
                     let result = exec_scalar_latest(
@@ -3784,7 +3776,6 @@ impl Vm {
                 }
                 Opcode::BatchAggSumI64 | Opcode::BatchAggMinI64 | Opcode::BatchAggMaxI64 => {
                     let (slot, val_col) = (operand!(r.index()), operand!(r.index()));
-                    bpc = r.pos();
                     let kind = match op {
                         Opcode::BatchAggSumI64 => AggKind::Sum,
                         Opcode::BatchAggMinI64 => AggKind::Min,

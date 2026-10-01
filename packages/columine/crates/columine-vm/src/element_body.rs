@@ -3,11 +3,15 @@
 //! A program carries its index operands as LEB128 (`columine_types::operand`)
 //! so a narrow program stays small. A `FOR_EACH` body runs once per matched
 //! element, though, and decoding its instructions again for every element is
-//! work the batch already did. So the batch widens the body once: aggregates
-//! (pass one's, never an element's) are dropped, every index operand becomes a
-//! little-endian `u32`, and a `FLAT_MAP`'s inner body is widened in place
-//! behind a `u32` length. An element then reads fixed-width operands with no
-//! per-operand branch, and walks only the instructions it executes.
+//! work the batch already did. So a batch scans each body once
+//! ([`plan_element_body`]), recording where pass one's aggregates sit, which
+//! pass one then folds without walking the body again per match id; and at
+//! the first matching row it widens the body ([`widen_element_body`]):
+//! aggregates (pass one's, never an element's) are left out, every index
+//! operand becomes a little-endian `u32`, and a `FLAT_MAP`'s inner body is
+//! widened in place behind a `u32` length. An element then reads fixed-width
+//! operands with no per-operand branch and walks only the instructions it
+//! executes, and a body no row matches is never widened.
 //!
 //! The instruction shapes are stated once, in [`walk_operands`]: measuring an
 //! instruction ([`crate::vm::body_op_len`]) and widening it are the same walk
@@ -110,9 +114,11 @@ impl<'a> OperandRead<'a> for WideOperands<'a> {
 }
 
 /// Where a walk sends an instruction's operands, in wire order: each index
-/// as its value, every fixed-width operand as its bytes.
+/// as its value, every one-byte operand as its byte, every wider fixed-width
+/// operand as its bytes.
 pub(crate) trait OperandSink {
     fn index(&mut self, value: u32);
+    fn byte(&mut self, value: u8);
     fn raw(&mut self, bytes: &[u8]);
 }
 
@@ -124,6 +130,9 @@ impl OperandSink for Skip {
     fn index(&mut self, _: u32) {}
 
     #[inline(always)]
+    fn byte(&mut self, _: u8) {}
+
+    #[inline(always)]
     fn raw(&mut self, _: &[u8]) {}
 }
 
@@ -131,30 +140,46 @@ impl OperandSink for Skip {
 struct Widen<'o>(&'o mut Vec<u8>);
 
 impl OperandSink for Widen<'_> {
+    #[inline(always)]
     fn index(&mut self, value: u32) {
         self.0.extend_from_slice(&value.to_le_bytes());
     }
 
+    #[inline(always)]
+    fn byte(&mut self, value: u8) {
+        self.0.push(value);
+    }
+
+    #[inline(always)]
     fn raw(&mut self, bytes: &[u8]) {
         self.0.extend_from_slice(bytes);
     }
 }
 
+#[inline(always)]
 fn index<S: OperandSink>(r: &mut Operands<'_>, sink: &mut S) -> Option<()> {
     sink.index(r.index()?);
     Some(())
 }
 
+#[inline(always)]
+fn byte<S: OperandSink>(r: &mut Operands<'_>, sink: &mut S) -> Option<()> {
+    sink.byte(r.byte()?);
+    Some(())
+}
+
+#[inline(always)]
 fn raw<S: OperandSink>(r: &mut Operands<'_>, sink: &mut S, len: usize) -> Option<()> {
     sink.raw(r.bytes(len)?);
     Some(())
 }
 
 /// A count operand: forwarded as its byte, answered as its value.
+#[inline(always)]
 fn count<S: OperandSink>(r: &mut Operands<'_>, sink: &mut S) -> Option<usize> {
-    let bytes = r.bytes(1)?;
-    sink.raw(bytes);
-    Some(usize::from(bytes[0]))
+    let value = r.byte()?;
+    sink.byte(value);
+    Some(usize::from(value))
 }
 
 /// One fixed-shape operand of the layout table.
@@ -193,7 +218,7 @@ pub(crate) fn walk_operands<S: OperandSink>(
             // (probe_field, out_field) × num_fields, out_key_col.
             index(r, sink)?;
             index(r, sink)?;
-            raw(r, sink, 1)?;
+            byte(r, sink)?;
             index(r, sink)?;
             let num_fields = count(r, sink)?;
             raw(r, sink, num_fields.checked_mul(2)?)?;
@@ -210,7 +235,7 @@ pub(crate) fn walk_operands<S: OperandSink>(
             raw(r, sink, 3)?;
             let num_routes = count(r, sink)?;
             for _ in 0..num_routes {
-                raw(r, sink, 1)?;
+                byte(r, sink)?;
                 index(r, sink)?;
                 raw(r, sink, 3)?;
             }
@@ -238,7 +263,7 @@ pub(crate) fn walk_operands<S: OperandSink>(
             let num_guards = count(r, sink)?;
             for _ in 0..num_guards {
                 index(r, sink)?;
-                raw(r, sink, 1)?;
+                byte(r, sink)?;
             }
             scatter_routes(r, sink)?;
             &[]
@@ -279,10 +304,10 @@ pub(crate) fn walk_operands<S: OperandSink>(
             for _ in 0..num_arrays {
                 index(r, sink)?;
                 index(r, sink)?;
-                raw(r, sink, 1)?;
+                byte(r, sink)?;
             }
             if op == Opcode::BatchStructMapUpsertMax {
-                raw(r, sink, 1)?;
+                byte(r, sink)?;
             }
             &[]
         }
@@ -340,7 +365,7 @@ pub(crate) fn walk_operands<S: OperandSink>(
     for shape in fixed {
         match shape {
             I => index(r, sink)?,
-            B => raw(r, sink, 1)?,
+            B => byte(r, sink)?,
         }
     }
     Some(())
@@ -356,7 +381,7 @@ fn pairs<S: OperandSink>(r: &mut Operands<'_>, sink: &mut S, max: usize) -> Opti
     }
     for _ in 0..num_vals {
         index(r, sink)?;
-        raw(r, sink, 1)?;
+        byte(r, sink)?;
     }
     Some(())
 }
@@ -366,17 +391,82 @@ fn pairs<S: OperandSink>(r: &mut Operands<'_>, sink: &mut S, max: usize) -> Opti
 fn scatter_routes<S: OperandSink>(r: &mut Operands<'_>, sink: &mut S) -> Option<()> {
     let num_routes = count(r, sink)?;
     for _ in 0..num_routes {
-        raw(r, sink, 1)?;
+        byte(r, sink)?;
         index(r, sink)?;
-        raw(r, sink, 1)?;
+        byte(r, sink)?;
         index(r, sink)?;
     }
     Some(())
 }
 
-/// Append `body`'s per-element form to `out`. `None` for a body that does
-/// not decode; the caller validated it, so that is a malformed program.
-pub(crate) fn widen_element_body(body: &[u8], out: &mut Vec<u8>) -> Option<()> {
+/// A `FOR_EACH` body as one batch runs it. [`plan_element_body`] scans the
+/// body once — the only walk a body no row matches costs — recording where
+/// pass one's aggregates sit and the slot every `BATCH_SCALAR_LATEST` names,
+/// and refusing a body that does not decode. The per-element form is built
+/// by [`widen_element_body`] when the first row matches.
+#[derive(Debug, Default)]
+pub(crate) struct BodyPlan {
+    /// Offsets in the body of its top-level aggregates, in order. A
+    /// `FLAT_MAP`'s inner aggregates fold nothing: neither pass runs them.
+    pub(crate) aggregates: Vec<usize>,
+    /// The slot of every `BATCH_SCALAR_LATEST`, inner ones included, for the
+    /// caller's check against the state.
+    pub(crate) scalar_latest_slots: Vec<u32>,
+    /// The body's per-element form once widened: no aggregates, `u32`
+    /// indexes, each `FLAT_MAP`'s inner body widened behind a `u32` length.
+    pub(crate) wide: Vec<u8>,
+}
+
+/// Scan `body` for one batch over `plan`'s allocations. `None` for a body
+/// that does not decode: a malformed program.
+pub(crate) fn plan_element_body(body: &[u8], plan: &mut BodyPlan) -> Option<()> {
+    plan.aggregates.clear();
+    plan.scalar_latest_slots.clear();
+    plan.wide.clear();
+    scan_body(
+        body,
+        Some(&mut plan.aggregates),
+        &mut plan.scalar_latest_slots,
+    )
+}
+
+/// Record `body`'s aggregates (when it is the top level) and scalar-latest
+/// slots, and check that every instruction, nested ones included, decodes.
+fn scan_body(
+    body: &[u8],
+    mut aggregates: Option<&mut Vec<usize>>,
+    scalar_latest_slots: &mut Vec<u32>,
+) -> Option<()> {
+    let mut pc = 0;
+    while pc < body.len() {
+        let op = Opcode::from_u8(body[pc])?;
+        if is_aggregate_op(op) {
+            if op == Opcode::BatchScalarLatest {
+                scalar_latest_slots.push(Operands::at(body, pc.checked_add(1)?).index()?);
+            }
+            if let Some(aggregates) = aggregates.as_deref_mut() {
+                aggregates.push(pc);
+            }
+        } else if op == Opcode::FlatMap {
+            let mut r = Operands::at(body, pc.checked_add(1)?);
+            r.index()?;
+            r.index()?;
+            let inner_len = usize::from(r.u16()?);
+            scan_body(r.bytes(inner_len)?, None, scalar_latest_slots)?;
+        }
+        pc = pc.checked_add(body_op_len(body, pc)?)?;
+    }
+    Some(())
+}
+
+/// Write the per-element form of `body`, which [`plan_element_body`]
+/// scanned, into `plan.wide`.
+pub(crate) fn widen_element_body(body: &[u8], plan: &mut BodyPlan) -> Option<()> {
+    plan.wide.clear();
+    widen_body(body, &mut plan.wide)
+}
+
+fn widen_body(body: &[u8], out: &mut Vec<u8>) -> Option<()> {
     let mut pc = 0;
     while pc < body.len() {
         let op = Opcode::from_u8(body[pc])?;
@@ -394,7 +484,7 @@ pub(crate) fn widen_element_body(body: &[u8], out: &mut Vec<u8>) -> Option<()> {
             let inner = r.bytes(inner_len)?;
             let len_at = out.len();
             out.extend_from_slice(&[0; 4]);
-            widen_element_body(inner, out)?;
+            widen_body(inner, out)?;
             let inner_wide = u32::try_from(out.len() - len_at - 4).ok()?;
             out[len_at..len_at + 4].copy_from_slice(&inner_wide.to_le_bytes());
         } else {
