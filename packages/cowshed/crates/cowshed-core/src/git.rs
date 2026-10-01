@@ -2185,6 +2185,7 @@ impl GitRepository {
             let output = run_git_at_with_objects(
                 &main.root,
                 main.alternate_objects.as_deref(),
+                #[cfg(target_os = "macos")]
                 Some(&staging),
                 [
                     OsStr::new("worktree"),
@@ -2270,6 +2271,7 @@ impl GitRepository {
         let output = run_git_at_with_objects(
             &self.root,
             self.alternate_objects.as_deref(),
+            #[cfg(target_os = "macos")]
             Some(mount),
             [
                 OsStr::new("worktree"),
@@ -2378,7 +2380,14 @@ impl GitRepository {
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
-        run_git_at_with_objects(&self.root, self.alternate_objects.as_deref(), None, args).await
+        run_git_at_with_objects(
+            &self.root,
+            self.alternate_objects.as_deref(),
+            #[cfg(target_os = "macos")]
+            None,
+            args,
+        )
+        .await
     }
 }
 
@@ -2387,7 +2396,14 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    run_git_at_with_objects(root, None, None, args).await
+    run_git_at_with_objects(
+        root,
+        None,
+        #[cfg(target_os = "macos")]
+        None,
+        args,
+    )
+    .await
 }
 
 /// Bundle object transport is the narrow exception to sandboxed Git: the
@@ -2713,6 +2729,7 @@ pub fn git_spawn_error(error: &std::io::Error) -> CowshedError {
 async fn run_git_at_with_objects<I, S>(
     root: &Path,
     alternate_objects: Option<&Path>,
+    #[cfg(target_os = "macos")]
     writable: Option<&Path>,
     args: I,
 ) -> Result<Output>
