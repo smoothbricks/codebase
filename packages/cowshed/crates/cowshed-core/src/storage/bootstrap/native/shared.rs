@@ -324,6 +324,8 @@ pub enum NativeBootstrapError {
     CommandFailed(HostCommandFailure),
     #[error("diskutil APFS inventory is malformed: {0}")]
     MalformedPlist(String),
+    #[error("diskutil APFS inventory contains departing container {0:?}")]
+    DepartingApfsContainer(String),
     #[error("kernel device {device:?} belongs to no APFS container in diskutil evidence")]
     ContainerNotFound { device: String },
     #[error("kernel device {device:?} ambiguously belongs to {matches} APFS containers")]

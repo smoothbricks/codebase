@@ -1781,7 +1781,7 @@ fn plan_existing_host_storage(
     home: &Path,
 ) -> Result<BootstrapPlan, NativeBootstrapError> {
     let gathered =
-        gather_existing_apfs_evidence(source, home, InventoryReadPolicy::RepairEmptyRoot)?;
+        gather_existing_apfs_evidence(source, home, InventoryReadPolicy::RepairTransient)?;
     let selected = select_substrate(gathered.statfs, None)?;
     plan_bootstrap(selected, home, gathered.bootstrap).map_err(Into::into)
 }
@@ -1925,7 +1925,7 @@ enum InventoryReadPolicy {
     // A read-only consumer can repeat an incomplete observation; an inventory used before
     // creating a volume must fail closed instead of treating a partial scan as absence.
     Strict,
-    RepairEmptyRoot,
+    RepairTransient,
 }
 
 fn run_apfs_inventory_command(
@@ -1934,25 +1934,25 @@ fn run_apfs_inventory_command(
     policy: InventoryReadPolicy,
 ) -> Result<ApfsInventory, NativeBootstrapError> {
     const MAX_READ_ATTEMPTS: usize = 4;
-    let attempts = if policy == InventoryReadPolicy::RepairEmptyRoot {
+    let attempts = if policy == InventoryReadPolicy::RepairTransient {
         MAX_READ_ATTEMPTS
     } else {
         1
     };
-    let mut empty_reads = 0;
+    let mut incomplete_reads = 0;
     for attempt in 1..=attempts {
         let output = source.run_command(&command).map_err(|error| {
-            if empty_reads > 0 {
+            if incomplete_reads > 0 {
                 eprintln!(
-                    "diskutil APFS inventory: {empty_reads} empty-root reads before retry {attempt}/{attempts} failed: {error}"
+                    "diskutil APFS inventory: {incomplete_reads} incomplete reads before retry {attempt}/{attempts} failed: {error}"
                 );
             }
             error
         })?;
         if !output.succeeded() {
-            if empty_reads > 0 {
+            if incomplete_reads > 0 {
                 eprintln!(
-                    "diskutil APFS inventory: {empty_reads} empty-root reads before retry {attempt}/{attempts} exited {:?}",
+                    "diskutil APFS inventory: {incomplete_reads} incomplete reads before retry {attempt}/{attempts} exited {:?}",
                     output.status
                 );
             }
@@ -1972,15 +1972,16 @@ fn run_apfs_inventory_command(
                 return Ok(inventory);
             }
             Err(error) => {
-                // diskutil sometimes exits 0 with exactly an XML `<dict/>` during unrelated
-                // image teardown. Only that observed transient is retryable: a nonempty plist,
-                // malformed container, wrong device, or failed command remains authoritative.
+                // During image teardown diskutil can publish an empty root or a container with
+                // only its device name. Reobserve only those incomplete snapshots; no partial
+                // inventory can establish absence, and other malformed records still fail closed.
                 let root = Value::from_reader(std::io::Cursor::new(&output.stdout))
                     .ok()
                     .and_then(Value::into_dictionary);
-                let empty_root = root.as_ref().is_some_and(Dictionary::is_empty);
-                if empty_root {
-                    empty_reads += 1;
+                let incomplete = root.as_ref().is_some_and(Dictionary::is_empty)
+                    || matches!(error, NativeBootstrapError::DepartingApfsContainer(_));
+                if incomplete {
+                    incomplete_reads += 1;
                     if attempt < attempts {
                         std::thread::sleep(Duration::from_millis(50));
                         continue;
@@ -1999,10 +2000,13 @@ fn run_apfs_inventory_command(
                 );
                 let reason = match error {
                     NativeBootstrapError::MalformedPlist(reason) => reason,
+                    NativeBootstrapError::DepartingApfsContainer(container) => {
+                        format!("departing APFS container {container:?}")
+                    }
                     other => return Err(other),
                 };
                 return Err(NativeBootstrapError::MalformedPlist(format!(
-                    "{reason}; {} {:?} exited {:?}, stdout {} bytes, root {shape}, read {attempt}/{attempts} ({empty_reads} empty-root reads)",
+                    "{reason}; {} {:?} exited {:?}, stdout {} bytes, root {shape}, read {attempt}/{attempts} ({incomplete_reads} incomplete reads)",
                     command.program(),
                     command.args(),
                     output.status,
@@ -2171,12 +2175,15 @@ fn parse_apfs_inventory(bytes: &[u8]) -> Result<ApfsInventory, NativeBootstrapEr
 fn parse_container(value: &Value, index: usize) -> Result<ApfsContainer, NativeBootstrapError> {
     let container = dictionary(value, &format!("Containers[{index}]"))?;
     let reference = required_string(container, "ContainerReference", "container")?;
-    let capacity_bytes = required_unsigned(container, "CapacityCeiling", "container")?;
     if !valid_container_identifier(reference.as_bytes()) {
         return Err(malformed(format!(
             "invalid ContainerReference {reference:?}"
         )));
     }
+    if container.len() == 1 {
+        return Err(NativeBootstrapError::DepartingApfsContainer(reference));
+    }
+    let capacity_bytes = required_unsigned(container, "CapacityCeiling", "container")?;
     let volumes = container
         .get("Volumes")
         .and_then(Value::as_array)
@@ -5512,7 +5519,7 @@ mod tests {
         let gathered = gather_existing_apfs_evidence(
             &mut evidence_source,
             Path::new("/Users/alice"),
-            InventoryReadPolicy::RepairEmptyRoot,
+            InventoryReadPolicy::RepairTransient,
         )
         .expect("mis-mounted caches evidence");
         assert!(matches!(
@@ -5548,7 +5555,7 @@ mod tests {
         let gathered = gather_existing_apfs_evidence(
             &mut evidence_source,
             Path::new("/Users/alice"),
-            InventoryReadPolicy::RepairEmptyRoot,
+            InventoryReadPolicy::RepairTransient,
         )
         .expect("detached caches evidence");
         assert!(matches!(
@@ -5577,6 +5584,87 @@ mod tests {
                 })
         )));
         assert!(!mutating_setup_actions(&plan).is_empty());
+    }
+
+    #[test]
+    fn incomplete_inventory_never_authorizes_provisioning_or_hides_malformed_records() {
+        let complete = plist(&container("disk3", &volume("Data", "disk3s5", None)));
+        let departing = plist(
+            &(container("disk3", &volume("Data", "disk3s5", None))
+                + "<dict><key>ContainerReference</key><string>disk71</string></dict>"),
+        );
+        let mut strict = source(complete.clone());
+        strict.command_outputs = VecDeque::from([
+            HostCommandOutput::success(complete.clone()),
+            HostCommandOutput::success(departing.clone()),
+        ]);
+        assert!(matches!(
+            plan_native_bootstrap(
+                &mut strict,
+                Path::new("/Users/alice/project"),
+                Path::new("/Users/alice"),
+            ),
+            Err(NativeBootstrapError::MalformedPlist(_))
+        ));
+
+        let mut never_complete = source(departing);
+        assert!(matches!(
+            plan_existing_host_storage(&mut never_complete, Path::new("/Users/alice")),
+            Err(NativeBootstrapError::MalformedPlist(_))
+        ));
+
+        for malformed in [
+            "<dict><key>ContainerReference</key><string>not-a-device</string></dict>",
+            "<dict><key>ContainerReference</key><string>disk71</string><key>Volumes</key><array/></dict>",
+        ] {
+            let mut evidence = source(complete.clone());
+            evidence.command_outputs = VecDeque::from([
+                HostCommandOutput::success(complete.clone()),
+                HostCommandOutput::success(plist(
+                    &(container("disk3", &volume("Data", "disk3s5", None)) + malformed),
+                )),
+            ]);
+            assert!(matches!(
+                plan_existing_host_storage(&mut evidence, Path::new("/Users/alice")),
+                Err(NativeBootstrapError::MalformedPlist(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn departing_global_container_does_not_hide_a_reserved_volume() {
+        let scoped = plist(&container("disk3", &volume("Data", "disk3s5", None)));
+        // Captured from a real image teardown: diskutil publishes just the departing device name.
+        let departing = plist(
+            &(container("disk3", &volume("Data", "disk3s5", None))
+                + "<dict><key>ContainerReference</key><string>disk71</string></dict>"),
+        );
+        let complete = plist(
+            &(container("disk3", &volume("Data", "disk3s5", None))
+                + &container(
+                    "disk7",
+                    &volume_with_filevault(APFS_STORE_VOLUME, "disk7s2", None, false),
+                )),
+        );
+        let mut evidence = source(complete.clone());
+        evidence.command_outputs = VecDeque::from([
+            HostCommandOutput::success(scoped),
+            HostCommandOutput::success(departing),
+            HostCommandOutput::success(complete),
+        ]);
+        let gathered = gather_existing_apfs_evidence(
+            &mut evidence,
+            Path::new("/Users/alice"),
+            InventoryReadPolicy::RepairTransient,
+        )
+        .expect("read-only planning must reobserve a departing container");
+        assert!(matches!(
+            gathered.bootstrap,
+            BootstrapEvidence::Apfs {
+                store: ExistingStorage::FoundElsewhere { container, device, .. },
+                caches: ExistingStorage::Absent,
+            } if container == "disk7" && device == "disk7s2"
+        ));
     }
 
     #[test]

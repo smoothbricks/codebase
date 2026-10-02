@@ -165,6 +165,12 @@ The planner still overlaps actual teardown and asserts that the selected home de
 does not require machine-global `cowshed.store`/`cowshed.caches` installation on an ephemeral runner. Installation
 validation remains a separate contract and still refuses missing storage.
 
+Real teardown also produces a nonempty global plist containing a container dictionary with only `ContainerReference`.
+Read-only planning reobserves that departing-container snapshot within the existing four-read bound, just as it does an
+empty root; it never drops the record and assumes a reserved volume is absent. A regression proves that the complete
+observation still finds a reserved volume in another container. Mutation planning refuses the incomplete first scan;
+exhausted reads, invalid device names, and partially populated records other than that observed shape remain errors.
+
 APFS diagnostics distinguish host-device lease acquisition, blank-image creation and formatting, raw-device pinning,
 image/device identity inspection, attach, and fsck. Adoption also reports secret scanning, grant reservation, staged
 copy and credential publication, and supervisor startup. The checked-land fixture reports elapsed phase boundaries so a
