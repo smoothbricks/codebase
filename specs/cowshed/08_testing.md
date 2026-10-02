@@ -163,6 +163,10 @@ while ejecting a disposable ASIF image. It asserts that the selected home device
 not require machine-global `cowshed.store`/`cowshed.caches` installation on an ephemeral runner. Installation validation
 remains a separate contract and still refuses missing storage.
 
+APFS attach diagnostics distinguish raw-device pinning and image/device identity inspection from attach and fsck. The
+checked-land fixture reports elapsed phase boundaries so a 30-second failure identifies the stalled operation without
+exposing workspace paths or command payloads.
+
 The CLI dispatch tier opens a real `ActorBridge` on caller-owned APFS images and the same persisted workspace/project
 grant stores as a normal controller. It tests grant denial without a write, grant survival across runtime restart, a
 real gateway's reconciliation of revised grants and raced ports, and checked landing's gateway-absent refusal followed

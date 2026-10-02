@@ -464,23 +464,39 @@ async fn real_apfs_dispatch_reallocates_a_raced_port_and_reconciles_gateway_gran
 
 #[tokio::test]
 async fn real_apfs_checked_land_preserves_target_when_gateway_absent_then_fast_forwards() {
+    let started = std::time::Instant::now();
+    let phase = |name| {
+        eprintln!(
+            "checked-land fixture: {name} elapsed={:?}",
+            started.elapsed()
+        );
+    };
+    phase("fixture");
     let mut fixture = Fixture::new();
     fixture.install_checked_land_shell();
+    phase("open");
     let mut service = fixture.open().await;
+    phase("adopt");
     adopt(&fixture, &mut service).await;
+    phase("start gateway");
     fixture.start_gateway().await;
+    phase("reconcile gateway");
     service
         .reconcile_gateway()
         .await
         .expect("install main gateway session");
+    phase("new topic");
     let (created, _, _) = run(&mut service, ["new", "topic"]).await;
     assert_eq!(created.expect("create real APFS topic"), 0);
+    phase("commit topic");
     let topic = service.path("topic", false).await.expect("mounted topic");
     fs::write(topic.mount.join("feature.txt"), b"feature\n").expect("topic change");
     git(&topic.mount, &["add", "feature.txt"]);
     git(&topic.mount, &["commit", "-q", "-m", "feature"]);
 
+    phase("stop gateway");
     fixture.stop_gateway().await;
+    phase("refused land");
     let (refused, stdout, _) = run(
         &mut service,
         [
@@ -501,7 +517,9 @@ async fn real_apfs_checked_land_preserves_target_when_gateway_absent_then_fast_f
     assert!(stdout.is_empty(), "failed preflight has no machine answer");
     assert!(!fixture.checkout.join("feature.txt").exists());
 
+    phase("restart gateway");
     fixture.start_gateway().await;
+    phase("checked land");
     let (landed, _, stderr) = run(
         &mut service,
         [
@@ -524,8 +542,11 @@ async fn real_apfs_checked_land_preserves_target_when_gateway_absent_then_fast_f
         fs::read(fixture.checkout.join("feature.txt")).expect("fast-forwarded main worktree"),
         b"feature\n"
     );
+    phase("shutdown runtime");
     service.shutdown().await.expect("shutdown runtime");
+    phase("drain gateway");
     fixture.stop_gateway().await;
+    phase("done");
 }
 
 // The real host-origin Nix evaluation plus two APFS sandbox entries exceed nextest's 30s

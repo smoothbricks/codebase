@@ -896,17 +896,20 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
 
     fn pin_attached_volume(&self, attachment: &AttachedImage) -> Result<Option<File>, ApfsError> {
         let raw = PathBuf::from(raw_device_from(&attachment.volume_device));
-        let pin = self
-            .runner
-            .pin_raw_device(&raw)
-            .map_err(|source| ApfsError::FileOperation {
-                operation: "pin attached APFS volume against device reuse",
-                path: raw,
-                source,
-            })?;
+        let pin = timed_apfs_step(apfs_step_leg(&attachment.image), "pin", || {
+            self.runner
+                .pin_raw_device(&raw)
+                .map_err(|source| ApfsError::FileOperation {
+                    operation: "pin attached APFS volume against device reuse",
+                    path: raw,
+                    source,
+                })
+        })?;
         // A pre-check without this pin leaves a gap where an unrelated process can eject
         // the image and the kernel can hand diskN to a foreign mounted volume.
-        self.require_attached_mapping(attachment)?;
+        timed_apfs_step(apfs_step_leg(&attachment.image), "identity", || {
+            self.require_attached_mapping(attachment)
+        })?;
         Ok(pin)
     }
 
