@@ -266,12 +266,11 @@ descriptor across the `attach_verified` → `mount` method boundary. It is relea
 intentional detach, or before the exclusive `diskutil apfs resizeContainer` writer, which cannot run with a raw
 descriptor open. Independent device ejects during container resize after pin release are not covered. While held, the
 descriptor prevents even external `diskutil eject force` or `hdiutil detach -force` from releasing the image and
-recycling its device name. If the image lost the reported device
-before the descriptor could be pinned, cowshed performs at most one fresh attachment, and only when inventory shows no
-remaining attachment for that image. A conflicting or unreadable mapping fails closed, without running fsck on the
-reported device. No live-fsck option authorizes touching a foreign mounted container. Blank-image formatting keeps its
-image-to-whole-device check under the host lease; its exclusive formatter cannot share a raw-device descriptor with
-another opener.
+recycling its device name. If the image lost the reported device before the descriptor could be pinned, cowshed performs
+at most one fresh attachment, and only when inventory shows no remaining attachment for that image. A conflicting or
+unreadable mapping fails closed, without running fsck on the reported device. No live-fsck option authorizes touching a
+foreign mounted container. Blank-image formatting keeps its image-to-whole-device check under the host lease; its
+exclusive formatter cannot share a raw-device descriptor with another opener.
 
 For every mounted attachment:
 
@@ -351,13 +350,17 @@ Both volumes are created once by explicit foreground `cowshed setup`
 free-space pool — no sizing, no space cost for the split. The complete create/mount/pin transaction uses the one
 provisioning authorization session described in 14_nix.md.
 
-Read-only host-storage validation retries a `diskutil apfs list -plist` inventory read only when `diskutil` exits
-successfully with an empty plist root (`<dict/>`), as observed while an unrelated APFS image detaches. It re-reads the
-same scoped (or, if needed, global) query at most four times and still requires the exact kernel mount-source volume in
-the parsed home container. A malformed nonempty inventory or exhausted reads reports the original parse error with
-command/status, output length, and root shape, without printing volume contents. A later failed command retains its own
-typed failure and logs the preceding empty-root count. Setup and the pre-create global inventory stay strict: an
-incomplete inventory never authorizes a write.
+Read-only host-storage validation reobserves a successful `diskutil apfs list -plist` read when parsing encounters an
+empty plist root (`<dict/>`) or an APFS container dictionary containing only a valid `ContainerReference`. Both
+incomplete shapes were captured while an unrelated image detached. It repeats the same scoped (or, if needed, global)
+query at most four times, with 50 ms between incomplete reads, and still requires a complete parsed inventory containing
+the exact kernel mount-source volume in the home container. A departing record is never dropped to establish absence.
+Other parse errors, including a nonempty root without `Containers`, remain authoritative when encountered. Parsing stops
+at the first error, so an earlier departing record may cause a bounded re-read before a later malformed record is seen;
+no incomplete scan is accepted. Exhausted reads report the parse failure with command/status, output length, root shape,
+and incomplete-read count without printing volume contents. A later failed command retains its own typed failure and
+logs the preceding incomplete-read count. Mutation planning and the execution-time pre-create global inventory stay
+strict: the first incomplete observation is refused, and no incomplete inventory ever authorizes a write.
 
 **Boot mounting is owned by a root system LaunchDaemon, and both volumes are FileVault-encrypted.** At provision, the
 same authorization session:
