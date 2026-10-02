@@ -408,8 +408,13 @@ nothing when nothing changed:
   task graph before relocating paths to this checkout. The export is produced without caller credentials after devenv
   proves its merged enterShell hook is disabled for the evaluation; the original hook executes only when direnv imports
   it in the destination checkout. Missing or changed inputs, external symlinks, or writing enterShell tasks fall back to
-  in-place evaluation. A writable cache shared by siblings is never a source of shell code; successful reuse reports
-  that it happened without printing the origin checkout path or credentials.
+  in-place evaluation. A writable cache shared by siblings is never a source of shell code; successful reuse drains the
+  complete export (including shells larger than 64 KiB) and reports reuse without printing the origin checkout path or
+  credentials.
+  To verify the full physical path (host-origin Nix evaluation, scratch APFS adoption/COW clone,
+  dedicated Gateway/ActorBridge sandbox entry, and poisoned symlink fallback) on macOS, run
+  `cargo test -p cowshed-cli --test command_dispatch real_apfs_first_shell_reuses_private_origin_artifact_without_exposing_origin -- --ignored --nocapture`.
+  This explicit smoke exceeds nextest's normal 30-second per-test limit; ordinary tests keep that limit.
 - The repository's local git config includes `tooling/workspace.gitconfig` by a path relative to the config file
   (`../tooling/workspace.gitconfig` in `.git/config`), so a copied checkout reads its own copy. An absolute include
   would name the checkout that wrote it, and git refuses to run when an include exists but cannot be read — the original

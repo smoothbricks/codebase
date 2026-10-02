@@ -146,7 +146,13 @@ describe('private inherited devenv with real devenv', () => {
     () => {
       const scratch = realpathSync(mkdtempSync('/tmp/smoo-inh-'));
       try {
-        const origin = workspace(scratch, 'main', '{ ... }: { env.PROBE = "host-origin"; }\n');
+        // An actual pipe must drain the entire export, not just Bun's first 64 KiB at exit.
+        const padding = 'p'.repeat(70_000);
+        const origin = workspace(
+          scratch,
+          'main',
+          `{ ... }: { env.PROBE = "host-origin"; env.SHELL_PADDING = "${padding}"; }\n`,
+        );
         // Host HOME is an ancestor of the checkout; a relocation must never replace
         // the new checkout's path again while moving the old HOME.
         origin.env.HOME = scratch;
@@ -154,6 +160,7 @@ describe('private inherited devenv with real devenv', () => {
         origin.env.PRIVATE_CREDENTIAL = 'origin-only-secret-sentinel';
         const first = shell(origin);
         expect(first.imported.PROBE).toBe('host-origin');
+        expect(first.imported.SHELL_PADDING).toBe(padding);
         expect(existsSync(join(origin.root, 'tooling/direnv/.devenv/inherited-shell.json'))).toBe(true);
         expect(readFileSync(join(origin.root, 'tooling/direnv/.devenv/inherited-shell.json'), 'utf8')).not.toContain(
           origin.env.PRIVATE_CREDENTIAL,
@@ -162,6 +169,7 @@ describe('private inherited devenv with real devenv', () => {
         const second = shell(next);
         expect(second.stderr).toContain('reused this checkout');
         expect(second.imported.PROBE).toBe('host-origin');
+        expect(second.imported.SHELL_PADDING).toBe(padding);
         expect(second.imported.DEVENV_ROOT).toBe(join(next.root, 'tooling/direnv'));
         expect(second.script).not.toContain(origin.root);
         expect(second.script).not.toContain(origin.env.PRIVATE_CREDENTIAL);
