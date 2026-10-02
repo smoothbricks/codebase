@@ -128,10 +128,10 @@ every clone automatically). Main and sessions use identical wiring; only the san
 - **Format**: one — an ASIF image (`.asif`) holding one case-sensitive APFS volume. There is no second format, no
   fallback, and no format field in any metadata: `.asif` is the only image extension anything enumerates, and macOS 26,
   which introduced ASIF (`diskutil` documents it as the replacement for the legacy `.sparseimage`), is the floor.
-  Creation is four unprivileged steps, 441 ms at the median:
+  Creation is four unprivileged steps:
   `diskutil image create blank --format ASIF --size <capacity-bytes> --volumeName <label> --fs None <image>`,
   `diskutil image attach --nobrowse --noMount --plist <image>`,
-  `newfs_apfs -U <uid> -G <gid> -e -v <label> <whole-device>`, and `diskutil eject <whole-device>`. The attaching user
+  `newfs_apfs -U <uid> -G <gid> -e -v <label> <whole-device>`, and `hdiutil detach <whole-device>`. The attaching user
   owns the image's device nodes, so formatting needs no privilege, and `-U`/`-G` make the volume root the invoking
   user's from the start. `diskutil`'s own `--fs APFS` is not used: it cannot ask for case sensitivity, and it leaves a
   root-owned volume root that an `owners` mount cannot write and only root can hand over.
@@ -253,9 +253,14 @@ _"use 'diskutil image attach'"_), whose machine-readable output names the APFS v
 cowshed runs `fsck_apfs -q <device>`; any non-zero result detaches the image and fails without exposing a workspace
 mount. It then mounts with the kernel helper as the invoking user, `mount_apfs -o nobrowse,owners <device> <path>`
 (`--browse` omits `nobrowse`), not `diskutil mount`: Disk Arbitration serialises every mount on the host, and under a
-loaded fleet a mount `mount_apfs` completes in about a second queued there for 68 s at the median. Detach is
-`diskutil eject <whole-device>`. The read-only `hdiutil info -plist` inventory is the one host view that maps an
-attached image's path to its devices (`diskutil image info` reports none), so it stays the attachment inventory.
+loaded fleet a mount `mount_apfs` completes in about a second queued there for 68 s at the median. Owned-image detach is
+`hdiutil detach <whole-device>`, using the disk-image driver's release interface rather than general `diskutil eject`;
+the latter spent 11.086 s detaching a mounted staging image in a hosted arm64 release. A local real-ASIF comparison
+measured 127–173 ms for the image-driver detach against 257–298 ms for general eject; this does not establish a hosted
+latency bound. `WhenIdle` returns the observed EBUSY/resource-busy refusal without forcing. `Release` retains its
+existing grace and then uses `hdiutil detach -force`; every other error remains authoritative. There is no general-eject
+fallback. `hdiutil info -plist` remains the one host view that maps an image's path to its devices
+(`diskutil image info` reports none).
 
 Disk device names are reusable, not image identities. A private per-user `/private/tmp/cowshed-apfs-device-<uid>.lock`
 (`flock`, regular owner-only 0600 file, opened without following symlinks) coordinates physical create, attach, format,

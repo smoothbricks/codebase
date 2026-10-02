@@ -2200,7 +2200,7 @@ fn sidecar_removal_does_not_hide_non_file_errors() {
 
 /// A `WhenIdle` detach that a holder dissents leaves the workspace exactly as it found it: still
 /// mounted, and still the actor's to detach once the holder lets go. The holder is real — a file
-/// open on the volume — so the dissent is the one `diskutil eject` gives. Escalation is the
+/// open on the volume — so the refusal is the one `hdiutil detach` gives. Escalation is the
 /// backend's grace, proved against `DetachGrace` where the waiting can be observed without
 /// spending it.
 #[test]
@@ -2438,6 +2438,15 @@ fn real_apfs_verified_attachment_cannot_be_recycled_before_mount() {
         .arg(attachment.whole_device())
         .output()
         .expect("external forced eject");
+    let image_driver_ejected = Command::new("/usr/bin/hdiutil")
+        .args(["detach", "-force"])
+        .arg(attachment.whole_device())
+        .output()
+        .expect("external image-driver forced detach");
+    assert!(
+        !image_driver_ejected.status.success(),
+        "image driver released a pinned owner: {image_driver_ejected:?}"
+    );
     if ejected.status.success() {
         let attached_foreign = Command::new("/usr/sbin/diskutil")
             .args(["image", "attach", "--nobrowse", "--plist"])

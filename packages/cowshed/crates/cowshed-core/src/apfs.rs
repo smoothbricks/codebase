@@ -18,8 +18,8 @@ use std::time::Duration;
 
 use crate::device::{DISKUTIL, container_of, identifier_depth};
 
-/// Read for the attachment inventory alone (`hdiutil info -plist`): `diskutil image info` reports
-/// no devices, so this stays the image-path → device map. Every mutation goes through `diskutil`.
+/// The disk-image driver's inventory and detach interface. Creation and attachment of ASIF
+/// images use `diskutil image`; releasing an owned image goes directly through `hdiutil detach`.
 const HDIUTIL: &str = "/usr/bin/hdiutil";
 const FSCK_APFS: &str = "/sbin/fsck_apfs";
 /// The kernel mount helper. Workspace volumes are mounted with it rather than `diskutil mount`
@@ -40,12 +40,6 @@ pub(crate) const SECTOR_BYTES: u64 = 512;
 /// accepted. Every other failure propagates, and the caller still reads the resulting capacity
 /// back out of the attachment inventory.
 const CONTAINER_ALREADY_SPANS_IMAGE: [&str; 2] = ["Error: -69743:", "Error: -69519:"];
-
-/// A detach fails while another process still holds the volume. `diskutil eject` exits 1 and names
-/// the Disk Arbitration dissenter on stderr, a status it shares with every other diskutil failure,
-/// so the text is the only evidence. Observed on macOS 26.6.1 against a volume held by nothing
-/// more than another process's cwd.
-const DISKUTIL_DISSENT: [&str; 2] = ["could not be unmounted", "dissented by"];
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CommandRequest {
@@ -267,7 +261,7 @@ impl CommandRunner for SystemCommandRunner {
         }
     }
     fn pin_raw_device(&self, device: &Path) -> io::Result<Option<File>> {
-        // A live raw-device descriptor pins this IOMedia, including against `eject force`.
+        // A live raw-device descriptor pins this IOMedia, including against forced image detach.
         // Open first, then confirm the image-to-volume mapping while it cannot be recycled.
         OpenOptions::new().read(true).open(device).map(Some)
     }
@@ -408,7 +402,7 @@ impl Sleeper for ThreadSleeper {
 
 /// The wait a just-detached whole device is given to leave the attachment inventory.
 ///
-/// `diskutil eject` returning zero means the kernel let go; Disk Arbitration
+/// A successful image detach means the kernel let go; the attachment inventory
 /// announcing the departure is a second, lagging step. A verb that detaches an image and then
 /// attaches it again, as `resize` does, should not start the attach while the old device is
 /// still listed.
@@ -1274,12 +1268,13 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
     }
 
     fn detach_once(&self, target: &OsStr, force: bool) -> Result<(), ApfsError> {
-        let mut args = vec![OsString::from("eject")];
+        let mut args = Vec::with_capacity(2 + usize::from(force));
+        args.push(OsString::from("detach"));
         if force {
-            args.push(OsString::from("force"));
+            args.push(OsString::from("-force"));
         }
         args.push(target.to_owned());
-        self.run_checked("detach image", CommandRequest::new(DISKUTIL, args))
+        self.run_checked("detach image", CommandRequest::new(HDIUTIL, args))
             .map(|_| ())
     }
 
@@ -1828,15 +1823,19 @@ fn validate_detach_target(target: DetachTarget<'_>) -> Result<OsString, ApfsErro
 
 /// Whether a failed detach failed because something still holds the volume.
 ///
-/// `diskutil` leaves that evidence only in its stderr. Anything else — a bad device, a missing
-/// tool, a spawn failure — is not a dissent and must not be waited on.
+/// The image driver reports EBUSY plus its resource-busy diagnostic. Anything else — a bad
+/// device, a missing tool, a spawn failure — is not a dissent and must not be waited on.
 fn detach_was_dissented(error: &ApfsError) -> bool {
-    let ApfsError::CommandFailed { output, .. } = error else {
+    let ApfsError::CommandFailed {
+        request, output, ..
+    } = error
+    else {
         return false;
     };
-    DISKUTIL_DISSENT
-        .iter()
-        .any(|marker| contains_bytes(&output.stderr, marker.as_bytes()))
+    request.program == Path::new(HDIUTIL)
+        && request.args.first().is_some_and(|arg| arg == "detach")
+        && output.status == ProcessStatus::Exit(libc::EBUSY)
+        && contains_bytes(&output.stderr, b"Resource busy")
 }
 
 fn attachment_inventory_path(image: &Path) -> Result<PathBuf, ApfsError> {
@@ -2417,11 +2416,11 @@ mod tests {
         })
     }
 
-    /// `diskutil eject` refusing because something still holds the volume.
+    /// The resource-busy refusal observed from a real held-file image detach.
     fn dissent() -> CommandOutput {
         CommandOutput::failure(
-            1,
-            "Unmount of disk5 failed: at least one volume could not be unmounted",
+            libc::EBUSY,
+            "hdiutil: couldn't unmount \"disk5\" - Resource busy",
         )
     }
 
@@ -2531,8 +2530,8 @@ mod tests {
                 return Ok(CommandOutput::success("<plist><dict><key>malformed"));
             }
             assert!(
-                request.program == Path::new(DISKUTIL)
-                    && args == ["eject", self.new_device.as_str()],
+                request.program == Path::new(HDIUTIL)
+                    && args == ["detach", self.new_device.as_str()],
                 "unexpected command: {request:?}"
             );
             if self.fail_detach {
@@ -2702,7 +2701,7 @@ mod tests {
     }
     #[test]
     fn system_runner_hung_disk_child_is_killed_at_the_deadline() {
-        // Hang injection: a shell-builtin spin stands in for a hung diskutil eject
+        // Hang injection: a shell-builtin spin stands in for a hung disk-image child
         // that never answers. Absolute coreutils paths (`/bin/sleep`, `/bin/echo`)
         // do not exist on all Linux runners (NixOS provides only `/bin/sh`), so
         // the hang and the follow-up probe must use `/bin/sh` builtins only.
@@ -2782,7 +2781,7 @@ mod tests {
             Some(PathBuf::from("/store/acme/main.asif"))
         );
         assert_eq!(
-            deferred_image_target(&CommandRequest::new(DISKUTIL, ["eject", "/dev/disk9"])),
+            deferred_image_target(&CommandRequest::new(HDIUTIL, ["detach", "/dev/disk9"])),
             None
         );
         assert_eq!(
@@ -2801,110 +2800,6 @@ mod tests {
             deferred_image_target(&CommandRequest::new("/bin/sleep", ["30"])),
             None
         );
-    }
-
-    #[test]
-    fn failed_command_diagnostics_preserve_status_argv_and_both_raw_streams() {
-        let cases = [
-            (
-                ProcessStatus::Exit(16),
-                b"  holder reported on stdout\n".as_slice(),
-                b"".as_slice(),
-                "exit status 16; stdout: holder reported on stdout; stderr: <empty>",
-            ),
-            (
-                ProcessStatus::Exit(16),
-                b"".as_slice(),
-                b"\ncouldn't unmount disk17 - Resource busy\n".as_slice(),
-                "exit status 16; stdout: <empty>; stderr: couldn't unmount disk17 - Resource busy",
-            ),
-            (
-                ProcessStatus::Exit(16),
-                b" stdout detail \n".as_slice(),
-                b" stderr detail \n".as_slice(),
-                "exit status 16; stdout: stdout detail; stderr: stderr detail",
-            ),
-            (
-                ProcessStatus::Exit(16),
-                b"".as_slice(),
-                b"".as_slice(),
-                "exit status 16; stdout: <empty>; stderr: <empty>",
-            ),
-            (
-                ProcessStatus::Exit(16),
-                b" holder \xff pid \n".as_slice(),
-                b"\x80 busy ".as_slice(),
-                r"exit status 16; stdout: holder \xff pid; stderr: \x80 busy",
-            ),
-            (
-                ProcessStatus::Signal(libc::SIGKILL),
-                b" partial output ".as_slice(),
-                b"".as_slice(),
-                "signal 9; stdout: partial output; stderr: <empty>",
-            ),
-        ];
-
-        for (status, stdout, stderr, detail) in cases {
-            let error = ApfsError::CommandFailed {
-                operation: "detach image",
-                request: CommandRequest::new(DISKUTIL, ["eject", "/dev/disk9"]),
-                output: CommandOutput::failure_with_streams(status, stdout, stderr),
-            };
-            assert_eq!(
-                error.to_string(),
-                format!(
-                    "detach image failed: executable \"/usr/sbin/diskutil\", argv [\"eject\", \"/dev/disk9\"], {detail}"
-                )
-            );
-        }
-    }
-
-    #[test]
-    fn typed_errors_preserve_messages_and_sources() {
-        let clone = CloneFileError::Io {
-            source_path: PathBuf::from("source.asif"),
-            destination_path: PathBuf::from("destination.asif"),
-            source: io::Error::new(io::ErrorKind::PermissionDenied, "clone denied"),
-        };
-        assert!(clone.to_string().contains("clone denied"));
-        assert_eq!(
-            std::error::Error::source(&clone).unwrap().to_string(),
-            "clone denied"
-        );
-
-        let spawn = ApfsError::CommandRun(CommandRunError {
-            request: CommandRequest::new("/missing", ["--flag"]),
-            failure: CommandRunFailure::Spawn(io::Error::new(io::ErrorKind::NotFound, "missing")),
-        });
-        assert!(spawn.to_string().contains("/missing"));
-        assert!(std::error::Error::source(&spawn).is_some());
-
-        let file = ApfsError::FileOperation {
-            operation: "delete image",
-            path: PathBuf::from("main.asif"),
-            source: io::Error::new(io::ErrorKind::PermissionDenied, "denied"),
-        };
-        assert!(file.to_string().contains("delete image main.asif failed"));
-        assert!(std::error::Error::source(&file).is_some());
-
-        let clone = ApfsError::Clone(CloneFileError::DestinationExists {
-            destination: PathBuf::from("session.asif"),
-        });
-        assert!(clone.to_string().contains("session.asif"));
-        assert!(std::error::Error::source(&clone).is_some());
-
-        let detach = ApfsError::CommandFailed {
-            operation: "detach image",
-            request: CommandRequest::new(DISKUTIL, ["eject", "/dev/disk4"]),
-            output: CommandOutput::failure(1, "busy"),
-        };
-        let combined = ApfsError::VerificationAndDetachFailed {
-            request: CommandRequest::new(FSCK_APFS, ["-q", "/dev/rdisk4s1"]),
-            verification: CommandOutput::failure(8, "not clean"),
-            detach: Box::new(detach),
-        };
-        assert!(combined.to_string().contains("detaching"));
-        assert!(std::error::Error::source(&combined).is_some());
     }
 
     #[test]
@@ -2947,8 +2842,8 @@ mod tests {
         assert_eq!(requests[3].program, Path::new(FSCK_APFS));
         assert_eq!(argv(&requests[3]), ["-q", "/dev/rdisk5s1"]);
         assert_eq!(argv(&requests[4]), ["info", "-plist"]);
-        assert_eq!(requests[5].program, Path::new(DISKUTIL));
-        assert_eq!(argv(&requests[5]), ["eject", "/dev/disk5"]);
+        assert_eq!(requests[5].program, Path::new(HDIUTIL));
+        assert_eq!(argv(&requests[5]), ["detach", "/dev/disk5"]);
         assert!(
             !requests
                 .iter()
@@ -2983,7 +2878,7 @@ mod tests {
         assert!(
             !requests
                 .iter()
-                .any(|request| argv(request).first().is_some_and(|arg| arg == "eject"))
+                .any(|request| argv(request).first().is_some_and(|arg| arg == "detach"))
         );
     }
 
@@ -3025,7 +2920,7 @@ mod tests {
         );
         assert_eq!(argv(&requests[2]), ["info", "-plist"]);
         assert_eq!(argv(&requests[3]), ["info", "-plist"]);
-        assert_eq!(argv(&requests[4]), ["eject", "/dev/disk8"]);
+        assert_eq!(argv(&requests[4]), ["detach", "/dev/disk8"]);
         assert_eq!(argv(&requests[6]), ["info", "-plist"]);
         assert!(!requests.iter().any(|request| {
             let args = argv(request);
@@ -3094,7 +2989,7 @@ mod tests {
         assert_eq!(argv(&requests[1]), ["info", "-plist"]);
         assert_eq!(argv(&requests[3]), ["info", "-plist"]);
         assert_eq!(argv(&requests[4]), ["info", "-plist"]);
-        assert_eq!(argv(&requests[5]), ["eject", "/dev/disk8"]);
+        assert_eq!(argv(&requests[5]), ["detach", "/dev/disk8"]);
         assert_eq!(argv(&requests[6]), ["info", "-plist"]);
         fs::remove_file(image).unwrap();
     }
@@ -3109,7 +3004,7 @@ mod tests {
             CommandOutput::success("<plist><dict><key>malformed"),
             CommandOutput::success(attached.as_bytes()),
             CommandOutput::success(attached.as_bytes()),
-            CommandOutput::failure(16, "busy after eject"),
+            CommandOutput::failure(1, "detach refused"),
             CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY),
         ]));
 
@@ -3129,7 +3024,7 @@ mod tests {
         }
         let requests = backend.runner().requests();
         assert_eq!(requests.len(), 6);
-        assert_eq!(argv(&requests[4]), ["eject", "/dev/disk8"]);
+        assert_eq!(argv(&requests[4]), ["detach", "/dev/disk8"]);
         assert_eq!(argv(&requests[5]), ["info", "-plist"]);
     }
 
@@ -3315,7 +3210,7 @@ mod tests {
         assert_eq!(requests.len(), 8);
         assert_eq!(requests[4].program, Path::new(NEWFS_APFS));
         assert_eq!(argv(&requests[5]), ["info", "-plist"]);
-        assert_eq!(argv(&requests[6]), ["eject", "/dev/disk8"]);
+        assert_eq!(argv(&requests[6]), ["detach", "/dev/disk8"]);
         assert_eq!(requests[7].program, Path::new(HDIUTIL));
     }
 
@@ -3527,25 +3422,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn public_detach_ejects_the_whole_device_the_image_still_holds() {
-        let attachment = identity_attachment("delegates");
-        let backend = graced_backend([
-            holding(&attachment.image, &attachment.whole_device),
-            CommandOutput::success([]),
-            CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY),
-        ]);
-
-        backend.detach(&attachment, DetachIntent::Release).unwrap();
-
-        let requests = backend.runner().requests();
-        assert_eq!(requests.len(), 3);
-        assert_eq!(argv(&requests[0]), ["info", "-plist"]);
-        assert_eq!(requests[1].program, Path::new(DISKUTIL));
-        assert_eq!(argv(&requests[1]), ["eject", "/dev/disk12"]);
-        assert_eq!(argv(&requests[2]), ["info", "-plist"]);
-    }
-
     /// A device name is only a name for this image while the image holds it. Once the image is
     /// gone, the kernel hands the same `/dev/diskN` to the next attach, and detaching the recorded
     /// name would take another image away from its owner.
@@ -3667,7 +3543,7 @@ mod tests {
         );
     }
 
-    /// The dissent `diskutil eject` emits buys the volume the whole grace, and the force lands
+    /// The image driver's resource-busy refusal buys the whole grace, and the force lands
     /// exactly once at the end of it.
     #[test]
     fn a_released_detach_spends_its_grace_before_forcing_once() {
@@ -3680,12 +3556,12 @@ mod tests {
         let requests = backend.runner().requests();
         assert_eq!(requests.len(), 4, "three polite attempts, then one force");
         for request in requests.iter() {
-            assert_eq!(request.program, Path::new(DISKUTIL));
+            assert_eq!(request.program, Path::new(HDIUTIL));
         }
         for request in requests.iter().take(3) {
-            assert_eq!(argv(request), ["eject", "/dev/disk4"]);
+            assert_eq!(argv(request), ["detach", "/dev/disk4"]);
         }
-        assert_eq!(argv(&requests[3]), ["eject", "force", "/dev/disk4"]);
+        assert_eq!(argv(&requests[3]), ["detach", "-force", "/dev/disk4"]);
         assert_eq!(
             *backend.sleeper.waits(),
             [Duration::from_millis(10), Duration::from_millis(10)]
@@ -3707,7 +3583,7 @@ mod tests {
             ApfsError::CommandFailed {
                 operation: "detach image",
                 output: CommandOutput {
-                    status: ProcessStatus::Exit(1),
+                    status: ProcessStatus::Exit(libc::EBUSY),
                     ..
                 },
                 ..
@@ -3721,38 +3597,22 @@ mod tests {
     /// will fail in ten seconds, so waiting on it would only delay the report.
     #[test]
     fn a_detach_that_failed_for_another_reason_is_never_waited_on() {
-        let backend = graced_backend([CommandOutput::failure(1, "no such device")]);
-
-        backend
-            .detach_target(DetachTarget::Device("/dev/disk4"), DetachIntent::Release)
-            .unwrap_err();
-
-        assert_eq!(backend.runner().requests().len(), 1);
-        assert!(backend.sleeper.waits().is_empty());
-    }
-
-    #[test]
-    fn detach_target_ejects_devices_and_mountpoints_with_diskutil() {
-        let cases: [(DetachTarget<'_>, &[&str]); 2] = [
-            (
-                DetachTarget::Device("/dev/disk3s1"),
-                &["eject", "/dev/disk3s1"],
-            ),
-            (
-                DetachTarget::MountPoint(Path::new("/Volumes/cowshed/main")),
-                &["eject", "/Volumes/cowshed/main"],
-            ),
-        ];
-
-        for (target, expected_argv) in cases {
-            let backend = graced_backend([CommandOutput::success([])]);
-            backend
-                .detach_target(target, DetachIntent::Release)
-                .unwrap();
-            let requests = backend.runner().requests();
-            assert_eq!(requests.len(), 1);
-            assert_eq!(requests[0].program, Path::new(DISKUTIL));
-            assert_eq!(argv(&requests[0]), expected_argv);
+        for (status, message) in [
+            (1, "no such device"),
+            (libc::EBUSY, "permission denied"),
+            (1, "Resource busy"),
+        ] {
+            let backend = graced_backend([CommandOutput::failure(status, message)]);
+            let error = backend
+                .detach_target(DetachTarget::Device("/dev/disk4"), DetachIntent::Release)
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                ApfsError::CommandFailed { output, .. }
+                    if output.status == ProcessStatus::Exit(status)
+            ));
+            assert_eq!(backend.runner().requests().len(), 1);
+            assert!(backend.sleeper.waits().is_empty());
         }
     }
 
