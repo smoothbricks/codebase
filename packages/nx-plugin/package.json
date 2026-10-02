@@ -178,9 +178,45 @@
     "targets": {
       "lint": {},
       "test": {
+        "executor": "nx:noop",
+        "dependsOn": [
+          "test-shard1",
+          "test-shard2",
+          "test-shard3",
+          "test-shard4"
+        ]
+      },
+      "test-shard1": {
         "executor": "@smoothbricks/nx-plugin:bounded-exec",
         "options": {
-          "command": "bun test --timeout=30000",
+          "command": "bun test --timeout=30000 --shard=1/4",
+          "cwd": "{projectRoot}",
+          "timeoutMs": 120000,
+          "killAfterMs": 10000.0
+        }
+      },
+      "test-shard2": {
+        "executor": "@smoothbricks/nx-plugin:bounded-exec",
+        "options": {
+          "command": "bun test --timeout=30000 --shard=2/4",
+          "cwd": "{projectRoot}",
+          "timeoutMs": 120000,
+          "killAfterMs": 10000.0
+        }
+      },
+      "test-shard3": {
+        "executor": "@smoothbricks/nx-plugin:bounded-exec",
+        "options": {
+          "command": "bun test --timeout=30000 --shard=3/4",
+          "cwd": "{projectRoot}",
+          "timeoutMs": 120000,
+          "killAfterMs": 10000.0
+        }
+      },
+      "test-shard4": {
+        "executor": "@smoothbricks/nx-plugin:bounded-exec",
+        "options": {
+          "command": "bun test --timeout=30000 --shard=4/4",
           "cwd": "{projectRoot}",
           "timeoutMs": 120000,
           "killAfterMs": 10000.0

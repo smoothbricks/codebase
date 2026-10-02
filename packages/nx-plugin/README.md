@@ -38,6 +38,11 @@ Keep `targetDefaults.lint` limited to shared cache policy. Smoo's workspace poli
 commands, dependencies, inputs and outputs because they override source-aware inference for every project. Project-local
 `nx.targets.lint` declarations retain normal Nx override precedence.
 
+The plugin's own `nx run nx-plugin:test` aggregates four bounded Bun targets. Each uses Bun's `--shard=N/4` file
+partition, so every test file (including newly added files) runs in exactly one shard; a failed shard fails the
+aggregate. Keep each shard below the standard 120-second target deadline instead of hiding a slow full suite behind a
+larger timeout.
+
 ## Cargo Workspace Layouts
 
 The plugin discovers Cargo workspaces beside Nx project manifests at any depth:
