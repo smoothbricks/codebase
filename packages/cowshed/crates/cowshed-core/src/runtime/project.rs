@@ -15200,7 +15200,8 @@ mod port_reservation_tests {
         let first = reserve_port_grants(&inventory, &staging, stale.clone())
             .await
             .expect("first allocation");
-        let first_base = first.grants.port_block.expect("first block").base();
+        let first_block = first.grants.port_block.expect("first block");
+        let first_base = first_block.base();
         assert!(PortBlock::macos_candidates().any(|candidate| candidate.base() == first_base));
         let image = layout.main_image().expect("main image");
         std::fs::write(image.image(), b"detached image fixture").expect("image");
@@ -15244,8 +15245,9 @@ mod port_reservation_tests {
         let second = reserve_port_grants(&inventory, &staging, stale)
             .await
             .expect("allocation after publication");
-        let second_base = second.grants.port_block.expect("second block").base();
-        assert!(second_base > first_base);
+        let second_block = second.grants.port_block.expect("second block");
+        let second_base = second_block.base();
+        assert!(!second_block.overlaps(first_block));
         assert!(
             claim_port_block(&staging, second_base)
                 .expect("competing claim")
@@ -15271,7 +15273,8 @@ mod port_reservation_tests {
         let first = reserve_port_grants(&inventory, &staging, Default::default())
             .await
             .expect("initial allocation");
-        let first_base = first.grants.port_block.expect("first block").base();
+        let first_block = first.grants.port_block.expect("first block");
+        let first_base = first_block.base();
         let name = WorkspaceName::session("unfinished").expect("session");
         let image = layout.session_image(&name).expect("session image");
         std::fs::create_dir_all(image.image().parent().expect("session directory"))
@@ -15325,7 +15328,11 @@ mod port_reservation_tests {
             .await
             .expect("allocation after creator death");
         assert!(
-            second.grants.port_block.expect("second block").base() > first_base,
+            !second
+                .grants
+                .port_block
+                .expect("second block")
+                .overlaps(first_block),
             "the pending image still owns its first block"
         );
         drop(second);
@@ -15470,7 +15477,11 @@ mod port_reservation_tests {
             .await
             .expect("allocation after the first new block");
         assert!(
-            second.grants.port_block.expect("second block").base() > first_block.base(),
+            !second
+                .grants
+                .port_block
+                .expect("second block")
+                .overlaps(first_block),
             "publication of the first block excludes it from the next allocation"
         );
         drop(second);

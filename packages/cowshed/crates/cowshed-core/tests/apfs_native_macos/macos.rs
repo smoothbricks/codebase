@@ -4289,7 +4289,7 @@ fn independent_hosts_and_processes_serialize_and_crash_releases_the_lock() {
         let mut command = Command::new(std::env::current_exe().expect("test executable"));
         command
             .arg("--exact")
-            .arg("flock_child_helper")
+            .arg("macos::flock_child_helper")
             .env("COWSHED_FLOCK_HELPER_ROOT", &fixture.root)
             .env("COWSHED_FLOCK_HELPER_LOCK", &lock)
             .env("COWSHED_FLOCK_HELPER_READY", &ready)
