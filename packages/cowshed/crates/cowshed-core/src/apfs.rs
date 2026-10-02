@@ -977,7 +977,7 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
         let image = attachment_inventory_path(image)?;
         // Tahoe's `diskutil image info --plist` does not expose attachment devices. The
         // read-only hdiutil inventory is the observed authoritative image-path -> system-entities
-        // map; creation, attachment, and detachment are diskutil-only.
+        // map; ASIF creation/attachment use diskutil, and image release uses hdiutil.
         let output = self.run_checked(
             "inventory attached disk images",
             CommandRequest::new(HDIUTIL, ["info", "-plist"]),

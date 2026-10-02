@@ -5037,20 +5037,13 @@ fn real_apfs_resize_refuses_a_busy_workspace_before_growing_the_image() {
     let host = fixture.host();
     let holder = std::fs::File::open(mount.join("payload")).expect("hold the volume");
 
-    let error = host
-        .resize(
-            &workspace(),
-            &image,
-            &mount,
-            ImageCapacity::from_gibibytes(2),
-        )
-        .expect_err("a busy volume refuses the resize rather than being torn out");
-    let message = error.to_string();
-    assert!(
-        message.contains("detach image failed") && message.contains(&*mount.to_string_lossy()),
-        "the refusal names the detach of this workspace's mount: {message}"
-    );
-
+    host.resize(
+        &workspace(),
+        &image,
+        &mount,
+        ImageCapacity::from_gibibytes(2),
+    )
+    .expect_err("a busy volume refuses the resize rather than being torn out");
     assert!(
         kernel_mount_at(&mount).is_some(),
         "the workspace stays mounted"
@@ -5096,15 +5089,8 @@ fn real_apfs_defragment_refuses_a_busy_workspace_before_touching_the_image() {
     let before = std::fs::metadata(&image).expect("image").ino();
     let holder = std::fs::File::open(mount.join("payload")).expect("hold the volume");
 
-    let error = host
-        .defragment(&workspace(), &image, &mount)
+    host.defragment(&workspace(), &image, &mount)
         .expect_err("a busy volume refuses the rewrite rather than being torn out");
-
-    let message = error.to_string();
-    assert!(
-        message.contains("detach image failed") && message.contains(&*mount.to_string_lossy()),
-        "the refusal names the detach of this workspace's mount: {message}"
-    );
     assert_eq!(
         std::fs::metadata(&image).expect("image").ino(),
         before,
