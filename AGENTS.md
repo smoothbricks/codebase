@@ -1,5 +1,36 @@
 # AGENTS.md - AI Coding Assistant Guidelines for LMAO
 
+## Where this work lives (read first)
+
+This checkout is on Alex Ultra's MacBook ("ultra"), not on a server. Colleagues use it remotely via ChatGPT + Desktop Commander.
+
+- 2026-09-17: the MacBook disk hit 98% full. All conloca checkouts under ~/work were archived to an external disk and deleted by mistake, then restored the same day (archive: /Volumes/backups/archive/conloca/, see MANIFEST.md).
+- Restored: branches, stashes, worktrees, uncommitted and untracked file contents, agent logs.
+- NOT restored:
+  - gitignored files: node_modules, build output, caches (.nx, .native-cache), .env / .env.*, .dev.vars, .envrc-local, .mcp.json, *.pem, devenv.local.nix, .wrangler/.direnv/.serena state. Reinstall dependencies and recreate local env and secret files. Run `direnv allow` to re-apply the workspace git config.
+  - the staged vs unstaged split: all changes are now staged as one set.
+  - in-progress merges/rebases (final-families account-shell, content, media, ui-support): conflict-marker files are back, but git no longer knows a merge is in progress. Redo those merges.
+  - 6 index-only files in final-families: account-shell (HostShellWorkspaceBridge.tsx, shell-story-fixture.tsx, shell-workspace.ts, AccountContextBridge.tsx, GitIdentityContextBridge.tsx) and media (CmsWorkspaceBoundary.tsx).
+  - local git config (user.*, per-branch upstreams except same-name origin branches), .git/info/exclude, reflogs.
+  - statebus-pr84-nested: the two local commits were re-applied from patches, so their hashes changed (content identical).
+- Each worker worktree with its own full dependency install costs 3-4 GB here; the PR84/PR82 swarms used ~90 GB in three days.
+
+### Please move this work to the server
+Recommended by ultra@glide.vc: `ssh root@77.42.45.86` (key-based login from this MacBook).
+
+Server today: Ubuntu 24.04, 8 CPU, 15 GB RAM, no swap, ~60 GB free disk, shared by several people as root. Has git, node 22, npm, docker, claude, tmux. Missing: bun, pnpm, codex.
+
+You can keep using this MacBook, but only over SSH, with SSH always part of the chain. Do not run agent swarms directly on the MacBook through Desktop Commander.
+
+How to move a checkout:
+1. Push every branch you need, including local-only ones.
+2. On the server, work only inside `/root/work/conloca/` (or a separate non-root user): `git clone` there, recreate worktrees with `git worktree add`. Do not touch other folders in /root/work (they belong to the HyperIDE team).
+3. Install bun (and codex if you use it) before running scripts.
+4. Keep credentials in `.env` and exclude it locally: `echo .env >> .git/info/exclude` (in the main checkout; worktrees share it).
+5. At most 3-4 parallel workers on this server; one dependency install shared across worker worktrees where possible.
+6. After a branch is merged or abandoned: `git worktree remove <path>` and `git worktree prune`.
+7. Check `df -h` before starting a swarm; do not start workers below 30 GB free.
+
 `CLAUDE.md` is the short repo-memory sheet. This file is the detailed manual. Keep the core rules in both files aligned.
 
 ## Read First
