@@ -335,6 +335,14 @@ Both volumes are created once by explicit foreground `cowshed setup`
 free-space pool — no sizing, no space cost for the split. The complete create/mount/pin transaction uses the one
 provisioning authorization session described in 14_nix.md.
 
+Read-only host-storage validation retries a `diskutil apfs list -plist` inventory read only when `diskutil` exits
+successfully with an empty plist root (`<dict/>`), as observed while an unrelated APFS image detaches. It re-reads the
+same scoped (or, if needed, global) query at most four times and still requires the exact kernel mount-source volume in
+the parsed home container. A malformed nonempty inventory or exhausted reads reports the original parse error with
+command/status, output length, and root shape, without printing volume contents. A later failed command retains its own
+typed failure and logs the preceding empty-root count. Setup and the pre-create global inventory stay strict: an
+incomplete inventory never authorizes a write.
+
 **Boot mounting is owned by a root system LaunchDaemon, and both volumes are FileVault-encrypted.** At provision, the
 same authorization session:
 
