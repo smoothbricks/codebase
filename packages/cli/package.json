@@ -100,12 +100,58 @@
     "targets": {
       "lint": {},
       "test": {
+        "executor": "nx:noop",
+        "dependsOn": [
+          "test-shell-entry",
+          "test-shard-1",
+          "test-shard-2",
+          "test-shard-3",
+          "test-shard-4"
+        ]
+      },
+      "test-shell-entry": {
         "executor": "@smoothbricks/nx-plugin:bounded-exec",
         "options": {
-          "command": "bun test --timeout=30000",
+          "command": "bun test --timeout=30000 src/monorepo/setup-environment.test.ts",
           "cwd": "{projectRoot}",
           "timeoutMs": 120000,
-          "killAfterMs": 10000.0
+          "killAfterMs": 10000
+        }
+      },
+      "test-shard-1": {
+        "executor": "@smoothbricks/nx-plugin:bounded-exec",
+        "options": {
+          "command": "bun test --timeout=30000 --path-ignore-patterns='**/setup-environment.test.ts' --shard=1/4",
+          "cwd": "{projectRoot}",
+          "timeoutMs": 120000,
+          "killAfterMs": 10000
+        }
+      },
+      "test-shard-2": {
+        "executor": "@smoothbricks/nx-plugin:bounded-exec",
+        "options": {
+          "command": "bun test --timeout=30000 --path-ignore-patterns='**/setup-environment.test.ts' --shard=2/4",
+          "cwd": "{projectRoot}",
+          "timeoutMs": 120000,
+          "killAfterMs": 10000
+        }
+      },
+      "test-shard-3": {
+        "executor": "@smoothbricks/nx-plugin:bounded-exec",
+        "options": {
+          "command": "bun test --timeout=30000 --path-ignore-patterns='**/setup-environment.test.ts' --shard=3/4",
+          "cwd": "{projectRoot}",
+          "timeoutMs": 120000,
+          "killAfterMs": 10000
+        }
+      },
+      "test-shard-4": {
+        "executor": "@smoothbricks/nx-plugin:bounded-exec",
+        "options": {
+          "command": "bun test --timeout=30000 --path-ignore-patterns='**/setup-environment.test.ts' --shard=4/4",
+          "cwd": "{projectRoot}",
+          "timeoutMs": 120000,
+          "killAfterMs": 10000
         }
       }
     },

@@ -278,6 +278,10 @@ Concrete targets use `{tool}-{output}` names and describe the tool that runs and
   `*-html`, `*-css`, `*-ios`, `*-android`, `*-native`, `*-napi`, `*-bun`, and `*-wasm` instead of duplicating commands.
 - `lint` is an aggregate validation target. It is not a formatting target.
 
+This CLI's `cli:test` target runs the slow shell-entry integration file on its own and divides every other Bun test file
+across four native `--shard` targets. All five bounded targets must pass; the four shards ignore only the shell-entry
+file, so new tests discovered under `src/` remain in the suite without maintaining a file list or extending its timeout.
+
 The root `@typescript/native` dependency follows TypeScript's documented side-by-side pattern: it aliases TypeScript 7
 and supplies the native compiler used by `ttsc`. Because `ttsc` resolves only the unscoped package by default, the
 managed devenv shell sets `TTSC_TSGO_BINARY` to `node_modules/@typescript/native/bin/tsc`; the GitHub setup action
