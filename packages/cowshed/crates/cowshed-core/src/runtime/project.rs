@@ -5864,8 +5864,18 @@ async fn finish_store_residue<H: crate::storage::apfs::ApfsExecutionHost>(
     let substrate = crate::storage::apfs::ApfsSubstrate::new(config, host);
     let _span = crate::timing::span("open", "reclaim");
     for retirement in retired {
-        // Trash reclamation is best effort; the retirement is already a fact of the inventory.
-        let _ = substrate.reclaim(retirement).await;
+        // Trash reclamation is best effort: the retirement is already a fact of the inventory,
+        // and an image left in the trash is reclaimed by the next open or by `gc`. A failure is
+        // said, never dropped.
+        let workspace = retirement.workspace().name().clone();
+        let incarnation = retirement.workspace().incarnation().clone();
+        if let Err(error) = substrate.reclaim(retirement).await {
+            eprintln!(
+                "cowshed: retired workspace {workspace} (incarnation {incarnation}) stays in \
+                 sessions/.trash: reclaiming it failed ({error}); the next cowshed command or \
+                 cowshed gc retries, and cowshed doctor reports it as retired-trash"
+            );
+        }
     }
     Ok(substrate)
 }
