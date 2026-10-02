@@ -3510,18 +3510,37 @@ mod tests {
         let mut source = SystemEvidenceSource {
             host: &SystemBootstrapHost,
         };
-        for _ in 0..8 {
-            let attachment = backend.attach_verified(&image).expect("attach real image");
-            let detach = std::thread::spawn(move || {
-                MacOsApfsBackend::new(SystemCommandRunner)
-                    .detach(&attachment, DetachIntent::Release)
-                    .expect("detach the fixture's image");
-            });
-            let plan = plan_existing_host_storage(&mut source, &home);
-            detach.join().expect("detach worker");
-            let plan = plan.expect("home inventory must survive unrelated APFS teardown");
-            assert_eq!(plan.substrate(), &expected);
-        }
+        let attachment = backend.attach_verified(&image).expect("attach real image");
+        let start = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let worker_start = std::sync::Arc::clone(&start);
+        let detach = std::thread::spawn(move || {
+            let backend = MacOsApfsBackend::new(SystemCommandRunner);
+            worker_start.wait();
+            let started = std::time::Instant::now();
+            let result = backend.detach(&attachment, DetachIntent::Release);
+            let finished = std::time::Instant::now();
+            result.expect("detach the fixture's image");
+            (started, finished)
+        });
+        start.wait();
+        let planner_started = std::time::Instant::now();
+        let plan = plan_existing_host_storage(&mut source, &home);
+        let planner_finished = std::time::Instant::now();
+        let (detach_started, detach_finished) = detach.join().expect("detach worker");
+        let overlap = planner_finished
+            .min(detach_finished)
+            .saturating_duration_since(planner_started.max(detach_started));
+        assert!(
+            !overlap.is_zero(),
+            "the production planner and real image teardown must execute concurrently"
+        );
+        eprintln!(
+            "inventory teardown race: planner={:?} detach={:?} overlap={overlap:?}",
+            planner_finished.duration_since(planner_started),
+            detach_finished.duration_since(detach_started),
+        );
+        let plan = plan.expect("home inventory must survive unrelated APFS teardown");
+        assert_eq!(plan.substrate(), &expected);
     }
 
     fn mount_service_pins() -> Vec<FstabPin> {

@@ -168,10 +168,11 @@ parsed workspace for the deletion record rather than allocating a second name; m
 
 The native inventory teardown regression runs the production read-only host-storage planner against the real home device
 while detaching a disposable ASIF image. Attachment and teardown use the production APFS backend, including its
-host-device lease and image ownership checks, so independent Nextest runners cannot recycle another fixture's device.
-The planner still overlaps actual teardown and asserts that the selected home device and container remain unchanged; it
-does not require machine-global `cowshed.store`/`cowshed.caches` installation on an ephemeral runner. Installation
-validation remains a separate contract and still refuses missing storage.
+host-device lease and image ownership checks, so independent Nextest runners cannot recycle another fixture's device. A
+barrier starts one real teardown beside the planner; measured operation intervals must overlap, and the selected home
+device and container must remain unchanged. The regression does not require machine-global
+`cowshed.store`/`cowshed.caches` installation on an ephemeral runner. Installation validation remains a separate
+contract and still refuses missing storage.
 
 Real teardown also produces a nonempty global plist containing a container dictionary with only `ContainerReference`.
 Read-only planning reobserves that departing-container snapshot within the existing four-read bound, just as it does an
