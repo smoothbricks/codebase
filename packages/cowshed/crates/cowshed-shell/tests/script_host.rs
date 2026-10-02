@@ -224,6 +224,39 @@ fn alive(pid: i32) -> bool {
     unsafe { libc::kill(pid, 0) == 0 }
 }
 
+fn stop_fixture_jobs(host_pid: u32, leader: Option<i32>, descendant: Option<i32>) {
+    let host_pid = i32::try_from(host_pid).expect("host PID");
+    let host_group = unsafe { libc::getpgid(host_pid) };
+    let our_group = unsafe { libc::getpgrp() };
+    if let Some(pid) = leader.filter(|pid| {
+        *pid > 0 && *pid != host_pid && *pid != host_group && *pid != our_group
+    }) {
+        // SAFETY: never signal our group or the host's group.
+        unsafe { libc::kill(-pid, libc::SIGKILL) };
+    }
+    if let Some(pid) = descendant
+        .filter(|pid| *pid > 0 && *pid != host_pid && *pid != std::process::id() as i32)
+    {
+        // A background child may have escaped its leader's group.
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+    }
+}
+
+struct ScriptJobGuard {
+    host_pid: u32,
+    leader: i32,
+    descendant: i32,
+    armed: bool,
+}
+
+impl Drop for ScriptJobGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            stop_fixture_jobs(self.host_pid, Some(self.leader), Some(self.descendant));
+        }
+    }
+}
+
 #[test]
 fn a_script_has_its_own_streams_and_exact_status() {
     let mut host = Host::start("streams");
@@ -262,42 +295,88 @@ fn a_script_that_does_not_parse_never_runs() {
 #[test]
 fn killing_a_script_job_group_reaches_its_grandchildren_and_spares_the_host() {
     let mut host = Host::start("group");
-    let pids = host.directory.join("pids");
+    let leader = host.directory.join("leader");
+    let descendant = host.directory.join("descendant");
     let rendered = text(&format!(
-        "sleep 300 & printf '%s %s\\n' $$ $! > {}; wait",
-        pids.display()
+        "sh -c 'printf \"%s\\n\" \"$$\" > {}; exec sleep 300' & printf '%s\\n' \"$$\" > {}; wait",
+        descendant.display(),
+        leader.display()
     ));
     let (sender, receiver) = std::sync::mpsc::channel();
     let control = host.control.try_clone().expect("control clone");
     let directory = host.directory.clone();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
     let runner = std::thread::spawn(move || {
         let ran = run_on(&control, &directory, &rendered);
         sender.send((ran.pid, ran.status)).unwrap();
     });
-    let recorded = loop {
-        if let Ok(text) = std::fs::read_to_string(&pids)
-            && text.ends_with('\n')
-        {
-            break text;
+    // Wait until the descendant itself has written its PID. `$!` in the parent
+    // may still be unset when its background command first starts.
+    let pids = loop {
+        if let (Ok(parent), Ok(child)) = (
+            std::fs::read_to_string(&leader),
+            std::fs::read_to_string(&descendant),
+        ) {
+            if let (Ok(parent), Ok(child)) =
+                (parent.trim().parse::<i32>(), child.trim().parse::<i32>())
+            {
+                break [parent, child];
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            let parent = std::fs::read_to_string(&leader);
+            let child = std::fs::read_to_string(&descendant);
+            let parent_pid = parent
+                .as_ref()
+                .ok()
+                .and_then(|value| value.trim().parse::<i32>().ok());
+            let child_pid = child
+                .as_ref()
+                .ok()
+                .and_then(|value| value.trim().parse::<i32>().ok());
+            stop_fixture_jobs(host.child.id(), parent_pid, child_pid);
+            let host_status = host.child.try_wait().expect("host status");
+            panic!(
+                "the background job did not publish both PIDs: leader={parent:?}, descendant={child:?}, host={host_status:?}"
+            );
         }
         std::thread::sleep(Duration::from_millis(20));
     };
-    let pids: Vec<i32> = recorded
-        .split_whitespace()
-        .map(|pid| pid.parse().unwrap())
-        .collect();
+    let mut job = ScriptJobGuard {
+        host_pid: host.child.id(),
+        leader: pids[0],
+        descendant: pids[1],
+        armed: true,
+    };
+    // The background child holds the script's output pipes. If brush moves it to a
+    // different process group, killing the script leaves both those pipes open.
+    let script_group = unsafe { libc::getpgid(pids[0]) };
+    let grandchild_group = unsafe { libc::getpgid(pids[1]) };
+    assert_eq!(script_group, pids[0], "the script must lead its own group");
+    assert_eq!(
+        grandchild_group, script_group,
+        "a background child must remain in the script's group"
+    );
     // The job's group is the script process's own pid.
     // SAFETY: a group signal to the job's group.
     assert_eq!(unsafe { libc::kill(-pids[0], libc::SIGTERM) }, 0);
-    let (_, status) = receiver
-        .recv_timeout(Duration::from_secs(10))
-        .expect("the job ends");
+    let outcome =
+        receiver.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()));
+    let (_, status) = outcome.unwrap_or_else(|error| {
+        let script_group = unsafe { libc::getpgid(pids[0]) };
+        let grandchild_group = unsafe { libc::getpgid(pids[1]) };
+        let host = host.child.try_wait().expect("host status");
+        panic!(
+            "the job did not end: {error}; script group={script_group}, grandchild group={grandchild_group}, host={host:?}"
+        );
+    });
     runner.join().unwrap();
     assert_eq!(signaled(status), Some(libc::SIGTERM));
     std::thread::sleep(Duration::from_millis(100));
     for pid in pids {
         assert!(!alive(pid), "process {pid} of the killed script survived");
     }
+    job.armed = false;
     assert!(
         host.child.try_wait().unwrap().is_none(),
         "the host is not in the job's group"
