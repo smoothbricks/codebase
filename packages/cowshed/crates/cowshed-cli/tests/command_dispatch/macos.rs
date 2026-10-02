@@ -394,13 +394,13 @@ async fn real_apfs_checked_land_preserves_target_when_gateway_absent_then_fast_f
         ],
     )
     .await;
-    assert_eq!(
-        landed.expect(&format!(
-            "checked land through real service: {}",
+    let code = landed.unwrap_or_else(|error| {
+        panic!(
+            "checked land through real service failed: {error}; stderr: {}",
             String::from_utf8_lossy(&stderr)
-        )),
-        0
-    );
+        )
+    });
+    assert_eq!(code, 0);
     assert_eq!(
         fs::read(fixture.checkout.join("feature.txt")).expect("fast-forwarded main worktree"),
         b"feature\n"
