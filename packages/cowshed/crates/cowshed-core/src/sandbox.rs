@@ -1650,7 +1650,6 @@ mod tests {
             "gradle/caches",
             "nix/cache",
             "nix/state",
-            "devenv",
         ] {
             assert!(
                 profile.contains(&format!(
@@ -1661,6 +1660,9 @@ mod tests {
         }
         assert!(!profile.contains(
             "(allow file-read* file-write* (subpath \"/private/cowshed/caches/sccache\"))"
+        ));
+        assert!(!profile.contains(
+            "(allow file-read* file-write* (subpath \"/private/cowshed/caches/devenv\"))"
         ));
     }
 
