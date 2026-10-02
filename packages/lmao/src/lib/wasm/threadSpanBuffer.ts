@@ -32,6 +32,14 @@ export type ThreadSpanBufferHandle = number;
 export const THREAD_SPAN_BUFFER_OK = 0;
 
 /**
+ * The row a span that holds none writes to: no store issues it, and a view
+ * stores nothing there. A view's rows are this until its store opens the span,
+ * stay this if the store refuses it, and become this once the store released
+ * the rows ({@link ThreadSpanBufferBinding.spanStartRow}).
+ */
+export const NO_ROW = -1;
+
+/**
  * `u64` words one attribute field occupies in a block of `capacity` rows: the
  * value cells plus the validity bitmap (`lmao-core` `attribute_cells::stride`).
  */
@@ -102,9 +110,24 @@ export interface ThreadSpanBufferBinding {
   free(): void;
   /**
    * Release every row and span, keeping every block's memory and — until the
-   * store reclaims its text — the interned vocabulary.
+   * store reclaims its text — the interned vocabulary. Moves
+   * {@link rowGeneration}.
    */
   reset(): number;
+  /**
+   * Moves each time the store may have moved or released rows a view holds: a
+   * {@link reset}, and a host flush that keeps the open spans by moving their
+   * rows to the front (`lmao-core` `ThreadStore::retain_open`). Within one
+   * generation a receipt's row stays that span's row; a view that holds rows
+   * from an earlier generation reads them again ({@link spanStartRow}).
+   */
+  readonly rowGeneration: number;
+  /**
+   * The start row the store holds for `spanId` now — its reserved completion
+   * row is the next — or {@link NO_ROW} when the store holds that span no
+   * longer: a flush released it once it ended, or a reset did.
+   */
+  spanStartRow(spanId: number): number;
   /**
    * Intern `text`; the ordinal is stable within the store's text epoch, and
    * `0` means refused. A warm string costs one lookup and crosses nothing.
@@ -285,15 +308,23 @@ export function bindThreadSpanBuffer(
     },
     () => value.thread_span_buffer_text_epoch(handle),
   );
+  // allocator.wasm moves rows only by `reset`, which releases every span: a
+  // span a view asks about after the generation moved is no longer held.
+  let rowGeneration = 0;
   return {
     handle,
     capacity,
     free: () => value.thread_span_buffer_free(handle),
     reset: () => {
       const status = value.thread_span_buffer_reset(handle);
+      rowGeneration += 1;
       interned.revalidate();
       return status;
     },
+    get rowGeneration() {
+      return rowGeneration;
+    },
+    spanStartRow: () => NO_ROW,
     intern: interned.intern,
     openSpan: (traceId, parentThreadId, parentSpanId, nameOrdinal, timestamp, line) => {
       const trace = scratch.writeUtf8(traceId);

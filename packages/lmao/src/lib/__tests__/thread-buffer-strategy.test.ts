@@ -46,6 +46,10 @@ function refusingBackend(runtime: ThreadSpanBufferRuntime, refused: ReadonlySet<
         capacity: store.capacity,
         free: () => store.free(),
         reset: () => store.reset(),
+        get rowGeneration() {
+          return store.rowGeneration;
+        },
+        spanStartRow: (spanId) => store.spanStartRow(spanId),
         intern(text) {
           const ordinal = store.intern(text);
           names.set(ordinal, text);
@@ -278,6 +282,44 @@ describe('ThreadBufferStrategy', () => {
     const root = tracer.rootBuffers[tracer.rootBuffers.length - 1];
     if (!isThreadSpanView(root)) throw new Error('expected a thread-lane span');
     expect(reclaiming.provider.readMessage(root.binding, root.startRow)).toBe('kept-name');
+  });
+
+  it("never lands a span's write after its store released its rows on another span's row", async () => {
+    const moving: ThreadBufferStrategy<typeof schema, ThreadSpanBufferRuntime> = await createThreadBufferStrategy({
+      capacity: 8,
+    });
+    const tracer = new TestTracer(opContext, { bufferStrategy: moving, createTraceRoot });
+    let resume: () => void = () => undefined;
+    const held = tracer.trace('held', async (ctx) => {
+      ctx.tag.count(1);
+      await new Promise<void>((resolve) => {
+        resume = resolve;
+      });
+      // The store released this span's rows while it waited; the rows it read
+      // at open are another span's now.
+      ctx.tag.count(2);
+      ctx.log.info('after the release').count(3);
+      return ctx.ok('held');
+    });
+    moving.reset();
+    // Opens on the rows the reset released, the held span's included.
+    tracer.trace_fn(0, 'later', {}, (ctx) => {
+      ctx.log.info('untagged');
+      return ctx.ok(2);
+    });
+    const later = tracer.rootBuffers[tracer.rootBuffers.length - 1];
+    if (!isThreadSpanView(later)) throw new Error('expected a thread-lane span');
+    const count = later.ordinals.get('count');
+    if (count === undefined) throw new Error('missing schema field count');
+    const rows = moving.provider.rowCount(later.binding);
+
+    resume();
+    // The released span writes nothing further, and fails nothing it traces.
+    expect((await held).value).toBe('held');
+    expect(moving.provider.rowCount(later.binding)).toBe(rows);
+    for (let row = 0; row < rows; row += 1) {
+      expect(moving.provider.readAttr(later.binding, row, count)).toBeUndefined();
+    }
   });
 });
 

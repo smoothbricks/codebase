@@ -19,6 +19,7 @@ import { encodeSchemaBlob, schemaAttributeOrdinals } from '../lib/wasm/schemaBlo
 import {
   attributeCellStride,
   internCache,
+  NO_ROW,
   type ThreadAttributeKind,
   type ThreadSpanBufferBinding,
   type ThreadSpanBufferHandle,
@@ -145,6 +146,9 @@ function bindNative(handle: Pointer, capacity: number, fieldCount: number): Nati
     (text) => withUtf8(text, (address, length) => symbols.thread_span_buffer_intern(handle, address, length)),
     () => symbols.thread_span_buffer_text_epoch(handle),
   );
+  // The native store moves rows only by `reset`, which releases every span: a
+  // span a view asks about after the generation moved is no longer held.
+  let rowGeneration = 0;
   return {
     handle,
     capacity,
@@ -152,9 +156,14 @@ function bindNative(handle: Pointer, capacity: number, fieldCount: number): Nati
     free: () => symbols.thread_span_buffer_free(handle),
     reset: () => {
       const status = symbols.thread_span_buffer_reset(handle);
+      rowGeneration += 1;
       interned.revalidate();
       return status;
     },
+    get rowGeneration() {
+      return rowGeneration;
+    },
+    spanStartRow: () => NO_ROW,
     intern: interned.intern,
     openSpan: (traceId, parentThreadId, parentSpanId, nameOrdinal, timestamp, line) =>
       withUtf8(traceId, (address, length) =>

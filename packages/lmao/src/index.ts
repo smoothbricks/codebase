@@ -136,6 +136,7 @@ export {
   attributeCellStride,
   type InternCache,
   internCache,
+  NO_ROW,
   THREAD_SPAN_BUFFER_OK,
   type ThreadAttributeKind,
   type ThreadSpanBufferBinding,

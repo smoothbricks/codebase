@@ -24,6 +24,7 @@ import { getVocabularyGeneration } from '../vocabularyRegistry.js';
 import { attributeKindForSchemaType, schemaAttributeOrdinals, THREAD_SYSTEM_COLUMN_COUNT } from './schemaBlob.js';
 import {
   attributeCellStride,
+  NO_ROW,
   THREAD_SPAN_BUFFER_OK,
   type ThreadAttributeKind,
   type ThreadSpanBufferBinding,
@@ -81,13 +82,6 @@ const NULL_SINK = new Uint8Array(NULL_LANE_BYTES);
  */
 const LOG_STAMP_REFRESH = 16;
 
-/**
- * The row a span that holds none writes to: no store issues it, and
- * {@link ThreadSpanView.storeCell} lands nothing there. A view's rows are this
- * until its store opens the span, and stay this if the store refuses it.
- */
-const NO_ROW = -1;
-
 /** The store has not been asked yet: a span opens on its first write. */
 const SPAN_UNOPENED = 0;
 /** The store opened the span; its rows and its span id are the store's. */
@@ -98,9 +92,16 @@ const SPAN_OPEN = 1;
  * cell, and no lifecycle call that would name a span the store has no record of.
  */
 const SPAN_REFUSED = 2;
+/**
+ * The store released the span's rows — a flush after it ended, or a reset —
+ * so it holds no record of it any more and the span writes nothing further,
+ * exactly as a refused one: its rows were emitted, and the rows it read before
+ * are another span's now.
+ */
+const SPAN_RELEASED = 3;
 
 /** Where a view's span stands with its row store. */
-export type ThreadSpanState = typeof SPAN_UNOPENED | typeof SPAN_OPEN | typeof SPAN_REFUSED;
+export type ThreadSpanState = typeof SPAN_UNOPENED | typeof SPAN_OPEN | typeof SPAN_REFUSED | typeof SPAN_RELEASED;
 
 const bits = new DataView(new ArrayBuffer(8));
 
@@ -288,6 +289,13 @@ export class ThreadSpanView {
   pendingEntryType: number | undefined;
   state: ThreadSpanState = SPAN_UNOPENED;
   readonly fakeToReal = new Map<number, number>();
+  /**
+   * The store's {@link ThreadSpanBufferBinding.rowGeneration} the rows above
+   * were read at. A flush moves an open span's rows and a reset releases them,
+   * so rows read at an earlier generation are re-read before any write
+   * ({@link currentRows}).
+   */
+  rowGeneration = 0;
 
   /**
    * Row-stamp cache: the value log rows ride and the reads left before a
@@ -535,11 +543,36 @@ export class ThreadSpanView {
 
   /**
    * Open the span if nothing has yet, and answer whether it holds rows to
-   * write: false once its store refused it.
+   * write: false once its store refused it or released its rows. An open
+   * span's rows are the store's current ones when this answers true.
    */
   writable(): boolean {
     if (this.state === SPAN_UNOPENED) this.openSpan(this._spanName ?? 'span');
+    else this.currentRows();
     return this.state === SPAN_OPEN;
+  }
+
+  /**
+   * Re-read this span's rows when the store moved them since they were read.
+   * A host flush keeps an open span by moving its start and completion rows to
+   * the front of the store, and a reset releases every row, so a row read
+   * before either names another span's row after it. The lifecycle pair is read
+   * again from the store; every log row the span had was emitted and released
+   * by that flush, so what still names one writes nothing; and a span whose
+   * rows the store released writes nothing further.
+   */
+  currentRows(): void {
+    if (this.state !== SPAN_OPEN) return;
+    const generation = this.binding.rowGeneration;
+    if (generation === this.rowGeneration) return;
+    this.rowGeneration = generation;
+    const start = this.binding.spanStartRow(this.spanId);
+    // Before any log row, the last row is the start row, and moves with it.
+    this.lastRow = this.lastRow === this.startRow ? start : NO_ROW;
+    this.startRow = start;
+    this.completionRow = start === NO_ROW ? NO_ROW : start + 1;
+    for (const index of this.fakeToReal.keys()) this.fakeToReal.set(index, NO_ROW);
+    if (start === NO_ROW) this.state = SPAN_RELEASED;
   }
 
   openSpan(name: string | number): void {
@@ -551,7 +584,8 @@ export class ThreadSpanView {
     // 0 it would open as a root, which a host store parents on whatever it
     // roots unattributed spans on — so it is not offered at all.
     const parent = this._parent;
-    if (parent !== undefined && requireThreadSpanView(parent).state === SPAN_REFUSED) {
+    const parentState = parent === undefined ? undefined : requireThreadSpanView(parent).state;
+    if (parentState === SPAN_REFUSED || parentState === SPAN_RELEASED) {
       this.state = SPAN_REFUSED;
       return;
     }
@@ -580,6 +614,7 @@ export class ThreadSpanView {
     this.startRow = Number(packed & 0xffffffffn);
     this.completionRow = this.startRow + 1;
     this.lastRow = this.startRow;
+    this.rowGeneration = this.binding.rowGeneration;
     this.timestamp[0] = timestamp;
     this.entry_type[0] = 1;
     this.line_values[0] = this.pendingLine;
@@ -646,6 +681,7 @@ export class ThreadSpanView {
   syncScope(attributes: object): void {
     const next: Record<string, unknown> = { ...this._scopeValues };
     // Only a span the store opened has a scope there to set.
+    this.currentRows();
     const scoped = this.state === SPAN_OPEN;
     for (const key of Object.keys(attributes)) {
       const value = Reflect.get(attributes, key);
@@ -681,27 +717,35 @@ export class ThreadSpanView {
     return this;
   }
 
+  // These name a lifecycle row or the last log row directly, so each reads the
+  // store's current rows first ({@link currentRows}).
   error_code(_pos: number, val: string): this {
+    this.currentRows();
     return this.writeNamed('error_code', this.completionRow, val);
   }
 
   retry_attempt(_pos: number, val: number): this {
+    this.currentRows();
     return this.writeNamed('retry_attempt', this.lastRow, val);
   }
 
   retry_delay_ms(_pos: number, val: number): this {
+    this.currentRows();
     return this.writeNamed('retry_delay_ms', this.lastRow, val);
   }
 
   exception_stack(_pos: number, val: string): this {
+    this.currentRows();
     return this.writeNamed('exception_stack', this.completionRow, val);
   }
 
   ff_value(_pos: number, val: string): this {
+    this.currentRows();
     return this.writeNamed('ff_value', this.lastRow, val);
   }
 
   uint64_value(_pos: number, val: bigint): this {
+    this.currentRows();
     return this.writeNamed('uint64_value', this.lastRow, val);
   }
 
@@ -755,15 +799,17 @@ export class ThreadSpanView {
   }
 
   physicalRow(index: number): number {
+    this.currentRows();
     // Fakes 0/1 are the lifecycle pair; they are structural, never entries in
     // the log-row map, which tests and stamp accounting read as logs-only.
     if (index === 0) return this.startRow;
     if (index === 1) return this.completionRow;
     const row = this.fakeToReal.get(index);
     if (row !== undefined) return row;
-    // A refused span appended no rows, so it mapped none: what its writers
-    // store for one lands on NO_ROW, which stores nothing.
-    if (this.state === SPAN_REFUSED) return NO_ROW;
+    // A refused span appended no rows, so it mapped none, and a released one
+    // appends none: what their writers store for one lands on NO_ROW, which
+    // stores nothing.
+    if (this.state === SPAN_REFUSED || this.state === SPAN_RELEASED) return NO_ROW;
     // invariant throw: generated writers store a row's message before its
     // attributes, so an unmapped index is a writer bug — and guessing a row
     // would write another span's cell.
