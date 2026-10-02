@@ -15144,8 +15144,8 @@ mod port_reservation_tests {
     use super::{claim_port_block, reserve_port_grants};
     use crate::gateway_inventory::NativeGatewayInventory;
     use crate::metadata::{
-        DetachedWorkspaceMetadata, GrantSet, MACOS_PORT_MIN, NEW_PORT_BLOCK_SIZE, Platform,
-        PortBlock, PublicationState, SIDECAR_VERSION, WorkspaceIncarnation, WorkspaceName,
+        DetachedWorkspaceMetadata, GrantSet, MACOS_PORT_MIN, Platform, PortBlock, PublicationState,
+        SIDECAR_VERSION, WorkspaceIncarnation, WorkspaceName,
     };
     use crate::repository::{BoundIdentity, RepoId, RepositoryBinding};
     use crate::storage::StorageLayout;

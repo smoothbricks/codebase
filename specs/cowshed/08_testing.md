@@ -164,6 +164,12 @@ real gateway's reconciliation of revised grants and raced ports, and checked lan
 by a successful fast-forward. There is no test-only `CliService` answering commands. The gateway and scratch-image
 teardown guards run on assertion failure as well as success; no test installs or changes the machine-global daemon.
 
+**Existing fixture debt — owner: cowshed-core native tests.** The older `FakeInventory` and `RecordingRunner` cases in
+`apfs_native_macos/macos.rs` synthesize `hdiutil` responses to test command-runner handling. They are not real
+host/substrate evidence and do not count toward the `real_apfs_*` acceptance set. The real APFS cases added beside them
+use `ScratchRoot`, `SystemCommandRunner`, and the kernel's attachment table; the command-runner fixtures remain a
+separate, explicitly owned migration boundary rather than being presented as real dispatch tests.
+
 Covered flows:
 
 - adopt → new → exec → push → rm (the golden path), including marker/token rewrite on new;

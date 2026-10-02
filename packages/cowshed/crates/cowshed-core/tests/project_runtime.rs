@@ -337,7 +337,8 @@ impl FakeHost {
                         self.descriptor.git_root.clone()
                     } else {
                         self.descriptor
-                            .store_root
+                            .storage
+                            .store()
                             .join("mnt")
                             .join(workspace.name.as_str())
                     }
