@@ -40,11 +40,11 @@ no reflink, so the cache's volume never enters an install's cost.
 
 ## The three layers
 
-| Layer                                   | Contents                                                                                                                                                                                | Location                                                                                                                   | Sharing                                   |
-| --------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------- |
-| 1. Gateway mirrors                      | npm tarballs, crate files, registry metadata, bare repository mirrors                                                                                                                   | `/private/cowshed/caches/mirror` and `/private/cowshed/caches/repo-mirrors` (gateway-owned, sandbox-read-only)             | Global, written only by cowshed-gateway   |
-| 2. Clone-materializing caches           | caches a tool reflinks out of into the workspace — **none today**: bun's isolated linker links into its cache instead                                                                   | Inside each workspace image                                                                                                | Inherited from main via CoW at clone time |
-| 3. Read-at-build and link-target caches | Cargo registry/git extraction caches, bun global install cache, uv cache, Go module + build caches, ttsc plugins, sccache, zig global cache, gradle, Nix eval/fetcher and profile state | Dedicated writable roots under `/private/cowshed/caches/` reached through the host's literal default path or direct config | Shared writable by all workspaces         |
+| Layer                                   | Contents                                                                                                                                                                                                              | Location                                                                                                                   | Sharing                                   |
+| --------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------- |
+| 1. Gateway mirrors                      | npm tarballs, crate files, registry metadata, bare repository mirrors                                                                                                                                                 | `/private/cowshed/caches/mirror` and `/private/cowshed/caches/repo-mirrors` (gateway-owned, sandbox-read-only)             | Global, written only by cowshed-gateway   |
+| 2. Clone-materializing caches           | caches a tool reflinks out of into the workspace — **none today**: bun's isolated linker links into its cache instead                                                                                                 | Inside each workspace image                                                                                                | Inherited from main via CoW at clone time |
+| 3. Read-at-build and link-target caches | Cargo registry/git extraction caches, bun global install cache, uv cache, Go module + build caches, ttsc plugins, sccache, zig global cache, gradle, Nix eval/fetcher and profile state, sandboxed devenv evaluations | Dedicated writable roots under `/private/cowshed/caches/` reached through the host's literal default path or direct config | Shared writable by all workspaces         |
 
 Layer 1 removes duplicate _downloads_ (and stores compressed bytes once, ever). Bare repository mirrors live only at
 `/private/cowshed/caches/repo-mirrors/<host>/<path>.git`; they are written by the gateway's `repo mirror` control-plane
@@ -167,13 +167,37 @@ them there; they contain the endpoint URL, whose userinfo is the workspace token
   so no cargo process reads or writes them mid-copy; a cargo process holding a lock refuses the run. bun and uv offer no
   host-wide lock to take, so their caches move only while no install runs. sccache's platform cache is not linked: the
   store is daemon-write-only, and `cowshed setup` instead writes sccache's own config so a store-less client caches in
-  `/private/cowshed/caches/sccache` (below). Go and ttsc remain direct-configured:
-  `/private/cowshed/caches/go/{mod,build}` through Go's env file and `/private/cowshed/caches/ttsc` through
-  `TTSC_CACHE_DIR`; the supervisor creates the three directories before a child runs, because a child granted writes
-  inside one cannot create its parent. A smoo-managed repository shell (`tooling/direnv/shared-caches.sh`) exports
-  `TTSC_CACHE_DIR`, `GOCACHE` and `GOMODCACHE` naming those same directories whenever `/private/cowshed/caches` exists,
-  on the host and in every sandbox alike, so one path reaches each cache from every checkout. Gateway artifacts remain
-  outside every writable tool root at `mirror/` and `repo-mirrors/`.
+  `/private/cowshed/caches/sccache` (below). Go, ttsc and devenv remain direct-configured:
+  `/private/cowshed/caches/go/{mod,build}` through Go's env file, `/private/cowshed/caches/ttsc` through
+  `TTSC_CACHE_DIR`, and `/private/cowshed/caches/devenv` through `COWSHED_DEVENV_CACHE` (below); the supervisor creates
+  the four directories before a child runs, because a child granted writes inside one cannot create its parent. A
+  smoo-managed repository shell (`tooling/direnv/shared-caches.sh`) exports `TTSC_CACHE_DIR`, `GOCACHE` and `GOMODCACHE`
+  naming those same directories whenever `/private/cowshed/caches` exists, on the host and in every sandbox alike, so
+  one path reaches each cache from every checkout. Gateway artifacts remain outside every writable tool root at
+  `mirror/` and `repo-mirrors/`.
+
+  **Sandboxed shells share devenv evaluations by content.** devenv evaluates a project at its path, and the result
+  really differs per path, so devenv itself cannot key on content. The absolute root, its `.devenv`, `TMPDIR` and the
+  runtime directory under `XDG_RUNTIME_DIR` are fields of the arguments devenv hands Nix (devenv 2.3 `devenv-core`
+  `nix_args.rs` `NixArgs`), which are its evaluation-cache key (`evaluator.rs` `eval_cache_key_args`). The modules
+  compile them into the shell: `top-level.nix` exports `DEVENV_ROOT`, `DEVENV_STATE`, `DEVENV_RUNTIME` and
+  `DEVENV_DOTFILE` and writes `TMPDIR`, the runtime and the dotfile into the shell hook; `files.nix`, `rust.nix` and
+  `processes.nix` bake the root, the state and the runtime into store paths. nixpkgs also reads impure overlays from
+  `HOME`. So a clone at a new path, with its own private environment, re-evaluated nixpkgs on its first shell entry.
+  Measured on a large monorepo: about 10 s of CPU and 37,000 synchronous nix-daemon round trips, 27 s on an idle host
+  and over 8 minutes at load 60–80. The supervisor names `/private/cowshed/caches/devenv` as `COWSHED_DEVENV_CACHE` for
+  every sandboxed child. A smoo-managed repository shell (`tooling/direnv/shared-devenv.ts`) works in four steps:
+  - it copies its devenv inputs there under a digest of their content;
+  - it evaluates the copy with `HOME`, `TMPDIR` and `XDG_RUNTIME_DIR` fixed under that directory;
+  - it moves the export onto the workspace before direnv imports it, replacing only paths it chose itself;
+  - it unsets the compiled task file, a store path that names the copy and that only an in-place `devenv tasks`, `up` or
+    `test` reads.
+
+  Workspaces with identical inputs share one cache entry, and changed inputs are a new digest and a new evaluation. A
+  project whose enterShell tasks would write into the project they run in (anything beyond devenv's own enterShell and
+  an empty `files`) evaluates in place, and the task graph that evaluation leaves in the checkout's `.devenv`, which a
+  clone inherits, sends later entries straight there. Host shells never get the variable and evaluate in place, because
+  they would otherwise run what any sandbox wrote there.
 
   **Every checkout reaches a shared tool home through the host's literal path.** Cargo fingerprints a registry or git
   dependency by the absolute path of its source under `$CARGO_HOME` (measured: the same registry reached through a
@@ -246,6 +270,8 @@ them there; they contain the endpoint URL, whose userinfo is the workspace token
       ships no sccache left a bare `sccache` unresolvable, failing every cargo at its version probe. A host that pinned
       none — sccache is opt-in — or whose pinned store path was collected gets no wrapper at all; neither value is the
       caller's;
+    - `COWSHED_DEVENV_CACHE=/private/cowshed/caches/devenv`, where repository shells share devenv evaluations (above),
+      on a host with the caches volume and never the caller's value;
     - trust anchors as defaults a caller may override: `NODE_EXTRA_CA_CERTS`, `GIT_SSL_CAINFO`, `CARGO_HTTP_CAINFO`,
       `NIX_SSL_CERT_FILE`, `SSL_CERT_FILE`, `UV_SYSTEM_CERTS=true`, and an `ssl-cert-file` line appended to `NIX_CONFIG`
       (04_sandbox.md);

@@ -278,9 +278,25 @@ pub const RELOCATED_TOOL_CACHES: [(&str, &str); 4] = [
 
 /// Caches shared like the relocated ones but named directly by the tool's own configuration —
 /// Go's module and build caches through its env file (03_caches.md), ttsc's compiled plugins
-/// through `TTSC_CACHE_DIR` — so nothing on the host is relocated for them, and the supervisor
-/// creates them before a child runs.
-pub const DIRECT_TOOL_CACHES: [&str; 3] = ["go/mod", "go/build", "ttsc"];
+/// through `TTSC_CACHE_DIR`, sandboxed devenv evaluations through [`DEVENV_CACHE_ENV`] — so
+/// nothing on the host is relocated for them, and the supervisor creates them before a child
+/// runs.
+pub const DIRECT_TOOL_CACHES: [&str; 4] = ["go/mod", "go/build", "ttsc", DEVENV_CACHE];
+
+/// Where sandboxed shells share devenv evaluations, under the caches root.
+///
+/// devenv keys its evaluation cache on the absolute project root, `.devenv`, `TMPDIR`, runtime
+/// directory and `HOME`, and compiles the root into the shell it builds, so a workspace at a new
+/// path with its own private environment re-evaluates nixpkgs on its first shell entry. A
+/// repository shell that names this directory evaluates a content-addressed copy of its devenv
+/// inputs there with those fixed, and relocates the export onto the workspace; every workspace
+/// with identical inputs then gets the same cache entry. It is shared writable like the Nix
+/// client caches beside it, so only sandboxed children are pointed at it: a host shell that
+/// evaluated from it would run what any sandbox wrote there.
+pub const DEVENV_CACHE: &str = "devenv";
+
+/// Names [`DEVENV_CACHE`] for every sandboxed child of a host with the caches volume.
+pub const DEVENV_CACHE_ENV: &str = "COWSHED_DEVENV_CACHE";
 
 /// A symlink beside the workspace mount — `<mount_root>/<org>/<project>/<name>` — that an
 /// operator planted so a relative dependency (`../<name>`) resolves from every workspace of the
@@ -1651,6 +1667,7 @@ mod tests {
             "gradle/caches",
             "nix/cache",
             "nix/state",
+            "devenv",
         ] {
             assert!(
                 profile.contains(&format!(

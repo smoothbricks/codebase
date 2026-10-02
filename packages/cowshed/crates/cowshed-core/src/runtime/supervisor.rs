@@ -1408,6 +1408,19 @@ pub(super) async fn sandbox_environment(
     // its timestamps) rather than left in place.
     own("NX_DAEMON", OsStr::new("false"));
     own(GO_ENV, private_cache.join("go/env").as_os_str());
+    // A repository shell shares its devenv evaluation with every workspace whose inputs match
+    // through one directory on the caches volume (`sandbox::DEVENV_CACHE`), which
+    // `prepare_private_environment` created. Only sandboxed children are pointed at it, and a
+    // caller's value never passes: a host without the volume has nowhere to share one.
+    let caches = Path::new(crate::storage::bootstrap::CACHES_ROOT);
+    if caches.is_dir() {
+        own(
+            crate::sandbox::DEVENV_CACHE_ENV,
+            caches.join(crate::sandbox::DEVENV_CACHE).as_os_str(),
+        );
+    } else {
+        withheld.push(crate::sandbox::DEVENV_CACHE_ENV);
+    }
     // Rust routes through sccache in every workspace of a host that pinned one. Cargo's
     // `-C metadata` is path-independent for workspace members (cargo >= 1.97, measured), and the
     // pinned sccache normalizes the residual path-bearing key inputs (cwd, blanket `CARGO_*` env,
@@ -4589,6 +4602,52 @@ mod workspace_toolchain_tests {
         std::fs::remove_file(sandbox_runtime_link(&sandbox)).ok();
     }
 
+    /// A sandboxed child is pointed at the one directory where shells share devenv evaluations
+    /// whenever the host has the caches volume, and nowhere otherwise; a caller cannot point a
+    /// one-shot child or a warm shell's command at another directory.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn a_sandboxed_child_shares_devenv_evaluations_only_through_the_caches_volume() {
+        let root = scratch("devenv-cache");
+        let mount = root.join("workspace");
+        std::fs::create_dir_all(mount.join(".cowshed")).expect("private root");
+        std::fs::write(mount.join(".cowshed/token"), "A".repeat(43)).expect("token");
+        let mut sandbox = sandbox_at(&mount);
+        sandbox.port_block = crate::metadata::PortBlock::new(49_056, 16).expect("port block");
+        let caller = BTreeMap::from([(
+            crate::sandbox::DEVENV_CACHE_ENV.to_owned(),
+            root.join("elsewhere").display().to_string(),
+        )]);
+        let environment = sandbox_environment(&sandbox, None, &caller)
+            .await
+            .expect("environment");
+        let child = environment.child(&caller);
+        let mut pooled = environment.base();
+        pooled.extend(environment.overlay(&caller));
+        assert_eq!(
+            pooled, child,
+            "pooled and one-shot children see one environment"
+        );
+        let caches = Path::new(crate::storage::bootstrap::CACHES_ROOT);
+        let expected = caches
+            .is_dir()
+            .then(|| caches.join("devenv").into_os_string());
+        assert_eq!(
+            child
+                .get(OsStr::new(crate::sandbox::DEVENV_CACHE_ENV))
+                .cloned(),
+            expected
+        );
+        if caches.is_dir() {
+            assert!(
+                caches.join("devenv").is_dir(),
+                "the directory it names exists"
+            );
+        }
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_file(sandbox_runtime_link(&sandbox)).ok();
+    }
+
     /// Every spawn of a live workspace finds its link already in place, so it must not scan the
     /// directory the links share (on a busy host `/tmp` holds thousands of entries); only taking
     /// a link sweeps the dangling ones a retired workspace left beside it.
@@ -5221,15 +5280,15 @@ mod sandbox_environment_tests {
     }
 
     /// Nothing on the host is relocated for the caches a tool's own configuration names (Go's
-    /// env file, `TTSC_CACHE_DIR`), and a child granted writes inside one cannot create its
-    /// parent: the directories exist before any child runs.
+    /// env file, `TTSC_CACHE_DIR`, `COWSHED_DEVENV_CACHE`), and a child granted writes inside one
+    /// cannot create its parent: the directories exist before any child runs.
     #[test]
     fn directly_configured_caches_exist_before_a_child_runs() {
         let root = scratch("direct-caches");
         let caches = root.join("caches");
         std::fs::create_dir_all(&caches).unwrap();
         prepare_private_environment(&root.join("environment"), &caches).unwrap();
-        for directory in ["go/mod", "go/build", "ttsc"] {
+        for directory in ["go/mod", "go/build", "ttsc", "devenv"] {
             assert!(caches.join(directory).is_dir(), "{directory}");
         }
         std::fs::remove_dir_all(root).unwrap();

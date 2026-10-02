@@ -319,7 +319,7 @@ All cowshed bytes live on two dedicated APFS volumes, split by **rebuildability 
 cowshed churn at all:
 
 - **`cowshed.caches`**, mounted at `/private/cowshed/caches` — everything rebuildable. Layout:
-  `/private/cowshed/caches/{mirror,repo-mirrors,cargo,sccache,zig,gradle,go/{mod,build},nix/{cache,state}}` (see
+  `/private/cowshed/caches/{mirror,repo-mirrors,cargo,sccache,zig,gradle,go/{mod,build},nix/{cache,state},devenv}` (see
   03_caches.md). `repo-mirrors/` holds bare git mirrors (`<host>/<org>/<repo>.git`) — written only by the gateway via
   `cowshed repo mirror`, sandbox-read-only, and distinct from Cargo's shared writable `cargo/git` cache. Because nothing
   unique lives here, the nuclear recovery path is always safe: `diskutil apfs deleteVolume` + lazy recreate — the mirror
