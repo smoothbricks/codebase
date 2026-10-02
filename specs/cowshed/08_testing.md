@@ -159,13 +159,16 @@ suite-level guard reaps leaked `cowshed.itest.*` volumes/pools. The same flow ta
 assertions (fsck step on APFS, origin-snapshot GC on ZFS) are tagged.
 
 The native inventory teardown regression runs the production read-only host-storage planner against the real home device
-while ejecting a disposable ASIF image. It asserts that the selected home device and container remain unchanged; it does
-not require machine-global `cowshed.store`/`cowshed.caches` installation on an ephemeral runner. Installation validation
-remains a separate contract and still refuses missing storage.
+while detaching a disposable ASIF image. Attachment and teardown use the production APFS backend, including its
+host-device lease and image ownership checks, so independent Nextest runners cannot recycle another fixture's device.
+The planner still overlaps actual teardown and asserts that the selected home device and container remain unchanged; it
+does not require machine-global `cowshed.store`/`cowshed.caches` installation on an ephemeral runner. Installation
+validation remains a separate contract and still refuses missing storage.
 
-APFS attach diagnostics distinguish raw-device pinning and image/device identity inspection from attach and fsck. The
-checked-land fixture reports elapsed phase boundaries so a 30-second failure identifies the stalled operation without
-exposing workspace paths or command payloads.
+APFS diagnostics distinguish host-device lease acquisition, blank-image creation and formatting, raw-device pinning,
+image/device identity inspection, attach, and fsck. Adoption also reports secret scanning, grant reservation, staged
+copy and credential publication, and supervisor startup. The checked-land fixture reports elapsed phase boundaries so a
+30-second failure identifies the stalled operation without exposing workspace paths or command payloads.
 
 The CLI dispatch tier opens a real `ActorBridge` on caller-owned APFS images and the same persisted workspace/project
 grant stores as a normal controller. It tests grant denial without a write, grant survival across runtime restart, a

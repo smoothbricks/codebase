@@ -3460,7 +3460,9 @@ mod tests {
 
     #[test]
     fn real_apfs_inventory_survives_concurrent_image_teardown() {
-        use crate::apfs::{ApfsBackend, CreateImageRequest, MacOsApfsBackend, SystemCommandRunner};
+        use crate::apfs::{
+            ApfsBackend, CreateImageRequest, DetachIntent, MacOsApfsBackend, SystemCommandRunner,
+        };
         use crate::metadata::ImageCapacity;
 
         let root = scratch_apfs::ScratchRoot::new("inventory-teardown").expect("scratch root");
@@ -3495,48 +3497,11 @@ mod tests {
             host: &SystemBootstrapHost,
         };
         for _ in 0..8 {
-            let attached = Command::new(DISKUTIL)
-                .args(["image", "attach", "--noMount", "--plist"])
-                .arg(&image)
-                .output()
-                .expect("attach real image");
-            assert!(
-                attached.status.success(),
-                "diskutil image attach: {}",
-                String::from_utf8_lossy(&attached.stderr)
-            );
-            let device = plist::Value::from_reader(std::io::Cursor::new(&attached.stdout))
-                .expect("attach plist")
-                .as_dictionary()
-                .and_then(|dict| dict.get("system-entities"))
-                .and_then(plist::Value::as_array)
-                .and_then(|entities| {
-                    entities
-                        .iter()
-                        .filter_map(|entity| entity.as_dictionary()?.get("dev-entry")?.as_string())
-                        .find(|entry| {
-                            entry
-                                .strip_prefix("/dev/")
-                                .unwrap_or(entry)
-                                .strip_prefix("disk")
-                                .is_some_and(|digits| {
-                                    !digits.is_empty()
-                                        && digits.bytes().all(|byte| byte.is_ascii_digit())
-                                })
-                        })
-                })
-                .expect("whole attached disk")
-                .to_owned();
+            let attachment = backend.attach_verified(&image).expect("attach real image");
             let detach = std::thread::spawn(move || {
-                let output = Command::new(DISKUTIL)
-                    .args(["eject", &device])
-                    .output()
-                    .expect("eject real image");
-                assert!(
-                    output.status.success(),
-                    "diskutil eject: {}",
-                    String::from_utf8_lossy(&output.stderr)
-                );
+                MacOsApfsBackend::new(SystemCommandRunner)
+                    .detach(&attachment, DetachIntent::Release)
+                    .expect("detach the fixture's image");
             });
             let plan = plan_existing_host_storage(&mut source, &home);
             detach.join().expect("detach worker");

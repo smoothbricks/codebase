@@ -6862,11 +6862,15 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                 "retry with the bound repository identity",
             ));
         }
-        enforce_adopt_secret_policy(
-            self.descriptor.git_root.clone(),
-            self.layout.project().waivers.clone(),
-            self.layout.project().quarantine.clone(),
-            options.quarantine,
+        timed_async(
+            "adopt",
+            "secrets",
+            enforce_adopt_secret_policy(
+                self.descriptor.git_root.clone(),
+                self.layout.project().waivers.clone(),
+                self.layout.project().quarantine.clone(),
+                options.quarantine,
+            ),
         )
         .await?;
         // Capacity is fixed for the image's lifetime at creation; `cowshed resize` is what moves
@@ -6878,7 +6882,7 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
         let pre_cowshed = pre_cowshed_path(&self.descriptor.git_root)?;
         self.begin_lifecycle_intent(intent).await?;
 
-        let reservation = self.fresh_grants().await?;
+        let reservation = timed_async("adopt", "grants", self.fresh_grants()).await?;
         let mut grants = reservation.grants.clone();
         grants.revision = 0;
         let identity = self
@@ -6929,8 +6933,8 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
         )
         .await?;
         let name = receipt.workspace.name().clone();
-        self.ensure_supervisor(&name).await?;
-        self.snapshot_named(&name).await
+        timed_async("adopt", "supervisor", self.ensure_supervisor(&name)).await?;
+        timed_async("adopt", "snapshot", self.snapshot_named(&name)).await
     }
 
     async fn create(

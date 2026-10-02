@@ -2087,19 +2087,27 @@ fn prepare_adopt_stage<H: ApfsExecutionHost>(
     let prepared = host
         .mount(&attachment, &mount_point, MountAccess::ReadWrite, false)
         .and_then(|()| {
-            host.copy_tree(source_checkout, &mount_point)?;
-            host.mint_workspace_credentials(
-                &workspace,
-                &staged_image,
-                &mount_point,
-                &canonical_mount,
-                &staged_companion,
-            )?;
-            host.write_marker(&mount_point, &workspace, None, identity)?;
-            host.validate_marker(
-                &mount_point,
-                &MarkerExpectation::freshly_stamped(&workspace),
-            )
+            timed_apfs_step("staging", "copy", || {
+                host.copy_tree(source_checkout, &mount_point)
+            })?;
+            timed_apfs_step("staging", "creds", || {
+                host.mint_workspace_credentials(
+                    &workspace,
+                    &staged_image,
+                    &mount_point,
+                    &canonical_mount,
+                    &staged_companion,
+                )
+            })?;
+            timed_apfs_step("staging", "marker", || {
+                host.write_marker(&mount_point, &workspace, None, identity)
+            })?;
+            timed_apfs_step("staging", "validate", || {
+                host.validate_marker(
+                    &mount_point,
+                    &MarkerExpectation::freshly_stamped(&workspace),
+                )
+            })
         });
     if let Err(primary) = prepared {
         let cleanup = detach_and_reclaim(host, attachment, &staged_image, "adopt staging detach");

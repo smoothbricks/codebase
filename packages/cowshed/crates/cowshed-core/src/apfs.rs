@@ -885,13 +885,15 @@ impl<R, S> MacOsApfsBackend<R, S> {
 
 impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
     fn host_device_lease(&self, image: &Path) -> Result<Option<File>, ApfsError> {
-        self.runner
-            .host_device_lease()
-            .map_err(|source| ApfsError::FileOperation {
-                operation: "acquire host APFS device lease for image",
-                path: image.to_owned(),
-                source,
-            })
+        timed_apfs_step(apfs_step_leg(image), "device-lease", || {
+            self.runner
+                .host_device_lease()
+                .map_err(|source| ApfsError::FileOperation {
+                    operation: "acquire host APFS device lease for image",
+                    path: image.to_owned(),
+                    source,
+                })
+        })
     }
 
     fn pin_attached_volume(&self, attachment: &AttachedImage) -> Result<Option<File>, ApfsError> {
@@ -1068,7 +1070,9 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
                 path.as_os_str().to_owned(),
             ],
         );
-        self.run_checked("create ASIF image", create)?;
+        timed_apfs_step(apfs_step_leg(path), "blank-create", || {
+            self.run_checked("create ASIF image", create)
+        })?;
         let attached_before = self.attached_whole_devices(path)?;
 
         let attach = CommandRequest::new(
@@ -1082,7 +1086,9 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
                 path.as_os_str().to_owned(),
             ],
         );
-        let output = match self.run_checked("attach blank ASIF image", attach) {
+        let output = match timed_apfs_step(apfs_step_leg(path), "blank-attach", || {
+            self.run_checked("attach blank ASIF image", attach)
+        }) {
             Ok(output) => output,
             Err(primary) => {
                 return Err(self.failed_asif_attachment(path, &attached_before, primary));
@@ -1123,7 +1129,9 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
                 OsString::from(&whole_device),
             ],
         );
-        if let Err(primary) = self.run_checked("format ASIF APFS volume", format) {
+        if let Err(primary) = timed_apfs_step(apfs_step_leg(path), "format", || {
+            self.run_checked("format ASIF APFS volume", format)
+        }) {
             return match self.detach_image_device_unlocked(
                 path,
                 &whole_device,
