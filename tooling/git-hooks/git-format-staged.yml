@@ -57,6 +57,7 @@ formatters:
       # Bun lockfiles are generated and should not be rewritten by Prettier
       - '!bun.lock'
       # Binary artifacts: not text, nothing for Prettier to do.
+      - '!*.bin'
       - '!*.wasm'
       - '!*.wasm.sha256'
 

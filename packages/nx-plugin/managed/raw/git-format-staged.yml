@@ -55,6 +55,7 @@ formatters:
       # Cargo lockfiles are generated and should not be rewritten by Prettier
       - '!Cargo.lock'
       # Binary artifacts: not text, nothing for Prettier to do.
+      - '!*.bin'
       - '!*.wasm'
       - '!*.wasm.sha256'
       # Prettier has no parser for these; --ignore-unknown swallows stdin and

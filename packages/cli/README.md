@@ -410,9 +410,8 @@ nothing when nothing changed:
   it in the destination checkout. Missing or changed inputs, external symlinks, or writing enterShell tasks fall back to
   in-place evaluation. A writable cache shared by siblings is never a source of shell code; successful reuse drains the
   complete export (including shells larger than 64 KiB) and reports reuse without printing the origin checkout path or
-  credentials.
-  To verify the full physical path (host-origin Nix evaluation, scratch APFS adoption/COW clone,
-  dedicated Gateway/ActorBridge sandbox entry, and poisoned symlink fallback) on macOS, run
+  credentials. To verify the full physical path (host-origin Nix evaluation, scratch APFS adoption/COW clone, dedicated
+  Gateway/ActorBridge sandbox entry, and poisoned symlink fallback) on macOS, run
   `cargo test -p cowshed-cli --test command_dispatch real_apfs_first_shell_reuses_private_origin_artifact_without_exposing_origin -- --ignored --nocapture`.
   This explicit smoke exceeds nextest's normal 30-second per-test limit; ordinary tests keep that limit.
 - The repository's local git config includes `tooling/workspace.gitconfig` by a path relative to the config file
@@ -463,7 +462,8 @@ command that brings a link back once it has been replaced, so after a plain inst
 ## Formatting And Git Hooks
 
 The root `lint:fix` script runs [`git-format-staged`][git-format-staged] with
-`--config tooling/git-hooks/git-format-staged.yml --unstaged`. The formatter config intentionally excludes `bun.lock`.
+`--config tooling/git-hooks/git-format-staged.yml --unstaged`. Both the managed commit-hook config and the repository
+formatter config exclude `bun.lock` and binary `.bin`/`.wasm` artifacts from text formatting.
 
 The generated pre-commit hook runs the same formatter path from the repository root with `tooling`, `node_modules/.bin`,
 and the [devenv] profile on `PATH`.
