@@ -45,7 +45,8 @@ impl Fixture {
         }
         git(&checkout, &["init", "-q", "-b", "main"]);
         fs::write(checkout.join("tracked"), b"tracked\n").expect("tracked file");
-        fs::write(checkout.join(".gitignore"), b".envrc\n").expect("workspace hook ignore");
+        fs::write(checkout.join(".gitignore"), b".envrc\n.devenv/\n")
+            .expect("workspace hook and evaluated profile ignore");
         git(&checkout, &["add", "tracked", ".gitignore"]);
         git(&checkout, &["commit", "-q", "-m", "initial"]);
         let storage = ValidatedHostStorage::new(
@@ -59,6 +60,31 @@ impl Fixture {
             granted,
             gateway: None,
         }
+    }
+
+    fn install_checked_land_shell(&self) {
+        // The checked command runs inside the workspace sandbox, which cannot inherit CI's
+        // checkout PATH. Give this scratch repository the same real, store-backed profile that
+        // devenv evaluated for the test runner; its direnv binary must be usable after cloning.
+        let manifest = PathBuf::from(
+            std::env::var_os("CARGO_MANIFEST_DIR").expect("Cargo manifest directory"),
+        );
+        let profile = manifest
+            .join("../../../../tooling/direnv/.devenv/profile")
+            .canonicalize()
+            .expect("evaluated repository devenv profile");
+        assert!(
+            profile.starts_with("/nix/store"),
+            "profile must be immutable"
+        );
+        assert!(
+            profile.join("bin/direnv").is_file(),
+            "real direnv is installed"
+        );
+        let state = self.checkout.join(".devenv");
+        fs::create_dir_all(&state).expect("workspace devenv state");
+        std::os::unix::fs::symlink(profile, state.join("profile"))
+            .expect("workspace profile points to real Nix shell");
     }
 
     async fn open(&self) -> ActorBridge {
@@ -347,6 +373,7 @@ async fn real_apfs_dispatch_reallocates_a_raced_port_and_reconciles_gateway_gran
 #[tokio::test]
 async fn real_apfs_checked_land_preserves_target_when_gateway_absent_then_fast_forwards() {
     let mut fixture = Fixture::new();
+    fixture.install_checked_land_shell();
     let mut service = fixture.open().await;
     adopt(&fixture, &mut service).await;
     fixture.start_gateway().await;
