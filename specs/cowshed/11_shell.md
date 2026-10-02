@@ -471,7 +471,13 @@ admitted but never sealed. Two things put that right:
   when it finds on its own start a socket nothing answers, it ends the groups that supervisor's ledger names — TERM, two
   seconds, KILL — and marks the ledger ended, keeping the jobs it names. A group whose leader is alive under another
   start time is a reused pid and is left alone; a watcher acts only on a ledger the supervisor it watched wrote, never
-  on one a newer supervisor of the workspace has written since.
+  on one a newer supervisor of the workspace has written since. Ownership is revalidated before force. An unreadable
+  start time is an operational error, not leader absence; leader absence alone never proves the group empty. On macOS,
+  the exact recorded PGID's membership is enumerated and its members inspected, so an unreaped dead leader is
+  distinguished from a surviving descendant. A full membership buffer is not absence evidence. Inspection or signaling
+  failures retain the original ledger and report the error; they never mark it ended or consume it. A previous ended
+  marker does not bypass live authority checks during recovery or sealing. Genuine sandbox-denied inspection/signaling
+  controls exercise both refusal paths and a later host-authorized retry.
 - **Sealing.** The next supervisor of the workspace binds its socket first — holding it is what makes it the workspace's
   one supervisor — ends whatever groups the ledger still names, and seals each job the ledger names that was admitted
   and never sealed: a `failed` terminal record naming `failure: supervisorLost`, carrying the bytes the job spilled to

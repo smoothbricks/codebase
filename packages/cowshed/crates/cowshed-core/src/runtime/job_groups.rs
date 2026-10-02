@@ -34,7 +34,7 @@ struct Ledger {
 struct Group {
     job_id: u64,
     pgid: i32,
-    /// The leader's start time in microseconds since the epoch, when it could be read.
+    /// The leader's start time; `None` means it was already authoritatively absent.
     leader_start: Option<u64>,
 }
 
@@ -45,15 +45,22 @@ pub fn record(path: &Path, groups: &[(u64, u32)]) -> io::Result<()> {
         ended: false,
         groups: groups
             .iter()
-            .filter_map(|&(job_id, pgid)| {
-                let pgid = i32::try_from(pgid).ok()?;
-                Some(Group {
+            .map(|&(job_id, pgid)| {
+                let pgid = i32::try_from(pgid)
+                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+                if pgid <= 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "a job process group must be positive",
+                    ));
+                }
+                Ok(Group {
                     job_id,
                     pgid,
-                    leader_start: start_time(pgid),
+                    leader_start: start_time(pgid)?,
                 })
             })
-            .collect(),
+            .collect::<io::Result<Vec<_>>>()?,
     };
     replace(path, &ledger)
 }
@@ -88,10 +95,7 @@ pub fn end_recorded(path: &Path, writer: Writer, grace: Duration) -> io::Result<
     {
         return Ok(Vec::new());
     }
-    if ledger.ended {
-        return Ok(Vec::new());
-    }
-    let signalled = end_groups(&ledger.groups, grace);
+    let signalled = end_groups(&ledger.groups, grace)?;
     ledger.ended = true;
     replace(path, &ledger)?;
     Ok(signalled)
@@ -104,9 +108,8 @@ pub fn take_lost(path: &Path, grace: Duration) -> io::Result<()> {
     let Some(ledger) = read(path)? else {
         return Ok(());
     };
-    if !ledger.ended {
-        end_groups(&ledger.groups, grace);
-    }
+    // A prior signaling pass is not authority to discard a still-live group's evidence.
+    end_groups(&ledger.groups, grace)?;
     std::fs::remove_file(path)
 }
 
@@ -120,45 +123,144 @@ fn read(path: &Path) -> io::Result<Option<Ledger>> {
     }
 }
 
-/// TERM the groups that are the jobs', wait `grace`, KILL them; the job ids signalled.
-fn end_groups(groups: &[Group], grace: Duration) -> Vec<u64> {
-    let ours: Vec<Group> = groups
-        .iter()
-        .copied()
-        .filter(|group| match (group.leader_start, start_time(group.pgid)) {
-            // The leader lives on under the recorded start: the job's own group.
-            (Some(recorded), Some(now)) => recorded == now,
-            // The pid now names another process: not ours.
-            (None, Some(_)) => false,
-            // The leader is gone; the group, if it still exists, is the job's.
-            (_, None) => true,
-        })
-        .collect();
-    let signalled: Vec<u64> = ours
-        .iter()
-        .filter(|group| signal_group(group.pgid, libc::SIGTERM))
-        .map(|group| group.job_id)
-        .collect();
-    if !signalled.is_empty() {
-        std::thread::sleep(grace);
-        for group in &ours {
-            signal_group(group.pgid, libc::SIGKILL);
+/// TERM the owned groups, wait `grace`, revalidate their ownership, then KILL them.
+/// A failed inspection or signal leaves the caller's original ledger available for retry.
+fn end_groups(groups: &[Group], grace: Duration) -> io::Result<Vec<u64>> {
+    let mut signalled = Vec::with_capacity(groups.len());
+    for group in groups {
+        if owns_group(group)? && signal_group(group.pgid, libc::SIGTERM)? {
+            signalled.push(group.job_id);
         }
     }
-    signalled
+    if !signalled.is_empty() {
+        std::thread::sleep(grace);
+        for group in groups {
+            if owns_group(group)? {
+                signal_group(group.pgid, libc::SIGKILL)?;
+            }
+        }
+    }
+    Ok(signalled)
 }
 
-/// Whether `signal` reached a group that exists.
-fn signal_group(pgid: i32, signal: i32) -> bool {
-    // SAFETY: killpg takes plain integers and touches no memory of ours.
-    unsafe { libc::killpg(pgid, signal) == 0 }
+fn owns_group(group: &Group) -> io::Result<bool> {
+    if group.pgid <= 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "a recorded job process group must be positive",
+        ));
+    }
+    let now = start_time(group.pgid).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("cannot verify process group {}: {error}", group.pgid),
+        )
+    })?;
+    Ok(match (group.leader_start, now) {
+        (Some(recorded), Some(now)) => recorded == now,
+        (None, Some(_)) => false,
+        // Leader absence alone says nothing about surviving descendants.
+        (_, None) => return group_has_live_members(group.pgid),
+    })
 }
 
-/// When `pid` started, in microseconds since the epoch, if it is alive.
 #[cfg(target_os = "macos")]
-fn start_time(pid: i32) -> Option<u64> {
+fn group_has_live_members(pgid: i32) -> io::Result<bool> {
+    fn read_members(pgid: i32, members: &mut [i32]) -> io::Result<usize> {
+        let bytes = i32::try_from(std::mem::size_of_val(members)).map_err(io::Error::other)?;
+        // SAFETY: errno is thread-local; libproc writes at most `bytes` into this live slice.
+        let count = unsafe {
+            *libc::__error() = 0;
+            libc::proc_listpgrppids(pgid, members.as_mut_ptr().cast(), bytes)
+        };
+        if count <= 0 {
+            let error = io::Error::last_os_error();
+            return if count == 0 && error.raw_os_error() == Some(0) {
+                Ok(0)
+            } else {
+                Err(error)
+            };
+        }
+        let count = usize::try_from(count).map_err(io::Error::other)?;
+        if count > members.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "process group membership exceeded its buffer",
+            ));
+        }
+        Ok(count)
+    }
+
+    fn contains_live(members: &[i32]) -> io::Result<bool> {
+        for &pid in members {
+            if pid <= 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "process group membership contains an invalid pid",
+                ));
+            }
+            if start_time(pid)?.is_some() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    // Small groups need no allocation. A full buffer is never evidence of complete absence.
+    let mut stack = [0; 32];
+    let count = read_members(pgid, &mut stack)?;
+    if contains_live(&stack[..count])? {
+        return Ok(true);
+    }
+    if count < stack.len() {
+        return Ok(false);
+    }
+    let mut members = vec![0; stack.len() * 2];
+    loop {
+        let count = read_members(pgid, &mut members)?;
+        if contains_live(&members[..count])? {
+            return Ok(true);
+        }
+        if count < members.len() {
+            return Ok(false);
+        }
+        let length = members.len().checked_mul(2).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "process group membership overflowed",
+            )
+        })?;
+        members.resize(length, 0);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn group_has_live_members(pgid: i32) -> io::Result<bool> {
+    signal_group(pgid, 0)
+}
+
+/// Whether a signal reached a group, or ESRCH proved it absent. Other failures are errors.
+fn signal_group(pgid: i32, signal: i32) -> io::Result<bool> {
+    // SAFETY: killpg takes plain integers and touches no memory of ours.
+    if unsafe { libc::killpg(pgid, signal) } == 0 {
+        return Ok(true);
+    }
+    let error = io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        return Ok(false);
+    }
+    Err(io::Error::new(
+        error.kind(),
+        format!("signaling process group {pgid} with signal {signal} failed: {error}"),
+    ))
+}
+
+/// The leader's start time, or confirmed absence. An unreadable process is never absent.
+#[cfg(target_os = "macos")]
+fn start_time(pid: i32) -> io::Result<Option<u64>> {
     let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
-    let size = i32::try_from(std::mem::size_of::<libc::proc_bsdinfo>()).ok()?;
+    let size =
+        i32::try_from(std::mem::size_of::<libc::proc_bsdinfo>()).map_err(io::Error::other)?;
     // SAFETY: `info` is writable storage of exactly `size` bytes.
     let written = unsafe {
         libc::proc_pidinfo(
@@ -170,22 +272,56 @@ fn start_time(pid: i32) -> Option<u64> {
         )
     };
     if written != size {
-        return None;
+        if written <= 0 {
+            let error = io::Error::last_os_error();
+            return if error.raw_os_error() == Some(libc::ESRCH) {
+                Ok(None)
+            } else {
+                Err(error)
+            };
+        }
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("proc_pidinfo returned {written} bytes, expected {size}"),
+        ));
     }
     // SAFETY: proc_pidinfo filled all `size` bytes.
     let info = unsafe { info.assume_init() };
     info.pbi_start_tvsec
-        .checked_mul(1_000_000)?
-        .checked_add(info.pbi_start_tvusec)
+        .checked_mul(1_000_000)
+        .and_then(|seconds| seconds.checked_add(info.pbi_start_tvusec))
+        .map(Some)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "process start time overflowed"))
 }
 
-/// When `pid` started, in clock ticks since boot, if it is alive.
+/// The leader's start time in ticks since boot, or confirmed absence on a mounted procfs.
 #[cfg(target_os = "linux")]
-fn start_time(pid: i32) -> Option<u64> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+fn start_time(pid: i32) -> io::Result<Option<u64>> {
+    let stat = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(stat) => stat,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            std::fs::metadata("/proc/self/stat")?;
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+    };
     // The command name is parenthesized and may hold spaces; fields resume after the last ')'.
-    let rest = &stat[stat.rfind(')')? + 1..];
-    rest.split_whitespace().nth(19)?.parse().ok()
+    let closing = stat.rfind(')').ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "process stat has no command delimiter",
+        )
+    })?;
+    let start = stat[closing + 1..]
+        .split_whitespace()
+        .nth(19)
+        .ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "process stat has no start time")
+        })?;
+    start
+        .parse()
+        .map(Some)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
 
 #[cfg(test)]
@@ -204,6 +340,61 @@ mod tests {
             .process_group(0)
             .spawn()
             .expect("spawn a job group")
+    }
+
+    #[cfg(target_os = "macos")]
+    struct OwnedGroup(std::process::Child);
+
+    #[cfg(target_os = "macos")]
+    impl Drop for OwnedGroup {
+        fn drop(&mut self) {
+            let pgid = i32::try_from(self.0.id()).expect("owned child pid");
+            // SAFETY: this unreaped child is the group leader spawned by this test.
+            unsafe { libc::killpg(pgid, libc::SIGKILL) };
+            let _ = self.0.wait();
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn an_absent_leader_does_not_hide_its_live_group_descendant() {
+        use std::io::BufRead as _;
+
+        let child = Command::new("/bin/sh")
+            .args(["-c", "(trap '' TERM; echo READY; exec sleep 300) & wait"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let mut group = OwnedGroup(child);
+        let pgid = i32::try_from(group.0.id()).unwrap();
+        let mut ready = String::new();
+        std::io::BufReader::new(group.0.stdout.take().unwrap())
+            .read_line(&mut ready)
+            .unwrap();
+        assert_eq!(ready.trim(), "READY");
+        let ledger = scratch();
+        record(&ledger, &[(9, group.0.id())]).unwrap();
+        group.0.kill().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while super::start_time(pgid).unwrap().is_some() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(super::start_time(pgid).unwrap().is_none());
+        assert!(super::group_has_live_members(pgid).unwrap());
+        assert_eq!(
+            end_recorded(&ledger, Writer::Any, Duration::ZERO).unwrap(),
+            vec![9]
+        );
+        drop(group);
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while super::group_has_live_members(pgid).unwrap() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!super::group_has_live_members(pgid).unwrap());
+        take_lost(&ledger, Duration::ZERO).unwrap();
+        assert!(!ledger.exists());
     }
 
     fn group_alive(pgid: i32) -> bool {
@@ -265,5 +456,73 @@ mod tests {
         )
         .unwrap();
         let _ = job.wait();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn permission_denials_preserve_the_owned_ledger_and_allow_retry() {
+        const LEDGER_ENV: &str = "COWSHED_TEST_GROUP_LEDGER";
+        if let Some(path) = std::env::var_os(LEDGER_ENV) {
+            let path = std::path::PathBuf::from(path);
+            let error = end_recorded(&path, Writer::Any, Duration::ZERO)
+                .expect_err("denied group authority cannot mark the ledger ended");
+            assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+            let error = take_lost(&path, Duration::ZERO)
+                .expect_err("denied group authority cannot remove the ledger");
+            assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+            return;
+        }
+
+        for (profile, previously_ended) in [
+            ("(version 1)(allow default)(deny signal)", false),
+            (
+                "(version 1)(allow default)(deny process-info*)(deny signal)",
+                false,
+            ),
+            ("(version 1)(allow default)(deny signal)", true),
+        ] {
+            let group = OwnedGroup(job_group());
+            let pgid = i32::try_from(group.0.id()).unwrap();
+            let ledger = scratch();
+            record(&ledger, &[(7, group.0.id())]).unwrap();
+            if previously_ended {
+                let mut recorded = super::read(&ledger).unwrap().unwrap();
+                recorded.ended = true;
+                super::replace(&ledger, &recorded).unwrap();
+            }
+            let before = std::fs::read(&ledger).unwrap();
+            let output = Command::new("/usr/bin/sandbox-exec")
+                .args(["-p", profile, "--"])
+                .arg(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "runtime::job_groups::tests::permission_denials_preserve_the_owned_ledger_and_allow_retry",
+                    "--nocapture",
+                ])
+                .env(LEDGER_ENV, &ledger)
+                .output()
+                .expect("real restricted cleanup process");
+            let after = std::fs::read(&ledger).unwrap();
+            let survived_refusal = group_alive(pgid);
+            let retried = end_recorded(&ledger, Writer::Any, Duration::ZERO);
+            let taken = take_lost(&ledger, Duration::ZERO);
+            drop(group);
+
+            assert!(
+                output.status.success(),
+                "restricted cleanup: stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(after, before, "failed cleanup retains the original ledger");
+            assert!(survived_refusal, "the refused group remained alive");
+            assert_eq!(
+                retried.unwrap(),
+                vec![7],
+                "host authority can retry cleanup"
+            );
+            taken.unwrap();
+            assert!(!ledger.exists(), "successful retry consumes the ledger");
+        }
     }
 }
