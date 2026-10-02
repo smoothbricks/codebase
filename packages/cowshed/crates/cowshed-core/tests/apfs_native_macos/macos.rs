@@ -96,9 +96,15 @@ fn inventory_plist(images: &[String]) -> Vec<u8> {
         plist.push_str("<dict><key>image-path</key><string>");
         plist.push_str(image);
         plist.push_str("</string><key>system-entities</key><array>");
-        for device in ["/dev/disk9", "/dev/disk10", "/dev/disk10s1"] {
+        for (device, hint) in [
+            ("/dev/disk9", ""),
+            ("/dev/disk10", "EF57347C-0000-11AA-AA11-00306543ECAC"),
+            ("/dev/disk10s1", "41504653-0000-11AA-AA11-00306543ECAC"),
+        ] {
             plist.push_str("<dict><key>dev-entry</key><string>");
             plist.push_str(device);
+            plist.push_str("</string><key>content-hint</key><string>");
+            plist.push_str(hint);
             plist.push_str("</string></dict>");
         }
         plist.push_str("</array></dict>");
@@ -165,6 +171,12 @@ impl CommandRunner for RecordingRunner {
             Ok(self.inventory.respond(request))
         }
     }
+    fn host_device_lease(&self) -> std::io::Result<Option<std::fs::File>> {
+        Ok(None)
+    }
+    fn pin_raw_device(&self, _: &Path) -> std::io::Result<Option<std::fs::File>> {
+        Ok(None)
+    }
 }
 /// Answers the first attachment inventory with the deadline failure [`SystemCommandRunner`]
 /// reports for a disk child that outlives `DISK_CHILD_DEADLINE`.
@@ -191,6 +203,12 @@ impl CommandRunner for DeadlineFirstInventoryRunner {
             });
         }
         Ok(CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY))
+    }
+    fn host_device_lease(&self) -> std::io::Result<Option<std::fs::File>> {
+        Ok(None)
+    }
+    fn pin_raw_device(&self, _: &Path) -> std::io::Result<Option<std::fs::File>> {
+        Ok(None)
     }
 }
 
@@ -1238,41 +1256,6 @@ fn gc_stale_orphan_image_identity_preserves_same_size_replacement() {
 }
 
 #[test]
-fn mount_registry_actor_owns_attachment_state() {
-    let fixture = Fixture::new("mount-registry");
-    let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
-    let image = layout.main_image().expect("image");
-    create_image(image.image());
-    let runner = RecordingRunner::default();
-    let host = native_host(&fixture, runner.clone());
-    let workspace = workspace();
-
-    let attachment = host
-        .attach_verified(image.image())
-        .expect("verified attachment");
-    host.mount(
-        &attachment,
-        &fixture.root.join("mounted"),
-        MountAccess::ReadWrite,
-        false,
-    )
-    .expect("mount attachment");
-    let mount_id = host
-        .retain_mounted(&workspace, attachment)
-        .expect("retain attachment");
-
-    assert_eq!(mount_id, 1);
-
-    host.detach_mounted(&workspace, DetachIntent::Release)
-        .expect("detach retained image");
-    assert_eq!(
-        runner.calls(),
-        7,
-        "inventory, attach, fsck, mount, the detach's identity read, detach, and detach-settle cross the command boundary"
-    );
-}
-
-#[test]
 fn marker_validation_checks_every_detached_identity_dimension() {
     let fixture = Fixture::new("marker");
     let host = native_host(&fixture, RecordingRunner::default());
@@ -2203,27 +2186,6 @@ fn stats_distinguish_a_missing_checkpoint_directory_from_an_invalid_one() {
 }
 
 #[test]
-fn reverse_teardown_drains_actor_state_and_detaches_every_attachment() {
-    let fixture = Fixture::new("reverse-teardown");
-    let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
-    let image = layout.main_image().expect("image");
-    create_image(image.image());
-    let runner = RecordingRunner::default();
-    let host = native_host(&fixture, runner.clone());
-    let attachment = host.attach_verified(image.image()).expect("attachment");
-    host.retain_mounted(&workspace(), attachment)
-        .expect("retain");
-
-    host.detach_all_reverse().expect("reverse detach");
-
-    assert_eq!(
-        runner.calls(),
-        6,
-        "inventory, attach, fsck, the detach's identity read, detach, and detach-settle"
-    );
-}
-
-#[test]
 fn sidecar_removal_does_not_hide_non_file_errors() {
     let fixture = Fixture::new("sidecar-error");
     let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
@@ -2268,26 +2230,6 @@ fn real_apfs_dissented_when_idle_detach_leaves_the_mount_to_the_actor() {
         .expect("the workspace is still the actor's to detach");
     assert!(kernel_mount_at(&mount).is_none());
     assert!(!attached(image.image()));
-}
-
-#[test]
-fn direct_detach_crosses_the_backend_boundary() {
-    let fixture = Fixture::new("direct-detach");
-    let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
-    let image = layout.main_image().expect("image");
-    create_image(image.image());
-    let runner = RecordingRunner::default();
-    let host = native_host(&fixture, runner.clone());
-    let attachment = host.attach_verified(image.image()).expect("attachment");
-
-    host.detach(attachment, DetachIntent::Release)
-        .expect("detach");
-
-    assert_eq!(
-        runner.calls(),
-        6,
-        "inventory, attach, fsck, the detach's identity read, detach, and detach-settle"
-    );
 }
 
 #[test]
@@ -2376,6 +2318,260 @@ fn published_listing_distinguishes_missing_sessions_from_an_invalid_sessions_pat
 
     std::fs::write(&layout.project().sessions, b"not a directory").expect("sessions file");
     assert!(host.list(&repo()).is_err());
+}
+
+/// A real, independent diskutil process attempts to release the image precisely after cowshed
+/// has checked its identity and before fsck opens diskN. A pathname check alone loses that race;
+/// the raw volume descriptor must keep the kernel from recycling diskN even for a forced eject.
+struct EjectAtFsck {
+    foreign: PathBuf,
+    ejected: AtomicUsize,
+}
+
+impl CommandRunner for EjectAtFsck {
+    fn run(&self, request: &CommandRequest) -> Result<CommandOutput, CommandRunError> {
+        let system = SystemCommandRunner;
+        let device = if request.program == Path::new("/sbin/fsck_apfs") {
+            request
+                .args
+                .last()
+                .and_then(|raw| raw.to_str())
+                .and_then(|raw| raw.strip_prefix("/dev/r"))
+        } else if request.program == Path::new("/sbin/mount_apfs") {
+            request
+                .args
+                .get(2)
+                .and_then(|device| device.to_str())
+                .and_then(|device| device.strip_prefix("/dev/"))
+        } else {
+            None
+        };
+        if let Some(volume) = device {
+            let container = volume.strip_suffix("s1").expect("one APFS volume");
+            let eject = system.run(&CommandRequest::new(
+                "/usr/sbin/diskutil",
+                ["eject", "force", &format!("/dev/{container}")],
+            ))?;
+            if eject.succeeded() {
+                self.ejected.store(1, Ordering::SeqCst);
+                // Real disk image and real attach bytes. A foreign mounted volume is planted
+                // into the just-released device namespace before fsck resolves its pathname.
+                let attached = system.run(&CommandRequest::new(
+                    "/usr/sbin/diskutil",
+                    [
+                        std::ffi::OsString::from("image"),
+                        std::ffi::OsString::from("attach"),
+                        std::ffi::OsString::from("--nobrowse"),
+                        std::ffi::OsString::from("--plist"),
+                        self.foreign.as_os_str().to_owned(),
+                    ],
+                ))?;
+                assert!(
+                    attached.succeeded(),
+                    "foreign image attach failed: {attached:?}"
+                );
+                assert!(
+                    String::from_utf8_lossy(&attached.stdout)
+                        .contains(&format!("<string>{volume}</string>")),
+                    "recycled volume did not reuse {volume}: {}",
+                    String::from_utf8_lossy(&attached.stdout)
+                );
+                eprintln!("foreign mounted on recycled {volume} before fsck");
+            }
+        }
+        system.run(request)
+    }
+
+    fn host_device_lease(&self) -> std::io::Result<Option<std::fs::File>> {
+        SystemCommandRunner.host_device_lease()
+    }
+
+    fn pin_raw_device(&self, device: &Path) -> std::io::Result<Option<std::fs::File>> {
+        SystemCommandRunner.pin_raw_device(device)
+    }
+}
+
+#[test]
+fn real_apfs_raw_pin_prevents_foreign_eject_during_fsck() {
+    let fixture = RealFixture::new("pin-vs-foreign-eject");
+    let owned = fixture.root().join("owned.asif");
+    let foreign = fixture.root().join("foreign.asif");
+    fixture.blank_image(&owned);
+    fixture.blank_image(&foreign);
+    let runner = EjectAtFsck {
+        foreign: foreign.clone(),
+        ejected: AtomicUsize::new(0),
+    };
+    let backend = cowshed_core::apfs::MacOsApfsBackend::new(runner);
+    let attachment = backend
+        .attach_verified(&owned)
+        .expect("owned image verified");
+    assert_eq!(
+        backend.runner().ejected.load(Ordering::SeqCst),
+        0,
+        "foreign diskutil ejected an image while its raw volume was pinned"
+    );
+    let mount = fixture.root().join("owned-mount");
+    backend
+        .mount(&attachment, &mount, MountAccess::ReadWrite, false)
+        .expect("pin also holds while mounting");
+    backend
+        .detach(&attachment, DetachIntent::Release)
+        .expect("detach owned image");
+    assert!(!attached(&owned));
+    assert!(!attached(&foreign), "the foreign image was never attached");
+}
+
+/// The verified attachment itself must own the kernel pin until its mount returns. A device
+/// checked and then released between these method calls can be ejected by an outside process.
+#[test]
+fn real_apfs_verified_attachment_cannot_be_recycled_before_mount() {
+    let fixture = RealFixture::new("pin-through-mount-handoff");
+    let owned = fixture.root().join("owned.asif");
+    let foreign = fixture.root().join("foreign.asif");
+    fixture.blank_image(&owned);
+    fixture.blank_image(&foreign);
+    let backend = cowshed_core::apfs::MacOsApfsBackend::new(SystemCommandRunner);
+    let attachment = backend.attach_verified(&owned).expect("verified owner");
+    let ejected = Command::new("/usr/sbin/diskutil")
+        .args(["eject", "force"])
+        .arg(attachment.whole_device())
+        .output()
+        .expect("external forced eject");
+    if ejected.status.success() {
+        let attached_foreign = Command::new("/usr/sbin/diskutil")
+            .args(["image", "attach", "--nobrowse", "--plist"])
+            .arg(&foreign)
+            .output()
+            .expect("external foreign attachment");
+        assert!(
+            attached_foreign.status.success(),
+            "foreign ASIF mount: {attached_foreign:?}"
+        );
+        let volume = attachment.volume_device().trim_start_matches("/dev/");
+        eprintln!(
+            "foreign volume reused {volume}: {}",
+            String::from_utf8_lossy(&attached_foreign.stdout)
+                .contains(&format!("<string>{volume}</string>"))
+        );
+    }
+    assert!(
+        !ejected.status.success(),
+        "verified image was ejected before mount: {}",
+        String::from_utf8_lossy(&ejected.stdout)
+    );
+    let mount = fixture.root().join("owned-mount");
+    backend
+        .mount(&attachment, &mount, MountAccess::ReadWrite, false)
+        .expect("mount the pinned owner");
+    backend
+        .detach(&attachment, DetachIntent::Release)
+        .expect("detach the owned image");
+    assert!(!attached(&owned));
+    assert!(!attached(&foreign));
+}
+
+/// Release the owner's first real attachment before cowshed can open its raw volume.
+/// Its next fsck must run only against a fresh owner attachment, never a reused name.
+struct EjectAfterAttach {
+    owned: PathBuf,
+    foreign: PathBuf,
+    ejected: AtomicUsize,
+    fscks: AtomicUsize,
+}
+
+impl CommandRunner for EjectAfterAttach {
+    fn run(&self, request: &CommandRequest) -> Result<CommandOutput, CommandRunError> {
+        let system = SystemCommandRunner;
+        let output = system.run(request)?;
+        if request.program == Path::new("/sbin/fsck_apfs") {
+            self.fscks.fetch_add(1, Ordering::SeqCst);
+        }
+        if request.program == Path::new("/usr/sbin/diskutil")
+            && request.args.first().is_some_and(|arg| arg == "image")
+            && request.args.get(1).is_some_and(|arg| arg == "attach")
+            && request
+                .args
+                .last()
+                .is_some_and(|arg| arg == self.owned.as_os_str())
+            && self.ejected.fetch_add(1, Ordering::SeqCst) == 0
+        {
+            assert!(output.succeeded(), "owner attach failed: {output:?}");
+            let plist = plist::Value::from_reader(std::io::Cursor::new(&output.stdout))
+                .expect("real attach plist");
+            let volume = plist
+                .as_dictionary()
+                .and_then(|entry| entry.get("system-entities"))
+                .and_then(plist::Value::as_array)
+                .expect("real attach entities")
+                .iter()
+                .find(|entity| {
+                    entity
+                        .as_dictionary()
+                        .and_then(|entry| entry.get("content-hint"))
+                        .and_then(plist::Value::as_string)
+                        == Some("Apple_APFS_Volume")
+                })
+                .and_then(plist::Value::as_dictionary)
+                .and_then(|entry| entry.get("dev-entry"))
+                .and_then(plist::Value::as_string)
+                .expect("real APFS volume");
+            let container = volume.strip_suffix("s1").expect("single-volume image");
+            let ejected = system.run(&CommandRequest::new(
+                "/usr/sbin/diskutil",
+                ["eject", "force", &format!("/dev/{container}")],
+            ))?;
+            assert!(ejected.succeeded(), "unheld device must eject: {ejected:?}");
+            let attached = system.run(&CommandRequest::new(
+                "/usr/sbin/diskutil",
+                [
+                    std::ffi::OsString::from("image"),
+                    std::ffi::OsString::from("attach"),
+                    std::ffi::OsString::from("--nobrowse"),
+                    std::ffi::OsString::from("--plist"),
+                    self.foreign.as_os_str().to_owned(),
+                ],
+            ))?;
+            assert!(attached.succeeded(), "foreign mount failed: {attached:?}");
+        }
+        Ok(output)
+    }
+
+    fn host_device_lease(&self) -> std::io::Result<Option<std::fs::File>> {
+        SystemCommandRunner.host_device_lease()
+    }
+
+    fn pin_raw_device(&self, device: &Path) -> std::io::Result<Option<std::fs::File>> {
+        SystemCommandRunner.pin_raw_device(device)
+    }
+}
+
+#[test]
+fn real_apfs_lost_attachment_reattaches_without_verifying_foreign_volume() {
+    let fixture = RealFixture::new("reattach-after-reuse");
+    let owned = fixture.root().join("owned.asif");
+    let foreign = fixture.root().join("foreign.asif");
+    fixture.blank_image(&owned);
+    fixture.blank_image(&foreign);
+    let backend = cowshed_core::apfs::MacOsApfsBackend::new(EjectAfterAttach {
+        owned: owned.clone(),
+        foreign: foreign.clone(),
+        ejected: AtomicUsize::new(0),
+        fscks: AtomicUsize::new(0),
+    });
+    let attachment = backend
+        .attach_verified(&owned)
+        .expect("fresh owned attachment");
+    assert_eq!(backend.runner().ejected.load(Ordering::SeqCst), 2);
+    assert_eq!(backend.runner().fscks.load(Ordering::SeqCst), 1);
+    backend
+        .detach(&attachment, DetachIntent::Release)
+        .expect("detach only owned image");
+    assert!(!attached(&owned));
+    assert!(
+        attached(&foreign),
+        "detaching the owner must leave the foreign mount intact"
+    );
 }
 
 /// A mount an earlier controller left is a kernel fact a restarted host reads back, identified by

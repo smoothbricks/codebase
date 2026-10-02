@@ -257,6 +257,20 @@ loaded fleet a mount `mount_apfs` completes in about a second queued there for 6
 `diskutil eject <whole-device>`. The read-only `hdiutil info -plist` inventory is the one host view that maps an
 attached image's path to its devices (`diskutil image info` reports none), so it stays the attachment inventory.
 
+Disk device names are reusable, not image identities. A private per-user `/private/tmp/cowshed-apfs-device-<uid>.lock`
+(`flock`, regular owner-only 0600 file, opened without following symlinks) coordinates physical create, attach, format,
+mount and detach across independent cowshed processes. It does **not** constrain another user's disk tools. Before
+`fsck_apfs` or `mount_apfs`, cowshed opens the reported raw volume read-only, then verifies that the attachment
+inventory maps **both** its whole container and its volume to the exact image. A verified attachment owns that raw
+descriptor across the `attach_verified` → `mount` method boundary; it is released only after `mount_apfs` finishes or
+when the attachment is detached. On macOS an open raw volume prevents even an external `diskutil eject force` or
+`hdiutil detach -force` from releasing that image and recycling its device name. If the image lost the reported device
+before the descriptor could be pinned, cowshed performs at most one fresh attachment, and only when inventory shows no
+remaining attachment for that image. A conflicting or unreadable mapping fails closed, without running fsck on the
+reported device. No live-fsck option authorizes touching a foreign mounted container. Blank-image formatting keeps its
+image-to-whole-device check under the host lease; its exclusive formatter cannot share a raw-device descriptor with
+another opener.
+
 For every mounted attachment:
 
 - Session workspaces mount under the host-configured mount root at `<mount-root>/<owner>/<repo>/<workspace>`.

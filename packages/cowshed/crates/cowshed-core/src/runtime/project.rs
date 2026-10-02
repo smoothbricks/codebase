@@ -12398,6 +12398,12 @@ mod retired_recovery_tests {
         ) -> std::result::Result<crate::apfs::CommandOutput, crate::apfs::CommandRunError> {
             panic!("reclaiming a detached retired image ran a disk command: {request:?}");
         }
+        fn host_device_lease(&self) -> std::io::Result<Option<std::fs::File>> {
+            panic!("reclaiming a detached retired image requested the host APFS device lease");
+        }
+        fn pin_raw_device(&self, device: &Path) -> std::io::Result<Option<std::fs::File>> {
+            panic!("reclaiming a detached retired image pinned a raw APFS device: {device:?}");
+        }
     }
 
     /// `doctor` opens the project to inspect it. Its open must leave a retired image where it is

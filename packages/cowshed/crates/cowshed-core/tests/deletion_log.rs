@@ -30,6 +30,12 @@ impl CommandRunner for StubRunner {
     ) -> Result<CommandOutput, cowshed_core::apfs::CommandRunError> {
         Ok(CommandOutput::success(Vec::new()))
     }
+    fn host_device_lease(&self) -> std::io::Result<Option<std::fs::File>> {
+        Ok(None)
+    }
+    fn pin_raw_device(&self, _: &std::path::Path) -> std::io::Result<Option<std::fs::File>> {
+        Ok(None)
+    }
 }
 
 struct Fixture {
