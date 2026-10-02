@@ -38,10 +38,12 @@ Keep `targetDefaults.lint` limited to shared cache policy. Smoo's workspace poli
 commands, dependencies, inputs and outputs because they override source-aware inference for every project. Project-local
 `nx.targets.lint` declarations retain normal Nx override precedence.
 
-The plugin's own `nx run nx-plugin:test` aggregates four bounded Bun targets. Each uses Bun's `--shard=N/4` file
-partition, so every test file (including newly added files) runs in exactly one shard; a failed shard fails the
-aggregate. Keep each shard below the standard 120-second target deadline instead of hiding a slow full suite behind a
-larger timeout.
+The plugin's own `nx run nx-plugin:test` aggregates four bounded Bun targets. Each uses Bun's native
+`--timings=test-timings.json --shard=N/4` partition to balance measured per-file work, while normal discovery still runs
+every test file (including newly added files) exactly once. A failed shard fails the aggregate. The shard count,
+parallelism and standard 120-second target deadline stay unchanged. Refresh the portable timing manifest from this
+package directory with `bun test --timeout=30000 --timings=test-timings.json --update-timings`; it is scheduling data,
+not a test allowlist.
 
 ## Cargo Workspace Layouts
 

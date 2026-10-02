@@ -189,7 +189,7 @@
       "test-shard1": {
         "executor": "@smoothbricks/nx-plugin:bounded-exec",
         "options": {
-          "command": "bun test --timeout=30000 --shard=1/4",
+          "command": "bun test --timeout=30000 --timings=test-timings.json --shard=1/4",
           "cwd": "{projectRoot}",
           "timeoutMs": 120000,
           "killAfterMs": 10000.0
@@ -198,7 +198,7 @@
       "test-shard2": {
         "executor": "@smoothbricks/nx-plugin:bounded-exec",
         "options": {
-          "command": "bun test --timeout=30000 --shard=2/4",
+          "command": "bun test --timeout=30000 --timings=test-timings.json --shard=2/4",
           "cwd": "{projectRoot}",
           "timeoutMs": 120000,
           "killAfterMs": 10000.0
@@ -207,7 +207,7 @@
       "test-shard3": {
         "executor": "@smoothbricks/nx-plugin:bounded-exec",
         "options": {
-          "command": "bun test --timeout=30000 --shard=3/4",
+          "command": "bun test --timeout=30000 --timings=test-timings.json --shard=3/4",
           "cwd": "{projectRoot}",
           "timeoutMs": 120000,
           "killAfterMs": 10000.0
@@ -216,7 +216,7 @@
       "test-shard4": {
         "executor": "@smoothbricks/nx-plugin:bounded-exec",
         "options": {
-          "command": "bun test --timeout=30000 --shard=4/4",
+          "command": "bun test --timeout=30000 --timings=test-timings.json --shard=4/4",
           "cwd": "{projectRoot}",
           "timeoutMs": 120000,
           "killAfterMs": 10000.0
@@ -232,6 +232,7 @@
     "dist",
     "src",
     "nextest.toml",
+    "test-timings.json",
     "README.md",
     "loader.js",
     "generators.json",
