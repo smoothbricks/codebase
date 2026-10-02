@@ -402,6 +402,14 @@ nothing when nothing changed:
   `/private/cowshed/caches/{ttsc,go/build,go/mod}` whenever that directory exists, so every checkout on the machine,
   sandboxed or not, shares one warm cache. Without it, ttsc caches in the checkout's `.cache/ttsc` and Go keeps its
   defaults. A value the caller already exported wins.
+- Inside a cowshed sandbox, which names `COWSHED_DEVENV_CACHE`, `tooling/direnv/shared-devenv.ts` has devenv evaluate a
+  copy of its inputs (`tooling/direnv` and the local `path:` inputs `devenv.yaml` names) kept under a digest of their
+  content in that directory, with `HOME`, `TMPDIR` and the runtime directory fixed there, and moves the export back onto
+  the workspace before direnv imports it. devenv keys its evaluation on all of those paths, so a workspace that is a
+  copy of another checkout at a new path otherwise re-evaluates nixpkgs on its first shell entry; with the copy, every
+  workspace whose inputs match reuses one evaluation, and changing an input evaluates afresh. Host shells, a checkout
+  with `devenv.local.*`, `.env` or `~/.config/nixpkgs`, and a project whose enterShell tasks write into it evaluate in
+  place, and the shell says why.
 - The repository's local git config includes `tooling/workspace.gitconfig` by a path relative to the config file
   (`../tooling/workspace.gitconfig` in `.git/config`), so a copied checkout reads its own copy. An absolute include
   would name the checkout that wrote it, and git refuses to run when an include exists but cannot be read — the original
