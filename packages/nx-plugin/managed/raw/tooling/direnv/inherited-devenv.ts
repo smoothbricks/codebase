@@ -74,6 +74,7 @@ interface Artifact {
   readonly version: 1;
   readonly root: string;
   readonly paths: Readonly<Record<string, string>>;
+  readonly basis: string;
   readonly graphBasis: string;
   readonly watches: readonly Watch[];
   readonly watchBasis: string;
