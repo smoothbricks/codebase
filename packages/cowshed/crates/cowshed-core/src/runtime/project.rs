@@ -15052,7 +15052,7 @@ mod port_reservation_tests {
     }
 
     fn inventory(root: &std::path::Path) -> (NativeGatewayInventory, StorageLayout) {
-        let roots = CanonicalRoots::for_test(root.join("store"), root.join("caches"));
+        let roots = CanonicalRoots::at(root.join("store"), root.join("caches"));
         std::fs::create_dir_all(roots.store()).expect("store");
         std::fs::create_dir_all(roots.caches()).expect("caches");
         let repo = RepoId::parse("acme/widget").expect("repo");

@@ -1751,7 +1751,7 @@ mod tests {
             ));
             let home = root.join("home");
             fs::create_dir_all(&home).expect("fixture home");
-            let roots = CanonicalRoots::for_test(root.join("store"), root.join("caches"));
+            let roots = CanonicalRoots::at(root.join("store"), root.join("caches"));
             fs::create_dir_all(roots.store()).expect("fixture store");
             fs::create_dir_all(roots.caches()).expect("fixture caches");
             fs::create_dir_all(roots.telemetry()).expect("fixture telemetry");

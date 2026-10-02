@@ -652,6 +652,9 @@ pub enum MountGuardError {
     },
 }
 
+/// The store and cache roots one host serves: the machine-global volumes ([`Self::global`]) in
+/// production, or roots a caller provisioned itself ([`Self::at`]), such as a scratch store of
+/// real APFS images.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CanonicalRoots {
     store: PathBuf,
@@ -661,16 +664,10 @@ pub struct CanonicalRoots {
 
 impl CanonicalRoots {
     pub fn global() -> Self {
-        let store = PathBuf::from(STORE_ROOT);
-        Self {
-            caches: PathBuf::from(CACHES_ROOT),
-            telemetry: store.join("telemetry"),
-            store,
-        }
+        Self::at(PathBuf::from(STORE_ROOT), PathBuf::from(CACHES_ROOT))
     }
 
-    #[cfg(test)]
-    pub(crate) fn for_test(store: PathBuf, caches: PathBuf) -> Self {
+    pub fn at(store: PathBuf, caches: PathBuf) -> Self {
         let telemetry = store.join("telemetry");
         Self {
             store,
@@ -692,10 +689,12 @@ impl CanonicalRoots {
     }
 }
 
-/// Canonical host-storage roots whose APFS volumes were authoritatively validated in place.
+/// Host-storage roots a project runtime, gateway, or service opens on, with the home they were
+/// resolved for.
 ///
-/// This type is only constructed by the existing-only native validation boundary. Possession
-/// therefore attests that no provisioning was needed to use the returned machine-global roots.
+/// In production this is constructed only by the native boundaries that validated (or
+/// bootstrapped) the machine-global volumes in place, and every component downstream takes the
+/// value rather than resolving `$HOME` again: one open, one storage.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ValidatedHostStorage {
     home: PathBuf,
@@ -705,6 +704,10 @@ pub struct ValidatedHostStorage {
 impl ValidatedHostStorage {
     pub fn new(home: PathBuf, roots: CanonicalRoots) -> Self {
         Self { home, roots }
+    }
+
+    pub fn roots(&self) -> &CanonicalRoots {
+        &self.roots
     }
 
     pub fn home(&self) -> &Path {
