@@ -3437,6 +3437,10 @@ fn read_marker_no_follow(root: &Path) -> Result<Option<Vec<u8>>, HostError> {
 }
 
 #[cfg(test)]
+#[path = "../../../../tests/support/scratch_apfs.rs"]
+mod scratch_apfs;
+
+#[cfg(test)]
 mod tests {
     use std::cell::RefCell;
     use std::collections::BTreeMap;
@@ -3453,6 +3457,93 @@ mod tests {
     use super::*;
     use crate::storage::bootstrap::{BlockingJob, CACHES_ROOT, STORE_ROOT};
     use uuid::Uuid;
+
+    #[test]
+    fn real_apfs_inventory_survives_concurrent_image_teardown() {
+        use crate::apfs::{ApfsBackend, CreateImageRequest, MacOsApfsBackend, SystemCommandRunner};
+        use crate::metadata::ImageCapacity;
+
+        let root = scratch_apfs::ScratchRoot::new("inventory-teardown").expect("scratch root");
+        let backend = MacOsApfsBackend::new(SystemCommandRunner);
+        let image = backend
+            .create_staged_image(&CreateImageRequest {
+                staged_stem: root.path().join("transient"),
+                capacity: ImageCapacity::from_gibibytes(1),
+                volume_name: "cowshed-inventory-transient".to_owned(),
+                // SAFETY: getuid/getgid only read this process's credentials.
+                owner_uid: unsafe { libc::getuid() },
+                owner_gid: unsafe { libc::getgid() },
+            })
+            .expect("create a real case-sensitive ASIF image");
+
+        // Exercise the production read-only planner, not installation validation: a hosted
+        // runner need not have cowshed.store/cowshed.caches. The actual home device and its
+        // container must remain the selection anchor while an unrelated image disappears.
+        let home = std::env::home_dir().expect("home directory");
+        let snapshot = system_statfs(&home).expect("home filesystem");
+        assert_eq!(snapshot.fs_type, "apfs");
+        let device = exact_device_identifier(&snapshot.mount_source).expect("home device");
+        let expected = select_substrate(
+            StatFsEvidence::Apfs {
+                mount_source: snapshot.mount_source,
+                container: Some(container_reference_of(&device).expect("home container")),
+            },
+            None,
+        )
+        .expect("home APFS selection");
+        let mut source = SystemEvidenceSource {
+            host: &SystemBootstrapHost,
+        };
+        for _ in 0..8 {
+            let attached = Command::new(DISKUTIL)
+                .args(["image", "attach", "--noMount", "--plist"])
+                .arg(&image)
+                .output()
+                .expect("attach real image");
+            assert!(
+                attached.status.success(),
+                "diskutil image attach: {}",
+                String::from_utf8_lossy(&attached.stderr)
+            );
+            let device = plist::Value::from_reader(std::io::Cursor::new(&attached.stdout))
+                .expect("attach plist")
+                .as_dictionary()
+                .and_then(|dict| dict.get("system-entities"))
+                .and_then(plist::Value::as_array)
+                .and_then(|entities| {
+                    entities
+                        .iter()
+                        .filter_map(|entity| entity.as_dictionary()?.get("dev-entry")?.as_string())
+                        .find(|entry| {
+                            entry
+                                .strip_prefix("/dev/")
+                                .unwrap_or(entry)
+                                .strip_prefix("disk")
+                                .is_some_and(|digits| {
+                                    !digits.is_empty()
+                                        && digits.bytes().all(|byte| byte.is_ascii_digit())
+                                })
+                        })
+                })
+                .expect("whole attached disk")
+                .to_owned();
+            let detach = std::thread::spawn(move || {
+                let output = Command::new(DISKUTIL)
+                    .args(["eject", &device])
+                    .output()
+                    .expect("eject real image");
+                assert!(
+                    output.status.success(),
+                    "diskutil eject: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            });
+            let plan = plan_existing_host_storage(&mut source, &home);
+            detach.join().expect("detach worker");
+            let plan = plan.expect("home inventory must survive unrelated APFS teardown");
+            assert_eq!(plan.substrate(), &expected);
+        }
+    }
 
     fn mount_service_pins() -> Vec<FstabPin> {
         vec![

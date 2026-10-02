@@ -158,6 +158,11 @@ and the pool exported on teardown; the Linux leg also exercises `cowshed-helper`
 suite-level guard reaps leaked `cowshed.itest.*` volumes/pools. The same flow table runs on both; substrate-specific
 assertions (fsck step on APFS, origin-snapshot GC on ZFS) are tagged.
 
+The native inventory teardown regression runs the production read-only host-storage planner against the real home device
+while ejecting a disposable ASIF image. It asserts that the selected home device and container remain unchanged; it does
+not require machine-global `cowshed.store`/`cowshed.caches` installation on an ephemeral runner. Installation validation
+remains a separate contract and still refuses missing storage.
+
 The CLI dispatch tier opens a real `ActorBridge` on caller-owned APFS images and the same persisted workspace/project
 grant stores as a normal controller. It tests grant denial without a write, grant survival across runtime restart, a
 real gateway's reconciliation of revised grants and raced ports, and checked landing's gateway-absent refusal followed
