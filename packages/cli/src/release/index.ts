@@ -68,6 +68,7 @@ import {
   divergedReleaseBranchMessage,
   type GitReleaseTagInfo,
   pendingReleaseTargets,
+  RELEASE_BUMPS,
   type ReleasePackageInfo,
   releaseTag,
   releaseTagAliases,
@@ -1932,8 +1933,8 @@ async function gitRemoteExists(root: string, remote: string): Promise<boolean> {
 }
 
 function releaseBumpArg(bump = 'auto'): string {
-  if (!['auto', 'patch', 'minor', 'major', 'prerelease'].includes(bump)) {
-    throw new Error(`Invalid --bump "${bump}". Expected auto, patch, minor, major, or prerelease.`);
+  if (!RELEASE_BUMPS.some((allowed) => allowed === bump)) {
+    throw new Error(`Invalid --bump "${bump}". Expected ${RELEASE_BUMPS.join(', ')}.`);
   }
   return bump;
 }

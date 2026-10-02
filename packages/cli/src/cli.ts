@@ -1,5 +1,5 @@
 import { resolve } from 'node:path';
-import { Command, CommanderError } from 'commander';
+import { Command, CommanderError, InvalidArgumentError, Option } from 'commander';
 import { variants } from './generate/index.js';
 import { dispatchCiWorkflow, ensureCiPullRequest } from './github-ci/api.js';
 import { cliPackageVersion } from './lib/cli-package.js';
@@ -7,6 +7,7 @@ import { decode, findRepoRoot, printCommandOutput } from './lib/run.js';
 import { checkPublicDenylist } from './monorepo/public-denylist.js';
 import { ensureChromium, runWithChromium } from './playwright/index.js';
 import { resolvePrConflicts } from './pr/index.js';
+import { RELEASE_BUMPS } from './release/core.js';
 import { secretsSet, secretsStatus, secretsSync } from './secrets/commands.js';
 import { secretsRun } from './secrets/run.js';
 import {
@@ -18,6 +19,7 @@ import {
 } from './wrangler/deploy-stage.js';
 import { deployedVersion } from './wrangler/deployed-version.js';
 import { scaffold } from './wrangler/scaffold.js';
+import { type DeploymentStage, parseDeploymentStage, parsePullRequestNumber } from './wrangler/stage.js';
 
 export async function runCli(argv = process.argv.slice(2)): Promise<void> {
   const program = buildProgram();
@@ -160,16 +162,18 @@ function buildProgram(): Command {
   monorepo
     .command('sync-bun-lockfile-versions')
     .option('--stage', 'stage bun.lock when versions were resynced; quiet when clean')
-    .option(
-      '--mode <mode>',
-      'install: match package.json (default, CI); publish: map unpublished -next to last stable tag (pre-pack only)',
-      'install',
+    .addOption(
+      new Option(
+        '--mode <mode>',
+        'install: match package.json (default, CI); publish: map unpublished -next to last stable tag (pre-pack only)',
+      )
+        .choices(['install', 'publish'])
+        .default('install'),
     )
-    .action(async (options: { stage?: boolean; mode?: 'install' | 'publish' }) => {
+    .action(async (options: { stage?: boolean; mode: 'install' | 'publish' }) => {
       const { syncBunLockfileVersions } = await import('./monorepo/index.js');
-      const mode = options.mode === 'publish' ? 'publish' : 'install';
       syncBunLockfileVersions(await findRepoRoot(), {
-        mode,
+        mode: options.mode,
         ...(options.stage ? { log: false, stage: true } : {}),
       });
     });
@@ -236,18 +240,18 @@ function buildProgram(): Command {
   release
     .command('repair-pending')
     .description('Repair incomplete older release commits before releasing the current HEAD')
-    .option('--dry-run [dryRun]', 'run without pushing, publishing, or writing GitHub Releases')
+    .option('--dry-run [dryRun]', 'run without pushing, publishing, or writing GitHub Releases', dryRunOption)
     .option('--ref <ref>', 'fixed release graph ref to inspect')
     .option('--platform-outputs <paths>', 'comma-separated cross-platform repair output roots grouped by release SHA')
-    .action(async (options: { dryRun?: string | boolean; platformOutputs?: string; ref?: string }) => {
+    .action(async (options: { dryRun?: boolean; platformOutputs?: string; ref?: string }) => {
       // The source self-hosting shim has no Typia transform; release commands import transformed output validators.
       const { releaseRepairPending } = await import('./release/index.js');
-      await releaseRepairPending(await findRepoRoot(), { ...options, dryRun: booleanOption(options.dryRun) });
+      await releaseRepairPending(await findRepoRoot(), { ...options, dryRun: options.dryRun === true });
     });
   release
     .command('build-platform-outputs')
     .description('Build selected current and pending-release platform outputs')
-    .requiredOption('--bump <bump>', 'auto, patch, minor, major, or prerelease')
+    .addOption(bumpOption().makeOptionMandatory())
     .option(
       '--projects <projects>',
       'comma-separated Nx projects to release, or all for every owned release package; blank releases package-local changes',
@@ -273,43 +277,43 @@ function buildProgram(): Command {
   release
     .command('version')
     .description('Bump release package versions and create the release commit; writes no tags')
-    .option('--bump <bump>', 'auto, patch, minor, major, or prerelease', 'auto')
+    .addOption(bumpOption().default('auto'))
     .option(
       '--projects <projects>',
       'comma-separated Nx projects to release, or all for every owned release package; blank releases package-local changes',
     )
-    .option('--dry-run [dryRun]', 'preview the bump without writing versions or a release commit')
+    .option('--dry-run [dryRun]', 'preview the bump without writing versions or a release commit', dryRunOption)
     .option('--github-output <path>', 'append mode=<mode> and projects=<nx-projects> to a GitHub Actions output file')
-    .action(async (options: { bump: string; projects?: string; dryRun?: string | boolean; githubOutput?: string }) => {
+    .action(async (options: { bump: string; projects?: string; dryRun?: boolean; githubOutput?: string }) => {
       const { releaseVersion } = await import('./release/index.js');
       await releaseVersion(await findRepoRoot(), {
         bump: options.bump,
         projects: options.projects,
-        dryRun: booleanOption(options.dryRun),
+        dryRun: options.dryRun === true,
         githubOutput: options.githubOutput,
       });
     });
   release
     .command('tag')
     .description('Create the release tags for the release commit at HEAD')
-    .option('--dry-run [dryRun]', 'report the tags without creating them')
-    .action(async (options: { dryRun?: string | boolean }) => {
+    .option('--dry-run [dryRun]', 'report the tags without creating them', dryRunOption)
+    .action(async (options: { dryRun?: boolean }) => {
       const { releaseCreateTags } = await import('./release/index.js');
-      await releaseCreateTags(await findRepoRoot(), { dryRun: booleanOption(options.dryRun) });
+      await releaseCreateTags(await findRepoRoot(), { dryRun: options.dryRun === true });
     });
   release
     .command('publish')
-    .option('--bump <bump>', 'auto, patch, minor, major, or prerelease', 'auto')
-    .option('--dry-run [dryRun]', 'run without pushing, publishing, or writing GitHub Releases')
+    .addOption(bumpOption().default('auto'))
+    .option('--dry-run [dryRun]', 'run without pushing, publishing, or writing GitHub Releases', dryRunOption)
     .option(
       '--prebuilt <directories...>',
       'publish only outputs matching the collected artifact manifests in these directories',
     )
-    .action(async (options: { bump: string; dryRun?: string | boolean; prebuilt?: string[] }) => {
+    .action(async (options: { bump: string; dryRun?: boolean; prebuilt?: string[] }) => {
       const { releasePublish } = await import('./release/index.js');
       await releasePublish(await findRepoRoot(), {
         ...options,
-        dryRun: booleanOption(options.dryRun),
+        dryRun: options.dryRun === true,
         prebuilt: options.prebuilt,
       });
     });
@@ -331,7 +335,7 @@ function buildProgram(): Command {
     .option('--dispatch', 'push moved tags and start publish.yml with bump=auto')
     .option('--remote <remote>', 'git remote used for pushed tags')
     .option('--branch <branch>', 'branch used for publish workflow dispatch')
-    .option('--dry-run [dryRun]', 'validate and print the retag operation without mutating refs')
+    .option('--dry-run [dryRun]', 'validate and print the retag operation without mutating refs', dryRunOption)
     .action(
       async (
         tags: string[],
@@ -341,7 +345,7 @@ function buildProgram(): Command {
           dispatch?: boolean;
           remote?: string;
           branch?: string;
-          dryRun?: string | boolean;
+          dryRun?: boolean;
         },
       ) => {
         const { releaseRetagUnpublished } = await import('./release/index.js');
@@ -352,7 +356,7 @@ function buildProgram(): Command {
           dispatch: options.dispatch === true,
           remote: options.remote,
           branch: options.branch,
-          dryRun: booleanOption(options.dryRun),
+          dryRun: options.dryRun === true,
         });
       },
     );
@@ -360,14 +364,14 @@ function buildProgram(): Command {
     .command('bootstrap-npm-packages')
     .alias('bootstrap')
     .description('Publish minimal npm placeholder packages so trusted publishing can be configured')
-    .option('--dry-run [dryRun]', 'show placeholder publishes without logging in or publishing')
+    .option('--dry-run [dryRun]', 'show placeholder publishes without logging in or publishing', dryRunOption)
     .option('--skip-login', 'skip npm browser login before publishing placeholders')
     .option('--otp <otp>', 'npm one-time password for placeholder publish operations')
     .option('--package <name...>', 'only bootstrap the selected owned release package names')
-    .action(async (options: { dryRun?: string | boolean; skipLogin?: boolean; otp?: string; package?: string[] }) => {
+    .action(async (options: { dryRun?: boolean; skipLogin?: boolean; otp?: string; package?: string[] }) => {
       const { releaseBootstrapNpmPackages } = await import('./release/index.js');
       await releaseBootstrapNpmPackages(await findRepoRoot(), {
-        dryRun: booleanOption(options.dryRun),
+        dryRun: options.dryRun === true,
         skipLogin: options.skipLogin === true,
         otp: options.otp,
         packages: options.package ?? [],
@@ -376,14 +380,14 @@ function buildProgram(): Command {
   release
     .command('trust-publisher')
     .description('Configure npm trusted publishing for owned release packages')
-    .option('--dry-run [dryRun]', 'show npm trust changes without saving them')
+    .option('--dry-run [dryRun]', 'show npm trust changes without saving them', dryRunOption)
     .option('--bootstrap', 'publish missing npm placeholder packages before configuring trust')
     .option('--bootstrap-otp <otp>', 'npm one-time password for placeholder publishes during --bootstrap')
     .option('--skip-login', 'skip npm browser login before publishing placeholders during --bootstrap')
     .option('--package <name...>', 'only configure the selected owned release package names')
     .action(
       async (options: {
-        dryRun?: string | boolean;
+        dryRun?: boolean;
         bootstrap?: boolean;
         bootstrapOtp?: string;
         skipLogin?: boolean;
@@ -391,7 +395,7 @@ function buildProgram(): Command {
       }) => {
         const { releaseTrustPublisher } = await import('./release/index.js');
         await releaseTrustPublisher(await findRepoRoot(), {
-          dryRun: booleanOption(options.dryRun),
+          dryRun: options.dryRun === true,
           bootstrap: options.bootstrap === true,
           bootstrapOtp: options.bootstrapOtp,
           skipLogin: options.skipLogin === true,
@@ -463,7 +467,7 @@ function buildProgram(): Command {
     .requiredOption('--target <target>')
     .option('--name <name>')
     .option('--step <step>')
-    .option('--mode <mode>', 'auto, affected, or run-many', 'auto')
+    .addOption(new Option('--mode <mode>', 'how Nx selects projects').choices(NX_MODES).default('auto'))
     .option('--configuration <configuration>')
     .option('--stage <stage>')
     .option('--stream-output', 'stream Nx task output without prefixes')
@@ -472,7 +476,7 @@ function buildProgram(): Command {
         target: string;
         name?: string;
         step?: string;
-        mode?: 'auto' | 'affected' | 'run-many';
+        mode: (typeof NX_MODES)[number];
         configuration?: string;
         stage?: string;
         streamOutput?: boolean;
@@ -510,16 +514,16 @@ function buildProgram(): Command {
     });
   githubCi
     .command('nx-deploy')
-    .option('--stage <stage>', 'explicit staging, production, or prN override')
-    .option('--mode <mode>', 'auto, affected, or run-many', 'run-many')
+    .option('--stage <stage>', 'explicit staging, production, or prN override', usageArgument(parseDeploymentStage))
+    .addOption(new Option('--mode <mode>', 'how Nx selects projects').choices(NX_MODES).default('run-many'))
     .option('--name <name>')
     .option('--step <step>')
     .option('--verify', 'run build, lint, and test before deploy')
     .option('--select-tag <tag>', 'deploy only projects carrying this nx tag')
     .action(
       async (options: {
-        stage?: string;
-        mode?: 'auto' | 'affected' | 'run-many';
+        stage?: DeploymentStage;
+        mode: (typeof NX_MODES)[number];
         name?: string;
         step?: string;
         verify?: boolean;
@@ -639,10 +643,10 @@ function buildProgram(): Command {
     });
   wrangler
     .command('deploy-stage')
-    .requiredOption('--stage <stage>', 'staging, production, or prN')
+    .requiredOption('--stage <stage>', 'staging, production, or prN', usageArgument(parseDeploymentStage))
     .option('--config <path>', "deploy a build-generated flat wrangler.json instead of the project's own config")
     .option('--version-endpoint <url>', 'URL served by this worker whose trimmed body is the running version tag')
-    .action(async (options: { stage: string; config?: string; versionEndpoint?: string }) => {
+    .action(async (options: { stage: DeploymentStage; config?: string; versionEndpoint?: string }) => {
       await deployStage(process.cwd(), {
         stage: options.stage,
         repositoryRoot: await findRepoRoot(),
@@ -653,10 +657,10 @@ function buildProgram(): Command {
   wrangler
     .command('deployed-version')
     .description('Print the version tag serving all traffic for this project\u2019s worker on a stage')
-    .requiredOption('--stage <stage>', 'staging, production, or prN')
+    .requiredOption('--stage <stage>', 'staging, production, or prN', usageArgument(parseDeploymentStage))
     .option('--config <path>', 'resolve the worker name from a build-generated flat wrangler.json')
     .option('--refresh', 'ask Cloudflare even when a fresh cached answer exists')
-    .action(async (options: { stage: string; config?: string; refresh?: boolean }) => {
+    .action(async (options: { stage: DeploymentStage; config?: string; refresh?: boolean }) => {
       const report = await deployedVersion(process.cwd(), {
         stage: options.stage,
         ...(options.config ? { config: resolve(options.config) } : {}),
@@ -669,12 +673,12 @@ function buildProgram(): Command {
   wrangler
     .command('cleanup-pr')
     .description('Delete what the deploys of this repository\u2019s prN stage recorded, then those records')
-    .requiredOption('--pr <number>', 'pull-request number')
+    .requiredOption('--pr <number>', 'pull-request number', usageArgument(parsePullRequestNumber))
     .option('--dry-run', 'list what cleanup would delete and delete nothing')
     .option('--json', 'write the result as JSON instead of a sentence')
-    .action(async (options: { pr: string; dryRun?: boolean; json?: boolean }) => {
+    .action(async (options: { pr: number; dryRun?: boolean; json?: boolean }) => {
       const root = await findRepoRoot();
-      const pr = Number(options.pr);
+      const { pr } = options;
       const json = options.json === true;
       if (options.dryRun === true) {
         const inventory = await inventoryPullRequest(root, pr);
@@ -688,6 +692,35 @@ function buildProgram(): Command {
   return program;
 }
 
-function booleanOption(value: string | boolean | undefined): boolean {
-  return value === true || value === 'true';
+const NX_MODES = ['auto', 'affected', 'run-many'] as const;
+
+function bumpOption(): Option {
+  return new Option('--bump <bump>', 'how far to bump each released package').choices(RELEASE_BUMPS);
+}
+
+/**
+ * Commander's parser for a value only a domain parser can judge. A value it refuses becomes a usage
+ * error, which commander prints as one line before the command runs (`error: option '--pr <number>'
+ * argument '0' is invalid.` and the parser's reason) and exits 1, where a throw from inside the
+ * command would print a stack that names smoo's own call sites instead of what was wrong.
+ */
+function usageArgument<T>(parse: (value: string) => T): (value: string) => T {
+  return (value) => {
+    try {
+      return parse(value);
+    } catch (error) {
+      if (error instanceof Error) throw new InvalidArgumentError(error.message);
+      throw error;
+    }
+  };
+}
+
+/**
+ * `--dry-run` alone, or `--dry-run true|false` from a workflow input. Anything else is refused: read
+ * as "not a dry run", a typo would publish.
+ */
+function dryRunOption(value: string): boolean {
+  if (value === 'true') return true;
+  if (value === 'false') return false;
+  throw new InvalidArgumentError('Expected true or false, or the flag alone.');
 }

@@ -6,13 +6,25 @@ import { derivedStagingName, hasStageLabel, replaceExactToken, replaceHostnameLa
 export type { DeploymentStage } from '@smoothbricks/nx-plugin/deploy-policy';
 
 const MAX_PULL_REQUEST_NUMBER = 999_999_999;
+const PULL_REQUEST_NUMBER_RULE = `Pull request number must be an integer from 1 through ${MAX_PULL_REQUEST_NUMBER}.`;
+/** 1 through 999999999 in decimal, the only way anyone writes a pull-request number. */
+const PULL_REQUEST_NUMBER_PATTERN = /^[1-9][0-9]{0,8}$/;
 const STAGE_PATTERN = /^(?:staging|production|pr[1-9][0-9]{0,8})$/;
 
 export function pullRequestStage(prNumber: number): `pr${number}` {
   if (!Number.isInteger(prNumber) || prNumber < 1 || prNumber > MAX_PULL_REQUEST_NUMBER) {
-    throw new Error(`Pull request number must be an integer from 1 through ${MAX_PULL_REQUEST_NUMBER}.`);
+    throw new Error(PULL_REQUEST_NUMBER_RULE);
   }
   return `pr${prNumber}`;
+}
+
+/**
+ * A pull-request number as it is written on the command line. `Number` alone also reads `1e3`,
+ * `0x10` and ` 7 ` as numbers, each naming a pull request nobody wrote.
+ */
+export function parsePullRequestNumber(value: string): number {
+  if (!PULL_REQUEST_NUMBER_PATTERN.test(value)) throw new Error(PULL_REQUEST_NUMBER_RULE);
+  return Number(value);
 }
 
 export function parseDeploymentStage(value: string): DeploymentStage {

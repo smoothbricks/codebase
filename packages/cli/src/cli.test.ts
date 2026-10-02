@@ -39,6 +39,14 @@ function gitFreeEnvironment(): Record<string, string> {
   return mergeEnv(undefined, ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_COMMON_DIR', 'GITHUB_REPOSITORY']);
 }
 
+/**
+ * The CLI exactly as it ships: `bin/smoo` running the built `dist`, which `nx run cli:test` builds
+ * first (the test target depends on `build`). A child that ran the source instead paid the typia
+ * transform of the whole CLI source graph in every process: 3-4 s per spawn in CI, and past the
+ * 30 s test timeout under load, where the built CLI starts in a fraction of a second.
+ */
+const SMOO = join(import.meta.dir, '..', 'bin', 'smoo');
+
 describe('smoo wrangler cleanup-pr', () => {
   it('scopes a cleanup started in a project directory by the workspace root, naming its manifest', async () => {
     // Real path: git reports the resolved root, and macOS's temporary directory is a symlink.
@@ -55,17 +63,7 @@ describe('smoo wrangler cleanup-pr', () => {
         join(project, 'package.json'),
         '{ "name": "@acme/web", "repository": "https://github.com/acme/app" }\n',
       );
-      // JavaScript, so the transform never looks for a tsconfig beside it.
-      const entry = join(root, 'smoo.mjs');
-      await writeFile(
-        entry,
-        `import { runCli } from ${JSON.stringify(join(import.meta.dir, 'cli.ts'))};\nawait runCli();\n`,
-      );
-
-      // The source runs only with typia's transform, which the workspace's own bunfig preloads.
-      const preload = Bun.resolveSync('@smoothbricks/validation/bun/preload', import.meta.dir);
-      const command = ['bun', '--preload', preload, entry, 'wrangler', 'cleanup-pr', '--pr', '7'];
-      const child = Bun.spawnSync(command, {
+      const child = Bun.spawnSync(['bun', SMOO, 'wrangler', 'cleanup-pr', '--pr', '7'], {
         cwd: project,
         env: gitFreeEnvironment(),
       });
@@ -79,7 +77,7 @@ describe('smoo wrangler cleanup-pr', () => {
 });
 
 /**
- * A workspace root, a project directory inside it, and a `smoo.mjs` entry whose `fetch` answers a
+ * A workspace root, a project directory inside it, and a `fake-cloudflare.mjs` preload whose `fetch` answers a
  * local fake Cloudflare: a pr7 stage holding one Worker and one R2 bucket (`stage`), or an account
  * with no record bucket at all (`empty`). For every scenario except `deleting`, any write, or any
  * read outside the fake's script, fails the child, so a green run proves the command only read.
@@ -98,7 +96,7 @@ async function cleanupCliRoot(): Promise<{
   await writeFile(join(root, 'package.json'), '{ "name": "@acme/app", "repository": "https://github.com/acme/app" }\n');
   const project = join(root, 'packages', 'web');
   await mkdir(project, { recursive: true });
-  const entry = join(root, 'smoo.mjs');
+  const fakeCloudflare = join(root, 'fake-cloudflare.mjs');
   const fake = `
 globalThis.fetch = async (input, init) => {
   const method = init?.method ?? 'GET';
@@ -138,16 +136,13 @@ globalThis.fetch = async (input, init) => {
   console.error(\`unexpected \${method} \${path}\`);
   process.exit(8);
 };
-const { runCli } = await import(${JSON.stringify(join(import.meta.dir, 'cli.ts'))});
-await runCli();
 `;
-  await writeFile(entry, fake);
-  const preload = Bun.resolveSync('@smoothbricks/validation/bun/preload', import.meta.dir);
+  await writeFile(fakeCloudflare, fake);
   return {
     root,
     project,
     run: (args: string[], env: Record<string, string> = {}) => {
-      const child = Bun.spawnSync(['bun', '--preload', preload, entry, ...args], {
+      const child = Bun.spawnSync(['bun', '--preload', fakeCloudflare, SMOO, ...args], {
         cwd: project,
         env: {
           ...gitFreeEnvironment(),
@@ -165,25 +160,13 @@ await runCli();
   };
 }
 
-/**
- * The child's stderr, minus the ttsc routing preload's benign notice ("directory mismatch ... you
- * don't need to do anything", ANSI-dimmed when Bun colorizes), which the CLI cannot suppress. Anything
- * left is a real complaint.
- */
-function realComplaints(stderr: string): string {
-  return stderr
-    .split('\n')
-    .filter((line) => line !== '' && !line.includes('directory mismatch for directory'))
-    .join('\n');
-}
-
 describe('smoo wrangler cleanup-pr --dry-run', () => {
   it('prints the JSON inventory of the recorded stage and writes nothing', async () => {
     const { root, run } = await cleanupCliRoot();
     try {
       const child = run(['wrangler', 'cleanup-pr', '--pr', '7', '--dry-run', '--json']);
 
-      expect(realComplaints(child.stderr)).toBe('');
+      expect(child.stderr).toBe('');
       expect(child.exitCode).toBe(0);
       expect(JSON.parse(child.stdout)).toEqual({
         stage: 'pr7',
@@ -211,7 +194,7 @@ describe('smoo wrangler cleanup-pr --dry-run', () => {
     try {
       const child = run(['wrangler', 'cleanup-pr', '--pr', '7', '--dry-run']);
 
-      expect(realComplaints(child.stderr)).toBe('');
+      expect(child.stderr).toBe('');
       expect(child.exitCode).toBe(0);
       expect(child.stdout).toBe(
         'Dry run for pr7 of github.com/acme/app from 2 records: would delete 1 Worker, 0 custom domains, 0 routes, 0 DNS records, 0 KV namespaces, 1 R2 bucket (2 objects), 0 D1 databases; 0 recorded items are already gone. Nothing was deleted.\n',
@@ -256,7 +239,7 @@ describe('smoo wrangler cleanup-pr --json', () => {
     try {
       const child = run(['wrangler', 'cleanup-pr', '--pr', '7', '--json'], { SMOO_TEST_SCENARIO: 'deleting' });
 
-      expect(realComplaints(child.stderr)).toBe('');
+      expect(child.stderr).toBe('');
       expect(child.exitCode).toBe(0);
       expect(JSON.parse(child.stdout)).toEqual({
         stage: 'pr7',
@@ -280,14 +263,23 @@ describe('smoo wrangler cleanup-pr --json', () => {
     }
   });
 
-  it('refuses an invalid PR before any network call, and prints no JSON at all', async () => {
+  it('refuses an invalid PR as a usage error before any network call, and prints no JSON at all', async () => {
     const { root, run } = await cleanupCliRoot();
     try {
-      const child = run(['wrangler', 'cleanup-pr', '--pr', '0', '--json']);
+      // `1e3` is a number to `Number`, which would have cleaned up pr1000.
+      for (const pr of ['0', '1e3']) {
+        const child = run(['wrangler', 'cleanup-pr', '--pr', pr, '--json']);
 
-      expect(child.exitCode).toBe(1);
-      expect(child.stdout).toBe('');
-      expect(realComplaints(child.stderr)).toContain('1 through 999999999');
+        expect(child.exitCode).toBe(1);
+        expect(child.stdout).toBe('');
+        // The first line names the option, the value given and the allowed range; the command's help
+        // follows, and no stack frame anywhere.
+        const [refusal] = child.stderr.split('\n');
+        expect(refusal).toContain('--pr');
+        expect(refusal).toContain(`'${pr}'`);
+        expect(refusal).toContain('1 through 999999999');
+        expect(child.stderr).not.toContain('    at ');
+      }
     } finally {
       await rm(root, { recursive: true, force: true });
     }

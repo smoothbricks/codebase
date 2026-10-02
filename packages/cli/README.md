@@ -35,18 +35,18 @@ smoo monorepo check
 smoo monorepo diff
 smoo monorepo validate-commit-msg <commit-msg-file>
 smoo monorepo check-public-denylist [revisions...]
-smoo monorepo sync-bun-lockfile-versions
+smoo monorepo sync-bun-lockfile-versions [--mode <install|publish>] [--stage]
 smoo monorepo list-release-packages [--fail-empty] [--github-output <path>]
 smoo monorepo validate-public-tags
 smoo monorepo setup-test-tracing (--all | --projects <projects>) [--dry-run]
 
 smoo release npm-status
-smoo release repair-pending [--dry-run]
-smoo release version --bump <auto|patch|minor|major|prerelease> [--projects <projects|all>] [--dry-run] [--github-output <path>]
-smoo release publish --bump <auto|patch|minor|major|prerelease> [--dry-run]
-smoo release retag-unpublished <tag...> [--to <ref>] [--push] [--dispatch] [--remote <remote>] [--branch <branch>] [--dry-run]
-smoo release bootstrap-npm-packages [--dry-run] [--skip-login] [--package <name...>]
-smoo release trust-publisher [--bootstrap] [--dry-run] [--skip-login] [--package <name...>]
+smoo release repair-pending [--dry-run [true|false]]
+smoo release version --bump <auto|patch|minor|major|prerelease> [--projects <projects|all>] [--dry-run [true|false]] [--github-output <path>]
+smoo release publish --bump <auto|patch|minor|major|prerelease> [--dry-run [true|false]]
+smoo release retag-unpublished <tag...> [--to <ref>] [--push] [--dispatch] [--remote <remote>] [--branch <branch>] [--dry-run [true|false]]
+smoo release bootstrap-npm-packages [--dry-run [true|false]] [--skip-login] [--package <name...>]
+smoo release trust-publisher [--bootstrap] [--dry-run [true|false]] [--skip-login] [--package <name...>]
 
 smoo secrets status [-R <owner/name|remote>] [--env <environment>] [--json]
 smoo secrets set [name] [-R <owner/name|remote>] [--env <environment>]
@@ -63,6 +63,12 @@ smoo github-ci ensure-pull-request --head <branch> --base <branch> --title <titl
 smoo playwright ensure chromium
 smoo playwright run <command> [args...]
 ```
+
+An option value smoo cannot honour is refused before the command runs, as one line naming the option, the value given
+and what it accepts, followed by the command's help; the exit status is 1. That covers `--pr` (an integer from 1 through
+999999999, in decimal), `--stage` on `wrangler deploy-stage`, `wrangler deployed-version` and `github-ci nx-deploy`
+(`staging`, `production` or `prN`), `--bump`, `--mode`, and a `--dry-run` value other than `true` or `false`: read as
+"not a dry run", a misspelled one would publish.
 
 ## Initialization
 

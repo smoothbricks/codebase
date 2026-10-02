@@ -1,3 +1,6 @@
+/** What `--bump` accepts: `auto` derives each package's bump from its commits; the rest force one. */
+export const RELEASE_BUMPS = ['auto', 'patch', 'minor', 'major', 'prerelease'] as const;
+
 export interface ReleasePackageInfo {
   name: string;
   projectName: string;
