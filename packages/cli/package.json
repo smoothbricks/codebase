@@ -163,11 +163,11 @@
         "inputs": [
           "default",
           "^production",
-          "{workspaceRoot}/packages/nx-plugin/managed/raw/tooling/direnv/shared-devenv.ts",
+          "{workspaceRoot}/packages/nx-plugin/managed/raw/tooling/direnv/inherited-devenv.ts",
           "{workspaceRoot}/tooling/direnv/devenv.lock"
         ],
         "options": {
-          "command": "bun test --timeout=1200000 ./src/monorepo/shared-devenv.devenv-test.ts",
+          "command": "bun test --timeout=1200000 ./src/monorepo/inherited-devenv.devenv-test.ts",
           "cwd": "{projectRoot}",
           "timeoutMs": 2700000,
           "killAfterMs": 10000.0

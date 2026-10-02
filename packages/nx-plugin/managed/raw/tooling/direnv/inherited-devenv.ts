@@ -1,4 +1,5 @@
 #!/usr/bin/env bun
+import { randomUUID } from 'node:crypto';
 /**
  * Managed by `smoo monorepo`. A cowshed clone inherits its origin's .devenv
  * along with the source tree. Reuse a real devenv export from that private
@@ -73,7 +74,7 @@ interface Artifact {
   readonly version: 1;
   readonly root: string;
   readonly paths: Readonly<Record<string, string>>;
-  readonly basis: string;
+  readonly graphBasis: string;
   readonly watches: readonly Watch[];
   readonly watchBasis: string;
   readonly toolchain: string;
@@ -139,9 +140,26 @@ export function relocations(
   return moves;
 }
 export function relocate(text: string, moves: readonly Relocation[]): string {
-  let result = text;
-  for (const { from, to } of moves) result = result.replaceAll(from, to);
-  return result;
+  // Match only the original export: a replacement can itself start with HOME,
+  // especially when a host's checkout lives below HOME.
+  let cursor = 0;
+  let result = '';
+  while (cursor < text.length) {
+    let next = text.length;
+    let selected: Relocation | undefined;
+    for (const move of moves) {
+      if (!move.from) continue;
+      const found = text.indexOf(move.from, cursor);
+      if (found !== -1 && (found < next || (found === next && move.from.length > (selected?.from.length ?? 0)))) {
+        next = found;
+        selected = move;
+      }
+    }
+    if (!selected) break;
+    result += text.slice(cursor, next) + selected.to;
+    cursor = next + selected.from.length;
+  }
+  return result + text.slice(cursor);
 }
 
 /** Local path inputs have Nix's layout; unknown YAML imports are not guessed. */
@@ -279,6 +297,21 @@ function watchedBasis(root: string, env: NodeJS.ProcessEnv, watches: readonly Wa
   return hash.digest('hex');
 }
 
+function graphBasis(dotfile: string): string {
+  const gc = path.join(dotfile, 'gc');
+  if (!lstatSync(dotfile).isDirectory() || !lstatSync(gc).isDirectory())
+    throw new Error('devenv state or GC root is not a private directory');
+  const graph = path.join(gc, 'task-config-devenv-config-task-config');
+  const link = lstatSync(graph);
+  if (
+    !link.isSymbolicLink() ||
+    !readlinkSync(graph).startsWith('/nix/store/') ||
+    !realpathSync(graph).startsWith('/nix/store/')
+  )
+    throw new Error(`task graph is not a Nix store link: ${graph}`);
+  return new Bun.CryptoHasher('sha256').update(readFileSync(graph)).digest('hex');
+}
+
 function readArtifact(file: string): Artifact | undefined {
   if (!lstatSync(file, { throwIfNoEntry: false })?.isFile()) return undefined;
   const value: unknown = JSON.parse(readFileSync(file, 'utf8'));
@@ -294,6 +327,8 @@ function readArtifact(file: string): Artifact | undefined {
     value.paths === null ||
     Array.isArray(value.paths) ||
     !('basis' in value) ||
+    !('graphBasis' in value) ||
+    typeof value.graphBasis !== 'string' ||
     typeof value.basis !== 'string' ||
     !('watches' in value) ||
     !Array.isArray(value.watches) ||
@@ -333,6 +368,7 @@ function readArtifact(file: string): Artifact | undefined {
     root: value.root,
     paths,
     basis: value.basis,
+    graphBasis: value.graphBasis,
     watches,
     watchBasis: value.watchBasis,
     toolchain: value.toolchain,
@@ -342,35 +378,36 @@ function readArtifact(file: string): Artifact | undefined {
 
 /** Check inherited data from this checkout only. A sibling cannot write this file or its GC roots. */
 function inherited(root: string, env: NodeJS.ProcessEnv, file: string): string | undefined {
+  if (!lstatSync(path.dirname(file), { throwIfNoEntry: false })?.isDirectory()) return undefined;
   const artifact = readArtifact(file);
   if (!artifact) return undefined;
   if (
     artifact.basis !== sourceBasis(root) ||
     artifact.toolchain !== toolchain(privateEnvironment(env)) ||
-    artifact.watchBasis !== watchedBasis(root, env, artifact.watches)
+    artifact.watchBasis !== watchedBasis(root, env, artifact.watches) ||
+    artifact.graphBasis !== graphBasis(path.join(root, DEVENV_DIR, '.devenv'))
   )
     return undefined;
   const graph = enterShellTasks(path.join(root, DEVENV_DIR, '.devenv'));
   if (graph.kind !== 'confined') return undefined;
-  const moves = relocations(artifact.root, artifact.paths, root, env);
   const dotfile = path.join(root, DEVENV_DIR, '.devenv');
+  const shell = path.join(dotfile, 'gc', 'shell');
+  if (!lstatSync(shell, { throwIfNoEntry: false })?.isSymbolicLink()) return undefined;
+  const target = readlinkSync(shell);
+  if (!target.startsWith('/nix/store/') || !realpathSync(shell).startsWith('/nix/store/')) return undefined;
+  const moves = relocations(artifact.root, artifact.paths, root, env);
+  const registered = Bun.spawnSync(['nix-store', '--realise', target, '--add-root', shell], {
+    env: privateEnvironment(env),
+    stdout: 'ignore',
+    stderr: 'inherit',
+  });
+  if (registered.exitCode !== 0) return undefined;
   const inputPaths = path.join(dotfile, 'input-paths.txt');
   if (existsSync(inputPaths)) {
-    const staged = `${inputPaths}.${process.pid}`;
-    writeFileSync(staged, relocate(readFileSync(inputPaths, 'utf8'), moves));
+    const staged = `${inputPaths}.${randomUUID()}`;
+    writeFileSync(staged, relocate(readFileSync(inputPaths, 'utf8'), moves), { flag: 'wx' });
     renameSync(staged, inputPaths);
   }
-  const shell = path.join(dotfile, 'gc', 'shell');
-  if (lstatSync(shell, { throwIfNoEntry: false })?.isSymbolicLink()) {
-    const target = readlinkSync(shell);
-    if (!target.startsWith('/nix/store/')) return undefined;
-    const registered = Bun.spawnSync(['nix-store', '--realise', target, '--add-root', shell], {
-      env,
-      stdout: 'ignore',
-      stderr: 'inherit',
-    });
-    if (registered.exitCode !== 0) return undefined;
-  } else return undefined;
   return `${relocate(artifact.export, moves)}\nunset DEVENV_TASK_FILE DEVENV_TASKS\n`;
 }
 
@@ -384,7 +421,9 @@ function strings(value: unknown): value is string[] {
   return Array.isArray(value) && value.every((item): item is string => typeof item === 'string');
 }
 /** Classify the real graph emitted by devenv, not script text or source names. */
-function enterShellTasks(dotfile: string): { kind: 'confined' } | { kind: 'writes'; reason: string } {
+function enterShellTasks(
+  dotfile: string,
+): { kind: 'confined'; names: ReadonlySet<string> } | { kind: 'writes'; reason: string } {
   const graph = path.join(dotfile, 'gc', 'task-config-devenv-config-task-config');
   let rows: unknown;
   try {
@@ -433,15 +472,15 @@ function enterShellTasks(dotfile: string): { kind: 'confined' } | { kind: 'write
     );
   });
   return writing.length === 0
-    ? { kind: 'confined' }
+    ? { kind: 'confined', names: new Set(tasks.keys()) }
     : { kind: 'writes', reason: `enterShell runs ${writing.sort().join(', ')}, which write into its evaluation root` };
 }
 
-/** Forward the live export; only an independently reproduced public export becomes inherited data. */
+/** Expose only a credential-free evaluated shell to future private COW clones. */
 export function exportShell(rootPath: string, args: readonly string[], env: NodeJS.ProcessEnv): number {
   const root = realpathSync(rootPath);
   const cwd = path.join(root, DEVENV_DIR);
-  if (args.at(-1) !== 'direnv-export' || !env.COWSHED_PORT_BASE) {
+  if (args.at(-1) !== 'direnv-export') {
     const live = Bun.spawnSync(['devenv', ...args], {
       cwd,
       env,
@@ -451,65 +490,120 @@ export function exportShell(rootPath: string, args: readonly string[], env: Node
     });
     return live.exitCode;
   }
+  const local = ['.env', 'devenv.local.nix', 'devenv.local.yaml', 'devenv.local.yml'];
+  const privateInputs =
+    local.some((name) => existsSync(path.join(cwd, name))) ||
+    (env.HOME && existsSync(path.join(env.HOME, '.config', 'nixpkgs')));
   const file = path.join(cwd, '.devenv', ARTIFACT);
-  try {
-    const cached = inherited(root, env, file);
-    if (cached !== undefined) {
-      process.stdout.write(cached);
-      console.error(
-        `inherited devenv: reused this checkout's evaluated shell from ${JSON.parse(readFileSync(file, 'utf8')).root}`,
-      );
-      return 0;
+  if (!privateInputs) {
+    try {
+      const cached = inherited(root, env, file);
+      if (cached !== undefined) {
+        process.stdout.write(cached);
+        console.error(
+          `inherited devenv: reused this checkout's evaluated shell from ${JSON.parse(readFileSync(file, 'utf8')).root}`,
+        );
+        return 0;
+      }
+    } catch (error) {
+      console.error(`inherited devenv: private artifact cannot be used (${String(error)}); evaluating in place`);
     }
-  } catch (error) {
-    console.error(`inherited devenv: private artifact cannot be used (${String(error)}); evaluating in place`);
   }
-  const live = Bun.spawnSync(['devenv', ...args], { cwd, env, stdin: 'inherit', stdout: 'pipe', stderr: 'inherit' });
-  if (live.exitCode !== 0) return live.exitCode;
-  process.stdout.write(live.stdout);
-  const graph = enterShellTasks(path.join(cwd, '.devenv'));
-  if (graph.kind !== 'confined') {
-    console.error(`inherited devenv: ${graph.reason}; this checkout evaluates in place`);
-    return 0;
-  }
-  try {
-    const safe = privateEnvironment(env);
-    const before = sourceBasis(root);
-    const candidate = Bun.spawnSync(['devenv', ...args], {
+  const safe = privateEnvironment(env);
+  const dotfile = path.join(cwd, '.devenv');
+  const live = (): number => {
+    const evaluated = Bun.spawnSync(['devenv', ...args], {
       cwd,
-      env: safe,
+      env,
       stdin: 'inherit',
       stdout: 'pipe',
       stderr: 'inherit',
     });
-    if (candidate.exitCode !== 0 || !Buffer.from(candidate.stdout).equals(Buffer.from(live.stdout))) {
-      console.error('inherited devenv: a credential-free evaluation differs; this checkout evaluates in place');
-      return 0;
-    }
-    const watches = watchPaths(root, env);
+    if (evaluated.exitCode === 0) process.stdout.write(evaluated.stdout);
+    return evaluated.exitCode;
+  };
+  if (privateInputs) {
+    console.error('inherited devenv: checkout-local or home configuration; evaluating in place');
+    return live();
+  }
+  try {
+    const before = sourceBasis(root);
+    const options = args.slice(0, -1);
+    const disabled = [...options, '--option', 'enterShell:string', ''];
+    const evaluate = (argv: readonly string[]) =>
+      Bun.spawnSync(['devenv', ...argv], {
+        cwd,
+        env: safe,
+        stdin: 'inherit',
+        stdout: 'pipe',
+        stderr: 'inherit',
+      });
+    const original = evaluate([...options, 'eval', 'enterShell']);
+    const without = evaluate([...disabled, 'eval', 'enterShell']);
+    if (original.exitCode !== 0 || without.exitCode !== 0)
+      throw new Error('devenv cannot evaluate the merged hook without executing it');
+    const hook: unknown = JSON.parse(original.stdout.toString());
+    const empty: unknown = JSON.parse(without.stdout.toString());
+    if (
+      typeof hook !== 'object' ||
+      hook === null ||
+      !('enterShell' in hook) ||
+      typeof hook.enterShell !== 'string' ||
+      typeof empty !== 'object' ||
+      empty === null ||
+      !('enterShell' in empty) ||
+      empty.enterShell !== ''
+    )
+      throw new Error('devenv did not prove the complete merged hook was disabled');
+    const listed = evaluate([...disabled, 'tasks', 'list', '--json']);
+    if (listed.exitCode !== 0) throw new Error('devenv cannot list the disabled task graph');
+    const listing: unknown = JSON.parse(listed.stdout.toString());
+    if (
+      !Array.isArray(listing) ||
+      listing.some(
+        (entry: unknown) =>
+          typeof entry !== 'object' || entry === null || !('name' in entry) || typeof entry.name !== 'string',
+      )
+    )
+      throw new Error('devenv returned a malformed task listing');
+    const graph = enterShellTasks(dotfile);
+    if (graph.kind !== 'confined') throw new Error(graph.reason);
+    const names = new Set(listing.map((entry: { name: string }) => entry.name));
+    if (
+      names.size !== listing.length ||
+      names.size !== graph.names.size ||
+      [...names].some((name) => !graph.names.has(name))
+    )
+      throw new Error('listed tasks differ from the compiled task graph');
+    const planned = graphBasis(dotfile);
+    const evaluated = evaluate([...disabled, 'direnv-export']);
+    if (evaluated.exitCode !== 0) throw new Error(`devenv export exited ${evaluated.exitCode}`);
+    if (planned !== graphBasis(dotfile)) throw new Error('task graph changed after preflight');
+    const watches = watchPaths(root, safe);
     const after = sourceBasis(root);
     const version = toolchain(safe);
-    if (before !== after || !version) return 0;
+    if (before !== after || !version) throw new Error('evaluated inputs or toolchain changed');
+    const exported = `${evaluated.stdout.toString()}\n${hook.enterShell}\nunset DEVENV_TASK_FILE DEVENV_TASKS\n`;
     const artifact: Artifact = {
       version: 1,
       root,
-      paths: pathsOf(root, env),
+      paths: pathsOf(root, safe),
       basis: after,
       watches,
-      watchBasis: watchedBasis(root, env, watches),
+      watchBasis: watchedBasis(root, safe, watches),
+      graphBasis: planned,
       toolchain: version,
-      export: candidate.stdout.toString(),
+      export: exported,
     };
-    mkdirSync(path.dirname(file), { recursive: true });
-    const staged = `${file}.${process.pid}`;
-    writeFileSync(staged, `${JSON.stringify(artifact)}\n`, { mode: 0o600 });
+    const staged = `${file}.${randomUUID()}`;
+    writeFileSync(staged, `${JSON.stringify(artifact)}\n`, { mode: 0o600, flag: 'wx' });
     renameSync(staged, file);
+    process.stdout.write(exported);
+    return 0;
   } catch (error) {
-    console.error(
-      `inherited devenv: cannot publish a private evaluated shell (${String(error)}); this checkout evaluates in place`,
-    );
+    console.error(`inherited devenv: ${String(error)}; evaluating in place`);
+    return live();
   }
-  return 0;
 }
 
 if (import.meta.main) {

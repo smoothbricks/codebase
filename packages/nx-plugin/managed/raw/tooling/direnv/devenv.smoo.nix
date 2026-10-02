@@ -387,9 +387,9 @@ in {
     # daemon refuse whichever came second ("received a message from a
     # different workspace"). Nobody supplies this deliberately.
     #
-    # In a cowshed sandbox shared-devenv.ts evaluates a content-addressed copy
-    # with enterShell disabled. direnv runs this hook after the copy's export is
-    # relocated onto the workspace; the install and stamp never run in the copy.
+    # In a cowshed sandbox an inherited private .devenv can supply the
+    # evaluated shell after its inputs and task graph are checked. The merged
+    # hook still runs only when direnv imports the workspace's own export.
     (lib.mkBefore ''
       cd "$DEVENV_ROOT/../.."
       export PATH="$("$PWD/tooling/direnv/repo-path")"

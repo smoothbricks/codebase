@@ -402,14 +402,13 @@ nothing when nothing changed:
   `/private/cowshed/caches/{ttsc,go/build,go/mod}` whenever that directory exists, so every checkout on the machine,
   sandboxed or not, shares one warm cache. Without it, ttsc caches in the checkout's `.cache/ttsc` and Go keeps its
   defaults. A value the caller already exported wins.
-- Inside a cowshed sandbox, which names `COWSHED_DEVENV_CACHE`, `tooling/direnv/shared-devenv.ts` copies devenv inputs
-  (`tooling/direnv` and local `path:` inputs) under their content digest. It evaluates the merged `enterShell` option
-  without executing it, then proves devenv's `enterShell:string ""` override emptied the hook and inspects the resulting
-  task graph before any task can run in the copy. devenv evaluates that copy with fixed `HOME`, `TMPDIR` and runtime
-  paths; its export is relocated onto the workspace, and direnv runs the original merged hook there once. Identical
-  inputs share one evaluation across workspaces; a changed input gets a new digest. Host shells, checkout-local devenv
-  or nixpkgs configuration, and projects with other enterShell tasks that write outside `.devenv` evaluate in place with
-  an explicit reason. An absent or unreadable graph also evaluates in place, never against an unchecked copy.
+- The origin checkout's shell publishes a private `.devenv` evaluated export; after cowshed clones the image,
+  `tooling/direnv/inherited-devenv.ts` can reuse that export in the new checkout. It checks the exact contents and
+  executable bits of `tooling/direnv` and local `path:` inputs, devenv's watched inputs, the toolchain and the emitted
+  task graph before relocating paths to this checkout. The export is produced without caller credentials after devenv
+  proves its merged enterShell hook is disabled for the evaluation; the original hook executes only when direnv imports
+  it in the destination checkout. Missing or changed inputs, external symlinks, or writing enterShell tasks fall back to
+  in-place evaluation. A writable cache shared by siblings is never a source of shell code.
 - The repository's local git config includes `tooling/workspace.gitconfig` by a path relative to the config file
   (`../tooling/workspace.gitconfig` in `.git/config`), so a copied checkout reads its own copy. An absolute include
   would name the checkout that wrote it, and git refuses to run when an include exists but cannot be read — the original
