@@ -214,10 +214,35 @@ export function defineCiWorkflow(options: CiWorkflowDefinitionOptions): CiWorkfl
 /**
  * CI's concurrency group, spelled literally rather than from `github.workflow`
  * (which a forge may fill with the file name), so the PR preview cleanup can
- * join the same group: a pull request's close then cancels its running CI and
- * the cleanup starts only after that run's stage deploy has stopped.
+ * reconstruct the same group name for a pull request's runs. One in-flight run
+ * per ref: for a pull request's CI runs github.ref is `refs/pull/<number>/merge`,
+ * for a base-branch push it is `refs/heads/<branch>`, and the two never collide.
  */
 export const CI_CONCURRENCY_GROUP = 'CI-${{ github.ref }}';
+
+/**
+ * The concurrency group of a pull request's CI runs, reconstructed from the PR
+ * number rather than read from github.ref, so the PR preview cleanup joins it.
+ *
+ * The cleanup runs on `pull_request: closed`, where github.ref is NOT the pull
+ * request's merge ref: GitHub sets it to `refs/pull/<number>/merge` only on an
+ * unmerged close; on a merged close it is the base branch the pull request was
+ * merged into, e.g. `refs/heads/main` (docs: "Events that trigger workflows" →
+ * pull_request). So `CI-${{ github.ref }}` in the cleanup would, on a merged
+ * close, be the base branch's push CI group — it would cancel the post-merge
+ * production run and never meet the pull request's own CI. A pull request's CI
+ * runs on `pull_request` events, whose github.ref IS `refs/pull/<number>/merge`,
+ * so this rebuilds exactly that string from `github.event.pull_request.number`,
+ * which every close carries and no forge derives from github.ref.
+ *
+ * Portability: this assumes a forge's pull-request-triggered CI runs carry
+ * `github.ref = refs/pull/<number>/merge` (Forgejo does). A forge that used a
+ * different pull-request ref (e.g. `refs/pull/<number>/head`) would put its CI
+ * in another group and the two would not meet; that is undocumented and not
+ * guaranteed, and there is deliberately no fallback to a branch ref, which would
+ * reintroduce the production-run collision this fixes.
+ */
+export const PR_CLEANUP_CONCURRENCY_GROUP = 'CI-refs/pull/${{ github.event.pull_request.number }}/merge';
 
 export function renderCiWorkflowYaml(options: CiWorkflowDefinitionOptions): string {
   const steps = defineCiWorkflow(options);

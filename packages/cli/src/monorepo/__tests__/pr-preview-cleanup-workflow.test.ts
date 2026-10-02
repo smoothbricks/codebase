@@ -44,9 +44,12 @@ describe('PR preview cleanup workflow', () => {
     expect(rendered).toContain('CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}');
   });
 
-  // A close's pull_request event carries the same github.ref as the pull
-  // request's CI runs, so sharing CI's group makes the close cancel a running
-  // stage deploy and start the cleanup only after that deploy has stopped.
+  // The cleanup runs on `pull_request: closed`. On a merged close github.ref is
+  // the base branch, not the pull request's merge ref, so it cannot join CI's
+  // group by github.ref: it would land in the base branch's production CI group
+  // and cancel the post-merge run. The cleanup instead reconstructs the pull
+  // request's own CI group `CI-refs/pull/<number>/merge` from the PR number,
+  // which every close carries, so it meets that pull request's CI and no other.
   describe("in the pull request's CI concurrency group", () => {
     /** The workflow-level `concurrency:` block, up to the next top-level key. */
     function concurrencyBlock(workflow: string): string[] {
@@ -57,25 +60,71 @@ describe('PR preview cleanup workflow', () => {
       return lines.slice(start + 1, end).filter((line) => line.trim() !== '' && !/^\s*#/.test(line));
     }
 
-    function groupLine(workflow: string): string | undefined {
-      return concurrencyBlock(workflow).find((line) => line.trim().startsWith('group:'));
+    /** The concurrency group expression, still carrying its `${{ ... }}` placeholders. */
+    function groupExpression(workflow: string): string {
+      const line = concurrencyBlock(workflow).find((entry) => entry.trim().startsWith('group:'));
+      expect(line).toBeDefined();
+      return requiredTestValue(line)
+        .trim()
+        .replace(/^group:\s*/, '');
     }
 
-    it('cancels the run it finds in progress in that group', () => {
+    function requiredTestValue<T>(value: T | undefined): T {
+      if (value === undefined) throw new Error('expected a concurrency group line');
+      return value;
+    }
+
+    /**
+     * What a forge substitutes into a group expression for one event. github.ref and the pull
+     * request number are the only placeholders either workflow uses, so this is the whole grammar.
+     */
+    function evaluateGroup(expression: string, context: { ref: string; prNumber?: number }): string {
+      return expression
+        .replaceAll('${{ github.ref }}', context.ref)
+        .replaceAll('${{ github.event.pull_request.number }}', String(context.prNumber));
+    }
+
+    // The github.ref each event carries, from GitHub's "Events that trigger workflows".
+    const mergedClose = { ref: 'refs/heads/main', prNumber: 7 };
+    const unmergedClose = { ref: 'refs/pull/7/merge', prNumber: 7 };
+    const pullRequestSync = { ref: 'refs/pull/7/merge', prNumber: 7 };
+    const basePush = { ref: 'refs/heads/main' };
+
+    it('reconstructs the pull request merge ref from the PR number, not github.ref', () => {
       expect(concurrencyBlock(renderPrPreviewCleanupWorkflowYaml())).toEqual([
-        '  group: CI-${{ github.ref }}',
+        '  group: CI-refs/pull/${{ github.event.pull_request.number }}/merge',
         '  cancel-in-progress: true',
       ]);
     });
 
-    it('with the group both CI variants render, whatever the forge calls the workflow', () => {
+    it('resolves to the same group whether the close merged or not', () => {
+      const cleanup = groupExpression(renderPrPreviewCleanupWorkflowYaml());
+
+      expect(evaluateGroup(cleanup, mergedClose)).toBe('CI-refs/pull/7/merge');
+      expect(evaluateGroup(cleanup, unmergedClose)).toBe('CI-refs/pull/7/merge');
+    });
+
+    it("meets the pull request's own CI run so the close cancels its in-flight stage deploy", () => {
+      const ci = groupExpression(renderCiWorkflowYaml(deployingCi));
+      const cleanup = groupExpression(renderPrPreviewCleanupWorkflowYaml());
+
+      expect(evaluateGroup(cleanup, mergedClose)).toBe(evaluateGroup(ci, pullRequestSync));
+    });
+
+    it('never cancels the base branch push CI that a merged close also triggers', () => {
+      const ci = groupExpression(renderCiWorkflowYaml(deployingCi));
+      const cleanup = groupExpression(renderPrPreviewCleanupWorkflowYaml());
+
+      expect(evaluateGroup(ci, basePush)).toBe('CI-refs/heads/main');
+      expect(evaluateGroup(cleanup, mergedClose)).not.toBe(evaluateGroup(ci, basePush));
+    });
+
+    it('keeps CI in one group whatever the forge calls the workflow', () => {
       const deploying = renderCiWorkflowYaml(deployingCi);
       const validating = renderCiWorkflowYaml({ ...deployingCi, deploy: false });
-      const cleanup = renderPrPreviewCleanupWorkflowYaml({ runsOn: 'ubuntu-latest' });
 
-      expect(groupLine(cleanup)).toBe('  group: CI-${{ github.ref }}');
-      expect(groupLine(deploying)).toBe(groupLine(cleanup));
-      expect(groupLine(validating)).toBe(groupLine(cleanup));
+      expect(groupExpression(deploying)).toBe('CI-${{ github.ref }}');
+      expect(groupExpression(validating)).toBe('CI-${{ github.ref }}');
       expect(deploying).not.toContain('github.workflow');
       expect(validating).not.toContain('github.workflow');
     });
