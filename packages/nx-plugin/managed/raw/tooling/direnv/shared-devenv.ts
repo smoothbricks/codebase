@@ -412,8 +412,12 @@ function enterShellTasks(dotfile: string): EnterShellTasks {
     if (closure.has(name)) {
       continue;
     }
+    const task = tasks.get(name);
+    if (task === undefined) {
+      return { kind: 'writes', reason: `${graph} depends on missing task ${name}` };
+    }
     closure.add(name);
-    pending.push(...(tasks.get(name)?.after ?? []));
+    pending.push(...task.after);
     for (const task of tasks.values()) {
       if (task.before.includes(name)) {
         pending.push(task.name);

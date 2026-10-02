@@ -137,8 +137,8 @@ const managedFiles: ManagedFileDescriptor[] = [
   },
   {
     kind: 'raw',
-    source: 'tooling/direnv/shared-devenv.ts',
-    target: 'tooling/direnv/shared-devenv.ts',
+    source: 'tooling/direnv/inherited-devenv.ts',
+    target: 'tooling/direnv/inherited-devenv.ts',
     executable: true,
   },
   {

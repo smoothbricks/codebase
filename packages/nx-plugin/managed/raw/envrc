@@ -31,22 +31,20 @@ unset devenv_keys
 # leaves us there and a bare relative path would resolve under tooling/direnv.
 project_root="$PWD"
 local_override="$project_root/.envrc-local"
-# In a cowshed sandbox, which names COWSHED_DEVENV_CACHE, devenv evaluates a
-# content-addressed copy of its inputs that every workspace with the same
-# inputs shares, instead of this checkout's path; tooling/direnv/shared-devenv.ts
-# says why. Everywhere else, and when it says why not, devenv evaluates in place.
-watch_file tooling/direnv/shared-devenv.ts
-if [ -n "${COWSHED_DEVENV_CACHE:-}" ] &&
-  shared_devenv_copy="$(bun "$project_root/tooling/direnv/shared-devenv.ts" enter "$project_root")"; then
-  smoo_shared_devenv() {
-    bun "$project_root/tooling/direnv/shared-devenv.ts" export "$project_root" "$shared_devenv_copy" "$@"
+# A sandboxed shell can reuse the real devenv export its cowshed origin left
+# inside this checkout's private .devenv. No writable cache belongs to a
+# sibling. A missing or changed basis evaluates in place and refreshes it.
+if [ -n "${COWSHED_PORT_BASE:-}" ]; then
+  watch_file tooling/direnv/inherited-devenv.ts
+  smoo_inherited_devenv() {
+    bun "$project_root/tooling/direnv/inherited-devenv.ts" "$project_root" "$@"
   }
-  DEVENV_BIN=smoo_shared_devenv
+  DEVENV_BIN=smoo_inherited_devenv
 fi
 cd tooling/direnv
 . envrc.sh
-unset -f smoo_shared_devenv
-unset DEVENV_BIN shared_devenv_copy
+unset -f smoo_inherited_devenv
+unset DEVENV_BIN
 
 # Re-enter exactly when shell entry has something to do. The scripts it runs
 # decide what that is, and setup-environment.ts records the files its install
