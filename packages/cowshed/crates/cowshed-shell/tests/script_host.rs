@@ -228,14 +228,14 @@ fn stop_fixture_jobs(host_pid: u32, leader: Option<i32>, descendant: Option<i32>
     let host_pid = i32::try_from(host_pid).expect("host PID");
     let host_group = unsafe { libc::getpgid(host_pid) };
     let our_group = unsafe { libc::getpgrp() };
-    if let Some(pid) = leader.filter(|pid| {
-        *pid > 0 && *pid != host_pid && *pid != host_group && *pid != our_group
-    }) {
+    if let Some(pid) =
+        leader.filter(|pid| *pid > 0 && *pid != host_pid && *pid != host_group && *pid != our_group)
+    {
         // SAFETY: never signal our group or the host's group.
         unsafe { libc::kill(-pid, libc::SIGKILL) };
     }
-    if let Some(pid) = descendant
-        .filter(|pid| *pid > 0 && *pid != host_pid && *pid != std::process::id() as i32)
+    if let Some(pid) =
+        descendant.filter(|pid| *pid > 0 && *pid != host_pid && *pid != std::process::id() as i32)
     {
         // A background child may have escaped its leader's group.
         unsafe { libc::kill(pid, libc::SIGKILL) };
@@ -313,15 +313,14 @@ fn killing_a_script_job_group_reaches_its_grandchildren_and_spares_the_host() {
     // Wait until the descendant itself has written its PID. `$!` in the parent
     // may still be unset when its background command first starts.
     let pids = loop {
-        if let (Ok(parent), Ok(child)) = (
-            std::fs::read_to_string(&leader),
-            std::fs::read_to_string(&descendant),
-        ) {
-            if let (Ok(parent), Ok(child)) =
-                (parent.trim().parse::<i32>(), child.trim().parse::<i32>())
-            {
-                break [parent, child];
-            }
+        let parent = std::fs::read_to_string(&leader)
+            .ok()
+            .and_then(|value| value.trim().parse::<i32>().ok());
+        let child = std::fs::read_to_string(&descendant)
+            .ok()
+            .and_then(|value| value.trim().parse::<i32>().ok());
+        if let (Some(parent), Some(child)) = (parent, child) {
+            break [parent, child];
         }
         if std::time::Instant::now() >= deadline {
             let parent = std::fs::read_to_string(&leader);
