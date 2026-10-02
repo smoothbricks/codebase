@@ -408,7 +408,8 @@ nothing when nothing changed:
   task graph before relocating paths to this checkout. The export is produced without caller credentials after devenv
   proves its merged enterShell hook is disabled for the evaluation; the original hook executes only when direnv imports
   it in the destination checkout. Missing or changed inputs, external symlinks, or writing enterShell tasks fall back to
-  in-place evaluation. A writable cache shared by siblings is never a source of shell code.
+  in-place evaluation. A writable cache shared by siblings is never a source of shell code; successful reuse reports
+  that it happened without printing the origin checkout path or credentials.
 - The repository's local git config includes `tooling/workspace.gitconfig` by a path relative to the config file
   (`../tooling/workspace.gitconfig` in `.git/config`), so a copied checkout reads its own copy. An absolute include
   would name the checkout that wrote it, and git refuses to run when an include exists but cannot be read — the original

@@ -500,9 +500,7 @@ export function exportShell(rootPath: string, args: readonly string[], env: Node
       const cached = inherited(root, env, file);
       if (cached !== undefined) {
         process.stdout.write(cached);
-        console.error(
-          `inherited devenv: reused this checkout's evaluated shell from ${JSON.parse(readFileSync(file, 'utf8')).root}`,
-        );
+        console.error('inherited devenv: reused this checkout\'s evaluated shell');
         return 0;
       }
     } catch (error) {

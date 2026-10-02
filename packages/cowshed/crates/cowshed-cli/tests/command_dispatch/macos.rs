@@ -10,6 +10,7 @@ use cowshed_gateway::{
     ArrowAuditConfig, ArrowAuditSink, Gateway, GatewayConfig, KeychainCredentialProvider,
     MirrorCacheConfig, SystemConnector,
 };
+use serde_json::{Value, json};
 use std::ffi::OsString;
 use std::fs;
 use std::net::{Ipv4Addr, TcpListener};
@@ -45,8 +46,11 @@ impl Fixture {
         }
         git(&checkout, &["init", "-q", "-b", "main"]);
         fs::write(checkout.join("tracked"), b"tracked\n").expect("tracked file");
-        fs::write(checkout.join(".gitignore"), b".envrc\n.devenv/\n")
-            .expect("workspace hook and evaluated profile ignore");
+        fs::write(
+            checkout.join(".gitignore"),
+            b".envrc\n.envrc-local\n.devenv/\n",
+        )
+        .expect("workspace hooks and evaluated profile ignore");
         git(&checkout, &["add", "tracked", ".gitignore"]);
         git(&checkout, &["commit", "-q", "-m", "initial"]);
         let storage = ValidatedHostStorage::new(
@@ -85,6 +89,94 @@ impl Fixture {
         fs::create_dir_all(&state).expect("workspace devenv state");
         std::os::unix::fs::symlink(profile, state.join("profile"))
             .expect("workspace profile points to real Nix shell");
+    }
+
+    fn install_inherited_shell(&self) -> PathBuf {
+        let manifest = PathBuf::from(
+            std::env::var_os("CARGO_MANIFEST_DIR").expect("Cargo manifest directory"),
+        );
+        let source = manifest.join("../../../../tooling/direnv");
+        let directory = self.checkout.join("tooling/direnv");
+        fs::create_dir_all(&directory).expect("devenv source directory");
+        fs::copy(
+            source.join("inherited-devenv.ts"),
+            directory.join("inherited-devenv.ts"),
+        )
+        .expect("candidate inherited shell implementation");
+        fs::write(
+            directory.join("devenv.nix"),
+            "{ ... }: { env.PROBE = \"host-origin\"; }\n",
+        )
+        .expect("devenv fixture");
+        fs::write(
+            directory.join("devenv.yaml"),
+            "inputs:\n  nixpkgs:\n    url: github:cachix/devenv-nixpkgs/rolling\n",
+        )
+        .expect("devenv inputs");
+        let lock: Value =
+            serde_json::from_slice(&fs::read(source.join("devenv.lock")).expect("repository lock"))
+                .expect("valid repository lock");
+        let nodes = &lock["nodes"];
+        let isolated = json!({
+            "nodes": {
+                "devenv": nodes["devenv"],
+                "nixpkgs": nodes["nixpkgs"],
+                "nixpkgs-src": nodes["nixpkgs-src"],
+                "root": { "inputs": { "devenv": "devenv", "nixpkgs": "nixpkgs" } }
+            },
+            "root": "root",
+            "version": lock["version"]
+        });
+        fs::write(
+            directory.join("devenv.lock"),
+            serde_json::to_vec(&isolated).expect("isolated lock"),
+        )
+        .expect("write isolated lock");
+        fs::write(
+            self.checkout.join(".envrc"),
+            "shell=$(bun \"$PWD/tooling/direnv/inherited-devenv.ts\" \"$PWD\" direnv-export) || exit\n\
+             eval \"$shell\"\n\
+             local_override=\"$PWD/.envrc-local\"\n\
+             source_env_if_exists \"$local_override\"\n",
+        )
+        .expect("direnv shell hook");
+        git(&self.checkout, &["add", "-f", ".envrc"]);
+        git(&self.checkout, &["add", "tooling/direnv"]);
+        git(&self.checkout, &["commit", "-q", "-m", "shell fixture"]);
+        let home = self._scratch.path().join("host-home");
+        let keys = home.join(".local/share/devenv/cachix_trusted_keys.json");
+        fs::create_dir_all(keys.parent().expect("devenv home")).expect("devenv home directory");
+        fs::write(
+            keys,
+            "{\"devenv\":\"devenv.cachix.org-1:w1cLUi8dv3hnoSPGAuibQv+f9TZLr6cv/Hm9XgU50cw=\"}\n",
+        )
+        .expect("public cache key");
+        let result = Command::new("bun")
+            .arg(directory.join("inherited-devenv.ts"))
+            .arg(&self.checkout)
+            .arg("direnv-export")
+            .current_dir(&directory)
+            .env("HOME", &home)
+            .env("PRIVATE_CREDENTIAL", "origin-only-secret-sentinel")
+            .env_remove("COWSHED_PORT_BASE")
+            .output()
+            .expect("evaluate origin shell");
+        assert!(
+            result.status.success(),
+            "origin evaluation: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let artifact = directory.join(".devenv/inherited-shell.json");
+        let metadata = fs::metadata(&artifact).expect("published private origin artifact");
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+        assert!(
+            !fs::read(&artifact)
+                .expect("private artifact")
+                .windows(b"origin-only-secret-sentinel".len())
+                .any(|part| part == b"origin-only-secret-sentinel"),
+            "origin secret cannot enter private artifact"
+        );
+        artifact
     }
 
     async fn open(&self) -> ActorBridge {
@@ -433,5 +525,127 @@ async fn real_apfs_checked_land_preserves_target_when_gateway_absent_then_fast_f
         b"feature\n"
     );
     service.shutdown().await.expect("shutdown runtime");
+    fixture.stop_gateway().await;
+}
+
+#[tokio::test]
+async fn real_apfs_first_shell_reuses_private_origin_artifact_without_exposing_origin() {
+    let mut fixture = Fixture::new();
+    let artifact = fixture.install_inherited_shell();
+    let origin = fixture.checkout.display().to_string();
+    let mut service = fixture.open().await;
+    adopt(&fixture, &mut service).await;
+    fixture.start_gateway().await;
+    service
+        .reconcile_gateway()
+        .await
+        .expect("install main on the isolated gateway");
+    let (created, _, stderr) = run(&mut service, ["new", "fresh-shell"]).await;
+    assert_eq!(
+        created.unwrap_or_else(|error| panic!(
+            "real APFS clone: {error}; {}",
+            String::from_utf8_lossy(&stderr)
+        )),
+        0
+    );
+    let clone = service
+        .path("fresh-shell", false)
+        .await
+        .expect("mounted COW clone");
+    let inherited = clone
+        .mount
+        .join("tooling/direnv/.devenv/inherited-shell.json");
+    assert_eq!(
+        fs::metadata(&inherited)
+            .expect("COW-inherited origin artifact")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+    let (result, stdout, stderr) = run(
+        &mut service,
+        [
+            "exec",
+            "fresh-shell",
+            "--",
+            "/bin/sh",
+            "-c",
+            "printf '%s|%s|%s\\n' \"$PROBE\" \"$DEVENV_ROOT\" \"$DEVENV_STATE\"",
+        ],
+    )
+    .await;
+    assert_eq!(
+        result.unwrap_or_else(|error| panic!(
+            "first sandbox shell: {error}; {}",
+            String::from_utf8_lossy(&stderr)
+        )),
+        0,
+        "sandbox stderr: {}",
+        String::from_utf8_lossy(&stderr)
+    );
+    let output = String::from_utf8(stdout).expect("first-shell stdout");
+    let feedback = String::from_utf8(stderr).expect("first-shell stderr");
+    let shell_root = clone.mount.join("tooling/direnv");
+    assert!(
+        output.contains(&format!(
+            "host-origin|{}|{}",
+            shell_root.display(),
+            shell_root.join(".devenv/state").display()
+        )),
+        "first shell must use clone-local identity: {output}"
+    );
+    assert!(
+        feedback.contains("reused this checkout"),
+        "shell must reuse the origin artifact: {feedback}"
+    );
+    assert!(
+        !output.contains(&origin) && !feedback.contains(&origin),
+        "shell output must not expose origin path"
+    );
+    assert!(
+        !output.contains("origin-only-secret-sentinel")
+            && !feedback.contains("origin-only-secret-sentinel"),
+        "shell output must not expose origin credentials"
+    );
+
+    let poisoned = fixture._scratch.path().join("poisoned-artifact.json");
+    fs::write(&poisoned, fs::read(&artifact).expect("origin artifact")).expect("poison source");
+    fs::remove_file(&inherited).expect("remove COW copy");
+    std::os::unix::fs::symlink(&poisoned, &inherited).expect("poisoned artifact symlink");
+    let (result, stdout, stderr) = run(
+        &mut service,
+        [
+            "exec",
+            "fresh-shell",
+            "--",
+            "/bin/sh",
+            "-c",
+            "printf '%s|%s\\n' \"$PROBE\" \"$DEVENV_ROOT\"",
+        ],
+    )
+    .await;
+    assert_eq!(
+        result.unwrap_or_else(|error| panic!(
+            "poisoned artifact fallback: {error}; {}",
+            String::from_utf8_lossy(&stderr)
+        )),
+        0,
+        "fallback stderr: {}",
+        String::from_utf8_lossy(&stderr)
+    );
+    let fallback = String::from_utf8(stdout).expect("fallback stdout");
+    let feedback = String::from_utf8(stderr).expect("fallback stderr");
+    assert!(fallback.contains(&format!("host-origin|{}", shell_root.display())));
+    assert!(
+        !feedback.contains("reused this checkout"),
+        "symlink must not be trusted"
+    );
+    assert!(!fallback.contains(&origin) && !feedback.contains(&origin));
+    assert!(
+        !fallback.contains("origin-only-secret-sentinel")
+            && !feedback.contains("origin-only-secret-sentinel")
+    );
+    service.shutdown().await.expect("shutdown scratch runtime");
     fixture.stop_gateway().await;
 }
