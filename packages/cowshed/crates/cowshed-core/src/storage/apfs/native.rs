@@ -2380,11 +2380,15 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
 
     /// The mountpoint a staging stem is attached at while its operation runs.
     fn staging_mount_point(&self, repo: &RepoId, stem: &str) -> Result<PathBuf, ApfsStorageError> {
-        Ok(layout(&self.config, repo)?
-            .project()
-            .mount_root
-            .join(super::STAGING_NAMESPACE)
-            .join(stem))
+        let layout = layout(&self.config, repo)?;
+        let mount_root = &layout.project().mount_root;
+        let mut mount_point = PathBuf::with_capacity(
+            mount_root.as_os_str().len() + super::STAGING_NAMESPACE.len() + stem.len() + 2,
+        );
+        mount_point.push(mount_root);
+        mount_point.push(super::STAGING_NAMESPACE);
+        mount_point.push(stem);
+        Ok(mount_point)
     }
 
     /// Detach a staging mountpoint if the kernel still holds a volume there, then remove the
@@ -2955,14 +2959,12 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
                         {
                             let mount_point = self.staging_mount_point(plan.repo(), stem)?;
                             if self.retire_staging_mount(&mount_point, candidate.path())? {
-                                let workspace = staged_stem_workspace(stem)
-                                    .map(|name| name.as_str().to_owned())
-                                    .unwrap_or_default();
+                                let workspace = staged_stem_workspace(stem);
                                 deletion_log::log_deletion(
                                     project,
                                     DeletionOp::RemoveStagingMount,
                                     DeletionKind::Other,
-                                    &workspace,
+                                    workspace.as_ref().map_or("", |name| name.as_str()),
                                     None,
                                     &mount_point,
                                 );

@@ -163,8 +163,8 @@ exercises `cowshed-helper` and the Landlock/netns exec path. A suite-level guard
 volumes/pools. The same flow table runs on both; substrate-specific assertions (fsck step on APFS, origin-snapshot GC on
 ZFS) are tagged.
 
-Staging-mount GC retains the workspace parsed from its owned stem and derives the backing-image path in one preallocated
-buffer, without rebuilding the intermediate staging path or reparsing the stem for the deletion record.
+Staging GC derives backing-image and mountpoint paths in one preallocated buffer each. Both orphan branches borrow the
+parsed workspace for the deletion record rather than allocating a second name; mount GC also retains its parsed stem.
 
 The native inventory teardown regression runs the production read-only host-storage planner against the real home device
 while detaching a disposable ASIF image. Attachment and teardown use the production APFS backend, including its
