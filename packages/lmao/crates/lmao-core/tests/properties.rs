@@ -254,3 +254,84 @@ proptest! {
         prop_assert_eq!(a, b, "same inputs + fixed clock must yield bit-identical buffers");
     }
 }
+
+// ── Thread row store: a span id a writer holds ───────────────────────────────
+
+use lmao_core::ThreadSpanBuffer;
+
+/// One call a host makes on a thread row store; `Log` and `End` pick one of
+/// the spans still open.
+#[derive(Clone, Debug)]
+enum StoreStep {
+    Open,
+    Log(usize),
+    End(usize),
+    /// A streaming flush's release: the open spans move to the front.
+    Flush,
+    Reset,
+}
+
+fn store_step() -> impl Strategy<Value = StoreStep> {
+    prop_oneof![
+        4 => Just(StoreStep::Open),
+        3 => any::<usize>().prop_map(StoreStep::Log),
+        3 => any::<usize>().prop_map(StoreStep::End),
+        1 => Just(StoreStep::Flush),
+        1 => Just(StoreStep::Reset),
+    ]
+}
+
+proptest! {
+    /// A foreign writer keeps the span id a receipt named and asks the store
+    /// where that span's rows are now (`start_row`). Whatever the host does in
+    /// between — open, log, end, a flush that moves the open spans' rows
+    /// (`retain_open`), a reset — a held id resolves to that span's own start
+    /// row while the store holds it and to nothing once released: never to
+    /// another span's rows.
+    #[test]
+    fn a_held_span_id_resolves_to_its_own_rows_or_to_none(
+        steps in prop::collection::vec(store_step(), 1..64),
+    ) {
+        let mut store = ThreadSpanBuffer::new(7, 8, &[]);
+        let trace = TraceId::new("prop-store-trace").unwrap();
+        let mut issued = std::collections::HashSet::new();
+        let mut open: Vec<u32> = Vec::new();
+        let mut ended: Vec<u32> = Vec::new();
+        let mut released: Vec<u32> = Vec::new();
+        for (clock, step) in (1_i64..).zip(steps) {
+            match step {
+                StoreStep::Open => {
+                    let id = store.open_span(trace.clone(), 0, 0, "s".into(), clock, 1).unwrap();
+                    prop_assert!(issued.insert(id), "span id {} was issued again", id);
+                    open.push(id);
+                }
+                StoreStep::Log(pick) if !open.is_empty() => {
+                    let id = open[pick % open.len()];
+                    store.append_log(id, EntryType::Info, Some("row".into()), 2, clock).unwrap();
+                }
+                StoreStep::End(pick) if !open.is_empty() => {
+                    let id = open.swap_remove(pick % open.len());
+                    store.end_ok(id, clock).unwrap();
+                    ended.push(id);
+                }
+                StoreStep::Log(_) | StoreStep::End(_) => {}
+                StoreStep::Flush => {
+                    store.retain_open();
+                    released.append(&mut ended);
+                }
+                StoreStep::Reset => {
+                    store.reset();
+                    released.append(&mut open);
+                    released.append(&mut ended);
+                }
+            }
+            for &id in open.iter().chain(&ended) {
+                let at = store.start_row(id).and_then(|row| store.span_id_at(row));
+                prop_assert_eq!(at, Some(id), "held span {} does not resolve to its own row", id);
+            }
+            for &id in &released {
+                prop_assert_eq!(store.start_row(id), None, "released span {} still resolves", id);
+            }
+        }
+    }
+}

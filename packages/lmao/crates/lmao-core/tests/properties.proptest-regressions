@@ -5,3 +5,4 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc a9ace53a0f8e187dd591785b46dd943c88181c29b1eaa0eedeb86bde3e18cd7f # shrinks to capacity_exp = 3, n_appends = 7
+cc ee297757dfa57dc87ae92bb70fe673b90af8ca4acd1af522779b8d2c514c6ae2 # shrinks to steps = [Open, Reset, Open]

@@ -1466,23 +1466,6 @@ mod tests {
         assert_eq!(buffer.dynamic_message_at(9), None);
     }
     #[test]
-    fn a_span_id_from_before_a_reset_names_no_span_after_it() {
-        // A foreign writer keeps the span id a receipt named and asks the store
-        // where that span's rows are now; after a reset released it, the answer
-        // must be "nowhere", never the rows of a span opened since.
-        let mut buffer = ThreadSpanBuffer::new(7, 8, FIELDS);
-        let held = buffer
-            .open_span(trace(), 0, 0, "held".into(), 1, 1)
-            .unwrap();
-        buffer.reset();
-        let later = buffer
-            .open_span(trace(), 0, 0, "later".into(), 2, 2)
-            .unwrap();
-        assert_ne!(held, later, "a reset reissued span id {held}");
-        assert_eq!(buffer.start_row(held), None);
-        assert_eq!(buffer.start_row(later), Some(0));
-    }
-    #[test]
     fn a_foreign_store_into_the_cells_reads_back_through_the_schema() {
         let mut buffer = ThreadSpanBuffer::new(7, 8, FIELDS);
         let span = buffer.open_span(trace(), 0, 0, "s".into(), 1, 1).unwrap();
