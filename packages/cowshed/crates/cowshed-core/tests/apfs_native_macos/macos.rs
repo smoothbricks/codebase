@@ -2200,9 +2200,9 @@ fn sidecar_removal_does_not_hide_non_file_errors() {
 
 /// A `WhenIdle` detach that a holder dissents leaves the workspace exactly as it found it: still
 /// mounted, and still the actor's to detach once the holder lets go. The holder is real — a file
-/// open on the volume — so the refusal is the one `hdiutil detach` gives. Escalation is the
-/// backend's grace, proved against `DetachGrace` where the waiting can be observed without
-/// spending it.
+/// open on the volume — so the refusal is the native unmount's resource-busy result. The separate
+/// real held-file release test proves escalation after the unchanged grace; this test proves that
+/// `WhenIdle` leaves the volume and its contents to their owner.
 #[test]
 fn real_apfs_dissented_when_idle_detach_leaves_the_mount_to_the_actor() {
     let fixture = RealFixture::new("detach-dissent");
