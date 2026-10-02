@@ -4,15 +4,15 @@ use std::fs::{FileTimes, OpenOptions};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use rcgen::{KeyPair, PKCS_ECDSA_P256_SHA256};
 
 use cowshed_core::apfs::{
-    CommandOutput, CommandRequest, CommandRunError, CommandRunFailure, CommandRunner,
-    CreateImageRequest, DetachIntent, MountAccess,
+    ApfsBackend, AttachedImage, CommandOutput, CommandRequest, CommandRunError, CommandRunFailure,
+    CommandRunner, CreateImageRequest, DetachIntent, MountAccess, SystemCommandRunner,
 };
 use cowshed_core::metadata::{
     DetachedWorkspaceMetadata, GrantSet, ImageCapacity, MACOS_PORT_MIN, NEW_PORT_BLOCK_SIZE,
@@ -34,6 +34,12 @@ use cowshed_core::storage::lifecycle::{
 };
 use cowshed_core::storage::{CheckpointLabel, StorageLayout, StorageLayoutError};
 use cowshed_core::workspace_credentials::mint_workspace_credentials;
+
+#[path = "support/scratch_apfs.rs"]
+mod scratch_apfs;
+
+use scratch_apfs::ScratchRoot;
+
 /// `diskutil image attach --nobrowse --noMount --plist` for an ASIF image: the whole device
 /// carries no content hint, and the synthesized container and its one volume follow it. The
 /// attach answers with the volume and the container it hangs from.
@@ -162,6 +168,12 @@ impl CommandRunner for RecordingRunner {
         }
     }
 }
+/// Answers the first attachment inventory with the deadline failure [`SystemCommandRunner`]
+/// reports for a disk child that outlives `DISK_CHILD_DEADLINE`.
+///
+/// This is the one double in the GC tests, and it stays one for a concrete reason: a real
+/// `hdiutil info -plist` cannot be made to run past that 120 s deadline inside the 30 s each test
+/// is given, so the deadline path is reachable only by answering as the runner would.
 #[derive(Default)]
 struct DeadlineFirstInventoryRunner(AtomicUsize);
 
@@ -181,90 +193,6 @@ impl CommandRunner for DeadlineFirstInventoryRunner {
             });
         }
         Ok(CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY))
-    }
-}
-
-#[derive(Clone)]
-struct FailingDetachRunner {
-    calls: Arc<AtomicUsize>,
-    failures_remaining: Arc<AtomicUsize>,
-    detach_attempts: Arc<Mutex<Vec<bool>>>,
-    inventory: FakeInventory,
-}
-
-impl FailingDetachRunner {
-    fn new(failures: usize) -> Self {
-        Self {
-            calls: Arc::default(),
-            failures_remaining: Arc::new(AtomicUsize::new(failures)),
-            detach_attempts: Arc::default(),
-            inventory: FakeInventory::default(),
-        }
-    }
-}
-
-impl CommandRunner for FailingDetachRunner {
-    fn run(&self, request: &CommandRequest) -> Result<CommandOutput, CommandRunError> {
-        self.calls.fetch_add(1, Ordering::SeqCst);
-        if request.program == Path::new("/usr/sbin/diskutil")
-            && request
-                .args
-                .first()
-                .is_some_and(|argument| argument == "info")
-        {
-            let device = request
-                .args
-                .last()
-                .expect("device")
-                .to_string_lossy()
-                .trim_start_matches("/dev/")
-                .to_owned();
-            return Ok(CommandOutput::success(device_info_plist(
-                &device,
-                "cowshed.acme--widget.main",
-            )));
-        }
-        let is_detach = request
-            .args
-            .first()
-            .is_some_and(|argument| argument == "eject");
-        if is_detach {
-            self.detach_attempts
-                .lock()
-                .expect("detach attempts")
-                .push(request.args.iter().any(|argument| argument == "force"));
-        }
-        if is_detach
-            && self
-                .failures_remaining
-                .try_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
-                    remaining.checked_sub(1)
-                })
-                .is_ok()
-        {
-            // `diskutil eject` reports a holder only in its stderr.
-            Ok(CommandOutput::failure(
-                1,
-                "Unmount of disk10 failed: at least one volume could not be unmounted\n",
-            ))
-        } else {
-            Ok(self.inventory.respond(request))
-        }
-    }
-}
-
-#[derive(Clone, Default)]
-struct FakeKernelMountSource(Arc<Mutex<Vec<KernelMountSnapshot>>>);
-
-impl FakeKernelMountSource {
-    fn set(&self, mounts: Vec<KernelMountSnapshot>) {
-        *self.0.lock().expect("kernel mounts") = mounts;
-    }
-}
-
-impl KernelMountSource for FakeKernelMountSource {
-    fn mounts(&self) -> Result<Vec<KernelMountSnapshot>, ApfsStorageError> {
-        Ok(self.0.lock().expect("kernel mounts").clone())
     }
 }
 
@@ -316,6 +244,152 @@ impl Drop for Fixture {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.root);
     }
+}
+
+/// A store on real APFS images: a scratch root under `/private/tmp` laid out like [`Fixture`]'s,
+/// driven by the production host (real `hdiutil`/`diskutil`/`mount_apfs`, the live kernel mount
+/// table). Its attachments are detached and its tree removed when the test ends however it
+/// ends, and by the next run's sweep when it could not.
+struct RealFixture {
+    scratch: ScratchRoot,
+}
+
+impl RealFixture {
+    fn new(test: &str) -> Self {
+        Self {
+            scratch: ScratchRoot::new(test).expect("scratch root"),
+        }
+    }
+
+    fn root(&self) -> &Path {
+        self.scratch.path()
+    }
+
+    fn config(&self) -> ApfsSubstrateConfig {
+        ApfsSubstrateConfig::new(
+            self.root(),
+            self.root().join("caches"),
+            self.root().join("mount"),
+        )
+    }
+
+    /// A fresh production host. Each one starts with an empty mount registry, so a second one is
+    /// what a restarted controller sees: whatever is mounted, it learns from the kernel alone.
+    fn host(&self) -> MacOsApfsExecutionHost<SystemCommandRunner> {
+        MacOsApfsExecutionHost::new(SystemCommandRunner, self.config()).expect("native APFS host")
+    }
+
+    /// Main mounts at the adopted checkout itself.
+    fn main_mount(&self) -> PathBuf {
+        self.config().checkout_path
+    }
+
+    fn layout(&self) -> StorageLayout {
+        StorageLayout::new(self.root(), &repo()).expect("layout")
+    }
+
+    /// Mint a real one-volume ASIF image at `image` (which must end `.asif`) the way the host
+    /// stages one, and nothing beside it.
+    fn blank_image(&self, image: &Path) {
+        let staged = self
+            .host()
+            .create_staged(&CreateImageRequest {
+                staged_stem: image.with_extension(""),
+                capacity: ImageCapacity::from_gibibytes(1),
+                volume_name: "cowshed.acme--widget.main".to_owned(),
+                // SAFETY: getuid and getgid read this process's credentials and cannot fail.
+                owner_uid: unsafe { libc::getuid() },
+                owner_gid: unsafe { libc::getgid() },
+            })
+            .expect("real ASIF image");
+        assert_eq!(staged, image);
+    }
+
+    /// [`Self::blank_image`] published as [`workspace`]'s: its sidecar and CA key beside it.
+    fn published_image(&self, image: &Path) {
+        self.blank_image(image);
+        metadata().write_for_image(image).expect("sidecar");
+        let signing_key =
+            KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).expect("fixture P-256 private key");
+        write_ca_key(image, signing_key.serialize_pem().as_bytes());
+    }
+
+    /// Attach `image` and mount its volume at `mount_point` with exactly `options` (as
+    /// `mount_apfs -o` takes them), the way an earlier process left it: the hosts under test
+    /// learn of the mount from the kernel alone.
+    fn mount_left_behind(&self, image: &Path, mount_point: &Path, options: &str) -> AttachedImage {
+        let attachment = self
+            .host()
+            .backend()
+            .attach_verified(image)
+            .expect("attach a real image");
+        self.remount(&attachment, mount_point, options);
+        attachment
+    }
+
+    /// Mount `attachment`'s volume at `mount_point` with exactly `options`.
+    fn remount(&self, attachment: &AttachedImage, mount_point: &Path, options: &str) {
+        std::fs::create_dir_all(mount_point).expect("mount point");
+        let mounted = Command::new("/sbin/mount_apfs")
+            .args(["-o", options])
+            .arg(attachment.volume_device())
+            .arg(mount_point)
+            .output()
+            .expect("run mount_apfs");
+        assert!(
+            mounted.status.success(),
+            "mount_apfs -o {options} {} {}: {}",
+            attachment.volume_device(),
+            mount_point.display(),
+            String::from_utf8_lossy(&mounted.stderr)
+        );
+    }
+
+    /// [`workspace`]'s in-image marker on the volume mounted at `mount_point`.
+    fn plant_marker(&self, mount_point: &Path, workspace: &LifecycleWorkspace) {
+        self.host()
+            .write_marker(mount_point, workspace, None, &identity_at(self.root()))
+            .expect("mount marker");
+    }
+}
+
+/// What the kernel mounts at `mount_point` right now, if anything.
+fn kernel_mount_at(mount_point: &Path) -> Option<KernelMountSnapshot> {
+    SystemKernelMountSource
+        .mounts()
+        .expect("getmntinfo")
+        .into_iter()
+        .find(|mount| mount.mount_point == mount_point)
+}
+
+/// Whether `hdiutil` lists `image` as attached right now.
+fn attached(image: &Path) -> bool {
+    let info = Command::new("/usr/bin/hdiutil")
+        .arg("info")
+        .output()
+        .expect("hdiutil info");
+    assert!(info.status.success(), "hdiutil info failed");
+    String::from_utf8_lossy(&info.stdout).lines().any(|line| {
+        line.strip_prefix("image-path")
+            .map(|path| path.trim_start_matches([' ', ':']))
+            .is_some_and(|path| Path::new(path) == image)
+    })
+}
+
+/// The total size of the filesystem mounted at `mount_point`, from `statfs`.
+fn filesystem_bytes(mount_point: &Path) -> u64 {
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::ffi::CString::new(mount_point.as_os_str().as_bytes()).expect("C path");
+    // SAFETY: statfs writes only into the zeroed struct it is handed; the path is NUL-terminated.
+    let mut stat = unsafe { std::mem::zeroed::<libc::statfs>() };
+    assert_eq!(
+        unsafe { libc::statfs(path.as_ptr(), &mut stat) },
+        0,
+        "statfs {}: {}",
+        mount_point.display(),
+        std::io::Error::last_os_error()
+    );
+    stat.f_blocks * u64::from(stat.f_bsize)
 }
 
 fn repo() -> RepoId {
@@ -395,37 +469,6 @@ fn session_workspace(workspace: &str, incarnation: &str) -> LifecycleWorkspace {
     .expect("lifecycle workspace")
 }
 
-/// Main's canonical mount — under the layout's mount root like every other workspace, never the
-/// adopted checkout path.
-/// Main mounts at the adopted checkout itself.
-fn main_mount(fixture: &Fixture) -> PathBuf {
-    fixture.config().checkout_path
-}
-
-/// Plant the in-image marker a mounted volume must carry for cowshed to recognize it as this
-/// workspace's. Mount identity is the marker, not the volume label: labels are human-facing and
-/// a hand-renamed volume must still be recognized.
-fn plant_mount_marker(fixture: &Fixture, mount: &Path) {
-    plant_foreign_mount_marker(fixture, mount, &workspace());
-}
-
-fn plant_foreign_mount_marker(fixture: &Fixture, mount: &Path, workspace: &LifecycleWorkspace) {
-    native_host(fixture, RecordingRunner::default())
-        .write_marker(mount, workspace, None, &identity(fixture))
-        .expect("mount marker");
-}
-
-fn native_host_with_mounts(
-    fixture: &Fixture,
-    runner: RecordingRunner,
-    mounts: Vec<KernelMountSnapshot>,
-) -> MacOsApfsExecutionHost<RecordingRunner> {
-    let source = FakeKernelMountSource::default();
-    source.set(mounts);
-    MacOsApfsExecutionHost::with_mount_source(runner, fixture.config(), source)
-        .expect("native APFS host")
-}
-
 fn native_host(
     fixture: &Fixture,
     runner: RecordingRunner,
@@ -462,8 +505,12 @@ fn wait_for_path(path: &Path) {
 }
 
 fn identity(fixture: &Fixture) -> OperationIdentity {
+    identity_at(&fixture.root)
+}
+
+fn identity_at(root: &Path) -> OperationIdentity {
     OperationIdentity {
-        project_root: fixture.root.join("project"),
+        project_root: root.join("project"),
         base_commit: "0123456789abcdef".to_owned(),
         created_at: "2026-07-13T00:00:00Z".to_owned(),
         branch: Some("main".to_owned()),
@@ -974,14 +1021,17 @@ fn malformed_session_sidecar_is_not_treated_as_a_missing_sidecar_orphan() {
     assert!(sidecar_path(&image).exists());
 }
 
+/// A session image the kernel still mounts or still has attached is deferred with the reason,
+/// never deleted, and the sweep carries on to the candidates after it. Both holds are real: one
+/// image's volume is mounted at its workspace mount point, another is attached without a mount.
 #[test]
-fn gc_reports_item_local_deferrals_and_reclaims_later_session_images() {
+fn real_apfs_gc_reports_item_local_deferrals_and_reclaims_later_session_images() {
     use std::os::fd::AsRawFd;
-    let fixture = Fixture::new("gc-session-deferrals");
-    let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
+    let fixture = RealFixture::new("gc-session-deferrals");
+    let layout = fixture.layout();
     std::fs::create_dir_all(&layout.project().sessions).expect("sessions directory");
-    let mounted_image = layout.project().sessions.join("a-mounted.sparseimage");
-    std::fs::write(&mounted_image, b"still mounted").expect("mounted sparseimage");
+    let mounted_image = layout.project().sessions.join("a-mounted.asif");
+    fixture.blank_image(&mounted_image);
     let later_image = layout.project().sessions.join("z-reclaim.asif");
     std::fs::write(&later_image, b"fixture").expect("sidecarless later image");
 
@@ -1004,29 +1054,19 @@ fn gc_reports_item_local_deferrals_and_reclaims_later_session_images() {
 
     use std::os::unix::fs::symlink;
     let symlink_image = layout.project().sessions.join("y-symlink.sparseimage");
-    let symlink_target = fixture.root.join("external.sparseimage");
+    let symlink_target = fixture.root().join("external.sparseimage");
     std::fs::write(&symlink_target, b"outside image").expect("external image");
     symlink(&symlink_target, &symlink_image).expect("legacy image symlink");
-    let attached_image = layout.project().sessions.join("c-attached.sparseimage");
-    std::fs::write(&attached_image, b"attached image").expect("attached sparseimage");
+    let attached_image = layout.project().sessions.join("c-attached.asif");
+    fixture.blank_image(&attached_image);
+    fixture
+        .host()
+        .backend()
+        .attach_verified(&attached_image)
+        .expect("attach without mounting");
 
     let mount_point = layout.project().mount_root.join("a-mounted");
-    std::fs::create_dir_all(&mount_point).expect("mounted workspace path");
-    let kernel = FakeKernelMountSource::default();
-    kernel.set(vec![KernelMountSnapshot::new(
-        1,
-        mount_point.clone(),
-        "/dev/disk9",
-        true,
-        true,
-    )]);
-    let runner = RecordingRunner::default();
-    runner
-        .inventory
-        .0
-        .lock()
-        .expect("fake inventory")
-        .push(attached_image.to_string_lossy().into_owned());
+    fixture.mount_left_behind(&mounted_image, &mount_point, "nobrowse,owners");
 
     let orphan_mountpoint = layout.project().mount_root.join("stray");
     std::fs::create_dir_all(&orphan_mountpoint).expect("orphan mountpoint");
@@ -1034,8 +1074,7 @@ fn gc_reports_item_local_deferrals_and_reclaims_later_session_images() {
     std::fs::write(&kept_work, b"unsaved work").expect("visible user work");
 
     let config = fixture.config();
-    let host = MacOsApfsExecutionHost::with_mount_source(runner, config.clone(), kernel)
-        .expect("native APFS host");
+    let host = fixture.host();
     let plan = host.preview_gc(&config, &repo()).expect("GC plan");
     assert!(plan.candidates().iter().any(|candidate| {
         candidate.path() == mounted_image.as_path()
@@ -1079,6 +1118,14 @@ fn gc_reports_item_local_deferrals_and_reclaims_later_session_images() {
     }));
     assert!(mounted_image.exists(), "mounted image is never deleted");
     assert!(
+        kernel_mount_at(&mount_point).is_some(),
+        "the deferral leaves the volume mounted"
+    );
+    assert!(
+        attached(&attached_image),
+        "the deferral leaves the image attached"
+    );
+    assert!(
         !later_image.exists(),
         "a deferred item does not stop later reclamation"
     );
@@ -1116,7 +1163,7 @@ fn gc_defers_an_inventory_deadline_and_reclaims_later_candidates() {
     let host = MacOsApfsExecutionHost::with_mount_source(
         DeadlineFirstInventoryRunner::default(),
         config.clone(),
-        FakeKernelMountSource::default(),
+        SystemKernelMountSource,
     )
     .expect("native APFS host");
     let plan = host.preview_gc(&config, &repo()).expect("GC plan");
@@ -2191,36 +2238,38 @@ fn sidecar_removal_does_not_hide_non_file_errors() {
     assert!(host.reclaim_image(image.image()).is_err());
 }
 
-/// A `WhenIdle` detach that a holder dissents leaves the workspace exactly as it found it: the
-/// mount is still the actor's, and exactly one unforced attempt was spent. Escalation is the
+/// A `WhenIdle` detach that a holder dissents leaves the workspace exactly as it found it: still
+/// mounted, and still the actor's to detach once the holder lets go. The holder is real — a file
+/// open on the volume — so the dissent is the one `diskutil eject` gives. Escalation is the
 /// backend's grace, proved against `DetachGrace` where the waiting can be observed without
 /// spending it.
 #[test]
-fn dissented_when_idle_detach_restores_actor_state_after_a_single_attempt() {
-    let fixture = Fixture::new("detach-retry");
-    let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
-    let image = layout.main_image().expect("image");
-    create_image(image.image());
-    let runner = FailingDetachRunner::new(1);
-    let host = MacOsApfsExecutionHost::new(runner.clone(), fixture.config()).expect("host");
+fn real_apfs_dissented_when_idle_detach_leaves_the_mount_to_the_actor() {
+    let fixture = RealFixture::new("detach-dissent");
+    let image = fixture.layout().main_image().expect("image");
+    fixture.published_image(image.image());
+    let host = fixture.host();
     let workspace = workspace();
+    let mount = fixture.main_mount();
+    std::fs::create_dir_all(&mount).expect("mount point");
     let attachment = host.attach_verified(image.image()).expect("attachment");
+    host.mount(&attachment, &mount, MountAccess::ReadWrite, false)
+        .expect("mount");
     host.retain_mounted(&workspace, attachment).expect("retain");
+    let holder = std::fs::File::create(mount.join("held")).expect("hold the volume");
 
     host.detach_mounted(&workspace, DetachIntent::WhenIdle)
         .expect_err("a dissented WhenIdle detach must fail");
-    assert_eq!(
-        *runner.detach_attempts.lock().expect("detach attempts"),
-        [false],
-        "WhenIdle never forces"
+    assert!(
+        kernel_mount_at(&mount).is_some(),
+        "WhenIdle never forces: the volume stays mounted"
     );
 
-    host.detach_mounted(&workspace, DetachIntent::WhenIdle)
+    drop(holder);
+    host.detach_mounted(&workspace, DetachIntent::Release)
         .expect("the workspace is still the actor's to detach");
-    assert_eq!(
-        *runner.detach_attempts.lock().expect("detach attempts"),
-        [false, false]
-    );
+    assert!(kernel_mount_at(&mount).is_none());
+    assert!(!attached(image.image()));
 }
 
 #[test]
@@ -2331,103 +2380,80 @@ fn published_listing_distinguishes_missing_sessions_from_an_invalid_sessions_pat
     assert!(host.list(&repo()).is_err());
 }
 
+/// A mount an earlier controller left is a kernel fact a restarted host reads back, identified by
+/// the in-image marker rather than the volume label (here renamed by hand between the two), and
+/// the restarted host detaches it by its mountpoint.
 #[test]
-fn kernel_mount_facts_survive_host_restart_and_detach_by_mountpoint() {
-    let fixture = Fixture::new("kernel-restart");
-    let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
-    let canonical = layout.main_image().expect("canonical");
-    create_image(canonical.image());
-    let source = FakeKernelMountSource::default();
-    source.set(vec![KernelMountSnapshot::new(
-        42,
-        main_mount(&fixture),
-        "/dev/disk10s1",
-        true,
-        true,
-    )]);
-    plant_mount_marker(&fixture, &main_mount(&fixture));
-    let first = MacOsApfsExecutionHost::with_mount_source(
-        RecordingRunner::default(),
-        fixture.config(),
-        source.clone(),
-    )
-    .expect("first host");
-    assert_eq!(first.mounts(&repo()).expect("first facts")[0].mount_id, 42);
+fn real_apfs_kernel_mount_facts_survive_host_restart_and_detach_by_mountpoint() {
+    let fixture = RealFixture::new("kernel-restart");
+    let canonical = fixture.layout().main_image().expect("canonical");
+    fixture.published_image(canonical.image());
+    let mount = fixture.main_mount();
+    fixture.mount_left_behind(canonical.image(), &mount, "nobrowse,owners");
+    fixture.plant_marker(&mount, &workspace());
+    let kernel_id = kernel_mount_at(&mount).expect("mounted").mount_id;
+
+    let first = fixture.host();
+    assert_eq!(
+        first.mounts(&repo()).expect("first facts")[0].mount_id,
+        kernel_id
+    );
     drop(first);
 
-    let runner = RecordingRunner::default();
-    let restarted =
-        MacOsApfsExecutionHost::with_mount_source(runner.clone(), fixture.config(), source)
-            .expect("restarted host");
+    let restarted = fixture.host();
+    restarted
+        .rename_volume(&mount, "hand-renamed")
+        .expect("rename the volume behind cowshed's back");
     assert_eq!(
         restarted.mounts(&repo()).expect("restart facts")[0].mount_id,
-        42
-    );
-    assert!(
-        runner.requests().is_empty(),
+        kernel_id,
         "mount identity is read from the in-image marker, never from the volume label"
     );
     restarted
         .detach_mounted(&workspace(), DetachIntent::Release)
         .expect("restart-safe detach");
-    let detach = runner.requests().last().cloned().expect("detach request");
-    assert_eq!(detach.program, Path::new("/usr/sbin/diskutil"));
-    assert_eq!(
-        detach.args,
-        [
-            std::ffi::OsString::from("eject"),
-            main_mount(&fixture).into_os_string(),
-        ]
-    );
+    assert!(kernel_mount_at(&mount).is_none());
+    assert!(!attached(canonical.image()));
 }
 
 /// A mount the host only knows from kernel facts is detached by mountpoint, and a `WhenIdle`
 /// detach of it reports the dissent rather than forcing a volume the user may still be in.
 #[test]
-fn restart_safe_when_idle_detach_reports_a_dissent_without_forcing() {
-    let fixture = Fixture::new("kernel-restart-force");
-    let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
-    let canonical = layout.main_image().expect("canonical");
-    create_image(canonical.image());
-    let source = FakeKernelMountSource::default();
-    source.set(vec![KernelMountSnapshot::new(
-        43,
-        main_mount(&fixture),
-        "/dev/disk10s1",
-        true,
-        true,
-    )]);
-    plant_mount_marker(&fixture, &main_mount(&fixture));
-    let runner = FailingDetachRunner::new(1);
-    let host = MacOsApfsExecutionHost::with_mount_source(runner.clone(), fixture.config(), source)
-        .expect("host");
+fn real_apfs_restart_safe_when_idle_detach_reports_a_dissent_without_forcing() {
+    let fixture = RealFixture::new("kernel-restart-dissent");
+    let canonical = fixture.layout().main_image().expect("canonical");
+    fixture.published_image(canonical.image());
+    let mount = fixture.main_mount();
+    fixture.mount_left_behind(canonical.image(), &mount, "nobrowse,owners");
+    fixture.plant_marker(&mount, &workspace());
+    let host = fixture.host();
+    let holder = std::fs::File::create(mount.join("held")).expect("hold the volume");
 
     host.detach_mounted(&workspace(), DetachIntent::WhenIdle)
         .expect_err("a dissented WhenIdle detach must not escalate");
-    host.detach_mounted(&workspace(), DetachIntent::WhenIdle)
-        .expect("the second attempt finds the mountpoint free");
-    assert_eq!(
-        *runner.detach_attempts.lock().expect("detach attempts"),
-        [false, false]
+    assert!(
+        kernel_mount_at(&mount).is_some(),
+        "the dissented volume is left mounted"
     );
+
+    drop(holder);
+    host.detach_mounted(&workspace(), DetachIntent::Release)
+        .expect("the mountpoint is free once the holder lets go");
+    assert!(kernel_mount_at(&mount).is_none());
 }
 
 #[test]
-fn canonical_path_with_an_unrelated_volume_fails_closed_without_detaching() {
-    let fixture = Fixture::new("wrong-source");
-    let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
-    let canonical = layout.main_image().expect("canonical");
-    create_image(canonical.image());
-    let source = FakeKernelMountSource::default();
-    source.set(vec![KernelMountSnapshot::new(
-        8,
-        main_mount(&fixture),
-        "/dev/disk10s1",
-        true,
-        true,
-    )]);
-    // An impostor that is itself a well-formed cowshed volume — a different project's — proves
-    // the check reads identity out of the marker rather than merely noticing a missing file.
+fn real_apfs_canonical_path_with_an_unrelated_volume_fails_closed_without_detaching() {
+    let fixture = RealFixture::new("wrong-source");
+    let canonical = fixture.layout().main_image().expect("canonical");
+    fixture.published_image(canonical.image());
+    // An impostor that is itself a well-formed cowshed volume — a different project's, on an
+    // image of its own — proves the check reads identity out of the marker rather than merely
+    // noticing a missing file.
+    let impostor_image = fixture.root().join("impostor/main.asif");
+    fixture.blank_image(&impostor_image);
+    let mount = fixture.main_mount();
+    fixture.mount_left_behind(&impostor_image, &mount, "nobrowse,owners");
     let foreign = LifecycleWorkspace::new(
         RepoId::parse("other/widget").expect("repo"),
         WorkspaceName::new("main").expect("main"),
@@ -2437,14 +2463,14 @@ fn canonical_path_with_an_unrelated_volume_fails_closed_without_detaching() {
         WorkspaceRole::Main,
     )
     .expect("foreign workspace");
-    plant_foreign_mount_marker(&fixture, &main_mount(&fixture), &foreign);
-    let runner = RecordingRunner::default();
-    let host = MacOsApfsExecutionHost::with_mount_source(runner.clone(), fixture.config(), source)
-        .expect("host");
+    fixture.plant_marker(&mount, &foreign);
+    let impostor = kernel_mount_at(&mount).expect("impostor mounted");
+    let host = fixture.host();
+
     let error = host.mounts(&repo()).expect_err("impostor mount");
     assert!(error.to_string().contains("mount identity mismatch"));
     let error = host
-        .heal_mount(&workspace(), &main_mount(&fixture))
+        .heal_mount(&workspace(), &mount)
         .expect_err("impostor must not be healed destructively");
     assert!(error.to_string().contains("cannot use unrelated mount"));
     let error = host
@@ -2455,8 +2481,9 @@ fn canonical_path_with_an_unrelated_volume_fails_closed_without_detaching() {
             .to_string()
             .contains("refusing to detach unrelated mount")
     );
-    assert!(
-        runner.requests().is_empty(),
+    assert_eq!(
+        kernel_mount_at(&mount).map(|mount| mount.source_device),
+        Some(impostor.source_device),
         "an impostor mount is rejected from its marker alone and never detached"
     );
 }
@@ -2471,12 +2498,7 @@ fn direct_mount_handoff_swaps_the_checkout_for_a_stubbed_mountpoint() {
     let pre_cowshed = fixture.root.join("mount.pre-cowshed");
     std::fs::create_dir_all(&checkout).expect("checkout");
     std::fs::write(checkout.join("README"), b"the user's tree").expect("user file");
-    let host = MacOsApfsExecutionHost::with_mount_source(
-        RecordingRunner::default(),
-        fixture.config(),
-        FakeKernelMountSource::default(),
-    )
-    .expect("host");
+    let host = MacOsApfsExecutionHost::new(SystemCommandRunner, fixture.config()).expect("host");
 
     host.vacate_adopted_checkout(&checkout, &pre_cowshed)
         .expect("vacate");
@@ -2518,12 +2540,7 @@ fn direct_mount_handoff_refuses_a_checkout_it_did_not_take_over() {
     let pre_cowshed = fixture.root.join("mount.pre-cowshed");
     std::fs::create_dir_all(&checkout).expect("checkout");
     std::fs::create_dir_all(&pre_cowshed).expect("collision");
-    let host = MacOsApfsExecutionHost::with_mount_source(
-        RecordingRunner::default(),
-        fixture.config(),
-        FakeKernelMountSource::default(),
-    )
-    .expect("host");
+    let host = MacOsApfsExecutionHost::new(SystemCommandRunner, fixture.config()).expect("host");
 
     // A retained tree already at the destination means a previous adoption left state behind.
     host.vacate_adopted_checkout(&checkout, &pre_cowshed)
@@ -2535,24 +2552,15 @@ fn direct_mount_handoff_refuses_a_checkout_it_did_not_take_over() {
 }
 
 #[test]
-fn wrong_kernel_mount_flags_are_detected_and_healed_by_mountpoint() {
-    let fixture = Fixture::new("wrong-flags");
-    let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
-    let canonical = layout.main_image().expect("canonical");
-    create_image(canonical.image());
-    let source = FakeKernelMountSource::default();
-    source.set(vec![KernelMountSnapshot::new(
-        7,
-        main_mount(&fixture),
-        "/dev/disk10s1",
-        false,
-        false,
-    )]);
-    plant_mount_marker(&fixture, &main_mount(&fixture));
-    let runner = RecordingRunner::default();
-    let host =
-        MacOsApfsExecutionHost::with_mount_source(runner.clone(), fixture.config(), source.clone())
-            .expect("host");
+fn real_apfs_wrong_kernel_mount_flags_are_detected_and_healed_by_mountpoint() {
+    let fixture = RealFixture::new("wrong-flags");
+    let canonical = fixture.layout().main_image().expect("canonical");
+    fixture.published_image(canonical.image());
+    let mount = fixture.main_mount();
+    // Browsable, and with ownership ignored: both flags the canonical mount must not carry.
+    fixture.mount_left_behind(canonical.image(), &mount, "noowners");
+    fixture.plant_marker(&mount, &workspace());
+    let host = fixture.host();
     let workspace = workspace();
     assert!(
         host.mounts(&repo())
@@ -2561,24 +2569,13 @@ fn wrong_kernel_mount_flags_are_detected_and_healed_by_mountpoint() {
             .contains("non-canonical flags")
     );
 
-    host.heal_mount(&workspace, &main_mount(&fixture))
+    host.heal_mount(&workspace, &mount)
         .expect("heal by mountpoint");
-    let requests = runner.requests();
-    assert_eq!(
-        requests.len(),
-        1,
-        "identity comes from the marker, so the only command is the detach"
+    assert!(
+        kernel_mount_at(&mount).is_none(),
+        "healing a wrongly flagged mount detaches it for a canonical remount"
     );
-    let detach = requests.last().expect("detach request");
-    assert_eq!(detach.program, Path::new("/usr/sbin/diskutil"));
-    assert_eq!(
-        detach.args,
-        [
-            std::ffi::OsString::from("eject"),
-            main_mount(&fixture).into_os_string(),
-        ]
-    );
-    source.set(Vec::new());
+    assert!(!attached(canonical.image()));
     assert!(host.mounts(&repo()).expect("healed facts").is_empty());
 }
 
@@ -3028,14 +3025,14 @@ fn gc_reclaims_unowned_staging_pairs_and_keeps_a_recoverable_publication() {
 /// of an interrupted operation; one whose volume the kernel still holds is detached first, and
 /// one an operation still owns (its lifecycle lock is held) is retained and counted.
 #[test]
-fn gc_retires_orphaned_staging_mountpoints_and_detaches_the_ones_still_attached() {
-    let fixture = Fixture::new("staging-mounts");
-    let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
+fn real_apfs_gc_retires_orphaned_staging_mountpoints_and_detaches_the_ones_still_attached() {
+    let fixture = RealFixture::new("staging-mounts");
+    let layout = fixture.layout();
     let staging_mounts = layout.project().mount_root.join(".staging");
     let empty = staging_mounts.join("session-a-00000000000000000000000000000002");
-    let attached = staging_mounts.join("session-b-00000000000000000000000000000003");
+    let held = staging_mounts.join("session-b-00000000000000000000000000000003");
     let owned = staging_mounts.join("session-c-00000000000000000000000000000004");
-    for directory in [&empty, &attached, &owned] {
+    for directory in [&empty, &held, &owned] {
         std::fs::create_dir_all(directory).expect("staging mountpoint");
     }
     std::fs::write(staging_mounts.join("not-a-staging-name"), b"ignored").expect("noise");
@@ -3043,26 +3040,16 @@ fn gc_retires_orphaned_staging_mountpoints_and_detaches_the_ones_still_attached(
         .project()
         .project_root
         .join(".staging/session-b-00000000000000000000000000000003.asif");
-    create_image(&staged);
+    fixture.published_image(&staged);
+    fixture.mount_left_behind(&staged, &held, "nobrowse,owners");
     let owned_lock = layout
         .session_image(&WorkspaceName::session("session-c").expect("session-c"))
         .expect("session-c image")
         .lock()
         .to_owned();
 
-    let runner = RecordingRunner::default();
-    let host = native_host_with_mounts(
-        &fixture,
-        runner.clone(),
-        vec![KernelMountSnapshot::new(
-            7,
-            attached.clone(),
-            "/dev/disk9s1",
-            true,
-            true,
-        )],
-    );
-    let owner = native_host_at(&fixture.root);
+    let host = fixture.host();
+    let owner = fixture.host();
     let guard = owner
         .lock_images(std::slice::from_ref(&owned_lock), LockMode::Wait)
         .expect("owner lock")
@@ -3089,26 +3076,19 @@ fn gc_retires_orphaned_staging_mountpoints_and_detaches_the_ones_still_attached(
     assert_eq!(report.reclaimed, 2);
     assert!(!empty.exists(), "the empty mountpoint is removed");
     assert!(
-        !attached.exists(),
-        "the attached mountpoint is removed after detach"
+        kernel_mount_at(&held).is_none(),
+        "the kernel-held volume is detached before its mountpoint goes"
+    );
+    assert!(
+        !held.exists(),
+        "the held mountpoint is removed after detach"
+    );
+    assert!(
+        !attached(&staged),
+        "nothing still holds the reclaimed image"
     );
     assert!(!staged.exists(), "the attached image is reclaimed");
     assert!(owned.exists(), "the owned mountpoint is retained");
-    let detached = runner.requests().into_iter().any(|request| {
-        request.program == Path::new("/usr/sbin/diskutil")
-            && request
-                .args
-                .first()
-                .is_some_and(|argument| argument == "eject")
-            && request
-                .args
-                .last()
-                .is_some_and(|argument| argument == attached.as_os_str())
-    });
-    assert!(
-        detached,
-        "the kernel-held volume is detached before its mountpoint goes"
-    );
 }
 
 #[cfg(unix)]
@@ -4220,35 +4200,38 @@ fn system_mount_source_observes_the_live_root_mount() {
     assert!(mounts.iter().all(|mount| mount.mount_id != 0));
 }
 
+/// One real volume remounted under every combination of the two flags the check reads, each read
+/// back from the kernel: browsing is the user's choice, honoring ownership is not.
 #[test]
-fn kernel_mount_flag_truth_table_allows_browse_but_requires_owners() {
-    for (nobrowse, owners, expected_valid) in [
-        (true, true, true),
-        (true, false, false),
-        (false, true, true),
-        (false, false, false),
+fn real_apfs_kernel_mount_flag_truth_table_allows_browse_but_requires_owners() {
+    let fixture = RealFixture::new("flag-table");
+    let canonical = fixture.layout().main_image().expect("canonical");
+    fixture.published_image(canonical.image());
+    let mount = fixture.main_mount();
+    let attachment = fixture.mount_left_behind(canonical.image(), &mount, "nobrowse,owners");
+    fixture.plant_marker(&mount, &workspace());
+    let host = fixture.host();
+    for (options, expected_valid) in [
+        ("nobrowse,owners", true),
+        ("nobrowse,noowners", false),
+        ("owners", true),
+        ("noowners", false),
     ] {
-        let fixture = Fixture::new(&format!("flag-table-{nobrowse}-{owners}"));
-        let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
-        let canonical = layout.main_image().expect("canonical");
-        create_image(canonical.image());
-        plant_mount_marker(&fixture, &main_mount(&fixture));
-        let source = FakeKernelMountSource::default();
-        source.set(vec![KernelMountSnapshot::new(
-            91,
-            main_mount(&fixture),
-            "/dev/disk10s1",
-            nobrowse,
-            owners,
-        )]);
-        let host = MacOsApfsExecutionHost::with_mount_source(
-            RecordingRunner::default(),
-            fixture.config(),
-            source,
-        )
-        .expect("host");
+        if kernel_mount_at(&mount).is_none() {
+            fixture.remount(&attachment, &mount, options);
+        }
         let result = host.mounts(&repo());
-        assert_eq!(result.is_ok(), expected_valid, "{nobrowse}/{owners}");
+        assert_eq!(result.is_ok(), expected_valid, "{options}: {result:?}");
+        let unmounted = Command::new("/sbin/umount")
+            .arg(&mount)
+            .output()
+            .expect("umount");
+        assert!(
+            unmounted.status.success(),
+            "umount {}: {}",
+            mount.display(),
+            String::from_utf8_lossy(&unmounted.stderr)
+        );
     }
 }
 
@@ -4694,279 +4677,108 @@ fn sidecar_primary_and_rollback_double_failure_retains_every_forward_artifact() 
     assert!(!pre_cowshed.exists());
 }
 
-/// Answers the resize sequence the way the real tools do: the image reports its old capacity
-/// until it is grown, and the attachment inventory only lists it once `attach` has run — which is
-/// what lets one runner serve both the pre-flight capacity read and the post-growth verification.
-#[derive(Clone)]
-struct ResizeRunner {
-    requests: Arc<Mutex<Vec<CommandRequest>>>,
-    image: PathBuf,
-    before: ImageCapacity,
-    after: ImageCapacity,
-    resized: Arc<AtomicBool>,
-    attached: Arc<AtomicBool>,
-    detach_failures: Arc<AtomicUsize>,
+/// A real main image mounted canonically at the checkout, carrying its marker, its minted
+/// credentials, and a payload a rewrite or resize must carry across — mounted by an earlier
+/// process, so the host under test learns of it from the kernel alone.
+fn mounted_main(fixture: &RealFixture) -> (PathBuf, PathBuf) {
+    let image = fixture
+        .layout()
+        .main_image()
+        .expect("image")
+        .image()
+        .to_owned();
+    fixture.published_image(&image);
+    let mount = fixture.main_mount();
+    fixture.mount_left_behind(&image, &mount, "nobrowse,owners");
+    fixture.plant_marker(&mount, &workspace());
+    mint_credentials(&workspace(), &mount, &fixture.root().join("main.ca.key"))
+        .expect("workspace credentials");
+    std::fs::write(mount.join("payload"), b"carried across").expect("payload");
+    (image, mount)
 }
 
-impl ResizeRunner {
-    fn new(image: &Path, before: ImageCapacity, after: ImageCapacity) -> Self {
-        Self {
-            requests: Arc::default(),
-            image: std::path::absolute(image).expect("absolute image path"),
-            before,
-            after,
-            resized: Arc::new(AtomicBool::new(false)),
-            attached: Arc::new(AtomicBool::new(false)),
-            detach_failures: Arc::default(),
-        }
-    }
-
-    fn failing_detach(self, failures: usize) -> Self {
-        self.detach_failures.store(failures, Ordering::SeqCst);
-        self
-    }
-
-    fn requests(&self) -> Vec<CommandRequest> {
-        self.requests.lock().expect("requests").clone()
-    }
-
-    fn argv(&self) -> Vec<Vec<String>> {
-        self.requests()
-            .iter()
-            .map(|request| {
-                std::iter::once(request.program.to_string_lossy().into_owned())
-                    .chain(
-                        request
-                            .args
-                            .iter()
-                            .map(|argument| argument.to_string_lossy().into_owned()),
-                    )
-                    .collect()
-            })
-            .collect()
-    }
-
-    fn capacity(&self) -> ImageCapacity {
-        if self.resized.load(Ordering::SeqCst) {
-            self.after
-        } else {
-            self.before
-        }
-    }
-
-    fn inventory(&self) -> Vec<u8> {
-        if !self.attached.load(Ordering::SeqCst) {
-            return EMPTY_ATTACHMENT_INVENTORY.as_bytes().to_vec();
-        }
-        format!(
-            r#"<?xml version="1.0"?><plist><dict><key>images</key><array><dict>
-              <key>image-path</key><string>{}</string>
-              <key>blockcount</key><integer>{}</integer>
-              <key>blocksize</key><integer>512</integer>
-              <key>system-entities</key><array>
-                <dict><key>dev-entry</key><string>/dev/disk9</string></dict>
-                <dict><key>dev-entry</key><string>/dev/disk10</string></dict>
-                <dict><key>dev-entry</key><string>/dev/disk10s1</string></dict>
-              </array>
-            </dict></array></dict></plist>"#,
-            self.image.display(),
-            self.capacity().bytes() / 512
-        )
-        .into_bytes()
-    }
-
-    /// `diskutil image resize --plist`: the image's current size and its bounds, in bytes.
-    fn limits(&self) -> Vec<u8> {
-        format!(
-            r#"<?xml version="1.0"?><plist version="1.0"><dict>
-              <key>current</key><integer>{}</integer>
-              <key>max</key><integer>4503599626321920</integer>
-              <key>min</key><integer>20971520</integer>
-            </dict></plist>"#,
-            self.capacity().bytes()
-        )
-        .into_bytes()
-    }
-}
-
-impl CommandRunner for ResizeRunner {
-    fn run(&self, request: &CommandRequest) -> Result<CommandOutput, CommandRunError> {
-        self.requests
-            .lock()
-            .expect("requests")
-            .push(request.clone());
-        let args: Vec<_> = request
-            .args
-            .iter()
-            .map(|argument| argument.to_string_lossy().into_owned())
-            .collect();
-        let head: Vec<&str> = args.iter().take(3).map(String::as_str).collect();
-        Ok(match head.as_slice() {
-            ["info", "-plist", ..] => CommandOutput::success(self.inventory()),
-            ["image", "resize", "--plist"] => CommandOutput::success(self.limits()),
-            ["image", "resize", "--size"] => {
-                self.resized.store(true, Ordering::SeqCst);
-                CommandOutput::success([])
-            }
-            ["image", "attach", ..] => {
-                self.attached.store(true, Ordering::SeqCst);
-                CommandOutput::success(ATTACH_PLIST.as_bytes().to_vec())
-            }
-            ["eject", ..] => {
-                if self
-                    .detach_failures
-                    .try_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
-                        remaining.checked_sub(1)
-                    })
-                    .is_ok()
-                {
-                    CommandOutput::failure(
-                        1,
-                        "Unmount of disk10 failed: at least one volume could not be unmounted\n",
-                    )
-                } else {
-                    self.attached.store(false, Ordering::SeqCst);
-                    CommandOutput::success([])
-                }
-            }
-            _ => CommandOutput::success([]),
-        })
-    }
-}
-
-fn resize_host(
-    fixture: &Fixture,
-    runner: ResizeRunner,
-    mounts: Vec<KernelMountSnapshot>,
-) -> MacOsApfsExecutionHost<ResizeRunner> {
-    let source = FakeKernelMountSource::default();
-    source.set(mounts);
-    MacOsApfsExecutionHost::with_mount_source(runner, fixture.config(), source)
-        .expect("native APFS host")
+/// After a verb that hands the workspace back mounted: it is on its own mount point with the
+/// canonical flags, its payload intact, and the attachment is the host's to detach.
+fn assert_back_on_its_mount(
+    host: &MacOsApfsExecutionHost<SystemCommandRunner>,
+    image: &Path,
+    mount: &Path,
+) {
+    assert!(
+        kernel_mount_at(mount).is_some(),
+        "the workspace returns to its own mount point"
+    );
+    assert_eq!(
+        host.mounts(&repo()).expect("canonical mount facts").len(),
+        1,
+        "the remount carries the canonical flags and the workspace's marker"
+    );
+    assert_eq!(
+        std::fs::read(mount.join("payload")).expect("payload"),
+        b"carried across"
+    );
+    host.detach_mounted(&workspace(), DetachIntent::Release)
+        .expect("the attachment is owned by the mount registry");
+    assert!(kernel_mount_at(mount).is_none());
+    assert!(!attached(image));
 }
 
 #[test]
-fn resizing_a_detached_workspace_grows_the_image_then_the_container_and_verifies_the_capacity() {
-    let fixture = Fixture::new("resize-detached");
-    let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
-    let image = layout.main_image().expect("image");
-    create_image(image.image());
-    let runner = ResizeRunner::new(
-        image.image(),
-        ImageCapacity::from_gibibytes(100),
-        ImageCapacity::from_gibibytes(200),
-    );
-    let host = resize_host(&fixture, runner.clone(), Vec::new());
+fn real_apfs_resizing_a_detached_workspace_grows_the_image_then_the_container() {
+    let fixture = RealFixture::new("resize-detached");
+    let image = fixture.layout().main_image().expect("image");
+    fixture.published_image(image.image());
+    let host = fixture.host();
 
     let outcome = host
         .resize(
             &workspace(),
             image.image(),
-            &main_mount(&fixture),
-            ImageCapacity::from_gibibytes(200),
+            &fixture.main_mount(),
+            ImageCapacity::from_gibibytes(2),
         )
         .expect("resize a detached workspace");
 
-    assert_eq!(outcome.previous, ImageCapacity::from_gibibytes(100));
-    assert_eq!(outcome.capacity, ImageCapacity::from_gibibytes(200));
-    let image_path = image.image().to_string_lossy().into_owned();
-    assert_eq!(
-        runner.argv(),
-        vec![
-            vec![
-                "/usr/bin/hdiutil".to_owned(),
-                "info".into(),
-                "-plist".into()
-            ],
-            vec![
-                "/usr/sbin/diskutil".to_owned(),
-                "image".into(),
-                "resize".into(),
-                "--plist".into(),
-                image_path.clone(),
-            ],
-            vec![
-                "/usr/sbin/diskutil".to_owned(),
-                "image".into(),
-                "resize".into(),
-                "--size".into(),
-                "214748364800".into(),
-                image_path.clone(),
-            ],
-            vec![
-                "/usr/bin/hdiutil".to_owned(),
-                "info".into(),
-                "-plist".into()
-            ],
-            vec![
-                "/usr/sbin/diskutil".to_owned(),
-                "image".into(),
-                "attach".into(),
-                "--nobrowse".into(),
-                "--noMount".into(),
-                "--plist".into(),
-                image_path,
-            ],
-            vec![
-                "/sbin/fsck_apfs".to_owned(),
-                "-q".into(),
-                "/dev/rdisk10s1".into()
-            ],
-            vec![
-                "/usr/sbin/diskutil".to_owned(),
-                "apfs".into(),
-                "resizeContainer".into(),
-                "/dev/disk10".into(),
-                "0".into(),
-            ],
-            vec![
-                "/usr/bin/hdiutil".to_owned(),
-                "info".into(),
-                "-plist".into()
-            ],
-            vec![
-                "/usr/bin/hdiutil".to_owned(),
-                "info".into(),
-                "-plist".into()
-            ],
-            vec![
-                "/usr/sbin/diskutil".to_owned(),
-                "eject".into(),
-                "/dev/disk10".into(),
-            ],
-            vec![
-                "/usr/bin/hdiutil".to_owned(),
-                "info".into(),
-                "-plist".into()
-            ],
-        ],
-        "a detached workspace is grown, verified, handed back detached by its image identity, and settle-confirmed"
+    assert_eq!(outcome.previous, ImageCapacity::from_gibibytes(1));
+    assert_eq!(outcome.capacity, ImageCapacity::from_gibibytes(2));
+    assert!(
+        !attached(image.image()),
+        "a detached workspace is handed back detached"
     );
+    assert_eq!(
+        host.backend()
+            .image_capacity(image.image())
+            .expect("image capacity"),
+        ImageCapacity::from_gibibytes(2)
+    );
+    // The container grew with the image: the volume's filesystem spans the new capacity.
+    let probe = fixture.root().join("probe");
+    let attachment = fixture.mount_left_behind(image.image(), &probe, "nobrowse,owners");
+    assert!(
+        filesystem_bytes(&probe) > ImageCapacity::from_gibibytes(1).bytes(),
+        "the APFS container was grown into the image: {} bytes",
+        filesystem_bytes(&probe)
+    );
+    host.detach(attachment, DetachIntent::Release)
+        .expect("detach the probe");
 }
 
 #[test]
-fn resize_refuses_a_capacity_that_does_not_grow_before_touching_the_image() {
-    let fixture = Fixture::new("resize-shrink");
-    let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
-    let image = layout.main_image().expect("image");
-    create_image(image.image());
+fn real_apfs_resize_refuses_a_capacity_that_does_not_grow_before_touching_the_image() {
+    let fixture = RealFixture::new("resize-shrink");
+    let image = fixture.layout().main_image().expect("image");
+    fixture.published_image(image.image());
+    let host = fixture.host();
 
     for requested in [
-        ImageCapacity::from_gibibytes(50),
-        ImageCapacity::from_gibibytes(100),
+        ImageCapacity::parse("512m").expect("half a gibibyte"),
+        ImageCapacity::from_gibibytes(1),
     ] {
-        let runner = ResizeRunner::new(
-            image.image(),
-            ImageCapacity::from_gibibytes(100),
-            ImageCapacity::from_gibibytes(200),
-        );
-        let host = resize_host(&fixture, runner.clone(), Vec::new());
-
         let error = host
             .resize(
                 &workspace(),
                 image.image(),
-                &main_mount(&fixture),
+                &fixture.main_mount(),
                 requested,
             )
             .expect_err("resize only ever grows");
@@ -4975,198 +4787,94 @@ fn resize_refuses_a_capacity_that_does_not_grow_before_touching_the_image() {
             matches!(
                 error,
                 ApfsStorageError::CapacityNotGrowing { current, requested: asked }
-                    if current == ImageCapacity::from_gibibytes(100) && asked == requested
+                    if current == ImageCapacity::from_gibibytes(1) && asked == requested
             ),
             "unexpected refusal: {error}"
         );
-        assert!(
-            runner
-                .argv()
-                .iter()
-                .all(|argv| !argv.contains(&"--size".to_owned())),
-            "a refused resize must not have grown anything: {:?}",
-            runner.argv()
+        assert_eq!(
+            host.backend()
+                .image_capacity(image.image())
+                .expect("image capacity"),
+            ImageCapacity::from_gibibytes(1),
+            "a refused resize must not have grown anything"
         );
     }
 }
 
 #[test]
-fn resize_refuses_a_busy_workspace_before_growing_the_image() {
-    let fixture = Fixture::new("resize-busy");
-    let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
-    let image = layout.main_image().expect("image");
-    create_image(image.image());
-    plant_mount_marker(&fixture, &main_mount(&fixture));
-    let runner = ResizeRunner::new(
-        image.image(),
-        ImageCapacity::from_gibibytes(100),
-        ImageCapacity::from_gibibytes(200),
-    )
-    .failing_detach(1);
-    let mount = main_mount(&fixture);
-    let host = resize_host(
-        &fixture,
-        runner.clone(),
-        vec![KernelMountSnapshot::new(
-            7,
-            mount.clone(),
-            "/dev/disk10s1",
-            true,
-            true,
-        )],
-    );
+fn real_apfs_resize_refuses_a_busy_workspace_before_growing_the_image() {
+    let fixture = RealFixture::new("resize-busy");
+    let (image, mount) = mounted_main(&fixture);
+    let host = fixture.host();
+    let holder = std::fs::File::open(mount.join("payload")).expect("hold the volume");
 
     let error = host
         .resize(
             &workspace(),
-            image.image(),
+            &image,
             &mount,
-            ImageCapacity::from_gibibytes(200),
+            ImageCapacity::from_gibibytes(2),
         )
         .expect_err("a busy volume refuses the resize rather than being torn out");
-    assert_eq!(
-        error.to_string(),
-        format!(
-            "APFS operation failed: detach image failed: executable \"/usr/sbin/diskutil\", argv [\"eject\", {:?}], exit status 1; stdout: <empty>; stderr: Unmount of disk10 failed: at least one volume could not be unmounted",
-            mount.as_os_str()
-        )
+    let message = error.to_string();
+    assert!(
+        message.contains("detach image failed") && message.contains(&*mount.to_string_lossy()),
+        "the refusal names the detach of this workspace's mount: {message}"
     );
 
     assert!(
-        runner
-            .argv()
-            .iter()
-            .all(|argv| !argv.contains(&"--size".to_owned())),
-        "a workspace that would not detach must keep its capacity: {:?}",
-        runner.argv()
+        kernel_mount_at(&mount).is_some(),
+        "the workspace stays mounted"
     );
+    assert_eq!(
+        host.backend()
+            .attached_capacity(&image)
+            .expect("attached capacity"),
+        ImageCapacity::from_gibibytes(1),
+        "a workspace that would not detach must keep its capacity"
+    );
+    drop(holder);
 }
 
 #[test]
-fn resizing_a_mounted_workspace_puts_it_back_on_its_mount() {
-    let fixture = Fixture::new("resize-mounted");
-    let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
-    let image = layout.main_image().expect("image");
-    create_image(image.image());
-    let mount = main_mount(&fixture);
-    plant_mount_marker(&fixture, &mount);
-    mint_credentials(&workspace(), &mount, &fixture.root.join("resize.ca.key"))
-        .expect("workspace credentials");
-    let runner = ResizeRunner::new(
-        image.image(),
-        ImageCapacity::from_gibibytes(100),
-        ImageCapacity::from_gibibytes(200),
-    );
-    let host = resize_host(
-        &fixture,
-        runner.clone(),
-        vec![KernelMountSnapshot::new(
-            7,
-            mount.clone(),
-            "/dev/disk10s1",
-            true,
-            true,
-        )],
-    );
+fn real_apfs_resizing_a_mounted_workspace_puts_it_back_on_its_mount() {
+    let fixture = RealFixture::new("resize-mounted");
+    let (image, mount) = mounted_main(&fixture);
+    let host = fixture.host();
 
     let outcome = host
         .resize(
             &workspace(),
-            image.image(),
+            &image,
             &mount,
-            ImageCapacity::from_gibibytes(200),
+            ImageCapacity::from_gibibytes(2),
         )
         .expect("resize a mounted workspace");
 
-    assert_eq!(outcome.capacity, ImageCapacity::from_gibibytes(200));
-    let argv = runner.argv();
-    let detached_first = argv
-        .iter()
-        .position(|command| command.get(1).is_some_and(|verb| verb == "eject"))
-        .expect("the mounted volume is detached first");
-    let grew = argv
-        .iter()
-        .position(|command| command.contains(&"--size".to_owned()))
-        .expect("the image is grown");
-    let remounted = argv
-        .iter()
-        .position(|command| command[0] == "/sbin/mount_apfs")
-        .expect("the workspace is mounted again");
+    assert_eq!(outcome.capacity, ImageCapacity::from_gibibytes(2));
     assert!(
-        detached_first < grew && grew < remounted,
-        "resize must detach, grow, then remount: {argv:?}"
+        filesystem_bytes(&mount) > ImageCapacity::from_gibibytes(1).bytes(),
+        "the remounted volume spans the grown container"
     );
-    assert!(
-        argv[remounted].contains(&mount.to_string_lossy().into_owned()),
-        "the workspace returns to its own mount point: {:?}",
-        argv[remounted]
-    );
-    host.detach_mounted(&workspace(), DetachIntent::Release)
-        .expect("the resized attachment is owned by the mount registry");
-}
-
-/// A mounted fixture main whose detach the runner refuses `busy` times, plus its host.
-fn defragment_fixture(
-    test: &str,
-    busy: usize,
-) -> (
-    Fixture,
-    PathBuf,
-    PathBuf,
-    ResizeRunner,
-    MacOsApfsExecutionHost<ResizeRunner>,
-) {
-    let fixture = Fixture::new(test);
-    let image = StorageLayout::new(&fixture.root, &repo())
-        .expect("layout")
-        .main_image()
-        .expect("image")
-        .image()
-        .to_owned();
-    create_image(&image);
-    let mount = main_mount(&fixture);
-    plant_mount_marker(&fixture, &mount);
-    mint_credentials(
-        &workspace(),
-        &mount,
-        &fixture.root.join("defragment.ca.key"),
-    )
-    .expect("workspace credentials");
-    let runner = ResizeRunner::new(
-        &image,
-        ImageCapacity::from_gibibytes(100),
-        ImageCapacity::from_gibibytes(100),
-    )
-    .failing_detach(busy);
-    let host = resize_host(
-        &fixture,
-        runner.clone(),
-        vec![KernelMountSnapshot::new(
-            7,
-            mount.clone(),
-            "/dev/disk10s1",
-            true,
-            true,
-        )],
-    );
-    (fixture, image, mount, runner, host)
+    assert_back_on_its_mount(&host, &image, &mount);
 }
 
 #[test]
-fn defragment_refuses_a_busy_workspace_before_touching_the_image() {
-    let (_fixture, image, mount, runner, host) = defragment_fixture("defragment-busy", 1);
+fn real_apfs_defragment_refuses_a_busy_workspace_before_touching_the_image() {
+    let fixture = RealFixture::new("defragment-busy");
+    let (image, mount) = mounted_main(&fixture);
+    let host = fixture.host();
     let before = std::fs::metadata(&image).expect("image").ino();
+    let holder = std::fs::File::open(mount.join("payload")).expect("hold the volume");
 
     let error = host
         .defragment(&workspace(), &image, &mount)
         .expect_err("a busy volume refuses the rewrite rather than being torn out");
 
-    assert_eq!(
-        error.to_string(),
-        format!(
-            "APFS operation failed: detach image failed: executable \"/usr/sbin/diskutil\", argv [\"eject\", {:?}], exit status 1; stdout: <empty>; stderr: Unmount of disk10 failed: at least one volume could not be unmounted",
-            mount.as_os_str()
-        )
+    let message = error.to_string();
+    assert!(
+        message.contains("detach image failed") && message.contains(&*mount.to_string_lossy()),
+        "the refusal names the detach of this workspace's mount: {message}"
     );
     assert_eq!(
         std::fs::metadata(&image).expect("image").ino(),
@@ -5181,18 +4889,17 @@ fn defragment_refuses_a_busy_workspace_before_touching_the_image() {
         "a refused rewrite never starts a copy"
     );
     assert!(
-        runner
-            .argv()
-            .iter()
-            .all(|argv| argv.get(1..3) != Some(&["image".to_owned(), "attach".to_owned()][..])),
-        "nothing is attached for a refused rewrite: {:?}",
-        runner.argv()
+        kernel_mount_at(&mount).is_some(),
+        "the workspace stays mounted"
     );
+    drop(holder);
 }
 
 #[test]
-fn defragmenting_a_mounted_workspace_replaces_the_image_then_puts_it_back_on_its_mount() {
-    let (_fixture, image, mount, runner, host) = defragment_fixture("defragment-mounted", 0);
+fn real_apfs_defragmenting_a_mounted_workspace_replaces_the_image_then_puts_it_back_on_its_mount() {
+    let fixture = RealFixture::new("defragment-mounted");
+    let (image, mount) = mounted_main(&fixture);
+    let host = fixture.host();
     let before = std::fs::metadata(&image).expect("image");
 
     let outcome = host
@@ -5201,44 +4908,23 @@ fn defragmenting_a_mounted_workspace_replaces_the_image_then_puts_it_back_on_its
 
     let after = std::fs::metadata(&image).expect("image");
     assert_ne!(after.ino(), before.ino(), "the image is a new file");
-    assert_eq!(std::fs::read(&image).expect("image"), b"fixture");
+    assert_eq!(after.len(), before.len());
     assert_eq!(after.permissions().mode(), before.permissions().mode());
-    assert_eq!(outcome.bytes, 7);
-    let argv = runner.argv();
-    let detached = argv
-        .iter()
-        .position(|command| command.get(1).is_some_and(|verb| verb == "eject"))
-        .expect("the mounted volume is detached first");
-    let attached = argv
-        .iter()
-        .position(|command| {
-            command.get(1..3) == Some(&["image".to_owned(), "attach".to_owned()][..])
-        })
-        .expect("the rewritten image is attached and verified");
-    let fsck = argv
-        .iter()
-        .position(|command| command[0] == "/sbin/fsck_apfs")
-        .expect("the rewritten image is checked before it is mounted");
-    let remounted = argv
-        .iter()
-        .position(|command| command[0] == "/sbin/mount_apfs")
-        .expect("the workspace is mounted again");
     assert!(
-        detached < attached && attached < fsck && fsck < remounted,
-        "defragment must detach, rewrite, verify, then remount: {argv:?}"
+        outcome.bytes > 0 && outcome.bytes <= before.len(),
+        "only the image's data is copied: {} of {} bytes",
+        outcome.bytes,
+        before.len()
     );
-    assert!(
-        argv[remounted].contains(&mount.to_string_lossy().into_owned()),
-        "the workspace returns to its own mount point: {:?}",
-        argv[remounted]
-    );
-    host.detach_mounted(&workspace(), DetachIntent::Release)
-        .expect("the rewritten attachment is owned by the mount registry");
+    assert_back_on_its_mount(&host, &image, &mount);
 }
 
 #[test]
-fn a_failed_rewrite_leaves_the_image_untouched_and_puts_the_workspace_back_on_its_mount() {
-    let (_fixture, image, mount, runner, host) = defragment_fixture("defragment-failed", 0);
+fn real_apfs_a_failed_rewrite_leaves_the_image_untouched_and_puts_the_workspace_back_on_its_mount()
+{
+    let fixture = RealFixture::new("defragment-failed");
+    let (image, mount) = mounted_main(&fixture);
+    let host = fixture.host();
     let before = std::fs::metadata(&image).expect("image").ino();
     // A directory where the copy has to go: the rewrite cannot clear it, so it fails before a
     // byte is copied.
@@ -5259,17 +4945,7 @@ fn a_failed_rewrite_leaves_the_image_untouched_and_puts_the_workspace_back_on_it
         "unexpected failure: {error}"
     );
     assert_eq!(std::fs::metadata(&image).expect("image").ino(), before);
-    assert_eq!(std::fs::read(&image).expect("image"), b"fixture");
-    assert!(
-        runner
-            .argv()
-            .iter()
-            .any(|command| command[0] == "/sbin/mount_apfs"),
-        "the untouched image goes back on its mount: {:?}",
-        runner.argv()
-    );
-    host.detach_mounted(&workspace(), DetachIntent::Release)
-        .expect("the restored attachment is owned by the mount registry");
+    assert_back_on_its_mount(&host, &image, &mount);
 }
 
 /// SliceA quarantine: a published canonical image whose grants sidecar exists but whose CA

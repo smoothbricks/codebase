@@ -142,12 +142,16 @@ Invariants the table-driven unit cases only sample. Each is a pure function over
 
 ## Integration tests (real substrate)
 
-Gated by `COWSHED_INTEGRATION=1` and parametrized over the substrate the host provides. On macOS: small `.asif` images
-(1 GiB caps) under `/private/tmp/cowshed-itest-<pid>`, mirroring the apfs-workspace-bench harness, cleaned up in reverse
-mount order with `-force` fallback. On Linux: a scratch ZFS pool on a loopback/file vdev (`cowshed.itest.<pid>`) with
-datasets destroyed and the pool exported on teardown; the Linux leg also exercises `cowshed-helper` and the
-Landlock/netns exec path. A suite-level guard reaps leaked `cowshed.itest.*` volumes/pools. The same flow table runs on
-both; substrate-specific assertions (fsck step on APFS, origin-snapshot GC on ZFS) are tagged.
+Parametrized over the substrate the host provides, and never gated off on it: a missing capability is a failure, not a
+skip. On macOS these are the `real_apfs_*` tests, compiled only for macOS and serialized run-wide by the nextest
+`real-apfs` group: small `.asif` images (1 GiB caps) under `/private/tmp/cowshed-itest-<pid>-<n>-<label>`, driven by the
+production host — real `diskutil`/`hdiutil`/`mount_apfs`, the live kernel mount table. A mount state a test needs (wrong
+flags, an impostor volume, a busy holder) is produced on a real volume, never by a substitute mount source. Each root
+detaches its images and is removed when its test ends, and every run first reclaims the roots and attachments of runs
+whose pid is gone. On Linux: a scratch ZFS pool on a loopback/file vdev (`cowshed.itest.<pid>`) with datasets destroyed
+and the pool exported on teardown; the Linux leg also exercises `cowshed-helper` and the Landlock/netns exec path. A
+suite-level guard reaps leaked `cowshed.itest.*` volumes/pools. The same flow table runs on both; substrate-specific
+assertions (fsck step on APFS, origin-snapshot GC on ZFS) are tagged.
 
 Covered flows:
 
