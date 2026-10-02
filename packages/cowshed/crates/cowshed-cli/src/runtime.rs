@@ -302,8 +302,12 @@ impl ActorBridge {
         requested_repo_id: Option<RepoId>,
         storage: ValidatedHostStorage,
     ) -> Result<Self> {
-        let runtime =
-            ProjectRuntime::open_for_adopt_at(project_root, requested_repo_id, storage).await?;
+        let runtime = cowshed_core::timing::timed_async(
+            "controller-open",
+            "runtime",
+            ProjectRuntime::open_for_adopt_at(project_root, requested_repo_id, storage),
+        )
+        .await?;
         Self::from_runtime(project_root, runtime).await
     }
 
@@ -349,13 +353,25 @@ impl ActorBridge {
         ));
         let client_descriptor: OwnedFd = client.into();
 
-        let (cowshed, token) = match cowshed_core::Cowshed::connect(client_descriptor).await {
+        let (cowshed, token) = match cowshed_core::timing::timed_async(
+            "controller-open",
+            "connect",
+            cowshed_core::Cowshed::connect(client_descriptor),
+        )
+        .await
+        {
             Ok(connection) => connection,
             Err(primary) => {
                 return Err(cleanup_open_failure(primary, connection, runtime).await);
             }
         };
-        let project = match cowshed.open(project_root).await {
+        let project = match cowshed_core::timing::timed_async(
+            "controller-open",
+            "project",
+            cowshed.open(project_root),
+        )
+        .await
+        {
             Ok(project) => project,
             Err(primary) => {
                 drop(token);

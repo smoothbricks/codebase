@@ -8437,17 +8437,17 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
         into: Option<WorkspaceTarget>,
         options: LandOptions,
     ) -> Result<LandReport> {
-        self.validate_binding().await?;
-        let current = self.current(&workspace).await?;
+        timed_async("land", "binding", self.validate_binding()).await?;
+        let current = timed_async("land", "source", self.current(&workspace)).await?;
         if let Some(expected) = options.expected_workspace_incarnation.as_ref() {
             Self::require_exact_incarnation(&current, expected)?;
         }
         // Resolved before any check runs: a lane base that was recreated under its name refuses
         // here, not after minutes of checks.
-        let into = self.landing_into(&workspace, into).await?;
+        let into = timed_async("land", "target", self.landing_into(&workspace, into)).await?;
         let source_mount = current_snapshot_mount(self, &current)?;
         let source_repository = crate::git::GitRepository::from_root(&source_mount);
-        let source_head = git_oid(&source_mount).await?;
+        let source_head = timed_async("land", "source-head", git_oid(&source_mount)).await?;
         if options
             .expected_source_head
             .as_ref()
@@ -8462,9 +8462,12 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
         // would pass validation without landing, and would then refuse the retire after main had
         // already moved. The same reading of "work" as `rm` makes, so land refuses exactly the
         // trees retirement would.
-        if source_repository
-            .is_dirty_by(Some(&self.substrate_config.checkout_path))
-            .await?
+        if timed_async(
+            "land",
+            "source-dirty",
+            source_repository.is_dirty_by(Some(&self.substrate_config.checkout_path)),
+        )
+        .await?
         {
             return Err(CowshedError::conflict(
                 format!(
@@ -8477,21 +8480,36 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
         }
         let target_branch = match options.target_branch.clone() {
             Some(branch) => branch,
-            None => into.checked_out_branch().await?,
+            None => timed_async("land", "target-branch", into.checked_out_branch()).await?,
         };
-        require_target_checked_out(&into.root, &target_branch).await?;
+        timed_async(
+            "land",
+            "target-check",
+            require_target_checked_out(&into.root, &target_branch),
+        )
+        .await?;
         let target_ref = format!("refs/heads/{target_branch}");
-        let previous = git_optional_ref_oid(&into.root, &target_ref).await?;
+        let previous = timed_async(
+            "land",
+            "target-head",
+            git_optional_ref_oid(&into.root, &target_ref),
+        )
+        .await?;
         require_expected_ref(
             options.expected_target_head.as_ref(),
             previous.as_ref(),
             "land target",
         )?;
         let retire = options.retire;
-        let handle = self.ensure_supervisor(&workspace).await?;
+        let handle = timed_async("land", "supervisor", self.ensure_supervisor(&workspace)).await?;
         for check in options.check.unwrap_or_default() {
-            let job_id = handle.exec(None, land_check_request(&check)).await?;
-            let info = handle.wait(job_id).await?;
+            let job_id = timed_async(
+                "land",
+                "check-exec",
+                handle.exec(None, land_check_request(&check)),
+            )
+            .await?;
+            let info = timed_async("land", "check-wait", handle.wait(job_id)).await?;
             let exit_code = match info.exit {
                 Some(crate::api::dto::ExitStatus::Exited { code }) => Some(code),
                 _ => None,
@@ -8531,20 +8549,27 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
         // Land has no branch-name contract with the workspace: it delivers whatever branch the
         // workspace has checked out, whether an agent named it `cowshed/<ws>`, `wt/<ws>`, or
         // anything else. Only the resolved head is load-bearing.
-        let source_branch = source_repository.current_branch().await?.ok_or_else(|| {
-            CowshedError::conflict(
-                format!("workspace {workspace} has no checked-out branch to land"),
-                "check out a branch in the workspace and retry land",
-            )
-        })?;
-        deliver_into(
-            &into.name,
-            &into.root,
-            &source_mount,
-            &workspace,
-            &source_branch,
-            &source_head,
-            &target_branch,
+        let source_branch =
+            timed_async("land", "source-branch", source_repository.current_branch())
+                .await?
+                .ok_or_else(|| {
+                    CowshedError::conflict(
+                        format!("workspace {workspace} has no checked-out branch to land"),
+                        "check out a branch in the workspace and retry land",
+                    )
+                })?;
+        timed_async(
+            "land",
+            "delivery",
+            deliver_into(
+                &into.name,
+                &into.root,
+                &source_mount,
+                &workspace,
+                &source_branch,
+                &source_head,
+                &target_branch,
+            ),
         )
         .await?;
         // The target has moved, so build it at what landed: every later clone of it copies its

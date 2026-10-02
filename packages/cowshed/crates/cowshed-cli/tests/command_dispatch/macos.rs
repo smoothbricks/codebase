@@ -248,6 +248,9 @@ impl Drop for Fixture {
 }
 
 fn git(directory: &Path, args: &[&str]) {
+    let verb = args.first().copied().unwrap_or("empty");
+    eprintln!("dispatch fixture git: {verb} start");
+    let started = std::time::Instant::now();
     let output = Command::new("git")
         .args(args)
         .current_dir(directory)
@@ -259,6 +262,11 @@ fn git(directory: &Path, args: &[&str]) {
         .env("GIT_COMMITTER_EMAIL", "fixture@example.invalid")
         .output()
         .expect("git process");
+    eprintln!(
+        "dispatch fixture git: {verb} done elapsed={:?} status={}",
+        started.elapsed(),
+        output.status
+    );
     assert!(
         output.status.success(),
         "git {:?}: {}",
