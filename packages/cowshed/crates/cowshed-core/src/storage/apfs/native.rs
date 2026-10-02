@@ -906,15 +906,10 @@ fn typed_children(
         .map_err(|error| io_error("enumerate recovery directory", directory, error))?;
     entries
         .filter_map(|entry| match entry {
-            Ok(entry) => match fs::symlink_metadata(entry.path()) {
-                Ok(metadata) if keep(metadata.file_type()) => Some(Ok(entry.path())),
-                Ok(_) => None,
-                Err(error) => Some(Err(io_error(
-                    "inspect recovery directory",
-                    &entry.path(),
-                    error,
-                ))),
-            },
+            Ok(entry) => {
+                let path = entry.path();
+                kept_child(path.clone(), fs::symlink_metadata(&path), &keep)
+            }
             Err(error) => Some(Err(io_error(
                 "read recovery directory entry",
                 directory,
@@ -922,6 +917,23 @@ fn typed_children(
             ))),
         })
         .collect()
+}
+
+/// One listed entry of a recovery directory, judged by its own metadata: kept when `keep` accepts
+/// its type, skipped when it is not, and skipped when it no longer exists. A listing is a snapshot
+/// and other workspaces' lifecycle verbs remove their files concurrently, so an entry removed
+/// between `read_dir` and its inspection is gone, not a fault of this pass.
+fn kept_child(
+    path: PathBuf,
+    metadata: io::Result<fs::Metadata>,
+    keep: &impl Fn(fs::FileType) -> bool,
+) -> Option<Result<PathBuf, ApfsStorageError>> {
+    match metadata {
+        Ok(metadata) if keep(metadata.file_type()) => Some(Ok(path)),
+        Ok(_) => None,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => Some(Err(io_error("inspect recovery directory", &path, error))),
+    }
 }
 
 fn directory_children(directory: &Path) -> Result<Vec<PathBuf>, ApfsStorageError> {
@@ -5900,6 +5912,27 @@ fn clone_lineage_from(marker_path: &Path, repo: &RepoId) -> Vec<WorkspaceIncarna
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A recovery pass lists a directory other workspaces' lifecycle verbs write to at the same
+    /// time: an entry removed between the listing and its inspection is skipped, never a failure
+    /// of the pass (a sibling's retirement removing its `.asif.ca.key` failed every job poll of
+    /// an unrelated workspace). Any other inspection failure is still the pass's error.
+    #[test]
+    fn a_listed_entry_removed_before_its_inspection_is_skipped() {
+        let regular = |file_type: fs::FileType| file_type.is_file();
+        let removed = Err(io::Error::from(io::ErrorKind::NotFound));
+        assert!(kept_child(PathBuf::from("/s/gone.asif.ca.key"), removed, &regular).is_none());
+        let denied = Err(io::Error::from(io::ErrorKind::PermissionDenied));
+        assert!(matches!(
+            kept_child(PathBuf::from("/s/locked"), denied, &regular),
+            Some(Err(_))
+        ));
+        let file = std::env::current_exe().expect("the test binary is a regular file");
+        assert!(matches!(
+            kept_child(file.clone(), fs::symlink_metadata(&file), &regular),
+            Some(Ok(path)) if path == file
+        ));
+    }
 
     /// A retired mountpoint's strays: hidden and gitignored ones go, so does a copy of a file the
     /// repository already stores, and a visible file with bytes git does not hold stays and is
