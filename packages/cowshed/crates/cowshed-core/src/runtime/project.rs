@@ -8683,8 +8683,9 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
         }
         // What any other opening would have finished first, read where it is recorded: an
         // inspecting open (doctor without --repair) finishes none of it.
-        let identity_intent =
-            crate::storage::recovery::RepositoryIdentityIntent::path(&self.descriptor.store_root);
+        let identity_intent = crate::storage::recovery::RepositoryIdentityIntent::path(
+            self.descriptor.storage.store(),
+        );
         if identity_intent.symlink_metadata().is_ok() {
             findings.push(crate::api::dto::Finding {
                 code: "identity-change-unfinished".into(),
