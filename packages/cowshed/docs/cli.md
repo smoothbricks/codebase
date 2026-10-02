@@ -572,7 +572,8 @@ status of the command's to give. A command that finishes just as the timeout fir
 the rest of its output and exits with its code. `--background` prints the numeric job id and returns at once, exit 0,
 naming on stderr how to reach the job. No CLI verb reattaches to a job; the cowshed API does (`worker("<ws>").job(<id>)`
 waits for it, reads its logs or kills it — see [integrations.md](integrations.md)). `cowshed exec` accepts
-`--session <name>` for a named session whose cwd and variables carry across calls.
+`--session <name>` for a named session whose cwd and variables carry across calls; opening a name the workspace already
+holds rejoins that session and never closes it.
 
 Commands under the workspace `.envrc` run in a warm shell: the supervisor activates the `.envrc` once and starts each
 command from that activated environment, so only the first command after the workspace shell's inputs change pays for

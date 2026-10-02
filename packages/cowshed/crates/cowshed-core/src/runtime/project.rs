@@ -5715,6 +5715,17 @@ impl NativeProjectRuntimeHost {
     }
 }
 
+/// The token a session open replaced, when it names another session. The supervisor answers a
+/// name it still holds with that session's own identity, so a reopen's previous token is the
+/// session just opened, and closing it would close the session the caller is about to run in.
+#[cfg(target_os = "macos")]
+fn superseded_session(
+    previous: super::supervisor::SessionToken,
+    reopened: u64,
+) -> Option<super::supervisor::SessionToken> {
+    (previous.identity() != reopened).then_some(previous)
+}
+
 #[cfg(target_os = "macos")]
 struct NativeWorkspace {
     derived: crate::storage::lifecycle::DerivedWorkspace,
@@ -8863,8 +8874,20 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
         Self::require_exact_incarnation(&current, &incarnation)?;
         let handle = self.ensure_supervisor(&workspace).await?;
         let token = handle.open_session(name.clone()).await?;
-        if let Some(previous) = self.sessions.insert((workspace, name), token) {
-            handle.close_session(previous).await?;
+        let reopened = token.identity();
+        if let Some(previous) = self.sessions.insert((workspace.clone(), name), token)
+            && let Some(previous) = superseded_session(previous, reopened)
+        {
+            let superseded = previous.identity();
+            match handle.close_session(previous).await {
+                // Every Conflict a close answers says the supervisor holds no session for this
+                // token under its authority (it restarted, or the session was closed): the
+                // session is already closed. Said, never dropped silently.
+                Err(error) if error.code == ErrorCode::Conflict => eprintln!(
+                    "cowshed: session {superseded} of workspace {workspace}, superseded by session {reopened}, was already closed by its supervisor: {error}"
+                ),
+                closed => closed?,
+            }
         }
         Ok(())
     }
@@ -15505,5 +15528,40 @@ mod exec_admission_tests {
             let error = exec_command(wire.argv, wire.script).expect_err("refused");
             assert_eq!(error.code, ErrorCode::Usage, "{fields}: {error:?}");
         }
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod session_reopen_tests {
+    use super::super::supervisor::{SessionToken, WorkspaceAuthoritySnapshot};
+    use super::superseded_session;
+    use crate::metadata::{WorkspaceIncarnation, WorkspaceName};
+    use crate::repository::RepoId;
+
+    fn token(identity: u64) -> SessionToken {
+        SessionToken::remote(
+            &WorkspaceAuthoritySnapshot {
+                repo_id: RepoId::parse("acme/widget").expect("repo"),
+                workspace: WorkspaceName::new("task").expect("workspace"),
+                workspace_incarnation: WorkspaceIncarnation::new(
+                    "0123456789abcdef0123456789abcdef",
+                )
+                .expect("incarnation"),
+                grant_revision: 1,
+                lifecycle_revision: 1,
+            },
+            identity,
+            Some("build".to_owned()),
+        )
+    }
+
+    /// Reopening a named session the supervisor still holds answers that session's own identity:
+    /// the token it replaces is the same session and must stay open, or every second command of
+    /// the session meets "session identity is closed or stale". A token of another identity — a
+    /// session closed and reopened under the name — is superseded and closed.
+    #[test]
+    fn a_reopened_named_session_is_never_closed_as_its_own_predecessor() {
+        assert_eq!(superseded_session(token(7), 7), None);
+        assert_eq!(superseded_session(token(7), 8), Some(token(7)));
     }
 }
