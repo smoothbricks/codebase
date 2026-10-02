@@ -2975,31 +2975,29 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
                             )?;
                     }
                     StorageGcReason::OrphanStagingMount => {
-                        let parses = candidate
-                            .path()
-                            .file_name()
-                            .and_then(|name| name.to_str())
-                            .and_then(staged_stem_workspace)
-                            .is_some();
-                        if parses {
-                            let stem = candidate.path().file_name().ok_or(
-                                ApfsStorageError::InvalidPlan("staging mount has no stem"),
-                            )?;
-                            let mut image = project.join(super::STAGING_NAMESPACE).join(stem);
+                        let staged = candidate.path().file_name().and_then(|stem| {
+                            stem.to_str()
+                                .and_then(staged_stem_workspace)
+                                .map(|workspace| (stem, workspace))
+                        });
+                        if let Some((stem, workspace)) = staged {
+                            let mut image = PathBuf::with_capacity(
+                                project.as_os_str().len()
+                                    + super::STAGING_NAMESPACE.len()
+                                    + stem.len()
+                                    + IMAGE_EXTENSION.len()
+                                    + 3,
+                            );
+                            image.push(project);
+                            image.push(super::STAGING_NAMESPACE);
+                            image.push(stem);
                             image.set_extension(IMAGE_EXTENSION);
                             if self.retire_staging_mount(candidate.path(), &image)? {
-                                let workspace = candidate
-                                    .path()
-                                    .file_name()
-                                    .and_then(|name| name.to_str())
-                                    .and_then(staged_stem_workspace)
-                                    .map(|name| name.as_str().to_owned())
-                                    .unwrap_or_default();
                                 deletion_log::log_deletion(
                                     project,
                                     DeletionOp::RemoveStagingMount,
                                     DeletionKind::Other,
-                                    &workspace,
+                                    workspace.as_str(),
                                     None,
                                     candidate.path(),
                                 );
