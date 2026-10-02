@@ -262,9 +262,11 @@ Disk device names are reusable, not image identities. A private per-user `/priva
 mount and detach across independent cowshed processes. It does **not** constrain another user's disk tools. Before
 `fsck_apfs` or `mount_apfs`, cowshed opens the reported raw volume read-only, then verifies that the attachment
 inventory maps **both** its whole container and its volume to the exact image. A verified attachment owns that raw
-descriptor across the `attach_verified` → `mount` method boundary; it is released only after `mount_apfs` finishes or
-when the attachment is detached. On macOS an open raw volume prevents even an external `diskutil eject force` or
-`hdiutil detach -force` from releasing that image and recycling its device name. If the image lost the reported device
+descriptor across the `attach_verified` → `mount` method boundary. It is released after `mount_apfs` finishes, before
+intentional detach, or before the exclusive `diskutil apfs resizeContainer` writer, which cannot run with a raw
+descriptor open. Independent device ejects during container resize after pin release are not covered. While held, the
+descriptor prevents even external `diskutil eject force` or `hdiutil detach -force` from releasing the image and
+recycling its device name. If the image lost the reported device
 before the descriptor could be pinned, cowshed performs at most one fresh attachment, and only when inventory shows no
 remaining attachment for that image. A conflicting or unreadable mapping fails closed, without running fsck on the
 reported device. No live-fsck option authorizes touching a foreign mounted container. Blank-image formatting keeps its
