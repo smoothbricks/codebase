@@ -186,18 +186,21 @@ them there; they contain the endpoint URL, whose userinfo is the workspace token
   `HOME`. So a clone at a new path, with its own private environment, re-evaluated nixpkgs on its first shell entry.
   Measured on a large monorepo: about 10 s of CPU and 37,000 synchronous nix-daemon round trips, 27 s on an idle host
   and over 8 minutes at load 60–80. The supervisor names `/private/cowshed/caches/devenv` as `COWSHED_DEVENV_CACHE` for
-  every sandboxed child. A smoo-managed repository shell (`tooling/direnv/shared-devenv.ts`) works in four steps:
+  every sandboxed child. A smoo-managed repository shell (`tooling/direnv/shared-devenv.ts`) works in five steps:
   - it copies its devenv inputs there under a digest of their content;
-  - it evaluates the copy with `HOME`, `TMPDIR` and `XDG_RUNTIME_DIR` fixed under that directory;
-  - it moves the export onto the workspace before direnv imports it, replacing only paths it chose itself;
-  - it unsets the compiled task file, a store path that names the copy and that only an in-place `devenv tasks`, `up` or
-    `test` reads.
+  - it evaluates the merged `enterShell` Nix option without executing the hook, then proves the structured
+    `enterShell:string ""` override leaves the copy's hook empty;
+  - `devenv tasks list --json` builds the current copy's task graph without executing it. A task outside devenv's own
+    empty-hook enterShell and `files`/cleanup with no declared files sends the shell straight to in-place evaluation;
+  - devenv evaluates the checked copy with `HOME`, `TMPDIR` and `XDG_RUNTIME_DIR` fixed under the cache;
+  - it moves the export and the original merged hook onto the workspace before direnv imports them, replacing only paths
+    it chose itself. direnv executes that hook once in the workspace. The compiled task file is unset because its store
+    path names the copy; in-place `devenv tasks`, `up` and `test` never read it.
 
-  Workspaces with identical inputs share one cache entry, and changed inputs are a new digest and a new evaluation. A
-  project whose enterShell tasks would write into the project they run in (anything beyond devenv's own enterShell and
-  an empty `files`) evaluates in place, and the task graph that evaluation leaves in the checkout's `.devenv`, which a
-  clone inherits, sends later entries straight there. Host shells never get the variable and evaluate in place, because
-  they would otherwise run what any sandbox wrote there.
+  Workspaces with identical inputs share one cache entry, and changed inputs get a new digest and evaluation. An
+  unreadable/missing current task graph evaluates in place without first executing a hook in the copy; an inherited
+  graph from a previous workspace evaluation cannot authorize a new input digest. Host shells never get the variable and
+  evaluate in place, because they would otherwise run what any sandbox wrote into the shared cache.
 
   **Every checkout reaches a shared tool home through the host's literal path.** Cargo fingerprints a registry or git
   dependency by the absolute path of its source under `$CARGO_HOME` (measured: the same registry reached through a

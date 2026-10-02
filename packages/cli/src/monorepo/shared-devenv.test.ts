@@ -125,7 +125,6 @@ describe('shared-devenv.ts', () => {
       expect(lstatSync(join(copy, 'tooling', 'direnv', 'module.nix')).isFile()).toBe(true);
       expect(existsSync(join(copy, 'tooling', 'overlay', 'flake.nix'))).toBe(true);
       expect(existsSync(join(copy, 'tooling', 'direnv', '.devenv'))).toBe(false);
-      expect(existsSync(join(copy, '.smoo-devenv-snapshot'))).toBe(true);
 
       // The link's target is what the digest covers.
       writeFileSync(join(managed, 'module.nix'), '{ ... }: { env.LINKED = "2"; }\n');

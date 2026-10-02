@@ -212,14 +212,54 @@ describe('shared-devenv.ts with devenv', () => {
           '{ ... }: { tasks."probe:setup" = { exec = "touch \\"$DEVENV_ROOT/ran-here\\""; before = [ "devenv:enterShell" ]; }; }\n',
         );
         const copy = enter(project).copy ?? '';
+        // Devenv's task listing evaluates the task graph without running enterShell.
+        // This is the preflight boundary before the shared copy can execute a task.
+        const listed = spawnSync('devenv', ['tasks', 'list', '--json'], {
+          cwd: join(copy, 'tooling', 'direnv'),
+          encoding: 'utf8',
+          env: {
+            ...project.env,
+            HOME: join(cache, 'home'),
+            TMPDIR: join(cache, 'tmp'),
+            XDG_RUNTIME_DIR: join(cache, 'run'),
+          },
+        });
+        if (listed.status !== 0) printCommandOutput(listed.stdout ?? '', listed.stderr ?? '');
+        expect(listed.status).toBe(0);
+        expect(existsSync(join(copy, 'tooling', 'direnv', 'ran-here'))).toBe(false);
+        expect(
+          existsSync(join(copy, 'tooling', 'direnv', '.devenv', 'gc', 'task-config-devenv-config-task-config')),
+        ).toBe(true);
         const exported = exportShell(project, copy);
         expect(exported.stderr).toContain('enterShell runs probe:setup, which write into the project they run in');
+        expect(existsSync(join(copy, 'tooling', 'direnv', 'ran-here'))).toBe(false);
         expect(exported.imported.DEVENV_ROOT).toBe(join(project.root, 'tooling', 'direnv'));
         expect(existsSync(join(project.root, 'tooling', 'direnv', 'ran-here'))).toBe(true);
 
-        const again = enter(project);
-        expect(again.copy).toBeUndefined();
-        expect(again.stderr).toContain('enterShell runs probe:setup');
+        // The inherited in-place graph describes the old inputs. A new,
+        // side-effect-free configuration must use its own current graph.
+        writeFileSync(
+          join(project.root, 'tooling', 'direnv', 'devenv.nix'),
+          '{ ... }: { env.SHARED_DEVENV_PROBE = "safe"; }\n',
+        );
+        const safe = enter(project);
+        expect(safe.copy).toBeDefined();
+        expect(safe.copy).not.toBe(copy);
+        const shared = exportShell(project, safe.copy ?? '');
+        expect(shared.imported.SHARED_DEVENV_PROBE).toBe('safe');
+        expectNoCachePath(shared, cache);
+
+        const custom = workspace(
+          scratch,
+          cache,
+          'custom-hook',
+          `{ ... }: { enterShell = ''\n  echo entered >> "$DEVENV_ROOT/hook-runs"\n''; }\n`,
+        );
+        const customCopy = enter(custom).copy ?? '';
+        const customExport = exportShell(custom, customCopy);
+        expect(existsSync(join(customCopy, 'tooling', 'direnv', 'hook-runs'))).toBe(false);
+        expect(readFileSync(join(custom.root, 'tooling', 'direnv', 'hook-runs'), 'utf8')).toBe('entered\n');
+        expect(customExport.imported.DEVENV_ROOT).toBe(join(custom.root, 'tooling', 'direnv'));
       } finally {
         rmSync(scratch, { recursive: true, force: true });
       }

@@ -42,25 +42,21 @@
  * and the same cache entry; a changed input is a new digest and a fresh
  * evaluation.
  *
- * The export devenv prints is then moved onto the workspace before direnv
- * imports it. Every replaced string is an absolute path this program chose
- * (the copy's root, and the fixed HOME, TMPDIR and runtime), unique by
- * construction, so the replacement is exact and never interprets devenv's
- * script. A path under the copy becomes the same path under the project
- * root, and the fixed HOME, TMPDIR and runtime become the sandbox's own. The
- * shell hook therefore runs against the workspace exactly as an in-place
- * evaluation's would. The compiled task file (DEVENV_TASK_FILE, DEVENV_TASKS)
- * is a store path whose contents name the copy and cannot be moved, so the
- * export unsets it. `devenv tasks`, `devenv up` and `devenv test` evaluate the
- * workspace in place, so none of them reads it.
+ * The merged enterShell option is read through devenv's evaluator without
+ * running it. An `enterShell:string ""` override must evaluate to the empty
+ * hook before devenv may execute a task in the copy. `devenv tasks list --json`
+ * then evaluates the copy's current task graph without running those tasks:
+ * only devenv's empty-hook enterShell and files/cleanup with no declared files
+ * may run there. Any other task evaluates the workspace in place instead.
  *
- * devenv runs the enterShell tasks itself, in the directory it evaluated. Its
- * own devenv:enterShell writes only into the copy's .devenv, and so do
- * devenv:files and devenv:files:cleanup when no `files` are declared. A project
- * whose enterShell tasks are anything else writes into its project from those
- * tasks, so it evaluates in place. The task graph that evaluation leaves in the
- * checkout's .devenv, which a clone inherits, sends later entries straight
- * there.
+ * The resulting export and the original merged hook are relocated onto the
+ * workspace before direnv imports them. Every replaced string is an absolute
+ * path this program chose (copy root, fixed HOME, TMPDIR, runtime), so no shell
+ * syntax is interpreted. A path inside the copy becomes its workspace path;
+ * direnv executes the original hook once there, including project extensions
+ * and managed installs. The compiled task file (DEVENV_TASK_FILE, DEVENV_TASKS)
+ * is a store path naming the copy and is unset; `devenv tasks`, `devenv up` and
+ * `devenv test` evaluate the workspace in place.
  *
  * The host never takes this path. The cache is writable by every sandbox, so a
  * host shell that evaluated or imported from it would run whatever any
@@ -87,19 +83,11 @@ import {
 import path from 'node:path';
 
 const DEVENV_DIR = 'tooling/direnv';
-/** Marks a copy's root. The managed enterShell prologue skips workspace installs under it. */
-const SNAPSHOT_MARKER = '.smoo-devenv-snapshot';
 /** Touched whenever a shell enters a copy; a copy untouched for 30 days is dropped. */
 const USED_MARKER = '.used';
 const RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
 const STAGING_PREFIX = '.new.';
 const STAGING_RETENTION_MS = 24 * 60 * 60 * 1000;
-/**
- * The tasks devenv's own modules put before devenv:enterShell that write
- * nowhere but the evaluated root's .devenv, provided they have no command
- * (devenv:files with no `files` declared) or are listed here with one.
- */
-const COPY_SAFE_TASKS = new Set(['devenv:enterShell', 'devenv:files', 'devenv:files:cleanup']);
 
 /** The checkout evaluates in place. `reason` is empty outside a sandbox, where nothing needs saying. */
 class InPlace extends Error {
@@ -327,18 +315,11 @@ export function enter(projectRoot: string, env: NodeJS.ProcessEnv): string {
       throw new InPlace(`${local} exists and is not shared`);
     }
   }
-  // The checkout's own last in-place evaluation, a clone's inherited one
-  // included, already says whether its enterShell tasks would write into it.
-  const previous = enterShellTasks(path.join(devenvDir, '.devenv'));
-  if (previous.kind === 'writes') {
-    throw new InPlace(previous.reason);
-  }
   const entries = [...devenvFiles(root), ...pathInputs(root).flatMap((input) => inputFiles(root, input))];
   const copy = path.join(cache, digestOf(root, entries));
   if (!existsSync(copy)) {
     const staging = mkdtempSync(path.join(cache, STAGING_PREFIX));
     copyEntries(root, entries, staging);
-    writeFileSync(path.join(staging, SNAPSHOT_MARKER), '');
     writeFileSync(path.join(staging, USED_MARKER), '');
     try {
       renameSync(staging, copy);
@@ -370,11 +351,11 @@ interface Task {
 /** What the enterShell tasks of one evaluation do, read from the task graph it left. */
 type EnterShellTasks =
   | { readonly kind: 'absent'; readonly graph: string }
-  | { readonly kind: 'confined' }
+  | { readonly kind: 'confined'; readonly names: ReadonlySet<string>; readonly graph: string }
   | { readonly kind: 'writes'; readonly reason: string };
 
-function strings(value: unknown): string[] {
-  return Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : [];
+function strings(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every((item): item is string => typeof item === 'string');
 }
 
 /**
@@ -388,7 +369,12 @@ function enterShellTasks(dotfile: string): EnterShellTasks {
   if (!existsSync(graph)) {
     return { kind: 'absent', graph };
   }
-  const parsed: unknown = JSON.parse(readFileSync(graph, 'utf8'));
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(readFileSync(graph, 'utf8'));
+  } catch (error) {
+    return { kind: 'writes', reason: `${graph} cannot be read as devenv tasks (${String(error)})` };
+  }
   if (!Array.isArray(parsed)) {
     return {
       kind: 'writes',
@@ -397,18 +383,28 @@ function enterShellTasks(dotfile: string): EnterShellTasks {
   }
   const tasks = new Map<string, Task>();
   for (const raw of parsed) {
-    if (typeof raw !== 'object' || raw === null || !('name' in raw) || typeof raw.name !== 'string') {
+    if (
+      typeof raw !== 'object' ||
+      raw === null ||
+      !('name' in raw) ||
+      typeof raw.name !== 'string' ||
+      !('command' in raw) ||
+      (raw.command !== null && typeof raw.command !== 'string') ||
+      !('before' in raw) ||
+      !strings(raw.before) ||
+      !('after' in raw) ||
+      !strings(raw.after) ||
+      tasks.has(raw.name)
+    ) {
       return {
         kind: 'writes',
-        reason: `${graph} holds a task without a name, so its enterShell tasks cannot be checked`,
+        reason: `${graph} holds a malformed or duplicate task, so its enterShell tasks cannot be checked`,
       };
     }
-    tasks.set(raw.name, {
-      name: raw.name,
-      command: 'command' in raw && typeof raw.command === 'string' ? raw.command : null,
-      before: strings('before' in raw ? raw.before : undefined),
-      after: strings('after' in raw ? raw.after : undefined),
-    });
+    tasks.set(raw.name, { name: raw.name, command: raw.command, before: raw.before, after: raw.after });
+  }
+  if (!tasks.has('devenv:enterShell')) {
+    return { kind: 'writes', reason: `${graph} has no devenv:enterShell task` };
   }
   const closure = new Set<string>();
   const pending = ['devenv:enterShell'];
@@ -424,13 +420,15 @@ function enterShellTasks(dotfile: string): EnterShellTasks {
       }
     }
   }
-  // devenv:files has a command only when `files` are declared, and then it writes them into the root.
+  // devenv:files has a command only when files are declared; that command writes into the root.
   const writing = [...closure].filter((name) => {
     const task = tasks.get(name);
-    return task !== undefined && task.command !== null && (!COPY_SAFE_TASKS.has(name) || name === 'devenv:files');
+    return (
+      task !== undefined && task.command !== null && name !== 'devenv:enterShell' && name !== 'devenv:files:cleanup'
+    );
   });
   return writing.length === 0
-    ? { kind: 'confined' }
+    ? { kind: 'confined', names: new Set(tasks.keys()), graph: realpathSync(graph) }
     : {
         kind: 'writes',
         reason: `enterShell runs ${writing.sort().join(', ')}, which write into the project they run in`,
@@ -438,12 +436,10 @@ function enterShellTasks(dotfile: string): EnterShellTasks {
 }
 
 /**
- * Run devenv in `copy` with the fixed HOME, TMPDIR and runtime, print its
- * export moved onto `projectRoot`, and leave the workspace what an in-place
- * evaluation would have: the inputs `use devenv` watches, a GC root for the
- * shell, and a devenv.lock that devenv rewrote. A project whose enterShell
- * tasks write into it is evaluated in place instead. Returns the exit status
- * `use devenv` reads.
+ * Evaluate the current task graph with enterShell disabled before executing
+ * anything in the shared copy. The evaluator's original merged enterShell hook
+ * is relocated and run once by direnv in the workspace, not by devenv in the
+ * copy. Other tasks that write outside .devenv require in-place evaluation.
  */
 export function exportShell(
   projectRoot: string,
@@ -453,9 +449,118 @@ export function exportShell(
 ): number {
   const workspace = realpathSync(projectRoot);
   const fixed = fixedDirectories(path.dirname(copy));
-  const devenv = Bun.spawnSync(['devenv', ...args], {
-    cwd: path.join(copy, DEVENV_DIR),
-    env: { ...env, HOME: fixed.home, TMPDIR: fixed.tmp, XDG_RUNTIME_DIR: fixed.run },
+  const copyDevenv = path.join(copy, DEVENV_DIR);
+  const workspaceDevenv = path.join(workspace, DEVENV_DIR);
+  const inPlace = (reason: string): number => {
+    console.error(`shared devenv: ${reason}; evaluating in place`);
+    const evaluated = Bun.spawnSync(['devenv', ...args], {
+      cwd: workspaceDevenv,
+      env,
+      stdin: 'inherit',
+      stdout: 'inherit',
+      stderr: 'inherit',
+    });
+    return evaluated.exitCode;
+  };
+  if (args.at(-1) !== 'direnv-export') {
+    return inPlace('only direnv-export can use the shared copy');
+  }
+  const copyEnv = { ...env, HOME: fixed.home, TMPDIR: fixed.tmp, XDG_RUNTIME_DIR: fixed.run };
+  const originalHook = Bun.spawnSync(['devenv', ...args.slice(0, -1), 'eval', 'enterShell'], {
+    cwd: copyDevenv,
+    env: copyEnv,
+    stdin: 'inherit',
+    stdout: 'pipe',
+    stderr: 'inherit',
+  });
+  if (originalHook.exitCode !== 0) {
+    return inPlace(`devenv eval enterShell exited ${originalHook.exitCode}`);
+  }
+  // An option override replaces the whole merged hook, including contributions
+  // from project modules, rust and devenv itself. Check the evaluator's value
+  // before the first command that can execute a task in the shared copy.
+  const withoutHook = [...args.slice(0, -1), '--option', 'enterShell:string', ''];
+  const disabledHook = Bun.spawnSync(['devenv', ...withoutHook, 'eval', 'enterShell'], {
+    cwd: copyDevenv,
+    env: copyEnv,
+    stdin: 'inherit',
+    stdout: 'pipe',
+    stderr: 'inherit',
+  });
+  if (disabledHook.exitCode !== 0) {
+    return inPlace(`devenv eval with enterShell disabled exited ${disabledHook.exitCode}`);
+  }
+  let original: unknown;
+  let disabled: unknown;
+  try {
+    original = JSON.parse(originalHook.stdout.toString());
+    disabled = JSON.parse(disabledHook.stdout.toString());
+  } catch (error) {
+    return inPlace(`devenv eval returned invalid JSON (${String(error)})`);
+  }
+  if (
+    typeof original !== 'object' ||
+    original === null ||
+    !('enterShell' in original) ||
+    typeof original.enterShell !== 'string' ||
+    typeof disabled !== 'object' ||
+    disabled === null ||
+    !('enterShell' in disabled) ||
+    disabled.enterShell !== ''
+  ) {
+    return inPlace('devenv did not prove that its copy has an empty enterShell hook');
+  }
+  const hook = original.enterShell;
+  const listed = Bun.spawnSync(['devenv', ...withoutHook, 'tasks', 'list', '--json'], {
+    cwd: copyDevenv,
+    env: copyEnv,
+    stdin: 'inherit',
+    stdout: 'pipe',
+    stderr: 'inherit',
+  });
+  if (listed.exitCode !== 0) {
+    return inPlace(`devenv tasks list exited ${listed.exitCode}, so its enterShell tasks cannot be checked`);
+  }
+  let tasks: unknown;
+  try {
+    tasks = JSON.parse(listed.stdout.toString());
+  } catch (error) {
+    return inPlace(`devenv tasks list returned invalid JSON (${String(error)})`);
+  }
+  if (!Array.isArray(tasks)) {
+    return inPlace('devenv tasks list did not return an array');
+  }
+  const listedNames = new Set<string>();
+  for (const row of tasks) {
+    const task: unknown = row;
+    if (
+      typeof task !== 'object' ||
+      task === null ||
+      !('name' in task) ||
+      typeof task.name !== 'string' ||
+      listedNames.has(task.name)
+    ) {
+      return inPlace('devenv tasks list returned malformed or duplicate task names');
+    }
+    listedNames.add(task.name);
+  }
+  if (!listedNames.has('devenv:enterShell')) {
+    return inPlace('devenv tasks list did not include devenv:enterShell');
+  }
+  const planned = enterShellTasks(path.join(copyDevenv, '.devenv'));
+  if (planned.kind !== 'confined') {
+    return inPlace(
+      planned.kind === 'writes'
+        ? planned.reason
+        : `devenv left no task graph at ${planned.graph}, so its enterShell tasks cannot be checked`,
+    );
+  }
+  if (planned.names.size !== listedNames.size || [...listedNames].some((name) => !planned.names.has(name))) {
+    return inPlace('devenv task list differs from the compiled task graph');
+  }
+  const devenv = Bun.spawnSync(['devenv', ...withoutHook, 'direnv-export'], {
+    cwd: copyDevenv,
+    env: copyEnv,
     stdin: 'inherit',
     stdout: 'pipe',
     stderr: 'inherit',
@@ -463,32 +568,17 @@ export function exportShell(
   if (devenv.exitCode !== 0) {
     return devenv.exitCode;
   }
-  // devenv ran the enterShell tasks in the copy. When they write into the
-  // project they ran in, the workspace still needs them run against it.
-  const ran = enterShellTasks(path.join(copy, DEVENV_DIR, '.devenv'));
-  if (ran.kind !== 'confined') {
-    const reason =
-      ran.kind === 'writes'
-        ? ran.reason
-        : `devenv left no task graph at ${ran.graph}, so its enterShell tasks cannot be checked`;
-    console.error(`shared devenv: ${reason}; evaluating in place`);
-    const inPlace = Bun.spawnSync(['devenv', ...args], {
-      cwd: path.join(workspace, DEVENV_DIR),
-      env,
-      stdin: 'inherit',
-      stdout: 'inherit',
-      stderr: 'inherit',
-    });
-    return inPlace.exitCode;
+  const ran = enterShellTasks(path.join(copyDevenv, '.devenv'));
+  if (ran.kind !== 'confined' || ran.graph !== planned.graph) {
+    console.error('shared devenv: task graph changed after preflight; the export cannot be relocated');
+    return 1;
   }
   const moves = relocations(copy, workspace, env);
   process.stdout.write(relocate(devenv.stdout.toString(), moves));
   process.stdout.write('\nunset DEVENV_TASK_FILE DEVENV_TASKS\n');
-
-  const copyDevenv = path.join(copy, DEVENV_DIR);
-  const workspaceDevenv = path.join(workspace, DEVENV_DIR);
   const copyDot = path.join(copyDevenv, '.devenv');
   const workspaceDot = path.join(workspaceDevenv, '.devenv');
+  mkdirSync(path.join(workspaceDot, 'state'), { recursive: true });
   mkdirSync(path.join(workspaceDot, 'gc'), { recursive: true });
   const inputPaths = path.join(copyDot, 'input-paths.txt');
   if (existsSync(inputPaths)) {
@@ -525,6 +615,7 @@ export function exportShell(
       console.error(`shared devenv: devenv rewrote devenv.lock; copied it into ${workspaceDevenv}`);
     }
   }
+  process.stdout.write(`\n${relocate(hook, moves)}\n`);
   return 0;
 }
 

@@ -387,11 +387,9 @@ in {
     # daemon refuse whichever came second ("received a message from a
     # different workspace"). Nobody supplies this deliberately.
     #
-    # A cowshed sandbox evaluates a shared, content-addressed copy of the devenv
-    # inputs (shared-devenv.ts), and devenv's own environment capture runs this
-    # hook against that copy, whose root holds `.smoo-devenv-snapshot`. Only the
-    # steps that write into a workspace (the install and the toolchain stamp) are
-    # skipped there; the shell direnv imports runs them against the workspace.
+    # In a cowshed sandbox shared-devenv.ts evaluates a content-addressed copy
+    # with enterShell disabled. direnv runs this hook after the copy's export is
+    # relocated onto the workspace; the install and stamp never run in the copy.
     (lib.mkBefore ''
       cd "$DEVENV_ROOT/../.."
       export PATH="$("$PWD/tooling/direnv/repo-path")"
@@ -407,9 +405,7 @@ in {
       export TTSC_TSGO_BINARY="$PWD/node_modules/@typescript/native/bin/tsc"
       . "$DEVENV_ROOT/shared-caches.sh" /private/cowshed/caches
       unset GOROOT
-      if [ ! -e "$DEVENV_ROOT/../../.smoo-devenv-snapshot" ]; then
-        bun "$DEVENV_ROOT/setup-environment.ts"${lib.optionalString uvProject " --python ${python.package.interpreter}"} || exit $?
-      fi
+      bun "$DEVENV_ROOT/setup-environment.ts"${lib.optionalString uvProject " --python ${python.package.interpreter}"} || exit $?
       ${lib.optionalString uvProject ''
         if [ -f pyproject.toml ]; then
           export VIRTUAL_ENV="$UV_PROJECT_ENVIRONMENT"
@@ -446,9 +442,7 @@ in {
     # SDKROOT/compilers; the toolchain identity must see the final values). The
     # stamp logic lives in toolchain-stamp.ts; see its header for why.
     (lib.mkAfter ''
-      if [ ! -e "$DEVENV_ROOT/../../.smoo-devenv-snapshot" ]; then
-        bun "$DEVENV_ROOT/toolchain-stamp.ts" || exit $?
-      fi
+      bun "$DEVENV_ROOT/toolchain-stamp.ts" || exit $?
       if [ -n "$DEVENV_SHELL_PWD" ]; then
         cd "$DEVENV_SHELL_PWD"
       fi
