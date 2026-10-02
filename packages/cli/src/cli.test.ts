@@ -77,17 +77,21 @@ describe('smoo wrangler cleanup-pr', () => {
 });
 
 /**
- * A workspace root, a project directory inside it, and a `fake-cloudflare.mjs` preload whose `fetch` answers a
- * local fake Cloudflare: a pr7 stage holding one Worker and one R2 bucket (`stage`), or an account
- * with no record bucket at all (`empty`). For every scenario except `deleting`, any write, or any
- * read outside the fake's script, fails the child, so a green run proves the command only read.
- * `deleting` additionally accepts exactly the six DELETE calls the recorded stage's own cleanup
- * issues — nothing else, so a wrong key or a different stage's/bucket's object still fails the child.
+ * The shipped CLI talks to an isolated HTTP server at its Cloudflare API boundary.
+ * The server records every request and refuses anything outside the stage fixture.
  */
 async function cleanupCliRoot(): Promise<{
   root: string;
-  project: string;
-  run: (args: string[], env?: Record<string, string>) => { exitCode: number; stdout: string; stderr: string };
+  requests: string[];
+  close: () => void;
+  run: (
+    args: string[],
+    scenario?: 'stage' | 'empty' | 'deleting',
+  ) => Promise<{
+    exitCode: number;
+    stdout: string;
+    stderr: string;
+  }>;
 }> {
   const root = await realpath(await mkdtemp(join(tmpdir(), 'smoo-cli-dry-run-')));
   const init = Bun.spawnSync(['git', 'init', '--quiet'], { cwd: root, env: gitFreeEnvironment() });
@@ -96,75 +100,97 @@ async function cleanupCliRoot(): Promise<{
   await writeFile(join(root, 'package.json'), '{ "name": "@acme/app", "repository": "https://github.com/acme/app" }\n');
   const project = join(root, 'packages', 'web');
   await mkdir(project, { recursive: true });
-  const fakeCloudflare = join(root, 'fake-cloudflare.mjs');
-  const fake = `
-globalThis.fetch = async (input, init) => {
-  const method = init?.method ?? 'GET';
-  const scenario = process.env.SMOO_TEST_SCENARIO ?? 'stage';
-  const path = new URL(input).pathname.replace('/client/v4/accounts/account-1', '');
-  const answer = (result) =>
-    new Response(JSON.stringify({ success: true, errors: [], result }), { status: 200 });
-  if (scenario === 'deleting' && method === 'DELETE') {
-    if (
-      path === '/workers/scripts/web-pr7' ||
-      path === '/r2/buckets/media-pr7' ||
-      path === '/r2/buckets/media-pr7/objects/one' ||
-      path === '/r2/buckets/media-pr7/objects/nested/two' ||
-      path === '/r2/buckets/smoo-stage-records/objects/v1/github.com%252Facme%252Fapp/pr7/web-pr7/worker' ||
-      path === '/r2/buckets/smoo-stage-records/objects/v1/github.com%252Facme%252Fapp/pr7/web-pr7/r2/media-pr7'
-    )
-      return answer(null);
-    console.error(\`unexpected DELETE \${path}\`);
-    process.exit(8);
-  }
-  if (method !== 'GET') {
-    console.error(\`the command must not \${method}\`);
-    process.exit(9);
-  }
-  if (scenario === 'empty') {
-    if (path === '/r2/buckets') return answer([]);
-  } else {
-    if (path === '/r2/buckets') return answer([{ name: 'smoo-stage-records' }, { name: 'media-pr7' }]);
-    if (path === '/r2/buckets/smoo-stage-records/objects')
-      return answer([
-        { key: 'v1/github.com%2Facme%2Fapp/pr7/web-pr7/worker' },
-        { key: 'v1/github.com%2Facme%2Fapp/pr7/web-pr7/r2/media-pr7' },
-      ]);
-    if (path === '/r2/buckets/media-pr7/objects') return answer([{ key: 'one' }, { key: 'nested/two' }]);
-    if (path === '/workers/scripts') return answer([{ id: 'web-pr7' }]);
-  }
-  console.error(\`unexpected \${method} \${path}\`);
-  process.exit(8);
-};
-`;
-  await writeFile(fakeCloudflare, fake);
+
+  const requests: string[] = [];
+  const unexpected: string[] = [];
+  const deletions: Record<string, true> = {
+    '/workers/scripts/web-pr7': true,
+    '/r2/buckets/media-pr7': true,
+    '/r2/buckets/media-pr7/objects/one': true,
+    '/r2/buckets/media-pr7/objects/nested/two': true,
+    '/r2/buckets/smoo-stage-records/objects/v1/github.com%252Facme%252Fapp/pr7/web-pr7/worker': true,
+    '/r2/buckets/smoo-stage-records/objects/v1/github.com%252Facme%252Fapp/pr7/web-pr7/r2/media-pr7': true,
+  };
+  const records = [
+    { key: 'v1/github.com%2Facme%2Fapp/pr7/web-pr7/worker' },
+    { key: 'v1/github.com%2Facme%2Fapp/pr7/web-pr7/r2/media-pr7' },
+  ];
+  let scenario: 'stage' | 'empty' | 'deleting' = 'stage';
+  const server = Bun.serve({
+    hostname: '127.0.0.1',
+    port: 0,
+    fetch(request) {
+      const url = new URL(request.url);
+      const path = url.pathname.replace(/^\/client\/v4\/accounts\/account-1/, '');
+      const call = `${request.method} ${path}`;
+      requests.push(call);
+      const answer = (result: unknown) => Response.json({ success: true, errors: [], result });
+      if (
+        request.headers.get('authorization') !== 'Bearer token-1' ||
+        !url.pathname.startsWith('/client/v4/accounts/account-1/')
+      ) {
+        unexpected.push(`invalid endpoint or authorization: ${call}`);
+      } else if (request.method === 'DELETE' && scenario === 'deleting' && deletions[path]) {
+        return answer(null);
+      } else if (request.method === 'GET') {
+        if (scenario === 'empty' && path === '/r2/buckets') return answer([]);
+        if (scenario !== 'empty') {
+          if (path === '/r2/buckets') return answer([{ name: 'smoo-stage-records' }, { name: 'media-pr7' }]);
+          if (path === '/r2/buckets/smoo-stage-records/objects') return answer(records);
+          if (path === '/r2/buckets/media-pr7/objects') return answer([{ key: 'one' }, { key: 'nested/two' }]);
+          if (path === '/workers/scripts') return answer([{ id: 'web-pr7' }]);
+        }
+        unexpected.push(`unexpected read: ${call}`);
+      } else {
+        unexpected.push(`unexpected mutation: ${call}`);
+      }
+      return Response.json({ success: false, errors: [{ message: `unexpected ${call}` }] }, { status: 500 });
+    },
+  });
   return {
     root,
-    project,
-    run: (args: string[], env: Record<string, string> = {}) => {
-      const child = Bun.spawnSync(['bun', '--preload', fakeCloudflare, SMOO, ...args], {
+    requests,
+    close: () => server.stop(true),
+    run: async (args, selected = 'stage') => {
+      scenario = selected;
+      const before = requests.length;
+      const child = Bun.spawn(['bun', SMOO, ...args], {
         cwd: project,
         env: {
           ...gitFreeEnvironment(),
           CLOUDFLARE_ACCOUNT_ID: 'account-1',
           CLOUDFLARE_API_TOKEN: 'token-1',
-          ...env,
+          CLOUDFLARE_API_BASE_URL: `http://127.0.0.1:${server.port}/client/v4`,
         },
+        stdout: 'pipe',
+        stderr: 'pipe',
       });
-      return {
-        exitCode: child.exitCode,
-        stdout: child.stdout.toString(),
-        stderr: child.stderr.toString(),
-      };
+      const [stdout, stderr, exitCode] = await Promise.all([
+        new Response(child.stdout).text(),
+        new Response(child.stderr).text(),
+        child.exited,
+      ]);
+      expect(unexpected).toEqual([]);
+      const calls = requests.slice(before);
+      if (selected === 'deleting') {
+        expect(calls.filter((call) => call.startsWith('DELETE ')).sort()).toEqual(
+          Object.keys(deletions)
+            .map((path) => `DELETE ${path}`)
+            .sort(),
+        );
+      } else {
+        expect(calls.every((call) => call.startsWith('GET '))).toBe(true);
+      }
+      return { exitCode, stdout, stderr };
     },
   };
 }
 
 describe('smoo wrangler cleanup-pr --dry-run', () => {
   it('prints the JSON inventory of the recorded stage and writes nothing', async () => {
-    const { root, run } = await cleanupCliRoot();
+    const { root, run, close } = await cleanupCliRoot();
     try {
-      const child = run(['wrangler', 'cleanup-pr', '--pr', '7', '--dry-run', '--json']);
+      const child = await run(['wrangler', 'cleanup-pr', '--pr', '7', '--dry-run', '--json']);
 
       expect(child.stderr).toBe('');
       expect(child.exitCode).toBe(0);
@@ -185,14 +211,15 @@ describe('smoo wrangler cleanup-pr --dry-run', () => {
         leftInPlace: [],
       });
     } finally {
+      close();
       await rm(root, { recursive: true, force: true });
     }
   });
 
   it('prints the dry-run sentence without --json', async () => {
-    const { root, run } = await cleanupCliRoot();
+    const { root, run, close } = await cleanupCliRoot();
     try {
-      const child = run(['wrangler', 'cleanup-pr', '--pr', '7', '--dry-run']);
+      const child = await run(['wrangler', 'cleanup-pr', '--pr', '7', '--dry-run']);
 
       expect(child.stderr).toBe('');
       expect(child.exitCode).toBe(0);
@@ -200,34 +227,35 @@ describe('smoo wrangler cleanup-pr --dry-run', () => {
         'Dry run for pr7 of github.com/acme/app from 2 records: would delete 1 Worker, 0 custom domains, 0 routes, 0 DNS records, 0 KV namespaces, 1 R2 bucket (2 objects), 0 D1 databases; 0 recorded items are already gone. Nothing was deleted.\n',
       );
     } finally {
+      close();
       await rm(root, { recursive: true, force: true });
     }
   });
 
   it('keeps the plain sentences without the new flags, and prints the inventory warning as JSON for a stage without records', async () => {
-    const { root, run } = await cleanupCliRoot();
+    const { root, run, close } = await cleanupCliRoot();
     try {
-      const empty = { SMOO_TEST_SCENARIO: 'empty' };
-      const plain = run(['wrangler', 'cleanup-pr', '--pr', '7'], empty);
+      const plain = await run(['wrangler', 'cleanup-pr', '--pr', '7'], 'empty');
       expect(plain.exitCode).toBe(0);
       expect(plain.stdout).toBe(
         'Nothing is recorded for pr7 of github.com/acme/app, so nothing was deleted. That is expected when the pull request deployed nothing or an earlier cleanup finished its stage. A stage an older smoo deployed, or one deployed while the root package.json named another repository, has no records here and may still be live, so check for its items by hand and delete what is left.\n',
       );
 
-      const live = run(['wrangler', 'cleanup-pr', '--pr', '7', '--json'], empty);
+      const live = await run(['wrangler', 'cleanup-pr', '--pr', '7', '--json'], 'empty');
       expect(live.exitCode).toBe(0);
       const liveResult = JSON.parse(live.stdout);
       expect(liveResult).toMatchObject({ stage: 'pr7', recorded: 0, alreadyGone: 0 });
       expect(liveResult.warning).toContain('an older smoo deployed');
       expect(liveResult.warning).toContain('named another repository');
 
-      const dry = run(['wrangler', 'cleanup-pr', '--pr', '7', '--dry-run', '--json'], empty);
+      const dry = await run(['wrangler', 'cleanup-pr', '--pr', '7', '--dry-run', '--json'], 'empty');
       expect(dry.exitCode).toBe(0);
       const dryResult = JSON.parse(dry.stdout);
       expect(dryResult).toMatchObject({ stage: 'pr7', recorded: 0 });
       expect(dryResult.warning).toContain('an older smoo deployed');
       expect(dryResult.warning).toContain('named another repository');
     } finally {
+      close();
       await rm(root, { recursive: true, force: true });
     }
   });
@@ -235,9 +263,9 @@ describe('smoo wrangler cleanup-pr --dry-run', () => {
 
 describe('smoo wrangler cleanup-pr --json', () => {
   it('deletes the recorded stage and prints the deleting result as JSON, with no preview and no warning', async () => {
-    const { root, run } = await cleanupCliRoot();
+    const { root, run, close } = await cleanupCliRoot();
     try {
-      const child = run(['wrangler', 'cleanup-pr', '--pr', '7', '--json'], { SMOO_TEST_SCENARIO: 'deleting' });
+      const child = await run(['wrangler', 'cleanup-pr', '--pr', '7', '--json'], 'deleting');
 
       expect(child.stderr).toBe('');
       expect(child.exitCode).toBe(0);
@@ -259,16 +287,17 @@ describe('smoo wrangler cleanup-pr --json', () => {
         leftInPlace: [],
       });
     } finally {
+      close();
       await rm(root, { recursive: true, force: true });
     }
   });
 
   it('refuses an invalid PR as a usage error before any network call, and prints no JSON at all', async () => {
-    const { root, run } = await cleanupCliRoot();
+    const { root, run, close, requests } = await cleanupCliRoot();
     try {
       // `1e3` is a number to `Number`, which would have cleaned up pr1000.
       for (const pr of ['0', '1e3']) {
-        const child = run(['wrangler', 'cleanup-pr', '--pr', pr, '--json']);
+        const child = await run(['wrangler', 'cleanup-pr', '--pr', pr, '--json']);
 
         expect(child.exitCode).toBe(1);
         expect(child.stdout).toBe('');
@@ -280,7 +309,9 @@ describe('smoo wrangler cleanup-pr --json', () => {
         expect(refusal).toContain('1 through 999999999');
         expect(child.stderr).not.toContain('    at ');
       }
+      expect(requests).toEqual([]);
     } finally {
+      close();
       await rm(root, { recursive: true, force: true });
     }
   });

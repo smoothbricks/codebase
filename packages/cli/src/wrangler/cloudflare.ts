@@ -171,6 +171,7 @@ export class CloudflareRestClient implements CloudflareClient {
     private readonly accountId: string,
     private readonly apiToken: string,
     private readonly fetcher: CloudflareFetcher = fetch,
+    private readonly apiBaseUrl = 'https://api.cloudflare.com/client/v4',
   ) {
     if (!accountId || !apiToken) {
       throw new Error('CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN are required.');
@@ -441,7 +442,7 @@ export class CloudflareRestClient implements CloudflareClient {
   }
 
   private async send(path: string, init: RequestInit = {}): Promise<{ response: Response; text: string }> {
-    const response = await this.fetcher(`https://api.cloudflare.com/client/v4${path}`, {
+    const response = await this.fetcher(`${this.apiBaseUrl}${path}`, {
       ...init,
       headers: {
         Authorization: `Bearer ${this.apiToken}`,

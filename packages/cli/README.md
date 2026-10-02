@@ -1017,6 +1017,10 @@ Deletes a closed pull request's stage: exactly what this repository's `prN` depl
 repository deploying into the same account, or this repository's `pr70`, is never touched. It runs from anywhere in the
 workspace; the repository is read from the root `package.json` the same way the deploy reads it.
 
+For a local API-compatible endpoint (for example an integration-test server), set `CLOUDFLARE_API_BASE_URL` to its full
+`/client/v4` URL; unset it to use Cloudflare's API. The CLI sends `CLOUDFLARE_API_TOKEN` to that endpoint as a Bearer
+token, so only point it at a server you trust.
+
 - Every recorded item is looked up before the first delete. A recorded zone is found by name within the
   `CLOUDFLARE_ACCOUNT_ID` account, and only recorded zones and recorded kinds are listed.
 - A recorded zone the token does not list stops the command before anything is deleted, with every record kept. A token

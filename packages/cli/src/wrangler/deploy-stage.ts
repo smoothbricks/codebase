@@ -680,6 +680,8 @@ async function resolveStageCleanup(
     new CloudflareRestClient(
       requiredEnvironmentValue(processEnv.CLOUDFLARE_ACCOUNT_ID, 'CLOUDFLARE_ACCOUNT_ID'),
       requiredEnvironmentValue(processEnv.CLOUDFLARE_API_TOKEN, 'CLOUDFLARE_API_TOKEN'),
+      undefined,
+      processEnv.CLOUDFLARE_API_BASE_URL,
     );
   const { keys, records, buckets } = await readStageRecords(cloudflare, scope, stage);
   const targets =
