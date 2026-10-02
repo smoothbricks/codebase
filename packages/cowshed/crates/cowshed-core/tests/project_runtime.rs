@@ -246,7 +246,13 @@ impl FakeHost {
                 repo_id,
                 binding,
                 git_root: root.join("checkout"),
-                store_root: root.join("store"),
+                storage: cowshed_core::storage::bootstrap::ValidatedHostStorage::new(
+                    root.join("home"),
+                    cowshed_core::storage::bootstrap::CanonicalRoots::at(
+                        root.join("store"),
+                        root.join("caches"),
+                    ),
+                ),
             },
             state_path: root.join("durable.json"),
             state: DurableState::default(),
@@ -546,7 +552,12 @@ impl ProjectRuntimeHost for FakeHost {
                 .collect::<std::collections::BTreeSet<_>>()
             {
                 let source = self.descriptor.git_root.join(path);
-                let destination = self.descriptor.store_root.join("quarantine").join(path);
+                let destination = self
+                    .descriptor
+                    .storage
+                    .store()
+                    .join("quarantine")
+                    .join(path);
                 std::fs::create_dir_all(destination.parent().expect("quarantine parent"))
                     .map_err(|error| CowshedError::internal(error.to_string()))?;
                 std::fs::rename(&source, &destination)
@@ -914,7 +925,7 @@ impl ProjectRuntimeHost for FakeHost {
                     target_branch: "main".to_owned(),
                     target_head: Some(GitOid::new("1".repeat(40)).expect("fixed tip")),
                     unlanded_commits: 3,
-                    bundle: self.descriptor.store_root.join(format!(
+                    bundle: self.descriptor.storage.store().join(format!(
                         "sessions/.trash/{workspace}-{}.bundle",
                         "4".repeat(40)
                     )),
@@ -1085,7 +1096,7 @@ impl ProjectRuntimeHost for FakeHost {
         self.workspace(&workspace)?;
         Ok(MirrorInfo {
             url: url.to_string(),
-            mirror: self.descriptor.store_root.join("mirror.git"),
+            mirror: self.descriptor.storage.store().join("mirror.git"),
         })
     }
 

@@ -43,7 +43,7 @@ pub async fn dispatch<W: std::io::Write + Send, E: std::io::Write + Send>(
         ProjectRuntime::open_existing(project_root, RecoveryScope::Workspaces(Default::default()))
             .await?;
     let repo_id = runtime.descriptor().repo_id.clone();
-    let store_root = runtime.descriptor().store_root.clone();
+    let store_root = runtime.descriptor().storage.store().to_path_buf();
     match command {
         CredentialCommand::Add(args) => add(&repo_id, &store_root, args, json, output).await,
         CredentialCommand::Status => report(&repo_id, &store_root, json, output).await,

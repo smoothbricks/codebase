@@ -516,7 +516,13 @@ pub async fn bind(path: &Path) -> Result<UnixListener> {
             ));
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(_) => std::fs::remove_file(path).map_err(|error| io("remove the stale", error))?,
+        Err(_) => match std::fs::remove_file(path) {
+            Ok(()) => {}
+            // The previous server can unlink its socket after our failed connect but before
+            // removal. The next bind still owns the result; this is not a missing directory.
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(io("remove the stale", error)),
+        },
     }
     let listener = UnixListener::bind(path).map_err(|error| io("bind", error))?;
     // The directory already admits only this user; the socket's own mode says the same. The

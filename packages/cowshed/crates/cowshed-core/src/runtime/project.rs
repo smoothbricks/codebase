@@ -62,7 +62,7 @@ pub struct ProjectDescriptor {
     pub repo_id: RepoId,
     pub binding: RepositoryBinding,
     pub git_root: PathBuf,
-    pub store_root: PathBuf,
+    pub storage: crate::storage::bootstrap::ValidatedHostStorage,
 }
 
 /// Which captured stream a log read walks.
@@ -488,6 +488,7 @@ impl ProjectRuntime {
             continuity_from_environment()?,
             BindingRemoteValidation::Strict,
             RecoveryScope::Workspaces(std::collections::BTreeSet::new()),
+            None,
         )
         .await
     }
@@ -510,6 +511,7 @@ impl ProjectRuntime {
             continuity_from_environment()?,
             BindingRemoteValidation::Strict,
             scope,
+            None,
         )
         .await
     }
@@ -528,6 +530,7 @@ impl ProjectRuntime {
             continuity_from_environment()?,
             BindingRemoteValidation::ForIdentityChange,
             RecoveryScope::Workspaces(std::collections::BTreeSet::new()),
+            None,
         )
         .await
     }
@@ -548,6 +551,44 @@ impl ProjectRuntime {
             continuity,
             BindingRemoteValidation::Strict,
             RecoveryScope::Workspaces(std::collections::BTreeSet::new()),
+            None,
+        )
+        .await
+    }
+
+    /// Open an isolated caller-provisioned APFS store without touching machine-global volumes.
+    /// The caller owns the supplied roots and their teardown; production uses `open_for_adopt`.
+    pub async fn open_for_adopt_at(
+        project_root: impl AsRef<Path>,
+        requested_repo_id: Option<RepoId>,
+        storage: crate::storage::bootstrap::ValidatedHostStorage,
+    ) -> Result<Self> {
+        Self::open_native(
+            project_root.as_ref(),
+            crate::storage::bootstrap::native::NativeBootstrapMode::Provision,
+            requested_repo_id,
+            continuity_from_environment()?,
+            BindingRemoteValidation::Strict,
+            RecoveryScope::Workspaces(std::collections::BTreeSet::new()),
+            Some(storage),
+        )
+        .await
+    }
+
+    /// Reopen the same caller-owned store under ordinary existing-only recovery rules.
+    pub async fn open_existing_at(
+        project_root: impl AsRef<Path>,
+        scope: RecoveryScope,
+        storage: crate::storage::bootstrap::ValidatedHostStorage,
+    ) -> Result<Self> {
+        Self::open_native(
+            project_root.as_ref(),
+            crate::storage::bootstrap::native::NativeBootstrapMode::ExistingOnly,
+            None,
+            continuity_from_environment()?,
+            BindingRemoteValidation::Strict,
+            scope,
+            Some(storage),
         )
         .await
     }
@@ -559,6 +600,7 @@ impl ProjectRuntime {
         continuity: crate::storage::audit::ContinuityAudit,
         validation: BindingRemoteValidation,
         recovery_scope: RecoveryScope,
+        storage: Option<crate::storage::bootstrap::ValidatedHostStorage>,
     ) -> Result<Self> {
         #[cfg(target_os = "macos")]
         {
@@ -569,6 +611,7 @@ impl ProjectRuntime {
                 continuity,
                 validation,
                 recovery_scope,
+                storage,
             )
             .await?;
             Self::start(host).await
@@ -582,6 +625,7 @@ impl ProjectRuntime {
                 continuity,
                 validation,
                 recovery_scope,
+                storage,
             );
             Err(CowshedError::environment_missing(
                 "the native cowshed project runtime requires macOS APFS",
@@ -820,7 +864,7 @@ impl ProjectActor {
             "repoId": descriptor.repo_id,
             "binding": descriptor.binding,
             "gitRoot": descriptor.git_root,
-            "storeRoot": descriptor.store_root,
+            "storeRoot": descriptor.storage.store(),
         }))
     }
 
@@ -1850,11 +1894,13 @@ impl Drop for ServedSupervisor {
 struct PortGrantReservation {
     grants: GrantSet,
     marker: PathBuf,
+    listeners: Vec<std::net::TcpListener>,
 }
 
 #[cfg(target_os = "macos")]
 impl Drop for PortGrantReservation {
     fn drop(&mut self) {
+        self.listeners.clear();
         let _ = std::fs::remove_file(&self.marker);
     }
 }
@@ -1901,6 +1947,61 @@ fn claim_port_block(staging: &Path, base: u16) -> std::io::Result<Option<PathBuf
     Ok(None)
 }
 
+#[cfg(target_os = "macos")]
+fn bind_port_block(
+    block: crate::metadata::PortBlock,
+) -> std::io::Result<Option<Vec<std::net::TcpListener>>> {
+    let mut listeners = Vec::with_capacity(usize::from(block.size()));
+    for port in block.base()..block.base() + block.size() {
+        match std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)) {
+            Ok(listener) => listeners.push(listener),
+            Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => return Ok(None),
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(Some(listeners))
+}
+
+#[cfg(target_os = "macos")]
+async fn reserve_specific_port_grants(
+    inventory: &crate::gateway_inventory::NativeGatewayInventory,
+    reservation_root: &Path,
+    block: crate::metadata::PortBlock,
+) -> Result<Option<PortGrantReservation>> {
+    let grants = GrantSet::closed_baseline(Some(block)).map_err(native_integrity_error)?;
+    let base = block.base();
+    let Some(marker) = claim_port_block(reservation_root, base).map_err(|error| {
+        CowshedError::internal(format!(
+            "claim macOS port block {base} at {}: {error}",
+            reservation_root.display()
+        ))
+    })?
+    else {
+        return Ok(None);
+    };
+    let mut reservation = PortGrantReservation {
+        grants,
+        marker,
+        listeners: Vec::new(),
+    };
+    reservation.listeners = match bind_port_block(block).map_err(|error| {
+        CowshedError::environment_missing(
+            format!("cannot bind macOS port block {block}: {error}"),
+            "check the host's local port availability",
+        )
+    })? {
+        Some(listeners) => listeners,
+        None => return Ok(None),
+    };
+    // A concurrent creator can publish and release its claim after the initial snapshot.
+    // The marker and kernel listeners stay held across this authoritative re-read.
+    let used = inventory
+        .all_reserved_port_blocks()
+        .await
+        .map_err(native_integrity_error)?;
+    Ok((used.overlapping(block).is_none()).then_some(reservation))
+}
+
 /// Claims the lowest new-size block that shares no port with a live block of any size. Every
 /// allocator claims new-size blocks on one aligned grid, so a claim marker keyed by base is
 /// enough to exclude a concurrent allocator; live blocks of other sizes are excluded by overlap.
@@ -1908,32 +2009,15 @@ fn claim_port_block(staging: &Path, base: u16) -> std::io::Result<Option<PathBuf
 async fn reserve_port_grants(
     inventory: &crate::gateway_inventory::NativeGatewayInventory,
     reservation_root: &Path,
-    mut used: crate::metadata::ReservedPortBlocks,
+    used: crate::metadata::ReservedPortBlocks,
 ) -> Result<PortGrantReservation> {
     for block in crate::metadata::PortBlock::macos_candidates() {
         if used.overlapping(block).is_some() {
             continue;
         }
-        let base = block.base();
-        let grants = GrantSet::closed_baseline(Some(block)).map_err(native_integrity_error)?;
-        let Some(marker) = claim_port_block(reservation_root, base).map_err(|error| {
-            CowshedError::internal(format!(
-                "claim macOS port block {base} at {}: {error}",
-                reservation_root.display()
-            ))
-        })?
-        else {
-            continue;
-        };
-        let reservation = PortGrantReservation { grants, marker };
-        // A creator can publish and release this marker after our initial inventory read.
-        // Owning it excludes another claimant while we re-read publication; retaining the
-        // guard across this await also releases the marker on error or cancellation.
-        used = inventory
-            .all_reserved_port_blocks()
-            .await
-            .map_err(native_integrity_error)?;
-        if used.overlapping(block).is_none() {
+        if let Some(reservation) =
+            reserve_specific_port_grants(inventory, reservation_root, block).await?
+        {
             return Ok(reservation);
         }
     }
@@ -2298,6 +2382,7 @@ impl NativeProjectRuntimeHost {
         continuity: crate::storage::audit::ContinuityAudit,
         validation: BindingRemoteValidation,
         recovery_scope: RecoveryScope,
+        supplied_storage: Option<crate::storage::bootstrap::ValidatedHostStorage>,
     ) -> Result<Self> {
         use crate::storage::apfs::ApfsExecutionHost;
         use crate::timing::spanned;
@@ -2309,35 +2394,50 @@ impl NativeProjectRuntimeHost {
         })
         .await?;
         let git_root = git.root().to_path_buf();
-        let home = std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .filter(|path| path.is_absolute())
-            .ok_or_else(|| {
-                CowshedError::environment_missing(
-                    "HOME is missing or is not absolute",
-                    "launch the controller with a canonical HOME",
+        let supervisors_run_in = if supplied_storage.is_some() {
+            SupervisorHome::ThisProcess
+        } else {
+            SupervisorHome::Daemon
+        };
+        let storage = match supplied_storage {
+            Some(storage) => storage,
+            None => {
+                let home = std::env::var_os("HOME")
+                    .map(PathBuf::from)
+                    .filter(|path| path.is_absolute())
+                    .ok_or_else(|| {
+                        CowshedError::environment_missing(
+                            "HOME is missing or is not absolute",
+                            "launch the controller with a canonical HOME",
+                        )
+                    })?;
+                let bootstrap = spanned(
+                    "open",
+                    "bootstrap",
+                    crate::storage::bootstrap::native::bootstrap_system_storage(
+                        &git_root,
+                        &home,
+                        bootstrap_mode,
+                    ),
                 )
-            })?;
-        let bootstrap = spanned(
-            "open",
-            "bootstrap",
-            crate::storage::bootstrap::native::bootstrap_system_storage(
-                &git_root,
-                &home,
-                bootstrap_mode,
-            ),
-        )
-        .await
-        .map_err(native_environment_error)?;
-        if !matches!(
-            bootstrap.substrate(),
-            crate::storage::bootstrap::SelectedSubstrate::Apfs { .. }
-        ) {
-            return Err(CowshedError::environment_missing(
-                "the macOS runtime requires the APFS image substrate",
-                "remove the unsupported substrate override and retry",
-            ));
-        }
+                .await
+                .map_err(native_environment_error)?;
+                if !matches!(
+                    bootstrap.substrate(),
+                    crate::storage::bootstrap::SelectedSubstrate::Apfs { .. }
+                ) {
+                    return Err(CowshedError::environment_missing(
+                        "the macOS runtime requires the APFS image substrate",
+                        "remove the unsupported substrate override and retry",
+                    ));
+                }
+                crate::storage::bootstrap::ValidatedHostStorage::new(
+                    home,
+                    bootstrap.roots().clone(),
+                )
+            }
+        };
+        let home = storage.home().to_path_buf();
         let existing_only = matches!(
             &bootstrap_mode,
             crate::storage::bootstrap::native::NativeBootstrapMode::ExistingOnly
@@ -2348,7 +2448,7 @@ impl NativeProjectRuntimeHost {
             spanned(
                 "open",
                 "identity-intent",
-                recover_repository_identity_intent(bootstrap.roots().store()),
+                recover_repository_identity_intent(storage.store()),
             )
             .await?;
         }
@@ -2362,12 +2462,8 @@ impl NativeProjectRuntimeHost {
         // be a missing direct mount, so resolving that identity must happen before replacing the
         // invocation repository handle with one rooted at the recorded checkout.
         let session_project = if existing_only {
-            project_binding_from_workspace_origin(
-                bootstrap.roots().store(),
-                &git_root,
-                origin.as_ref(),
-            )
-            .await?
+            project_binding_from_workspace_origin(storage.store(), &git_root, origin.as_ref())
+                .await?
         } else {
             None
         };
@@ -2393,14 +2489,11 @@ impl NativeProjectRuntimeHost {
             _ => (git_root, git),
         };
         if existing_only && binding_repo_id.is_none() {
-            let storage = crate::storage::bootstrap::ValidatedHostStorage::new(
-                bootstrap.home().to_owned(),
-                bootstrap.roots().clone(),
-            );
+            let inventory_storage = storage.clone();
             binding_repo_id = spanned(
                 "open",
                 "repository-for-root",
-                crate::gateway_inventory::NativeGatewayInventory::new(storage)
+                crate::gateway_inventory::NativeGatewayInventory::new(inventory_storage)
                     .repository_for_project_root(&git_root),
             )
             .await
@@ -2411,7 +2504,7 @@ impl NativeProjectRuntimeHost {
             resolved
         } else {
             let recorded = match binding_repo_id.as_ref() {
-                Some(repo_id) => project_owning_repo_id(bootstrap.roots().store(), repo_id).await?,
+                Some(repo_id) => project_owning_repo_id(storage.store(), repo_id).await?,
                 None => None,
             };
             match recorded {
@@ -2454,9 +2547,8 @@ impl NativeProjectRuntimeHost {
                         .map_err(native_integrity_error)?
                         .repo_id
                         .clone();
-                    let layout =
-                        crate::storage::StorageLayout::new(bootstrap.roots().store(), &repo_id)
-                            .map_err(native_integrity_error)?;
+                    let layout = crate::storage::StorageLayout::new(storage.store(), &repo_id)
+                        .map_err(native_integrity_error)?;
                     let binding = load_or_validate_binding(&layout, candidate, &git).await?;
                     (repo_id, layout, binding)
                 }
@@ -2485,8 +2577,8 @@ impl NativeProjectRuntimeHost {
             })?;
         }
         let config = crate::storage::apfs::ApfsSubstrateConfig::new(
-            bootstrap.roots().store(),
-            bootstrap.roots().caches(),
+            storage.store(),
+            storage.caches(),
             &git_root,
         );
         let host = crate::storage::apfs::native::MacOsApfsExecutionHost::new(
@@ -2566,7 +2658,7 @@ impl NativeProjectRuntimeHost {
                 ));
             }
         }
-        let telemetry_root = bootstrap.roots().store().join("telemetry");
+        let telemetry_root = storage.telemetry().to_path_buf();
         // A sink of the host's own takes the workspaces' commitments too: the supervisors that
         // record them are processes of their own, so this controller forwards them.
         let forwards_commitments = matches!(
@@ -2595,7 +2687,7 @@ impl NativeProjectRuntimeHost {
             repo_id,
             binding,
             git_root,
-            store_root: bootstrap.roots().store().to_path_buf(),
+            storage,
         };
         Ok(Self {
             descriptor,
@@ -2606,7 +2698,7 @@ impl NativeProjectRuntimeHost {
             commitments,
             supervisors: std::collections::BTreeMap::new(),
             served: std::collections::BTreeMap::new(),
-            supervisors_run_in: SupervisorHome::Daemon,
+            supervisors_run_in,
             forwarders: if forwards_commitments {
                 Some(std::collections::BTreeMap::new())
             } else {
@@ -2837,10 +2929,7 @@ impl NativeProjectRuntimeHost {
                     LifecycleIntent::Create { .. } | LifecycleIntent::Fork { .. }
                 )
             }) {
-            let storage = crate::storage::bootstrap::ValidatedHostStorage::new(
-                self.home.clone(),
-                crate::storage::bootstrap::CanonicalRoots::global(),
-            );
+            let storage = self.descriptor.storage.clone();
             match crate::gateway_inventory::NativeGatewayInventory::new(storage)
                 .all_reserved_port_blocks()
                 .await
@@ -3529,7 +3618,7 @@ impl NativeProjectRuntimeHost {
         }
         let mount_point = self.workspace_mount_path(&main)?;
         let record = self.checkout_record()?;
-        let store_root = self.descriptor.store_root.clone();
+        let store_root = self.descriptor.storage.store().to_path_buf();
         let observed = observed.to_owned();
         let probe_mount = mount_point.clone();
         let Some(checkout) = crate::storage::lifecycle::dispatch_blocking(move || {
@@ -3583,8 +3672,8 @@ impl NativeProjectRuntimeHost {
                 "nothing to move; run cowshed doctor to see whether a workspace's records lag",
             ));
         }
-        if destination.starts_with(&self.descriptor.store_root)
-            || self.descriptor.store_root.starts_with(destination)
+        if destination.starts_with(self.descriptor.storage.store())
+            || self.descriptor.storage.store().starts_with(destination)
             || destination.starts_with(source)
         {
             return Err(CowshedError::usage(
@@ -3594,7 +3683,7 @@ impl NativeProjectRuntimeHost {
                 ),
                 format!(
                     "choose a destination outside {} and outside the current checkout",
-                    self.descriptor.store_root.display()
+                    self.descriptor.storage.store().display()
                 ),
             ));
         }
@@ -4811,11 +4900,7 @@ impl NativeProjectRuntimeHost {
     }
 
     async fn fresh_grants(&self) -> Result<PortGrantReservation> {
-        let roots = crate::storage::bootstrap::CanonicalRoots::global();
-        // NativeProjectRuntimeHost is created only after ExistingOnly/Provision bootstrap has
-        // validated these exact roots; preserve that capability while enumerating every repo.
-        let storage =
-            crate::storage::bootstrap::ValidatedHostStorage::new(self.home.clone(), roots);
+        let storage = self.descriptor.storage.clone();
         let reservation_root = storage.store().join(".staging");
         let inventory = crate::gateway_inventory::NativeGatewayInventory::new(storage);
         let used = inventory
@@ -4840,9 +4925,7 @@ impl NativeProjectRuntimeHost {
         {
             // A pending sidecar owns this grant; an independently published duplicate must
             // refuse before the pending workspace can be activated or served.
-            let roots = crate::storage::bootstrap::CanonicalRoots::global();
-            let storage =
-                crate::storage::bootstrap::ValidatedHostStorage::new(self.home.clone(), roots);
+            let storage = self.descriptor.storage.clone();
             crate::gateway_inventory::NativeGatewayInventory::new(storage)
                 .all_reserved_port_blocks()
                 .await
@@ -4931,7 +5014,7 @@ impl NativeProjectRuntimeHost {
         // change relaunches the supervisor exactly as a workspace grant change does.
         let grants = effective_workspace_grants(&self.layout, &current.metadata.grants)?;
         let socket = super::supervisor_socket::socket_path(
-            &self.descriptor.store_root,
+            self.descriptor.storage.store(),
             &self.descriptor.repo_id,
             name,
         );
@@ -4976,7 +5059,7 @@ impl NativeProjectRuntimeHost {
                 "supervisor",
                 "manager-ensure",
                 super::supervisor_manager::ensure(
-                    &self.descriptor.store_root,
+                    self.descriptor.storage.store(),
                     &self.descriptor.git_root,
                     &needed,
                 ),
@@ -5021,7 +5104,7 @@ impl NativeProjectRuntimeHost {
             // project's approved gateway credentials came from, so no child receives an ambient
             // copy of a token the gateway already holds.
             credential_env_names: crate::storage::host_config::HostConfig::load_for_store(
-                &self.descriptor.store_root,
+                self.descriptor.storage.store(),
             )
             .map_err(|error| {
                 CowshedError::integrity(
@@ -5265,7 +5348,7 @@ impl NativeProjectRuntimeHost {
             Some(handle) => Some(handle),
             None => {
                 let socket = super::supervisor_socket::socket_path(
-                    &self.descriptor.store_root,
+                    self.descriptor.storage.store(),
                     &self.descriptor.repo_id,
                     name,
                 );
@@ -5317,7 +5400,7 @@ impl NativeProjectRuntimeHost {
         self.ensure_supervisor_for(current).await?;
         if !self.served.contains_key(&name) {
             let socket = super::supervisor_socket::socket_path(
-                &self.descriptor.store_root,
+                self.descriptor.storage.store(),
                 &self.descriptor.repo_id,
                 &name,
             );
@@ -8180,11 +8263,40 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                 })?,
         )
         .map_err(|_| CowshedError::usage("slot overflows port space", "choose a smaller slot"))?;
+        let block = crate::metadata::PortBlock::new(base, crate::metadata::NEW_PORT_BLOCK_SIZE)
+            .map_err(|error| CowshedError::usage(error.to_string(), "choose another slot"))?;
+        if !crate::metadata::PortBlock::macos_candidates().any(|candidate| candidate == block) {
+            return Err(CowshedError::usage(
+                format!("port block {block} is outside the macOS workspace range"),
+                "choose a macOS workspace slot",
+            ));
+        }
+        if current.metadata.grants.port_block == Some(block) {
+            return Ok(());
+        }
+        let inventory =
+            crate::gateway_inventory::NativeGatewayInventory::new(self.descriptor.storage.clone());
+        let used = inventory
+            .all_reserved_port_blocks()
+            .await
+            .map_err(native_integrity_error)?;
+        if let Some(held) = used.overlapping(block) {
+            return Err(CowshedError::conflict(
+                format!("port block {block} overlaps workspace port block {held}"),
+                "choose an unassigned workspace slot",
+            ));
+        }
+        let reservation_root = self.descriptor.storage.store().join(".staging");
+        let _reservation = reserve_specific_port_grants(&inventory, &reservation_root, block)
+            .await?
+            .ok_or_else(|| {
+                CowshedError::conflict(
+                    format!("port block {block} is already held or bound"),
+                    "choose an unassigned workspace slot",
+                )
+            })?;
         let mut metadata = current.metadata;
-        metadata.grants.port_block = Some(
-            crate::metadata::PortBlock::new(base, crate::metadata::NEW_PORT_BLOCK_SIZE)
-                .map_err(|error| CowshedError::usage(error.to_string(), "choose another slot"))?,
-        );
+        metadata.grants.port_block = Some(block);
         metadata.grants.revision = metadata
             .grants
             .revision
@@ -9026,7 +9138,7 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
         // Recovery quarantines a companion-less workspace and continues, so the failure never
         // reaches `doctor` as an error: the tombstones and the live images are read here, from
         // the same store-side facts, instead.
-        let store_root = self.descriptor.store_root.clone();
+        let store_root = self.descriptor.storage.store().to_path_buf();
         let repo_id = self.descriptor.repo_id.clone();
         findings.extend(
             crate::storage::lifecycle::dispatch_blocking(move || {
@@ -9797,7 +9909,7 @@ pub async fn bind_remote_identity(
     #[cfg(target_os = "macos")]
     {
         let layout =
-            crate::storage::StorageLayout::new(&descriptor.store_root, &descriptor.repo_id)
+            crate::storage::StorageLayout::new(descriptor.storage.store(), &descriptor.repo_id)
                 .map_err(native_integrity_error)?;
         let binding = read_persisted_binding(&layout).await?.ok_or_else(|| {
             CowshedError::integrity(
@@ -9808,7 +9920,7 @@ pub async fn bind_remote_identity(
         let remotes = crate::git::GitRepository::from_root(&descriptor.git_root)
             .remotes()
             .await?;
-        let store = descriptor.store_root.clone();
+        let store = descriptor.storage.store().to_path_buf();
         let project = descriptor.repo_id.clone();
         let others =
             crate::storage::lifecycle::dispatch_blocking(move || other_bindings(&store, &project))
@@ -15088,7 +15200,7 @@ mod port_reservation_tests {
             .await
             .expect("first allocation");
         let first_base = first.grants.port_block.expect("first block").base();
-        assert_eq!(first_base, MACOS_PORT_MIN);
+        assert!(PortBlock::macos_candidates().any(|candidate| candidate.base() == first_base));
         let image = layout.main_image().expect("main image");
         std::fs::write(image.image(), b"detached image fixture").expect("image");
         DetachedWorkspaceMetadata {
@@ -15132,7 +15244,7 @@ mod port_reservation_tests {
             .await
             .expect("allocation after publication");
         let second_base = second.grants.port_block.expect("second block").base();
-        assert_eq!(second_base, first_base + NEW_PORT_BLOCK_SIZE);
+        assert!(second_base > first_base);
         assert!(
             claim_port_block(&staging, second_base)
                 .expect("competing claim")
@@ -15211,9 +15323,9 @@ mod port_reservation_tests {
         let second = reserve_port_grants(&inventory, &staging, Default::default())
             .await
             .expect("allocation after creator death");
-        assert_eq!(
-            second.grants.port_block.expect("second block").base(),
-            first_base + NEW_PORT_BLOCK_SIZE
+        assert!(
+            second.grants.port_block.expect("second block").base() > first_base,
+            "the pending image still owns its first block"
         );
         drop(second);
         let main = layout.main_image().expect("main image");
@@ -15341,10 +15453,9 @@ mod port_reservation_tests {
             .await
             .expect("allocation around live blocks");
         let first_block = first.grants.port_block.expect("first block");
-        assert_eq!(
-            first_block,
-            PortBlock::new(MACOS_PORT_MIN + 128, NEW_PORT_BLOCK_SIZE).expect("expected block")
-        );
+        assert!(first_block.base() >= MACOS_PORT_MIN + 128);
+        assert!(!first_block.overlaps(published));
+        assert!(!first_block.overlaps(pending_block));
         let second_name = WorkspaceName::session("second").expect("session");
         let second_image = layout.session_image(&second_name).expect("session image");
         publish(
@@ -15357,11 +15468,46 @@ mod port_reservation_tests {
         let second = reserve_port_grants(&inventory, &staging, Default::default())
             .await
             .expect("allocation after the first new block");
-        assert_eq!(
-            second.grants.port_block.expect("second block"),
-            PortBlock::new(MACOS_PORT_MIN + 192, NEW_PORT_BLOCK_SIZE).expect("expected block")
+        assert!(
+            second.grants.port_block.expect("second block").base() > first_block.base(),
+            "publication of the first block excludes it from the next allocation"
         );
         drop(second);
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[tokio::test]
+    async fn a_port_bound_outside_inventory_cannot_be_allocated_to_a_workspace() {
+        use std::net::{Ipv4Addr, TcpListener};
+
+        let root = root("external-listener");
+        let (inventory, _) = inventory(&root);
+        let staging = root.join("store/.staging");
+        let mut used = crate::metadata::ReservedPortBlocks::default();
+        let (blocked, listener) = PortBlock::macos_candidates()
+            .find_map(
+                |block| match TcpListener::bind((Ipv4Addr::LOCALHOST, block.base() + 1)) {
+                    Ok(listener) => Some((block, listener)),
+                    Err(_) => {
+                        used.insert(block).expect("disjoint candidate blocks");
+                        None
+                    }
+                },
+            )
+            .expect("one test block with a free service port");
+        let granted = reserve_port_grants(&inventory, &staging, used)
+            .await
+            .expect("allocator skips a kernel-owned service port");
+        assert_ne!(
+            granted.grants.port_block,
+            Some(blocked),
+            "the persisted grant must not include a port another process already holds"
+        );
+        let granted_base = granted.grants.port_block.expect("selected block").base();
+        drop((granted, listener));
+        let released = TcpListener::bind((Ipv4Addr::LOCALHOST, granted_base))
+            .expect("dropping the publication guard releases its kernel listeners");
+        drop(released);
         std::fs::remove_dir_all(root).expect("cleanup");
     }
 

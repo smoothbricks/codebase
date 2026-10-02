@@ -42,6 +42,13 @@ topology is platform-specific:
   `127.0.0.1:7644` is only a namespace-local compatibility endpoint, so fixed service ports neither collide nor reach
   siblings.
 
+The allocator's publication marker excludes other cowshed creators while it binds all ports in the candidate block.
+Those listeners are released only after the image and grant are published. A separate host process can still claim a
+port before the daemon installs the session: `AddrInUse` is a typed control refusal, not a stale-grant success. The
+project controller chooses a new unassigned block under the same reservation and inventory check, publishes a higher
+grant revision, rereads the authoritative session, and retries. A refused base is excluded for that reconciliation, so a
+retry cannot alternate between occupied ports. Other installation errors remain errors.
+
 Every data-plane request additionally carries exactly `Proxy-Authorization: Bearer <opaque-token>`. The token is 32
 random bytes encoded as unpadded base64url, lives at `.cowshed/token` mode 0600, and is defense in depth rather than the
 workspace selector: the already-selected macOS listener or Linux socket chooses the workspace before comparison. A proxy

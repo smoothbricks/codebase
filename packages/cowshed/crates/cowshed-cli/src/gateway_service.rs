@@ -8,10 +8,12 @@ use crate::launchd::{
 };
 use crate::output::Output;
 use async_trait::async_trait;
+use cowshed_core::api::Coordinator;
 use cowshed_core::api::{EmptyResult, GatewayStatus as CliGatewayStatus, StaleDaemonBinary};
+use cowshed_core::metadata::{NEW_PORT_BLOCK_SIZE, PortBlock};
 use cowshed_core::repository::RepoId;
 use cowshed_core::{
-    CowshedError, NativeGatewayInventory, Result, ValidatedHostStorage,
+    CowshedError, ErrorCode, NativeGatewayInventory, Result, ValidatedHostStorage,
     validate_existing_host_storage,
 };
 use cowshed_gateway::{
@@ -26,12 +28,14 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 pub use cowshed_core::gateway_sessions::{
-    ControlRefusal, GATEWAY_START_HINT, GatewayControl, GatewayInstaller, GatewayStatusError,
-    NativeSessionInventory, ReconcileReport, SessionInventory, canonical_home, control_error,
-    control_socket_path, effective_uid, gateway_absent, install_all_sessions, policy_from_grants,
-    project_session_prefix, reconcile_against_status, reconcile_project, session_from_fact,
-    sessions_from_facts, stable_workspace_id,
+    ControlRefusal, GATEWAY_START_HINT, GatewayControl, GatewayInstaller, GatewayPortReallocator,
+    GatewayStatusError, NativeSessionInventory, ReconcileReport, SessionInventory, canonical_home,
+    control_error, control_socket_path, effective_uid, gateway_absent, install_all_sessions,
+    policy_from_grants, project_session_prefix, reconcile_against_status, reconcile_project,
+    reconcile_project_with_reallocator, session_from_fact, sessions_from_facts,
+    stable_workspace_id,
 };
+use std::collections::BTreeSet;
 
 /// A running daemon reached over its control socket.
 ///
@@ -88,6 +92,10 @@ fn control_refusal(error: ControlError) -> ControlRefusal {
             code: ControlFailureCode::RevisionFence | ControlFailureCode::NotInstalled,
             ..
         } => ControlRefusal::Superseded(error.to_string()),
+        ControlError::Rejected {
+            code: ControlFailureCode::AddressInUse,
+            ..
+        } => ControlRefusal::AddressInUse(error.to_string()),
         error => ControlRefusal::Failed(error.to_string()),
     }
 }
@@ -111,20 +119,132 @@ impl GatewayInstaller for OwnedGateway {
     }
 }
 
-pub async fn reconcile_native_project(repo_id: &RepoId) -> Result<ReconcileReport> {
-    let home = canonical_home()?;
-    let storage = cowshed_core::timing::spanned(
-        "reconcile",
-        "host-storage",
-        validate_existing_host_storage(&home),
-    )
-    .await?;
-    let inventory = NativeSessionInventory::new(storage);
-    let control = ControlSocket::at(control_socket_path())?;
+/// The owning project actor publishes a replacement port grant; gateway reconciliation reads
+/// that published revision back rather than manufacturing a session from the requested slot.
+#[async_trait]
+pub trait PortSlotAssigner: Send + Sync {
+    async fn assign_port_slot(&self, workspace: &str, slot: u32) -> Result<()>;
+}
+
+#[async_trait]
+impl PortSlotAssigner for Coordinator {
+    async fn assign_port_slot(&self, workspace: &str, slot: u32) -> Result<()> {
+        self.assign_slot(workspace, slot).await
+    }
+}
+
+struct NativePortReallocator<'a> {
+    storage: &'a ValidatedHostStorage,
+    repo_id: &'a RepoId,
+    assigner: &'a dyn PortSlotAssigner,
+}
+
+#[async_trait]
+impl GatewayPortReallocator for NativePortReallocator<'_> {
+    async fn reallocate(
+        &self,
+        session: &WorkspaceSession,
+        rejected: &BTreeSet<u16>,
+    ) -> Result<WorkspaceSession> {
+        let inventory = NativeGatewayInventory::new(self.storage.clone());
+        let attached = inventory
+            .project_attached(self.repo_id)
+            .await
+            .map_err(|error| {
+                CowshedError::integrity(
+                    format!("cannot inspect gateway port owners: {error}"),
+                    "cowshed doctor --json",
+                )
+            })?;
+        let fact = attached
+            .into_iter()
+            .find(|fact| {
+                stable_workspace_id(&fact.repo_id, fact.workspace.as_str(), &fact.incarnation)
+                    == session.workspace_id
+            })
+            .ok_or_else(|| {
+                CowshedError::conflict(
+                    format!(
+                        "gateway workspace {} is no longer attached",
+                        session.workspace_id
+                    ),
+                    "retry against current workspace inventory",
+                )
+            })?;
+        if fact.revision > session.revision {
+            return session_from_fact(fact);
+        }
+        let used = inventory
+            .all_reserved_port_blocks()
+            .await
+            .map_err(|error| {
+                CowshedError::integrity(
+                    format!("cannot inspect gateway port blocks: {error}"),
+                    "cowshed doctor --json",
+                )
+            })?;
+        for block in PortBlock::macos_candidates() {
+            if used.overlapping(block).is_some() || rejected.contains(&block.base()) {
+                continue;
+            }
+            let slot = u32::from(block.base()) / u32::from(NEW_PORT_BLOCK_SIZE);
+            match self
+                .assigner
+                .assign_port_slot(fact.workspace.as_str(), slot)
+                .await
+            {
+                Ok(()) => {
+                    return NativeSessionInventory::new(self.storage.clone())
+                        .project_sessions(self.repo_id)
+                        .await?
+                        .into_iter()
+                        .find(|current| current.workspace_id == session.workspace_id)
+                        .ok_or_else(|| {
+                            CowshedError::conflict(
+                                format!(
+                                    "gateway workspace {} disappeared during port reallocation",
+                                    session.workspace_id
+                                ),
+                                "retry against current workspace inventory",
+                            )
+                        });
+                }
+                Err(error) if error.code == ErrorCode::Conflict => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Err(CowshedError::conflict(
+            format!(
+                "no free macOS gateway port block remains for {}",
+                fact.workspace
+            ),
+            "release an unused workspace port block or stop the process holding a service port",
+        ))
+    }
+}
+
+pub async fn reconcile_native_project(
+    repo_id: &RepoId,
+    storage: &ValidatedHostStorage,
+    assigner: &dyn PortSlotAssigner,
+) -> Result<ReconcileReport> {
+    let inventory = NativeSessionInventory::new(storage.clone());
+    let control = ControlSocket::at(storage.store().join("gateway.sock"))?;
+    let reallocator = NativePortReallocator {
+        storage,
+        repo_id,
+        assigner,
+    };
     cowshed_core::timing::spanned(
         "reconcile",
         "sessions",
-        reconcile_project(&control, &inventory, repo_id, effective_uid()),
+        reconcile_project_with_reallocator(
+            &control,
+            &inventory,
+            repo_id,
+            effective_uid(),
+            &reallocator,
+        ),
     )
     .await
 }
@@ -158,7 +278,7 @@ impl GatewayPaths {
             cache_volume: storage.caches().to_path_buf(),
             mirror_cache: storage.caches().join("mirror"),
             telemetry: storage.telemetry().join("gateway"),
-            control_socket: control_socket_path(),
+            control_socket: storage.store().join("gateway.sock"),
         }
     }
 

@@ -115,6 +115,11 @@ the stale allocator resumes. The stale allocator must claim then re-read current
 reject the now published block, and choose another. Inventory errors must release the newly claimed marker; successful
 reservations remain held until their owner's publication finishes.
 
+An occupied port inside an otherwise unclaimed block is planted with a real loopback listener: the allocator must skip
+that candidate, and the guard must close every probed listener before another allocation may reuse the block. A second
+regression claims the published gateway base _after_ allocation and proves the real daemon rejects its bind, the
+controller rotates the durable grant to another block, and the new endpoint answers with the updated revision.
+
 ## Property tests (proptest, pure, all platforms)
 
 Invariants the table-driven unit cases only sample. Each is a pure function over generated inputs:
@@ -152,6 +157,12 @@ whose pid is gone. On Linux: a scratch ZFS pool on a loopback/file vdev (`cowshe
 and the pool exported on teardown; the Linux leg also exercises `cowshed-helper` and the Landlock/netns exec path. A
 suite-level guard reaps leaked `cowshed.itest.*` volumes/pools. The same flow table runs on both; substrate-specific
 assertions (fsck step on APFS, origin-snapshot GC on ZFS) are tagged.
+
+The CLI dispatch tier opens a real `ActorBridge` on caller-owned APFS images and the same persisted workspace/project
+grant stores as a normal controller. It tests grant denial without a write, grant survival across runtime restart, a
+real gateway's reconciliation of revised grants and raced ports, and checked landing's gateway-absent refusal followed
+by a successful fast-forward. There is no test-only `CliService` answering commands. The gateway and scratch-image
+teardown guards run on assertion failure as well as success; no test installs or changes the machine-global daemon.
 
 Covered flows:
 

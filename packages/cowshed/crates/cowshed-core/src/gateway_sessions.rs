@@ -69,13 +69,17 @@ pub enum ControlRefusal {
     /// a removal names has since been replaced or removed. Another reconcile that read a newer
     /// snapshot made it, and it stands.
     Superseded(String),
+    /// The host kernel already owns the listener; a publisher may choose another port block.
+    AddressInUse(String),
     Failed(String),
 }
 
 impl std::fmt::Display for ControlRefusal {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Superseded(reason) | Self::Failed(reason) => formatter.write_str(reason),
+            Self::Superseded(reason) | Self::Failed(reason) | Self::AddressInUse(reason) => {
+                formatter.write_str(reason)
+            }
         }
     }
 }
@@ -97,6 +101,18 @@ pub trait GatewayControl: Send + Sync {
         workspace_id: &str,
         expected_revision: u64,
     ) -> std::result::Result<(), ControlRefusal>;
+}
+
+/// Reassign a persisted workspace port block after the gateway reports `AddrInUse`, returning
+/// the new authoritative session. `rejected` includes every candidate the kernel refused in this
+/// reconciliation, so the allocator cannot bounce between a pair of occupied ports.
+#[async_trait]
+pub trait GatewayPortReallocator: Send + Sync {
+    async fn reallocate(
+        &self,
+        session: &WorkspaceSession,
+        rejected: &BTreeSet<u16>,
+    ) -> Result<WorkspaceSession>;
 }
 
 #[async_trait]
@@ -304,6 +320,34 @@ where
     C: GatewayControl + ?Sized,
     I: SessionInventory + ?Sized,
 {
+    reconcile_project_inner(control, inventory, repo_id, uid, None).await
+}
+
+pub async fn reconcile_project_with_reallocator<C, I>(
+    control: &C,
+    inventory: &I,
+    repo_id: &RepoId,
+    uid: u32,
+    reallocator: &dyn GatewayPortReallocator,
+) -> Result<ReconcileReport>
+where
+    C: GatewayControl + ?Sized,
+    I: SessionInventory + ?Sized,
+{
+    reconcile_project_inner(control, inventory, repo_id, uid, Some(reallocator)).await
+}
+
+async fn reconcile_project_inner<C, I>(
+    control: &C,
+    inventory: &I,
+    repo_id: &RepoId,
+    uid: u32,
+    reallocator: Option<&dyn GatewayPortReallocator>,
+) -> Result<ReconcileReport>
+where
+    C: GatewayControl + ?Sized,
+    I: SessionInventory + ?Sized,
+{
     let status = control.status().await.map_err(|error| match error {
         GatewayStatusError::Absent => gateway_absent(uid),
         GatewayStatusError::Control(message) => {
@@ -311,12 +355,13 @@ where
         }
     })?;
     let desired = inventory.project_sessions(repo_id).await?;
-    reconcile_against_status(
+    reconcile_against_status_inner(
         control,
         inventory,
         &project_session_prefix(repo_id),
         desired,
         status,
+        reallocator,
     )
     .await
 }
@@ -340,6 +385,21 @@ pub async fn reconcile_against_status<C, I>(
     project_prefix: &str,
     desired: Vec<WorkspaceSession>,
     status: GatewayStatus,
+) -> Result<ReconcileReport>
+where
+    C: GatewayControl + ?Sized,
+    I: SessionInventory + ?Sized,
+{
+    reconcile_against_status_inner(control, host, project_prefix, desired, status, None).await
+}
+
+async fn reconcile_against_status_inner<C, I>(
+    control: &C,
+    host: &I,
+    project_prefix: &str,
+    desired: Vec<WorkspaceSession>,
+    status: GatewayStatus,
+    reallocator: Option<&dyn GatewayPortReallocator>,
 ) -> Result<ReconcileReport>
 where
     C: GatewayControl + ?Sized,
@@ -382,7 +442,7 @@ where
             {
                 Ok(()) => report.removed += 1,
                 Err(ControlRefusal::Superseded(_)) => report.superseded += 1,
-                Err(ControlRefusal::Failed(error)) => {
+                Err(ControlRefusal::Failed(error) | ControlRefusal::AddressInUse(error)) => {
                     return Err(CowshedError::internal(format!(
                         "could not remove stale gateway session {}: {error}",
                         installed.workspace_id
@@ -425,7 +485,7 @@ where
             match control.remove(&owner.workspace_id, owner.revision).await {
                 Ok(()) => report.removed += 1,
                 Err(ControlRefusal::Superseded(_)) => report.superseded += 1,
-                Err(ControlRefusal::Failed(error)) => {
+                Err(ControlRefusal::Failed(error) | ControlRefusal::AddressInUse(error)) => {
                     return Err(CowshedError::internal(format!(
                         "could not remove stale gateway session {} holding endpoint {}: {error}",
                         owner.workspace_id, owner.endpoint
@@ -442,12 +502,67 @@ where
         if unchanged {
             continue;
         }
-        match control.install(session).await {
-            Ok(()) => report.installed += 1,
-            Err(ControlRefusal::Superseded(_)) => report.superseded += 1,
-            Err(ControlRefusal::Failed(error)) => failures.push(format!(
-                "could not install gateway session {identity}: {error}"
-            )),
+        let mut replacement: Option<WorkspaceSession> = None;
+        let mut rejected = BTreeSet::new();
+        loop {
+            let attempted = replacement.as_ref().unwrap_or(session);
+            match control.install(attempted).await {
+                Ok(()) => {
+                    report.installed += 1;
+                    break;
+                }
+                Err(ControlRefusal::Superseded(_)) => {
+                    report.superseded += 1;
+                    break;
+                }
+                Err(ControlRefusal::Failed(error)) => {
+                    failures.push(format!(
+                        "could not install gateway session {identity}: {error}"
+                    ));
+                    break;
+                }
+                Err(ControlRefusal::AddressInUse(error)) => {
+                    let WorkspaceEndpoint::Tcp { address, .. } = &attempted.endpoint else {
+                        failures.push(format!(
+                            "could not install gateway session {identity}: {error}"
+                        ));
+                        break;
+                    };
+                    let Some(reallocator) = reallocator else {
+                        failures.push(format!(
+                            "could not install gateway session {identity}: {error}"
+                        ));
+                        break;
+                    };
+                    if !rejected.insert(address.port()) {
+                        failures.push(format!(
+                            "could not install gateway session {identity}: repeated occupied port {}",
+                            address.port()
+                        ));
+                        break;
+                    }
+                    match reallocator.reallocate(attempted, &rejected).await {
+                        Ok(next)
+                            if next.workspace_id == session.workspace_id
+                                && next.revision > attempted.revision =>
+                        {
+                            replacement = Some(next);
+                        }
+                        Ok(_) => {
+                            failures.push(format!(
+                                "could not install gateway session {identity}: reallocation did not advance its authority"
+                            ));
+                            break;
+                        }
+                        Err(error) => {
+                            failures.push(format!(
+                                "could not reallocate occupied gateway session {identity}: {error}"
+                            ));
+                            break;
+                        }
+                    }
+                }
+            }
         }
     }
     if failures.is_empty() {

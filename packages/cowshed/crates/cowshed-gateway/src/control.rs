@@ -365,6 +365,7 @@ pub enum ControlFailureCode {
     /// The operation names a workspace with no installed session.
     NotInstalled,
     EndpointConflict,
+    AddressInUse,
     NotAdmitted,
     BrokerRejected,
     Rejected,
@@ -988,11 +989,14 @@ fn invalid_session(error: String) -> ControlResponse {
 }
 
 fn rejected(error: GatewayError) -> ControlResponse {
-    let code = match error {
+    let code = match &error {
         GatewayError::StaleRevision | GatewayError::RevisionMismatch { .. } => {
             ControlFailureCode::RevisionFence
         }
         GatewayError::EndpointInUse => ControlFailureCode::EndpointConflict,
+        GatewayError::Io(source) if source.kind() == std::io::ErrorKind::AddrInUse => {
+            ControlFailureCode::AddressInUse
+        }
         GatewayError::UnknownWorkspace => ControlFailureCode::NotInstalled,
         GatewayError::Config(_) | GatewayError::Tls(_) => ControlFailureCode::InvalidSession,
         _ => ControlFailureCode::Rejected,

@@ -17,13 +17,14 @@ use std::num::NonZeroUsize;
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::os::unix::fs::FileTypeExt;
 use std::path::Path;
+use std::sync::Arc;
 
 use cowshed_core::api::server::{
     ConnectionAuthority, RouterCommand, RouterHandle, serve_controller_connection,
 };
 use cowshed_core::repository::RepoId;
 use cowshed_core::runtime::{ProjectRuntime, RecoveryScope};
-use cowshed_core::{CowshedError, Result};
+use cowshed_core::{CowshedError, Result, ValidatedHostStorage};
 use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
@@ -102,11 +103,12 @@ pub async fn serve(project_root: &Path, socket: OwnedFd) -> Result<()> {
     )
     .await?;
     let repo_id = runtime.descriptor().repo_id.clone();
+    let storage = Arc::new(runtime.descriptor().storage.clone());
     let authority = ConnectionAuthority::Coordinator {
         repo_id: repo_id.clone(),
     };
     let (router, calls) = RouterHandle::channel(RELAY_CAPACITY);
-    let relay = tokio::spawn(relay(calls, runtime.router(), repo_id));
+    let relay = tokio::spawn(relay(calls, runtime.router(), repo_id, storage));
     let served = serve_controller_connection(socket, authority, router).await;
     // The connection held every sender; with it gone the relay ends, abandoning what the peer
     // left unanswered just as the connection did.
@@ -119,13 +121,18 @@ pub async fn serve(project_root: &Path, socket: OwnedFd) -> Result<()> {
 
 /// Hand each call to the project's router as it arrives, each on a task of its own so a job wait
 /// never holds the calls behind it.
-async fn relay(mut calls: mpsc::Receiver<RouterCommand>, router: RouterHandle, repo_id: RepoId) {
+async fn relay(
+    mut calls: mpsc::Receiver<RouterCommand>,
+    router: RouterHandle,
+    repo_id: RepoId,
+    storage: Arc<ValidatedHostStorage>,
+) {
     let mut open = JoinSet::new();
     loop {
         tokio::select! {
             call = calls.recv() => match call {
                 Some(call) => {
-                    open.spawn(answer(call, router.clone(), repo_id.clone()));
+                    open.spawn(answer(call, router.clone(), repo_id.clone(), Arc::clone(&storage)));
                 }
                 None => return,
             },
@@ -138,11 +145,47 @@ async fn relay(mut calls: mpsc::Receiver<RouterCommand>, router: RouterHandle, r
     }
 }
 
-async fn answer(call: RouterCommand, router: RouterHandle, repo_id: RepoId) {
+struct RouterPortSlotAssigner<'a> {
+    router: &'a RouterHandle,
+    repo_id: &'a RepoId,
+}
+
+#[async_trait::async_trait]
+impl gateway_service::PortSlotAssigner for RouterPortSlotAssigner<'_> {
+    async fn assign_port_slot(&self, workspace: &str, slot: u32) -> Result<()> {
+        self.router
+            .route(
+                ConnectionAuthority::Coordinator {
+                    repo_id: self.repo_id.clone(),
+                },
+                "coordinator.assignSlot".to_owned(),
+                serde_json::json!({
+                    "repoId": self.repo_id,
+                    "workspace": workspace,
+                    "slot": slot,
+                }),
+                None,
+                None,
+            )
+            .await
+            .map(|_| ())
+    }
+}
+
+async fn answer(
+    call: RouterCommand,
+    router: RouterHandle,
+    repo_id: RepoId,
+    storage: Arc<ValidatedHostStorage>,
+) {
     let (request, reply) = call.into_parts();
     let response = async {
         if needs_gateway(request.method(), request.params()) {
-            gateway_service::reconcile_native_project(&repo_id).await?;
+            let assigner = RouterPortSlotAssigner {
+                router: &router,
+                repo_id: &repo_id,
+            };
+            gateway_service::reconcile_native_project(&repo_id, &storage, &assigner).await?;
         }
         let (authority, method, params, upload, steps) = request.into_parts();
         router.route(authority, method, params, upload, steps).await

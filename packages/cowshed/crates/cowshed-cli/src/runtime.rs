@@ -296,6 +296,26 @@ impl ActorBridge {
         Self::from_runtime(project_root, runtime).await
     }
 
+    /// Drive dispatch against caller-owned APFS images rather than machine-global storage.
+    pub async fn open_for_adopt_at(
+        project_root: &Path,
+        requested_repo_id: Option<RepoId>,
+        storage: ValidatedHostStorage,
+    ) -> Result<Self> {
+        let runtime =
+            ProjectRuntime::open_for_adopt_at(project_root, requested_repo_id, storage).await?;
+        Self::from_runtime(project_root, runtime).await
+    }
+
+    pub async fn open_existing_at(
+        project_root: &Path,
+        scope: RecoveryScope,
+        storage: ValidatedHostStorage,
+    ) -> Result<Self> {
+        let runtime = ProjectRuntime::open_existing_at(project_root, scope, storage).await?;
+        Self::from_runtime(project_root, runtime).await
+    }
+
     pub async fn open_existing(project_root: &Path, scope: RecoveryScope) -> Result<Self> {
         let runtime = ProjectRuntime::open_existing(project_root, scope).await?;
         Self::from_runtime(project_root, runtime).await
@@ -387,7 +407,7 @@ impl ActorBridge {
     fn store_root(&self) -> Result<&Path> {
         self.runtime
             .as_ref()
-            .map(|runtime| runtime.descriptor().store_root.as_path())
+            .map(|runtime| runtime.descriptor().storage.store())
             .ok_or_else(|| {
                 CowshedError::internal("the CLI project runtime has already been shut down")
             })
@@ -727,10 +747,20 @@ impl CliService for ActorBridge {
     }
 
     async fn reconcile_gateway(&mut self) -> Result<()> {
-        let repo_id = self.coordinator()?.project().repo_id().clone();
-        gateway_service::reconcile_native_project(&repo_id)
-            .await
-            .map(|_| ())
+        let descriptor = self
+            .runtime
+            .as_ref()
+            .ok_or_else(|| {
+                CowshedError::internal("the CLI project runtime has already been shut down")
+            })?
+            .descriptor();
+        gateway_service::reconcile_native_project(
+            &descriptor.repo_id,
+            &descriptor.storage,
+            self.coordinator()?,
+        )
+        .await
+        .map(|_| ())
     }
     async fn shutdown(self) -> Result<()> {
         ActorBridge::shutdown(self).await
@@ -2184,8 +2214,35 @@ struct StoreWideMounts<T> {
 /// Project-scoped attach reaches this through `ActorBridge::reconcile_gateway`; the store-wide
 /// arms never enter that path, which is why they call it here. Without it a host-wide attach
 /// mounts volumes the daemon does not know exist until the next project-scoped exec.
-async fn reconcile_after_mount_change(repo_id: &RepoId) -> Option<CowshedError> {
-    gateway_service::reconcile_native_project(repo_id)
+struct StoreWidePortSlotAssigner<'a>(&'a Path);
+
+#[async_trait]
+impl gateway_service::PortSlotAssigner for StoreWidePortSlotAssigner<'_> {
+    async fn assign_port_slot(&self, workspace: &str, slot: u32) -> Result<()> {
+        let scope = RecoveryScope::Workspaces(
+            [WorkspaceName::new(workspace)
+                .map_err(|error| CowshedError::usage(error.to_string(), "name a workspace"))?]
+            .into(),
+        );
+        let bridge = ActorBridge::open_existing(self.0, scope).await?;
+        let assigned = match bridge.coordinator() {
+            Ok(coordinator) => coordinator.assign_slot(workspace, slot).await,
+            Err(error) => Err(error),
+        };
+        let shutdown = bridge.shutdown().await;
+        match assigned {
+            Ok(()) => shutdown,
+            Err(primary) => Err(merge_primary(primary, shutdown.err())),
+        }
+    }
+}
+
+async fn reconcile_after_mount_change(
+    project: &AdoptedProject,
+    storage: &ValidatedHostStorage,
+) -> Option<CowshedError> {
+    let assigner = StoreWidePortSlotAssigner(&project.project_root);
+    gateway_service::reconcile_native_project(&project.repo_id, storage, &assigner)
         .await
         .err()
 }
@@ -2215,7 +2272,7 @@ async fn attach_store_wide(browse: bool) -> Result<StoreWideMounts<Vec<Workspace
             continue;
         }
         attached.extend(mounted);
-        if let Some(error) = reconcile_after_mount_change(&project.repo_id).await {
+        if let Some(error) = reconcile_after_mount_change(project, &storage).await {
             stale.push((project.repo_id.clone(), error));
         }
     }
@@ -2409,7 +2466,7 @@ async fn detach_store_wide() -> Result<StoreWideMounts<()>> {
             continue;
         }
         detached += unmounted;
-        if let Some(error) = reconcile_after_mount_change(&project.repo_id).await {
+        if let Some(error) = reconcile_after_mount_change(project, &storage).await {
             stale.push((project.repo_id.clone(), error));
         }
     }
