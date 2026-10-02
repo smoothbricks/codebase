@@ -28,6 +28,7 @@ const FSCK_APFS: &str = "/sbin/fsck_apfs";
 /// measured queueing for 68 s at the median and past the 120 s child deadline at the tail.
 /// Disk Arbitration still observes the mounted volume, so eject and inventory keep working.
 const MOUNT_APFS: &str = "/sbin/mount_apfs";
+const UMOUNT: &str = "/sbin/umount";
 const NEWFS_APFS: &str = "/System/Library/Filesystems/apfs.fs/Contents/Resources/newfs_apfs";
 
 /// Unix `st_blocks` units: 512 bytes on Darwin. GC allocated-byte accounting reads them.
@@ -923,6 +924,47 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
                 attachment.whole_device,
                 attachment.volume_device
             )))
+        }
+    }
+
+    /// Remove an owned volume from the filesystem namespace before releasing its image.
+    /// The raw IOMedia pin freezes the device identity while native unmount bypasses DA.
+    pub(crate) fn unmount_verified(
+        &self,
+        attachment: &AttachedImage,
+        intent: DetachIntent,
+    ) -> Result<(), ApfsError> {
+        let _lease = self.host_device_lease(&attachment.image)?;
+        let _pin = self.pin_attached_volume(attachment)?;
+        let mut waited = Duration::ZERO;
+        let mut force = false;
+        loop {
+            let mut args = Vec::with_capacity(1 + usize::from(force));
+            if force {
+                args.push(OsString::from("-f"));
+            }
+            args.push(OsString::from(&attachment.volume_device));
+            let result = timed_apfs_step(apfs_step_leg(&attachment.image), "unmount", || {
+                self.run_checked(
+                    "unmount verified APFS volume",
+                    CommandRequest::new(UMOUNT, args),
+                )
+            });
+            match result {
+                Ok(_) => return Ok(()),
+                Err(error) if !force && detach_was_dissented(&error) => {
+                    if intent == DetachIntent::WhenIdle {
+                        return Err(error);
+                    }
+                    if waited >= self.grace.total {
+                        force = true;
+                    } else {
+                        self.sleeper.sleep(self.grace.poll);
+                        waited = waited.saturating_add(self.grace.poll);
+                    }
+                }
+                Err(error) => return Err(error),
+            }
         }
     }
 
@@ -1832,10 +1874,11 @@ fn detach_was_dissented(error: &ApfsError) -> bool {
     else {
         return false;
     };
-    request.program == Path::new(HDIUTIL)
-        && request.args.first().is_some_and(|arg| arg == "detach")
-        && output.status == ProcessStatus::Exit(libc::EBUSY)
-        && contains_bytes(&output.stderr, b"Resource busy")
+    contains_bytes(&output.stderr, b"Resource busy")
+        && ((request.program == Path::new(HDIUTIL)
+            && request.args.first().is_some_and(|arg| arg == "detach")
+            && output.status == ProcessStatus::Exit(libc::EBUSY))
+            || (request.program == Path::new(UMOUNT) && output.status == ProcessStatus::Exit(1)))
 }
 
 fn attachment_inventory_path(image: &Path) -> Result<PathBuf, ApfsError> {

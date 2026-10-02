@@ -1379,6 +1379,22 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
         &self.backend
     }
 
+    fn unmount_attached(
+        &self,
+        attachment: &AttachedImage,
+        intent: DetachIntent,
+    ) -> Result<(), ApfsStorageError> {
+        if self
+            .mount_source
+            .mounts()?
+            .iter()
+            .any(|mount| mount.source_device == attachment.volume_device())
+        {
+            self.backend.unmount_verified(attachment, intent)?;
+        }
+        Ok(())
+    }
+
     fn find_canonical_image(
         &self,
         repo: &RepoId,
@@ -3828,6 +3844,7 @@ where
         attachment: Self::Attachment,
         intent: DetachIntent,
     ) -> Result<(), ApfsStorageError> {
+        self.unmount_attached(&attachment, intent)?;
         self.backend.detach(&attachment, intent).map_err(Into::into)
     }
 
@@ -3871,7 +3888,7 @@ where
     ) -> Result<(), ApfsStorageError> {
         let key = (workspace.repo().clone(), workspace.name().clone());
         let Some(entry) = self.mounted.remove(key.clone())? else {
-            let Some((_, metadata)) =
+            let Some((image, metadata)) =
                 self.find_canonical_image(workspace.repo(), workspace.name())?
             else {
                 return Ok(());
@@ -3900,16 +3917,32 @@ where
                     metadata.workspace_incarnation
                 )));
             }
-            return self
-                .backend
-                .detach_target(DetachTarget::MountPoint(&mount_point), intent)
-                .map_err(Into::into);
+            let attachment = self.backend.existing_attachment(&image)?.ok_or_else(|| {
+                ApfsStorageError::Host(format!(
+                    "mounted workspace image has no attachment identity: {}",
+                    image.display()
+                ))
+            })?;
+            if attachment.volume_device() != mount.source_device {
+                return Err(ApfsStorageError::Host(format!(
+                    "mounted workspace image device disagrees with kernel source {}",
+                    mount.source_device
+                )));
+            }
+            self.unmount_attached(&attachment, intent)?;
+            return self.backend.detach(&attachment, intent).map_err(Into::into);
         };
-        let result = self.backend.detach(&entry.attachment, intent);
+        let result = self
+            .unmount_attached(&entry.attachment, intent)
+            .and_then(|()| {
+                self.backend
+                    .detach(&entry.attachment, intent)
+                    .map_err(Into::into)
+            });
         match result {
             Ok(()) => Ok(()),
             Err(error) => {
-                let primary = ApfsStorageError::from(error);
+                let primary = error;
                 match self.mounted.restore(key, entry)? {
                     Ok(()) => Err(primary),
                     Err(orphaned) => match self

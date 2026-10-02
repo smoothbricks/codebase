@@ -262,6 +262,16 @@ existing grace and then uses `hdiutil detach -force`; every other error remains 
 fallback. `hdiutil info -plist` remains the one host view that maps an image's path to its devices
 (`diskutil image info` reports none).
 
+Mounted-image release first uses `/sbin/umount <verified-volume-device>`, the kernel's unmount interface. Merely
+changing general eject to `hdiutil detach` did not remove the hosted mounted-volume delay: that command still spent
+10.694 s in the next release run. The native host reads kernel mount facts, then holds the host lease and a fresh raw
+IOMedia pin while cross-checking exact image/whole-device/volume identity before unmount. It never unmounts a path
+selected by an untrusted child. Restart-owned mounts additionally require their incarnation marker and matching kernel
+source. `WhenIdle` returns native unmount's observed resource-busy refusal without force; `Release` waits the existing
+grace before `umount -f`. Other errors remain errors. Only after filesystem removal does the image driver's detach
+release the device. Local real mounted-image probes measured 29–42 ms for native unmount; hosted deadline closure is not
+implied.
+
 Disk device names are reusable, not image identities. A private per-user `/private/tmp/cowshed-apfs-device-<uid>.lock`
 (`flock`, regular owner-only 0600 file, opened without following symlinks) coordinates physical create, attach, format,
 mount and detach across independent cowshed processes. It does **not** constrain another user's disk tools. Before

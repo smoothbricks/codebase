@@ -2233,6 +2233,32 @@ fn real_apfs_dissented_when_idle_detach_leaves_the_mount_to_the_actor() {
 }
 
 #[test]
+fn real_apfs_release_detaches_a_volume_held_open_after_its_grace() {
+    let fixture = RealFixture::new("native-release-held-file");
+    let image = fixture.layout().main_image().expect("image");
+    fixture.published_image(image.image());
+    let host = fixture.host();
+    let workspace = workspace();
+    let mount = fixture.main_mount();
+    std::fs::create_dir_all(&mount).expect("mount point");
+    let attachment = host.attach_verified(image.image()).expect("attachment");
+    host.mount(&attachment, &mount, MountAccess::ReadWrite, false)
+        .expect("mount");
+    host.retain_mounted(&workspace, attachment).expect("retain");
+    let mut holder = std::fs::File::create(mount.join("held")).expect("hold the volume");
+
+    host.detach_mounted(&workspace, DetachIntent::Release)
+        .expect("release waits its grace, then forces the owned volume");
+    assert!(kernel_mount_at(&mount).is_none());
+    assert!(!attached(image.image()));
+    use std::io::Write as _;
+    assert!(
+        holder.write_all(b"after forced unmount").is_err(),
+        "a held file cannot write into a released filesystem"
+    );
+}
+
+#[test]
 fn native_volume_rename_crosses_the_backend_boundary() {
     let fixture = Fixture::new("rename-volume");
     let runner = RecordingRunner::default();
