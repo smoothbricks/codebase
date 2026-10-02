@@ -454,14 +454,17 @@ impl ThreadSpanBuffer {
     /// cost a lookup per distinct string per window — and are reclaimed once
     /// the arena is large ([`Self::reclaim_text`]). Blocks survive so the next
     /// window writes without allocating and so a foreign writer's views of
-    /// their attribute cells stay valid.
+    /// their attribute cells stay valid. Span ids keep counting across it: a
+    /// foreign writer keeps the id a receipt named and asks [`Self::start_row`]
+    /// where that span is now, so a reset never reissues an id, and the one a
+    /// writer kept names no span after it (until 2^32 later opens wrap the
+    /// counter).
     pub fn reset(&mut self) {
         for block in &mut self.blocks[..self.active_blocks] {
             block.truncate(0);
         }
         self.active_blocks = 1;
         self.row_count = 0;
-        self.next_span_id = 1;
         self.spans.clear();
         self.scopes.clear();
         self.traces.clear();
@@ -1461,6 +1464,23 @@ mod tests {
         assert_eq!(buffer.attribute_cells(1).unwrap().as_ptr(), second);
         assert_eq!(buffer.attribute_at(9, 12), None);
         assert_eq!(buffer.dynamic_message_at(9), None);
+    }
+    #[test]
+    fn a_span_id_from_before_a_reset_names_no_span_after_it() {
+        // A foreign writer keeps the span id a receipt named and asks the store
+        // where that span's rows are now; after a reset released it, the answer
+        // must be "nowhere", never the rows of a span opened since.
+        let mut buffer = ThreadSpanBuffer::new(7, 8, FIELDS);
+        let held = buffer
+            .open_span(trace(), 0, 0, "held".into(), 1, 1)
+            .unwrap();
+        buffer.reset();
+        let later = buffer
+            .open_span(trace(), 0, 0, "later".into(), 2, 2)
+            .unwrap();
+        assert_ne!(held, later, "a reset reissued span id {held}");
+        assert_eq!(buffer.start_row(held), None);
+        assert_eq!(buffer.start_row(later), Some(0));
     }
     #[test]
     fn a_foreign_store_into_the_cells_reads_back_through_the_schema() {
