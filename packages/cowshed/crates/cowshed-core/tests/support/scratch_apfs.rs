@@ -8,6 +8,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Once;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use super::{ApfsSubstrateConfig, DetachIntent, MacOsApfsExecutionHost, SystemCommandRunner};
+
 /// Every scratch root lives directly under this prefix and spells out the pid of the run that
 /// owns it. The pid is the whole cleanup protocol: a later run can tell a live root from an
 /// abandoned one without any lock file or shared state of its own.
@@ -45,8 +47,13 @@ impl Drop for ScratchRoot {
         // A failed test unwinds with its volumes still attached; removing the tree without
         // detaching first strands kernel attachments pointing into a half-deleted root, and
         // leaves their volumes showing up in Finder and `mount` until the machine reboots.
-        let root = self.path.to_string_lossy().into_owned();
-        detach_images(|image| image.starts_with(&root));
+        if let Err(error) = detach_images(|image| image.starts_with(&self.path)) {
+            eprintln!(
+                "scratch root {} remains intact because its images could not be released: {error}",
+                self.path.display()
+            );
+            return;
+        }
         if let Err(error) = fs::remove_dir_all(&self.path) {
             eprintln!(
                 "scratch root {} was not removed ({error}); the next run's sweep reclaims it",
@@ -66,7 +73,12 @@ impl Drop for ScratchRoot {
 /// deleted backing file. Detaching therefore selects on the image path `hdiutil` still reports,
 /// not on what is on disk now.
 fn sweep_dead_runs() {
-    detach_images(|image| owner_pid(image).is_some_and(process_is_gone));
+    if let Err(error) =
+        detach_images(|image| owner_pid(&image.to_string_lossy()).is_some_and(process_is_gone))
+    {
+        eprintln!("abandoned scratch roots remain intact after image-release failure: {error}");
+        return;
+    }
     let Ok(entries) = fs::read_dir("/private/tmp") else {
         return;
     };
@@ -101,43 +113,46 @@ fn process_is_gone(pid: i32) -> bool {
     probe != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
 }
 
-/// Detach every attached disk image whose backing path `select` accepts, using each image's first
-/// (whole-device) `/dev/diskN` line — detaching the whole device takes its synthesized APFS
-/// container and every mounted volume down with it. Text parsing is deliberate: this is
-/// best-effort hygiene, and a parse miss only means the residue waits for the next sweep.
-fn detach_images(select: impl Fn(&str) -> bool) {
-    let output = match std::process::Command::new("hdiutil").arg("info").output() {
-        Ok(output) => output,
-        Err(error) => {
-            eprintln!("hdiutil info could not run, so no scratch image was detached: {error}");
-            return;
-        }
-    };
+/// Select images by backing path, then let the production host reread and release their exact
+/// attachment identities under its lease/pin/native-unmount protocol. Never act on cached diskN.
+fn detach_images(select: impl Fn(&Path) -> bool) -> std::io::Result<()> {
+    let output = std::process::Command::new("/usr/bin/hdiutil")
+        .arg("info")
+        .output()?;
+    if !output.status.success() {
+        return Err(std::io::Error::other(format!(
+            "scratch image inventory exited {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
+    let root = Path::new("/private/tmp");
+    let host = MacOsApfsExecutionHost::new(
+        SystemCommandRunner,
+        ApfsSubstrateConfig::new(root, root, root),
+    )
+    .map_err(std::io::Error::other)?;
     let info = String::from_utf8_lossy(&output.stdout);
-    let mut in_matching_image = false;
+    let mut first_error = None;
     for line in info.lines() {
-        if let Some(image_path) = line.strip_prefix("image-path") {
-            in_matching_image = select(image_path.trim_start_matches([' ', ':']));
+        let Some(image_path) = line.strip_prefix("image-path") else {
             continue;
-        }
-        if !in_matching_image {
-            continue;
-        }
-        if let Some(device) = line.split_whitespace().next().filter(|token| {
-            token.starts_with("/dev/disk") && !token.trim_start_matches("/dev/disk").contains('s')
-        }) {
-            match std::process::Command::new("hdiutil")
-                .args(["detach", device, "-force"])
-                .output()
-            {
-                Ok(detached) if detached.status.success() => {}
-                Ok(detached) => eprintln!(
-                    "hdiutil detach {device} failed: {}",
-                    String::from_utf8_lossy(&detached.stderr).trim()
-                ),
-                Err(error) => eprintln!("hdiutil detach {device} could not run: {error}"),
+        };
+        let image = Path::new(image_path.trim_start_matches([' ', ':']));
+        if select(image)
+            && let Err(error) = host.detach_existing_image(image, DetachIntent::Release)
+        {
+            eprintln!(
+                "scratch image {} could not be released: {error}",
+                image.display()
+            );
+            if first_error.is_none() {
+                first_error = Some(std::io::Error::other(error));
             }
-            in_matching_image = false;
         }
+    }
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(()),
     }
 }

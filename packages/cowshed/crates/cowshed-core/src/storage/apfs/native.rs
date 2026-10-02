@@ -19,7 +19,7 @@ use std::os::unix::io::{AsRawFd, FromRawFd};
 
 use crate::apfs::{
     ApfsBackend, ApfsError, AttachedImage, CommandRunner, CreateImageRequest, DetachIntent,
-    DetachTarget, MacOsApfsBackend, MountAccess,
+    MacOsApfsBackend, MountAccess,
 };
 use crate::copy::copy_until_quiescent_blocking;
 use crate::metadata::{
@@ -1395,6 +1395,28 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
         Ok(())
     }
 
+    fn detach_attachment(
+        &self,
+        attachment: &AttachedImage,
+        intent: DetachIntent,
+    ) -> Result<(), ApfsStorageError> {
+        self.unmount_attached(attachment, intent)?;
+        self.backend.detach(attachment, intent).map_err(Into::into)
+    }
+
+    /// Release a controller-owned image from its current attachment identity, not a cached diskN.
+    pub fn detach_existing_image(
+        &self,
+        image: &Path,
+        intent: DetachIntent,
+    ) -> Result<(), ApfsStorageError> {
+        self.verify_controller_path(image)?;
+        match self.backend.existing_attachment(image)? {
+            Some(attachment) => self.detach_attachment(&attachment, intent),
+            None => Ok(()),
+        }
+    }
+
     fn find_canonical_image(
         &self,
         repo: &RepoId,
@@ -1842,10 +1864,7 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
             self.backend
                 .mount(&attachment, mount_point, MountAccess::ReadOnly, false)
         {
-            let cleanup = self
-                .backend
-                .detach(&attachment, DetachIntent::Release)
-                .map_err(Into::into);
+            let cleanup = self.detach_attachment(&attachment, DetachIntent::Release);
             return super::combine_cleanup("recovery marker mount", primary.into(), cleanup);
         }
         let incarnation = WorkspaceMarker::read_from(&mount_point.join(WORKSPACE_MARKER_PATH))
@@ -1853,10 +1872,7 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
             .map_err(|error| ApfsStorageError::Host(error.to_string()));
         // The unforced detach already spends its grace and then forces (apfs::DetachGrace), so
         // there is nothing left for a second attempt here to try.
-        let detach = self
-            .backend
-            .detach(&attachment, DetachIntent::Release)
-            .map_err(Into::into);
+        let detach = self.detach_attachment(&attachment, DetachIntent::Release);
         let cleanup = match (incarnation, detach) {
             (Ok(incarnation), Ok(())) => Ok(incarnation),
             (Err(primary), cleanup) => {
@@ -2377,7 +2393,11 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
     /// Returns whether the directory was actually removed: an already-absent mountpoint is
     /// success without removal, and the caller logs a tombstone only for a real removal so
     /// the deletion log never claims an unlink that did not happen.
-    fn retire_staging_mount(&self, mount_point: &Path) -> Result<bool, ApfsStorageError>
+    fn retire_staging_mount(
+        &self,
+        mount_point: &Path,
+        image: &Path,
+    ) -> Result<bool, ApfsStorageError>
     where
         R: CommandRunner,
     {
@@ -2385,10 +2405,22 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
             .mount_source
             .mounts()?
             .into_iter()
-            .any(|mount| mount.mount_point == mount_point);
-        if mounted {
-            self.backend
-                .detach_target(DetachTarget::MountPoint(mount_point), DetachIntent::Release)?;
+            .find(|mount| mount.mount_point == mount_point);
+        if let Some(mount) = mounted {
+            let attachment = self.backend.existing_attachment(image)?.ok_or_else(|| {
+                ApfsStorageError::Host(format!(
+                    "staging mount {} has no owned image attachment",
+                    mount_point.display()
+                ))
+            })?;
+            if attachment.volume_device() != mount.source_device {
+                return Err(ApfsStorageError::Host(format!(
+                    "staging image {} does not own mounted device {}",
+                    image.display(),
+                    mount.source_device
+                )));
+            }
+            self.detach_attachment(&attachment, DetachIntent::Release)?;
         }
         match fs::remove_dir(mount_point) {
             Ok(()) => sync_parent_path(mount_point).map(|()| true),
@@ -2922,7 +2954,7 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
                             candidate.path().file_stem().and_then(|stem| stem.to_str())
                         {
                             let mount_point = self.staging_mount_point(plan.repo(), stem)?;
-                            if self.retire_staging_mount(&mount_point)? {
+                            if self.retire_staging_mount(&mount_point, candidate.path())? {
                                 let workspace = staged_stem_workspace(stem)
                                     .map(|name| name.as_str().to_owned())
                                     .unwrap_or_default();
@@ -2950,7 +2982,12 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
                             .and_then(staged_stem_workspace)
                             .is_some();
                         if parses {
-                            if self.retire_staging_mount(candidate.path())? {
+                            let stem = candidate.path().file_name().ok_or(
+                                ApfsStorageError::InvalidPlan("staging mount has no stem"),
+                            )?;
+                            let mut image = project.join(super::STAGING_NAMESPACE).join(stem);
+                            image.set_extension(IMAGE_EXTENSION);
+                            if self.retire_staging_mount(candidate.path(), &image)? {
                                 let workspace = candidate
                                     .path()
                                     .file_name()
@@ -3234,12 +3271,10 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
             // Teardown detaches every attachment before reporting, so the first failure is kept
             // and the rest of the reverse order still runs. The unforced detach already escalates
             // to force after its grace (apfs::DetachGrace).
-            if let Err(error) = self
-                .backend
-                .detach(&entry.attachment, DetachIntent::Release)
+            if let Err(error) = self.detach_attachment(&entry.attachment, DetachIntent::Release)
                 && first_error.is_none()
             {
-                first_error = Some(error.into());
+                first_error = Some(error);
             }
         }
         match first_error {
@@ -3259,12 +3294,12 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
         primary: ApfsStorageError,
         operation: &'static str,
     ) -> ApfsStorageError {
-        match self.backend.detach(&attachment, DetachIntent::Release) {
+        match self.detach_attachment(&attachment, DetachIntent::Release) {
             Ok(()) => primary,
             Err(cleanup) => ApfsStorageError::Cleanup {
                 operation,
                 primary: Box::new(primary),
-                cleanup: Box::new(cleanup.into()),
+                cleanup: Box::new(cleanup),
             },
         }
     }
@@ -3289,10 +3324,7 @@ where
         operation: &'static str,
     ) -> Result<(), ApfsStorageError> {
         if !was_mounted {
-            return self
-                .backend
-                .detach(&attachment, DetachIntent::Release)
-                .map_err(Into::into);
+            return self.detach_attachment(&attachment, DetachIntent::Release);
         }
         if let Err(primary) = self
             .backend
@@ -3651,9 +3683,7 @@ where
             // A kill between attach and mount may also precede fsck. Reusing that unmounted device
             // would silently skip verification, so settle it out and take the ordinary verified
             // attach path again. This churn exists only during crash recovery, never the hot path.
-            self.backend
-                .detach(&attachment, DetachIntent::Release)
-                .map_err(ApfsStorageError::from)?;
+            self.detach_attachment(&attachment, DetachIntent::Release)?;
         }
         let attachment = self
             .backend
@@ -3844,8 +3874,7 @@ where
         attachment: Self::Attachment,
         intent: DetachIntent,
     ) -> Result<(), ApfsStorageError> {
-        self.unmount_attached(&attachment, intent)?;
-        self.backend.detach(&attachment, intent).map_err(Into::into)
+        self.detach_attachment(&attachment, intent)
     }
 
     fn retain_mounted(
@@ -3866,15 +3895,12 @@ where
                     workspace.repo(),
                     workspace.name()
                 ));
-                match self
-                    .backend
-                    .detach(&entry.attachment, DetachIntent::Release)
-                {
+                match self.detach_attachment(&entry.attachment, DetachIntent::Release) {
                     Ok(()) => Err(primary),
                     Err(cleanup) => Err(ApfsStorageError::Cleanup {
                         operation: "reject duplicate mounted attachment",
                         primary: Box::new(primary),
-                        cleanup: Box::new(cleanup.into()),
+                        cleanup: Box::new(cleanup),
                     }),
                 }
             }
@@ -3929,33 +3955,25 @@ where
                     mount.source_device
                 )));
             }
-            self.unmount_attached(&attachment, intent)?;
-            return self.backend.detach(&attachment, intent).map_err(Into::into);
+            return self.detach_attachment(&attachment, intent);
         };
-        let result = self
-            .unmount_attached(&entry.attachment, intent)
-            .and_then(|()| {
-                self.backend
-                    .detach(&entry.attachment, intent)
-                    .map_err(Into::into)
-            });
+        let result = self.detach_attachment(&entry.attachment, intent);
         match result {
             Ok(()) => Ok(()),
             Err(error) => {
                 let primary = error;
                 match self.mounted.restore(key, entry)? {
                     Ok(()) => Err(primary),
-                    Err(orphaned) => match self
-                        .backend
-                        .detach(&orphaned.attachment, DetachIntent::Release)
-                    {
-                        Ok(()) => Err(primary),
-                        Err(cleanup) => Err(ApfsStorageError::Cleanup {
-                            operation: "restore failed mounted attachment",
-                            primary: Box::new(primary),
-                            cleanup: Box::new(cleanup.into()),
-                        }),
-                    },
+                    Err(orphaned) => {
+                        match self.detach_attachment(&orphaned.attachment, DetachIntent::Release) {
+                            Ok(()) => Err(primary),
+                            Err(cleanup) => Err(ApfsStorageError::Cleanup {
+                                operation: "restore failed mounted attachment",
+                                primary: Box::new(primary),
+                                cleanup: Box::new(cleanup),
+                            }),
+                        }
+                    }
                 }
             }
         }

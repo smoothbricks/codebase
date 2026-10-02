@@ -151,12 +151,17 @@ Parametrized over the substrate the host provides, and never gated off on it: a 
 skip. On macOS these are the `real_apfs_*` tests, compiled only for macOS and serialized run-wide by the nextest
 `real-apfs` group: small `.asif` images (1 GiB caps) under `/private/tmp/cowshed-itest-<pid>-<n>-<label>`, driven by the
 production host — real `diskutil`/`hdiutil`/`mount_apfs`, the live kernel mount table. A mount state a test needs (wrong
-flags, an impostor volume, a busy holder) is produced on a real volume, never by a substitute mount source. Each root
-detaches its images and is removed when its test ends, and every run first reclaims the roots and attachments of runs
-whose pid is gone. On Linux: a scratch ZFS pool on a loopback/file vdev (`cowshed.itest.<pid>`) with datasets destroyed
-and the pool exported on teardown; the Linux leg also exercises `cowshed-helper` and the Landlock/netns exec path. A
-suite-level guard reaps leaked `cowshed.itest.*` volumes/pools. The same flow table runs on both; substrate-specific
-assertions (fsck step on APFS, origin-snapshot GC on ZFS) are tagged.
+flags, an impostor volume, a busy holder) is produced on a real volume, never by a substitute mount source. Every
+scratch root selects its backing image paths, then calls the same production owned-attachment cleanup used by normal
+removal, recovery-marker reads, reverse-order teardown, duplicate-attachment rejection, and staging GC. Each cleanup
+rereads image/whole-device/volume identity, pins the raw IOMedia for native unmount, and releases the image under the
+host lease; a previously cached disk number or mountpoint never authorizes a detach. A failed release keeps the scratch
+tree intact for the next run, rather than deleting a still-attached image's backing files. Successful cleanup removes
+the root, and every run first reclaims roots and attachments whose owner pid is gone. On Linux: a scratch ZFS pool on a
+loopback/file vdev (`cowshed.itest.<pid>`) with datasets destroyed and the pool exported on teardown; the Linux leg also
+exercises `cowshed-helper` and the Landlock/netns exec path. A suite-level guard reaps leaked `cowshed.itest.*`
+volumes/pools. The same flow table runs on both; substrate-specific assertions (fsck step on APFS, origin-snapshot GC on
+ZFS) are tagged.
 
 The native inventory teardown regression runs the production read-only host-storage planner against the real home device
 while detaching a disposable ASIF image. Attachment and teardown use the production APFS backend, including its

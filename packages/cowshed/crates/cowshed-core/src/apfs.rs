@@ -465,12 +465,6 @@ pub struct CreateImageRequest {
     pub owner_gid: u32,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum DetachTarget<'a> {
-    Device(&'a str),
-    MountPoint(&'a Path),
-}
-
 /// What a detach may do about a volume something else still holds.
 ///
 /// The distinction is not politeness, it is ownership. A volume cowshed has finished with —
@@ -823,11 +817,6 @@ pub trait ApfsBackend {
         browse: bool,
     ) -> Result<(), ApfsError>;
     fn detach(&self, attachment: &AttachedImage, intent: DetachIntent) -> Result<(), ApfsError>;
-    fn detach_target(
-        &self,
-        target: DetachTarget<'_>,
-        intent: DetachIntent,
-    ) -> Result<(), ApfsError>;
     fn delete_image(&self, image: &Path) -> Result<(), ApfsError>;
     /// The capacity a detached image currently holds, read from its own resize limits.
     fn image_capacity(&self, image: &Path) -> Result<ImageCapacity, ApfsError>;
@@ -1278,28 +1267,27 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
         })
     }
 
-    /// Detach `target` under `intent`.
+    /// Detach an owned whole device under `intent`.
     ///
     /// A `Release` waits out a dissent and then forces, because the volume is cowshed's own and
     /// is finished with; a `WhenIdle` hands the dissent straight back so its verb can refuse.
     /// Only a dissent is retried — an invalid device or a missing tool fails immediately either
     /// way.
-    fn detach_target_checked(
-        &self,
-        target: DetachTarget<'_>,
-        intent: DetachIntent,
-    ) -> Result<(), ApfsError> {
-        let target = validate_detach_target(target)?;
+    fn detach_device_checked(&self, target: &str, intent: DetachIntent) -> Result<(), ApfsError> {
+        if !is_kernel_device_path(target) {
+            return Err(ApfsError::InvalidDetachTarget(PathBuf::from(target)));
+        }
+        let target = OsStr::new(target);
         let mut waited = Duration::ZERO;
         loop {
-            match self.detach_once(&target, false) {
+            match self.detach_once(target, false) {
                 Ok(()) => return Ok(()),
                 Err(error) if detach_was_dissented(&error) => {
                     if intent == DetachIntent::WhenIdle {
                         return Err(error);
                     }
                     if waited >= self.grace.total {
-                        return self.detach_once(&target, true);
+                        return self.detach_once(target, true);
                     }
                     self.sleeper.sleep(self.grace.poll);
                     waited = waited.saturating_add(self.grace.poll);
@@ -1343,7 +1331,7 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
             );
             return Ok(());
         }
-        self.detach_target_checked(DetachTarget::Device(whole_device), intent)?;
+        self.detach_device_checked(whole_device, intent)?;
         self.settle_detached_device(whole_device);
         Ok(())
     }
@@ -1606,15 +1594,6 @@ impl<R: CommandRunner, S: Sleeper> ApfsBackend for MacOsApfsBackend<R, S> {
         self.detach_image_device_unlocked(&attachment.image, &attachment.whole_device, intent)
     }
 
-    fn detach_target(
-        &self,
-        target: DetachTarget<'_>,
-        intent: DetachIntent,
-    ) -> Result<(), ApfsError> {
-        let _lease = self.host_device_lease(Path::new("host APFS device"))?;
-        self.detach_target_checked(target, intent)
-    }
-
     fn delete_image(&self, image: &Path) -> Result<(), ApfsError> {
         validate_image_path(image)?;
         match fs::remove_file(image) {
@@ -1843,23 +1822,6 @@ fn parse_attachment_capacity(image: &Path, bytes: &[u8]) -> Result<ImageCapacity
     }
     parsed.capacity.ok_or_else(|| {
         ApfsError::InvalidAttachmentInventory("matching image has no unsigned blockcount".into())
-    })
-}
-
-fn validate_detach_target(target: DetachTarget<'_>) -> Result<OsString, ApfsError> {
-    let valid = match target {
-        DetachTarget::Device(device) => is_kernel_device_path(device),
-        DetachTarget::MountPoint(path) => is_canonical_mount_point(path),
-    };
-    if !valid {
-        return Err(ApfsError::InvalidDetachTarget(match target {
-            DetachTarget::Device(device) => PathBuf::from(device),
-            DetachTarget::MountPoint(path) => path.to_owned(),
-        }));
-    }
-    Ok(match target {
-        DetachTarget::Device(device) => OsString::from(device),
-        DetachTarget::MountPoint(path) => path.as_os_str().to_owned(),
     })
 }
 
@@ -3593,7 +3555,7 @@ mod tests {
         let backend = graced_backend([dissent(), dissent(), dissent(), CommandOutput::success([])]);
 
         backend
-            .detach_target(DetachTarget::Device("/dev/disk4"), DetachIntent::Release)
+            .detach_device_checked("/dev/disk4", DetachIntent::Release)
             .unwrap();
 
         let requests = backend.runner().requests();
@@ -3618,7 +3580,7 @@ mod tests {
         let backend = graced_backend([dissent()]);
 
         let error = backend
-            .detach_target(DetachTarget::Device("/dev/disk4"), DetachIntent::WhenIdle)
+            .detach_device_checked("/dev/disk4", DetachIntent::WhenIdle)
             .unwrap_err();
 
         assert!(matches!(
@@ -3647,7 +3609,7 @@ mod tests {
         ] {
             let backend = graced_backend([CommandOutput::failure(status, message)]);
             let error = backend
-                .detach_target(DetachTarget::Device("/dev/disk4"), DetachIntent::Release)
+                .detach_device_checked("/dev/disk4", DetachIntent::Release)
                 .unwrap_err();
             assert!(matches!(
                 error,
@@ -3657,44 +3619,6 @@ mod tests {
             assert_eq!(backend.runner().requests().len(), 1);
             assert!(backend.sleeper.waits().is_empty());
         }
-    }
-
-    #[test]
-    fn detach_target_rejects_unvalidated_devices_and_mountpoints_before_spawning() {
-        let invalid = [
-            DetachTarget::Device("disk1"),
-            DetachTarget::Device("/dev/rdisk1"),
-            DetachTarget::Device("/dev/disk"),
-            DetachTarget::Device("/dev/disk01"),
-            DetachTarget::Device("/dev/disk1s01"),
-            DetachTarget::Device("/dev/disk1s"),
-            DetachTarget::Device("/dev/disk1/child"),
-            DetachTarget::MountPoint(Path::new("relative/mount")),
-            DetachTarget::MountPoint(Path::new("/")),
-            DetachTarget::MountPoint(Path::new("/dev")),
-            DetachTarget::MountPoint(Path::new("/dev/disk1")),
-            DetachTarget::MountPoint(Path::new("/Volumes/../private/tmp")),
-            DetachTarget::MountPoint(Path::new("/Volumes/./main")),
-            DetachTarget::MountPoint(Path::new("/Volumes//main")),
-            DetachTarget::MountPoint(Path::new("/Volumes/main/")),
-            DetachTarget::MountPoint(Path::new("/Volumes/\0main")),
-        ];
-        let backend = MacOsApfsBackend::new(RecordingRunner::default());
-
-        for target in invalid {
-            let expected = match target {
-                DetachTarget::Device(device) => PathBuf::from(device),
-                DetachTarget::MountPoint(path) => path.to_owned(),
-            };
-            let error = backend
-                .detach_target(target, DetachIntent::Release)
-                .unwrap_err();
-            assert!(matches!(
-                error,
-                ApfsError::InvalidDetachTarget(path) if path == expected
-            ));
-        }
-        assert!(backend.runner().requests().is_empty());
     }
 
     #[test]

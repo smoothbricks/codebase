@@ -1,9 +1,12 @@
 use cowshed_cli::args::parse_args;
 use cowshed_cli::output::Output;
 use cowshed_cli::runtime::{ActorBridge, CliService, dispatch};
+use cowshed_core::apfs::{DetachIntent, SystemCommandRunner};
 use cowshed_core::metadata::WorkspaceName;
 use cowshed_core::repository::RepoId;
 use cowshed_core::runtime::RecoveryScope;
+use cowshed_core::storage::apfs::ApfsSubstrateConfig;
+use cowshed_core::storage::apfs::native::MacOsApfsExecutionHost;
 use cowshed_core::storage::bootstrap::{CanonicalRoots, ValidatedHostStorage};
 use cowshed_core::{ErrorCode, Result};
 use cowshed_gateway::{

@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use cowshed_core::apfs::{SystemCommandRunner, volume_name};
+use cowshed_core::apfs::{DetachIntent, SystemCommandRunner, volume_name};
 use cowshed_core::metadata::{
     GrantSet, ImageCapacity, MACOS_PORT_MIN, NEW_PORT_BLOCK_SIZE, PortBlock, WorkspaceName,
 };
