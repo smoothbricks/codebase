@@ -1035,16 +1035,18 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
         operation: &'static str,
         request: CommandRequest,
     ) -> Result<CommandOutput, ApfsError> {
-        let output = self.runner.run(&request)?;
-        if output.succeeded() {
-            Ok(output)
-        } else {
-            Err(ApfsError::CommandFailed {
-                operation,
-                request,
-                output,
-            })
-        }
+        crate::timing::timed("apfs-command", format_args!("{operation}"), || {
+            let output = self.runner.run(&request)?;
+            if output.succeeded() {
+                Ok(output)
+            } else {
+                Err(ApfsError::CommandFailed {
+                    operation,
+                    request,
+                    output,
+                })
+            }
+        })
     }
 
     /// Create a blank ASIF image, attach it without mounting, and format its whole device as one

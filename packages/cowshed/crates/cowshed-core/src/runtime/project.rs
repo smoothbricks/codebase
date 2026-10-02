@@ -6830,7 +6830,7 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
     async fn adopt(&mut self, options: AdoptOptions) -> Result<WorkspaceSnapshot> {
         use super::supervisor::CommitmentSink;
         use crate::storage::lifecycle::LifecyclePlanner;
-        self.validate_binding().await?;
+        timed_async("adopt", "binding", self.validate_binding()).await?;
         let intent = crate::storage::recovery::LifecycleIntent::Adopt {
             options: options.clone(),
         };
@@ -6840,16 +6840,23 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
             return self.snapshot(&current);
         }
 
-        if !self.authoritative().await?.is_empty() {
+        if !timed_async("adopt", "inventory", self.authoritative())
+            .await?
+            .is_empty()
+        {
             return Err(CowshedError::conflict(
                 "repository is already adopted",
                 "list the existing main workspace",
             ));
         }
-        refuse_identity_owned_by_a_live_project(
-            &self.substrate_config.store_root,
-            &self.descriptor.repo_id,
-            &self.descriptor.repo_id,
+        timed_async(
+            "adopt",
+            "identity-owner",
+            refuse_identity_owned_by_a_live_project(
+                &self.substrate_config.store_root,
+                &self.descriptor.repo_id,
+                &self.descriptor.repo_id,
+            ),
         )
         .await?;
         if options
@@ -6880,7 +6887,7 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
             None => self.substrate_config.capacity,
         };
         let pre_cowshed = pre_cowshed_path(&self.descriptor.git_root)?;
-        self.begin_lifecycle_intent(intent).await?;
+        timed_async("adopt", "intent", self.begin_lifecycle_intent(intent)).await?;
 
         let reservation = timed_async("adopt", "grants", self.fresh_grants()).await?;
         let mut grants = reservation.grants.clone();
@@ -6904,12 +6911,32 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
         let receipt = self
             .substrate
             .execute_adopt_staged(plan, move |stage| async move {
-                crate::inherited_git_locks::discard_in(&stage.mount_point).await?;
-                crate::inherited_daemons::macos::discard_in(&stage.mount_point).await?;
+                timed_async(
+                    "adopt",
+                    "locks",
+                    crate::inherited_git_locks::discard_in(&stage.mount_point),
+                )
+                .await?;
+                timed_async(
+                    "adopt",
+                    "daemons",
+                    crate::inherited_daemons::macos::discard_in(&stage.mount_point),
+                )
+                .await?;
                 let repository = crate::git::GitRepository::from_root(&stage.mount_point);
                 // The image's volume is case-sensitive; the tree it was copied from may not be.
-                repository.record_case_sensitive_filesystem().await?;
-                repository.ensure_workspace_environment_wiring().await?;
+                timed_async(
+                    "adopt",
+                    "case",
+                    repository.record_case_sensitive_filesystem(),
+                )
+                .await?;
+                timed_async(
+                    "adopt",
+                    "environment",
+                    repository.ensure_workspace_environment_wiring(),
+                )
+                .await?;
                 crate::storage::lifecycle::dispatch_blocking(move || {
                     crate::metadata::write_json(&binding_path, &binding)
                 })
