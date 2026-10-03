@@ -1,1 +1,4 @@
 modules/
+# Workspace-owned runtime state is not source: watching the daemon's own log
+# and plugin sockets feeds each write back into project graph construction.
+.cowshed/

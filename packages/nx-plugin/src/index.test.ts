@@ -15,7 +15,11 @@ import { CARGO_CROSS_LINT_COMMAND, CARGO_CROSS_LINT_TARGET, CARGO_LINT_CLIPPY_CO
 import { createNodesV2, createNodesV2ForPlatform } from './index.js';
 import { applyWorkspaceConfig, RELEASE_CONFIGURATION } from './workspace-config-policy.js';
 
-const [, inferTargets] = createNodesV2;
+const [, rawInferTargets] = createNodesV2;
+const inferTargets: typeof rawInferTargets = async (files, options, context) => {
+  await prepareCargoFixture(context.workspaceRoot);
+  return rawInferTargets(files, options, context);
+};
 
 describe('@smoothbricks/nx-plugin inferred targets', () => {
   it('runs Rust-only lint without ESLint and checks JavaScript when sources appear', async () => {
@@ -1063,7 +1067,6 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
           '',
         ].join('\n'),
       );
-      await workspace.write('Cargo.lock', 'version = 4\n');
       await workspace.write(
         'packages/runtime/crates/runtime-core/Cargo.toml',
         '[package]\nname = "runtime-core"\n\n[package.metadata.smoothbricks.test]\nshards = 2\n',
@@ -2043,7 +2046,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       // One added edge per target. Everything that makes each target do its job
       // — executor, options, inputs, cache — must survive the declaration
       // instead of being replaced wholesale by it.
-      'cargo-test': { dependsOn: ['cargo-test-compile', 'cargo-wasm'] },
+      'cargo-test': { dependsOn: ['cargo-test-ferris-core', 'cargo-wasm'] },
       'cargo-test-compile': { dependsOn: ['cargo-wasm'] },
       'cargo-lint': { inputs: ['{projectRoot}/clippy.toml'] },
       mutation: { options: { command: 'cargo mutants --in-diff' } },
@@ -2054,30 +2057,27 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         'packages/ferris/package.json',
         JSON.stringify({ name: 'ferris', nx: { targets: declared } }),
       );
-      await workspace.write('packages/ferris/Cargo.toml', '[workspace]\nmembers = []\n');
+      await workspace.write('packages/ferris/Cargo.toml', '[workspace]\nmembers = ["crates/ferris-core"]\n');
+      await workspace.write('packages/ferris/crates/ferris-core/Cargo.toml', '[package]\nname = "ferris-core"\n');
 
       const targets = await inferProjectTargets(workspace, 'packages/ferris/package.json');
 
-      // Inference must still emit the base. Without one Nx has nothing to merge
-      // the declaration onto and normalizes a bare `dependsOn` to `nx:noop` with
-      // empty options — a cargo-test that passes having run no test binary.
-      expect(targets['cargo-test']?.executor).toBe('@smoothbricks/nx-plugin:bounded-exec');
+      // The aggregate stays a no-op that reaches bounded crate runners. A
+      // partial declaration must keep that inferred base, not erase the chain.
+      expect(targets['cargo-test']?.executor).toBe('nx:noop');
+      expect(targets['cargo-test-ferris-core']?.executor).toBe('@smoothbricks/nx-plugin:bounded-exec');
       expect(targets['cargo-test-compile']?.executor).toBe('nx:run-commands');
       expect(targets['cargo-lint']?.options).toMatchObject({
         commands: ['cargo fmt --all --check', CARGO_LINT_CLIPPY_COMMAND],
       });
 
       const cargoTest = resolveDeclaredOverInferred(targets, declared, 'cargo-test');
-      expect(cargoTest?.executor).toBe('@smoothbricks/nx-plugin:bounded-exec');
+      expect(cargoTest?.executor).toBe('nx:noop');
       expect(cargoTest?.cache).toBe(true);
-      expect(cargoTest?.dependsOn).toEqual(['cargo-test-compile', 'cargo-wasm']);
-      expect(cargoTest?.options).toEqual({
-        command: 'cargo --frozen test --workspace',
-        cwd: 'packages/ferris',
-        timeoutMs: 120000,
-        killAfterMs: 10000,
-      });
-      expect(cargoTest?.inputs).toContain('{projectRoot}/**/*.rs');
+      expect(cargoTest?.dependsOn).toEqual(['cargo-test-ferris-core', 'cargo-wasm']);
+      expect(cargoTest?.options).toBeUndefined();
+      expect(targets['cargo-test-ferris-core']?.options?.command).toContain("-E 'package(ferris-core)'");
+      expect(targets['cargo-test-ferris-core']?.options?.timeoutMs).toBe(120000);
 
       const cargoTestCompile = resolveDeclaredOverInferred(targets, declared, 'cargo-test-compile');
       expect(cargoTestCompile?.executor).toBe('nx:run-commands');
@@ -2121,15 +2121,16 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         'packages/ferris/package.json',
         JSON.stringify({ name: 'ferris', nx: { targets: declared } }),
       );
-      await workspace.write('packages/ferris/Cargo.toml', '[workspace]\nmembers = []\n');
+      await workspace.write('packages/ferris/Cargo.toml', '[workspace]\nmembers = ["crates/ferris-core"]\n');
+      await workspace.write('packages/ferris/crates/ferris-core/Cargo.toml', '[package]\nname = "ferris-core"\n');
 
       const targets = await inferProjectTargets(workspace, 'packages/ferris/package.json');
 
       // The spread expands exactly once, against the single inferred base this
       // plugin emits — re-implementing the overlay here would double it.
       const cargoTest = resolveDeclaredOverInferred(targets, declared, 'cargo-test');
-      expect(cargoTest?.dependsOn).toEqual(['cargo-fetch', 'cargo-test-compile', 'cargo-wasm']);
-      expect(cargoTest?.executor).toBe('@smoothbricks/nx-plugin:bounded-exec');
+      expect(cargoTest?.dependsOn).toEqual(['cargo-test-ferris-core', 'cargo-wasm']);
+      expect(cargoTest?.executor).toBe('nx:noop');
     } finally {
       await workspace.cleanup();
     }
@@ -2429,6 +2430,45 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
   //#endregion
 });
 
+/**
+ * Target-inference fixtures declare real Cargo workspaces. Supply their empty
+ * Rust library and initial lock before inference, rather than relying on a
+ * rejected Cargo query. Explicit sources and locks, including planted failures,
+ * remain untouched.
+ */
+async function prepareCargoFixture(root: string): Promise<void> {
+  const manifests = (await readdir(root, { recursive: true }))
+    .filter((path) => path === 'Cargo.toml' || path.endsWith('/Cargo.toml'))
+    .filter((path) => !path.split('/').some((part) => ['node_modules', 'target', '.nx'].includes(part)));
+  const workspaces: string[] = [];
+  for (const manifest of manifests) {
+    const path = join(root, manifest);
+    const contents = await readFile(path, 'utf8');
+    if (/^\[package\]\s*$/m.test(contents)) {
+      const source = join(dirname(path), 'src/lib.rs');
+      if (!(await Bun.file(source).exists())) {
+        await mkdir(dirname(source), { recursive: true });
+        await writeFile(source, '// Empty Cargo fixture library.\n');
+      }
+    }
+    if (/^\[workspace\]\s*$/m.test(contents)) workspaces.push(path);
+  }
+  for (const manifest of workspaces) {
+    if (await Bun.file(join(dirname(manifest), 'Cargo.lock')).exists()) continue;
+    const child = Bun.spawn(['cargo', 'generate-lockfile', '--offline', '--manifest-path', manifest], {
+      cwd: root,
+      stdout: 'pipe',
+      stderr: 'pipe',
+    });
+    const [code, stdout, stderr] = await Promise.all([
+      child.exited,
+      new Response(child.stdout).text(),
+      new Response(child.stderr).text(),
+    ]);
+    if (code !== 0) throw new Error(`Cargo fixture ${manifest} could not lock:\n${stdout}${stderr}`);
+  }
+}
+
 async function createWorkspace(): Promise<WorkspaceFixture> {
   // Canonical, because macOS puts the temp directory behind a /private symlink
   // and a daemon never sees an edit made under a root named through one.
@@ -2558,6 +2598,7 @@ async function inferProject(
   createNodes: CreateNodesV2 = createNodesV2,
 ) {
   const [, infer] = createNodes;
+  await prepareCargoFixture(workspace.context.workspaceRoot);
   const result = await infer([packageJsonPath], undefined, workspace.context);
   return result[0]?.[1].projects?.[dirname(packageJsonPath)];
 }
@@ -2573,6 +2614,7 @@ async function inferProjectWithNxJson(
   nxJsonConfiguration: CreateNodesContextV2['nxJsonConfiguration'],
 ) {
   const [, infer] = createNodesV2;
+  await prepareCargoFixture(workspace.context.workspaceRoot);
   const result = await infer([packageJsonPath], undefined, {
     workspaceRoot: workspace.context.workspaceRoot,
     nxJsonConfiguration,

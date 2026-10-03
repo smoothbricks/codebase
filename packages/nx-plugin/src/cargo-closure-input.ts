@@ -9,7 +9,6 @@ import {
   CARGO_ANCESTOR_INPUTS,
   type CargoResolve,
   dependencyClosure,
-  governingManifest,
   HASH_SKIPPED_DIRECTORIES,
   readCargoResolve,
 } from './cargo-source-hash.js';
@@ -22,6 +21,22 @@ import {
 export const CARGO_CLOSURE_INPUT = 'cargoClosure';
 
 type Input = NonNullable<TargetConfiguration['inputs']>[number];
+
+/** A closure Nx cannot express exactly is a refusal, never a broader cache key. */
+export class CargoClosureInputError extends Error {
+  readonly projectRoot: string;
+
+  constructor(projectRoot: string, cause: unknown) {
+    super(
+      `Cannot infer ${CARGO_CLOSURE_INPUT} for ${projectRoot}: ${cause instanceof Error ? cause.message : String(cause)}`,
+      {
+        cause,
+      },
+    );
+    this.name = 'CargoClosureInputError';
+    this.projectRoot = projectRoot;
+  }
+}
 
 /**
  * How a runtime input reaches the hash command. Nx runs it with `sh -c` from
@@ -41,17 +56,14 @@ const GLOB_SYNTAX = /[*?[\]{}()!,]/;
  * One Cargo workspace as one project-graph computation sees it. `manifest` is
  * the workspace's root manifest relative to the Nx workspace root.
  */
-export type CargoClosureSource =
-  | {
-      readonly kind: 'resolved';
-      readonly manifest: string;
-      /** The canonical Nx workspace root. */
-      readonly root: string;
-      readonly cargo: CargoResolve;
-      /** Every `Cargo.toml` in Nx's file index, relative to the workspace root. */
-      readonly indexed: ReadonlySet<string>;
-    }
-  | { readonly kind: 'unresolved'; readonly manifest: string };
+export interface CargoClosureSource {
+  readonly manifest: string;
+  /** The canonical Nx workspace root. */
+  readonly root: string;
+  readonly cargo: CargoResolve;
+  /** Every `Cargo.toml` in Nx's file index, relative to the workspace root. */
+  readonly indexed: ReadonlySet<string>;
+}
 
 /**
  * Every `Cargo.toml` Nx's workspace file index holds: .gitignore and .nxignore
@@ -67,36 +79,18 @@ export async function indexedCargoManifests(workspaceRoot: string): Promise<Read
 }
 
 /**
- * Locked, offline `cargo metadata` for one Cargo workspace, once per graph
- * computation. Never rejects: a workspace Cargo cannot resolve right now (no
- * cargo on PATH, a stale lockfile, an unfetched dependency) still gets its
- * closure inputs, hashed at run time by the command that reports the same
- * failure wherever a task needs it. Said once here, not once per project.
+ * Content-keyed locked offline metadata. A refusal fails graph inference:
+ * a stale closure or runtime whole-workspace fallback cannot establish the
+ * precise set of cache inputs.
  */
 export async function resolveCargoClosureSource(
   manifest: string,
   workspaceRoot: string,
   indexed: Promise<ReadonlySet<string>>,
 ): Promise<CargoClosureSource> {
-  try {
-    // One Promise.all, entered before any await, so a failed index listing is
-    // handled here even when it settles before Cargo does.
-    const [{ root, cargo }, index] = await Promise.all([
-      realpath(workspaceRoot).then(async (root) => ({
-        root,
-        cargo: await readCargoResolve(join(root, manifest), root),
-      })),
-      indexed,
-    ]);
-    return { kind: 'resolved', manifest, root, cargo, indexed: index };
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    process.stderr.write(
-      `@smoothbricks/nx-plugin: resolving ${manifest} failed (${message.trim().split('\n').slice(0, 3).join(' ')}); ` +
-        `every ${CARGO_CLOSURE_INPUT} under it runs smoo-nx-cargo-hash on each hash instead of reading Nx's file index.\n`,
-    );
-    return { kind: 'unresolved', manifest };
-  }
+  const [root, index] = await Promise.all([realpath(workspaceRoot), indexed]);
+  const cargo = await readCargoResolve(join(root, manifest), root, index);
+  return { manifest, root, cargo, indexed: index };
 }
 
 /**
@@ -115,10 +109,9 @@ export async function resolveCargoClosureSource(
  * exist. That command resolves the closure again when it runs, so a member
  * that only an edit outside the workspace brings in is still covered.
  *
- * When the closure cannot be expressed that way — Cargo could not resolve it
- * here, or a member inside the workspace is missing from Nx's file index —
- * the definition is the complete runtime hash instead: correct, slower, and
- * reported on stderr.
+ * An in-workspace member missing from Nx's file index is a typed refusal,
+ * never a whole-workspace runtime hash. Only outside-workspace members need
+ * the external-only runtime input.
  */
 export async function cargoClosureInputs(
   projectRoot: string,
@@ -143,8 +136,6 @@ export async function cargoClosureInputs(
 async function workspaceClosureInputs(projectRoot: string, source: CargoClosureSource): Promise<Input[]> {
   const lock = posix.join('{workspaceRoot}', posix.dirname(source.manifest), 'Cargo.lock');
   const closureArguments = `--closure ${shellWord(projectRoot)} ${shellWord(source.manifest)}`;
-  const runtimeHash: Input[] = [lock, { runtime: `${CARGO_HASH_COMMAND} --include-workspace ${closureArguments}` }];
-  if (source.kind === 'unresolved') return runtimeHash;
 
   const { root, cargo, indexed } = source;
   const packageDirectories: string[] = [];
@@ -163,7 +154,7 @@ async function workspaceClosureInputs(projectRoot: string, source: CargoClosureS
         throw new Error(`the Cargo package ${directory} is not in Nx's file index (an ignored directory)`);
       }
       packageDirectories.push(directory);
-      for (const file of [...pkg.sources, await governingManifest(cargo, pkg, root)]) {
+      for (const file of [...pkg.sources, pkg.governingManifest]) {
         const path = indexablePath(root, file);
         if (path === null) throw new Error(`${directory} compiles ${file}, which Nx's file index cannot hold`);
         files.push(path);
@@ -172,11 +163,7 @@ async function workspaceClosureInputs(projectRoot: string, source: CargoClosureS
     const unglobbable = [...packageDirectories, ...files].find((path) => GLOB_SYNTAX.test(path));
     if (unglobbable !== undefined) throw new Error(`${unglobbable} contains glob syntax, so no fileset can name it`);
   } catch (error) {
-    process.stderr.write(
-      `@smoothbricks/nx-plugin: ${projectRoot}'s ${CARGO_CLOSURE_INPUT} runs smoo-nx-cargo-hash on each hash ` +
-        `instead of reading Nx's file index: ${error instanceof Error ? error.message : String(error)}\n`,
-    );
-    return runtimeHash;
+    throw new CargoClosureInputError(projectRoot, error);
   }
 
   // A package nested in another member's directory is already covered by it.

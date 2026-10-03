@@ -894,9 +894,6 @@ function createNodesHandler(hostPlatform: NapiPlatform | null): CreateNodesHandl
         }
       }),
     );
-    // A project that failed before reaching its closure never awaited Cargo;
-    // no process this call started may outlive it.
-    await Promise.all(cargoWorkspaces.map((workspace) => workspace.closureSource));
 
     if (errors.length > 0) {
       throw new AggregateCreateNodesError(errors, results);
@@ -1817,7 +1814,7 @@ async function createProjectTargets(
   if (closureSources.length > 0) {
     namedInputs[CARGO_CLOSURE_INPUT] = await cargoClosureInputs(
       projectRoot,
-      await Promise.all(closureSources.map((workspace) => workspace.closureSource)),
+      closureSources.map((workspace) => workspace.closureSource),
     );
   }
   return {
@@ -2298,12 +2295,8 @@ interface CargoWorkspace {
   projectRoot: string;
   /** One derivation memo for the whole graph computation (see cargoPackageTestInputs). */
   inputsCache: CargoInputsCache;
-  /**
-   * Cargo's own resolve, started once per graph computation and awaited only
-   * where a project's `cargoClosure` is built, so the `cargo metadata` process
-   * overlaps the rest of inference.
-   */
-  closureSource: Promise<CargoClosureSource>;
+  /** The content-keyed Cargo resolve, checked before publishing any project's closure. */
+  closureSource: CargoClosureSource;
 }
 
 type CargoTargetDependency = NonNullable<TargetConfiguration['dependsOn']>[number];
@@ -2383,14 +2376,16 @@ async function resolveCargoWorkspaces(
   // Started only once every workspace listed cleanly, so a listing that throws
   // leaves no Cargo process behind.
   const indexedManifests = indexedCargoManifests(workspaceRoot);
-  return found.map((workspace) => ({
-    ...workspace,
-    closureSource: resolveCargoClosureSource(
-      posix.join(workspace.projectRoot, 'Cargo.toml'),
-      workspaceRoot,
-      indexedManifests,
-    ),
-  }));
+  return Promise.all(
+    found.map(async (workspace) => ({
+      ...workspace,
+      closureSource: await resolveCargoClosureSource(
+        posix.join(workspace.projectRoot, 'Cargo.toml'),
+        workspaceRoot,
+        indexedManifests,
+      ),
+    })),
+  );
 }
 
 /**

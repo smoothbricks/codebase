@@ -1,8 +1,26 @@
-import { execFile, execFileSync, spawnSync } from 'node:child_process';
-import { createHash } from 'node:crypto';
-import { realpathSync, statSync } from 'node:fs';
-import { lstat, readdir, readFile, readlink, realpath } from 'node:fs/promises';
-import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
+import { type ChildProcess, execFileSync, spawn, spawnSync } from 'node:child_process';
+import { createHash, randomUUID } from 'node:crypto';
+import { constants, realpathSync, statSync } from 'node:fs';
+import {
+  access,
+  lstat,
+  mkdir,
+  readdir,
+  readFile,
+  readlink,
+  realpath,
+  rename,
+  rm,
+  stat,
+  writeFile,
+} from 'node:fs/promises';
+import { homedir } from 'node:os';
+import { delimiter, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
+import native from 'nx/src/native/index.js';
+import { workspaceDataDirectoryForWorkspace } from 'nx/src/utils/cache-directory.js';
+import { CARGO_TOOLCHAIN_PIN_INPUTS } from './cargo-toolchain-policy.js';
+
+const { FileLock, IS_WASM, WorkspaceContext } = native;
 
 /** The fields of `cargo metadata --format-version 1` this module reads. */
 interface CargoMetadata {
@@ -11,6 +29,8 @@ interface CargoMetadata {
     source: string | null;
     manifest_path: string;
     targets: { src_path: string }[];
+    /** Added by the cache after Cargo identifies each local package's governing workspace. */
+    governing_manifest_path?: string;
   }[];
   resolve: { nodes: { id: string; deps: { pkg: string }[] }[] } | null;
   workspace_members: string[];
@@ -43,6 +63,9 @@ function parseCargoMetadata(json: string): CargoMetadata {
       targets: list(member(pkg, 'targets'), 'package targets').map((target) => ({
         src_path: text(member(target, 'src_path'), 'target src_path'),
       })),
+      ...(member(pkg, 'governing_manifest_path') === undefined
+        ? {}
+        : { governing_manifest_path: text(member(pkg, 'governing_manifest_path'), 'governing manifest') }),
     })),
     resolve:
       resolveGraph === null
@@ -69,6 +92,7 @@ export interface LocalCargoPackage {
   readonly manifest: string;
   /** Every target's source file: library, binaries, tests, build script. A target may live outside `directory`. */
   readonly sources: readonly string[];
+  readonly governingManifest: string;
 }
 
 /** What locked, offline `cargo metadata` reports about one Cargo workspace's mutable packages. */
@@ -93,6 +117,59 @@ export interface CargoPathInputsOptions {
 }
 
 /**
+ * Nx workers handle termination by exiting, so their exit hook kills owned
+ * Cargo groups. Standalone callers need signal forwarding after detaching
+ * Cargo from the terminal; handlers are installed only where the caller has
+ * not already chosen a signal disposition, and removed after the last child.
+ * Uncatchable SIGKILL cannot execute either hook.
+ */
+const cargoChildren = new Set<ChildProcess>();
+
+function killCargoChild(child: ChildProcess): void {
+  if (process.platform === 'win32' || child.pid === undefined) child.kill('SIGKILL');
+  else {
+    try {
+      process.kill(-child.pid, 'SIGKILL');
+    } catch (error) {
+      if (!(error instanceof Error && 'code' in error && error.code === 'ESRCH')) throw error;
+    }
+  }
+}
+
+function killCargoChildren(): void {
+  for (const child of cargoChildren) killCargoChild(child);
+}
+
+type CargoSignal = 'SIGINT' | 'SIGTERM' | 'SIGHUP';
+const forwardedSignals = new Set<CargoSignal>();
+const cargoSignalHandlers: Record<CargoSignal, () => void> = {
+  SIGINT: () => forwardCargoSignal('SIGINT'),
+  SIGTERM: () => forwardCargoSignal('SIGTERM'),
+  SIGHUP: () => forwardCargoSignal('SIGHUP'),
+};
+
+function removeCargoSignalHandlers(): void {
+  for (const signal of forwardedSignals) process.removeListener(signal, cargoSignalHandlers[signal]);
+  forwardedSignals.clear();
+}
+
+function forwardCargoSignal(signal: CargoSignal): void {
+  killCargoChildren();
+  removeCargoSignalHandlers();
+  process.kill(process.pid, signal);
+}
+
+function ownCargoChildren(): void {
+  process.on('exit', killCargoChildren);
+  for (const signal of Object.keys(cargoSignalHandlers)) {
+    if (signal !== 'SIGINT' && signal !== 'SIGTERM' && signal !== 'SIGHUP') continue;
+    if (process.listenerCount(signal) !== 0) continue;
+    process.on(signal, cargoSignalHandlers[signal]);
+    forwardedSignals.add(signal);
+  }
+}
+
+/**
  * Cargo's stdout, or its failure with Cargo's stderr in the message. Not
  * `promisify` from `node:util`: importing that module makes Node probe color
  * support at startup, and with FORCE_COLOR and NO_COLOR both set (an Nx
@@ -101,11 +178,61 @@ export interface CargoPathInputsOptions {
  * every run.
  */
 function runCargo(args: readonly string[], cwd: string): Promise<string> {
-  // The executor form: the workspace compiles against es2022, which has no `Promise.withResolvers`.
+  // spawn forwards detached groups; execFile does not. The public ES2022
+  // library API requires the constructor form, not Promise.withResolvers.
   return new Promise((settle, reject) => {
-    execFile('cargo', args, { cwd, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 }, (error, stdout) =>
-      error === null ? settle(stdout) : reject(error),
-    );
+    const child = spawn('cargo', args, {
+      cwd,
+      detached: process.platform !== 'win32',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let stdout = '';
+    let stderr = '';
+    let stdoutBytes = 0;
+    let stderrBytes = 0;
+    let failure: Error | undefined;
+    const fail = (error: Error): void => {
+      failure ??= error;
+      killCargoChild(child);
+    };
+    child.stdout.setEncoding('utf8');
+    child.stderr.setEncoding('utf8');
+    child.stdout.on('data', (chunk: string) => {
+      if (failure !== undefined) return;
+      stdoutBytes += Buffer.byteLength(chunk);
+      if (stdoutBytes > 64 * 1024 * 1024) {
+        fail(new Error('Cargo stdout exceeded 64 MiB'));
+        return;
+      }
+      stdout += chunk;
+    });
+    child.stderr.on('data', (chunk: string) => {
+      if (failure !== undefined) return;
+      stderrBytes += Buffer.byteLength(chunk);
+      if (stderrBytes > 64 * 1024 * 1024) {
+        fail(new Error('Cargo stderr exceeded 64 MiB'));
+        return;
+      }
+      stderr += chunk;
+    });
+    child.on('error', (error) => {
+      failure ??= error;
+    });
+    child.stdout.on('error', fail);
+    child.stderr.on('error', fail);
+    child.on('close', (code, signal) => {
+      cargoChildren.delete(child);
+      if (cargoChildren.size === 0) {
+        process.removeListener('exit', killCargoChildren);
+        removeCargoSignalHandlers();
+      }
+      if (failure !== undefined) reject(failure);
+      else if (code !== 0) {
+        reject(new Error(`cargo ${args.join(' ')} failed (${signal ?? code}): ${stderr.trim()}`));
+      } else settle(stdout);
+    });
+    if (cargoChildren.size === 0) ownCargoChildren();
+    cargoChildren.add(child);
   });
 }
 
@@ -148,50 +275,329 @@ export const CARGO_ANCESTOR_INPUTS = ['Cargo.toml', '.cargo/config', '.cargo/con
 // on stderr ("Blocking waiting for file lock on package cache") a
 // timing-dependent number of times when Nx hashes many tasks at once, which
 // made one unchanged tree produce four different task hashes per run. Cargo's
-// stderr is kept for the failure path only, where execFile attaches it to the
+// stderr is kept for the failure path only, where runCargo includes it in the
 // rejected error. Git runs under the same rule.
 const CHILD_STDIO: ['ignore', 'pipe', 'pipe'] = ['ignore', 'pipe', 'pipe'];
 
-/** Locked, offline `cargo metadata` for the workspace `manifestPath` names, run from `cwd`. */
-export async function readCargoResolve(manifestPath: string, cwd: string): Promise<CargoResolve> {
-  const stdout = await runCargo(
-    ['metadata', '--format-version', '1', '--locked', '--offline', '--manifest-path', resolve(manifestPath)],
-    cwd,
+/** A Cargo resolution refusal: no stale closure or runtime whole-workspace substitute is safe. */
+export class CargoMetadataError extends Error {
+  readonly manifestPath: string;
+
+  constructor(manifestPath: string, cause: unknown) {
+    const detail =
+      cause instanceof Error
+        ? `${cause.name}: ${cause.message}`
+        : typeof cause === 'object' && cause !== null && 'message' in cause
+          ? String(cause.message)
+          : String(cause);
+    super(`Locked offline Cargo resolution failed for ${manifestPath}: ${detail}`, { cause });
+    this.name = 'CargoMetadataError';
+    this.manifestPath = manifestPath;
+  }
+}
+
+interface ResolveCache {
+  readonly key: string;
+  readonly cargo: CargoResolve;
+}
+interface ResolveState {
+  ready: Promise<void>;
+  cached: ResolveCache | null;
+  pending?: { readonly key: string; readonly promise: Promise<CargoResolve> };
+}
+const resolves = new Map<string, ResolveState>();
+const RESOLVE_CACHE_SCHEMA = 'cargo-resolve-v1';
+
+/**
+ * The full manifest SET, not merely the last closure: adding a glob workspace
+ * member must invalidate resolution even when Cargo.lock did not change.
+ * Graph callers supply Nx's already-current index; standalone hash callers
+ * take a fresh native snapshot. File contents below are read directly so an
+ * edit within Nx's mtime granularity cannot reuse a stale resolution.
+ */
+function resolutionFiles(
+  root: string,
+  manifest: string,
+  cargo: CargoResolve | null,
+  indexed: ReadonlySet<string>,
+): ReadonlySet<string> {
+  const paths = new Set<string>([manifest]);
+  for (const file of indexed) paths.add(resolve(root, file));
+  for (const pkg of cargo?.local ?? []) {
+    paths.add(pkg.manifest);
+    paths.add(pkg.governingManifest);
+  }
+  if (cargo !== null) paths.add(join(cargo.root, 'Cargo.toml'));
+  const directories = new Set<string>([root]);
+  for (const file of paths) directories.add(dirname(file));
+  for (const directory of directories) {
+    paths.add(join(directory, 'Cargo.lock'));
+    for (let ancestor = directory; ; ancestor = dirname(ancestor)) {
+      paths.add(join(ancestor, '.cargo/config'));
+      paths.add(join(ancestor, '.cargo/config.toml'));
+      paths.add(join(ancestor, 'rust-toolchain'));
+      paths.add(join(ancestor, 'rust-toolchain.toml'));
+      paths.add(join(ancestor, 'Cargo.toml'));
+      if (dirname(ancestor) === ancestor) break;
+    }
+  }
+  for (const pin of CARGO_TOOLCHAIN_PIN_INPUTS) paths.add(pin.replace('{workspaceRoot}', root));
+  const cargoHome = resolve(process.env.CARGO_HOME ?? join(homedir(), '.cargo'));
+  paths.add(join(cargoHome, 'config'));
+  paths.add(join(cargoHome, 'config.toml'));
+  return paths;
+}
+
+/** Toolchain selection can change even while the declared pin's bytes do not. */
+async function cargoExecutable(): Promise<string> {
+  for (const directory of (process.env.PATH ?? '').split(delimiter)) {
+    const executable = resolve(directory, process.platform === 'win32' ? 'cargo.exe' : 'cargo');
+    try {
+      await access(executable, constants.X_OK);
+      return await realpath(executable);
+    } catch (error) {
+      if (
+        !(
+          error instanceof Error &&
+          'code' in error &&
+          (error.code === 'ENOENT' || error.code === 'EACCES' || error.code === 'ENOTDIR')
+        )
+      )
+        throw error;
+    }
+  }
+  return '<cargo-not-on-PATH>';
+}
+
+async function resolutionKey(
+  root: string,
+  manifest: string,
+  cargo: CargoResolve | null,
+  indexed: ReadonlySet<string>,
+): Promise<string> {
+  const cargoHome = resolve(process.env.CARGO_HOME ?? join(homedir(), '.cargo'));
+  const executable = await cargoExecutable();
+  const hash = createHash('sha256').update(
+    `${RESOLVE_CACHE_SCHEMA}\0${root}\0${manifest}\0${cargoHome}\0${executable}\0${process.env.RUSTUP_TOOLCHAIN ?? ''}\0${process.env.RUSTUP_HOME ?? ''}\0`,
   );
-  const metadata = parseCargoMetadata(stdout);
-  const local = await Promise.all(
-    metadata.packages
-      .filter((pkg) => pkg.source === null)
-      .map(async (pkg): Promise<LocalCargoPackage> => {
-        const manifest = await realpath(pkg.manifest_path);
-        const sources = await Promise.all(pkg.targets.map((target) => realpath(target.src_path)));
-        return { id: pkg.id, directory: dirname(manifest), manifest, sources };
-      }),
-  );
+  for (const file of [...resolutionFiles(root, manifest, cargo, indexed)].sort()) {
+    hash.update(file).update('\0');
+    try {
+      const [bytes, canonical] = await Promise.all([readFile(file), realpath(file)]);
+      hash.update(`${canonical}\0${bytes.length}\0`).update(bytes);
+    } catch (error) {
+      if (!(error instanceof Error && 'code' in error && error.code === 'ENOENT')) throw error;
+      hash.update('missing');
+    }
+    hash.update('\0');
+  }
+  return hash.digest('hex');
+}
+
+function cargoFromMetadata(metadata: CargoMetadata): CargoResolve {
   return {
-    root: await realpath(metadata.workspace_root),
+    root: metadata.workspace_root,
     members: new Set(metadata.workspace_members),
-    local,
+    local: metadata.packages
+      .filter((pkg) => pkg.source === null)
+      .map((pkg) => {
+        if (pkg.governing_manifest_path === undefined) throw new Error('Cargo cache omitted a governing manifest');
+        return {
+          id: pkg.id,
+          directory: dirname(pkg.manifest_path),
+          manifest: pkg.manifest_path,
+          sources: pkg.targets.map((target) => target.src_path),
+          governingManifest: pkg.governing_manifest_path,
+        };
+      }),
     edges:
       metadata.resolve === null
         ? null
-        : new Map(metadata.resolve.nodes.map((node) => [node.id, node.deps.map((dependency) => dependency.pkg)])),
+        : new Map(metadata.resolve.nodes.map((node) => [node.id, node.deps.map((dep) => dep.pkg)])),
   };
 }
 
+async function loadResolveCache(file: string): Promise<ResolveCache | null> {
+  let content: string;
+  try {
+    content = await readFile(file, 'utf8');
+  } catch (error) {
+    if (error instanceof Error && 'code' in error && error.code === 'ENOENT') return null;
+    throw error;
+  }
+  try {
+    const newline = content.indexOf('\n');
+    const key = content.slice(0, newline);
+    if (newline === -1 || !/^[a-f0-9]{64}$/.test(key)) throw new Error('invalid content-key header');
+    const metadata = parseCargoMetadata(content.slice(newline + 1));
+    return { key, cargo: cargoFromMetadata(metadata) };
+  } catch (error) {
+    process.stderr.write(
+      `@smoothbricks/nx-plugin: discarding corrupt Cargo resolution cache ${file}: ${error instanceof Error ? error.message : String(error)}\n`,
+    );
+    return null;
+  }
+}
+
 /**
- * The canonical root manifest of the Cargo workspace that governs `pkg`.
- * Metadata's `workspace_root` describes only the invoking workspace, which is
- * the answer for its own members. Any other path package asks Cargo, which
- * resolves an explicit `package.workspace` as well as the ancestor search.
+ * One content-keyed resolution per Cargo workspace, across concurrent graph
+ * calls and workers. Nx's kernel FileLock releases even if its worker dies;
+ * in-process callers join before taking that lock, so a synchronous lock()
+ * cannot block the continuation that owns it. A changed key queues behind
+ * the old child instead of receiving its stale answer.
  */
-export async function governingManifest(cargo: CargoResolve, pkg: LocalCargoPackage, cwd: string): Promise<string> {
-  if (cargo.members.has(pkg.id)) return realpath(join(cargo.root, 'Cargo.toml'));
+export async function readCargoResolve(
+  manifestPath: string,
+  cwd: string,
+  indexed?: ReadonlySet<string>,
+): Promise<CargoResolve> {
+  let manifest = resolve(manifestPath);
+  try {
+    const root = await realpath(cwd);
+    manifest = await realpath(manifest);
+    const index =
+      indexed ?? new Set(new WorkspaceContext(root, workspaceDataDirectoryForWorkspace(root)).glob(['**/Cargo.toml']));
+    const identity = createHash('sha256').update(`${RESOLVE_CACHE_SCHEMA}\0${root}\0${manifest}`).digest('hex');
+    const directory = join(workspaceDataDirectoryForWorkspace(root), 'cargo-resolve', identity);
+    const file = join(directory, 'entry.cache');
+    let state = resolves.get(identity);
+    if (state === undefined) {
+      const created: ResolveState = { ready: Promise.resolve(), cached: null };
+      created.ready = loadResolveCache(file).then((cached) => {
+        created.cached = cached;
+      });
+      resolves.set(identity, created);
+      state = created;
+      try {
+        await created.ready;
+      } catch (error) {
+        resolves.delete(identity);
+        throw error;
+      }
+    } else await state.ready;
+    for (let joined = 0; joined <= 3; joined += 1) {
+      const key = await resolutionKey(root, manifest, state.cached?.cargo ?? null, index);
+      const pending = state.pending;
+      if (pending !== undefined) {
+        if (joined === 3) break;
+        try {
+          await pending.promise;
+        } catch (error) {
+          // Sharers of a refused key receive its refusal; a changed key still
+          // needs its own resolution after the old flight releases the lock.
+          if (pending.key === key) throw error;
+        }
+        // Re-key every joiner with the discovered paths, including an external
+        // manifest edited after the flight's last validation, before publication.
+        continue;
+      }
+      if (state.cached?.key === key) return state.cached.cargo;
+      if (joined === 3) break;
+      const active = state;
+      const promise = resolveAndCache(root, manifest, index, directory, file, active);
+      active.pending = { key, promise };
+      try {
+        return await promise;
+      } finally {
+        if (active.pending?.promise === promise) delete active.pending;
+      }
+    }
+    throw new Error('Cargo resolution inputs kept changing across three consecutive in-flight queries');
+  } catch (error) {
+    if (error instanceof CargoMetadataError) throw error;
+    throw new CargoMetadataError(manifest, error);
+  }
+}
+
+async function resolveAndCache(
+  root: string,
+  manifest: string,
+  indexed: ReadonlySet<string>,
+  directory: string,
+  file: string,
+  state: ResolveState,
+): Promise<CargoResolve> {
+  if (IS_WASM)
+    throw new Error('Cargo resolution requires the native Nx file lock; a WASM Nx host cannot own Cargo children');
+  await mkdir(directory, { recursive: true });
+  const lockFile = join(directory, 'resolve.lock');
+  const lock = new FileLock(lockFile);
+  while (lock.check()) await lock.wait();
+  // Nx's lock() is synchronous: losing this inter-process check/acquire race
+  // can block for one foreign flight. Only the in-process leader reaches it.
+  lock.lock();
+  try {
+    // Another worker may have populated it while this worker waited.
+    state.cached = await loadResolveCache(file);
+    let inputs = state.cached?.cargo ?? null;
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const before = await resolutionKey(root, manifest, inputs, indexed);
+      if (state.cached?.key === before) return state.cached.cargo;
+      const knownFiles = resolutionFiles(root, manifest, inputs, indexed);
+      // A filesystem timestamp, not a sandbox's wall clock: a newly
+      // discovered external input edited during this flight requires replay.
+      await writeFile(lockFile, '');
+      const started = (await stat(lockFile)).mtimeMs;
+      const metadata = await resolveCargoMetadata(manifest, root);
+      const cargo = cargoFromMetadata(metadata);
+      // Capture the published key before validation. Reading it afterwards
+      // could pair a post-edit key with Cargo's pre-edit answer.
+      const key = await resolutionKey(root, manifest, cargo, indexed);
+      let changed = before !== (await resolutionKey(root, manifest, inputs, indexed));
+      for (const added of resolutionFiles(root, manifest, cargo, indexed)) {
+        if (knownFiles.has(added)) continue;
+        try {
+          if ((await stat(added)).mtimeMs >= started) changed = true;
+        } catch (error) {
+          if (!(error instanceof Error && 'code' in error && error.code === 'ENOENT')) throw error;
+        }
+      }
+      if (changed) {
+        inputs = cargo;
+        continue;
+      }
+      const temporary = `${file}.${process.pid}.${randomUUID()}.tmp`;
+      try {
+        await writeFile(temporary, `${key}\n${JSON.stringify(metadata)}\n`);
+        await rename(temporary, file);
+      } finally {
+        await rm(temporary, { force: true });
+      }
+      state.cached = { key, cargo };
+      return cargo;
+    }
+    throw new Error('Cargo resolution inputs kept changing during three consecutive locked offline queries');
+  } finally {
+    lock.unlock();
+  }
+}
+
+async function resolveCargoMetadata(manifestPath: string, cwd: string): Promise<CargoMetadata> {
   const stdout = await runCargo(
-    ['locate-project', '--workspace', '--manifest-path', pkg.manifest, '--message-format', 'plain'],
+    ['metadata', '--format-version', '1', '--locked', '--offline', '--manifest-path', manifestPath],
     cwd,
   );
-  return realpath(stdout.trim());
+  const metadata = parseCargoMetadata(stdout);
+  metadata.workspace_root = await realpath(metadata.workspace_root);
+  const members = new Set(metadata.workspace_members);
+  // Sequential: the metadata flight owns every Cargo process it starts,
+  // including the one-time governing-workspace lookups for path dependencies.
+  for (const pkg of metadata.packages) {
+    if (pkg.source !== null) continue;
+    pkg.manifest_path = await realpath(pkg.manifest_path);
+    for (const target of pkg.targets) target.src_path = await realpath(target.src_path);
+    pkg.governing_manifest_path = members.has(pkg.id)
+      ? join(metadata.workspace_root, 'Cargo.toml')
+      : await realpath(
+          (
+            await runCargo(
+              ['locate-project', '--workspace', '--manifest-path', pkg.manifest_path, '--message-format', 'plain'],
+              cwd,
+            )
+          ).trim(),
+        );
+  }
+  return metadata;
 }
 
 export async function hashCargoPathInputs(
@@ -227,7 +633,7 @@ export async function hashCargoPathInputs(
     }
     directories.add(directory);
     files.add(pkg.manifest);
-    files.add(await governingManifest(cargo, pkg, root));
+    files.add(pkg.governingManifest);
     packageSources.push(...pkg.sources);
     // A member can inherit edition, lint policy, dependencies and
     // profiles from a workspace above its package directory. Those manifests

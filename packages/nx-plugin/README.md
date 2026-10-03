@@ -113,6 +113,29 @@ source replacement, credentials, and toolchain settings; forwarding it with `--c
 access may consequently serialize on Cargo's package-cache lock. Clippy's dedicated target directory keeps its check
 artifacts out of the test build directory without splitting one directory per crate.
 
+Graph inference persists locked, offline Cargo resolution in Nx's workspace-data directory. Its content key includes the
+canonical workspace and manifest paths, the complete indexed manifest set, local path-dependency and governing
+manifests, lockfiles, Cargo configuration (including ancestor and `CARGO_HOME` configuration), toolchain pins, the
+resolved Cargo executable, and explicit rustup toolchain selection. Changing only Rust sources, other files, or file
+timestamps reuses the resolved closure without starting Cargo. The configuration identity here is a local
+resolution-cache key, not a machine-specific task input.
+
+Concurrent graph computations share one in-flight resolution per workspace. A native Nx file lock serializes workers;
+after acquiring it, a worker checks the persisted result again before starting Cargo. A caller with changed inputs waits
+for the current flight and resolves the new content rather than accepting the old closure. Successful cache writes use
+atomic rename; failed resolutions are never cached. A corrupt cache is reported and resolved again. Inputs that change
+during resolution are retried at most three times, then refused with the cause intact. A WASM-only Nx host cannot
+provide the native lock and receives a typed refusal rather than an unserialized fallback.
+
+A plugin worker's normal exit, host disconnect, or handled termination kills Cargo children it still owns; on POSIX it
+kills the whole process group, including wrapper descendants. Standalone callers also forward unhandled termination
+signals to their owned groups. An uncatchable `SIGKILL` cannot run an exit hook; the kernel still releases its file
+lock.
+
+Keep workspace-owned runtime state outside Nx's source index. In a cowshed workspace, the root `.nxignore` must include
+`.cowshed/`: Nx's watcher reads the root ignore files, not Git's `.git/info/exclude`. Watching the daemon's own log,
+plugin sockets or job records turns each graph computation into another file event and another graph computation.
+
 ### Cargo source runtime inputs
 
 For inferred Cargo targets in a repository-root Cargo workspace, declare the external-source input once:
@@ -129,8 +152,8 @@ For a package-root Cargo workspace, pass its manifest relative to the Nx root:
 `smoo-nx-cargo-hash packages/example/Cargo.toml`. A shared input covering several Cargo workspaces includes one runtime
 entry per manifest.
 
-By default, the command queries `cargo metadata --locked --offline` and hashes the resolved external path packages,
-including transitive dependencies, Rust sources, target source files, governing Cargo manifests, and Cargo
+By default, the command uses the content-keyed `cargo metadata --locked --offline` resolution and hashes external path
+packages, including transitive dependencies, Rust sources, target source files, governing Cargo manifests, and Cargo
 configuration. It also covers path packages under `node_modules`, which Nx's normal file map ignores. Packages inside
 both the Nx and Cargo workspaces are left to the plugin's inferred file inputs. Adding or moving a dependency does not
 require maintaining a second list of source roots. The command refuses missing dependencies or an unavailable locked
@@ -155,24 +178,23 @@ it in each custom Cargo target's `inputs`, alongside `cargoToolchain`, the targe
 }
 ```
 
-Cargo decides the closure. Once per project-graph computation, `cargo metadata --locked --offline` resolves the local
-packages under the project's root and every mutable local package they reach through normal, build or dev dependencies;
-an edit to a workspace member outside that closure leaves the key alone. The members Nx's file index holds become
-filesets: each package's `.rs` files, `Cargo.toml` files and `.cargo/config[.toml]` below its directory (skipping
-`target/` and the other directories the hash command skips), target sources outside it, its governing workspace
-manifest, the `Cargo.toml` and `.cargo/config[.toml]` of every directory from the package up to the Nx root, and the
-workspace's `Cargo.lock`. Nx hashes those from the file hashes it already keeps, so hashing a task over an unchanged
-tree starts no process; the graph computation pays one `cargo metadata` instead.
+Cargo decides the closure. Graph inference checks the content-keyed locked offline resolution of the local packages
+under the project's root and every mutable local package they reach through normal, build or dev dependencies; an edit
+to a workspace member outside that closure leaves the task key alone. The members Nx's file index holds become filesets:
+each package's `.rs` files, `Cargo.toml` files and `.cargo/config[.toml]` below its directory (skipping `target/` and
+the other directories the hash command skips), target sources outside it, its governing workspace manifest, the
+`Cargo.toml` and `.cargo/config[.toml]` of every directory from the package up to the Nx root, and the workspace's
+`Cargo.lock`. Nx hashes those from the file hashes it already keeps, so hashing these inputs starts no process. A graph
+with unchanged resolution inputs starts no Cargo process either.
 
 Members the file index cannot hold, outside the Nx workspace or under `node_modules`, are hashed by one runtime
-`smoo-nx-cargo-hash --closure <projectRoot> <Cargo.toml>` entry, present only while such members exist. It resolves the
-closure again when it runs, so a member that only an edit outside the workspace brings in is still covered.
+`smoo-nx-cargo-hash --closure <projectRoot> <Cargo.toml>` entry, present only while such members exist. Its cached
+resolution checks external manifests too, so a dependency introduced by an external manifest edit is still covered.
 
-When the closure cannot be expressed that way, `cargoClosure` is the complete runtime hash,
-`smoo-nx-cargo-hash --include-workspace --closure <projectRoot> <Cargo.toml>`, and the plugin says why on stderr: Cargo
-could not resolve the workspace during graph computation (no `cargo` on PATH, a stale `Cargo.lock`, an unfetched
-dependency), or a member inside the workspace is missing from the file index (an ignored directory). The command reports
-the same Cargo failure wherever a task needs it.
+Cargo resolution failures (no `cargo` on PATH, a stale `Cargo.lock`, or an unavailable locked dependency) fail graph
+inference with `CargoMetadataError`, including the manifest path and Cargo's cause. A member inside the workspace
+missing from Nx's file index, or another closure Nx cannot express precisely, fails with `CargoClosureInputError`.
+Neither condition falls back to a whole-workspace runtime hash or silently reuses an older closure.
 
 In-workspace members follow Nx's file semantics, which differ from the command's own walk in two places: a symlinked
 directory inside a package is not followed, and manifests and Cargo configuration above the Nx root (a
