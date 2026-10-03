@@ -459,6 +459,17 @@ A plain `bun install`, `bun add` or `bun remove` re-points every declared depend
 included. Bun does this before the root `preinstall` script runs, so no lifecycle script can keep a link. smoo has no
 command that brings a link back once it has been replaced, so after a plain install you have to link again.
 
+An install that exists to replace links, such as a script that runs `bun link <name>` against providers registered anew,
+names the packages it replaces so that smoo does not undo it:
+`keepDeveloperLinks(root, install, { relink: ['@scope/name'] })` from the repository's
+`tooling/direnv/developer-links.ts`. A name is a package name, scoped or not, and selects that package's link in the
+root's `node_modules` and in every workspace member's. When `install` resolves, what it left at those names stays and
+every other developer link is put back as for any install. When it rejects, every link is put back, the named ones
+included, so a failed relink changes nothing. The line naming linked checkouts then lists the links in place after the
+install, not the ones before it. `relink` selects links and creates none: a named package without a link to a local
+checkout when the install starts is left as the install leaves it, and a named link whose checkout is gone is removed
+with the usual warning first.
+
 ## Formatting And Git Hooks
 
 The root `lint:fix` script runs [`git-format-staged`][git-format-staged] with

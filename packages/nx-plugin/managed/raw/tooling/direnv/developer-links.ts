@@ -28,6 +28,16 @@
  * before the install, with a warning, so that install puts the lockfile's
  * version in its place.
  *
+ * An install that exists to replace links says which: `{ relink }` names the
+ * packages (`name` or `@scope/name`) it is meant to relink, in the root's
+ * tree and in every member's. When the install resolves, what it left at
+ * those names stays (a `bun link` run against providers a developer
+ * registered anew) and every other developer link is put back as before.
+ * When it rejects, every link is put back, the named ones included, so a
+ * failed relink changes nothing. A named package with no developer link when
+ * the install starts has nothing to put back, and a named link that dangled
+ * is removed first, as for any install.
+ *
  * Like secret-references.ts, this is a managed raw script: shell entry imports
  * it before anything is installed, and `smoo monorepo update` loads the copy
  * the nx-plugin ships. Because both use the one implementation, the shell and
@@ -45,6 +55,7 @@ import {
   symlinkSync,
 } from 'node:fs';
 import path from 'node:path';
+import type { KeepDeveloperLinksOptions } from '@smoothbricks/nx-plugin/managed-assets';
 
 interface DeveloperLink {
   /** Where the link is, relative to the project root. */
@@ -62,22 +73,38 @@ interface DeveloperLinks {
 /**
  * Runs `install` with every developer link under `root` kept. The links in
  * place when it starts are exactly the links in place when it settles,
- * whether it resolved or rejected, less those that already dangled. It then
- * names them as `reportDeveloperLinks` does.
+ * whether it resolved or rejected, less those that already dangled; except
+ * that a resolved install keeps what it left at the packages `relink` names.
+ * It then names the links in place as `reportDeveloperLinks` does.
  */
-export async function keepDeveloperLinks<T>(root: string, install: () => Promise<T>): Promise<T> {
+export async function keepDeveloperLinks<T>(
+  root: string,
+  install: () => Promise<T>,
+  options?: KeepDeveloperLinksOptions,
+): Promise<T> {
   const { live, dangling } = findDeveloperLinks(root);
   for (const link of dangling) {
     rmSync(path.join(root, link.path), { force: true });
     console.error(`! removed developer link ${link.path}: its target ${resolvedTarget(root, link)} no longer exists`);
   }
+  // Only an install that resolved leaves the links it was meant to replace as
+  // it made them; a rejected one puts every link back.
+  let replaced: readonly string[] | undefined;
   try {
-    return await install();
+    const result = await install();
+    replaced = options?.relink;
+    return result;
   } finally {
     for (const link of live) {
-      restoreLink(root, link);
+      if (!replaced?.length || !replaced.includes(packageName(link))) {
+        restoreLink(root, link);
+      }
     }
-    describeDeveloperLinks(root, live);
+    if (replaced?.length) {
+      reportDeveloperLinks(root);
+    } else {
+      describeDeveloperLinks(root, live);
+    }
   }
 }
 
@@ -93,6 +120,11 @@ export function reportDeveloperLinks(root: string): void {
   describeDeveloperLinks(root, findDeveloperLinks(root).live);
 }
 
+/** The package a link stands for in its tree: `name` or `@scope/name`. */
+function packageName(link: DeveloperLink): string {
+  return link.path.slice(link.path.lastIndexOf('node_modules/') + 'node_modules/'.length);
+}
+
 /** A package linked from many members is named once, with its count. */
 function describeDeveloperLinks(root: string, links: readonly DeveloperLink[]): void {
   if (links.length === 0) {
@@ -100,8 +132,7 @@ function describeDeveloperLinks(root: string, links: readonly DeveloperLink[]): 
   }
   const counts = new Map<string, number>();
   for (const link of links) {
-    const name = link.path.slice(link.path.lastIndexOf('node_modules/') + 'node_modules/'.length);
-    const named = `${name} -> ${resolvedTarget(root, link)}`;
+    const named = `${packageName(link)} -> ${resolvedTarget(root, link)}`;
     counts.set(named, (counts.get(named) ?? 0) + 1);
   }
   const entries = [...counts].map(([named, count]) => (count === 1 ? named : `${named} (${count} links)`));

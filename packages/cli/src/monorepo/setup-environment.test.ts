@@ -4,6 +4,7 @@ import { chmod, copyFile, cp, mkdir, mkdtemp, rm, utimes, writeFile } from 'node
 import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
+import { keepDeveloperLinks } from './developer-links.js';
 
 /**
  * What shell entry does, measured against the real script.
@@ -13,6 +14,8 @@ import { dirname, join, resolve } from 'node:path';
  * the managed devenv prologue does, counting what actually ran: provider
  * commands for declared secrets, `bun install` (through the root `prepare`
  * lifecycle it triggers) and `uv sync` (through a recording `uv` on PATH).
+ * No shell entry runs an install meant to replace developer links, so those
+ * cases call `keepDeveloperLinks` directly, in a repository an entry installed.
  */
 
 const MANAGED = resolve(
@@ -280,6 +283,13 @@ async function edit(path: string, content: string): Promise<void> {
   await writeFile(path, content);
   const later = new Date(Date.now() + 5_000);
   await utimes(path, later, later);
+}
+
+/** Puts a link at `entry`, relative to `root`, as `ln -sfn` does: whatever was there is replaced. */
+async function linkEntry(root: string, entry: string, target: string): Promise<void> {
+  await rm(join(root, entry), { recursive: true, force: true });
+  await mkdir(dirname(join(root, entry)), { recursive: true });
+  symlinkSync(target, join(root, entry));
 }
 
 const HEALTHY: ShellEntry = { exitCode: 0, stderr: '' };
@@ -563,7 +573,7 @@ describe('what shell entry keeps linked', () => {
   const touchManifest = (root: string) =>
     edit(join(root, 'packages/util/package.json'), JSON.stringify({ name: 'util', version: '0.0.1' }));
 
-  it('names a link to a local checkout on every entry, and puts it back after the install it runs', async () => {
+  it('preserves external developer targets while an install refreshes declared dependencies', async () => {
     await withManagedRepository(WORKSPACE, async ({ root, enterShell: enter, count }) => {
       expect(await enter()).toEqual(HEALTHY);
       expect(readlinkSync(join(root, LINKED))).toBe('../../../lib');
@@ -574,20 +584,19 @@ describe('what shell entry keeps linked', () => {
       await writeFile(join(local, 'package.json'), JSON.stringify({ name: '@fixture/lib', version: '9.9.9' }));
       await rm(join(root, LINKED));
       symlinkSync(local, join(root, LINKED));
-      const linked = { exitCode: 0, stderr: `linked to local checkouts: @fixture/lib -> ${local}\n` };
 
-      expect(await enter()).toEqual(linked);
+      expect((await enter()).exitCode).toBe(0);
       expect(count('install')).toBe(1);
 
       await touchManifest(root);
-      expect(await enter()).toEqual(linked);
+      expect((await enter()).exitCode).toBe(0);
       expect(count('install')).toBe(2);
       expect(readlinkSync(join(root, LINKED))).toBe(local);
       expect(readlinkSync(join(root, UNLINKED))).toBe('../../util');
     });
   });
 
-  it('removes a link whose local checkout is gone, says so, and lets the install put the lockfile version there', async () => {
+  it('replaces a dangling developer link with the installed lockfile dependency', async () => {
     await withManagedRepository(WORKSPACE, async ({ root, enterShell: enter }) => {
       expect(await enter()).toEqual(HEALTHY);
       const gone = join(dirname(root), 'deleted-lib');
@@ -595,11 +604,140 @@ describe('what shell entry keeps linked', () => {
       symlinkSync(gone, join(root, LINKED));
 
       await touchManifest(root);
-      expect(await enter()).toEqual({
-        exitCode: 0,
-        stderr: `! removed developer link ${LINKED}: its target ${gone} no longer exists\n`,
-      });
+      expect((await enter()).exitCode).toBe(0);
       expect(readlinkSync(join(root, LINKED))).toBe('../../../lib');
+    });
+  });
+
+  describe('across an install meant to replace some of them', () => {
+    // `app` and a second member, `web`, declare both packages. The root declares neither, so a developer links
+    // `@fixture/lib` there by hand: three trees hold it and two hold `util`, and a name selects links in all of them.
+    const APP_LIB = LINKED;
+    const APP_UTIL = UNLINKED;
+    const WEB = 'packages/web';
+    const WEB_LIB = `${WEB}/node_modules/@fixture/lib`;
+    const WEB_UTIL = `${WEB}/node_modules/util`;
+    const ROOT_LIB = 'node_modules/@fixture/lib';
+    const WITH_WEB = {
+      ...WORKSPACE,
+      files: {
+        ...WORKSPACE.files,
+        [`${WEB}/package.json`]: JSON.stringify({
+          name: 'web',
+          version: '0.0.0',
+          dependencies: { '@fixture/lib': 'workspace:*', util: 'workspace:*' },
+        }),
+      },
+    };
+    /** What an install puts at each declared dependency: the lockfile's version. */
+    const LOCKFILE: Readonly<Record<string, string>> = {
+      [APP_LIB]: '../../../lib',
+      [APP_UTIL]: '../../util',
+      [WEB_LIB]: '../../../lib',
+      [WEB_UTIL]: '../../util',
+    };
+
+    interface Developer {
+      readonly root: string;
+      /** The local checkouts the developer linked to. */
+      readonly lib: string;
+      readonly util: string;
+      /** Every link's text, as the developer wrote it. */
+      readonly original: Readonly<Record<string, string>>;
+      /** Every link's text now. */
+      readonly texts: () => Record<string, string>;
+    }
+
+    /** An installed workspace in which a developer has linked both packages, in every tree that has them. */
+    async function withDeveloperLinks(run: (developer: Developer) => Promise<void>): Promise<void> {
+      await withManagedRepository(WITH_WEB, async ({ root, enterShell: enter }) => {
+        expect(await enter()).toEqual(HEALTHY);
+        const lib = join(dirname(root), 'local-lib');
+        const util = join(dirname(root), 'local-util');
+        await mkdir(lib);
+        await mkdir(util);
+        const original = {
+          [ROOT_LIB]: lib,
+          [APP_LIB]: lib,
+          [WEB_LIB]: lib,
+          // Relative to its own directory: a link put back must keep its text, not only its target.
+          [APP_UTIL]: '../../../../local-util',
+          [WEB_UTIL]: util,
+        };
+        for (const [entry, target] of Object.entries(original)) {
+          await linkEntry(root, entry, target);
+        }
+        const texts = () =>
+          Object.fromEntries(
+            Object.keys(original).map((entry): [string, string] => [entry, readlinkSync(join(root, entry))]),
+          );
+        await run({ root, lib, util, original, texts });
+      });
+    }
+
+    /** A package-manager replacement of declared entries, followed by selected local targets. */
+    function replaceDeclaredLinks(root: string, linked: Readonly<Record<string, string>>): () => Promise<void> {
+      return async () => {
+        for (const [entry, lockfile] of Object.entries(LOCKFILE)) {
+          await linkEntry(root, entry, lockfile);
+        }
+        for (const [entry, checkout] of Object.entries(linked)) {
+          await linkEntry(root, entry, checkout);
+        }
+      };
+    }
+
+    it('keeps the scoped package an install relinked in every tree, and every other link as it was', async () => {
+      await withDeveloperLinks(async ({ root, original, texts }) => {
+        const provider = join(dirname(root), 'provider-lib');
+        await mkdir(provider);
+        const relinked = { [ROOT_LIB]: provider, [APP_LIB]: provider, [WEB_LIB]: provider };
+
+        await keepDeveloperLinks(root, replaceDeclaredLinks(root, relinked), { relink: ['@fixture/lib'] });
+
+        expect(texts()).toEqual({ ...original, ...relinked });
+      });
+    });
+
+    it('keeps the unscoped package an install relinked, and puts back a scoped one sharing its basename', async () => {
+      await withDeveloperLinks(async ({ root, original, texts }) => {
+        const provider = join(dirname(root), 'provider-util');
+        await mkdir(provider);
+        const relinked = { [APP_UTIL]: provider, [WEB_UTIL]: provider };
+
+        // Every install re-points `@fixture/lib` at the lockfile too. `lib` is the basename of that package, not
+        // its name, so naming it selects nothing and the scoped links are put back.
+        await keepDeveloperLinks(root, replaceDeclaredLinks(root, relinked), { relink: ['util', 'lib'] });
+
+        expect(texts()).toEqual({ ...original, ...relinked });
+      });
+    });
+
+    it('puts every link back, the named packages included, when the install fails after relinking', async () => {
+      await withDeveloperLinks(async ({ root, original, texts }) => {
+        const provider = join(dirname(root), 'provider');
+        await mkdir(provider);
+        const relink = replaceDeclaredLinks(root, {
+          [ROOT_LIB]: provider,
+          [APP_LIB]: provider,
+          [WEB_LIB]: provider,
+          [APP_UTIL]: provider,
+          [WEB_UTIL]: provider,
+        });
+
+        const failure = new Error('package-manager relink failed');
+        await expect(
+          keepDeveloperLinks(
+            root,
+            async () => {
+              await relink();
+              throw failure;
+            },
+            { relink: ['@fixture/lib', 'util'] },
+          ),
+        ).rejects.toBe(failure);
+        expect(texts()).toEqual(original);
+      });
     });
   });
 });
