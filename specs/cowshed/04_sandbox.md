@@ -635,7 +635,9 @@ cannot reach a host daemon's socket and replaces it, and host clients then send 
 to a daemon inside the sandbox. Every job therefore gets `NX_WORKSPACE_DATA_DIRECTORY` and `NX_CACHE_DIRECTORY`, naming
 `nx/workspace-data` and `nx/cache` under its private `XDG_CACHE_HOME`, and a caller's values never pass. They are scoped
 per workspace and mode like the runtime link: in the image for a read-write job, in the exec temp dir for a read-only
-one, so a read-only client never reaches a daemon that can write the workspace.
+one, so a read-only client never reaches a daemon that can write the workspace. The supervisor binds
+`NX_WORKSPACE_ROOT_PATH` to this workspace. The managed shell publishes the same owner beside its socket override, so a
+wrapper entering another root can discard the owner's state locations rather than share its daemon.
 
 The two directories move together. Once either is configured, Nx keeps its task database in the workspace-data
 directory; the database's rows index one cache directory, and a database beside another boundary's cache takes hits on

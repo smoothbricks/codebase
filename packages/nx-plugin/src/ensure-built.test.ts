@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe, expect, it } from 'bun:test';
 import { spawn } from 'node:child_process';
-import { chmod, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readdir, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -175,6 +175,12 @@ const NX_ENV_KEYS = [
   'NX_WORKSPACE_DATA_DIRECTORY',
 ];
 const SHARED_NX_DIRECTORY_KEYS = ['NX_CACHE_DIRECTORY', 'NX_WORKSPACE_DATA_DIRECTORY'] as const;
+/**
+ * The caller's socket directory names one workspace's daemon, and Nx takes it
+ * literally. A fixture never inherits it, so a daemon it starts or stops can
+ * only touch its own socket; a test that wants one passes it explicitly.
+ */
+const NX_SOCKET_ENV_KEYS = ['NX_SOCKET_DIR', 'NX_DAEMON_SOCKET_DIR'] as const;
 
 interface BinRun {
   readonly code: number | null;
@@ -186,6 +192,9 @@ interface BinRun {
 function fixtureNxEnvironment(env: Readonly<NodeJS.ProcessEnv> = {}): NodeJS.ProcessEnv {
   const childEnv = { ...process.env };
   for (const key of NX_ENV_KEYS) {
+    delete childEnv[key];
+  }
+  for (const key of NX_SOCKET_ENV_KEYS) {
     delete childEnv[key];
   }
   // The parent Nx process may set FORCE_COLOR while the shell exports
@@ -610,16 +619,6 @@ describe('smoo-nx-exec', () => {
     expect(run.stdout).not.toContain(MARKER);
   });
 
-  it('falls back to the workspace nx CLI when the daemon is disabled', async () => {
-    const run = await runBin(workspace, ['app:build', '--', './report'], {
-      NX_DAEMON: 'false',
-      NX_VERBOSE_LOGGING: 'true',
-    });
-    expect(run.code).toBe(0);
-    expect(run.stderr).toContain('daemon is disabled');
-    expect(run.stdout.split('\n')[0], run.stdout).toBe(MARKER);
-  });
-
   it('prints the message from a plain-object Nx rejection', async () => {
     const rejectingWorkspace = await realpath(await mkdtemp(join(tmpdir(), 'ensure-built-rejection-')));
     try {
@@ -674,13 +673,28 @@ describe('smoo-nx-exec', () => {
 describe('smoo-nx-exec signal forwarding', () => {
   let workspace = '';
 
-  // A workspace whose `nx` is a script that kills itself. The daemon-disabled
-  // path spawns exactly that binary, so this is the whole signal path end to
-  // end — and deterministic, unlike racing a real build with a kill.
+  // A workspace whose `nx` is a script that kills itself. A target that has
+  // never run is a miss, and a miss spawns exactly that binary, so this is the
+  // whole signal path end to end — and deterministic, unlike racing a real
+  // build with a kill. The probe ahead of the miss is the real daemon's, so the
+  // workspace carries the repository's own Nx beside the fake CLI.
   beforeAll(async () => {
     workspace = await realpath(await mkdtemp(join(tmpdir(), 'ensure-built-signal-')));
+    const initialized = Bun.spawnSync(['git', 'init', '--quiet', workspace]);
+    expect(initialized.exitCode).toBe(0);
     await mkdir(join(workspace, 'node_modules', '.bin'), { recursive: true });
-    await writeFile(join(workspace, 'nx.json'), '{}');
+    await symlink(join(repoRoot, 'node_modules', 'nx'), join(workspace, 'node_modules', 'nx'), 'dir');
+    await writeFile(join(workspace, 'nx.json'), JSON.stringify({ useDaemonProcess: true }));
+    await mkdir(join(workspace, 'packages', 'app'), { recursive: true });
+    await writeFile(
+      join(workspace, 'packages', 'app', 'project.json'),
+      JSON.stringify({
+        name: 'app',
+        targets: {
+          build: { executor: 'nx:run-commands', cache: true, options: { command: 'true', cwd: '{projectRoot}' } },
+        },
+      }),
+    );
     const fakeNx = join(workspace, 'node_modules', '.bin', 'nx');
     await writeFile(fakeNx, '#!/bin/sh\nkill -TERM $$\n');
     await chmod(fakeNx, 0o755);
@@ -690,13 +704,80 @@ describe('smoo-nx-exec signal forwarding', () => {
 
   afterAll(async () => {
     if (workspace) {
-      await rm(workspace, { recursive: true, force: true });
+      try {
+        await nx(workspace, ['daemon', '--stop']);
+      } finally {
+        await rm(workspace, { recursive: true, force: true });
+      }
     }
   });
 
   it('re-raises the signal that killed nx instead of flattening it to a code', async () => {
-    const run = await runBin(workspace, ['app:build', '--', './report'], { NX_DAEMON: 'false' });
+    const run = await runBin(workspace, ['app:build', '--', './report']);
     expect(run.signal).toBe('SIGTERM');
     expect(run.stdout).not.toContain(MARKER);
+  });
+});
+
+describe('smoo-nx-exec daemon socket', () => {
+  let workspace = '';
+  let socketDir = '';
+  let callerDir = '';
+  const record = () => readFile(join(workspace, '.nx', 'workspace-data', 'd', 'server-process.json'), 'utf-8');
+
+  beforeAll(async () => {
+    workspace = await realpath(await mkdtemp(join(tmpdir(), 'ensure-built-socket-')));
+    // Under /tmp, not the platform temp directory: a socket path has a 95
+    // character budget and macOS's temp directory spends half of it.
+    socketDir = await mkdtemp(join('/tmp', 'eb-sock-'));
+    callerDir = await realpath(await mkdtemp(join(tmpdir(), 'ensure-built-caller-')));
+    const initialized = Bun.spawnSync(['git', 'init', '--quiet', workspace]);
+    expect(initialized.exitCode).toBe(0);
+    await symlink(join(repoRoot, 'node_modules'), join(workspace, 'node_modules'), 'dir');
+    await writeFile(join(workspace, 'nx.json'), JSON.stringify({ useDaemonProcess: true }));
+    await mkdir(join(workspace, 'packages', 'app'), { recursive: true });
+    await writeFile(
+      join(workspace, 'packages', 'app', 'project.json'),
+      JSON.stringify({
+        name: 'app',
+        targets: {
+          build: { executor: 'nx:run-commands', cache: true, options: { command: 'true', cwd: '{projectRoot}' } },
+        },
+      }),
+    );
+  });
+
+  afterAll(async () => {
+    try {
+      if (workspace) {
+        await nx(workspace, ['daemon', '--stop']);
+      }
+    } finally {
+      await rm(workspace, { recursive: true, force: true });
+      await rm(socketDir, { recursive: true, force: true });
+      await rm(callerDir, { recursive: true, force: true });
+    }
+  });
+
+  it('starts the daemon of a root the caller does not stand in on its own socket, not the caller\u0027s', async () => {
+    // The caller's environment was set up for another workspace, as a managed
+    // devenv's is: its socket directory belongs to that workspace's daemon,
+    // and a second daemon listening there would take the socket from it.
+    const stopped = await nx(workspace, ['daemon', '--stop']);
+    expect(stopped.code, stopped.stdout + stopped.stderr).toBe(0);
+    const run = await runBinWith('bun', binEntry, callerDir, ['app:build', '--workspace-root', workspace], {
+      NX_SOCKET_DIR: socketDir,
+    });
+    expect(run.code, run.stdout + run.stderr).toBe(0);
+    expect(await readdir(socketDir)).toEqual([]);
+    expect(await record()).not.toContain(socketDir);
+  });
+
+  it('keeps the socket directory of a caller standing in the root it was set up for', async () => {
+    const stopped = await nx(workspace, ['daemon', '--stop']);
+    expect(stopped.code, stopped.stdout + stopped.stderr).toBe(0);
+    const run = await runBin(workspace, ['app:build'], { NX_SOCKET_DIR: socketDir });
+    expect(run.code, run.stdout + run.stderr).toBe(0);
+    expect(await record()).toContain(join(socketDir, 'd.sock'));
   });
 });

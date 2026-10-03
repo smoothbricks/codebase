@@ -3,7 +3,7 @@ import { execFileSync } from 'node:child_process';
 import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { fixtureNxEnv } from './__tests__/fixture-nx-env.js';
+import { fixtureNxEnv, stopFixtureNxDaemon } from './__tests__/fixture-nx-env.js';
 import { hashCargoPathInputs } from './cargo-source-hash.js';
 
 it.each(['app', '.'])('invalidates transitive and inherited Cargo inputs with Nx rooted at %s', async (nxDirectory) => {
@@ -374,7 +374,11 @@ await appendFile(${JSON.stringify(executions)}, result);
       expect(await readFile(output, 'utf8')).toBe('12\n');
       expect(await readFile(executions, 'utf8')).toBe('11\n12\n');
     } finally {
-      await rm(root, { recursive: true, force: true });
+      try {
+        await stopFixtureNxDaemon(join(root, 'workspace'));
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
     }
   },
   120_000,

@@ -273,12 +273,27 @@ import('nx/src/project-graph/project-graph.js')
   });
 `;
 
+/**
+ * Nx's overrides for where one workspace keeps its daemon socket, daemon record,
+ * task database and cache. This process's environment names the primary
+ * workspace's; a foreign root's own Nx, started with them, would listen on the
+ * primary's socket and share its database.
+ */
+const PRIMARY_WORKSPACE_STATE_ENV = [
+  'NX_SOCKET_DIR',
+  'NX_DAEMON_SOCKET_DIR',
+  'NX_WORKSPACE_DATA_DIRECTORY',
+  'NX_CACHE_DIRECTORY',
+] as const;
+
 async function loadForeignNxProjects(root: string): Promise<NxProjects> {
-  const result = await runResult(process.execPath, ['--eval', FOREIGN_GRAPH_SCRIPT], root, {
-    NX_DAEMON: 'false',
-    NX_ISOLATE_PLUGINS: 'false',
-    NX_WORKSPACE_ROOT_PATH: root,
-  });
+  const result = await runResult(
+    process.execPath,
+    ['--eval', FOREIGN_GRAPH_SCRIPT],
+    root,
+    { NX_ISOLATE_PLUGINS: 'false', NX_WORKSPACE_ROOT_PATH: root },
+    PRIMARY_WORKSPACE_STATE_ENV,
+  );
   if (result.exitCode !== 0) {
     printCommandOutput(result.stdout, result.stderr);
     throw new Error(

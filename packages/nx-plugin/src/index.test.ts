@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'bun:test';
-import { chmod, mkdir, mkdtemp, readdir, readFile, rm, symlink, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readdir, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -8,6 +8,7 @@ import type { CreateNodesContextV2, CreateNodesV2, TargetConfiguration } from 'n
 import { AggregateCreateNodesError } from 'nx/src/project-graph/error-types.js';
 import { createTargetDefaultsResults } from 'nx/src/project-graph/utils/project-configuration/target-defaults.js';
 import { mergeTargetConfigurations } from 'nx/src/project-graph/utils/project-configuration-utils.js';
+import { fixtureNxEnv, stopFixtureNxDaemon } from './__tests__/fixture-nx-env.js';
 import { BOUNDED_TEST_TIMEOUT_MS } from './bounded-test-policy.js';
 import { exceptionalTestFilter, packageNameFromCargoTestTarget } from './cargo-workspace.js';
 import { CARGO_CROSS_LINT_COMMAND, CARGO_CROSS_LINT_TARGET, CARGO_LINT_CLIPPY_COMMAND } from './cross-check-policy.js';
@@ -18,7 +19,7 @@ const [, inferTargets] = createNodesV2;
 
 describe('@smoothbricks/nx-plugin inferred targets', () => {
   it('runs Rust-only lint without ESLint and checks JavaScript when sources appear', async () => {
-    const workspace = await createWorkspace();
+    const workspace = await createNxWorkspace();
     const root = workspace.context.workspaceRoot;
     const repositoryRoot = fileURLToPath(new URL('../../../', import.meta.url));
     try {
@@ -52,12 +53,8 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         const child = Bun.spawn(['bun', join(repositoryRoot, 'node_modules/.bin/nx'), 'run', 'rust-fixture:lint'], {
           cwd: root,
           env: {
-            ...process.env,
+            ...fixtureNxEnv(root),
             PATH: `${join(repositoryRoot, 'node_modules/.bin')}:${process.env.PATH ?? ''}`,
-            NX_DAEMON: 'false',
-            NX_ISOLATE_PLUGINS: 'false',
-            NX_WORKSPACE_DATA_DIRECTORY: join(root, '.nx/workspace-data'),
-            NX_CACHE_DIRECTORY: join(root, '.nx/cache'),
             RUSTC_WRAPPER: '',
             RUSTC_WORKSPACE_WRAPPER: '',
           },
@@ -89,12 +86,12 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       expect(overridden).toMatchObject({ exitCode: 0 });
       expect(overridden.output).toContain('explicit-lint');
     } finally {
-      await workspace.cleanup();
+      await cleanupNxWorkspace(workspace);
     }
   }, 120_000);
 
   it('never restores a stale child artifact from the cached build aggregate', async () => {
-    const workspace = await createWorkspace();
+    const workspace = await createNxWorkspace();
     const root = workspace.context.workspaceRoot;
     const repositoryRoot = fileURLToPath(new URL('../../../', import.meta.url));
     try {
@@ -142,12 +139,8 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         const child = Bun.spawn(['bun', join(repositoryRoot, 'node_modules/.bin/nx'), 'run', 'app:build'], {
           cwd: root,
           env: {
-            ...process.env,
+            ...fixtureNxEnv(root),
             PATH: `${join(repositoryRoot, 'node_modules/.bin')}:${process.env.PATH ?? ''}`,
-            NX_DAEMON: 'false',
-            NX_ISOLATE_PLUGINS: 'false',
-            NX_WORKSPACE_DATA_DIRECTORY: join(root, '.nx/workspace-data'),
-            NX_CACHE_DIRECTORY: join(root, '.nx/cache'),
           },
           stdout: 'pipe',
           stderr: 'pipe',
@@ -173,7 +166,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       // would have claimed on the first run.
       expect(await artifact(), second.output).toBe('source\ntoolchain-2\n');
     } finally {
-      await workspace.cleanup();
+      await cleanupNxWorkspace(workspace);
     }
   }, 120_000);
 
@@ -2275,7 +2268,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
   });
 
   it('orders a three-project chain of INFERRED deploys through one run-many', async () => {
-    const workspace = await createWorkspace();
+    const workspace = await createNxWorkspace();
     const root = workspace.context.workspaceRoot;
     const repositoryRoot = fileURLToPath(new URL('../../../', import.meta.url));
     try {
@@ -2330,12 +2323,8 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         {
           cwd: root,
           env: {
-            ...process.env,
+            ...fixtureNxEnv(root),
             PATH: `${join(repositoryRoot, 'node_modules/.bin')}:${process.env.PATH ?? ''}`,
-            NX_DAEMON: 'false',
-            NX_ISOLATE_PLUGINS: 'false',
-            NX_WORKSPACE_DATA_DIRECTORY: join(root, '.nx/workspace-data'),
-            NX_CACHE_DIRECTORY: join(root, '.nx/cache'),
           },
           stdout: 'pipe',
           stderr: 'pipe',
@@ -2350,7 +2339,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       const order = (await readFile(join(root, 'deploy-order.txt'), 'utf8')).trim().split('\n');
       expect(order).toEqual(['c', 'b', 'a']);
     } finally {
-      await workspace.cleanup();
+      await cleanupNxWorkspace(workspace);
     }
   }, 120_000);
 
@@ -2441,7 +2430,9 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
 });
 
 async function createWorkspace(): Promise<WorkspaceFixture> {
-  const root = await mkdtemp(join(tmpdir(), 'smoothbricks-nx-plugin-'));
+  // Canonical, because macOS puts the temp directory behind a /private symlink
+  // and a daemon never sees an edit made under a root named through one.
+  const root = await realpath(await mkdtemp(join(tmpdir(), 'smoothbricks-nx-plugin-')));
 
   return {
     context: {
@@ -2457,6 +2448,27 @@ async function createWorkspace(): Promise<WorkspaceFixture> {
       await rm(root, { recursive: true, force: true });
     },
   };
+}
+
+/**
+ * A workspace that runs real Nx. It gets its own Git boundary, as every other
+ * fixture here that runs Nx does: a daemon's ignore-aware watcher drops all of
+ * a fixture's edits when an enclosing checkout ignores the temp directory.
+ */
+async function createNxWorkspace(): Promise<WorkspaceFixture> {
+  const workspace = await createWorkspace();
+  const initialized = Bun.spawnSync(['git', 'init', '--quiet', workspace.context.workspaceRoot]);
+  expect(initialized.exitCode).toBe(0);
+  return workspace;
+}
+
+/** Release the fixture's own Nx daemon through Nx before its root is deleted. */
+async function cleanupNxWorkspace(workspace: WorkspaceFixture): Promise<void> {
+  try {
+    await stopFixtureNxDaemon(workspace.context.workspaceRoot);
+  } finally {
+    await workspace.cleanup();
+  }
 }
 
 interface WorkspaceFixture {

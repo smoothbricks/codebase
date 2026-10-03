@@ -1,4 +1,5 @@
-import { mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
+import { mkdir, mkdtemp, realpath, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { $ } from 'bun';
@@ -6,6 +7,7 @@ import { decode, printCommandOutput } from '../../../lib/run.js';
 import type { GitReleaseTagInfo } from '../../core.js';
 
 const GIT_TIMEOUT_MS = 10_000;
+const NX_DAEMON_STOP_TIMEOUT_MS = 10_000;
 
 // Isolate fixture git from the runner environment and skip fsync. These are
 // throwaway temp repos (deleted in withFixtureRepo's finally) so durability is
@@ -26,14 +28,20 @@ const GIT_FIXTURE_ENV: Record<string, string> = {
 };
 
 export async function withFixtureRepo(fn: (root: string) => Promise<void>): Promise<void> {
-  const root = await mkdtemp(join(tmpdir(), 'smoo-release-test-'));
+  // Canonical, because macOS puts the temp directory behind a /private symlink
+  // and a daemon never sees an edit made under a root named through one.
+  const root = await realpath(await mkdtemp(join(tmpdir(), 'smoo-release-test-')));
   try {
     await git(root, ['init', '-b', 'main']);
     await git(root, ['config', 'user.name', 'Test User']);
     await git(root, ['config', 'user.email', 'test@example.com']);
     await fn(root);
   } finally {
-    await rm(root, { recursive: true, force: true });
+    try {
+      await stopFixtureNxDaemon(root);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   }
 }
 
@@ -149,25 +157,62 @@ async function streamBytes(stream: ReadableStream<Uint8Array>): Promise<Uint8Arr
   return new Uint8Array(await new Response(stream).arrayBuffer());
 }
 
-export async function runFixtureNx(root: string, args: string[]): Promise<void> {
-  // Nested Nx must own both its workspace root and its graph/cache paths.
-  // Inheriting the outer task's locations can select or overwrite another workspace.
-  const result = await $`nx ${args}`
+/**
+ * `nx` against a fixture root, owning its own workspace root, graph, cache and
+ * daemon. Nx's own defaults decide whether a daemon runs: an inherited
+ * `NX_DAEMON`, and the socket directory of whichever workspace launched this
+ * process, never reach the fixture. Inheriting the outer task's locations
+ * could select or overwrite another workspace.
+ */
+function runNxInFixture(root: string, args: string[]) {
+  const env = definedProcessEnv();
+  delete env.NX_DAEMON;
+  delete env.NX_SOCKET_DIR;
+  delete env.NX_DAEMON_SOCKET_DIR;
+  return $`nx ${args}`
     .cwd(root)
     .env({
-      ...definedProcessEnv(),
-      NX_DAEMON: 'false',
+      ...env,
       NX_WORKSPACE_ROOT_PATH: root,
       NX_CACHE_DIRECTORY: join(root, '.nx', 'cache'),
       NX_WORKSPACE_DATA_DIRECTORY: join(root, '.nx', 'workspace-data'),
     })
     .quiet()
     .nothrow();
+}
+
+export async function runFixtureNx(root: string, args: string[]): Promise<void> {
+  const result = await runNxInFixture(root, args);
   if (result.exitCode !== 0) {
     const stdout = decode(result.stdout);
     const stderr = decode(result.stderr);
     printCommandOutput(stdout, stderr);
     throw new Error(`nx ${args.join(' ')} failed with exit code ${result.exitCode}\n${stdout}\n${stderr}`);
+  }
+}
+
+/**
+ * Release the Nx daemon a fixture root started, through `nx daemon --stop`,
+ * before the root is deleted. Nx records a started daemon in
+ * `d/server-process.json` under the root's workspace-data directory, so a root
+ * without that record never had one. The record goes when the daemon has shut
+ * down; one that outlives the stop is reported, not buried by the delete.
+ */
+export async function stopFixtureNxDaemon(root: string): Promise<void> {
+  const record = join(root, '.nx', 'workspace-data', 'd', 'server-process.json');
+  if (!existsSync(record)) {
+    return;
+  }
+  const result = await runNxInFixture(root, ['daemon', '--stop']);
+  if (result.exitCode !== 0) {
+    throw new Error(`nx daemon --stop failed in ${root} with exit code ${result.exitCode}\n${decode(result.stderr)}`);
+  }
+  const deadline = Date.now() + NX_DAEMON_STOP_TIMEOUT_MS;
+  while (existsSync(record)) {
+    if (Date.now() > deadline) {
+      throw new Error(`Nx daemon of ${root} still recorded ${NX_DAEMON_STOP_TIMEOUT_MS}ms after nx daemon --stop`);
+    }
+    await Bun.sleep(50);
   }
 }
 

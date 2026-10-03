@@ -1428,6 +1428,10 @@ pub(super) async fn sandbox_environment(
         nx_state.join("workspace-data").as_os_str(),
     );
     own("NX_CACHE_DIRECTORY", nx_state.join("cache").as_os_str());
+    own(
+        "NX_WORKSPACE_ROOT_PATH",
+        sandbox.workspace_mount.as_os_str(),
+    );
     withheld.push("NX_DAEMON");
     own(GO_ENV, private_cache.join("go/env").as_os_str());
     // Rust routes through sccache in every workspace of a host that pinned one. Cargo's

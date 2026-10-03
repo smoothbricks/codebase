@@ -2,7 +2,8 @@ import { createHash, type Hash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { join, posix } from 'node:path';
 
-import { globWithWorkspaceContext } from 'nx/src/utils/workspace-context.js';
+import { globWithWorkspaceContext, globWithWorkspaceContextSync } from 'nx/src/utils/workspace-context.js';
+import { workspaceRoot as daemonWorkspaceRoot } from 'nx/src/utils/workspace-root.js';
 
 /**
  * A release rewrites `version` in every manifest it publishes. Those manifests
@@ -180,7 +181,11 @@ export async function hashVersionlessCrateManifests(projectRoot: string, workspa
  */
 async function listCrateManifests(projectRoot: string, workspaceRoot: string): Promise<string[]> {
   const prefix = projectRoot === '.' ? '' : `${posix.normalize(projectRoot)}/`;
-  const files = await globWithWorkspaceContext(workspaceRoot, [`${prefix}**/${CARGO_MANIFEST}`]);
+  const pattern = [`${prefix}**/${CARGO_MANIFEST}`];
+  const files =
+    workspaceRoot === daemonWorkspaceRoot
+      ? await globWithWorkspaceContext(workspaceRoot, pattern)
+      : globWithWorkspaceContextSync(workspaceRoot, pattern);
   return files.map((file) => file.slice(prefix.length)).sort();
 }
 

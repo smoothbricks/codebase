@@ -1,6 +1,5 @@
 [test]
 preload = [
-  "./src/__tests__/in-process-nx-index.ts",
   "@smoothbricks/validation/bun/preload",
   "@smoothbricks/lmao/bun/trace-preload",
 ]

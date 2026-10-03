@@ -137,7 +137,7 @@ export async function withPackWorkspace(
     for (const tag of options.stableTags ?? []) {
       await git(root, ['tag', tag]);
     }
-    await withFixtureNxEnv(() => fn(root));
+    await fn(root);
   });
 }
 
@@ -226,24 +226,4 @@ export async function packedManifestJson(tarball: string): Promise<string> {
     throw new Error(`unable to read package.json from ${tarball}: ${result.stderr.toString()}`);
   }
   return result.stdout.toString();
-}
-
-/**
- * The bun-test preload (`src/bun/isolate-nx-env.ts`) already deletes
- * NX_CACHE_DIRECTORY/NX_WORKSPACE_DATA_DIRECTORY, so a fixture Nx keeps its
- * state under its own root. What remains is the daemon: a background daemon
- * started for a workspace that is about to be deleted outlives the test.
- */
-export async function withFixtureNxEnv(fn: () => Promise<void>): Promise<void> {
-  const previous = process.env.NX_DAEMON;
-  process.env.NX_DAEMON = 'false';
-  try {
-    await fn();
-  } finally {
-    if (previous === undefined) {
-      delete process.env.NX_DAEMON;
-    } else {
-      process.env.NX_DAEMON = previous;
-    }
-  }
 }

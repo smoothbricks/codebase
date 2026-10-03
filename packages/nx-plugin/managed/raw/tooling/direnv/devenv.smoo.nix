@@ -420,6 +420,7 @@ in {
       # workspace"), which reads as a hung Nx in a workspace that did nothing
       # wrong. Nx's own diagnostic names this exact cause.
       nx_workspace_root="$(cd "$DEVENV_ROOT/../.." >/dev/null 2>&1 && pwd || printf '%s' "$PWD")"
+      export NX_WORKSPACE_ROOT_PATH="$nx_workspace_root"
       export NX_SOCKET_DIR="$DEVENV_RUNTIME/nx-$(printf '%s' "$nx_workspace_root" | cksum | cut -d' ' -f1)"
       mkdir -p "$NX_SOCKET_DIR"
       ${lib.optionalString pkgs.stdenv.isDarwin ''

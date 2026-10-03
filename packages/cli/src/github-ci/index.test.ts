@@ -1,10 +1,11 @@
 import { describe, expect, it } from 'bun:test';
-import { chmod, mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, realpath, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { $ } from 'bun';
 import { decode } from '../lib/run.js';
 import type { ProjectTargets } from '../nx/index.js';
+import { stopFixtureNxDaemon } from '../release/__tests__/helpers/fixture-repo.js';
 import {
   expandNxTargetDependencyRuns,
   expandNxTargetRuns,
@@ -802,7 +803,9 @@ async function withOutputFixture(
 async function withNxRunManyFixture(
   run: (fixture: { root: string; artifact: string }) => Promise<void>,
 ): Promise<void> {
-  const temp = await mkdtemp(join(tmpdir(), 'smoo-empty-platform-output-'));
+  // Canonical, because a daemon never sees an edit made under a root named
+  // through macOS's /private temp symlink.
+  const temp = await realpath(await mkdtemp(join(tmpdir(), 'smoo-empty-platform-output-')));
   const root = join(temp, 'repo');
   const artifact = join(temp, 'artifact');
   try {
@@ -838,7 +841,11 @@ async function withNxRunManyFixture(
 
     await run({ root, artifact });
   } finally {
-    await rm(temp, { recursive: true, force: true });
+    try {
+      await stopFixtureNxDaemon(root);
+    } finally {
+      await rm(temp, { recursive: true, force: true });
+    }
   }
 }
 

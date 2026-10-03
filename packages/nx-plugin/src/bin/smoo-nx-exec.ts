@@ -1,9 +1,8 @@
 #!/usr/bin/env node
-import { existsSync } from 'node:fs';
-import { dirname, isAbsolute, join, resolve } from 'node:path';
+import { isAbsolute, resolve } from 'node:path';
 import { inspect } from 'node:util';
 
-import { describeMiss, ensureBuilt, parseTargetSelector } from '../ensure-built.js';
+import { describeMiss, ensureBuilt, findNxWorkspaceRoot, parseTargetSelector } from '../ensure-built.js';
 
 const USAGE = 'usage: smoo-nx-exec <project:target[:configuration]> [--workspace-root <dir>] [-- <binary> [args...]]';
 
@@ -43,17 +42,7 @@ function tokenize(args: readonly string[]): string[] {
 }
 
 function findWorkspaceRoot(from: string): string {
-  let directory = from;
-  for (;;) {
-    if (existsSync(join(directory, 'nx.json'))) {
-      return directory;
-    }
-    const parent = dirname(directory);
-    if (parent === directory) {
-      return usageError(`no nx.json at or above ${from}; pass --workspace-root`);
-    }
-    directory = parent;
-  }
+  return findNxWorkspaceRoot(from) ?? usageError(`no nx.json at or above ${from}; pass --workspace-root`);
 }
 
 const argv = process.argv.slice(2);

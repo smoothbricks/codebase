@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 
 import { resetWorkspaceContext } from 'nx/src/utils/workspace-context.js';
-import { fixtureNxEnv } from './__tests__/fixture-nx-env.js';
+import { fixtureNxEnv, stopFixtureNxDaemon } from './__tests__/fixture-nx-env.js';
 import { CARGO_CLOSURE_INPUT } from './cargo-closure-input.js';
 import { createNodesV2 } from './index.js';
 
@@ -110,6 +110,15 @@ await appendFile(${JSON.stringify(executions)}, result);
   return { workspace, compile, edit, log };
 }
 
+/** Release the fixture's own Nx daemon through Nx, then delete the whole fixture root. */
+async function removeFixture(root: string): Promise<void> {
+  try {
+    await stopFixtureNxDaemon(join(root, 'workspace'));
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+}
+
 it('keys a custom target on exactly its Cargo closure, inside the workspace and out', async () => {
   const root = await realpath(await mkdtemp(join(tmpdir(), 'cargo-closure-')));
   try {
@@ -134,7 +143,7 @@ it('keys a custom target on exactly its Cargo closure, inside the workspace and 
     await compile();
     expect(await log()).toBe('11\n12\n22\n');
   } finally {
-    await rm(root, { recursive: true, force: true });
+    await removeFixture(root);
   }
 }, 120_000);
 
@@ -148,7 +157,7 @@ it('hashes a closure member in an ignored directory, which no fileset can see', 
     await compile();
     expect(await log()).toBe('11\n12\n');
   } finally {
-    await rm(root, { recursive: true, force: true });
+    await removeFixture(root);
   }
 }, 120_000);
 

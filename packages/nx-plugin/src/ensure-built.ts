@@ -1,9 +1,9 @@
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import type { BigIntStats } from 'node:fs';
-import { closeSync, existsSync, lstatSync, openSync, readdirSync, readlinkSync, readSync } from 'node:fs';
+import { closeSync, existsSync, lstatSync, openSync, readdirSync, readlinkSync, readSync, realpathSync } from 'node:fs';
 import { createRequire } from 'node:module';
-import { isAbsolute, join, resolve } from 'node:path';
+import { dirname, isAbsolute, join, resolve } from 'node:path';
 
 import type * as NxConfiguration from 'nx/src/config/nx-json';
 import type { NxJsonConfiguration } from 'nx/src/config/nx-json';
@@ -239,13 +239,22 @@ export async function ensureBuilt(options: EnsureBuiltOptions): Promise<EnsureBu
   const workspaceRoot = resolve(options.cwd);
   const callerCwd = process.cwd();
   const callerEnv = { ...process.env };
+  // Whether the environment this process was launched with belongs to the
+  // workspace asked for, decided before the chdir and the rebinding below. The
+  // caller's workspace is the one its own Nx would bind: `NX_WORKSPACE_ROOT_PATH`
+  // when set, else the nearest `nx.json` above where it stands (none, when it
+  // stands in no workspace).
+  const callerRoot = callerEnv.NX_WORKSPACE_ROOT_PATH
+    ? resolve(callerCwd, callerEnv.NX_WORKSPACE_ROOT_PATH)
+    : findNxWorkspaceRoot(callerCwd);
+  const callerOwnsRoot = callerRoot !== null && isSameDirectory(callerRoot, workspaceRoot);
   try {
     // `cd <root> && nx run ...` is the invocation whose hashes are in the
     // cache. Everything below — plugin hooks, `runtime` inputs, and the hasher,
     // which keys against `process.cwd()` — has to see the same directory or the
     // probe keys differently from the CLI and never hits.
     process.chdir(workspaceRoot);
-    return await ensureBuiltInWorkspace(workspaceRoot, selector, options.onMiss ?? 'stream');
+    return await ensureBuiltInWorkspace(workspaceRoot, selector, options.onMiss ?? 'stream', callerOwnsRoot);
   } finally {
     // Nx configures itself through the environment and this function runs
     // in-process, so without this the caller — and anything it goes on to exec
@@ -266,11 +275,79 @@ export async function ensureBuilt(options: EnsureBuiltOptions): Promise<EnsureBu
   }
 }
 
+/**
+ * Nx's own overrides for where one workspace keeps its daemon socket, daemon
+ * record, task database and cache. Each names the state of a single
+ * workspace, and Nx takes it literally: a daemon spawned for another root
+ * with `NX_SOCKET_DIR` inherited listens on, and on stop deletes, the socket
+ * directory of the workspace that exported it; with
+ * `NX_WORKSPACE_DATA_DIRECTORY` it reads and overwrites that workspace's
+ * daemon record and task database; and the cache has to move with the
+ * database or a hit names artifacts the run never wrote.
+ */
+const WORKSPACE_STATE_ENV_KEYS = [
+  'NX_SOCKET_DIR',
+  'NX_DAEMON_SOCKET_DIR',
+  'NX_WORKSPACE_DATA_DIRECTORY',
+  'NX_CACHE_DIRECTORY',
+] as const;
+
+/**
+ * The nearest directory at or above `from` holding an `nx.json`, or null.
+ * The marker this wrapper roots a workspace at when `--workspace-root` is
+ * not given.
+ */
+export function findNxWorkspaceRoot(from: string): string | null {
+  let directory = from;
+  for (;;) {
+    if (existsSync(join(directory, 'nx.json'))) {
+      return directory;
+    }
+    const parent = dirname(directory);
+    if (parent === directory) {
+      return null;
+    }
+    directory = parent;
+  }
+}
+
+function isSameDirectory(left: string, right: string): boolean {
+  try {
+    return realpathSync(left) === realpathSync(right);
+  } catch {
+    // A path that cannot be resolved cannot be shown to be the same
+    // workspace, and "not the same" is the isolating answer.
+    return false;
+  }
+}
+
+/**
+ * Point every Nx this call starts — the daemon client loaded below and the
+ * `nx` CLI a miss spawns — at `workspaceRoot`, and give it that workspace's
+ * state locations. A caller that was set up for this same root keeps its
+ * overrides: they are the owner's cache and sandbox boundary. A caller set up
+ * for another root, or for none, passes none of them on, so Nx falls back to
+ * the per-root defaults. Nothing is reset or bypassed: the root's own daemon
+ * and cache are used as they stand. `ensureBuilt` restores the caller's
+ * environment when it returns.
+ */
+function isolateWorkspaceEnvironment(workspaceRoot: string, callerOwnsRoot: boolean): void {
+  process.env.NX_WORKSPACE_ROOT_PATH = workspaceRoot;
+  if (callerOwnsRoot) {
+    return;
+  }
+  for (const key of WORKSPACE_STATE_ENV_KEYS) {
+    delete process.env[key];
+  }
+}
+
 async function ensureBuiltInWorkspace(
   workspaceRoot: string,
   selector: TargetSelector,
   onMiss: 'stream',
+  callerOwnsRoot: boolean,
 ): Promise<EnsureBuiltResult> {
+  isolateWorkspaceEnvironment(workspaceRoot, callerOwnsRoot);
   // The environment has precedence over nx.json. Avoid loading Nx at all on
   // this explicit fallback path, which also lets a deliberately minimal
   // checkout-local CLI stand in for Nx.
@@ -388,10 +465,10 @@ function selectorTaskId(selector: TargetSelector): string {
  * a module-level singleton that reads `nx.json` from that root. So the root has
  * to be bound before the first Nx module loads, which is why this module
  * imports Nx dynamically throughout. A static import at the top of the file
- * would bind the caller's launch directory instead.
+ * would bind the caller's launch directory instead. `isolateWorkspaceEnvironment`
+ * has already set `NX_WORKSPACE_ROOT_PATH`; this loads Nx and checks it took.
  */
 function bindWorkspaceRoot(workspaceRoot: string, requireNx: WorkspaceNxRequire): void {
-  process.env.NX_WORKSPACE_ROOT_PATH = workspaceRoot;
   if (process.env.NX_PERF_LOGGING === 'true') {
     // Installs Nx's PerformanceObserver, which reports every `performance
     // .measure` this module and Nx itself record. Loading it unconditionally

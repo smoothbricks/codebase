@@ -432,6 +432,13 @@ It is deliberately not `nx run <target> && exec`:
 Pass `--workspace-root <dir>` before `--` when invoking the wrapper outside the workspace. The binary path resolves
 against the caller's current directory.
 
+Nx state belongs to one workspace. The wrapper's own Nx is the one `NX_WORKSPACE_ROOT_PATH` names, else the nearest
+`nx.json` above the current directory. When that is not the requested root, `NX_SOCKET_DIR`, `NX_DAEMON_SOCKET_DIR`,
+`NX_WORKSPACE_DATA_DIRECTORY` and `NX_CACHE_DIRECTORY` are not passed on, so the root's daemon, task database and cache
+stay its own instead of landing on the socket and database of the workspace that exported them. The managed shell and
+Cowshed supervisor publish `NX_WORKSPACE_ROOT_PATH` beside those overrides, so a child entering a scratch root still
+knows which workspace owns its inherited state. Without a managed owner, the wrapper derives the root from cwd.
+
 Without `--` and a binary, the wrapper only makes the target current and exits 0, or with the failed run's status:
 
 ```bash
