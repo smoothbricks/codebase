@@ -164,12 +164,12 @@ async function streamBytes(stream: ReadableStream<Uint8Array>): Promise<Uint8Arr
  * process, never reach the fixture. Inheriting the outer task's locations
  * could select or overwrite another workspace.
  */
-function runNxInFixture(root: string, args: string[]) {
+export async function runFixtureNx(root: string, args: string[]): Promise<void> {
   const env = definedProcessEnv();
   delete env.NX_DAEMON;
   delete env.NX_SOCKET_DIR;
   delete env.NX_DAEMON_SOCKET_DIR;
-  return $`nx ${args}`
+  const result = await $`nx ${args}`
     .cwd(root)
     .env({
       ...env,
@@ -179,10 +179,6 @@ function runNxInFixture(root: string, args: string[]) {
     })
     .quiet()
     .nothrow();
-}
-
-export async function runFixtureNx(root: string, args: string[]): Promise<void> {
-  const result = await runNxInFixture(root, args);
   if (result.exitCode !== 0) {
     const stdout = decode(result.stdout);
     const stderr = decode(result.stderr);
@@ -203,10 +199,7 @@ export async function stopFixtureNxDaemon(root: string): Promise<void> {
   if (!existsSync(record)) {
     return;
   }
-  const result = await runNxInFixture(root, ['daemon', '--stop']);
-  if (result.exitCode !== 0) {
-    throw new Error(`nx daemon --stop failed in ${root} with exit code ${result.exitCode}\n${decode(result.stderr)}`);
-  }
+  await runFixtureNx(root, ['daemon', '--stop']);
   const deadline = Date.now() + NX_DAEMON_STOP_TIMEOUT_MS;
   while (existsSync(record)) {
     if (Date.now() > deadline) {

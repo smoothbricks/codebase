@@ -19,6 +19,7 @@ import {
   gitSucceeds,
   packageVersionAtRef,
   runFixtureNx,
+  stopFixtureNxDaemon,
   tag,
   withFixtureRepo,
   writeBuildablePackage,
@@ -193,48 +194,56 @@ describe('release planning with fixture git repositories', () => {
       await git(author, ['push', 'origin', 'main', '--tags']);
       await git(author, ['clone', '--branch', 'main', join(author, 'remote.git'), 'runner']);
       const runner = join(author, 'runner');
-      await git(runner, ['config', 'user.name', 'Test User']);
-      await git(runner, ['config', 'user.email', 'test@example.com']);
-      await git(runner, ['fetch', '--tags', 'origin', 'main']);
-      const restoreRef = 'origin/main';
-      const packages = releaseFixturePackages();
-      const npmPublished = new Set(['@scope/a@1.0.0', '@scope/b@1.0.0', '@scope/a@1.1.0']);
-      const githubReleases = new Set(['a@1.0.0', 'b@1.0.0']);
+      try {
+        await git(runner, ['config', 'user.name', 'Test User']);
+        await git(runner, ['config', 'user.email', 'test@example.com']);
+        await git(runner, ['fetch', '--tags', 'origin', 'main']);
+        const restoreRef = 'origin/main';
+        const packages = releaseFixturePackages();
+        const npmPublished = new Set(['@scope/a@1.0.0', '@scope/b@1.0.0', '@scope/a@1.1.0']);
+        const githubReleases = new Set(['a@1.0.0', 'b@1.0.0']);
 
-      const records = await collectOwnedReleaseTagRecords(packages, restoreRef, {
-        listReleaseTagsByCreatorDate: () => gitReleaseTagsByCreatorDate(runner),
-        isAncestor: (ancestor, descendant) => gitIsAncestor(runner, ancestor, descendant),
-        packageVersionAtRef: (packagePath, ref) => packageVersionAtRef(runner, packagePath, ref),
-        durableTagState: async (pkg, tagName) => ({
-          npmPublished: npmPublished.has(`${pkg.name}@${pkg.version}`),
-          githubReleaseExists: githubReleases.has(tagName),
-        }),
-      });
-      const pending = pendingReleaseTargets(records, headSha);
+        const records = await collectOwnedReleaseTagRecords(packages, restoreRef, {
+          listReleaseTagsByCreatorDate: () => gitReleaseTagsByCreatorDate(runner),
+          isAncestor: (ancestor, descendant) => gitIsAncestor(runner, ancestor, descendant),
+          packageVersionAtRef: (packagePath, ref) => packageVersionAtRef(runner, packagePath, ref),
+          durableTagState: async (pkg, tagName) => ({
+            npmPublished: npmPublished.has(`${pkg.name}@${pkg.version}`),
+            githubReleaseExists: githubReleases.has(tagName),
+          }),
+        });
+        const pending = pendingReleaseTargets(records, headSha);
 
-      expect(pending.map((target) => target.sha)).toEqual([githubOnlySha, npmAndGithubSha]);
-      expect(pending[0]?.npmPackages).toEqual([]);
-      expect(pending[0]?.githubPackages.map((pkg) => `${pkg.name}@${pkg.version}`)).toEqual(['@scope/a@1.1.0']);
-      expect(pending[1]?.npmPackages.map((pkg) => `${pkg.name}@${pkg.version}`)).toEqual(['@scope/b@2.0.0-beta.1']);
-      expect(pending[1]?.githubPackages.map((pkg) => `${pkg.name}@${pkg.version}`)).toEqual(['@scope/b@2.0.0-beta.1']);
+        expect(pending.map((target) => target.sha)).toEqual([githubOnlySha, npmAndGithubSha]);
+        expect(pending[0]?.npmPackages).toEqual([]);
+        expect(pending[0]?.githubPackages.map((pkg) => `${pkg.name}@${pkg.version}`)).toEqual(['@scope/a@1.1.0']);
+        expect(pending[1]?.npmPackages.map((pkg) => `${pkg.name}@${pkg.version}`)).toEqual(['@scope/b@2.0.0-beta.1']);
+        expect(pending[1]?.githubPackages.map((pkg) => `${pkg.name}@${pkg.version}`)).toEqual([
+          '@scope/b@2.0.0-beta.1',
+        ]);
 
-      const shell = new LocalGitRepairShell(runner);
-      const summaries = await repairPendingTargets(shell, pending, restoreRef, false);
+        const shell = new LocalGitRepairShell(runner);
+        const summaries = await repairPendingTargets(shell, pending, restoreRef, false);
 
-      expect(shell.checkouts).toEqual([githubOnlySha, npmAndGithubSha, restoreRef]);
-      expect(shell.devenvLoads).toBe(3);
-      expect(shell.devenvRefs).toEqual([githubOnlySha, npmAndGithubSha, headSha]);
-      await expect(readFile(join(runner, '.generated-tool-ref'), 'utf8')).resolves.toBe(`${headSha}\n`);
-      expect(shell.builds).toEqual([['@scope/b']]);
-      expect(shell.publishes).toEqual([{ name: '@scope/b', version: '2.0.0-beta.1', distTag: 'next', dryRun: false }]);
-      expect(shell.githubCreates).toEqual([
-        { name: '@scope/a', version: '1.1.0', dryRun: false },
-        { name: '@scope/b', version: '2.0.0-beta.1', dryRun: false },
-      ]);
-      expect(shell.pushes).toEqual([['a@1.1.0'], ['b@2.0.0-beta.1']]);
-      expect(summaries.map((summary) => summary.sha)).toEqual([githubOnlySha, npmAndGithubSha]);
-      await expect(readFile(join(runner, 'packages/b/dist/index.js'), 'utf8')).resolves.toBe('{}\n');
-      await expect(readFile(join(runner, 'packages/a/dist/index.js'), 'utf8')).rejects.toThrow();
+        expect(shell.checkouts).toEqual([githubOnlySha, npmAndGithubSha, restoreRef]);
+        expect(shell.devenvLoads).toBe(3);
+        expect(shell.devenvRefs).toEqual([githubOnlySha, npmAndGithubSha, headSha]);
+        await expect(readFile(join(runner, '.generated-tool-ref'), 'utf8')).resolves.toBe(`${headSha}\n`);
+        expect(shell.builds).toEqual([['@scope/b']]);
+        expect(shell.publishes).toEqual([
+          { name: '@scope/b', version: '2.0.0-beta.1', distTag: 'next', dryRun: false },
+        ]);
+        expect(shell.githubCreates).toEqual([
+          { name: '@scope/a', version: '1.1.0', dryRun: false },
+          { name: '@scope/b', version: '2.0.0-beta.1', dryRun: false },
+        ]);
+        expect(shell.pushes).toEqual([['a@1.1.0'], ['b@2.0.0-beta.1']]);
+        expect(summaries.map((summary) => summary.sha)).toEqual([githubOnlySha, npmAndGithubSha]);
+        await expect(readFile(join(runner, 'packages/b/dist/index.js'), 'utf8')).resolves.toBe('{}\n');
+        await expect(readFile(join(runner, 'packages/a/dist/index.js'), 'utf8')).rejects.toThrow();
+      } finally {
+        await stopFixtureNxDaemon(runner);
+      }
     });
   });
 
@@ -293,35 +302,39 @@ describe('release planning with fixture git repositories', () => {
       await git(author, ['push', 'origin', 'main', '--tags']);
       await git(author, ['clone', '--branch', 'main', join(author, 'remote.git'), 'runner']);
       const runner = join(author, 'runner');
-      await git(runner, ['config', 'user.name', 'Test User']);
-      await git(runner, ['config', 'user.email', 'test@example.com']);
-      await git(runner, ['fetch', '--tags', 'origin', 'main']);
+      try {
+        await git(runner, ['config', 'user.name', 'Test User']);
+        await git(runner, ['config', 'user.email', 'test@example.com']);
+        await git(runner, ['fetch', '--tags', 'origin', 'main']);
 
-      const pkg: ReleasePackageInfo = {
-        name: '@scope/cli',
-        projectName: 'cli',
-        path: 'packages/cli',
-        version: '0.0.0',
-      };
-      const records = await collectOwnedReleaseTagRecords([pkg], 'origin/main', {
-        listReleaseTagsByCreatorDate: () => gitReleaseTagsByCreatorDate(runner),
-        isAncestor: (ancestor, descendant) => gitIsAncestor(runner, ancestor, descendant),
-        packageVersionAtRef: (packagePath, ref) => packageVersionAtRef(runner, packagePath, ref),
-        durableTagState: async () => ({ npmPublished: false, githubReleaseExists: false }),
-      });
-      const pending = pendingReleaseTargets(records, 'not-head');
+        const pkg: ReleasePackageInfo = {
+          name: '@scope/cli',
+          projectName: 'cli',
+          path: 'packages/cli',
+          version: '0.0.0',
+        };
+        const records = await collectOwnedReleaseTagRecords([pkg], 'origin/main', {
+          listReleaseTagsByCreatorDate: () => gitReleaseTagsByCreatorDate(runner),
+          isAncestor: (ancestor, descendant) => gitIsAncestor(runner, ancestor, descendant),
+          packageVersionAtRef: (packagePath, ref) => packageVersionAtRef(runner, packagePath, ref),
+          durableTagState: async () => ({ npmPublished: false, githubReleaseExists: false }),
+        });
+        const pending = pendingReleaseTargets(records, 'not-head');
 
-      const shell = new LocalGitRepairShell(runner);
-      const summaries = await repairPendingTargets(shell, pending, 'origin/main', false);
+        const shell = new LocalGitRepairShell(runner);
+        const summaries = await repairPendingTargets(shell, pending, 'origin/main', false);
 
-      expect(records.map((record) => record.tag)).toEqual(['cli@0.2.0']);
-      expect(pending.map((target) => target.sha)).toEqual([releaseSha]);
-      expect(shell.pushes).toEqual([['cli@0.2.0']]);
-      expect(shell.publishes).toEqual([{ name: '@scope/cli', version: '0.2.0', distTag: 'latest', dryRun: false }]);
-      expect(shell.githubCreates).toEqual([{ name: '@scope/cli', version: '0.2.0', dryRun: false }]);
-      expect(summaries[0]?.packages.map((releasePackage) => releasePackage.name)).toEqual(['@scope/cli']);
-      await expect(gitSucceeds(runner, ['rev-parse', '--verify', 'refs/tags/cli@0.2.0'])).resolves.toBe(true);
-      await expect(gitSucceeds(runner, ['rev-parse', '--verify', 'refs/tags/@scope/cli@0.2.0'])).resolves.toBe(false);
+        expect(records.map((record) => record.tag)).toEqual(['cli@0.2.0']);
+        expect(pending.map((target) => target.sha)).toEqual([releaseSha]);
+        expect(shell.pushes).toEqual([['cli@0.2.0']]);
+        expect(shell.publishes).toEqual([{ name: '@scope/cli', version: '0.2.0', distTag: 'latest', dryRun: false }]);
+        expect(shell.githubCreates).toEqual([{ name: '@scope/cli', version: '0.2.0', dryRun: false }]);
+        expect(summaries[0]?.packages.map((releasePackage) => releasePackage.name)).toEqual(['@scope/cli']);
+        await expect(gitSucceeds(runner, ['rev-parse', '--verify', 'refs/tags/cli@0.2.0'])).resolves.toBe(true);
+        await expect(gitSucceeds(runner, ['rev-parse', '--verify', 'refs/tags/@scope/cli@0.2.0'])).resolves.toBe(false);
+      } finally {
+        await stopFixtureNxDaemon(runner);
+      }
     });
   });
 
