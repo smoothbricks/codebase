@@ -13338,9 +13338,11 @@ mod unresolved_retirement_tests {
 
     #[tokio::test]
     async fn destructive_changes_retain_a_leaderless_writer_until_it_releases_naturally() {
-        let root = std::env::temp_dir().join(format!(
-            "cowshed-unresolved-retirement-{}",
-            std::process::id()
+        // Unix socket addresses need their own short namespace, independent of the host's
+        // potentially long TMPDIR. The owned fixture still carries its ledger and real writer.
+        let root = PathBuf::from("/tmp").join(format!(
+            "cowshed-unresolved-{}",
+            &uuid::Uuid::new_v4().simple().to_string()[..12]
         ));
         std::fs::create_dir(&root).unwrap();
         let ledger = root.join("supervisor.groups");

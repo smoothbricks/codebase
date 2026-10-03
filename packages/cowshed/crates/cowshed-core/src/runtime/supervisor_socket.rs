@@ -2130,13 +2130,20 @@ mod socket_ownership_tests {
             unsafe { libc::fcntl(listener.as_raw_fd(), libc::F_SETFD, 0) },
             0
         );
-        // `cat` from PATH: NixOS keeps nothing but `sh` and `env` in /bin and /usr/bin.
-        std::process::Command::new("cat")
-            .stdin(std::process::Stdio::inherit())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .unwrap();
+        // The intermediary is waited by its parent; its background cat inherits the listener
+        // and explicit stdin, then remains alive after the creator exits, until stdin ends.
+        assert!(
+            std::process::Command::new("/bin/sh")
+                .args(["-c", "cat <&0 & exit 0"])
+                .stdin(std::process::Stdio::inherit())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap()
+                .wait()
+                .unwrap()
+                .success()
+        );
     }
 
     /// A listener stays live while any process holds it, whatever became of the process that
