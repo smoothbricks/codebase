@@ -1008,11 +1008,42 @@ pub async fn acknowledge_commitments(path: &Path, through: u64) -> Result<()> {
     .map(|_| ())
 }
 
+/// The supervisor a drain reached: the process the connection's peer credential names, which is
+/// the identity any later signal to it must go through -- whatever happens to its pid, the handle
+/// names only that process.
+pub struct Drained {
+    pub process: super::job_groups::Process,
+}
+
+impl Drained {
+    pub fn pid(&self) -> u32 {
+        self.process.pid().unsigned_abs()
+    }
+}
+
 /// Ask the supervisor at `path` to admit nothing more and retire once its running jobs end,
-/// whatever protocol it speaks otherwise; the pid serving it.
-pub async fn drain(path: &Path) -> Result<u32> {
-    let (value, _) = exchange(path, &Request::Drain, Bytes::new()).await?;
-    decode(value)
+/// whatever protocol it speaks otherwise; the process serving it.
+pub async fn drain(path: &Path) -> Result<Drained> {
+    let mut stream = UnixStream::connect(path)
+        .await
+        .map_err(|error| unavailable(path, &error))?;
+    let process = super::job_groups::Process::of_socket_peer(&stream).map_err(|error| {
+        protocol_error(format!(
+            "cannot identify the supervisor at {}: {error}",
+            path.display()
+        ))
+    })?;
+    let (value, _) = exchange_on(&mut stream, path, &Request::Drain, Bytes::new()).await?;
+    let answered: u32 = decode(value)?;
+    if i32::try_from(answered).ok() != Some(process.pid()) {
+        return Err(protocol_error(format!(
+            "the supervisor at {} answered as pid {answered}, but the process serving the \
+             connection is pid {}",
+            path.display(),
+            process.pid()
+        )));
+    }
+    Ok(Drained { process })
 }
 
 /// Ask the supervisor at `path` to serve under its workspace's current grants; the authority
@@ -1057,12 +1088,21 @@ async fn exchange(
     let mut stream = UnixStream::connect(path)
         .await
         .map_err(|error| unavailable(path, &error))?;
-    write_json(&mut stream, request).await?;
+    exchange_on(&mut stream, path, request, payload).await
+}
+
+async fn exchange_on(
+    stream: &mut UnixStream,
+    path: &Path,
+    request: &Request,
+    payload: Bytes,
+) -> Result<(serde_json::Value, Bytes)> {
+    write_json(stream, request).await?;
     if !payload.is_empty() {
-        write_frame(&mut stream, &payload, MAX_BYTES_FRAME).await?;
+        write_frame(stream, &payload, MAX_BYTES_FRAME).await?;
     }
-    match read_json::<Response>(&mut stream).await {
-        Ok(Response::Ok { value, bytes }) => Ok((value, read_bytes(&mut stream, bytes).await?)),
+    match read_json::<Response>(stream).await {
+        Ok(Response::Ok { value, bytes }) => Ok((value, read_bytes(stream, bytes).await?)),
         Ok(Response::Err(error)) => Err(error),
         // The supervisor went away mid-call: the call's outcome is unknown, which is what
         // "unavailable" says; the caller re-reads job state rather than assuming either way.

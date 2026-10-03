@@ -12,10 +12,11 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use cowshed_core::api::{ScriptCommand, ScriptValue};
+use cowshed_core::runtime::job_groups::Birth;
 use cowshed_core::runtime::shell_host::{
     BINDING_ARRAY, BINDING_SCALAR, CONTROL_DESCRIPTOR, FrameReader, FrameWriter, REPLY_EXITED,
     REPLY_HOST_FAILED, REPLY_SCRIPT_SYNTAX, REPLY_STARTED, REQUEST_APPROVE, REQUEST_SCRIPT,
-    read_frame, send_with_descriptors,
+    REQUEST_SIGNAL, read_frame, send_with_descriptors,
 };
 use cowshed_core::script::{Binding, RenderedScript, render};
 
@@ -81,8 +82,22 @@ impl Host {
     }
 
     fn run(&mut self, script: &RenderedScript) -> Ran {
-        run_on(&self.control, &self.directory, script)
+        run_on(&self.control, &self.directory, script, None)
     }
+
+    /// Run `script`, sending the host `signal` for it once it has started.
+    fn run_signalled(&mut self, script: &RenderedScript, signal: i32) -> Ran {
+        run_on(&self.control, &self.directory, script, Some(signal))
+    }
+}
+
+/// Ask the host to signal the command it runs.
+fn send_signal(control: &std::os::unix::net::UnixStream, signal: i32) {
+    let frame = FrameWriter::new(REQUEST_SIGNAL)
+        .i32(signal)
+        .finish()
+        .unwrap();
+    std::io::Write::write_all(&mut &*control, &frame).expect("send the signal");
 }
 
 /// Run a rendered script on a host's control socket; returns the job's raw status and streams.
@@ -90,6 +105,7 @@ fn run_on(
     control: &std::os::unix::net::UnixStream,
     directory: &Path,
     script: &RenderedScript,
+    signal: Option<i32>,
 ) -> Ran {
     {
         let (stdout_read, stdout_write) = pipe();
@@ -145,14 +161,18 @@ fn run_on(
         });
         let (first, _) = read_frame(control).unwrap().expect("a reply");
         let (tag, mut fields) = FrameReader::new(&first).unwrap();
-        let (pid, status) = match tag {
+        let (birth, status) = match tag {
             REPLY_SCRIPT_SYNTAX => (None, None),
             REPLY_STARTED => {
-                let pid = fields.u32().unwrap();
+                let birth = fields.birth().unwrap();
+                fields.finish().unwrap();
+                if let Some(signal) = signal {
+                    send_signal(control, signal);
+                }
                 let (last, _) = read_frame(control).unwrap().expect("an exit");
                 let (tag, mut fields) = FrameReader::new(&last).unwrap();
                 assert_eq!(tag, REPLY_EXITED);
-                (Some(pid), Some(fields.i32().unwrap()))
+                (Some(birth), Some(fields.i32().unwrap()))
             }
             REPLY_HOST_FAILED => panic!(
                 "the host failed: {}",
@@ -162,7 +182,8 @@ fn run_on(
         };
         let [stdout, stderr] = readers.map(|reader| reader.join().expect("stream reader"));
         Ran {
-            pid,
+            pid: birth.as_ref().map(Birth::pid),
+            birth,
             status,
             stdout,
             stderr,
@@ -180,6 +201,8 @@ impl Drop for Host {
 
 struct Ran {
     pid: Option<u32>,
+    /// The job's group leader as the host observed it before reaping it.
+    birth: Option<Birth>,
     /// Raw `waitpid` status; `None` when the script did not parse.
     status: Option<i32>,
     stdout: String,
@@ -279,6 +302,41 @@ fn a_script_has_its_own_streams_and_exact_status() {
     );
 }
 
+/// The host is the job's parent, so it observes the job's group leader before it reaps it and
+/// reports that identity with the start, under the pid the host reports -- even for a job whose
+/// leader exits at once. No later observer could identify the leader once the host has reaped
+/// the job and its pid is free for another process.
+#[test]
+fn the_host_reports_the_leader_it_observed_before_reaping_it() {
+    let mut host = Host::start("birth");
+    for source in ["sleep 0.2", "exit 0"] {
+        let ran = host.run(&text(source));
+        assert_eq!(exited(ran.status), Some(0));
+        let leader = ran
+            .birth
+            .as_ref()
+            .and_then(Birth::leader)
+            .expect("the host identified the job's group leader");
+        assert_eq!(Some(leader.pgid().unsigned_abs()), ran.pid);
+    }
+}
+
+/// A job's signal reaches its command through the host, the command's parent, which applies it
+/// while it still holds the command unreaped. One that arrives after the command ended and was
+/// reaped reaches nothing, and the host goes on to serve the next request.
+#[test]
+fn the_host_signals_its_running_command_and_ignores_a_late_signal() {
+    let mut host = Host::start("signal");
+    let ran = host.run_signalled(&text("sleep 30"), libc::SIGKILL);
+    assert_eq!(signaled(ran.status), Some(libc::SIGKILL));
+    send_signal(&host.control, libc::SIGKILL);
+    let ran = host.run(&text("printf after"));
+    assert_eq!(
+        (exited(ran.status), ran.stdout.as_str()),
+        (Some(0), "after")
+    );
+}
+
 #[test]
 fn a_script_that_does_not_parse_never_runs() {
     let mut host = Host::start("syntax");
@@ -307,7 +365,7 @@ fn killing_a_script_job_group_reaches_its_grandchildren_and_spares_the_host() {
     let directory = host.directory.clone();
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     let runner = std::thread::spawn(move || {
-        let ran = run_on(&control, &directory, &rendered);
+        let ran = run_on(&control, &directory, &rendered, None);
         sender.send((ran.pid, ran.status)).unwrap();
     });
     // Wait until the descendant itself has written its PID. `$!` in the parent

@@ -26,6 +26,7 @@ use std::os::unix::net::UnixStream;
 use std::path::Path;
 
 use brush_builtins::ShellBuilderExt as _;
+use cowshed_core::runtime::job_groups::Birth;
 use cowshed_core::runtime::shell_host::{
     CONTROL_DESCRIPTOR, FrameWriter, REPLY_EXITED, REPLY_SCRIPT_SYNTAX, REPLY_STARTED,
 };
@@ -99,7 +100,7 @@ pub(crate) fn run(
         child(job_descriptors, ready, cwd, variables, program);
     }
     drop((stdin, stdout, stderr, ready_write));
-    // The supervisor signals the job's group the moment it learns the pid, so the group must
+    // A signal for the job reaches its group the moment the start is reported, so the group must
     // exist first. Only the child creates it: two creations of one group race, and macOS
     // refuses the loser with EPERM. The child reports once its group exists; an end of file
     // means it ended before it could.
@@ -121,19 +122,11 @@ pub(crate) fn run(
     }
     drop(ready);
     let pid_u32 = u32::try_from(pid).map_err(io::Error::other)?;
-    reply(socket, FrameWriter::new(REPLY_STARTED).u32(pid_u32))?;
-    let mut status = 0;
-    loop {
-        // SAFETY: `pid` is this host's own child and `status` a valid out-pointer.
-        let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
-        if waited == pid {
-            break;
-        }
-        let error = io::Error::last_os_error();
-        if error.kind() != io::ErrorKind::Interrupted {
-            return Err(error);
-        }
-    }
+    // Before the wait below: this host is the child's parent, so until it reaps the child its pid
+    // names nothing else.
+    let birth = Birth::of(pid_u32);
+    reply(socket, FrameWriter::new(REPLY_STARTED).birth(&birth)?)?;
+    let status = crate::wait_serving_signals(socket, pid)?;
     reply(socket, FrameWriter::new(REPLY_EXITED).i32(status))
 }
 

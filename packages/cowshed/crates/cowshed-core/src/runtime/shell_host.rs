@@ -18,6 +18,8 @@ use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 
+use super::job_groups::{Birth, GroupLeader};
+
 /// The argument that turns the `cowshed` binary into an exec host.
 pub const SHELL_HOST_ARGUMENT: &str = "--cowshed-shell-host";
 
@@ -46,11 +48,19 @@ pub const REQUEST_RUN: u8 = 3;
 /// program there, so every process the script starts is in the job's group and the child's own
 /// wait status is the job's.
 pub const REQUEST_SCRIPT: u8 = 4;
+/// Signal the running command's group: `[signal]`. Sent only while a run or script request is
+/// served, between its `REPLY_STARTED` and `REPLY_EXITED`. The host is the command's parent and
+/// applies the signal only while it has not reaped the command, in the same thread that reaps
+/// it, so the signal never reaches a process that reused the command's id. One that arrives
+/// after the command ended reaches nothing.
+pub const REQUEST_SIGNAL: u8 = 5;
 
 pub const REPLY_APPROVED: u8 = 1;
 pub const REPLY_ACTIVATION_EXITED: u8 = 2;
 pub const REPLY_ACTIVATED: u8 = 3;
 pub const REPLY_ACTIVATION_UNUSABLE: u8 = 4;
+/// The command started: `[birth]`, its group leader as the host observed it before it could
+/// reap the command ([`FrameWriter::birth`]).
 pub const REPLY_STARTED: u8 = 5;
 pub const REPLY_EXITED: u8 = 6;
 /// A script request's text did not parse; nothing ran. `[diagnostic]`, also written to the
@@ -63,6 +73,10 @@ pub const REPLY_HOST_FAILED: u8 = 8;
 /// A script binding's value kind on the wire.
 pub const BINDING_SCALAR: u8 = 0;
 pub const BINDING_ARRAY: u8 = 1;
+
+/// A [`Birth`]'s kind on the wire.
+const BIRTH_OBSERVED: u32 = 0;
+const BIRTH_UNOBSERVED: u32 = 1;
 
 /// A raw `waitpid` status, decoded only where it is reported.
 pub type RawWaitStatus = i32;
@@ -89,6 +103,26 @@ impl FrameWriter {
     pub fn i32(mut self, value: i32) -> Self {
         self.0.extend_from_slice(&value.to_le_bytes());
         self
+    }
+
+    pub fn u64(mut self, value: u64) -> Self {
+        self.0.extend_from_slice(&value.to_le_bytes());
+        self
+    }
+
+    /// `[kind]` then, for an observed leader, `[pgid, birth]`; for an unobserved one,
+    /// `[pid, reason]`.
+    pub fn birth(self, birth: &Birth) -> io::Result<Self> {
+        match birth {
+            Birth::Observed(leader) => Ok(self
+                .u32(BIRTH_OBSERVED)
+                .i32(leader.pgid())
+                .u64(leader.birth())),
+            Birth::Unobserved { pid, reason } => self
+                .u32(BIRTH_UNOBSERVED)
+                .u32(*pid)
+                .bytes(reason.as_bytes()),
+        }
     }
 
     pub fn bytes(mut self, value: &[u8]) -> io::Result<Self> {
@@ -155,6 +189,28 @@ impl<'a> FrameReader<'a> {
     pub fn i32(&mut self) -> io::Result<i32> {
         let bytes: [u8; 4] = self.take(4)?.try_into().map_err(|_| truncated())?;
         Ok(i32::from_le_bytes(bytes))
+    }
+
+    pub fn u64(&mut self) -> io::Result<u64> {
+        let bytes: [u8; 8] = self.take(8)?.try_into().map_err(|_| truncated())?;
+        Ok(u64::from_le_bytes(bytes))
+    }
+
+    pub fn birth(&mut self) -> io::Result<Birth> {
+        match self.u32()? {
+            BIRTH_OBSERVED => {
+                let pgid = self.i32()?;
+                GroupLeader::from_parts(pgid, self.u64()?).map(Birth::Observed)
+            }
+            BIRTH_UNOBSERVED => Ok(Birth::Unobserved {
+                pid: self.u32()?,
+                reason: String::from_utf8_lossy(self.bytes()?).into_owned(),
+            }),
+            other => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unknown birth kind {other}"),
+            )),
+        }
     }
 
     pub fn bytes(&mut self) -> io::Result<&'a [u8]> {
@@ -411,6 +467,41 @@ mod tests {
         assert_eq!(fields.bytes().unwrap(), b"/w");
         assert_eq!(fields.list().unwrap(), vec![b"K".as_slice(), b"V"]);
         fields.finish().unwrap();
+    }
+
+    /// An observed leader always carries its identity, a non-positive group is refused, and an
+    /// unknown kind is refused rather than read as some other shape.
+    #[test]
+    fn a_birth_crosses_the_wire_unchanged_and_a_malformed_one_is_refused() {
+        let births = [
+            Birth::Observed(GroupLeader::from_parts(41, 0).unwrap()),
+            Birth::Observed(GroupLeader::from_parts(41, u64::MAX).unwrap()),
+            Birth::Unobserved {
+                pid: 41,
+                reason: "unreadable".into(),
+            },
+        ];
+        for birth in births {
+            let frame = FrameWriter::new(REPLY_STARTED)
+                .birth(&birth)
+                .unwrap()
+                .finish()
+                .unwrap();
+            let (_, mut fields) = FrameReader::new(&frame[4..]).unwrap();
+            assert_eq!(fields.birth().unwrap(), birth);
+            fields.finish().unwrap();
+        }
+        for malformed in [
+            FrameWriter::new(REPLY_STARTED)
+                .u32(BIRTH_OBSERVED)
+                .i32(0)
+                .u64(7),
+            FrameWriter::new(REPLY_STARTED).u32(9).i32(41).u64(7),
+        ] {
+            let frame = malformed.finish().unwrap();
+            let (_, mut fields) = FrameReader::new(&frame[4..]).unwrap();
+            assert!(fields.birth().is_err());
+        }
     }
 
     #[test]

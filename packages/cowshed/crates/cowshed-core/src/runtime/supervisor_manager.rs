@@ -257,7 +257,8 @@ impl SupervisorManager {
                 // the next command for its workspace gets one of this build.
                 Err(error) if error.code == ErrorCode::Conflict => {
                     match supervisor_socket::drain(&path).await {
-                        Ok(pid) => {
+                        Ok(drained) => {
+                            let pid = drained.pid();
                             eprintln!(
                                 "cowshed: draining workspace supervisor {} (pid {pid}) of another cowshed build",
                                 path.display()
@@ -467,11 +468,23 @@ async fn end_lost_jobs(socket: PathBuf, writer: super::job_groups::Writer) {
     })
     .await;
     match ended {
-        Ok(Ok(jobs)) if jobs.is_empty() => {}
-        Ok(Ok(jobs)) => eprintln!(
-            "cowshed: ended jobs {jobs:?}, left running by workspace supervisor {}",
-            socket.display()
-        ),
+        Ok(Ok(ended)) => {
+            if !ended.signalled.is_empty() {
+                eprintln!(
+                    "cowshed: ended jobs {:?}, left running by workspace supervisor {}",
+                    ended.signalled,
+                    socket.display()
+                );
+            }
+            if !ended.unresolved.is_empty() {
+                eprintln!(
+                    "cowshed: jobs {:?} of workspace supervisor {} left processes whose group \
+                     leader is gone; not signalled, and kept in its ledger for the next supervisor",
+                    ended.unresolved,
+                    socket.display()
+                );
+            }
+        }
         Ok(Err(error)) => eprintln!(
             "cowshed: cannot end the jobs workspace supervisor {} left running: {error}",
             socket.display()
@@ -580,19 +593,17 @@ fn exits_within(pid: u32, within: Option<Duration>) -> io::Result<bool> {
 /// How long a supervisor of another build gets after each signal a lifecycle verb sends it.
 const OTHER_BUILD_GRACE: Duration = Duration::from_secs(5);
 
-/// TERM `pid`, then KILL it once `grace` passes without it exiting; blocks until it is gone.
-fn terminate(pid: u32, grace: Duration) -> io::Result<()> {
-    let target = libc::pid_t::try_from(pid).map_err(io::Error::other)?;
+/// TERM `process`, then KILL it once `grace` passes without it exiting; blocks until it is gone.
+/// Every signal goes through the process's own identity, so one that exited -- and whose pid
+/// another process may since hold -- is never reached through its pid.
+fn terminate(process: &super::job_groups::Process, grace: Duration) -> io::Result<()> {
+    let pid = process.pid().unsigned_abs();
     for signal in [libc::SIGTERM, libc::SIGKILL] {
-        // SAFETY: kill with a positive pid signals exactly that process and touches no memory.
-        if unsafe { libc::kill(target, signal) } != 0 {
-            let error = io::Error::last_os_error();
-            return if error.raw_os_error() == Some(libc::ESRCH) {
-                Ok(())
-            } else {
-                Err(error)
-            };
+        if !process.signal(signal)? {
+            return Ok(());
         }
+        // Only waits: should the pid already name another process, the next signal still
+        // reaches nothing of it.
         if exits_within(pid, Some(grace))? {
             return Ok(());
         }
@@ -608,14 +619,15 @@ fn terminate(pid: u32, grace: Duration) -> io::Result<()> {
 /// ran as.
 ///
 /// This build speaks no request of that supervisor's protocol but `drain`, the one whose shape
-/// never changes, and `drain` alone only waits for its jobs. So `drain` names the process serving
-/// the socket and stops it admitting work, and the process is then signalled: TERM, and KILL
-/// once the grace has passed. What its own retirement would have done is done for it once it is
-/// gone: the jobs it left running are ended from the group ledger it kept beside the socket, the
-/// ledger removed, and the socket unlinked unless something serves it again. The jobs' records
-/// stay running until the workspace's next supervisor seals them, as after any lost supervisor.
+/// never changes, and `drain` alone only waits for its jobs. The connected peer's non-reusable
+/// kernel identity, cross-checked with the drain reply, owns TERM and KILL after the grace: no
+/// later process that took its pid can receive either. Once it is gone, its group ledger ends
+/// only positively owned processes and carries unresolved groups for the next supervisor. The
+/// socket is unlinked unless something serves it again. The jobs' records remain unterminated
+/// until that next supervisor seals them, as after any lost supervisor.
 pub async fn stop_other_build(socket: &Path) -> Result<u32> {
-    let pid = supervisor_socket::drain(socket).await?;
+    let drained = supervisor_socket::drain(socket).await?;
+    let pid = drained.pid();
     if pid <= 1 || pid == std::process::id() {
         return Err(CowshedError::integrity(
             format!(
@@ -625,7 +637,7 @@ pub async fn stop_other_build(socket: &Path) -> Result<u32> {
             "stop the supervisor process yourself, then retry",
         ));
     }
-    tokio::task::spawn_blocking(move || terminate(pid, OTHER_BUILD_GRACE))
+    tokio::task::spawn_blocking(move || terminate(&drained.process, OTHER_BUILD_GRACE))
         .await
         .map_err(|error| CowshedError::internal(format!("stopping pid {pid}: {error}")))?
         .map_err(|error| {
@@ -639,18 +651,28 @@ pub async fn stop_other_build(socket: &Path) -> Result<u32> {
         })?;
     let ledger = super::job_groups::ledger_path(socket);
     let taken = ledger.clone();
-    tokio::task::spawn_blocking(move || super::job_groups::take_lost(&taken, LOST_JOB_GRACE))
-        .await
-        .map_err(|error| CowshedError::internal(format!("ending lost jobs: {error}")))?
-        .map_err(|error| {
-            CowshedError::environment_missing(
-                format!(
-                    "cannot end the jobs pid {pid} left running, recorded in {}: {error}",
-                    ledger.display()
-                ),
-                "end the jobs' process groups yourself, remove that file, then retry",
-            )
-        })?;
+    let unresolved =
+        tokio::task::spawn_blocking(move || super::job_groups::take_lost(&taken, LOST_JOB_GRACE))
+            .await
+            .map_err(|error| CowshedError::internal(format!("ending lost jobs: {error}")))?
+            .map_err(|error| {
+                CowshedError::environment_missing(
+                    format!(
+                        "cannot end the jobs pid {pid} left running, recorded in {}: {error}",
+                        ledger.display()
+                    ),
+                    "end the jobs' process groups yourself, remove that file, then retry",
+                )
+            })?;
+    for group in &unresolved {
+        eprintln!(
+            "cowshed: job {} process group {} that pid {pid} left still has processes but its \
+             leader is gone; not signalled, and kept in {} for the workspace's next supervisor",
+            group.job_id(),
+            group.pgid(),
+            ledger.display()
+        );
+    }
     match UnixStream::connect(socket).await {
         Ok(_) => {}
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
@@ -1027,7 +1049,8 @@ mod tests {
             .expect("a job leading its own group");
         let group = job.id().expect("the job runs");
         let ledger = super::super::job_groups::ledger_path(&socket);
-        super::super::job_groups::record(&ledger, &[(7, group)]).expect("ledger");
+        let leader = super::super::job_groups::GroupLeader::observe(group).expect("leader");
+        super::super::job_groups::record(&ledger, &[(7, leader)], &[]).expect("ledger");
 
         let stopped = stop_other_build(&socket).await.expect("stopped");
 

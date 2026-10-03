@@ -50,6 +50,20 @@ group, so a kill reaches all of them and never the host; a killed script dies by
 `cd`, `umask`, `ulimit`, `trap` and `exec` end with the child. The interpreter lives only in the host binary (the
 `cowshed-shell` crate), not in the supervisor library or its Node addon.
 
+**Process identity and signal ownership.** The process that creates a command's group observes its leader's immutable
+birth identity before anything can reap it, including a leader that exits immediately. One-shot commands and activation
+hosts are direct children held by a parent-owned reap/signal fence: signalling and `waitpid` serialize on that fence,
+and a reaped child can never be signalled by its old numeric pid. The parent waits through exit notifications, without
+holding a blocking lock across an await. A warm host reports the observed identity with its start reply; the supervisor
+never samples a reported pid later to manufacture one. A failed observation is explicit operational data and never
+becomes a signal or ledger claim.
+
+A warm command's signal is a framed request to its host, the command's actual parent, rather than `killpg` in the
+supervisor. The host retains the child unreaped while handling a signal, then returns its exact wait status. A signal
+that arrives after reaping reaches nothing, including the next command. A malformed or unknown control frame fails
+closed. Host/controller EOF still terminates and reaps the host's own command; it never turns a stale start reply into
+permission to signal another process.
+
 **Freshness is direnv's own.** direnv records every input an evaluation depended on — the `.envrc`, its approval files,
 each `source_up`, `use devenv` and `watch_file` target — as `DIRENV_WATCHES` (base64url of zlib-deflated JSON
 `[{path, modtime, exists}]`) and reloads when any of them changes. The supervisor decodes that list from each
@@ -465,26 +479,30 @@ under, so no host of the old revision serves a command of the new one.
 A supervisor that ends without retiring — killed, crashed — leaves its jobs' processes running and their records
 admitted but never sealed. Two things put that right:
 
-- **The group ledger.** A served supervisor keeps `<store>/run/<digest>.groups` beside its socket: the process group of
-  every running job and its leader's start time, replaced whole (write, rename) whenever a job's group starts or its job
-  is sealed, and naming the supervisor process that wrote it. When the manager sees a supervisor it watches end, and
-  when it finds on its own start a socket nothing answers, it ends the groups that supervisor's ledger names — TERM, two
-  seconds, KILL — and marks the ledger ended, keeping the jobs it names. A group whose leader is alive under another
-  start time is a reused pid and is left alone; a watcher acts only on a ledger the supervisor it watched wrote, never
-  on one a newer supervisor of the workspace has written since. Ownership is revalidated before force. An unreadable
-  start time is an operational error, not leader absence; leader absence alone never proves the group empty. On macOS,
-  the exact recorded PGID's membership is enumerated and its members inspected, so an unreaped dead leader is
-  distinguished from a surviving descendant. A full membership buffer is not absence evidence. Inspection or signaling
-  failures retain the original ledger and report the error; they never mark it ended or consume it. A previous ended
-  marker does not bypass live authority checks during recovery or sealing. Genuine sandbox-denied inspection/signaling
-  controls exercise both refusal paths and a later host-authorized retry.
-- **Sealing.** The next supervisor of the workspace binds its socket first — holding it is what makes it the workspace's
-  one supervisor — ends whatever groups the ledger still names, and seals each job the ledger names that was admitted
-  and never sealed: a `failed` terminal record naming `failure: supervisorLost`, carrying the bytes the job spilled to
-  its protected files (sealed read-only as a finished job's are) and nothing of what was only in the lost supervisor's
-  memory, and a terminal commitment for it. Then it removes the ledger, and only then does it admit anything. A job no
-  ledger names is never sealed: it may be running under a supervisor of an older cowshed build that kept its supervisor
-  in the controller's own process.
+- **The group ledger.** A served supervisor keeps `<store>/run/<digest>.groups` beside its socket: each job's process
+  group and the leader's immutable birth identity observed by its parent before reaping, naming the supervisor that
+  wrote it. Every rewrite carries that original observation; it never samples an old pid again to renew a claim. A
+  watcher acts only on its own lost supervisor's ledger, never one a newer supervisor has written. Older protected
+  ledgers with a recorded start time remain readable, but new writers record the birth identity.
+
+  Recovery proves that the recorded leader held its id throughout the membership snapshot. Only those proven members are
+  signalled, through a kernel identity that cannot target a later process: the pid/version audit token on macOS, a pidfd
+  on Linux. It sends TERM, waits the existing grace, proves ownership again, then sends KILL to still-owned members. No
+  ledger operation signals a numeric pid or group after an ownership check. A reused live leader is left alone. A reaped
+  or never-identified leader with surviving members is unresolved, never signalled or silently dropped. A full
+  membership buffer is not absence evidence; inspection and signal failures retain the ledger and report the operational
+  error.
+
+  Every replacement supervisor inherits unresolved entries with their original job, group, and lost supervisor. Each
+  subsequent ledger rewrite carries them while the group remains unaccounted for, and drops only entries proven
+  released. A prior ended marker does not authorize force or erase that evidence. Unresolved groups are diagnosed
+  through `doctor`; they do not prevent a new supervisor from serving safe commands.
+
+- **Sealing.** The next supervisor binds the workspace socket first, reconciles the predecessor's groups, then seals
+  every admitted but unterminated record of the current incarnation as `failed` with `failure: supervisorLost` and a
+  terminal commitment. It preserves the bytes already spilled to protected files, not bytes held only in lost memory.
+  The record allocator and recovery use the protected records, not a ledger's completeness: power loss may have taken an
+  entry. Unresolved process evidence remains in the inherited ledger independently of the job's terminal record.
 
 **Draining a supervisor of another build.** The manager of a newly started daemon asks every supervisor of another build
 — including one that names no build at all — to drain: it admits nothing more, lets its running jobs finish, and
@@ -497,13 +515,15 @@ next supervisor by its number, through `sealed` and `logRead`, and reads on from
 Until a draining supervisor retires, a command of the new build that reaches it is refused by name: `exec` and every
 other verb that would run work there, because they cannot speak its protocol. A lifecycle verb that must change the
 workspace's substrate — `detach`, `rm`, `restore`, `resize`, `mv` — does not wait for it, since a drain lasts as long as
-its longest job. It stops the supervisor itself, doing what that supervisor's own retirement would have done: `drain`
-names the process serving the socket and stops its admissions, the process gets SIGTERM and, after a grace, SIGKILL, and
-once it has exited the verb ends the jobs its group ledger names (as the group ledger above prescribes for any lost
-supervisor), removes the ledger, and unlinks the socket unless something serves it again. The jobs' records stay
-`running` until the workspace's next supervisor seals them. `exec` does not do this on its own: replacing a supervisor
-ends its jobs, which an ordinary command must not do as a side effect, so its refusal names `cowshed detach` as the step
-that does.
+its longest job. A lifecycle verb stops admission with `drain` and identifies the serving process from that exact
+connection's kernel peer credential, cross-checking the reply's pid. TERM and, after the existing grace, KILL go only
+through that non-reusable identity: a macOS audit token or Linux peer pidfd (kernel 6.5 or newer), never a later process
+that reused the pid. A host lacking that identity primitive gets a typed refusal, not a raw-pid fallback.
+
+Once the supervisor exits, the verb reconciles its group ledger as above and unlinks the socket unless something serves
+it again; unresolved group evidence is retained. The jobs' records remain unterminated until the next supervisor seals
+them. `exec` does not replace another build as a side effect: its refusal names the lifecycle step that owns the
+cutover.
 
 ## Teardown ordering
 
@@ -521,12 +541,21 @@ the whole descendant tree regardless of what those processes are. Order:
 The supervisor tracks its descendants (process group) precisely so this is deterministic — another reason the shell
 layer is not optional glue but core to correct lifecycle.
 
+Lost-supervisor groups that cannot be safely identified do not block ordinary supervisor startup or new admission. They
+do block destroying or replacing the canonical image: `rm`, checkpoint restore, and adopted-main restore reconcile the
+ledger **after** stopping the supervisor and return a typed refusal while any unresolved group remains. Neither
+`--force` nor a prior ended marker authorizes detaching beneath an unaccounted-for writer. Ordinary detach and resize
+already use idle-only unmounting, without a force fallback. Grant changes retain their existing contract above: jobs
+already running keep their original profiles; a revision change is not a claim that every old-authority process died.
+
 ## doctor awareness
 
 `cowshed doctor` reports a detached workspace that still has a supervisor (`mount-supervisor`), with the detach and
-attach that clear it. It has no finding for a supervisor socket or a job: a socket nothing answers is what a dead
-supervisor leaves, and the daemon's manager ends the jobs it left running the next time it starts (Supervisor recovery,
-above).
+attach that clear it. It also reports each unresolved lost-job group (`unresolved-job-group`) with its workspace, job,
+group id, lost supervisor, reason, and retained ledger path. A readable live unresolved group is a warning, not a
+fabricated healthy or dead group; an unreadable ledger is an error. The next ledger writer drops evidence only once the
+recorded group is proven released. This read-only diagnosis grants no permission to signal a stale numeric pid,
+force-detach a busy image, or erase a ledger.
 
 ## Tradeoffs
 
@@ -592,7 +621,13 @@ destination is never promised while the command runs, never used for job reads, 
 
 Once the protected terminal record is sealed, a refused output copy cannot leave the live job `running`: terminal state,
 exit, artifacts, commitment, and session removal advance before the original copy error reaches an early or late
-`wait`/`kill` caller; normal process-group bookkeeping still concludes. A true sealing or commitment error is retained
-separately and answers future callers without hanging, preserves uncommitted captured bytes and ownership evidence, and
-does not fabricate a different child exit. Retirement may proceed after the child has ended; the next supervisor uses
-the existing lost-job recovery for records that genuinely remained unterminated.
+`wait`/`kill` caller; normal process-group bookkeeping still concludes. A refused terminal commitment likewise fails its
+callers without replacing sealed state, stream counts/hashes, or quota metadata with the admission's empty values. The
+completed in-memory outcome is either a sealed artifact with separate commitment/publication errors, or a genuine
+sealing failure; it cannot claim both sealed and unsealed.
+
+A true sealing failure answers `info`, `list`, `wait`, and `kill` with that error rather than presenting a fake empty
+success. The captured bytes remain readable through `logRead`; `sealed` reports no terminal record. Every caller is
+answered without hanging, and retirement may proceed after the child has ended. The next supervisor uses the existing
+lost-job recovery for records that genuinely remained unterminated, preserving the distinction between a child's exit, a
+protected terminal record, and its controller commitment.

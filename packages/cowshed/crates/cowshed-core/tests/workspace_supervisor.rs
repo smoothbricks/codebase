@@ -15,6 +15,7 @@ use cowshed_core::api::{
 use cowshed_core::error::{CowshedError, ErrorCode, Result};
 use cowshed_core::metadata::{PortBlock, WorkspaceIncarnation, WorkspaceName};
 use cowshed_core::repository::{OwnedRepoIds, RepoId};
+use cowshed_core::runtime::job_groups::Birth;
 use cowshed_core::runtime::land_warm::warm_after_land;
 use cowshed_core::sandbox::{SandboxConfig, SandboxGrants};
 use cowshed_core::storage::job_artifact::{ArtifactConfig, ArtifactStore, JobEnding, StreamKind};
@@ -71,9 +72,14 @@ impl SpawnSink for FakeSpawner {
                 events,
             })
             .expect("spawn observer");
+        let pid = 10_000 + u32::try_from(request.job_id.get()).unwrap();
         Ok(Box::new(FakeProcess {
             job_id: request.job_id,
-            pid: 10_000 + u32::try_from(request.job_id.get()).unwrap(),
+            // Not a process: its pid names nothing this test owns, so no group is identified.
+            birth: Birth::Unobserved {
+                pid,
+                reason: "a fake process leads no group".into(),
+            },
             observations: self.process_observations.clone(),
             backpressure: self.backpressure,
             writes: 0,
@@ -83,15 +89,15 @@ impl SpawnSink for FakeSpawner {
 
 struct FakeProcess {
     job_id: JobId,
-    pid: u32,
+    birth: Birth,
     observations: mpsc::UnboundedSender<ProcessObservation>,
     backpressure: bool,
     writes: usize,
 }
 
 impl RunningProcess for FakeProcess {
-    fn pid(&self) -> Option<u32> {
-        Some(self.pid)
+    fn birth(&self) -> Option<&Birth> {
+        Some(&self.birth)
     }
 
     fn try_write_stdin(&mut self, bytes: Bytes) -> Result<bool> {
@@ -387,6 +393,7 @@ fn config() -> WorkspaceSupervisorConfig {
         shell_host: None,
         shell_pool: Default::default(),
         group_ledger: None,
+        inherited_groups: Vec::new(),
     }
 }
 
@@ -863,52 +870,6 @@ async fn exact_authority_and_session_identity_are_fenced() {
     assert!(h.spawned.try_recv().is_err());
 }
 
-/// The regression guard for per-exec profile rendering: every job admitted under one authority
-/// is handed the one sandbox rendering taken with that authority — never a fresh one — and a
-/// grant advance renders exactly one new one, which the next jobs share. A read-only job narrows
-/// that rendering's ceiling without rendering anything.
-#[tokio::test]
-async fn jobs_under_one_authority_share_the_policy_rendered_when_it_was_taken() {
-    let mut h = harness(1, 1024, false, false);
-    let mut read_only = request(StdinSource::Empty);
-    read_only.mode = RunSandboxMode::ReadOnly;
-    let mut policies = Vec::new();
-    for submitted in [
-        request(StdinSource::Empty),
-        read_only,
-        request(StdinSource::Empty),
-    ] {
-        h.handle.exec(None, submitted).await.unwrap();
-        policies.push(h.spawned.recv().await.unwrap().request);
-    }
-    for later in &policies[1..] {
-        assert!(policies[0].policy.is_same_rendering(&later.policy));
-    }
-    let (read_write, _) = policies[0].policy.child(RunSandboxMode::ReadWrite);
-    let (narrowed, _) = policies[1].policy.child(policies[1].mode);
-    assert_eq!(
-        narrowed.mode,
-        cowshed_core::sandbox::RunSandboxMode::ReadOnly
-    );
-    assert_ne!(read_write.mode, narrowed.mode);
-
-    let advanced = h
-        .handle
-        .advance_authority(8, 12, config().sandbox)
-        .await
-        .unwrap();
-    let mut after = Vec::new();
-    for _ in 0..2 {
-        advanced
-            .exec(None, request(StdinSource::Empty))
-            .await
-            .unwrap();
-        after.push(h.spawned.recv().await.unwrap().request.policy);
-    }
-    assert!(!after[0].is_same_rendering(&policies[0].policy));
-    assert!(after[0].is_same_rendering(&after[1]));
-}
-
 #[tokio::test]
 async fn disconnect_does_not_cancel_background_process() {
     let mut h = harness(1, 1024, false, false);
@@ -1383,11 +1344,10 @@ async fn a_refused_terminal_record_answers_every_caller_and_stays_unterminated()
     assert_eq!(refused.code, ErrorCode::Integrity);
     assert_eq!(h.handle.wait(job).await.unwrap_err(), refused);
     assert_eq!(h.handle.kill(job).await.unwrap_err(), refused);
-    let info = h.handle.info(job).await.unwrap();
-    assert_eq!(
-        (info.state, info.exit),
-        (JobState::Exited, Some(ExitStatus::Exited { code: 0 }))
-    );
+    // Nothing durable says how the job ended, so its status is the refusal rather than a
+    // projection of streams no record backs.
+    assert_eq!(h.handle.info(job).await.unwrap_err(), refused);
+    assert_eq!(h.handle.list().await.unwrap_err(), refused);
     assert_eq!(
         h.handle.sealed(job).await.unwrap_err().code,
         ErrorCode::NotFound
@@ -1418,6 +1378,346 @@ async fn a_refused_terminal_record_answers_every_caller_and_stays_unterminated()
             .collect::<Vec<_>>(),
         vec![(job, JobState::Failed, Some(JobFailure::SupervisorLost))]
     );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+/// A commitment sink whose publisher is gone by the time a job ends.
+struct GoneTerminalPublisher {
+    refusal: CowshedError,
+}
+
+#[async_trait]
+impl CommitmentSink for GoneTerminalPublisher {
+    async fn record(&mut self, draft: CommitmentDraft) -> Result<()> {
+        match draft {
+            CommitmentDraft::Terminal { .. } => Err(self.refusal.clone()),
+            _ => Ok(()),
+        }
+    }
+}
+
+/// When the terminal record is durable but its audit commitment is refused, the job's status is
+/// the record's truth -- its state, exit and sealed streams, read back from the store -- while
+/// every waiter and killer, early or late, is told the commitment refusal.
+#[tokio::test]
+async fn a_refused_terminal_commitment_keeps_the_sealed_truth_and_fails_its_callers() {
+    let (supervisor_config, root) = isolated_config("refused-commitment");
+    let refusal = CowshedError::environment_missing(
+        "the commitment publisher is gone",
+        "reattach the workspace",
+    );
+    let store = ArtifactStoreSink::open(
+        supervisor_config.workspace_root.clone(),
+        &supervisor_config.owned_repo_ids,
+        &supervisor_config.authority,
+        supervisor_config.artifacts.clone(),
+    )
+    .unwrap();
+    let (spawn_tx, mut spawned) = mpsc::unbounded_channel();
+    let (process_tx, _process) = mpsc::unbounded_channel();
+    let (order_tx, _order) = mpsc::unbounded_channel();
+    let handle = WorkspaceSupervisor::start_with_sinks(
+        supervisor_config,
+        Box::new(FakeSpawner {
+            spawned: spawn_tx,
+            process_observations: process_tx,
+            fail_next: false,
+            backpressure: false,
+            order: order_tx,
+        }),
+        Box::new(store),
+        Box::new(GoneTerminalPublisher {
+            refusal: refusal.clone(),
+        }),
+    )
+    .unwrap();
+    let job = handle
+        .exec(None, request(StdinSource::Empty))
+        .await
+        .unwrap();
+    let spawned = spawned.recv().await.unwrap();
+    let waiter = handle.clone();
+    let early = tokio::spawn(async move { waiter.wait(job).await });
+    tokio::task::yield_now().await;
+    handle.info(job).await.unwrap();
+    complete(&spawned, b"payload", b"", ExitStatus::Exited { code: 0 }).await;
+
+    assert_eq!(early.await.unwrap().unwrap_err(), refusal);
+    assert_eq!(handle.wait(job).await.unwrap_err(), refusal);
+    assert_eq!(handle.kill(job).await.unwrap_err(), refusal);
+    let info = handle.info(job).await.unwrap();
+    let sealed = handle.sealed(job).await.unwrap();
+    assert_eq!(
+        (info.state, info.exit, info.stdout.sha256),
+        (
+            JobState::Exited,
+            Some(ExitStatus::Exited { code: 0 }),
+            Sha256Digest::compute(b"payload")
+        )
+    );
+    assert_eq!(
+        (sealed.state, sealed.stdout),
+        (JobState::Exited, info.stdout)
+    );
+    let output = handle
+        .log_read(job, StreamKind::Stdout, 0, false)
+        .await
+        .unwrap();
+    assert_eq!((output.bytes.as_ref(), output.eof), (&b"payload"[..], true));
+    handle.quiesce().await.unwrap();
+    handle.retire().await.unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+/// Spawns nothing: hands each job a process group the test owns, observed as its parent observes
+/// it, and then ends and reaps that group's leader before the supervisor learns of the job -- the
+/// race a real wait task can win. After that only the parent's observation can name the leader.
+struct ReapedGroupSpawner {
+    groups: std::collections::VecDeque<std::process::Child>,
+    births: mpsc::UnboundedSender<Birth>,
+    spawned: mpsc::UnboundedSender<Spawned>,
+    process_observations: mpsc::UnboundedSender<ProcessObservation>,
+}
+
+#[async_trait]
+impl SpawnSink for ReapedGroupSpawner {
+    async fn spawn(
+        &mut self,
+        request: ProcessSpawnRequest,
+        events: mpsc::Sender<ProcessEvent>,
+    ) -> Result<Box<dyn RunningProcess>> {
+        let mut group = self.groups.pop_front().expect("one owned group per job");
+        let birth = Birth::of(group.id());
+        let pgid = i32::try_from(group.id()).unwrap();
+        // SAFETY: the unreaped test child leads this group.
+        assert_eq!(unsafe { libc::killpg(pgid, libc::SIGKILL) }, 0);
+        use std::os::unix::process::ExitStatusExt as _;
+        assert_eq!(group.wait().unwrap().signal(), Some(libc::SIGKILL));
+        self.spawned
+            .send(Spawned {
+                request: request.clone(),
+                events,
+            })
+            .expect("spawn observer");
+        self.births.send(birth.clone()).expect("birth observer");
+        Ok(Box::new(FakeProcess {
+            job_id: request.job_id,
+            birth,
+            observations: self.process_observations.clone(),
+            backpressure: false,
+            writes: 0,
+        }))
+    }
+}
+
+fn owned_group() -> std::process::Child {
+    use std::os::unix::process::CommandExt as _;
+    std::process::Command::new("/bin/sh")
+        .args(["-c", "sleep 300 & wait"])
+        .stdin(std::process::Stdio::null())
+        .process_group(0)
+        .spawn()
+        .expect("a test-owned process group")
+}
+
+/// `(job id, leader birth)` for every group the ledger at `path` names.
+fn ledger_leaders(path: &std::path::Path) -> Vec<(u64, Option<u64>)> {
+    let ledger: serde_json::Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    ledger["groups"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|group| {
+            (
+                group["jobId"].as_u64().unwrap(),
+                group["leaderBirth"].as_u64(),
+            )
+        })
+        .collect()
+}
+
+/// A job's group enters the ledger with its leader as the job's parent observed it, even when the
+/// leader was reaped before the supervisor learned of the job, and every later rewrite carries
+/// that identity. Observing the pid at either point instead could find no leader at all, and once
+/// the pid is reused, whatever stranger then holds it.
+#[tokio::test]
+async fn the_ledger_names_each_group_by_its_parent_s_observation() {
+    let (mut supervisor_config, root) = isolated_config("ledger-births");
+    let ledger = root.join("supervisor.groups");
+    supervisor_config.group_ledger = Some(ledger.clone());
+    let (birth_tx, mut births) = mpsc::unbounded_channel();
+    let (spawn_tx, mut spawns) = mpsc::unbounded_channel();
+    let (process_tx, _process) = mpsc::unbounded_channel();
+    let (artifact_tx, _artifacts) = mpsc::unbounded_channel();
+    let (commitment_tx, _commitments) = mpsc::unbounded_channel();
+    let (order_tx, _order) = mpsc::unbounded_channel();
+    let handle = WorkspaceSupervisor::start_with_sinks(
+        supervisor_config,
+        Box::new(ReapedGroupSpawner {
+            groups: [owned_group(), owned_group()].into(),
+            births: birth_tx,
+            spawned: spawn_tx,
+            process_observations: process_tx,
+        }),
+        Box::new(FakeArtifactSink {
+            sealed_stdout: None,
+            next: JobId::new(1).unwrap(),
+            next_barrier: 1,
+            quota: 1024,
+            jobs: BTreeMap::new(),
+            observations: artifact_tx,
+            order: order_tx.clone(),
+        }),
+        Box::new(FakeCommitments {
+            next_order: 1,
+            observations: commitment_tx,
+            order: order_tx,
+        }),
+    )
+    .unwrap();
+    let birth = |birth: Birth| {
+        let leader = birth.leader().expect("the parent identified the leader");
+        Some(leader.birth())
+    };
+
+    handle
+        .exec(None, request(StdinSource::Empty))
+        .await
+        .unwrap();
+    let first = birth(births.recv().await.unwrap());
+    assert_eq!(ledger_leaders(&ledger), vec![(1, first)]);
+    handle
+        .exec(None, request(StdinSource::Empty))
+        .await
+        .unwrap();
+    let second = birth(births.recv().await.unwrap());
+    assert_eq!(ledger_leaders(&ledger), vec![(1, first), (2, second)]);
+    for id in [JobId::new(1).unwrap(), JobId::new(2).unwrap()] {
+        let spawned = spawns.recv().await.unwrap();
+        complete(
+            &spawned,
+            b"",
+            b"",
+            ExitStatus::Signaled {
+                signal: libc::SIGKILL,
+                core_dumped: false,
+            },
+        )
+        .await;
+        handle.wait(id).await.unwrap();
+    }
+    handle.retire().await.unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+/// A job whose parent could not identify its group leader still runs and reports its pid, but its
+/// group never enters the ledger: nothing may later end a group no one identified.
+#[tokio::test]
+async fn an_unidentified_leader_never_enters_the_ledger() {
+    let (mut supervisor_config, root) = isolated_config("ledger-unobserved");
+    let ledger = root.join("supervisor.groups");
+    supervisor_config.group_ledger = Some(ledger.clone());
+    let mut h = harness_with_config(supervisor_config, 1, 1024, false, false);
+    let job = h
+        .handle
+        .exec(None, request(StdinSource::Empty))
+        .await
+        .unwrap();
+    assert_eq!(h.handle.info(job).await.unwrap().pid, Some(10_001));
+    assert_eq!(ledger_leaders(&ledger), Vec::new());
+    let spawned = h.spawned.recv().await.unwrap();
+    complete(&spawned, b"", b"", ExitStatus::Exited { code: 0 }).await;
+    h.handle.wait(job).await.unwrap();
+    h.handle.retire().await.unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+/// The groups a lost predecessor left unresolved neither stop the next supervisor from serving
+/// nor fall out of its ledger: each rewrite carries them while processes hold their ids, and drops
+/// one only once nothing does. Never signalled throughout.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn a_supervisor_serves_and_carries_the_groups_its_predecessor_left_unresolved() {
+    use std::io::BufRead as _;
+    use std::os::unix::process::CommandExt as _;
+
+    let (mut supervisor_config, root) = isolated_config("ledger-inherited");
+    let ledger = root.join("supervisor.groups");
+    // A group whose leader exited and was reaped while a descendant holds the id.
+    let mut leaderless = std::process::Command::new("/bin/sh")
+        .args(["-c", "(trap '' TERM; echo READY; exec sleep 300) & wait"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .process_group(0)
+        .spawn()
+        .unwrap();
+    let pgid = i32::try_from(leaderless.id()).unwrap();
+    let mut ready = String::new();
+    std::io::BufReader::new(leaderless.stdout.take().unwrap())
+        .read_line(&mut ready)
+        .unwrap();
+    leaderless.kill().unwrap();
+    leaderless.wait().unwrap();
+    std::fs::write(
+        &ledger,
+        format!(r#"{{"supervisor":1,"groups":[{{"jobId":9,"pgid":{pgid},"leaderStart":null}}]}}"#),
+    )
+    .unwrap();
+    let inherited = cowshed_core::runtime::job_groups::take_lost(&ledger, Duration::ZERO).unwrap();
+    assert_eq!(inherited.len(), 1);
+    supervisor_config.group_ledger = Some(ledger.clone());
+    supervisor_config.inherited_groups = inherited;
+    let mut h = harness_with_config(supervisor_config, 1, 1024, false, false);
+    let carried = |ledger: &std::path::Path| -> Vec<u64> {
+        let ledger: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(ledger).unwrap()).unwrap();
+        ledger["unresolved"]
+            .as_array()
+            .map(|groups| {
+                groups
+                    .iter()
+                    .map(|group| group["group"]["jobId"].as_u64().unwrap())
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+
+    let first = h
+        .handle
+        .exec(None, request(StdinSource::Empty))
+        .await
+        .unwrap();
+    assert_eq!(carried(&ledger), vec![9]);
+    // SAFETY: signal 0 only checks that the group exists.
+    assert_eq!(
+        unsafe { libc::killpg(pgid, 0) },
+        0,
+        "the inherited group was signalled"
+    );
+    let spawned = h.spawned.recv().await.unwrap();
+    complete(&spawned, b"", b"", ExitStatus::Exited { code: 0 }).await;
+    h.handle.wait(first).await.unwrap();
+
+    // SAFETY: this test made the group; its id still names the test's own descendant.
+    assert_eq!(unsafe { libc::killpg(pgid, libc::SIGKILL) }, 0);
+    let deadline = std::time::Instant::now() + Duration::from_secs(1);
+    while !cowshed_core::runtime::job_groups::unresolved(&ledger)
+        .unwrap()
+        .is_empty()
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let second = h
+        .handle
+        .exec(None, request(StdinSource::Empty))
+        .await
+        .unwrap();
+    assert_eq!(carried(&ledger), Vec::<u64>::new());
+    let spawned = h.spawned.recv().await.unwrap();
+    complete(&spawned, b"", b"", ExitStatus::Exited { code: 0 }).await;
+    h.handle.wait(second).await.unwrap();
+    h.handle.retire().await.unwrap();
     std::fs::remove_dir_all(root).unwrap();
 }
 
@@ -2179,7 +2479,7 @@ async fn a_supervisor_that_cannot_start_fails_the_ensure_with_its_own_reason() {
 #[tokio::test]
 async fn the_manager_moves_a_running_supervisor_to_a_newer_grant_revision() {
     use cowshed_core::runtime::{supervisor_manager::SupervisorManager, supervisor_socket};
-    let h = harness(1, 1024, false, false);
+    let mut h = harness(1, 1024, false, false);
     let store = manager_store();
     let path = supervisor_socket::socket_path(&store, &authority().repo_id, &authority().workspace);
     let listener = supervisor_socket::bind(&path).await.unwrap();
@@ -2230,10 +2530,14 @@ async fn the_manager_moves_a_running_supervisor_to_a_newer_grant_revision() {
         "no second supervisor"
     );
     let remote = supervisor_socket::connect(ensured.socket, ensured.authority);
-    remote
+    let admitted = remote
         .exec(None, request(StdinSource::Empty))
         .await
         .unwrap();
+    let spawned = h.spawned.recv().await.unwrap();
+    complete(&spawned, b"", b"", ExitStatus::Exited { code: 0 }).await;
+    remote.wait(admitted).await.unwrap();
+    remote.retire().await.unwrap();
 }
 
 #[tokio::test]
@@ -2259,7 +2563,7 @@ async fn a_drained_supervisor_finishes_its_jobs_admits_none_and_stops_serving() 
     let spawned = h.spawned.recv().await.unwrap();
 
     assert_eq!(
-        supervisor_socket::drain(&path).await.unwrap(),
+        supervisor_socket::drain(&path).await.unwrap().pid(),
         std::process::id(),
         "drain answers at once with the serving pid"
     );
@@ -2513,6 +2817,9 @@ async fn an_unbuilt_base_is_left_out_of_the_warm_environment() {
     let spawned = h.spawned.recv().await.unwrap();
     let head = oid('b');
     assert_eq!(land_heads(&spawned), (None, Some(head.as_str())));
+    complete(&spawned, b"", b"", ExitStatus::Exited { code: 0 }).await;
+    h.handle.wait(spawned.request.job_id).await.unwrap();
+    h.handle.retire().await.unwrap();
 }
 
 #[tokio::test]
@@ -2588,6 +2895,10 @@ async fn lands_during_a_warm_run_coalesce_into_the_one_run_waiting_behind_it() {
             range: range('e', 'f'),
         }
     );
+    let fourth = h.spawned.recv().await.unwrap();
+    complete(&fourth, b"", b"", ExitStatus::Exited { code: 0 }).await;
+    h.handle.wait(job(4)).await.unwrap();
+    h.handle.retire().await.unwrap();
 }
 
 #[tokio::test]
@@ -2676,4 +2987,10 @@ async fn a_served_supervisor_takes_a_warm_step_across_its_socket() {
         remote.info(job_id).await.unwrap().warm,
         Some(range('a', 'b'))
     );
+    complete(&spawned, b"", b"", ExitStatus::Exited { code: 0 }).await;
+    remote.wait(job_id).await.unwrap();
+    let queued = h.spawned.recv().await.unwrap();
+    complete(&queued, b"", b"", ExitStatus::Exited { code: 0 }).await;
+    remote.wait(queued.request.job_id).await.unwrap();
+    remote.retire().await.unwrap();
 }

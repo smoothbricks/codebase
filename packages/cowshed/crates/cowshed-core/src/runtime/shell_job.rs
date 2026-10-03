@@ -15,27 +15,28 @@ use std::os::unix::fs::PermissionsExt as _;
 use std::os::unix::process::ExitStatusExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _, Interest};
 use tokio::sync::mpsc;
 
+use super::job_groups::Birth;
 use super::shell_host::{
     BINDING_ARRAY, BINDING_SCALAR, FrameReader, FrameWriter, MAX_FRAME_BYTES, REPLY_ACTIVATED,
     REPLY_ACTIVATION_EXITED, REPLY_ACTIVATION_UNUSABLE, REPLY_APPROVED, REPLY_EXITED,
     REPLY_HOST_FAILED, REPLY_SCRIPT_SYNTAX, REPLY_STARTED, REQUEST_ACTIVATE, REQUEST_APPROVE,
-    REQUEST_RUN, REQUEST_SCRIPT, RawWaitStatus, SHELL_HOST_DIRECTORY, ShellHostProgram,
-    send_with_descriptors,
+    REQUEST_RUN, REQUEST_SCRIPT, REQUEST_SIGNAL, RawWaitStatus, SHELL_HOST_DIRECTORY,
+    ShellHostProgram, send_with_descriptors,
 };
 use super::shell_pool::{Acquired, Activation, Activator, ShellPool, ShellPoolConfig};
 use super::shell_watch::{
     ActivationEvidence, EvaluationClock, FsInstant, Snapshot, decode_direnv_watches,
 };
 use super::supervisor::{
-    ProcessEvent, ProcessSignal, RunningProcess, SandboxEnvironment, StdinLane, kill_process_group,
+    ChildFence, ProcessEvent, ProcessSignal, RunningProcess, SandboxEnvironment, StdinLane,
     process_termination_from_wait, run_system_output, run_system_stdin,
 };
 use crate::api::dto::{ExitStatus, JobId, Sha256Digest};
@@ -237,45 +238,68 @@ fn null_device() -> io::Result<OwnedFd> {
 // ---------------------------------------------------------------------------------------------
 // Job control shared with the supervisor actor
 
-const PHASE_MASK: u64 = !0xffff_ffff;
-const ACTIVATING: u64 = 1 << 32;
-const RUNNING: u64 = 2 << 32;
-const FINISHED: u64 = 3 << 32;
-
-/// Which process group a job's signals reach right now, lock-free.
+/// Which process group a job's signals reach right now, and through whom.
 ///
-/// While a fresh host activates for the job, that host's group is the job (activation output
-/// and failure belong to the job); once the command starts, the command's own group is. A
-/// signal requested before either exists is recorded and delivered the moment one is
-/// published, so no window loses it.
+/// While a fresh host activates for the job, that host's group is the job (activation output and
+/// failure belong to the job): this process is the host's parent and signals it through the
+/// host's reap fence ([`ChildFence`]). Once the command starts, the command's own group is: the
+/// host forked the command and alone reaps it, so a signal is sent to the host, which applies it
+/// only while it still holds the command unreaped. No signal is ever sent to a group whose leader
+/// this process cannot vouch for. A signal requested before either exists is recorded and
+/// delivered the moment one is published, so no window loses it.
 #[derive(Default)]
 pub(super) struct JobControl {
-    target: AtomicU64,
+    target: Mutex<Target>,
     requested: AtomicI32,
 }
 
+#[derive(Default)]
+enum Target {
+    #[default]
+    Pending,
+    Host(Arc<ChildFence>),
+    /// The command's host, through the run that forwards signals to it.
+    Command(mpsc::UnboundedSender<i32>),
+    Finished,
+}
+
+impl Target {
+    fn deliver(&self, signal: i32) -> Result<()> {
+        match self {
+            Self::Host(fence) => fence.signal(signal),
+            Self::Command(host) => host.send(signal).map_err(|_| {
+                CowshedError::conflict(
+                    "the job's run no longer forwards signals to its host: the command ended, its \
+                     host is gone, or the supervisor is going away, in which case the host ends \
+                     the command itself",
+                    "inspect the job's status",
+                )
+            }),
+            Self::Pending | Self::Finished => Ok(()),
+        }
+    }
+}
+
 impl JobControl {
-    fn publish(&self, phase: u64, pid: u32) {
-        self.target.store(phase | u64::from(pid), Ordering::SeqCst);
+    fn publish(&self, published: Target) {
+        let mut target = self.target.lock().unwrap_or_else(PoisonError::into_inner);
         let requested = self.requested.load(Ordering::SeqCst);
         if requested != 0 {
-            let _ = kill_process_group(pid, requested);
+            let _ = published.deliver(requested);
         }
+        *target = published;
     }
 
     fn finish(&self) {
-        self.target.store(FINISHED, Ordering::SeqCst);
+        *self.target.lock().unwrap_or_else(PoisonError::into_inner) = Target::Finished;
     }
 
     fn signal(&self, signal: i32) -> Result<()> {
         self.requested.store(signal, Ordering::SeqCst);
-        let target = self.target.load(Ordering::SeqCst);
-        match target & PHASE_MASK {
-            ACTIVATING | RUNNING => {
-                kill_process_group(u32::try_from(target & 0xffff_ffff).unwrap_or(0), signal)
-            }
-            _ => Ok(()),
-        }
+        self.target
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .deliver(signal)
     }
 }
 
@@ -285,8 +309,8 @@ struct PooledProcess {
 }
 
 impl RunningProcess for PooledProcess {
-    fn pid(&self) -> Option<u32> {
-        // The command's pid arrives with `ProcessEvent::Started`.
+    fn birth(&self) -> Option<&Birth> {
+        // The command's process arrives with `ProcessEvent::Started`.
         None
     }
 
@@ -323,7 +347,8 @@ struct RunCommand {
 
 enum Outcome {
     Exited(ExitStatus),
-    /// The command ran but its end was not observed; its group has been killed.
+    /// The command ran but its end was not observed: its host is gone, and with it the only
+    /// process that could prove the command's group its own, so the group was not signalled.
     Unobserved(CowshedError),
     /// No command was started; the diagnostic is already on the job's stderr.
     NotLaunched(CowshedError),
@@ -399,7 +424,7 @@ async fn run_pooled(
                 Ok(host) => host,
                 Err(error) => return Outcome::NotLaunched(error),
             };
-            control.publish(ACTIVATING, host.pid);
+            control.publish(Target::Host(Arc::clone(&host.fence)));
             let output = match (io.stdout.try_clone(), io.stderr.try_clone()) {
                 (Ok(stdout), Ok(stderr)) => (stdout, stderr),
                 (Err(error), _) | (_, Err(error)) => {
@@ -438,8 +463,8 @@ async fn run_pooled(
     // The descriptors travel to the host and are closed here once sent, so end of output is
     // decided by the command's process tree alone.
     let started = host.run(&command, [stdin, stdout, stderr]).await;
-    let pid = match started {
-        Ok(Started::Running(pid)) => pid,
+    let birth = match started {
+        Ok(Started::Running(birth)) => birth,
         Ok(Started::Unexecutable(status)) => return decode(status),
         Ok(Started::ScriptSyntax) => return Outcome::ScriptSyntax,
         Err(error) => {
@@ -447,13 +472,19 @@ async fn run_pooled(
             return Outcome::NotLaunched(error);
         }
     };
-    control.publish(RUNNING, pid);
-    let _ = events.send(ProcessEvent::Started { job_id, pid }).await;
-    match host.exited().await {
+    // The host applies the job's signals to the command while it holds it unreaped; the run
+    // forwards them until the host reports the command's end.
+    let (signals, mut forwarded) = mpsc::unbounded_channel();
+    control.publish(Target::Command(signals));
+    let _ = events.send(ProcessEvent::Started { job_id, birth }).await;
+    let ended = host.exited(&mut forwarded).await;
+    control.finish();
+    match ended {
         Ok(status) => decode(status),
         Err(error) => {
+            // Its host is gone, and with it the one process that could prove the command's group
+            // its own: nothing signals the group from here.
             checkout.poison();
-            let _ = kill_process_group(pid, libc::SIGKILL);
             Outcome::Unobserved(error)
         }
     }
@@ -463,29 +494,32 @@ async fn run_pooled(
 // The host process and its protocol, supervisor side
 
 pub(super) struct ExecHost {
-    child: tokio::process::Child,
-    pid: u32,
+    /// This process is the host's parent and reaps it only inside this fence.
+    fence: Arc<ChildFence>,
     control: tokio::net::UnixStream,
-    /// Set once the host's own exit status was collected: its pid, and so its group id, may
-    /// then belong to another process, which no signal of ours may reach.
-    reaped: bool,
     /// Set once the host closed its end of the control socket, or announced that it exits.
     closed: bool,
 }
 
 /// A dropped host takes its activation with it: the host leads its own process group, which
 /// holds `direnv` and whatever the evaluation started, while every command it forked leads a
-/// group of its own and keeps running.
+/// group of its own and keeps running. The host is then reaped in the background, through its
+/// fence, so its id is freed only once no signal of this process can reach it.
 impl Drop for ExecHost {
     fn drop(&mut self) {
-        if !self.reaped {
-            let _ = kill_process_group(self.pid, libc::SIGKILL);
+        let _ = self.fence.signal(libc::SIGKILL);
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            let fence = Arc::clone(&self.fence);
+            runtime.spawn(async move {
+                let _ = fence.wait().await;
+            });
         }
     }
 }
 
 enum Started {
-    Running(u32),
+    /// The command runs; the host observed its group leader before it could reap it.
+    Running(Birth),
     /// The argv could not be executed; the host already wrote why to the job's stderr.
     Unexecutable(RawWaitStatus),
     /// The script did not parse; the host already wrote why to the job's stderr.
@@ -555,33 +589,7 @@ impl ExecHost {
     }
 
     async fn receive(&mut self) -> Result<Vec<u8>> {
-        let mut header = [0_u8; 4];
-        if let Err(error) = self.control.read_exact(&mut header).await {
-            self.closed |= host_closed(&error);
-            return Err(protocol_error("reply", error));
-        }
-        let length = usize::try_from(u32::from_le_bytes(header)).unwrap_or(usize::MAX);
-        if length > MAX_FRAME_BYTES {
-            return Err(protocol_error("reply", "frame exceeds its bound"));
-        }
-        let mut payload = vec![0_u8; length];
-        if let Err(error) = self.control.read_exact(&mut payload).await {
-            self.closed |= host_closed(&error);
-            return Err(protocol_error("reply", error));
-        }
-        // The host names why it could not serve the request, then exits.
-        if let Ok((REPLY_HOST_FAILED, mut fields)) = FrameReader::new(&payload) {
-            self.closed = true;
-            let reason = fields
-                .bytes()
-                .map(|reason| String::from_utf8_lossy(reason).into_owned())
-                .unwrap_or_else(|error| format!("an unreadable reason ({error})"));
-            return Err(CowshedError::environment_missing(
-                format!("the workspace shell host failed: {reason}"),
-                "cowshed doctor --json",
-            ));
-        }
-        Ok(payload)
+        receive_frame(&mut self.control, &mut self.closed).await
     }
 
     async fn run(&mut self, command: &RunCommand, descriptors: [OwnedFd; 3]) -> Result<Started> {
@@ -615,7 +623,7 @@ impl ExecHost {
             FrameReader::new(&payload).map_err(|error| protocol_error("reply", error))?;
         let started = match tag {
             REPLY_STARTED => {
-                Started::Running(fields.u32().map_err(|e| protocol_error("reply", e))?)
+                Started::Running(fields.birth().map_err(|e| protocol_error("reply", e))?)
             }
             REPLY_EXITED => {
                 Started::Unexecutable(fields.i32().map_err(|e| protocol_error("reply", e))?)
@@ -632,8 +640,45 @@ impl ExecHost {
         Ok(started)
     }
 
-    async fn exited(&mut self) -> Result<RawWaitStatus> {
-        let payload = self.receive().await?;
+    /// Wait for the command's end, forwarding the job's signals to the host meanwhile: the host
+    /// applies each to the command's group only while it still holds the command unreaped, and a
+    /// signal it reads after reporting the end reaches nothing.
+    async fn exited(
+        &mut self,
+        signals: &mut mpsc::UnboundedReceiver<i32>,
+    ) -> Result<RawWaitStatus> {
+        let mut closed = false;
+        let payload = {
+            let (mut replies, mut requests) = self.control.split();
+            let reply = receive_frame(&mut replies, &mut closed);
+            tokio::pin!(reply);
+            let mut forwarding = true;
+            loop {
+                tokio::select! {
+                    payload = &mut reply => break payload,
+                    signal = signals.recv(), if forwarding => match signal {
+                        Some(signal) => {
+                            let sent = FrameWriter::new(REQUEST_SIGNAL)
+                                .i32(signal)
+                                .finish()
+                                .map_err(io::Error::other);
+                            let sent = match sent {
+                                Ok(frame) => requests.write_all(&frame).await,
+                                Err(error) => Err(error),
+                            };
+                            if let Err(error) = sent {
+                                // The reply says how the host ended; the signal reached nothing.
+                                eprintln!("cowshed: cannot send a job signal to its host: {error}");
+                                forwarding = false;
+                            }
+                        }
+                        None => forwarding = false,
+                    },
+                }
+            }
+        };
+        self.closed |= closed;
+        let payload = payload?;
         let (tag, mut fields) =
             FrameReader::new(&payload).map_err(|error| protocol_error("reply", error))?;
         if tag != REPLY_EXITED {
@@ -651,21 +696,58 @@ impl ExecHost {
     /// End a host that broke its protocol. One that closed its end is exiting and is waited
     /// for; one still running is killed, and its death is this call's, not the job's.
     async fn end(&mut self) -> HostEnd {
-        if !self.closed && !matches!(self.child.try_wait(), Ok(Some(_))) {
-            let _ = kill_process_group(self.pid, libc::SIGKILL);
-            let _ = self.child.wait().await;
-            self.reaped = true;
-            return HostEnd::Killed;
-        }
-        match self.child.wait().await {
-            Ok(status) => {
-                self.reaped = true;
-                HostEnd::Own(status.into_raw())
+        if !self.closed {
+            match self.fence.try_reap() {
+                Ok(Some(status)) => return HostEnd::Own(status.into_raw()),
+                Ok(None) => {
+                    let _ = self.fence.signal(libc::SIGKILL);
+                    let _ = self.fence.wait().await;
+                    return HostEnd::Killed;
+                }
+                // Not reapable: dropping the host still ends its group through the fence.
+                Err(_) => return HostEnd::Killed,
             }
-            // Not reaped: dropping the host still ends its group.
+        }
+        match self.fence.wait().await {
+            Ok(status) => HostEnd::Own(status.into_raw()),
             Err(_) => HostEnd::Killed,
         }
     }
+}
+
+/// One reply frame from a host's control socket. A host that names why it failed is closed, and
+/// so is one whose end of the socket is gone.
+async fn receive_frame<R: tokio::io::AsyncRead + Unpin>(
+    control: &mut R,
+    closed: &mut bool,
+) -> Result<Vec<u8>> {
+    let mut header = [0_u8; 4];
+    if let Err(error) = control.read_exact(&mut header).await {
+        *closed |= host_closed(&error);
+        return Err(protocol_error("reply", error));
+    }
+    let length = usize::try_from(u32::from_le_bytes(header)).unwrap_or(usize::MAX);
+    if length > MAX_FRAME_BYTES {
+        return Err(protocol_error("reply", "frame exceeds its bound"));
+    }
+    let mut payload = vec![0_u8; length];
+    if let Err(error) = control.read_exact(&mut payload).await {
+        *closed |= host_closed(&error);
+        return Err(protocol_error("reply", error));
+    }
+    // The host names why it could not serve the request, then exits.
+    if let Ok((REPLY_HOST_FAILED, mut fields)) = FrameReader::new(&payload) {
+        *closed = true;
+        let reason = fields
+            .bytes()
+            .map(|reason| String::from_utf8_lossy(reason).into_owned())
+            .unwrap_or_else(|error| format!("an unreadable reason ({error})"));
+        return Err(CowshedError::environment_missing(
+            format!("the workspace shell host failed: {reason}"),
+            "cowshed doctor --json",
+        ));
+    }
+    Ok(payload)
 }
 
 enum HostActivation {
@@ -714,8 +796,7 @@ impl HostActivator {
             .current_dir(self.home())
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .kill_on_drop(false);
+            .stderr(Stdio::null());
         prepare_child_descriptors(command.as_std_mut())
             .map_err(ExecError::from)
             .map_err(super::supervisor::map_exec_error)?;
@@ -740,22 +821,20 @@ impl HostActivator {
                 Ok(())
             });
         }
+        // Through `std`: this process alone reaps the host, inside its fence ([`ChildFence`]).
         let child = command
+            .into_std()
             .spawn()
             .map_err(classify_spawn_error)
             .map_err(ExecError::from)
             .map_err(super::supervisor::map_exec_error)?;
         drop(theirs);
-        let pid = child
-            .id()
-            .ok_or_else(|| CowshedError::internal("spawned exec host has no process identity"))?;
+        let fence = Arc::new(ChildFence::new(child.id())?);
         ours.set_nonblocking(true).map_err(pipe_error)?;
         let control = tokio::net::UnixStream::from_std(ours).map_err(pipe_error)?;
         Ok(ExecHost {
-            child,
-            pid,
+            fence,
             control,
-            reaped: false,
             closed: false,
         })
     }

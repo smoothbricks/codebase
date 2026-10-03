@@ -3975,6 +3975,7 @@ impl NativeProjectRuntimeHost {
         force: bool,
     ) -> Result<(NativeWorkspace, NativeRemovalGitFence)> {
         self.stop_supervisor_for_removal(workspace, force).await?;
+        require_lost_groups_released(workspace, self.job_group_ledger(workspace), "remove").await?;
         let current = self.current(workspace).await?;
         Self::require_exact_incarnation(&current, &initial.incarnation)?;
         let fence = self.removal_git_fence(&current).await?;
@@ -4421,6 +4422,12 @@ impl NativeProjectRuntimeHost {
             self.mark_lifecycle_intent_mutating(&workspace).await?;
             let incarnation = current.derived.workspace.incarnation().clone();
             self.stop_supervisor(&workspace).await?;
+            require_lost_groups_released(
+                &workspace,
+                self.job_group_ledger(&workspace),
+                "restore main",
+            )
+            .await?;
             let current = self.current(&workspace).await?;
             Self::require_exact_incarnation(&current, &incarnation)?;
             let rollback_state = self.adopt_rollback_state(&current, &pre_cowshed).await?;
@@ -5087,7 +5094,7 @@ impl NativeProjectRuntimeHost {
             current.derived.workspace.incarnation(),
             crate::storage::job_artifact::ArtifactConfig::default().retained_recovery_budget_bytes,
         )?;
-        let config = super::supervisor::WorkspaceSupervisorConfig {
+        let mut config = super::supervisor::WorkspaceSupervisorConfig {
             authority: needed,
             owned_repo_ids: self.owned_repo_ids()?,
             workspace_root: mount,
@@ -5118,6 +5125,8 @@ impl NativeProjectRuntimeHost {
             // use: a spare activated ahead of demand is the next command's warm shell.
             shell_pool: super::shell_pool::ShellPoolConfig::default(),
             group_ledger: Some(super::job_groups::ledger_path(&socket)),
+            // Filled from the lost predecessor's ledger once this process holds the socket.
+            inherited_groups: Vec::new(),
         };
         // A workspace has one supervisor, its one job allocator: when another controller
         // process already serves it under this authority, its commands go there.
@@ -5151,7 +5160,7 @@ impl NativeProjectRuntimeHost {
         // The socket first: holding it is what makes this the workspace's one supervisor, so
         // what the last one left running is this one's to end and seal.
         let listener = super::supervisor_socket::bind(&socket).await?;
-        self.seal_lost_jobs(&socket, &config).await?;
+        self.seal_lost_jobs(&socket, &mut config).await?;
         // Every commitment goes to this process's own sink, the host's default, and is kept for
         // controllers that forward the workspace's commitments into sinks of their own.
         let feed = super::commitment_feed::CommitmentFeed::default();
@@ -5236,27 +5245,43 @@ impl NativeProjectRuntimeHost {
     }
 
     /// Before a supervisor starts on the socket it now holds: end the process groups its lost
-    /// predecessor's ledger still names, then seal `failed` with `supervisorLost` every job this
+    /// predecessor's ledger still names and can prove the job's, hand the supervisor the ones it
+    /// cannot (`inherited_groups`), then seal `failed` with `supervisorLost` every job this
     /// incarnation admitted and never sealed, recording their terminal commitments. Holding the
     /// socket means no other supervisor serves the workspace; a job the ledger does not name lost
     /// its ledger entry, or its terminal record, to the power loss that ended it.
     async fn seal_lost_jobs(
         &mut self,
         socket: &Path,
-        config: &super::supervisor::WorkspaceSupervisorConfig,
+        config: &mut super::supervisor::WorkspaceSupervisorConfig,
     ) -> Result<()> {
         use super::supervisor::{CommitmentDraft, CommitmentSink as _};
 
         let ledger = super::job_groups::ledger_path(socket);
-        tokio::task::spawn_blocking(move || super::job_groups::take_lost(&ledger, LOST_JOB_GRACE))
-            .await
-            .map_err(|error| CowshedError::internal(format!("ending lost jobs failed: {error}")))?
-            .map_err(|error| {
-                CowshedError::environment_missing(
-                    format!("cannot end the jobs a lost supervisor left running: {error}"),
-                    "cowshed doctor --json",
-                )
-            })?;
+        let unresolved = tokio::task::spawn_blocking(move || {
+            super::job_groups::take_lost(&ledger, LOST_JOB_GRACE)
+        })
+        .await
+        .map_err(|error| CowshedError::internal(format!("ending lost jobs failed: {error}")))?
+        .map_err(|error| {
+            CowshedError::environment_missing(
+                format!("cannot end the jobs a lost supervisor left running: {error}"),
+                "cowshed doctor --json",
+            )
+        })?;
+        for group in &unresolved {
+            eprintln!(
+                "cowshed: workspace {}: job {} process group {} (recorded by lost supervisor process \
+                 {}) still has processes but its leader is gone, so they cannot be told from \
+                 another group that took the id; not signalled, kept in the ledger and reported by \
+                 `cowshed doctor`",
+                config.authority.workspace,
+                group.job_id(),
+                group.pgid(),
+                group.lost_supervisor()
+            );
+        }
+        config.inherited_groups = unresolved;
         let (root, owned, incarnation, artifacts) = (
             config.workspace_root.clone(),
             config.owned_repo_ids.clone(),
@@ -5309,6 +5334,17 @@ impl NativeProjectRuntimeHost {
                 .await?;
         }
         Ok(())
+    }
+
+    /// The ledger of the process groups `workspace`'s supervisor runs, and of the groups a lost
+    /// one left unresolved ([`super::job_groups`]): what any change to the workspace's substrate
+    /// reads first to learn whether processes it cannot account for may still use it.
+    fn job_group_ledger(&self, workspace: &WorkspaceName) -> PathBuf {
+        super::job_groups::ledger_path(&super::supervisor_socket::socket_path(
+            self.descriptor.storage.store(),
+            &self.descriptor.repo_id,
+            workspace,
+        ))
     }
 
     async fn stop_supervisor(&mut self, name: &WorkspaceName) -> Result<()> {
@@ -7935,6 +7971,8 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
             )
             .await?;
         self.stop_supervisor(&workspace).await?;
+        require_lost_groups_released(&workspace, self.job_group_ledger(&workspace), "restore")
+            .await?;
         let checkpoint_ref = crate::storage::lifecycle::CheckpointRef::new(
             current.derived.workspace.clone(),
             checkpoint.label.clone(),
@@ -8899,6 +8937,13 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                 }));
                 for workspace in workspaces {
                     let workspace_name = workspace.derived.workspace.name().clone();
+                    findings.extend(
+                        unresolved_group_findings(
+                            &workspace_name,
+                            self.job_group_ledger(&workspace_name),
+                        )
+                        .await,
+                    );
                     let expected_mount = match self.workspace_mount_path(&workspace_name) {
                         Ok(path) => path,
                         Err(error) => {
@@ -10880,15 +10925,21 @@ mod removal_supervisor_tests {
             request: ProcessSpawnRequest,
             events: tokio::sync::mpsc::Sender<ProcessEvent>,
         ) -> Result<Box<dyn RunningProcess>> {
+            // Not a process: its pid names nothing this test owns, so no group is identified.
+            let birth = super::super::job_groups::Birth::Unobserved {
+                pid: 42,
+                reason: "a test process has no process group".into(),
+            };
             events
                 .send(ProcessEvent::Started {
                     job_id: request.job_id,
-                    pid: 42,
+                    birth: birth.clone(),
                 })
                 .await
                 .map_err(|_| CowshedError::internal("test process event channel closed"))?;
             Ok(Box::new(TestProcess {
                 job_id: request.job_id,
+                birth,
                 events,
                 signals: self.0.clone(),
             }))
@@ -10897,6 +10948,7 @@ mod removal_supervisor_tests {
 
     struct TestProcess {
         job_id: JobId,
+        birth: super::super::job_groups::Birth,
         events: tokio::sync::mpsc::Sender<ProcessEvent>,
         signals: Arc<Mutex<Vec<ProcessSignal>>>,
     }
@@ -10910,8 +10962,8 @@ mod removal_supervisor_tests {
     }
 
     impl RunningProcess for TestProcess {
-        fn pid(&self) -> Option<u32> {
-            Some(42)
+        fn birth(&self) -> Option<&super::super::job_groups::Birth> {
+            Some(&self.birth)
         }
 
         fn try_write_stdin(&mut self, _bytes: bytes::Bytes) -> Result<bool> {
@@ -13194,6 +13246,197 @@ fn native_finding(
         message: error.message,
         hint: error.hint,
         path: None,
+    }
+}
+
+/// A stopped supervisor is not proof that every process it started has gone. Recovery may keep
+/// groups whose leader it cannot identify. Ordinary admission remains safe, but replacing or
+/// destroying their image would cut the substrate out from under an unaccounted-for writer.
+#[cfg(target_os = "macos")]
+async fn require_lost_groups_released(
+    workspace: &WorkspaceName,
+    ledger: PathBuf,
+    operation: &str,
+) -> Result<()> {
+    let read = ledger.clone();
+    let groups = crate::storage::lifecycle::dispatch_blocking(move || {
+        super::job_groups::take_lost(&read, LOST_JOB_GRACE)
+    })
+    .await
+    .map_err(|error| {
+        CowshedError::internal(format!(
+            "inspecting stopped workspace {workspace}'s groups: {error}"
+        ))
+    })?
+    .map_err(|error| {
+        CowshedError::environment_missing(
+            format!(
+                "cannot {operation} workspace {workspace}: its stopped supervisor's process-group \
+                 ledger {} cannot be reconciled: {error}",
+                ledger.display()
+            ),
+            "cowshed doctor --json",
+        )
+    })?;
+    if let Some(group) = groups.first() {
+        return Err(CowshedError::conflict(
+            format!(
+                "cannot {operation} workspace {workspace}: {} unresolved process group(s) remain; \
+                 job {} group {} from lost supervisor {} may still use its image, retained in {}",
+                groups.len(),
+                group.job_id(),
+                group.pgid(),
+                group.lost_supervisor(),
+                ledger.display()
+            ),
+            format!(
+                "cowshed doctor --json; inspect `ps -g {}` and retry only after the group releases \
+                 the image; do not force-detach or remove its ledger",
+                group.pgid()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod unresolved_retirement_tests {
+    use super::*;
+    use std::io::{BufRead as _, Read as _, Write as _};
+    use std::os::unix::process::CommandExt as _;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn destructive_changes_retain_a_leaderless_writer_until_it_releases_naturally() {
+        let root = std::env::temp_dir().join(format!(
+            "cowshed-unresolved-retirement-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let ledger = root.join("supervisor.groups");
+        let workspace = WorkspaceName::new("retained").unwrap();
+        let mut child = std::process::Command::new("/bin/sh")
+            .args([
+                "-c",
+                "exec 3<&0; (printf 'READY\\n'; cat <&3; printf 'RELEASED\\n') & exit 0",
+            ])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let birth = super::super::job_groups::GroupLeader::observe(child.id()).unwrap();
+        super::super::job_groups::record(&ledger, &[(9, birth)], &[]).unwrap();
+        let mut release = child.stdin.take().unwrap();
+        let mut output = std::io::BufReader::new(child.stdout.take().unwrap());
+        let mut ready = String::new();
+        output.read_line(&mut ready).unwrap();
+        assert_eq!(ready, "READY\n");
+        assert!(child.wait().unwrap().success());
+
+        for operation in ["remove", "restore", "restore main"] {
+            let error = require_lost_groups_released(&workspace, ledger.clone(), operation)
+                .await
+                .unwrap_err();
+            assert_eq!(error.code, ErrorCode::Conflict);
+            assert!(
+                error
+                    .message
+                    .contains(&format!("job 9 group {}", birth.pgid()))
+            );
+            let unresolved = super::super::job_groups::unresolved(&ledger).unwrap();
+            assert_eq!(unresolved.len(), 1);
+            assert_eq!(unresolved[0].job_id(), 9);
+            assert_eq!(unresolved[0].pgid(), birth.pgid());
+        }
+        release.write_all(b"the writer is still alive\n").unwrap();
+        drop(release);
+        let mut tail = String::new();
+        output.read_to_string(&mut tail).unwrap();
+        assert_eq!(tail, "the writer is still alive\nRELEASED\n");
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while !super::super::job_groups::unresolved(&ledger)
+            .unwrap()
+            .is_empty()
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the writer did not release its group"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        require_lost_groups_released(&workspace, ledger.clone(), "remove")
+            .await
+            .unwrap();
+        assert!(
+            !ledger.exists(),
+            "released group evidence is reconciled before retirement"
+        );
+        std::fs::remove_dir(root).unwrap();
+    }
+}
+
+/// The groups a lost supervisor left that processes still hold although their leader is gone,
+/// observed now from the workspace's ledger ([`super::job_groups::UnresolvedGroup`]). Read-only:
+/// the workspace's next ledger writer drops the ones nothing holds any more.
+#[cfg(target_os = "macos")]
+async fn unresolved_group_findings(
+    workspace: &WorkspaceName,
+    ledger: PathBuf,
+) -> Vec<crate::api::dto::Finding> {
+    let read = ledger.clone();
+    let observed =
+        crate::storage::lifecycle::dispatch_blocking(move || super::job_groups::unresolved(&read))
+            .await;
+    match observed {
+        Ok(Ok(groups)) => groups
+            .into_iter()
+            .map(|group| crate::api::dto::Finding {
+                code: "unresolved-job-group".into(),
+                severity: crate::api::dto::FindingSeverity::Warning,
+                message: format!(
+                    "workspace {workspace}: job {} process group {} still has processes, but the \
+                     supervisor that ran it (process {}) was lost and {}; they cannot be told \
+                     from another group that took the id, so cowshed has not signalled them",
+                    group.job_id(),
+                    group.pgid(),
+                    group.lost_supervisor(),
+                    match group.reason() {
+                        super::job_groups::UnresolvedReason::LeaderGone =>
+                            "the group's recorded leader has been reaped",
+                        super::job_groups::UnresolvedReason::LeaderNeverIdentified =>
+                            "an earlier cowshed recorded the group without its leader's identity",
+                    }
+                ),
+                hint: format!(
+                    "inspect them with `ps -g {}`; cowshed drops this record once nothing holds \
+                     the group id",
+                    group.pgid()
+                ),
+                path: Some(ledger.clone()),
+            })
+            .collect(),
+        Ok(Err(error)) => vec![crate::api::dto::Finding {
+            code: "unresolved-job-group".into(),
+            severity: crate::api::dto::FindingSeverity::Error,
+            message: format!(
+                "workspace {workspace}: the job process group ledger {} cannot be inspected: \
+                 {error}",
+                ledger.display()
+            ),
+            hint: "cowshed doctor --json".into(),
+            path: Some(ledger),
+        }],
+        Err(error) => vec![crate::api::dto::Finding {
+            code: "unresolved-job-group".into(),
+            severity: crate::api::dto::FindingSeverity::Error,
+            message: format!(
+                "workspace {workspace}: inspecting the job process group ledger {} failed: {error}",
+                ledger.display()
+            ),
+            hint: "cowshed doctor --json".into(),
+            path: Some(ledger),
+        }],
     }
 }
 
