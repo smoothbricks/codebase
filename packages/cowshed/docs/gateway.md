@@ -83,10 +83,12 @@ Measurements used `Accept: application/vnd.npm.install-v1+json; q=1.0, applicati
 | `wrangler`    |     16,297,094 |
 
 The 134,217,728-byte cap gives the largest measured body 5.24 times headroom while retaining a finite upstream bound.
-Oversized metadata returns HTTP 502 with JSON `code: "mirror-metadata-too-large"`, the package in `package`, its size in
-`sizeBytes`, the bound in `limitBytes`, and a readable `error`. `sizeBytes` is the declared `Content-Length` when
-available, or a lower bound from the observed stream prefix; the gateway does not drain an oversized upstream to
-determine its final length. The audit classification is also `mirror-metadata-too-large`.
+Oversized buffered metadata returns HTTP 502 with JSON `code: "mirror-metadata-too-large"`, the package in `package`,
+its size in `sizeBytes`, the bound in `limitBytes`, and a readable `error`. `sizeBytes` is the declared `Content-Length`
+when available, or a lower bound from the observed stream prefix; the gateway does not drain an oversized upstream to
+determine its final length. The audit classification is also `mirror-metadata-too-large`. Cacheable client metadata
+streamed only into a cache fill can exceed its bound after HTTP 200 headers have already been sent when no
+`Content-Length` was declared; those streams abort rather than replacing the response status.
 
 ## Start at login (launchd)
 
