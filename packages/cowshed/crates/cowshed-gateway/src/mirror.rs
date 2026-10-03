@@ -23,7 +23,10 @@ use crate::{
 const MAX_REDIRECTS: u8 = 5;
 const MAX_LOCATION_BYTES: usize = 8 * 1024;
 const MAX_OBJECT_BYTES: u64 = 2 * 1024 * 1024 * 1024;
-const MAX_METADATA_BYTES: u64 = 8 * 1024 * 1024;
+/// Bounded metadata body size: 5.24x the largest abbreviated npm packument measured
+/// in October 2026 (next, 25,607,776 bytes). JSON DOM parsing and rewriting allocate
+/// additional memory beyond this input bound.
+pub const MAX_METADATA_BYTES: u64 = 128 * 1024 * 1024;
 /// What npm clients send for a packument; the mirror asks for the same representation.
 const NPM_PACKUMENT_ACCEPT: &str =
     "application/vnd.npm.install-v1+json; q=1.0, application/json; q=0.8, */*";
@@ -305,7 +308,7 @@ impl MirrorService {
         if response.response.status() != StatusCode::OK {
             return Err(MirrorError::MissingIntegrity);
         }
-        let bytes = collect_metadata(response.response.into_body()).await?;
+        let (_, bytes) = collect_metadata(response.response, &tarball.metadata.identity).await?;
         let path = tarball
             .upstream_path
             .split_once('?')
@@ -557,22 +560,47 @@ fn response_from_hit(
     }
 }
 
-async fn collect_metadata(mut body: MirrorBody) -> Result<Vec<u8>, MirrorError> {
+async fn collect_metadata(
+    response: Response<MirrorBody>,
+    package: &str,
+) -> Result<(http::response::Parts, Vec<u8>), MirrorError> {
+    if let Some(size_bytes) = response_content_length_optional(&response)?
+        && size_bytes > MAX_METADATA_BYTES
+    {
+        return Err(MirrorError::MetadataTooLarge {
+            package: package.to_owned(),
+            size_bytes,
+        });
+    }
+    let (parts, mut body) = response.into_parts();
     let mut bytes = Vec::new();
     while let Some(frame) = body.frame().await {
-        let frame = frame.map_err(MirrorError::Upstream)?;
+        let frame = frame.map_err(|error| {
+            if matches!(
+                error.downcast_ref::<CacheError>(),
+                Some(CacheError::ObjectTooLarge)
+            ) {
+                MirrorError::MetadataTooLarge {
+                    package: package.to_owned(),
+                    size_bytes: MAX_METADATA_BYTES + 1,
+                }
+            } else {
+                MirrorError::Upstream(error)
+            }
+        })?;
         if let Ok(data) = frame.into_data() {
-            if bytes
-                .len()
-                .checked_add(data.len())
-                .is_none_or(|length| length > MAX_METADATA_BYTES as usize)
-            {
-                return Err(MirrorError::MetadataTooLarge);
+            let size_bytes =
+                u64::try_from(bytes.len().saturating_add(data.len())).unwrap_or(u64::MAX);
+            if size_bytes > MAX_METADATA_BYTES {
+                return Err(MirrorError::MetadataTooLarge {
+                    package: package.to_owned(),
+                    size_bytes,
+                });
             }
             bytes.extend_from_slice(&data);
         }
     }
-    Ok(bytes)
+    Ok((parts, bytes))
 }
 
 /// The path npm clients request a package's packument at: `/@scope%2fname` or `/name`.
@@ -637,13 +665,7 @@ async fn rewrite_metadata_response(
     {
         return Ok(response);
     }
-    if response_content_length_optional(&response)?
-        .is_some_and(|length| length > MAX_METADATA_BYTES)
-    {
-        return Err(MirrorError::MetadataTooLarge);
-    }
-    let (mut parts, body) = response.into_parts();
-    let bytes = collect_metadata(body).await?;
+    let (mut parts, bytes) = collect_metadata(response, &request.metadata.identity).await?;
     let rewritten = match request.protocol {
         MirrorProtocol::Npm => rewrite_npm_packument(request, &bytes)?,
         MirrorProtocol::Cargo if request.upstream_path == "/config.json" => {
@@ -879,8 +901,13 @@ fn response_limit(
         }
         return Ok(expected.length);
     }
-    if header_length.is_some_and(|length| length > MAX_METADATA_BYTES) {
-        return Err(MirrorError::ObjectTooLarge);
+    if let Some(size_bytes) = header_length
+        && size_bytes > MAX_METADATA_BYTES
+    {
+        return Err(MirrorError::MetadataTooLarge {
+            package: request.metadata.identity.clone(),
+            size_bytes,
+        });
     }
     Ok(MAX_METADATA_BYTES)
 }
@@ -1201,8 +1228,15 @@ pub enum MirrorError {
     MissingIntegrity,
     #[error("mirror object exceeds the 2 GiB maximum")]
     ObjectTooLarge,
-    #[error("mirror metadata exceeds the 8 MiB parser limit")]
-    MetadataTooLarge,
+    #[error(
+        "mirror metadata for {package} is at least {size_bytes} bytes; limit is {} bytes",
+        MAX_METADATA_BYTES
+    )]
+    MetadataTooLarge {
+        package: String,
+        /// Declared length or a lower bound from the observed stream prefix.
+        size_bytes: u64,
+    },
     #[error("mirror metadata is malformed")]
     InvalidMetadata,
     #[error("mirror metadata points at an unadmitted origin")]

@@ -1066,6 +1066,101 @@ async fn local_mirror_route_rewrites_only_the_admitted_scope() {
     gateway.drain().await.expect("drain gateway");
 }
 
+/// A packument over the mirror's metadata bound reaches the registry client as a typed failure
+/// naming the package and its size, not as an opaque mirror-service 502. The upstream declares
+/// its length and then never sends a byte: the refusal comes from the declared length alone, so
+/// a hostile registry cannot make the gateway buffer the body it is refusing.
+#[tokio::test]
+async fn oversized_mirror_metadata_reaches_the_client_as_a_typed_failure() {
+    let upstream = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind oversized packument fixture");
+    let upstream_port = upstream.local_addr().expect("fixture address").port();
+    let declared = cowshed_gateway::MAX_METADATA_BYTES + 1;
+    let (captured, mut forwarded) = mpsc::channel(1);
+    let release = Arc::new(Notify::new());
+    let held = release.clone();
+    let _upstream = tokio::spawn(async move {
+        let (mut stream, _) = upstream.accept().await.expect("accept packument request");
+        captured
+            .send(read_headers(&mut stream).await)
+            .await
+            .expect("capture packument request");
+        stream
+            .write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {declared}\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .expect("write packument headers");
+        held.notified().await;
+    });
+    let endpoint = free_endpoint();
+    let gateway = gateway(
+        test_config(),
+        Arc::new(NoCredentials),
+        Arc::new(LocalConnector {
+            health: UpstreamHealth::Healthy,
+            observed: None,
+        }),
+        Arc::new(DiscardAudit),
+    )
+    .await;
+    let policy = WorkspacePolicy {
+        grants: Vec::new(),
+        mirrors: vec![MirrorRoute {
+            local_prefix: "/npm/".to_owned(),
+            upstream_origin: format!("https://mirror.test:{upstream_port}"),
+            protocol: MirrorProtocol::Npm,
+            admitted_prefixes: vec!["/".to_owned()],
+            credentialed: false,
+        }],
+    };
+    let (session, token, _) = session(
+        "oversized",
+        "owner/repo-oversized",
+        block_endpoint(endpoint),
+        13,
+        1,
+        policy,
+    );
+    gateway
+        .handle()
+        .install(session)
+        .await
+        .expect("install mirror session");
+
+    let response = proxy_request(
+        endpoint,
+        format!(
+            "GET /npm/@huge%2fpkg HTTP/1.1\r\nHost: {endpoint}\r\nProxy-Authorization: Bearer {token}\r\nConnection: close\r\n\r\n"
+        ),
+    )
+    .await;
+    release.notify_one();
+    let forwarded = forwarded.recv().await.expect("captured packument request");
+    assert!(
+        forwarded.starts_with("GET /@huge%2fpkg HTTP/1.1"),
+        "{forwarded}"
+    );
+    assert!(response.starts_with("HTTP/1.1 502"), "{response}");
+    let (_, body) = response
+        .split_once("\r\n\r\n")
+        .expect("response has a body");
+    let problem: serde_json::Value = serde_json::from_str(body).expect("typed JSON failure");
+    assert_eq!(problem["code"], "mirror-metadata-too-large", "{problem}");
+    assert_eq!(problem["package"], "@huge/pkg", "{problem}");
+    assert_eq!(problem["sizeBytes"], declared, "{problem}");
+    assert_eq!(
+        problem["limitBytes"],
+        cowshed_gateway::MAX_METADATA_BYTES,
+        "{problem}"
+    );
+    gateway.drain().await.expect("drain gateway");
+}
+
 /// A registry client talks to its registry, not to a proxy, so it can only send the token in its
 /// own `Authorization` header: bun as `Bearer` (bunfig `token`), Go as `Basic` (netrc). On the
 /// local mirror routes that header carries the workspace token; it is still one exact token,

@@ -45,9 +45,9 @@ pub use interfaces::{
     UpstreamConnector, UpstreamHealth, UpstreamPurpose,
 };
 pub use mirror::{
-    MirrorBody, MirrorCacheScope, MirrorCacheStatus, MirrorError, MirrorFetchRequest,
-    MirrorOutcome, MirrorProtocolMetadata, MirrorRedirect, MirrorRequest, MirrorResourceKind,
-    MirrorResponse, MirrorService, MirrorUpstream,
+    MAX_METADATA_BYTES, MirrorBody, MirrorCacheScope, MirrorCacheStatus, MirrorError,
+    MirrorFetchRequest, MirrorOutcome, MirrorProtocolMetadata, MirrorRedirect, MirrorRequest,
+    MirrorResourceKind, MirrorResponse, MirrorService, MirrorUpstream,
 };
 #[cfg(target_os = "macos")]
 pub use platform::KeychainCredentialProvider;

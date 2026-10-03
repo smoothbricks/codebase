@@ -63,6 +63,31 @@ Five jobs:
 Every decision is auditable in Arrow telemetry under `/private/cowshed/store/telemetry/gateway/`
 ([telemetry.md](telemetry.md)).
 
+### Registry metadata limits
+
+Metadata the gateway buffers is bounded at 128 MiB, including packuments fetched to recover a lockfile tarball's
+published integrity. The limit applies before buffering or parsing; JSON parsing and tarball-URL rewriting allocate
+additional memory. A buffered stream without `Content-Length` is stopped as soon as it crosses the bound. Uncacheable
+client metadata responses pass through without buffering; this parser bound does not limit those streamed responses.
+
+The limit is a power of two with more than four times the largest abbreviated npm packument measured on 2026-10-03.
+Measurements used `Accept: application/vnd.npm.install-v1+json; q=1.0, application/json; q=0.8, */*` and
+`Accept-Encoding: identity` against `https://registry.npmjs.org`:
+
+| Package       | Metadata bytes |
+| ------------- | -------------: |
+| `typescript`  |      8,714,866 |
+| `@types/node` |      2,332,109 |
+| `next`        |     25,607,776 |
+| `aws-sdk`     |      3,771,153 |
+| `wrangler`    |     16,297,094 |
+
+The 134,217,728-byte cap gives the largest measured body 5.24 times headroom while retaining a finite upstream bound.
+Oversized metadata returns HTTP 502 with JSON `code: "mirror-metadata-too-large"`, the package in `package`, its size in
+`sizeBytes`, the bound in `limitBytes`, and a readable `error`. `sizeBytes` is the declared `Content-Length` when
+available, or a lower bound from the observed stream prefix; the gateway does not drain an oversized upstream to
+determine its final length. The audit classification is also `mirror-metadata-too-large`.
+
 ## Start at login (launchd)
 
 On macOS, run:

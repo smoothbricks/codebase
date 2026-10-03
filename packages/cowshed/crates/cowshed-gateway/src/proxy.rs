@@ -50,8 +50,8 @@ use crate::{
         UpstreamConnection, UpstreamConnector, UpstreamHealth, UpstreamPurpose,
     },
     mirror::{
-        MirrorBody, MirrorCacheScope, MirrorCacheStatus, MirrorError, MirrorFetchRequest,
-        MirrorOutcome, MirrorRequest, MirrorService, MirrorUpstream,
+        MAX_METADATA_BYTES, MirrorBody, MirrorCacheScope, MirrorCacheStatus, MirrorError,
+        MirrorFetchRequest, MirrorOutcome, MirrorRequest, MirrorService, MirrorUpstream,
     },
     repo_mirror::RepoMirrorHandle,
     sim_broker::{SimBrokerError, SimBrokerHandle, SimRequest},
@@ -956,7 +956,35 @@ async fn mirror_failure(
     error: MirrorError,
     audit_kind: AuditKind,
 ) -> Response<ResponseBody> {
-    let (status, audit_status, classification, message) = match error {
+    if let MirrorError::MetadataTooLarge {
+        package,
+        size_bytes,
+    } = &error
+    {
+        let status = StatusCode::BAD_GATEWAY;
+        complete_now(
+            context,
+            admission,
+            AuditStatus::Failed,
+            Some(status),
+            Some("mirror-metadata-too-large"),
+            0,
+            audit_kind,
+        )
+        .await;
+        return json_problem(
+            status,
+            serde_json::json!({
+                "code": "mirror-metadata-too-large",
+                "error": error.to_string(),
+                "package": package,
+                "sizeBytes": size_bytes,
+                "limitBytes": MAX_METADATA_BYTES,
+                "grantHint": null,
+            }),
+        );
+    }
+    let (status, audit_status, classification, message) = match &error {
         MirrorError::OfflineMiss => (
             StatusCode::SERVICE_UNAVAILABLE,
             AuditStatus::Offline,
@@ -2985,10 +3013,16 @@ fn empty(status: StatusCode) -> Response<ResponseBody> {
 const PROXY_REALM: &str = "Basic realm=\"cowshed\", charset=\"UTF-8\"";
 
 fn problem(status: StatusCode, message: &str, hint: Option<&str>) -> Response<ResponseBody> {
-    let value = serde_json::json!({
-        "error": message,
-        "grantHint": hint,
-    });
+    json_problem(
+        status,
+        serde_json::json!({
+            "error": message,
+            "grantHint": hint,
+        }),
+    )
+}
+
+fn json_problem(status: StatusCode, value: serde_json::Value) -> Response<ResponseBody> {
     let bytes = Bytes::from(value.to_string());
     let body = Full::new(bytes)
         .map_err(|never| -> BoxError { match never {} })

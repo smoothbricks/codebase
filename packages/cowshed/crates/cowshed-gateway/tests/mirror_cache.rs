@@ -2,10 +2,12 @@ use std::{
     collections::VecDeque,
     fs::OpenOptions as StdOpenOptions,
     path::{Path, PathBuf},
+    pin::Pin,
     sync::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
+    task::{Context, Poll},
     time::Duration,
 };
 
@@ -14,12 +16,13 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use bytes::Bytes;
 use cowshed_gateway::{
     Cache, CacheBodyError, CacheConfig, CacheError, CanonicalTarget, ConfigError, GatewayConfig,
-    MirrorBody, MirrorCacheConfig, MirrorCacheScope, MirrorCacheStatus, MirrorError,
-    MirrorFetchRequest, MirrorOutcome, MirrorProtocol, MirrorRequest, MirrorResourceKind,
-    MirrorRoute, MirrorService, MirrorUpstream, ObjectDigest, ObjectExpectation, TargetScheme,
-    UpstreamHealth, WorkspacePolicy,
+    MAX_METADATA_BYTES, MirrorBody, MirrorCacheConfig, MirrorCacheScope, MirrorCacheStatus,
+    MirrorError, MirrorFetchRequest, MirrorOutcome, MirrorProtocol, MirrorRequest,
+    MirrorResourceKind, MirrorRoute, MirrorService, MirrorUpstream, ObjectDigest,
+    ObjectExpectation, TargetScheme, UpstreamHealth, WorkspacePolicy,
 };
 use http::{HeaderMap, Method, Response, StatusCode, header};
+use http_body::{Body, Frame};
 use http_body_util::{BodyExt as _, Full};
 use sha2::{Digest as _, Sha256, Sha512};
 use uuid::Uuid;
@@ -112,6 +115,32 @@ impl MirrorUpstream for FailingUpstream {
     ) -> Result<Response<MirrorBody>, CacheBodyError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         Err("fixture connector offline".into())
+    }
+}
+
+struct OversizedMetadataBody {
+    sent: u64,
+}
+
+impl Body for OversizedMetadataBody {
+    type Data = Bytes;
+    type Error = CacheBodyError;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        _context: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, CacheBodyError>>> {
+        assert!(
+            self.sent <= MAX_METADATA_BYTES,
+            "oversized stream was drained"
+        );
+        let bytes = if self.sent == MAX_METADATA_BYTES {
+            Bytes::from_static(b" ")
+        } else {
+            Bytes::from_static(&[b' '; 1024 * 1024])
+        };
+        self.sent += u64::try_from(bytes.len()).expect("frame length fits u64");
+        Poll::Ready(Some(Ok(Frame::data(bytes))))
     }
 }
 
@@ -427,6 +456,100 @@ async fn synthetic_digest_header_cannot_supply_protocol_integrity() {
         Err(MirrorError::MissingIntegrity)
     ));
     assert_eq!(upstream.call_count(), 1);
+}
+
+#[tokio::test]
+async fn metadata_over_the_old_cap_supplies_tarball_integrity() {
+    let artifact = b"verified tarball";
+    let mut packument = serde_json::to_vec(&serde_json::json!({
+        "name": "typescript",
+        "versions": { "1.0.0": { "dist": {
+            "tarball": "https://registry.npmjs.org/typescript/-/typescript-1.0.0.tgz",
+            "integrity": format!("sha512-{}", STANDARD.encode(Sha512::digest(artifact))),
+            "size": artifact.len()
+        }}}
+    }))
+    .expect("encode packument");
+    packument.resize(8 * 1024 * 1024 + 1, b' ');
+
+    for response in [
+        registry_packument_response(&packument),
+        json_response(&packument),
+    ] {
+        let root = TestRoot::new();
+        let service = open_service(&root).await;
+        let request = request(
+            MirrorProtocol::Npm,
+            target("registry.npmjs.org"),
+            "/typescript/-/typescript-1.0.0.tgz",
+            MirrorCacheScope::Anonymous,
+            false,
+            None,
+        );
+        let upstream = QueueUpstream::new([response, ok_response(artifact)]);
+        let (status, bytes) = collect(
+            service
+                .execute(request, UpstreamHealth::Healthy, &upstream)
+                .await
+                .expect("large metadata supplies published integrity"),
+        )
+        .await;
+        assert_eq!(status, MirrorCacheStatus::Filled);
+        assert_eq!(bytes.as_ref(), artifact);
+        assert_eq!(upstream.call_count(), 2);
+        assert_eq!(upstream.requests()[0].path, "/typescript");
+    }
+}
+
+#[tokio::test]
+async fn metadata_over_the_new_cap_is_a_typed_package_failure() {
+    for (declared_length, cacheable) in [(true, false), (false, false), (false, true)] {
+        let root = TestRoot::new();
+        let service = open_service(&root).await;
+        let request = request(
+            MirrorProtocol::Npm,
+            target("registry.npmjs.org"),
+            "/@huge/pkg/-/pkg-1.0.0.tgz",
+            MirrorCacheScope::Anonymous,
+            false,
+            None,
+        );
+        let mut response = Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "application/vnd.npm.install-v1+json");
+        if !cacheable {
+            response = response.header(header::VARY, "accept-encoding, accept");
+        }
+        let upstream_body = if declared_length {
+            response = response.header(header::CONTENT_LENGTH, MAX_METADATA_BYTES + 1);
+            body(Bytes::new())
+        } else {
+            OversizedMetadataBody { sent: 0 }.boxed()
+        };
+        let upstream = QueueUpstream::new([response
+            .body(upstream_body)
+            .expect("oversized metadata response")]);
+        let error = service
+            .execute(request, UpstreamHealth::Healthy, &upstream)
+            .await
+            .expect_err("oversized metadata must fail before fetching a tarball");
+        assert!(error.to_string().contains("@huge/pkg"));
+        assert!(
+            error
+                .to_string()
+                .contains(&(MAX_METADATA_BYTES + 1).to_string())
+        );
+        let MirrorError::MetadataTooLarge {
+            package,
+            size_bytes,
+        } = error
+        else {
+            panic!("expected typed metadata size failure");
+        };
+        assert_eq!(package, "@huge/pkg");
+        assert_eq!(size_bytes, MAX_METADATA_BYTES + 1);
+        assert_eq!(upstream.call_count(), 1);
+    }
 }
 
 #[tokio::test]
