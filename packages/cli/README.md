@@ -416,12 +416,15 @@ nothing when nothing changed:
 - The origin checkout's shell publishes a private `.devenv` evaluated export; after cowshed clones the image,
   `tooling/direnv/inherited-devenv.ts` can reuse that export in the new checkout. It checks the exact contents and
   executable bits of `tooling/direnv` and local `path:` inputs, devenv's watched inputs, the toolchain and the emitted
-  task graph before relocating paths to this checkout. The export is produced without caller credentials after devenv
-  proves its merged enterShell hook is disabled for the evaluation; the original hook executes only when direnv imports
-  it in the destination checkout. Missing or changed inputs, external symlinks, or writing enterShell tasks fall back to
-  in-place evaluation. A writable cache shared by siblings is never a source of shell code; successful reuse drains the
-  complete export (including shells larger than 64 KiB) and reports reuse without printing the origin checkout path or
-  credentials. To verify the full physical path (host-origin Nix evaluation, scratch APFS adoption/COW clone, dedicated
+  task graph before relocating paths to this checkout. The export is evaluated after devenv proves its merged enterShell
+  hook is disabled, with the checkout's live network routing (proxy variables, `NO_PROXY`, CA files, `NIX_CONFIG`'s
+  `ssl-cert-file`) and Nix's client fetcher cache but no other caller credential. Nix's shared evaluation cache is
+  disabled for this evaluation; an export that embeds a proxy value or its userinfo is never published, and the
+  destination checkout keeps its own routing. The original hook executes only when direnv imports it in the destination
+  checkout. Missing or changed inputs, external symlinks, or writing enterShell tasks fall back to in-place evaluation.
+  A writable cache shared by siblings is never a source of shell code; successful reuse drains the complete export
+  (including shells larger than 64 KiB) and reports reuse without printing the origin checkout path or credentials. To
+  verify the full physical path (host-origin Nix evaluation, scratch APFS adoption/COW clone, dedicated
   Gateway/ActorBridge sandbox entry, and poisoned symlink fallback) on macOS, run
   `cargo test -p cowshed-cli --test command_dispatch real_apfs_first_shell_reuses_private_origin_artifact_without_exposing_origin -- --ignored --nocapture`.
   This explicit smoke exceeds nextest's normal 30-second per-test limit; ordinary tests keep that limit.

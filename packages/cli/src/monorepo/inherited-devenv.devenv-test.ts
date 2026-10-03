@@ -19,6 +19,30 @@ const program = join(managedAssetsRoot, 'raw/tooling/direnv/inherited-devenv.ts'
 const repositoryLock = join(managedAssetsRoot, '..', '..', '..', 'tooling', 'direnv', 'devenv.lock');
 const timeout = 1_200_000;
 type Workspace = { root: string; env: Record<string, string> };
+const PROXY = ['HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'http_proxy', 'https_proxy', 'all_proxy'] as const;
+// The caller's live routing and trust, as the caller has them: inside a cowshed
+// workspace, its own gateway endpoint (token as userinfo), exclusions and CA.
+const routing: Record<string, string> = {};
+for (const name of [
+  ...PROXY,
+  'NO_PROXY',
+  'no_proxy',
+  'NIX_CONFIG',
+  'NIX_SSL_CERT_FILE',
+  'SSL_CERT_FILE',
+  'NODE_EXTRA_CA_CERTS',
+  'GIT_SSL_CAINFO',
+]) {
+  const value = process.env[name];
+  if (value !== undefined) routing[name] = value;
+}
+const callerHome = process.env.HOME;
+if (!callerHome) throw new Error('the real devenv fixture needs the caller HOME that locates its Nix cache');
+// Nix's client cache, resolved as nix resolves it for the caller. Each fixture
+// HOME is fresh, but this machine-wide fetch index (cowshed shares one across
+// workspaces) is not checkout state: without it every first entry downloads the
+// locked nixpkgs tarball from GitHub again.
+const nixCache = process.env.NIX_CACHE_HOME ?? join(process.env.XDG_CACHE_HOME ?? join(callerHome, '.cache'), 'nix');
 
 function lock(): string {
   const original = JSON.parse(readFileSync(repositoryLock, 'utf8'));
@@ -48,6 +72,7 @@ function workspace(scratch: string, name: string, nix: string): Workspace {
     TMPDIR: join(scratch, `tmp-${name}`),
     XDG_RUNTIME_DIR: join(scratch, `run-${name}`),
     XDG_DATA_HOME: join(root, '.data'),
+    NIX_CACHE_HOME: nixCache,
   };
   for (const directory of [env.HOME, env.TMPDIR, env.XDG_RUNTIME_DIR, join(env.XDG_DATA_HOME, 'devenv')])
     mkdirSync(directory, { recursive: true });
@@ -55,7 +80,7 @@ function workspace(scratch: string, name: string, nix: string): Workspace {
     join(env.XDG_DATA_HOME, 'devenv', 'cachix_trusted_keys.json'),
     '{"devenv":"devenv.cachix.org-1:w1cLUi8dv3hnoSPGAuibQv+f9TZLr6cv/Hm9XgU50cw="}\n',
   );
-  return { root, env };
+  return { root, env: { ...routing, ...env } };
 }
 
 function clone(scratch: string, from: Workspace, name: string): Workspace {
@@ -68,14 +93,17 @@ function clone(scratch: string, from: Workspace, name: string): Workspace {
   return to;
 }
 
-function shell(ws: Workspace): {
+function shell(
+  ws: Workspace,
+  options: readonly string[] = [],
+): {
   script: string;
   stderr: string;
   imported: Record<string, string>;
   runsBeforeImport: number;
 } {
   const dir = join(ws.root, 'tooling', 'direnv');
-  const result = spawnSync('bun', [program, ws.root, 'direnv-export'], {
+  const result = spawnSync('bun', [program, ws.root, ...options, 'direnv-export'], {
     cwd: dir,
     env: ws.env,
     encoding: 'utf8',
@@ -158,14 +186,22 @@ describe('private inherited devenv with real devenv', () => {
         origin.env.HOME = scratch;
         delete origin.env.COWSHED_PORT_BASE;
         origin.env.PRIVATE_CREDENTIAL = 'origin-only-secret-sentinel';
+        // A live proxy credential the evaluator receives. Every fetch here is HTTPS,
+        // so a plain-HTTP proxy routes nothing; any caller HTTPS routing stays as is.
+        origin.env.http_proxy = 'http://cowshed:origin-proxy-token-sentinel@127.0.0.1:49136';
         const first = shell(origin);
         expect(first.imported.PROBE).toBe('host-origin');
         expect(first.imported.SHELL_PADDING).toBe(padding);
         expect(existsSync(join(origin.root, 'tooling/direnv/.devenv/inherited-shell.json'))).toBe(true);
-        expect(readFileSync(join(origin.root, 'tooling/direnv/.devenv/inherited-shell.json'), 'utf8')).not.toContain(
+        const artifact = readFileSync(join(origin.root, 'tooling/direnv/.devenv/inherited-shell.json'), 'utf8');
+        for (const secret of [
           origin.env.PRIVATE_CREDENTIAL,
-        );
+          'origin-proxy-token-sentinel',
+          ...PROXY.flatMap((name) => origin.env[name] ?? []),
+        ])
+          expect(artifact).not.toContain(secret);
         const next = clone(scratch, origin, 'fresh-shed');
+        next.env.http_proxy = 'http://cowshed:fresh-shed-proxy-token-sentinel@127.0.0.1:49200';
         const second = shell(next);
         expect(second.stderr).toContain('reused this checkout');
         expect(second.imported.PROBE).toBe('host-origin');
@@ -173,6 +209,30 @@ describe('private inherited devenv with real devenv', () => {
         expect(second.imported.DEVENV_ROOT).toBe(join(next.root, 'tooling/direnv'));
         expect(second.script).not.toContain(origin.root);
         expect(second.script).not.toContain(origin.env.PRIVATE_CREDENTIAL);
+        expect(second.script).not.toContain('origin-proxy-token-sentinel');
+        // The reused shell routes through the clone's own proxy, never the origin's.
+        for (const name of PROXY) expect(second.imported[name]).toBe(next.env[name]);
+      } finally {
+        rmSync(scratch, { recursive: true, force: true });
+      }
+    },
+    timeout,
+  );
+
+  it(
+    'evaluates with the live proxy credential but never publishes an export that captured it',
+    () => {
+      const scratch = realpathSync(mkdtempSync('/tmp/smoo-inh-'));
+      try {
+        const main = workspace(scratch, 'main', '{ ... }: { env.CAPTURED_PROXY = builtins.getEnv "http_proxy"; }\n');
+        main.env.http_proxy = 'http://cowshed:captured-proxy-token-sentinel@127.0.0.1:49136';
+        // Impure evaluation lets devenv.nix read the evaluator's environment. Only an
+        // evaluator that received the live credential can embed it, and that export
+        // stays this checkout's: it is refused before anything is published.
+        const first = shell(main, ['--impure']);
+        expect(first.stderr).toContain('proxy routing, which no clone may inherit; evaluating in place');
+        expect(first.imported.CAPTURED_PROXY).toBe(main.env.http_proxy);
+        expect(existsSync(join(main.root, 'tooling/direnv/.devenv/inherited-shell.json'))).toBe(false);
       } finally {
         rmSync(scratch, { recursive: true, force: true });
       }

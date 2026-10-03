@@ -179,13 +179,17 @@ them there; they contain the endpoint URL, whose userinfo is the workspace token
   really differs per path. The absolute root, its `.devenv`, `TMPDIR` and runtime directory are inputs to its
   evaluation-cache key, and its exported hook may embed each path. The origin checkout's `.devenv` lives inside the
   workspace image and travels to a new workspace through cowshed's copy-on-write clone. A smoo-managed shell
-  (`tooling/direnv/inherited-devenv.ts`) records a real `devenv direnv-export` in that private `.devenv` with a
-  credential-free evaluator environment and a verified disabled merged hook. Before relocating it in a clone, it checks
-  exact source and local path-input contents, devenv's watched input paths, the toolchain, and the emitted task graph.
-  The graph may not contain writing prerequisites for `devenv:enterShell`. The original merged enterShell hook is not
-  executed during verification; direnv imports and runs it in the destination checkout. Missing, changed or unsafe
-  evidence falls back to an in-place evaluation. No sibling can update another's private artifact: a shared writable
-  cache, however content-addressed, cannot safely serve executable shell exports.
+  (`tooling/direnv/inherited-devenv.ts`) records a real `devenv direnv-export` in that private `.devenv` with a verified
+  disabled merged hook. Its evaluator fetches inputs through the workspace's live routing — the proxy variables (token
+  as userinfo), `NO_PROXY`, the CA files and the `ssl-cert-file` line of `NIX_CONFIG` — and Nix's client fetcher cache.
+  The evaluator disables Nix's shared evaluation cache so it cannot supply executable shell code, and receives no other
+  credential or `NIX_CONFIG` line. An export that embeds a proxy value or its userinfo is never published, so a clone
+  always routes through its own gateway. Before relocating it in a clone, it checks exact source and local path-input
+  contents, devenv's watched input paths, the toolchain, and the emitted task graph. The graph may not contain writing
+  prerequisites for `devenv:enterShell`. The original merged enterShell hook is not executed during verification; direnv
+  imports and runs it in the destination checkout. Missing, changed or unsafe evidence falls back to an in-place
+  evaluation. No sibling can update another's private artifact: a shared writable cache, however content-addressed,
+  cannot safely serve executable shell exports.
 
   **Every checkout reaches a shared tool home through the host's literal path.** Cargo fingerprints a registry or git
   dependency by the absolute path of its source under `$CARGO_HOME` (measured: the same registry reached through a

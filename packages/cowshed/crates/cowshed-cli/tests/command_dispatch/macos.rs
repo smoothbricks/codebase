@@ -154,12 +154,26 @@ impl Fixture {
             "{\"devenv\":\"devenv.cachix.org-1:w1cLUi8dv3hnoSPGAuibQv+f9TZLr6cv/Hm9XgU50cw=\"}\n",
         )
         .expect("public cache key");
+        // Nix's client cache, resolved as nix resolves it for this caller. The fresh host
+        // home is the shell's own, but this machine-wide fetch index is not: without it the
+        // origin evaluation downloads every locked input the machine already fetched.
+        let nix_cache = match (
+            std::env::var_os("NIX_CACHE_HOME"),
+            std::env::var_os("XDG_CACHE_HOME"),
+        ) {
+            (Some(nix), _) => PathBuf::from(nix),
+            (None, Some(xdg)) => PathBuf::from(xdg).join("nix"),
+            (None, None) => {
+                PathBuf::from(std::env::var_os("HOME").expect("caller HOME")).join(".cache/nix")
+            }
+        };
         let result = Command::new("bun")
             .arg(directory.join("inherited-devenv.ts"))
             .arg(&self.checkout)
             .arg("direnv-export")
             .current_dir(&directory)
             .env("HOME", &home)
+            .env("NIX_CACHE_HOME", &nix_cache)
             .env("PRIVATE_CREDENTIAL", "origin-only-secret-sentinel")
             .env_remove("COWSHED_PORT_BASE")
             .output()

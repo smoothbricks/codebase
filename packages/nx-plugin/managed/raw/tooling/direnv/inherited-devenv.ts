@@ -34,8 +34,16 @@ const ENV_PATHS = [
   'DIRENV_CONFIG',
   'NX_SOCKET_DIR',
 ] as const;
-// Nix receives no caller credential, gateway token, or ambient impure override
-// while creating an artifact. A live shell still runs with its exact caller env.
+// The evaluator fetches the lock's inputs itself, so it runs with this
+// workspace's live routing: the proxy endpoint (a cowshed workspace's userinfo is
+// its own gateway token), its exclusions, the CA files, and the one NIX_CONFIG
+// setting that is pure transport (`ssl-cert-file`, which outranks nix.conf). Nix's
+// client cache comes along so a locked input already fetched on this machine is
+// not downloaded again. No other caller credential, gateway token, NIX_CONFIG
+// line (`access-tokens`, `impure-env`, …) or ambient impure override reaches it.
+// Routing belongs to the evaluating checkout only: an export that embeds any
+// proxy value or its userinfo is never published. A live shell still runs with
+// its exact caller env.
 const EVALUATOR_ENV = [
   'PATH',
   'HOME',
@@ -45,6 +53,7 @@ const EVALUATOR_ENV = [
   'XDG_CACHE_HOME',
   'XDG_DATA_HOME',
   'XDG_STATE_HOME',
+  'NIX_CACHE_HOME',
   'DEVENV_HOME',
   'DIRENV_CONFIG',
   'NX_SOCKET_DIR',
@@ -61,7 +70,11 @@ const EVALUATOR_ENV = [
   'GIT_SSL_CAINFO',
   'DEVELOPER_DIR',
   'SDKROOT',
+  'NO_PROXY',
+  'no_proxy',
 ] as const;
+/** curl and reqwest read these; a value may carry credentials as URL userinfo. */
+const PROXY_ENV = ['HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'http_proxy', 'https_proxy', 'all_proxy'] as const;
 
 type Watch = { readonly scope: 'root' | 'home' | 'runtime' | 'tmp' | 'store'; readonly relative: string };
 type Entry = {
@@ -82,13 +95,54 @@ interface Artifact {
   readonly export: string;
 }
 
-function privateEnvironment(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+/** NIX_CONFIG reduced to its last `ssl-cert-file`, read as nix reads it: `#` starts a comment. */
+function nixTransportConfig(config: string | undefined): string | undefined {
+  let caFile: string | undefined;
+  for (const line of config?.split('\n') ?? []) {
+    const setting = /^\s*ssl-cert-file\s*=\s*(.*?)\s*$/.exec(line.split('#', 1)[0] ?? '');
+    if (setting) caFile = setting[1];
+  }
+  return caFile === undefined ? undefined : `ssl-cert-file = ${caFile}`;
+}
+
+export function privateEnvironment(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   const selected: NodeJS.ProcessEnv = {};
-  for (const name of EVALUATOR_ENV) {
+  for (const name of [...EVALUATOR_ENV, ...PROXY_ENV]) {
     const value = env[name];
     if (value !== undefined) selected[name] = value;
   }
+  const transport = nixTransportConfig(env.NIX_CONFIG);
+  if (transport !== undefined) selected.NIX_CONFIG = transport;
   return selected;
+}
+
+function percentDecoded(text: string): string {
+  try {
+    return decodeURIComponent(text);
+  } catch {
+    return text;
+  }
+}
+
+/**
+ * Whether `text` holds a proxy value of `env`, or the credential in its userinfo. A
+ * userinfo with a password is matched whole or by the password, never by the
+ * username alone: cowshed's username is the fixed label `cowshed`.
+ */
+export function embedsRouting(text: string, env: NodeJS.ProcessEnv): boolean {
+  const secrets: string[] = [];
+  for (const name of PROXY_ENV) {
+    const value = env[name];
+    if (!value) continue;
+    secrets.push(value);
+    const url = URL.parse(value);
+    if (url?.password) {
+      secrets.push(`${url.username}:${url.password}`, url.password, percentDecoded(url.password));
+    } else if (url?.username) {
+      secrets.push(url.username, percentDecoded(url.username));
+    }
+  }
+  return secrets.some((secret) => text.includes(secret));
 }
 
 function toolchain(env: NodeJS.ProcessEnv): string | undefined {
@@ -527,7 +581,8 @@ export function exportShell(rootPath: string, args: readonly string[], env: Node
   }
   try {
     const before = sourceBasis(root);
-    const options = args.slice(0, -1);
+    // Shared fetcher bytes are useful; a sibling-writable Nix eval cache must not supply shell code.
+    const options = [...args.slice(0, -1), '--nix-option', 'eval-cache', 'false'];
     const disabled = [...options, '--option', 'enterShell:string', ''];
     const evaluate = (argv: readonly string[]) =>
       Bun.spawnSync(['devenv', ...argv], {
@@ -594,8 +649,11 @@ export function exportShell(rootPath: string, args: readonly string[], env: Node
       toolchain: version,
       export: exported,
     };
+    const serialized = `${JSON.stringify(artifact)}\n`;
+    if (embedsRouting(exported, safe) || embedsRouting(serialized, safe))
+      throw new Error("the evaluated shell embeds this checkout's proxy routing, which no clone may inherit");
     const staged = `${file}.${randomUUID()}`;
-    writeFileSync(staged, `${JSON.stringify(artifact)}\n`, { mode: 0o600, flag: 'wx' });
+    writeFileSync(staged, serialized, { mode: 0o600, flag: 'wx' });
     renameSync(staged, file);
     process.stdout.write(exported);
     return 0;
