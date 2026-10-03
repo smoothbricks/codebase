@@ -71,11 +71,11 @@ interface DeveloperLinks {
 }
 
 /**
- * Runs `install` with every developer link under `root` kept. The links in
- * place when it starts are exactly the links in place when it settles,
- * whether it resolved or rejected, less those that already dangled; except
- * that a resolved install keeps what it left at the packages `relink` names.
- * It then names the links in place as `reportDeveloperLinks` does.
+ * Runs `install` while preserving the developer links captured under `root`.
+ * On rejection every captured live link is restored, less links that already
+ * dangled; a resolved install keeps its selected `relink` replacements.
+ * This is not a transaction over new entries created by the install. Relink
+ * intent reports the actual final link state on either outcome.
  */
 export async function keepDeveloperLinks<T>(
   root: string,
@@ -88,7 +88,7 @@ export async function keepDeveloperLinks<T>(
     console.error(`! removed developer link ${link.path}: its target ${resolvedTarget(root, link)} no longer exists`);
   }
   // Only an install that resolved leaves the links it was meant to replace as
-  // it made them; a rejected one puts every link back.
+  // it made them; a rejected one puts every captured live link back.
   let replaced: readonly string[] | undefined;
   try {
     const result = await install();
@@ -100,7 +100,7 @@ export async function keepDeveloperLinks<T>(
         restoreLink(root, link);
       }
     }
-    if (replaced?.length) {
+    if (options !== undefined) {
       reportDeveloperLinks(root);
     } else {
       describeDeveloperLinks(root, live);

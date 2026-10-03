@@ -464,11 +464,12 @@ names the packages it replaces so that smoo does not undo it:
 `keepDeveloperLinks(root, install, { relink: ['@scope/name'] })` from the repository's
 `tooling/direnv/developer-links.ts`. A name is a package name, scoped or not, and selects that package's link in the
 root's `node_modules` and in every workspace member's. When `install` resolves, what it left at those names stays and
-every other developer link is put back as for any install. When it rejects, every link is put back, the named ones
-included, so a failed relink changes nothing. The line naming linked checkouts then lists the links in place after the
-install, not the ones before it. `relink` selects links and creates none: a named package without a link to a local
-checkout when the install starts is left as the install leaves it, and a named link whose checkout is gone is removed
-with the usual warning first.
+every other captured developer link is put back as for any install. When it rejects, every captured live link is put
+back, the named ones included. Entries that had no developer link at the start remain as the failed install left them;
+this helper does not promise transactional rollback of new package-manager entries. Relink intent lists the actual final
+linked checkouts on success or failure. `relink` selects links and creates none: a named package without a link to a
+local checkout when the install starts is left as the install leaves it, and a named link whose checkout is gone is
+removed with the usual warning first.
 
 ## Formatting And Git Hooks
 

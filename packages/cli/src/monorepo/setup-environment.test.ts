@@ -739,6 +739,28 @@ describe('what shell entry keeps linked', () => {
         expect(texts()).toEqual(original);
       });
     });
+
+    it('restores captured links without hiding a new external entry left by a failed relink', async () => {
+      await withDeveloperLinks(async ({ root, original, texts }) => {
+        const provider = join(dirname(root), 'new-provider');
+        await mkdir(provider);
+        const created = 'node_modules/@fixture/new';
+        const failure = new Error('package-manager partial relink failed');
+        await expect(
+          keepDeveloperLinks(
+            root,
+            async () => {
+              await linkEntry(root, created, provider);
+              await linkEntry(root, APP_LIB, provider);
+              throw failure;
+            },
+            { relink: ['@fixture/lib', '@fixture/new'] },
+          ),
+        ).rejects.toBe(failure);
+        expect(texts()).toEqual(original);
+        expect(readlinkSync(join(root, created))).toBe(provider);
+      });
+    });
   });
 });
 
