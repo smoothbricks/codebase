@@ -1,4 +1,5 @@
-//! macOS host adapter: APFS inventory, Authorization Services, diskutil, fstab.
+//! macOS host adapter: kernel APFS inventory, Authorization Services, diskutil, fstab.
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{CString, OsString, c_void};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
@@ -10,7 +11,7 @@ use std::process::{Command, Output};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use plist::{Dictionary, Value};
+use plist::Value;
 use tokio::sync::oneshot;
 use uuid::Uuid;
 use zeroize::Zeroizing;
@@ -31,7 +32,11 @@ use super::shared::{
     VolumeOutcome, VolumeState, execute_native_bootstrap_plan, existing_host_storage_error,
     platform_host_error, provision_volumes_action, setup_execution_error, write_marker_action,
 };
+use crate::apfs::{RegisteredApfsContainer, registered_apfs_containers};
 use crate::error::CowshedError;
+use crate::storage::apfs::native::{
+    KernelMountSnapshot, KernelMountSource, SystemKernelMountSource,
+};
 use crate::storage::fstab::{COWSHED_FSTAB_TAG, FstabPin, build_fstab};
 
 const DISKUTIL_PROBE_DEADLINE: Duration = Duration::from_secs(5);
@@ -425,7 +430,7 @@ fn desired_mount_service(pins: &[FstabPin]) -> Result<MountServiceFiles, NativeB
     let mut mounts = String::new();
     for pin in pins {
         Uuid::parse_str(&pin.volume_uuid).map_err(|_| {
-            NativeBootstrapError::MalformedPlist(format!(
+            NativeBootstrapError::MalformedApfsInventory(format!(
                 "{} has invalid APFS volume UUID {:?}",
                 pin.label, pin.volume_uuid
             ))
@@ -597,7 +602,7 @@ fn prepare_setup_snapshot(
     home: &Path,
     existing_fstab: &str,
 ) -> Result<SetupSnapshot, NativeBootstrapError> {
-    let gathered = gather_existing_apfs_evidence(source, home, InventoryReadPolicy::Strict)?;
+    let gathered = gather_existing_apfs_evidence(source, home)?;
     let selected = select_substrate(gathered.statfs, None)?;
     let mut plan = plan_bootstrap(selected, home, gathered.bootstrap)?;
     let pins = gathered
@@ -720,13 +725,13 @@ fn build_host_actions(
     for volume in volumes {
         let existing_identity = || {
             let uuid = volume.volume_uuid.clone().ok_or_else(|| {
-                NativeBootstrapError::MalformedPlist(format!(
+                NativeBootstrapError::MalformedApfsInventory(format!(
                     "{} has no APFS volume UUID",
                     volume.name
                 ))
             })?;
             let size_bytes = volume.size_bytes.ok_or_else(|| {
-                NativeBootstrapError::MalformedPlist(format!(
+                NativeBootstrapError::MalformedApfsInventory(format!(
                     "{} has no APFS container capacity",
                     volume.name
                 ))
@@ -1625,24 +1630,25 @@ struct MountedVolumeEvidence {
 
 trait EvidenceSource {
     fn statfs(&mut self, path: &Path) -> Result<StatFsSnapshot, NativeBootstrapError>;
-    fn run_command(
-        &mut self,
-        command: &HostCommand,
-    ) -> Result<HostCommandOutput, NativeBootstrapError>;
+    /// One authoritative kernel snapshot of every APFS container, with each volume's kernel mount.
+    ///
+    /// Required of every source: no listing decision may come from a CLI projection, so tests
+    /// hand the planner typed registry and mount-table records instead of command output.
+    fn apfs_inventory(&mut self) -> Result<ApfsInventory, NativeBootstrapError>;
     fn inspect_mountpoint(&mut self, path: &Path) -> Result<MountpointState, NativeBootstrapError>;
     fn mounted_volume(
         &mut self,
         path: &Path,
     ) -> Result<MountedVolumeEvidence, NativeBootstrapError>;
-    /// Where the named volume is currently mounted, per per-volume diskutil evidence.
+    /// FileVault state of one reserved volume already selected from the kernel inventory.
     ///
-    /// `None` means detached. This exists because `diskutil apfs list -plist` stopped
-    /// reporting `MountPoint` keys on recent macOS releases, so container-inventory
-    /// evidence alone can no longer distinguish "detached" from "mounted somewhere else".
-    fn volume_mountpoint(
+    /// No kernel property carries FileVault, so this is per-volume crypto metadata for that
+    /// exact record — never a listing and never a global query.
+    fn volume_file_vault(
         &mut self,
-        identifier: &str,
-    ) -> Result<Option<PathBuf>, NativeBootstrapError>;
+        container: &str,
+        volume: &ApfsVolume,
+    ) -> Result<bool, NativeBootstrapError>;
     fn keychain_item_usable(&mut self, label: &'static str) -> Result<bool, NativeBootstrapError>;
     fn invoking_identity(&mut self) -> (u32, u32);
 }
@@ -1656,11 +1662,8 @@ impl EvidenceSource for SystemEvidenceSource<'_> {
         system_statfs(path)
     }
 
-    fn run_command(
-        &mut self,
-        command: &HostCommand,
-    ) -> Result<HostCommandOutput, NativeBootstrapError> {
-        self.host.run_command(command).map_err(Into::into)
+    fn apfs_inventory(&mut self) -> Result<ApfsInventory, NativeBootstrapError> {
+        system_apfs_inventory()
     }
 
     fn inspect_mountpoint(&mut self, path: &Path) -> Result<MountpointState, NativeBootstrapError> {
@@ -1693,30 +1696,21 @@ impl EvidenceSource for SystemEvidenceSource<'_> {
         })
     }
 
-    fn volume_mountpoint(
+    fn volume_file_vault(
         &mut self,
-        identifier: &str,
-    ) -> Result<Option<PathBuf>, NativeBootstrapError> {
-        let command = HostCommand::new(DISKUTIL, ["info", "-plist", identifier]);
-        let output = self
-            .host
-            .run_command(&command)
-            .map_err(NativeBootstrapError::Host)?;
+        container: &str,
+        volume: &ApfsVolume,
+    ) -> Result<bool, NativeBootstrapError> {
+        let command = HostCommand::new(DISKUTIL, ["info", "-plist", volume.identifier.as_str()]);
+        let output = self.host.run_command(&command)?;
         if !output.succeeded() {
             return Err(NativeBootstrapError::CommandFailed(
                 HostCommandFailure::new(command, output),
             ));
         }
-        let value = plist::Value::from_reader(std::io::Cursor::new(&output.stdout))
-            .map_err(|error| NativeBootstrapError::MalformedPlist(error.to_string()))?;
-        let root = dictionary(&value, "diskutil info root")?;
-        Ok(match root.get("MountPoint") {
-            Some(plist::Value::String(mountpoint)) if !mountpoint.is_empty() => {
-                Some(PathBuf::from(mountpoint))
-            }
-            _ => None,
-        })
+        attest_volume_file_vault(&output.stdout, container, volume)
     }
+
     fn keychain_item_usable(&mut self, label: &'static str) -> Result<bool, NativeBootstrapError> {
         let command = HostCommand::new(
             SECURITY,
@@ -1780,8 +1774,7 @@ fn plan_existing_host_storage(
     source: &mut impl EvidenceSource,
     home: &Path,
 ) -> Result<BootstrapPlan, NativeBootstrapError> {
-    let gathered =
-        gather_existing_apfs_evidence(source, home, InventoryReadPolicy::RepairTransient)?;
+    let gathered = gather_existing_apfs_evidence(source, home)?;
     let selected = select_substrate(gathered.statfs, None)?;
     plan_bootstrap(selected, home, gathered.bootstrap).map_err(Into::into)
 }
@@ -1792,13 +1785,12 @@ fn gather_apfs_evidence(
     home: &Path,
 ) -> Result<GatheredEvidence, NativeBootstrapError> {
     require_canonical(project_root)?;
-    gather_existing_apfs_evidence(source, home, InventoryReadPolicy::Strict)
+    gather_existing_apfs_evidence(source, home)
 }
 
 fn gather_existing_apfs_evidence(
     source: &mut impl EvidenceSource,
     home: &Path,
-    inventory_policy: InventoryReadPolicy,
 ) -> Result<GatheredEvidence, NativeBootstrapError> {
     require_canonical(home)?;
     let snapshot = source.statfs(home)?;
@@ -1809,17 +1801,9 @@ fn gather_existing_apfs_evidence(
         });
     }
     let mount_device = exact_device_identifier(&snapshot.mount_source)?;
-    // Ask for the home container first: the global inventory is only needed before a create.
-    let container_reference = container_reference_of(&mount_device)
-        .ok_or_else(|| NativeBootstrapError::InvalidMountSource(snapshot.mount_source.clone()))?;
-    let inventory = run_apfs_inventory_command(
-        source,
-        HostCommand::new(
-            DISKUTIL,
-            ["apfs", "list", "-plist", container_reference.as_str()],
-        ),
-        inventory_policy,
-    )?;
+    // One kernel snapshot answers both the home-container classification and the global
+    // reserved-name guard, so the two decisions can never observe different listings.
+    let inventory = source.apfs_inventory()?;
     let container = inventory.containing_container(&mount_device)?;
     let roots = CanonicalRoots::global();
     let mut store = classify_volume(
@@ -1836,17 +1820,8 @@ fn gather_existing_apfs_evidence(
         roots.caches(),
         VolumeRole::Caches,
     )?;
-    if matches!(store.storage, ExistingStorage::Absent)
-        || matches!(caches.storage, ExistingStorage::Absent)
-    {
-        let global = run_apfs_inventory_command(
-            source,
-            HostCommand::new(DISKUTIL, ["apfs", "list", "-plist"]),
-            inventory_policy,
-        )?;
-        guard_absent_volume_globally(source, &global, APFS_STORE_VOLUME, &mut store)?;
-        guard_absent_volume_globally(source, &global, APFS_CACHES_VOLUME, &mut caches)?;
-    }
+    guard_absent_volume_globally(source, &inventory, APFS_STORE_VOLUME, &mut store)?;
+    guard_absent_volume_globally(source, &inventory, APFS_CACHES_VOLUME, &mut caches)?;
 
     let classified = [
         (APFS_STORE_VOLUME, VolumeRole::Store, roots.store(), &store),
@@ -1896,7 +1871,7 @@ fn gather_existing_apfs_evidence(
     for volume in &classified {
         if volume.file_vault == Some(true) && !source.keychain_item_usable(volume.name)? {
             let uuid = volume.volume_uuid.clone().ok_or_else(|| {
-                NativeBootstrapError::MalformedPlist(format!(
+                NativeBootstrapError::MalformedApfsInventory(format!(
                     "{} has FileVault enabled but no APFS volume UUID",
                     volume.name
                 ))
@@ -1918,104 +1893,6 @@ fn gather_existing_apfs_evidence(
         },
         volumes: classified,
     })
-}
-
-#[derive(Clone, Copy, Eq, PartialEq)]
-enum InventoryReadPolicy {
-    // A read-only consumer can repeat an incomplete observation; an inventory used before
-    // creating a volume must fail closed instead of treating a partial scan as absence.
-    Strict,
-    RepairTransient,
-}
-
-fn run_apfs_inventory_command(
-    source: &mut impl EvidenceSource,
-    command: HostCommand,
-    policy: InventoryReadPolicy,
-) -> Result<ApfsInventory, NativeBootstrapError> {
-    const MAX_READ_ATTEMPTS: usize = 4;
-    let attempts = if policy == InventoryReadPolicy::RepairTransient {
-        MAX_READ_ATTEMPTS
-    } else {
-        1
-    };
-    let mut incomplete_reads = 0;
-    for attempt in 1..=attempts {
-        let output = source.run_command(&command).map_err(|error| {
-            if incomplete_reads > 0 {
-                eprintln!(
-                    "diskutil APFS inventory: {incomplete_reads} incomplete reads before retry {attempt}/{attempts} failed: {error}"
-                );
-            }
-            error
-        })?;
-        if !output.succeeded() {
-            if incomplete_reads > 0 {
-                eprintln!(
-                    "diskutil APFS inventory: {incomplete_reads} incomplete reads before retry {attempt}/{attempts} exited {:?}",
-                    output.status
-                );
-            }
-            return Err(NativeBootstrapError::CommandFailed(
-                HostCommandFailure::new(command, output),
-            ));
-        }
-        match parse_apfs_inventory(&output.stdout) {
-            Ok(inventory) => {
-                if attempt > 1 {
-                    eprintln!(
-                        "diskutil APFS inventory repaired after {attempt} reads: {} {:?}",
-                        command.program(),
-                        command.args()
-                    );
-                }
-                return Ok(inventory);
-            }
-            Err(error) => {
-                // During image teardown diskutil can publish an empty root or a container with
-                // only its device name. Reobserve only those incomplete snapshots; no partial
-                // inventory can establish absence, and other malformed records still fail closed.
-                let root = Value::from_reader(std::io::Cursor::new(&output.stdout))
-                    .ok()
-                    .and_then(Value::into_dictionary);
-                let incomplete = root.as_ref().is_some_and(Dictionary::is_empty)
-                    || matches!(error, NativeBootstrapError::DepartingApfsContainer(_));
-                if incomplete {
-                    incomplete_reads += 1;
-                    if attempt < attempts {
-                        std::thread::sleep(Duration::from_millis(50));
-                        continue;
-                    }
-                }
-                let shape = root.map_or_else(
-                    || "not a plist dictionary".to_owned(),
-                    |root| {
-                        if root.is_empty() {
-                            "empty dictionary".to_owned()
-                        } else {
-                            let keys = root.keys().map(String::as_str).collect::<Vec<_>>();
-                            format!("dictionary keys {keys:?}")
-                        }
-                    },
-                );
-                let reason = match error {
-                    NativeBootstrapError::MalformedPlist(reason) => reason,
-                    NativeBootstrapError::DepartingApfsContainer(container) => {
-                        format!("departing APFS container {container:?}")
-                    }
-                    other => return Err(other),
-                };
-                return Err(NativeBootstrapError::MalformedPlist(format!(
-                    "{reason}; {} {:?} exited {:?}, stdout {} bytes, root {shape}, read {attempt}/{attempts} ({incomplete_reads} incomplete reads)",
-                    command.program(),
-                    command.args(),
-                    output.status,
-                    output.stdout.len()
-                )));
-            }
-        }
-    }
-    unreachable!("bounded inventory loop always returns")
 }
 
 fn guard_absent_volume_globally(
@@ -2042,10 +1919,7 @@ fn guard_absent_volume_globally(
     match matches.as_slice() {
         [] => Ok(()),
         [(container, volume)] => {
-            let mounted_at = match &volume.mountpoint {
-                Some(path) => Some(path.clone()),
-                None => source.volume_mountpoint(&volume.identifier)?,
-            };
+            let mounted_at = volume.mountpoint.clone();
             *state = ExistingStorage::FoundElsewhere {
                 container: container.reference.clone(),
                 device: volume.identifier.clone(),
@@ -2053,7 +1927,7 @@ fn guard_absent_volume_globally(
                 size_bytes: container.capacity_bytes,
                 mounted_at,
             };
-            classified.file_vault = Some(volume.file_vault);
+            classified.file_vault = Some(source.volume_file_vault(&container.reference, volume)?);
             Ok(())
         }
         _ => Err(NativeBootstrapError::AmbiguousVolume {
@@ -2085,12 +1959,6 @@ fn exact_device_identifier(path: &Path) -> Result<String, NativeBootstrapError> 
     }
 }
 
-/// The synthesized APFS container (`diskN`) that a device identifier of any depth lives in —
-/// a sealed snapshot's `<volume>s<snapshot>` included — or `None` for a malformed identifier.
-fn container_reference_of(volume_identifier: &str) -> Option<String> {
-    crate::device::container_of(volume_identifier).map(str::to_owned)
-}
-
 fn valid_container_identifier(value: &[u8]) -> bool {
     str::from_utf8(value)
         .ok()
@@ -2107,6 +1975,11 @@ fn valid_volume_identifier(value: &[u8]) -> bool {
         == Some(1)
 }
 
+/// Every APFS container the kernel registry published in one snapshot.
+///
+/// Only [`ApfsInventory::from_kernel`] builds one, so container references and volume
+/// identifiers are globally unique, every volume lies inside its container, and each volume
+/// carries at most one kernel mountpoint.
 #[derive(Clone, Debug)]
 struct ApfsInventory {
     containers: Vec<ApfsContainer>,
@@ -2119,166 +1992,187 @@ struct ApfsContainer {
     volumes: Vec<ApfsVolume>,
 }
 
+/// Kernel identity of one volume. FileVault is deliberately absent: the registry's `Encrypted`
+/// property is per-volume encryption (the Data volume is encrypted without FileVault), so the
+/// FileVault answer comes from [`EvidenceSource::volume_file_vault`] for reserved volumes only.
 #[derive(Clone, Debug)]
 struct ApfsVolume {
     name: String,
     identifier: String,
+    /// The kernel mount-table mountpoint of this exact device; `None` means detached.
     mountpoint: Option<PathBuf>,
     volume_uuid: String,
-    file_vault: bool,
+}
+
+/// IORegistry names the containers and volumes, the kernel mount table names where each volume
+/// is mounted. Neither read queues behind Disk Arbitration, and no CLI listing is consulted.
+fn system_apfs_inventory() -> Result<ApfsInventory, NativeBootstrapError> {
+    let registered = registered_apfs_containers()
+        .map_err(|source| NativeBootstrapError::ApfsRegistry { source })?;
+    let mounts = SystemKernelMountSource
+        .mounts()
+        .map_err(|source| NativeBootstrapError::KernelMountTable { source })?;
+    ApfsInventory::from_kernel(registered, &mounts)
 }
 
 impl ApfsInventory {
+    /// Validate one registry snapshot and attach each volume's kernel mount. Every rule fails
+    /// closed: an empty or inconsistent snapshot can never establish that a volume is absent.
+    fn from_kernel(
+        registered: Vec<RegisteredApfsContainer>,
+        mounts: &[KernelMountSnapshot],
+    ) -> Result<Self, NativeBootstrapError> {
+        if registered.is_empty() {
+            return Err(NativeBootstrapError::EmptyApfsInventory);
+        }
+        let mut mounted: BTreeMap<&str, Vec<PathBuf>> = BTreeMap::new();
+        for mount in mounts {
+            if let Some(device) = mount.source_device.strip_prefix("/dev/") {
+                mounted
+                    .entry(device)
+                    .or_default()
+                    .push(mount.mount_point.clone());
+            }
+        }
+        let mut references = BTreeSet::new();
+        let mut identifiers = BTreeSet::new();
+        let mut containers = Vec::with_capacity(registered.len());
+        for container in registered {
+            if !valid_container_identifier(container.reference.as_bytes()) {
+                return Err(malformed(format!(
+                    "invalid APFS container reference {:?}",
+                    container.reference
+                )));
+            }
+            if !references.insert(container.reference.clone()) {
+                return Err(NativeBootstrapError::DuplicateApfsContainer(
+                    container.reference,
+                ));
+            }
+            if container.capacity_bytes == 0 {
+                return Err(malformed(format!(
+                    "APFS container {:?} has no capacity",
+                    container.reference
+                )));
+            }
+            let mut volumes = Vec::with_capacity(container.volumes.len());
+            for volume in container.volumes {
+                if !valid_volume_identifier(volume.identifier.as_bytes())
+                    || crate::device::container_of(&volume.identifier)
+                        != Some(container.reference.as_str())
+                {
+                    return Err(malformed(format!(
+                        "volume {:?} is not in container {:?}",
+                        volume.identifier, container.reference
+                    )));
+                }
+                if volume.name.is_empty() {
+                    return Err(malformed(format!(
+                        "volume {:?} has no name",
+                        volume.identifier
+                    )));
+                }
+                if volume.volume_uuid.len() != 36
+                    || !Uuid::try_parse(&volume.volume_uuid).is_ok_and(|uuid| !uuid.is_nil())
+                {
+                    return Err(malformed(format!(
+                        "volume {:?} has invalid volume UUID {:?}",
+                        volume.identifier, volume.volume_uuid
+                    )));
+                }
+                if !identifiers.insert(volume.identifier.clone()) {
+                    return Err(NativeBootstrapError::DuplicateApfsVolume(volume.identifier));
+                }
+                let mountpoint = match mounted.remove(volume.identifier.as_str()) {
+                    None => None,
+                    Some(mountpoints) => match <[PathBuf; 1]>::try_from(mountpoints) {
+                        Ok([mountpoint]) => Some(mountpoint),
+                        Err(mountpoints) => {
+                            return Err(NativeBootstrapError::AmbiguousVolumeMount {
+                                identifier: volume.identifier,
+                                mountpoints,
+                            });
+                        }
+                    },
+                };
+                volumes.push(ApfsVolume {
+                    name: volume.name,
+                    identifier: volume.identifier,
+                    mountpoint,
+                    volume_uuid: volume.volume_uuid,
+                });
+            }
+            containers.push(ApfsContainer {
+                reference: container.reference,
+                capacity_bytes: container.capacity_bytes,
+                volumes,
+            });
+        }
+        Ok(Self { containers })
+    }
+
+    /// Identifiers are unique across the validated snapshot, so at most one container matches.
     fn containing_container(&self, device: &str) -> Result<&ApfsContainer, NativeBootstrapError> {
-        let matches: Vec<_> = self
-            .containers
+        self.containers
             .iter()
-            .filter(|container| {
+            .find(|container| {
                 container
                     .volumes
                     .iter()
                     .any(|volume| volume.identifier == device)
             })
-            .collect();
-        match matches.as_slice() {
-            [container] => Ok(container),
-            [] => Err(NativeBootstrapError::ContainerNotFound {
+            .ok_or_else(|| NativeBootstrapError::ContainerNotFound {
                 device: device.to_owned(),
-            }),
-            _ => Err(NativeBootstrapError::AmbiguousContainer {
-                device: device.to_owned(),
-                matches: matches.len(),
-            }),
-        }
-    }
-}
-
-fn parse_apfs_inventory(bytes: &[u8]) -> Result<ApfsInventory, NativeBootstrapError> {
-    let value = Value::from_reader(std::io::Cursor::new(bytes))
-        .map_err(|error| NativeBootstrapError::MalformedPlist(error.to_string()))?;
-    let root = dictionary(&value, "root")?;
-    let containers = root
-        .get("Containers")
-        .and_then(Value::as_array)
-        .ok_or_else(|| malformed("missing Containers array"))?;
-    if containers.is_empty() {
-        return Err(malformed("Containers array is empty"));
-    }
-    let containers = containers
-        .iter()
-        .enumerate()
-        .map(|(index, value)| parse_container(value, index))
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(ApfsInventory { containers })
-}
-
-fn parse_container(value: &Value, index: usize) -> Result<ApfsContainer, NativeBootstrapError> {
-    let container = dictionary(value, &format!("Containers[{index}]"))?;
-    let reference = required_string(container, "ContainerReference", "container")?;
-    if !valid_container_identifier(reference.as_bytes()) {
-        return Err(malformed(format!(
-            "invalid ContainerReference {reference:?}"
-        )));
-    }
-    if container.len() == 1 {
-        return Err(NativeBootstrapError::DepartingApfsContainer(reference));
-    }
-    let capacity_bytes = required_unsigned(container, "CapacityCeiling", "container")?;
-    let volumes = container
-        .get("Volumes")
-        .and_then(Value::as_array)
-        .ok_or_else(|| malformed(format!("container {reference:?} has no Volumes array")))?;
-    let volumes = volumes
-        .iter()
-        .enumerate()
-        .map(|(volume_index, volume)| parse_volume(volume, &reference, volume_index))
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(ApfsContainer {
-        reference,
-        capacity_bytes,
-        volumes,
-    })
-}
-
-fn parse_volume(
-    value: &Value,
-    container: &str,
-    index: usize,
-) -> Result<ApfsVolume, NativeBootstrapError> {
-    let volume = dictionary(value, &format!("{container}.Volumes[{index}]"))?;
-    let name = required_string(volume, "Name", "volume")?;
-    let identifier = required_string(volume, "DeviceIdentifier", "volume")?;
-    let volume_uuid = required_string(volume, "APFSVolumeUUID", "volume")?;
-    if !valid_volume_identifier(identifier.as_bytes())
-        || !identifier.strip_prefix(container).is_some_and(|slice| {
-            slice.strip_prefix('s').is_some_and(|digits| {
-                !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())
             })
-        })
-    {
-        return Err(malformed(format!(
-            "volume DeviceIdentifier {identifier:?} is not in container {container:?}"
-        )));
     }
-    let mountpoint = match volume.get("MountPoint") {
-        None => None,
-        Some(Value::String(value)) if !value.is_empty() => Some(PathBuf::from(value)),
-        Some(_) => {
-            return Err(malformed(format!(
-                "volume {identifier:?} has invalid MountPoint"
-            )));
-        }
-    };
-    let file_vault = match volume.get("FileVault") {
-        None => false,
-        Some(Value::Boolean(enabled)) => *enabled,
-        Some(_) => {
-            return Err(malformed(format!(
-                "volume {identifier:?} has invalid FileVault evidence"
-            )));
-        }
-    };
-    Ok(ApfsVolume {
-        name,
-        identifier,
-        volume_uuid,
-        mountpoint,
-        file_vault,
-    })
-}
-
-fn dictionary<'a>(value: &'a Value, context: &str) -> Result<&'a Dictionary, NativeBootstrapError> {
-    value
-        .as_dictionary()
-        .ok_or_else(|| malformed(format!("{context} is not a dictionary")))
-}
-
-fn required_string(
-    dictionary: &Dictionary,
-    key: &str,
-    context: &str,
-) -> Result<String, NativeBootstrapError> {
-    dictionary
-        .get(key)
-        .and_then(Value::as_string)
-        .filter(|value| !value.is_empty())
-        .map(str::to_owned)
-        .ok_or_else(|| malformed(format!("{context} has no nonempty {key} string")))
-}
-
-fn required_unsigned(
-    dictionary: &Dictionary,
-    key: &str,
-    context: &str,
-) -> Result<u64, NativeBootstrapError> {
-    dictionary
-        .get(key)
-        .and_then(Value::as_unsigned_integer)
-        .ok_or_else(|| malformed(format!("{context} has no unsigned {key} integer")))
 }
 
 fn malformed(message: impl Into<String>) -> NativeBootstrapError {
-    NativeBootstrapError::MalformedPlist(message.into())
+    NativeBootstrapError::MalformedApfsInventory(message.into())
+}
+
+/// Read FileVault from one volume's `diskutil info -plist` answer. The answer counts only when
+/// it names the exact kernel record — device, volume UUID, container and name — and states
+/// `FileVault` explicitly; an empty, foreign, or silent answer is unknown and fails closed.
+fn attest_volume_file_vault(
+    bytes: &[u8],
+    container: &str,
+    volume: &ApfsVolume,
+) -> Result<bool, NativeBootstrapError> {
+    let refuse = |reason: String| NativeBootstrapError::VolumeFileVaultEvidence {
+        identifier: volume.identifier.clone(),
+        reason,
+    };
+    let value = Value::from_reader(std::io::Cursor::new(bytes))
+        .map_err(|error| refuse(format!("unreadable plist: {error}")))?;
+    let info = value
+        .as_dictionary()
+        .ok_or_else(|| refuse("plist root is not a dictionary".to_owned()))?;
+    for (key, expected) in [
+        ("DeviceIdentifier", volume.identifier.as_str()),
+        ("APFSContainerReference", container),
+        ("VolumeName", volume.name.as_str()),
+    ] {
+        let actual = info.get(key).and_then(Value::as_string);
+        if actual != Some(expected) {
+            return Err(refuse(format!(
+                "{key} is {actual:?}, expected {expected:?}"
+            )));
+        }
+    }
+    let uuid = info.get("VolumeUUID").and_then(Value::as_string);
+    if !uuid.is_some_and(|uuid| uuid.eq_ignore_ascii_case(&volume.volume_uuid)) {
+        return Err(refuse(format!(
+            "VolumeUUID is {uuid:?}, expected {:?}",
+            volume.volume_uuid
+        )));
+    }
+    match info.get("FileVault") {
+        Some(Value::Boolean(enabled)) => Ok(*enabled),
+        other => Err(refuse(format!(
+            "FileVault is {other:?}, expected a boolean"
+        ))),
+    }
 }
 
 fn classify_volume(
@@ -2337,19 +2231,15 @@ fn classify_volume(
                 }
             }
             MountpointState::Missing | MountpointState::EmptyDirectory => {
-                // Container-inventory mountpoint evidence is unreliable: recent diskutil releases
-                // omit MountPoint, so per-volume evidence distinguishes detached from mis-mounted.
-                let current = match &volume.mountpoint {
-                    Some(mountpoint) => Some(mountpoint.clone()),
-                    None => source.volume_mountpoint(&volume.identifier)?,
-                };
-                match current {
+                // The kernel mount table distinguishes detached from mounted elsewhere; the
+                // statfs of that other mountpoint must then re-attest the same exact device.
+                match &volume.mountpoint {
                     None => ExistingStorage::detached_incomplete(&volume.identifier),
                     Some(current) => {
-                        require_canonical(&current)?;
-                        let mounted = source.mounted_volume(&current)?;
+                        require_canonical(current)?;
+                        let mounted = source.mounted_volume(current)?;
                         if mounted.exact_identifier != volume.identifier
-                            || mounted.mountpoint != current
+                            || mounted.mountpoint != *current
                         {
                             return Err(NativeBootstrapError::MountEvidenceMismatch {
                                 path: current.clone(),
@@ -2385,10 +2275,14 @@ fn classify_volume(
             MountpointState::Mounted { .. } => ExistingStorage::Absent,
         }
     };
+    let file_vault = match matches.first() {
+        Some(volume) => Some(source.volume_file_vault(&container.reference, volume)?),
+        None => None,
+    };
     Ok(ClassifiedStorage {
         storage,
         reclaimable_stubs,
-        file_vault: matches.first().map(|volume| volume.file_vault),
+        file_vault,
     })
 }
 
@@ -2437,6 +2331,8 @@ trait ApfsProvisionIo {
     ) -> Result<(), HostError>;
     fn attest_owner(&self, path: &Path, uid: u32, gid: u32) -> Result<(), HostError>;
     fn write_marker(&self, path: &Path, contents: &[u8]) -> Result<(), HostError>;
+    /// The global kernel APFS inventory the create recheck refuses reserved names against.
+    fn apfs_inventory(&self) -> Result<ApfsInventory, NativeBootstrapError>;
 }
 
 struct SystemApfsProvisionIo;
@@ -2504,6 +2400,10 @@ impl ApfsProvisionIo for SystemApfsProvisionIo {
     fn write_marker(&self, path: &Path, contents: &[u8]) -> Result<(), HostError> {
         write_marker_atomic(path, contents)
     }
+
+    fn apfs_inventory(&self) -> Result<ApfsInventory, NativeBootstrapError> {
+        system_apfs_inventory()
+    }
 }
 
 /// Return a freshly attested volume to the detached state.
@@ -2562,9 +2462,11 @@ where
         .map(ApfsVolumeProvision::name)
         .collect::<Vec<_>>();
     if !create_names.is_empty() {
-        let inventory_command = HostCommand::new(DISKUTIL, ["apfs", "list", "-plist"]);
-        let output = run_privileged_command(session, &inventory_command)?;
-        let inventory = parse_apfs_inventory(&output.stdout)
+        // Recheck inside the authorization session, immediately before any create, against a
+        // fresh kernel snapshot: planning-time absence may have gone stale while the user
+        // answered the prompt, and an unreadable or empty snapshot refuses the create.
+        let inventory = io
+            .apfs_inventory()
             .map_err(|error| HostError::new(error.to_string()))?;
         if let Some((container, volume)) = inventory.containers.iter().find_map(|container| {
             container
@@ -3469,6 +3371,7 @@ mod tests {
 
     use super::super::shared::mutating_setup_actions;
     use super::*;
+    use crate::apfs::RegisteredApfsVolume;
     use crate::storage::bootstrap::{BlockingJob, CACHES_ROOT, STORE_ROOT};
     use uuid::Uuid;
 
@@ -3502,7 +3405,11 @@ mod tests {
         let expected = select_substrate(
             StatFsEvidence::Apfs {
                 mount_source: snapshot.mount_source,
-                container: Some(container_reference_of(&device).expect("home container")),
+                container: Some(
+                    crate::device::container_of(&device)
+                        .expect("home container")
+                        .to_owned(),
+                ),
             },
             None,
         )
@@ -3541,6 +3448,122 @@ mod tests {
         );
         let plan = plan.expect("home inventory must survive unrelated APFS teardown");
         assert_eq!(plan.substrate(), &expected);
+    }
+
+    /// Read-only host evidence that panics on any diskutil listing. The captured failure was
+    /// `diskutil apfs list -plist` exiting 0 with an empty root dictionary; the only diskutil
+    /// call planning may make is one `info -plist` FileVault attestation per reserved volume,
+    /// which is recorded and delegated to the real tool.
+    #[derive(Default)]
+    struct ListingForbiddenHost {
+        file_vault_queries: Mutex<Vec<String>>,
+    }
+
+    impl BootstrapHost for ListingForbiddenHost {
+        fn verify_zfs_delegation(
+            &self,
+            _pool: &str,
+            _required_root: &str,
+        ) -> Result<(), HostError> {
+            unreachable!("APFS planning has no ZFS evidence")
+        }
+
+        fn inspect_mountpoint(&self, path: &Path) -> Result<MountpointState, HostError> {
+            SystemBootstrapHost.inspect_mountpoint(path)
+        }
+
+        fn create_dir_all(&self, path: &Path) -> Result<(), HostError> {
+            unreachable!("read-only planning created {path:?}")
+        }
+
+        fn reclaim_mountpoint(&self, path: &Path) -> Result<(), HostError> {
+            unreachable!("read-only planning reclaimed {path:?}")
+        }
+
+        fn run_command(&self, command: &HostCommand) -> Result<HostCommandOutput, HostError> {
+            match (command.program(), command.args()) {
+                (DISKUTIL, [info, plist, identifier])
+                    if info == "info"
+                        && plist == "-plist"
+                        && valid_volume_identifier(identifier.as_bytes()) =>
+                {
+                    self.file_vault_queries
+                        .lock()
+                        .expect("query log")
+                        .push(identifier.clone());
+                    SystemBootstrapHost.run_command(command)
+                }
+                (DISKUTIL, args) => panic!("APFS planning invoked a diskutil listing: {args:?}"),
+                (SECURITY, _) => Ok(HostCommandOutput::success(Vec::new())),
+                (program, args) => panic!("unexpected planning command {program} {args:?}"),
+            }
+        }
+
+        fn provision_apfs_volumes(
+            &self,
+            container: &str,
+            _volumes: &[ApfsVolumeProvision],
+        ) -> Result<(), HostError> {
+            unreachable!("read-only planning provisioned in {container:?}")
+        }
+
+        fn write_file_atomic(&self, path: &Path, _contents: &[u8]) -> Result<(), HostError> {
+            unreachable!("read-only planning wrote {path:?}")
+        }
+
+        fn pin_volumes_in_fstab(&self, _pins: &[FstabPin]) -> Result<(), HostError> {
+            unreachable!("read-only planning pinned fstab")
+        }
+    }
+
+    #[test]
+    fn production_planner_reads_kernel_authority_without_any_diskutil_listing() {
+        let home = std::env::home_dir().expect("home directory");
+        let snapshot = system_statfs(&home).expect("home filesystem");
+        assert_eq!(snapshot.fs_type, "apfs");
+        let device = exact_device_identifier(&snapshot.mount_source).expect("home device");
+
+        let inventory = system_apfs_inventory().expect("kernel APFS inventory");
+        let container = inventory
+            .containing_container(&device)
+            .expect("home device is registered in exactly one container");
+        assert_eq!(
+            Some(container.reference.as_str()),
+            crate::device::container_of(&device)
+        );
+        let home_volume = container
+            .volumes
+            .iter()
+            .find(|volume| volume.identifier == device)
+            .expect("home volume record");
+        assert_eq!(
+            home_volume.mountpoint.as_deref(),
+            Some(snapshot.mountpoint.as_path()),
+            "the kernel mount table and statfs must name the same home mount"
+        );
+
+        let host = ListingForbiddenHost::default();
+        let plan = plan_existing_host_storage(&mut SystemEvidenceSource { host: &host }, &home)
+            .expect("production planner over the kernel snapshot");
+        assert!(matches!(
+            plan.substrate(),
+            crate::storage::bootstrap::SelectedSubstrate::Apfs { container: selected, .. }
+                if *selected == container.reference
+        ));
+        let reserved = inventory
+            .containers
+            .iter()
+            .flat_map(|container| &container.volumes)
+            .filter(|volume| volume.name == APFS_STORE_VOLUME || volume.name == APFS_CACHES_VOLUME)
+            .map(|volume| volume.identifier.clone())
+            .collect::<BTreeSet<_>>();
+        let queried = host.file_vault_queries.into_inner().expect("query log");
+        assert!(
+            queried
+                .iter()
+                .all(|identifier| reserved.contains(identifier)),
+            "FileVault is attested only for reserved volumes: {queried:?} vs {reserved:?}"
+        );
     }
 
     fn mount_service_pins() -> Vec<FstabPin> {
@@ -3733,21 +3756,126 @@ mod tests {
         let mut pins = mount_service_pins();
         pins[0].volume_uuid = "disk3s8; touch /tmp/pwned".to_owned();
         let error = desired_mount_service(&pins).unwrap_err();
-        assert!(matches!(error, NativeBootstrapError::MalformedPlist(_)));
+        assert!(matches!(
+            error,
+            NativeBootstrapError::MalformedApfsInventory(_)
+        ));
     }
+
+    /// Typed kernel evidence: IORegistry container records plus the kernel mount table, and
+    /// the per-volume FileVault answer a reserved record's attestation would return.
+    #[derive(Clone, Debug)]
+    struct KernelFixture {
+        containers: Vec<RegisteredApfsContainer>,
+        mounts: Vec<KernelMountSnapshot>,
+        file_vault: BTreeMap<String, bool>,
+    }
+
+    impl KernelFixture {
+        fn inventory(&self) -> Result<ApfsInventory, NativeBootstrapError> {
+            ApfsInventory::from_kernel(self.containers.clone(), &self.mounts)
+        }
+    }
+
+    struct VolumeFixture {
+        record: RegisteredApfsVolume,
+        mountpoint: Option<PathBuf>,
+        file_vault: bool,
+    }
+
+    /// A canonical uppercase volume UUID unique to `identifier`.
+    fn volume_uuid(identifier: &str) -> String {
+        let mut bytes = [0; 16];
+        bytes[..identifier.len()].copy_from_slice(identifier.as_bytes());
+        Uuid::from_bytes(bytes)
+            .hyphenated()
+            .to_string()
+            .to_uppercase()
+    }
+
+    fn container(
+        reference: &str,
+        volumes: impl IntoIterator<Item = VolumeFixture>,
+    ) -> KernelFixture {
+        let mut records = Vec::new();
+        let mut mounts = Vec::new();
+        let mut file_vault = BTreeMap::new();
+        for VolumeFixture {
+            record,
+            mountpoint,
+            file_vault: enabled,
+        } in volumes
+        {
+            if let Some(mountpoint) = mountpoint {
+                mounts.push(KernelMountSnapshot::new(
+                    0,
+                    mountpoint,
+                    format!("/dev/{}", record.identifier),
+                    true,
+                    true,
+                ));
+            }
+            file_vault.insert(record.identifier.clone(), enabled);
+            records.push(record);
+        }
+        KernelFixture {
+            containers: vec![RegisteredApfsContainer {
+                reference: reference.to_owned(),
+                capacity_bytes: 1_000_000_000_000,
+                volumes: records,
+            }],
+            mounts,
+            file_vault,
+        }
+    }
+
+    /// One kernel snapshot spanning several containers.
+    fn kernel(parts: impl IntoIterator<Item = KernelFixture>) -> KernelFixture {
+        let mut snapshot = KernelFixture {
+            containers: Vec::new(),
+            mounts: Vec::new(),
+            file_vault: BTreeMap::new(),
+        };
+        for part in parts {
+            snapshot.containers.extend(part.containers);
+            snapshot.mounts.extend(part.mounts);
+            snapshot.file_vault.extend(part.file_vault);
+        }
+        snapshot
+    }
+
+    fn volume(name: &str, identifier: &str, mountpoint: Option<&str>) -> VolumeFixture {
+        volume_with_filevault(name, identifier, mountpoint, true)
+    }
+
+    fn volume_with_filevault(
+        name: &str,
+        identifier: &str,
+        mountpoint: Option<&str>,
+        file_vault: bool,
+    ) -> VolumeFixture {
+        VolumeFixture {
+            record: RegisteredApfsVolume {
+                name: name.to_owned(),
+                identifier: identifier.to_owned(),
+                volume_uuid: volume_uuid(identifier),
+            },
+            mountpoint: mountpoint.map(PathBuf::from),
+            file_vault,
+        }
+    }
+
     struct FakeEvidenceSource {
         statfs: StatFsSnapshot,
         statfs_overrides: BTreeMap<PathBuf, StatFsSnapshot>,
         statfs_paths: Vec<PathBuf>,
-        command_output: HostCommandOutput,
-        command_outputs: VecDeque<HostCommandOutput>,
+        /// `Err` is an unreadable registry; the error kind is what IOKit would surface.
+        kernel: Result<KernelFixture, io::ErrorKind>,
+        inventory_reads: usize,
+        file_vault_queries: Vec<String>,
         mountpoints: BTreeMap<PathBuf, MountpointState>,
         mounted_volumes: BTreeMap<PathBuf, MountedVolumeEvidence>,
-        // Per-identifier answers for `volume_mountpoint`; an absent identifier means detached,
-        // mirroring what `diskutil info -plist` reports with an empty MountPoint.
-        volume_mountpoints: BTreeMap<String, Option<PathBuf>>,
         keychain_items: BTreeMap<&'static str, bool>,
-        commands: Vec<HostCommand>,
         invoking_identity: (u32, u32),
     }
 
@@ -3761,15 +3889,14 @@ mod tests {
                 .unwrap_or_else(|| self.statfs.clone()))
         }
 
-        fn run_command(
-            &mut self,
-            command: &HostCommand,
-        ) -> Result<HostCommandOutput, NativeBootstrapError> {
-            self.commands.push(command.clone());
-            Ok(self
-                .command_outputs
-                .pop_front()
-                .unwrap_or_else(|| self.command_output.clone()))
+        fn apfs_inventory(&mut self) -> Result<ApfsInventory, NativeBootstrapError> {
+            self.inventory_reads += 1;
+            match &self.kernel {
+                Ok(kernel) => kernel.inventory(),
+                Err(kind) => Err(NativeBootstrapError::ApfsRegistry {
+                    source: io::Error::from(*kind),
+                }),
+            }
         }
 
         fn inspect_mountpoint(
@@ -3796,12 +3923,22 @@ mod tests {
             })
         }
 
-        fn volume_mountpoint(
+        fn volume_file_vault(
             &mut self,
-            identifier: &str,
-        ) -> Result<Option<PathBuf>, NativeBootstrapError> {
-            Ok(self.volume_mountpoints.get(identifier).cloned().flatten())
+            _container: &str,
+            volume: &ApfsVolume,
+        ) -> Result<bool, NativeBootstrapError> {
+            self.file_vault_queries.push(volume.identifier.clone());
+            self.kernel
+                .as_ref()
+                .ok()
+                .and_then(|kernel| kernel.file_vault.get(&volume.identifier).copied())
+                .ok_or_else(|| NativeBootstrapError::VolumeFileVaultEvidence {
+                    identifier: volume.identifier.clone(),
+                    reason: "no fixture answer".to_owned(),
+                })
         }
+
         fn keychain_item_usable(
             &mut self,
             label: &'static str,
@@ -3814,39 +3951,7 @@ mod tests {
         }
     }
 
-    fn plist(containers: &str) -> Vec<u8> {
-        format!(
-            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plist version=\"1.0\"><dict><key>Containers</key><array>{containers}</array></dict></plist>"
-        )
-        .into_bytes()
-    }
-
-    fn container(reference: &str, volumes: &str) -> String {
-        format!(
-            "<dict><key>ContainerReference</key><string>{reference}</string><key>CapacityCeiling</key><integer>1000000000000</integer><key>Volumes</key><array>{volumes}</array></dict>"
-        )
-    }
-
-    fn volume(name: &str, identifier: &str, mountpoint: Option<&str>) -> String {
-        volume_with_filevault(name, identifier, mountpoint, true)
-    }
-
-    fn volume_with_filevault(
-        name: &str,
-        identifier: &str,
-        mountpoint: Option<&str>,
-        file_vault: bool,
-    ) -> String {
-        let mountpoint = mountpoint
-            .map(|path| format!("<key>MountPoint</key><string>{path}</string>"))
-            .unwrap_or_default();
-        let file_vault = if file_vault { "<true/>" } else { "<false/>" };
-        format!(
-            "<dict><key>Name</key><string>{name}</string><key>DeviceIdentifier</key><string>{identifier}</string><key>APFSVolumeUUID</key><string>{identifier}-UUID</string><key>FileVault</key>{file_vault}{mountpoint}</dict>"
-        )
-    }
-
-    fn source(inventory: Vec<u8>) -> FakeEvidenceSource {
+    fn source(kernel: KernelFixture) -> FakeEvidenceSource {
         FakeEvidenceSource {
             statfs: StatFsSnapshot {
                 fs_type: "apfs".to_owned(),
@@ -3856,8 +3961,9 @@ mod tests {
             },
             statfs_overrides: BTreeMap::new(),
             statfs_paths: Vec::new(),
-            command_output: HostCommandOutput::success(inventory),
-            command_outputs: VecDeque::new(),
+            kernel: Ok(kernel),
+            inventory_reads: 0,
+            file_vault_queries: Vec::new(),
             mountpoints: BTreeMap::from([
                 (
                     PathBuf::from("/private/cowshed/store"),
@@ -3890,22 +3996,24 @@ mod tests {
                     },
                 ),
             ]),
-            volume_mountpoints: BTreeMap::new(),
             keychain_items: BTreeMap::from([(APFS_STORE_VOLUME, true), (APFS_CACHES_VOLUME, true)]),
             invoking_identity: (501, 20),
-            commands: Vec::new(),
         }
     }
 
     fn healthy_existing_source() -> FakeEvidenceSource {
-        let volumes = volume("Data", "disk3s5", Some("/System/Volumes/Data"))
-            + &volume(APFS_STORE_VOLUME, "disk3s8", Some("/private/cowshed/store"))
-            + &volume(
-                APFS_CACHES_VOLUME,
-                "disk3s9",
-                Some("/private/cowshed/caches"),
-            );
-        let mut source = source(plist(&container("disk3", &volumes)));
+        let mut source = source(container(
+            "disk3",
+            [
+                volume("Data", "disk3s5", Some("/System/Volumes/Data")),
+                volume(APFS_STORE_VOLUME, "disk3s8", Some("/private/cowshed/store")),
+                volume(
+                    APFS_CACHES_VOLUME,
+                    "disk3s9",
+                    Some("/private/cowshed/caches"),
+                ),
+            ],
+        ));
         source.mountpoints.insert(
             PathBuf::from("/private/cowshed/store"),
             MountpointState::Mounted {
@@ -3929,14 +4037,18 @@ mod tests {
         source
     }
 
-    fn source_with_caches_inventory_mountpoint_omitted(
-        volume_mountpoint: Option<&str>,
-    ) -> FakeEvidenceSource {
-        let volumes = volume("Data", "disk3s5", Some("/System/Volumes/Data"))
-            + &volume(APFS_STORE_VOLUME, "disk3s8", Some("/private/cowshed/store"))
-            + &volume(APFS_CACHES_VOLUME, "disk3s9", None);
+    /// The canonical caches mountpoint is vacant; the kernel mount table alone says whether
+    /// the caches volume is detached (`None`) or mounted somewhere else.
+    fn source_with_caches_kernel_mount(kernel_mount: Option<&str>) -> FakeEvidenceSource {
         let mut source = healthy_existing_source();
-        source.command_output = HostCommandOutput::success(plist(&container("disk3", &volumes)));
+        source.kernel = Ok(container(
+            "disk3",
+            [
+                volume("Data", "disk3s5", Some("/System/Volumes/Data")),
+                volume(APFS_STORE_VOLUME, "disk3s8", Some("/private/cowshed/store")),
+                volume(APFS_CACHES_VOLUME, "disk3s9", kernel_mount),
+            ],
+        ));
         source.mountpoints.insert(
             PathBuf::from("/private/cowshed/caches"),
             MountpointState::Missing,
@@ -3944,21 +4056,18 @@ mod tests {
         source
             .mounted_volumes
             .remove(Path::new("/private/cowshed/caches"));
-        if let Some(mountpoint) = volume_mountpoint {
+        if let Some(mountpoint) = kernel_mount {
             let mountpoint = PathBuf::from(mountpoint);
             source.mounted_volumes.insert(
                 mountpoint.clone(),
                 MountedVolumeEvidence {
                     exact_identifier: "disk3s9".to_owned(),
-                    mountpoint: mountpoint.clone(),
+                    mountpoint,
                     nobrowse: false,
                     uid: 501,
                     gid: 20,
                 },
             );
-            source
-                .volume_mountpoints
-                .insert("disk3s9".to_owned(), Some(mountpoint));
         }
         source
     }
@@ -4105,6 +4214,7 @@ mod tests {
     #[derive(Clone, Debug, Eq, PartialEq)]
     enum ProvisionEvent {
         Acquire,
+        Inventory,
         Command { program: String, args: Vec<String> },
         Prepare(PathBuf),
         AttestMounted(PathBuf, String, bool),
@@ -4136,8 +4246,17 @@ mod tests {
         }
     }
 
+    /// What the create recheck's kernel read observes inside the authorization session.
+    enum KernelRead {
+        Snapshot(KernelFixture),
+        Unreadable(io::ErrorKind),
+        /// Batches without a create must never read the inventory.
+        Forbidden,
+    }
+
     struct FakeProvisionIo {
         events: Rc<RefCell<Vec<ProvisionEvent>>>,
+        kernel: KernelRead,
     }
 
     impl ApfsProvisionIo for FakeProvisionIo {
@@ -4175,6 +4294,19 @@ mod tests {
                 .push(ProvisionEvent::Marker(path.to_owned(), contents.to_vec()));
             Ok(())
         }
+
+        fn apfs_inventory(&self) -> Result<ApfsInventory, NativeBootstrapError> {
+            self.events.borrow_mut().push(ProvisionEvent::Inventory);
+            match &self.kernel {
+                KernelRead::Snapshot(kernel) => kernel.inventory(),
+                KernelRead::Unreadable(kind) => Err(NativeBootstrapError::ApfsRegistry {
+                    source: io::Error::from(*kind),
+                }),
+                KernelRead::Forbidden => {
+                    panic!("a batch without a create read the kernel APFS inventory")
+                }
+            }
+        }
     }
 
     fn provision_info(identifier: &str, container: &str, name: &str, mountpoint: &str) -> Vec<u8> {
@@ -4192,10 +4324,11 @@ mod tests {
     }
 
     #[test]
-    fn exact_container_is_selected_and_diskutil_argv_is_fixed() {
-        let unrelated = container("disk2", &volume("Data", "disk2s1", None));
-        let containing = container("disk3", &volume("Data", "disk3s5", Some("/")));
-        let mut source = source(plist(&(unrelated + &containing)));
+    fn exact_container_is_selected_from_one_kernel_snapshot() {
+        let mut source = source(kernel([
+            container("disk2", [volume("Data", "disk2s1", None)]),
+            container("disk3", [volume("Data", "disk3s5", Some("/"))]),
+        ]));
         let gathered = gather_apfs_evidence(
             &mut source,
             Path::new("/Users/alice/project"),
@@ -4203,30 +4336,35 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(
-            gathered.statfs,
-            StatFsEvidence::Apfs { container: Some(ref value), .. } if value == "disk3"
+            &gathered.statfs,
+            StatFsEvidence::Apfs { container: Some(value), .. } if value == "disk3"
         ));
-        assert_eq!(source.commands.len(), 2);
-        assert_eq!(source.commands[0].program(), "/usr/sbin/diskutil");
         assert_eq!(
-            source.commands[0].args(),
-            ["apfs", "list", "-plist", "disk3"]
+            source.inventory_reads, 1,
+            "home selection and the global guard share one snapshot"
         );
-        assert_eq!(source.commands[1].args(), ["apfs", "list", "-plist"]);
     }
 
     #[test]
     fn home_anchor_selects_host_container_when_project_is_on_another_filesystem() {
-        let data = volume("Data", "disk3s5", Some("/System/Volumes/Data"));
-        let cowshed = volume(APFS_STORE_VOLUME, "disk3s8", None)
-            + &volume(APFS_CACHES_VOLUME, "disk3s9", None);
-        let project_container = container(
-            "disk13",
-            &volume("Workspace", "disk13s1", Some("/workspace")),
-        );
-        let mut source = source(plist(
-            &(project_container + &container("disk3", &(data + &cowshed))),
-        ));
+        let mut source = source(kernel([
+            container(
+                "disk13",
+                [volume("Workspace", "disk13s1", Some("/workspace"))],
+            ),
+            container(
+                "disk3",
+                [
+                    volume("Data", "disk3s5", Some("/System/Volumes/Data")),
+                    volume(APFS_STORE_VOLUME, "disk3s8", Some("/private/cowshed/store")),
+                    volume(
+                        APFS_CACHES_VOLUME,
+                        "disk3s9",
+                        Some("/private/cowshed/caches"),
+                    ),
+                ],
+            ),
+        ]));
         source.statfs_overrides.insert(
             PathBuf::from("/workspace/project"),
             StatFsSnapshot {
@@ -4278,49 +4416,158 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_container_membership_and_malformed_plist_fail_closed() {
-        let duplicated = plist(
-            &(container("disk3", &volume("Data", "disk3s5", None))
-                + &container("disk3", &volume("Data", "disk3s5", None))),
-        );
-        let mut duplicate_source = source(duplicated);
-        assert!(matches!(
-            gather_apfs_evidence(
-                &mut duplicate_source,
+    fn duplicate_ambiguous_and_malformed_kernel_records_fail_closed() {
+        let gather = |kernel: KernelFixture| {
+            let mut evidence = source(kernel);
+            let result = gather_apfs_evidence(
+                &mut evidence,
                 Path::new("/Users/alice/project"),
-                Path::new("/Users/alice")
-            ),
-            Err(NativeBootstrapError::AmbiguousContainer { matches: 2, .. })
+                Path::new("/Users/alice"),
+            )
+            .map(|_| ());
+            assert_eq!(
+                evidence.inventory_reads, 1,
+                "a refused snapshot is never reread"
+            );
+            result
+        };
+        let home = || {
+            container(
+                "disk3",
+                [volume("Data", "disk3s5", Some("/System/Volumes/Data"))],
+            )
+        };
+
+        let unmounted_home = || container("disk3", [volume("Data", "disk3s5", None)]);
+        assert!(matches!(
+            gather(kernel([unmounted_home(), unmounted_home()])),
+            Err(NativeBootstrapError::DuplicateApfsContainer(reference)) if reference == "disk3"
+        ));
+        assert!(matches!(
+            gather(container(
+                "disk3",
+                [
+                    volume("Data", "disk3s5", None),
+                    volume("Shadow", "disk3s5", None),
+                ],
+            )),
+            Err(NativeBootstrapError::DuplicateApfsVolume(identifier)) if identifier == "disk3s5"
+        ));
+        let mut mounted_twice = home();
+        mounted_twice.mounts.push(KernelMountSnapshot::new(
+            1,
+            "/Volumes/Data",
+            "/dev/disk3s5",
+            true,
+            true,
+        ));
+        assert!(matches!(
+            gather(mounted_twice),
+            Err(NativeBootstrapError::AmbiguousVolumeMount { identifier, mountpoints })
+                if identifier == "disk3s5" && mountpoints.len() == 2
         ));
 
-        for malformed_bytes in [
-            b"not a plist".to_vec(),
-            plist("<dict><key>ContainerReference</key><string>disk3</string></dict>"),
-            plist(&container(
-                "disk3",
-                "<dict><key>Name</key><string>Data</string></dict>",
-            )),
+        let mut invalid_reference = home();
+        invalid_reference.containers[0].reference = "not-a-device".to_owned();
+        let mut no_capacity = home();
+        no_capacity.containers[0].capacity_bytes = 0;
+        let mut foreign_volume = home();
+        foreign_volume.containers[0].volumes[0].identifier = "disk4s5".to_owned();
+        let mut snapshot_depth = home();
+        snapshot_depth.containers[0].volumes[0].identifier = "disk3s5s1".to_owned();
+        let mut unnamed = home();
+        unnamed.containers[0].volumes[0].name = String::new();
+        let mut invalid_uuid = home();
+        invalid_uuid.containers[0].volumes[0].volume_uuid = "disk3s5-UUID".to_owned();
+        let mut braced_uuid = home();
+        braced_uuid.containers[0].volumes[0].volume_uuid =
+            format!("{{{}}}", volume_uuid("disk3s5"));
+        let mut nil_uuid = home();
+        nil_uuid.containers[0].volumes[0].volume_uuid =
+            "00000000-0000-0000-0000-000000000000".to_owned();
+        for malformed in [
+            invalid_reference,
+            no_capacity,
+            foreign_volume,
+            snapshot_depth,
+            unnamed,
+            invalid_uuid,
+            braced_uuid,
+            nil_uuid,
         ] {
-            let mut malformed_source = source(malformed_bytes);
             assert!(matches!(
-                gather_apfs_evidence(
-                    &mut malformed_source,
+                gather(malformed),
+                Err(NativeBootstrapError::MalformedApfsInventory(_))
+            ));
+        }
+    }
+
+    /// The captured failure: an image teardown made the listing read back an empty root. The
+    /// kernel registry is the only listing now; an empty or unreadable snapshot is refused by
+    /// every planner after exactly one read, never repaired into "no reserved volumes exist".
+    #[test]
+    fn empty_or_unreadable_kernel_snapshot_never_establishes_absence() {
+        // No mountpoint evidence is staged: classifying any volume before the snapshot is
+        // refused would surface as `MountEvidenceMismatch`, not as the inventory error.
+        let empty = || {
+            let mut evidence = source(kernel([]));
+            evidence.mountpoints.clear();
+            evidence
+        };
+        let unreadable = || {
+            let mut evidence = empty();
+            evidence.kernel = Err(io::ErrorKind::InvalidData);
+            evidence
+        };
+        let mut evidence = empty();
+        assert!(matches!(
+            plan_existing_host_storage(&mut evidence, Path::new("/Users/alice")),
+            Err(NativeBootstrapError::EmptyApfsInventory)
+        ));
+        assert_eq!(evidence.inventory_reads, 1);
+        let mut evidence = unreadable();
+        assert!(matches!(
+            plan_existing_host_storage(&mut evidence, Path::new("/Users/alice")),
+            Err(NativeBootstrapError::ApfsRegistry { source })
+                if source.kind() == io::ErrorKind::InvalidData
+        ));
+        assert_eq!(evidence.inventory_reads, 1);
+        for mut evidence in [empty(), unreadable()] {
+            assert!(matches!(
+                prepare_setup_snapshot(&mut evidence, Path::new("/Users/alice"), ""),
+                Err(NativeBootstrapError::EmptyApfsInventory
+                    | NativeBootstrapError::ApfsRegistry { .. })
+            ));
+            assert_eq!(evidence.inventory_reads, 1);
+        }
+        for mut evidence in [empty(), unreadable()] {
+            assert!(matches!(
+                plan_native_bootstrap(
+                    &mut evidence,
                     Path::new("/Users/alice/project"),
-                    Path::new("/Users/alice")
+                    Path::new("/Users/alice"),
                 ),
-                Err(NativeBootstrapError::MalformedPlist(_))
+                Err(NativeBootstrapError::EmptyApfsInventory
+                    | NativeBootstrapError::ApfsRegistry { .. })
             ));
         }
     }
 
     #[test]
-    fn kernel_mount_identity_and_marker_override_omitted_inventory_mountpoint() {
+    fn statfs_identity_marker_and_kernel_mount_classify_the_store() {
         let marker = VolumeMarker::new(VolumeRole::Store, SubstrateKind::Apfs)
             .to_json()
             .unwrap();
-        let volumes = volume(APFS_STORE_VOLUME, "disk3s8", None)
-            + &volume("Data", "disk3s5", Some("/System/Volumes/Data"));
-        let inventory = plist(&container("disk3", &volumes));
+        let store_mounted_at = |mountpoint: Option<&str>| {
+            container(
+                "disk3",
+                [
+                    volume(APFS_STORE_VOLUME, "disk3s8", mountpoint),
+                    volume("Data", "disk3s5", Some("/System/Volumes/Data")),
+                ],
+            )
+        };
+        let inventory = store_mounted_at(Some("/private/cowshed/store"));
         let mut valid = source(inventory.clone());
         valid.mountpoints.insert(
             PathBuf::from("/private/cowshed/store"),
@@ -4441,7 +4688,7 @@ mod tests {
             } if exact_identifier == "disk3s8"
         ));
 
-        let mut detached = source(inventory.clone());
+        let mut detached = source(store_mounted_at(None));
         let gathered = gather_apfs_evidence(
             &mut detached,
             Path::new("/Users/alice/project"),
@@ -4472,10 +4719,36 @@ mod tests {
             Err(NativeBootstrapError::InvalidMountedMarker { .. })
         ));
 
-        let duplicates = volume(APFS_STORE_VOLUME, "disk3s8", None)
-            + &volume(APFS_STORE_VOLUME, "disk3s9", None)
-            + &volume("Data", "disk3s5", None);
-        let mut duplicate = source(plist(&container("disk3", &duplicates)));
+        // The kernel mounts the store elsewhere, but statfs at that path names another device.
+        let mut mismatched = source(store_mounted_at(Some("/Volumes/cowshed.store")));
+        mismatched.mounted_volumes.insert(
+            PathBuf::from("/Volumes/cowshed.store"),
+            MountedVolumeEvidence {
+                exact_identifier: "disk3s9".to_owned(),
+                mountpoint: PathBuf::from("/Volumes/cowshed.store"),
+                nobrowse: false,
+                uid: 0,
+                gid: 0,
+            },
+        );
+        assert!(matches!(
+            gather_apfs_evidence(
+                &mut mismatched,
+                Path::new("/Users/alice/project"),
+                Path::new("/Users/alice")
+            ),
+            Err(NativeBootstrapError::MountEvidenceMismatch { path, identifier })
+                if path == Path::new("/Volumes/cowshed.store") && identifier == "disk3s9"
+        ));
+
+        let mut duplicate = source(container(
+            "disk3",
+            [
+                volume(APFS_STORE_VOLUME, "disk3s8", None),
+                volume(APFS_STORE_VOLUME, "disk3s9", None),
+                volume("Data", "disk3s5", None),
+            ],
+        ));
         assert!(matches!(
             gather_apfs_evidence(
                 &mut duplicate,
@@ -4488,10 +4761,10 @@ mod tests {
 
     #[test]
     fn masked_nonempty_mountpoint_is_refused() {
-        let inventory = plist(&container(
+        let inventory = container(
             "disk3",
-            &volume("Data", "disk3s5", Some("/System/Volumes/Data")),
-        ));
+            [volume("Data", "disk3s5", Some("/System/Volumes/Data"))],
+        );
         let mut source = source(inventory);
         source.mountpoints.insert(
             PathBuf::from("/private/cowshed/store"),
@@ -4509,14 +4782,18 @@ mod tests {
 
     #[test]
     fn automounted_exact_volume_plans_unprivileged_remount() {
-        let volumes = volume(APFS_STORE_VOLUME, "disk3s8", Some("/Volumes/cowshed.store"))
-            + &volume(
-                APFS_CACHES_VOLUME,
-                "disk3s9",
-                Some("/Volumes/cowshed.caches"),
-            )
-            + &volume("Data", "disk3s5", Some("/System/Volumes/Data"));
-        let mut source = source(plist(&container("disk3", &volumes)));
+        let mut source = source(container(
+            "disk3",
+            [
+                volume(APFS_STORE_VOLUME, "disk3s8", Some("/Volumes/cowshed.store")),
+                volume(
+                    APFS_CACHES_VOLUME,
+                    "disk3s9",
+                    Some("/Volumes/cowshed.caches"),
+                ),
+                volume("Data", "disk3s5", Some("/System/Volumes/Data")),
+            ],
+        ));
         source.mountpoints.insert(
             PathBuf::from("/private/cowshed/store"),
             MountpointState::ReclaimableStub {
@@ -4580,18 +4857,18 @@ mod tests {
                 .iter()
                 .any(|operation| matches!(operation, HostOperation::ProvisionApfsVolumes { .. }))
         );
-        assert_eq!(source.commands.len(), 1);
-        assert_eq!(
-            source.commands[0].args(),
-            ["apfs", "list", "-plist", "disk3"]
-        );
+        assert_eq!(source.inventory_reads, 1);
     }
 
     #[test]
     fn reclaimable_launchd_stub_classifies_as_mis_mounted_when_volume_exists() {
-        let volumes = volume(APFS_STORE_VOLUME, "disk3s8", Some("/Volumes/cowshed.store"))
-            + &volume("Data", "disk3s5", Some("/System/Volumes/Data"));
-        let mut source = source(plist(&container("disk3", &volumes)));
+        let mut source = source(container(
+            "disk3",
+            [
+                volume(APFS_STORE_VOLUME, "disk3s8", Some("/Volumes/cowshed.store")),
+                volume("Data", "disk3s5", Some("/System/Volumes/Data")),
+            ],
+        ));
         source.mountpoints.insert(
             PathBuf::from("/private/cowshed/store"),
             MountpointState::ReclaimableStub {
@@ -4630,10 +4907,14 @@ mod tests {
 
     #[test]
     fn safe_masking_topology_is_an_enumerated_reclaim_plan_not_a_fatal_error() {
-        let volumes = volume("Data", "disk3s5", Some("/System/Volumes/Data"))
-            + &volume(APFS_STORE_VOLUME, "disk3s8", None)
-            + &volume(APFS_CACHES_VOLUME, "disk3s9", None);
-        let mut source = source(plist(&container("disk3", &volumes)));
+        let mut source = source(container(
+            "disk3",
+            [
+                volume("Data", "disk3s5", Some("/System/Volumes/Data")),
+                volume(APFS_STORE_VOLUME, "disk3s8", None),
+                volume(APFS_CACHES_VOLUME, "disk3s9", None),
+            ],
+        ));
         source.mountpoints.insert(
             PathBuf::from("/private/cowshed/store"),
             MountpointState::ReclaimableStub {
@@ -4680,7 +4961,7 @@ mod tests {
         let seen = RefCell::new(VecDeque::new());
         let command = HostCommand::new(
             "/usr/sbin/diskutil",
-            ["apfs", "list", "-plist", "literal;not-shell"],
+            ["info", "-plist", "literal;not-shell"],
         );
         let output = run_command_with(&command, |program, args| {
             seen.borrow_mut()
@@ -4696,15 +4977,14 @@ mod tests {
         assert_eq!(output.stderr, b"diskutil exact failure\n");
         assert_eq!(
             HostCommandFailure::new(command, output).to_string(),
-            "command failed: executable \"/usr/sbin/diskutil\", argv [\"apfs\", \"list\", \"-plist\", \"literal;not-shell\"], exit status 1; stdout: ignored; stderr: diskutil exact failure"
+            "command failed: executable \"/usr/sbin/diskutil\", argv [\"info\", \"-plist\", \"literal;not-shell\"], exit status 1; stdout: ignored; stderr: diskutil exact failure"
         );
         assert_eq!(
             seen.into_inner().pop_front().unwrap(),
             (
                 PathBuf::from("/usr/sbin/diskutil"),
                 vec![
-                    "apfs".to_owned(),
-                    "list".to_owned(),
+                    "info".to_owned(),
                     "-plist".to_owned(),
                     "literal;not-shell".to_owned(),
                 ]
@@ -4716,10 +4996,6 @@ mod tests {
     fn one_authorization_session_wraps_fixed_argv_for_all_new_volumes() {
         let events = Rc::new(RefCell::new(Vec::new()));
         let outputs = VecDeque::from([
-            Ok(HostCommandOutput::success(plist(&container(
-                "disk3",
-                &volume("Data", "disk3s5", Some("/System/Volumes/Data")),
-            )))),
             Ok(HostCommandOutput::success(
                 b"Created new APFS Volume disk3s8\n".to_vec(),
             )),
@@ -4784,6 +5060,10 @@ mod tests {
             },
             &FakeProvisionIo {
                 events: Rc::clone(&events),
+                kernel: KernelRead::Snapshot(container(
+                    "disk3",
+                    [volume("Data", "disk3s5", Some("/System/Volumes/Data"))],
+                )),
             },
         )
         .unwrap();
@@ -4812,7 +5092,19 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(commands.len(), 11);
+        assert_eq!(commands.len(), 10);
+        assert!(
+            matches!(
+                events.as_slice(),
+                [
+                    ProvisionEvent::Acquire,
+                    ProvisionEvent::Inventory,
+                    ProvisionEvent::Prepare(_),
+                    ..
+                ]
+            ),
+            "the kernel recheck runs inside the session, before any create: {events:?}"
+        );
         assert!(
             commands
                 .iter()
@@ -4870,53 +5162,77 @@ mod tests {
     }
 
     #[test]
-    fn execution_time_global_inventory_refuses_duplicate_create() {
-        let events = Rc::new(RefCell::new(Vec::new()));
-        let global = plist(
-            &(container("disk3", &volume("Data", "disk3s5", None))
-                + &container(
-                    "disk7",
-                    &volume(APFS_STORE_VOLUME, "disk7s2", Some("/Volumes/cowshed.store")),
-                )),
-        );
-        let volume = ApfsVolumeProvision {
+    fn execution_time_kernel_recheck_refuses_duplicate_create() {
+        let store = || ApfsVolumeProvision {
             name: APFS_STORE_VOLUME,
             mountpoint: PathBuf::from("/private/cowshed/store"),
             role: VolumeRole::Store,
             kind: ApfsProvisionKind::Create,
         };
-        let acquire_events = Rc::clone(&events);
-        let error = provision_apfs_volumes_with(
-            "disk3",
-            &[volume],
-            501,
-            20,
-            move || {
-                acquire_events.borrow_mut().push(ProvisionEvent::Acquire);
-                Ok(FakePrivilegedSession {
-                    events: Rc::clone(&acquire_events),
-                    outputs: VecDeque::from([Ok(HostCommandOutput::success(global))]),
-                })
-            },
-            &FakeProvisionIo {
-                events: Rc::clone(&events),
-            },
-        )
-        .expect_err("an existing reserved-name volume must prevent addVolume");
+        let provision = |kernel: KernelRead| {
+            let events = Rc::new(RefCell::new(Vec::new()));
+            let acquire_events = Rc::clone(&events);
+            let result = provision_apfs_volumes_with(
+                "disk3",
+                &[store()],
+                501,
+                20,
+                move || {
+                    acquire_events.borrow_mut().push(ProvisionEvent::Acquire);
+                    Ok(FakePrivilegedSession {
+                        events: Rc::clone(&acquire_events),
+                        outputs: VecDeque::new(),
+                    })
+                },
+                &FakeProvisionIo {
+                    events: Rc::clone(&events),
+                    kernel,
+                },
+            );
+            let events = events.borrow().clone();
+            (result, events)
+        };
+        let refused_before_any_command = |events: &[ProvisionEvent]| {
+            events
+                == [
+                    ProvisionEvent::Acquire,
+                    ProvisionEvent::Inventory,
+                    ProvisionEvent::Free,
+                ]
+        };
+
+        let (result, events) = provision(KernelRead::Snapshot(kernel([
+            container("disk3", [volume("Data", "disk3s5", None)]),
+            container(
+                "disk7",
+                [volume(
+                    APFS_STORE_VOLUME,
+                    "disk7s2",
+                    Some("/Volumes/cowshed.store"),
+                )],
+            ),
+        ])));
+        let error = result.expect_err("an existing reserved-name volume must prevent addVolume");
         assert!(error.to_string().contains("already exists as disk7s2"));
-        let events = events.borrow();
-        let commands = events
-            .iter()
-            .filter_map(|event| match event {
-                ProvisionEvent::Command { args, .. } => Some(args.as_slice()),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(commands, [vec!["apfs", "list", "-plist"].as_slice()]);
-        assert!(!events.iter().any(|event| matches!(
-            event,
-            ProvisionEvent::Prepare(_) | ProvisionEvent::Marker(_, _)
-        )));
+        assert!(refused_before_any_command(&events), "{events:?}");
+
+        let (result, events) = provision(KernelRead::Snapshot(kernel([])));
+        assert!(
+            result
+                .expect_err("an empty snapshot must not authorize a create")
+                .to_string()
+                .contains("no containers")
+        );
+        assert!(refused_before_any_command(&events), "{events:?}");
+
+        let (result, events) = provision(KernelRead::Unreadable(io::ErrorKind::InvalidData));
+        assert!(
+            result
+                .expect_err("an unreadable registry must not authorize a create")
+                .to_string()
+                .contains("kernel APFS registry")
+        );
+        assert!(refused_before_any_command(&events), "{events:?}");
     }
 
     #[test]
@@ -4954,6 +5270,7 @@ mod tests {
             },
             &FakeProvisionIo {
                 events: Rc::clone(&events),
+                kernel: KernelRead::Forbidden,
             },
         )
         .unwrap();
@@ -5029,6 +5346,7 @@ mod tests {
             },
             &FakeProvisionIo {
                 events: Rc::clone(&events),
+                kernel: KernelRead::Forbidden,
             },
         )
         .unwrap();
@@ -5134,6 +5452,7 @@ mod tests {
             },
             &FakeProvisionIo {
                 events: Rc::clone(&events),
+                kernel: KernelRead::Forbidden,
             },
         )
         .unwrap();
@@ -5228,10 +5547,6 @@ mod tests {
     fn an_auto_mounted_new_volume_is_detached_before_its_private_mount() {
         let events = Rc::new(RefCell::new(Vec::new()));
         let outputs = VecDeque::from([
-            Ok(HostCommandOutput::success(plist(&container(
-                "disk3",
-                &volume("Data", "disk3s5", Some("/System/Volumes/Data")),
-            )))),
             Ok(HostCommandOutput::success(
                 b"Created new APFS Volume disk3s8\n".to_vec(),
             )),
@@ -5275,11 +5590,22 @@ mod tests {
             },
             &FakeProvisionIo {
                 events: Rc::clone(&events),
+                kernel: KernelRead::Snapshot(container(
+                    "disk3",
+                    [volume("Data", "disk3s5", Some("/System/Volumes/Data"))],
+                )),
             },
         )
         .unwrap();
 
         let events = events.borrow();
+        assert!(
+            matches!(
+                events.as_slice(),
+                [ProvisionEvent::Acquire, ProvisionEvent::Inventory, ..]
+            ),
+            "the kernel inventory is rechecked inside the authorization session"
+        );
         let commands: Vec<_> = events
             .iter()
             .filter_map(|event| match event {
@@ -5289,11 +5615,6 @@ mod tests {
             .collect();
         assert_eq!(
             commands[0].as_slice(),
-            ["apfs", "list", "-plist"],
-            "global inventory is rechecked inside the authorization session"
-        );
-        assert_eq!(
-            commands[1].as_slice(),
             [
                 "apfs",
                 "addVolume",
@@ -5304,14 +5625,14 @@ mod tests {
             ],
             "-nomount is still requested; the unmount is a fallback, not a replacement"
         );
-        assert_eq!(commands[2].as_slice(), ["info", "-plist", "disk3s8"]);
+        assert_eq!(commands[1].as_slice(), ["info", "-plist", "disk3s8"]);
         assert_eq!(
-            commands[3].as_slice(),
+            commands[2].as_slice(),
             ["unmount", "disk3s8"],
             "the default mount is dropped before the private mount"
         );
         assert_eq!(
-            commands[4].as_slice(),
+            commands[3].as_slice(),
             [
                 "mount",
                 "-nobrowse",
@@ -5369,6 +5690,7 @@ mod tests {
             },
             &FakeProvisionIo {
                 events: Rc::clone(&events),
+                kernel: KernelRead::Forbidden,
             },
         )
         .unwrap();
@@ -5459,6 +5781,7 @@ mod tests {
             },
             &FakeProvisionIo {
                 events: Rc::clone(&denied_events),
+                kernel: KernelRead::Forbidden,
             },
         )
         .unwrap_err();
@@ -5476,14 +5799,12 @@ mod tests {
                 acquire_events.borrow_mut().push(ProvisionEvent::Acquire);
                 Ok(FakePrivilegedSession {
                     events: Rc::clone(&acquire_events),
-                    outputs: VecDeque::from([
-                        Ok(HostCommandOutput::success(plist(&container("disk3", "")))),
-                        Ok(HostCommandOutput::failure(1, "child failed\n")),
-                    ]),
+                    outputs: VecDeque::from([Ok(HostCommandOutput::failure(1, "child failed\n"))]),
                 })
             },
             &FakeProvisionIo {
                 events: Rc::clone(&failed_events),
+                kernel: KernelRead::Snapshot(container("disk3", [])),
             },
         )
         .unwrap_err();
@@ -5521,33 +5842,25 @@ mod tests {
     }
 
     #[test]
-    fn container_reference_is_the_synthesized_disk_of_the_volume_identifier() {
-        assert_eq!(container_reference_of("disk3s5").as_deref(), Some("disk3"));
-        assert_eq!(
-            container_reference_of("disk13s1").as_deref(),
-            Some("disk13")
-        );
-        // A sealed system snapshot mounts as `<volume>s<snapshot>`; the container is unchanged.
-        assert_eq!(
-            container_reference_of("disk3s1s1").as_deref(),
-            Some("disk3")
-        );
-        // Input that never named a device is refused, not sliced: the old byte-indexing here
-        // panicked on anything that did not start with `disk`.
-        assert_eq!(container_reference_of("not-a-disk"), None);
-        assert_eq!(container_reference_of("disk01s1"), None);
+    fn volume_container_is_the_synthesized_disk_of_the_volume_identifier() {
+        use crate::device::container_of;
+        assert_eq!(container_of("disk3s5"), Some("disk3"));
+        assert_eq!(container_of("disk13s1"), Some("disk13"));
+        // A sealed system snapshot mounts as `<volume>s<snapshot>`; the container is unchanged,
+        // which is why kernel volume records must also be exactly volume depth.
+        assert_eq!(container_of("disk3s1s1"), Some("disk3"));
+        assert!(!valid_volume_identifier(b"disk3s1s1"));
+        // Input that never named a device is refused, not sliced.
+        assert_eq!(container_of("not-a-disk"), None);
+        assert_eq!(container_of("disk01s1"), None);
     }
 
     #[tokio::test]
     async fn validator_reports_mis_mounted_volume_without_executing_remount() {
-        let mut evidence_source =
-            source_with_caches_inventory_mountpoint_omitted(Some("/Volumes/cowshed.caches"));
-        let gathered = gather_existing_apfs_evidence(
-            &mut evidence_source,
-            Path::new("/Users/alice"),
-            InventoryReadPolicy::RepairTransient,
-        )
-        .expect("mis-mounted caches evidence");
+        let mut evidence_source = source_with_caches_kernel_mount(Some("/Volumes/cowshed.caches"));
+        let gathered =
+            gather_existing_apfs_evidence(&mut evidence_source, Path::new("/Users/alice"))
+                .expect("mis-mounted caches evidence");
         assert!(matches!(
             gathered.bootstrap,
             BootstrapEvidence::Apfs {
@@ -5560,8 +5873,7 @@ mod tests {
                 && current_mountpoint == Path::new("/Volumes/cowshed.caches")
         ));
 
-        let mut plan_source =
-            source_with_caches_inventory_mountpoint_omitted(Some("/Volumes/cowshed.caches"));
+        let mut plan_source = source_with_caches_kernel_mount(Some("/Volumes/cowshed.caches"));
         let plan = plan_existing_host_storage(&mut plan_source, Path::new("/Users/alice"))
             .expect("mis-mounted caches repair plan");
         assert!(mutating_setup_actions(&plan).is_empty());
@@ -5576,14 +5888,11 @@ mod tests {
     }
 
     #[test]
-    fn volume_absent_from_inventory_and_mountpoint_info_requires_provisioning() {
-        let mut evidence_source = source_with_caches_inventory_mountpoint_omitted(None);
-        let gathered = gather_existing_apfs_evidence(
-            &mut evidence_source,
-            Path::new("/Users/alice"),
-            InventoryReadPolicy::RepairTransient,
-        )
-        .expect("detached caches evidence");
+    fn kernel_unmounted_volume_requires_recovery() {
+        let mut evidence_source = source_with_caches_kernel_mount(None);
+        let gathered =
+            gather_existing_apfs_evidence(&mut evidence_source, Path::new("/Users/alice"))
+                .expect("detached caches evidence");
         assert!(matches!(
             gathered.bootstrap,
             BootstrapEvidence::Apfs {
@@ -5594,7 +5903,7 @@ mod tests {
             } if exact_identifier == "disk3s9"
         ));
 
-        let mut plan_source = source_with_caches_inventory_mountpoint_omitted(None);
+        let mut plan_source = source_with_caches_kernel_mount(None);
         let plan = plan_existing_host_storage(&mut plan_source, Path::new("/Users/alice"))
             .expect("detached caches repair plan");
         assert!(plan.operations().iter().any(|operation| matches!(
@@ -5613,77 +5922,21 @@ mod tests {
     }
 
     #[test]
-    fn incomplete_inventory_never_authorizes_provisioning_or_hides_malformed_records() {
-        let complete = plist(&container("disk3", &volume("Data", "disk3s5", None)));
-        let departing = plist(
-            &(container("disk3", &volume("Data", "disk3s5", None))
-                + "<dict><key>ContainerReference</key><string>disk71</string></dict>"),
-        );
-        let mut strict = source(complete.clone());
-        strict.command_outputs = VecDeque::from([
-            HostCommandOutput::success(complete.clone()),
-            HostCommandOutput::success(departing.clone()),
-        ]);
-        assert!(matches!(
-            plan_native_bootstrap(
-                &mut strict,
-                Path::new("/Users/alice/project"),
-                Path::new("/Users/alice"),
+    fn detached_reserved_volume_in_another_container_is_found_elsewhere() {
+        let mut evidence = source(kernel([
+            container("disk3", [volume("Data", "disk3s5", None)]),
+            container(
+                "disk7",
+                [volume_with_filevault(
+                    APFS_STORE_VOLUME,
+                    "disk7s2",
+                    None,
+                    false,
+                )],
             ),
-            Err(NativeBootstrapError::MalformedPlist(_))
-        ));
-
-        let mut never_complete = source(departing);
-        assert!(matches!(
-            plan_existing_host_storage(&mut never_complete, Path::new("/Users/alice")),
-            Err(NativeBootstrapError::MalformedPlist(_))
-        ));
-
-        for malformed in [
-            "<dict><key>ContainerReference</key><string>not-a-device</string></dict>",
-            "<dict><key>ContainerReference</key><string>disk71</string><key>Volumes</key><array/></dict>",
-        ] {
-            let mut evidence = source(complete.clone());
-            evidence.command_outputs = VecDeque::from([
-                HostCommandOutput::success(complete.clone()),
-                HostCommandOutput::success(plist(
-                    &(container("disk3", &volume("Data", "disk3s5", None)) + malformed),
-                )),
-            ]);
-            assert!(matches!(
-                plan_existing_host_storage(&mut evidence, Path::new("/Users/alice")),
-                Err(NativeBootstrapError::MalformedPlist(_))
-            ));
-        }
-    }
-
-    #[test]
-    fn departing_global_container_does_not_hide_a_reserved_volume() {
-        let scoped = plist(&container("disk3", &volume("Data", "disk3s5", None)));
-        // Captured from a real image teardown: diskutil publishes just the departing device name.
-        let departing = plist(
-            &(container("disk3", &volume("Data", "disk3s5", None))
-                + "<dict><key>ContainerReference</key><string>disk71</string></dict>"),
-        );
-        let complete = plist(
-            &(container("disk3", &volume("Data", "disk3s5", None))
-                + &container(
-                    "disk7",
-                    &volume_with_filevault(APFS_STORE_VOLUME, "disk7s2", None, false),
-                )),
-        );
-        let mut evidence = source(complete.clone());
-        evidence.command_outputs = VecDeque::from([
-            HostCommandOutput::success(scoped),
-            HostCommandOutput::success(departing),
-            HostCommandOutput::success(complete),
-        ]);
-        let gathered = gather_existing_apfs_evidence(
-            &mut evidence,
-            Path::new("/Users/alice"),
-            InventoryReadPolicy::RepairTransient,
-        )
-        .expect("read-only planning must reobserve a departing container");
+        ]));
+        let gathered = gather_existing_apfs_evidence(&mut evidence, Path::new("/Users/alice"))
+            .expect("a foreign reserved volume is classified, never created over");
         assert!(matches!(
             gathered.bootstrap,
             BootstrapEvidence::Apfs {
@@ -5695,24 +5948,20 @@ mod tests {
 
     #[test]
     fn global_inventory_prevents_create_when_reserved_volume_is_in_another_container() {
-        let scoped = plist(&container(
-            "disk3",
-            &volume("Data", "disk3s5", Some("/System/Volumes/Data")),
-        ));
-        let global = plist(
-            &(container(
+        let mut source = source(kernel([
+            container(
                 "disk3",
-                &volume("Data", "disk3s5", Some("/System/Volumes/Data")),
-            ) + &container(
+                [volume("Data", "disk3s5", Some("/System/Volumes/Data"))],
+            ),
+            container(
                 "disk7",
-                &volume(APFS_STORE_VOLUME, "disk7s2", Some("/Volumes/cowshed.store")),
-            )),
-        );
-        let mut source = source(scoped.clone());
-        source.command_outputs = VecDeque::from([
-            HostCommandOutput::success(scoped),
-            HostCommandOutput::success(global),
-        ]);
+                [volume(
+                    APFS_STORE_VOLUME,
+                    "disk7s2",
+                    Some("/Volumes/cowshed.store"),
+                )],
+            ),
+        ]));
 
         let snapshot = prepare_setup_snapshot(&mut source, Path::new("/Users/alice"), "")
             .expect("cross-container volume must be repairable");
@@ -5732,7 +5981,7 @@ mod tests {
                 mounted_at,
                 mount_at,
             } if name == APFS_STORE_VOLUME
-                && uuid == "disk7s2-UUID"
+                && uuid == &volume_uuid("disk7s2")
                 && mounted_at == Path::new("/Volumes/cowshed.store")
                 && mount_at == Path::new("/private/cowshed/store")
         )));
@@ -5765,7 +6014,7 @@ mod tests {
             setup_requires_authorization(&snapshot),
         );
         assert!(!public_plan.non_destructive);
-        assert_eq!(source.commands[1].args(), ["apfs", "list", "-plist"]);
+        assert_eq!(source.inventory_reads, 1);
     }
 
     #[tokio::test]
@@ -5784,19 +6033,19 @@ mod tests {
             operation,
             HostOperation::PinVolumesInFstab { pins }
                 if pins.len() == 2
-                    && pins.iter().any(|pin| pin.volume_uuid == "disk3s8-UUID")
-                    && pins.iter().any(|pin| pin.volume_uuid == "disk3s9-UUID")
+                    && pins.iter().any(|pin| pin.volume_uuid == volume_uuid("disk3s8"))
+                    && pins.iter().any(|pin| pin.volume_uuid == volume_uuid("disk3s9"))
         )));
         assert!(setup_requires_authorization(&snapshot));
         assert_eq!(
             snapshot.actions,
             vec![
                 HostAction::PinFstab {
-                    uuid: "disk3s8-UUID".to_owned(),
+                    uuid: volume_uuid("disk3s8"),
                     mount_at: PathBuf::from("/private/cowshed/store"),
                 },
                 HostAction::PinFstab {
-                    uuid: "disk3s9-UUID".to_owned(),
+                    uuid: volume_uuid("disk3s9"),
                     mount_at: PathBuf::from("/private/cowshed/caches"),
                 },
             ]
@@ -5993,12 +6242,8 @@ UUID=CACHES /private/cowshed/caches apfs rw # cowshed created volume labelled co
             .expect("healthy plan");
 
         assert_eq!(source.statfs_paths, [PathBuf::from("/Users/alice")]);
-        assert_eq!(source.commands.len(), 1);
-        assert_eq!(source.commands[0].program(), DISKUTIL);
-        assert_eq!(
-            source.commands[0].args(),
-            ["apfs", "list", "-plist", "disk3"]
-        );
+        assert_eq!(source.inventory_reads, 1);
+        assert_eq!(source.file_vault_queries, ["disk3s8", "disk3s9"]);
         assert!(
             plan.operations()
                 .iter()
@@ -6120,10 +6365,10 @@ UUID=CACHES /private/cowshed/caches apfs rw # cowshed created volume labelled co
 
     #[tokio::test]
     async fn absent_storage_setup_plan_is_rejected_without_authorization() {
-        let inventory = plist(&container(
+        let inventory = container(
             "disk3",
-            &volume("Data", "disk3s5", Some("/System/Volumes/Data")),
-        ));
+            [volume("Data", "disk3s5", Some("/System/Volumes/Data"))],
+        );
         let mut source = source(inventory);
         let plan = plan_existing_host_storage(&mut source, Path::new("/Users/alice"))
             .expect("absence produces a setup plan");
@@ -6236,11 +6481,17 @@ UUID=CACHES /private/cowshed/caches apfs rw # cowshed created volume labelled co
 
     #[test]
     fn unencrypted_existing_volumes_mount_before_encrypting_in_place() {
-        let volumes = volume("Data", "disk3s5", Some("/System/Volumes/Data"))
-            + &volume_with_filevault(APFS_STORE_VOLUME, "disk3s8", None, false)
-            + &volume_with_filevault(APFS_CACHES_VOLUME, "disk3s9", None, false);
+        // FileVault comes only from the per-volume attestation; a false answer plans
+        // encryption after the existing volumes are mounted.
         let mut source = healthy_existing_source();
-        source.command_output = HostCommandOutput::success(plist(&container("disk3", &volumes)));
+        source.kernel = Ok(container(
+            "disk3",
+            [
+                volume("Data", "disk3s5", Some("/System/Volumes/Data")),
+                volume_with_filevault(APFS_STORE_VOLUME, "disk3s8", None, false),
+                volume_with_filevault(APFS_CACHES_VOLUME, "disk3s9", None, false),
+            ],
+        ));
         for path in [
             Path::new("/private/cowshed/store"),
             Path::new("/private/cowshed/caches"),
@@ -6292,9 +6543,152 @@ UUID=CACHES /private/cowshed/caches apfs rw # cowshed created volume labelled co
             error,
             NativeBootstrapError::MissingVolumeKeychain {
                 name: APFS_STORE_VOLUME,
-                ..
-            }
+                uuid,
+            } if uuid == volume_uuid("disk3s8")
         ));
+    }
+
+    #[test]
+    fn filevault_is_attested_only_for_reserved_kernel_records() {
+        let mut source = healthy_existing_source();
+        prepare_setup_snapshot(&mut source, Path::new("/Users/alice"), "")
+            .expect("healthy setup plan");
+        assert_eq!(source.file_vault_queries, ["disk3s8", "disk3s9"]);
+
+        let mut silent = healthy_existing_source();
+        if let Ok(kernel) = &mut silent.kernel {
+            kernel.file_vault.remove("disk3s9");
+        }
+        assert!(matches!(
+            prepare_setup_snapshot(&mut silent, Path::new("/Users/alice"), ""),
+            Err(NativeBootstrapError::VolumeFileVaultEvidence { identifier, .. })
+                if identifier == "disk3s9"
+        ));
+    }
+
+    #[test]
+    fn foreign_filevault_volume_keeps_kernel_uuid_mount_and_keychain_guard() {
+        let mut missing_keychain = source_with_foreign_store();
+        missing_keychain
+            .keychain_items
+            .insert(APFS_STORE_VOLUME, false);
+        assert!(matches!(
+            gather_existing_apfs_evidence(&mut missing_keychain, Path::new("/Users/alice")),
+            Err(NativeBootstrapError::MissingVolumeKeychain {
+                name: APFS_STORE_VOLUME,
+                uuid,
+            }) if uuid == volume_uuid("disk7s2")
+        ));
+        assert_eq!(missing_keychain.file_vault_queries, ["disk7s2"]);
+
+        let mut source = source_with_foreign_store();
+        let gathered = gather_existing_apfs_evidence(&mut source, Path::new("/Users/alice"))
+            .expect("foreign FileVault store with its keychain item");
+        let store = &gathered.volumes[0];
+        assert_eq!(store.file_vault, Some(true));
+        assert_eq!(store.volume_uuid, Some(volume_uuid("disk7s2")));
+        assert!(matches!(
+            &store.storage,
+            ExistingStorage::FoundElsewhere { container, device, mounted_at, .. }
+                if container == "disk7"
+                    && device == "disk7s2"
+                    && mounted_at.as_deref() == Some(Path::new("/Volumes/cowshed.store"))
+        ));
+    }
+
+    fn source_with_foreign_store() -> FakeEvidenceSource {
+        source(kernel([
+            container(
+                "disk3",
+                [volume("Data", "disk3s5", Some("/System/Volumes/Data"))],
+            ),
+            container(
+                "disk7",
+                [volume(
+                    APFS_STORE_VOLUME,
+                    "disk7s2",
+                    Some("/Volumes/cowshed.store"),
+                )],
+            ),
+        ]))
+    }
+
+    fn volume_info(entries: &[(&str, Value)]) -> Vec<u8> {
+        let mut info = plist::Dictionary::new();
+        for (key, value) in entries {
+            info.insert((*key).to_owned(), value.clone());
+        }
+        let mut bytes = Vec::new();
+        Value::Dictionary(info)
+            .to_writer_xml(&mut bytes)
+            .expect("encode volume info");
+        bytes
+    }
+
+    #[test]
+    fn filevault_attestation_requires_the_exact_kernel_record_and_an_explicit_answer() {
+        let store = ApfsVolume {
+            name: APFS_STORE_VOLUME.to_owned(),
+            identifier: "disk3s8".to_owned(),
+            mountpoint: Some(PathBuf::from("/private/cowshed/store")),
+            volume_uuid: volume_uuid("disk3s8"),
+        };
+        let exact = |file_vault: Option<Value>| {
+            let mut entries = vec![
+                ("DeviceIdentifier", Value::from("disk3s8")),
+                ("VolumeUUID", Value::from(volume_uuid("disk3s8"))),
+                ("APFSContainerReference", Value::from("disk3")),
+                ("VolumeName", Value::from(APFS_STORE_VOLUME)),
+                // Per-volume encryption is reported independently and must not stand in.
+                ("EncryptionThisVolumeProper", Value::Boolean(true)),
+            ];
+            entries.extend(file_vault.map(|value| ("FileVault", value)));
+            entries
+        };
+        let attest = |entries: &[(&str, Value)]| {
+            attest_volume_file_vault(&volume_info(entries), "disk3", &store)
+        };
+        assert!(matches!(
+            attest(&exact(Some(Value::Boolean(true)))),
+            Ok(true)
+        ));
+        assert!(matches!(
+            attest(&exact(Some(Value::Boolean(false)))),
+            Ok(false)
+        ));
+
+        let refused = |result: Result<bool, NativeBootstrapError>| {
+            matches!(
+                result,
+                Err(NativeBootstrapError::VolumeFileVaultEvidence { identifier, .. })
+                    if identifier == "disk3s8"
+            )
+        };
+        assert!(refused(attest_volume_file_vault(
+            b"not a plist",
+            "disk3",
+            &store
+        )));
+        assert!(refused(attest(&[])), "an empty root is unknown evidence");
+        assert!(
+            refused(attest(&exact(None))),
+            "missing FileVault is not false"
+        );
+        assert!(refused(attest(&exact(Some(Value::from("true"))))));
+        for (key, foreign) in [
+            ("DeviceIdentifier", Value::from("disk3s9")),
+            ("VolumeUUID", Value::from(volume_uuid("disk3s9"))),
+            ("APFSContainerReference", Value::from("disk7")),
+            ("VolumeName", Value::from(APFS_CACHES_VOLUME)),
+        ] {
+            let mut entries = exact(Some(Value::Boolean(true)));
+            for entry in &mut entries {
+                if entry.0 == key {
+                    entry.1 = foreign.clone();
+                }
+            }
+            assert!(refused(attest(&entries)), "foreign {key} must be refused");
+        }
     }
 
     struct EncryptCommandHost {

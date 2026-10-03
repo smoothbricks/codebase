@@ -65,8 +65,9 @@ only from `/private/cowshed/store/<owner>/<repo>/policy.json`, never from the ch
 kernel still holds the workspace's image, but nothing is mounted at its mount point — an attachment an interrupted
 process or an outside tool left behind. Neither verb can grow or rewrite an image the kernel holds (the image file stays
 exclusively locked while attached), and that attachment is not the workspace mount's to release, so the verb refuses
-before touching anything. Release the device it names with the `hdiutil detach /dev/diskN` it prints, then run the verb
-again. A resize that fails after a mounted workspace was detached puts it back on its mount.
+before touching anything. Device names are reused: confirm that the named device still belongs to this exact image
+before manually running `hdiutil detach /dev/diskN`, then retry the verb. A resize that fails after a mounted workspace
+was detached puts it back on its mount.
 
 ## Sandbox denials (exit 6)
 
@@ -352,10 +353,11 @@ the error names every failed identity.
 
 Per-command cost does not grow with history or with the number of warm workspaces: no command reads the audit segments
 under `/private/cowshed/store/telemetry/` (they are write-only telemetry; authority is the image inventory); the host
-APFS inventory is queried only for the cowshed container, and attaching an image takes its volume from the attach's own
-report, asking Disk Arbitration nothing after it (`diskutil info` and `diskutil apfs list` queue behind every
-arbitration client on the host); one project open validates the repository binding and reads the inventory once for
-every workspace it recovers. When a command is still slow on a wait in a host process,
+APFS inventory is one IORegistry snapshot plus the kernel mount table, never `diskutil apfs list`, and only the two
+reserved cowshed volumes get a `diskutil info` (for their FileVault state); attaching an image takes its volume from the
+attach's own report, asking Disk Arbitration nothing after it (`diskutil` queues behind every arbitration client on the
+host); one project open validates the repository binding and reads the inventory once for every workspace it recovers.
+When a command is still slow on a wait in a host process,
 `ps -o pid,ppid,etime,args -ax | grep -E 'diskutil|hdiutil|git'` names it while it runs.
 
 `cowshed new` prints a `cowshed: apfs canonical/<step>` or `cowshed: new <step>` span with its elapsed time for every

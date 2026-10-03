@@ -2661,18 +2661,227 @@ fn classify_clone_error(source: &Path, destination: &Path, error: io::Error) -> 
     }
 }
 
-/// The kernel's I/O Registry view of attached disk images.
+/// One APFS container the kernel has registered: its synthesized whole disk and every volume it
+/// hosts, read from one I/O Registry matching snapshot by [`registered_apfs_containers`].
+///
+/// Mount state is deliberately absent: the kernel mount table is the mount authority.
+#[cfg(any(target_os = "macos", test))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RegisteredApfsContainer {
+    /// The container's synthesized whole disk as a bare BSD name, e.g. `disk3`.
+    pub reference: String,
+    /// The `Size` of that `AppleAPFSMedia`: the ceiling every volume in it shares.
+    pub capacity_bytes: u64,
+    /// The container's volumes, sorted by identifier. Snapshots are not volumes.
+    pub volumes: Vec<RegisteredApfsVolume>,
+}
+
+/// One `AppleAPFSVolume` the kernel has published as a BSD device.
+#[cfg(any(target_os = "macos", test))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RegisteredApfsVolume {
+    /// The volume's `FullName`.
+    pub name: String,
+    /// The volume's bare BSD name, e.g. `disk3s8`, always a slice of its container's reference.
+    pub identifier: String,
+    /// The volume's `UUID`, canonical uppercase hyphenated. Unique within its container only:
+    /// a cloned image attached beside its source registers the same volume UUIDs.
+    pub volume_uuid: String,
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) use io_registry::registered_apfs_containers;
+
+/// What one `AppleAPFSMedia` registers. `reference` is absent until the media's BSD client has
+/// published the device node: such a container is arriving, not yet addressable.
+#[cfg(any(target_os = "macos", test))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ApfsMediaFacts {
+    reference: Option<String>,
+    capacity_bytes: Option<u64>,
+}
+
+/// What one `AppleAPFSVolume` registers, keyed to the registry entry id of the
+/// `AppleAPFSMedia` its `AppleAPFSContainer` provider hangs from.
+#[cfg(any(target_os = "macos", test))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ApfsVolumeFacts {
+    media: u64,
+    identifier: Option<String>,
+    name: Option<String>,
+    uuid: Option<String>,
+}
+
+/// Validate one registry snapshot's APFS facts into the container inventory.
+///
+/// Volumes are grouped by the registry identity of the media their container provider hangs
+/// from, never by parsing BSD names; a volume's name must then agree with that provider. Only a
+/// missing BSD Name means "not yet published" and leaves an object out; every other gap,
+/// malformation, duplicate or disagreement is an error, so a damaged read can never pass for
+/// an inventory with fewer containers or volumes in it.
+#[cfg(any(target_os = "macos", test))]
+fn project_registered_apfs(
+    media: &std::collections::BTreeMap<u64, ApfsMediaFacts>,
+    volumes: Vec<ApfsVolumeFacts>,
+) -> io::Result<Vec<RegisteredApfsContainer>> {
+    use std::collections::BTreeMap;
+    use std::collections::btree_map::Entry;
+
+    fn malformed(message: String) -> io::Error {
+        io::Error::new(io::ErrorKind::InvalidData, message)
+    }
+
+    let mut containers: BTreeMap<u64, RegisteredApfsContainer> = BTreeMap::new();
+    let mut references: BTreeMap<&str, u64> = BTreeMap::new();
+    for (&entry, facts) in media {
+        let Some(reference) = facts.reference.as_deref() else {
+            continue;
+        };
+        if identifier_depth(reference) != Some(0) {
+            return Err(malformed(format!(
+                "APFS container media {entry:#x} registers BSD Name {reference:?}, not a whole disk"
+            )));
+        }
+        let capacity_bytes = match facts.capacity_bytes {
+            Some(0) => {
+                return Err(malformed(format!(
+                    "APFS container {reference} registers a zero Size"
+                )));
+            }
+            Some(bytes) => bytes,
+            None => {
+                return Err(malformed(format!(
+                    "APFS container {reference} registers no Size"
+                )));
+            }
+        };
+        if let Some(other) = references.insert(reference, entry) {
+            return Err(malformed(format!(
+                "APFS container media {other:#x} and {entry:#x} both register BSD Name {reference}"
+            )));
+        }
+        containers.insert(
+            entry,
+            RegisteredApfsContainer {
+                reference: reference.to_owned(),
+                capacity_bytes,
+                volumes: Vec::new(),
+            },
+        );
+    }
+
+    for volume in volumes {
+        let Some(identifier) = volume.identifier else {
+            continue;
+        };
+        let Some(container) = containers.get_mut(&volume.media) else {
+            return Err(malformed(match media.get(&volume.media) {
+                Some(_) => format!(
+                    "APFS volume {identifier} is published before its container media {:#x}",
+                    volume.media
+                ),
+                None => format!(
+                    "APFS volume {identifier} hangs from container media {:#x} the snapshot never read",
+                    volume.media
+                ),
+            }));
+        };
+        if identifier_depth(&identifier) != Some(1)
+            || container_of(&identifier) != Some(container.reference.as_str())
+        {
+            return Err(malformed(format!(
+                "APFS volume {identifier} hangs from container {}, whose volume it cannot be",
+                container.reference
+            )));
+        }
+        let name = match volume.name {
+            Some(name) if !name.is_empty() => name,
+            Some(_) => {
+                return Err(malformed(format!(
+                    "APFS volume {identifier} registers an empty FullName"
+                )));
+            }
+            None => {
+                return Err(malformed(format!(
+                    "APFS volume {identifier} registers no FullName"
+                )));
+            }
+        };
+        let Some(mut volume_uuid) = volume.uuid else {
+            return Err(malformed(format!(
+                "APFS volume {identifier} registers no UUID"
+            )));
+        };
+        // Only the hyphenated form is 36 bytes long, so uppercasing it in place is canonical.
+        if volume_uuid.len() != 36
+            || !uuid::Uuid::try_parse(&volume_uuid).is_ok_and(|parsed| !parsed.is_nil())
+        {
+            return Err(malformed(format!(
+                "APFS volume {identifier} registers UUID {volume_uuid:?}, not a hyphenated volume UUID"
+            )));
+        }
+        volume_uuid.make_ascii_uppercase();
+        container.volumes.push(RegisteredApfsVolume {
+            name,
+            identifier,
+            volume_uuid,
+        });
+    }
+
+    let mut inventory: Vec<RegisteredApfsContainer> = containers.into_values().collect();
+    for container in &mut inventory {
+        container
+            .volumes
+            .sort_by(|left, right| left.identifier.cmp(&right.identifier));
+        if let Some(pair) = container
+            .volumes
+            .windows(2)
+            .find(|pair| pair[0].identifier == pair[1].identifier)
+        {
+            return Err(malformed(format!(
+                "two APFS volumes in container {} both register BSD Name {}",
+                container.reference, pair[0].identifier
+            )));
+        }
+        let mut uuids: BTreeMap<&str, &str> = BTreeMap::new();
+        for volume in &container.volumes {
+            match uuids.entry(&volume.volume_uuid) {
+                Entry::Occupied(first) => {
+                    return Err(malformed(format!(
+                        "APFS volumes {} and {} in container {} both register UUID {}",
+                        first.get(),
+                        volume.identifier,
+                        container.reference,
+                        volume.volume_uuid
+                    )));
+                }
+                Entry::Vacant(slot) => {
+                    slot.insert(&volume.identifier);
+                }
+            }
+        }
+    }
+    inventory.sort_by(|left, right| left.reference.cmp(&right.reference));
+    Ok(inventory)
+}
+
+/// The kernel's I/O Registry view of attached disk images and registered APFS containers.
 ///
 /// One `IOServiceGetMatchingServices` call answers every IOMedia node the kernel has registered.
 /// The kernel collects those matches under the registry's own consistency check — it restarts
 /// its walk whenever a concurrent attach or detach invalidates it — so the set is complete for
-/// one instant, which is exactly what `hdiutil info` is not. Each node is then walked up its
-/// provider chain to the image driver's `AppleDiskImageDevice`, whose `DiskImageURL` names the
-/// backing store. A live node's provider links do not change; a node already detached from the
-/// plane is departing and is not reported.
+/// one instant, which is exactly what `hdiutil info` and `diskutil apfs list` are not. For disk
+/// images each node is walked up its provider chain to the image driver's
+/// `AppleDiskImageDevice`, whose `DiskImageURL` names the backing store; for APFS the same
+/// snapshot yields every container's `AppleAPFSMedia` and every `AppleAPFSVolume`, grouped by
+/// the media its `AppleAPFSContainer` provider hangs from. A live node's provider links do not
+/// change; a node already detached from the plane is departing and is not reported.
 #[cfg(target_os = "macos")]
 mod io_registry {
-    use super::{AttachedDiskImage, DiskImageSource, ImageMedia};
+    use super::{
+        ApfsMediaFacts, ApfsVolumeFacts, AttachedDiskImage, DiskImageSource, ImageMedia,
+        RegisteredApfsContainer, project_registered_apfs,
+    };
     use crate::metadata::ImageCapacity;
     use std::collections::BTreeMap;
     use std::collections::btree_map::Entry;
@@ -2788,13 +2997,29 @@ mod io_registry {
         is_whole: bool,
     }
 
-    pub(super) fn attached_disk_images() -> io::Result<Vec<AttachedDiskImage>> {
-        let keys = Keys {
-            bsd_name: key("BSD Name")?,
-            content: key("Content")?,
-            size: key("Size")?,
-            url: key("DiskImageURL")?,
-        };
+    struct ApfsKeys {
+        bsd_name: Cf,
+        size: Cf,
+        full_name: Cf,
+        uuid: Cf,
+    }
+
+    /// Every IOMedia node registered at one instant, yielded as owned references.
+    struct MediaSnapshot(Object);
+
+    impl Iterator for MediaSnapshot {
+        type Item = Object;
+
+        fn next(&mut self) -> Option<Object> {
+            // SAFETY: the wrapped iterator is live; each object it yields is +1.
+            match unsafe { IOIteratorNext(self.0.0) } {
+                0 => None,
+                next => Some(Object(next)),
+            }
+        }
+    }
+
+    fn registered_media() -> io::Result<MediaSnapshot> {
         // SAFETY: the class name is NUL-terminated; a null answer is refused below.
         let matching = unsafe { IOServiceMatching(c"IOMedia".as_ptr()) };
         if matching.is_null() {
@@ -2810,15 +3035,18 @@ mod io_registry {
         if status != KERN_SUCCESS {
             return Err(kernel_error("match registered IOMedia", status));
         }
-        let iterator = Object(iterator);
+        Ok(MediaSnapshot(Object(iterator)))
+    }
+
+    pub(super) fn attached_disk_images() -> io::Result<Vec<AttachedDiskImage>> {
+        let keys = Keys {
+            bsd_name: key("BSD Name")?,
+            content: key("Content")?,
+            size: key("Size")?,
+            url: key("DiskImageURL")?,
+        };
         let mut images: BTreeMap<u64, AttachedDiskImage> = BTreeMap::new();
-        loop {
-            // SAFETY: `iterator` is a live matching iterator; each object it yields is +1.
-            let next = unsafe { IOIteratorNext(iterator.0) };
-            if next == 0 {
-                break;
-            }
-            let media = Object(next);
+        for media in registered_media()? {
             let Some(name) = string_property(&media, &keys.bsd_name, "BSD Name")? else {
                 continue;
             };
@@ -2861,17 +3089,87 @@ mod io_registry {
             .collect())
     }
 
+    /// Every APFS container and volume registered at one instant, from the same IOMedia snapshot
+    /// [`attached_disk_images`] reads: `AppleAPFSMedia` is a container's synthesized whole disk,
+    /// and each `AppleAPFSVolume` hangs from an `AppleAPFSContainer` that hangs from one. A
+    /// container whose volumes are all gone, or not yet started, is still reported. A volume
+    /// whose provider chain has already left the plane is departing and is not; any other read
+    /// failure fails the whole inventory, which [`super::project_registered_apfs`] validates.
+    pub(crate) fn registered_apfs_containers() -> io::Result<Vec<RegisteredApfsContainer>> {
+        let keys = ApfsKeys {
+            bsd_name: key("BSD Name")?,
+            size: key("Size")?,
+            full_name: key("FullName")?,
+            uuid: key("UUID")?,
+        };
+        let mut media: BTreeMap<u64, ApfsMediaFacts> = BTreeMap::new();
+        let mut volumes = Vec::new();
+        for entry in registered_media()? {
+            if conforms(&entry, c"AppleAPFSMedia") {
+                record_apfs_media(&mut media, &entry, &keys)?;
+            } else if conforms(&entry, c"AppleAPFSVolume") {
+                let identifier = string_property(&entry, &keys.bsd_name, "BSD Name")?;
+                let Some(container_media) = apfs_volume_media(&entry, identifier.as_deref())?
+                else {
+                    continue;
+                };
+                volumes.push(ApfsVolumeFacts {
+                    media: record_apfs_media(&mut media, &container_media, &keys)?,
+                    identifier,
+                    name: string_property(&entry, &keys.full_name, "FullName")?,
+                    uuid: string_property(&entry, &keys.uuid, "UUID")?,
+                });
+            }
+        }
+        project_registered_apfs(&media, volumes)
+    }
+
+    /// Read one `AppleAPFSMedia` once, however many of its volumes reach it, and answer its
+    /// registry entry id.
+    fn record_apfs_media(
+        media: &mut BTreeMap<u64, ApfsMediaFacts>,
+        entry: &Object,
+        keys: &ApfsKeys,
+    ) -> io::Result<u64> {
+        let id = entry_id(entry, "read an APFS container media's registry id")?;
+        if let Entry::Vacant(slot) = media.entry(id) {
+            slot.insert(ApfsMediaFacts {
+                reference: string_property(entry, &keys.bsd_name, "BSD Name")?,
+                capacity_bytes: size_property(entry, &keys.size)?,
+            });
+        }
+        Ok(id)
+    }
+
+    /// The `AppleAPFSMedia` a volume's `AppleAPFSContainer` provider hangs from, or `None` once
+    /// either link has left the plane. Any other provider is not APFS and is refused.
+    fn apfs_volume_media(volume: &Object, identifier: Option<&str>) -> io::Result<Option<Object>> {
+        let named = identifier.unwrap_or("<unpublished>");
+        let Some(container) = provider(volume)? else {
+            return Ok(None);
+        };
+        if !conforms(&container, c"AppleAPFSContainer") {
+            return Err(invalid(format!(
+                "APFS volume {named} hangs from a provider that is not an AppleAPFSContainer"
+            )));
+        }
+        let Some(media) = provider(&container)? else {
+            return Ok(None);
+        };
+        if !conforms(&media, c"AppleAPFSMedia") {
+            return Err(invalid(format!(
+                "the AppleAPFSContainer of APFS volume {named} hangs from a provider that is not an AppleAPFSMedia"
+            )));
+        }
+        Ok(Some(media))
+    }
+
     fn image_driver_of(media: &Object) -> io::Result<Option<ImageDriver>> {
         let mut intervening_media = 0usize;
         let mut current = provider(media)?;
         while let Some(entry) = current {
             if conforms(&entry, c"AppleDiskImageDevice") {
-                let mut id = 0u64;
-                // SAFETY: `entry` is a live registry reference and `id` is writable.
-                let status = unsafe { IORegistryEntryGetRegistryEntryID(entry.0, &mut id) };
-                if status != KERN_SUCCESS {
-                    return Err(kernel_error("read a disk image's registry id", status));
-                }
+                let id = entry_id(&entry, "read a disk image's registry id")?;
                 return Ok(Some(ImageDriver {
                     driver: entry,
                     id,
@@ -2900,6 +3198,17 @@ mod io_registry {
     fn conforms(entry: &Object, class: &CStr) -> bool {
         // SAFETY: `entry` is live and `class` is NUL-terminated.
         unsafe { IOObjectConformsTo(entry.0, class.as_ptr()) != 0 }
+    }
+
+    fn entry_id(entry: &Object, operation: &str) -> io::Result<u64> {
+        let mut id = 0u64;
+        // SAFETY: `entry` is a live registry reference and `id` is writable.
+        let status = unsafe { IORegistryEntryGetRegistryEntryID(entry.0, &mut id) };
+        if status == KERN_SUCCESS {
+            Ok(id)
+        } else {
+            Err(kernel_error(operation, status))
+        }
     }
 
     fn key(name: &str) -> io::Result<Cf> {
@@ -5801,5 +6110,216 @@ mod tests {
 
         fs::remove_file(source).unwrap();
         fs::remove_file(destination).unwrap();
+    }
+
+    const SYSTEM_UUID: &str = "A925F069-4430-489F-8206-41FC42B27763";
+    const CACHES_UUID: &str = "2B1BDA0B-603C-497C-AD3D-DBA63F7BFA36";
+
+    fn apfs_media(reference: Option<&str>, capacity_bytes: Option<u64>) -> ApfsMediaFacts {
+        ApfsMediaFacts {
+            reference: reference.map(str::to_owned),
+            capacity_bytes,
+        }
+    }
+
+    fn apfs_volume(
+        media: u64,
+        identifier: Option<&str>,
+        name: Option<&str>,
+        uuid: Option<&str>,
+    ) -> ApfsVolumeFacts {
+        ApfsVolumeFacts {
+            media,
+            identifier: identifier.map(str::to_owned),
+            name: name.map(str::to_owned),
+            uuid: uuid.map(str::to_owned),
+        }
+    }
+
+    fn registered_volume(name: &str, identifier: &str, uuid: &str) -> RegisteredApfsVolume {
+        RegisteredApfsVolume {
+            name: name.to_owned(),
+            identifier: identifier.to_owned(),
+            volume_uuid: uuid.to_owned(),
+        }
+    }
+
+    #[test]
+    fn registered_apfs_groups_volumes_by_their_container_provider() {
+        let media = BTreeMap::from([
+            (0x10, apfs_media(Some("disk3"), Some(7_998_499_225_600))),
+            (0x20, apfs_media(Some("disk5"), Some(322_122_547_200))),
+            (0x30, apfs_media(None, None)),
+            (0x40, apfs_media(Some("disk9"), Some(214_748_364_800))),
+        ]);
+        let volumes = vec![
+            apfs_volume(
+                0x10,
+                Some("disk3s9"),
+                Some("cowshed.caches"),
+                Some(&CACHES_UUID.to_ascii_lowercase()),
+            ),
+            apfs_volume(0x10, None, Some("arriving"), None),
+            apfs_volume(0x40, Some("disk9s1"), Some("clone"), Some(SYSTEM_UUID)),
+            apfs_volume(
+                0x10,
+                Some("disk3s1"),
+                Some("Macintosh HD"),
+                Some(SYSTEM_UUID),
+            ),
+        ];
+
+        let inventory = project_registered_apfs(&media, volumes).unwrap();
+
+        assert_eq!(
+            inventory,
+            vec![
+                RegisteredApfsContainer {
+                    reference: "disk3".to_owned(),
+                    capacity_bytes: 7_998_499_225_600,
+                    volumes: vec![
+                        registered_volume("Macintosh HD", "disk3s1", SYSTEM_UUID),
+                        registered_volume("cowshed.caches", "disk3s9", CACHES_UUID),
+                    ],
+                },
+                RegisteredApfsContainer {
+                    reference: "disk5".to_owned(),
+                    capacity_bytes: 322_122_547_200,
+                    volumes: Vec::new(),
+                },
+                RegisteredApfsContainer {
+                    reference: "disk9".to_owned(),
+                    capacity_bytes: 214_748_364_800,
+                    volumes: vec![registered_volume("clone", "disk9s1", SYSTEM_UUID)],
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn registered_apfs_refuses_incomplete_or_conflicting_registry_facts() {
+        let disk3 = || apfs_media(Some("disk3"), Some(1 << 30));
+        let system = |identifier: &str| {
+            apfs_volume(
+                0x10,
+                Some(identifier),
+                Some("Macintosh HD"),
+                Some(SYSTEM_UUID),
+            )
+        };
+        let cases: Vec<(&str, BTreeMap<u64, ApfsMediaFacts>, Vec<ApfsVolumeFacts>)> = vec![
+            (
+                "not a whole disk",
+                BTreeMap::from([(0x10, apfs_media(Some("disk3s1"), Some(1 << 30)))]),
+                Vec::new(),
+            ),
+            (
+                "not a whole disk",
+                BTreeMap::from([(0x10, apfs_media(Some("/dev/disk3"), Some(1 << 30)))]),
+                Vec::new(),
+            ),
+            (
+                "registers no Size",
+                BTreeMap::from([(0x10, apfs_media(Some("disk3"), None))]),
+                Vec::new(),
+            ),
+            (
+                "registers a zero Size",
+                BTreeMap::from([(0x10, apfs_media(Some("disk3"), Some(0)))]),
+                Vec::new(),
+            ),
+            (
+                "both register BSD Name disk3",
+                BTreeMap::from([(0x10, disk3()), (0x11, disk3())]),
+                Vec::new(),
+            ),
+            (
+                "published before its container media",
+                BTreeMap::from([(0x10, apfs_media(None, None))]),
+                vec![system("disk3s1")],
+            ),
+            (
+                "the snapshot never read",
+                BTreeMap::from([(0x20, disk3())]),
+                vec![system("disk3s1")],
+            ),
+            (
+                "whose volume it cannot be",
+                BTreeMap::from([(0x10, disk3())]),
+                vec![system("disk7s1")],
+            ),
+            (
+                "whose volume it cannot be",
+                BTreeMap::from([(0x10, disk3())]),
+                vec![system("disk3s1s1")],
+            ),
+            (
+                "whose volume it cannot be",
+                BTreeMap::from([(0x10, disk3())]),
+                vec![system("disk3")],
+            ),
+            (
+                "registers no FullName",
+                BTreeMap::from([(0x10, disk3())]),
+                vec![apfs_volume(0x10, Some("disk3s1"), None, Some(SYSTEM_UUID))],
+            ),
+            (
+                "registers an empty FullName",
+                BTreeMap::from([(0x10, disk3())]),
+                vec![apfs_volume(
+                    0x10,
+                    Some("disk3s1"),
+                    Some(""),
+                    Some(SYSTEM_UUID),
+                )],
+            ),
+            (
+                "registers no UUID",
+                BTreeMap::from([(0x10, disk3())]),
+                vec![apfs_volume(0x10, Some("disk3s1"), Some("Data"), None)],
+            ),
+            (
+                "not a hyphenated volume UUID",
+                BTreeMap::from([(0x10, disk3())]),
+                vec![apfs_volume(
+                    0x10,
+                    Some("disk3s1"),
+                    Some("Data"),
+                    Some("A925F0694430489F820641FC42B27763"),
+                )],
+            ),
+            (
+                "not a hyphenated volume UUID",
+                BTreeMap::from([(0x10, disk3())]),
+                vec![apfs_volume(
+                    0x10,
+                    Some("disk3s1"),
+                    Some("Data"),
+                    Some("00000000-0000-0000-0000-000000000000"),
+                )],
+            ),
+            (
+                "both register BSD Name disk3s1",
+                BTreeMap::from([(0x10, disk3())]),
+                vec![
+                    system("disk3s1"),
+                    apfs_volume(0x10, Some("disk3s1"), Some("Data"), Some(CACHES_UUID)),
+                ],
+            ),
+            (
+                "both register UUID",
+                BTreeMap::from([(0x10, disk3())]),
+                vec![system("disk3s1"), system("disk3s2")],
+            ),
+        ];
+        for (expected, media, volumes) in cases {
+            let error = project_registered_apfs(&media, volumes)
+                .expect_err(&format!("projection must refuse: {expected}"));
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{error}");
+            assert!(
+                error.to_string().contains(expected),
+                "expected {expected:?} in {error}"
+            );
+        }
     }
 }

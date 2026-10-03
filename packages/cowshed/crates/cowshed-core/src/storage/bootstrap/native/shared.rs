@@ -11,6 +11,7 @@ use super::super::{
     VolumeRole, execute_bootstrap,
 };
 use crate::error::CowshedError;
+use crate::storage::apfs::ApfsStorageError;
 
 /// Whether native bootstrap may apply its mutating host plan.
 ///
@@ -322,14 +323,31 @@ pub enum NativeBootstrapError {
     Host(#[from] HostError),
     #[error("{0}")]
     CommandFailed(HostCommandFailure),
-    #[error("diskutil APFS inventory is malformed: {0}")]
-    MalformedPlist(String),
-    #[error("diskutil APFS inventory contains departing container {0:?}")]
-    DepartingApfsContainer(String),
-    #[error("kernel device {device:?} belongs to no APFS container in diskutil evidence")]
+    #[error("cannot read the kernel APFS registry: {source}")]
+    ApfsRegistry { source: io::Error },
+    #[error("cannot read the kernel mount table: {source}")]
+    KernelMountTable { source: ApfsStorageError },
+    #[error(
+        "kernel APFS registry published no containers; an empty snapshot cannot establish volume absence"
+    )]
+    EmptyApfsInventory,
+    #[error("kernel APFS inventory is malformed: {0}")]
+    MalformedApfsInventory(String),
+    #[error("kernel APFS registry publishes container {0:?} more than once")]
+    DuplicateApfsContainer(String),
+    #[error("kernel APFS registry publishes volume {0:?} more than once")]
+    DuplicateApfsVolume(String),
+    #[error(
+        "APFS volume {identifier:?} has kernel mounts at {mountpoints:?}; expected at most one"
+    )]
+    AmbiguousVolumeMount {
+        identifier: String,
+        mountpoints: Vec<PathBuf>,
+    },
+    #[error("kernel device {device:?} belongs to no APFS container in the kernel APFS registry")]
     ContainerNotFound { device: String },
-    #[error("kernel device {device:?} ambiguously belongs to {matches} APFS containers")]
-    AmbiguousContainer { device: String, matches: usize },
+    #[error("diskutil info cannot attest FileVault for APFS volume {identifier:?}: {reason}")]
+    VolumeFileVaultEvidence { identifier: String, reason: String },
     #[error("APFS container {container:?} has {matches} volumes named {name:?}")]
     AmbiguousVolume {
         container: String,
@@ -340,16 +358,11 @@ pub enum NativeBootstrapError {
         "FileVault volume {name:?} ({uuid}) has no usable System.keychain password; refusing to replace its unlock credential"
     )]
     MissingVolumeKeychain { name: &'static str, uuid: String },
-    #[error("APFS volume {identifier:?} has invalid mountpoint evidence {mountpoint:?}")]
-    InvalidVolumeMountpoint {
-        identifier: String,
-        mountpoint: Option<PathBuf>,
-    },
     #[error(
         "mountpoint {path:?} contains data but is not the exact expected APFS mount; run cowshed setup"
     )]
     MaskedMountpoint { path: PathBuf },
-    #[error("mountpoint {path:?} conflicts with diskutil evidence for {identifier:?}")]
+    #[error("mountpoint {path:?} conflicts with kernel APFS evidence for {identifier:?}")]
     MountEvidenceMismatch { path: PathBuf, identifier: String },
     #[error("mounted APFS marker at {path:?} is invalid: {message}")]
     InvalidMountedMarker { path: PathBuf, message: String },

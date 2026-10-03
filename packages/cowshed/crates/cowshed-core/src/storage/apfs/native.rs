@@ -3336,7 +3336,7 @@ fn attached_without_mount(
     done: &str,
 ) -> ApfsStorageError {
     ApfsStorageError::Host(format!(
-        "{} is still attached as {device} with nothing mounted at {}; that attachment is not the workspace mount's to release, so the image was not {done}. Release it with `hdiutil detach {device}` and run the command again",
+        "{} is still attached as {device} with nothing mounted at {}; that attachment is not the workspace mount's to release, so the image was not {done}. Device names are reused: confirm its backing image is still this exact image before manually releasing it with `hdiutil detach {device}`, then run the command again",
         image.display(),
         mount_point.display()
     ))

@@ -409,17 +409,24 @@ Both volumes are created once by explicit foreground `cowshed setup`
 free-space pool — no sizing, no space cost for the split. The complete create/mount/pin transaction uses the one
 provisioning authorization session described in 14_nix.md.
 
-Read-only host-storage validation reobserves a successful `diskutil apfs list -plist` read when parsing encounters an
-empty plist root (`<dict/>`) or an APFS container dictionary containing only a valid `ContainerReference`. Both
-incomplete shapes were captured while an unrelated image detached. It repeats the same scoped (or, if needed, global)
-query at most four times, with 50 ms between incomplete reads, and still requires a complete parsed inventory containing
-the exact kernel mount-source volume in the home container. A departing record is never dropped to establish absence.
-Other parse errors, including a nonempty root without `Containers`, remain authoritative when encountered. Parsing stops
-at the first error, so an earlier departing record may cause a bounded re-read before a later malformed record is seen;
-no incomplete scan is accepted. Exhausted reads report the parse failure with command/status, output length, root shape,
-and incomplete-read count without printing volume contents. A later failed command retains its own typed failure and
-logs the preceding incomplete-read count. Mutation planning and the execution-time pre-create global inventory stay
-strict: the first incomplete observation is refused, and no incomplete inventory ever authorizes a write.
+Host-storage planning takes its APFS listing from the kernel, never from `diskutil apfs list`. One IORegistry snapshot
+names every container (BSD name, capacity ceiling) and every volume (BSD name, name, volume UUID); the kernel mount
+table (`getmntinfo`) names where each volume is mounted, and a volume with no mount entry is detached. That one snapshot
+selects the container holding the home directory's exact mount-source volume and is the global reserved-name guard, so
+the two decisions cannot observe different listings. The snapshot is read once, with no retry or delay, and fails
+closed: an unreadable registry, an empty registry, a duplicated container or volume identifier, a volume outside its
+container or at snapshot depth, an empty name, a non-canonical volume UUID, a zero capacity, or two kernel mounts of one
+volume is an error, never evidence that a reserved volume is absent. The listing `diskutil apfs list -plist` read back
+an empty root while an unrelated image detached; the registry has no such transient projection. A volume mounted
+somewhere other than its canonical path is attested by `statfs` at that path before it is reported as mis-mounted.
+
+The registry's per-volume `Encrypted` property is not FileVault — the Data volume is encrypted without FileVault — and
+no kernel property reports FileVault. FileVault state is therefore read, only for the selected reserved `cowshed.store`
+/ `cowshed.caches` records, from one `diskutil info -plist <identifier>` each. That answer is accepted only when its
+`DeviceIdentifier`, `VolumeUUID`, `APFSContainerReference`, and `VolumeName` all match the kernel record and it states
+`FileVault` as a boolean; an empty, foreign, unreadable, or silent answer fails closed. It is per-volume crypto
+metadata, never a listing and never a global query. The execution-time pre-create recheck inside the authorization
+session reads a fresh kernel snapshot the same way, and an unreadable or empty snapshot refuses the create.
 
 **Boot mounting is owned by a root system LaunchDaemon, and both volumes are FileVault-encrypted.** At provision, the
 same authorization session:
