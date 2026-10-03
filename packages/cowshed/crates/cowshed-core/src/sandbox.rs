@@ -690,10 +690,17 @@ pub fn seatbelt_profile(
     // Filesystem watchers need this service port or they silently receive no
     // events. FSEvents still filters notifications through the file-read
     // policy: the real watcher regression covers an allowed update and a
-    // denied descendant. No other Mach service or filesystem access is added.
+    // denied descendant. This service adds no filesystem authority.
     push_line(
         &mut profile,
         "(allow mach-lookup (global-name \"com.apple.FSEvents\"))",
+    );
+    // pwd.h/grp.h use OpenDirectory's read-only libinfo lookup service, as
+    // Apple's opendirectory.sb documents. Stock id and ssh-keygen need it to
+    // resolve the effective uid; record (.api) and membership services stay denied.
+    push_line(
+        &mut profile,
+        "(allow mach-lookup (global-name \"com.apple.system.opendirectoryd.libinfo\"))",
     );
 
     for socket in &sockets {
@@ -1874,6 +1881,92 @@ mod tests {
             "the socket's own directory must be traversable"
         );
 
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
+    fn host_controller_seatbelt_resolves_unix_identity_without_directory_record_authority() {
+        let sequence = NEXT_SANDBOX_DIR.fetch_add(1, Ordering::Relaxed);
+        let root_alias = std::env::temp_dir().join(format!(
+            "cowshed-identity-test-{}-{sequence}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root_alias).unwrap();
+        let root = fs::canonicalize(&root_alias).unwrap();
+        let mut config = config(RunSandboxMode::ReadWrite);
+        config.home = root.join("home");
+        config.mount_root = root.join("mounts");
+        config.workspace_mount = root.join("workspace");
+        config.exec_temp_dir = root.join("tmp");
+        config.allowed_unix_sockets.clear();
+        for path in [&config.home, &config.workspace_mount, &config.exec_temp_dir] {
+            fs::create_dir_all(path).unwrap();
+        }
+        let host_name = std::process::Command::new("/usr/bin/id")
+            .arg("-un")
+            .output()
+            .unwrap();
+        assert!(host_name.status.success(), "{host_name:?}");
+        let name = std::str::from_utf8(&host_name.stdout).unwrap().trim();
+        let record = format!("/Users/{name}");
+        let host_record = std::process::Command::new("/usr/bin/dscl")
+            .args([".", "-read", &record, "UniqueID"])
+            .output()
+            .unwrap();
+        assert!(host_record.status.success(), "{host_record:?}");
+        let key = config.workspace_mount.join("identity-key");
+        let generated = std::process::Command::new("/usr/bin/ssh-keygen")
+            .args(["-q", "-t", "ed25519", "-N", "", "-f"])
+            .arg(&key)
+            .output()
+            .unwrap();
+        assert!(generated.status.success(), "{generated:?}");
+        let public_key = key.with_extension("pub");
+        let host_fingerprint = std::process::Command::new("/usr/bin/ssh-keygen")
+            .arg("-lf")
+            .arg(&public_key)
+            .output()
+            .unwrap();
+        assert!(host_fingerprint.status.success(), "{host_fingerprint:?}");
+        for role in [
+            SandboxProfileRole::TrustedSupervisor,
+            SandboxProfileRole::ExecutedChild,
+            SandboxProfileRole::GitDiscovery,
+        ] {
+            let profile = seatbelt_profile(&config, role).unwrap();
+            let identity = std::process::Command::new("/usr/bin/sandbox-exec")
+                .args(["-p", &profile, "--", "/usr/bin/id", "-un"])
+                .output()
+                .unwrap();
+            assert!(identity.status.success(), "{role:?}: {identity:?}");
+            assert_eq!(identity.stdout, host_name.stdout, "{role:?}");
+            let fingerprint = std::process::Command::new("/usr/bin/sandbox-exec")
+                .args(["-p", &profile, "--", "/usr/bin/ssh-keygen", "-lf"])
+                .arg(&public_key)
+                .output()
+                .unwrap();
+            assert!(fingerprint.status.success(), "{role:?}: {fingerprint:?}");
+            assert_eq!(fingerprint.stdout, host_fingerprint.stdout, "{role:?}");
+            let denied_record = std::process::Command::new("/usr/bin/sandbox-exec")
+                .args([
+                    "-p",
+                    &profile,
+                    "--",
+                    "/usr/bin/dscl",
+                    ".",
+                    "-read",
+                    &record,
+                    "UniqueID",
+                ])
+                .output()
+                .unwrap();
+            assert!(
+                !denied_record.status.success(),
+                "{role:?} must not acquire directory-record authority: {denied_record:?}"
+            );
+        }
         fs::remove_dir_all(&root).unwrap();
     }
 
