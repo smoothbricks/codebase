@@ -1,6 +1,6 @@
 import { mkdir, symlink, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
-import { git, withFixtureRepo } from './fixture-repo.js';
+import { FIXTURE_NX_DIAGNOSTICS, git, withFixtureRepo } from './fixture-repo.js';
 import { bunBinary } from './private-registry.js';
 
 /** Every fixture package claims this repository, so root ownership checks pass. */
@@ -41,7 +41,16 @@ export async function withPackWorkspace(
   await withFixtureRepo(async (root) => {
     // Build output stays out of the index so a command's Nx build does not
     // register as a working-tree mutation.
-    await writeFile(join(root, '.gitignore'), 'node_modules\n.nx\nartifacts\nbun-home\nbun-cache\ndist\n*.tgz\n');
+    await writeFile(join(root, '.gitignore'), 'node_modules\n.nx\nartifacts\nbun-home\nbun-cache\ndist\n*.tgz\n.env\n');
+    // `release pack` spawns Nx itself, from this process's environment. Nx
+    // loads the workspace root's `.env` before anything else, so its child
+    // and daemon get the fixture diagnostics without a global env change.
+    await writeFile(
+      join(root, '.env'),
+      Object.entries(FIXTURE_NX_DIAGNOSTICS)
+        .map(([name, value]) => `${name}=${value}\n`)
+        .join(''),
+    );
     await writeFile(
       join(root, 'package.json'),
       manifestText({

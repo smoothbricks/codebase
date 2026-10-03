@@ -1,5 +1,6 @@
+import { onTestFinished } from 'bun:test';
 import { existsSync } from 'node:fs';
-import { mkdir, mkdtemp, realpath, rm, symlink, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { $ } from 'bun';
@@ -8,6 +9,20 @@ import type { GitReleaseTagInfo } from '../../core.js';
 
 const GIT_TIMEOUT_MS = 10_000;
 const NX_DAEMON_STOP_TIMEOUT_MS = 10_000;
+
+/**
+ * Every fixture Nx process reports its own phases. A fixture Nx run has stalled
+ * for the whole 30s test deadline while its measured tasks took 294ms, and no
+ * evidence of the stall survived. With these set, the client writes its daemon
+ * wait and request lines, with timestamps, into the fixture daemon log. The
+ * daemon logs the time each graph, plugin and hashing phase took, and the
+ * client prints its own phase durations to stderr. Both are logging only and
+ * change no Nx behaviour.
+ */
+export const FIXTURE_NX_DIAGNOSTICS: Readonly<Record<string, string>> = {
+  NX_PERF_LOGGING: 'true',
+  NX_DAEMON_VERBOSE_LOGGING: 'true',
+};
 
 // Isolate fixture git from the runner environment and skip fsync. These are
 // throwaway temp repos (deleted in withFixtureRepo's finally) so durability is
@@ -27,22 +42,55 @@ const GIT_FIXTURE_ENV: Record<string, string> = {
   GIT_CONFIG_VALUE_0: 'none',
 };
 
+/**
+ * A temp git repository for one test. Bun moves on when a test times out but
+ * does not cancel its body. The body can then finish later and delete the only
+ * evidence of what stalled. So when the test finishes while the root still
+ * exists, the fixture snapshots its Nx daemon log at that moment. A body
+ * failure reports the same log before cleanup.
+ */
 export async function withFixtureRepo(fn: (root: string) => Promise<void>): Promise<void> {
+  let heldRoot: string | null = null;
+  onTestFinished(async () => {
+    const root = heldRoot;
+    if (root !== null) {
+      await reportFixtureNxDaemon(root, 'the test finished while the fixture still existed');
+    }
+  });
   // Canonical, because macOS puts the temp directory behind a /private symlink
   // and a daemon never sees an edit made under a root named through one.
   const root = await realpath(await mkdtemp(join(tmpdir(), 'smoo-release-test-')));
+  heldRoot = root;
   try {
     await git(root, ['init', '-b', 'main']);
     await git(root, ['config', 'user.name', 'Test User']);
     await git(root, ['config', 'user.email', 'test@example.com']);
     await fn(root);
+  } catch (error) {
+    await reportFixtureNxDaemon(root, 'the fixture body failed');
+    throw error;
   } finally {
     try {
       await stopFixtureNxDaemon(root);
     } finally {
       await rm(root, { recursive: true, force: true });
+      heldRoot = null;
     }
   }
+}
+
+/**
+ * Write a fixture's Nx daemon log to stderr before the root that holds it is
+ * deleted. Bun's test output is the artifact the gate keeps. A root without the
+ * log never started a daemon, so it has nothing to report.
+ */
+async function reportFixtureNxDaemon(root: string, reason: string): Promise<void> {
+  const log = join(root, '.nx', 'workspace-data', 'd', 'daemon.log');
+  if (!existsSync(log)) {
+    return;
+  }
+  const text = await readFile(log, 'utf8').catch((error: unknown) => `daemon log unreadable: ${String(error)}`);
+  process.stderr.write(`Nx daemon log of fixture ${root} (${reason}):\n${text}\n`);
 }
 
 export async function writeWorkspace(root: string): Promise<void> {
@@ -176,6 +224,7 @@ export async function runFixtureNx(root: string, args: string[]): Promise<void> 
       NX_WORKSPACE_ROOT_PATH: root,
       NX_CACHE_DIRECTORY: join(root, '.nx', 'cache'),
       NX_WORKSPACE_DATA_DIRECTORY: join(root, '.nx', 'workspace-data'),
+      ...FIXTURE_NX_DIAGNOSTICS,
     })
     .quiet()
     .nothrow();

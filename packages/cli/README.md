@@ -288,6 +288,11 @@ This CLI's `cli:test` target runs the slow shell-entry integration file on its o
 across four native `--shard` targets. All five bounded targets must pass; the four shards ignore only the shell-entry
 file, so new tests discovered under `src/` remain in the suite without maintaining a file list or extending its timeout.
 
+Release fixtures enable Nx performance and verbose daemon logging in their child environment. A body failure or a test
+ending before its fixture is released prints the fixture's daemon log into the retained test output before cleanup. This
+records graph, hashing, and daemon-request phases without changing deadlines, retries, or daemon selection; it does not
+cancel a timed-out test body or claim to repair a stall.
+
 The root `@typescript/native` dependency follows TypeScript's documented side-by-side pattern: it aliases TypeScript 7
 and supplies the native compiler used by `ttsc`. Because `ttsc` resolves only the unscoped package by default, the
 managed devenv shell sets `TTSC_TSGO_BINARY` to `node_modules/@typescript/native/bin/tsc`; the GitHub setup action
