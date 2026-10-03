@@ -123,7 +123,7 @@ export function parseOrder(line: string): BrokerOrder | Error {
  * arrived since the last newline: a peer that died mid-line leaves it there for diagnostics.
  */
 export function readLines(socket: Socket, onLine: (line: string) => void): () => string {
-  let pending = Buffer.alloc(0);
+  let pending: Buffer = Buffer.alloc(0);
   socket.on('data', (chunk: Buffer) => {
     let data = pending.length === 0 ? chunk : Buffer.concat([pending, chunk]);
     for (let newline = data.indexOf(10); newline !== -1; newline = data.indexOf(10)) {
