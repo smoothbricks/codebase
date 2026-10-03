@@ -36,6 +36,9 @@ impl CommandRunner for StubRunner {
     fn pin_raw_device(&self, _: &std::path::Path) -> std::io::Result<Option<std::fs::File>> {
         Ok(None)
     }
+    fn attached_disk_images(&self) -> std::io::Result<Vec<cowshed_core::apfs::AttachedDiskImage>> {
+        Ok(Vec::new())
+    }
 }
 
 struct Fixture {

@@ -61,6 +61,13 @@ Fix the remote or explicitly select/rebind the intended identity; discovery only
 repositories must be adopted with `--repo-id owner/repo`. Moving a checkout is not a conflict. Trusted policy is read
 only from `/private/cowshed/store/<owner>/<repo>/policy.json`, never from the checkout.
 
+**`cowshed resize` or `cowshed defrag` says the image `is still attached as /dev/diskN with nothing mounted`.** The
+kernel still holds the workspace's image, but nothing is mounted at its mount point — an attachment an interrupted
+process or an outside tool left behind. Neither verb can grow or rewrite an image the kernel holds
+(`diskutil image resize` answers only `Resource busy`), and that attachment is not the workspace mount's to release, so
+the verb refuses before touching anything. Release the device it names with the `hdiutil detach /dev/diskN` it prints,
+then run the verb again. A resize that fails after a mounted workspace was detached puts it back on its mount.
+
 ## Sandbox denials (exit 6)
 
 When cowshed reports exit 6, it comes with the diagnosis and the fix on stderr:

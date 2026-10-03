@@ -9,8 +9,9 @@ use std::time::{Duration, Instant, SystemTime};
 use rcgen::{KeyPair, PKCS_ECDSA_P256_SHA256};
 
 use cowshed_core::apfs::{
-    ApfsBackend, AttachedImage, CommandOutput, CommandRequest, CommandRunError, CommandRunFailure,
-    CommandRunner, CreateImageRequest, DetachIntent, MountAccess, SystemCommandRunner,
+    ApfsBackend, ApfsError, AttachedDiskImage, AttachedImage, CommandOutput, CommandRequest,
+    CommandRunError, CommandRunner, CreateImageRequest, DetachIntent, DiskImageSource, MountAccess,
+    SystemCommandRunner,
 };
 use cowshed_core::metadata::{
     DetachedWorkspaceMetadata, GrantSet, ImageCapacity, MACOS_PORT_MIN, NEW_PORT_BLOCK_SIZE,
@@ -47,9 +48,6 @@ const ATTACH_PLIST: &str = r#"<?xml version="1.0"?><plist><dict><key>system-enti
 <dict><key>content-hint</key><string>Apple_APFS_Volume</string><key>dev-entry</key><string>/dev/disk10s1</string><key>filesystem-type</key><string>apfs</string></dict>
 </array></dict></plist>"#;
 
-const EMPTY_ATTACHMENT_INVENTORY: &str =
-    r#"<?xml version="1.0"?><plist><dict><key>images</key><array/></dict></plist>"#;
-
 /// `diskutil info -plist <device>` for a device in the fixture's single container: names the
 /// volume, for rename checks.
 fn device_info_plist(device: &str, volume_name: &str) -> Vec<u8> {
@@ -59,9 +57,10 @@ fn device_info_plist(device: &str, volume_name: &str) -> Vec<u8> {
     .into_bytes()
 }
 
-/// What `hdiutil info -plist` reports in these fixtures: every image the fake attached and has
-/// not detached, holding the fixture's devices. Every device detach re-reads it first to prove
-/// the device still belongs to that image, so the fake must remember what it attached.
+/// The kernel's disk-image inventory in these fixtures: every image the fake attached and has
+/// not detached, holding the fixture's devices at one gibibyte. Every device detach re-reads it
+/// first to prove the device still belongs to that image, so the fake must remember what it
+/// attached.
 #[derive(Clone, Default)]
 struct FakeInventory(Arc<Mutex<Vec<String>>>);
 
@@ -72,11 +71,8 @@ impl FakeInventory {
             .iter()
             .map(|argument| argument.to_string_lossy().into_owned())
             .collect();
-        let hdiutil = request.program == Path::new("/usr/bin/hdiutil");
         let mut attached = self.0.lock().expect("fake inventory");
-        let stdout = if hdiutil && args == ["info", "-plist"] {
-            inventory_plist(&attached)
-        } else if args.starts_with(&["image".into(), "attach".into()]) {
+        let stdout = if args.starts_with(&["image".into(), "attach".into()]) {
             attached.push(args.last().expect("attached image").clone());
             ATTACH_PLIST.as_bytes().to_vec()
         } else {
@@ -88,29 +84,25 @@ impl FakeInventory {
         };
         CommandOutput::success(stdout)
     }
-}
 
-fn inventory_plist(images: &[String]) -> Vec<u8> {
-    let mut plist = String::from(r#"<?xml version="1.0"?><plist><dict><key>images</key><array>"#);
-    for image in images {
-        plist.push_str("<dict><key>image-path</key><string>");
-        plist.push_str(image);
-        plist.push_str("</string><key>system-entities</key><array>");
-        for (device, hint) in [
-            ("/dev/disk9", ""),
-            ("/dev/disk10", "EF57347C-0000-11AA-AA11-00306543ECAC"),
-            ("/dev/disk10s1", "41504653-0000-11AA-AA11-00306543ECAC"),
-        ] {
-            plist.push_str("<dict><key>dev-entry</key><string>");
-            plist.push_str(device);
-            plist.push_str("</string><key>content-hint</key><string>");
-            plist.push_str(hint);
-            plist.push_str("</string></dict>");
-        }
-        plist.push_str("</array></dict>");
+    fn images(&self) -> Vec<AttachedDiskImage> {
+        self.0
+            .lock()
+            .expect("fake inventory")
+            .iter()
+            .map(|image| {
+                AttachedDiskImage::file(
+                    image,
+                    Some(ImageCapacity::from_gibibytes(1)),
+                    [
+                        ("/dev/disk9", ""),
+                        ("/dev/disk10", "EF57347C-0000-11AA-AA11-00306543ECAC"),
+                        ("/dev/disk10s1", "41504653-0000-11AA-AA11-00306543ECAC"),
+                    ],
+                )
+            })
+            .collect()
     }
-    plist.push_str("</array></dict></plist>");
-    plist.into_bytes()
 }
 
 #[derive(Clone)]
@@ -177,38 +169,35 @@ impl CommandRunner for RecordingRunner {
     fn pin_raw_device(&self, _: &Path) -> std::io::Result<Option<std::fs::File>> {
         Ok(None)
     }
+    fn attached_disk_images(&self) -> std::io::Result<Vec<AttachedDiskImage>> {
+        Ok(self.inventory.images())
+    }
 }
-/// Answers the first attachment inventory with the deadline failure [`SystemCommandRunner`]
-/// reports for a disk child that outlives `DISK_CHILD_DEADLINE`.
+/// Fails the first kernel disk-image inventory read, then reports nothing attached.
 ///
-/// This is the one double in the GC tests, and it stays one for a concrete reason: a real
-/// `hdiutil info -plist` cannot be made to run past that 120 s deadline inside the 30 s each test
-/// is given, so the deadline path is reachable only by answering as the runner would.
+/// This is the one double in the GC tests, and it stays one for a concrete reason: a live host's
+/// I/O Registry cannot be made to refuse a matching snapshot on demand, so an unreadable
+/// inventory is reachable only by answering as the runner would.
 #[derive(Default)]
-struct DeadlineFirstInventoryRunner(AtomicUsize);
+struct UnreadableFirstInventoryRunner(AtomicUsize);
 
-impl CommandRunner for DeadlineFirstInventoryRunner {
-    fn run(&self, request: &CommandRequest) -> Result<CommandOutput, CommandRunError> {
-        let inventory = request.program == Path::new("/usr/bin/hdiutil")
-            && request.args.len() == 2
-            && request.args[0] == "info"
-            && request.args[1] == "-plist";
-        if !inventory {
-            return Ok(CommandOutput::success([]));
-        }
-        if self.0.fetch_add(1, Ordering::SeqCst) == 0 {
-            return Err(CommandRunError {
-                request: request.clone(),
-                failure: CommandRunFailure::Deadline(Duration::from_secs(120)),
-            });
-        }
-        Ok(CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY))
+impl CommandRunner for UnreadableFirstInventoryRunner {
+    fn run(&self, _: &CommandRequest) -> Result<CommandOutput, CommandRunError> {
+        Ok(CommandOutput::success([]))
     }
     fn host_device_lease(&self) -> std::io::Result<Option<std::fs::File>> {
         Ok(None)
     }
     fn pin_raw_device(&self, _: &Path) -> std::io::Result<Option<std::fs::File>> {
         Ok(None)
+    }
+    fn attached_disk_images(&self) -> std::io::Result<Vec<AttachedDiskImage>> {
+        if self.0.fetch_add(1, Ordering::SeqCst) == 0 {
+            return Err(std::io::Error::other(
+                "injected I/O Registry snapshot failure",
+            ));
+        }
+        Ok(Vec::new())
     }
 }
 
@@ -324,7 +313,8 @@ impl RealFixture {
     }
 
     /// Mint a real one-volume ASIF image at `image` (which must end `.asif`) the way the host
-    /// stages one, and nothing beside it.
+    /// stages one, and nothing beside it. Staging hands the image back detached: every verb that
+    /// grows or replaces it next needs an image nothing holds.
     fn blank_image(&self, image: &Path) {
         let staged = self
             .host()
@@ -338,6 +328,11 @@ impl RealFixture {
             })
             .expect("real ASIF image");
         assert_eq!(staged, image);
+        assert!(
+            !attached(image),
+            "staging left {} attached",
+            image.display()
+        );
     }
 
     /// [`Self::blank_image`] published as [`workspace`]'s: its sidecar and CA key beside it.
@@ -397,18 +392,20 @@ fn kernel_mount_at(mount_point: &Path) -> Option<KernelMountSnapshot> {
         .find(|mount| mount.mount_point == mount_point)
 }
 
-/// Whether `hdiutil` lists `image` as attached right now.
+/// Every attachment the kernel's I/O Registry holds for `image` right now. `hdiutil info` is no
+/// witness here: it omits attached images while another image attaches or detaches.
+fn kernel_attachments(image: &Path) -> Vec<AttachedDiskImage> {
+    SystemCommandRunner
+        .attached_disk_images()
+        .expect("kernel disk-image inventory")
+        .into_iter()
+        .filter(|attached| matches!(&attached.source, DiskImageSource::File(path) if path == image))
+        .collect()
+}
+
+/// Whether the kernel holds `image` attached right now.
 fn attached(image: &Path) -> bool {
-    let info = Command::new("/usr/bin/hdiutil")
-        .arg("info")
-        .output()
-        .expect("hdiutil info");
-    assert!(info.status.success(), "hdiutil info failed");
-    String::from_utf8_lossy(&info.stdout).lines().any(|line| {
-        line.strip_prefix("image-path")
-            .map(|path| path.trim_start_matches([' ', ':']))
-            .is_some_and(|path| Path::new(path) == image)
-    })
+    !kernel_attachments(image).is_empty()
 }
 
 /// The total size of the filesystem mounted at `mount_point`, from `statfs`.
@@ -1186,31 +1183,33 @@ fn real_apfs_gc_reports_item_local_deferrals_and_reclaims_later_session_images()
 }
 
 #[test]
-fn gc_defers_an_inventory_deadline_and_reclaims_later_candidates() {
-    let fixture = Fixture::new("gc-inventory-deadline");
+fn gc_defers_an_unreadable_inventory_and_reclaims_later_candidates() {
+    let fixture = Fixture::new("gc-inventory-unreadable");
     let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
     std::fs::create_dir_all(&layout.project().sessions).expect("sessions directory");
     let deferred_image = layout.project().sessions.join("a-deferred.sparseimage");
-    std::fs::write(&deferred_image, b"inventory timed out").expect("deferred image");
+    std::fs::write(&deferred_image, b"inventory unreadable").expect("deferred image");
     let later_image = layout.project().sessions.join("z-reclaim.sparseimage");
     std::fs::write(&later_image, b"later candidate").expect("later image");
     let config = fixture.config();
     let host = MacOsApfsExecutionHost::with_mount_source(
-        DeadlineFirstInventoryRunner::default(),
+        UnreadableFirstInventoryRunner::default(),
         config.clone(),
         SystemKernelMountSource,
     )
     .expect("native APFS host");
     let plan = host.preview_gc(&config, &repo()).expect("GC plan");
 
-    let report = host.execute_gc(&config, plan).expect("item-local deadline");
+    let report = host
+        .execute_gc(&config, plan)
+        .expect("item-local inventory failure");
     assert_eq!(report.reclaimed, 1);
     assert_eq!(report.deferred.len(), 1);
     assert_eq!(report.deferred[0].path, deferred_image);
     assert!(
         report.deferred[0]
             .diagnostic
-            .contains("did not finish within 120s"),
+            .contains("injected I/O Registry snapshot failure"),
         "{}",
         report.deferred[0].diagnostic
     );
@@ -2434,6 +2433,10 @@ impl CommandRunner for EjectAtFsck {
     fn pin_raw_device(&self, device: &Path) -> std::io::Result<Option<std::fs::File>> {
         SystemCommandRunner.pin_raw_device(device)
     }
+
+    fn attached_disk_images(&self) -> std::io::Result<Vec<AttachedDiskImage>> {
+        SystemCommandRunner.attached_disk_images()
+    }
 }
 
 #[test]
@@ -2597,6 +2600,10 @@ impl CommandRunner for EjectAfterAttach {
 
     fn pin_raw_device(&self, device: &Path) -> std::io::Result<Option<std::fs::File>> {
         SystemCommandRunner.pin_raw_device(device)
+    }
+
+    fn attached_disk_images(&self) -> std::io::Result<Vec<AttachedDiskImage>> {
+        SystemCommandRunner.attached_disk_images()
     }
 }
 
@@ -4947,8 +4954,8 @@ fn mounted_main(fixture: &RealFixture) -> (PathBuf, PathBuf) {
 
 /// After a verb that hands the workspace back mounted: it is on its own mount point with the
 /// canonical flags, its payload intact, and the attachment is the host's to detach.
-fn assert_back_on_its_mount(
-    host: &MacOsApfsExecutionHost<SystemCommandRunner>,
+fn assert_back_on_its_mount<R: CommandRunner + Send + Sync + 'static>(
+    host: &MacOsApfsExecutionHost<R>,
     image: &Path,
     mount: &Path,
 ) {
@@ -5055,24 +5062,40 @@ fn real_apfs_resize_refuses_a_busy_workspace_before_growing_the_image() {
     let (image, mount) = mounted_main(&fixture);
     let host = fixture.host();
     let holder = std::fs::File::open(mount.join("payload")).expect("hold the volume");
+    let before = kernel_attachments(&image);
+    assert!(
+        matches!(
+            before.as_slice(),
+            [only] if only.capacity == Some(ImageCapacity::from_gibibytes(1))
+        ),
+        "one attachment at one gibibyte before the resize: {before:?}"
+    );
 
-    host.resize(
-        &workspace(),
-        &image,
-        &mount,
-        ImageCapacity::from_gibibytes(2),
-    )
-    .expect_err("a busy volume refuses the resize rather than being torn out");
+    let error = host
+        .resize(
+            &workspace(),
+            &image,
+            &mount,
+            ImageCapacity::from_gibibytes(2),
+        )
+        .expect_err("a busy volume refuses the resize rather than being torn out");
+    // The kernel's unmount dissent is the refusal, not an attachment the host failed to identify.
+    assert!(
+        matches!(
+            &error,
+            ApfsStorageError::Apfs(ApfsError::CommandFailed { operation, .. })
+                if *operation == "unmount verified APFS volume"
+        ),
+        "unexpected refusal: {error}"
+    );
     assert!(
         kernel_mount_at(&mount).is_some(),
         "the workspace stays mounted"
     );
     assert_eq!(
-        host.backend()
-            .attached_capacity(&image)
-            .expect("attached capacity"),
-        ImageCapacity::from_gibibytes(1),
-        "a workspace that would not detach must keep its capacity"
+        kernel_attachments(&image),
+        before,
+        "a workspace that would not detach keeps its one attachment, devices and capacity"
     );
     drop(holder);
 }
@@ -5096,6 +5119,159 @@ fn real_apfs_resizing_a_mounted_workspace_puts_it_back_on_its_mount() {
     assert!(
         filesystem_bytes(&mount) > ImageCapacity::from_gibibytes(1).bytes(),
         "the remounted volume spans the grown container"
+    );
+    assert_back_on_its_mount(&host, &image, &mount);
+}
+
+/// An image the kernel still holds with nothing mounted at the workspace's mount point — what an
+/// image release that misread its inventory leaves behind — is refused before `diskutil image
+/// resize` runs. diskutil would answer only `Resource busy`, and that attachment is not the
+/// workspace mount's to release, so nothing is detached either.
+#[test]
+fn resize_refuses_an_image_still_attached_with_nothing_mounted_before_touching_it() {
+    let fixture = Fixture::new("resize-attached-unmounted");
+    let image = StorageLayout::new(&fixture.root, &repo())
+        .expect("layout")
+        .main_image()
+        .expect("image");
+    create_image(image.image());
+    let runner = RecordingRunner::default();
+    runner
+        .inventory
+        .0
+        .lock()
+        .expect("fake inventory")
+        .push(image.image().to_str().expect("UTF-8 image path").to_owned());
+    let host = native_host(&fixture, runner.clone());
+    let mount_point = fixture.config().checkout_path;
+
+    let error = host
+        .resize(
+            &workspace(),
+            image.image(),
+            &mount_point,
+            ImageCapacity::from_gibibytes(2),
+        )
+        .expect_err("an attached image nothing mounts is refused");
+
+    assert!(
+        matches!(
+            &error,
+            ApfsStorageError::Host(message)
+                if message.contains(&image.image().display().to_string())
+                    && message.contains("hdiutil detach /dev/disk10")
+        ),
+        "unexpected refusal: {error}"
+    );
+    let requests = runner.requests();
+    assert!(
+        requests.is_empty(),
+        "a refused resize runs no disk command: {requests:?}"
+    );
+    assert_eq!(
+        std::fs::read(image.image()).expect("image"),
+        b"fixture",
+        "a refused resize leaves the image as it found it"
+    );
+}
+
+/// Lets `diskutil image resize` really run, against an image file nothing may write: the
+/// user-immutable flag goes on immediately before the resize and comes off as soon as it
+/// returns. diskutil really refuses, and the image is really unchanged.
+struct ImmutableDuringResize {
+    image: PathBuf,
+    resized: AtomicUsize,
+}
+
+fn set_file_flags(path: &Path, flags: u32) {
+    use std::os::unix::ffi::OsStrExt;
+    let raw = std::ffi::CString::new(path.as_os_str().as_bytes()).expect("C path");
+    // SAFETY: chflags reads only the NUL-terminated path, which outlives the call.
+    assert_eq!(
+        unsafe { libc::chflags(raw.as_ptr(), flags) },
+        0,
+        "chflags {}: {}",
+        path.display(),
+        std::io::Error::last_os_error()
+    );
+}
+
+impl CommandRunner for ImmutableDuringResize {
+    fn run(&self, request: &CommandRequest) -> Result<CommandOutput, CommandRunError> {
+        use std::os::macos::fs::MetadataExt as _;
+        let grows = request.program == Path::new("/usr/sbin/diskutil")
+            && request
+                .args
+                .iter()
+                .take(3)
+                .eq(["image", "resize", "--size"]);
+        if !grows {
+            return SystemCommandRunner.run(request);
+        }
+        let flags = std::fs::metadata(&self.image).expect("image").st_flags();
+        set_file_flags(&self.image, flags | libc::UF_IMMUTABLE);
+        let output = SystemCommandRunner.run(request);
+        set_file_flags(&self.image, flags);
+        self.resized.fetch_add(1, Ordering::SeqCst);
+        output
+    }
+
+    fn host_device_lease(&self) -> std::io::Result<Option<std::fs::File>> {
+        SystemCommandRunner.host_device_lease()
+    }
+
+    fn pin_raw_device(&self, device: &Path) -> std::io::Result<Option<std::fs::File>> {
+        SystemCommandRunner.pin_raw_device(device)
+    }
+
+    fn attached_disk_images(&self) -> std::io::Result<Vec<AttachedDiskImage>> {
+        SystemCommandRunner.attached_disk_images()
+    }
+}
+
+#[test]
+fn real_apfs_a_refused_resize_leaves_the_image_ungrown_and_puts_the_workspace_back_on_its_mount() {
+    let fixture = RealFixture::new("resize-refused");
+    let (image, mount) = mounted_main(&fixture);
+    let host = MacOsApfsExecutionHost::with_mount_source(
+        ImmutableDuringResize {
+            image: image.clone(),
+            resized: AtomicUsize::new(0),
+        },
+        fixture.config(),
+        SystemKernelMountSource,
+    )
+    .expect("native APFS host");
+
+    let error = host
+        .resize(
+            &workspace(),
+            &image,
+            &mount,
+            ImageCapacity::from_gibibytes(2),
+        )
+        .expect_err("an image nothing may write refuses to grow");
+
+    assert!(
+        matches!(
+            &error,
+            ApfsStorageError::Apfs(ApfsError::CommandFailed { operation, .. })
+                if *operation == "resize image"
+        ),
+        "unexpected failure: {error}"
+    );
+    assert_eq!(
+        host.backend().runner().resized.load(Ordering::SeqCst),
+        1,
+        "diskutil really ran the refused resize"
+    );
+    let after = kernel_attachments(&image);
+    assert!(
+        matches!(
+            after.as_slice(),
+            [only] if only.capacity == Some(ImageCapacity::from_gibibytes(1))
+        ),
+        "a refused resize grows nothing and leaves one fresh attachment: {after:?}"
     );
     assert_back_on_its_mount(&host, &image, &mount);
 }

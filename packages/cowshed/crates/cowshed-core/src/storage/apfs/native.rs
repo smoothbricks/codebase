@@ -3312,6 +3312,34 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
             },
         }
     }
+
+    /// The whole device of `image`'s attachment, when the kernel holds one.
+    fn attached_device(&self, image: &Path) -> Result<Option<String>, ApfsStorageError> {
+        Ok(match self.backend.recovered_image_attachment(image)? {
+            None => None,
+            Some(RecoveredImageAttachment::Apfs(attachment)) => {
+                Some(attachment.whole_device().to_owned())
+            }
+            Some(RecoveredImageAttachment::Unformatted { whole_device, .. }) => Some(whole_device),
+        })
+    }
+}
+
+/// Refuse to grow or rewrite an image the kernel still holds with nothing mounted at the
+/// workspace's mount point. That attachment is not the workspace mount's to release, so the image
+/// is left exactly as it was found, and the refusal names the device to release before running
+/// the verb again.
+fn attached_without_mount(
+    image: &Path,
+    mount_point: &Path,
+    device: &str,
+    done: &str,
+) -> ApfsStorageError {
+    ApfsStorageError::Host(format!(
+        "{} is still attached as {device} with nothing mounted at {}; that attachment is not the workspace mount's to release, so the image was not {done}. Release it with `hdiutil detach {device}` and run the command again",
+        image.display(),
+        mount_point.display()
+    ))
 }
 
 const RESIZE_CLEANUP: &str = "detach the attachment a failed resize left behind";
@@ -3349,6 +3377,36 @@ where
             return Err(self.abandon_attachment(attachment, primary, operation));
         }
         self.retain_mounted(workspace, attachment).map(|_| ())
+    }
+
+    /// Put back on its mount a workspace a failed step detached, reporting the step's failure.
+    ///
+    /// The step must have left the image an image — untouched, or grown whole — and the verified
+    /// attach (fsck included) is what proves it mounts again. A remount that fails is reported
+    /// beside the step's failure, never in place of it.
+    fn remount_after_failure(
+        &self,
+        workspace: &LifecycleWorkspace,
+        image: &Path,
+        mount_point: &Path,
+        primary: ApfsStorageError,
+        cleanup: &'static str,
+        operation: &'static str,
+    ) -> ApfsStorageError {
+        match self
+            .backend
+            .attach_verified(image)
+            .map_err(ApfsStorageError::from)
+            .and_then(|attachment| {
+                self.hand_back_attachment(workspace, attachment, mount_point, true, cleanup)
+            }) {
+            Ok(()) => primary,
+            Err(remount) => ApfsStorageError::Cleanup {
+                operation,
+                primary: Box::new(primary),
+                cleanup: Box::new(remount),
+            },
+        }
     }
 }
 
@@ -3997,6 +4055,23 @@ where
     ) -> Result<ResizeOutcome, ApfsStorageError> {
         self.verify_controller_path(image)?;
         self.verify_controller_path(mount_point)?;
+        let was_mounted = self
+            .mount_source
+            .mounts()?
+            .into_iter()
+            .any(|mount| mount.mount_point == mount_point);
+        // `diskutil image resize` grows only an image nothing holds; an attached one is answered
+        // with a bare `Resource busy`. Releasing the workspace's mount releases the attachment
+        // behind it, but an attachment with nothing mounted at the workspace's mount point is not
+        // that mount's to release, so it is refused here, before anything is detached.
+        if !was_mounted && let Some(device) = self.attached_device(image)? {
+            return Err(attached_without_mount(
+                image,
+                mount_point,
+                &device,
+                "resized",
+            ));
+        }
         // The capacity to compare against comes from whichever authority can see the image right
         // now: the kernel's attachment inventory while it is attached, the image's own resize
         // limits while it is not. Reading it before anything is detached keeps a refused resize
@@ -4013,13 +4088,24 @@ where
             });
         }
 
-        let was_mounted = self
-            .mount_source
-            .mounts()?
-            .into_iter()
-            .any(|mount| mount.mount_point == mount_point);
         self.detach_mounted(workspace, DetachIntent::WhenIdle)?;
-        self.backend.resize_image(image, capacity)?;
+        // A refused resize leaves the image an image — untouched, or grown — so a workspace that
+        // was mounted goes back on its mount rather than staying detached over the failure.
+        if let Err(primary) = self.backend.resize_image(image, capacity) {
+            let primary = ApfsStorageError::from(primary);
+            return Err(if was_mounted {
+                self.remount_after_failure(
+                    workspace,
+                    image,
+                    mount_point,
+                    primary,
+                    RESIZE_CLEANUP,
+                    "remount the workspace a failed resize detached",
+                )
+            } else {
+                primary
+            });
+        }
 
         let attachment = self.backend.attach_verified(image)?;
         if let Err(primary) = self.backend.grow_container(&attachment) {
@@ -4076,16 +4162,13 @@ where
         // Copying an image the kernel still holds would copy whatever it has not yet written back,
         // and the rename would leave the attachment serving a file that no longer has a name. The
         // mount is gone at this point; an attachment without one is left for its owner to release.
-        match self.backend.attached_capacity(image) {
-            Err(ApfsError::ImageNotAttached(_)) => {}
-            Ok(_) => {
-                return Err(ApfsStorageError::Host(format!(
-                    "{} is still attached with nothing mounted at {}; `hdiutil info` names its device, and it has to be detached before the image can be rewritten",
-                    image.display(),
-                    mount_point.display()
-                )));
-            }
-            Err(error) => return Err(error.into()),
+        if let Some(device) = self.attached_device(image)? {
+            return Err(attached_without_mount(
+                image,
+                mount_point,
+                &device,
+                "rewritten",
+            ));
         }
 
         let bytes = match timed(
@@ -4097,28 +4180,14 @@ where
             // The image is untouched: the copy never replaced it. A mounted workspace goes back on
             // its mount rather than staying detached over a failure that changed nothing.
             Err(primary) if was_mounted => {
-                return Err(
-                    match self
-                        .backend
-                        .attach_verified(image)
-                        .map_err(ApfsStorageError::from)
-                        .and_then(|attachment| {
-                            self.hand_back_attachment(
-                                workspace,
-                                attachment,
-                                mount_point,
-                                true,
-                                DEFRAGMENT_CLEANUP,
-                            )
-                        }) {
-                        Ok(()) => primary,
-                        Err(cleanup) => ApfsStorageError::Cleanup {
-                            operation: "remount the workspace a failed rewrite detached",
-                            primary: Box::new(primary),
-                            cleanup: Box::new(cleanup),
-                        },
-                    },
-                );
+                return Err(self.remount_after_failure(
+                    workspace,
+                    image,
+                    mount_point,
+                    primary,
+                    DEFRAGMENT_CLEANUP,
+                    "remount the workspace a failed rewrite detached",
+                ));
             }
             Err(primary) => return Err(primary),
         };

@@ -340,7 +340,7 @@ work. Rolling back would also need a fence for the corpse and a reclaim rule any
 crash after a successful initialization deletes complete work. Resume never deletes state a user can reach.
 
 **Mounting the staging image and renaming it under the live mount was rejected.** It renames an attached image's backing
-file, after which the `hdiutil info` inventory, keyed by the path the image was opened with, reads a mounted image as
+file, after which the attachment inventory, keyed by the path the image was opened with, reads a mounted image as
 detached. A crash during initialization would also leave a staging image mounted at the canonical mountpoint, which the
 staging-mount collector does not retire, so the retry would find its own mountpoint busy.
 

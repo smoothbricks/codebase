@@ -259,13 +259,18 @@ the latter spent 11.086 s detaching a mounted staging image in a hosted arm64 re
 measured 127–173 ms for the image-driver detach against 257–298 ms for general eject; this does not establish a hosted
 latency bound. `WhenIdle` returns the observed EBUSY/resource-busy refusal without forcing. `Release` retains its
 existing grace and then uses `hdiutil detach -force`; every other error remains authoritative. There is no general-eject
-fallback. `hdiutil info -plist` remains the one host view that maps an image's path to its devices
-(`diskutil image info` reports none).
+fallback. The kernel's I/O Registry is the one host view that maps an image's path to its devices (`diskutil image info`
+reports none): one `IOServiceGetMatchingServices("IOMedia")` snapshot, each node walked up to its `AppleDiskImageDevice`
+and that device's `DiskImageURL`. `hdiutil info -plist` is not an inventory: while any other image attaches or detaches
+it answers a truncated image list with nothing marking it (a reviewer probe that kept one image attached while churning
+another saw it missing from 11–89 of every 648–1551 polls, and from none of the same polls' registry reads). Reading
+that omission as absence once skipped a post-format release, leaving the image attached for `diskutil image resize` to
+refuse as busy, and once lost a mounted workspace's attachment on restart.
 
-DiskImages2 can return a newly attached blank whole device before `hdiutil info` publishes its image entry. Creation
-reobserves only that absence within the existing attachment-settle bound while holding the host lease. A positive exact
-image-to-single-device mapping is still required before formatting; an observed conflicting mapping fails immediately,
-and exhausted or unreadable inventory leaves both the attachment and backing file intact for diagnosis. No mutation is
+The image driver registers an attach's media before `diskutil image attach` reports them, so creation requires the
+reported blank whole device to be the image's exact single-device mapping in one registry read before formatting.
+Absence there is a contradiction, not lag: it fails at once, as does an observed conflicting mapping, and an unreadable
+inventory is a typed refusal; each leaves both the attachment and backing file intact for diagnosis. No mutation is
 retried and no unproved device is formatted. Shared owned-image cleanup distinguishes this unformatted whole-device
 state from an APFS volume: it rechecks the exact mapping under the lease and releases only that owned device without
 deleting the backing file first.

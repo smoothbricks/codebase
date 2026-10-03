@@ -8,7 +8,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Once;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use super::{ApfsSubstrateConfig, DetachIntent, MacOsApfsExecutionHost, SystemCommandRunner};
+use super::{
+    ApfsSubstrateConfig, CommandRunner, DetachIntent, DiskImageSource, MacOsApfsExecutionHost,
+    SystemCommandRunner,
+};
 
 /// Every scratch root lives directly under this prefix and spells out the pid of the run that
 /// owns it. The pid is the whole cleanup protocol: a later run can tell a live root from an
@@ -70,7 +73,7 @@ impl Drop for ScratchRoot {
 /// The sweep is driven off the attachment table rather than the directory listing, because the
 /// two residues outlive each other independently: a root directory can be deleted (by hand, or by
 /// a tmp reaper) while its images stay attached, and an attached image keeps working from a
-/// deleted backing file. Detaching therefore selects on the image path `hdiutil` still reports,
+/// deleted backing file. Detaching therefore selects on the image path the kernel still holds,
 /// not on what is on disk now.
 fn sweep_dead_runs() {
     if let Err(error) =
@@ -113,32 +116,26 @@ fn process_is_gone(pid: i32) -> bool {
     probe != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
 }
 
-/// Select images by backing path, then let the production host reread and release their exact
-/// attachment identities under its lease/pin/native-unmount protocol. Never act on cached diskN.
+/// Select images by the backing path the kernel's I/O Registry holds, then let the production
+/// host reread and release their exact attachment identities under its lease/pin/native-unmount
+/// protocol. Never act on cached diskN, and never select from `hdiutil info`, which omits attached
+/// images while another image attaches or detaches.
 fn detach_images(select: impl Fn(&Path) -> bool) -> std::io::Result<()> {
-    let output = std::process::Command::new("/usr/bin/hdiutil")
-        .arg("info")
-        .output()?;
-    if !output.status.success() {
-        return Err(std::io::Error::other(format!(
-            "scratch image inventory exited {}: {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr)
-        )));
-    }
+    let attached = SystemCommandRunner.attached_disk_images()?;
     let root = Path::new("/private/tmp");
     let host = MacOsApfsExecutionHost::new(
         SystemCommandRunner,
         ApfsSubstrateConfig::new(root, root, root),
     )
     .map_err(std::io::Error::other)?;
-    let info = String::from_utf8_lossy(&output.stdout);
     let mut first_error = None;
-    for line in info.lines() {
-        let Some(image_path) = line.strip_prefix("image-path") else {
-            continue;
-        };
-        let image = Path::new(image_path.trim_start_matches([' ', ':']));
+    for image in attached
+        .iter()
+        .filter_map(|attached| match &attached.source {
+            DiskImageSource::File(path) => Some(path.as_path()),
+            DiskImageSource::Url(_) => None,
+        })
+    {
         if select(image)
             && let Err(error) = host.detach_existing_image(image, DetachIntent::Release)
         {

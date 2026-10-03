@@ -12542,6 +12542,9 @@ mod retired_recovery_tests {
         fn pin_raw_device(&self, device: &Path) -> std::io::Result<Option<std::fs::File>> {
             panic!("reclaiming a detached retired image pinned a raw APFS device: {device:?}");
         }
+        fn attached_disk_images(&self) -> std::io::Result<Vec<crate::apfs::AttachedDiskImage>> {
+            panic!("reclaiming a detached retired image read the kernel disk-image inventory");
+        }
     }
 
     /// `doctor` opens the project to inspect it. Its open must leave a retired image where it is

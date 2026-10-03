@@ -18,8 +18,10 @@ use std::time::Duration;
 
 use crate::device::{DISKUTIL, container_of, identifier_depth};
 
-/// The disk-image driver's inventory and detach interface. Creation and attachment of ASIF
-/// images use `diskutil image`; releasing an owned image goes directly through `hdiutil detach`.
+/// The disk-image driver's detach interface. Creation and attachment of ASIF images use
+/// `diskutil image`; releasing an owned image goes directly through `hdiutil detach`. Which
+/// images are attached is read from the kernel ([`CommandRunner::attached_disk_images`]), never
+/// from `hdiutil info`.
 const HDIUTIL: &str = "/usr/bin/hdiutil";
 const FSCK_APFS: &str = "/sbin/fsck_apfs";
 /// The kernel mount helper. Workspace volumes are mounted with it rather than `diskutil mount`
@@ -125,6 +127,14 @@ pub trait CommandRunner {
     /// prevents even a forced image eject until the descriptor closes. Recording runners
     /// explicitly opt out; production must not fall back to an unpinned pathname.
     fn pin_raw_device(&self, device: &Path) -> io::Result<Option<File>>;
+    /// Every disk image the kernel has attached right now, read from the I/O Registry.
+    ///
+    /// This is the one attachment inventory, and its absences are authoritative. `hdiutil info
+    /// -plist` is not: while any other image attaches or detaches it answers a truncated image
+    /// list with nothing marking it, and reading that omission as "not attached" skipped a
+    /// release that never happened and lost a mounted workspace's identity on restart. The
+    /// kernel's matching snapshot is taken under the registry's own consistency check.
+    fn attached_disk_images(&self) -> io::Result<Vec<AttachedDiskImage>>;
 }
 
 /// The bound every spawned disk child (attach/detach, inventory, mount) answers inside.
@@ -266,6 +276,19 @@ impl CommandRunner for SystemCommandRunner {
         // Open first, then confirm the image-to-volume mapping while it cannot be recycled.
         OpenOptions::new().read(true).open(device).map(Some)
     }
+    fn attached_disk_images(&self) -> io::Result<Vec<AttachedDiskImage>> {
+        #[cfg(target_os = "macos")]
+        {
+            io_registry::attached_disk_images()
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "attached disk images are read from the macOS I/O Registry",
+            ))
+        }
+    }
 }
 /// Spawn a disk child detached into its own process group on Unix, so the deadline kill
 /// reaps the whole helper tree: a disk-image tool can fork helpers (`hdiutil` forks
@@ -403,16 +426,15 @@ impl Sleeper for ThreadSleeper {
 
 /// The wait a just-detached whole device is given to leave the attachment inventory.
 ///
-/// A successful image detach means the kernel let go; the attachment inventory
-/// announcing the departure is a second, lagging step. A verb that detaches an image and then
-/// attaches it again, as `resize` does, should not start the attach while the old device is
-/// still listed.
+/// A successful image detach means the image driver let go; the kernel terminating the media it
+/// exposed is a second, lagging step. A verb that detaches an image and then attaches it again,
+/// as `resize` does, should not start the attach while the old device is still registered.
 ///
-/// After every whole-device detach the backend therefore polls `hdiutil info -plist` until the
+/// After every whole-device detach the backend therefore re-reads the kernel inventory until the
 /// device is gone, logging each outcome. The bound is generous against a normally sub-second
 /// departure and the outcome is always soft: at the bound the operation proceeds exactly as it
 /// would have without the check, but loudly. No blind sleeps: the first poll runs immediately,
-/// and a departed device costs one inventory read (tens of milliseconds) and no waiting.
+/// and a departed device costs one registry read and no waiting.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DetachSettleGrace {
     pub total: Duration,
@@ -515,6 +537,75 @@ pub(crate) enum RecoveredImageAttachment {
         whole_device: String,
     },
     Apfs(AttachedImage),
+}
+
+/// What backs an attached disk image, as the image driver registered it with the kernel.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DiskImageSource {
+    /// A local backing file: the path the attach was handed.
+    File(PathBuf),
+    /// Any other backing store (RAM, network), by its URL. It is never a workspace image.
+    Url(String),
+}
+
+impl DiskImageSource {
+    /// The image driver registers its backing store as a URL (`DiskImageURL`); a local `file:`
+    /// URL is the path the attach was handed.
+    pub fn from_url(url: &str) -> Self {
+        match url::Url::parse(url) {
+            Ok(parsed) if parsed.scheme() == "file" => match parsed.to_file_path() {
+                Ok(path) => Self::File(path),
+                Err(()) => Self::Url(url.to_owned()),
+            },
+            _ => Self::Url(url.to_owned()),
+        }
+    }
+}
+
+/// One BSD media node an attached image exposes.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ImageMedia {
+    /// The `/dev/diskN[sM…]` node.
+    pub device: String,
+    /// The media's content hint: empty for an image that is its own APFS store, a partition
+    /// scheme, or an Apple partition-type GUID (`EF57347C-…` for the synthesized container,
+    /// `41504653-…` for its volume).
+    pub content: String,
+}
+
+/// One attached disk image as the kernel's I/O Registry holds it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AttachedDiskImage {
+    pub source: DiskImageSource,
+    /// The size of the image's own whole device; `None` while that device is not registered.
+    pub capacity: Option<ImageCapacity>,
+    /// Every BSD media node beneath the image driver, in device order.
+    pub media: Vec<ImageMedia>,
+}
+
+impl AttachedDiskImage {
+    /// A file-backed attachment exposing `media` as `(device, content hint)` pairs.
+    pub fn file<'a>(
+        image: impl Into<PathBuf>,
+        capacity: Option<ImageCapacity>,
+        media: impl IntoIterator<Item = (&'a str, &'a str)>,
+    ) -> Self {
+        Self {
+            source: DiskImageSource::File(image.into()),
+            capacity,
+            media: media
+                .into_iter()
+                .map(|(device, content)| ImageMedia {
+                    device: device.to_owned(),
+                    content: content.to_owned(),
+                })
+                .collect(),
+        }
+    }
+
+    fn is_backed_by(&self, image: &Path) -> bool {
+        matches!(&self.source, DiskImageSource::File(path) if path == image)
+    }
 }
 
 #[derive(Debug)]
@@ -663,6 +754,8 @@ pub enum ApfsError {
     },
     InvalidResizeLimits(String),
     ImageNotAttached(PathBuf),
+    /// The kernel's disk-image inventory could not be read.
+    KernelInventory(io::Error),
 }
 
 impl fmt::Display for ApfsError {
@@ -765,6 +858,9 @@ impl fmt::Display for ApfsError {
                 "{} reports no attachment to read a capacity from",
                 image.display()
             ),
+            Self::KernelInventory(source) => {
+                write!(f, "read the kernel disk-image inventory: {source}")
+            }
         }
     }
 }
@@ -773,6 +869,7 @@ impl std::error::Error for ApfsError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::CommandRun(error) => Some(error),
+            Self::KernelInventory(source) => Some(source),
             Self::FileOperation { source, .. } => Some(source),
             Self::Clone(error) => Some(error),
             Self::VerificationAndDetachFailed { detach, .. } => Some(detach),
@@ -977,14 +1074,22 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
 
     fn attachment_inventory(&self, image: &Path) -> Result<AttachmentInventory, ApfsError> {
         let image = attachment_inventory_path(image)?;
-        // Tahoe's `diskutil image info --plist` does not expose attachment devices. The
-        // read-only hdiutil inventory is the observed authoritative image-path -> system-entities
-        // map; ASIF creation/attachment use diskutil, and image release uses hdiutil.
-        let output = self.run_checked(
-            "inventory attached disk images",
-            CommandRequest::new(HDIUTIL, ["info", "-plist"]),
-        )?;
-        parse_hdiutil_images(&image, &output.stdout)
+        image_inventory(&image, &self.attached_disk_images()?)
+    }
+
+    /// The kernel's disk-image inventory: Tahoe's `diskutil image info --plist` exposes no
+    /// attachment devices, and `hdiutil info -plist` truncates its list while other images
+    /// attach or detach, so only the I/O Registry answers both presence and absence.
+    fn attached_disk_images(&self) -> Result<Vec<AttachedDiskImage>, ApfsError> {
+        crate::timing::timed(
+            "apfs-inventory",
+            format_args!("attached disk images"),
+            || {
+                self.runner
+                    .attached_disk_images()
+                    .map_err(ApfsError::KernelInventory)
+            },
+        )
     }
 
     fn cleanup_new_attachments(
@@ -1149,7 +1254,7 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
                 ),
             ));
         }
-        self.settle_attached_device(path, &whole_device)?;
+        self.require_blank_attachment(path, &whole_device)?;
         let format = CommandRequest::new(
             NEWFS_APFS,
             [
@@ -1231,11 +1336,7 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
     ) -> Result<Option<RecoveredImageAttachment>, ApfsError> {
         validate_image_path(image)?;
         let image = attachment_inventory_path(image)?;
-        let output = self.run_checked(
-            "inventory attached disk images",
-            CommandRequest::new(HDIUTIL, ["info", "-plist"]),
-        )?;
-        parse_existing_attachment(&image, &output.stdout)
+        existing_image_attachment(&image, &self.attached_disk_images()?)
     }
 
     pub(crate) fn detach_unformatted_image(
@@ -1346,15 +1447,16 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
             .map(|_| ())
     }
 
-    /// Detach `whole_device` only while the inventory still shows `image` holding it.
+    /// Detach `whole_device` only while the kernel still shows `image` holding it.
     ///
     /// A `/dev/diskN` name read earlier is not an identity: once its image detaches, the kernel
     /// hands the same name to the next attach anywhere on the host, and detaching the recorded
-    /// name would take that image away from its owner. The image path `hdiutil` recorded at
-    /// attach time is the identity (it survives renaming the file while attached), so the device
-    /// is re-read against it immediately before every detach. Empty inventory is already
-    /// released; a positive conflicting mapping is a refusal, never release success.
-    /// Its caller holds the host lease while the image identity is read and ejected.
+    /// name would take that image away from its owner. The backing file the image driver
+    /// registered at attach time is the identity, so the device is re-read against it
+    /// immediately before every detach. The kernel inventory's absences are authoritative, so an
+    /// image it does not hold is already released; a positive conflicting mapping is a refusal,
+    /// never release success. Its caller holds the host lease while the image identity is read
+    /// and ejected.
     fn detach_image_device_unlocked(
         &self,
         image: &Path,
@@ -1377,45 +1479,39 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
         Ok(())
     }
 
-    /// DiskImages2 may finish attaching before hdiutil publishes the exact image mapping.
-    /// Reobserve only absence under the caller's host lease; a conflicting mapping fails at once.
-    /// Formatting never proceeds without positive ownership proof. Exhaustion leaves the image
-    /// and attachment intact, since an unpublished attachment is not authority to remove either.
-    fn settle_attached_device(&self, image: &Path, whole_device: &str) -> Result<(), ApfsError> {
-        let mut waited = Duration::ZERO;
-        loop {
-            let inventory = self.attachment_inventory(image)?;
-            if inventory.matched {
-                return if inventory.devices.len() == 1 && inventory.devices.contains(whole_device) {
-                    Ok(())
-                } else {
-                    Err(ApfsError::InvalidAttachmentInventory(format!(
-                        "{} no longer owns {whole_device} (holds {:?}); refusing to format a foreign device",
-                        image.display(),
-                        inventory.devices,
-                    )))
-                };
-            }
-            if waited >= self.settle.total {
-                return Err(ApfsError::InvalidAttachmentInventory(format!(
-                    "{} attach of {whole_device} was not published in hdiutil after {waited:?}; retaining the image and attachment",
-                    image.display(),
-                )));
-            }
-            self.sleeper.sleep(self.settle.poll);
-            waited = waited.saturating_add(self.settle.poll);
+    /// The image driver registers an attach's media with the kernel before `diskutil image
+    /// attach` reports them, so formatting proceeds only when the reported whole device is
+    /// already this image's, and only this image's. Absence is a contradiction, not lag: it
+    /// leaves the image and attachment intact, since an unproven attachment is not authority to
+    /// format, eject or remove either.
+    fn require_blank_attachment(&self, image: &Path, whole_device: &str) -> Result<(), ApfsError> {
+        let inventory = self.attachment_inventory(image)?;
+        if !inventory.matched {
+            return Err(ApfsError::InvalidAttachmentInventory(format!(
+                "{} attach of {whole_device} is not registered to the image in the kernel; retaining the image and attachment",
+                image.display(),
+            )));
+        }
+        if inventory.devices.len() == 1 && inventory.devices.contains(whole_device) {
+            Ok(())
+        } else {
+            Err(ApfsError::InvalidAttachmentInventory(format!(
+                "{} no longer owns {whole_device} (holds {:?}); refusing to format a foreign device",
+                image.display(),
+                inventory.devices,
+            )))
         }
     }
 
-    /// Bounded, logged confirmation that a detached whole device left the attachment
-    /// inventory before any later attach. The poll is keyed on the device rather than an image
-    /// path: after a detach there may be no image to scope by, and the question is whether the
-    /// device is gone at all.
+    /// Bounded, logged confirmation that a detached whole device left the kernel inventory
+    /// before any later attach. The poll is keyed on the device rather than an image path: after
+    /// a detach there may be no image to scope by, and the question is whether the device is
+    /// gone at all.
     ///
-    /// Soft by design: a lingering or unreadable inventory is logged and the operation proceeds
-    /// exactly as it would have without the check. Failing a detach that succeeded over the
-    /// inventory's announcement lag would turn a slow departure under load into a user-facing
-    /// failure.
+    /// Soft by design: the detach already succeeded, so a lingering or unreadable inventory is
+    /// logged and the operation proceeds exactly as it would have without the check. Failing a
+    /// detach that succeeded over the media's termination lag would turn a slow departure under
+    /// load into a user-facing failure.
     fn settle_detached_device(&self, whole_device: &str) {
         let mut waited = Duration::ZERO;
         loop {
@@ -1447,11 +1543,7 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
     }
 
     fn detached_device_departed(&self, whole_device: &str) -> Result<bool, ApfsError> {
-        let output = self.run_checked(
-            "inventory attached disk images",
-            CommandRequest::new(HDIUTIL, ["info", "-plist"]),
-        )?;
-        Ok(!parse_inventory_devices(&output.stdout)?.contains(whole_device))
+        Ok(!inventory_devices(&self.attached_disk_images()?).contains(whole_device))
     }
 }
 
@@ -1626,8 +1718,8 @@ impl<R: CommandRunner, S: Sleeper> ApfsBackend for MacOsApfsBackend<R, S> {
             .expect("attachment pin mutex poisoned");
         let _fresh_pin = if inherited_pin.is_some() {
             // The same verified IOMedia handle survived fsck and still prevents eject.
-            // A second hdiutil snapshot can lag behind a live attachment; it cannot
-            // add identity evidence that the held kernel pin lacks.
+            // A second registry read cannot add identity evidence that the held kernel pin
+            // lacks.
             None
         } else {
             self.pin_attached_volume(attachment)?
@@ -1741,11 +1833,7 @@ impl<R: CommandRunner, S: Sleeper> ApfsBackend for MacOsApfsBackend<R, S> {
 
     fn attached_capacity(&self, image: &Path) -> Result<ImageCapacity, ApfsError> {
         let image = attachment_inventory_path(image)?;
-        let output = self.run_checked(
-            "inventory attached disk images",
-            CommandRequest::new(HDIUTIL, ["info", "-plist"]),
-        )?;
-        parse_attachment_capacity(&image, &output.stdout)
+        attachment_capacity(&image, &self.attached_disk_images()?)
     }
 }
 
@@ -1782,66 +1870,36 @@ fn parse_asif_resize_limits(bytes: &[u8]) -> Result<ImageCapacity, ApfsError> {
         .ok_or_else(|| ApfsError::InvalidResizeLimits("missing unsigned current".to_owned()))
 }
 
-/// One walk of `hdiutil info -plist`: devices from `system-entities`, capacity from
-/// `blockcount * blocksize`. The two public projections must not drift about which
-/// image-path is a match.
+/// One walk of the kernel inventory for one image: whether it is attached, its whole devices,
+/// and its capacity. Every projection reads this walk, so none can drift about which attachment
+/// is the image's.
 struct AttachmentInventory {
     devices: BTreeSet<String>,
     capacity: Option<ImageCapacity>,
     matched: bool,
 }
 
-fn parse_hdiutil_images(image: &Path, bytes: &[u8]) -> Result<AttachmentInventory, ApfsError> {
-    let expected = image.to_str().ok_or_else(|| {
-        ApfsError::InvalidAttachmentInventory("image path is not valid UTF-8".into())
-    })?;
-    let value = plist::Value::from_reader(std::io::Cursor::new(bytes))
-        .map_err(|error| ApfsError::InvalidAttachmentInventory(error.to_string()))?;
-    let images = value
-        .as_dictionary()
-        .and_then(|root| root.get("images"))
-        .and_then(plist::Value::as_array)
-        .ok_or_else(|| ApfsError::InvalidAttachmentInventory("missing images array".into()))?;
+fn image_inventory(
+    image: &Path,
+    images: &[AttachedDiskImage],
+) -> Result<AttachmentInventory, ApfsError> {
     let mut devices = BTreeSet::new();
     let mut capacity = None;
     let mut matched = false;
-    for entry in images {
-        let dictionary = entry.as_dictionary().ok_or_else(|| {
-            ApfsError::InvalidAttachmentInventory("images entry is not a dictionary".into())
-        })?;
-        let reported_path = dictionary
-            .get("image-path")
-            .and_then(plist::Value::as_string)
-            .ok_or_else(|| {
-                ApfsError::InvalidAttachmentInventory(
-                    "images entry has no string image-path".into(),
-                )
-            })?;
-        if reported_path != expected {
-            continue;
-        }
+    for attached in images
+        .iter()
+        .filter(|attached| attached.is_backed_by(image))
+    {
         matched = true;
-        let entities = dictionary
-            .get("system-entities")
-            .and_then(plist::Value::as_array)
-            .ok_or_else(|| {
-                ApfsError::InvalidAttachmentInventory(
-                    "matching image has no system-entities array".into(),
-                )
-            })?;
         let mut roots = 0usize;
-        for entity in entities {
-            let device = entity
-                .as_dictionary()
-                .and_then(|entity| entity.get("dev-entry"))
-                .and_then(plist::Value::as_string)
-                .and_then(device_path)
-                .ok_or_else(|| {
-                    ApfsError::InvalidAttachmentInventory(
-                        "matching image has an invalid dev-entry".into(),
-                    )
-                })?;
-            if device_depth(&device) == 0 && is_kernel_device_path(&device) {
+        for media in &attached.media {
+            let device = device_path(&media.device).ok_or_else(|| {
+                ApfsError::InvalidAttachmentInventory(format!(
+                    "matching image has an invalid device {:?}",
+                    media.device
+                ))
+            })?;
+            if device_depth(&device) == 0 {
                 roots += 1;
                 devices.insert(device);
             }
@@ -1851,32 +1909,13 @@ fn parse_hdiutil_images(image: &Path, bytes: &[u8]) -> Result<AttachmentInventor
                 "matching image has no canonical whole device".into(),
             ));
         }
-        let extent = |key: &str| {
-            dictionary
-                .get(key)
-                .and_then(plist::Value::as_unsigned_integer)
-        };
-        match (extent("blockcount"), extent("blocksize")) {
-            (None, None) => {}
-            (Some(blockcount), Some(blocksize)) => {
-                let bytes = blockcount.checked_mul(blocksize).ok_or_else(|| {
-                    ApfsError::InvalidAttachmentInventory(
-                        "matching image reports an overflowing extent".into(),
-                    )
-                })?;
-                let observed = ImageCapacity::from_bytes(bytes);
-                if capacity.is_some_and(|previous| previous != observed) {
-                    return Err(ApfsError::InvalidAttachmentInventory(
-                        "matching image is attached twice at different capacities".into(),
-                    ));
-                }
-                capacity = Some(observed);
-            }
-            _ => {
+        if let Some(observed) = attached.capacity {
+            if capacity.is_some_and(|previous| previous != observed) {
                 return Err(ApfsError::InvalidAttachmentInventory(
-                    "matching image has no unsigned blockcount".into(),
+                    "matching image is attached twice at different capacities".into(),
                 ));
             }
+            capacity = Some(observed);
         }
     }
     Ok(AttachmentInventory {
@@ -1886,13 +1925,18 @@ fn parse_hdiutil_images(image: &Path, bytes: &[u8]) -> Result<AttachmentInventor
     })
 }
 
-fn parse_attachment_capacity(image: &Path, bytes: &[u8]) -> Result<ImageCapacity, ApfsError> {
-    let parsed = parse_hdiutil_images(image, bytes)?;
-    if !parsed.matched {
+fn attachment_capacity(
+    image: &Path,
+    images: &[AttachedDiskImage],
+) -> Result<ImageCapacity, ApfsError> {
+    let inventory = image_inventory(image, images)?;
+    if !inventory.matched {
         return Err(ApfsError::ImageNotAttached(image.to_owned()));
     }
-    parsed.capacity.ok_or_else(|| {
-        ApfsError::InvalidAttachmentInventory("matching image has no unsigned blockcount".into())
+    inventory.capacity.ok_or_else(|| {
+        ApfsError::InvalidAttachmentInventory(
+            "matching image has no registered whole-device size".into(),
+        )
     })
 }
 
@@ -1922,41 +1966,25 @@ fn attachment_inventory_path(image: &Path) -> Result<PathBuf, ApfsError> {
     })
 }
 
-fn parse_existing_attachment(
+fn existing_image_attachment(
     image: &Path,
-    bytes: &[u8],
+    images: &[AttachedDiskImage],
 ) -> Result<Option<RecoveredImageAttachment>, ApfsError> {
-    let expected = image.to_str().ok_or_else(|| {
-        ApfsError::InvalidAttachmentInventory("image path is not valid UTF-8".into())
-    })?;
-    let value = plist::Value::from_reader(std::io::Cursor::new(bytes))
-        .map_err(|error| ApfsError::InvalidAttachmentInventory(error.to_string()))?;
-    let images = value
-        .as_dictionary()
-        .and_then(|root| root.get("images"))
-        .and_then(plist::Value::as_array)
-        .ok_or_else(|| ApfsError::InvalidAttachmentInventory("missing images array".into()))?;
     let mut attachment = None;
-    for entry in images {
-        let dictionary = entry.as_dictionary().ok_or_else(|| {
-            ApfsError::InvalidAttachmentInventory("images entry is not a dictionary".into())
-        })?;
-        if dictionary
-            .get("image-path")
-            .and_then(plist::Value::as_string)
-            != Some(expected)
-        {
-            continue;
-        }
-        let entities = dictionary
-            .get("system-entities")
-            .and_then(plist::Value::as_array)
-            .ok_or_else(|| {
-                ApfsError::InvalidAttachmentInventory(
-                    "matching image has no system-entities array".into(),
+    for attached in images
+        .iter()
+        .filter(|attached| attached.is_backed_by(image))
+    {
+        let entities: Vec<(String, String)> = attached
+            .media
+            .iter()
+            .map(|media| {
+                (
+                    device_path(&media.device).unwrap_or_else(|| media.device.clone()),
+                    media.content.clone(),
                 )
-            })?;
-        let entities = collect_attachment_entities(entities)?;
+            })
+            .collect();
         let found = match entities.as_slice() {
             [(device, hint)]
                 if device_depth(device) == 0
@@ -1988,47 +2016,17 @@ fn parse_existing_attachment(
     Ok(attachment)
 }
 
-/// Every whole device `hdiutil info -plist` currently attaches, across all images. The
-/// detach-settle check keys on the device rather than scoping by image: after a detach there
-/// may be no image to scope by, and the question is whether the device is gone at all.
-///
-/// Deliberately more lenient than [`parse_hdiutil_images`]: entries without a
-/// `system-entities` array are skipped rather than failing the whole read. The settle check
-/// treats an unreadable inventory as "unknown, proceed loudly", so strictness here would only
-/// convert tolerated shape drift into noise; the authoritative per-image mapping stays strict
-/// where it matters.
-fn parse_inventory_devices(bytes: &[u8]) -> Result<BTreeSet<String>, ApfsError> {
-    let value = plist::Value::from_reader(std::io::Cursor::new(bytes))
-        .map_err(|error| ApfsError::InvalidAttachmentInventory(error.to_string()))?;
-    let images = value
-        .as_dictionary()
-        .and_then(|root| root.get("images"))
-        .and_then(plist::Value::as_array)
-        .ok_or_else(|| ApfsError::InvalidAttachmentInventory("missing images array".into()))?;
-    let mut devices = BTreeSet::new();
-    for entry in images {
-        let Some(entities) = entry
-            .as_dictionary()
-            .and_then(|entry| entry.get("system-entities"))
-            .and_then(plist::Value::as_array)
-        else {
-            continue;
-        };
-        for entity in entities {
-            let Some(device) = entity
-                .as_dictionary()
-                .and_then(|entity| entity.get("dev-entry"))
-                .and_then(plist::Value::as_string)
-                .and_then(device_path)
-            else {
-                continue;
-            };
-            if device_depth(&device) == 0 && is_kernel_device_path(&device) {
-                devices.insert(device);
-            }
-        }
-    }
-    Ok(devices)
+/// Every whole device the kernel currently attaches for any disk image. The detach-settle
+/// check keys on the device rather than scoping by image: after a detach there may be no image
+/// to scope by, and the question is whether the device is gone at all. A node that is not a
+/// kernel device name names no device to wait on.
+fn inventory_devices(images: &[AttachedDiskImage]) -> BTreeSet<String> {
+    images
+        .iter()
+        .flat_map(|attached| &attached.media)
+        .filter_map(|media| device_path(&media.device))
+        .filter(|device| device_depth(device) == 0)
+        .collect()
 }
 
 fn is_canonical_mount_point(path: &Path) -> bool {
@@ -2223,8 +2221,8 @@ fn parse_attachment_plist(bytes: &[u8]) -> Result<(String, String), ApfsError> {
         .map_err(ApfsError::InvalidAttachmentPlist)
 }
 
-/// Apple's fixed APFS partition-type GUID prefixes, as `hdiutil info -plist` labels an attached
-/// image's entities: the synthesized container (its physical store), then the volume.
+/// Apple's fixed APFS partition-type GUID prefixes, as the kernel's IOMedia `Content` labels an
+/// attached image's media: the synthesized container (its physical store), then the volume.
 const APFS_STORE_TYPE_GUID_PREFIX: &str = "EF57347C-";
 const APFS_VOLUME_TYPE_GUID_PREFIX: &str = "41504653-";
 
@@ -2248,7 +2246,7 @@ fn is_apfs_container_hint(hint: &str) -> bool {
 ///
 /// Every image holds one volume in one container, and both reports of an attachment name the
 /// two: `diskutil image attach --plist` with string hints (`Apple_APFS_Container`,
-/// `Apple_APFS_Volume`), `hdiutil info -plist` with Apple's partition-type GUIDs. The answer
+/// `Apple_APFS_Volume`), the kernel inventory with Apple's partition-type GUIDs. The answer
 /// therefore needs no Disk Arbitration query: `diskutil info` and `diskutil apfs list` queue
 /// behind every arbitration client on the host, and under contention answered before Disk
 /// Arbitration had announced the attach at all. Anything but exactly one volume inside a
@@ -2401,14 +2399,370 @@ fn classify_clone_error(source: &Path, destination: &Path, error: io::Error) -> 
     }
 }
 
+/// The kernel's I/O Registry view of attached disk images.
+///
+/// One `IOServiceGetMatchingServices` call answers every IOMedia node the kernel has registered.
+/// The kernel collects those matches under the registry's own consistency check — it restarts
+/// its walk whenever a concurrent attach or detach invalidates it — so the set is complete for
+/// one instant, which is exactly what `hdiutil info` is not. Each node is then walked up its
+/// provider chain to the image driver's `AppleDiskImageDevice`, whose `DiskImageURL` names the
+/// backing store. A live node's provider links do not change; a node already detached from the
+/// plane is departing and is not reported.
+#[cfg(target_os = "macos")]
+mod io_registry {
+    use super::{AttachedDiskImage, DiskImageSource, ImageMedia};
+    use crate::metadata::ImageCapacity;
+    use std::collections::BTreeMap;
+    use std::collections::btree_map::Entry;
+    use std::ffi::{CStr, c_char, c_void};
+    use std::io;
+    use std::ptr;
+
+    type IoObject = libc::mach_port_t;
+    type KernReturn = libc::c_int;
+    type CfType = *const c_void;
+    type CfIndex = isize;
+
+    const KERN_SUCCESS: KernReturn = 0;
+    /// `kIOReturnNoDevice`: the entry has no provider in the plane.
+    const IO_RETURN_NO_DEVICE: KernReturn = 0xE000_02C0_u32 as KernReturn;
+    /// `kIOMainPortDefault`.
+    const MAIN_PORT_DEFAULT: libc::mach_port_t = 0;
+    const SERVICE_PLANE: &CStr = c"IOService";
+    const CF_STRING_ENCODING_UTF8: u32 = 0x0800_0100;
+    const CF_NUMBER_SINT64_TYPE: CfIndex = 4;
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct CfRange {
+        location: CfIndex,
+        length: CfIndex,
+    }
+
+    #[link(name = "IOKit", kind = "framework")]
+    unsafe extern "C" {
+        fn IOServiceMatching(name: *const c_char) -> *mut c_void;
+        fn IOServiceGetMatchingServices(
+            main_port: libc::mach_port_t,
+            matching: *mut c_void,
+            existing: *mut IoObject,
+        ) -> KernReturn;
+        fn IOIteratorNext(iterator: IoObject) -> IoObject;
+        fn IOObjectRelease(object: IoObject) -> KernReturn;
+        fn IOObjectConformsTo(object: IoObject, class_name: *const c_char) -> libc::c_int;
+        fn IORegistryEntryGetParentEntry(
+            entry: IoObject,
+            plane: *const c_char,
+            parent: *mut IoObject,
+        ) -> KernReturn;
+        fn IORegistryEntryGetRegistryEntryID(entry: IoObject, entry_id: *mut u64) -> KernReturn;
+        fn IORegistryEntryCreateCFProperty(
+            entry: IoObject,
+            key: CfType,
+            allocator: CfType,
+            options: u32,
+        ) -> CfType;
+    }
+
+    #[link(name = "CoreFoundation", kind = "framework")]
+    unsafe extern "C" {
+        fn CFRelease(object: CfType);
+        fn CFGetTypeID(object: CfType) -> usize;
+        fn CFStringGetTypeID() -> usize;
+        fn CFNumberGetTypeID() -> usize;
+        fn CFStringCreateWithBytes(
+            allocator: CfType,
+            bytes: *const u8,
+            length: CfIndex,
+            encoding: u32,
+            external_representation: u8,
+        ) -> CfType;
+        fn CFStringGetLength(string: CfType) -> CfIndex;
+        fn CFStringGetBytes(
+            string: CfType,
+            range: CfRange,
+            encoding: u32,
+            loss_byte: u8,
+            external_representation: u8,
+            buffer: *mut u8,
+            capacity: CfIndex,
+            used: *mut CfIndex,
+        ) -> CfIndex;
+        fn CFNumberGetValue(number: CfType, number_type: CfIndex, value: *mut c_void) -> u8;
+    }
+
+    /// One owned registry reference.
+    struct Object(IoObject);
+
+    impl Drop for Object {
+        fn drop(&mut self) {
+            // SAFETY: the wrapper owns exactly one reference to a non-null registry object.
+            unsafe { IOObjectRelease(self.0) };
+        }
+    }
+
+    /// One owned, non-null CoreFoundation object.
+    struct Cf(CfType);
+
+    impl Drop for Cf {
+        fn drop(&mut self) {
+            // SAFETY: the wrapper owns exactly one reference to a non-null CF object.
+            unsafe { CFRelease(self.0) };
+        }
+    }
+
+    struct Keys {
+        bsd_name: Cf,
+        content: Cf,
+        size: Cf,
+        url: Cf,
+    }
+
+    /// The image driver a media node hangs from, and whether the node is the image's own whole
+    /// device: no other media lies between them.
+    struct ImageDriver {
+        driver: Object,
+        id: u64,
+        is_whole: bool,
+    }
+
+    pub(super) fn attached_disk_images() -> io::Result<Vec<AttachedDiskImage>> {
+        let keys = Keys {
+            bsd_name: key("BSD Name")?,
+            content: key("Content")?,
+            size: key("Size")?,
+            url: key("DiskImageURL")?,
+        };
+        // SAFETY: the class name is NUL-terminated; a null answer is refused below.
+        let matching = unsafe { IOServiceMatching(c"IOMedia".as_ptr()) };
+        if matching.is_null() {
+            return Err(io::Error::other(
+                "IOServiceMatching(IOMedia) returned no matching dictionary",
+            ));
+        }
+        let mut iterator: IoObject = 0;
+        // SAFETY: `matching` is a +1 dictionary the call consumes whatever it returns, and
+        // `iterator` is writable.
+        let status =
+            unsafe { IOServiceGetMatchingServices(MAIN_PORT_DEFAULT, matching, &mut iterator) };
+        if status != KERN_SUCCESS {
+            return Err(kernel_error("match registered IOMedia", status));
+        }
+        let iterator = Object(iterator);
+        let mut images: BTreeMap<u64, AttachedDiskImage> = BTreeMap::new();
+        loop {
+            // SAFETY: `iterator` is a live matching iterator; each object it yields is +1.
+            let next = unsafe { IOIteratorNext(iterator.0) };
+            if next == 0 {
+                break;
+            }
+            let media = Object(next);
+            let Some(name) = string_property(&media, &keys.bsd_name, "BSD Name")? else {
+                continue;
+            };
+            let Some(owner) = image_driver_of(&media)? else {
+                continue;
+            };
+            let image = match images.entry(owner.id) {
+                Entry::Occupied(entry) => entry.into_mut(),
+                Entry::Vacant(entry) => {
+                    let url = string_property(&owner.driver, &keys.url, "DiskImageURL")?
+                        .ok_or_else(|| {
+                            invalid(format!(
+                                "the disk image exposing {name} registers no DiskImageURL"
+                            ))
+                        })?;
+                    entry.insert(AttachedDiskImage {
+                        source: DiskImageSource::from_url(&url),
+                        capacity: None,
+                        media: Vec::new(),
+                    })
+                }
+            };
+            if owner.is_whole {
+                image.capacity = size_property(&media, &keys.size)?.map(ImageCapacity::from_bytes);
+            }
+            let content = string_property(&media, &keys.content, "Content")?.unwrap_or_default();
+            image.media.push(ImageMedia {
+                device: format!("/dev/{name}"),
+                content,
+            });
+        }
+        Ok(images
+            .into_values()
+            .map(|mut image| {
+                image
+                    .media
+                    .sort_by(|left, right| left.device.cmp(&right.device));
+                image
+            })
+            .collect())
+    }
+
+    fn image_driver_of(media: &Object) -> io::Result<Option<ImageDriver>> {
+        let mut intervening_media = 0usize;
+        let mut current = provider(media)?;
+        while let Some(entry) = current {
+            if conforms(&entry, c"AppleDiskImageDevice") {
+                let mut id = 0u64;
+                // SAFETY: `entry` is a live registry reference and `id` is writable.
+                let status = unsafe { IORegistryEntryGetRegistryEntryID(entry.0, &mut id) };
+                if status != KERN_SUCCESS {
+                    return Err(kernel_error("read a disk image's registry id", status));
+                }
+                return Ok(Some(ImageDriver {
+                    driver: entry,
+                    id,
+                    is_whole: intervening_media == 0,
+                }));
+            }
+            if conforms(&entry, c"IOMedia") {
+                intervening_media += 1;
+            }
+            current = provider(&entry)?;
+        }
+        Ok(None)
+    }
+
+    fn provider(entry: &Object) -> io::Result<Option<Object>> {
+        let mut parent: IoObject = 0;
+        // SAFETY: `entry` is live, the plane name is NUL-terminated, and `parent` is writable.
+        match unsafe { IORegistryEntryGetParentEntry(entry.0, SERVICE_PLANE.as_ptr(), &mut parent) }
+        {
+            KERN_SUCCESS => Ok(Some(Object(parent))),
+            IO_RETURN_NO_DEVICE => Ok(None),
+            status => Err(kernel_error("read a registry provider", status)),
+        }
+    }
+
+    fn conforms(entry: &Object, class: &CStr) -> bool {
+        // SAFETY: `entry` is live and `class` is NUL-terminated.
+        unsafe { IOObjectConformsTo(entry.0, class.as_ptr()) != 0 }
+    }
+
+    fn key(name: &str) -> io::Result<Cf> {
+        let length = CfIndex::try_from(name.len())
+            .map_err(|_| invalid(format!("registry key {name:?} is too long")))?;
+        // SAFETY: `name` is valid UTF-8 for `length` bytes and is copied by the call.
+        let created = unsafe {
+            CFStringCreateWithBytes(
+                ptr::null(),
+                name.as_ptr(),
+                length,
+                CF_STRING_ENCODING_UTF8,
+                0,
+            )
+        };
+        if created.is_null() {
+            Err(io::Error::other(format!(
+                "CoreFoundation could not create the registry key {name:?}"
+            )))
+        } else {
+            Ok(Cf(created))
+        }
+    }
+
+    fn property(entry: &Object, key: &Cf) -> Option<Cf> {
+        // SAFETY: `entry` is live and `key` is a CFString; the answer is +1 or null.
+        let value = unsafe { IORegistryEntryCreateCFProperty(entry.0, key.0, ptr::null(), 0) };
+        // A null answer must never be wrapped: the wrapper releases what it holds.
+        if value.is_null() {
+            None
+        } else {
+            Some(Cf(value))
+        }
+    }
+
+    fn string_property(entry: &Object, key: &Cf, name: &str) -> io::Result<Option<String>> {
+        let Some(value) = property(entry, key) else {
+            return Ok(None);
+        };
+        // SAFETY: `value` is a live CF object.
+        if unsafe { CFGetTypeID(value.0) != CFStringGetTypeID() } {
+            return Err(invalid(format!("registry property {name} is not a string")));
+        }
+        let range = CfRange {
+            location: 0,
+            // SAFETY: `value` is a live CFString.
+            length: unsafe { CFStringGetLength(value.0) },
+        };
+        let mut needed: CfIndex = 0;
+        // SAFETY: a null buffer asks only for the UTF-8 length of the whole range.
+        let measured = unsafe {
+            CFStringGetBytes(
+                value.0,
+                range,
+                CF_STRING_ENCODING_UTF8,
+                0,
+                0,
+                ptr::null_mut(),
+                0,
+                &mut needed,
+            )
+        };
+        let capacity = usize::try_from(needed)
+            .map_err(|_| invalid(format!("registry property {name} has a negative length")))?;
+        let mut bytes = vec![0u8; capacity];
+        let mut used: CfIndex = 0;
+        // SAFETY: `bytes` is writable for `needed` bytes, the capacity the call is given.
+        let converted = unsafe {
+            CFStringGetBytes(
+                value.0,
+                range,
+                CF_STRING_ENCODING_UTF8,
+                0,
+                0,
+                bytes.as_mut_ptr(),
+                needed,
+                &mut used,
+            )
+        };
+        if measured != range.length || converted != range.length || used != needed {
+            return Err(invalid(format!(
+                "registry property {name} did not convert to UTF-8 whole"
+            )));
+        }
+        String::from_utf8(bytes)
+            .map(Some)
+            .map_err(|_| invalid(format!("registry property {name} is not UTF-8")))
+    }
+
+    fn size_property(entry: &Object, key: &Cf) -> io::Result<Option<u64>> {
+        let Some(value) = property(entry, key) else {
+            return Ok(None);
+        };
+        // SAFETY: `value` is a live CF object.
+        if unsafe { CFGetTypeID(value.0) != CFNumberGetTypeID() } {
+            return Err(invalid("registry property Size is not a number"));
+        }
+        let mut size = 0i64;
+        // SAFETY: `value` is a live CFNumber and `size` is writable storage for an SInt64.
+        if unsafe { CFNumberGetValue(value.0, CF_NUMBER_SINT64_TYPE, (&raw mut size).cast()) } == 0
+        {
+            return Err(invalid(
+                "registry property Size is not an exact 64-bit integer",
+            ));
+        }
+        u64::try_from(size)
+            .map(Some)
+            .map_err(|_| invalid("registry property Size is negative"))
+    }
+
+    fn invalid(message: impl Into<String>) -> io::Error {
+        io::Error::new(io::ErrorKind::InvalidData, message.into())
+    }
+
+    fn kernel_error(operation: &str, status: KernReturn) -> io::Error {
+        io::Error::other(format!("{operation}: IOKit returned {status:#010x}"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::cell::{Ref, RefCell};
     use std::collections::{BTreeMap, VecDeque};
 
-    const EMPTY_ATTACHMENT_INVENTORY: &str =
-        r#"<?xml version="1.0"?><plist><dict><key>images</key><array/></dict></plist>"#;
     const BLANK_ASIF_PLIST: &str = r#"<?xml version="1.0"?><plist><dict><key>system-entities</key><array>
       <dict><key>dev-entry</key><string>disk8</string><key>content-hint</key><string>GUID_partition_scheme</string></dict>
     </array></dict></plist>"#;
@@ -2423,54 +2777,90 @@ mod tests {
       <dict><key>content-hint</key><string>Apple_APFS_Volume</string><key>dev-entry</key><string>disk5s1</string><key>filesystem-name</key><string>Case-sensitive APFS</string><key>filesystem-type</key><string>apfs</string></dict>
     </array></dict></plist>"#;
 
-    /// `hdiutil info -plist` for one attached ASIF image, captured live on macOS 26.6 and trimmed to
-    /// the keys cowshed reads. This is the schema `existing_attachment` reads: partition-type GUID
-    /// `content-hint`s rather than attach stdout's string hints. The GUID prefixes are Apple's
-    /// fixed APFS types (the synthesized store, then the volume); the device numbers are the live
-    /// capture's.
-    const INFO_INVENTORY_PLIST: &str = r#"<?xml version="1.0"?><plist><dict><key>images</key><array><dict>
-      <key>image-path</key><string>/tmp/cowshed-target.asif</string>
-      <key>blockcount</key><integer>125000</integer>
-      <key>blocksize</key><integer>512</integer>
-      <key>system-entities</key><array>
-        <dict><key>content-hint</key><string></string><key>dev-entry</key><string>/dev/disk14</string></dict>
-        <dict><key>content-hint</key><string>EF57347C-0000-11AA-AA11-00306543ECAC</string><key>dev-entry</key><string>/dev/disk15</string></dict>
-        <dict><key>content-hint</key><string>41504653-0000-11AA-AA11-00306543ECAC</string><key>dev-entry</key><string>/dev/disk15s1</string></dict>
-      </array>
-    </dict></array></dict></plist>"#;
+    const APFS_CONTAINER_CONTENT: &str = "EF57347C-0000-11AA-AA11-00306543ECAC";
+    const APFS_VOLUME_CONTENT: &str = "41504653-0000-11AA-AA11-00306543ECAC";
+
+    /// One scripted host answer, in the order the backend asks for it.
+    #[derive(Debug)]
+    enum Reply {
+        Command(CommandOutput),
+        Inventory(io::Result<Vec<AttachedDiskImage>>),
+    }
+
+    /// One thing the backend asked the host, in order.
+    #[derive(Clone, Debug, PartialEq)]
+    enum Seen {
+        Command(CommandRequest),
+        Inventory,
+    }
+
+    impl Seen {
+        fn command(&self) -> &CommandRequest {
+            match self {
+                Self::Command(request) => request,
+                Self::Inventory => panic!("expected a command, saw the kernel inventory read"),
+            }
+        }
+    }
+
+    fn commands(steps: &[Seen]) -> Vec<CommandRequest> {
+        steps
+            .iter()
+            .filter_map(|step| match step {
+                Seen::Command(request) => Some(request.clone()),
+                Seen::Inventory => None,
+            })
+            .collect()
+    }
 
     #[derive(Default)]
     struct RecordingRunner {
-        requests: RefCell<Vec<CommandRequest>>,
-        outputs: RefCell<VecDeque<CommandOutput>>,
+        steps: RefCell<Vec<Seen>>,
+        replies: RefCell<VecDeque<Reply>>,
     }
 
     impl RecordingRunner {
-        fn with_outputs(outputs: impl IntoIterator<Item = CommandOutput>) -> Self {
+        fn with_outputs(replies: impl IntoIterator<Item = Reply>) -> Self {
             Self {
-                requests: RefCell::new(Vec::new()),
-                outputs: RefCell::new(outputs.into_iter().collect()),
+                steps: RefCell::new(Vec::new()),
+                replies: RefCell::new(replies.into_iter().collect()),
             }
         }
-        fn requests(&self) -> Ref<'_, Vec<CommandRequest>> {
-            self.requests.borrow()
+        /// Every command and inventory read, in the order the backend made them.
+        fn steps(&self) -> Vec<Seen> {
+            self.steps.borrow().clone()
+        }
+        /// The commands alone.
+        fn requests(&self) -> Vec<CommandRequest> {
+            commands(&self.steps.borrow())
+        }
+        fn next_reply(&self, step: Seen) -> Reply {
+            self.steps.borrow_mut().push(step.clone());
+            self.replies
+                .borrow_mut()
+                .pop_front()
+                .unwrap_or_else(|| panic!("test supplied no reply for {step:?}"))
         }
     }
 
     impl CommandRunner for RecordingRunner {
         fn run(&self, request: &CommandRequest) -> Result<CommandOutput, CommandRunError> {
-            self.requests.borrow_mut().push(request.clone());
-            Ok(self
-                .outputs
-                .borrow_mut()
-                .pop_front()
-                .expect("test supplied an output for each command"))
+            match self.next_reply(Seen::Command(request.clone())) {
+                Reply::Command(output) => Ok(output),
+                other => panic!("test scripted {other:?} where {request:?} ran"),
+            }
         }
         fn host_device_lease(&self) -> io::Result<Option<File>> {
             Ok(None)
         }
         fn pin_raw_device(&self, _: &Path) -> io::Result<Option<File>> {
             Ok(None)
+        }
+        fn attached_disk_images(&self) -> io::Result<Vec<AttachedDiskImage>> {
+            match self.next_reply(Seen::Inventory) {
+                Reply::Inventory(images) => images,
+                other => panic!("test scripted {other:?} where the kernel inventory was read"),
+            }
         }
     }
 
@@ -2493,10 +2883,10 @@ mod tests {
     /// A backend whose detach graces each admit exactly two retries before giving up. The sleeper only
     /// records, so both bounds are reached in zero wall-clock time.
     fn graced_backend(
-        outputs: impl IntoIterator<Item = CommandOutput>,
+        replies: impl IntoIterator<Item = Reply>,
     ) -> MacOsApfsBackend<RecordingRunner, RecordingSleeper> {
         MacOsApfsBackend::with_grace(
-            RecordingRunner::with_outputs(outputs),
+            RecordingRunner::with_outputs(replies),
             RecordingSleeper::default(),
             DetachGrace {
                 total: Duration::from_millis(20),
@@ -2509,9 +2899,17 @@ mod tests {
         })
     }
 
+    fn ok(stdout: impl Into<Vec<u8>>) -> Reply {
+        Reply::Command(CommandOutput::success(stdout))
+    }
+
+    fn failed(status: i32, stderr: &str) -> Reply {
+        Reply::Command(CommandOutput::failure(status, stderr))
+    }
+
     /// The resource-busy refusal observed from a real held-file image detach.
-    fn dissent() -> CommandOutput {
-        CommandOutput::failure(
+    fn dissent() -> Reply {
+        failed(
             libc::EBUSY,
             "hdiutil: couldn't unmount \"disk5\" - Resource busy",
         )
@@ -2529,20 +2927,74 @@ mod tests {
             .collect()
     }
 
+    /// The content hint the kernel registers for a fixture device: the volume for a first slice,
+    /// the synthesized container for `/dev/disk5`, none for an image's own store.
+    fn fixture_content(device: &str) -> &'static str {
+        if device.ends_with("s1") {
+            APFS_VOLUME_CONTENT
+        } else if device == "/dev/disk5" {
+            APFS_CONTAINER_CONTENT
+        } else {
+            ""
+        }
+    }
+
+    /// Kernel inventory records: each image path holding its devices.
+    fn attached_images(entries: &[(&str, &[&str])]) -> Vec<AttachedDiskImage> {
+        entries
+            .iter()
+            .map(|(path, devices)| {
+                AttachedDiskImage::file(
+                    *path,
+                    None,
+                    devices
+                        .iter()
+                        .map(|device| (*device, fixture_content(device))),
+                )
+            })
+            .collect()
+    }
+
+    fn images(entries: &[(&str, &[&str])]) -> Reply {
+        Reply::Inventory(Ok(attached_images(entries)))
+    }
+
+    fn no_images() -> Reply {
+        Reply::Inventory(Ok(Vec::new()))
+    }
+
+    fn unreadable_inventory() -> Reply {
+        Reply::Inventory(Err(io::Error::other("registry unavailable")))
+    }
+
+    /// The identity read every device detach makes first: the kernel still shows `image`
+    /// (resolved the way the backend resolves it) holding `device`.
+    fn holding(image: impl AsRef<Path>, device: &str) -> Reply {
+        let image = attachment_inventory_path(image.as_ref()).unwrap();
+        images(&[(image.to_str().unwrap(), &[device][..])])
+    }
+
+    fn holding_verified_volume(image: impl AsRef<Path>) -> Reply {
+        let image = attachment_inventory_path(image.as_ref()).unwrap();
+        images(&[(
+            image.to_str().unwrap(),
+            &["/dev/disk4", "/dev/disk5", "/dev/disk5s1"][..],
+        )])
+    }
+
+    /// Attaches its one new device to `image` on the first `diskutil image attach`, answers that
+    /// attach with a malformed plist, and removes the device again when `hdiutil detach` names it.
     struct StatefulMalformedAttachRunner {
-        requests: RefCell<Vec<CommandRequest>>,
-        attached: RefCell<BTreeMap<String, BTreeSet<String>>>,
-        image: String,
+        steps: RefCell<Vec<Seen>>,
+        attached: RefCell<BTreeMap<PathBuf, BTreeSet<String>>>,
+        image: PathBuf,
         new_device: String,
         fail_detach: bool,
     }
 
     impl StatefulMalformedAttachRunner {
         fn new(image: &Path, preexisting: &[&str], fail_detach: bool) -> Self {
-            let image = attachment_inventory_path(image)
-                .unwrap()
-                .to_string_lossy()
-                .into_owned();
+            let image = attachment_inventory_path(image).unwrap();
             let mut attached = BTreeMap::new();
             attached.insert(
                 image.clone(),
@@ -2552,11 +3004,11 @@ mod tests {
                     .collect(),
             );
             attached.insert(
-                "/tmp/cowshed-unrelated.asif".into(),
+                PathBuf::from("/tmp/cowshed-unrelated.asif"),
                 BTreeSet::from(["/dev/disk20".into()]),
             );
             Self {
-                requests: RefCell::new(Vec::new()),
+                steps: RefCell::new(Vec::new()),
                 attached: RefCell::new(attached),
                 image,
                 new_device: "/dev/disk8".into(),
@@ -2564,34 +3016,12 @@ mod tests {
             }
         }
 
-        fn inventory(&self) -> String {
-            let attached = self.attached.borrow();
-            let mut plist =
-                String::from(r#"<?xml version="1.0"?><plist><dict><key>images</key><array>"#);
-            for (path, devices) in attached.iter().filter(|(_, devices)| !devices.is_empty()) {
-                plist.push_str("<dict><key>image-path</key><string>");
-                plist.push_str(path);
-                plist.push_str("</string><key>system-entities</key><array>");
-                for device in devices {
-                    plist.push_str("<dict><key>dev-entry</key><string>");
-                    plist.push_str(device);
-                    plist.push_str("</string></dict>");
-                }
-                plist.push_str("</array></dict>");
-            }
-            plist.push_str("</array></dict></plist>");
-            plist
-        }
-
-        fn requests(&self) -> Ref<'_, Vec<CommandRequest>> {
-            self.requests.borrow()
+        fn steps(&self) -> Vec<Seen> {
+            self.steps.borrow().clone()
         }
 
         fn devices_for(&self, image: &Path) -> BTreeSet<String> {
-            let image = attachment_inventory_path(image)
-                .unwrap()
-                .to_string_lossy()
-                .into_owned();
+            let image = attachment_inventory_path(image).unwrap();
             self.attached
                 .borrow()
                 .get(&image)
@@ -2602,11 +3032,8 @@ mod tests {
 
     impl CommandRunner for StatefulMalformedAttachRunner {
         fn run(&self, request: &CommandRequest) -> Result<CommandOutput, CommandRunError> {
-            self.requests.borrow_mut().push(request.clone());
+            self.steps.borrow_mut().push(Seen::Command(request.clone()));
             let args = argv(request);
-            if request.program == Path::new(HDIUTIL) && args == ["info", "-plist"] {
-                return Ok(CommandOutput::success(self.inventory()));
-            }
             if request.program == Path::new(DISKUTIL)
                 && args.starts_with(&["image".into(), "create".into(), "blank".into()])
             {
@@ -2643,51 +3070,22 @@ mod tests {
         fn pin_raw_device(&self, _: &Path) -> io::Result<Option<File>> {
             Ok(None)
         }
-    }
-
-    fn attachment_inventory(entries: &[(&str, &[&str])]) -> String {
-        let mut plist =
-            String::from(r#"<?xml version="1.0"?><plist><dict><key>images</key><array>"#);
-        for (path, devices) in entries {
-            plist.push_str("<dict><key>image-path</key><string>");
-            plist.push_str(path);
-            plist.push_str("</string><key>system-entities</key><array>");
-            for device in *devices {
-                plist.push_str("<dict><key>dev-entry</key><string>");
-                plist.push_str(device);
-                let hint = if device.ends_with("s1") {
-                    "41504653-0000-11AA-AA11-00306543ECAC"
-                } else if *device == "/dev/disk5" {
-                    "EF57347C-0000-11AA-AA11-00306543ECAC"
-                } else {
-                    ""
-                };
-                plist.push_str("</string><key>content-hint</key><string>");
-                plist.push_str(hint);
-                plist.push_str("</string></dict>");
-            }
-            plist.push_str("</array></dict>");
+        fn attached_disk_images(&self) -> io::Result<Vec<AttachedDiskImage>> {
+            self.steps.borrow_mut().push(Seen::Inventory);
+            Ok(self
+                .attached
+                .borrow()
+                .iter()
+                .filter(|(_, devices)| !devices.is_empty())
+                .map(|(path, devices)| {
+                    AttachedDiskImage::file(
+                        path.clone(),
+                        None,
+                        devices.iter().map(|device| (device.as_str(), "")),
+                    )
+                })
+                .collect())
         }
-        plist.push_str("</array></dict></plist>");
-        plist
-    }
-
-    /// The identity read every device detach makes first: the inventory still shows `image`
-    /// (resolved the way the backend resolves it) holding `device`.
-    fn holding(image: impl AsRef<Path>, device: &str) -> CommandOutput {
-        let image = attachment_inventory_path(image.as_ref()).unwrap();
-        CommandOutput::success(attachment_inventory(&[(
-            image.to_str().unwrap(),
-            &[device][..],
-        )]))
-    }
-
-    fn holding_verified_volume(image: impl AsRef<Path>) -> CommandOutput {
-        let image = attachment_inventory_path(image.as_ref()).unwrap();
-        CommandOutput::success(attachment_inventory(&[(
-            image.to_str().unwrap(),
-            &["/dev/disk4", "/dev/disk5", "/dev/disk5s1"],
-        )]))
     }
 
     fn temp_path(label: &str, extension: &str) -> PathBuf {
@@ -2938,13 +3336,13 @@ mod tests {
     #[test]
     fn failed_verification_detaches_the_whole_image_device() {
         let backend = MacOsApfsBackend::new(RecordingRunner::with_outputs([
-            CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY),
-            CommandOutput::success(ATTACH_PLIST),
+            no_images(),
+            ok(ATTACH_PLIST),
             holding_verified_volume("session.asif"),
-            CommandOutput::failure(8, "not clean"),
+            failed(8, "not clean"),
             holding("session.asif", "/dev/disk5"),
-            CommandOutput::success([]),
-            CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY),
+            ok([]),
+            no_images(),
         ]));
         let error = backend
             .attach_verified(Path::new("session.asif"))
@@ -2960,15 +3358,15 @@ mod tests {
             } if request.program == Path::new(FSCK_APFS)
                 && argv(&request) == ["-q", "/dev/rdisk5s1"]
         ));
-        let requests = backend.runner().requests();
-        assert_eq!(requests.len(), 7);
-        assert_eq!(requests[3].program, Path::new(FSCK_APFS));
-        assert_eq!(argv(&requests[3]), ["-q", "/dev/rdisk5s1"]);
-        assert_eq!(argv(&requests[4]), ["info", "-plist"]);
-        assert_eq!(requests[5].program, Path::new(HDIUTIL));
-        assert_eq!(argv(&requests[5]), ["detach", "/dev/disk5"]);
+        let steps = backend.runner().steps();
+        assert_eq!(steps.len(), 7);
+        assert_eq!(steps[3].command().program, Path::new(FSCK_APFS));
+        assert_eq!(argv(steps[3].command()), ["-q", "/dev/rdisk5s1"]);
+        assert_eq!(steps[4], Seen::Inventory);
+        assert_eq!(steps[5].command().program, Path::new(HDIUTIL));
+        assert_eq!(argv(steps[5].command()), ["detach", "/dev/disk5"]);
         assert!(
-            !requests
+            !commands(&steps)
                 .iter()
                 .any(|request| argv(request).first().is_some_and(|arg| arg == "mount"))
         );
@@ -2977,13 +3375,12 @@ mod tests {
     #[test]
     fn parsed_attach_never_detaches_a_preexisting_same_image_device() {
         let image = Path::new("/tmp/cowshed-preexisting.asif");
-        let inventory =
-            attachment_inventory(&[("/tmp/cowshed-preexisting.asif", &["/dev/disk5"][..])]);
+        let inventory = || images(&[("/tmp/cowshed-preexisting.asif", &["/dev/disk5"][..])]);
         let backend = MacOsApfsBackend::new(RecordingRunner::with_outputs([
-            CommandOutput::success(inventory.as_bytes()),
-            CommandOutput::success(ATTACH_PLIST),
-            CommandOutput::success(inventory.as_bytes()),
-            CommandOutput::success(inventory.as_bytes()),
+            inventory(),
+            ok(ATTACH_PLIST),
+            inventory(),
+            inventory(),
         ]));
 
         let error = backend.attach_verified(image).unwrap_err();
@@ -2993,13 +3390,13 @@ mod tests {
             ApfsError::InvalidAttachmentPlist(message)
                 if message == "attach reported a pre-existing whole image device"
         ));
-        let requests = backend.runner().requests();
-        assert_eq!(requests.len(), 4);
-        assert_eq!(argv(&requests[0]), ["info", "-plist"]);
-        assert_eq!(argv(&requests[2]), ["info", "-plist"]);
-        assert_eq!(argv(&requests[3]), ["info", "-plist"]);
+        let steps = backend.runner().steps();
+        assert_eq!(steps.len(), 4);
+        assert_eq!(steps[0], Seen::Inventory);
+        assert_eq!(steps[2], Seen::Inventory);
+        assert_eq!(steps[3], Seen::Inventory);
         assert!(
-            !requests
+            !commands(&steps)
                 .iter()
                 .any(|request| argv(request).first().is_some_and(|arg| arg == "detach"))
         );
@@ -3027,11 +3424,11 @@ mod tests {
                 .devices_for(Path::new("/tmp/cowshed-unrelated.asif")),
             BTreeSet::from(["/dev/disk20".into()])
         );
-        let requests = backend.runner().requests();
-        assert_eq!(requests.len(), 7);
-        assert_eq!(argv(&requests[0]), ["info", "-plist"]);
+        let steps = backend.runner().steps();
+        assert_eq!(steps.len(), 7);
+        assert_eq!(steps[0], Seen::Inventory);
         assert_eq!(
-            argv(&requests[1]),
+            argv(steps[1].command()),
             [
                 "image",
                 "attach",
@@ -3041,11 +3438,11 @@ mod tests {
                 "/tmp/cowshed-malformed-attach.asif",
             ]
         );
-        assert_eq!(argv(&requests[2]), ["info", "-plist"]);
-        assert_eq!(argv(&requests[3]), ["info", "-plist"]);
-        assert_eq!(argv(&requests[4]), ["detach", "/dev/disk8"]);
-        assert_eq!(argv(&requests[6]), ["info", "-plist"]);
-        assert!(!requests.iter().any(|request| {
+        assert_eq!(steps[2], Seen::Inventory);
+        assert_eq!(steps[3], Seen::Inventory);
+        assert_eq!(argv(steps[4].command()), ["detach", "/dev/disk8"]);
+        assert_eq!(steps[6], Seen::Inventory);
+        assert!(!commands(&steps).iter().any(|request| {
             let args = argv(request);
             args.iter()
                 .any(|arg| arg == "/dev/disk4" || arg == "/dev/disk20")
@@ -3106,29 +3503,28 @@ mod tests {
             }
             other => panic!("unexpected error: {other}"),
         }
-        let requests = backend.runner().requests();
-        assert_eq!(requests.len(), 7);
-        assert_eq!(argv(&requests[0])[..3], ["image", "create", "blank"]);
-        assert_eq!(argv(&requests[1]), ["info", "-plist"]);
-        assert_eq!(argv(&requests[3]), ["info", "-plist"]);
-        assert_eq!(argv(&requests[4]), ["info", "-plist"]);
-        assert_eq!(argv(&requests[5]), ["detach", "/dev/disk8"]);
-        assert_eq!(argv(&requests[6]), ["info", "-plist"]);
+        let steps = backend.runner().steps();
+        assert_eq!(steps.len(), 7);
+        assert_eq!(argv(steps[0].command())[..3], ["image", "create", "blank"]);
+        assert_eq!(steps[1], Seen::Inventory);
+        assert_eq!(steps[3], Seen::Inventory);
+        assert_eq!(steps[4], Seen::Inventory);
+        assert_eq!(argv(steps[5].command()), ["detach", "/dev/disk8"]);
+        assert_eq!(steps[6], Seen::Inventory);
         fs::remove_file(image).unwrap();
     }
 
     #[test]
     fn failed_detach_remains_a_cleanup_error_when_inventory_reports_absence() {
         let image = Path::new("/tmp/cowshed-failed-detach.asif");
-        let attached =
-            attachment_inventory(&[("/tmp/cowshed-failed-detach.asif", &["/dev/disk8"][..])]);
+        let attached = || images(&[("/tmp/cowshed-failed-detach.asif", &["/dev/disk8"][..])]);
         let backend = MacOsApfsBackend::new(RecordingRunner::with_outputs([
-            CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY),
-            CommandOutput::success("<plist><dict><key>malformed"),
-            CommandOutput::success(attached.as_bytes()),
-            CommandOutput::success(attached.as_bytes()),
-            CommandOutput::failure(1, "detach refused"),
-            CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY),
+            no_images(),
+            ok("<plist><dict><key>malformed"),
+            attached(),
+            attached(),
+            failed(1, "detach refused"),
+            no_images(),
         ]));
 
         let error = backend.attach_verified(image).unwrap_err();
@@ -3145,28 +3541,29 @@ mod tests {
             }
             other => panic!("unexpected error: {other}"),
         }
-        let requests = backend.runner().requests();
-        assert_eq!(requests.len(), 6);
-        assert_eq!(argv(&requests[4]), ["detach", "/dev/disk8"]);
-        assert_eq!(argv(&requests[5]), ["info", "-plist"]);
+        let steps = backend.runner().steps();
+        assert_eq!(steps.len(), 6);
+        assert_eq!(argv(steps[4].command()), ["detach", "/dev/disk8"]);
+        assert_eq!(steps[5], Seen::Inventory);
     }
 
     #[test]
     fn malformed_blank_asif_inventory_failures_preserve_the_image() {
-        let cleanup_outputs = [
-            CommandOutput::failure(5, "inventory unavailable"),
-            CommandOutput::success("not a plist"),
-        ];
-        for (index, cleanup_output) in cleanup_outputs.into_iter().enumerate() {
+        for index in 0..2 {
             let stem =
                 temp_path(&format!("malformed-inventory-{index}"), "stem").with_extension("");
             let image = stem.with_extension(IMAGE_EXTENSION);
             fs::write(&image, b"created").unwrap();
+            let cleanup_inventory = if index == 0 {
+                unreadable_inventory()
+            } else {
+                images(&[(image.to_str().unwrap(), &["not-a-device"][..])])
+            };
             let backend = MacOsApfsBackend::new(RecordingRunner::with_outputs([
-                CommandOutput::success([]),
-                CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY),
-                CommandOutput::success("<plist><dict><key>malformed"),
-                cleanup_output,
+                ok([]),
+                no_images(),
+                ok("<plist><dict><key>malformed"),
+                cleanup_inventory,
             ]));
 
             let error = backend
@@ -3187,17 +3584,7 @@ mod tests {
                     assert!(matches!(*primary, ApfsError::InvalidAttachmentPlist(_)));
                     let inventory = cleanup.inventory.expect("inventory failure is retained");
                     if index == 0 {
-                        assert!(matches!(
-                            *inventory,
-                            ApfsError::CommandFailed {
-                                operation: "inventory attached disk images",
-                                output: CommandOutput {
-                                    status: ProcessStatus::Exit(5),
-                                    ..
-                                },
-                                ..
-                            }
-                        ));
+                        assert!(matches!(*inventory, ApfsError::KernelInventory(_)));
                     } else {
                         assert!(matches!(
                             *inventory,
@@ -3209,7 +3596,7 @@ mod tests {
                 }
                 other => panic!("unexpected error: {other}"),
             }
-            assert_eq!(backend.runner().requests().len(), 4);
+            assert_eq!(backend.runner().steps().len(), 4);
             fs::remove_file(image).unwrap();
         }
     }
@@ -3220,11 +3607,11 @@ mod tests {
         let image = stem.with_extension(IMAGE_EXTENSION);
         fs::write(&image, b"partial").unwrap();
         let backend = MacOsApfsBackend::new(RecordingRunner::with_outputs([
-            CommandOutput::success([]),
-            CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY),
-            CommandOutput::failure(1, "unsupported after create"),
-            CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY),
-            CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY),
+            ok([]),
+            no_images(),
+            failed(1, "unsupported after create"),
+            no_images(),
+            no_images(),
         ]));
         let error = backend
             .create_staged_image(&CreateImageRequest {
@@ -3244,13 +3631,13 @@ mod tests {
             }
         ));
         assert!(!image.exists());
-        let requests = backend.runner().requests();
-        assert_eq!(requests.len(), 5);
-        assert_eq!(argv(&requests[1]), ["info", "-plist"]);
+        let steps = backend.runner().steps();
+        assert_eq!(steps.len(), 5);
+        assert_eq!(steps[1], Seen::Inventory);
         assert_eq!(
-            requests
+            steps
                 .iter()
-                .filter(|request| argv(request) == ["info", "-plist"])
+                .filter(|step| **step == Seen::Inventory)
                 .count(),
             3
         );
@@ -3262,11 +3649,11 @@ mod tests {
         let image = stem.with_extension(IMAGE_EXTENSION);
         assert!(!image.exists());
         let backend = MacOsApfsBackend::new(RecordingRunner::with_outputs([
-            CommandOutput::success([]),
-            CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY),
-            CommandOutput::failure(9, "attach failed"),
-            CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY),
-            CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY),
+            ok([]),
+            no_images(),
+            failed(9, "attach failed"),
+            no_images(),
+            no_images(),
         ]));
         let error = backend
             .create_staged_image(&CreateImageRequest {
@@ -3289,7 +3676,7 @@ mod tests {
                 ..
             }
         ));
-        assert_eq!(backend.runner().requests().len(), 5);
+        assert_eq!(backend.runner().steps().len(), 5);
     }
 
     #[test]
@@ -3299,8 +3686,8 @@ mod tests {
         let backend = graced_backend([
             holding(&image, "/dev/disk8"),
             holding(&image, "/dev/disk8"),
-            CommandOutput::success([]),
-            CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY),
+            ok([]),
+            no_images(),
         ]);
         backend
             .detach_unformatted_image(&image, "/dev/disk8", DetachIntent::Release)
@@ -3358,50 +3745,76 @@ mod tests {
         fs::remove_file(image).unwrap();
     }
 
+    fn blank_request(stem: PathBuf) -> CreateImageRequest {
+        CreateImageRequest {
+            staged_stem: stem,
+            capacity: capacity("5g"),
+            volume_name: "main".into(),
+            owner_uid: 502,
+            owner_gid: 20,
+        }
+    }
+
+    /// The detached-resize root: a blank image is released after formatting only through the
+    /// kernel's own mapping. `hdiutil info` once omitted the still-attached image here, the
+    /// release read that omission as "already released", and the image stayed attached until
+    /// `diskutil image resize` refused it as busy. No step may consult `hdiutil info` at all.
     #[test]
-    fn delayed_blank_attachment_publication_gates_format_on_positive_ownership() {
-        let stem = temp_path("asif-delayed-publication", "stem").with_extension("");
+    fn a_formatted_blank_image_is_released_through_the_kernel_mapping() {
+        let stem = temp_path("asif-kernel-release", "stem").with_extension("");
         let image = stem.with_extension(IMAGE_EXTENSION);
-        fs::write(&image, b"created").unwrap();
         let backend = graced_backend([
-            CommandOutput::success([]),
-            CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY),
-            CommandOutput::success(BLANK_ASIF_PLIST),
-            CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY),
-            CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY),
+            ok([]),
+            no_images(),
+            ok(BLANK_ASIF_PLIST),
             holding(&image, "/dev/disk8"),
-            CommandOutput::failure(70, "format reached"),
+            ok([]),
             holding(&image, "/dev/disk8"),
-            CommandOutput::success([]),
-            CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY),
+            ok([]),
+            no_images(),
+        ]);
+        backend.create_staged_image(&blank_request(stem)).unwrap();
+
+        let steps = backend.runner().steps();
+        assert_eq!(steps.len(), 8);
+        assert_eq!(steps[4].command().program, Path::new(NEWFS_APFS));
+        assert_eq!(steps[5], Seen::Inventory);
+        assert_eq!(argv(steps[6].command()), ["detach", "/dev/disk8"]);
+        assert_eq!(steps[7], Seen::Inventory);
+        assert!(
+            !commands(&steps)
+                .iter()
+                .any(|request| argv(request).first().is_some_and(|arg| arg == "info")),
+            "no attachment decision reads `hdiutil info`"
+        );
+        assert!(backend.sleeper.waits().is_empty());
+    }
+
+    /// An unreadable kernel inventory at the final release is a typed refusal, never a release.
+    #[test]
+    fn an_unreadable_inventory_at_release_is_never_treated_as_released() {
+        let stem = temp_path("asif-unreadable-release", "stem").with_extension("");
+        let image = stem.with_extension(IMAGE_EXTENSION);
+        let backend = graced_backend([
+            ok([]),
+            no_images(),
+            ok(BLANK_ASIF_PLIST),
+            holding(&image, "/dev/disk8"),
+            ok([]),
+            unreadable_inventory(),
         ]);
         let error = backend
-            .create_staged_image(&CreateImageRequest {
-                staged_stem: stem,
-                capacity: capacity("5g"),
-                volume_name: "main".into(),
-                owner_uid: 502,
-                owner_gid: 20,
-            })
+            .create_staged_image(&blank_request(stem))
             .unwrap_err();
-        assert!(matches!(
-            error,
-            ApfsError::CommandFailed {
-                operation: "format ASIF APFS volume",
-                output: CommandOutput {
-                    status: ProcessStatus::Exit(70),
-                    ..
-                },
-                ..
-            }
-        ));
-        assert_eq!(
-            *backend.sleeper.waits(),
-            [Duration::from_millis(10), Duration::from_millis(10)]
-        );
+
+        assert!(matches!(error, ApfsError::KernelInventory(_)), "{error}");
         assert!(
-            !image.exists(),
-            "proven owned format failure permits cleanup"
+            !backend
+                .runner()
+                .requests()
+                .iter()
+                .any(|request| request.args.first().is_some_and(|arg| arg == "detach")),
+            "an unknown mapping authorizes no eject"
         );
     }
 
@@ -3411,9 +3824,9 @@ mod tests {
         let image = stem.with_extension(IMAGE_EXTENSION);
         fs::write(&image, b"created").unwrap();
         let backend = graced_backend([
-            CommandOutput::success([]),
-            CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY),
-            CommandOutput::success(BLANK_ASIF_PLIST),
+            ok([]),
+            no_images(),
+            ok(BLANK_ASIF_PLIST),
             holding(&image, "/dev/disk9"),
         ]);
         let error = backend
@@ -3441,19 +3854,15 @@ mod tests {
         fs::remove_file(image).unwrap();
     }
 
+    /// The image driver registers an attach's media before `diskutil image attach` reports
+    /// them, so a reported device the kernel does not map to the image is a contradiction to
+    /// refuse at once, not lag to wait out.
     #[test]
-    fn unpublished_blank_attachment_exhaustion_preserves_unproven_media() {
-        let stem = temp_path("asif-unpublished-attachment", "stem").with_extension("");
+    fn an_unregistered_blank_attachment_fails_closed_without_waiting_or_mutating() {
+        let stem = temp_path("asif-unregistered-attachment", "stem").with_extension("");
         let image = stem.with_extension(IMAGE_EXTENSION);
         fs::write(&image, b"created").unwrap();
-        let backend = graced_backend([
-            CommandOutput::success([]),
-            CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY),
-            CommandOutput::success(BLANK_ASIF_PLIST),
-            CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY),
-            CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY),
-            CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY),
-        ]);
+        let backend = graced_backend([ok([]), no_images(), ok(BLANK_ASIF_PLIST), no_images()]);
         let error = backend
             .create_staged_image(&CreateImageRequest {
                 staged_stem: stem,
@@ -3465,13 +3874,10 @@ mod tests {
             .unwrap_err();
         assert!(matches!(
             error,
-            ApfsError::InvalidAttachmentInventory(message) if message.contains("not published")
+            ApfsError::InvalidAttachmentInventory(message) if message.contains("not registered")
         ));
         assert_eq!(fs::read(&image).unwrap(), b"created");
-        assert_eq!(
-            *backend.sleeper.waits(),
-            [Duration::from_millis(10), Duration::from_millis(10)]
-        );
+        assert!(backend.sleeper.waits().is_empty());
         assert!(
             !backend.runner().requests().iter().any(|request| {
                 request.program == Path::new(NEWFS_APFS)
@@ -3488,14 +3894,14 @@ mod tests {
         let image = stem.with_extension(IMAGE_EXTENSION);
         fs::write(&image, b"partial").unwrap();
         let backend = MacOsApfsBackend::new(RecordingRunner::with_outputs([
-            CommandOutput::success([]),
-            CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY),
-            CommandOutput::success(BLANK_ASIF_PLIST),
+            ok([]),
+            no_images(),
+            ok(BLANK_ASIF_PLIST),
             holding(&image, "/dev/disk8"),
-            CommandOutput::failure(70, "format failed"),
+            failed(70, "format failed"),
             holding(&image, "/dev/disk8"),
-            CommandOutput::success([]),
-            CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY),
+            ok([]),
+            no_images(),
         ]));
         let error = backend
             .create_staged_image(&CreateImageRequest {
@@ -3519,12 +3925,12 @@ mod tests {
             }
         ));
         assert!(!image.exists());
-        let requests = backend.runner().requests();
-        assert_eq!(requests.len(), 8);
-        assert_eq!(requests[4].program, Path::new(NEWFS_APFS));
-        assert_eq!(argv(&requests[5]), ["info", "-plist"]);
-        assert_eq!(argv(&requests[6]), ["detach", "/dev/disk8"]);
-        assert_eq!(requests[7].program, Path::new(HDIUTIL));
+        let steps = backend.runner().steps();
+        assert_eq!(steps.len(), 8);
+        assert_eq!(steps[4].command().program, Path::new(NEWFS_APFS));
+        assert_eq!(steps[5], Seen::Inventory);
+        assert_eq!(argv(steps[6].command()), ["detach", "/dev/disk8"]);
+        assert_eq!(steps[7], Seen::Inventory);
     }
 
     #[test]
@@ -3533,13 +3939,13 @@ mod tests {
         let image = stem.with_extension(IMAGE_EXTENSION);
         fs::write(&image, b"partial").unwrap();
         let backend = MacOsApfsBackend::new(RecordingRunner::with_outputs([
-            CommandOutput::success([]),
-            CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY),
-            CommandOutput::success(BLANK_ASIF_PLIST),
+            ok([]),
+            no_images(),
+            ok(BLANK_ASIF_PLIST),
             holding(&image, "/dev/disk8"),
-            CommandOutput::failure(70, "format failed"),
+            failed(70, "format failed"),
             holding(&image, "/dev/disk8"),
-            CommandOutput::failure(16, "busy"),
+            failed(16, "busy"),
         ]));
         let error = backend
             .create_staged_image(&CreateImageRequest {
@@ -3586,14 +3992,14 @@ mod tests {
         let image = stem.with_extension(IMAGE_EXTENSION);
         fs::create_dir(&image).unwrap();
         let backend = MacOsApfsBackend::new(RecordingRunner::with_outputs([
-            CommandOutput::success([]),
-            CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY),
-            CommandOutput::success(BLANK_ASIF_PLIST),
+            ok([]),
+            no_images(),
+            ok(BLANK_ASIF_PLIST),
             holding(&image, "/dev/disk8"),
-            CommandOutput::failure(70, "format failed"),
+            failed(70, "format failed"),
             holding(&image, "/dev/disk8"),
-            CommandOutput::success([]),
-            CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY),
+            ok([]),
+            no_images(),
         ]));
         let error = backend
             .create_staged_image(&CreateImageRequest {
@@ -3634,13 +4040,13 @@ mod tests {
         let image = stem.with_extension(IMAGE_EXTENSION);
         fs::write(&image, b"formatted").unwrap();
         let backend = MacOsApfsBackend::new(RecordingRunner::with_outputs([
-            CommandOutput::success([]),
-            CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY),
-            CommandOutput::success(BLANK_ASIF_PLIST),
+            ok([]),
+            no_images(),
+            ok(BLANK_ASIF_PLIST),
             holding(&image, "/dev/disk8"),
-            CommandOutput::success([]),
+            ok([]),
             holding(&image, "/dev/disk8"),
-            CommandOutput::failure(16, "busy"),
+            failed(16, "busy"),
         ]));
         let error = backend
             .create_staged_image(&CreateImageRequest {
@@ -3741,28 +4147,26 @@ mod tests {
     #[test]
     fn detach_leaves_a_recorded_device_that_now_belongs_to_another_image() {
         let attachment = identity_attachment("reused-device");
-        let reused = attachment_inventory(&[("/tmp/someone-else.asif", &["/dev/disk12"][..])]);
-        let backend = graced_backend([CommandOutput::success(reused.as_bytes())]);
+        let backend = graced_backend([images(&[("/tmp/someone-else.asif", &["/dev/disk12"][..])])]);
 
         backend.detach(&attachment, DetachIntent::Release).unwrap();
 
-        let requests = backend.runner().requests();
+        let steps = backend.runner().steps();
         assert_eq!(
-            requests.len(),
-            1,
-            "no detach of another image's device: {requests:?}"
+            steps,
+            [Seen::Inventory],
+            "no detach of another image's device: {steps:?}"
         );
-        assert_eq!(argv(&requests[0]), ["info", "-plist"]);
     }
 
     #[test]
     fn detach_of_an_image_no_longer_attached_issues_no_detach() {
         let attachment = identity_attachment("already-gone");
-        let backend = graced_backend([CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY)]);
+        let backend = graced_backend([no_images()]);
 
         backend.detach(&attachment, DetachIntent::Release).unwrap();
 
-        assert_eq!(backend.runner().requests().len(), 1);
+        assert_eq!(backend.runner().steps(), [Seen::Inventory]);
     }
 
     /// Detach-settle: a device already gone from the inventory costs one read and no waiting.
@@ -3771,13 +4175,13 @@ mod tests {
         let attachment = identity_attachment("settle-gone");
         let backend = graced_backend([
             holding(&attachment.image, &attachment.whole_device),
-            CommandOutput::success([]),
-            CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY),
+            ok([]),
+            no_images(),
         ]);
         backend.detach(&attachment, DetachIntent::Release).unwrap();
-        let requests = backend.runner().requests();
-        assert_eq!(requests.len(), 3);
-        assert_eq!(argv(&requests[2]), ["info", "-plist"]);
+        let steps = backend.runner().steps();
+        assert_eq!(steps.len(), 3);
+        assert_eq!(steps[2], Seen::Inventory);
         assert!(
             backend.sleeper.waits().is_empty(),
             "no blind sleeps: departed on the first poll"
@@ -3787,18 +4191,16 @@ mod tests {
     /// Detach-settle: a lingering device is polled until it departs, then the detach succeeds.
     #[test]
     fn detach_settle_polls_until_departure_then_returns() {
-        let lingering =
-            attachment_inventory(&[("/tmp/cowshed-lingering.asif", &["/dev/disk12"][..])]);
+        let lingering = || images(&[("/tmp/cowshed-lingering.asif", &["/dev/disk12"][..])]);
         let attachment = identity_attachment("settle-polls");
         let backend = graced_backend([
             holding(&attachment.image, &attachment.whole_device),
-            CommandOutput::success([]),
-            CommandOutput::success(lingering.as_bytes()),
-            CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY),
+            ok([]),
+            lingering(),
+            no_images(),
         ]);
         backend.detach(&attachment, DetachIntent::Release).unwrap();
-        let requests = backend.runner().requests();
-        assert_eq!(requests.len(), 4);
+        assert_eq!(backend.runner().steps().len(), 4);
         assert_eq!(
             *backend.sleeper.waits(),
             [Duration::from_millis(10)],
@@ -3811,18 +4213,17 @@ mod tests {
     /// slowness under load into user-facing failures; the loud log is the measurement.
     #[test]
     fn detach_settle_proceeds_loudly_at_bound_while_device_lingers() {
-        let lingering =
-            attachment_inventory(&[("/tmp/cowshed-lingering.asif", &["/dev/disk12"][..])]);
+        let lingering = || images(&[("/tmp/cowshed-lingering.asif", &["/dev/disk12"][..])]);
         let attachment = identity_attachment("settle-bound");
         let backend = graced_backend([
             holding(&attachment.image, &attachment.whole_device),
-            CommandOutput::success([]),
-            CommandOutput::success(lingering.as_bytes()),
-            CommandOutput::success(lingering.as_bytes()),
-            CommandOutput::success(lingering.as_bytes()),
+            ok([]),
+            lingering(),
+            lingering(),
+            lingering(),
         ]);
         backend.detach(&attachment, DetachIntent::Release).unwrap();
-        assert_eq!(backend.runner().requests().len(), 5);
+        assert_eq!(backend.runner().steps().len(), 5);
         assert_eq!(
             *backend.sleeper.waits(),
             [Duration::from_millis(10), Duration::from_millis(10)],
@@ -3831,28 +4232,16 @@ mod tests {
     }
 
     #[test]
-    fn parse_inventory_devices_collects_whole_devices_across_images() {
-        let bytes = attachment_inventory(&[
+    fn inventory_devices_collects_whole_devices_across_images() {
+        let devices = inventory_devices(&attached_images(&[
             ("/tmp/a.asif", &["/dev/disk4"][..]),
             ("/tmp/b.asif", &["disk5s1", "/dev/disk5"][..]),
-        ]);
-        let devices = parse_inventory_devices(bytes.as_bytes()).unwrap();
+            // A node that is not a kernel device name names nothing to wait on.
+            ("/tmp/c.asif", &["not-a-device"][..]),
+        ]));
         assert_eq!(
             devices,
             BTreeSet::from(["/dev/disk4".to_owned(), "/dev/disk5".to_owned()])
-        );
-        assert!(parse_inventory_devices(b"not a plist").is_err());
-        assert!(parse_inventory_devices(
-            br#"<?xml version="1.0"?><plist><dict><key>images</key><string>nope</string></dict></plist>"#
-        )
-        .is_err());
-        // Entries without system-entities are skipped, not fatal: shape drift in one image
-        // must not blind the departure check for every other device.
-        let drifted = r#"<?xml version="1.0"?><plist><dict><key>images</key><array><dict><key>image-path</key><string>/tmp/c.asif</string></dict></array></dict></plist>"#;
-        assert!(
-            parse_inventory_devices(drifted.as_bytes())
-                .unwrap()
-                .is_empty()
         );
     }
 
@@ -3860,7 +4249,7 @@ mod tests {
     /// exactly once at the end of it.
     #[test]
     fn a_released_detach_spends_its_grace_before_forcing_once() {
-        let backend = graced_backend([dissent(), dissent(), dissent(), CommandOutput::success([])]);
+        let backend = graced_backend([dissent(), dissent(), dissent(), ok([])]);
 
         backend
             .detach_device_checked("/dev/disk4", DetachIntent::Release)
@@ -3915,7 +4304,7 @@ mod tests {
             (libc::EBUSY, "permission denied"),
             (1, "Resource busy"),
         ] {
-            let backend = graced_backend([CommandOutput::failure(status, message)]);
+            let backend = graced_backend([failed(status, message)]);
             let error = backend
                 .detach_device_checked("/dev/disk4", DetachIntent::Release)
                 .unwrap_err();
@@ -3931,8 +4320,7 @@ mod tests {
 
     #[test]
     fn rename_volume_records_checked_diskutil_rename_volume_command() {
-        let backend =
-            MacOsApfsBackend::new(RecordingRunner::with_outputs([CommandOutput::success([])]));
+        let backend = MacOsApfsBackend::new(RecordingRunner::with_outputs([ok([])]));
 
         backend
             .rename_volume(
@@ -3957,8 +4345,7 @@ mod tests {
     #[test]
     fn rename_volume_accepts_a_255_byte_path_safe_name() {
         let name = "a".repeat(255);
-        let backend =
-            MacOsApfsBackend::new(RecordingRunner::with_outputs([CommandOutput::success([])]));
+        let backend = MacOsApfsBackend::new(RecordingRunner::with_outputs([ok([])]));
 
         backend
             .rename_volume(Path::new("/Volumes/cowshed-stage"), &name)
@@ -4026,10 +4413,7 @@ mod tests {
     #[test]
     fn rename_volume_propagates_checked_diskutil_failure() {
         let backend =
-            MacOsApfsBackend::new(RecordingRunner::with_outputs([CommandOutput::failure(
-                7,
-                "rename failed",
-            )]));
+            MacOsApfsBackend::new(RecordingRunner::with_outputs([failed(7, "rename failed")]));
 
         let error = backend
             .rename_volume(Path::new("/Volumes/cowshed-stage"), "main")
@@ -4131,7 +4515,7 @@ mod tests {
 
     #[test]
     fn attachment_inventory_selects_only_exact_image_path_whole_devices() {
-        let plist = attachment_inventory(&[
+        let images = attached_images(&[
             (
                 "/tmp/cowshed-target.asif",
                 &["disk4", "/dev/disk4s1", "/dev/disk5"][..],
@@ -4139,28 +4523,43 @@ mod tests {
             ("/tmp/cowshed-unrelated.asif", &["/dev/disk20"][..]),
         ]);
 
-        let parsed =
-            parse_hdiutil_images(Path::new("/tmp/cowshed-target.asif"), plist.as_bytes()).unwrap();
+        let parsed = image_inventory(Path::new("/tmp/cowshed-target.asif"), &images).unwrap();
         assert_eq!(
             parsed.devices,
             BTreeSet::from(["/dev/disk4".into(), "/dev/disk5".into()])
         );
         assert!(parsed.matched);
         assert_eq!(parsed.capacity, None);
-        assert!(
-            parse_hdiutil_images(Path::new("/tmp/cowshed-absent.asif"), plist.as_bytes())
-                .unwrap()
-                .devices
-                .is_empty()
-        );
+        let absent = image_inventory(Path::new("/tmp/cowshed-absent.asif"), &images).unwrap();
+        assert!(!absent.matched);
+        assert!(absent.devices.is_empty());
     }
 
+    /// One attached ASIF image as the I/O Registry records it, with the device numbers and
+    /// partition-type GUID contents of a live macOS 26.6 capture: the image's own store, then the
+    /// synthesized container and its volume.
+    fn live_capture() -> AttachedDiskImage {
+        AttachedDiskImage::file(
+            "/tmp/cowshed-target.asif",
+            Some(ImageCapacity::from_bytes(125_000 * 512)),
+            [
+                ("/dev/disk14", ""),
+                ("/dev/disk15", APFS_CONTAINER_CONTENT),
+                ("/dev/disk15s1", APFS_VOLUME_CONTENT),
+            ],
+        )
+    }
+
+    /// The mounted-restart root: a restarted controller finds its mounted image's attachment in
+    /// the kernel inventory with one read and never attaches again. Its capacity probe and its
+    /// identity read project the same record, so they cannot disagree about whether the image
+    /// is attached — the disagreement `hdiutil info`'s truncated snapshots produced.
     #[test]
-    fn existing_attachment_reuses_one_inventory_mapping_without_attaching_again() {
-        let backend =
-            MacOsApfsBackend::new(RecordingRunner::with_outputs([CommandOutput::success(
-                INFO_INVENTORY_PLIST,
-            )]));
+    fn existing_attachment_and_capacity_project_one_kernel_record() {
+        let backend = MacOsApfsBackend::new(RecordingRunner::with_outputs([
+            Reply::Inventory(Ok(vec![live_capture()])),
+            Reply::Inventory(Ok(vec![live_capture()])),
+        ]));
 
         let attachment = backend
             .existing_attachment(Path::new("/tmp/cowshed-target.asif"))
@@ -4168,44 +4567,106 @@ mod tests {
             .expect("existing attachment");
         assert_eq!(attachment.whole_device(), "/dev/disk15");
         assert_eq!(attachment.volume_device(), "/dev/disk15s1");
-        let requests = backend.runner().requests();
         assert_eq!(
-            requests.len(),
-            1,
-            "the inventory names the volume; nothing else is asked"
+            backend
+                .attached_capacity(Path::new("/tmp/cowshed-target.asif"))
+                .unwrap(),
+            ImageCapacity::from_bytes(125_000 * 512)
         );
-        assert_eq!(argv(&requests[0]), ["info", "-plist"]);
+        assert_eq!(
+            backend.runner().steps(),
+            [Seen::Inventory, Seen::Inventory],
+            "the kernel inventory names the volume; nothing is attached or spawned"
+        );
+    }
+
+    /// Kernel absence is authoritative: no record for the image is no attachment and no
+    /// capacity, never an error to retry or a cache to consult.
+    #[test]
+    fn kernel_absence_is_no_attachment() {
+        let backend =
+            MacOsApfsBackend::new(RecordingRunner::with_outputs([no_images(), no_images()]));
         assert!(
-            requests
-                .iter()
-                .all(|request| !argv(request).iter().any(|arg| *arg == "attach")),
-            "resume inventory must not create a duplicate attachment"
+            backend
+                .existing_attachment(Path::new("/tmp/cowshed-target.asif"))
+                .unwrap()
+                .is_none()
         );
+        assert!(matches!(
+            backend.attached_capacity(Path::new("/tmp/cowshed-target.asif")),
+            Err(ApfsError::ImageNotAttached(path)) if path == Path::new("/tmp/cowshed-target.asif")
+        ));
+    }
+
+    /// Foreign, ambiguous, malformed and unreadable inventories fail closed.
+    #[test]
+    fn foreign_ambiguous_and_unreadable_inventories_fail_closed() {
+        let image = Path::new("/tmp/cowshed-target.asif");
+        let foreign = [
+            AttachedDiskImage {
+                source: DiskImageSource::Url("ram://2048".into()),
+                capacity: None,
+                media: live_capture().media,
+            },
+            AttachedDiskImage::file("/tmp/cowshed-other.asif", None, [("/dev/disk20", "")]),
+        ];
+        assert!(
+            existing_image_attachment(image, &foreign)
+                .unwrap()
+                .is_none()
+        );
+
+        let ambiguous = [live_capture(), live_capture()];
+        assert!(matches!(
+            existing_image_attachment(image, &ambiguous),
+            Err(ApfsError::InvalidAttachmentInventory(message))
+                if message == "matching image has multiple inventory entries"
+        ));
+
+        let volumeless = [AttachedDiskImage::file(
+            image,
+            None,
+            [("/dev/disk14", ""), ("/dev/disk15", APFS_CONTAINER_CONTENT)],
+        )];
+        assert!(matches!(
+            existing_image_attachment(image, &volumeless),
+            Err(ApfsError::InvalidAttachmentInventory(_))
+        ));
+
+        let backend =
+            MacOsApfsBackend::new(RecordingRunner::with_outputs([unreadable_inventory()]));
+        assert!(matches!(
+            backend.existing_attachment(image),
+            Err(ApfsError::KernelInventory(_))
+        ));
+    }
+
+    #[test]
+    fn disk_image_sources_decode_only_local_file_urls_to_paths() {
+        assert_eq!(
+            DiskImageSource::from_url("file:///private/tmp/a%20b.asif"),
+            DiskImageSource::File(PathBuf::from("/private/tmp/a b.asif"))
+        );
+        for url in ["ram://2048", "file://host/share/x.asif", "not a url"] {
+            assert_eq!(
+                DiskImageSource::from_url(url),
+                DiskImageSource::Url(url.into())
+            );
+        }
     }
 
     #[test]
     fn inventory_attachment_entities_select_apfs_guid_hints() {
-        let value =
-            plist::Value::from_reader(std::io::Cursor::new(INFO_INVENTORY_PLIST.as_bytes()))
-                .unwrap();
-        let entities = value
-            .as_dictionary()
-            .unwrap()
-            .get("images")
-            .and_then(plist::Value::as_array)
-            .unwrap()[0]
-            .as_dictionary()
-            .unwrap()
-            .get("system-entities")
-            .and_then(plist::Value::as_array)
-            .unwrap()
-            .as_slice();
-        let (whole, volume) =
-            attached_apfs_volume(&collect_attachment_entities(entities).unwrap()).unwrap();
+        let Some(RecoveredImageAttachment::Apfs(attachment)) =
+            existing_image_attachment(Path::new("/tmp/cowshed-target.asif"), &[live_capture()])
+                .unwrap()
+        else {
+            panic!("the live capture is a formatted APFS attachment");
+        };
         // The synthesized APFS volume, not the image's own device or the synthesized store, and
         // the whole disk that volume hangs from.
-        assert_eq!(volume, "/dev/disk15s1");
-        assert_eq!(whole, "/dev/disk15");
+        assert_eq!(attachment.volume_device(), "/dev/disk15s1");
+        assert_eq!(attachment.whole_device(), "/dev/disk15");
     }
 
     /// An attach that does not report exactly one APFS volume inside a container it also reports
@@ -4269,35 +4730,52 @@ mod tests {
 
     #[test]
     fn attachment_inventory_rejects_malformed_matching_records() {
+        let image = Path::new("/tmp/cowshed-target.asif");
         let malformed = [
-            b"not a plist".as_slice(),
-            br#"<?xml version="1.0"?><plist><dict/></plist>"#,
-            br#"<?xml version="1.0"?><plist><dict><key>images</key><array><string>bad</string></array></dict></plist>"#,
-            br#"<?xml version="1.0"?><plist><dict><key>images</key><array><dict><key>image-path</key><string>/tmp/cowshed-target.asif</string></dict></array></dict></plist>"#,
-            br#"<?xml version="1.0"?><plist><dict><key>images</key><array><dict><key>image-path</key><string>/tmp/cowshed-target.asif</string><key>system-entities</key><array><dict><key>dev-entry</key><string>not-a-device</string></dict></array></dict></array></dict></plist>"#,
+            vec![AttachedDiskImage::file(
+                image,
+                None,
+                Vec::<(&str, &str)>::new(),
+            )],
+            vec![AttachedDiskImage::file(image, None, [("not-a-device", "")])],
+            vec![AttachedDiskImage::file(
+                image,
+                None,
+                [("/dev/disk4s1", APFS_VOLUME_CONTENT)],
+            )],
+            vec![
+                AttachedDiskImage::file(
+                    image,
+                    Some(ImageCapacity::from_bytes(512)),
+                    [("/dev/disk4", "")],
+                ),
+                AttachedDiskImage::file(
+                    image,
+                    Some(ImageCapacity::from_bytes(1024)),
+                    [("/dev/disk6", "")],
+                ),
+            ],
         ];
-        for plist in malformed {
-            assert!(matches!(
-                parse_hdiutil_images(Path::new("/tmp/cowshed-target.asif"), plist),
-                Err(ApfsError::InvalidAttachmentInventory(_))
-            ));
+        for images in malformed {
+            assert!(
+                matches!(
+                    image_inventory(image, &images),
+                    Err(ApfsError::InvalidAttachmentInventory(_))
+                ),
+                "{images:?}"
+            );
         }
     }
 
     #[test]
-    fn attachment_inventory_parse_returns_devices_and_capacity() {
-        let plist = r#"<?xml version="1.0"?><plist><dict><key>images</key><array>
-          <dict>
-            <key>image-path</key><string>/tmp/cowshed-target.asif</string>
-            <key>blockcount</key><integer>419430400</integer>
-            <key>blocksize</key><integer>512</integer>
-            <key>system-entities</key><array>
-              <dict><key>dev-entry</key><string>/dev/disk4</string></dict>
-            </array>
-          </dict>
-        </array></dict></plist>"#;
-        let parsed =
-            parse_hdiutil_images(Path::new("/tmp/cowshed-target.asif"), plist.as_bytes()).unwrap();
+    fn attachment_inventory_returns_devices_and_capacity() {
+        let image = Path::new("/tmp/cowshed-target.asif");
+        let images = [AttachedDiskImage::file(
+            image,
+            Some(ImageCapacity::from_bytes(419_430_400_u64 * 512)),
+            [("/dev/disk4", "")],
+        )];
+        let parsed = image_inventory(image, &images).unwrap();
         assert_eq!(parsed.devices, BTreeSet::from(["/dev/disk4".into()]));
         assert_eq!(
             parsed.capacity,
@@ -4305,10 +4783,14 @@ mod tests {
         );
         assert!(parsed.matched);
         assert_eq!(
-            parse_attachment_capacity(Path::new("/tmp/cowshed-target.asif"), plist.as_bytes())
-                .unwrap(),
+            attachment_capacity(image, &images).unwrap(),
             parsed.capacity.unwrap()
         );
+        let sizeless = [AttachedDiskImage::file(image, None, [("/dev/disk4", "")])];
+        assert!(matches!(
+            attachment_capacity(image, &sizeless),
+            Err(ApfsError::InvalidAttachmentInventory(_))
+        ));
     }
 
     const ASIF_RESIZE_LIMITS_PLIST: &str = r#"<?xml version="1.0"?><plist version="1.0"><dict>
@@ -4321,8 +4803,8 @@ mod tests {
     fn asif_resize_uses_the_diskutil_image_verbs_for_both_limits_and_growth() {
         let image = Path::new("/tmp/cowshed-resize/main.asif");
         let backend = MacOsApfsBackend::new(RecordingRunner::with_outputs([
-            CommandOutput::success(ASIF_RESIZE_LIMITS_PLIST),
-            CommandOutput::success([]),
+            ok(ASIF_RESIZE_LIMITS_PLIST),
+            ok([]),
         ]));
 
         assert_eq!(backend.image_capacity(image).unwrap(), capacity("100g"));
@@ -4379,11 +4861,11 @@ mod tests {
             "Error: -69519: The target disk is too small for this operation",
         ] {
             let backend = MacOsApfsBackend::new(RecordingRunner::with_outputs([
-                CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY),
-                CommandOutput::success(ATTACH_PLIST),
+                no_images(),
+                ok(ATTACH_PLIST),
                 holding_verified_volume("/tmp/cowshed-resize/main.asif"),
-                CommandOutput::success([]),
-                CommandOutput::failure(1, refusal),
+                ok([]),
+                failed(1, refusal),
             ]));
             let attachment = backend
                 .attach_verified(Path::new("/tmp/cowshed-resize/main.asif"))
@@ -4395,11 +4877,11 @@ mod tests {
     #[test]
     fn a_container_growth_failure_that_is_not_an_already_full_refusal_propagates() {
         let backend = MacOsApfsBackend::new(RecordingRunner::with_outputs([
-            CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY),
-            CommandOutput::success(ATTACH_PLIST),
+            no_images(),
+            ok(ATTACH_PLIST),
             holding_verified_volume("/tmp/cowshed-resize/main.asif"),
-            CommandOutput::success([]),
-            CommandOutput::failure(1, "Error: -69620: The given file system is not supported"),
+            ok([]),
+            failed(1, "Error: -69620: The given file system is not supported"),
         ]));
         let attachment = backend
             .attach_verified(Path::new("/tmp/cowshed-resize/main.asif"))

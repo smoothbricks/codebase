@@ -3444,7 +3444,7 @@ fn read_marker_no_follow(root: &Path) -> Result<Option<Vec<u8>>, HostError> {
 }
 
 #[cfg(test)]
-use crate::apfs::{DetachIntent, SystemCommandRunner};
+use crate::apfs::{CommandRunner, DetachIntent, DiskImageSource, SystemCommandRunner};
 #[cfg(test)]
 use crate::storage::apfs::ApfsSubstrateConfig;
 #[cfg(test)]
