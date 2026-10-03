@@ -312,14 +312,22 @@
         "cache": false,
         "dependsOn": [
           {
-            "target": "cargo-test-compile",
+            "target": "cargo-test-archive",
             "projects": [
               "@smoothbricks/codebase"
             ]
           }
         ],
+        "inputs": [
+          "default",
+          "{workspaceRoot}/packages/nx-plugin/nextest.toml",
+          {
+            "dependentTasksOutputFiles": "**/archive.tar.zst",
+            "transitive": false
+          }
+        ],
         "options": {
-          "comment": "Run from an unsandboxed host-controller shell, never cowshed exec: controller fixtures require file-link, deliberately denied to every workspace supervisor and child. This mandatory target runs only ignored host_controller_ tests across core and CLI, without relaxing that boundary or mutating installed host services.",
+          "comment": "Run from an unsandboxed host-controller shell, never cowshed exec: controller fixtures require file-link, deliberately denied to every workspace supervisor and child. Runs ignored host_controller_ tests from the owning workspace's prebuilt nextest archive, whose output bytes are hashed inputs. Compilation is cached and paid by cargo-test-archive before this run; the private runtime TMPDIR cannot change the compiled environment, so the 120s guard covers only extraction and tests.",
           "command": "bun packages/cowshed/scripts/host-controller-test.ts",
           "cwd": ".",
           "timeoutMs": 120000,

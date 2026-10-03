@@ -85,15 +85,18 @@ No mounts, no root, no network — pure functions with table-driven cases:
 ## Host-controller authority
 
 Run `nx run cowshed:host-controller-test` from the owned checkout in an unsandboxed host-controller shell. This single
-uncached target selects `test(/host_controller_/)` across `cowshed-core` and `cowshed-cli` with `--run-ignored only`,
-without a second list of fixture names. Controller-owned filesystem and kernel-profile fixtures carry that prefix and an
-explicit ignore reason naming this target. Ordinary sandboxed nextest runs report them ignored: an enclosing
-executed-child profile cannot grant an inner supervisor independent authority. Pure policy tests and pre-spawn refusal
-tests remain in the ordinary lane. The host runner probes actual hard-link authority before running and refuses with the
-same actionable command if an enclosing sandbox denies it; neither a write grant nor a nested profile can undo that
-denial. It pins `TMPDIR` to a unique disposable directory under the exact owned checkout's `.cowshed/tmp` and removes it
-afterward. Fixtures use only disposable local data: no launchd calls, installed host-service changes, or checkout source
-mutation.
+uncached target selects `test(/host_controller_/)` across `cowshed-core`, `cowshed-cli`, and `cowshed-shell` with
+`--run-ignored only`, without a second list of fixture names. Its owning `cargo-test-archive` dependency compiles once
+before the run, and the target hashes the archive output bytes. The host runner consumes that prebuilt archive with
+`--archive-file` and remaps its workspace to the exact owned checkout; it never recompiles under the test guard or lets
+its private runtime `TMPDIR` change compiled artifacts. An empty selection fails. Controller-owned filesystem and
+kernel-profile fixtures carry that prefix and an explicit ignore reason naming this target. Ordinary sandboxed nextest
+runs report them ignored: an enclosing executed-child profile cannot grant an inner supervisor independent authority.
+Pure policy tests and pre-spawn refusal tests remain in the ordinary lane. The host runner probes actual hard-link
+authority before running and refuses with the same actionable command if an enclosing sandbox denies it; neither a write
+grant nor a nested profile can undo that denial. It pins `TMPDIR` to a unique disposable directory under the exact owned
+checkout's `.cowshed/tmp` and removes it afterward. Fixtures use only disposable local data: no launchd calls, installed
+host-service changes, or checkout source mutation.
 
 Git discovery fixtures exercise the restricted discovery profile, including denied includes, alternate object stores,
 and worktree metadata grants. The probe executes Git through the system-selected developer directory, not the
