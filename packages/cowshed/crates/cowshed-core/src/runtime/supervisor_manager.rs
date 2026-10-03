@@ -905,7 +905,9 @@ mod tests {
         ));
         std::fs::create_dir_all(store.join("run")).expect("run directory");
         let socket = manager_socket_path(&store);
-        let listener = UnixListener::bind(&socket).expect("bind the manager");
+        let listener = supervisor_socket::bind(&socket)
+            .await
+            .expect("bind the manager");
         let served = tokio::spawn(serve(
             listener,
             SupervisorManager::new(&store, Box::new(NoSpawner)),
