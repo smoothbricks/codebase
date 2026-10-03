@@ -1105,7 +1105,7 @@ fn check_capability_probe(source: impl Fn(&str) -> &'static str) -> std::process
 /// cowshed-core's whole dependency tree as the probe resolves it. On a cold CI runner that check
 /// takes longer than the bounded window of the test below (measured over 100s on a hosted arm64
 /// macOS runner, where it timed the release candidate out), and none of it is under test. So
-/// `cowshed:capability-probe-warmup` runs this ahead of `cargo-test-cowshed-core-exceptions`, in
+/// `cowshed:capability-probe-warmup` runs this ahead of the cowshed-core exceptional shards, in
 /// a build budget, and the test's window covers the six case crates alone. Ignored, because it
 /// proves nothing a test should: every crate is empty and must check.
 #[test]

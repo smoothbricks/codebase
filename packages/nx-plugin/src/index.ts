@@ -2280,6 +2280,7 @@ interface CargoTargetRef {
 
 interface CargoTestPiece {
   extra: string;
+  parallelism: boolean;
   selector: string;
   targetName: string;
 }
@@ -2351,17 +2352,20 @@ async function resolveCargoWorkspaces(
         const targetName = cargoTestPackageTargetName(pkg.name, sharded ? `shard${index}` : undefined);
         pieces.push({
           extra: sharded ? ` --partition hash:${index}/${pkg.testShards}` : '',
+          parallelism: true,
           selector: shardable,
           targetName,
         });
       }
       if (pin !== null) {
-        const targetName = cargoTestPackageTargetName(pkg.name, CARGO_TEST_EXCEPTIONS_SUFFIX);
-        pieces.push({
-          extra: '',
-          selector: `package(${pkg.name}) and (${pin})`,
-          targetName,
-        });
+        for (let index = 1; index <= pkg.testShards; index += 1) {
+          pieces.push({
+            extra: ` --partition hash:${index}/${pkg.testShards}`,
+            parallelism: false,
+            selector: `package(${pkg.name}) and (${pin})`,
+            targetName: cargoTestPackageTargetName(pkg.name, `${CARGO_TEST_EXCEPTIONS_SUFFIX}-shard${index}`),
+          });
+        }
       }
       packages.push({ package: pkg, pieces });
     }
@@ -2390,7 +2394,8 @@ async function resolveCargoWorkspaces(
 
 /**
  * One bounded target per crate; a crate that declares `smoothbricks.test.shards`
- * gets one per shard plus one for the tests nextest.toml singles out.
+ * gets that many ordinary and exceptional shards. Exceptional shards run alone
+ * so nextest's per-process group limits also hold across Nx tasks.
  *
  * Every piece EXECUTES, it never builds: it runs the binaries
  * `cargo-test-archive` compiled once for the whole workspace. That is what
@@ -2509,6 +2514,7 @@ async function addCargoTestTargets(
       targets[piece.targetName] = {
         executor: '@smoothbricks/nx-plugin:bounded-exec',
         cache: true,
+        parallelism: piece.parallelism,
         inputs,
         dependsOn: [archive],
         options: {

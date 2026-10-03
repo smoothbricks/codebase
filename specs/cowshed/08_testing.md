@@ -107,10 +107,11 @@ No outer sandbox installation or permission change is required for this target: 
 Updating the checkout's sandbox source cannot change an already-running outer supervisor; separately testing a changed
 runtime policy requires the controller to install the intended release and start a fresh supervisor. Never broaden
 `file-link` to make this proof run. The ordinary CLI/core shards run inside the workspace sandbox. After
-`nx run @smoothbricks/codebase:cargo-lint`, run the complete `nx run cowshed:cargo-test-cowshed-core-exceptions` chain
-from an unsandboxed host-controller shell: its exception lane also exercises real APFS image attachment through
-DiskManagement. Run the explicit `host-controller-test` target separately. Both are mandatory proofs; an ignored
-controller fixture in the ordinary chain is never evidence that its behavior passed.
+`nx run @smoothbricks/codebase:cargo-lint`, run all five `cargo-test-cowshed-core-exceptions-shard1..5` targets through
+`nx run-many -p cowshed -t cargo-test-cowshed-core-exceptions-shard1 cargo-test-cowshed-core-exceptions-shard2 cargo-test-cowshed-core-exceptions-shard3 cargo-test-cowshed-core-exceptions-shard4 cargo-test-cowshed-core-exceptions-shard5`
+from an unsandboxed host-controller shell: those lanes also exercise real APFS image attachment through DiskManagement.
+Run the explicit `host-controller-test` target separately. Both are mandatory proofs; an ignored controller fixture in
+the ordinary chain is never evidence that its behavior passed.
 
 The ordinary core lane also covers port allocation's publication handoff. A deterministic regression snapshots native
 inventory, lets another allocator reserve a block, publishes its workspace metadata, and releases its reservation before
@@ -165,6 +166,16 @@ loopback/file vdev (`cowshed.itest.<pid>`) with datasets destroyed and the pool 
 exercises `cowshed-helper` and the Landlock/netns exec path. A suite-level guard reaps leaked `cowshed.itest.*`
 volumes/pools. The same flow table runs on both; substrate-specific assertions (fsck step on APFS, origin-snapshot GC on
 ZFS) are tagged.
+
+The `real-apfs` group serializes these tests only inside one nextest run. Disk Arbitration and DiskImages are shared by
+the whole host, so `cargo-test-cowshed-cli` and the five inferred `cargo-test-cowshed-core-exceptions-shard1..5` targets
+declare `parallelism: false`. On a hosted arm64 macOS runner the CLI lane overlapped other cargo lanes. Checked land
+then timed out at 30s while still inside adopt, because its two production `hdiutil detach` calls took 6.4s and 9.1s.
+The core exceptions lane, which ran with no other task running, completed whole create/attach/format/detach tests in
+3.3–5.4s, but its 23 serialized tests did not fit one 120s window: 17 took 117.5s and six were still waiting.
+Exceptional tests are therefore partitioned by the crate's declared shard count, with exclusive Nx scheduling keeping
+the process-local group limit effective across those partitions. Test selection, per-test deadlines and the 120s target
+bound are unchanged.
 
 Staging GC derives backing-image and mountpoint paths in one preallocated buffer each. Both orphan branches borrow the
 parsed workspace for the deletion record rather than allocating a second name; mount GC also retains its parsed stem.

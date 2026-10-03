@@ -1123,14 +1123,15 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       expect(String(root['cargo-lint']?.options?.commands?.[1])).toContain('clippy --workspace');
       expect(root['cargo-lint']?.options?.cwd).toBe(root['cargo-test-compile']?.options?.cwd);
       expect(root['cargo-lint']?.dependsOn).toContain('cargo-fetch');
-      expect(root['cargo-test']?.dependsOn).toHaveLength(5);
+      expect(root['cargo-test']?.dependsOn).toHaveLength(6);
 
       // Root mode: every piece of every project hangs off the one root archive,
       // in any order. The crate is selected by filterset alone — `-p` would
       // re-resolve features, and there is nothing left to build anyway.
       expect(runtime['cargo-test-runtime-core-shard1']?.dependsOn).toEqual([rootFetch, rootArchive]);
       expect(runtime['cargo-test-runtime-core-shard2']?.dependsOn).toEqual([rootFetch, rootArchive]);
-      expect(runtime['cargo-test-runtime-core-exceptions']?.dependsOn).toEqual([rootFetch, rootArchive]);
+      expect(runtime['cargo-test-runtime-core-exceptions-shard1']?.dependsOn).toEqual([rootFetch, rootArchive]);
+      expect(runtime['cargo-test-runtime-core-exceptions-shard2']?.dependsOn).toEqual([rootFetch, rootArchive]);
       expect(runtime['cargo-test-runtime-core-shard1']?.options).toMatchObject({ cwd: '.' });
       // At the root the helper is the root's own `node_modules` link, no `../`.
       expect(runtime['cargo-test-runtime-core-shard1']?.options?.command).toStartWith(
@@ -1143,7 +1144,8 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       expect(runtime['cargo-test']?.dependsOn).toEqual([
         'cargo-test-runtime-core-shard1',
         'cargo-test-runtime-core-shard2',
-        'cargo-test-runtime-core-exceptions',
+        'cargo-test-runtime-core-exceptions-shard1',
+        'cargo-test-runtime-core-exceptions-shard2',
       ]);
       // A package owning crates validates through the root's one clippy verdict.
       expect(runtime['cargo-lint']?.dependsOn).toEqual([{ projects: [rootProject], target: 'cargo-lint' }]);
@@ -1890,7 +1892,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
     }
   });
 
-  it('shards a crate around the tests nextest.toml singles out, not through them', async () => {
+  it('partitions ordinary and exceptional tests separately while keeping exceptional runs exclusive', async () => {
     const workspace = await createWorkspace();
     try {
       await workspace.write('packages/rusty/package.json', '{"name":"rusty"}\n');
@@ -1923,30 +1925,40 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         );
         expect(targets[`cargo-test-big-shard${index}`]?.options?.timeoutMs).toBe(BOUNDED_TEST_TIMEOUT_MS);
       }
-      // Exact complement of the shards' filterset, so the union is the crate.
-      expect(targets['cargo-test-big-exceptions']?.options?.command).toContain(
-        `-E 'package(big) and (${exceptional})' --no-tests=pass`,
-      );
-      expect(targets['cargo-test-big-exceptions']?.options?.command).not.toContain('--partition');
-      expect(targets['cargo-test-big-exceptions']?.options?.timeoutMs).toBe(BOUNDED_TEST_TIMEOUT_MS);
+      // Exceptional partitions are the exact complement. Nx exclusivity keeps
+      // nextest's process-local group mutex effective across all their runs.
+      for (const index of [1, 2, 3]) {
+        const name = `cargo-test-big-exceptions-shard${index}`;
+        expect(targets[name]?.options?.command).toContain(
+          `-E 'package(big) and (${exceptional})' --partition hash:${index}/3 --no-tests=pass`,
+        );
+        expect(targets[name]?.options?.timeoutMs).toBe(BOUNDED_TEST_TIMEOUT_MS);
+        expect(targets[name]?.parallelism).toBe(false);
+        expect(packageNameFromCargoTestTarget(name)).toBe('big');
+      }
+      expect(targets['cargo-test-big-exceptions']).toBeUndefined();
       // An unsharded crate needs no pin: its whole suite is already one run.
       expect(targets['cargo-test-small-exceptions']).toBeUndefined();
       expect(targets['cargo-test-big']).toBeUndefined();
       // Every piece reaches the aggregate, and they all hang off the one
       // archive: a run extracts binaries to its own temp directory and writes
-      // nothing to cargo's flocked target/, so nothing is left to serialize.
+      // nothing to cargo's flocked target/. Only exceptional runs serialize.
       expect(targets['cargo-test']?.dependsOn).toEqual([
         'cargo-test-big-shard1',
         'cargo-test-big-shard2',
         'cargo-test-big-shard3',
-        'cargo-test-big-exceptions',
+        'cargo-test-big-exceptions-shard1',
+        'cargo-test-big-exceptions-shard2',
+        'cargo-test-big-exceptions-shard3',
         'cargo-test-small',
       ]);
       for (const name of [
         'cargo-test-big-shard1',
         'cargo-test-big-shard2',
         'cargo-test-big-shard3',
-        'cargo-test-big-exceptions',
+        'cargo-test-big-exceptions-shard1',
+        'cargo-test-big-exceptions-shard2',
+        'cargo-test-big-exceptions-shard3',
         'cargo-test-small',
       ]) {
         expect(targets[name]?.dependsOn).toEqual(['cargo-fetch', 'cargo-test-archive']);
@@ -1954,7 +1966,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       // Pieces of one crate share its inputs: they are one suite, split only to
       // fit the bound, so any change to the crate invalidates all of them.
       expect(targets['cargo-test-big-shard2']?.inputs).toEqual(targets['cargo-test-big-shard1']?.inputs);
-      expect(targets['cargo-test-big-exceptions']?.inputs).toEqual(targets['cargo-test-big-shard1']?.inputs);
+      expect(targets['cargo-test-big-exceptions-shard1']?.inputs).toEqual(targets['cargo-test-big-shard1']?.inputs);
     } finally {
       await workspace.cleanup();
     }
