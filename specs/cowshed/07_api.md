@@ -370,6 +370,7 @@ pub enum EgressMode { Intercept, Opaque }
 pub struct GrantDelta {
     pub read: Vec<PathBuf>, pub write: Vec<PathBuf>, pub deny_write: Vec<PathBuf>,
     pub egress: Vec<EgressRule>, pub repos: Vec<RepoRule>, pub sim: Vec<SimVerb>,
+    pub service_ports: Option<u16>,      // macOS: minimum service ports in the block, gateway excluded; grows only
     pub expected_revision: Option<u64>,  // CAS: reject with Conflict if the on-disk revision differs
 }
 
@@ -384,7 +385,19 @@ pub struct SandboxSpec {
 `GrantDelta::expected_revision` is the compare-and-swap hook: when set, `grant`/`revoke` refuse
 (`CowshedError::Conflict`) if the grant file has moved on since the caller last read it, so two coordinators cannot
 silently clobber each other (mutation semantics in 04_sandbox.md). There are **no SSH-key or Docker fields** in the
-grant model — the axes are read, write, egress, and repo.
+grant model — the axes are read, write, egress, and repo, plus macOS port capacity.
+
+`GrantDelta::service_ports` asks for a macOS port block holding at least that many service ports, the gateway listener
+at `base` excluded; the block becomes the smallest aligned power-of-two block with `service_ports + 1` ports. Growth is
+monotone: a count the block already holds leaves the block, the revision, and the supervisor unchanged, and `revoke`
+refuses the field. Linux refuses it because no port block exists there. The block grows in place when it can and
+otherwise moves to a larger disjoint block; either way the grant requires an idle workspace and is refused immediately
+(never queued) while any of its jobs is active. A disjoint move adds the old block to `GrantSet::retained_port_blocks`:
+it stays reserved to the workspace and connectable by its jobs until the workspace retires, while the gateway endpoint
+and the advertised base/size follow the current `port_block`. Growth into a block that contains the current one retains
+nothing, and a later block that contains a retained block drops that entry without releasing a port; retained blocks are
+otherwise released only at retirement. The next exec launches a supervisor, and so a `SandboxSpec`, from the new
+snapshot. A block with no free aligned place in the host's reserved range is refused.
 
 This is the controller integration point: a trusted orchestrator holds a `Coordinator`, hands each worker a
 `WorkspaceHandle`, calls `Coordinator::grant` as policy allows, and either lets cowshed spawn (`exec`) or takes a
@@ -597,9 +610,10 @@ and payload-free controller commitments; they never reveal protected paths or in
 
 Field sketches elsewhere in this spec are illustrative; the freeze rule — one definition, reused, versioned together —
 is the contract. `GrantSet.port_block` is the platform union: macOS always `PortBlock`, while Linux carries `None` and
-its JSON/N-API projection omits `portBlock`. Adapters and consumers must use that optional shape directly; casts,
-`null`, zero-sized blocks, and sentinel base values are forbidden. Adding a field is a coordinated change across core +
-goldens, not a per-adapter patch.
+its JSON/N-API projection omits `portBlock`. `GrantSet.retained_port_blocks` (`retainedPortBlocks`, omitted when empty)
+is controller-written, macOS-only, and non-empty only after a relocation; no `GrantDelta` field sets it. Adapters and
+consumers must use that optional shape directly; casts, `null`, zero-sized blocks, and sentinel base values are
+forbidden. Adding a field is a coordinated change across core + goldens, not a per-adapter patch.
 
 JSON and N-API use the same camel-case projection. `StreamInfo` is exactly `{storage,bytes,sha256,summary}`. `storage`
 is `{kind:"captured",artifact}` or `{kind:"redirect",source,artifact}`; an artifact is `{kind:"inline",data}` or
@@ -683,9 +697,11 @@ reuse those DTOs. Serde uses `camelCase`, documented enum strings, and omission 
   and `PushOptions` use the expectation fields shown above. All booleans are explicit in JSON; absence never silently
   means authority was granted.
 - `GrantSet`, `GrantDelta`, `PortBlock`, `EgressRule`, `RepoRule`, and `SimVerb` reuse the metadata definitions.
-  `GrantSet.portBlock` is present on macOS and omitted on Linux; `GrantDelta.expectedRevision` is optional. `PortBlock`
-  fields are private; `new`, `base()`, and `size()` are the public surface, and custom deserialization invokes the same
-  validation so size zero, any size other than 16, overflow, unknown fields, and struct-literal forgery fail.
+  `GrantSet.portBlock` is present on macOS and omitted on Linux; `GrantSet.retainedPortBlocks` is present only after a
+  macOS relocation; `GrantDelta.servicePorts` and `GrantDelta.expectedRevision` are optional. `PortBlock` fields are
+  private; `new`, `base()`, and `size()` are the public surface, and custom deserialization invokes the same validation
+  so size zero, a size that is not a power of two, a base not aligned to its size, overflow, unknown fields, and
+  struct-literal forgery fail.
 - `PushReport = { sourceHead, destinationRef, previousDestinationHead? }`;
   `LandReport = { landedHead, targetBranch, previousTargetHead?, targetWasCheckedOut, retired, warm? }`;
   `WarmRange = { base?, head }`;

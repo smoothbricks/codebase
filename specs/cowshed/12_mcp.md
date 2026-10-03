@@ -83,21 +83,21 @@ even if compromised — escalation is strictly a decision made one level up.
 
 ### Coordinator tools (require coordinator authority)
 
-| Tool                | Args (sketch)                                                                                          | Returns                                                  |
-| ------------------- | ------------------------------------------------------------------------------------------------------ | -------------------------------------------------------- |
-| `workspace_create`  | `name`, `ref?`, `from?`, `slot?`                                                                       | mount path, base commit                                  |
-| `workspace_list`    | —                                                                                                      | records (name, state, base, age, written/referenced)     |
-| `workspace_destroy` | `name`, `force?`                                                                                       | ok                                                       |
-| `fork`              | `src`, `dst`                                                                                           | mount path                                               |
-| `checkpoint`        | `name`, `label?`                                                                                       | label (generated UTC timestamp if omitted)               |
-| `restore`           | `name`, `label` (**required**)                                                                         | mount path                                               |
-| `rebase`            | `name`, `onto?`, `fresh?`, `expectedWorkspaceIncarnation?`, `expectedSourceHead?`, `expectedOntoHead?` | new head sha                                             |
-| `land`              | `name`, `targetBranch?`, `check?`, `retire?`, `pushOnly?`, source/incarnation/target CAS expectations  | target branch, landed sha, checkout state, retired       |
-| `grant` / `revoke`  | `name`, `read[]?`, `write[]?`, `egress[]?`, `repo[]?`, `sim[]?`, `all?`, `expectedRevision?`           | new grant revision                                       |
-| `slot_assign`       | `name`, `slot`                                                                                         | ok (recycled mount path for the slot)                    |
-| `mint_worker`       | `name`                                                                                                 | 256-bit, 30-second, one-use worker connection descriptor |
-| `gc`                | `dryRun?`                                                                                              | reclaimed bytes/report                                   |
-| `repo_mirror`       | `name`, `url`                                                                                          | controller-owned read-only mirror path                   |
+| Tool                | Args (sketch)                                                                                                 | Returns                                                  |
+| ------------------- | ------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------- |
+| `workspace_create`  | `name`, `ref?`, `from?`, `slot?`                                                                              | mount path, base commit                                  |
+| `workspace_list`    | —                                                                                                             | records (name, state, base, age, written/referenced)     |
+| `workspace_destroy` | `name`, `force?`                                                                                              | ok                                                       |
+| `fork`              | `src`, `dst`                                                                                                  | mount path                                               |
+| `checkpoint`        | `name`, `label?`                                                                                              | label (generated UTC timestamp if omitted)               |
+| `restore`           | `name`, `label` (**required**)                                                                                | mount path                                               |
+| `rebase`            | `name`, `onto?`, `fresh?`, `expectedWorkspaceIncarnation?`, `expectedSourceHead?`, `expectedOntoHead?`        | new head sha                                             |
+| `land`              | `name`, `targetBranch?`, `check?`, `retire?`, `pushOnly?`, source/incarnation/target CAS expectations         | target branch, landed sha, checkout state, retired       |
+| `grant` / `revoke`  | `name`, `read[]?`, `write[]?`, `egress[]?`, `repo[]?`, `sim[]?`, `servicePorts?`, `all?`, `expectedRevision?` | new grant revision                                       |
+| `slot_assign`       | `name`, `slot`                                                                                                | ok (recycled mount path for the slot)                    |
+| `mint_worker`       | `name`                                                                                                        | 256-bit, 30-second, one-use worker connection descriptor |
+| `gc`                | `dryRun?`                                                                                                     | reclaimed bytes/report                                   |
+| `repo_mirror`       | `name`, `url`                                                                                                 | controller-owned read-only mirror path                   |
 
 A coordinator-scoped telemetry query tool (selector/SQL over controller commitments and telemetry, 13_telemetry.md) is
 roadmap, not v1. Workers get only one-workspace job status/log tools: lifecycle is reconciled against controller
@@ -109,7 +109,9 @@ repo-scoped mirror grants (05_gateway.md). Each `egress[]` entry is `{ host, por
 mirroring the grant-file schema (04_sandbox.md): a coordinator sets a host's interception mode at grant time, `mode`
 defaulting to `intercept`. `sim[]` carries personal-session simulator broker verbs (`"openurl"` / `"install"` —
 04_sandbox.md/05_gateway.md); `install` remains bound to drop-dir artifacts and the human-gating rule regardless of the
-grant (14_nix.md). There are no SSH/Docker grant axes.
+grant (14_nix.md). `servicePorts` is grant-only and macOS-only: the minimum service-port count of the workspace's port
+block, gateway excluded, which only grows (04_sandbox.md); `revoke` and Linux refuse it. There are no SSH/Docker grant
+axes.
 
 `land.targetBranch` defaults to `main`. It names a real local branch in the main workspace repository. If that branch is
 checked out in the main workspace, a successful call advances the visible checkout — branch ref, `HEAD`, index, and

@@ -370,7 +370,14 @@ pub struct SandboxConfig {
     /// Operator-planted symlinks beside the workspace mount; see [`ShedLink`].
     pub shed_links: Vec<ShedLink>,
     pub exec_temp_dir: PathBuf,
+    /// The block the workspace's environment names (`COWSHED_PORT_BASE`/`_SIZE`) and its
+    /// gateway listens on.
     pub port_block: PortBlock,
+    /// Blocks the workspace was relocated away from, still reserved to it until they retire:
+    /// a background process a finished job left behind may still listen on one, and the
+    /// workspace's own children keep reaching it. Outbound loopback TCP is admitted to these as
+    /// to `port_block`; nothing else derives from them.
+    pub retained_port_blocks: Vec<PortBlock>,
     pub mode: RunSandboxMode,
     pub grants: SandboxGrants,
     /// Canonical, controller-selected sockets only (for example, the Nix daemon).
@@ -461,6 +468,7 @@ pub fn workspace_sandbox(workspace: WorkspaceSandbox<'_>) -> crate::Result<Sandb
         port_block: grants.port_block.ok_or_else(|| {
             CowshedError::integrity("workspace has no port block", "cowshed doctor --json")
         })?,
+        retained_port_blocks: grants.retained_port_blocks.clone(),
         mode: RunSandboxMode::ReadWrite,
         grants: SandboxGrants {
             read: grants.read.clone(),
@@ -563,13 +571,14 @@ fn validated_sandbox_paths(
     validate_path(&config.mount_root)?;
     validate_path(&config.workspace_mount)?;
     validate_path(&config.exec_temp_dir)?;
-    config
-        .port_block
-        .validate()
-        .map_err(|_| SandboxError::InvalidPortBlock {
-            base: config.port_block.base,
-            size: config.port_block.size,
-        })?;
+    for block in held_port_blocks(config) {
+        block
+            .validate()
+            .map_err(|_| SandboxError::InvalidPortBlock {
+                base: block.base,
+                size: block.size,
+            })?;
+    }
 
     if let Some(repository) = &config.git_worktree_repository {
         validate_path(repository)?;
@@ -749,18 +758,17 @@ pub fn seatbelt_profile(
             ),
         );
     }
-    for port in config
-        .port_block
-        .ports()
-        .map_err(|_| SandboxError::InvalidPortBlock {
-            base: config.port_block.base,
-            size: config.port_block.size,
-        })?
-    {
-        push_line(
-            &mut profile,
-            &format!("(allow network-outbound (remote tcp \"localhost:{port}\"))"),
-        );
+    // Every port of every block the workspace holds, current and retained, one literal each.
+    for block in held_port_blocks(config) {
+        for port in block.ports().map_err(|_| SandboxError::InvalidPortBlock {
+            base: block.base,
+            size: block.size,
+        })? {
+            push_line(
+                &mut profile,
+                &format!("(allow network-outbound (remote tcp \"localhost:{port}\"))"),
+            );
+        }
     }
 
     for path in &read_grants {
@@ -990,6 +998,11 @@ pub fn seatbelt_profile(
     Ok(profile)
 }
 
+/// The current block, then every retained one.
+fn held_port_blocks(config: &SandboxConfig) -> impl Iterator<Item = PortBlock> + '_ {
+    std::iter::once(config.port_block).chain(config.retained_port_blocks.iter().copied())
+}
+
 fn hard_denies<'a>(
     home: &Path,
     mount_root: &'a Path,
@@ -1152,6 +1165,7 @@ mod tests {
             shed_links: Vec::new(),
             exec_temp_dir: PathBuf::from("/private/tmp/cowshed-raven"),
             port_block: PortBlock::new(40_960, 16).unwrap(),
+            retained_port_blocks: Vec::new(),
             mode,
             grants: SandboxGrants {
                 read: vec![PathBuf::from("/opt/shared"), PathBuf::from("/opt/shared")],
@@ -1380,6 +1394,52 @@ mod tests {
             assert!(!first.contains(&format!("localhost:40960-{last}")));
             assert!(!first.contains("example.com"));
         }
+    }
+
+    /// A relocated workspace keeps reaching the blocks it still holds, and only those: every
+    /// port of the current and each retained block has its literal rule, a neighbouring block's
+    /// ports have none, and an invalid retained block refuses the profile.
+    #[test]
+    fn retained_port_blocks_admit_their_own_ports_and_no_neighbour() {
+        let mut config = config(RunSandboxMode::ReadWrite);
+        config.port_block = PortBlock::new(41_088, 128).unwrap();
+        config.retained_port_blocks = vec![
+            PortBlock::new(40_960, 64).unwrap(),
+            PortBlock::new(41_024, 16).unwrap(),
+        ];
+        let profile = seatbelt_profile(&config, SandboxProfileRole::ExecutedChild).unwrap();
+        let admitted: Vec<u16> = profile
+            .lines()
+            .filter_map(|line| {
+                line.strip_prefix("(allow network-outbound (remote tcp \"localhost:")?
+                    .strip_suffix("\"))")?
+                    .parse()
+                    .ok()
+            })
+            .collect();
+        let held: Vec<u16> = (41_088..=41_215)
+            .chain(40_960..=41_023)
+            .chain(41_024..=41_039)
+            .collect();
+        assert_eq!(admitted, held);
+        for neighbour in [40_959, 41_040, 41_087, 41_216] {
+            assert!(!profile.contains(&format!("localhost:{neighbour}\"")));
+        }
+        assert!(
+            profile.contains("(allow network-bind network-inbound (local tcp \"localhost:*\"))")
+        );
+
+        config.retained_port_blocks.push(PortBlock {
+            base: 41_041,
+            size: 16,
+        });
+        assert_eq!(
+            seatbelt_profile(&config, SandboxProfileRole::ExecutedChild),
+            Err(SandboxError::InvalidPortBlock {
+                base: 41_041,
+                size: 16
+            })
+        );
     }
 
     /// The git-worktree hole, stated as what the profile actually says: narrowed to `.git`, and

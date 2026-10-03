@@ -47,6 +47,7 @@ direnv users need nothing extra.
 | Grant host paths        | `cowshed grant <ws> --read <path...> [--write <path...>]`            | Widen filesystem access from the next exec; omit flags to list.                            |
 | Grant network reach     | `cowshed grant <ws> --egress <host>`                                 | Admit one host through the gateway; separately audited.                                    |
 | Grant a pinned client   | `cowshed grant <ws> --egress <host> --opaque`                        | Tunnel without interception for a client that verifies the real certificate (Go on macOS). |
+| Grant service ports     | `cowshed grant <ws> --ports <N>`                                     | macOS: grow the port block to at least N service ports before launching services.          |
 | List this project       | `cowshed ls`                                                         | Show its workspaces.                                                                       |
 | List every project      | `cowshed ls --all`                                                   | Show workspaces store-wide.                                                                |
 | Inspect host            | `cowshed doctor`                                                     | Check host and workspace invariants without mutation.                                      |

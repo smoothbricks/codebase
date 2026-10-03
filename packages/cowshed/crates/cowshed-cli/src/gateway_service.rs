@@ -183,7 +183,14 @@ impl GatewayPortReallocator for NativePortReallocator<'_> {
                     "cowshed doctor --json",
                 )
             })?;
-        for block in PortBlock::macos_candidates() {
+        let candidates =
+            PortBlock::macos_candidates_with_size(fact.port_block.size()).map_err(|error| {
+                CowshedError::integrity(
+                    format!("cannot enumerate workspace port capacity: {error}"),
+                    "cowshed doctor --json",
+                )
+            })?;
+        for block in candidates {
             if used.overlapping(block).is_some() || rejected.contains(&block.base()) {
                 continue;
             }

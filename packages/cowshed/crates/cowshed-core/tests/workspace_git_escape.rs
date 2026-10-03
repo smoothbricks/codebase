@@ -38,6 +38,7 @@ fn sandbox(workspace: &Path, temp: &Path) -> SandboxConfig {
         shed_links: Vec::new(),
         exec_temp_dir: execution,
         port_block: PortBlock::new(40_960, 16).expect("port block"),
+        retained_port_blocks: Vec::new(),
         mode: RunSandboxMode::ReadWrite,
         grants: SandboxGrants::default(),
         allowed_unix_sockets: Vec::new(),

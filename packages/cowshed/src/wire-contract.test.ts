@@ -7,6 +7,7 @@ import typia from 'typia';
 import type {
   DoctorReport,
   GcReport,
+  GrantDelta,
   GrantSet,
   JobInfo,
   LandReport,
@@ -186,5 +187,28 @@ describe('napi wire contract', () => {
     expect(() => seamTypes.JobInfo.assertOne({ ...script, argv: argv.argv })).toThrow();
     const { script: _script, ...neither } = script;
     expect(() => seamTypes.JobInfo.assertOne(neither)).toThrow();
+  });
+
+  it('sends a port request under the name the Rust GrantDelta deserializes', () => {
+    // The input direction has no serde corpus: `public_api_contracts.rs` pins the Rust side to
+    // `{"servicePorts":80}`, and this pins `GrantDelta` in `types.ts` to the same key, so a rename
+    // on either side is red here rather than a request the controller refuses as unknown.
+    const assertDelta = typia.createAssertEquals<GrantDelta>();
+    expect(assertDelta({ servicePorts: 80 })).toEqual({ servicePorts: 80 });
+    expect(() => assertDelta({ service_ports: 80 })).toThrow();
+    expect(() => assertDelta({ servicePorts: '80' })).toThrow();
+  });
+
+  it('keeps blocks a relocated workspace still reserves apart from its current block', () => {
+    // The `open` corpus document carries both: `portBlock` is the gateway endpoint and job env, while
+    // `retainedPortBlocks` are the blocks it moved away from and still owns. A singular or misspelled
+    // retained field must fail rather than drop the reservation on the TypeScript side.
+    const grants = seamTypes.GrantSet.assertOne(corpus.GrantSet?.open);
+    expect(grants.portBlock).toEqual({ base: 40960, size: 128 });
+    expect(grants.retainedPortBlocks).toEqual([{ base: 41088, size: 64 }]);
+
+    const { retainedPortBlocks, ...current } = grants;
+    expect(() => seamTypes.GrantSet.assertOne({ ...current, retainedPortBlock: retainedPortBlocks?.[0] })).toThrow();
+    expect(() => seamTypes.GrantSet.assertOne({ ...current, retainedPortBlocks: retainedPortBlocks?.[0] })).toThrow();
   });
 });

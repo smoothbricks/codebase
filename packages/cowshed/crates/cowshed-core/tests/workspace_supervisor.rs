@@ -377,6 +377,7 @@ fn config() -> WorkspaceSupervisorConfig {
             workspace_mount: workspace_root,
             exec_temp_dir: PathBuf::from("/tmp/cowshed-exec"),
             port_block: PortBlock::new(49_136, 16).unwrap(),
+            retained_port_blocks: Vec::new(),
             mode: cowshed_core::sandbox::RunSandboxMode::ReadWrite,
             grants: SandboxGrants::default(),
             allowed_unix_sockets: Vec::new(),
@@ -1993,6 +1994,39 @@ async fn quiesce_rejects_admission_and_waits_for_existing_terminal_commitment() 
     complete(&spawned, b"", b"", ExitStatus::Exited { code: 0 }).await;
     quiesce.await.unwrap().unwrap();
     assert_eq!(h.handle.info(job).await.unwrap().state, JobState::Exited);
+}
+
+#[tokio::test]
+async fn idle_quiesce_refuses_busy_without_closing_admission_or_waiting() {
+    let mut h = harness(2, 1024, false, false);
+    let first = h
+        .handle
+        .exec(None, request(StdinSource::Empty))
+        .await
+        .unwrap();
+    let first_spawned = h.spawned.recv().await.unwrap();
+    let refused = h.handle.quiesce_if_idle().await.unwrap_err();
+    assert_eq!(refused.code, ErrorCode::Conflict);
+    let second = h
+        .handle
+        .exec(None, request(StdinSource::Empty))
+        .await
+        .expect("busy refusal must leave admission open");
+    let second_spawned = h.spawned.recv().await.unwrap();
+    complete(&first_spawned, b"", b"", ExitStatus::Exited { code: 0 }).await;
+    complete(&second_spawned, b"", b"", ExitStatus::Exited { code: 0 }).await;
+    h.handle.wait(first).await.unwrap();
+    h.handle.wait(second).await.unwrap();
+    h.handle.quiesce_if_idle().await.unwrap();
+    assert_eq!(
+        h.handle
+            .exec(None, request(StdinSource::Empty))
+            .await
+            .unwrap_err()
+            .code,
+        ErrorCode::Conflict
+    );
+    h.handle.retire().await.unwrap();
 }
 
 #[tokio::test]

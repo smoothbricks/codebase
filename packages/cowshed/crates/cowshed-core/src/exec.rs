@@ -494,6 +494,7 @@ mod tests {
                 workspace_mount: self.workspace.clone(),
                 exec_temp_dir: self.root.join("tmp"),
                 port_block: PortBlock::new(40_960, 16).unwrap(),
+                retained_port_blocks: Vec::new(),
                 mode: RunSandboxMode::ReadWrite,
                 grants: SandboxGrants::default(),
                 allowed_unix_sockets: vec![],

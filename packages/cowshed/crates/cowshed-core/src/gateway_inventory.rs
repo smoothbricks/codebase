@@ -887,6 +887,9 @@ impl NativeGatewayInventory {
                     }
                 })?;
                 reserve_port_block(&mut blocks, block)?;
+                for retained in metadata.grants.retained_port_blocks {
+                    reserve_port_block(&mut blocks, retained)?;
+                }
             }
             // Incomplete clones cannot be served, but a canonical pending payload owns its
             // stored grant even after its creator exits. Sidecar-only fences are reclaimed
@@ -991,7 +994,11 @@ impl NativeGatewayInventory {
                     repo: repo.clone(),
                     workspace: workspace.clone(),
                 })?;
-        reserve_port_block(blocks, block)
+        reserve_port_block(blocks, block)?;
+        for retained in metadata.grants.retained_port_blocks {
+            reserve_port_block(blocks, retained)?;
+        }
+        Ok(())
     }
 
     fn all_attached_blocking(&self) -> Result<Vec<GatewaySessionFact>, GatewayInventoryError> {
@@ -1003,6 +1010,9 @@ impl NativeGatewayInventory {
                 Ok(project) => {
                     for fact in &project {
                         reserve_port_block(&mut port_blocks, fact.port_block)?;
+                        for retained in &fact.grants.retained_port_blocks {
+                            reserve_port_block(&mut port_blocks, *retained)?;
+                        }
                     }
                     facts.extend(project);
                 }

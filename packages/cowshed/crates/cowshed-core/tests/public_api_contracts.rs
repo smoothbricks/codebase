@@ -766,6 +766,31 @@ fn all_lifecycle_options_use_camel_case_and_omit_only_optionals() {
     let grant_delta = serde_json::from_value::<GrantDelta>(json!({})).unwrap();
     assert_eq!(grant_delta, GrantDelta::default());
     assert_eq!(serde_json::to_value(grant_delta).unwrap(), json!({}));
+    // `servicePorts` is the minimum service-port count, the gateway port excluded; absent means no
+    // port request, and it travels as a bare JSON number in camelCase like every other field.
+    let ports_delta = GrantDelta {
+        service_ports: Some(80),
+        ..GrantDelta::default()
+    };
+    assert_eq!(
+        serde_json::to_value(&ports_delta).unwrap(),
+        json!({"servicePorts":80})
+    );
+    assert_eq!(
+        serde_json::from_value::<GrantDelta>(json!({"servicePorts":80})).unwrap(),
+        ports_delta
+    );
+    for refused in [
+        json!({"service_ports":80}),
+        json!({"servicePorts":-1}),
+        json!({"servicePorts":65536}),
+        json!({"servicePorts":"80"}),
+    ] {
+        assert!(
+            serde_json::from_value::<GrantDelta>(refused.clone()).is_err(),
+            "{refused}"
+        );
+    }
 
     let rebase = RebaseOptions {
         onto: Some(RevisionTarget::Branch(BranchName::new("main").unwrap())),

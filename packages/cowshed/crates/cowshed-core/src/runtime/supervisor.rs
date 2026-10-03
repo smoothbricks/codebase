@@ -147,6 +147,7 @@ impl Default for WorkspaceSupervisorConfig {
                 workspace_mount: workspace_root,
                 exec_temp_dir: PathBuf::from("/tmp/cowshed-exec"),
                 port_block: crate::metadata::PortBlock::new(49_136, 16).expect("static port block"),
+                retained_port_blocks: Vec::new(),
                 mode: crate::sandbox::RunSandboxMode::ReadWrite,
                 grants: crate::sandbox::SandboxGrants::default(),
                 allowed_unix_sockets: Vec::new(),
@@ -2481,6 +2482,17 @@ impl WorkspaceSupervisorHandle {
     pub async fn quiesce(&self) -> Result<()> {
         self.call(|reply| Command::Quiesce {
             authority: self.authority.clone(),
+            fail_if_busy: false,
+            reply,
+        })
+        .await
+    }
+
+    /// Close admission atomically only when no job is active; never wait for a workload.
+    pub async fn quiesce_if_idle(&self) -> Result<()> {
+        self.call(|reply| Command::Quiesce {
+            authority: self.authority.clone(),
+            fail_if_busy: true,
             reply,
         })
         .await
@@ -2699,6 +2711,7 @@ pub(super) enum Command {
     },
     Quiesce {
         authority: WorkspaceAuthoritySnapshot,
+        fail_if_busy: bool,
         reply: oneshot::Sender<Result<()>>,
     },
     Retire {
@@ -3083,11 +3096,20 @@ impl SupervisorActor {
                 let result = self.checkpoint(&authority, checkpoint_id).await;
                 let _ = reply.send(result);
             }
-            Command::Quiesce { authority, reply } => {
+            Command::Quiesce {
+                authority,
+                fail_if_busy,
+                reply,
+            } => {
                 if let Err(error) = self.validate_authority(&authority) {
                     let _ = reply.send(Err(error));
                 } else if self.lifecycle == ActorLifecycle::Retired {
                     let _ = reply.send(Ok(()));
+                } else if fail_if_busy && self.has_running_jobs() {
+                    let _ = reply.send(Err(CowshedError::conflict(
+                        "workspace port capacity cannot change while jobs are active",
+                        "request port capacity before starting the workload",
+                    )));
                 } else {
                     if self.lifecycle == ActorLifecycle::Running {
                         self.lifecycle = ActorLifecycle::Quiescing;
@@ -4695,6 +4717,7 @@ mod workspace_toolchain_tests {
             workspace_mount: mount.to_path_buf(),
             exec_temp_dir: mount.parent().expect("root").join("tmp"),
             port_block: crate::metadata::PortBlock::new(40_960, 16).expect("port block"),
+            retained_port_blocks: Vec::new(),
             mode: RunSandboxMode::ReadWrite,
             grants: SandboxGrants::default(),
             allowed_unix_sockets: nix_daemon_socket().into_iter().collect(),
@@ -5077,6 +5100,7 @@ mod workspace_toolchain_tests {
             workspace_mount: root.join("workspace"),
             exec_temp_dir: root.join("tmp"),
             port_block: crate::metadata::PortBlock::new(40_960, 16).expect("port block"),
+            retained_port_blocks: Vec::new(),
             mode: crate::sandbox::RunSandboxMode::ReadWrite,
             grants: crate::sandbox::SandboxGrants::default(),
             allowed_unix_sockets: Vec::new(),

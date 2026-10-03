@@ -121,11 +121,17 @@
         }
       ],
       "portBlock": {
-        "base": 51200,
-        "size": 16
+        "base": 40960,
+        "size": 128
       },
       "read": ["/Users/fixture/.cargo/registry"],
       "repos": ["smoothbricks/*"],
+      "retainedPortBlocks": [
+        {
+          "base": 41088,
+          "size": 64
+        }
+      ],
       "revision": 12,
       "sim": ["openurl", "install"],
       "write": ["/Users/fixture/Library/Caches/sccache"]

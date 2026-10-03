@@ -656,6 +656,7 @@ mod tests {
             shed_links: Vec::new(),
             exec_temp_dir: root.join("temp"),
             port_block: crate::metadata::PortBlock::new(49_136, 16).expect("ports"),
+            retained_port_blocks: Vec::new(),
             mode: crate::sandbox::RunSandboxMode::ReadWrite,
             grants: crate::sandbox::SandboxGrants {
                 read: vec![checkout.to_owned()],

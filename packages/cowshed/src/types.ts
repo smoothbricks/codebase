@@ -84,7 +84,16 @@ export interface EgressRule {
 
 export interface GrantSet {
   readonly revision: number;
+  /** macOS: the current block — the gateway listener and the base/size every new job's environment carries. */
   readonly portBlock?: PortBlock;
+  /**
+   * macOS: blocks this workspace was moved away from by a `servicePorts` grant that found no free block containing its
+   * current one. They stay reserved to it until it retires — or until a later, larger block contains them, which drops
+   * the entry without releasing a port — because a background process left behind by a finished job may still hold
+   * their ports, and the workspace's jobs may still connect to them. The gateway endpoint and the advertised base/size
+   * come from `portBlock` alone. Absent when there are none; no grant request can set it.
+   */
+  readonly retainedPortBlocks?: readonly PortBlock[];
   readonly read: readonly string[];
   readonly write: readonly string[];
   readonly denyWrite?: readonly string[];
@@ -124,6 +133,14 @@ export interface GrantDelta {
   readonly egress?: readonly EgressRule[];
   readonly repos?: readonly string[];
   readonly sim?: readonly SimVerb[];
+  /**
+   * macOS only: the minimum number of service ports the workspace's port block must hold, excluding
+   * the gateway port at its base — an integer from 1 to 65535. The block only grows: a count it already
+   * holds is a no-op, `revoke` refuses this field, and Linux, whose workspaces each own a private
+   * loopback, refuses it outright. Growth is refused at once while any of the workspace's jobs is
+   * running; the next exec runs under the new block (`GrantSet.portBlock`).
+   */
+  readonly servicePorts?: number;
   readonly expectedRevision?: number;
 }
 

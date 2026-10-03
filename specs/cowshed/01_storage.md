@@ -548,8 +548,9 @@ optional sink that nothing reads for a decision (07_api.md/13_telemetry.md).
 cowshed-core (running unsandboxed as the controller) reads and writes it. Besides grants it carries the workspace's
 identity and `workspaceIncarnation` needed while detached, the optional macOS-only `portBlock` binding (`{base, size}`;
 base = the gateway's per-workspace data-plane listener, `base+1 … base+size-1` = the workspace's own bindable dev-server
-ports; a new block is 64 ports, and a live block keeps the size it was allocated with), and the detach-time info
-snapshot described above. Linux sidecars omit `portBlock`. The workspace's CA **private key** sits alongside it
+ports; a new block is 64 ports, and a live block keeps its size until a `service_ports` grant grows it — a grant that
+moves it keeps the old block in `retainedPortBlocks`, reserved to the workspace until it retires), and the detach-time
+info snapshot described above. Linux sidecars omit `portBlock`. The workspace's CA **private key** sits alongside it
 (`<image>.ca.key`, 0600, same controller-only, sandbox-denied treatment) — the gateway signs per-host interception
 leaves with it; only the public CA cert ever enters the image (04_sandbox.md/05_gateway.md). Schema in 04_sandbox.md.
 

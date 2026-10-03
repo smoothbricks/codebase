@@ -9,8 +9,8 @@ use crate::metadata::{MetadataError, Platform, PortBlock, write_atomic_bytes};
 pub const WORKSPACE_ENVIRONMENT_PATH: &str = ".cowshed/env";
 pub const WORKSPACE_TOKEN_ENV: &str = "COWSHED_WORKSPACE_TOKEN";
 pub const PORT_BASE_ENV: &str = "COWSHED_PORT_BASE";
-/// The workspace's port block size: `base+1 … base+size-1` are its service ports. A block keeps
-/// the size it was allocated with, so tools read it here rather than assuming one.
+/// The workspace's current port block size: `base+1 … base+size-1` are its service ports.
+/// Capacity grants can grow it, so tools read the admitted size rather than assuming one.
 pub const PORT_BLOCK_SIZE_ENV: &str = "COWSHED_PORT_BLOCK_SIZE";
 pub const GO_ENV: &str = "GOENV";
 /// Node's and Bun's additive TLS trust anchor. The workspace CA is wired here and nowhere else:

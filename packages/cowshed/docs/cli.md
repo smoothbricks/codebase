@@ -548,20 +548,21 @@ output text. Failures of the exec wrapper itself use exit codes 100–106.
 
 ### Dev servers inside workspaces
 
-On macOS, each workspace owns a **port block** allocated at creation — 64 ports for a new workspace; a workspace keeps
-the size it was allocated with — and the gateway data plane sits on the base port, with base+1 through base+size-1 as
-workspace service ports. Linux allocates no port block: every workspace instead gets private loopback in its own network
-namespace, so fixed service ports do not collide with siblings. Ordinary package tools still use
-`http://127.0.0.1:7644/…`: exactly one controller-owned, non-signalable connector in that namespace binds that address
-and forwards bytes only to the workspace's mounted `/run/cowshed/gateway.sock`. It holds no policy or credentials and is
-not a general TCP/Unix-socket forwarder; the socket inode, namespace, and opaque token retain the authority boundary.
-Detach or restore drains and kills it. Tools must use cowshed's platform-specific configuration rather than assuming
-host-wide loopback.
+On macOS, each workspace owns a **port block** — 64 ports when the workspace is created — and the gateway data plane
+sits on the base port, with base+1 through base+size-1 as workspace service ports: 63 of them in a new block. A
+sandboxed process can connect only to its own block, so a service set that needs more ports asks for them with
+[`cowshed grant <name> --ports <N>`](#sandbox-grants). Linux allocates no port block: every workspace instead gets
+private loopback in its own network namespace, so fixed service ports do not collide with siblings. Ordinary package
+tools still use `http://127.0.0.1:7644/…`: exactly one controller-owned, non-signalable connector in that namespace
+binds that address and forwards bytes only to the workspace's mounted `/run/cowshed/gateway.sock`. It holds no policy or
+credentials and is not a general TCP/Unix-socket forwarder; the socket inode, namespace, and opaque token retain the
+authority boundary. Detach or restore drains and kills it. Tools must use cowshed's platform-specific configuration
+rather than assuming host-wide loopback.
 
 On macOS, `.cowshed/env` and every job's environment carry `COWSHED_PORT_BASE` and `COWSHED_PORT_BLOCK_SIZE`: the block
-is `base … base+size-1`, and its size is the one the workspace was allocated with (64 for new workspaces), so read it
-rather than assume it. devenv offsets can derive from the block. Linux configuration contains no block or sentinel
-values.
+is `base … base+size-1`. Its size is 64 for a new workspace, may be larger after a `--ports` grant, and older workspaces
+may hold 16-port blocks, so read it rather than assume it. devenv offsets can derive from the block. Linux configuration
+contains no block or sentinel values.
 
 ```
 $ cowshed exec raven -- sh -c 'echo $((COWSHED_PORT_BASE + 1))'
@@ -705,7 +706,7 @@ next: cowshed attach raven
 
 ## Sandbox grants
 
-### `cowshed grant <name> [--read <path...>] [--write <path...>] [--deny-write <relative-path...>] [--egress <host>] [--opaque]`
+### `cowshed grant <name> [--read <path...>] [--write <path...>] [--deny-write <relative-path...>] [--egress <host>] [--opaque] [--ports <N>]`
 
 Workspaces start **closed**: write access to their own volume, `/private/cowshed/caches`, and temp; read access to the
 toolchains and system; egress to the localhost gateway only. Widen filesystem and network access per workspace:
@@ -745,6 +746,39 @@ next: cowshed exec raven -- <retry your command>
   (`cowshed grant --project-wide --egress proxy.golang.org --egress sum.golang.org --opaque`). A host holds one rule, so
   granting it again restates its mode: `--egress <host>` alone turns it back to intercepted.
 - Egress grants apply immediately: the gateway reads the current policy per request, with no re-exec.
+- `--ports <N>` (macOS) grows the workspace's port block to hold at least N service ports, not counting the gateway port
+  at its base. Blocks are power-of-two sized and aligned, so the block becomes the smallest one with N+1 ports:
+  `cowshed grant raven --ports 80` turns the initial 64-port block (63 service ports) into a 128-port block (127). The
+  count is a minimum and a block never shrinks: a count the block already holds, on its own, leaves the block, the grant
+  revision, and the workspace's supervisor as they are, and `--ports 0`, a malformed count, and `--project-wide --ports`
+  are usage errors.
+  - cowshed prefers a larger block that contains the current one: it grows in place, keeping the base when that base is
+    aligned to the larger size. When no free containing block exists, the workspace moves to a free larger block and
+    keeps the block it moved from reserved to itself: a background process left behind by a finished job may still hold
+    old-block ports, so no other workspace is handed them, and new jobs may still connect to them. The grant set lists
+    such blocks as `retainedPortBlocks` (`--json`); they appear only after such a move, and no grant request can add
+    one. A later growth whose block contains a retained block drops that entry without releasing any port; other
+    retained blocks stay until the workspace is removed, when they are released like any retired block. The gateway
+    endpoint and the advertised `COWSHED_PORT_BASE`/`COWSHED_PORT_BLOCK_SIZE` come from the current `portBlock` alone.
+  - Growth, whether or not the base moves, needs an idle workspace: while any of its jobs is running the grant is
+    refused at once, never queued or waited out. Stop those jobs, grant, then start them again — or better, grant ports
+    before launching the services that need them.
+  - The next exec starts a fresh supervisor under the new block: its jobs get the new
+    `COWSHED_PORT_BASE`/`COWSHED_PORT_BLOCK_SIZE` and a Seatbelt profile that allows the new block and any retained
+    ones.
+  - Ports are a host resource, not a per-workspace quota: every workspace's block, current or retained, comes from the
+    one reserved range (`40960–49151` by default, 8192 ports in all), so a block that cannot be placed because the range
+    has no free aligned block that large is refused rather than waited for.
+  - Linux refuses `--ports`: each workspace's private network namespace already gives it every loopback port.
+
+  ```
+  $ cowshed grant raven --ports 80
+  cowshed: grants for raven now: 0 read, 0 write, 0 denied writes, 0 egress
+  cowshed: port block for raven now: COWSHED_PORT_BASE=40960 COWSHED_PORT_BLOCK_SIZE=128 (127 service ports)
+  cowshed: grants apply from the next exec or shell
+  next: cowshed exec raven -- <retry your command>
+  ```
+
 - `cowshed grant <name>` with no flags prints the current grant set (TSV; `--json` for the envelope):
 
 ```

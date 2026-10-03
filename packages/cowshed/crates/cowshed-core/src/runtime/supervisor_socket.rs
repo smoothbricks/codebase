@@ -305,7 +305,10 @@ enum Call {
     Checkpoint {
         checkpoint_id: String,
     },
-    Quiesce,
+    #[serde(rename_all = "camelCase")]
+    Quiesce {
+        fail_if_busy: bool,
+    },
     Retire,
 }
 
@@ -1133,8 +1136,12 @@ async fn answer(
                 Bytes::new(),
             )
         }
-        Call::Quiesce => {
-            supervisor.quiesce().await?;
+        Call::Quiesce { fail_if_busy } => {
+            if fail_if_busy {
+                supervisor.quiesce_if_idle().await?;
+            } else {
+                supervisor.quiesce().await?;
+            }
             (unit()?, Bytes::new())
         }
         Call::Retire => {
@@ -1608,8 +1615,20 @@ async fn forward(path: Arc<PathBuf>, command: Command) {
             });
             let _ = reply.send(result);
         }
-        Command::Quiesce { authority, reply } => {
-            let _ = reply.send(call(path, &authority, Call::Quiesce, Bytes::new()).await);
+        Command::Quiesce {
+            authority,
+            fail_if_busy,
+            reply,
+        } => {
+            let _ = reply.send(
+                call(
+                    path,
+                    &authority,
+                    Call::Quiesce { fail_if_busy },
+                    Bytes::new(),
+                )
+                .await,
+            );
         }
         Command::Retire { authority, reply } => {
             let _ = reply.send(call(path, &authority, Call::Retire, Bytes::new()).await);

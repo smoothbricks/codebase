@@ -79,6 +79,9 @@ Shape:
 (allow network-outbound (remote tcp "localhost:<base>"))    ;; own gateway listener
 (allow network-outbound (remote tcp "localhost:<base+1>"))  ;; own service ports…
 ;; … one rule per port through <base+size-1> — `size` single-port rules, never a range.
+;; The same single-port rules cover every block in `retainedPortBlocks`: blocks this
+;; workspace moved away from and still owns, so a process started under an old block
+;; stays reachable. They carry no gateway listener and are not advertised in the env.
 ;; Everything else on loopback — 7644 (control plane), every sibling's block and
 ;; ephemeral listeners — falls through to (deny default) for CONNECT: a sibling
 ;; may bind anything, but this workspace cannot reach it (measured: EPERM).
@@ -227,17 +230,19 @@ Notes:
 - Each workspace serves on its own block ports (`base+1 … base+size-1`), so dev servers that honor the port convention
   never collide — the port block _is_ the collision fix. Because bind stays permissive (macOS has no per-process network
   namespace), a sibling may still _bind_ any loopback port, including a hardcoded default; isolation holds anyway
-  because **connect is the boundary**: a workspace's outbound set is its own block plus its scoped unix sockets, so it
-  cannot reach a sibling's listeners — block or ephemeral — at all (measured: EPERM). Linux workspaces get a private
-  loopback via netns (below), so nothing is shared and the block scheme is unnecessary there; ordinary tools reach a
-  trusted per-workspace connector on private `127.0.0.1:7644`, which alone reaches the mounted Unix gateway socket.
+  because **connect is the boundary**: a workspace's outbound set is its own blocks (current and retained) plus its
+  scoped unix sockets, so it cannot reach a sibling's listeners — block or ephemeral — at all (measured: EPERM). Linux
+  workspaces get a private loopback via netns (below), so nothing is shared and the block scheme is unnecessary there;
+  ordinary tools reach a trusted per-workspace connector on private `127.0.0.1:7644`, which alone reaches the mounted
+  Unix gateway socket.
 - **macOS cooperative sandboxing caveat.** The block only helps tools that take port configuration. On macOS, the
   in-image `.cowshed/env` and the supervisor's job environment both carry `COWSHED_PORT_BASE=<base>` and
   `COWSHED_PORT_BLOCK_SIZE=<size>` as the conventions dev servers should honor; a tool that hardcodes a fixed default
   port must be pointed at a block port (devenv port offsets derive from `COWSHED_PORT_BASE`). A tool that spreads
   listeners across the block reads its size from `COWSHED_PORT_BLOCK_SIZE` and never assumes one: blocks of different
-  sizes are live at once. Tools that ignore the convention bind outside their block and are denied. Linux exports
-  neither value: its services use private loopback directly and its package/proxy endpoint is fixed at `127.0.0.1:7644`.
+  sizes are live at once, and `cowshed grant <ws> --ports <N>` can grow a workspace's block (below). Tools that ignore
+  the convention bind outside their block and are denied. Linux exports neither value: its services use private loopback
+  directly and its package/proxy endpoint is fixed at `127.0.0.1:7644`.
 - `RunSandboxMode::ReadOnly` drops the workspace mount from the write set — for inspector-style commands that must
   observe without mutating.
 - **Read grants have one narrow meaning.** Built-in system/toolchain roots remain readable so processes can start. A
@@ -292,7 +297,8 @@ Controller-owned, host-readable while the image is detached, outside the workspa
   "workspaceIncarnation": "0198f2c0b7e34dc795f17b238b331c80",
   "revision": 7,
   "platform": "macos",
-  "portBlock": { "base": 40960, "size": 64 },
+  "portBlock": { "base": 40960, "size": 128 },
+  "retainedPortBlocks": [{ "base": 41088, "size": 64 }],
   "updatedAt": "2026-07-11T12:34:56Z",
   "read": ["<project-root>/shared-fixtures"],
   "write": ["<project-root>/artifacts/raven"],
@@ -332,13 +338,35 @@ Controller-owned, host-readable while the image is detached, outside the workspa
   and `base+1 … base+size-1` are workspace service ports. A block's size is persisted data, not a global assumption:
   `size` is a power of two of at least 2, `base` is aligned to its own `size`, and every reader — sidecar parsing, grant
   validation, the gateway's session check, the Seatbelt profile — validates a block against its own recorded
-  `{base, size}`. A new workspace gets `NEW_PORT_BLOCK_SIZE` (64) ports at the lowest aligned base whose block shares no
-  port with any live block of any size; a live workspace keeps the size it was allocated with until it is removed, so
-  16-port blocks from before the size was raised stay valid beside new 64-port ones. Alignment makes blocks nest or stay
-  disjoint, never straddle, and the store-wide readers refuse any two live blocks that share a port. It is allocated at
-  new/fork (adopt, for main), preserved across restore, never inherited by a fork, and omitted on Linux. Linux records
-  no synthetic port alias; its per-workspace Unix gateway socket and private loopback namespace are runtime topology,
-  not grant authority.
+  `{base, size}`. A new workspace gets `NEW_PORT_BLOCK_SIZE` (64) ports — the gateway plus 63 service ports — at the
+  lowest aligned base whose block shares no port with any live block of any size. A live block keeps its size until a
+  `service_ports` grant (below) grows it, so 16-port blocks from before the size was raised stay valid beside 64-port
+  ones and grown ones. Alignment makes blocks nest or stay disjoint, never straddle, and the store-wide readers refuse
+  any two live blocks that share a port. It is allocated at new/fork (adopt, for main), preserved across restore, never
+  inherited by a fork, and omitted on Linux. Linux records no synthetic port alias; its per-workspace Unix gateway
+  socket and private loopback namespace are runtime topology, not grant authority.
+- **Port capacity grows only by grant.** `GrantDelta.service_ports = N` (`cowshed grant <ws> --ports <N>`) requires the
+  block to hold at least N service ports, the gateway port excluded: the target size is the smallest power of two of at
+  least N+1. Growth is monotone — a count the current block already holds leaves the block, the revision, and the
+  supervisor unchanged (other fields of the same delta apply as usual), and `revoke` refuses the field. The new block is
+  an aligned block of the target size whose ports belong to no other workspace's block; it may contain this workspace's
+  own current and retained blocks, and the block that contains the current one is preferred. A current block the new
+  block contains needs no separate entry (the base stays the same exactly when the current base is aligned to the target
+  size); a current block it does not contain joins `retainedPortBlocks`. A retained block that a later, larger block
+  contains is dropped from the list without releasing any port, since the containing block still owns it; every other
+  retained block stays. Growth at least doubles the current size, so growth alone can retain at most seven predecessor
+  blocks from the initial 64-port allocation to the 8192-port host range. Slot reassignment can retain additional
+  blocks; allocation failures report this workspace's retained block count and port footprint. A retained block is
+  durable ownership — written with the grants, counted by the host-wide allocator and every overlap check, allowed by
+  every new job's Seatbelt profile, absent from the environment and the gateway endpoint — because a background process
+  a finished job left behind may still hold its ports. It is released only when the workspace retires, through the same
+  availability checks that release any retired block; cowshed does not claim to reap such processes.
+  `retainedPortBlocks` is controller-written only: no grant delta carries it, it is empty until the workspace moves to a
+  block that does not contain its current one, and it is omitted on Linux. Any growth, whether or not the base moves,
+  requires an idle workspace: with any job active the grant is refused immediately — never queued or waited out — and
+  admission stays open. The reserved range is finite and shared by every workspace on the host, retained blocks
+  included: when no aligned block of the target size is free, the grant is refused and the block is unchanged. Linux
+  refuses the field, since each workspace's private loopback already holds every port and there is no block to grow.
 
 ### Project-standing grants
 
@@ -400,15 +428,15 @@ Grant files are small, but they are the authority record — mutations are speci
 - **Crash-safe replacement.** Same-directory temporary file → write → flush → chmod 0600 → rename over the grant file →
   fsync the parent directory. A crash leaves the old file or the new file, never a torn one.
 - **Revision discipline.** An effective change increments `revision` exactly once. A no-op delta (granting an
-  already-present path, revoking an absent one) leaves the file byte-identical, the revision unchanged, and reports the
-  current set; revoking a nonexistent item is a no-op, not an error. An effective read/write change also marks any
-  active supervisor at the prior revision for the drain/relaunch protocol below; egress-only and `sim`-only changes do
-  not.
+  already-present path, revoking an absent one, asking for service ports the block already holds) leaves the file
+  byte-identical, the revision unchanged, and reports the current set; revoking a nonexistent item is a no-op, not an
+  error. An effective read/write change also marks any active supervisor at the prior revision for the drain/relaunch
+  protocol below; egress-only and `sim`-only changes do not, and a port-block change never drains (below).
 
 ### Widening and narrowing
 
 ```
-cowshed grant  <ws> [--read <path>]… [--write <path>]… [--deny-write <relative-path>]… [--egress <host>]…
+cowshed grant  <ws> [--read <path>]… [--write <path>]… [--deny-write <relative-path>]… [--egress <host>]… [--ports <N>]
 cowshed grant  --project-wide [--read <path>]… [--deny-write <relative-path>]… [--egress <host>]…
 ```
 
@@ -427,6 +455,13 @@ Propagation:
   filesystem grant. A named session pinned to a stale supervisor revision is not silently migrated or resumed; a request
   targeting it conflicts (exit 4 / `CowshedError::Conflict`) and the caller must create a session under the relaunched
   revision. No-op mutations cause neither a drain nor a relaunch.
+- **Port block (macOS)**: idle-only, never drained. Current and retained blocks form the Seatbelt connect allowlist; the
+  current block alone supplies the job environment (`COWSHED_PORT_BASE`, `COWSHED_PORT_BLOCK_SIZE`), so growth is
+  admitted only when the workspace has no active job, checked atomically with the grant; otherwise it is refused at
+  once. An admitted growth stops the idle supervisor and fences new admissions until the new block and the environment
+  derived from it are durably published; the next exec starts a supervisor from the new snapshot. Already completed jobs
+  may have left services running under their old profile, so old blocks remain owned. Callers grant ports before
+  launching the services that need them.
 
 ### The "simulator" profile preset
 
@@ -660,10 +695,10 @@ On macOS, port collisions between workspaces are handled by the per-workspace po
 `COWSHED_PORT_BLOCK_SIZE`, so two workspaces running the same service set land on different ports and both are reachable
 from the host browser. The residuals are the cooperative-sandboxing caveat above (a tool that hardcodes a port can still
 bind it — bind is permissive — but collides with a sibling doing the same and is unreachable from its own workspace's
-clients), and the in-block-only rule for in-sandbox clients: a workspace process can connect only to its own block
-ports, so service-to-service traffic inside a workspace must also ride block ports. On Linux the netns makes both moot:
-each workspace's loopback is private, no `COWSHED_PORT_BASE` exists, and package traffic uses the fixed connector
-address instead.
+clients), and the owned-block-only rule for in-sandbox clients: a workspace process can connect only to its current or
+retained block ports, so service-to-service traffic inside a workspace must also ride owned block ports. On Linux the
+netns makes both moot: each workspace's loopback is private, no `COWSHED_PORT_BASE` exists, and package traffic uses the
+fixed connector address instead.
 
 ## The sccache daemon as trusted mediator
 

@@ -50,6 +50,7 @@ use cowshed_core::{
 use std::collections::HashMap;
 use std::fs;
 use std::io::{self, Write};
+use std::num::NonZeroU16;
 use std::os::fd::OwnedFd;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
@@ -1172,7 +1173,8 @@ where
             let changed = !args.read.is_empty()
                 || !args.write.is_empty()
                 || !args.deny_write.is_empty()
-                || !args.egress.is_empty();
+                || !args.egress.is_empty()
+                || args.service_ports.is_some();
             let workspace = match args.target {
                 GrantTarget::Workspace(workspace) => workspace,
                 GrantTarget::Project => {
@@ -1199,6 +1201,7 @@ where
                             write: args.write,
                             deny_write: args.deny_write,
                             egress,
+                            service_ports: args.service_ports.map(NonZeroU16::get),
                             ..GrantDelta::default()
                         },
                     )
@@ -1239,6 +1242,19 @@ where
                         grants.egress.len()
                     ))
                     .map_err(output_error)?;
+                if let (Some(_), Some(block)) = (args.service_ports, grants.port_block) {
+                    // The block, not the request, is what jobs run under: it is rounded up to a
+                    // whole aligned block and may have moved, so say where it now is.
+                    output
+                        .guidance(&format!(
+                            "port block for {} now: COWSHED_PORT_BASE={} COWSHED_PORT_BLOCK_SIZE={} ({} service ports)",
+                            workspace,
+                            block.base(),
+                            block.size(),
+                            block.size() - 1
+                        ))
+                        .map_err(output_error)?;
+                }
                 output
                     .guidance("grants apply from the next exec or shell")
                     .map_err(output_error)?;

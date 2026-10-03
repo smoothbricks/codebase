@@ -10,10 +10,14 @@ The host control plane is host-netns `127.0.0.1:7644` plus `/private/cowshed/sto
 is reachable from a workspace. Linux reuses the numeric loopback address inside each private netns for a distinct
 data-plane connector; it is not the host control listener. Data-plane identity depends on the OS:
 
-- **macOS:** each workspace has a port block from `40960–49151`, recorded as `{base, size}` (64 ports for a new
-  workspace; a live one keeps the size it was allocated with). The gateway listener is `base`; service ports are
-  `base+1 … base+size-1`. Seatbelt lets the workspace connect only to its own block, so the destination listener
-  identifies the workspace.
+- **macOS:** each workspace has a port block from `40960–49151`, recorded as `{base, size}`: 64 ports for a new
+  workspace, grown on request by `cowshed grant <ws> --ports <N>` (at least N service ports, gateway excluded; never
+  shrunk). The gateway listener is `base`; service ports are `base+1 … base+size-1`. Seatbelt lets the workspace connect
+  only to its own blocks, so the destination listener identifies the workspace. A block grows into a larger block
+  containing it when one is free and otherwise moves; a block it moved from stays reserved to the workspace (and
+  connectable by its jobs) until the workspace is removed or a later block contains it, but carries no gateway listener.
+  Growth is refused while any of the workspace's jobs runs, and the next exec reaches the gateway at the current block's
+  base.
 - **Linux:** there is no port block. A controller-owned socket at
   `/private/cowshed/store/run/gateway/<workspaceIncarnation>.sock` is mounted as `/run/cowshed/gateway.sock` inside that
   workspace's private loopback-only network namespace. The controller launches exactly one trusted minimal connector in

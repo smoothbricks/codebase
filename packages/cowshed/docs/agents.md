@@ -152,9 +152,12 @@ Every workspace starts closed: writes limited to its own volume, designated cach
 your own gateway listener. Public npm HTTPS reads are admitted anonymously by the built-in package-registry default;
 other destinations need egress grants. npm installs use the gateway's verified artifact cache. Third-party repositories
 arrive by `git clone` over an intercepted egress grant for their host, which admits fetch and refuses push. Need a dev
-server? Bind it to a port from `$COWSHED_PORT_BASE + 1` up — each workspace owns a block of `$COWSHED_PORT_BLOCK_SIZE`
-ports from its gateway base (`$COWSHED_PORT_BASE`), reachable from the host browser container-style and guaranteed not
-to collide with sibling workspaces.
+server? On macOS, bind it to a port from `$COWSHED_PORT_BASE + 1` up — each workspace owns a block of
+`$COWSHED_PORT_BLOCK_SIZE` ports from its gateway base (`$COWSHED_PORT_BASE`), reachable from the host browser
+container-style and guaranteed not to collide with sibling workspaces. A new block holds 63 service ports; a service
+set that needs more is a grant to negotiate before you launch it — `cowshed grant <ws> --ports <N>` from the trusted
+host — because growing the block is refused while any of the workspace's jobs is running, and the next exec is the
+first to see the larger block. On Linux your loopback is private, so bind the ports you like.
 
 **Exit code 6 is not an error to retry — it is a request to negotiate.** When cowshed reports 6 it has authoritative
 evidence of the denial (egress denials always — the gateway logged the decision; filesystem denials when the kernel

@@ -4,6 +4,7 @@ use cowshed_core::metadata::{EgressMode, MetadataError, WorkspaceName};
 use cowshed_core::repository::RepoId;
 use std::ffi::{OsStr, OsString};
 use std::fmt;
+use std::num::NonZeroU16;
 use std::path::PathBuf;
 use std::sync::LazyLock;
 
@@ -368,6 +369,9 @@ pub struct GrantArgs {
     /// The mode every `egress` host is granted in: intercepted by default, or `--opaque` for a
     /// client that cannot trust the workspace CA (a pinned client, or Go on macOS).
     pub egress_mode: EgressMode,
+    /// `--ports N`: the minimum number of service ports this workspace's port block must hold,
+    /// excluding the gateway listener. Zero is not a request, so it is unrepresentable here.
+    pub service_ports: Option<NonZeroU16>,
 }
 
 /// `rm <ws>` — retire one workspace.
@@ -752,7 +756,8 @@ fn cli_command() -> ClapCommand {
                     path_values("deny-write"),
                 ])
                 .arg(append_value("egress"))
-                .arg(flag("opaque")),
+                .arg(flag("opaque"))
+                .arg(value("ports")),
         )
         .subcommand(leaf("rm").arg(positional("workspace", 0..=1)).args([
             flag("force"),
@@ -2141,6 +2146,7 @@ const GRANT: CommandSpec = CommandSpec {
         "A path is recorded under its resolved spelling. A symlink planted beside the workspace so `../<name>` resolves (for example `<shed>/<org>/<project>/<name>` pointing at a sibling repository) is readable through the link exactly when its target is granted; grant the target, not the link.",
         "`--project-wide` changes the project's standing policy instead: read paths, egress hosts and workspace-relative write denies every workspace — main, new, and forks — runs under. A workspace grant cannot remove a project deny. A write allow stays per workspace. With no other flags, prints the project's standing policy.",
         "An egress host is intercepted by default: the gateway terminates its TLS under the workspace CA, audits each request, and can attach a credential the host holds. `--opaque` grants the hosts named in the same invocation as opaque tunnels instead, for a client that verifies the real certificate — a pinned client, or Go on macOS, whose platform verifier never trusts the workspace CA. A host holds one rule, so granting it again restates its mode.",
+        "On macOS a workspace's port block starts at 64 ports: the gateway listener at `$COWSHED_PORT_BASE` and 63 service ports above it, and a sandboxed process can connect only to its own blocks. `--ports <N>` grows the block to hold at least N service ports, not counting the gateway port — `cowshed grant raven --ports 80` yields a 128-port block. A block never shrinks, and a count it already holds changes nothing. The block grows into a larger block that contains it when one is free, and otherwise moves to a free larger block; a block it moved from stays reserved to the workspace, and connectable by its jobs, until the workspace is removed. Growth needs an idle workspace: while any of its jobs is running the grant is refused at once rather than queued, so grant ports before launching services. The next exec gets the new `COWSHED_PORT_BASE` and `COWSHED_PORT_BLOCK_SIZE` and the matching sandbox profile. The ports come from the host's finite reserved range, so a block that cannot be placed is refused. Linux has no port block — each workspace's private loopback already holds every port — and refuses `--ports`.",
     ],
     options: &[
         Opt {
@@ -2167,6 +2173,10 @@ const GRANT: CommandSpec = CommandSpec {
             spelling: "--opaque",
             meaning: "grant this invocation's --egress hosts as opaque tunnels instead of intercepted ones",
         },
+        Opt {
+            spelling: "--ports <N>",
+            meaning: "macOS, one workspace only: grow the port block to hold at least N service ports, a positive integer that excludes the gateway port; never shrinks it",
+        },
     ],
 };
 
@@ -2182,6 +2192,12 @@ fn parse_grant(matches: &ArgMatches) -> Result<Command, UsageError> {
         if matches.get_many::<PathBuf>("write").is_some() {
             return Err(UsageError::new(
                 "a project-wide grant carries reads and egress; a write grant is a per-workspace decision",
+                USAGE,
+            ));
+        }
+        if os(matches, "ports").is_some() {
+            return Err(UsageError::new(
+                "a project-wide grant carries reads and egress; --ports sizes one workspace's port block",
                 USAGE,
             ));
         }
@@ -2223,7 +2239,39 @@ fn parse_grant(matches: &ArgMatches) -> Result<Command, UsageError> {
             .unwrap_or_default(),
         egress,
         egress_mode,
+        service_ports: parse_service_ports(matches, USAGE)?,
     }))
+}
+
+/// `--ports <N>`: a positive count of service ports, the gateway port not included. A zero or a
+/// malformed count is refused, never read as "no change": a request the operator typed must
+/// either take effect or say why it cannot.
+fn parse_service_ports(
+    matches: &ArgMatches,
+    usage: &'static CommandSpec,
+) -> Result<Option<NonZeroU16>, UsageError> {
+    let Some(value) = os(matches, "ports") else {
+        return Ok(None);
+    };
+    let count = value
+        .to_str()
+        .and_then(|text| text.parse::<u16>().ok())
+        .ok_or_else(|| {
+            UsageError::new(
+                format!(
+                    "--ports must be a whole number of service ports from 1 to {}, got `{}`",
+                    u16::MAX,
+                    value.to_string_lossy()
+                ),
+                usage,
+            )
+        })?;
+    NonZeroU16::new(count).map(Some).ok_or_else(|| {
+        UsageError::new(
+            "--ports 0 requests no service ports; a port block only grows, so name at least 1",
+            usage,
+        )
+    })
 }
 
 /// Usage text is where the destructive flags are documented: a human reads options here
@@ -2846,6 +2894,71 @@ mod tests {
                 error.message
             );
         }
+    }
+
+    /// `--ports N` is a workspace grant of at least N service ports, gateway excluded. It is not a
+    /// project-wide policy, and a zero or malformed count is refused rather than read as "no
+    /// change" — the operator asked for ports and must hear why none were granted.
+    #[test]
+    fn ports_grants_a_minimum_service_port_count_to_one_workspace() {
+        let listed = parse_args(["grant", "raven"]).expect("listing parses");
+        let Command::Grant(listed) = listed.command else {
+            panic!("expected grant")
+        };
+        assert_eq!(listed.service_ports, None);
+
+        let Command::Grant(grant) = parse_args(["grant", "raven", "--ports", "80"])
+            .expect("ports grant parses")
+            .command
+        else {
+            panic!("expected grant")
+        };
+        assert_eq!(grant.target, GrantTarget::Workspace("raven".to_owned()));
+        assert_eq!(grant.service_ports, NonZeroU16::new(80));
+        assert!(grant.read.is_empty() && grant.write.is_empty() && grant.egress.is_empty());
+
+        let Command::Grant(combined) = parse_args([
+            "grant",
+            "raven",
+            "--egress",
+            "github.com",
+            "--ports",
+            "65535",
+        ])
+        .expect("ports combine with other grants")
+        .command
+        else {
+            panic!("expected grant")
+        };
+        assert_eq!(combined.service_ports, NonZeroU16::new(u16::MAX));
+        assert_eq!(combined.egress, ["github.com"]);
+
+        let project = parse_args(["grant", "--project-wide", "--ports", "80"])
+            .expect_err("project-wide ports refused");
+        assert_eq!(project.kind, UsageErrorKind::InvalidArguments);
+        assert!(project.message.contains("--ports"), "{}", project.message);
+
+        let zero = parse_args(["grant", "raven", "--ports", "0"]).expect_err("zero refused");
+        assert_eq!(zero.kind, UsageErrorKind::InvalidArguments);
+        assert!(zero.message.contains("at least 1"), "{}", zero.message);
+
+        for malformed in ["-1", "80.5", "eighty", "0x50", "65536"] {
+            let error = parse_args(["grant", "raven", "--ports", malformed])
+                .expect_err("malformed refused");
+            assert_eq!(
+                error.kind,
+                UsageErrorKind::InvalidArguments,
+                "{malformed:?}"
+            );
+            assert!(
+                error.message.contains("--ports must be a whole number"),
+                "{malformed:?}: {}",
+                error.message
+            );
+        }
+
+        let missing = parse_args(["grant", "--ports", "80"]).expect_err("no workspace");
+        assert!(missing.message.contains("grant requires a workspace"));
     }
 
     /// The pre-parse walk answers about output shape exactly as the parser would, and it does not

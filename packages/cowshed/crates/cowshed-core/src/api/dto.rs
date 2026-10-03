@@ -2560,6 +2560,18 @@ pub struct GrantDelta {
     pub repos: Vec<RepoRule>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sim: Vec<SimVerb>,
+    /// macOS only: the minimum number of service ports the workspace's port block must hold,
+    /// excluding the gateway listener at its base. Growth is monotone: a count the block already
+    /// holds is a no-op on its own, and `revoke` refuses the field. The block grows into a
+    /// larger aligned block containing it when one is free; otherwise the workspace moves to a
+    /// larger disjoint block and keeps the old one reserved (`GrantSet::retained_port_blocks`)
+    /// until it retires, unless a later block contains it. Either
+    /// way growth needs an idle workspace: it is refused at once, never queued, while any job is
+    /// active, and the next exec starts under the new block's profile and environment. Linux has
+    /// no port block — each workspace's private loopback already holds the whole port space — so
+    /// it refuses the field rather than record a block.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub service_ports: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expected_revision: Option<u64>,
 }

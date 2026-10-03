@@ -1004,6 +1004,7 @@ impl ProjectActor {
         require_coordinator(request.authority())?;
         let params: GrantParams = decode_params(request.params(), request.method())?;
         self.require_repo(&params.repo_id)?;
+        requested_port_block_size(&params.delta, revoke)?;
         let grants = self
             .host
             .grant(params.workspace, params.delta, revoke)
@@ -1892,7 +1893,7 @@ impl Drop for ServedSupervisor {
 #[cfg(target_os = "macos")]
 struct PortGrantReservation {
     grants: GrantSet,
-    marker: PathBuf,
+    markers: Vec<PathBuf>,
     listeners: Vec<std::net::TcpListener>,
 }
 
@@ -1900,7 +1901,14 @@ struct PortGrantReservation {
 impl Drop for PortGrantReservation {
     fn drop(&mut self) {
         self.listeners.clear();
-        let _ = std::fs::remove_file(&self.marker);
+        for marker in &self.markers {
+            if let Err(error) = std::fs::remove_file(marker) {
+                eprintln!(
+                    "cowshed: cannot release port reservation {}: {error}",
+                    marker.display()
+                );
+            }
+        }
     }
 }
 
@@ -1949,9 +1957,17 @@ fn claim_port_block(staging: &Path, base: u16) -> std::io::Result<Option<PathBuf
 #[cfg(target_os = "macos")]
 fn bind_port_block(
     block: crate::metadata::PortBlock,
+    existing: Option<&GrantSet>,
 ) -> std::io::Result<Option<Vec<std::net::TcpListener>>> {
     let mut listeners = Vec::with_capacity(usize::from(block.size()));
     for port in block.base()..block.base() + block.size() {
+        if existing.is_some_and(|grants| {
+            grants
+                .port_blocks()
+                .any(|owned| port >= owned.base() && port - owned.base() < owned.size())
+        }) {
+            continue;
+        }
         match std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)) {
             Ok(listener) => listeners.push(listener),
             Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => return Ok(None),
@@ -1967,23 +1983,41 @@ async fn reserve_specific_port_grants(
     reservation_root: &Path,
     block: crate::metadata::PortBlock,
 ) -> Result<Option<PortGrantReservation>> {
+    reserve_port_grant_replacement(inventory, reservation_root, block, None).await
+}
+
+#[cfg(target_os = "macos")]
+async fn reserve_port_grant_replacement(
+    inventory: &crate::gateway_inventory::NativeGatewayInventory,
+    reservation_root: &Path,
+    block: crate::metadata::PortBlock,
+    existing: Option<&GrantSet>,
+) -> Result<Option<PortGrantReservation>> {
     let grants = GrantSet::closed_baseline(Some(block)).map_err(native_integrity_error)?;
-    let base = block.base();
-    let Some(marker) = claim_port_block(reservation_root, base).map_err(|error| {
-        CowshedError::internal(format!(
-            "claim macOS port block {base} at {}: {error}",
-            reservation_root.display()
-        ))
-    })?
-    else {
-        return Ok(None);
-    };
     let mut reservation = PortGrantReservation {
         grants,
-        marker,
+        markers: Vec::with_capacity(
+            usize::from(block.size()).div_ceil(usize::from(crate::metadata::NEW_PORT_BLOCK_SIZE)),
+        ),
         listeners: Vec::new(),
     };
-    reservation.listeners = match bind_port_block(block).map_err(|error| {
+    // Own every covered initial-size grid cell before publication: a smaller allocator
+    // cannot claim a block in the middle of a larger allocation.
+    for base in (block.base()..block.base() + block.size())
+        .step_by(usize::from(crate::metadata::NEW_PORT_BLOCK_SIZE))
+    {
+        let Some(marker) = claim_port_block(reservation_root, base).map_err(|error| {
+            CowshedError::internal(format!(
+                "claim macOS port block {base} at {}: {error}",
+                reservation_root.display()
+            ))
+        })?
+        else {
+            return Ok(None);
+        };
+        reservation.markers.push(marker);
+    }
+    reservation.listeners = match bind_port_block(block, existing).map_err(|error| {
         CowshedError::environment_missing(
             format!("cannot bind macOS port block {block}: {error}"),
             "check the host's local port availability",
@@ -1992,18 +2026,21 @@ async fn reserve_specific_port_grants(
         Some(listeners) => listeners,
         None => return Ok(None),
     };
-    // A concurrent creator can publish and release its claim after the initial snapshot.
-    // The marker and kernel listeners stay held across this authoritative re-read.
+    // Claims and kernel listeners stay held across the authoritative re-read.
+    // Only blocks already owned by this same workspace may overlap.
     let used = inventory
         .all_reserved_port_blocks()
         .await
         .map_err(native_integrity_error)?;
-    Ok((used.overlapping(block).is_none()).then_some(reservation))
+    Ok((!used.blocks().any(|held| {
+        held.overlaps(block)
+            && !existing.is_some_and(|grants| grants.port_blocks().any(|owned| owned == held))
+    }))
+    .then_some(reservation))
 }
 
-/// Claims the lowest new-size block that shares no port with a live block of any size. Every
-/// allocator claims new-size blocks on one aligned grid, so a claim marker keyed by base is
-/// enough to exclude a concurrent allocator; live blocks of other sizes are excluded by overlap.
+/// Claims the lowest initial-size block disjoint from every published block. All allocation
+/// sizes claim the same grid cells, so unpublished reservations exclude overlapping creators.
 #[cfg(target_os = "macos")]
 async fn reserve_port_grants(
     inventory: &crate::gateway_inventory::NativeGatewayInventory,
@@ -2023,6 +2060,77 @@ async fn reserve_port_grants(
     Err(CowshedError::conflict(
         "no macOS workspace port block remains",
         "remove an unused workspace",
+    ))
+}
+
+#[cfg(target_os = "macos")]
+fn retain_port_authority(grants: &mut GrantSet, block: crate::metadata::PortBlock) {
+    grants
+        .retained_port_blocks
+        .retain(|owned| !block.overlaps(*owned));
+    if let Some(previous) = grants.port_block
+        && !block.overlaps(previous)
+    {
+        grants.retained_port_blocks.push(previous);
+    }
+    grants
+        .retained_port_blocks
+        .sort_unstable_by_key(|owned| owned.base());
+    grants.port_block = Some(block);
+}
+
+#[cfg(target_os = "macos")]
+async fn reserve_grown_port_grants(
+    inventory: &crate::gateway_inventory::NativeGatewayInventory,
+    reservation_root: &Path,
+    owned: &GrantSet,
+    size: u16,
+) -> Result<PortGrantReservation> {
+    let existing = owned.port_block.ok_or_else(|| {
+        CowshedError::integrity("workspace has no port block", "cowshed doctor --json")
+    })?;
+    let used = inventory
+        .all_reserved_port_blocks()
+        .await
+        .map_err(native_integrity_error)?;
+    let overlaps_sibling = |block| {
+        used.blocks()
+            .any(|held| held.overlaps(block) && !owned.port_blocks().any(|own| own == held))
+    };
+    let containing_base = existing.base() - existing.base() % size;
+    if let Ok(block) = crate::metadata::PortBlock::new(containing_base, size)
+        && cowshed_gateway_types::is_macos_port_block(block.base(), block.size())
+        && !overlaps_sibling(block)
+        && let Some(reservation) =
+            reserve_port_grant_replacement(inventory, reservation_root, block, Some(owned)).await?
+    {
+        return Ok(reservation);
+    }
+    for block in crate::metadata::PortBlock::macos_candidates_with_size(size)
+        .map_err(native_integrity_error)?
+    {
+        if block.base() == containing_base || overlaps_sibling(block) {
+            continue;
+        }
+        if let Some(reservation) =
+            reserve_port_grant_replacement(inventory, reservation_root, block, Some(owned)).await?
+        {
+            return Ok(reservation);
+        }
+    }
+    Err(CowshedError::conflict(
+        format!(
+            "no disjoint macOS workspace port block with {} service ports remains; this workspace owns {} ports in its current block and {} retained ports in {} blocks",
+            size - 1,
+            existing.size(),
+            owned
+                .retained_port_blocks
+                .iter()
+                .map(|block| u32::from(block.size()))
+                .sum::<u32>(),
+            owned.retained_port_blocks.len(),
+        ),
+        "remove an unused workspace to release its current and retained ports, then request capacity again",
     ))
 }
 
@@ -8149,6 +8257,7 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
         })
     }
 
+    // Port capacity is a grant, but never a revocation or a silently shrinking allocation.
     async fn grant(
         &mut self,
         workspace: WorkspaceName,
@@ -8157,6 +8266,44 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
     ) -> Result<GrantSet> {
         self.validate_binding().await?;
         let mut current = self.current(&workspace).await?;
+        let required_size = requested_port_block_size(&delta, revoke)?;
+        delta.service_ports = None;
+        let previous_block = current.metadata.grants.port_block.ok_or_else(|| {
+            CowshedError::integrity("workspace has no port block", "cowshed doctor --json")
+        })?;
+        let growth_size = required_size.filter(|size| *size > previous_block.size());
+        // Port authority changes require an idle workspace. The actor rejects a busy
+        // request atomically, without queuing it or stopping any existing workload.
+        let port_lease = if growth_size.is_some() {
+            self.ensure_supervisor(&workspace)
+                .await?
+                .quiesce_if_idle()
+                .await?;
+            Some(self.stop_supervisor(&workspace).await?)
+        } else {
+            None
+        };
+        let reservation = if let Some(size) = growth_size {
+            let inventory = crate::gateway_inventory::NativeGatewayInventory::new(
+                self.descriptor.storage.clone(),
+            );
+            Some(
+                reserve_grown_port_grants(
+                    &inventory,
+                    &self.descriptor.storage.store().join(".staging"),
+                    &current.metadata.grants,
+                    size,
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
+        let replacement_block = reservation
+            .as_ref()
+            .and_then(|reservation| reservation.grants.port_block);
+        let previous_retained_blocks =
+            std::mem::take(&mut current.metadata.grants.retained_port_blocks);
         let lock_path = self
             .layout
             .canonical_image(&workspace)
@@ -8189,6 +8336,19 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                     }
                     normalize_grant_delta(&mut delta)?;
                     let previous = current.metadata.grants.clone();
+                    if let Some(block) = replacement_block {
+                        if previous.port_block != Some(previous_block)
+                            || previous.retained_port_blocks != previous_retained_blocks
+                        {
+                            return Err(CowshedError::conflict(
+                                "workspace port allocation changed during capacity reservation",
+                                "refresh workspace grants and request capacity again",
+                            ));
+                        }
+                        // Immutable profiles can outlive a completed job. A relocated block
+                        // stays owned and connectable; containing growth subsumes it instead.
+                        retain_port_authority(&mut current.metadata.grants, block);
+                    }
                     apply_grant_delta(&mut current.metadata.grants, delta, revoke);
 
                     // Validated as the workspace will run: its own grants plus the project's.
@@ -8222,13 +8382,32 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                         .metadata
                         .write_for_image(&image)
                         .map_err(native_integrity_error)?;
+                    if replacement_block.is_some() {
+                        crate::workspace_credentials::publish_workspace_environment(
+                            &config.workspace_mount,
+                            &config.workspace_mount,
+                            current.metadata.platform,
+                            published.port_block,
+                        )
+                        .map_err(|error| {
+                            CowshedError::internal(format!(
+                                "publish grown workspace port environment: {error}"
+                            ))
+                        })?;
+                    }
                     Ok((published, Some((config, effective_revision))))
                 })()
             })
             .await
             .map_err(native_storage_error)??;
 
-        if let Some((config, effective_revision)) = replacement_config
+        if port_lease.is_some() {
+            // Publish ownership before releasing the kernel reservations; release the
+            // supervisor socket fence only after the new authority is durable.
+            drop(reservation);
+            drop(port_lease);
+            self.ensure_supervisor(&workspace).await?;
+        } else if let Some((config, effective_revision)) = replacement_config
             && self.supervisors.remove(&workspace).is_some()
         {
             // Only the process running the actor can advance it. A supervisor another process
@@ -8338,9 +8517,17 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                 })?,
         )
         .map_err(|_| CowshedError::usage("slot overflows port space", "choose a smaller slot"))?;
-        let block = crate::metadata::PortBlock::new(base, crate::metadata::NEW_PORT_BLOCK_SIZE)
+        let size = current
+            .metadata
+            .grants
+            .port_block
+            .ok_or_else(|| {
+                CowshedError::integrity("workspace has no port block", "cowshed doctor --json")
+            })?
+            .size();
+        let block = crate::metadata::PortBlock::new(base, size)
             .map_err(|error| CowshedError::usage(error.to_string(), "choose another slot"))?;
-        if !crate::metadata::PortBlock::macos_candidates().any(|candidate| candidate == block) {
+        if !cowshed_gateway_types::is_macos_port_block(block.base(), block.size()) {
             return Err(CowshedError::usage(
                 format!("port block {block} is outside the macOS workspace range"),
                 "choose a macOS workspace slot",
@@ -8355,23 +8542,35 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
             .all_reserved_port_blocks()
             .await
             .map_err(native_integrity_error)?;
-        if let Some(held) = used.overlapping(block) {
+        if let Some(held) = used.blocks().find(|held| {
+            held.overlaps(block)
+                && !current
+                    .metadata
+                    .grants
+                    .port_blocks()
+                    .any(|owned| owned == *held)
+        }) {
             return Err(CowshedError::conflict(
                 format!("port block {block} overlaps workspace port block {held}"),
                 "choose an unassigned workspace slot",
             ));
         }
         let reservation_root = self.descriptor.storage.store().join(".staging");
-        let _reservation = reserve_specific_port_grants(&inventory, &reservation_root, block)
-            .await?
-            .ok_or_else(|| {
-                CowshedError::conflict(
-                    format!("port block {block} is already held or bound"),
-                    "choose an unassigned workspace slot",
-                )
-            })?;
+        let _reservation = reserve_port_grant_replacement(
+            &inventory,
+            &reservation_root,
+            block,
+            Some(&current.metadata.grants),
+        )
+        .await?
+        .ok_or_else(|| {
+            CowshedError::conflict(
+                format!("port block {block} is already held or bound"),
+                "choose an unassigned workspace slot",
+            )
+        })?;
         let mut metadata = current.metadata;
-        metadata.grants.port_block = Some(block);
+        retain_port_authority(&mut metadata.grants, block);
         metadata.grants.revision = metadata
             .grants
             .revision
@@ -11654,6 +11853,34 @@ fn sandbox_denial_in(stderr: &str) -> Option<String> {
     })
 }
 
+fn requested_port_block_size(delta: &GrantDelta, revoke: bool) -> Result<Option<u16>> {
+    let Some(service_ports) = delta.service_ports else {
+        return Ok(None);
+    };
+    if revoke {
+        return Err(CowshedError::usage(
+            "workspace service port capacity cannot be revoked",
+            "request a minimum capacity with cowshed grant --ports",
+        ));
+    }
+    if cfg!(target_os = "linux") {
+        return Err(CowshedError::usage(
+            "Linux workspaces already have private network namespaces, not port blocks",
+            "bind service ports directly inside the workspace",
+        ));
+    }
+    crate::metadata::PortBlock::size_for_service_ports(service_ports)
+        .map(Some)
+        .map_err(|_| {
+            CowshedError::usage(
+                format!(
+                    "{service_ports} service ports do not fit the host's macOS workspace port range"
+                ),
+                "request a positive capacity within the available host port space",
+            )
+        })
+}
+
 #[cfg(target_os = "macos")]
 fn normalize_grant_delta(delta: &mut GrantDelta) -> Result<()> {
     normalize_grant_paths(&mut delta.read)?;
@@ -11897,6 +12124,7 @@ mod grant_unit_tests {
             shed_links: Vec::new(),
             exec_temp_dir: PathBuf::from("/private/tmp/cowshed-grant-unit"),
             port_block: crate::metadata::PortBlock::new(40_960, 16).unwrap(),
+            retained_port_blocks: Vec::new(),
             mode: RunSandboxMode::ReadWrite,
             grants: SandboxGrants::default(),
             allowed_unix_sockets: Vec::new(),
@@ -15466,7 +15694,10 @@ mod binding_tests {
 
 #[cfg(all(test, target_os = "macos"))]
 mod port_reservation_tests {
-    use super::{claim_port_block, reserve_port_grants};
+    use super::{
+        claim_port_block, reserve_grown_port_grants, reserve_port_grant_replacement,
+        reserve_port_grants,
+    };
     use crate::gateway_inventory::NativeGatewayInventory;
     use crate::metadata::{
         DetachedWorkspaceMetadata, GrantSet, MACOS_PORT_MIN, Platform, PortBlock, PublicationState,
@@ -15508,6 +15739,94 @@ mod port_reservation_tests {
         (NativeGatewayInventory::new(storage), layout)
     }
 
+    #[test]
+    fn requested_capacity_is_not_limited_to_the_initial_block_size() {
+        for (services, size) in [
+            (1, 2),
+            (63, 64),
+            (64, 128),
+            (80, 128),
+            (255, 256),
+            (8191, 8192),
+        ] {
+            assert_eq!(PortBlock::size_for_service_ports(services).unwrap(), size);
+            let blocks = PortBlock::macos_candidates_with_size(size)
+                .unwrap()
+                .collect::<Vec<_>>();
+            assert!(!blocks.is_empty());
+            assert!(blocks.windows(2).all(|pair| !pair[0].overlaps(pair[1])));
+        }
+        for services in [0, 8192, u16::MAX] {
+            assert!(PortBlock::size_for_service_ports(services).is_err());
+        }
+    }
+
+    #[test]
+    fn relocation_retains_authority_and_containing_growth_coalesces_it() {
+        let first = PortBlock::new(40960, 64).unwrap();
+        let second = PortBlock::new(41216, 128).unwrap();
+        let third = PortBlock::new(41472, 256).unwrap();
+        let containing = PortBlock::new(40960, 1024).unwrap();
+        let mut grants = GrantSet::closed_baseline(Some(first)).unwrap();
+        super::retain_port_authority(&mut grants, second);
+        assert_eq!(grants.retained_port_blocks, [first]);
+        super::retain_port_authority(&mut grants, third);
+        assert_eq!(grants.retained_port_blocks, [first, second]);
+        grants.validate(Platform::Macos).unwrap();
+        super::retain_port_authority(&mut grants, containing);
+        assert_eq!(grants.port_block, Some(containing));
+        assert!(grants.retained_port_blocks.is_empty());
+        grants.validate(Platform::Macos).unwrap();
+    }
+
+    #[test]
+    fn reusing_a_retained_slot_does_not_accumulate_authority() {
+        let first = PortBlock::new(40960, 64).unwrap();
+        let second = PortBlock::new(41024, 64).unwrap();
+        let mut grants = GrantSet::closed_baseline(Some(first)).unwrap();
+        for _ in 0..128 {
+            super::retain_port_authority(&mut grants, second);
+            assert_eq!(grants.retained_port_blocks, [first]);
+            super::retain_port_authority(&mut grants, first);
+            assert_eq!(grants.retained_port_blocks, [second]);
+        }
+        grants.validate(Platform::Macos).unwrap();
+    }
+
+    #[tokio::test]
+    async fn larger_unpublished_claim_excludes_every_smaller_grid_cell() {
+        let root = root("large-claim");
+        let (inventory, _) = inventory(&root);
+        let staging = root.join("store/.staging");
+        let existing = reserve_port_grants(&inventory, &staging, Default::default())
+            .await
+            .expect("initial allocation");
+        let owned = existing.grants.clone();
+        drop(existing);
+        let grown = reserve_grown_port_grants(&inventory, &staging, &owned, 128)
+            .await
+            .expect("grow beyond 64");
+        let block = grown.grants.port_block.unwrap();
+        for base in [block.base(), block.base() + 64] {
+            assert!(claim_port_block(&staging, base).unwrap().is_none());
+            let smaller = PortBlock::new(base, 64).unwrap();
+            assert!(
+                reserve_port_grant_replacement(&inventory, &staging, smaller, None)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        drop(grown);
+        for base in [block.base(), block.base() + 64] {
+            let marker = claim_port_block(&staging, base)
+                .unwrap()
+                .expect("all grid claims release together");
+            std::fs::remove_file(marker).unwrap();
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[tokio::test]
     async fn publication_after_snapshot_and_before_claim_cannot_reuse_a_port_block() {
         let root = root("publication");
@@ -15521,7 +15840,7 @@ mod port_reservation_tests {
 
         // Pause the second allocator at its snapshot boundary. The first completes the
         // real claim -> canonical image/metadata publication -> reservation release handoff.
-        let first = reserve_port_grants(&inventory, &staging, stale.clone())
+        let mut first = reserve_port_grants(&inventory, &staging, stale.clone())
             .await
             .expect("first allocation");
         let first_block = first.grants.port_block.expect("first block");
@@ -15553,6 +15872,14 @@ mod port_reservation_tests {
         }
         .write_for_image(image.image())
         .expect("publish allocation");
+        // Transfer one reserved listener without an unbound interval: another concurrent
+        // fixture may claim every newly free host port immediately.
+        let service_index = first
+            .listeners
+            .iter()
+            .position(|listener| listener.local_addr().unwrap().port() == first_base + 1)
+            .expect("reserved service listener");
+        let old_listener = first.listeners.swap_remove(service_index);
         drop(first);
         assert_eq!(
             inventory
@@ -15572,6 +15899,45 @@ mod port_reservation_tests {
         let second_block = second.grants.port_block.expect("second block");
         let second_base = second_block.base();
         assert!(!second_block.overlaps(first_block));
+        // Growth must exclude the second creator's unpublished claim as well as every
+        // published sibling. Publish its variable size before releasing the reservation.
+        let mut metadata =
+            DetachedWorkspaceMetadata::read_for_image(image.image()).expect("current allocation");
+        let grown = reserve_grown_port_grants(&inventory, &staging, &metadata.grants, 128)
+            .await
+            .expect("grow around a concurrent creator");
+        let grown_block = grown.grants.port_block.unwrap();
+        assert!(!grown_block.overlaps(second_block));
+        assert_eq!(grown_block.size(), 128);
+        super::retain_port_authority(&mut metadata.grants, grown_block);
+        metadata.grants.revision += 1;
+        metadata.write_for_image(image.image()).unwrap();
+        drop(grown);
+        let held = inventory
+            .all_reserved_port_blocks()
+            .await
+            .unwrap()
+            .blocks()
+            .collect::<Vec<_>>();
+        assert!(held.contains(&grown_block));
+        if !grown_block.overlaps(first_block) {
+            assert!(
+                held.contains(&first_block),
+                "relocation never releases old authority"
+            );
+        }
+        assert!(!held.iter().any(|block| block.overlaps(second_block)));
+        let third = reserve_port_grants(&inventory, &staging, Default::default())
+            .await
+            .expect("a stale allocator still excludes current and retained authority");
+        let third_block = third.grants.port_block.unwrap();
+        assert!(
+            !metadata
+                .grants
+                .port_blocks()
+                .any(|owned| owned.overlaps(third_block))
+        );
+        drop(third);
         assert!(
             claim_port_block(&staging, second_base)
                 .expect("competing claim")
@@ -15586,6 +15952,7 @@ mod port_reservation_tests {
             .expect("claim after owner release")
             .expect("successful owner releases marker");
         std::fs::remove_file(released).expect("release probe");
+        drop(old_listener);
         std::fs::remove_dir_all(root).expect("cleanup");
     }
 
@@ -15719,8 +16086,8 @@ mod port_reservation_tests {
         std::fs::remove_dir_all(root).expect("cleanup");
     }
 
-    /// A workspace keeps the block size it was allocated with, so the store holds blocks of
-    /// several sizes at once. Live 16-port blocks sit inside the first two 64-port candidates —
+    /// A workspace keeps its recorded grant size until an explicit capacity grant, so the store
+    /// holds several sizes at once. Live 16-port blocks sit inside the first two 64-port candidates —
     /// one published, one fenced into a pending clone — and a new workspace gets a 64-port block
     /// that overlaps neither, then the next one after it.
     #[tokio::test]

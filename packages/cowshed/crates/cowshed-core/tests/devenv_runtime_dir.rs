@@ -6,23 +6,27 @@
 
 #![cfg(target_os = "macos")]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
+use std::io::ErrorKind;
+use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use cowshed_core::api::{ExitStatus, JobId};
-use cowshed_core::metadata::{PortBlock, WorkspaceIncarnation, WorkspaceName};
+use cowshed_core::metadata::{MACOS_PORT_MIN, PortBlock, WorkspaceIncarnation, WorkspaceName};
 use cowshed_core::repository::RepoId;
 use cowshed_core::runtime::supervisor::{
-    ProcessEvent, ProcessSpawnRequest, SandboxPolicy, SpawnSink, SystemSpawnSink,
-    WorkspaceAuthoritySnapshot,
+    ProcessEvent, ProcessSignal, ProcessSpawnRequest, RunningProcess, SandboxPolicy, SpawnSink,
+    SystemSpawnSink, WorkspaceAuthoritySnapshot,
 };
 use cowshed_core::sandbox::{
     RunSandboxMode, SandboxConfig, SandboxGrants, sandbox_runtime_dir, sandbox_runtime_link,
 };
 use cowshed_core::storage::job_artifact::StreamKind;
 use cowshed_core::workspace_credentials::WORKSPACE_TOKEN_PATH;
+use cowshed_core::workspace_environment::{PORT_BASE_ENV, PORT_BLOCK_SIZE_ENV};
 use cowshed_gateway_types::WorkspaceToken;
 
 use tokio::sync::mpsc;
@@ -87,6 +91,7 @@ fn workspace(root: &Path, port_base: u16) -> SandboxConfig {
         workspace_mount: mount,
         exec_temp_dir,
         port_block: PortBlock::new(port_base, 16).expect("port block"),
+        retained_port_blocks: Vec::new(),
         mode: RunSandboxMode::ReadWrite,
         grants: SandboxGrants::default(),
         allowed_unix_sockets: Vec::new(),
@@ -557,6 +562,393 @@ async fn host_controller_proxy_bypass_does_not_admit_unallocated_loopback_ports(
     std::fs::remove_dir_all(root).expect("remove test workspace");
 }
 
+/// Turns this test binary into a TCP probe inside a workspace sandbox: `listen <port>,…` holds
+/// the block's listener pairs and the named retained-block ports until stdin ends;
+/// `connect <port>,…` reports what each connect met.
+const TCP_PROBE: &str = "COWSHED_TCP_PROBE";
+const TCP_PROBE_TEST: &str = "host_controller_tcp_probe_runs_as_a_sandboxed_child";
+/// The prefix of every line the probe reports; the test harness's own output has none.
+const TCP_PROBE_LINE: &str = "tcp-probe ";
+const TCP_PROBE_IO: Duration = Duration::from_secs(3);
+/// The size every workspace's block used to be capped at, and a block grown past it.
+const CAPPED_BLOCK_SIZE: u16 = 64;
+const GROWN_BLOCK_SIZE: u16 = 128;
+/// 80 service ports held at once: more than a capped block has at all.
+const LISTENER_PAIRS: u16 = 40;
+
+/// Pair `i` is a block's `i`th service port from the bottom and from the top (the base is the
+/// gateway's), so every pair straddles the capped block's boundary and the block's last port is
+/// held. The controller lays the pairs out from the block it built, the probe from the base and
+/// size its environment names, so the two agree only if the environment carries the grown block.
+fn listener_pairs(base: u16, size: u16) -> Vec<[u16; 2]> {
+    (0..LISTENER_PAIRS)
+        .map(|pair| [base + 1 + pair, base + size - 1 - pair])
+        .collect()
+}
+
+/// The sandboxed half of the grown-block regression: this test binary, executed inside a
+/// workspace sandbox with its probe named in the environment. Run without one, it has nothing
+/// to answer.
+#[test]
+#[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
+fn host_controller_tcp_probe_runs_as_a_sandboxed_child() {
+    let Ok(probe) = std::env::var(TCP_PROBE) else {
+        return;
+    };
+    let port = |name: &str| -> u16 {
+        let value = std::env::var(name).unwrap_or_else(|error| panic!("{name}: {error}"));
+        value
+            .parse()
+            .unwrap_or_else(|error| panic!("{name}={value}: {error}"))
+    };
+    let base = port(PORT_BASE_ENV);
+    if let Some(retained) = probe.strip_prefix("listen ") {
+        hold_listener_pairs(base, port(PORT_BLOCK_SIZE_ENV), parse_ports(retained));
+    } else if let Some(targets) = probe.strip_prefix("connect ") {
+        connect_beyond_the_block(base, parse_ports(targets));
+    } else {
+        panic!("unknown TCP probe `{probe}`");
+    }
+}
+
+fn format_ports(ports: &[u16]) -> String {
+    ports
+        .iter()
+        .map(u16::to_string)
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn parse_ports(ports: &str) -> Vec<u16> {
+    ports
+        .split(',')
+        .map(|port| {
+            port.parse()
+                .unwrap_or_else(|error| panic!("probe port `{port}`: {error}"))
+        })
+        .collect()
+}
+
+/// Binds every pair's ports and the named ports of a retained block, connects to each while all
+/// of them stay bound, then holds them until the controller closes stdin. A connection waiting
+/// on any listener afterwards is one the sandbox let through from outside this process.
+fn hold_listener_pairs(base: u16, size: u16, retained: Vec<u16>) {
+    use std::io::Read;
+
+    let listeners: Vec<(u16, TcpListener)> = listener_pairs(base, size)
+        .into_iter()
+        .flatten()
+        .chain(retained)
+        .map(
+            |port| match TcpListener::bind((Ipv4Addr::LOCALHOST, port)) {
+                Ok(listener) => (port, listener),
+                Err(error) => panic!("bind 127.0.0.1:{port} inside the sandbox: {error}"),
+            },
+        )
+        .collect();
+    for (port, listener) in &listeners {
+        roundtrip(listener, *port);
+        println!("{TCP_PROBE_LINE}{port} roundtrip");
+    }
+    println!("{TCP_PROBE_LINE}ready");
+    // The controller's stdin pipe is the hold: it ends when the controller closes it, kills this
+    // process group, or exits.
+    std::io::stdin()
+        .read_to_end(&mut Vec::new())
+        .expect("hold until the controller closes stdin");
+    for (port, listener) in &listeners {
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking listener");
+        match listener.accept() {
+            Err(error) if error.kind() == ErrorKind::WouldBlock => {}
+            Ok((_, peer)) => println!("{TCP_PROBE_LINE}{port} reached by {peer}"),
+            Err(error) => panic!("accept on {port}: {error}"),
+        }
+    }
+}
+
+/// Roundtrips one connection to the block's first service port, then reports what connecting
+/// to each target met: `denied` is the profile refusing the connect inside this process.
+fn connect_beyond_the_block(base: u16, targets: Vec<u16>) {
+    let own = base + 1;
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, own))
+        .unwrap_or_else(|error| panic!("bind 127.0.0.1:{own} inside the sandbox: {error}"));
+    roundtrip(&listener, own);
+    println!("{TCP_PROBE_LINE}{own} roundtrip");
+    for port in targets {
+        match TcpStream::connect_timeout(
+            &SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
+            TCP_PROBE_IO,
+        ) {
+            Ok(_) => println!("{TCP_PROBE_LINE}{port} connected"),
+            Err(error) if error.kind() == ErrorKind::PermissionDenied => {
+                println!("{TCP_PROBE_LINE}{port} denied");
+            }
+            Err(error) => println!("{TCP_PROBE_LINE}{port} {error}"),
+        }
+    }
+}
+
+/// One request and reply over a connection this process makes to `listener`. The client closes
+/// first, so the `TIME_WAIT` lands on its ephemeral port and the listener's port is free again
+/// as soon as the listener goes.
+fn roundtrip(listener: &TcpListener, port: u16) {
+    use std::io::{Read, Write};
+
+    let mut client =
+        TcpStream::connect_timeout(&SocketAddr::from((Ipv4Addr::LOCALHOST, port)), TCP_PROBE_IO)
+            .unwrap_or_else(|error| panic!("connect to 127.0.0.1:{port}: {error}"));
+    let (mut accepted, peer) = listener
+        .accept()
+        .unwrap_or_else(|error| panic!("accept on {port}: {error}"));
+    assert_eq!(
+        peer,
+        client.local_addr().expect("client address"),
+        "port {port} accepted a connection that is not the probe's"
+    );
+    for stream in [&client, &accepted] {
+        stream
+            .set_read_timeout(Some(TCP_PROBE_IO))
+            .expect("read timeout");
+        stream
+            .set_write_timeout(Some(TCP_PROBE_IO))
+            .expect("write timeout");
+    }
+    let request = port.to_be_bytes();
+    client.write_all(&request).expect("request");
+    let mut received = [0_u8; 2];
+    accepted.read_exact(&mut received).expect("receive request");
+    assert_eq!(received, request, "request on {port}");
+    accepted.write_all(&received).expect("reply");
+    let mut reply = [0_u8; 2];
+    client.read_exact(&mut reply).expect("receive reply");
+    assert_eq!(reply, request, "reply on {port}");
+    drop(client);
+    assert_eq!(
+        accepted.read(&mut [0_u8; 1]).expect("client close"),
+        0,
+        "the client on {port} closed after the reply"
+    );
+}
+
+/// The grown block a relocated workspace now holds, the 64-port block it was relocated from and
+/// still retains, and a sibling workspace's block between them: adjacent to both, so the grown
+/// block's last port and the retained block's base border it.
+struct ProbeBlocks {
+    own: PortBlock,
+    sibling: PortBlock,
+    retained: PortBlock,
+    /// A kernel claim shared across parallel runs and TMPDIR namespaces. The probe's
+    /// service listeners never use the current gateway port.
+    _claim: TcpListener,
+}
+
+impl ProbeBlocks {
+    /// The retained block's first and last port: the old gateway port and its last service port.
+    fn retained_ports(&self) -> [u16; 2] {
+        let ports = self.retained.ports().expect("retained block");
+        [*ports.start(), *ports.end()]
+    }
+}
+
+/// Blocks below the macOS allocator range, where live workspaces hold theirs, whose probed ports
+/// are free on this host.
+fn free_probe_blocks() -> ProbeBlocks {
+    (32_768..MACOS_PORT_MIN)
+        .step_by(usize::from(4 * GROWN_BLOCK_SIZE))
+        .find_map(|base| {
+            let claim = TcpListener::bind((Ipv4Addr::LOCALHOST, base)).ok()?;
+            let blocks = ProbeBlocks {
+                own: PortBlock::new(base, GROWN_BLOCK_SIZE).expect("aligned grown block"),
+                sibling: PortBlock::new(base + GROWN_BLOCK_SIZE, GROWN_BLOCK_SIZE)
+                    .expect("aligned sibling block"),
+                retained: PortBlock::new(base + 2 * GROWN_BLOCK_SIZE, CAPPED_BLOCK_SIZE)
+                    .expect("aligned retained block"),
+                _claim: claim,
+            };
+            listener_pairs(base, GROWN_BLOCK_SIZE)
+                .into_iter()
+                .flatten()
+                .chain(blocks.retained_ports())
+                .chain([blocks.sibling.base() + 1])
+                .map(|port| TcpListener::bind((Ipv4Addr::LOCALHOST, port)))
+                .collect::<Result<Vec<_>, _>>()
+                .is_ok()
+                .then_some(blocks)
+        })
+        .expect("free probe blocks below the macOS allocator range")
+}
+
+/// Every port is bound by someone else: a listener this host process cannot take.
+fn assert_ports_held(ports: &[u16], moment: &str) {
+    for port in ports {
+        match TcpListener::bind((Ipv4Addr::LOCALHOST, *port)) {
+            Err(error) if error.kind() == ErrorKind::AddrInUse => {}
+            Ok(_) => panic!("127.0.0.1:{port} was free {moment}: the holder is not listening"),
+            Err(error) => panic!("probe 127.0.0.1:{port} {moment}: {error}"),
+        }
+    }
+}
+
+fn probe_lines(stdout: &[u8]) -> Vec<String> {
+    String::from_utf8_lossy(stdout)
+        .lines()
+        .filter(|line| line.starts_with(TCP_PROBE_LINE))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// A workspace holding `block` and `retained` whose children may also read, and so execute,
+/// this test binary.
+fn probe_workspace(
+    root: &Path,
+    block: PortBlock,
+    retained: Vec<PortBlock>,
+    probe: &Path,
+) -> SandboxConfig {
+    let mut sandbox = workspace(root, block.base());
+    sandbox.port_block = block;
+    sandbox.retained_port_blocks = retained;
+    sandbox.grants.read.push(probe.to_path_buf());
+    sandbox
+}
+
+fn tcp_probe_request(
+    sandbox: &SandboxConfig,
+    probe: &Path,
+    operation: String,
+) -> ProcessSpawnRequest {
+    let mut request = spawn_request(
+        sandbox,
+        &sandbox.workspace_mount,
+        vec![
+            probe.into(),
+            "--exact".into(),
+            TCP_PROBE_TEST.into(),
+            "--ignored".into(),
+            "--nocapture".into(),
+            // Terse output prints nothing as a test starts, so every probe line starts a line.
+            "--quiet".into(),
+        ],
+    );
+    request.env.insert(TCP_PROBE.to_owned(), operation);
+    request
+}
+
+/// A workspace relocated to a grown block holds 40 listener pairs at once: 80 service ports,
+/// more than a capped block has, one of every pair past its boundary and one the block's last
+/// port. It still holds the 64-port block it was relocated from, so it also listens on that
+/// block's first and last port. The executed child binds them all inside its sandbox, the pairs
+/// from the base and size its environment names, and roundtrips a connection to every one. A
+/// sibling workspace's sandbox holding the block between the two meanwhile reaches its own port
+/// and is denied every one of them, while each stays bound and none sees a connection.
+#[tokio::test]
+#[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
+async fn host_controller_a_grown_port_block_holds_listener_pairs_no_sibling_reaches() {
+    let blocks = free_probe_blocks();
+    let ProbeBlocks {
+        own,
+        sibling,
+        retained,
+        ..
+    } = blocks;
+    for (left, right) in [(own, sibling), (sibling, retained), (own, retained)] {
+        assert!(!left.overlaps(right), "{left} and {right} are disjoint");
+    }
+    let pairs: Vec<u16> = listener_pairs(own.base(), own.size())
+        .into_iter()
+        .flatten()
+        .collect();
+    let service = own.ports().expect("grown block");
+    assert_eq!(
+        pairs
+            .iter()
+            .filter(|port| service.contains(*port) && **port != own.base())
+            .collect::<BTreeSet<_>>()
+            .len(),
+        usize::from(2 * LISTENER_PAIRS),
+        "every listener holds its own service port of the grown block"
+    );
+    assert_eq!(
+        pairs
+            .iter()
+            .filter(|port| **port - own.base() >= CAPPED_BLOCK_SIZE)
+            .count(),
+        usize::from(LISTENER_PAIRS),
+        "one port of every pair lies past the capped block"
+    );
+    assert!(pairs.contains(service.end()));
+    let retained_ports = blocks.retained_ports();
+    let ports: Vec<u16> = pairs.iter().copied().chain(retained_ports).collect();
+
+    let probe = std::fs::canonicalize(std::env::current_exe().expect("test binary"))
+        .expect("canonical test binary");
+    let own_root = scratch("grown-ports");
+    let sibling_root = scratch("grown-ports-sibling");
+    let holder = probe_workspace(&own_root, own, vec![retained], &probe);
+    let neighbour = probe_workspace(&sibling_root, sibling, Vec::new(), &probe);
+
+    let mut held = SandboxedChild::spawn(tcp_probe_request(
+        &holder,
+        &probe,
+        format!("listen {}", format_ports(&retained_ports)),
+    ))
+    .await;
+    held.until_probe_line(&format!("{TCP_PROBE_LINE}ready"))
+        .await;
+    assert_ports_held(&ports, "once the holder was ready");
+    let (exit, stdout, stderr) = SandboxedChild::run(tcp_probe_request(
+        &neighbour,
+        &probe,
+        format!("connect {}", format_ports(&ports)),
+    ))
+    .await;
+    assert_eq!(
+        exit,
+        ExitStatus::Exited { code: 0 },
+        "sibling probe: {}",
+        String::from_utf8_lossy(&stderr)
+    );
+    assert_eq!(
+        probe_lines(&stdout),
+        std::iter::once(format!("{TCP_PROBE_LINE}{} roundtrip", sibling.base() + 1))
+            .chain(
+                ports
+                    .iter()
+                    .map(|port| format!("{TCP_PROBE_LINE}{port} denied"))
+            )
+            .collect::<Vec<_>>(),
+        "the sibling reaches its own block and no listener of the grown or retained one"
+    );
+    assert_ports_held(&ports, "after the sibling's connects");
+
+    held.close_stdin();
+    let (exit, stdout, stderr) = held.wait().await;
+    assert_eq!(
+        exit,
+        ExitStatus::Exited { code: 0 },
+        "holding probe: {}",
+        String::from_utf8_lossy(&stderr)
+    );
+    assert_eq!(
+        probe_lines(&stdout),
+        ports
+            .iter()
+            .map(|port| format!("{TCP_PROBE_LINE}{port} roundtrip"))
+            .chain([format!("{TCP_PROBE_LINE}ready")])
+            .collect::<Vec<_>>(),
+        "every listener roundtrips inside the sandbox and no sibling connect reaches one"
+    );
+    for port in &ports {
+        TcpListener::bind((Ipv4Addr::LOCALHOST, *port)).unwrap_or_else(|error| {
+            panic!("127.0.0.1:{port} stayed bound after the holder exited: {error}")
+        });
+    }
+    std::fs::remove_dir_all(own_root).expect("remove grown workspace");
+    std::fs::remove_dir_all(sibling_root).expect("remove sibling workspace");
+}
+
 fn spawn_request(sandbox: &SandboxConfig, cwd: &Path, argv: Vec<OsString>) -> ProcessSpawnRequest {
     ProcessSpawnRequest {
         authority: WorkspaceAuthoritySnapshot {
@@ -577,39 +969,114 @@ fn spawn_request(sandbox: &SandboxConfig, cwd: &Path, argv: Vec<OsString>) -> Pr
     }
 }
 
+/// A child running under the real sandbox, its output collected as it arrives. Dropping one that
+/// has not exited kills its process group, so a failed assertion leaves nothing behind.
+struct SandboxedChild {
+    process: Box<dyn RunningProcess>,
+    events: mpsc::Receiver<ProcessEvent>,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    exit: Option<ExitStatus>,
+    eof: usize,
+}
+
+impl SandboxedChild {
+    async fn spawn(request: ProcessSpawnRequest) -> Self {
+        let (events, receiver) = mpsc::channel(16);
+        let process = SystemSpawnSink::default()
+            .spawn(request, events)
+            .await
+            .expect("spawn through the real sandbox");
+        Self {
+            process,
+            events: receiver,
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            exit: None,
+            eof: 0,
+        }
+    }
+
+    async fn run(request: ProcessSpawnRequest) -> (ExitStatus, Vec<u8>, Vec<u8>) {
+        let mut child = Self::spawn(request).await;
+        child.close_stdin();
+        child.wait().await
+    }
+
+    fn close_stdin(&mut self) {
+        self.process.close_stdin().expect("close stdin");
+    }
+
+    fn finished(&self) -> bool {
+        self.exit.is_some() && self.eof == 2
+    }
+
+    /// Advances on the child's next event. The deadline only guards a hang, and names what is
+    /// still open when it fires.
+    async fn step(&mut self) {
+        let Ok(event) = tokio::time::timeout(Duration::from_secs(30), self.events.recv()).await
+        else {
+            panic!(
+                "sandboxed child hung: exit {:?}, {} of 2 output streams ended\nstdout: {}\nstderr: {}",
+                self.exit,
+                self.eof,
+                String::from_utf8_lossy(&self.stdout),
+                String::from_utf8_lossy(&self.stderr)
+            );
+        };
+        let event = event.expect("process event channel remains open until exit and EOF");
+        match event {
+            ProcessEvent::Output { stream, bytes, .. } => match stream {
+                StreamKind::Stdout => self.stdout.extend_from_slice(&bytes),
+                StreamKind::Stderr => self.stderr.extend_from_slice(&bytes),
+            },
+            ProcessEvent::OutputEof { .. } => self.eof += 1,
+            ProcessEvent::Exited { exit, .. } => self.exit = Some(exit),
+            ProcessEvent::WaitFailed { error, .. } => panic!("child wait failed: {error}"),
+            _ => {}
+        }
+    }
+
+    /// Waits, while the child keeps running, until it reports `line`.
+    async fn until_probe_line(&mut self, line: &str) {
+        while !probe_lines(&self.stdout).iter().any(|seen| seen == line) {
+            assert!(
+                !self.finished(),
+                "the child ended before reporting `{line}`: {}",
+                String::from_utf8_lossy(&self.stderr)
+            );
+            self.step().await;
+        }
+    }
+
+    async fn wait(mut self) -> (ExitStatus, Vec<u8>, Vec<u8>) {
+        while !self.finished() {
+            self.step().await;
+        }
+        (
+            self.exit.clone().expect("observed child exit"),
+            std::mem::take(&mut self.stdout),
+            std::mem::take(&mut self.stderr),
+        )
+    }
+}
+
+impl Drop for SandboxedChild {
+    fn drop(&mut self) {
+        if self.exit.is_none()
+            && let Err(error) = self.process.signal_process_tree(ProcessSignal::Kill)
+        {
+            eprintln!("cannot kill the sandboxed child: {error}");
+        }
+    }
+}
+
 async fn run_in_sandbox(
     sandbox: &SandboxConfig,
     cwd: &Path,
     argv: Vec<OsString>,
 ) -> (ExitStatus, Vec<u8>, Vec<u8>) {
-    let request = spawn_request(sandbox, cwd, argv);
-    let (events, mut receiver) = mpsc::channel(16);
-    let mut process = SystemSpawnSink::default()
-        .spawn(request, events)
-        .await
-        .expect("spawn through the real sandbox");
-    process.close_stdin().expect("close unused stdin");
-    let mut stdout = Vec::new();
-    let mut stderr = Vec::new();
-    let mut exit = None;
-    let mut eof = 0;
-    while exit.is_none() || eof < 2 {
-        let event = tokio::time::timeout(std::time::Duration::from_secs(30), receiver.recv())
-            .await
-            .expect("sandboxed command terminates")
-            .expect("process event channel remains open until exit and EOF");
-        match event {
-            ProcessEvent::Output { stream, bytes, .. } => match stream {
-                StreamKind::Stdout => stdout.extend_from_slice(&bytes),
-                StreamKind::Stderr => stderr.extend_from_slice(&bytes),
-            },
-            ProcessEvent::OutputEof { .. } => eof += 1,
-            ProcessEvent::Exited { exit: status, .. } => exit = Some(status),
-            ProcessEvent::WaitFailed { error, .. } => panic!("child wait failed: {error}"),
-            _ => {}
-        }
-    }
-    (exit.expect("observed child exit"), stdout, stderr)
+    SandboxedChild::run(spawn_request(sandbox, cwd, argv)).await
 }
 
 #[tokio::test]

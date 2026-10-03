@@ -49,6 +49,10 @@ pub enum MetadataError {
         base: u16,
         size: u16,
     },
+    OverlappingPortBlocks {
+        first: PortBlock,
+        second: PortBlock,
+    },
     InvalidPath {
         path: PathBuf,
         reason: &'static str,
@@ -107,6 +111,9 @@ impl fmt::Display for MetadataError {
             ),
             Self::InvalidPortBlock { base, size } => {
                 write!(f, "invalid port block {{ base: {base}, size: {size} }}")
+            }
+            Self::OverlappingPortBlocks { first, second } => {
+                write!(f, "workspace port blocks {first} and {second} overlap")
             }
             Self::InvalidPath { path, reason } => {
                 write!(f, "invalid metadata path {}: {reason}", path.display())
@@ -796,7 +803,7 @@ pub struct PortBlock {
 
 impl PortBlock {
     /// A block is valid against its own size: a power of two of at least two ports, with `base`
-    /// aligned to it. Live blocks keep the size they were allocated with.
+    /// aligned to it. Capacity grants may replace it with a larger valid block.
     pub fn new(base: u16, size: u16) -> Result<Self, MetadataError> {
         if is_port_block(base, size) {
             Ok(Self { base, size })
@@ -807,12 +814,36 @@ impl PortBlock {
 
     /// Every new-size block of the macOS range, lowest first.
     pub fn macos_candidates() -> impl Iterator<Item = Self> {
-        (MACOS_PORT_MIN..=MACOS_PORT_MAX - (NEW_PORT_BLOCK_SIZE - 1))
-            .step_by(usize::from(NEW_PORT_BLOCK_SIZE))
-            .map(|base| Self {
-                base,
-                size: NEW_PORT_BLOCK_SIZE,
-            })
+        Self::macos_candidates_with_size(NEW_PORT_BLOCK_SIZE)
+            .expect("the initial block size fits the macOS workspace range")
+    }
+
+    /// Growable allocations use the same aligned, disjoint-block grammar as initial ones.
+    pub fn macos_candidates_with_size(
+        size: u16,
+    ) -> Result<impl Iterator<Item = Self>, MetadataError> {
+        if !is_macos_port_block(MACOS_PORT_MIN, size) {
+            return Err(MetadataError::InvalidPortBlock {
+                base: MACOS_PORT_MIN,
+                size,
+            });
+        }
+        Ok((MACOS_PORT_MIN..=MACOS_PORT_MAX - (size - 1))
+            .step_by(usize::from(size))
+            .map(move |base| Self { base, size }))
+    }
+
+    /// Minimum block containing the gateway plus the requested service capacity.
+    pub fn size_for_service_ports(service_ports: u16) -> Result<u16, MetadataError> {
+        let size = service_ports
+            .checked_add(1)
+            .and_then(u16::checked_next_power_of_two)
+            .filter(|size| service_ports != 0 && is_macos_port_block(MACOS_PORT_MIN, *size))
+            .ok_or(MetadataError::InvalidPortBlock {
+                base: MACOS_PORT_MIN,
+                size: service_ports,
+            })?;
+        Ok(size)
     }
 
     pub const fn base(self) -> u16 {
@@ -848,7 +879,7 @@ impl fmt::Display for PortBlock {
     }
 }
 
-/// The port blocks live workspaces hold, each at the size it was allocated with. A block that
+/// The port blocks live workspaces hold at their currently granted sizes. A block that
 /// shares a port with a held one is refused, so the set is disjoint by construction.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ReservedPortBlocks(BTreeMap<u16, PortBlock>);
@@ -953,6 +984,10 @@ pub struct GrantSet {
     pub revision: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub port_block: Option<PortBlock>,
+    /// A relocated sandbox may have left services alive after its job concluded. Its
+    /// previous disjoint blocks remain this workspace's authority, never a sibling's.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub retained_port_blocks: Vec<PortBlock>,
     #[serde(default)]
     pub read: Vec<PathBuf>,
     #[serde(default)]
@@ -979,19 +1014,41 @@ impl GrantSet {
         })
     }
 
+    pub fn port_blocks(&self) -> impl Iterator<Item = PortBlock> + '_ {
+        self.port_block
+            .into_iter()
+            .chain(self.retained_port_blocks.iter().copied())
+    }
+
     pub fn validate(&self, platform: Platform) -> Result<(), MetadataError> {
         match (platform, self.port_block) {
-            (Platform::Macos, Some(block)) if is_macos_port_block(block.base, block.size) => Ok(()),
-            (Platform::Macos, Some(block)) => Err(MetadataError::InvalidPortBlock {
-                base: block.base,
-                size: block.size,
-            }),
-            (Platform::Linux, None) => Ok(()),
+            (Platform::Macos, Some(_)) => {
+                for (index, block) in self.port_blocks().enumerate() {
+                    if !is_macos_port_block(block.base, block.size) {
+                        return Err(MetadataError::InvalidPortBlock {
+                            base: block.base,
+                            size: block.size,
+                        });
+                    }
+                    if let Some(held) = self
+                        .port_blocks()
+                        .take(index)
+                        .find(|held| held.overlaps(block))
+                    {
+                        return Err(MetadataError::OverlappingPortBlocks {
+                            first: held,
+                            second: block,
+                        });
+                    }
+                }
+                Ok(())
+            }
+            (Platform::Linux, None) if self.retained_port_blocks.is_empty() => Ok(()),
             (_, Some(block)) => Err(MetadataError::InvalidPortBlock {
                 base: block.base,
                 size: block.size,
             }),
-            (Platform::Macos, None) => Err(MetadataError::InvalidPortBlock { base: 0, size: 0 }),
+            (_, None) => Err(MetadataError::InvalidPortBlock { base: 0, size: 0 }),
         }
     }
 }
@@ -1603,6 +1660,30 @@ mod tests {
         assert!(write_json(&path, &Fails).is_err());
         assert_eq!(fs::read_dir(&directory).unwrap().count(), 0);
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn retained_port_authority_is_disjoint_and_macos_only() {
+        let current = PortBlock::new(40960, 128).unwrap();
+        let retained = PortBlock::new(41088, 64).unwrap();
+        let mut grants = GrantSet::closed_baseline(Some(current)).unwrap();
+        grants.retained_port_blocks.push(retained);
+        grants.validate(Platform::Macos).unwrap();
+        assert!(grants.validate(Platform::Linux).is_err());
+        grants.retained_port_blocks.push(retained);
+        assert!(matches!(
+            grants.validate(Platform::Macos),
+            Err(MetadataError::OverlappingPortBlocks { .. })
+        ));
+        grants.retained_port_blocks = vec![PortBlock::new(41024, 64).unwrap()];
+        assert!(matches!(
+            grants.validate(Platform::Macos),
+            Err(MetadataError::OverlappingPortBlocks { .. })
+        ));
+        grants.port_block = None;
+        assert!(grants.validate(Platform::Linux).is_err());
+        grants.retained_port_blocks.clear();
+        grants.validate(Platform::Linux).unwrap();
     }
 
     #[test]

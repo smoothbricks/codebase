@@ -466,7 +466,12 @@ fn grant_sets() -> BTreeMap<&'static str, Value> {
 
     let open = GrantSet {
         revision: 12,
-        port_block: Some(PortBlock::new(51_200, 16).expect("fixture port block is aligned")),
+        port_block: Some(PortBlock::new(40_960, 128).expect("fixture port block is aligned")),
+        // The 64-port block it was relocated from: still reserved to this workspace until it
+        // retires, because a background process a finished job left behind may still hold it.
+        retained_port_blocks: vec![
+            PortBlock::new(41_088, 64).expect("fixture retained port block is aligned"),
+        ],
         read: vec![PathBuf::from("/Users/fixture/.cargo/registry")],
         write: vec![PathBuf::from("/Users/fixture/Library/Caches/sccache")],
         deny_write: vec![PathBuf::from(".git/hooks"), PathBuf::from(".git/config")],

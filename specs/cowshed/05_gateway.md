@@ -24,12 +24,13 @@ inside each private netns for its data-plane connector; namespace separation mak
 topology is platform-specific:
 
 - **macOS — port block.** Every workspace, main included, gets a contiguous block of ports from 40960–49151, recorded as
-  `portBlock {base, size}` (04_sandbox.md: a power-of-two size, a base aligned to it; new workspaces get 64 ports, live
-  ones keep the size they were allocated with). `portBlock` is allocated at new/fork (adopt for main), preserved across
-  restore, and present only in macOS grant files. The gateway binds `base`; `base+1 … base+size-1` are workspace service
-  ports. A session carries its block's recorded size, and the gateway validates the endpoint against it. Seatbelt
-  permits a workspace to connect only to its own block. The destination `base` listener is the primary, kernel-enforced
-  workspace identity.
+  `portBlock {base, size}` (04_sandbox.md: a power-of-two size, a base aligned to it; new workspaces get 64 ports, and a
+  live block grows only through a `service_ports` grant; one that moves keeps its old block reserved as
+  `retainedPortBlocks`, which carries no gateway listener). `portBlock` is allocated at new/fork (adopt for main),
+  preserved across restore, and present only in macOS grant files. The gateway binds `base`; `base+1 … base+size-1` are
+  workspace service ports. A session carries its block's recorded size, and the gateway validates the endpoint against
+  it. Seatbelt permits a workspace to connect only to its current and retained blocks. The destination `base` listener
+  is the primary, kernel-enforced workspace identity.
 - **Linux — Unix socket, private netns, and trusted connector.** No `portBlock` is allocated. The controller creates
   `/private/cowshed/store/run/gateway/<workspaceIncarnation>.sock` under a 0700 directory with mode 0600 and bind-mounts
   that one socket as `/run/cowshed/gateway.sock` inside the workspace's private network namespace. The namespace has
