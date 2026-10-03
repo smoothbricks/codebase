@@ -387,6 +387,10 @@ pub struct ArtifactSeal {
     pub stderr: StreamInfo,
     pub terminal_batch_sha256: Sha256Digest,
     pub output_limit: Option<OutputLimitInfo>,
+    /// The first refusal of an output copy the job asked for, stdout's before stderr's. The seal
+    /// stands regardless: the terminal record is durable before any copy is attempted, so a
+    /// refused copy travels beside it instead of replacing it.
+    pub publication_failure: Option<CowshedError>,
 }
 
 pub trait ArtifactSink: Send {
@@ -539,17 +543,17 @@ impl ArtifactSink for ArtifactStoreSink {
             .store
             .finish_and_publish(token, ending, stdout_copy, stderr_copy)
             .map_err(map_artifact_error)?;
-        if let Some(Err(error)) = stdout_publication {
-            return Err(map_artifact_error(error));
-        }
-        if let Some(Err(error)) = stderr_publication {
-            return Err(map_artifact_error(error));
-        }
+        let publication_failure = [stdout_publication, stderr_publication]
+            .into_iter()
+            .flatten()
+            .find_map(|publication| publication.err())
+            .map(map_artifact_error);
         Ok(ArtifactSeal {
             stdout: sealed.record.stdout,
             stderr: sealed.record.stderr,
             terminal_batch_sha256: sealed.terminal_batch_sha256,
             output_limit: sealed.output_limit,
+            publication_failure,
         })
     }
 
@@ -2549,7 +2553,6 @@ struct JobStateRecord {
     info: JobInfo,
     started_at: Instant,
     process: Option<Box<dyn RunningProcess>>,
-    artifact_live: bool,
     stdout: VecDeque<Bytes>,
     stderr: VecDeque<Bytes>,
     stdout_len: u64,
@@ -2560,6 +2563,15 @@ struct JobStateRecord {
     /// Set when `wait(2)` could not name the child's termination. Keeps the job's terminal
     /// record free of a fabricated exit and hands the failure to everyone awaiting the job.
     wait_failure: Option<CowshedError>,
+    /// Set when the job ended but its terminal record, or with the record durable its terminal
+    /// commitment, could not be established. The job still leaves `Running` -- its end is a fact
+    /// -- but it is not `terminal_committed`: the actor keeps serving its output, the ledger keeps
+    /// its group, and a record the store refused stays unterminated for the workspace's next
+    /// supervisor to seal as lost.
+    terminal_failure: Option<CowshedError>,
+    /// Set when the job's terminal record and commitment stand but an output copy it asked for
+    /// was refused. Its state and artifacts are the true ones; only the copy did not happen.
+    publication_failure: Option<CowshedError>,
     output_limit: Option<OutputLimitInfo>,
     kill_reason: Option<KillReason>,
     terminal_committed: bool,
@@ -2582,10 +2594,20 @@ impl JobStateRecord {
 
     /// The answer to "how did this job end", for every caller that asked to be told.
     ///
-    /// A retained wait failure outranks the record: the state and byte counts are true, but
-    /// nothing observed the child terminate, so `Ok` would be a wrong-success channel.
+    /// A retained failure outranks the record, in the order it was incurred: a wait failure
+    /// (nothing observed the child terminate), then a terminal record or commitment that could not
+    /// be established, then a refused output copy. In each case the state is true, but `Ok`
+    /// would be a wrong-success channel for what the caller asked.
     fn terminal_outcome(&self) -> Result<JobInfo> {
-        match &self.wait_failure {
+        match [
+            &self.wait_failure,
+            &self.terminal_failure,
+            &self.publication_failure,
+        ]
+        .into_iter()
+        .flatten()
+        .next()
+        {
             Some(error) => Err(error.clone()),
             None => Ok(self.info.clone()),
         }
@@ -3222,7 +3244,6 @@ impl SupervisorActor {
             info,
             started_at: Instant::now(),
             process: None,
-            artifact_live: true,
             stdout: VecDeque::new(),
             stderr: VecDeque::new(),
             stdout_len: 0,
@@ -3231,6 +3252,8 @@ impl SupervisorActor {
             stderr_eof: false,
             exit: None,
             wait_failure: None,
+            terminal_failure: None,
+            publication_failure: None,
             output_limit: None,
             kill_reason: None,
             terminal_committed: false,
@@ -3475,7 +3498,7 @@ impl SupervisorActor {
             .jobs
             .get_mut(&job_id)
             .expect("begin_kill validated the job");
-        if job.terminal_committed {
+        if job.terminal() {
             let _ = reply.send(job.terminal_outcome().map(|_| ()));
         } else {
             job.kill_waiters.push(reply);
@@ -3598,7 +3621,7 @@ impl SupervisorActor {
                 let Some(job) = self.jobs.get_mut(&job_id) else {
                     return;
                 };
-                if job.terminal_committed {
+                if job.terminal() {
                     return;
                 }
                 // `exit` stays `None`: there is no truthful status to publish. The job seals as
@@ -3642,7 +3665,7 @@ impl SupervisorActor {
                 let Some(job) = self.jobs.get_mut(&job_id) else {
                     return;
                 };
-                if job.terminal_committed {
+                if job.terminal() {
                     return;
                 }
                 // The same terminal shape as a spawn that failed synchronously; the job's
@@ -3657,7 +3680,7 @@ impl SupervisorActor {
                 let Some(job) = self.jobs.get_mut(&job_id) else {
                     return;
                 };
-                if job.terminal_committed {
+                if job.terminal() {
                     return;
                 }
                 // Bash's own status for a script that does not parse.
@@ -3680,7 +3703,7 @@ impl SupervisorActor {
         let Some(job) = self.jobs.get(&job_id) else {
             return;
         };
-        if job.terminal_committed || !job.artifact_live {
+        if job.terminal() {
             return;
         }
         match self.artifacts.write(job_id, stream, &bytes) {
@@ -3795,8 +3818,8 @@ impl SupervisorActor {
             .filter_map(|(id, job)| {
                 // An unreaped child may hold its pipes open forever, so a wait failure does not
                 // wait for EOF. Output already accepted is sealed; anything later is dropped by
-                // the `terminal_committed` guard in `process_output`.
-                (!job.terminal_committed
+                // the terminal guard in `process_output`.
+                (!job.terminal()
                     && (job.wait_failure.is_some()
                         || (job.exit.is_some() && job.stdout_eof && job.stderr_eof)))
                     .then_some(*id)
@@ -3811,7 +3834,7 @@ impl SupervisorActor {
         let Some(job) = self.jobs.get_mut(&job_id) else {
             return;
         };
-        if job.terminal_committed {
+        if job.terminal() {
             return;
         }
         let state = forced_state.unwrap_or_else(|| match job.kill_reason {
@@ -3829,10 +3852,6 @@ impl SupervisorActor {
                 ExitStatus::Signaled { .. } => JobState::Signaled,
             },
         });
-        if !job.artifact_live {
-            return;
-        }
-        job.artifact_live = false;
         let duration_ms = job
             .started_at
             .elapsed()
@@ -3852,53 +3871,46 @@ impl SupervisorActor {
             job.stderr_copy.take(),
         );
         drop(seal_span);
-        let seal = match sealed {
-            Ok(seal) => seal,
-            Err(error) => {
-                for waiter in job.waiters.drain(..) {
-                    let _ = waiter.send(Err(error.clone()));
-                }
-                for waiter in job.kill_waiters.drain(..) {
-                    let _ = waiter.send(Err(error.clone()));
-                }
-                return;
+        // The child's end is a fact whatever becomes of its record, so the job leaves `Running`
+        // on every path below and every waiter is answered. A job left `Running` after its
+        // artifact was consumed has nobody to finish it: later waits and kills queue forever and
+        // retirement never sees the workspace idle.
+        let (seal, terminal_failure) = match sealed {
+            Ok(seal) => {
+                let commitment = crate::timing::spanned(
+                    "seal",
+                    "commitment",
+                    self.commitments.record(CommitmentDraft::Terminal {
+                        repo_id: self.authority.repo_id.clone(),
+                        workspace_incarnation: self.authority.workspace_incarnation.clone(),
+                        job_id,
+                        state,
+                        grant_revision: job.info.grant_revision,
+                        stdout_bytes: seal.stdout.bytes,
+                        stdout_sha256: seal.stdout.sha256,
+                        stderr_bytes: seal.stderr.bytes,
+                        stderr_sha256: seal.stderr.sha256,
+                        batch_sha256: seal.terminal_batch_sha256,
+                        output_limit: seal.output_limit.clone(),
+                    }),
+                )
+                .await;
+                (Some(seal), commitment.err())
             }
+            Err(error) => (None, Some(error)),
         };
-        let commitment = crate::timing::spanned(
-            "seal",
-            "commitment",
-            self.commitments.record(CommitmentDraft::Terminal {
-                repo_id: self.authority.repo_id.clone(),
-                workspace_incarnation: self.authority.workspace_incarnation.clone(),
-                job_id,
-                state,
-                grant_revision: job.info.grant_revision,
-                stdout_bytes: seal.stdout.bytes,
-                stdout_sha256: seal.stdout.sha256,
-                stderr_bytes: seal.stderr.bytes,
-                stderr_sha256: seal.stderr.sha256,
-                batch_sha256: seal.terminal_batch_sha256,
-                output_limit: seal.output_limit.clone(),
-            }),
-        )
-        .await;
-        if let Err(error) = commitment {
-            for waiter in job.waiters.drain(..) {
-                let _ = waiter.send(Err(error.clone()));
-            }
-            for waiter in job.kill_waiters.drain(..) {
-                let _ = waiter.send(Err(error.clone()));
-            }
-            return;
-        }
-        job.terminal_committed = true;
+        let committed = terminal_failure.is_none();
+        job.terminal_committed = committed;
+        job.terminal_failure = terminal_failure;
         job.info.state = state;
-        let ledger_changed = job.info.pid.is_some();
         job.info.duration_ms = Some(duration_ms);
         job.info.exit = job.exit.clone();
-        job.info.stdout = seal.stdout;
-        job.info.stderr = seal.stderr;
-        job.info.output_limit = seal.output_limit;
+        if let Some(seal) = seal {
+            job.info.stdout = seal.stdout;
+            job.info.stderr = seal.stderr;
+            job.info.output_limit = seal.output_limit;
+            job.publication_failure = seal.publication_failure;
+        }
         job.info.failure =
             (job.kill_reason == Some(KillReason::ScriptSyntax)).then_some(JobFailure::ScriptSyntax);
         job.info.stdin.complete = true;
@@ -3915,6 +3927,11 @@ impl SupervisorActor {
             let _ = waiter.send(outcome.clone().map(|_| ()));
         }
         flush_log_waiters(job);
+        if !committed {
+            // Without a committed terminal the actor's copy is the output it serves, and the
+            // ledger keeps the group for the workspace's next supervisor to end.
+            return;
+        }
         // Release the actor's copy of the output. The store already holds every byte, under a
         // committed digest, and its per-job quota is a gigabyte -- so retaining this second copy
         // for the supervisor's lifetime is growth with no closed form, and a workspace that
@@ -3922,7 +3939,7 @@ impl SupervisorActor {
         // waiters so a follower that is mid-stream is served from the live deque first.
         job.stdout = VecDeque::new();
         job.stderr = VecDeque::new();
-        if ledger_changed {
+        if job.info.pid.is_some() {
             self.record_groups();
         }
     }

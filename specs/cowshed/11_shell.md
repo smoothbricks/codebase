@@ -589,3 +589,10 @@ component walks. Absolute paths, traversal, symlink ancestors, directories, devi
 closed. Publication disposition (`clone`, `reflink`, or `copy`) and failure are structured metadata. Publication failure
 does not change the established process/quota state or `StreamInfo`; it is a separate typed operational outcome. The
 destination is never promised while the command runs, never used for job reads, and never authoritative.
+
+Once the protected terminal record is sealed, a refused output copy cannot leave the live job `running`: terminal state,
+exit, artifacts, commitment, and session removal advance before the original copy error reaches an early or late
+`wait`/`kill` caller; normal process-group bookkeeping still concludes. A true sealing or commitment error is retained
+separately and answers future callers without hanging, preserves uncommitted captured bytes and ownership evidence, and
+does not fabricate a different child exit. Retirement may proceed after the child has ended; the next supervisor uses
+the existing lost-job recovery for records that genuinely remained unterminated.

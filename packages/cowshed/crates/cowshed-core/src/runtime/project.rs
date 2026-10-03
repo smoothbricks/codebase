@@ -10845,6 +10845,7 @@ mod removal_supervisor_tests {
                 stderr: empty_stream(),
                 terminal_batch_sha256: Sha256Digest::compute(&[]),
                 output_limit: None,
+                publication_failure: None,
             })
         }
 

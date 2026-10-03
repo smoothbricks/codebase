@@ -8,16 +8,16 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use cowshed_core::api::{
     CONTROLLER_COMMITMENT_VERSION, CommandArg, ControllerCommitment, ExecCommand, ExecRequest,
-    ExitStatus, GitOid, JobId, JobState, MAX_COMMAND_ARG_BYTES, OutputLimitInfo, OutputPublication,
-    OutputStorage, OutputSummary, ProtectedOutput, RunSandboxMode, Sha256Digest, StdinSource,
-    StreamInfo, WarmAdmission, WarmRange, WorkspacePath,
+    ExitStatus, GitOid, JobFailure, JobId, JobState, MAX_COMMAND_ARG_BYTES, OutputLimitInfo,
+    OutputPublication, OutputStorage, OutputSummary, ProtectedOutput, PublicationPolicy,
+    RunSandboxMode, Sha256Digest, StdinSource, StreamInfo, WarmAdmission, WarmRange, WorkspacePath,
 };
 use cowshed_core::error::{CowshedError, ErrorCode, Result};
 use cowshed_core::metadata::{PortBlock, WorkspaceIncarnation, WorkspaceName};
 use cowshed_core::repository::{OwnedRepoIds, RepoId};
 use cowshed_core::runtime::land_warm::warm_after_land;
 use cowshed_core::sandbox::{SandboxConfig, SandboxGrants};
-use cowshed_core::storage::job_artifact::{ArtifactConfig, JobEnding, StreamKind};
+use cowshed_core::storage::job_artifact::{ArtifactConfig, ArtifactStore, JobEnding, StreamKind};
 use tokio::sync::mpsc;
 
 use cowshed_core::runtime::supervisor::{
@@ -292,6 +292,7 @@ impl FakeArtifactJob {
             stderr: stream(self.stderr),
             terminal_batch_sha256: Sha256Digest::compute(&self.id.get().to_be_bytes()),
             output_limit: self.crossing,
+            publication_failure: None,
         })
     }
 }
@@ -1286,6 +1287,138 @@ async fn a_fresh_supervisor_answers_for_a_job_its_predecessor_sealed() {
         ErrorCode::NotFound,
         "a job nothing sealed has no terminal record to answer from"
     );
+}
+
+/// A copy the job asked for is a separate act from sealing it. When the store refuses the copy --
+/// here a destination inside the protected `.cowshed` tree -- the job's terminal record and
+/// commitment still stand and it stops running, while every waiter and killer, early or late, is
+/// told the copy's own refusal.
+#[tokio::test]
+async fn a_refused_output_copy_fails_its_callers_after_the_job_ends_truthfully() {
+    let (supervisor_config, root) = isolated_config("refused-copy");
+    let destination = supervisor_config.workspace_root.join(".cowshed/leak");
+    let mut h = real_store_harness(supervisor_config);
+    let job = h
+        .handle
+        .exec(
+            None,
+            ExecRequest {
+                stdout_copy: Some(OutputPublication {
+                    path: WorkspacePath::new(".cowshed/leak").unwrap(),
+                    policy: PublicationPolicy::CreateNew,
+                }),
+                ..request(StdinSource::Empty)
+            },
+        )
+        .await
+        .unwrap();
+    let spawned = h.spawned.recv().await.unwrap();
+    let handle = h.handle.clone();
+    let early = tokio::spawn(async move { handle.wait(job).await });
+    tokio::task::yield_now().await;
+    // Commands are served in order: once this answers, the early wait is queued on a running job.
+    h.handle.info(job).await.unwrap();
+    complete(&spawned, b"payload", b"", ExitStatus::Exited { code: 0 }).await;
+
+    let refused = early
+        .await
+        .unwrap()
+        .expect_err("the refused copy reaches the waiter queued before the job ended");
+    assert_eq!(refused.code, ErrorCode::Integrity);
+    assert_eq!(h.handle.wait(job).await.unwrap_err(), refused);
+    assert_eq!(h.handle.kill(job).await.unwrap_err(), refused);
+
+    let info = h.handle.info(job).await.unwrap();
+    assert_eq!(
+        (info.state, info.exit, info.stdout.bytes),
+        (JobState::Exited, Some(ExitStatus::Exited { code: 0 }), 7)
+    );
+    let sealed = h.handle.sealed(job).await.unwrap();
+    assert_eq!((sealed.state, sealed.stdout.bytes), (JobState::Exited, 7));
+    assert!(!destination.exists());
+    let terminals = std::iter::from_fn(|| h.commitments.try_recv().ok())
+        .filter(|commitment| matches!(commitment, ControllerCommitment::Terminal(_)))
+        .count();
+    assert_eq!(terminals, 1);
+    h.handle.quiesce().await.unwrap();
+    h.handle.retire().await.unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+/// A job whose terminal record the store refuses has still ended. Its waiters, early and late, and
+/// its killers are answered with the refusal instead of queueing forever, its output stays readable
+/// and retirement completes. The durable record stays unterminated, so the workspace's next
+/// supervisor seals it failed as lost rather than as a success nothing recorded.
+#[tokio::test]
+async fn a_refused_terminal_record_answers_every_caller_and_stays_unterminated() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (supervisor_config, root) = isolated_config("refused-seal");
+    let job_root = supervisor_config.workspace_root.join(".cowshed/job");
+    let store = (
+        supervisor_config.workspace_root.clone(),
+        supervisor_config.owned_repo_ids.clone(),
+        supervisor_config.authority.workspace_incarnation.clone(),
+        supervisor_config.artifacts.clone(),
+    );
+    let mut h = real_store_harness(supervisor_config);
+    let job = h
+        .handle
+        .exec(None, request(StdinSource::Empty))
+        .await
+        .unwrap();
+    let spawned = h.spawned.recv().await.unwrap();
+    let handle = h.handle.clone();
+    let early = tokio::spawn(async move { handle.wait(job).await });
+    tokio::task::yield_now().await;
+    h.handle.info(job).await.unwrap();
+    // The store appends records only under a private job directory.
+    std::fs::set_permissions(&job_root, std::fs::Permissions::from_mode(0o755)).unwrap();
+    complete(&spawned, b"payload", b"", ExitStatus::Exited { code: 0 }).await;
+
+    let refused = early
+        .await
+        .unwrap()
+        .expect_err("the store's refusal reaches the waiter queued before the job ended");
+    assert_eq!(refused.code, ErrorCode::Integrity);
+    assert_eq!(h.handle.wait(job).await.unwrap_err(), refused);
+    assert_eq!(h.handle.kill(job).await.unwrap_err(), refused);
+    let info = h.handle.info(job).await.unwrap();
+    assert_eq!(
+        (info.state, info.exit),
+        (JobState::Exited, Some(ExitStatus::Exited { code: 0 }))
+    );
+    assert_eq!(
+        h.handle.sealed(job).await.unwrap_err().code,
+        ErrorCode::NotFound
+    );
+    let output = h
+        .handle
+        .log_read(job, StreamKind::Stdout, 0, false)
+        .await
+        .unwrap();
+    assert_eq!((output.bytes.as_ref(), output.eof), (&b"payload"[..], true));
+    assert!(
+        !std::iter::from_fn(|| h.commitments.try_recv().ok())
+            .any(|commitment| matches!(commitment, ControllerCommitment::Terminal(_)))
+    );
+    h.handle.quiesce().await.unwrap();
+    h.handle.retire().await.unwrap();
+    drop(h);
+
+    std::fs::set_permissions(&job_root, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let (workspace_root, owned, incarnation, artifacts) = store;
+    let lost = ArtifactStore::open(workspace_root, owned, incarnation, artifacts)
+        .unwrap()
+        .seal_unterminated()
+        .unwrap();
+    assert_eq!(
+        lost.iter()
+            .map(|(record, _)| (record.job_id, record.state, record.failure))
+            .collect::<Vec<_>>(),
+        vec![(job, JobState::Failed, Some(JobFailure::SupervisorLost))]
+    );
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[tokio::test]
